@@ -1,0 +1,314 @@
+// ============================================
+// Luxo 语法演示 / Luxo Syntax Demo
+// ============================================
+
+// use — 从共享模块导入类型
+use common.{ Base, Searchable, Page }
+
+// ============================================
+// model — 数据模型定义
+// 支持继承(:)、interface 实现、注解(@)
+// ============================================
+
+/// 用户模型，关联 `Post` 和 `Profile`
+model User : Base, Searchable @crud {
+  // 基础字段
+  name:     String  @varchar(100) @filterable  // @varchar 数据库列长度, @filterable 允许客户端过滤
+  email:    String  @unique                    // @unique 唯一约束
+  password: String  @hidden @hash              // @hidden 永远不返回, @hash 自动 bcrypt
+  role:     Role    = Role.USER                // 默认值
+  avatar:   String?                            // ? 表示可空
+  phone:    String  @immutable                 // @immutable 创建后不可改
+  status:   String  @internal                  // @internal 用户不能传，只能代码内部设
+
+  // 关联关系 — 零注解，框架自动推断
+  posts:    [Post]                             // 一对多（Post 表有 userId）
+  profile:  Profile?                           // 一对一（Profile 表有 userId）
+  tags:     [Tag]                              // 多对多（自动中间表）
+  roles:    [Role] through UserRole            // 多对多（显式中间表）
+
+  // 多态关联
+  // target: (Post, Video, Product)            // 一个字段关联多种 model
+
+  // 计算字段 — 不存数据库，查询时按需计算
+  val postCount: Int get @count                // SQL COUNT
+  val avgLikes: Float get @avg(field: likes)   // SQL AVG
+
+  // 自定义计算
+  val displayName: String get {
+    name + " (" + role + ")"
+  }
+
+  // 自定义外键名
+  // author: User(key: authorId)
+
+  // 字段变换
+  // avatar: String @transform { "${CDN_URL}/${avatar}" }  // 返回时拼 CDN
+  // email:  String @beforeSave { email.lowercase() }      // 存库前转小写
+  // phone:  String @mask("***####****")                   // 脱敏返回 138****1234
+
+  // 条件返回 — 表达式为 true 才返回
+  // realName: String @visible(currentUser.id == id || currentUser.role == Role.ADMIN)
+
+  // 查询预设
+  scope active {
+    val x = 1
+  }
+
+  scope vip {
+    val x = 1
+  }
+}
+
+// ============================================
+// enum — 枚举类型
+// ============================================
+
+enum Role {
+  USER
+  ADMIN
+  MODERATOR
+}
+
+enum PostStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+// ============================================
+// sealed — 密封类型（when 必须穷举所有分支）
+// ============================================
+
+sealed PayResult {
+  Success(transactionId: String)
+  Failed(reason: String, code: Int)
+  Pending(retryAfter: Duration)
+}
+
+// ============================================
+// type — 类型定义，支持泛型
+// ============================================
+
+type Page<T> {
+  items:    [T]
+  total:    Int
+  page:     Int
+  pageSize: Int
+}
+
+type AuthResult {
+  token: String
+  user:  User
+}
+
+type RegisterInput {
+  name:     String
+  email:    String
+  password: String
+}
+
+// ============================================
+// interface — 接口，可以带默认实现（借鉴 Scala trait）
+// ============================================
+
+interface Auditable {
+  createdBy: String
+  updatedBy: String
+
+  // 默认实现 — 实现此 interface 的 model 自动拥有这些钩子
+  fn beforeCreate() {
+    createdBy = currentUser.name
+    updatedBy = currentUser.name
+  }
+
+  fn beforeUpdate() {
+    updatedBy = currentUser.name
+  }
+}
+
+// ============================================
+// api — 接口定义（三种写法）
+// ============================================
+
+// 写法 1: 纯声明 — 框架自动生成实现，零代码
+api getUser(id: Int): User @auth @cache(ttl: 60)
+api listUsers(status: String?, limit: Int = 20): Page<User>
+api deleteUser(id: Int): Boolean @auth(role: "admin")
+
+// 写法 2: 带逻辑 — 在 luxo 里写业务逻辑
+/// 注册新用户，密码通过 `@hash` 自动加密
+/// 如果邮箱已存在抛出 `EmailExists`
+api register(input: RegisterInput): AuthResult {
+  // ?: 条件断言 — 不满足就抛错（i18n key）
+  input.password.length >= 8 ?: throw error.password_too_short
+
+  // find — 查询单条，返回可空
+  val exists = find(User, where: email == input.email)
+  exists == null ?: throw error.email_exists
+
+  // create — 创建记录，@hash 自动处理密码
+  val user = create(User,
+    name: input.name,
+    email: input.email,
+    password: input.password
+  )
+
+  // Duration 字面量: 7d = 7天
+  val token = generateToken(user, expires: 7d)
+
+  // 对象构造
+  AuthResult { token: token, user: user }  // 最后一行 = 返回值
+}
+
+// 写法 3: @native — 极复杂逻辑交给 Go
+/// OAuth 第三方登录，Go 实现见 `resolvers/auth.go`
+api oauthLogin(provider: String, code: String): AuthResult @native
+
+// ============================================
+// 复杂业务逻辑示例
+// ============================================
+
+/// 创建订单，使用 `calcDiscount` 计算折扣
+/// 库存不足抛出 `OutOfStock`
+api createOrder(input: OrderInput): Order @auth {
+  // ?. 安全调用 — 空值时短路返回 null
+  val product = find(Product, id: input.productId)
+    ?: throw error.product_not_found
+
+  product.stock >= input.quantity ?: throw error.out_of_stock
+
+  val totalPrice = product.price * input.quantity
+
+  // when 表达式 — 模式匹配，替代 if-else 链
+  val finalPrice = when {
+    currentUser.role == Role.VIP -> totalPrice * 0.85
+    input.coupon != null         -> totalPrice * 0.9
+    totalPrice > 500             -> totalPrice * 0.95
+    else                         -> totalPrice
+  }
+
+  // transaction — 数据库事务，全成功或全回滚
+  val order = transaction {
+    update(product, stock: product.stock - input.quantity)
+    create(Order,
+      userId: currentUser.id,
+      productId: input.productId,
+      total: finalPrice,
+      status: "pending"
+    )
+  }
+
+  // emit — 发送异步事件
+  // 有客户端订阅 watchOrders → WebSocket 推送
+  // 有服务 consume → NATS 消息队列
+  emit("order.created", order, userId: currentUser.id)
+  order
+}
+
+// ============================================
+// when 更多用法
+// ============================================
+
+api handlePayResult(result: PayResult): String {
+  // when + sealed 类型 — 编译器强制穷举所有分支
+  val message = when(result) {
+    is Success -> "支付成功: ${result.transactionId}"
+    is Failed  -> "失败: ${result.reason}"
+    is Pending -> "请等待 ${result.retryAfter}"
+  }
+  message
+}
+
+// ============================================
+// for 循环 + 集合操作
+// ============================================
+
+api batchProcess(ids: [Int]): Int @auth {
+  val items = find(Product, where: id in ids)
+  val total = items.sumOf { it.price * it.quantity }
+
+  for item in items {
+    update(item, status: "processed")
+  }
+
+  val names = items.map { it.name }
+  val expensive = items.filter { it.price > 100 }
+  val hasVip = items.any { it.premium == true }
+
+  items.size
+}
+
+// ============================================
+// stream — WebSocket 流式推送
+// ============================================
+
+api watchComments(postId: Int): stream Comment
+api watchOrders(userId: Int): stream Order
+
+// ============================================
+// fn — 函数定义
+// ============================================
+
+// @native 函数 — Go 实现，luxo 里可直接调用
+fn encrypt(value: String): String @native
+fn verifyHash(plain: String, hashed: String): Boolean @native
+fn generateToken(user: User, expires: Duration): String @native
+
+// luxo 函数 — 纯 luxo 实现
+fn calcDiscount(total: Float, role: Role): Float {
+  when(role) {
+    Role.VIP       -> total * 0.15
+    Role.MODERATOR -> total * 0.10
+    else           -> 0.0
+  }
+}
+
+// ============================================
+// extend — 跨模块扩展（网关运行时聚合）
+// ============================================
+
+// Post 模块给 User 加字段，不需要 import User
+extend User {
+  orders: [Order]
+  notifications: [Notification]
+}
+
+// ============================================
+// error — 结构化错误定义
+// ============================================
+
+error NotFound(resource: String, id: Int) {
+  code: 404
+  message: error.not_found
+}
+
+error OutOfStock(productId: Int, available: Int) {
+  code: 409
+  message: error.out_of_stock
+}
+
+// internal: true — 不暴露细节给客户端，只记日志
+error DatabaseError {
+  code: 500
+  message: error.internal
+  internal: true
+}
+
+// ============================================
+// middleware — 中间件
+// ============================================
+
+// luxo 写
+middleware requestLogger {
+  log.info("${request.method} ${request.path}")
+}
+
+// Go 写
+middleware customAuth @native
+
+/*
+  多行注释
+  这里可以写任何说明
+  /* 支持嵌套 */
+*/

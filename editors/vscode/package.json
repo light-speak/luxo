@@ -1,0 +1,38 @@
+{
+  "name": "luxo",
+  "displayName": "Luxo",
+  "description": "Language support for Luxo (.luxo) - Build APIs at the speed of light",
+  "version": "0.1.0",
+  "publisher": "light-speak",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/light-speak/luxo"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "luxo",
+        "aliases": ["Luxo", "luxo"],
+        "extensions": [".luxo"],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/luxo-light.svg",
+          "dark": "./icons/luxo-dark.svg"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "luxo",
+        "scopeName": "source.luxo",
+        "path": "./syntaxes/luxo.tmLanguage.json"
+      }
+    ]
+  }
+}

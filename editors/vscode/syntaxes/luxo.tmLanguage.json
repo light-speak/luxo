@@ -1,0 +1,428 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Luxo",
+  "scopeName": "source.luxo",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#directives" },
+    { "include": "#declarations" },
+    { "include": "#field-definitions" },
+    { "include": "#function-calls" },
+    { "include": "#keywords" },
+    { "include": "#operators" },
+    { "include": "#types" },
+    { "include": "#constants" },
+    { "include": "#punctuation" },
+    { "include": "#identifiers" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.documentation.luxo",
+          "begin": "///",
+          "end": "$",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.comment.luxo" }
+          },
+          "patterns": [
+            {
+              "comment": "反引号引用 — 可跳转的引用",
+              "match": "(`)(\\w+)(`)",
+              "captures": {
+                "1": { "name": "punctuation.definition.reference.begin.luxo" },
+                "2": { "name": "entity.name.tag.reference.luxo" },
+                "3": { "name": "punctuation.definition.reference.end.luxo" }
+              }
+            }
+          ]
+        },
+        {
+          "name": "comment.line.double-slash.luxo",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.luxo",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "patterns": [
+            {
+              "match": "(`)(\\w+)(`)",
+              "captures": {
+                "1": { "name": "punctuation.definition.reference.begin.luxo" },
+                "2": { "name": "entity.name.tag.reference.luxo" },
+                "3": { "name": "punctuation.definition.reference.end.luxo" }
+              }
+            },
+            { "include": "#comments" }
+          ]
+        }
+      ]
+    },
+
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.luxo",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.luxo",
+              "match": "\\\\[\"\\\\nrt0]"
+            },
+            {
+              "begin": "(\\$\\{)",
+              "end": "(\\})",
+              "beginCaptures": {
+                "1": { "name": "punctuation.section.interpolation.begin.luxo" }
+              },
+              "endCaptures": {
+                "1": { "name": "punctuation.section.interpolation.end.luxo" }
+              },
+              "contentName": "meta.embedded.expression.luxo",
+              "patterns": [
+                { "include": "source.luxo" }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.duration.luxo",
+          "match": "\\b\\d+(ms|[dhms])\\b"
+        },
+        {
+          "name": "constant.numeric.float.luxo",
+          "match": "\\b\\d+\\.\\d+\\b"
+        },
+        {
+          "name": "constant.numeric.integer.luxo",
+          "match": "\\b\\d+\\b"
+        }
+      ]
+    },
+
+    "directives": {
+      "patterns": [
+        {
+          "comment": "@ 用 punctuation.definition.annotation，指令名用 entity.name.function.decorator",
+          "match": "(@)(\\w+)(\\()",
+          "captures": {
+            "1": { "name": "punctuation.definition.annotation.luxo" },
+            "2": { "name": "entity.name.function.decorator.luxo" },
+            "3": { "name": "punctuation.definition.parameters.begin.luxo" }
+          }
+        },
+        {
+          "match": "(@)(\\w+)",
+          "captures": {
+            "1": { "name": "punctuation.definition.annotation.luxo" },
+            "2": { "name": "entity.name.function.decorator.luxo" }
+          }
+        }
+      ]
+    },
+
+    "declarations": {
+      "patterns": [
+        {
+          "comment": "model/interface/enum/sealed/type/error 后面跟类型名",
+          "match": "\\b(model|interface|enum|sealed|type|error)\\s+([A-Z]\\w*)",
+          "captures": {
+            "1": { "name": "storage.type.luxo" },
+            "2": { "name": "entity.name.type.luxo" }
+          }
+        },
+        {
+          "comment": "middleware 后面跟名字",
+          "match": "\\b(middleware)\\s+(\\w+)",
+          "captures": {
+            "1": { "name": "storage.type.luxo" },
+            "2": { "name": "entity.name.function.luxo" }
+          }
+        },
+        {
+          "comment": "api 后面跟函数名",
+          "match": "\\b(api)\\s+(\\w+)",
+          "captures": {
+            "1": { "name": "storage.type.luxo" },
+            "2": { "name": "entity.name.function.luxo" }
+          }
+        },
+        {
+          "comment": "fn 后面跟函数名",
+          "match": "\\b(fn)\\s+(\\w+)",
+          "captures": {
+            "1": { "name": "storage.type.luxo" },
+            "2": { "name": "entity.name.function.luxo" }
+          }
+        },
+        {
+          "comment": "extend 后面跟类型名",
+          "match": "\\b(extend)\\s+([A-Z]\\w*)",
+          "captures": {
+            "1": { "name": "storage.modifier.luxo" },
+            "2": { "name": "entity.name.type.luxo" }
+          }
+        },
+        {
+          "comment": "use 导入",
+          "match": "\\b(use)\\s+(\\w+)\\s*(\\.)",
+          "captures": {
+            "1": { "name": "keyword.control.import.luxo" },
+            "2": { "name": "entity.name.namespace.luxo" },
+            "3": { "name": "punctuation.accessor.luxo" }
+          }
+        },
+        {
+          "comment": "scope 定义",
+          "match": "\\b(scope)\\s+(\\w+)",
+          "captures": {
+            "1": { "name": "storage.type.luxo" },
+            "2": { "name": "entity.name.function.luxo" }
+          }
+        }
+      ]
+    },
+
+    "field-definitions": {
+      "patterns": [
+        {
+          "comment": "val 变量声明",
+          "match": "\\b(val)\\s+(\\w+)",
+          "captures": {
+            "1": { "name": "storage.type.luxo" },
+            "2": { "name": "variable.other.constant.luxo" }
+          }
+        }
+      ]
+    },
+
+    "function-calls": {
+      "patterns": [
+        {
+          "comment": "CRUD 内置函数",
+          "match": "\\b(find|create|update|delete)\\s*(?=\\()",
+          "name": "support.function.luxo"
+        },
+        {
+          "comment": "系统函数",
+          "match": "\\b(emit|throw)\\s*(?=\\()",
+          "name": "support.function.luxo"
+        },
+        {
+          "comment": "transaction 块",
+          "match": "\\b(transaction)\\s*(?=\\{)",
+          "name": "support.function.luxo"
+        },
+        {
+          "comment": "集合方法",
+          "match": "\\.(filter|map|sumOf|count|any|firstOrNull|sortBy|groupBy|forEach|flatMap|joinToString|take|takeLast|matches)\\b",
+          "captures": {
+            "0": { "name": "support.function.luxo" }
+          }
+        },
+        {
+          "comment": "框架内置对象方法",
+          "match": "\\b(log|cache|storage|mail|task)\\s*(\\.)(\\w+)",
+          "captures": {
+            "1": { "name": "support.class.luxo" },
+            "2": { "name": "punctuation.accessor.luxo" },
+            "3": { "name": "support.function.luxo" }
+          }
+        },
+        {
+          "comment": "普通函数调用",
+          "match": "\\b([a-z]\\w*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "entity.name.function.luxo" }
+          }
+        }
+      ]
+    },
+
+    "keywords": {
+      "patterns": [
+        {
+          "comment": "声明关键字 — 和 class/function 同色",
+          "name": "storage.type.luxo",
+          "match": "\\b(model|interface|enum|sealed|type|fn|api|error|middleware)\\b"
+        },
+        {
+          "comment": "修饰符 — 和 public/static 同色",
+          "name": "storage.modifier.luxo",
+          "match": "\\b(extend|override|use|through|stream)\\b"
+        },
+        {
+          "comment": "流程控制 — 和 if/for/return 同色",
+          "name": "keyword.control.luxo",
+          "match": "\\b(when|if|else|for|in|return|is|throw)\\b"
+        },
+        {
+          "comment": "val — 和 var/let/const 同色",
+          "name": "storage.type.luxo",
+          "match": "\\b(val)\\b"
+        },
+        {
+          "comment": "get 关键字（计算字段）",
+          "name": "storage.modifier.luxo",
+          "match": "\\b(get)\\b(?=\\s*[@{])"
+        }
+      ]
+    },
+
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.comparison.luxo",
+          "match": "(==|!=|>=|<=|>|<)"
+        },
+        {
+          "name": "keyword.operator.logical.luxo",
+          "match": "(&&|\\|\\|)"
+        },
+        {
+          "comment": "Elvis 操作符 — 突出显示",
+          "name": "keyword.control.luxo",
+          "match": "\\?:"
+        },
+        {
+          "comment": "安全调用 — 突出显示",
+          "name": "keyword.control.luxo",
+          "match": "\\?\\."
+        },
+        {
+          "comment": "箭头 — when 分支、->",
+          "name": "keyword.control.luxo",
+          "match": "->"
+        },
+        {
+          "name": "keyword.operator.range.luxo",
+          "match": "\\.\\."
+        },
+        {
+          "name": "keyword.operator.assignment.luxo",
+          "match": "(?<![=!<>])=(?!=)"
+        },
+        {
+          "name": "keyword.operator.arithmetic.luxo",
+          "match": "[+\\-*/%]"
+        },
+        {
+          "name": "keyword.operator.not.luxo",
+          "match": "!"
+        }
+      ]
+    },
+
+    "types": {
+      "patterns": [
+        {
+          "comment": "内置原始类型 — 和 int/string 同色",
+          "name": "support.type.luxo",
+          "match": "\\b(String|Int|Float|Boolean|DateTime|Duration|Json|File|Void)\\b"
+        },
+        {
+          "comment": "枚举成员（全大写）— 和常量同色",
+          "name": "variable.other.enummember.luxo",
+          "match": "\\b([A-Z][A-Z_0-9]{1,})\\b"
+        },
+        {
+          "comment": "用户定义类型（大写开头）— 和 class 名同色",
+          "name": "entity.name.type.luxo",
+          "match": "\\b[A-Z][a-zA-Z0-9]*\\b"
+        }
+      ]
+    },
+
+    "constants": {
+      "patterns": [
+        {
+          "comment": "布尔值 — 和 true/false 同色",
+          "name": "constant.language.luxo",
+          "match": "\\b(true|false)\\b"
+        },
+        {
+          "comment": "null — 和 null/nil 同色",
+          "name": "constant.language.luxo",
+          "match": "\\b(null)\\b"
+        },
+        {
+          "comment": "特殊变量 — 和 this/self 同色",
+          "name": "variable.language.luxo",
+          "match": "\\b(currentUser|it)\\b"
+        }
+      ]
+    },
+
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.bracket.round.luxo",
+          "match": "[()]"
+        },
+        {
+          "name": "punctuation.bracket.square.luxo",
+          "match": "[\\[\\]]"
+        },
+        {
+          "name": "punctuation.bracket.curly.luxo",
+          "match": "[{}]"
+        },
+        {
+          "name": "punctuation.separator.comma.luxo",
+          "match": ","
+        },
+        {
+          "comment": "冒号 — 类型声明、命名参数",
+          "name": "punctuation.separator.colon.luxo",
+          "match": ":"
+        },
+        {
+          "comment": "可空标记",
+          "name": "keyword.operator.optional.luxo",
+          "match": "\\?"
+        }
+      ]
+    },
+
+    "identifiers": {
+      "patterns": [
+        {
+          "comment": "命名参数标签: name: value — 和函数参数同色",
+          "match": "\\b(\\w+)\\s*(:)\\s*(?=[\\w\"\\[{(])",
+          "captures": {
+            "1": { "name": "variable.parameter.luxo" },
+            "2": { "name": "punctuation.separator.colon.luxo" }
+          }
+        },
+        {
+          "comment": "成员访问的对象: input.name 的 input",
+          "match": "\\b([a-z_]\\w*)(?=\\?\\.|\\.\\w)",
+          "captures": {
+            "1": { "name": "variable.other.object.luxo" }
+          }
+        },
+        {
+          "comment": "成员属性: .name .email",
+          "match": "(?<=\\.)(\\w+)\\b(?!\\.)",
+          "captures": {
+            "1": { "name": "variable.other.property.luxo" }
+          }
+        },
+        {
+          "comment": "普通变量",
+          "name": "variable.other.luxo",
+          "match": "\\b[a-z_][a-zA-Z0-9_]*\\b"
+        }
+      ]
+    }
+  }
+}

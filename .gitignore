@@ -8,6 +8,10 @@
 bin/
 vendor/
 
+# VS Code Extension
+*.vsix
+editors/vscode/node_modules/
+
 # OS
 .DS_Store
 Thumbs.db
