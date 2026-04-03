@@ -2195,3 +2195,17 @@ func TestModelNameConflictWithBuiltinFields(t *testing.T) {
 	result := analyze(t, `model String { value: Int }`)
 	expectError(t, result, "already declared")
 }
+
+// Regression: fuzz found nil pointer in ElvisExpr when left type is nil
+func TestElvisOnUnresolvedType(t *testing.T) {
+	result := analyze(t, `
+api test(): Int {
+  val x = unknownFunc() ?: 0
+  x
+}
+`)
+	// should report error for unknownFunc but not panic
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+}

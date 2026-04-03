@@ -576,14 +576,14 @@ func (a *Analyzer) checkExpr(expr ast.Expr, scope *Scope) *ResolvedType {
 	case *ast.ElvisExpr:
 		leftType := a.checkExpr(e.Left, scope)
 		a.checkExpr(e.Right, scope)
+		if leftType == nil {
+			return nil
+		}
 		// after ?:, the left side is narrowed to non-null
 		if ident, ok := e.Left.(*ast.Ident); ok {
 			scope.Narrow(ident.Name, leftType.AsNonNull())
 		}
-		if leftType != nil {
-			return leftType.AsNonNull()
-		}
-		return nil
+		return leftType.AsNonNull()
 
 	case *ast.WhenExpr:
 		if e.Subject != nil {
