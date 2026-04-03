@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 120" fill="none">
+  <defs>
+    <linearGradient id="bolt" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#FFD700"/>
+      <stop offset="100%" style="stop-color:#FF8C00"/>
+    </linearGradient>
+    <linearGradient id="text" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#F8F8F2"/>
+      <stop offset="100%" style="stop-color:#CCCCCC"/>
+    </linearGradient>
+  </defs>
+  <!-- Lightning bolt icon -->
+  <path d="M30 10 L58 10 L46 45 L65 45 L28 110 L38 60 L20 60 Z" fill="url(#bolt)" />
+  <!-- LUXO text -->
+  <text x="85" y="82" font-family="'SF Pro Display', 'Helvetica Neue', Arial, sans-serif" font-size="72" font-weight="800" letter-spacing="6" fill="url(#text)">LUXO</text>
+</svg>

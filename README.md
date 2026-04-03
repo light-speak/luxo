@@ -1,40 +1,75 @@
-# Luxo
+<p align="center">
+  <img src="assets/logo.svg" alt="Luxo" width="360" />
+</p>
 
-**Build APIs at the speed of light.**
+<h3 align="center">Build APIs at the speed of light.</h3>
 
-A high-performance, schema-first Go framework for building modern APIs with binary encoding and client-driven field selection.
+<p align="center">
+  A schema-first Go framework that replaces REST, GraphQL, and gRPC<br/>
+  with one language, one protocol, one toolchain.
+</p>
 
-[![Tests](https://github.com/light-speak/luxo/actions/workflows/test.yml/badge.svg)](https://github.com/light-speak/luxo/actions/workflows/test.yml)
-[![codecov](https://codecov.io/gh/light-speak/luxo/branch/main/graph/badge.svg)](https://codecov.io/gh/light-speak/luxo)
-[![Go Report Card](https://goreportcard.com/badge/github.com/light-speak/luxo)](https://goreportcard.com/report/github.com/light-speak/luxo)
-[![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go)](https://go.dev)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+<p align="center">
+  <a href="https://github.com/light-speak/luxo/actions/workflows/test.yml"><img src="https://github.com/light-speak/luxo/actions/workflows/test.yml/badge.svg" alt="Tests" /></a>
+  <a href="https://codecov.io/gh/light-speak/luxo"><img src="https://codecov.io/gh/light-speak/luxo/branch/main/graph/badge.svg" alt="codecov" /></a>
+  <a href="https://goreportcard.com/report/github.com/light-speak/luxo"><img src="https://goreportcard.com/badge/github.com/light-speak/luxo" alt="Go Report Card" /></a>
+  <a href="https://go.dev"><img src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go" alt="Go Version" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License" /></a>
+</p>
 
-[中文文档](README_CN.md)
+<p align="center">
+  <a href="README_CN.md">中文文档</a> ·
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#example">Example</a> ·
+  <a href="#roadmap">Roadmap</a>
+</p>
 
 ---
 
-## Why Luxo?
+## The Problem
 
-| | GraphQL | gRPC | Luxo |
-|---|---|---|---|
-| Field Selection | Client-driven, too loose | None (fixed message) | Client-driven, schema-controlled |
-| Transport | JSON only | Protobuf only | JSON (dev) / Binary (prod), auto-switch |
-| Schema | GraphQL SDL | .proto | `.luxo` (with logic) |
-| Coupling | Too loose | Too tight | Just right |
-| Code Generation | Separate tooling | protoc | Built-in, one schema generates everything |
+You're writing the same thing three times: **schema**, **API handlers**, **database queries**. You're choosing between protocols that each solve half the problem. You're gluing together 10 different tools just to serve a JSON response.
+
+## The Solution
+
+**One `.luxo` file. Everything else is generated.**
+
+```luxo
+model User : Base @crud {
+  name:     String @varchar(100) @filterable
+  email:    String @unique
+  password: String @hidden @hash
+  avatar:   String?
+  posts:    [Post]
+}
+```
+
+This single definition generates: Go structs, database tables, CRUD APIs, query builders, DataLoaders, client SDKs, migration files. Zero boilerplate.
+
+## Why Not...
+
+| | GraphQL | gRPC | REST | **Luxo** |
+|---|---|---|---|---|
+| Field Selection | ✅ Too loose | ❌ None | ❌ None | ✅ Schema-controlled |
+| Binary Transport | ❌ JSON only | ✅ Protobuf | ❌ JSON only | ✅ JSON + Binary, auto-switch |
+| One Schema | ❌ SDL + ORM + OpenAPI | ❌ .proto + ORM | ❌ Manual | ✅ `.luxo` generates everything |
+| Code Gen | ❌ Separate tools | ⚠️ protoc | ❌ Manual | ✅ Built-in |
+| N+1 Prevention | ❌ Manual DataLoader | N/A | ❌ Manual | ✅ Automatic |
+| Type Safety | ⚠️ Runtime | ✅ Compile-time | ❌ None | ✅ Compile-time + null safety |
+| Multi-service | ⚠️ Federation (complex) | ✅ Native | ❌ Manual | ✅ `extend` + gateway |
 
 ## Features
 
-- **Schema-first** — Define your API in `.luxo` files, generate API layer, database layer, and client SDKs
-- **Field selection** — Clients request only the fields they need, all the way down to SQL queries
-- **Multi-mode transport** — JSON for development, Binary for production, zero code change
-- **All-in PostgreSQL** — Postgres by default, pluggable drivers (Redis, NATS, S3) when you need them
-- **Built-in RPC** — Luxo is its own protocol. No gRPC, no GraphQL, no extra dependency
-- **Zero boilerplate** — Standard CRUD with zero code. Only write Go for complex business logic
-- **DataLoader built-in** — N+1 problem solved automatically for all relationships
-- **Null safety** — Compile-time null checks, inspired by Kotlin
-- **Federation** — Multi-service architecture with gateway aggregation via `extend`
+- **Schema-first** — `.luxo` DSL with Kotlin-inspired syntax, logic included
+- **Field selection** — Client → API → SQL, only requested fields at every layer
+- **Multi-mode transport** — `JSON` for dev, `Binary` for prod, middleware auto-switch
+- **All-in PostgreSQL** — Postgres by default, pluggable drivers (Redis, NATS, S3)
+- **Built-in RPC** — Luxo IS the protocol. No gRPC, no GraphQL dependency
+- **Zero boilerplate** — `@crud` generates everything. Write Go only for `@native` logic
+- **Null safety** — Compile-time checks. `?` for nullable, `?:` for fallback, `?.` for safe access
+- **DataLoader built-in** — N+1 solved automatically for all relationships
+- **Federation** — `extend` for multi-service, gateway aggregation, identity propagation
+- **Luxo Studio** — Built-in monitoring dashboard, request tracing, API playground
 
 ## Quick Start
 
@@ -48,6 +83,8 @@ luxo dev
 
 ## Example
 
+**Define your API:**
+
 ```luxo
 model User : Base @crud {
   name:     String @varchar(100) @filterable
@@ -58,10 +95,7 @@ model User : Base @crud {
   posts:    [Post]
 }
 
-enum Role {
-  USER
-  ADMIN
-}
+enum Role { USER ADMIN }
 
 /// Register a new user
 api register(input: RegisterInput): AuthResult {
@@ -77,23 +111,26 @@ api register(input: RegisterInput): AuthResult {
   )
 
   val token = generateToken(user, expires: 7d)
-  return AuthResult { token: token, user: user }
+  AuthResult { token: token, user: user }
 }
 
-/// Complex logic? Use Go.
+/// Complex logic? Write Go.
 api oauthLogin(provider: String, code: String): AuthResult @native
 ```
 
-**Client query:**
+**Query with field selection:**
 
 ```
 getUser(1) {
   name email
-  posts { title createdAt }
+  posts {
+    title createdAt
+    comments { content user { name } }
+  }
 }
 ```
 
-**Response (only requested fields):**
+**Response — only what you asked for:**
 
 ```json
 {
@@ -101,7 +138,13 @@ getUser(1) {
     "name": "lin",
     "email": "lin@test.com",
     "posts": [
-      { "title": "Hello Luxo", "createdAt": "2026-04-03" }
+      {
+        "title": "Hello Luxo",
+        "createdAt": "2026-04-03",
+        "comments": [
+          { "content": "Great!", "user": { "name": "alice" } }
+        ]
+      }
     ]
   }
 }
@@ -110,57 +153,53 @@ getUser(1) {
 ## Architecture
 
 ```
-Client ←HTTP/2→ Luxo Router ←HTTP/2→ Services
-                    │
-                    ├── Schema composition (extend)
-                    ├── Load balancing
-                    ├── Health check & circuit breaker
-                    └── Luxo Studio (built-in dashboard)
+                        ┌──────────────────────────┐
+                        │       Luxo Router        │
+  Client ──HTTP/2──────►│  Schema · LB · Breaker   │──HTTP/2──► Services
+         ◄─WebSocket────│  Studio · Identity       │
+                        └──────────────────────────┘
+                              │          │
+                        ┌─────┘          └─────┐
+                        ▼                      ▼
+                  ┌───────────┐          ┌───────────┐
+                  │   User    │          │   Order   │
+                  │  Service  │──NATS───►│  Service  │
+                  └───────────┘          └───────────┘
 
-Single service:  luxo dev
-Multi service:   luxo dev --all
+  Single service:  luxo dev
+  Multi service:   luxo dev --all
+```
+
+## VS Code Extension
+
+Syntax highlighting, auto-completion, real-time error reporting, go-to-definition, and hover info for `.luxo` files.
+
+```bash
+# Auto-installs language server on first use
+code --install-extension luxo-0.2.0.vsix
 ```
 
 ## Roadmap
 
-### Phase 1 — Core (In Progress)
-- [x] Lexer (tokenizer)
-- [x] Parser (Pratt parser, AST)
-- [ ] Semantic analyzer (type checking, null safety)
-- [ ] Go code generator
-- [ ] Query builder (pgx)
-- [ ] DataLoader
-- [ ] JSON transport + field selection
-- [ ] Auto CRUD generation
-- [ ] CLI (init / generate / dev / run)
-- [ ] VS Code extension (LSP)
+### Phase 1 — Compiler ✅
+- [x] Lexer · Parser · Semantic Analyzer · LSP
+- [x] 442 tests · 99%+ coverage · Fuzz testing
+- [ ] Code generator · Query builder · DataLoader
 
-### Phase 2 — Complete
-- [ ] @native functions + resolver smart merge
-- [ ] Migration engine (declarative diff)
-- [ ] Transaction support
-- [ ] @auth + Identity context
-- [ ] i18n error handling
-- [ ] Validation annotations (@email, @range, etc.)
-- [ ] WebSocket stream
-- [ ] Batch requests
+### Phase 2 — Framework
+- [ ] JSON transport + field selection
+- [ ] Auto CRUD · @native resolver merge
+- [ ] Migration engine · Auth · i18n · Validation
+- [ ] WebSocket stream · Batch requests
 
 ### Phase 3 — Multi-service
-- [ ] Luxo Router
-- [ ] Schema composition + extend aggregation
-- [ ] Service discovery + load balancing
-- [ ] Health check + circuit breaker
-- [ ] Inter-service Luxo RPC
-- [ ] Identity context propagation
+- [ ] Luxo Router · Service discovery · Circuit breaker
+- [ ] Inter-service RPC · Identity propagation
 
 ### Phase 4 — Ecosystem
-- [ ] Binary transport protocol
-- [ ] Client SDK generation (TypeScript / Dart)
-- [ ] Luxo Studio (monitoring dashboard)
-- [ ] Built-in capabilities (Cache / Event / Task / Scheduler / Storage / Mail)
-- [ ] Monitoring & tracing
-- [ ] k3s deployment generation
-- [ ] .luxo test runner
+- [ ] Binary protocol · Client SDK (TS / Dart)
+- [ ] Luxo Studio · Cache / Event / Task / Storage
+- [ ] k3s deployment · .luxo test runner
 
 ## Contributing
 
@@ -168,16 +207,4 @@ Luxo is in early development. Contributions, ideas, and feedback are welcome.
 
 ## License
 
-Copyright 2026 light-speak
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+Apache-2.0 · Copyright 2026 light-speak
