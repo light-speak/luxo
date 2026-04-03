@@ -1317,3 +1317,723 @@ func TestHoverModelWithParent(t *testing.T) {
 		t.Error("expected parent 'Base' in hover")
 	}
 }
+
+// ========== Additional Coverage Tests (Phase 2) ==========
+
+func TestRunWithShutdownExit(t *testing.T) {
+	// Build shutdown request
+	shutdownBody, _ := json.Marshal(Request{
+		JSONRPC: "2.0",
+		ID:      func() *json.RawMessage { r := json.RawMessage(`99`); return &r }(),
+		Method:  "shutdown",
+	})
+	// Build exit notification
+	exitBody, _ := json.Marshal(Request{
+		JSONRPC: "2.0",
+		Method:  "exit",
+	})
+
+	var input bytes.Buffer
+	for _, body := range [][]byte{shutdownBody, exitBody} {
+		fmt.Fprintf(&input, "Content-Length: %d\r\n\r\n%s", len(body), body)
+	}
+
+	var output bytes.Buffer
+	logger := log.New(io.Discard, "", 0)
+	server := NewServer(&input, &output, logger)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.Run() }()
+
+	err := <-errCh
+	if err != nil {
+		t.Fatalf("Run() returned error: %v", err)
+	}
+}
+
+func TestHandleExit(t *testing.T) {
+	server, _ := newTestServer()
+	err := server.handleMessage(&Request{Method: "exit"})
+	if err != nil {
+		t.Fatalf("exit handler error: %v", err)
+	}
+}
+
+func TestHandleCompletionUnmarshalError(t *testing.T) {
+	server, _ := newTestServer()
+	id := json.RawMessage(`1`)
+	err := server.handleMessage(&Request{
+		JSONRPC: "2.0",
+		ID:      &id,
+		Method:  "textDocument/completion",
+		Params:  json.RawMessage(`not valid json`),
+	})
+	if err == nil {
+		t.Error("expected error for invalid JSON in completion params")
+	}
+}
+
+func TestHandleHoverUnmarshalError(t *testing.T) {
+	server, _ := newTestServer()
+	id := json.RawMessage(`1`)
+	err := server.handleMessage(&Request{
+		JSONRPC: "2.0",
+		ID:      &id,
+		Method:  "textDocument/hover",
+		Params:  json.RawMessage(`not valid json`),
+	})
+	if err == nil {
+		t.Error("expected error for invalid JSON in hover params")
+	}
+}
+
+func TestHandleDefinitionUnmarshalError(t *testing.T) {
+	server, _ := newTestServer()
+	id := json.RawMessage(`1`)
+	err := server.handleMessage(&Request{
+		JSONRPC: "2.0",
+		ID:      &id,
+		Method:  "textDocument/definition",
+		Params:  json.RawMessage(`not valid json`),
+	})
+	if err == nil {
+		t.Error("expected error for invalid JSON in definition params")
+	}
+}
+
+func TestMemberCompletionVariable(t *testing.T) {
+	server, _ := newTestServer()
+	// Create a doc with a scope containing a variable with a type that has fields
+	doc := &Document{
+		URI:     "file:///test.luxo",
+		Content: "myVar.",
+		Result: &semantic.Result{
+			Scope: semantic.NewScope(),
+			Types: map[string]*semantic.ResolvedType{},
+		},
+	}
+	userType := &semantic.ResolvedType{
+		Kind: semantic.TypeModel,
+		Name: "User",
+		Fields: map[string]*semantic.FieldInfo{
+			"name": {Name: "name", Type: &semantic.ResolvedType{Name: "String"}},
+			"age":  {Name: "age", Type: nil}, // field with nil Type
+		},
+	}
+	doc.Result.Scope.Define(&semantic.Symbol{
+		Name: "myVar",
+		Kind: semantic.SymVariable,
+		Type: userType,
+	})
+
+	items := server.getMemberCompletions(doc, Position{Line: 0, Character: 6})
+	foundName := false
+	foundAge := false
+	for _, item := range items {
+		if item.Label == "name" {
+			foundName = true
+			if item.Detail != "String" {
+				t.Errorf("expected detail 'String' for name, got %q", item.Detail)
+			}
+		}
+		if item.Label == "age" {
+			foundAge = true
+			if item.Detail != "" {
+				t.Errorf("expected empty detail for age (nil type), got %q", item.Detail)
+			}
+		}
+	}
+	if !foundName {
+		t.Error("expected 'name' field in variable member completion")
+	}
+	if !foundAge {
+		t.Error("expected 'age' field in variable member completion")
+	}
+	// Also verify collection methods are present
+	foundFilter := false
+	for _, item := range items {
+		if item.Label == "filter" {
+			foundFilter = true
+		}
+	}
+	if !foundFilter {
+		t.Error("expected collection method 'filter' in variable member completion")
+	}
+}
+
+func TestMemberCompletionInheritedFields(t *testing.T) {
+	server, output := newTestServer()
+	openDoc(server, output, "file:///test.luxo", "model Base { id: Int }\nmodel User : Base { name: String }\nUser.")
+	resp := requestCompletion(server, output, "file:///test.luxo", Position{Line: 2, Character: 5})
+	if !strings.Contains(resp, "name") {
+		t.Error("expected own field 'name' in member completion")
+	}
+	if !strings.Contains(resp, "id") {
+		t.Error("expected inherited field 'id' in member completion")
+	}
+	if !strings.Contains(resp, "from Base") {
+		t.Error("expected '(from Base)' annotation for inherited field")
+	}
+}
+
+func TestMemberCompletionNoDotChar(t *testing.T) {
+	server, _ := newTestServer()
+	doc := &Document{
+		URI:     "file:///test.luxo",
+		Content: "abc",
+		Result: &semantic.Result{
+			Scope: semantic.NewScope(),
+			Types: map[string]*semantic.ResolvedType{},
+		},
+	}
+	// dotPos = character-1 = 1, but line[1] = 'b', not '.'
+	items := server.getMemberCompletions(doc, Position{Line: 0, Character: 2})
+	if len(items) != 0 {
+		t.Errorf("expected empty completion when dot char not found, got %d items", len(items))
+	}
+}
+
+func TestGetSymbolCompletionsWithDoc(t *testing.T) {
+	server, _ := newTestServer()
+	doc := &Document{
+		URI:     "file:///test.luxo",
+		Content: "",
+		Result: &semantic.Result{
+			Scope: semantic.NewScope(),
+			Types: map[string]*semantic.ResolvedType{},
+		},
+	}
+	doc.Result.Scope.Define(&semantic.Symbol{
+		Name: "getUser",
+		Kind: semantic.SymApi,
+		Type: &semantic.ResolvedType{Name: "User"},
+		Doc:  "Retrieves a user by ID",
+	})
+
+	items := server.getSymbolCompletions(doc, "get")
+	found := false
+	for _, item := range items {
+		if item.Label == "getUser" {
+			found = true
+			if item.Documentation != "Retrieves a user by ID" {
+				t.Errorf("expected doc in completion, got %q", item.Documentation)
+			}
+			if !strings.Contains(item.Detail, "User") {
+				t.Errorf("expected type name in detail, got %q", item.Detail)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected 'getUser' in symbol completions")
+	}
+}
+
+func TestFormatTypeHoverNilFieldType(t *testing.T) {
+	typ := &semantic.ResolvedType{
+		Kind: semantic.TypeModel,
+		Name: "Widget",
+		Fields: map[string]*semantic.FieldInfo{
+			"data": {Name: "data", Type: nil, Nullable: true},
+		},
+	}
+	result := formatTypeHover("Widget", typ)
+	if !strings.Contains(result, "model Widget") {
+		t.Errorf("expected 'model Widget' in hover, got: %s", result)
+	}
+	if !strings.Contains(result, "?") {
+		t.Error("expected nullable marker '?' in hover for nullable field")
+	}
+	// Should not panic when field.Type is nil
+}
+
+func TestDefinitionBySymbol(t *testing.T) {
+	server, output := newTestServer()
+	// Open doc where 'getUser' is an api symbol. We want to jump to its definition.
+	openDoc(server, output, "file:///test.luxo", "model User { name: String }\napi getUser(id: Int): User {\n  find(User, where: id == id)\n}")
+	// Definition of "getUser" — this is a symbol, not a type
+	resp := requestDefinition(server, output, "file:///test.luxo", Position{Line: 1, Character: 5})
+	if !strings.Contains(resp, "test.luxo") {
+		t.Error("expected file URI in definition response for symbol")
+	}
+}
+
+func TestDefinitionSymbolNoFile(t *testing.T) {
+	server, _ := newTestServer()
+	doc := &Document{
+		URI:     "file:///test.luxo",
+		Content: "myVar",
+		Result: &semantic.Result{
+			Scope: semantic.NewScope(),
+			Types: map[string]*semantic.ResolvedType{},
+		},
+	}
+	// Define a symbol with no file position
+	doc.Result.Scope.Define(&semantic.Symbol{
+		Name: "myVar",
+		Kind: semantic.SymVariable,
+		Pos:  token.Position{}, // empty — no file
+	})
+	server.docs.Open("file:///test.luxo", 1, "myVar")
+	// Override the doc's result
+	server.docs.Get("file:///test.luxo").Result = doc.Result
+
+	output := &bytes.Buffer{}
+	resp := requestDefinition(server, output, "file:///test.luxo", Position{Line: 0, Character: 2})
+	// Symbol exists but has no file position — should return null result
+	if strings.Contains(resp, `"line"`) {
+		t.Error("expected null result when symbol has no file position")
+	}
+}
+
+func TestTransportReadMessageInvalidContentLength(t *testing.T) {
+	input := "Content-Length: notanumber\r\n\r\n{}"
+	transport := NewTransport(strings.NewReader(input), io.Discard)
+	_, err := transport.ReadMessage()
+	if err == nil {
+		t.Error("expected error for non-numeric Content-Length")
+	}
+	if !strings.Contains(err.Error(), "invalid Content-Length") {
+		t.Errorf("expected 'invalid Content-Length' in error, got: %v", err)
+	}
+}
+
+func TestTransportSendMarshalError(t *testing.T) {
+	var buf bytes.Buffer
+	transport := NewTransport(strings.NewReader(""), &buf)
+	// Channels cannot be marshaled to JSON
+	err := transport.send(make(chan int))
+	if err == nil {
+		t.Error("expected error when marshaling a channel")
+	}
+}
+
+// ========== Coverage Push Tests (Phase 3) ==========
+
+// errHeaderWriter fails on the first Write (header write), succeeds on nothing.
+type errHeaderWriter struct {
+	calls int
+}
+
+func (e *errHeaderWriter) Write(p []byte) (int, error) {
+	e.calls++
+	if e.calls == 1 {
+		return 0, fmt.Errorf("header write error")
+	}
+	return len(p), nil
+}
+
+// TestRunReadError covers Run() returning an error when ReadMessage fails and shutdown is false.
+func TestRunReadError(t *testing.T) {
+	// An empty reader will immediately return io.EOF on ReadString
+	var output bytes.Buffer
+	logger := log.New(io.Discard, "", 0)
+	server := NewServer(strings.NewReader(""), &output, logger)
+
+	err := server.Run()
+	if err == nil {
+		t.Fatal("expected error from Run() when reader returns EOF")
+	}
+	if !strings.Contains(err.Error(), "read:") {
+		t.Errorf("expected 'read:' in error, got: %v", err)
+	}
+}
+
+// TestRunHandleMessageError covers the error logging branch in Run() when handleMessage returns error.
+func TestRunHandleMessageError(t *testing.T) {
+	// Send a request with params that are valid JSON but unmarshal to wrong type,
+	// followed by an exit message.
+	badBody := []byte(`{"jsonrpc":"2.0","id":1,"method":"textDocument/didOpen","params":"wrong type"}`)
+	exitBody, _ := json.Marshal(Request{
+		JSONRPC: "2.0",
+		Method:  "exit",
+	})
+
+	var input bytes.Buffer
+	for _, body := range [][]byte{badBody, exitBody} {
+		fmt.Fprintf(&input, "Content-Length: %d\r\n\r\n%s", len(body), body)
+	}
+
+	var output bytes.Buffer
+	logger := log.New(io.Discard, "", 0)
+	server := NewServer(&input, &output, logger)
+
+	err := server.Run()
+	if err != nil {
+		t.Fatalf("Run() returned error: %v", err)
+	}
+}
+
+// TestRunShutdownThenEOF covers the Run() branch where shutdown is true and ReadMessage returns EOF.
+func TestRunShutdownThenEOF(t *testing.T) {
+	// Send only a shutdown request. After processing it, the reader will EOF.
+	// Run() should return nil (not an error) because shutdown is true.
+	shutdownBody, _ := json.Marshal(Request{
+		JSONRPC: "2.0",
+		ID:      func() *json.RawMessage { r := json.RawMessage(`99`); return &r }(),
+		Method:  "shutdown",
+	})
+
+	var input bytes.Buffer
+	fmt.Fprintf(&input, "Content-Length: %d\r\n\r\n%s", len(shutdownBody), shutdownBody)
+
+	var output bytes.Buffer
+	logger := log.New(io.Discard, "", 0)
+	server := NewServer(&input, &output, logger)
+
+	err := server.Run()
+	if err != nil {
+		t.Fatalf("Run() returned error after shutdown+EOF: %v", err)
+	}
+}
+
+// TestGetMemberCompletionStartGteEnd covers the start >= end branch (no identifier before dot).
+func TestGetMemberCompletionStartGteEnd(t *testing.T) {
+	server, _ := newTestServer()
+	doc := &Document{
+		URI:     "file:///test.luxo",
+		Content: ".",
+		Result: &semantic.Result{
+			Scope: semantic.NewScope(),
+			Types: map[string]*semantic.ResolvedType{},
+		},
+	}
+	// dot at position 0, cursor at 1: dotPos=0, line[0]='.', end=0, start=-1->0, start>=end
+	items := server.getMemberCompletions(doc, Position{Line: 0, Character: 1})
+	if len(items) != 0 {
+		t.Errorf("expected empty completion for dot with no identifier before it, got %d items", len(items))
+	}
+}
+
+// TestGetMemberCompletionNullableField covers the nullable field branch in model member completion.
+func TestGetMemberCompletionNullableField(t *testing.T) {
+	server, _ := newTestServer()
+	doc := &Document{
+		URI:     "file:///test.luxo",
+		Content: "MyModel.",
+		Result: &semantic.Result{
+			Scope: semantic.NewScope(),
+			Types: map[string]*semantic.ResolvedType{
+				"MyModel": {
+					Kind: semantic.TypeModel,
+					Name: "MyModel",
+					Fields: map[string]*semantic.FieldInfo{
+						"email": {Name: "email", Type: &semantic.ResolvedType{Name: "String"}, Nullable: true},
+					},
+				},
+			},
+		},
+	}
+	items := server.getMemberCompletions(doc, Position{Line: 0, Character: 8})
+	found := false
+	for _, item := range items {
+		if item.Label == "email" {
+			found = true
+			if !strings.Contains(item.Detail, "?") {
+				t.Errorf("expected nullable marker '?' in detail, got %q", item.Detail)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected 'email' field in member completion")
+	}
+}
+
+// TestGetSymbolCompletionsDuplicate covers the seen[sym.Name] dedup branch.
+func TestGetSymbolCompletionsDuplicate(t *testing.T) {
+	server, _ := newTestServer()
+
+	// Create parent scope with symbol, then child scope with same-name symbol.
+	// LookupPrefix walks both and returns duplicates; getSymbolCompletions must dedup.
+	parent := semantic.NewScope()
+	parent.Define(&semantic.Symbol{
+		Name: "dupVar",
+		Kind: semantic.SymVariable,
+		Doc:  "from parent",
+	})
+	child := parent.Child()
+	child.Define(&semantic.Symbol{
+		Name: "dupVar",
+		Kind: semantic.SymVariable,
+		Doc:  "from child",
+	})
+
+	doc := &Document{
+		URI:     "file:///test.luxo",
+		Content: "",
+		Result: &semantic.Result{
+			Scope: child,
+			Types: map[string]*semantic.ResolvedType{},
+		},
+	}
+	items := server.getSymbolCompletions(doc, "dup")
+	count := 0
+	for _, item := range items {
+		if item.Label == "dupVar" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected exactly 1 entry after dedup, got %d", count)
+	}
+}
+
+// TestGetSymbolCompletionsNilTypeEmptyDoc covers symbol with nil Type and empty Doc.
+func TestGetSymbolCompletionsNilTypeEmptyDoc(t *testing.T) {
+	server, _ := newTestServer()
+	doc := &Document{
+		URI:     "file:///test.luxo",
+		Content: "",
+		Result: &semantic.Result{
+			Scope: semantic.NewScope(),
+			Types: map[string]*semantic.ResolvedType{},
+		},
+	}
+	doc.Result.Scope.Define(&semantic.Symbol{
+		Name: "noTypeVar",
+		Kind: semantic.SymVariable,
+		Type: nil,
+		Doc:  "",
+	})
+
+	items := server.getSymbolCompletions(doc, "noType")
+	found := false
+	for _, item := range items {
+		if item.Label == "noTypeVar" {
+			found = true
+			if item.Documentation != "" {
+				t.Errorf("expected empty documentation, got %q", item.Documentation)
+			}
+			// Detail should just be the kind string without ": typeName"
+			if strings.Contains(item.Detail, ":") {
+				t.Errorf("expected no type in detail, got %q", item.Detail)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected 'noTypeVar' in symbol completions")
+	}
+}
+
+// TestHandleHoverFinalNilReturn covers the final nil return in handleHover
+// when word is not a type, not a symbol, and not a keyword.
+func TestHandleHoverFinalNilReturn(t *testing.T) {
+	server, output := newTestServer()
+	openDoc(server, output, "file:///test.luxo", "model User { name: String }")
+	// "name" is a field name, not a type/symbol/keyword in the scope
+	resp := requestHover(server, output, "file:///test.luxo", Position{Line: 0, Character: 14})
+	// Should return null result (not a type, not a symbol, not a keyword)
+	if strings.Contains(resp, "markdown") {
+		t.Error("expected null hover result for non-type/non-symbol/non-keyword word")
+	}
+}
+
+// TestFormatTypeHoverMultipleParents covers the i > 0 branch in model parent listing.
+func TestFormatTypeHoverMultipleParents(t *testing.T) {
+	typ := &semantic.ResolvedType{
+		Kind: semantic.TypeModel,
+		Name: "Child",
+		Parents: []*semantic.ResolvedType{
+			{Name: "ParentA"},
+			{Name: "ParentB"},
+		},
+		Fields: map[string]*semantic.FieldInfo{},
+	}
+	result := formatTypeHover("Child", typ)
+	if !strings.Contains(result, "ParentA") {
+		t.Error("expected ParentA in hover")
+	}
+	if !strings.Contains(result, ", ParentB") {
+		t.Error("expected ', ParentB' separator in hover for multiple parents")
+	}
+}
+
+// TestFormatTypeHoverSealedVariantNoFields covers sealed variant with no fields.
+func TestFormatTypeHoverSealedVariantNoFields(t *testing.T) {
+	typ := &semantic.ResolvedType{
+		Kind: semantic.TypeSealed,
+		Name: "MySealed",
+		Variants: []*semantic.SealedVariantInfo{
+			{Name: "Empty"},
+			{Name: "WithFields", Fields: []*semantic.FieldInfo{{Name: "code"}, {Name: "message"}}},
+		},
+	}
+	result := formatTypeHover("MySealed", typ)
+	if !strings.Contains(result, "sealed MySealed") {
+		t.Errorf("expected 'sealed MySealed', got: %s", result)
+	}
+	if !strings.Contains(result, "Empty") {
+		t.Error("expected variant 'Empty' in hover")
+	}
+	// "Empty" should NOT have parentheses since it has no fields
+	// "WithField" should have parentheses
+	if !strings.Contains(result, "WithFields(code, message)") {
+		t.Errorf("expected 'WithFields(code, message)' in hover, got: %s", result)
+	}
+}
+
+// TestHandleDefinitionEmptyWord covers the word == "" branch in handleDefinition.
+func TestHandleDefinitionEmptyWord(t *testing.T) {
+	server, output := newTestServer()
+	openDoc(server, output, "file:///test.luxo", "model User { }")
+	// Position on the space — empty word
+	resp := requestDefinition(server, output, "file:///test.luxo", Position{Line: 0, Character: 13})
+	if strings.Contains(resp, `"line"`) {
+		t.Error("expected null result for definition at empty word position")
+	}
+}
+
+// TestReadMessageZeroContentLength covers the Content-Length: 0 path.
+func TestReadMessageZeroContentLength(t *testing.T) {
+	input := "Content-Length: 0\r\n\r\n"
+	transport := NewTransport(strings.NewReader(input), io.Discard)
+	_, err := transport.ReadMessage()
+	if err == nil {
+		t.Error("expected error for Content-Length 0")
+	}
+	if !strings.Contains(err.Error(), "missing Content-Length") {
+		t.Errorf("expected 'missing Content-Length' error, got: %v", err)
+	}
+}
+
+// TestReadMessageHeaderReadError covers the header read error path.
+func TestReadMessageHeaderReadError(t *testing.T) {
+	// A reader that returns an error immediately
+	r := &errReader{err: fmt.Errorf("connection reset")}
+	transport := NewTransport(r, io.Discard)
+	_, err := transport.ReadMessage()
+	if err == nil {
+		t.Error("expected error from ReadMessage")
+	}
+	if !strings.Contains(err.Error(), "reading header") {
+		t.Errorf("expected 'reading header' in error, got: %v", err)
+	}
+}
+
+type errReader struct {
+	err error
+}
+
+func (e *errReader) Read(p []byte) (int, error) {
+	return 0, e.err
+}
+
+// TestReadMessageInvalidJSON covers JSON unmarshal error after valid Content-Length.
+func TestReadMessageInvalidJSON(t *testing.T) {
+	body := "not valid json!"
+	input := fmt.Sprintf("Content-Length: %d\r\n\r\n%s", len(body), body)
+	transport := NewTransport(strings.NewReader(input), io.Discard)
+	_, err := transport.ReadMessage()
+	if err == nil {
+		t.Error("expected error for invalid JSON body")
+	}
+	if !strings.Contains(err.Error(), "parsing JSON-RPC") {
+		t.Errorf("expected 'parsing JSON-RPC' in error, got: %v", err)
+	}
+}
+
+// TestTransportSendHeaderWriteError covers the header write error path in send().
+func TestTransportSendHeaderWriteError(t *testing.T) {
+	w := &errHeaderWriter{}
+	transport := NewTransport(strings.NewReader(""), w)
+	id := json.RawMessage(`1`)
+	err := transport.SendResponse(&id, "test")
+	if err == nil {
+		t.Error("expected error from header write")
+	}
+	if !strings.Contains(err.Error(), "header write error") {
+		t.Errorf("expected 'header write error', got: %v", err)
+	}
+}
+
+// TestTransportSendBodyWriteError covers the body write error path in send().
+func TestTransportSendBodyWriteError(t *testing.T) {
+	// Writer that succeeds on header (first call via io.WriteString) but fails on body write
+	w := &bodyErrWriter{}
+	transport := NewTransport(strings.NewReader(""), w)
+	id := json.RawMessage(`1`)
+	err := transport.SendResponse(&id, "test")
+	if err == nil {
+		t.Error("expected error from body write")
+	}
+	if !strings.Contains(err.Error(), "body write error") {
+		t.Errorf("expected 'body write error', got: %v", err)
+	}
+}
+
+type bodyErrWriter struct {
+	calls int
+}
+
+func (e *bodyErrWriter) Write(p []byte) (int, error) {
+	e.calls++
+	if e.calls == 1 {
+		// Header write succeeds
+		return len(p), nil
+	}
+	// Body write fails
+	return 0, fmt.Errorf("body write error")
+}
+
+func TestDiagnosticsFileFiltering(t *testing.T) {
+	store := NewDocumentStore()
+	store.Open("file:///main.luxo", 1, "model User { name: String }")
+	doc := store.Get("file:///main.luxo")
+
+	if doc.Result == nil {
+		t.Fatal("expected analysis result")
+	}
+
+	// Add semantic errors: one for this file, one for another file, one with empty file
+	doc.Result.Errors = append(doc.Result.Errors,
+		semantic.Error{
+			Pos:     token.Position{File: URIToPath("file:///main.luxo"), Line: 1, Col: 1},
+			Message: "error in main",
+		},
+		semantic.Error{
+			Pos:     token.Position{File: "/other.luxo", Line: 1, Col: 1},
+			Message: "error in other",
+		},
+		semantic.Error{
+			Pos:     token.Position{File: "", Line: 1, Col: 1},
+			Message: "error with empty file",
+		},
+	)
+	// Add warnings similarly
+	doc.Result.Warnings = append(doc.Result.Warnings,
+		semantic.Warning{
+			Pos:     token.Position{File: "/other.luxo", Line: 1, Col: 1},
+			Message: "warning in other",
+		},
+		semantic.Warning{
+			Pos:     token.Position{File: "", Line: 1, Col: 1},
+			Message: "warning with empty file",
+		},
+	)
+
+	diags := doc.Diagnostics()
+	for _, d := range diags {
+		if strings.Contains(d.Message, "error in other") {
+			t.Error("should filter out errors from other files")
+		}
+		if strings.Contains(d.Message, "warning in other") {
+			t.Error("should filter out warnings from other files")
+		}
+	}
+	// "error with empty file" should pass through (empty file matches the continue condition as false)
+	foundEmpty := false
+	foundMain := false
+	for _, d := range diags {
+		if strings.Contains(d.Message, "error with empty file") {
+			foundEmpty = true
+		}
+		if strings.Contains(d.Message, "error in main") {
+			foundMain = true
+		}
+	}
+	if !foundEmpty {
+		t.Error("expected error with empty file to pass through filter")
+	}
+	if !foundMain {
+		t.Error("expected error in main to be included")
+	}
+}

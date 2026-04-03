@@ -2027,3 +2027,158 @@ func TestResolveTypeRefNilDirect(t *testing.T) {
 		t.Errorf("expected TypeVoid, got %v", sym.Type.Kind)
 	}
 }
+
+// ========== Coverage Gap Tests ==========
+
+func TestResolveInheritanceNilType(t *testing.T) {
+	// Exercise the typ == nil guard in resolveInheritance (line 190).
+	// This happens when a model name appears in the AST but was never
+	// registered in a.types (e.g. name collision removed it).
+	a := New()
+	// Do NOT declare "Ghost" in a.types, but include it in the file's Models
+	// with a parent reference. resolveInheritance should skip it via continue.
+	file := &ast.File{
+		Models: []*ast.ModelDecl{
+			{
+				Name:    "Ghost",
+				Parents: []string{"Base"},
+			},
+		},
+	}
+	// Run only pass 2 (resolveInheritance) directly
+	a.resolveInheritance(file)
+	// No panic and no errors about "Ghost" itself (it was skipped)
+	if len(a.errors) > 0 {
+		t.Errorf("expected no errors for skipped nil type, got %v", a.errors)
+	}
+}
+
+func TestResolveFieldsNilModelType(t *testing.T) {
+	// Exercise the typ == nil guard in resolveFields for models (line 209).
+	a := New()
+	file := &ast.File{
+		Models: []*ast.ModelDecl{
+			{
+				Name: "Ghost",
+				Fields: []*ast.FieldDecl{
+					{Name: "x", Type: &ast.TypeRef{Name: "String"}},
+				},
+			},
+		},
+	}
+	a.resolveFields(file)
+	if len(a.errors) > 0 {
+		t.Errorf("expected no errors for skipped nil model, got %v", a.errors)
+	}
+}
+
+func TestResolveFieldsNilInterfaceType(t *testing.T) {
+	// Exercise the typ == nil guard in resolveFields for interfaces (line 227).
+	a := New()
+	file := &ast.File{
+		Interfaces: []*ast.InterfaceDecl{
+			{
+				Name: "Ghost",
+				Fields: []*ast.FieldDecl{
+					{Name: "x", Type: &ast.TypeRef{Name: "String"}},
+				},
+			},
+		},
+	}
+	a.resolveFields(file)
+	if len(a.errors) > 0 {
+		t.Errorf("expected no errors for skipped nil interface, got %v", a.errors)
+	}
+}
+
+func TestResolveFieldsNilCustomType(t *testing.T) {
+	// Exercise the typ == nil guard in resolveFields for custom types (line 240).
+	a := New()
+	file := &ast.File{
+		Types: []*ast.TypeDecl{
+			{
+				Name: "Ghost",
+				Fields: []*ast.FieldDecl{
+					{Name: "x", Type: &ast.TypeRef{Name: "String"}},
+				},
+			},
+		},
+	}
+	a.resolveFields(file)
+	if len(a.errors) > 0 {
+		t.Errorf("expected no errors for skipped nil custom type, got %v", a.errors)
+	}
+}
+
+func TestResolveFieldsNilApiSymbol(t *testing.T) {
+	// Exercise the sym == nil guard in resolveFields for apis (line 254).
+	a := New()
+	// Don't define the api in scope, but include it in the file
+	file := &ast.File{
+		APIs: []*ast.ApiDecl{
+			{
+				Name:       "ghostApi",
+				ReturnType: &ast.TypeRef{Name: "String"},
+			},
+		},
+	}
+	a.resolveFields(file)
+	if len(a.errors) > 0 {
+		t.Errorf("expected no errors for skipped nil api symbol, got %v", a.errors)
+	}
+}
+
+func TestResolveFieldsNilFnSymbol(t *testing.T) {
+	// Exercise the sym == nil guard in resolveFields for fns (line 269).
+	a := New()
+	// Don't define the fn in scope, but include it in the file
+	file := &ast.File{
+		Functions: []*ast.FnDecl{
+			{
+				Name:       "ghostFn",
+				ReturnType: &ast.TypeRef{Name: "String"},
+			},
+		},
+	}
+	a.resolveFields(file)
+	if len(a.errors) > 0 {
+		t.Errorf("expected no errors for skipped nil fn symbol, got %v", a.errors)
+	}
+}
+
+func TestExtendTargetNotFound(t *testing.T) {
+	// Exercise the extend target not found path (line 282-285).
+	// When extend references a type not in a.types, fields should
+	// still be validated.
+	result := analyze(t, `
+extend NonExistent {
+  field: String
+}
+`)
+	// No error for the missing target (it might be in another module),
+	// but the field type should be resolved without error.
+	for _, err := range result.Errors {
+		if strings.Contains(err.Message, "NonExistent") {
+			t.Errorf("should not error on extend target not found, got: %v", err)
+		}
+	}
+}
+
+func TestFnWithoutReturnType(t *testing.T) {
+	// fn with no return type annotation - exercises the fn.ReturnType == nil path
+	result := analyze(t, `
+fn doSomething(x: Int) {
+  val y = x * 2
+}
+`)
+	expectNoErrors(t, result)
+	sym := result.Scope.Lookup("doSomething")
+	if sym == nil {
+		t.Fatal("expected doSomething symbol")
+	}
+	// Without a return type, sym.Type should remain nil (not resolved to Void
+	// since the nil check skips resolveTypeRef)
+	if sym.Type != nil {
+		t.Logf("sym.Type = %v (expected nil since no return type annotation)", sym.Type)
+	}
+}

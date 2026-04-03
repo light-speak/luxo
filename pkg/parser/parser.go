@@ -1230,7 +1230,9 @@ func (p *Parser) expect(typ token.Type) token.Token {
 		return p.advance()
 	}
 	p.error("expected %s, got %s", typ, p.current().Type)
-	return p.current()
+	tok := p.current()
+	p.advance() // consume bad token to prevent infinite loop
+	return tok
 }
 
 func (p *Parser) expectIdent() string {
@@ -1238,6 +1240,7 @@ func (p *Parser) expectIdent() string {
 		return p.advance().Val
 	}
 	p.error("expected identifier, got %s", p.current().Type)
+	p.advance() // consume bad token to prevent infinite loop
 	return ""
 }
 
