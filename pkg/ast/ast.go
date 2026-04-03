@@ -16,6 +16,13 @@ type File struct {
 	Extends     []*ExtendDecl
 	Uses        []*UseDecl
 	Middlewares []*MiddlewareDecl
+	Imports     []*ImportDecl
+}
+
+// ImportDecl: import http
+type ImportDecl struct {
+	Pos    token.Position
+	Module string
 }
 
 // ========== Top-level Declarations ==========
@@ -158,6 +165,7 @@ type ParamDecl struct {
 	Name    string
 	Type    *TypeRef
 	Default Expr
+	Spread  bool // ...messages: String
 }
 
 // TypeRef: String, String?, [Post], Page<User>, (Post, Video, Product)
@@ -293,6 +301,24 @@ type TransactionExpr struct {
 	Body *Block
 }
 
+// YieldExpr: yield expr
+type YieldExpr struct {
+	Pos   token.Position
+	Value Expr
+}
+
+// AsyncExpr: async { ... }
+type AsyncExpr struct {
+	Pos  token.Position
+	Body *Block
+}
+
+// AwaitExpr: await { ... }
+type AwaitExpr struct {
+	Pos  token.Position
+	Body *Block
+}
+
 // ========== Statements ==========
 
 type Stmt interface {
@@ -342,6 +368,19 @@ type EmitStmt struct {
 	Args []*NamedArg
 }
 
+// AssignStmt: x = 2, x += 1
+type AssignStmt struct {
+	Pos    token.Position
+	Target Expr   // variable being assigned
+	Op     string // "=", "+=", "-=", "*=", "/=", "%="
+	Value  Expr
+}
+
+// BreakStmt: break
+type BreakStmt struct {
+	Pos token.Position
+}
+
 // ExprStmt: expression used as statement (function call, assignment, etc.)
 type ExprStmt struct {
 	Pos  token.Position
@@ -370,6 +409,10 @@ func (n *ObjectExpr) exprNode()      {}
 func (n *TemplateString) exprNode()  {}
 func (n *RangeExpr) exprNode()       {}
 func (n *TransactionExpr) exprNode() {}
+func (n *YieldExpr) exprNode()       {}
+func (n *AsyncExpr) exprNode()       {}
+func (n *AwaitExpr) exprNode()       {}
+func (n *ForStmt) exprNode()         {} // for can be used as expression
 
 func (n *ValStmt) stmtNode()    {}
 func (n *IfStmt) stmtNode()     {}
@@ -377,6 +420,8 @@ func (n *ForStmt) stmtNode()    {}
 func (n *ReturnStmt) stmtNode() {}
 func (n *ThrowStmt) stmtNode()  {}
 func (n *EmitStmt) stmtNode()   {}
+func (n *AssignStmt) stmtNode() {}
+func (n *BreakStmt) stmtNode()  {}
 func (n *ExprStmt) stmtNode()   {}
 
 func (n *Literal) GetPos() token.Position         { return n.Pos }
@@ -393,6 +438,9 @@ func (n *ObjectExpr) GetPos() token.Position      { return n.Pos }
 func (n *TemplateString) GetPos() token.Position  { return n.Pos }
 func (n *RangeExpr) GetPos() token.Position       { return n.Pos }
 func (n *TransactionExpr) GetPos() token.Position { return n.Pos }
+func (n *YieldExpr) GetPos() token.Position       { return n.Pos }
+func (n *AsyncExpr) GetPos() token.Position       { return n.Pos }
+func (n *AwaitExpr) GetPos() token.Position       { return n.Pos }
 
 func (n *ValStmt) GetPos() token.Position    { return n.Pos }
 func (n *IfStmt) GetPos() token.Position     { return n.Pos }
@@ -400,4 +448,6 @@ func (n *ForStmt) GetPos() token.Position    { return n.Pos }
 func (n *ReturnStmt) GetPos() token.Position { return n.Pos }
 func (n *ThrowStmt) GetPos() token.Position  { return n.Pos }
 func (n *EmitStmt) GetPos() token.Position   { return n.Pos }
+func (n *AssignStmt) GetPos() token.Position { return n.Pos }
+func (n *BreakStmt) GetPos() token.Position  { return n.Pos }
 func (n *ExprStmt) GetPos() token.Position   { return n.Pos }

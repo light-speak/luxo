@@ -84,8 +84,9 @@ func TestOperators(t *testing.T) {
 func TestKeywords(t *testing.T) {
 	input := `model interface enum sealed type fn api error middleware
 extend override use through stream
-val when if else for in return is
-find create update delete transaction emit throw
+val when if else for in return break is
+async await yield import
+throw
 true false null`
 
 	l := New(input, "test.luxo")
@@ -651,4 +652,155 @@ func TestAdvanceBeyondEnd(t *testing.T) {
 	if tokens[0].Type != token.EOF {
 		t.Errorf("expected EOF, got %s", tokens[0].Type)
 	}
+}
+
+func TestCompoundAssignment(t *testing.T) {
+	input := `+= -= *= /= %=`
+	expected := []struct {
+		typ token.Type
+		val string
+	}{
+		{token.PlusAssign, "+="},
+		{token.MinusAssign, "-="},
+		{token.StarAssign, "*="},
+		{token.SlashAssign, "/="},
+		{token.PercentAssign, "%="},
+		{token.EOF, ""},
+	}
+
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if len(tokens) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d", len(expected), len(tokens))
+	}
+
+	for i, exp := range expected {
+		if tokens[i].Type != exp.typ {
+			t.Errorf("token[%d]: expected type %s, got %s", i, exp.typ, tokens[i].Type)
+		}
+		if tokens[i].Val != exp.val {
+			t.Errorf("token[%d]: expected val %q, got %q", i, exp.val, tokens[i].Val)
+		}
+	}
+}
+
+func TestChanSend(t *testing.T) {
+	input := `<-`
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if tokens[0].Type != token.ChanSend {
+		t.Errorf("expected ChanSend, got %s (%q)", tokens[0].Type, tokens[0].Val)
+	}
+	if tokens[0].Val != "<-" {
+		t.Errorf("expected val %q, got %q", "<-", tokens[0].Val)
+	}
+}
+
+func TestChanSendVsLte(t *testing.T) {
+	input := `<= <-`
+	expected := []struct {
+		typ token.Type
+		val string
+	}{
+		{token.Lte, "<="},
+		{token.ChanSend, "<-"},
+		{token.EOF, ""},
+	}
+
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if len(tokens) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d", len(expected), len(tokens))
+	}
+
+	for i, exp := range expected {
+		if tokens[i].Type != exp.typ {
+			t.Errorf("token[%d]: expected type %s, got %s", i, exp.typ, tokens[i].Type)
+		}
+		if tokens[i].Val != exp.val {
+			t.Errorf("token[%d]: expected val %q, got %q", i, exp.val, tokens[i].Val)
+		}
+	}
+}
+
+func TestDotDotDot(t *testing.T) {
+	input := `...`
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if tokens[0].Type != token.DotDotDot {
+		t.Errorf("expected DotDotDot, got %s (%q)", tokens[0].Type, tokens[0].Val)
+	}
+	if tokens[0].Val != "..." {
+		t.Errorf("expected val %q, got %q", "...", tokens[0].Val)
+	}
+}
+
+func TestDotDotDotVsDotDot(t *testing.T) {
+	input := `.. ...`
+	expected := []struct {
+		typ token.Type
+		val string
+	}{
+		{token.DotDot, ".."},
+		{token.DotDotDot, "..."},
+		{token.EOF, ""},
+	}
+
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if len(tokens) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d", len(expected), len(tokens))
+	}
+
+	for i, exp := range expected {
+		if tokens[i].Type != exp.typ {
+			t.Errorf("token[%d]: expected type %s, got %s", i, exp.typ, tokens[i].Type)
+		}
+		if tokens[i].Val != exp.val {
+			t.Errorf("token[%d]: expected val %q, got %q", i, exp.val, tokens[i].Val)
+		}
+	}
+}
+
+func TestPeekAtBeyondSource(t *testing.T) {
+	l := New("a", "test.luxo")
+	l.Tokenize()
+	// pos is now past end, directly call peekAt
+	r := l.peekAt(0)
+	if r != 0 {
+		t.Errorf("expected 0, got %c", r)
+	}
+	r = l.peekAt(100)
+	if r != 0 {
+		t.Errorf("expected 0, got %c", r)
+	}
+}
+
+func TestAdvanceBeyondSource(t *testing.T) {
+	l := New("a", "test.luxo")
+	l.Tokenize()
+	// pos is now past end, advance should be no-op
+	l.advance()
+	l.advance()
+	// no panic = pass
 }

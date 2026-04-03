@@ -72,19 +72,36 @@ type SealedVariantInfo struct {
 	Fields []*FieldInfo
 }
 
-// BuiltinTypes returns the built-in primitive types.
+// BuiltinTypes returns the built-in primitive types with their properties.
 func BuiltinTypes() map[string]*ResolvedType {
+	intType := &ResolvedType{Kind: TypeInt, Name: "Int", Fields: map[string]*FieldInfo{}}
+	floatType := &ResolvedType{Kind: TypeFloat, Name: "Float", Fields: map[string]*FieldInfo{}}
+	boolType := &ResolvedType{Kind: TypeBool, Name: "Boolean", Fields: map[string]*FieldInfo{}}
+
+	stringType := &ResolvedType{Kind: TypeString, Name: "String", Fields: map[string]*FieldInfo{
+		"length":    {Name: "length", Type: intType},
+		"isEmpty":   {Name: "isEmpty", Type: boolType},
+		"lowercase": {Name: "lowercase", Type: nil}, // returns String (self-ref resolved later)
+		"uppercase": {Name: "uppercase", Type: nil},
+		"trim":      {Name: "trim", Type: nil},
+		"size":      {Name: "size", Type: intType},
+	}}
+	// self-reference for string methods that return String
+	stringType.Fields["lowercase"].Type = stringType
+	stringType.Fields["uppercase"].Type = stringType
+	stringType.Fields["trim"].Type = stringType
+
 	return map[string]*ResolvedType{
-		"Int":      {Kind: TypeInt, Name: "Int"},
-		"Float":    {Kind: TypeFloat, Name: "Float"},
-		"String":   {Kind: TypeString, Name: "String"},
-		"Boolean":  {Kind: TypeBool, Name: "Boolean"},
-		"Bool":     {Kind: TypeBool, Name: "Bool"},
-		"DateTime": {Kind: TypeDateTime, Name: "DateTime"},
-		"Duration": {Kind: TypeDuration, Name: "Duration"},
-		"Json":     {Kind: TypeJson, Name: "Json"},
-		"File":     {Kind: TypeFile, Name: "File"},
-		"Void":     {Kind: TypeVoid, Name: "Void"},
+		"Int":      intType,
+		"Float":    floatType,
+		"String":   stringType,
+		"Boolean":  boolType,
+		"Bool":     boolType,
+		"DateTime": {Kind: TypeDateTime, Name: "DateTime", Fields: map[string]*FieldInfo{}},
+		"Duration": {Kind: TypeDuration, Name: "Duration", Fields: map[string]*FieldInfo{}},
+		"Json":     {Kind: TypeJson, Name: "Json", Fields: map[string]*FieldInfo{}},
+		"File":     {Kind: TypeFile, Name: "File", Fields: map[string]*FieldInfo{}},
+		"Void":     {Kind: TypeVoid, Name: "Void", Fields: map[string]*FieldInfo{}},
 	}
 }
 

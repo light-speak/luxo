@@ -24,6 +24,10 @@ func TestExprGetPos(t *testing.T) {
 		&TemplateString{Pos: pos},
 		&RangeExpr{Pos: pos},
 		&TransactionExpr{Pos: pos},
+		&YieldExpr{Pos: pos},
+		&AsyncExpr{Pos: pos},
+		&AwaitExpr{Pos: pos},
+		&ForStmt{Pos: pos},
 	}
 
 	for _, e := range exprs {
@@ -45,6 +49,8 @@ func TestStmtGetPos(t *testing.T) {
 		&ThrowStmt{Pos: pos},
 		&EmitStmt{Pos: pos},
 		&ExprStmt{Pos: pos},
+		&AssignStmt{Pos: pos},
+		&BreakStmt{Pos: pos},
 	}
 
 	for _, s := range stmts {
@@ -62,6 +68,7 @@ func TestExprNodeInterface(t *testing.T) {
 		&BinaryExpr{}, &UnaryExpr{}, &ElvisExpr{}, &WhenExpr{},
 		&LambdaExpr{}, &ListExpr{}, &ObjectExpr{}, &TemplateString{},
 		&RangeExpr{}, &TransactionExpr{},
+		&YieldExpr{}, &AsyncExpr{}, &AwaitExpr{}, &ForStmt{},
 	}
 	for _, e := range exprs {
 		e.exprNode() // just ensure it compiles and doesn't panic
@@ -72,6 +79,7 @@ func TestStmtNodeInterface(t *testing.T) {
 	stmts := []Stmt{
 		&ValStmt{}, &IfStmt{}, &ForStmt{},
 		&ReturnStmt{}, &ThrowStmt{}, &EmitStmt{}, &ExprStmt{},
+		&AssignStmt{}, &BreakStmt{},
 	}
 	for _, s := range stmts {
 		s.stmtNode()

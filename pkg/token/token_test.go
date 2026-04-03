@@ -44,8 +44,15 @@ func TestTypeStringKnown(t *testing.T) {
 		{Or, "||"},
 		{Arrow, "->"},
 		{DotDot, ".."},
+		{DotDotDot, "..."},
 		{Elvis, "?:"},
 		{SafeDot, "?."},
+		{ChanSend, "<-"},
+		{PlusAssign, "+="},
+		{MinusAssign, "-="},
+		{StarAssign, "*="},
+		{SlashAssign, "/="},
+		{PercentAssign, "%="},
 		{Model, "model"},
 		{Interface, "interface"},
 		{Enum, "enum"},
@@ -67,13 +74,12 @@ func TestTypeStringKnown(t *testing.T) {
 		{For, "for"},
 		{In, "in"},
 		{Return, "return"},
+		{Break, "break"},
 		{Is, "is"},
-		{Find, "find"},
-		{Create, "create"},
-		{Update, "update"},
-		{Delete, "delete"},
-		{Transaction, "transaction"},
-		{Emit, "emit"},
+		{Async, "async"},
+		{Await, "await"},
+		{Yield, "yield"},
+		{Import, "import"},
 		{Throw, "throw"},
 		{True, "true"},
 		{False, "false"},
@@ -106,8 +112,8 @@ func TestLookupKeywordFound(t *testing.T) {
 		"override": Override, "use": Use, "through": Through,
 		"stream": Stream, "val": Val, "when": When, "if": If,
 		"else": Else, "for": For, "in": In, "return": Return,
-		"is": Is, "find": Find, "create": Create, "update": Update,
-		"delete": Delete, "transaction": Transaction, "emit": Emit,
+		"break": Break, "is": Is, "async": Async, "await": Await,
+		"yield": Yield, "import": Import,
 		"throw": Throw, "true": True, "false": False, "null": Null,
 	}
 	for kw, want := range keywords {
@@ -119,7 +125,7 @@ func TestLookupKeywordFound(t *testing.T) {
 }
 
 func TestLookupKeywordNotFound(t *testing.T) {
-	nonKeywords := []string{"foo", "bar", "User", "xyz", ""}
+	nonKeywords := []string{"foo", "bar", "User", "xyz", "", "find", "create", "update", "delete", "transaction", "emit"}
 	for _, s := range nonKeywords {
 		got := LookupKeyword(s)
 		if got != Ident {
@@ -133,8 +139,9 @@ func TestIsKeyword(t *testing.T) {
 	keywordTypes := []Type{
 		Model, Interface, Enum, Sealed, KwType, Fn, Api, Error,
 		Middleware, Extend, Override, Use, Through, Stream,
-		Val, When, If, Else, For, In, Return, Is,
-		Find, Create, Update, Delete, Transaction, Emit, Throw,
+		Val, When, If, Else, For, In, Return, Break, Is,
+		Async, Await, Yield, Import,
+		Throw,
 		True, False, Null,
 	}
 	for _, tt := range keywordTypes {

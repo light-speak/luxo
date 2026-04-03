@@ -32,25 +32,32 @@ const (
 	Question // ?
 
 	// Operators
-	Assign  // =
-	Plus    // +
-	Minus   // -
-	Star    // *
-	Slash   // /
-	Percent // %
-	Bang    // !
-	Eq      // ==
-	Neq     // !=
-	Gt      // >
-	Gte     // >=
-	Lt      // <
-	Lte     // <=
-	And     // &&
-	Or      // ||
-	Arrow   // ->
-	DotDot  // ..
-	Elvis   // ?:
-	SafeDot // ?.
+	Assign        // =
+	Plus          // +
+	Minus         // -
+	Star          // *
+	Slash         // /
+	Percent       // %
+	Bang          // !
+	Eq            // ==
+	Neq           // !=
+	Gt            // >
+	Gte           // >=
+	Lt            // <
+	Lte           // <=
+	And           // &&
+	Or            // ||
+	Arrow         // ->
+	DotDot        // ..
+	DotDotDot     // ...
+	Elvis         // ?:
+	SafeDot       // ?.
+	ChanSend      // <-
+	PlusAssign    // +=
+	MinusAssign   // -=
+	StarAssign    // *=
+	SlashAssign   // /=
+	PercentAssign // %=
 
 	// Keywords - Definitions
 	kwStart
@@ -79,16 +86,19 @@ const (
 	For    // for
 	In     // in
 	Return // return
+	Break  // break
 	Is     // is
 
+	// Keywords - Concurrency
+	Async // async
+	Await // await
+	Yield // yield
+
+	// Keywords - Modules
+	Import // import
+
 	// Keywords - Operations
-	Find        // find
-	Create      // create
-	Update      // update
-	Delete      // delete
-	Transaction // transaction
-	Emit        // emit
-	Throw       // throw
+	Throw // throw
 
 	// Keywords - Constants
 	True  // true
@@ -121,58 +131,64 @@ var tokenNames = map[Type]string{
 	At:       "@",
 	Question: "?",
 
-	Assign:  "=",
-	Plus:    "+",
-	Minus:   "-",
-	Star:    "*",
-	Slash:   "/",
-	Percent: "%",
-	Bang:    "!",
-	Eq:      "==",
-	Neq:     "!=",
-	Gt:      ">",
-	Gte:     ">=",
-	Lt:      "<",
-	Lte:     "<=",
-	And:     "&&",
-	Or:      "||",
-	Arrow:   "->",
-	DotDot:  "..",
-	Elvis:   "?:",
-	SafeDot: "?.",
+	Assign:        "=",
+	Plus:          "+",
+	Minus:         "-",
+	Star:          "*",
+	Slash:         "/",
+	Percent:       "%",
+	Bang:          "!",
+	Eq:            "==",
+	Neq:           "!=",
+	Gt:            ">",
+	Gte:           ">=",
+	Lt:            "<",
+	Lte:           "<=",
+	And:           "&&",
+	Or:            "||",
+	Arrow:         "->",
+	DotDot:        "..",
+	DotDotDot:     "...",
+	Elvis:         "?:",
+	SafeDot:       "?.",
+	ChanSend:      "<-",
+	PlusAssign:    "+=",
+	MinusAssign:   "-=",
+	StarAssign:    "*=",
+	SlashAssign:   "/=",
+	PercentAssign: "%=",
 
-	Model:       "model",
-	Interface:   "interface",
-	Enum:        "enum",
-	Sealed:      "sealed",
-	KwType:      "type",
-	Fn:          "fn",
-	Api:         "api",
-	Error:       "error",
-	Middleware:  "middleware",
-	Extend:      "extend",
-	Override:    "override",
-	Use:         "use",
-	Through:     "through",
-	Stream:      "stream",
-	Val:         "val",
-	When:        "when",
-	If:          "if",
-	Else:        "else",
-	For:         "for",
-	In:          "in",
-	Return:      "return",
-	Is:          "is",
-	Find:        "find",
-	Create:      "create",
-	Update:      "update",
-	Delete:      "delete",
-	Transaction: "transaction",
-	Emit:        "emit",
-	Throw:       "throw",
-	True:        "true",
-	False:       "false",
-	Null:        "null",
+	Model:      "model",
+	Interface:  "interface",
+	Enum:       "enum",
+	Sealed:     "sealed",
+	KwType:     "type",
+	Fn:         "fn",
+	Api:        "api",
+	Error:      "error",
+	Middleware: "middleware",
+	Extend:     "extend",
+	Override:   "override",
+	Use:        "use",
+	Through:    "through",
+	Stream:     "stream",
+	Val:        "val",
+	When:       "when",
+	If:         "if",
+	Else:       "else",
+	For:        "for",
+	In:         "in",
+	Return:     "return",
+	Break:      "break",
+	Is:         "is",
+	Async:      "async",
+	Await:      "await",
+	Yield:      "yield",
+	Import:     "import",
+	Throw:      "throw",
+	True:       "true",
+	False:      "false",
+	Null:       "null",
 }
 
 func (t Type) String() string {
@@ -183,38 +199,37 @@ func (t Type) String() string {
 }
 
 var keywords = map[string]Type{
-	"model":       Model,
-	"interface":   Interface,
-	"enum":        Enum,
-	"sealed":      Sealed,
-	"type":        KwType,
-	"fn":          Fn,
-	"api":         Api,
-	"error":       Error,
-	"middleware":  Middleware,
-	"extend":      Extend,
-	"override":    Override,
-	"use":         Use,
-	"through":     Through,
-	"stream":      Stream,
-	"val":         Val,
-	"when":        When,
-	"if":          If,
-	"else":        Else,
-	"for":         For,
-	"in":          In,
-	"return":      Return,
-	"is":          Is,
-	"find":        Find,
-	"create":      Create,
-	"update":      Update,
-	"delete":      Delete,
-	"transaction": Transaction,
-	"emit":        Emit,
-	"throw":       Throw,
-	"true":        True,
-	"false":       False,
-	"null":        Null,
+	"model":      Model,
+	"interface":  Interface,
+	"enum":       Enum,
+	"sealed":     Sealed,
+	"type":       KwType,
+	"fn":         Fn,
+	"api":        Api,
+	"error":      Error,
+	"middleware": Middleware,
+	"extend":     Extend,
+	"override":   Override,
+	"use":        Use,
+	"through":    Through,
+	"stream":     Stream,
+	"val":        Val,
+	"when":       When,
+	"if":         If,
+	"else":       Else,
+	"for":        For,
+	"in":         In,
+	"return":     Return,
+	"break":      Break,
+	"is":         Is,
+	"async":      Async,
+	"await":      Await,
+	"yield":      Yield,
+	"import":     Import,
+	"throw":      Throw,
+	"true":       True,
+	"false":      False,
+	"null":       Null,
 }
 
 // LookupKeyword returns the keyword token type for the given identifier,

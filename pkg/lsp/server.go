@@ -200,6 +200,9 @@ func (s *Server) getCompletions(doc *Document, pos Position) []CompletionItem {
 	// keyword completions
 	items = append(items, getKeywordCompletions(prefix)...)
 
+	// built-in function completions
+	items = append(items, getBuiltinFunctionCompletions(prefix)...)
+
 	// type and symbol completions from analysis
 	if doc.Result != nil && doc.Result.Scope != nil {
 		items = append(items, s.getSymbolCompletions(doc, prefix)...)
@@ -452,12 +455,6 @@ func getKeywordCompletions(prefix string) []CompletionItem {
 		{"for", "for loop", "for ${1:item} in ${2:collection} {\n\t$0\n}"},
 		{"return", "return", "return $0"},
 		{"throw", "throw error", "throw error.$0"},
-		{"emit", "emit event", "emit(\"$1\", $0)"},
-		{"transaction", "transaction block", "transaction {\n\t$0\n}"},
-		{"find", "find records", "find(${1:Model}, ${2:where: condition})"},
-		{"create", "create record", "create(${1:Model}, ${2:field: value})"},
-		{"update", "update record", "update(${1:record}, ${2:field: value})"},
-		{"delete", "delete record", "delete(${1:record})"},
 		{"use", "import module", "use ${1:module}.{ $0 }"},
 		{"override", "override api", "override api $0"},
 		{"true", "boolean true", ""},
@@ -475,6 +472,41 @@ func getKeywordCompletions(prefix string) []CompletionItem {
 			}
 			if kw.snippet != "" {
 				item.InsertText = kw.snippet
+				item.Kind = 15 // Snippet
+			}
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func getBuiltinFunctionCompletions(prefix string) []CompletionItem {
+	builtins := []struct {
+		label, detail, snippet string
+	}{
+		{"find", "find records", "find(${1:Model}, ${2:where: condition})"},
+		{"create", "create record", "create(${1:Model}, ${2:field: value})"},
+		{"update", "update record", "update(${1:record}, ${2:field: value})"},
+		{"delete", "delete record", "delete(${1:record})"},
+		{"emit", "emit event", "emit(\"$1\", $0)"},
+		{"transaction", "transaction block", "transaction {\n\t$0\n}"},
+		{"log", "log output", "log($0)"},
+		{"cache", "cache operation", "cache($0)"},
+		{"storage", "storage operation", "storage($0)"},
+		{"mail", "send mail", "mail($0)"},
+		{"task", "async task", "task($0)"},
+	}
+
+	var items []CompletionItem
+	for _, fn := range builtins {
+		if prefix == "" || strings.HasPrefix(fn.label, prefix) {
+			item := CompletionItem{
+				Label:  fn.label,
+				Kind:   3, // Function
+				Detail: "built-in: " + fn.detail,
+			}
+			if fn.snippet != "" {
+				item.InsertText = fn.snippet
 				item.Kind = 15 // Snippet
 			}
 			items = append(items, item)
@@ -527,6 +559,13 @@ func (s *Server) handleHover(req *Request) error {
 	if sym := doc.Result.Scope.Lookup(word); sym != nil {
 		return s.transport.SendResponse(req.ID, Hover{
 			Contents: MarkupContent{Kind: "markdown", Value: formatSymbolHover(sym)},
+		})
+	}
+
+	// built-in function hover
+	if desc := builtinFunctionDescription(word); desc != "" {
+		return s.transport.SendResponse(req.ID, Hover{
+			Contents: MarkupContent{Kind: "markdown", Value: desc},
 		})
 	}
 
@@ -618,36 +657,47 @@ func formatSymbolHover(sym *semantic.Symbol) string {
 
 func keywordDescription(word string) string {
 	descriptions := map[string]string{
-		"model":       "`model` — Define a data model, maps to database table\n\n定义数据模型，映射到数据库表",
-		"interface":   "`interface` — Define an interface with optional default implementations\n\n定义接口，可带默认实现",
-		"enum":        "`enum` — Define an enumeration type\n\n定义枚举类型",
-		"sealed":      "`sealed` — Define a sealed type, `when` must be exhaustive\n\n定义密封类型，`when` 必须穷举",
-		"type":        "`type` — Define a custom type or generic type\n\n定义自定义类型或泛型类型",
-		"api":         "`api` — Define an API endpoint\n\n定义 API 接口",
-		"fn":          "`fn` — Define a function\n\n定义函数",
-		"val":         "`val` — Declare an immutable variable\n\n定义不可变变量",
-		"when":        "`when` — Pattern matching expression\n\n模式匹配表达式",
-		"if":          "`if` — Conditional statement\n\n条件判断语句",
-		"else":        "`else` — Else branch of if statement\n\nif 语句的 else 分支",
-		"for":         "`for` — Loop over a collection\n\n遍历集合",
-		"in":          "`in` — Used in for loops and range checks\n\n用于 for 循环和范围检查",
-		"return":      "`return` — Early return from function (last expression is implicit return)\n\n提前返回（最后一行表达式自动返回）",
-		"find":        "`find` — Query database records\n\n查询数据库记录",
-		"create":      "`create` — Create a database record\n\n创建数据库记录",
-		"update":      "`update` — Update a database record\n\n更新数据库记录",
-		"delete":      "`delete` — Delete a database record\n\n删除数据库记录",
-		"transaction": "`transaction` — Database transaction, all-or-nothing\n\n数据库事务，全成功或全回滚",
-		"emit":        "`emit` — Send async event (message queue + WebSocket)\n\n发送异步事件（消息队列 + WebSocket）",
-		"throw":       "`throw` — Throw an error\n\n抛出错误",
-		"extend":      "`extend` — Extend a type across modules (gateway aggregation)\n\n跨模块扩展类型（网关聚合）",
-		"use":         "`use` — Import from a shared module\n\n从共享模块导入",
-		"override":    "`override` — Override an auto-generated API implementation\n\n覆盖自动生成的 API 实现",
-		"stream":      "`stream` — Server push via WebSocket\n\n通过 WebSocket 流式推送",
-		"through":     "`through` — Many-to-many with explicit join table\n\n多对多显式中间表",
-		"is":          "`is` — Type check in `when` branches\n\n`when` 分支中的类型匹配",
-		"null":        "`null` — Null value\n\n空值",
-		"true":        "`true` — Boolean true\n\n布尔真",
-		"false":       "`false` — Boolean false\n\n布尔假",
+		"model":     "`model` — Define a data model, maps to database table\n\n定义数据模型，映射到数据库表",
+		"interface": "`interface` — Define an interface with optional default implementations\n\n定义接口，可带默认实现",
+		"enum":      "`enum` — Define an enumeration type\n\n定义枚举类型",
+		"sealed":    "`sealed` — Define a sealed type, `when` must be exhaustive\n\n定义密封类型，`when` 必须穷举",
+		"type":      "`type` — Define a custom type or generic type\n\n定义自定义类型或泛型类型",
+		"api":       "`api` — Define an API endpoint\n\n定义 API 接口",
+		"fn":        "`fn` — Define a function\n\n定义函数",
+		"val":       "`val` — Declare an immutable variable\n\n定义不可变变量",
+		"when":      "`when` — Pattern matching expression\n\n模式匹配表达式",
+		"if":        "`if` — Conditional statement\n\n条件判断语句",
+		"else":      "`else` — Else branch of if statement\n\nif 语句的 else 分支",
+		"for":       "`for` — Loop over a collection\n\n遍历集合",
+		"in":        "`in` — Used in for loops and range checks\n\n用于 for 循环和范围检查",
+		"return":    "`return` — Early return from function (last expression is implicit return)\n\n提前返回（最后一行表达式自动返回）",
+		"throw":     "`throw` — Throw an error\n\n抛出错误",
+		"extend":    "`extend` — Extend a type across modules (gateway aggregation)\n\n跨模块扩展类型（网关聚合）",
+		"use":       "`use` — Import from a shared module\n\n从共享模块导入",
+		"override":  "`override` — Override an auto-generated API implementation\n\n覆盖自动生成的 API 实现",
+		"stream":    "`stream` — Server push via WebSocket\n\n通过 WebSocket 流式推送",
+		"through":   "`through` — Many-to-many with explicit join table\n\n多对多显式中间表",
+		"is":        "`is` — Type check in `when` branches\n\n`when` 分支中的类型匹配",
+		"null":      "`null` — Null value\n\n空值",
+		"true":      "`true` — Boolean true\n\n布尔真",
+		"false":     "`false` — Boolean false\n\n布尔假",
+	}
+	return descriptions[word]
+}
+
+func builtinFunctionDescription(word string) string {
+	descriptions := map[string]string{
+		"find":        "`find(Model, ...)` — Query database records\n\n查询数据库记录",
+		"create":      "`create(Model, ...)` — Create a database record\n\n创建数据库记录",
+		"update":      "`update(record, ...)` — Update a database record\n\n更新数据库记录",
+		"delete":      "`delete(record)` — Delete a database record\n\n删除数据库记录",
+		"transaction": "`transaction { ... }` — Database transaction, all-or-nothing\n\n数据库事务，全成功或全回滚",
+		"emit":        "`emit(event, ...)` — Send async event (message queue + WebSocket)\n\n发送异步事件（消息队列 + WebSocket）",
+		"log":         "`log(...)` — Log output\n\n日志输出",
+		"cache":       "`cache(...)` — Cache operation\n\n缓存操作",
+		"storage":     "`storage(...)` — Storage operation\n\n存储操作",
+		"mail":        "`mail(...)` — Send mail\n\n发送邮件",
+		"task":        "`task(...)` — Async task\n\n异步任务",
 	}
 	return descriptions[word]
 }

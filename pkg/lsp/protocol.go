@@ -17,7 +17,7 @@ type Request struct {
 type Response struct {
 	JSONRPC string           `json:"jsonrpc"`
 	ID      *json.RawMessage `json:"id"`
-	Result  any              `json:"result,omitempty"`
+	Result  any              `json:"result"`
 	Error   *RespError       `json:"error,omitempty"`
 }
 

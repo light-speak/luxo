@@ -125,6 +125,12 @@ func (a *Analyzer) collectDeclarations(file *ast.File) {
 	}
 	for _, t := range file.Types {
 		a.declareType(t.Name, TypeCustom, t.Pos, t.Doc)
+		// register generic type params (T, K, V, etc.) as types
+		for _, tp := range t.TypeParams {
+			if _, exists := a.types[tp]; !exists {
+				a.types[tp] = &ResolvedType{Kind: TypeGeneric, Name: tp, Fields: make(map[string]*FieldInfo)}
+			}
+		}
 	}
 	for _, api := range file.APIs {
 		a.scope.Define(&Symbol{
@@ -162,7 +168,7 @@ func (a *Analyzer) collectDeclarations(file *ast.File) {
 
 func (a *Analyzer) declareType(name string, kind TypeKind, pos token.Position, doc string) *ResolvedType {
 	if _, exists := a.types[name]; exists {
-		a.addError(pos, "type '%s' already declared", name)
+		a.addError(pos, "type '%s' already declared / 类型 '%s' 已声明", name, name)
 		return nil
 	}
 	typ := &ResolvedType{
@@ -193,7 +199,7 @@ func (a *Analyzer) resolveInheritance(file *ast.File) {
 		for _, parentName := range m.Parents {
 			parent, ok := a.types[parentName]
 			if !ok {
-				a.addErrorWithSuggestion(m.Pos, parentName, "type '%s' not found", parentName)
+				a.addErrorWithSuggestion(m.Pos, parentName, "type '%s' not found / 类型 '%s' 未找到", parentName, parentName)
 				continue
 			}
 			typ.Parents = append(typ.Parents, parent)
@@ -225,7 +231,7 @@ func (a *Analyzer) resolveModelFields(file *ast.File) {
 			fi := a.resolveFieldDecl(f)
 			if fi != nil {
 				if _, exists := typ.Fields[fi.Name]; exists {
-					a.addError(f.Pos, "duplicate field '%s' in model '%s'", fi.Name, m.Name)
+					a.addError(f.Pos, "duplicate field '%s' in model '%s' / 模型 '%s' 中字段 '%s' 重复", fi.Name, m.Name, m.Name, fi.Name)
 					continue
 				}
 				typ.Fields[fi.Name] = fi
@@ -359,14 +365,14 @@ func (a *Analyzer) resolveTypeRef(ref *ast.TypeRef, pos token.Position) *Resolve
 
 	// Stream type: strip "stream " prefix
 	name := ref.Name
-	if strings.HasPrefix(name, "stream ") {
-		name = strings.TrimPrefix(name, "stream ")
+	if after, ok := strings.CutPrefix(name, "stream "); ok {
+		name = after
 	}
 
 	// Look up the type
 	typ, ok := a.types[name]
 	if !ok {
-		a.addErrorWithSuggestion(pos, name, "unknown type '%s'", name)
+		a.addErrorWithSuggestion(pos, name, "unknown type '%s' / 未知类型 '%s'", name, name)
 		return &ResolvedType{Kind: TypeUnknown, Name: name, Nullable: ref.Nullable}
 	}
 
@@ -574,7 +580,7 @@ func (a *Analyzer) checkIdentExpr(e *ast.Ident, scope *Scope) *ResolvedType {
 	if isBuiltinOp(e.Name) {
 		return nil
 	}
-	a.addErrorWithSuggestion(e.Pos, e.Name, "undefined: '%s'", e.Name)
+	a.addErrorWithSuggestion(e.Pos, e.Name, "undefined: '%s' / 未定义: '%s'", e.Name, e.Name)
 	return nil
 }
 
@@ -585,7 +591,12 @@ func (a *Analyzer) checkMemberExpr(e *ast.MemberExpr, scope *Scope) *ResolvedTyp
 	}
 
 	if e.SafeCall && !objType.Nullable {
-		a.addWarning(e.Pos, "unnecessary safe call (?.) on non-null type '%s'", objType.Name)
+		a.addWarning(e.Pos, "unnecessary safe call (?.) on non-null type '%s' / 对非空类型 '%s' 使用了不必要的安全调用 (?.)", objType.Name, objType.Name)
+	}
+
+	// collection methods on list types
+	if objType.IsList && isCollectionMethod(e.Field) {
+		return a.resolveCollectionMethod(e.Field, objType)
 	}
 
 	field := objType.LookupField(e.Field)
@@ -611,17 +622,86 @@ func (a *Analyzer) checkMemberExpr(e *ast.MemberExpr, scope *Scope) *ResolvedTyp
 
 func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
 	a.checkExpr(e.Func, scope)
-	for _, arg := range e.Args {
-		a.checkExpr(arg.Value, scope)
+
+	// for find/create/update/delete, inject model fields into scope
+	// so that `find(User, where: email == input.email)` resolves `email`
+	callScope := scope
+	if ident, ok := e.Func.(*ast.Ident); ok && isCRUDOp(ident.Name) {
+		callScope = scope.Child()
+		if len(e.Args) > 0 {
+			if modelIdent, ok := e.Args[0].Value.(*ast.Ident); ok {
+				if modelType, ok := a.types[modelIdent.Name]; ok {
+					for fieldName, field := range modelType.Fields {
+						callScope.Define(&Symbol{
+							Name: fieldName,
+							Kind: SymField,
+							Type: field.Type,
+						})
+					}
+					// also inject inherited fields
+					for _, parent := range modelType.Parents {
+						for fieldName, field := range parent.Fields {
+							callScope.Define(&Symbol{
+								Name: fieldName,
+								Kind: SymField,
+								Type: field.Type,
+							})
+						}
+					}
+				}
+			}
+		}
 	}
+
+	for _, arg := range e.Args {
+		a.checkExpr(arg.Value, callScope)
+	}
+
 	// return type is inferred from function declaration
 	if ident, ok := e.Func.(*ast.Ident); ok {
+		// CRUD operations return the model type
+		if isCRUDOp(ident.Name) && len(e.Args) > 0 {
+			if modelIdent, ok := e.Args[0].Value.(*ast.Ident); ok {
+				if modelType, ok := a.types[modelIdent.Name]; ok {
+					// find with where: returns list, find with id: returns single (nullable)
+					if ident.Name == "find" {
+						hasWhere := false
+						for _, arg := range e.Args {
+							if arg.Name == "where" {
+								hasWhere = true
+								break
+							}
+						}
+						if hasWhere {
+							return &ResolvedType{
+								Kind:    modelType.Kind,
+								Name:    modelType.Name,
+								IsList:  true,
+								Fields:  modelType.Fields,
+								Parents: modelType.Parents,
+							}
+						}
+						// find by id returns nullable
+						return modelType.AsNullable()
+					}
+					return modelType
+				}
+			}
+		}
 		sym := a.scope.Lookup(ident.Name)
 		if sym != nil {
 			return sym.Type
 		}
 	}
 	return nil
+}
+
+func isCRUDOp(name string) bool {
+	switch name {
+	case "find", "create", "update", "delete":
+		return true
+	}
+	return false
 }
 
 func (a *Analyzer) checkBinaryExpr(e *ast.BinaryExpr, scope *Scope) *ResolvedType {
@@ -636,7 +716,7 @@ func (a *Analyzer) checkUnaryExpr(e *ast.UnaryExpr, scope *Scope) *ResolvedType 
 		return nil // throw never returns
 	}
 	if e.Op == "!" && inner != nil && inner.Kind != TypeBool {
-		a.addError(e.Pos, "operator '!' requires Boolean, got '%s'", inner.Name)
+		a.addError(e.Pos, "operator '!' requires Boolean, got '%s' / 运算符 '!' 需要 Boolean 类型，得到 '%s'", inner.Name, inner.Name)
 	}
 	return inner
 }
@@ -715,7 +795,7 @@ func (a *Analyzer) checkBinaryOp(op string, left, right *ResolvedType, pos token
 
 	case ">", ">=", "<", "<=":
 		if !left.IsOrderable() {
-			a.addError(pos, "operator '%s' requires orderable type, got '%s'", op, left.Name)
+			a.addError(pos, "operator '%s' requires orderable type, got '%s' / 运算符 '%s' 需要可排序类型，得到 '%s'", op, left.Name, op, left.Name)
 		}
 		return a.types["Boolean"]
 
@@ -737,7 +817,7 @@ func (a *Analyzer) checkArithmeticOp(op string, left, right *ResolvedType, pos t
 		if op == "+" && left.Kind == TypeString {
 			return left // string concatenation
 		}
-		a.addError(pos, "operator '%s' requires numeric types, got '%s' and '%s'", op, left.Name, right.Name)
+		a.addError(pos, "operator '%s' requires numeric types, got '%s' and '%s' / 运算符 '%s' 需要数字类型，得到 '%s' 和 '%s'", op, left.Name, right.Name, op, left.Name, right.Name)
 	}
 	if left.Kind == TypeFloat || right.Kind == TypeFloat {
 		return a.types["Float"]
@@ -781,7 +861,7 @@ func (a *Analyzer) checkDirectives(directives []*ast.Directive, context string) 
 	}
 	for _, d := range directives {
 		if !valid[d.Name] && !validFieldDirectives[d.Name] {
-			a.addWarning(d.Pos, "unknown directive '@%s' in %s context", d.Name, context)
+			a.addWarning(d.Pos, "unknown directive '@%s' in %s context / 未知指令 '@%s'，在 %s 上下文中", d.Name, context, d.Name, context)
 		}
 	}
 }
@@ -794,13 +874,13 @@ func (a *Analyzer) checkFieldDirectives(f *ast.FieldDecl) {
 	for _, d := range f.Directives {
 		if stringOnlyDirectives[d.Name] {
 			if typeName != "String" && typeName != "" {
-				a.addError(d.Pos, "@%s can only be used on String fields, got '%s'", d.Name, typeName)
+				a.addError(d.Pos, "@%s can only be used on String fields, got '%s' / @%s 只能用在 String 字段上，得到 '%s'", d.Name, typeName, d.Name, typeName)
 			}
 		}
 		if numericOnlyDirectives[d.Name] {
 			resolved := a.resolveTypeRef(f.Type, f.Pos)
 			if resolved != nil && !resolved.IsNumeric() {
-				a.addError(d.Pos, "@%s can only be used on numeric fields, got '%s'", d.Name, typeName)
+				a.addError(d.Pos, "@%s can only be used on numeric fields, got '%s' / @%s 只能用在数字字段上，得到 '%s'", d.Name, typeName, d.Name, typeName)
 			}
 		}
 	}
@@ -835,7 +915,7 @@ func (a *Analyzer) addErrorWithSuggestion(pos token.Position, name string, forma
 }
 
 func (a *Analyzer) addFieldError(pos token.Position, objType *ResolvedType, fieldName string) {
-	msg := fmt.Sprintf("'%s' has no field '%s'", objType.Name, fieldName)
+	msg := fmt.Sprintf("'%s' has no field '%s' / '%s' 没有字段 '%s'", objType.Name, fieldName, objType.Name, fieldName)
 	err := Error{Pos: pos, Message: msg}
 
 	// suggest closest field name
@@ -878,6 +958,52 @@ func findClosestString(target string, candidates []string) string {
 		}
 	}
 	return best
+}
+
+func isCollectionMethod(name string) bool {
+	switch name {
+	case "map", "filter", "sumOf", "count", "any", "firstOrNull",
+		"sortBy", "groupBy", "forEach", "flatMap", "joinToString",
+		"take", "takeLast", "size", "isEmpty", "contains":
+		return true
+	}
+	return false
+}
+
+func (a *Analyzer) resolveCollectionMethod(method string, listType *ResolvedType) *ResolvedType {
+	intType := a.types["Int"]
+	boolType := a.types["Boolean"]
+	stringType := a.types["String"]
+
+	switch method {
+	case "size", "count":
+		return intType
+	case "isEmpty", "any", "contains":
+		return boolType
+	case "joinToString":
+		return stringType
+	case "filter", "sortBy", "take", "takeLast":
+		return listType // returns same list type
+	case "map", "flatMap", "groupBy":
+		return nil // type depends on lambda, can't infer here
+	case "forEach":
+		return nil // void
+	case "firstOrNull":
+		// returns single element, nullable
+		return &ResolvedType{
+			Kind:     listType.Kind,
+			Name:     listType.Name,
+			Nullable: true,
+			Fields:   listType.Fields,
+			Parents:  listType.Parents,
+		}
+	case "sumOf":
+		return a.types["Float"]
+	default:
+		// distinct, reversed, shuffled, drop, dropLast, zip, chunked, windowed, indexOf, etc.
+		return nil
+	}
+	return nil
 }
 
 func editDistance(a, b string) int {
@@ -925,7 +1051,7 @@ func isBuiltinOp(name string) bool {
 	switch name {
 	case "find", "create", "update", "delete", "emit",
 		"throw", "transaction", "log", "cache", "storage",
-		"mail", "task", "services":
+		"mail", "task", "services", "error", "request":
 		return true
 	}
 	return false

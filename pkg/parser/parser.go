@@ -51,9 +51,6 @@ func (p *Parser) Parse(filename string) (*ast.File, []Error) {
 	file := &ast.File{Name: filename}
 
 	for !p.isEOF() {
-		if p.check(token.EOF) {
-			break
-		}
 		p.parseTopLevel(file)
 	}
 
@@ -96,6 +93,8 @@ func (p *Parser) parseTopLevel(file *ast.File) {
 		file.Uses = append(file.Uses, p.parseUse())
 	case p.check(token.Middleware):
 		file.Middlewares = append(file.Middlewares, p.parseMiddleware())
+	case p.check(token.Import):
+		file.Imports = append(file.Imports, p.parseImport())
 	case p.check(token.Comment):
 		p.advance() // skip standalone comments
 	case p.check(token.EOF):
@@ -425,6 +424,15 @@ func (p *Parser) parseMiddleware() *ast.MiddlewareDecl {
 	return mw
 }
 
+func (p *Parser) parseImport() *ast.ImportDecl {
+	pos := p.current().Pos
+	p.expect(token.Import)
+	return &ast.ImportDecl{
+		Pos:    pos,
+		Module: p.expectIdent(),
+	}
+}
+
 func (p *Parser) parseScope() *ast.ScopeDecl {
 	pos := p.current().Pos
 	p.advance() // skip "scope" (it's an ident, not keyword)
@@ -498,9 +506,11 @@ func (p *Parser) parseComputedField() *ast.FieldDecl {
 }
 
 func (p *Parser) parseParam() *ast.ParamDecl {
-	param := &ast.ParamDecl{
-		Name: p.expectIdent(),
+	param := &ast.ParamDecl{}
+	if p.match(token.DotDotDot) {
+		param.Spread = true
 	}
+	param.Name = p.expectIdent()
 	p.expect(token.Colon)
 	param.Type = p.parseTypeRef()
 
@@ -681,8 +691,12 @@ func (p *Parser) parseStmt() ast.Stmt {
 		return p.parseReturnStmt()
 	case p.check(token.Throw):
 		return p.parseThrowStmt()
-	case p.check(token.Emit):
-		return p.parseEmitStmt()
+	case p.check(token.Break):
+		pos := p.current().Pos
+		p.advance()
+		return &ast.BreakStmt{Pos: pos}
+	case p.check(token.Ident) && p.isAssignOp(p.peekType()):
+		return p.parseAssignStmt()
 	case p.check(token.Comment), p.check(token.DocComment):
 		p.advance()
 		return nil
@@ -691,13 +705,54 @@ func (p *Parser) parseStmt() ast.Stmt {
 	}
 }
 
+func (p *Parser) isAssignOp(t token.Type) bool {
+	switch t {
+	case token.Assign, token.PlusAssign, token.MinusAssign,
+		token.StarAssign, token.SlashAssign, token.PercentAssign:
+		return true
+	}
+	return false
+}
+
+func (p *Parser) parseAssignStmt() *ast.AssignStmt {
+	pos := p.current().Pos
+	target := &ast.Ident{Pos: pos, Name: p.advance().Val}
+	op := p.advance().Val
+	value := p.parseExpr(precNone)
+	return &ast.AssignStmt{
+		Pos:    pos,
+		Target: target,
+		Op:     op,
+		Value:  value,
+	}
+}
+
 func (p *Parser) parseValStmt() *ast.ValStmt {
 	pos := p.current().Pos
 	p.expect(token.Val)
 
-	stmt := &ast.ValStmt{
-		Pos:  pos,
-		Name: p.expectIdent(),
+	stmt := &ast.ValStmt{Pos: pos}
+
+	// destructuring: val (x, y) = ...
+	if p.check(token.LParen) {
+		p.advance()
+		names := []string{}
+		for !p.check(token.RParen) && !p.isEOF() {
+			names = append(names, p.expectIdent())
+			p.match(token.Comma)
+		}
+		p.expect(token.RParen)
+		// Store as comma-joined name for now
+		joined := ""
+		for i, n := range names {
+			if i > 0 {
+				joined += ","
+			}
+			joined += n
+		}
+		stmt.Name = joined
+	} else {
+		stmt.Name = p.expectIdent()
 	}
 
 	// optional type: val x: Int = ...
@@ -739,13 +794,25 @@ func (p *Parser) parseForStmt() *ast.ForStmt {
 	pos := p.current().Pos
 	p.expect(token.For)
 
-	stmt := &ast.ForStmt{
-		Pos:     pos,
-		VarName: p.expectIdent(),
+	stmt := &ast.ForStmt{Pos: pos}
+
+	// infinite loop: for { ... }
+	if p.check(token.LBrace) {
+		stmt.Body = p.parseBlock()
+		return stmt
 	}
 
-	p.expect(token.In)
-	stmt.Collection = p.parseConditionExpr()
+	// Check if this is a "for x in ..." or "for condition { ... }"
+	// If current is Ident and next is In, it's a range loop
+	if p.check(token.Ident) && p.peekType() == token.In {
+		stmt.VarName = p.expectIdent()
+		p.expect(token.In)
+		stmt.Collection = p.parseConditionExpr()
+	} else {
+		// conditional loop: for condition { ... }
+		stmt.Collection = p.parseConditionExpr()
+	}
+
 	stmt.Body = p.parseBlock()
 	return stmt
 }
@@ -766,26 +833,6 @@ func (p *Parser) parseThrowStmt() *ast.ThrowStmt {
 		Pos:   pos,
 		Error: p.parseExpr(precNone),
 	}
-}
-
-func (p *Parser) parseEmitStmt() *ast.EmitStmt {
-	pos := p.current().Pos
-	p.expect(token.Emit)
-	p.expect(token.LParen)
-
-	stmt := &ast.EmitStmt{Pos: pos}
-	for !p.check(token.RParen) && !p.isEOF() {
-		arg := &ast.NamedArg{}
-		if p.check(token.Ident) && p.peekType() == token.Colon {
-			arg.Name = p.expectIdent()
-			p.expect(token.Colon)
-		}
-		arg.Value = p.parseExpr(precNone)
-		stmt.Args = append(stmt.Args, arg)
-		p.match(token.Comma)
-	}
-	p.expect(token.RParen)
-	return stmt
 }
 
 func (p *Parser) parseExprStmt() *ast.ExprStmt {
@@ -861,9 +908,25 @@ func (p *Parser) parsePrefixExpr() ast.Expr {
 	case p.check(token.When):
 		return p.parseWhenExpr(pos)
 
-	case p.check(token.Transaction):
+	case p.check(token.Yield):
 		p.advance()
-		return &ast.TransactionExpr{Pos: pos, Body: p.parseBlock()}
+		return &ast.YieldExpr{Pos: pos, Value: p.parseExpr(precNone)}
+
+	case p.check(token.Async):
+		p.advance()
+		return &ast.AsyncExpr{Pos: pos, Body: p.parseBlock()}
+
+	case p.check(token.Await):
+		p.advance()
+		return &ast.AwaitExpr{Pos: pos, Body: p.parseBlock()}
+
+	case p.check(token.ChanSend):
+		p.advance()
+		return &ast.UnaryExpr{Pos: pos, Op: "<-", Value: p.parseExpr(precUnary)}
+
+	case p.check(token.For):
+		forStmt := p.parseForStmt()
+		return forStmt
 
 	default:
 		p.error("expected expression, got %s", p.current().Type)
@@ -950,6 +1013,13 @@ func (p *Parser) parseInfixExpr(left ast.Expr) ast.Expr {
 	case p.check(token.DotDot):
 		p.advance()
 		return &ast.RangeExpr{Pos: pos, Start: left, End: p.parseExpr(precRange)}
+
+	// Channel send: ch <- 42
+	case p.check(token.ChanSend):
+		op := p.current().Val
+		prec := p.currentPrec()
+		p.advance()
+		return &ast.BinaryExpr{Pos: pos, Left: left, Op: op, Right: p.parseExpr(prec)}
 
 	// Binary operators
 	case p.isBinaryOp():
@@ -1102,6 +1172,8 @@ func (p *Parser) currentPrec() int {
 		return precComparison
 	case token.DotDot:
 		return precRange
+	case token.ChanSend:
+		return precAdd
 	case token.Plus, token.Minus:
 		return precAdd
 	case token.Star, token.Slash, token.Percent:
@@ -1161,8 +1233,7 @@ func (p *Parser) isKeywordUsedAsIdent() bool {
 	// some keywords can be used as identifiers in certain contexts
 	// e.g., field names: find, create, update, delete, error, etc.
 	switch p.current().Type {
-	case token.Find, token.Create, token.Update, token.Delete,
-		token.Error, token.Stream, token.Through:
+	case token.Error, token.Stream, token.Through:
 		return true
 	}
 	return false
