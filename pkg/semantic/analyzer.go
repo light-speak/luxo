@@ -1003,7 +1003,6 @@ func (a *Analyzer) resolveCollectionMethod(method string, listType *ResolvedType
 		// distinct, reversed, shuffled, drop, dropLast, zip, chunked, windowed, indexOf, etc.
 		return nil
 	}
-	return nil
 }
 
 func editDistance(a, b string) int {

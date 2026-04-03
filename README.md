@@ -5,8 +5,8 @@
 <h3 align="center">Build APIs at the speed of light.</h3>
 
 <p align="center">
-  A schema-first Go framework that replaces REST, GraphQL, and gRPC<br/>
-  with one language, one protocol, one toolchain.
+  A general-purpose language with a built-in API framework.<br/>
+  One language, one protocol, one toolchain — replaces REST, GraphQL, and gRPC.
 </p>
 
 <p align="center">
@@ -20,31 +20,30 @@
 <p align="center">
   <a href="README_CN.md">中文文档</a> ·
   <a href="#quick-start">Quick Start</a> ·
-  <a href="#example">Example</a> ·
+  <a href="#the-language">The Language</a> ·
   <a href="#roadmap">Roadmap</a>
 </p>
 
 ---
 
-## The Problem
+## What is Luxo?
 
-You're writing the same thing three times: **schema**, **API handlers**, **database queries**. You're choosing between protocols that each solve half the problem. You're gluing together 10 different tools just to serve a JSON response.
+Luxo is a **programming language** that compiles to Go — with a built-in API framework, its own protocol, and a complete toolchain from schema to deployment.
 
-## The Solution
-
-**One `.luxo` file. Everything else is generated.**
+Write `.luxo` files. Get: API server, database layer, client SDKs, migrations, monitoring dashboard. No glue code.
 
 ```luxo
-model User : Base @crud {
-  name:     String @varchar(100) @filterable
+model User @crud {
+  name:     String @filterable
   email:    String @unique
   password: String @hidden @hash
+  role:     Role = Role.USER
   avatar:   String?
   posts:    [Post]
 }
 ```
 
-This single definition generates: Go structs, database tables, CRUD APIs, query builders, DataLoaders, client SDKs, migration files. Zero boilerplate.
+This generates everything. One file, zero boilerplate.
 
 ## Why Not...
 
@@ -53,23 +52,127 @@ This single definition generates: Go structs, database tables, CRUD APIs, query 
 | Field Selection | ✅ Too loose | ❌ None | ❌ None | ✅ Schema-controlled |
 | Binary Transport | ❌ JSON only | ✅ Protobuf | ❌ JSON only | ✅ JSON + Binary, auto-switch |
 | One Schema | ❌ SDL + ORM + OpenAPI | ❌ .proto + ORM | ❌ Manual | ✅ `.luxo` generates everything |
-| Code Gen | ❌ Separate tools | ⚠️ protoc | ❌ Manual | ✅ Built-in |
-| N+1 Prevention | ❌ Manual DataLoader | N/A | ❌ Manual | ✅ Automatic |
-| Type Safety | ⚠️ Runtime | ✅ Compile-time | ❌ None | ✅ Compile-time + null safety |
-| Multi-service | ⚠️ Federation (complex) | ✅ Native | ❌ Manual | ✅ `extend` + gateway |
+| N+1 Prevention | ❌ Manual | N/A | ❌ Manual | ✅ Automatic DataLoader |
+| Null Safety | ⚠️ Runtime | ✅ Compile-time | ❌ None | ✅ Compile-time `?` `?:` `?.` |
+| Error Handling | ❌ Untyped | ✅ Status codes | ❌ HTTP codes | ✅ `Result<T>` + `?` operator |
+| Concurrency | ❌ N/A | ❌ Manual | ❌ Manual | ✅ `async` `await` `Channel` |
+| Multi-service | ⚠️ Federation | ✅ Native | ❌ Manual | ✅ `extend` + gateway + RPC |
 
-## Features
+## The Language
 
-- **Schema-first** — `.luxo` DSL with Kotlin-inspired syntax, logic included
-- **Field selection** — Client → API → SQL, only requested fields at every layer
-- **Multi-mode transport** — `JSON` for dev, `Binary` for prod, middleware auto-switch
-- **All-in PostgreSQL** — Postgres by default, pluggable drivers (Redis, NATS, S3)
-- **Built-in RPC** — Luxo IS the protocol. No gRPC, no GraphQL dependency
-- **Zero boilerplate** — `@crud` generates everything. Write Go only for `@native` logic
-- **Null safety** — Compile-time checks. `?` for nullable, `?:` for fallback, `?.` for safe access
-- **DataLoader built-in** — N+1 solved automatically for all relationships
-- **Federation** — `extend` for multi-service, gateway aggregation, identity propagation
-- **Luxo Studio** — Built-in monitoring dashboard, request tracing, API playground
+Luxo is a real programming language — not just a schema DSL. **28 keywords**, clean syntax, compiles to Go.
+
+### Null Safety
+
+```luxo
+val user = find(User, id: 1)       // User? (nullable)
+val name = user?.name               // safe access
+val sure = user ?: throw error.not_found  // elvis — assert or throw
+```
+
+### Pattern Matching
+
+```luxo
+val level = when(score) {
+  in 90..100 -> "A"
+  in 80..89  -> "B"
+  else       -> "C"
+}
+
+when(result) {
+  is Ok  -> result.value
+  is Err -> throw result.error
+}
+```
+
+### Result Type + `?` Operator
+
+Errors propagate with `?` — no try/catch, no async/await infection.
+
+```luxo
+val user = findUser(1)?              // Ok → unwrap, Err → auto throw
+val data = http.get(url)?            // errors propagate automatically
+```
+
+### Concurrency — No async/await Infection
+
+```luxo
+// Everything looks synchronous — Go runtime handles scheduling
+val user = fetchUser(1)              // no await needed
+
+// Concurrent execution — only when you want it
+val (user, posts) = await {
+  fetchUser(1)                       // run simultaneously
+  fetchPosts(1)                      // run simultaneously
+}
+
+// Fire and forget
+async {
+  sendEmail(user.email, "Welcome!")
+}
+
+// Channels
+val ch = Channel<Int>(10)
+ch <- 42                             // send
+val value = <-ch                     // receive
+```
+
+### yield — For Loops as Expressions
+
+```luxo
+val found = for item in items {
+  if item.special { yield item }     // exit loop with value
+}
+// found: Item? — yield's value, or null if not found
+```
+
+### Collection Operations
+
+```luxo
+val total = items.sumOf { it.price * it.quantity }
+val active = users.filter { it.status == "active" }
+val names = users.map { it.name }.joinToString(", ")
+val vip = users.any { it.role == Role.VIP }
+```
+
+### API Definition — Three Levels
+
+```luxo
+// 1. Zero code — framework generates everything
+api getUser(id: Int): User @cache(ttl: 60)
+
+// 2. With logic — write in Luxo
+api register(input: RegisterInput): AuthResult {
+  input.password.length >= 8 ?: throw error.password_too_short
+  val user = create(User, name: input.name, email: input.email, password: input.password)
+  val token = generateToken(user, expires: 7d)
+  AuthResult { token: token, user: user }
+}
+
+// 3. Complex — write in Go
+api oauthLogin(provider: String, code: String): AuthResult @native
+```
+
+### Field Selection — All The Way Down
+
+```
+getUser(1) {
+  name email
+  posts { title comments { content user { name } } }
+}
+```
+
+Client selects fields → API serializes only those → SQL queries only those. End to end.
+
+### Events + Real-time
+
+```luxo
+// Emit events — framework handles WebSocket + message queue
+emit("order.created", order, userId: order.userId)
+
+// Subscribe — clients get real-time updates
+api watchComments(postId: Int): stream Comment
+```
 
 ## Quick Start
 
@@ -79,75 +182,6 @@ go install github.com/light-speak/luxo/cmd/luxo@latest
 luxo init my-app
 cd my-app
 luxo dev
-```
-
-## Example
-
-**Define your API:**
-
-```luxo
-model User : Base @crud {
-  name:     String @varchar(100) @filterable
-  email:    String @unique
-  password: String @hidden @hash
-  role:     Role = Role.USER
-  avatar:   String?
-  posts:    [Post]
-}
-
-enum Role { USER ADMIN }
-
-/// Register a new user
-api register(input: RegisterInput): AuthResult {
-  input.password.length >= 8 ?: throw error.password_too_short
-
-  val exists = find(User, where: email == input.email)
-  exists == null ?: throw error.email_exists
-
-  val user = create(User,
-    name: input.name,
-    email: input.email,
-    password: input.password
-  )
-
-  val token = generateToken(user, expires: 7d)
-  AuthResult { token: token, user: user }
-}
-
-/// Complex logic? Write Go.
-api oauthLogin(provider: String, code: String): AuthResult @native
-```
-
-**Query with field selection:**
-
-```
-getUser(1) {
-  name email
-  posts {
-    title createdAt
-    comments { content user { name } }
-  }
-}
-```
-
-**Response — only what you asked for:**
-
-```json
-{
-  "data": {
-    "name": "lin",
-    "email": "lin@test.com",
-    "posts": [
-      {
-        "title": "Hello Luxo",
-        "createdAt": "2026-04-03",
-        "comments": [
-          { "content": "Great!", "user": { "name": "alice" } }
-        ]
-      }
-    ]
-  }
-}
 ```
 
 ## Architecture
@@ -170,35 +204,48 @@ getUser(1) {
   Multi service:   luxo dev --all
 ```
 
-## VS Code Extension
+## Compiler
 
-Syntax highlighting, auto-completion, real-time error reporting, go-to-definition, and hover info for `.luxo` files.
+Complete compiler pipeline with IDE support:
 
-```bash
-# Auto-installs language server on first use
-code --install-extension luxo-0.2.0.vsix
 ```
+.luxo source → Lexer → Parser → Semantic Analyzer → Go Code Generator
+                                       ↓
+                                 LSP Server
+                                       ↓
+                    Real-time errors · completion · hover · go-to-definition
+```
+
+- **510 tests** · Coverage at maximum achievable limit
+- **Fuzz testing** on Lexer, Parser, and Semantic Analyzer
+- **Bilingual error messages** (English + Chinese)
 
 ## Roadmap
 
 ### Phase 1 — Compiler ✅
-- [x] Lexer · Parser · Semantic Analyzer · LSP
-- [x] 442 tests · 99%+ coverage · Fuzz testing
-- [ ] Code generator · Query builder · DataLoader
+- [x] Lexer · Parser (28 keywords, Pratt parser)
+- [x] Semantic Analyzer (type checking, null safety, field injection)
+- [x] LSP Server (diagnostics, completion, hover, go-to-definition)
+- [x] 510 tests · max coverage · fuzz testing
+- [ ] Go code generator
 
 ### Phase 2 — Framework
 - [ ] JSON transport + field selection
 - [ ] Auto CRUD · @native resolver merge
-- [ ] Migration engine · Auth · i18n · Validation
+- [ ] Migration engine (declarative diff)
+- [ ] Auth · i18n · Validation
 - [ ] WebSocket stream · Batch requests
+- [ ] Runtime: error handling, DB pool, logging, messaging
 
 ### Phase 3 — Multi-service
 - [ ] Luxo Router · Service discovery · Circuit breaker
-- [ ] Inter-service RPC · Identity propagation
+- [ ] Inter-service Luxo RPC
+- [ ] Identity context propagation
 
 ### Phase 4 — Ecosystem
-- [ ] Binary protocol · Client SDK (TS / Dart)
-- [ ] Luxo Studio · Cache / Event / Task / Storage
+- [ ] Binary protocol · Client SDK (TypeScript / Dart)
+- [ ] Luxo Studio (monitoring dashboard)
+- [ ] Cache / Event / Task / Storage / Mail
 - [ ] k3s deployment · .luxo test runner
 
 ## Contributing
