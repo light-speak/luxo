@@ -831,8 +831,8 @@ func TestDocumentDiagnosticsWarning(t *testing.T) {
 	store := NewDocumentStore()
 	// A model with a field using an unknown type generates a semantic error,
 	// but we also want to test the warning path. We construct a doc with Result.Warnings manually.
-	doc := store.Open("file:///test.luxo", 1, "model User { name: String }")
-	doc = store.Get("file:///test.luxo")
+	store.Open("file:///test.luxo", 1, "model User { name: String }")
+	doc := store.Get("file:///test.luxo")
 
 	// Inject a warning to cover the warning branch in Diagnostics()
 	if doc.Result != nil {
