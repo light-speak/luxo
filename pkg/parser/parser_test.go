@@ -1,0 +1,764 @@
+package parser
+
+import (
+	"testing"
+
+	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lexer"
+)
+
+func parse(t *testing.T, input string) *ast.File {
+	t.Helper()
+	l := lexer.New(input, "test.luxo")
+	tokens, lexErrors := l.Tokenize()
+	if len(lexErrors) > 0 {
+		t.Fatalf("lexer errors: %v", lexErrors)
+	}
+	p := New(tokens)
+	file, parseErrors := p.Parse("test.luxo")
+	if len(parseErrors) > 0 {
+		t.Fatalf("parser errors: %v", parseErrors)
+	}
+	return file
+}
+
+func TestParseModel(t *testing.T) {
+	input := `model User : Base {
+  name: String @varchar(100)
+  email: String @unique
+  avatar: String?
+  role: Role = Role.USER
+}`
+	file := parse(t, input)
+
+	if len(file.Models) != 1 {
+		t.Fatalf("expected 1 model, got %d", len(file.Models))
+	}
+
+	m := file.Models[0]
+	if m.Name != "User" {
+		t.Errorf("expected model name 'User', got %q", m.Name)
+	}
+	if len(m.Parents) != 1 || m.Parents[0] != "Base" {
+		t.Errorf("expected parent [Base], got %v", m.Parents)
+	}
+	if len(m.Fields) != 4 {
+		t.Fatalf("expected 4 fields, got %d", len(m.Fields))
+	}
+
+	// name: String @varchar(100)
+	f := m.Fields[0]
+	if f.Name != "name" {
+		t.Errorf("field[0]: expected 'name', got %q", f.Name)
+	}
+	if f.Type.Name != "String" {
+		t.Errorf("field[0]: expected type 'String', got %q", f.Type.Name)
+	}
+	if len(f.Directives) != 1 || f.Directives[0].Name != "varchar" {
+		t.Errorf("field[0]: expected directive @varchar")
+	}
+
+	// avatar: String?
+	f2 := m.Fields[2]
+	if !f2.Type.Nullable {
+		t.Error("field[2]: expected nullable type")
+	}
+
+	// role: Role = Role.USER
+	f3 := m.Fields[3]
+	if f3.Default == nil {
+		t.Error("field[3]: expected default value")
+	}
+}
+
+func TestParseModelMultipleInheritance(t *testing.T) {
+	input := `model User : Base, Searchable, Auditable {
+  name: String
+}`
+	file := parse(t, input)
+	m := file.Models[0]
+	if len(m.Parents) != 3 {
+		t.Fatalf("expected 3 parents, got %d", len(m.Parents))
+	}
+	if m.Parents[0] != "Base" || m.Parents[1] != "Searchable" || m.Parents[2] != "Auditable" {
+		t.Errorf("parents: %v", m.Parents)
+	}
+}
+
+func TestParseModelWithDirective(t *testing.T) {
+	input := `model User : Base @crud {
+  name: String
+}`
+	file := parse(t, input)
+	m := file.Models[0]
+	if len(m.Directives) != 1 || m.Directives[0].Name != "crud" {
+		t.Error("expected @crud directive on model")
+	}
+}
+
+func TestParseEnum(t *testing.T) {
+	input := `enum Role {
+  USER
+  ADMIN
+  MODERATOR
+}`
+	file := parse(t, input)
+
+	if len(file.Enums) != 1 {
+		t.Fatalf("expected 1 enum, got %d", len(file.Enums))
+	}
+	e := file.Enums[0]
+	if e.Name != "Role" {
+		t.Errorf("expected enum name 'Role', got %q", e.Name)
+	}
+	if len(e.Values) != 3 {
+		t.Errorf("expected 3 values, got %d", len(e.Values))
+	}
+}
+
+func TestParseInterface(t *testing.T) {
+	input := `interface Auditable {
+  createdBy: String
+  updatedBy: String
+  fn beforeCreate() {
+  }
+}`
+	file := parse(t, input)
+
+	if len(file.Interfaces) != 1 {
+		t.Fatalf("expected 1 interface, got %d", len(file.Interfaces))
+	}
+	iface := file.Interfaces[0]
+	if len(iface.Fields) != 2 {
+		t.Errorf("expected 2 fields, got %d", len(iface.Fields))
+	}
+	if len(iface.Methods) != 1 {
+		t.Errorf("expected 1 method, got %d", len(iface.Methods))
+	}
+}
+
+func TestParseSealed(t *testing.T) {
+	input := `sealed PayResult {
+  Success(transactionId: String)
+  Failed(reason: String, code: Int)
+  Pending(retryAfter: Duration)
+}`
+	file := parse(t, input)
+
+	if len(file.Sealeds) != 1 {
+		t.Fatalf("expected 1 sealed, got %d", len(file.Sealeds))
+	}
+	s := file.Sealeds[0]
+	if len(s.Variants) != 3 {
+		t.Errorf("expected 3 variants, got %d", len(s.Variants))
+	}
+	if s.Variants[1].Name != "Failed" {
+		t.Errorf("expected 'Failed', got %q", s.Variants[1].Name)
+	}
+	if len(s.Variants[1].Fields) != 2 {
+		t.Errorf("expected 2 fields in Failed, got %d", len(s.Variants[1].Fields))
+	}
+}
+
+func TestParseTypeGeneric(t *testing.T) {
+	input := `type Page<T> {
+  items: [T]
+  total: Int
+  page: Int
+}`
+	file := parse(t, input)
+
+	if len(file.Types) != 1 {
+		t.Fatalf("expected 1 type, got %d", len(file.Types))
+	}
+	td := file.Types[0]
+	if td.Name != "Page" {
+		t.Errorf("expected 'Page', got %q", td.Name)
+	}
+	if len(td.TypeParams) != 1 || td.TypeParams[0] != "T" {
+		t.Errorf("expected type params [T], got %v", td.TypeParams)
+	}
+	if len(td.Fields) != 3 {
+		t.Errorf("expected 3 fields, got %d", len(td.Fields))
+	}
+	// items: [T]
+	if !td.Fields[0].Type.IsList {
+		t.Error("expected items to be list type")
+	}
+}
+
+func TestParseApiSimple(t *testing.T) {
+	input := `api getUser(id: Int): User`
+	file := parse(t, input)
+
+	if len(file.APIs) != 1 {
+		t.Fatalf("expected 1 api, got %d", len(file.APIs))
+	}
+	api := file.APIs[0]
+	if api.Name != "getUser" {
+		t.Errorf("expected 'getUser', got %q", api.Name)
+	}
+	if len(api.Params) != 1 {
+		t.Errorf("expected 1 param, got %d", len(api.Params))
+	}
+	if api.ReturnType.Name != "User" {
+		t.Errorf("expected return type 'User', got %q", api.ReturnType.Name)
+	}
+	if api.Body != nil {
+		t.Error("expected no body")
+	}
+}
+
+func TestParseApiWithDirectives(t *testing.T) {
+	input := `api getUser(id: Int): User @auth @cache(ttl: 60)`
+	file := parse(t, input)
+	api := file.APIs[0]
+
+	if len(api.Directives) != 2 {
+		t.Fatalf("expected 2 directives, got %d", len(api.Directives))
+	}
+	if api.Directives[0].Name != "auth" {
+		t.Errorf("expected @auth, got @%s", api.Directives[0].Name)
+	}
+	if api.Directives[1].Name != "cache" {
+		t.Errorf("expected @cache, got @%s", api.Directives[1].Name)
+	}
+	if len(api.Directives[1].Args) != 1 {
+		t.Errorf("expected 1 arg for @cache, got %d", len(api.Directives[1].Args))
+	}
+}
+
+func TestParseApiWithBody(t *testing.T) {
+	input := `api register(input: RegisterInput): AuthResult {
+  val user = create(User, name: input.name)
+  return user
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+
+	if api.Body == nil {
+		t.Fatal("expected body")
+	}
+	if len(api.Body.Stmts) != 2 {
+		t.Errorf("expected 2 statements, got %d", len(api.Body.Stmts))
+	}
+
+	// val user = ...
+	valStmt, ok := api.Body.Stmts[0].(*ast.ValStmt)
+	if !ok {
+		t.Fatalf("expected ValStmt, got %T", api.Body.Stmts[0])
+	}
+	if valStmt.Name != "user" {
+		t.Errorf("expected 'user', got %q", valStmt.Name)
+	}
+
+	// return user
+	_, ok = api.Body.Stmts[1].(*ast.ReturnStmt)
+	if !ok {
+		t.Fatalf("expected ReturnStmt, got %T", api.Body.Stmts[1])
+	}
+}
+
+func TestParseApiDefaultParam(t *testing.T) {
+	input := `api listUsers(status: String?, limit: Int = 20): Page<User>`
+	file := parse(t, input)
+	api := file.APIs[0]
+
+	if len(api.Params) != 2 {
+		t.Fatalf("expected 2 params, got %d", len(api.Params))
+	}
+	if !api.Params[0].Type.Nullable {
+		t.Error("expected status to be nullable")
+	}
+	if api.Params[1].Default == nil {
+		t.Error("expected default value for limit")
+	}
+	if api.ReturnType.Name != "Page" {
+		t.Errorf("expected return type 'Page', got %q", api.ReturnType.Name)
+	}
+	if len(api.ReturnType.TypeArgs) != 1 {
+		t.Error("expected generic type arg")
+	}
+}
+
+func TestParseFn(t *testing.T) {
+	input := `fn encrypt(value: String): String @native`
+	file := parse(t, input)
+
+	if len(file.Functions) != 1 {
+		t.Fatalf("expected 1 fn, got %d", len(file.Functions))
+	}
+	fn := file.Functions[0]
+	if fn.Name != "encrypt" {
+		t.Errorf("expected 'encrypt', got %q", fn.Name)
+	}
+	if fn.Body != nil {
+		t.Error("expected no body for @native fn")
+	}
+	if len(fn.Directives) != 1 || fn.Directives[0].Name != "native" {
+		t.Error("expected @native directive")
+	}
+}
+
+func TestParseExtend(t *testing.T) {
+	input := `extend User {
+  posts: [Post]
+  comments: [Comment]
+}`
+	file := parse(t, input)
+
+	if len(file.Extends) != 1 {
+		t.Fatalf("expected 1 extend, got %d", len(file.Extends))
+	}
+	ext := file.Extends[0]
+	if ext.Name != "User" {
+		t.Errorf("expected 'User', got %q", ext.Name)
+	}
+	if len(ext.Fields) != 2 {
+		t.Errorf("expected 2 fields, got %d", len(ext.Fields))
+	}
+	if !ext.Fields[0].Type.IsList {
+		t.Error("expected list type for posts")
+	}
+}
+
+func TestParseUse(t *testing.T) {
+	input := `use common.{ Base, Searchable, Page }`
+	file := parse(t, input)
+
+	if len(file.Uses) != 1 {
+		t.Fatalf("expected 1 use, got %d", len(file.Uses))
+	}
+	u := file.Uses[0]
+	if u.Module != "common" {
+		t.Errorf("expected module 'common', got %q", u.Module)
+	}
+	if len(u.Names) != 3 {
+		t.Errorf("expected 3 names, got %d", len(u.Names))
+	}
+}
+
+func TestParseElvisExpr(t *testing.T) {
+	input := `api test(): User {
+  val user = find(User, id: 1) ?: throw error.not_found
+  return user
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+
+	valStmt := api.Body.Stmts[0].(*ast.ValStmt)
+	elvis, ok := valStmt.Value.(*ast.ElvisExpr)
+	if !ok {
+		t.Fatalf("expected ElvisExpr, got %T", valStmt.Value)
+	}
+	if elvis.Left == nil || elvis.Right == nil {
+		t.Error("elvis left or right is nil")
+	}
+}
+
+func TestParseWhenExpr(t *testing.T) {
+	input := `api test(): String {
+  val level = when(score) {
+    in 90..100 -> "A"
+    in 80..89 -> "B"
+    else -> "F"
+  }
+  return level
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+
+	valStmt := api.Body.Stmts[0].(*ast.ValStmt)
+	when, ok := valStmt.Value.(*ast.WhenExpr)
+	if !ok {
+		t.Fatalf("expected WhenExpr, got %T", valStmt.Value)
+	}
+	if when.Subject == nil {
+		t.Error("expected when subject")
+	}
+	if len(when.Branches) != 2 {
+		t.Errorf("expected 2 branches, got %d", len(when.Branches))
+	}
+	if when.Else == nil {
+		t.Error("expected else branch")
+	}
+}
+
+func TestParseForStmt(t *testing.T) {
+	input := `api test(): Int {
+  for item in items {
+    update(item, status: "done")
+  }
+  return 0
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+
+	forStmt, ok := api.Body.Stmts[0].(*ast.ForStmt)
+	if !ok {
+		t.Fatalf("expected ForStmt, got %T", api.Body.Stmts[0])
+	}
+	if forStmt.VarName != "item" {
+		t.Errorf("expected 'item', got %q", forStmt.VarName)
+	}
+}
+
+func TestParseIfStmt(t *testing.T) {
+	input := `api test(): Int {
+  if condition {
+    return 1
+  } else {
+    return 0
+  }
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+
+	ifStmt, ok := api.Body.Stmts[0].(*ast.IfStmt)
+	if !ok {
+		t.Fatalf("expected IfStmt, got %T", api.Body.Stmts[0])
+	}
+	if ifStmt.Then == nil {
+		t.Error("expected then block")
+	}
+	if ifStmt.Else == nil {
+		t.Error("expected else block")
+	}
+}
+
+func TestParseEmitStmt(t *testing.T) {
+	input := `api test(): Boolean {
+  emit("order.created", order, userId: order.userId)
+  return true
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+
+	emitStmt, ok := api.Body.Stmts[0].(*ast.EmitStmt)
+	if !ok {
+		t.Fatalf("expected EmitStmt, got %T", api.Body.Stmts[0])
+	}
+	if len(emitStmt.Args) != 3 {
+		t.Errorf("expected 3 args, got %d", len(emitStmt.Args))
+	}
+	// third arg should be named: userId: order.userId
+	if emitStmt.Args[2].Name != "userId" {
+		t.Errorf("expected named arg 'userId', got %q", emitStmt.Args[2].Name)
+	}
+}
+
+func TestParseMemberAccess(t *testing.T) {
+	input := `api test(): String {
+  val name = user.name
+  val city = user?.address?.city
+  return name
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+
+	// user.name
+	valStmt := api.Body.Stmts[0].(*ast.ValStmt)
+	member, ok := valStmt.Value.(*ast.MemberExpr)
+	if !ok {
+		t.Fatalf("expected MemberExpr, got %T", valStmt.Value)
+	}
+	if member.Field != "name" || member.SafeCall {
+		t.Error("expected .name (not safe)")
+	}
+
+	// user?.address?.city
+	valStmt2 := api.Body.Stmts[1].(*ast.ValStmt)
+	member2, ok := valStmt2.Value.(*ast.MemberExpr)
+	if !ok {
+		t.Fatalf("expected MemberExpr, got %T", valStmt2.Value)
+	}
+	if member2.Field != "city" || !member2.SafeCall {
+		t.Error("expected ?.city (safe)")
+	}
+}
+
+func TestParseComputedField(t *testing.T) {
+	input := `model Post : Base {
+  title: String
+  val totalCount: Int get @count
+  val avgLikes: Float get @avg(field: likes)
+}`
+	file := parse(t, input)
+	m := file.Models[0]
+
+	if len(m.Fields) != 3 {
+		t.Fatalf("expected 3 fields, got %d", len(m.Fields))
+	}
+
+	// val totalCount: Int get @count
+	f := m.Fields[1]
+	if f.Name != "totalCount" {
+		t.Errorf("expected 'totalCount', got %q", f.Name)
+	}
+	if f.Computed == nil {
+		t.Fatal("expected computed field")
+	}
+	if len(f.Computed.Directives) != 1 || f.Computed.Directives[0].Name != "count" {
+		t.Error("expected @count directive")
+	}
+}
+
+func TestParseTupleType(t *testing.T) {
+	input := `model Comment : Base {
+  content: String
+  target: (Post, Video, Product)
+}`
+	file := parse(t, input)
+	m := file.Models[0]
+
+	f := m.Fields[1]
+	if f.Name != "target" {
+		t.Errorf("expected 'target', got %q", f.Name)
+	}
+	if len(f.Type.Tuple) != 3 {
+		t.Fatalf("expected 3 tuple types, got %d", len(f.Type.Tuple))
+	}
+	if f.Type.Tuple[0].Name != "Post" {
+		t.Errorf("expected 'Post', got %q", f.Type.Tuple[0].Name)
+	}
+}
+
+func TestParseListType(t *testing.T) {
+	input := `model User : Base {
+  posts: [Post]
+  tags: [String]
+}`
+	file := parse(t, input)
+	m := file.Models[0]
+
+	if !m.Fields[0].Type.IsList {
+		t.Error("expected posts to be list type")
+	}
+	if !m.Fields[1].Type.IsList {
+		t.Error("expected tags to be list type")
+	}
+}
+
+func TestParseDocComment(t *testing.T) {
+	input := `/// 获取用户信息
+api getUser(id: Int): User`
+	file := parse(t, input)
+	api := file.APIs[0]
+	if api.Doc != "获取用户信息" {
+		t.Errorf("expected doc comment, got %q", api.Doc)
+	}
+}
+
+func TestParseTransaction(t *testing.T) {
+	input := `api test(): Order {
+  val order = transaction {
+    update(product, stock: 0)
+    create(Order, total: 100)
+  }
+  return order
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	valStmt := api.Body.Stmts[0].(*ast.ValStmt)
+
+	_, ok := valStmt.Value.(*ast.TransactionExpr)
+	if !ok {
+		t.Fatalf("expected TransactionExpr, got %T", valStmt.Value)
+	}
+}
+
+func TestParseError(t *testing.T) {
+	input := `error NotFound(resource: String, id: Int) {
+  code: 404
+  message: error.not_found
+}`
+	file := parse(t, input)
+
+	if len(file.Errors) != 1 {
+		t.Fatalf("expected 1 error, got %d", len(file.Errors))
+	}
+	e := file.Errors[0]
+	if e.Name != "NotFound" {
+		t.Errorf("expected 'NotFound', got %q", e.Name)
+	}
+	if e.Code != 404 {
+		t.Errorf("expected code 404, got %d", e.Code)
+	}
+	if len(e.Fields) != 2 {
+		t.Errorf("expected 2 fields, got %d", len(e.Fields))
+	}
+}
+
+func TestParseScope(t *testing.T) {
+	input := `model Post : Base {
+  status: String
+  scope published {
+    val x = 1
+  }
+}`
+	file := parse(t, input)
+	m := file.Models[0]
+
+	if len(m.Scopes) != 1 {
+		t.Fatalf("expected 1 scope, got %d", len(m.Scopes))
+	}
+	if m.Scopes[0].Name != "published" {
+		t.Errorf("expected 'published', got %q", m.Scopes[0].Name)
+	}
+}
+
+func TestParseComplexSchema(t *testing.T) {
+	input := `use common.{ Base, Page }
+
+model User : Base @crud {
+  name:     String @varchar(100) @filterable
+  email:    String @unique
+  password: String @hidden @hash
+  role:     Role = Role.USER
+  avatar:   String?
+  posts:    [Post]
+  profile:  Profile?
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+api getUser(id: Int): User @cache(ttl: 60)
+
+api register(input: RegisterInput): AuthResult {
+  input.password.length >= 8 ?: throw error.password_too_short
+  val exists = find(User, where: email == input.email)
+  exists == null ?: throw error.email_exists
+  val user = create(User, name: input.name, email: input.email, password: input.password)
+  val tok = generateToken(user, expires: 7d)
+  return AuthResult { token: tok, user: user }
+}
+
+extend User {
+  orders: [Order]
+}
+
+fn encrypt(value: String): String @native
+
+error NotFound(resource: String) {
+  code: 404
+  message: error.not_found
+}`
+
+	file := parse(t, input)
+
+	if len(file.Uses) != 1 {
+		t.Errorf("expected 1 use, got %d", len(file.Uses))
+	}
+	if len(file.Models) != 1 {
+		t.Errorf("expected 1 model, got %d", len(file.Models))
+	}
+	if len(file.Enums) != 1 {
+		t.Errorf("expected 1 enum, got %d", len(file.Enums))
+	}
+	if len(file.APIs) != 2 {
+		t.Errorf("expected 2 apis, got %d", len(file.APIs))
+	}
+	if len(file.Extends) != 1 {
+		t.Errorf("expected 1 extend, got %d", len(file.Extends))
+	}
+	if len(file.Functions) != 1 {
+		t.Errorf("expected 1 function, got %d", len(file.Functions))
+	}
+	if len(file.Errors) != 1 {
+		t.Errorf("expected 1 error, got %d", len(file.Errors))
+	}
+
+	// register api should have body with 5 statements
+	registerAPI := file.APIs[1]
+	if registerAPI.Body == nil {
+		t.Fatal("expected body for register api")
+	}
+	if len(registerAPI.Body.Stmts) != 6 {
+		t.Errorf("expected 6 statements in register body, got %d", len(registerAPI.Body.Stmts))
+	}
+}
+
+func TestParseMiddleware(t *testing.T) {
+	input := `middleware customAuth @native`
+	file := parse(t, input)
+
+	if len(file.Middlewares) != 1 {
+		t.Fatalf("expected 1 middleware, got %d", len(file.Middlewares))
+	}
+	mw := file.Middlewares[0]
+	if mw.Name != "customAuth" {
+		t.Errorf("expected 'customAuth', got %q", mw.Name)
+	}
+	if len(mw.Directives) != 1 || mw.Directives[0].Name != "native" {
+		t.Error("expected @native directive")
+	}
+}
+
+func TestParseBinaryExpr(t *testing.T) {
+	input := `api test(): Boolean {
+  val result = a + b * c
+  return result
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	valStmt := api.Body.Stmts[0].(*ast.ValStmt)
+
+	// should be: a + (b * c) due to precedence
+	binExpr, ok := valStmt.Value.(*ast.BinaryExpr)
+	if !ok {
+		t.Fatalf("expected BinaryExpr, got %T", valStmt.Value)
+	}
+	if binExpr.Op != "+" {
+		t.Errorf("expected '+' at top level, got %q", binExpr.Op)
+	}
+	rightBin, ok := binExpr.Right.(*ast.BinaryExpr)
+	if !ok {
+		t.Fatalf("expected right to be BinaryExpr, got %T", binExpr.Right)
+	}
+	if rightBin.Op != "*" {
+		t.Errorf("expected '*' in right, got %q", rightBin.Op)
+	}
+}
+
+func TestParseStreamReturnType(t *testing.T) {
+	input := `api watchComments(postId: Int): stream Comment`
+	file := parse(t, input)
+	api := file.APIs[0]
+
+	if api.ReturnType.Name != "stream Comment" {
+		t.Errorf("expected 'stream Comment', got %q", api.ReturnType.Name)
+	}
+}
+
+func TestParseForeignKey(t *testing.T) {
+	input := `model Post : Base {
+  authorId: Int
+  author: User(key: authorId)
+}`
+	file := parse(t, input)
+	m := file.Models[0]
+
+	f := m.Fields[1]
+	if f.Type.FKField != "authorId" {
+		t.Errorf("expected FK 'authorId', got %q", f.Type.FKField)
+	}
+}
+
+func TestParseThroughRelation(t *testing.T) {
+	input := `model User : Base {
+  roles: [Role] through UserRole
+}`
+	file := parse(t, input)
+	m := file.Models[0]
+
+	f := m.Fields[0]
+	if !f.Type.IsList {
+		t.Error("expected list type")
+	}
+	if f.Type.FKField != "through:UserRole" {
+		t.Errorf("expected 'through:UserRole', got %q", f.Type.FKField)
+	}
+}
