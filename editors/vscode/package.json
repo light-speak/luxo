@@ -2,7 +2,7 @@
   "name": "luxo",
   "displayName": "Luxo",
   "description": "Language support for Luxo (.luxo) - Build APIs at the speed of light",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "light-speak",
   "repository": {
     "type": "git",
@@ -14,7 +14,24 @@
   "categories": [
     "Programming Languages"
   ],
+  "activationEvents": [
+    "onLanguage:luxo"
+  ],
+  "main": "./extension.js",
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
   "contributes": {
+    "configuration": {
+      "title": "Luxo",
+      "properties": {
+        "luxo.lsp.path": {
+          "type": "string",
+          "default": "luxo-lsp",
+          "description": "Path to the luxo-lsp binary"
+        }
+      }
+    },
     "languages": [
       {
         "id": "luxo",

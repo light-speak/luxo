@@ -51,6 +51,7 @@ func (p *Parser) Parse(filename string) (*ast.File, []Error) {
 	file := &ast.File{Name: filename}
 
 	for !p.isEOF() {
+		startPos := p.pos
 		p.consumeDoc()
 
 		switch {
@@ -91,6 +92,11 @@ func (p *Parser) Parse(filename string) (*ast.File, []Error) {
 			return file, p.errors
 		default:
 			p.error("unexpected token: %s", p.current().Val)
+			p.advance()
+		}
+
+		// prevent infinite loop in main parse
+		if p.pos == startPos {
 			p.advance()
 		}
 	}
@@ -807,8 +813,12 @@ func (p *Parser) parseExpr(prec int) ast.Expr {
 		return nil
 	}
 
-	for prec < p.currentPrec() {
+	for prec < p.currentPrec() && !p.isEOF() {
+		startPos := p.pos
 		left = p.parseInfixExpr(left)
+		if p.pos == startPos {
+			break // prevent infinite loop
+		}
 	}
 	return left
 }
