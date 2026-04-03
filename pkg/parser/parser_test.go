@@ -762,3 +762,68 @@ func TestParseThroughRelation(t *testing.T) {
 		t.Errorf("expected 'through:UserRole', got %q", f.Type.FKField)
 	}
 }
+
+func TestStatementBoundaryAfterCall(t *testing.T) {
+	input := `api test(): Int {
+  val x = create(User, name: "test")
+  val y = 42
+  y
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	if api.Body == nil {
+		t.Fatal("expected body")
+	}
+	t.Logf("stmts count: %d", len(api.Body.Stmts))
+	for i, s := range api.Body.Stmts {
+		t.Logf("stmt[%d]: %T", i, s)
+	}
+	if len(api.Body.Stmts) != 3 {
+		t.Errorf("expected 3 statements, got %d", len(api.Body.Stmts))
+	}
+}
+
+func TestStatementBoundaryAfterObjectExpr(t *testing.T) {
+	input := `api test(): Int {
+  val x = AuthResult { token: "abc", user: "test" }
+  val y = 42
+  y
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	if api.Body == nil {
+		t.Fatal("expected body")
+	}
+	t.Logf("stmts count: %d", len(api.Body.Stmts))
+	for i, s := range api.Body.Stmts {
+		t.Logf("stmt[%d]: %T", i, s)
+	}
+	if len(api.Body.Stmts) != 3 {
+		t.Errorf("expected 3 statements, got %d", len(api.Body.Stmts))
+	}
+}
+
+func TestStatementBoundaryCreateThenObjectExpr(t *testing.T) {
+	input := `api test(): Int {
+  val user = create(User, name: "test")
+  AuthResult { token: "abc", user: user }
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	if api.Body == nil {
+		t.Fatal("expected body")
+	}
+	t.Logf("stmts count: %d", len(api.Body.Stmts))
+	for i, s := range api.Body.Stmts {
+		t.Logf("stmt[%d]: %T", i, s)
+		if vs, ok := s.(*ast.ValStmt); ok {
+			t.Logf("  val %s = %T", vs.Name, vs.Value)
+		}
+		if es, ok := s.(*ast.ExprStmt); ok {
+			t.Logf("  expr: %T", es.Expr)
+		}
+	}
+	if len(api.Body.Stmts) != 2 {
+		t.Errorf("expected 2 statements, got %d", len(api.Body.Stmts))
+	}
+}
