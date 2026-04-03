@@ -21,7 +21,7 @@ type Document struct {
 	Result  *semantic.Result
 	Tokens  []token.Token
 
-	lexErrors  []lexer.Error
+	lexErrors   []lexer.Error
 	parseErrors []parser.Error
 }
 

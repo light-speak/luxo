@@ -25,10 +25,10 @@ func FuzzLexer(f *testing.F) {
 		`用户 名前 이름`,
 		`"\\"escaped\\""`,
 		`model { } [ ] ( ) , : . @ ? = + - * / %`,
-		"model\x00User",      // null byte
+		"model\x00User", // null byte
 		"model\tUser\r\n{}\r\n",
-		string([]byte{0xFF, 0xFE, 0xFD}), // invalid UTF-8
-		`"` + string(make([]byte, 10000)),  // very long string
+		string([]byte{0xFF, 0xFE, 0xFD}),              // invalid UTF-8
+		`"` + string(make([]byte, 10000)),             // very long string
 		`model ` + string(make([]byte, 1000)) + ` {}`, // very long identifier
 	}
 

@@ -25,7 +25,7 @@ type ModelDecl struct {
 	Pos        token.Position
 	Doc        string
 	Name       string
-	Parents    []string       // inheritance: ["Base", "Searchable"]
+	Parents    []string // inheritance: ["Base", "Searchable"]
 	Fields     []*FieldDecl
 	Scopes     []*ScopeDecl
 	Directives []*Directive
@@ -356,20 +356,20 @@ type Block struct {
 
 // ========== Interface implementations ==========
 
-func (n *Literal) exprNode()          {}
-func (n *Ident) exprNode()            {}
-func (n *MemberExpr) exprNode()       {}
-func (n *CallExpr) exprNode()         {}
-func (n *BinaryExpr) exprNode()       {}
-func (n *UnaryExpr) exprNode()        {}
-func (n *ElvisExpr) exprNode()        {}
-func (n *WhenExpr) exprNode()         {}
-func (n *LambdaExpr) exprNode()       {}
-func (n *ListExpr) exprNode()         {}
-func (n *ObjectExpr) exprNode()       {}
-func (n *TemplateString) exprNode()   {}
-func (n *RangeExpr) exprNode()        {}
-func (n *TransactionExpr) exprNode()  {}
+func (n *Literal) exprNode()         {}
+func (n *Ident) exprNode()           {}
+func (n *MemberExpr) exprNode()      {}
+func (n *CallExpr) exprNode()        {}
+func (n *BinaryExpr) exprNode()      {}
+func (n *UnaryExpr) exprNode()       {}
+func (n *ElvisExpr) exprNode()       {}
+func (n *WhenExpr) exprNode()        {}
+func (n *LambdaExpr) exprNode()      {}
+func (n *ListExpr) exprNode()        {}
+func (n *ObjectExpr) exprNode()      {}
+func (n *TemplateString) exprNode()  {}
+func (n *RangeExpr) exprNode()       {}
+func (n *TransactionExpr) exprNode() {}
 
 func (n *ValStmt) stmtNode()    {}
 func (n *IfStmt) stmtNode()     {}
@@ -379,20 +379,20 @@ func (n *ThrowStmt) stmtNode()  {}
 func (n *EmitStmt) stmtNode()   {}
 func (n *ExprStmt) stmtNode()   {}
 
-func (n *Literal) GetPos() token.Position          { return n.Pos }
-func (n *Ident) GetPos() token.Position             { return n.Pos }
-func (n *MemberExpr) GetPos() token.Position        { return n.Pos }
-func (n *CallExpr) GetPos() token.Position          { return n.Pos }
-func (n *BinaryExpr) GetPos() token.Position        { return n.Pos }
-func (n *UnaryExpr) GetPos() token.Position         { return n.Pos }
-func (n *ElvisExpr) GetPos() token.Position         { return n.Pos }
-func (n *WhenExpr) GetPos() token.Position          { return n.Pos }
-func (n *LambdaExpr) GetPos() token.Position        { return n.Pos }
-func (n *ListExpr) GetPos() token.Position          { return n.Pos }
-func (n *ObjectExpr) GetPos() token.Position        { return n.Pos }
-func (n *TemplateString) GetPos() token.Position    { return n.Pos }
-func (n *RangeExpr) GetPos() token.Position         { return n.Pos }
-func (n *TransactionExpr) GetPos() token.Position   { return n.Pos }
+func (n *Literal) GetPos() token.Position         { return n.Pos }
+func (n *Ident) GetPos() token.Position           { return n.Pos }
+func (n *MemberExpr) GetPos() token.Position      { return n.Pos }
+func (n *CallExpr) GetPos() token.Position        { return n.Pos }
+func (n *BinaryExpr) GetPos() token.Position      { return n.Pos }
+func (n *UnaryExpr) GetPos() token.Position       { return n.Pos }
+func (n *ElvisExpr) GetPos() token.Position       { return n.Pos }
+func (n *WhenExpr) GetPos() token.Position        { return n.Pos }
+func (n *LambdaExpr) GetPos() token.Position      { return n.Pos }
+func (n *ListExpr) GetPos() token.Position        { return n.Pos }
+func (n *ObjectExpr) GetPos() token.Position      { return n.Pos }
+func (n *TemplateString) GetPos() token.Position  { return n.Pos }
+func (n *RangeExpr) GetPos() token.Position       { return n.Pos }
+func (n *TransactionExpr) GetPos() token.Position { return n.Pos }
 
 func (n *ValStmt) GetPos() token.Position    { return n.Pos }
 func (n *IfStmt) GetPos() token.Position     { return n.Pos }

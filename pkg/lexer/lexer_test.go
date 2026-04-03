@@ -341,9 +341,9 @@ func TestQuestionVariants(t *testing.T) {
 	tokens, _ := l.Tokenize()
 
 	expected := []token.Type{
-		token.Ident, token.Question,          // String?
+		token.Ident, token.Question, // String?
 		token.Ident, token.SafeDot, token.Ident, // user?.name
-		token.Ident, token.Elvis, token.Ident,    // value ?: fallback
+		token.Ident, token.Elvis, token.Ident, // value ?: fallback
 		token.EOF,
 	}
 

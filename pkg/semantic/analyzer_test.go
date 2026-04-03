@@ -1712,7 +1712,7 @@ func TestElvisNarrowingOnIdent(t *testing.T) {
 				Body: &ast.Block{
 					Stmts: []ast.Stmt{
 						&ast.ValStmt{
-							Name: "user",
+							Name:  "user",
 							Value: &ast.Literal{Kind: token.Null, Value: "null"},
 						},
 						&ast.ExprStmt{

@@ -344,9 +344,9 @@ func (s *Server) getSymbolCompletions(doc *Document, prefix string) []Completion
 		}
 
 		items = append(items, CompletionItem{
-			Label:  sym.Name,
-			Kind:   kind,
-			Detail: detail,
+			Label:         sym.Name,
+			Kind:          kind,
+			Detail:        detail,
 			Documentation: sym.Doc,
 		})
 	}

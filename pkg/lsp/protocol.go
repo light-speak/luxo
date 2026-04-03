@@ -7,18 +7,18 @@ import "encoding/json"
 
 // Request represents a JSON-RPC request.
 type Request struct {
-	JSONRPC string          `json:"jsonrpc"`
+	JSONRPC string           `json:"jsonrpc"`
 	ID      *json.RawMessage `json:"id,omitempty"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params,omitempty"`
+	Method  string           `json:"method"`
+	Params  json.RawMessage  `json:"params,omitempty"`
 }
 
 // Response represents a JSON-RPC response.
 type Response struct {
-	JSONRPC string      `json:"jsonrpc"`
+	JSONRPC string           `json:"jsonrpc"`
 	ID      *json.RawMessage `json:"id"`
-	Result  any         `json:"result,omitempty"`
-	Error   *RespError  `json:"error,omitempty"`
+	Result  any              `json:"result,omitempty"`
+	Error   *RespError       `json:"error,omitempty"`
 }
 
 // RespError represents a JSON-RPC error.
@@ -51,7 +51,7 @@ type ServerInfo struct {
 }
 
 type ServerCapabilities struct {
-	TextDocumentSync   int            `json:"textDocumentSync"`   // 1=Full, 2=Incremental
+	TextDocumentSync   int            `json:"textDocumentSync"` // 1=Full, 2=Incremental
 	CompletionProvider *CompletionOpt `json:"completionProvider,omitempty"`
 	HoverProvider      bool           `json:"hoverProvider"`
 	DefinitionProvider bool           `json:"definitionProvider"`
@@ -75,8 +75,8 @@ type TextDocumentItem struct {
 }
 
 type DidChangeParams struct {
-	TextDocument   VersionedTextDocID    `json:"textDocument"`
-	ContentChanges []TextDocumentChange  `json:"contentChanges"`
+	TextDocument   VersionedTextDocID   `json:"textDocument"`
+	ContentChanges []TextDocumentChange `json:"contentChanges"`
 }
 
 type VersionedTextDocID struct {
@@ -145,7 +145,7 @@ type CompletionList struct {
 
 type CompletionItem struct {
 	Label         string `json:"label"`
-	Kind          int    `json:"kind"`           // 1=Text,2=Method,3=Function,6=Variable,7=Class,8=Interface,13=Enum,14=Keyword,15=Snippet
+	Kind          int    `json:"kind"` // 1=Text,2=Method,3=Function,6=Variable,7=Class,8=Interface,13=Enum,14=Keyword,15=Snippet
 	Detail        string `json:"detail,omitempty"`
 	Documentation string `json:"documentation,omitempty"`
 	InsertText    string `json:"insertText,omitempty"`

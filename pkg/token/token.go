@@ -32,25 +32,25 @@ const (
 	Question // ?
 
 	// Operators
-	Assign    // =
-	Plus      // +
-	Minus     // -
-	Star      // *
-	Slash     // /
-	Percent   // %
-	Bang      // !
-	Eq        // ==
-	Neq       // !=
-	Gt        // >
-	Gte       // >=
-	Lt        // <
-	Lte       // <=
-	And       // &&
-	Or        // ||
-	Arrow     // ->
-	DotDot    // ..
-	Elvis     // ?:
-	SafeDot   // ?.
+	Assign  // =
+	Plus    // +
+	Minus   // -
+	Star    // *
+	Slash   // /
+	Percent // %
+	Bang    // !
+	Eq      // ==
+	Neq     // !=
+	Gt      // >
+	Gte     // >=
+	Lt      // <
+	Lte     // <=
+	And     // &&
+	Or      // ||
+	Arrow   // ->
+	DotDot  // ..
+	Elvis   // ?:
+	SafeDot // ?.
 
 	// Keywords - Definitions
 	kwStart
@@ -141,38 +141,38 @@ var tokenNames = map[Type]string{
 	Elvis:   "?:",
 	SafeDot: "?.",
 
-	Model:      "model",
-	Interface:  "interface",
-	Enum:       "enum",
-	Sealed:     "sealed",
-	KwType:     "type",
-	Fn:         "fn",
-	Api:        "api",
-	Error:      "error",
-	Middleware: "middleware",
-	Extend:     "extend",
-	Override:   "override",
-	Use:        "use",
-	Through:    "through",
-	Stream:     "stream",
-	Val:        "val",
-	When:       "when",
-	If:         "if",
-	Else:       "else",
-	For:        "for",
-	In:         "in",
-	Return:     "return",
-	Is:         "is",
-	Find:       "find",
-	Create:     "create",
-	Update:     "update",
-	Delete:     "delete",
+	Model:       "model",
+	Interface:   "interface",
+	Enum:        "enum",
+	Sealed:      "sealed",
+	KwType:      "type",
+	Fn:          "fn",
+	Api:         "api",
+	Error:       "error",
+	Middleware:  "middleware",
+	Extend:      "extend",
+	Override:    "override",
+	Use:         "use",
+	Through:     "through",
+	Stream:      "stream",
+	Val:         "val",
+	When:        "when",
+	If:          "if",
+	Else:        "else",
+	For:         "for",
+	In:          "in",
+	Return:      "return",
+	Is:          "is",
+	Find:        "find",
+	Create:      "create",
+	Update:      "update",
+	Delete:      "delete",
 	Transaction: "transaction",
-	Emit:       "emit",
-	Throw:      "throw",
-	True:       "true",
-	False:      "false",
-	Null:       "null",
+	Emit:        "emit",
+	Throw:       "throw",
+	True:        "true",
+	False:       "false",
+	Null:        "null",
 }
 
 func (t Type) String() string {
