@@ -1,10 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 100" fill="none">
-  <defs>
-    <linearGradient id="bolt" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#FFD700"/>
-      <stop offset="100%" style="stop-color:#FF8C00"/>
-    </linearGradient>
-  </defs>
-  <path d="M22 5 L48 5 L37 38 L55 38 L20 95 L30 50 L13 50 Z" fill="url(#bolt)" />
-  <text x="70" y="72" font-family="'Helvetica Neue', Arial, sans-serif" font-size="68" font-weight="900" letter-spacing="8" fill="#E8E8E8">LUXO</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 80" fill="none">
+  <path d="M18 4 L40 4 L31 30 L46 30 L16 76 L24 40 L10 40 Z" fill="#F5A623"/>
+  <text x="58" y="58" font-family="Arial,sans-serif" font-size="56" font-weight="bold" letter-spacing="6" fill="#E8E8E8">LUXO</text>
 </svg>
