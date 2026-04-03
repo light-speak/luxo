@@ -2182,3 +2182,16 @@ fn doSomething(x: Int) {
 		t.Logf("sym.Type = %v (expected nil since no return type annotation)", sym.Type)
 	}
 }
+
+// Regression: fuzz found panic on nil map when model name conflicts with builtin type
+func TestModelNameConflictWithBuiltin(t *testing.T) {
+	result := analyze(t, `model Int { name: String }`)
+	// should report "already declared" error but not panic
+	expectError(t, result, "already declared")
+}
+
+func TestModelNameConflictWithBuiltinFields(t *testing.T) {
+	// model String shadows builtin, resolveFields should not panic
+	result := analyze(t, `model String { value: Int }`)
+	expectError(t, result, "already declared")
+}

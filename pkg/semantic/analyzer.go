@@ -209,6 +209,9 @@ func (a *Analyzer) resolveFields(file *ast.File) {
 		if typ == nil {
 			continue
 		}
+		if typ.Fields == nil {
+			typ.Fields = make(map[string]*FieldInfo)
+		}
 		for _, f := range m.Fields {
 			fi := a.resolveFieldDecl(f)
 			if fi != nil {
@@ -227,6 +230,9 @@ func (a *Analyzer) resolveFields(file *ast.File) {
 		if typ == nil {
 			continue
 		}
+		if typ.Fields == nil {
+			typ.Fields = make(map[string]*FieldInfo)
+		}
 		for _, f := range i.Fields {
 			fi := a.resolveFieldDecl(f)
 			if fi != nil {
@@ -239,6 +245,9 @@ func (a *Analyzer) resolveFields(file *ast.File) {
 		typ := a.types[t.Name]
 		if typ == nil {
 			continue
+		}
+		if typ.Fields == nil {
+			typ.Fields = make(map[string]*FieldInfo)
 		}
 		for _, f := range t.Fields {
 			fi := a.resolveFieldDecl(f)
