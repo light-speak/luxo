@@ -106,107 +106,43 @@ func (l *Lexer) nextToken() token.Token {
 
 	// Dot, DotDot
 	case ch == '.':
-		l.advance()
-		if l.peek() == '.' {
-			l.advance()
-			return l.makeToken(token.DotDot, "..", pos)
-		}
-		return l.makeToken(token.Dot, ".", pos)
+		return l.readDotOrRange(pos)
 
 	// Question, Elvis, SafeDot
 	case ch == '?':
-		l.advance()
-		switch l.peek() {
-		case ':':
-			l.advance()
-			return l.makeToken(token.Elvis, "?:", pos)
-		case '.':
-			l.advance()
-			return l.makeToken(token.SafeDot, "?.", pos)
-		}
-		return l.makeToken(token.Question, "?", pos)
+		return l.readQuestion(pos)
 
 	// Assign, Eq
 	case ch == '=':
-		l.advance()
-		if l.peek() == '=' {
-			l.advance()
-			return l.makeToken(token.Eq, "==", pos)
-		}
-		return l.makeToken(token.Assign, "=", pos)
+		return l.readEquals(pos)
 
 	// Bang, Neq
 	case ch == '!':
-		l.advance()
-		if l.peek() == '=' {
-			l.advance()
-			return l.makeToken(token.Neq, "!=", pos)
-		}
-		return l.makeToken(token.Bang, "!", pos)
+		return l.readBang(pos)
 
 	// Gt, Gte
 	case ch == '>':
-		l.advance()
-		if l.peek() == '=' {
-			l.advance()
-			return l.makeToken(token.Gte, ">=", pos)
-		}
-		return l.makeToken(token.Gt, ">", pos)
+		return l.readGreater(pos)
 
 	// Lt, Lte
 	case ch == '<':
-		l.advance()
-		if l.peek() == '=' {
-			l.advance()
-			return l.makeToken(token.Lte, "<=", pos)
-		}
-		return l.makeToken(token.Lt, "<", pos)
+		return l.readLess(pos)
 
 	// And
 	case ch == '&':
-		l.advance()
-		if l.peek() == '&' {
-			l.advance()
-			return l.makeToken(token.And, "&&", pos)
-		}
-		l.error(pos, "unexpected '&', did you mean '&&'?")
-		return l.makeToken(token.Illegal, "&", pos)
+		return l.readAmpersand(pos)
 
 	// Or
 	case ch == '|':
-		l.advance()
-		if l.peek() == '|' {
-			l.advance()
-			return l.makeToken(token.Or, "||", pos)
-		}
-		l.error(pos, "unexpected '|', did you mean '||'?")
-		return l.makeToken(token.Illegal, "|", pos)
+		return l.readPipe(pos)
 
 	// Minus, Arrow
 	case ch == '-':
-		l.advance()
-		if l.peek() == '>' {
-			l.advance()
-			return l.makeToken(token.Arrow, "->", pos)
-		}
-		return l.makeToken(token.Minus, "-", pos)
+		return l.readMinus(pos)
 
 	// Slash, Comment, DocComment, BlockComment
 	case ch == '/':
-		l.advance()
-		if l.peek() == '/' {
-			l.advance()
-			if l.peek() == '/' {
-				l.advance()
-				return l.readDocComment(pos)
-			}
-			return l.readLineComment(pos)
-		}
-		if l.peek() == '*' {
-			l.advance()
-			return l.readBlockComment(pos)
-		}
-		return l.makeToken(token.Slash, "/", pos)
+		return l.readSlashOrComment(pos)
 
 	// String
 	case ch == '"':
@@ -225,6 +161,120 @@ func (l *Lexer) nextToken() token.Token {
 		l.error(pos, fmt.Sprintf("unexpected character: %c", ch))
 		return l.makeToken(token.Illegal, string(ch), pos)
 	}
+}
+
+// readDotOrRange reads a dot or dot-dot token.
+func (l *Lexer) readDotOrRange(pos token.Position) token.Token {
+	l.advance()
+	if l.peek() == '.' {
+		l.advance()
+		return l.makeToken(token.DotDot, "..", pos)
+	}
+	return l.makeToken(token.Dot, ".", pos)
+}
+
+// readQuestion reads a question mark, elvis, or safe-dot token.
+func (l *Lexer) readQuestion(pos token.Position) token.Token {
+	l.advance()
+	switch l.peek() {
+	case ':':
+		l.advance()
+		return l.makeToken(token.Elvis, "?:", pos)
+	case '.':
+		l.advance()
+		return l.makeToken(token.SafeDot, "?.", pos)
+	}
+	return l.makeToken(token.Question, "?", pos)
+}
+
+// readEquals reads an assign or equality token.
+func (l *Lexer) readEquals(pos token.Position) token.Token {
+	l.advance()
+	if l.peek() == '=' {
+		l.advance()
+		return l.makeToken(token.Eq, "==", pos)
+	}
+	return l.makeToken(token.Assign, "=", pos)
+}
+
+// readBang reads a bang or not-equal token.
+func (l *Lexer) readBang(pos token.Position) token.Token {
+	l.advance()
+	if l.peek() == '=' {
+		l.advance()
+		return l.makeToken(token.Neq, "!=", pos)
+	}
+	return l.makeToken(token.Bang, "!", pos)
+}
+
+// readGreater reads a greater-than or greater-than-or-equal token.
+func (l *Lexer) readGreater(pos token.Position) token.Token {
+	l.advance()
+	if l.peek() == '=' {
+		l.advance()
+		return l.makeToken(token.Gte, ">=", pos)
+	}
+	return l.makeToken(token.Gt, ">", pos)
+}
+
+// readLess reads a less-than or less-than-or-equal token.
+func (l *Lexer) readLess(pos token.Position) token.Token {
+	l.advance()
+	if l.peek() == '=' {
+		l.advance()
+		return l.makeToken(token.Lte, "<=", pos)
+	}
+	return l.makeToken(token.Lt, "<", pos)
+}
+
+// readAmpersand reads an ampersand (expecting &&).
+func (l *Lexer) readAmpersand(pos token.Position) token.Token {
+	l.advance()
+	if l.peek() == '&' {
+		l.advance()
+		return l.makeToken(token.And, "&&", pos)
+	}
+	l.error(pos, "unexpected '&', did you mean '&&'?")
+	return l.makeToken(token.Illegal, "&", pos)
+}
+
+// readPipe reads a pipe (expecting ||).
+func (l *Lexer) readPipe(pos token.Position) token.Token {
+	l.advance()
+	if l.peek() == '|' {
+		l.advance()
+		return l.makeToken(token.Or, "||", pos)
+	}
+	l.error(pos, "unexpected '|', did you mean '||'?")
+	return l.makeToken(token.Illegal, "|", pos)
+}
+
+// readMinus reads a minus or arrow token.
+func (l *Lexer) readMinus(pos token.Position) token.Token {
+	l.advance()
+	if l.peek() == '>' {
+		l.advance()
+		return l.makeToken(token.Arrow, "->", pos)
+	}
+	return l.makeToken(token.Minus, "-", pos)
+}
+
+// readSlashOrComment reads a slash, line comment, doc comment, or block comment.
+func (l *Lexer) readSlashOrComment(pos token.Position) token.Token {
+	l.advance()
+	if l.peek() == '/' {
+		l.advance()
+		if l.peek() == '/' {
+			l.advance()
+			return l.readDocComment(pos)
+		}
+		return l.readLineComment(pos)
+	}
+	if l.peek() == '*' {
+		l.advance()
+		return l.readBlockComment(pos)
+	}
+	return l.makeToken(token.Slash, "/", pos)
 }
 
 // readIdent reads an identifier or keyword.

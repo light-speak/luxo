@@ -204,6 +204,15 @@ func (a *Analyzer) resolveInheritance(file *ast.File) {
 // ========== Pass 3: Resolve Fields ==========
 
 func (a *Analyzer) resolveFields(file *ast.File) {
+	a.resolveModelFields(file)
+	a.resolveInterfaceFields(file)
+	a.resolveTypeFields(file)
+	a.resolveApiTypes(file)
+	a.resolveFnTypes(file)
+	a.resolveExtendFields(file)
+}
+
+func (a *Analyzer) resolveModelFields(file *ast.File) {
 	for _, m := range file.Models {
 		typ := a.types[m.Name]
 		if typ == nil {
@@ -224,7 +233,9 @@ func (a *Analyzer) resolveFields(file *ast.File) {
 		}
 		a.checkDirectives(m.Directives, "model")
 	}
+}
 
+func (a *Analyzer) resolveInterfaceFields(file *ast.File) {
 	for _, i := range file.Interfaces {
 		typ := a.types[i.Name]
 		if typ == nil {
@@ -240,7 +251,9 @@ func (a *Analyzer) resolveFields(file *ast.File) {
 			}
 		}
 	}
+}
 
+func (a *Analyzer) resolveTypeFields(file *ast.File) {
 	for _, t := range file.Types {
 		typ := a.types[t.Name]
 		if typ == nil {
@@ -256,8 +269,9 @@ func (a *Analyzer) resolveFields(file *ast.File) {
 			}
 		}
 	}
+}
 
-	// Resolve api return types and param types
+func (a *Analyzer) resolveApiTypes(file *ast.File) {
 	for _, api := range file.APIs {
 		sym := a.scope.Lookup(api.Name)
 		if sym == nil {
@@ -271,8 +285,9 @@ func (a *Analyzer) resolveFields(file *ast.File) {
 		}
 		a.checkDirectives(api.Directives, "api")
 	}
+}
 
-	// Resolve fn return types
+func (a *Analyzer) resolveFnTypes(file *ast.File) {
 	for _, fn := range file.Functions {
 		sym := a.scope.Lookup(fn.Name)
 		if sym == nil {
@@ -285,8 +300,9 @@ func (a *Analyzer) resolveFields(file *ast.File) {
 			a.resolveTypeRef(p.Type, fn.Pos)
 		}
 	}
+}
 
-	// Resolve extend fields
+func (a *Analyzer) resolveExtendFields(file *ast.File) {
 	for _, ext := range file.Extends {
 		if _, ok := a.types[ext.Name]; !ok {
 			// extend target might be in another module (resolved at gateway)
@@ -491,149 +507,41 @@ func (a *Analyzer) checkExpr(expr ast.Expr, scope *Scope) *ResolvedType {
 
 	switch e := expr.(type) {
 	case *ast.Literal:
-		return a.literalType(e)
-
+		return a.checkLiteralExpr(e)
 	case *ast.Ident:
-		// check if it's a type name
-		if typ, ok := a.types[e.Name]; ok {
-			return typ
-		}
-		// check local scope (includes parent scopes)
-		resolved := scope.ResolvedTypeOf(e.Name)
-		if resolved != nil {
-			return resolved
-		}
-		sym := scope.Lookup(e.Name)
-		if sym != nil {
-			return sym.Type
-		}
-		// don't error on built-in operations used as expressions
-		if isBuiltinOp(e.Name) {
-			return nil
-		}
-		a.addErrorWithSuggestion(e.Pos, e.Name, "undefined: '%s'", e.Name)
-		return nil
-
+		return a.checkIdentExpr(e, scope)
 	case *ast.MemberExpr:
-		objType := a.checkExpr(e.Object, scope)
-		if objType == nil {
-			return nil
-		}
-
-		if e.SafeCall && !objType.Nullable {
-			a.addWarning(e.Pos, "unnecessary safe call (?.) on non-null type '%s'", objType.Name)
-		}
-
-		field := objType.LookupField(e.Field)
-		if field == nil {
-			// check enum values
-			if objType.Kind == TypeEnum {
-				for _, v := range objType.EnumValues {
-					if v == e.Field {
-						return objType
-					}
-				}
-			}
-			a.addFieldError(e.Pos, objType, e.Field)
-			return nil
-		}
-
-		result := field.Type
-		if result != nil && e.SafeCall {
-			result = result.AsNullable()
-		}
-		return result
-
+		return a.checkMemberExpr(e, scope)
 	case *ast.CallExpr:
-		a.checkExpr(e.Func, scope)
-		for _, arg := range e.Args {
-			a.checkExpr(arg.Value, scope)
-		}
-		// return type is inferred from function declaration
-		if ident, ok := e.Func.(*ast.Ident); ok {
-			sym := a.scope.Lookup(ident.Name)
-			if sym != nil {
-				return sym.Type
-			}
-		}
-		return nil
-
+		return a.checkCallExpr(e, scope)
 	case *ast.BinaryExpr:
-		left := a.checkExpr(e.Left, scope)
-		right := a.checkExpr(e.Right, scope)
-		return a.checkBinaryOp(e.Op, left, right, e.Pos)
-
+		return a.checkBinaryExpr(e, scope)
 	case *ast.UnaryExpr:
-		inner := a.checkExpr(e.Value, scope)
-		if e.Op == "throw" {
-			return nil // throw never returns
-		}
-		if e.Op == "!" && inner != nil && inner.Kind != TypeBool {
-			a.addError(e.Pos, "operator '!' requires Boolean, got '%s'", inner.Name)
-		}
-		return inner
-
+		return a.checkUnaryExpr(e, scope)
 	case *ast.ElvisExpr:
-		leftType := a.checkExpr(e.Left, scope)
-		a.checkExpr(e.Right, scope)
-		if leftType == nil {
-			return nil
-		}
-		// after ?:, the left side is narrowed to non-null
-		if ident, ok := e.Left.(*ast.Ident); ok {
-			scope.Narrow(ident.Name, leftType.AsNonNull())
-		}
-		return leftType.AsNonNull()
-
+		return a.checkElvisExpr(e, scope)
 	case *ast.WhenExpr:
-		if e.Subject != nil {
-			a.checkExpr(e.Subject, scope)
-		}
-		for _, b := range e.Branches {
-			if b.Condition != nil {
-				a.checkExpr(b.Condition, scope)
-			}
-			if b.Body != nil {
-				a.checkExpr(b.Body, scope)
-			}
-		}
-		if e.Else != nil {
-			a.checkExpr(e.Else, scope)
-		}
-		return nil // TODO: infer when return type
-
+		return a.checkWhenExpr(e, scope)
 	case *ast.LambdaExpr:
-		childScope := scope.Child()
-		// 'it' is the implicit parameter
-		childScope.Define(&Symbol{
-			Name: "it",
-			Kind: SymVariable,
-		})
-		a.checkBlock(e.Body, childScope)
-		return nil
-
+		return a.checkLambdaExpr(e, scope)
 	case *ast.ListExpr:
 		for _, item := range e.Items {
 			a.checkExpr(item, scope)
 		}
 		return nil
-
 	case *ast.ObjectExpr:
 		for _, f := range e.Fields {
 			a.checkExpr(f.Value, scope)
 		}
 		return nil
-
 	case *ast.RangeExpr:
 		a.checkExpr(e.Start, scope)
 		a.checkExpr(e.End, scope)
 		return nil
-
 	case *ast.TransactionExpr:
 		childScope := scope.Child()
 		a.checkBlock(e.Body, childScope)
 		return nil
-
 	case *ast.TemplateString:
 		for _, part := range e.Parts {
 			a.checkExpr(part, scope)
@@ -641,6 +549,137 @@ func (a *Analyzer) checkExpr(expr ast.Expr, scope *Scope) *ResolvedType {
 		return &ResolvedType{Kind: TypeString, Name: "String"}
 	}
 
+	return nil
+}
+
+func (a *Analyzer) checkLiteralExpr(e *ast.Literal) *ResolvedType {
+	return a.literalType(e)
+}
+
+func (a *Analyzer) checkIdentExpr(e *ast.Ident, scope *Scope) *ResolvedType {
+	// check if it's a type name
+	if typ, ok := a.types[e.Name]; ok {
+		return typ
+	}
+	// check local scope (includes parent scopes)
+	resolved := scope.ResolvedTypeOf(e.Name)
+	if resolved != nil {
+		return resolved
+	}
+	sym := scope.Lookup(e.Name)
+	if sym != nil {
+		return sym.Type
+	}
+	// don't error on built-in operations used as expressions
+	if isBuiltinOp(e.Name) {
+		return nil
+	}
+	a.addErrorWithSuggestion(e.Pos, e.Name, "undefined: '%s'", e.Name)
+	return nil
+}
+
+func (a *Analyzer) checkMemberExpr(e *ast.MemberExpr, scope *Scope) *ResolvedType {
+	objType := a.checkExpr(e.Object, scope)
+	if objType == nil {
+		return nil
+	}
+
+	if e.SafeCall && !objType.Nullable {
+		a.addWarning(e.Pos, "unnecessary safe call (?.) on non-null type '%s'", objType.Name)
+	}
+
+	field := objType.LookupField(e.Field)
+	if field == nil {
+		// check enum values
+		if objType.Kind == TypeEnum {
+			for _, v := range objType.EnumValues {
+				if v == e.Field {
+					return objType
+				}
+			}
+		}
+		a.addFieldError(e.Pos, objType, e.Field)
+		return nil
+	}
+
+	result := field.Type
+	if result != nil && e.SafeCall {
+		result = result.AsNullable()
+	}
+	return result
+}
+
+func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
+	a.checkExpr(e.Func, scope)
+	for _, arg := range e.Args {
+		a.checkExpr(arg.Value, scope)
+	}
+	// return type is inferred from function declaration
+	if ident, ok := e.Func.(*ast.Ident); ok {
+		sym := a.scope.Lookup(ident.Name)
+		if sym != nil {
+			return sym.Type
+		}
+	}
+	return nil
+}
+
+func (a *Analyzer) checkBinaryExpr(e *ast.BinaryExpr, scope *Scope) *ResolvedType {
+	left := a.checkExpr(e.Left, scope)
+	right := a.checkExpr(e.Right, scope)
+	return a.checkBinaryOp(e.Op, left, right, e.Pos)
+}
+
+func (a *Analyzer) checkUnaryExpr(e *ast.UnaryExpr, scope *Scope) *ResolvedType {
+	inner := a.checkExpr(e.Value, scope)
+	if e.Op == "throw" {
+		return nil // throw never returns
+	}
+	if e.Op == "!" && inner != nil && inner.Kind != TypeBool {
+		a.addError(e.Pos, "operator '!' requires Boolean, got '%s'", inner.Name)
+	}
+	return inner
+}
+
+func (a *Analyzer) checkElvisExpr(e *ast.ElvisExpr, scope *Scope) *ResolvedType {
+	leftType := a.checkExpr(e.Left, scope)
+	a.checkExpr(e.Right, scope)
+	if leftType == nil {
+		return nil
+	}
+	// after ?:, the left side is narrowed to non-null
+	if ident, ok := e.Left.(*ast.Ident); ok {
+		scope.Narrow(ident.Name, leftType.AsNonNull())
+	}
+	return leftType.AsNonNull()
+}
+
+func (a *Analyzer) checkWhenExpr(e *ast.WhenExpr, scope *Scope) *ResolvedType {
+	if e.Subject != nil {
+		a.checkExpr(e.Subject, scope)
+	}
+	for _, b := range e.Branches {
+		if b.Condition != nil {
+			a.checkExpr(b.Condition, scope)
+		}
+		if b.Body != nil {
+			a.checkExpr(b.Body, scope)
+		}
+	}
+	if e.Else != nil {
+		a.checkExpr(e.Else, scope)
+	}
+	return nil // TODO: infer when return type
+}
+
+func (a *Analyzer) checkLambdaExpr(e *ast.LambdaExpr, scope *Scope) *ResolvedType {
+	childScope := scope.Child()
+	// 'it' is the implicit parameter
+	childScope.Define(&Symbol{
+		Name: "it",
+		Kind: SymVariable,
+	})
+	a.checkBlock(e.Body, childScope)
 	return nil
 }
 
@@ -669,16 +708,7 @@ func (a *Analyzer) checkBinaryOp(op string, left, right *ResolvedType, pos token
 
 	switch op {
 	case "+", "-", "*", "/", "%":
-		if !left.IsNumeric() || !right.IsNumeric() {
-			if op == "+" && left.Kind == TypeString {
-				return left // string concatenation
-			}
-			a.addError(pos, "operator '%s' requires numeric types, got '%s' and '%s'", op, left.Name, right.Name)
-		}
-		if left.Kind == TypeFloat || right.Kind == TypeFloat {
-			return a.types["Float"]
-		}
-		return a.types["Int"]
+		return a.checkArithmeticOp(op, left, right, pos)
 
 	case "==", "!=":
 		return a.types["Boolean"]
@@ -700,6 +730,19 @@ func (a *Analyzer) checkBinaryOp(op string, left, right *ResolvedType, pos token
 	}
 
 	return nil
+}
+
+func (a *Analyzer) checkArithmeticOp(op string, left, right *ResolvedType, pos token.Position) *ResolvedType {
+	if !left.IsNumeric() || !right.IsNumeric() {
+		if op == "+" && left.Kind == TypeString {
+			return left // string concatenation
+		}
+		a.addError(pos, "operator '%s' requires numeric types, got '%s' and '%s'", op, left.Name, right.Name)
+	}
+	if left.Kind == TypeFloat || right.Kind == TypeFloat {
+		return a.types["Float"]
+	}
+	return a.types["Int"]
 }
 
 // ========== Directive Validation ==========

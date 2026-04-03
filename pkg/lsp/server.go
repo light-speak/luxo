@@ -243,43 +243,59 @@ func (s *Server) getMemberCompletions(doc *Document, pos Position) []CompletionI
 
 	// look up the type
 	if typ, ok := doc.Result.Types[objName]; ok {
-		// type member access: Role.USER, Role.ADMIN
-		if typ.Kind == semantic.TypeEnum {
-			for _, v := range typ.EnumValues {
-				items = append(items, CompletionItem{
-					Label:  v,
-					Kind:   20, // EnumMember
-					Detail: objName + "." + v,
-				})
-			}
-		}
-		// model field access
-		for name, field := range typ.Fields {
-			detail := field.Type.Name
-			if field.Nullable {
-				detail += "?"
-			}
-			items = append(items, CompletionItem{
-				Label:  name,
-				Kind:   5, // Field
-				Detail: detail,
-			})
-		}
-		// inherited fields
-		for _, parent := range typ.Parents {
-			for name, field := range parent.Fields {
-				detail := field.Type.Name + " (from " + parent.Name + ")"
-				items = append(items, CompletionItem{
-					Label:  name,
-					Kind:   5,
-					Detail: detail,
-				})
-			}
-		}
-		return items
+		return s.getTypeMemberCompletions(typ, objName)
 	}
 
 	// variable member access: look up variable type
+	items = append(items, s.getVariableMemberCompletions(doc, objName)...)
+
+	// collection methods
+	items = append(items, getCollectionMethodCompletions()...)
+
+	return items
+}
+
+func (s *Server) getTypeMemberCompletions(typ *semantic.ResolvedType, objName string) []CompletionItem {
+	var items []CompletionItem
+
+	// type member access: Role.USER, Role.ADMIN
+	if typ.Kind == semantic.TypeEnum {
+		for _, v := range typ.EnumValues {
+			items = append(items, CompletionItem{
+				Label:  v,
+				Kind:   20, // EnumMember
+				Detail: objName + "." + v,
+			})
+		}
+	}
+	// model field access
+	for name, field := range typ.Fields {
+		detail := field.Type.Name
+		if field.Nullable {
+			detail += "?"
+		}
+		items = append(items, CompletionItem{
+			Label:  name,
+			Kind:   5, // Field
+			Detail: detail,
+		})
+	}
+	// inherited fields
+	for _, parent := range typ.Parents {
+		for name, field := range parent.Fields {
+			detail := field.Type.Name + " (from " + parent.Name + ")"
+			items = append(items, CompletionItem{
+				Label:  name,
+				Kind:   5,
+				Detail: detail,
+			})
+		}
+	}
+	return items
+}
+
+func (s *Server) getVariableMemberCompletions(doc *Document, objName string) []CompletionItem {
+	var items []CompletionItem
 	sym := doc.Result.Scope.Lookup(objName)
 	if sym != nil && sym.Type != nil {
 		for name, field := range sym.Type.Fields {
@@ -294,8 +310,10 @@ func (s *Server) getMemberCompletions(doc *Document, pos Position) []CompletionI
 			})
 		}
 	}
+	return items
+}
 
-	// collection methods
+func getCollectionMethodCompletions() []CompletionItem {
 	collectionMethods := []struct {
 		name   string
 		detail string
@@ -315,6 +333,7 @@ func (s *Server) getMemberCompletions(doc *Document, pos Position) []CompletionI
 		{"lowercase", "to lowercase"},
 		{"uppercase", "to uppercase"},
 	}
+	items := make([]CompletionItem, 0, len(collectionMethods))
 	for _, m := range collectionMethods {
 		items = append(items, CompletionItem{
 			Label:  m.name,
@@ -322,7 +341,6 @@ func (s *Server) getMemberCompletions(doc *Document, pos Position) []CompletionI
 			Detail: m.detail,
 		})
 	}
-
 	return items
 }
 

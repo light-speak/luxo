@@ -51,51 +51,59 @@ func (p *Parser) Parse(filename string) (*ast.File, []Error) {
 	file := &ast.File{Name: filename}
 
 	for !p.isEOF() {
-		p.consumeDoc()
-
-		switch {
-		case p.check(token.Model):
-			file.Models = append(file.Models, p.parseModel())
-		case p.check(token.Interface):
-			file.Interfaces = append(file.Interfaces, p.parseInterface())
-		case p.check(token.Enum):
-			file.Enums = append(file.Enums, p.parseEnum())
-		case p.check(token.Sealed):
-			file.Sealeds = append(file.Sealeds, p.parseSealed())
-		case p.check(token.KwType):
-			file.Types = append(file.Types, p.parseType())
-		case p.check(token.Api):
-			file.APIs = append(file.APIs, p.parseAPI())
-		case p.check(token.Override):
-			p.advance() // consume 'override'
-			if p.check(token.Api) {
-				api := p.parseAPI()
-				api.Override = true
-				file.APIs = append(file.APIs, api)
-			} else {
-				p.error("expected 'api' after 'override', got %s", p.current().Val)
-			}
-		case p.check(token.Fn):
-			file.Functions = append(file.Functions, p.parseFn())
-		case p.check(token.Error):
-			file.Errors = append(file.Errors, p.parseError())
-		case p.check(token.Extend):
-			file.Extends = append(file.Extends, p.parseExtend())
-		case p.check(token.Use):
-			file.Uses = append(file.Uses, p.parseUse())
-		case p.check(token.Middleware):
-			file.Middlewares = append(file.Middlewares, p.parseMiddleware())
-		case p.check(token.Comment):
-			p.advance() // skip standalone comments
-		case p.check(token.EOF):
-			return file, p.errors
-		default:
-			p.error("unexpected token: %s", p.current().Val)
-			p.advance()
+		if p.check(token.EOF) {
+			break
 		}
+		p.parseTopLevel(file)
 	}
 
 	return file, p.errors
+}
+
+// parseTopLevel parses one top-level declaration and appends it to the file.
+func (p *Parser) parseTopLevel(file *ast.File) {
+	p.consumeDoc()
+
+	switch {
+	case p.check(token.Model):
+		file.Models = append(file.Models, p.parseModel())
+	case p.check(token.Interface):
+		file.Interfaces = append(file.Interfaces, p.parseInterface())
+	case p.check(token.Enum):
+		file.Enums = append(file.Enums, p.parseEnum())
+	case p.check(token.Sealed):
+		file.Sealeds = append(file.Sealeds, p.parseSealed())
+	case p.check(token.KwType):
+		file.Types = append(file.Types, p.parseType())
+	case p.check(token.Api):
+		file.APIs = append(file.APIs, p.parseAPI())
+	case p.check(token.Override):
+		p.advance() // consume 'override'
+		if p.check(token.Api) {
+			api := p.parseAPI()
+			api.Override = true
+			file.APIs = append(file.APIs, api)
+		} else {
+			p.error("expected 'api' after 'override', got %s", p.current().Val)
+		}
+	case p.check(token.Fn):
+		file.Functions = append(file.Functions, p.parseFn())
+	case p.check(token.Error):
+		file.Errors = append(file.Errors, p.parseError())
+	case p.check(token.Extend):
+		file.Extends = append(file.Extends, p.parseExtend())
+	case p.check(token.Use):
+		file.Uses = append(file.Uses, p.parseUse())
+	case p.check(token.Middleware):
+		file.Middlewares = append(file.Middlewares, p.parseMiddleware())
+	case p.check(token.Comment):
+		p.advance() // skip standalone comments
+	case p.check(token.EOF):
+		// do nothing, caller will break
+	default:
+		p.error("unexpected token: %s", p.current().Val)
+		p.advance()
+	}
 }
 
 // ========== Top-level Parsers ==========
@@ -815,33 +823,10 @@ func (p *Parser) parsePrefixExpr() ast.Expr {
 	pos := p.current().Pos
 
 	switch {
-	case p.check(token.Int):
-		tok := p.advance()
-		return &ast.Literal{Pos: pos, Kind: token.Int, Value: tok.Val}
-
-	case p.check(token.Float):
-		tok := p.advance()
-		return &ast.Literal{Pos: pos, Kind: token.Float, Value: tok.Val}
-
-	case p.check(token.String):
-		tok := p.advance()
-		return &ast.Literal{Pos: pos, Kind: token.String, Value: tok.Val}
-
-	case p.check(token.Duration):
-		tok := p.advance()
-		return &ast.Literal{Pos: pos, Kind: token.Duration, Value: tok.Val}
-
-	case p.check(token.True):
-		p.advance()
-		return &ast.Literal{Pos: pos, Kind: token.True, Value: "true"}
-
-	case p.check(token.False):
-		p.advance()
-		return &ast.Literal{Pos: pos, Kind: token.False, Value: "false"}
-
-	case p.check(token.Null):
-		p.advance()
-		return &ast.Literal{Pos: pos, Kind: token.Null, Value: "null"}
+	case p.check(token.Int), p.check(token.Float), p.check(token.String),
+		p.check(token.Duration), p.check(token.True), p.check(token.False),
+		p.check(token.Null):
+		return p.parseLiteral(pos)
 
 	case p.check(token.Ident) || p.isKeywordUsedAsIdent():
 		tok := p.advance()
@@ -884,6 +869,33 @@ func (p *Parser) parsePrefixExpr() ast.Expr {
 		p.error("expected expression, got %s", p.current().Type)
 		p.advance()
 		return nil
+	}
+}
+
+// parseLiteral parses a literal expression (Int, Float, String, Duration, True, False, Null).
+func (p *Parser) parseLiteral(pos token.Position) ast.Expr {
+	switch {
+	case p.check(token.Int):
+		tok := p.advance()
+		return &ast.Literal{Pos: pos, Kind: token.Int, Value: tok.Val}
+	case p.check(token.Float):
+		tok := p.advance()
+		return &ast.Literal{Pos: pos, Kind: token.Float, Value: tok.Val}
+	case p.check(token.String):
+		tok := p.advance()
+		return &ast.Literal{Pos: pos, Kind: token.String, Value: tok.Val}
+	case p.check(token.Duration):
+		tok := p.advance()
+		return &ast.Literal{Pos: pos, Kind: token.Duration, Value: tok.Val}
+	case p.check(token.True):
+		p.advance()
+		return &ast.Literal{Pos: pos, Kind: token.True, Value: "true"}
+	case p.check(token.False):
+		p.advance()
+		return &ast.Literal{Pos: pos, Kind: token.False, Value: "false"}
+	default: // token.Null
+		p.advance()
+		return &ast.Literal{Pos: pos, Kind: token.Null, Value: "null"}
 	}
 }
 
