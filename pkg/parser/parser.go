@@ -66,6 +66,15 @@ func (p *Parser) Parse(filename string) (*ast.File, []Error) {
 			file.Types = append(file.Types, p.parseType())
 		case p.check(token.Api):
 			file.APIs = append(file.APIs, p.parseAPI())
+		case p.check(token.Override):
+			p.advance() // consume 'override'
+			if p.check(token.Api) {
+				api := p.parseAPI()
+				api.Override = true
+				file.APIs = append(file.APIs, api)
+			} else {
+				p.error("expected 'api' after 'override', got %s", p.current().Val)
+			}
 		case p.check(token.Fn):
 			file.Functions = append(file.Functions, p.parseFn())
 		case p.check(token.Error):

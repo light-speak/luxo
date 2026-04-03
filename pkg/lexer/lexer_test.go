@@ -353,3 +353,302 @@ func TestQuestionVariants(t *testing.T) {
 		}
 	}
 }
+
+func TestUnterminatedString(t *testing.T) {
+	input := `"hello`
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+
+	if len(errs) == 0 {
+		t.Fatal("expected error for unterminated string")
+	}
+
+	found := false
+	for _, e := range errs {
+		if e.Message == "unterminated string" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected 'unterminated string' error, got: %v", errs)
+	}
+
+	// The unterminated string should produce an Illegal token
+	if tokens[0].Type != token.Illegal {
+		t.Errorf("expected ILLEGAL token, got %s", tokens[0].Type)
+	}
+}
+
+func TestNestedBlockComment(t *testing.T) {
+	input := `/* outer /* inner */ outer */`
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	// Nested block comment should be a single Comment token followed by EOF
+	if tokens[0].Type != token.Comment {
+		t.Errorf("expected COMMENT, got %s", tokens[0].Type)
+	}
+	if tokens[1].Type != token.EOF {
+		t.Errorf("expected EOF after nested block comment, got %s (%q)", tokens[1].Type, tokens[1].Val)
+	}
+}
+
+func TestUnterminatedBlockComment(t *testing.T) {
+	input := `/* unclosed`
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+
+	if len(errs) == 0 {
+		t.Fatal("expected error for unterminated block comment")
+	}
+
+	found := false
+	for _, e := range errs {
+		if e.Message == "unterminated block comment" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected 'unterminated block comment' error, got: %v", errs)
+	}
+
+	// Should produce an Illegal token
+	hasIllegal := false
+	for _, tok := range tokens {
+		if tok.Type == token.Illegal {
+			hasIllegal = true
+		}
+	}
+	if !hasIllegal {
+		t.Error("expected an ILLEGAL token for unterminated block comment")
+	}
+}
+
+func TestMultipleIllegalChars(t *testing.T) {
+	input := `model User { ~ ^ & }`
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+
+	// Should have errors for ~, ^, and &
+	if len(errs) < 3 {
+		t.Errorf("expected at least 3 errors, got %d: %v", len(errs), errs)
+	}
+
+	// Should still recover and find model, User, braces
+	types := map[token.Type]bool{}
+	for _, tok := range tokens {
+		types[tok.Type] = true
+	}
+	if !types[token.Model] {
+		t.Error("expected to find MODEL token despite errors")
+	}
+	if !types[token.Ident] {
+		t.Error("expected to find IDENT token (User) despite errors")
+	}
+	if !types[token.LBrace] {
+		t.Error("expected to find LBRACE token despite errors")
+	}
+	if !types[token.RBrace] {
+		t.Error("expected to find RBRACE token despite errors")
+	}
+}
+
+func TestEmptyInput(t *testing.T) {
+	l := New("", "test.luxo")
+	tokens, errs := l.Tokenize()
+
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if len(tokens) != 1 {
+		t.Fatalf("expected 1 token (EOF), got %d", len(tokens))
+	}
+	if tokens[0].Type != token.EOF {
+		t.Errorf("expected EOF, got %s", tokens[0].Type)
+	}
+}
+
+func TestOnlyWhitespace(t *testing.T) {
+	l := New("   \t\n\n  \r\n  ", "test.luxo")
+	tokens, errs := l.Tokenize()
+
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if len(tokens) != 1 {
+		t.Fatalf("expected 1 token (EOF), got %d", len(tokens))
+	}
+	if tokens[0].Type != token.EOF {
+		t.Errorf("expected EOF, got %s", tokens[0].Type)
+	}
+}
+
+func TestUnicodeIdentifiers(t *testing.T) {
+	input := `用户`
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if tokens[0].Type != token.Ident {
+		t.Errorf("expected IDENT for unicode identifier, got %s", tokens[0].Type)
+	}
+	if tokens[0].Val != "用户" {
+		t.Errorf("expected val %q, got %q", "用户", tokens[0].Val)
+	}
+}
+
+func TestAdjacentOperators(t *testing.T) {
+	input := `>=<=!=`
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	expected := []struct {
+		typ token.Type
+		val string
+	}{
+		{token.Gte, ">="},
+		{token.Lte, "<="},
+		{token.Neq, "!="},
+		{token.EOF, ""},
+	}
+
+	if len(tokens) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d", len(expected), len(tokens))
+	}
+
+	for i, exp := range expected {
+		if tokens[i].Type != exp.typ {
+			t.Errorf("token[%d]: expected %s, got %s", i, exp.typ, tokens[i].Type)
+		}
+		if tokens[i].Val != exp.val {
+			t.Errorf("token[%d]: expected val %q, got %q", i, exp.val, tokens[i].Val)
+		}
+	}
+}
+
+func TestDotAfterNumber(t *testing.T) {
+	// 42.toString: the lexer sees '42', then '.', peekAt(1) is 't' (not '.'),
+	// so it parses as a float "42." followed by ident "toString"
+	input := `42.toString`
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	if tokens[0].Type != token.Float {
+		t.Errorf("expected FLOAT for '42.', got %s (%q)", tokens[0].Type, tokens[0].Val)
+	}
+	if tokens[0].Val != "42." {
+		t.Errorf("expected val %q, got %q", "42.", tokens[0].Val)
+	}
+	if tokens[1].Type != token.Ident {
+		t.Errorf("expected IDENT for 'toString', got %s (%q)", tokens[1].Type, tokens[1].Val)
+	}
+	if tokens[1].Val != "toString" {
+		t.Errorf("expected val %q, got %q", "toString", tokens[1].Val)
+	}
+}
+
+func TestSingleAmpersand(t *testing.T) {
+	input := `&`
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+
+	if len(errs) == 0 {
+		t.Fatal("expected error for single '&'")
+	}
+
+	// Should have a suggestion about &&
+	found := false
+	for _, e := range errs {
+		if e.Message == "unexpected '&', did you mean '&&'?" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected suggestion about '&&', got: %v", errs)
+	}
+
+	// Should produce an Illegal token
+	if tokens[0].Type != token.Illegal {
+		t.Errorf("expected ILLEGAL, got %s", tokens[0].Type)
+	}
+	if tokens[0].Val != "&" {
+		t.Errorf("expected val %q, got %q", "&", tokens[0].Val)
+	}
+}
+
+func TestSinglePipe(t *testing.T) {
+	input := `|`
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+
+	if len(errs) == 0 {
+		t.Fatal("expected error for single '|'")
+	}
+
+	// Should have a suggestion about ||
+	found := false
+	for _, e := range errs {
+		if e.Message == "unexpected '|', did you mean '||'?" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected suggestion about '||', got: %v", errs)
+	}
+
+	// Should produce an Illegal token
+	if tokens[0].Type != token.Illegal {
+		t.Errorf("expected ILLEGAL, got %s", tokens[0].Type)
+	}
+	if tokens[0].Val != "|" {
+		t.Errorf("expected val %q, got %q", "|", tokens[0].Val)
+	}
+}
+
+func TestErrorStringFormat(t *testing.T) {
+	l := New("~", "test.luxo")
+	_, errs := l.Tokenize()
+	if len(errs) == 0 {
+		t.Fatal("expected error")
+	}
+	s := errs[0].Error()
+	if s == "" {
+		t.Error("expected non-empty error string")
+	}
+}
+
+func TestPeekAtBeyondEnd(t *testing.T) {
+	// Single char input, peekAt(1) should return 0
+	l := New("a", "test.luxo")
+	tokens, _ := l.Tokenize()
+	// 'a' → IDENT, then EOF. If peekAt works correctly, no panic.
+	if tokens[0].Type != token.Ident {
+		t.Errorf("expected IDENT, got %s", tokens[0].Type)
+	}
+}
+
+func TestAdvanceBeyondEnd(t *testing.T) {
+	// Ensure advancing past EOF doesn't panic
+	l := New("", "test.luxo")
+	tokens, _ := l.Tokenize()
+	if tokens[0].Type != token.EOF {
+		t.Errorf("expected EOF, got %s", tokens[0].Type)
+	}
+}

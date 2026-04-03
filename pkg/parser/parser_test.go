@@ -827,3 +827,407 @@ func TestStatementBoundaryCreateThenObjectExpr(t *testing.T) {
 		t.Errorf("expected 2 statements, got %d", len(api.Body.Stmts))
 	}
 }
+
+func TestParseOverrideApi(t *testing.T) {
+	input := `override api createUser(input: UserInput): User {
+  val x = 1
+}`
+	file := parse(t, input)
+
+	if len(file.APIs) != 1 {
+		t.Fatalf("expected 1 api, got %d", len(file.APIs))
+	}
+	api := file.APIs[0]
+	if !api.Override {
+		t.Error("expected api to be marked as override")
+	}
+	if api.Name != "createUser" {
+		t.Errorf("expected 'createUser', got %q", api.Name)
+	}
+	if len(api.Params) != 1 {
+		t.Errorf("expected 1 param, got %d", len(api.Params))
+	}
+	if api.ReturnType.Name != "User" {
+		t.Errorf("expected return type 'User', got %q", api.ReturnType.Name)
+	}
+	if api.Body == nil {
+		t.Fatal("expected body")
+	}
+	if len(api.Body.Stmts) != 1 {
+		t.Errorf("expected 1 statement, got %d", len(api.Body.Stmts))
+	}
+}
+
+func TestParseWhenIsType(t *testing.T) {
+	input := `api test(): String {
+  val x = when(result) {
+    is Success -> "ok"
+    is Failed -> "err"
+    else -> "?"
+  }
+  return x
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	valStmt := api.Body.Stmts[0].(*ast.ValStmt)
+	when, ok := valStmt.Value.(*ast.WhenExpr)
+	if !ok {
+		t.Fatalf("expected WhenExpr, got %T", valStmt.Value)
+	}
+	if when.Subject == nil {
+		t.Error("expected when subject")
+	}
+	if len(when.Branches) != 2 {
+		t.Fatalf("expected 2 branches, got %d", len(when.Branches))
+	}
+	if when.Branches[0].IsType != "Success" {
+		t.Errorf("expected IsType 'Success', got %q", when.Branches[0].IsType)
+	}
+	if when.Branches[1].IsType != "Failed" {
+		t.Errorf("expected IsType 'Failed', got %q", when.Branches[1].IsType)
+	}
+	if when.Else == nil {
+		t.Error("expected else branch")
+	}
+}
+
+func TestParseWhenNoSubject(t *testing.T) {
+	input := `api test(): String {
+  val x = when {
+    x > 0 -> "pos"
+    else -> "neg"
+  }
+  return x
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	valStmt := api.Body.Stmts[0].(*ast.ValStmt)
+	when, ok := valStmt.Value.(*ast.WhenExpr)
+	if !ok {
+		t.Fatalf("expected WhenExpr, got %T", valStmt.Value)
+	}
+	if when.Subject != nil {
+		t.Error("expected no subject for when without parens")
+	}
+	if len(when.Branches) != 1 {
+		t.Fatalf("expected 1 branch, got %d", len(when.Branches))
+	}
+	if when.Else == nil {
+		t.Error("expected else branch")
+	}
+}
+
+func TestParseTrailingLambda(t *testing.T) {
+	input := `api test(): String {
+  val x = items.filter { it.active }
+  val y = items.map { it.name }
+  return x
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+
+	// items.filter { it.active }
+	valStmt := api.Body.Stmts[0].(*ast.ValStmt)
+	call, ok := valStmt.Value.(*ast.CallExpr)
+	if !ok {
+		t.Fatalf("expected CallExpr, got %T", valStmt.Value)
+	}
+	member, ok := call.Func.(*ast.MemberExpr)
+	if !ok {
+		t.Fatalf("expected MemberExpr func, got %T", call.Func)
+	}
+	if member.Field != "filter" {
+		t.Errorf("expected 'filter', got %q", member.Field)
+	}
+	if len(call.Args) != 1 {
+		t.Fatalf("expected 1 arg (lambda), got %d", len(call.Args))
+	}
+	_, ok = call.Args[0].Value.(*ast.LambdaExpr)
+	if !ok {
+		t.Fatalf("expected LambdaExpr arg, got %T", call.Args[0].Value)
+	}
+
+	// items.map { it.name }
+	valStmt2 := api.Body.Stmts[1].(*ast.ValStmt)
+	call2, ok := valStmt2.Value.(*ast.CallExpr)
+	if !ok {
+		t.Fatalf("expected CallExpr, got %T", valStmt2.Value)
+	}
+	member2, ok := call2.Func.(*ast.MemberExpr)
+	if !ok {
+		t.Fatalf("expected MemberExpr func, got %T", call2.Func)
+	}
+	if member2.Field != "map" {
+		t.Errorf("expected 'map', got %q", member2.Field)
+	}
+}
+
+func TestParseChainedCalls(t *testing.T) {
+	input := `api test(): String {
+  val x = users.filter { it.active }.map { it.name }.sortBy { it }
+  return x
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	valStmt := api.Body.Stmts[0].(*ast.ValStmt)
+
+	// The outermost should be a CallExpr for .sortBy { it }
+	call, ok := valStmt.Value.(*ast.CallExpr)
+	if !ok {
+		t.Fatalf("expected CallExpr, got %T", valStmt.Value)
+	}
+	member, ok := call.Func.(*ast.MemberExpr)
+	if !ok {
+		t.Fatalf("expected MemberExpr func, got %T", call.Func)
+	}
+	if member.Field != "sortBy" {
+		t.Errorf("expected 'sortBy', got %q", member.Field)
+	}
+}
+
+func TestParseNestedMemberAccess(t *testing.T) {
+	input := `api test(): String {
+  val x = a.b.c.d
+  return x
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	valStmt := api.Body.Stmts[0].(*ast.ValStmt)
+
+	// a.b.c.d => MemberExpr{Object: MemberExpr{Object: MemberExpr{Object: Ident{a}, Field: b}, Field: c}, Field: d}
+	m, ok := valStmt.Value.(*ast.MemberExpr)
+	if !ok {
+		t.Fatalf("expected MemberExpr, got %T", valStmt.Value)
+	}
+	if m.Field != "d" {
+		t.Errorf("expected field 'd', got %q", m.Field)
+	}
+	m2, ok := m.Object.(*ast.MemberExpr)
+	if !ok {
+		t.Fatalf("expected MemberExpr for .c, got %T", m.Object)
+	}
+	if m2.Field != "c" {
+		t.Errorf("expected field 'c', got %q", m2.Field)
+	}
+	m3, ok := m2.Object.(*ast.MemberExpr)
+	if !ok {
+		t.Fatalf("expected MemberExpr for .b, got %T", m2.Object)
+	}
+	if m3.Field != "b" {
+		t.Errorf("expected field 'b', got %q", m3.Field)
+	}
+}
+
+func TestParseSafeDotChain(t *testing.T) {
+	input := `api test(): String {
+  val x = user?.address?.city?.name
+  return x
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	valStmt := api.Body.Stmts[0].(*ast.ValStmt)
+
+	// user?.address?.city?.name
+	m, ok := valStmt.Value.(*ast.MemberExpr)
+	if !ok {
+		t.Fatalf("expected MemberExpr, got %T", valStmt.Value)
+	}
+	if m.Field != "name" || !m.SafeCall {
+		t.Errorf("expected ?.name (safe), got field=%q safe=%v", m.Field, m.SafeCall)
+	}
+	m2, ok := m.Object.(*ast.MemberExpr)
+	if !ok {
+		t.Fatalf("expected MemberExpr for ?.city, got %T", m.Object)
+	}
+	if m2.Field != "city" || !m2.SafeCall {
+		t.Errorf("expected ?.city (safe), got field=%q safe=%v", m2.Field, m2.SafeCall)
+	}
+	m3, ok := m2.Object.(*ast.MemberExpr)
+	if !ok {
+		t.Fatalf("expected MemberExpr for ?.address, got %T", m2.Object)
+	}
+	if m3.Field != "address" || !m3.SafeCall {
+		t.Errorf("expected ?.address (safe), got field=%q safe=%v", m3.Field, m3.SafeCall)
+	}
+}
+
+func TestParseUnaryNot(t *testing.T) {
+	input := `api test(): Boolean {
+  val x = !condition
+  return x
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	valStmt := api.Body.Stmts[0].(*ast.ValStmt)
+
+	unary, ok := valStmt.Value.(*ast.UnaryExpr)
+	if !ok {
+		t.Fatalf("expected UnaryExpr, got %T", valStmt.Value)
+	}
+	if unary.Op != "!" {
+		t.Errorf("expected op '!', got %q", unary.Op)
+	}
+	ident, ok := unary.Value.(*ast.Ident)
+	if !ok {
+		t.Fatalf("expected Ident, got %T", unary.Value)
+	}
+	if ident.Name != "condition" {
+		t.Errorf("expected 'condition', got %q", ident.Name)
+	}
+}
+
+func TestParseUnaryMinus(t *testing.T) {
+	input := `api test(): Int {
+  val x = -42
+  return x
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	valStmt := api.Body.Stmts[0].(*ast.ValStmt)
+
+	unary, ok := valStmt.Value.(*ast.UnaryExpr)
+	if !ok {
+		t.Fatalf("expected UnaryExpr, got %T", valStmt.Value)
+	}
+	if unary.Op != "-" {
+		t.Errorf("expected op '-', got %q", unary.Op)
+	}
+	lit, ok := unary.Value.(*ast.Literal)
+	if !ok {
+		t.Fatalf("expected Literal, got %T", unary.Value)
+	}
+	if lit.Value != "42" {
+		t.Errorf("expected '42', got %q", lit.Value)
+	}
+}
+
+func TestParseParenExpr(t *testing.T) {
+	input := `api test(): Int {
+  val x = (a + b) * c
+  return x
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	valStmt := api.Body.Stmts[0].(*ast.ValStmt)
+
+	// (a + b) * c => BinaryExpr{Left: BinaryExpr{a + b}, Op: *, Right: c}
+	bin, ok := valStmt.Value.(*ast.BinaryExpr)
+	if !ok {
+		t.Fatalf("expected BinaryExpr, got %T", valStmt.Value)
+	}
+	if bin.Op != "*" {
+		t.Errorf("expected '*' at top level, got %q", bin.Op)
+	}
+	inner, ok := bin.Left.(*ast.BinaryExpr)
+	if !ok {
+		t.Fatalf("expected BinaryExpr for (a + b), got %T", bin.Left)
+	}
+	if inner.Op != "+" {
+		t.Errorf("expected '+' inside parens, got %q", inner.Op)
+	}
+}
+
+func TestParseListExpr(t *testing.T) {
+	input := `api test(): Int {
+  val x = [1, 2, 3]
+  return x
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	valStmt := api.Body.Stmts[0].(*ast.ValStmt)
+
+	list, ok := valStmt.Value.(*ast.ListExpr)
+	if !ok {
+		t.Fatalf("expected ListExpr, got %T", valStmt.Value)
+	}
+	if len(list.Items) != 3 {
+		t.Fatalf("expected 3 items, got %d", len(list.Items))
+	}
+	for i, item := range list.Items {
+		lit, ok := item.(*ast.Literal)
+		if !ok {
+			t.Fatalf("item[%d]: expected Literal, got %T", i, item)
+		}
+		expected := []string{"1", "2", "3"}
+		if lit.Value != expected[i] {
+			t.Errorf("item[%d]: expected %q, got %q", i, expected[i], lit.Value)
+		}
+	}
+}
+
+func TestParseApiStream(t *testing.T) {
+	input := `api watchComments(postId: Int): stream Comment`
+	file := parse(t, input)
+
+	if len(file.APIs) != 1 {
+		t.Fatalf("expected 1 api, got %d", len(file.APIs))
+	}
+	api := file.APIs[0]
+	if api.Name != "watchComments" {
+		t.Errorf("expected 'watchComments', got %q", api.Name)
+	}
+	if api.ReturnType.Name != "stream Comment" {
+		t.Errorf("expected 'stream Comment', got %q", api.ReturnType.Name)
+	}
+	if len(api.Params) != 1 {
+		t.Errorf("expected 1 param, got %d", len(api.Params))
+	}
+	if api.Params[0].Name != "postId" {
+		t.Errorf("expected param 'postId', got %q", api.Params[0].Name)
+	}
+}
+
+func TestParseErrorRecovery(t *testing.T) {
+	// Invalid syntax: missing colon in field declaration.
+	// The parser should not crash/panic but should collect errors.
+	input := `model Broken {
+  name String
+}`
+	l := lexer.New(input, "test.luxo")
+	tokens, lexErrors := l.Tokenize()
+	if len(lexErrors) > 0 {
+		t.Fatalf("lexer errors: %v", lexErrors)
+	}
+	p := New(tokens)
+	file, parseErrors := p.Parse("test.luxo")
+
+	// We expect parse errors (missing colon)
+	if len(parseErrors) == 0 {
+		t.Error("expected parse errors for invalid syntax, got none")
+	}
+	// The parser should still return a file (not nil/crash)
+	if file == nil {
+		t.Fatal("expected non-nil file even with errors")
+	}
+}
+
+func TestParseMultipleApis(t *testing.T) {
+	input := `api getUser(id: Int): User
+api listUsers(limit: Int): Page<User>
+api deleteUser(id: Int): Boolean`
+	file := parse(t, input)
+
+	if len(file.APIs) != 3 {
+		t.Fatalf("expected 3 apis, got %d", len(file.APIs))
+	}
+	names := []string{"getUser", "listUsers", "deleteUser"}
+	for i, api := range file.APIs {
+		if api.Name != names[i] {
+			t.Errorf("api[%d]: expected %q, got %q", i, names[i], api.Name)
+		}
+	}
+
+	// Verify return types
+	if file.APIs[0].ReturnType.Name != "User" {
+		t.Errorf("api[0]: expected return type 'User', got %q", file.APIs[0].ReturnType.Name)
+	}
+	if file.APIs[1].ReturnType.Name != "Page" {
+		t.Errorf("api[1]: expected return type 'Page', got %q", file.APIs[1].ReturnType.Name)
+	}
+	if len(file.APIs[1].ReturnType.TypeArgs) != 1 {
+		t.Error("api[1]: expected generic type arg")
+	}
+	if file.APIs[2].ReturnType.Name != "Boolean" {
+		t.Errorf("api[2]: expected return type 'Boolean', got %q", file.APIs[2].ReturnType.Name)
+	}
+}

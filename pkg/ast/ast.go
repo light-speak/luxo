@@ -74,6 +74,7 @@ type TypeDecl struct {
 type ApiDecl struct {
 	Pos        token.Position
 	Doc        string
+	Override   bool // override api ...
 	Name       string
 	Params     []*ParamDecl
 	ReturnType *TypeRef
