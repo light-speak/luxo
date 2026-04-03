@@ -51,7 +51,6 @@ func (p *Parser) Parse(filename string) (*ast.File, []Error) {
 	file := &ast.File{Name: filename}
 
 	for !p.isEOF() {
-		startPos := p.pos
 		p.consumeDoc()
 
 		switch {
@@ -92,11 +91,6 @@ func (p *Parser) Parse(filename string) (*ast.File, []Error) {
 			return file, p.errors
 		default:
 			p.error("unexpected token: %s", p.current().Val)
-			p.advance()
-		}
-
-		// prevent infinite loop in main parse
-		if p.pos == startPos {
 			p.advance()
 		}
 	}
@@ -656,15 +650,9 @@ func (p *Parser) parseBlock() *ast.Block {
 	block := &ast.Block{Pos: pos}
 
 	for !p.check(token.RBrace) && !p.isEOF() {
-		startPos := p.pos
 		stmt := p.parseStmt()
 		if stmt != nil {
 			block.Stmts = append(block.Stmts, stmt)
-		}
-		// prevent infinite loop
-		if p.pos == startPos {
-			p.error("stuck at token: %s", p.current().Val)
-			p.advance()
 		}
 	}
 	p.expect(token.RBrace)
@@ -891,14 +879,6 @@ func (p *Parser) parsePrefixExpr() ast.Expr {
 	case p.check(token.Transaction):
 		p.advance()
 		return &ast.TransactionExpr{Pos: pos, Body: p.parseBlock()}
-
-	case p.check(token.Find), p.check(token.Create), p.check(token.Update), p.check(token.Delete):
-		tok := p.advance()
-		ident := &ast.Ident{Pos: pos, Name: tok.Val}
-		if p.check(token.LParen) {
-			return p.parseCallArgs(pos, ident)
-		}
-		return ident
 
 	default:
 		p.error("expected expression, got %s", p.current().Type)
