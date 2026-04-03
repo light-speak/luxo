@@ -4,6 +4,9 @@
 
 一个高性能、Schema 驱动的 Go 框架，用于构建现代 API。支持二进制编码和客户端按需字段选择。
 
+[![Tests](https://github.com/light-speak/luxo/actions/workflows/test.yml/badge.svg)](https://github.com/light-speak/luxo/actions/workflows/test.yml)
+[![codecov](https://codecov.io/gh/light-speak/luxo/branch/main/graph/badge.svg)](https://codecov.io/gh/light-speak/luxo)
+[![Go Report Card](https://goreportcard.com/badge/github.com/light-speak/luxo)](https://goreportcard.com/report/github.com/light-speak/luxo)
 [![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 

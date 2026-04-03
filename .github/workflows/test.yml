@@ -1,0 +1,74 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests with coverage
+        run: go test ./pkg/... -v -coverprofile=coverage.out -timeout 120s -count=1
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+      - name: Coverage gate (minimum 95%)
+        run: |
+          TOTAL=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | sed 's/%//')
+          echo "Total coverage: ${TOTAL}%"
+          if (( $(echo "$TOTAL < 95" | bc -l) )); then
+            echo "::error::Coverage ${TOTAL}% is below 95% threshold"
+            exit 1
+          fi
+          echo "Coverage ${TOTAL}% meets threshold"
+
+      - name: Upload coverage to Codecov
+        if: github.event_name == 'push'
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.out
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./pkg/... ./cmd/...
+
+      - name: Build
+        run: go build ./pkg/... ./cmd/...
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Fuzz Lexer
+        run: go test ./pkg/lexer/ -fuzz=FuzzLexer -fuzztime=30s -timeout=60s
+
+      - name: Fuzz Parser
+        run: go test ./pkg/parser/ -fuzz=FuzzParser -fuzztime=30s -timeout=60s
+
+      - name: Fuzz Semantic
+        run: go test ./pkg/semantic/ -fuzz=FuzzAnalyzer -fuzztime=30s -timeout=60s
