@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 
+	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
 )
@@ -211,6 +212,9 @@ func (s *Server) getCompletions(doc *Document, pos Position) []CompletionItem {
 	// built-in type completions
 	items = append(items, getBuiltinTypeCompletions(prefix)...)
 
+	// local variable/parameter completions
+	items = append(items, getLocalCompletions(doc, pos)...)
+
 	return items
 }
 
@@ -312,8 +316,28 @@ func (s *Server) getVariableMemberCompletions(doc *Document, objName string) []C
 				Detail: detail,
 			})
 		}
+		return items
 	}
+
+	// Also check AST parameters for type resolution
+	items = append(items, s.getParamMemberCompletions(doc, objName)...)
 	return items
+}
+
+// getParamMemberCompletions resolves a parameter's type from the AST and returns field completions.
+func (s *Server) getParamMemberCompletions(doc *Document, paramName string) []CompletionItem {
+	if doc.File == nil || doc.Result == nil {
+		return nil
+	}
+	typeName := findParamTypeName(doc.File, paramName)
+	if typeName == "" {
+		return nil
+	}
+	typ, ok := doc.Result.Types[typeName]
+	if !ok {
+		return nil
+	}
+	return s.getTypeMemberCompletions(typ, typeName)
 }
 
 func getCollectionMethodCompletions() []CompletionItem {
@@ -535,6 +559,187 @@ func getBuiltinTypeCompletions(prefix string) []CompletionItem {
 	return items
 }
 
+// ========== Local Completions ==========
+
+// getLocalCompletions collects parameters and val declarations visible at pos.
+func getLocalCompletions(doc *Document, pos Position) []CompletionItem {
+	if doc.File == nil {
+		return nil
+	}
+
+	var items []CompletionItem
+	items = append(items, getAPILocalCompletions(doc.File, pos)...)
+	items = append(items, getFnLocalCompletions(doc.File, pos)...)
+	return items
+}
+
+// getAPILocalCompletions collects params and locals from the API enclosing pos.
+func getAPILocalCompletions(file *ast.File, pos Position) []CompletionItem {
+	var items []CompletionItem
+	for _, api := range file.APIs {
+		apiStartLine := api.Pos.Line - 1 // convert 1-based to 0-based
+		if pos.Line < apiStartLine {
+			continue
+		}
+		for _, p := range api.Params {
+			items = append(items, CompletionItem{
+				Label:  p.Name,
+				Kind:   6, // Variable
+				Detail: "param: " + typeRefToString(p.Type),
+			})
+		}
+		if api.Body != nil {
+			items = append(items, collectValsFromBlock(api.Body, pos)...)
+		}
+		// currentUser is available inside any api body
+		items = append(items, CompletionItem{
+			Label:  "currentUser",
+			Kind:   6,
+			Detail: "current authenticated user",
+		})
+	}
+	return items
+}
+
+// getFnLocalCompletions collects params and locals from the fn enclosing pos.
+func getFnLocalCompletions(file *ast.File, pos Position) []CompletionItem {
+	var items []CompletionItem
+	for _, fn := range file.Functions {
+		fnStartLine := fn.Pos.Line - 1
+		if pos.Line < fnStartLine {
+			continue
+		}
+		if fn.Body == nil {
+			continue
+		}
+		for _, p := range fn.Params {
+			items = append(items, CompletionItem{
+				Label:  p.Name,
+				Kind:   6,
+				Detail: "param: " + typeRefToString(p.Type),
+			})
+		}
+		items = append(items, collectValsFromBlock(fn.Body, pos)...)
+	}
+	return items
+}
+
+// collectValsFromBlock collects val declarations and for-loop variables before pos.
+func collectValsFromBlock(block *ast.Block, pos Position) []CompletionItem {
+	var items []CompletionItem
+	for _, stmt := range block.Stmts {
+		if stmt.GetPos().Line-1 > pos.Line {
+			break
+		}
+		if vs, ok := stmt.(*ast.ValStmt); ok {
+			items = append(items, CompletionItem{
+				Label:  vs.Name,
+				Kind:   6,
+				Detail: "val",
+			})
+		}
+		if fs, ok := stmt.(*ast.ForStmt); ok {
+			if fs.VarName != "" {
+				items = append(items, CompletionItem{
+					Label:  fs.VarName,
+					Kind:   6,
+					Detail: "loop variable",
+				})
+			}
+		}
+	}
+	return items
+}
+
+// findParamTypeName searches all api/fn declarations for a parameter with the given name.
+func findParamTypeName(file *ast.File, paramName string) string {
+	for _, api := range file.APIs {
+		for _, p := range api.Params {
+			if p.Name == paramName && p.Type != nil {
+				return p.Type.Name
+			}
+		}
+	}
+	for _, fn := range file.Functions {
+		for _, p := range fn.Params {
+			if p.Name == paramName && p.Type != nil {
+				return p.Type.Name
+			}
+		}
+	}
+	return ""
+}
+
+// typeRefToString converts a TypeRef to a human-readable string.
+func typeRefToString(t *ast.TypeRef) string {
+	if t == nil {
+		return ""
+	}
+	name := t.Name
+	if t.IsList {
+		name = "[" + name + "]"
+	}
+	if t.Nullable {
+		name += "?"
+	}
+	return name
+}
+
+// getLocalHover returns a hover string for a local variable, parameter, or field.
+func getLocalHover(doc *Document, word string, pos Position) string {
+	if doc.File == nil {
+		return ""
+	}
+	// check api params
+	for _, api := range doc.File.APIs {
+		if pos.Line < api.Pos.Line-1 {
+			continue
+		}
+		for _, p := range api.Params {
+			if p.Name == word {
+				return "```luxo\nparam " + p.Name + ": " + typeRefToString(p.Type) + "\n```"
+			}
+		}
+	}
+	// check fn params
+	for _, fn := range doc.File.Functions {
+		if pos.Line < fn.Pos.Line-1 {
+			continue
+		}
+		for _, p := range fn.Params {
+			if p.Name == word {
+				return "```luxo\nparam " + p.Name + ": " + typeRefToString(p.Type) + "\n```"
+			}
+		}
+	}
+	// check model fields — show doc comment + type
+	for _, m := range doc.File.Models {
+		for _, f := range m.Fields {
+			if f.Name == word {
+				return formatFieldHover(m.Name, f)
+			}
+		}
+	}
+	return ""
+}
+
+// formatFieldHover formats a hover string for a model field with doc comment.
+func formatFieldHover(modelName string, f *ast.FieldDecl) string {
+	var b strings.Builder
+	b.WriteString("```luxo\n")
+	b.WriteString(modelName + "." + f.Name + ": " + typeRefToString(f.Type))
+	if len(f.Directives) > 0 {
+		for _, d := range f.Directives {
+			b.WriteString(" @" + d.Name)
+		}
+	}
+	b.WriteString("\n```")
+	if f.Doc != "" {
+		b.WriteString("\n\n---\n\n" + f.Doc)
+	}
+	return b.String()
+}
+
 // ========== Hover ==========
 
 func (s *Server) handleHover(req *Request) error {
@@ -567,6 +772,15 @@ func (s *Server) handleHover(req *Request) error {
 		})
 	}
 
+	// local parameter/variable hover
+	if doc.File != nil {
+		if hover := getLocalHover(doc, word, params.Position); hover != "" {
+			return s.transport.SendResponse(req.ID, Hover{
+				Contents: MarkupContent{Kind: "markdown", Value: hover},
+			})
+		}
+	}
+
 	// built-in function hover
 	if desc := builtinFunctionDescription(word); desc != "" {
 		return s.transport.SendResponse(req.ID, Hover{
@@ -590,60 +804,72 @@ func formatTypeHover(name string, typ *semantic.ResolvedType) string {
 
 	switch typ.Kind {
 	case semantic.TypeModel:
-		b.WriteString("model " + name)
-		if len(typ.Parents) > 0 {
-			b.WriteString(" : ")
-			for i, p := range typ.Parents {
-				if i > 0 {
-					b.WriteString(", ")
-				}
-				b.WriteString(p.Name)
-			}
-		}
-		b.WriteString(" {\n")
-		for fieldName, field := range typ.Fields {
-			b.WriteString("  " + fieldName + ": ")
-			if field.Type != nil {
-				b.WriteString(field.Type.Name)
-			}
-			if field.Nullable {
-				b.WriteString("?")
-			}
-			b.WriteString("\n")
-		}
-		b.WriteString("}")
-
+		formatModelHover(&b, name, typ)
 	case semantic.TypeEnum:
-		b.WriteString("enum " + name + " {\n")
-		for _, v := range typ.EnumValues {
-			b.WriteString("  " + v + "\n")
-		}
-		b.WriteString("}")
-
+		formatEnumHover(&b, name, typ)
 	case semantic.TypeSealed:
-		b.WriteString("sealed " + name + " {\n")
-		for _, v := range typ.Variants {
-			b.WriteString("  " + v.Name)
-			if len(v.Fields) > 0 {
-				b.WriteString("(")
-				for i, f := range v.Fields {
-					if i > 0 {
-						b.WriteString(", ")
-					}
-					b.WriteString(f.Name)
-				}
-				b.WriteString(")")
-			}
-			b.WriteString("\n")
-		}
-		b.WriteString("}")
-
+		formatSealedHover(&b, name, typ)
 	default:
 		b.WriteString("type " + name)
 	}
 
 	b.WriteString("\n```")
 	return b.String()
+}
+
+func formatModelHover(b *strings.Builder, name string, typ *semantic.ResolvedType) {
+	b.WriteString("model " + name)
+	if len(typ.Parents) > 0 {
+		b.WriteString(" : ")
+		for i, p := range typ.Parents {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(p.Name)
+		}
+	}
+	b.WriteString(" {\n")
+	for fieldName, field := range typ.Fields {
+		b.WriteString("  " + fieldName + ": ")
+		if field.Type != nil {
+			b.WriteString(field.Type.Name)
+		}
+		if field.Nullable {
+			b.WriteString("?")
+		}
+		if field.Doc != "" {
+			b.WriteString("  // " + field.Doc)
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("}")
+}
+
+func formatEnumHover(b *strings.Builder, name string, typ *semantic.ResolvedType) {
+	b.WriteString("enum " + name + " {\n")
+	for _, v := range typ.EnumValues {
+		b.WriteString("  " + v + "\n")
+	}
+	b.WriteString("}")
+}
+
+func formatSealedHover(b *strings.Builder, name string, typ *semantic.ResolvedType) {
+	b.WriteString("sealed " + name + " {\n")
+	for _, v := range typ.Variants {
+		b.WriteString("  " + v.Name)
+		if len(v.Fields) > 0 {
+			b.WriteString("(")
+			for i, f := range v.Fields {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(f.Name)
+			}
+			b.WriteString(")")
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("}")
 }
 
 func formatSymbolHover(sym *semantic.Symbol) string {
@@ -708,6 +934,13 @@ func builtinFunctionDescription(word string) string {
 		"storage":     "`storage(...)` — Storage operation\n\n存储操作",
 		"mail":        "`mail(...)` — Send mail\n\n发送邮件",
 		"task":        "`task(...)` — Async task\n\n异步任务",
+		"Channel":     "`Channel<T>(size)` — Create a buffered channel for coroutine communication\n\n创建缓冲 channel 用于协程通信",
+		"http":        "`http.get(url)` / `http.post(url, body)` — HTTP client\n\nHTTP 客户端",
+		"json":        "`json.parse(str)` / `json.stringify(obj)` — JSON serialization\n\nJSON 序列化",
+		"time":        "`time.now()` / `time.today()` — Date and time\n\n日期时间",
+		"math":        "`math.abs()` / `math.max()` — Math functions\n\n数学函数",
+		"crypto":      "`crypto.sha256()` / `crypto.randomToken()` — Cryptographic functions\n\n加密函数",
+		"request":     "`request.ip` / `request.header(name)` — Current HTTP request context\n\n当前 HTTP 请求上下文",
 	}
 	return descriptions[word]
 }

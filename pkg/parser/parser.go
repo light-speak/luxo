@@ -35,10 +35,11 @@ func (e Error) Error() string {
 
 // Parser parses a token stream into an AST.
 type Parser struct {
-	tokens  []token.Token
-	pos     int
-	errors  []Error
-	lastDoc string
+	tokens        []token.Token
+	pos           int
+	errors        []Error
+	lastDoc       string
+	noBraceLambda bool // when true, { is not treated as trailing lambda in expressions
 }
 
 // New creates a new Parser.
@@ -140,6 +141,12 @@ func (p *Parser) parseModel() *ast.ModelDecl {
 	p.expect(token.LBrace)
 	for !p.check(token.RBrace) && !p.isEOF() {
 		p.consumeDoc()
+
+		// skip regular comments inside model body
+		if p.check(token.Comment) {
+			p.advance()
+			continue
+		}
 
 		// scope declaration
 		if p.check(token.Ident) && p.current().Val == "scope" {
@@ -713,6 +720,10 @@ func (p *Parser) parseStmt() ast.Stmt {
 		return &ast.BreakStmt{Pos: pos}
 	case p.check(token.Ident) && p.isAssignOp(p.peekType()):
 		return p.parseAssignStmt()
+	case p.check(token.Ident) && p.peekType() == token.Dot:
+		// could be member assignment: user.name = "value"
+		// or regular expression: user.name (member access)
+		return p.parseExprOrAssignStmt()
 	case p.check(token.Comment), p.check(token.DocComment):
 		p.advance()
 		return nil
@@ -743,6 +754,28 @@ func (p *Parser) parseAssignStmt() *ast.AssignStmt {
 	}
 }
 
+// parseExprOrAssignStmt parses either a member assignment (user.name = value)
+// or a regular expression statement (user.name).
+func (p *Parser) parseExprOrAssignStmt() ast.Stmt {
+	pos := p.current().Pos
+	// parse the left side as an expression (handles member access chains)
+	expr := p.parseExpr(precNone)
+
+	// check if followed by assign op
+	if p.isAssignOp(p.current().Type) {
+		op := p.advance().Val
+		value := p.parseExpr(precNone)
+		return &ast.AssignStmt{
+			Pos:    pos,
+			Target: expr,
+			Op:     op,
+			Value:  value,
+		}
+	}
+
+	return &ast.ExprStmt{Pos: pos, Expr: expr}
+}
+
 func (p *Parser) parseValStmt() *ast.ValStmt {
 	pos := p.current().Pos
 	p.expect(token.Val)
@@ -752,21 +785,11 @@ func (p *Parser) parseValStmt() *ast.ValStmt {
 	// destructuring: val (x, y) = ...
 	if p.check(token.LParen) {
 		p.advance()
-		names := []string{}
 		for !p.check(token.RParen) && !p.isEOF() {
-			names = append(names, p.expectIdent())
+			stmt.Names = append(stmt.Names, p.expectIdent())
 			p.match(token.Comma)
 		}
 		p.expect(token.RParen)
-		// Store as comma-joined name for now
-		joined := ""
-		for i, n := range names {
-			if i > 0 {
-				joined += ","
-			}
-			joined += n
-		}
-		stmt.Name = joined
 	} else {
 		stmt.Name = p.expectIdent()
 	}
@@ -823,10 +846,10 @@ func (p *Parser) parseForStmt() *ast.ForStmt {
 	if p.check(token.Ident) && p.peekType() == token.In {
 		stmt.VarName = p.expectIdent()
 		p.expect(token.In)
-		stmt.Collection = p.parseConditionExpr()
+		stmt.Collection = p.parseForCondition()
 	} else {
 		// conditional loop: for condition { ... }
-		stmt.Collection = p.parseConditionExpr()
+		stmt.Collection = p.parseForCondition()
 	}
 
 	stmt.Body = p.parseBlock()
@@ -1023,6 +1046,11 @@ func (p *Parser) parseInfixExpr(left ast.Expr) ast.Expr {
 		field := p.expectIdent()
 		return &ast.MemberExpr{Pos: pos, Object: left, Field: field, SafeCall: true}
 
+	// Postfix ? operator: riskyOperation(id)?
+	case p.check(token.Question):
+		p.advance()
+		return &ast.UnaryExpr{Pos: pos, Op: "?", Value: left}
+
 	// Function call: find(User, id: 1)
 	case p.check(token.LParen):
 		return p.parseCallArgs(pos, left)
@@ -1176,7 +1204,54 @@ func hasDirectiveBody(name string) bool {
 
 // parseConditionExpr parses an expression that stops before '{'.
 // Used in if/for conditions where '{' starts the block, not a lambda.
+// parseForCondition parses the condition/collection for a for loop.
+// Unlike parseExpr, it never treats { as trailing lambda — { starts the for body.
+func (p *Parser) parseForCondition() ast.Expr {
+	left := p.parsePrefixExpr()
+	if left == nil {
+		return nil
+	}
+	for !p.check(token.LBrace) && !p.isEOF() {
+		// only process infix operators that aren't {
+		switch {
+		case p.check(token.Dot):
+			p.advance()
+			field := p.expectIdent()
+			left = &ast.MemberExpr{Pos: left.GetPos(), Object: left, Field: field}
+		case p.check(token.SafeDot):
+			p.advance()
+			field := p.expectIdent()
+			left = &ast.MemberExpr{Pos: left.GetPos(), Object: left, Field: field, SafeCall: true}
+		case p.check(token.LParen):
+			left = p.parseCallArgs(left.GetPos(), left)
+		case p.isBinaryOp():
+			pos := p.current().Pos
+			op := p.current().Val
+			p.advance()
+			right := p.parseForCondition() // recurse without { being eaten
+			left = &ast.BinaryExpr{Pos: pos, Left: left, Op: op, Right: right}
+		case p.check(token.DotDot):
+			pos := p.current().Pos
+			p.advance()
+			right := p.parseForCondition()
+			left = &ast.RangeExpr{Pos: pos, Start: left, End: right}
+		case p.check(token.Elvis):
+			pos := p.current().Pos
+			p.advance()
+			right := p.parseForCondition()
+			left = &ast.ElvisExpr{Pos: pos, Left: left, Right: right}
+		default:
+			return left
+		}
+	}
+	return left
+}
+
 func (p *Parser) parseConditionExpr() ast.Expr {
+	old := p.noBraceLambda
+	p.noBraceLambda = true
+	defer func() { p.noBraceLambda = old }()
+
 	left := p.parsePrefixExpr()
 	if left == nil {
 		return nil
@@ -1209,10 +1284,13 @@ func (p *Parser) currentPrec() int {
 		return precAdd
 	case token.Star, token.Slash, token.Percent:
 		return precMul
-	case token.Dot, token.SafeDot, token.LParen:
+	case token.Dot, token.SafeDot, token.LParen, token.Question:
 		return precCall
 	case token.LBrace:
-		// trailing lambda only for callable expressions
+		// trailing lambda only for callable expressions, and not in condition context
+		if p.noBraceLambda {
+			return precNone
+		}
 		return precCall
 	}
 	return precNone

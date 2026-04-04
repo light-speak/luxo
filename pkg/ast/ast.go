@@ -329,7 +329,8 @@ type Stmt interface {
 // ValStmt: val x = expr, val x: Type = expr
 type ValStmt struct {
 	Pos   token.Position
-	Name  string
+	Name  string   // single name: val x = ...
+	Names []string // destructure: val (a, b, c) = ...
 	Type  *TypeRef // optional, usually inferred
 	Value Expr
 }

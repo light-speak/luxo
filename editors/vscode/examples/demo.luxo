@@ -1,54 +1,64 @@
 // ============================================
-// Luxo 语法完整演示 / Luxo Complete Syntax Demo
-// 覆盖所有语法特性，自包含无外部依赖
+// Luxo 完整业务演示 — 电商 + 社交 + 实时通信
+// Complete Business Demo — E-commerce + Social + Real-time
+// 覆盖所有语法特性
 // ============================================
 
-// ============================================
-// enum — 枚举类型 / Enumeration types
-// ============================================
-
-enum Role {
-  USER
-  ADMIN
-  MODERATOR
-}
-
-enum PostStatus {
-  DRAFT
-  PUBLISHED
-  ARCHIVED
-}
+import http
+import json
+import time
+import math
+import crypto
 
 // ============================================
-// model — 数据模型 / Data models
-// 支持继承(:)、注解(@)、默认值(=)、可空(?)
+// 枚举 / Enums
 // ============================================
 
-/// 用户模型 / User model
-model User {
+enum Role { USER ADMIN MODERATOR }
+enum PostStatus { DRAFT PUBLISHED ARCHIVED }
+enum OrderStatus { PENDING PAID SHIPPED COMPLETED CANCELLED }
+
+// ============================================
+// 数据模型 / Data Models
+// ============================================
+
+/// 用户 / User
+model User @crud {
+  /// 用户 ID / User ID
   id:        Int
-  name:      String
+  /// 用户名 / Username
+  name:      String    @filterable
+  /// 邮箱 / Email
   email:     String    @unique
+  /// 密码（不返回）/ Password (hidden)
   password:  String    @hidden @hash
+  /// 角色 / Role
   role:      Role      = Role.USER
+  /// 头像（可空）/ Avatar (nullable)
   avatar:    String?
+  /// 手机号（创建后不可改）/ Phone (immutable after create)
   phone:     String    @immutable
-  status:    String    @internal
+  /// 创建时间 / Created at
   createdAt: DateTime
 }
 
-/// 文章模型 / Post model
-model Post {
+/// 文章 / Post
+model Post @crud {
   id:        Int
+  /// 标题 / Title
   title:     String    @filterable
+  /// 内容 / Content
   content:   String
+  /// 状态 / Status
   status:    PostStatus = PostStatus.DRAFT
+  /// 作者 ID / Author ID
   userId:    Int        @index
+  /// 点赞数 / Like count
   likes:     Int        = 0
   createdAt: DateTime   @sortable
 }
 
-/// 评论模型 / Comment model
+/// 评论 / Comment
 model Comment {
   id:        Int
   content:   String
@@ -57,9 +67,45 @@ model Comment {
   createdAt: DateTime
 }
 
+/// 商品 / Product
+model Product {
+  id:        Int
+  name:      String    @filterable
+  price:     Float
+  stock:     Int
+  image:     String?
+}
+
+/// 订单 / Order
+model Order {
+  id:        Int
+  orderNo:   String    @unique
+  userId:    Int
+  productId: Int
+  quantity:  Int
+  total:     Float
+  status:    OrderStatus = OrderStatus.PENDING
+  createdAt: DateTime
+}
+
+/// 聊天消息 / Chat Message
+model Message {
+  id:        Int
+  roomId:    Int
+  userId:    Int
+  content:   String
+  createdAt: DateTime
+}
+
+/// 聊天室成员 / Room Member
+model RoomMember {
+  id:        Int
+  roomId:    Int
+  userId:    Int
+}
+
 // ============================================
-// sealed — 密封类型 / Sealed types
-// when 必须穷举所有分支
+// sealed — 支付结果 / Payment Result
 // ============================================
 
 sealed PayResult {
@@ -69,8 +115,7 @@ sealed PayResult {
 }
 
 // ============================================
-// type — 自定义类型 / Custom types
-// 支持泛型 / Supports generics
+// 自定义类型 / Custom Types
 // ============================================
 
 type AuthResult {
@@ -82,6 +127,7 @@ type RegisterInput {
   name:     String
   email:    String
   password: String
+  phone:    String
 }
 
 type Page<T> {
@@ -92,8 +138,7 @@ type Page<T> {
 }
 
 // ============================================
-// interface — 接口 / Interfaces
-// 可以带默认实现 / Can have default implementations
+// interface — 审计 / Auditable
 // ============================================
 
 interface Auditable {
@@ -106,190 +151,7 @@ interface Auditable {
 }
 
 // ============================================
-// api — 接口定义 / API definitions
-// 三种写法 / Three styles
-// ============================================
-
-// 写法 1: 纯声明 — 框架自动实现
-// Style 1: Pure declaration — auto-generated
-api getUser(id: Int): User @cache(ttl: 60)
-api listUsers(limit: Int = 20): [User]
-api deleteUser(id: Int): Boolean @auth(role: "admin")
-
-// 写法 2: 带逻辑 — luxo 代码
-// Style 2: With logic — luxo code
-
-/// 注册新用户 / Register new user
-/// 密码通过 `@hash` 自动加密 / Password auto-hashed via `@hash`
-api register(input: RegisterInput): AuthResult {
-  // ?: 条件断言 / Conditional assertion
-  input.password.length >= 8 ?: throw error.password_too_short
-
-  // find 查询 / find query
-  val exists = find(User, where: email == input.email)
-  exists == null ?: throw error.email_exists
-
-  // create 创建 / create record
-  val user = create(User,
-    name: input.name,
-    email: input.email,
-    password: input.password
-  )
-
-  // Duration 字面量 / Duration literal
-  val token = generateToken(user, expires: 7d)
-
-  // 最后一行表达式 = 返回值 / Last expression = return value
-  AuthResult { token: token, user: user }
-}
-
-/// 创建文章 / Create post
-api createPost(title: String, content: String): Post @auth {
-  val post = create(Post,
-    title: title,
-    content: content,
-    userId: currentUser.id,
-    status: PostStatus.DRAFT
-  )
-  // emit 异步事件 / Async event
-  emit("post.created", post, userId: currentUser.id)
-  post
-}
-
-/// 发布文章 — 展示 ?. 和 ?: / Publish post — shows ?. and ?:
-api publishPost(id: Int): Post @auth {
-  val post = find(Post, id: id)
-    ?: throw error.not_found
-
-  val updated = update(post, status: PostStatus.PUBLISHED)
-  emit("post.published", updated)
-  updated
-}
-
-/// when + sealed — 模式匹配 / Pattern matching
-api handlePayResult(result: PayResult): String {
-  val message = when(result) {
-    is Success -> "支付成功"
-    is Failed  -> "支付失败"
-    is Pending -> "等待中"
-  }
-  message
-}
-
-/// for 循环 + 集合操作 / For loop + collection operations
-api batchProcess(ids: [Int]): Int {
-  val items = find(Post, where: id in ids)
-
-  // for 循环 / for loop
-  for item in items {
-    update(item, status: PostStatus.ARCHIVED)
-  }
-
-  // 集合方法 / Collection methods
-  val titles = items.map { it.title }
-  val active = items.filter { it.status == PostStatus.PUBLISHED }
-  val hasLiked = items.any { it.likes > 0 }
-  val totalLikes = items.sumOf { it.likes }
-
-  items.size
-}
-
-/// when 表达式 — 无 subject / when expression — no subject
-api getDiscount(total: Float, role: Role): Float {
-  when {
-    role == Role.ADMIN     -> total * 0.5
-    role == Role.MODERATOR -> total * 0.8
-    total > 1000           -> total * 0.9
-    else                   -> total
-  }
-}
-
-/// when 表达式 — 有 subject + 范围 / when with subject + range
-api getLevel(score: Int): String {
-  when(score) {
-    in 90..100 -> "A"
-    in 80..89  -> "B"
-    in 60..79  -> "C"
-    else       -> "D"
-  }
-}
-
-/// if/else 语句 / if/else statement
-api checkAge(age: Int): String {
-  if age >= 18 {
-    "adult"
-  } else {
-    "minor"
-  }
-}
-
-/// transaction 事务 / Database transaction
-api transferLikes(fromId: Int, toId: Int, amount: Int): Boolean {
-  val fromPost = find(Post, id: fromId) ?: throw error.not_found
-  val toPost = find(Post, id: toId) ?: throw error.not_found
-
-  transaction {
-    update(fromPost, likes: fromPost.likes - amount)
-    update(toPost, likes: toPost.likes + amount)
-  }
-
-  true
-}
-
-/// 字符串模板 + 成员方法 / String template + member methods
-api greet(name: String): String {
-  val lower = name.lowercase
-  val len = name.length
-  "Hello ${name}, your name has ${len} characters"
-}
-
-// 写法 3: @native — 复杂逻辑交给 Go
-// Style 3: @native — complex logic in Go
-api oauthLogin(provider: String, code: String): AuthResult @native
-api paymentCallback(payload: Json): Boolean @native
-
-// ============================================
-// stream — WebSocket 流式推送 / WebSocket stream
-// ============================================
-
-api watchComments(postId: Int): stream Comment
-api watchPosts(userId: Int): stream Post
-
-// ============================================
-// fn — 函数定义 / Function definitions
-// ============================================
-
-// @native — Go 实现 / Go implementation
-fn encrypt(value: String): String @native
-fn verifyHash(plain: String, hashed: String): Boolean @native
-fn generateToken(user: User, expires: Duration): String @native
-
-// luxo 函数 / luxo function
-fn calcDiscount(total: Float, role: Role): Float {
-  when(role) {
-    Role.ADMIN     -> total * 0.15
-    Role.MODERATOR -> total * 0.10
-    else           -> 0.0
-  }
-}
-
-// 无返回值函数 / Void function
-fn logAction(action: String) {
-  val msg = "Action: ${action}"
-  emit("log", msg)
-}
-
-// ============================================
-// extend — 跨模块扩展 / Cross-module extension
-// ============================================
-
-extend User {
-  posts:    [Post]
-  comments: [Comment]
-}
-
-// ============================================
-// error — 结构化错误 / Structured errors
+// 错误定义 / Error Definitions
 // ============================================
 
 error NotFound(resource: String) {
@@ -307,95 +169,547 @@ error OutOfStock(productId: Int, available: Int) {
   message: error.out_of_stock
 }
 
-// ============================================
-// middleware — 中间件 / Middleware
-// ============================================
-
-middleware customAuth @native
-
-// ============================================
-// 赋值 + 复合赋值 / Assignment
-// ============================================
-
-api testAssignment(): Int {
-  val count = 0
-  count = 10
-  count += 5
-  count -= 2
-  count *= 3
-  count /= 2
-  count
+error DuplicateEmail {
+  code: 409
+  message: error.email_exists
 }
 
 // ============================================
-// for 条件循环 + 无限循环 / Conditional + Infinite loop
+// 用户认证 / User Authentication
 // ============================================
 
-api testLoops(): Int {
-  val sum = 0
+fn encrypt(value: String): String @native
+fn verifyHash(plain: String, hashed: String): Boolean @native
+fn generateToken(user: User, expires: Duration): String @native
 
-  // 条件循环 / Conditional loop (replaces while)
-  for sum < 100 {
-    sum += 10
+/// 注册 / Register
+api register(input: RegisterInput): AuthResult {
+  // 密码校验 / Password validation
+  input.password.length >= 8 ?: throw error.password_too_short
+
+  // 邮箱唯一检查 / Email uniqueness check
+  val exists = find(User, where: email == input.email)
+  exists == null ?: throw error.email_exists
+
+  // 创建用户 / Create user
+  val user = create(User,
+    name: input.name,
+    email: input.email,
+    password: input.password,
+    phone: input.phone
+  )
+
+  val token = generateToken(user, expires: 7d)
+  AuthResult { token: token, user: user }
+}
+
+/// 登录 / Login
+api login(email: String, password: String): AuthResult {
+  val user = find(User, where: email == email)
+    ?: throw error.not_found
+
+  verifyHash(password, user.password) ?: throw error.unauthorized
+
+  val token = generateToken(user, expires: 7d)
+  AuthResult { token: token, user: user }
+}
+
+/// OAuth 第三方登录 / OAuth Login
+api oauthLogin(provider: String, code: String): AuthResult @native
+
+// ============================================
+// 文章 CRUD / Post CRUD
+// ============================================
+
+/// 创建文章 / Create Post
+api createPost(title: String, content: String): Post @auth {
+  val post = create(Post,
+    title: title,
+    content: content,
+    userId: currentUser.id,
+    status: PostStatus.DRAFT
+  )
+  emit("post.created", post, userId: currentUser.id)
+  post
+}
+
+/// 发布文章 / Publish Post
+api publishPost(id: Int): Post @auth {
+  val post = find(Post, id: id)
+    ?: throw error.not_found
+
+  // 成员赋值 / Member assignment
+  post.status = PostStatus.PUBLISHED
+  val updated = update(post, status: PostStatus.PUBLISHED)
+  emit("post.published", updated)
+  updated
+}
+
+/// 文章列表 — 分页 + 过滤 + 排序 / Post list with pagination
+api listPosts(status: String?, page: Int = 1, limit: Int = 20): Page<Post> {
+  val posts = find(Post, where: status == PostStatus.PUBLISHED)
+  val total = posts.size
+  Page { items: posts, total: total, page: page, pageSize: limit }
+}
+
+/// 点赞 — 原子操作 / Like — atomic operation
+api likePost(id: Int): Post @auth {
+  val post = find(Post, id: id)
+    ?: throw error.not_found
+  post.likes += 1
+  update(post, likes: post.likes)
+  post
+}
+
+/// 搜索 — 集合操作 / Search — collection operations
+api searchPosts(keyword: String): [Post] {
+  val posts = find(Post, where: status == PostStatus.PUBLISHED)
+  val matched = posts.filter { it.title.contains(keyword) }
+  val sorted = matched.sortBy { it.createdAt }
+  sorted
+}
+
+// ============================================
+// 电商 — 下单流程 / E-commerce — Order Flow
+// ============================================
+
+/// 下单 / Create Order
+api createOrder(productId: Int, quantity: Int): Order @auth {
+  val product = find(Product, id: productId)
+    ?: throw error.not_found
+
+  // 库存检查 / Stock check
+  product.stock >= quantity ?: throw error.out_of_stock
+
+  val total = product.price * quantity
+
+  // when 表达式 — VIP 折扣 / when expression — VIP discount
+  val finalPrice = when {
+    currentUser.role == Role.ADMIN -> total * 0.5
+    currentUser.role == Role.MODERATOR -> total * 0.8
+    total > 1000 -> total * 0.95
+    else -> total
   }
 
-  // 无限循环 + break / Infinite loop + break
+  // 事务 — 扣库存 + 创建订单 / Transaction
+  val order = transaction {
+    product.stock -= quantity
+    update(product, stock: product.stock)
+    create(Order,
+      orderNo: crypto.randomToken(16),
+      userId: currentUser.id,
+      productId: productId,
+      quantity: quantity,
+      total: finalPrice,
+      status: OrderStatus.PENDING
+    )
+  }
+
+  // 异步通知 / Async notification
+  async {
+    log.info("订单创建: ${order.orderNo}")
+  }
+
+  emit("order.created", order, userId: currentUser.id)
+  order
+}
+
+/// 取消订单 / Cancel Order
+api cancelOrder(id: Int): Order @auth {
+  val order = find(Order, id: id)
+    ?: throw error.not_found
+
+  val product = find(Product, id: order.productId)
+    ?: throw error.not_found
+
+  transaction {
+    product.stock += order.quantity
+    update(product, stock: product.stock)
+    order.status = OrderStatus.CANCELLED
+    update(order, status: OrderStatus.CANCELLED)
+  }
+
+  emit("order.cancelled", order)
+  order
+}
+
+// ============================================
+// 实时聊天 / Real-time Chat
+// ============================================
+
+/// 聊天订阅 / Chat subscription (WebSocket)
+api watchChat(roomId: Int): stream Message
+
+/// 发消息 — emit 推送 / Send message — emit push
+api sendMessage(roomId: Int, content: String): Message @auth {
+  // 检查是否是房间成员 / Check room membership
+  val member = find(RoomMember, where: roomId == roomId && userId == currentUser.id)
+  member != null ?: throw error.unauthorized
+
+  val msg = create(Message,
+    roomId: roomId,
+    userId: currentUser.id,
+    content: content
+  )
+
+  // 查出房间所有成员 / Get all room members
+  val members = find(RoomMember, where: roomId == roomId)
+  val targetIds = members.map { it.userId }.filter { it != currentUser.id }
+
+  // emit 推送给指定用户 / Push to specific users
+  emit("watchChat", msg, userId: targetIds)
+
+  msg
+}
+
+// ============================================
+// when 模式匹配 / Pattern Matching
+// ============================================
+
+/// 评分等级 — 范围匹配 / Score level — range matching
+api getLevel(score: Int): String {
+  when(score) {
+    in 90..100 -> "A"
+    in 80..89  -> "B"
+    in 60..79  -> "C"
+    else       -> "D"
+  }
+}
+
+/// 支付结果处理 — sealed 穷举 / Payment result — sealed exhaustive
+api handlePayResult(result: PayResult): String {
+  when(result) {
+    is Success -> "txn: ${result.transactionId}"
+    is Failed  -> "error: ${result.reason}"
+    is Pending -> "retry after ${result.retryAfter}"
+  }
+}
+
+// ============================================
+// 循环 + yield + break / Loops
+// ============================================
+
+/// yield — for 作为表达式 / for as expression
+api findFirstExpensive(products: [Product]): Product {
+  val found = for product in products {
+    if product.price > 1000 { yield product }
+  }
+  found ?: throw error.not_found
+}
+
+/// 条件循环 + 赋值 / Conditional loop + assignment
+api sumUntil(items: [Int], limit: Int): Int {
+  val total = 0
   val i = 0
-  for {
+  for i < items.size {
+    total += 1
+    if total >= limit { break }
     i += 1
-    if i >= 5 { break }
+  }
+  total
+}
+
+/// 集合操作综合 / Collection operations
+api analyzeOrders(orders: [Order]): String {
+  val total = orders.sumOf { it.total }
+  val avg = total / orders.size
+  val expensive = orders.filter { it.total > 500 }
+  val hasVip = orders.any { it.total > 10000 }
+  val grouped = orders.groupBy { it.status }
+  val ids = orders.map { it.id }.joinToString(", ")
+  "total: ${total}, avg: ${avg}, expensive: ${expensive.size}"
+}
+
+// ============================================
+// 并发 / Concurrency
+// ============================================
+
+/// await — 并发加载 / Concurrent loading
+api getUserProfile(id: Int): User @auth {
+  val (user, posts, orders) = await {
+    find(User, id: id)
+    find(Post, where: userId == id)
+    find(Order, where: userId == id)
+  }
+  user
+}
+
+/// async — 后台任务 / Background task
+api processAndNotify(orderId: Int): Boolean @auth {
+  val order = find(Order, id: orderId)
+    ?: throw error.not_found
+
+  async {
+    log.info("processing order ${order.orderNo}")
+    emit("order.processed", order)
   }
 
+  true
+}
+
+/// Channel — 协程通信 / Coroutine communication
+api testChannel(): Int {
+  val ch = Channel(10)
+
+  async {
+    for i in 0..9 {
+      ch <- i
+    }
+  }
+
+  val sum = 0
+  for value in ch {
+    sum += value
+    if sum > 20 { break }
+  }
   sum
 }
 
 // ============================================
-// yield — for 作为表达式 / for as expression
+// 标准库使用 / Standard Library
 // ============================================
 
-api testYield(items: [Int]): Int {
-  val found = for item in items {
-    if item > 100 { yield item }
-  }
-  found
+/// String 操作 / String operations
+api formatUserInfo(user: User): String {
+  val name = user.name.trim.lowercase
+  val emailDomain = user.email.split("@").last
+  val masked = user.phone.substring(0, 3) + "****" + user.phone.substring(7, 11)
+  "name: ${name}, domain: ${emailDomain}, phone: ${masked}"
+}
+
+/// HTTP 调用 / HTTP request
+api fetchExternalData(url: String): String {
+  val response = http.get(url)
+  val data = json.parse(response.body)
+  json.stringify(data)
+}
+
+/// 时间操作 / Time operations
+api getTimeInfo(): String {
+  val now = time.now()
+  val formatted = now.format("2006-01-02 15:04:05")
+  val tomorrow = now.add(1d)
+  "now: ${formatted}, tomorrow: ${tomorrow.format("2006-01-02")}"
+}
+
+/// request 上下文 / Request context
+api getRequestInfo(): String @auth {
+  val ip = request.ip
+  val ua = request.header("User-Agent")
+  val method = request.method
+  "ip: ${ip}, ua: ${ua}, method: ${method}"
 }
 
 // ============================================
-// async / await — 协程 / Coroutines
+// 继承 + 计算字段 + 注解全覆盖
+// Inheritance + Computed Fields + All Directives
 // ============================================
 
-api testConcurrency(): Int {
-  // async — 启动协程不等待 / Fire and forget
+/// 基础模型 / Base model
+model Base {
+  id:        Int
+  createdAt: DateTime
+  updatedAt: DateTime
+}
+
+/// 带审计的文章（继承 Base）/ Auditable post (inherits Base)
+model AuditablePost : Base {
+  title:     String
+  /// 内部状态（用户不可设）/ Internal status
+  internal:  String   @internal
+  /// 可见性条件 / Visibility condition
+  secret:    String   @visible(currentUser.role == Role.ADMIN)
+  /// CDN 变换 / CDN transform
+  cover:     String   @transform { "https://cdn.example.com/${cover}" }
+  /// 存前小写 / Lowercase before save
+  slug:      String   @beforeSave { slug.lowercase }
+  /// 手机脱敏 / Phone masking
+  phone:     String   @mask("***####****")
+  /// 已弃用 / Deprecated
+  oldField:  String?  @deprecated("use newField")
+  /// 缓存接口 / Cached API
+  cachedData: String?
+
+  // 计算字段 / Computed fields
+  val commentCount: Int get @count
+  val avgRating: Float get @avg(field: likes)
+
+  // 查询预设 / Query scope
+  scope published {
+    val x = 1
+  }
+}
+
+// ============================================
+// 多态 + 多对多 / Polymorphic + Many-to-Many
+// ============================================
+
+model Video {
+  id: Int
+  title: String
+}
+
+/// 评论目标（多态）/ Comment target (polymorphic)
+model Reaction {
+  id:     Int
+  target: (Post, Video, Product)
+  userId: Int
+}
+
+/// 角色（多对多显式中间表）/ Role (many-to-many through)
+model UserRole : Base {
+  userId: Int
+  roleId: Int
+}
+
+model Permission {
+  id:   Int
+  name: String
+  roles: [Role] through UserRole
+}
+
+// ============================================
+// use — 跨模块引用 / Cross-module Import
+// ============================================
+
+use common.{ Base, Page }
+
+// ============================================
+// 跨模块扩展 / Cross-module Extension
+// ============================================
+
+extend User {
+  posts:    [Post]
+  orders:   [Order]
+  comments: [Comment]
+}
+
+// ============================================
+// override — 覆盖自动 CRUD / Override Auto CRUD
+// ============================================
+
+override api createUser(input: RegisterInput): User {
+  val user = create(User,
+    name: input.name,
+    email: input.email,
+    password: input.password,
+    phone: input.phone
+  )
+  emit("user.created", user)
+  user
+}
+
+// ============================================
+// @cache — 缓存 / Caching
+// ============================================
+
+api getPopularPosts(): [Post] @cache(ttl: 60) {
+  val posts = find(Post, where: status == PostStatus.PUBLISHED)
+  posts.sortBy { it.likes }
+}
+
+// ============================================
+// 空安全全路径 / Null Safety Full Path
+// ============================================
+
+api testNullSafety(userId: Int): String {
+  val user = find(User, id: userId)
+
+  // ?. 安全调用 / Safe call
+  val name = user?.name
+  val upper = user?.name?.uppercase
+
+  // ?: Elvis
+  val displayName = user?.name ?: "Anonymous"
+
+  // .let 作用域函数 / Scope function
+  val result = user?.let { "found: ${it.name}" }
+
+  // 显式 return / Explicit return
+  if user == null {
+    return "not found"
+  }
+
+  displayName
+}
+
+// ============================================
+// 逻辑运算 + 字面量 / Logic Ops + Literals
+// ============================================
+
+api testLogic(a: Boolean, b: Boolean): Boolean {
+  val x = a && b
+  val y = a || b
+  val z = !a
+  val isTrue = true
+  val isFalse = false
+  val nothing = null
+
+  if x && !y {
+    return isTrue
+  }
+
+  isFalse
+}
+
+// ============================================
+// Result<T> + ? 操作符 / Result + ? Operator
+// ============================================
+
+fn riskyOperation(id: Int): Result<User> @native
+
+api testResult(id: Int): User {
+  // ? 操作符 — Ok 取值，Err 自动 throw
+  val user = riskyOperation(id)?
+  user
+}
+
+// ============================================
+// 无限循环 + Channel 接收 / Infinite Loop + Channel Receive
+// ============================================
+
+api testInfiniteLoop(): Int {
+  val total = 0
+  val ch = Channel(5)
+
   async {
-    log("background task")
+    for i in 0..4 {
+      ch <- i
+    }
   }
 
-  // await — 并发执行等待全部 / Concurrent wait
-  val (user, posts) = await {
-    find(User, id: 1)
-    find(Post, where: userId == 1)
+  // 无限循环 / Infinite loop
+  for {
+    val value = <-ch
+    total += value
+    if total > 5 { break }
   }
 
-  0
+  total
 }
 
 // ============================================
-// Channel — 协程通信 / Coroutine communication
+// 中间件 / Middleware
 // ============================================
 
-api testChannel(): Int {
-  val ch = Channel(10)
-  ch <- 42
-  val value = <-ch
-  value
+middleware adminOnly @native
+
+// ============================================
+// @native 函数 / Native Functions
+// ============================================
+
+fn sendEmail(to: String, subject: String, body: String) @native
+fn sendSms(phone: String, content: String) @native
+fn log(...messages: String) @native
+
+/// 计算折扣 / Calculate discount
+fn calcDiscount(total: Float, role: Role): Float {
+  when(role) {
+    Role.ADMIN     -> total * 0.15
+    Role.MODERATOR -> total * 0.10
+    else           -> 0.0
+  }
 }
-
-// ============================================
-// import — 标准库 / Standard library
-// ============================================
-
-import http
-import json
 
 /*
   多行注释 / Block comment

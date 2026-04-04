@@ -458,13 +458,7 @@ func (a *Analyzer) checkBlock(block *ast.Block, scope *Scope) {
 func (a *Analyzer) checkStmt(stmt ast.Stmt, scope *Scope) {
 	switch s := stmt.(type) {
 	case *ast.ValStmt:
-		exprType := a.checkExpr(s.Value, scope)
-		scope.Define(&Symbol{
-			Name: s.Name,
-			Kind: SymVariable,
-			Type: exprType,
-			Pos:  s.Pos,
-		})
+		a.checkValStmt(s, scope)
 
 	case *ast.IfStmt:
 		a.checkExpr(s.Condition, scope)
@@ -476,29 +470,7 @@ func (a *Analyzer) checkStmt(stmt ast.Stmt, scope *Scope) {
 		}
 
 	case *ast.ForStmt:
-		childScope := scope.Child()
-		if s.Collection != nil {
-			collType := a.checkExpr(s.Collection, childScope)
-			// only define loop variable if VarName is set (for item in collection)
-			if s.VarName != "" {
-				var itemType *ResolvedType
-				if collType != nil && collType.IsList {
-					itemType = &ResolvedType{
-						Kind:   collType.Kind,
-						Name:   collType.Name,
-						Fields: collType.Fields,
-					}
-				}
-				childScope.Define(&Symbol{
-					Name: s.VarName,
-					Kind: SymVariable,
-					Type: itemType,
-					Pos:  s.Pos,
-				})
-			}
-		}
-		// for condition { } and for { } — body shares parent scope for variable access
-		a.checkBlock(s.Body, childScope)
+		a.checkForStmt(s, scope)
 
 	case *ast.ReturnStmt:
 		if s.Value != nil {
@@ -527,6 +499,51 @@ func (a *Analyzer) checkStmt(stmt ast.Stmt, scope *Scope) {
 			a.checkExpr(s.Expr, scope)
 		}
 	}
+}
+
+func (a *Analyzer) checkValStmt(s *ast.ValStmt, scope *Scope) {
+	exprType := a.checkExpr(s.Value, scope)
+	if len(s.Names) > 0 {
+		for _, name := range s.Names {
+			scope.Define(&Symbol{
+				Name: name,
+				Kind: SymVariable,
+				Type: exprType,
+				Pos:  s.Pos,
+			})
+		}
+	} else {
+		scope.Define(&Symbol{
+			Name: s.Name,
+			Kind: SymVariable,
+			Type: exprType,
+			Pos:  s.Pos,
+		})
+	}
+}
+
+func (a *Analyzer) checkForStmt(s *ast.ForStmt, scope *Scope) {
+	childScope := scope.Child()
+	if s.Collection != nil {
+		collType := a.checkExpr(s.Collection, childScope)
+		if s.VarName != "" {
+			var itemType *ResolvedType
+			if collType != nil && collType.IsList {
+				itemType = &ResolvedType{
+					Kind:   collType.Kind,
+					Name:   collType.Name,
+					Fields: collType.Fields,
+				}
+			}
+			childScope.Define(&Symbol{
+				Name: s.VarName,
+				Kind: SymVariable,
+				Type: itemType,
+				Pos:  s.Pos,
+			})
+		}
+	}
+	a.checkBlock(s.Body, childScope)
 }
 
 func (a *Analyzer) checkExpr(expr ast.Expr, scope *Scope) *ResolvedType {
@@ -661,6 +678,11 @@ func (a *Analyzer) checkMemberExpr(e *ast.MemberExpr, scope *Scope) *ResolvedTyp
 	// collection methods on list types
 	if objType.IsList && isCollectionMethod(e.Field) {
 		return a.resolveCollectionMethod(e.Field, objType)
+	}
+
+	// .let scope function — works on any type
+	if e.Field == "let" {
+		return nil // lambda return type, can't infer
 	}
 
 	field := objType.LookupField(e.Field)
@@ -1045,7 +1067,11 @@ func isCollectionMethod(name string) bool {
 	switch name {
 	case "map", "filter", "sumOf", "count", "any", "firstOrNull",
 		"sortBy", "groupBy", "forEach", "flatMap", "joinToString",
-		"take", "takeLast", "size", "isEmpty", "contains":
+		"take", "takeLast", "size", "isEmpty", "contains",
+		"first", "last", "lastOrNull", "reversed", "shuffled",
+		"distinct", "distinctBy", "drop", "dropLast",
+		"indexOf", "zip", "chunked", "windowed", "all", "none",
+		"minOf", "maxOf", "sortByDesc", "isNotEmpty", "let":
 		return true
 	}
 	return false
@@ -1131,7 +1157,10 @@ func isBuiltinOp(name string) bool {
 	switch name {
 	case "find", "create", "update", "delete", "emit",
 		"throw", "transaction", "log", "cache", "storage",
-		"mail", "task", "services", "error", "request":
+		"mail", "task", "services", "error", "request",
+		"Channel", "Result",
+		"http", "json", "time", "math", "crypto",
+		"regex", "fmt", "base64", "url", "uuid":
 		return true
 	}
 	return false

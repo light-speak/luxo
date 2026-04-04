@@ -263,14 +263,14 @@ middleware requestLogger {
 
 func TestSealedType(t *testing.T) {
 	result := analyze(t, `
-sealed Result {
+sealed MyResult {
   Ok(value: String)
   Err(message: String, code: Int)
 }
 `)
 	expectNoErrors(t, result)
 
-	typ := result.Types["Result"]
+	typ := result.Types["MyResult"]
 	if typ == nil {
 		t.Fatal("expected type Result")
 	}
@@ -314,16 +314,16 @@ fn double(x: Int): Int {
 func TestSealedKindToSymbol(t *testing.T) {
 	// This exercises kindToSymbol with TypeSealed
 	result := analyze(t, `
-sealed Result {
+sealed MyResult {
   Ok(value: String)
   Err(message: String)
 }
 `)
 	expectNoErrors(t, result)
 
-	sym := result.Scope.Lookup("Result")
+	sym := result.Scope.Lookup("MyResult")
 	if sym == nil {
-		t.Fatal("expected 'Result' symbol")
+		t.Fatal("expected 'MyResult' symbol")
 	}
 	if sym.Kind != SymSealed {
 		t.Errorf("expected SymSealed, got %v", sym.Kind)

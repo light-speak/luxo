@@ -79,17 +79,42 @@ func BuiltinTypes() map[string]*ResolvedType {
 	boolType := &ResolvedType{Kind: TypeBool, Name: "Boolean", Fields: map[string]*FieldInfo{}}
 
 	stringType := &ResolvedType{Kind: TypeString, Name: "String", Fields: map[string]*FieldInfo{
-		"length":    {Name: "length", Type: intType},
-		"isEmpty":   {Name: "isEmpty", Type: boolType},
-		"lowercase": {Name: "lowercase", Type: nil}, // returns String (self-ref resolved later)
+		// properties
+		"length":  {Name: "length", Type: intType},
+		"isEmpty": {Name: "isEmpty", Type: boolType},
+		"size":    {Name: "size", Type: intType},
+		// transform — return String (self-ref resolved below)
+		"lowercase": {Name: "lowercase", Type: nil},
 		"uppercase": {Name: "uppercase", Type: nil},
 		"trim":      {Name: "trim", Type: nil},
-		"size":      {Name: "size", Type: intType},
+		"trimStart": {Name: "trimStart", Type: nil},
+		"trimEnd":   {Name: "trimEnd", Type: nil},
+		"reversed":  {Name: "reversed", Type: nil},
+		// methods that take args — return type varies but LSP won't error
+		"contains":   {Name: "contains", Type: boolType},
+		"startsWith": {Name: "startsWith", Type: boolType},
+		"endsWith":   {Name: "endsWith", Type: boolType},
+		"matches":    {Name: "matches", Type: boolType},
+		"replace":    {Name: "replace", Type: nil},
+		"replaceAll": {Name: "replaceAll", Type: nil},
+		"split":      {Name: "split", Type: nil},
+		"substring":  {Name: "substring", Type: nil},
+		"repeat":     {Name: "repeat", Type: nil},
+		"padStart":   {Name: "padStart", Type: nil},
+		"padEnd":     {Name: "padEnd", Type: nil},
+		"toInt":      {Name: "toInt", Type: intType},
+		"toFloat":    {Name: "toFloat", Type: floatType},
 	}}
 	// self-reference for string methods that return String
-	stringType.Fields["lowercase"].Type = stringType
-	stringType.Fields["uppercase"].Type = stringType
-	stringType.Fields["trim"].Type = stringType
+	stringReturnMethods := []string{
+		"lowercase", "uppercase", "trim", "trimStart", "trimEnd", "reversed",
+		"replace", "replaceAll", "substring", "repeat", "padStart", "padEnd",
+	}
+	for _, m := range stringReturnMethods {
+		stringType.Fields[m].Type = stringType
+	}
+	// split returns list (approximate — not typed as [String] but won't error)
+	stringType.Fields["split"].Type = &ResolvedType{Kind: TypeString, Name: "String", IsList: true}
 
 	return map[string]*ResolvedType{
 		"Int":      intType,
@@ -102,6 +127,8 @@ func BuiltinTypes() map[string]*ResolvedType {
 		"Json":     {Kind: TypeJson, Name: "Json", Fields: map[string]*FieldInfo{}},
 		"File":     {Kind: TypeFile, Name: "File", Fields: map[string]*FieldInfo{}},
 		"Void":     {Kind: TypeVoid, Name: "Void", Fields: map[string]*FieldInfo{}},
+		"Result":   {Kind: TypeGeneric, Name: "Result", Fields: map[string]*FieldInfo{}},
+		"Channel":  {Kind: TypeGeneric, Name: "Channel", Fields: map[string]*FieldInfo{}},
 	}
 }
 

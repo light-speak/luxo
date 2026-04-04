@@ -797,9 +797,9 @@ api test(): Int {
 
 func TestObjectExpr(t *testing.T) {
 	result := analyze(t, `
-type Result { value: String }
-api test(): Result {
-  Result { value: "hello" }
+type ObjResult { value: String }
+api test(): ObjResult {
+  ObjResult { value: "hello" }
 }
 `)
 	expectNoErrors(t, result)

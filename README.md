@@ -28,17 +28,21 @@
 
 ## Why "Luxo"?
 
-Every API request is, at its core, data traveling from origin to destination. But the path is bloated — redundant JSON field names, GraphQL runtime parsing overhead, ORM reflection costs, `SELECT *` fetching fields that get thrown away.
+The path from database to client should be short. Instead, we turned it into a maze.
 
-We went back to the origin and asked: what is the minimum number of steps from database to client? What is the minimum number of bytes at each step?
+JSON repeats every field name on every response — like a memo that prints the letterhead on every line. GraphQL parses queries at runtime that were already hardcoded at compile time. ORMs reflect over structs again and again, doing work the compiler finished long ago. `SELECT *` fetches entire rows, only to throw most of them away by hand.
 
-The answer is Luxo.
+Every layer re-discovers what the layer before it already knew.
 
-**Lux** (Latin, *light*) — data should arrive at the speed of light. Not a metaphor. An engineering goal. Binary encoding, compile-time query plans, full-pipeline field selection — every layer pushing toward the physical limit.
+We started with one question: **from storage to screen, what is the minimum number of steps — and the minimum number of bytes at each step?**
 
-**O** (*origin*) — back to the origin of API communication. Schema is the single source of truth. From it, database tables, type definitions, codecs, client SDKs — everything grows from one origin. No redundant layers, no duplicate definitions.
+Follow that question to its logical end, and you arrive at Luxo.
 
-> **Luxo — Data at the speed of light, from a single origin.**
+**Lux** (Latin, *light*) — not a metaphor, but an engineering constraint. Binary encoding is decided at compile time. Query plans are generated at compile time. Field selection flows from client all the way down to SQL. Every layer is pushed toward the physical limit of data transfer. Data should arrive the way light does: no detours, no waste.
+
+**O** (*origin*) — everything starts from the schema, and only from the schema. Database tables, type definitions, codecs, client SDKs — all grown from a single `.luxo` file. No second source of truth. No definitions to keep in sync by hand. Renaming a field doesn't mean touching three files.
+
+> **Luxo — One origin. Speed of light.**
 
 ## What is Luxo?
 
