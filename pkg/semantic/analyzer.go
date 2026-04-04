@@ -476,23 +476,28 @@ func (a *Analyzer) checkStmt(stmt ast.Stmt, scope *Scope) {
 		}
 
 	case *ast.ForStmt:
-		collType := a.checkExpr(s.Collection, scope)
 		childScope := scope.Child()
-		// infer loop variable type from collection
-		var itemType *ResolvedType
-		if collType != nil && collType.IsList {
-			itemType = &ResolvedType{
-				Kind:   collType.Kind,
-				Name:   collType.Name,
-				Fields: collType.Fields,
+		if s.Collection != nil {
+			collType := a.checkExpr(s.Collection, childScope)
+			// only define loop variable if VarName is set (for item in collection)
+			if s.VarName != "" {
+				var itemType *ResolvedType
+				if collType != nil && collType.IsList {
+					itemType = &ResolvedType{
+						Kind:   collType.Kind,
+						Name:   collType.Name,
+						Fields: collType.Fields,
+					}
+				}
+				childScope.Define(&Symbol{
+					Name: s.VarName,
+					Kind: SymVariable,
+					Type: itemType,
+					Pos:  s.Pos,
+				})
 			}
 		}
-		childScope.Define(&Symbol{
-			Name: s.VarName,
-			Kind: SymVariable,
-			Type: itemType,
-			Pos:  s.Pos,
-		})
+		// for condition { } and for { } — body shares parent scope for variable access
 		a.checkBlock(s.Body, childScope)
 
 	case *ast.ReturnStmt:
@@ -507,6 +512,15 @@ func (a *Analyzer) checkStmt(stmt ast.Stmt, scope *Scope) {
 		for _, arg := range s.Args {
 			a.checkExpr(arg.Value, scope)
 		}
+
+	case *ast.AssignStmt:
+		// check target exists
+		a.checkExpr(s.Target, scope)
+		// check value
+		a.checkExpr(s.Value, scope)
+
+	case *ast.BreakStmt:
+		// valid in any loop context, no check needed at semantic level
 
 	case *ast.ExprStmt:
 		if s.Expr != nil {
@@ -557,6 +571,20 @@ func (a *Analyzer) checkCompositeExpr(expr ast.Expr, scope *Scope) *ResolvedType
 		return a.checkTransactionExpr(e, scope)
 	case *ast.TemplateString:
 		return a.checkTemplateString(e, scope)
+	case *ast.YieldExpr:
+		return a.checkExpr(e.Value, scope)
+	case *ast.AsyncExpr:
+		childScope := scope.Child()
+		a.checkBlock(e.Body, childScope)
+		return nil
+	case *ast.AwaitExpr:
+		childScope := scope.Child()
+		a.checkBlock(e.Body, childScope)
+		return nil
+	case *ast.ForStmt:
+		// for as expression — check like statement but return type
+		a.checkStmt(e, scope)
+		return nil // yield type inference is complex, return nil for now
 	}
 	return nil
 }

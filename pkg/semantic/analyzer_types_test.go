@@ -1268,3 +1268,111 @@ api getUser(id: Int, name: String): User {
 `)
 	expectNoErrors(t, result)
 }
+
+// ========== New AST Node Type Checks ==========
+
+func TestAssignStmt(t *testing.T) {
+	result := analyze(t, `
+api test(): Int {
+  val x = 1
+  x = 2
+  x += 3
+  x
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestAssignUndefinedVar(t *testing.T) {
+	result := analyze(t, `
+api test(): Int {
+  y = 2
+  y
+}
+`)
+	expectError(t, result, "undefined")
+}
+
+func TestBreakStmt(t *testing.T) {
+	result := analyze(t, `
+api test(): Int {
+  val i = 0
+  for {
+    i += 1
+    if i >= 10 { break }
+  }
+  i
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestYieldExpr(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(): User {
+  val users = find(User, where: name == "test")
+  val found = for user in users {
+    if user.name == "test" { yield user }
+  }
+  found
+}
+`)
+	// should not panic, yield creates a value
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+}
+
+func TestAsyncExpr(t *testing.T) {
+	result := analyze(t, `
+api test(): Int {
+  async {
+    val x = 1
+  }
+  0
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestAwaitExpr(t *testing.T) {
+	result := analyze(t, `
+api test(): Int {
+  val result = await {
+    find(User, id: 1)
+  }
+  0
+}
+`)
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+}
+
+func TestForConditionLoop(t *testing.T) {
+	result := analyze(t, `
+api test(): Int {
+  val count = 0
+  for count < 10 {
+    count += 1
+  }
+  count
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestForInfiniteLoop(t *testing.T) {
+	result := analyze(t, `
+api test(): Int {
+  val i = 0
+  for {
+    i += 1
+    if i >= 5 { break }
+  }
+  i
+}
+`)
+	expectNoErrors(t, result)
+}

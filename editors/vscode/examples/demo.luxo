@@ -313,6 +313,90 @@ error OutOfStock(productId: Int, available: Int) {
 
 middleware customAuth @native
 
+// ============================================
+// 赋值 + 复合赋值 / Assignment
+// ============================================
+
+api testAssignment(): Int {
+  val count = 0
+  count = 10
+  count += 5
+  count -= 2
+  count *= 3
+  count /= 2
+  count
+}
+
+// ============================================
+// for 条件循环 + 无限循环 / Conditional + Infinite loop
+// ============================================
+
+api testLoops(): Int {
+  val sum = 0
+
+  // 条件循环 / Conditional loop (replaces while)
+  for sum < 100 {
+    sum += 10
+  }
+
+  // 无限循环 + break / Infinite loop + break
+  val i = 0
+  for {
+    i += 1
+    if i >= 5 { break }
+  }
+
+  sum
+}
+
+// ============================================
+// yield — for 作为表达式 / for as expression
+// ============================================
+
+api testYield(items: [Int]): Int {
+  val found = for item in items {
+    if item > 100 { yield item }
+  }
+  found
+}
+
+// ============================================
+// async / await — 协程 / Coroutines
+// ============================================
+
+api testConcurrency(): Int {
+  // async — 启动协程不等待 / Fire and forget
+  async {
+    log("background task")
+  }
+
+  // await — 并发执行等待全部 / Concurrent wait
+  val (user, posts) = await {
+    find(User, id: 1)
+    find(Post, where: userId == 1)
+  }
+
+  0
+}
+
+// ============================================
+// Channel — 协程通信 / Coroutine communication
+// ============================================
+
+api testChannel(): Int {
+  val ch = Channel(10)
+  ch <- 42
+  val value = <-ch
+  value
+}
+
+// ============================================
+// import — 标准库 / Standard library
+// ============================================
+
+import http
+import json
+
 /*
   多行注释 / Block comment
   支持嵌套 / Supports nesting
