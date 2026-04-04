@@ -26,6 +26,20 @@
 
 ---
 
+## Why "Luxo"?
+
+Every API request is, at its core, data traveling from origin to destination. But the path is bloated — redundant JSON field names, GraphQL runtime parsing overhead, ORM reflection costs, `SELECT *` fetching fields that get thrown away.
+
+We went back to the origin and asked: what is the minimum number of steps from database to client? What is the minimum number of bytes at each step?
+
+The answer is Luxo.
+
+**Lux** (Latin, *light*) — data should arrive at the speed of light. Not a metaphor. An engineering goal. Binary encoding, compile-time query plans, full-pipeline field selection — every layer pushing toward the physical limit.
+
+**O** (*origin*) — back to the origin of API communication. Schema is the single source of truth. From it, database tables, type definitions, codecs, client SDKs — everything grows from one origin. No redundant layers, no duplicate definitions.
+
+> **Luxo — Data at the speed of light, from a single origin.**
+
 ## What is Luxo?
 
 Luxo is a **programming language** that compiles to Go — with a built-in API framework, its own protocol, and a complete toolchain from schema to deployment.
