@@ -62,100 +62,21 @@ func (l *Lexer) nextToken() token.Token {
 	pos := l.position()
 	ch := l.peek()
 
-	switch {
-	case ch == 0:
+	if ch == 0 {
 		return l.makeToken(token.EOF, "", pos)
+	}
 
-	// Symbols
-	case ch == ':':
-		l.advance()
-		return l.makeToken(token.Colon, ":", pos)
-	case ch == '{':
-		l.advance()
-		return l.makeToken(token.LBrace, "{", pos)
-	case ch == '}':
-		l.advance()
-		return l.makeToken(token.RBrace, "}", pos)
-	case ch == '(':
-		l.advance()
-		return l.makeToken(token.LParen, "(", pos)
-	case ch == ')':
-		l.advance()
-		return l.makeToken(token.RParen, ")", pos)
-	case ch == '[':
-		l.advance()
-		return l.makeToken(token.LBracket, "[", pos)
-	case ch == ']':
-		l.advance()
-		return l.makeToken(token.RBracket, "]", pos)
-	case ch == ',':
-		l.advance()
-		return l.makeToken(token.Comma, ",", pos)
-	case ch == '@':
-		l.advance()
-		return l.makeToken(token.At, "@", pos)
-	case ch == '+':
-		l.advance()
-		if l.peek() == '=' {
-			l.advance()
-			return l.makeToken(token.PlusAssign, "+=", pos)
-		}
-		return l.makeToken(token.Plus, "+", pos)
-	case ch == '*':
-		l.advance()
-		if l.peek() == '=' {
-			l.advance()
-			return l.makeToken(token.StarAssign, "*=", pos)
-		}
-		return l.makeToken(token.Star, "*", pos)
-	case ch == '%':
-		l.advance()
-		if l.peek() == '=' {
-			l.advance()
-			return l.makeToken(token.PercentAssign, "%=", pos)
-		}
-		return l.makeToken(token.Percent, "%", pos)
+	// Try single-char tokens first
+	if tok, ok := l.readSingleChar(ch, pos); ok {
+		return tok
+	}
 
-	// Dot, DotDot
-	case ch == '.':
-		return l.readDotOrRange(pos)
+	// Try compound operator tokens
+	if tok, ok := l.readOperator(ch, pos); ok {
+		return tok
+	}
 
-	// Question, Elvis, SafeDot
-	case ch == '?':
-		return l.readQuestion(pos)
-
-	// Assign, Eq
-	case ch == '=':
-		return l.readEquals(pos)
-
-	// Bang, Neq
-	case ch == '!':
-		return l.readBang(pos)
-
-	// Gt, Gte
-	case ch == '>':
-		return l.readGreater(pos)
-
-	// Lt, Lte
-	case ch == '<':
-		return l.readLess(pos)
-
-	// And
-	case ch == '&':
-		return l.readAmpersand(pos)
-
-	// Or
-	case ch == '|':
-		return l.readPipe(pos)
-
-	// Minus, Arrow
-	case ch == '-':
-		return l.readMinus(pos)
-
-	// Slash, Comment, DocComment, BlockComment
-	case ch == '/':
-		return l.readSlashOrComment(pos)
-
+	switch {
 	// String
 	case ch == '"':
 		return l.readString(pos)
@@ -173,6 +94,78 @@ func (l *Lexer) nextToken() token.Token {
 		l.error(pos, fmt.Sprintf("unexpected character: %c", ch))
 		return l.makeToken(token.Illegal, string(ch), pos)
 	}
+}
+
+// readSingleChar handles single-character tokens that need no lookahead.
+func (l *Lexer) readSingleChar(ch rune, pos token.Position) (token.Token, bool) {
+	var typ token.Type
+	switch ch {
+	case ':':
+		typ = token.Colon
+	case '{':
+		typ = token.LBrace
+	case '}':
+		typ = token.RBrace
+	case '(':
+		typ = token.LParen
+	case ')':
+		typ = token.RParen
+	case '[':
+		typ = token.LBracket
+	case ']':
+		typ = token.RBracket
+	case ',':
+		typ = token.Comma
+	case '@':
+		typ = token.At
+	default:
+		return token.Token{}, false
+	}
+	l.advance()
+	return l.makeToken(typ, string(ch), pos), true
+}
+
+// readOperator handles multi-character operators and delegated operator reads.
+func (l *Lexer) readOperator(ch rune, pos token.Position) (token.Token, bool) {
+	switch ch {
+	case '+':
+		return l.readCompoundAssign(pos, token.Plus, "+", token.PlusAssign, "+="), true
+	case '*':
+		return l.readCompoundAssign(pos, token.Star, "*", token.StarAssign, "*="), true
+	case '%':
+		return l.readCompoundAssign(pos, token.Percent, "%", token.PercentAssign, "%="), true
+	case '.':
+		return l.readDotOrRange(pos), true
+	case '?':
+		return l.readQuestion(pos), true
+	case '=':
+		return l.readEquals(pos), true
+	case '!':
+		return l.readBang(pos), true
+	case '>':
+		return l.readGreater(pos), true
+	case '<':
+		return l.readLess(pos), true
+	case '&':
+		return l.readAmpersand(pos), true
+	case '|':
+		return l.readPipe(pos), true
+	case '-':
+		return l.readMinus(pos), true
+	case '/':
+		return l.readSlashOrComment(pos), true
+	}
+	return token.Token{}, false
+}
+
+// readCompoundAssign reads an operator that may be followed by '=' for a compound assignment.
+func (l *Lexer) readCompoundAssign(pos token.Position, simpleType token.Type, simpleLit string, assignType token.Type, assignLit string) token.Token {
+	l.advance()
+	if l.peek() == '=' {
+		l.advance()
+		return l.makeToken(assignType, assignLit, pos)
+	}
+	return l.makeToken(simpleType, simpleLit, pos)
 }
 
 // readDotOrRange reads a dot, dot-dot, or dot-dot-dot token.

@@ -72,17 +72,8 @@ func (p *Parser) parseTopLevel(file *ast.File) {
 		file.Sealeds = append(file.Sealeds, p.parseSealed())
 	case p.check(token.KwType):
 		file.Types = append(file.Types, p.parseType())
-	case p.check(token.Api):
-		file.APIs = append(file.APIs, p.parseAPI())
-	case p.check(token.Override):
-		p.advance() // consume 'override'
-		if p.check(token.Api) {
-			api := p.parseAPI()
-			api.Override = true
-			file.APIs = append(file.APIs, api)
-		} else {
-			p.error("expected 'api' after 'override', got %s", p.current().Val)
-		}
+	case p.check(token.Api), p.check(token.Override):
+		file.APIs = append(file.APIs, p.parseAPIOrOverride())
 	case p.check(token.Fn):
 		file.Functions = append(file.Functions, p.parseFn())
 	case p.check(token.Error):
@@ -95,14 +86,28 @@ func (p *Parser) parseTopLevel(file *ast.File) {
 		file.Middlewares = append(file.Middlewares, p.parseMiddleware())
 	case p.check(token.Import):
 		file.Imports = append(file.Imports, p.parseImport())
-	case p.check(token.Comment):
-		p.advance() // skip standalone comments
-	case p.check(token.EOF):
-		// do nothing, caller will break
+	case p.check(token.Comment), p.check(token.EOF):
+		p.handleNonDecl()
 	default:
 		p.error("unexpected token: %s", p.current().Val)
 		p.advance()
 	}
+}
+
+// parseAPIOrOverride parses an api declaration or an override api declaration.
+func (p *Parser) parseAPIOrOverride() *ast.ApiDecl {
+	if p.check(token.Override) {
+		return p.parseOverrideAPI()
+	}
+	return p.parseAPI()
+}
+
+// handleNonDecl handles non-declaration tokens (comments and EOF).
+func (p *Parser) handleNonDecl() {
+	if p.check(token.Comment) {
+		p.advance()
+	}
+	// EOF: do nothing, caller will break
 }
 
 // ========== Top-level Parsers ==========
@@ -263,6 +268,17 @@ func (p *Parser) parseType() *ast.TypeDecl {
 	}
 	p.expect(token.RBrace)
 	return td
+}
+
+func (p *Parser) parseOverrideAPI() *ast.ApiDecl {
+	p.advance() // consume 'override'
+	if !p.check(token.Api) {
+		p.error("expected 'api' after 'override', got %s", p.current().Val)
+		return &ast.ApiDecl{}
+	}
+	api := p.parseAPI()
+	api.Override = true
+	return api
 }
 
 func (p *Parser) parseAPI() *ast.ApiDecl {
@@ -876,62 +892,77 @@ func (p *Parser) parsePrefixExpr() ast.Expr {
 		return p.parseLiteral(pos)
 
 	case p.check(token.Ident) || p.isKeywordUsedAsIdent():
-		tok := p.advance()
-		ident := &ast.Ident{Pos: pos, Name: tok.Val}
-		// Object construction: AuthResult { token: tok, user: user }
-		if p.check(token.LBrace) && p.isTypeName(tok.Val) {
-			return p.parseObjectConstruction(pos, tok.Val)
-		}
-		return ident
+		return p.parseIdentOrConstruction(pos)
 
-	case p.check(token.Bang):
-		p.advance()
-		return &ast.UnaryExpr{Pos: pos, Op: "!", Value: p.parseExpr(precUnary)}
-
-	case p.check(token.Minus):
-		p.advance()
-		return &ast.UnaryExpr{Pos: pos, Op: "-", Value: p.parseExpr(precUnary)}
+	case p.check(token.Bang), p.check(token.Minus),
+		p.check(token.Throw), p.check(token.ChanSend):
+		return p.parsePrefixUnary(pos)
 
 	case p.check(token.LParen):
-		p.advance()
-		expr := p.parseExpr(precNone)
-		p.expect(token.RParen)
-		return expr
+		return p.parseParenExpr()
 
 	case p.check(token.LBracket):
 		return p.parseListExpr(pos)
 
-	case p.check(token.Throw):
-		p.advance()
-		return &ast.UnaryExpr{Pos: pos, Op: "throw", Value: p.parseExpr(precNone)}
-
 	case p.check(token.When):
 		return p.parseWhenExpr(pos)
 
-	case p.check(token.Yield):
-		p.advance()
-		return &ast.YieldExpr{Pos: pos, Value: p.parseExpr(precNone)}
-
-	case p.check(token.Async):
-		p.advance()
-		return &ast.AsyncExpr{Pos: pos, Body: p.parseBlock()}
-
-	case p.check(token.Await):
-		p.advance()
-		return &ast.AwaitExpr{Pos: pos, Body: p.parseBlock()}
-
-	case p.check(token.ChanSend):
-		p.advance()
-		return &ast.UnaryExpr{Pos: pos, Op: "<-", Value: p.parseExpr(precUnary)}
+	case p.check(token.Yield), p.check(token.Async), p.check(token.Await):
+		return p.parseConcurrencyExpr(pos)
 
 	case p.check(token.For):
-		forStmt := p.parseForStmt()
-		return forStmt
+		return p.parseForStmt()
 
 	default:
 		p.error("expected expression, got %s", p.current().Type)
 		p.advance()
 		return nil
+	}
+}
+
+// parseIdentOrConstruction parses an identifier or object construction expression.
+func (p *Parser) parseIdentOrConstruction(pos token.Position) ast.Expr {
+	tok := p.advance()
+	ident := &ast.Ident{Pos: pos, Name: tok.Val}
+	if p.check(token.LBrace) && p.isTypeName(tok.Val) {
+		return p.parseObjectConstruction(pos, tok.Val)
+	}
+	return ident
+}
+
+// parsePrefixUnary parses a unary prefix expression (!, -, throw, <-).
+func (p *Parser) parsePrefixUnary(pos token.Position) ast.Expr {
+	tok := p.advance()
+	switch tok.Type {
+	case token.Bang:
+		return &ast.UnaryExpr{Pos: pos, Op: "!", Value: p.parseExpr(precUnary)}
+	case token.Minus:
+		return &ast.UnaryExpr{Pos: pos, Op: "-", Value: p.parseExpr(precUnary)}
+	case token.ChanSend:
+		return &ast.UnaryExpr{Pos: pos, Op: "<-", Value: p.parseExpr(precUnary)}
+	default: // token.Throw
+		return &ast.UnaryExpr{Pos: pos, Op: "throw", Value: p.parseExpr(precNone)}
+	}
+}
+
+// parseParenExpr parses a parenthesized expression.
+func (p *Parser) parseParenExpr() ast.Expr {
+	p.advance()
+	expr := p.parseExpr(precNone)
+	p.expect(token.RParen)
+	return expr
+}
+
+// parseConcurrencyExpr parses yield, async, or await expressions.
+func (p *Parser) parseConcurrencyExpr(pos token.Position) ast.Expr {
+	tok := p.advance()
+	switch tok.Type {
+	case token.Yield:
+		return &ast.YieldExpr{Pos: pos, Value: p.parseExpr(precNone)}
+	case token.Async:
+		return &ast.AsyncExpr{Pos: pos, Body: p.parseBlock()}
+	default: // token.Await
+		return &ast.AwaitExpr{Pos: pos, Body: p.parseBlock()}
 	}
 }
 

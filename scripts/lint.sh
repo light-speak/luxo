@@ -18,8 +18,23 @@ echo "==> go vet"
 go vet ./pkg/... ./cmd/...
 echo "✅ go vet OK"
 
+echo "==> gocyclo (complexity ≤ 15)"
+if command -v gocyclo &> /dev/null; then
+    COMPLEX=$(gocyclo -over 15 pkg/ 2>/dev/null)
+    if [ -n "$COMPLEX" ]; then
+        echo "❌ 圈复杂度超过 15 / Cyclomatic complexity > 15:"
+        echo "$COMPLEX"
+        exit 1
+    fi
+    echo "✅ gocyclo OK"
+else
+    echo "⚠️  gocyclo 未安装，跳过 / gocyclo not installed, skipping"
+    echo "   安装 / Install: go install github.com/fzipp/gocyclo/cmd/gocyclo@latest"
+fi
+
 echo "==> go test"
 go test ./pkg/... -cover -timeout 60s
 echo "✅ tests OK"
 
-echo "==> 全部通过 / All checks passed"
+echo ""
+echo "==> 全部通过，可以提交 / All checks passed, ready to commit"

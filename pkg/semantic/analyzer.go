@@ -111,26 +111,12 @@ func (a *Analyzer) collectDeclarations(file *ast.File) {
 	for _, s := range file.Sealeds {
 		typ := a.declareType(s.Name, TypeSealed, s.Pos, s.Doc)
 		if typ != nil {
-			for _, v := range s.Variants {
-				vi := &SealedVariantInfo{Name: v.Name}
-				for _, f := range v.Fields {
-					vi.Fields = append(vi.Fields, &FieldInfo{
-						Name: f.Name,
-						Pos:  token.Position{},
-					})
-				}
-				typ.Variants = append(typ.Variants, vi)
-			}
+			a.collectSealedVariants(typ, s.Variants)
 		}
 	}
 	for _, t := range file.Types {
 		a.declareType(t.Name, TypeCustom, t.Pos, t.Doc)
-		// register generic type params (T, K, V, etc.) as types
-		for _, tp := range t.TypeParams {
-			if _, exists := a.types[tp]; !exists {
-				a.types[tp] = &ResolvedType{Kind: TypeGeneric, Name: tp, Fields: make(map[string]*FieldInfo)}
-			}
-		}
+		a.registerTypeParams(t.TypeParams)
 	}
 	for _, api := range file.APIs {
 		a.scope.Define(&Symbol{
@@ -163,6 +149,29 @@ func (a *Analyzer) collectDeclarations(file *ast.File) {
 			Pos:  mw.Pos,
 			Doc:  mw.Doc,
 		})
+	}
+}
+
+// collectSealedVariants populates a sealed type with its variant information.
+func (a *Analyzer) collectSealedVariants(typ *ResolvedType, variants []*ast.SealedVariant) {
+	for _, v := range variants {
+		vi := &SealedVariantInfo{Name: v.Name}
+		for _, f := range v.Fields {
+			vi.Fields = append(vi.Fields, &FieldInfo{
+				Name: f.Name,
+				Pos:  token.Position{},
+			})
+		}
+		typ.Variants = append(typ.Variants, vi)
+	}
+}
+
+// registerTypeParams registers generic type parameters as types if not already declared.
+func (a *Analyzer) registerTypeParams(params []string) {
+	for _, tp := range params {
+		if _, exists := a.types[tp]; !exists {
+			a.types[tp] = &ResolvedType{Kind: TypeGeneric, Name: tp, Fields: make(map[string]*FieldInfo)}
+		}
 	}
 }
 
@@ -530,32 +539,59 @@ func (a *Analyzer) checkExpr(expr ast.Expr, scope *Scope) *ResolvedType {
 		return a.checkWhenExpr(e, scope)
 	case *ast.LambdaExpr:
 		return a.checkLambdaExpr(e, scope)
-	case *ast.ListExpr:
-		for _, item := range e.Items {
-			a.checkExpr(item, scope)
-		}
-		return nil
-	case *ast.ObjectExpr:
-		for _, f := range e.Fields {
-			a.checkExpr(f.Value, scope)
-		}
-		return nil
-	case *ast.RangeExpr:
-		a.checkExpr(e.Start, scope)
-		a.checkExpr(e.End, scope)
-		return nil
-	case *ast.TransactionExpr:
-		childScope := scope.Child()
-		a.checkBlock(e.Body, childScope)
-		return nil
-	case *ast.TemplateString:
-		for _, part := range e.Parts {
-			a.checkExpr(part, scope)
-		}
-		return &ResolvedType{Kind: TypeString, Name: "String"}
+	default:
+		return a.checkCompositeExpr(expr, scope)
 	}
+}
 
+// checkCompositeExpr handles composite expression types (list, object, range, transaction, template).
+func (a *Analyzer) checkCompositeExpr(expr ast.Expr, scope *Scope) *ResolvedType {
+	switch e := expr.(type) {
+	case *ast.ListExpr:
+		return a.checkListExpr(e, scope)
+	case *ast.ObjectExpr:
+		return a.checkObjectExpr(e, scope)
+	case *ast.RangeExpr:
+		return a.checkRangeExpr(e, scope)
+	case *ast.TransactionExpr:
+		return a.checkTransactionExpr(e, scope)
+	case *ast.TemplateString:
+		return a.checkTemplateString(e, scope)
+	}
 	return nil
+}
+
+func (a *Analyzer) checkListExpr(e *ast.ListExpr, scope *Scope) *ResolvedType {
+	for _, item := range e.Items {
+		a.checkExpr(item, scope)
+	}
+	return nil
+}
+
+func (a *Analyzer) checkObjectExpr(e *ast.ObjectExpr, scope *Scope) *ResolvedType {
+	for _, f := range e.Fields {
+		a.checkExpr(f.Value, scope)
+	}
+	return nil
+}
+
+func (a *Analyzer) checkRangeExpr(e *ast.RangeExpr, scope *Scope) *ResolvedType {
+	a.checkExpr(e.Start, scope)
+	a.checkExpr(e.End, scope)
+	return nil
+}
+
+func (a *Analyzer) checkTransactionExpr(e *ast.TransactionExpr, scope *Scope) *ResolvedType {
+	childScope := scope.Child()
+	a.checkBlock(e.Body, childScope)
+	return nil
+}
+
+func (a *Analyzer) checkTemplateString(e *ast.TemplateString, scope *Scope) *ResolvedType {
+	for _, part := range e.Parts {
+		a.checkExpr(part, scope)
+	}
+	return &ResolvedType{Kind: TypeString, Name: "String"}
 }
 
 func (a *Analyzer) checkLiteralExpr(e *ast.Literal) *ResolvedType {
@@ -623,77 +659,94 @@ func (a *Analyzer) checkMemberExpr(e *ast.MemberExpr, scope *Scope) *ResolvedTyp
 func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
 	a.checkExpr(e.Func, scope)
 
-	// for find/create/update/delete, inject model fields into scope
-	// so that `find(User, where: email == input.email)` resolves `email`
-	callScope := scope
-	if ident, ok := e.Func.(*ast.Ident); ok && isCRUDOp(ident.Name) {
-		callScope = scope.Child()
-		if len(e.Args) > 0 {
-			if modelIdent, ok := e.Args[0].Value.(*ast.Ident); ok {
-				if modelType, ok := a.types[modelIdent.Name]; ok {
-					for fieldName, field := range modelType.Fields {
-						callScope.Define(&Symbol{
-							Name: fieldName,
-							Kind: SymField,
-							Type: field.Type,
-						})
-					}
-					// also inject inherited fields
-					for _, parent := range modelType.Parents {
-						for fieldName, field := range parent.Fields {
-							callScope.Define(&Symbol{
-								Name: fieldName,
-								Kind: SymField,
-								Type: field.Type,
-							})
-						}
-					}
-				}
-			}
-		}
-	}
+	callScope := a.injectCRUDScope(e, scope)
 
 	for _, arg := range e.Args {
 		a.checkExpr(arg.Value, callScope)
 	}
 
-	// return type is inferred from function declaration
-	if ident, ok := e.Func.(*ast.Ident); ok {
-		// CRUD operations return the model type
-		if isCRUDOp(ident.Name) && len(e.Args) > 0 {
-			if modelIdent, ok := e.Args[0].Value.(*ast.Ident); ok {
-				if modelType, ok := a.types[modelIdent.Name]; ok {
-					// find with where: returns list, find with id: returns single (nullable)
-					if ident.Name == "find" {
-						hasWhere := false
-						for _, arg := range e.Args {
-							if arg.Name == "where" {
-								hasWhere = true
-								break
-							}
-						}
-						if hasWhere {
-							return &ResolvedType{
-								Kind:    modelType.Kind,
-								Name:    modelType.Name,
-								IsList:  true,
-								Fields:  modelType.Fields,
-								Parents: modelType.Parents,
-							}
-						}
-						// find by id returns nullable
-						return modelType.AsNullable()
-					}
-					return modelType
-				}
-			}
-		}
-		sym := a.scope.Lookup(ident.Name)
-		if sym != nil {
-			return sym.Type
-		}
+	return a.inferCallReturnType(e)
+}
+
+// injectCRUDScope creates a child scope with model fields injected for CRUD operations.
+func (a *Analyzer) injectCRUDScope(e *ast.CallExpr, scope *Scope) *Scope {
+	ident, ok := e.Func.(*ast.Ident)
+	if !ok || !isCRUDOp(ident.Name) || len(e.Args) == 0 {
+		return scope
+	}
+	modelIdent, ok := e.Args[0].Value.(*ast.Ident)
+	if !ok {
+		return scope
+	}
+	modelType, ok := a.types[modelIdent.Name]
+	if !ok {
+		return scope
+	}
+	callScope := scope.Child()
+	a.defineFieldsInScope(callScope, modelType)
+	for _, parent := range modelType.Parents {
+		a.defineFieldsInScope(callScope, parent)
+	}
+	return callScope
+}
+
+// defineFieldsInScope defines all fields from a type into the given scope.
+func (a *Analyzer) defineFieldsInScope(scope *Scope, typ *ResolvedType) {
+	for fieldName, field := range typ.Fields {
+		scope.Define(&Symbol{
+			Name: fieldName,
+			Kind: SymField,
+			Type: field.Type,
+		})
+	}
+}
+
+// inferCallReturnType infers the return type of a call expression.
+func (a *Analyzer) inferCallReturnType(e *ast.CallExpr) *ResolvedType {
+	ident, ok := e.Func.(*ast.Ident)
+	if !ok {
+		return nil
+	}
+	if isCRUDOp(ident.Name) && len(e.Args) > 0 {
+		return a.inferCRUDReturnType(e, ident.Name)
+	}
+	sym := a.scope.Lookup(ident.Name)
+	if sym != nil {
+		return sym.Type
 	}
 	return nil
+}
+
+// inferCRUDReturnType infers the return type for CRUD operations.
+func (a *Analyzer) inferCRUDReturnType(e *ast.CallExpr, opName string) *ResolvedType {
+	modelIdent, ok := e.Args[0].Value.(*ast.Ident)
+	if !ok {
+		return nil
+	}
+	modelType, ok := a.types[modelIdent.Name]
+	if !ok {
+		return nil
+	}
+	if opName == "find" {
+		return a.inferFindReturnType(e, modelType)
+	}
+	return modelType
+}
+
+// inferFindReturnType returns list type for where queries, nullable for id queries.
+func (a *Analyzer) inferFindReturnType(e *ast.CallExpr, modelType *ResolvedType) *ResolvedType {
+	for _, arg := range e.Args {
+		if arg.Name == "where" {
+			return &ResolvedType{
+				Kind:    modelType.Kind,
+				Name:    modelType.Name,
+				IsList:  true,
+				Fields:  modelType.Fields,
+				Parents: modelType.Parents,
+			}
+		}
+	}
+	return modelType.AsNullable()
 }
 
 func isCRUDOp(name string) bool {
