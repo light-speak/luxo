@@ -1,0 +1,588 @@
+direction: down
+
+# ============================================================
+# Theme & Styles
+# ============================================================
+
+vars: {
+  d2-config: {
+    theme-id: 200
+    layout-engine: elk
+    pad: 40
+  }
+}
+
+classes: {
+  compiler: {
+    style: {
+      fill: "#1a1a2e"
+      stroke: "#e94560"
+      font-color: "#ffffff"
+      border-radius: 8
+      shadow: true
+    }
+  }
+  runtime: {
+    style: {
+      fill: "#16213e"
+      stroke: "#0f3460"
+      font-color: "#ffffff"
+      border-radius: 8
+      shadow: true
+    }
+  }
+  gateway: {
+    style: {
+      fill: "#0f3460"
+      stroke: "#e94560"
+      font-color: "#ffffff"
+      border-radius: 8
+      shadow: true
+      stroke-width: 3
+    }
+  }
+  storage: {
+    style: {
+      fill: "#1a1a2e"
+      stroke: "#533483"
+      font-color: "#ffffff"
+      border-radius: 12
+      shadow: true
+    }
+  }
+  client: {
+    style: {
+      fill: "#e94560"
+      stroke: "#e94560"
+      font-color: "#ffffff"
+      border-radius: 20
+      shadow: true
+      font-size: 16
+      bold: true
+    }
+  }
+  protocol: {
+    style: {
+      fill: "#533483"
+      stroke: "#e94560"
+      font-color: "#ffffff"
+      border-radius: 6
+      shadow: true
+    }
+  }
+  gen: {
+    style: {
+      fill: "#0a0a1a"
+      stroke: "#e94560"
+      font-color: "#e94560"
+      border-radius: 4
+      stroke-dash: 3
+    }
+  }
+  note: {
+    style: {
+      fill: "#2a2a3e"
+      stroke: "#666"
+      font-color: "#aaa"
+      border-radius: 4
+      font-size: 12
+      italic: true
+    }
+  }
+}
+
+# ============================================================
+# Title
+# ============================================================
+
+title: {
+  label: |md
+    # LUXO Architecture
+    *One origin. Speed of light.*
+  |
+  style: {
+    font-color: "#e94560"
+    fill: transparent
+    stroke: transparent
+    font-size: 20
+  }
+}
+
+# ============================================================
+# Layer 1: Compile Time
+# ============================================================
+
+compiler: "⚡ Compile Time" {
+  class: compiler
+
+  source: ".luxo Source" {
+    style: {
+      fill: "#2a1a3e"
+      stroke: "#e94560"
+      font-color: "#f5a623"
+      border-radius: 8
+      font-size: 16
+      bold: true
+    }
+  }
+
+  pipeline: "Compiler Pipeline" {
+    class: compiler
+
+    lexer: "Lexer\n31 keywords" {
+      class: compiler
+    }
+    parser: "Parser\nPratt parsing" {
+      class: compiler
+    }
+    semantic: "Semantic Analyzer\nType check · Null safety\nField injection · Safety rules" {
+      class: compiler
+    }
+
+    lexer -> parser: tokens {
+      style.stroke: "#e94560"
+      style.font-color: "#aaa"
+    }
+    parser -> semantic: AST {
+      style.stroke: "#e94560"
+      style.font-color: "#aaa"
+    }
+  }
+
+  source -> pipeline.lexer: {
+    style.stroke: "#f5a623"
+    style.stroke-width: 2
+  }
+
+  lsp: "LSP Server\nDiagnostics · Completion\nHover · Go-to-def · References" {
+    class: compiler
+    style.stroke: "#0f3460"
+  }
+
+  codegen: "Code Generator" {
+    class: compiler
+
+    go_code: "Go Code\nmodel · api · db\ndataloader · main" {
+      class: gen
+    }
+    migration: "SQL Migrations\nUP + DOWN" {
+      class: gen
+    }
+    lock: ".luxo.lock\nField ID mapping\nBinary versioning" {
+      class: gen
+    }
+    sdk: "Client SDK\nTypeScript · Dart" {
+      class: gen
+    }
+  }
+
+  pipeline.semantic -> lsp: "shared analysis" {
+    style.stroke: "#0f3460"
+    style.stroke-dash: 3
+    style.font-color: "#aaa"
+  }
+  pipeline.semantic -> codegen: "typed AST" {
+    style.stroke: "#e94560"
+    style.font-color: "#aaa"
+  }
+}
+
+# ============================================================
+# Layer 2: Clients
+# ============================================================
+
+clients: "Clients" {
+  style: {
+    fill: transparent
+    stroke: transparent
+  }
+
+  web: "Web App\nTypeScript SDK" {
+    class: client
+    shape: rectangle
+  }
+  mobile: "Mobile App\nDart SDK" {
+    class: client
+    shape: rectangle
+  }
+  third: "3rd Party\nHTTP / WebSocket" {
+    class: client
+    shape: rectangle
+  }
+}
+
+# ============================================================
+# Layer 3: Binary Protocol
+# ============================================================
+
+protocol: "Binary Protocol" {
+  class: protocol
+
+  format: "Wire Format" {
+    class: protocol
+
+    json_mode: "JSON Mode (dev)\nHuman readable\nContent-Type: application/luxo\nX-Luxo-Mode: json" {
+      class: protocol
+      style.stroke: "#f5a623"
+    }
+
+    binary_mode: "Binary Mode (prod)\nField mask (bitfield)\nVarint · Length-prefixed\nX-Luxo-Mode: binary" {
+      class: protocol
+      style.stroke: "#e94560"
+    }
+  }
+
+  response: "Response Format" {
+    class: protocol
+
+    resp_detail: |md
+      ```
+      [1 byte flags]
+        bit 0: has_data
+        bit 1: has_errors
+
+      [data]  → binary encoded
+      [errors] → length-prefixed JSON
+      ```
+    | {
+      style: {
+        fill: "#2a1a3e"
+        stroke: "#533483"
+        font-color: "#ccc"
+        border-radius: 4
+      }
+    }
+  }
+}
+
+# ============================================================
+# Layer 4: Luvia Gateway (Always-on)
+# ============================================================
+
+luvia: "🛤️ Luvia Gateway — Always On" {
+  class: gateway
+
+  note: "Single service: embedded (in-process, zero overhead)\nMulti service: standalone (HTTP/2 forwarding)" {
+    class: note
+  }
+
+  auth: "Auth Layer\nJWT → Identity\nmy.id · my.load()" {
+    class: gateway
+    style.fill: "#1a2a4e"
+  }
+
+  middleware: "Middleware\nCORS · RateLimit\nJSON ↔ Binary" {
+    class: gateway
+    style.fill: "#1a2a4e"
+  }
+
+  router: "Smart Router" {
+    class: gateway
+    style.fill: "#1a2a4e"
+
+    schema: "Schema Compose\nPull & merge all\nservice schemas" {
+      class: gateway
+      style.fill: "#0a1a3e"
+    }
+
+    routing: "Route Table\napi → service mapping\nextend → source service" {
+      class: gateway
+      style.fill: "#0a1a3e"
+    }
+
+    schema -> routing: {
+      style.stroke: "#e94560"
+    }
+  }
+
+  orchestrator: "Orchestrator" {
+    class: gateway
+    style.fill: "#1a2a4e"
+
+    direct: "Direct\nSingle service\npass-through" {
+      class: gateway
+      style.fill: "#0a1a3e"
+    }
+
+    aggregate: "Aggregate\nextend fields\nparallel fan-out\nassemble result" {
+      class: gateway
+      style.fill: "#0a1a3e"
+    }
+
+    batch: "Batch Merge\nN × getUser(id)\n→ 1 × batchGetUser([ids])" {
+      class: gateway
+      style.fill: "#0a1a3e"
+    }
+  }
+
+  health: "Health & Circuit Breaker\nLB: round_robin · least_conn\nBreaker: closed → open → half_open" {
+    class: gateway
+    style.fill: "#1a2a4e"
+  }
+
+  auth -> middleware: {style.stroke: "#0f3460"}
+  middleware -> router: {style.stroke: "#0f3460"}
+  router -> orchestrator: {style.stroke: "#0f3460"}
+  orchestrator -> health: {style.stroke: "#0f3460"}
+}
+
+# ============================================================
+# Layer 5: Services (Runtime)
+# ============================================================
+
+services: "Services" {
+  style: {
+    fill: transparent
+    stroke: "#0f3460"
+    stroke-dash: 3
+    border-radius: 12
+  }
+
+  user_svc: "User Service" {
+    class: runtime
+
+    handler: "Handlers\nauto CRUD + Luxo logic\n+ @native (Go)" {
+      class: runtime
+      style.fill: "#0a1a3e"
+    }
+
+    dl: "DataLoader\nAuto batch\nN+1 eliminated" {
+      class: runtime
+      style.fill: "#0a1a3e"
+    }
+
+    qb: "Query Builder\nType-safe · pgx\nField selection → SQL" {
+      class: runtime
+      style.fill: "#0a1a3e"
+    }
+
+    handler -> dl: {style.stroke: "#0f3460"}
+    dl -> qb: {style.stroke: "#0f3460"}
+  }
+
+  order_svc: "Order Service" {
+    class: runtime
+
+    handler: "Handlers" {
+      class: runtime
+      style.fill: "#0a1a3e"
+    }
+
+    dl: "DataLoader" {
+      class: runtime
+      style.fill: "#0a1a3e"
+    }
+
+    qb: "Query Builder" {
+      class: runtime
+      style.fill: "#0a1a3e"
+    }
+
+    handler -> dl: {style.stroke: "#0f3460"}
+    dl -> qb: {style.stroke: "#0f3460"}
+  }
+
+  post_svc: "Post Service" {
+    class: runtime
+
+    handler: "Handlers" {
+      class: runtime
+      style.fill: "#0a1a3e"
+    }
+
+    dl: "DataLoader" {
+      class: runtime
+      style.fill: "#0a1a3e"
+    }
+
+    qb: "Query Builder" {
+      class: runtime
+      style.fill: "#0a1a3e"
+    }
+
+    handler -> dl: {style.stroke: "#0f3460"}
+    dl -> qb: {style.stroke: "#0f3460"}
+  }
+
+  # Cross-service RPC
+  user_svc.handler -> order_svc.handler: "services.user\n@service RPC\nBinary protocol" {
+    style: {
+      stroke: "#e94560"
+      stroke-dash: 5
+      font-color: "#e94560"
+      font-size: 11
+    }
+  }
+}
+
+# ============================================================
+# Layer 6: Infrastructure
+# ============================================================
+
+infra: "Infrastructure" {
+  style: {
+    fill: transparent
+    stroke: transparent
+  }
+
+  pg: "PostgreSQL\nAll-in Postgres\npgx · Connection Pool" {
+    class: storage
+    shape: cylinder
+  }
+
+  nats: "NATS JetStream\nevent / emit / on\nCross-service messaging" {
+    class: storage
+    shape: queue
+  }
+
+  studio: "Luxo Studio\nMonitoring · Tracing\nAPI Playground" {
+    class: storage
+    style.stroke: "#f5a623"
+  }
+}
+
+# ============================================================
+# Connections
+# ============================================================
+
+# Compiler → generates code for services
+compiler.codegen.go_code -> services: "generates" {
+  style: {
+    stroke: "#e94560"
+    stroke-dash: 5
+    font-color: "#e94560"
+  }
+}
+
+# Compiler → generates SDK for clients
+compiler.codegen.sdk -> clients: "generates" {
+  style: {
+    stroke: "#e94560"
+    stroke-dash: 5
+    font-color: "#e94560"
+  }
+}
+
+# Compiler → generates lock for protocol
+compiler.codegen.lock -> protocol: "field IDs" {
+  style: {
+    stroke: "#533483"
+    stroke-dash: 5
+    font-color: "#aaa"
+  }
+}
+
+# Clients → Luvia
+clients.web -> luvia.auth: "HTTP/2 + field selection" {
+  style: {
+    stroke: "#e94560"
+    stroke-width: 2
+    font-color: "#aaa"
+  }
+}
+clients.mobile -> luvia.auth: "HTTP/2 + Binary" {
+  style: {
+    stroke: "#e94560"
+    stroke-width: 2
+    font-color: "#aaa"
+  }
+}
+clients.third -> luvia.auth: "HTTP/2" {
+  style: {
+    stroke: "#e94560"
+    stroke-width: 2
+    font-color: "#aaa"
+  }
+}
+
+# Protocol sits between clients and Luvia
+clients -> protocol: "encode" {
+  style: {
+    stroke: "#533483"
+    stroke-dash: 3
+    font-color: "#aaa"
+  }
+}
+protocol -> luvia: "decode / re-encode" {
+  style: {
+    stroke: "#533483"
+    stroke-dash: 3
+    font-color: "#aaa"
+  }
+}
+
+# Luvia → Services
+luvia.health -> services.user_svc.handler: "HTTP/2\nBinary internal" {
+  style: {
+    stroke: "#0f3460"
+    stroke-width: 2
+    font-color: "#aaa"
+  }
+}
+luvia.health -> services.order_svc.handler: {
+  style: {
+    stroke: "#0f3460"
+    stroke-width: 2
+  }
+}
+luvia.health -> services.post_svc.handler: {
+  style: {
+    stroke: "#0f3460"
+    stroke-width: 2
+  }
+}
+
+# Services → DB
+services.user_svc.qb -> infra.pg: {
+  style: {
+    stroke: "#533483"
+    stroke-width: 2
+  }
+}
+services.order_svc.qb -> infra.pg: {
+  style: {
+    stroke: "#533483"
+    stroke-width: 2
+  }
+}
+services.post_svc.qb -> infra.pg: {
+  style: {
+    stroke: "#533483"
+    stroke-width: 2
+  }
+}
+
+# Services → NATS
+services.user_svc.handler -> infra.nats: "emit" {
+  style: {
+    stroke: "#f5a623"
+    stroke-dash: 3
+    font-color: "#f5a623"
+  }
+}
+services.order_svc.handler -> infra.nats: "emit / on" {
+  style: {
+    stroke: "#f5a623"
+    stroke-dash: 3
+    font-color: "#f5a623"
+  }
+}
+
+# Luvia → Studio
+luvia -> infra.studio: "metrics · traces" {
+  style: {
+    stroke: "#f5a623"
+    stroke-dash: 3
+    font-color: "#aaa"
+  }
+}
+
+# WebSocket
+clients.web -> luvia.auth: "WebSocket (stream)" {
+  style: {
+    stroke: "#f5a623"
+    stroke-width: 1
+    font-color: "#f5a623"
+    stroke-dash: 3
+  }
+}

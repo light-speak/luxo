@@ -73,8 +73,9 @@ This generates everything. One file, zero boilerplate.
 | **N+1 Prevention** | ❌ Resolver-per-field pattern naturally causes N+1 — requires manual DataLoader integration (standard practice; frameworks like Hasura auto-solve) | N/A — no nested field resolution model | ❌ Nested resources require manual query optimization or eager loading | ✅ Compiler auto-analyzes relations and generates DataLoader batching — no manual intervention needed |
 | **Null Safety** | ⚠️ SDL `!` marks non-null with server-side runtime enforcement; client codegen can provide compile-time type safety | ✅ Protobuf fields have default zero values with compile-time type safety (but proto3 can't distinguish "zero" from "unset" without `optional`) | ❌ No null safety — null errors only surface at runtime | ✅ Language-level compile-time null safety: `?` nullable declaration, `?.` safe access, `?:` Elvis fallback — null errors caught before running |
 | **Error Handling** | ❌ Loosely-typed `errors` array with message string + optional extensions — hard for clients to handle structurally | ✅ gRPC Status with 16 standard codes + rich error details — well-typed | ❌ HTTP status codes + custom JSON body — no unified error structure standard | ✅ `Result<T>` typed errors + `?` operator for auto-propagation — safe and concise |
-| **Concurrency** | ⚠️ Most implementations auto-parallelize independent resolvers (gqlgen / Apollo / graphql-java), but no language-level concurrency primitives — complex orchestration still depends on the host language | ❌ Supports bidirectional streaming, but concurrency orchestration is entirely manual | ❌ No built-in concurrency — fully depends on framework or manual thread/goroutine management | ✅ Built-in `async` / `await` + `Channel` message passing — concurrency safety guaranteed by the compiler |
+| **Concurrency** | ⚠️ Most implementations auto-parallelize independent resolvers (gqlgen / Apollo / graphql-java), but no language-level concurrency primitives — complex orchestration still depends on the host language | ❌ Supports bidirectional streaming, but concurrency orchestration is entirely manual | ❌ No built-in concurrency — fully depends on framework or manual thread/goroutine management | ✅ Built-in `async` / `await` + `Channel` — compiles directly to Go goroutines and channels, zero-cost concurrency |
 | **Multi-service** | ⚠️ Apollo Federation is mature but operationally complex — requires extra gateway layer and cross-service coordination | ⚠️ Native point-to-point RPC, but multi-service orchestration still needs service mesh/discovery (Istio, Consul, etc.) | ❌ Inter-service calls require hand-written HTTP clients or additional frameworks | ✅ `extend` for cross-service type composition + built-in gateway routing + native RPC — multi-service out of the box |
+| **Scaling** | ❌ Monolith-to-federation migration requires rewriting resolvers, adding `@key`/`@external` annotations, deploying Apollo Router | ❌ Service split requires redefining `.proto` files, regenerating stubs, rewriting client calls | ❌ Every split means new routes, new HTTP clients, new deployment configs | ✅ Single service → multi-service by changing config only — zero code changes, Luvia gateway handles everything |
 
 ## The Language
 
@@ -131,7 +132,7 @@ async {
   sendEmail(user.email, "Welcome!")
 }
 
-// Channels
+// Channels — compiles to Go channels
 val ch = Channel<Int>(10)
 ch <- 42                             // send
 val value = <-ch                     // receive
@@ -248,35 +249,11 @@ luxo dev
 
 ## Architecture
 
-```
-                        ┌──────────────────────────┐
-                        │         Luvia            │
-  Client ──HTTP/2──────►│  Schema · LB · Breaker   │──HTTP/2──► Services
-         ◄─WebSocket────│  Studio · Identity       │
-                        └──────────────────────────┘
-                              │          │
-                        ┌─────┘          └─────┐
-                        ▼                      ▼
-                  ┌───────────┐          ┌───────────┐
-                  │   User    │          │   Order   │
-                  │  Service  │──NATS───►│  Service  │
-                  └───────────┘          └───────────┘
+<p align="center">
+  <img src="assets/architecture.svg" alt="Luxo Architecture" width="100%" />
+</p>
 
-  Single service:  luxo dev
-  Multi service:   luxo dev --all
-```
-
-## Compiler
-
-Complete compiler pipeline with IDE support:
-
-```
-.luxo source → Lexer → Parser → Semantic Analyzer → Go Code Generator
-                                       ↓
-                                 LSP Server
-                                       ↓
-                    Real-time errors · completion · hover · go-to-definition
-```
+**Luvia is always on** — single service runs embedded (in-process, zero overhead), multi-service runs as a standalone gateway. Same code, same behavior, just change the config. Scale from prototype to production without touching a single line of code.
 
 - **510 tests** · Coverage at maximum achievable limit
 - **Fuzz testing** on Lexer, Parser, and Semantic Analyzer
