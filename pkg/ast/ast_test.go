@@ -51,6 +51,7 @@ func TestStmtGetPos(t *testing.T) {
 		&ExprStmt{Pos: pos},
 		&AssignStmt{Pos: pos},
 		&BreakStmt{Pos: pos},
+		&OnDecl{Pos: pos},
 	}
 
 	for _, s := range stmts {
@@ -79,15 +80,14 @@ func TestStmtNodeInterface(t *testing.T) {
 	stmts := []Stmt{
 		&ValStmt{}, &IfStmt{}, &ForStmt{},
 		&ReturnStmt{}, &ThrowStmt{}, &EmitStmt{}, &ExprStmt{},
-		&AssignStmt{}, &BreakStmt{},
+		&AssignStmt{}, &BreakStmt{}, &OnDecl{},
 	}
 	for _, s := range stmts {
 		s.stmtNode()
 	}
 }
 
-func TestStructFieldAccess(t *testing.T) {
-	// Verify key struct fields are accessible.
+func TestStructFieldAccessDecls(t *testing.T) {
 	m := &ModelDecl{Name: "User", Parents: []string{"Base"}}
 	if m.Name != "User" || len(m.Parents) != 1 {
 		t.Error("ModelDecl fields not accessible")
@@ -112,7 +112,9 @@ func TestStructFieldAccess(t *testing.T) {
 	if d.Name != "cache" || len(d.Args) != 1 {
 		t.Error("Directive fields not accessible")
 	}
+}
 
+func TestStructFieldAccessNodes(t *testing.T) {
 	wb := &WhenBranch{IsType: "User", Body: &Ident{Name: "x"}}
 	if wb.IsType != "User" {
 		t.Error("WhenBranch fields not accessible")
@@ -131,5 +133,20 @@ func TestStructFieldAccess(t *testing.T) {
 	pd := &ParamDecl{Name: "id"}
 	if pd.Name != "id" {
 		t.Error("ParamDecl fields not accessible")
+	}
+
+	ev := &EventDecl{Name: "UserCreated", Pos: token.Position{Line: 1, Col: 1}}
+	if ev.Name != "UserCreated" || ev.GetPos().Line != 1 {
+		t.Error("EventDecl fields not accessible")
+	}
+
+	on := &OnDecl{EventName: "UserCreated", Native: true, Pos: token.Position{Line: 2, Col: 1}}
+	if on.EventName != "UserCreated" || !on.Native || on.GetPos().Line != 2 {
+		t.Error("OnDecl fields not accessible")
+	}
+
+	es := &EmitStmt{EventName: "UserCreated"}
+	if es.EventName != "UserCreated" {
+		t.Error("EmitStmt.EventName not accessible")
 	}
 }

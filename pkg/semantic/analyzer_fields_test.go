@@ -562,17 +562,6 @@ extend NonExistent {
 	}
 }
 
-func TestThroughRelation(t *testing.T) {
-	result := analyze(t, `
-model Role { name: String }
-model UserRole { userId: Int roleId: Int }
-model User {
-  roles: [Role] through UserRole
-}
-`)
-	expectNoErrors(t, result)
-}
-
 func TestCustomFKField(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }

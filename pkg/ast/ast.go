@@ -16,10 +16,13 @@ type File struct {
 	Extends     []*ExtendDecl
 	Uses        []*UseDecl
 	Middlewares []*MiddlewareDecl
+	Events      []*EventDecl
+	Listeners   []*OnDecl
 	Imports     []*ImportDecl
+	Globals     []*ValStmt // top-level val/var declarations
 }
 
-// ImportDecl: import http
+// ImportDecl: use http (stdlib import)
 type ImportDecl struct {
 	Pos    token.Position
 	Module string
@@ -134,6 +137,22 @@ type MiddlewareDecl struct {
 	Body       *Block
 }
 
+// EventDecl: event UserCreated(user: User)
+type EventDecl struct {
+	Pos    token.Position
+	Name   string
+	Params []*ParamDecl
+}
+
+// OnDecl: on UserCreated { ... }
+type OnDecl struct {
+	Pos       token.Position
+	EventName string
+	Params    []string // lambda-style params: on Event { user -> ... }
+	Body      *Block   // nil if @native
+	Native    bool
+}
+
 // ScopeDecl: scope published { where: status == "PUBLISHED" }
 type ScopeDecl struct {
 	Pos  token.Position
@@ -162,6 +181,7 @@ type ComputedField struct {
 
 // ParamDecl: id: Int = 0
 type ParamDecl struct {
+	Pos     token.Position
 	Name    string
 	Type    *TypeRef
 	Default Expr
@@ -326,21 +346,21 @@ type Stmt interface {
 	GetPos() token.Position
 }
 
-// ValStmt: val x = expr, val x: Type = expr
+// ValStmt: val x = expr (immutable), var x = expr (mutable)
 type ValStmt struct {
-	Pos   token.Position
-	Name  string   // single name: val x = ...
-	Names []string // destructure: val (a, b, c) = ...
-	Type  *TypeRef // optional, usually inferred
-	Value Expr
+	Pos     token.Position
+	Name    string   // single name: val x = ...
+	Names   []string // destructure: val (a, b, c) = ...
+	Type    *TypeRef // optional, usually inferred
+	Value   Expr
+	Mutable bool // true for var, false for val
 }
 
-// IfStmt: if condition { ... } else { ... }
+// IfStmt: if condition { ... } — single branch only, use when for multi-branch
 type IfStmt struct {
 	Pos       token.Position
 	Condition Expr
 	Then      *Block
-	Else      *Block // nil if no else
 }
 
 // ForStmt: for item in collection { ... }
@@ -363,10 +383,11 @@ type ThrowStmt struct {
 	Error Expr
 }
 
-// EmitStmt: emit("event", data, key: value)
+// EmitStmt: emit UserCreated(user: currentUser)
 type EmitStmt struct {
-	Pos  token.Position
-	Args []*NamedArg
+	Pos       token.Position
+	EventName string
+	Args      []*NamedArg
 }
 
 // AssignStmt: x = 2, x += 1
@@ -390,8 +411,9 @@ type ExprStmt struct {
 
 // Block: a sequence of statements
 type Block struct {
-	Pos   token.Position
-	Stmts []Stmt
+	Pos    token.Position
+	EndPos token.Position // position of closing }
+	Stmts  []Stmt
 }
 
 // ========== Interface implementations ==========
@@ -424,6 +446,7 @@ func (n *EmitStmt) stmtNode()   {}
 func (n *AssignStmt) stmtNode() {}
 func (n *BreakStmt) stmtNode()  {}
 func (n *ExprStmt) stmtNode()   {}
+func (n *OnDecl) stmtNode()     {}
 
 func (n *Literal) GetPos() token.Position         { return n.Pos }
 func (n *Ident) GetPos() token.Position           { return n.Pos }
@@ -452,3 +475,5 @@ func (n *EmitStmt) GetPos() token.Position   { return n.Pos }
 func (n *AssignStmt) GetPos() token.Position { return n.Pos }
 func (n *BreakStmt) GetPos() token.Position  { return n.Pos }
 func (n *ExprStmt) GetPos() token.Position   { return n.Pos }
+func (n *EventDecl) GetPos() token.Position  { return n.Pos }
+func (n *OnDecl) GetPos() token.Position     { return n.Pos }

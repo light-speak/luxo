@@ -19,6 +19,7 @@ const (
 	SymVariable
 	SymMiddleware
 	SymScope
+	SymEvent
 )
 
 var symbolKindNames = map[SymbolKind]string{
@@ -26,6 +27,7 @@ var symbolKindNames = map[SymbolKind]string{
 	SymSealed: "sealed", SymType: "type", SymApi: "api", SymFn: "fn",
 	SymError: "error", SymField: "field", SymParam: "param",
 	SymVariable: "variable", SymMiddleware: "middleware", SymScope: "scope",
+	SymEvent: "event",
 }
 
 func (k SymbolKind) String() string {
@@ -37,12 +39,13 @@ func (k SymbolKind) String() string {
 
 // Symbol represents a named declaration in the program.
 type Symbol struct {
-	Name   string
-	Kind   SymbolKind
-	Type   *ResolvedType
-	Pos    token.Position
-	Doc    string
-	Module string // which module this belongs to
+	Name    string
+	Kind    SymbolKind
+	Type    *ResolvedType
+	Pos     token.Position
+	Doc     string
+	Module  string // which module this belongs to
+	Mutable bool   // true for var, false for val
 }
 
 // Scope represents a lexical scope with symbols.

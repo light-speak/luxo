@@ -13,15 +13,13 @@ const (
 	TypeBool
 	TypeDateTime
 	TypeDuration
-	TypeJson
-	TypeFile
-	TypeVoid
+	TypeVoid // internal only, not user-facing
 	TypeModel
 	TypeInterface
 	TypeEnum
 	TypeSealed
 	TypeCustom  // user-defined type
-	TypeGeneric // Page<T>
+	TypeGeneric // Page<T>, Result<T>
 	TypeTuple   // (Post, Video, Product) polymorphic
 )
 
@@ -121,12 +119,8 @@ func BuiltinTypes() map[string]*ResolvedType {
 		"Float":    floatType,
 		"String":   stringType,
 		"Boolean":  boolType,
-		"Bool":     boolType,
 		"DateTime": {Kind: TypeDateTime, Name: "DateTime", Fields: map[string]*FieldInfo{}},
 		"Duration": {Kind: TypeDuration, Name: "Duration", Fields: map[string]*FieldInfo{}},
-		"Json":     {Kind: TypeJson, Name: "Json", Fields: map[string]*FieldInfo{}},
-		"File":     {Kind: TypeFile, Name: "File", Fields: map[string]*FieldInfo{}},
-		"Void":     {Kind: TypeVoid, Name: "Void", Fields: map[string]*FieldInfo{}},
 		"Result":   {Kind: TypeGeneric, Name: "Result", Fields: map[string]*FieldInfo{}},
 		"Channel":  {Kind: TypeGeneric, Name: "Channel", Fields: map[string]*FieldInfo{}},
 	}

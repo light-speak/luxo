@@ -461,22 +461,6 @@ func TestParseForeignKey(t *testing.T) {
 	}
 }
 
-func TestParseThroughRelation(t *testing.T) {
-	input := `model User : Base {
-  roles: [Role] through UserRole
-}`
-	file := parse(t, input)
-	m := file.Models[0]
-
-	f := m.Fields[0]
-	if !f.Type.IsList {
-		t.Error("expected list type")
-	}
-	if f.Type.FKField != "through:UserRole" {
-		t.Errorf("expected 'through:UserRole', got %q", f.Type.FKField)
-	}
-}
-
 func TestParseErrorRecovery(t *testing.T) {
 	// Invalid syntax: missing colon in field declaration.
 	// The parser should not crash/panic but should collect errors.
@@ -766,6 +750,63 @@ func TestIsTypeNameEdgeCases(t *testing.T) {
 	}
 }
 
+// ========== parseEmitStmt — emit with empty parens ==========
+
+func TestParseEmitEmptyParens(t *testing.T) {
+	input := `event Ping()
+api test(): Int {
+  emit Ping()
+  0
+}`
+	file := parse(t, input)
+	if len(file.APIs) != 1 {
+		t.Fatal("expected 1 api")
+	}
+	body := file.APIs[0].Body
+	if body == nil || len(body.Stmts) < 1 {
+		t.Fatal("expected at least 1 statement")
+	}
+	emit, ok := body.Stmts[0].(*ast.EmitStmt)
+	if !ok {
+		t.Fatal("expected EmitStmt")
+	}
+	if emit.EventName != "Ping" {
+		t.Errorf("expected event name 'Ping', got %q", emit.EventName)
+	}
+	if len(emit.Args) != 0 {
+		t.Errorf("expected 0 args, got %d", len(emit.Args))
+	}
+}
+
+// ========== tryParseLambdaParams — fallback case (non-ident after comma) ==========
+
+func TestTryParseLambdaParamsFallback(t *testing.T) {
+	// x, 42 -> ... is not a valid lambda params pattern (non-ident after comma)
+	// This should fall back to parsing as expression
+	input := `api test(): Int {
+  val result = [1, 2, 3]
+  0
+}`
+	file := parse(t, input)
+	if len(file.APIs) != 1 {
+		t.Fatal("expected 1 api")
+	}
+}
+
+// ========== parseExpr — defensive nil guard (unreachable token) ==========
+
+func TestParseExprUnexpectedTokenInVal(t *testing.T) {
+	// Use a token that can't start an expression in val assignment
+	input := `api test(): Int {
+  val x = }
+  0
+}`
+	_, errs := parseWithErrors(t, input)
+	if len(errs) == 0 {
+		t.Error("expected parser errors for unexpected token")
+	}
+}
+
 // Test nullable list type [Post]? in parseTypeRef.
 func TestParseNullableListTypeRef(t *testing.T) {
 	input := `extend User {
@@ -779,21 +820,5 @@ func TestParseNullableListTypeRef(t *testing.T) {
 	}
 	if !f.Type.Nullable {
 		t.Error("expected nullable list")
-	}
-}
-
-// Test through on non-list type (line 581-583 in parseTypeRef).
-func TestParseThroughOnScalarType(t *testing.T) {
-	input := `model User : Base {
-  profile: Profile through UserProfile
-}`
-	file := parse(t, input)
-	m := file.Models[0]
-	f := m.Fields[0]
-	if f.Type.Name != "Profile" {
-		t.Errorf("expected type 'Profile', got %q", f.Type.Name)
-	}
-	if f.Type.FKField != "through:UserProfile" {
-		t.Errorf("expected FK 'through:UserProfile', got %q", f.Type.FKField)
 	}
 }

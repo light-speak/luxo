@@ -82,11 +82,11 @@ func TestOperators(t *testing.T) {
 }
 
 func TestKeywords(t *testing.T) {
-	input := `model interface enum sealed type fn api error middleware
-extend override use through stream
-val when if else for in return break is
-async await yield import
-throw
+	input := `model interface enum sealed type fn api error middleware event
+extend override use stream
+val var when if else for in return break is on my
+async await yield
+throw emit
 true false null`
 
 	l := New(input, "test.luxo")

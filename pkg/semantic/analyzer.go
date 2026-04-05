@@ -39,10 +39,14 @@ type Result struct {
 
 // Analyzer performs semantic analysis on AST nodes.
 type Analyzer struct {
-	scope    *Scope
-	types    map[string]*ResolvedType
-	errors   []Error
-	warnings []Warning
+	scope         *Scope
+	types         map[string]*ResolvedType
+	errors        []Error
+	warnings      []Warning
+	inLambda      bool // true when checking inside a lambda body
+	inTransaction bool // true when checking inside a transaction block
+	inAwait       bool // true when checking inside an await block
+	files         []*ast.File
 }
 
 // New creates a new Analyzer.
@@ -65,6 +69,8 @@ func New() *Analyzer {
 
 // Analyze performs semantic analysis on one or more parsed files.
 func (a *Analyzer) Analyze(files []*ast.File) *Result {
+	a.files = files
+
 	// Pass 1: collect all top-level declarations (types, models, enums, etc.)
 	for _, file := range files {
 		a.collectDeclarations(file)
@@ -84,6 +90,9 @@ func (a *Analyzer) Analyze(files []*ast.File) *Result {
 	for _, file := range files {
 		a.checkBodies(file)
 	}
+
+	// Pass 5: check circular event dependencies
+	a.checkEventCycles()
 
 	return &Result{
 		Scope:    a.scope,
@@ -148,6 +157,13 @@ func (a *Analyzer) collectDeclarations(file *ast.File) {
 			Kind: SymMiddleware,
 			Pos:  mw.Pos,
 			Doc:  mw.Doc,
+		})
+	}
+	for _, ev := range file.Events {
+		a.scope.Define(&Symbol{
+			Name: ev.Name,
+			Kind: SymEvent,
+			Pos:  ev.Pos,
 		})
 	}
 }
@@ -318,12 +334,23 @@ func (a *Analyzer) resolveFnTypes(file *ast.File) {
 }
 
 func (a *Analyzer) resolveExtendFields(file *ast.File) {
+	// detect extend field conflicts: same model + same field name
+	extendFields := map[string]map[string]token.Position{} // model → field → first pos
 	for _, ext := range file.Extends {
 		if _, ok := a.types[ext.Name]; !ok {
 			// extend target might be in another module (resolved at gateway)
-			// just validate that fields are valid
+		}
+		if extendFields[ext.Name] == nil {
+			extendFields[ext.Name] = map[string]token.Position{}
 		}
 		for _, f := range ext.Fields {
+			if firstPos, exists := extendFields[ext.Name][f.Name]; exists {
+				a.addError(f.Pos,
+					"extend field '%s.%s' conflicts with previous declaration at line %d / extend 字段 '%s.%s' 与第 %d 行的声明冲突",
+					ext.Name, f.Name, firstPos.Line, ext.Name, f.Name, firstPos.Line)
+			} else {
+				extendFields[ext.Name][f.Name] = f.Pos
+			}
 			a.resolveFieldDecl(f)
 		}
 	}
@@ -386,13 +413,15 @@ func (a *Analyzer) resolveTypeRef(ref *ast.TypeRef, pos token.Position) *Resolve
 	}
 
 	result := &ResolvedType{
-		Kind:     typ.Kind,
-		Name:     typ.Name,
-		Nullable: ref.Nullable,
-		IsList:   ref.IsList,
-		Fields:   typ.Fields,
-		Parents:  typ.Parents,
-		Pos:      typ.Pos,
+		Kind:       typ.Kind,
+		Name:       typ.Name,
+		Nullable:   ref.Nullable,
+		IsList:     ref.IsList,
+		Fields:     typ.Fields,
+		Parents:    typ.Parents,
+		Pos:        typ.Pos,
+		Variants:   typ.Variants,
+		EnumValues: typ.EnumValues,
 	}
 
 	// Generic args
@@ -406,6 +435,14 @@ func (a *Analyzer) resolveTypeRef(ref *ast.TypeRef, pos token.Position) *Resolve
 // ========== Pass 4: Check Bodies ==========
 
 func (a *Analyzer) checkBodies(file *ast.File) {
+	// global val/var declarations — var is forbidden at global scope
+	for _, g := range file.Globals {
+		if g.Mutable {
+			a.addError(g.Pos, "global 'var' is not allowed, use 'val' for global constants or 'cache' for mutable state / 全局不允许 'var'，使用 'val' 定义全局常量或使用 'cache' 管理可变状态")
+		}
+		a.checkValStmt(g, a.scope)
+	}
+
 	for _, api := range file.APIs {
 		if api.Body != nil {
 			scope := a.scope.Child()
@@ -419,9 +456,9 @@ func (a *Analyzer) checkBodies(file *ast.File) {
 					Pos:  api.Pos,
 				})
 			}
-			// add currentUser to scope
+			// add my (current authenticated user) to scope
 			scope.Define(&Symbol{
-				Name: "currentUser",
+				Name: "my",
 				Kind: SymVariable,
 				Type: a.types["Identity"],
 			})
@@ -444,15 +481,49 @@ func (a *Analyzer) checkBodies(file *ast.File) {
 			a.checkBlock(fn.Body, scope)
 		}
 	}
+
+	for _, on := range file.Listeners {
+		if on.Body != nil {
+			scope := a.scope.Child()
+			// add lambda-style params to scope
+			for _, p := range on.Params {
+				scope.Define(&Symbol{
+					Name: p,
+					Kind: SymParam,
+				})
+			}
+			a.checkBlock(on.Body, scope)
+		}
+	}
 }
 
 func (a *Analyzer) checkBlock(block *ast.Block, scope *Scope) {
 	if block == nil {
 		return
 	}
+	terminated := false
 	for _, stmt := range block.Stmts {
+		if terminated {
+			a.addWarning(stmt.GetPos(), "unreachable code / 不可达代码")
+			break
+		}
 		a.checkStmt(stmt, scope)
+		if isTerminating(stmt) {
+			terminated = true
+		}
 	}
+}
+
+func isTerminating(stmt ast.Stmt) bool {
+	switch stmt.(type) {
+	case *ast.ReturnStmt:
+		return true
+	case *ast.BreakStmt:
+		return true
+	case *ast.ThrowStmt:
+		return true
+	}
+	return false
 }
 
 func (a *Analyzer) checkStmt(stmt ast.Stmt, scope *Scope) {
@@ -464,10 +535,6 @@ func (a *Analyzer) checkStmt(stmt ast.Stmt, scope *Scope) {
 		a.checkExpr(s.Condition, scope)
 		childScope := scope.Child()
 		a.checkBlock(s.Then, childScope)
-		if s.Else != nil {
-			elseScope := scope.Child()
-			a.checkBlock(s.Else, elseScope)
-		}
 
 	case *ast.ForStmt:
 		a.checkForStmt(s, scope)
@@ -486,10 +553,7 @@ func (a *Analyzer) checkStmt(stmt ast.Stmt, scope *Scope) {
 		}
 
 	case *ast.AssignStmt:
-		// check target exists
-		a.checkExpr(s.Target, scope)
-		// check value
-		a.checkExpr(s.Value, scope)
+		a.checkAssignStmt(s, scope)
 
 	case *ast.BreakStmt:
 		// valid in any loop context, no check needed at semantic level
@@ -504,21 +568,53 @@ func (a *Analyzer) checkStmt(stmt ast.Stmt, scope *Scope) {
 func (a *Analyzer) checkValStmt(s *ast.ValStmt, scope *Scope) {
 	exprType := a.checkExpr(s.Value, scope)
 	if len(s.Names) > 0 {
-		for _, name := range s.Names {
-			scope.Define(&Symbol{
-				Name: name,
-				Kind: SymVariable,
-				Type: exprType,
-				Pos:  s.Pos,
-			})
-		}
+		a.defineDestructured(s, exprType, scope)
 	} else {
 		scope.Define(&Symbol{
-			Name: s.Name,
-			Kind: SymVariable,
-			Type: exprType,
-			Pos:  s.Pos,
+			Name:    s.Name,
+			Kind:    SymVariable,
+			Type:    exprType,
+			Pos:     s.Pos,
+			Mutable: s.Mutable,
 		})
+	}
+}
+
+// defineDestructured unpacks a tuple type into individual variables.
+// val (a, b, c) = await { expr1; expr2; expr3 }
+// a gets type of expr1, b gets type of expr2, c gets type of expr3.
+func (a *Analyzer) defineDestructured(s *ast.ValStmt, exprType *ResolvedType, scope *Scope) {
+	for i, name := range s.Names {
+		var varType *ResolvedType
+		if exprType != nil && exprType.Kind == TypeTuple && i < len(exprType.Tuple) {
+			varType = exprType.Tuple[i]
+		} else if exprType != nil && exprType.Kind != TypeTuple {
+			// non-tuple assigned to destructuring — all get same type
+			varType = exprType
+		}
+		scope.Define(&Symbol{
+			Name:    name,
+			Kind:    SymVariable,
+			Type:    varType,
+			Pos:     s.Pos,
+			Mutable: s.Mutable,
+		})
+	}
+	// warn if count mismatch
+	if exprType != nil && exprType.Kind == TypeTuple && len(s.Names) != len(exprType.Tuple) {
+		a.addError(s.Pos,
+			"destructuring count mismatch: %d variables but tuple has %d elements / 解构数量不匹配：%d 个变量但元组有 %d 个元素",
+			len(s.Names), len(exprType.Tuple), len(s.Names), len(exprType.Tuple))
+	}
+}
+
+func (a *Analyzer) checkAssignStmt(s *ast.AssignStmt, scope *Scope) {
+	a.checkExpr(s.Target, scope)
+	a.checkExpr(s.Value, scope)
+	if ident, ok := s.Target.(*ast.Ident); ok {
+		if sym := scope.Lookup(ident.Name); sym != nil && sym.Kind == SymVariable && !sym.Mutable {
+			a.addError(s.Pos, "cannot assign to immutable variable '%s' (declared with val) / 不能给不可变变量 '%s' 赋值（使用 val 声明）", ident.Name, ident.Name)
+		}
 	}
 }
 
@@ -544,6 +640,43 @@ func (a *Analyzer) checkForStmt(s *ast.ForStmt, scope *Scope) {
 		}
 	}
 	a.checkBlock(s.Body, childScope)
+}
+
+// checkAwaitExpr collects the type of each expression statement in the await
+// block and returns a tuple type so that destructuring can assign each variable
+// its own type: val (user, posts) = await { getUser(id); getPosts(uid) }
+func (a *Analyzer) checkAwaitExpr(e *ast.AwaitExpr, scope *Scope) *ResolvedType {
+	if a.inAwait {
+		a.addError(e.Pos, "nested await is not allowed / 不允许嵌套 await")
+		return nil
+	}
+	prevAwait := a.inAwait
+	a.inAwait = true
+	defer func() { a.inAwait = prevAwait }()
+	childScope := scope.Child()
+	var elements []*ResolvedType
+	if e.Body != nil {
+		for _, stmt := range e.Body.Stmts {
+			if es, ok := stmt.(*ast.ExprStmt); ok && es.Expr != nil {
+				t := a.checkExpr(es.Expr, childScope)
+				elements = append(elements, t)
+			} else {
+				a.checkStmt(stmt, childScope)
+			}
+		}
+	}
+	// single expression — return its type directly, not a tuple
+	if len(elements) == 1 {
+		return elements[0]
+	}
+	if len(elements) > 1 {
+		return &ResolvedType{
+			Kind:  TypeTuple,
+			Name:  "Tuple",
+			Tuple: elements,
+		}
+	}
+	return nil
 }
 
 func (a *Analyzer) checkExpr(expr ast.Expr, scope *Scope) *ResolvedType {
@@ -595,9 +728,7 @@ func (a *Analyzer) checkCompositeExpr(expr ast.Expr, scope *Scope) *ResolvedType
 		a.checkBlock(e.Body, childScope)
 		return nil
 	case *ast.AwaitExpr:
-		childScope := scope.Child()
-		a.checkBlock(e.Body, childScope)
-		return nil
+		return a.checkAwaitExpr(e, scope)
 	case *ast.ForStmt:
 		// for as expression — check like statement but return type
 		a.checkStmt(e, scope)
@@ -628,7 +759,10 @@ func (a *Analyzer) checkRangeExpr(e *ast.RangeExpr, scope *Scope) *ResolvedType 
 
 func (a *Analyzer) checkTransactionExpr(e *ast.TransactionExpr, scope *Scope) *ResolvedType {
 	childScope := scope.Child()
+	prev := a.inTransaction
+	a.inTransaction = true
 	a.checkBlock(e.Body, childScope)
+	a.inTransaction = prev
 	return nil
 }
 
@@ -675,6 +809,18 @@ func (a *Analyzer) checkMemberExpr(e *ast.MemberExpr, scope *Scope) *ResolvedTyp
 		a.addWarning(e.Pos, "unnecessary safe call (?.) on non-null type '%s' / 对非空类型 '%s' 使用了不必要的安全调用 (?.)", objType.Name, objType.Name)
 	}
 
+	// debug chain methods — valid on all types, return self
+	if isDebugMethod(e.Field) {
+		return objType
+	}
+
+	// warn about .contains() on String (non-list) without @search — generates LIKE '%%...%%'
+	if e.Field == "contains" && objType.Kind == TypeString && !objType.IsList {
+		if !a.hasSearchDirective(e.Object) {
+			a.addWarning(e.Pos, "'contains' generates LIKE '%%%%...%%%%' which causes full table scan, consider @search for full-text index / 'contains' 会生成 LIKE 模糊查询导致全表扫描，建议使用 @search 全文索引")
+		}
+	}
+
 	// collection methods on list types
 	if objType.IsList && isCollectionMethod(e.Field) {
 		return a.resolveCollectionMethod(e.Field, objType)
@@ -685,9 +831,13 @@ func (a *Analyzer) checkMemberExpr(e *ast.MemberExpr, scope *Scope) *ResolvedTyp
 		return nil // lambda return type, can't infer
 	}
 
+	return a.resolveFieldAccess(e, objType)
+}
+
+// resolveFieldAccess resolves a field or enum value access on a type.
+func (a *Analyzer) resolveFieldAccess(e *ast.MemberExpr, objType *ResolvedType) *ResolvedType {
 	field := objType.LookupField(e.Field)
 	if field == nil {
-		// check enum values
 		if objType.Kind == TypeEnum {
 			for _, v := range objType.EnumValues {
 				if v == e.Field {
@@ -709,6 +859,25 @@ func (a *Analyzer) checkMemberExpr(e *ast.MemberExpr, scope *Scope) *ResolvedTyp
 func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
 	a.checkExpr(e.Func, scope)
 
+	// check CRUD inside lambda
+	if a.inLambda {
+		if ident, ok := e.Func.(*ast.Ident); ok && isCRUDOp(ident.Name) {
+			a.addError(e.Pos, "database query inside collection lambda is forbidden, use batch query instead / 集合 lambda 内禁止数据库查询，请使用批量查询")
+		}
+	}
+
+	// transaction { ... } — parsed as CallExpr(Ident("transaction"), [LambdaExpr])
+	// Set inTransaction for the lambda body; also suppress inLambda since
+	// transaction blocks are NOT collection lambdas.
+	if ident, ok := e.Func.(*ast.Ident); ok && ident.Name == "transaction" {
+		return a.checkTransactionCall(e, scope)
+	}
+
+	// my.load(field, ...) — field names are not variables, skip checking args
+	if a.isMyMethodCall(e) {
+		return nil
+	}
+
 	callScope := a.injectCRUDScope(e, scope)
 
 	for _, arg := range e.Args {
@@ -716,6 +885,46 @@ func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
 	}
 
 	return a.inferCallReturnType(e)
+}
+
+// checkTransactionCall handles transaction { ... } which is parsed as
+// CallExpr(Ident("transaction"), [LambdaExpr]). It sets inTransaction
+// and suppresses inLambda for the body.
+func (a *Analyzer) checkTransactionCall(e *ast.CallExpr, scope *Scope) *ResolvedType {
+	prevTx := a.inTransaction
+	prevLambda := a.inLambda
+	a.inTransaction = true
+	a.inLambda = false
+	for _, arg := range e.Args {
+		// If the arg is a LambdaExpr, check its body directly without
+		// entering checkLambdaExpr (which would set inLambda=true).
+		if lambda, ok := arg.Value.(*ast.LambdaExpr); ok {
+			childScope := scope.Child()
+			childScope.Define(&Symbol{
+				Name: "it",
+				Kind: SymVariable,
+			})
+			a.checkBlock(lambda.Body, childScope)
+		} else {
+			a.checkExpr(arg.Value, scope)
+		}
+	}
+	a.inTransaction = prevTx
+	a.inLambda = prevLambda
+	return nil
+}
+
+// isMyMethodCall returns true if the call is my.load(...) or similar my.xxx() builtin.
+func (a *Analyzer) isMyMethodCall(e *ast.CallExpr) bool {
+	member, ok := e.Func.(*ast.MemberExpr)
+	if !ok {
+		return false
+	}
+	ident, ok := member.Object.(*ast.Ident)
+	if !ok {
+		return false
+	}
+	return ident.Name == "my"
 }
 
 // injectCRUDScope creates a child scope with model fields injected for CRUD operations.
@@ -737,7 +946,80 @@ func (a *Analyzer) injectCRUDScope(e *ast.CallExpr, scope *Scope) *Scope {
 	for _, parent := range modelType.Parents {
 		a.defineFieldsInScope(callScope, parent)
 	}
+	// inject 'it' as a reference to the model type for disambiguation
+	callScope.Define(&Symbol{
+		Name: "it",
+		Kind: SymVariable,
+		Type: modelType,
+	})
+	// warn about ambiguous identifiers: field name shadows an outer scope symbol
+	a.warnAmbiguousCRUDFields(e, callScope, scope)
 	return callScope
+}
+
+// warnAmbiguousCRUDFields warns when a CRUD-injected field name shadows a symbol from the outer scope.
+// Only checks "where:" args — other named args (id:, title:, etc.) have clear semantics.
+func (a *Analyzer) warnAmbiguousCRUDFields(e *ast.CallExpr, callScope *Scope, outerScope *Scope) {
+	for _, arg := range e.Args {
+		if arg.Name == "where" {
+			a.collectAmbiguousIdents(arg.Value, callScope, outerScope)
+		}
+	}
+}
+
+// collectAmbiguousIdents walks an expression tree and warns about identifiers
+// that match both a CRUD-injected field and an outer scope symbol.
+func (a *Analyzer) collectAmbiguousIdents(expr ast.Expr, callScope *Scope, outerScope *Scope) {
+	if expr == nil {
+		return
+	}
+	switch e := expr.(type) {
+	case *ast.Ident:
+		// bare ident is not ambiguous on its own — only same-name comparison (x == x) is
+	case *ast.BinaryExpr:
+		a.checkBinaryAmbiguity(e, callScope, outerScope)
+	case *ast.UnaryExpr:
+		a.collectAmbiguousIdents(e.Value, callScope, outerScope)
+	case *ast.CallExpr:
+		for _, arg := range e.Args {
+			a.collectAmbiguousIdents(arg.Value, callScope, outerScope)
+		}
+	case *ast.MemberExpr:
+		a.collectAmbiguousIdents(e.Object, callScope, outerScope)
+	}
+}
+
+func (a *Analyzer) checkBinaryAmbiguity(e *ast.BinaryExpr, callScope *Scope, outerScope *Scope) {
+	if itMemberField(e.Left) != "" || itMemberField(e.Right) != "" {
+		return
+	}
+	leftIdent, leftOk := e.Left.(*ast.Ident)
+	rightIdent, rightOk := e.Right.(*ast.Ident)
+	if leftOk && rightOk && leftIdent.Name == rightIdent.Name {
+		fieldSym := callScope.LookupLocal(leftIdent.Name)
+		outerSym := outerScope.Lookup(leftIdent.Name)
+		if fieldSym != nil && fieldSym.Kind == SymField && outerSym != nil {
+			a.addWarning(leftIdent.Pos,
+				"ambiguous: '%s' == '%s' — both refer to same name, use 'it.%s' for field / 歧义：'%s' == '%s'，请用 'it.%s' 指定字段",
+				leftIdent.Name, rightIdent.Name, leftIdent.Name, leftIdent.Name, rightIdent.Name, leftIdent.Name)
+		}
+		return
+	}
+	a.collectAmbiguousIdents(e.Left, callScope, outerScope)
+	a.collectAmbiguousIdents(e.Right, callScope, outerScope)
+}
+
+// itMemberField returns the field name if expr is `it.fieldName`, empty string otherwise.
+func itMemberField(expr ast.Expr) string {
+	m, ok := expr.(*ast.MemberExpr)
+	if !ok {
+		return ""
+	}
+	ident, ok := m.Object.(*ast.Ident)
+	if !ok || ident.Name != "it" {
+		return ""
+	}
+	return m.Field
 }
 
 // defineFieldsInScope defines all fields from a type into the given scope.
@@ -838,10 +1120,19 @@ func (a *Analyzer) checkElvisExpr(e *ast.ElvisExpr, scope *Scope) *ResolvedType 
 }
 
 func (a *Analyzer) checkWhenExpr(e *ast.WhenExpr, scope *Scope) *ResolvedType {
+	var subjectType *ResolvedType
 	if e.Subject != nil {
-		a.checkExpr(e.Subject, scope)
+		subjectType = a.checkExpr(e.Subject, scope)
 	}
+	// check duplicate branches
+	seenBranches := map[string]bool{}
 	for _, b := range e.Branches {
+		if b.IsType != "" {
+			if seenBranches[b.IsType] {
+				a.addError(e.Pos, "duplicate when branch 'is %s' / 重复的 when 分支 'is %s'", b.IsType, b.IsType)
+			}
+			seenBranches[b.IsType] = true
+		}
 		if b.Condition != nil {
 			a.checkExpr(b.Condition, scope)
 		}
@@ -852,7 +1143,78 @@ func (a *Analyzer) checkWhenExpr(e *ast.WhenExpr, scope *Scope) *ResolvedType {
 	if e.Else != nil {
 		a.checkExpr(e.Else, scope)
 	}
-	return nil // TODO: infer when return type
+	// sealed exhaustiveness check
+	a.checkWhenExhaustive(e, subjectType)
+	return nil
+}
+
+// checkWhenExhaustive verifies when exhaustiveness for sealed/enum types and else requirement.
+func (a *Analyzer) checkWhenExhaustive(e *ast.WhenExpr, subjectType *ResolvedType) {
+	// when without subject (no sealed/enum) — must have else
+	if subjectType == nil {
+		if e.Else == nil {
+			a.addError(e.Pos, "when expression must have 'else' branch / when 表达式必须有 'else' 分支")
+		}
+		return
+	}
+	// enum exhaustiveness
+	if subjectType.Kind == TypeEnum {
+		a.checkEnumExhaustive(e, subjectType)
+		return
+	}
+	if subjectType.Kind != TypeSealed {
+		if e.Else == nil {
+			a.addError(e.Pos, "when expression must have 'else' branch / when 表达式必须有 'else' 分支")
+		}
+		return
+	}
+	// if there's an else branch, exhaustiveness is guaranteed
+	if e.Else != nil {
+		return
+	}
+	// collect matched variant names
+	matched := map[string]bool{}
+	for _, b := range e.Branches {
+		if b.IsType != "" {
+			matched[b.IsType] = true
+		}
+	}
+	// check for missing variants
+	for _, v := range subjectType.Variants {
+		if !matched[v.Name] {
+			a.addError(e.Pos,
+				"when on sealed type '%s' is not exhaustive, missing variant '%s' / when 未穷举密封类型 '%s'，缺少变体 '%s'",
+				subjectType.Name, v.Name, subjectType.Name, v.Name)
+		}
+	}
+}
+
+// checkEnumExhaustive verifies that when on an enum type covers all values.
+func (a *Analyzer) checkEnumExhaustive(e *ast.WhenExpr, subjectType *ResolvedType) {
+	if e.Else != nil {
+		return
+	}
+	// collect matched enum values from branch conditions (e.g. Role.ADMIN -> ...)
+	matched := map[string]bool{}
+	for _, b := range e.Branches {
+		a.collectEnumValues(b.Condition, matched)
+	}
+	for _, v := range subjectType.EnumValues {
+		if !matched[v] {
+			a.addError(e.Pos,
+				"when on enum '%s' is not exhaustive, missing value '%s' / when 未穷举枚举 '%s'，缺少值 '%s'",
+				subjectType.Name, v, subjectType.Name, v)
+		}
+	}
+}
+
+func (a *Analyzer) collectEnumValues(expr ast.Expr, matched map[string]bool) {
+	if expr == nil {
+		return
+	}
+	if member, ok := expr.(*ast.MemberExpr); ok {
+		matched[member.Field] = true
+	}
 }
 
 func (a *Analyzer) checkLambdaExpr(e *ast.LambdaExpr, scope *Scope) *ResolvedType {
@@ -862,7 +1224,10 @@ func (a *Analyzer) checkLambdaExpr(e *ast.LambdaExpr, scope *Scope) *ResolvedTyp
 		Name: "it",
 		Kind: SymVariable,
 	})
+	prev := a.inLambda
+	a.inLambda = true
 	a.checkBlock(e.Body, childScope)
+	a.inLambda = prev
 	return nil
 }
 
@@ -928,19 +1293,117 @@ func (a *Analyzer) checkArithmeticOp(op string, left, right *ResolvedType, pos t
 	return a.types["Int"]
 }
 
+// ========== Event Cycle Detection ==========
+
+// checkEventCycles detects circular event dependencies among on-listeners.
+// For each on EventA { ... emit EventB(...) ... }, edge A → B is added.
+// DFS detects cycles and reports them as errors.
+func (a *Analyzer) checkEventCycles() {
+	graph := a.buildEventGraph()
+	if len(graph) == 0 {
+		return
+	}
+	a.detectCycles(graph)
+}
+
+// buildEventGraph walks all OnDecl bodies looking for EmitStmt nodes
+// and returns an adjacency map: event → list of emitted events.
+func (a *Analyzer) buildEventGraph() map[string][]string {
+	graph := map[string][]string{}
+	for _, file := range a.files {
+		for _, on := range file.Listeners {
+			if on.Body == nil {
+				continue
+			}
+			emitted := collectEmits(on.Body)
+			if len(emitted) > 0 {
+				graph[on.EventName] = append(graph[on.EventName], emitted...)
+			}
+		}
+	}
+	return graph
+}
+
+// collectEmits recursively collects all event names from EmitStmt in a block.
+func collectEmits(block *ast.Block) []string {
+	var result []string
+	for _, stmt := range block.Stmts {
+		if emit, ok := stmt.(*ast.EmitStmt); ok {
+			result = append(result, emit.EventName)
+		}
+	}
+	return result
+}
+
+// detectCycles runs DFS on the event graph to find and report cycles.
+func (a *Analyzer) detectCycles(graph map[string][]string) {
+	const (
+		white = 0 // unvisited
+		gray  = 1 // in progress
+		black = 2 // done
+	)
+	color := map[string]int{}
+	parent := map[string]string{}
+
+	var dfs func(node string)
+	dfs = func(node string) {
+		color[node] = gray
+		for _, next := range graph[node] {
+			if color[next] == gray {
+				// cycle found — reconstruct path
+				path := a.buildCyclePath(next, node, parent)
+				a.addError(token.Position{},
+					"circular event dependency detected: %s / 检测到循环事件依赖: %s",
+					path, path)
+				return
+			}
+			if color[next] == white {
+				parent[next] = node
+				dfs(next)
+			}
+		}
+		color[node] = black
+	}
+
+	for node := range graph {
+		if color[node] == white {
+			dfs(node)
+		}
+	}
+}
+
+// buildCyclePath reconstructs the cycle path string from parent map.
+func (a *Analyzer) buildCyclePath(cycleStart, cycleEnd string, parent map[string]string) string {
+	var path []string
+	cur := cycleEnd
+	for cur != cycleStart {
+		path = append([]string{cur}, path...)
+		cur = parent[cur]
+	}
+	path = append([]string{cycleStart}, path...)
+	path = append(path, cycleStart)
+	return strings.Join(path, " → ")
+}
+
 // ========== Directive Validation ==========
 
 var validModelDirectives = map[string]bool{
 	"crud": true, "unique": true, "index": true,
+	"soft": true, "noTime": true,
 }
 
 var validFieldDirectives = map[string]bool{
-	"id": true, "unique": true, "index": true, "varchar": true,
+	"id": true, "unique": true, "index": true,
 	"hidden": true, "hash": true, "immutable": true, "internal": true,
 	"visible": true, "transform": true, "beforeSave": true, "mask": true,
 	"filterable": true, "sortable": true, "search": true,
-	"auto": true, "soft": true, "deprecated": true, "reserved": true,
+	"auto": true, "deprecated": true, "reserved": true,
 	"count": true, "sum": true, "avg": true, "min": true, "max": true,
+	"encrypt": true,
+	// database type annotations
+	"length": true, "serial": true, "bigint": true, "smallint": true,
+	"decimal": true, "uuid": true, "inet": true, "point": true,
+	"brin": true, "date": true, "time": true, "vector": true,
 }
 
 var validApiDirectives = map[string]bool{
@@ -1063,6 +1526,36 @@ func findClosestString(target string, candidates []string) string {
 	return best
 }
 
+// hasSearchDirective checks if the expression's underlying field has @search directive.
+func (a *Analyzer) hasSearchDirective(expr ast.Expr) bool {
+	member, ok := expr.(*ast.MemberExpr)
+	if !ok {
+		return false
+	}
+	objType := a.checkExpr(member.Object, a.scope)
+	if objType == nil {
+		return false
+	}
+	field := objType.LookupField(member.Field)
+	if field == nil {
+		return false
+	}
+	for _, d := range field.Directives {
+		if d == "search" {
+			return true
+		}
+	}
+	return false
+}
+
+func isDebugMethod(name string) bool {
+	switch name {
+	case "d", "i", "w", "e":
+		return true
+	}
+	return false
+}
+
 func isCollectionMethod(name string) bool {
 	switch name {
 	case "map", "filter", "sumOf", "count", "any", "firstOrNull",
@@ -1155,12 +1648,12 @@ func min3(a, b, c int) int {
 
 func isBuiltinOp(name string) bool {
 	switch name {
-	case "find", "create", "update", "delete", "emit",
-		"throw", "transaction", "log", "cache", "storage",
+	case "find", "create", "update", "delete",
+		"throw", "transaction", "cache", "storage",
 		"mail", "task", "services", "error", "request",
-		"Channel", "Result",
+		"Channel", "Result", "my",
 		"http", "json", "time", "math", "crypto",
-		"regex", "fmt", "base64", "url", "uuid":
+		"regex", "base64", "url", "uuid":
 		return true
 	}
 	return false

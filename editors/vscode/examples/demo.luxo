@@ -4,11 +4,18 @@
 // 覆盖所有语法特性
 // ============================================
 
-import http
-import json
-import time
-import math
-import crypto
+use http
+use json
+use time
+use math
+use crypto
+
+// ============================================
+// 全局常量 / Global Constants (val only — var is forbidden globally)
+// ============================================
+
+val APP_NAME = "MyShop"
+val MAX_RETRIES = 3
 
 // ============================================
 // 枚举 / Enums
@@ -156,23 +163,40 @@ interface Auditable {
 
 error NotFound(resource: String) {
   code: 404
-  message: error.not_found
+  message: "error.not_found"
 }
 
 error Unauthorized {
   code: 401
-  message: error.unauthorized
+  message: "error.unauthorized"
 }
 
 error OutOfStock(productId: Int, available: Int) {
   code: 409
-  message: error.out_of_stock
+  message: "error.out_of_stock"
 }
 
 error DuplicateEmail {
   code: 409
-  message: error.email_exists
+  message: "error.email_exists"
 }
+
+error PasswordTooShort {
+  code: 400
+  message: "error.password_too_short"
+}
+
+// ============================================
+// 类型化事件 / Typed Events
+// ============================================
+
+event PostCreated(post: Post, userId: Int)
+event PostPublished(post: Post)
+event OrderCreated(order: Order, userId: Int)
+event OrderCancelled(order: Order)
+event OrderProcessed(order: Order)
+event UserCreated(user: User)
+event ChatMessage(message: Message, roomId: Int)
 
 // ============================================
 // 用户认证 / User Authentication
@@ -185,11 +209,11 @@ fn generateToken(user: User, expires: Duration): String @native
 /// 注册 / Register
 api register(input: RegisterInput): AuthResult {
   // 密码校验 / Password validation
-  input.password.length >= 8 ?: throw error.password_too_short
+  input.password.length >= 8 ?: throw PasswordTooShort
 
   // 邮箱唯一检查 / Email uniqueness check
   val exists = find(User, where: email == input.email)
-  exists == null ?: throw error.email_exists
+  exists == null ?: throw DuplicateEmail
 
   // 创建用户 / Create user
   val user = create(User,
@@ -200,18 +224,19 @@ api register(input: RegisterInput): AuthResult {
   )
 
   val token = generateToken(user, expires: 7d)
-  AuthResult { token: token, user: user }
+  AuthResult { token, user }
 }
 
 /// 登录 / Login
 api login(email: String, password: String): AuthResult {
-  val user = find(User, where: email == email)
-    ?: throw error.not_found
+  val user = find(User, where: it.email == email)
+    ?: throw NotFound
 
-  verifyHash(password, user.password) ?: throw error.unauthorized
+
+  verifyHash(password, user.password) ?: throw Unauthorized
 
   val token = generateToken(user, expires: 7d)
-  AuthResult { token: token, user: user }
+  AuthResult { token, user }
 }
 
 /// OAuth 第三方登录 / OAuth Login
@@ -226,22 +251,22 @@ api createPost(title: String, content: String): Post @auth {
   val post = create(Post,
     title: title,
     content: content,
-    userId: currentUser.id,
+    userId: my.id,
     status: PostStatus.DRAFT
   )
-  emit("post.created", post, userId: currentUser.id)
+  emit PostCreated(post: post, userId: my.id)
   post
 }
 
 /// 发布文章 / Publish Post
 api publishPost(id: Int): Post @auth {
   val post = find(Post, id: id)
-    ?: throw error.not_found
+    ?: throw NotFound
 
   // 成员赋值 / Member assignment
   post.status = PostStatus.PUBLISHED
   val updated = update(post, status: PostStatus.PUBLISHED)
-  emit("post.published", updated)
+  emit PostPublished(post: updated)
   updated
 }
 
@@ -255,7 +280,7 @@ api listPosts(status: String?, page: Int = 1, limit: Int = 20): Page<Post> {
 /// 点赞 — 原子操作 / Like — atomic operation
 api likePost(id: Int): Post @auth {
   val post = find(Post, id: id)
-    ?: throw error.not_found
+    ?: throw NotFound
   post.likes += 1
   update(post, likes: post.likes)
   post
@@ -276,17 +301,17 @@ api searchPosts(keyword: String): [Post] {
 /// 下单 / Create Order
 api createOrder(productId: Int, quantity: Int): Order @auth {
   val product = find(Product, id: productId)
-    ?: throw error.not_found
+    ?: throw NotFound
 
   // 库存检查 / Stock check
-  product.stock >= quantity ?: throw error.out_of_stock
+  product.stock >= quantity ?: throw OutOfStock
 
   val total = product.price * quantity
 
   // when 表达式 — VIP 折扣 / when expression — VIP discount
   val finalPrice = when {
-    currentUser.role == Role.ADMIN -> total * 0.5
-    currentUser.role == Role.MODERATOR -> total * 0.8
+    my.role == Role.ADMIN -> total * 0.5
+    my.role == Role.MODERATOR -> total * 0.8
     total > 1000 -> total * 0.95
     else -> total
   }
@@ -297,7 +322,7 @@ api createOrder(productId: Int, quantity: Int): Order @auth {
     update(product, stock: product.stock)
     create(Order,
       orderNo: crypto.randomToken(16),
-      userId: currentUser.id,
+      userId: my.id,
       productId: productId,
       quantity: quantity,
       total: finalPrice,
@@ -307,20 +332,20 @@ api createOrder(productId: Int, quantity: Int): Order @auth {
 
   // 异步通知 / Async notification
   async {
-    log.info("订单创建: ${order.orderNo}")
+    "订单创建: ${order.orderNo}".i
   }
 
-  emit("order.created", order, userId: currentUser.id)
+  emit OrderCreated(order: order, userId: my.id)
   order
 }
 
 /// 取消订单 / Cancel Order
 api cancelOrder(id: Int): Order @auth {
   val order = find(Order, id: id)
-    ?: throw error.not_found
+    ?: throw NotFound
 
   val product = find(Product, id: order.productId)
-    ?: throw error.not_found
+    ?: throw NotFound
 
   transaction {
     product.stock += order.quantity
@@ -329,7 +354,7 @@ api cancelOrder(id: Int): Order @auth {
     update(order, status: OrderStatus.CANCELLED)
   }
 
-  emit("order.cancelled", order)
+  emit OrderCancelled(order: order)
   order
 }
 
@@ -343,23 +368,57 @@ api watchChat(roomId: Int): stream Message
 /// 发消息 — emit 推送 / Send message — emit push
 api sendMessage(roomId: Int, content: String): Message @auth {
   // 检查是否是房间成员 / Check room membership
-  val member = find(RoomMember, where: roomId == roomId && userId == currentUser.id)
-  member != null ?: throw error.unauthorized
+  val member = find(RoomMember, where: it.roomId == roomId && userId == my.id)
+  member != null ?: throw Unauthorized
 
   val msg = create(Message,
     roomId: roomId,
-    userId: currentUser.id,
+    userId: my.id,
     content: content
   )
 
   // 查出房间所有成员 / Get all room members
-  val members = find(RoomMember, where: roomId == roomId)
-  val targetIds = members.map { it.userId }.filter { it != currentUser.id }
+  val members = find(RoomMember, where: it.roomId == roomId)
+  val targetIds = members.map { it.userId }.filter { it != my.id }
 
   // emit 推送给指定用户 / Push to specific users
-  emit("watchChat", msg, userId: targetIds)
+  emit ChatMessage(message: msg, roomId: roomId)
 
   msg
+}
+
+// ============================================
+// 批量操作 / Batch Operations
+// ============================================
+
+/// 批量创建商品 / Create multiple products
+api createProducts(names: [String], price: Float): Int @auth {
+  var count = 0
+  for name in names {
+    create(Product, name: name, price: price, stock: 100)
+    count += 1
+  }
+  count
+}
+
+/// 批量删除订单 / Delete multiple orders
+api removeOldOrders(orders: [Order]): Int @auth {
+  var count = 0
+  for order in orders {
+    delete(order)
+    count += 1
+  }
+  count
+}
+
+/// 批量更新库存 / Update stock for many products
+api restockAll(products: [Product], amount: Int): Int @auth {
+  var count = 0
+  for product in products {
+    update(product, stock: amount)
+    count += 1
+  }
+  count
 }
 
 // ============================================
@@ -394,13 +453,13 @@ api findFirstExpensive(products: [Product]): Product {
   val found = for product in products {
     if product.price > 1000 { yield product }
   }
-  found ?: throw error.not_found
+  found ?: throw NotFound
 }
 
 /// 条件循环 + 赋值 / Conditional loop + assignment
 api sumUntil(items: [Int], limit: Int): Int {
-  val total = 0
-  val i = 0
+  var total = 0
+  var i = 0
   for i < items.size {
     total += 1
     if total >= limit { break }
@@ -437,11 +496,11 @@ api getUserProfile(id: Int): User @auth {
 /// async — 后台任务 / Background task
 api processAndNotify(orderId: Int): Boolean @auth {
   val order = find(Order, id: orderId)
-    ?: throw error.not_found
+    ?: throw NotFound
 
   async {
-    log.info("processing order ${order.orderNo}")
-    emit("order.processed", order)
+    "processing order ${order.orderNo}".i
+    emit OrderProcessed(order: order)
   }
 
   true
@@ -457,7 +516,7 @@ api testChannel(): Int {
     }
   }
 
-  val sum = 0
+  var sum = 0
   for value in ch {
     sum += value
     if sum > 20 { break }
@@ -518,7 +577,7 @@ model AuditablePost : Base {
   /// 内部状态（用户不可设）/ Internal status
   internal:  String   @internal
   /// 可见性条件 / Visibility condition
-  secret:    String   @visible(currentUser.role == Role.ADMIN)
+  secret:    String   @visible(my.role == Role.ADMIN)
   /// CDN 变换 / CDN transform
   cover:     String   @transform { "https://cdn.example.com/${cover}" }
   /// 存前小写 / Lowercase before save
@@ -556,16 +615,10 @@ model Reaction {
   userId: Int
 }
 
-/// 角色（多对多显式中间表）/ Role (many-to-many through)
+/// 用户角色（一对多中间表）/ User-Role relation
 model UserRole : Base {
   userId: Int
   roleId: Int
-}
-
-model Permission {
-  id:   Int
-  name: String
-  roles: [Role] through UserRole
 }
 
 // ============================================
@@ -595,7 +648,7 @@ override api createUser(input: RegisterInput): User {
     password: input.password,
     phone: input.phone
   )
-  emit("user.created", user)
+  emit UserCreated(user: user)
   user
 }
 
@@ -669,7 +722,7 @@ api testResult(id: Int): User {
 // ============================================
 
 api testInfiniteLoop(): Int {
-  val total = 0
+  var total = 0
   val ch = Channel(5)
 
   async {
@@ -700,7 +753,6 @@ middleware adminOnly @native
 
 fn sendEmail(to: String, subject: String, body: String) @native
 fn sendSms(phone: String, content: String) @native
-fn log(...messages: String) @native
 
 /// 计算折扣 / Calculate discount
 fn calcDiscount(total: Float, role: Role): Float {
@@ -711,8 +763,181 @@ fn calcDiscount(total: Float, role: Role): Float {
   }
 }
 
+// ============================================
+// 运算符全覆盖 / Full Operator Coverage
+// ============================================
+
+/// 取模 + 所有复合赋值 / Modulo + all compound assignments
+fn testAllOps(x: Int): Int {
+  val a = x % 3
+  var b = a
+  b *= 2
+  b /= 1
+  b %= 5
+  b
+}
+
+/// when 替代 if/else / when replaces if/else
+api checkAge(age: Int): String {
+  when {
+    age >= 18 -> "adult"
+    else -> "minor"
+  }
+}
+
+// ============================================
+// 数据库类型注解 / Database Type Annotations
+// ============================================
+
+model Config @noTime {
+  key:   String @length(50)
+  value: String
+}
+
+model Payment @soft {
+  orderId:    Int @bigint
+  amount:     Float @decimal(19, 4)
+  traceId:    String @uuid
+  clientIp:   String @inet
+  paidDate:   DateTime @date
+  paidTime:   DateTime @time
+}
+
+// ============================================
+// 事件订阅 / Event Listeners
+// ============================================
+
+on UserCreated {
+  "user created".i
+}
+
+on OrderCreated @native
+
+on PostPublished { post -> "published".i }
+
+// ============================================
+// .d 链式调试 / Debug Chain Method
+// ============================================
+
+api debugExample(id: Int): String {
+  val user = find(User, id: id).d    // .d 打印并返回自身
+  "done"
+}
+
+// ============================================
+// my.load 懒加载 / Lazy Loading
+// ============================================
+
+api dashboard(): String @auth {
+  val user = my.load(name, role)     // 懒加载指定字段
+  "welcome ${user.name}"
+}
+
+// ============================================
+// use 展开导入 / Use with Destructuring
+// ============================================
+
+use model { Base }                  // 从 common/model 展开导入
+use event { PostCreated }           // 从 common/event 展开导入
+
 /*
   多行注释 / Block comment
   支持嵌套 / Supports nesting
   /* 嵌套注释 / Nested comment */
 */
+
+// ============================================
+// ============================================
+// 数据库类型注解 / Database Type Annotations
+// ============================================
+
+model AppConfig @noTime {
+  key:   String @length(50)
+  value: String
+}
+
+model Invoice @soft {
+  seqId:      Int @serial
+  amount:     Float @decimal(19, 4)
+  traceId:    String @uuid
+  clientIp:   String @inet
+  issueDate:  DateTime @date
+  issueTime:  DateTime @time
+}
+
+// ============================================
+// 运算符覆盖 / Operator Coverage
+// ============================================
+
+/// spread 参数 / Spread params
+fn sendNotification(...targets: String) @native
+
+/// 比较运算符 / Comparison operators
+api compareTest(a: Int, b: Int): String {
+  when {
+    a < b -> "less"
+    a <= b -> "less or equal"
+    else -> "greater"
+  }
+}
+
+// ============================================
+// 编译期安全检查（本 demo 展示正确用法）
+// Compile-Time Safety Checks (demo shows correct usage)
+// ============================================
+//
+// 以下特性由编译器强制执行，不在 demo 中演示错误用法：
+// The following are enforced by the compiler, not shown as errors here:
+//
+// 1. 全局 var 禁止 — 只允许全局 val（本文件已使用 val）
+//    Global var forbidden — only val allowed globally (this file uses val)
+//
+// 2. duplicate when branch 检测 — 重复分支编译报错
+//    Duplicate when branch detection — duplicate branches cause compile error
+//
+// 3. unreachable code warning — return/throw/break 后的代码触发警告
+//    Unreachable code warning — code after return/throw/break triggers warning
+//
+// 4. 嵌套 await 禁止 — await 内不能再套 await
+//    Nested await forbidden — cannot nest await inside await
+//
+// 5. enum 穷举检查 — when 匹配 enum 必须覆盖所有值或有 else
+//    Enum exhaustive check — when on enum must cover all values or have else
+//
+// 6. sealed 穷举检查 — when 匹配 sealed 必须覆盖所有变体
+//    Sealed exhaustive check — when on sealed must cover all variants
+//
+// 7. Lambda 内禁止 CRUD — users.map { find(...) } 编译报错
+//    CRUD forbidden in lambda — users.map { find(...) } causes compile error
+//
+// 8. contains 无 @search 时警告 — 全表扫描提示
+//    contains without @search warns — full table scan hint
+//
+// 9. 循环事件依赖检测 — A->B->A 编译报错
+//    Circular event dependency detection — A->B->A causes compile error
+//
+// ============================================
+// 已设计但未在 demo 中展示的特性
+// Designed Features Not Yet Demonstrated
+// ============================================
+//
+// - @withAuth: auth 注解到 model，@claim 标注 JWT 字段，@auth([User, Admin]) 多身份
+//   @withAuth: auth on model, @claim marks JWT fields, @auth([User, Admin]) multi-identity
+//
+// - createMany / deleteMany / updateMany: 批量 CRUD，codegen 自动分批
+//   createMany / deleteMany / updateMany: batch CRUD, codegen auto-batches
+//
+// - @crud(only:[]) / @crud(except:[]): 细粒度 CRUD 控制
+//   @crud(only:[]) / @crud(except:[]): fine-grained CRUD control
+//
+// - scope 链式调用: scope published { ... } 配合 find where AND 组合
+//   Scope chaining: scope published { ... } combined with find where AND
+//
+// - @cache(ttl:5m): 计算字段缓存
+//   @cache(ttl:5m): computed field caching
+//
+// - Binary 传输协议: Field ID + varint + length-prefixed 编码
+//   Binary protocol: Field ID + varint + length-prefixed encoding
+//
+// - Luvia 网关: Schema 拉取 + 路由表 + 聚合请求 + 负载均衡
+//   Luvia gateway: Schema fetch + routing table + aggregation + load balancing

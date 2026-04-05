@@ -195,11 +195,11 @@
     "field-definitions": {
       "patterns": [
         {
-          "comment": "val 变量声明",
-          "match": "\\b(val)\\s+(\\w+)",
+          "comment": "val/var 变量声明",
+          "match": "\\b(val|var)\\s+(\\w+)",
           "captures": {
             "1": { "name": "storage.type.luxo" },
-            "2": { "name": "variable.other.constant.luxo" }
+            "2": { "name": "variable.other.luxo" }
           }
         }
       ]
@@ -214,7 +214,7 @@
         },
         {
           "comment": "系统函数",
-          "match": "\\b(emit|throw)\\s*(?=\\()",
+          "match": "\\b(throw)\\s*(?=\\()",
           "name": "support.function.luxo"
         },
         {
@@ -223,15 +223,15 @@
           "name": "support.function.luxo"
         },
         {
-          "comment": "集合方法",
-          "match": "\\.(filter|map|sumOf|count|any|firstOrNull|sortBy|groupBy|forEach|flatMap|joinToString|take|takeLast|matches)\\b",
+          "comment": "集合/字符串/调试方法",
+          "match": "\\.(filter|map|sumOf|count|any|all|firstOrNull|sortBy|groupBy|forEach|flatMap|joinToString|take|drop|distinct|reversed|first|last|let|d|i|w|e|size|length|isEmpty|contains|startsWith|endsWith|lowercase|uppercase|trim|split|replace|substring|toInt|toFloat|format|add|sub|before|after|load)\\b",
           "captures": {
             "0": { "name": "support.function.luxo" }
           }
         },
         {
           "comment": "框架内置对象方法",
-          "match": "\\b(log|cache|storage|mail|task)\\s*(\\.)(\\w+)",
+          "match": "\\b(cache|storage|mail|task|my|req|res)\\s*(\\.)(\\w+)",
           "captures": {
             "1": { "name": "support.class.luxo" },
             "2": { "name": "punctuation.accessor.luxo" },
@@ -253,22 +253,22 @@
         {
           "comment": "声明关键字 — 和 class/function 同色",
           "name": "storage.type.luxo",
-          "match": "\\b(model|interface|enum|sealed|type|fn|api|error|middleware)\\b"
+          "match": "\\b(model|interface|enum|sealed|type|fn|api|error|middleware|event|on)\\b"
         },
         {
           "comment": "修饰符 — 和 public/static 同色",
           "name": "storage.modifier.luxo",
-          "match": "\\b(extend|override|use|through|stream)\\b"
+          "match": "\\b(extend|override|use|stream)\\b"
         },
         {
           "comment": "流程控制 — 和 if/for/return 同色",
           "name": "keyword.control.luxo",
-          "match": "\\b(when|if|else|for|in|return|is|throw)\\b"
+          "match": "\\b(when|if|else|for|in|return|break|is|throw|emit|async|await|yield)\\b"
         },
         {
-          "comment": "val — 和 var/let/const 同色",
+          "comment": "val/var — 和 var/let/const 同色",
           "name": "storage.type.luxo",
-          "match": "\\b(val)\\b"
+          "match": "\\b(val|var)\\b"
         },
         {
           "comment": "get 关键字（计算字段）",

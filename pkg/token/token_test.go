@@ -65,7 +65,7 @@ func TestTypeStringKnown(t *testing.T) {
 		{Extend, "extend"},
 		{Override, "override"},
 		{Use, "use"},
-		{Through, "through"},
+		{Event, "event"},
 		{Stream, "stream"},
 		{Val, "val"},
 		{When, "when"},
@@ -76,10 +76,11 @@ func TestTypeStringKnown(t *testing.T) {
 		{Return, "return"},
 		{Break, "break"},
 		{Is, "is"},
+		{On, "on"},
+		{My, "my"},
 		{Async, "async"},
 		{Await, "await"},
 		{Yield, "yield"},
-		{Import, "import"},
 		{Throw, "throw"},
 		{True, "true"},
 		{False, "false"},
@@ -109,11 +110,11 @@ func TestLookupKeywordFound(t *testing.T) {
 		"model": Model, "interface": Interface, "enum": Enum,
 		"sealed": Sealed, "type": KwType, "fn": Fn, "api": Api,
 		"error": Error, "middleware": Middleware, "extend": Extend,
-		"override": Override, "use": Use, "through": Through,
+		"override": Override, "use": Use, "event": Event,
 		"stream": Stream, "val": Val, "when": When, "if": If,
 		"else": Else, "for": For, "in": In, "return": Return,
-		"break": Break, "is": Is, "async": Async, "await": Await,
-		"yield": Yield, "import": Import,
+		"break": Break, "is": Is, "on": On, "my": My, "async": Async, "await": Await,
+		"yield": Yield,
 		"throw": Throw, "true": True, "false": False, "null": Null,
 	}
 	for kw, want := range keywords {
@@ -125,7 +126,7 @@ func TestLookupKeywordFound(t *testing.T) {
 }
 
 func TestLookupKeywordNotFound(t *testing.T) {
-	nonKeywords := []string{"foo", "bar", "User", "xyz", "", "find", "create", "update", "delete", "transaction", "emit"}
+	nonKeywords := []string{"foo", "bar", "User", "xyz", "", "find", "create", "update", "delete", "transaction"}
 	for _, s := range nonKeywords {
 		got := LookupKeyword(s)
 		if got != Ident {
@@ -138,10 +139,10 @@ func TestIsKeyword(t *testing.T) {
 	// Keywords should return true
 	keywordTypes := []Type{
 		Model, Interface, Enum, Sealed, KwType, Fn, Api, Error,
-		Middleware, Extend, Override, Use, Through, Stream,
-		Val, When, If, Else, For, In, Return, Break, Is,
-		Async, Await, Yield, Import,
-		Throw,
+		Middleware, Event, Extend, Override, Use, Stream,
+		Val, When, If, Else, For, In, Return, Break, Is, On, My,
+		Async, Await, Yield,
+		Throw, Emit,
 		True, False, Null,
 	}
 	for _, tt := range keywordTypes {

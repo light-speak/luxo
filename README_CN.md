@@ -28,7 +28,7 @@
 
 ## 为什么叫 "Luxo"？
 
-数据从数据库到达客户端，这条路本该很短。
+**Luxo** /lɑːkèsuǒ/ — 数据从数据库到达客户端，这条路本该很短。
 
 但我们把它走成了迷宫。JSON 在每个字段前都重复一遍名字，像一份每行都写着抬头的公文。GraphQL 在运行时才去解析查询，而那些查询在编译期就已经写死了。ORM 用反射一遍遍翻译结构体，做着编译器早就做完的事。`SELECT *` 把整张表捞出来，再亲手丢掉大半。
 
@@ -67,28 +67,30 @@ model User @crud {
 
 | | GraphQL | gRPC | REST | **Luxo** |
 |---|---|---|---|---|
-| 字段选择 | ✅ 太松散 | ❌ 没有 | ❌ 没有 | ✅ Schema 控制 |
-| 二进制传输 | ❌ 只有 JSON | ✅ Protobuf | ❌ 只有 JSON | ✅ JSON + Binary 自动切换 |
-| 一份 Schema | ❌ SDL + ORM + OpenAPI | ❌ .proto + ORM | ❌ 手写 | ✅ `.luxo` 生成一切 |
-| N+1 防护 | ❌ 手写 | N/A | ❌ 手写 | ✅ 自动 DataLoader |
-| 空安全 | ⚠️ 运行时 | ✅ 编译期 | ❌ 没有 | ✅ 编译期 `?` `?:` `?.` |
-| 错误处理 | ❌ 无类型 | ✅ 状态码 | ❌ HTTP 码 | ✅ `Result<T>` + `?` 操作符 |
-| 并发 | ❌ 无 | ❌ 手写 | ❌ 手写 | ✅ `async` `await` `Channel` |
-| 多服务 | ⚠️ Federation | ✅ 原生 | ❌ 手写 | ✅ `extend` + 网关 + RPC |
+| **字段选择** | ✅ 支持但过于松散，客户端可任意构造深层嵌套查询，需额外配置深度/复杂度限制防止滥用 | ❌ 不支持，响应固定为 proto 定义的完整结构（`FieldMask` 可实现但需手动处理） | ❌ 不支持，每个端点返回固定字段，需手动实现 `?fields=` 参数 | ✅ Schema 级别声明字段可见性，编译期校验选择合法性，贯穿到 SQL 只查所选列 |
+| **二进制传输** | ❌ 规范不限编码格式，但实践中几乎只用 JSON，大数据量场景序列化开销显著 | ✅ Protobuf 二进制编码，高效紧凑 | ❌ 可通过 Content Negotiation 支持任意格式，但实践中以 JSON 为主，无标准二进制方案 | ✅ 开发环境 JSON 便于调试，生产环境自动切换 Binary 提升吞吐，零配置 |
+| **一份 Schema** | ❌ SDL 定义 API 接口，但仍需独立维护 ORM 数据库映射，两处定义容易不同步（code-first 工具可缓解） | ❌ `.proto` 定义接口 + ORM 定义数据库，两套定义需手动保持一致 | ❌ 无 Schema 驱动，路由 / 模型 / 文档全部手写 | ✅ 一份 `.luxo` 生成 API 接口、数据库迁移、客户端 SDK 和文档，单一事实来源 |
+| **N+1 防护** | ❌ Resolver 模式天然引发 N+1，需手动集成 DataLoader（已是标准实践，部分框架如 Hasura 可自动解决） | N/A 不涉及嵌套字段解析场景 | ❌ 嵌套资源需手动优化查询或引入预加载逻辑 | ✅ 编译器自动分析关联关系，生成 DataLoader 批量加载，无需手动干预 |
+| **空安全** | ⚠️ SDL `!` 标记非空，服务端运行时校验；客户端可通过 codegen 获得编译期类型安全 | ✅ Protobuf 字段有默认零值，编译期类型安全（但 proto3 无法区分"零值"和"未设置"） | ❌ 无任何空安全保障，null 错误只能运行时发现 | ✅ 语言级编译期空安全：`?` 可空声明、`?.` 安全访问、`?:` Elvis 兜底，空值错误编译阶段拦截 |
+| **错误处理** | ❌ `errors` 数组结构松散，仅有 message 字符串 + 可选 extensions，客户端难以结构化处理 | ✅ gRPC Status 标准 16 种状态码 + 富错误详情，类型明确 | ❌ 依赖 HTTP 状态码 + 自定义 JSON body，无统一错误结构规范 | ✅ `Result<T>` 类型化错误 + `?` 操作符自动传播，错误处理既安全又简洁 |
+| **并发** | ⚠️ 多数实现自动并行执行独立 resolver（gqlgen / Apollo / graphql-java），但无语言级并发原语，复杂编排仍依赖宿主语言 | ❌ 支持双向流式传输，但并发编排逻辑需开发者手动管理 | ❌ 无内建并发支持，完全依赖框架或手写线程/协程管理 | ✅ 语言内建 `async` / `await` 异步模型 + `Channel` 消息通信，并发安全由编译器保证 |
+| **多服务** | ⚠️ Apollo Federation 成熟但运维复杂，需额外网关层和服务间协调 | ⚠️ 原生点对点 RPC 调用，但多服务编排仍需服务网格/发现（Istio、Consul 等） | ❌ 服务间调用需手写 HTTP 客户端或引入额外框架 | ✅ `extend` 跨服务扩展类型 + 内建网关路由 + 原生 RPC 调用，多服务协作开箱即用 |
 
 ## 语言特性
 
-Luxo 是一门真正的编程语言 — 不只是 Schema DSL。**28 个关键字**，简洁语法，编译到 Go。
+Luxo 是一门真正的编程语言 — 不只是 Schema DSL。**31 个关键字**，6 种核心类型（`Int`、`Float`、`String`、`Boolean`、`DateTime`、`Duration`），简洁语法，编译到 Go。
 
 ### 空安全
 
 ```luxo
 val user = find(User, id: 1)       // User?（可空）
 val name = user?.name               // 安全访问
-val sure = user ?: throw error.not_found  // Elvis — 断言或抛错
+val sure = user ?: throw NotFound   // Elvis — 断言或抛错
 ```
 
-### 模式匹配
+### 模式匹配 — `when`
+
+`when` 取代 if/else 多分支逻辑：
 
 ```luxo
 val level = when(score) {
@@ -144,6 +146,14 @@ val found = for item in items {
 // found: Item? — yield 的值，未找到则 null
 ```
 
+### 变量 — `val` + `var`
+
+```luxo
+val name = "不可变"                   // 不可变（全局 + 局部）
+var count = 0                        // 可变（仅限局部）
+count += 1
+```
+
 ### 集合操作
 
 ```luxo
@@ -161,14 +171,52 @@ api getUser(id: Int): User @cache(ttl: 60)
 
 // 2. 带逻辑 — 用 Luxo 写
 api register(input: RegisterInput): AuthResult {
-  input.password.length >= 8 ?: throw error.password_too_short
+  input.password.length >= 8 ?: throw PasswordTooShort
   val user = create(User, name: input.name, email: input.email, password: input.password)
   val token = generateToken(user, expires: 7d)
-  AuthResult { token: token, user: user }
+  AuthResult { token, user }         // 简写 — 字段名 = 变量名
 }
 
 // 3. 复杂逻辑 — 用 Go 写
 api oauthLogin(provider: String, code: String): AuthResult @native
+```
+
+### 模块 — `use`
+
+```luxo
+use http                             // 标准库导入
+use common.{ Base, Page }           // 展开导入
+```
+
+### 当前用户 — `my`
+
+```luxo
+api createPost(title: String): Post @auth {
+  val post = create(Post, title: title, userId: my.id)
+  post
+}
+```
+
+### 事件 — `event` / `emit` / `on`
+
+```luxo
+event OrderCreated(order: Order, userId: Int)    // 类型化事件声明
+
+api placeOrder(id: Int): Order @auth {
+  val order = create(Order, userId: my.id)
+  emit OrderCreated(order: order, userId: my.id) // 类型化 emit
+  order
+}
+
+on OrderCreated { order ->                       // 事件监听
+  "order created".i                              // .i = info 日志
+}
+```
+
+### 调试链 — `.d`
+
+```luxo
+val user = find(User, id: 1).d       // .d 打印并返回自身
 ```
 
 ### 字段选择 — 贯穿全链路
@@ -182,13 +230,9 @@ getUser(1) {
 
 客户端选字段 → API 只序列化这些 → SQL 只查这些。端到端。
 
-### 事件 + 实时推送
+### 实时流
 
 ```luxo
-// 发送事件 — 框架自动处理 WebSocket + 消息队列
-emit("order.created", order, userId: order.userId)
-
-// 订阅 — 客户端实时收到更新
 api watchComments(postId: Int): stream Comment
 ```
 
@@ -206,7 +250,7 @@ luxo dev
 
 ```
                         ┌──────────────────────────┐
-                        │       Luxo Router        │
+                        │         Luvia            │
   客户端 ──HTTP/2──────►│  Schema · 负载均衡 · 熔断  │──HTTP/2──► 各服务
         ◄─WebSocket────│  Studio · Identity       │
                         └──────────────────────────┘
@@ -241,7 +285,7 @@ luxo dev
 ## 开发进度
 
 ### Phase 1 — 编译器 ✅
-- [x] 词法分析 · 语法分析（28 关键字，Pratt Parser）
+- [x] 词法分析 · 语法分析（31 关键字，Pratt Parser）
 - [x] 语义分析（类型检查、空安全、字段注入）
 - [x] LSP 服务器（诊断、补全、悬停、跳转定义）
 - [x] 510 个测试 · 极限覆盖率 · Fuzz 测试
@@ -256,7 +300,7 @@ luxo dev
 - [ ] 运行时：错误处理、连接池、日志、消息系统
 
 ### Phase 3 — 多服务
-- [ ] Luxo Router · 服务发现 · 熔断
+- [ ] Luvia /lɑːviyɑː/ 网关 · 服务发现 · 熔断
 - [ ] 服务间 Luxo RPC
 - [ ] Identity 上下文传递
 

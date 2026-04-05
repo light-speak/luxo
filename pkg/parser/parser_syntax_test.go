@@ -205,14 +205,21 @@ func TestParseSpreadParam(t *testing.T) {
 	}
 }
 
-// ========== import ==========
+// ========== use (stdlib import) ==========
 
-func TestParseImport(t *testing.T) {
-	input := `import http
-import json`
+func TestParseUseStdlib(t *testing.T) {
+	input := `use http
+use json`
 	file := parse(t, input)
-	// import should be recognized as top-level declaration
-	_ = file
+	if len(file.Imports) != 2 {
+		t.Fatalf("expected 2 imports, got %d", len(file.Imports))
+	}
+	if file.Imports[0].Module != "http" {
+		t.Errorf("expected 'http', got %q", file.Imports[0].Module)
+	}
+	if file.Imports[1].Module != "json" {
+		t.Errorf("expected 'json', got %q", file.Imports[1].Module)
+	}
 }
 
 // ========== for 作为表达式（带 yield）==========
@@ -262,5 +269,145 @@ func TestParseComplexNewSyntax(t *testing.T) {
 	api := file.APIs[0]
 	if api.Body == nil {
 		t.Fatal("expected body")
+	}
+}
+
+// ========== event / on / emit ==========
+
+func TestParseEventDecl(t *testing.T) {
+	input := `event PostCreated(post: Post, userId: Int)`
+	file := parse(t, input)
+	if len(file.Events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(file.Events))
+	}
+	ev := file.Events[0]
+	if ev.Name != "PostCreated" {
+		t.Errorf("expected 'PostCreated', got %q", ev.Name)
+	}
+	if len(ev.Params) != 2 {
+		t.Errorf("expected 2 params, got %d", len(ev.Params))
+	}
+}
+
+func TestParseEventNoParams(t *testing.T) {
+	input := `event SystemReady`
+	file := parse(t, input)
+	if len(file.Events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(file.Events))
+	}
+}
+
+func TestParseOnDeclWithBody(t *testing.T) {
+	input := `on PostCreated {
+  val x = 1
+}`
+	file := parse(t, input)
+	if len(file.Listeners) != 1 {
+		t.Fatalf("expected 1 listener, got %d", len(file.Listeners))
+	}
+	on := file.Listeners[0]
+	if on.EventName != "PostCreated" {
+		t.Errorf("expected 'PostCreated', got %q", on.EventName)
+	}
+	if on.Body == nil {
+		t.Error("expected body")
+	}
+}
+
+func TestParseOnNative(t *testing.T) {
+	input := `on PostCreated @native`
+	file := parse(t, input)
+	if len(file.Listeners) != 1 {
+		t.Fatalf("expected 1 listener, got %d", len(file.Listeners))
+	}
+	if !file.Listeners[0].Native {
+		t.Error("expected native")
+	}
+}
+
+func TestParseOnWithLambdaParams(t *testing.T) {
+	input := `on PostCreated { post -> val x = 1 }`
+	file := parse(t, input)
+	if len(file.Listeners) != 1 {
+		t.Fatalf("expected 1 listener, got %d", len(file.Listeners))
+	}
+	on := file.Listeners[0]
+	if on.EventName != "PostCreated" {
+		t.Errorf("expected 'PostCreated', got %q", on.EventName)
+	}
+	if len(on.Params) != 1 || on.Params[0] != "post" {
+		t.Errorf("expected params [post], got %v", on.Params)
+	}
+	if on.Body == nil {
+		t.Error("expected body")
+	}
+}
+
+func TestParseOnWithMultipleLambdaParams(t *testing.T) {
+	input := `on ChatMessage { msg, roomId -> val x = 1 }`
+	file := parse(t, input)
+	on := file.Listeners[0]
+	if len(on.Params) != 2 {
+		t.Fatalf("expected 2 params, got %d", len(on.Params))
+	}
+	if on.Params[0] != "msg" || on.Params[1] != "roomId" {
+		t.Errorf("expected params [msg, roomId], got %v", on.Params)
+	}
+}
+
+func TestParseUseDestructured(t *testing.T) {
+	input := `use http { get, post }`
+	file := parse(t, input)
+	if len(file.Uses) != 1 {
+		t.Fatalf("expected 1 use, got %d", len(file.Uses))
+	}
+	u := file.Uses[0]
+	if u.Module != "http" {
+		t.Errorf("expected module 'http', got %q", u.Module)
+	}
+	if len(u.Names) != 2 || u.Names[0] != "get" || u.Names[1] != "post" {
+		t.Errorf("expected names [get, post], got %v", u.Names)
+	}
+}
+
+func TestParseUseKeywordAsModule(t *testing.T) {
+	input := `use model { Base }`
+	file := parse(t, input)
+	if len(file.Uses) != 1 {
+		t.Fatalf("expected 1 use, got %d", len(file.Uses))
+	}
+	u := file.Uses[0]
+	if u.Module != "model" {
+		t.Errorf("expected module 'model', got %q", u.Module)
+	}
+	if len(u.Names) != 1 || u.Names[0] != "Base" {
+		t.Errorf("expected names [Base], got %v", u.Names)
+	}
+}
+
+func TestParseEmitTyped(t *testing.T) {
+	input := `api test(): Int {
+  emit OrderCreated(order: order, userId: 1)
+  0
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	emitStmt, ok := api.Body.Stmts[0].(*ast.EmitStmt)
+	if !ok {
+		t.Fatalf("expected EmitStmt, got %T", api.Body.Stmts[0])
+	}
+	if emitStmt.EventName != "OrderCreated" {
+		t.Errorf("expected 'OrderCreated', got %q", emitStmt.EventName)
+	}
+}
+
+func TestParseMyKeyword(t *testing.T) {
+	input := `api test(): Int {
+  my.id
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	if api.Body == nil || len(api.Body.Stmts) == 0 {
+		t.Fatal("expected body with statements")
 	}
 }

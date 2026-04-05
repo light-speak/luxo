@@ -596,20 +596,6 @@ api test(): Int {
 	expectError(t, result, "undefined: 'inner'")
 }
 
-func TestIfStmtWithElse(t *testing.T) {
-	result := analyze(t, `
-api test(): String {
-  if true {
-    val x = "yes"
-  } else {
-    val y = "no"
-  }
-  "done"
-}
-`)
-	expectNoErrors(t, result)
-}
-
 func TestIfStmtWithNilBlock(t *testing.T) {
 	// Exercise checkBlock with nil Then/Else blocks
 	a := New()
@@ -623,7 +609,6 @@ func TestIfStmtWithNilBlock(t *testing.T) {
 						&ast.IfStmt{
 							Condition: &ast.Literal{Kind: token.True, Value: "true"},
 							Then:      nil, // nil Then block
-							Else:      nil, // nil Else block
 						},
 					},
 				},
@@ -696,8 +681,9 @@ api test(): Int {
 
 func TestEmitStmtCheck(t *testing.T) {
 	result := analyze(t, `
+event UserCreated(userId: Int)
 api test(): Int {
-  emit("user_created", 42)
+  emit UserCreated(userId: 42)
   42
 }
 `)
@@ -732,8 +718,9 @@ func TestEmitStmtDirect(t *testing.T) {
 
 	a := New()
 	result := a.Analyze([]*ast.File{file})
-	// No panic and no fatal errors about emit
-	_ = result
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
 }
 
 func TestLambdaItVariable(t *testing.T) {
@@ -846,7 +833,9 @@ func TestTransactionExprDirect(t *testing.T) {
 
 	a := New()
 	result := a.Analyze([]*ast.File{file})
-	_ = result
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
 }
 
 func TestTemplateStringExpr(t *testing.T) {
@@ -905,7 +894,9 @@ func TestTemplateStringDirect(t *testing.T) {
 
 	a := New()
 	result := a.Analyze([]*ast.File{file})
-	_ = result
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
 }
 
 func TestNilStmtInBlock(t *testing.T) {
@@ -1274,7 +1265,7 @@ api getUser(id: Int, name: String): User {
 func TestAssignStmt(t *testing.T) {
 	result := analyze(t, `
 api test(): Int {
-  val x = 1
+  var x = 1
   x = 2
   x += 3
   x
@@ -1296,7 +1287,7 @@ api test(): Int {
 func TestBreakStmt(t *testing.T) {
 	result := analyze(t, `
 api test(): Int {
-  val i = 0
+  var i = 0
   for {
     i += 1
     if i >= 10 { break }
@@ -1353,7 +1344,7 @@ api test(): Int {
 func TestForConditionLoop(t *testing.T) {
 	result := analyze(t, `
 api test(): Int {
-  val count = 0
+  var count = 0
   for count < 10 {
     count += 1
   }
@@ -1366,12 +1357,70 @@ api test(): Int {
 func TestForInfiniteLoop(t *testing.T) {
 	result := analyze(t, `
 api test(): Int {
-  val i = 0
+  var i = 0
   for {
     i += 1
     if i >= 5 { break }
   }
   i
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestDebugChainMethods(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(id: Int): String {
+  val user = find(User, id: id)
+  val u1 = user.d
+  val u2 = user.i
+  val u3 = user.w
+  val u4 = user.e
+  val chained = user.d.i.w.e
+  user.name
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestDebugChainOnList(t *testing.T) {
+	result := analyze(t, `
+model Post { title: String }
+api test(): [Post] {
+  val posts = find(Post, where: title == "x")
+  posts.d.filter { it.title == "y" }
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestMyMethodCall(t *testing.T) {
+	result := analyze(t, `
+api test(): String @auth {
+  val user = my.load(name, role)
+  "done"
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestMyIdAccess(t *testing.T) {
+	result := analyze(t, `
+api test(): Int @auth {
+  my.id
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestLetScopeFunction(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(id: Int): String {
+  val user = find(User, id: id)
+  val result = user?.let { "found" }
+  result ?: "not found"
 }
 `)
 	expectNoErrors(t, result)

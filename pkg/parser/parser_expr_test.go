@@ -301,16 +301,12 @@ func TestParseConditionExprForLoop(t *testing.T) {
   }
   return 0
 }`
-	// Note: this may not parse perfectly since filter{} is tricky in condition context,
-	// but it exercises parseConditionExpr.
-	file, errs := parseWithErrors(t, input)
+	file, _ := parseWithErrors(t, input)
 	if file == nil {
 		t.Fatal("expected non-nil file")
 	}
-	_ = errs
 }
 
-// Test parseConditionExpr null left: if condition starts with a non-expression token.
 func TestParseConditionExprNullLeft(t *testing.T) {
 	// if ) { ... } — RParen can't start an expression, parsePrefixExpr returns nil
 	input := `api test(): Int {
@@ -341,7 +337,9 @@ func TestParseWhenConditionNullLeft(t *testing.T) {
 	if file == nil {
 		t.Fatal("expected non-nil file")
 	}
-	_ = errs
+	if len(errs) == 0 {
+		t.Error("expected parse errors for bad when condition")
+	}
 }
 
 // Test isBinaryOp: remaining operators (%, /, >=, <=, in, is) used as infix in conditions.
@@ -1023,34 +1021,21 @@ func TestParseTransactionExpr(t *testing.T) {
 
 func TestParseEmitStmt(t *testing.T) {
 	input := `api test(): Boolean {
-  emit("order.created", order, userId: order.userId)
+  emit OrderCreated(order: order, userId: 1)
   return true
 }`
 	file := parse(t, input)
 	api := file.APIs[0]
 
-	// emit is now a regular function call, parsed as ExprStmt wrapping CallExpr
-	exprStmt, ok := api.Body.Stmts[0].(*ast.ExprStmt)
+	emitStmt, ok := api.Body.Stmts[0].(*ast.EmitStmt)
 	if !ok {
-		t.Fatalf("expected ExprStmt, got %T", api.Body.Stmts[0])
+		t.Fatalf("expected EmitStmt, got %T", api.Body.Stmts[0])
 	}
-	callExpr, ok := exprStmt.Expr.(*ast.CallExpr)
-	if !ok {
-		t.Fatalf("expected CallExpr, got %T", exprStmt.Expr)
+	if emitStmt.EventName != "OrderCreated" {
+		t.Errorf("expected event 'OrderCreated', got %q", emitStmt.EventName)
 	}
-	ident, ok := callExpr.Func.(*ast.Ident)
-	if !ok {
-		t.Fatalf("expected Ident func, got %T", callExpr.Func)
-	}
-	if ident.Name != "emit" {
-		t.Errorf("expected func name 'emit', got %q", ident.Name)
-	}
-	if len(callExpr.Args) != 3 {
-		t.Errorf("expected 3 args, got %d", len(callExpr.Args))
-	}
-	// third arg should be named: userId: order.userId
-	if callExpr.Args[2].Name != "userId" {
-		t.Errorf("expected named arg 'userId', got %q", callExpr.Args[2].Name)
+	if len(emitStmt.Args) != 2 {
+		t.Errorf("expected 2 args, got %d", len(emitStmt.Args))
 	}
 }
 
@@ -1240,7 +1225,9 @@ func TestParseExprStmtStuckRecovery(t *testing.T) {
 	if file == nil {
 		t.Fatal("expected non-nil file")
 	}
-	_ = errs // errors are expected
+	if len(errs) == 0 {
+		t.Error("expected parse errors")
+	}
 }
 
 // Test parseExprStmt stuck recovery: expression that doesn't consume tokens.
@@ -1254,11 +1241,10 @@ func TestParseExprStmtWithBadToken(t *testing.T) {
   )
   return 1
 }`
-	file, errs := parseWithErrors(t, input)
+	file, _ := parseWithErrors(t, input)
 	if file == nil {
 		t.Fatal("expected non-nil file")
 	}
-	_ = errs
 }
 
 func TestParseExprStmtStuckRecoveryDirect(t *testing.T) {
@@ -1318,5 +1304,187 @@ func TestParseIsTypeNameEmpty(t *testing.T) {
 	}
 	if ident.Name != "lowercase" {
 		t.Errorf("expected 'lowercase', got %q", ident.Name)
+	}
+}
+
+// ========== SafeDot in expression ==========
+
+func TestParseSafeDotExpr(t *testing.T) {
+	input := `api test(): String {
+  val name = user?.name
+  name
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	valStmt := api.Body.Stmts[0].(*ast.ValStmt)
+	member, ok := valStmt.Value.(*ast.MemberExpr)
+	if !ok {
+		t.Fatalf("expected MemberExpr, got %T", valStmt.Value)
+	}
+	if !member.SafeCall {
+		t.Error("expected SafeCall = true")
+	}
+	if member.Field != "name" {
+		t.Errorf("expected field 'name', got %q", member.Field)
+	}
+}
+
+func TestParsePostfixQuestion(t *testing.T) {
+	input := `api test(): Int {
+  val x = riskyOp(1)?
+  x
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	valStmt := api.Body.Stmts[0].(*ast.ValStmt)
+	unary, ok := valStmt.Value.(*ast.UnaryExpr)
+	if !ok {
+		t.Fatalf("expected UnaryExpr, got %T", valStmt.Value)
+	}
+	if unary.Op != "?" {
+		t.Errorf("expected op '?', got %q", unary.Op)
+	}
+}
+
+func TestParseForConditionSafeDot(t *testing.T) {
+	input := `api test(): Int {
+  for x?.active {
+    val y = 1
+  }
+  0
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	if api.Body == nil {
+		t.Fatal("expected body")
+	}
+}
+
+func TestParseForConditionElvis(t *testing.T) {
+	input := `api test(): Int {
+  for x ?: fallback {
+    val y = 1
+  }
+  0
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	if api.Body == nil {
+		t.Fatal("expected body")
+	}
+}
+
+func TestParseForConditionRange(t *testing.T) {
+	input := `api test(): Int {
+  for i in 0..10 {
+    val x = i
+  }
+  0
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	forStmt := api.Body.Stmts[0].(*ast.ForStmt)
+	if forStmt.VarName != "i" {
+		t.Errorf("expected var 'i', got %q", forStmt.VarName)
+	}
+}
+
+func TestParseForConditionWithCall(t *testing.T) {
+	input := `api test(): Int {
+  for getCount() > 0 {
+    val x = 1
+  }
+  0
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	if api.Body == nil {
+		t.Fatal("expected body")
+	}
+}
+
+func TestIsCallableNonCallable(t *testing.T) {
+	// binary expression is not callable — should not produce trailing lambda
+	input := `api test(): Int {
+  val x = 1 + 2
+  x
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	valStmt := api.Body.Stmts[0].(*ast.ValStmt)
+	if _, ok := valStmt.Value.(*ast.BinaryExpr); !ok {
+		t.Fatalf("expected BinaryExpr, got %T", valStmt.Value)
+	}
+}
+
+func TestParseObjectConstructionShorthand(t *testing.T) {
+	input := `type AuthResult {
+  token: String
+  user: String
+}
+api test(): AuthResult {
+  val token = "abc"
+  val user = "lin"
+  AuthResult { token, user }
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	// the last statement should be an expression statement containing an ObjectExpr
+	lastStmt := api.Body.Stmts[len(api.Body.Stmts)-1]
+	exprStmt, ok := lastStmt.(*ast.ExprStmt)
+	if !ok {
+		t.Fatalf("expected ExprStmt, got %T", lastStmt)
+	}
+	obj, ok := exprStmt.Expr.(*ast.ObjectExpr)
+	if !ok {
+		t.Fatalf("expected ObjectExpr, got %T", exprStmt.Expr)
+	}
+	if len(obj.Fields) != 2 {
+		t.Fatalf("expected 2 fields, got %d", len(obj.Fields))
+	}
+	// shorthand: { token } → Name should be "token"
+	if obj.Fields[0].Name != "token" {
+		t.Errorf("expected field name 'token', got %q", obj.Fields[0].Name)
+	}
+	if obj.Fields[1].Name != "user" {
+		t.Errorf("expected field name 'user', got %q", obj.Fields[1].Name)
+	}
+}
+
+func TestParseCallArgsEmptyExpression(t *testing.T) {
+	// find(User, where: ) — incomplete expression after colon, should not crash
+	input := `api test(): Int {
+  find(User, where: )
+  0
+}`
+	_, errs := parseWithErrors(t, input)
+	// should parse without panic, may have errors
+	_ = errs
+}
+
+func TestParseObjectConstructionWithColon(t *testing.T) {
+	input := `type AuthResult {
+  token: String
+  user: String
+}
+api test(): AuthResult {
+  AuthResult { token: "abc", user: "lin" }
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	lastStmt := api.Body.Stmts[len(api.Body.Stmts)-1]
+	exprStmt, ok := lastStmt.(*ast.ExprStmt)
+	if !ok {
+		t.Fatalf("expected ExprStmt, got %T", lastStmt)
+	}
+	obj, ok := exprStmt.Expr.(*ast.ObjectExpr)
+	if !ok {
+		t.Fatalf("expected ObjectExpr, got %T", exprStmt.Expr)
+	}
+	if len(obj.Fields) != 2 {
+		t.Fatalf("expected 2 fields, got %d", len(obj.Fields))
+	}
+	if obj.Fields[0].Name != "token" {
+		t.Errorf("expected 'token', got %q", obj.Fields[0].Name)
 	}
 }

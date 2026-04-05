@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/ast"
@@ -30,9 +31,8 @@ func TestParseIfStmt(t *testing.T) {
 	input := `api test(): Int {
   if condition {
     return 1
-  } else {
-    return 0
   }
+  return 0
 }`
 	file := parse(t, input)
 	api := file.APIs[0]
@@ -43,47 +43,6 @@ func TestParseIfStmt(t *testing.T) {
 	}
 	if ifStmt.Then == nil {
 		t.Error("expected then block")
-	}
-	if ifStmt.Else == nil {
-		t.Error("expected else block")
-	}
-}
-
-func TestParseElseIf(t *testing.T) {
-	input := `api test(): Int {
-  if x {
-    return 1
-  } else if y {
-    return 2
-  } else {
-    return 3
-  }
-}`
-	file := parse(t, input)
-	api := file.APIs[0]
-	ifStmt, ok := api.Body.Stmts[0].(*ast.IfStmt)
-	if !ok {
-		t.Fatalf("expected IfStmt, got %T", api.Body.Stmts[0])
-	}
-	if ifStmt.Then == nil {
-		t.Error("expected then block")
-	}
-	if ifStmt.Else == nil {
-		t.Fatal("expected else block")
-	}
-	// else block should contain a nested IfStmt
-	if len(ifStmt.Else.Stmts) != 1 {
-		t.Fatalf("expected 1 stmt in else block, got %d", len(ifStmt.Else.Stmts))
-	}
-	innerIf, ok := ifStmt.Else.Stmts[0].(*ast.IfStmt)
-	if !ok {
-		t.Fatalf("expected nested IfStmt, got %T", ifStmt.Else.Stmts[0])
-	}
-	if innerIf.Then == nil {
-		t.Error("expected inner then block")
-	}
-	if innerIf.Else == nil {
-		t.Error("expected inner else block")
 	}
 }
 
@@ -243,11 +202,10 @@ func TestParseBlockStuckRecovery(t *testing.T) {
   )
   return 1
 }`
-	file, errs := parseWithErrors(t, input)
+	file, _ := parseWithErrors(t, input)
 	if file == nil {
 		t.Fatal("expected non-nil file")
 	}
-	_ = errs
 }
 
 // Test parseBlock stuck recovery and nil stmt paths via direct token manipulation.
@@ -268,42 +226,6 @@ func TestParseBlockStuckRecoveryDirect(t *testing.T) {
 	if len(api.Body.Stmts) != 1 {
 		t.Errorf("expected 1 statement (nil stmt filtered), got %d", len(api.Body.Stmts))
 	}
-}
-
-// Test parseBlock stuck recovery by directly calling parseBlock
-// when the parser is positioned beyond all tokens.
-func TestParseBlockStuckGuard(t *testing.T) {
-	// Construct a parser where parseBlock's loop will enter (not RBrace, not EOF
-	// at first), then parseStmt returns without advancing.
-	// We achieve this by creating tokens: { <empty> with no RBrace.
-	// After LBrace is consumed by expect, the loop checks !check(RBrace) && !isEOF().
-	// With empty tokens after LBrace, current() returns EOF -> isEOF() true -> loop exits.
-	// So we can't trigger the stuck guard from outside. Call parseBlock directly
-	// with a token that parseStmt won't advance past.
-	// Actually, the simplest way: no tokens at all, call parseBlock.
-	// expect(LBrace) fails (error), pos stays at 0 (pos >= len).
-	// Loop: !check(RBrace) is true (EOF != RBrace), !isEOF() is false (EOF). Loop exits.
-	// So stuck guard is NOT triggered this way either.
-
-	// Call parseBlock directly with pos beyond all tokens.
-	// expect(LBrace) errors but doesn't advance (pos >= len).
-	// Loop: check(RBrace) -> false, isEOF() -> current().Type == EOF -> true. Loop exits.
-	// But parseExprStmt's stuck guard now advances... Let me try with tokens where
-	// we get inside the loop but parseStmt doesn't advance.
-	// Use a single LBrace token. After expect(LBrace), pos=1. len=1, so pos >= len.
-	// Loop: current() is EOF. !check(RBrace) true, !isEOF() false. Loop exits.
-	// Stuck guard not reached.
-
-	// Alternative: { Ident } — LBrace consumed, Ident is not EOF/RBrace so loop enters.
-	// parseStmt -> parseExprStmt -> parseExpr -> parsePrefixExpr: check(Ident) true,
-	// advance() increments pos to 2. Returns ident. parseExprStmt: pos changed, returns ExprStmt.
-	// Loop: current() returns tokens[2] which is RBrace. check(RBrace) true. Loop exits.
-	// Stuck guard not reached because parseStmt advanced.
-
-	// The stuck guard fires ONLY if parseStmt returns without advancing AND we're
-	// not at RBrace/EOF. This is unreachable because parseStmt (via parseExprStmt)
-	// always advances at least one token via its own stuck guard (which we already covered).
-	t.Log("parseBlock stuck guard at line 665-668 is a defensive unreachable path")
 }
 
 // Test Parse main loop with comma token (adjacent to stuck guard path).
@@ -429,5 +351,238 @@ func TestExpectIdentErrorPathDirect(t *testing.T) {
 	}
 	if len(p.errors) == 0 {
 		t.Error("expected error from expectIdent")
+	}
+}
+
+// ========== Compound Assignment Operators ==========
+
+func TestParseCompoundAssignStmt(t *testing.T) {
+	tests := []struct {
+		name string
+		code string
+		op   string
+	}{
+		{"PlusAssign", "x += 1", "+="},
+		{"MinusAssign", "x -= 1", "-="},
+		{"StarAssign", "x *= 2", "*="},
+		{"SlashAssign", "x /= 2", "/="},
+		{"PercentAssign", "x %= 3", "%="},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := `api test(): Int {
+  val x = 10
+  ` + tt.code + `
+  x
+}`
+			file := parse(t, input)
+			api := file.APIs[0]
+			assign, ok := api.Body.Stmts[1].(*ast.AssignStmt)
+			if !ok {
+				t.Fatalf("expected AssignStmt, got %T", api.Body.Stmts[1])
+			}
+			if assign.Op != tt.op {
+				t.Errorf("expected op %q, got %q", tt.op, assign.Op)
+			}
+		})
+	}
+}
+
+func TestParseMemberAssignStmt(t *testing.T) {
+	input := `api test(): Int {
+  user.name = "John"
+  user.score += 10
+  0
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	assign1, ok := api.Body.Stmts[0].(*ast.AssignStmt)
+	if !ok {
+		t.Fatalf("expected AssignStmt, got %T", api.Body.Stmts[0])
+	}
+	if assign1.Op != "=" {
+		t.Errorf("expected op '=', got %q", assign1.Op)
+	}
+	member, ok := assign1.Target.(*ast.MemberExpr)
+	if !ok {
+		t.Fatalf("expected MemberExpr target, got %T", assign1.Target)
+	}
+	if member.Field != "name" {
+		t.Errorf("expected field 'name', got %q", member.Field)
+	}
+
+	assign2, ok := api.Body.Stmts[1].(*ast.AssignStmt)
+	if !ok {
+		t.Fatalf("expected AssignStmt, got %T", api.Body.Stmts[1])
+	}
+	if assign2.Op != "+=" {
+		t.Errorf("expected op '+=', got %q", assign2.Op)
+	}
+}
+
+func TestParseModelScope(t *testing.T) {
+	input := `model Post {
+  title: String
+  scope published {
+    val x = 1
+  }
+}`
+	file := parse(t, input)
+	model := file.Models[0]
+	if len(model.Scopes) != 1 {
+		t.Fatalf("expected 1 scope, got %d", len(model.Scopes))
+	}
+}
+
+func TestParseModelComputedField(t *testing.T) {
+	input := `model Post {
+  title: String
+  val commentCount: Int get @count
+}`
+	file := parse(t, input)
+	model := file.Models[0]
+	// regular field + computed field
+	if len(model.Fields) != 2 {
+		t.Fatalf("expected 2 fields, got %d", len(model.Fields))
+	}
+}
+
+func TestParseVarStmt(t *testing.T) {
+	input := `api test(): Int {
+  var x = 1
+  x += 2
+  x
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	valStmt := api.Body.Stmts[0].(*ast.ValStmt)
+	if valStmt.Name != "x" {
+		t.Errorf("expected 'x', got %q", valStmt.Name)
+	}
+	if !valStmt.Mutable {
+		t.Error("expected Mutable = true for var")
+	}
+}
+
+func TestParseValIsImmutable(t *testing.T) {
+	input := `api test(): Int {
+  val x = 1
+  x
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	valStmt := api.Body.Stmts[0].(*ast.ValStmt)
+	if valStmt.Mutable {
+		t.Error("expected Mutable = false for val")
+	}
+}
+
+func TestParseGlobalValVar(t *testing.T) {
+	input := `val APP_NAME = "test"
+var counter = 0`
+	file := parse(t, input)
+	if len(file.Globals) != 2 {
+		t.Fatalf("expected 2 globals, got %d", len(file.Globals))
+	}
+	if file.Globals[0].Mutable {
+		t.Error("expected val to be immutable")
+	}
+	if !file.Globals[1].Mutable {
+		t.Error("expected var to be mutable")
+	}
+}
+
+func TestParseModelCommentInBody(t *testing.T) {
+	// exercises the comment-skipping branch in parseModel
+	input := `model Post {
+  // this is a comment inside model body
+  title: String
+  // another comment
+  content: String
+}`
+	file := parse(t, input)
+	model := file.Models[0]
+	if len(model.Fields) != 2 {
+		t.Fatalf("expected 2 fields, got %d", len(model.Fields))
+	}
+}
+
+func TestParseEmitStmtNoArgs(t *testing.T) {
+	input := `event UserCreated(user: String)
+api test(): Int {
+  emit UserCreated
+  0
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	emitStmt, ok := api.Body.Stmts[0].(*ast.EmitStmt)
+	if !ok {
+		t.Fatalf("expected EmitStmt, got %T", api.Body.Stmts[0])
+	}
+	if emitStmt.EventName != "UserCreated" {
+		t.Errorf("expected event name 'UserCreated', got %q", emitStmt.EventName)
+	}
+	if len(emitStmt.Args) != 0 {
+		t.Errorf("expected 0 args, got %d", len(emitStmt.Args))
+	}
+}
+
+func TestParseEmitStmtWithArgs(t *testing.T) {
+	input := `event OrderCreated(orderId: Int)
+api test(): Int {
+  emit OrderCreated(orderId: 42)
+  0
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	emitStmt, ok := api.Body.Stmts[0].(*ast.EmitStmt)
+	if !ok {
+		t.Fatalf("expected EmitStmt, got %T", api.Body.Stmts[0])
+	}
+	if emitStmt.EventName != "OrderCreated" {
+		t.Errorf("expected 'OrderCreated', got %q", emitStmt.EventName)
+	}
+	if len(emitStmt.Args) != 1 {
+		t.Fatalf("expected 1 arg, got %d", len(emitStmt.Args))
+	}
+	if emitStmt.Args[0].Name != "orderId" {
+		t.Errorf("expected arg name 'orderId', got %q", emitStmt.Args[0].Name)
+	}
+}
+
+func TestExpectIdentOrKeyword(t *testing.T) {
+	// "use model { Base }" — "model" is a keyword used as identifier
+	input := `use model { Base }`
+	file := parse(t, input)
+	if file == nil {
+		t.Fatal("expected non-nil file")
+	}
+	// should parse without error — "model" used as module name
+}
+
+func TestExpectIdentOrKeywordEvent(t *testing.T) {
+	// "use event { PostCreated }" — "event" is a keyword used as module name
+	input := `use event { PostCreated }`
+	file := parse(t, input)
+	if file == nil {
+		t.Fatal("expected non-nil file")
+	}
+}
+
+func TestExpectIdentOrKeywordError(t *testing.T) {
+	// "use 123" — number is not ident or keyword, should trigger error branch
+	input := `use 123`
+	_, errs := parseWithErrors(t, input)
+	if len(errs) == 0 {
+		t.Error("expected parser errors for 'use 123'")
+	}
+	foundExpected := false
+	for _, e := range errs {
+		if strings.Contains(e.Message, "expected identifier") {
+			foundExpected = true
+		}
+	}
+	if !foundExpected {
+		t.Errorf("expected 'expected identifier' error, got: %v", errs)
 	}
 }

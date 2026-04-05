@@ -77,16 +77,27 @@ func (p *Parser) parseTopLevel(file *ast.File) {
 		file.APIs = append(file.APIs, p.parseAPIOrOverride())
 	case p.check(token.Fn):
 		file.Functions = append(file.Functions, p.parseFn())
+	default:
+		p.parseTopLevelExtended(file)
+	}
+}
+
+func (p *Parser) parseTopLevelExtended(file *ast.File) {
+	switch {
 	case p.check(token.Error):
 		file.Errors = append(file.Errors, p.parseError())
 	case p.check(token.Extend):
 		file.Extends = append(file.Extends, p.parseExtend())
 	case p.check(token.Use):
-		file.Uses = append(file.Uses, p.parseUse())
+		p.parseUseDispatch(file)
 	case p.check(token.Middleware):
 		file.Middlewares = append(file.Middlewares, p.parseMiddleware())
-	case p.check(token.Import):
-		file.Imports = append(file.Imports, p.parseImport())
+	case p.check(token.Event):
+		file.Events = append(file.Events, p.parseEvent())
+	case p.check(token.On):
+		file.Listeners = append(file.Listeners, p.parseOn())
+	case p.check(token.Val), p.check(token.Var):
+		file.Globals = append(file.Globals, p.parseValStmt())
 	case p.check(token.Comment), p.check(token.EOF):
 		p.handleNonDecl()
 	default:
@@ -383,7 +394,11 @@ func (p *Parser) parseError() *ast.ErrorDecl {
 			code, _ := strconv.Atoi(p.expect(token.Int).Val)
 			errDecl.Code = code
 		case "message":
-			errDecl.Message = p.parseQualifiedName()
+			if p.check(token.String) {
+				errDecl.Message = p.advance().Val
+			} else {
+				errDecl.Message = p.parseQualifiedName()
+			}
 		case "internal":
 			errDecl.Internal = p.current().Type == token.True
 			p.advance()
@@ -410,21 +425,47 @@ func (p *Parser) parseExtend() *ast.ExtendDecl {
 	return ext
 }
 
-func (p *Parser) parseUse() *ast.UseDecl {
+// parseUseDispatch handles the unified `use` keyword:
+//   - `use http`           → ImportDecl (stdlib import)
+//   - `use common.{ ... }` → UseDecl   (module import)
+func (p *Parser) parseUseDispatch(file *ast.File) {
 	pos := p.current().Pos
 	p.expect(token.Use)
 
-	use := &ast.UseDecl{Pos: pos}
-	use.Module = p.expectIdent()
-	p.expect(token.Dot)
+	name := p.expectIdentOrKeyword()
 
-	p.expect(token.LBrace)
-	for !p.check(token.RBrace) && !p.isEOF() {
-		use.Names = append(use.Names, p.expectIdent())
-		p.match(token.Comma)
+	// If next token is '.', this is a dotted module import: use common.{ Base }
+	if p.check(token.Dot) {
+		use := &ast.UseDecl{Pos: pos, Module: name}
+		p.expect(token.Dot)
+		p.expect(token.LBrace)
+		for !p.check(token.RBrace) && !p.isEOF() {
+			use.Names = append(use.Names, p.expectIdent())
+			p.match(token.Comma)
+		}
+		p.expect(token.RBrace)
+		file.Uses = append(file.Uses, use)
+		return
 	}
-	p.expect(token.RBrace)
-	return use
+
+	// If next token is '{', this is a destructured import: use model { Base }
+	if p.check(token.LBrace) {
+		use := &ast.UseDecl{Pos: pos, Module: name}
+		p.expect(token.LBrace)
+		for !p.check(token.RBrace) && !p.isEOF() {
+			use.Names = append(use.Names, p.expectIdent())
+			p.match(token.Comma)
+		}
+		p.expect(token.RBrace)
+		file.Uses = append(file.Uses, use)
+		return
+	}
+
+	// Otherwise it's a stdlib import: use http
+	file.Imports = append(file.Imports, &ast.ImportDecl{
+		Pos:    pos,
+		Module: name,
+	})
 }
 
 func (p *Parser) parseMiddleware() *ast.MiddlewareDecl {
@@ -447,13 +488,119 @@ func (p *Parser) parseMiddleware() *ast.MiddlewareDecl {
 	return mw
 }
 
-func (p *Parser) parseImport() *ast.ImportDecl {
+// parseEmitStmt: emit PostCreated(post: post, userId: my.id)
+func (p *Parser) parseEmitStmt() *ast.EmitStmt {
 	pos := p.current().Pos
-	p.expect(token.Import)
-	return &ast.ImportDecl{
-		Pos:    pos,
-		Module: p.expectIdent(),
+	p.expect(token.Emit)
+	stmt := &ast.EmitStmt{
+		Pos:       pos,
+		EventName: p.expectIdent(),
 	}
+	if p.match(token.LParen) {
+		for !p.check(token.RParen) && !p.isEOF() {
+			arg := &ast.NamedArg{}
+			name := p.expectIdent()
+			p.expect(token.Colon)
+			arg.Name = name
+			val := p.parseExpr(precNone)
+			if val == nil {
+				// incomplete expression — skip this arg
+				p.match(token.Comma)
+				continue
+			}
+			arg.Value = val
+			stmt.Args = append(stmt.Args, arg)
+			p.match(token.Comma)
+		}
+		p.expect(token.RParen)
+	}
+	return stmt
+}
+
+// parseEvent: event PostCreated(post: Post, userId: Int)
+func (p *Parser) parseEvent() *ast.EventDecl {
+	pos := p.current().Pos
+	p.expect(token.Event)
+	event := &ast.EventDecl{
+		Pos:  pos,
+		Name: p.expectIdent(),
+	}
+	if p.match(token.LParen) {
+		for !p.check(token.RParen) && !p.isEOF() {
+			event.Params = append(event.Params, p.parseParam())
+			p.match(token.Comma)
+		}
+		p.expect(token.RParen)
+	}
+	return event
+}
+
+// parseOn: on PostCreated { ... } or on PostCreated @native
+// Also supports lambda-style params: on PostCreated { user -> ... }
+func (p *Parser) parseOn() *ast.OnDecl {
+	pos := p.current().Pos
+	p.expect(token.On)
+	on := &ast.OnDecl{
+		Pos:       pos,
+		EventName: p.expectIdent(),
+	}
+	if p.check(token.At) {
+		// @native
+		p.parseDirectives()
+		on.Native = true
+	} else if p.check(token.LBrace) {
+		on.Params, on.Body = p.parseOnBlock()
+	}
+	return on
+}
+
+// parseOnBlock parses { params -> stmts } or { stmts }.
+// It detects the lambda-style param list by scanning for ident (,ident)* -> pattern.
+func (p *Parser) parseOnBlock() ([]string, *ast.Block) {
+	pos := p.current().Pos
+	p.expect(token.LBrace)
+	block := &ast.Block{Pos: pos}
+
+	// detect lambda-style params: ident (,ident)* ->
+	params := p.tryParseLambdaParams()
+
+	for !p.check(token.RBrace) && !p.isEOF() {
+		stmt := p.parseStmt()
+		if stmt != nil {
+			block.Stmts = append(block.Stmts, stmt)
+		}
+	}
+	block.EndPos = p.current().Pos
+	p.expect(token.RBrace)
+	return params, block
+}
+
+// tryParseLambdaParams attempts to parse ident (,ident)* -> at the current position.
+// Returns the param names if the pattern matches, nil otherwise.
+func (p *Parser) tryParseLambdaParams() []string {
+	// scan ahead to check for ident (,ident)* -> pattern without consuming tokens
+	save := p.pos
+	if !p.check(token.Ident) {
+		return nil
+	}
+	var names []string
+	names = append(names, p.current().Val)
+	p.advance()
+	for p.check(token.Comma) {
+		p.advance() // skip comma
+		if !p.check(token.Ident) {
+			p.pos = save
+			return nil
+		}
+		names = append(names, p.current().Val)
+		p.advance()
+	}
+	if !p.check(token.Arrow) {
+		p.pos = save
+		return nil
+	}
+	p.advance() // skip ->
+	return names
 }
 
 func (p *Parser) parseScope() *ast.ScopeDecl {
@@ -529,7 +676,7 @@ func (p *Parser) parseComputedField() *ast.FieldDecl {
 }
 
 func (p *Parser) parseParam() *ast.ParamDecl {
-	param := &ast.ParamDecl{}
+	param := &ast.ParamDecl{Pos: p.current().Pos}
 	if p.match(token.DotDotDot) {
 		param.Spread = true
 	}
@@ -562,11 +709,6 @@ func (p *Parser) parseTypeRef() *ast.TypeRef {
 			IsList:   true,
 			Name:     inner.Name,
 			TypeArgs: inner.TypeArgs,
-		}
-		// through: [Role] through UserRole
-		if p.check(token.Through) {
-			p.advance()
-			ref.FKField = "through:" + p.expectIdent()
 		}
 		// Nullable: [Post]?
 		if p.match(token.Question) {
@@ -610,12 +752,6 @@ func (p *Parser) parseTypeRef() *ast.TypeRef {
 			ref.FKField = p.expectIdent()
 		}
 		p.expect(token.RParen)
-	}
-
-	// through: [Role] through UserRole
-	if p.check(token.Through) {
-		p.advance()
-		ref.FKField = "through:" + p.expectIdent()
 	}
 
 	// Nullable: String?
@@ -696,6 +832,7 @@ func (p *Parser) parseBlock() *ast.Block {
 			block.Stmts = append(block.Stmts, stmt)
 		}
 	}
+	block.EndPos = p.current().Pos
 	p.expect(token.RBrace)
 	return block
 }
@@ -704,7 +841,7 @@ func (p *Parser) parseBlock() *ast.Block {
 
 func (p *Parser) parseStmt() ast.Stmt {
 	switch {
-	case p.check(token.Val):
+	case p.check(token.Val), p.check(token.Var):
 		return p.parseValStmt()
 	case p.check(token.If):
 		return p.parseIfStmt()
@@ -718,6 +855,8 @@ func (p *Parser) parseStmt() ast.Stmt {
 		pos := p.current().Pos
 		p.advance()
 		return &ast.BreakStmt{Pos: pos}
+	case p.check(token.Emit):
+		return p.parseEmitStmt()
 	case p.check(token.Ident) && p.isAssignOp(p.peekType()):
 		return p.parseAssignStmt()
 	case p.check(token.Ident) && p.peekType() == token.Dot:
@@ -778,9 +917,14 @@ func (p *Parser) parseExprOrAssignStmt() ast.Stmt {
 
 func (p *Parser) parseValStmt() *ast.ValStmt {
 	pos := p.current().Pos
-	p.expect(token.Val)
+	mutable := p.check(token.Var)
+	if mutable {
+		p.expect(token.Var)
+	} else {
+		p.expect(token.Val)
+	}
 
-	stmt := &ast.ValStmt{Pos: pos}
+	stmt := &ast.ValStmt{Pos: pos, Mutable: mutable}
 
 	// destructuring: val (x, y) = ...
 	if p.check(token.LParen) {
@@ -808,25 +952,11 @@ func (p *Parser) parseIfStmt() *ast.IfStmt {
 	pos := p.current().Pos
 	p.expect(token.If)
 
-	stmt := &ast.IfStmt{
+	return &ast.IfStmt{
 		Pos:       pos,
 		Condition: p.parseConditionExpr(),
 		Then:      p.parseBlock(),
 	}
-
-	if p.match(token.Else) {
-		if p.check(token.If) {
-			// else if → nested
-			inner := p.parseIfStmt()
-			stmt.Else = &ast.Block{
-				Pos:   inner.Pos,
-				Stmts: []ast.Stmt{inner},
-			}
-		} else {
-			stmt.Else = p.parseBlock()
-		}
-	}
-	return stmt
 }
 
 func (p *Parser) parseForStmt() *ast.ForStmt {
@@ -913,6 +1043,10 @@ func (p *Parser) parsePrefixExpr() ast.Expr {
 		p.check(token.Duration), p.check(token.True), p.check(token.False),
 		p.check(token.Null):
 		return p.parseLiteral(pos)
+
+	case p.check(token.My):
+		tok := p.advance()
+		return &ast.Ident{Pos: pos, Name: tok.Val}
 
 	case p.check(token.Ident) || p.isKeywordUsedAsIdent():
 		return p.parseIdentOrConstruction(pos)
@@ -1102,8 +1236,16 @@ func (p *Parser) parseCallArgs(pos token.Position, fn ast.Expr) *ast.CallExpr {
 		if p.check(token.Ident) && p.peekType() == token.Colon {
 			arg.Name = p.expectIdent()
 			p.expect(token.Colon)
+			// incomplete: `where: )` — no expression after colon
+			if p.check(token.RParen) {
+				break
+			}
 		}
-		arg.Value = p.parseExpr(precNone)
+		val := p.parseExpr(precNone)
+		if val == nil {
+			break
+		}
+		arg.Value = val
 		call.Args = append(call.Args, arg)
 		p.match(token.Comma)
 	}
@@ -1329,8 +1471,14 @@ func (p *Parser) parseObjectConstruction(pos token.Position, typeName string) as
 		if p.check(token.Ident) && p.peekType() == token.Colon {
 			arg.Name = p.expectIdent()
 			p.expect(token.Colon)
+			arg.Value = p.parseExpr(precNone)
+		} else {
+			arg.Value = p.parseExpr(precNone)
+			// shorthand: { token } → { token: token }
+			if ident, ok := arg.Value.(*ast.Ident); ok && arg.Name == "" {
+				arg.Name = ident.Name
+			}
 		}
-		arg.Value = p.parseExpr(precNone)
 		obj.Fields = append(obj.Fields, arg)
 		p.match(token.Comma)
 	}
@@ -1338,11 +1486,24 @@ func (p *Parser) parseObjectConstruction(pos token.Position, typeName string) as
 	return obj
 }
 
+// expectIdentOrKeyword accepts an identifier or any keyword as a name.
+// Used in contexts like `use model { ... }` where keywords serve as module names.
+func (p *Parser) expectIdentOrKeyword() string {
+	tok := p.current()
+	if tok.Type == token.Ident || token.IsKeyword(tok.Type) {
+		p.advance()
+		return tok.Val
+	}
+	p.error("expected identifier, got %s", tok.Type)
+	p.advance()
+	return ""
+}
+
 func (p *Parser) isKeywordUsedAsIdent() bool {
 	// some keywords can be used as identifiers in certain contexts
 	// e.g., field names: find, create, update, delete, error, etc.
 	switch p.current().Type {
-	case token.Error, token.Stream, token.Through:
+	case token.Error, token.Stream:
 		return true
 	}
 	return false

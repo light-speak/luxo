@@ -70,16 +70,17 @@ const (
 	Api        // api
 	Error      // error
 	Middleware // middleware
+	Event      // event
 
 	// Keywords - Modifiers
 	Extend   // extend
 	Override // override
 	Use      // use
-	Through  // through
 	Stream   // stream
 
 	// Keywords - Logic
 	Val    // val
+	Var    // var
 	When   // when
 	If     // if
 	Else   // else
@@ -88,17 +89,17 @@ const (
 	Return // return
 	Break  // break
 	Is     // is
+	On     // on
+	My     // my
 
 	// Keywords - Concurrency
 	Async // async
 	Await // await
 	Yield // yield
 
-	// Keywords - Modules
-	Import // import
-
 	// Keywords - Operations
 	Throw // throw
+	Emit  // emit
 
 	// Keywords - Constants
 	True  // true
@@ -167,12 +168,13 @@ var tokenNames = map[Type]string{
 	Api:        "api",
 	Error:      "error",
 	Middleware: "middleware",
+	Event:      "event",
 	Extend:     "extend",
 	Override:   "override",
 	Use:        "use",
-	Through:    "through",
 	Stream:     "stream",
 	Val:        "val",
+	Var:        "var",
 	When:       "when",
 	If:         "if",
 	Else:       "else",
@@ -181,11 +183,13 @@ var tokenNames = map[Type]string{
 	Return:     "return",
 	Break:      "break",
 	Is:         "is",
+	On:         "on",
+	My:         "my",
 	Async:      "async",
 	Await:      "await",
 	Yield:      "yield",
-	Import:     "import",
 	Throw:      "throw",
+	Emit:       "emit",
 	True:       "true",
 	False:      "false",
 	Null:       "null",
@@ -208,12 +212,13 @@ var keywords = map[string]Type{
 	"api":        Api,
 	"error":      Error,
 	"middleware": Middleware,
+	"event":      Event,
 	"extend":     Extend,
 	"override":   Override,
 	"use":        Use,
-	"through":    Through,
 	"stream":     Stream,
 	"val":        Val,
+	"var":        Var,
 	"when":       When,
 	"if":         If,
 	"else":       Else,
@@ -222,11 +227,13 @@ var keywords = map[string]Type{
 	"return":     Return,
 	"break":      Break,
 	"is":         Is,
+	"on":         On,
+	"my":         My,
 	"async":      Async,
 	"await":      Await,
 	"yield":      Yield,
-	"import":     Import,
 	"throw":      Throw,
+	"emit":       Emit,
 	"true":       True,
 	"false":      False,
 	"null":       Null,

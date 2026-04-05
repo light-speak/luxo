@@ -55,6 +55,7 @@ type ServerCapabilities struct {
 	CompletionProvider *CompletionOpt `json:"completionProvider,omitempty"`
 	HoverProvider      bool           `json:"hoverProvider"`
 	DefinitionProvider bool           `json:"definitionProvider"`
+	ReferencesProvider bool           `json:"referencesProvider"`
 }
 
 type CompletionOpt struct {
@@ -149,6 +150,7 @@ type CompletionItem struct {
 	Detail        string `json:"detail,omitempty"`
 	Documentation string `json:"documentation,omitempty"`
 	InsertText    string `json:"insertText,omitempty"`
+	SortText      string `json:"sortText,omitempty"`
 }
 
 // ========== Hover ==========
@@ -171,6 +173,11 @@ type MarkupContent struct {
 // ========== Definition ==========
 
 type DefinitionParams struct {
+	TextDocument TextDocumentID `json:"textDocument"`
+	Position     Position       `json:"position"`
+}
+
+type ReferenceParams struct {
 	TextDocument TextDocumentID `json:"textDocument"`
 	Position     Position       `json:"position"`
 }

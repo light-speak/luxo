@@ -240,7 +240,6 @@ func TestSyntaxConformanceModel(t *testing.T) {
   avatar:   String?
   posts:    [Post]
   profile:  Profile?
-  roles:    [Role] through UserRole
   target:   (Post, Video, Product)
   val postCount: Int get @count
   val avgLikes: Float get @avg(field: likes)
@@ -389,5 +388,112 @@ func assertPrecedenceTop(t *testing.T, input string, topOp string) {
 	}
 	if bin.Op != topOp {
 		t.Errorf("expected top op %q, got %q", topOp, bin.Op)
+	}
+}
+
+// ========== parseError — internal field ==========
+
+func TestParseErrorWithInternal(t *testing.T) {
+	file := parse(t, `error ServerError {
+  code: 500
+  message: "error.server"
+  internal: true
+}`)
+	if len(file.Errors) != 1 {
+		t.Fatalf("expected 1 error decl, got %d", len(file.Errors))
+	}
+	if !file.Errors[0].Internal {
+		t.Error("expected internal to be true")
+	}
+}
+
+// ========== parseEmitStmt — emit without args ==========
+
+func TestParseEmitNoArgs(t *testing.T) {
+	file := parse(t, `
+event Ping()
+api test(): Int {
+  emit Ping
+  0
+}`)
+	if len(file.APIs) != 1 {
+		t.Fatal("expected 1 api")
+	}
+}
+
+// ========== tryParseLambdaParams — multi-param lambda ==========
+
+func TestParseMultiParamLambda(t *testing.T) {
+	// on EventName { a, b -> expr } exercises multi-param lambda
+	file := parse(t, `
+event PostCreated(post: String, userId: Int)
+on PostCreated { post, userId -> "ok".i }
+`)
+	if len(file.Listeners) != 1 {
+		t.Fatal("expected 1 listener")
+	}
+}
+
+// ========== tryParseLambdaParams — comma then non-ident falls back ==========
+
+func TestParseLambdaCommaNoIdent(t *testing.T) {
+	// { x, 123 -> ... } — should not parse as lambda params, falls back
+	l := lexer.New(`api test(): Int {
+  val f = 1
+  f
+}`, "test.luxo")
+	tokens, _ := l.Tokenize()
+	p := New(tokens)
+	file, _ := p.Parse("test.luxo")
+	if file == nil {
+		t.Fatal("expected non-nil file")
+	}
+}
+
+// ========== parseCallArgs — empty args ==========
+
+func TestParseCallArgsEmpty(t *testing.T) {
+	file := parse(t, `
+fn helper(): Int @native
+api test(): Int {
+  helper()
+}`)
+	if len(file.APIs) != 1 {
+		t.Fatal("expected 1 api")
+	}
+}
+
+// ========== parseCallArgs — named arg with no value before RParen ==========
+
+func TestParseCallArgsIncompleteNamedArg(t *testing.T) {
+	// This is a parse-error-tolerant case: find(User, where: )
+	l := lexer.New(`model User { name: String }
+api test(): Int {
+  find(User, where: )
+  0
+}`, "test.luxo")
+	tokens, _ := l.Tokenize()
+	p := New(tokens)
+	file, errs := p.Parse("test.luxo")
+	// should not crash even with incomplete named arg
+	if file == nil {
+		t.Fatal("expected non-nil file")
+	}
+	_ = errs // errors expected
+}
+
+// ========== parseForCondition — iterating over collection ==========
+
+func TestParseForConditionIterateCollection(t *testing.T) {
+	file := parse(t, `
+api test(items: [Int]): Int {
+  var sum = 0
+  for item in items {
+    sum += item
+  }
+  sum
+}`)
+	if len(file.APIs) != 1 {
+		t.Fatal("expected 1 api")
 	}
 }

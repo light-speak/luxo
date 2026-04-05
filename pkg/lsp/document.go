@@ -243,6 +243,164 @@ func (d *Document) PrevChar(pos Position) byte {
 	return 0
 }
 
+// IsNamedArgLabel checks if the word at pos is a named argument label (followed by ':').
+func (d *Document) IsNamedArgLabel(pos Position) bool {
+	lines := strings.Split(d.Content, "\n")
+	if pos.Line >= len(lines) {
+		return false
+	}
+	line := lines[pos.Line]
+	// find end of word
+	end := pos.Character
+	for end < len(line) && isIdentChar(line[end]) {
+		end++
+	}
+	// skip whitespace after word
+	for end < len(line) && line[end] == ' ' {
+		end++
+	}
+	return end < len(line) && line[end] == ':'
+}
+
+// FindEnclosingCall returns the function name and model name of a CRUD call enclosing pos.
+// Supports multi-line calls by scanning backward across lines.
+func (d *Document) FindEnclosingCall(pos Position) (funcName string, modelName string) {
+	lines := strings.Split(d.Content, "\n")
+	if pos.Line >= len(lines) {
+		return "", ""
+	}
+
+	// build a flat string from start of file to cursor, tracking line positions
+	parenDepth := 0
+	lineIdx := pos.Line
+	col := pos.Character
+	if col >= len(lines[lineIdx]) {
+		col = len(lines[lineIdx]) - 1
+	}
+
+	for lineIdx >= 0 {
+		line := lines[lineIdx]
+		start := 0
+		end := len(line) - 1
+		if lineIdx == pos.Line {
+			end = col
+		}
+		for i := end; i >= start; i-- {
+			ch := line[i]
+			if ch == ')' {
+				parenDepth++
+			} else if ch == '(' {
+				if parenDepth == 0 {
+					return d.extractCallInfo(lines, lineIdx, i)
+				}
+				parenDepth--
+			}
+		}
+		lineIdx--
+	}
+	return "", ""
+}
+
+// extractCallInfo extracts function name before '(' and first arg after '('.
+func (d *Document) extractCallInfo(lines []string, lineIdx, parenCol int) (string, string) {
+	line := lines[lineIdx]
+	// function name before '('
+	end := parenCol
+	start := end - 1
+	for start >= 0 && isIdentChar(line[start]) {
+		start--
+	}
+	start++
+	var funcName string
+	if start < end {
+		funcName = line[start:end]
+	}
+	// first arg after '(' — may be on same line or next
+	argStr := line[parenCol+1:]
+	argStr = strings.TrimLeft(argStr, " \t")
+	if argStr == "" && lineIdx+1 < len(lines) {
+		argStr = strings.TrimLeft(lines[lineIdx+1], " \t")
+	}
+	var modelName string
+	for i := 0; i < len(argStr) && isIdentChar(argStr[i]); i++ {
+		modelName = argStr[:i+1]
+	}
+	return funcName, modelName
+}
+
+// IsAfterAt checks if the word at pos is preceded by '@' (directive context).
+func (d *Document) IsAfterAt(pos Position) bool {
+	lines := strings.Split(d.Content, "\n")
+	if pos.Line >= len(lines) {
+		return false
+	}
+	line := lines[pos.Line]
+	start := pos.Character
+	for start > 0 && isIdentChar(line[start-1]) {
+		start--
+	}
+	return start > 0 && line[start-1] == '@'
+}
+
+// IsAfterDot checks if the word at pos is preceded by a dot (member access context).
+func (d *Document) IsAfterDot(pos Position) bool {
+	lines := strings.Split(d.Content, "\n")
+	if pos.Line >= len(lines) {
+		return false
+	}
+	line := lines[pos.Line]
+	start := pos.Character
+	for start > 0 && isIdentChar(line[start-1]) {
+		start--
+	}
+	return start > 0 && line[start-1] == '.'
+}
+
+// IsAfterItDot checks if the word at pos is preceded by "it." (model field access).
+func (d *Document) IsAfterItDot(pos Position) bool {
+	lines := strings.Split(d.Content, "\n")
+	if pos.Line >= len(lines) {
+		return false
+	}
+	line := lines[pos.Line]
+	// find start of current word
+	start := pos.Character
+	for start > 0 && isIdentChar(line[start-1]) {
+		start--
+	}
+	// check if preceded by "it."
+	if start >= 3 && line[start-3:start] == "it." {
+		return true
+	}
+	return false
+}
+
+// ObjectBeforeDot returns the identifier name before the dot at the given position.
+func (d *Document) ObjectBeforeDot(pos Position) string {
+	lines := strings.Split(d.Content, "\n")
+	if pos.Line >= len(lines) {
+		return ""
+	}
+	line := lines[pos.Line]
+	start := pos.Character
+	for start > 0 && isIdentChar(line[start-1]) {
+		start--
+	}
+	if start < 2 || line[start-1] != '.' {
+		return ""
+	}
+	objEnd := start - 1
+	objStart := objEnd - 1
+	for objStart >= 0 && isIdentChar(line[objStart]) {
+		objStart--
+	}
+	objStart++
+	if objStart >= objEnd {
+		return ""
+	}
+	return line[objStart:objEnd]
+}
+
 func isIdentChar(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
 }

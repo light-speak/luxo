@@ -79,6 +79,8 @@ func (s *Server) handleMessage(req *Request) error {
 		return s.handleHover(req)
 	case "textDocument/definition":
 		return s.handleDefinition(req)
+	case "textDocument/references":
+		return s.handleReferences(req)
 	default:
 		if req.ID != nil {
 			return s.transport.SendError(req.ID, -32601, "method not found: "+req.Method)
@@ -98,6 +100,7 @@ func (s *Server) handleInitialize(req *Request) error {
 			},
 			HoverProvider:      true,
 			DefinitionProvider: true,
+			ReferencesProvider: true,
 		},
 		ServerInfo: ServerInfo{
 			Name:    "luxo-lsp",
@@ -212,6 +215,9 @@ func (s *Server) getCompletions(doc *Document, pos Position) []CompletionItem {
 	// built-in type completions
 	items = append(items, getBuiltinTypeCompletions(prefix)...)
 
+	// CRUD context completions (find/create/update/delete params + model fields)
+	items = append(items, s.getCRUDCompletions(doc, pos)...)
+
 	// local variable/parameter completions
 	items = append(items, getLocalCompletions(doc, pos)...)
 
@@ -248,6 +254,11 @@ func (s *Server) getMemberCompletions(doc *Document, pos Position) []CompletionI
 	}
 	objName := line[start:end]
 
+	// stdlib module methods: time., http., json., crypto., math., log., request.
+	if methods := getStdlibModuleMethods(objName); len(methods) > 0 {
+		return methods
+	}
+
 	// look up the type
 	if typ, ok := doc.Result.Types[objName]; ok {
 		return s.getTypeMemberCompletions(typ, objName)
@@ -256,8 +267,9 @@ func (s *Server) getMemberCompletions(doc *Document, pos Position) []CompletionI
 	// variable member access: look up variable type
 	items = append(items, s.getVariableMemberCompletions(doc, objName)...)
 
-	// collection methods
+	// collection methods + string properties + DateTime methods
 	items = append(items, getCollectionMethodCompletions()...)
+	items = append(items, getDateTimeMethods()...)
 
 	return items
 }
@@ -269,9 +281,10 @@ func (s *Server) getTypeMemberCompletions(typ *semantic.ResolvedType, objName st
 	if typ.Kind == semantic.TypeEnum {
 		for _, v := range typ.EnumValues {
 			items = append(items, CompletionItem{
-				Label:  v,
-				Kind:   20, // EnumMember
-				Detail: objName + "." + v,
+				Label:    v,
+				Kind:     20, // EnumMember
+				Detail:   objName + "." + v,
+				SortText: "a_" + v,
 			})
 		}
 	}
@@ -282,9 +295,10 @@ func (s *Server) getTypeMemberCompletions(typ *semantic.ResolvedType, objName st
 			detail += "?"
 		}
 		items = append(items, CompletionItem{
-			Label:  name,
-			Kind:   5, // Field
-			Detail: detail,
+			Label:    name,
+			Kind:     5, // Field
+			Detail:   detail,
+			SortText: "a_" + name,
 		})
 	}
 	// inherited fields
@@ -292,9 +306,10 @@ func (s *Server) getTypeMemberCompletions(typ *semantic.ResolvedType, objName st
 		for name, field := range parent.Fields {
 			detail := field.Type.Name + " (from " + parent.Name + ")"
 			items = append(items, CompletionItem{
-				Label:  name,
-				Kind:   5,
-				Detail: detail,
+				Label:    name,
+				Kind:     5,
+				Detail:   detail,
+				SortText: "b_" + name,
 			})
 		}
 	}
@@ -311,9 +326,10 @@ func (s *Server) getVariableMemberCompletions(doc *Document, objName string) []C
 				detail = field.Type.Name
 			}
 			items = append(items, CompletionItem{
-				Label:  name,
-				Kind:   5,
-				Detail: detail,
+				Label:    name,
+				Kind:     5,
+				Detail:   detail,
+				SortText: "a_" + name,
 			})
 		}
 		return items
@@ -345,23 +361,146 @@ func getCollectionMethodCompletions() []CompletionItem {
 		name   string
 		detail string
 	}{
-		{"filter", "filter { condition }"},
-		{"map", "map { transform }"},
-		{"sumOf", "sumOf { expr }"},
-		{"count", "count { condition }"},
-		{"any", "any { condition }"},
-		{"firstOrNull", "firstOrNull { condition }"},
-		{"sortBy", "sortBy { field }"},
-		{"groupBy", "groupBy { field }"},
-		{"forEach", "forEach { action }"},
-		{"size", "collection size"},
-		{"length", "string length"},
-		{"contains", "contains(value)"},
-		{"lowercase", "to lowercase"},
-		{"uppercase", "to uppercase"},
+		// collection methods
+		{"filter", "filter { condition } — 过滤"},
+		{"map", "map { transform } — 转换"},
+		{"sumOf", "sumOf { expr } — 求和"},
+		{"count", "count { condition } — 计数"},
+		{"any", "any { condition } — 任一匹配"},
+		{"all", "all { condition } — 全部匹配"},
+		{"firstOrNull", "firstOrNull { condition } — 第一个匹配"},
+		{"sortBy", "sortBy { field } — 排序"},
+		{"groupBy", "groupBy { field } — 分组"},
+		{"forEach", "forEach { action } — 遍历"},
+		{"joinToString", "joinToString(separator) — 连接为字符串"},
+		{"first", "first — 第一个元素"},
+		{"last", "last — 最后一个元素"},
+		{"distinct", "distinct — 去重"},
+		{"flatten", "flatten — 展平嵌套集合"},
+		{"take", "take(n) — 取前 N 个"},
+		{"drop", "drop(n) — 跳过前 N 个"},
+		{"reversed", "reversed — 反转"},
+		{"size", "size — 集合大小"},
+		{"isEmpty", "isEmpty — 是否为空"},
+		{"let", "let { transform } — 作用域函数"},
+		// string methods
+		{"length", "length — 字符串长度"},
+		{"contains", "contains(value) — 包含"},
+		{"startsWith", "startsWith(prefix) — 以…开头"},
+		{"endsWith", "endsWith(suffix) — 以…结尾"},
+		{"lowercase", "lowercase — 转小写"},
+		{"uppercase", "uppercase — 转大写"},
+		{"trim", "trim — 去首尾空白"},
+		{"trimStart", "trimStart — 去首空白"},
+		{"trimEnd", "trimEnd — 去尾空白"},
+		{"split", "split(separator) — 拆分"},
+		{"replace", "replace(old, new) — 替换"},
+		{"replaceAll", "replaceAll(old, new) — 全部替换"},
+		{"substring", "substring(start, end) — 截取"},
+		{"repeat", "repeat(n) — 重复 N 次"},
+		{"padStart", "padStart(length, char) — 左填充"},
+		{"padEnd", "padEnd(length, char) — 右填充"},
+		{"matches", "matches(regex) — 正则匹配"},
+		{"toInt", "toInt — 转为整数"},
+		{"toFloat", "toFloat — 转为浮点数"},
+		// debug chain methods
+		{"d", "d — debug log / 调试日志"},
+		{"i", "i — info log / 信息日志"},
+		{"w", "w — warn log / 警告日志"},
+		{"e", "e — error log / 错误日志"},
 	}
 	items := make([]CompletionItem, 0, len(collectionMethods))
 	for _, m := range collectionMethods {
+		items = append(items, CompletionItem{
+			Label:    m.name,
+			Kind:     2, // Method
+			Detail:   m.detail,
+			SortText: "z_" + m.name,
+		})
+	}
+	return items
+}
+
+func getStdlibModuleMethods(module string) []CompletionItem {
+	methods := map[string][]struct{ name, detail string }{
+		"time": {
+			{"now", "now(): DateTime — current time / 当前时间"},
+			{"parse", "parse(str, layout): DateTime — parse time string / 解析时间字符串"},
+			{"since", "since(t): Duration — duration since t / 距 t 的时间"},
+			{"until", "until(t): Duration — duration until t / 到 t 的时间"},
+		},
+		"http": {
+			{"get", "get(url): Response — HTTP GET request / HTTP GET 请求"},
+			{"post", "post(url, body): Response — HTTP POST request / HTTP POST 请求"},
+			{"put", "put(url, body): Response — HTTP PUT request / HTTP PUT 请求"},
+			{"delete", "delete(url): Response — HTTP DELETE request / HTTP DELETE 请求"},
+			{"patch", "patch(url, body): Response — HTTP PATCH request / HTTP PATCH 请求"},
+		},
+		"json": {
+			{"parse", "parse(str): Json — parse JSON string / 解析 JSON 字符串"},
+			{"stringify", "stringify(value): String — convert to JSON string / 转为 JSON 字符串"},
+		},
+		"crypto": {
+			{"randomToken", "randomToken(length): String — generate random token / 生成随机令牌"},
+			{"hash", "hash(value): String — hash value (bcrypt) / 哈希值"},
+			{"verify", "verify(plain, hashed): Boolean — verify hash / 验证哈希"},
+			{"encrypt", "encrypt(data, key): String — encrypt data / 加密数据"},
+			{"decrypt", "decrypt(data, key): String — decrypt data / 解密数据"},
+			{"uuid", "uuid(): String — generate UUID / 生成 UUID"},
+		},
+		"math": {
+			{"abs", "abs(x): Number — absolute value / 绝对值"},
+			{"max", "max(a, b): Number — maximum / 最大值"},
+			{"min", "min(a, b): Number — minimum / 最小值"},
+			{"ceil", "ceil(x): Int — round up / 向上取整"},
+			{"floor", "floor(x): Int — round down / 向下取整"},
+			{"round", "round(x): Int — round to nearest / 四舍五入"},
+			{"random", "random(): Float — random 0.0~1.0 / 随机数"},
+			{"pow", "pow(base, exp): Float — power / 幂运算"},
+			{"sqrt", "sqrt(x): Float — square root / 平方根"},
+		},
+		"request": {
+			{"ip", "ip: String — client IP address / 客户端 IP"},
+			{"method", "method: String — HTTP method / HTTP 方法"},
+			{"path", "path: String — request path / 请求路径"},
+			{"header", "header(name): String — get header value / 获取请求头"},
+			{"query", "query(name): String — get query param / 获取查询参数"},
+			{"body", "body: String — request body / 请求体"},
+		},
+	}
+
+	defs, ok := methods[module]
+	if !ok {
+		return nil
+	}
+	items := make([]CompletionItem, 0, len(defs))
+	for _, m := range defs {
+		items = append(items, CompletionItem{
+			Label:  m.name,
+			Kind:   3, // Function
+			Detail: m.detail,
+		})
+	}
+	return items
+}
+
+func getDateTimeMethods() []CompletionItem {
+	methods := []struct{ name, detail string }{
+		{"format", "format(layout): String — format as string / 格式化为字符串"},
+		{"add", "add(duration): DateTime — add duration / 加时间段"},
+		{"sub", "sub(duration): DateTime — subtract duration / 减时间段"},
+		{"before", "before(other): Boolean — is before other / 是否早于"},
+		{"after", "after(other): Boolean — is after other / 是否晚于"},
+		{"year", "year: Int — year component / 年"},
+		{"month", "month: Int — month component / 月"},
+		{"day", "day: Int — day component / 日"},
+		{"hour", "hour: Int — hour component / 时"},
+		{"minute", "minute: Int — minute component / 分"},
+		{"second", "second: Int — second component / 秒"},
+		{"unix", "unix: Int — unix timestamp / Unix 时间戳"},
+	}
+	items := make([]CompletionItem, 0, len(methods))
+	for _, m := range methods {
 		items = append(items, CompletionItem{
 			Label:  m.name,
 			Kind:   2, // Method
@@ -446,6 +585,18 @@ func getDirectiveCompletions() []CompletionItem {
 		{"pattern", "regex validation"}, {"minLength", "minimum length"},
 		{"maxLength", "maximum length"}, {"range", "numeric range"},
 		{"notBlank", "not blank"}, {"webhook", "webhook endpoint"},
+		// database type annotations
+		{"length", "string length limit"}, {"serial", "auto-increment"},
+		{"bigint", "big integer"}, {"smallint", "small integer"},
+		{"decimal", "high precision float"}, {"uuid", "UUID type"},
+		{"inet", "IP address type"}, {"point", "geographic coordinate"},
+		{"date", "date only"}, {"time", "time only"},
+		{"vector", "vector type (pgvector)"}, {"brin", "BRIN index"},
+		// model annotations
+		{"soft", "soft delete"}, {"noTime", "disable auto timestamps"},
+		{"encrypt", "salted encryption at rest"},
+		// api annotations
+		{"global", "global middleware"}, {"broadcast", "broadcast event"},
 	}
 
 	items := make([]CompletionItem, 0, len(directives))
@@ -473,9 +624,10 @@ func getKeywordCompletions(prefix string) []CompletionItem {
 		{"error", "error declaration", "error ${1:Name} {\n\tcode: ${2:400}\n\tmessage: error.${3:name}\n}"},
 		{"extend", "extend type", "extend ${1:Type} {\n\t$0\n}"},
 		{"middleware", "middleware", "middleware ${1:name} {\n\t$0\n}"},
-		{"val", "variable", "val ${1:name} = $0"},
+		{"val", "immutable variable", "val ${1:name} = $0"},
+		{"var", "mutable variable", "var ${1:name} = $0"},
 		{"when", "when expression", "when {\n\t$0\n}"},
-		{"if", "if statement", "if ${1:condition} {\n\t$0\n}"},
+		{"if", "if guard (no else, use when)", "if ${1:condition} {\n\t$0\n}"},
 		{"for", "for loop", "for ${1:item} in ${2:collection} {\n\t$0\n}"},
 		{"return", "return", "return $0"},
 		{"throw", "throw error", "throw error.$0"},
@@ -483,12 +635,18 @@ func getKeywordCompletions(prefix string) []CompletionItem {
 		{"yield", "exit loop with value", "yield $0"},
 		{"async", "launch coroutine", "async {\n\t$0\n}"},
 		{"await", "concurrent wait", "await {\n\t$0\n}"},
-		{"import", "import stdlib", "import $0"},
-		{"use", "import module", "use ${1:module}.{ $0 }"},
+		{"use", "use stdlib or module", "use $0"},
 		{"override", "override api", "override api $0"},
 		{"true", "boolean true", ""},
 		{"false", "boolean false", ""},
 		{"null", "null value", ""},
+		{"else", "else branch", ""},
+		{"in", "membership / range", ""},
+		{"is", "type check", ""},
+		{"stream", "WebSocket stream", "stream $0"},
+		{"event", "event declaration", "event ${1:Name}(${2:params}) "},
+		{"on", "event listener", "on ${1:EventName} {\n\t$0\n}"},
+		{"my", "current user", ""},
 	}
 
 	var items []CompletionItem
@@ -519,7 +677,6 @@ func getBuiltinFunctionCompletions(prefix string) []CompletionItem {
 		{"delete", "delete record", "delete(${1:record})"},
 		{"emit", "emit event", "emit(\"$1\", $0)"},
 		{"transaction", "transaction block", "transaction {\n\t$0\n}"},
-		{"log", "log output", "log($0)"},
 		{"cache", "cache operation", "cache($0)"},
 		{"storage", "storage operation", "storage($0)"},
 		{"mail", "send mail", "mail($0)"},
@@ -545,7 +702,7 @@ func getBuiltinFunctionCompletions(prefix string) []CompletionItem {
 }
 
 func getBuiltinTypeCompletions(prefix string) []CompletionItem {
-	types := []string{"String", "Int", "Float", "Boolean", "DateTime", "Duration", "Json", "File"}
+	types := []string{"String", "Int", "Float", "Boolean", "DateTime", "Duration", "Json", "File", "Void", "Result", "Channel"}
 	var items []CompletionItem
 	for _, t := range types {
 		if prefix == "" || strings.HasPrefix(strings.ToLower(t), prefix) {
@@ -632,10 +789,14 @@ func collectValsFromBlock(block *ast.Block, pos Position) []CompletionItem {
 			break
 		}
 		if vs, ok := stmt.(*ast.ValStmt); ok {
+			detail := "val"
+			if vs.Mutable {
+				detail = "var"
+			}
 			items = append(items, CompletionItem{
 				Label:  vs.Name,
 				Kind:   6,
-				Detail: "val",
+				Detail: detail,
 			})
 		}
 		if fs, ok := stmt.(*ast.ForStmt); ok {
@@ -690,8 +851,19 @@ func getLocalHover(doc *Document, word string, pos Position) string {
 	if doc.File == nil {
 		return ""
 	}
-	// check api params
-	for _, api := range doc.File.APIs {
+	if !doc.IsAfterItDot(pos) {
+		if hover := getParamHover(doc.File, word, pos); hover != "" {
+			return hover
+		}
+	}
+	if hover := getValVarHover(doc.File, word, pos); hover != "" {
+		return hover
+	}
+	return getFieldHover(doc.File, word)
+}
+
+func getParamHover(file *ast.File, word string, pos Position) string {
+	for _, api := range file.APIs {
 		if pos.Line < api.Pos.Line-1 {
 			continue
 		}
@@ -701,8 +873,7 @@ func getLocalHover(doc *Document, word string, pos Position) string {
 			}
 		}
 	}
-	// check fn params
-	for _, fn := range doc.File.Functions {
+	for _, fn := range file.Functions {
 		if pos.Line < fn.Pos.Line-1 {
 			continue
 		}
@@ -712,11 +883,61 @@ func getLocalHover(doc *Document, word string, pos Position) string {
 			}
 		}
 	}
-	// check model fields — show doc comment + type
-	for _, m := range doc.File.Models {
+	return ""
+}
+
+func getValVarHover(file *ast.File, word string, pos Position) string {
+	for _, api := range file.APIs {
+		if api.Body != nil {
+			if hover := findValHover(api.Body, word, pos); hover != "" {
+				return hover
+			}
+		}
+	}
+	for _, fn := range file.Functions {
+		if fn.Body != nil {
+			if hover := findValHover(fn.Body, word, pos); hover != "" {
+				return hover
+			}
+		}
+	}
+	return ""
+}
+
+func getFieldHover(file *ast.File, word string) string {
+	for _, m := range file.Models {
 		for _, f := range m.Fields {
 			if f.Name == word {
 				return formatFieldHover(m.Name, f)
+			}
+		}
+	}
+	for _, t := range file.Types {
+		for _, f := range t.Fields {
+			if f.Name == word {
+				return formatFieldHover(t.Name, f)
+			}
+		}
+	}
+	return ""
+}
+
+func findValHover(block *ast.Block, word string, pos Position) string {
+	for _, stmt := range block.Stmts {
+		if stmt.GetPos().Line-1 > pos.Line {
+			break
+		}
+		if vs, ok := stmt.(*ast.ValStmt); ok {
+			if vs.Name == word {
+				kind := "val"
+				if vs.Mutable {
+					kind = "var"
+				}
+				typeStr := ""
+				if vs.Type != nil {
+					typeStr = ": " + typeRefToString(vs.Type)
+				}
+				return "```luxo\n" + kind + " " + vs.Name + typeStr + "\n```"
 			}
 		}
 	}
@@ -758,44 +979,60 @@ func (s *Server) handleHover(req *Request) error {
 		return s.transport.SendResponse(req.ID, nil)
 	}
 
+	hover := s.resolveHover(doc, word, params.Position)
+	if hover == "" {
+		return s.transport.SendResponse(req.ID, nil)
+	}
+	return s.transport.SendResponse(req.ID, Hover{
+		Contents: MarkupContent{Kind: "markdown", Value: hover},
+	})
+}
+
+// resolveHover returns a hover string for the word at the given position, or "" if none.
+func (s *Server) resolveHover(doc *Document, word string, pos Position) string {
+	// directive hover
+	if doc.PrevChar(pos) == '@' || doc.IsAfterAt(pos) {
+		if desc := directiveDescription(word); desc != "" {
+			return desc
+		}
+	}
+
+	// built-in type hover with Go + PG info
+	if desc := builtinTypeDescription(word); desc != "" {
+		return desc
+	}
+
 	// type hover
 	if typ, ok := doc.Result.Types[word]; ok {
-		return s.transport.SendResponse(req.ID, Hover{
-			Contents: MarkupContent{Kind: "markdown", Value: formatTypeHover(word, typ)},
-		})
+		return formatTypeHover(word, typ)
 	}
 
 	// symbol hover
 	if sym := doc.Result.Scope.Lookup(word); sym != nil {
-		return s.transport.SendResponse(req.ID, Hover{
-			Contents: MarkupContent{Kind: "markdown", Value: formatSymbolHover(sym)},
-		})
+		return formatSymbolHover(sym)
 	}
 
 	// local parameter/variable hover
 	if doc.File != nil {
-		if hover := getLocalHover(doc, word, params.Position); hover != "" {
-			return s.transport.SendResponse(req.ID, Hover{
-				Contents: MarkupContent{Kind: "markdown", Value: hover},
-			})
+		if hover := getLocalHover(doc, word, pos); hover != "" {
+			return hover
+		}
+	}
+
+	// collection method / string property hover
+	if doc.PrevChar(pos) == '.' || doc.IsAfterDot(pos) {
+		if desc := memberMethodDescription(word); desc != "" {
+			return desc
 		}
 	}
 
 	// built-in function hover
 	if desc := builtinFunctionDescription(word); desc != "" {
-		return s.transport.SendResponse(req.ID, Hover{
-			Contents: MarkupContent{Kind: "markdown", Value: desc},
-		})
+		return desc
 	}
 
 	// keyword hover
-	if desc := keywordDescription(word); desc != "" {
-		return s.transport.SendResponse(req.ID, Hover{
-			Contents: MarkupContent{Kind: "markdown", Value: desc},
-		})
-	}
-
-	return s.transport.SendResponse(req.ID, nil)
+	return keywordDescription(word)
 }
 
 func formatTypeHover(name string, typ *semantic.ResolvedType) string {
@@ -896,9 +1133,10 @@ func keywordDescription(word string) string {
 		"api":       "`api` — Define an API endpoint\n\n定义 API 接口",
 		"fn":        "`fn` — Define a function\n\n定义函数",
 		"val":       "`val` — Declare an immutable variable\n\n定义不可变变量",
+		"var":       "`var` — Declare a mutable variable\n\n定义可变变量",
 		"when":      "`when` — Pattern matching expression\n\n模式匹配表达式",
-		"if":        "`if` — Conditional statement\n\n条件判断语句",
-		"else":      "`else` — Else branch of if statement\n\nif 语句的 else 分支",
+		"if":        "`if` — Single-branch guard (no else, use `when` for multi-branch)\n\n单分支守卫（无 else，多分支用 `when`）",
+		"else":      "`else` — Default branch in `when` expression\n\n`when` 表达式的默认分支",
 		"for":       "`for` — Loop over a collection\n\n遍历集合",
 		"in":        "`in` — Used in for loops and range checks\n\n用于 for 循环和范围检查",
 		"return":    "`return` — Early return from function (last expression is implicit return)\n\n提前返回（最后一行表达式自动返回）",
@@ -907,18 +1145,105 @@ func keywordDescription(word string) string {
 		"yield":     "`yield` — Exit loop and return a value (for as expression)\n\n退出循环并返回值（for 作为表达式）",
 		"async":     "`async` — Launch a coroutine (fire and forget)\n\n启动协程（不等待结果）",
 		"await":     "`await` — Run multiple operations concurrently and wait for all\n\n并发执行多个操作并等待全部完成",
-		"import":    "`import` — Import a standard library module\n\n导入标准库模块",
 		"extend":    "`extend` — Extend a type across modules (gateway aggregation)\n\n跨模块扩展类型（网关聚合）",
-		"use":       "`use` — Import from a shared module\n\n从共享模块导入",
+		"use":       "`use` — Import a stdlib module (`use http`) or shared module (`use common.{ Base }`)\n\n导入标准库模块或共享模块",
 		"override":  "`override` — Override an auto-generated API implementation\n\n覆盖自动生成的 API 实现",
 		"stream":    "`stream` — Server push via WebSocket\n\n通过 WebSocket 流式推送",
-		"through":   "`through` — Many-to-many with explicit join table\n\n多对多显式中间表",
 		"is":        "`is` — Type check in `when` branches\n\n`when` 分支中的类型匹配",
+		"event":     "`event` — Define a typed event\n\n定义类型化事件",
+		"on":        "`on` — Subscribe to an event\n\n订阅事件",
+		"my":        "`my` — Current authenticated user (my.id is always available, my.load() for full data)\n\n当前认证用户（my.id 零开销，my.load() 懒加载）",
 		"null":      "`null` — Null value\n\n空值",
 		"true":      "`true` — Boolean true\n\n布尔真",
 		"false":     "`false` — Boolean false\n\n布尔假",
 	}
 	return descriptions[word]
+}
+
+func memberMethodDescription(word string) string {
+	descriptions := map[string]string{
+		// collection methods
+		"size":         "`size` — Number of elements in collection\n\n集合元素数量",
+		"filter":       "`filter { condition }` — Filter elements by condition\n\n按条件过滤元素",
+		"map":          "`map { transform }` — Transform each element\n\n转换每个元素",
+		"sumOf":        "`sumOf { expr }` — Sum of expression values\n\n表达式值的总和",
+		"any":          "`any { condition }` — True if any element matches\n\n任意元素匹配则为 true",
+		"count":        "`count { condition }` — Count matching elements\n\n计算匹配元素数量",
+		"firstOrNull":  "`firstOrNull { condition }` — First matching element or null\n\n第一个匹配元素，无则 null",
+		"sortBy":       "`sortBy { field }` — Sort by field\n\n按字段排序",
+		"groupBy":      "`groupBy { field }` — Group by field\n\n按字段分组",
+		"forEach":      "`forEach { action }` — Execute action for each element\n\n对每个元素执行操作",
+		"joinToString": "`joinToString(separator)` — Join elements as string\n\n将元素连接为字符串",
+		"first":        "`first` — First element\n\n第一个元素",
+		"last":         "`last` — Last element\n\n最后一个元素",
+		"distinct":     "`distinct` — Remove duplicates\n\n去重",
+		// string properties
+		"length":     "`length` — String length\n\n字符串长度",
+		"isEmpty":    "`isEmpty` — True if string is empty\n\n字符串是否为空",
+		"trim":       "`trim` — Remove leading/trailing whitespace\n\n去除首尾空白",
+		"lowercase":  "`lowercase` — Convert to lowercase\n\n转为小写",
+		"uppercase":  "`uppercase` — Convert to uppercase\n\n转为大写",
+		"contains":   "`contains(substring)` — Check if contains substring\n\n是否包含子串",
+		"startsWith": "`startsWith(prefix)` — Check if starts with prefix\n\n是否以前缀开头",
+		"endsWith":   "`endsWith(suffix)` — Check if ends with suffix\n\n是否以后缀结尾",
+		"split":      "`split(separator)` — Split string by separator\n\n按分隔符拆分",
+		"replace":    "`replace(old, new)` — Replace occurrences\n\n替换子串",
+		"substring":  "`substring(start, end)` — Extract substring\n\n截取子串",
+		"let":        "`let { transform }` — Scope function, transform value\n\n作用域函数，转换值",
+		// missing string methods
+		"trimStart":  "`trimStart` — Remove leading whitespace\n\n去除首部空白",
+		"trimEnd":    "`trimEnd` — Remove trailing whitespace\n\n去除尾部空白",
+		"replaceAll": "`replaceAll(old, new)` — Replace all occurrences\n\n替换所有匹配",
+		"matches":    "`matches(regex)` — Test regex match\n\n正则匹配",
+		"repeat":     "`repeat(n)` — Repeat string N times\n\n重复 N 次",
+		"padStart":   "`padStart(length, char)` — Pad start to length\n\n左填充到指定长度",
+		"padEnd":     "`padEnd(length, char)` — Pad end to length\n\n右填充到指定长度",
+		"toInt":      "`toInt` — Convert to Int\n\n转为整数",
+		"toFloat":    "`toFloat` — Convert to Float\n\n转为浮点数",
+		"reversed":   "`reversed` — Reverse string or collection\n\n反转",
+		// missing collection methods
+		"all":     "`all { condition }` — True if all elements match\n\n所有元素匹配则为 true",
+		"flatten": "`flatten` — Flatten nested collection\n\n展平嵌套集合",
+		"take":    "`take(n)` — Take first N elements\n\n取前 N 个元素",
+		"drop":    "`drop(n)` — Drop first N elements\n\n跳过前 N 个元素",
+		// DateTime methods
+		"format": "`format(layout)` — Format DateTime as string\n\n格式化时间为字符串",
+		"add":    "`add(duration)` — Add duration to DateTime\n\n加时间段",
+		"sub":    "`sub(duration)` — Subtract duration from DateTime\n\n减时间段",
+		"before": "`before(other)` — Is before other DateTime\n\n是否早于",
+		"after":  "`after(other)` — Is after other DateTime\n\n是否晚于",
+		"year":   "`year` — Year component\n\n年",
+		"month":  "`month` — Month component\n\n月",
+		"day":    "`day` — Day component\n\n日",
+		"hour":   "`hour` — Hour component\n\n时",
+		"minute": "`minute` — Minute component\n\n分",
+		"second": "`second` — Second component\n\n秒",
+		"unix":   "`unix` — Unix timestamp\n\nUnix 时间戳",
+		// stdlib module methods (also accessible as hover on now/parse/etc)
+		"now":         "`time.now()` — Current time\n\n当前时间",
+		"parse":       "`parse(...)` — Parse from string\n\n解析字符串",
+		"stringify":   "`json.stringify(value)` — Convert to JSON string\n\n转为 JSON 字符串",
+		"get":         "`http.get(url)` — HTTP GET request\n\nHTTP GET 请求",
+		"post":        "`http.post(url, body)` — HTTP POST request\n\nHTTP POST 请求",
+		"randomToken": "`crypto.randomToken(length)` — Generate random token\n\n生成随机令牌",
+		"hash":        "`crypto.hash(value)` — Hash value\n\n哈希值",
+		"uuid":        "`crypto.uuid()` — Generate UUID\n\n生成 UUID",
+		"ip":          "`request.ip` — Client IP address\n\n客户端 IP",
+		"method":      "`request.method` — HTTP method\n\nHTTP 方法",
+		"path":        "`request.path` — Request path\n\n请求路径",
+		"header":      "`request.header(name)` — Get header value\n\n获取请求头",
+		"query":       "`request.query(name)` — Get query parameter\n\n获取查询参数",
+		"body":        "`request.body` — Request body\n\n请求体",
+		// debug chain methods
+		"d": "`.d` — Debug log, returns self for chaining\n\n调试日志，返回自身用于链式调用",
+		"i": "`.i` — Info log, returns self for chaining\n\n信息日志，返回自身用于链式调用",
+		"w": "`.w` — Warn log, returns self for chaining\n\n警告日志，返回自身用于链式调用",
+		"e": "`.e` — Error log, returns self for chaining\n\n错误日志，返回自身用于链式调用",
+	}
+	if desc, ok := descriptions[word]; ok {
+		return desc
+	}
+	return ""
 }
 
 func builtinFunctionDescription(word string) string {
@@ -928,8 +1253,7 @@ func builtinFunctionDescription(word string) string {
 		"update":      "`update(record, ...)` — Update a database record\n\n更新数据库记录",
 		"delete":      "`delete(record)` — Delete a database record\n\n删除数据库记录",
 		"transaction": "`transaction { ... }` — Database transaction, all-or-nothing\n\n数据库事务，全成功或全回滚",
-		"emit":        "`emit(event, ...)` — Send async event (message queue + WebSocket)\n\n发送异步事件（消息队列 + WebSocket）",
-		"log":         "`log(...)` — Log output\n\n日志输出",
+		"emit":        "`emit EventName(args)` — Send typed event (async). Inside transaction: delayed until commit, discarded on rollback\n\n发送类型化事件（异步）。事务内：延迟到提交后发送，回滚时丢弃",
 		"cache":       "`cache(...)` — Cache operation\n\n缓存操作",
 		"storage":     "`storage(...)` — Storage operation\n\n存储操作",
 		"mail":        "`mail(...)` — Send mail\n\n发送邮件",
@@ -943,6 +1267,104 @@ func builtinFunctionDescription(word string) string {
 		"request":     "`request.ip` / `request.header(name)` — Current HTTP request context\n\n当前 HTTP 请求上下文",
 	}
 	return descriptions[word]
+}
+
+func directiveDescription(name string) string {
+	descriptions := map[string]string{
+		// database type annotations
+		"length":   "`@length(n)` — PG: varchar(n), Go: string\n\n限制字符串长度",
+		"serial":   "`@serial` — PG: serial (auto-increment), Go: int64\n\n自增主键",
+		"bigint":   "`@bigint` — PG: bigint, Go: int64\n\n大整数",
+		"smallint": "`@smallint` — PG: smallint, Go: int16\n\n小整数",
+		"decimal":  "`@decimal(p, s)` — PG: numeric(p,s), Go: decimal.Decimal\n\n高精度浮点",
+		"uuid":     "`@uuid` — PG: uuid, Go: string\n\nUUID 类型",
+		"inet":     "`@inet` — PG: inet, Go: string\n\nIP 地址类型",
+		"point":    "`@point` — PG: point, Go: [2]float64\n\n地理坐标",
+		"date":     "`@date` — PG: date, Go: time.Time\n\n仅日期",
+		"time":     "`@time` — PG: time, Go: time.Time\n\n仅时间",
+		"vector":   "`@vector(n)` — PG: vector(n) (pgvector), Go: []float32\n\n向量类型",
+		"brin":     "`@brin` — PG: BRIN index (time-series optimization)\n\n时序索引",
+		// model annotations
+		"crud":   "`@crud` — Auto-generate admin CRUD APIs (get/list/create/update/delete)\n\n自动生成后台 CRUD 接口",
+		"soft":   "`@soft` — Soft delete (deletedAt column, auto WHERE deletedAt IS NULL)\n\n软删除",
+		"noTime": "`@noTime` — Disable auto createdAt/updatedAt timestamps\n\n禁用自动时间戳",
+		// field annotations
+		"unique":     "`@unique` — PG: UNIQUE constraint\n\n唯一约束",
+		"index":      "`@index` — PG: B-tree index\n\n数据库索引",
+		"hidden":     "`@hidden` — Never returned to client, write-only\n\n不返回客户端，只写",
+		"hash":       "`@hash` — Auto bcrypt hash on save\n\n保存时自动 bcrypt 加密",
+		"immutable":  "`@immutable` — Cannot change after create\n\n创建后不可修改",
+		"internal":   "`@internal` — Only set by server, not by client\n\n仅服务端设置",
+		"filterable": "`@filterable` — Enable filtering in list queries\n\n启用列表过滤",
+		"sortable":   "`@sortable` — Enable sorting in list queries\n\n启用列表排序",
+		"search":     "`@search` — PG: tsvector + GIN index, full-text search\n\n全文搜索",
+		"mask":       "`@mask(pattern)` — Return masked value (e.g. 138****1234)\n\n返回脱敏值",
+		"encrypt":    "`@encrypt` — Salted encryption at rest, auto decrypt on read\n\n加盐加密存储",
+		"deprecated": "`@deprecated(msg)` — Mark field as deprecated\n\n标记字段已弃用",
+		"visible":    "`@visible(expr)` — Conditional visibility\n\n条件可见",
+		"transform":  "`@transform { expr }` — Transform value on return\n\n返回时转换",
+		"beforeSave": "`@beforeSave { expr }` — Transform before saving\n\n保存前转换",
+		// api annotations
+		"auth":      "`@auth` / `@auth(AuthType)` — Require authentication\n\n需要认证",
+		"native":    "`@native` — Implementation in Go\n\n使用 Go 实现",
+		"cache":     "`@cache(ttl: duration)` — Cache response\n\n缓存响应",
+		"rateLimit": "`@rateLimit(max, window)` — Rate limiting\n\n限流",
+		"global":    "`@global` — Global middleware\n\n全局中间件",
+		"retry":     "`@retry(max, delay)` — Retry on failure\n\n失败重试",
+		"broadcast": "`@broadcast` — All instances receive event\n\n所有实例都接收事件",
+	}
+	if desc, ok := descriptions[name]; ok {
+		return desc
+	}
+	return ""
+}
+
+func builtinTypeDescription(name string) string {
+	descriptions := map[string]string{
+		"Int":      "```\nInt\n```\n\nGo: `int64` | PG: `integer`\n\nAnnotations: `@serial` (auto-increment), `@bigint`, `@smallint`",
+		"Float":    "```\nFloat\n```\n\nGo: `float64` | PG: `double precision`\n\nAnnotations: `@decimal(p, s)` → PG numeric",
+		"String":   "```\nString\n```\n\nGo: `string` | PG: `text`\n\nAnnotations: `@length(n)` → varchar(n), `@uuid`, `@inet`",
+		"Boolean":  "```\nBoolean\n```\n\nGo: `bool` | PG: `boolean`",
+		"DateTime": "```\nDateTime\n```\n\nGo: `time.Time` | PG: `timestamptz`\n\nAnnotations: `@date` → date only, `@time` → time only",
+		"Duration": "```\nDuration\n```\n\nGo: `time.Duration` | PG: `interval`\n\nLiterals: `7d`, `5m`, `1h`, `30s`, `500ms`",
+	}
+	if desc, ok := descriptions[name]; ok {
+		return desc
+	}
+	return ""
+}
+
+// ========== References ==========
+
+func (s *Server) handleReferences(req *Request) error {
+	var params ReferenceParams
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return err
+	}
+
+	doc := s.docs.Get(params.TextDocument.URI)
+	if doc == nil {
+		return s.transport.SendResponse(req.ID, nil)
+	}
+
+	word := doc.WordAt(params.Position)
+	if word == "" {
+		return s.transport.SendResponse(req.ID, nil)
+	}
+
+	var locations []Location
+	for _, tok := range doc.Tokens {
+		if tok.Val == word {
+			locations = append(locations, Location{
+				URI: params.TextDocument.URI,
+				Range: Range{
+					Start: Position{Line: tok.Pos.Line - 1, Character: tok.Pos.Col - 1},
+					End:   Position{Line: tok.Pos.Line - 1, Character: tok.Pos.Col - 1 + len(word)},
+				},
+			})
+		}
+	}
+	return s.transport.SendResponse(req.ID, locations)
 }
 
 // ========== Definition ==========
@@ -963,20 +1385,7 @@ func (s *Server) handleDefinition(req *Request) error {
 		return s.transport.SendResponse(req.ID, nil)
 	}
 
-	var defPos *token.Position
-
-	// type definition
-	if typ, ok := doc.Result.Types[word]; ok && typ.Pos.File != "" {
-		defPos = &typ.Pos
-	}
-
-	// symbol definition
-	if defPos == nil {
-		if sym := doc.Result.Scope.Lookup(word); sym != nil && sym.Pos.File != "" {
-			defPos = &sym.Pos
-		}
-	}
-
+	defPos := s.resolveDefinition(doc, word, params.Position)
 	if defPos == nil {
 		return s.transport.SendResponse(req.ID, nil)
 	}
@@ -989,4 +1398,277 @@ func (s *Server) handleDefinition(req *Request) error {
 		},
 	}
 	return s.transport.SendResponse(req.ID, location)
+}
+
+func (s *Server) resolveDefinition(doc *Document, word string, pos Position) *token.Position {
+	// type definition
+	if typ, ok := doc.Result.Types[word]; ok && typ.Pos.File != "" {
+		return &typ.Pos
+	}
+	// symbol definition (api, fn, error, middleware, etc.)
+	if sym := doc.Result.Scope.Lookup(word); sym != nil && sym.Pos.File != "" {
+		return &sym.Pos
+	}
+	// enum value definition: e.g. USER in Role.USER or in when branch
+	for _, typ := range doc.Result.Types {
+		if typ.Kind == semantic.TypeEnum {
+			for _, v := range typ.EnumValues {
+				if v == word {
+					return &typ.Pos
+				}
+			}
+		}
+	}
+	if doc.File == nil {
+		return nil
+	}
+	// named arg label in CRUD call → jump to model field
+	if doc.IsNamedArgLabel(pos) {
+		if p := findCRUDFieldDefinition(doc, word, pos); p != nil {
+			return p
+		}
+	}
+	// member field definition: input.name → jump to type's field
+	if doc.IsAfterDot(pos) {
+		if p := findMemberFieldDefinition(doc, word, pos); p != nil {
+			return p
+		}
+	}
+	// local variable / parameter definition
+	return findLocalDefinition(doc.File, word, pos)
+}
+
+// findMemberFieldDefinition resolves member access to a type's field definition.
+func findMemberFieldDefinition(doc *Document, fieldName string, pos Position) *token.Position {
+	if doc.File == nil || doc.Result == nil {
+		return nil
+	}
+	objName := doc.ObjectBeforeDot(pos)
+	if objName == "" {
+		return nil
+	}
+	// "it" is lambda implicit param — search all models/types for the field
+	if objName == "it" {
+		return findFieldInAnyType(doc.File, fieldName)
+	}
+	typeName := findParamTypeName(doc.File, objName)
+	if typeName == "" {
+		return nil
+	}
+	return findFieldInType(doc.File, typeName, fieldName)
+}
+
+// findFieldInAnyType searches all models and types for a field by name.
+func findFieldInAnyType(file *ast.File, fieldName string) *token.Position {
+	for _, m := range file.Models {
+		for _, f := range m.Fields {
+			if f.Name == fieldName {
+				return &f.Pos
+			}
+		}
+	}
+	for _, t := range file.Types {
+		for _, f := range t.Fields {
+			if f.Name == fieldName {
+				return &f.Pos
+			}
+		}
+	}
+	return nil
+}
+
+// findFieldInType looks up a field by name in models and types.
+func findFieldInType(file *ast.File, typeName, fieldName string) *token.Position {
+	for _, m := range file.Models {
+		if m.Name == typeName {
+			for _, f := range m.Fields {
+				if f.Name == fieldName {
+					return &f.Pos
+				}
+			}
+		}
+	}
+	for _, t := range file.Types {
+		if t.Name == typeName {
+			for _, f := range t.Fields {
+				if f.Name == fieldName {
+					return &f.Pos
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// findCRUDFieldDefinition resolves a named arg label in a CRUD call to a model field definition.
+// e.g., find(Order, id: id) — clicking on "id:" jumps to Order.id field.
+func findCRUDFieldDefinition(doc *Document, fieldName string, pos Position) *token.Position {
+	funcName, modelName := doc.FindEnclosingCall(pos)
+	if !isCRUDFunc(funcName) || modelName == "" {
+		return nil
+	}
+	// CRUD params like "where", "id", "orderBy" are not model fields
+	if isCRUDParam(fieldName) {
+		return nil
+	}
+	if doc.File == nil {
+		return nil
+	}
+	for _, m := range doc.File.Models {
+		if m.Name == modelName {
+			for _, f := range m.Fields {
+				if f.Name == fieldName {
+					return &f.Pos
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// getCRUDCompletions provides CRUD parameter and model field completions.
+func (s *Server) getCRUDCompletions(doc *Document, pos Position) []CompletionItem {
+	funcName, modelName := doc.FindEnclosingCall(pos)
+	if !isCRUDFunc(funcName) || modelName == "" {
+		return nil
+	}
+	var items []CompletionItem
+
+	// CRUD operation params
+	items = append(items, getCRUDParamCompletions(funcName)...)
+
+	// model field completions for where/create/update context
+	if doc.Result != nil {
+		if typ, ok := doc.Result.Types[modelName]; ok && typ.Fields != nil {
+			for fieldName, field := range typ.Fields {
+				detail := "field"
+				if field.Type != nil {
+					detail = field.Type.Name
+				}
+				items = append(items, CompletionItem{
+					Label:  fieldName,
+					Kind:   5, // Field
+					Detail: detail,
+				})
+			}
+		}
+	}
+	return items
+}
+
+func getCRUDParamCompletions(funcName string) []CompletionItem {
+	var items []CompletionItem
+	switch funcName {
+	case "find":
+		items = append(items,
+			CompletionItem{Label: "id", Kind: 5, Detail: "id: — find by primary key / 按主键查找"},
+			CompletionItem{Label: "where", Kind: 5, Detail: "where: — filter condition / 过滤条件"},
+			CompletionItem{Label: "orderBy", Kind: 5, Detail: "orderBy: — sort order / 排序"},
+			CompletionItem{Label: "limit", Kind: 5, Detail: "limit: — max results / 最大结果数"},
+			CompletionItem{Label: "offset", Kind: 5, Detail: "offset: — skip results / 跳过条数"},
+			CompletionItem{Label: "first", Kind: 5, Detail: "first: — first N results / 前 N 条"},
+			CompletionItem{Label: "last", Kind: 5, Detail: "last: — last N results / 后 N 条"},
+		)
+	case "create":
+		// model fields are the params — no extra keywords
+	case "update":
+		items = append(items,
+			CompletionItem{Label: "where", Kind: 5, Detail: "where: — update condition / 更新条件"},
+		)
+	case "delete":
+		items = append(items,
+			CompletionItem{Label: "where", Kind: 5, Detail: "where: — delete condition / 删除条件"},
+		)
+	}
+	return items
+}
+
+func isCRUDFunc(name string) bool {
+	switch name {
+	case "find", "create", "update", "delete":
+		return true
+	}
+	return false
+}
+
+func isCRUDParam(name string) bool {
+	switch name {
+	case "where", "id", "orderBy", "limit", "offset", "first", "last":
+		return true
+	}
+	return false
+}
+
+// findLocalDefinition searches api/fn params and body val statements for a local variable definition.
+func findLocalDefinition(file *ast.File, word string, pos Position) *token.Position {
+	// search api params and body
+	for _, api := range file.APIs {
+		if !posInsideDecl(pos, api.Pos, api.Body) {
+			continue
+		}
+		for _, p := range api.Params {
+			if p.Name == word {
+				return &p.Pos
+			}
+		}
+		if api.Body != nil {
+			if found := findValInBlock(api.Body, word, pos); found != nil {
+				return found
+			}
+		}
+	}
+	// search fn params and body
+	for _, fn := range file.Functions {
+		if !posInsideDecl(pos, fn.Pos, fn.Body) {
+			continue
+		}
+		for _, p := range fn.Params {
+			if p.Name == word {
+				return &p.Pos
+			}
+		}
+		if fn.Body != nil {
+			if found := findValInBlock(fn.Body, word, pos); found != nil {
+				return found
+			}
+		}
+	}
+	return nil
+}
+
+// posInsideDecl checks if cursor position is within a declaration's range.
+func posInsideDecl(cursor Position, declPos token.Position, body *ast.Block) bool {
+	if cursor.Line < declPos.Line-1 {
+		return false
+	}
+	if body != nil && body.EndPos.Line > 0 {
+		return cursor.Line <= body.EndPos.Line-1
+	}
+	return false
+}
+
+// findValInBlock searches a block for a val statement or for-loop variable matching word, before cursor.
+func findValInBlock(block *ast.Block, word string, cursor Position) *token.Position {
+	for _, stmt := range block.Stmts {
+		// only consider definitions before cursor
+		if stmt.GetPos().Line-1 > cursor.Line {
+			break
+		}
+		if vs, ok := stmt.(*ast.ValStmt); ok {
+			if vs.Name == word {
+				return &vs.Pos
+			}
+			for _, name := range vs.Names {
+				if name == word {
+					return &vs.Pos
+				}
+			}
+		}
+		if fs, ok := stmt.(*ast.ForStmt); ok {
+			if fs.VarName == word {
+				return &fs.Pos
+			}
+		}
+	}
+	return nil
 }

@@ -247,9 +247,9 @@ api test(): String {
   items.name
 }
 `)
-	// items is [Item], accessing .name should not find a field (or may error)
-	// The point is to exercise isCollectionMethod returning false
-	_ = result
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
 }
 
 func TestFindReturnsListType(t *testing.T) {
