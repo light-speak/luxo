@@ -255,37 +255,40 @@ luxo dev
 
 **Luvia 始终在线** — 单服务时内嵌运行（进程内调用，零开销），多服务时独立部署为网关。同一套代码，同一套行为，只改配置。从原型到生产，不改一行代码。
 
-- **510 个测试** · 覆盖率达极限
-- **Fuzz 测试** — 词法、语法、语义分析器
-- **双语错误信息**（English + 中文）
 
 ## 开发进度
 
 ### Phase 1 — 编译器 ✅
 - [x] 词法分析 · 语法分析（31 关键字，Pratt Parser）
 - [x] 语义分析（类型检查、空安全、字段注入）
-- [x] LSP 服务器（诊断、补全、悬停、跳转定义）
-- [x] 510 个测试 · 极限覆盖率 · Fuzz 测试
+- [x] LSP 服务器（诊断、补全、悬停、跳转定义、引用查找）
 - [ ] Go 代码生成
 
-### Phase 2 — 框架
-- [ ] JSON 传输 + 字段选择
+### Phase 2 — 运行时 + Luvia
+- [ ] Go 代码生成（model · api · db · dataloader · native 接口）
+- [ ] 类型安全查询构建器（pgx，字段选择 → SQL）
+- [ ] Luvia 网关（始终在线：单服务内嵌 / 多服务独立）
 - [ ] 自动 CRUD · @native 智能合并
-- [ ] 迁移引擎（声明式 diff）
-- [ ] 认证 · i18n · 校验
+- [ ] JSON 传输 + 字段选择（端到端贯穿）
+- [ ] 认证（@auth · JWT · Identity · `my` 关键字）
+- [ ] 迁移引擎（声明式 diff · 安全回滚）
+- [ ] i18n 错误体系 · 校验注解
 - [ ] WebSocket 流式 · Batch 请求
-- [ ] 运行时：错误处理、连接池、日志、消息系统
+- [ ] 事件系统（emit / on · NATS JetStream）
 
-### Phase 3 — 多服务
-- [ ] Luvia /lɑːviyɑː/ 网关 · 服务发现 · 熔断
-- [ ] 服务间 Luxo RPC
-- [ ] Identity 上下文传递
+### Phase 3 — 多服务 + Binary
+- [ ] Schema 组装 · 服务发现 · 负载均衡
+- [ ] @service RPC（类型安全跨服务调用）
+- [ ] extend 字段聚合（并行扇出）
+- [ ] 熔断器 · 健康检查
+- [ ] Binary 协议（field ID · varint · field mask）
+- [ ] 客户端 SDK 生成（TypeScript · Dart）
 
 ### Phase 4 — 生态
-- [ ] Binary 协议 · 客户端 SDK（TypeScript / Dart）
-- [ ] Luxo Studio（监控面板）
-- [ ] Cache / Event / Task / Storage / Mail
-- [ ] k3s 部署 · .luxo 测试运行器
+- [ ] Luxo Studio（监控 · 追踪 · API Playground）
+- [ ] Cache / Task / Scheduler / Storage / Mail
+- [ ] .luxo 测试运行器
+- [ ] k3s 部署生成
 
 ## 贡献
 

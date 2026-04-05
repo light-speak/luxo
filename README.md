@@ -255,37 +255,40 @@ luxo dev
 
 **Luvia is always on** — single service runs embedded (in-process, zero overhead), multi-service runs as a standalone gateway. Same code, same behavior, just change the config. Scale from prototype to production without touching a single line of code.
 
-- **510 tests** · Coverage at maximum achievable limit
-- **Fuzz testing** on Lexer, Parser, and Semantic Analyzer
-- **Bilingual error messages** (English + Chinese)
 
 ## Roadmap
 
 ### Phase 1 — Compiler ✅
 - [x] Lexer · Parser (31 keywords, Pratt parser)
 - [x] Semantic Analyzer (type checking, null safety, field injection)
-- [x] LSP Server (diagnostics, completion, hover, go-to-definition)
-- [x] 510 tests · max coverage · fuzz testing
+- [x] LSP Server (diagnostics, completion, hover, go-to-definition, references)
 - [ ] Go code generator
 
-### Phase 2 — Framework
-- [ ] JSON transport + field selection
+### Phase 2 — Runtime + Luvia
+- [ ] Go code generation (model · api · db · dataloader · native interface)
+- [ ] Type-safe query builder (pgx, field selection → SQL)
+- [ ] Luvia gateway (always-on: embedded single / standalone multi)
 - [ ] Auto CRUD · @native resolver merge
-- [ ] Migration engine (declarative diff)
-- [ ] Auth · i18n · Validation
+- [ ] JSON transport + field selection (end to end)
+- [ ] Auth (@auth · JWT · Identity · `my` keyword)
+- [ ] Migration engine (declarative diff · safe rollback)
+- [ ] i18n error system · Validation annotations
 - [ ] WebSocket stream · Batch requests
-- [ ] Runtime: error handling, DB pool, logging, messaging
+- [ ] Event system (emit / on · NATS JetStream)
 
-### Phase 3 — Multi-service
-- [ ] Luvia /lɑːviyɑː/ gateway · Service discovery · Circuit breaker
-- [ ] Inter-service Luxo RPC
-- [ ] Identity context propagation
+### Phase 3 — Multi-service + Binary
+- [ ] Schema compose · Service discovery · Load balancing
+- [ ] @service RPC (type-safe cross-service calls)
+- [ ] extend field aggregation (parallel fan-out)
+- [ ] Circuit breaker · Health check
+- [ ] Binary protocol (field ID · varint · field mask)
+- [ ] Client SDK generation (TypeScript · Dart)
 
 ### Phase 4 — Ecosystem
-- [ ] Binary protocol · Client SDK (TypeScript / Dart)
-- [ ] Luxo Studio (monitoring dashboard)
-- [ ] Cache / Event / Task / Storage / Mail
-- [ ] k3s deployment · .luxo test runner
+- [ ] Luxo Studio (monitoring · tracing · API playground)
+- [ ] Cache / Task / Scheduler / Storage / Mail
+- [ ] .luxo test runner
+- [ ] k3s deployment generation
 
 ## Contributing
 
