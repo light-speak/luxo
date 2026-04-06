@@ -2171,44 +2171,31 @@ func (a *Analyzer) resolveQueryMethod(method string, modelType *ResolvedType) *R
 }
 
 func editDistance(a, b string) int {
-	la, lb := len(a), len(b)
-	if la == 0 {
-		return lb
+	m, n := len(a), len(b)
+	if m == 0 {
+		return n
 	}
-	if lb == 0 {
-		return la
+	if n == 0 {
+		return m
 	}
-	dp := make([][]int, la+1)
-	for i := range dp {
-		dp[i] = make([]int, lb+1)
-		dp[i][0] = i
+	// Two-row DP: O(n) space instead of O(m*n).
+	prev := make([]int, n+1)
+	curr := make([]int, n+1)
+	for j := 0; j <= n; j++ {
+		prev[j] = j
 	}
-	for j := 0; j <= lb; j++ {
-		dp[0][j] = j
-	}
-	for i := 1; i <= la; i++ {
-		for j := 1; j <= lb; j++ {
-			cost := 1
-			if a[i-1] == b[j-1] {
-				cost = 0
+	for i := 1; i <= m; i++ {
+		curr[0] = i
+		for j := 1; j <= n; j++ {
+			cost := 0
+			if a[i-1] != b[j-1] {
+				cost = 1
 			}
-			dp[i][j] = min3(dp[i-1][j]+1, dp[i][j-1]+1, dp[i-1][j-1]+cost)
+			curr[j] = min(curr[j-1]+1, min(prev[j]+1, prev[j-1]+cost))
 		}
+		prev, curr = curr, prev
 	}
-	return dp[la][lb]
-}
-
-func min3(a, b, c int) int {
-	if a < b {
-		if a < c {
-			return a
-		}
-		return c
-	}
-	if b < c {
-		return b
-	}
-	return c
+	return prev[n]
 }
 
 func isBuiltinOp(name string) bool {

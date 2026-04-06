@@ -18,9 +18,14 @@ func Format(source, filename string) (string, error) {
 		}
 		return "", &FormatError{Messages: msgs}
 	}
+	return FormatTokens(tokens), nil
+}
+
+// FormatTokens formats using a pre-existing token stream, avoiding redundant lexing.
+func FormatTokens(tokens []token.Token) string {
 	f := &formatter{tokens: tokens}
 	f.formatFile()
-	return f.out.String(), nil
+	return f.out.String()
 }
 
 // FormatError reports lexer errors encountered during formatting.

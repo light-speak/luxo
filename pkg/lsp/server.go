@@ -2208,9 +2208,16 @@ func (s *Server) handleFormatting(req *Request) error {
 	}
 
 	source := doc.Content
-	formatted, err := formatter.Format(source, params.TextDocument.URI)
-	if err != nil {
-		return s.transport.SendResponse(req.ID, nil)
+	var formatted string
+	if len(doc.Tokens) > 0 && len(doc.lexErrors) == 0 {
+		// Reuse existing token stream from analysis, avoiding redundant lexing.
+		formatted = formatter.FormatTokens(doc.Tokens)
+	} else {
+		var err error
+		formatted, err = formatter.Format(source, params.TextDocument.URI)
+		if err != nil {
+			return s.transport.SendResponse(req.ID, nil)
+		}
 	}
 
 	if formatted == source {

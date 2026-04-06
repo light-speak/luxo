@@ -44,6 +44,9 @@ func New(source, file string) *Lexer {
 
 // Tokenize scans the entire source and returns all tokens.
 func (l *Lexer) Tokenize() ([]token.Token, []Error) {
+	// Pre-allocate token slice based on source length.
+	// Empirical ratio: ~1 token per 4 characters.
+	l.tokens = make([]token.Token, 0, len(l.source)/4)
 	for {
 		tok := l.nextToken()
 		if tok.Type == token.Comment || tok.Type == token.DocComment {

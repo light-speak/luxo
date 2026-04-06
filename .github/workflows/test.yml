@@ -52,6 +52,24 @@ jobs:
       - name: Vet
         run: go vet ./pkg/... ./cmd/...
 
+      - name: Gofmt check
+        run: |
+          UNFORMATTED=$(gofmt -l pkg/ cmd/)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "::error::Files not formatted: $UNFORMATTED"
+            exit 1
+          fi
+
+      - name: Gocyclo check
+        run: |
+          go install github.com/fzipp/gocyclo/cmd/gocyclo@latest
+          VIOLATIONS=$(gocyclo -over 15 pkg/)
+          if [ -n "$VIOLATIONS" ]; then
+            echo "::error::Cyclomatic complexity > 15:"
+            echo "$VIOLATIONS"
+            exit 1
+          fi
+
       - name: Build
         run: go build ./pkg/... ./cmd/...
 

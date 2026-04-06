@@ -1,0 +1,30 @@
+#!/bin/sh
+# Luxo pre-commit hook — quality gate
+# Install: cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+
+set -e
+
+echo "=== gofmt ==="
+UNFORMATTED=$(gofmt -l pkg/ cmd/ 2>/dev/null || true)
+if [ -n "$UNFORMATTED" ]; then
+  echo "ERROR: Files not formatted:"
+  echo "$UNFORMATTED"
+  echo "Run: gofmt -s -w pkg/ cmd/"
+  exit 1
+fi
+
+echo "=== go vet ==="
+go vet ./pkg/... ./cmd/...
+
+echo "=== gocyclo ==="
+VIOLATIONS=$(gocyclo -over 15 pkg/ 2>/dev/null || true)
+if [ -n "$VIOLATIONS" ]; then
+  echo "ERROR: Cyclomatic complexity > 15:"
+  echo "$VIOLATIONS"
+  exit 1
+fi
+
+echo "=== go test ==="
+go test ./pkg/... -timeout 120s -count=1
+
+echo "=== All checks passed ==="
