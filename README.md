@@ -84,9 +84,10 @@ Luxo is a real programming language — not just a schema DSL. **31 keywords**, 
 ### Null Safety
 
 ```luxo
-val user = find(User, id: 1)       // User? (nullable)
-val name = user?.name               // safe access
-val sure = user ?: throw NotFound   // elvis — assert or throw
+val user = User.find(id: 1)          // User (auto-throws NotFound)
+val maybe = User.where(id == 1).first() // User? (nullable)
+val name = maybe?.name               // safe access
+val sure = maybe ?: throw NotFound   // elvis — assert or throw
 ```
 
 ### Pattern Matching — `when`
@@ -173,7 +174,7 @@ api getUser(id: Int): User @cache(ttl: 60)
 // 2. With logic — write in Luxo
 api register(input: RegisterInput): AuthResult {
   input.password.length >= 8 ?: throw PasswordTooShort
-  val user = create(User, name: input.name, email: input.email, password: input.password)
+  val user = User.create(name: input.name, email: input.email, password: input.password)
   val token = generateToken(user, expires: 7d)
   AuthResult { token, user }         // shorthand — field name = variable name
 }
@@ -193,7 +194,7 @@ use common.{ Base, Page }           // destructured import
 
 ```luxo
 api createPost(title: String): Post @auth {
-  val post = create(Post, title: title, userId: my.id)
+  val post = Post.create(title: title, userId: my.id)
   post
 }
 ```
@@ -204,7 +205,7 @@ api createPost(title: String): Post @auth {
 event OrderCreated(order: Order, userId: Int)    // typed event declaration
 
 api placeOrder(id: Int): Order @auth {
-  val order = create(Order, userId: my.id)
+  val order = Order.create(userId: my.id)
   emit OrderCreated(order: order, userId: my.id) // typed emit
   order
 }
@@ -217,7 +218,7 @@ on OrderCreated { order ->                       // event listener
 ### Debug Chain — `.d`
 
 ```luxo
-val user = find(User, id: 1).d       // .d prints and returns self
+val user = User.find(id: 1).d        // .d prints and returns self
 ```
 
 ### Field Selection — All The Way Down
@@ -256,6 +257,30 @@ luxo dev
 **Luvia is always on** — single service runs embedded (in-process, zero overhead), multi-service runs as a standalone gateway. Same code, same behavior, just change the config. Scale from prototype to production without touching a single line of code.
 
 
+## AI-Native by Design
+
+Luxo isn't just shorter code — it's **the most reliable language for AI to write backend APIs**.
+
+| | Traditional (Go/TS) | Luxo |
+|---|---|---|
+| **Context needed** | 50+ files, 10K+ tokens | 1 `.luxo` file, ~500 tokens |
+| **AI output correctness** | Compiles ≠ correct, needs tests | Compiler catches types, nulls, exhaustiveness |
+| **Code style variance** | AI picks different patterns each time | One way to write everything |
+| **Schema understanding** | AI reverse-engineers from code | Schema IS the code |
+
+```
+"Add a product favorites feature"
+
+→ AI generates 15 lines of .luxo
+→ Compiler validates types, null safety, required fields
+→ Done. API is running.
+
+Same task in Go? 200+ lines across 7 files.
+Same task in TypeScript? 150+ lines, 4 packages, no compile-time safety.
+```
+
+**Luxo + AI = reliable backend engineer.** Other languages give AI too much freedom. Luxo gives AI exactly the right constraints.
+
 ## Roadmap
 
 ### Phase 1 — Compiler ✅
@@ -284,7 +309,10 @@ luxo dev
 - [ ] Binary protocol (field ID · varint · field mask)
 - [ ] Client SDK generation (TypeScript · Dart)
 
-### Phase 4 — Ecosystem
+### Phase 4 — AI + Ecosystem
+- [ ] MCP Server (AI reads/writes .luxo projects natively)
+- [ ] luxo-ai (natural language → .luxo → running API)
+- [ ] luxo-copilot (schema-aware AI completion for VS Code / Cursor)
 - [ ] Luxo Studio (monitoring · tracing · API playground)
 - [ ] Cache / Task / Scheduler / Storage / Mail
 - [ ] .luxo test runner

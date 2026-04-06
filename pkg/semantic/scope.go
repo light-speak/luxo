@@ -46,6 +46,7 @@ type Symbol struct {
 	Doc     string
 	Module  string // which module this belongs to
 	Mutable bool   // true for var, false for val
+	Used    bool   // true if referenced after declaration
 }
 
 // Scope represents a lexical scope with symbols.
@@ -82,6 +83,7 @@ func (s *Scope) Define(sym *Symbol) bool {
 // Lookup looks up a symbol by name, walking up the scope chain.
 func (s *Scope) Lookup(name string) *Symbol {
 	if sym, ok := s.symbols[name]; ok {
+		sym.Used = true
 		return sym
 	}
 	if s.parent != nil {

@@ -130,7 +130,7 @@ func TestBinaryIs(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
 api test(): Boolean {
-  val x = find(User, id: 1)
+  val x = User.find(id: 1)
   val result = x is User
   result
 }
@@ -252,7 +252,7 @@ func TestMemberAccess(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
 api test(): String {
-  val user = find(User, id: 1)
+  val user = User.find(id: 1)
   user.name
 }
 `)
@@ -292,15 +292,15 @@ api test(): String {
 }
 
 func TestElvisNarrowing(t *testing.T) {
+	// use first() which returns nullable, then narrow with ?:
 	result := analyze(t, `
 model User { name: String }
 api test(): String {
-  val user = find(User, id: 1) ?: throw error.not_found
+  val user = User.where(name == "test").first() ?: throw error.not_found
   user.name
 }
 `)
 	// After ?:, user should be narrowed to non-null
-	// find returns nil type (unresolved), so just check no panics
 	if result == nil {
 		t.Fatal("expected non-nil result")
 	}
@@ -356,7 +356,7 @@ func TestMemberCallExpr(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
 api test(): Int {
-  val user = find(User, id: 1)
+  val user = User.find(id: 1)
   user.toString()
   42
 }
@@ -491,7 +491,7 @@ func TestForLoopVarType(t *testing.T) {
 model Post { title: String }
 model User { posts: [Post] }
 api test(): String {
-  val items = find(User, id: 1)
+  val items = User.find(id: 1)
   for post in items {
     val t = post
   }
@@ -729,7 +729,7 @@ func TestLambdaItVariable(t *testing.T) {
 model Post { title: String }
 model User { posts: [Post] }
 api test(): Int {
-  val items = find(User, id: 1)
+  val items = User.find(id: 1)
   items.filter { val x = it }
   42
 }
@@ -797,7 +797,7 @@ func TestTransactionExprCheck(t *testing.T) {
 model User { name: String }
 api test(): Int {
   val result = transaction {
-    create(User, name: "test")
+    User.create(name: "test")
   }
   42
 }
@@ -1085,7 +1085,7 @@ api feed(): (Post, Video)
 func TestStreamTypeResolution(t *testing.T) {
 	result := analyze(t, `
 model Comment { text: String }
-api comments(): stream Comment
+api comments(): Comment @stream
 `)
 	expectNoErrors(t, result)
 
@@ -1094,21 +1094,62 @@ api comments(): stream Comment
 		t.Fatal("expected 'comments' symbol")
 	}
 	if sym.Type == nil {
-		t.Fatal("expected non-nil return type for stream")
+		t.Fatal("expected non-nil return type for @stream api")
 	}
 	if sym.Type.Name != "Comment" {
-		t.Errorf("expected stream type name 'Comment', got %q", sym.Type.Name)
+		t.Errorf("expected return type name 'Comment', got %q", sym.Type.Name)
+	}
+}
+
+func TestBuiltinPageType(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api listUsers(): Page<User>
+`)
+	expectNoErrors(t, result)
+
+	sym := result.Scope.Lookup("listUsers")
+	if sym == nil {
+		t.Fatal("expected 'listUsers' symbol")
+	}
+	if sym.Type == nil {
+		t.Fatal("expected non-nil return type")
+	}
+	if sym.Type.Name != "Page" {
+		t.Errorf("expected type name 'Page', got %q", sym.Type.Name)
+	}
+	if len(sym.Type.TypeArgs) != 1 {
+		t.Errorf("expected 1 type arg, got %d", len(sym.Type.TypeArgs))
+	}
+}
+
+func TestBuiltinCursorType(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api listUsers(): Cursor<User>
+`)
+	expectNoErrors(t, result)
+
+	sym := result.Scope.Lookup("listUsers")
+	if sym == nil {
+		t.Fatal("expected 'listUsers' symbol")
+	}
+	if sym.Type == nil {
+		t.Fatal("expected non-nil return type")
+	}
+	if sym.Type.Name != "Cursor" {
+		t.Errorf("expected type name 'Cursor', got %q", sym.Type.Name)
 	}
 }
 
 func TestGenericTypeResolution(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
-type Page {
+type Paginated {
   items: [User]
   total: Int
 }
-api listUsers(): Page<User>
+api listUsers(): Paginated<User>
 `)
 	expectNoErrors(t, result)
 
@@ -1126,7 +1167,7 @@ api listUsers(): Page<User>
 
 func TestGenericTypeParam(t *testing.T) {
 	result := analyze(t, `
-type Page<T> {
+type Paginated<T> {
   items: [T]
   total: Int
   page: Int
@@ -1213,7 +1254,7 @@ func TestForStmt(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
 api test(): String {
-  val users = find(User, where: name == "x")
+  val users = User.find(where: name == "x")
   for u in users {
     u.name
   }
@@ -1228,7 +1269,7 @@ func TestVarAfterCreate(t *testing.T) {
 model User { name: String }
 type AuthResult { token: String }
 api test(): AuthResult {
-  val user = create(User, name: "test")
+  val user = User.create(name: "test")
   AuthResult { token: "abc", user: user }
 }
 `)
@@ -1253,7 +1294,7 @@ func TestApiParamTypeResolution(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
 api getUser(id: Int, name: String): User {
-  val u = find(User, id: id)
+  val u = User.find(id: id)
   u
 }
 `)
@@ -1298,11 +1339,43 @@ api test(): Int {
 	expectNoErrors(t, result)
 }
 
+func TestContinueStmt(t *testing.T) {
+	result := analyze(t, `
+api test(): Int {
+  var sum = 0
+  var i = 0
+  for i < 10 {
+    i += 1
+    if i % 2 == 0 { continue }
+    sum += i
+  }
+  sum
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestContinueUnreachable(t *testing.T) {
+	result := analyze(t, `
+api test(): Int {
+  for {
+    continue
+    val x = 1
+  }
+  0
+}
+`)
+	// code after continue should trigger unreachable warning
+	if len(result.Warnings) == 0 {
+		t.Error("expected unreachable code warning after continue")
+	}
+}
+
 func TestYieldExpr(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
 api test(): User {
-  val users = find(User, where: name == "test")
+  val users = User.find(where: name == "test")
   val found = for user in users {
     if user.name == "test" { yield user }
   }
@@ -1331,7 +1404,7 @@ func TestAwaitExpr(t *testing.T) {
 	result := analyze(t, `
 api test(): Int {
   val result = await {
-    find(User, id: 1)
+    User.find(id: 1)
   }
   0
 }
@@ -1372,7 +1445,7 @@ func TestDebugChainMethods(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
 api test(id: Int): String {
-  val user = find(User, id: id)
+  val user = User.find(id: id)
   val u1 = user.d
   val u2 = user.i
   val u3 = user.w
@@ -1388,7 +1461,7 @@ func TestDebugChainOnList(t *testing.T) {
 	result := analyze(t, `
 model Post { title: String }
 api test(): [Post] {
-  val posts = find(Post, where: title == "x")
+  val posts = Post.find(where: title == "x")
   posts.d.filter { it.title == "y" }
 }
 `)
@@ -1418,10 +1491,36 @@ func TestLetScopeFunction(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
 api test(id: Int): String {
-  val user = find(User, id: id)
+  val user = User.find(id: id)
   val result = user?.let { "found" }
   result ?: "not found"
 }
 `)
 	expectNoErrors(t, result)
+}
+
+// ========== TypeKind.String() Tests ==========
+
+func TestTypeKindString(t *testing.T) {
+	tests := []struct {
+		kind TypeKind
+		want string
+	}{
+		{TypeModel, "model"},
+		{TypeInterface, "interface"},
+		{TypeEnum, "enum"},
+		{TypeSealed, "sealed"},
+		{TypeCustom, "type"},
+		{TypeGeneric, "generic"},
+		{TypeTuple, "tuple"},
+		{TypeQueryBuilder, "query builder"},
+		{TypeUnknown, "type"},
+		{TypeInt, "type"},
+	}
+	for _, tt := range tests {
+		got := tt.kind.String()
+		if got != tt.want {
+			t.Errorf("TypeKind(%d).String() = %q, want %q", tt.kind, got, tt.want)
+		}
+	}
 }

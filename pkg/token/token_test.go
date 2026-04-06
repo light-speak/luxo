@@ -66,7 +66,6 @@ func TestTypeStringKnown(t *testing.T) {
 		{Override, "override"},
 		{Use, "use"},
 		{Event, "event"},
-		{Stream, "stream"},
 		{Val, "val"},
 		{When, "when"},
 		{If, "if"},
@@ -111,7 +110,7 @@ func TestLookupKeywordFound(t *testing.T) {
 		"sealed": Sealed, "type": KwType, "fn": Fn, "api": Api,
 		"error": Error, "middleware": Middleware, "extend": Extend,
 		"override": Override, "use": Use, "event": Event,
-		"stream": Stream, "val": Val, "when": When, "if": If,
+		"val": Val, "when": When, "if": If,
 		"else": Else, "for": For, "in": In, "return": Return,
 		"break": Break, "is": Is, "on": On, "my": My, "async": Async, "await": Await,
 		"yield": Yield,
@@ -139,8 +138,8 @@ func TestIsKeyword(t *testing.T) {
 	// Keywords should return true
 	keywordTypes := []Type{
 		Model, Interface, Enum, Sealed, KwType, Fn, Api, Error,
-		Middleware, Event, Extend, Override, Use, Stream,
-		Val, When, If, Else, For, In, Return, Break, Is, On, My,
+		Middleware, Event, Extend, Override, Use,
+		Val, Var, When, If, Else, For, In, Return, Break, Continue, Is, On, My,
 		Async, Await, Yield,
 		Throw, Emit,
 		True, False, Null,

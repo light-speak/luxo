@@ -14,7 +14,19 @@ function findLspBinary() {
         return configPath;
     }
 
-    // 2. GOPATH/bin
+    // 2. common GOPATH/bin locations (works even without go in PATH)
+    const home = process.env.HOME || process.env.USERPROFILE || '';
+    const commonPaths = [
+        path.join(home, 'go', 'bin', 'luxo-lsp'),
+        '/usr/local/go/bin/luxo-lsp',
+    ];
+    for (const p of commonPaths) {
+        if (fs.existsSync(p)) {
+            return p;
+        }
+    }
+
+    // 3. GOPATH/bin via go env
     try {
         const gopath = execSync('go env GOPATH', { encoding: 'utf8' }).trim();
         const gopathBin = path.join(gopath, 'bin', 'luxo-lsp');
@@ -23,13 +35,13 @@ function findLspBinary() {
         }
     } catch (e) { /* go not installed */ }
 
-    // 3. try PATH
+    // 4. try PATH
     try {
         const which = execSync('which luxo-lsp', { encoding: 'utf8' }).trim();
         if (which) return which;
     } catch (e) { /* not in PATH */ }
 
-    // 4. auto install
+    // 5. auto install
     return autoInstall();
 }
 

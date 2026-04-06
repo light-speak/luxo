@@ -35,7 +35,7 @@ func TestParseBinaryExpr(t *testing.T) {
 
 func TestParseElvisExpr(t *testing.T) {
 	input := `api test(): User {
-  val user = find(User, id: 1) ?: throw error.not_found
+  val user = User.find(id: 1) ?: throw error.not_found
   return user
 }`
 	file := parse(t, input)
@@ -694,47 +694,54 @@ func TestParseFloatAndDurationLiterals(t *testing.T) {
 
 func TestParseFindCreateExpr(t *testing.T) {
 	input := `api test(): User {
-  val u = find(User, id: 1)
-  val o = create(Order, total: 100)
+  val u = User.find(id: 1)
+  val o = Order.create(total: 100)
   return u
 }`
 	file := parse(t, input)
 	api := file.APIs[0]
 
-	// find(User, id: 1)
+	// User.find(id: 1) — chain-style, Func is MemberExpr
 	valU := api.Body.Stmts[0].(*ast.ValStmt)
 	call, ok := valU.Value.(*ast.CallExpr)
 	if !ok {
 		t.Fatalf("expected CallExpr, got %T", valU.Value)
 	}
-	ident, ok := call.Func.(*ast.Ident)
+	member, ok := call.Func.(*ast.MemberExpr)
 	if !ok {
-		t.Fatalf("expected Ident func, got %T", call.Func)
+		t.Fatalf("expected MemberExpr func, got %T", call.Func)
 	}
-	if ident.Name != "find" {
-		t.Errorf("expected 'find', got %q", ident.Name)
+	if member.Field != "find" {
+		t.Errorf("expected 'find', got %q", member.Field)
+	}
+	objIdent, ok := member.Object.(*ast.Ident)
+	if !ok {
+		t.Fatalf("expected Ident object, got %T", member.Object)
+	}
+	if objIdent.Name != "User" {
+		t.Errorf("expected 'User', got %q", objIdent.Name)
 	}
 
-	// create(Order, total: 100)
+	// Order.create(total: 100) — chain-style, Func is MemberExpr
 	valO := api.Body.Stmts[1].(*ast.ValStmt)
 	call2, ok := valO.Value.(*ast.CallExpr)
 	if !ok {
 		t.Fatalf("expected CallExpr, got %T", valO.Value)
 	}
-	ident2, ok := call2.Func.(*ast.Ident)
+	member2, ok := call2.Func.(*ast.MemberExpr)
 	if !ok {
-		t.Fatalf("expected Ident func, got %T", call2.Func)
+		t.Fatalf("expected MemberExpr func, got %T", call2.Func)
 	}
-	if ident2.Name != "create" {
-		t.Errorf("expected 'create', got %q", ident2.Name)
+	if member2.Field != "create" {
+		t.Errorf("expected 'create', got %q", member2.Field)
 	}
 }
 
 func TestParseUpdateDeleteExpr(t *testing.T) {
 	// Cover update/delete branches in parsePrefixExpr
 	input := `api test(): Int {
-  update(User, id: 1, name: "new")
-  delete(User, id: 1)
+  User.update(id: 1, name: "new")
+  User.delete(id: 1)
   return 0
 }`
 	file := parse(t, input)
@@ -771,7 +778,7 @@ func TestParseCRUDKeywordsAsIdent(t *testing.T) {
 // Test throw as prefix expression (UnaryExpr with op "throw").
 func TestParseThrowAsExpr(t *testing.T) {
 	input := `api test(): Int {
-  val x = find(User, id: 1) ?: throw error.not_found
+  val x = User.find(id: 1) ?: throw error.not_found
   return 0
 }`
 	file := parse(t, input)
@@ -883,7 +890,7 @@ func TestParseChainedCalls(t *testing.T) {
 func TestParseTrailingLambdaOnCallArgs(t *testing.T) {
 	// Cover trailing lambda after parseCallArgs (line 982-986)
 	input := `api test(): Int {
-  val x = find(User, id: 1) {
+  val x = User.find(id: 1) {
     val y = 1
   }
   return x
@@ -952,8 +959,8 @@ func TestIsCallableMemberExpr(t *testing.T) {
 func TestParseTransaction(t *testing.T) {
 	input := `api test(): Order {
   val order = transaction {
-    update(product, stock: 0)
-    create(Order, total: 100)
+    product.update(stock: 0)
+    Order.create(total: 100)
   }
   return order
 }`
@@ -986,7 +993,7 @@ func TestParseTransaction(t *testing.T) {
 func TestParseTransactionExpr(t *testing.T) {
 	input := `api test(): Order {
   val result = transaction {
-    val x = create(Order, total: 100)
+    val x = Order.create(total: 100)
     return x
   }
   return result
@@ -1452,9 +1459,9 @@ api test(): AuthResult {
 }
 
 func TestParseCallArgsEmptyExpression(t *testing.T) {
-	// find(User, where: ) — incomplete expression after colon, should not crash
+	// User.find(where: ) — incomplete expression after colon, should not crash
 	input := `api test(): Int {
-  find(User, where: )
+  User.find(where: )
   0
 }`
 	_, errs := parseWithErrors(t, input)

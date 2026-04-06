@@ -22,11 +22,11 @@ func FuzzParser(f *testing.F) {
 		"middleware auth @native",
 		`api test(): Int {
   val x = 42 + 3.14
-  val y = find(User, id: 1) ?: throw error.not_found
+  val y = User.find(id: 1) ?: throw error.not_found
   when(x) { in 1..10 -> "a" else -> "b" }
-  for item in items { update(item, status: "done") }
+  for item in items { item.update(status: "done") }
   if true { val z = 1 } else { val z = 2 }
-  transaction { create(Order, total: 100) }
+  transaction { Order.create(total: 100) }
   emit("event", data, key: value)
   x
 }`,

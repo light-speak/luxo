@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lexer"
@@ -27,9 +28,13 @@ type Document struct {
 
 // DocumentStore manages all open documents.
 type DocumentStore struct {
-	mu   sync.RWMutex
-	docs map[string]*Document
+	mu            sync.RWMutex
+	docs          map[string]*Document
+	debounceTimer *time.Timer
+	debounceMu    sync.Mutex
 }
+
+const analyzeDebounce = 100 * time.Millisecond
 
 // NewDocumentStore creates a new document store.
 func NewDocumentStore() *DocumentStore {
@@ -54,7 +59,8 @@ func (s *DocumentStore) Open(uri string, version int, content string) *Document 
 	return s.Get(uri)
 }
 
-// Update updates a document's content and re-analyzes all documents.
+// Update updates a document's content and re-analyzes with debounce.
+// Rapid keystrokes only trigger one analysis after the last keystroke.
 func (s *DocumentStore) Update(uri string, version int, content string) *Document {
 	s.mu.Lock()
 	doc, ok := s.docs[uri]
@@ -66,8 +72,20 @@ func (s *DocumentStore) Update(uri string, version int, content string) *Documen
 	doc.Content = content
 	s.mu.Unlock()
 
-	s.analyzeAll()
+	s.scheduleAnalysis()
 	return s.Get(uri)
+}
+
+// scheduleAnalysis debounces analysis — resets the timer on each call.
+func (s *DocumentStore) scheduleAnalysis() {
+	s.debounceMu.Lock()
+	defer s.debounceMu.Unlock()
+	if s.debounceTimer != nil {
+		s.debounceTimer.Stop()
+	}
+	s.debounceTimer = time.AfterFunc(analyzeDebounce, func() {
+		s.analyzeAll()
+	})
 }
 
 // Get returns a document by URI.
@@ -169,8 +187,12 @@ func (d *Document) Diagnostics() []Diagnostic {
 			if warn.Pos.File != filename && warn.Pos.File != "" {
 				continue
 			}
+			warnLen := warn.NameLen
+			if warnLen < 1 {
+				warnLen = 1
+			}
 			diags = append(diags, Diagnostic{
-				Range:    tokenPosToRange(warn.Pos, 1),
+				Range:    tokenPosToRange(warn.Pos, warnLen),
 				Severity: 2,
 				Source:   "luxo/semantic",
 				Message:  warn.Message,
@@ -301,7 +323,8 @@ func (d *Document) FindEnclosingCall(pos Position) (funcName string, modelName s
 	return "", ""
 }
 
-// extractCallInfo extracts function name before '(' and first arg after '('.
+// extractCallInfo extracts function name before '(' and model name.
+// Supports both function-style find(User, ...) and chain-style User.find(...).
 func (d *Document) extractCallInfo(lines []string, lineIdx, parenCol int) (string, string) {
 	line := lines[lineIdx]
 	// function name before '('
@@ -315,7 +338,22 @@ func (d *Document) extractCallInfo(lines []string, lineIdx, parenCol int) (strin
 	if start < end {
 		funcName = line[start:end]
 	}
-	// first arg after '(' — may be on same line or next
+
+	// chain-style: check for Model.method( pattern — dot before funcName
+	if start > 0 && line[start-1] == '.' {
+		objEnd := start - 1
+		objStart := objEnd - 1
+		for objStart >= 0 && isIdentChar(line[objStart]) {
+			objStart--
+		}
+		objStart++
+		if objStart < objEnd {
+			modelName := line[objStart:objEnd]
+			return funcName, modelName
+		}
+	}
+
+	// function-style: first arg after '(' — may be on same line or next
 	argStr := line[parenCol+1:]
 	argStr = strings.TrimLeft(argStr, " \t")
 	if argStr == "" && lineIdx+1 < len(lines) {
@@ -399,6 +437,249 @@ func (d *Document) ObjectBeforeDot(pos Position) string {
 		return ""
 	}
 	return line[objStart:objEnd]
+}
+
+// FindEnclosingObjectType returns the type name of an enclosing object construction.
+// For example, in `AuthResult { user: expr }`, if the cursor is on `user`,
+// this returns "AuthResult". It scans backward to find the matching `{`,
+// then extracts the uppercase identifier before it.
+func (d *Document) FindEnclosingObjectType(pos Position) string {
+	lines := strings.Split(d.Content, "\n")
+	if pos.Line >= len(lines) {
+		return ""
+	}
+
+	braceDepth := 0
+	lineIdx := pos.Line
+	col := pos.Character
+	if col >= len(lines[lineIdx]) {
+		col = len(lines[lineIdx]) - 1
+	}
+
+	for lineIdx >= 0 {
+		line := lines[lineIdx]
+		start := 0
+		end := len(line) - 1
+		if lineIdx == pos.Line {
+			end = col
+		}
+		for i := end; i >= start; i-- {
+			ch := line[i]
+			if ch == '}' {
+				braceDepth++
+			} else if ch == '{' {
+				if braceDepth == 0 {
+					return d.extractTypeBeforeBrace(lines, lineIdx, i)
+				}
+				braceDepth--
+			}
+		}
+		lineIdx--
+	}
+	return ""
+}
+
+// extractTypeBeforeBrace extracts the uppercase identifier immediately before '{' at the given position.
+// Returns empty string if this is a declaration context (model/type/interface/etc.).
+func (d *Document) extractTypeBeforeBrace(lines []string, lineIdx, braceCol int) string {
+	line := lines[lineIdx]
+	name := extractIdentBeforePos(line, braceCol)
+	if len(name) == 0 || name[0] < 'A' || name[0] > 'Z' {
+		return ""
+	}
+	if precedingWordIsDeclaration(line, braceCol, name) {
+		return ""
+	}
+	return name
+}
+
+// extractIdentBeforePos finds the identifier ending just before pos (skipping spaces).
+func extractIdentBeforePos(line string, pos int) string {
+	end := pos - 1
+	for end >= 0 && line[end] == ' ' {
+		end--
+	}
+	if end < 0 {
+		return ""
+	}
+	idEnd := end + 1
+	idStart := end
+	for idStart >= 0 && isIdentChar(line[idStart]) {
+		idStart--
+	}
+	idStart++
+	if idStart >= idEnd {
+		return ""
+	}
+	return line[idStart:idEnd]
+}
+
+// precedingWordIsDeclaration checks if the word before the type name is a declaration keyword.
+func precedingWordIsDeclaration(line string, braceCol int, typeName string) bool {
+	// find where the type name starts
+	nameStart := braceCol - 1
+	for nameStart >= 0 && line[nameStart] == ' ' {
+		nameStart--
+	}
+	nameStart = nameStart - len(typeName) + 1
+	kwEnd := nameStart - 1
+	for kwEnd >= 0 && line[kwEnd] == ' ' {
+		kwEnd--
+	}
+	if kwEnd < 0 {
+		return false
+	}
+	kwStart := kwEnd
+	for kwStart >= 0 && isIdentChar(line[kwStart]) {
+		kwStart--
+	}
+	kwStart++
+	return isDeclarationKeyword(line[kwStart : kwEnd+1])
+}
+
+// isDeclarationKeyword returns true if the word is a Luxo declaration keyword
+// that introduces a type definition (not an object construction).
+func isDeclarationKeyword(word string) bool {
+	switch word {
+	case "model", "type", "interface", "enum", "sealed", "error", "event", "extend", "middleware":
+		return true
+	}
+	return false
+}
+
+// IsInsideMyLoadCall checks if the cursor position is inside a my.load(...) call.
+// Returns true if the enclosing call is "load" and the identifier before "load(" is "my.".
+func (d *Document) IsInsideMyLoadCall(pos Position) bool {
+	lines := strings.Split(d.Content, "\n")
+	if pos.Line >= len(lines) {
+		return false
+	}
+
+	// find the enclosing '(' by scanning backward
+	parenDepth := 0
+	lineIdx := pos.Line
+	col := pos.Character
+	if col >= len(lines[lineIdx]) {
+		col = len(lines[lineIdx]) - 1
+	}
+
+	for lineIdx >= 0 {
+		line := lines[lineIdx]
+		start := 0
+		end := len(line) - 1
+		if lineIdx == pos.Line {
+			end = col
+		}
+		for i := end; i >= start; i-- {
+			ch := line[i]
+			if ch == ')' {
+				parenDepth++
+			} else if ch == '(' {
+				if parenDepth == 0 {
+					// found the opening paren — check if preceded by "my.load"
+					return isMyLoadBefore(line, i)
+				}
+				parenDepth--
+			}
+		}
+		lineIdx--
+	}
+	return false
+}
+
+// isMyLoadBefore checks if the text before parenCol is "my.load".
+func isMyLoadBefore(line string, parenCol int) bool {
+	// extract identifier before '('
+	end := parenCol
+	start := end - 1
+	for start >= 0 && isIdentChar(line[start]) {
+		start--
+	}
+	start++
+	if start >= end {
+		return false
+	}
+	funcName := line[start:end]
+	if funcName != "load" {
+		return false
+	}
+	// check for "my." before "load"
+	dotPos := start - 1
+	if dotPos < 0 || line[dotPos] != '.' {
+		return false
+	}
+	objEnd := dotPos
+	objStart := objEnd - 1
+	for objStart >= 0 && isIdentChar(line[objStart]) {
+		objStart--
+	}
+	objStart++
+	if objStart >= objEnd {
+		return false
+	}
+	return line[objStart:objEnd] == "my"
+}
+
+// IsInsideScopeDirective checks if the cursor is inside @scope(...) arguments.
+// Returns true when pos is between the '(' and ')' of @scope(...).
+func (d *Document) IsInsideScopeDirective(pos Position) bool {
+	lines := strings.Split(d.Content, "\n")
+	if pos.Line >= len(lines) {
+		return false
+	}
+
+	// scan backward from cursor to find enclosing '('
+	// LSP cursor position is *before* the character at that index,
+	// so we scan from col-1 to avoid including the character at cursor.
+	parenDepth := 0
+	lineIdx := pos.Line
+	col := pos.Character - 1
+	if col >= len(lines[lineIdx]) {
+		col = len(lines[lineIdx]) - 1
+	}
+
+	for lineIdx >= 0 {
+		line := lines[lineIdx]
+		start := 0
+		end := len(line) - 1
+		if lineIdx == pos.Line {
+			end = col
+		}
+		for i := end; i >= start; i-- {
+			ch := line[i]
+			if ch == ')' {
+				parenDepth++
+			} else if ch == '(' {
+				if parenDepth == 0 {
+					return isScopeDirectiveBefore(line, i)
+				}
+				parenDepth--
+			}
+		}
+		lineIdx--
+	}
+	return false
+}
+
+// isScopeDirectiveBefore checks if "@scope" appears immediately before the '(' at parenCol.
+func isScopeDirectiveBefore(line string, parenCol int) bool {
+	// extract identifier before '('
+	end := parenCol
+	start := end - 1
+	for start >= 0 && isIdentChar(line[start]) {
+		start--
+	}
+	start++
+	if start >= end {
+		return false
+	}
+	name := line[start:end]
+	if name != "scope" {
+		return false
+	}
+	// check for '@' before "scope"
+	atPos := start - 1
+	return atPos >= 0 && line[atPos] == '@'
 }
 
 func isIdentChar(b byte) bool {

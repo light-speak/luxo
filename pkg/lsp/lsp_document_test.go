@@ -582,3 +582,116 @@ func TestFormatSymbolHoverNoDoc(t *testing.T) {
 		t.Error("should not have doc separator when no doc")
 	}
 }
+
+// ========== Coverage: extractCallInfo — function-style arg on next line ==========
+
+func TestExtractCallInfoArgOnNextLine(t *testing.T) {
+	doc := &Document{Content: "find(\n  User, where: id == 1)"}
+	fn, model := doc.FindEnclosingCall(Position{Line: 1, Character: 10})
+	if fn != "find" {
+		t.Errorf("expected 'find', got %q", fn)
+	}
+	if model != "User" {
+		t.Errorf("expected 'User', got %q", model)
+	}
+}
+
+// ========== Coverage: FindEnclosingObjectType — col >= len(line) ==========
+
+func TestFindEnclosingObjectTypeColBeyondLine(t *testing.T) {
+	store := NewDocumentStore()
+	// cursor is inside braces but col exceeds line length — triggers col clamping
+	store.Open("file:///test.luxo", 1, "MyType { x: 1\n  y: 2 }")
+	doc := store.Get("file:///test.luxo")
+	// line 0 has 13 chars ("MyType { x: 1"), character 999 is beyond — should clamp to 12
+	// scanning backward from col 12 finds '{' at index 7, then extracts "MyType"
+	typeName := doc.FindEnclosingObjectType(Position{Line: 0, Character: 999})
+	if typeName != "MyType" {
+		t.Errorf("expected 'MyType' with clamped col, got %q", typeName)
+	}
+}
+
+// ========== Coverage: FindEnclosingObjectType — no matching brace (lineIdx < 0) ==========
+
+func TestFindEnclosingObjectTypeNoBrace(t *testing.T) {
+	store := NewDocumentStore()
+	store.Open("file:///test.luxo", 1, "just text without braces")
+	doc := store.Get("file:///test.luxo")
+	typeName := doc.FindEnclosingObjectType(Position{Line: 0, Character: 10})
+	if typeName != "" {
+		t.Errorf("expected empty for no braces, got %q", typeName)
+	}
+}
+
+// ========== Coverage: extractIdentBeforePos — only spaces before pos ==========
+
+func TestExtractIdentBeforePosOnlySpaces(t *testing.T) {
+	result := extractIdentBeforePos("     {", 5)
+	if result != "" {
+		t.Errorf("expected empty for only spaces before brace, got %q", result)
+	}
+}
+
+// ========== Coverage: isDeclarationKeyword — non-keyword returns false ==========
+
+func TestIsDeclarationKeywordFalse(t *testing.T) {
+	cases := []string{"api", "fn", "val", "if", "for", "User", ""}
+	for _, kw := range cases {
+		if isDeclarationKeyword(kw) {
+			t.Errorf("expected false for %q", kw)
+		}
+	}
+}
+
+func TestIsDeclarationKeywordAllTrue(t *testing.T) {
+	cases := []string{"model", "type", "interface", "enum", "sealed", "error", "event", "extend", "middleware"}
+	for _, kw := range cases {
+		if !isDeclarationKeyword(kw) {
+			t.Errorf("expected true for %q", kw)
+		}
+	}
+}
+
+// ========== Coverage: IsInsideMyLoadCall — col >= len(line) ==========
+
+func TestIsInsideMyLoadCallColBeyondLine(t *testing.T) {
+	store := NewDocumentStore()
+	// cursor on line 1 which is "  name" (inside the call), col exceeds line length — triggers clamping
+	store.Open("file:///test.luxo", 1, "my.load(\n  name\n)")
+	doc := store.Get("file:///test.luxo")
+	// line 1 is "  name" (len=6), col=999 clamps to 5
+	result := doc.IsInsideMyLoadCall(Position{Line: 1, Character: 999})
+	if !result {
+		t.Error("expected true for my.load with clamped col")
+	}
+}
+
+// ========== Coverage: isMyLoadBefore — objStart >= objEnd (e.g., ".load(") ==========
+
+func TestIsMyLoadBeforeNoObject(t *testing.T) {
+	// ".load(" — dot before load but no object name
+	result := isMyLoadBefore(".load(", 5)
+	if result {
+		t.Error("expected false when no object before dot")
+	}
+}
+
+// ========== Coverage: isScopeDirectiveBefore — start >= end (no identifier before paren) ==========
+
+func TestIsScopeDirectiveBeforeNoIdent(t *testing.T) {
+	// "(" alone — no identifier before paren
+	result := isScopeDirectiveBefore("(", 0)
+	if result {
+		t.Error("expected false when no identifier before paren")
+	}
+}
+
+// ========== Coverage: extractIdentBeforePos — non-ident char before pos ==========
+
+func TestExtractIdentBeforePosNonIdentChar(t *testing.T) {
+	// "= {" — char before brace is '=' (not ident), so idStart >= idEnd
+	result := extractIdentBeforePos("= {", 2)
+	if result != "" {
+		t.Errorf("expected empty for non-ident char before brace, got %q", result)
+	}
+}

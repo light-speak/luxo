@@ -26,6 +26,7 @@ func (e Error) Error() string {
 // Warning represents a semantic warning.
 type Warning struct {
 	Pos     token.Position
+	NameLen int // length of the identifier for diagnostic range
 	Message string
 }
 
@@ -46,6 +47,7 @@ type Analyzer struct {
 	inLambda      bool // true when checking inside a lambda body
 	inTransaction bool // true when checking inside a transaction block
 	inAwait       bool // true when checking inside an await block
+	inCallFunc    bool // true when checking the Func part of a CallExpr
 	files         []*ast.File
 }
 
@@ -93,6 +95,11 @@ func (a *Analyzer) Analyze(files []*ast.File) *Result {
 
 	// Pass 5: check circular event dependencies
 	a.checkEventCycles()
+
+	// Pass 6: query optimization analysis
+	for _, file := range files {
+		a.analyzeQueries(file)
+	}
 
 	return &Result{
 		Scope:    a.scope,
@@ -262,7 +269,11 @@ func (a *Analyzer) resolveModelFields(file *ast.File) {
 				typ.Fields[fi.Name] = fi
 			}
 		}
-		a.checkDirectives(m.Directives, "model")
+		a.checkDirectives(m.Directives, OnModel)
+		// @withAuth: inject .createToken(), .verify(), .refreshToken() methods
+		if hasModelDirective(m.Directives, "withAuth") {
+			a.injectWithAuthMethods(typ, m.Directives)
+		}
 	}
 }
 
@@ -314,8 +325,74 @@ func (a *Analyzer) resolveApiTypes(file *ast.File) {
 		for _, p := range api.Params {
 			a.resolveTypeRef(p.Type, api.Pos)
 		}
-		a.checkDirectives(api.Directives, "api")
+		a.checkDirectives(api.Directives, OnApi)
+		a.validateScopeDirective(api)
 	}
+}
+
+// validateScopeDirective checks @scope usage on an API:
+// 1. The return type must be a model (not a custom type, enum, etc.)
+// 2. Each scope name must exist on the target model
+func (a *Analyzer) validateScopeDirective(api *ast.ApiDecl) {
+	for _, d := range api.Directives {
+		if d.Name != "scope" {
+			continue
+		}
+		// resolve the base return type name (strip list wrapper)
+		baseTypeName := ""
+		if api.ReturnType != nil {
+			baseTypeName = api.ReturnType.Name
+		}
+		if baseTypeName == "" {
+			a.addWarning(d.Pos, "@scope can only be used on APIs returning a model type / @scope 只能用在返回模型类型的 API 上")
+			return
+		}
+		typ, ok := a.types[baseTypeName]
+		if !ok {
+			return // type not found — already reported by resolveTypeRef
+		}
+		if typ.Kind != TypeModel {
+			a.addWarning(d.Pos, "@scope can only be used on APIs returning a model type, '%s' is %s / @scope 只能用在返回模型类型的 API 上，'%s' 是 %s",
+				baseTypeName, typ.Kind, baseTypeName, typ.Kind)
+			return
+		}
+		// validate each scope name arg exists on the model
+		modelScopes := a.findModelScopes(baseTypeName)
+		for _, arg := range d.Args {
+			scopeName := ""
+			if ident, ok := arg.Value.(*ast.Ident); ok {
+				scopeName = ident.Name
+			}
+			if scopeName == "" {
+				continue
+			}
+			if !stringInSlice(scopeName, modelScopes) {
+				closest := findClosestString(scopeName, modelScopes)
+				if closest != "" {
+					a.addError(d.Pos, "scope '%s' not found on model '%s', did you mean '%s'? / 模型 '%s' 上未找到 scope '%s'，你是不是想写 '%s'？",
+						scopeName, baseTypeName, closest, baseTypeName, scopeName, closest)
+				} else {
+					a.addError(d.Pos, "scope '%s' not found on model '%s' / 模型 '%s' 上未找到 scope '%s'",
+						scopeName, baseTypeName, baseTypeName, scopeName)
+				}
+			}
+		}
+	}
+}
+
+// findModelScopes returns all scope names defined on a model across all files.
+func (a *Analyzer) findModelScopes(modelName string) []string {
+	var scopes []string
+	for _, file := range a.files {
+		for _, m := range file.Models {
+			if m.Name == modelName {
+				for _, sc := range m.Scopes {
+					scopes = append(scopes, sc.Name)
+				}
+			}
+		}
+	}
+	return scopes
 }
 
 func (a *Analyzer) resolveFnTypes(file *ast.File) {
@@ -330,6 +407,7 @@ func (a *Analyzer) resolveFnTypes(file *ast.File) {
 		for _, p := range fn.Params {
 			a.resolveTypeRef(p.Type, fn.Pos)
 		}
+		a.checkDirectives(fn.Directives, OnFn)
 	}
 }
 
@@ -399,11 +477,7 @@ func (a *Analyzer) resolveTypeRef(ref *ast.TypeRef, pos token.Position) *Resolve
 		return result
 	}
 
-	// Stream type: strip "stream " prefix
 	name := ref.Name
-	if after, ok := strings.CutPrefix(name, "stream "); ok {
-		name = after
-	}
 
 	// Look up the type
 	typ, ok := a.types[name]
@@ -463,6 +537,7 @@ func (a *Analyzer) checkBodies(file *ast.File) {
 				Type: a.types["Identity"],
 			})
 			a.checkBlock(api.Body, scope)
+			a.checkUnusedVariables(scope)
 		}
 	}
 
@@ -479,7 +554,12 @@ func (a *Analyzer) checkBodies(file *ast.File) {
 				})
 			}
 			a.checkBlock(fn.Body, scope)
+			a.checkUnusedVariables(scope)
 		}
+	}
+
+	for _, mw := range file.Middlewares {
+		a.checkDirectives(mw.Directives, OnMiddleware)
 	}
 
 	for _, on := range file.Listeners {
@@ -520,6 +600,8 @@ func isTerminating(stmt ast.Stmt) bool {
 		return true
 	case *ast.BreakStmt:
 		return true
+	case *ast.ContinueStmt:
+		return true
 	case *ast.ThrowStmt:
 		return true
 	}
@@ -558,6 +640,9 @@ func (a *Analyzer) checkStmt(stmt ast.Stmt, scope *Scope) {
 	case *ast.BreakStmt:
 		// valid in any loop context, no check needed at semantic level
 
+	case *ast.ContinueStmt:
+		// valid in any loop context, no check needed at semantic level
+
 	case *ast.ExprStmt:
 		if s.Expr != nil {
 			a.checkExpr(s.Expr, scope)
@@ -570,11 +655,15 @@ func (a *Analyzer) checkValStmt(s *ast.ValStmt, scope *Scope) {
 	if len(s.Names) > 0 {
 		a.defineDestructured(s, exprType, scope)
 	} else {
+		pos := s.NamePos
+		if pos.Line == 0 {
+			pos = s.Pos // fallback for older AST without NamePos
+		}
 		scope.Define(&Symbol{
 			Name:    s.Name,
 			Kind:    SymVariable,
 			Type:    exprType,
-			Pos:     s.Pos,
+			Pos:     pos,
 			Mutable: s.Mutable,
 		})
 	}
@@ -614,6 +703,14 @@ func (a *Analyzer) checkAssignStmt(s *ast.AssignStmt, scope *Scope) {
 	if ident, ok := s.Target.(*ast.Ident); ok {
 		if sym := scope.Lookup(ident.Name); sym != nil && sym.Kind == SymVariable && !sym.Mutable {
 			a.addError(s.Pos, "cannot assign to immutable variable '%s' (declared with val) / 不能给不可变变量 '%s' 赋值（使用 val 声明）", ident.Name, ident.Name)
+		}
+	}
+	// 1.4: mark compound assignment on model member as atomic
+	if s.Op == "+=" || s.Op == "-=" {
+		if member, ok := s.Target.(*ast.MemberExpr); ok {
+			if objType := a.checkExpr(member.Object, scope); objType != nil && objType.Kind == TypeModel {
+				s.Atomic = true
+			}
 		}
 	}
 }
@@ -734,6 +831,8 @@ func (a *Analyzer) checkCompositeExpr(expr ast.Expr, scope *Scope) *ResolvedType
 		a.checkStmt(e, scope)
 		return nil // yield type inference is complex, return nil for now
 	}
+	// unreachable: all known ast.Expr types are covered by checkExpr + checkCompositeExpr switches;
+	// kept as defensive fallback required by Go's type system.
 	return nil
 }
 
@@ -809,29 +908,47 @@ func (a *Analyzer) checkMemberExpr(e *ast.MemberExpr, scope *Scope) *ResolvedTyp
 		a.addWarning(e.Pos, "unnecessary safe call (?.) on non-null type '%s' / 对非空类型 '%s' 使用了不必要的安全调用 (?.)", objType.Name, objType.Name)
 	}
 
-	// debug chain methods — valid on all types, return self
-	if isDebugMethod(e.Field) {
-		return objType
+	a.warnStringContains(e, objType)
+
+	if result, ok := a.resolveMemberMethod(e, objType); ok {
+		return result
 	}
 
-	// warn about .contains() on String (non-list) without @search — generates LIKE '%%...%%'
+	return a.resolveFieldAccess(e, objType)
+}
+
+// warnStringContains warns about .contains() on String (non-list) without @search.
+func (a *Analyzer) warnStringContains(e *ast.MemberExpr, objType *ResolvedType) {
 	if e.Field == "contains" && objType.Kind == TypeString && !objType.IsList {
 		if !a.hasSearchDirective(e.Object) {
 			a.addWarning(e.Pos, "'contains' generates LIKE '%%%%...%%%%' which causes full table scan, consider @search for full-text index / 'contains' 会生成 LIKE 模糊查询导致全表扫描，建议使用 @search 全文索引")
 		}
 	}
+}
 
+// resolveMemberMethod attempts to resolve the member access as a built-in method call.
+// Returns (result, true) if resolved, (nil, false) if it should fall through to field access.
+func (a *Analyzer) resolveMemberMethod(e *ast.MemberExpr, objType *ResolvedType) (*ResolvedType, bool) {
+	// debug chain methods — valid on all types, return self
+	if isDebugMethod(e.Field) {
+		return objType, true
+	}
+	// query builder chain methods — Model.where(...).sum(...) etc.
+	if objType.Kind == TypeModel && isQueryMethod(e.Field) {
+		return a.resolveQueryMethod(e.Field, objType), true
+	}
+	if objType.Kind == TypeQueryBuilder && isQueryMethod(e.Field) {
+		return a.resolveQueryMethod(e.Field, objType.ModelType), true
+	}
 	// collection methods on list types
 	if objType.IsList && isCollectionMethod(e.Field) {
-		return a.resolveCollectionMethod(e.Field, objType)
+		return a.resolveCollectionMethod(e.Field, objType), true
 	}
-
 	// .let scope function — works on any type
 	if e.Field == "let" {
-		return nil // lambda return type, can't infer
+		return nil, true
 	}
-
-	return a.resolveFieldAccess(e, objType)
+	return nil, false
 }
 
 // resolveFieldAccess resolves a field or enum value access on a type.
@@ -849,6 +966,12 @@ func (a *Analyzer) resolveFieldAccess(e *ast.MemberExpr, objType *ResolvedType) 
 		return nil
 	}
 
+	// method fields require () to call
+	if field.IsMethod && !a.inCallFunc {
+		a.addError(e.Pos, "'%s' is a method, use %s() / '%s' 是方法，请使用 %s()", e.Field, e.Field, e.Field, e.Field)
+		return field.Type
+	}
+
 	result := field.Type
 	if result != nil && e.SafeCall {
 		result = result.AsNullable()
@@ -857,13 +980,14 @@ func (a *Analyzer) resolveFieldAccess(e *ast.MemberExpr, objType *ResolvedType) 
 }
 
 func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
+	prev := a.inCallFunc
+	a.inCallFunc = true
 	a.checkExpr(e.Func, scope)
+	a.inCallFunc = prev
 
-	// check CRUD inside lambda
-	if a.inLambda {
-		if ident, ok := e.Func.(*ast.Ident); ok && isCRUDOp(ident.Name) {
-			a.addError(e.Pos, "database query inside collection lambda is forbidden, use batch query instead / 集合 lambda 内禁止数据库查询，请使用批量查询")
-		}
+	// check CRUD inside lambda (function-style and chain-style)
+	if a.inLambda && isCRUDCall(e) {
+		a.addError(e.Pos, "database query inside collection lambda is forbidden, use batch query instead / 集合 lambda 内禁止数据库查询，请使用批量查询")
 	}
 
 	// transaction { ... } — parsed as CallExpr(Ident("transaction"), [LambdaExpr])
@@ -879,9 +1003,27 @@ func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
 	}
 
 	callScope := a.injectCRUDScope(e, scope)
+	isCRUD := isCRUDIdent(e)
+
+	// orderBy(field.desc) — sort expressions are not normal expressions, skip checking
+	if isOrderByMethod(e) {
+		return a.inferCallReturnType(e)
+	}
 
 	for _, arg := range e.Args {
+		// skip order/select/include/distinct — these use query modifier syntax (field.desc)
+		if isCRUD && isQueryModifierArg(arg.Name) {
+			continue
+		}
 		a.checkExpr(arg.Value, callScope)
+	}
+
+	// 1.3: check create required fields (function-style and chain-style)
+	if ident, ok := e.Func.(*ast.Ident); ok && ident.Name == "create" {
+		a.checkCreateRequiredFields(e)
+	}
+	if method, _ := chainCRUDInfo(e); method == "create" {
+		a.checkChainCreateRequiredFields(e)
 	}
 
 	return a.inferCallReturnType(e)
@@ -928,19 +1070,31 @@ func (a *Analyzer) isMyMethodCall(e *ast.CallExpr) bool {
 }
 
 // injectCRUDScope creates a child scope with model fields injected for CRUD operations.
+// Handles both function-style find(User, where: ...) and chain-style User.find(where: ...).
 func (a *Analyzer) injectCRUDScope(e *ast.CallExpr, scope *Scope) *Scope {
-	ident, ok := e.Func.(*ast.Ident)
-	if !ok || !isCRUDOp(ident.Name) || len(e.Args) == 0 {
+	var modelType *ResolvedType
+
+	// function-style: find(User, where: ...)
+	if ident, ok := e.Func.(*ast.Ident); ok && isCRUDOp(ident.Name) && len(e.Args) > 0 {
+		if modelIdent, ok := e.Args[0].Value.(*ast.Ident); ok {
+			modelType = a.types[modelIdent.Name]
+		}
+	}
+
+	// chain-style: User.find(where: ...), User.where(email == ...)
+	if _, modelName := chainCRUDInfo(e); modelName != "" {
+		modelType = a.types[modelName]
+	}
+
+	// chain on query builder variable: orders.sum(total) where orders is TypeQueryBuilder
+	if modelType == nil {
+		modelType = a.resolveChainModelType(e, scope)
+	}
+
+	if modelType == nil {
 		return scope
 	}
-	modelIdent, ok := e.Args[0].Value.(*ast.Ident)
-	if !ok {
-		return scope
-	}
-	modelType, ok := a.types[modelIdent.Name]
-	if !ok {
-		return scope
-	}
+
 	callScope := scope.Child()
 	a.defineFieldsInScope(callScope, modelType)
 	for _, parent := range modelType.Parents {
@@ -975,7 +1129,8 @@ func (a *Analyzer) collectAmbiguousIdents(expr ast.Expr, callScope *Scope, outer
 	}
 	switch e := expr.(type) {
 	case *ast.Ident:
-		// bare ident is not ambiguous on its own — only same-name comparison (x == x) is
+		// bare ident is not ambiguous on its own — only same-name comparison (x == x) is.
+		// No executable code here; Go coverage considers this switch branch uncoverable.
 	case *ast.BinaryExpr:
 		a.checkBinaryAmbiguity(e, callScope, outerScope)
 	case *ast.UnaryExpr:
@@ -1035,22 +1190,30 @@ func (a *Analyzer) defineFieldsInScope(scope *Scope, typ *ResolvedType) {
 
 // inferCallReturnType infers the return type of a call expression.
 func (a *Analyzer) inferCallReturnType(e *ast.CallExpr) *ResolvedType {
-	ident, ok := e.Func.(*ast.Ident)
-	if !ok {
+	// function-style CRUD: find(User, ...)
+	if ident, ok := e.Func.(*ast.Ident); ok {
+		if isCRUDOp(ident.Name) && len(e.Args) > 0 {
+			return a.inferCRUDReturnType(e, ident.Name)
+		}
+		sym := a.scope.Lookup(ident.Name)
+		if sym != nil {
+			return sym.Type
+		}
 		return nil
 	}
-	if isCRUDOp(ident.Name) && len(e.Args) > 0 {
-		return a.inferCRUDReturnType(e, ident.Name)
-	}
-	sym := a.scope.Lookup(ident.Name)
-	if sym != nil {
-		return sym.Type
+	// chain-style CRUD: User.find(...)
+	if method, modelName := chainCRUDInfo(e); method != "" {
+		return a.inferChainCRUDReturnType(e, method, modelName)
 	}
 	return nil
 }
 
 // inferCRUDReturnType infers the return type for CRUD operations.
 func (a *Analyzer) inferCRUDReturnType(e *ast.CallExpr, opName string) *ResolvedType {
+	// aggregate/groupBy/raw/paginate have dynamic return types
+	if isDynamicReturnCRUD(opName) {
+		return nil
+	}
 	modelIdent, ok := e.Args[0].Value.(*ast.Ident)
 	if !ok {
 		return nil
@@ -1059,32 +1222,281 @@ func (a *Analyzer) inferCRUDReturnType(e *ast.CallExpr, opName string) *Resolved
 	if !ok {
 		return nil
 	}
-	if opName == "find" {
+	switch opName {
+	case "find":
 		return a.inferFindReturnType(e, modelType)
+	case "findFirst":
+		return modelType.AsNullable()
+	case "findMany", "createMany":
+		return modelType.AsList()
+	case "create", "update", "upsert", "delete", "save":
+		return modelType
+	case "deleteMany", "updateMany", "count":
+		return a.types["Int"]
+	case "exists":
+		return a.types["Boolean"]
+	}
+	// unreachable: all known CRUD ops are handled above or filtered by isDynamicReturnCRUD;
+	// kept as defensive fallback.
+	return modelType
+}
+
+// isDynamicReturnCRUD returns true for CRUD ops with dynamic return types.
+func isDynamicReturnCRUD(opName string) bool {
+	switch opName {
+	case "aggregate", "groupBy", "raw", "paginate":
+		return true
+	}
+	return false
+}
+
+// inferFindReturnType returns list type for where queries, non-nullable for id queries
+// (find auto-throws NotFound when record is missing; use first() for nullable).
+func (a *Analyzer) inferFindReturnType(e *ast.CallExpr, modelType *ResolvedType) *ResolvedType {
+	for _, arg := range e.Args {
+		if arg.Name == "where" {
+			return modelType.AsList()
+		}
 	}
 	return modelType
 }
 
-// inferFindReturnType returns list type for where queries, nullable for id queries.
-func (a *Analyzer) inferFindReturnType(e *ast.CallExpr, modelType *ResolvedType) *ResolvedType {
-	for _, arg := range e.Args {
-		if arg.Name == "where" {
-			return &ResolvedType{
-				Kind:    modelType.Kind,
-				Name:    modelType.Name,
-				IsList:  true,
-				Fields:  modelType.Fields,
-				Parents: modelType.Parents,
-			}
+// inferChainCRUDReturnType infers the return type for chain-style CRUD: Model.find(...), Model.create(...), etc.
+func (a *Analyzer) inferChainCRUDReturnType(e *ast.CallExpr, method string, modelName string) *ResolvedType {
+	if isDynamicReturnCRUD(method) {
+		return nil
+	}
+	modelType, ok := a.types[modelName]
+	if !ok {
+		return nil
+	}
+	switch method {
+	case "find":
+		return a.inferFindReturnType(e, modelType)
+	case "findFirst":
+		return modelType.AsNullable()
+	case "findMany", "createMany":
+		return modelType.AsList()
+	case "create", "update", "upsert", "delete", "save":
+		return modelType
+	case "deleteMany", "updateMany", "count":
+		return a.types["Int"]
+	case "exists":
+		return a.types["Boolean"]
+	}
+	// unreachable: all known CRUD ops are handled above or filtered by isDynamicReturnCRUD;
+	// kept as defensive fallback.
+	return modelType
+}
+
+// checkChainCreateRequiredFields checks required fields for chain-style User.create(...).
+func (a *Analyzer) checkChainCreateRequiredFields(e *ast.CallExpr) {
+	_, modelName := chainCRUDInfo(e)
+	modelType, ok := a.types[modelName]
+	if !ok || modelType.Fields == nil {
+		return
+	}
+	provided := collectProvidedFields(e.Args)
+	for _, field := range modelType.Fields {
+		if isAutoManagedField(field) || provided[field.Name] {
+			continue
+		}
+		a.addWarning(e.Pos, "missing required field '%s' in %s.create(...) / %s.create(...) 缺少必填字段 '%s'",
+			field.Name, modelName, modelName, field.Name)
+	}
+}
+
+// checkCreateRequiredFields checks that all required fields are provided in create().
+func (a *Analyzer) checkCreateRequiredFields(e *ast.CallExpr) {
+	if len(e.Args) == 0 {
+		return
+	}
+	modelIdent, ok := e.Args[0].Value.(*ast.Ident)
+	if !ok {
+		return
+	}
+	modelType, ok := a.types[modelIdent.Name]
+	if !ok || modelType.Fields == nil {
+		return
+	}
+	provided := collectProvidedFields(e.Args[1:])
+	for _, field := range modelType.Fields {
+		if isAutoManagedField(field) || provided[field.Name] {
+			continue
+		}
+		a.addWarning(e.Pos, "missing required field '%s' in create(%s, ...) / create(%s, ...) 缺少必填字段 '%s'",
+			field.Name, modelIdent.Name, modelIdent.Name, field.Name)
+	}
+}
+
+func collectProvidedFields(args []*ast.NamedArg) map[string]bool {
+	provided := map[string]bool{}
+	for _, arg := range args {
+		if arg.Name != "" {
+			provided[arg.Name] = true
 		}
 	}
-	return modelType.AsNullable()
+	return provided
+}
+
+// isAutoManagedField returns true for fields that don't need explicit values in create().
+func isAutoManagedField(field *FieldInfo) bool {
+	if field.Nullable || field.HasDefault || field.Computed || field.IsMethod {
+		return true
+	}
+	if hasDirective(field.Directives, "auto") || hasDirective(field.Directives, "id") {
+		return true
+	}
+	return field.Name == "createdAt" || field.Name == "updatedAt" || field.Name == "deletedAt" || field.Name == "id"
+}
+
+func hasDirective(directives []string, name string) bool {
+	for _, d := range directives {
+		if d == name {
+			return true
+		}
+	}
+	return false
+}
+
+// isCRUDIdent returns true if the call is a CRUD operation (function-style or chain-style).
+// isCRUDCall returns true if the call is a CRUD operation (function-style or chain-style).
+func isCRUDCall(e *ast.CallExpr) bool {
+	if ident, ok := e.Func.(*ast.Ident); ok && isDBQueryOp(ident.Name) {
+		return true
+	}
+	if member, ok := e.Func.(*ast.MemberExpr); ok && isDBQueryOp(member.Field) {
+		return true
+	}
+	return false
+}
+
+func isCRUDIdent(e *ast.CallExpr) bool {
+	if ident, ok := e.Func.(*ast.Ident); ok {
+		return isCRUDOp(ident.Name)
+	}
+	// chain-style: Model.find(...), User.create(...)
+	if member, ok := e.Func.(*ast.MemberExpr); ok {
+		return isCRUDOp(member.Field)
+	}
+	return false
+}
+
+// chainCRUDInfo extracts the CRUD method name and model name from a chain-style call.
+// Supports both direct chain (User.find(...)) and query chain (User.where(...)).
+// Returns ("", "") if not a chain-style CRUD/query call.
+func chainCRUDInfo(e *ast.CallExpr) (method string, modelName string) {
+	member, ok := e.Func.(*ast.MemberExpr)
+	if !ok {
+		return "", ""
+	}
+	if !isCRUDOp(member.Field) && !isQueryMethod(member.Field) {
+		return "", ""
+	}
+	// direct: User.where(...)
+	if ident, ok := member.Object.(*ast.Ident); ok {
+		return member.Field, ident.Name
+	}
+	return member.Field, ""
+}
+
+// resolveChainModelType resolves the underlying model type from a chain call on a variable.
+// e.g., orders.sum(total) where orders: TypeQueryBuilder → returns the model type.
+func (a *Analyzer) resolveChainModelType(e *ast.CallExpr, scope *Scope) *ResolvedType {
+	member, ok := e.Func.(*ast.MemberExpr)
+	if !ok {
+		return nil
+	}
+	return a.resolveModelFromExpr(member.Object, scope)
+}
+
+// resolveModelFromExpr extracts the underlying model type from an expression.
+// Handles: Ident (variable), MemberExpr (Model.where), CallExpr (Order.where(...).sum).
+func (a *Analyzer) resolveModelFromExpr(expr ast.Expr, scope *Scope) *ResolvedType {
+	switch obj := expr.(type) {
+	case *ast.Ident:
+		// variable: orders.sum(total) — look up variable type
+		sym := scope.Lookup(obj.Name)
+		if sym != nil && sym.Type != nil {
+			if sym.Type.Kind == TypeQueryBuilder && sym.Type.ModelType != nil {
+				return sym.Type.ModelType
+			}
+			if sym.Type.Kind == TypeModel {
+				return sym.Type
+			}
+		}
+		// model name directly: Order.sum(total)
+		if t := a.types[obj.Name]; t != nil && t.Kind == TypeModel {
+			return t
+		}
+	case *ast.CallExpr:
+		// chained call: Order.where(...).sum(total) — recurse into the call's func
+		if m, ok := obj.Func.(*ast.MemberExpr); ok {
+			return a.resolveModelFromExpr(m.Object, scope)
+		}
+	}
+	return nil
+}
+
+// isQueryModifierArg returns true for CRUD named args that use query modifier syntax.
+// isOrderByMethod returns true if the call is an orderBy chain method
+// whose args are sort expressions (field.desc, field.asc), not normal expressions.
+func isOrderByMethod(e *ast.CallExpr) bool {
+	member, ok := e.Func.(*ast.MemberExpr)
+	if !ok {
+		return false
+	}
+	return member.Field == "orderBy"
+}
+
+func isQueryModifierArg(name string) bool {
+	switch name {
+	case "order", "select", "include", "distinct",
+		"by", "sum", "avg", "min", "max",
+		"having", "page", "pageSize", "cursor", "limit",
+		"params":
+		return true
+	}
+	return false
 }
 
 func isCRUDOp(name string) bool {
 	switch name {
-	case "find", "create", "update", "delete":
+	case "find", "findFirst", "findMany",
+		"create", "createMany",
+		"update", "updateMany",
+		"delete", "deleteMany",
+		"upsert", "count", "exists",
+		"aggregate", "groupBy", "raw", "paginate",
+		"save":
 		return true
+	}
+	return false
+}
+
+// isDBQueryOp returns true for operations that trigger a database query.
+// Used to forbid DB queries inside collection lambdas.
+// Excludes aggregate methods (sum, avg, count, etc.) which are valid in groupBy lambdas.
+func isDBQueryOp(name string) bool {
+	switch name {
+	case "find", "findFirst", "findMany",
+		"create", "createMany",
+		"update", "updateMany",
+		"delete", "deleteMany",
+		"upsert", "raw":
+		return true
+	}
+	return false
+}
+
+// isAggregateFieldRefCall returns true for aggregate/groupBy calls whose args
+// are field name references (not variables) and should not be expression-checked.
+func isAggregateFieldRefCall(e *ast.CallExpr) bool {
+	if ident, ok := e.Func.(*ast.Ident); ok {
+		return ident.Name == "aggregate" || ident.Name == "groupBy"
+	}
+	if member, ok := e.Func.(*ast.MemberExpr); ok {
+		return member.Field == "aggregate" || member.Field == "groupBy"
 	}
 	return false
 }
@@ -1137,7 +1549,12 @@ func (a *Analyzer) checkWhenExpr(e *ast.WhenExpr, scope *Scope) *ResolvedType {
 			a.checkExpr(b.Condition, scope)
 		}
 		if b.Body != nil {
-			a.checkExpr(b.Body, scope)
+			// sealed variant narrowing: inject variant fields into subject
+			branchScope := scope
+			if b.IsType != "" && subjectType != nil && subjectType.Kind == TypeSealed {
+				branchScope = a.injectSealedVariantFields(scope, subjectType, b.IsType, e.Subject)
+			}
+			a.checkExpr(b.Body, branchScope)
 		}
 	}
 	if e.Else != nil {
@@ -1219,11 +1636,15 @@ func (a *Analyzer) collectEnumValues(expr ast.Expr, matched map[string]bool) {
 
 func (a *Analyzer) checkLambdaExpr(e *ast.LambdaExpr, scope *Scope) *ResolvedType {
 	childScope := scope.Child()
-	// 'it' is the implicit parameter
-	childScope.Define(&Symbol{
-		Name: "it",
-		Kind: SymVariable,
-	})
+	if len(e.Params) > 0 {
+		// named params: { x -> ... } or { a, b -> ... }
+		for _, name := range e.Params {
+			childScope.Define(&Symbol{Name: name, Kind: SymVariable})
+		}
+	} else {
+		// implicit 'it' parameter
+		childScope.Define(&Symbol{Name: "it", Kind: SymVariable})
+	}
 	prev := a.inLambda
 	a.inLambda = true
 	a.checkBlock(e.Body, childScope)
@@ -1259,6 +1680,13 @@ func (a *Analyzer) checkBinaryOp(op string, left, right *ResolvedType, pos token
 		return a.checkArithmeticOp(op, left, right, pos)
 
 	case "==", "!=":
+		// 1.1: enum cannot compare with String
+		if left.Kind == TypeEnum && right.Kind == TypeString {
+			a.addError(pos, "cannot compare enum '%s' with String, use %s.VALUE / 不能用 String 和枚举 '%s' 比较，请使用 %s.VALUE", left.Name, left.Name, left.Name, left.Name)
+		}
+		if left.Kind == TypeString && right.Kind == TypeEnum {
+			a.addError(pos, "cannot compare String with enum '%s', use %s.VALUE / 不能用 String 和枚举 '%s' 比较，请使用 %s.VALUE", right.Name, right.Name, right.Name, right.Name)
+		}
 		return a.types["Boolean"]
 
 	case ">", ">=", "<", "<=":
@@ -1281,6 +1709,13 @@ func (a *Analyzer) checkBinaryOp(op string, left, right *ResolvedType, pos token
 }
 
 func (a *Analyzer) checkArithmeticOp(op string, left, right *ResolvedType, pos token.Position) *ResolvedType {
+	// 1.2: nullable cannot be used in arithmetic
+	if left.Nullable {
+		a.addError(pos, "cannot use '%s' on nullable '%s?', unwrap first with ?: / 不能对可空类型 '%s?' 使用 '%s'，请先用 ?: 解包", op, left.Name, left.Name, op)
+	}
+	if right.Nullable {
+		a.addError(pos, "cannot use '%s' on nullable '%s?', unwrap first with ?: / 不能对可空类型 '%s?' 使用 '%s'，请先用 ?: 解包", op, right.Name, right.Name, op)
+	}
 	if !left.IsNumeric() || !right.IsNumeric() {
 		if op == "+" && left.Kind == TypeString {
 			return left // string concatenation
@@ -1291,6 +1726,103 @@ func (a *Analyzer) checkArithmeticOp(op string, left, right *ResolvedType, pos t
 		return a.types["Float"]
 	}
 	return a.types["Int"]
+}
+
+// ========== Sealed Variant Field Injection ==========
+
+// injectSealedVariantFields creates a child scope where the subject variable
+// has the variant's fields accessible (e.g., result.transactionId after is Success).
+func (a *Analyzer) injectSealedVariantFields(scope *Scope, sealedType *ResolvedType, variantName string, subject ast.Expr) *Scope {
+	ident, ok := subject.(*ast.Ident)
+	if !ok {
+		return scope
+	}
+	// find the variant
+	for _, v := range sealedType.Variants {
+		if v.Name == variantName {
+			// create a narrowed type with the variant's fields
+			narrowed := &ResolvedType{
+				Kind:   TypeModel,
+				Name:   sealedType.Name,
+				Fields: make(map[string]*FieldInfo),
+			}
+			for _, f := range v.Fields {
+				narrowed.Fields[f.Name] = f
+			}
+			child := scope.Child()
+			child.Define(&Symbol{
+				Name: ident.Name,
+				Kind: SymVariable,
+				Type: narrowed,
+			})
+			return child
+		}
+	}
+	return scope
+}
+
+// ========== @withAuth Method Injection ==========
+
+func hasModelDirective(directives []*ast.Directive, name string) bool {
+	for _, d := range directives {
+		if d.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *Analyzer) injectWithAuthMethods(typ *ResolvedType, directives []*ast.Directive) {
+	typ.Fields["createToken"] = &FieldInfo{
+		Name:     "createToken",
+		Type:     a.types["String"],
+		IsMethod: true,
+		Doc:      ".createToken(expires?: Duration): String — Generate JWT token / 生成 JWT 令牌",
+	}
+	typ.Fields["verify"] = &FieldInfo{
+		Name:     "verify",
+		Type:     a.types["Boolean"],
+		IsMethod: true,
+		Doc:      ".verify(plain: String): Boolean — Verify password against @hash field / 校验 @hash 字段的密码",
+	}
+	// refreshToken only if refresh: true
+	for _, d := range directives {
+		if d.Name == "withAuth" {
+			for _, arg := range d.Args {
+				if arg.Name == "refresh" {
+					typ.Fields["refreshToken"] = &FieldInfo{
+						Name:     "refreshToken",
+						Type:     a.types["String"],
+						IsMethod: true,
+						Doc:      ".refreshToken(token: String): String — Refresh JWT token / 刷新 JWT 令牌",
+					}
+				}
+			}
+		}
+	}
+}
+
+// ========== Unused Variable Warning ==========
+
+// checkUnusedVariables warns about variables declared but never used.
+func (a *Analyzer) checkUnusedVariables(scope *Scope) {
+	for _, sym := range scope.AllSymbols() {
+		if sym.Kind != SymVariable {
+			continue
+		}
+		if sym.Used {
+			continue
+		}
+		// skip _ prefixed variables and auto-injected symbols
+		if len(sym.Name) > 0 && sym.Name[0] == '_' {
+			continue
+		}
+		if sym.Name == "my" || sym.Name == "it" || sym.Name == "request" {
+			continue
+		}
+		// Use name length so the diagnostic range highlights the full identifier
+		a.addWarningWithLen(sym.Pos, len(sym.Name), "variable '%s' is declared but never used / 变量 '%s' 已声明但未使用", sym.Name, sym.Name)
+	}
 }
 
 // ========== Event Cycle Detection ==========
@@ -1376,9 +1908,13 @@ func (a *Analyzer) detectCycles(graph map[string][]string) {
 func (a *Analyzer) buildCyclePath(cycleStart, cycleEnd string, parent map[string]string) string {
 	var path []string
 	cur := cycleEnd
-	for cur != cycleStart {
+	for i := 0; cur != cycleStart && i < len(parent)+1; i++ {
 		path = append([]string{cur}, path...)
-		cur = parent[cur]
+		next, ok := parent[cur]
+		if !ok {
+			break
+		}
+		cur = next
 	}
 	path = append([]string{cycleStart}, path...)
 	path = append(path, cycleStart)
@@ -1387,48 +1923,9 @@ func (a *Analyzer) buildCyclePath(cycleStart, cycleEnd string, parent map[string
 
 // ========== Directive Validation ==========
 
-var validModelDirectives = map[string]bool{
-	"crud": true, "unique": true, "index": true,
-	"soft": true, "noTime": true,
-}
-
-var validFieldDirectives = map[string]bool{
-	"id": true, "unique": true, "index": true,
-	"hidden": true, "hash": true, "immutable": true, "internal": true,
-	"visible": true, "transform": true, "beforeSave": true, "mask": true,
-	"filterable": true, "sortable": true, "search": true,
-	"auto": true, "deprecated": true, "reserved": true,
-	"count": true, "sum": true, "avg": true, "min": true, "max": true,
-	"encrypt": true,
-	// database type annotations
-	"length": true, "serial": true, "bigint": true, "smallint": true,
-	"decimal": true, "uuid": true, "inet": true, "point": true,
-	"brin": true, "date": true, "time": true, "vector": true,
-}
-
-var validApiDirectives = map[string]bool{
-	"auth": true, "native": true, "cache": true, "rateLimit": true,
-	"scope": true, "stream": true,
-}
-
-var stringOnlyDirectives = map[string]bool{
-	"email": true, "varchar": true, "hash": true, "mask": true,
-	"pattern": true, "minLength": true, "maxLength": true, "notBlank": true,
-}
-
-var numericOnlyDirectives = map[string]bool{
-	"range": true,
-}
-
-func (a *Analyzer) checkDirectives(directives []*ast.Directive, context string) {
-	valid := validModelDirectives
-	if context == "api" {
-		valid = validApiDirectives
-	}
+func (a *Analyzer) checkDirectives(directives []*ast.Directive, ctx DirectiveContext) {
 	for _, d := range directives {
-		if !valid[d.Name] && !validFieldDirectives[d.Name] {
-			a.addWarning(d.Pos, "unknown directive '@%s' in %s context / 未知指令 '@%s'，在 %s 上下文中", d.Name, context, d.Name, context)
-		}
+		a.validateDirective(d, ctx, "")
 	}
 }
 
@@ -1438,16 +1935,12 @@ func (a *Analyzer) checkFieldDirectives(f *ast.FieldDecl) {
 	}
 	typeName := f.Type.Name
 	for _, d := range f.Directives {
-		if stringOnlyDirectives[d.Name] {
-			if typeName != "String" && typeName != "" {
-				a.addError(d.Pos, "@%s can only be used on String fields, got '%s' / @%s 只能用在 String 字段上，得到 '%s'", d.Name, typeName, d.Name, typeName)
-			}
-		}
-		if numericOnlyDirectives[d.Name] {
-			resolved := a.resolveTypeRef(f.Type, f.Pos)
-			if resolved != nil && !resolved.IsNumeric() {
-				a.addError(d.Pos, "@%s can only be used on numeric fields, got '%s' / @%s 只能用在数字字段上，得到 '%s'", d.Name, typeName, d.Name, typeName)
-			}
+		a.validateDirective(d, OnField, typeName)
+	}
+	// computed field directives (@count, @sum, @avg, etc.)
+	if f.Computed != nil {
+		for _, d := range f.Computed.Directives {
+			a.validateDirective(d, OnComputed, typeName)
 		}
 	}
 }
@@ -1464,6 +1957,14 @@ func (a *Analyzer) addError(pos token.Position, format string, args ...any) {
 func (a *Analyzer) addWarning(pos token.Position, format string, args ...any) {
 	a.warnings = append(a.warnings, Warning{
 		Pos:     pos,
+		Message: fmt.Sprintf(format, args...),
+	})
+}
+
+func (a *Analyzer) addWarningWithLen(pos token.Position, nameLen int, format string, args ...any) {
+	a.warnings = append(a.warnings, Warning{
+		Pos:     pos,
+		NameLen: nameLen,
 		Message: fmt.Sprintf(format, args...),
 	})
 }
@@ -1556,6 +2057,21 @@ func isDebugMethod(name string) bool {
 	return false
 }
 
+// isQueryMethod returns true if the name is a chain query method on models.
+func isQueryMethod(name string) bool {
+	switch name {
+	case "where", "groupBy", "orderBy",
+		"sum", "avg", "count", "min", "max",
+		"select", "first", "all",
+		"limit", "offset",
+		"aggregate", "paginate", "exists",
+		"deleteMany", "save":
+		return true
+	}
+	// CRUD ops are also valid chain methods on models (e.g. User.find(...))
+	return isCRUDOp(name)
+}
+
 func isCollectionMethod(name string) bool {
 	switch name {
 	case "map", "filter", "sumOf", "count", "any", "firstOrNull",
@@ -1605,6 +2121,55 @@ func (a *Analyzer) resolveCollectionMethod(method string, listType *ResolvedType
 	}
 }
 
+// resolveQueryMethod resolves the return type for a chain query method on a model.
+// modelType is the underlying model type (not the query builder).
+func (a *Analyzer) resolveQueryMethod(method string, modelType *ResolvedType) *ResolvedType {
+	qb := &ResolvedType{
+		Kind:      TypeQueryBuilder,
+		Name:      modelType.Name + "QueryBuilder",
+		Fields:    modelType.Fields,
+		ModelType: modelType,
+	}
+
+	switch method {
+	case "where", "groupBy", "orderBy", "limit", "offset":
+		// chaining methods — return a query builder
+		return qb
+	case "sum", "avg":
+		return a.types["Float"]
+	case "count":
+		return a.types["Int"]
+	case "min", "max":
+		// could be any numeric type; Float is a safe approximation
+		return a.types["Float"]
+	case "select":
+		// select { ... } — return type depends on the lambda; can't infer here
+		return nil
+	case "first":
+		return modelType.AsNullable()
+	case "all":
+		return modelType.AsList()
+	// chain-style CRUD operations: Model.find(...), Model.create(...), etc.
+	case "find":
+		// return type depends on args (where → list, id → non-nullable); resolved in checkCallExpr
+		return nil
+	case "findFirst":
+		return modelType.AsNullable()
+	case "findMany", "createMany":
+		return modelType.AsList()
+	case "create", "update", "upsert", "delete", "save":
+		return modelType
+	case "deleteMany", "updateMany":
+		return a.types["Int"]
+	case "exists":
+		return a.types["Boolean"]
+	case "aggregate", "raw", "paginate":
+		return nil
+	default:
+		return nil
+	}
+}
+
 func editDistance(a, b string) int {
 	la, lb := len(a), len(b)
 	if la == 0 {
@@ -1648,12 +2213,19 @@ func min3(a, b, c int) int {
 
 func isBuiltinOp(name string) bool {
 	switch name {
-	case "find", "create", "update", "delete",
+	case "find", "findFirst", "findMany",
+		"create", "createMany",
+		"update", "updateMany",
+		"delete", "deleteMany",
+		"upsert", "count", "exists",
+		"aggregate", "groupBy", "raw", "paginate", "save",
 		"throw", "transaction", "cache", "storage",
 		"mail", "task", "services", "error", "request",
 		"Channel", "Result", "my",
-		"http", "json", "time", "math", "crypto",
-		"regex", "base64", "url", "uuid":
+		"http", "json", "time", "math", "crypto", "convert",
+		"regex", "base64", "url", "uuid",
+		"print", "env", "now", "today",
+		"verifyHash", "generateToken":
 		return true
 	}
 	return false

@@ -30,9 +30,9 @@ func FuzzAnalyzer(f *testing.F) {
   val z = true && false
   x > 0 ?: throw error.bad
   when(x) { in 1..10 -> "a" else -> "b" }
-  for item in items { update(item, v: 1) }
+  for item in items { item.update(v: 1) }
   if true { val inner = 1 }
-  transaction { create(Order, total: 100) }
+  transaction { Order.create(total: 100) }
   emit("event", data)
   x
 }`,

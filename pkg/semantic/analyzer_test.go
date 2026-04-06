@@ -7,6 +7,7 @@ import (
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lexer"
 	"github.com/light-speak/luxo/pkg/parser"
+	"github.com/light-speak/luxo/pkg/token"
 )
 
 func analyze(t *testing.T, input string) *Result {
@@ -209,7 +210,7 @@ type AuthResult {
 api getUser(id: Int): User @cache(ttl: 60)
 
 api register(input: AuthResult): AuthResult {
-  val user = create(User, name: "test")
+  val user = User.create(name: "test")
   AuthResult { token: "abc", user: user }
 }
 
@@ -375,8 +376,8 @@ model User { name: String }
 model Post { title: String  userId: Int }
 api loadProfile(id: Int): User {
   val (user, posts) = await {
-    find(User, id: id)
-    find(Post, where: userId == id)
+    User.find(id: id)
+    Post.find(where: userId == id)
   }
   user
 }
@@ -390,7 +391,7 @@ func TestAwaitSingleExpr(t *testing.T) {
 model User { name: String }
 api getOne(id: Int): User {
   val user = await {
-    find(User, id: id)
+    User.find(id: id)
   }
   user
 }
@@ -404,8 +405,8 @@ model User { name: String }
 model Post { title: String  userId: Int }
 api bad(id: Int): User {
   val (a, b, c) = await {
-    find(User, id: id)
-    find(Post, where: userId == id)
+    User.find(id: id)
+    Post.find(where: userId == id)
   }
   a
 }
@@ -449,7 +450,7 @@ model User { name: String }
 api test(): Int {
   val x = await {
     val temp = 1
-    find(User, id: temp)
+    User.find(id: temp)
   }
   0
 }
@@ -459,23 +460,14 @@ api test(): Int {
 
 // ========== CRUD Return Type Edge Cases ==========
 
-func TestCRUDCreateReturnType(t *testing.T) {
-	result := analyze(t, `
-model User { name: String }
-api test(): User {
-  val user = create(User, name: "test")
-  user
-}
-`)
-	expectNoErrors(t, result)
-}
+// TestCRUDCreateReturnType removed — duplicated by TestCreateReturnsModelType in analyzer_crud_test.go
 
 func TestCRUDDeleteReturnType(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
 api test(id: Int): User {
-  val user = find(User, id: id) ?: throw error.not_found
-  delete(user)
+  val user = User.find(id: id)
+  user.delete()
   user
 }
 `)
@@ -486,9 +478,22 @@ func TestCRUDUpdateReturnType(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
 api test(id: Int): User {
-  val user = find(User, id: id) ?: throw error.not_found
-  val updated = update(user, name: "new")
+  val user = User.find(id: id)
+  val updated = user.update(name: "new")
   updated
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestSaveMethod(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(id: Int): User {
+  val user = User.find(id: id) ?: throw error.not_found
+  user.name = "updated"
+  user.save()
+  user
 }
 `)
 	expectNoErrors(t, result)
@@ -500,7 +505,7 @@ func TestSafeCallOnNonNullWarning(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
 api test(): String {
-  val user = create(User, name: "test")
+  val user = User.create(name: "test")
   val name = user?.name
   name
 }
@@ -523,7 +528,7 @@ api test(): Int {
 func TestCRUDWithUnknownModel(t *testing.T) {
 	result := analyze(t, `
 api test(): Int {
-  val x = find(Unknown, id: 1)
+  val x = Unknown.find(id: 1)
   0
 }
 `)
@@ -599,7 +604,7 @@ func TestCRUDItDisambiguation(t *testing.T) {
 	result := analyze(t, `
 model Room { roomId: Int  name: String }
 api test(roomId: Int): Room {
-  val room = find(Room, where: it.roomId == roomId)
+  val room = Room.find(where: it.roomId == roomId)
     ?: throw error.not_found
   room
 }
@@ -611,7 +616,7 @@ func TestCRUDItNoAmbiguity(t *testing.T) {
 	result := analyze(t, `
 model User { name: String  email: String }
 api test(input: String): User {
-  val user = find(User, where: email == input)
+  val user = User.find(where: email == input)
     ?: throw error.not_found
   user
 }
@@ -688,8 +693,8 @@ func TestFindInLambdaForbidden(t *testing.T) {
 model User { name: String }
 model Post { userId: Int }
 api test(): Int {
-  val users = find(User, where: name == "test")
-  val posts = users.map { find(Post, where: userId == it.id) }
+  val users = User.find(where: name == "test")
+  val posts = users.map { Post.find(where: userId == it.id) }
   0
 }
 `)
@@ -701,7 +706,7 @@ func TestFindInLambdaAllowed(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
 api test(): Int {
-  val users = find(User, where: name == "test")
+  val users = User.find(where: name == "test")
   0
 }
 `)
@@ -712,8 +717,8 @@ func TestCreateInLambdaForbidden(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
 api test(): Int {
-  val names = find(User, where: name == "a")
-  names.forEach { create(User, name: "b") }
+  val names = User.find(where: name == "a")
+  names.forEach { User.create(name: "b") }
   0
 }
 `)
@@ -724,8 +729,8 @@ func TestDeleteInLambdaForbidden(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
 api test(): Int {
-  val users = find(User, where: name == "test")
-  users.forEach { delete(User, id: 1) }
+  val users = User.find(where: name == "test")
+  users.forEach { User.delete(id: 1) }
   0
 }
 `)
@@ -736,8 +741,8 @@ func TestUpdateInLambdaForbidden(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
 api test(): Int {
-  val users = find(User, where: name == "test")
-  users.forEach { update(User, name: "x") }
+  val users = User.find(where: name == "test")
+  users.forEach { User.update(name: "x") }
   0
 }
 `)
@@ -750,7 +755,7 @@ func TestCRUDInTransactionAllowed(t *testing.T) {
 model User { name: String }
 api test(): Int {
   val result = transaction {
-    create(User, name: "test")
+    User.create(name: "test")
   }
   42
 }
@@ -765,7 +770,7 @@ func TestContainsWarning(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
 api test(): Boolean {
-  val user = create(User, name: "test")
+  val user = User.create(name: "test")
   user.name.contains("test")
 }
 `)
@@ -773,17 +778,17 @@ api test(): Boolean {
 }
 
 func TestContainsOnListNoWarning(t *testing.T) {
-	// .contains on a list type should NOT produce the warning
+	// .contains on a list type should NOT produce the LIKE warning
 	result := analyze(t, `
-model Item { name: String }
+model Item { name: String @index }
 api test(): Boolean {
-  val items = find(Item, where: name == "x")
+  val items = Item.find(where: name == "x")
   items.contains
 }
 `)
 	for _, w := range result.Warnings {
-		if strings.Contains(w.Message, "full table scan") {
-			t.Errorf("unexpected contains warning on list type: %s", w.Message)
+		if strings.Contains(w.Message, "LIKE") {
+			t.Errorf("unexpected contains/LIKE warning on list type: %s", w.Message)
 		}
 	}
 }
@@ -797,7 +802,7 @@ model User { name: String }
 event UserCreated(name: String)
 api test(): Int {
   transaction {
-    create(User, name: "test")
+    User.create(name: "test")
     emit UserCreated(name: "test")
   }
   0
@@ -815,7 +820,7 @@ func TestEmitOutsideTransactionNoWarning(t *testing.T) {
 model User { name: String }
 event UserCreated(name: String)
 api test(): Int {
-  create(User, name: "test")
+  User.create(name: "test")
   emit UserCreated(name: "test")
   0
 }
@@ -943,7 +948,7 @@ func TestCollectAmbiguousIdentsDifferentNames(t *testing.T) {
 	result := analyze(t, `
 model User { userId: Int  name: String }
 api test(id: Int): User {
-  val user = find(User, where: userId == id)
+  val user = User.find(where: userId == id)
     ?: throw error.not_found
   user
 }
@@ -963,7 +968,7 @@ func TestCheckBinaryAmbiguityDisambiguated(t *testing.T) {
 	result := analyze(t, `
 model User { email: String  name: String }
 api test(email: String): User {
-  val user = find(User, where: it.email == email)
+  val user = User.find(where: it.email == email)
     ?: throw error.not_found
   user
 }
@@ -985,7 +990,7 @@ model Post {
   content: String
 }
 api test(keyword: String): [Post] {
-  val posts = find(Post, where: title == keyword)
+  val posts = Post.find(where: title == keyword)
   val filtered = posts.filter { it.title.contains(keyword) }
   filtered
 }
@@ -1028,7 +1033,7 @@ func TestCollectAmbiguousIdentsCallExpr(t *testing.T) {
 	result := analyze(t, `
 model Post { title: String  content: String }
 api test(keyword: String): [Post] {
-  val posts = find(Post, where: title.contains(keyword))
+  val posts = Post.find(where: title.contains(keyword))
   posts
 }
 `)
@@ -1042,7 +1047,7 @@ func TestCollectAmbiguousIdentsMemberExpr(t *testing.T) {
 	result := analyze(t, `
 model User { name: String  email: String }
 api test(): [User] {
-  val users = find(User, where: it.name == "test")
+  val users = User.find(where: it.name == "test")
   users
 }
 `)
@@ -1056,7 +1061,7 @@ func TestCollectAmbiguousIdentsUnaryExpr(t *testing.T) {
 	result := analyze(t, `
 model User { active: Boolean  name: String }
 api test(): [User] {
-  val users = find(User, where: !active)
+  val users = User.find(where: !active)
   users
 }
 `)
@@ -1214,7 +1219,7 @@ model User { name: String }
 api test(): Int {
   val x = await {
     await {
-      find(User, id: 1)
+      User.find(id: 1)
     }
   }
   0
@@ -1233,7 +1238,7 @@ model User {
   name: String
 }
 api test(keyword: String): Boolean {
-  val user = find(User, id: 1)
+  val user = User.find(id: 1)
   user?.email?.contains(keyword) ?: false
 }
 `)
@@ -1247,7 +1252,7 @@ func TestCheckBinaryAmbiguitySameNameWarns(t *testing.T) {
 	result := analyze(t, `
 model User { email: String  name: String }
 api test(email: String): User {
-  val user = find(User, where: email == email)
+  val user = User.find(where: email == email)
     ?: throw error.not_found
   user
 }
@@ -1263,7 +1268,7 @@ func TestCheckBinaryAmbiguityDifferentNames(t *testing.T) {
 	result := analyze(t, `
 model User { name: String  email: String }
 api test(keyword: String): [User] {
-  val users = find(User, where: name == keyword)
+  val users = User.find(where: name == keyword)
   users
 }
 `)
@@ -1277,7 +1282,7 @@ func TestCheckBinaryAmbiguityFieldOnlyNoOuterSym(t *testing.T) {
 	result := analyze(t, `
 model User { email: String  name: String }
 api test(): [User] {
-  val users = find(User, where: email == email)
+  val users = User.find(where: email == email)
   users
 }
 `)
@@ -1296,7 +1301,7 @@ func TestCheckBinaryAmbiguityNonIdentOperands(t *testing.T) {
 	result := analyze(t, `
 model User { name: String  age: Int }
 api test(): [User] {
-  val users = find(User, where: it.age > 18)
+  val users = User.find(where: it.age > 18)
   users
 }
 `)
@@ -1310,9 +1315,9 @@ func TestTransactionWithNonLambdaArg(t *testing.T) {
 	result := analyze(t, `
 model Product { stock: Int }
 api test(): Int {
-  val p = find(Product, id: 1)
+  val p = Product.find(id: 1)
   transaction {
-    update(p, stock: 10)
+    p.update(stock: 10)
   }
   0
 }
@@ -1389,7 +1394,7 @@ func TestCollectAmbiguousIdentsUnaryExprBoolean(t *testing.T) {
 	result := analyze(t, `
 model User { email: String  active: Boolean }
 api test(active: Boolean): [User] {
-  val users = find(User, where: !active == active)
+  val users = User.find(where: !active == active)
   users
 }
 `)
@@ -1406,7 +1411,7 @@ func TestCollectAmbiguousIdentsCallExprFunction(t *testing.T) {
 model User { name: String  email: String }
 fn lower(s: String): String { s }
 api test(name: String): [User] {
-  val users = find(User, where: lower(name) == name)
+  val users = User.find(where: lower(name) == name)
   users
 }
 `)
@@ -1421,7 +1426,7 @@ func TestCollectAmbiguousIdentsMemberExprItPrefix(t *testing.T) {
 	result := analyze(t, `
 model User { name: String  email: String }
 api test(name: String): [User] {
-  val users = find(User, where: it.name == name)
+  val users = User.find(where: it.name == name)
   users
 }
 `)
@@ -1436,7 +1441,7 @@ func TestItMemberFieldNonMemberExpr(t *testing.T) {
 	result := analyze(t, `
 model User { name: String  email: String }
 api test(name: String): [User] {
-  val users = find(User, where: name == name)
+  val users = User.find(where: name == name)
   users
 }
 `)
@@ -1450,7 +1455,7 @@ func TestItMemberFieldNonIdentObject(t *testing.T) {
 	result := analyze(t, `
 model User { name: String  email: String }
 api test(u: User): [User] {
-  val users = find(User, where: u.name == u.name)
+  val users = User.find(where: u.name == u.name)
   users
 }
 `)
@@ -1528,7 +1533,7 @@ model Post {
   body: String
 }
 api test(keyword: String): [Post] {
-  val posts = find(Post, where: title == keyword)
+  val posts = Post.find(where: title == keyword)
   val filtered = posts.filter { it.title.contains(keyword) }
   filtered
 }
@@ -1550,7 +1555,7 @@ func TestCheckTransactionCallNonLambdaArg(t *testing.T) {
 model User { name: String }
 api test(): Int {
   transaction {
-    val u = find(User, id: 1)
+    val u = User.find(id: 1)
     u
   }
   0
@@ -1563,10 +1568,11 @@ api test(): Int {
 
 func TestCheckCompositeExprAwait(t *testing.T) {
 	result := analyze(t, `
+model User { name: String }
 api test(): Int {
   val results = await {
-    find(Int, id: 1)
-    find(Int, id: 2)
+    User.find(id: 1)
+    User.find(id: 2)
   }
   0
 }
@@ -1581,8 +1587,1800 @@ func TestItMemberFieldNonIdent(t *testing.T) {
 	result := analyze(t, `
 model User { name: String  email: String }
 api test(u: User): [User] {
-  val users = find(User, where: it.name == u.name)
+  val users = User.find(where: it.name == u.name)
   users
+}
+`)
+	expectNoErrors(t, result)
+}
+
+// ========== New CRUD Operation Tests ==========
+
+func TestAggregateOperation(t *testing.T) {
+	result := analyze(t, `
+model Order {
+  total: Float
+  status: String
+}
+api test(): Int {
+  val agg = aggregate(Order, sum: total, count: true)
+  0
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestGroupByOperation(t *testing.T) {
+	result := analyze(t, `
+model Order {
+  total: Float
+  status: String
+}
+api test(): Int {
+  val grouped = groupBy(Order, by: status, sum: total)
+  0
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestPaginateOperation(t *testing.T) {
+	result := analyze(t, `
+model User {
+  name: String
+}
+api test(): Int {
+  val page = paginate(User, page: 1, pageSize: 20)
+  0
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestRawOperation(t *testing.T) {
+	result := analyze(t, `
+api test(): Int {
+  val r = raw("SELECT 1")
+  0
+}
+`)
+	expectNoErrors(t, result)
+}
+
+// ========== @withAuth Directive Tests ==========
+
+func TestWithAuthDirective(t *testing.T) {
+	result := analyze(t, `
+model User @withAuth(secret: "secret", stores: "id") {
+  name: String
+  email: String
+}
+`)
+	expectNoErrors(t, result)
+
+	// verify injected methods have Doc strings
+	userType := result.Types["User"]
+	if userType == nil {
+		t.Fatal("User type not found")
+	}
+	if f, ok := userType.Fields["createToken"]; !ok {
+		t.Error("createToken field not injected")
+	} else if f.Doc == "" {
+		t.Error("createToken field missing Doc string")
+	}
+	if f, ok := userType.Fields["verify"]; !ok {
+		t.Error("verify field not injected")
+	} else if f.Doc == "" {
+		t.Error("verify field missing Doc string")
+	}
+}
+
+func TestWithAuthDirectiveRefreshTokenDoc(t *testing.T) {
+	result := analyze(t, `
+model User @withAuth(secret: "secret", stores: "id", refresh: true) {
+  name: String
+  email: String
+}
+`)
+	expectNoErrors(t, result)
+
+	userType := result.Types["User"]
+	if userType == nil {
+		t.Fatal("User type not found")
+	}
+	if f, ok := userType.Fields["refreshToken"]; !ok {
+		t.Error("refreshToken field not injected when refresh: true")
+	} else if f.Doc == "" {
+		t.Error("refreshToken field missing Doc string")
+	}
+}
+
+// ========== @auth Directive with Model References ==========
+
+func TestAuthDirectiveWithModels(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+model Admin { name: String }
+api getProfile(): Int @auth(User, Admin)
+`)
+	expectNoErrors(t, result)
+}
+
+// ========== isDynamicReturnCRUD Unit Tests ==========
+
+func TestIsDynamicReturnCRUD(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{"aggregate", true},
+		{"groupBy", true},
+		{"raw", true},
+		{"paginate", true},
+		{"find", false},
+		{"create", false},
+		{"update", false},
+		{"delete", false},
+		{"unknown", false},
+	}
+	for _, tt := range tests {
+		got := isDynamicReturnCRUD(tt.name)
+		if got != tt.want {
+			t.Errorf("isDynamicReturnCRUD(%q) = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
+// ========== Method Without Call Error Tests ==========
+
+func TestMethodWithoutCallError(t *testing.T) {
+	// user.createToken without () should be a compile error
+	result := analyze(t, `
+model User @withAuth(secret: "secret", stores: "id") {
+  name: String
+  email: String
+}
+api test(): String {
+  val user = User.create(name: "test", email: "a@b.com")
+  val t = user.createToken
+  t
+}
+`)
+	expectError(t, result, "is a method, use createToken()")
+}
+
+func TestMethodWithCallOK(t *testing.T) {
+	// user.createToken() with () should be fine
+	result := analyze(t, `
+model User @withAuth(secret: "secret", stores: "id") {
+  name: String
+  email: String
+}
+api test(): String {
+  val user = User.create(name: "test", email: "a@b.com")
+  val t = user.createToken()
+  t
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestMethodVerifyWithoutCallError(t *testing.T) {
+	// user.verify without () should be a compile error
+	result := analyze(t, `
+model User @withAuth(secret: "secret", stores: "id") {
+  name: String
+  email: String
+}
+api test(): Boolean {
+  val user = User.create(name: "test", email: "a@b.com")
+  val v = user.verify
+  v
+}
+`)
+	expectError(t, result, "is a method, use verify()")
+}
+
+func TestMethodRefreshTokenWithoutCallError(t *testing.T) {
+	// user.refreshToken without () should be a compile error
+	result := analyze(t, `
+model User @withAuth(secret: "secret", stores: "id", refresh: true) {
+  name: String
+  email: String
+}
+api test(): String {
+  val user = User.create(name: "test", email: "a@b.com")
+  val r = user.refreshToken
+  r
+}
+`)
+	expectError(t, result, "is a method, use refreshToken()")
+}
+
+func TestWithAuthIsMethodFlag(t *testing.T) {
+	// verify that IsMethod flag is set on injected auth methods
+	result := analyze(t, `
+model User @withAuth(secret: "secret", stores: "id", refresh: true) {
+  name: String
+  email: String
+}
+`)
+	expectNoErrors(t, result)
+
+	userType := result.Types["User"]
+	if userType == nil {
+		t.Fatal("User type not found")
+	}
+	for _, methodName := range []string{"createToken", "verify", "refreshToken"} {
+		f, ok := userType.Fields[methodName]
+		if !ok {
+			t.Errorf("%s field not injected", methodName)
+			continue
+		}
+		if !f.IsMethod {
+			t.Errorf("%s field should have IsMethod=true", methodName)
+		}
+	}
+	// regular field should NOT have IsMethod
+	if f, ok := userType.Fields["name"]; ok && f.IsMethod {
+		t.Error("regular field 'name' should not have IsMethod=true")
+	}
+}
+
+// ========== Function-style CRUD Return Type Tests ==========
+
+func TestFunctionStyleCreateReturnType(t *testing.T) {
+	// function-style create(User, ...) — exercises checkCreateRequiredFields and inferCRUDReturnType
+	result := analyze(t, `
+model User { name: String }
+api test(): User {
+  val user = create(User, name: "alice")
+  user
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestFunctionStyleFindReturnType(t *testing.T) {
+	// function-style find(User, id: 1) returns non-nullable (auto-throws NotFound)
+	result := analyze(t, `
+model User { name: String }
+api test(): User {
+  find(User, id: 1)
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestFunctionStyleFindWhereReturnType(t *testing.T) {
+	// function-style find(User, where: ...) returns list
+	result := analyze(t, `
+model User { name: String }
+api test(): [User] {
+  find(User, where: name == "test")
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestFunctionStyleFindFirstReturnType(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(): Int {
+  val user = findFirst(User, where: name == "test")
+  0
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestFunctionStyleFindManyReturnType(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(): [User] {
+  findMany(User, where: name == "test")
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestFunctionStyleCreateManyReturnType(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(): [User] {
+  createMany(User, name: "a")
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestFunctionStyleUpdateReturnType(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(): User {
+  update(User, name: "b")
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestFunctionStyleUpsertReturnType(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(): User {
+  upsert(User, name: "c")
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestFunctionStyleDeleteReturnType(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(): User {
+  delete(User, id: 1)
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestFunctionStyleDeleteManyReturnType(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(): Int {
+  deleteMany(User, where: name == "old")
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestFunctionStyleUpdateManyReturnType(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(): Int {
+  updateMany(User, where: name == "a")
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestFunctionStyleCountReturnType(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(): Int {
+  count(User, where: name == "a")
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestFunctionStyleExistsReturnType(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(): Boolean {
+  exists(User, where: name == "a")
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestFunctionStyleAggregateReturnType(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(): Int {
+  val r = aggregate(User, count: true)
+  0
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestFunctionStyleCreateRequiredFieldsMissing(t *testing.T) {
+	// function-style create(User, ...) without required field should warn
+	result := analyze(t, `
+model Product {
+  name: String
+  price: Float
+}
+api test(): Product {
+  create(Product, name: "item")
+}
+`)
+	expectWarning(t, result, "missing required field 'price'")
+}
+
+func TestFunctionStyleCreateWithNonIdentFirstArg(t *testing.T) {
+	// function-style create with non-Ident first arg — exercises early return in checkCreateRequiredFields
+	result := analyze(t, `
+api test(): Int {
+  create(1 + 2, name: "x")
+  0
+}
+`)
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+}
+
+func TestFunctionStyleCreateWithUnknownModel(t *testing.T) {
+	// function-style create with unknown model — exercises modelType not found path
+	result := analyze(t, `
+api test(): Int {
+  create(UnknownModel, name: "x")
+  0
+}
+`)
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+}
+
+func TestFunctionStyleCreateModelNilFields(t *testing.T) {
+	// model with nil Fields map — exercises early return in checkCreateRequiredFields
+	a := New()
+	a.types["EmptyModel"] = &ResolvedType{Kind: TypeModel, Name: "EmptyModel", Fields: nil}
+	a.scope.Define(&Symbol{Name: "EmptyModel", Kind: SymType, Type: a.types["EmptyModel"]})
+	file := &ast.File{
+		APIs: []*ast.ApiDecl{
+			{
+				Name:       "test",
+				ReturnType: &ast.TypeRef{Name: "Int"},
+				Body: &ast.Block{
+					Stmts: []ast.Stmt{
+						&ast.ExprStmt{
+							Expr: &ast.CallExpr{
+								Func: &ast.Ident{Name: "create"},
+								Args: []*ast.NamedArg{
+									{Value: &ast.Ident{Name: "EmptyModel"}},
+									{Name: "name", Value: &ast.Literal{Kind: token.String, Value: "x"}},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	result := a.Analyze([]*ast.File{file})
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+}
+
+func TestFunctionStyleCreateEmptyArgs(t *testing.T) {
+	// create() with no args — exercises the len(e.Args) == 0 early return
+	a := New()
+	file := &ast.File{
+		APIs: []*ast.ApiDecl{
+			{
+				Name:       "test",
+				ReturnType: &ast.TypeRef{Name: "Int"},
+				Body: &ast.Block{
+					Stmts: []ast.Stmt{
+						&ast.ExprStmt{
+							Expr: &ast.CallExpr{
+								Func: &ast.Ident{Name: "create"},
+								Args: []*ast.NamedArg{},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	result := a.Analyze([]*ast.File{file})
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+}
+
+// ========== @scope Directive Validation Tests ==========
+
+func TestScopeDirectiveOnNonModelReturn(t *testing.T) {
+	// @scope on API returning a custom type (not a model) — should warn
+	result := analyze(t, `
+type MyType { value: String }
+api test(): MyType @scope(active) {
+  MyType { value: "test" }
+}
+`)
+	expectWarning(t, result, "@scope can only be used on APIs returning a model type")
+}
+
+func TestScopeDirectiveNoReturnType(t *testing.T) {
+	// @scope on API with no return type — exercises baseTypeName == "" path
+	a := New()
+	file := &ast.File{
+		APIs: []*ast.ApiDecl{
+			{
+				Name: "test",
+				// no ReturnType
+				Directives: []*ast.Directive{
+					{Name: "scope", Args: []*ast.NamedArg{
+						{Value: &ast.Ident{Name: "active"}},
+					}},
+				},
+				Body: &ast.Block{
+					Stmts: []ast.Stmt{
+						&ast.ExprStmt{Expr: &ast.Literal{Kind: token.Int, Value: "42"}},
+					},
+				},
+			},
+		},
+	}
+	result := a.Analyze([]*ast.File{file})
+	expectWarning(t, result, "@scope can only be used on APIs returning a model type")
+}
+
+func TestScopeDirectiveScopeNotFoundWithSuggestion(t *testing.T) {
+	// @scope referencing a non-existent scope with close match — exercises suggestion path
+	a := New()
+	file := &ast.File{
+		Models: []*ast.ModelDecl{
+			{
+				Name:   "User",
+				Fields: []*ast.FieldDecl{{Name: "name", Type: &ast.TypeRef{Name: "String"}}},
+				Scopes: []*ast.ScopeDecl{{Name: "active"}},
+			},
+		},
+		APIs: []*ast.ApiDecl{
+			{
+				Name:       "test",
+				ReturnType: &ast.TypeRef{Name: "User", IsList: true},
+				Directives: []*ast.Directive{
+					{Name: "scope", Args: []*ast.NamedArg{
+						{Value: &ast.Ident{Name: "actve"}}, // typo
+					}},
+				},
+				Body: &ast.Block{
+					Stmts: []ast.Stmt{
+						&ast.ExprStmt{Expr: &ast.Literal{Kind: token.Int, Value: "0"}},
+					},
+				},
+			},
+		},
+	}
+	result := a.Analyze([]*ast.File{file})
+	expectError(t, result, "did you mean 'active'")
+}
+
+func TestScopeDirectiveScopeNotFoundNoSuggestion(t *testing.T) {
+	// @scope referencing a non-existent scope with no close match
+	a := New()
+	file := &ast.File{
+		Models: []*ast.ModelDecl{
+			{
+				Name:   "User",
+				Fields: []*ast.FieldDecl{{Name: "name", Type: &ast.TypeRef{Name: "String"}}},
+				Scopes: []*ast.ScopeDecl{{Name: "active"}},
+			},
+		},
+		APIs: []*ast.ApiDecl{
+			{
+				Name:       "test",
+				ReturnType: &ast.TypeRef{Name: "User", IsList: true},
+				Directives: []*ast.Directive{
+					{Name: "scope", Args: []*ast.NamedArg{
+						{Value: &ast.Ident{Name: "xyzzy"}}, // no close match
+					}},
+				},
+				Body: &ast.Block{
+					Stmts: []ast.Stmt{
+						&ast.ExprStmt{Expr: &ast.Literal{Kind: token.Int, Value: "0"}},
+					},
+				},
+			},
+		},
+	}
+	result := a.Analyze([]*ast.File{file})
+	expectError(t, result, "scope 'xyzzy' not found on model 'User'")
+}
+
+func TestScopeDirectiveUnknownReturnType(t *testing.T) {
+	// @scope on API with unknown return type — type not found, already reported by resolveTypeRef
+	result := analyze(t, `
+api test(): UnknownType @scope(active) {
+  42
+}
+`)
+	// Should have error about UnknownType but no panic
+	expectError(t, result, "unknown type 'UnknownType'")
+}
+
+func TestScopeDirectiveNonIdentArg(t *testing.T) {
+	// @scope arg is not an Ident (e.g., a literal) — exercises scopeName == "" continue path
+	a := New()
+	file := &ast.File{
+		Models: []*ast.ModelDecl{
+			{
+				Name:   "User",
+				Fields: []*ast.FieldDecl{{Name: "name", Type: &ast.TypeRef{Name: "String"}}},
+				Scopes: []*ast.ScopeDecl{{Name: "active"}},
+			},
+		},
+		APIs: []*ast.ApiDecl{
+			{
+				Name:       "test",
+				ReturnType: &ast.TypeRef{Name: "User", IsList: true},
+				Directives: []*ast.Directive{
+					{Name: "scope", Args: []*ast.NamedArg{
+						{Value: &ast.Literal{Kind: token.String, Value: "active"}}, // literal, not ident
+					}},
+				},
+				Body: &ast.Block{
+					Stmts: []ast.Stmt{
+						&ast.ExprStmt{Expr: &ast.Literal{Kind: token.Int, Value: "0"}},
+					},
+				},
+			},
+		},
+	}
+	result := a.Analyze([]*ast.File{file})
+	// scopeName is "" because arg.Value is a Literal, not an Ident — should skip without error
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+}
+
+// ========== Compound Assignment Atomic Tests ==========
+
+func TestCompoundAssignOnModelMemberAtomic(t *testing.T) {
+	// += on model member should mark Atomic
+	result := analyze(t, `
+model Product { stock: Int }
+api test(): Int {
+  var p = Product.create(stock: 10)
+  p.stock += 5
+  p.stock
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestCompoundAssignSubOnModelMemberAtomic(t *testing.T) {
+	// -= on model member should mark Atomic
+	result := analyze(t, `
+model Product { stock: Int }
+api test(): Int {
+  var p = Product.create(stock: 10)
+  p.stock -= 3
+  p.stock
+}
+`)
+	expectNoErrors(t, result)
+}
+
+// ========== Unused Variable with _ Prefix ==========
+
+func TestUnusedVariableUnderscorePrefix(t *testing.T) {
+	// _ prefixed variables should NOT produce unused warnings
+	result := analyze(t, `
+api test(): Int {
+  val _unused = 42
+  0
+}
+`)
+	for _, w := range result.Warnings {
+		if strings.Contains(w.Message, "_unused") {
+			t.Errorf("should not warn about _ prefixed variable: %s", w.Message)
+		}
+	}
+}
+
+// ========== Enum Comparison with String ==========
+
+func TestEnumCompareWithString(t *testing.T) {
+	result := analyze(t, `
+enum Role { USER ADMIN }
+api test(): Boolean {
+  val r = Role.USER
+  r == "USER"
+}
+`)
+	expectError(t, result, "cannot compare enum")
+}
+
+func TestStringCompareWithEnum(t *testing.T) {
+	result := analyze(t, `
+enum Role { USER ADMIN }
+api test(): Boolean {
+  val r = Role.USER
+  "USER" == r
+}
+`)
+	expectError(t, result, "cannot compare String with enum")
+}
+
+// ========== Nullable Arithmetic ==========
+
+func TestNullableArithmeticLeft(t *testing.T) {
+	result := analyze(t, `
+model User { age: Int }
+api test(): Int {
+  val user = User.findFirst(where: age > 0)
+  val x = user?.age + 1
+  x
+}
+`)
+	expectError(t, result, "cannot use '+' on nullable")
+}
+
+func TestNullableArithmeticRight(t *testing.T) {
+	result := analyze(t, `
+model User { age: Int }
+api test(): Int {
+  val user = User.findFirst(where: age > 0)
+  val x = 1 + user?.age
+  x
+}
+`)
+	expectError(t, result, "cannot use '+' on nullable")
+}
+
+// ========== Sealed Variant Field Injection ==========
+
+func TestSealedVariantFieldInjection(t *testing.T) {
+	// when(r) { is Ok -> r.value } — exercises injectSealedVariantFields
+	result := analyze(t, `
+sealed PayResult {
+  Success(transactionId: String)
+  Failed(reason: String)
+}
+api test(r: PayResult): String {
+  when(r) {
+    is Success -> r.transactionId
+    is Failed -> r.reason
+  }
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestSealedVariantFieldInjectionNonIdentSubject(t *testing.T) {
+	// when with non-Ident subject — should not crash; injectSealedVariantFields returns scope unchanged
+	a := New()
+	a.declareType("PayResult", TypeSealed, token.Position{}, "")
+	payResult := a.types["PayResult"]
+	payResult.Variants = []*SealedVariantInfo{
+		{Name: "Ok", Fields: []*FieldInfo{{Name: "value", Type: a.types["String"]}}},
+	}
+	file := &ast.File{
+		APIs: []*ast.ApiDecl{
+			{
+				Name:       "test",
+				ReturnType: &ast.TypeRef{Name: "String"},
+				Body: &ast.Block{
+					Stmts: []ast.Stmt{
+						&ast.ExprStmt{
+							Expr: &ast.WhenExpr{
+								Subject: &ast.MemberExpr{Object: &ast.Ident{Name: "x"}, Field: "result"},
+								Branches: []*ast.WhenBranch{
+									{
+										IsType: "Ok",
+										Body:   &ast.Literal{Kind: token.String, Value: "ok"},
+									},
+								},
+								Else: &ast.Literal{Kind: token.String, Value: "other"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	result := a.Analyze([]*ast.File{file})
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+}
+
+func TestInjectSealedVariantFieldsFoundWithFieldsDirect(t *testing.T) {
+	// directly test injectSealedVariantFields when variant IS found and has fields
+	a := New()
+	sealedType := &ResolvedType{
+		Kind: TypeSealed,
+		Name: "Result",
+		Variants: []*SealedVariantInfo{
+			{Name: "Ok", Fields: []*FieldInfo{
+				{Name: "value", Type: a.types["String"]},
+				{Name: "code", Type: a.types["Int"]},
+			}},
+		},
+	}
+	scope := NewScope()
+	subject := &ast.Ident{Name: "r"}
+
+	result := a.injectSealedVariantFields(scope, sealedType, "Ok", subject)
+	if result == scope {
+		t.Error("expected new child scope when variant found")
+	}
+	// check that variant fields are accessible
+	sym := result.Lookup("r")
+	if sym == nil {
+		t.Fatal("expected 'r' symbol in narrowed scope")
+	}
+	if sym.Type == nil || len(sym.Type.Fields) != 2 {
+		t.Errorf("expected 2 fields in narrowed type, got %v", sym.Type)
+	}
+}
+
+func TestInjectSealedVariantFieldsVariantNotFoundDirect(t *testing.T) {
+	// directly test injectSealedVariantFields when variant is not found
+	a := New()
+	sealedType := &ResolvedType{
+		Kind: TypeSealed,
+		Name: "PayResult",
+		Variants: []*SealedVariantInfo{
+			{Name: "Ok", Fields: []*FieldInfo{{Name: "value", Type: a.types["String"]}}},
+		},
+	}
+	scope := NewScope()
+	subject := &ast.Ident{Name: "r"}
+
+	// variant "NonExistent" doesn't exist — should return the original scope
+	result := a.injectSealedVariantFields(scope, sealedType, "NonExistent", subject)
+	if result != scope {
+		t.Error("expected same scope when variant not found")
+	}
+}
+
+func TestSealedVariantFieldInjectionVariantNotFound(t *testing.T) {
+	// when(r) { is NonExistent -> ... } where NonExistent is not a variant of the sealed type
+	// exercises the variant not found path (loop finishes without match, returns scope)
+	a := New()
+	a.declareType("PayResult", TypeSealed, token.Position{}, "")
+	payResult := a.types["PayResult"]
+	payResult.Variants = []*SealedVariantInfo{
+		{Name: "Ok", Fields: []*FieldInfo{{Name: "value", Type: a.types["String"]}}},
+		{Name: "Err", Fields: []*FieldInfo{{Name: "message", Type: a.types["String"]}}},
+	}
+	file := &ast.File{
+		APIs: []*ast.ApiDecl{
+			{
+				Name:       "test",
+				ReturnType: &ast.TypeRef{Name: "String"},
+				Body: &ast.Block{
+					Stmts: []ast.Stmt{
+						&ast.ValStmt{
+							Name:  "r",
+							Value: &ast.Ident{Name: "PayResult"},
+						},
+						&ast.ExprStmt{
+							Expr: &ast.WhenExpr{
+								Subject: &ast.Ident{Name: "r"},
+								Branches: []*ast.WhenBranch{
+									{
+										IsType: "Ok",
+										Body:   &ast.Literal{Kind: token.String, Value: "ok"},
+									},
+									{
+										IsType: "NonExistent", // not a real variant
+										Body:   &ast.Literal{Kind: token.String, Value: "?"},
+									},
+								},
+								Else: &ast.Literal{Kind: token.String, Value: "other"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	result := a.Analyze([]*ast.File{file})
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+}
+
+// ========== Chain CRUD Return Type Edge Cases ==========
+
+func TestChainCRUDFindFirstReturnType(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(): Int {
+  val u = User.findFirst(where: name == "x")
+  0
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestChainCRUDDeleteManyReturnType(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(): Int {
+  User.deleteMany(where: name == "old")
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestChainCRUDUpdateManyReturnType(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(): Int {
+  User.updateMany(where: name == "old")
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestChainCRUDCountReturnType(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(): Int {
+  User.count(where: name == "x")
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestChainCRUDExistsReturnType(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(): Boolean {
+  User.exists(where: name == "x")
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestChainCRUDUpsertReturnType(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(): User {
+  User.upsert(where: name == "x", name: "y")
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestChainCRUDCreateManyReturnType(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+api test(): [User] {
+  User.createMany(name: "a")
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestChainCRUDAggregateReturnType(t *testing.T) {
+	// chain-style aggregate — exercises the isDynamicReturnCRUD path in inferChainCRUDReturnType
+	a := New()
+	a.declareType("User", TypeModel, token.Position{}, "")
+	userType := a.types["User"]
+	userType.Fields["name"] = &FieldInfo{Name: "name", Type: a.types["String"]}
+
+	// call inferChainCRUDReturnType directly
+	e := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "aggregate"},
+		Args: []*ast.NamedArg{{Name: "count", Value: &ast.Literal{Kind: token.True, Value: "true"}}},
+	}
+	result := a.inferChainCRUDReturnType(e, "aggregate", "User")
+	if result != nil {
+		t.Errorf("expected nil for aggregate, got %v", result)
+	}
+}
+
+// ========== isAutoManagedField Edge Cases ==========
+
+func TestCreateMissingFieldWithIdDirective(t *testing.T) {
+	// field with @id should be auto-managed — no warning
+	result := analyze(t, `
+model Product {
+  sku: Int @id
+  name: String
+}
+api test(): Product {
+  Product.create(name: "item")
+}
+`)
+	// sku has @id, so should not warn about it
+	for _, w := range result.Warnings {
+		if strings.Contains(w.Message, "sku") {
+			t.Errorf("should not warn about @id field: %s", w.Message)
+		}
+	}
+}
+
+func TestCreateMissingFieldComputedField(t *testing.T) {
+	// computed fields should be auto-managed — no warning
+	result := analyze(t, `
+model Post {
+  title: String
+  val totalCount: Int get @count
+}
+api test(): Post {
+  Post.create(title: "hello")
+}
+`)
+	for _, w := range result.Warnings {
+		if strings.Contains(w.Message, "totalCount") {
+			t.Errorf("should not warn about computed field: %s", w.Message)
+		}
+	}
+}
+
+// ========== Chain Create Required Fields — modelType not found ==========
+
+func TestChainCreateRequiredFieldsUnknownModel(t *testing.T) {
+	// chain-style create on undefined model — exercises the !ok early return
+	result := analyze(t, `
+api test(): Int {
+  val r = UnknownModel.create(name: "x")
+  0
+}
+`)
+	expectError(t, result, "undefined")
+}
+
+// ========== hasDirective found path ==========
+
+func TestHasDirectiveFound(t *testing.T) {
+	found := hasDirective([]string{"auto", "id", "unique"}, "id")
+	if !found {
+		t.Error("expected hasDirective to return true for 'id'")
+	}
+}
+
+func TestHasDirectiveNotFound(t *testing.T) {
+	found := hasDirective([]string{"auto", "unique"}, "id")
+	if found {
+		t.Error("expected hasDirective to return false for 'id'")
+	}
+}
+
+// ========== isCRUDCall and isCRUDIdent member expr path ==========
+
+func TestIsCRUDCallMemberExpr(t *testing.T) {
+	call := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.Ident{Name: "User"},
+			Field:  "find",
+		},
+	}
+	if !isCRUDCall(call) {
+		t.Error("expected isCRUDCall to return true for User.find(...)")
+	}
+}
+
+func TestIsCRUDCallNonCRUD(t *testing.T) {
+	call := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.Ident{Name: "User"},
+			Field:  "toString",
+		},
+	}
+	if isCRUDCall(call) {
+		t.Error("expected isCRUDCall to return false for User.toString(...)")
+	}
+}
+
+func TestIsCRUDCallIdentNonCRUD(t *testing.T) {
+	// ident func with non-CRUD name — exercises ident branch falling through
+	call := &ast.CallExpr{
+		Func: &ast.Ident{Name: "myFunc"},
+	}
+	if isCRUDCall(call) {
+		t.Error("expected isCRUDCall to return false for non-CRUD ident")
+	}
+}
+
+func TestIsCRUDIdentMemberExpr(t *testing.T) {
+	call := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.Ident{Name: "User"},
+			Field:  "create",
+		},
+	}
+	if !isCRUDIdent(call) {
+		t.Error("expected isCRUDIdent to return true for User.create(...)")
+	}
+}
+
+func TestIsCRUDIdentNonCRUD(t *testing.T) {
+	call := &ast.CallExpr{
+		Func: &ast.Literal{Kind: token.Int, Value: "42"},
+	}
+	if isCRUDIdent(call) {
+		t.Error("expected isCRUDIdent to return false for non-ident func")
+	}
+	if isCRUDCall(call) {
+		t.Error("expected isCRUDCall to return false for non-ident func")
+	}
+}
+
+// ========== chainCRUDInfo edge cases ==========
+
+func TestChainCRUDInfoNonMember(t *testing.T) {
+	call := &ast.CallExpr{
+		Func: &ast.Ident{Name: "find"},
+	}
+	method, model := chainCRUDInfo(call)
+	if method != "" || model != "" {
+		t.Errorf("expected empty for non-member func, got %q, %q", method, model)
+	}
+}
+
+func TestChainCRUDInfoNonCRUDMethod(t *testing.T) {
+	call := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.Ident{Name: "User"},
+			Field:  "toString",
+		},
+	}
+	method, _ := chainCRUDInfo(call)
+	if method != "" {
+		t.Errorf("expected empty for non-CRUD method, got %q", method)
+	}
+}
+
+func TestChainCRUDInfoNonIdentObject(t *testing.T) {
+	// when object is not an Ident, method is returned but modelName is empty
+	call := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.MemberExpr{
+				Object: &ast.Ident{Name: "x"},
+				Field:  "y",
+			},
+			Field: "find",
+		},
+	}
+	method, modelName := chainCRUDInfo(call)
+	if method != "find" {
+		t.Errorf("expected method 'find' for non-ident object, got %q", method)
+	}
+	if modelName != "" {
+		t.Errorf("expected empty modelName for non-ident object, got %q", modelName)
+	}
+}
+
+// ========== collectEnumValues nil expr ==========
+
+func TestCollectEnumValuesNilExprDirect(t *testing.T) {
+	a := New()
+	matched := map[string]bool{}
+	a.collectEnumValues(nil, matched)
+	if len(matched) != 0 {
+		t.Errorf("expected empty map after nil expr, got %v", matched)
+	}
+}
+
+// ========== resolveQueryMethod CRUD chain methods ==========
+
+func TestResolveQueryMethodCRUDChain(t *testing.T) {
+	a := New()
+	a.declareType("Order", TypeModel, token.Position{}, "")
+	orderType := a.types["Order"]
+	orderType.Fields["total"] = &FieldInfo{Name: "total", Type: a.types["Float"]}
+
+	tests := []struct {
+		method   string
+		wantNil  bool
+		wantKind TypeKind
+		wantList bool
+		wantNull bool
+	}{
+		{"find", true, 0, false, false}, // find returns nil (resolved in checkCallExpr)
+		{"findFirst", false, TypeModel, false, true},
+		{"findMany", false, TypeModel, true, false},
+		{"createMany", false, TypeModel, true, false},
+		{"create", false, TypeModel, false, false},
+		{"update", false, TypeModel, false, false},
+		{"upsert", false, TypeModel, false, false},
+		{"delete", false, TypeModel, false, false},
+		{"deleteMany", false, TypeInt, false, false},
+		{"updateMany", false, TypeInt, false, false},
+		{"exists", false, TypeBool, false, false},
+		{"aggregate", true, 0, false, false},
+		{"raw", true, 0, false, false},
+		{"paginate", true, 0, false, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.method, func(t *testing.T) {
+			got := a.resolveQueryMethod(tt.method, orderType)
+			if tt.wantNil {
+				if got != nil {
+					t.Errorf("resolveQueryMethod(%q) = %v, want nil", tt.method, got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("resolveQueryMethod(%q) returned nil", tt.method)
+			}
+			if got.Kind != tt.wantKind {
+				t.Errorf("resolveQueryMethod(%q).Kind = %v, want %v", tt.method, got.Kind, tt.wantKind)
+			}
+			if got.IsList != tt.wantList {
+				t.Errorf("resolveQueryMethod(%q).IsList = %v, want %v", tt.method, got.IsList, tt.wantList)
+			}
+			if got.Nullable != tt.wantNull {
+				t.Errorf("resolveQueryMethod(%q).Nullable = %v, want %v", tt.method, got.Nullable, tt.wantNull)
+			}
+		})
+	}
+}
+
+// ========== N+1 Detection — chain-style in for loop ==========
+
+func TestN1ChainStyleInForLoop(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+model Post { userId: Int  title: String }
+api test(users: [User]): Int {
+  var count = 0
+  for user in users {
+    val posts = Post.findMany(where: userId == 1)
+    count += posts.size
+  }
+  count
+}
+`)
+	expectWarning(t, result, "N+1 query")
+}
+
+func TestN1DetectionExprStmt(t *testing.T) {
+	// CRUD as ExprStmt (not ValStmt) in for loop
+	result := analyze(t, `
+model User { name: String }
+api test(ids: [Int]): Int {
+  for id in ids {
+    User.find(id: id)
+  }
+  0
+}
+`)
+	expectWarning(t, result, "N+1 query")
+}
+
+// ========== CRUD in lambda — chain-style forbidden ==========
+
+func TestChainStyleCRUDInLambdaForbidden(t *testing.T) {
+	result := analyze(t, `
+model User { name: String }
+model Post { userId: Int }
+api test(): Int {
+  val users = User.find(where: name == "test")
+  users.forEach { Post.findMany(where: userId == 1) }
+  0
+}
+`)
+	expectError(t, result, "lambda")
+}
+
+// ========== hasSearchDirective — directives loop iterates but no search ==========
+
+func TestHasSearchDirectiveNonSearchDirective(t *testing.T) {
+	// field has directives but none is @search — exercises the loop without finding "search"
+	result := analyze(t, `
+model User {
+  email: String @unique @index
+}
+api test(keyword: String): Boolean {
+  val u = User.find(id: 1)
+  u?.email?.contains(keyword) ?: false
+}
+`)
+	expectWarning(t, result, "contains")
+}
+
+func TestHasSearchDirectiveFieldWithSearchDirectAccess(t *testing.T) {
+	// exercise the return true path in hasSearchDirective
+	// by pre-defining a variable in scope with a @search field
+	a := New()
+	postType := &ResolvedType{
+		Kind: TypeModel,
+		Name: "Post",
+		Fields: map[string]*FieldInfo{
+			"title": {Name: "title", Type: a.types["String"], Directives: []string{"search"}},
+		},
+	}
+	a.types["Post"] = postType
+	a.scope.Define(&Symbol{Name: "Post", Kind: SymType, Type: postType})
+	// define "post" variable in the global scope so hasSearchDirective can find it
+	a.scope.Define(&Symbol{Name: "post", Kind: SymVariable, Type: postType})
+
+	file := &ast.File{
+		APIs: []*ast.ApiDecl{
+			{
+				Name:       "test",
+				ReturnType: &ast.TypeRef{Name: "Boolean"},
+				Body: &ast.Block{
+					Stmts: []ast.Stmt{
+						// post.title.contains("keyword")
+						&ast.ExprStmt{
+							Expr: &ast.CallExpr{
+								Func: &ast.MemberExpr{
+									Object: &ast.MemberExpr{
+										Object: &ast.Ident{Name: "post"},
+										Field:  "title",
+									},
+									Field: "contains",
+								},
+								Args: []*ast.NamedArg{
+									{Value: &ast.Literal{Kind: token.String, Value: "keyword"}},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	result := a.Analyze([]*ast.File{file})
+	// post.title has @search, so no "contains" warning should appear
+	for _, w := range result.Warnings {
+		if strings.Contains(w.Message, "contains") {
+			t.Errorf("should not warn about contains on @search field: %s", w.Message)
+		}
+	}
+}
+
+func TestHasSearchDirectiveEmptyDirectives(t *testing.T) {
+	// field has NO directives at all — exercises the empty loop path
+	a := New()
+	postType := &ResolvedType{
+		Kind: TypeModel,
+		Name: "Post",
+		Fields: map[string]*FieldInfo{
+			"title": {Name: "title", Type: a.types["String"], Directives: nil},
+		},
+	}
+	a.scope.Define(&Symbol{Name: "post", Kind: SymVariable, Type: postType})
+
+	expr := &ast.MemberExpr{Object: &ast.Ident{Name: "post"}, Field: "title"}
+	got := a.hasSearchDirective(expr)
+	if got {
+		t.Error("expected false for field with no directives")
+	}
+}
+
+func TestHasSearchDirectiveDirectLoopNoSearch(t *testing.T) {
+	// directly test hasSearchDirective where field has directives but none is "search"
+	a := New()
+	postType := &ResolvedType{
+		Kind: TypeModel,
+		Name: "Post",
+		Fields: map[string]*FieldInfo{
+			"title": {Name: "title", Type: a.types["String"], Directives: []string{"unique", "index"}},
+		},
+	}
+	a.scope.Define(&Symbol{Name: "post", Kind: SymVariable, Type: postType})
+
+	// hasSearchDirective(post.title) — should return false because no "search" directive
+	expr := &ast.MemberExpr{Object: &ast.Ident{Name: "post"}, Field: "title"}
+	got := a.hasSearchDirective(expr)
+	if got {
+		t.Error("expected false for field without @search")
+	}
+}
+
+func TestHasSearchDirectiveDirectLoopWithSearch(t *testing.T) {
+	// directly test hasSearchDirective where field has @search directive
+	a := New()
+	postType := &ResolvedType{
+		Kind: TypeModel,
+		Name: "Post",
+		Fields: map[string]*FieldInfo{
+			"title": {Name: "title", Type: a.types["String"], Directives: []string{"search"}},
+		},
+	}
+	a.scope.Define(&Symbol{Name: "post", Kind: SymVariable, Type: postType})
+
+	expr := &ast.MemberExpr{Object: &ast.Ident{Name: "post"}, Field: "title"}
+	got := a.hasSearchDirective(expr)
+	if !got {
+		t.Error("expected true for field with @search")
+	}
+}
+
+func TestHasSearchDirectiveFieldWithNonSearchDirective(t *testing.T) {
+	// field has directives but no @search — exercises the loop falling through to return false
+	a := New()
+	postType := &ResolvedType{
+		Kind: TypeModel,
+		Name: "Post",
+		Fields: map[string]*FieldInfo{
+			"title": {Name: "title", Type: a.types["String"], Directives: []string{"unique", "index"}},
+		},
+	}
+	a.types["Post"] = postType
+	a.scope.Define(&Symbol{Name: "Post", Kind: SymType, Type: postType})
+	a.scope.Define(&Symbol{Name: "post", Kind: SymVariable, Type: postType})
+
+	file := &ast.File{
+		APIs: []*ast.ApiDecl{
+			{
+				Name:       "test",
+				ReturnType: &ast.TypeRef{Name: "Boolean"},
+				Body: &ast.Block{
+					Stmts: []ast.Stmt{
+						&ast.ExprStmt{
+							Expr: &ast.CallExpr{
+								Func: &ast.MemberExpr{
+									Object: &ast.MemberExpr{
+										Object: &ast.Ident{Name: "post"},
+										Field:  "title",
+									},
+									Field: "contains",
+								},
+								Args: []*ast.NamedArg{
+									{Value: &ast.Literal{Kind: token.String, Value: "keyword"}},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	result := a.Analyze([]*ast.File{file})
+	expectWarning(t, result, "contains")
+}
+
+// ========== Transaction with explicit non-lambda arg ==========
+
+func TestTransactionCallWithNonLambdaArgDirect(t *testing.T) {
+	// transaction called with a non-LambdaExpr argument — exercises the else branch in checkTransactionCall
+	a := New()
+	file := &ast.File{
+		APIs: []*ast.ApiDecl{
+			{
+				Name:       "test",
+				ReturnType: &ast.TypeRef{Name: "Int"},
+				Body: &ast.Block{
+					Stmts: []ast.Stmt{
+						&ast.ExprStmt{
+							Expr: &ast.CallExpr{
+								Func: &ast.Ident{Name: "transaction"},
+								Args: []*ast.NamedArg{
+									{Value: &ast.Literal{Kind: token.Int, Value: "42"}},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	result := a.Analyze([]*ast.File{file})
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+}
+
+// ========== ForStmt as expression in checkCompositeExpr ==========
+
+func TestForStmtAsExpression(t *testing.T) {
+	// for as expression — exercises the ForStmt case in checkCompositeExpr
+	a := New()
+	file := &ast.File{
+		APIs: []*ast.ApiDecl{
+			{
+				Name:       "test",
+				ReturnType: &ast.TypeRef{Name: "Int"},
+				Body: &ast.Block{
+					Stmts: []ast.Stmt{
+						&ast.ValStmt{
+							Name: "result",
+							Value: &ast.ForStmt{
+								VarName:    "i",
+								Collection: &ast.ListExpr{Items: []ast.Expr{&ast.Literal{Kind: token.Int, Value: "1"}}},
+								Body: &ast.Block{
+									Stmts: []ast.Stmt{
+										&ast.ExprStmt{Expr: &ast.Ident{Name: "i"}},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	result := a.Analyze([]*ast.File{file})
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+}
+
+// ========== isAggregateFieldRefCall Tests ==========
+
+func TestIsAggregateFieldRefCallIdent(t *testing.T) {
+	call := &ast.CallExpr{Func: &ast.Ident{Name: "aggregate"}}
+	if !isAggregateFieldRefCall(call) {
+		t.Error("expected true for aggregate ident")
+	}
+	call2 := &ast.CallExpr{Func: &ast.Ident{Name: "groupBy"}}
+	if !isAggregateFieldRefCall(call2) {
+		t.Error("expected true for groupBy ident")
+	}
+	call3 := &ast.CallExpr{Func: &ast.Ident{Name: "find"}}
+	if isAggregateFieldRefCall(call3) {
+		t.Error("expected false for find ident")
+	}
+}
+
+func TestIsAggregateFieldRefCallMember(t *testing.T) {
+	call := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "aggregate"},
+	}
+	if !isAggregateFieldRefCall(call) {
+		t.Error("expected true for User.aggregate member")
+	}
+	call2 := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "find"},
+	}
+	if isAggregateFieldRefCall(call2) {
+		t.Error("expected false for User.find member")
+	}
+}
+
+func TestIsAggregateFieldRefCallNonIdentNonMember(t *testing.T) {
+	call := &ast.CallExpr{Func: &ast.Literal{Kind: token.Int, Value: "1"}}
+	if isAggregateFieldRefCall(call) {
+		t.Error("expected false for literal func")
+	}
+}
+
+// ========== isQueryModifierMethod Tests ==========
+
+func TestQueryModifierMethodOrderBy(t *testing.T) {
+	// Model.orderBy(field.desc) — exercises isQueryModifierMethod returning true
+	result := analyze(t, `
+model Post {
+  title: String
+  likes: Int
+}
+api test(): [Post] {
+  Post.orderBy(likes.desc).all
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestQueryModifierMethodGroupBy(t *testing.T) {
+	// Model.groupBy(field) — exercises isQueryModifierMethod returning true
+	result := analyze(t, `
+model Post {
+  title: String
+  status: String
+}
+api test(): Int {
+  val grouped = Post.groupBy(status)
+  0
+}
+`)
+	expectNoErrors(t, result)
+}
+
+// ========== isAutoManagedField — IsMethod field ==========
+
+func TestIsAutoManagedFieldIsMethod(t *testing.T) {
+	field := &FieldInfo{Name: "verify", IsMethod: true}
+	if !isAutoManagedField(field) {
+		t.Error("expected IsMethod field to be auto-managed")
+	}
+}
+
+func TestIsAutoManagedFieldHasDefault(t *testing.T) {
+	field := &FieldInfo{Name: "status", HasDefault: true}
+	if !isAutoManagedField(field) {
+		t.Error("expected HasDefault field to be auto-managed")
+	}
+}
+
+func TestIsAutoManagedFieldDeletedAt(t *testing.T) {
+	field := &FieldInfo{Name: "deletedAt"}
+	if !isAutoManagedField(field) {
+		t.Error("expected deletedAt field to be auto-managed")
+	}
+}
+
+func TestIsAutoManagedFieldWithAutoDirective(t *testing.T) {
+	field := &FieldInfo{Name: "seq", Directives: []string{"auto"}}
+	if !isAutoManagedField(field) {
+		t.Error("expected @auto field to be auto-managed")
+	}
+}
+
+func TestIsAutoManagedFieldWithIdDirective(t *testing.T) {
+	field := &FieldInfo{Name: "pk", Directives: []string{"id"}}
+	if !isAutoManagedField(field) {
+		t.Error("expected @id field to be auto-managed")
+	}
+}
+
+func TestIsAutoManagedFieldRegularRequired(t *testing.T) {
+	field := &FieldInfo{Name: "title"}
+	if isAutoManagedField(field) {
+		t.Error("expected regular non-nullable field to NOT be auto-managed")
+	}
+}
+
+// ========== resolveModelFromExpr — QueryBuilder variable ==========
+
+func TestResolveModelFromExprQueryBuilder(t *testing.T) {
+	// directly test resolveModelFromExpr with a QueryBuilder type variable
+	a := New()
+	a.declareType("Order", TypeModel, token.Position{}, "")
+	orderType := a.types["Order"]
+	orderType.Fields["total"] = &FieldInfo{Name: "total", Type: a.types["Float"]}
+
+	qbType := &ResolvedType{
+		Kind:      TypeQueryBuilder,
+		Name:      "OrderQueryBuilder",
+		Fields:    orderType.Fields,
+		ModelType: orderType,
+	}
+	scope := NewScope()
+	scope.Define(&Symbol{Name: "qb", Kind: SymVariable, Type: qbType})
+
+	result := a.resolveModelFromExpr(&ast.Ident{Name: "qb"}, scope)
+	if result == nil {
+		t.Fatal("expected non-nil result for QueryBuilder variable")
+	}
+	if result.Kind != TypeModel {
+		t.Errorf("expected TypeModel, got %v", result.Kind)
+	}
+	if result.Name != "Order" {
+		t.Errorf("expected 'Order', got %q", result.Name)
+	}
+}
+
+// ========== resolveModelFromExpr — chained CallExpr (direct) ==========
+
+func TestResolveModelFromExprCallExprDirect(t *testing.T) {
+	// directly test resolveModelFromExpr with a CallExpr whose Func is a MemberExpr
+	a := New()
+	a.declareType("Order", TypeModel, token.Position{}, "")
+	scope := NewScope()
+
+	// CallExpr(MemberExpr(Ident("Order"), "where"), args)
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.Ident{Name: "Order"},
+			Field:  "where",
+		},
+		Args: []*ast.NamedArg{},
+	}
+	result := a.resolveModelFromExpr(expr, scope)
+	if result == nil {
+		t.Fatal("expected non-nil result for chained CallExpr")
+	}
+	if result.Name != "Order" {
+		t.Errorf("expected 'Order', got %q", result.Name)
+	}
+}
+
+func TestResolveModelFromExprChainedCall(t *testing.T) {
+	// Order.where(...).sum(total) — exercises the CallExpr path in resolveModelFromExpr
+	a := New()
+	a.declareType("Order", TypeModel, token.Position{}, "")
+	orderType := a.types["Order"]
+	orderType.Fields["total"] = &FieldInfo{Name: "total", Type: a.types["Float"]}
+
+	file := &ast.File{
+		APIs: []*ast.ApiDecl{
+			{
+				Name:       "test",
+				ReturnType: &ast.TypeRef{Name: "Float"},
+				Body: &ast.Block{
+					Stmts: []ast.Stmt{
+						// Order.where(true).sum(total) — chained call
+						&ast.ExprStmt{
+							Expr: &ast.CallExpr{
+								Func: &ast.MemberExpr{
+									Object: &ast.CallExpr{
+										Func: &ast.MemberExpr{
+											Object: &ast.Ident{Name: "Order"},
+											Field:  "where",
+										},
+										Args: []*ast.NamedArg{
+											{Value: &ast.Literal{Kind: token.True, Value: "true"}},
+										},
+									},
+									Field: "sum",
+								},
+								Args: []*ast.NamedArg{
+									{Value: &ast.Ident{Name: "total"}},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	result := a.Analyze([]*ast.File{file})
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+}
+
+// ========== isCRUDCall: ident with DB query op name ==========
+
+func TestIsCRUDCallIdentWithDBQueryOp(t *testing.T) {
+	// Exercises the ident branch returning true in isCRUDCall (line 1358-1360).
+	call := &ast.CallExpr{
+		Func: &ast.Ident{Name: "find"},
+	}
+	if !isCRUDCall(call) {
+		t.Error("expected isCRUDCall to return true for ident 'find'")
+	}
+}
+
+// ========== injectSealedVariantFields: non-ident subject ==========
+
+func TestInjectSealedVariantFieldsNonIdentSubject(t *testing.T) {
+	// Exercises the !ok early return when subject is not an *ast.Ident (line 1725).
+	// Directly call injectSealedVariantFields with a non-ident subject.
+	a := New()
+	sealedType := &ResolvedType{
+		Kind: TypeSealed,
+		Name: "Result",
+		Variants: []*SealedVariantInfo{
+			{Name: "Ok", Fields: []*FieldInfo{{Name: "value"}}},
+		},
+	}
+	// MemberExpr is not an *ast.Ident — should return scope unchanged
+	subject := &ast.MemberExpr{Object: &ast.Ident{Name: "x"}, Field: "val"}
+	scope := NewScope()
+	got := a.injectSealedVariantFields(scope, sealedType, "Ok", subject)
+	if got != scope {
+		t.Error("expected original scope to be returned for non-ident subject")
+	}
+}
+
+// ========== hasSearchDirective: field is nil ==========
+
+func TestHasSearchDirectiveFieldNilDirect(t *testing.T) {
+	// Exercises the field == nil return path in hasSearchDirective (line 2016).
+	// Directly call hasSearchDirective with a MemberExpr whose object type
+	// resolves but the field does not exist in the resolved type.
+	a := New()
+	a.types = BuiltinTypes()
+	a.scope = NewScope()
+	// Define a variable "obj" with type that has fields
+	objType := &ResolvedType{
+		Kind:   TypeModel,
+		Name:   "Obj",
+		Fields: map[string]*FieldInfo{"real": {Name: "real"}},
+	}
+	a.scope.Define(&Symbol{Name: "obj", Kind: SymVariable, Type: objType})
+
+	// MemberExpr "obj.ghost" — obj resolves, "ghost" does not exist → field == nil
+	expr := &ast.MemberExpr{Object: &ast.Ident{Name: "obj"}, Field: "ghost"}
+	if a.hasSearchDirective(expr) {
+		t.Error("expected false for non-existent field")
+	}
+}
+
+// ========== checkLambdaExpr: named lambda params ==========
+
+func TestNamedLambdaParams(t *testing.T) {
+	// Exercises the named params branch in checkLambdaExpr (line 1631-1635).
+	// Lambda with explicit named params: { x -> x + 1 }
+	result := analyze(t, `
+model Item { value: Int }
+api test(): [Item] {
+  val items = Item.find(where: value > 0)
+  items.filter { x -> true }
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestNamedLambdaMultipleParams(t *testing.T) {
+	// Lambda with multiple named params: { a, b -> a + b }
+	result := analyze(t, `
+model Item { value: Int }
+api test(): Int {
+  val items = Item.find(where: value > 0)
+  items.forEach { x -> x }
+  0
 }
 `)
 	expectNoErrors(t, result)

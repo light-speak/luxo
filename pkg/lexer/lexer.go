@@ -16,8 +16,10 @@ type Lexer struct {
 	line   int
 	col    int
 
-	tokens []token.Token
-	errors []Error
+	tokens      []token.Token
+	errors      []Error
+	braceDepth  int   // tracks brace nesting inside string interpolation
+	interpStack []int // stack of brace depths where interpolation started
 }
 
 // Error represents a lexer error with position.
@@ -66,6 +68,15 @@ func (l *Lexer) nextToken() token.Token {
 		return l.makeToken(token.EOF, "", pos)
 	}
 
+	// If inside string interpolation and we see '}' at the matching depth,
+	// continue reading the rest of the string.
+	if ch == '}' && l.inInterpolation() && l.braceDepth == l.interpTop() {
+		l.advance() // skip '}'
+		l.popInterp()
+		l.braceDepth--
+		return l.readStringContinuation(pos)
+	}
+
 	// Try single-char tokens first
 	if tok, ok := l.readSingleChar(ch, pos); ok {
 		return tok
@@ -96,6 +107,26 @@ func (l *Lexer) nextToken() token.Token {
 	}
 }
 
+// inInterpolation returns true if the lexer is inside a string interpolation.
+func (l *Lexer) inInterpolation() bool {
+	return len(l.interpStack) > 0
+}
+
+// interpTop returns the brace depth at which the current interpolation started.
+func (l *Lexer) interpTop() int {
+	return l.interpStack[len(l.interpStack)-1]
+}
+
+// pushInterp pushes the current brace depth onto the interpolation stack.
+func (l *Lexer) pushInterp() {
+	l.interpStack = append(l.interpStack, l.braceDepth)
+}
+
+// popInterp pops the interpolation stack.
+func (l *Lexer) popInterp() {
+	l.interpStack = l.interpStack[:len(l.interpStack)-1]
+}
+
 // readSingleChar handles single-character tokens that need no lookahead.
 func (l *Lexer) readSingleChar(ch rune, pos token.Position) (token.Token, bool) {
 	var typ token.Type
@@ -103,8 +134,10 @@ func (l *Lexer) readSingleChar(ch rune, pos token.Position) (token.Token, bool) 
 	case ':':
 		typ = token.Colon
 	case '{':
+		l.braceDepth++
 		typ = token.LBrace
 	case '}':
+		l.braceDepth--
 		typ = token.RBrace
 	case '(':
 		typ = token.LParen
@@ -345,9 +378,21 @@ func (l *Lexer) readNumber(pos token.Position) token.Token {
 	return l.makeToken(token.Int, val, pos)
 }
 
-// readString reads a string literal, supporting template interpolation.
+// readString reads a string literal, handling template interpolation ${expr}.
 func (l *Lexer) readString(pos token.Position) token.Token {
 	l.advance() // skip opening "
+	return l.readStringBody(pos, token.String, token.StringStart)
+}
+
+// readStringContinuation reads the string portion after a closing } of interpolation.
+func (l *Lexer) readStringContinuation(pos token.Position) token.Token {
+	return l.readStringBody(pos, token.StringEnd, token.StringMid)
+}
+
+// readStringBody reads string content until closing quote or ${.
+// plainType is used when no interpolation is found (plain string or string end).
+// interpType is used when ${ is found (string start or string mid).
+func (l *Lexer) readStringBody(pos token.Position, plainType, interpType token.Type) token.Token {
 	start := l.pos
 	for {
 		ch := l.peek()
@@ -360,10 +405,18 @@ func (l *Lexer) readString(pos token.Position) token.Token {
 			l.advance() // skip escaped char
 			continue
 		}
+		if ch == '$' && l.peekAt(1) == '{' {
+			val := l.source[start:l.pos]
+			l.advance() // skip $
+			l.advance() // skip {
+			l.braceDepth++
+			l.pushInterp()
+			return l.makeToken(interpType, val, pos)
+		}
 		if ch == '"' {
 			val := l.source[start:l.pos]
 			l.advance() // skip closing "
-			return l.makeToken(token.String, val, pos)
+			return l.makeToken(plainType, val, pos)
 		}
 		l.advance()
 	}

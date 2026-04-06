@@ -18,10 +18,35 @@ const (
 	TypeInterface
 	TypeEnum
 	TypeSealed
-	TypeCustom  // user-defined type
-	TypeGeneric // Page<T>, Result<T>
-	TypeTuple   // (Post, Video, Product) polymorphic
+	TypeCustom       // user-defined type
+	TypeGeneric      // Page<T>, Result<T>
+	TypeTuple        // (Post, Video, Product) polymorphic
+	TypeQueryBuilder // Model.where(...).sum(...) chain query
 )
+
+// String returns the display name for a TypeKind.
+func (k TypeKind) String() string {
+	switch k {
+	case TypeModel:
+		return "model"
+	case TypeInterface:
+		return "interface"
+	case TypeEnum:
+		return "enum"
+	case TypeSealed:
+		return "sealed"
+	case TypeCustom:
+		return "type"
+	case TypeGeneric:
+		return "generic"
+	case TypeTuple:
+		return "tuple"
+	case TypeQueryBuilder:
+		return "query builder"
+	default:
+		return "type"
+	}
+}
 
 // ResolvedType represents a fully resolved type after semantic analysis.
 type ResolvedType struct {
@@ -45,6 +70,9 @@ type ResolvedType struct {
 	// Tuple types: (Post, Video, Product)
 	Tuple []*ResolvedType
 
+	// ModelType references the underlying model for query builder types
+	ModelType *ResolvedType
+
 	// Parents (inheritance)
 	Parents []*ResolvedType
 
@@ -59,6 +87,7 @@ type FieldInfo struct {
 	Nullable   bool
 	HasDefault bool
 	Computed   bool
+	IsMethod   bool     // true if this field is a method requiring ()
 	Directives []string // directive names for quick lookup
 	Pos        token.Position
 	Doc        string
@@ -114,6 +143,14 @@ func BuiltinTypes() map[string]*ResolvedType {
 	// split returns list (approximate — not typed as [String] but won't error)
 	stringType.Fields["split"].Type = &ResolvedType{Kind: TypeString, Name: "String", IsList: true}
 
+	identityType := &ResolvedType{Kind: TypeModel, Name: "Identity", Fields: map[string]*FieldInfo{
+		"id":   {Name: "id", Type: intType},
+		"load": {Name: "load", Type: nil, IsMethod: true, Doc: ".load(fields...): Identity — Lazy load user fields / 懒加载用户字段"}, // my.load(fields...) — lazy load
+		"role": {Name: "role", Type: nil},                                                                                      // role from JWT stores, type resolved at codegen
+	}}
+	// self-reference: load() returns Identity
+	identityType.Fields["load"].Type = identityType
+
 	return map[string]*ResolvedType{
 		"Int":      intType,
 		"Float":    floatType,
@@ -123,6 +160,18 @@ func BuiltinTypes() map[string]*ResolvedType {
 		"Duration": {Kind: TypeDuration, Name: "Duration", Fields: map[string]*FieldInfo{}},
 		"Result":   {Kind: TypeGeneric, Name: "Result", Fields: map[string]*FieldInfo{}},
 		"Channel":  {Kind: TypeGeneric, Name: "Channel", Fields: map[string]*FieldInfo{}},
+		"Page": {Kind: TypeGeneric, Name: "Page", Fields: map[string]*FieldInfo{
+			"items":    {Name: "items", Type: nil},
+			"total":    {Name: "total", Type: intType},
+			"page":     {Name: "page", Type: intType},
+			"pageSize": {Name: "pageSize", Type: intType},
+		}},
+		"Cursor": {Kind: TypeGeneric, Name: "Cursor", Fields: map[string]*FieldInfo{
+			"items":      {Name: "items", Type: nil},
+			"nextCursor": {Name: "nextCursor", Type: stringType, Nullable: true},
+			"hasMore":    {Name: "hasMore", Type: boolType},
+		}},
+		"Identity": identityType,
 	}
 }
 
@@ -153,6 +202,17 @@ func (t *ResolvedType) AsNullable() *ResolvedType {
 	copy := *t
 	copy.Nullable = true
 	return &copy
+}
+
+// AsList returns a list version of this type.
+func (t *ResolvedType) AsList() *ResolvedType {
+	return &ResolvedType{
+		Kind:    t.Kind,
+		Name:    t.Name,
+		IsList:  true,
+		Fields:  t.Fields,
+		Parents: t.Parents,
+	}
 }
 
 // AsNonNull returns a non-nullable version of this type.

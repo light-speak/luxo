@@ -189,6 +189,74 @@ model Post { title: String }`
 	}
 }
 
+func TestErrorRecoveryIncompleteDecl(t *testing.T) {
+	// Incomplete "api test" (no params, return type, or body) followed by
+	// valid declarations. The parser should report the error for the
+	// incomplete api but still parse the subsequent model and enum.
+	input := `
+api test
+
+model User {
+  name: String
+}
+
+enum Status {
+  Active
+  Inactive
+}
+`
+	l := lexer.New(input, "test.luxo")
+	tokens, _ := l.Tokenize()
+	p := New(tokens)
+	file, errs := p.Parse("test.luxo")
+
+	if len(errs) == 0 {
+		t.Error("expected parse errors for incomplete api declaration")
+	}
+	if len(file.Models) != 1 {
+		t.Errorf("expected 1 model after recovery, got %d", len(file.Models))
+	}
+	if len(file.Enums) != 1 {
+		t.Errorf("expected 1 enum after recovery, got %d", len(file.Enums))
+	}
+}
+
+func TestErrorRecoveryMultipleIncompleteDecls(t *testing.T) {
+	// Multiple incomplete declarations interspersed with valid ones.
+	input := `
+model User {
+  name: String
+}
+
+fn broken(
+
+model Post {
+  title: String
+}
+
+api incomplete
+
+enum Color {
+  Red
+  Blue
+}
+`
+	l := lexer.New(input, "test.luxo")
+	tokens, _ := l.Tokenize()
+	p := New(tokens)
+	file, errs := p.Parse("test.luxo")
+
+	if len(errs) == 0 {
+		t.Error("expected parse errors")
+	}
+	if len(file.Models) != 2 {
+		t.Errorf("expected 2 models after recovery, got %d", len(file.Models))
+	}
+	if len(file.Enums) != 1 {
+		t.Errorf("expected 1 enum after recovery, got %d", len(file.Enums))
+	}
+}
+
 // ========== Empty Body / Params Tests ==========
 
 func TestEmptyModelBody(t *testing.T) {
@@ -257,9 +325,9 @@ func TestSyntaxConformanceModel(t *testing.T) {
 func TestSyntaxConformanceApi(t *testing.T) {
 	input := `api register(input: RegisterInput): AuthResult {
   input.password.length >= 8 ?: throw error.password_too_short
-  val exists = find(User, where: email == input.email)
+  val exists = User.find(where: email == input.email)
   exists == null ?: throw error.email_exists
-  val user = create(User, name: input.name, email: input.email, password: input.password)
+  val user = User.create(name: input.name, email: input.email, password: input.password)
   val token = generateToken(user, expires: 7d)
   AuthResult { token: token, user: user }
 }`
@@ -348,12 +416,8 @@ func TestSyntaxConformanceExtend(t *testing.T) {
 func TestSyntaxConformanceScope(t *testing.T) {
 	input := `model Post : Base {
   status: String
-  scope published {
-    val x = 1
-  }
-  scope hot {
-    val y = 2
-  }
+  scope published = where(status == "PUBLISHED")
+  scope hot = where(likes > 100).orderBy(likes.desc)
 }`
 	file := parse(t, input)
 	if len(file.Models[0].Scopes) != 2 {
@@ -466,10 +530,10 @@ api test(): Int {
 // ========== parseCallArgs — named arg with no value before RParen ==========
 
 func TestParseCallArgsIncompleteNamedArg(t *testing.T) {
-	// This is a parse-error-tolerant case: find(User, where: )
+	// This is a parse-error-tolerant case: User.find(where: )
 	l := lexer.New(`model User { name: String }
 api test(): Int {
-  find(User, where: )
+  User.find(where: )
   0
 }`, "test.luxo")
 	tokens, _ := l.Tokenize()

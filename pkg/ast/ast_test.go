@@ -51,6 +51,7 @@ func TestStmtGetPos(t *testing.T) {
 		&ExprStmt{Pos: pos},
 		&AssignStmt{Pos: pos},
 		&BreakStmt{Pos: pos},
+		&ContinueStmt{Pos: pos},
 		&OnDecl{Pos: pos},
 	}
 

@@ -153,11 +153,13 @@ type OnDecl struct {
 	Native    bool
 }
 
-// ScopeDecl: scope published { where: status == "PUBLISHED" }
+// ScopeDecl: scope published = where(status == PostStatus.PUBLISHED)
+// ScopeDecl: scope recent(days: Int) = where(createdAt > now() - days.days)
 type ScopeDecl struct {
-	Pos  token.Position
-	Name string
-	Body *Block
+	Pos    token.Position
+	Name   string
+	Params []*ParamDecl // optional parameters
+	Expr   Expr         // where(...).orderBy(...) chain expression
 }
 
 // ========== Fields & Params ==========
@@ -182,6 +184,7 @@ type ComputedField struct {
 // ParamDecl: id: Int = 0
 type ParamDecl struct {
 	Pos     token.Position
+	Doc     string
 	Name    string
 	Type    *TypeRef
 	Default Expr
@@ -284,10 +287,11 @@ type WhenBranch struct {
 	Body      Expr
 }
 
-// LambdaExpr: { it.name }
+// LambdaExpr: { it.name } or { x -> x.name } or { a, b -> a + b }
 type LambdaExpr struct {
-	Pos  token.Position
-	Body *Block
+	Pos    token.Position
+	Params []string // named params: { x -> ... }, nil = use implicit 'it'
+	Body   *Block
 }
 
 // ListExpr: [1, 2, 3]
@@ -349,9 +353,10 @@ type Stmt interface {
 // ValStmt: val x = expr (immutable), var x = expr (mutable)
 type ValStmt struct {
 	Pos     token.Position
-	Name    string   // single name: val x = ...
-	Names   []string // destructure: val (a, b, c) = ...
-	Type    *TypeRef // optional, usually inferred
+	NamePos token.Position // position of the variable name identifier
+	Name    string         // single name: val x = ...
+	Names   []string       // destructure: val (a, b, c) = ...
+	Type    *TypeRef       // optional, usually inferred
 	Value   Expr
 	Mutable bool // true for var, false for val
 }
@@ -396,10 +401,16 @@ type AssignStmt struct {
 	Target Expr   // variable being assigned
 	Op     string // "=", "+=", "-=", "*=", "/=", "%="
 	Value  Expr
+	Atomic bool // set by semantic analysis: field += n on model → SQL SET field = field + n
 }
 
 // BreakStmt: break
 type BreakStmt struct {
+	Pos token.Position
+}
+
+// ContinueStmt: continue
+type ContinueStmt struct {
 	Pos token.Position
 }
 
@@ -437,16 +448,17 @@ func (n *AsyncExpr) exprNode()       {}
 func (n *AwaitExpr) exprNode()       {}
 func (n *ForStmt) exprNode()         {} // for can be used as expression
 
-func (n *ValStmt) stmtNode()    {}
-func (n *IfStmt) stmtNode()     {}
-func (n *ForStmt) stmtNode()    {}
-func (n *ReturnStmt) stmtNode() {}
-func (n *ThrowStmt) stmtNode()  {}
-func (n *EmitStmt) stmtNode()   {}
-func (n *AssignStmt) stmtNode() {}
-func (n *BreakStmt) stmtNode()  {}
-func (n *ExprStmt) stmtNode()   {}
-func (n *OnDecl) stmtNode()     {}
+func (n *ValStmt) stmtNode()      {}
+func (n *IfStmt) stmtNode()       {}
+func (n *ForStmt) stmtNode()      {}
+func (n *ReturnStmt) stmtNode()   {}
+func (n *ThrowStmt) stmtNode()    {}
+func (n *EmitStmt) stmtNode()     {}
+func (n *AssignStmt) stmtNode()   {}
+func (n *BreakStmt) stmtNode()    {}
+func (n *ContinueStmt) stmtNode() {}
+func (n *ExprStmt) stmtNode()     {}
+func (n *OnDecl) stmtNode()       {}
 
 func (n *Literal) GetPos() token.Position         { return n.Pos }
 func (n *Ident) GetPos() token.Position           { return n.Pos }
@@ -466,14 +478,15 @@ func (n *YieldExpr) GetPos() token.Position       { return n.Pos }
 func (n *AsyncExpr) GetPos() token.Position       { return n.Pos }
 func (n *AwaitExpr) GetPos() token.Position       { return n.Pos }
 
-func (n *ValStmt) GetPos() token.Position    { return n.Pos }
-func (n *IfStmt) GetPos() token.Position     { return n.Pos }
-func (n *ForStmt) GetPos() token.Position    { return n.Pos }
-func (n *ReturnStmt) GetPos() token.Position { return n.Pos }
-func (n *ThrowStmt) GetPos() token.Position  { return n.Pos }
-func (n *EmitStmt) GetPos() token.Position   { return n.Pos }
-func (n *AssignStmt) GetPos() token.Position { return n.Pos }
-func (n *BreakStmt) GetPos() token.Position  { return n.Pos }
-func (n *ExprStmt) GetPos() token.Position   { return n.Pos }
-func (n *EventDecl) GetPos() token.Position  { return n.Pos }
-func (n *OnDecl) GetPos() token.Position     { return n.Pos }
+func (n *ValStmt) GetPos() token.Position      { return n.Pos }
+func (n *IfStmt) GetPos() token.Position       { return n.Pos }
+func (n *ForStmt) GetPos() token.Position      { return n.Pos }
+func (n *ReturnStmt) GetPos() token.Position   { return n.Pos }
+func (n *ThrowStmt) GetPos() token.Position    { return n.Pos }
+func (n *EmitStmt) GetPos() token.Position     { return n.Pos }
+func (n *AssignStmt) GetPos() token.Position   { return n.Pos }
+func (n *BreakStmt) GetPos() token.Position    { return n.Pos }
+func (n *ContinueStmt) GetPos() token.Position { return n.Pos }
+func (n *ExprStmt) GetPos() token.Position     { return n.Pos }
+func (n *EventDecl) GetPos() token.Position    { return n.Pos }
+func (n *OnDecl) GetPos() token.Position       { return n.Pos }

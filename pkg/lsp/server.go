@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/formatter"
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
 )
@@ -58,21 +59,26 @@ func (s *Server) handleMessage(req *Request) error {
 	switch req.Method {
 	case "initialize":
 		return s.handleInitialize(req)
-	case "initialized":
+	case "initialized", "textDocument/didSave":
 		return nil
 	case "shutdown":
 		s.shutdown = true
 		return s.transport.SendResponse(req.ID, nil)
 	case "exit":
 		return nil
+	default:
+		return s.handleTextDocument(req)
+	}
+}
+
+func (s *Server) handleTextDocument(req *Request) error {
+	switch req.Method {
 	case "textDocument/didOpen":
 		return s.handleDidOpen(req)
 	case "textDocument/didChange":
 		return s.handleDidChange(req)
 	case "textDocument/didClose":
 		return s.handleDidClose(req)
-	case "textDocument/didSave":
-		return nil
 	case "textDocument/completion":
 		return s.handleCompletion(req)
 	case "textDocument/hover":
@@ -81,6 +87,10 @@ func (s *Server) handleMessage(req *Request) error {
 		return s.handleDefinition(req)
 	case "textDocument/references":
 		return s.handleReferences(req)
+	case "textDocument/formatting":
+		return s.handleFormatting(req)
+	case "textDocument/inlayHint":
+		return s.handleInlayHint(req)
 	default:
 		if req.ID != nil {
 			return s.transport.SendError(req.ID, -32601, "method not found: "+req.Method)
@@ -98,9 +108,11 @@ func (s *Server) handleInitialize(req *Request) error {
 			CompletionProvider: &CompletionOpt{
 				TriggerCharacters: []string{".", "@", ":"},
 			},
-			HoverProvider:      true,
-			DefinitionProvider: true,
-			ReferencesProvider: true,
+			HoverProvider:              true,
+			DefinitionProvider:         true,
+			ReferencesProvider:         true,
+			DocumentFormattingProvider: true,
+			InlayHintProvider:          true,
 		},
 		ServerInfo: ServerInfo{
 			Name:    "luxo-lsp",
@@ -189,6 +201,12 @@ func (s *Server) getCompletions(doc *Document, pos Position) []CompletionItem {
 	word := doc.WordAt(pos)
 	prefix := strings.ToLower(word)
 
+	// inside @scope(...) — suggest scope names from the API's return type model
+	if doc.IsInsideScopeDirective(pos) && doc.File != nil {
+		items = append(items, s.getScopeCompletions(doc, pos)...)
+		return items
+	}
+
 	// after '.' — field/method completion
 	if prevChar == '.' {
 		items = append(items, s.getMemberCompletions(doc, pos)...)
@@ -267,9 +285,10 @@ func (s *Server) getMemberCompletions(doc *Document, pos Position) []CompletionI
 	// variable member access: look up variable type
 	items = append(items, s.getVariableMemberCompletions(doc, objName)...)
 
-	// collection methods + string properties + DateTime methods
+	// collection methods + string properties + DateTime methods + query methods
 	items = append(items, getCollectionMethodCompletions()...)
 	items = append(items, getDateTimeMethods()...)
+	items = append(items, getQueryMethodCompletions()...)
 
 	return items
 }
@@ -312,6 +331,10 @@ func (s *Server) getTypeMemberCompletions(typ *semantic.ResolvedType, objName st
 				SortText: "b_" + name,
 			})
 		}
+	}
+	// CRUD chain methods for model types
+	if typ.Kind == semantic.TypeModel {
+		items = append(items, getQueryMethodCompletions()...)
 	}
 	return items
 }
@@ -421,6 +444,48 @@ func getCollectionMethodCompletions() []CompletionItem {
 	return items
 }
 
+// getQueryMethodCompletions returns CRUD chain method completions for Model/QueryBuilder types.
+func getQueryMethodCompletions() []CompletionItem {
+	methods := []struct {
+		name   string
+		detail string
+	}{
+		{"where", "where(condition) — filter records / 按条件筛选记录"},
+		{"all", "all() — fetch all matching records / 获取所有匹配记录"},
+		{"first", "first() — fetch first matching record / 获取第一条匹配记录"},
+		{"find", "find(id) — find record by ID, throws NotFound if missing / 按 ID 查找，找不到自动抛出 NotFound"},
+		{"create", "create(fields) — create a record / 创建记录"},
+		{"createMany", "createMany(records) — create multiple records / 批量创建记录"},
+		{"update", "update(fields) — update a record / 更新记录"},
+		{"delete", "delete() — delete a record / 删除记录"},
+		{"deleteMany", "deleteMany(condition) — delete multiple records / 批量删除记录"},
+		{"orderBy", "orderBy(field.asc/desc) — sort results / 排序"},
+		{"limit", "limit(n) — limit number of results / 限制返回数量"},
+		{"offset", "offset(n) — skip N results / 跳过 N 条结果"},
+		{"groupBy", "groupBy { field } — group by field / 按字段分组"},
+		{"select", "select { fields } — project/transform results / 投影"},
+		{"sum", "sum { field } — sum field values / 求和"},
+		{"avg", "avg { field } — average field values / 求平均"},
+		{"count", "count() — count matching records / 计数"},
+		{"min", "min { field } — minimum value / 最小值"},
+		{"max", "max { field } — maximum value / 最大值"},
+		{"exists", "exists() — check if records exist / 检查记录是否存在"},
+		{"upsert", "upsert(fields) — create or update record / 创建或更新记录"},
+		{"paginate", "paginate(page:, size:) — paginated query / 分页查询"},
+		{"save", "save() — save dirty fields / 保存修改的字段"},
+	}
+	items := make([]CompletionItem, 0, len(methods))
+	for _, m := range methods {
+		items = append(items, CompletionItem{
+			Label:    m.name,
+			Kind:     2, // Method
+			Detail:   m.detail,
+			SortText: "c_" + m.name,
+		})
+	}
+	return items
+}
+
 func getStdlibModuleMethods(module string) []CompletionItem {
 	methods := map[string][]struct{ name, detail string }{
 		"time": {
@@ -441,12 +506,14 @@ func getStdlibModuleMethods(module string) []CompletionItem {
 			{"stringify", "stringify(value): String — convert to JSON string / 转为 JSON 字符串"},
 		},
 		"crypto": {
-			{"randomToken", "randomToken(length): String — generate random token / 生成随机令牌"},
+			{"randomToken", "randomToken(length): String — generate random hex token / 生成随机令牌"},
 			{"hash", "hash(value): String — hash value (bcrypt) / 哈希值"},
 			{"verify", "verify(plain, hashed): Boolean — verify hash / 验证哈希"},
 			{"encrypt", "encrypt(data, key): String — encrypt data / 加密数据"},
 			{"decrypt", "decrypt(data, key): String — decrypt data / 解密数据"},
-			{"uuid", "uuid(): String — generate UUID / 生成 UUID"},
+			{"uuid", "uuid(): String — generate UUID v4 / 生成 UUID"},
+			{"hmac", "hmac(data, secret): String — HMAC-SHA256 / HMAC-SHA256 签名"},
+			{"sha256", "sha256(data): String — SHA-256 digest / SHA-256 摘要"},
 		},
 		"math": {
 			{"abs", "abs(x): Number — absolute value / 绝对值"},
@@ -458,6 +525,15 @@ func getStdlibModuleMethods(module string) []CompletionItem {
 			{"random", "random(): Float — random 0.0~1.0 / 随机数"},
 			{"pow", "pow(base, exp): Float — power / 幂运算"},
 			{"sqrt", "sqrt(x): Float — square root / 平方根"},
+			{"clamp", "clamp(value, min, max): Number — clamp to range / 限制范围"},
+		},
+		"convert": {
+			{"toInt", "toInt(value): Int — convert to Int / 转为整数"},
+			{"toFloat", "toFloat(value): Float — convert to Float / 转为浮点数"},
+			{"toString", "toString(value): String — convert to String / 转为字符串"},
+			{"toBool", "toBool(value): Boolean — convert to Boolean / 转为布尔值"},
+			{"tryInt", "tryInt(value): Int? — safe convert to Int / 安全转为整数"},
+			{"tryFloat", "tryFloat(value): Float? — safe convert to Float / 安全转为浮点数"},
 		},
 		"request": {
 			{"ip", "ip: String — client IP address / 客户端 IP"},
@@ -466,6 +542,12 @@ func getStdlibModuleMethods(module string) []CompletionItem {
 			{"header", "header(name): String — get header value / 获取请求头"},
 			{"query", "query(name): String — get query param / 获取查询参数"},
 			{"body", "body: String — request body / 请求体"},
+			{"fields", "fields: FieldSet — client requested fields / 客户端请求的字段集"},
+		},
+		"my": {
+			{"id", "id: Int — user ID from JWT (zero-cost) / JWT 中的用户 ID（零开销）"},
+			{"load", "load(fields...): Identity — lazy load user fields / 懒加载用户字段"},
+			{"role", "role — user role from JWT / JWT 中的用户角色"},
 		},
 	}
 
@@ -632,6 +714,7 @@ func getKeywordCompletions(prefix string) []CompletionItem {
 		{"return", "return", "return $0"},
 		{"throw", "throw error", "throw error.$0"},
 		{"break", "exit loop", ""},
+		{"continue", "skip to next iteration", ""},
 		{"yield", "exit loop with value", "yield $0"},
 		{"async", "launch coroutine", "async {\n\t$0\n}"},
 		{"await", "concurrent wait", "await {\n\t$0\n}"},
@@ -643,7 +726,6 @@ func getKeywordCompletions(prefix string) []CompletionItem {
 		{"else", "else branch", ""},
 		{"in", "membership / range", ""},
 		{"is", "type check", ""},
-		{"stream", "WebSocket stream", "stream $0"},
 		{"event", "event declaration", "event ${1:Name}(${2:params}) "},
 		{"on", "event listener", "on ${1:EventName} {\n\t$0\n}"},
 		{"my", "current user", ""},
@@ -859,7 +941,33 @@ func getLocalHover(doc *Document, word string, pos Position) string {
 	if hover := getValVarHover(doc.File, word, pos); hover != "" {
 		return hover
 	}
+	// inside CRUD call, resolve field against the target model
+	if hover := getCRUDFieldHover(doc, word, pos); hover != "" {
+		return hover
+	}
 	return getFieldHover(doc.File, word)
+}
+
+// getCRUDFieldHover resolves a field name against the CRUD target model.
+// Inside find(RoomMember, where: ...), bare field names resolve to RoomMember's fields.
+func getCRUDFieldHover(doc *Document, word string, pos Position) string {
+	funcName, modelName := doc.FindEnclosingCall(pos)
+	if !isCRUDFunc(funcName) || modelName == "" {
+		return ""
+	}
+	if doc.File == nil {
+		return ""
+	}
+	for _, m := range doc.File.Models {
+		if m.Name == modelName {
+			for _, f := range m.Fields {
+				if f.Name == word {
+					return formatFieldHover(m.Name, f)
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func getParamHover(file *ast.File, word string, pos Position) string {
@@ -990,48 +1098,59 @@ func (s *Server) handleHover(req *Request) error {
 
 // resolveHover returns a hover string for the word at the given position, or "" if none.
 func (s *Server) resolveHover(doc *Document, word string, pos Position) string {
-	// directive hover
+	if hover := s.resolveContextualHover(doc, word, pos); hover != "" {
+		return hover
+	}
+	if hover := resolveSemanticHover(doc, word, pos); hover != "" {
+		return hover
+	}
+	return resolveBuiltinHover(doc, word, pos)
+}
+
+// resolveContextualHover checks position-dependent hovers (directives, scopes, built-in types).
+func (s *Server) resolveContextualHover(doc *Document, word string, pos Position) string {
 	if doc.PrevChar(pos) == '@' || doc.IsAfterAt(pos) {
 		if desc := directiveDescription(word); desc != "" {
 			return desc
 		}
 	}
-
-	// built-in type hover with Go + PG info
+	if doc.IsInsideScopeDirective(pos) && doc.File != nil {
+		if hover := scopeNameHover(doc, word); hover != "" {
+			return hover
+		}
+	}
 	if desc := builtinTypeDescription(word); desc != "" {
 		return desc
 	}
+	return ""
+}
 
-	// type hover
+// resolveSemanticHover checks type, symbol, and local variable hovers.
+func resolveSemanticHover(doc *Document, word string, pos Position) string {
 	if typ, ok := doc.Result.Types[word]; ok {
 		return formatTypeHover(word, typ)
 	}
-
-	// symbol hover
 	if sym := doc.Result.Scope.Lookup(word); sym != nil {
 		return formatSymbolHover(sym)
 	}
-
-	// local parameter/variable hover
 	if doc.File != nil {
 		if hover := getLocalHover(doc, word, pos); hover != "" {
 			return hover
 		}
 	}
+	return ""
+}
 
-	// collection method / string property hover
+// resolveBuiltinHover checks member methods, built-in functions, and keyword hovers.
+func resolveBuiltinHover(doc *Document, word string, pos Position) string {
 	if doc.PrevChar(pos) == '.' || doc.IsAfterDot(pos) {
 		if desc := memberMethodDescription(word); desc != "" {
 			return desc
 		}
 	}
-
-	// built-in function hover
 	if desc := builtinFunctionDescription(word); desc != "" {
 		return desc
 	}
-
-	// keyword hover
 	return keywordDescription(word)
 }
 
@@ -1142,13 +1261,13 @@ func keywordDescription(word string) string {
 		"return":    "`return` — Early return from function (last expression is implicit return)\n\n提前返回（最后一行表达式自动返回）",
 		"throw":     "`throw` — Throw an error\n\n抛出错误",
 		"break":     "`break` — Exit the current loop\n\n退出当前循环",
+		"continue":  "`continue` — Skip to the next iteration of the current loop\n\n跳过当前循环的剩余部分，进入下一次迭代",
 		"yield":     "`yield` — Exit loop and return a value (for as expression)\n\n退出循环并返回值（for 作为表达式）",
 		"async":     "`async` — Launch a coroutine (fire and forget)\n\n启动协程（不等待结果）",
 		"await":     "`await` — Run multiple operations concurrently and wait for all\n\n并发执行多个操作并等待全部完成",
 		"extend":    "`extend` — Extend a type across modules (gateway aggregation)\n\n跨模块扩展类型（网关聚合）",
 		"use":       "`use` — Import a stdlib module (`use http`) or shared module (`use common.{ Base }`)\n\n导入标准库模块或共享模块",
 		"override":  "`override` — Override an auto-generated API implementation\n\n覆盖自动生成的 API 实现",
-		"stream":    "`stream` — Server push via WebSocket\n\n通过 WebSocket 流式推送",
 		"is":        "`is` — Type check in `when` branches\n\n`when` 分支中的类型匹配",
 		"event":     "`event` — Define a typed event\n\n定义类型化事件",
 		"on":        "`on` — Subscribe to an event\n\n订阅事件",
@@ -1234,11 +1353,32 @@ func memberMethodDescription(word string) string {
 		"header":      "`request.header(name)` — Get header value\n\n获取请求头",
 		"query":       "`request.query(name)` — Get query parameter\n\n获取查询参数",
 		"body":        "`request.body` — Request body\n\n请求体",
+		// @withAuth injected methods
+		"createToken":  "`.createToken(expires?: Duration): String` — Generate JWT token\n\n生成 JWT 令牌",
+		"verify":       "`.verify(plain: String): Boolean` — Verify password against @hash field\n\n校验 @hash 字段的密码",
+		"refreshToken": "`.refreshToken(token: String): String` — Refresh JWT token\n\n刷新 JWT 令牌",
+		// Identity methods
+		"load": "`.load(fields...): Identity` — Lazy load user fields from database\n\n从数据库懒加载用户字段",
+		// CRUD chain methods
+		"where":   "`where(condition)` — Filter records by condition / 按条件筛选记录\n\n`Model.where(field == value).all()`",
+		"orderBy": "`orderBy(field.asc/desc)` — Sort results / 排序\n\n`Model.where(...).orderBy(field.desc)`",
+		"limit":   "`limit(n)` — Limit number of results / 限制返回数量",
+		"offset":  "`offset(n)` — Skip N results / 跳过 N 条结果",
+		"sum":     "`sum { field }` — Sum field values (DB aggregate) / 求和\n\n`orders.sum { it.total }`",
+		"avg":     "`avg { field }` — Average field values (DB aggregate) / 求平均\n\n`orders.avg { it.total }`",
+		"min":     "`min { field }` — Minimum value (DB aggregate) / 最小值\n\n`orders.min { it.price }`",
+		"max":     "`max { field }` — Maximum value (DB aggregate) / 最大值\n\n`orders.max { it.price }`",
+		"select":  "`select { fields }` — Project/transform query results / 投影\n\n`Model.groupBy { it.status }.select { ... }`",
+		// request.fields methods
+		"fields": "`request.fields` — Client-requested field set / 客户端请求的字段集合\n\n`request.fields.has(\"posts\")`",
+		"has":    "`has(name)` — Check if field was requested (O(1) hash lookup) / 检查字段是否被请求",
 		// debug chain methods
 		"d": "`.d` — Debug log, returns self for chaining\n\n调试日志，返回自身用于链式调用",
 		"i": "`.i` — Info log, returns self for chaining\n\n信息日志，返回自身用于链式调用",
 		"w": "`.w` — Warn log, returns self for chaining\n\n警告日志，返回自身用于链式调用",
 		"e": "`.e` — Error log, returns self for chaining\n\n错误日志，返回自身用于链式调用",
+		// dirty tracking save
+		"save": "Save dirty fields to database / 保存修改的字段到数据库\n\n`post.status = ...; post.save()`",
 	}
 	if desc, ok := descriptions[word]; ok {
 		return desc
@@ -1248,10 +1388,10 @@ func memberMethodDescription(word string) string {
 
 func builtinFunctionDescription(word string) string {
 	descriptions := map[string]string{
-		"find":        "`find(Model, ...)` — Query database records\n\n查询数据库记录",
-		"create":      "`create(Model, ...)` — Create a database record\n\n创建数据库记录",
-		"update":      "`update(record, ...)` — Update a database record\n\n更新数据库记录",
-		"delete":      "`delete(record)` — Delete a database record\n\n删除数据库记录",
+		"find":        "`Model.find(id)` — Find record by primary key, throws NotFound if not found. Use first() for nullable.\n\n按主键查找，找不到自动抛出 NotFound。如需 nullable 返回请用 first()",
+		"create":      "`Model.create(...)` — Create a database record\n\n创建数据库记录",
+		"update":      "`record.update(...)` — Update a database record\n\n更新数据库记录",
+		"delete":      "`record.delete()` — Delete a database record\n\n删除数据库记录",
 		"transaction": "`transaction { ... }` — Database transaction, all-or-nothing\n\n数据库事务，全成功或全回滚",
 		"emit":        "`emit EventName(args)` — Send typed event (async). Inside transaction: delayed until commit, discarded on rollback\n\n发送类型化事件（异步）。事务内：延迟到提交后发送，回滚时丢弃",
 		"cache":       "`cache(...)` — Cache operation\n\n缓存操作",
@@ -1262,9 +1402,14 @@ func builtinFunctionDescription(word string) string {
 		"http":        "`http.get(url)` / `http.post(url, body)` — HTTP client\n\nHTTP 客户端",
 		"json":        "`json.parse(str)` / `json.stringify(obj)` — JSON serialization\n\nJSON 序列化",
 		"time":        "`time.now()` / `time.today()` — Date and time\n\n日期时间",
-		"math":        "`math.abs()` / `math.max()` — Math functions\n\n数学函数",
-		"crypto":      "`crypto.sha256()` / `crypto.randomToken()` — Cryptographic functions\n\n加密函数",
-		"request":     "`request.ip` / `request.header(name)` — Current HTTP request context\n\n当前 HTTP 请求上下文",
+		"math":        "`math.abs()` / `math.max()` / `math.clamp()` — Math functions\n\n数学函数",
+		"crypto":      "`crypto.sha256()` / `crypto.randomToken()` / `crypto.uuid()` — Cryptographic functions\n\n加密函数",
+		"convert":     "`convert.toInt()` / `convert.toFloat()` / `convert.tryInt()` — Type conversion\n\n类型转换",
+		"request":     "`request.ip` / `request.header(name)` / `request.fields` — Current HTTP request context\n\n当前 HTTP 请求上下文",
+		"aggregate":   "`aggregate(Model, sum:, avg:, ...)` — Aggregate query\n\n聚合查询",
+		"groupBy":     "`groupBy(Model, by:, sum:, ...)` — Group by aggregation\n\n分组聚合",
+		"raw":         "`raw<T>(sql, params:)` — SQL escape hatch (⚠ bypasses type safety)\n\nSQL 逃生舱（⚠ 绕过类型安全）",
+		"paginate":    "`paginate(Model, page:, ...)` — Offset or cursor pagination\n\n分页查询（offset 或 cursor）",
 	}
 	return descriptions[word]
 }
@@ -1305,13 +1450,17 @@ func directiveDescription(name string) string {
 		"transform":  "`@transform { expr }` — Transform value on return\n\n返回时转换",
 		"beforeSave": "`@beforeSave { expr }` — Transform before saving\n\n保存前转换",
 		// api annotations
-		"auth":      "`@auth` / `@auth(AuthType)` — Require authentication\n\n需要认证",
+		"auth":      "`@auth` / `@auth(User, Admin)` / `@auth(Admin, permission: { it.role == ... })` — Require authentication with optional identity and permission\n\n认证鉴权，可指定认证主体和权限",
+		"withAuth":  "`@withAuth(jwt: { secret: env(\"...\"), expires: 7d }, stores: [id])` — Mark model as auth subject, auto-generates .createToken()/.verify()\n\n标记模型为认证主体，自动生成认证方法",
 		"native":    "`@native` — Implementation in Go\n\n使用 Go 实现",
 		"cache":     "`@cache(ttl: duration)` — Cache response\n\n缓存响应",
 		"rateLimit": "`@rateLimit(max, window)` — Rate limiting\n\n限流",
 		"global":    "`@global` — Global middleware\n\n全局中间件",
 		"retry":     "`@retry(max, delay)` — Retry on failure\n\n失败重试",
 		"broadcast": "`@broadcast` — All instances receive event\n\n所有实例都接收事件",
+		"scope":     "`@scope(scopeNames...)` — Apply query scope(s) to API\n\n应用查询预设",
+		"stream":    "`@stream` — Enable streaming response via WebSocket\n\n启用 WebSocket 流式推送",
+		"paginate":  "`@paginate` / `@paginate(defaultPageSize: 50)` — Auto-inject page/pageSize params, wrap return type [T] → Page<T>\n\n自动注入分页参数，返回类型从 [T] 包装为 Page<T>",
 	}
 	if desc, ok := descriptions[name]; ok {
 		return desc
@@ -1401,15 +1550,28 @@ func (s *Server) handleDefinition(req *Request) error {
 }
 
 func (s *Server) resolveDefinition(doc *Document, word string, pos Position) *token.Position {
-	// type definition
+	if p := resolveGlobalDefinition(doc, word); p != nil {
+		return p
+	}
+	if doc.File == nil {
+		return nil
+	}
+	return resolveLocalDefinition(doc, word, pos)
+}
+
+// resolveGlobalDefinition checks types, symbols, and enum values from semantic results.
+func resolveGlobalDefinition(doc *Document, word string) *token.Position {
 	if typ, ok := doc.Result.Types[word]; ok && typ.Pos.File != "" {
 		return &typ.Pos
 	}
-	// symbol definition (api, fn, error, middleware, etc.)
 	if sym := doc.Result.Scope.Lookup(word); sym != nil && sym.Pos.File != "" {
 		return &sym.Pos
 	}
-	// enum value definition: e.g. USER in Role.USER or in when branch
+	return findEnumValueDefinition(doc, word)
+}
+
+// findEnumValueDefinition searches all enum types for a matching value.
+func findEnumValueDefinition(doc *Document, word string) *token.Position {
 	for _, typ := range doc.Result.Types {
 		if typ.Kind == semantic.TypeEnum {
 			for _, v := range typ.EnumValues {
@@ -1419,23 +1581,203 @@ func (s *Server) resolveDefinition(doc *Document, word string, pos Position) *to
 			}
 		}
 	}
-	if doc.File == nil {
-		return nil
-	}
-	// named arg label in CRUD call → jump to model field
-	if doc.IsNamedArgLabel(pos) {
-		if p := findCRUDFieldDefinition(doc, word, pos); p != nil {
+	return nil
+}
+
+// resolveLocalDefinition checks position-dependent definitions (scope, my.load, member, local, CRUD).
+func resolveLocalDefinition(doc *Document, word string, pos Position) *token.Position {
+	if doc.IsInsideScopeDirective(pos) {
+		if p := findScopeDefinition(doc, word); p != nil {
 			return p
 		}
 	}
-	// member field definition: input.name → jump to type's field
+	if doc.IsInsideMyLoadCall(pos) {
+		if p := findMyLoadFieldDefinition(doc, word); p != nil {
+			return p
+		}
+	}
+	if doc.IsNamedArgLabel(pos) {
+		return resolveNamedArgDefinition(doc, word, pos)
+	}
 	if doc.IsAfterDot(pos) {
 		if p := findMemberFieldDefinition(doc, word, pos); p != nil {
 			return p
 		}
 	}
-	// local variable / parameter definition
-	return findLocalDefinition(doc.File, word, pos)
+	if p := findLocalDefinition(doc.File, word, pos); p != nil {
+		return p
+	}
+	return findCRUDBareFieldDefinition(doc, word, pos)
+}
+
+// findMyLoadFieldDefinition resolves an argument inside my.load(name, role) to the
+// corresponding field definition in the @withAuth model.
+func findMyLoadFieldDefinition(doc *Document, fieldName string) *token.Position {
+	modelName := findWithAuthModelName(doc)
+	if modelName == "" {
+		return nil
+	}
+	// try AST-level lookup first (current file)
+	if doc.File != nil {
+		if p := findFieldInType(doc.File, modelName, fieldName); p != nil {
+			return p
+		}
+	}
+	// fall back to semantic result for cross-file resolution
+	if doc.Result != nil {
+		if typ, ok := doc.Result.Types[modelName]; ok {
+			if fi, ok := typ.Fields[fieldName]; ok && fi.Pos.File != "" {
+				return &fi.Pos
+			}
+		}
+	}
+	return nil
+}
+
+// findScopeDefinition searches all models in the AST for a scope with the given name.
+func findScopeDefinition(doc *Document, scopeName string) *token.Position {
+	if doc.File == nil {
+		return nil
+	}
+	for _, m := range doc.File.Models {
+		for _, sc := range m.Scopes {
+			if sc.Name == scopeName {
+				return &sc.Pos
+			}
+		}
+	}
+	return nil
+}
+
+// scopeNameHover returns a hover string for a scope name inside @scope(...).
+func scopeNameHover(doc *Document, scopeName string) string {
+	if doc.File == nil {
+		return ""
+	}
+	for _, m := range doc.File.Models {
+		for _, sc := range m.Scopes {
+			if sc.Name == scopeName {
+				var b strings.Builder
+				b.WriteString("```luxo\n")
+				fmt.Fprintf(&b, "scope %s", sc.Name)
+				if len(sc.Params) > 0 {
+					b.WriteByte('(')
+					for i, p := range sc.Params {
+						if i > 0 {
+							b.WriteString(", ")
+						}
+						fmt.Fprintf(&b, "%s: %s", p.Name, p.Type.Name)
+					}
+					b.WriteByte(')')
+				}
+				b.WriteString("\n```\n")
+				fmt.Fprintf(&b, "Defined in model `%s`\n\n", m.Name)
+				fmt.Fprintf(&b, "定义在模型 `%s` 中", m.Name)
+				return b.String()
+			}
+		}
+	}
+	return ""
+}
+
+// getScopeCompletions returns scope names from the API's return type model as completion items.
+func (s *Server) getScopeCompletions(doc *Document, pos Position) []CompletionItem {
+	modelName := findEnclosingApiReturnModelName(doc, pos)
+	if modelName == "" {
+		return nil
+	}
+	// find scopes defined on the target model
+	for _, m := range doc.File.Models {
+		if m.Name == modelName {
+			items := make([]CompletionItem, 0, len(m.Scopes))
+			for _, sc := range m.Scopes {
+				detail := "scope " + sc.Name
+				if len(sc.Params) > 0 {
+					detail += "("
+					for i, p := range sc.Params {
+						if i > 0 {
+							detail += ", "
+						}
+						detail += p.Name + ": " + typeRefToString(p.Type)
+					}
+					detail += ")"
+				}
+				items = append(items, CompletionItem{
+					Label:    sc.Name,
+					Kind:     20, // EnumMember — scope name acts like an enum value
+					Detail:   detail,
+					SortText: "a_" + sc.Name,
+				})
+			}
+			return items
+		}
+	}
+	return nil
+}
+
+// findEnclosingApiReturnModelName finds the API declaration on the same line as pos,
+// and returns its return type's base model name (stripping [] for lists).
+func findEnclosingApiReturnModelName(doc *Document, pos Position) string {
+	if doc.File == nil {
+		return ""
+	}
+	for _, api := range doc.File.APIs {
+		// API declarations are typically on a single line or the directive is on the same line
+		// Match when pos.Line equals the API's declaration line (0-based vs 1-based)
+		if api.Pos.Line-1 == pos.Line {
+			if api.ReturnType == nil {
+				return ""
+			}
+			return api.ReturnType.Name
+		}
+	}
+	return ""
+}
+
+// findWithAuthModelName finds the model name that has the @withAuth directive
+// by searching the current file's AST model declarations.
+func findWithAuthModelName(doc *Document) string {
+	if doc.File == nil {
+		return ""
+	}
+	for _, m := range doc.File.Models {
+		for _, d := range m.Directives {
+			if d.Name == "withAuth" {
+				return m.Name
+			}
+		}
+	}
+	return ""
+}
+
+// findCRUDBareFieldDefinition resolves a bare field name (without "it." prefix) inside a CRUD call
+// to the target model's field definition.
+// e.g., find(RoomMember, where: userId == my.id) — "userId" jumps to RoomMember.userId.
+func findCRUDBareFieldDefinition(doc *Document, fieldName string, pos Position) *token.Position {
+	funcName, modelName := doc.FindEnclosingCall(pos)
+	if !isCRUDFunc(funcName) || modelName == "" {
+		return nil
+	}
+	if doc.File == nil {
+		return nil
+	}
+	return findFieldInType(doc.File, modelName, fieldName)
+}
+
+// resolveNamedArgDefinition resolves a named arg key to a field definition.
+func resolveNamedArgDefinition(doc *Document, word string, pos Position) *token.Position {
+	if p := findCRUDFieldDefinition(doc, word, pos); p != nil {
+		return p
+	}
+	// named arg keys in CRUD calls are query parameters, not variable references
+	funcName, _ := doc.FindEnclosingCall(pos)
+	if isCRUDFunc(funcName) {
+		return nil
+	}
+	if p := findObjectFieldDefinition(doc, word, pos); p != nil {
+		return p
+	}
+	return nil
 }
 
 // findMemberFieldDefinition resolves member access to a type's field definition.
@@ -1447,15 +1789,141 @@ func findMemberFieldDefinition(doc *Document, fieldName string, pos Position) *t
 	if objName == "" {
 		return nil
 	}
-	// "it" is lambda implicit param — search all models/types for the field
+	// "it" is lambda implicit param — resolve against CRUD model if in CRUD context
 	if objName == "it" {
+		funcName, modelName := doc.FindEnclosingCall(pos)
+		if isCRUDFunc(funcName) && modelName != "" {
+			if p := findFieldInType(doc.File, modelName, fieldName); p != nil {
+				return p
+			}
+		}
 		return findFieldInAnyType(doc.File, fieldName)
 	}
 	typeName := findParamTypeName(doc.File, objName)
 	if typeName == "" {
+		typeName = findValTypeName(doc.File, objName, pos)
+	}
+	if typeName == "" {
 		return nil
 	}
 	return findFieldInType(doc.File, typeName, fieldName)
+}
+
+// findValTypeName searches for a val statement matching varName in the enclosing
+// api/fn body, and infers the type name from the assigned expression.
+func findValTypeName(file *ast.File, varName string, cursor Position) string {
+	// search api bodies
+	for _, api := range file.APIs {
+		if !posInsideDecl(cursor, api.Pos, api.Body) {
+			continue
+		}
+		if api.Body != nil {
+			if tn := findValTypeInBlock(api.Body, varName, cursor); tn != "" {
+				return tn
+			}
+		}
+	}
+	// search fn bodies
+	for _, fn := range file.Functions {
+		if !posInsideDecl(cursor, fn.Pos, fn.Body) {
+			continue
+		}
+		if fn.Body != nil {
+			if tn := findValTypeInBlock(fn.Body, varName, cursor); tn != "" {
+				return tn
+			}
+		}
+	}
+	return ""
+}
+
+// findValTypeInBlock finds a val statement for varName before cursor and infers its type.
+func findValTypeInBlock(block *ast.Block, varName string, cursor Position) string {
+	for _, stmt := range block.Stmts {
+		if stmt.GetPos().Line-1 > cursor.Line {
+			break
+		}
+		vs, ok := stmt.(*ast.ValStmt)
+		if !ok || vs.Name != varName {
+			continue
+		}
+		// explicit type annotation
+		if vs.Type != nil {
+			return vs.Type.Name
+		}
+		// infer from assigned expression
+		return inferExprTypeName(vs.Value)
+	}
+	return ""
+}
+
+// inferExprTypeName extracts the model/type name from an expression.
+// Handles: create(Order, ...), find(Order, ...), transaction { ... create(Order, ...) }, etc.
+func inferExprTypeName(expr ast.Expr) string {
+	if expr == nil {
+		return ""
+	}
+	switch e := expr.(type) {
+	case *ast.CallExpr:
+		return inferCallTypeName(e)
+	case *ast.TransactionExpr:
+		return inferBlockTypeName(e.Body)
+	}
+	return ""
+}
+
+// inferCallTypeName extracts the model name from a CRUD call.
+// Supports both function-style create(Order, ...) and chain-style Order.create(...).
+func inferCallTypeName(call *ast.CallExpr) string {
+	// function-style: create(Order, ...), find(Order, ...)
+	if fn, ok := call.Func.(*ast.Ident); ok {
+		if isCRUDFunc(fn.Name) {
+			if len(call.Args) == 0 {
+				return ""
+			}
+			if ident, ok := call.Args[0].Value.(*ast.Ident); ok {
+				return ident.Name
+			}
+			return ""
+		}
+		// block-calls like transaction { ... } parsed as CallExpr with trailing LambdaExpr
+		if len(call.Args) > 0 {
+			lastArg := call.Args[len(call.Args)-1]
+			if lambda, ok := lastArg.Value.(*ast.LambdaExpr); ok {
+				return inferBlockTypeName(lambda.Body)
+			}
+		}
+		return ""
+	}
+
+	// chain-style: Order.create(...), User.find(...)
+	if member, ok := call.Func.(*ast.MemberExpr); ok && isCRUDFunc(member.Field) {
+		if ident, ok := member.Object.(*ast.Ident); ok {
+			return ident.Name
+		}
+	}
+
+	return ""
+}
+
+// inferBlockTypeName infers the type from the last expression in a block.
+func inferBlockTypeName(block *ast.Block) string {
+	if block == nil || len(block.Stmts) == 0 {
+		return ""
+	}
+	last := block.Stmts[len(block.Stmts)-1]
+	// ExprStmt wrapping an expression
+	if es, ok := last.(*ast.ExprStmt); ok {
+		return inferExprTypeName(es.Expr)
+	}
+	// ValStmt as last statement — infer from its value
+	if vs, ok := last.(*ast.ValStmt); ok {
+		if vs.Type != nil {
+			return vs.Type.Name
+		}
+		return inferExprTypeName(vs.Value)
+	}
+	return ""
 }
 
 // findFieldInAnyType searches all models and types for a field by name.
@@ -1497,6 +1965,43 @@ func findFieldInType(file *ast.File, typeName, fieldName string) *token.Position
 			}
 		}
 	}
+	return findFieldInSealed(file.Sealeds, typeName, fieldName)
+}
+
+// findFieldInSealed looks up a field by name in sealed types and their variants.
+func findFieldInSealed(sealeds []*ast.SealedDecl, typeName, fieldName string) *token.Position {
+	for _, s := range sealeds {
+		if s.Name == typeName {
+			if p := findFieldInVariants(s.Variants, fieldName); p != nil {
+				return p
+			}
+		}
+		for _, v := range s.Variants {
+			if v.Name == typeName {
+				return findParamByName(v.Fields, fieldName)
+			}
+		}
+	}
+	return nil
+}
+
+// findFieldInVariants searches all variants of a sealed type for a field.
+func findFieldInVariants(variants []*ast.SealedVariant, fieldName string) *token.Position {
+	for _, v := range variants {
+		if p := findParamByName(v.Fields, fieldName); p != nil {
+			return p
+		}
+	}
+	return nil
+}
+
+// findParamByName finds a parameter by name in a slice of ParamDecl.
+func findParamByName(params []*ast.ParamDecl, name string) *token.Position {
+	for _, f := range params {
+		if f.Name == name {
+			return &f.Pos
+		}
+	}
 	return nil
 }
 
@@ -1521,6 +2026,22 @@ func findCRUDFieldDefinition(doc *Document, fieldName string, pos Position) *tok
 					return &f.Pos
 				}
 			}
+		}
+	}
+	return nil
+}
+
+// findObjectFieldDefinition resolves a named arg label in an object construction
+// to a type's field definition.
+// e.g., AuthResult { user: currentUser } — clicking on "user:" jumps to AuthResult.user field.
+func findObjectFieldDefinition(doc *Document, fieldName string, pos Position) *token.Position {
+	typeName := doc.FindEnclosingObjectType(pos)
+	if typeName == "" {
+		return nil
+	}
+	if doc.File != nil {
+		if p := findFieldInType(doc.File, typeName, fieldName); p != nil {
+			return p
 		}
 	}
 	return nil
@@ -1671,4 +2192,108 @@ func findValInBlock(block *ast.Block, word string, cursor Position) *token.Posit
 		}
 	}
 	return nil
+}
+
+// ========== Formatting ==========
+
+func (s *Server) handleFormatting(req *Request) error {
+	var params FormattingParams
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return s.transport.SendError(req.ID, -32602, "invalid params")
+	}
+
+	doc := s.docs.Get(params.TextDocument.URI)
+	if doc == nil {
+		return s.transport.SendResponse(req.ID, nil)
+	}
+
+	source := doc.Content
+	formatted, err := formatter.Format(source, params.TextDocument.URI)
+	if err != nil {
+		return s.transport.SendResponse(req.ID, nil)
+	}
+
+	if formatted == source {
+		return s.transport.SendResponse(req.ID, nil)
+	}
+
+	// Replace entire document
+	lines := strings.Count(source, "\n")
+	lastLineLen := len(source)
+	if idx := strings.LastIndexByte(source, '\n'); idx >= 0 {
+		lastLineLen = len(source) - idx - 1
+	}
+
+	edits := []TextEdit{{
+		Range: Range{
+			Start: Position{Line: 0, Character: 0},
+			End:   Position{Line: lines, Character: lastLineLen},
+		},
+		NewText: formatted,
+	}}
+	return s.transport.SendResponse(req.ID, edits)
+}
+
+// ========== Inlay Hints ==========
+
+func (s *Server) handleInlayHint(req *Request) error {
+	var params InlayHintParams
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return s.transport.SendError(req.ID, -32602, "invalid params")
+	}
+
+	doc := s.docs.Get(params.TextDocument.URI)
+	if doc == nil || doc.File == nil {
+		return s.transport.SendResponse(req.ID, []InlayHint{})
+	}
+
+	hints := collectImplicitReturnHints(doc.File)
+	return s.transport.SendResponse(req.ID, hints)
+}
+
+// collectImplicitReturnHints finds the last expression in api/fn bodies
+// that serves as an implicit return value.
+func collectImplicitReturnHints(file *ast.File) []InlayHint {
+	var hints []InlayHint
+
+	for _, api := range file.APIs {
+		if api.Body != nil && api.ReturnType != nil {
+			if h := findImplicitReturn(api.Body); h != nil {
+				hints = append(hints, *h)
+			}
+		}
+	}
+
+	for _, fn := range file.Functions {
+		if fn.Body != nil && fn.ReturnType != nil {
+			if h := findImplicitReturn(fn.Body); h != nil {
+				hints = append(hints, *h)
+			}
+		}
+	}
+
+	return hints
+}
+
+// findImplicitReturn checks if the last statement in a block is an
+// expression statement (implicit return) and returns an InlayHint for it.
+func findImplicitReturn(block *ast.Block) *InlayHint {
+	if block == nil || len(block.Stmts) == 0 {
+		return nil
+	}
+
+	last := block.Stmts[len(block.Stmts)-1]
+	exprStmt, ok := last.(*ast.ExprStmt)
+	if !ok {
+		return nil
+	}
+
+	pos := exprStmt.Pos
+	return &InlayHint{
+		Position:     Position{Line: pos.Line - 1, Character: pos.Col - 1},
+		Label:        "return ",
+		Kind:         1, // Type hint
+		Tooltip:      "implicit return / 隐式返回",
+		PaddingRight: true,
+	}
 }

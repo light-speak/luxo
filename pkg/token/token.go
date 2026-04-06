@@ -11,11 +11,14 @@ const (
 	DocComment // /// ...
 
 	// Literals
-	Ident    // identifier
-	Int      // 42
-	Float    // 3.14
-	String   // "hello"
-	Duration // 7d, 5m, 1h, 30s, 500ms
+	Ident       // identifier
+	Int         // 42
+	Float       // 3.14
+	String      // "hello"
+	StringStart // "hello ${  (template string opening part)
+	StringMid   // } middle ${ (template string middle part)
+	StringEnd   // } end"     (template string closing part)
+	Duration    // 7d, 5m, 1h, 30s, 500ms
 
 	// Symbols
 	Colon    // :
@@ -76,21 +79,21 @@ const (
 	Extend   // extend
 	Override // override
 	Use      // use
-	Stream   // stream
 
 	// Keywords - Logic
-	Val    // val
-	Var    // var
-	When   // when
-	If     // if
-	Else   // else
-	For    // for
-	In     // in
-	Return // return
-	Break  // break
-	Is     // is
-	On     // on
-	My     // my
+	Val      // val
+	Var      // var
+	When     // when
+	If       // if
+	Else     // else
+	For      // for
+	In       // in
+	Return   // return
+	Break    // break
+	Continue // continue
+	Is       // is
+	On       // on
+	My       // my
 
 	// Keywords - Concurrency
 	Async // async
@@ -114,11 +117,14 @@ var tokenNames = map[Type]string{
 	Comment:    "COMMENT",
 	DocComment: "DOC_COMMENT",
 
-	Ident:    "IDENT",
-	Int:      "INT",
-	Float:    "FLOAT",
-	String:   "STRING",
-	Duration: "DURATION",
+	Ident:       "IDENT",
+	Int:         "INT",
+	Float:       "FLOAT",
+	String:      "STRING",
+	StringStart: "STRING_START",
+	StringMid:   "STRING_MID",
+	StringEnd:   "STRING_END",
+	Duration:    "DURATION",
 
 	Colon:    ":",
 	LBrace:   "{",
@@ -172,7 +178,6 @@ var tokenNames = map[Type]string{
 	Extend:     "extend",
 	Override:   "override",
 	Use:        "use",
-	Stream:     "stream",
 	Val:        "val",
 	Var:        "var",
 	When:       "when",
@@ -182,6 +187,7 @@ var tokenNames = map[Type]string{
 	In:         "in",
 	Return:     "return",
 	Break:      "break",
+	Continue:   "continue",
 	Is:         "is",
 	On:         "on",
 	My:         "my",
@@ -216,7 +222,6 @@ var keywords = map[string]Type{
 	"extend":     Extend,
 	"override":   Override,
 	"use":        Use,
-	"stream":     Stream,
 	"val":        Val,
 	"var":        Var,
 	"when":       When,
@@ -226,6 +231,7 @@ var keywords = map[string]Type{
 	"in":         In,
 	"return":     Return,
 	"break":      Break,
+	"continue":   Continue,
 	"is":         Is,
 	"on":         On,
 	"my":         My,

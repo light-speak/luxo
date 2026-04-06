@@ -52,6 +52,12 @@ func (t *Transport) ReadMessage() (*Request, error) {
 		return nil, fmt.Errorf("missing Content-Length header")
 	}
 
+	// guard against excessive memory allocation from malformed Content-Length
+	const maxContentLength = 50 * 1024 * 1024 // 50 MB
+	if contentLength > maxContentLength {
+		return nil, fmt.Errorf("Content-Length %d exceeds maximum %d", contentLength, maxContentLength)
+	}
+
 	// read body
 	body := make([]byte, contentLength)
 	_, err := io.ReadFull(t.reader, body)

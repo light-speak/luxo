@@ -558,7 +558,7 @@ func TestHoverSealed(t *testing.T) {
 
 func TestHoverSymbol(t *testing.T) {
 	server, output := newTestServer()
-	openDoc(server, output, "file:///test.luxo", "model User { name: String }\napi getUser(id: Int): User {\n  find(User, where: id == id)\n}")
+	openDoc(server, output, "file:///test.luxo", "model User { name: String }\napi getUser(id: Int): User {\n  User.find(where: id == id)\n}")
 	// hover over "getUser" — symbol hover
 	resp := requestHover(server, output, "file:///test.luxo", Position{Line: 1, Character: 5})
 	if !strings.Contains(resp, "getUser") {
@@ -569,7 +569,7 @@ func TestHoverSymbol(t *testing.T) {
 func TestHoverSymbolWithDoc(t *testing.T) {
 	server, output := newTestServer()
 	// doc comment syntax: // comment before api
-	openDoc(server, output, "file:///test.luxo", "model User { name: String }\n// Get a user by ID\napi getUser(id: Int): User {\n  find(User, where: id == id)\n}")
+	openDoc(server, output, "file:///test.luxo", "model User { name: String }\n// Get a user by ID\napi getUser(id: Int): User {\n  User.find(where: id == id)\n}")
 	resp := requestHover(server, output, "file:///test.luxo", Position{Line: 2, Character: 5})
 	if !strings.Contains(resp, "getUser") {
 		t.Error("expected 'getUser' in hover with doc")
@@ -611,20 +611,20 @@ func TestHoverModelWithParent(t *testing.T) {
 func TestHoverBuiltinFunction(t *testing.T) {
 	server, output := newTestServer()
 	// "find" appears as a word in the source text; it is a builtin function
-	openDoc(server, output, "file:///test.luxo", "model User { name: String }\napi test(): User {\n  find(User, id: 1)\n}")
-	// hover over "find" on line 2, character 2
-	resp := requestHover(server, output, "file:///test.luxo", Position{Line: 2, Character: 3})
+	openDoc(server, output, "file:///test.luxo", "model User { name: String }\napi test(): User {\n  User.find(id: 1)\n}")
+	// hover over "find" on line 2, character 7 (after "  User.")
+	resp := requestHover(server, output, "file:///test.luxo", Position{Line: 2, Character: 7})
 	if !strings.Contains(resp, "find") {
 		t.Error("expected 'find' in builtin function hover response")
 	}
-	if !strings.Contains(resp, "Query database") || !strings.Contains(resp, "查询数据库") {
+	if !strings.Contains(resp, "Find record by primary key") || !strings.Contains(resp, "按主键查找") {
 		t.Error("expected bilingual description in builtin function hover")
 	}
 }
 
 func TestHoverBuiltinFunctionEmit(t *testing.T) {
 	server, output := newTestServer()
-	openDoc(server, output, "file:///test.luxo", "model User { name: String }\napi test(): User {\n  emit(test, id: 1)\n  find(User, id: 1)\n}")
+	openDoc(server, output, "file:///test.luxo", "model User { name: String }\napi test(): User {\n  emit(test, id: 1)\n  User.find(id: 1)\n}")
 	// hover over "emit" on line 2
 	resp := requestHover(server, output, "file:///test.luxo", Position{Line: 2, Character: 3})
 	if !strings.Contains(resp, "emit") {
@@ -637,7 +637,7 @@ func TestHoverBuiltinFunctionEmit(t *testing.T) {
 
 func TestDefinitionSymbol(t *testing.T) {
 	server, output := newTestServer()
-	openDoc(server, output, "file:///test.luxo", "model User { name: String }\napi getUser(id: Int): User {\n  find(User, where: id == id)\n}")
+	openDoc(server, output, "file:///test.luxo", "model User { name: String }\napi getUser(id: Int): User {\n  User.find(where: id == id)\n}")
 	// jump to definition of "User" from return type on line 1
 	resp := requestDefinition(server, output, "file:///test.luxo", Position{Line: 1, Character: 23})
 	if !strings.Contains(resp, "test.luxo") {
@@ -667,7 +667,7 @@ func TestDefinitionUnknownWord(t *testing.T) {
 func TestDefinitionBySymbol(t *testing.T) {
 	server, output := newTestServer()
 	// Open doc where 'getUser' is an api symbol. We want to jump to its definition.
-	openDoc(server, output, "file:///test.luxo", "model User { name: String }\napi getUser(id: Int): User {\n  find(User, where: id == id)\n}")
+	openDoc(server, output, "file:///test.luxo", "model User { name: String }\napi getUser(id: Int): User {\n  User.find(where: id == id)\n}")
 	// Definition of "getUser" — this is a symbol, not a type
 	resp := requestDefinition(server, output, "file:///test.luxo", Position{Line: 1, Character: 5})
 	if !strings.Contains(resp, "test.luxo") {
@@ -1378,7 +1378,7 @@ func TestGetAPILocalCompletions(t *testing.T) {
 	server, output := newTestServer()
 	uri := "file:///test_api_local.luxo"
 	openDoc(server, output, uri, `api getUser(id: Int, name: String): String {
-  val user = find(User, id: id)
+  val user = User.find(id: id)
   user
 }`)
 
@@ -1563,7 +1563,7 @@ func TestDefinitionValStmt(t *testing.T) {
 	server, output := newTestServer()
 	uri := "file:///test_def_val.luxo"
 	openDoc(server, output, uri, `api likePost(id: Int): Int {
-  val post = find(Post, id: id)
+  val post = Post.find(id: id)
   post
 }`)
 
@@ -2254,10 +2254,10 @@ func TestCRUDCompletionsInFind(t *testing.T) {
   total: Float
 }
 api test(): Int {
-  val order = find(Order, )
+  val order = Order.find( )
   0
 }`)
-	// trigger completion inside find(Order, ...)
+	// trigger completion inside Order.find(...)
 	result := requestCompletion(server, output, uri, Position{Line: 6, Character: 25})
 	// should include CRUD params
 	if !strings.Contains(result, "where") {
@@ -2294,11 +2294,11 @@ func TestNamedArgLabelDefinitionToModelField(t *testing.T) {
   userId: Int
 }
 api test(orderId: Int): Int {
-  val order = find(Order, userId: orderId)
+  val order = Order.find(userId: orderId)
   0
 }`)
 	// cmd+click on "userId" (the named arg label, before :) at line 5
-	// "userId" is at position ~26 in "find(Order, userId: orderId)"
+	// "userId" is at position ~26 in "Order.find(userId: orderId)"
 	result := requestDefinition(server, output, uri, Position{Line: 5, Character: 26})
 	// should jump to userId field in Order model (line 2)
 	if !strings.Contains(result, `"line":2`) {
@@ -2308,26 +2308,26 @@ api test(orderId: Int): Int {
 
 func TestIsNamedArgLabel(t *testing.T) {
 	store := NewDocumentStore()
-	store.Open("file:///test.luxo", 1, `find(User, id: 1, where: x == y)`)
+	store.Open("file:///test.luxo", 1, `User.find(id: 1, where: x == y)`)
 	doc := store.Get("file:///test.luxo")
 
-	// "id" at position 11 is followed by ":"
-	if !doc.IsNamedArgLabel(Position{Line: 0, Character: 11}) {
+	// "id" at position 10 is followed by ":"
+	if !doc.IsNamedArgLabel(Position{Line: 0, Character: 10}) {
 		t.Error("expected 'id' to be named arg label")
 	}
-	// "where" at position 18 is followed by ":"
-	if !doc.IsNamedArgLabel(Position{Line: 0, Character: 18}) {
+	// "where" at position 17 is followed by ":"
+	if !doc.IsNamedArgLabel(Position{Line: 0, Character: 17}) {
 		t.Error("expected 'where' to be named arg label")
 	}
-	// "User" at position 5 is followed by ","
+	// "find" at position 5 is followed by "("
 	if doc.IsNamedArgLabel(Position{Line: 0, Character: 5}) {
-		t.Error("'User' should not be named arg label")
+		t.Error("'find' should not be named arg label")
 	}
 }
 
 func TestFindEnclosingCall(t *testing.T) {
 	store := NewDocumentStore()
-	store.Open("file:///test.luxo", 1, `val x = find(Order, userId: 1)`)
+	store.Open("file:///test.luxo", 1, `val x = Order.find(userId: 1)`)
 	doc := store.Get("file:///test.luxo")
 
 	fn, model := doc.FindEnclosingCall(Position{Line: 0, Character: 20})
@@ -2373,7 +2373,7 @@ func TestIsCRUDFunc(t *testing.T) {
 
 func TestIsNamedArgLabelOutOfBounds(t *testing.T) {
 	store := NewDocumentStore()
-	store.Open("file:///test.luxo", 1, `find(User)`)
+	store.Open("file:///test.luxo", 1, `User.find()`)
 	doc := store.Get("file:///test.luxo")
 	// out of bounds
 	if doc.IsNamedArgLabel(Position{Line: 99, Character: 0}) {
@@ -2393,7 +2393,7 @@ func TestFindEnclosingCallNotInCall(t *testing.T) {
 
 func TestFindEnclosingCallOutOfBounds(t *testing.T) {
 	store := NewDocumentStore()
-	store.Open("file:///test.luxo", 1, `find(User)`)
+	store.Open("file:///test.luxo", 1, `User.find()`)
 	doc := store.Get("file:///test.luxo")
 	fn, _ := doc.FindEnclosingCall(Position{Line: 99, Character: 0})
 	if fn != "" {
@@ -2416,7 +2416,7 @@ func TestFindCRUDFieldDefinitionNonCRUD(t *testing.T) {
 func TestFindCRUDFieldDefinitionCRUDParam(t *testing.T) {
 	doc := &Document{
 		URI:     "file:///test.luxo",
-		Content: `val x = find(Order, where: true)`,
+		Content: `val x = Order.find(where: true)`,
 		File:    &ast.File{},
 	}
 	// "where" is a CRUD param, not a model field
@@ -2429,7 +2429,7 @@ func TestFindCRUDFieldDefinitionCRUDParam(t *testing.T) {
 func TestFindCRUDFieldDefinitionModelNotFound(t *testing.T) {
 	doc := &Document{
 		URI:     "file:///test.luxo",
-		Content: `val x = find(Unknown, name: 1)`,
+		Content: `val x = Unknown.find(name: 1)`,
 		File:    &ast.File{Models: []*ast.ModelDecl{{Name: "Other"}}},
 	}
 	pos := findCRUDFieldDefinition(doc, "name", Position{Line: 0, Character: 22})
@@ -2440,7 +2440,7 @@ func TestFindCRUDFieldDefinitionModelNotFound(t *testing.T) {
 
 func TestFindEnclosingCallNestedParens(t *testing.T) {
 	store := NewDocumentStore()
-	store.Open("file:///test.luxo", 1, `val x = find(Order, where: fn() == 1)`)
+	store.Open("file:///test.luxo", 1, `val x = Order.find(where: fn() == 1)`)
 	doc := store.Get("file:///test.luxo")
 	// cursor at position 34 — after fn() close paren, scans back through nested parens
 	fn, model := doc.FindEnclosingCall(Position{Line: 0, Character: 34})
@@ -2454,7 +2454,7 @@ func TestFindEnclosingCallNestedParens(t *testing.T) {
 
 func TestFindEnclosingCallNoSpaceAfterParen(t *testing.T) {
 	store := NewDocumentStore()
-	store.Open("file:///test.luxo", 1, `find(Order,id: 1)`)
+	store.Open("file:///test.luxo", 1, `Order.find(id: 1)`)
 	doc := store.Get("file:///test.luxo")
 	fn, model := doc.FindEnclosingCall(Position{Line: 0, Character: 12})
 	if fn != "find" {
@@ -2468,7 +2468,7 @@ func TestFindEnclosingCallNoSpaceAfterParen(t *testing.T) {
 func TestFindCRUDFieldDefinitionNoFile(t *testing.T) {
 	doc := &Document{
 		URI:     "file:///test.luxo",
-		Content: `val x = find(Order, name: 1)`,
+		Content: `val x = Order.find(name: 1)`,
 	}
 	pos := findCRUDFieldDefinition(doc, "name", Position{Line: 0, Character: 20})
 	if pos != nil {
@@ -2528,6 +2528,12 @@ func TestMemberMethodDescription(t *testing.T) {
 		{"contains", true},
 		{"let", true},
 		{"joinToString", true},
+		// @withAuth injected methods
+		{"createToken", true},
+		{"verify", true},
+		{"refreshToken", true},
+		// Identity methods
+		{"load", true},
 		{"nonexistent", false},
 	}
 	for _, tt := range tests {
@@ -2577,7 +2583,7 @@ func TestHoverMemberMethod(t *testing.T) {
 	server, output := newTestServer()
 	uri := "file:///test_hover_method.luxo"
 	openDoc(server, output, uri, `api test(): Int {
-  val items = find(Post, where: true)
+  val items = Post.find(where: true)
   items.size
 }`)
 	// hover on "size" at line 2, character 8
@@ -2594,7 +2600,7 @@ func TestHoverItFieldNotParam(t *testing.T) {
   roomId: Int
 }
 api test(roomId: Int): Int {
-  val r = find(Room, where: it.roomId == roomId)
+  val r = Room.find(where: it.roomId == roomId)
   0
 }`)
 	// hover on "roomId" after "it." at line 4 — should show field, not param
@@ -2646,8 +2652,7 @@ func TestMultiLineCRUDCompletion(t *testing.T) {
   userId: Int
 }
 api test(): Int {
-  val order = find(Order,
-    userId: 1)
+  val order = Order.find(    userId: 1)
   0
 }`)
 	// completion on line 6, inside multi-line find() call
@@ -2659,9 +2664,9 @@ api test(): Int {
 
 func TestExtractCallInfoNextLine(t *testing.T) {
 	store := NewDocumentStore()
-	store.Open("file:///test.luxo", 1, "val x = find(\n  Order, id: 1)")
+	store.Open("file:///test.luxo", 1, "val x = Order.find(\n  id: 1)")
 	doc := store.Get("file:///test.luxo")
-	fn, model := doc.FindEnclosingCall(Position{Line: 1, Character: 10})
+	fn, model := doc.FindEnclosingCall(Position{Line: 1, Character: 5})
 	if fn != "find" {
 		t.Errorf("expected 'find', got %q", fn)
 	}
@@ -2713,6 +2718,23 @@ func TestStdlibNonModule(t *testing.T) {
 	items := getStdlibModuleMethods("unknown")
 	if len(items) != 0 {
 		t.Errorf("expected no items for unknown module, got %d", len(items))
+	}
+}
+
+func TestStdlibMyCompletions(t *testing.T) {
+	items := getStdlibModuleMethods("my")
+	names := map[string]bool{}
+	for _, item := range items {
+		names[item.Label] = true
+	}
+	if !names["id"] {
+		t.Errorf("missing my.id in completions, got: %v", names)
+	}
+	if !names["load"] {
+		t.Errorf("missing my.load in completions, got: %v", names)
+	}
+	if !names["role"] {
+		t.Errorf("missing my.role in completions, got: %v", names)
 	}
 }
 
@@ -2791,7 +2813,7 @@ func TestFindFieldInAnyType(t *testing.T) {
   title: String
 }
 api test(): String {
-  val posts = find(Post, where: status == "ok")
+  val posts = Post.find(where: status == "ok")
   val matched = posts.filter { it.title }
   "done"
 }`)
@@ -3062,7 +3084,7 @@ func TestHoverMemberMethodFilter(t *testing.T) {
 	uri := "file:///test_method.luxo"
 	openDoc(server, output, uri, `model User { name: String }
 api test(): String {
-  val users = find(User, where: name == "x")
+  val users = User.find(where: name == "x")
   users.filter
 }`)
 	resp := requestHover(server, output, uri, Position{Line: 3, Character: 9})
@@ -3157,7 +3179,7 @@ func TestDefinitionItMemberField(t *testing.T) {
   price: Float
 }
 api test(): Int {
-  val items = find(Item, where: name == "x")
+  val items = Item.find(where: name == "x")
   items.filter { it.price > 0 }
   0
 }`)
@@ -3178,7 +3200,7 @@ func TestHandleReferencesMultiple(t *testing.T) {
   name: String
 }
 api test(): String {
-  val user = find(User, id: 1)
+  val user = User.find(id: 1)
   user?.name ?: "anon"
 }`)
 	// request references for "name" on line 1 (0-based)
@@ -3316,5 +3338,1971 @@ api login(auth: AuthResult): String {
 	resp := requestDefinition(server, output, uri, Position{Line: 5, Character: 7})
 	if !strings.Contains(resp, "test_type_field.luxo") {
 		t.Error("expected definition location for type field")
+	}
+}
+
+// ========== findMemberFieldDefinition — val variable from CRUD call ==========
+
+func TestDefinitionMemberFieldValCRUD(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_val_crud.luxo"
+	openDoc(server, output, uri, `model Order {
+  orderNo: String
+  amount: Float
+}
+api test(): String {
+  val order = Order.create(orderNo: "123", amount: 9.99)
+  order.orderNo
+}`)
+	// "orderNo" after "order." on line 6: "  order.orderNo"
+	// "order" is 2..7, "." is 7, "orderNo" starts at 8
+	resp := requestDefinition(server, output, uri, Position{Line: 6, Character: 10})
+	if !strings.Contains(resp, `"line":1`) {
+		t.Errorf("expected definition to point to orderNo field at line 1, got %s", resp)
+	}
+}
+
+// ========== findMemberFieldDefinition — val variable from transaction block ==========
+
+func TestDefinitionMemberFieldValTransaction(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_val_tx.luxo"
+	openDoc(server, output, uri, `model Order {
+  orderNo: String
+  status: String
+}
+api test(): String {
+  val order = transaction {
+    Order.create(orderNo: "456", status: "new")
+  }
+  order.status
+}`)
+	// "status" after "order." on line 8: "  order.status"
+	resp := requestDefinition(server, output, uri, Position{Line: 8, Character: 10})
+	if !strings.Contains(resp, `"line":2`) {
+		t.Errorf("expected definition to point to status field at line 2, got %s", resp)
+	}
+}
+
+// ========== findMemberFieldDefinition — val with explicit type annotation ==========
+
+func TestDefinitionMemberFieldValExplicitType(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_val_typed.luxo"
+	openDoc(server, output, uri, `model User {
+  name: String
+  email: String
+}
+api test(): String {
+  val user: User = User.find(id: 1)
+  user.email
+}`)
+	// "email" after "user." on line 6: "  user.email"
+	resp := requestDefinition(server, output, uri, Position{Line: 6, Character: 9})
+	if !strings.Contains(resp, `"line":2`) {
+		t.Errorf("expected definition to point to email field at line 2, got %s", resp)
+	}
+}
+
+// ========== findMemberFieldDefinition — val from find() ==========
+
+func TestDefinitionMemberFieldValFind(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_val_find.luxo"
+	openDoc(server, output, uri, `model Product {
+  title: String
+  price: Float
+}
+api test(): String {
+  val product = Product.find(id: 1)
+  product.title
+}`)
+	// "title" after "product." on line 6
+	resp := requestDefinition(server, output, uri, Position{Line: 6, Character: 12})
+	if !strings.Contains(resp, `"line":1`) {
+		t.Errorf("expected definition to point to title field at line 1, got %s", resp)
+	}
+}
+
+// ========== inferExprTypeName — non-CRUD call returns empty ==========
+
+func TestInferExprTypeNameNonCRUD(t *testing.T) {
+	expr := &ast.CallExpr{
+		Func: &ast.Ident{Name: "encrypt"},
+		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "password"}}},
+	}
+	if got := inferExprTypeName(expr); got != "" {
+		t.Errorf("expected empty for non-CRUD call, got %q", got)
+	}
+}
+
+// ========== inferExprTypeName — nil expr ==========
+
+func TestInferExprTypeNameNil(t *testing.T) {
+	if got := inferExprTypeName(nil); got != "" {
+		t.Errorf("expected empty for nil expr, got %q", got)
+	}
+}
+
+// ========== inferExprTypeName — unrecognized expr type ==========
+
+func TestInferExprTypeNameUnknownExpr(t *testing.T) {
+	expr := &ast.Literal{Value: "hello"}
+	if got := inferExprTypeName(expr); got != "" {
+		t.Errorf("expected empty for literal expr, got %q", got)
+	}
+}
+
+// ========== inferCallTypeName — no args ==========
+
+func TestInferCallTypeNameNoArgs(t *testing.T) {
+	call := &ast.CallExpr{
+		Func: &ast.Ident{Name: "create"},
+		Args: []*ast.NamedArg{},
+	}
+	if got := inferCallTypeName(call); got != "" {
+		t.Errorf("expected empty for no-arg CRUD call, got %q", got)
+	}
+}
+
+// ========== inferCallTypeName — first arg is not Ident ==========
+
+func TestInferCallTypeNameNonIdentFirstArg(t *testing.T) {
+	call := &ast.CallExpr{
+		Func: &ast.Ident{Name: "create"},
+		Args: []*ast.NamedArg{{Value: &ast.Literal{Value: "42"}}},
+	}
+	if got := inferCallTypeName(call); got != "" {
+		t.Errorf("expected empty when first arg is not Ident, got %q", got)
+	}
+}
+
+// ========== inferCallTypeName — func is not Ident ==========
+
+func TestInferCallTypeNameFuncNotIdent(t *testing.T) {
+	call := &ast.CallExpr{
+		Func: &ast.MemberExpr{Field: "create"},
+		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "Order"}}},
+	}
+	if got := inferCallTypeName(call); got != "" {
+		t.Errorf("expected empty when func is not Ident, got %q", got)
+	}
+}
+
+// ========== inferCallTypeName — block-call with trailing lambda ==========
+
+func TestInferCallTypeNameTrailingLambda(t *testing.T) {
+	call := &ast.CallExpr{
+		Func: &ast.Ident{Name: "transaction"},
+		Args: []*ast.NamedArg{
+			{Value: &ast.LambdaExpr{
+				Body: &ast.Block{
+					Stmts: []ast.Stmt{
+						&ast.ExprStmt{Expr: &ast.CallExpr{
+							Func: &ast.Ident{Name: "create"},
+							Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "Order"}}},
+						}},
+					},
+				},
+			}},
+		},
+	}
+	if got := inferCallTypeName(call); got != "Order" {
+		t.Errorf("expected 'Order' for transaction with lambda, got %q", got)
+	}
+}
+
+// ========== inferCallTypeName — non-CRUD call without lambda args ==========
+
+func TestInferCallTypeNameNonCRUDNoLambda(t *testing.T) {
+	call := &ast.CallExpr{
+		Func: &ast.Ident{Name: "doSomething"},
+		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "x"}}},
+	}
+	if got := inferCallTypeName(call); got != "" {
+		t.Errorf("expected empty for non-CRUD non-lambda call, got %q", got)
+	}
+}
+
+// ========== inferCallTypeName — non-CRUD call with zero args ==========
+
+func TestInferCallTypeNameNonCRUDNoArgs(t *testing.T) {
+	call := &ast.CallExpr{
+		Func: &ast.Ident{Name: "doSomething"},
+		Args: []*ast.NamedArg{},
+	}
+	if got := inferCallTypeName(call); got != "" {
+		t.Errorf("expected empty for non-CRUD zero-arg call, got %q", got)
+	}
+}
+
+// ========== inferBlockTypeName — nil block ==========
+
+func TestInferBlockTypeNameNil(t *testing.T) {
+	if got := inferBlockTypeName(nil); got != "" {
+		t.Errorf("expected empty for nil block, got %q", got)
+	}
+}
+
+// ========== inferBlockTypeName — empty block ==========
+
+func TestInferBlockTypeNameEmpty(t *testing.T) {
+	block := &ast.Block{Stmts: []ast.Stmt{}}
+	if got := inferBlockTypeName(block); got != "" {
+		t.Errorf("expected empty for empty block, got %q", got)
+	}
+}
+
+// ========== inferBlockTypeName — last stmt is ValStmt with type ==========
+
+func TestInferBlockTypeNameLastVal(t *testing.T) {
+	block := &ast.Block{
+		Stmts: []ast.Stmt{
+			&ast.ValStmt{
+				Name:  "x",
+				Type:  &ast.TypeRef{Name: "User"},
+				Value: &ast.Literal{Value: "1"},
+			},
+		},
+	}
+	if got := inferBlockTypeName(block); got != "User" {
+		t.Errorf("expected 'User' for val with explicit type, got %q", got)
+	}
+}
+
+// ========== inferBlockTypeName — last stmt is non-expr/non-val ==========
+
+func TestInferBlockTypeNameLastNonExpr(t *testing.T) {
+	block := &ast.Block{
+		Stmts: []ast.Stmt{
+			&ast.ReturnStmt{},
+		},
+	}
+	if got := inferBlockTypeName(block); got != "" {
+		t.Errorf("expected empty for return stmt, got %q", got)
+	}
+}
+
+// ========== findValTypeName — var not found ==========
+
+func TestFindValTypeNameNotFound(t *testing.T) {
+	file := &ast.File{
+		APIs: []*ast.ApiDecl{
+			{
+				Pos:  token.Position{Line: 1},
+				Name: "test",
+				Body: &ast.Block{
+					EndPos: token.Position{Line: 5},
+					Stmts: []ast.Stmt{
+						&ast.ValStmt{
+							Pos:   token.Position{Line: 2},
+							Name:  "other",
+							Value: &ast.CallExpr{Func: &ast.Ident{Name: "create"}, Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "Order"}}}},
+						},
+					},
+				},
+			},
+		},
+	}
+	if got := findValTypeName(file, "missing", Position{Line: 3}); got != "" {
+		t.Errorf("expected empty for missing var, got %q", got)
+	}
+}
+
+// ========== findValTypeName — works in fn body ==========
+
+func TestFindValTypeNameInFn(t *testing.T) {
+	file := &ast.File{
+		Functions: []*ast.FnDecl{
+			{
+				Pos:  token.Position{Line: 1},
+				Name: "helper",
+				Body: &ast.Block{
+					EndPos: token.Position{Line: 5},
+					Stmts: []ast.Stmt{
+						&ast.ValStmt{
+							Pos:   token.Position{Line: 2},
+							Name:  "item",
+							Value: &ast.CallExpr{Func: &ast.Ident{Name: "find"}, Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "Product"}}}},
+						},
+					},
+				},
+			},
+		},
+	}
+	if got := findValTypeName(file, "item", Position{Line: 3}); got != "Product" {
+		t.Errorf("expected 'Product', got %q", got)
+	}
+}
+
+// ========== Object Construction Named Arg Definition Tests ==========
+
+func TestDefinitionNamedArgInObjectConstruction(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_obj_def.luxo"
+	openDoc(server, output, uri, `type AuthResult {
+  token: String
+  user: String
+}
+api login(password: String): AuthResult {
+  AuthResult { token: password, user: password }
+}`)
+	// Click on "token" (the named arg key before ':') in AuthResult { token: ... }
+	// Line 5: "  AuthResult { token: password, user: password }"
+	// "token" starts at character 17
+	output.Reset()
+	resp := requestDefinition(server, output, uri, Position{Line: 5, Character: 17})
+	// should jump to token field in AuthResult type (line 1)
+	if !strings.Contains(resp, `"line":1`) {
+		t.Errorf("expected definition at line 1 (AuthResult.token), got: %s", resp)
+	}
+}
+
+func TestDefinitionNamedArgInObjectConstructionUserField(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_obj_def2.luxo"
+	openDoc(server, output, uri, `type AuthResult {
+  token: String
+  user: String
+}
+api login(password: String): AuthResult {
+  AuthResult { token: password, user: password }
+}`)
+	// Click on "user" (the second named arg key) in AuthResult { ..., user: password }
+	// Line 5: "  AuthResult { token: password, user: password }"
+	// "user" starts at character 34
+	output.Reset()
+	resp := requestDefinition(server, output, uri, Position{Line: 5, Character: 34})
+	// should jump to user field in AuthResult type (line 2)
+	if !strings.Contains(resp, `"line":2`) {
+		t.Errorf("expected definition at line 2 (AuthResult.user), got: %s", resp)
+	}
+}
+
+func TestDefinitionNamedArgInModelObjectConstruction(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_obj_model.luxo"
+	openDoc(server, output, uri, `model User {
+  name: String
+  email: String
+}
+api createUser(n: String, e: String): User {
+  User { name: n, email: e }
+}`)
+	// Click on "name" (the named arg key) in User { name: n, ... }
+	// Line 5: "  User { name: n, email: e }"
+	// "name" starts at character 9
+	output.Reset()
+	resp := requestDefinition(server, output, uri, Position{Line: 5, Character: 9})
+	// should jump to name field in User model (line 1)
+	if !strings.Contains(resp, `"line":1`) {
+		t.Errorf("expected definition at line 1 (User.name), got: %s", resp)
+	}
+}
+
+func TestDefinitionNamedArgNotInDeclaration(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_decl.luxo"
+	openDoc(server, output, uri, `model User { name: String }`)
+	// Click on "name" inside model declaration — this is the definition itself,
+	// should NOT resolve via object construction path
+	output.Reset()
+	resp := requestDefinition(server, output, uri, Position{Line: 0, Character: 14})
+	// should return null (no definition to jump to for a declaration)
+	if strings.Contains(resp, `"line"`) {
+		t.Errorf("expected null for field declaration, got: %s", resp)
+	}
+}
+
+func TestFindEnclosingObjectType(t *testing.T) {
+	store := NewDocumentStore()
+	store.Open("file:///test.luxo", 1, `AuthResult { token: x, user: y }`)
+	doc := store.Get("file:///test.luxo")
+
+	// cursor on "token" — should find AuthResult
+	typeName := doc.FindEnclosingObjectType(Position{Line: 0, Character: 13})
+	if typeName != "AuthResult" {
+		t.Errorf("expected 'AuthResult', got %q", typeName)
+	}
+
+	// cursor on "user" — should find AuthResult
+	typeName = doc.FindEnclosingObjectType(Position{Line: 0, Character: 23})
+	if typeName != "AuthResult" {
+		t.Errorf("expected 'AuthResult', got %q", typeName)
+	}
+}
+
+func TestFindEnclosingObjectTypeDeclaration(t *testing.T) {
+	store := NewDocumentStore()
+	store.Open("file:///test.luxo", 1, `model User { name: String }`)
+	doc := store.Get("file:///test.luxo")
+
+	// cursor on "name" inside model declaration — should return empty (declaration keyword blocks it)
+	typeName := doc.FindEnclosingObjectType(Position{Line: 0, Character: 14})
+	if typeName != "" {
+		t.Errorf("expected empty for declaration context, got %q", typeName)
+	}
+}
+
+func TestFindEnclosingObjectTypeNoType(t *testing.T) {
+	store := NewDocumentStore()
+	store.Open("file:///test.luxo", 1, `{ name: x }`)
+	doc := store.Get("file:///test.luxo")
+
+	// anonymous object — no uppercase type name before '{'
+	typeName := doc.FindEnclosingObjectType(Position{Line: 0, Character: 2})
+	if typeName != "" {
+		t.Errorf("expected empty for anonymous object, got %q", typeName)
+	}
+}
+
+func TestFindEnclosingObjectTypeOutOfBounds(t *testing.T) {
+	store := NewDocumentStore()
+	store.Open("file:///test.luxo", 1, `AuthResult { x: 1 }`)
+	doc := store.Get("file:///test.luxo")
+
+	// line out of bounds
+	typeName := doc.FindEnclosingObjectType(Position{Line: 99, Character: 0})
+	if typeName != "" {
+		t.Errorf("expected empty for out of bounds, got %q", typeName)
+	}
+}
+
+func TestFindObjectFieldDefinitionNoFile(t *testing.T) {
+	doc := &Document{
+		Content: `AuthResult { token: x }`,
+		File:    nil,
+	}
+	// no file → should return nil
+	p := findObjectFieldDefinition(doc, "token", Position{Line: 0, Character: 13})
+	if p != nil {
+		t.Error("expected nil when doc.File is nil")
+	}
+}
+
+func TestFindEnclosingObjectTypeMultiLine(t *testing.T) {
+	store := NewDocumentStore()
+	src := "AuthResult {\n  token: x,\n  user: y\n}"
+	store.Open("file:///test.luxo", 1, src)
+	doc := store.Get("file:///test.luxo")
+
+	// cursor on "user" at line 2 — should find AuthResult on line 0
+	typeName := doc.FindEnclosingObjectType(Position{Line: 2, Character: 2})
+	if typeName != "AuthResult" {
+		t.Errorf("expected 'AuthResult', got %q", typeName)
+	}
+}
+
+func TestFindEnclosingObjectTypeNestedBraces(t *testing.T) {
+	store := NewDocumentStore()
+	src := "Outer { inner: Inner { x: 1 }, name: y }"
+	store.Open("file:///test.luxo", 1, src)
+	doc := store.Get("file:///test.luxo")
+
+	// cursor on "name" at character 32 — should find Outer (not Inner)
+	typeName := doc.FindEnclosingObjectType(Position{Line: 0, Character: 32})
+	if typeName != "Outer" {
+		t.Errorf("expected 'Outer', got %q", typeName)
+	}
+}
+
+func TestFindObjectFieldDefinitionNoType(t *testing.T) {
+	doc := &Document{
+		Content: `{ token: x }`,
+		File:    &ast.File{},
+	}
+	// no enclosing type → should return nil
+	p := findObjectFieldDefinition(doc, "token", Position{Line: 0, Character: 2})
+	if p != nil {
+		t.Error("expected nil for anonymous object")
+	}
+}
+
+// ========== Inlay Hint Tests ==========
+
+func TestHandleInlayHintImplicitReturn(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_inlay.luxo"
+	openDoc(server, output, uri, `api getUser(id: Int): User {
+  val user = User.find(id: id)
+  user
+}`)
+
+	params, _ := json.Marshal(InlayHintParams{
+		TextDocument: TextDocumentID{URI: uri},
+		Range:        Range{Start: Position{0, 0}, End: Position{10, 0}},
+	})
+	raw, _ := json.Marshal(json.RawMessage("1"))
+	server.handleMessage(&Request{
+		JSONRPC: "2.0",
+		ID:      (*json.RawMessage)(&raw),
+		Method:  "textDocument/inlayHint",
+		Params:  params,
+	})
+
+	resp := output.String()
+	if !strings.Contains(resp, "return") {
+		t.Errorf("expected inlay hint with 'return', got: %s", resp)
+	}
+}
+
+func TestHandleInlayHintNoImplicitReturn(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_inlay_no.luxo"
+	// Last stmt is return, not implicit
+	openDoc(server, output, uri, `api getUser(id: Int): Int {
+  return 42
+}`)
+
+	params, _ := json.Marshal(InlayHintParams{
+		TextDocument: TextDocumentID{URI: uri},
+		Range:        Range{Start: Position{0, 0}, End: Position{10, 0}},
+	})
+	raw, _ := json.Marshal(json.RawMessage("2"))
+	server.handleMessage(&Request{
+		JSONRPC: "2.0",
+		ID:      (*json.RawMessage)(&raw),
+		Method:  "textDocument/inlayHint",
+		Params:  params,
+	})
+
+	resp := output.String()
+	// Should NOT contain return hint since last stmt is explicit return
+	if strings.Contains(resp, `"return "`) {
+		t.Errorf("did not expect inlay hint for explicit return, got: %s", resp)
+	}
+}
+
+func TestHandleInlayHintFn(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_inlay_fn.luxo"
+	openDoc(server, output, uri, `fn double(x: Int): Int {
+  x * 2
+}`)
+
+	params, _ := json.Marshal(InlayHintParams{
+		TextDocument: TextDocumentID{URI: uri},
+		Range:        Range{Start: Position{0, 0}, End: Position{10, 0}},
+	})
+	raw, _ := json.Marshal(json.RawMessage("3"))
+	server.handleMessage(&Request{
+		JSONRPC: "2.0",
+		ID:      (*json.RawMessage)(&raw),
+		Method:  "textDocument/inlayHint",
+		Params:  params,
+	})
+
+	resp := output.String()
+	if !strings.Contains(resp, "return") {
+		t.Errorf("expected inlay hint for fn implicit return, got: %s", resp)
+	}
+}
+
+func TestHandleInlayHintNoReturnType(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_inlay_void.luxo"
+	// No return type — should NOT show hint
+	openDoc(server, output, uri, `fn doSomething() {
+  val x = 1
+}`)
+
+	params, _ := json.Marshal(InlayHintParams{
+		TextDocument: TextDocumentID{URI: uri},
+		Range:        Range{Start: Position{0, 0}, End: Position{10, 0}},
+	})
+	raw, _ := json.Marshal(json.RawMessage("4"))
+	server.handleMessage(&Request{
+		JSONRPC: "2.0",
+		ID:      (*json.RawMessage)(&raw),
+		Method:  "textDocument/inlayHint",
+		Params:  params,
+	})
+
+	resp := output.String()
+	if strings.Contains(resp, `"return "`) {
+		t.Errorf("should not hint for function without return type, got: %s", resp)
+	}
+}
+
+func TestHandleInlayHintNoDoc(t *testing.T) {
+	server, output := newTestServer()
+	params, _ := json.Marshal(InlayHintParams{
+		TextDocument: TextDocumentID{URI: "file:///nonexistent.luxo"},
+		Range:        Range{Start: Position{0, 0}, End: Position{10, 0}},
+	})
+	raw, _ := json.Marshal(json.RawMessage("5"))
+	server.handleMessage(&Request{
+		JSONRPC: "2.0",
+		ID:      (*json.RawMessage)(&raw),
+		Method:  "textDocument/inlayHint",
+		Params:  params,
+	})
+
+	resp := output.String()
+	if !strings.Contains(resp, "[]") {
+		t.Errorf("expected empty hints for nonexistent doc, got: %s", resp)
+	}
+}
+
+func TestCollectImplicitReturnHintsNil(t *testing.T) {
+	hints := collectImplicitReturnHints(&ast.File{})
+	if len(hints) != 0 {
+		t.Errorf("expected 0 hints for empty file, got %d", len(hints))
+	}
+}
+
+func TestFindImplicitReturnNilBlock(t *testing.T) {
+	hint := findImplicitReturn(nil)
+	if hint != nil {
+		t.Error("expected nil for nil block")
+	}
+}
+
+func TestFindImplicitReturnEmptyBlock(t *testing.T) {
+	hint := findImplicitReturn(&ast.Block{})
+	if hint != nil {
+		t.Error("expected nil for empty block")
+	}
+}
+
+func TestCRUDNamedArgKeyNoGotoDefinition(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_crud_key.luxo"
+	// In Post.find(id: id), the first "id" (named arg key) should NOT jump
+	// to the api parameter "id". It is a CRUD query parameter name.
+	openDoc(server, output, uri, `model Post {
+  id:    Int
+  title: String
+}
+api getPost(id: Int): Post {
+  val post = Post.find(id: id)
+  post
+}`)
+	output.Reset()
+	// Cursor on the first "id" (named arg key at character 23 in "Post.find(id: id)")
+	// Line 5 is "  val post = Post.find(id: id)"
+	// "id" before ":" starts at character 23
+	result := requestDefinition(server, output, uri, Position{Line: 5, Character: 23})
+	// The named arg key "id" in a CRUD call should NOT resolve to any definition
+	if strings.Contains(result, `"line"`) {
+		t.Errorf("expected no definition for CRUD named arg key 'id:', got: %s", result)
+	}
+
+	output.Reset()
+	// Cursor on the second "id" (the value after ":") at character 27
+	result = requestDefinition(server, output, uri, Position{Line: 5, Character: 27})
+	// The value "id" should jump to the api parameter at line 4
+	if !strings.Contains(result, `"line":4`) {
+		t.Errorf("expected definition at line 4 (api param 'id'), got: %s", result)
+	}
+}
+
+// ========== CRUD where clause field resolution ==========
+
+// TestHoverBareFieldInCRUDWhere tests that a bare field name (without "it." prefix)
+// inside a CRUD where clause resolves to the correct model's field, not the first
+// model that has a field with that name.
+func TestHoverBareFieldInCRUDWhere(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_crud_where_hover.luxo"
+	// Post.userId comes first in source order, but RoomMember.find(...) should
+	// resolve userId to RoomMember.userId, not Post.userId.
+	openDoc(server, output, uri, `model Post {
+  userId: Int
+  title: String
+}
+model RoomMember {
+  roomId: Int
+  userId: Int
+}
+api test(roomId: Int): RoomMember {
+  val member = RoomMember.find(where: it.roomId == roomId && userId == 1)
+  member
+}`)
+	// "userId" without "it." prefix at line 9
+	// Line 9: "  val member = RoomMember.find(where: it.roomId == roomId && userId == 1)"
+	// "userId" starts around character 60
+	output.Reset()
+	result := requestHover(server, output, uri, Position{Line: 9, Character: 62})
+	if !strings.Contains(result, "RoomMember.userId") {
+		t.Errorf("expected hover to show RoomMember.userId, got: %s", result)
+	}
+	if strings.Contains(result, "Post.userId") {
+		t.Errorf("hover should NOT show Post.userId, got: %s", result)
+	}
+}
+
+// TestHoverItFieldInCRUDWhere tests that it.fieldName inside a CRUD where clause
+// resolves to the correct CRUD model's field.
+func TestHoverItFieldInCRUDWhere(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_crud_it_hover.luxo"
+	openDoc(server, output, uri, `model Post {
+  roomId: Int
+  title: String
+}
+model RoomMember {
+  roomId: Int
+  userId: Int
+}
+api test(roomId: Int): RoomMember {
+  val member = RoomMember.find(where: it.roomId == roomId)
+  member
+}`)
+	// "roomId" after "it." at line 9
+	// Line 9: "  val member = RoomMember.find(where: it.roomId == roomId)"
+	// "roomId" after "it." starts around character 41
+	output.Reset()
+	result := requestHover(server, output, uri, Position{Line: 9, Character: 43})
+	if !strings.Contains(result, "RoomMember.roomId") {
+		t.Errorf("expected hover to show RoomMember.roomId, got: %s", result)
+	}
+	if strings.Contains(result, "Post.roomId") {
+		t.Errorf("hover should NOT show Post.roomId, got: %s", result)
+	}
+}
+
+// TestDefinitionBareFieldInCRUDWhere tests that goto-definition on a bare field name
+// inside a CRUD where clause jumps to the correct model's field definition.
+func TestDefinitionBareFieldInCRUDWhere(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_crud_where_def.luxo"
+	openDoc(server, output, uri, `model Post {
+  userId: Int
+  title: String
+}
+model RoomMember {
+  roomId: Int
+  userId: Int
+}
+api test(roomId: Int): RoomMember {
+  val member = RoomMember.find(where: it.roomId == roomId && userId == 1)
+  member
+}`)
+	// "userId" without "it." at line 9, should jump to RoomMember.userId at line 6
+	output.Reset()
+	result := requestDefinition(server, output, uri, Position{Line: 9, Character: 62})
+	// RoomMember.userId is at line 6 (0-indexed)
+	if !strings.Contains(result, `"line":6`) {
+		t.Errorf("expected definition at line 6 (RoomMember.userId), got: %s", result)
+	}
+}
+
+// TestDefinitionItFieldInCRUDWhere tests that goto-definition on it.fieldName
+// inside a CRUD where clause jumps to the correct CRUD model's field.
+func TestDefinitionItFieldInCRUDWhere(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_crud_it_def.luxo"
+	openDoc(server, output, uri, `model Post {
+  roomId: Int
+  title: String
+}
+model RoomMember {
+  roomId: Int
+  userId: Int
+}
+api test(roomId: Int): RoomMember {
+  val member = RoomMember.find(where: it.roomId == roomId)
+  member
+}`)
+	// "roomId" after "it." at line 9, should jump to RoomMember.roomId at line 5
+	output.Reset()
+	result := requestDefinition(server, output, uri, Position{Line: 9, Character: 43})
+	// RoomMember.roomId is at line 5 (0-indexed)
+	if !strings.Contains(result, `"line":5`) {
+		t.Errorf("expected definition at line 5 (RoomMember.roomId), got: %s", result)
+	}
+}
+
+// TestCRUDFieldHoverNoFile tests getCRUDFieldHover when doc.File is nil.
+func TestCRUDFieldHoverNoFile(t *testing.T) {
+	result := getCRUDFieldHover(&Document{Content: "User.find(where: name == 1)"}, "name", Position{Line: 0, Character: 20})
+	if result != "" {
+		t.Errorf("expected empty hover for nil file, got: %s", result)
+	}
+}
+
+// TestCRUDFieldHoverNonCRUD tests getCRUDFieldHover in a non-CRUD call.
+func TestCRUDFieldHoverNonCRUD(t *testing.T) {
+	result := getCRUDFieldHover(&Document{Content: "foo(User, name: 1)"}, "name", Position{Line: 0, Character: 12})
+	if result != "" {
+		t.Errorf("expected empty hover for non-CRUD call, got: %s", result)
+	}
+}
+
+// TestCRUDBareFieldDefinitionNonCRUD tests findCRUDBareFieldDefinition in a non-CRUD call.
+func TestCRUDBareFieldDefinitionNonCRUD(t *testing.T) {
+	doc := &Document{Content: "foo(User, name: 1)"}
+	result := findCRUDBareFieldDefinition(doc, "name", Position{Line: 0, Character: 12})
+	if result != nil {
+		t.Errorf("expected nil for non-CRUD call, got: %v", result)
+	}
+}
+
+// TestCRUDBareFieldDefinitionNoFile tests findCRUDBareFieldDefinition when doc.File is nil.
+func TestCRUDBareFieldDefinitionNoFile(t *testing.T) {
+	doc := &Document{Content: "User.find(where: name == 1)"}
+	result := findCRUDBareFieldDefinition(doc, "name", Position{Line: 0, Character: 20})
+	if result != nil {
+		t.Errorf("expected nil for nil file, got: %v", result)
+	}
+}
+
+// ========== my.load() goto-definition ==========
+
+// TestDefinitionMyLoadField tests that goto-definition on arguments inside my.load()
+// resolves to the corresponding field in the @withAuth model.
+func TestDefinitionMyLoadField(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_myload.luxo"
+	openDoc(server, output, uri, `model User @withAuth(secret: "s", stores: "id") {
+  name: String
+  role: String
+}
+api test(): String @auth {
+  val u = my.load(name, role)
+  u.name
+}`)
+	// "name" is at line 5 (0-based), my.load(name, role) — "name" starts at character 18
+	resp := requestDefinition(server, output, uri, Position{Line: 5, Character: 19})
+	if !strings.Contains(resp, "test_myload") {
+		t.Errorf("expected definition to point to User.name field, got: %s", resp)
+	}
+	// verify it points to line 2 (1-based) where name: String is declared
+	if !strings.Contains(resp, `"line":1`) {
+		t.Errorf("expected definition on line 1 (0-based), got: %s", resp)
+	}
+}
+
+// TestDefinitionMyLoadSecondArg tests goto-definition on the second argument of my.load().
+func TestDefinitionMyLoadSecondArg(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_myload2.luxo"
+	openDoc(server, output, uri, `model User @withAuth(secret: "s", stores: "id") {
+  name: String
+  role: String
+}
+api test(): String @auth {
+  val u = my.load(name, role)
+  u.name
+}`)
+	// "role" is at line 5, my.load(name, role) — "role" starts at character 24
+	resp := requestDefinition(server, output, uri, Position{Line: 5, Character: 25})
+	if !strings.Contains(resp, "test_myload2") {
+		t.Errorf("expected definition to point to User.role field, got: %s", resp)
+	}
+	// verify it points to line 3 (1-based, 2 zero-based) where role: String is declared
+	if !strings.Contains(resp, `"line":2`) {
+		t.Errorf("expected definition on line 2 (0-based), got: %s", resp)
+	}
+}
+
+// TestDefinitionMyLoadNoWithAuth tests that my.load() returns nil when no @withAuth model exists.
+func TestDefinitionMyLoadNoWithAuth(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_myload_noauth.luxo"
+	openDoc(server, output, uri, `model User {
+  name: String
+}
+api test(): String {
+  val u = my.load(name)
+  u.name
+}`)
+	resp := requestDefinition(server, output, uri, Position{Line: 4, Character: 19})
+	// should not resolve — no @withAuth model
+	if strings.Contains(resp, `"line"`) {
+		t.Errorf("expected no definition without @withAuth model, got: %s", resp)
+	}
+}
+
+// TestDefinitionMyLoadNonexistentField tests that my.load() returns nil for a field
+// that doesn't exist in the @withAuth model.
+func TestDefinitionMyLoadNonexistentField(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_myload_nofield.luxo"
+	openDoc(server, output, uri, `model User @withAuth(secret: "s", stores: "id") {
+  name: String
+}
+api test(): String @auth {
+  val u = my.load(email)
+  u.name
+}`)
+	resp := requestDefinition(server, output, uri, Position{Line: 4, Character: 19})
+	// "email" is not a field of User
+	if strings.Contains(resp, `"line"`) {
+		t.Errorf("expected no definition for nonexistent field, got: %s", resp)
+	}
+}
+
+// TestIsInsideMyLoadCall tests the IsInsideMyLoadCall document method.
+func TestIsInsideMyLoadCall(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		pos     Position
+		want    bool
+	}{
+		{
+			name:    "inside my.load",
+			content: "my.load(name, role)",
+			pos:     Position{Line: 0, Character: 10},
+			want:    true,
+		},
+		{
+			name:    "not in call",
+			content: "val x = name",
+			pos:     Position{Line: 0, Character: 8},
+			want:    false,
+		},
+		{
+			name:    "inside regular load call",
+			content: "load(name)",
+			pos:     Position{Line: 0, Character: 6},
+			want:    false,
+		},
+		{
+			name:    "inside other.load call",
+			content: "other.load(name)",
+			pos:     Position{Line: 0, Character: 12},
+			want:    false,
+		},
+		{
+			name:    "out of bounds line",
+			content: "my.load(name)",
+			pos:     Position{Line: 5, Character: 0},
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc := &Document{Content: tt.content}
+			got := doc.IsInsideMyLoadCall(tt.pos)
+			if got != tt.want {
+				t.Errorf("IsInsideMyLoadCall() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestIsMyLoadBefore tests the isMyLoadBefore helper.
+func TestIsMyLoadBefore(t *testing.T) {
+	tests := []struct {
+		line     string
+		parenCol int
+		want     bool
+	}{
+		{"my.load(", 7, true},
+		{"  my.load(", 9, true},
+		{"load(", 4, false},
+		{"other.load(", 10, false},
+		{"my.save(", 7, false},
+		{"(", 0, false},
+	}
+	for _, tt := range tests {
+		got := isMyLoadBefore(tt.line, tt.parenCol)
+		if got != tt.want {
+			t.Errorf("isMyLoadBefore(%q, %d) = %v, want %v", tt.line, tt.parenCol, got, tt.want)
+		}
+	}
+}
+
+// TestFindMyLoadFieldDefinitionNilFile tests findMyLoadFieldDefinition when doc.File is nil.
+func TestFindMyLoadFieldDefinitionNilFile(t *testing.T) {
+	doc := &Document{Content: "my.load(name)"}
+	result := findMyLoadFieldDefinition(doc, "name")
+	if result != nil {
+		t.Errorf("expected nil for nil file, got: %v", result)
+	}
+}
+
+// TestFindWithAuthModelName tests findWithAuthModelName with various configurations.
+func TestFindWithAuthModelName(t *testing.T) {
+	// nil file
+	doc := &Document{}
+	if name := findWithAuthModelName(doc); name != "" {
+		t.Errorf("expected empty for nil file, got: %s", name)
+	}
+
+	// file with @withAuth model
+	doc = &Document{
+		File: &ast.File{
+			Models: []*ast.ModelDecl{
+				{
+					Name:       "User",
+					Directives: []*ast.Directive{{Name: "withAuth"}},
+				},
+				{
+					Name: "Post",
+				},
+			},
+		},
+	}
+	if name := findWithAuthModelName(doc); name != "User" {
+		t.Errorf("expected User, got: %s", name)
+	}
+
+	// file without @withAuth
+	doc = &Document{
+		File: &ast.File{
+			Models: []*ast.ModelDecl{
+				{Name: "Post"},
+			},
+		},
+	}
+	if name := findWithAuthModelName(doc); name != "" {
+		t.Errorf("expected empty, got: %s", name)
+	}
+}
+
+// ========== @scope Hover and Goto Definition Tests ==========
+
+func TestScopeDirectiveHover(t *testing.T) {
+	server, output := newTestServer()
+
+	// line 0: model AuditablePost : Base {
+	// line 1:   title: String
+	// line 2:   status: String
+	// line 3:   scope published = where(status == "PUBLISHED")
+	// line 4: }
+	// line 5:
+	// line 6: api listPosts(): [AuditablePost] @scope(published)
+	src := "model AuditablePost : Base {\n  title: String\n  status: String\n  scope published = where(status == \"PUBLISHED\")\n}\n\napi listPosts(): [AuditablePost] @scope(published)"
+	openDoc(server, output, "file:///scope.luxo", src)
+
+	// hover on @scope directive name itself (the word "scope" after @)
+	// line 6: api listPosts(): [AuditablePost] @scope(published)
+	// @scope starts at col 33, 'scope' is cols 34-38
+	resp := requestHover(server, output, "file:///scope.luxo", Position{Line: 6, Character: 35})
+	if !strings.Contains(resp, "scope") || !strings.Contains(resp, "应用查询预设") {
+		t.Errorf("expected @scope directive hover, got: %s", resp)
+	}
+
+	// hover on scope name "published" inside @scope(published)
+	// 'published' starts at col 40
+	output.Reset()
+	resp = requestHover(server, output, "file:///scope.luxo", Position{Line: 6, Character: 42})
+	if !strings.Contains(resp, "published") {
+		t.Errorf("expected scope name hover for 'published', got: %s", resp)
+	}
+	if !strings.Contains(resp, "AuditablePost") {
+		t.Errorf("expected model name in hover, got: %s", resp)
+	}
+}
+
+func TestScopeDirectiveGotoDefinition(t *testing.T) {
+	server, output := newTestServer()
+
+	// line 0: model AuditablePost : Base {
+	// line 1:   title: String
+	// line 2:   status: String
+	// line 3:   scope published = where(status == "PUBLISHED")
+	// line 4: }
+	// line 5:
+	// line 6: api listPosts(): [AuditablePost] @scope(published)
+	src := "model AuditablePost : Base {\n  title: String\n  status: String\n  scope published = where(status == \"PUBLISHED\")\n}\n\napi listPosts(): [AuditablePost] @scope(published)"
+	openDoc(server, output, "file:///scope.luxo", src)
+
+	// goto definition on "published" inside @scope(published)
+	// 'published' starts at col 40 on line 6
+	resp := requestDefinition(server, output, "file:///scope.luxo", Position{Line: 6, Character: 42})
+	// should jump to line 3 (0-indexed) where "scope published" is declared
+	if !strings.Contains(resp, `"line":3`) && !strings.Contains(resp, `"line": 3`) {
+		t.Errorf("expected definition to jump to scope declaration line, got: %s", resp)
+	}
+}
+
+func TestIsInsideScopeDirective(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		pos     Position
+		want    bool
+	}{
+		{
+			name:    "inside @scope args",
+			content: "api list(): [Post] @scope(published, mine)",
+			pos:     Position{Line: 0, Character: 30},
+			want:    true,
+		},
+		{
+			name:    "outside @scope - before paren",
+			content: "api list(): [Post] @scope(published)",
+			pos:     Position{Line: 0, Character: 22},
+			want:    false,
+		},
+		{
+			name:    "not @scope - different directive",
+			content: "api list(): [Post] @auth(User)",
+			pos:     Position{Line: 0, Character: 27},
+			want:    false,
+		},
+		{
+			name:    "empty content",
+			content: "",
+			pos:     Position{Line: 0, Character: 0},
+			want:    false,
+		},
+		{
+			name:    "line out of bounds",
+			content: "api list(): [Post] @scope(published)",
+			pos:     Position{Line: 5, Character: 0},
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc := &Document{Content: tt.content}
+			got := doc.IsInsideScopeDirective(tt.pos)
+			if got != tt.want {
+				t.Errorf("IsInsideScopeDirective() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFindScopeDefinition(t *testing.T) {
+	doc := &Document{
+		File: &ast.File{
+			Models: []*ast.ModelDecl{
+				{
+					Name: "Post",
+					Scopes: []*ast.ScopeDecl{
+						{
+							Name: "published",
+							Pos:  token.Position{File: "/test.luxo", Line: 4, Col: 3},
+						},
+						{
+							Name: "recent",
+							Pos:  token.Position{File: "/test.luxo", Line: 8, Col: 3},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// found
+	pos := findScopeDefinition(doc, "published")
+	if pos == nil {
+		t.Fatal("expected to find scope 'published'")
+	}
+	if pos.Line != 4 {
+		t.Errorf("expected line 4, got %d", pos.Line)
+	}
+
+	// found second scope
+	pos = findScopeDefinition(doc, "recent")
+	if pos == nil {
+		t.Fatal("expected to find scope 'recent'")
+	}
+	if pos.Line != 8 {
+		t.Errorf("expected line 8, got %d", pos.Line)
+	}
+
+	// not found
+	pos = findScopeDefinition(doc, "nonexistent")
+	if pos != nil {
+		t.Error("expected nil for nonexistent scope")
+	}
+
+	// nil file
+	doc2 := &Document{}
+	pos = findScopeDefinition(doc2, "published")
+	if pos != nil {
+		t.Error("expected nil for nil file")
+	}
+}
+
+func TestScopeNameHover(t *testing.T) {
+	doc := &Document{
+		File: &ast.File{
+			Models: []*ast.ModelDecl{
+				{
+					Name: "Post",
+					Scopes: []*ast.ScopeDecl{
+						{
+							Name: "published",
+							Pos:  token.Position{File: "/test.luxo", Line: 4, Col: 3},
+						},
+						{
+							Name: "recent",
+							Pos:  token.Position{File: "/test.luxo", Line: 8, Col: 3},
+							Params: []*ast.ParamDecl{
+								{Name: "days", Type: &ast.TypeRef{Name: "Int"}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// simple scope
+	hover := scopeNameHover(doc, "published")
+	if !strings.Contains(hover, "published") {
+		t.Errorf("expected 'published' in hover, got: %s", hover)
+	}
+	if !strings.Contains(hover, "Post") {
+		t.Errorf("expected 'Post' in hover, got: %s", hover)
+	}
+
+	// scope with params
+	hover = scopeNameHover(doc, "recent")
+	if !strings.Contains(hover, "days: Int") {
+		t.Errorf("expected 'days: Int' in hover, got: %s", hover)
+	}
+
+	// not found
+	hover = scopeNameHover(doc, "nonexistent")
+	if hover != "" {
+		t.Errorf("expected empty hover for nonexistent scope, got: %s", hover)
+	}
+
+	// nil file
+	doc2 := &Document{}
+	hover = scopeNameHover(doc2, "published")
+	if hover != "" {
+		t.Errorf("expected empty hover for nil file, got: %s", hover)
+	}
+}
+
+// ========== @scope Autocomplete Tests ==========
+
+func TestScopeCompletionSuggestsScopeNames(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test/scope_complete.luxo"
+	src := `model Post {
+  title: String
+  scope published = where(status == "PUBLISHED")
+  scope mine = where(userId == my.id)
+  scope hot = where(likes > 100)
+}
+api listPosts(): [Post] @scope()`
+
+	openDoc(server, output, uri, src)
+	output.Reset()
+
+	// cursor inside @scope() — line 6 (0-based), character 31 is between ( and )
+	// "api listPosts(): [Post] @scope()" — @scope( at col 25, ( at col 31, ) at col 32
+	result := requestCompletion(server, output, uri, Position{Line: 6, Character: 31})
+	if !strings.Contains(result, "published") {
+		t.Errorf("expected 'published' in scope completions, got: %s", result)
+	}
+	if !strings.Contains(result, "mine") {
+		t.Errorf("expected 'mine' in scope completions, got: %s", result)
+	}
+	if !strings.Contains(result, "hot") {
+		t.Errorf("expected 'hot' in scope completions, got: %s", result)
+	}
+}
+
+func TestScopeCompletionNoModelReturnsEmpty(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test/scope_no_model.luxo"
+	src := `type MyResult { data: String }
+api test(): MyResult @scope()`
+
+	openDoc(server, output, uri, src)
+	output.Reset()
+
+	// cursor inside @scope() — no model, should return no scope items
+	result := requestCompletion(server, output, uri, Position{Line: 1, Character: 28})
+	// should not contain scope-specific items (no scopes on a type)
+	if strings.Contains(result, "\"kind\":20") {
+		t.Errorf("expected no EnumMember completions for non-model type, got: %s", result)
+	}
+}
+
+func TestScopeCompletionScopeWithParams(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test/scope_params.luxo"
+	src := `model Post {
+  title: String
+  scope recent(days: Int) = where(createdAt > now())
+}
+api listPosts(): [Post] @scope()`
+
+	openDoc(server, output, uri, src)
+	output.Reset()
+
+	result := requestCompletion(server, output, uri, Position{Line: 4, Character: 31})
+	if !strings.Contains(result, "recent") {
+		t.Errorf("expected 'recent' in scope completions, got: %s", result)
+	}
+	// should show parameter info in detail
+	if !strings.Contains(result, "days: Int") {
+		t.Errorf("expected param info 'days: Int' in detail, got: %s", result)
+	}
+}
+
+func TestFindEnclosingApiReturnModelName(t *testing.T) {
+	doc := &Document{
+		Content: `api listPosts(): [Post] @scope()`,
+		File: &ast.File{
+			APIs: []*ast.ApiDecl{
+				{
+					Pos:  token.Position{Line: 1, Col: 1},
+					Name: "listPosts",
+					ReturnType: &ast.TypeRef{
+						Name:   "Post",
+						IsList: true,
+					},
+				},
+			},
+		},
+	}
+
+	name := findEnclosingApiReturnModelName(doc, Position{Line: 0, Character: 30})
+	if name != "Post" {
+		t.Errorf("expected 'Post', got %q", name)
+	}
+
+	// different line — should not match
+	name = findEnclosingApiReturnModelName(doc, Position{Line: 5, Character: 10})
+	if name != "" {
+		t.Errorf("expected empty, got %q", name)
+	}
+
+	// nil file
+	doc2 := &Document{Content: "test"}
+	name = findEnclosingApiReturnModelName(doc2, Position{Line: 0, Character: 0})
+	if name != "" {
+		t.Errorf("expected empty for nil file, got %q", name)
+	}
+
+	// API with no return type
+	doc3 := &Document{
+		Content: `api test() @scope()`,
+		File: &ast.File{
+			APIs: []*ast.ApiDecl{
+				{
+					Pos:  token.Position{Line: 1, Col: 1},
+					Name: "test",
+				},
+			},
+		},
+	}
+	name = findEnclosingApiReturnModelName(doc3, Position{Line: 0, Character: 15})
+	if name != "" {
+		t.Errorf("expected empty for nil return type, got %q", name)
+	}
+}
+
+// ========== Coverage: handleTextDocument — formatting method ==========
+
+func TestHandleFormattingBasic(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_fmt.luxo"
+	// open a document with poor formatting (extra spaces)
+	openDoc(server, output, uri, "model  User  {\n  name:  String\n}")
+	output.Reset()
+
+	id := json.RawMessage(`200`)
+	params, _ := json.Marshal(FormattingParams{
+		TextDocument: TextDocumentID{URI: uri},
+	})
+	server.handleMessage(&Request{
+		JSONRPC: "2.0",
+		ID:      &id,
+		Method:  "textDocument/formatting",
+		Params:  params,
+	})
+
+	resp := output.String()
+	// should return a text edit or nil (depends on formatter behavior)
+	if !strings.Contains(resp, "result") {
+		t.Errorf("expected a response for formatting, got: %s", resp)
+	}
+}
+
+func TestHandleFormattingNoDoc(t *testing.T) {
+	server, output := newTestServer()
+	id := json.RawMessage(`201`)
+	params, _ := json.Marshal(FormattingParams{
+		TextDocument: TextDocumentID{URI: "file:///nonexistent.luxo"},
+	})
+	server.handleMessage(&Request{
+		JSONRPC: "2.0",
+		ID:      &id,
+		Method:  "textDocument/formatting",
+		Params:  params,
+	})
+
+	resp := output.String()
+	if !strings.Contains(resp, "result") {
+		t.Errorf("expected null result for nonexistent doc, got: %s", resp)
+	}
+}
+
+func TestHandleFormattingInvalidParams(t *testing.T) {
+	server, output := newTestServer()
+	id := json.RawMessage(`202`)
+	server.handleMessage(&Request{
+		JSONRPC: "2.0",
+		ID:      &id,
+		Method:  "textDocument/formatting",
+		Params:  json.RawMessage(`{invalid`),
+	})
+
+	resp := output.String()
+	if !strings.Contains(resp, "error") {
+		t.Errorf("expected error for invalid params, got: %s", resp)
+	}
+}
+
+func TestHandleFormattingLexError(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_fmt_err.luxo"
+	// open with content that causes lexer error
+	openDoc(server, output, uri, "model User { name: \"unterminated\n}")
+	output.Reset()
+
+	id := json.RawMessage(`203`)
+	params, _ := json.Marshal(FormattingParams{
+		TextDocument: TextDocumentID{URI: uri},
+	})
+	server.handleMessage(&Request{
+		JSONRPC: "2.0",
+		ID:      &id,
+		Method:  "textDocument/formatting",
+		Params:  params,
+	})
+
+	resp := output.String()
+	// formatter returns error, so response should be null result
+	if !strings.Contains(resp, "result") {
+		t.Errorf("expected result for lex-error doc, got: %s", resp)
+	}
+}
+
+func TestHandleFormattingNoChange(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test_fmt_nochange.luxo"
+	// open with already-formatted content
+	openDoc(server, output, uri, "model User {\n  name: String\n}\n")
+	output.Reset()
+
+	id := json.RawMessage(`204`)
+	params, _ := json.Marshal(FormattingParams{
+		TextDocument: TextDocumentID{URI: uri},
+	})
+	server.handleMessage(&Request{
+		JSONRPC: "2.0",
+		ID:      &id,
+		Method:  "textDocument/formatting",
+		Params:  params,
+	})
+
+	resp := output.String()
+	if !strings.Contains(resp, "result") {
+		t.Errorf("expected result for already-formatted doc, got: %s", resp)
+	}
+}
+
+// ========== Coverage: handleInlayHint — invalid params ==========
+
+func TestHandleInlayHintInvalidParams(t *testing.T) {
+	server, output := newTestServer()
+	id := json.RawMessage(`210`)
+	server.handleMessage(&Request{
+		JSONRPC: "2.0",
+		ID:      &id,
+		Method:  "textDocument/inlayHint",
+		Params:  json.RawMessage(`{bad`),
+	})
+	resp := output.String()
+	if !strings.Contains(resp, "error") {
+		t.Errorf("expected error for invalid inlayHint params, got: %s", resp)
+	}
+}
+
+// ========== Coverage: handleReferences — invalid params ==========
+
+func TestHandleReferencesInvalidParams(t *testing.T) {
+	server, _ := newTestServer()
+	id := json.RawMessage(`220`)
+	// handleReferences returns the error directly (not via SendError),
+	// so we call handleMessage which logs the error internally.
+	err := server.handleMessage(&Request{
+		JSONRPC: "2.0",
+		ID:      &id,
+		Method:  "textDocument/references",
+		Params:  json.RawMessage(`{bad`),
+	})
+	// handleMessage returns nil (logs the error), but the code path is covered
+	_ = err
+}
+
+// ========== Coverage: getParamMemberCompletions — resolved type from Result ==========
+
+func TestGetParamMemberCompletionsResolvedType(t *testing.T) {
+	server, _ := newTestServer()
+	doc := &Document{
+		Content: "api test(u: User) { u. }",
+		File: &ast.File{
+			APIs: []*ast.ApiDecl{
+				{
+					Pos:  token.Position{Line: 1},
+					Name: "test",
+					Params: []*ast.ParamDecl{
+						{Name: "u", Type: &ast.TypeRef{Name: "User"}},
+					},
+				},
+			},
+		},
+		Result: &semantic.Result{
+			Types: map[string]*semantic.ResolvedType{
+				"User": {
+					Name: "User",
+					Fields: map[string]*semantic.FieldInfo{
+						"name":  {Name: "name", Type: &semantic.ResolvedType{Name: "String"}, Pos: token.Position{Line: 2}},
+						"email": {Name: "email", Type: &semantic.ResolvedType{Name: "String"}, Pos: token.Position{Line: 3}},
+					},
+				},
+			},
+		},
+	}
+	items := server.getParamMemberCompletions(doc, "u")
+	if len(items) == 0 {
+		t.Error("expected completions for param type resolved from Result")
+	}
+	foundName := false
+	for _, item := range items {
+		if item.Label == "name" {
+			foundName = true
+		}
+	}
+	if !foundName {
+		t.Error("expected 'name' in completions")
+	}
+}
+
+// ========== Coverage: getCRUDFieldHover — no matching field ==========
+
+func TestGetCRUDFieldHoverNoMatchingField(t *testing.T) {
+	doc := &Document{
+		Content: "Order.find(nonexistentField: 1)",
+		File: &ast.File{
+			Models: []*ast.ModelDecl{
+				{
+					Name: "Order",
+					Fields: []*ast.FieldDecl{
+						{Name: "status", Type: &ast.TypeRef{Name: "String"}, Pos: token.Position{Line: 2}},
+					},
+				},
+			},
+		},
+	}
+	hover := getCRUDFieldHover(doc, "nonexistentField", Position{Line: 0, Character: 12})
+	if hover != "" {
+		t.Errorf("expected empty hover for non-matching field, got: %s", hover)
+	}
+}
+
+// ========== Coverage: findMyLoadFieldDefinition — cross-file via Result.Types ==========
+
+func TestFindMyLoadFieldDefinitionCrossFile(t *testing.T) {
+	doc := &Document{
+		Content: "my.load(email)",
+		File: &ast.File{
+			Models: []*ast.ModelDecl{
+				{
+					Name: "AuthUser",
+					Directives: []*ast.Directive{
+						{Name: "withAuth"},
+					},
+					// no field named "email" in this file's AST
+				},
+			},
+		},
+		Result: &semantic.Result{
+			Types: map[string]*semantic.ResolvedType{
+				"AuthUser": {
+					Name: "AuthUser",
+					Fields: map[string]*semantic.FieldInfo{
+						"email": {Name: "email", Type: &semantic.ResolvedType{Name: "String"}, Pos: token.Position{File: "/other.luxo", Line: 5, Col: 3}},
+					},
+				},
+			},
+		},
+	}
+	pos := findMyLoadFieldDefinition(doc, "email")
+	if pos == nil {
+		t.Fatal("expected cross-file definition, got nil")
+	}
+	if pos.File != "/other.luxo" {
+		t.Errorf("expected file '/other.luxo', got %q", pos.File)
+	}
+}
+
+// ========== Coverage: scopeNameHover — scope with multiple params ==========
+
+func TestScopeNameHoverMultipleParams(t *testing.T) {
+	doc := &Document{
+		File: &ast.File{
+			Models: []*ast.ModelDecl{
+				{
+					Name: "Post",
+					Scopes: []*ast.ScopeDecl{
+						{
+							Name: "filtered",
+							Pos:  token.Position{File: "/test.luxo", Line: 3, Col: 3},
+							Params: []*ast.ParamDecl{
+								{Name: "status", Type: &ast.TypeRef{Name: "String"}},
+								{Name: "limit", Type: &ast.TypeRef{Name: "Int"}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	hover := scopeNameHover(doc, "filtered")
+	if !strings.Contains(hover, "status: String") {
+		t.Errorf("expected 'status: String' in hover, got: %s", hover)
+	}
+	if !strings.Contains(hover, ", limit: Int") {
+		t.Errorf("expected ', limit: Int' (with comma) in hover, got: %s", hover)
+	}
+}
+
+// ========== Coverage: getScopeCompletions — modelName empty ==========
+
+func TestGetScopeCompletionsNoModel(t *testing.T) {
+	server, _ := newTestServer()
+	doc := &Document{
+		Content: `api test() @scope()`,
+		File:    &ast.File{},
+	}
+	items := server.getScopeCompletions(doc, Position{Line: 0, Character: 17})
+	if items != nil {
+		t.Errorf("expected nil for no model, got: %v", items)
+	}
+}
+
+// ========== Coverage: getScopeCompletions — scope with multiple params ==========
+
+func TestGetScopeCompletionsMultipleParams(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///test/scope_mp.luxo"
+	src := `model Post {
+  title: String
+  scope range(from: Int, to: Int) = where(id >= from && id <= to)
+}
+api listPosts(): [Post] @scope()`
+
+	openDoc(server, output, uri, src)
+	output.Reset()
+
+	result := requestCompletion(server, output, uri, Position{Line: 4, Character: 31})
+	if !strings.Contains(result, "range") {
+		t.Errorf("expected 'range' in completions, got: %s", result)
+	}
+	if !strings.Contains(result, "from: Int") {
+		t.Errorf("expected param info 'from: Int' in detail, got: %s", result)
+	}
+	if !strings.Contains(result, "to: Int") {
+		t.Errorf("expected param info 'to: Int' in detail, got: %s", result)
+	}
+}
+
+// ========== Coverage: findMemberFieldDefinition — nil file/result ==========
+
+func TestFindMemberFieldDefinitionNilFileOrResult(t *testing.T) {
+	doc := &Document{Content: "obj.field"}
+	pos := findMemberFieldDefinition(doc, "field", Position{Line: 0, Character: 5})
+	if pos != nil {
+		t.Errorf("expected nil for nil file/result, got: %v", pos)
+	}
+}
+
+// ========== Coverage: findMemberFieldDefinition — empty objName ==========
+
+func TestFindMemberFieldDefinitionEmptyObj(t *testing.T) {
+	doc := &Document{
+		Content: ".field",
+		File:    &ast.File{},
+		Result:  &semantic.Result{Types: map[string]*semantic.ResolvedType{}},
+	}
+	pos := findMemberFieldDefinition(doc, "field", Position{Line: 0, Character: 2})
+	if pos != nil {
+		t.Errorf("expected nil for empty objName, got: %v", pos)
+	}
+}
+
+// ========== Coverage: findValTypeName — fn body with non-matching cursor ==========
+
+func TestFindValTypeNameFnBodyNonMatch(t *testing.T) {
+	file := &ast.File{
+		Functions: []*ast.FnDecl{
+			{
+				Pos:  token.Position{Line: 1},
+				Name: "helper",
+				Body: &ast.Block{
+					EndPos: token.Position{Line: 5},
+					Stmts: []ast.Stmt{
+						&ast.ValStmt{
+							Pos:  token.Position{Line: 2},
+							Name: "item",
+							Type: &ast.TypeRef{Name: "Product"},
+						},
+					},
+				},
+			},
+		},
+	}
+	// cursor is inside fn body but looking for a different var
+	if got := findValTypeName(file, "missing", Position{Line: 3}); got != "" {
+		t.Errorf("expected empty for missing var in fn, got %q", got)
+	}
+}
+
+// ========== Coverage: findValTypeInBlock — stmt after cursor ==========
+
+func TestFindValTypeInBlockStmtAfterCursor(t *testing.T) {
+	block := &ast.Block{
+		Stmts: []ast.Stmt{
+			&ast.ValStmt{
+				Pos:   token.Position{Line: 10},
+				Name:  "late",
+				Value: &ast.CallExpr{Func: &ast.Ident{Name: "create"}, Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "Order"}}}},
+			},
+		},
+	}
+	// cursor at line 5 (0-based=5 => AST line 6), but stmt is at AST line 10 => stmt.GetPos().Line-1=9 > 5
+	got := findValTypeInBlock(block, "late", Position{Line: 5})
+	if got != "" {
+		t.Errorf("expected empty for stmt after cursor, got %q", got)
+	}
+}
+
+// ========== Coverage: inferExprTypeName — TransactionExpr ==========
+
+func TestInferExprTypeNameTransaction(t *testing.T) {
+	expr := &ast.TransactionExpr{
+		Body: &ast.Block{
+			Stmts: []ast.Stmt{
+				&ast.ExprStmt{Expr: &ast.CallExpr{
+					Func: &ast.Ident{Name: "create"},
+					Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "Order"}}},
+				}},
+			},
+		},
+	}
+	if got := inferExprTypeName(expr); got != "Order" {
+		t.Errorf("expected 'Order' for TransactionExpr, got %q", got)
+	}
+}
+
+// ========== Coverage: findValTypeName — skips non-matching API and fn ==========
+
+func TestFindValTypeNameSkipsNonMatchingDecls(t *testing.T) {
+	file := &ast.File{
+		APIs: []*ast.ApiDecl{
+			{
+				Pos:  token.Position{Line: 1},
+				Name: "earlyApi",
+				Body: &ast.Block{
+					EndPos: token.Position{Line: 3},
+					Stmts: []ast.Stmt{
+						&ast.ValStmt{
+							Pos:  token.Position{Line: 2},
+							Name: "item",
+							Type: &ast.TypeRef{Name: "WrongType"},
+						},
+					},
+				},
+			},
+			{
+				Pos:  token.Position{Line: 10},
+				Name: "targetApi",
+				Body: &ast.Block{
+					EndPos: token.Position{Line: 15},
+					Stmts: []ast.Stmt{
+						&ast.ValStmt{
+							Pos:  token.Position{Line: 11},
+							Name: "item",
+							Type: &ast.TypeRef{Name: "CorrectType"},
+						},
+					},
+				},
+			},
+		},
+		Functions: []*ast.FnDecl{
+			{
+				Pos:  token.Position{Line: 20},
+				Name: "earlyFn",
+				Body: &ast.Block{
+					EndPos: token.Position{Line: 22},
+					Stmts: []ast.Stmt{
+						&ast.ValStmt{
+							Pos:  token.Position{Line: 21},
+							Name: "item",
+							Type: &ast.TypeRef{Name: "FnWrong"},
+						},
+					},
+				},
+			},
+			{
+				Pos:  token.Position{Line: 30},
+				Name: "targetFn",
+				Body: &ast.Block{
+					EndPos: token.Position{Line: 35},
+					Stmts: []ast.Stmt{
+						&ast.ValStmt{
+							Pos:  token.Position{Line: 31},
+							Name: "result",
+							Type: &ast.TypeRef{Name: "FnCorrect"},
+						},
+					},
+				},
+			},
+		},
+	}
+	// cursor at line 12 (0-based) = AST line 13, inside targetApi (lines 10-15), outside earlyApi (lines 1-3)
+	if got := findValTypeName(file, "item", Position{Line: 12}); got != "CorrectType" {
+		t.Errorf("expected 'CorrectType', got %q", got)
+	}
+	// cursor at line 32 (0-based) = AST line 33, inside targetFn (lines 30-35), outside earlyFn (lines 20-22)
+	if got := findValTypeName(file, "result", Position{Line: 32}); got != "FnCorrect" {
+		t.Errorf("expected 'FnCorrect', got %q", got)
+	}
+}
+
+// ========== Coverage: inferBlockTypeName — last stmt is ValStmt without type ==========
+
+func TestInferBlockTypeNameLastValNoType(t *testing.T) {
+	block := &ast.Block{
+		Stmts: []ast.Stmt{
+			&ast.ValStmt{
+				Name: "x",
+				Value: &ast.CallExpr{
+					Func: &ast.Ident{Name: "create"},
+					Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "Product"}}},
+				},
+			},
+		},
+	}
+	if got := inferBlockTypeName(block); got != "Product" {
+		t.Errorf("expected 'Product' for last ValStmt without type, got %q", got)
+	}
+}
+
+// ========== Query Method Completions Tests ==========
+
+func TestGetQueryMethodCompletions(t *testing.T) {
+	items := getQueryMethodCompletions()
+	if len(items) == 0 {
+		t.Fatal("expected query method completions")
+	}
+	// check a few known methods
+	found := map[string]bool{}
+	for _, item := range items {
+		found[item.Label] = true
+		if item.Kind != 2 {
+			t.Errorf("expected Kind=2 (Method) for %q, got %d", item.Label, item.Kind)
+		}
+	}
+	for _, name := range []string{"where", "all", "first", "find", "create", "createMany",
+		"update", "delete", "deleteMany", "orderBy", "limit", "offset",
+		"groupBy", "select", "sum", "avg", "count", "min", "max", "exists", "upsert", "paginate"} {
+		if !found[name] {
+			t.Errorf("expected query method %q in completions", name)
+		}
+	}
+}
+
+func TestMemberCompletionIncludesQueryMethods(t *testing.T) {
+	server, output := newTestServer()
+	openDoc(server, output, "file:///test.luxo", "model User { name: String }\napi test(): String {\n  val u = User.\n}")
+	resp := requestCompletion(server, output, "file:///test.luxo", Position{Line: 2, Character: 15})
+	for _, method := range []string{"where", "create", "delete", "paginate"} {
+		if !strings.Contains(resp, method) {
+			t.Errorf("expected query method %q in member completion", method)
+		}
+	}
+}
+
+// ========== CRUD Chain Method Hover Tests ==========
+
+func TestMemberMethodDescriptionCRUDChain(t *testing.T) {
+	tests := []struct {
+		word   string
+		expect bool
+	}{
+		{"where", true},
+		{"orderBy", true},
+		{"limit", true},
+		{"offset", true},
+		{"sum", true},
+		{"avg", true},
+		{"min", true},
+		{"max", true},
+		{"select", true},
+		{"fields", true},
+		{"has", true},
+	}
+	for _, tt := range tests {
+		desc := memberMethodDescription(tt.word)
+		if tt.expect && desc == "" {
+			t.Errorf("expected description for %q", tt.word)
+		}
+	}
+}
+
+// ========== findFieldInType Sealed Tests ==========
+
+func TestFindFieldInTypeSealed(t *testing.T) {
+	file := &ast.File{
+		Sealeds: []*ast.SealedDecl{
+			{
+				Name: "Result",
+				Variants: []*ast.SealedVariant{
+					{
+						Name: "Success",
+						Fields: []*ast.ParamDecl{
+							{Name: "data", Pos: token.Position{File: "test.luxo", Line: 5, Col: 3}},
+						},
+					},
+					{
+						Name: "Error",
+						Fields: []*ast.ParamDecl{
+							{Name: "message", Pos: token.Position{File: "test.luxo", Line: 8, Col: 3}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// find field by sealed type name (searches all variants)
+	pos := findFieldInType(file, "Result", "data")
+	if pos == nil {
+		t.Fatal("expected to find 'data' in sealed Result")
+	}
+	if pos.Line != 5 {
+		t.Errorf("expected line 5, got %d", pos.Line)
+	}
+
+	// find field by variant name
+	pos = findFieldInType(file, "Error", "message")
+	if pos == nil {
+		t.Fatal("expected to find 'message' in variant Error")
+	}
+	if pos.Line != 8 {
+		t.Errorf("expected line 8, got %d", pos.Line)
+	}
+
+	// not found
+	pos = findFieldInType(file, "Result", "nonexistent")
+	if pos != nil {
+		t.Error("expected nil for nonexistent field in sealed")
+	}
+
+	pos = findFieldInType(file, "UnknownSealed", "data")
+	if pos != nil {
+		t.Error("expected nil for unknown sealed type")
 	}
 }

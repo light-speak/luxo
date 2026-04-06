@@ -11,7 +11,7 @@ func TestCollectionMethodsOnList(t *testing.T) {
 	result := analyze(t, `
 model Item { name: String }
 api test(): Int {
-  val items = find(Item, where: name == "x")
+  val items = Item.find(where: name == "x")
   val mapped = items.map { it }
   val filtered = items.filter { true }
   val sz = items.size
@@ -26,7 +26,7 @@ func TestCollectionMethodSize(t *testing.T) {
 	result := analyze(t, `
 model Item { name: String }
 api test(): Int {
-  val items = find(Item, where: name == "x")
+  val items = Item.find(where: name == "x")
   items.size
 }
 `)
@@ -37,7 +37,7 @@ func TestCollectionMethodAny(t *testing.T) {
 	result := analyze(t, `
 model Item { name: String }
 api test(): Boolean {
-  val items = find(Item, where: name == "x")
+  val items = Item.find(where: name == "x")
   items.any
 }
 `)
@@ -48,7 +48,7 @@ func TestCollectionMethodFirstOrNull(t *testing.T) {
 	result := analyze(t, `
 model Item { name: String }
 api test(): Item {
-  val items = find(Item, where: name == "x")
+  val items = Item.find(where: name == "x")
   val first = items.firstOrNull
   first
 }
@@ -67,7 +67,7 @@ func TestCollectionMethodFilter(t *testing.T) {
 	result := analyze(t, `
 model Item { name: String }
 api test(): [Item] {
-  val items = find(Item, where: name == "x")
+  val items = Item.find(where: name == "x")
   items.filter { true }
 }
 `)
@@ -78,7 +78,7 @@ func TestCollectionMethodSumOf(t *testing.T) {
 	result := analyze(t, `
 model Item { price: Float }
 api test(): Float {
-  val items = find(Item, where: price > 0)
+  val items = Item.find(where: price > 0)
   items.sumOf
 }
 `)
@@ -89,7 +89,7 @@ func TestCollectionMethodJoinToString(t *testing.T) {
 	result := analyze(t, `
 model Item { name: String }
 api test(): String {
-  val items = find(Item, where: name == "x")
+  val items = Item.find(where: name == "x")
   items.joinToString
 }
 `)
@@ -100,7 +100,7 @@ func TestCollectionMethodContains(t *testing.T) {
 	result := analyze(t, `
 model Item { name: String }
 api test(): Boolean {
-  val items = find(Item, where: name == "x")
+  val items = Item.find(where: name == "x")
   items.contains
 }
 `)
@@ -111,7 +111,7 @@ func TestCollectionMethodIsEmpty(t *testing.T) {
 	result := analyze(t, `
 model Item { name: String }
 api test(): Boolean {
-  val items = find(Item, where: name == "x")
+  val items = Item.find(where: name == "x")
   items.isEmpty
 }
 `)
@@ -122,7 +122,7 @@ func TestCollectionMethodCount(t *testing.T) {
 	result := analyze(t, `
 model Item { name: String }
 api test(): Int {
-  val items = find(Item, where: name == "x")
+  val items = Item.find(where: name == "x")
   items.count
 }
 `)
@@ -133,7 +133,7 @@ func TestCollectionMethodSortBy(t *testing.T) {
 	result := analyze(t, `
 model Item { name: String }
 api test(): [Item] {
-  val items = find(Item, where: name == "x")
+  val items = Item.find(where: name == "x")
   items.sortBy
 }
 `)
@@ -144,7 +144,7 @@ func TestCollectionMethodTake(t *testing.T) {
 	result := analyze(t, `
 model Item { name: String }
 api test(): [Item] {
-  val items = find(Item, where: name == "x")
+  val items = Item.find(where: name == "x")
   items.take
 }
 `)
@@ -155,7 +155,7 @@ func TestCollectionMethodTakeLast(t *testing.T) {
 	result := analyze(t, `
 model Item { name: String }
 api test(): [Item] {
-  val items = find(Item, where: name == "x")
+  val items = Item.find(where: name == "x")
   items.takeLast
 }
 `)
@@ -166,7 +166,7 @@ func TestCollectionMethodGroupBy(t *testing.T) {
 	result := analyze(t, `
 model Item { name: String }
 api test(): Int {
-  val items = find(Item, where: name == "x")
+  val items = Item.find(where: name == "x")
   val grouped = items.groupBy
   0
 }
@@ -178,7 +178,7 @@ func TestCollectionMethodFlatMap(t *testing.T) {
 	result := analyze(t, `
 model Item { name: String }
 api test(): Int {
-  val items = find(Item, where: name == "x")
+  val items = Item.find(where: name == "x")
   val flat = items.flatMap
   0
 }
@@ -190,7 +190,7 @@ func TestCollectionMethodForEach(t *testing.T) {
 	result := analyze(t, `
 model Item { name: String }
 api test(): Int {
-  val items = find(Item, where: name == "x")
+  val items = Item.find(where: name == "x")
   items.forEach { it }
   0
 }
@@ -202,7 +202,7 @@ func TestCollectionMethodReversed(t *testing.T) {
 	result := analyze(t, `
 model Post { title: String }
 api test(): [Post] {
-  val items = find(Post, where: title == "test")
+  val items = Post.find(where: title == "test")
   items.reversed
 }
 `)
@@ -215,7 +215,7 @@ func TestCollectionMethodDistinct(t *testing.T) {
 	result := analyze(t, `
 model Post { title: String }
 api test(): [Post] {
-  val items = find(Post, where: title == "test")
+  val items = Post.find(where: title == "test")
   items.distinct
 }
 `)
@@ -228,7 +228,7 @@ func TestCollectionMethodChunked(t *testing.T) {
 	result := analyze(t, `
 model Post { title: String }
 api test(): [Post] {
-  val items = find(Post, where: title == "test")
+  val items = Post.find(where: title == "test")
   items.chunked
 }
 `)
@@ -243,7 +243,7 @@ func TestListFieldAccessNonCollectionMethod(t *testing.T) {
 	result := analyze(t, `
 model Item { name: String }
 api test(): String {
-  val items = find(Item, where: name == "x")
+  val items = Item.find(where: name == "x")
   items.name
 }
 `)
@@ -256,28 +256,22 @@ func TestFindReturnsListType(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
 api test(): [User] {
-  find(User, where: name == "x")
+  User.find(where: name == "x")
 }
 `)
 	expectNoErrors(t, result)
 }
 
-func TestFindReturnsNullable(t *testing.T) {
+func TestFindReturnsNonNullable(t *testing.T) {
+	// find by id returns non-nullable (auto-throws NotFound)
 	result := analyze(t, `
 model User { name: String }
 api test(): User {
-  val u = find(User, id: 1)
+  val u = User.find(id: 1)
   u
 }
 `)
-	// find by id returns nullable, no errors expected for the call itself
-	if len(result.Errors) > 0 {
-		for _, err := range result.Errors {
-			if !strings.Contains(err.Message, "undefined") {
-				t.Errorf("unexpected error: %v", err)
-			}
-		}
-	}
+	expectNoErrors(t, result)
 }
 
 // CRUD operations should inject model fields into scope and return model type
@@ -288,7 +282,7 @@ model User {
   email: String
 }
 api test(): User {
-  val user = find(User, where: email == "test@test.com")
+  val user = User.find(where: email == "test@test.com")
   user
 }
 `)
@@ -302,7 +296,7 @@ model User {
   email: String
 }
 api test(): User {
-  val user = create(User, name: "lin", email: "test@test.com")
+  val user = User.create(name: "lin", email: "test@test.com")
   user.name
   user
 }
@@ -317,8 +311,8 @@ model Post {
   status: String
 }
 api test(): Post {
-  val post = find(Post, where: title == "hello")
-  update(post, status: "published")
+  val post = Post.find(where: title == "hello")
+  post.update(status: "published")
   post
 }
 `)

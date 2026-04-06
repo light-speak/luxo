@@ -49,7 +49,7 @@ func TestParseApiWithDirectives(t *testing.T) {
 
 func TestParseApiWithBody(t *testing.T) {
 	input := `api register(input: RegisterInput): AuthResult {
-  val user = create(User, name: input.name)
+  val user = User.create(name: input.name)
   return user
 }`
 	file := parse(t, input)
@@ -101,7 +101,7 @@ func TestParseApiDefaultParam(t *testing.T) {
 }
 
 func TestParseApiStream(t *testing.T) {
-	input := `api watchComments(postId: Int): stream Comment`
+	input := `api watchComments(postId: Int): Comment @stream`
 	file := parse(t, input)
 
 	if len(file.APIs) != 1 {
@@ -111,8 +111,11 @@ func TestParseApiStream(t *testing.T) {
 	if api.Name != "watchComments" {
 		t.Errorf("expected 'watchComments', got %q", api.Name)
 	}
-	if api.ReturnType.Name != "stream Comment" {
-		t.Errorf("expected 'stream Comment', got %q", api.ReturnType.Name)
+	if api.ReturnType.Name != "Comment" {
+		t.Errorf("expected return type 'Comment', got %q", api.ReturnType.Name)
+	}
+	if len(api.Directives) != 1 || api.Directives[0].Name != "stream" {
+		t.Errorf("expected @stream directive, got %v", api.Directives)
 	}
 	if len(api.Params) != 1 {
 		t.Errorf("expected 1 param, got %d", len(api.Params))
@@ -184,21 +187,26 @@ func TestParseOverrideApi(t *testing.T) {
 }
 
 func TestParseStreamReturnType(t *testing.T) {
-	input := `api watchComments(postId: Int): stream Comment`
+	input := `api watchComments(postId: Int): Comment @stream`
 	file := parse(t, input)
 	api := file.APIs[0]
 
-	if api.ReturnType.Name != "stream Comment" {
-		t.Errorf("expected 'stream Comment', got %q", api.ReturnType.Name)
+	if api.ReturnType.Name != "Comment" {
+		t.Errorf("expected return type 'Comment', got %q", api.ReturnType.Name)
+	}
+	if len(api.Directives) != 1 || api.Directives[0].Name != "stream" {
+		t.Errorf("expected @stream directive")
 	}
 }
 
-func TestParseStreamType(t *testing.T) {
-	// Already partially covered by TestParseStreamReturnType, but cover parseTypeRef stream branch
-	input := `api watch(): stream Event`
+func TestParseStreamAnnotation(t *testing.T) {
+	input := `api watch(): Event @stream`
 	file := parse(t, input)
 	api := file.APIs[0]
-	if api.ReturnType.Name != "stream Event" {
-		t.Errorf("expected 'stream Event', got %q", api.ReturnType.Name)
+	if api.ReturnType.Name != "Event" {
+		t.Errorf("expected return type 'Event', got %q", api.ReturnType.Name)
+	}
+	if len(api.Directives) != 1 || api.Directives[0].Name != "stream" {
+		t.Errorf("expected @stream directive")
 	}
 }

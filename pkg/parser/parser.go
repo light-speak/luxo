@@ -33,6 +33,12 @@ func (e Error) Error() string {
 	return fmt.Sprintf("%s: %s", e.Pos, e.Message)
 }
 
+// bailout is a sentinel used for panic-based error recovery.
+// When the parser encounters an unexpected token during a declaration,
+// it panics with bailout so the top-level loop can recover and
+// synchronize to the next declaration boundary.
+type bailout struct{}
+
 // Parser parses a token stream into an AST.
 type Parser struct {
 	tokens        []token.Token
@@ -52,10 +58,55 @@ func (p *Parser) Parse(filename string) (*ast.File, []Error) {
 	file := &ast.File{Name: filename}
 
 	for !p.isEOF() {
-		p.parseTopLevel(file)
+		p.parseTopLevelRecover(file)
 	}
 
 	return file, p.errors
+}
+
+// parseTopLevelRecover wraps parseTopLevel with panic recovery.
+// When a declaration parse fails (via bailout panic), it catches the
+// panic and synchronizes to the next top-level keyword so that
+// subsequent valid declarations can still be parsed.
+func (p *Parser) parseTopLevelRecover(file *ast.File) {
+	defer func() {
+		if r := recover(); r != nil {
+			if _, ok := r.(bailout); !ok {
+				panic(r) // re-panic for unexpected errors
+			}
+			p.synchronize()
+		}
+	}()
+	p.parseTopLevel(file)
+}
+
+// isTopLevelKeyword reports whether typ is a keyword that can start
+// a top-level declaration.
+func isTopLevelKeyword(typ token.Type) bool {
+	switch typ {
+	case token.Model, token.Interface, token.Enum, token.Sealed,
+		token.KwType, token.Api, token.Fn, token.Error,
+		token.Event, token.On, token.Middleware, token.Extend,
+		token.Override, token.Use, token.Val, token.Var:
+		return true
+	}
+	return false
+}
+
+// synchronize advances tokens until the parser reaches a top-level
+// declaration boundary, allowing parsing to continue after an error.
+func (p *Parser) synchronize() {
+	for !p.isEOF() {
+		// If current token is a top-level keyword, we can resume here.
+		if isTopLevelKeyword(p.current().Type) {
+			return
+		}
+		// Also treat DocComment before a top-level keyword as a boundary.
+		if p.current().Type == token.DocComment {
+			return
+		}
+		p.advance()
+	}
 }
 
 // parseTopLevel parses one top-level declaration and appends it to the file.
@@ -612,7 +663,18 @@ func (p *Parser) parseScope() *ast.ScopeDecl {
 		Name: p.expectIdent(),
 	}
 
-	scope.Body = p.parseBlock()
+	// Optional parameters: scope recent(days: Int) { ... }
+	if p.match(token.LParen) {
+		for !p.check(token.RParen) && !p.isEOF() {
+			scope.Params = append(scope.Params, p.parseParam())
+			p.match(token.Comma)
+		}
+		p.expect(token.RParen)
+	}
+
+	// Parse scope expression: = expr
+	p.expect(token.Assign)
+	scope.Expr = p.parseExpr(precNone)
 	return scope
 }
 
@@ -676,7 +738,8 @@ func (p *Parser) parseComputedField() *ast.FieldDecl {
 }
 
 func (p *Parser) parseParam() *ast.ParamDecl {
-	param := &ast.ParamDecl{Pos: p.current().Pos}
+	p.consumeDoc()
+	param := &ast.ParamDecl{Pos: p.current().Pos, Doc: p.takeDoc()}
 	if p.match(token.DotDotDot) {
 		param.Spread = true
 	}
@@ -717,20 +780,9 @@ func (p *Parser) parseTypeRef() *ast.TypeRef {
 		return ref
 	}
 
-	// stream keyword before type
-	isStream := false
-	if p.check(token.Stream) {
-		isStream = true
-		p.advance()
-	}
-
 	ref := &ast.TypeRef{
 		Pos:  pos,
 		Name: p.expectIdent(),
-	}
-
-	if isStream {
-		ref.Name = "stream " + ref.Name
 	}
 
 	// Generic args: Page<User>
@@ -803,7 +855,12 @@ func (p *Parser) parseDirective() *ast.Directive {
 				arg.Name = p.expectIdent()
 				p.expect(token.Colon)
 			}
-			arg.Value = p.parseExpr(precNone)
+			// lambda body for permission: { expr }
+			if p.check(token.LBrace) {
+				arg.Value = p.parseLambdaExpr()
+			} else {
+				arg.Value = p.parseExpr(precNone)
+			}
 			dir.Args = append(dir.Args, arg)
 			p.match(token.Comma)
 		}
@@ -820,6 +877,24 @@ func (p *Parser) parseDirective() *ast.Directive {
 }
 
 // ========== Block ==========
+
+// parseLambdaExpr parses a lambda expression: { body } or { params -> body }.
+// The opening { must be the current token.
+func (p *Parser) parseLambdaExpr() *ast.LambdaExpr {
+	pos := p.current().Pos
+	p.expect(token.LBrace)
+	params := p.tryParseLambdaParams()
+	block := &ast.Block{Pos: pos}
+	for !p.check(token.RBrace) && !p.isEOF() {
+		stmt := p.parseStmt()
+		if stmt != nil {
+			block.Stmts = append(block.Stmts, stmt)
+		}
+	}
+	block.EndPos = p.current().Pos
+	p.expect(token.RBrace)
+	return &ast.LambdaExpr{Pos: pos, Params: params, Body: block}
+}
 
 func (p *Parser) parseBlock() *ast.Block {
 	pos := p.current().Pos
@@ -855,6 +930,10 @@ func (p *Parser) parseStmt() ast.Stmt {
 		pos := p.current().Pos
 		p.advance()
 		return &ast.BreakStmt{Pos: pos}
+	case p.check(token.Continue):
+		pos := p.current().Pos
+		p.advance()
+		return &ast.ContinueStmt{Pos: pos}
 	case p.check(token.Emit):
 		return p.parseEmitStmt()
 	case p.check(token.Ident) && p.isAssignOp(p.peekType()):
@@ -935,6 +1014,7 @@ func (p *Parser) parseValStmt() *ast.ValStmt {
 		}
 		p.expect(token.RParen)
 	} else {
+		stmt.NamePos = p.current().Pos
 		stmt.Name = p.expectIdent()
 	}
 
@@ -1044,6 +1124,9 @@ func (p *Parser) parsePrefixExpr() ast.Expr {
 		p.check(token.Null):
 		return p.parseLiteral(pos)
 
+	case p.check(token.StringStart):
+		return p.parseTemplateString(pos)
+
 	case p.check(token.My):
 		tok := p.advance()
 		return &ast.Ident{Pos: pos, Name: tok.Val}
@@ -1123,6 +1206,42 @@ func (p *Parser) parseConcurrencyExpr(pos token.Position) ast.Expr {
 	}
 }
 
+// parseTemplateString parses a string template: "text ${expr} more ${expr} end"
+// Tokens arrive as: StringStart, expr..., StringMid, expr..., StringEnd
+func (p *Parser) parseTemplateString(pos token.Position) ast.Expr {
+	tmpl := &ast.TemplateString{Pos: pos}
+
+	// StringStart: "text ${"
+	start := p.advance()
+	if start.Val != "" {
+		tmpl.Parts = append(tmpl.Parts, &ast.Literal{Pos: start.Pos, Kind: token.String, Value: start.Val})
+	}
+
+	// Parse the first interpolated expression
+	tmpl.Parts = append(tmpl.Parts, p.parseExpr(0))
+
+	// Loop: StringMid or StringEnd
+	for p.check(token.StringMid) {
+		mid := p.advance()
+		if mid.Val != "" {
+			tmpl.Parts = append(tmpl.Parts, &ast.Literal{Pos: mid.Pos, Kind: token.String, Value: mid.Val})
+		}
+		tmpl.Parts = append(tmpl.Parts, p.parseExpr(0))
+	}
+
+	// StringEnd: "} text"
+	if p.check(token.StringEnd) {
+		end := p.advance()
+		if end.Val != "" {
+			tmpl.Parts = append(tmpl.Parts, &ast.Literal{Pos: end.Pos, Kind: token.String, Value: end.Val})
+		}
+	} else {
+		p.error("expected end of template string")
+	}
+
+	return tmpl
+}
+
 // parseLiteral parses a literal expression (Int, Float, String, Duration, True, False, Null).
 func (p *Parser) parseLiteral(pos token.Position) ast.Expr {
 	switch {
@@ -1164,12 +1283,12 @@ func (p *Parser) parseInfixExpr(left ast.Expr) ast.Expr {
 		if p.check(token.LParen) {
 			return p.parseCallArgs(pos, member)
 		}
-		// Lambda call: items.map { it.name }
+		// Lambda call: items.map { it.name } or items.map { x -> x.name }
 		if p.check(token.LBrace) {
 			return &ast.CallExpr{
 				Pos:  pos,
 				Func: member,
-				Args: []*ast.NamedArg{{Value: &ast.LambdaExpr{Pos: pos, Body: p.parseBlock()}}},
+				Args: []*ast.NamedArg{{Value: p.parseLambdaExpr()}},
 			}
 		}
 		return member
@@ -1189,12 +1308,12 @@ func (p *Parser) parseInfixExpr(left ast.Expr) ast.Expr {
 	case p.check(token.LParen):
 		return p.parseCallArgs(pos, left)
 
-	// Trailing lambda: items.filter { it.active }
+	// Trailing lambda: items.filter { it.active } or { x -> x.active }
 	case p.check(token.LBrace) && p.isCallable(left):
 		return &ast.CallExpr{
 			Pos:  pos,
 			Func: left,
-			Args: []*ast.NamedArg{{Value: &ast.LambdaExpr{Pos: pos, Body: p.parseBlock()}}},
+			Args: []*ast.NamedArg{{Value: p.parseLambdaExpr()}},
 		}
 
 	// Elvis: expr ?: fallback
@@ -1251,10 +1370,11 @@ func (p *Parser) parseCallArgs(pos token.Position, fn ast.Expr) *ast.CallExpr {
 	}
 	p.expect(token.RParen)
 
-	// trailing lambda: find(User, id: 1) { ... }
-	if p.check(token.LBrace) {
+	// trailing lambda: find(User, id: 1) { ... } or { x -> ... }
+	// but NOT inside if/for conditions (noBraceLambda flag)
+	if p.check(token.LBrace) && !p.noBraceLambda {
 		call.Args = append(call.Args, &ast.NamedArg{
-			Value: &ast.LambdaExpr{Pos: p.current().Pos, Body: p.parseBlock()},
+			Value: p.parseLambdaExpr(),
 		})
 	}
 
@@ -1317,7 +1437,7 @@ func (p *Parser) parseWhenExpr(pos token.Position) ast.Expr {
 
 func (p *Parser) parseWhenBody() ast.Expr {
 	if p.check(token.LBrace) {
-		return &ast.LambdaExpr{Pos: p.current().Pos, Body: p.parseBlock()}
+		return p.parseLambdaExpr()
 	}
 	return p.parseWhenCondition() // stop before next branch keyword (in/is/else)
 }
@@ -1399,7 +1519,11 @@ func (p *Parser) parseConditionExpr() ast.Expr {
 		return nil
 	}
 	for p.currentPrec() > precNone && !p.check(token.LBrace) {
+		startPos := p.pos
 		left = p.parseInfixExpr(left)
+		if p.pos == startPos {
+			break // guard against infinite loop
+		}
 	}
 	return left
 }
@@ -1503,7 +1627,7 @@ func (p *Parser) isKeywordUsedAsIdent() bool {
 	// some keywords can be used as identifiers in certain contexts
 	// e.g., field names: find, create, update, delete, error, etc.
 	switch p.current().Type {
-	case token.Error, token.Stream:
+	case token.Error:
 		return true
 	}
 	return false
@@ -1563,9 +1687,7 @@ func (p *Parser) expect(typ token.Type) token.Token {
 		return p.advance()
 	}
 	p.error("expected %s, got %s", typ, p.current().Type)
-	tok := p.current()
-	p.advance() // consume bad token to prevent infinite loop
-	return tok
+	panic(bailout{})
 }
 
 func (p *Parser) expectIdent() string {
@@ -1573,8 +1695,7 @@ func (p *Parser) expectIdent() string {
 		return p.advance().Val
 	}
 	p.error("expected identifier, got %s", p.current().Type)
-	p.advance() // consume bad token to prevent infinite loop
-	return ""
+	panic(bailout{})
 }
 
 func (p *Parser) isEOF() bool {

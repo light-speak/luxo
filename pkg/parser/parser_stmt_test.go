@@ -11,7 +11,7 @@ import (
 func TestParseForStmt(t *testing.T) {
 	input := `api test(): Int {
   for item in items {
-    update(item, status: "done")
+    item.update(status: "done")
   }
   return 0
 }`
@@ -91,7 +91,7 @@ func TestParseValWithType(t *testing.T) {
 
 func TestStatementBoundaryAfterCall(t *testing.T) {
 	input := `api test(): Int {
-  val x = create(User, name: "test")
+  val x = User.create(name: "test")
   val y = 42
   y
 }`
@@ -131,7 +131,7 @@ func TestStatementBoundaryAfterObjectExpr(t *testing.T) {
 
 func TestStatementBoundaryCreateThenObjectExpr(t *testing.T) {
 	input := `api test(): Int {
-  val user = create(User, name: "test")
+  val user = User.create(name: "test")
   AuthResult { token: "abc", user: user }
 }`
 	file := parse(t, input)
@@ -340,14 +340,23 @@ func TestPeekSingleToken(t *testing.T) {
 }
 
 // Test expectIdent error path: when a non-ident, non-keyword token is at current position.
+// expectIdent panics with bailout for error recovery; verify the error is recorded.
 func TestExpectIdentErrorPathDirect(t *testing.T) {
 	p := New([]token.Token{
 		{Type: token.Int, Val: "42"},
 		{Type: token.EOF},
 	})
-	result := p.expectIdent()
-	if result != "" {
-		t.Errorf("expected empty string from expectIdent error, got %q", result)
+	panicked := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked = true
+			}
+		}()
+		p.expectIdent()
+	}()
+	if !panicked {
+		t.Error("expected expectIdent to panic with bailout")
 	}
 	if len(p.errors) == 0 {
 		t.Error("expected error from expectIdent")
@@ -423,9 +432,7 @@ func TestParseMemberAssignStmt(t *testing.T) {
 func TestParseModelScope(t *testing.T) {
 	input := `model Post {
   title: String
-  scope published {
-    val x = 1
-  }
+  scope published = where(status == "PUBLISHED")
 }`
 	file := parse(t, input)
 	model := file.Models[0]

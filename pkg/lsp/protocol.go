@@ -51,11 +51,13 @@ type ServerInfo struct {
 }
 
 type ServerCapabilities struct {
-	TextDocumentSync   int            `json:"textDocumentSync"` // 1=Full, 2=Incremental
-	CompletionProvider *CompletionOpt `json:"completionProvider,omitempty"`
-	HoverProvider      bool           `json:"hoverProvider"`
-	DefinitionProvider bool           `json:"definitionProvider"`
-	ReferencesProvider bool           `json:"referencesProvider"`
+	TextDocumentSync           int            `json:"textDocumentSync"` // 1=Full, 2=Incremental
+	CompletionProvider         *CompletionOpt `json:"completionProvider,omitempty"`
+	HoverProvider              bool           `json:"hoverProvider"`
+	DefinitionProvider         bool           `json:"definitionProvider"`
+	ReferencesProvider         bool           `json:"referencesProvider"`
+	DocumentFormattingProvider bool           `json:"documentFormattingProvider"`
+	InlayHintProvider          bool           `json:"inlayHintProvider"`
 }
 
 type CompletionOpt struct {
@@ -180,4 +182,30 @@ type DefinitionParams struct {
 type ReferenceParams struct {
 	TextDocument TextDocumentID `json:"textDocument"`
 	Position     Position       `json:"position"`
+}
+
+// ========== Formatting ==========
+
+type FormattingParams struct {
+	TextDocument TextDocumentID `json:"textDocument"`
+}
+
+type TextEdit struct {
+	Range   Range  `json:"range"`
+	NewText string `json:"newText"`
+}
+
+// ========== Inlay Hints ==========
+
+type InlayHintParams struct {
+	TextDocument TextDocumentID `json:"textDocument"`
+	Range        Range          `json:"range"`
+}
+
+type InlayHint struct {
+	Position     Position `json:"position"`
+	Label        string   `json:"label"`
+	Kind         int      `json:"kind"` // 1=Type, 2=Parameter
+	Tooltip      string   `json:"tooltip,omitempty"`
+	PaddingRight bool     `json:"paddingRight,omitempty"`
 }

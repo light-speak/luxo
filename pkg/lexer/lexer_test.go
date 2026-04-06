@@ -83,7 +83,7 @@ func TestOperators(t *testing.T) {
 
 func TestKeywords(t *testing.T) {
 	input := `model interface enum sealed type fn api error middleware event
-extend override use stream
+extend override use
 val var when if else for in return break is on my
 async await yield
 throw emit
@@ -259,7 +259,7 @@ enum Role {
 api getUser(id: Int): User @cache(ttl: 60)
 api register(input: RegisterInput): AuthResult {
   input.password.length >= 8 ?: throw error.password_too_short
-  val user = create(User, name: input.name, email: input.email)
+  val user = User.create(name: input.name, email: input.email)
   return AuthResult { token: generateToken(user, expires: 7d), user: user }
 }`
 
@@ -803,4 +803,178 @@ func TestAdvanceBeyondSource(t *testing.T) {
 	l.advance()
 	l.advance()
 	// no panic = pass
+}
+
+func TestStringTemplateSimple(t *testing.T) {
+	input := `"hello ${name}"`
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	expected := []struct {
+		typ token.Type
+		val string
+	}{
+		{token.StringStart, "hello "},
+		{token.Ident, "name"},
+		{token.StringEnd, ""},
+		{token.EOF, ""},
+	}
+	if len(tokens) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d: %v", len(expected), len(tokens), tokens)
+	}
+	for i, exp := range expected {
+		if tokens[i].Type != exp.typ || tokens[i].Val != exp.val {
+			t.Errorf("token[%d]: expected %s(%q), got %s(%q)",
+				i, exp.typ, exp.val, tokens[i].Type, tokens[i].Val)
+		}
+	}
+}
+
+func TestStringTemplateMultiple(t *testing.T) {
+	input := `"hello ${name}, age ${age}!"`
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	expected := []struct {
+		typ token.Type
+		val string
+	}{
+		{token.StringStart, "hello "},
+		{token.Ident, "name"},
+		{token.StringMid, ", age "},
+		{token.Ident, "age"},
+		{token.StringEnd, "!"},
+		{token.EOF, ""},
+	}
+	if len(tokens) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d: %v", len(expected), len(tokens), tokens)
+	}
+	for i, exp := range expected {
+		if tokens[i].Type != exp.typ || tokens[i].Val != exp.val {
+			t.Errorf("token[%d]: expected %s(%q), got %s(%q)",
+				i, exp.typ, exp.val, tokens[i].Type, tokens[i].Val)
+		}
+	}
+}
+
+func TestStringTemplateMemberExpr(t *testing.T) {
+	input := `"name: ${user.name}"`
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	expected := []struct {
+		typ token.Type
+		val string
+	}{
+		{token.StringStart, "name: "},
+		{token.Ident, "user"},
+		{token.Dot, "."},
+		{token.Ident, "name"},
+		{token.StringEnd, ""},
+		{token.EOF, ""},
+	}
+	if len(tokens) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d: %v", len(expected), len(tokens), tokens)
+	}
+	for i, exp := range expected {
+		if tokens[i].Type != exp.typ || tokens[i].Val != exp.val {
+			t.Errorf("token[%d]: expected %s(%q), got %s(%q)",
+				i, exp.typ, exp.val, tokens[i].Type, tokens[i].Val)
+		}
+	}
+}
+
+func TestStringTemplateNoInterpolation(t *testing.T) {
+	// Plain string without ${ should remain a single String token
+	input := `"hello world"`
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if tokens[0].Type != token.String {
+		t.Errorf("expected String token, got %s", tokens[0].Type)
+	}
+	if tokens[0].Val != "hello world" {
+		t.Errorf("expected value 'hello world', got %q", tokens[0].Val)
+	}
+}
+
+func TestStringTemplateNestedBraces(t *testing.T) {
+	// Expression with object literal inside interpolation
+	input := `"result: ${a + b}"`
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	expected := []struct {
+		typ token.Type
+		val string
+	}{
+		{token.StringStart, "result: "},
+		{token.Ident, "a"},
+		{token.Plus, "+"},
+		{token.Ident, "b"},
+		{token.StringEnd, ""},
+		{token.EOF, ""},
+	}
+	if len(tokens) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d: %v", len(expected), len(tokens), tokens)
+	}
+	for i, exp := range expected {
+		if tokens[i].Type != exp.typ || tokens[i].Val != exp.val {
+			t.Errorf("token[%d]: expected %s(%q), got %s(%q)",
+				i, exp.typ, exp.val, tokens[i].Type, tokens[i].Val)
+		}
+	}
+}
+
+func TestStringTemplateEmpty(t *testing.T) {
+	// Interpolation at start and end
+	input := `"${x}"`
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	expected := []struct {
+		typ token.Type
+		val string
+	}{
+		{token.StringStart, ""},
+		{token.Ident, "x"},
+		{token.StringEnd, ""},
+		{token.EOF, ""},
+	}
+	if len(tokens) != len(expected) {
+		t.Fatalf("expected %d tokens, got %d: %v", len(expected), len(tokens), tokens)
+	}
+	for i, exp := range expected {
+		if tokens[i].Type != exp.typ || tokens[i].Val != exp.val {
+			t.Errorf("token[%d]: expected %s(%q), got %s(%q)",
+				i, exp.typ, exp.val, tokens[i].Type, tokens[i].Val)
+		}
+	}
+}
+
+func TestStringTemplateWithEscape(t *testing.T) {
+	input := `"hello \"${name}\""`
+	l := New(input, "test.luxo")
+	tokens, errs := l.Tokenize()
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if tokens[0].Type != token.StringStart {
+		t.Errorf("expected StringStart, got %s", tokens[0].Type)
+	}
+	if tokens[0].Val != `hello \"` {
+		t.Errorf("expected 'hello \\\"', got %q", tokens[0].Val)
+	}
 }

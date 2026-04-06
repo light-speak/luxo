@@ -342,9 +342,7 @@ func TestParseError(t *testing.T) {
 func TestParseScope(t *testing.T) {
 	input := `model Post : Base {
   status: String
-  scope published {
-    val x = 1
-  }
+  scope published = where(status == "PUBLISHED")
 }`
 	file := parse(t, input)
 	m := file.Models[0]
@@ -354,6 +352,9 @@ func TestParseScope(t *testing.T) {
 	}
 	if m.Scopes[0].Name != "published" {
 		t.Errorf("expected 'published', got %q", m.Scopes[0].Name)
+	}
+	if m.Scopes[0].Expr == nil {
+		t.Fatal("expected non-nil Expr")
 	}
 }
 
@@ -379,9 +380,9 @@ api getUser(id: Int): User @cache(ttl: 60)
 
 api register(input: RegisterInput): AuthResult {
   input.password.length >= 8 ?: throw error.password_too_short
-  val exists = find(User, where: email == input.email)
+  val exists = User.find(where: email == input.email)
   exists == null ?: throw error.email_exists
-  val user = create(User, name: input.name, email: input.email, password: input.password)
+  val user = User.create(name: input.name, email: input.email, password: input.password)
   val tok = generateToken(user, expires: 7d)
   return AuthResult { token: tok, user: user }
 }
@@ -807,6 +808,198 @@ func TestParseExprUnexpectedTokenInVal(t *testing.T) {
 	}
 }
 
+// ========== Template String Tests ==========
+
+func TestParseTemplateStringSimple(t *testing.T) {
+	input := `api test(): String {
+  val x = "hello ${name}"
+  x
+}`
+	file := parse(t, input)
+	body := file.APIs[0].Body
+	valStmt := body.Stmts[0].(*ast.ValStmt)
+	tmpl, ok := valStmt.Value.(*ast.TemplateString)
+	if !ok {
+		t.Fatalf("expected TemplateString, got %T", valStmt.Value)
+	}
+	if len(tmpl.Parts) != 2 {
+		t.Fatalf("expected 2 parts, got %d", len(tmpl.Parts))
+	}
+	// Part 0: string literal "hello "
+	lit, ok := tmpl.Parts[0].(*ast.Literal)
+	if !ok {
+		t.Fatalf("part[0]: expected Literal, got %T", tmpl.Parts[0])
+	}
+	if lit.Value != "hello " {
+		t.Errorf("part[0]: expected 'hello ', got %q", lit.Value)
+	}
+	// Part 1: ident "name"
+	ident, ok := tmpl.Parts[1].(*ast.Ident)
+	if !ok {
+		t.Fatalf("part[1]: expected Ident, got %T", tmpl.Parts[1])
+	}
+	if ident.Name != "name" {
+		t.Errorf("part[1]: expected 'name', got %q", ident.Name)
+	}
+}
+
+func TestParseTemplateStringMultiple(t *testing.T) {
+	input := `api test(): String {
+  val x = "hello ${name}, age ${age}!"
+  x
+}`
+	file := parse(t, input)
+	body := file.APIs[0].Body
+	valStmt := body.Stmts[0].(*ast.ValStmt)
+	tmpl, ok := valStmt.Value.(*ast.TemplateString)
+	if !ok {
+		t.Fatalf("expected TemplateString, got %T", valStmt.Value)
+	}
+	// "hello " + name + ", age " + age + "!" = 5 parts
+	if len(tmpl.Parts) != 5 {
+		t.Fatalf("expected 5 parts, got %d", len(tmpl.Parts))
+	}
+	// Part 0: "hello "
+	if lit, ok := tmpl.Parts[0].(*ast.Literal); !ok || lit.Value != "hello " {
+		t.Errorf("part[0]: expected Literal 'hello ', got %T %v", tmpl.Parts[0], tmpl.Parts[0])
+	}
+	// Part 1: ident name
+	if id, ok := tmpl.Parts[1].(*ast.Ident); !ok || id.Name != "name" {
+		t.Errorf("part[1]: expected Ident 'name', got %T", tmpl.Parts[1])
+	}
+	// Part 2: ", age "
+	if lit, ok := tmpl.Parts[2].(*ast.Literal); !ok || lit.Value != ", age " {
+		t.Errorf("part[2]: expected Literal ', age ', got %T %v", tmpl.Parts[2], tmpl.Parts[2])
+	}
+	// Part 3: ident age
+	if id, ok := tmpl.Parts[3].(*ast.Ident); !ok || id.Name != "age" {
+		t.Errorf("part[3]: expected Ident 'age', got %T", tmpl.Parts[3])
+	}
+	// Part 4: "!"
+	if lit, ok := tmpl.Parts[4].(*ast.Literal); !ok || lit.Value != "!" {
+		t.Errorf("part[4]: expected Literal '!', got %T %v", tmpl.Parts[4], tmpl.Parts[4])
+	}
+}
+
+func TestParseTemplateStringExpr(t *testing.T) {
+	input := `api test(): String {
+  val x = "result: ${a + b}"
+  x
+}`
+	file := parse(t, input)
+	body := file.APIs[0].Body
+	valStmt := body.Stmts[0].(*ast.ValStmt)
+	tmpl, ok := valStmt.Value.(*ast.TemplateString)
+	if !ok {
+		t.Fatalf("expected TemplateString, got %T", valStmt.Value)
+	}
+	if len(tmpl.Parts) != 2 {
+		t.Fatalf("expected 2 parts, got %d", len(tmpl.Parts))
+	}
+	// Part 0: "result: "
+	lit, ok := tmpl.Parts[0].(*ast.Literal)
+	if !ok {
+		t.Fatalf("part[0]: expected Literal, got %T", tmpl.Parts[0])
+	}
+	if lit.Value != "result: " {
+		t.Errorf("part[0]: expected 'result: ', got %q", lit.Value)
+	}
+	// Part 1: BinaryExpr (a + b)
+	binExpr, ok := tmpl.Parts[1].(*ast.BinaryExpr)
+	if !ok {
+		t.Fatalf("part[1]: expected BinaryExpr, got %T", tmpl.Parts[1])
+	}
+	if binExpr.Op != "+" {
+		t.Errorf("part[1]: expected op '+', got %q", binExpr.Op)
+	}
+}
+
+// ========== Scope with Params Tests ==========
+
+func TestParseScopeWithParams(t *testing.T) {
+	input := `model Post : Base {
+  status: String
+  scope recent(days: Int) = where(createdAt > days)
+}`
+	file := parse(t, input)
+	m := file.Models[0]
+	if len(m.Scopes) != 1 {
+		t.Fatalf("expected 1 scope, got %d", len(m.Scopes))
+	}
+	s := m.Scopes[0]
+	if s.Name != "recent" {
+		t.Errorf("expected scope name 'recent', got %q", s.Name)
+	}
+	if len(s.Params) != 1 {
+		t.Fatalf("expected 1 param, got %d", len(s.Params))
+	}
+	if s.Params[0].Name != "days" {
+		t.Errorf("expected param name 'days', got %q", s.Params[0].Name)
+	}
+	if s.Params[0].Type.Name != "Int" {
+		t.Errorf("expected param type 'Int', got %q", s.Params[0].Type.Name)
+	}
+	if s.Expr == nil {
+		t.Fatal("expected non-nil Expr")
+	}
+}
+
+func TestParseScopeWithoutParams(t *testing.T) {
+	input := `model Post : Base {
+  status: String
+  scope published = where(status == "PUBLISHED")
+}`
+	file := parse(t, input)
+	m := file.Models[0]
+	if len(m.Scopes) != 1 {
+		t.Fatalf("expected 1 scope, got %d", len(m.Scopes))
+	}
+	s := m.Scopes[0]
+	if s.Name != "published" {
+		t.Errorf("expected scope name 'published', got %q", s.Name)
+	}
+	if len(s.Params) != 0 {
+		t.Errorf("expected 0 params, got %d", len(s.Params))
+	}
+	if s.Expr == nil {
+		t.Fatal("expected non-nil Expr")
+	}
+}
+
+func TestParseScopeMultipleParams(t *testing.T) {
+	input := `model Post : Base {
+  status: String
+  scope between(start: DateTime, end: DateTime) = where(createdAt > start)
+}`
+	file := parse(t, input)
+	m := file.Models[0]
+	if len(m.Scopes) != 1 {
+		t.Fatalf("expected 1 scope, got %d", len(m.Scopes))
+	}
+	s := m.Scopes[0]
+	if s.Name != "between" {
+		t.Errorf("expected scope name 'between', got %q", s.Name)
+	}
+	if len(s.Params) != 2 {
+		t.Fatalf("expected 2 params, got %d", len(s.Params))
+	}
+	if s.Params[0].Name != "start" {
+		t.Errorf("expected param[0] name 'start', got %q", s.Params[0].Name)
+	}
+	if s.Params[0].Type.Name != "DateTime" {
+		t.Errorf("expected param[0] type 'DateTime', got %q", s.Params[0].Type.Name)
+	}
+	if s.Params[1].Name != "end" {
+		t.Errorf("expected param[1] name 'end', got %q", s.Params[1].Name)
+	}
+	if s.Params[1].Type.Name != "DateTime" {
+		t.Errorf("expected param[1] type 'DateTime', got %q", s.Params[1].Type.Name)
+	}
+	if s.Expr == nil {
+		t.Fatal("expected non-nil Expr")
+	}
+}
+
 // Test nullable list type [Post]? in parseTypeRef.
 func TestParseNullableListTypeRef(t *testing.T) {
 	input := `extend User {
@@ -820,5 +1013,99 @@ func TestParseNullableListTypeRef(t *testing.T) {
 	}
 	if !f.Type.Nullable {
 		t.Error("expected nullable list")
+	}
+}
+
+func TestParseParamDocComment(t *testing.T) {
+	t.Run("api param doc comment", testApiParamDocComment)
+	t.Run("fn param doc comment", testFnParamDocComment)
+	t.Run("error param doc comment", testErrorParamDocComment)
+	t.Run("event param doc comment", testEventParamDocComment)
+	t.Run("param without doc comment has empty doc", testParamWithoutDoc)
+	t.Run("multi-line param doc comment", testMultiLineParamDoc)
+	t.Run("api param doc with unicode", testApiParamDocUnicode)
+}
+
+func testApiParamDocComment(t *testing.T) {
+	file := parse(t, "api test(\n  /// parameter a description\n  a: String,\n  /// parameter b description\n  b: Int\n): String")
+	if len(file.APIs) != 1 {
+		t.Fatalf("expected 1 api, got %d", len(file.APIs))
+	}
+	api := file.APIs[0]
+	if len(api.Params) != 2 {
+		t.Fatalf("expected 2 params, got %d", len(api.Params))
+	}
+	if api.Params[0].Doc != "parameter a description" {
+		t.Errorf("param a doc = %q, want %q", api.Params[0].Doc, "parameter a description")
+	}
+	if api.Params[1].Doc != "parameter b description" {
+		t.Errorf("param b doc = %q, want %q", api.Params[1].Doc, "parameter b description")
+	}
+}
+
+func testFnParamDocComment(t *testing.T) {
+	file := parse(t, "fn encrypt(\n  /// the value to encrypt\n  value: String\n): String")
+	if len(file.Functions) != 1 {
+		t.Fatalf("expected 1 fn, got %d", len(file.Functions))
+	}
+	fn := file.Functions[0]
+	if len(fn.Params) != 1 {
+		t.Fatalf("expected 1 param, got %d", len(fn.Params))
+	}
+	if fn.Params[0].Doc != "the value to encrypt" {
+		t.Errorf("param doc = %q, want %q", fn.Params[0].Doc, "the value to encrypt")
+	}
+}
+
+func testErrorParamDocComment(t *testing.T) {
+	file := parse(t, "error NotFound(\n  /// the resource type\n  resource: String\n) {\n  code: 404\n  message: error.not_found\n}")
+	if len(file.Errors) != 1 {
+		t.Fatalf("expected 1 error, got %d", len(file.Errors))
+	}
+	e := file.Errors[0]
+	if len(e.Fields) != 1 {
+		t.Fatalf("expected 1 field, got %d", len(e.Fields))
+	}
+	if e.Fields[0].Doc != "the resource type" {
+		t.Errorf("param doc = %q, want %q", e.Fields[0].Doc, "the resource type")
+	}
+}
+
+func testEventParamDocComment(t *testing.T) {
+	file := parse(t, "event UserCreated(\n  /// the created user\n  user: User\n)")
+	if len(file.Events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(file.Events))
+	}
+	ev := file.Events[0]
+	if len(ev.Params) != 1 {
+		t.Fatalf("expected 1 param, got %d", len(ev.Params))
+	}
+	if ev.Params[0].Doc != "the created user" {
+		t.Errorf("param doc = %q, want %q", ev.Params[0].Doc, "the created user")
+	}
+}
+
+func testParamWithoutDoc(t *testing.T) {
+	file := parse(t, "api test(a: String): String")
+	api := file.APIs[0]
+	if api.Params[0].Doc != "" {
+		t.Errorf("expected empty doc, got %q", api.Params[0].Doc)
+	}
+}
+
+func testMultiLineParamDoc(t *testing.T) {
+	file := parse(t, "api test(\n  /// first line\n  /// second line\n  a: String\n): String")
+	api := file.APIs[0]
+	expected := "first line\nsecond line"
+	if api.Params[0].Doc != expected {
+		t.Errorf("param doc = %q, want %q", api.Params[0].Doc, expected)
+	}
+}
+
+func testApiParamDocUnicode(t *testing.T) {
+	file := parse(t, "api test(\n  /// 干嘛的\n  a: String\n): String")
+	api := file.APIs[0]
+	if api.Params[0].Doc != "干嘛的" {
+		t.Errorf("param doc = %q, want %q", api.Params[0].Doc, "干嘛的")
 	}
 }

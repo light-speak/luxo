@@ -112,6 +112,27 @@ func TestParseBreakStmt(t *testing.T) {
 	}
 }
 
+// ========== continue ==========
+
+func TestParseContinueStmt(t *testing.T) {
+	input := `api test(): Int {
+  for {
+    continue
+  }
+  0
+}`
+	file := parse(t, input)
+	api := file.APIs[0]
+	forStmt := api.Body.Stmts[0].(*ast.ForStmt)
+	// continue should be in the for body
+	if len(forStmt.Body.Stmts) < 1 {
+		t.Fatal("expected continue stmt in for body")
+	}
+	if _, ok := forStmt.Body.Stmts[0].(*ast.ContinueStmt); !ok {
+		t.Fatalf("expected *ast.ContinueStmt, got %T", forStmt.Body.Stmts[0])
+	}
+}
+
 // ========== yield ==========
 
 func TestParseYieldExpr(t *testing.T) {

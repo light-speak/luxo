@@ -84,7 +84,7 @@ Luxo 是一门真正的编程语言 — 不只是 Schema DSL。**31 个关键字
 ### 空安全
 
 ```luxo
-val user = find(User, id: 1)       // User?（可空）
+val user = User.find(id: 1)        // User?（可空）
 val name = user?.name               // 安全访问
 val sure = user ?: throw NotFound   // Elvis — 断言或抛错
 ```
@@ -173,7 +173,7 @@ api getUser(id: Int): User @cache(ttl: 60)
 // 2. 带逻辑 — 用 Luxo 写
 api register(input: RegisterInput): AuthResult {
   input.password.length >= 8 ?: throw PasswordTooShort
-  val user = create(User, name: input.name, email: input.email, password: input.password)
+  val user = User.create(name: input.name, email: input.email, password: input.password)
   val token = generateToken(user, expires: 7d)
   AuthResult { token, user }         // 简写 — 字段名 = 变量名
 }
@@ -193,7 +193,7 @@ use common.{ Base, Page }           // 展开导入
 
 ```luxo
 api createPost(title: String): Post @auth {
-  val post = create(Post, title: title, userId: my.id)
+  val post = Post.create(title: title, userId: my.id)
   post
 }
 ```
@@ -204,7 +204,7 @@ api createPost(title: String): Post @auth {
 event OrderCreated(order: Order, userId: Int)    // 类型化事件声明
 
 api placeOrder(id: Int): Order @auth {
-  val order = create(Order, userId: my.id)
+  val order = Order.create(userId: my.id)
   emit OrderCreated(order: order, userId: my.id) // 类型化 emit
   order
 }
@@ -217,7 +217,7 @@ on OrderCreated { order ->                       // 事件监听
 ### 调试链 — `.d`
 
 ```luxo
-val user = find(User, id: 1).d       // .d 打印并返回自身
+val user = User.find(id: 1).d        // .d 打印并返回自身
 ```
 
 ### 字段选择 — 贯穿全链路
@@ -256,6 +256,30 @@ luxo dev
 **Luvia 始终在线** — 单服务时内嵌运行（进程内调用，零开销），多服务时独立部署为网关。同一套代码，同一套行为，只改配置。从原型到生产，不改一行代码。
 
 
+## AI 原生设计
+
+Luxo 不只是代码更短 — 它是 **AI 写后端最可靠的语言**。
+
+| | 传统方案 (Go/TS) | Luxo |
+|---|---|---|
+| **AI 需要的上下文** | 50+ 文件，10K+ tokens | 1 个 `.luxo` 文件，~500 tokens |
+| **AI 输出正确性** | 能编译 ≠ 正确，靠测试 | 编译器检查类型、空安全、穷举 |
+| **代码风格一致性** | AI 每次选不同写法 | 一件事一种写法 |
+| **理解业务** | AI 要从代码反推 | Schema 就是业务 |
+
+```
+"加一个商品收藏功能"
+
+→ AI 生成 15 行 .luxo
+→ 编译器校验类型、空安全、必填字段
+→ 搞定，API 跑起来了
+
+同样的事用 Go？200+ 行，7 个文件
+同样的事用 TypeScript？150+ 行，4 个包，零编译期安全
+```
+
+**Luxo + AI = 可靠的后端工程师。** 其他语言给 AI 太多自由度，Luxo 给 AI 刚好够用的约束。
+
 ## 开发进度
 
 ### Phase 1 — 编译器 ✅
@@ -284,7 +308,10 @@ luxo dev
 - [ ] Binary 协议（field ID · varint · field mask）
 - [ ] 客户端 SDK 生成（TypeScript · Dart）
 
-### Phase 4 — 生态
+### Phase 4 — AI + 生态
+- [ ] MCP Server（AI 直接读写 .luxo 项目）
+- [ ] luxo-ai（自然语言 → .luxo → 运行中的 API）
+- [ ] luxo-copilot（基于 schema 的 AI 补全，VS Code / Cursor）
 - [ ] Luxo Studio（监控 · 追踪 · API Playground）
 - [ ] Cache / Task / Scheduler / Storage / Mail
 - [ ] .luxo 测试运行器
