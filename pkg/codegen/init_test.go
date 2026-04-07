@@ -3,44 +3,124 @@ package codegen
 import (
 	"strings"
 	"testing"
-
-	"github.com/light-speak/luxo/pkg/ast"
 )
 
-func TestInit(t *testing.T) {
-	file := &ast.File{
-		Name: "test.luxo",
-		Models: []*ast.ModelDecl{
-			{
-				Name: "User",
-				Fields: []*ast.FieldDecl{
-					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
-				},
-			},
-		},
-	}
+func TestInitProject(t *testing.T) {
+	sr := InitProject("github.com/example/myapp")
 
-	ir := Init(result(file), "myapp", "luxo")
-
-	if len(ir.Files) != 2 {
-		t.Fatalf("expected 2 files, got %d", len(ir.Files))
-	}
-	if _, ok := ir.Files["cmd/app/main.go"]; !ok {
-		t.Error("missing cmd/app/main.go")
-	}
-	if _, ok := ir.Files["resolver/resolver.go"]; !ok {
-		t.Error("missing resolver/resolver.go")
+	expected := []string{".gitignore", ".env.example", "go.mod"}
+	for _, name := range expected {
+		if _, ok := sr.Files[name]; !ok {
+			t.Errorf("missing %s", name)
+		}
 	}
 }
 
-func TestGenerateMainGo(t *testing.T) {
-	src := string(generateMainGo("github.com/example/myapp", "luxo"))
+func TestInitProjectGoMod(t *testing.T) {
+	sr := InitProject("github.com/example/myapp")
+	src := string(sr.Files["go.mod"])
+
+	checks := []string{
+		"module github.com/example/myapp",
+		"go 1.23.0",
+		"github.com/light-speak/luxo",
+	}
+	for _, check := range checks {
+		if !strings.Contains(src, check) {
+			t.Errorf("missing %q in go.mod:\n%s", check, src)
+		}
+	}
+}
+
+func TestInitProjectGitignore(t *testing.T) {
+	sr := InitProject("github.com/example/myapp")
+	src := string(sr.Files[".gitignore"])
+
+	checks := []string{".env", "bin/", ".DS_Store", "*.cov"}
+	for _, check := range checks {
+		if !strings.Contains(src, check) {
+			t.Errorf("missing %q in .gitignore:\n%s", check, src)
+		}
+	}
+}
+
+func TestInitProjectEnvExample(t *testing.T) {
+	sr := InitProject("github.com/example/myapp")
+	src := string(sr.Files[".env.example"])
+
+	checks := []string{
+		"DATABASE_DRIVER=pg",
+		"JWT_SECRET=change-me",
+		"DEPLOY_MODE=embedded",
+		"CORS_ORIGINS=*",
+		"LOG_LEVEL=info",
+		"HEALTH_PATH=/health",
+	}
+	for _, check := range checks {
+		if !strings.Contains(src, check) {
+			t.Errorf("missing %q in .env.example:\n%s", check, src)
+		}
+	}
+}
+
+func TestAddModule(t *testing.T) {
+	sr := AddModule("github.com/example/myapp", "user")
+
+	expected := []string{
+		"origin/user.luxo",
+		"service/user/resolver/resolver.go",
+		"luxis/user/main.go",
+	}
+	for _, name := range expected {
+		if _, ok := sr.Files[name]; !ok {
+			t.Errorf("missing %s", name)
+		}
+	}
+}
+
+func TestAddModuleSchema(t *testing.T) {
+	sr := AddModule("github.com/example/myapp", "user")
+	src := string(sr.Files["origin/user.luxo"])
+
+	checks := []string{
+		"User module schema",
+		"model User",
+		"id:        UUID      @auto",
+		"createdAt: DateTime",
+		"updatedAt: DateTime",
+	}
+	for _, check := range checks {
+		if !strings.Contains(src, check) {
+			t.Errorf("missing %q in user.luxo:\n%s", check, src)
+		}
+	}
+}
+
+func TestAddModuleResolver(t *testing.T) {
+	sr := AddModule("github.com/example/myapp", "user")
+	src := string(sr.Files["service/user/resolver/resolver.go"])
+
+	checks := []string{
+		"package resolver",
+		"type Resolver struct",
+		"func Setup(app any)",
+		"user module",
+	}
+	for _, check := range checks {
+		if !strings.Contains(src, check) {
+			t.Errorf("missing %q in resolver.go:\n%s", check, src)
+		}
+	}
+}
+
+func TestAddModuleMain(t *testing.T) {
+	sr := AddModule("github.com/example/myapp", "user")
+	src := string(sr.Files["luxis/user/main.go"])
 
 	checks := []string{
 		"package main",
-		`"github.com/example/myapp/luxo"`,
-		`"github.com/example/myapp/resolver"`,
-		`"github.com/light-speak/luxo/pkg/lux/env"`,
+		`"github.com/example/myapp/service/user/luxo"`,
+		`"github.com/example/myapp/service/user/resolver"`,
 		`env.Load(".env")`,
 		"luxo.New(ctx)",
 		"defer app.Close()",
@@ -53,17 +133,26 @@ func TestGenerateMainGo(t *testing.T) {
 	}
 }
 
-func TestGenerateResolverGo(t *testing.T) {
-	src := string(generateResolverGo())
-
-	checks := []string{
-		"package resolver",
-		"type Resolver struct",
-		"func Setup(app any)",
+func TestAddModuleDifferentNames(t *testing.T) {
+	tests := []struct {
+		module    string
+		modelName string
+	}{
+		{"user", "User"},
+		{"order", "Order"},
+		{"payment", "Payment"},
 	}
-	for _, check := range checks {
-		if !strings.Contains(src, check) {
-			t.Errorf("missing %q in resolver.go:\n%s", check, src)
-		}
+	for _, tt := range tests {
+		t.Run(tt.module, func(t *testing.T) {
+			sr := AddModule("github.com/example/myapp", tt.module)
+			schema := string(sr.Files["origin/"+tt.module+".luxo"])
+			if !strings.Contains(schema, "model "+tt.modelName) {
+				t.Errorf("missing model %s in schema:\n%s", tt.modelName, schema)
+			}
+			mainSrc := string(sr.Files["luxis/"+tt.module+"/main.go"])
+			if !strings.Contains(mainSrc, "service/"+tt.module+"/luxo") {
+				t.Errorf("missing module import in main.go:\n%s", mainSrc)
+			}
+		})
 	}
 }

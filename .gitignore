@@ -17,3 +17,7 @@ editors/vscode/package-lock.json
 .DS_Store
 Thumbs.db
 *.cov
+
+# Examples (local testing only)
+examples/
+
