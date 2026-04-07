@@ -327,7 +327,7 @@
         {
           "comment": "内置原始类型 — 和 int/string 同色",
           "name": "support.type.luxo",
-          "match": "\\b(String|Int|Float|Boolean|DateTime|Duration|Json|File|Void)\\b"
+          "match": "\\b(String|Int|Float|Boolean|DateTime|Duration|UUID|Decimal|Bytes|Void)\\b"
         },
         {
           "comment": "枚举成员（全大写）— 和常量同色",

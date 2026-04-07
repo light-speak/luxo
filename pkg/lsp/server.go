@@ -784,7 +784,7 @@ func getBuiltinFunctionCompletions(prefix string) []CompletionItem {
 }
 
 func getBuiltinTypeCompletions(prefix string) []CompletionItem {
-	types := []string{"String", "Int", "Float", "Boolean", "DateTime", "Duration", "Json", "File", "Void", "Result", "Channel"}
+	types := []string{"String", "Int", "Float", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes", "Void", "Result", "Channel"}
 	var items []CompletionItem
 	for _, t := range types {
 		if prefix == "" || strings.HasPrefix(strings.ToLower(t), prefix) {
@@ -1476,6 +1476,9 @@ func builtinTypeDescription(name string) string {
 		"Boolean":  "```\nBoolean\n```\n\nGo: `bool` | PG: `boolean`",
 		"DateTime": "```\nDateTime\n```\n\nGo: `time.Time` | PG: `timestamptz`\n\nAnnotations: `@date` → date only, `@time` → time only",
 		"Duration": "```\nDuration\n```\n\nGo: `time.Duration` | PG: `interval`\n\nLiterals: `7d`, `5m`, `1h`, `30s`, `500ms`",
+		"UUID":     "```\nUUID\n```\n\nGo: `uuid.UUID` | PG: `uuid` | MySQL: `BINARY(16)` | Mongo: native\n\nUse `@auto` for auto-generated UUID v7",
+		"Decimal":  "```\nDecimal\n```\n\nGo: `decimal.Decimal` | PG: `numeric` | MySQL: `DECIMAL`\n\nPrecise decimal arithmetic — use for money, never use Float for money\n\nAnnotations: `@decimal(precision, scale)`",
+		"Bytes":    "```\nBytes\n```\n\nGo: `[]byte` | PG: `bytea` | MySQL: `BLOB` | Mongo: `BinData`\n\nBinary data storage — encrypted data, small files, certificates",
 	}
 	if desc, ok := descriptions[name]; ok {
 		return desc

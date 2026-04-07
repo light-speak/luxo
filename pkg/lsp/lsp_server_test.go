@@ -2901,7 +2901,7 @@ func TestDirectiveDescriptionCoverage(t *testing.T) {
 // ========== builtinTypeDescription Tests ==========
 
 func TestBuiltinTypeDescriptionAll(t *testing.T) {
-	types := []string{"Int", "Float", "String", "Boolean", "DateTime", "Duration"}
+	types := []string{"Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes"}
 	for _, name := range types {
 		desc := builtinTypeDescription(name)
 		if desc == "" {

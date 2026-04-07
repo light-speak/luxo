@@ -34,6 +34,7 @@ type Warning struct {
 type Result struct {
 	Scope    *Scope
 	Types    map[string]*ResolvedType // all resolved types by name
+	Files    []*ast.File              // original AST files (for codegen access to directives, bodies, etc.)
 	Errors   []Error
 	Warnings []Warning
 }
@@ -104,6 +105,7 @@ func (a *Analyzer) Analyze(files []*ast.File) *Result {
 	return &Result{
 		Scope:    a.scope,
 		Types:    a.types,
+		Files:    files,
 		Errors:   a.errors,
 		Warnings: a.warnings,
 	}

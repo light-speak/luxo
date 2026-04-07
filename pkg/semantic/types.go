@@ -13,6 +13,9 @@ const (
 	TypeBool
 	TypeDateTime
 	TypeDuration
+	TypeUUID
+	TypeDecimal
+	TypeBytes
 	TypeVoid // internal only, not user-facing
 	TypeModel
 	TypeInterface
@@ -158,6 +161,9 @@ func BuiltinTypes() map[string]*ResolvedType {
 		"Boolean":  boolType,
 		"DateTime": {Kind: TypeDateTime, Name: "DateTime", Fields: map[string]*FieldInfo{}},
 		"Duration": {Kind: TypeDuration, Name: "Duration", Fields: map[string]*FieldInfo{}},
+		"UUID":     {Kind: TypeUUID, Name: "UUID", Fields: map[string]*FieldInfo{}},
+		"Decimal":  {Kind: TypeDecimal, Name: "Decimal", Fields: map[string]*FieldInfo{}},
+		"Bytes":    {Kind: TypeBytes, Name: "Bytes", Fields: map[string]*FieldInfo{}},
 		"Result":   {Kind: TypeGeneric, Name: "Result", Fields: map[string]*FieldInfo{}},
 		"Channel":  {Kind: TypeGeneric, Name: "Channel", Fields: map[string]*FieldInfo{}},
 		"Page": {Kind: TypeGeneric, Name: "Page", Fields: map[string]*FieldInfo{
@@ -177,13 +183,13 @@ func BuiltinTypes() map[string]*ResolvedType {
 
 // IsNumeric returns true if the type is numeric.
 func (t *ResolvedType) IsNumeric() bool {
-	return t.Kind == TypeInt || t.Kind == TypeFloat
+	return t.Kind == TypeInt || t.Kind == TypeFloat || t.Kind == TypeDecimal
 }
 
 // IsComparable returns true if the type supports == and !=.
 func (t *ResolvedType) IsComparable() bool {
 	switch t.Kind {
-	case TypeInt, TypeFloat, TypeString, TypeBool, TypeEnum:
+	case TypeInt, TypeFloat, TypeString, TypeBool, TypeEnum, TypeUUID, TypeDecimal, TypeDateTime:
 		return true
 	}
 	return false
