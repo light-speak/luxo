@@ -79,7 +79,7 @@ model User @crud {
 
 ## 语言特性
 
-Luxo 是一门真正的编程语言 — 不只是 Schema DSL。**31 个关键字**，6 种核心类型（`Int`、`Float`、`String`、`Boolean`、`DateTime`、`Duration`），简洁语法，编译到 Go。
+Luxo 是一门真正的编程语言 — 不只是 Schema DSL。**32 个关键字**，9 种核心类型（`Int`、`Float`、`String`、`Boolean`、`DateTime`、`Duration`、`UUID`、`Decimal`、`Bytes`），简洁语法，编译到 Go。
 
 ### 空安全
 
@@ -244,16 +244,17 @@ go install github.com/light-speak/luxo/cmd/luxo@latest
 
 luxo init my-app
 cd my-app
-luxo dev
+luxo add user
+luxo gen
+cp .env.example .env
+luxo run
 ```
 
 ## 架构
 
-<p align="center">
-  <img src="assets/architecture.svg" alt="Luxo Architecture" width="100%" />
-</p>
+> [查看完整架构图](assets/architecture.svg)
 
-**Luvia 始终在线** — 单服务时内嵌运行（进程内调用，零开销），多服务时独立部署为网关。同一套代码，同一套行为，只改配置。从原型到生产，不改一行代码。
+**Luvia 始终在线** — 单服务时内嵌运行（进程内调用，零开销），多服务时独立部署为网关。同一套代码，同一套行为，只改 `.env` 中的 `DEPLOY_MODE`。从原型到生产，不改一行代码。
 
 
 ## AI 原生设计
@@ -283,39 +284,43 @@ Luxo 不只是代码更短 — 它是 **AI 写后端最可靠的语言**。
 ## 开发进度
 
 ### Phase 1 — 编译器 ✅
-- [x] 词法分析 · 语法分析（31 关键字，Pratt Parser）
-- [x] 语义分析（类型检查、空安全、字段注入）
+- [x] 词法分析 · 语法分析（32 关键字，Pratt Parser）
+- [x] 语义分析（类型检查、空安全、字段注入、59 个内置注解）
 - [x] LSP 服务器（诊断、补全、悬停、跳转定义、引用查找）
-- [ ] Go 代码生成
+- [x] VS Code 扩展（语法高亮、LSP 集成）
 
-### Phase 2 — 运行时 + Luvia
-- [ ] Go 代码生成（model · api · db · dataloader · native 接口）
-- [ ] 类型安全查询构建器（pgx，字段选择 → SQL）
-- [ ] Luvia 网关（始终在线：单服务内嵌 / 多服务独立）
-- [ ] 自动 CRUD · @native 智能合并
+### Phase 2 — 代码生成 + 运行时（进行中）
+- [x] 代码生成（model struct · enum · 自对齐输出）
+- [x] 类型安全查询构建器（pgx，零反射 scanner，字段选择 → SQL）
+- [x] App 入口聚合（自动汇聚所有 Client，`New()` 从环境变量初始化）
+- [x] 事务支持（`app.Tx()` 提交/回滚/panic 恢复）
+- [x] @soft 软删除（SoftDelete/ForceDelete/Restore/WithDeleted）
+- [x] Dotenv 运行时（`pkg/lux/env`，零依赖，系统环境变量优先）
+- [x] 项目骨架生成（`luxo init` + `luxo add` + 项目结构）
+- [x] @withAuth 简化（JWT 配置走 .env，stores 编译期确定）
+- [ ] @native resolver AST 合并（更新签名、保留方法体、零标记注释）
+- [ ] API handler 生成（请求路由、字段选择、响应序列化）
+- [ ] 自动 CRUD 生成
 - [ ] JSON 传输 + 字段选择（端到端贯穿）
-- [ ] 认证（@auth · JWT · Identity · `my` 关键字）
+- [ ] 认证运行时（JWT 签发/验证、`my` 关键字解析）
 - [ ] 迁移引擎（声明式 diff · 安全回滚）
-- [ ] i18n 错误体系 · 校验注解
-- [ ] WebSocket 流式 · Batch 请求
-- [ ] 事件系统（emit / on · NATS JetStream）
+- [ ] 部署生成（`luxo deploy compose` / `luxo deploy helm`）
 
 ### Phase 3 — 多服务 + Binary
-- [ ] Schema 组装 · 服务发现 · 负载均衡
+- [ ] Schema 组装 · 服务发现
 - [ ] @service RPC（类型安全跨服务调用）
 - [ ] extend 字段聚合（并行扇出）
-- [ ] 熔断器 · 健康检查
 - [ ] Binary 协议（field ID · varint · field mask）
 - [ ] 客户端 SDK 生成（TypeScript · Dart）
+- [ ] WebSocket 流式 · Batch 请求
+- [ ] 事件系统（emit / on · NATS）
 
 ### Phase 4 — AI + 生态
 - [ ] MCP Server（AI 直接读写 .luxo 项目）
 - [ ] luxo-ai（自然语言 → .luxo → 运行中的 API）
-- [ ] luxo-copilot（基于 schema 的 AI 补全，VS Code / Cursor）
 - [ ] Luxo Studio（监控 · 追踪 · API Playground）
-- [ ] Cache / Task / Scheduler / Storage / Mail
-- [ ] .luxo 测试运行器
-- [ ] k3s 部署生成
+- [ ] Cache / Queue / Storage / Mail / Search
+- [ ] Helm Chart 生成（每服务独立 Chart + helmfile）
 
 ## 贡献
 

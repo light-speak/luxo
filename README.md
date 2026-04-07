@@ -79,7 +79,7 @@ This generates everything. One file, zero boilerplate.
 
 ## The Language
 
-Luxo is a real programming language — not just a schema DSL. **31 keywords**, 6 core types (`Int`, `Float`, `String`, `Boolean`, `DateTime`, `Duration`), clean syntax, compiles to Go.
+Luxo is a real programming language — not just a schema DSL. **32 keywords**, 9 core types (`Int`, `Float`, `String`, `Boolean`, `DateTime`, `Duration`, `UUID`, `Decimal`, `Bytes`), clean syntax, compiles to Go.
 
 ### Null Safety
 
@@ -245,16 +245,17 @@ go install github.com/light-speak/luxo/cmd/luxo@latest
 
 luxo init my-app
 cd my-app
-luxo dev
+luxo add user
+luxo gen
+cp .env.example .env
+luxo run
 ```
 
 ## Architecture
 
-<p align="center">
-  <img src="assets/architecture.svg" alt="Luxo Architecture" width="100%" />
-</p>
+> [View full architecture diagram](assets/architecture.svg)
 
-**Luvia is always on** — single service runs embedded (in-process, zero overhead), multi-service runs as a standalone gateway. Same code, same behavior, just change the config. Scale from prototype to production without touching a single line of code.
+**Luvia is always on** — single service runs embedded (in-process, zero overhead), multi-service runs as a standalone gateway. Same code, same behavior, just change `DEPLOY_MODE` in `.env`. Scale from prototype to production without touching a single line of code.
 
 
 ## AI-Native by Design
@@ -284,39 +285,43 @@ Same task in TypeScript? 150+ lines, 4 packages, no compile-time safety.
 ## Roadmap
 
 ### Phase 1 — Compiler ✅
-- [x] Lexer · Parser (31 keywords, Pratt parser)
-- [x] Semantic Analyzer (type checking, null safety, field injection)
+- [x] Lexer · Parser (32 keywords, Pratt parser)
+- [x] Semantic Analyzer (type checking, null safety, field injection, 59 directives)
 - [x] LSP Server (diagnostics, completion, hover, go-to-definition, references)
-- [ ] Go code generator
+- [x] VS Code Extension (syntax highlighting, LSP integration)
 
-### Phase 2 — Runtime + Luvia
-- [ ] Go code generation (model · api · db · dataloader · native interface)
-- [ ] Type-safe query builder (pgx, field selection → SQL)
-- [ ] Luvia gateway (always-on: embedded single / standalone multi)
-- [ ] Auto CRUD · @native resolver merge
+### Phase 2 — Codegen + Runtime (in progress)
+- [x] Code generation (model structs · enums · self-aligned output)
+- [x] Type-safe query builder (pgx, zero-reflection scanner, field selection → SQL)
+- [x] App wiring (auto-aggregate all Clients, `New()` from env)
+- [x] Transaction support (`app.Tx()` with commit/rollback/panic-recovery)
+- [x] @soft directive (soft delete — SoftDelete/ForceDelete/Restore/WithDeleted)
+- [x] Dotenv runtime (`pkg/lux/env`, zero deps, system env priority)
+- [x] Project scaffold (`luxo init` + `luxo add` + project structure)
+- [x] @withAuth simplified (JWT config via .env, stores at compile time)
+- [ ] @native resolver AST merge (update signatures, preserve body, zero comment markers)
+- [ ] API handler generation (request routing, field selection, response serialization)
+- [ ] Auto CRUD generation
 - [ ] JSON transport + field selection (end to end)
-- [ ] Auth (@auth · JWT · Identity · `my` keyword)
+- [ ] Auth runtime (JWT sign/verify, `my` keyword resolution)
 - [ ] Migration engine (declarative diff · safe rollback)
-- [ ] i18n error system · Validation annotations
-- [ ] WebSocket stream · Batch requests
-- [ ] Event system (emit / on · NATS JetStream)
+- [ ] Deploy generation (`luxo deploy compose` / `luxo deploy helm`)
 
 ### Phase 3 — Multi-service + Binary
-- [ ] Schema compose · Service discovery · Load balancing
+- [ ] Schema compose · Service discovery
 - [ ] @service RPC (type-safe cross-service calls)
 - [ ] extend field aggregation (parallel fan-out)
-- [ ] Circuit breaker · Health check
 - [ ] Binary protocol (field ID · varint · field mask)
 - [ ] Client SDK generation (TypeScript · Dart)
+- [ ] WebSocket stream · Batch requests
+- [ ] Event system (emit / on · NATS)
 
 ### Phase 4 — AI + Ecosystem
 - [ ] MCP Server (AI reads/writes .luxo projects natively)
 - [ ] luxo-ai (natural language → .luxo → running API)
-- [ ] luxo-copilot (schema-aware AI completion for VS Code / Cursor)
 - [ ] Luxo Studio (monitoring · tracing · API playground)
-- [ ] Cache / Task / Scheduler / Storage / Mail
-- [ ] .luxo test runner
-- [ ] k3s deployment generation
+- [ ] Cache / Queue / Storage / Mail / Search
+- [ ] Helm Chart generation (per-service Chart + helmfile)
 
 ## Contributing
 
