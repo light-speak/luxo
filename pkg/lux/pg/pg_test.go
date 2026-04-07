@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"errors"
+
 	"github.com/google/uuid"
 	"github.com/light-speak/luxo/pkg/lux"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -508,5 +510,141 @@ func TestCreateBaseAndUpdateBase(t *testing.T) {
 	}
 	if updated.Name != "update-base" {
 		t.Errorf("name = %q", updated.Name)
+	}
+}
+
+func TestTxCommit(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	err := db.Tx(ctx, func(tx *DB) error {
+		_, err := InsertReturning(ctx, tx, scanUser, "users",
+			[]string{"id", "name", "email"},
+			[]any{uuid.Must(uuid.NewV7()), "tx-user", "tx@test.com"},
+		)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("tx commit: %v", err)
+	}
+
+	// Verify committed
+	count, _ := QueryScalar[int64](ctx, db, "SELECT COUNT(*) FROM users WHERE name = 'tx-user'")
+	if count != 1 {
+		t.Errorf("count = %d, want 1", count)
+	}
+}
+
+func TestTxRollback(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	testErr := errors.New("rollback me")
+	err := db.Tx(ctx, func(tx *DB) error {
+		_, _ = InsertReturning(ctx, tx, scanUser, "users",
+			[]string{"id", "name", "email"},
+			[]any{uuid.Must(uuid.NewV7()), "rollback-user", "rb@test.com"},
+		)
+		return testErr
+	})
+	if !errors.Is(err, testErr) {
+		t.Fatalf("expected testErr, got %v", err)
+	}
+
+	// Verify rolled back
+	count, _ := QueryScalar[int64](ctx, db, "SELECT COUNT(*) FROM users WHERE name = 'rollback-user'")
+	if count != 0 {
+		t.Errorf("count = %d, want 0 (should be rolled back)", count)
+	}
+}
+
+func TestTxPanicRollback(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	defer func() {
+		p := recover()
+		if p == nil {
+			t.Fatal("expected panic")
+		}
+		if p != "boom" {
+			t.Fatalf("panic = %v, want boom", p)
+		}
+		// Verify rolled back
+		count, _ := QueryScalar[int64](ctx, db, "SELECT COUNT(*) FROM users WHERE name = 'panic-user'")
+		if count != 0 {
+			t.Errorf("count = %d, want 0 (should be rolled back)", count)
+		}
+	}()
+
+	_ = db.Tx(ctx, func(tx *DB) error {
+		_, _ = InsertReturning(ctx, tx, scanUser, "users",
+			[]string{"id", "name", "email"},
+			[]any{uuid.Must(uuid.NewV7()), "panic-user", "panic@test.com"},
+		)
+		panic("boom")
+	})
+}
+
+func TestTxBeginError(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	// Close the pool to force Begin to fail
+	db.Close()
+
+	err := db.Tx(ctx, func(tx *DB) error {
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected error when pool is closed")
+	}
+}
+
+func TestTxNestedQuery(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	// Insert outside tx
+	id := uuid.Must(uuid.NewV7())
+	_, _ = InsertReturning(ctx, db, scanUser, "users",
+		[]string{"id", "name", "email"},
+		[]any{id, "existing", "exist@test.com"},
+	)
+
+	err := db.Tx(ctx, func(tx *DB) error {
+		// Query inside tx should see existing data
+		q := NewQuery(tx, "users", scanUser, []lux.Condition{
+			lux.NewUUIDField("id").Eq(id),
+		})
+		user, err := q.First(ctx)
+		if err != nil {
+			return err
+		}
+		if user == nil {
+			t.Error("should see existing user in tx")
+		}
+
+		// Insert + query within same tx
+		newID := uuid.Must(uuid.NewV7())
+		_, err = InsertReturning(ctx, tx, scanUser, "users",
+			[]string{"id", "name", "email"},
+			[]any{newID, "in-tx", "intx@test.com"},
+		)
+		if err != nil {
+			return err
+		}
+
+		count, err := QueryScalar[int64](ctx, tx, "SELECT COUNT(*) FROM users")
+		if err != nil {
+			return err
+		}
+		if count != 2 {
+			t.Errorf("count in tx = %d, want 2", count)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("tx: %v", err)
 	}
 }

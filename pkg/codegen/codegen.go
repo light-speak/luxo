@@ -62,42 +62,54 @@ func writeHeader(b *strings.Builder, packageName, sourceFile string) {
 	fmt.Fprintf(b, "package %s\n\n", packageName)
 }
 
+// modelImportNeeds tracks which imports model.gen.go requires.
+type modelImportNeeds struct {
+	time    bool
+	uuid    bool
+	decimal bool
+}
+
+// scanModelFieldImports checks a single field for import needs in model.gen.go.
+func scanModelFieldImports(f *ast.FieldDecl, needs *modelImportNeeds) {
+	if f.Computed != nil || f.Type == nil {
+		return
+	}
+	switch f.Type.Name {
+	case "DateTime", "Duration":
+		needs.time = true
+	case "UUID":
+		needs.uuid = true
+	case "Decimal":
+		needs.decimal = true
+	}
+}
+
 // writeImports writes import block for model.gen.go.
 func writeImports(b *strings.Builder, files []*ast.File) {
-	needsTime := false
-	needsUUID := false
-	needsDecimal := false
-
+	var needs modelImportNeeds
 	for _, file := range files {
 		for _, m := range file.Models {
+			if isSoftDelete(m) && !hasDeletedAtField(m.Fields) {
+				needs.time = true
+			}
 			for _, f := range m.Fields {
-				if f.Computed != nil || f.Type == nil {
-					continue
-				}
-				switch f.Type.Name {
-				case "DateTime", "Duration":
-					needsTime = true
-				case "UUID":
-					needsUUID = true
-				case "Decimal":
-					needsDecimal = true
-				}
+				scanModelFieldImports(f, &needs)
 			}
 		}
 	}
 
-	if !needsTime && !needsUUID && !needsDecimal {
+	if !needs.time && !needs.uuid && !needs.decimal {
 		return
 	}
 
 	b.WriteString("import (\n")
-	if needsTime {
+	if needs.time {
 		b.WriteString("\t\"time\"\n")
 	}
-	if needsUUID {
+	if needs.uuid {
 		b.WriteString("\n\t\"github.com/google/uuid\"\n")
 	}
-	if needsDecimal {
+	if needs.decimal {
 		b.WriteString("\t\"github.com/shopspring/decimal\"\n")
 	}
 	b.WriteString(")\n\n")
@@ -139,6 +151,13 @@ type dbImportNeeds struct {
 	decimal bool
 }
 
+// scanDBModelImports checks model-level directives for import needs.
+func scanDBModelImports(m *ast.ModelDecl, needs *dbImportNeeds) {
+	if isSoftDelete(m) {
+		needs.time = true // SoftDelete uses time.Now()
+	}
+}
+
 // scanDBFieldImports checks a single field for import needs in db.gen.go.
 func scanDBFieldImports(f *ast.FieldDecl, needs *dbImportNeeds) {
 	if f.Computed != nil || f.Type == nil {
@@ -170,6 +189,7 @@ func writeDBImports(b *strings.Builder, files []*ast.File) {
 	var needs dbImportNeeds
 	for _, file := range files {
 		for _, m := range file.Models {
+			scanDBModelImports(m, &needs)
 			for _, f := range m.Fields {
 				scanDBFieldImports(f, &needs)
 			}

@@ -13,7 +13,7 @@ func TestGenerateClient(t *testing.T) {
 		{Name: "name", Type: &ast.TypeRef{Name: "String"}},
 	}
 	var b strings.Builder
-	generateClient(&b, "User", "users", fields)
+	generateClient(&b, "User", "users", fields, false)
 	got := b.String()
 
 	checks := []string{
@@ -429,5 +429,113 @@ func TestGenerateUpdateBuilderAutoUpdatedAt(t *testing.T) {
 func TestLuxImportConstant(t *testing.T) {
 	if luxImport != "github.com/light-speak/luxo/pkg/lux" {
 		t.Errorf("luxImport = %q, want github.com/light-speak/luxo/pkg/lux", luxImport)
+	}
+}
+
+func TestGenerateClientSoftDelete(t *testing.T) {
+	fields := []*ast.FieldDecl{
+		{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+		{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+	}
+	var b strings.Builder
+	generateClient(&b, "User", "users", fields, true)
+	got := b.String()
+
+	checks := []string{
+		// Where auto-filters deleted records
+		`lux.NewTimeField("deleted_at").IsNull()`,
+		// WithDeleted bypasses soft delete filter
+		"func (c *UserClient) WithDeleted(conds ...lux.Condition) *pg.Query[User]",
+		// SoftDelete sets deleted_at
+		"func (c *UserClient) SoftDelete(ctx context.Context, conds ...lux.Condition) (int64, error)",
+		`lux.SetField{Col: "deleted_at", Val: time.Now()}`,
+		// ForceDelete does real DELETE
+		"func (c *UserClient) ForceDelete(ctx context.Context, conds ...lux.Condition) (int64, error)",
+		"q.Delete(ctx)",
+		// Restore un-deletes
+		"func (c *UserClient) Restore(ctx context.Context, conds ...lux.Condition) (int64, error)",
+		`lux.SetField{Col: "deleted_at", Val: nil}`,
+	}
+	for _, check := range checks {
+		if !strings.Contains(got, check) {
+			t.Errorf("missing %q in:\n%s", check, got)
+		}
+	}
+}
+
+func TestGenerateClientNoSoftDelete(t *testing.T) {
+	fields := []*ast.FieldDecl{
+		{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+		{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+	}
+	var b strings.Builder
+	generateClient(&b, "User", "users", fields, false)
+	got := b.String()
+
+	// Should NOT have soft delete methods
+	absent := []string{"WithDeleted", "SoftDelete", "ForceDelete", "Restore", "deleted_at"}
+	for _, a := range absent {
+		if strings.Contains(got, a) {
+			t.Errorf("non-soft model should not contain %q in:\n%s", a, got)
+		}
+	}
+}
+
+func TestGenerateQueryBuilderSoft(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "Post",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+		},
+		Directives: []*ast.Directive{{Name: "soft"}},
+	}
+
+	var b strings.Builder
+	generateQueryBuilder(&b, m)
+	got := b.String()
+
+	// Should have deletedAt in scanner and fields
+	checks := []string{
+		"SoftDelete",
+		"ForceDelete",
+		"WithDeleted",
+		"Restore",
+		"DeletedAt",    // field constant
+		`"deleted_at"`, // column name in scanner
+		`*time.Time`,   // nullable DateTime type for deletedAt
+	}
+	for _, check := range checks {
+		if !strings.Contains(got, check) {
+			t.Errorf("missing %q in:\n%s", check, got)
+		}
+	}
+}
+
+func TestGenerateQueryBuilderSoftWithExistingDeletedAt(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "Post",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "deletedAt", Type: &ast.TypeRef{Name: "DateTime", Nullable: true}},
+		},
+		Directives: []*ast.Directive{{Name: "soft"}},
+	}
+
+	var b strings.Builder
+	generateQueryBuilder(&b, m)
+	got := b.String()
+
+	// Should still have soft delete methods
+	if !strings.Contains(got, "SoftDelete") {
+		t.Errorf("missing SoftDelete:\n%s", got)
+	}
+	// Should NOT duplicate deletedAt field
+	count := strings.Count(got, `"deleted_at"`)
+	// deletedAt appears in: scanner case, field constant value, where field value, plus soft delete methods
+	// but should NOT have duplicate struct fields
+	if count < 3 {
+		t.Errorf("expected at least 3 occurrences of deleted_at, got %d:\n%s", count, got)
 	}
 }

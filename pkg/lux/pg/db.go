@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/light-speak/luxo/pkg/lux"
 )
@@ -18,9 +19,18 @@ type Rows = pgx.Rows
 // ScanFunc scans the current row into a T. Generated per-model with zero reflection.
 type ScanFunc[T any] func(rows Rows) (*T, error)
 
-// DB wraps a pgx connection pool.
+// conn is the internal interface satisfied by both *pgxpool.Pool and pgx.Tx.
+// Not exported — generated code never sees this.
+type conn interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+// DB wraps a pgx connection pool or transaction.
 type DB struct {
 	pool *pgxpool.Pool
+	conn conn // pool or tx — all queries go through this
 }
 
 // NewDB creates a new DB from a connection string.
@@ -31,12 +41,12 @@ func NewDB(ctx context.Context, connString string) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("pg: connect to database: %w", err)
 	}
-	return &DB{pool: pool}, nil
+	return &DB{pool: pool, conn: pool}, nil
 }
 
 // NewDBFromPool creates a DB from an existing pgxpool.Pool.
 func NewDBFromPool(pool *pgxpool.Pool) *DB {
-	return &DB{pool: pool}
+	return &DB{pool: pool, conn: pool}
 }
 
 // Close closes the underlying connection pool.
@@ -49,9 +59,36 @@ func (db *DB) Pool() *pgxpool.Pool {
 	return db.pool
 }
 
+// Tx runs fn inside a database transaction. The *DB passed to fn uses the
+// transaction for all queries. If fn returns nil, the transaction commits;
+// otherwise it rolls back. Panics inside fn are recovered and cause a rollback.
+func (db *DB) Tx(ctx context.Context, fn func(tx *DB) error) (err error) {
+	pgxTx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("pg: begin tx: %w", err)
+	}
+
+	txDB := &DB{pool: db.pool, conn: pgxTx}
+
+	defer func() {
+		if p := recover(); p != nil {
+			_ = pgxTx.Rollback(ctx)
+			panic(p) // re-panic after rollback
+		}
+		if err != nil {
+			_ = pgxTx.Rollback(ctx)
+			return
+		}
+		err = pgxTx.Commit(ctx)
+	}()
+
+	err = fn(txDB)
+	return
+}
+
 // QueryRows executes a SELECT and scans all rows using the provided scan function.
 func QueryRows[T any](ctx context.Context, db *DB, scan ScanFunc[T], query string, args ...any) ([]*T, error) {
-	rows, err := db.pool.Query(ctx, query, args...)
+	rows, err := db.conn.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +107,7 @@ func QueryRows[T any](ctx context.Context, db *DB, scan ScanFunc[T], query strin
 
 // QueryRow executes a SELECT and scans the first row, or returns nil.
 func QueryRow[T any](ctx context.Context, db *DB, scan ScanFunc[T], query string, args ...any) (*T, error) {
-	rows, err := db.pool.Query(ctx, query, args...)
+	rows, err := db.conn.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -88,13 +125,13 @@ func QueryRow[T any](ctx context.Context, db *DB, scan ScanFunc[T], query string
 // QueryScalar executes a SELECT and scans a single scalar value.
 func QueryScalar[T any](ctx context.Context, db *DB, query string, args ...any) (T, error) {
 	var result T
-	err := db.pool.QueryRow(ctx, query, args...).Scan(&result)
+	err := db.conn.QueryRow(ctx, query, args...).Scan(&result)
 	return result, err
 }
 
 // Exec executes a statement and returns rows affected.
 func Exec(ctx context.Context, db *DB, query string, args ...any) (int64, error) {
-	tag, err := db.pool.Exec(ctx, query, args...)
+	tag, err := db.conn.Exec(ctx, query, args...)
 	if err != nil {
 		return 0, err
 	}

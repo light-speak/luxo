@@ -90,10 +90,10 @@ var builtinDirectives = []DirectiveDef{
 	},
 	{
 		Name: "withAuth", Contexts: OnModel,
-		Params:      []ParamDef{{Name: "secret", Required: true}, {Name: "expires"}, {Name: "stores"}, {Name: "refresh"}, {Name: "default"}},
-		MaxArgs:     5,
+		Params:      []ParamDef{{Name: "stores", Required: true}, {Name: "default"}},
+		MaxArgs:     2,
 		HasBody:     false,
-		Description: "mark model as auth subject, auto-generates .createToken()/.verify()/.refreshToken(). default: true means @auth without args defaults to this model",
+		Description: "mark model as auth subject, auto-generates .createToken()/.verify()/.refreshToken(). stores: fields to store in JWT token. default: true means @auth without args defaults to this model. JWT secret/expires/refresh configured via .env",
 	},
 
 	// ===== Field-level directives — identity & indexing =====

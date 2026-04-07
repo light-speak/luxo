@@ -1787,20 +1787,13 @@ func (a *Analyzer) injectWithAuthMethods(typ *ResolvedType, directives []*ast.Di
 		IsMethod: true,
 		Doc:      ".verify(plain: String): Boolean — Verify password against @hash field / 校验 @hash 字段的密码",
 	}
-	// refreshToken only if refresh: true
-	for _, d := range directives {
-		if d.Name == "withAuth" {
-			for _, arg := range d.Args {
-				if arg.Name == "refresh" {
-					typ.Fields["refreshToken"] = &FieldInfo{
-						Name:     "refreshToken",
-						Type:     a.types["String"],
-						IsMethod: true,
-						Doc:      ".refreshToken(token: String): String — Refresh JWT token / 刷新 JWT 令牌",
-					}
-				}
-			}
-		}
+	// refreshToken always injected — whether refresh is enabled is controlled
+	// by JWT_REFRESH env var at runtime, not at compile time.
+	typ.Fields["refreshToken"] = &FieldInfo{
+		Name:     "refreshToken",
+		Type:     a.types["String"],
+		IsMethod: true,
+		Doc:      ".refreshToken(token: String): String — Refresh JWT token / 刷新 JWT 令牌",
 	}
 }
 

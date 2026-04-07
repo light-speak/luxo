@@ -17,19 +17,26 @@ const luxImport = "github.com/light-speak/luxo/pkg/lux"
 func generateQueryBuilder(b *strings.Builder, m *ast.ModelDecl) {
 	name := m.Name
 	tableName := toSnakeCase(name) + "s" // simple pluralize
+	soft := isSoftDelete(m)
 
-	generateScanner(b, m)
-	generateClient(b, name, tableName, m.Fields)
-	generateFieldConstants(b, name, m.Fields)
-	generateWhereFields(b, name, m.Fields)
-	generateCreateBuilder(b, name, m.Fields)
-	generateCreateManyBuilder(b, name, m.Fields)
-	generateUpdateBuilder(b, name, m.Fields)
+	// @soft: ensure deletedAt field exists for scanner/struct generation
+	fields := m.Fields
+	if soft && !hasDeletedAtField(m.Fields) {
+		fields = append(append([]*ast.FieldDecl{}, m.Fields...), softDeleteField())
+	}
+
+	generateScanner(b, &ast.ModelDecl{Name: m.Name, Fields: fields, Directives: m.Directives})
+	generateClient(b, name, tableName, fields, soft)
+	generateFieldConstants(b, name, fields)
+	generateWhereFields(b, name, fields)
+	generateCreateBuilder(b, name, fields)
+	generateCreateManyBuilder(b, name, fields)
+	generateUpdateBuilder(b, name, fields)
 }
 
 // --- Client ---
 
-func generateClient(b *strings.Builder, name, tableName string, fields []*ast.FieldDecl) {
+func generateClient(b *strings.Builder, name, tableName string, fields []*ast.FieldDecl, soft bool) {
 	scanFn := "scan" + name
 
 	// Determine id field type for Find method.
@@ -51,12 +58,34 @@ func (c *%sClient) Find(ctx context.Context, id %s) (*%s, error) {
 	return c.Where(%sWhere.Id.Eq(id)).First(ctx)
 }
 
-// Where starts a query with conditions.
+`, name, name, name,
+		name, name, idType, name, name)
+
+	// Where — @soft models inject deleted_at IS NULL by default
+	if soft {
+		fmt.Fprintf(b, `// Where starts a query with conditions. @soft: auto-filters deleted records.
+func (c *%sClient) Where(conds ...lux.Condition) *pg.Query[%s] {
+	conds = append(conds, lux.NewTimeField("deleted_at").IsNull())
+	return pg.NewQuery(c.db, %q, %s, conds)
+}
+
+// WithDeleted starts a query that includes soft-deleted records.
+func (c *%sClient) WithDeleted(conds ...lux.Condition) *pg.Query[%s] {
+	return pg.NewQuery(c.db, %q, %s, conds)
+}
+
+`, name, name, tableName, scanFn,
+			name, name, tableName, scanFn)
+	} else {
+		fmt.Fprintf(b, `// Where starts a query with conditions.
 func (c *%sClient) Where(conds ...lux.Condition) *pg.Query[%s] {
 	return pg.NewQuery(c.db, %q, %s, conds)
 }
 
-// Create starts a single-row create builder.
+`, name, name, tableName, scanFn)
+	}
+
+	fmt.Fprintf(b, `// Create starts a single-row create builder.
 func (c *%sClient) Create() *%sCreateBuilder {
 	return &%sCreateBuilder{CreateBase: pg.CreateBase[%s]{Db: c.db, Table: %q, Scan: %s}}
 }
@@ -66,11 +95,34 @@ func (c *%sClient) CreateMany() *%sCreateManyBuilder {
 	return &%sCreateManyBuilder{db: c.db, table: %q}
 }
 
-`, name, name, name,
-		name, name, idType, name, name,
-		name, name, tableName, scanFn,
-		name, name, name, name, tableName, scanFn,
+`, name, name, name, name, tableName, scanFn,
 		name, name, name, tableName)
+
+	// @soft: SoftDelete and ForceDelete
+	if soft {
+		fmt.Fprintf(b, `// SoftDelete marks matching records as deleted (sets deleted_at).
+func (c *%sClient) SoftDelete(ctx context.Context, conds ...lux.Condition) (int64, error) {
+	conds = append(conds, lux.NewTimeField("deleted_at").IsNull())
+	q := pg.NewQuery[%s](c.db, %q, %s, conds)
+	return q.Update(ctx, lux.SetField{Col: "deleted_at", Val: time.Now()})
+}
+
+// ForceDelete permanently removes matching records from the database.
+func (c *%sClient) ForceDelete(ctx context.Context, conds ...lux.Condition) (int64, error) {
+	q := pg.NewQuery[%s](c.db, %q, %s, conds)
+	return q.Delete(ctx)
+}
+
+// Restore un-deletes soft-deleted records matching the conditions.
+func (c *%sClient) Restore(ctx context.Context, conds ...lux.Condition) (int64, error) {
+	q := pg.NewQuery[%s](c.db, %q, %s, conds)
+	return q.Update(ctx, lux.SetField{Col: "deleted_at", Val: nil})
+}
+
+`, name, name, tableName, scanFn,
+			name, name, tableName, scanFn,
+			name, name, tableName, scanFn)
+	}
 }
 
 // --- Field constants ---

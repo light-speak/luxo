@@ -470,28 +470,35 @@ func TestHasNamedArgNotFound(t *testing.T) {
 
 // ========== checkDirectiveArgs required param provided ==========
 
-func TestDirectiveRequiredParamProvided(t *testing.T) {
-	// @withAuth requires 'secret' — providing it should not error
+func TestDirectiveWithAuthStores(t *testing.T) {
+	// @withAuth with stores — should work
 	result := analyze(t, `
-model User @withAuth(secret: "my-secret") {
+model User @withAuth(stores: [id, role]) {
   name: String
   email: String
 }
 `)
-	for _, err := range result.Errors {
-		if strings.Contains(err.Message, "requires parameter 'secret'") {
-			t.Errorf("should not error about required param when provided: %s", err.Message)
-		}
-	}
+	expectNoErrors(t, result)
 }
 
-func TestDirectiveRequiredParamMissing(t *testing.T) {
-	// @withAuth without 'secret' — should error
+func TestDirectiveWithAuthDefault(t *testing.T) {
+	// @withAuth(stores: ..., default: true) — marks this model as the default auth subject
 	result := analyze(t, `
-model User @withAuth(stores: "id") {
+model User @withAuth(stores: [id], default: true) {
   name: String
   email: String
 }
 `)
-	expectError(t, result, "requires parameter 'secret'")
+	expectNoErrors(t, result)
+}
+
+func TestDirectiveWithAuthMissingStores(t *testing.T) {
+	// @withAuth without stores — should error
+	result := analyze(t, `
+model User @withAuth {
+  name: String
+  email: String
+}
+`)
+	expectError(t, result, "requires parameter 'stores'")
 }

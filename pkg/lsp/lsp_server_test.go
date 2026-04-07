@@ -4155,7 +4155,7 @@ func TestCRUDBareFieldDefinitionNoFile(t *testing.T) {
 func TestDefinitionMyLoadField(t *testing.T) {
 	server, output := newTestServer()
 	uri := "file:///test_myload.luxo"
-	openDoc(server, output, uri, `model User @withAuth(secret: "s", stores: "id") {
+	openDoc(server, output, uri, `model User @withAuth(stores: [id]) {
   name: String
   role: String
 }
@@ -4178,7 +4178,7 @@ api test(): String @auth {
 func TestDefinitionMyLoadSecondArg(t *testing.T) {
 	server, output := newTestServer()
 	uri := "file:///test_myload2.luxo"
-	openDoc(server, output, uri, `model User @withAuth(secret: "s", stores: "id") {
+	openDoc(server, output, uri, `model User @withAuth(stores: [id]) {
   name: String
   role: String
 }
@@ -4220,7 +4220,7 @@ api test(): String {
 func TestDefinitionMyLoadNonexistentField(t *testing.T) {
 	server, output := newTestServer()
 	uri := "file:///test_myload_nofield.luxo"
-	openDoc(server, output, uri, `model User @withAuth(secret: "s", stores: "id") {
+	openDoc(server, output, uri, `model User @withAuth(stores: [id]) {
   name: String
 }
 api test(): String @auth {

@@ -21,7 +21,7 @@ enum Role {
   MODERATOR
 }
 
-model User @withAuth(secret: env("JWT_SECRET"), expires: 7d, stores: [id, role]) @crud {
+model User @withAuth(default: true) @crud {
   id:        Int
   name:      String   @filterable
   email:     String   @unique

@@ -1651,7 +1651,7 @@ api test(): Int {
 
 func TestWithAuthDirective(t *testing.T) {
 	result := analyze(t, `
-model User @withAuth(secret: "secret", stores: "id") {
+model User @withAuth(stores: [id, role]) {
   name: String
   email: String
 }
@@ -1677,7 +1677,7 @@ model User @withAuth(secret: "secret", stores: "id") {
 
 func TestWithAuthDirectiveRefreshTokenDoc(t *testing.T) {
 	result := analyze(t, `
-model User @withAuth(secret: "secret", stores: "id", refresh: true) {
+model User @withAuth(stores: [id, role]) {
   name: String
   email: String
 }
@@ -1688,8 +1688,9 @@ model User @withAuth(secret: "secret", stores: "id", refresh: true) {
 	if userType == nil {
 		t.Fatal("User type not found")
 	}
+	// refreshToken is always injected — runtime env controls whether it's enabled
 	if f, ok := userType.Fields["refreshToken"]; !ok {
-		t.Error("refreshToken field not injected when refresh: true")
+		t.Error("refreshToken field not injected")
 	} else if f.Doc == "" {
 		t.Error("refreshToken field missing Doc string")
 	}
@@ -1736,7 +1737,7 @@ func TestIsDynamicReturnCRUD(t *testing.T) {
 func TestMethodWithoutCallError(t *testing.T) {
 	// user.createToken without () should be a compile error
 	result := analyze(t, `
-model User @withAuth(secret: "secret", stores: "id") {
+model User @withAuth(stores: [id, role]) {
   name: String
   email: String
 }
@@ -1752,7 +1753,7 @@ api test(): String {
 func TestMethodWithCallOK(t *testing.T) {
 	// user.createToken() with () should be fine
 	result := analyze(t, `
-model User @withAuth(secret: "secret", stores: "id") {
+model User @withAuth(stores: [id, role]) {
   name: String
   email: String
 }
@@ -1768,7 +1769,7 @@ api test(): String {
 func TestMethodVerifyWithoutCallError(t *testing.T) {
 	// user.verify without () should be a compile error
 	result := analyze(t, `
-model User @withAuth(secret: "secret", stores: "id") {
+model User @withAuth(stores: [id, role]) {
   name: String
   email: String
 }
@@ -1784,7 +1785,7 @@ api test(): Boolean {
 func TestMethodRefreshTokenWithoutCallError(t *testing.T) {
 	// user.refreshToken without () should be a compile error
 	result := analyze(t, `
-model User @withAuth(secret: "secret", stores: "id", refresh: true) {
+model User @withAuth(stores: [id, role]) {
   name: String
   email: String
 }
@@ -1800,7 +1801,7 @@ api test(): String {
 func TestWithAuthIsMethodFlag(t *testing.T) {
 	// verify that IsMethod flag is set on injected auth methods
 	result := analyze(t, `
-model User @withAuth(secret: "secret", stores: "id", refresh: true) {
+model User @withAuth(stores: [id, role]) {
   name: String
   email: String
 }

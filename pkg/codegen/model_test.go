@@ -200,5 +200,91 @@ func TestCapitalize(t *testing.T) {
 	}
 }
 
+func TestIsSoftDelete(t *testing.T) {
+	soft := &ast.ModelDecl{Directives: []*ast.Directive{{Name: "soft"}}}
+	if !isSoftDelete(soft) {
+		t.Error("should be soft delete")
+	}
+
+	notSoft := &ast.ModelDecl{Directives: []*ast.Directive{{Name: "unique"}}}
+	if isSoftDelete(notSoft) {
+		t.Error("should not be soft delete")
+	}
+
+	none := &ast.ModelDecl{}
+	if isSoftDelete(none) {
+		t.Error("should not be soft delete with no directives")
+	}
+}
+
+func TestHasDeletedAtField(t *testing.T) {
+	fields := []*ast.FieldDecl{
+		{Name: "id"},
+		{Name: "deletedAt"},
+	}
+	if !hasDeletedAtField(fields) {
+		t.Error("should find deletedAt")
+	}
+	if hasDeletedAtField(fields[:1]) {
+		t.Error("should not find deletedAt")
+	}
+}
+
+func TestSoftDeleteField(t *testing.T) {
+	f := softDeleteField()
+	if f.Name != "deletedAt" {
+		t.Errorf("name = %q", f.Name)
+	}
+	if f.Type.Name != "DateTime" {
+		t.Errorf("type = %q", f.Type.Name)
+	}
+	if !f.Type.Nullable {
+		t.Error("should be nullable")
+	}
+}
+
+func TestGenerateModelWithSoftDelete(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "Post",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+		},
+		Directives: []*ast.Directive{{Name: "soft"}},
+	}
+
+	var b strings.Builder
+	generateModel(&b, m)
+	got := b.String()
+
+	if !strings.Contains(got, "DeletedAt") {
+		t.Errorf("missing DeletedAt:\n%s", got)
+	}
+	if !strings.Contains(got, "*time.Time") {
+		t.Errorf("missing *time.Time:\n%s", got)
+	}
+}
+
+func TestGenerateModelSoftDeleteExistingField(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "Post",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "deletedAt", Type: &ast.TypeRef{Name: "DateTime", Nullable: true}},
+		},
+		Directives: []*ast.Directive{{Name: "soft"}},
+	}
+
+	var b strings.Builder
+	generateModel(&b, m)
+	got := b.String()
+
+	// Should NOT duplicate DeletedAt
+	count := strings.Count(got, "DeletedAt")
+	if count != 1 {
+		t.Errorf("DeletedAt should appear once, got %d:\n%s", count, got)
+	}
+}
+
 // suppress unused import warning
 var _ = token.Position{}

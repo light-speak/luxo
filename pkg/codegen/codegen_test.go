@@ -345,3 +345,77 @@ func TestGenerateUUIDPrimaryKeyFind(t *testing.T) {
 		t.Errorf("UpdateBase should use uuid.UUID as ID type:\n%s", dbSrc)
 	}
 }
+
+func TestGenerateSoftDeleteModel(t *testing.T) {
+	file := &ast.File{
+		Name: "test.luxo",
+		Models: []*ast.ModelDecl{
+			{
+				Name: "Post",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+				},
+				Directives: []*ast.Directive{{Name: "soft"}},
+			},
+		},
+	}
+
+	gr := Generate(result(file), "gen")
+	modelSrc := string(gr.Files["model.gen.go"])
+	dbSrc := string(gr.Files["db.gen.go"])
+
+	// model.gen.go should have deletedAt field and time import
+	if !strings.Contains(modelSrc, "DeletedAt") {
+		t.Errorf("missing DeletedAt field in model:\n%s", modelSrc)
+	}
+	if !strings.Contains(modelSrc, "*time.Time") {
+		t.Errorf("missing *time.Time for deletedAt:\n%s", modelSrc)
+	}
+	if !strings.Contains(modelSrc, `"time"`) {
+		t.Errorf("missing time import for @soft model:\n%s", modelSrc)
+	}
+
+	// db.gen.go should have soft delete methods
+	if !strings.Contains(dbSrc, "SoftDelete") {
+		t.Errorf("missing SoftDelete in db:\n%s", dbSrc)
+	}
+	if !strings.Contains(dbSrc, "ForceDelete") {
+		t.Errorf("missing ForceDelete in db:\n%s", dbSrc)
+	}
+	if !strings.Contains(dbSrc, "WithDeleted") {
+		t.Errorf("missing WithDeleted in db:\n%s", dbSrc)
+	}
+	if !strings.Contains(dbSrc, "Restore") {
+		t.Errorf("missing Restore in db:\n%s", dbSrc)
+	}
+	if !strings.Contains(dbSrc, `"time"`) {
+		t.Errorf("missing time import in db for @soft:\n%s", dbSrc)
+	}
+}
+
+func TestGenerateSoftDeleteWithExistingDeletedAt(t *testing.T) {
+	file := &ast.File{
+		Name: "test.luxo",
+		Models: []*ast.ModelDecl{
+			{
+				Name: "Post",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+					{Name: "deletedAt", Type: &ast.TypeRef{Name: "DateTime", Nullable: true}},
+				},
+				Directives: []*ast.Directive{{Name: "soft"}},
+			},
+		},
+	}
+
+	gr := Generate(result(file), "gen")
+	modelSrc := string(gr.Files["model.gen.go"])
+
+	// Should not duplicate deletedAt
+	count := strings.Count(modelSrc, "DeletedAt")
+	if count != 1 {
+		t.Errorf("DeletedAt should appear exactly once, got %d:\n%s", count, modelSrc)
+	}
+}

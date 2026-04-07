@@ -19,11 +19,17 @@ type fieldInfo struct {
 // generateModel generates a Go struct for a Luxo model declaration.
 // Pre-computes field widths and aligns output without needing gofmt.
 func generateModel(b *strings.Builder, m *ast.ModelDecl) {
+	// Collect effective fields — @soft adds deletedAt if missing.
+	effectiveFields := m.Fields
+	if isSoftDelete(m) && !hasDeletedAtField(m.Fields) {
+		effectiveFields = append(append([]*ast.FieldDecl{}, m.Fields...), softDeleteField())
+	}
+
 	// First pass: collect field info and measure widths.
 	var fields []fieldInfo
 	maxName := 0
 	maxType := 0
-	for _, f := range m.Fields {
+	for _, f := range effectiveFields {
 		if f.Computed != nil {
 			continue
 		}
@@ -127,6 +133,29 @@ func isAutoManaged(f *ast.FieldDecl) bool {
 // isAutoOnUpdate returns true if the field is auto-filled on UPDATE.
 func isAutoOnUpdate(f *ast.FieldDecl) bool {
 	return f.Name == "updatedAt" && f.Type != nil && f.Type.Name == "DateTime"
+}
+
+// isSoftDelete returns true if the model has @soft directive.
+func isSoftDelete(m *ast.ModelDecl) bool {
+	return hasDirective(m.Directives, "soft")
+}
+
+// hasDeletedAtField returns true if the model already has a deletedAt field.
+func hasDeletedAtField(fields []*ast.FieldDecl) bool {
+	for _, f := range fields {
+		if f.Name == "deletedAt" {
+			return true
+		}
+	}
+	return false
+}
+
+// softDeleteField returns a synthetic deletedAt field for @soft models.
+func softDeleteField() *ast.FieldDecl {
+	return &ast.FieldDecl{
+		Name: "deletedAt",
+		Type: &ast.TypeRef{Name: "DateTime", Nullable: true},
+	}
 }
 
 func hasDirective(directives []*ast.Directive, name string) bool {
