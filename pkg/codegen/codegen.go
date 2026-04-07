@@ -27,6 +27,11 @@ func Generate(result *semantic.Result, packageName string) *GenerateResult {
 		gr.Files["db.gen.go"] = dbSrc
 	}
 
+	// app.gen.go — App struct wiring all Clients
+	if appSrc := generateAppFile(result, packageName); appSrc != nil {
+		gr.Files["app.gen.go"] = appSrc
+	}
+
 	return gr
 }
 
@@ -182,6 +187,82 @@ func scanDBFieldImports(f *ast.FieldDecl, needs *dbImportNeeds) {
 	case "Decimal":
 		needs.decimal = true
 	}
+}
+
+// generateAppFile produces app.gen.go containing the App struct that wires all Clients.
+// Returns nil if there are no models.
+func generateAppFile(result *semantic.Result, packageName string) []byte {
+	var models []string
+	for _, file := range result.Files {
+		for _, m := range file.Models {
+			models = append(models, m.Name)
+		}
+	}
+	if len(models) == 0 {
+		return nil
+	}
+
+	var b strings.Builder
+	writeHeader(&b, packageName, "app.gen.go")
+
+	b.WriteString("import (\n")
+	b.WriteString("\t\"context\"\n")
+	b.WriteString("\t\"fmt\"\n")
+	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/env\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/pg\"\n")
+	b.WriteString(")\n\n")
+
+	// App struct
+	b.WriteString("// App is the entry point for all database operations.\n")
+	b.WriteString("type App struct {\n")
+	b.WriteString("\tDB *pg.DB\n")
+	for _, name := range models {
+		fmt.Fprintf(&b, "\t%s *%sClient\n", name, name)
+	}
+	b.WriteString("}\n\n")
+
+	// New function
+	b.WriteString("// New creates an App by reading DATABASE_URL from the environment.\n")
+	b.WriteString("// Call env.Load(\".env\") before New() if using a .env file.\n")
+	b.WriteString("func New(ctx context.Context) (*App, error) {\n")
+	b.WriteString("\turl, ok := env.Get(\"DATABASE_URL\")\n")
+	b.WriteString("\tif !ok {\n")
+	b.WriteString("\t\treturn nil, fmt.Errorf(\"luxo: DATABASE_URL is not set\")\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\tdb, err := pg.NewDB(ctx, url)\n")
+	b.WriteString("\tif err != nil {\n")
+	b.WriteString("\t\treturn nil, fmt.Errorf(\"luxo: connect to database: %w\", err)\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\treturn NewFromDB(db), nil\n")
+	b.WriteString("}\n\n")
+
+	// NewFromDB function
+	b.WriteString("// NewFromDB creates an App from an existing *pg.DB.\n")
+	b.WriteString("func NewFromDB(db *pg.DB) *App {\n")
+	b.WriteString("\treturn &App{\n")
+	b.WriteString("\t\tDB: db,\n")
+	for _, name := range models {
+		fmt.Fprintf(&b, "\t\t%s: &%sClient{db: db},\n", name, name)
+	}
+	b.WriteString("\t}\n")
+	b.WriteString("}\n\n")
+
+	// Close function
+	b.WriteString("// Close closes the database connection.\n")
+	b.WriteString("func (a *App) Close() {\n")
+	b.WriteString("\ta.DB.Close()\n")
+	b.WriteString("}\n\n")
+
+	// Tx function
+	b.WriteString("// Tx runs fn inside a transaction. The App passed to fn uses the transaction\n")
+	b.WriteString("// for all queries. If fn returns nil, the transaction commits; otherwise it rolls back.\n")
+	b.WriteString("func (a *App) Tx(ctx context.Context, fn func(tx *App) error) error {\n")
+	b.WriteString("\treturn a.DB.Tx(ctx, func(txDB *pg.DB) error {\n")
+	b.WriteString("\t\treturn fn(NewFromDB(txDB))\n")
+	b.WriteString("\t})\n")
+	b.WriteString("}\n")
+
+	return []byte(b.String())
 }
 
 // writeDBImports writes import block for db.gen.go.

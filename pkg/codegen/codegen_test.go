@@ -419,3 +419,89 @@ func TestGenerateSoftDeleteWithExistingDeletedAt(t *testing.T) {
 		t.Errorf("DeletedAt should appear exactly once, got %d:\n%s", count, modelSrc)
 	}
 }
+
+func TestGenerateAppFile(t *testing.T) {
+	file := &ast.File{
+		Name: "test.luxo",
+		Models: []*ast.ModelDecl{
+			{
+				Name: "User",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+				},
+			},
+			{
+				Name: "Order",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "total", Type: &ast.TypeRef{Name: "Float"}},
+				},
+			},
+		},
+	}
+
+	gr := Generate(result(file), "gen")
+	appSrc := string(gr.Files["app.gen.go"])
+
+	checks := []string{
+		"package gen",
+		"type App struct",
+		"DB *pg.DB",
+		"User *UserClient",
+		"Order *OrderClient",
+		"func New(ctx context.Context) (*App, error)",
+		`env.Get("DATABASE_URL")`,
+		"pg.NewDB(ctx, url)",
+		"func NewFromDB(db *pg.DB) *App",
+		"&UserClient{db: db}",
+		"&OrderClient{db: db}",
+		"func (a *App) Close()",
+		"func (a *App) Tx(ctx context.Context, fn func(tx *App) error) error",
+		"NewFromDB(txDB)",
+	}
+	for _, check := range checks {
+		if !strings.Contains(appSrc, check) {
+			t.Errorf("missing %q in app.gen.go:\n%s", check, appSrc)
+		}
+	}
+}
+
+func TestGenerateAppFileNoModels(t *testing.T) {
+	file := &ast.File{
+		Name: "test.luxo",
+		Enums: []*ast.EnumDecl{
+			{Name: "Role", Values: []string{"USER", "ADMIN"}},
+		},
+	}
+
+	gr := Generate(result(file), "gen")
+	if _, ok := gr.Files["app.gen.go"]; ok {
+		t.Error("app.gen.go should not be generated when no models exist")
+	}
+}
+
+func TestGenerateAppFileSingleModel(t *testing.T) {
+	file := &ast.File{
+		Name: "test.luxo",
+		Models: []*ast.ModelDecl{
+			{
+				Name: "Post",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+				},
+			},
+		},
+	}
+
+	gr := Generate(result(file), "gen")
+	appSrc := string(gr.Files["app.gen.go"])
+
+	if !strings.Contains(appSrc, "Post *PostClient") {
+		t.Errorf("missing Post client:\n%s", appSrc)
+	}
+	// Should NOT contain other models
+	if strings.Contains(appSrc, "User") {
+		t.Errorf("should not contain User:\n%s", appSrc)
+	}
+}
