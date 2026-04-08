@@ -1,5 +1,6 @@
 #!/bin/sh
-# Luxo pre-commit hook — quality gate
+# Luxo pre-commit hook — fast quality gate (<3s)
+# Full tests run on CI (PR checks), not here.
 # Install: cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
 
 set -e
@@ -17,14 +18,14 @@ echo "=== go vet ==="
 go vet ./pkg/... ./cmd/...
 
 echo "=== gocyclo ==="
-VIOLATIONS=$(gocyclo -over 15 pkg/ 2>/dev/null || true)
+VIOLATIONS=$(gocyclo -over 15 pkg/ cmd/ 2>/dev/null || true)
 if [ -n "$VIOLATIONS" ]; then
   echo "ERROR: Cyclomatic complexity > 15:"
   echo "$VIOLATIONS"
   exit 1
 fi
 
-echo "=== go test ==="
-go test ./pkg/... -timeout 120s -count=1
+echo "=== go mod tidy ==="
+go mod tidy
 
 echo "=== All checks passed ==="
