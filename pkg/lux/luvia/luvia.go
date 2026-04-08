@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/lux/api"
+	"github.com/light-speak/luxo/pkg/lux/auth"
 	"github.com/light-speak/luxo/pkg/lux/env"
 )
 
@@ -38,8 +39,15 @@ func (g *Gateway) Serve(version string) error {
 	printBanner(version, port, mode, transport, dbURL, g.modules)
 
 	mux := http.NewServeMux()
-	mux.Handle("/luvia", g.Router)
 	mux.HandleFunc("/health", handleHealth)
+
+	// JWT auth middleware — wraps /luvia handler
+	var handler http.Handler = g.Router
+	jwtCfg, err := auth.LoadConfig()
+	if err == nil {
+		handler = AuthMiddleware(jwtCfg, handler)
+	}
+	mux.Handle("/luvia", handler)
 
 	addr := ":" + port
 	fmt.Printf("  Listening on http://localhost%s\n\n", addr)
