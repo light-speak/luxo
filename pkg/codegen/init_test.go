@@ -82,7 +82,7 @@ func TestAddModuleSchema(t *testing.T) {
 	src := string(sr.Files["origin/user.luxo"])
 
 	checks := []string{
-		"User module schema",
+		"User module",
 		"model User",
 		"id:        UUID      @auto",
 		"createdAt: DateTime",

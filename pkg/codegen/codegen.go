@@ -32,6 +32,11 @@ func Generate(result *semantic.Result, packageName string) *GenerateResult {
 		gr.Files["app.gen.go"] = appSrc
 	}
 
+	// dataloader.gen.go — relation loaders
+	if dlSrc := generateDataLoaderFile(result, packageName); dlSrc != nil {
+		gr.Files["dataloader.gen.go"] = dlSrc
+	}
+
 	// handler.gen.go — CRUD handlers + RegisterHandlers
 	if handlerSrc := generateHandlerFile(result, packageName); handlerSrc != nil {
 		gr.Files["handler.gen.go"] = handlerSrc
@@ -236,12 +241,27 @@ func generateAppFile(result *semantic.Result, packageName string) []byte {
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/pg\"\n")
 	b.WriteString(")\n\n")
 
+	// Check if any model has relations (needs loaders field)
+	enums := collectEnums(result)
+	hasRelations := false
+	for _, file := range result.Files {
+		for _, m := range file.Models {
+			if len(analyzeRelations(m, enums)) > 0 {
+				hasRelations = true
+				break
+			}
+		}
+	}
+
 	// App struct
 	b.WriteString("// App is the entry point for all database operations.\n")
 	b.WriteString("type App struct {\n")
 	b.WriteString("\tDB *pg.DB\n")
 	for _, name := range models {
 		fmt.Fprintf(&b, "\t%s *%sClient\n", name, name)
+	}
+	if hasRelations {
+		b.WriteString("\tloaders Loaders\n")
 	}
 	b.WriteString("}\n\n")
 
