@@ -85,7 +85,7 @@ func generateGoMod(modulePath string) []byte {
 func generateModuleSchema(moduleName string) []byte {
 	name := capitalize(moduleName)
 	var b strings.Builder
-	fmt.Fprintf(&b, "// %s module schema\n\n", name)
+	fmt.Fprintf(&b, "// %s module\n\n", name)
 	fmt.Fprintf(&b, "model %s {\n", name)
 	b.WriteString("  id:        UUID      @auto\n")
 	b.WriteString("  createdAt: DateTime\n")

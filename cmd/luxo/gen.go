@@ -62,6 +62,15 @@ func runGen(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Generate embedded entry point: luxis/app/main.gen.go
+	modulePath, _ := readModulePath()
+	if modulePath != "" {
+		if err := generateEntry(result, modulePath); err != nil {
+			return err
+		}
+		totalFiles++
+	}
+
 	green := "\033[32m"
 	dim := "\033[2m"
 	bold := "\033[1m"
@@ -152,6 +161,25 @@ func generateModules(files []*ast.File, result *semantic.Result) (int, error) {
 		}
 	}
 	return total, nil
+}
+
+func generateEntry(result *semantic.Result, modulePath string) error {
+	green := "\033[32m"
+	reset := "\033[0m"
+	src := codegen.GenerateEntryFile(result, modulePath)
+	if src == nil {
+		return nil
+	}
+	outDir := filepath.Join("luxis", "app")
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		return fmt.Errorf("create %s: %w", outDir, err)
+	}
+	outPath := filepath.Join(outDir, "main.gen.go")
+	if err := os.WriteFile(outPath, src, 0644); err != nil {
+		return fmt.Errorf("write %s: %w", outPath, err)
+	}
+	fmt.Printf("  %s+%s %s\n", green, reset, outPath)
+	return nil
 }
 
 func parseFile(path string) (*ast.File, error) {
