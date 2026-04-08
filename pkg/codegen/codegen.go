@@ -32,6 +32,11 @@ func Generate(result *semantic.Result, packageName string) *GenerateResult {
 		gr.Files["app.gen.go"] = appSrc
 	}
 
+	// handler.gen.go — CRUD handlers + RegisterHandlers
+	if handlerSrc := generateHandlerFile(result, packageName); handlerSrc != nil {
+		gr.Files["handler.gen.go"] = handlerSrc
+	}
+
 	return gr
 }
 
@@ -46,6 +51,25 @@ func generateModelFile(result *semantic.Result, packageName string) []byte {
 	for _, file := range result.Files {
 		for _, e := range file.Enums {
 			generateEnum(&b, e)
+			b.WriteByte('\n')
+		}
+	}
+
+	// Collect model names to avoid duplicate struct generation from extend.
+	modelNames := make(map[string]bool)
+	for _, file := range result.Files {
+		for _, m := range file.Models {
+			modelNames[m.Name] = true
+		}
+	}
+
+	// extend stubs — generate minimal structs for external types
+	for _, file := range result.Files {
+		for _, ext := range file.Extends {
+			if modelNames[ext.Name] {
+				continue // already defined as a full model in this file
+			}
+			generateExtendStub(&b, ext)
 			b.WriteByte('\n')
 		}
 	}

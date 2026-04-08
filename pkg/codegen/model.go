@@ -62,6 +62,42 @@ func generateModel(b *strings.Builder, m *ast.ModelDecl) {
 	b.WriteString("}\n")
 }
 
+// generateExtendStub generates a minimal Go struct for an extend declaration.
+// This provides type information for cross-module references.
+func generateExtendStub(b *strings.Builder, ext *ast.ExtendDecl) {
+	var fields []fieldInfo
+	maxName := 0
+	maxType := 0
+	for _, f := range ext.Fields {
+		if f.Computed != nil {
+			continue
+		}
+		fi := fieldInfo{
+			goName:  capitalize(f.Name),
+			goType:  resolveGoType(f.Type),
+			dbTag:   toSnakeCase(f.Name),
+			jsonTag: f.Name,
+		}
+		if len(fi.goName) > maxName {
+			maxName = len(fi.goName)
+		}
+		if len(fi.goType) > maxType {
+			maxType = len(fi.goType)
+		}
+		fields = append(fields, fi)
+	}
+
+	fmt.Fprintf(b, "// %s is a stub for the external %s model (from extend).\n", ext.Name, ext.Name)
+	fmt.Fprintf(b, "type %s struct {\n", ext.Name)
+	for _, fi := range fields {
+		fmt.Fprintf(b, "\t%-*s %-*s `db:%q json:%q`\n",
+			maxName, fi.goName,
+			maxType, fi.goType,
+			fi.dbTag, fi.jsonTag)
+	}
+	b.WriteString("}\n")
+}
+
 // resolveGoType maps a Luxo TypeRef to a Go type string.
 func resolveGoType(t *ast.TypeRef) string {
 	if t == nil {

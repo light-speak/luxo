@@ -49,6 +49,12 @@ func runAdd(cmd *cobra.Command, args []string) error {
 
 	sr := codegen.AddModule(modulePath, moduleName)
 
+	green := "\033[32m"
+	cyan := "\033[36m"
+	dim := "\033[2m"
+	bold := "\033[1m"
+	reset := "\033[0m"
+
 	for relPath, content := range sr.Files {
 		if err := os.MkdirAll(filepath.Dir(relPath), 0755); err != nil {
 			return fmt.Errorf("create directory for %s: %w", relPath, err)
@@ -56,12 +62,13 @@ func runAdd(cmd *cobra.Command, args []string) error {
 		if err := os.WriteFile(relPath, content, 0644); err != nil {
 			return fmt.Errorf("write %s: %w", relPath, err)
 		}
-		fmt.Printf("  created %s\n", relPath)
+		fmt.Printf("  %s+%s %s\n", green, reset, relPath)
 	}
 
-	fmt.Printf("\nModule %s added / 模块 %s 已添加\n\n", moduleName, moduleName)
-	fmt.Printf("  1. Edit origin/%s.luxo / 编辑 origin/%s.luxo 定义 schema\n", moduleName, moduleName)
-	fmt.Println("  2. luxo gen              Generate Go code / 生成 Go 代码")
+	fmt.Printf("\n%s%s✓ Module %s added / 模块已添加%s\n\n", bold, green, moduleName, reset)
+	fmt.Printf("  %sNext / 下一步:%s\n\n", dim, reset)
+	fmt.Printf("    %s1.%s Define %sorigin/%s.luxo%s / 定义 origin/%s.luxo\n", cyan, reset, bold, moduleName, reset, moduleName)
+	fmt.Printf("    %s2.%s Run  %s$%s luxo gen   %s# generate code / 生成代码%s\n", cyan, reset, cyan, reset, dim, reset)
 	fmt.Println()
 
 	return nil

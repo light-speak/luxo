@@ -71,11 +71,19 @@ func runInit(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	fmt.Printf("Created project %s / 项目 %s 已创建\n\n", projectName, projectName)
-	fmt.Printf("  cd %s\n", projectName)
-	fmt.Println("  luxo add <module>    Add a service module / 添加服务模块")
-	fmt.Println("  luxo gen             Generate Go code / 生成 Go 代码")
-	fmt.Println("  cp .env.example .env Configure environment / 配置环境变量")
+	green := "\033[32m"
+	cyan := "\033[36m"
+	dim := "\033[2m"
+	bold := "\033[1m"
+	reset := "\033[0m"
+
+	fmt.Printf("\n%s%s✓ Project %s created / 项目已创建%s\n\n", bold, green, projectName, reset)
+	fmt.Printf("  %sGet started / 开始使用:%s\n\n", dim, reset)
+	fmt.Printf("    %s$%s cd %s\n", cyan, reset, projectName)
+	fmt.Printf("    %s$%s luxo add user          %s# add a module / 添加模块%s\n", cyan, reset, dim, reset)
+	fmt.Printf("    %s$%s luxo gen               %s# generate code / 生成代码%s\n", cyan, reset, dim, reset)
+	fmt.Printf("    %s$%s cp .env.example .env   %s# configure env / 配置环境%s\n", cyan, reset, dim, reset)
+	fmt.Printf("    %s$%s luxo run               %s# start server / 启动服务%s\n", cyan, reset, dim, reset)
 	fmt.Println()
 
 	return nil
