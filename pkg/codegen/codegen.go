@@ -42,6 +42,11 @@ func Generate(result *semantic.Result, packageName string) *GenerateResult {
 		gr.Files["handler.gen.go"] = handlerSrc
 	}
 
+	// native.gen.go — NativeResolver interface for @native APIs
+	if nativeSrc := GenerateNativeFile(result, packageName); nativeSrc != nil {
+		gr.Files["native.gen.go"] = nativeSrc
+	}
+
 	return gr
 }
 
