@@ -286,7 +286,7 @@ Same task in TypeScript? 150+ lines, 4 packages, no compile-time safety.
 
 ### Phase 1 — Compiler ✅
 - [x] Lexer · Parser (32 keywords, Pratt parser)
-- [x] Semantic Analyzer (type checking, null safety, field injection, 59 directives)
+- [x] Semantic Analyzer (type checking, null safety, field injection, 58 directives)
 - [x] LSP Server (diagnostics, completion, hover, go-to-definition, references)
 - [x] VS Code Extension (syntax highlighting, LSP integration)
 

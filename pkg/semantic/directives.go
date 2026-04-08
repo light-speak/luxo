@@ -188,11 +188,6 @@ var builtinDirectives = []DirectiveDef{
 		MaxArgs:     1,
 		Description: "mark as deprecated with optional reason",
 	},
-	{
-		Name: "reserved", Contexts: OnField,
-		Description: "field name is reserved for future use",
-	},
-
 	// ===== Field-level directives — validation (String) =====
 	{
 		Name: "email", Contexts: OnField,
