@@ -18,11 +18,11 @@ type Request struct {
 
 // ParseRequest reads an HTTP request body and extracts $api, $select, and params.
 func ParseRequest(r *http.Request) (*Request, error) {
+	defer r.Body.Close()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
 	}
-	defer r.Body.Close()
 
 	if len(body) == 0 {
 		return nil, fmt.Errorf("empty request body")

@@ -34,7 +34,7 @@ func TestGenerateCreateTable(t *testing.T) {
 		mkField("email", "String", &luxoast.Directive{Name: "unique"}),
 	})
 
-	up, down := generateCreateTable(m)
+	up, down := generateCreateTable(m, nil)
 
 	checks := []string{
 		"CREATE TABLE users",
@@ -62,7 +62,7 @@ func TestGenerateCreateTableSoftDelete(t *testing.T) {
 		mkField("title", "String"),
 	})
 
-	up, _ := generateCreateTable(m)
+	up, _ := generateCreateTable(m, nil)
 
 	if !strings.Contains(up, "deleted_at TIMESTAMPTZ") {
 		t.Errorf("missing deleted_at for @soft:\n%s", up)
@@ -75,7 +75,7 @@ func TestGenerateCreateTableNoTime(t *testing.T) {
 		mkField("value", "String"),
 	})
 
-	up, _ := generateCreateTable(m)
+	up, _ := generateCreateTable(m, nil)
 
 	if strings.Contains(up, "created_at") {
 		t.Error("@noTime should skip created_at")
@@ -91,7 +91,7 @@ func TestGenerateCreateTableIndex(t *testing.T) {
 		mkField("name", "String", &luxoast.Directive{Name: "index"}),
 	})
 
-	up, _ := generateCreateTable(m)
+	up, _ := generateCreateTable(m, nil)
 
 	if !strings.Contains(up, "CREATE INDEX idx_users_name ON users (name)") {
 		t.Errorf("missing index:\n%s", up)
@@ -105,7 +105,7 @@ func TestGenerateCreateTableSkipsRelation(t *testing.T) {
 		{Name: "comments", Type: &luxoast.TypeRef{Name: "Comment", IsList: true}},
 	})
 
-	up, _ := generateCreateTable(m)
+	up, _ := generateCreateTable(m, nil)
 
 	if strings.Contains(up, "comments") {
 		t.Error("relation field should be skipped")
@@ -118,7 +118,7 @@ func TestGenerateCreateTableNullable(t *testing.T) {
 		{Name: "avatar", Type: &luxoast.TypeRef{Name: "String", Nullable: true}},
 	})
 
-	up, _ := generateCreateTable(m)
+	up, _ := generateCreateTable(m, nil)
 
 	// Nullable field should not have NOT NULL
 	if strings.Contains(up, "avatar TEXT NOT NULL") {

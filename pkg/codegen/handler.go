@@ -230,14 +230,11 @@ func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType
 	fmt.Fprintf(b, "\t\tif err != nil {\n")
 	fmt.Fprintf(b, "\t\t\treturn nil, err\n")
 	fmt.Fprintf(b, "\t\t}\n")
-	fmt.Fprintf(b, "\t\tobj, err := app.%s.Find(ctx, id)\n", name)
-	fmt.Fprintf(b, "\t\tif err != nil {\n")
+	fmt.Fprintf(b, "\t\tif _, err := app.%s.Find(ctx, id); err != nil {\n", name)
 	fmt.Fprintf(b, "\t\t\treturn nil, err\n")
 	fmt.Fprintf(b, "\t\t}\n")
 	tableName := toSnakeCase(name) + "s"
-	scanFn := "scan" + name
 	fmt.Fprintf(b, "\t\tbuilder := new%sUpdateBuilder(app.%s.db, %q, id)\n", name, name, tableName)
-	_ = scanFn
 
 	for _, f := range m.Fields {
 		if skipHandlerField(f, enums) || f.Name == "id" || hasDirective(f.Directives, "immutable") {
@@ -248,8 +245,6 @@ func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType
 		generateParamSet(b, f, setter, "\t\t\t", enums)
 		fmt.Fprintf(b, "\t\t}\n")
 	}
-
-	fmt.Fprintf(b, "\t\t_ = obj\n") // suppress unused if no updatable fields
 	fmt.Fprintf(b, "\t\treturn builder.Exec(ctx)\n")
 	fmt.Fprintf(b, "\t}\n")
 	fmt.Fprintf(b, "}\n\n")

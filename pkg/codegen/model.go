@@ -225,9 +225,7 @@ func capitalize(s string) string {
 	if s == "" {
 		return s
 	}
-	r := []rune(s)
-	r[0] = unicode.ToUpper(r[0])
-	return string(r)
+	return string(unicode.ToUpper(rune(s[0]))) + s[1:]
 }
 
 // toSnakeCase converts camelCase to snake_case.

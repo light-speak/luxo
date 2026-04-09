@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/semantic"
 )
 
@@ -105,17 +104,4 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("}\n")
 
 	return []byte(b.String())
-}
-
-// collectModuleNames extracts module names from parsed files.
-func collectModuleNames(files []*ast.File) []string {
-	var names []string
-	for _, f := range files {
-		name := strings.TrimSuffix(f.Name, ".luxo")
-		if idx := strings.LastIndex(name, "/"); idx >= 0 {
-			name = name[idx+1:]
-		}
-		names = append(names, name)
-	}
-	return names
 }

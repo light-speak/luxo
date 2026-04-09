@@ -2,9 +2,9 @@ package lockfile
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"sort"
+	"strconv"
 
 	"github.com/light-speak/luxo/pkg/ast"
 )
@@ -42,7 +42,7 @@ func (ml *ModelLock) MarshalJSON() ([]byte, error) {
 	var b []byte
 	b = append(b, '{')
 	b = append(b, `"next_id":`...)
-	b = append(b, []byte(fmt.Sprintf("%d", ml.NextID))...)
+	b = strconv.AppendInt(b, int64(ml.NextID), 10)
 
 	b = append(b, `,"fields":{`...)
 	for i, e := range entries {
@@ -52,7 +52,7 @@ func (ml *ModelLock) MarshalJSON() ([]byte, error) {
 		key, _ := json.Marshal(e.Name)
 		b = append(b, key...)
 		b = append(b, ':')
-		b = append(b, []byte(fmt.Sprintf("%d", e.ID))...)
+		b = strconv.AppendInt(b, int64(e.ID), 10)
 	}
 	b = append(b, '}')
 

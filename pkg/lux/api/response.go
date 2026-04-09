@@ -8,34 +8,29 @@ import (
 
 // FilterFields filters a JSON-serializable value by the given field selection.
 // If fields is nil, returns the full value (no filtering).
+// Marshals data to JSON once, then filters — one marshal + one unmarshal.
 func FilterFields(data any, fields []*selection.Field) (json.RawMessage, error) {
-	if fields == nil {
-		return json.Marshal(data)
-	}
-
-	// Marshal to JSON first, then filter
 	raw, err := json.Marshal(data)
 	if err != nil {
 		return nil, err
 	}
-
+	if fields == nil {
+		return raw, nil
+	}
 	return filterRaw(raw, fields)
 }
 
 // filterRaw applies field selection to a raw JSON value.
 func filterRaw(raw json.RawMessage, fields []*selection.Field) (json.RawMessage, error) {
-	// Detect if it's an array or object
 	if len(raw) == 0 {
 		return raw, nil
 	}
-
 	switch raw[0] {
 	case '[':
 		return filterArray(raw, fields)
 	case '{':
 		return filterObject(raw, fields)
 	default:
-		// scalar — return as-is
 		return raw, nil
 	}
 }
