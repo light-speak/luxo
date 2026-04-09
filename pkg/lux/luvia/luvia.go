@@ -45,9 +45,18 @@ func (g *Gateway) buildMux(version string) (*http.ServeMux, string) {
 	port := envOr("APP_PORT", "4000")
 	mode := envOr("DEPLOY_MODE", "embedded")
 	transport := envOr("TRANSPORT_MODE", "json")
-	dbURL := envOr("DATABASE_URL", "")
 
-	printBanner(version, port, mode, transport, dbURL, g.modules)
+	// Build DB display string from DATABASE_* fields
+	dbHost := envOr("DATABASE_HOST", "")
+	dbPort := envOr("DATABASE_PORT", "5432")
+	dbUser := envOr("DATABASE_USER", "")
+	dbPrefix := envOr("DATABASE_PREFIX", "")
+	dbDisplay := ""
+	if dbHost != "" {
+		dbDisplay = fmt.Sprintf("%s@%s:%s/%s", dbUser, dbHost, dbPort, dbPrefix)
+	}
+
+	printBanner(version, port, mode, transport, dbDisplay, g.modules)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", handleHealth)
