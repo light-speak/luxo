@@ -276,13 +276,13 @@ func generateOpSQL(upB, downB *strings.Builder, op DiffOp, desired *SchemaState,
 	case CreateTable:
 		ms := desired.Models[op.Model]
 		upB.WriteString(generateCreateTableSQL(ms, d))
-		fmt.Fprintf(downB, "DROP TABLE IF EXISTS %s;\n", op.Table)
+		fmt.Fprintf(downB, "DROP TABLE IF EXISTS %s;\n", op.Table) // down is always real DROP (reverting a CREATE)
 	case DropTable:
 		upB.WriteString(d.DropTable(op.Table))
 		fmt.Fprintf(downB, "-- Recreate %s table manually if needed\n", op.Table)
 	case AddColumn:
 		upB.WriteString(d.AddColumn(op.Table, d.ColumnDef(op.Column, toColumnInfo(op.NewColumn))))
-		fmt.Fprintf(downB, "ALTER TABLE %s DROP COLUMN %s;\n", op.Table, op.Column)
+		fmt.Fprintf(downB, "ALTER TABLE %s DROP COLUMN %s;\n", op.Table, op.Column) // down reverts ADD, always real DROP
 	case DropColumn:
 		upB.WriteString(d.DropColumn(op.Table, op.Column))
 		downB.WriteString(d.AddColumn(op.Table, d.ColumnDef(op.Column, toColumnInfo(op.OldColumn))))
