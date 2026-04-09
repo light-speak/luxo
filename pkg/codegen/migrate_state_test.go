@@ -220,19 +220,19 @@ func TestDiffNoChanges(t *testing.T) {
 
 func TestDiffIndexes(t *testing.T) {
 	current := &SchemaState{Models: map[string]*ModelState{
-		"User": {Table: "users", Columns: map[string]*ColumnState{}, Indexes: []string{"idx_users_name"}},
+		"User": {Table: "users", Columns: map[string]*ColumnState{}, Indexes: []lux.IndexInfo{{Name: "idx_users_name", Kind: lux.BTreeIndex, Columns: []string{"name"}}}},
 	}}
 	desired := &SchemaState{Models: map[string]*ModelState{
-		"User": {Table: "users", Columns: map[string]*ColumnState{}, Indexes: []string{"idx_users_email"}},
+		"User": {Table: "users", Columns: map[string]*ColumnState{}, Indexes: []lux.IndexInfo{{Name: "idx_users_email", Kind: lux.BTreeIndex, Columns: []string{"email"}}}},
 	}}
 
 	ops := Diff(current, desired)
 	addIdx, dropIdx := false, false
 	for _, op := range ops {
-		if op.Kind == AddIndex && op.Index == "idx_users_email" {
+		if op.Kind == AddIndex && op.Index.Name == "idx_users_email" {
 			addIdx = true
 		}
-		if op.Kind == DropIndex && op.Index == "idx_users_name" {
+		if op.Kind == DropIndex && op.Index.Name == "idx_users_name" {
 			dropIdx = true
 		}
 	}

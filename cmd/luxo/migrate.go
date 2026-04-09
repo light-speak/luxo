@@ -166,9 +166,9 @@ func printDiffOps(ops []codegen.DiffOp) {
 		case codegen.AlterColumn:
 			fmt.Printf("    %sALTER COLUMN%s %s.%s\n", yellow, reset, op.Table, op.Column)
 		case codegen.AddIndex:
-			fmt.Printf("    %sADD INDEX%s    %s\n", green, reset, op.Index)
+			fmt.Printf("    %sADD INDEX%s    %s\n", green, reset, op.Index.Name)
 		case codegen.DropIndex:
-			fmt.Printf("    %sDROP INDEX%s   %s\n", yellow, reset, op.Index)
+			fmt.Printf("    %sDROP INDEX%s   %s\n", yellow, reset, op.Index.Name)
 		}
 	}
 }

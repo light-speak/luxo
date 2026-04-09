@@ -3,15 +3,13 @@ package lux
 // Dialect defines database-specific SQL generation for migrations.
 type Dialect interface {
 	// ColumnType maps a Luxo type name + directives to a SQL column type.
-	// e.g., "Int" → "BIGINT" (PG) or "BIGINT" (MySQL)
 	ColumnType(luxoType string, serial bool, directives []DirectiveInfo) string
 
 	// ColumnDef produces a full column definition.
-	// e.g., "id SERIAL PRIMARY KEY" or "id BIGINT AUTO_INCREMENT PRIMARY KEY"
 	ColumnDef(name string, col ColumnInfo) string
 
-	// CreateTable produces a CREATE TABLE statement.
-	CreateTable(table string, columns []ColumnEntry, indexes []string) string
+	// CreateTable produces a CREATE TABLE statement with all indexes.
+	CreateTable(table string, columns []ColumnEntry, indexes []IndexInfo) string
 
 	// AddColumn produces ALTER TABLE ADD COLUMN.
 	AddColumn(table, colDef string) string
@@ -30,8 +28,10 @@ type Dialect interface {
 	AddUnique(table, column string) string
 	DropUnique(table, column string) string
 
-	// CreateIndex / DropIndex
-	CreateIndex(index, table, column string) string
+	// CreateIndexSQL produces CREATE INDEX for any index type.
+	CreateIndexSQL(idx IndexInfo, table string) string
+
+	// DropIndex produces DROP INDEX.
 	DropIndex(index string) string
 
 	// DropTable (commented out for safety)
@@ -60,4 +60,23 @@ type ColumnInfo struct {
 type ColumnEntry struct {
 	Name string
 	Info ColumnInfo
+}
+
+// IndexKind distinguishes index types.
+type IndexKind int
+
+const (
+	BTreeIndex     IndexKind = iota // default B-tree index
+	UniqueIndex                     // UNIQUE constraint as index
+	SearchIndex                     // full-text search (@search)
+	BrinIndex                       // BRIN index (@brin, time-series)
+	CompositeIndex                  // multi-column index (@index(fields: [...]))
+)
+
+// IndexInfo describes a database index.
+type IndexInfo struct {
+	Name    string    // index name, e.g., "idx_users_name"
+	Kind    IndexKind // index type
+	Columns []string  // column(s) in the index
+	Lang    string    // language for search index (PG: "simple", "english")
 }

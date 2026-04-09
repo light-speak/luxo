@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lux"
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
 )
@@ -230,10 +231,10 @@ func TestScenarioRemoveUnique(t *testing.T) {
 func TestScenarioIndexChanges(t *testing.T) {
 	d := pgDialect()
 	current := &SchemaState{Models: map[string]*ModelState{
-		"User": {Table: "users", Columns: map[string]*ColumnState{}, Indexes: []string{"idx_users_name"}},
+		"User": {Table: "users", Columns: map[string]*ColumnState{}, Indexes: []lux.IndexInfo{{Name: "idx_users_name", Kind: lux.BTreeIndex, Columns: []string{"name"}}}},
 	}}
 	desired := &SchemaState{Models: map[string]*ModelState{
-		"User": {Table: "users", Columns: map[string]*ColumnState{}, Indexes: []string{"idx_users_email"}},
+		"User": {Table: "users", Columns: map[string]*ColumnState{}, Indexes: []lux.IndexInfo{{Name: "idx_users_email", Kind: lux.BTreeIndex, Columns: []string{"email"}}}},
 	}}
 
 	ops := Diff(current, desired)
@@ -285,7 +286,7 @@ func TestScenarioMultipleChanges(t *testing.T) {
 			"id":     {Type: "SERIAL", PK: true},
 			"name":   {Type: "TEXT"},                 // changed type
 			"avatar": {Type: "TEXT", Nullable: true}, // new column
-		}, Indexes: []string{"idx_users_name"}}, // new index
+		}, Indexes: []lux.IndexInfo{{Name: "idx_users_name", Kind: lux.BTreeIndex, Columns: []string{"name"}}}}, // new index
 		"Post": {Table: "posts", Columns: map[string]*ColumnState{ // new table
 			"id":    {Type: "SERIAL", PK: true},
 			"title": {Type: "TEXT"},

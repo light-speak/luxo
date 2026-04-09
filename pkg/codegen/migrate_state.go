@@ -21,7 +21,7 @@ type SchemaState struct {
 type ModelState struct {
 	Table   string                  `json:"table"`
 	Columns map[string]*ColumnState `json:"columns"`
-	Indexes []string                `json:"indexes,omitempty"`
+	Indexes []lux.IndexInfo         `json:"indexes,omitempty"`
 }
 
 // ColumnState represents a single column's state.
@@ -100,12 +100,8 @@ func ComputeState(result *semantic.Result, enums map[string]bool, dialect lux.Di
 				}
 			}
 
-			// Indexes
-			for _, f := range m.Fields {
-				if hasDirective(f.Directives, "index") {
-					ms.Indexes = append(ms.Indexes, fmt.Sprintf("idx_%s_%s", ms.Table, toSnakeCase(f.Name)))
-				}
-			}
+			// Indexes — all types
+			ms.Indexes = collectIndexes(m, ms.Table)
 
 			s.Models[m.Name] = ms
 		}
@@ -133,6 +129,66 @@ func buildColumnState(f *ast.FieldDecl, dialect lux.Dialect) *ColumnState {
 	}
 }
 
+// collectIndexes extracts all index definitions from a model.
+func collectIndexes(m *ast.ModelDecl, table string) []lux.IndexInfo {
+	var indexes []lux.IndexInfo
+
+	// Model-level @index(fields: [...]) → composite index
+	for _, d := range m.Directives {
+		if d.Name == "index" {
+			cols := extractIndexFields(d)
+			if len(cols) > 0 {
+				name := "idx_" + table + "_" + strings.Join(cols, "_")
+				indexes = append(indexes, lux.IndexInfo{Name: name, Kind: lux.CompositeIndex, Columns: cols})
+			}
+		}
+	}
+
+	// Field-level directives
+	for _, f := range m.Fields {
+		if f.Computed != nil {
+			continue
+		}
+		col := toSnakeCase(f.Name)
+
+		if hasDirective(f.Directives, "index") {
+			indexes = append(indexes, lux.IndexInfo{
+				Name: "idx_" + table + "_" + col, Kind: lux.BTreeIndex, Columns: []string{col},
+			})
+		}
+		if hasDirective(f.Directives, "search") {
+			indexes = append(indexes, lux.IndexInfo{
+				Name: "idx_" + table + "_" + col + "_search", Kind: lux.SearchIndex, Columns: []string{col},
+			})
+		}
+		if hasDirective(f.Directives, "brin") {
+			indexes = append(indexes, lux.IndexInfo{
+				Name: "idx_" + table + "_" + col + "_brin", Kind: lux.BrinIndex, Columns: []string{col},
+			})
+		}
+	}
+
+	return indexes
+}
+
+// extractIndexFields extracts field names from @index(fields: [name, email]).
+func extractIndexFields(d *ast.Directive) []string {
+	for _, arg := range d.Args {
+		if arg.Name == "fields" {
+			if list, ok := arg.Value.(*ast.ListExpr); ok {
+				var cols []string
+				for _, item := range list.Items {
+					if ident, ok := item.(*ast.Ident); ok {
+						cols = append(cols, toSnakeCase(ident.Name))
+					}
+				}
+				return cols
+			}
+		}
+	}
+	return nil
+}
+
 // extractDirectiveInfos converts AST directives to the dialect-layer DirectiveInfo.
 func extractDirectiveInfos(directives []*ast.Directive) []lux.DirectiveInfo {
 	var infos []lux.DirectiveInfo
@@ -156,7 +212,7 @@ type DiffOp struct {
 	Column    string // column name (for column ops)
 	OldColumn *ColumnState
 	NewColumn *ColumnState
-	Index     string // index name (for index ops)
+	Index     *lux.IndexInfo // index info (for index ops)
 }
 
 // DiffKind is the type of schema change.
@@ -239,22 +295,22 @@ func diffColumns(model, table string, current, desired *ModelState) []DiffOp {
 func diffIndexes(model, table string, current, desired *ModelState) []DiffOp {
 	var ops []DiffOp
 
-	currentIdx := make(map[string]bool, len(current.Indexes))
-	for _, idx := range current.Indexes {
-		currentIdx[idx] = true
+	currentIdx := make(map[string]*lux.IndexInfo, len(current.Indexes))
+	for i := range current.Indexes {
+		currentIdx[current.Indexes[i].Name] = &current.Indexes[i]
 	}
-	desiredIdx := make(map[string]bool, len(desired.Indexes))
-	for _, idx := range desired.Indexes {
-		desiredIdx[idx] = true
+	desiredIdx := make(map[string]*lux.IndexInfo, len(desired.Indexes))
+	for i := range desired.Indexes {
+		desiredIdx[desired.Indexes[i].Name] = &desired.Indexes[i]
 	}
 
-	for idx := range desiredIdx {
-		if !currentIdx[idx] {
+	for name, idx := range desiredIdx {
+		if _, ok := currentIdx[name]; !ok {
 			ops = append(ops, DiffOp{Kind: AddIndex, Model: model, Table: table, Index: idx})
 		}
 	}
-	for idx := range currentIdx {
-		if !desiredIdx[idx] {
+	for name, idx := range currentIdx {
+		if _, ok := desiredIdx[name]; !ok {
 			ops = append(ops, DiffOp{Kind: DropIndex, Model: model, Table: table, Index: idx})
 		}
 	}
@@ -289,13 +345,11 @@ func generateOpSQL(upB, downB *strings.Builder, op DiffOp, desired *SchemaState,
 	case AlterColumn:
 		generateAlterColumnSQL(upB, downB, op, d)
 	case AddIndex:
-		col := strings.TrimPrefix(op.Index, "idx_"+op.Table+"_")
-		upB.WriteString(d.CreateIndex(op.Index, op.Table, col))
-		downB.WriteString(d.DropIndex(op.Index))
+		upB.WriteString(d.CreateIndexSQL(*op.Index, op.Table))
+		downB.WriteString(d.DropIndex(op.Index.Name))
 	case DropIndex:
-		col := strings.TrimPrefix(op.Index, "idx_"+op.Table+"_")
-		upB.WriteString(d.DropIndex(op.Index))
-		downB.WriteString(d.CreateIndex(op.Index, op.Table, col))
+		upB.WriteString(d.DropIndex(op.Index.Name))
+		downB.WriteString(d.CreateIndexSQL(*op.Index, op.Table))
 	}
 }
 

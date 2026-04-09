@@ -19,15 +19,8 @@ func (Dialect) ColumnType(luxoType string, serial bool, directives []lux.Directi
 		return "SERIAL"
 	}
 	if hasDir(directives, "varchar") {
-		length := "255"
-		for _, d := range directives {
-			if d.Name == "varchar" && d.Arg != "" {
-				length = d.Arg
-			}
-		}
-		return fmt.Sprintf("VARCHAR(%s)", length)
+		return "VARCHAR(" + dirArg(directives, "varchar", "255") + ")"
 	}
-
 	base := pgBaseType(luxoType)
 	return pgApplyDirective(base, luxoType, directives)
 }
@@ -68,7 +61,22 @@ func pgApplyDirective(base, luxoType string, directives []lux.DirectiveInfo) str
 		}
 	case "Float":
 		if hasDir(directives, "decimal") {
+			p := dirArg(directives, "decimal", "")
+			if p != "" {
+				return "DECIMAL(" + p + ")"
+			}
 			return "DECIMAL"
+		}
+	case "String":
+		if hasDir(directives, "inet") {
+			return "INET"
+		}
+		if hasDir(directives, "point") {
+			return "POINT"
+		}
+		if hasDir(directives, "vector") {
+			dim := dirArg(directives, "vector", "1536")
+			return "vector(" + dim + ")"
 		}
 	case "DateTime":
 		if hasDir(directives, "date") {
@@ -96,7 +104,7 @@ func (Dialect) ColumnDef(name string, col lux.ColumnInfo) string {
 	return strings.Join(parts, " ")
 }
 
-func (d Dialect) CreateTable(table string, columns []lux.ColumnEntry, indexes []string) string {
+func (d Dialect) CreateTable(table string, columns []lux.ColumnEntry, indexes []lux.IndexInfo) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "CREATE TABLE %s (\n", table)
 
@@ -108,8 +116,7 @@ func (d Dialect) CreateTable(table string, columns []lux.ColumnEntry, indexes []
 	b.WriteString("\n);\n")
 
 	for _, idx := range indexes {
-		col := strings.TrimPrefix(idx, "idx_"+table+"_")
-		fmt.Fprintf(&b, "CREATE INDEX %s ON %s (%s);\n", idx, table, col)
+		b.WriteString(d.CreateIndexSQL(idx, table))
 	}
 	return b.String()
 }
@@ -142,8 +149,22 @@ func (Dialect) DropUnique(table, column string) string {
 	return fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s_%s_key;\n", table, table, column)
 }
 
-func (Dialect) CreateIndex(index, table, column string) string {
-	return fmt.Sprintf("CREATE INDEX %s ON %s (%s);\n", index, table, column)
+func (Dialect) CreateIndexSQL(idx lux.IndexInfo, table string) string {
+	cols := strings.Join(idx.Columns, ", ")
+	switch idx.Kind {
+	case lux.SearchIndex:
+		lang := idx.Lang
+		if lang == "" {
+			lang = "simple"
+		}
+		return fmt.Sprintf("CREATE INDEX %s ON %s USING gin(to_tsvector('%s', %s));\n", idx.Name, table, lang, cols)
+	case lux.BrinIndex:
+		return fmt.Sprintf("CREATE INDEX %s ON %s USING brin(%s);\n", idx.Name, table, cols)
+	case lux.UniqueIndex:
+		return fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s (%s);\n", idx.Name, table, cols)
+	default: // BTreeIndex, CompositeIndex
+		return fmt.Sprintf("CREATE INDEX %s ON %s (%s);\n", idx.Name, table, cols)
+	}
 }
 
 func (Dialect) DropIndex(index string) string {
@@ -161,4 +182,13 @@ func hasDir(directives []lux.DirectiveInfo, name string) bool {
 		}
 	}
 	return false
+}
+
+func dirArg(directives []lux.DirectiveInfo, name, fallback string) string {
+	for _, d := range directives {
+		if d.Name == name && d.Arg != "" {
+			return d.Arg
+		}
+	}
+	return fallback
 }
