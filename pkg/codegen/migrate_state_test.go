@@ -7,9 +7,13 @@ import (
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lux"
+	"github.com/light-speak/luxo/pkg/lux/pg"
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
 )
+
+func pgDialect() lux.Dialect { return pg.Dialect{} }
 
 func mkPos() token.Position {
 	return token.Position{File: "test.luxo", Line: 1, Col: 1}
@@ -80,7 +84,7 @@ func TestComputeState(t *testing.T) {
 		}},
 	}
 
-	s := ComputeState(result, nil)
+	s := ComputeState(result, nil, pgDialect())
 	ms := s.Models["User"]
 	if ms == nil {
 		t.Fatal("User model missing")
@@ -251,7 +255,7 @@ func TestGenerateMigrationSQL(t *testing.T) {
 		{Kind: CreateTable, Model: "User", Table: "users"},
 	}
 
-	up, down := GenerateMigrationSQL(ops, desired)
+	up, down := GenerateMigrationSQL(ops, desired, pgDialect())
 
 	if !strings.Contains(up, "CREATE TABLE users") {
 		t.Errorf("up missing CREATE TABLE:\n%s", up)
@@ -265,7 +269,7 @@ func TestGenerateMigrationSQLDrop(t *testing.T) {
 	ops := []DiffOp{
 		{Kind: DropTable, Model: "Old", Table: "olds"},
 	}
-	up, _ := GenerateMigrationSQL(ops, &SchemaState{Models: map[string]*ModelState{}})
+	up, _ := GenerateMigrationSQL(ops, &SchemaState{Models: map[string]*ModelState{}}, pgDialect())
 
 	if !strings.Contains(up, "-- DROP TABLE") {
 		t.Error("DROP TABLE should be commented out")
@@ -278,7 +282,7 @@ func TestGenerateMigrationSQLAlter(t *testing.T) {
 			OldColumn: &ColumnState{Type: "VARCHAR(50)", Nullable: false, Unique: false},
 			NewColumn: &ColumnState{Type: "TEXT", Nullable: true, Unique: true}},
 	}
-	up, _ := GenerateMigrationSQL(ops, &SchemaState{Models: map[string]*ModelState{}})
+	up, _ := GenerateMigrationSQL(ops, &SchemaState{Models: map[string]*ModelState{}}, pgDialect())
 
 	if !strings.Contains(up, "ALTER COLUMN name TYPE TEXT") {
 		t.Errorf("should alter type:\n%s", up)

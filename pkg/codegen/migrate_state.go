@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lux"
 	"github.com/light-speak/luxo/pkg/semantic"
 )
 
@@ -61,7 +62,7 @@ func SaveState(path string, s *SchemaState) error {
 }
 
 // ComputeState builds the desired schema state from the current AST.
-func ComputeState(result *semantic.Result, enums map[string]bool) *SchemaState {
+func ComputeState(result *semantic.Result, enums map[string]bool, dialect lux.Dialect) *SchemaState {
 	s := &SchemaState{Models: make(map[string]*ModelState)}
 
 	for _, file := range result.Files {
@@ -75,26 +76,27 @@ func ComputeState(result *semantic.Result, enums map[string]bool) *SchemaState {
 				if f.Computed != nil || isRelationField(f, enums) {
 					continue
 				}
-				col := buildColumnState(f)
+				col := buildColumnState(f, dialect)
 				if col != nil {
 					ms.Columns[toSnakeCase(f.Name)] = col
 				}
 			}
 
 			// Auto timestamps
+			tsType := dialect.ColumnType("DateTime", false, nil)
 			if !hasDirective(m.Directives, "noTime") {
 				if _, ok := ms.Columns["created_at"]; !ok {
-					ms.Columns["created_at"] = &ColumnState{Type: "TIMESTAMPTZ"}
+					ms.Columns["created_at"] = &ColumnState{Type: tsType}
 				}
 				if _, ok := ms.Columns["updated_at"]; !ok {
-					ms.Columns["updated_at"] = &ColumnState{Type: "TIMESTAMPTZ"}
+					ms.Columns["updated_at"] = &ColumnState{Type: tsType}
 				}
 			}
 
 			// Soft delete
 			if isSoftDelete(m) {
 				if _, ok := ms.Columns["deleted_at"]; !ok {
-					ms.Columns["deleted_at"] = &ColumnState{Type: "TIMESTAMPTZ", Nullable: true}
+					ms.Columns["deleted_at"] = &ColumnState{Type: tsType, Nullable: true}
 				}
 			}
 
@@ -113,24 +115,37 @@ func ComputeState(result *semantic.Result, enums map[string]bool) *SchemaState {
 }
 
 // buildColumnState creates a ColumnState from a field declaration.
-func buildColumnState(f *ast.FieldDecl) *ColumnState {
-	sqlType := resolveColumnType(f)
-	if sqlType == "" {
+func buildColumnState(f *ast.FieldDecl, dialect lux.Dialect) *ColumnState {
+	if f.Type == nil || f.Type.IsList {
 		return nil
 	}
 
 	isSerial := hasDirective(f.Directives, "serial")
-	if isSerial {
-		sqlType = "SERIAL"
-	}
+	dirs := extractDirectiveInfos(f.Directives)
+	sqlType := dialect.ColumnType(f.Type.Name, isSerial, dirs)
 
 	return &ColumnState{
 		Type:     sqlType,
-		Nullable: f.Type != nil && f.Type.Nullable,
+		Nullable: f.Type.Nullable,
 		PK:       isSerial || hasDirective(f.Directives, "id"),
 		Unique:   hasDirective(f.Directives, "unique"),
 		Serial:   isSerial,
 	}
+}
+
+// extractDirectiveInfos converts AST directives to the dialect-layer DirectiveInfo.
+func extractDirectiveInfos(directives []*ast.Directive) []lux.DirectiveInfo {
+	var infos []lux.DirectiveInfo
+	for _, d := range directives {
+		info := lux.DirectiveInfo{Name: d.Name}
+		if len(d.Args) > 0 {
+			if lit, ok := d.Args[0].Value.(*ast.Literal); ok {
+				info.Arg = lit.Value
+			}
+		}
+		infos = append(infos, info)
+	}
+	return infos
 }
 
 // DiffOp represents a single schema change operation.
@@ -247,71 +262,69 @@ func diffIndexes(model, table string, current, desired *ModelState) []DiffOp {
 	return ops
 }
 
-// GenerateMigrationSQL generates up/down SQL from diff operations.
-func GenerateMigrationSQL(ops []DiffOp, desired *SchemaState) (up, down string) {
+// GenerateMigrationSQL generates up/down SQL from diff operations using the given dialect.
+func GenerateMigrationSQL(ops []DiffOp, desired *SchemaState, dialect lux.Dialect) (up, down string) {
 	var upB, downB strings.Builder
 	for _, op := range ops {
-		generateOpSQL(&upB, &downB, op, desired)
+		generateOpSQL(&upB, &downB, op, desired, dialect)
 	}
 	return upB.String(), downB.String()
 }
 
-func generateOpSQL(upB, downB *strings.Builder, op DiffOp, desired *SchemaState) {
+func generateOpSQL(upB, downB *strings.Builder, op DiffOp, desired *SchemaState, d lux.Dialect) {
 	switch op.Kind {
 	case CreateTable:
-		upB.WriteString(generateCreateTableSQL(op.Table, desired.Models[op.Model]))
+		ms := desired.Models[op.Model]
+		upB.WriteString(generateCreateTableSQL(ms, d))
 		fmt.Fprintf(downB, "DROP TABLE IF EXISTS %s;\n", op.Table)
 	case DropTable:
-		fmt.Fprintf(upB, "-- DROP TABLE IF EXISTS %s; -- DANGEROUS: uncomment to apply\n", op.Table)
+		upB.WriteString(d.DropTable(op.Table))
 		fmt.Fprintf(downB, "-- Recreate %s table manually if needed\n", op.Table)
 	case AddColumn:
-		fmt.Fprintf(upB, "ALTER TABLE %s ADD COLUMN %s;\n", op.Table, columnDef(op.Column, op.NewColumn))
+		upB.WriteString(d.AddColumn(op.Table, d.ColumnDef(op.Column, toColumnInfo(op.NewColumn))))
 		fmt.Fprintf(downB, "ALTER TABLE %s DROP COLUMN %s;\n", op.Table, op.Column)
 	case DropColumn:
-		fmt.Fprintf(upB, "-- ALTER TABLE %s DROP COLUMN %s; -- DANGEROUS: uncomment to apply\n", op.Table, op.Column)
-		fmt.Fprintf(downB, "ALTER TABLE %s ADD COLUMN %s;\n", op.Table, columnDef(op.Column, op.OldColumn))
+		upB.WriteString(d.DropColumn(op.Table, op.Column))
+		downB.WriteString(d.AddColumn(op.Table, d.ColumnDef(op.Column, toColumnInfo(op.OldColumn))))
 	case AlterColumn:
-		generateAlterColumnSQL(upB, downB, op)
+		generateAlterColumnSQL(upB, downB, op, d)
 	case AddIndex:
 		col := strings.TrimPrefix(op.Index, "idx_"+op.Table+"_")
-		fmt.Fprintf(upB, "CREATE INDEX %s ON %s (%s);\n", op.Index, op.Table, col)
-		fmt.Fprintf(downB, "DROP INDEX IF EXISTS %s;\n", op.Index)
+		upB.WriteString(d.CreateIndex(op.Index, op.Table, col))
+		downB.WriteString(d.DropIndex(op.Index))
 	case DropIndex:
 		col := strings.TrimPrefix(op.Index, "idx_"+op.Table+"_")
-		fmt.Fprintf(upB, "DROP INDEX IF EXISTS %s;\n", op.Index)
-		fmt.Fprintf(downB, "CREATE INDEX %s ON %s (%s);\n", op.Index, op.Table, col)
+		upB.WriteString(d.DropIndex(op.Index))
+		downB.WriteString(d.CreateIndex(op.Index, op.Table, col))
 	}
 }
 
-func generateAlterColumnSQL(upB, downB *strings.Builder, op DiffOp) {
+func generateAlterColumnSQL(upB, downB *strings.Builder, op DiffOp, d lux.Dialect) {
 	if op.OldColumn.Type != op.NewColumn.Type {
-		fmt.Fprintf(upB, "ALTER TABLE %s ALTER COLUMN %s TYPE %s;\n", op.Table, op.Column, op.NewColumn.Type)
-		fmt.Fprintf(downB, "ALTER TABLE %s ALTER COLUMN %s TYPE %s;\n", op.Table, op.Column, op.OldColumn.Type)
+		upB.WriteString(d.AlterColumnType(op.Table, op.Column, op.NewColumn.Type))
+		downB.WriteString(d.AlterColumnType(op.Table, op.Column, op.OldColumn.Type))
 	}
 	if op.OldColumn.Nullable != op.NewColumn.Nullable {
 		if op.NewColumn.Nullable {
-			fmt.Fprintf(upB, "ALTER TABLE %s ALTER COLUMN %s DROP NOT NULL;\n", op.Table, op.Column)
-			fmt.Fprintf(downB, "ALTER TABLE %s ALTER COLUMN %s SET NOT NULL;\n", op.Table, op.Column)
+			upB.WriteString(d.DropNotNull(op.Table, op.Column))
+			downB.WriteString(d.SetNotNull(op.Table, op.Column))
 		} else {
-			fmt.Fprintf(upB, "ALTER TABLE %s ALTER COLUMN %s SET NOT NULL;\n", op.Table, op.Column)
-			fmt.Fprintf(downB, "ALTER TABLE %s ALTER COLUMN %s DROP NOT NULL;\n", op.Table, op.Column)
+			upB.WriteString(d.SetNotNull(op.Table, op.Column))
+			downB.WriteString(d.DropNotNull(op.Table, op.Column))
 		}
 	}
 	if !op.OldColumn.Unique && op.NewColumn.Unique {
-		fmt.Fprintf(upB, "ALTER TABLE %s ADD CONSTRAINT %s_%s_key UNIQUE (%s);\n", op.Table, op.Table, op.Column, op.Column)
-		fmt.Fprintf(downB, "ALTER TABLE %s DROP CONSTRAINT %s_%s_key;\n", op.Table, op.Table, op.Column)
+		upB.WriteString(d.AddUnique(op.Table, op.Column))
+		downB.WriteString(d.DropUnique(op.Table, op.Column))
 	}
 	if op.OldColumn.Unique && !op.NewColumn.Unique {
-		fmt.Fprintf(upB, "ALTER TABLE %s DROP CONSTRAINT %s_%s_key;\n", op.Table, op.Table, op.Column)
-		fmt.Fprintf(downB, "ALTER TABLE %s ADD CONSTRAINT %s_%s_key UNIQUE (%s);\n", op.Table, op.Table, op.Column, op.Column)
+		upB.WriteString(d.DropUnique(op.Table, op.Column))
+		downB.WriteString(d.AddUnique(op.Table, op.Column))
 	}
 }
 
-// generateCreateTableSQL produces CREATE TABLE for a full model state.
-func generateCreateTableSQL(table string, ms *ModelState) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "CREATE TABLE %s (\n", table)
-
+// generateCreateTableSQL produces CREATE TABLE using dialect.
+func generateCreateTableSQL(ms *ModelState, d lux.Dialect) string {
 	// Sort columns: PK first, then alphabetical
 	type colEntry struct {
 		name string
@@ -323,40 +336,27 @@ func generateCreateTableSQL(table string, ms *ModelState) string {
 	}
 	sort.Slice(entries, func(i, j int) bool {
 		if entries[i].cs.PK != entries[j].cs.PK {
-			return entries[i].cs.PK // PK first
+			return entries[i].cs.PK
 		}
 		return entries[i].name < entries[j].name
 	})
 
-	var cols []string
+	columns := make([]lux.ColumnEntry, 0, len(entries))
 	for _, e := range entries {
-		cols = append(cols, "  "+columnDef(e.name, e.cs))
+		columns = append(columns, lux.ColumnEntry{Name: e.name, Info: toColumnInfo(e.cs)})
 	}
-	b.WriteString(strings.Join(cols, ",\n"))
-	b.WriteString("\n);\n")
-
-	for _, idx := range ms.Indexes {
-		col := strings.TrimPrefix(idx, "idx_"+table+"_")
-		fmt.Fprintf(&b, "CREATE INDEX %s ON %s (%s);\n", idx, table, col)
-	}
-
-	return b.String()
+	return d.CreateTable(ms.Table, columns, ms.Indexes)
 }
 
-// columnDef produces a column definition string like "name TEXT NOT NULL UNIQUE".
-func columnDef(name string, cs *ColumnState) string {
-	var parts []string
-	parts = append(parts, name+" "+cs.Type)
-	if !cs.Nullable && !cs.Serial {
-		parts = append(parts, "NOT NULL")
+// toColumnInfo converts internal ColumnState to dialect-layer ColumnInfo.
+func toColumnInfo(cs *ColumnState) lux.ColumnInfo {
+	return lux.ColumnInfo{
+		Type:     cs.Type,
+		Nullable: cs.Nullable,
+		PK:       cs.PK,
+		Unique:   cs.Unique,
+		Serial:   cs.Serial,
 	}
-	if cs.PK {
-		parts = append(parts, "PRIMARY KEY")
-	}
-	if cs.Unique {
-		parts = append(parts, "UNIQUE")
-	}
-	return strings.Join(parts, " ")
 }
 
 // AutoMigrationName generates a descriptive name from diff operations.

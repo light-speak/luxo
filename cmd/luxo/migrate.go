@@ -9,6 +9,9 @@ import (
 	"time"
 
 	"github.com/light-speak/luxo/pkg/codegen"
+	"github.com/light-speak/luxo/pkg/lux"
+	"github.com/light-speak/luxo/pkg/lux/env"
+	"github.com/light-speak/luxo/pkg/lux/pg"
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/spf13/cobra"
 )
@@ -72,8 +75,10 @@ func runMigrateDiff(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	env.Load(".env")
+	dialect := loadDialect()
 	enums := codegen.CollectEnumsFromResult(result)
-	desired := codegen.ComputeState(result, enums)
+	desired := codegen.ComputeState(result, enums, dialect)
 
 	statePath := filepath.Join("migrations", ".state.json")
 	current, err := codegen.LoadState(statePath)
@@ -92,7 +97,7 @@ func runMigrateDiff(cmd *cobra.Command, args []string) error {
 		name = args[0]
 	}
 
-	migrationPath, err := writeMigrationFile(ops, desired, name)
+	migrationPath, err := writeMigrationFile(ops, desired, name, dialect)
 	if err != nil {
 		return err
 	}
@@ -120,8 +125,8 @@ func parseAndAnalyze() (*semantic.Result, error) {
 	return analyzeFiles(files)
 }
 
-func writeMigrationFile(ops []codegen.DiffOp, desired *codegen.SchemaState, name string) (string, error) {
-	up, down := codegen.GenerateMigrationSQL(ops, desired)
+func writeMigrationFile(ops []codegen.DiffOp, desired *codegen.SchemaState, name string, dialect lux.Dialect) (string, error) {
+	up, down := codegen.GenerateMigrationSQL(ops, desired, dialect)
 
 	seq := nextMigrationSeq()
 	fileName := fmt.Sprintf("%s_%03d_%s.sql", time.Now().Format("20060102"), seq, name)
@@ -187,6 +192,18 @@ func runMigrateStatus(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  %s\n", name)
 	}
 	return nil
+}
+
+// loadDialect returns the SQL dialect based on DATABASE_DRIVER env.
+func loadDialect() lux.Dialect {
+	driver, _ := env.Get("DATABASE_DRIVER")
+	switch driver {
+	case "mysql":
+		fmt.Fprintf(os.Stderr, "warning: MySQL dialect not yet implemented, using pg\n")
+		return pg.Dialect{}
+	default:
+		return pg.Dialect{}
+	}
 }
 
 func nextMigrationSeq() int {
