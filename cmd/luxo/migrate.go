@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/codegen"
 	"github.com/light-speak/luxo/pkg/lux"
 	"github.com/light-speak/luxo/pkg/lux/env"
+	"github.com/light-speak/luxo/pkg/lux/migrate"
 	"github.com/light-speak/luxo/pkg/lux/pg"
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/spf13/cobra"
@@ -51,6 +51,13 @@ var migrateUpCmd = &cobra.Command{
 	RunE:  runMigrateUp,
 }
 
+var migrateDownCmd = &cobra.Command{
+	Use:   "down [N]",
+	Short: "Rollback last N migrations (default 1) / 回滚最近 N 次迁移（默认 1）",
+	Args:  cobra.MaximumNArgs(1),
+	RunE:  runMigrateDown,
+}
+
 var migrateStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show migration status / 查看迁移状态",
@@ -61,6 +68,7 @@ var migrateStatusCmd = &cobra.Command{
 func init() {
 	migrateCmd.AddCommand(migrateDiffCmd)
 	migrateCmd.AddCommand(migrateUpCmd)
+	migrateCmd.AddCommand(migrateDownCmd)
 	migrateCmd.AddCommand(migrateStatusCmd)
 	rootCmd.AddCommand(migrateCmd)
 }
@@ -174,23 +182,110 @@ func printDiffOps(ops []codegen.DiffOp) {
 }
 
 func runMigrateUp(cmd *cobra.Command, args []string) error {
-	fmt.Println("luxo migrate up is not yet implemented / luxo migrate up 尚未实现")
-	fmt.Println("For now, apply the generated SQL manually / 目前请手动执行生成的 SQL")
+	green := "\033[32m"
+	bold := "\033[1m"
+	dim := "\033[2m"
+	reset := "\033[0m"
+
+	env.Load(".env")
+	ctx := cmd.Context()
+
+	runner, err := migrate.New(ctx, "migrations")
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer runner.Close()
+
+	executed, err := runner.Up(ctx)
+	if err != nil {
+		return fmt.Errorf("migrate up: %w", err)
+	}
+
+	if len(executed) == 0 {
+		fmt.Printf("\n  %s✓ No pending migrations / 无待执行的迁移%s\n\n", green, reset)
+		return nil
+	}
+
+	fmt.Printf("\n  %s%s✓ %d migration(s) applied / 已执行 %d 个迁移%s\n\n", bold, green, len(executed), len(executed), reset)
+	for _, name := range executed {
+		fmt.Printf("  %s✓%s %s%s%s\n", green, reset, dim, name, reset)
+	}
+	fmt.Println()
+	return nil
+}
+
+func runMigrateDown(cmd *cobra.Command, args []string) error {
+	yellow := "\033[33m"
+	bold := "\033[1m"
+	dim := "\033[2m"
+	reset := "\033[0m"
+
+	n := 1
+	if len(args) > 0 {
+		fmt.Sscanf(args[0], "%d", &n)
+	}
+
+	env.Load(".env")
+	ctx := cmd.Context()
+
+	runner, err := migrate.New(ctx, "migrations")
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer runner.Close()
+
+	rolledBack, err := runner.Down(ctx, n)
+	if err != nil {
+		return fmt.Errorf("migrate down: %w", err)
+	}
+
+	if len(rolledBack) == 0 {
+		fmt.Printf("\n  %s✓ No migrations to rollback / 无可回滚的迁移%s\n\n", yellow, reset)
+		return nil
+	}
+
+	fmt.Printf("\n  %s%s✓ %d migration(s) rolled back / 已回滚 %d 个迁移%s\n\n", bold, yellow, len(rolledBack), len(rolledBack), reset)
+	for _, name := range rolledBack {
+		fmt.Printf("  %s↩%s %s%s%s\n", yellow, reset, dim, name, reset)
+	}
+	fmt.Println()
 	return nil
 }
 
 func runMigrateStatus(cmd *cobra.Command, args []string) error {
-	entries, err := filepath.Glob("migrations/*.sql")
-	if err != nil || len(entries) == 0 {
+	green := "\033[32m"
+	dim := "\033[2m"
+	yellow := "\033[33m"
+	reset := "\033[0m"
+
+	env.Load(".env")
+	ctx := cmd.Context()
+
+	runner, err := migrate.New(ctx, "migrations")
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer runner.Close()
+
+	statuses, err := runner.Status(ctx)
+	if err != nil {
+		return err
+	}
+
+	if len(statuses) == 0 {
 		fmt.Println("  No migrations found / 未找到迁移文件")
 		return nil
 	}
 
-	sort.Strings(entries)
-	for _, e := range entries {
-		name := filepath.Base(e)
-		fmt.Printf("  %s\n", name)
+	fmt.Println()
+	for _, s := range statuses {
+		if s.Applied {
+			fmt.Printf("  %s✓%s %s %s%s%s\n", green, reset, s.Name, dim, s.AppliedAt.Format("2006-01-02 15:04:05"), reset)
+		} else {
+			fmt.Printf("  %s○%s %s %s(pending)%s\n", yellow, reset, s.Name, dim, reset)
+		}
 	}
+	fmt.Println()
 	return nil
 }
 

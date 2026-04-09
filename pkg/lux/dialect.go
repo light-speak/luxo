@@ -54,6 +54,7 @@ type ColumnInfo struct {
 	PK       bool
 	Unique   bool
 	Serial   bool
+	Default  string
 }
 
 // ColumnEntry is a name + info pair for ordered column rendering.

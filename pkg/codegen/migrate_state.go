@@ -31,6 +31,7 @@ type ColumnState struct {
 	PK       bool   `json:"pk,omitempty"`
 	Unique   bool   `json:"unique,omitempty"`
 	Serial   bool   `json:"serial,omitempty"`
+	Default  string `json:"default,omitempty"`
 }
 
 // LoadState reads the schema state from a file. Returns empty state if not found.
@@ -86,10 +87,10 @@ func ComputeState(result *semantic.Result, enums map[string]bool, dialect lux.Di
 			tsType := dialect.ColumnType("DateTime", false, nil)
 			if !hasDirective(m.Directives, "noTime") {
 				if _, ok := ms.Columns["created_at"]; !ok {
-					ms.Columns["created_at"] = &ColumnState{Type: tsType}
+					ms.Columns["created_at"] = &ColumnState{Type: tsType, Default: "NOW()"}
 				}
 				if _, ok := ms.Columns["updated_at"]; !ok {
-					ms.Columns["updated_at"] = &ColumnState{Type: tsType}
+					ms.Columns["updated_at"] = &ColumnState{Type: tsType, Default: "NOW()"}
 				}
 			}
 
@@ -120,13 +121,25 @@ func buildColumnState(f *ast.FieldDecl, dialect lux.Dialect) *ColumnState {
 	dirs := extractDirectiveInfos(f.Directives)
 	sqlType := dialect.ColumnType(f.Type.Name, isSerial, dirs)
 
-	return &ColumnState{
+	cs := &ColumnState{
 		Type:     sqlType,
 		Nullable: f.Type.Nullable,
 		PK:       isSerial || hasDirective(f.Directives, "id"),
 		Unique:   hasDirective(f.Directives, "unique"),
 		Serial:   isSerial,
 	}
+	if f.Default != nil {
+		if lit, ok := f.Default.(*ast.Literal); ok {
+			cs.Default = defaultSQL(f.Type.Name, lit.Value)
+		} else if ident, ok := f.Default.(*ast.Ident); ok {
+			// Enum default: Role.USER → 'USER'
+			parts := strings.SplitN(ident.Name, ".", 2)
+			if len(parts) == 2 {
+				cs.Default = "'" + parts[1] + "'"
+			}
+		}
+	}
+	return cs
 }
 
 // collectIndexes extracts all index definitions from a model.
@@ -187,6 +200,21 @@ func extractIndexFields(d *ast.Directive) []string {
 		}
 	}
 	return nil
+}
+
+// defaultSQL converts a Luxo default value to SQL representation.
+func defaultSQL(luxoType, value string) string {
+	switch luxoType {
+	case "String":
+		return "'" + value + "'"
+	case "Boolean":
+		if value == "true" {
+			return "TRUE"
+		}
+		return "FALSE"
+	default:
+		return value
+	}
 }
 
 // extractDirectiveInfos converts AST directives to the dialect-layer DirectiveInfo.
@@ -283,7 +311,7 @@ func diffColumns(model, table string, current, desired *ModelState) []DiffOp {
 		if !ok {
 			continue
 		}
-		if cc.Type != dc.Type || cc.Nullable != dc.Nullable || cc.Unique != dc.Unique {
+		if cc.Type != dc.Type || cc.Nullable != dc.Nullable || cc.Unique != dc.Unique || cc.Default != dc.Default {
 			ops = append(ops, DiffOp{Kind: AlterColumn, Model: model, Table: table, Column: col, OldColumn: cc, NewColumn: dc})
 		}
 	}
@@ -375,6 +403,18 @@ func generateAlterColumnSQL(upB, downB *strings.Builder, op DiffOp, d lux.Dialec
 		upB.WriteString(d.DropUnique(op.Table, op.Column))
 		downB.WriteString(d.AddUnique(op.Table, op.Column))
 	}
+	if op.OldColumn.Default != op.NewColumn.Default {
+		if op.NewColumn.Default != "" {
+			fmt.Fprintf(upB, "ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;\n", op.Table, op.Column, op.NewColumn.Default)
+		} else {
+			fmt.Fprintf(upB, "ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT;\n", op.Table, op.Column)
+		}
+		if op.OldColumn.Default != "" {
+			fmt.Fprintf(downB, "ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;\n", op.Table, op.Column, op.OldColumn.Default)
+		} else {
+			fmt.Fprintf(downB, "ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT;\n", op.Table, op.Column)
+		}
+	}
 }
 
 // generateCreateTableSQL produces CREATE TABLE using dialect.
@@ -410,6 +450,7 @@ func toColumnInfo(cs *ColumnState) lux.ColumnInfo {
 		PK:       cs.PK,
 		Unique:   cs.Unique,
 		Serial:   cs.Serial,
+		Default:  cs.Default,
 	}
 }
 
