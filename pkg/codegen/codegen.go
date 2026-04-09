@@ -65,7 +65,8 @@ func generateModelFile(result *semantic.Result, packageName string) []byte {
 		}
 	}
 
-	// Collect model names to avoid duplicate struct generation from extend.
+	// Collect enum and model names
+	enumNames := collectEnums(result)
 	modelNames := make(map[string]bool)
 	for _, file := range result.Files {
 		for _, m := range file.Models {
@@ -87,7 +88,7 @@ func generateModelFile(result *semantic.Result, packageName string) []byte {
 	// model structs
 	for _, file := range result.Files {
 		for _, m := range file.Models {
-			generateModel(&b, m)
+			generateModel(&b, m, enumNames)
 			b.WriteByte('\n')
 		}
 	}

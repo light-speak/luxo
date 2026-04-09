@@ -97,7 +97,7 @@ func TestGenerateModel(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var b strings.Builder
-			generateModel(&b, tt.model)
+			generateModel(&b, tt.model, map[string]bool{"Status": true, "Role": true})
 			got := b.String()
 			for _, check := range tt.checks {
 				if !strings.Contains(got, check) {
@@ -254,7 +254,7 @@ func TestGenerateModelWithSoftDelete(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateModel(&b, m)
+	generateModel(&b, m, nil)
 	got := b.String()
 
 	if !strings.Contains(got, "DeletedAt") {
@@ -276,7 +276,7 @@ func TestGenerateModelSoftDeleteExistingField(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateModel(&b, m)
+	generateModel(&b, m, nil)
 	got := b.String()
 
 	// Should NOT duplicate DeletedAt

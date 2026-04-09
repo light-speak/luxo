@@ -270,24 +270,21 @@ func skipHandlerField(f *ast.FieldDecl, enums map[string]bool) bool {
 }
 
 // isRelationField detects if a field is a relation to another model.
-// List fields ([Post]) are always relations. Non-built-in, non-enum types are relations.
+// Non-built-in, non-enum types are relations. [String]/[Int] are scalar arrays, not relations.
 func isRelationField(f *ast.FieldDecl, enums map[string]bool) bool {
 	if f.Type == nil {
 		return false
 	}
-	if f.Type.IsList {
-		return true // [Post] is always a relation
-	}
-	// Built-in scalar types — never relations
+	// Check the base type name (works for both scalar and list)
 	switch f.Type.Name {
 	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes":
-		return false
+		return false // String, [String], Int, [Int] etc. are never relations
 	}
 	// Enum types — not relations
 	if enums[f.Type.Name] {
 		return false
 	}
-	// Everything else (uppercase type, not built-in, not enum) is a relation
+	// Non-builtin, non-enum: it's a relation (Post, [Post], User, etc.)
 	return true
 }
 

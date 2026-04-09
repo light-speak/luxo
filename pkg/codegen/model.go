@@ -18,7 +18,7 @@ type fieldInfo struct {
 
 // generateModel generates a Go struct for a Luxo model declaration.
 // Pre-computes field widths and aligns output without needing gofmt.
-func generateModel(b *strings.Builder, m *ast.ModelDecl) {
+func generateModel(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
 	// Collect effective fields — @soft adds deletedAt if missing.
 	effectiveFields := m.Fields
 	if isSoftDelete(m) && !hasDeletedAtField(m.Fields) {
@@ -33,11 +33,20 @@ func generateModel(b *strings.Builder, m *ast.ModelDecl) {
 		if f.Computed != nil {
 			continue
 		}
+		relation := isRelationField(f, enums)
+		goType := resolveGoType(f.Type)
+		// Single model references use pointer to avoid circular struct embedding
+		if relation && f.Type != nil && !f.Type.IsList {
+			goType = "*" + goType
+		}
 		fi := fieldInfo{
 			goName:  capitalize(f.Name),
-			goType:  resolveGoType(f.Type),
+			goType:  goType,
 			dbTag:   toSnakeCase(f.Name),
 			jsonTag: f.Name,
+		}
+		if relation {
+			fi.dbTag = "-" // relation fields are not DB columns
 		}
 		if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
 			fi.jsonTag = "-"
@@ -54,10 +63,18 @@ func generateModel(b *strings.Builder, m *ast.ModelDecl) {
 	// Second pass: write aligned fields.
 	fmt.Fprintf(b, "type %s struct {\n", m.Name)
 	for _, fi := range fields {
-		fmt.Fprintf(b, "\t%-*s %-*s `db:%q json:%q`\n",
-			maxName, fi.goName,
-			maxType, fi.goType,
-			fi.dbTag, fi.jsonTag)
+		if fi.dbTag == "-" {
+			// Relation fields: json only, no db tag
+			fmt.Fprintf(b, "\t%-*s %-*s `json:%q`\n",
+				maxName, fi.goName,
+				maxType, fi.goType,
+				fi.jsonTag)
+		} else {
+			fmt.Fprintf(b, "\t%-*s %-*s `db:%q json:%q`\n",
+				maxName, fi.goName,
+				maxType, fi.goType,
+				fi.dbTag, fi.jsonTag)
+		}
 	}
 	b.WriteString("}\n")
 }
