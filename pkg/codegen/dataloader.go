@@ -178,6 +178,11 @@ func loaderFieldName(modelName string, rel Relation) string {
 	return capitalize(modelName) + capitalize(rel.FieldName)
 }
 
+// CollectEnumsFromResult collects all enum names from the result (exported for CLI).
+func CollectEnumsFromResult(result *semantic.Result) map[string]bool {
+	return collectEnums(result)
+}
+
 // collectEnums collects all enum names from the result.
 func collectEnums(result *semantic.Result) map[string]bool {
 	enums := make(map[string]bool)
