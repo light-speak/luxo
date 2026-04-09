@@ -114,7 +114,7 @@ func TestDiffCreateTable(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired)
+	ops := Diff(current, desired, nil)
 	if len(ops) != 1 || ops[0].Kind != CreateTable {
 		t.Errorf("expected CreateTable, got %v", ops)
 	}
@@ -126,7 +126,7 @@ func TestDiffDropTable(t *testing.T) {
 	}}
 	desired := &SchemaState{Models: map[string]*ModelState{}}
 
-	ops := Diff(current, desired)
+	ops := Diff(current, desired, nil)
 	if len(ops) != 1 || ops[0].Kind != DropTable {
 		t.Errorf("expected DropTable, got %v", ops)
 	}
@@ -145,7 +145,7 @@ func TestDiffAddColumn(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired)
+	ops := Diff(current, desired, nil)
 	found := false
 	for _, op := range ops {
 		if op.Kind == AddColumn && op.Column == "name" {
@@ -170,7 +170,7 @@ func TestDiffDropColumn(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired)
+	ops := Diff(current, desired, nil)
 	found := false
 	for _, op := range ops {
 		if op.Kind == DropColumn && op.Column == "old" {
@@ -194,7 +194,7 @@ func TestDiffAlterColumn(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired)
+	ops := Diff(current, desired, nil)
 	found := false
 	for _, op := range ops {
 		if op.Kind == AlterColumn && op.Column == "name" {
@@ -212,7 +212,7 @@ func TestDiffNoChanges(t *testing.T) {
 			"id": {Type: "SERIAL"},
 		}},
 	}}
-	ops := Diff(s, s)
+	ops := Diff(s, s, nil)
 	if len(ops) != 0 {
 		t.Errorf("expected no changes, got %d ops", len(ops))
 	}
@@ -226,7 +226,7 @@ func TestDiffIndexes(t *testing.T) {
 		"User": {Table: "users", Columns: map[string]*ColumnState{}, Indexes: []lux.IndexInfo{{Name: "idx_users_email", Kind: lux.BTreeIndex, Columns: []string{"email"}}}},
 	}}
 
-	ops := Diff(current, desired)
+	ops := Diff(current, desired, nil)
 	addIdx, dropIdx := false, false
 	for _, op := range ops {
 		if op.Kind == AddIndex && op.Index.Name == "idx_users_email" {

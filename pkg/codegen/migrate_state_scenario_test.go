@@ -32,7 +32,7 @@ func TestScenarioFirstMigration(t *testing.T) {
 	desired := ComputeState(result, nil, d)
 	current := &SchemaState{Models: map[string]*ModelState{}}
 
-	ops := Diff(current, desired)
+	ops := Diff(current, desired, nil)
 	if len(ops) != 1 || ops[0].Kind != CreateTable {
 		t.Fatalf("expected 1 CreateTable, got %d ops", len(ops))
 	}
@@ -77,7 +77,7 @@ func TestScenarioAddColumn(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired)
+	ops := Diff(current, desired, nil)
 	up, down := GenerateMigrationSQL(ops, desired, d)
 
 	if !strings.Contains(up, "ADD COLUMN avatar TEXT") {
@@ -113,7 +113,7 @@ func TestScenarioDropColumn(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired)
+	ops := Diff(current, desired, nil)
 	up, _ := GenerateMigrationSQL(ops, desired, d)
 
 	// Should be commented out
@@ -137,7 +137,7 @@ func TestScenarioAlterColumnType(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired)
+	ops := Diff(current, desired, nil)
 	up, down := GenerateMigrationSQL(ops, desired, d)
 
 	if !strings.Contains(up, "ALTER COLUMN name TYPE TEXT") {
@@ -163,7 +163,7 @@ func TestScenarioChangeNullable(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired)
+	ops := Diff(current, desired, nil)
 	up, down := GenerateMigrationSQL(ops, desired, d)
 
 	if !strings.Contains(up, "DROP NOT NULL") {
@@ -189,7 +189,7 @@ func TestScenarioAddUnique(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired)
+	ops := Diff(current, desired, nil)
 	up, down := GenerateMigrationSQL(ops, desired, d)
 
 	if !strings.Contains(up, "ADD CONSTRAINT users_email_key UNIQUE") {
@@ -215,7 +215,7 @@ func TestScenarioRemoveUnique(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired)
+	ops := Diff(current, desired, nil)
 	up, down := GenerateMigrationSQL(ops, desired, d)
 
 	if !strings.Contains(up, "DROP CONSTRAINT users_email_key") {
@@ -237,7 +237,7 @@ func TestScenarioIndexChanges(t *testing.T) {
 		"User": {Table: "users", Columns: map[string]*ColumnState{}, Indexes: []lux.IndexInfo{{Name: "idx_users_email", Kind: lux.BTreeIndex, Columns: []string{"email"}}}},
 	}}
 
-	ops := Diff(current, desired)
+	ops := Diff(current, desired, nil)
 	up, down := GenerateMigrationSQL(ops, desired, d)
 
 	if !strings.Contains(up, "CREATE INDEX idx_users_email ON users (email)") {
@@ -263,7 +263,7 @@ func TestScenarioDropTable(t *testing.T) {
 	}}
 	desired := &SchemaState{Models: map[string]*ModelState{}}
 
-	ops := Diff(current, desired)
+	ops := Diff(current, desired, nil)
 	up, _ := GenerateMigrationSQL(ops, desired, d)
 
 	if !strings.Contains(up, "-- DROP TABLE IF EXISTS old_models") {
@@ -293,7 +293,7 @@ func TestScenarioMultipleChanges(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired)
+	ops := Diff(current, desired, nil)
 
 	// Should have: CreateTable(Post) + AddColumn(avatar) + AlterColumn(name) + AddIndex
 	kinds := map[DiffKind]int{}
@@ -404,9 +404,160 @@ func TestScenarioIdempotent(t *testing.T) {
 	}
 
 	state := ComputeState(result, nil, d)
-	ops := Diff(state, state)
+	ops := Diff(state, state, nil)
 
 	if len(ops) != 0 {
 		t.Errorf("diff of same state should be empty, got %d ops", len(ops))
+	}
+}
+
+// ===== Scenario: Rename column via field ID =====
+
+func TestScenarioRenameColumn(t *testing.T) {
+	d := pgDialect()
+	current := &SchemaState{Models: map[string]*ModelState{
+		"User": {Table: "users", Columns: map[string]*ColumnState{
+			"name": {Type: "TEXT"},
+		}},
+	}}
+	desired := &SchemaState{Models: map[string]*ModelState{
+		"User": {Table: "users", Columns: map[string]*ColumnState{
+			"display_name": {Type: "TEXT"},
+		}},
+	}}
+
+	// Field ID 2 was "name", now "display_name"
+	fieldIDs := map[string]*FieldIDMap{
+		"User": {
+			OldByID: map[int]string{2: "name"},
+			NewByID: map[int]string{2: "display_name"},
+		},
+	}
+
+	ops := Diff(current, desired, fieldIDs)
+
+	foundRename := false
+	for _, op := range ops {
+		if op.Kind == RenameColumn && op.OldName == "name" && op.Column == "display_name" {
+			foundRename = true
+		}
+	}
+	if !foundRename {
+		t.Error("should detect rename via field ID")
+	}
+
+	// Should NOT have DROP + ADD
+	for _, op := range ops {
+		if op.Kind == DropColumn && op.Column == "name" {
+			t.Error("should NOT drop old column when rename detected")
+		}
+		if op.Kind == AddColumn && op.Column == "display_name" {
+			t.Error("should NOT add new column when rename detected")
+		}
+	}
+
+	up, _ := GenerateMigrationSQL(ops, desired, d)
+	if !strings.Contains(up, "RENAME COLUMN name TO display_name") {
+		t.Errorf("UP should have RENAME COLUMN:\n%s", up)
+	}
+}
+
+// ===== Scenario: Rename + type change =====
+
+func TestScenarioRenameAndTypeChange(t *testing.T) {
+	d := pgDialect()
+	current := &SchemaState{Models: map[string]*ModelState{
+		"User": {Table: "users", Columns: map[string]*ColumnState{
+			"status": {Type: "TEXT"},
+		}},
+	}}
+	desired := &SchemaState{Models: map[string]*ModelState{
+		"User": {Table: "users", Columns: map[string]*ColumnState{
+			"state": {Type: "BIGINT"},
+		}},
+	}}
+
+	fieldIDs := map[string]*FieldIDMap{
+		"User": {
+			OldByID: map[int]string{3: "status"},
+			NewByID: map[int]string{3: "state"},
+		},
+	}
+
+	ops := Diff(current, desired, fieldIDs)
+
+	hasRename, hasAlter := false, false
+	for _, op := range ops {
+		if op.Kind == RenameColumn {
+			hasRename = true
+		}
+		if op.Kind == AlterColumn {
+			hasAlter = true
+		}
+	}
+	if !hasRename {
+		t.Error("should detect rename")
+	}
+	if !hasAlter {
+		t.Error("should detect type change after rename")
+	}
+
+	up, _ := GenerateMigrationSQL(ops, desired, d)
+	if !strings.Contains(up, "RENAME COLUMN status TO state") {
+		t.Errorf("UP missing RENAME:\n%s", up)
+	}
+	if !strings.Contains(up, "TYPE BIGINT") {
+		t.Errorf("UP missing TYPE change:\n%s", up)
+	}
+}
+
+// ===== Scenario: Safety warnings =====
+
+func TestScenarioSafetyWarnings(t *testing.T) {
+	current := &SchemaState{Models: map[string]*ModelState{
+		"User": {Table: "users", Columns: map[string]*ColumnState{
+			"name": {Type: "TEXT"},
+			"old":  {Type: "TEXT"},
+		}},
+	}}
+	desired := &SchemaState{Models: map[string]*ModelState{
+		"User": {Table: "users", Columns: map[string]*ColumnState{
+			"name": {Type: "BIGINT"}, // TEXT → BIGINT = dangerous
+		}},
+	}}
+
+	ops := Diff(current, desired, nil)
+
+	// Should have warnings
+	for _, op := range ops {
+		if op.Kind == AlterColumn && op.Column == "name" && op.Warning == "" {
+			t.Error("type change TEXT → BIGINT should have a warning")
+		}
+		if op.Kind == DropColumn && op.Column == "old" && op.Warning == "" {
+			t.Error("DROP COLUMN should have a warning")
+		}
+	}
+}
+
+// ===== Scenario: NOT NULL without default warning =====
+
+func TestScenarioNotNullWithoutDefault(t *testing.T) {
+	current := &SchemaState{Models: map[string]*ModelState{
+		"User": {Table: "users", Columns: map[string]*ColumnState{
+			"bio": {Type: "TEXT", Nullable: true},
+		}},
+	}}
+	desired := &SchemaState{Models: map[string]*ModelState{
+		"User": {Table: "users", Columns: map[string]*ColumnState{
+			"bio": {Type: "TEXT", Nullable: false}, // nullable → NOT NULL, no default
+		}},
+	}}
+
+	ops := Diff(current, desired, nil)
+
+	for _, op := range ops {
+		if op.Kind == AlterColumn && op.Warning == "" {
+			t.Error("setting NOT NULL without DEFAULT should warn")
+		}
 	}
 }

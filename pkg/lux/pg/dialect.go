@@ -133,7 +133,31 @@ func (Dialect) DropColumn(table, column string) string {
 }
 
 func (Dialect) AlterColumnType(table, column, newType string) string {
+	using := pgUsingClause(column, newType)
+	if using != "" {
+		return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s USING %s;\n", table, column, newType, using)
+	}
 	return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s;\n", table, column, newType)
+}
+
+// pgUsingClause returns a USING expression for type conversions that need explicit casting.
+func pgUsingClause(column, newType string) string {
+	switch newType {
+	case "BIGINT", "SMALLINT", "SERIAL":
+		return column + "::BIGINT"
+	case "DOUBLE PRECISION":
+		return column + "::DOUBLE PRECISION"
+	case "BOOLEAN":
+		return column + "::BOOLEAN"
+	case "TIMESTAMPTZ":
+		return column + "::TIMESTAMPTZ"
+	case "UUID":
+		return column + "::UUID"
+	}
+	if strings.HasPrefix(newType, "DECIMAL") {
+		return column + "::DECIMAL"
+	}
+	return "" // TEXT, VARCHAR — implicit cast
 }
 
 func (Dialect) SetNotNull(table, column string) string {

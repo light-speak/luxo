@@ -2,6 +2,7 @@ package migrate
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -268,6 +269,99 @@ func parseSection(path, section string) (string, error) {
 		return strings.TrimSpace(after), nil
 	}
 	return strings.TrimSpace(after[:end]), nil
+}
+
+// Verify checks that the database matches the expected schema state.
+func (r *Runner) Verify(ctx context.Context) ([]string, error) {
+	if err := r.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	dbTables, err := r.listTables(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var drifts []string
+	drifts = append(drifts, r.checkPending(ctx)...)
+
+	expected := r.loadExpectedTables()
+	for _, t := range expected {
+		if !dbTables[t] {
+			drifts = append(drifts, fmt.Sprintf("missing table: %s (expected by schema)", t))
+		}
+	}
+
+	expectedSet := make(map[string]bool, len(expected))
+	for _, t := range expected {
+		expectedSet[t] = true
+	}
+	for t := range dbTables {
+		if !expectedSet[t] {
+			drifts = append(drifts, fmt.Sprintf("unexpected table: %s (not in schema)", t))
+		}
+	}
+
+	return drifts, nil
+}
+
+func (r *Runner) listTables(ctx context.Context) (map[string]bool, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT table_name FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+		AND table_name != '_migrations'
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	tables := make(map[string]bool)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		tables[name] = true
+	}
+	return tables, nil
+}
+
+func (r *Runner) checkPending(ctx context.Context) []string {
+	applied, err := r.appliedSet(ctx)
+	if err != nil {
+		return nil
+	}
+	pending, err := r.pendingFiles(applied)
+	if err != nil {
+		return nil
+	}
+	var drifts []string
+	for _, f := range pending {
+		drifts = append(drifts, fmt.Sprintf("pending migration: %s", filepath.Base(f)))
+	}
+	return drifts
+}
+
+func (r *Runner) loadExpectedTables() []string {
+	data, err := os.ReadFile(filepath.Join(r.dir, ".state.json"))
+	if err != nil {
+		return nil
+	}
+	type stateFile struct {
+		Models map[string]struct {
+			Table string `json:"table"`
+		} `json:"models"`
+	}
+	var state stateFile
+	if json.Unmarshal(data, &state) != nil {
+		return nil
+	}
+	var tables []string
+	for _, m := range state.Models {
+		tables = append(tables, m.Table)
+	}
+	return tables
 }
 
 // BuildDatabaseURL constructs a connection string from DATABASE_* env vars.

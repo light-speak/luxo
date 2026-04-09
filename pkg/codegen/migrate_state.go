@@ -238,9 +238,11 @@ type DiffOp struct {
 	Model     string // model name
 	Table     string // table name
 	Column    string // column name (for column ops)
+	OldName   string // old column name (for rename)
 	OldColumn *ColumnState
 	NewColumn *ColumnState
 	Index     *lux.IndexInfo // index info (for index ops)
+	Warning   string         // safety warning message
 }
 
 // DiffKind is the type of schema change.
@@ -252,71 +254,148 @@ const (
 	AddColumn
 	DropColumn
 	AlterColumn
+	RenameColumn
 	AddIndex
 	DropIndex
 )
 
-// Diff compares two schema states and returns the operations needed to go from current to desired.
-func Diff(current, desired *SchemaState) []DiffOp {
+// FieldIDMap maps field ID → column name for rename detection.
+// Built from luxo.lock: old state maps old names, new state maps new names.
+type FieldIDMap struct {
+	OldByID map[int]string // field ID → old column name
+	NewByID map[int]string // field ID → new column name
+}
+
+// Diff compares two schema states and returns the operations needed.
+// fieldIDs is optional — when provided, enables rename detection via luxo.lock.
+func Diff(current, desired *SchemaState, fieldIDs map[string]*FieldIDMap) []DiffOp {
 	var ops []DiffOp
 
-	// New models → CREATE TABLE
 	for name, dm := range desired.Models {
 		if _, ok := current.Models[name]; !ok {
 			ops = append(ops, DiffOp{Kind: CreateTable, Model: name, Table: dm.Table})
 		}
 	}
 
-	// Removed models → DROP TABLE
 	for name, cm := range current.Models {
 		if _, ok := desired.Models[name]; !ok {
 			ops = append(ops, DiffOp{Kind: DropTable, Model: name, Table: cm.Table})
 		}
 	}
 
-	// Changed models → column diff
 	for name, dm := range desired.Models {
 		cm, ok := current.Models[name]
 		if !ok {
-			continue // handled by CreateTable
+			continue
 		}
-		ops = append(ops, diffColumns(name, dm.Table, cm, dm)...)
+		var fim *FieldIDMap
+		if fieldIDs != nil {
+			fim = fieldIDs[name]
+		}
+		ops = append(ops, diffColumns(name, dm.Table, cm, dm, fim)...)
 		ops = append(ops, diffIndexes(name, dm.Table, cm, dm)...)
 	}
 
-	return ops
+	return addSafetyWarnings(ops)
 }
 
 // diffColumns compares columns between current and desired model states.
-func diffColumns(model, table string, current, desired *ModelState) []DiffOp {
+func diffColumns(model, table string, current, desired *ModelState, fim *FieldIDMap) []DiffOp {
+	renames := detectRenames(current, desired, fim)
+	renamedOld, renamedNew := renamesSets(renames)
+
 	var ops []DiffOp
+	ops = append(ops, diffRenamedColumns(model, table, renames, current, desired)...)
+	ops = append(ops, diffAddedColumns(model, table, current, desired, renamedNew)...)
+	ops = append(ops, diffDroppedColumns(model, table, current, desired, renamedOld)...)
+	ops = append(ops, diffChangedColumns(model, table, current, desired, renamedNew)...)
+	return ops
+}
 
-	// New columns
-	for col, dc := range desired.Columns {
-		if _, ok := current.Columns[col]; !ok {
-			ops = append(ops, DiffOp{Kind: AddColumn, Model: model, Table: table, Column: col, NewColumn: dc})
+func renamesSets(renames map[string]string) (old, new_ map[string]bool) {
+	old = make(map[string]bool, len(renames))
+	new_ = make(map[string]bool, len(renames))
+	for o, n := range renames {
+		old[o] = true
+		new_[n] = true
+	}
+	return
+}
+
+func diffRenamedColumns(model, table string, renames map[string]string, current, desired *ModelState) []DiffOp {
+	var ops []DiffOp
+	for oldName, newName := range renames {
+		oldCS, newCS := current.Columns[oldName], desired.Columns[newName]
+		ops = append(ops, DiffOp{Kind: RenameColumn, Model: model, Table: table, Column: newName, OldName: oldName, OldColumn: oldCS, NewColumn: newCS})
+		if columnChanged(oldCS, newCS) {
+			ops = append(ops, DiffOp{Kind: AlterColumn, Model: model, Table: table, Column: newName, OldColumn: oldCS, NewColumn: newCS})
 		}
 	}
+	return ops
+}
 
-	// Removed columns
-	for col, cc := range current.Columns {
-		if _, ok := desired.Columns[col]; !ok {
-			ops = append(ops, DiffOp{Kind: DropColumn, Model: model, Table: table, Column: col, OldColumn: cc})
-		}
-	}
-
-	// Changed columns
+func diffAddedColumns(model, table string, current, desired *ModelState, renamedNew map[string]bool) []DiffOp {
+	var ops []DiffOp
 	for col, dc := range desired.Columns {
-		cc, ok := current.Columns[col]
-		if !ok {
+		if _, ok := current.Columns[col]; ok || renamedNew[col] {
 			continue
 		}
-		if cc.Type != dc.Type || cc.Nullable != dc.Nullable || cc.Unique != dc.Unique || cc.Default != dc.Default {
+		ops = append(ops, DiffOp{Kind: AddColumn, Model: model, Table: table, Column: col, NewColumn: dc})
+	}
+	return ops
+}
+
+func diffDroppedColumns(model, table string, current, desired *ModelState, renamedOld map[string]bool) []DiffOp {
+	var ops []DiffOp
+	for col, cc := range current.Columns {
+		if _, ok := desired.Columns[col]; ok || renamedOld[col] {
+			continue
+		}
+		ops = append(ops, DiffOp{Kind: DropColumn, Model: model, Table: table, Column: col, OldColumn: cc})
+	}
+	return ops
+}
+
+func diffChangedColumns(model, table string, current, desired *ModelState, renamedNew map[string]bool) []DiffOp {
+	var ops []DiffOp
+	for col, dc := range desired.Columns {
+		cc, ok := current.Columns[col]
+		if !ok || renamedNew[col] {
+			continue
+		}
+		if columnChanged(cc, dc) {
 			ops = append(ops, DiffOp{Kind: AlterColumn, Model: model, Table: table, Column: col, OldColumn: cc, NewColumn: dc})
 		}
 	}
-
 	return ops
+}
+
+func columnChanged(old, new_ *ColumnState) bool {
+	return old.Type != new_.Type || old.Nullable != new_.Nullable || old.Unique != new_.Unique || old.Default != new_.Default
+}
+
+// detectRenames uses field ID mapping to find renamed columns.
+// Returns map[oldColumnName]newColumnName.
+func detectRenames(current, desired *ModelState, fim *FieldIDMap) map[string]string {
+	if fim == nil {
+		return nil
+	}
+	renames := make(map[string]string)
+	for id, oldName := range fim.OldByID {
+		newName, ok := fim.NewByID[id]
+		if !ok || oldName == newName {
+			continue
+		}
+		// Verify: old name exists in current, new name exists in desired
+		if _, inCurrent := current.Columns[oldName]; !inCurrent {
+			continue
+		}
+		if _, inDesired := desired.Columns[newName]; !inDesired {
+			continue
+		}
+		renames[oldName] = newName
+	}
+	return renames
 }
 
 // diffIndexes compares indexes between current and desired.
@@ -370,6 +449,9 @@ func generateOpSQL(upB, downB *strings.Builder, op DiffOp, desired *SchemaState,
 	case DropColumn:
 		upB.WriteString(d.DropColumn(op.Table, op.Column))
 		downB.WriteString(d.AddColumn(op.Table, d.ColumnDef(op.Column, toColumnInfo(op.OldColumn))))
+	case RenameColumn:
+		fmt.Fprintf(upB, "ALTER TABLE %s RENAME COLUMN %s TO %s;\n", op.Table, op.OldName, op.Column)
+		fmt.Fprintf(downB, "ALTER TABLE %s RENAME COLUMN %s TO %s;\n", op.Table, op.Column, op.OldName)
 	case AlterColumn:
 		generateAlterColumnSQL(upB, downB, op, d)
 	case AddIndex:
@@ -518,4 +600,105 @@ func joinNames(names []string, max int) string {
 	}
 	first := strings.Join(names[:max], "_")
 	return fmt.Sprintf("%s_and_%d_more", first, len(names)-max)
+}
+
+// addSafetyWarnings annotates DiffOps with warnings about dangerous operations.
+func addSafetyWarnings(ops []DiffOp) []DiffOp {
+	for i := range ops {
+		ops[i].Warning = classifyWarning(&ops[i])
+	}
+	return ops
+}
+
+func classifyWarning(op *DiffOp) string {
+	switch op.Kind {
+	case DropTable:
+		return "DANGEROUS: table and all data will be lost"
+	case DropColumn:
+		return "DANGEROUS: column data will be lost"
+	case AlterColumn:
+		return classifyAlterWarning(op)
+	}
+	return ""
+}
+
+func classifyAlterWarning(op *DiffOp) string {
+	if op.OldColumn == nil || op.NewColumn == nil {
+		return ""
+	}
+	// Type change warnings
+	if op.OldColumn.Type != op.NewColumn.Type {
+		return classifyTypeChange(op.OldColumn.Type, op.NewColumn.Type)
+	}
+	// Making NOT NULL without default on existing data
+	if op.OldColumn.Nullable && !op.NewColumn.Nullable && op.NewColumn.Default == "" {
+		return "WARNING: setting NOT NULL without DEFAULT may fail if existing rows have NULL values"
+	}
+	return ""
+}
+
+// classifyTypeChange returns a warning level for type changes.
+func classifyTypeChange(oldType, newType string) string {
+	// Safe: widening conversions
+	safe := map[string][]string{
+		"SMALLINT": {"BIGINT", "DOUBLE PRECISION", "DECIMAL", "TEXT"},
+		"BIGINT":   {"DOUBLE PRECISION", "DECIMAL", "TEXT"},
+		"SERIAL":   {"BIGINT", "TEXT"},
+	}
+	for _, s := range safe[oldType] {
+		if s == newType {
+			return ""
+		}
+	}
+	// Narrowing or incompatible
+	if isNumeric(oldType) && !isNumeric(newType) {
+		return "DANGEROUS: numeric → non-numeric conversion may fail"
+	}
+	if !isNumeric(oldType) && isNumeric(newType) {
+		return "DANGEROUS: non-numeric → numeric conversion may fail if data is not convertible"
+	}
+	if oldType == "TEXT" && strings.HasPrefix(newType, "VARCHAR") {
+		return "WARNING: TEXT → VARCHAR may truncate existing data"
+	}
+	return fmt.Sprintf("WARNING: type change %s → %s — verify data compatibility", oldType, newType)
+}
+
+func isNumeric(t string) bool {
+	switch t {
+	case "BIGINT", "SMALLINT", "SERIAL", "DOUBLE PRECISION", "DECIMAL":
+		return true
+	}
+	return strings.HasPrefix(t, "DECIMAL(")
+}
+
+// BuildFieldIDMaps constructs FieldIDMap for each model by comparing old and new luxo.lock states.
+func BuildFieldIDMaps(oldLock, newLock map[string]map[string]int) map[string]*FieldIDMap {
+	result := make(map[string]*FieldIDMap)
+	// Collect all model names
+	models := make(map[string]bool)
+	for m := range oldLock {
+		models[m] = true
+	}
+	for m := range newLock {
+		models[m] = true
+	}
+
+	for model := range models {
+		fim := &FieldIDMap{
+			OldByID: make(map[int]string),
+			NewByID: make(map[int]string),
+		}
+		if old, ok := oldLock[model]; ok {
+			for name, id := range old {
+				fim.OldByID[id] = toSnakeCase(name)
+			}
+		}
+		if nw, ok := newLock[model]; ok {
+			for name, id := range nw {
+				fim.NewByID[id] = toSnakeCase(name)
+			}
+		}
+		result[model] = fim
+	}
+	return result
 }
