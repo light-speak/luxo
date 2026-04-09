@@ -81,8 +81,7 @@ func analyzeRelations(m *ast.ModelDecl, enums map[string]bool) []Relation {
 }
 
 // generateDataLoaderFile produces dataloader.gen.go with loader types and batch function signatures.
-func generateDataLoaderFile(result *semantic.Result, packageName string) []byte {
-	enums := collectEnums(result)
+func generateDataLoaderFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
 	var allRelations []struct {
 		modelName string
 		relations []Relation

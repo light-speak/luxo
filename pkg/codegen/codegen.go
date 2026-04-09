@@ -18,31 +18,22 @@ func Generate(result *semantic.Result, packageName string) *GenerateResult {
 	gr := &GenerateResult{
 		Files: make(map[string][]byte),
 	}
+	enums := collectEnums(result)
 
-	// model.gen.go — enums + model structs
-	gr.Files["model.gen.go"] = generateModelFile(result, packageName)
+	gr.Files["model.gen.go"] = generateModelFile(result, packageName, enums)
 
-	// db.gen.go — query builders (Client, Query, Where, Create, Update)
-	if dbSrc := generateDBFile(result, packageName); dbSrc != nil {
+	if dbSrc := generateDBFile(result, packageName, enums); dbSrc != nil {
 		gr.Files["db.gen.go"] = dbSrc
 	}
-
-	// app.gen.go — App struct wiring all Clients
-	if appSrc := generateAppFile(result, packageName); appSrc != nil {
+	if appSrc := generateAppFile(result, packageName, enums); appSrc != nil {
 		gr.Files["app.gen.go"] = appSrc
 	}
-
-	// dataloader.gen.go — relation loaders
-	if dlSrc := generateDataLoaderFile(result, packageName); dlSrc != nil {
+	if dlSrc := generateDataLoaderFile(result, packageName, enums); dlSrc != nil {
 		gr.Files["dataloader.gen.go"] = dlSrc
 	}
-
-	// handler.gen.go — CRUD handlers + RegisterHandlers
-	if handlerSrc := generateHandlerFile(result, packageName); handlerSrc != nil {
+	if handlerSrc := generateHandlerFile(result, packageName, enums); handlerSrc != nil {
 		gr.Files["handler.gen.go"] = handlerSrc
 	}
-
-	// native.gen.go — NativeResolver interface for @native APIs
 	if nativeSrc := GenerateNativeFile(result, packageName); nativeSrc != nil {
 		gr.Files["native.gen.go"] = nativeSrc
 	}
@@ -51,7 +42,7 @@ func Generate(result *semantic.Result, packageName string) *GenerateResult {
 }
 
 // generateModelFile produces the model.gen.go file containing enums and structs.
-func generateModelFile(result *semantic.Result, packageName string) []byte {
+func generateModelFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
 	var b strings.Builder
 
 	writeHeader(&b, packageName, "model.gen.go")
@@ -65,8 +56,6 @@ func generateModelFile(result *semantic.Result, packageName string) []byte {
 		}
 	}
 
-	// Collect enum and model names
-	enumNames := collectEnums(result)
 	modelNames := make(map[string]bool)
 	for _, file := range result.Files {
 		for _, m := range file.Models {
@@ -88,7 +77,7 @@ func generateModelFile(result *semantic.Result, packageName string) []byte {
 	// model structs
 	for _, file := range result.Files {
 		for _, m := range file.Models {
-			generateModel(&b, m, enumNames)
+			generateModel(&b, m, enums)
 			b.WriteByte('\n')
 		}
 	}
@@ -157,7 +146,7 @@ func writeImports(b *strings.Builder, files []*ast.File) {
 
 // generateDBFile produces the db.gen.go file containing query builders.
 // Returns nil if there are no models.
-func generateDBFile(result *semantic.Result, packageName string) []byte {
+func generateDBFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
 	hasModels := false
 	for _, file := range result.Files {
 		if len(file.Models) > 0 {
@@ -174,7 +163,6 @@ func generateDBFile(result *semantic.Result, packageName string) []byte {
 	writeHeader(&b, packageName, "db.gen.go")
 	writeDBImports(&b, result.Files)
 
-	enums := collectEnums(result)
 	for _, file := range result.Files {
 		for _, m := range file.Models {
 			generateQueryBuilder(&b, m, enums)
@@ -227,7 +215,7 @@ func scanDBFieldImports(f *ast.FieldDecl, needs *dbImportNeeds) {
 
 // generateAppFile produces app.gen.go containing the App struct that wires all Clients.
 // Returns nil if there are no models.
-func generateAppFile(result *semantic.Result, packageName string) []byte {
+func generateAppFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
 	var models []string
 	for _, file := range result.Files {
 		for _, m := range file.Models {
@@ -249,7 +237,6 @@ func generateAppFile(result *semantic.Result, packageName string) []byte {
 	b.WriteString(")\n\n")
 
 	// Check if any model has relations (needs loaders field)
-	enums := collectEnums(result)
 	hasRelations := false
 	for _, file := range result.Files {
 		for _, m := range file.Models {

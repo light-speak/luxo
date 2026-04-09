@@ -50,7 +50,7 @@ func TestGenerateHandlerFileNoCrud(t *testing.T) {
 			},
 		}},
 	}
-	src := generateHandlerFile(result, "luxo")
+	src := generateHandlerFile(result, "luxo", nil)
 	if src != nil {
 		t.Fatal("should return nil when no @crud models")
 	}
@@ -68,7 +68,7 @@ func TestGenerateHandlerFileAllCrud(t *testing.T) {
 			},
 		}},
 	}
-	src := generateHandlerFile(result, "luxo")
+	src := generateHandlerFile(result, "luxo", nil)
 	if src == nil {
 		t.Fatal("should generate handler file")
 	}
@@ -114,7 +114,7 @@ func TestGenerateHandlerCrudOnlyGetList(t *testing.T) {
 			},
 		}},
 	}
-	src := generateHandlerFile(result, "luxo")
+	src := generateHandlerFile(result, "luxo", nil)
 	code := string(src)
 
 	if !strings.Contains(code, "handleGetPost") {
@@ -150,7 +150,7 @@ func TestGenerateHandlerCrudExceptDelete(t *testing.T) {
 			},
 		}},
 	}
-	src := generateHandlerFile(result, "luxo")
+	src := generateHandlerFile(result, "luxo", nil)
 	code := string(src)
 
 	if !strings.Contains(code, "handleGetUser") {
@@ -175,7 +175,7 @@ func TestGenerateHandlerSoftDelete(t *testing.T) {
 			},
 		}},
 	}
-	src := generateHandlerFile(result, "luxo")
+	src := generateHandlerFile(result, "luxo", nil)
 	code := string(src)
 
 	if !strings.Contains(code, "SoftDelete") {
@@ -199,7 +199,7 @@ func TestGenerateHandlerNullableField(t *testing.T) {
 			},
 		}},
 	}
-	src := generateHandlerFile(result, "luxo")
+	src := generateHandlerFile(result, "luxo", nil)
 	code := string(src)
 
 	// Nullable field should have HasParam check in create handler
@@ -220,7 +220,7 @@ func TestGenerateHandlerImmutableField(t *testing.T) {
 			},
 		}},
 	}
-	src := generateHandlerFile(result, "luxo")
+	src := generateHandlerFile(result, "luxo", nil)
 	code := string(src)
 
 	// Update handler should NOT include immutable fields

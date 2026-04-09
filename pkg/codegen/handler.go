@@ -13,7 +13,7 @@ var crudOps = []string{"get", "list", "create", "update", "delete"}
 
 // generateHandlerFile produces handler.gen.go containing CRUD handlers and RegisterHandlers.
 // Returns nil if there are no @crud models.
-func generateHandlerFile(result *semantic.Result, packageName string) []byte {
+func generateHandlerFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
 	var models []*ast.ModelDecl
 	for _, file := range result.Files {
 		for _, m := range file.Models {
@@ -34,14 +34,6 @@ func generateHandlerFile(result *semantic.Result, packageName string) []byte {
 	b.WriteString("\t\"fmt\"\n")
 	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
 	b.WriteString(")\n\n")
-
-	// Collect enum names to distinguish enum fields from relations.
-	enums := make(map[string]bool)
-	for _, file := range result.Files {
-		for _, e := range file.Enums {
-			enums[e.Name] = true
-		}
-	}
 
 	// Generate handlers per model
 	for _, m := range models {
@@ -122,9 +114,10 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 	name := m.Name
 	idType := idGoType(m)
 
+	apiName := crudAPIName(name, op)
+
 	switch op {
 	case "get":
-		apiName := "get" + name
 		fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
 	return func(ctx context.Context, req *api.Request) (any, error) {
 		id, err := req.Param%s("id")
@@ -138,7 +131,6 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 `, capitalize(apiName), paramMethod(idType), name)
 
 	case "list":
-		apiName := "list" + pluralize(name)
 		fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
 	return func(ctx context.Context, req *api.Request) (any, error) {
 		return app.%s.Where().All(ctx)
@@ -148,15 +140,12 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 `, capitalize(apiName), name)
 
 	case "create":
-		apiName := "create" + name
 		generateCreateHandler(b, m, apiName, enums)
 
 	case "update":
-		apiName := "update" + name
 		generateUpdateHandler(b, m, apiName, idType, enums)
 
 	case "delete":
-		apiName := "delete" + name
 		soft := isSoftDelete(m)
 		if soft {
 			fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
@@ -303,29 +292,25 @@ func generateParamSet(b *strings.Builder, f *ast.FieldDecl, setter, indent strin
 	fmt.Fprintf(b, "%sbuilder.%s(%s)\n", indent, setter, argExpr)
 }
 
+// crudAPIName returns the API endpoint name for a CRUD operation.
+func crudAPIName(modelName, op string) string {
+	switch op {
+	case "list":
+		return "list" + pluralize(modelName)
+	default:
+		return op + modelName
+	}
+}
+
 // generateRegisterFunc generates the RegisterHandlers function.
 func generateRegisterFunc(b *strings.Builder, models []*ast.ModelDecl) {
 	b.WriteString("// RegisterHandlers registers all CRUD handlers with the API router.\n")
 	b.WriteString("func RegisterHandlers(router *api.Router, app *App) {\n")
 
 	for _, m := range models {
-		ops := crudOperations(m)
-		name := m.Name
-		for _, op := range ops {
-			var apiName string
-			switch op {
-			case "get":
-				apiName = "get" + name
-			case "list":
-				apiName = "list" + pluralize(name)
-			case "create":
-				apiName = "create" + name
-			case "update":
-				apiName = "update" + name
-			case "delete":
-				apiName = "delete" + name
-			}
-			fmt.Fprintf(b, "\trouter.Handle(%q, handle%s(app))\n", apiName, capitalize(apiName))
+		for _, op := range crudOperations(m) {
+			name := crudAPIName(m.Name, op)
+			fmt.Fprintf(b, "\trouter.Handle(%q, handle%s(app))\n", name, capitalize(name))
 		}
 	}
 
