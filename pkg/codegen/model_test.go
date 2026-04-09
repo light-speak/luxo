@@ -286,5 +286,100 @@ func TestGenerateModelSoftDeleteExistingField(t *testing.T) {
 	}
 }
 
+func TestGenerateModelRelationPointer(t *testing.T) {
+	// Single model reference should use pointer type
+	m := &ast.ModelDecl{
+		Name: "Post",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "user", Type: &ast.TypeRef{Name: "User"}},
+		},
+	}
+
+	var b strings.Builder
+	generateModel(&b, m, nil) // no enums, so User is a relation
+	got := b.String()
+
+	// Single relation should use *User pointer
+	if !strings.Contains(got, "*User") {
+		t.Errorf("single relation should use pointer type:\n%s", got)
+	}
+	// Relation field should have json tag only, no db tag
+	if !strings.Contains(got, "`json:\"user\"`") {
+		t.Errorf("relation field should have json-only tag:\n%s", got)
+	}
+}
+
+func TestGenerateModelRelationList(t *testing.T) {
+	// List relation field
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+		},
+	}
+
+	var b strings.Builder
+	generateModel(&b, m, nil)
+	got := b.String()
+
+	// List relation should use []Post (not pointer)
+	if !strings.Contains(got, "[]Post") {
+		t.Errorf("list relation should use slice type:\n%s", got)
+	}
+	// Should have json-only tag (db:"-" → json only)
+	if !strings.Contains(got, "`json:\"posts\"`") {
+		t.Errorf("list relation should have json-only tag:\n%s", got)
+	}
+}
+
+func TestGenerateExtendStub(t *testing.T) {
+	ext := &ast.ExtendDecl{
+		Name: "ExternalUser",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}
+
+	var b strings.Builder
+	generateExtendStub(&b, ext)
+	got := b.String()
+
+	if !strings.Contains(got, "type ExternalUser struct") {
+		t.Errorf("missing struct declaration:\n%s", got)
+	}
+	if !strings.Contains(got, `db:"id"`) {
+		t.Errorf("missing db tag:\n%s", got)
+	}
+	if !strings.Contains(got, `json:"email"`) {
+		t.Errorf("missing json tag:\n%s", got)
+	}
+	if !strings.Contains(got, "stub for the external ExternalUser model") {
+		t.Errorf("missing doc comment:\n%s", got)
+	}
+}
+
+func TestGenerateExtendStubWithComputed(t *testing.T) {
+	ext := &ast.ExtendDecl{
+		Name: "ExternalUser",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "computed", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{}},
+		},
+	}
+
+	var b strings.Builder
+	generateExtendStub(&b, ext)
+	got := b.String()
+
+	// Computed field should be skipped
+	if strings.Contains(got, "Computed") {
+		t.Errorf("computed field should be skipped:\n%s", got)
+	}
+}
+
 // suppress unused import warning
 var _ = token.Position{}

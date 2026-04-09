@@ -271,3 +271,205 @@ func TestExtractListArgNonList(t *testing.T) {
 		t.Error("should return nil for non-list arg")
 	}
 }
+
+func TestCrudOperationsMultipleDirectives(t *testing.T) {
+	// Model with multiple directives including @crud — tests the continue branch
+	m := testModel("User", []*ast.Directive{
+		{Name: "soft"},
+		crudDirective(),
+		{Name: "noTime"},
+	}, nil)
+	ops := crudOperations(m)
+	if len(ops) != 5 {
+		t.Errorf("got %d ops, want 5 (should skip non-crud directives)", len(ops))
+	}
+}
+
+func TestCrudOperationsUnknownArg(t *testing.T) {
+	// @crud with unknown arg (not only/except) falls through to default crudOps
+	unknownArg := &ast.NamedArg{
+		Name:  "unknown",
+		Value: &ast.Ident{Name: "something"},
+	}
+	m := testModel("User", []*ast.Directive{crudDirective(unknownArg)}, nil)
+	ops := crudOperations(m)
+	if len(ops) != 5 {
+		t.Errorf("got %d ops, want 5 (should fall through to default)", len(ops))
+	}
+}
+
+func TestSkipHandlerFieldComputed(t *testing.T) {
+	f := &ast.FieldDecl{
+		Name:     "commentCount",
+		Type:     &ast.TypeRef{Name: "Int"},
+		Computed: &ast.ComputedField{},
+	}
+	if !skipHandlerField(f, nil) {
+		t.Error("computed field should be skipped")
+	}
+}
+
+func TestSkipHandlerFieldIDNoAuto(t *testing.T) {
+	// id field with @id but without @auto should NOT be skipped
+	f := &ast.FieldDecl{
+		Name:       "id",
+		Type:       &ast.TypeRef{Name: "Int"},
+		Directives: []*ast.Directive{{Name: "id"}},
+	}
+	if skipHandlerField(f, nil) {
+		t.Error("id without @auto should not be skipped")
+	}
+}
+
+func TestSkipHandlerFieldIDWithAuto(t *testing.T) {
+	// id field with @auto should be skipped
+	f := &ast.FieldDecl{
+		Name:       "id",
+		Type:       &ast.TypeRef{Name: "Int"},
+		Directives: []*ast.Directive{{Name: "auto"}},
+	}
+	if !skipHandlerField(f, nil) {
+		t.Error("id with @auto should be skipped")
+	}
+}
+
+func TestSkipHandlerFieldRelation(t *testing.T) {
+	// Non-builtin, non-enum type is a relation → skipped
+	f := &ast.FieldDecl{
+		Name: "user",
+		Type: &ast.TypeRef{Name: "User"},
+	}
+	if !skipHandlerField(f, nil) {
+		t.Error("relation field should be skipped")
+	}
+}
+
+func TestIdGoTypeNoIdField(t *testing.T) {
+	m := testModel("User", nil, []*ast.FieldDecl{
+		testField("name", "String"),
+	})
+	if got := idGoType(m); got != "int64" {
+		t.Errorf("idGoType = %q, want int64 (default)", got)
+	}
+}
+
+func TestIdGoTypeUUID(t *testing.T) {
+	m := testModel("User", nil, []*ast.FieldDecl{
+		testField("id", "UUID"),
+		testField("name", "String"),
+	})
+	if got := idGoType(m); got != "uuid.UUID" {
+		t.Errorf("idGoType = %q, want uuid.UUID", got)
+	}
+}
+
+func TestIdGoTypeString(t *testing.T) {
+	m := testModel("User", nil, []*ast.FieldDecl{
+		testField("id", "String"),
+		testField("name", "String"),
+	})
+	if got := idGoType(m); got != "string" {
+		t.Errorf("idGoType = %q, want string", got)
+	}
+}
+
+func TestParamMethodBool(t *testing.T) {
+	if got := paramMethod("bool"); got != "Bool" {
+		t.Errorf("paramMethod(bool) = %q, want Bool", got)
+	}
+}
+
+func TestParamMethodFloat(t *testing.T) {
+	// float64 is an unknown type, maps to default "String"
+	if got := paramMethod("float64"); got != "String" {
+		t.Errorf("paramMethod(float64) = %q, want String", got)
+	}
+}
+
+func TestGenerateHandlerEnumField(t *testing.T) {
+	enums := map[string]bool{"Role": true}
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("User", []*ast.Directive{crudDirective()}, []*ast.FieldDecl{
+					testField("id", "Int", directive("id"), directive("auto")),
+					testField("role", "Role"),
+				}),
+			},
+		}},
+	}
+	src := generateHandlerFile(result, "luxo", enums)
+	code := string(src)
+
+	// Enum field should have cast: Role(roleValVal)
+	if !strings.Contains(code, "Role(") {
+		t.Errorf("enum field should be cast to enum type:\n%s", code)
+	}
+}
+
+func TestGenerateHandlerUUIDId(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("Token", []*ast.Directive{crudDirective()}, []*ast.FieldDecl{
+					testField("id", "UUID", directive("id"), directive("auto")),
+					testField("value", "String"),
+				}),
+			},
+		}},
+	}
+	src := generateHandlerFile(result, "luxo", nil)
+	code := string(src)
+
+	// UUID id should use ParamString
+	if !strings.Contains(code, "ParamString") {
+		t.Errorf("UUID id should use ParamString:\n%s", code)
+	}
+}
+
+func TestGenerateHandlerBooleanField(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("User", []*ast.Directive{crudDirective()}, []*ast.FieldDecl{
+					testField("id", "Int", directive("id"), directive("auto")),
+					testField("active", "Boolean"),
+				}),
+			},
+		}},
+	}
+	src := generateHandlerFile(result, "luxo", nil)
+	code := string(src)
+
+	// Boolean field should use ParamBool
+	if !strings.Contains(code, "ParamBool") {
+		t.Errorf("Boolean field should use ParamBool:\n%s", code)
+	}
+}
+
+func TestGenerateHandlerHardDelete(t *testing.T) {
+	// Test delete without @soft (hard delete path)
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("User",
+					[]*ast.Directive{crudDirective()},
+					[]*ast.FieldDecl{
+						testField("id", "Int", directive("id")),
+						testField("name", "String"),
+					},
+				),
+			},
+		}},
+	}
+	src := generateHandlerFile(result, "luxo", nil)
+	code := string(src)
+
+	// Hard delete should use .Where().Delete()
+	if strings.Contains(code, "SoftDelete") {
+		t.Error("non-@soft model should NOT use SoftDelete")
+	}
+	if !strings.Contains(code, ".Delete(ctx)") {
+		t.Error("should use .Delete(ctx)")
+	}
+}

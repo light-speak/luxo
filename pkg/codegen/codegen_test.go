@@ -481,6 +481,148 @@ func TestGenerateAppFileNoModels(t *testing.T) {
 	}
 }
 
+func TestGenerateAppFileWithRelations(t *testing.T) {
+	file := &ast.File{
+		Name: "test.luxo",
+		Models: []*ast.ModelDecl{
+			{
+				Name: "User",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+				},
+			},
+			{
+				Name: "Post",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "user", Type: &ast.TypeRef{Name: "User"}},
+				},
+			},
+		},
+	}
+
+	gr := Generate(result(file), "gen")
+	appSrc := string(gr.Files["app.gen.go"])
+
+	// Should have loaders field since there are relations
+	if !strings.Contains(appSrc, "loaders Loaders") {
+		t.Errorf("should have loaders field for models with relations:\n%s", appSrc)
+	}
+}
+
+func TestGenerateFullWithHandlerAndDataloader(t *testing.T) {
+	file := &ast.File{
+		Name: "test.luxo",
+		Models: []*ast.ModelDecl{
+			{
+				Name: "User",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+					{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+				},
+				Directives: []*ast.Directive{{Name: "crud"}},
+			},
+			{
+				Name: "Post",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+					{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "user", Type: &ast.TypeRef{Name: "User"}},
+				},
+				Directives: []*ast.Directive{{Name: "crud"}},
+			},
+		},
+		APIs: []*ast.ApiDecl{
+			{
+				Name:       "doCustom",
+				Directives: []*ast.Directive{{Name: "native"}},
+				ReturnType: &ast.TypeRef{Name: "String"},
+			},
+		},
+	}
+
+	gr := Generate(result(file), "gen")
+
+	// Should generate all files
+	if _, ok := gr.Files["handler.gen.go"]; !ok {
+		t.Error("missing handler.gen.go")
+	}
+	if _, ok := gr.Files["dataloader.gen.go"]; !ok {
+		t.Error("missing dataloader.gen.go")
+	}
+	if _, ok := gr.Files["native.gen.go"]; !ok {
+		t.Error("missing native.gen.go")
+	}
+}
+
+func TestGenerateModelFileWithExtend(t *testing.T) {
+	file := &ast.File{
+		Name: "test.luxo",
+		Models: []*ast.ModelDecl{
+			{
+				Name: "Post",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+				},
+			},
+		},
+		Extends: []*ast.ExtendDecl{
+			{
+				Name: "ExternalUser",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+				},
+			},
+		},
+	}
+
+	gr := Generate(result(file), "gen")
+	src := string(gr.Files["model.gen.go"])
+
+	if !strings.Contains(src, "type ExternalUser struct") {
+		t.Errorf("should have extend stub struct:\n%s", src)
+	}
+	if !strings.Contains(src, "stub for the external ExternalUser model") {
+		t.Errorf("should have stub comment:\n%s", src)
+	}
+}
+
+func TestGenerateModelFileExtendSkipsExistingModel(t *testing.T) {
+	file := &ast.File{
+		Name: "test.luxo",
+		Models: []*ast.ModelDecl{
+			{
+				Name: "User",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+				},
+			},
+		},
+		Extends: []*ast.ExtendDecl{
+			{
+				Name: "User", // same name as an existing model
+				Fields: []*ast.FieldDecl{
+					{Name: "extra", Type: &ast.TypeRef{Name: "String"}},
+				},
+			},
+		},
+	}
+
+	gr := Generate(result(file), "gen")
+	src := string(gr.Files["model.gen.go"])
+
+	// Should not generate a stub for User since it already exists as a model
+	if strings.Contains(src, "stub for the external User model") {
+		t.Errorf("should not generate stub for existing model:\n%s", src)
+	}
+}
+
 func TestGenerateAppFileSingleModel(t *testing.T) {
 	file := &ast.File{
 		Name: "test.luxo",

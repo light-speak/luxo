@@ -220,6 +220,124 @@ func TestExtractByArgsDefault(t *testing.T) {
 	}
 }
 
+func TestAnalyzeRelationsWithByHasMany(t *testing.T) {
+	// @by on a list field → HasMany
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "articles", Type: &ast.TypeRef{Name: "Article", IsList: true}, Directives: []*ast.Directive{
+				{Name: "by", Args: []*ast.NamedArg{
+					{Name: "remote", Value: &ast.Ident{Name: "authorId"}},
+					{Name: "local", Value: &ast.Ident{Name: "id"}},
+				}},
+			}},
+		},
+	}
+	rels := analyzeRelations(m, map[string]bool{})
+	if len(rels) != 1 {
+		t.Fatalf("expected 1 relation, got %d", len(rels))
+	}
+	r := rels[0]
+	if r.Type != HasMany {
+		t.Errorf("type = %v, want HasMany", r.Type)
+	}
+	if r.RemoteKey != "authorId" || r.LocalKey != "id" {
+		t.Errorf("keys = remote:%s local:%s, want remote:authorId local:id", r.RemoteKey, r.LocalKey)
+	}
+}
+
+func TestAnalyzeRelationsWithByHasOne(t *testing.T) {
+	// @by on a non-list field where the localKey is NOT a FK on this model → HasOne
+	// The local key must not match any existing field name in the model
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "settings", Type: &ast.TypeRef{Name: "Settings"}, Directives: []*ast.Directive{
+				{Name: "by", Args: []*ast.NamedArg{
+					{Name: "remote", Value: &ast.Ident{Name: "userId"}},
+					// local defaults to "id" via extractByArgs, but "id" IS a field
+					// So use a local key that doesn't exist as a field
+					{Name: "local", Value: &ast.Ident{Name: "nonExistentKey"}},
+				}},
+			}},
+		},
+	}
+	rels := analyzeRelations(m, map[string]bool{})
+	if len(rels) != 1 {
+		t.Fatalf("expected 1 relation, got %d", len(rels))
+	}
+	r := rels[0]
+	if r.Type != HasOne {
+		t.Errorf("type = %v, want HasOne", r.Type)
+	}
+}
+
+func TestAnalyzeRelationsSkipsNilType(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "unknown", Type: nil},
+		},
+	}
+	rels := analyzeRelations(m, map[string]bool{})
+	if len(rels) != 0 {
+		t.Errorf("nil type should be skipped, got %d relations", len(rels))
+	}
+}
+
+func TestAnalyzeRelationsSkipsComputed(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "postCount", Type: &ast.TypeRef{Name: "Post"}, Computed: &ast.ComputedField{}},
+		},
+	}
+	rels := analyzeRelations(m, map[string]bool{})
+	if len(rels) != 0 {
+		t.Errorf("computed fields should be skipped, got %d relations", len(rels))
+	}
+}
+
+func TestGenerateDataLoaderDedup(t *testing.T) {
+	// Two models with relations to the same target via the same key
+	// should deduplicate loader types
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Models: []*ast.ModelDecl{
+				{
+					Pos:  pos0(),
+					Name: "Post",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "user", Type: &ast.TypeRef{Name: "User"}},
+					},
+				},
+				{
+					Pos:  pos0(),
+					Name: "Comment",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "user", Type: &ast.TypeRef{Name: "User"}},
+					},
+				},
+			},
+		}},
+	}
+	src := generateDataLoaderFile(result, "luxo", nil)
+	code := string(src)
+
+	// UserByIdLoader type should appear only once
+	count := strings.Count(code, "type UserByIdLoader")
+	if count != 1 {
+		t.Errorf("UserByIdLoader type should be defined once, found %d times", count)
+	}
+}
+
 func TestExtractByArgsEmpty(t *testing.T) {
 	d := &ast.Directive{Name: "by"}
 	remote, local := extractByArgs(d)
