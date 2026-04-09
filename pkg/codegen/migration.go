@@ -231,21 +231,16 @@ func applyTypeDirective(base string, f *ast.FieldDecl) string {
 }
 
 // isRelationFieldSimple checks if a field is a relation without needing enum info.
-// A field is a relation if its type is a non-builtin model type.
-// [String], [Int] etc. are NOT relations — they're scalar arrays.
+// Only detects list relations ([Post]) — single model references (user: User)
+// need isRelationField with enum context to avoid false positives on enums.
 func isRelationFieldSimple(f *ast.FieldDecl) bool {
 	if f.Type == nil {
 		return false
 	}
-	// Check if the base type (ignoring list) is a builtin scalar
+	// Builtin scalars are never relations (even as lists: [String] → scalar array)
 	switch f.Type.Name {
 	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes":
-		return false // [String], [Int] etc. are scalar arrays, not relations
-	}
-	// Non-builtin type: could be a model relation or enum
-	// If field name matches type name (case-insensitive), it's a relation (user: User)
-	if strings.EqualFold(f.Name, f.Type.Name) {
-		return true
+		return false
 	}
 	// List of non-builtin = relation ([Post], [Comment])
 	if f.Type.IsList {

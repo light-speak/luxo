@@ -246,7 +246,7 @@ func TestGenerateQueryBuilder(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateQueryBuilder(&b, m)
+	generateQueryBuilder(&b, m, nil)
 	got := b.String()
 
 	sections := []string{
@@ -287,7 +287,7 @@ func TestGenerateQueryBuilderTableName(t *testing.T) {
 				},
 			}
 			var b strings.Builder
-			generateQueryBuilder(&b, m)
+			generateQueryBuilder(&b, m, nil)
 			got := b.String()
 			if !strings.Contains(got, `"`+tt.tableName+`"`) {
 				t.Errorf("expected table name %q in:\n%s", tt.tableName, got)
@@ -492,7 +492,7 @@ func TestGenerateQueryBuilderSoft(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateQueryBuilder(&b, m)
+	generateQueryBuilder(&b, m, nil)
 	got := b.String()
 
 	// Should have deletedAt in scanner and fields
@@ -524,7 +524,7 @@ func TestGenerateQueryBuilderSoftWithExistingDeletedAt(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateQueryBuilder(&b, m)
+	generateQueryBuilder(&b, m, nil)
 	got := b.String()
 
 	// Should still have soft delete methods

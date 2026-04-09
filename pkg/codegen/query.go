@@ -14,7 +14,7 @@ const luxImport = "github.com/light-speak/luxo/pkg/lux"
 // Uses runtime generics (lux.Query[T], lux.CreateBase[T], lux.UpdateBase[T])
 // to minimize generated code — only scanner, client, fields, where, and
 // typed Set methods are generated per model.
-func generateQueryBuilder(b *strings.Builder, m *ast.ModelDecl) {
+func generateQueryBuilder(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
 	name := m.Name
 	tableName := toSnakeCase(name) + "s" // simple pluralize
 	soft := isSoftDelete(m)
@@ -25,13 +25,21 @@ func generateQueryBuilder(b *strings.Builder, m *ast.ModelDecl) {
 		fields = append(append([]*ast.FieldDecl{}, m.Fields...), softDeleteField())
 	}
 
-	generateScanner(b, &ast.ModelDecl{Name: m.Name, Fields: fields, Directives: m.Directives})
-	generateClient(b, name, tableName, fields, soft)
-	generateFieldConstants(b, name, fields)
-	generateWhereFields(b, name, fields)
-	generateCreateBuilder(b, name, fields)
-	generateCreateManyBuilder(b, name, fields)
-	generateUpdateBuilder(b, name, fields)
+	// Filter out relation fields — they're not DB columns
+	var dbFields []*ast.FieldDecl
+	for _, f := range fields {
+		if !isRelationField(f, enums) {
+			dbFields = append(dbFields, f)
+		}
+	}
+
+	generateScanner(b, &ast.ModelDecl{Name: m.Name, Fields: dbFields, Directives: m.Directives})
+	generateClient(b, name, tableName, dbFields, soft)
+	generateFieldConstants(b, name, dbFields)
+	generateWhereFields(b, name, dbFields)
+	generateCreateBuilder(b, name, dbFields)
+	generateCreateManyBuilder(b, name, dbFields)
+	generateUpdateBuilder(b, name, dbFields)
 }
 
 // --- Client ---
@@ -275,7 +283,7 @@ func collectAutoCols(fields []*ast.FieldDecl) []autoCol {
 	return result
 }
 
-// collectUserFields returns fields that are user-provided (not computed, not internal, not auto-managed).
+// collectUserFields returns fields that are user-provided (not computed, not internal, not auto-managed, not relation).
 func collectUserFields(fields []*ast.FieldDecl) []*ast.FieldDecl {
 	var result []*ast.FieldDecl
 	for _, f := range fields {
@@ -397,7 +405,7 @@ func new%sUpdateBuilder(db *pg.DB, table string, id %s) *%sUpdateBuilder {
 
 `, name, name, idType, name, name, name, idType, scanFn)
 
-	// Generate Set methods — skip auto-managed, @immutable, @internal, computed
+	// Generate Set methods — skip auto-managed, @immutable, @internal, computed, relation
 	for _, f := range fields {
 		if f.Computed != nil || isAutoManaged(f) {
 			continue

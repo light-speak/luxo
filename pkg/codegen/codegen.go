@@ -174,9 +174,10 @@ func generateDBFile(result *semantic.Result, packageName string) []byte {
 	writeHeader(&b, packageName, "db.gen.go")
 	writeDBImports(&b, result.Files)
 
+	enums := collectEnums(result)
 	for _, file := range result.Files {
 		for _, m := range file.Models {
-			generateQueryBuilder(&b, m)
+			generateQueryBuilder(&b, m, enums)
 			b.WriteByte('\n')
 		}
 	}
