@@ -115,7 +115,7 @@ var builtinDirectives = []DirectiveDef{
 	// ===== Field-level directives — relations =====
 	{
 		Name: "by", Contexts: OnField,
-		Params:      []ParamDef{{Name: "remote", Required: true}, {Name: "local"}},
+		Params:      []ParamDef{{}, {}}, // positional: remote, local
 		MaxArgs:     2,
 		Description: "specify relation FK: @by(remoteField, localField). DataLoader: WHERE remote IN (local values)",
 	},

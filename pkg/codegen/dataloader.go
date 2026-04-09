@@ -108,9 +108,15 @@ func generateDataLoaderFile(result *semantic.Result, packageName string) []byte 
 	writeHeader(&b, packageName, "dataloader.gen.go")
 	b.WriteString("import \"context\"\n\n")
 
-	// Generate loader function types for each relation
+	// Generate loader function types for each relation (deduplicate by type name)
+	seenTypes := make(map[string]bool)
 	for _, mr := range allRelations {
 		for _, rel := range mr.relations {
+			typeName := loaderTypeName(mr.modelName, rel)
+			if seenTypes[typeName] {
+				continue
+			}
+			seenTypes[typeName] = true
 			generateLoaderType(&b, mr.modelName, rel)
 		}
 	}
