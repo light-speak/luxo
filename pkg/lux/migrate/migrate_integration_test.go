@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -298,6 +299,112 @@ func TestIntegrationVerifyWithState(t *testing.T) {
 	if !hasMissing {
 		t.Errorf("should detect missing table, drifts: %v", drifts)
 	}
+}
+
+func TestIntegrationChecksumTamper(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	ctx := context.Background()
+
+	writeMigration(t, dir, "001_create_users.sql",
+		"CREATE TABLE test_users (id SERIAL PRIMARY KEY);",
+		"DROP TABLE IF EXISTS test_users;")
+
+	// Up — stores checksum
+	runner.Up(ctx)
+
+	// Tamper the migration file
+	path := filepath.Join(dir, "001_create_users.sql")
+	os.WriteFile(path, []byte("-- TAMPERED\n-- ====== UP ======\nSELECT 1;\n-- ====== DOWN ======\nSELECT 1;"), 0644)
+
+	// Add a second migration
+	writeMigration(t, dir, "002_add_col.sql",
+		"ALTER TABLE test_users ADD COLUMN name TEXT;",
+		"ALTER TABLE test_users DROP COLUMN name;")
+
+	// Up should detect checksum mismatch
+	_, err := runner.Up(ctx)
+	if err == nil {
+		t.Fatal("should detect tampered migration")
+	}
+	if !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Errorf("error should mention checksum, got: %v", err)
+	}
+}
+
+func TestIntegrationDryRun(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	ctx := context.Background()
+
+	writeMigration(t, dir, "001_create_users.sql",
+		"CREATE TABLE test_users (id SERIAL PRIMARY KEY);",
+		"DROP TABLE IF EXISTS test_users;")
+
+	// DryRun should return SQL without executing
+	names, sqls, err := runner.DryRun(ctx)
+	if err != nil {
+		t.Fatalf("DryRun: %v", err)
+	}
+	if len(names) != 1 || names[0] != "001_create_users.sql" {
+		t.Errorf("names = %v", names)
+	}
+	if !strings.Contains(sqls[0], "CREATE TABLE test_users") {
+		t.Errorf("sql should contain CREATE TABLE, got: %s", sqls[0])
+	}
+
+	// Table should NOT exist (dry run doesn't execute)
+	var exists bool
+	runner.pool.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name='test_users')").Scan(&exists)
+	if exists {
+		t.Error("DryRun should not create the table")
+	}
+}
+
+func TestIntegrationConcurrently(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	ctx := context.Background()
+
+	// First create the table
+	writeMigration(t, dir, "001_create_users.sql",
+		"CREATE TABLE test_users (id SERIAL PRIMARY KEY, name TEXT);",
+		"DROP TABLE IF EXISTS test_users;")
+	runner.Up(ctx)
+
+	// Then add a CONCURRENTLY index
+	writeMigration(t, dir, "002_add_index.sql",
+		"CREATE INDEX CONCURRENTLY idx_test_users_name ON test_users (name);",
+		"DROP INDEX IF EXISTS idx_test_users_name;")
+
+	executed, err := runner.Up(ctx)
+	if err != nil {
+		t.Fatalf("Up with CONCURRENTLY: %v", err)
+	}
+	if len(executed) != 1 {
+		t.Errorf("expected 1 executed, got %d", len(executed))
+	}
+
+	// Verify index exists
+	var indexExists bool
+	runner.pool.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE indexname='idx_test_users_name')").Scan(&indexExists)
+	if !indexExists {
+		t.Error("CONCURRENTLY index should exist")
+	}
+}
+
+func TestIntegrationAdvisoryLock(t *testing.T) {
+	runner, _ := setupTestRunner(t)
+	ctx := context.Background()
+
+	// Acquire lock
+	err := runner.acquireLock(ctx)
+	if err != nil {
+		t.Fatalf("acquireLock: %v", err)
+	}
+
+	// Release lock
+	runner.releaseLock(ctx)
+	// Should not panic or error
 }
 
 func TestIntegrationVerify(t *testing.T) {

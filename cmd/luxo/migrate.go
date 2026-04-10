@@ -44,6 +44,8 @@ Example / 示例:
 	RunE: runMigrateDiff,
 }
 
+var dryRun bool
+
 var migrateUpCmd = &cobra.Command{
 	Use:   "up",
 	Short: "Apply pending migrations / 执行未执行的迁移",
@@ -80,6 +82,7 @@ var migrateSquashCmd = &cobra.Command{
 }
 
 func init() {
+	migrateUpCmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show SQL without executing / 显示 SQL 但不执行")
 	migrateCmd.AddCommand(migrateDiffCmd)
 	migrateCmd.AddCommand(migrateUpCmd)
 	migrateCmd.AddCommand(migrateDownCmd)
@@ -206,6 +209,7 @@ func printDiffOps(ops []codegen.DiffOp) {
 
 func runMigrateUp(cmd *cobra.Command, args []string) error {
 	green := "\033[32m"
+	cyan := "\033[36m"
 	bold := "\033[1m"
 	dim := "\033[2m"
 	reset := "\033[0m"
@@ -218,6 +222,23 @@ func runMigrateUp(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("connect: %w", err)
 	}
 	defer runner.Close()
+
+	if dryRun {
+		names, sqls, err := runner.DryRun(ctx)
+		if err != nil {
+			return fmt.Errorf("dry run: %w", err)
+		}
+		if len(names) == 0 {
+			fmt.Printf("\n  %s✓ No pending migrations / 无待执行的迁移%s\n\n", green, reset)
+			return nil
+		}
+		fmt.Printf("\n  %s%s== DRY RUN ==%s\n\n", bold, cyan, reset)
+		for i, name := range names {
+			fmt.Printf("  %s--%s %s%s%s\n", cyan, reset, dim, name, reset)
+			fmt.Printf("  %s\n\n", sqls[i])
+		}
+		return nil
+	}
 
 	executed, err := runner.Up(ctx)
 	if err != nil {
