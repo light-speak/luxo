@@ -9,6 +9,7 @@ import (
 
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lux"
+	"github.com/light-speak/luxo/pkg/lux/str"
 	"github.com/light-speak/luxo/pkg/semantic"
 )
 
@@ -69,7 +70,7 @@ func ComputeState(result *semantic.Result, enums map[string]bool, dialect lux.Di
 	for _, file := range result.Files {
 		for _, m := range file.Models {
 			ms := &ModelState{
-				Table:   toSnakeCase(m.Name) + "s",
+				Table:   str.ToSnakeCase(m.Name) + "s",
 				Columns: make(map[string]*ColumnState),
 			}
 
@@ -79,7 +80,7 @@ func ComputeState(result *semantic.Result, enums map[string]bool, dialect lux.Di
 				}
 				col := buildColumnState(f, dialect)
 				if col != nil {
-					ms.Columns[toSnakeCase(f.Name)] = col
+					ms.Columns[str.ToSnakeCase(f.Name)] = col
 				}
 			}
 
@@ -162,7 +163,7 @@ func collectIndexes(m *ast.ModelDecl, table string) []lux.IndexInfo {
 		if f.Computed != nil {
 			continue
 		}
-		col := toSnakeCase(f.Name)
+		col := str.ToSnakeCase(f.Name)
 
 		if hasDirective(f.Directives, "index") {
 			indexes = append(indexes, lux.IndexInfo{
@@ -192,7 +193,7 @@ func extractIndexFields(d *ast.Directive) []string {
 				var cols []string
 				for _, item := range list.Items {
 					if ident, ok := item.(*ast.Ident); ok {
-						cols = append(cols, toSnakeCase(ident.Name))
+						cols = append(cols, str.ToSnakeCase(ident.Name))
 					}
 				}
 				return cols
@@ -690,12 +691,12 @@ func BuildFieldIDMaps(oldLock, newLock map[string]map[string]int) map[string]*Fi
 		}
 		if old, ok := oldLock[model]; ok {
 			for name, id := range old {
-				fim.OldByID[id] = toSnakeCase(name)
+				fim.OldByID[id] = str.ToSnakeCase(name)
 			}
 		}
 		if nw, ok := newLock[model]; ok {
 			for name, id := range nw {
-				fim.NewByID[id] = toSnakeCase(name)
+				fim.NewByID[id] = str.ToSnakeCase(name)
 			}
 		}
 		result[model] = fim

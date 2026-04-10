@@ -3,6 +3,8 @@ package codegen
 import (
 	"fmt"
 	"strings"
+
+	"github.com/light-speak/luxo/pkg/lux/str"
 )
 
 // ScaffoldResult holds scaffold files to be written to disk.
@@ -83,7 +85,7 @@ func generateGoMod(modulePath string) []byte {
 
 // generateModuleSchema produces the origin/<module>.luxo skeleton.
 func generateModuleSchema(moduleName string) []byte {
-	name := capitalize(moduleName)
+	name := str.Capitalize(moduleName)
 	var b strings.Builder
 	fmt.Fprintf(&b, "// %s module\n\n", name)
 	fmt.Fprintf(&b, "model %s {\n", name)

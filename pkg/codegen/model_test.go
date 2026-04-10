@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lux/str"
 	"github.com/light-speak/luxo/pkg/token"
 )
 
@@ -172,9 +173,9 @@ func TestToSnakeCase(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			got := toSnakeCase(tt.input)
+			got := str.ToSnakeCase(tt.input)
 			if got != tt.expect {
-				t.Errorf("toSnakeCase(%q) = %q, want %q", tt.input, got, tt.expect)
+				t.Errorf("str.ToSnakeCase(%q) = %q, want %q", tt.input, got, tt.expect)
 			}
 		})
 	}
@@ -192,9 +193,9 @@ func TestCapitalize(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			got := capitalize(tt.input)
+			got := str.Capitalize(tt.input)
 			if got != tt.expect {
-				t.Errorf("capitalize(%q) = %q, want %q", tt.input, got, tt.expect)
+				t.Errorf("str.Capitalize(%q) = %q, want %q", tt.input, got, tt.expect)
 			}
 		})
 	}

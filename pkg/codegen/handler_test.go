@@ -507,3 +507,69 @@ func TestGenerateHandlerHardDelete(t *testing.T) {
 		t.Error("should use .Delete(ctx)")
 	}
 }
+
+func TestSkipHandlerFieldNilType(t *testing.T) {
+	// Field with nil type should not panic in isRelationField
+	f := &ast.FieldDecl{
+		Name: "unknown",
+		Type: nil,
+	}
+	// Should not be skipped (nil type → isRelationField returns false)
+	if skipHandlerField(f, nil) {
+		t.Error("nil-type field should not be skipped")
+	}
+}
+
+func TestGenerateHandlerWithRelations(t *testing.T) {
+	// Test get/list handlers with relation resolvers
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("User",
+					[]*ast.Directive{crudDirective()},
+					[]*ast.FieldDecl{
+						testField("id", "Int", directive("id"), directive("auto")),
+						testField("name", "String"),
+						{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+					},
+				),
+			},
+		}},
+	}
+	src := generateHandlerFile(result, "luxo", nil)
+	code := string(src)
+
+	// Should have relation resolver function
+	if !strings.Contains(code, "resolveUserRelations") {
+		t.Errorf("should have relation resolver:\n%s", code)
+	}
+	// Get handler should call resolve
+	if !strings.Contains(code, "resolveUserRelations(ctx, app, result, req.Select)") {
+		t.Errorf("get handler should call resolveRelations:\n%s", code)
+	}
+}
+
+func TestGenerateHandlerDefaultFieldValue(t *testing.T) {
+	// Field with a default value should use HasParam in create handler
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("User", []*ast.Directive{crudDirective()}, []*ast.FieldDecl{
+					testField("id", "Int", directive("id"), directive("auto")),
+					{
+						Name:    "role",
+						Type:    &ast.TypeRef{Name: "String"},
+						Default: &ast.Literal{Value: "user"},
+					},
+				}),
+			},
+		}},
+	}
+	src := generateHandlerFile(result, "luxo", nil)
+	code := string(src)
+
+	// Field with default should have HasParam check
+	if !strings.Contains(code, `req.HasParam("role")`) {
+		t.Errorf("field with default should use HasParam:\n%s", code)
+	}
+}

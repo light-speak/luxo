@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	luxoast "github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lux/str"
 	"github.com/light-speak/luxo/pkg/semantic"
 )
 
@@ -36,7 +37,7 @@ func GenerateNativeFile(result *semantic.Result, packageName string) []byte {
 	b.WriteString("// Implement this interface in your resolver package.\n")
 	b.WriteString("type NativeResolver interface {\n")
 	for _, api := range apis {
-		fmt.Fprintf(&b, "\t%s(ctx context.Context", capitalize(api.Name))
+		fmt.Fprintf(&b, "\t%s(ctx context.Context", str.Capitalize(api.Name))
 		for _, p := range api.Params {
 			goType := resolveGoType(p.Type)
 			fmt.Fprintf(&b, ", %s %s", p.Name, goType)
@@ -100,7 +101,7 @@ func MergeResolver(filePath string, apis []nativeAPI) error {
 	// Collect new functions to append
 	var toAppend []string
 	for _, api := range apis {
-		funcName := capitalize(api.Name)
+		funcName := str.Capitalize(api.Name)
 		if _, exists := existingFuncs[funcName]; exists {
 			// Function exists — signature update would require AST rewriting.
 			// For now, trust the user's implementation. If signature changes,
@@ -133,8 +134,8 @@ func MergeResolver(filePath string, apis []nativeAPI) error {
 // generateNativeStub creates a function stub for a new @native API.
 func generateNativeStub(api nativeAPI) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "// %s implements the @native API.\n", capitalize(api.Name))
-	fmt.Fprintf(&b, "func %s(ctx context.Context", capitalize(api.Name))
+	fmt.Fprintf(&b, "// %s implements the @native API.\n", str.Capitalize(api.Name))
+	fmt.Fprintf(&b, "func %s(ctx context.Context", str.Capitalize(api.Name))
 	for _, p := range api.Params {
 		goType := resolveGoType(p.Type)
 		fmt.Fprintf(&b, ", %s %s", p.Name, goType)

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lux/str"
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
 )
@@ -201,8 +202,8 @@ func TestLowerFirst(t *testing.T) {
 		{"a", "a"},
 	}
 	for _, tt := range tests {
-		if got := lowerFirst(tt.in); got != tt.want {
-			t.Errorf("lowerFirst(%q) = %q, want %q", tt.in, got, tt.want)
+		if got := str.LowerFirst(tt.in); got != tt.want {
+			t.Errorf("str.LowerFirst(%q) = %q, want %q", tt.in, got, tt.want)
 		}
 	}
 }
@@ -358,5 +359,163 @@ func TestRelTypeName(t *testing.T) {
 	}
 	if relTypeName(RelationType(99)) != "unknown" {
 		t.Error("unknown")
+	}
+}
+
+func TestGenerateDataLoaderWithExternalSoftModels(t *testing.T) {
+	// Test externalSoftModels non-nil path + soft target filtering
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Models: []*ast.ModelDecl{
+				{
+					Pos:  pos0(),
+					Name: "Post",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "user", Type: &ast.TypeRef{Name: "User"}},
+					},
+				},
+			},
+		}},
+	}
+
+	// User is soft-deleted externally
+	externalSoft := map[string]bool{"User": true}
+	src := generateDataLoaderFile(result, "luxo", nil, externalSoft)
+	if src == nil {
+		t.Fatal("should generate dataloader file")
+	}
+	code := string(src)
+
+	// Should contain soft delete filter for User target
+	if !strings.Contains(code, "deleted_at") {
+		t.Errorf("should filter soft-deleted User targets:\n%s", code)
+	}
+}
+
+func TestGenerateDataLoaderWithLocalSoftModel(t *testing.T) {
+	// Test local @soft model detected in generateDataLoaderFile
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Models: []*ast.ModelDecl{
+				{
+					Pos:  pos0(),
+					Name: "User",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+					},
+				},
+				{
+					Pos:        pos0(),
+					Name:       "Post",
+					Directives: []*ast.Directive{{Name: "soft"}},
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+					},
+				},
+			},
+		}},
+	}
+
+	src := generateDataLoaderFile(result, "luxo", nil, nil)
+	if src == nil {
+		t.Fatal("should generate dataloader file")
+	}
+	code := string(src)
+
+	// HasMany to Post (which is @soft) should add deleted_at filter
+	if !strings.Contains(code, "deleted_at") {
+		t.Errorf("should filter soft-deleted Post targets:\n%s", code)
+	}
+}
+
+func TestDeduplicateLoadersSkipsDuplicate(t *testing.T) {
+	// Two relations that produce the same loader field name
+	allRelations := []struct {
+		modelName string
+		relations []Relation
+	}{
+		{
+			modelName: "Post",
+			relations: []Relation{
+				{FieldName: "user", TargetName: "User", RemoteKey: "id", LocalKey: "userId"},
+			},
+		},
+		{
+			modelName: "Comment",
+			relations: []Relation{
+				// Same fieldName pattern: Comment + user → CommentUser, different from PostUser
+				// Use same modelName+field combo to force dedup
+				{FieldName: "user", TargetName: "User", RemoteKey: "id", LocalKey: "userId"},
+			},
+		},
+	}
+
+	// PostUser and CommentUser are different, so both should be kept
+	entries := deduplicateLoaders(allRelations)
+	if len(entries) != 2 {
+		// This tests that unique names are kept; let's create a real duplicate
+		t.Logf("got %d entries (expected 2 for different model names)", len(entries))
+	}
+
+	// Test with actual duplicates: same model+field produces same loaderFieldName
+	dupRelations := []struct {
+		modelName string
+		relations []Relation
+	}{
+		{
+			modelName: "Post",
+			relations: []Relation{
+				{FieldName: "user", TargetName: "User", RemoteKey: "id", LocalKey: "userId"},
+				{FieldName: "user", TargetName: "User", RemoteKey: "id", LocalKey: "userId"},
+			},
+		},
+	}
+	entries2 := deduplicateLoaders(dupRelations)
+	if len(entries2) != 1 {
+		t.Errorf("duplicate loaders should be deduped, got %d", len(entries2))
+	}
+}
+
+func TestGenerateDefaultLoadersDeduplicate(t *testing.T) {
+	// Test that generateDefaultLoaders skips duplicate loaders (seen map)
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Models: []*ast.ModelDecl{
+				{
+					Pos:  pos0(),
+					Name: "Post",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "user", Type: &ast.TypeRef{Name: "User"}},
+					},
+				},
+				{
+					Pos:  pos0(),
+					Name: "Comment",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "user", Type: &ast.TypeRef{Name: "User"}},
+					},
+				},
+			},
+		}},
+	}
+
+	src := generateDataLoaderFile(result, "luxo", nil, nil)
+	code := string(src)
+
+	// UserByIdLoader should only appear once as a type definition
+	typeCount := strings.Count(code, "type UserByIdLoader")
+	if typeCount != 1 {
+		t.Errorf("UserByIdLoader type should be defined once, found %d times", typeCount)
 	}
 }

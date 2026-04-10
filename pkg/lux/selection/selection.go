@@ -25,7 +25,7 @@ func SQLColumns(fields []*Field) []string {
 		if f.Children != nil {
 			continue
 		}
-		col := toSnakeCase(f.Name)
+		col := str.ToSnakeCase(f.Name)
 		if col == "id" {
 			continue // already added
 		}
@@ -36,8 +36,6 @@ func SQLColumns(fields []*Field) []string {
 	}
 	return cols
 }
-
-func toSnakeCase(s string) string { return str.ToSnakeCase(s) }
 
 // Parse parses a $select string into a field selection tree.
 //

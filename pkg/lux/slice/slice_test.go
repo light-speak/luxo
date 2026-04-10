@@ -150,3 +150,10 @@ func TestMapStringToInt(t *testing.T) {
 		t.Errorf("got %v", result)
 	}
 }
+
+func TestLastEmpty(t *testing.T) {
+	_, ok := Last([]int{})
+	if ok {
+		t.Error("empty last should return false")
+	}
+}

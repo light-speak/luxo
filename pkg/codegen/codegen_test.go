@@ -648,3 +648,50 @@ func TestGenerateAppFileSingleModel(t *testing.T) {
 		t.Errorf("should not contain User:\n%s", appSrc)
 	}
 }
+
+func TestGenerateWithSoftModelsParam(t *testing.T) {
+	// Test Generate() with the optional softModels parameter
+	file := &ast.File{
+		Name: "test.luxo",
+		Models: []*ast.ModelDecl{
+			{
+				Name: "Post",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "user", Type: &ast.TypeRef{Name: "User"}},
+				},
+			},
+		},
+		Extends: []*ast.ExtendDecl{
+			{
+				Name: "User",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+				},
+			},
+		},
+	}
+
+	// Pass softModels map (external soft model info)
+	softModels := map[string]bool{"User": true}
+	gr := Generate(result(file), "gen", softModels)
+
+	// dataloader.gen.go should contain soft delete filter
+	dlSrc := string(gr.Files["dataloader.gen.go"])
+	if !strings.Contains(dlSrc, "deleted_at") {
+		t.Errorf("soft model should add deleted_at filter in dataloader:\n%s", dlSrc)
+	}
+}
+
+func TestIsSoftDeleteExported(t *testing.T) {
+	soft := &ast.ModelDecl{Directives: []*ast.Directive{{Name: "soft"}}}
+	if !IsSoftDelete(soft) {
+		t.Error("IsSoftDelete should return true for @soft model")
+	}
+	notSoft := &ast.ModelDecl{}
+	if IsSoftDelete(notSoft) {
+		t.Error("IsSoftDelete should return false without @soft")
+	}
+}

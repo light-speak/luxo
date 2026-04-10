@@ -40,9 +40,9 @@ func generateModel(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) 
 			goType = "*" + goType
 		}
 		fi := fieldInfo{
-			goName:  capitalize(f.Name),
+			goName:  str.Capitalize(f.Name),
 			goType:  goType,
-			dbTag:   toSnakeCase(f.Name),
+			dbTag:   str.ToSnakeCase(f.Name),
 			jsonTag: f.Name,
 		}
 		if relation {
@@ -90,9 +90,9 @@ func generateExtendStub(b *strings.Builder, ext *ast.ExtendDecl) {
 			continue
 		}
 		fi := fieldInfo{
-			goName:  capitalize(f.Name),
+			goName:  str.Capitalize(f.Name),
 			goType:  resolveGoType(f.Type),
-			dbTag:   toSnakeCase(f.Name),
+			dbTag:   str.ToSnakeCase(f.Name),
 			jsonTag: f.Name,
 		}
 		if len(fi.goName) > maxName {
@@ -224,6 +224,3 @@ func hasDirective(directives []*ast.Directive, name string) bool {
 	}
 	return false
 }
-
-func capitalize(s string) string  { return str.Capitalize(s) }
-func toSnakeCase(s string) string { return str.ToSnakeCase(s) }

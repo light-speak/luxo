@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lux/str"
 	"github.com/light-speak/luxo/pkg/semantic"
 )
 
@@ -143,7 +144,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 	}
 }
 
-`, capitalize(apiName), paramMethod(idType), name, name, name)
+`, str.Capitalize(apiName), paramMethod(idType), name, name, name)
 		} else {
 			fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
 	return func(ctx context.Context, req *api.Request) (any, error) {
@@ -156,7 +157,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 	}
 }
 
-`, capitalize(apiName), paramMethod(idType), name, name)
+`, str.Capitalize(apiName), paramMethod(idType), name, name)
 		}
 
 	case "list":
@@ -177,7 +178,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 	}
 }
 
-`, capitalize(apiName), name, name)
+`, str.Capitalize(apiName), name, name)
 		} else {
 			fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
 	return func(ctx context.Context, req *api.Request) (any, error) {
@@ -186,7 +187,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 	}
 }
 
-`, capitalize(apiName), name)
+`, str.Capitalize(apiName), name)
 		}
 
 	case "create":
@@ -212,7 +213,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 	}
 }
 
-`, capitalize(apiName), paramMethod(idType), name, name)
+`, str.Capitalize(apiName), paramMethod(idType), name, name)
 		} else {
 			fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
 	return func(ctx context.Context, req *api.Request) (any, error) {
@@ -228,7 +229,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 	}
 }
 
-`, capitalize(apiName), paramMethod(idType), name, name)
+`, str.Capitalize(apiName), paramMethod(idType), name, name)
 		}
 	}
 }
@@ -236,7 +237,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 // generateCreateHandler generates a create handler that reads params and calls Create().
 func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string, enums map[string]bool) {
 	name := m.Name
-	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", capitalize(apiName))
+	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) (any, error) {\n")
 	fmt.Fprintf(b, "\t\tbuilder := app.%s.Create()\n", name)
 
@@ -244,7 +245,7 @@ func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string,
 		if skipHandlerField(f, enums) {
 			continue
 		}
-		setter := "Set" + capitalize(f.Name)
+		setter := "Set" + str.Capitalize(f.Name)
 		optional := (f.Type != nil && f.Type.Nullable) || f.Default != nil
 		if optional {
 			fmt.Fprintf(b, "\t\tif req.HasParam(%q) {\n", f.Name)
@@ -263,7 +264,7 @@ func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string,
 // generateUpdateHandler generates an update handler.
 func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType string, enums map[string]bool) {
 	name := m.Name
-	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", capitalize(apiName))
+	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) (any, error) {\n")
 	fmt.Fprintf(b, "\t\tid, err := req.Param%s(\"id\")\n", paramMethod(idType))
 	fmt.Fprintf(b, "\t\tif err != nil {\n")
@@ -272,14 +273,14 @@ func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType
 	fmt.Fprintf(b, "\t\tif _, err := app.%s.Find(ctx, id); err != nil {\n", name)
 	fmt.Fprintf(b, "\t\t\treturn nil, err\n")
 	fmt.Fprintf(b, "\t\t}\n")
-	tableName := toSnakeCase(name) + "s"
+	tableName := str.ToSnakeCase(name) + "s"
 	fmt.Fprintf(b, "\t\tbuilder := new%sUpdateBuilder(app.%s.db, %q, id)\n", name, name, tableName)
 
 	for _, f := range m.Fields {
 		if skipHandlerField(f, enums) || f.Name == "id" || hasDirective(f.Directives, "immutable") {
 			continue
 		}
-		setter := "Set" + capitalize(f.Name)
+		setter := "Set" + str.Capitalize(f.Name)
 		fmt.Fprintf(b, "\t\tif req.HasParam(%q) {\n", f.Name)
 		generateParamSet(b, f, setter, "\t\t\t", enums)
 		fmt.Fprintf(b, "\t\t}\n")
@@ -358,7 +359,7 @@ func generateRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relat
 		localKey := rel.LocalKey
 
 		// Determine the Go field to read the FK from
-		goLocalKey := capitalize(localKey)
+		goLocalKey := str.Capitalize(localKey)
 
 		fmt.Fprintf(b, "\tfor _, f := range fields {\n")
 		fmt.Fprintf(b, "\t\tif f.Name == %q && f.Children != nil {\n", fieldName)
@@ -366,7 +367,7 @@ func generateRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relat
 		fmt.Fprintf(b, "\t\t\tresult, err := app.loaders.%s.Load(ctx, %s.%s, childCols)\n",
 			loaderField, lower, goLocalKey)
 		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
-		fmt.Fprintf(b, "\t\t\t%s.%s = result\n", lower, capitalize(fieldName))
+		fmt.Fprintf(b, "\t\t\t%s.%s = result\n", lower, str.Capitalize(fieldName))
 
 		fmt.Fprintf(b, "\t\t\tbreak\n")
 		fmt.Fprintf(b, "\t\t}\n")
@@ -395,7 +396,7 @@ func generateRegisterFunc(b *strings.Builder, models []*ast.ModelDecl) {
 	for _, m := range models {
 		for _, op := range crudOperations(m) {
 			name := crudAPIName(m.Name, op)
-			fmt.Fprintf(b, "\trouter.Handle(%q, handle%s(app))\n", name, capitalize(name))
+			fmt.Fprintf(b, "\trouter.Handle(%q, handle%s(app))\n", name, str.Capitalize(name))
 		}
 	}
 

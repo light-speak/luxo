@@ -3,6 +3,8 @@ package selection
 import (
 	"strings"
 	"testing"
+
+	"github.com/light-speak/luxo/pkg/lux/str"
 )
 
 func TestParseEmpty(t *testing.T) {
@@ -377,8 +379,20 @@ func TestToSnakeCase(t *testing.T) {
 		{"", ""},
 	}
 	for _, tt := range tests {
-		if got := toSnakeCase(tt.in); got != tt.want {
-			t.Errorf("toSnakeCase(%q) = %q, want %q", tt.in, got, tt.want)
+		if got := str.ToSnakeCase(tt.in); got != tt.want {
+			t.Errorf("str.ToSnakeCase(%q) = %q, want %q", tt.in, got, tt.want)
 		}
+	}
+}
+
+func TestSQLColumnsOnlyRelations(t *testing.T) {
+	// All fields have Children (relations) — only "id" is collected, so should return nil (SELECT *)
+	fields := []*Field{
+		{Name: "posts", Children: []*Field{{Name: "title"}}},
+		{Name: "comments", Children: []*Field{{Name: "content"}}},
+	}
+	cols := SQLColumns(fields)
+	if cols != nil {
+		t.Errorf("only-relation fields should return nil (SELECT *), got %v", cols)
 	}
 }

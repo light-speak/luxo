@@ -60,17 +60,17 @@ func analyzeRelations(m *ast.ModelDecl, enums map[string]bool) []Relation {
 			// Auto-infer
 			if rel.IsList {
 				rel.Type = HasMany
-				rel.RemoteKey = lowerFirst(m.Name) + "Id"
+				rel.RemoteKey = str.LowerFirst(m.Name) + "Id"
 				rel.LocalKey = "id"
 			} else {
-				fkName := lowerFirst(rel.TargetName) + "Id"
+				fkName := str.LowerFirst(rel.TargetName) + "Id"
 				if hasFKField(m.Fields, fkName) {
 					rel.Type = BelongsTo
 					rel.LocalKey = fkName
 					rel.RemoteKey = "id"
 				} else {
 					rel.Type = HasOne
-					rel.RemoteKey = lowerFirst(m.Name) + "Id"
+					rel.RemoteKey = str.LowerFirst(m.Name) + "Id"
 					rel.LocalKey = "id"
 				}
 			}
@@ -214,13 +214,13 @@ func generateLoadersStruct(b *strings.Builder, allRelations []struct {
 	b.WriteString("func NewLoaders(cfg dataloader.Config,\n")
 	var params []string
 	for _, e := range entries {
-		params = append(params, fmt.Sprintf("\t%sFn %s", lowerFirst(e.fieldName), e.typeName))
+		params = append(params, fmt.Sprintf("\t%sFn %s", str.LowerFirst(e.fieldName), e.typeName))
 	}
 	b.WriteString(strings.Join(params, ",\n"))
 	b.WriteString(",\n) Loaders {\n")
 	b.WriteString("\treturn Loaders{\n")
 	for _, e := range entries {
-		fmt.Fprintf(b, "\t\t%s: dataloader.New(%sFn, cfg),\n", e.fieldName, lowerFirst(e.fieldName))
+		fmt.Fprintf(b, "\t\t%s: dataloader.New(%sFn, cfg),\n", e.fieldName, str.LowerFirst(e.fieldName))
 	}
 	b.WriteString("\t}\n")
 	b.WriteString("}\n\n")
@@ -271,10 +271,10 @@ func generateDefaultLoaders(b *strings.Builder, allRelations []struct {
 // generateBatchFunc generates an inline batch function for a relation.
 // Uses raw pg.QueryRows with the module's scan function — no cross-module Client dependency.
 func generateBatchFunc(b *strings.Builder, modelName string, rel Relation, softTarget bool) {
-	targetTable := toSnakeCase(rel.TargetName) + "s"
-	remoteCol := toSnakeCase(rel.RemoteKey)
+	targetTable := str.ToSnakeCase(rel.TargetName) + "s"
+	remoteCol := str.ToSnakeCase(rel.RemoteKey)
 	scanFn := "scan" + rel.TargetName
-	goRemoteField := capitalize(rel.RemoteKey) // camelCase → PascalCase (e.g., userId → UserId)
+	goRemoteField := str.Capitalize(rel.RemoteKey) // camelCase → PascalCase (e.g., userId → UserId)
 
 	if rel.IsList {
 		fmt.Fprintf(b, "\t\tfunc(ctx context.Context, keys []int64, fields []string) (map[int64][]%s, error) {\n", rel.TargetName)
@@ -314,14 +314,14 @@ func generateBatchFunc(b *strings.Builder, modelName string, rel Relation, softT
 // loaderTypeName returns the type name for a loader function.
 func loaderTypeName(modelName string, rel Relation) string {
 	if rel.IsList {
-		return pluralize(rel.TargetName) + "By" + capitalize(rel.RemoteKey) + "Loader"
+		return pluralize(rel.TargetName) + "By" + str.Capitalize(rel.RemoteKey) + "Loader"
 	}
-	return rel.TargetName + "By" + capitalize(rel.RemoteKey) + "Loader"
+	return rel.TargetName + "By" + str.Capitalize(rel.RemoteKey) + "Loader"
 }
 
 // loaderFieldName returns the field name for a loader in the Loaders struct.
 func loaderFieldName(modelName string, rel Relation) string {
-	return capitalize(modelName) + capitalize(rel.FieldName)
+	return str.Capitalize(modelName) + str.Capitalize(rel.FieldName)
 }
 
 // CollectEnumsFromResult collects all enum names from the result (exported for CLI).
@@ -377,8 +377,6 @@ func hasFKField(fields []*ast.FieldDecl, name string) bool {
 	}
 	return false
 }
-
-func lowerFirst(s string) string { return str.LowerFirst(s) }
 
 // relTypeName returns a display name for a relation type.
 func relTypeName(t RelationType) string {

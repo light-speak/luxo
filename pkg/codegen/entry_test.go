@@ -89,3 +89,47 @@ func TestGenerateEntryFileNoCrud(t *testing.T) {
 		t.Error("should NOT register handlers for non-crud model")
 	}
 }
+
+func TestGenerateEntryFileWithLoaders(t *testing.T) {
+	// Test that models with relations trigger SetLoaders + NewDefaultLoaders
+	result := &semantic.Result{
+		Files: []*ast.File{
+			{
+				Name: "origin/blog.luxo",
+				Models: []*ast.ModelDecl{
+					{
+						Pos:        token.Position{File: "test.luxo", Line: 1, Col: 1},
+						Name:       "User",
+						Directives: []*ast.Directive{{Name: "crud"}},
+						Fields: []*ast.FieldDecl{
+							{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+							{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+						},
+					},
+					{
+						Pos:  token.Position{File: "test.luxo", Line: 1, Col: 1},
+						Name: "Post",
+						Fields: []*ast.FieldDecl{
+							{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+							{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	src := GenerateEntryFile(result, "myapp")
+	if src == nil {
+		t.Fatal("should generate entry file")
+	}
+	code := string(src)
+
+	// Should have SetLoaders and NewDefaultLoaders for the module with relations
+	if !strings.Contains(code, "SetLoaders") {
+		t.Errorf("should call SetLoaders for module with relations:\n%s", code)
+	}
+	if !strings.Contains(code, "NewDefaultLoaders") {
+		t.Errorf("should call NewDefaultLoaders for module with relations:\n%s", code)
+	}
+}

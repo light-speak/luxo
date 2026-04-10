@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lux/str"
 )
 
 // generateScanner generates a per-model scan function with zero reflection.
@@ -42,8 +43,8 @@ func generateScanner(b *strings.Builder, m *ast.ModelDecl) {
 		if f.Computed != nil {
 			continue
 		}
-		col := toSnakeCase(f.Name)
-		goField := capitalize(f.Name)
+		col := str.ToSnakeCase(f.Name)
+		goField := str.Capitalize(f.Name)
 		fmt.Fprintf(b, "\t\tcase %q:\n", col)
 		fmt.Fprintf(b, "\t\t\tdests[i] = &%s.%s\n", lower, goField)
 	}
