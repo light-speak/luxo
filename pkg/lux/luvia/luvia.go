@@ -140,10 +140,6 @@ func buildBanner(version, port, mode, transport, dbURL string, modules []string)
 	return sb.String()
 }
 
-func gradientLine(line string, rgb func(int, int, int) string) {
-	fmt.Print(buildGradientLine(line, rgb))
-}
-
 // buildGradientLine builds a gradient-colored line string without printing it.
 func buildGradientLine(line string, rgb func(int, int, int) string) string {
 	type color struct{ r, g, b int }
