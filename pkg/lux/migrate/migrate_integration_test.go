@@ -439,3 +439,68 @@ func TestIntegrationVerify(t *testing.T) {
 		}
 	}
 }
+
+func TestIntegrationDryRunEmpty(t *testing.T) {
+	runner, _ := setupTestRunner(t)
+	ctx := context.Background()
+
+	names, sqls, err := runner.DryRun(ctx)
+	if err != nil {
+		t.Fatalf("DryRun: %v", err)
+	}
+	if len(names) != 0 || len(sqls) != 0 {
+		t.Error("empty DryRun should return nothing")
+	}
+}
+
+func TestIntegrationUpChecksumStored(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	ctx := context.Background()
+
+	writeMigration(t, dir, "001_create_users.sql",
+		"CREATE TABLE test_users (id SERIAL PRIMARY KEY);",
+		"DROP TABLE IF EXISTS test_users;")
+
+	runner.Up(ctx)
+
+	// Check that checksum was stored in _migrations
+	var checksum string
+	err := runner.pool.QueryRow(ctx, "SELECT checksum FROM _migrations WHERE name = $1", "001_create_users.sql").Scan(&checksum)
+	if err != nil {
+		t.Fatalf("query checksum: %v", err)
+	}
+	if checksum == "" {
+		t.Error("checksum should be stored")
+	}
+	if len(checksum) != 32 {
+		t.Errorf("checksum length = %d, want 32", len(checksum))
+	}
+}
+
+func TestIntegrationVerifyUnexpectedTable(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	ctx := context.Background()
+
+	runner.Init(ctx)
+
+	// Create a table directly (not via migration)
+	runner.pool.Exec(ctx, "CREATE TABLE test_rogue (id INT)")
+	t.Cleanup(func() {
+		runner.pool.Exec(context.Background(), "DROP TABLE IF EXISTS test_rogue")
+	})
+
+	// Write state that doesn't include test_rogue
+	stateJSON := `{"models":{}}`
+	os.WriteFile(filepath.Join(dir, ".state.json"), []byte(stateJSON), 0644)
+
+	drifts, _ := runner.Verify(ctx)
+	hasUnexpected := false
+	for _, d := range drifts {
+		if strings.Contains(d, "test_rogue") && strings.Contains(d, "unexpected") {
+			hasUnexpected = true
+		}
+	}
+	if !hasUnexpected {
+		t.Errorf("should detect unexpected table, drifts: %v", drifts)
+	}
+}

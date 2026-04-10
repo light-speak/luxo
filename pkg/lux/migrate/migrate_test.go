@@ -1,10 +1,12 @@
 package migrate
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseSectionUP(t *testing.T) {
@@ -174,5 +176,83 @@ func TestEnvOr(t *testing.T) {
 	}
 	if got := envOr("TEST_ENVVAR_MISSING", "fallback"); got != "fallback" {
 		t.Errorf("envOr with missing: got %q, want %q", got, "fallback")
+	}
+}
+
+func TestSplitConcurrently(t *testing.T) {
+	sql := "CREATE TABLE users (id INT);\nCREATE INDEX CONCURRENTLY idx ON users (name);\nALTER TABLE users ADD COLUMN age INT;"
+	txSQL, nonTx := splitConcurrently(sql)
+
+	if len(nonTx) != 1 {
+		t.Fatalf("expected 1 non-tx, got %d", len(nonTx))
+	}
+	if !strings.Contains(nonTx[0], "CONCURRENTLY") {
+		t.Error("non-tx should contain CONCURRENTLY")
+	}
+	if strings.Contains(txSQL, "CONCURRENTLY") {
+		t.Error("tx SQL should not contain CONCURRENTLY")
+	}
+}
+
+func TestSplitConcurrentlyNone(t *testing.T) {
+	txSQL, nonTx := splitConcurrently("CREATE TABLE users (id INT);")
+	if len(nonTx) != 0 {
+		t.Errorf("expected 0 non-tx, got %d", len(nonTx))
+	}
+	if !strings.Contains(txSQL, "CREATE TABLE") {
+		t.Error("should contain all")
+	}
+}
+
+func TestSplitConcurrentlyEmpty(t *testing.T) {
+	_, nonTx := splitConcurrently("")
+	if len(nonTx) != 0 {
+		t.Errorf("expected 0, got %d", len(nonTx))
+	}
+}
+
+func TestSplitStatements(t *testing.T) {
+	stmts := splitStatements("SELECT 1; SELECT 2;  ; SELECT 3")
+	if len(stmts) != 3 {
+		t.Errorf("expected 3, got %d: %v", len(stmts), stmts)
+	}
+}
+
+func TestFileChecksum(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.sql")
+	os.WriteFile(path, []byte("CREATE TABLE users (id INT);"), 0644)
+
+	cs1 := fileChecksum(path)
+	if cs1 == "" || len(cs1) != 32 {
+		t.Errorf("bad checksum: %q", cs1)
+	}
+
+	os.WriteFile(path, []byte("DIFFERENT"), 0644)
+	cs2 := fileChecksum(path)
+	if cs1 == cs2 {
+		t.Error("different content should differ")
+	}
+}
+
+func TestFileChecksumNotFound(t *testing.T) {
+	if fileChecksum("/nonexistent") != "" {
+		t.Error("should be empty")
+	}
+}
+
+func TestNewConnectionError(t *testing.T) {
+	t.Setenv("DATABASE_HOST", "192.0.2.1") // non-routable
+	t.Setenv("DATABASE_PORT", "1")
+	t.Setenv("DATABASE_USER", "bad")
+	t.Setenv("DATABASE_PASSWORD", "bad")
+	t.Setenv("DATABASE_PREFIX", "bad")
+	t.Setenv("DATABASE_SSL", "disable")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := New(ctx, t.TempDir())
+	if err == nil {
+		t.Fatal("should fail")
 	}
 }
