@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Integration tests require a running PostgreSQL instance.
@@ -569,6 +570,106 @@ func TestIntegrationExecRollbackConcurrently(t *testing.T) {
 	}
 	if len(rolledBack) != 1 {
 		t.Errorf("expected 1, got %d", len(rolledBack))
+	}
+}
+
+func TestIntegrationPGDBQueryRow(t *testing.T) {
+	runner, _ := setupTestRunner(t)
+	ctx := context.Background()
+	runner.Init(ctx)
+
+	db := runner.db.(*PGDB)
+	row := db.QueryRow(ctx, "SELECT count(*) FROM _migrations")
+	var count int64
+	if err := row.Scan(&count); err != nil {
+		t.Fatalf("QueryRow: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected 0, got %d", count)
+	}
+}
+
+func TestIntegrationPGDBQueryError(t *testing.T) {
+	runner, _ := setupTestRunner(t)
+	ctx := context.Background()
+
+	db := runner.db.(*PGDB)
+	_, err := db.Query(ctx, "SELECT * FROM nonexistent_table_xyz")
+	if err == nil {
+		t.Fatal("should error on nonexistent table")
+	}
+}
+
+func TestIntegrationPGDBBeginAndRollback(t *testing.T) {
+	runner, _ := setupTestRunner(t)
+	ctx := context.Background()
+	runner.Init(ctx)
+
+	db := runner.db.(*PGDB)
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+
+	err = tx.Exec(ctx, "INSERT INTO _migrations (name) VALUES ($1)", "test_tx")
+	if err != nil {
+		t.Fatalf("Exec in tx: %v", err)
+	}
+
+	// Rollback — should not persist
+	tx.Rollback(ctx)
+
+	row := db.QueryRow(ctx, "SELECT count(*) FROM _migrations WHERE name = 'test_tx'")
+	var count int64
+	row.Scan(&count)
+	if count != 0 {
+		t.Error("rollback should not persist")
+	}
+}
+
+func TestIntegrationPGDBBeginAndCommit(t *testing.T) {
+	runner, _ := setupTestRunner(t)
+	ctx := context.Background()
+	runner.Init(ctx)
+
+	db := runner.db.(*PGDB)
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+
+	tx.Exec(ctx, "INSERT INTO _migrations (name) VALUES ($1)", "test_commit")
+	tx.Commit(ctx)
+
+	row := db.QueryRow(ctx, "SELECT count(*) FROM _migrations WHERE name = 'test_commit'")
+	var count int64
+	row.Scan(&count)
+	if count != 1 {
+		t.Error("commit should persist")
+	}
+}
+
+func TestIntegrationNewPGDBError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := NewPGDB(ctx, "postgres://bad:bad@192.0.2.1:1/bad?sslmode=disable")
+	if err == nil {
+		t.Fatal("should fail")
+	}
+}
+
+func TestIntegrationExecMigrationTxError(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	ctx := context.Background()
+	runner.Init(ctx)
+
+	// Migration with valid non-tx but invalid tx SQL
+	content := "-- ====== UP ======\n\nINVALID SQL HERE;\n\n-- ====== DOWN ======\n\nSELECT 1;"
+	os.WriteFile(filepath.Join(dir, "001_bad_tx.sql"), []byte(content), 0644)
+
+	_, err := runner.Up(ctx)
+	if err == nil {
+		t.Fatal("should fail on invalid tx SQL")
 	}
 }
 
