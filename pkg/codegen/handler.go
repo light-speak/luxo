@@ -33,6 +33,7 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	b.WriteString("\t\"context\"\n")
 	b.WriteString("\t\"fmt\"\n")
 	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
 	b.WriteString(")\n\n")
 
 	// Generate handlers per model
@@ -124,16 +125,18 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		if err != nil {
 			return nil, err
 		}
-		return app.%s.Find(ctx, id)
+		cols := selection.SQLColumns(req.Select)
+		return app.%s.Where(%sWhere.Id.Eq(id)).Select(cols...).First(ctx)
 	}
 }
 
-`, capitalize(apiName), paramMethod(idType), name)
+`, capitalize(apiName), paramMethod(idType), name, name)
 
 	case "list":
 		fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
 	return func(ctx context.Context, req *api.Request) (any, error) {
-		return app.%s.Where().All(ctx)
+		cols := selection.SQLColumns(req.Select)
+		return app.%s.Where().Select(cols...).All(ctx)
 	}
 }
 

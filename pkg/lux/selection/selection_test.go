@@ -300,3 +300,85 @@ func TestErrorNestedCommaUnclosed(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestSQLColumnsNil(t *testing.T) {
+	cols := SQLColumns(nil)
+	if cols != nil {
+		t.Errorf("nil fields should return nil, got %v", cols)
+	}
+}
+
+func TestSQLColumnsEmpty(t *testing.T) {
+	cols := SQLColumns([]*Field{})
+	if cols != nil {
+		t.Errorf("empty fields should return nil, got %v", cols)
+	}
+}
+
+func TestSQLColumnsLeafOnly(t *testing.T) {
+	fields, _ := Parse("name,email,avatar")
+	cols := SQLColumns(fields)
+	// Should include id + selected fields
+	if len(cols) != 4 {
+		t.Fatalf("expected 4 cols (id+3), got %d: %v", len(cols), cols)
+	}
+	if cols[0] != "id" {
+		t.Error("first col should be id")
+	}
+}
+
+func TestSQLColumnsSkipsRelation(t *testing.T) {
+	fields, _ := Parse("name,posts{title}")
+	cols := SQLColumns(fields)
+	// posts has Children → skipped
+	for _, c := range cols {
+		if c == "posts" {
+			t.Error("relation field should be skipped")
+		}
+	}
+}
+
+func TestSQLColumnsIdAlreadySelected(t *testing.T) {
+	fields, _ := Parse("id,name")
+	cols := SQLColumns(fields)
+	// Should not duplicate id
+	count := 0
+	for _, c := range cols {
+		if c == "id" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("id should appear once, got %d", count)
+	}
+}
+
+func TestSQLColumnsCamelToSnake(t *testing.T) {
+	fields, _ := Parse("userId,createdAt")
+	cols := SQLColumns(fields)
+	found := map[string]bool{}
+	for _, c := range cols {
+		found[c] = true
+	}
+	if !found["user_id"] {
+		t.Error("userId should become user_id")
+	}
+	if !found["created_at"] {
+		t.Error("createdAt should become created_at")
+	}
+}
+
+func TestToSnakeCase(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"userId", "user_id"},
+		{"createdAt", "created_at"},
+		{"name", "name"},
+		{"ID", "i_d"},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		if got := toSnakeCase(tt.in); got != tt.want {
+			t.Errorf("toSnakeCase(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}

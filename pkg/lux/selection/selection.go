@@ -1,11 +1,52 @@
 package selection
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+	"unicode"
+)
 
 // Field represents a selected field, optionally with nested sub-selections.
 type Field struct {
 	Name     string
 	Children []*Field // nil = leaf field
+}
+
+// SQLColumns extracts leaf field names as snake_case SQL column names.
+// Relation fields (with Children) are excluded — they're not DB columns.
+// Always includes "id" if not already selected (needed for DataLoader FK resolution).
+func SQLColumns(fields []*Field) []string {
+	if len(fields) == 0 {
+		return nil // nil = SELECT *
+	}
+	hasID := false
+	var cols []string
+	for _, f := range fields {
+		if f.Children != nil {
+			continue // relation field, not a DB column
+		}
+		col := toSnakeCase(f.Name)
+		cols = append(cols, col)
+		if col == "id" {
+			hasID = true
+		}
+	}
+	if !hasID && len(cols) > 0 {
+		cols = append([]string{"id"}, cols...)
+	}
+	return cols
+}
+
+// toSnakeCase converts camelCase to snake_case.
+func toSnakeCase(s string) string {
+	var b strings.Builder
+	for i, r := range s {
+		if unicode.IsUpper(r) && i > 0 {
+			b.WriteByte('_')
+		}
+		b.WriteRune(unicode.ToLower(r))
+	}
+	return b.String()
 }
 
 // Parse parses a $select string into a field selection tree.
