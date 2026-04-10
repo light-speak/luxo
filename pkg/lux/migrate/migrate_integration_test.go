@@ -22,8 +22,8 @@ func skipIfNoDB(t *testing.T) {
 	if host == "" {
 		host = "localhost"
 	}
-	user := os.Getenv("DATABASE_USER")
-	if user == "" {
+	// Skip if DATABASE_USER not set (CI without PG)
+	if os.Getenv("DATABASE_USER") == "" {
 		t.Skip("DATABASE_USER not set, skipping integration test")
 	}
 }
