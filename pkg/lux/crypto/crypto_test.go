@@ -129,6 +129,35 @@ func TestRandomHexError(t *testing.T) {
 	}
 }
 
+func TestHashPassword(t *testing.T) {
+	hash, err := HashPassword("secret123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hash == "" || hash == "secret123" {
+		t.Error("should be hashed, not plain")
+	}
+	// Different calls produce different hashes (salt)
+	hash2, _ := HashPassword("secret123")
+	if hash == hash2 {
+		t.Error("should produce different hashes (different salt)")
+	}
+}
+
+func TestVerifyPassword(t *testing.T) {
+	hash, _ := HashPassword("mypassword")
+
+	if !VerifyPassword("mypassword", hash) {
+		t.Error("correct password should verify")
+	}
+	if VerifyPassword("wrongpassword", hash) {
+		t.Error("wrong password should not verify")
+	}
+	if VerifyPassword("mypassword", "not-a-hash") {
+		t.Error("invalid hash should not verify")
+	}
+}
+
 func TestRandomBytesZero(t *testing.T) {
 	_, err := RandomBytes(0)
 	if err == nil {

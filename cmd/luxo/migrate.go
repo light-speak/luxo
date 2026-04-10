@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/light-speak/luxo/pkg/codegen"
+	"github.com/light-speak/luxo/pkg/lockfile"
 	"github.com/light-speak/luxo/pkg/lux"
 	"github.com/light-speak/luxo/pkg/lux/env"
 	"github.com/light-speak/luxo/pkg/lux/migrate"
@@ -113,7 +114,9 @@ func runMigrateDiff(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("load state: %w", err)
 	}
 
-	ops := codegen.Diff(current, desired, nil) // TODO: pass field ID maps for rename detection
+	// Build field ID maps from luxo.lock for rename detection
+	fieldIDs := buildFieldIDMaps()
+	ops := codegen.Diff(current, desired, fieldIDs)
 	if len(ops) == 0 {
 		fmt.Printf("\n  %s✓ No changes detected / 无变更%s\n\n", green, reset)
 		return nil
@@ -343,6 +346,45 @@ func loadDialect() lux.Dialect {
 	default:
 		return pg.Dialect{}
 	}
+}
+
+// buildFieldIDMaps reads luxo.lock and the previous state to build rename detection maps.
+func buildFieldIDMaps() map[string]*codegen.FieldIDMap {
+	lf, err := lockfile.Load("luxo.lock")
+	if err != nil {
+		return nil
+	}
+
+	// Current lock has the latest field names → NewByID
+	// Previous state (.state.json columns) has old names → we need old lock
+	// Since luxo.lock is already updated by `luxo gen`, we use it as the new state.
+	// For old state, we read .state.json column names as proxy.
+	// Build from lock file: model → {fieldID → column name}
+	newLock := make(map[string]map[string]int)
+	for model, ml := range lf.Models {
+		newLock[model] = ml.Fields
+	}
+
+	// Old lock: read from .state.json columns (they represent the DB state before this diff)
+	oldLock := make(map[string]map[string]int)
+	oldState, _ := codegen.LoadState(filepath.Join("migrations", ".state.json"))
+	if oldState != nil {
+		for model, ml := range lf.Models {
+			// Map old column names to their field IDs
+			if ms, ok := oldState.Models[model]; ok {
+				fields := make(map[string]int)
+				for fieldName, id := range ml.Fields {
+					// Check if this field name existed as a column in old state
+					if _, exists := ms.Columns[codegen.SnakeCase(fieldName)]; exists {
+						fields[fieldName] = id
+					}
+				}
+				oldLock[model] = fields
+			}
+		}
+	}
+
+	return codegen.BuildFieldIDMaps(oldLock, newLock)
 }
 
 func nextMigrationSeq() int {

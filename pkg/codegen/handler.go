@@ -30,12 +30,32 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	var b strings.Builder
 	writeHeader(&b, packageName, "handler.gen.go")
 
+	// Check if any model has @hash fields
+	hasHash := false
+	for _, m := range models {
+		for _, f := range m.Fields {
+			if hasDirective(f.Directives, "hash") {
+				hasHash = true
+			}
+		}
+	}
+
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
 	b.WriteString("\t\"fmt\"\n")
 	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
+	if hasHash {
+		b.WriteString("\tluxocrypto \"github.com/light-speak/luxo/pkg/lux/crypto\"\n")
+	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
 	b.WriteString(")\n\n")
+
+	// Generate defaultCols for models with @hidden fields (excludes hidden from SELECT *)
+	for _, m := range models {
+		if hasHiddenFields(m) {
+			generateDefaultCols(&b, m, enums)
+		}
+	}
 
 	// Generate handlers + relation resolvers per model (analyzeRelations once per model)
 	for _, m := range models {
@@ -122,6 +142,13 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 
 	apiName := crudAPIName(name, op)
 	hasRels := len(rels) > 0
+	hidden := hasHiddenFields(m)
+
+	// colsExpr: uses defaultCols when no $select for models with @hidden fields
+	colsExpr := "selection.SQLColumns(req.Select)"
+	if hidden {
+		colsExpr = fmt.Sprintf("selection.SQLColumnsOr(req.Select, default%sCols)", name)
+	}
 
 	switch op {
 	case "get":
@@ -132,7 +159,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		if err != nil {
 			return nil, err
 		}
-		cols := selection.SQLColumns(req.Select)
+		cols := %s
 		result, err := app.%s.Where(%sWhere.Id.Eq(id)).Select(cols...).First(ctx)
 		if err != nil {
 			return nil, err
@@ -144,7 +171,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 	}
 }
 
-`, str.Capitalize(apiName), paramMethod(idType), name, name, name)
+`, str.Capitalize(apiName), paramMethod(idType), colsExpr, name, name, name)
 		} else {
 			fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
 	return func(ctx context.Context, req *api.Request) (any, error) {
@@ -152,19 +179,19 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		if err != nil {
 			return nil, err
 		}
-		cols := selection.SQLColumns(req.Select)
+		cols := %s
 		return app.%s.Where(%sWhere.Id.Eq(id)).Select(cols...).First(ctx)
 	}
 }
 
-`, str.Capitalize(apiName), paramMethod(idType), name, name)
+`, str.Capitalize(apiName), paramMethod(idType), colsExpr, name, name)
 		}
 
 	case "list":
 		if hasRels {
 			fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
 	return func(ctx context.Context, req *api.Request) (any, error) {
-		cols := selection.SQLColumns(req.Select)
+		cols := %s
 		results, err := app.%s.Where().Select(cols...).All(ctx)
 		if err != nil {
 			return nil, err
@@ -178,16 +205,16 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 	}
 }
 
-`, str.Capitalize(apiName), name, name)
+`, str.Capitalize(apiName), colsExpr, name, name)
 		} else {
 			fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
 	return func(ctx context.Context, req *api.Request) (any, error) {
-		cols := selection.SQLColumns(req.Select)
+		cols := %s
 		return app.%s.Where().Select(cols...).All(ctx)
 	}
 }
 
-`, str.Capitalize(apiName), name)
+`, str.Capitalize(apiName), colsExpr, name)
 		}
 
 	case "create":
@@ -332,15 +359,50 @@ func generateParamSet(b *strings.Builder, f *ast.FieldDecl, setter, indent strin
 	fmt.Fprintf(b, "%s\treturn nil, fmt.Errorf(\"param %s: %%w\", err)\n", indent, f.Name)
 	fmt.Fprintf(b, "%s}\n", indent)
 
+	// @hash: auto-hash password before save
+	if hasDirective(f.Directives, "hash") {
+		fmt.Fprintf(b, "%s%s, err = luxocrypto.HashPassword(%s)\n", indent, varName, varName)
+		fmt.Fprintf(b, "%sif err != nil {\n", indent)
+		fmt.Fprintf(b, "%s\treturn nil, fmt.Errorf(\"hash %s: %%w\", err)\n", indent, f.Name)
+		fmt.Fprintf(b, "%s}\n", indent)
+	}
+
 	argExpr := varName
 	if f.Type != nil && f.Type.Nullable {
-		// Nullable field: pass pointer
 		argExpr = "&" + varName
 	} else if f.Type != nil && enums[f.Type.Name] {
-		// Enum field: cast string to enum type
 		argExpr = f.Type.Name + "(" + varName + ")"
 	}
 	fmt.Fprintf(b, "%sbuilder.%s(%s)\n", indent, setter, argExpr)
+}
+
+// hasHiddenFields checks if a model has any @hidden fields.
+func hasHiddenFields(m *ast.ModelDecl) bool {
+	for _, f := range m.Fields {
+		if hasDirective(f.Directives, "hidden") {
+			return true
+		}
+	}
+	return false
+}
+
+// generateDefaultCols generates a defaultCols variable that excludes @hidden fields.
+// Used when no $select is provided — prevents querying hidden columns.
+func generateDefaultCols(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
+	fmt.Fprintf(b, "// default%sCols excludes @hidden fields from SELECT *.\n", m.Name)
+	fmt.Fprintf(b, "var default%sCols = []string{", m.Name)
+	first := true
+	for _, f := range m.Fields {
+		if f.Computed != nil || isRelationField(f, enums) || hasDirective(f.Directives, "hidden") {
+			continue
+		}
+		if !first {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(b, "%q", str.ToSnakeCase(f.Name))
+		first = false
+	}
+	b.WriteString("}\n\n")
 }
 
 // generateRelationResolver generates a resolve<Model>Relations function

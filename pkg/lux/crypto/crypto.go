@@ -10,6 +10,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 // randReader is the source of cryptographic randomness. It defaults to
@@ -28,11 +30,21 @@ func MD5(data string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// TODO: Bcrypt(password string) (string, error) — requires golang.org/x/crypto/bcrypt.
-// Will be added when bcrypt support is needed for @hash annotation.
+// HashPassword hashes a password using bcrypt with automatic salt.
+// Used by @hash directive — called automatically on create/update.
+func HashPassword(password string) (string, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return "", fmt.Errorf("crypto: hash password: %w", err)
+	}
+	return string(hash), nil
+}
 
-// TODO: BcryptVerify(password, hash string) bool — requires golang.org/x/crypto/bcrypt.
-// Will be added when bcrypt support is needed for @withAuth verify.
+// VerifyPassword checks if a plaintext password matches a bcrypt hash.
+// Used by @withAuth verify — called during login.
+func VerifyPassword(password, hash string) bool {
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
+}
 
 // HMAC returns the HMAC-SHA256 of data using key, as a hex-encoded string.
 func HMAC(data, key string) string {

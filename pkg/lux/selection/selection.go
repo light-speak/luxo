@@ -37,6 +37,16 @@ func SQLColumns(fields []*Field) []string {
 	return cols
 }
 
+// SQLColumnsOr returns SQLColumns if $select is provided, otherwise returns fallback.
+// Used to exclude @hidden fields when no $select is given.
+func SQLColumnsOr(fields []*Field, fallback []string) []string {
+	cols := SQLColumns(fields)
+	if cols != nil {
+		return cols
+	}
+	return fallback
+}
+
 // Parse parses a $select string into a field selection tree.
 //
 // Grammar:

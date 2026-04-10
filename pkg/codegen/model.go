@@ -216,6 +216,9 @@ func softDeleteField() *ast.FieldDecl {
 	}
 }
 
+// SnakeCase is exported for CLI usage.
+func SnakeCase(s string) string { return str.ToSnakeCase(s) }
+
 func hasDirective(directives []*ast.Directive, name string) bool {
 	for _, d := range directives {
 		if d.Name == name {
