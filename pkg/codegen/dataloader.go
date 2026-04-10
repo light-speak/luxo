@@ -105,9 +105,9 @@ func generateDataLoaderFile(result *semantic.Result, packageName string, enums m
 
 	var b strings.Builder
 	writeHeader(&b, packageName, "dataloader.gen.go")
-	b.WriteString("import \"context\"\n\n")
+	b.WriteString("import \"github.com/light-speak/luxo/pkg/lux/dataloader\"\n\n")
 
-	// Generate loader function types for each relation (deduplicate by type name)
+	// Generate batch function types (deduplicate by type name)
 	seenTypes := make(map[string]bool)
 	for _, mr := range allRelations {
 		for _, rel := range mr.relations {
@@ -120,46 +120,84 @@ func generateDataLoaderFile(result *semantic.Result, packageName string, enums m
 		}
 	}
 
-	// Generate SetLoaders method on App to inject all loaders
-	generateSetLoaders(&b, allRelations)
+	// Generate Loaders struct with actual Loader instances
+	generateLoadersStruct(&b, allRelations, seenTypes)
 
 	return []byte(b.String())
 }
 
-// generateLoaderType generates the function type and field for a single relation loader.
+// generateLoaderType generates the BatchFn type alias for a relation.
 func generateLoaderType(b *strings.Builder, modelName string, rel Relation) {
 	loaderName := loaderTypeName(modelName, rel)
-	localGoType := "int64" // default FK type
+	localGoType := "int64"
 	if rel.IsList {
-		fmt.Fprintf(b, "// %s loads %s.%s (hasMany).\n", loaderName, modelName, rel.FieldName)
-		fmt.Fprintf(b, "// Query: WHERE %s IN (...)\n", toSnakeCase(rel.RemoteKey))
-		fmt.Fprintf(b, "type %s func(ctx context.Context, keys []%s) (map[%s][]%s, error)\n\n",
-			loaderName, localGoType, localGoType, rel.TargetName)
+		fmt.Fprintf(b, "// %s is the batch function for %s.%s (hasMany).\n", loaderName, modelName, rel.FieldName)
+		fmt.Fprintf(b, "type %s = dataloader.BatchFn[%s, []%s]\n\n", loaderName, localGoType, rel.TargetName)
 	} else {
-		fmt.Fprintf(b, "// %s loads %s.%s (%s).\n", loaderName, modelName, rel.FieldName, relTypeName(rel.Type))
-		fmt.Fprintf(b, "// Query: WHERE %s IN (...)\n", toSnakeCase(rel.RemoteKey))
-		fmt.Fprintf(b, "type %s func(ctx context.Context, keys []%s) (map[%s]*%s, error)\n\n",
-			loaderName, localGoType, localGoType, rel.TargetName)
+		fmt.Fprintf(b, "// %s is the batch function for %s.%s (%s).\n", loaderName, modelName, rel.FieldName, relTypeName(rel.Type))
+		fmt.Fprintf(b, "type %s = dataloader.BatchFn[%s, *%s]\n\n", loaderName, localGoType, rel.TargetName)
 	}
 }
 
-// generateSetLoaders generates the Loaders struct and SetLoaders function.
-func generateSetLoaders(b *strings.Builder, allRelations []struct {
+// generateLoadersStruct generates the Loaders struct with actual Loader instances.
+func generateLoadersStruct(b *strings.Builder, allRelations []struct {
 	modelName string
 	relations []Relation
-}) {
-	b.WriteString("// Loaders holds all DataLoader functions for dependency injection.\n")
+}, seenTypes map[string]bool) {
+	b.WriteString("// Loaders holds DataLoader instances for all relations.\n")
 	b.WriteString("type Loaders struct {\n")
+	seen := make(map[string]bool)
 	for _, mr := range allRelations {
 		for _, rel := range mr.relations {
 			name := loaderFieldName(mr.modelName, rel)
-			typeName := loaderTypeName(mr.modelName, rel)
-			fmt.Fprintf(b, "\t%s %s\n", name, typeName)
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			if rel.IsList {
+				fmt.Fprintf(b, "\t%s *dataloader.Loader[int64, []%s]\n", name, rel.TargetName)
+			} else {
+				fmt.Fprintf(b, "\t%s *dataloader.Loader[int64, *%s]\n", name, rel.TargetName)
+			}
 		}
 	}
 	b.WriteString("}\n\n")
 
-	b.WriteString("// SetLoaders injects DataLoader functions into the App.\n")
+	// NewLoaders constructor
+	b.WriteString("// NewLoaders creates Loaders from batch functions.\n")
+	b.WriteString("func NewLoaders(cfg dataloader.Config,\n")
+	seen = make(map[string]bool)
+	var params []string
+	for _, mr := range allRelations {
+		for _, rel := range mr.relations {
+			name := loaderFieldName(mr.modelName, rel)
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			typeName := loaderTypeName(mr.modelName, rel)
+			param := fmt.Sprintf("\t%sFn %s", lowerFirst(name), typeName)
+			params = append(params, param)
+		}
+	}
+	b.WriteString(strings.Join(params, ",\n"))
+	b.WriteString(",\n) Loaders {\n")
+	b.WriteString("\treturn Loaders{\n")
+	seen = make(map[string]bool)
+	for _, mr := range allRelations {
+		for _, rel := range mr.relations {
+			name := loaderFieldName(mr.modelName, rel)
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			fmt.Fprintf(b, "\t\t%s: dataloader.New(%sFn, cfg),\n", name, lowerFirst(name))
+		}
+	}
+	b.WriteString("\t}\n")
+	b.WriteString("}\n\n")
+
+	b.WriteString("// SetLoaders injects DataLoader instances into the App.\n")
 	b.WriteString("func (a *App) SetLoaders(l Loaders) {\n")
 	b.WriteString("\ta.loaders = l\n")
 	b.WriteString("}\n")
