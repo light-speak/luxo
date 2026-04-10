@@ -11,41 +11,38 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/light-speak/luxo/pkg/lux/env"
 )
 
 // Runner executes migrations against a database.
 type Runner struct {
-	pool *pgxpool.Pool
-	dir  string // migrations directory
+	db  DB
+	dir string // migrations directory
 }
 
 // New creates a Runner from DATABASE_* env vars.
 func New(ctx context.Context, dir string) (*Runner, error) {
 	url := BuildDatabaseURL()
-	pool, err := pgxpool.New(ctx, url)
+	db, err := NewPGDB(ctx, url)
 	if err != nil {
-		return nil, fmt.Errorf("connect: %w", err)
+		return nil, err
 	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("ping: %w", err)
-	}
-	return &Runner{pool: pool, dir: dir}, nil
+	return &Runner{db: db, dir: dir}, nil
+}
+
+// NewFromDB creates a Runner from an existing DB implementation.
+func NewFromDB(db DB, dir string) *Runner {
+	return &Runner{db: db, dir: dir}
 }
 
 // Close closes the database connection.
 func (r *Runner) Close() {
-	r.pool.Close()
+	r.db.Close()
 }
-
-// advisory lock ID for preventing concurrent migrations.
-const migrateLockID = 707813578 // hash of "luxo.migrate"
 
 // Init creates the _migrations table if it doesn't exist.
 func (r *Runner) Init(ctx context.Context) error {
-	_, err := r.pool.Exec(ctx, `
+	return r.db.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS _migrations (
 			id         SERIAL PRIMARY KEY,
 			name       TEXT NOT NULL UNIQUE,
@@ -53,18 +50,6 @@ func (r *Runner) Init(ctx context.Context) error {
 			applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)
 	`)
-	return err
-}
-
-// acquireLock gets an advisory lock to prevent concurrent migrations.
-func (r *Runner) acquireLock(ctx context.Context) error {
-	_, err := r.pool.Exec(ctx, "SELECT pg_advisory_lock($1)", migrateLockID)
-	return err
-}
-
-// releaseLock releases the advisory lock.
-func (r *Runner) releaseLock(ctx context.Context) {
-	r.pool.Exec(ctx, "SELECT pg_advisory_unlock($1)", migrateLockID)
 }
 
 // Up executes all pending migrations with advisory lock and checksum verification.
@@ -72,12 +57,11 @@ func (r *Runner) Up(ctx context.Context) ([]string, error) {
 	if err := r.Init(ctx); err != nil {
 		return nil, err
 	}
-	if err := r.acquireLock(ctx); err != nil {
+	if err := r.db.AcquireLock(ctx); err != nil {
 		return nil, fmt.Errorf("acquire lock: %w", err)
 	}
-	defer r.releaseLock(ctx)
+	defer r.db.ReleaseLock(ctx)
 
-	// Verify checksums of already-applied migrations
 	if err := r.verifyChecksums(ctx); err != nil {
 		return nil, err
 	}
@@ -144,18 +128,15 @@ func (r *Runner) Down(ctx context.Context, n int) ([]string, error) {
 	if err := r.Init(ctx); err != nil {
 		return nil, err
 	}
-	if err := r.acquireLock(ctx); err != nil {
+	if err := r.db.AcquireLock(ctx); err != nil {
 		return nil, fmt.Errorf("acquire lock: %w", err)
 	}
-	defer r.releaseLock(ctx)
+	defer r.db.ReleaseLock(ctx)
 	if n <= 0 {
 		n = 1
 	}
 
-	// Get last N applied migrations in reverse order
-	rows, err := r.pool.Query(ctx, `
-		SELECT name FROM _migrations ORDER BY id DESC LIMIT $1
-	`, n)
+	rows, err := r.db.Query(ctx, `SELECT name FROM _migrations ORDER BY id DESC LIMIT $1`, n)
 	if err != nil {
 		return nil, err
 	}
@@ -229,26 +210,24 @@ type MigrationStatus struct {
 func (r *Runner) execMigration(ctx context.Context, name, sqlText, checksum string) error {
 	txSQL, nonTxSQL := splitConcurrently(sqlText)
 
-	// Execute non-transactional statements first (CREATE INDEX CONCURRENTLY)
 	for _, stmt := range nonTxSQL {
-		if _, err := r.pool.Exec(ctx, stmt); err != nil {
+		if err := r.db.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("non-tx statement: %w", err)
 		}
 	}
 
-	// Execute transactional statements + record migration
-	tx, err := r.pool.Begin(ctx)
+	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
 
 	if txSQL != "" {
-		if _, err := tx.Exec(ctx, txSQL); err != nil {
+		if err := tx.Exec(ctx, txSQL); err != nil {
 			return err
 		}
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO _migrations (name, checksum) VALUES ($1, $2)`, name, checksum); err != nil {
+	if err := tx.Exec(ctx, `INSERT INTO _migrations (name, checksum) VALUES ($1, $2)`, name, checksum); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -259,30 +238,29 @@ func (r *Runner) execRollback(ctx context.Context, name, sqlText string) error {
 	txSQL, nonTxSQL := splitConcurrently(sqlText)
 
 	for _, stmt := range nonTxSQL {
-		if _, err := r.pool.Exec(ctx, stmt); err != nil {
+		if err := r.db.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("non-tx statement: %w", err)
 		}
 	}
 
-	tx, err := r.pool.Begin(ctx)
+	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
 
 	if txSQL != "" {
-		if _, err := tx.Exec(ctx, txSQL); err != nil {
+		if err := tx.Exec(ctx, txSQL); err != nil {
 			return err
 		}
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM _migrations WHERE name = $1`, name); err != nil {
+	if err := tx.Exec(ctx, `DELETE FROM _migrations WHERE name = $1`, name); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
 
 // splitConcurrently separates CONCURRENTLY statements from transactional ones.
-// PG's CREATE INDEX CONCURRENTLY cannot run inside a transaction.
 func splitConcurrently(sql string) (txSQL string, nonTxStmts []string) {
 	var txParts []string
 	for _, stmt := range splitStatements(sql) {
@@ -299,7 +277,7 @@ func splitConcurrently(sql string) (txSQL string, nonTxStmts []string) {
 	return strings.Join(txParts, ";\n") + ";", nonTxStmts
 }
 
-// splitStatements splits SQL by semicolons (simple, no string literal handling).
+// splitStatements splits SQL by semicolons.
 func splitStatements(sql string) []string {
 	parts := strings.Split(sql, ";")
 	var result []string
@@ -324,7 +302,7 @@ func fileChecksum(path string) string {
 
 // verifyChecksums checks that applied migrations haven't been modified.
 func (r *Runner) verifyChecksums(ctx context.Context) error {
-	rows, err := r.pool.Query(ctx, `SELECT name, checksum FROM _migrations WHERE checksum IS NOT NULL ORDER BY id`)
+	rows, err := r.db.Query(ctx, `SELECT name, checksum FROM _migrations WHERE checksum IS NOT NULL ORDER BY id`)
 	if err != nil {
 		return err
 	}
@@ -359,7 +337,7 @@ func (r *Runner) appliedSet(ctx context.Context) (map[string]bool, error) {
 
 // appliedMap returns applied migrations with their timestamps.
 func (r *Runner) appliedMap(ctx context.Context) (map[string]time.Time, error) {
-	rows, err := r.pool.Query(ctx, `SELECT name, applied_at FROM _migrations ORDER BY id`)
+	rows, err := r.db.Query(ctx, `SELECT name, applied_at FROM _migrations ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -409,7 +387,6 @@ func parseSection(path, section string) (string, error) {
 	}
 	after := content[idx+len(marker):]
 
-	// Find the next section marker or end of file
 	nextMarker := "-- ======"
 	end := strings.Index(after, nextMarker)
 	if end < 0 {
@@ -453,7 +430,7 @@ func (r *Runner) Verify(ctx context.Context) ([]string, error) {
 }
 
 func (r *Runner) listTables(ctx context.Context) (map[string]bool, error) {
-	rows, err := r.pool.Query(ctx, `
+	rows, err := r.db.Query(ctx, `
 		SELECT table_name FROM information_schema.tables
 		WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
 		AND table_name != '_migrations'

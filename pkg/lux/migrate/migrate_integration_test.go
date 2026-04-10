@@ -34,16 +34,16 @@ func setupTestRunner(t *testing.T) (*Runner, string) {
 	dir := t.TempDir()
 	ctx := context.Background()
 
-	runner, err := New(ctx, dir)
+	db, err := NewPGDB(ctx, BuildDatabaseURL())
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
+	runner := NewFromDB(db, dir)
 
-	// Clean up test tables
 	t.Cleanup(func() {
-		runner.pool.Exec(context.Background(), "DROP TABLE IF EXISTS _migrations")
-		runner.pool.Exec(context.Background(), "DROP TABLE IF EXISTS test_users")
-		runner.pool.Exec(context.Background(), "DROP TABLE IF EXISTS test_posts")
+		db.Exec(context.Background(), "DROP TABLE IF EXISTS _migrations")
+		db.Exec(context.Background(), "DROP TABLE IF EXISTS test_users")
+		db.Exec(context.Background(), "DROP TABLE IF EXISTS test_posts")
 		runner.Close()
 	})
 
@@ -70,7 +70,7 @@ func TestIntegrationInitCreatesTable(t *testing.T) {
 
 	// Verify _migrations table exists
 	var count int64
-	err = runner.pool.QueryRow(ctx, "SELECT count(*) FROM _migrations").Scan(&count)
+	err = runner.db.(*PGDB).pool.QueryRow(ctx, "SELECT count(*) FROM _migrations").Scan(&count)
 	if err != nil {
 		t.Fatalf("_migrations table should exist: %v", err)
 	}
@@ -119,8 +119,8 @@ func TestIntegrationUpAndStatus(t *testing.T) {
 
 	// Verify tables exist
 	var count int64
-	runner.pool.QueryRow(ctx, "SELECT count(*) FROM test_users").Scan(&count)
-	runner.pool.QueryRow(ctx, "SELECT count(*) FROM test_posts").Scan(&count)
+	runner.db.(*PGDB).pool.QueryRow(ctx, "SELECT count(*) FROM test_users").Scan(&count)
+	runner.db.(*PGDB).pool.QueryRow(ctx, "SELECT count(*) FROM test_posts").Scan(&count)
 }
 
 func TestIntegrationDown(t *testing.T) {
@@ -151,14 +151,14 @@ func TestIntegrationDown(t *testing.T) {
 
 	// test_posts should be gone
 	var exists bool
-	runner.pool.QueryRow(ctx,
+	runner.db.(*PGDB).pool.QueryRow(ctx,
 		"SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name='test_posts')").Scan(&exists)
 	if exists {
 		t.Error("test_posts should be dropped after Down")
 	}
 
 	// test_users should still exist
-	runner.pool.QueryRow(ctx,
+	runner.db.(*PGDB).pool.QueryRow(ctx,
 		"SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name='test_users')").Scan(&exists)
 	if !exists {
 		t.Error("test_users should still exist")
@@ -353,7 +353,7 @@ func TestIntegrationDryRun(t *testing.T) {
 
 	// Table should NOT exist (dry run doesn't execute)
 	var exists bool
-	runner.pool.QueryRow(ctx,
+	runner.db.(*PGDB).pool.QueryRow(ctx,
 		"SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name='test_users')").Scan(&exists)
 	if exists {
 		t.Error("DryRun should not create the table")
@@ -385,7 +385,7 @@ func TestIntegrationConcurrently(t *testing.T) {
 
 	// Verify index exists
 	var indexExists bool
-	runner.pool.QueryRow(ctx,
+	runner.db.(*PGDB).pool.QueryRow(ctx,
 		"SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE indexname='idx_test_users_name')").Scan(&indexExists)
 	if !indexExists {
 		t.Error("CONCURRENTLY index should exist")
@@ -396,14 +396,11 @@ func TestIntegrationAdvisoryLock(t *testing.T) {
 	runner, _ := setupTestRunner(t)
 	ctx := context.Background()
 
-	// Acquire lock
-	err := runner.acquireLock(ctx)
+	err := runner.db.AcquireLock(ctx)
 	if err != nil {
-		t.Fatalf("acquireLock: %v", err)
+		t.Fatalf("AcquireLock: %v", err)
 	}
-
-	// Release lock
-	runner.releaseLock(ctx)
+	runner.db.ReleaseLock(ctx)
 	// Should not panic or error
 }
 
@@ -440,6 +437,141 @@ func TestIntegrationVerify(t *testing.T) {
 	}
 }
 
+func TestIntegrationUpAfterClose(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	ctx := context.Background()
+
+	writeMigration(t, dir, "001_a.sql",
+		"CREATE TABLE test_users (id SERIAL PRIMARY KEY);",
+		"DROP TABLE IF EXISTS test_users;")
+
+	runner.db.(*PGDB).pool.Close()
+
+	_, err := runner.Up(ctx)
+	if err == nil {
+		t.Fatal("should fail on closed pool")
+	}
+}
+
+func TestIntegrationDownAfterClose(t *testing.T) {
+	runner, _ := setupTestRunner(t)
+	ctx := context.Background()
+
+	runner.db.(*PGDB).pool.Close()
+
+	_, err := runner.Down(ctx, 1)
+	if err == nil {
+		t.Fatal("should fail on closed pool")
+	}
+}
+
+func TestIntegrationStatusAfterClose(t *testing.T) {
+	runner, _ := setupTestRunner(t)
+	ctx := context.Background()
+
+	runner.db.(*PGDB).pool.Close()
+
+	_, err := runner.Status(ctx)
+	if err == nil {
+		t.Fatal("should fail on closed pool")
+	}
+}
+
+func TestIntegrationVerifyAfterClose(t *testing.T) {
+	runner, _ := setupTestRunner(t)
+	ctx := context.Background()
+
+	runner.db.(*PGDB).pool.Close()
+
+	_, err := runner.Verify(ctx)
+	if err == nil {
+		t.Fatal("should fail on closed pool")
+	}
+}
+
+func TestIntegrationDryRunAfterClose(t *testing.T) {
+	runner, _ := setupTestRunner(t)
+	ctx := context.Background()
+
+	runner.db.(*PGDB).pool.Close()
+
+	_, _, err := runner.DryRun(ctx)
+	if err == nil {
+		t.Fatal("should fail on closed pool")
+	}
+}
+
+func TestIntegrationDownBadDownSQL(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	ctx := context.Background()
+
+	writeMigration(t, dir, "001_a.sql",
+		"CREATE TABLE test_users (id SERIAL PRIMARY KEY);",
+		"THIS IS BAD SQL;")
+
+	runner.Up(ctx)
+
+	_, err := runner.Down(ctx, 1)
+	if err == nil {
+		t.Fatal("should fail on bad DOWN SQL")
+	}
+}
+
+func TestIntegrationDownMissingFile(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	ctx := context.Background()
+
+	writeMigration(t, dir, "001_a.sql",
+		"CREATE TABLE test_users (id SERIAL PRIMARY KEY);",
+		"DROP TABLE IF EXISTS test_users;")
+
+	runner.Up(ctx)
+
+	// Delete the migration file
+	os.Remove(filepath.Join(dir, "001_a.sql"))
+
+	_, err := runner.Down(ctx, 1)
+	if err == nil {
+		t.Fatal("should fail when migration file is missing")
+	}
+}
+
+func TestIntegrationUpMissingSectionInFile(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	ctx := context.Background()
+
+	// Write file without proper sections
+	os.WriteFile(filepath.Join(dir, "001_bad.sql"), []byte("no sections here"), 0644)
+
+	_, err := runner.Up(ctx)
+	if err == nil {
+		t.Fatal("should fail when UP section missing")
+	}
+}
+
+func TestIntegrationExecRollbackConcurrently(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	ctx := context.Background()
+
+	writeMigration(t, dir, "001_create.sql",
+		"CREATE TABLE test_users (id SERIAL PRIMARY KEY, name TEXT);",
+		"DROP TABLE IF EXISTS test_users;")
+	writeMigration(t, dir, "002_idx.sql",
+		"CREATE INDEX CONCURRENTLY idx_test_name ON test_users (name);",
+		"DROP INDEX CONCURRENTLY IF EXISTS idx_test_name;")
+
+	runner.Up(ctx)
+
+	// Down should handle CONCURRENTLY in DOWN section
+	rolledBack, err := runner.Down(ctx, 1)
+	if err != nil {
+		t.Fatalf("Down with CONCURRENTLY: %v", err)
+	}
+	if len(rolledBack) != 1 {
+		t.Errorf("expected 1, got %d", len(rolledBack))
+	}
+}
+
 func TestIntegrationDryRunEmpty(t *testing.T) {
 	runner, _ := setupTestRunner(t)
 	ctx := context.Background()
@@ -465,7 +597,7 @@ func TestIntegrationUpChecksumStored(t *testing.T) {
 
 	// Check that checksum was stored in _migrations
 	var checksum string
-	err := runner.pool.QueryRow(ctx, "SELECT checksum FROM _migrations WHERE name = $1", "001_create_users.sql").Scan(&checksum)
+	err := runner.db.(*PGDB).pool.QueryRow(ctx, "SELECT checksum FROM _migrations WHERE name = $1", "001_create_users.sql").Scan(&checksum)
 	if err != nil {
 		t.Fatalf("query checksum: %v", err)
 	}
@@ -484,9 +616,9 @@ func TestIntegrationVerifyUnexpectedTable(t *testing.T) {
 	runner.Init(ctx)
 
 	// Create a table directly (not via migration)
-	runner.pool.Exec(ctx, "CREATE TABLE test_rogue (id INT)")
+	runner.db.(*PGDB).pool.Exec(ctx, "CREATE TABLE test_rogue (id INT)")
 	t.Cleanup(func() {
-		runner.pool.Exec(context.Background(), "DROP TABLE IF EXISTS test_rogue")
+		runner.db.(*PGDB).pool.Exec(context.Background(), "DROP TABLE IF EXISTS test_rogue")
 	})
 
 	// Write state that doesn't include test_rogue
