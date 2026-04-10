@@ -195,8 +195,8 @@ func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string,
 			continue
 		}
 		setter := "Set" + capitalize(f.Name)
-		nullable := f.Type != nil && f.Type.Nullable
-		if nullable {
+		optional := (f.Type != nil && f.Type.Nullable) || f.Default != nil
+		if optional {
 			fmt.Fprintf(b, "\t\tif req.HasParam(%q) {\n", f.Name)
 			generateParamSet(b, f, setter, "\t\t\t", enums)
 			fmt.Fprintf(b, "\t\t}\n")
