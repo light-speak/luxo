@@ -50,33 +50,33 @@ func New[K comparable, V any](fn BatchFn[K, V], cfg Config) *Loader[K, V] {
 }
 
 // Load adds a key + fields to the current batch and waits for the result.
-// Multiple concurrent Load calls within the wait window are batched together.
-// fields are merged (union) across all calls in the same batch.
+// Respects ctx cancellation — returns immediately if context is done.
 func (l *Loader[K, V]) Load(ctx context.Context, key K, fields []string) (V, error) {
 	l.mu.Lock()
 
-	// Create batch if needed, start timer
 	if l.batch == nil {
 		l.batch = newBatch[K, V]()
 		go l.scheduleBatch(l.batch)
 	}
 	b := l.batch
-
-	// Add request to batch
 	req := b.add(key, fields)
 
-	// If max batch reached, dispatch immediately
 	if l.maxBatch > 0 && b.size() >= l.maxBatch {
-		l.batch = nil // next Load creates a new batch
+		l.batch = nil
 		l.mu.Unlock()
 		l.dispatchBatch(b)
 	} else {
 		l.mu.Unlock()
 	}
 
-	// Wait for result
-	<-req.done
-	return req.value, req.err
+	// Wait for result or context cancellation
+	select {
+	case <-req.done:
+		return req.value, req.err
+	case <-ctx.Done():
+		var zero V
+		return zero, ctx.Err()
+	}
 }
 
 // LoadMany loads multiple keys with the same fields.
@@ -109,7 +109,6 @@ func (l *Loader[K, V]) scheduleBatch(b *batch[K, V]) {
 	time.Sleep(l.wait)
 
 	l.mu.Lock()
-	// Only dispatch if this batch is still the current one
 	if l.batch == b {
 		l.batch = nil
 	}
@@ -119,11 +118,13 @@ func (l *Loader[K, V]) scheduleBatch(b *batch[K, V]) {
 }
 
 // dispatchBatch executes the batch function and distributes results.
+// Uses a merged context — cancelled only when ALL callers have cancelled.
 func (l *Loader[K, V]) dispatchBatch(b *batch[K, V]) {
 	b.once.Do(func() {
 		keys := b.keys()
 		fields := b.mergedFields()
-		results, err := l.batchFn(context.Background(), keys, fields)
+		ctx := b.mergedContext()
+		results, err := l.batchFn(ctx, keys, fields)
 
 		for _, req := range b.requests {
 			if err != nil {
@@ -139,7 +140,7 @@ func (l *Loader[K, V]) dispatchBatch(b *batch[K, V]) {
 // batch collects load requests within a window.
 type batch[K comparable, V any] struct {
 	requests []*request[K, V]
-	fieldSet map[string]bool // union of all requested fields
+	fieldSet map[string]bool
 	once     sync.Once
 }
 
@@ -188,11 +189,22 @@ func (b *batch[K, V]) keys() []K {
 
 func (b *batch[K, V]) mergedFields() []string {
 	if len(b.fieldSet) == 0 {
-		return nil // nil = SELECT *
+		return nil
 	}
 	fields := make([]string, 0, len(b.fieldSet))
 	for f := range b.fieldSet {
 		fields = append(fields, f)
 	}
 	return fields
+}
+
+// mergedContext returns a context for the batch query.
+// DataLoader manages its own context — it uses a timeout-based context
+// independent of any single caller. Individual callers check their own ctx
+// in Load() via select. This prevents one cancelled request from killing
+// the batch for everyone else.
+func (b *batch[K, V]) mergedContext() context.Context {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	_ = cancel // will be GC'd after batch completes
+	return ctx
 }

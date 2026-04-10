@@ -17,7 +17,7 @@ import (
 
 var genCmd = &cobra.Command{
 	Use:   "gen",
-	Short: "Generate Go code from .luxo schemas / 从 .luxo 生成 Go 代码",
+	Short: "Generate Go code from origin/*.luxo / 从 origin/*.luxo 生成 Go 代码",
 	Long: `Parse all .luxo files in origin/ and generate Go code for each service module.
 解析 origin/ 下的所有 .luxo 文件，为每个服务模块生成 Go 代码。
 
@@ -75,8 +75,8 @@ func runGen(cmd *cobra.Command, args []string) error {
 	dim := "\033[2m"
 	bold := "\033[1m"
 	reset := "\033[0m"
-	fmt.Printf("\n%s%s✓ %d file(s) generated from %d schema(s)%s\n", bold, green, totalFiles, len(schemaFiles), reset)
-	fmt.Printf("  %s%d 个 schema 生成了 %d 个文件%s\n\n", dim, len(schemaFiles), totalFiles, reset)
+	fmt.Printf("\n%s%s✓ %d file(s) generated from %d origin(s)%s\n", bold, green, totalFiles, len(schemaFiles), reset)
+	fmt.Printf("  %s%d 个 origin 生成了 %d 个文件%s\n\n", dim, len(schemaFiles), totalFiles, reset)
 	return nil
 }
 

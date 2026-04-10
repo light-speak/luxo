@@ -23,16 +23,16 @@ var migrateCmd = &cobra.Command{
 管理数据库迁移。
 
 Commands / 子命令:
-  diff [name]    Generate migration from schema changes / 从 schema 变更生成迁移
+  diff [name]    Generate migration from origin changes / 从 origin 变更生成迁移
   up             Apply pending migrations / 执行未执行的迁移
   status         Show migration status / 查看迁移状态`,
 }
 
 var migrateDiffCmd = &cobra.Command{
 	Use:   "diff [name]",
-	Short: "Generate migration SQL from schema diff / 从 schema 差异生成迁移 SQL",
-	Long: `Compare current .luxo schema with the last migration state and generate SQL.
-对比当前 .luxo schema 和上次迁移状态，生成差异 SQL。
+	Short: "Generate migration SQL from origin diff / 从 origin 差异生成迁移 SQL",
+	Long: `Compare current .luxo origin with the last migration state and generate SQL.
+对比当前 .luxo origin 和上次迁移状态，生成差异 SQL。
 
 Dangerous operations (DROP TABLE, DROP COLUMN) are commented out by default.
 破坏性操作（DROP TABLE、DROP COLUMN）默认注释掉。
@@ -67,7 +67,7 @@ var migrateStatusCmd = &cobra.Command{
 
 var migrateVerifyCmd = &cobra.Command{
 	Use:   "verify",
-	Short: "Verify DB matches expected schema / 验证数据库与预期 schema 一致",
+	Short: "Verify DB matches expected origin / 验证数据库与预期 origin 一致",
 	Args:  cobra.NoArgs,
 	RunE:  runMigrateVerify,
 }
@@ -138,11 +138,11 @@ func runMigrateDiff(cmd *cobra.Command, args []string) error {
 }
 
 func parseAndAnalyze() (*semantic.Result, error) {
-	schemaFiles, err := findSchemaFiles()
+	originFiles, err := findSchemaFiles()
 	if err != nil {
 		return nil, err
 	}
-	files, err := parseAllFiles(schemaFiles)
+	files, err := parseAllFiles(originFiles)
 	if err != nil {
 		return nil, err
 	}
@@ -353,11 +353,11 @@ func runMigrateVerify(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(drifts) == 0 {
-		fmt.Printf("\n  %s%s✓ Database matches expected schema / 数据库与预期 schema 一致%s\n\n", bold, green, reset)
+		fmt.Printf("\n  %s%s✓ Database matches expected origin / 数据库与预期 origin 一致%s\n\n", bold, green, reset)
 		return nil
 	}
 
-	fmt.Printf("\n  %s%s✗ Schema drift detected / 检测到 schema 漂移%s\n\n", bold, red, reset)
+	fmt.Printf("\n  %s%s✗ Schema drift detected / 检测到 origin 漂移%s\n\n", bold, red, reset)
 	for _, d := range drifts {
 		fmt.Printf("  %s•%s %s\n", red, reset, d)
 	}

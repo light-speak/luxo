@@ -229,6 +229,73 @@ func TestLoadDedupKeys(t *testing.T) {
 	}
 }
 
+func TestLoadContextCancel(t *testing.T) {
+	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+		time.Sleep(50 * time.Millisecond) // slow query
+		return map[int]string{1: "ok"}, nil
+	}, Config{Wait: 5 * time.Millisecond, MaxBatch: 100})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	_, err := loader.Load(ctx, 1, nil)
+	if err == nil {
+		t.Fatal("expected error from cancelled context")
+	}
+	if err != context.Canceled {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestLoadContextCancelDoesNotKillOthers(t *testing.T) {
+	var calls int32
+
+	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+		atomic.AddInt32(&calls, 1)
+		result := make(map[int]string)
+		for _, k := range keys {
+			result[k] = fmt.Sprintf("v%d", k)
+		}
+		return result, nil
+	}, Config{Wait: 10 * time.Millisecond, MaxBatch: 100})
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+
+	var wg sync.WaitGroup
+	var cancelErr, normalErr error
+	var normalVal string
+
+	// Request 1: will be cancelled
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, cancelErr = loader.Load(cancelCtx, 1, nil)
+	}()
+
+	// Request 2: normal, should succeed
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		normalVal, normalErr = loader.Load(context.Background(), 2, nil)
+	}()
+
+	// Cancel request 1 after a tiny delay
+	time.Sleep(1 * time.Millisecond)
+	cancel()
+
+	wg.Wait()
+
+	if cancelErr != context.Canceled {
+		t.Errorf("cancelled request should get context.Canceled, got %v", cancelErr)
+	}
+	if normalErr != nil {
+		t.Errorf("normal request should succeed, got %v", normalErr)
+	}
+	if normalVal != "v2" {
+		t.Errorf("normal request value = %q, want v2", normalVal)
+	}
+}
+
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
 	if cfg.Wait != 2*time.Millisecond {
