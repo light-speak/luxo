@@ -142,6 +142,16 @@ func updateLockFile(files []*ast.File) error {
 func generateModules(files []*ast.File, result *semantic.Result) (int, error) {
 	green := "\033[32m"
 	reset := "\033[0m"
+
+	// Collect @soft model names across ALL modules (for cross-module DataLoader filtering)
+	softModels := make(map[string]bool)
+	for _, file := range files {
+		for _, m := range file.Models {
+			if codegen.IsSoftDelete(m) {
+				softModels[m.Name] = true
+			}
+		}
+	}
 	total := 0
 	for _, file := range files {
 		moduleName := strings.TrimSuffix(filepath.Base(file.Name), ".luxo")
@@ -150,7 +160,7 @@ func generateModules(files []*ast.File, result *semantic.Result) (int, error) {
 			return 0, fmt.Errorf("create %s: %w", outDir, err)
 		}
 		singleResult := &semantic.Result{Files: []*ast.File{file}}
-		gr := codegen.Generate(singleResult, "luxo")
+		gr := codegen.Generate(singleResult, "luxo", softModels)
 		for name, src := range gr.Files {
 			outPath := filepath.Join(outDir, name)
 			if err := os.WriteFile(outPath, src, 0644); err != nil {

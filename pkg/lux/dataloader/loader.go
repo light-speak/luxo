@@ -118,12 +118,12 @@ func (l *Loader[K, V]) scheduleBatch(b *batch[K, V]) {
 }
 
 // dispatchBatch executes the batch function and distributes results.
-// Uses a merged context — cancelled only when ALL callers have cancelled.
 func (l *Loader[K, V]) dispatchBatch(b *batch[K, V]) {
 	b.once.Do(func() {
 		keys := b.keys()
 		fields := b.mergedFields()
-		ctx := b.mergedContext()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 		results, err := l.batchFn(ctx, keys, fields)
 
 		for _, req := range b.requests {
@@ -196,15 +196,4 @@ func (b *batch[K, V]) mergedFields() []string {
 		fields = append(fields, f)
 	}
 	return fields
-}
-
-// mergedContext returns a context for the batch query.
-// DataLoader manages its own context — it uses a timeout-based context
-// independent of any single caller. Individual callers check their own ctx
-// in Load() via select. This prevents one cancelled request from killing
-// the batch for everyone else.
-func (b *batch[K, V]) mergedContext() context.Context {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	_ = cancel // will be GC'd after batch completes
-	return ctx
 }

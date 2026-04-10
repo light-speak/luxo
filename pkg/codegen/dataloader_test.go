@@ -143,7 +143,7 @@ func TestGenerateDataLoaderFile(t *testing.T) {
 		}},
 	}
 
-	src := generateDataLoaderFile(result, "luxo", nil)
+	src := generateDataLoaderFile(result, "luxo", nil, nil)
 	if src == nil {
 		t.Fatal("should generate dataloader file")
 	}
@@ -175,7 +175,7 @@ func TestGenerateDataLoaderFileNoRelations(t *testing.T) {
 			}},
 		}},
 	}
-	src := generateDataLoaderFile(result, "luxo", nil)
+	src := generateDataLoaderFile(result, "luxo", nil, nil)
 	if src != nil {
 		t.Error("should return nil when no relations")
 	}
@@ -328,7 +328,7 @@ func TestGenerateDataLoaderDedup(t *testing.T) {
 			},
 		}},
 	}
-	src := generateDataLoaderFile(result, "luxo", nil)
+	src := generateDataLoaderFile(result, "luxo", nil, nil)
 	code := string(src)
 
 	// UserByIdLoader type should appear only once

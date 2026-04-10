@@ -189,6 +189,11 @@ func isAutoOnUpdate(f *ast.FieldDecl) bool {
 }
 
 // isSoftDelete returns true if the model has @soft directive.
+// IsSoftDelete checks if a model has @soft directive (exported for CLI).
+func IsSoftDelete(m *ast.ModelDecl) bool {
+	return isSoftDelete(m)
+}
+
 func isSoftDelete(m *ast.ModelDecl) bool {
 	return hasDirective(m.Directives, "soft")
 }

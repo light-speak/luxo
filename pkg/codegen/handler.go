@@ -36,21 +36,15 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
 	b.WriteString(")\n\n")
 
-	// Generate handlers per model
+	// Generate handlers + relation resolvers per model (analyzeRelations once per model)
 	for _, m := range models {
+		rels := analyzeRelations(m, enums)
 		ops := crudOperations(m)
 		for _, op := range ops {
-			generateHandler(&b, m, op, enums)
+			generateHandler(&b, m, op, enums, rels)
 		}
-	}
-
-	// Relation resolvers for models with relations
-	for _, file := range result.Files {
-		for _, m := range file.Models {
-			rels := analyzeRelations(m, enums)
-			if len(rels) > 0 {
-				generateRelationResolver(&b, m, rels)
-			}
+		if len(rels) > 0 {
+			generateRelationResolver(&b, m, rels)
 		}
 	}
 
@@ -121,13 +115,11 @@ func filterOps(all, except []string) []string {
 }
 
 // generateHandler generates a single CRUD handler function.
-func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[string]bool) {
+func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[string]bool, rels []Relation) {
 	name := m.Name
 	idType := idGoType(m)
 
 	apiName := crudAPIName(name, op)
-
-	rels := analyzeRelations(m, enums)
 	hasRels := len(rels) > 0
 
 	switch op {
@@ -371,20 +363,10 @@ func generateRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relat
 		fmt.Fprintf(b, "\tfor _, f := range fields {\n")
 		fmt.Fprintf(b, "\t\tif f.Name == %q && f.Children != nil {\n", fieldName)
 		fmt.Fprintf(b, "\t\t\tchildCols := selection.SQLColumns(f.Children)\n")
-
-		if rel.IsList {
-			// hasMany: Load returns []TargetType
-			fmt.Fprintf(b, "\t\t\tresult, err := app.loaders.%s.Load(ctx, %s.%s, childCols)\n",
-				loaderField, lower, goLocalKey)
-			fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
-			fmt.Fprintf(b, "\t\t\t%s.%s = result\n", lower, capitalize(fieldName))
-		} else {
-			// belongsTo/hasOne: Load returns *TargetType
-			fmt.Fprintf(b, "\t\t\tresult, err := app.loaders.%s.Load(ctx, %s.%s, childCols)\n",
-				loaderField, lower, goLocalKey)
-			fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
-			fmt.Fprintf(b, "\t\t\t%s.%s = result\n", lower, capitalize(fieldName))
-		}
+		fmt.Fprintf(b, "\t\t\tresult, err := app.loaders.%s.Load(ctx, %s.%s, childCols)\n",
+			loaderField, lower, goLocalKey)
+		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
+		fmt.Fprintf(b, "\t\t\t%s.%s = result\n", lower, capitalize(fieldName))
 
 		fmt.Fprintf(b, "\t\t\tbreak\n")
 		fmt.Fprintf(b, "\t\t}\n")

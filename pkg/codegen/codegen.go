@@ -14,7 +14,7 @@ type GenerateResult struct {
 }
 
 // Generate produces Go source files from semantic analysis result.
-func Generate(result *semantic.Result, packageName string) *GenerateResult {
+func Generate(result *semantic.Result, packageName string, softModels ...map[string]bool) *GenerateResult {
 	gr := &GenerateResult{
 		Files: make(map[string][]byte),
 	}
@@ -28,7 +28,11 @@ func Generate(result *semantic.Result, packageName string) *GenerateResult {
 	if appSrc := generateAppFile(result, packageName, enums); appSrc != nil {
 		gr.Files["app.gen.go"] = appSrc
 	}
-	if dlSrc := generateDataLoaderFile(result, packageName, enums); dlSrc != nil {
+	var soft map[string]bool
+	if len(softModels) > 0 {
+		soft = softModels[0]
+	}
+	if dlSrc := generateDataLoaderFile(result, packageName, enums, soft); dlSrc != nil {
 		gr.Files["dataloader.gen.go"] = dlSrc
 	}
 	if handlerSrc := generateHandlerFile(result, packageName, enums); handlerSrc != nil {

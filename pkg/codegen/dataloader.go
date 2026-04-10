@@ -81,7 +81,7 @@ func analyzeRelations(m *ast.ModelDecl, enums map[string]bool) []Relation {
 }
 
 // generateDataLoaderFile produces dataloader.gen.go with loader types and batch function signatures.
-func generateDataLoaderFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
+func generateDataLoaderFile(result *semantic.Result, packageName string, enums map[string]bool, externalSoftModels map[string]bool) []byte {
 	var allRelations []struct {
 		modelName string
 		relations []Relation
@@ -101,6 +101,19 @@ func generateDataLoaderFile(result *semantic.Result, packageName string, enums m
 
 	if len(allRelations) == 0 {
 		return nil
+	}
+
+	// Merge local + external @soft model names for DataLoader filtering
+	softModels := make(map[string]bool)
+	for k, v := range externalSoftModels {
+		softModels[k] = v
+	}
+	for _, file := range result.Files {
+		for _, m := range file.Models {
+			if isSoftDelete(m) {
+				softModels[m.Name] = true
+			}
+		}
 	}
 
 	var b strings.Builder
@@ -127,6 +140,7 @@ func generateDataLoaderFile(result *semantic.Result, packageName string, enums m
 
 	// Generate Loaders struct with actual Loader instances
 	generateLoadersStruct(&b, allRelations, seenTypes)
+	generateDefaultLoaders(&b, allRelations, softModels)
 
 	return []byte(b.String())
 }
@@ -144,60 +158,68 @@ func generateLoaderType(b *strings.Builder, modelName string, rel Relation) {
 	}
 }
 
+// loaderEntry is a deduplicated loader for code generation.
+type loaderEntry struct {
+	fieldName string
+	typeName  string
+	rel       Relation
+}
+
+// deduplicateLoaders returns unique loaders across all relations.
+func deduplicateLoaders(allRelations []struct {
+	modelName string
+	relations []Relation
+}) []loaderEntry {
+	seen := make(map[string]bool)
+	var entries []loaderEntry
+	for _, mr := range allRelations {
+		for _, rel := range mr.relations {
+			name := loaderFieldName(mr.modelName, rel)
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			entries = append(entries, loaderEntry{
+				fieldName: name,
+				typeName:  loaderTypeName(mr.modelName, rel),
+				rel:       rel,
+			})
+		}
+	}
+	return entries
+}
+
 // generateLoadersStruct generates the Loaders struct with actual Loader instances.
 func generateLoadersStruct(b *strings.Builder, allRelations []struct {
 	modelName string
 	relations []Relation
 }, seenTypes map[string]bool) {
+	entries := deduplicateLoaders(allRelations)
+
+	// Struct
 	b.WriteString("// Loaders holds DataLoader instances for all relations.\n")
 	b.WriteString("type Loaders struct {\n")
-	seen := make(map[string]bool)
-	for _, mr := range allRelations {
-		for _, rel := range mr.relations {
-			name := loaderFieldName(mr.modelName, rel)
-			if seen[name] {
-				continue
-			}
-			seen[name] = true
-			if rel.IsList {
-				fmt.Fprintf(b, "\t%s *dataloader.Loader[int64, []%s]\n", name, rel.TargetName)
-			} else {
-				fmt.Fprintf(b, "\t%s *dataloader.Loader[int64, *%s]\n", name, rel.TargetName)
-			}
+	for _, e := range entries {
+		if e.rel.IsList {
+			fmt.Fprintf(b, "\t%s *dataloader.Loader[int64, []%s]\n", e.fieldName, e.rel.TargetName)
+		} else {
+			fmt.Fprintf(b, "\t%s *dataloader.Loader[int64, *%s]\n", e.fieldName, e.rel.TargetName)
 		}
 	}
 	b.WriteString("}\n\n")
 
-	// NewLoaders constructor
+	// Constructor
 	b.WriteString("// NewLoaders creates Loaders from batch functions.\n")
 	b.WriteString("func NewLoaders(cfg dataloader.Config,\n")
-	seen = make(map[string]bool)
 	var params []string
-	for _, mr := range allRelations {
-		for _, rel := range mr.relations {
-			name := loaderFieldName(mr.modelName, rel)
-			if seen[name] {
-				continue
-			}
-			seen[name] = true
-			typeName := loaderTypeName(mr.modelName, rel)
-			param := fmt.Sprintf("\t%sFn %s", lowerFirst(name), typeName)
-			params = append(params, param)
-		}
+	for _, e := range entries {
+		params = append(params, fmt.Sprintf("\t%sFn %s", lowerFirst(e.fieldName), e.typeName))
 	}
 	b.WriteString(strings.Join(params, ",\n"))
 	b.WriteString(",\n) Loaders {\n")
 	b.WriteString("\treturn Loaders{\n")
-	seen = make(map[string]bool)
-	for _, mr := range allRelations {
-		for _, rel := range mr.relations {
-			name := loaderFieldName(mr.modelName, rel)
-			if seen[name] {
-				continue
-			}
-			seen[name] = true
-			fmt.Fprintf(b, "\t\t%s: dataloader.New(%sFn, cfg),\n", name, lowerFirst(name))
-		}
+	for _, e := range entries {
+		fmt.Fprintf(b, "\t\t%s: dataloader.New(%sFn, cfg),\n", e.fieldName, lowerFirst(e.fieldName))
 	}
 	b.WriteString("\t}\n")
 	b.WriteString("}\n\n")
@@ -217,15 +239,13 @@ func generateLoadersStruct(b *strings.Builder, allRelations []struct {
 	b.WriteString("\ta.loaders = l\n")
 	b.WriteString("}\n\n")
 
-	// NewDefaultLoaders — auto-wires batch functions using the module's Clients
-	generateDefaultLoaders(b, allRelations)
 }
 
 // generateDefaultLoaders generates NewDefaultLoaders that uses the module's own Clients.
 func generateDefaultLoaders(b *strings.Builder, allRelations []struct {
 	modelName string
 	relations []Relation
-}) {
+}, softModels map[string]bool) {
 	b.WriteString("// NewDefaultLoaders creates Loaders with default batch functions using the module's Clients.\n")
 	b.WriteString("// Used in embedded mode — all models share the same database.\n")
 	b.WriteString("func NewDefaultLoaders(app *App, cfg dataloader.Config) Loaders {\n")
@@ -239,7 +259,7 @@ func generateDefaultLoaders(b *strings.Builder, allRelations []struct {
 				continue
 			}
 			seen[name] = true
-			generateBatchFunc(b, mr.modelName, rel)
+			generateBatchFunc(b, mr.modelName, rel, softModels[rel.TargetName])
 		}
 	}
 
@@ -249,7 +269,7 @@ func generateDefaultLoaders(b *strings.Builder, allRelations []struct {
 
 // generateBatchFunc generates an inline batch function for a relation.
 // Uses raw pg.QueryRows with the module's scan function — no cross-module Client dependency.
-func generateBatchFunc(b *strings.Builder, modelName string, rel Relation) {
+func generateBatchFunc(b *strings.Builder, modelName string, rel Relation, softTarget bool) {
 	targetTable := toSnakeCase(rel.TargetName) + "s"
 	remoteCol := toSnakeCase(rel.RemoteKey)
 	scanFn := "scan" + rel.TargetName
@@ -258,8 +278,11 @@ func generateBatchFunc(b *strings.Builder, modelName string, rel Relation) {
 	if rel.IsList {
 		fmt.Fprintf(b, "\t\tfunc(ctx context.Context, keys []int64, fields []string) (map[int64][]%s, error) {\n", rel.TargetName)
 		fmt.Fprintf(b, "\t\t\tfields = ensureField(fields, %q)\n", remoteCol)
-		fmt.Fprintf(b, "\t\t\tcond := lux.NewIntField(%q).In(keys...)\n", remoteCol)
-		fmt.Fprintf(b, "\t\t\tquery, args := lux.BuildSelectSQL(%q, fields, []lux.Condition{cond}, nil, 0, 0)\n", targetTable)
+		fmt.Fprintf(b, "\t\t\tconds := []lux.Condition{lux.NewIntField(%q).In(keys...)}\n", remoteCol)
+		if softTarget {
+			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewTimeField(\"deleted_at\").IsNull())\n")
+		}
+		fmt.Fprintf(b, "\t\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", targetTable)
 		fmt.Fprintf(b, "\t\t\trows, err := pg.QueryRows(ctx, app.DB, %s, query, args...)\n", scanFn)
 		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
 		fmt.Fprintf(b, "\t\t\tresult := make(map[int64][]%s, len(keys))\n", rel.TargetName)
@@ -271,8 +294,11 @@ func generateBatchFunc(b *strings.Builder, modelName string, rel Relation) {
 	} else {
 		fmt.Fprintf(b, "\t\tfunc(ctx context.Context, keys []int64, fields []string) (map[int64]*%s, error) {\n", rel.TargetName)
 		fmt.Fprintf(b, "\t\t\tfields = ensureField(fields, %q)\n", remoteCol)
-		fmt.Fprintf(b, "\t\t\tcond := lux.NewIntField(%q).In(keys...)\n", remoteCol)
-		fmt.Fprintf(b, "\t\t\tquery, args := lux.BuildSelectSQL(%q, fields, []lux.Condition{cond}, nil, 0, 0)\n", targetTable)
+		fmt.Fprintf(b, "\t\t\tconds := []lux.Condition{lux.NewIntField(%q).In(keys...)}\n", remoteCol)
+		if softTarget {
+			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewTimeField(\"deleted_at\").IsNull())\n")
+		}
+		fmt.Fprintf(b, "\t\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", targetTable)
 		fmt.Fprintf(b, "\t\t\trows, err := pg.QueryRows(ctx, app.DB, %s, query, args...)\n", scanFn)
 		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
 		fmt.Fprintf(b, "\t\t\tresult := make(map[int64]*%s, len(keys))\n", rel.TargetName)

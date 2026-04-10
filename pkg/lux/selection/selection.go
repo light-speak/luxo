@@ -19,20 +19,20 @@ func SQLColumns(fields []*Field) []string {
 	if len(fields) == 0 {
 		return nil // nil = SELECT *
 	}
-	hasID := false
-	var cols []string
+	cols := make([]string, 0, len(fields)+1)
+	cols = append(cols, "id") // always include id
 	for _, f := range fields {
 		if f.Children != nil {
-			continue // relation field, not a DB column
+			continue
 		}
 		col := toSnakeCase(f.Name)
-		cols = append(cols, col)
 		if col == "id" {
-			hasID = true
+			continue // already added
 		}
+		cols = append(cols, col)
 	}
-	if !hasID && len(cols) > 0 {
-		cols = append([]string{"id"}, cols...)
+	if len(cols) == 1 { // only "id", no user fields → SELECT *
+		return nil
 	}
 	return cols
 }
