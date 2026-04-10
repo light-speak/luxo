@@ -2,8 +2,8 @@ package selection
 
 import (
 	"fmt"
-	"strings"
-	"unicode"
+
+	"github.com/light-speak/luxo/pkg/lux/str"
 )
 
 // Field represents a selected field, optionally with nested sub-selections.
@@ -37,17 +37,7 @@ func SQLColumns(fields []*Field) []string {
 	return cols
 }
 
-// toSnakeCase converts camelCase to snake_case.
-func toSnakeCase(s string) string {
-	var b strings.Builder
-	for i, r := range s {
-		if unicode.IsUpper(r) && i > 0 {
-			b.WriteByte('_')
-		}
-		b.WriteRune(unicode.ToLower(r))
-	}
-	return b.String()
-}
+func toSnakeCase(s string) string { return str.ToSnakeCase(s) }
 
 // Parse parses a $select string into a field selection tree.
 //

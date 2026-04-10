@@ -3,9 +3,9 @@ package codegen
 import (
 	"fmt"
 	"strings"
-	"unicode"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lux/str"
 )
 
 // fieldInfo holds pre-computed field data for aligned struct generation.
@@ -225,22 +225,5 @@ func hasDirective(directives []*ast.Directive, name string) bool {
 	return false
 }
 
-// capitalize returns the string with the first letter uppercased.
-func capitalize(s string) string {
-	if s == "" {
-		return s
-	}
-	return string(unicode.ToUpper(rune(s[0]))) + s[1:]
-}
-
-// toSnakeCase converts camelCase to snake_case.
-func toSnakeCase(s string) string {
-	var b strings.Builder
-	for i, r := range s {
-		if unicode.IsUpper(r) && i > 0 {
-			b.WriteByte('_')
-		}
-		b.WriteRune(unicode.ToLower(r))
-	}
-	return b.String()
-}
+func capitalize(s string) string  { return str.Capitalize(s) }
+func toSnakeCase(s string) string { return str.ToSnakeCase(s) }

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lux/str"
 	"github.com/light-speak/luxo/pkg/semantic"
 )
 
@@ -377,13 +378,7 @@ func hasFKField(fields []*ast.FieldDecl, name string) bool {
 	return false
 }
 
-// lowerFirst returns the string with the first character lowered.
-func lowerFirst(s string) string {
-	if len(s) == 0 {
-		return s
-	}
-	return strings.ToLower(s[:1]) + s[1:]
-}
+func lowerFirst(s string) string { return str.LowerFirst(s) }
 
 // relTypeName returns a display name for a relation type.
 func relTypeName(t RelationType) string {

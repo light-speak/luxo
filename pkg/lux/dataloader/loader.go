@@ -80,27 +80,41 @@ func (l *Loader[K, V]) Load(ctx context.Context, key K, fields []string) (V, err
 }
 
 // LoadMany loads multiple keys with the same fields.
+// Adds all keys to the same batch in a single lock — no per-key goroutine.
 func (l *Loader[K, V]) LoadMany(ctx context.Context, keys []K, fields []string) (map[K]V, error) {
-	results := make(map[K]V, len(keys))
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	var firstErr error
-
-	for _, key := range keys {
-		wg.Add(1)
-		go func(k K) {
-			defer wg.Done()
-			v, err := l.Load(ctx, k, fields)
-			mu.Lock()
-			if err != nil && firstErr == nil {
-				firstErr = err
-			}
-			results[k] = v
-			mu.Unlock()
-		}(key)
+	l.mu.Lock()
+	if l.batch == nil {
+		l.batch = newBatch[K, V]()
+		go l.scheduleBatch(l.batch)
+	}
+	b := l.batch
+	reqs := make([]*request[K, V], len(keys))
+	for i, key := range keys {
+		reqs[i] = b.add(key, fields)
+	}
+	if l.maxBatch > 0 && b.size() >= l.maxBatch {
+		l.batch = nil
+		l.mu.Unlock()
+		l.dispatchBatch(b)
+	} else {
+		l.mu.Unlock()
 	}
 
-	wg.Wait()
+	results := make(map[K]V, len(keys))
+	var firstErr error
+	for i, req := range reqs {
+		select {
+		case <-req.done:
+			if req.err != nil && firstErr == nil {
+				firstErr = req.err
+			}
+			results[keys[i]] = req.value
+		case <-ctx.Done():
+			if firstErr == nil {
+				firstErr = ctx.Err()
+			}
+		}
+	}
 	return results, firstErr
 }
 
