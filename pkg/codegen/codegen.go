@@ -163,6 +163,25 @@ func generateDBFile(result *semantic.Result, packageName string, enums map[strin
 	writeHeader(&b, packageName, "db.gen.go")
 	writeDBImports(&b, result.Files)
 
+	// Collect model names to skip generating scanners for models that already exist
+	modelNames := make(map[string]bool)
+	for _, file := range result.Files {
+		for _, m := range file.Models {
+			modelNames[m.Name] = true
+		}
+	}
+
+	// Generate scanners for extend stubs (needed by DataLoader batch functions)
+	for _, file := range result.Files {
+		for _, ext := range file.Extends {
+			if modelNames[ext.Name] {
+				continue // full model exists, has its own scanner
+			}
+			generateScanner(&b, &ast.ModelDecl{Name: ext.Name, Fields: ext.Fields})
+			b.WriteByte('\n')
+		}
+	}
+
 	for _, file := range result.Files {
 		for _, m := range file.Models {
 			generateQueryBuilder(&b, m, enums)

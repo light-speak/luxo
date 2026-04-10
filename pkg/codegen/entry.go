@@ -10,26 +10,31 @@ import (
 // GenerateEntryFile produces luxis/app/main.gen.go — the embedded entry point
 // that imports all modules, registers handlers, and starts the Luvia gateway.
 func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
+	enums := collectEnums(result)
+
 	type moduleInfo struct {
-		name    string
-		hasCrud bool
+		name       string
+		hasCrud    bool
+		hasLoaders bool
 	}
 
 	var modules []moduleInfo
 	for _, file := range result.Files {
 		name := strings.TrimSuffix(file.Name, ".luxo")
-		// Strip path prefix (e.g., "origin/user.luxo" → "user")
 		if idx := strings.LastIndex(name, "/"); idx >= 0 {
 			name = name[idx+1:]
 		}
 		crud := false
+		loaders := false
 		for _, m := range file.Models {
 			if hasDirective(m.Directives, "crud") {
 				crud = true
-				break
+			}
+			if len(analyzeRelations(m, enums)) > 0 {
+				loaders = true
 			}
 		}
-		modules = append(modules, moduleInfo{name: name, hasCrud: crud})
+		modules = append(modules, moduleInfo{name: name, hasCrud: crud, hasLoaders: loaders})
 	}
 
 	if len(modules) == 0 {
@@ -55,7 +60,8 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 		fmt.Fprintf(&b, "\t%s_resolver \"%s/service/%s/resolver\"\n", m.name, modulePath, m.name)
 	}
 
-	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/env\"\n")
+	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/dataloader\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/env\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
 	b.WriteString(")\n\n")
 
@@ -81,6 +87,15 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 	// Call resolver.Setup for each module
 	for _, m := range modules {
 		fmt.Fprintf(&b, "\t%s_resolver.Setup(%sApp)\n", m.name, m.name)
+	}
+	b.WriteString("\n")
+
+	// Wire DataLoaders (embedded mode — same DB for all modules)
+	b.WriteString("\tdlCfg := dataloader.DefaultConfig()\n")
+	for _, m := range modules {
+		if m.hasLoaders {
+			fmt.Fprintf(&b, "\t%sApp.SetLoaders(%s_luxo.NewDefaultLoaders(%sApp, dlCfg))\n", m.name, m.name, m.name)
+		}
 	}
 	b.WriteString("\n")
 

@@ -105,7 +105,12 @@ func generateDataLoaderFile(result *semantic.Result, packageName string, enums m
 
 	var b strings.Builder
 	writeHeader(&b, packageName, "dataloader.gen.go")
-	b.WriteString("import \"github.com/light-speak/luxo/pkg/lux/dataloader\"\n\n")
+	b.WriteString("import (\n")
+	b.WriteString("\t\"context\"\n\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/dataloader\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/pg\"\n")
+	b.WriteString(")\n\n")
 
 	// Generate batch function types (deduplicate by type name)
 	seenTypes := make(map[string]bool)
@@ -197,10 +202,86 @@ func generateLoadersStruct(b *strings.Builder, allRelations []struct {
 	b.WriteString("\t}\n")
 	b.WriteString("}\n\n")
 
+	// ensureField helper
+	b.WriteString("// ensureField adds a field to the list if not already present.\n")
+	b.WriteString("func ensureField(fields []string, name string) []string {\n")
+	b.WriteString("\tif fields == nil {\n\t\treturn nil\n\t}\n")
+	b.WriteString("\tfor _, f := range fields {\n")
+	b.WriteString("\t\tif f == name {\n\t\t\treturn fields\n\t\t}\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\treturn append(fields, name)\n")
+	b.WriteString("}\n\n")
+
 	b.WriteString("// SetLoaders injects DataLoader instances into the App.\n")
 	b.WriteString("func (a *App) SetLoaders(l Loaders) {\n")
 	b.WriteString("\ta.loaders = l\n")
+	b.WriteString("}\n\n")
+
+	// NewDefaultLoaders — auto-wires batch functions using the module's Clients
+	generateDefaultLoaders(b, allRelations)
+}
+
+// generateDefaultLoaders generates NewDefaultLoaders that uses the module's own Clients.
+func generateDefaultLoaders(b *strings.Builder, allRelations []struct {
+	modelName string
+	relations []Relation
+}) {
+	b.WriteString("// NewDefaultLoaders creates Loaders with default batch functions using the module's Clients.\n")
+	b.WriteString("// Used in embedded mode — all models share the same database.\n")
+	b.WriteString("func NewDefaultLoaders(app *App, cfg dataloader.Config) Loaders {\n")
+	b.WriteString("\treturn NewLoaders(cfg,\n")
+
+	seen := make(map[string]bool)
+	for _, mr := range allRelations {
+		for _, rel := range mr.relations {
+			name := loaderFieldName(mr.modelName, rel)
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			generateBatchFunc(b, mr.modelName, rel)
+		}
+	}
+
+	b.WriteString("\t)\n")
 	b.WriteString("}\n")
+}
+
+// generateBatchFunc generates an inline batch function for a relation.
+// Uses raw pg.QueryRows with the module's scan function — no cross-module Client dependency.
+func generateBatchFunc(b *strings.Builder, modelName string, rel Relation) {
+	targetTable := toSnakeCase(rel.TargetName) + "s"
+	remoteCol := toSnakeCase(rel.RemoteKey)
+	scanFn := "scan" + rel.TargetName
+	goRemoteField := capitalize(rel.RemoteKey) // camelCase → PascalCase (e.g., userId → UserId)
+
+	if rel.IsList {
+		fmt.Fprintf(b, "\t\tfunc(ctx context.Context, keys []int64, fields []string) (map[int64][]%s, error) {\n", rel.TargetName)
+		fmt.Fprintf(b, "\t\t\tfields = ensureField(fields, %q)\n", remoteCol)
+		fmt.Fprintf(b, "\t\t\tcond := lux.NewIntField(%q).In(keys...)\n", remoteCol)
+		fmt.Fprintf(b, "\t\t\tquery, args := lux.BuildSelectSQL(%q, fields, []lux.Condition{cond}, nil, 0, 0)\n", targetTable)
+		fmt.Fprintf(b, "\t\t\trows, err := pg.QueryRows(ctx, app.DB, %s, query, args...)\n", scanFn)
+		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
+		fmt.Fprintf(b, "\t\t\tresult := make(map[int64][]%s, len(keys))\n", rel.TargetName)
+		fmt.Fprintf(b, "\t\t\tfor _, row := range rows {\n")
+		fmt.Fprintf(b, "\t\t\t\tresult[row.%s] = append(result[row.%s], *row)\n", goRemoteField, goRemoteField)
+		fmt.Fprintf(b, "\t\t\t}\n")
+		fmt.Fprintf(b, "\t\t\treturn result, nil\n")
+		fmt.Fprintf(b, "\t\t},\n")
+	} else {
+		fmt.Fprintf(b, "\t\tfunc(ctx context.Context, keys []int64, fields []string) (map[int64]*%s, error) {\n", rel.TargetName)
+		fmt.Fprintf(b, "\t\t\tfields = ensureField(fields, %q)\n", remoteCol)
+		fmt.Fprintf(b, "\t\t\tcond := lux.NewIntField(%q).In(keys...)\n", remoteCol)
+		fmt.Fprintf(b, "\t\t\tquery, args := lux.BuildSelectSQL(%q, fields, []lux.Condition{cond}, nil, 0, 0)\n", targetTable)
+		fmt.Fprintf(b, "\t\t\trows, err := pg.QueryRows(ctx, app.DB, %s, query, args...)\n", scanFn)
+		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
+		fmt.Fprintf(b, "\t\t\tresult := make(map[int64]*%s, len(keys))\n", rel.TargetName)
+		fmt.Fprintf(b, "\t\t\tfor _, row := range rows {\n")
+		fmt.Fprintf(b, "\t\t\t\tresult[row.%s] = row\n", goRemoteField)
+		fmt.Fprintf(b, "\t\t\t}\n")
+		fmt.Fprintf(b, "\t\t\treturn result, nil\n")
+		fmt.Fprintf(b, "\t\t},\n")
+	}
 }
 
 // loaderTypeName returns the type name for a loader function.

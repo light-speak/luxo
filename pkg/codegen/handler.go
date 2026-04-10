@@ -44,6 +44,16 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 		}
 	}
 
+	// Relation resolvers for models with relations
+	for _, file := range result.Files {
+		for _, m := range file.Models {
+			rels := analyzeRelations(m, enums)
+			if len(rels) > 0 {
+				generateRelationResolver(&b, m, rels)
+			}
+		}
+	}
+
 	// RegisterHandlers function
 	generateRegisterFunc(&b, models)
 
@@ -117,9 +127,33 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 
 	apiName := crudAPIName(name, op)
 
+	rels := analyzeRelations(m, enums)
+	hasRels := len(rels) > 0
+
 	switch op {
 	case "get":
-		fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
+		if hasRels {
+			fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
+	return func(ctx context.Context, req *api.Request) (any, error) {
+		id, err := req.Param%s("id")
+		if err != nil {
+			return nil, err
+		}
+		cols := selection.SQLColumns(req.Select)
+		result, err := app.%s.Where(%sWhere.Id.Eq(id)).Select(cols...).First(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if err := resolve%sRelations(ctx, app, result, req.Select); err != nil {
+			return nil, err
+		}
+		return result, nil
+	}
+}
+
+`, capitalize(apiName), paramMethod(idType), name, name, name)
+		} else {
+			fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
 	return func(ctx context.Context, req *api.Request) (any, error) {
 		id, err := req.Param%s("id")
 		if err != nil {
@@ -131,9 +165,29 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 }
 
 `, capitalize(apiName), paramMethod(idType), name, name)
+		}
 
 	case "list":
-		fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
+		if hasRels {
+			fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
+	return func(ctx context.Context, req *api.Request) (any, error) {
+		cols := selection.SQLColumns(req.Select)
+		results, err := app.%s.Where().Select(cols...).All(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range results {
+			if err := resolve%sRelations(ctx, app, item, req.Select); err != nil {
+				return nil, err
+			}
+		}
+		return results, nil
+	}
+}
+
+`, capitalize(apiName), name, name)
+		} else {
+			fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
 	return func(ctx context.Context, req *api.Request) (any, error) {
 		cols := selection.SQLColumns(req.Select)
 		return app.%s.Where().Select(cols...).All(ctx)
@@ -141,6 +195,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 }
 
 `, capitalize(apiName), name)
+		}
 
 	case "create":
 		generateCreateHandler(b, m, apiName, enums)
@@ -293,6 +348,51 @@ func generateParamSet(b *strings.Builder, f *ast.FieldDecl, setter, indent strin
 		argExpr = f.Type.Name + "(" + varName + ")"
 	}
 	fmt.Fprintf(b, "%sbuilder.%s(%s)\n", indent, setter, argExpr)
+}
+
+// generateRelationResolver generates a resolve<Model>Relations function
+// that loads relation fields via DataLoader based on $select.
+func generateRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relation) {
+	name := m.Name
+	lower := strings.ToLower(name[:1]) + name[1:]
+
+	fmt.Fprintf(b, "// resolve%sRelations loads relation fields for %s based on $select.\n", name, name)
+	fmt.Fprintf(b, "func resolve%sRelations(ctx context.Context, app *App, %s *%s, fields []*selection.Field) error {\n", name, lower, name)
+	fmt.Fprintf(b, "\tif %s == nil {\n\t\treturn nil\n\t}\n", lower)
+
+	for _, rel := range rels {
+		fieldName := rel.FieldName
+		loaderField := loaderFieldName(name, rel)
+		localKey := rel.LocalKey
+
+		// Determine the Go field to read the FK from
+		goLocalKey := capitalize(localKey)
+
+		fmt.Fprintf(b, "\tfor _, f := range fields {\n")
+		fmt.Fprintf(b, "\t\tif f.Name == %q && f.Children != nil {\n", fieldName)
+		fmt.Fprintf(b, "\t\t\tchildCols := selection.SQLColumns(f.Children)\n")
+
+		if rel.IsList {
+			// hasMany: Load returns []TargetType
+			fmt.Fprintf(b, "\t\t\tresult, err := app.loaders.%s.Load(ctx, %s.%s, childCols)\n",
+				loaderField, lower, goLocalKey)
+			fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
+			fmt.Fprintf(b, "\t\t\t%s.%s = result\n", lower, capitalize(fieldName))
+		} else {
+			// belongsTo/hasOne: Load returns *TargetType
+			fmt.Fprintf(b, "\t\t\tresult, err := app.loaders.%s.Load(ctx, %s.%s, childCols)\n",
+				loaderField, lower, goLocalKey)
+			fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
+			fmt.Fprintf(b, "\t\t\t%s.%s = result\n", lower, capitalize(fieldName))
+		}
+
+		fmt.Fprintf(b, "\t\t\tbreak\n")
+		fmt.Fprintf(b, "\t\t}\n")
+		fmt.Fprintf(b, "\t}\n")
+	}
+
+	fmt.Fprintf(b, "\treturn nil\n")
+	fmt.Fprintf(b, "}\n\n")
 }
 
 // crudAPIName returns the API endpoint name for a CRUD operation.
