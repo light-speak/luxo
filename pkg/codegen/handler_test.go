@@ -344,6 +344,40 @@ func TestSkipHandlerFieldRelation(t *testing.T) {
 	}
 }
 
+func TestSkipHandlerFieldInternal(t *testing.T) {
+	f := &ast.FieldDecl{
+		Name:       "secret",
+		Type:       &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{{Name: "internal"}},
+	}
+	if !skipHandlerField(f, nil) {
+		t.Error("@internal field should be skipped")
+	}
+}
+
+func TestSkipHandlerFieldNormal(t *testing.T) {
+	// A normal field with no special directives should NOT be skipped
+	f := &ast.FieldDecl{
+		Name: "name",
+		Type: &ast.TypeRef{Name: "String"},
+	}
+	if skipHandlerField(f, nil) {
+		t.Error("normal field should not be skipped")
+	}
+}
+
+func TestSkipHandlerFieldEnumNotSkipped(t *testing.T) {
+	// Enum fields are NOT relation fields, so should NOT be skipped
+	enums := map[string]bool{"Role": true}
+	f := &ast.FieldDecl{
+		Name: "role",
+		Type: &ast.TypeRef{Name: "Role"},
+	}
+	if skipHandlerField(f, enums) {
+		t.Error("enum field should not be skipped")
+	}
+}
+
 func TestIdGoTypeNoIdField(t *testing.T) {
 	m := testModel("User", nil, []*ast.FieldDecl{
 		testField("name", "String"),
