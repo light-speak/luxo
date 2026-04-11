@@ -157,6 +157,41 @@ func TestChanBusConcurrent(t *testing.T) {
 	}
 }
 
+func TestChanBusHandlerPanicRecovery(t *testing.T) {
+	bus := NewChanBus(10)
+	defer bus.Close()
+
+	var count atomic.Int32
+	done := make(chan struct{})
+
+	bus.On("crash", func(ctx context.Context, payload []byte) {
+		count.Add(1)
+		panic("boom")
+	})
+	bus.On("crash", func(ctx context.Context, payload []byte) {
+		count.Add(1)
+		close(done)
+	})
+
+	bus.Emit(context.Background(), "crash", []byte("{}"))
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timeout — second handler not called after panic")
+	}
+
+	if count.Load() != 2 {
+		t.Errorf("expected 2, got %d", count.Load())
+	}
+}
+
+func TestSafeCall(t *testing.T) {
+	safeCall(func(ctx context.Context, payload []byte) {
+		panic("should not crash")
+	}, context.Background(), nil)
+}
+
 func TestNewChanBusDefaultBufSize(t *testing.T) {
 	bus := NewChanBus(0)
 	if bus.bufSize != 256 {

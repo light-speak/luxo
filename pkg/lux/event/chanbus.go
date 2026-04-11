@@ -89,12 +89,18 @@ func (b *ChanBus) dispatch(name string, ch chan message) {
 			b.mu.RUnlock()
 
 			for _, h := range handlers {
-				h(msg.ctx, msg.payload)
+				safeCall(h, msg.ctx, msg.payload)
 			}
 		case <-b.done:
 			return
 		}
 	}
+}
+
+// safeCall calls handler with panic recovery to prevent one handler from killing the dispatcher.
+func safeCall(h Handler, ctx context.Context, payload []byte) {
+	defer func() { recover() }()
+	h(ctx, payload)
 }
 
 // Close shuts down all dispatchers and channels.

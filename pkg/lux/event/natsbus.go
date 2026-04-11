@@ -36,7 +36,7 @@ func (b *NATSBus) Emit(ctx context.Context, name string, payload []byte) error {
 // On subscribes to a NATS subject. Handler runs in NATS's goroutine pool.
 func (b *NATSBus) On(name string, handler Handler) error {
 	sub, err := b.conn.Subscribe(name, func(msg *nats.Msg) {
-		handler(context.Background(), msg.Data)
+		safeCall(handler, context.Background(), msg.Data)
 	})
 	if err != nil {
 		return fmt.Errorf("nats subscribe: %w", err)
