@@ -8,12 +8,20 @@ import (
 // === Case conversion (used by codegen + runtime) ===
 
 // ToSnakeCase converts camelCase/PascalCase to snake_case.
+// Handles consecutive uppercase (acronyms): "userID" → "user_id", "HTMLParser" → "html_parser".
 func ToSnakeCase(s string) string {
+	runes := []rune(s)
 	var b strings.Builder
 	b.Grow(len(s) + 4)
-	for i, r := range s {
+	for i, r := range runes {
 		if unicode.IsUpper(r) && i > 0 {
-			b.WriteByte('_')
+			prev := runes[i-1]
+			// Insert _ before: lowercase→Upper, or Upper→Upper when next is lowercase (end of acronym)
+			if unicode.IsLower(prev) {
+				b.WriteByte('_')
+			} else if unicode.IsUpper(prev) && i+1 < len(runes) && unicode.IsLower(runes[i+1]) {
+				b.WriteByte('_')
+			}
 		}
 		b.WriteRune(unicode.ToLower(r))
 	}

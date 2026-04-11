@@ -55,9 +55,12 @@ func AddMonths(t time.Time, n int) time.Time {
 	return t.AddDate(0, n, 0)
 }
 
-// DaysBetween returns the number of days between a and b (absolute value).
+// DaysBetween returns the number of calendar days between a and b (absolute value).
+// Normalizes both times to UTC midnight before comparing.
 func DaysBetween(a, b time.Time) int {
-	days := int(b.Sub(a).Hours() / 24)
+	au := time.Date(a.Year(), a.Month(), a.Day(), 0, 0, 0, 0, time.UTC)
+	bu := time.Date(b.Year(), b.Month(), b.Day(), 0, 0, 0, 0, time.UTC)
+	days := int(bu.Sub(au) / (24 * time.Hour))
 	if days < 0 {
 		return -days
 	}
@@ -67,7 +70,8 @@ func DaysBetween(a, b time.Time) int {
 // IsToday reports whether t is today (UTC).
 func IsToday(t time.Time) bool {
 	now := time.Now().UTC()
-	return t.Year() == now.Year() && t.Month() == now.Month() && t.Day() == now.Day()
+	tu := t.UTC()
+	return tu.Year() == now.Year() && tu.Month() == now.Month() && tu.Day() == now.Day()
 }
 
 // IsZero reports whether t is the zero time.

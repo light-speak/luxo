@@ -20,9 +20,9 @@ func ToInt(v any) (int64, error) {
 	case int:
 		return int64(val), nil
 	case float64:
-		return int64(gomath.Round(val)), nil
+		return floatToInt(val)
 	case float32:
-		return int64(gomath.Round(float64(val))), nil
+		return floatToInt(float64(val))
 	case string:
 		return strconv.ParseInt(val, 10, 64)
 	case bool:
@@ -41,6 +41,18 @@ func ToInt(v any) (int64, error) {
 }
 
 // toIntReflect handles less common integer types.
+// floatToInt converts a float64 to int64 with NaN/Inf/overflow guards.
+func floatToInt(f float64) (int64, error) {
+	if gomath.IsNaN(f) || gomath.IsInf(f, 0) {
+		return 0, fmt.Errorf("convert: float %v cannot be converted to int64", f)
+	}
+	r := gomath.Round(f)
+	if r > float64(gomath.MaxInt64) || r < float64(gomath.MinInt64) {
+		return 0, fmt.Errorf("convert: float %v overflows int64", f)
+	}
+	return int64(r), nil
+}
+
 func toIntReflect(v any) (int64, error) {
 	switch val := v.(type) {
 	case int8:
@@ -50,6 +62,9 @@ func toIntReflect(v any) (int64, error) {
 	case int32:
 		return int64(val), nil
 	case uint:
+		if uint64(val) > gomath.MaxInt64 {
+			return 0, fmt.Errorf("convert: uint %d overflows int64", val)
+		}
 		return int64(val), nil
 	case uint8:
 		return int64(val), nil

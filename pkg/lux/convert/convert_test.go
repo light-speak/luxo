@@ -223,6 +223,38 @@ func TestToIntFloat64Rounds(t *testing.T) {
 	}
 }
 
+func TestToIntNaN(t *testing.T) {
+	_, err := ToInt(gomath.NaN())
+	if err == nil {
+		t.Error("expected error for NaN")
+	}
+}
+
+func TestToIntInf(t *testing.T) {
+	_, err := ToInt(gomath.Inf(1))
+	if err == nil {
+		t.Error("expected error for +Inf")
+	}
+	_, err = ToInt(gomath.Inf(-1))
+	if err == nil {
+		t.Error("expected error for -Inf")
+	}
+}
+
+func TestToIntFloat32NaN(t *testing.T) {
+	_, err := ToInt(float32(gomath.NaN()))
+	if err == nil {
+		t.Error("expected error for float32 NaN")
+	}
+}
+
+func TestToIntFloat64Overflow(t *testing.T) {
+	_, err := ToInt(float64(1e19))
+	if err == nil {
+		t.Error("expected error for float64 overflow")
+	}
+}
+
 func TestBoolToString(t *testing.T) {
 	if got := BoolToString(true); got != "true" {
 		t.Errorf("BoolToString(true) = %q, want %q", got, "true")

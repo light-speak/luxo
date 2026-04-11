@@ -42,7 +42,7 @@ func TestGet(t *testing.T) {
 	if resp.StatusCode != 200 || resp.Body != "get ok" {
 		t.Errorf("got %d %q", resp.StatusCode, resp.Body)
 	}
-	if resp.Headers["X-Test"] != "hello" {
+	if resp.Headers.Get("X-Test") != "hello" {
 		t.Error("missing header")
 	}
 }

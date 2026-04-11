@@ -16,7 +16,7 @@ const DefaultTimeout = 10 * time.Second
 type Response struct {
 	StatusCode int
 	Body       string
-	Headers    map[string]string
+	Headers    http.Header
 }
 
 var defaultClient = &http.Client{Timeout: DefaultTimeout}
@@ -64,14 +64,9 @@ func Do(ctx context.Context, method, url string, body string, headers map[string
 		return nil, err
 	}
 
-	respHeaders := make(map[string]string, len(resp.Header))
-	for k := range resp.Header {
-		respHeaders[k] = resp.Header.Get(k)
-	}
-
 	return &Response{
 		StatusCode: resp.StatusCode,
 		Body:       string(respBody),
-		Headers:    respHeaders,
+		Headers:    resp.Header.Clone(),
 	}, nil
 }

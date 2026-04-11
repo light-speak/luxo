@@ -7,9 +7,11 @@ func TestToSnakeCase(t *testing.T) {
 		{"userId", "user_id"},
 		{"createdAt", "created_at"},
 		{"name", "name"},
-		{"ID", "i_d"},
+		{"ID", "id"},
 		{"OrderItem", "order_item"},
-		{"HTMLParser", "h_t_m_l_parser"},
+		{"HTMLParser", "html_parser"},
+		{"userID", "user_id"},
+		{"getHTTPResponse", "get_http_response"},
 		{"", ""},
 		{"a", "a"},
 	}
