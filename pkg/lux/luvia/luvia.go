@@ -163,6 +163,9 @@ func buildGradientLine(line string, rgb func(int, int, int) string) string {
 	if n == 0 {
 		return ""
 	}
+	if n == 1 {
+		return rgb(stops[0].r, stops[0].g, stops[0].b) + line
+	}
 	var sb strings.Builder
 	for i, ch := range line {
 		t := float64(i) / float64(n-1) * float64(len(stops)-1)
