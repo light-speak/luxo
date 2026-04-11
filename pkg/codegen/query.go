@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lux/str"
 )
 
 // luxImport is the import path for the Luxo runtime package.
@@ -14,9 +15,9 @@ const luxImport = "github.com/light-speak/luxo/pkg/lux"
 // Uses runtime generics (lux.Query[T], lux.CreateBase[T], lux.UpdateBase[T])
 // to minimize generated code — only scanner, client, fields, where, and
 // typed Set methods are generated per model.
-func generateQueryBuilder(b *strings.Builder, m *ast.ModelDecl) {
+func generateQueryBuilder(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
 	name := m.Name
-	tableName := toSnakeCase(name) + "s" // simple pluralize
+	tableName := str.ToSnakeCase(name) + "s" // simple pluralize
 	soft := isSoftDelete(m)
 
 	// @soft: ensure deletedAt field exists for scanner/struct generation
@@ -25,13 +26,21 @@ func generateQueryBuilder(b *strings.Builder, m *ast.ModelDecl) {
 		fields = append(append([]*ast.FieldDecl{}, m.Fields...), softDeleteField())
 	}
 
-	generateScanner(b, &ast.ModelDecl{Name: m.Name, Fields: fields, Directives: m.Directives})
-	generateClient(b, name, tableName, fields, soft)
-	generateFieldConstants(b, name, fields)
-	generateWhereFields(b, name, fields)
-	generateCreateBuilder(b, name, fields)
-	generateCreateManyBuilder(b, name, fields)
-	generateUpdateBuilder(b, name, fields)
+	// Filter out relation fields — they're not DB columns
+	var dbFields []*ast.FieldDecl
+	for _, f := range fields {
+		if !isRelationField(f, enums) {
+			dbFields = append(dbFields, f)
+		}
+	}
+
+	generateScanner(b, &ast.ModelDecl{Name: m.Name, Fields: dbFields, Directives: m.Directives})
+	generateClient(b, name, tableName, dbFields, soft)
+	generateFieldConstants(b, name, dbFields)
+	generateWhereFields(b, name, dbFields)
+	generateCreateBuilder(b, name, dbFields)
+	generateCreateManyBuilder(b, name, dbFields)
+	generateUpdateBuilder(b, name, dbFields)
 }
 
 // --- Client ---
@@ -134,15 +143,15 @@ func generateFieldConstants(b *strings.Builder, name string, fields []*ast.Field
 		if f.Computed != nil {
 			continue
 		}
-		fmt.Fprintf(b, "\t%s string\n", capitalize(f.Name))
+		fmt.Fprintf(b, "\t%s string\n", str.Capitalize(f.Name))
 	}
 	b.WriteString("}{\n")
 	for _, f := range fields {
 		if f.Computed != nil {
 			continue
 		}
-		col := toSnakeCase(f.Name)
-		fmt.Fprintf(b, "\t%s: %q,\n", capitalize(f.Name), col)
+		col := str.ToSnakeCase(f.Name)
+		fmt.Fprintf(b, "\t%s: %q,\n", str.Capitalize(f.Name), col)
 	}
 	b.WriteString("}\n\n")
 }
@@ -156,7 +165,7 @@ func generateWhereFields(b *strings.Builder, name string, fields []*ast.FieldDec
 		if f.Computed != nil {
 			continue
 		}
-		goFieldName := capitalize(f.Name)
+		goFieldName := str.Capitalize(f.Name)
 		condType := fieldConditionType(f.Type)
 		fmt.Fprintf(b, "\t%s lux.%s\n", goFieldName, condType)
 	}
@@ -165,9 +174,9 @@ func generateWhereFields(b *strings.Builder, name string, fields []*ast.FieldDec
 		if f.Computed != nil {
 			continue
 		}
-		col := toSnakeCase(f.Name)
+		col := str.ToSnakeCase(f.Name)
 		condType := fieldConditionType(f.Type)
-		fmt.Fprintf(b, "\t%s: lux.New%s(%q),\n", capitalize(f.Name), condType, col)
+		fmt.Fprintf(b, "\t%s: lux.New%s(%q),\n", str.Capitalize(f.Name), condType, col)
 	}
 	b.WriteString("}\n\n")
 }
@@ -205,7 +214,7 @@ func collectAutoFills(fields []*ast.FieldDecl) []string {
 		if f.Computed != nil || f.Type == nil {
 			continue
 		}
-		col := toSnakeCase(f.Name)
+		col := str.ToSnakeCase(f.Name)
 		if hasDirective(f.Directives, "auto") && f.Type.Name == "UUID" {
 			fills = append(fills, fmt.Sprintf("\tb.Set(%q, uuid.Must(uuid.NewV7()))\n", col))
 		}
@@ -229,9 +238,9 @@ type %sCreateBuilder struct {
 		if f.Computed != nil || hasDirective(f.Directives, "internal") || isAutoManaged(f) {
 			continue
 		}
-		goFieldName := capitalize(f.Name)
+		goFieldName := str.Capitalize(f.Name)
 		goType := resolveGoType(f.Type)
-		col := toSnakeCase(f.Name)
+		col := str.ToSnakeCase(f.Name)
 		fmt.Fprintf(b, "func (b *%sCreateBuilder) Set%s(v %s) *%sCreateBuilder {\n", name, goFieldName, goType, name)
 		fmt.Fprintf(b, "\tb.Set(%q, v)\n", col)
 		fmt.Fprintf(b, "\treturn b\n")
@@ -264,7 +273,7 @@ func collectAutoCols(fields []*ast.FieldDecl) []autoCol {
 		if f.Computed != nil || f.Type == nil {
 			continue
 		}
-		col := toSnakeCase(f.Name)
+		col := str.ToSnakeCase(f.Name)
 		if hasDirective(f.Directives, "auto") && f.Type.Name == "UUID" {
 			result = append(result, autoCol{col, "uuid.Must(uuid.NewV7())"})
 		}
@@ -275,7 +284,7 @@ func collectAutoCols(fields []*ast.FieldDecl) []autoCol {
 	return result
 }
 
-// collectUserFields returns fields that are user-provided (not computed, not internal, not auto-managed).
+// collectUserFields returns fields that are user-provided (not computed, not internal, not auto-managed, not relation).
 func collectUserFields(fields []*ast.FieldDecl) []*ast.FieldDecl {
 	var result []*ast.FieldDecl
 	for _, f := range fields {
@@ -294,7 +303,7 @@ func buildCreateManyColumns(userFields []*ast.FieldDecl, autoCols []autoCol) (co
 		if i > 0 {
 			allCols.WriteString(", ")
 		}
-		fmt.Fprintf(&allCols, "%q", toSnakeCase(f.Name))
+		fmt.Fprintf(&allCols, "%q", str.ToSnakeCase(f.Name))
 	}
 	for _, ac := range autoCols {
 		allCols.WriteString(", ")
@@ -303,7 +312,7 @@ func buildCreateManyColumns(userFields []*ast.FieldDecl, autoCols []autoCol) (co
 
 	var valsExtract strings.Builder
 	for _, f := range userFields {
-		fmt.Fprintf(&valsExtract, "r.%s, ", capitalize(f.Name))
+		fmt.Fprintf(&valsExtract, "r.%s, ", str.Capitalize(f.Name))
 	}
 	for _, ac := range autoCols {
 		fmt.Fprintf(&valsExtract, "%s, ", ac.expr)
@@ -318,7 +327,7 @@ func generateCreateManyBuilder(b *strings.Builder, name string, fields []*ast.Fi
 	var structFields strings.Builder
 	for _, f := range userFields {
 		goType := resolveGoType(f.Type)
-		fmt.Fprintf(&structFields, "\t%s %s\n", capitalize(f.Name), goType)
+		fmt.Fprintf(&structFields, "\t%s %s\n", str.Capitalize(f.Name), goType)
 	}
 
 	colsStr, valsStr := buildCreateManyColumns(userFields, autoCols)
@@ -397,7 +406,7 @@ func new%sUpdateBuilder(db *pg.DB, table string, id %s) *%sUpdateBuilder {
 
 `, name, name, idType, name, name, name, idType, scanFn)
 
-	// Generate Set methods — skip auto-managed, @immutable, @internal, computed
+	// Generate Set methods — skip auto-managed, @immutable, @internal, computed, relation
 	for _, f := range fields {
 		if f.Computed != nil || isAutoManaged(f) {
 			continue
@@ -405,9 +414,9 @@ func new%sUpdateBuilder(db *pg.DB, table string, id %s) *%sUpdateBuilder {
 		if hasDirective(f.Directives, "immutable") || hasDirective(f.Directives, "internal") {
 			continue
 		}
-		goFieldName := capitalize(f.Name)
+		goFieldName := str.Capitalize(f.Name)
 		goType := resolveGoType(f.Type)
-		col := toSnakeCase(f.Name)
+		col := str.ToSnakeCase(f.Name)
 		fmt.Fprintf(b, "func (b *%sUpdateBuilder) Set%s(v %s) *%sUpdateBuilder {\n", name, goFieldName, goType, name)
 		fmt.Fprintf(b, "\tb.Set(%q, v)\n", col)
 		fmt.Fprintf(b, "\treturn b\n")

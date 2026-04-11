@@ -23,7 +23,7 @@ Commands / 命令:
   init <project>     Create a new project / 创建新项目
   add <module>       Add a service module / 添加服务模块
   gen                Generate Go code / 生成 Go 代码
-  run                Start dev server / 启动开发服务器
+  run                Start server / 启动服务
   deploy <target>    Generate deploy files / 生成部署文件`,
 	SilenceUsage:  true,
 	SilenceErrors: true,

@@ -289,21 +289,21 @@ Luxo 不只是代码更短 — 它是 **AI 写后端最可靠的语言**。
 - [x] LSP 服务器（诊断、补全、悬停、跳转定义、引用查找）
 - [x] VS Code 扩展（语法高亮、LSP 集成）
 
-### Phase 2 — 代码生成 + 运行时（进行中）
-- [x] 代码生成（model struct · enum · 自对齐输出）
-- [x] 类型安全查询构建器（pgx，零反射 scanner，字段选择 → SQL）
-- [x] App 入口聚合（自动汇聚所有 Client，`New()` 从环境变量初始化）
-- [x] 事务支持（`app.Tx()` 提交/回滚/panic 恢复）
-- [x] @soft 软删除（SoftDelete/ForceDelete/Restore/WithDeleted）
-- [x] Dotenv 运行时（`pkg/lux/env`，零依赖，系统环境变量优先）
-- [x] 项目骨架生成（`luxo init` + `luxo add` + 项目结构）
-- [x] @withAuth 简化（JWT 配置走 .env，stores 编译期确定）
-- [ ] @native resolver AST 合并（更新签名、保留方法体、零标记注释）
-- [ ] API handler 生成（请求路由、字段选择、响应序列化）
-- [ ] 自动 CRUD 生成
-- [ ] JSON 传输 + 字段选择（端到端贯穿）
-- [ ] 认证运行时（JWT 签发/验证、`my` 关键字解析）
-- [ ] 迁移引擎（声明式 diff · 安全回滚）
+### Phase 2 — 代码生成 + 运行时 ✅
+- [x] 代码生成（model · db · app · handler · dataloader · native · entry — 7 个 gen 文件）
+- [x] 类型安全查询构建器（pgx，零反射 scanner，`$select` → SQL）
+- [x] CRUD handler 生成（`@crud` → get/list/create/update/delete）
+- [x] DataLoader 运行时（2ms 批量窗口、字段合并、`@soft` 过滤）
+- [x] 关联自动解析（`$select` 嵌套字段 → DataLoader → SQL）
+- [x] `@hash` bcrypt 自动加盐，`VerifyPassword` 登录验证
+- [x] `@hidden` 默认 SELECT 排除（API 响应不含 password）
+- [x] `@by` 关联注解 + 自动推断（belongsTo/hasMany/hasOne）
+- [x] 迁移引擎（声明式 diff · 改名检测 · 安全警告 · `--dry-run`）
+- [x] 并发锁 + 校验和验证 + `CREATE INDEX CONCURRENTLY` 自动拆分
+- [x] 认证运行时（JWT 签发/验证/刷新、Luvia `AuthMiddleware`、`Identity(ctx)`）
+- [x] 标准库（str · slice · math · datetime · crypto · jsonutil · httputil · convert）
+- [x] 项目骨架（`luxo init` + `luxo add` + `luxo gen` + `luxo run`）
+- [x] Dialect 接口可插拔（PG 已实现，MySQL 占位）
 - [ ] 部署生成（`luxo deploy compose` / `luxo deploy helm`）
 
 ### Phase 3 — 多服务 + Binary

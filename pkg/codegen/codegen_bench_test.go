@@ -68,6 +68,6 @@ func BenchmarkGenerateModelFile(b *testing.B) {
 	result := buildBenchResult()
 	b.ResetTimer()
 	for b.Loop() {
-		generateModelFile(result, "gen")
+		generateModelFile(result, "gen", nil)
 	}
 }

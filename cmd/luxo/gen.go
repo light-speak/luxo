@@ -9,6 +9,7 @@ import (
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/codegen"
 	"github.com/light-speak/luxo/pkg/lexer"
+	"github.com/light-speak/luxo/pkg/lockfile"
 	"github.com/light-speak/luxo/pkg/parser"
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/spf13/cobra"
@@ -16,7 +17,7 @@ import (
 
 var genCmd = &cobra.Command{
 	Use:   "gen",
-	Short: "Generate Go code from .luxo schemas / 从 .luxo 生成 Go 代码",
+	Short: "Generate Go code from origin/*.luxo / 从 origin/*.luxo 生成 Go 代码",
 	Long: `Parse all .luxo files in origin/ and generate Go code for each service module.
 解析 origin/ 下的所有 .luxo 文件，为每个服务模块生成 Go 代码。
 
@@ -37,73 +38,157 @@ func init() {
 }
 
 func runGen(cmd *cobra.Command, args []string) error {
-	// Find all .luxo files
+	schemaFiles, err := findSchemaFiles()
+	if err != nil {
+		return err
+	}
+
+	files, err := parseAllFiles(schemaFiles)
+	if err != nil {
+		return err
+	}
+
+	result, err := analyzeFiles(files)
+	if err != nil {
+		return err
+	}
+
+	if err := updateLockFile(files); err != nil {
+		return err
+	}
+
+	totalFiles, err := generateModules(files, result)
+	if err != nil {
+		return err
+	}
+
+	// Generate embedded entry point: luxis/app/main.gen.go
+	modulePath, _ := readModulePath()
+	if modulePath != "" {
+		if err := generateEntry(result, modulePath); err != nil {
+			return err
+		}
+		totalFiles++
+	}
+
+	green := "\033[32m"
+	dim := "\033[2m"
+	bold := "\033[1m"
+	reset := "\033[0m"
+	fmt.Printf("\n%s%s✓ %d file(s) generated from %d origin(s)%s\n", bold, green, totalFiles, len(schemaFiles), reset)
+	fmt.Printf("  %s%d 个 origin 生成了 %d 个文件%s\n\n", dim, len(schemaFiles), totalFiles, reset)
+	return nil
+}
+
+func findSchemaFiles() ([]string, error) {
 	entries, err := os.ReadDir("origin")
 	if err != nil {
-		return fmt.Errorf("read origin/: %w\n读取 origin/ 失败: %w", err, err)
+		return nil, fmt.Errorf("read origin/: %w\n读取 origin/ 失败: %w", err, err)
 	}
-
-	var schemaFiles []string
+	var files []string
 	for _, e := range entries {
 		if !e.IsDir() && strings.HasSuffix(e.Name(), ".luxo") {
-			schemaFiles = append(schemaFiles, filepath.Join("origin", e.Name()))
+			files = append(files, filepath.Join("origin", e.Name()))
 		}
 	}
-
-	if len(schemaFiles) == 0 {
-		return fmt.Errorf("no .luxo files found in origin/\norigin/ 下没有 .luxo 文件")
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no .luxo files found in origin/\norigin/ 下没有 .luxo 文件")
 	}
+	return files, nil
+}
 
-	// Parse all files
+func parseAllFiles(paths []string) ([]*ast.File, error) {
 	var files []*ast.File
-	for _, path := range schemaFiles {
+	for _, path := range paths {
 		file, err := parseFile(path)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		files = append(files, file)
 	}
+	return files, nil
+}
 
-	// Semantic analysis
+func analyzeFiles(files []*ast.File) (*semantic.Result, error) {
 	a := semantic.New()
 	result := a.Analyze(files)
-
 	if len(result.Errors) > 0 {
 		for _, e := range result.Errors {
 			fmt.Fprintf(os.Stderr, "error: %s:%d: %s\n", e.Pos.File, e.Pos.Line, e.Message)
 		}
-		return fmt.Errorf("%d error(s) / %d 个错误", len(result.Errors), len(result.Errors))
+		return nil, fmt.Errorf("%d error(s) / %d 个错误", len(result.Errors), len(result.Errors))
 	}
-
 	for _, w := range result.Warnings {
 		fmt.Fprintf(os.Stderr, "warning: %s:%d: %s\n", w.Pos.File, w.Pos.Line, w.Message)
 	}
+	return result, nil
+}
 
-	// Generate code per module
-	totalFiles := 0
+func updateLockFile(files []*ast.File) error {
+	green := "\033[32m"
+	reset := "\033[0m"
+	lf, err := lockfile.Load("luxo.lock")
+	if err != nil {
+		return fmt.Errorf("load luxo.lock: %w\n加载 luxo.lock 失败: %w", err, err)
+	}
+	lf.Update(files)
+	if err := lf.Save("luxo.lock"); err != nil {
+		return fmt.Errorf("save luxo.lock: %w\n保存 luxo.lock 失败: %w", err, err)
+	}
+	fmt.Printf("  %s✓%s luxo.lock\n", green, reset)
+	return nil
+}
+
+func generateModules(files []*ast.File, result *semantic.Result) (int, error) {
+	green := "\033[32m"
+	reset := "\033[0m"
+
+	// Collect @soft model names across ALL modules (for cross-module DataLoader filtering)
+	softModels := make(map[string]bool)
+	for _, file := range files {
+		for _, m := range file.Models {
+			if codegen.IsSoftDelete(m) {
+				softModels[m.Name] = true
+			}
+		}
+	}
+	total := 0
 	for _, file := range files {
 		moduleName := strings.TrimSuffix(filepath.Base(file.Name), ".luxo")
 		outDir := filepath.Join("service", moduleName, "luxo")
-
 		if err := os.MkdirAll(outDir, 0755); err != nil {
-			return fmt.Errorf("create %s: %w", outDir, err)
+			return 0, fmt.Errorf("create %s: %w", outDir, err)
 		}
-
 		singleResult := &semantic.Result{Files: []*ast.File{file}}
-		gr := codegen.Generate(singleResult, "luxo")
-
+		gr := codegen.Generate(singleResult, "luxo", softModels)
 		for name, src := range gr.Files {
 			outPath := filepath.Join(outDir, name)
 			if err := os.WriteFile(outPath, src, 0644); err != nil {
-				return fmt.Errorf("write %s: %w", outPath, err)
+				return 0, fmt.Errorf("write %s: %w", outPath, err)
 			}
-			fmt.Printf("  generated %s\n", outPath)
-			totalFiles++
+			fmt.Printf("  %s+%s %s\n", green, reset, outPath)
+			total++
 		}
 	}
+	return total, nil
+}
 
-	fmt.Printf("\n%d file(s) generated from %d schema(s)\n", totalFiles, len(schemaFiles))
-	fmt.Printf("从 %d 个 schema 生成了 %d 个文件\n", len(schemaFiles), totalFiles)
+func generateEntry(result *semantic.Result, modulePath string) error {
+	green := "\033[32m"
+	reset := "\033[0m"
+	src := codegen.GenerateEntryFile(result, modulePath)
+	if src == nil {
+		return nil
+	}
+	outDir := filepath.Join("luxis", "app")
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		return fmt.Errorf("create %s: %w", outDir, err)
+	}
+	outPath := filepath.Join(outDir, "main.gen.go")
+	if err := os.WriteFile(outPath, src, 0644); err != nil {
+		return fmt.Errorf("write %s: %w", outPath, err)
+	}
+	fmt.Printf("  %s+%s %s\n", green, reset, outPath)
 	return nil
 }
 

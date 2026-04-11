@@ -14,29 +14,54 @@ type GenerateResult struct {
 }
 
 // Generate produces Go source files from semantic analysis result.
-func Generate(result *semantic.Result, packageName string) *GenerateResult {
+func Generate(result *semantic.Result, packageName string, softModels ...map[string]bool) *GenerateResult {
 	gr := &GenerateResult{
 		Files: make(map[string][]byte),
 	}
+	enums := collectEnums(result)
 
-	// model.gen.go — enums + model structs
-	gr.Files["model.gen.go"] = generateModelFile(result, packageName)
+	gr.Files["model.gen.go"] = generateModelFile(result, packageName, enums)
 
-	// db.gen.go — query builders (Client, Query, Where, Create, Update)
-	if dbSrc := generateDBFile(result, packageName); dbSrc != nil {
+	if dbSrc := generateDBFile(result, packageName, enums); dbSrc != nil {
 		gr.Files["db.gen.go"] = dbSrc
 	}
-
-	// app.gen.go — App struct wiring all Clients
-	if appSrc := generateAppFile(result, packageName); appSrc != nil {
+	if appSrc := generateAppFile(result, packageName, enums); appSrc != nil {
 		gr.Files["app.gen.go"] = appSrc
+	}
+	var soft map[string]bool
+	if len(softModels) > 0 {
+		soft = softModels[0]
+	}
+	if dlSrc := generateDataLoaderFile(result, packageName, enums, soft); dlSrc != nil {
+		gr.Files["dataloader.gen.go"] = dlSrc
+	}
+	if handlerSrc := generateHandlerFile(result, packageName, enums); handlerSrc != nil {
+		gr.Files["handler.gen.go"] = handlerSrc
+	}
+	if nativeSrc := GenerateNativeFile(result, packageName); nativeSrc != nil {
+		gr.Files["native.gen.go"] = nativeSrc
+	}
+
+	// event.gen.go — typed event structs + emit functions + listener registration
+	if eventSrc := generateEventFile(result, packageName); eventSrc != nil {
+		gr.Files["event.gen.go"] = eventSrc
+	}
+
+	// error.gen.go — typed error constructors
+	if errorSrc := generateErrorFile(result, packageName); errorSrc != nil {
+		gr.Files["error.gen.go"] = errorSrc
+	}
+
+	// writejson.gen.go — per-model WriteJSON for single-pass field-filtered serialization
+	if wjSrc := generateWriteJSONFile(result, packageName, enums); wjSrc != nil {
+		gr.Files["writejson.gen.go"] = wjSrc
 	}
 
 	return gr
 }
 
 // generateModelFile produces the model.gen.go file containing enums and structs.
-func generateModelFile(result *semantic.Result, packageName string) []byte {
+func generateModelFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
 	var b strings.Builder
 
 	writeHeader(&b, packageName, "model.gen.go")
@@ -50,10 +75,28 @@ func generateModelFile(result *semantic.Result, packageName string) []byte {
 		}
 	}
 
+	modelNames := make(map[string]bool)
+	for _, file := range result.Files {
+		for _, m := range file.Models {
+			modelNames[m.Name] = true
+		}
+	}
+
+	// extend stubs — generate minimal structs for external types
+	for _, file := range result.Files {
+		for _, ext := range file.Extends {
+			if modelNames[ext.Name] {
+				continue // already defined as a full model in this file
+			}
+			generateExtendStub(&b, ext)
+			b.WriteByte('\n')
+		}
+	}
+
 	// model structs
 	for _, file := range result.Files {
 		for _, m := range file.Models {
-			generateModel(&b, m)
+			generateModel(&b, m, enums)
 			b.WriteByte('\n')
 		}
 	}
@@ -122,7 +165,7 @@ func writeImports(b *strings.Builder, files []*ast.File) {
 
 // generateDBFile produces the db.gen.go file containing query builders.
 // Returns nil if there are no models.
-func generateDBFile(result *semantic.Result, packageName string) []byte {
+func generateDBFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
 	hasModels := false
 	for _, file := range result.Files {
 		if len(file.Models) > 0 {
@@ -139,9 +182,28 @@ func generateDBFile(result *semantic.Result, packageName string) []byte {
 	writeHeader(&b, packageName, "db.gen.go")
 	writeDBImports(&b, result.Files)
 
+	// Collect model names to skip generating scanners for models that already exist
+	modelNames := make(map[string]bool)
 	for _, file := range result.Files {
 		for _, m := range file.Models {
-			generateQueryBuilder(&b, m)
+			modelNames[m.Name] = true
+		}
+	}
+
+	// Generate scanners for extend stubs (needed by DataLoader batch functions)
+	for _, file := range result.Files {
+		for _, ext := range file.Extends {
+			if modelNames[ext.Name] {
+				continue // full model exists, has its own scanner
+			}
+			generateScanner(&b, &ast.ModelDecl{Name: ext.Name, Fields: ext.Fields})
+			b.WriteByte('\n')
+		}
+	}
+
+	for _, file := range result.Files {
+		for _, m := range file.Models {
+			generateQueryBuilder(&b, m, enums)
 			b.WriteByte('\n')
 		}
 	}
@@ -191,7 +253,7 @@ func scanDBFieldImports(f *ast.FieldDecl, needs *dbImportNeeds) {
 
 // generateAppFile produces app.gen.go containing the App struct that wires all Clients.
 // Returns nil if there are no models.
-func generateAppFile(result *semantic.Result, packageName string) []byte {
+func generateAppFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
 	var models []string
 	for _, file := range result.Files {
 		for _, m := range file.Models {
@@ -212,6 +274,17 @@ func generateAppFile(result *semantic.Result, packageName string) []byte {
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/pg\"\n")
 	b.WriteString(")\n\n")
 
+	// Check if any model has relations (needs loaders field)
+	hasRelations := false
+	for _, file := range result.Files {
+		for _, m := range file.Models {
+			if len(analyzeRelations(m, enums)) > 0 {
+				hasRelations = true
+				break
+			}
+		}
+	}
+
 	// App struct
 	b.WriteString("// App is the entry point for all database operations.\n")
 	b.WriteString("type App struct {\n")
@@ -219,21 +292,37 @@ func generateAppFile(result *semantic.Result, packageName string) []byte {
 	for _, name := range models {
 		fmt.Fprintf(&b, "\t%s *%sClient\n", name, name)
 	}
+	if hasRelations {
+		b.WriteString("\tloaders Loaders\n")
+	}
 	b.WriteString("}\n\n")
 
 	// New function
-	b.WriteString("// New creates an App by reading DATABASE_URL from the environment.\n")
+	b.WriteString("// New creates an App by reading DATABASE_* config from the environment.\n")
 	b.WriteString("// Call env.Load(\".env\") before New() if using a .env file.\n")
 	b.WriteString("func New(ctx context.Context) (*App, error) {\n")
-	b.WriteString("\turl, ok := env.Get(\"DATABASE_URL\")\n")
-	b.WriteString("\tif !ok {\n")
-	b.WriteString("\t\treturn nil, fmt.Errorf(\"luxo: DATABASE_URL is not set\")\n")
-	b.WriteString("\t}\n")
+	b.WriteString("\turl := buildDatabaseURL()\n")
 	b.WriteString("\tdb, err := pg.NewDB(ctx, url)\n")
 	b.WriteString("\tif err != nil {\n")
 	b.WriteString("\t\treturn nil, fmt.Errorf(\"luxo: connect to database: %w\", err)\n")
 	b.WriteString("\t}\n")
 	b.WriteString("\treturn NewFromDB(db), nil\n")
+	b.WriteString("}\n\n")
+
+	// buildDatabaseURL helper
+	b.WriteString("func buildDatabaseURL() string {\n")
+	b.WriteString("\thost, _ := env.Get(\"DATABASE_HOST\")\n")
+	b.WriteString("\tif host == \"\" { host = \"localhost\" }\n")
+	b.WriteString("\tport, _ := env.Get(\"DATABASE_PORT\")\n")
+	b.WriteString("\tif port == \"\" { port = \"5432\" }\n")
+	b.WriteString("\tuser, _ := env.Get(\"DATABASE_USER\")\n")
+	b.WriteString("\tif user == \"\" { user = \"postgres\" }\n")
+	b.WriteString("\tpass, _ := env.Get(\"DATABASE_PASSWORD\")\n")
+	b.WriteString("\tssl, _ := env.Get(\"DATABASE_SSL\")\n")
+	b.WriteString("\tif ssl == \"\" { ssl = \"disable\" }\n")
+	b.WriteString("\tprefix, _ := env.Get(\"DATABASE_PREFIX\")\n")
+	b.WriteString("\tif prefix == \"\" { prefix = \"luxo\" }\n")
+	b.WriteString("\treturn fmt.Sprintf(\"postgres://%s:%s@%s:%s/%s?sslmode=%s\", user, pass, host, port, prefix, ssl)\n")
 	b.WriteString("}\n\n")
 
 	// NewFromDB function

@@ -290,21 +290,21 @@ Same task in TypeScript? 150+ lines, 4 packages, no compile-time safety.
 - [x] LSP Server (diagnostics, completion, hover, go-to-definition, references)
 - [x] VS Code Extension (syntax highlighting, LSP integration)
 
-### Phase 2 — Codegen + Runtime (in progress)
-- [x] Code generation (model structs · enums · self-aligned output)
-- [x] Type-safe query builder (pgx, zero-reflection scanner, field selection → SQL)
-- [x] App wiring (auto-aggregate all Clients, `New()` from env)
-- [x] Transaction support (`app.Tx()` with commit/rollback/panic-recovery)
-- [x] @soft directive (soft delete — SoftDelete/ForceDelete/Restore/WithDeleted)
-- [x] Dotenv runtime (`pkg/lux/env`, zero deps, system env priority)
-- [x] Project scaffold (`luxo init` + `luxo add` + project structure)
-- [x] @withAuth simplified (JWT config via .env, stores at compile time)
-- [ ] @native resolver AST merge (update signatures, preserve body, zero comment markers)
-- [ ] API handler generation (request routing, field selection, response serialization)
-- [ ] Auto CRUD generation
-- [ ] JSON transport + field selection (end to end)
-- [ ] Auth runtime (JWT sign/verify, `my` keyword resolution)
-- [ ] Migration engine (declarative diff · safe rollback)
+### Phase 2 — Codegen + Runtime ✅
+- [x] Code generation (model · db · app · handler · dataloader · native · entry — 7 gen files)
+- [x] Type-safe query builder (pgx, zero-reflection scanner, `$select` → SQL)
+- [x] CRUD handler generation (`@crud` → get/list/create/update/delete)
+- [x] DataLoader runtime (2ms batch window, field merging, `@soft` filtering)
+- [x] Relation auto-resolve (`$select` nested fields → DataLoader → SQL)
+- [x] `@hash` bcrypt auto-hash on create/update, `VerifyPassword` for login
+- [x] `@hidden` excluded from default SELECT (no password in API responses)
+- [x] `@by` relation directive + auto-inference (belongsTo/hasMany/hasOne)
+- [x] Migration engine (declarative diff · rename detection · safety warnings · `--dry-run`)
+- [x] Advisory lock + checksum verification + `CREATE INDEX CONCURRENTLY` auto-split
+- [x] Auth runtime (JWT sign/verify/refresh, Luvia `AuthMiddleware`, `Identity(ctx)`)
+- [x] Standard library (str · slice · math · datetime · crypto · jsonutil · httputil · convert)
+- [x] Project scaffold (`luxo init` + `luxo add` + `luxo gen` + `luxo run`)
+- [x] Dialect interface (PG implemented, MySQL placeholder)
 - [ ] Deploy generation (`luxo deploy compose` / `luxo deploy helm`)
 
 ### Phase 3 — Multi-service + Binary

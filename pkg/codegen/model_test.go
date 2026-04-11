@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lux/str"
 	"github.com/light-speak/luxo/pkg/token"
 )
 
@@ -97,7 +98,7 @@ func TestGenerateModel(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var b strings.Builder
-			generateModel(&b, tt.model)
+			generateModel(&b, tt.model, map[string]bool{"Status": true, "Role": true})
 			got := b.String()
 			for _, check := range tt.checks {
 				if !strings.Contains(got, check) {
@@ -172,9 +173,9 @@ func TestToSnakeCase(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			got := toSnakeCase(tt.input)
+			got := str.ToSnakeCase(tt.input)
 			if got != tt.expect {
-				t.Errorf("toSnakeCase(%q) = %q, want %q", tt.input, got, tt.expect)
+				t.Errorf("str.ToSnakeCase(%q) = %q, want %q", tt.input, got, tt.expect)
 			}
 		})
 	}
@@ -192,9 +193,9 @@ func TestCapitalize(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			got := capitalize(tt.input)
+			got := str.Capitalize(tt.input)
 			if got != tt.expect {
-				t.Errorf("capitalize(%q) = %q, want %q", tt.input, got, tt.expect)
+				t.Errorf("str.Capitalize(%q) = %q, want %q", tt.input, got, tt.expect)
 			}
 		})
 	}
@@ -254,7 +255,7 @@ func TestGenerateModelWithSoftDelete(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateModel(&b, m)
+	generateModel(&b, m, nil)
 	got := b.String()
 
 	if !strings.Contains(got, "DeletedAt") {
@@ -276,13 +277,132 @@ func TestGenerateModelSoftDeleteExistingField(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateModel(&b, m)
+	generateModel(&b, m, nil)
 	got := b.String()
 
 	// Should NOT duplicate DeletedAt
 	count := strings.Count(got, "DeletedAt")
 	if count != 1 {
 		t.Errorf("DeletedAt should appear once, got %d:\n%s", count, got)
+	}
+}
+
+func TestGenerateModelRelationPointer(t *testing.T) {
+	// Single model reference should use pointer type
+	m := &ast.ModelDecl{
+		Name: "Post",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "user", Type: &ast.TypeRef{Name: "User"}},
+		},
+	}
+
+	var b strings.Builder
+	generateModel(&b, m, nil) // no enums, so User is a relation
+	got := b.String()
+
+	// Single relation should use *User pointer
+	if !strings.Contains(got, "*User") {
+		t.Errorf("single relation should use pointer type:\n%s", got)
+	}
+	// Relation field should have json tag only, no db tag
+	if !strings.Contains(got, "`json:\"user\"`") {
+		t.Errorf("relation field should have json-only tag:\n%s", got)
+	}
+}
+
+func TestGenerateModelNullableRelationPointer(t *testing.T) {
+	// Nullable single relation: user: User? → should be *User, NOT **User
+	m := &ast.ModelDecl{
+		Name: "Post",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "userId", Type: &ast.TypeRef{Name: "Int", Nullable: true}},
+			{Name: "user", Type: &ast.TypeRef{Name: "User", Nullable: true}},
+		},
+	}
+
+	var b strings.Builder
+	generateModel(&b, m, nil)
+	got := b.String()
+
+	// Should be *User, not **User
+	if strings.Contains(got, "**User") {
+		t.Errorf("nullable relation should be *User, not **User:\n%s", got)
+	}
+	if !strings.Contains(got, "*User") {
+		t.Errorf("nullable relation should use *User pointer:\n%s", got)
+	}
+}
+
+func TestGenerateModelRelationList(t *testing.T) {
+	// List relation field
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+		},
+	}
+
+	var b strings.Builder
+	generateModel(&b, m, nil)
+	got := b.String()
+
+	// List relation should use []Post (not pointer)
+	if !strings.Contains(got, "[]Post") {
+		t.Errorf("list relation should use slice type:\n%s", got)
+	}
+	// Should have json-only tag (db:"-" → json only)
+	if !strings.Contains(got, "`json:\"posts\"`") {
+		t.Errorf("list relation should have json-only tag:\n%s", got)
+	}
+}
+
+func TestGenerateExtendStub(t *testing.T) {
+	ext := &ast.ExtendDecl{
+		Name: "ExternalUser",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}
+
+	var b strings.Builder
+	generateExtendStub(&b, ext)
+	got := b.String()
+
+	if !strings.Contains(got, "type ExternalUser struct") {
+		t.Errorf("missing struct declaration:\n%s", got)
+	}
+	if !strings.Contains(got, `db:"id"`) {
+		t.Errorf("missing db tag:\n%s", got)
+	}
+	if !strings.Contains(got, `json:"email"`) {
+		t.Errorf("missing json tag:\n%s", got)
+	}
+	if !strings.Contains(got, "stub for the external ExternalUser model") {
+		t.Errorf("missing doc comment:\n%s", got)
+	}
+}
+
+func TestGenerateExtendStubWithComputed(t *testing.T) {
+	ext := &ast.ExtendDecl{
+		Name: "ExternalUser",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "computed", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{}},
+		},
+	}
+
+	var b strings.Builder
+	generateExtendStub(&b, ext)
+	got := b.String()
+
+	// Computed field should be skipped
+	if strings.Contains(got, "Computed") {
+		t.Errorf("computed field should be skipped:\n%s", got)
 	}
 }
 

@@ -1,0 +1,13 @@
+coverage:
+  status:
+    project:
+      default:
+        target: 98%
+    patch:
+      default:
+        target: 95%
+
+ignore:
+  - "cmd/**"              # CLI glue code — IO/subprocess, not unit testable
+  - "pkg/lux/migrate/**"  # requires real DB connection for integration tests
+  - "pkg/lux/mysql/**"    # not yet implemented

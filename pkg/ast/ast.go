@@ -151,6 +151,7 @@ type OnDecl struct {
 	Params    []string // lambda-style params: on Event { user -> ... }
 	Body      *Block   // nil if @native
 	Native    bool
+	Broadcast bool // @broadcast — all instances receive (default: queue per module)
 }
 
 // ScopeDecl: scope published = where(status == PostStatus.PUBLISHED)

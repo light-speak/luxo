@@ -3,9 +3,9 @@ package codegen
 import (
 	"fmt"
 	"strings"
-	"unicode"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lux/str"
 )
 
 // fieldInfo holds pre-computed field data for aligned struct generation.
@@ -18,29 +18,49 @@ type fieldInfo struct {
 
 // generateModel generates a Go struct for a Luxo model declaration.
 // Pre-computes field widths and aligns output without needing gofmt.
-func generateModel(b *strings.Builder, m *ast.ModelDecl) {
+func generateModel(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
 	// Collect effective fields — @soft adds deletedAt if missing.
 	effectiveFields := m.Fields
 	if isSoftDelete(m) && !hasDeletedAtField(m.Fields) {
 		effectiveFields = append(append([]*ast.FieldDecl{}, m.Fields...), softDeleteField())
 	}
 
-	// First pass: collect field info and measure widths.
+	fields, maxName, maxType := collectFieldInfos(effectiveFields, enums)
+
+	// Write aligned fields.
+	fmt.Fprintf(b, "type %s struct {\n", m.Name)
+	for _, fi := range fields {
+		if fi.dbTag == "-" {
+			// Relation fields: json only, no db tag
+			fmt.Fprintf(b, "\t%-*s %-*s `json:%q`\n",
+				maxName, fi.goName,
+				maxType, fi.goType,
+				fi.jsonTag)
+		} else {
+			fmt.Fprintf(b, "\t%-*s %-*s `db:%q json:%q`\n",
+				maxName, fi.goName,
+				maxType, fi.goType,
+				fi.dbTag, fi.jsonTag)
+		}
+	}
+	b.WriteString("}\n")
+}
+
+// generateExtendStub generates a minimal Go struct for an extend declaration.
+// This provides type information for cross-module references.
+func generateExtendStub(b *strings.Builder, ext *ast.ExtendDecl) {
 	var fields []fieldInfo
 	maxName := 0
 	maxType := 0
-	for _, f := range effectiveFields {
+	for _, f := range ext.Fields {
 		if f.Computed != nil {
 			continue
 		}
 		fi := fieldInfo{
-			goName:  capitalize(f.Name),
+			goName:  str.Capitalize(f.Name),
 			goType:  resolveGoType(f.Type),
-			dbTag:   toSnakeCase(f.Name),
+			dbTag:   str.ToSnakeCase(f.Name),
 			jsonTag: f.Name,
-		}
-		if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
-			fi.jsonTag = "-"
 		}
 		if len(fi.goName) > maxName {
 			maxName = len(fi.goName)
@@ -51,8 +71,8 @@ func generateModel(b *strings.Builder, m *ast.ModelDecl) {
 		fields = append(fields, fi)
 	}
 
-	// Second pass: write aligned fields.
-	fmt.Fprintf(b, "type %s struct {\n", m.Name)
+	fmt.Fprintf(b, "// %s is a stub for the external %s model (from extend).\n", ext.Name, ext.Name)
+	fmt.Fprintf(b, "type %s struct {\n", ext.Name)
 	for _, fi := range fields {
 		fmt.Fprintf(b, "\t%-*s %-*s `db:%q json:%q`\n",
 			maxName, fi.goName,
@@ -60,6 +80,45 @@ func generateModel(b *strings.Builder, m *ast.ModelDecl) {
 			fi.dbTag, fi.jsonTag)
 	}
 	b.WriteString("}\n")
+}
+
+// collectFieldInfos collects field info from declarations and measures column widths.
+func collectFieldInfos(fields []*ast.FieldDecl, enums map[string]bool) ([]fieldInfo, int, int) {
+	var infos []fieldInfo
+	maxName := 0
+	maxType := 0
+	for _, f := range fields {
+		if f.Computed != nil {
+			continue
+		}
+		relation := isRelationField(f, enums)
+		goType := resolveGoType(f.Type)
+		// Single model references use pointer — but if already nullable (*Type),
+		// don't double-pointer. We always want *Model, never **Model.
+		if relation && f.Type != nil && !f.Type.IsList && !f.Type.Nullable {
+			goType = "*" + goType
+		}
+		fi := fieldInfo{
+			goName:  str.Capitalize(f.Name),
+			goType:  goType,
+			dbTag:   str.ToSnakeCase(f.Name),
+			jsonTag: f.Name,
+		}
+		if relation {
+			fi.dbTag = "-"
+		}
+		if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
+			fi.jsonTag = "-"
+		}
+		if len(fi.goName) > maxName {
+			maxName = len(fi.goName)
+		}
+		if len(fi.goType) > maxType {
+			maxType = len(fi.goType)
+		}
+		infos = append(infos, fi)
+	}
+	return infos, maxName, maxType
 }
 
 // resolveGoType maps a Luxo TypeRef to a Go type string.
@@ -136,6 +195,11 @@ func isAutoOnUpdate(f *ast.FieldDecl) bool {
 }
 
 // isSoftDelete returns true if the model has @soft directive.
+// IsSoftDelete checks if a model has @soft directive (exported for CLI).
+func IsSoftDelete(m *ast.ModelDecl) bool {
+	return isSoftDelete(m)
+}
+
 func isSoftDelete(m *ast.ModelDecl) bool {
 	return hasDirective(m.Directives, "soft")
 }
@@ -165,26 +229,4 @@ func hasDirective(directives []*ast.Directive, name string) bool {
 		}
 	}
 	return false
-}
-
-// capitalize returns the string with the first letter uppercased.
-func capitalize(s string) string {
-	if s == "" {
-		return s
-	}
-	r := []rune(s)
-	r[0] = unicode.ToUpper(r[0])
-	return string(r)
-}
-
-// toSnakeCase converts camelCase to snake_case.
-func toSnakeCase(s string) string {
-	var b strings.Builder
-	for i, r := range s {
-		if unicode.IsUpper(r) && i > 0 {
-			b.WriteByte('_')
-		}
-		b.WriteRune(unicode.ToLower(r))
-	}
-	return b.String()
 }

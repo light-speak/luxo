@@ -22,8 +22,7 @@ func TestInitProjectGoMod(t *testing.T) {
 
 	checks := []string{
 		"module github.com/example/myapp",
-		"go 1.23.0",
-		"github.com/light-speak/luxo",
+		"go 1.26.0",
 	}
 	for _, check := range checks {
 		if !strings.Contains(src, check) {
@@ -83,7 +82,7 @@ func TestAddModuleSchema(t *testing.T) {
 	src := string(sr.Files["origin/user.luxo"])
 
 	checks := []string{
-		"User module schema",
+		"User module",
 		"model User",
 		"id:        UUID      @auto",
 		"createdAt: DateTime",
@@ -103,7 +102,7 @@ func TestAddModuleResolver(t *testing.T) {
 	checks := []string{
 		"package resolver",
 		"type Resolver struct",
-		"func Setup(app any)",
+		"func Setup(app *luxo.App)",
 		"user module",
 	}
 	for _, check := range checks {

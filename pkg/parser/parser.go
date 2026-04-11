@@ -596,10 +596,17 @@ func (p *Parser) parseOn() *ast.OnDecl {
 		EventName: p.expectIdent(),
 	}
 	if p.check(token.At) {
-		// @native
-		p.parseDirectives()
-		on.Native = true
-	} else if p.check(token.LBrace) {
+		dirs := p.parseDirectives()
+		for _, d := range dirs {
+			switch d.Name {
+			case "native":
+				on.Native = true
+			case "broadcast":
+				on.Broadcast = true
+			}
+		}
+	}
+	if p.check(token.LBrace) {
 		on.Params, on.Body = p.parseOnBlock()
 	}
 	return on

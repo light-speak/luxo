@@ -112,6 +112,14 @@ var builtinDirectives = []DirectiveDef{
 		Description: "add database index",
 	},
 
+	// ===== Field-level directives — relations =====
+	{
+		Name: "by", Contexts: OnField,
+		Params:      []ParamDef{{}, {}}, // positional: remote, local
+		MaxArgs:     2,
+		Description: "specify relation FK: @by(remoteField, localField). DataLoader: WHERE remote IN (local values)",
+	},
+
 	// ===== Field-level directives — visibility & security =====
 	{
 		Name: "hidden", Contexts: OnField,
@@ -188,11 +196,6 @@ var builtinDirectives = []DirectiveDef{
 		MaxArgs:     1,
 		Description: "mark as deprecated with optional reason",
 	},
-	{
-		Name: "reserved", Contexts: OnField,
-		Description: "field name is reserved for future use",
-	},
-
 	// ===== Field-level directives — validation (String) =====
 	{
 		Name: "email", Contexts: OnField,

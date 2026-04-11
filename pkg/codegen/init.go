@@ -3,6 +3,8 @@ package codegen
 import (
 	"fmt"
 	"strings"
+
+	"github.com/light-speak/luxo/pkg/lux/str"
 )
 
 // ScaffoldResult holds scaffold files to be written to disk.
@@ -33,7 +35,7 @@ func AddModule(modulePath, moduleName string) *ScaffoldResult {
 	}
 
 	sr.Files[fmt.Sprintf("origin/%s.luxo", moduleName)] = generateModuleSchema(moduleName)
-	sr.Files[fmt.Sprintf("service/%s/resolver/resolver.go", moduleName)] = generateModuleResolver(moduleName)
+	sr.Files[fmt.Sprintf("service/%s/resolver/resolver.go", moduleName)] = generateModuleResolver(modulePath, moduleName)
 	sr.Files[fmt.Sprintf("luxis/%s/main.go", moduleName)] = generateModuleMain(modulePath, moduleName)
 
 	return sr
@@ -73,21 +75,19 @@ tmp/
 }
 
 // generateGoMod produces the go.mod file.
+// Does not include luxo dependency — added automatically by `go mod tidy` after `luxo gen`.
 func generateGoMod(modulePath string) []byte {
 	var b strings.Builder
 	fmt.Fprintf(&b, "module %s\n\n", modulePath)
-	b.WriteString("go 1.23.0\n\n")
-	b.WriteString("require (\n")
-	b.WriteString("\tgithub.com/light-speak/luxo v0.0.0\n")
-	b.WriteString(")\n")
+	b.WriteString("go 1.26.0\n")
 	return []byte(b.String())
 }
 
 // generateModuleSchema produces the origin/<module>.luxo skeleton.
 func generateModuleSchema(moduleName string) []byte {
-	name := capitalize(moduleName)
+	name := str.Capitalize(moduleName)
 	var b strings.Builder
-	fmt.Fprintf(&b, "// %s module schema\n\n", name)
+	fmt.Fprintf(&b, "// %s module\n\n", name)
 	fmt.Fprintf(&b, "model %s {\n", name)
 	b.WriteString("  id:        UUID      @auto\n")
 	b.WriteString("  createdAt: DateTime\n")
@@ -97,15 +97,18 @@ func generateModuleSchema(moduleName string) []byte {
 }
 
 // generateModuleResolver produces the <module>/resolver/resolver.go scaffold.
-func generateModuleResolver(moduleName string) []byte {
+func generateModuleResolver(modulePath, moduleName string) []byte {
+	luxoPkg := fmt.Sprintf("%s/service/%s/luxo", modulePath, moduleName)
+
 	var b strings.Builder
 	b.WriteString("package resolver\n\n")
+	fmt.Fprintf(&b, "import luxo %q\n\n", luxoPkg)
 	fmt.Fprintf(&b, "// Resolver holds custom dependencies for the %s module.\n", moduleName)
 	b.WriteString("type Resolver struct {\n")
 	b.WriteString("\t// Add your dependencies here.\n")
 	b.WriteString("}\n\n")
 	fmt.Fprintf(&b, "// Setup initializes the %s module's custom dependencies.\n", moduleName)
-	b.WriteString("func Setup(app any) {\n")
+	b.WriteString("func Setup(app *luxo.App) {\n")
 	b.WriteString("\t// Register middleware, hooks, etc.\n")
 	b.WriteString("}\n")
 	return []byte(b.String())
@@ -160,6 +163,7 @@ APP_DEBUG=true                                         # debug logging
 APP_PORT=8080                                          # listen port
 APP_TIMEZONE=UTC                                       # timezone: UTC / Asia/Shanghai
 DEPLOY_MODE=embedded                                   # deploy: embedded / standalone / compose / cluster
+GEN_MODE=full                                          # codegen: full / minimal (minimal = model + db only)
 
 # ---- Database ----
 DATABASE_DRIVER=pg                                     # driver: pg / mysql / sqlite / mongo
