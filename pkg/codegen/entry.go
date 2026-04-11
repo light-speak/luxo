@@ -9,23 +9,22 @@ import (
 
 // GenerateEntryFile produces luxis/app/main.gen.go — the embedded entry point
 // that imports all modules, registers handlers, and starts the Luvia gateway.
-func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
+type moduleInfo struct {
+	name       string
+	hasCrud    bool
+	hasLoaders bool
+	hasEvents  bool
+}
+
+func collectModules(result *semantic.Result) []moduleInfo {
 	enums := collectEnums(result)
-
-	type moduleInfo struct {
-		name       string
-		hasCrud    bool
-		hasLoaders bool
-	}
-
 	var modules []moduleInfo
 	for _, file := range result.Files {
 		name := strings.TrimSuffix(file.Name, ".luxo")
 		if idx := strings.LastIndex(name, "/"); idx >= 0 {
 			name = name[idx+1:]
 		}
-		crud := false
-		loaders := false
+		crud, loaders := false, false
 		for _, m := range file.Models {
 			if hasDirective(m.Directives, "crud") {
 				crud = true
@@ -34,9 +33,14 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 				loaders = true
 			}
 		}
-		modules = append(modules, moduleInfo{name: name, hasCrud: crud, hasLoaders: loaders})
+		events := len(file.Events) > 0 || len(file.Listeners) > 0
+		modules = append(modules, moduleInfo{name: name, hasCrud: crud, hasLoaders: loaders, hasEvents: events})
 	}
+	return modules
+}
 
+func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
+	modules := collectModules(result)
 	if len(modules) == 0 {
 		return nil
 	}
@@ -60,8 +64,20 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 		fmt.Fprintf(&b, "\t%s_resolver \"%s/service/%s/resolver\"\n", m.name, modulePath, m.name)
 	}
 
+	// Check if any module has events
+	anyEvents := false
+	for _, m := range modules {
+		if m.hasEvents {
+			anyEvents = true
+			break
+		}
+	}
+
 	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/dataloader\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/env\"\n")
+	if anyEvents {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/event\"\n")
+	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
 	b.WriteString(")\n\n")
 
@@ -74,30 +90,11 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"warning: %v\\n\", err)\n")
 	b.WriteString("\t}\n\n")
 
-	// Create each module's App
-	for _, m := range modules {
-		fmt.Fprintf(&b, "\t%sApp, err := %s_luxo.New(ctx)\n", m.name, m.name)
-		b.WriteString("\tif err != nil {\n")
-		fmt.Fprintf(&b, "\t\tfmt.Fprintf(os.Stderr, \"fatal: %s: %%v\\n\", err)\n", m.name)
-		b.WriteString("\t\tos.Exit(1)\n")
-		b.WriteString("\t}\n")
-		fmt.Fprintf(&b, "\tdefer %sApp.Close()\n\n", m.name)
+	writeModuleApps(&b, modules)
+	writeDataLoaderWiring(&b, modules)
+	if anyEvents {
+		writeEventBusWiring(&b, modules)
 	}
-
-	// Call resolver.Setup for each module
-	for _, m := range modules {
-		fmt.Fprintf(&b, "\t%s_resolver.Setup(%sApp)\n", m.name, m.name)
-	}
-	b.WriteString("\n")
-
-	// Wire DataLoaders (embedded mode — same DB for all modules)
-	b.WriteString("\tdlCfg := dataloader.DefaultConfig()\n")
-	for _, m := range modules {
-		if m.hasLoaders {
-			fmt.Fprintf(&b, "\t%sApp.SetLoaders(%s_luxo.NewDefaultLoaders(%sApp, dlCfg))\n", m.name, m.name, m.name)
-		}
-	}
-	b.WriteString("\n")
 
 	// Create Luvia gateway
 	b.WriteString("\tgw := luvia.New()\n\n")
@@ -119,4 +116,52 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("}\n")
 
 	return []byte(b.String())
+}
+
+func writeModuleApps(b *strings.Builder, modules []moduleInfo) {
+	for _, m := range modules {
+		fmt.Fprintf(b, "\t%sApp, err := %s_luxo.New(ctx)\n", m.name, m.name)
+		b.WriteString("\tif err != nil {\n")
+		fmt.Fprintf(b, "\t\tfmt.Fprintf(os.Stderr, \"fatal: %s: %%v\\n\", err)\n", m.name)
+		b.WriteString("\t\tos.Exit(1)\n")
+		b.WriteString("\t}\n")
+		fmt.Fprintf(b, "\tdefer %sApp.Close()\n\n", m.name)
+	}
+	for _, m := range modules {
+		fmt.Fprintf(b, "\t%s_resolver.Setup(%sApp)\n", m.name, m.name)
+	}
+	b.WriteString("\n")
+}
+
+func writeDataLoaderWiring(b *strings.Builder, modules []moduleInfo) {
+	b.WriteString("\tdlCfg := dataloader.DefaultConfig()\n")
+	for _, m := range modules {
+		if m.hasLoaders {
+			fmt.Fprintf(b, "\t%sApp.SetLoaders(%s_luxo.NewDefaultLoaders(%sApp, dlCfg))\n", m.name, m.name, m.name)
+		}
+	}
+	b.WriteString("\n")
+}
+
+func writeEventBusWiring(b *strings.Builder, modules []moduleInfo) {
+	b.WriteString("\tvar eventBus event.Bus\n")
+	b.WriteString("\tif natsURL, ok := env.Get(\"NATS_URL\"); ok {\n")
+	b.WriteString("\t\tbus, err := event.NewNATSBus(natsURL)\n")
+	b.WriteString("\t\tif err != nil {\n")
+	b.WriteString("\t\t\tfmt.Fprintf(os.Stderr, \"warning: NATS connect failed, using channel bus: %v\\n\", err)\n")
+	b.WriteString("\t\t\teventBus = event.NewChanBus(256)\n")
+	b.WriteString("\t\t} else {\n")
+	b.WriteString("\t\t\teventBus = bus\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t} else {\n")
+	b.WriteString("\t\teventBus = event.NewChanBus(256)\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\tdefer eventBus.Close()\n\n")
+
+	for _, m := range modules {
+		if m.hasEvents {
+			fmt.Fprintf(b, "\t%s_luxo.RegisterEvents(eventBus)\n", m.name)
+		}
+	}
+	b.WriteString("\n")
 }

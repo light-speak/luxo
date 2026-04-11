@@ -42,6 +42,11 @@ func Generate(result *semantic.Result, packageName string, softModels ...map[str
 		gr.Files["native.gen.go"] = nativeSrc
 	}
 
+	// event.gen.go — typed event structs + emit functions + listener registration
+	if eventSrc := generateEventFile(result, packageName); eventSrc != nil {
+		gr.Files["event.gen.go"] = eventSrc
+	}
+
 	return gr
 }
 
