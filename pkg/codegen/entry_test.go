@@ -133,3 +133,49 @@ func TestGenerateEntryFileWithLoaders(t *testing.T) {
 		t.Errorf("should call NewDefaultLoaders for module with relations:\n%s", code)
 	}
 }
+
+func TestGenerateEntryFileWithEvents(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{
+			{
+				Name: "origin/user.luxo",
+				Models: []*ast.ModelDecl{
+					{
+						Pos:        token.Position{File: "test.luxo", Line: 1, Col: 1},
+						Name:       "User",
+						Directives: []*ast.Directive{{Name: "crud"}},
+						Fields: []*ast.FieldDecl{
+							{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+							{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+						},
+					},
+				},
+				Events: []*ast.EventDecl{
+					{Name: "UserCreated", Params: []*ast.ParamDecl{
+						{Name: "user", Type: &ast.TypeRef{Name: "User"}},
+					}},
+				},
+			},
+		},
+	}
+
+	src := GenerateEntryFile(result, "myapp")
+	if src == nil {
+		t.Fatal("should generate entry file")
+	}
+	code := string(src)
+
+	// Should have event bus wiring
+	if !strings.Contains(code, "event.Bus") {
+		t.Errorf("should declare eventBus:\n%s", code)
+	}
+	if !strings.Contains(code, "RegisterEvents") {
+		t.Errorf("should call RegisterEvents:\n%s", code)
+	}
+	if !strings.Contains(code, "NATS_URL") {
+		t.Errorf("should check NATS_URL env:\n%s", code)
+	}
+	if !strings.Contains(code, "NewChanBus") {
+		t.Errorf("should fallback to ChanBus:\n%s", code)
+	}
+}

@@ -346,6 +346,35 @@ func TestParseOnNative(t *testing.T) {
 	}
 }
 
+func TestParseOnBroadcast(t *testing.T) {
+	input := `on ConfigChanged @broadcast {
+  val x = 1
+}`
+	file := parse(t, input)
+	if len(file.Listeners) != 1 {
+		t.Fatalf("expected 1 listener, got %d", len(file.Listeners))
+	}
+	on := file.Listeners[0]
+	if !on.Broadcast {
+		t.Error("expected Broadcast=true")
+	}
+	if on.Native {
+		t.Error("should not be native")
+	}
+	if on.Body == nil {
+		t.Error("expected body")
+	}
+}
+
+func TestParseOnDefaultNotBroadcast(t *testing.T) {
+	input := `on UserCreated { val x = 1 }`
+	file := parse(t, input)
+	on := file.Listeners[0]
+	if on.Broadcast {
+		t.Error("default on should not be broadcast")
+	}
+}
+
 func TestParseOnWithLambdaParams(t *testing.T) {
 	input := `on PostCreated { post -> val x = 1 }`
 	file := parse(t, input)

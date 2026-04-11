@@ -11,6 +11,7 @@ import (
 
 // generateEventFile produces event.gen.go containing typed event structs,
 // emit functions, and on-listener registrations.
+// moduleName is used as the queue group for competing consumers.
 // Returns nil if there are no events.
 func generateEventFile(result *semantic.Result, packageName string) []byte {
 	var events []*ast.EventDecl
@@ -30,8 +31,10 @@ func generateEventFile(result *semantic.Result, packageName string) []byte {
 
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
-	b.WriteString("\t\"encoding/json\"\n")
-	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/event\"\n")
+	if len(listeners) > 0 {
+		b.WriteString("\n\t\"github.com/bytedance/sonic\"\n")
+	}
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/event\"\n")
 	b.WriteString(")\n\n")
 
 	// Event structs
@@ -39,13 +42,13 @@ func generateEventFile(result *semantic.Result, packageName string) []byte {
 		generateEventStruct(&b, e)
 	}
 
-	// Emit functions
+	// Emit functions — pass struct directly, zero serialization
 	for _, e := range events {
 		generateEmitFunc(&b, e)
 	}
 
 	// RegisterEvents function — wires all on-listeners
-	generateRegisterEvents(&b, listeners)
+	generateRegisterEvents(&b, listeners, packageName)
 
 	return []byte(b.String())
 }
@@ -62,19 +65,20 @@ func generateEventStruct(b *strings.Builder, e *ast.EventDecl) {
 }
 
 // generateEmitFunc generates a typed emit function.
+// Passes the struct directly — ChanBus delivers zero-copy,
+// NATSBus serializes at the wire boundary.
 func generateEmitFunc(b *strings.Builder, e *ast.EventDecl) {
 	fmt.Fprintf(b, "// Emit%s publishes a %s event.\n", e.Name, e.Name)
 	fmt.Fprintf(b, "func Emit%s(ctx context.Context, bus event.Bus, e %sEvent) error {\n", e.Name, e.Name)
-	fmt.Fprintf(b, "\tdata, err := json.Marshal(e)\n")
-	fmt.Fprintf(b, "\tif err != nil {\n")
-	fmt.Fprintf(b, "\t\treturn err\n")
-	fmt.Fprintf(b, "\t}\n")
-	fmt.Fprintf(b, "\treturn bus.Emit(ctx, %q, data)\n", e.Name)
+	fmt.Fprintf(b, "\treturn bus.Emit(ctx, %q, e)\n", e.Name)
 	fmt.Fprintf(b, "}\n\n")
 }
 
 // generateRegisterEvents generates RegisterEvents that wires all on-listeners.
-func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl) {
+// Default uses OnQueue with moduleName as the queue group (competing consumers).
+// Listeners with @broadcast use On (every instance receives).
+// Handlers use type switch: struct for ChanBus, []byte for NATSBus.
+func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleName string) {
 	b.WriteString("// RegisterEvents registers all event listeners with the bus.\n")
 	b.WriteString("func RegisterEvents(bus event.Bus) {\n")
 
@@ -83,10 +87,19 @@ func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl) {
 		if len(l.Params) > 0 {
 			paramName = l.Params[0]
 		}
-		fmt.Fprintf(b, "\tbus.On(%q, func(ctx context.Context, data []byte) {\n", l.EventName)
+		if l.Broadcast {
+			fmt.Fprintf(b, "\tbus.On(%q, func(ctx context.Context, payload any) {\n", l.EventName)
+		} else {
+			fmt.Fprintf(b, "\tbus.OnQueue(%q, %q, func(ctx context.Context, payload any) {\n", l.EventName, moduleName)
+		}
 		fmt.Fprintf(b, "\t\tvar %s %sEvent\n", paramName, l.EventName)
-		fmt.Fprintf(b, "\t\tjson.Unmarshal(data, &%s)\n", paramName)
-		fmt.Fprintf(b, "\t\t_ = %s // handler body compiled from .luxo\n", paramName)
+		fmt.Fprintf(b, "\t\tswitch v := payload.(type) {\n")
+		fmt.Fprintf(b, "\t\tcase %sEvent:\n", l.EventName)
+		fmt.Fprintf(b, "\t\t\t%s = v\n", paramName)
+		fmt.Fprintf(b, "\t\tcase []byte:\n")
+		fmt.Fprintf(b, "\t\t\tsonic.Unmarshal(v, &%s)\n", paramName)
+		fmt.Fprintf(b, "\t\t}\n")
+		fmt.Fprintf(b, "\t\t_ = %s\n", paramName)
 		b.WriteString("\t})\n")
 	}
 

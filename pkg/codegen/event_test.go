@@ -52,10 +52,13 @@ func TestGenerateEventFile(t *testing.T) {
 		`Order Order`,
 		`UserId int64`,
 		"func EmitOrderCreated(ctx context.Context, bus event.Bus, e OrderCreatedEvent) error",
-		`bus.Emit(ctx, "OrderCreated", data)`,
+		`bus.Emit(ctx, "OrderCreated", e)`,
 		"func RegisterEvents(bus event.Bus)",
-		`bus.On("OrderCreated"`,
+		`bus.OnQueue("OrderCreated", "luxo"`,
 		"var e OrderCreatedEvent",
+		"case OrderCreatedEvent:",
+		"case []byte:",
+		"sonic.Unmarshal",
 	}
 	for _, check := range checks {
 		if !strings.Contains(code, check) {
@@ -94,6 +97,57 @@ func TestGenerateEventFileNoListeners(t *testing.T) {
 	}
 }
 
+func TestGenerateEventListenerBroadcast(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Events: []*ast.EventDecl{
+				{Name: "ConfigChanged"},
+			},
+			Listeners: []*ast.OnDecl{
+				{EventName: "ConfigChanged", Broadcast: true},
+			},
+		}},
+	}
+
+	src := generateEventFile(result, "mymodule")
+	code := string(src)
+
+	// @broadcast should use bus.On (not bus.OnQueue)
+	if !strings.Contains(code, `bus.On("ConfigChanged"`) {
+		t.Errorf("@broadcast should use bus.On:\n%s", code)
+	}
+	if strings.Contains(code, `bus.OnQueue`) {
+		t.Errorf("@broadcast should NOT use bus.OnQueue:\n%s", code)
+	}
+}
+
+func TestGenerateEventListenerMixed(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Events: []*ast.EventDecl{
+				{Name: "OrderCreated"},
+				{Name: "CacheInvalidate"},
+			},
+			Listeners: []*ast.OnDecl{
+				{EventName: "OrderCreated", Params: []string{"e"}},                     // default: queue
+				{EventName: "CacheInvalidate", Broadcast: true, Params: []string{"e"}}, // broadcast
+			},
+		}},
+	}
+
+	src := generateEventFile(result, "order")
+	code := string(src)
+
+	if !strings.Contains(code, `bus.OnQueue("OrderCreated", "order"`) {
+		t.Errorf("default listener should use OnQueue:\n%s", code)
+	}
+	if !strings.Contains(code, `bus.On("CacheInvalidate"`) {
+		t.Errorf("@broadcast listener should use On:\n%s", code)
+	}
+}
+
 func TestGenerateEventListenerNoParams(t *testing.T) {
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -113,5 +167,9 @@ func TestGenerateEventListenerNoParams(t *testing.T) {
 	// Should default to "payload" as param name
 	if !strings.Contains(code, "var payload PingEvent") {
 		t.Errorf("should default to 'payload' param:\n%s", code)
+	}
+	// Default should use OnQueue
+	if !strings.Contains(code, `bus.OnQueue("Ping", "luxo"`) {
+		t.Errorf("default should use OnQueue:\n%s", code)
 	}
 }

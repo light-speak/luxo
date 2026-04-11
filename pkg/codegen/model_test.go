@@ -312,6 +312,30 @@ func TestGenerateModelRelationPointer(t *testing.T) {
 	}
 }
 
+func TestGenerateModelNullableRelationPointer(t *testing.T) {
+	// Nullable single relation: user: User? → should be *User, NOT **User
+	m := &ast.ModelDecl{
+		Name: "Post",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "userId", Type: &ast.TypeRef{Name: "Int", Nullable: true}},
+			{Name: "user", Type: &ast.TypeRef{Name: "User", Nullable: true}},
+		},
+	}
+
+	var b strings.Builder
+	generateModel(&b, m, nil)
+	got := b.String()
+
+	// Should be *User, not **User
+	if strings.Contains(got, "**User") {
+		t.Errorf("nullable relation should be *User, not **User:\n%s", got)
+	}
+	if !strings.Contains(got, "*User") {
+		t.Errorf("nullable relation should use *User pointer:\n%s", got)
+	}
+}
+
 func TestGenerateModelRelationList(t *testing.T) {
 	// List relation field
 	m := &ast.ModelDecl{

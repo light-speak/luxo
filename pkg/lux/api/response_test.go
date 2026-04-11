@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/bytedance/sonic"
 	"github.com/light-speak/luxo/pkg/lux/selection"
 )
 
@@ -14,12 +15,12 @@ func sel(s string) []*selection.Field {
 
 func jsonEqual(t *testing.T, got json.RawMessage, want string) {
 	t.Helper()
-	// Normalize both by re-marshaling
 	var g, w any
-	json.Unmarshal(got, &g)
-	json.Unmarshal([]byte(want), &w)
-	gb, _ := json.Marshal(g)
-	wb, _ := json.Marshal(w)
+	sonic.Unmarshal(got, &g)
+	sonic.Unmarshal([]byte(want), &w)
+	// Sort keys deterministically for comparison
+	gb, _ := sonic.ConfigStd.Marshal(g)
+	wb, _ := sonic.ConfigStd.Marshal(w)
 	if string(gb) != string(wb) {
 		t.Errorf("got %s, want %s", string(got), want)
 	}
@@ -33,7 +34,7 @@ func TestFilterFieldsNilSelect(t *testing.T) {
 	}
 	// Should return all fields
 	var obj map[string]any
-	json.Unmarshal(result, &obj)
+	sonic.Unmarshal(result, &obj)
 	if obj["name"] != "lin" || obj["email"] != "lin@test.com" {
 		t.Error("nil select should return all fields")
 	}

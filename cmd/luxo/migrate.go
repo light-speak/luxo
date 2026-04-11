@@ -13,6 +13,7 @@ import (
 	"github.com/light-speak/luxo/pkg/lux/env"
 	"github.com/light-speak/luxo/pkg/lux/migrate"
 	"github.com/light-speak/luxo/pkg/lux/pg"
+	"github.com/light-speak/luxo/pkg/lux/str"
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/spf13/cobra"
 )
@@ -375,7 +376,7 @@ func buildFieldIDMaps() map[string]*codegen.FieldIDMap {
 				fields := make(map[string]int)
 				for fieldName, id := range ml.Fields {
 					// Check if this field name existed as a column in old state
-					if _, exists := ms.Columns[codegen.SnakeCase(fieldName)]; exists {
+					if _, exists := ms.Columns[str.ToSnakeCase(fieldName)]; exists {
 						fields[fieldName] = id
 					}
 				}

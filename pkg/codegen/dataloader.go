@@ -26,6 +26,7 @@ type Relation struct {
 	LocalKey   string       // key on this model (e.g., "userId" for belongsTo, "id" for hasMany)
 	RemoteKey  string       // key on target model (e.g., "id" for belongsTo, "userId" for hasMany)
 	IsList     bool         // [Post] vs Post
+	FKNullable bool         // true if the FK field is nullable (e.g., userId: Int?)
 }
 
 // analyzeRelations extracts all relations from a model's fields.
@@ -75,6 +76,9 @@ func analyzeRelations(m *ast.ModelDecl, enums map[string]bool) []Relation {
 				}
 			}
 		}
+
+		// Check if the FK field is nullable (e.g., userId: Int?)
+		rel.FKNullable = isFKNullable(m.Fields, rel.LocalKey)
 
 		relations = append(relations, rel)
 	}
@@ -373,6 +377,16 @@ func hasFKField(fields []*ast.FieldDecl, name string) bool {
 	for _, f := range fields {
 		if f.Name == name {
 			return true
+		}
+	}
+	return false
+}
+
+// isFKNullable checks if a FK field is nullable.
+func isFKNullable(fields []*ast.FieldDecl, fkName string) bool {
+	for _, f := range fields {
+		if f.Name == fkName && f.Type != nil {
+			return f.Type.Nullable
 		}
 	}
 	return false

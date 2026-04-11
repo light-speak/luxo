@@ -47,6 +47,16 @@ func Generate(result *semantic.Result, packageName string, softModels ...map[str
 		gr.Files["event.gen.go"] = eventSrc
 	}
 
+	// error.gen.go — typed error constructors
+	if errorSrc := generateErrorFile(result, packageName); errorSrc != nil {
+		gr.Files["error.gen.go"] = errorSrc
+	}
+
+	// writejson.gen.go — per-model WriteJSON for single-pass field-filtered serialization
+	if wjSrc := generateWriteJSONFile(result, packageName, enums); wjSrc != nil {
+		gr.Files["writejson.gen.go"] = wjSrc
+	}
+
 	return gr
 }
 

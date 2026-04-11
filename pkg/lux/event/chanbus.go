@@ -7,6 +7,7 @@ import (
 
 // ChanBus implements Bus using Go channels.
 // Zero external dependencies — used in embedded (single-process) mode.
+// Payloads are passed directly as Go values — zero serialization.
 type ChanBus struct {
 	mu       sync.RWMutex
 	subs     map[string][]Handler
@@ -18,7 +19,7 @@ type ChanBus struct {
 
 type message struct {
 	ctx     context.Context
-	payload []byte
+	payload any
 }
 
 // NewChanBus creates a channel-based event bus.
@@ -38,7 +39,7 @@ func NewChanBus(bufSize int) *ChanBus {
 var _ Bus = (*ChanBus)(nil)
 
 // Emit publishes an event. Non-blocking — drops if buffer is full or bus is closed.
-func (b *ChanBus) Emit(ctx context.Context, name string, payload []byte) error {
+func (b *ChanBus) Emit(ctx context.Context, name string, payload any) error {
 	select {
 	case <-b.done:
 		return nil // bus closed
@@ -76,6 +77,12 @@ func (b *ChanBus) On(name string, handler Handler) error {
 	return nil
 }
 
+// OnQueue registers a queue handler. In single-process mode (ChanBus),
+// queue semantics are identical to broadcast — delegates to On.
+func (b *ChanBus) OnQueue(name string, group string, handler Handler) error {
+	return b.On(name, handler)
+}
+
 // dispatch reads from the channel and calls all handlers for the event.
 func (b *ChanBus) dispatch(name string, ch chan message) {
 	for {
@@ -98,7 +105,7 @@ func (b *ChanBus) dispatch(name string, ch chan message) {
 }
 
 // safeCall calls handler with panic recovery to prevent one handler from killing the dispatcher.
-func safeCall(h Handler, ctx context.Context, payload []byte) {
+func safeCall(h Handler, ctx context.Context, payload any) {
 	defer func() { recover() }()
 	h(ctx, payload)
 }

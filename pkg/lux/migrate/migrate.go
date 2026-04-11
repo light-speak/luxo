@@ -500,8 +500,5 @@ func BuildDatabaseURL() string {
 }
 
 func envOr(key, fallback string) string {
-	if v, ok := env.Get(key); ok {
-		return v
-	}
-	return fallback
+	return env.GetOrDefault(key, fallback)
 }

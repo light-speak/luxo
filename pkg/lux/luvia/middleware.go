@@ -8,9 +8,9 @@ import (
 	"github.com/light-speak/luxo/pkg/lux/auth"
 )
 
-type contextKey string
+type identityCtxKey struct{}
 
-const identityKey contextKey = "luxo.identity"
+var identityKey identityCtxKey
 
 // Identity returns the authenticated user's claims from context.
 // This is the `my` keyword in Luxo — access the current user's data.

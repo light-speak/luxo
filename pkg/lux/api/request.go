@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/bytedance/sonic"
 	"github.com/light-speak/luxo/pkg/lux/selection"
 )
 
@@ -14,6 +15,7 @@ type Request struct {
 	API    string                     // $api field
 	Select []*selection.Field         // parsed $select
 	Params map[string]json.RawMessage // remaining fields as raw JSON
+	Buf    *ResponseBuf               // response buffer — handler writes directly here
 }
 
 // ParseRequest reads an HTTP request body and extracts $api, $select, and params.
@@ -29,7 +31,7 @@ func ParseRequest(r *http.Request) (*Request, error) {
 	}
 
 	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(body, &raw); err != nil {
+	if err := sonic.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("invalid JSON: %w", err)
 	}
 
@@ -42,7 +44,7 @@ func ParseRequest(r *http.Request) (*Request, error) {
 	if !ok {
 		return nil, fmt.Errorf("missing $api field")
 	}
-	if err := json.Unmarshal(apiRaw, &req.API); err != nil {
+	if err := sonic.Unmarshal(apiRaw, &req.API); err != nil {
 		return nil, fmt.Errorf("$api must be a string")
 	}
 	if req.API == "" {
@@ -52,7 +54,7 @@ func ParseRequest(r *http.Request) (*Request, error) {
 	// Extract $select (optional)
 	if selRaw, ok := raw["$select"]; ok {
 		var selStr string
-		if err := json.Unmarshal(selRaw, &selStr); err != nil {
+		if err := sonic.Unmarshal(selRaw, &selStr); err != nil {
 			return nil, fmt.Errorf("$select must be a string")
 		}
 		fields, err := selection.Parse(selStr)
@@ -80,7 +82,7 @@ func (r *Request) ParamInt(name string) (int64, error) {
 		return 0, fmt.Errorf("missing parameter '%s'", name)
 	}
 	var v int64
-	if err := json.Unmarshal(raw, &v); err != nil {
+	if err := sonic.Unmarshal(raw, &v); err != nil {
 		return 0, fmt.Errorf("parameter '%s' must be an integer", name)
 	}
 	return v, nil
@@ -93,7 +95,7 @@ func (r *Request) ParamString(name string) (string, error) {
 		return "", fmt.Errorf("missing parameter '%s'", name)
 	}
 	var v string
-	if err := json.Unmarshal(raw, &v); err != nil {
+	if err := sonic.Unmarshal(raw, &v); err != nil {
 		return "", fmt.Errorf("parameter '%s' must be a string", name)
 	}
 	return v, nil
@@ -106,7 +108,7 @@ func (r *Request) ParamBool(name string) (bool, error) {
 		return false, fmt.Errorf("missing parameter '%s'", name)
 	}
 	var v bool
-	if err := json.Unmarshal(raw, &v); err != nil {
+	if err := sonic.Unmarshal(raw, &v); err != nil {
 		return false, fmt.Errorf("parameter '%s' must be a boolean", name)
 	}
 	return v, nil

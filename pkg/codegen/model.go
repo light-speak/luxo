@@ -25,42 +25,9 @@ func generateModel(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) 
 		effectiveFields = append(append([]*ast.FieldDecl{}, m.Fields...), softDeleteField())
 	}
 
-	// First pass: collect field info and measure widths.
-	var fields []fieldInfo
-	maxName := 0
-	maxType := 0
-	for _, f := range effectiveFields {
-		if f.Computed != nil {
-			continue
-		}
-		relation := isRelationField(f, enums)
-		goType := resolveGoType(f.Type)
-		// Single model references use pointer to avoid circular struct embedding
-		if relation && f.Type != nil && !f.Type.IsList {
-			goType = "*" + goType
-		}
-		fi := fieldInfo{
-			goName:  str.Capitalize(f.Name),
-			goType:  goType,
-			dbTag:   str.ToSnakeCase(f.Name),
-			jsonTag: f.Name,
-		}
-		if relation {
-			fi.dbTag = "-" // relation fields are not DB columns
-		}
-		if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
-			fi.jsonTag = "-"
-		}
-		if len(fi.goName) > maxName {
-			maxName = len(fi.goName)
-		}
-		if len(fi.goType) > maxType {
-			maxType = len(fi.goType)
-		}
-		fields = append(fields, fi)
-	}
+	fields, maxName, maxType := collectFieldInfos(effectiveFields, enums)
 
-	// Second pass: write aligned fields.
+	// Write aligned fields.
 	fmt.Fprintf(b, "type %s struct {\n", m.Name)
 	for _, fi := range fields {
 		if fi.dbTag == "-" {
@@ -113,6 +80,45 @@ func generateExtendStub(b *strings.Builder, ext *ast.ExtendDecl) {
 			fi.dbTag, fi.jsonTag)
 	}
 	b.WriteString("}\n")
+}
+
+// collectFieldInfos collects field info from declarations and measures column widths.
+func collectFieldInfos(fields []*ast.FieldDecl, enums map[string]bool) ([]fieldInfo, int, int) {
+	var infos []fieldInfo
+	maxName := 0
+	maxType := 0
+	for _, f := range fields {
+		if f.Computed != nil {
+			continue
+		}
+		relation := isRelationField(f, enums)
+		goType := resolveGoType(f.Type)
+		// Single model references use pointer — but if already nullable (*Type),
+		// don't double-pointer. We always want *Model, never **Model.
+		if relation && f.Type != nil && !f.Type.IsList && !f.Type.Nullable {
+			goType = "*" + goType
+		}
+		fi := fieldInfo{
+			goName:  str.Capitalize(f.Name),
+			goType:  goType,
+			dbTag:   str.ToSnakeCase(f.Name),
+			jsonTag: f.Name,
+		}
+		if relation {
+			fi.dbTag = "-"
+		}
+		if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
+			fi.jsonTag = "-"
+		}
+		if len(fi.goName) > maxName {
+			maxName = len(fi.goName)
+		}
+		if len(fi.goType) > maxType {
+			maxType = len(fi.goType)
+		}
+		infos = append(infos, fi)
+	}
+	return infos, maxName, maxType
 }
 
 // resolveGoType maps a Luxo TypeRef to a Go type string.
@@ -215,9 +221,6 @@ func softDeleteField() *ast.FieldDecl {
 		Type: &ast.TypeRef{Name: "DateTime", Nullable: true},
 	}
 }
-
-// SnakeCase is exported for CLI usage.
-func SnakeCase(s string) string { return str.ToSnakeCase(s) }
 
 func hasDirective(directives []*ast.Directive, name string) bool {
 	for _, d := range directives {

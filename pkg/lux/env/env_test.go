@@ -306,6 +306,16 @@ func TestParseLine(t *testing.T) {
 	}
 }
 
+func TestGetOrDefault(t *testing.T) {
+	t.Setenv("LUXO_TEST_GOD", "found")
+	if got := GetOrDefault("LUXO_TEST_GOD", "fallback"); got != "found" {
+		t.Errorf("got %q, want found", got)
+	}
+	if got := GetOrDefault("LUXO_NONEXISTENT_KEY_XYZ", "fallback"); got != "fallback" {
+		t.Errorf("got %q, want fallback", got)
+	}
+}
+
 func TestUnquote(t *testing.T) {
 	tests := []struct {
 		input  string

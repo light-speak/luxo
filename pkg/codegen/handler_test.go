@@ -549,6 +549,70 @@ func TestGenerateHandlerWithRelations(t *testing.T) {
 	}
 }
 
+func TestGenerateHandlerNullableRelation(t *testing.T) {
+	// Nullable FK should generate nil check before Load
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("Post",
+					[]*ast.Directive{crudDirective()},
+					[]*ast.FieldDecl{
+						testField("id", "Int", directive("id"), directive("auto")),
+						testField("title", "String"),
+						{Name: "userId", Type: &ast.TypeRef{Name: "Int", Nullable: true}},
+						{Name: "user", Type: &ast.TypeRef{Name: "User", Nullable: true}},
+					},
+				),
+			},
+		}},
+	}
+	src := generateHandlerFile(result, "luxo", nil)
+	code := string(src)
+
+	// Nullable FK should have nil check: if post.UserId != nil {
+	if !strings.Contains(code, "if post.UserId != nil") {
+		t.Errorf("nullable FK should have nil check before Load:\n%s", code)
+	}
+	// Should dereference the pointer: *post.UserId
+	if !strings.Contains(code, "*post.UserId") {
+		t.Errorf("nullable FK should dereference pointer in Load call:\n%s", code)
+	}
+}
+
+func TestGenerateHandlerNonNullableRelation(t *testing.T) {
+	// Non-nullable FK should NOT have nil check
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("Post",
+					[]*ast.Directive{crudDirective()},
+					[]*ast.FieldDecl{
+						testField("id", "Int", directive("id"), directive("auto")),
+						testField("title", "String"),
+						testField("userId", "Int"),
+						{Name: "user", Type: &ast.TypeRef{Name: "User"}},
+					},
+				),
+			},
+		}},
+	}
+	src := generateHandlerFile(result, "luxo", nil)
+	code := string(src)
+
+	// Non-nullable FK should NOT have nil check
+	if strings.Contains(code, "if post.UserId != nil") {
+		t.Errorf("non-nullable FK should NOT have nil check:\n%s", code)
+	}
+	// Should NOT dereference pointer
+	if strings.Contains(code, "*post.UserId") {
+		t.Errorf("non-nullable FK should NOT dereference:\n%s", code)
+	}
+	// Should directly pass post.UserId
+	if !strings.Contains(code, "post.UserId, childCols") {
+		t.Errorf("should directly pass FK value:\n%s", code)
+	}
+}
+
 func TestGenerateHandlerDefaultFieldValue(t *testing.T) {
 	// Field with a default value should use HasParam in create handler
 	result := &semantic.Result{
@@ -571,5 +635,115 @@ func TestGenerateHandlerDefaultFieldValue(t *testing.T) {
 	// Field with default should have HasParam check
 	if !strings.Contains(code, `req.HasParam("role")`) {
 		t.Errorf("field with default should use HasParam:\n%s", code)
+	}
+}
+
+func TestGenerateHandlerHiddenField(t *testing.T) {
+	// @hidden fields should generate defaultCols excluding hidden fields
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("User",
+					[]*ast.Directive{crudDirective()},
+					[]*ast.FieldDecl{
+						testField("id", "Int", directive("id"), directive("auto")),
+						testField("name", "String"),
+						{Name: "password", Type: &ast.TypeRef{Name: "String"},
+							Directives: []*ast.Directive{{Name: "hidden"}}},
+					},
+				),
+			},
+		}},
+	}
+	src := generateHandlerFile(result, "app", nil)
+	code := string(src)
+
+	// Should generate defaultUserCols
+	if !strings.Contains(code, "defaultUserCols") {
+		t.Errorf("should generate defaultCols for model with @hidden:\n%s", code)
+	}
+	// defaultCols should not contain password
+	if strings.Contains(code, `"password"`) && strings.Contains(code, "defaultUserCols") {
+		// check that password is not in the defaultCols var
+		idx := strings.Index(code, "defaultUserCols")
+		line := code[idx : idx+200]
+		if strings.Contains(line, "password") {
+			t.Errorf("defaultCols should not contain @hidden field password:\n%s", line)
+		}
+	}
+}
+
+func TestGenerateHandlerHashField(t *testing.T) {
+	// @hash field should auto-hash in create handler
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("User",
+					[]*ast.Directive{crudDirective()},
+					[]*ast.FieldDecl{
+						testField("id", "Int", directive("id"), directive("auto")),
+						testField("name", "String"),
+						{Name: "password", Type: &ast.TypeRef{Name: "String"},
+							Directives: []*ast.Directive{{Name: "hash"}}},
+					},
+				),
+			},
+		}},
+	}
+	src := generateHandlerFile(result, "app", nil)
+	code := string(src)
+
+	if !strings.Contains(code, "luxocrypto.HashPassword") {
+		t.Errorf("@hash field should generate HashPassword call:\n%s", code)
+	}
+}
+
+func TestGenerateHandlerNullableParam(t *testing.T) {
+	// Nullable param should use & prefix in setter
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("Post",
+					[]*ast.Directive{crudDirective()},
+					[]*ast.FieldDecl{
+						testField("id", "Int", directive("id"), directive("auto")),
+						testField("title", "String"),
+						{Name: "subtitle", Type: &ast.TypeRef{Name: "String", Nullable: true}},
+					},
+				),
+			},
+		}},
+	}
+	src := generateHandlerFile(result, "app", nil)
+	code := string(src)
+
+	if !strings.Contains(code, "&subtitleVal") {
+		t.Errorf("nullable param should use & prefix:\n%s", code)
+	}
+}
+
+func TestGenerateHandlerEnumParam(t *testing.T) {
+	// Enum param should cast to enum type
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Enums: []*ast.EnumDecl{{Name: "Role", Values: []string{"ADMIN", "USER"}}},
+			Models: []*ast.ModelDecl{
+				testModel("User",
+					[]*ast.Directive{crudDirective()},
+					[]*ast.FieldDecl{
+						testField("id", "Int", directive("id"), directive("auto")),
+						testField("name", "String"),
+						{Name: "role", Type: &ast.TypeRef{Name: "Role"}},
+					},
+				),
+			},
+		}},
+	}
+	enums := collectEnums(result)
+	src := generateHandlerFile(result, "app", enums)
+	code := string(src)
+
+	if !strings.Contains(code, "Role(roleVal)") {
+		t.Errorf("enum param should cast to enum type:\n%s", code)
 	}
 }

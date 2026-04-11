@@ -56,6 +56,14 @@ func Get(key string) (string, bool) {
 	return os.LookupEnv(key)
 }
 
+// GetOrDefault reads an environment variable, returning fallback if not set.
+func GetOrDefault(key, fallback string) string {
+	if val, ok := os.LookupEnv(key); ok {
+		return val
+	}
+	return fallback
+}
+
 // MustGet reads an environment variable and panics if it is not set.
 func MustGet(key string) string {
 	val, ok := os.LookupEnv(key)

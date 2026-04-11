@@ -3,14 +3,14 @@ package api
 import (
 	"encoding/json"
 
+	"github.com/bytedance/sonic"
 	"github.com/light-speak/luxo/pkg/lux/selection"
 )
 
-// FilterFields filters a JSON-serializable value by the given field selection.
-// If fields is nil, returns the full value (no filtering).
-// Marshals data to JSON once, then filters — one marshal + one unmarshal.
-func FilterFields(data any, fields []*selection.Field) (json.RawMessage, error) {
-	raw, err := json.Marshal(data)
+// FilterFields serializes data and filters by $select in a single pass.
+// If fields is nil, returns the full serialization (no filtering).
+func FilterFields(data any, fields []*selection.Field) ([]byte, error) {
+	raw, err := sonic.Marshal(data)
 	if err != nil {
 		return nil, err
 	}
@@ -20,8 +20,8 @@ func FilterFields(data any, fields []*selection.Field) (json.RawMessage, error) 
 	return filterRaw(raw, fields)
 }
 
-// filterRaw applies field selection to a raw JSON value.
-func filterRaw(raw json.RawMessage, fields []*selection.Field) (json.RawMessage, error) {
+// filterRaw applies field selection to raw JSON bytes.
+func filterRaw(raw []byte, fields []*selection.Field) ([]byte, error) {
 	if len(raw) == 0 {
 		return raw, nil
 	}
@@ -36,9 +36,10 @@ func filterRaw(raw json.RawMessage, fields []*selection.Field) (json.RawMessage,
 }
 
 // filterObject keeps only the selected fields from a JSON object.
-func filterObject(raw json.RawMessage, fields []*selection.Field) (json.RawMessage, error) {
+// Uses sonic for fast unmarshal into raw map, then selectively re-serializes.
+func filterObject(raw []byte, fields []*selection.Field) ([]byte, error) {
 	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &obj); err != nil {
+	if err := sonic.Unmarshal(raw, &obj); err != nil {
 		return nil, err
 	}
 
@@ -59,13 +60,13 @@ func filterObject(raw json.RawMessage, fields []*selection.Field) (json.RawMessa
 		}
 	}
 
-	return json.Marshal(result)
+	return sonic.Marshal(result)
 }
 
 // filterArray applies field selection to each element of a JSON array.
-func filterArray(raw json.RawMessage, fields []*selection.Field) (json.RawMessage, error) {
+func filterArray(raw []byte, fields []*selection.Field) ([]byte, error) {
 	var arr []json.RawMessage
-	if err := json.Unmarshal(raw, &arr); err != nil {
+	if err := sonic.Unmarshal(raw, &arr); err != nil {
 		return nil, err
 	}
 
@@ -78,5 +79,5 @@ func filterArray(raw json.RawMessage, fields []*selection.Field) (json.RawMessag
 		result = append(result, filtered)
 	}
 
-	return json.Marshal(result)
+	return sonic.Marshal(result)
 }

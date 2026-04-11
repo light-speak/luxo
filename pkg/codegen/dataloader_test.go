@@ -519,3 +519,59 @@ func TestGenerateDefaultLoadersDeduplicate(t *testing.T) {
 		t.Errorf("UserByIdLoader type should be defined once, found %d times", typeCount)
 	}
 }
+
+func TestAnalyzeRelationsNullableFK(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "Post",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "userId", Type: &ast.TypeRef{Name: "Int", Nullable: true}},
+			{Name: "user", Type: &ast.TypeRef{Name: "User", Nullable: true}},
+		},
+	}
+	rels := analyzeRelations(m, map[string]bool{})
+	if len(rels) != 1 {
+		t.Fatalf("expected 1 relation, got %d", len(rels))
+	}
+	r := rels[0]
+	if r.Type != BelongsTo {
+		t.Errorf("type = %v, want BelongsTo", r.Type)
+	}
+	if !r.FKNullable {
+		t.Error("FKNullable should be true for userId: Int?")
+	}
+}
+
+func TestAnalyzeRelationsNonNullableFK(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "Post",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "user", Type: &ast.TypeRef{Name: "User"}},
+		},
+	}
+	rels := analyzeRelations(m, map[string]bool{})
+	r := rels[0]
+	if r.FKNullable {
+		t.Error("FKNullable should be false for userId: Int")
+	}
+}
+
+func TestIsFKNullable(t *testing.T) {
+	fields := []*ast.FieldDecl{
+		{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+		{Name: "userId", Type: &ast.TypeRef{Name: "Int", Nullable: true}},
+		{Name: "categoryId", Type: &ast.TypeRef{Name: "Int"}},
+	}
+
+	if !isFKNullable(fields, "userId") {
+		t.Error("userId should be nullable")
+	}
+	if isFKNullable(fields, "categoryId") {
+		t.Error("categoryId should not be nullable")
+	}
+	if isFKNullable(fields, "nonExistent") {
+		t.Error("non-existent field should return false")
+	}
+}

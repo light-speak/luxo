@@ -425,11 +425,22 @@ func generateRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relat
 
 		fmt.Fprintf(b, "\tfor _, f := range fields {\n")
 		fmt.Fprintf(b, "\t\tif f.Name == %q && f.Children != nil {\n", fieldName)
-		fmt.Fprintf(b, "\t\t\tchildCols := selection.SQLColumns(f.Children)\n")
-		fmt.Fprintf(b, "\t\t\tresult, err := app.loaders.%s.Load(ctx, %s.%s, childCols)\n",
-			loaderField, lower, goLocalKey)
-		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
-		fmt.Fprintf(b, "\t\t\t%s.%s = result\n", lower, str.Capitalize(fieldName))
+		if rel.FKNullable {
+			// Nullable FK — skip Load if nil
+			fmt.Fprintf(b, "\t\t\tif %s.%s != nil {\n", lower, goLocalKey)
+			fmt.Fprintf(b, "\t\t\t\tchildCols := selection.SQLColumns(f.Children)\n")
+			fmt.Fprintf(b, "\t\t\t\tresult, err := app.loaders.%s.Load(ctx, *%s.%s, childCols)\n",
+				loaderField, lower, goLocalKey)
+			fmt.Fprintf(b, "\t\t\t\tif err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n")
+			fmt.Fprintf(b, "\t\t\t\t%s.%s = result\n", lower, str.Capitalize(fieldName))
+			fmt.Fprintf(b, "\t\t\t}\n")
+		} else {
+			fmt.Fprintf(b, "\t\t\tchildCols := selection.SQLColumns(f.Children)\n")
+			fmt.Fprintf(b, "\t\t\tresult, err := app.loaders.%s.Load(ctx, %s.%s, childCols)\n",
+				loaderField, lower, goLocalKey)
+			fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
+			fmt.Fprintf(b, "\t\t\t%s.%s = result\n", lower, str.Capitalize(fieldName))
+		}
 
 		fmt.Fprintf(b, "\t\t\tbreak\n")
 		fmt.Fprintf(b, "\t\t}\n")

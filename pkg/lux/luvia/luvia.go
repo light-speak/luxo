@@ -9,6 +9,7 @@ import (
 	"github.com/light-speak/luxo/pkg/lux/api"
 	"github.com/light-speak/luxo/pkg/lux/auth"
 	"github.com/light-speak/luxo/pkg/lux/env"
+	"github.com/light-speak/luxo/pkg/lux/i18n"
 )
 
 // Gateway is the Luvia API gateway.
@@ -61,8 +62,20 @@ func (g *Gateway) buildMux(version string) (*http.ServeMux, string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", handleHealth)
 
-	// JWT auth middleware — wraps /luvia handler
+	// i18n — load translations (non-fatal if missing)
+	translator := i18n.New(envOr("APP_LOCALE", "en"))
+	if err := translator.LoadDir("i18n"); err == nil {
+		g.Router.SetTranslator(translator)
+	}
+
+	// Dev mode
+	if envOr("APP_ENV", "") == "development" {
+		g.Router.SetDevMode(true)
+	}
+
+	// Middleware chain: trace → auth → router
 	var handler http.Handler = g.Router
+	handler = api.TraceMiddleware(handler)
 	jwtCfg, err := auth.LoadConfig()
 	if err == nil {
 		handler = AuthMiddleware(jwtCfg, handler)
@@ -78,10 +91,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func envOr(key, fallback string) string {
-	if v, ok := env.Get(key); ok {
-		return v
-	}
-	return fallback
+	return env.GetOrDefault(key, fallback)
 }
 
 func printBanner(version, port, mode, transport, dbURL string, modules []string) {

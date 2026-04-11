@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/bytedance/sonic"
 	"github.com/nats-io/nats.go"
 )
 
 // NATSBus implements Bus using NATS messaging.
 // Used in multi-service mode for cross-process event delivery.
+// Serializes payloads to JSON at the wire boundary.
 type NATSBus struct {
 	conn *nats.Conn
 	subs []*nats.Subscription
@@ -18,6 +20,9 @@ type NATSBus struct {
 }
 
 var _ Bus = (*NATSBus)(nil)
+
+// bgCtx is a cached context.Background() to avoid per-message allocation.
+var bgCtx = context.Background()
 
 // NewNATSBus connects to NATS and returns a bus.
 func NewNATSBus(url string) (*NATSBus, error) {
@@ -28,18 +33,37 @@ func NewNATSBus(url string) (*NATSBus, error) {
 	return &NATSBus{conn: conn}, nil
 }
 
-// Emit publishes an event to NATS.
-func (b *NATSBus) Emit(ctx context.Context, name string, payload []byte) error {
-	return b.conn.Publish(name, payload)
+// Emit serializes payload to JSON and publishes to NATS.
+func (b *NATSBus) Emit(ctx context.Context, name string, payload any) error {
+	data, err := sonic.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("nats marshal: %w", err)
+	}
+	return b.conn.Publish(name, data)
 }
 
-// On subscribes to a NATS subject. Handler runs in NATS's goroutine pool.
+// On subscribes to a NATS subject. Handler receives []byte (raw JSON from wire).
 func (b *NATSBus) On(name string, handler Handler) error {
 	sub, err := b.conn.Subscribe(name, func(msg *nats.Msg) {
-		safeCall(handler, context.Background(), msg.Data)
+		safeCall(handler, bgCtx, msg.Data)
 	})
 	if err != nil {
 		return fmt.Errorf("nats subscribe: %w", err)
+	}
+	b.mu.Lock()
+	b.subs = append(b.subs, sub)
+	b.mu.Unlock()
+	return nil
+}
+
+// OnQueue subscribes with a queue group. Only one member of the group
+// receives each message — used for competing consumers across pods.
+func (b *NATSBus) OnQueue(name string, group string, handler Handler) error {
+	sub, err := b.conn.QueueSubscribe(name, group, func(msg *nats.Msg) {
+		safeCall(handler, bgCtx, msg.Data)
+	})
+	if err != nil {
+		return fmt.Errorf("nats queue subscribe: %w", err)
 	}
 	b.mu.Lock()
 	b.subs = append(b.subs, sub)
