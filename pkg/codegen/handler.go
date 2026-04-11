@@ -152,70 +152,37 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 
 	switch op {
 	case "get":
+		fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
+		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
+		fmt.Fprintf(b, "\t\tid, err := req.Param%s(\"id\")\n", paramMethod(idType))
+		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+		fmt.Fprintf(b, "\t\tcols := %s\n", colsExpr)
+		fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(%sWhere.Id.Eq(id)).Select(cols...).First(ctx)\n", name, name)
+		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		if hasRels {
-			fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
-	return func(ctx context.Context, req *api.Request) (any, error) {
-		id, err := req.Param%s("id")
-		if err != nil {
-			return nil, err
+			fmt.Fprintf(b, "\t\tif err := resolve%sRelations(ctx, app, result, req.Select); err != nil {\n", name)
+			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 		}
-		cols := %s
-		result, err := app.%s.Where(%sWhere.Id.Eq(id)).Select(cols...).First(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if err := resolve%sRelations(ctx, app, result, req.Select); err != nil {
-			return nil, err
-		}
-		return result, nil
-	}
-}
-
-`, str.Capitalize(apiName), paramMethod(idType), colsExpr, name, name, name)
-		} else {
-			fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
-	return func(ctx context.Context, req *api.Request) (any, error) {
-		id, err := req.Param%s("id")
-		if err != nil {
-			return nil, err
-		}
-		cols := %s
-		return app.%s.Where(%sWhere.Id.Eq(id)).Select(cols...).First(ctx)
-	}
-}
-
-`, str.Capitalize(apiName), paramMethod(idType), colsExpr, name, name)
-		}
+		fmt.Fprintf(b, "\t\tresult.WriteJSON(req.Buf, req.Select)\n")
+		fmt.Fprintf(b, "\t\treturn nil\n")
+		fmt.Fprintf(b, "\t}\n}\n\n")
 
 	case "list":
+		fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
+		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
+		fmt.Fprintf(b, "\t\tcols := %s\n", colsExpr)
+		fmt.Fprintf(b, "\t\tresults, err := app.%s.Where().Select(cols...).All(ctx)\n", name)
+		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		if hasRels {
-			fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
-	return func(ctx context.Context, req *api.Request) (any, error) {
-		cols := %s
-		results, err := app.%s.Where().Select(cols...).All(ctx)
-		if err != nil {
-			return nil, err
+			fmt.Fprintf(b, "\t\tfor _, item := range results {\n")
+			fmt.Fprintf(b, "\t\t\tif err := resolve%sRelations(ctx, app, item, req.Select); err != nil {\n", name)
+			fmt.Fprintf(b, "\t\t\t\treturn err\n\t\t\t}\n")
+			fmt.Fprintf(b, "\t\t}\n")
 		}
-		for _, item := range results {
-			if err := resolve%sRelations(ctx, app, item, req.Select); err != nil {
-				return nil, err
-			}
-		}
-		return results, nil
-	}
-}
-
-`, str.Capitalize(apiName), colsExpr, name, name)
-		} else {
-			fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
-	return func(ctx context.Context, req *api.Request) (any, error) {
-		cols := %s
-		return app.%s.Where().Select(cols...).All(ctx)
-	}
-}
-
-`, str.Capitalize(apiName), colsExpr, name)
-		}
+		lower := str.LowerFirst(name)
+		fmt.Fprintf(b, "\t\t%sListJSON(results).WriteJSON(req.Buf, req.Select)\n", lower)
+		fmt.Fprintf(b, "\t\treturn nil\n")
+		fmt.Fprintf(b, "\t}\n}\n\n")
 
 	case "create":
 		generateCreateHandler(b, m, apiName, enums)
@@ -225,39 +192,21 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 
 	case "delete":
 		soft := isSoftDelete(m)
+		fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
+		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
+		fmt.Fprintf(b, "\t\tid, err := req.Param%s(\"id\")\n", paramMethod(idType))
+		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		if soft {
-			fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
-	return func(ctx context.Context, req *api.Request) (any, error) {
-		id, err := req.Param%s("id")
-		if err != nil {
-			return nil, err
-		}
-		n, err := app.%s.SoftDelete(ctx, %sWhere.Id.Eq(id))
-		if err != nil {
-			return nil, err
-		}
-		return map[string]int64{"deleted": n}, nil
-	}
-}
-
-`, str.Capitalize(apiName), paramMethod(idType), name, name)
+			fmt.Fprintf(b, "\t\tn, err := app.%s.SoftDelete(ctx, %sWhere.Id.Eq(id))\n", name, name)
 		} else {
-			fmt.Fprintf(b, `func handle%s(app *App) api.HandlerFunc {
-	return func(ctx context.Context, req *api.Request) (any, error) {
-		id, err := req.Param%s("id")
-		if err != nil {
-			return nil, err
+			fmt.Fprintf(b, "\t\tn, err := app.%s.Where(%sWhere.Id.Eq(id)).Delete(ctx)\n", name, name)
 		}
-		n, err := app.%s.Where(%sWhere.Id.Eq(id)).Delete(ctx)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]int64{"deleted": n}, nil
-	}
-}
-
-`, str.Capitalize(apiName), paramMethod(idType), name, name)
-		}
+		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+		fmt.Fprintf(b, "\t\treq.Buf.AppendString(`{\"deleted\":`)\n")
+		fmt.Fprintf(b, "\t\treq.Buf.AppendInt(n)\n")
+		fmt.Fprintf(b, "\t\treq.Buf.AppendByte('}')\n")
+		fmt.Fprintf(b, "\t\treturn nil\n")
+		fmt.Fprintf(b, "\t}\n}\n\n")
 	}
 }
 
@@ -265,7 +214,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string, enums map[string]bool) {
 	name := m.Name
 	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
-	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) (any, error) {\n")
+	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 	fmt.Fprintf(b, "\t\tbuilder := app.%s.Create()\n", name)
 
 	for _, f := range m.Fields {
@@ -283,7 +232,10 @@ func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string,
 		}
 	}
 
-	fmt.Fprintf(b, "\t\treturn builder.Exec(ctx)\n")
+	fmt.Fprintf(b, "\t\tresult, err := builder.Exec(ctx)\n")
+	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+	fmt.Fprintf(b, "\t\tresult.WriteJSON(req.Buf, nil)\n")
+	fmt.Fprintf(b, "\t\treturn nil\n")
 	fmt.Fprintf(b, "\t}\n")
 	fmt.Fprintf(b, "}\n\n")
 }
@@ -292,14 +244,11 @@ func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string,
 func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType string, enums map[string]bool) {
 	name := m.Name
 	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
-	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) (any, error) {\n")
+	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 	fmt.Fprintf(b, "\t\tid, err := req.Param%s(\"id\")\n", paramMethod(idType))
-	fmt.Fprintf(b, "\t\tif err != nil {\n")
-	fmt.Fprintf(b, "\t\t\treturn nil, err\n")
-	fmt.Fprintf(b, "\t\t}\n")
+	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 	fmt.Fprintf(b, "\t\tif _, err := app.%s.Find(ctx, id); err != nil {\n", name)
-	fmt.Fprintf(b, "\t\t\treturn nil, err\n")
-	fmt.Fprintf(b, "\t\t}\n")
+	fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 	tableName := str.ToSnakeCase(name) + "s"
 	fmt.Fprintf(b, "\t\tbuilder := new%sUpdateBuilder(app.%s.db, %q, id)\n", name, name, tableName)
 
@@ -312,7 +261,10 @@ func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType
 		generateParamSet(b, f, setter, "\t\t\t", enums)
 		fmt.Fprintf(b, "\t\t}\n")
 	}
-	fmt.Fprintf(b, "\t\treturn builder.Exec(ctx)\n")
+	fmt.Fprintf(b, "\t\tresult, err := builder.Exec(ctx)\n")
+	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+	fmt.Fprintf(b, "\t\tresult.WriteJSON(req.Buf, nil)\n")
+	fmt.Fprintf(b, "\t\treturn nil\n")
 	fmt.Fprintf(b, "\t}\n")
 	fmt.Fprintf(b, "}\n\n")
 }
@@ -356,14 +308,14 @@ func generateParamSet(b *strings.Builder, f *ast.FieldDecl, setter, indent strin
 	method := paramMethod(resolveGoType(f.Type))
 	fmt.Fprintf(b, "%s%s, err := req.Param%s(%q)\n", indent, varName, method, f.Name)
 	fmt.Fprintf(b, "%sif err != nil {\n", indent)
-	fmt.Fprintf(b, "%s\treturn nil, fmt.Errorf(\"param %s: %%w\", err)\n", indent, f.Name)
+	fmt.Fprintf(b, "%s\treturn fmt.Errorf(\"param %s: %%w\", err)\n", indent, f.Name)
 	fmt.Fprintf(b, "%s}\n", indent)
 
 	// @hash: auto-hash password before save
 	if hasDirective(f.Directives, "hash") {
 		fmt.Fprintf(b, "%s%s, err = luxocrypto.HashPassword(%s)\n", indent, varName, varName)
 		fmt.Fprintf(b, "%sif err != nil {\n", indent)
-		fmt.Fprintf(b, "%s\treturn nil, fmt.Errorf(\"hash %s: %%w\", err)\n", indent, f.Name)
+		fmt.Fprintf(b, "%s\treturn fmt.Errorf(\"hash %s: %%w\", err)\n", indent, f.Name)
 		fmt.Fprintf(b, "%s}\n", indent)
 	}
 

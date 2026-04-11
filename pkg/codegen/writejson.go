@@ -22,6 +22,23 @@ func generateWriteJSONFile(result *semantic.Result, packageName string, enums ma
 		return nil
 	}
 
+	// Collect model names to skip extend stubs that are also full models
+	modelNames := make(map[string]bool)
+	for _, m := range models {
+		modelNames[m.Name] = true
+	}
+
+	// Collect extend stubs that need WriteJSON (cross-module types)
+	var stubs []*ast.ModelDecl
+	for _, file := range result.Files {
+		for _, ext := range file.Extends {
+			if modelNames[ext.Name] {
+				continue
+			}
+			stubs = append(stubs, &ast.ModelDecl{Name: ext.Name, Fields: ext.Fields})
+		}
+	}
+
 	var b strings.Builder
 	writeHeader(&b, packageName, "writejson.gen.go")
 	writeWriteJSONImports(&b, models)
@@ -29,6 +46,12 @@ func generateWriteJSONFile(result *semantic.Result, packageName string, enums ma
 	for _, m := range models {
 		generateWriteJSON(&b, m, enums)
 		generateListJSONWrapper(&b, m)
+	}
+
+	// Extend stubs: simple WriteJSON that delegates to sonic (no field-level optimization)
+	for _, s := range stubs {
+		generateWriteJSON(&b, s, enums)
+		generateListJSONWrapper(&b, s)
 	}
 
 	return []byte(b.String())
