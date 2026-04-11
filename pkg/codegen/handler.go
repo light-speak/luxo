@@ -72,6 +72,7 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 		generateSorterParser(&b, m)
 		if len(rels) > 0 {
 			generateRelationResolver(&b, m, rels)
+			generateListRelationResolver(&b, m, rels)
 		}
 	}
 
@@ -182,21 +183,16 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		if isSoftDelete(m) {
 			fmt.Fprintf(b, "\t\tconds = append(conds, lux.NewTimeField(\"deleted_at\").IsNull())\n")
 		}
-		// Count
-		fmt.Fprintf(b, "\t\ttotal, err := app.%s.Where(conds...).Count(ctx)\n", name)
-		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		// Query with pagination + sorting
+		// Query with pagination + sorting + parallel COUNT
 		fmt.Fprintf(b, "\t\tq := app.%s.Where(conds...).Select(cols...)\n", name)
 		fmt.Fprintf(b, "\t\tif sorts := parse%sSorters(req.Sorters); len(sorts) > 0 {\n", name)
 		fmt.Fprintf(b, "\t\t\tq = q.OrderBy(sorts...)\n")
 		fmt.Fprintf(b, "\t\t}\n")
-		fmt.Fprintf(b, "\t\tresults, err := q.Limit(req.PageSize).Offset((req.Page - 1) * req.PageSize).All(ctx)\n")
+		fmt.Fprintf(b, "\t\tresults, total, err := q.Limit(req.PageSize).Offset((req.Page - 1) * req.PageSize).AllWithCount(ctx)\n")
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		if hasRels {
-			fmt.Fprintf(b, "\t\tfor _, item := range results {\n")
-			fmt.Fprintf(b, "\t\t\tif err := resolve%sRelations(ctx, app, item, req.Select); err != nil {\n", name)
-			fmt.Fprintf(b, "\t\t\t\treturn err\n\t\t\t}\n")
-			fmt.Fprintf(b, "\t\t}\n")
+			fmt.Fprintf(b, "\t\tif err := resolve%sListRelations(ctx, app, results, req.Select); err != nil {\n", name)
+			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 		}
 		// Write paginated response: {items: [...], total: N, page: N, pageSize: N}
 		lower := str.LowerFirst(name)
@@ -420,27 +416,90 @@ func generateRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relat
 		fieldName := rel.FieldName
 		loaderField := loaderFieldName(name, rel)
 		localKey := rel.LocalKey
-
-		// Determine the Go field to read the FK from
 		goLocalKey := str.Capitalize(localKey)
+		goFieldName := str.Capitalize(fieldName)
 
 		fmt.Fprintf(b, "\tfor _, f := range fields {\n")
 		fmt.Fprintf(b, "\t\tif f.Name == %q && f.Children != nil {\n", fieldName)
+		fmt.Fprintf(b, "\t\t\tchildCols := selection.SQLColumns(f.Children)\n")
 		if rel.FKNullable {
-			// Nullable FK — skip Load if nil
 			fmt.Fprintf(b, "\t\t\tif %s.%s != nil {\n", lower, goLocalKey)
-			fmt.Fprintf(b, "\t\t\t\tchildCols := selection.SQLColumns(f.Children)\n")
 			fmt.Fprintf(b, "\t\t\t\tresult, err := app.loaders.%s.Load(ctx, *%s.%s, childCols)\n",
 				loaderField, lower, goLocalKey)
 			fmt.Fprintf(b, "\t\t\t\tif err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n")
-			fmt.Fprintf(b, "\t\t\t\t%s.%s = result\n", lower, str.Capitalize(fieldName))
+			fmt.Fprintf(b, "\t\t\t\t%s.%s = result\n", lower, goFieldName)
 			fmt.Fprintf(b, "\t\t\t}\n")
 		} else {
-			fmt.Fprintf(b, "\t\t\tchildCols := selection.SQLColumns(f.Children)\n")
 			fmt.Fprintf(b, "\t\t\tresult, err := app.loaders.%s.Load(ctx, %s.%s, childCols)\n",
 				loaderField, lower, goLocalKey)
 			fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
-			fmt.Fprintf(b, "\t\t\t%s.%s = result\n", lower, str.Capitalize(fieldName))
+			fmt.Fprintf(b, "\t\t\t%s.%s = result\n", lower, goFieldName)
+		}
+
+		fmt.Fprintf(b, "\t\t\tbreak\n")
+		fmt.Fprintf(b, "\t\t}\n")
+		fmt.Fprintf(b, "\t}\n")
+	}
+
+	fmt.Fprintf(b, "\treturn nil\n")
+	fmt.Fprintf(b, "}\n\n")
+}
+
+// generateListRelationResolver generates a batch resolve function for LIST handlers.
+// Uses LoadAll (direct dispatch, zero wait) instead of per-item Load.
+func generateListRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relation) {
+	name := m.Name
+	lower := strings.ToLower(name[:1]) + name[1:]
+	_ = lower
+
+	fmt.Fprintf(b, "// resolve%sListRelations batch-loads all relation fields for a list of %s.\n", name, name)
+	fmt.Fprintf(b, "// Uses LoadAll — direct dispatch, zero wait.\n")
+	fmt.Fprintf(b, "func resolve%sListRelations(ctx context.Context, app *App, items []*%s, fields []*selection.Field) error {\n", name, name)
+
+	for _, rel := range rels {
+		fieldName := rel.FieldName
+		loaderField := loaderFieldName(name, rel)
+		localKey := rel.LocalKey
+		goLocalKey := str.Capitalize(localKey)
+		goFieldName := str.Capitalize(fieldName)
+
+		fmt.Fprintf(b, "\tfor _, f := range fields {\n")
+		fmt.Fprintf(b, "\t\tif f.Name == %q && f.Children != nil {\n", fieldName)
+		fmt.Fprintf(b, "\t\t\tchildCols := selection.SQLColumns(f.Children)\n")
+
+		// Collect all keys
+		fmt.Fprintf(b, "\t\t\tkeys := make([]int64, 0, len(items))\n")
+		if rel.FKNullable {
+			fmt.Fprintf(b, "\t\t\tfor _, item := range items {\n")
+			fmt.Fprintf(b, "\t\t\t\tif item.%s != nil {\n", goLocalKey)
+			fmt.Fprintf(b, "\t\t\t\t\tkeys = append(keys, *item.%s)\n", goLocalKey)
+			fmt.Fprintf(b, "\t\t\t\t}\n")
+			fmt.Fprintf(b, "\t\t\t}\n")
+		} else {
+			fmt.Fprintf(b, "\t\t\tfor _, item := range items {\n")
+			fmt.Fprintf(b, "\t\t\t\tkeys = append(keys, item.%s)\n", goLocalKey)
+			fmt.Fprintf(b, "\t\t\t}\n")
+		}
+
+		// LoadAll — direct dispatch, zero wait
+		if rel.IsList {
+			fmt.Fprintf(b, "\t\t\tresultMap, err := app.loaders.%s.LoadAll(ctx, keys, childCols)\n", loaderField)
+		} else {
+			fmt.Fprintf(b, "\t\t\tresultMap, err := app.loaders.%s.LoadAll(ctx, keys, childCols)\n", loaderField)
+		}
+		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
+
+		// Map results back
+		if rel.FKNullable {
+			fmt.Fprintf(b, "\t\t\tfor _, item := range items {\n")
+			fmt.Fprintf(b, "\t\t\t\tif item.%s != nil {\n", goLocalKey)
+			fmt.Fprintf(b, "\t\t\t\t\titem.%s = resultMap[*item.%s]\n", goFieldName, goLocalKey)
+			fmt.Fprintf(b, "\t\t\t\t}\n")
+			fmt.Fprintf(b, "\t\t\t}\n")
+		} else {
+			fmt.Fprintf(b, "\t\t\tfor _, item := range items {\n")
+			fmt.Fprintf(b, "\t\t\t\titem.%s = resultMap[item.%s]\n", goFieldName, goLocalKey)
+			fmt.Fprintf(b, "\t\t\t}\n")
 		}
 
 		fmt.Fprintf(b, "\t\t\tbreak\n")

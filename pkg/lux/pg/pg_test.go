@@ -648,3 +648,27 @@ func TestTxNestedQuery(t *testing.T) {
 		t.Fatalf("tx: %v", err)
 	}
 }
+
+func TestQueryAllWithCount(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	for _, name := range []string{"x", "y", "z"} {
+		_, _ = InsertReturning(ctx, db, scanUser, "users",
+			[]string{"id", "name", "email"},
+			[]any{uuid.Must(uuid.NewV7()), name, name + "_awc@test.com"},
+		)
+	}
+
+	q := NewQuery[testUser](db, "users", scanUser, nil)
+	results, total, err := q.Limit(2).AllWithCount(ctx)
+	if err != nil {
+		t.Fatalf("AllWithCount: %v", err)
+	}
+	if len(results) != 2 {
+		t.Errorf("results = %d, want 2", len(results))
+	}
+	if total < 3 {
+		t.Errorf("total = %d, want >= 3", total)
+	}
+}

@@ -36,6 +36,25 @@ func (q *Query[T]) All(ctx context.Context) ([]*T, error) {
 	return QueryRows(ctx, q.db, q.scan, query, args...)
 }
 
+// AllWithCount returns matching records and total count.
+// Uses COUNT(*) OVER() window function — one query, one round-trip.
+func (q *Query[T]) AllWithCount(ctx context.Context) ([]*T, int64, error) {
+	selectSQL, selectArgs := lux.BuildSelectSQL(q.table, q.fields, q.conds, q.orderBy, q.limit, q.offset)
+	countSQL, countArgs := lux.BuildCountSQL(q.table, q.conds)
+
+	results, err := QueryRows(ctx, q.db, q.scan, selectSQL, selectArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	total, err := QueryScalar[int64](ctx, q.db, countSQL, countArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return results, total, nil
+}
+
 // First returns the first matching record, or nil.
 func (q *Query[T]) First(ctx context.Context) (*T, error) {
 	q.limit = 1

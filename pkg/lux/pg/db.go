@@ -37,7 +37,13 @@ type DB struct {
 //
 //	db, err := pg.NewDB(ctx, "postgres://user:pass@localhost:5432/mydb")
 func NewDB(ctx context.Context, connString string) (*DB, error) {
-	pool, err := pgxpool.New(ctx, connString)
+	config, err := pgxpool.ParseConfig(connString)
+	if err != nil {
+		return nil, fmt.Errorf("pg: parse config: %w", err)
+	}
+	config.MaxConns = 50
+	config.MinConns = 10
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		return nil, fmt.Errorf("pg: connect to database: %w", err)
 	}
