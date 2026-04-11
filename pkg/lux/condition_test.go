@@ -243,3 +243,98 @@ func TestNewFieldConstructors(t *testing.T) {
 		t.Errorf("TimeField: %q", sql)
 	}
 }
+
+func TestIntFieldFilterOp(t *testing.T) {
+	f := NewIntField("age")
+	tests := []struct {
+		op, val, wantSQL string
+	}{
+		{"eq", "25", "age = $1"},
+		{"ne", "25", "age != $1"},
+		{"gt", "18", "age > $1"},
+		{"gte", "18", "age >= $1"},
+		{"lt", "100", "age < $1"},
+		{"lte", "100", "age <= $1"},
+		{"unknown", "0", "age = $1"},
+	}
+	for _, tt := range tests {
+		sql, _ := f.FilterOp(tt.op, tt.val).ToSQL(1)
+		if sql != tt.wantSQL {
+			t.Errorf("IntField.FilterOp(%q, %q) = %q, want %q", tt.op, tt.val, sql, tt.wantSQL)
+		}
+	}
+}
+
+func TestStringFieldFilterOp(t *testing.T) {
+	f := NewStringField("name")
+	tests := []struct {
+		op, val, wantSQL string
+	}{
+		{"eq", "lin", "name = $1"},
+		{"ne", "lin", "name != $1"},
+		{"contains", "lin", "name LIKE $1"},
+		{"startswith", "li", "name LIKE $1"},
+		{"endswith", "in", "name LIKE $1"},
+		{"unknown", "x", "name = $1"},
+	}
+	for _, tt := range tests {
+		sql, _ := f.FilterOp(tt.op, tt.val).ToSQL(1)
+		if sql != tt.wantSQL {
+			t.Errorf("StringField.FilterOp(%q, %q) = %q, want %q", tt.op, tt.val, sql, tt.wantSQL)
+		}
+	}
+}
+
+func TestStringFieldFilterOpContainsValue(t *testing.T) {
+	f := NewStringField("name")
+	_, args := f.FilterOp("contains", "lin").ToSQL(1)
+	if args[0] != "%lin%" {
+		t.Errorf("contains value = %q, want %%lin%%", args[0])
+	}
+	_, args = f.FilterOp("startswith", "li").ToSQL(1)
+	if args[0] != "li%" {
+		t.Errorf("startswith value = %q, want li%%", args[0])
+	}
+	_, args = f.FilterOp("endswith", "in").ToSQL(1)
+	if args[0] != "%in" {
+		t.Errorf("endswith value = %q, want %%in", args[0])
+	}
+}
+
+func TestBoolFieldFilterOp(t *testing.T) {
+	f := NewBoolField("active")
+	sql, args := f.FilterOp("eq", "true").ToSQL(1)
+	if sql != "active = $1" || args[0] != true {
+		t.Errorf("BoolField true: sql=%q args=%v", sql, args)
+	}
+	sql, args = f.FilterOp("eq", "false").ToSQL(1)
+	if sql != "active = $1" || args[0] != false {
+		t.Errorf("BoolField false: sql=%q args=%v", sql, args)
+	}
+	sql, args = f.FilterOp("eq", "1").ToSQL(1)
+	if args[0] != true {
+		t.Errorf("BoolField '1' should be true")
+	}
+}
+
+func TestParseInt64(t *testing.T) {
+	tests := []struct {
+		input string
+		want  int64
+		err   bool
+	}{
+		{"42", 42, false},
+		{"-7", -7, false},
+		{"0", 0, false},
+		{"abc", 0, true},
+	}
+	for _, tt := range tests {
+		got, err := parseInt64(tt.input)
+		if tt.err && err == nil {
+			t.Errorf("parseInt64(%q) should error", tt.input)
+		}
+		if !tt.err && got != tt.want {
+			t.Errorf("parseInt64(%q) = %d, want %d", tt.input, got, tt.want)
+		}
+	}
+}

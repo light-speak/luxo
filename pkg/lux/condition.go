@@ -131,6 +131,70 @@ func (f DecimalField) Gte(v decimal.Decimal) Condition { return &cmpCond{col: f.
 func (f DecimalField) Lt(v decimal.Decimal) Condition  { return &cmpCond{col: f.col, op: "<", val: v} }
 func (f DecimalField) Lte(v decimal.Decimal) Condition { return &cmpCond{col: f.col, op: "<=", val: v} }
 
+// --- FilterOp: generic operator dispatch from string (used by generated filter parsers) ---
+
+// FilterOp creates a condition from string operator and value.
+func (f IntField) FilterOp(op, val string) Condition {
+	v, _ := parseInt64(val)
+	switch strings.ToLower(op) {
+	case "eq":
+		return f.Eq(v)
+	case "ne":
+		return f.Neq(v)
+	case "gt":
+		return f.Gt(v)
+	case "gte":
+		return f.Gte(v)
+	case "lt":
+		return f.Lt(v)
+	case "lte":
+		return f.Lte(v)
+	default:
+		return f.Eq(v)
+	}
+}
+
+// FilterOp creates a condition from string operator and value.
+func (f StringField) FilterOp(op, val string) Condition {
+	switch strings.ToLower(op) {
+	case "eq":
+		return f.Eq(val)
+	case "ne":
+		return f.Neq(val)
+	case "contains":
+		return f.Like("%" + val + "%")
+	case "startswith":
+		return f.Like(val + "%")
+	case "endswith":
+		return f.Like("%" + val)
+	default:
+		return f.Eq(val)
+	}
+}
+
+// FilterOp creates a condition from string operator and value.
+func (f BoolField) FilterOp(op, val string) Condition {
+	v := strings.EqualFold(val, "true") || val == "1"
+	return f.Eq(v)
+}
+
+func parseInt64(s string) (int64, error) {
+	var v int64
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			if c == '-' {
+				continue
+			}
+			return 0, fmt.Errorf("invalid int: %s", s)
+		}
+		v = v*10 + int64(c-'0')
+	}
+	if len(s) > 0 && s[0] == '-' {
+		v = -v
+	}
+	return v, nil
+}
+
 // --- Internal condition implementations ---
 
 // cmpCond is a comparison condition: col op $N.

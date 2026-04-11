@@ -280,6 +280,9 @@ func TestParseLine(t *testing.T) {
 		{`KEY='single'`, "KEY", "single", false},
 		{"  KEY  =  val  ", "KEY", "val", false},
 		{"KEY=a=b=c", "KEY", "a=b=c", false},
+		{"KEY=localhost                                # host", "KEY", "localhost", false},
+		{"KEY=5432                                     # port", "KEY", "5432", false},
+		{`KEY="has # inside"`, "KEY", "has # inside", false},
 		{"NOEQ", "", "", true},
 		{"=val", "", "", true},
 	}

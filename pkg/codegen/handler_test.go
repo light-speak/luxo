@@ -156,7 +156,7 @@ func TestGenerateHandlerCrudExceptDelete(t *testing.T) {
 	if !strings.Contains(code, "handleGetUser") {
 		t.Error("should have getUser")
 	}
-	if strings.Contains(code, "handleDeleteUser") {
+	if strings.Contains(code, "handleDeleteUser(") {
 		t.Error("should NOT have deleteUser")
 	}
 }
@@ -252,8 +252,8 @@ func TestPluralize(t *testing.T) {
 func TestCrudOperationsNoArgs(t *testing.T) {
 	m := testModel("User", []*ast.Directive{crudDirective()}, nil)
 	ops := crudOperations(m)
-	if len(ops) != 5 {
-		t.Errorf("got %d ops, want 5", len(ops))
+	if len(ops) != 6 {
+		t.Errorf("got %d ops, want 6", len(ops))
 	}
 }
 
@@ -280,8 +280,8 @@ func TestCrudOperationsMultipleDirectives(t *testing.T) {
 		{Name: "noTime"},
 	}, nil)
 	ops := crudOperations(m)
-	if len(ops) != 5 {
-		t.Errorf("got %d ops, want 5 (should skip non-crud directives)", len(ops))
+	if len(ops) != 6 {
+		t.Errorf("got %d ops, want 6 (should skip non-crud directives)", len(ops))
 	}
 }
 
@@ -293,8 +293,8 @@ func TestCrudOperationsUnknownArg(t *testing.T) {
 	}
 	m := testModel("User", []*ast.Directive{crudDirective(unknownArg)}, nil)
 	ops := crudOperations(m)
-	if len(ops) != 5 {
-		t.Errorf("got %d ops, want 5 (should fall through to default)", len(ops))
+	if len(ops) != 6 {
+		t.Errorf("got %d ops, want 6 (should fall through to default)", len(ops))
 	}
 }
 

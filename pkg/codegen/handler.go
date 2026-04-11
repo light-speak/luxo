@@ -9,8 +9,8 @@ import (
 	"github.com/light-speak/luxo/pkg/semantic"
 )
 
-// crudOps defines the 5 CRUD operations.
-var crudOps = []string{"get", "list", "create", "update", "delete"}
+// crudOps defines the 6 CRUD operations.
+var crudOps = []string{"get", "list", "create", "update", "delete", "deleteMany"}
 
 // generateHandlerFile produces handler.gen.go containing CRUD handlers and RegisterHandlers.
 // Returns nil if there are no @crud models.
@@ -43,10 +43,14 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
 	b.WriteString("\t\"fmt\"\n")
-	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
+	b.WriteString("\t\"strings\"\n")
+	b.WriteString("\n\t\"github.com/bytedance/sonic\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
 	if hasHash {
 		b.WriteString("\tluxocrypto \"github.com/light-speak/luxo/pkg/lux/crypto\"\n")
 	}
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/errors\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
 	b.WriteString(")\n\n")
 
@@ -57,13 +61,15 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 		}
 	}
 
-	// Generate handlers + relation resolvers per model (analyzeRelations once per model)
+	// Generate handlers + filter/sorter parsers + relation resolvers per model
 	for _, m := range models {
 		rels := analyzeRelations(m, enums)
 		ops := crudOperations(m)
 		for _, op := range ops {
 			generateHandler(&b, m, op, enums, rels)
 		}
+		generateFilterParser(&b, m, enums)
+		generateSorterParser(&b, m)
 		if len(rels) > 0 {
 			generateRelationResolver(&b, m, rels)
 		}
@@ -159,6 +165,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		fmt.Fprintf(b, "\t\tcols := %s\n", colsExpr)
 		fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(%sWhere.Id.Eq(id)).Select(cols...).First(ctx)\n", name, name)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+		fmt.Fprintf(b, "\t\tif result == nil {\n\t\t\treturn errors.NotFound.WithData(map[string]any{\"resource\": %q, \"id\": id})\n\t\t}\n", name)
 		if hasRels {
 			fmt.Fprintf(b, "\t\tif err := resolve%sRelations(ctx, app, result, req.Select); err != nil {\n", name)
 			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
@@ -171,7 +178,19 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 		fmt.Fprintf(b, "\t\tcols := %s\n", colsExpr)
-		fmt.Fprintf(b, "\t\tresults, err := app.%s.Where().Select(cols...).All(ctx)\n", name)
+		fmt.Fprintf(b, "\t\tconds := parse%sFilters(req.Filters)\n", name)
+		if isSoftDelete(m) {
+			fmt.Fprintf(b, "\t\tconds = append(conds, lux.NewTimeField(\"deleted_at\").IsNull())\n")
+		}
+		// Count
+		fmt.Fprintf(b, "\t\ttotal, err := app.%s.Where(conds...).Count(ctx)\n", name)
+		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+		// Query with pagination + sorting
+		fmt.Fprintf(b, "\t\tq := app.%s.Where(conds...).Select(cols...)\n", name)
+		fmt.Fprintf(b, "\t\tif sorts := parse%sSorters(req.Sorters); len(sorts) > 0 {\n", name)
+		fmt.Fprintf(b, "\t\t\tq = q.OrderBy(sorts...)\n")
+		fmt.Fprintf(b, "\t\t}\n")
+		fmt.Fprintf(b, "\t\tresults, err := q.Limit(req.PageSize).Offset((req.Page - 1) * req.PageSize).All(ctx)\n")
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		if hasRels {
 			fmt.Fprintf(b, "\t\tfor _, item := range results {\n")
@@ -179,8 +198,17 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 			fmt.Fprintf(b, "\t\t\t\treturn err\n\t\t\t}\n")
 			fmt.Fprintf(b, "\t\t}\n")
 		}
+		// Write paginated response: {items: [...], total: N, page: N, pageSize: N}
 		lower := str.LowerFirst(name)
+		fmt.Fprintf(b, "\t\treq.Buf.AppendString(`{\"items\":`)\n")
 		fmt.Fprintf(b, "\t\t%sListJSON(results).WriteJSON(req.Buf, req.Select)\n", lower)
+		fmt.Fprintf(b, "\t\treq.Buf.AppendString(`,\"total\":`)\n")
+		fmt.Fprintf(b, "\t\treq.Buf.AppendInt(total)\n")
+		fmt.Fprintf(b, "\t\treq.Buf.AppendString(`,\"page\":`)\n")
+		fmt.Fprintf(b, "\t\treq.Buf.AppendInt(int64(req.Page))\n")
+		fmt.Fprintf(b, "\t\treq.Buf.AppendString(`,\"pageSize\":`)\n")
+		fmt.Fprintf(b, "\t\treq.Buf.AppendInt(int64(req.PageSize))\n")
+		fmt.Fprintf(b, "\t\treq.Buf.AppendByte('}')\n")
 		fmt.Fprintf(b, "\t\treturn nil\n")
 		fmt.Fprintf(b, "\t}\n}\n\n")
 
@@ -200,6 +228,27 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 			fmt.Fprintf(b, "\t\tn, err := app.%s.SoftDelete(ctx, %sWhere.Id.Eq(id))\n", name, name)
 		} else {
 			fmt.Fprintf(b, "\t\tn, err := app.%s.Where(%sWhere.Id.Eq(id)).Delete(ctx)\n", name, name)
+		}
+		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+		fmt.Fprintf(b, "\t\tif n == 0 {\n\t\t\treturn errors.NotFound.WithData(map[string]any{\"resource\": %q, \"id\": id})\n\t\t}\n", name)
+		fmt.Fprintf(b, "\t\treq.Buf.AppendString(`{\"deleted\":`)\n")
+		fmt.Fprintf(b, "\t\treq.Buf.AppendInt(n)\n")
+		fmt.Fprintf(b, "\t\treq.Buf.AppendByte('}')\n")
+		fmt.Fprintf(b, "\t\treturn nil\n")
+		fmt.Fprintf(b, "\t}\n}\n\n")
+
+	case "deleteMany":
+		soft := isSoftDelete(m)
+		fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
+		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
+		fmt.Fprintf(b, "\t\tvar ids []%s\n", idType)
+		fmt.Fprintf(b, "\t\tif err := sonic.Unmarshal(req.Params[\"ids\"], &ids); err != nil {\n")
+		fmt.Fprintf(b, "\t\t\treturn fmt.Errorf(\"param ids: %%w\", err)\n")
+		fmt.Fprintf(b, "\t\t}\n")
+		if soft {
+			fmt.Fprintf(b, "\t\tn, err := app.%s.SoftDelete(ctx, %sWhere.Id.In(ids...))\n", name, name)
+		} else {
+			fmt.Fprintf(b, "\t\tn, err := app.%s.Where(%sWhere.Id.In(ids...)).Delete(ctx)\n", name, name)
 		}
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		fmt.Fprintf(b, "\t\treq.Buf.AppendString(`{\"deleted\":`)\n")
@@ -234,7 +283,7 @@ func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string,
 
 	fmt.Fprintf(b, "\t\tresult, err := builder.Exec(ctx)\n")
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-	fmt.Fprintf(b, "\t\tresult.WriteJSON(req.Buf, nil)\n")
+	fmt.Fprintf(b, "\t\tresult.WriteJSON(req.Buf, req.Select)\n")
 	fmt.Fprintf(b, "\t\treturn nil\n")
 	fmt.Fprintf(b, "\t}\n")
 	fmt.Fprintf(b, "}\n\n")
@@ -263,7 +312,7 @@ func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType
 	}
 	fmt.Fprintf(b, "\t\tresult, err := builder.Exec(ctx)\n")
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-	fmt.Fprintf(b, "\t\tresult.WriteJSON(req.Buf, nil)\n")
+	fmt.Fprintf(b, "\t\tresult.WriteJSON(req.Buf, req.Select)\n")
 	fmt.Fprintf(b, "\t\treturn nil\n")
 	fmt.Fprintf(b, "\t}\n")
 	fmt.Fprintf(b, "}\n\n")
@@ -408,6 +457,8 @@ func crudAPIName(modelName, op string) string {
 	switch op {
 	case "list":
 		return "list" + pluralize(modelName)
+	case "deleteMany":
+		return "delete" + pluralize(modelName)
 	default:
 		return op + modelName
 	}
@@ -450,6 +501,80 @@ func paramMethod(goType string) string {
 	default:
 		return "String"
 	}
+}
+
+// generateFilterParser generates a parse{Model}Filters function that converts
+// api.Filter to lux.Condition, only allowing @filterable fields.
+func generateFilterParser(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
+	name := m.Name
+	fmt.Fprintf(b, "// parse%sFilters converts request filters to SQL conditions.\n", name)
+	fmt.Fprintf(b, "// Only @filterable fields are allowed.\n")
+	fmt.Fprintf(b, "func parse%sFilters(filters []api.Filter) []lux.Condition {\n", name)
+	fmt.Fprintf(b, "\tvar conds []lux.Condition\n")
+	fmt.Fprintf(b, "\tfor _, f := range filters {\n")
+	fmt.Fprintf(b, "\t\tswitch f.Field {\n")
+
+	for _, f := range m.Fields {
+		if !hasDirective(f.Directives, "filterable") || f.Type == nil || f.Computed != nil {
+			continue
+		}
+		if isRelationField(f, enums) {
+			continue
+		}
+		col := str.ToSnakeCase(f.Name)
+		fmt.Fprintf(b, "\t\tcase %q:\n", f.Name)
+
+		switch f.Type.Name {
+		case "Int":
+			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewIntField(%q).FilterOp(f.Operator, f.Value))\n", col)
+		case "String":
+			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewStringField(%q).FilterOp(f.Operator, f.Value))\n", col)
+		case "Boolean":
+			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewBoolField(%q).FilterOp(f.Operator, f.Value))\n", col)
+		default:
+			// Enum or other types — treat as string
+			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewStringField(%q).FilterOp(f.Operator, f.Value))\n", col)
+		}
+	}
+
+	fmt.Fprintf(b, "\t\t}\n") // end switch
+	fmt.Fprintf(b, "\t}\n")   // end for
+	fmt.Fprintf(b, "\treturn conds\n")
+	fmt.Fprintf(b, "}\n\n")
+}
+
+// generateSorterParser generates a parse{Model}Sorters function that converts
+// api.Sorter to ORDER BY clauses, only allowing @sortable fields.
+func generateSorterParser(b *strings.Builder, m *ast.ModelDecl) {
+	name := m.Name
+	fmt.Fprintf(b, "// parse%sSorters converts request sorters to ORDER BY clauses.\n", name)
+	fmt.Fprintf(b, "// Only @sortable fields are allowed.\n")
+	fmt.Fprintf(b, "func parse%sSorters(sorters []api.Sorter) []string {\n", name)
+	fmt.Fprintf(b, "\tvar clauses []string\n")
+	fmt.Fprintf(b, "\tfor _, s := range sorters {\n")
+	fmt.Fprintf(b, "\t\tvar col string\n")
+	fmt.Fprintf(b, "\t\tswitch s.Field {\n")
+
+	for _, f := range m.Fields {
+		if !hasDirective(f.Directives, "sortable") || f.Type == nil || f.Computed != nil {
+			continue
+		}
+		col := str.ToSnakeCase(f.Name)
+		fmt.Fprintf(b, "\t\tcase %q:\n", f.Name)
+		fmt.Fprintf(b, "\t\t\tcol = %q\n", col)
+	}
+
+	fmt.Fprintf(b, "\t\tdefault:\n")
+	fmt.Fprintf(b, "\t\t\tcontinue\n")
+	fmt.Fprintf(b, "\t\t}\n") // end switch
+	fmt.Fprintf(b, "\t\tif strings.EqualFold(s.Order, \"desc\") {\n")
+	fmt.Fprintf(b, "\t\t\tclauses = append(clauses, col+\" DESC\")\n")
+	fmt.Fprintf(b, "\t\t} else {\n")
+	fmt.Fprintf(b, "\t\t\tclauses = append(clauses, col+\" ASC\")\n")
+	fmt.Fprintf(b, "\t\t}\n")
+	fmt.Fprintf(b, "\t}\n") // end for
+	fmt.Fprintf(b, "\treturn clauses\n")
+	fmt.Fprintf(b, "}\n\n")
 }
 
 // pluralize adds "s" to a name (simple English pluralization).

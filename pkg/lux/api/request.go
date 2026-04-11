@@ -10,12 +10,29 @@ import (
 	"github.com/light-speak/luxo/pkg/lux/selection"
 )
 
+// Filter represents a single filter condition from $filters.
+type Filter struct {
+	Field    string `json:"field"`
+	Operator string `json:"op"`
+	Value    string `json:"value"`
+}
+
+// Sorter represents a sort directive from $sorters.
+type Sorter struct {
+	Field string `json:"field"`
+	Order string `json:"order"` // "asc" or "desc"
+}
+
 // Request represents a parsed Luvia API request.
 type Request struct {
-	API    string                     // $api field
-	Select []*selection.Field         // parsed $select
-	Params map[string]json.RawMessage // remaining fields as raw JSON
-	Buf    *ResponseBuf               // response buffer — handler writes directly here
+	API      string                     // $api field
+	Select   []*selection.Field         // parsed $select
+	Params   map[string]json.RawMessage // remaining fields as raw JSON
+	Buf      *ResponseBuf               // response buffer — handler writes directly here
+	Filters  []Filter                   // parsed $filters
+	Sorters  []Sorter                   // parsed $sorters
+	Page     int                        // page number (default 1)
+	PageSize int                        // page size (default 20)
 }
 
 // ParseRequest reads an HTTP request body and extracts $api, $select, and params.
@@ -64,15 +81,50 @@ func ParseRequest(r *http.Request) (*Request, error) {
 		req.Select = fields
 	}
 
+	// Extract list params (filters, sorters, pagination)
+	if err := req.parseListParams(raw); err != nil {
+		return nil, err
+	}
+
 	// Remaining fields are params
+	reserved := map[string]bool{"$api": true, "$select": true, "$filters": true, "$sorters": true, "page": true, "pageSize": true}
 	for k, v := range raw {
-		if k == "$api" || k == "$select" {
+		if reserved[k] {
 			continue
 		}
 		req.Params[k] = v
 	}
 
 	return req, nil
+}
+
+// parseListParams extracts $filters, $sorters, page, pageSize from raw request.
+func (req *Request) parseListParams(raw map[string]json.RawMessage) error {
+	if filtersRaw, ok := raw["$filters"]; ok {
+		if err := sonic.Unmarshal(filtersRaw, &req.Filters); err != nil {
+			return fmt.Errorf("$filters: %w", err)
+		}
+	}
+	if sortersRaw, ok := raw["$sorters"]; ok {
+		if err := sonic.Unmarshal(sortersRaw, &req.Sorters); err != nil {
+			return fmt.Errorf("$sorters: %w", err)
+		}
+	}
+	req.Page = 1
+	req.PageSize = 20
+	if pageRaw, ok := raw["page"]; ok {
+		sonic.Unmarshal(pageRaw, &req.Page)
+	}
+	if psRaw, ok := raw["pageSize"]; ok {
+		sonic.Unmarshal(psRaw, &req.PageSize)
+	}
+	if req.Page < 1 {
+		req.Page = 1
+	}
+	if req.PageSize < 1 || req.PageSize > 100 {
+		req.PageSize = 20
+	}
+	return nil
 }
 
 // ParamInt extracts an integer parameter.

@@ -190,3 +190,107 @@ func TestParamMissing(t *testing.T) {
 		t.Fatal("expected error for missing param")
 	}
 }
+
+func TestParseRequestWithFilters(t *testing.T) {
+	body := `{"$api":"listUsers","$filters":[{"field":"role","op":"eq","value":"ADMIN"}]}`
+	req, err := ParseRequest(makeReq(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(req.Filters) != 1 {
+		t.Fatalf("filters = %d, want 1", len(req.Filters))
+	}
+	if req.Filters[0].Field != "role" || req.Filters[0].Operator != "eq" || req.Filters[0].Value != "ADMIN" {
+		t.Errorf("filter = %+v", req.Filters[0])
+	}
+}
+
+func TestParseRequestWithSorters(t *testing.T) {
+	body := `{"$api":"listUsers","$sorters":[{"field":"name","order":"desc"}]}`
+	req, err := ParseRequest(makeReq(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(req.Sorters) != 1 {
+		t.Fatalf("sorters = %d, want 1", len(req.Sorters))
+	}
+	if req.Sorters[0].Field != "name" || req.Sorters[0].Order != "desc" {
+		t.Errorf("sorter = %+v", req.Sorters[0])
+	}
+}
+
+func TestParseRequestPagination(t *testing.T) {
+	body := `{"$api":"listUsers","page":3,"pageSize":50}`
+	req, err := ParseRequest(makeReq(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Page != 3 {
+		t.Errorf("page = %d, want 3", req.Page)
+	}
+	if req.PageSize != 50 {
+		t.Errorf("pageSize = %d, want 50", req.PageSize)
+	}
+	// page/pageSize should NOT be in Params
+	if req.HasParam("page") || req.HasParam("pageSize") {
+		t.Error("page/pageSize should not be in Params")
+	}
+}
+
+func TestParseRequestPaginationDefaults(t *testing.T) {
+	body := `{"$api":"listUsers"}`
+	req, err := ParseRequest(makeReq(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Page != 1 {
+		t.Errorf("default page = %d, want 1", req.Page)
+	}
+	if req.PageSize != 20 {
+		t.Errorf("default pageSize = %d, want 20", req.PageSize)
+	}
+}
+
+func TestParseRequestPaginationClamp(t *testing.T) {
+	body := `{"$api":"listUsers","page":-1,"pageSize":999}`
+	req, err := ParseRequest(makeReq(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Page != 1 {
+		t.Errorf("clamped page = %d, want 1", req.Page)
+	}
+	if req.PageSize != 20 {
+		t.Errorf("clamped pageSize = %d, want 20 (>100 resets)", req.PageSize)
+	}
+}
+
+func TestParseRequestBadFilters(t *testing.T) {
+	body := `{"$api":"test","$filters":"not_array"}`
+	_, err := ParseRequest(makeReq(body))
+	if err == nil {
+		t.Fatal("expected error for bad $filters")
+	}
+}
+
+func TestParseRequestBadSorters(t *testing.T) {
+	body := `{"$api":"test","$sorters":"not_array"}`
+	_, err := ParseRequest(makeReq(body))
+	if err == nil {
+		t.Fatal("expected error for bad $sorters")
+	}
+}
+
+func TestParseRequestReservedNotInParams(t *testing.T) {
+	body := `{"$api":"test","$filters":[],"$sorters":[],"page":1,"pageSize":10,"name":"lin"}`
+	req, err := ParseRequest(makeReq(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !req.HasParam("name") {
+		t.Error("name should be in params")
+	}
+	if req.HasParam("$filters") || req.HasParam("$sorters") || req.HasParam("page") {
+		t.Error("reserved fields should not be in params")
+	}
+}

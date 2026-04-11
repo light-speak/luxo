@@ -133,11 +133,11 @@ func buildColumnState(f *ast.FieldDecl, dialect lux.Dialect) *ColumnState {
 		if lit, ok := f.Default.(*ast.Literal); ok {
 			cs.Default = defaultSQL(f.Type.Name, lit.Value)
 		} else if ident, ok := f.Default.(*ast.Ident); ok {
+			// Enum default: USER → 'USER'
+			cs.Default = "'" + ident.Name + "'"
+		} else if member, ok := f.Default.(*ast.MemberExpr); ok {
 			// Enum default: Role.USER → 'USER'
-			parts := strings.SplitN(ident.Name, ".", 2)
-			if len(parts) == 2 {
-				cs.Default = "'" + parts[1] + "'"
-			}
+			cs.Default = "'" + member.Field + "'"
 		}
 	}
 	return cs
@@ -165,7 +165,7 @@ func collectIndexes(m *ast.ModelDecl, table string) []lux.IndexInfo {
 		}
 		col := str.ToSnakeCase(f.Name)
 
-		if hasDirective(f.Directives, "index") {
+		if hasDirective(f.Directives, "index") || hasDirective(f.Directives, "filterable") {
 			indexes = append(indexes, lux.IndexInfo{
 				Name: "idx_" + table + "_" + col, Kind: lux.BTreeIndex, Columns: []string{col},
 			})
