@@ -191,9 +191,7 @@ func writeScalarFieldJSON(b *strings.Builder, f *ast.FieldDecl, expr string) {
 	case "Boolean":
 		fmt.Fprintf(b, "\t\t\tbuf.AppendBool(%s)\n", expr)
 	case "DateTime":
-		fmt.Fprintf(b, "\t\t\tbuf.AppendByte('\"')\n")
-		fmt.Fprintf(b, "\t\t\tbuf.AppendString(%s.Format(time.RFC3339Nano))\n", expr)
-		fmt.Fprintf(b, "\t\t\tbuf.AppendByte('\"')\n")
+		fmt.Fprintf(b, "\t\t\tbuf.AppendTime(%s, time.RFC3339Nano)\n", expr)
 	case "Duration":
 		fmt.Fprintf(b, "\t\t\tbuf.AppendInt(int64(%s))\n", expr)
 	case "UUID":

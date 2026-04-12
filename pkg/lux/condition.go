@@ -1,7 +1,6 @@
 package lux
 
 import (
-	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -356,7 +355,14 @@ type cmpCond struct {
 }
 
 func (c *cmpCond) ToSQL(argOffset int) (string, []any) {
-	return fmt.Sprintf("%s %s $%d", c.col, c.op, argOffset), []any{c.val}
+	// c.col + " " + c.op + " $" + itoa — no fmt.Sprintf
+	var buf [32]byte
+	b := append(buf[:0], c.col...)
+	b = append(b, ' ')
+	b = append(b, c.op...)
+	b = append(b, " $"...)
+	b = strconv.AppendInt(b, int64(argOffset), 10)
+	return string(b), []any{c.val}
 }
 
 // inCond is an IN condition: col IN ($N, $N+1, ...).
@@ -369,11 +375,19 @@ func (c *inCond) ToSQL(argOffset int) (string, []any) {
 	if len(c.vals) == 0 {
 		return "FALSE", nil
 	}
-	placeholders := make([]string, len(c.vals))
+	var b strings.Builder
+	b.WriteString(c.col)
+	b.WriteString(" IN (")
+	var tmp [20]byte
 	for i := range c.vals {
-		placeholders[i] = fmt.Sprintf("$%d", argOffset+i)
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteByte('$')
+		b.Write(strconv.AppendInt(tmp[:0], int64(argOffset+i), 10))
 	}
-	return fmt.Sprintf("%s IN (%s)", c.col, strings.Join(placeholders, ", ")), c.vals
+	b.WriteByte(')')
+	return b.String(), c.vals
 }
 
 // notInCond is a NOT IN condition: col NOT IN ($N, $N+1, ...).
@@ -386,11 +400,19 @@ func (c *notInCond) ToSQL(argOffset int) (string, []any) {
 	if len(c.vals) == 0 {
 		return "TRUE", nil
 	}
-	placeholders := make([]string, len(c.vals))
+	var b strings.Builder
+	b.WriteString(c.col)
+	b.WriteString(" NOT IN (")
+	var tmp [20]byte
 	for i := range c.vals {
-		placeholders[i] = fmt.Sprintf("$%d", argOffset+i)
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteByte('$')
+		b.Write(strconv.AppendInt(tmp[:0], int64(argOffset+i), 10))
 	}
-	return fmt.Sprintf("%s NOT IN (%s)", c.col, strings.Join(placeholders, ", ")), c.vals
+	b.WriteByte(')')
+	return b.String(), c.vals
 }
 
 // nullCond is a NULL/NOT NULL condition: col IS NULL or col IS NOT NULL.
@@ -401,9 +423,9 @@ type nullCond struct {
 
 func (c *nullCond) ToSQL(argOffset int) (string, []any) {
 	if c.isNull {
-		return fmt.Sprintf("%s IS NULL", c.col), nil
+		return c.col + " IS NULL", nil
 	}
-	return fmt.Sprintf("%s IS NOT NULL", c.col), nil
+	return c.col + " IS NOT NULL", nil
 }
 
 // betweenCond is a BETWEEN condition: col BETWEEN $N AND $N+1.
@@ -414,7 +436,14 @@ type betweenCond struct {
 }
 
 func (c *betweenCond) ToSQL(argOffset int) (string, []any) {
-	return fmt.Sprintf("%s BETWEEN $%d AND $%d", c.col, argOffset, argOffset+1), []any{c.from, c.to}
+	var b strings.Builder
+	var tmp [20]byte
+	b.WriteString(c.col)
+	b.WriteString(" BETWEEN $")
+	b.Write(strconv.AppendInt(tmp[:0], int64(argOffset), 10))
+	b.WriteString(" AND $")
+	b.Write(strconv.AppendInt(tmp[:0], int64(argOffset+1), 10))
+	return b.String(), []any{c.from, c.to}
 }
 
 // falseCond always evaluates to FALSE — used when filter input is invalid.
@@ -450,7 +479,9 @@ func (c *rawCond) ToSQL(argOffset int) (string, []any) {
 			for _, ch := range c.sql[i+1 : j] {
 				n = n*10 + int(ch-'0')
 			}
-			fmt.Fprintf(&b, "$%d", argOffset+n-1)
+			b.WriteByte('$')
+			var tmp [20]byte
+			b.Write(strconv.AppendInt(tmp[:0], int64(argOffset+n-1), 10))
 			i = j
 		} else {
 			b.WriteByte(c.sql[i])

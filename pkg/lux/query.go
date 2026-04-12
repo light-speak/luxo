@@ -1,7 +1,7 @@
 package lux
 
 import (
-	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -19,11 +19,25 @@ func BuildSelectSQL(table string, fields []string, conds []Condition, orderBy []
 	} else {
 		b.WriteByte('*')
 	}
-	fmt.Fprintf(&b, " FROM %s", table)
+	b.WriteString(" FROM ")
+	b.WriteString(table)
 	argIdx, args = appendWhere(&b, argIdx, args, conds)
 	appendOrderBy(&b, orderBy)
 	appendLimitOffset(&b, &argIdx, &args, limit, offset)
 
+	return b.String(), args
+}
+
+// BuildExistsSQL builds a SELECT EXISTS(SELECT 1 FROM ... WHERE ... LIMIT 1) query.
+func BuildExistsSQL(table string, conds []Condition) (string, []any) {
+	var b strings.Builder
+	var args []any
+	argIdx := 1
+	b.WriteString("SELECT EXISTS(SELECT 1 FROM ")
+	b.WriteString(table)
+	argIdx, args = appendWhere(&b, argIdx, args, conds)
+	_ = argIdx
+	b.WriteString(" LIMIT 1)")
 	return b.String(), args
 }
 
@@ -32,7 +46,8 @@ func BuildCountSQL(table string, conds []Condition) (string, []any) {
 	var b strings.Builder
 	var args []any
 	argIdx := 1
-	fmt.Fprintf(&b, "SELECT COUNT(*) FROM %s", table)
+	b.WriteString("SELECT COUNT(*) FROM ")
+	b.WriteString(table)
 	argIdx, args = appendWhere(&b, argIdx, args, conds)
 	_ = argIdx
 	return b.String(), args
@@ -43,7 +58,8 @@ func BuildDeleteSQL(table string, conds []Condition) (string, []any) {
 	var b strings.Builder
 	var args []any
 	argIdx := 1
-	fmt.Fprintf(&b, "DELETE FROM %s", table)
+	b.WriteString("DELETE FROM ")
+	b.WriteString(table)
 	argIdx, args = appendWhere(&b, argIdx, args, conds)
 	_ = argIdx
 	return b.String(), args
@@ -54,12 +70,17 @@ func BuildUpdateSQL(table string, sets []SetField, conds []Condition) (string, [
 	var b strings.Builder
 	var args []any
 	argIdx := 1
-	fmt.Fprintf(&b, "UPDATE %s SET ", table)
+	b.WriteString("UPDATE ")
+	b.WriteString(table)
+	b.WriteString(" SET ")
+	var tmp [20]byte
 	for i, s := range sets {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		fmt.Fprintf(&b, "%s = $%d", s.Col, argIdx)
+		b.WriteString(s.Col)
+		b.WriteString(" = $")
+		b.Write(strconv.AppendInt(tmp[:0], int64(argIdx), 10))
 		args = append(args, s.Val)
 		argIdx++
 	}
@@ -94,13 +115,16 @@ func appendOrderBy(b *strings.Builder, orderBy []string) {
 }
 
 func appendLimitOffset(b *strings.Builder, argIdx *int, args *[]any, limit, offset int) {
+	var tmp [20]byte
 	if limit > 0 {
-		fmt.Fprintf(b, " LIMIT $%d", *argIdx)
+		b.WriteString(" LIMIT $")
+		b.Write(strconv.AppendInt(tmp[:0], int64(*argIdx), 10))
 		*args = append(*args, limit)
 		*argIdx++
 	}
 	if offset > 0 {
-		fmt.Fprintf(b, " OFFSET $%d", *argIdx)
+		b.WriteString(" OFFSET $")
+		b.Write(strconv.AppendInt(tmp[:0], int64(*argIdx), 10))
 		*args = append(*args, offset)
 		*argIdx++
 	}

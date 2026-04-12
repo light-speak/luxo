@@ -37,22 +37,32 @@ func (q *Query[T]) All(ctx context.Context) ([]*T, error) {
 }
 
 // AllWithCount returns matching records and total count.
-// Uses COUNT(*) OVER() window function — one query, one round-trip.
+// Runs select and count queries concurrently for lower latency.
 func (q *Query[T]) AllWithCount(ctx context.Context) ([]*T, int64, error) {
 	selectSQL, selectArgs := lux.BuildSelectSQL(q.table, q.fields, q.conds, q.orderBy, q.limit, q.offset)
 	countSQL, countArgs := lux.BuildCountSQL(q.table, q.conds)
+
+	type countResult struct {
+		n   int64
+		err error
+	}
+	ch := make(chan countResult, 1)
+	go func() {
+		n, err := QueryScalar[int64](ctx, q.db, countSQL, countArgs...)
+		ch <- countResult{n, err}
+	}()
 
 	results, err := QueryRows(ctx, q.db, q.scan, selectSQL, selectArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
 
-	total, err := QueryScalar[int64](ctx, q.db, countSQL, countArgs...)
-	if err != nil {
-		return nil, 0, err
+	cr := <-ch
+	if cr.err != nil {
+		return nil, 0, cr.err
 	}
 
-	return results, total, nil
+	return results, cr.n, nil
 }
 
 // First returns the first matching record, or nil.
@@ -69,9 +79,10 @@ func (q *Query[T]) Count(ctx context.Context) (int64, error) {
 }
 
 // Exists returns true if any matching record exists.
+// Uses SELECT EXISTS(SELECT 1 ... LIMIT 1) — short-circuits on first match.
 func (q *Query[T]) Exists(ctx context.Context) (bool, error) {
-	count, err := q.Count(ctx)
-	return count > 0, err
+	query, args := lux.BuildExistsSQL(q.table, q.conds)
+	return QueryScalar[bool](ctx, q.db, query, args...)
 }
 
 // OrderBy adds ORDER BY clauses.
