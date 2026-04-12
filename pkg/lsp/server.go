@@ -23,10 +23,29 @@ type Server struct {
 
 // NewServer creates a new LSP server.
 func NewServer(reader io.Reader, writer io.Writer, logger *log.Logger) *Server {
-	return &Server{
+	srv := &Server{
 		transport: NewTransport(reader, writer),
 		docs:      NewDocumentStore(),
 		logger:    logger,
+	}
+	// After debounced analysis, push diagnostics for all open docs
+	srv.docs.OnAnalyzed = func() {
+		srv.publishAllDiagnostics()
+	}
+	return srv
+}
+
+// publishAllDiagnostics pushes diagnostics for all open documents.
+func (s *Server) publishAllDiagnostics() {
+	s.docs.mu.RLock()
+	docs := make([]*Document, 0, len(s.docs.docs))
+	for _, doc := range s.docs.docs {
+		docs = append(docs, doc)
+	}
+	s.docs.mu.RUnlock()
+
+	for _, doc := range docs {
+		s.publishDiagnostics(doc)
 	}
 }
 
@@ -145,8 +164,10 @@ func (s *Server) handleDidChange(req *Request) error {
 	}
 
 	content := params.ContentChanges[len(params.ContentChanges)-1].Text
-	doc := s.docs.Update(params.TextDocument.URI, params.TextDocument.Version, content)
-	return s.publishDiagnostics(doc)
+	s.docs.Update(params.TextDocument.URI, params.TextDocument.Version, content)
+	// Don't publish diagnostics here — analysis is debounced.
+	// The debounce callback will call publishAllDiagnostics after analysis completes.
+	return nil
 }
 
 func (s *Server) handleDidClose(req *Request) error {

@@ -34,6 +34,9 @@ type DocumentStore struct {
 	docs          map[string]*Document
 	debounceTimer *time.Timer
 	debounceMu    sync.Mutex
+	siblingCache  []*Document // cached sibling files (refreshed on open/close)
+	siblingDirty  bool        // true when sibling cache needs refresh
+	OnAnalyzed    func()      // called after analyzeAll completes (for pushing diagnostics)
 }
 
 const analyzeDebounce = 100 * time.Millisecond
@@ -55,6 +58,7 @@ func (s *DocumentStore) Open(uri string, version int, content string) *Document 
 
 	s.mu.Lock()
 	s.docs[uri] = doc
+	s.siblingDirty = true // new file opened, refresh sibling discovery
 	s.mu.Unlock()
 
 	s.analyzeAll()
@@ -72,6 +76,11 @@ func (s *DocumentStore) Update(uri string, version int, content string) *Documen
 	}
 	doc.Version = version
 	doc.Content = content
+	// Clear stale results immediately so diagnostics don't flicker
+	doc.lexErrors = nil
+	doc.parseErrors = nil
+	doc.File = nil
+	doc.Tokens = nil
 	s.mu.Unlock()
 
 	s.scheduleAnalysis()
@@ -101,6 +110,7 @@ func (s *DocumentStore) Get(uri string) *Document {
 func (s *DocumentStore) Close(uri string) {
 	s.mu.Lock()
 	delete(s.docs, uri)
+	s.siblingDirty = true
 	s.mu.Unlock()
 }
 
@@ -114,9 +124,17 @@ func (s *DocumentStore) analyzeAll() {
 	}
 	s.mu.RUnlock()
 
-	// Discover sibling .luxo files that aren't open yet
-	discovered := s.discoverSiblingFiles(docs)
-	allDocs := append(docs, discovered...)
+	// Discover sibling .luxo files (cached, only refreshed on open/close)
+	s.mu.RLock()
+	dirty := s.siblingDirty
+	s.mu.RUnlock()
+	if dirty || s.siblingCache == nil {
+		s.siblingCache = s.discoverSiblingFiles(docs)
+		s.mu.Lock()
+		s.siblingDirty = false
+		s.mu.Unlock()
+	}
+	allDocs := append(docs, s.siblingCache...)
 
 	// Phase 1: lex and parse each file independently
 	var files []*ast.File
@@ -145,6 +163,11 @@ func (s *DocumentStore) analyzeAll() {
 	// distribute results to each document
 	for _, doc := range allDocs {
 		doc.Result = result
+	}
+
+	// notify server to push diagnostics
+	if s.OnAnalyzed != nil {
+		s.OnAnalyzed()
 	}
 }
 
