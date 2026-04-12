@@ -88,9 +88,17 @@ func parseLine(line string) (string, string, error) {
 
 	value := strings.TrimSpace(line[idx+1:])
 
-	// Strip inline comments for unquoted values: KEY=value # comment
-	// Quoted values preserve # inside quotes.
-	if len(value) > 0 && value[0] != '"' && value[0] != '\'' {
+	// Strip inline comments.
+	// For unquoted values: KEY=value # comment
+	// For quoted values: KEY="value" # comment — find closing quote first
+	if len(value) > 0 && (value[0] == '"' || value[0] == '\'') {
+		quote := value[0]
+		end := strings.IndexByte(value[1:], quote)
+		if end >= 0 {
+			// Extract just the quoted portion, discard trailing comment
+			value = value[:end+2]
+		}
+	} else {
 		if ci := strings.Index(value, " #"); ci >= 0 {
 			value = strings.TrimSpace(value[:ci])
 		}

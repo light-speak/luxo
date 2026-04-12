@@ -82,6 +82,27 @@ func (f FloatField) Between(from, to float64) Condition {
 	return &betweenCond{col: f.col, from: from, to: to}
 }
 
+func (f FloatField) IsNull() Condition    { return &nullCond{col: f.col, isNull: true} }
+func (f FloatField) IsNotNull() Condition { return &nullCond{col: f.col, isNull: false} }
+
+// In returns a condition matching any of the given values.
+func (f FloatField) In(vs ...float64) Condition {
+	vals := make([]any, len(vs))
+	for i, v := range vs {
+		vals[i] = v
+	}
+	return &inCond{col: f.col, vals: vals}
+}
+
+// NotIn returns a condition excluding the given values.
+func (f FloatField) NotIn(vs ...float64) Condition {
+	vals := make([]any, len(vs))
+	for i, v := range vs {
+		vals[i] = v
+	}
+	return &notInCond{col: f.col, vals: vals}
+}
+
 // StringField provides typed conditions for string columns.
 type StringField struct{ col string }
 
@@ -189,6 +210,15 @@ func (f UUIDField) In(vs ...uuid.UUID) Condition {
 	return &inCond{col: f.col, vals: vals}
 }
 
+// NotIn returns a condition excluding the given UUIDs.
+func (f UUIDField) NotIn(vs ...uuid.UUID) Condition {
+	vals := make([]any, len(vs))
+	for i, v := range vs {
+		vals[i] = v
+	}
+	return &notInCond{col: f.col, vals: vals}
+}
+
 // DecimalField provides typed conditions for decimal columns.
 type DecimalField struct{ col string }
 
@@ -207,6 +237,24 @@ func (f DecimalField) IsNotNull() Condition            { return &nullCond{col: f
 // Between returns a condition matching values in [from, to].
 func (f DecimalField) Between(from, to decimal.Decimal) Condition {
 	return &betweenCond{col: f.col, from: from, to: to}
+}
+
+// In returns a condition matching any of the given values.
+func (f DecimalField) In(vs ...decimal.Decimal) Condition {
+	vals := make([]any, len(vs))
+	for i, v := range vs {
+		vals[i] = v
+	}
+	return &inCond{col: f.col, vals: vals}
+}
+
+// NotIn returns a condition excluding the given values.
+func (f DecimalField) NotIn(vs ...decimal.Decimal) Condition {
+	vals := make([]any, len(vs))
+	for i, v := range vs {
+		vals[i] = v
+	}
+	return &notInCond{col: f.col, vals: vals}
 }
 
 // --- FilterOp: generic operator dispatch from string (used by generated filter parsers) ---
@@ -243,11 +291,11 @@ func (f StringField) FilterOp(op, val string) Condition {
 	case "ne":
 		return f.Neq(val)
 	case "contains":
-		return f.Like("%" + escapeLike(val) + "%")
+		return f.Like("%" + EscapeLike(val) + "%")
 	case "startswith":
-		return f.Like(escapeLike(val) + "%")
+		return f.Like(EscapeLike(val) + "%")
 	case "endswith":
-		return f.Like("%" + escapeLike(val))
+		return f.Like("%" + EscapeLike(val))
 	default:
 		return f.Eq(val)
 	}
@@ -290,10 +338,12 @@ func parseInt64(s string) (int64, error) {
 	return strconv.ParseInt(s, 10, 64)
 }
 
-// escapeLike escapes SQL LIKE wildcard characters (%, _) in user input.
-func escapeLike(s string) string {
-	r := strings.NewReplacer("%", "\\%", "_", "\\_")
-	return r.Replace(s)
+// likeReplacer escapes SQL LIKE wildcard characters.
+var likeReplacer = strings.NewReplacer("%", "\\%", "_", "\\_")
+
+// EscapeLike escapes SQL LIKE wildcard characters (%, _) in user input.
+func EscapeLike(s string) string {
+	return likeReplacer.Replace(s)
 }
 
 // --- Internal condition implementations ---

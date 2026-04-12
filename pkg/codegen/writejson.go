@@ -41,14 +41,14 @@ func generateWriteJSONFile(result *semantic.Result, packageName string, enums ma
 
 	var b strings.Builder
 	writeHeader(&b, packageName, "writejson.gen.go")
-	writeWriteJSONImports(&b, models)
+	writeWriteJSONImports(&b, models, stubs)
 
 	for _, m := range models {
 		generateWriteJSON(&b, m, enums)
 		generateListJSONWrapper(&b, m)
 	}
 
-	// Extend stubs: simple WriteJSON that delegates to sonic (no field-level optimization)
+	// Extend stubs: WriteJSON with direct field append (same as full models)
 	for _, s := range stubs {
 		generateWriteJSON(&b, s, enums)
 		generateListJSONWrapper(&b, s)
@@ -83,18 +83,20 @@ func scanWriteJSONImports(m *ast.ModelDecl, needs *writeJSONImportNeeds) {
 	}
 }
 
-func writeWriteJSONImports(b *strings.Builder, models []*ast.ModelDecl) {
+func writeWriteJSONImports(b *strings.Builder, models []*ast.ModelDecl, stubs []*ast.ModelDecl) {
 	var needs writeJSONImportNeeds
 	for _, m := range models {
 		scanWriteJSONImports(m, &needs)
+	}
+	for _, s := range stubs {
+		scanWriteJSONImports(s, &needs)
 	}
 
 	b.WriteString("import (\n")
 	if needs.time {
 		b.WriteString("\t\"time\"\n")
 	}
-	b.WriteString("\n\t\"github.com/bytedance/sonic\"\n")
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
+	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
 	if needs.uuid {
 		b.WriteString("\n\t\"github.com/google/uuid\"\n")
@@ -132,12 +134,8 @@ func generateWriteJSON(b *strings.Builder, m *ast.ModelDecl, enums map[string]bo
 	fmt.Fprintf(b, "// WriteJSON writes %s as filtered JSON. Single pass, zero marshal.\n", name)
 	fmt.Fprintf(b, "func (%s *%s) WriteJSON(buf *api.ResponseBuf, fields []*selection.Field) {\n", recv, name)
 
-	// nil-select fallback: write all fields via sonic
-	fmt.Fprintf(b, "\tif fields == nil {\n")
-	fmt.Fprintf(b, "\t\tdata, _ := sonic.Marshal(%s)\n", recv)
-	fmt.Fprintf(b, "\t\tbuf.AppendBytes(data)\n")
-	fmt.Fprintf(b, "\t\treturn\n")
-	fmt.Fprintf(b, "\t}\n")
+	// nil-select fallback: write all visible fields directly (zero marshal)
+	writeAllFieldsFallback(b, m, recv, enums)
 
 	fmt.Fprintf(b, "\tbuf.AppendByte('{')\n")
 	fmt.Fprintf(b, "\tfirst := true\n")
@@ -275,4 +273,39 @@ func generateListJSONWrapper(b *strings.Builder, m *ast.ModelDecl) {
 	fmt.Fprintf(b, "\t}\n")
 	fmt.Fprintf(b, "\tbuf.AppendByte(']')\n")
 	fmt.Fprintf(b, "}\n\n")
+}
+
+// writeAllFieldsFallback generates the nil-select path that writes all visible fields directly.
+func writeAllFieldsFallback(b *strings.Builder, m *ast.ModelDecl, recv string, enums map[string]bool) {
+	fmt.Fprintf(b, "\tif fields == nil {\n")
+	fmt.Fprintf(b, "\t\tbuf.AppendByte('{')\n")
+	first := true
+	for _, f := range m.Fields {
+		if f.Type == nil || f.Computed != nil {
+			continue
+		}
+		if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
+			continue
+		}
+		if isRelationField(f, enums) {
+			continue
+		}
+		jsonName := f.Name
+		goField := recv + "." + str.Capitalize(f.Name)
+		if !first {
+			fmt.Fprintf(b, "\t\tbuf.AppendByte(',')\n")
+		}
+		fmt.Fprintf(b, "\t\tbuf.AppendString(`%q:`)\n", jsonName)
+		if f.Type.Nullable {
+			writeNullableFieldJSON(b, f, goField)
+		} else if f.Type.IsList {
+			writeListFieldJSON(b, f, goField)
+		} else {
+			writeScalarFieldJSON(b, f, goField)
+		}
+		first = false
+	}
+	fmt.Fprintf(b, "\t\tbuf.AppendByte('}')\n")
+	fmt.Fprintf(b, "\t\treturn\n")
+	fmt.Fprintf(b, "\t}\n")
 }

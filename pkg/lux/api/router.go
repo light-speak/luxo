@@ -113,29 +113,37 @@ func (rt *Router) writeAppError(w http.ResponseWriter, r *http.Request, err erro
 		message = rt.translator.Translate(locale, appErr.Message, appErr.Data)
 	}
 
-	resp := map[string]any{
-		"error":   appErr.Name,
-		"code":    appErr.Code,
-		"message": message,
-	}
+	buf := GetBuf()
+	buf.AppendString(`{"error":`)
+	buf.AppendJSONString(appErr.Name)
+	buf.AppendString(`,"code":`)
+	buf.AppendInt(int64(appErr.Code))
+	buf.AppendString(`,"message":`)
+	buf.AppendJSONString(message)
 	if traceID != "" {
-		resp["traceId"] = traceID
+		buf.AppendString(`,"traceId":`)
+		buf.AppendJSONString(traceID)
 	}
 	if appErr.Data != nil && !appErr.Internal {
-		resp["data"] = appErr.Data
+		buf.AppendString(`,"data":`)
+		dataBytes, _ := sonic.Marshal(appErr.Data)
+		buf.B = append(buf.B, dataBytes...)
 	}
 	if rt.devMode && appErr.Cause != nil {
-		resp["cause"] = appErr.Cause.Error()
+		buf.AppendString(`,"cause":`)
+		buf.AppendJSONString(appErr.Cause.Error())
 	}
+	buf.AppendByte('}')
 
 	w.WriteHeader(appErr.Code)
-	data, _ := sonic.Marshal(resp)
-	w.Write(data)
+	w.Write(buf.B)
+	PutBuf(buf)
 }
 
 // writeError writes a simple JSON error response for infrastructure errors.
 func writeError(w http.ResponseWriter, code int, msg string) {
 	w.WriteHeader(code)
-	resp, _ := sonic.Marshal(map[string]string{"error": msg})
-	w.Write(resp)
+	w.Write([]byte(`{"error":"`))
+	w.Write([]byte(msg))
+	w.Write([]byte(`"}`))
 }

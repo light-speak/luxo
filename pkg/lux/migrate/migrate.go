@@ -274,6 +274,9 @@ func splitConcurrently(sql string) (txSQL string, nonTxStmts []string) {
 			txParts = append(txParts, trimmed)
 		}
 	}
+	if len(txParts) == 0 {
+		return "", nonTxStmts
+	}
 	return strings.Join(txParts, ";\n") + ";", nonTxStmts
 }
 

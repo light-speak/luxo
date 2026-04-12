@@ -462,13 +462,13 @@ func writeZeroParamClause(b *strings.Builder, op, condType, col string) bool {
 func writeStringMatchClause(b *strings.Builder, op, col, paramExpr string) bool {
 	switch op {
 	case "containing":
-		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).Like(\"%%\" + %s + \"%%\"),\n", col, paramExpr)
+		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).Like(\"%%\" + lux.EscapeLike(%s) + \"%%\"),\n", col, paramExpr)
 	case "notContaining":
-		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).NotLike(\"%%\" + %s + \"%%\"),\n", col, paramExpr)
+		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).NotLike(\"%%\" + lux.EscapeLike(%s) + \"%%\"),\n", col, paramExpr)
 	case "startswith":
-		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).Like(%s + \"%%\"),\n", col, paramExpr)
+		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).Like(lux.EscapeLike(%s) + \"%%\"),\n", col, paramExpr)
 	case "endswith":
-		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).Like(\"%%\" + %s),\n", col, paramExpr)
+		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).Like(\"%%\" + lux.EscapeLike(%s)),\n", col, paramExpr)
 	case "like":
 		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).Like(%s),\n", col, paramExpr)
 	case "notLike":
@@ -564,13 +564,13 @@ func writeClauseSQLZeroParam(b *strings.Builder, op, col string) bool {
 func writeClauseSQLStringMatch(b *strings.Builder, op, col, paramExpr string) bool {
 	switch op {
 	case "containing":
-		writeClauseSQLLike(b, col, "LIKE", "\"%%\" + "+paramExpr+" + \"%%\"")
+		writeClauseSQLLike(b, col, "LIKE", "\"%%\" + lux.EscapeLike("+paramExpr+") + \"%%\"")
 	case "notContaining":
-		writeClauseSQLLike(b, col, "NOT LIKE", "\"%%\" + "+paramExpr+" + \"%%\"")
+		writeClauseSQLLike(b, col, "NOT LIKE", "\"%%\" + lux.EscapeLike("+paramExpr+") + \"%%\"")
 	case "startswith":
-		writeClauseSQLLike(b, col, "LIKE", paramExpr+" + \"%%\"")
+		writeClauseSQLLike(b, col, "LIKE", "lux.EscapeLike("+paramExpr+") + \"%%\"")
 	case "endswith":
-		writeClauseSQLLike(b, col, "LIKE", "\"%%\" + "+paramExpr)
+		writeClauseSQLLike(b, col, "LIKE", "\"%%\" + lux.EscapeLike("+paramExpr+")")
 	case "like":
 		writeClauseSQLLike(b, col, "LIKE", paramExpr)
 	case "notLike":
