@@ -11,6 +11,12 @@ import (
 	"github.com/light-speak/luxo/pkg/lux/i18n"
 )
 
+// Pre-allocated response framing bytes — avoids per-request []byte conversion.
+var (
+	jsonDataPrefix = []byte(`{"data":`)
+	jsonDataSuffix = []byte(`}`)
+)
+
 // HandlerFunc is the signature for API handlers.
 // Handlers write their response directly to req.Buf — zero allocation, zero any.
 type HandlerFunc func(ctx context.Context, req *Request) error
@@ -80,9 +86,9 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Write response: {"data": <buf> }
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"data":`))
+	w.Write(jsonDataPrefix)
 	w.Write(buf.B)
-	w.Write([]byte(`}`))
+	w.Write(jsonDataSuffix)
 
 	PutBuf(buf)
 }

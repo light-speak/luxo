@@ -56,7 +56,8 @@ func (l *Loader[K, V]) Load(ctx context.Context, key K, fields []string) (V, err
 
 	if l.batch == nil {
 		l.batch = newBatch[K, V]()
-		go l.scheduleBatch(l.batch)
+		b := l.batch
+		time.AfterFunc(l.wait, func() { l.flushBatch(b) })
 	}
 	b := l.batch
 	req := b.add(key, fields)
@@ -89,10 +90,9 @@ func (l *Loader[K, V]) LoadAll(ctx context.Context, keys []K, fields []string) (
 	return l.batchFn(ctx, keys, fields)
 }
 
-// scheduleBatch waits for the batch window then dispatches.
-func (l *Loader[K, V]) scheduleBatch(b *batch[K, V]) {
-	time.Sleep(l.wait)
-
+// flushBatch dispatches a batch after the wait window expires.
+// Called by time.AfterFunc — no goroutine blocked during wait.
+func (l *Loader[K, V]) flushBatch(b *batch[K, V]) {
 	l.mu.Lock()
 	if l.batch == b {
 		l.batch = nil
