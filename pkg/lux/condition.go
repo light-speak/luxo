@@ -234,3 +234,26 @@ func (c *nullCond) ToSQL(argOffset int) (string, []any) {
 	}
 	return fmt.Sprintf("%s IS NOT NULL", c.col), nil
 }
+
+// rawCond is a pre-built SQL condition with embedded args.
+type rawCond struct {
+	sql  string
+	args []any
+}
+
+// RawCondition creates a condition from raw SQL with args.
+// Used for complex conditions like OR groups.
+func RawCondition(sql string, args ...any) Condition {
+	return &rawCond{sql: sql, args: args}
+}
+
+func (c *rawCond) ToSQL(argOffset int) (string, []any) {
+	// Rewrite $1, $2, ... to $argOffset, $argOffset+1, ...
+	sql := c.sql
+	for i := len(c.args); i >= 1; i-- {
+		old := fmt.Sprintf("$%d", i)
+		new := fmt.Sprintf("$%d", argOffset+i-1)
+		sql = strings.ReplaceAll(sql, old, new)
+	}
+	return sql, c.args
+}

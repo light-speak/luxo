@@ -219,6 +219,13 @@ func (s *Server) getCompletions(doc *Document, pos Position) []CompletionItem {
 		return items
 	}
 
+	// inferred API name completions (after "api " keyword)
+	if doc.File != nil && doc.File.Models != nil {
+		if inferred := s.getInferredAPICompletions(doc, pos, word); inferred != nil {
+			items = append(items, inferred...)
+		}
+	}
+
 	// keyword completions
 	items = append(items, getKeywordCompletions(prefix)...)
 
@@ -2306,4 +2313,165 @@ func findImplicitReturn(block *ast.Block) *InlayHint {
 		Tooltip:      "implicit return / 隐式返回",
 		PaddingRight: true,
 	}
+}
+
+// getInferredAPICompletions suggests method names when typing after "api ".
+// Generates: getUserByField, listModelsByField, countModelsByField, etc.
+func (s *Server) getInferredAPICompletions(doc *Document, pos Position, word string) []CompletionItem {
+	lines := strings.Split(doc.Content, "\n")
+	if pos.Line >= len(lines) {
+		return nil
+	}
+	line := strings.TrimSpace(lines[pos.Line])
+
+	// Only trigger after "api " at the start of a line
+	if !strings.HasPrefix(line, "api ") {
+		return nil
+	}
+
+	// Collect models from file (not extends)
+	var models []*ast.ModelDecl
+	if doc.File != nil {
+		models = doc.File.Models
+	}
+	if len(models) == 0 {
+		return nil
+	}
+
+	prefix := strings.ToLower(word)
+	enumNames := make(map[string]bool)
+	if doc.File != nil {
+		for _, e := range doc.File.Enums {
+			enumNames[e.Name] = true
+		}
+	}
+
+	var items []CompletionItem
+	for _, m := range models {
+		items = append(items, buildModelAPICompletions(m, enumNames, prefix)...)
+	}
+	return items
+}
+
+// buildModelAPICompletions generates completion items for a single model.
+func buildModelAPICompletions(m *ast.ModelDecl, enumNames map[string]bool, prefix string) []CompletionItem {
+	var items []CompletionItem
+	name := m.Name
+	plural := inferPlural(name)
+
+	var fields []string
+	for _, f := range m.Fields {
+		if f.Type == nil || f.Computed != nil {
+			continue
+		}
+		if !isBuiltinType(f.Type.Name) && !enumNames[f.Type.Name] {
+			continue
+		}
+		fields = append(fields, f.Name)
+	}
+
+	// Generate action+field suggestions
+	type apiAction struct{ prefix, detail, ret string }
+	actions := []apiAction{
+		{"get" + name + "By", "Single " + name + " query", name},
+		{"list" + plural + "By", "List " + name + " with pagination", "[" + name + "]"},
+		{"count" + plural + "By", "Count " + name, "Int"},
+		{"exists" + name + "By", "Check if " + name + " exists", "Boolean"},
+		{"delete" + name + "By", "Delete " + name, "Int"},
+		{"listTop10" + plural + "By", "Top 10 " + name, "[" + name + "]"},
+	}
+	for _, action := range actions {
+		items = append(items, buildFieldSuggestions(m, fields, action.prefix, action.detail, action.ret, name, prefix)...)
+	}
+
+	// Suggest Boolean fields with True/False suffix
+	for _, f := range m.Fields {
+		if f.Type != nil && f.Type.Name == "Boolean" {
+			for _, val := range []string{"True", "False"} {
+				suggestion := "list" + plural + "By" + capitalize(f.Name) + val
+				if prefix != "" && !strings.HasPrefix(strings.ToLower(suggestion), prefix) {
+					continue
+				}
+				items = append(items, CompletionItem{
+					Label:      suggestion,
+					Kind:       3,
+					Detail:     "List " + name + " where " + f.Name + " = " + strings.ToLower(val),
+					InsertText: suggestion + "()" + ": [" + name + "]",
+				})
+			}
+		}
+	}
+	return items
+}
+
+func buildFieldSuggestions(m *ast.ModelDecl, fields []string, actionPrefix, detail, ret, modelName, prefix string) []CompletionItem {
+	var items []CompletionItem
+	for _, field := range fields {
+		suggestion := actionPrefix + capitalize(field)
+		if prefix != "" && !strings.HasPrefix(strings.ToLower(suggestion), prefix) {
+			continue
+		}
+		fieldType := fieldTypeStr(m, field)
+		paramSig := "(" + field + ": " + fieldType + ")"
+		retSig := ": " + ret
+		items = append(items, CompletionItem{
+			Label:         suggestion,
+			Kind:          3,
+			Detail:        detail,
+			Documentation: suggestion + paramSig + retSig,
+			InsertText:    suggestion + paramSig + retSig,
+		})
+	}
+	// OrderBy suggestions for list actions
+	if strings.HasPrefix(actionPrefix, "list") {
+		for _, field := range fields {
+			for _, dir := range []string{"Asc", "Desc"} {
+				suggestion := actionPrefix[:len(actionPrefix)-2] + "OrderBy" + capitalize(field) + dir
+				if prefix != "" && !strings.HasPrefix(strings.ToLower(suggestion), prefix) {
+					continue
+				}
+				items = append(items, CompletionItem{
+					Label:      suggestion,
+					Kind:       3,
+					Detail:     "List " + modelName + " ordered by " + field,
+					InsertText: suggestion + "()" + ": " + ret,
+				})
+			}
+		}
+	}
+	return items
+}
+
+func inferPlural(name string) string {
+	if strings.HasSuffix(name, "y") {
+		return name[:len(name)-1] + "ies"
+	}
+	if strings.HasSuffix(name, "s") || strings.HasSuffix(name, "x") || strings.HasSuffix(name, "z") {
+		return name + "es"
+	}
+	return name + "s"
+}
+
+func capitalize(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+func isBuiltinType(name string) bool {
+	switch name {
+	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes":
+		return true
+	}
+	return false
+}
+
+func fieldTypeStr(m *ast.ModelDecl, name string) string {
+	for _, f := range m.Fields {
+		if f.Name == name && f.Type != nil {
+			return f.Type.Name
+		}
+	}
+	return "String"
 }

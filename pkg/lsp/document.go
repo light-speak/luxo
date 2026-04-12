@@ -2,6 +2,8 @@ package lsp
 
 import (
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -103,6 +105,7 @@ func (s *DocumentStore) Close(uri string) {
 }
 
 // analyzeAll runs analysis on all open documents together for cross-file resolution.
+// Also discovers sibling .luxo files in the same origin/ directory.
 func (s *DocumentStore) analyzeAll() {
 	s.mu.RLock()
 	docs := make([]*Document, 0, len(s.docs))
@@ -111,9 +114,13 @@ func (s *DocumentStore) analyzeAll() {
 	}
 	s.mu.RUnlock()
 
+	// Discover sibling .luxo files that aren't open yet
+	discovered := s.discoverSiblingFiles(docs)
+	allDocs := append(docs, discovered...)
+
 	// Phase 1: lex and parse each file independently
 	var files []*ast.File
-	for _, doc := range docs {
+	for _, doc := range allDocs {
 		filename := URIToPath(doc.URI)
 
 		l := lexer.New(doc.Content, filename)
@@ -136,9 +143,67 @@ func (s *DocumentStore) analyzeAll() {
 	result := a.Analyze(files)
 
 	// distribute results to each document
-	for _, doc := range docs {
+	for _, doc := range allDocs {
 		doc.Result = result
 	}
+}
+
+// discoverSiblingFiles finds .luxo files in the same origin/ directory
+// that aren't already open. Reads them from disk.
+func (s *DocumentStore) discoverSiblingFiles(openDocs []*Document) []*Document {
+	// Find origin/ directories from open files
+	originDirs := make(map[string]bool)
+	openPaths := make(map[string]bool)
+	for _, doc := range openDocs {
+		p := URIToPath(doc.URI)
+		openPaths[p] = true
+		dir := filepath.Dir(p)
+		// Walk up to find origin/ parent
+		for dir != "/" && dir != "." {
+			base := filepath.Base(dir)
+			if base == "origin" {
+				originDirs[dir] = true
+				break
+			}
+			// Also check if current dir IS inside origin/
+			parent := filepath.Dir(dir)
+			if filepath.Base(parent) == "origin" {
+				originDirs[parent] = true
+				break
+			}
+			dir = parent
+		}
+		// If file is directly in origin/
+		if filepath.Base(filepath.Dir(p)) == "origin" {
+			originDirs[filepath.Dir(p)] = true
+		}
+	}
+
+	var discovered []*Document
+	for originDir := range originDirs {
+		// Walk origin/ recursively for .luxo files
+		filepath.WalkDir(originDir, func(path string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			if !strings.HasSuffix(path, ".luxo") {
+				return nil
+			}
+			if openPaths[path] {
+				return nil // already open
+			}
+			content, err := os.ReadFile(path)
+			if err != nil {
+				return nil
+			}
+			discovered = append(discovered, &Document{
+				URI:     PathToURI(path),
+				Content: string(content),
+			})
+			return nil
+		})
+	}
+	return discovered
 }
 
 // Diagnostics returns all LSP diagnostics (lexer + parser + semantic errors).

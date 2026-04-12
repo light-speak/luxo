@@ -2,6 +2,7 @@ package codegen
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/ast"
@@ -12,8 +13,8 @@ import (
 // crudOps defines the 6 CRUD operations.
 var crudOps = []string{"get", "list", "create", "update", "delete", "deleteMany"}
 
-// generateHandlerFile produces handler.gen.go containing CRUD handlers and RegisterHandlers.
-// Returns nil if there are no @crud models.
+// generateHandlerFile produces handler.gen.go containing CRUD handlers,
+// inferred handlers (zero-body APIs), and RegisterHandlers.
 func generateHandlerFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
 	var models []*ast.ModelDecl
 	for _, file := range result.Files {
@@ -23,36 +24,16 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 			}
 		}
 	}
-	if len(models) == 0 {
+
+	modelMap, inferredAPIs := collectInferredAPIs(result)
+
+	if len(models) == 0 && len(inferredAPIs) == 0 {
 		return nil
 	}
 
 	var b strings.Builder
 	writeHeader(&b, packageName, "handler.gen.go")
-
-	// Check if any model has @hash fields
-	hasHash := false
-	for _, m := range models {
-		for _, f := range m.Fields {
-			if hasDirective(f.Directives, "hash") {
-				hasHash = true
-			}
-		}
-	}
-
-	b.WriteString("import (\n")
-	b.WriteString("\t\"context\"\n")
-	b.WriteString("\t\"fmt\"\n")
-	b.WriteString("\t\"strings\"\n")
-	b.WriteString("\n\t\"github.com/bytedance/sonic\"\n")
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux\"\n")
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
-	if hasHash {
-		b.WriteString("\tluxocrypto \"github.com/light-speak/luxo/pkg/lux/crypto\"\n")
-	}
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/errors\"\n")
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
-	b.WriteString(")\n\n")
+	writeHandlerImports(&b, models)
 
 	// Generate defaultCols for models with @hidden fields (excludes hidden from SELECT *)
 	for _, m := range models {
@@ -76,10 +57,68 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 		}
 	}
 
-	// RegisterHandlers function
-	generateRegisterFunc(&b, models)
+	// Generate inferred handlers (zero-body APIs)
+	var inferredNames []string
+	for _, api := range inferredAPIs {
+		inf := inferAPI(api.Name, modelMap)
+		if inf != nil {
+			// Validate return type
+			if errMsg := ValidateInferredReturnType(api, inf); errMsg != "" {
+				fmt.Fprintf(os.Stderr, "warning: %s:%d: %s\n", api.Pos.File, api.Pos.Line, errMsg)
+			}
+			generateInferredHandler(&b, api, inf, enums, modelMap[inf.ModelName])
+			inferredNames = append(inferredNames, api.Name)
+		}
+	}
+
+	// RegisterHandlers function (CRUD + inferred)
+	generateRegisterFuncWithInferred(&b, models, inferredNames)
 
 	return []byte(b.String())
+}
+
+// writeHandlerImports writes handler.gen.go imports.
+func writeHandlerImports(b *strings.Builder, models []*ast.ModelDecl) {
+	hasHash := false
+	for _, m := range models {
+		for _, f := range m.Fields {
+			if hasDirective(f.Directives, "hash") {
+				hasHash = true
+			}
+		}
+	}
+	b.WriteString("import (\n")
+	b.WriteString("\t\"context\"\n")
+	b.WriteString("\t\"fmt\"\n")
+	b.WriteString("\t\"strings\"\n")
+	b.WriteString("\n\t\"github.com/bytedance/sonic\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
+	if hasHash {
+		b.WriteString("\tluxocrypto \"github.com/light-speak/luxo/pkg/lux/crypto\"\n")
+	}
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/errors\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
+	b.WriteString(")\n\n")
+}
+
+// collectInferredAPIs builds a model map and collects zero-body APIs.
+func collectInferredAPIs(result *semantic.Result) (map[string]*ast.ModelDecl, []*ast.ApiDecl) {
+	modelMap := make(map[string]*ast.ModelDecl)
+	for _, file := range result.Files {
+		for _, m := range file.Models {
+			modelMap[m.Name] = m
+		}
+	}
+	var apis []*ast.ApiDecl
+	for _, file := range result.Files {
+		for _, api := range file.APIs {
+			if api.Body == nil && !hasDirective(api.Directives, "native") {
+				apis = append(apis, api)
+			}
+		}
+	}
+	return modelMap, apis
 }
 
 // hasCrud checks if model has @crud directive.
@@ -525,7 +564,12 @@ func crudAPIName(modelName, op string) string {
 
 // generateRegisterFunc generates the RegisterHandlers function.
 func generateRegisterFunc(b *strings.Builder, models []*ast.ModelDecl) {
-	b.WriteString("// RegisterHandlers registers all CRUD handlers with the API router.\n")
+	generateRegisterFuncWithInferred(b, models, nil)
+}
+
+// generateRegisterFuncWithInferred generates RegisterHandlers with CRUD + inferred handlers.
+func generateRegisterFuncWithInferred(b *strings.Builder, models []*ast.ModelDecl, inferredNames []string) {
+	b.WriteString("// RegisterHandlers registers all API handlers with the router.\n")
 	b.WriteString("func RegisterHandlers(router *api.Router, app *App) {\n")
 
 	for _, m := range models {
@@ -533,6 +577,10 @@ func generateRegisterFunc(b *strings.Builder, models []*ast.ModelDecl) {
 			name := crudAPIName(m.Name, op)
 			fmt.Fprintf(b, "\trouter.Handle(%q, handle%s(app))\n", name, str.Capitalize(name))
 		}
+	}
+
+	for _, name := range inferredNames {
+		fmt.Fprintf(b, "\trouter.Handle(%q, handle%s(app))\n", name, str.Capitalize(name))
 	}
 
 	b.WriteString("}\n")
