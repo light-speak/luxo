@@ -50,13 +50,20 @@ type Analyzer struct {
 	inAwait       bool // true when checking inside an await block
 	inCallFunc    bool // true when checking the Func part of a CallExpr
 	files         []*ast.File
+
+	// module isolation
+	moduleMap     FileModuleMap              // file → module info
+	typeOwners    *typeOwnership             // type name → owning module
+	extendVisible map[string]map[string]bool // module → set of type names visible via extend
 }
 
 // New creates a new Analyzer.
 func New() *Analyzer {
 	a := &Analyzer{
-		scope: NewScope(),
-		types: make(map[string]*ResolvedType),
+		scope:         NewScope(),
+		types:         make(map[string]*ResolvedType),
+		typeOwners:    newTypeOwnership(),
+		extendVisible: make(map[string]map[string]bool),
 	}
 	// register built-in types
 	for name, typ := range BuiltinTypes() {
@@ -71,12 +78,31 @@ func New() *Analyzer {
 }
 
 // Analyze performs semantic analysis on one or more parsed files.
+// When module isolation is not needed (e.g., single-file analysis), use this method.
 func (a *Analyzer) Analyze(files []*ast.File) *Result {
+	return a.analyzeInternal(files)
+}
+
+// AnalyzeWithModules performs semantic analysis with module scope isolation.
+// Files are grouped into modules based on their path under origin/.
+// Cross-module type references are only allowed via extend declarations.
+func (a *Analyzer) AnalyzeWithModules(files []*ast.File) *Result {
+	a.moduleMap = BuildFileModuleMap(files)
+	return a.analyzeInternal(files)
+}
+
+func (a *Analyzer) analyzeInternal(files []*ast.File) *Result {
 	a.files = files
 
 	// Pass 1: collect all top-level declarations (types, models, enums, etc.)
 	for _, file := range files {
 		a.collectDeclarations(file)
+	}
+
+	// Pass 1.5: collect extend visibility (before type resolution)
+	if a.moduleMap != nil {
+		a.collectExtendVisibility()
+		a.checkCrossModuleDuplicates()
 	}
 
 	// Pass 2: resolve inheritance, interface implementation
@@ -87,6 +113,11 @@ func (a *Analyzer) Analyze(files []*ast.File) *Result {
 	// Pass 3: resolve field types, check directives
 	for _, file := range files {
 		a.resolveFields(file)
+	}
+
+	// Pass 3.5: check cross-module type visibility
+	if a.moduleMap != nil {
+		a.checkModuleVisibility()
 	}
 
 	// Pass 4: check api/fn bodies (expressions, statements)
@@ -114,27 +145,34 @@ func (a *Analyzer) Analyze(files []*ast.File) *Result {
 // ========== Pass 1: Collect Declarations ==========
 
 func (a *Analyzer) collectDeclarations(file *ast.File) {
+	modName := a.fileModule(file.Name)
+
 	for _, m := range file.Models {
 		a.declareType(m.Name, TypeModel, m.Pos, m.Doc)
+		a.typeOwners.register(m.Name, modName)
 	}
 	for _, i := range file.Interfaces {
 		a.declareType(i.Name, TypeInterface, i.Pos, i.Doc)
+		a.typeOwners.register(i.Name, modName)
 	}
 	for _, e := range file.Enums {
 		typ := a.declareType(e.Name, TypeEnum, e.Pos, e.Doc)
 		if typ != nil {
 			typ.EnumValues = e.Values
 		}
+		a.typeOwners.register(e.Name, modName)
 	}
 	for _, s := range file.Sealeds {
 		typ := a.declareType(s.Name, TypeSealed, s.Pos, s.Doc)
 		if typ != nil {
 			a.collectSealedVariants(typ, s.Variants)
 		}
+		a.typeOwners.register(s.Name, modName)
 	}
 	for _, t := range file.Types {
 		a.declareType(t.Name, TypeCustom, t.Pos, t.Doc)
 		a.registerTypeParams(t.TypeParams)
+		a.typeOwners.register(t.Name, modName)
 	}
 	for _, api := range file.APIs {
 		a.scope.Define(&Symbol{
@@ -175,6 +213,220 @@ func (a *Analyzer) collectDeclarations(file *ast.File) {
 			Pos:  ev.Pos,
 		})
 	}
+}
+
+// fileModule returns the module name for a file. Returns "" when module isolation is disabled.
+func (a *Analyzer) fileModule(filename string) string {
+	if a.moduleMap == nil {
+		return ""
+	}
+	if mi, ok := a.moduleMap[filename]; ok {
+		return mi.Name
+	}
+	return ""
+}
+
+// collectExtendVisibility scans all files for extend declarations and records
+// which types are made visible in each module via extend.
+func (a *Analyzer) collectExtendVisibility() {
+	for _, file := range a.files {
+		modName := a.fileModule(file.Name)
+		if modName == "" {
+			continue
+		}
+		for _, ext := range file.Extends {
+			if a.extendVisible[modName] == nil {
+				a.extendVisible[modName] = make(map[string]bool)
+			}
+			a.extendVisible[modName][ext.Name] = true
+		}
+	}
+}
+
+// checkCrossModuleDuplicates reports errors when different (non-common) modules
+// declare types with the same name. The "already declared" error from declareType
+// catches in-module duplicates; this catches cross-module name collisions.
+func (a *Analyzer) checkCrossModuleDuplicates() {
+	// type name → first declaring module + position
+	type firstDecl struct {
+		module string
+		pos    token.Position
+	}
+	seen := make(map[string]firstDecl)
+
+	for _, file := range a.files {
+		mi := a.moduleMap[file.Name]
+		if mi == nil || mi.IsCommon {
+			continue
+		}
+		for _, decls := range a.fileTypeDecls(file) {
+			name, pos := decls.name, decls.pos
+			if prev, ok := seen[name]; ok {
+				if prev.module != mi.Name {
+					a.addError(pos,
+						"type '%s' already declared in module '%s', different modules cannot define same-named types / 类型 '%s' 已在模块 '%s' 中声明，不同模块不能定义同名类型",
+						name, prev.module, name, prev.module)
+				}
+			} else {
+				seen[name] = firstDecl{module: mi.Name, pos: pos}
+			}
+		}
+	}
+}
+
+// typeDecl is a helper pair for iteration.
+type typeDecl struct {
+	name string
+	pos  token.Position
+}
+
+// fileTypeDecls returns all type declarations in a file (model, enum, sealed, type, interface).
+func (a *Analyzer) fileTypeDecls(file *ast.File) []typeDecl {
+	var decls []typeDecl
+	for _, m := range file.Models {
+		decls = append(decls, typeDecl{m.Name, m.Pos})
+	}
+	for _, i := range file.Interfaces {
+		decls = append(decls, typeDecl{i.Name, i.Pos})
+	}
+	for _, e := range file.Enums {
+		decls = append(decls, typeDecl{e.Name, e.Pos})
+	}
+	for _, s := range file.Sealeds {
+		decls = append(decls, typeDecl{s.Name, s.Pos})
+	}
+	for _, t := range file.Types {
+		decls = append(decls, typeDecl{t.Name, t.Pos})
+	}
+	return decls
+}
+
+// checkModuleVisibility checks that type references in each file only refer to
+// types within the same module, in common/, or made visible via extend.
+func (a *Analyzer) checkModuleVisibility() {
+	for _, file := range a.files {
+		mi := a.moduleMap[file.Name]
+		if mi == nil {
+			continue
+		}
+		a.checkFileTypeRefs(file, mi)
+	}
+}
+
+// checkFileTypeRefs checks all type references in a file for module visibility.
+func (a *Analyzer) checkFileTypeRefs(file *ast.File, mi *ModuleInfo) {
+	a.checkModelTypeRefs(file, mi)
+	a.checkDeclTypeRefs(file, mi)
+}
+
+func (a *Analyzer) checkModelTypeRefs(file *ast.File, mi *ModuleInfo) {
+	for _, m := range file.Models {
+		for _, f := range m.Fields {
+			a.checkTypeRefVisibility(f.Type, mi, f.Pos)
+		}
+		for _, parentName := range m.Parents {
+			a.checkNameVisibility(parentName, mi, m.Pos)
+		}
+	}
+	for _, iface := range file.Interfaces {
+		for _, f := range iface.Fields {
+			a.checkTypeRefVisibility(f.Type, mi, f.Pos)
+		}
+	}
+	for _, t := range file.Types {
+		for _, f := range t.Fields {
+			a.checkTypeRefVisibility(f.Type, mi, f.Pos)
+		}
+	}
+}
+
+func (a *Analyzer) checkDeclTypeRefs(file *ast.File, mi *ModuleInfo) {
+	for _, api := range file.APIs {
+		a.checkTypeRefVisibility(api.ReturnType, mi, api.Pos)
+		for _, p := range api.Params {
+			a.checkTypeRefVisibility(p.Type, mi, p.Pos)
+		}
+	}
+	for _, fn := range file.Functions {
+		a.checkTypeRefVisibility(fn.ReturnType, mi, fn.Pos)
+		for _, p := range fn.Params {
+			a.checkTypeRefVisibility(p.Type, mi, p.Pos)
+		}
+	}
+	for _, ev := range file.Events {
+		for _, p := range ev.Params {
+			a.checkTypeRefVisibility(p.Type, mi, p.Pos)
+		}
+	}
+	// sealed variant fields
+	for _, s := range file.Sealeds {
+		for _, v := range s.Variants {
+			for _, f := range v.Fields {
+				a.checkTypeRefVisibility(f.Type, mi, f.Pos)
+			}
+		}
+	}
+}
+
+// checkTypeRefVisibility checks if a type reference is visible from the given module.
+func (a *Analyzer) checkTypeRefVisibility(ref *ast.TypeRef, mi *ModuleInfo, pos token.Position) {
+	if ref == nil {
+		return
+	}
+	a.checkNameVisibility(ref.Name, mi, pos)
+	// check generic args
+	for _, arg := range ref.TypeArgs {
+		a.checkTypeRefVisibility(arg, mi, pos)
+	}
+	// check tuple elements
+	for _, t := range ref.Tuple {
+		a.checkTypeRefVisibility(t, mi, pos)
+	}
+}
+
+// checkNameVisibility checks if a type name is visible from the given module.
+func (a *Analyzer) checkNameVisibility(name string, mi *ModuleInfo, pos token.Position) {
+	if name == "" {
+		return
+	}
+	// built-in types are always visible
+	if _, isBuiltin := BuiltinTypes()[name]; isBuiltin {
+		return
+	}
+	// check ownership
+	ownerMod := a.typeOwners.ownerOf(name)
+	if ownerMod == "" {
+		return // unknown type — will be caught by resolveTypeRef
+	}
+	// same module — ok
+	if ownerMod == mi.Name {
+		return
+	}
+	// common module types are globally visible
+	if a.isCommonModule(ownerMod) {
+		return
+	}
+	// common module can see everything
+	if mi.IsCommon {
+		return
+	}
+	// check if visible via extend
+	if visible, ok := a.extendVisible[mi.Name]; ok && visible[name] {
+		return
+	}
+	a.addError(pos,
+		"type '%s' is from module '%s', use 'extend %s { ... }' to access it / 类型 '%s' 来自模块 '%s'，使用 'extend %s { ... }' 来访问",
+		name, ownerMod, name, name, ownerMod, name)
+}
+
+// isCommonModule checks if the given module name is the common module.
+func (a *Analyzer) isCommonModule(modName string) bool {
+	for _, mi := range a.moduleMap {
+		if mi.Name == modName && mi.IsCommon {
+			return true
+		}
+	}
+	return false
 }
 
 // collectSealedVariants populates a sealed type with its variant information.

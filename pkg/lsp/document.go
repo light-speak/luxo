@@ -138,9 +138,9 @@ func (s *DocumentStore) analyzeAll() {
 		}
 	}
 
-	// Phase 2: semantic analysis across all files together
+	// Phase 2: semantic analysis across all files together with module isolation
 	a := semantic.New()
-	result := a.Analyze(files)
+	result := a.AnalyzeWithModules(files)
 
 	// distribute results to each document
 	for _, doc := range allDocs {

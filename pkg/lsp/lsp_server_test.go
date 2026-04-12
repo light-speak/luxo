@@ -5306,3 +5306,326 @@ func TestFindFieldInTypeSealed(t *testing.T) {
 		t.Error("expected nil for unknown sealed type")
 	}
 }
+
+// ========== Inferred API Completion Tests ==========
+
+func TestInferredAPICompletionBasic(t *testing.T) {
+	// Unit-test buildModelAPICompletions directly since partial "api " lines
+	// may not parse into a File with models.
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}
+	items := buildModelAPICompletions(m, map[string]bool{}, "")
+
+	labels := make(map[string]bool)
+	for _, item := range items {
+		labels[item.Label] = true
+	}
+
+	if !labels["getUserByName"] {
+		t.Error("expected getUserByName in completions")
+	}
+	if !labels["getUserByEmail"] {
+		t.Error("expected getUserByEmail in completions")
+	}
+	if !labels["listUsersByName"] {
+		t.Error("expected listUsersByName in completions")
+	}
+	if !labels["listUsersByEmail"] {
+		t.Error("expected listUsersByEmail in completions")
+	}
+	// Compound
+	if !labels["getUserByNameAndEmail"] {
+		t.Error("expected getUserByNameAndEmail in completions")
+	}
+	if !labels["getUserByNameOrEmail"] {
+		t.Error("expected getUserByNameOrEmail in completions")
+	}
+	// OrderBy
+	if !labels["listUsersOrderByNameAsc"] {
+		t.Error("expected listUsersOrderByNameAsc in completions")
+	}
+}
+
+func TestInferredAPICompletionMidWord(t *testing.T) {
+	// Test prefix filtering: "getuser" should match getUserBy* but not listUsers*
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}
+	items := buildModelAPICompletions(m, map[string]bool{}, "getuser")
+
+	labels := make(map[string]bool)
+	for _, item := range items {
+		labels[item.Label] = true
+	}
+
+	if !labels["getUserByName"] {
+		t.Error("expected getUserByName when prefix is 'getuser'")
+	}
+	if !labels["getUserByEmail"] {
+		t.Error("expected getUserByEmail when prefix is 'getuser'")
+	}
+	for label := range labels {
+		if strings.HasPrefix(label, "list") {
+			t.Errorf("should not include %s when prefix is 'getuser'", label)
+		}
+	}
+}
+
+func TestInferredAPICompletionCompound(t *testing.T) {
+	// Test compound suggestions with prefix filtering
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}
+	items := buildModelAPICompletions(m, map[string]bool{}, "getuserby")
+
+	labels := make(map[string]bool)
+	for _, item := range items {
+		labels[item.Label] = true
+	}
+
+	if !labels["getUserByNameAndEmail"] {
+		t.Error("expected getUserByNameAndEmail compound suggestion")
+	}
+	if !labels["getUserByNameOrEmail"] {
+		t.Error("expected getUserByNameOrEmail compound suggestion")
+	}
+	if !labels["getUserByEmailAndName"] {
+		t.Error("expected getUserByEmailAndName compound suggestion")
+	}
+}
+
+func TestInferredAPICompletionDetail(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}
+	items := buildFieldSuggestions(m, []string{"name", "email"}, "getUserBy", "User", "")
+	found := false
+	for _, item := range items {
+		if item.Label == "getUserByEmail" {
+			found = true
+			// Detail should show parameter signature with arrow
+			if item.Detail != "(email: String) -> User" {
+				t.Errorf("expected detail '(email: String) -> User', got %q", item.Detail)
+			}
+			// InsertText should include full signature
+			if item.InsertText != "getUserByEmail(email: String): User" {
+				t.Errorf("expected insertText 'getUserByEmail(email: String): User', got %q", item.InsertText)
+			}
+		}
+	}
+	if !found {
+		t.Error("getUserByEmail not found in suggestions")
+	}
+}
+
+func TestInferredAPICompletionCompoundDetail(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}
+	items := buildCompoundSuggestions(m, []string{"name", "email"}, "getUserBy", "User", "")
+	foundAnd := false
+	foundOr := false
+	for _, item := range items {
+		if item.Label == "getUserByNameAndEmail" {
+			foundAnd = true
+			if item.Detail != "(name: String, email: String) -> User" {
+				t.Errorf("And detail: got %q", item.Detail)
+			}
+			if item.InsertText != "getUserByNameAndEmail(name: String, email: String): User" {
+				t.Errorf("And insertText: got %q", item.InsertText)
+			}
+		}
+		if item.Label == "getUserByNameOrEmail" {
+			foundOr = true
+			if item.Detail != "(name: String, email: String) -> User" {
+				t.Errorf("Or detail: got %q", item.Detail)
+			}
+		}
+	}
+	if !foundAnd {
+		t.Error("getUserByNameAndEmail not found")
+	}
+	if !foundOr {
+		t.Error("getUserByNameOrEmail not found")
+	}
+}
+
+func TestInferredAPICompletionBoolean(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "Post",
+		Fields: []*ast.FieldDecl{
+			{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "published", Type: &ast.TypeRef{Name: "Boolean"}},
+		},
+	}
+	items := buildBooleanSuggestions(m, "Post", "Posts", "")
+	foundTrue := false
+	foundFalse := false
+	for _, item := range items {
+		if item.Label == "listPostsByPublishedTrue" {
+			foundTrue = true
+			if item.Detail != "() -> [Post]" {
+				t.Errorf("Boolean True detail: got %q", item.Detail)
+			}
+			if item.InsertText != "listPostsByPublishedTrue(): [Post]" {
+				t.Errorf("Boolean True insertText: got %q", item.InsertText)
+			}
+		}
+		if item.Label == "listPostsByPublishedFalse" {
+			foundFalse = true
+		}
+	}
+	if !foundTrue {
+		t.Error("listPostsByPublishedTrue not found")
+	}
+	if !foundFalse {
+		t.Error("listPostsByPublishedFalse not found")
+	}
+}
+
+func TestInferredAPICompletionOrderBy(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "Post",
+		Fields: []*ast.FieldDecl{
+			{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}
+	items := buildOrderBySuggestions(m, []string{"title"}, "Post", "Posts", "")
+	foundDesc := false
+	for _, item := range items {
+		if item.Label == "listPostsOrderByTitleDesc" {
+			foundDesc = true
+			if item.Detail != "() -> [Post]" {
+				t.Errorf("OrderBy detail: got %q", item.Detail)
+			}
+			if item.InsertText != "listPostsOrderByTitleDesc(): [Post]" {
+				t.Errorf("OrderBy insertText: got %q", item.InsertText)
+			}
+		}
+	}
+	if !foundDesc {
+		t.Error("listPostsOrderByTitleDesc not found")
+	}
+}
+
+func TestInferredAPICompletionPrefixFiltering(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}
+	// With prefix "listus", should match listUsersByName but not getUserByName
+	items := buildFieldSuggestions(m, []string{"name"}, "getUserBy", "User", "listus")
+	if len(items) != 0 {
+		t.Errorf("expected 0 items for prefix 'listus' on getUserBy*, got %d", len(items))
+	}
+
+	items = buildFieldSuggestions(m, []string{"name"}, "listUsersByName"[:13]+"By", "[User]", "listus")
+	if len(items) != 1 {
+		t.Errorf("expected 1 item for prefix 'listus' on listUsersBy*, got %d", len(items))
+	}
+}
+
+func TestInferredAPICompletionNoModels(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///empty.luxo"
+	openDoc(server, output, uri, "api ")
+
+	id := json.RawMessage(`1`)
+	params, _ := json.Marshal(CompletionParams{
+		TextDocument: TextDocumentID{URI: uri},
+		Position:     Position{Line: 0, Character: 4},
+	})
+	server.handleMessage(&Request{JSONRPC: "2.0", ID: &id, Method: "textDocument/completion", Params: params})
+	resp := output.String()
+	// Should not contain any model-based completions but should have keywords
+	if strings.Contains(resp, "getUserBy") {
+		t.Error("should not have inferred completions without models")
+	}
+}
+
+func TestMatchesPrefix(t *testing.T) {
+	if !matchesPrefix("getUserByName", "") {
+		t.Error("empty prefix should match everything")
+	}
+	if !matchesPrefix("getUserByName", "getuser") {
+		t.Error("should match case-insensitively")
+	}
+	if matchesPrefix("getUserByName", "listuser") {
+		t.Error("should not match different prefix")
+	}
+}
+
+func TestInferredAPICompletionNotOnNonAPILine(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///noapi.luxo"
+	openDoc(server, output, uri, "model User {\n  name: String\n}")
+
+	id := json.RawMessage(`1`)
+	params, _ := json.Marshal(CompletionParams{
+		TextDocument: TextDocumentID{URI: uri},
+		Position:     Position{Line: 0, Character: 6}, // on "model" line
+	})
+	server.handleMessage(&Request{JSONRPC: "2.0", ID: &id, Method: "textDocument/completion", Params: params})
+	resp := output.String()
+	if strings.Contains(resp, "getUserBy") {
+		t.Error("should not have inferred completions on non-api line")
+	}
+}
+
+func TestInferredAPICompletionIntegration(t *testing.T) {
+	server, output := newTestServer()
+	uri := "file:///inferint.luxo"
+	// A parseable document: completed api on line 3, incomplete "api getU" on line 4
+	openDoc(server, output, uri, "model User {\n  name: String\n  email: String\n}\napi getUser(id: Int): User\napi getU")
+
+	id := json.RawMessage(`1`)
+	params, _ := json.Marshal(CompletionParams{
+		TextDocument: TextDocumentID{URI: uri},
+		Position:     Position{Line: 5, Character: 7}, // after "api getU"
+	})
+	server.handleMessage(&Request{JSONRPC: "2.0", ID: &id, Method: "textDocument/completion", Params: params})
+	resp := output.String()
+
+	// Should include getUserByName from inferred completions (prefix = "getu")
+	if !strings.Contains(resp, "getUserByName") {
+		t.Log("Response:", resp[:min(len(resp), 500)])
+		t.Error("expected getUserByName in integration test completions")
+	}
+}
+
+func TestBuildCompoundPairNoMatch(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}
+	items := buildCompoundPair(m, "name", "email", "getUserBy", "User", "zzz", "And")
+	if len(items) != 0 {
+		t.Error("expected no items when prefix doesn't match")
+	}
+}
