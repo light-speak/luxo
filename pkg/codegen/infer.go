@@ -296,9 +296,7 @@ func writeInferredConditions(b *strings.Builder, inf *InferredAPI, m *ast.ModelD
 		fmt.Fprintf(b, "\t\t}\n")
 	}
 
-	if isSoftDelete(m) {
-		fmt.Fprintf(b, "\t\tconds = append(conds, lux.NewTimeField(\"deleted_at\").IsNull())\n")
-	}
+	// Note: @soft deleted_at filter is already in Client.Where(), not added here
 }
 
 // writeAndClause writes a single AND clause condition.

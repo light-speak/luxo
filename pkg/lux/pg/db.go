@@ -5,7 +5,9 @@ package pg
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -33,21 +35,64 @@ type DB struct {
 	conn conn // pool or tx — all queries go through this
 }
 
-// NewDB creates a new DB from a connection string.
-//
-//	db, err := pg.NewDB(ctx, "postgres://user:pass@localhost:5432/mydb")
+// NewDB creates a new DB from a connection string (reads config from env).
 func NewDB(ctx context.Context, connString string) (*DB, error) {
-	config, err := pgxpool.ParseConfig(connString)
+	return NewDBWithConfig(ctx, connString, ConfigFromEnv())
+}
+
+// NewDBWithConfig creates a new DB with explicit configuration.
+func NewDBWithConfig(ctx context.Context, connString string, cfg lux.DBConfig) (*DB, error) {
+	poolCfg, err := pgxpool.ParseConfig(connString)
 	if err != nil {
 		return nil, fmt.Errorf("pg: parse config: %w", err)
 	}
-	config.MaxConns = 50
-	config.MinConns = 10
-	pool, err := pgxpool.NewWithConfig(ctx, config)
+	poolCfg.MaxConns = int32(cfg.Pool)
+	poolCfg.MinConns = int32(cfg.Idle)
+	if cfg.Timeout > 0 {
+		poolCfg.ConnConfig.ConnectTimeout = cfg.Timeout
+	}
+	if cfg.DebugSQL {
+		poolCfg.ConnConfig.Tracer = &pgxTracer{}
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("pg: connect to database: %w", err)
 	}
 	return &DB{pool: pool, conn: pool}, nil
+}
+
+// --- pgx SQL Tracer (implements pgx.QueryTracer + lux.QueryTracer) ---
+
+type pgxTracer struct{}
+
+type traceStartKey struct{}
+
+type traceStartData struct {
+	startTime time.Time
+	sql       string
+	args      []any
+}
+
+func (t *pgxTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	return context.WithValue(ctx, traceStartKey{}, traceStartData{
+		startTime: time.Now(),
+		sql:       data.SQL,
+		args:      data.Args,
+	})
+}
+
+func (t *pgxTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryEndData) {
+	sd, _ := ctx.Value(traceStartKey{}).(traceStartData)
+	dur := time.Since(sd.startTime)
+	sql := strings.ReplaceAll(strings.ReplaceAll(sd.sql, "\n", " "), "\t", " ")
+	if len(sql) > 200 {
+		sql = sql[:200] + "..."
+	}
+	if data.Err != nil {
+		log.Printf("[SQL] %s | ERROR: %v | %s | args=%v", dur, data.Err, sql, sd.args)
+	} else {
+		log.Printf("[SQL] %s | %s | %s | args=%v", dur, data.CommandTag.String(), sql, sd.args)
+	}
 }
 
 // NewDBFromPool creates a DB from an existing pgxpool.Pool.

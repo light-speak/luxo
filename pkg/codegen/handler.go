@@ -77,6 +77,15 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	return []byte(b.String())
 }
 
+// writeFKEnsure generates ensureField calls for BelongsTo FK columns.
+func writeFKEnsure(b *strings.Builder, rels []Relation) {
+	for _, rel := range rels {
+		if rel.Type == BelongsTo {
+			fmt.Fprintf(b, "\t\tcols = ensureField(cols, %q)\n", str.ToSnakeCase(rel.LocalKey))
+		}
+	}
+}
+
 // writeHandlerImports writes handler.gen.go imports.
 func writeHandlerImports(b *strings.Builder, models []*ast.ModelDecl) {
 	hasHash := false
@@ -203,6 +212,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		fmt.Fprintf(b, "\t\tid, err := req.Param%s(\"id\")\n", paramMethod(idType))
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		fmt.Fprintf(b, "\t\tcols := %s\n", colsExpr)
+		writeFKEnsure(b, rels)
 		fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(%sWhere.Id.Eq(id)).Select(cols...).First(ctx)\n", name, name)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		fmt.Fprintf(b, "\t\tif result == nil {\n\t\t\treturn errors.NotFound.WithData(map[string]any{\"resource\": %q, \"id\": id})\n\t\t}\n", name)
@@ -218,11 +228,9 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 		fmt.Fprintf(b, "\t\tcols := %s\n", colsExpr)
+		writeFKEnsure(b, rels)
 		fmt.Fprintf(b, "\t\tconds := parse%sFilters(req.Filters)\n", name)
-		if isSoftDelete(m) {
-			fmt.Fprintf(b, "\t\tconds = append(conds, lux.NewTimeField(\"deleted_at\").IsNull())\n")
-		}
-		// Query with pagination + sorting + parallel COUNT
+		// Note: @soft deleted_at filter is already in Client.Where(), not added here
 		fmt.Fprintf(b, "\t\tq := app.%s.Where(conds...).Select(cols...)\n", name)
 		fmt.Fprintf(b, "\t\tif sorts := parse%sSorters(req.Sorters); len(sorts) > 0 {\n", name)
 		fmt.Fprintf(b, "\t\t\tq = q.OrderBy(sorts...)\n")

@@ -177,6 +177,9 @@ DATABASE_IDLE=5                                        # idle connections
 DATABASE_TIMEOUT=5s                                    # connection timeout
 DATABASE_SSL=disable                                   # SSL: disable / require / verify-full
 
+# ---- Debug ----
+# DEBUG_SQL=true                                        # print all SQL queries with timing
+
 # ---- Auth (JWT) ----
 JWT_SECRET=change-me                                   # HMAC signing key
 JWT_EXPIRES=7d                                         # token expiry

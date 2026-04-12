@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/light-speak/luxo/pkg/lux/env"
+	"github.com/light-speak/luxo/pkg/lux"
 )
 
 // Runner executes migrations against a database.
@@ -490,15 +490,5 @@ func (r *Runner) loadExpectedTables() []string {
 
 // BuildDatabaseURL constructs a connection string from DATABASE_* env vars.
 func BuildDatabaseURL() string {
-	host := envOr("DATABASE_HOST", "localhost")
-	port := envOr("DATABASE_PORT", "5432")
-	user := envOr("DATABASE_USER", "postgres")
-	pass, _ := env.Get("DATABASE_PASSWORD")
-	ssl := envOr("DATABASE_SSL", "disable")
-	prefix := envOr("DATABASE_PREFIX", "luxo")
-	return fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s", user, pass, host, port, prefix, ssl)
-}
-
-func envOr(key, fallback string) string {
-	return env.GetOrDefault(key, fallback)
+	return lux.DBConfigFromEnv().ConnectionString()
 }

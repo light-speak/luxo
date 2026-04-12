@@ -255,5 +255,6 @@ func (c *rawCond) ToSQL(argOffset int) (string, []any) {
 		new := fmt.Sprintf("$%d", argOffset+i-1)
 		sql = strings.ReplaceAll(sql, old, new)
 	}
-	return sql, c.args
+	// Wrap in parentheses to protect OR from AND precedence
+	return "(" + sql + ")", c.args
 }
