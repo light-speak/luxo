@@ -265,9 +265,6 @@ func generateInferredHandler(b *strings.Builder, api *ast.ApiDecl, inf *Inferred
 	writeInferredConditions(b, inf, m, api.Params)
 
 	writeInferredAction(b, inf, modelName, isSoftDelete(m))
-
-	fmt.Fprintf(b, "\t\treturn nil\n")
-	fmt.Fprintf(b, "\t}\n}\n\n")
 }
 
 // writeInferredConditions generates the WHERE conditions for an inferred handler.
