@@ -27,6 +27,7 @@ type Relation struct {
 	RemoteKey  string       // key on target model (e.g., "id" for belongsTo, "userId" for hasMany)
 	IsList     bool         // [Post] vs Post
 	FKNullable bool         // true if the FK field is nullable (e.g., userId: Int?)
+	KeyGoType  string       // Go type of the local key (e.g., "int64", "uuid.UUID")
 }
 
 // analyzeRelations extracts all relations from a model's fields.
@@ -79,6 +80,9 @@ func analyzeRelations(m *ast.ModelDecl, enums map[string]bool) []Relation {
 
 		// Check if the FK field is nullable (e.g., userId: Int?)
 		rel.FKNullable = isFKNullable(m.Fields, rel.LocalKey)
+
+		// Determine Go type of the local key field
+		rel.KeyGoType = fkGoType(m.Fields, rel.LocalKey)
 
 		relations = append(relations, rel)
 	}
@@ -153,7 +157,7 @@ func generateDataLoaderFile(result *semantic.Result, packageName string, enums m
 // generateLoaderType generates the BatchFn type alias for a relation.
 func generateLoaderType(b *strings.Builder, modelName string, rel Relation) {
 	loaderName := loaderTypeName(modelName, rel)
-	localGoType := "int64"
+	localGoType := rel.KeyGoType
 	if rel.IsList {
 		fmt.Fprintf(b, "// %s is the batch function for %s.%s (hasMany).\n", loaderName, modelName, rel.FieldName)
 		fmt.Fprintf(b, "type %s = dataloader.BatchFn[%s, []%s]\n\n", loaderName, localGoType, rel.TargetName)
@@ -206,9 +210,9 @@ func generateLoadersStruct(b *strings.Builder, allRelations []struct {
 	b.WriteString("type Loaders struct {\n")
 	for _, e := range entries {
 		if e.rel.IsList {
-			fmt.Fprintf(b, "\t%s *dataloader.Loader[int64, []%s]\n", e.fieldName, e.rel.TargetName)
+			fmt.Fprintf(b, "\t%s *dataloader.Loader[%s, []%s]\n", e.fieldName, e.rel.KeyGoType, e.rel.TargetName)
 		} else {
-			fmt.Fprintf(b, "\t%s *dataloader.Loader[int64, *%s]\n", e.fieldName, e.rel.TargetName)
+			fmt.Fprintf(b, "\t%s *dataloader.Loader[%s, *%s]\n", e.fieldName, e.rel.KeyGoType, e.rel.TargetName)
 		}
 	}
 	b.WriteString("}\n\n")
@@ -280,33 +284,36 @@ func generateBatchFunc(b *strings.Builder, modelName string, rel Relation, softT
 	scanFn := "scan" + rel.TargetName
 	goRemoteField := str.Capitalize(rel.RemoteKey) // camelCase → PascalCase (e.g., userId → UserId)
 
+	keyType := rel.KeyGoType
 	if rel.IsList {
-		fmt.Fprintf(b, "\t\tfunc(ctx context.Context, keys []int64, fields []string) (map[int64][]%s, error) {\n", rel.TargetName)
+		fmt.Fprintf(b, "\t\tfunc(ctx context.Context, keys []%s, fields []string) (map[%s][]%s, error) {\n", keyType, keyType, rel.TargetName)
 		fmt.Fprintf(b, "\t\t\tfields = ensureField(fields, %q)\n", remoteCol)
-		fmt.Fprintf(b, "\t\t\tconds := []lux.Condition{lux.NewIntField(%q).In(keys...)}\n", remoteCol)
+		condField := goTypeToCondField(keyType)
+		fmt.Fprintf(b, "\t\t\tconds := []lux.Condition{lux.New%s(%q).In(keys...)}\n", condField, remoteCol)
 		if softTarget {
 			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewTimeField(\"deleted_at\").IsNull())\n")
 		}
 		fmt.Fprintf(b, "\t\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", targetTable)
 		fmt.Fprintf(b, "\t\t\trows, err := pg.QueryRows(ctx, app.DB, %s, query, args...)\n", scanFn)
 		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
-		fmt.Fprintf(b, "\t\t\tresult := make(map[int64][]%s, len(keys))\n", rel.TargetName)
+		fmt.Fprintf(b, "\t\t\tresult := make(map[%s][]%s, len(keys))\n", keyType, rel.TargetName)
 		fmt.Fprintf(b, "\t\t\tfor _, row := range rows {\n")
 		fmt.Fprintf(b, "\t\t\t\tresult[row.%s] = append(result[row.%s], *row)\n", goRemoteField, goRemoteField)
 		fmt.Fprintf(b, "\t\t\t}\n")
 		fmt.Fprintf(b, "\t\t\treturn result, nil\n")
 		fmt.Fprintf(b, "\t\t},\n")
 	} else {
-		fmt.Fprintf(b, "\t\tfunc(ctx context.Context, keys []int64, fields []string) (map[int64]*%s, error) {\n", rel.TargetName)
+		fmt.Fprintf(b, "\t\tfunc(ctx context.Context, keys []%s, fields []string) (map[%s]*%s, error) {\n", keyType, keyType, rel.TargetName)
 		fmt.Fprintf(b, "\t\t\tfields = ensureField(fields, %q)\n", remoteCol)
-		fmt.Fprintf(b, "\t\t\tconds := []lux.Condition{lux.NewIntField(%q).In(keys...)}\n", remoteCol)
+		condField := goTypeToCondField(keyType)
+		fmt.Fprintf(b, "\t\t\tconds := []lux.Condition{lux.New%s(%q).In(keys...)}\n", condField, remoteCol)
 		if softTarget {
 			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewTimeField(\"deleted_at\").IsNull())\n")
 		}
 		fmt.Fprintf(b, "\t\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", targetTable)
 		fmt.Fprintf(b, "\t\t\trows, err := pg.QueryRows(ctx, app.DB, %s, query, args...)\n", scanFn)
 		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
-		fmt.Fprintf(b, "\t\t\tresult := make(map[int64]*%s, len(keys))\n", rel.TargetName)
+		fmt.Fprintf(b, "\t\t\tresult := make(map[%s]*%s, len(keys))\n", keyType, rel.TargetName)
 		fmt.Fprintf(b, "\t\t\tfor _, row := range rows {\n")
 		fmt.Fprintf(b, "\t\t\t\tresult[row.%s] = row\n", goRemoteField)
 		fmt.Fprintf(b, "\t\t\t}\n")
@@ -380,6 +387,30 @@ func hasFKField(fields []*ast.FieldDecl, name string) bool {
 		}
 	}
 	return false
+}
+
+// goTypeToCondField maps a Go type to the lux condition field type name.
+func goTypeToCondField(goType string) string {
+	switch goType {
+	case "int64":
+		return "IntField"
+	case "string":
+		return "StringField"
+	case "uuid.UUID":
+		return "UUIDField"
+	default:
+		return "IntField"
+	}
+}
+
+// fkGoType returns the Go type of a FK field by name. Defaults to "int64".
+func fkGoType(fields []*ast.FieldDecl, fkName string) string {
+	for _, f := range fields {
+		if f.Name == fkName && f.Type != nil {
+			return mapBaseType(f.Type.Name)
+		}
+	}
+	return "int64"
 }
 
 // isFKNullable checks if a FK field is nullable.

@@ -92,11 +92,11 @@ func pgApplyDirective(base, luxoType string, directives []lux.DirectiveInfo) str
 func (Dialect) ColumnDef(name string, col lux.ColumnInfo) string {
 	var parts []string
 	parts = append(parts, name+" "+col.Type)
-	if !col.Nullable && !col.Serial && col.Default == "" {
+	if !col.Nullable && !col.Serial {
 		parts = append(parts, "NOT NULL")
 	}
 	if col.Default != "" {
-		parts = append(parts, "NOT NULL DEFAULT "+col.Default)
+		parts = append(parts, "DEFAULT "+col.Default)
 	}
 	if col.PK {
 		parts = append(parts, "PRIMARY KEY")

@@ -207,7 +207,7 @@ func extractIndexFields(d *ast.Directive) []string {
 func defaultSQL(luxoType, value string) string {
 	switch luxoType {
 	case "String":
-		return "'" + value + "'"
+		return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 	case "Boolean":
 		if value == "true" {
 			return "TRUE"

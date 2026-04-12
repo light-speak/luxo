@@ -82,7 +82,10 @@ func (t *pgxTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.T
 }
 
 func (t *pgxTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryEndData) {
-	sd, _ := ctx.Value(traceStartKey{}).(traceStartData)
+	sd, ok := ctx.Value(traceStartKey{}).(traceStartData)
+	if !ok {
+		return
+	}
 	dur := time.Since(sd.startTime)
 	sql := strings.ReplaceAll(strings.ReplaceAll(sd.sql, "\n", " "), "\t", " ")
 	if len(sql) > 200 {

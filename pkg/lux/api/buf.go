@@ -3,6 +3,7 @@ package api
 import (
 	"strconv"
 	"sync"
+	"unicode/utf8"
 )
 
 // hex lookup for JSON \u00XX escape without fmt.Sprintf.
@@ -47,8 +48,7 @@ func (r *ResponseBuf) AppendBytes(b []byte)  { r.B = append(r.B, b...) }
 // Zero allocation for strings without control characters.
 func (r *ResponseBuf) AppendJSONString(s string) {
 	r.B = append(r.B, '"')
-	for i := 0; i < len(s); i++ {
-		c := s[i]
+	for _, c := range s {
 		switch c {
 		case '"':
 			r.B = append(r.B, '\\', '"')
@@ -62,9 +62,9 @@ func (r *ResponseBuf) AppendJSONString(s string) {
 			r.B = append(r.B, '\\', 't')
 		default:
 			if c < 0x20 {
-				r.B = append(r.B, '\\', 'u', '0', '0', hexDigits[c>>4], hexDigits[c&0x0f])
+				r.B = append(r.B, '\\', 'u', '0', '0', hexDigits[byte(c)>>4], hexDigits[byte(c)&0x0f])
 			} else {
-				r.B = append(r.B, c)
+				r.B = utf8.AppendRune(r.B, c)
 			}
 		}
 	}

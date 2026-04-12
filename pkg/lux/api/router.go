@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	stderrors "errors"
+	"fmt"
 	"net/http"
 
 	"github.com/bytedance/sonic"
@@ -70,9 +71,10 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	buf := GetBuf()
 	req.Buf = buf
 
-	if err := fn(r.Context(), req); err != nil {
+	herr := rt.callHandler(fn, r.Context(), req)
+	if herr != nil {
 		PutBuf(buf)
-		rt.writeAppError(w, r, err)
+		rt.writeAppError(w, r, herr)
 		return
 	}
 
@@ -83,6 +85,17 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`}`))
 
 	PutBuf(buf)
+}
+
+// callHandler executes a handler with panic recovery.
+// If the handler panics, the panic is caught and returned as an InternalServerError.
+func (rt *Router) callHandler(fn HandlerFunc, ctx context.Context, req *Request) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = errors.InternalError.WithCause(fmt.Errorf("panic: %v", p))
+		}
+	}()
+	return fn(ctx, req)
 }
 
 // writeAppError writes a structured error response with i18n translation and traceId.

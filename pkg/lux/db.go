@@ -4,7 +4,8 @@
 package lux
 
 import (
-	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"time"
@@ -81,8 +82,14 @@ func DBConfigFromEnv() DBConfig {
 
 // ConnectionString builds a PostgreSQL-style connection URL.
 func (c DBConfig) ConnectionString() string {
-	return fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s",
-		c.User, c.Password, c.Host, c.Port, c.DBName, c.SSL)
+	u := &url.URL{
+		Scheme:   "postgres",
+		User:     url.UserPassword(c.User, c.Password),
+		Host:     net.JoinHostPort(c.Host, c.Port),
+		Path:     c.DBName,
+		RawQuery: "sslmode=" + c.SSL,
+	}
+	return u.String()
 }
 
 // QueryTracer is called before and after each query for debugging.

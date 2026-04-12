@@ -2,6 +2,7 @@ package lux
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -144,8 +145,12 @@ func (f TimeField) Between(from, to time.Time) Condition {
 }
 
 // FilterOp creates a condition from string operator and value (RFC3339).
+// Returns FALSE condition if the value cannot be parsed.
 func (f TimeField) FilterOp(op, val string) Condition {
-	t, _ := time.Parse(time.RFC3339, val)
+	t, err := time.Parse(time.RFC3339, val)
+	if err != nil {
+		return falseCond{}
+	}
 	switch strings.ToLower(op) {
 	case "eq":
 		return f.Eq(t)
@@ -208,7 +213,10 @@ func (f DecimalField) Between(from, to decimal.Decimal) Condition {
 
 // FilterOp creates a condition from string operator and value.
 func (f IntField) FilterOp(op, val string) Condition {
-	v, _ := parseInt64(val)
+	v, err := parseInt64(val)
+	if err != nil {
+		return falseCond{}
+	}
 	switch strings.ToLower(op) {
 	case "eq":
 		return f.Eq(v)
@@ -235,37 +243,57 @@ func (f StringField) FilterOp(op, val string) Condition {
 	case "ne":
 		return f.Neq(val)
 	case "contains":
-		return f.Like("%" + val + "%")
+		return f.Like("%" + escapeLike(val) + "%")
 	case "startswith":
-		return f.Like(val + "%")
+		return f.Like(escapeLike(val) + "%")
 	case "endswith":
-		return f.Like("%" + val)
+		return f.Like("%" + escapeLike(val))
 	default:
 		return f.Eq(val)
 	}
 }
 
 // FilterOp creates a condition from string operator and value.
+func (f FloatField) FilterOp(op, val string) Condition {
+	v, err := strconv.ParseFloat(val, 64)
+	if err != nil {
+		return falseCond{}
+	}
+	switch strings.ToLower(op) {
+	case "eq":
+		return f.Eq(v)
+	case "ne":
+		return f.Neq(v)
+	case "gt":
+		return f.Gt(v)
+	case "gte":
+		return f.Gte(v)
+	case "lt":
+		return f.Lt(v)
+	case "lte":
+		return f.Lte(v)
+	default:
+		return f.Eq(v)
+	}
+}
+
+// FilterOp creates a condition from string operator and value.
 func (f BoolField) FilterOp(op, val string) Condition {
 	v := strings.EqualFold(val, "true") || val == "1"
+	if strings.EqualFold(op, "ne") {
+		return f.Eq(!v)
+	}
 	return f.Eq(v)
 }
 
 func parseInt64(s string) (int64, error) {
-	var v int64
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			if c == '-' {
-				continue
-			}
-			return 0, fmt.Errorf("invalid int: %s", s)
-		}
-		v = v*10 + int64(c-'0')
-	}
-	if len(s) > 0 && s[0] == '-' {
-		v = -v
-	}
-	return v, nil
+	return strconv.ParseInt(s, 10, 64)
+}
+
+// escapeLike escapes SQL LIKE wildcard characters (%, _) in user input.
+func escapeLike(s string) string {
+	r := strings.NewReplacer("%", "\\%", "_", "\\_")
+	return r.Replace(s)
 }
 
 // --- Internal condition implementations ---
@@ -288,6 +316,9 @@ type inCond struct {
 }
 
 func (c *inCond) ToSQL(argOffset int) (string, []any) {
+	if len(c.vals) == 0 {
+		return "FALSE", nil
+	}
 	placeholders := make([]string, len(c.vals))
 	for i := range c.vals {
 		placeholders[i] = fmt.Sprintf("$%d", argOffset+i)
@@ -302,6 +333,9 @@ type notInCond struct {
 }
 
 func (c *notInCond) ToSQL(argOffset int) (string, []any) {
+	if len(c.vals) == 0 {
+		return "TRUE", nil
+	}
 	placeholders := make([]string, len(c.vals))
 	for i := range c.vals {
 		placeholders[i] = fmt.Sprintf("$%d", argOffset+i)
@@ -332,6 +366,11 @@ type betweenCond struct {
 func (c *betweenCond) ToSQL(argOffset int) (string, []any) {
 	return fmt.Sprintf("%s BETWEEN $%d AND $%d", c.col, argOffset, argOffset+1), []any{c.from, c.to}
 }
+
+// falseCond always evaluates to FALSE — used when filter input is invalid.
+type falseCond struct{}
+
+func (c falseCond) ToSQL(argOffset int) (string, []any) { return "FALSE", nil }
 
 // rawCond is a pre-built SQL condition with embedded args.
 type rawCond struct {

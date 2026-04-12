@@ -356,8 +356,9 @@ func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType
 	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 	writeParamID(b, idType, "\t\t")
-	fmt.Fprintf(b, "\t\tif _, err := app.%s.Find(ctx, id); err != nil {\n", name)
-	fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
+	fmt.Fprintf(b, "\t\texisting, err := app.%s.Find(ctx, id)\n", name)
+	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+	fmt.Fprintf(b, "\t\tif existing == nil {\n\t\t\treturn errors.NotFound.WithData(map[string]any{\"resource\": %q, \"id\": id})\n\t\t}\n", name)
 	tableName := str.ToSnakeCase(name) + "s"
 	fmt.Fprintf(b, "\t\tbuilder := new%sUpdateBuilder(app.%s.db, %q, id)\n", name, name, tableName)
 
@@ -548,7 +549,7 @@ func generateListRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []R
 		fmt.Fprintf(b, "\t\t\tchildCols := selection.SQLColumns(f.Children)\n")
 
 		// Collect all keys
-		fmt.Fprintf(b, "\t\t\tkeys := make([]int64, 0, len(items))\n")
+		fmt.Fprintf(b, "\t\t\tkeys := make([]%s, 0, len(items))\n", rel.KeyGoType)
 		if rel.FKNullable {
 			fmt.Fprintf(b, "\t\t\tfor _, item := range items {\n")
 			fmt.Fprintf(b, "\t\t\t\tif item.%s != nil {\n", goLocalKey)
@@ -601,11 +602,6 @@ func crudAPIName(modelName, op string) string {
 	default:
 		return op + modelName
 	}
-}
-
-// generateRegisterFunc generates the RegisterHandlers function.
-func generateRegisterFunc(b *strings.Builder, models []*ast.ModelDecl) {
-	generateRegisterFuncWithInferred(b, models, nil)
 }
 
 // generateRegisterFuncWithInferred generates RegisterHandlers with CRUD + inferred handlers.
@@ -697,10 +693,14 @@ func generateFilterParser(b *strings.Builder, m *ast.ModelDecl, enums map[string
 		switch f.Type.Name {
 		case "Int":
 			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewIntField(%q).FilterOp(f.Operator, f.Value))\n", col)
+		case "Float":
+			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewFloatField(%q).FilterOp(f.Operator, f.Value))\n", col)
 		case "String":
 			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewStringField(%q).FilterOp(f.Operator, f.Value))\n", col)
 		case "Boolean":
 			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewBoolField(%q).FilterOp(f.Operator, f.Value))\n", col)
+		case "DateTime":
+			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewTimeField(%q).FilterOp(f.Operator, f.Value))\n", col)
 		default:
 			// Enum or other types — treat as string
 			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewStringField(%q).FilterOp(f.Operator, f.Value))\n", col)
