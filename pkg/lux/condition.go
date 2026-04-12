@@ -37,6 +37,14 @@ func (f IntField) Gte(v int64) Condition { return &cmpCond{col: f.col, op: ">=",
 func (f IntField) Lt(v int64) Condition  { return &cmpCond{col: f.col, op: "<", val: v} }
 func (f IntField) Lte(v int64) Condition { return &cmpCond{col: f.col, op: "<=", val: v} }
 
+// Between returns a condition matching values in [from, to].
+func (f IntField) Between(from, to int64) Condition {
+	return &betweenCond{col: f.col, from: from, to: to}
+}
+
+func (f IntField) IsNull() Condition    { return &nullCond{col: f.col, isNull: true} }
+func (f IntField) IsNotNull() Condition { return &nullCond{col: f.col, isNull: false} }
+
 // In returns a condition matching any of the given values.
 func (f IntField) In(vs ...int64) Condition {
 	vals := make([]any, len(vs))
@@ -44,6 +52,15 @@ func (f IntField) In(vs ...int64) Condition {
 		vals[i] = v
 	}
 	return &inCond{col: f.col, vals: vals}
+}
+
+// NotIn returns a condition excluding the given values.
+func (f IntField) NotIn(vs ...int64) Condition {
+	vals := make([]any, len(vs))
+	for i, v := range vs {
+		vals[i] = v
+	}
+	return &notInCond{col: f.col, vals: vals}
 }
 
 // FloatField provides typed conditions for float columns.
@@ -59,15 +76,24 @@ func (f FloatField) Gte(v float64) Condition { return &cmpCond{col: f.col, op: "
 func (f FloatField) Lt(v float64) Condition  { return &cmpCond{col: f.col, op: "<", val: v} }
 func (f FloatField) Lte(v float64) Condition { return &cmpCond{col: f.col, op: "<=", val: v} }
 
+// Between returns a condition matching values in [from, to].
+func (f FloatField) Between(from, to float64) Condition {
+	return &betweenCond{col: f.col, from: from, to: to}
+}
+
 // StringField provides typed conditions for string columns.
 type StringField struct{ col string }
 
 // NewStringField creates a StringField for the given column.
 func NewStringField(col string) StringField { return StringField{col: col} }
 
-func (f StringField) Eq(v string) Condition   { return &cmpCond{col: f.col, op: "=", val: v} }
-func (f StringField) Neq(v string) Condition  { return &cmpCond{col: f.col, op: "!=", val: v} }
-func (f StringField) Like(v string) Condition { return &cmpCond{col: f.col, op: "LIKE", val: v} }
+func (f StringField) Eq(v string) Condition      { return &cmpCond{col: f.col, op: "=", val: v} }
+func (f StringField) Neq(v string) Condition     { return &cmpCond{col: f.col, op: "!=", val: v} }
+func (f StringField) Like(v string) Condition    { return &cmpCond{col: f.col, op: "LIKE", val: v} }
+func (f StringField) NotLike(v string) Condition { return &cmpCond{col: f.col, op: "NOT LIKE", val: v} }
+func (f StringField) ILike(v string) Condition   { return &cmpCond{col: f.col, op: "ILIKE", val: v} }
+func (f StringField) IsNull() Condition          { return &nullCond{col: f.col, isNull: true} }
+func (f StringField) IsNotNull() Condition       { return &nullCond{col: f.col, isNull: false} }
 
 // In returns a condition matching any of the given values.
 func (f StringField) In(vs ...string) Condition {
@@ -76,6 +102,15 @@ func (f StringField) In(vs ...string) Condition {
 		vals[i] = v
 	}
 	return &inCond{col: f.col, vals: vals}
+}
+
+// NotIn returns a condition excluding the given values.
+func (f StringField) NotIn(vs ...string) Condition {
+	vals := make([]any, len(vs))
+	for i, v := range vs {
+		vals[i] = v
+	}
+	return &notInCond{col: f.col, vals: vals}
 }
 
 // BoolField provides typed conditions for boolean columns.
@@ -95,10 +130,39 @@ type TimeField struct{ col string }
 func NewTimeField(col string) TimeField { return TimeField{col: col} }
 
 func (f TimeField) Eq(v time.Time) Condition     { return &cmpCond{col: f.col, op: "=", val: v} }
+func (f TimeField) Neq(v time.Time) Condition    { return &cmpCond{col: f.col, op: "!=", val: v} }
 func (f TimeField) Before(v time.Time) Condition { return &cmpCond{col: f.col, op: "<", val: v} }
 func (f TimeField) After(v time.Time) Condition  { return &cmpCond{col: f.col, op: ">", val: v} }
+func (f TimeField) Gte(v time.Time) Condition    { return &cmpCond{col: f.col, op: ">=", val: v} }
+func (f TimeField) Lte(v time.Time) Condition    { return &cmpCond{col: f.col, op: "<=", val: v} }
 func (f TimeField) IsNull() Condition            { return &nullCond{col: f.col, isNull: true} }
 func (f TimeField) IsNotNull() Condition         { return &nullCond{col: f.col, isNull: false} }
+
+// Between returns a condition matching times in [from, to].
+func (f TimeField) Between(from, to time.Time) Condition {
+	return &betweenCond{col: f.col, from: from, to: to}
+}
+
+// FilterOp creates a condition from string operator and value (RFC3339).
+func (f TimeField) FilterOp(op, val string) Condition {
+	t, _ := time.Parse(time.RFC3339, val)
+	switch strings.ToLower(op) {
+	case "eq":
+		return f.Eq(t)
+	case "ne":
+		return f.Neq(t)
+	case "gt", "after":
+		return f.After(t)
+	case "gte":
+		return f.Gte(t)
+	case "lt", "before":
+		return f.Before(t)
+	case "lte":
+		return f.Lte(t)
+	default:
+		return f.Eq(t)
+	}
+}
 
 // UUIDField provides typed conditions for UUID columns.
 type UUIDField struct{ col string }
@@ -108,6 +172,8 @@ func NewUUIDField(col string) UUIDField { return UUIDField{col: col} }
 
 func (f UUIDField) Eq(v uuid.UUID) Condition  { return &cmpCond{col: f.col, op: "=", val: v} }
 func (f UUIDField) Neq(v uuid.UUID) Condition { return &cmpCond{col: f.col, op: "!=", val: v} }
+func (f UUIDField) IsNull() Condition         { return &nullCond{col: f.col, isNull: true} }
+func (f UUIDField) IsNotNull() Condition      { return &nullCond{col: f.col, isNull: false} }
 
 // In returns a condition matching any of the given UUIDs.
 func (f UUIDField) In(vs ...uuid.UUID) Condition {
@@ -130,6 +196,13 @@ func (f DecimalField) Gt(v decimal.Decimal) Condition  { return &cmpCond{col: f.
 func (f DecimalField) Gte(v decimal.Decimal) Condition { return &cmpCond{col: f.col, op: ">=", val: v} }
 func (f DecimalField) Lt(v decimal.Decimal) Condition  { return &cmpCond{col: f.col, op: "<", val: v} }
 func (f DecimalField) Lte(v decimal.Decimal) Condition { return &cmpCond{col: f.col, op: "<=", val: v} }
+func (f DecimalField) IsNull() Condition               { return &nullCond{col: f.col, isNull: true} }
+func (f DecimalField) IsNotNull() Condition            { return &nullCond{col: f.col, isNull: false} }
+
+// Between returns a condition matching values in [from, to].
+func (f DecimalField) Between(from, to decimal.Decimal) Condition {
+	return &betweenCond{col: f.col, from: from, to: to}
+}
 
 // --- FilterOp: generic operator dispatch from string (used by generated filter parsers) ---
 
@@ -222,6 +295,20 @@ func (c *inCond) ToSQL(argOffset int) (string, []any) {
 	return fmt.Sprintf("%s IN (%s)", c.col, strings.Join(placeholders, ", ")), c.vals
 }
 
+// notInCond is a NOT IN condition: col NOT IN ($N, $N+1, ...).
+type notInCond struct {
+	col  string
+	vals []any
+}
+
+func (c *notInCond) ToSQL(argOffset int) (string, []any) {
+	placeholders := make([]string, len(c.vals))
+	for i := range c.vals {
+		placeholders[i] = fmt.Sprintf("$%d", argOffset+i)
+	}
+	return fmt.Sprintf("%s NOT IN (%s)", c.col, strings.Join(placeholders, ", ")), c.vals
+}
+
 // nullCond is a NULL/NOT NULL condition: col IS NULL or col IS NOT NULL.
 type nullCond struct {
 	col    string
@@ -233,6 +320,17 @@ func (c *nullCond) ToSQL(argOffset int) (string, []any) {
 		return fmt.Sprintf("%s IS NULL", c.col), nil
 	}
 	return fmt.Sprintf("%s IS NOT NULL", c.col), nil
+}
+
+// betweenCond is a BETWEEN condition: col BETWEEN $N AND $N+1.
+type betweenCond struct {
+	col  string
+	from any
+	to   any
+}
+
+func (c *betweenCond) ToSQL(argOffset int) (string, []any) {
+	return fmt.Sprintf("%s BETWEEN $%d AND $%d", c.col, argOffset, argOffset+1), []any{c.from, c.to}
 }
 
 // rawCond is a pre-built SQL condition with embedded args.
@@ -249,12 +347,26 @@ func RawCondition(sql string, args ...any) Condition {
 
 func (c *rawCond) ToSQL(argOffset int) (string, []any) {
 	// Rewrite $1, $2, ... to $argOffset, $argOffset+1, ...
-	sql := c.sql
-	for i := len(c.args); i >= 1; i-- {
-		old := fmt.Sprintf("$%d", i)
-		new := fmt.Sprintf("$%d", argOffset+i-1)
-		sql = strings.ReplaceAll(sql, old, new)
+	// Use a builder to avoid $1 matching inside $10
+	var b strings.Builder
+	i := 0
+	for i < len(c.sql) {
+		if c.sql[i] == '$' && i+1 < len(c.sql) && c.sql[i+1] >= '1' && c.sql[i+1] <= '9' {
+			// Parse the full number after $
+			j := i + 1
+			for j < len(c.sql) && c.sql[j] >= '0' && c.sql[j] <= '9' {
+				j++
+			}
+			n := 0
+			for _, ch := range c.sql[i+1 : j] {
+				n = n*10 + int(ch-'0')
+			}
+			fmt.Fprintf(&b, "$%d", argOffset+n-1)
+			i = j
+		} else {
+			b.WriteByte(c.sql[i])
+			i++
+		}
 	}
-	// Wrap in parentheses to protect OR from AND precedence
-	return "(" + sql + ")", c.args
+	return "(" + b.String() + ")", c.args
 }

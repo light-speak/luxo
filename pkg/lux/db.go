@@ -39,44 +39,43 @@ func DefaultDBConfig() DBConfig {
 }
 
 // DBConfigFromEnv reads database configuration from environment variables.
-// Uses os.LookupEnv — call env.Load(".env") before this if using a .env file.
+// Uses os.Getenv — call env.Load(".env") before this if using a .env file.
 func DBConfigFromEnv() DBConfig {
-	getEnv := func(key string) string { return os.Getenv(key) }
 	cfg := DefaultDBConfig()
-	if v := getEnv("DATABASE_HOST"); v != "" {
+	if v := os.Getenv("DATABASE_HOST"); v != "" {
 		cfg.Host = v
 	}
-	if v := getEnv("DATABASE_PORT"); v != "" {
+	if v := os.Getenv("DATABASE_PORT"); v != "" {
 		cfg.Port = v
 	}
-	if v := getEnv("DATABASE_USER"); v != "" {
+	if v := os.Getenv("DATABASE_USER"); v != "" {
 		cfg.User = v
 	}
-	if v := getEnv("DATABASE_PASSWORD"); v != "" {
+	if v := os.Getenv("DATABASE_PASSWORD"); v != "" {
 		cfg.Password = v
 	}
-	if v := getEnv("DATABASE_PREFIX"); v != "" {
+	if v := os.Getenv("DATABASE_PREFIX"); v != "" {
 		cfg.DBName = v
 	}
-	if v := getEnv("DATABASE_SSL"); v != "" {
+	if v := os.Getenv("DATABASE_SSL"); v != "" {
 		cfg.SSL = v
 	}
-	if v := getEnv("DATABASE_POOL"); v != "" {
+	if v := os.Getenv("DATABASE_POOL"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.Pool = n
 		}
 	}
-	if v := getEnv("DATABASE_IDLE"); v != "" {
+	if v := os.Getenv("DATABASE_IDLE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.Idle = n
 		}
 	}
-	if v := getEnv("DATABASE_TIMEOUT"); v != "" {
+	if v := os.Getenv("DATABASE_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			cfg.Timeout = d
 		}
 	}
-	cfg.DebugSQL = getEnv("DEBUG_SQL") == "true"
+	cfg.DebugSQL = os.Getenv("DEBUG_SQL") == "true"
 	return cfg
 }
 

@@ -189,6 +189,136 @@ func TestParamMissing(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing param")
 	}
+	_, err = req.ParamFloat("price")
+	if err == nil {
+		t.Fatal("expected error for missing param")
+	}
+	_, err = req.ParamDateTime("date")
+	if err == nil {
+		t.Fatal("expected error for missing param")
+	}
+	_, err = req.ParamIntArray("ids")
+	if err == nil {
+		t.Fatal("expected error for missing param")
+	}
+	_, err = req.ParamStringArray("tags")
+	if err == nil {
+		t.Fatal("expected error for missing param")
+	}
+	var target struct{ X int }
+	err = req.ParamJSON("obj", &target)
+	if err == nil {
+		t.Fatal("expected error for missing param")
+	}
+}
+
+func TestParamIntArray(t *testing.T) {
+	req, _ := ParseRequest(makeReq(`{"$api":"test","ids":[1,2,3]}`))
+	ids, err := req.ParamIntArray("ids")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 3 || ids[0] != 1 || ids[1] != 2 || ids[2] != 3 {
+		t.Errorf("ids = %v, want [1 2 3]", ids)
+	}
+}
+
+func TestParamIntArrayWrongType(t *testing.T) {
+	req, _ := ParseRequest(makeReq(`{"$api":"test","ids":"not_array"}`))
+	_, err := req.ParamIntArray("ids")
+	if err == nil {
+		t.Fatal("expected error for string as int array")
+	}
+}
+
+func TestParamStringArray(t *testing.T) {
+	req, _ := ParseRequest(makeReq(`{"$api":"test","tags":["a","b"]}`))
+	tags, err := req.ParamStringArray("tags")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tags) != 2 || tags[0] != "a" || tags[1] != "b" {
+		t.Errorf("tags = %v, want [a b]", tags)
+	}
+}
+
+func TestParamStringArrayWrongType(t *testing.T) {
+	req, _ := ParseRequest(makeReq(`{"$api":"test","tags":123}`))
+	_, err := req.ParamStringArray("tags")
+	if err == nil {
+		t.Fatal("expected error for int as string array")
+	}
+}
+
+func TestParamFloat(t *testing.T) {
+	req, _ := ParseRequest(makeReq(`{"$api":"test","price":99.5}`))
+	v, err := req.ParamFloat("price")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != 99.5 {
+		t.Errorf("price = %f, want 99.5", v)
+	}
+}
+
+func TestParamFloatWrongType(t *testing.T) {
+	req, _ := ParseRequest(makeReq(`{"$api":"test","price":"abc"}`))
+	_, err := req.ParamFloat("price")
+	if err == nil {
+		t.Fatal("expected error for string as float")
+	}
+}
+
+func TestParamDateTime(t *testing.T) {
+	req, _ := ParseRequest(makeReq(`{"$api":"test","date":"2026-04-13T10:00:00Z"}`))
+	v, err := req.ParamDateTime("date")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Year() != 2026 || v.Month() != 4 || v.Day() != 13 {
+		t.Errorf("date = %v", v)
+	}
+}
+
+func TestParamDateTimeWrongFormat(t *testing.T) {
+	req, _ := ParseRequest(makeReq(`{"$api":"test","date":"2026-04-13"}`))
+	_, err := req.ParamDateTime("date")
+	if err == nil {
+		t.Fatal("expected error for non-RFC3339 format")
+	}
+}
+
+func TestParamDateTimeWrongType(t *testing.T) {
+	req, _ := ParseRequest(makeReq(`{"$api":"test","date":12345}`))
+	_, err := req.ParamDateTime("date")
+	if err == nil {
+		t.Fatal("expected error for number as datetime")
+	}
+}
+
+func TestParamJSON(t *testing.T) {
+	req, _ := ParseRequest(makeReq(`{"$api":"test","input":{"name":"lin","age":30}}`))
+	var target struct {
+		Name string `json:"name"`
+		Age  int    `json:"age"`
+	}
+	if err := req.ParamJSON("input", &target); err != nil {
+		t.Fatal(err)
+	}
+	if target.Name != "lin" || target.Age != 30 {
+		t.Errorf("target = %+v", target)
+	}
+}
+
+func TestParamJSONWrongType(t *testing.T) {
+	req, _ := ParseRequest(makeReq(`{"$api":"test","input":"not_object"}`))
+	var target struct {
+		Name string `json:"name"`
+	}
+	err := req.ParamJSON("input", &target)
+	if err == nil {
+		t.Fatal("expected error for string as struct")
+	}
 }
 
 func TestParseRequestWithFilters(t *testing.T) {

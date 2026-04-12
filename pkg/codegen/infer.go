@@ -173,20 +173,35 @@ var operatorSuffixes = []struct {
 	suffix string
 	op     string
 }{
+	// Comparison — longest first
 	{"GreaterThanEqual", "gte"},
 	{"LessThanEqual", "lte"},
 	{"GreaterThan", "gt"},
 	{"LessThan", "lt"},
+	// Time-semantic aliases
+	{"After", "gt"},
+	{"Before", "lt"},
+	// String matching
+	{"NotContaining", "notContaining"},
 	{"StartingWith", "startswith"},
 	{"EndingWith", "endswith"},
 	{"Containing", "containing"},
+	{"IgnoreCase", "ignoreCase"},
+	// Null checks
 	{"IsNotNull", "isNotNull"},
 	{"IsNull", "isNull"},
 	{"NotNull", "isNotNull"},
+	// Range
 	{"Between", "between"},
+	// Set membership
+	{"NotIn", "notIn"},
+	{"In", "in"},
+	// String pattern
 	{"NotLike", "notLike"},
 	{"Like", "like"},
+	// Negation
 	{"Not", "ne"},
+	// Boolean
 	{"True", "true"},
 	{"False", "false"},
 }
@@ -251,18 +266,35 @@ func generateInferredHandler(b *strings.Builder, api *ast.ApiDecl, inf *Inferred
 	name := api.Name
 	modelName := inf.ModelName
 
+	// Auto-infer params if not declared
+	params := api.Params
+	if len(params) == 0 {
+		params = buildInferredParams(inf, m)
+	}
+
 	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(name))
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 
 	// Parse params
-	for _, p := range api.Params {
-		method := paramMethod(resolveGoType(p.Type))
-		fmt.Fprintf(b, "\t\t%s, err := req.Param%s(%q)\n", p.Name, method, p.Name)
-		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+	for _, p := range params {
+		goType := resolveGoType(p.Type)
+		method := paramMethod(goType)
+		// Enum params are strings in JSON
+		if method == "" && p.Type != nil && enums[p.Type.Name] {
+			method = "String"
+		}
+		if method == "" {
+			fmt.Fprintf(b, "\t\tvar %s %s\n", p.Name, goType)
+			fmt.Fprintf(b, "\t\tif err := req.ParamJSON(%q, &%s); err != nil {\n", p.Name, p.Name)
+			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
+		} else {
+			fmt.Fprintf(b, "\t\t%s, err := req.Param%s(%q)\n", p.Name, method, p.Name)
+			fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+		}
 	}
 
 	// Build conditions
-	writeInferredConditions(b, inf, m, api.Params)
+	writeInferredConditions(b, inf, m, params)
 
 	writeInferredAction(b, inf, modelName, isSoftDelete(m))
 }
@@ -302,43 +334,36 @@ func writeInferredConditions(b *strings.Builder, inf *InferredAPI, m *ast.ModelD
 // writeAndClause writes a single AND clause condition.
 func writeAndClause(b *strings.Builder, clause InferClause, m *ast.ModelDecl, params []*ast.ParamDecl, paramIdx int) int {
 	col := str.ToSnakeCase(clause.Field)
-	fieldType := fieldGoType(m, clause.Field)
+	condType := fieldConditionType(getFieldTypeRefRaw(m, clause.Field))
 	paramExpr := ""
 	if paramIdx < len(params) {
 		paramExpr = params[paramIdx].Name
 	}
 
+	// Zero-param ops
+	if zp := writeZeroParamClause(b, clause.Op, condType, col); zp {
+		return paramIdx
+	}
+
+	// String matching ops
+	if sm := writeStringMatchClause(b, clause.Op, col, paramExpr); sm {
+		return paramIdx + 1
+	}
+
 	switch clause.Op {
-	case "true":
-		fmt.Fprintf(b, "\t\t\tlux.NewBoolField(%q).IsTrue(),\n", col)
-		return paramIdx
-	case "false":
-		fmt.Fprintf(b, "\t\t\tlux.NewBoolField(%q).IsFalse(),\n", col)
-		return paramIdx
-	case "isNull":
-		fmt.Fprintf(b, "\t\t\tlux.NewTimeField(%q).IsNull(),\n", col)
-		return paramIdx
-	case "isNotNull":
-		fmt.Fprintf(b, "\t\t\tlux.NewTimeField(%q).IsNotNull(),\n", col)
-		return paramIdx
-	case "containing":
-		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).Like(\"%%\" + %s + \"%%\"),\n", col, paramExpr)
-	case "startswith":
-		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).Like(%s + \"%%\"),\n", col, paramExpr)
-	case "endswith":
-		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).Like(\"%%\" + %s),\n", col, paramExpr)
-	case "like":
-		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).Like(%s),\n", col, paramExpr)
 	case "between":
 		param2 := ""
 		if paramIdx+1 < len(params) {
 			param2 = params[paramIdx+1].Name
 		}
-		fmt.Fprintf(b, "\t\t\tlux.NewIntField(%q).Gte(%s),\n", col, paramExpr)
-		fmt.Fprintf(b, "\t\t\tlux.NewIntField(%q).Lte(%s),\n", col, param2)
+		fmt.Fprintf(b, "\t\t\tlux.New%s(%q).Between(%s, %s),\n", condType, col, paramExpr, param2)
 		return paramIdx + 2
+	case "in":
+		fmt.Fprintf(b, "\t\t\tlux.New%s(%q).In(%s...),\n", condType, col, paramExpr)
+	case "notIn":
+		fmt.Fprintf(b, "\t\t\tlux.New%s(%q).NotIn(%s...),\n", condType, col, paramExpr)
 	default:
-		writeCondition(b, fieldType, col, opToMethod(clause.Op), paramExpr)
+		writeCondition(b, condType, col, opToMethod(clause.Op), paramExpr)
 	}
 	return paramIdx + 1
 }
@@ -414,6 +439,48 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 	fmt.Fprintf(b, "\t}\n}\n\n")
 }
 
+// writeZeroParamClause writes a zero-parameter clause (true/false/isNull/isNotNull).
+// Returns true if handled.
+func writeZeroParamClause(b *strings.Builder, op, condType, col string) bool {
+	switch op {
+	case "true":
+		fmt.Fprintf(b, "\t\t\tlux.NewBoolField(%q).IsTrue(),\n", col)
+	case "false":
+		fmt.Fprintf(b, "\t\t\tlux.NewBoolField(%q).IsFalse(),\n", col)
+	case "isNull":
+		fmt.Fprintf(b, "\t\t\tlux.New%s(%q).IsNull(),\n", condType, col)
+	case "isNotNull":
+		fmt.Fprintf(b, "\t\t\tlux.New%s(%q).IsNotNull(),\n", condType, col)
+	default:
+		return false
+	}
+	return true
+}
+
+// writeStringMatchClause writes a string matching clause (like/containing/etc.).
+// Returns true if handled.
+func writeStringMatchClause(b *strings.Builder, op, col, paramExpr string) bool {
+	switch op {
+	case "containing":
+		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).Like(\"%%\" + %s + \"%%\"),\n", col, paramExpr)
+	case "notContaining":
+		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).NotLike(\"%%\" + %s + \"%%\"),\n", col, paramExpr)
+	case "startswith":
+		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).Like(%s + \"%%\"),\n", col, paramExpr)
+	case "endswith":
+		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).Like(\"%%\" + %s),\n", col, paramExpr)
+	case "like":
+		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).Like(%s),\n", col, paramExpr)
+	case "notLike":
+		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).NotLike(%s),\n", col, paramExpr)
+	case "ignoreCase":
+		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).ILike(%s),\n", col, paramExpr)
+	default:
+		return false
+	}
+	return true
+}
+
 // opToMethod maps clause operator to Go condition method name.
 func opToMethod(op string) string {
 	switch op {
@@ -438,18 +505,7 @@ func opToMethod(op string) string {
 func writeClauseSQL(b *strings.Builder, clause InferClause, m *ast.ModelDecl, params []*ast.ParamDecl, paramIdx int) int {
 	col := str.ToSnakeCase(clause.Field)
 
-	switch clause.Op {
-	case "true":
-		fmt.Fprintf(b, "\t\t\tparts = append(parts, \"%s = true\")\n", col)
-		return paramIdx
-	case "false":
-		fmt.Fprintf(b, "\t\t\tparts = append(parts, \"%s = false\")\n", col)
-		return paramIdx
-	case "isNull":
-		fmt.Fprintf(b, "\t\t\tparts = append(parts, \"%s IS NULL\")\n", col)
-		return paramIdx
-	case "isNotNull":
-		fmt.Fprintf(b, "\t\t\tparts = append(parts, \"%s IS NOT NULL\")\n", col)
+	if zp := writeClauseSQLZeroParam(b, clause.Op, col); zp {
 		return paramIdx
 	}
 
@@ -458,48 +514,119 @@ func writeClauseSQL(b *strings.Builder, clause InferClause, m *ast.ModelDecl, pa
 		paramExpr = params[paramIdx].Name
 	}
 
-	sqlOp := "="
-	switch clause.Op {
-	case "ne":
-		sqlOp = "!="
-	case "gt":
-		sqlOp = ">"
-	case "gte":
-		sqlOp = ">="
-	case "lt":
-		sqlOp = "<"
-	case "lte":
-		sqlOp = "<="
-	case "containing":
-		fmt.Fprintf(b, "\t\t\tparts = append(parts, fmt.Sprintf(\"%s LIKE $%%d\", argIdx))\n", col)
-		fmt.Fprintf(b, "\t\t\torArgs = append(orArgs, \"%%\" + %s + \"%%\")\n", paramExpr)
-		fmt.Fprintf(b, "\t\t\targIdx++\n")
-		return paramIdx + 1
-	case "like":
-		fmt.Fprintf(b, "\t\t\tparts = append(parts, fmt.Sprintf(\"%s LIKE $%%d\", argIdx))\n", col)
-		fmt.Fprintf(b, "\t\t\torArgs = append(orArgs, %s)\n", paramExpr)
-		fmt.Fprintf(b, "\t\t\targIdx++\n")
+	if sm := writeClauseSQLStringMatch(b, clause.Op, col, paramExpr); sm {
 		return paramIdx + 1
 	}
 
+	switch clause.Op {
+	case "between":
+		param2 := ""
+		if paramIdx+1 < len(params) {
+			param2 = params[paramIdx+1].Name
+		}
+		fmt.Fprintf(b, "\t\t\tparts = append(parts, fmt.Sprintf(\"%s BETWEEN $%%d AND $%%d\", argIdx, argIdx+1))\n", col)
+		fmt.Fprintf(b, "\t\t\torArgs = append(orArgs, %s, %s)\n", paramExpr, param2)
+		fmt.Fprintf(b, "\t\t\targIdx += 2\n")
+		return paramIdx + 2
+	case "in":
+		writeClauseSQLSet(b, col, "IN", paramExpr)
+		return paramIdx + 1
+	case "notIn":
+		writeClauseSQLSet(b, col, "NOT IN", paramExpr)
+		return paramIdx + 1
+	}
+
+	sqlOp := clauseOpToSQL(clause.Op)
 	fmt.Fprintf(b, "\t\t\tparts = append(parts, fmt.Sprintf(\"%s %s $%%d\", argIdx))\n", col, sqlOp)
 	fmt.Fprintf(b, "\t\t\torArgs = append(orArgs, %s)\n", paramExpr)
 	fmt.Fprintf(b, "\t\t\targIdx++\n")
 	return paramIdx + 1
 }
 
-// writeCondition generates a typed condition call.
-func writeCondition(b *strings.Builder, fieldType, col, method, paramExpr string) {
-	switch fieldType {
-	case "int64":
-		fmt.Fprintf(b, "\t\t\tlux.NewIntField(%q).%s(%s),\n", col, method, paramExpr)
-	case "float64":
-		fmt.Fprintf(b, "\t\t\tlux.NewFloatField(%q).%s(%s),\n", col, method, paramExpr)
-	case "bool":
-		fmt.Fprintf(b, "\t\t\tlux.NewBoolField(%q).Eq(%s),\n", col, paramExpr)
+// writeClauseSQLZeroParam writes zero-param SQL clauses. Returns true if handled.
+func writeClauseSQLZeroParam(b *strings.Builder, op, col string) bool {
+	switch op {
+	case "true":
+		fmt.Fprintf(b, "\t\t\tparts = append(parts, \"%s = true\")\n", col)
+	case "false":
+		fmt.Fprintf(b, "\t\t\tparts = append(parts, \"%s = false\")\n", col)
+	case "isNull":
+		fmt.Fprintf(b, "\t\t\tparts = append(parts, \"%s IS NULL\")\n", col)
+	case "isNotNull":
+		fmt.Fprintf(b, "\t\t\tparts = append(parts, \"%s IS NOT NULL\")\n", col)
 	default:
-		fmt.Fprintf(b, "\t\t\tlux.NewStringField(%q).%s(%s),\n", col, method, paramExpr)
+		return false
 	}
+	return true
+}
+
+// writeClauseSQLStringMatch writes string matching SQL clauses. Returns true if handled.
+func writeClauseSQLStringMatch(b *strings.Builder, op, col, paramExpr string) bool {
+	switch op {
+	case "containing":
+		writeClauseSQLLike(b, col, "LIKE", "\"%%\" + "+paramExpr+" + \"%%\"")
+	case "notContaining":
+		writeClauseSQLLike(b, col, "NOT LIKE", "\"%%\" + "+paramExpr+" + \"%%\"")
+	case "startswith":
+		writeClauseSQLLike(b, col, "LIKE", paramExpr+" + \"%%\"")
+	case "endswith":
+		writeClauseSQLLike(b, col, "LIKE", "\"%%\" + "+paramExpr)
+	case "like":
+		writeClauseSQLLike(b, col, "LIKE", paramExpr)
+	case "notLike":
+		writeClauseSQLLike(b, col, "NOT LIKE", paramExpr)
+	case "ignoreCase":
+		writeClauseSQLLike(b, col, "ILIKE", paramExpr)
+	default:
+		return false
+	}
+	return true
+}
+
+// writeClauseSQLLike writes a LIKE/NOT LIKE/ILIKE clause for OR groups.
+func writeClauseSQLLike(b *strings.Builder, col, op, valExpr string) {
+	fmt.Fprintf(b, "\t\t\tparts = append(parts, fmt.Sprintf(\"%s %s $%%d\", argIdx))\n", col, op)
+	fmt.Fprintf(b, "\t\t\torArgs = append(orArgs, %s)\n", valExpr)
+	fmt.Fprintf(b, "\t\t\targIdx++\n")
+}
+
+// writeClauseSQLSet writes an IN/NOT IN clause for OR groups.
+// For simplicity, expands the slice with a loop.
+func writeClauseSQLSet(b *strings.Builder, col, op, paramExpr string) {
+	fmt.Fprintf(b, "\t\t\t{\n")
+	fmt.Fprintf(b, "\t\t\t\tph := make([]string, len(%s))\n", paramExpr)
+	fmt.Fprintf(b, "\t\t\t\tfor i := range %s {\n", paramExpr)
+	fmt.Fprintf(b, "\t\t\t\t\tph[i] = fmt.Sprintf(\"$%%d\", argIdx+i)\n")
+	fmt.Fprintf(b, "\t\t\t\t}\n")
+	fmt.Fprintf(b, "\t\t\t\tparts = append(parts, \"%s %s (\" + strings.Join(ph, \", \") + \")\")\n", col, op)
+	fmt.Fprintf(b, "\t\t\t\tfor _, v := range %s {\n", paramExpr)
+	fmt.Fprintf(b, "\t\t\t\t\torArgs = append(orArgs, v)\n")
+	fmt.Fprintf(b, "\t\t\t\t}\n")
+	fmt.Fprintf(b, "\t\t\t\targIdx += len(%s)\n", paramExpr)
+	fmt.Fprintf(b, "\t\t\t}\n")
+}
+
+// clauseOpToSQL converts clause operator to SQL operator.
+func clauseOpToSQL(op string) string {
+	switch op {
+	case "ne":
+		return "!="
+	case "gt":
+		return ">"
+	case "gte":
+		return ">="
+	case "lt":
+		return "<"
+	case "lte":
+		return "<="
+	default:
+		return "="
+	}
+}
+
+// writeCondition generates a typed condition call.
+func writeCondition(b *strings.Builder, condType, col, method, paramExpr string) {
+	fmt.Fprintf(b, "\t\t\tlux.New%s(%q).%s(%s),\n", condType, col, method, paramExpr)
 }
 
 // fieldGoType returns the Go base type for a model field.
@@ -514,9 +641,10 @@ func fieldGoType(m *ast.ModelDecl, name string) string {
 
 // ValidateInferredReturnType checks if the API return type matches the inferred action.
 // Returns an error message if invalid, empty string if OK.
+// If return type is nil, it's auto-inferred — always valid.
 func ValidateInferredReturnType(api *ast.ApiDecl, inf *InferredAPI) string {
 	if api.ReturnType == nil {
-		return fmt.Sprintf("inferred API %q must declare a return type", api.Name)
+		return "" // auto-inferred, always valid
 	}
 
 	rt := api.ReturnType
@@ -545,4 +673,85 @@ func ValidateInferredReturnType(api *ast.ApiDecl, inf *InferredAPI) string {
 		}
 	}
 	return ""
+}
+
+// buildInferredParams auto-generates parameter declarations from inferred clauses.
+// Each clause that requires a parameter produces one (or two for between).
+func buildInferredParams(inf *InferredAPI, m *ast.ModelDecl) []*ast.ParamDecl {
+	var params []*ast.ParamDecl
+	for _, group := range inf.Groups {
+		for _, clause := range group.Clauses {
+			switch clause.Op {
+			case "true", "false", "isNull", "isNotNull":
+				// Zero-param operations
+				continue
+
+			case "between":
+				fieldType := getFieldTypeRef(m, clause.Field)
+				params = append(params,
+					&ast.ParamDecl{Name: clause.Field + "From", Type: fieldType},
+					&ast.ParamDecl{Name: clause.Field + "To", Type: fieldType},
+				)
+
+			case "in", "notIn":
+				// Array param: [Int], [String], etc.
+				fieldType := getFieldTypeRef(m, clause.Field)
+				params = append(params, &ast.ParamDecl{
+					Name: inferParamName(clause),
+					Type: &ast.TypeRef{Name: fieldType.Name, IsList: true},
+				})
+
+			case "containing", "notContaining", "startswith", "endswith", "like", "notLike", "ignoreCase":
+				// String operations always take string param
+				params = append(params, &ast.ParamDecl{
+					Name: inferParamName(clause),
+					Type: &ast.TypeRef{Name: "String"},
+				})
+
+			default:
+				// eq, ne, gt, gte, lt, lte — same type as field
+				params = append(params, &ast.ParamDecl{
+					Name: inferParamName(clause),
+					Type: getFieldTypeRef(m, clause.Field),
+				})
+			}
+		}
+	}
+	return params
+}
+
+// inferParamName generates a reasonable parameter name from a clause.
+func inferParamName(clause InferClause) string {
+	switch clause.Op {
+	case "containing", "notContaining":
+		return "keyword"
+	case "startswith":
+		return clause.Field + "Prefix"
+	case "endswith":
+		return clause.Field + "Suffix"
+	case "in", "notIn":
+		return clause.Field + "s" // plural: ids, roles, etc.
+	default:
+		return clause.Field
+	}
+}
+
+// getFieldTypeRef returns a copy of the AST TypeRef for a model field.
+func getFieldTypeRef(m *ast.ModelDecl, name string) *ast.TypeRef {
+	for _, f := range m.Fields {
+		if f.Name == name && f.Type != nil {
+			return &ast.TypeRef{Name: f.Type.Name}
+		}
+	}
+	return &ast.TypeRef{Name: "String"}
+}
+
+// getFieldTypeRefRaw returns the original TypeRef from the model field (for fieldConditionType).
+func getFieldTypeRefRaw(m *ast.ModelDecl, name string) *ast.TypeRef {
+	for _, f := range m.Fields {
+		if f.Name == name {
+			return f.Type
+		}
+	}
+	return nil
 }

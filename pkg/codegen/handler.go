@@ -42,39 +42,59 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 		}
 	}
 
-	// Generate handlers + filter/sorter parsers + relation resolvers per model
+	generateCRUDHandlers(&b, models, enums)
+	inferredNames := generateInferredHandlers(&b, inferredAPIs, modelMap, enums)
+	compiledNames := generateCompiledHandlers(&b, result, modelMap)
+
+	// RegisterHandlers function (CRUD + inferred + compiled)
+	allInferred := append(inferredNames, compiledNames...)
+	generateRegisterFuncWithInferred(&b, models, allInferred)
+
+	return []byte(b.String())
+}
+
+func generateCRUDHandlers(b *strings.Builder, models []*ast.ModelDecl, enums map[string]bool) {
 	for _, m := range models {
 		rels := analyzeRelations(m, enums)
 		ops := crudOperations(m)
 		for _, op := range ops {
-			generateHandler(&b, m, op, enums, rels)
+			generateHandler(b, m, op, enums, rels)
 		}
-		generateFilterParser(&b, m, enums)
-		generateSorterParser(&b, m)
+		generateFilterParser(b, m, enums)
+		generateSorterParser(b, m)
 		if len(rels) > 0 {
-			generateRelationResolver(&b, m, rels)
-			generateListRelationResolver(&b, m, rels)
+			generateRelationResolver(b, m, rels)
+			generateListRelationResolver(b, m, rels)
 		}
 	}
+}
 
-	// Generate inferred handlers (zero-body APIs)
-	var inferredNames []string
-	for _, api := range inferredAPIs {
+func generateInferredHandlers(b *strings.Builder, apis []*ast.ApiDecl, modelMap map[string]*ast.ModelDecl, enums map[string]bool) []string {
+	var names []string
+	for _, api := range apis {
 		inf := inferAPI(api.Name, modelMap)
 		if inf != nil {
-			// Validate return type
 			if errMsg := ValidateInferredReturnType(api, inf); errMsg != "" {
 				fmt.Fprintf(os.Stderr, "warning: %s:%d: %s\n", api.Pos.File, api.Pos.Line, errMsg)
 			}
-			generateInferredHandler(&b, api, inf, enums, modelMap[inf.ModelName])
-			inferredNames = append(inferredNames, api.Name)
+			generateInferredHandler(b, api, inf, enums, modelMap[inf.ModelName])
+			names = append(names, api.Name)
 		}
 	}
+	return names
+}
 
-	// RegisterHandlers function (CRUD + inferred)
-	generateRegisterFuncWithInferred(&b, models, inferredNames)
-
-	return []byte(b.String())
+func generateCompiledHandlers(b *strings.Builder, result *semantic.Result, modelMap map[string]*ast.ModelDecl) []string {
+	var names []string
+	for _, file := range result.Files {
+		for _, api := range file.APIs {
+			if api.Body != nil && !hasDirective(api.Directives, "native") {
+				compileAPIBody(b, api, modelMap)
+				names = append(names, api.Name)
+			}
+		}
+	}
+	return names
 }
 
 // writeFKEnsure generates ensureField calls for BelongsTo FK columns.
@@ -209,8 +229,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 	case "get":
 		fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
-		fmt.Fprintf(b, "\t\tid, err := req.Param%s(\"id\")\n", paramMethod(idType))
-		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+		writeParamID(b, idType, "\t\t")
 		fmt.Fprintf(b, "\t\tcols := %s\n", colsExpr)
 		writeFKEnsure(b, rels)
 		fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(%sWhere.Id.Eq(id)).Select(cols...).First(ctx)\n", name, name)
@@ -265,8 +284,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		soft := isSoftDelete(m)
 		fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
-		fmt.Fprintf(b, "\t\tid, err := req.Param%s(\"id\")\n", paramMethod(idType))
-		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+		writeParamID(b, idType, "\t\t")
 		if soft {
 			fmt.Fprintf(b, "\t\tn, err := app.%s.SoftDelete(ctx, %sWhere.Id.Eq(id))\n", name, name)
 		} else {
@@ -337,8 +355,7 @@ func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType
 	name := m.Name
 	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
-	fmt.Fprintf(b, "\t\tid, err := req.Param%s(\"id\")\n", paramMethod(idType))
-	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+	writeParamID(b, idType, "\t\t")
 	fmt.Fprintf(b, "\t\tif _, err := app.%s.Find(ctx, id); err != nil {\n", name)
 	fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 	tableName := str.ToSnakeCase(name) + "s"
@@ -397,11 +414,27 @@ func isRelationField(f *ast.FieldDecl, enums map[string]bool) bool {
 // generateParamSet writes a param extraction + setter call.
 func generateParamSet(b *strings.Builder, f *ast.FieldDecl, setter, indent string, enums map[string]bool) {
 	varName := f.Name + "Val"
-	method := paramMethod(resolveGoType(f.Type))
-	fmt.Fprintf(b, "%s%s, err := req.Param%s(%q)\n", indent, varName, method, f.Name)
-	fmt.Fprintf(b, "%sif err != nil {\n", indent)
-	fmt.Fprintf(b, "%s\treturn fmt.Errorf(\"param %s: %%w\", err)\n", indent, f.Name)
-	fmt.Fprintf(b, "%s}\n", indent)
+	goType := resolveGoType(f.Type)
+
+	// Enum fields are strings in JSON
+	isEnum := f.Type != nil && enums[f.Type.Name]
+	method := paramMethod(goType)
+	if method == "" && isEnum {
+		method = "String"
+	}
+
+	if method == "" {
+		// Custom type — use ParamJSON
+		fmt.Fprintf(b, "%svar %s %s\n", indent, varName, goType)
+		fmt.Fprintf(b, "%sif err := req.ParamJSON(%q, &%s); err != nil {\n", indent, f.Name, varName)
+		fmt.Fprintf(b, "%s\treturn fmt.Errorf(\"param %s: %%w\", err)\n", indent, f.Name)
+		fmt.Fprintf(b, "%s}\n", indent)
+	} else {
+		fmt.Fprintf(b, "%s%s, err := req.Param%s(%q)\n", indent, varName, method, f.Name)
+		fmt.Fprintf(b, "%sif err != nil {\n", indent)
+		fmt.Fprintf(b, "%s\treturn fmt.Errorf(\"param %s: %%w\", err)\n", indent, f.Name)
+		fmt.Fprintf(b, "%s}\n", indent)
+	}
 
 	// @hash: auto-hash password before save
 	if hasDirective(f.Directives, "hash") {
@@ -414,7 +447,7 @@ func generateParamSet(b *strings.Builder, f *ast.FieldDecl, setter, indent strin
 	argExpr := varName
 	if f.Type != nil && f.Type.Nullable {
 		argExpr = "&" + varName
-	} else if f.Type != nil && enums[f.Type.Name] {
+	} else if isEnum {
 		argExpr = f.Type.Name + "(" + varName + ")"
 	}
 	fmt.Fprintf(b, "%sbuilder.%s(%s)\n", indent, setter, argExpr)
@@ -604,17 +637,39 @@ func idGoType(m *ast.ModelDecl) string {
 	return "int64"
 }
 
+// writeParamID generates id parameter extraction code for CRUD handlers.
+func writeParamID(b *strings.Builder, idType, indent string) {
+	method := paramMethod(idType)
+	if method != "" {
+		fmt.Fprintf(b, "%sid, err := req.Param%s(\"id\")\n", indent, method)
+		fmt.Fprintf(b, "%sif err != nil {\n%s\treturn err\n%s}\n", indent, indent, indent)
+	} else {
+		fmt.Fprintf(b, "%svar id %s\n", indent, idType)
+		fmt.Fprintf(b, "%sif err := req.ParamJSON(\"id\", &id); err != nil {\n", indent)
+		fmt.Fprintf(b, "%s\treturn err\n%s}\n", indent, indent)
+	}
+}
+
 // paramMethod returns the Request method name for a Go type.
+// Returns "" for types that require ParamJSON (custom structs, nested arrays, etc.).
 func paramMethod(goType string) string {
 	switch goType {
 	case "int64":
 		return "Int"
+	case "float64":
+		return "Float"
 	case "string":
 		return "String"
+	case "time.Time":
+		return "DateTime"
 	case "bool":
 		return "Bool"
+	case "[]int64":
+		return "IntArray"
+	case "[]string":
+		return "StringArray"
 	default:
-		return "String"
+		return "" // custom type — use ParamJSON
 	}
 }
 

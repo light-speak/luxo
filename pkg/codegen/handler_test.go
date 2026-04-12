@@ -414,9 +414,30 @@ func TestParamMethodBool(t *testing.T) {
 }
 
 func TestParamMethodFloat(t *testing.T) {
-	// float64 is an unknown type, maps to default "String"
-	if got := paramMethod("float64"); got != "String" {
-		t.Errorf("paramMethod(float64) = %q, want String", got)
+	if got := paramMethod("float64"); got != "Float" {
+		t.Errorf("paramMethod(float64) = %q, want Float", got)
+	}
+}
+
+func TestParamMethodDateTime(t *testing.T) {
+	if got := paramMethod("time.Time"); got != "DateTime" {
+		t.Errorf("paramMethod(time.Time) = %q, want DateTime", got)
+	}
+}
+
+func TestParamMethodCustomType(t *testing.T) {
+	// Custom types return empty for ParamJSON dispatch
+	if got := paramMethod("uuid.UUID"); got != "" {
+		t.Errorf("paramMethod(uuid.UUID) = %q, want empty", got)
+	}
+}
+
+func TestParamMethodArrayTypes(t *testing.T) {
+	if got := paramMethod("[]int64"); got != "IntArray" {
+		t.Errorf("paramMethod([]int64) = %q, want IntArray", got)
+	}
+	if got := paramMethod("[]string"); got != "StringArray" {
+		t.Errorf("paramMethod([]string) = %q, want StringArray", got)
 	}
 }
 

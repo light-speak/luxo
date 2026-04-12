@@ -317,6 +317,101 @@ func TestBoolFieldFilterOp(t *testing.T) {
 	}
 }
 
+func TestBetweenCond(t *testing.T) {
+	t.Run("int between", func(t *testing.T) {
+		sql, args := NewIntField("age").Between(18, 65).ToSQL(1)
+		if sql != "age BETWEEN $1 AND $2" {
+			t.Errorf("SQL = %q", sql)
+		}
+		if len(args) != 2 || args[0] != int64(18) || args[1] != int64(65) {
+			t.Errorf("args = %v", args)
+		}
+	})
+
+	t.Run("float between", func(t *testing.T) {
+		sql, args := NewFloatField("price").Between(10.0, 99.99).ToSQL(3)
+		if sql != "price BETWEEN $3 AND $4" {
+			t.Errorf("SQL = %q", sql)
+		}
+		if len(args) != 2 {
+			t.Errorf("args = %v", args)
+		}
+	})
+
+	t.Run("time between", func(t *testing.T) {
+		from := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		to := time.Date(2026, 12, 31, 0, 0, 0, 0, time.UTC)
+		sql, args := NewTimeField("created_at").Between(from, to).ToSQL(1)
+		if sql != "created_at BETWEEN $1 AND $2" {
+			t.Errorf("SQL = %q", sql)
+		}
+		if len(args) != 2 || args[0] != from || args[1] != to {
+			t.Errorf("args = %v", args)
+		}
+	})
+
+	t.Run("decimal between", func(t *testing.T) {
+		from := decimal.NewFromFloat(10)
+		to := decimal.NewFromFloat(100)
+		sql, args := NewDecimalField("amount").Between(from, to).ToSQL(1)
+		if sql != "amount BETWEEN $1 AND $2" {
+			t.Errorf("SQL = %q", sql)
+		}
+		if len(args) != 2 {
+			t.Errorf("args = %v", args)
+		}
+	})
+}
+
+func TestTimeFieldExtendedConditions(t *testing.T) {
+	now := time.Date(2026, 4, 13, 10, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name    string
+		cond    Condition
+		wantSQL string
+	}{
+		{"neq", NewTimeField("ts").Neq(now), "ts != $1"},
+		{"gte", NewTimeField("ts").Gte(now), "ts >= $1"},
+		{"lte", NewTimeField("ts").Lte(now), "ts <= $1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sql, args := tt.cond.ToSQL(1)
+			if sql != tt.wantSQL {
+				t.Errorf("SQL = %q, want %q", sql, tt.wantSQL)
+			}
+			if len(args) != 1 || args[0] != now {
+				t.Errorf("args = %v", args)
+			}
+		})
+	}
+}
+
+func TestTimeFieldFilterOp(t *testing.T) {
+	f := NewTimeField("created_at")
+	tests := []struct {
+		op, val, wantSQL string
+	}{
+		{"eq", "2026-04-13T10:00:00Z", "created_at = $1"},
+		{"ne", "2026-04-13T10:00:00Z", "created_at != $1"},
+		{"gt", "2026-04-13T10:00:00Z", "created_at > $1"},
+		{"after", "2026-04-13T10:00:00Z", "created_at > $1"},
+		{"gte", "2026-04-13T10:00:00Z", "created_at >= $1"},
+		{"lt", "2026-04-13T10:00:00Z", "created_at < $1"},
+		{"before", "2026-04-13T10:00:00Z", "created_at < $1"},
+		{"lte", "2026-04-13T10:00:00Z", "created_at <= $1"},
+		{"unknown", "2026-04-13T10:00:00Z", "created_at = $1"},
+	}
+	for _, tt := range tests {
+		sql, _ := f.FilterOp(tt.op, tt.val).ToSQL(1)
+		if sql != tt.wantSQL {
+			t.Errorf("TimeField.FilterOp(%q) = %q, want %q", tt.op, sql, tt.wantSQL)
+		}
+	}
+}
+
 func TestParseInt64(t *testing.T) {
 	tests := []struct {
 		input string
