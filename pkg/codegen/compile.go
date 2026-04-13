@@ -37,6 +37,7 @@ func compileAPIBody(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast
 		indent: "\t\t",
 		models: models,
 		api:    api,
+		vars:   make(map[string]valType),
 	}
 	for _, stmt := range api.Body.Stmts {
 		c.compileStmt(stmt)
@@ -45,12 +46,20 @@ func compileAPIBody(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast
 	fmt.Fprintf(b, "\t}\n}\n\n")
 }
 
+// valType tracks the resolved type of a val variable.
+type valType struct {
+	isModel bool   // true if this is a *Model or []*Model
+	isList  bool   // true if this is a list (e.g., []*Model)
+	name    string // model name or luxo type name (Int/String/Boolean/Float)
+}
+
 // compiler holds state during body compilation.
 type compiler struct {
 	b      *strings.Builder
 	indent string
 	models map[string]*ast.ModelDecl
 	api    *ast.ApiDecl
+	vars   map[string]valType // variable name → resolved type
 }
 
 func (c *compiler) write(format string, args ...any) {
@@ -83,9 +92,10 @@ func (c *compiler) compileStmt(stmt ast.Stmt) {
 func (c *compiler) compileVal(s *ast.ValStmt) {
 	expr := c.compileExpr(s.Value)
 	if c.isModelQuery(s.Value) {
-		// Model queries return (*T, error)
+		// Model queries return (*T, error) — track the type
 		c.write("%s, err := %s", s.Name, expr)
 		c.write("if err != nil {\n%s\treturn err\n%s}", c.indent, c.indent)
+		c.vars[s.Name] = c.resolveQueryType(s.Value)
 	} else {
 		c.write("%s := %s", s.Name, expr)
 	}
@@ -98,17 +108,57 @@ func (c *compiler) compileReturn(s *ast.ReturnStmt) {
 		return
 	}
 	expr := c.compileExpr(s.Value)
+
+	// 1. Direct model query chain — WriteJSON
 	if c.isModelQuery(s.Value) {
-		// Model query result — use WriteJSON
-		c.write("%s.WriteJSON(req.Buf, req.Select)", expr)
-	} else if c.isModelIdent(s.Value) {
-		// Model variable — use WriteJSON
-		c.write("%s.WriteJSON(req.Buf, req.Select)", expr)
-	} else {
-		// Scalar/typed value — emit type-specific append
-		c.writeScalarReturn(expr)
+		qt := c.resolveQueryType(s.Value)
+		if qt.isList {
+			lower := str.LowerFirst(qt.name)
+			c.write("%sListJSON(%s).WriteJSON(req.Buf, req.Select)", lower, expr)
+		} else {
+			c.write("%s.WriteJSON(req.Buf, req.Select)", expr)
+		}
+		c.write("return nil")
+		return
 	}
+
+	// 2. Variable with tracked type
+	if ident, ok := s.Value.(*ast.Ident); ok {
+		if vt, exists := c.vars[ident.Name]; exists {
+			c.writeReturnByType(expr, vt)
+			c.write("return nil")
+			return
+		}
+	}
+
+	// 3. Fallback: use API return type declaration
+	c.writeScalarReturn(expr)
 	c.write("return nil")
+}
+
+// writeReturnByType emits the correct output code based on tracked variable type.
+func (c *compiler) writeReturnByType(expr string, vt valType) {
+	if vt.isModel {
+		if vt.isList {
+			lower := str.LowerFirst(vt.name)
+			c.write("%sListJSON(%s).WriteJSON(req.Buf, req.Select)", lower, expr)
+		} else {
+			c.write("%s.WriteJSON(req.Buf, req.Select)", expr)
+		}
+		return
+	}
+	switch vt.name {
+	case "Int":
+		c.write("req.Buf.AppendInt(%s)", expr)
+	case "Float":
+		c.write("req.Buf.AppendFloat(%s)", expr)
+	case "Boolean":
+		c.write("req.Buf.AppendBool(%s)", expr)
+	case "String":
+		c.write("req.Buf.AppendJSONString(%s)", expr)
+	default:
+		c.write("req.Buf.AppendJSON(%s)", expr)
+	}
 }
 
 // writeScalarReturn emits the correct typed append for non-model return values.
@@ -472,20 +522,29 @@ func (c *compiler) compileThrowExpr(expr ast.Expr) string {
 	}
 }
 
-// isModelIdent checks if an expression is a variable that holds a model value.
-// Used by compileReturn to determine if WriteJSON should be called.
-func (c *compiler) isModelIdent(expr ast.Expr) bool {
-	if c.api == nil || c.api.Body == nil {
-		return false
+// resolveQueryType determines the return type of a model query chain.
+func (c *compiler) resolveQueryType(expr ast.Expr) valType {
+	chain := flattenChain(expr)
+	if len(chain) < 2 {
+		return valType{}
 	}
-	if ident, ok := expr.(*ast.Ident); ok {
-		for _, stmt := range c.api.Body.Stmts {
-			if vs, ok := stmt.(*ast.ValStmt); ok && vs.Name == ident.Name {
-				return c.isModelQuery(vs.Value)
+	root := chain[0]
+	if ident, ok := root.expr.(*ast.Ident); ok {
+		if _, isModel := c.models[ident.Name]; isModel {
+			last := chain[len(chain)-1]
+			switch last.method {
+			case "first", "find":
+				return valType{isModel: true, name: ident.Name}
+			case "all":
+				return valType{isModel: true, isList: true, name: ident.Name}
+			case "create", "exec":
+				return valType{isModel: true, name: ident.Name}
+			case "exists":
+				return valType{name: "Boolean"}
 			}
 		}
 	}
-	return false
+	return valType{}
 }
 
 // isModelQuery checks if an expression is a Model query chain (returns (*T, error)).

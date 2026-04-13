@@ -20,6 +20,7 @@ func newCompiler(models map[string]*ast.ModelDecl) *compiler {
 		indent: "\t\t",
 		models: models,
 		api:    &ast.ApiDecl{Name: "test"},
+		vars:   make(map[string]valType),
 	}
 }
 
@@ -898,34 +899,119 @@ func TestCompileStmtReturnScalar(t *testing.T) {
 func TestCompileStmtReturnModelVar(t *testing.T) {
 	models := map[string]*ast.ModelDecl{"User": {Name: "User"}}
 	c := newCompiler(models)
-	// Set up api context with a val statement that assigns from a model query
-	c.api = &ast.ApiDecl{
-		Name: "test",
-		Body: &ast.Block{
-			Stmts: []ast.Stmt{
-				&ast.ValStmt{
-					Name: "user",
-					Value: &ast.CallExpr{
-						Func: &ast.MemberExpr{
-							Object: &ast.CallExpr{
-								Func: &ast.MemberExpr{
-									Object: &ast.Ident{Name: "User"},
-									Field:  "where",
-								},
-								Args: []*ast.NamedArg{},
-							},
-							Field: "first",
-						},
-						Args: []*ast.NamedArg{},
+	c.vars = make(map[string]valType)
+
+	// First compile the val statement to register the variable type
+	valStmt := &ast.ValStmt{
+		Name: "user",
+		Value: &ast.CallExpr{
+			Func: &ast.MemberExpr{
+				Object: &ast.CallExpr{
+					Func: &ast.MemberExpr{
+						Object: &ast.Ident{Name: "User"},
+						Field:  "where",
 					},
+					Args: []*ast.NamedArg{},
 				},
+				Field: "first",
 			},
+			Args: []*ast.NamedArg{},
 		},
 	}
+	c.compileStmt(valStmt)
+
+	// Reset output, then compile return
+	c.b.Reset()
 	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "user"}})
 	out := compilerOut(c)
 	if !strings.Contains(out, "user.WriteJSON(req.Buf, req.Select)") {
 		t.Fatalf("expected WriteJSON for model var, got %q", out)
+	}
+}
+
+func TestCompileStmtReturnModelList(t *testing.T) {
+	models := map[string]*ast.ModelDecl{"User": {Name: "User"}}
+	c := newCompiler(models)
+	c.vars = make(map[string]valType)
+
+	// val users = User.where(...).all() → list type
+	valStmt := &ast.ValStmt{
+		Name: "users",
+		Value: &ast.CallExpr{
+			Func: &ast.MemberExpr{
+				Object: &ast.CallExpr{
+					Func: &ast.MemberExpr{
+						Object: &ast.Ident{Name: "User"},
+						Field:  "where",
+					},
+					Args: []*ast.NamedArg{},
+				},
+				Field: "all",
+			},
+			Args: []*ast.NamedArg{},
+		},
+	}
+	c.compileStmt(valStmt)
+
+	c.b.Reset()
+	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "users"}})
+	out := compilerOut(c)
+	if !strings.Contains(out, "userListJSON(users).WriteJSON(req.Buf, req.Select)") {
+		t.Fatalf("expected listJSON WriteJSON for list var, got %q", out)
+	}
+}
+
+func TestCompileStmtReturnWithAPIReturnType(t *testing.T) {
+	c := newCompiler(nil)
+	c.vars = make(map[string]valType)
+	c.api = &ast.ApiDecl{
+		Name:       "countUsers",
+		ReturnType: &ast.TypeRef{Name: "Int"},
+	}
+	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "count"}})
+	out := compilerOut(c)
+	if !strings.Contains(out, "req.Buf.AppendInt(count)") {
+		t.Fatalf("expected AppendInt for Int return type, got %q", out)
+	}
+}
+
+func TestCompileStmtReturnBooleanType(t *testing.T) {
+	c := newCompiler(nil)
+	c.vars = make(map[string]valType)
+	c.api = &ast.ApiDecl{
+		Name:       "existsUser",
+		ReturnType: &ast.TypeRef{Name: "Boolean"},
+	}
+	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "exists"}})
+	out := compilerOut(c)
+	if !strings.Contains(out, "req.Buf.AppendBool(exists)") {
+		t.Fatalf("expected AppendBool for Boolean return type, got %q", out)
+	}
+}
+
+func TestCompileStmtReturnDirectQuery(t *testing.T) {
+	models := map[string]*ast.ModelDecl{"User": {Name: "User"}}
+	c := newCompiler(models)
+	c.vars = make(map[string]valType)
+
+	// return User.where(...).all() — direct query, list type
+	retExpr := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{
+					Object: &ast.Ident{Name: "User"},
+					Field:  "where",
+				},
+				Args: []*ast.NamedArg{},
+			},
+			Field: "all",
+		},
+		Args: []*ast.NamedArg{},
+	}
+	c.compileStmt(&ast.ReturnStmt{Value: retExpr})
+	out := compilerOut(c)
+	if !strings.Contains(out, "userListJSON") {
+		t.Fatalf("expected userListJSON for direct .all() return, got %q", out)
 	}
 }
 
@@ -1356,5 +1442,183 @@ func TestCompilerWriteAddsIndent(t *testing.T) {
 	}
 	if !strings.Contains(out, "hello world") {
 		t.Fatalf("expected 'hello world', got %q", out)
+	}
+}
+
+func TestCompileReturnFloatType(t *testing.T) {
+	c := newCompiler(nil)
+	c.api = &ast.ApiDecl{Name: "getPrice", ReturnType: &ast.TypeRef{Name: "Float"}}
+	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "price"}})
+	out := compilerOut(c)
+	if !strings.Contains(out, "req.Buf.AppendFloat(price)") {
+		t.Fatalf("expected AppendFloat, got %q", out)
+	}
+}
+
+func TestCompileReturnStringType(t *testing.T) {
+	c := newCompiler(nil)
+	c.api = &ast.ApiDecl{Name: "getName", ReturnType: &ast.TypeRef{Name: "String"}}
+	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "name"}})
+	out := compilerOut(c)
+	if !strings.Contains(out, "req.Buf.AppendJSONString(name)") {
+		t.Fatalf("expected AppendJSONString, got %q", out)
+	}
+}
+
+func TestCompileReturnUnknownType(t *testing.T) {
+	c := newCompiler(nil)
+	c.api = &ast.ApiDecl{Name: "getCustom", ReturnType: &ast.TypeRef{Name: "CustomType"}}
+	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "data"}})
+	out := compilerOut(c)
+	if !strings.Contains(out, "req.Buf.AppendJSON(data)") {
+		t.Fatalf("expected AppendJSON fallback, got %q", out)
+	}
+}
+
+func TestCompileReturnNoAPIContext(t *testing.T) {
+	c := newCompiler(nil)
+	c.api = nil
+	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "x"}})
+	out := compilerOut(c)
+	if !strings.Contains(out, "req.Buf.AppendJSON(x)") {
+		t.Fatalf("expected AppendJSON fallback when no api, got %q", out)
+	}
+}
+
+func TestCompileReturnExistsQueryVar(t *testing.T) {
+	models := map[string]*ast.ModelDecl{"User": {Name: "User"}}
+	c := newCompiler(models)
+	// val exists = User.where(...).exists()
+	c.compileStmt(&ast.ValStmt{
+		Name: "exists",
+		Value: &ast.CallExpr{
+			Func: &ast.MemberExpr{
+				Object: &ast.CallExpr{
+					Func: &ast.MemberExpr{
+						Object: &ast.Ident{Name: "User"},
+						Field:  "where",
+					},
+					Args: []*ast.NamedArg{},
+				},
+				Field: "exists",
+			},
+			Args: []*ast.NamedArg{},
+		},
+	})
+	c.b.Reset()
+	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "exists"}})
+	out := compilerOut(c)
+	if !strings.Contains(out, "req.Buf.AppendBool(exists)") {
+		t.Fatalf("expected AppendBool for exists var, got %q", out)
+	}
+}
+
+func TestCompileReturnCreateQueryVar(t *testing.T) {
+	models := map[string]*ast.ModelDecl{"User": {Name: "User"}}
+	c := newCompiler(models)
+	// val user = User.create(name: "lin")
+	c.compileStmt(&ast.ValStmt{
+		Name: "user",
+		Value: &ast.CallExpr{
+			Func: &ast.MemberExpr{
+				Object: &ast.Ident{Name: "User"},
+				Field:  "create",
+			},
+			Args: []*ast.NamedArg{{Name: "name", Value: &ast.Ident{Name: "n"}}},
+		},
+	})
+	c.b.Reset()
+	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "user"}})
+	out := compilerOut(c)
+	if !strings.Contains(out, "user.WriteJSON(req.Buf, req.Select)") {
+		t.Fatalf("expected WriteJSON for create result, got %q", out)
+	}
+}
+
+func TestWriteReturnByTypeScalars(t *testing.T) {
+	tests := []struct {
+		vt   valType
+		want string
+	}{
+		{valType{name: "Int"}, "AppendInt"},
+		{valType{name: "Float"}, "AppendFloat"},
+		{valType{name: "Boolean"}, "AppendBool"},
+		{valType{name: "String"}, "AppendJSONString"},
+		{valType{name: "Unknown"}, "AppendJSON"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.vt.name, func(t *testing.T) {
+			c := newCompiler(nil)
+			c.writeReturnByType("val", tt.vt)
+			out := compilerOut(c)
+			if !strings.Contains(out, tt.want) {
+				t.Errorf("writeReturnByType(%+v) missing %q, got %q", tt.vt, tt.want, out)
+			}
+		})
+	}
+}
+
+func TestResolveQueryTypeFind(t *testing.T) {
+	models := map[string]*ast.ModelDecl{"Post": {Name: "Post"}}
+	c := newCompiler(models)
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "find"},
+		Args: []*ast.NamedArg{{Name: "id", Value: &ast.Ident{Name: "id"}}},
+	}
+	vt := c.resolveQueryType(expr)
+	if !vt.isModel || vt.name != "Post" || vt.isList {
+		t.Errorf("resolveQueryType(Post.find) = %+v", vt)
+	}
+}
+
+func TestCompileReturnDirectFirstQuery(t *testing.T) {
+	models := map[string]*ast.ModelDecl{"User": {Name: "User"}}
+	c := newCompiler(models)
+	// return User.where(...).first() — direct non-list query
+	retExpr := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+				Args: []*ast.NamedArg{},
+			},
+			Field: "first",
+		},
+		Args: []*ast.NamedArg{},
+	}
+	c.compileStmt(&ast.ReturnStmt{Value: retExpr})
+	out := compilerOut(c)
+	if !strings.Contains(out, ".WriteJSON(req.Buf, req.Select)") {
+		t.Fatalf("expected WriteJSON for direct .first() return, got %q", out)
+	}
+	if strings.Contains(out, "ListJSON") {
+		t.Fatalf("should NOT use ListJSON for .first(), got %q", out)
+	}
+}
+
+func TestResolveQueryTypeExec(t *testing.T) {
+	models := map[string]*ast.ModelDecl{"Post": {Name: "Post"}}
+	c := newCompiler(models)
+	// Post.create(...).exec()
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "create"},
+				Args: []*ast.NamedArg{},
+			},
+			Field: "exec",
+		},
+		Args: []*ast.NamedArg{},
+	}
+	vt := c.resolveQueryType(expr)
+	if !vt.isModel || vt.name != "Post" {
+		t.Errorf("resolveQueryType(Post.create.exec) = %+v, want model Post", vt)
+	}
+}
+
+func TestResolveQueryTypeNonModel(t *testing.T) {
+	c := newCompiler(nil)
+	vt := c.resolveQueryType(&ast.Ident{Name: "x"})
+	if vt.isModel || vt.name != "" {
+		t.Errorf("resolveQueryType(non-model) = %+v", vt)
 	}
 }
