@@ -27,7 +27,21 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 
 	modelMap, inferredAPIs := collectInferredAPIs(result)
 
-	if len(models) == 0 && len(inferredAPIs) == 0 {
+	// Check if there are any compiled APIs (body != nil, not @native)
+	hasCompiledAPIs := false
+	for _, file := range result.Files {
+		for _, api := range file.APIs {
+			if api.Body != nil && !hasDirective(api.Directives, "native") {
+				hasCompiledAPIs = true
+				break
+			}
+		}
+		if hasCompiledAPIs {
+			break
+		}
+	}
+
+	if len(models) == 0 && len(inferredAPIs) == 0 && !hasCompiledAPIs {
 		return nil
 	}
 
@@ -446,7 +460,12 @@ func generateParamSet(b *strings.Builder, f *ast.FieldDecl, setter, indent strin
 	}
 
 	argExpr := varName
-	if f.Type != nil && f.Type.Nullable {
+	if f.Type != nil && f.Type.Nullable && isEnum {
+		// Nullable enum: cast to enum type, then take pointer
+		tmpVar := varName + "Enum"
+		fmt.Fprintf(b, "%s%s := %s(%s)\n", indent, tmpVar, f.Type.Name, varName)
+		argExpr = "&" + tmpVar
+	} else if f.Type != nil && f.Type.Nullable {
 		argExpr = "&" + varName
 	} else if isEnum {
 		argExpr = f.Type.Name + "(" + varName + ")"

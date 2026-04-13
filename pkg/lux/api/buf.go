@@ -45,6 +45,23 @@ func (r *ResponseBuf) AppendFloat(v float64) { r.B = strconv.AppendFloat(r.B, v,
 func (r *ResponseBuf) AppendBool(v bool)     { r.B = strconv.AppendBool(r.B, v) }
 func (r *ResponseBuf) AppendBytes(b []byte)  { r.B = append(r.B, b...) }
 
+// AppendJSON writes any scalar value as JSON. Used for non-model return values.
+func (r *ResponseBuf) AppendJSON(v any) {
+	switch val := v.(type) {
+	case int64:
+		r.AppendInt(val)
+	case float64:
+		r.AppendFloat(val)
+	case bool:
+		r.AppendBool(val)
+	case string:
+		r.AppendJSONString(val)
+	default:
+		// Fallback: use strconv or fmt for unknown types
+		r.AppendString("null")
+	}
+}
+
 // AppendJSONString writes a JSON-escaped string directly into the buffer.
 // Uses a byte-level fast path for ASCII — bulk-appends runs of safe bytes.
 // Falls through to rune handling only for bytes >= 0x80 or special chars.

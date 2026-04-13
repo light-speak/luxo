@@ -98,8 +98,16 @@ func (c *compiler) compileReturn(s *ast.ReturnStmt) {
 		return
 	}
 	expr := c.compileExpr(s.Value)
-	// If returning a model, use WriteJSON
-	c.write("%s.WriteJSON(req.Buf, req.Select)", expr)
+	if c.isModelQuery(s.Value) {
+		// Model query result — use WriteJSON
+		c.write("%s.WriteJSON(req.Buf, req.Select)", expr)
+	} else if c.isModelIdent(s.Value) {
+		// Model variable — use WriteJSON
+		c.write("%s.WriteJSON(req.Buf, req.Select)", expr)
+	} else {
+		// Scalar value — write directly to buf
+		c.write("req.Buf.AppendJSON(%s)", expr)
+	}
 	c.write("return nil")
 }
 
@@ -232,15 +240,11 @@ func (c *compiler) compileCall(e *ast.CallExpr) string {
 		}
 	}
 
-	// Generic call
+	// Generic call — Go does not support named args, use positional only
 	funcExpr := c.compileExpr(e.Func)
 	var args []string
 	for _, a := range e.Args {
-		if a.Name != "" {
-			args = append(args, fmt.Sprintf("%s: %s", a.Name, c.compileExpr(a.Value)))
-		} else {
-			args = append(args, c.compileExpr(a.Value))
-		}
+		args = append(args, c.compileExpr(a.Value))
 	}
 	return fmt.Sprintf("%s(%s)", funcExpr, strings.Join(args, ", "))
 }
@@ -326,7 +330,10 @@ func (c *compiler) compileModelChain(modelName string, links []chainLink) string
 			b.WriteString(".Select(selection.SQLColumns(req.Select)...)")
 
 		default:
-			// Unknown method — pass through
+			// Unknown method — ensure model client is seeded
+			if i == 0 {
+				fmt.Fprintf(&b, "app.%s", modelName)
+			}
 			fmt.Fprintf(&b, ".%s(", str.Capitalize(link.method))
 			var args []string
 			for _, a := range link.args {
@@ -441,6 +448,22 @@ func (c *compiler) compileThrowExpr(expr ast.Expr) string {
 	default:
 		return c.compileExpr(expr)
 	}
+}
+
+// isModelIdent checks if an expression is a variable that holds a model value.
+// Used by compileReturn to determine if WriteJSON should be called.
+func (c *compiler) isModelIdent(expr ast.Expr) bool {
+	if c.api == nil || c.api.Body == nil {
+		return false
+	}
+	if ident, ok := expr.(*ast.Ident); ok {
+		for _, stmt := range c.api.Body.Stmts {
+			if vs, ok := stmt.(*ast.ValStmt); ok && vs.Name == ident.Name {
+				return c.isModelQuery(vs.Value)
+			}
+		}
+	}
+	return false
 }
 
 // isModelQuery checks if an expression is a Model query chain (returns (*T, error)).

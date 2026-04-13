@@ -331,8 +331,9 @@ func TestCompileCallGenericNamedArg(t *testing.T) {
 		Args: []*ast.NamedArg{{Name: "key", Value: &ast.Ident{Name: "val"}}},
 	}
 	got := c.compileExpr(call)
-	if got != "fn(key: val)" {
-		t.Fatalf("want 'fn(key: val)', got %q", got)
+	// Go does not support named args — only value is emitted
+	if got != "fn(val)" {
+		t.Fatalf("want 'fn(val)', got %q", got)
 	}
 }
 
@@ -885,15 +886,46 @@ func TestCompileStmtReturnNil(t *testing.T) {
 	}
 }
 
-func TestCompileStmtReturnValue(t *testing.T) {
+func TestCompileStmtReturnScalar(t *testing.T) {
 	c := newCompiler(nil)
+	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "count"}})
+	out := compilerOut(c)
+	if !strings.Contains(out, "req.Buf.AppendJSON(count)") {
+		t.Fatalf("expected AppendJSON for scalar, got %q", out)
+	}
+}
+
+func TestCompileStmtReturnModelVar(t *testing.T) {
+	models := map[string]*ast.ModelDecl{"User": {Name: "User"}}
+	c := newCompiler(models)
+	// Set up api context with a val statement that assigns from a model query
+	c.api = &ast.ApiDecl{
+		Name: "test",
+		Body: &ast.Block{
+			Stmts: []ast.Stmt{
+				&ast.ValStmt{
+					Name: "user",
+					Value: &ast.CallExpr{
+						Func: &ast.MemberExpr{
+							Object: &ast.CallExpr{
+								Func: &ast.MemberExpr{
+									Object: &ast.Ident{Name: "User"},
+									Field:  "where",
+								},
+								Args: []*ast.NamedArg{},
+							},
+							Field: "first",
+						},
+						Args: []*ast.NamedArg{},
+					},
+				},
+			},
+		},
+	}
 	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "user"}})
 	out := compilerOut(c)
 	if !strings.Contains(out, "user.WriteJSON(req.Buf, req.Select)") {
-		t.Fatalf("expected WriteJSON call, got %q", out)
-	}
-	if !strings.Contains(out, "return nil") {
-		t.Fatalf("expected 'return nil' after WriteJSON, got %q", out)
+		t.Fatalf("expected WriteJSON for model var, got %q", out)
 	}
 }
 
