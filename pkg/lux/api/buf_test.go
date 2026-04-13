@@ -2,6 +2,7 @@ package api
 
 import (
 	"testing"
+	"time"
 )
 
 func TestResponseBufAppendInt(t *testing.T) {
@@ -128,5 +129,41 @@ func TestResponseBufBuildJSON(t *testing.T) {
 	want := `{"id":42,"name":"lin","active":true}`
 	if string(buf.B) != want {
 		t.Errorf("got %s, want %s", string(buf.B), want)
+	}
+}
+
+func TestAppendJSONScalars(t *testing.T) {
+	tests := []struct {
+		name string
+		val  any
+		want string
+	}{
+		{"int64", int64(42), "42"},
+		{"float64", float64(3.14), "3.14"},
+		{"bool true", true, "true"},
+		{"bool false", false, "false"},
+		{"string", "hello", `"hello"`},
+		{"unknown", struct{}{}, "null"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			buf := GetBuf()
+			defer PutBuf(buf)
+			buf.AppendJSON(tt.val)
+			if string(buf.B) != tt.want {
+				t.Errorf("AppendJSON(%v) = %q, want %q", tt.val, string(buf.B), tt.want)
+			}
+		})
+	}
+}
+
+func TestAppendTime(t *testing.T) {
+	buf := GetBuf()
+	defer PutBuf(buf)
+	tm := time.Date(2026, 4, 13, 10, 0, 0, 0, time.UTC)
+	buf.AppendTime(tm, time.RFC3339)
+	want := `"2026-04-13T10:00:00Z"`
+	if string(buf.B) != want {
+		t.Errorf("AppendTime = %q, want %q", string(buf.B), want)
 	}
 }
