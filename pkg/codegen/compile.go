@@ -105,10 +105,32 @@ func (c *compiler) compileReturn(s *ast.ReturnStmt) {
 		// Model variable — use WriteJSON
 		c.write("%s.WriteJSON(req.Buf, req.Select)", expr)
 	} else {
-		// Scalar value — write directly to buf
-		c.write("req.Buf.AppendJSON(%s)", expr)
+		// Scalar/typed value — emit type-specific append
+		c.writeScalarReturn(expr)
 	}
 	c.write("return nil")
+}
+
+// writeScalarReturn emits the correct typed append for non-model return values.
+func (c *compiler) writeScalarReturn(expr string) {
+	if c.api != nil && c.api.ReturnType != nil {
+		switch c.api.ReturnType.Name {
+		case "Int":
+			c.write("req.Buf.AppendInt(%s)", expr)
+			return
+		case "Float":
+			c.write("req.Buf.AppendFloat(%s)", expr)
+			return
+		case "Boolean":
+			c.write("req.Buf.AppendBool(%s)", expr)
+			return
+		case "String":
+			c.write("req.Buf.AppendJSONString(%s)", expr)
+			return
+		}
+	}
+	// Fallback for unknown types
+	c.write("req.Buf.AppendJSON(%s)", expr)
 }
 
 // compileThrow: throw ErrorName(args)

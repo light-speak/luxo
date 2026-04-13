@@ -337,8 +337,8 @@ func parseInt64(s string) (int64, error) {
 	return strconv.ParseInt(s, 10, 64)
 }
 
-// likeReplacer escapes SQL LIKE wildcard characters.
-var likeReplacer = strings.NewReplacer("%", "\\%", "_", "\\_")
+// likeReplacer escapes SQL LIKE special characters (backslash, %, _).
+var likeReplacer = strings.NewReplacer("\\", "\\\\", "%", "\\%", "_", "\\_")
 
 // EscapeLike escapes SQL LIKE wildcard characters (%, _) in user input.
 func EscapeLike(s string) string {

@@ -111,12 +111,12 @@ func generateCompiledHandlers(b *strings.Builder, result *semantic.Result, model
 	return names
 }
 
-// writeFKEnsure generates ensureField calls for BelongsTo FK columns.
+// writeFKEnsure generates ensureField calls for relation key columns.
+// BelongsTo needs the FK column (e.g., user_id); HasOne/HasMany need the local key (e.g., id).
 func writeFKEnsure(b *strings.Builder, rels []Relation) {
 	for _, rel := range rels {
-		if rel.Type == BelongsTo {
-			fmt.Fprintf(b, "\t\tcols = ensureField(cols, %q)\n", str.ToSnakeCase(rel.LocalKey))
-		}
+		col := str.ToSnakeCase(rel.LocalKey)
+		fmt.Fprintf(b, "\t\tcols = ensureField(cols, %q)\n", col)
 	}
 }
 
