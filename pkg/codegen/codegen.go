@@ -270,7 +270,7 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
 	b.WriteString("\t\"fmt\"\n")
-	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/env\"\n")
+	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/pg\"\n")
 	b.WriteString(")\n\n")
 
@@ -297,32 +297,16 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 	}
 	b.WriteString("}\n\n")
 
-	// New function
+	// New function — uses lux.DBConfigFromEnv() for all DATABASE_* config
 	b.WriteString("// New creates an App by reading DATABASE_* config from the environment.\n")
 	b.WriteString("// Call env.Load(\".env\") before New() if using a .env file.\n")
 	b.WriteString("func New(ctx context.Context) (*App, error) {\n")
-	b.WriteString("\turl := buildDatabaseURL()\n")
-	b.WriteString("\tdb, err := pg.NewDB(ctx, url)\n")
+	b.WriteString("\tcfg := lux.DBConfigFromEnv()\n")
+	b.WriteString("\tdb, err := pg.NewDBWithConfig(ctx, cfg.ConnectionString(), cfg)\n")
 	b.WriteString("\tif err != nil {\n")
 	b.WriteString("\t\treturn nil, fmt.Errorf(\"luxo: connect to database: %w\", err)\n")
 	b.WriteString("\t}\n")
 	b.WriteString("\treturn NewFromDB(db), nil\n")
-	b.WriteString("}\n\n")
-
-	// buildDatabaseURL helper
-	b.WriteString("func buildDatabaseURL() string {\n")
-	b.WriteString("\thost, _ := env.Get(\"DATABASE_HOST\")\n")
-	b.WriteString("\tif host == \"\" { host = \"localhost\" }\n")
-	b.WriteString("\tport, _ := env.Get(\"DATABASE_PORT\")\n")
-	b.WriteString("\tif port == \"\" { port = \"5432\" }\n")
-	b.WriteString("\tuser, _ := env.Get(\"DATABASE_USER\")\n")
-	b.WriteString("\tif user == \"\" { user = \"postgres\" }\n")
-	b.WriteString("\tpass, _ := env.Get(\"DATABASE_PASSWORD\")\n")
-	b.WriteString("\tssl, _ := env.Get(\"DATABASE_SSL\")\n")
-	b.WriteString("\tif ssl == \"\" { ssl = \"disable\" }\n")
-	b.WriteString("\tprefix, _ := env.Get(\"DATABASE_PREFIX\")\n")
-	b.WriteString("\tif prefix == \"\" { prefix = \"luxo\" }\n")
-	b.WriteString("\treturn fmt.Sprintf(\"postgres://%s:%s@%s:%s/%s?sslmode=%s\", user, pass, host, port, prefix, ssl)\n")
 	b.WriteString("}\n\n")
 
 	// NewFromDB function

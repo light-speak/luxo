@@ -23,10 +23,29 @@ type Server struct {
 
 // NewServer creates a new LSP server.
 func NewServer(reader io.Reader, writer io.Writer, logger *log.Logger) *Server {
-	return &Server{
+	srv := &Server{
 		transport: NewTransport(reader, writer),
 		docs:      NewDocumentStore(),
 		logger:    logger,
+	}
+	// After debounced analysis, push diagnostics for all open docs
+	srv.docs.OnAnalyzed = func() {
+		srv.publishAllDiagnostics()
+	}
+	return srv
+}
+
+// publishAllDiagnostics pushes diagnostics for all open documents.
+func (s *Server) publishAllDiagnostics() {
+	s.docs.mu.RLock()
+	docs := make([]*Document, 0, len(s.docs.docs))
+	for _, doc := range s.docs.docs {
+		docs = append(docs, doc)
+	}
+	s.docs.mu.RUnlock()
+
+	for _, doc := range docs {
+		s.publishDiagnostics(doc)
 	}
 }
 
@@ -145,8 +164,10 @@ func (s *Server) handleDidChange(req *Request) error {
 	}
 
 	content := params.ContentChanges[len(params.ContentChanges)-1].Text
-	doc := s.docs.Update(params.TextDocument.URI, params.TextDocument.Version, content)
-	return s.publishDiagnostics(doc)
+	s.docs.Update(params.TextDocument.URI, params.TextDocument.Version, content)
+	// Don't publish diagnostics here — analysis is debounced.
+	// The debounce callback will call publishAllDiagnostics after analysis completes.
+	return nil
 }
 
 func (s *Server) handleDidClose(req *Request) error {
@@ -217,6 +238,13 @@ func (s *Server) getCompletions(doc *Document, pos Position) []CompletionItem {
 	if prevChar == '@' || strings.HasPrefix(word, "@") {
 		items = append(items, getDirectiveCompletions()...)
 		return items
+	}
+
+	// inferred API name completions (after "api " keyword)
+	if doc.File != nil && doc.File.Models != nil {
+		if inferred := s.getInferredAPICompletions(doc, pos, word); inferred != nil {
+			items = append(items, inferred...)
+		}
 	}
 
 	// keyword completions
@@ -2306,4 +2334,243 @@ func findImplicitReturn(block *ast.Block) *InlayHint {
 		Tooltip:      "implicit return / 隐式返回",
 		PaddingRight: true,
 	}
+}
+
+// getInferredAPICompletions suggests method names when typing after "api ".
+// Generates: getUserByField, listModelsByField, countModelsByField, etc.
+// Works mid-word: "api getUser|" filters to completions starting with "getuser".
+func (s *Server) getInferredAPICompletions(doc *Document, pos Position, word string) []CompletionItem {
+	lines := strings.Split(doc.Content, "\n")
+	if pos.Line >= len(lines) {
+		return nil
+	}
+	line := strings.TrimSpace(lines[pos.Line])
+
+	// Only trigger after "api " at the start of a line
+	if !strings.HasPrefix(line, "api ") {
+		return nil
+	}
+
+	// Collect models from file (not extends)
+	var models []*ast.ModelDecl
+	if doc.File != nil {
+		models = doc.File.Models
+	}
+	if len(models) == 0 {
+		return nil
+	}
+
+	// Extract the text typed after "api " for prefix filtering.
+	// e.g. "api getUserBy|" → prefix = "getuserby"
+	typed := line[4:] // strip "api "
+	prefix := strings.ToLower(typed)
+
+	enumNames := make(map[string]bool)
+	if doc.File != nil {
+		for _, e := range doc.File.Enums {
+			enumNames[e.Name] = true
+		}
+	}
+
+	var items []CompletionItem
+	for _, m := range models {
+		items = append(items, buildModelAPICompletions(m, enumNames, prefix)...)
+	}
+	return items
+}
+
+// buildModelAPICompletions generates completion items for a single model.
+// Includes single-field, And/Or compound, Boolean True/False, and OrderBy suggestions.
+func buildModelAPICompletions(m *ast.ModelDecl, enumNames map[string]bool, prefix string) []CompletionItem {
+	var items []CompletionItem
+	name := m.Name
+	plural := inferPlural(name)
+
+	var fields []string
+	for _, f := range m.Fields {
+		if f.Type == nil || f.Computed != nil {
+			continue
+		}
+		if !isBuiltinType(f.Type.Name) && !enumNames[f.Type.Name] {
+			continue
+		}
+		fields = append(fields, f.Name)
+	}
+
+	// Generate action+field suggestions (single field + compound)
+	type apiAction struct{ prefix, detail, ret string }
+	actions := []apiAction{
+		{"get" + name + "By", "Single " + name + " query", name},
+		{"list" + plural + "By", "List " + name + " with pagination", "[" + name + "]"},
+		{"count" + plural + "By", "Count " + name, "Int"},
+		{"exists" + name + "By", "Check if " + name + " exists", "Boolean"},
+		{"delete" + name + "By", "Delete " + name, "Int"},
+		{"listTop10" + plural + "By", "Top 10 " + name, "[" + name + "]"},
+	}
+	for _, action := range actions {
+		items = append(items, buildFieldSuggestions(m, fields, action.prefix, action.ret, prefix)...)
+		items = append(items, buildCompoundSuggestions(m, fields, action.prefix, action.ret, prefix)...)
+	}
+
+	// Boolean True/False suggestions
+	items = append(items, buildBooleanSuggestions(m, name, plural, prefix)...)
+
+	// OrderBy suggestions for list actions
+	items = append(items, buildOrderBySuggestions(m, fields, name, plural, prefix)...)
+
+	return items
+}
+
+// buildFieldSuggestions generates single-field completion items.
+// e.g. getUserByEmail → (email: String) -> User
+func buildFieldSuggestions(m *ast.ModelDecl, fields []string, actionPrefix, ret, prefix string) []CompletionItem {
+	var items []CompletionItem
+	for _, field := range fields {
+		suggestion := actionPrefix + capitalize(field)
+		if !matchesPrefix(suggestion, prefix) {
+			continue
+		}
+		ft := fieldTypeStr(m, field)
+		paramSig := "(" + field + ": " + ft + ")"
+		detail := paramSig + " -> " + ret
+		insertText := suggestion + paramSig + ": " + ret
+		items = append(items, CompletionItem{
+			Label:         suggestion,
+			Kind:          3,
+			Detail:        detail,
+			Documentation: insertText,
+			InsertText:    insertText,
+		})
+	}
+	return items
+}
+
+// buildCompoundSuggestions generates 2-field And/Or combination completions.
+// e.g. getUserByNameAndEmail, getUserByEmailOrPhone
+func buildCompoundSuggestions(m *ast.ModelDecl, fields []string, actionPrefix, ret, prefix string) []CompletionItem {
+	var items []CompletionItem
+	for i := 0; i < len(fields); i++ {
+		for j := 0; j < len(fields); j++ {
+			if i == j {
+				continue
+			}
+			items = append(items, buildCompoundPair(m, fields[i], fields[j], actionPrefix, ret, prefix, "And")...)
+			items = append(items, buildCompoundPair(m, fields[i], fields[j], actionPrefix, ret, prefix, "Or")...)
+		}
+	}
+	return items
+}
+
+// buildCompoundPair builds a single And/Or pair completion item.
+func buildCompoundPair(m *ast.ModelDecl, f1, f2, actionPrefix, ret, prefix, sep string) []CompletionItem {
+	suggestion := actionPrefix + capitalize(f1) + sep + capitalize(f2)
+	if !matchesPrefix(suggestion, prefix) {
+		return nil
+	}
+	t1 := fieldTypeStr(m, f1)
+	t2 := fieldTypeStr(m, f2)
+	paramSig := "(" + f1 + ": " + t1 + ", " + f2 + ": " + t2 + ")"
+	detail := paramSig + " -> " + ret
+	insertText := suggestion + paramSig + ": " + ret
+	return []CompletionItem{{
+		Label:         suggestion,
+		Kind:          3,
+		Detail:        detail,
+		Documentation: insertText,
+		InsertText:    insertText,
+	}}
+}
+
+// buildBooleanSuggestions generates True/False suffix completions for Boolean fields.
+func buildBooleanSuggestions(m *ast.ModelDecl, name, plural, prefix string) []CompletionItem {
+	var items []CompletionItem
+	ret := "[" + name + "]"
+	for _, f := range m.Fields {
+		if f.Type == nil || f.Type.Name != "Boolean" {
+			continue
+		}
+		for _, val := range []string{"True", "False"} {
+			suggestion := "list" + plural + "By" + capitalize(f.Name) + val
+			if !matchesPrefix(suggestion, prefix) {
+				continue
+			}
+			detail := "() -> " + ret
+			insertText := suggestion + "(): " + ret
+			items = append(items, CompletionItem{
+				Label:         suggestion,
+				Kind:          3,
+				Detail:        detail,
+				Documentation: "List " + name + " where " + f.Name + " = " + strings.ToLower(val),
+				InsertText:    insertText,
+			})
+		}
+	}
+	return items
+}
+
+// buildOrderBySuggestions generates OrderBy completions for list actions.
+func buildOrderBySuggestions(m *ast.ModelDecl, fields []string, name, plural, prefix string) []CompletionItem {
+	var items []CompletionItem
+	ret := "[" + name + "]"
+	listPrefix := "list" + plural
+	for _, field := range fields {
+		for _, dir := range []string{"Asc", "Desc"} {
+			suggestion := listPrefix + "OrderBy" + capitalize(field) + dir
+			if !matchesPrefix(suggestion, prefix) {
+				continue
+			}
+			detail := "() -> " + ret
+			insertText := suggestion + "(): " + ret
+			items = append(items, CompletionItem{
+				Label:         suggestion,
+				Kind:          3,
+				Detail:        detail,
+				Documentation: "List " + name + " ordered by " + field + " " + strings.ToLower(dir),
+				InsertText:    insertText,
+			})
+		}
+	}
+	return items
+}
+
+// matchesPrefix checks if suggestion matches the typed prefix (case-insensitive).
+func matchesPrefix(suggestion, prefix string) bool {
+	if prefix == "" {
+		return true
+	}
+	return strings.HasPrefix(strings.ToLower(suggestion), prefix)
+}
+
+func inferPlural(name string) string {
+	if strings.HasSuffix(name, "y") {
+		return name[:len(name)-1] + "ies"
+	}
+	if strings.HasSuffix(name, "s") || strings.HasSuffix(name, "x") || strings.HasSuffix(name, "z") {
+		return name + "es"
+	}
+	return name + "s"
+}
+
+func capitalize(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+func isBuiltinType(name string) bool {
+	switch name {
+	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes":
+		return true
+	}
+	return false
+}
+
+func fieldTypeStr(m *ast.ModelDecl, name string) string {
+	for _, f := range m.Fields {
+		if f.Name == name && f.Type != nil {
+			return f.Type.Name
+		}
+	}
+	return "String"
 }

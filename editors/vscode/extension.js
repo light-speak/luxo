@@ -77,12 +77,20 @@ function activate(context) {
         transport: TransportKind.stdio,
     };
 
+    const outputChannel = vscode.window.createOutputChannel('Luxo Language Server');
+    outputChannel.appendLine('LSP binary: ' + lspPath);
+
     const clientOptions = {
         documentSelector: [{ scheme: 'file', language: 'luxo' }],
+        outputChannel: outputChannel,
     };
 
     client = new LanguageClient('luxo', 'Luxo Language Server', serverOptions, clientOptions);
-    client.start();
+    client.start().then(() => {
+        outputChannel.appendLine('Luxo LSP started');
+    }, (err) => {
+        outputChannel.appendLine('Luxo LSP failed: ' + err);
+    });
 }
 
 function deactivate() {

@@ -575,3 +575,128 @@ func TestIsFKNullable(t *testing.T) {
 		t.Error("non-existent field should return false")
 	}
 }
+
+// TestGoTypeToCondField covers all branches of goTypeToCondField including
+// the previously-untested "string" and "uuid.UUID" cases and the default.
+func TestGoTypeToCondField(t *testing.T) {
+	cases := []struct {
+		goType string
+		want   string
+	}{
+		{"int64", "IntField"},
+		{"string", "StringField"},
+		{"uuid.UUID", "UUIDField"},
+		{"float64", "IntField"},   // default fallback
+		{"time.Time", "IntField"}, // default fallback
+	}
+	for _, tc := range cases {
+		got := goTypeToCondField(tc.goType)
+		if got != tc.want {
+			t.Errorf("goTypeToCondField(%q) = %q, want %q", tc.goType, got, tc.want)
+		}
+	}
+}
+
+// TestGenerateDataLoaderWithStringFK covers the goTypeToCondField("string") branch
+// by creating a model whose FK is a String type, so KeyGoType = "string".
+func TestGenerateDataLoaderWithStringFK(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Models: []*ast.ModelDecl{
+				{
+					Pos:  pos0(),
+					Name: "Post",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						// Use a String FK so KeyGoType maps to "string"
+						{Name: "userId", Type: &ast.TypeRef{Name: "String"}},
+						{Name: "user", Type: &ast.TypeRef{Name: "User"}},
+					},
+				},
+			},
+		}},
+	}
+
+	src := generateDataLoaderFile(result, "luxo", nil, nil)
+	if src == nil {
+		t.Fatal("should generate dataloader file")
+	}
+	code := string(src)
+	if !strings.Contains(code, "StringField") {
+		t.Errorf("string FK should use StringField in batch func:\n%s", code)
+	}
+}
+
+// TestGenerateDataLoaderWithUUIDFK covers the goTypeToCondField("uuid.UUID") branch.
+func TestGenerateDataLoaderWithUUIDFK(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Models: []*ast.ModelDecl{
+				{
+					Pos:  pos0(),
+					Name: "Post",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						// UUID FK so KeyGoType = "uuid.UUID"
+						{Name: "userId", Type: &ast.TypeRef{Name: "UUID"}},
+						{Name: "user", Type: &ast.TypeRef{Name: "User"}},
+					},
+				},
+			},
+		}},
+	}
+
+	src := generateDataLoaderFile(result, "luxo", nil, nil)
+	if src == nil {
+		t.Fatal("should generate dataloader file")
+	}
+	code := string(src)
+	if !strings.Contains(code, "UUIDField") {
+		t.Errorf("UUID FK should use UUIDField in batch func:\n%s", code)
+	}
+}
+
+// TestGenerateDataLoaderDefaultLoadersDedupSeenMap covers the seen-map branch
+// in generateDefaultLoaders (line 267–268: already-seen loader name is skipped).
+func TestGenerateDataLoaderDefaultLoadersDedupSeenMap(t *testing.T) {
+	// Two models that share the same loaderFieldName → second is skipped.
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Models: []*ast.ModelDecl{
+				{
+					Pos:  pos0(),
+					Name: "Post",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "user", Type: &ast.TypeRef{Name: "User"}},
+					},
+				},
+				{
+					Pos:  pos0(),
+					Name: "Post", // duplicate model name → same loaderFieldName
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "user", Type: &ast.TypeRef{Name: "User"}},
+					},
+				},
+			},
+		}},
+	}
+
+	src := generateDataLoaderFile(result, "luxo", nil, nil)
+	if src == nil {
+		t.Fatal("should generate dataloader file")
+	}
+	code := string(src)
+
+	// PostUser loader should appear exactly once as a batch function inline
+	count := strings.Count(code, "func(ctx context.Context, keys []int64, fields []string) (map[int64]*User, error)")
+	if count != 1 {
+		t.Errorf("deduplicated default loader should appear once, got %d", count)
+	}
+}

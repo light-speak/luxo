@@ -3,6 +3,8 @@ package api
 import (
 	"strconv"
 	"sync"
+	"time"
+	"unicode/utf8"
 )
 
 // hex lookup for JSON \u00XX escape without fmt.Sprintf.
@@ -43,12 +45,54 @@ func (r *ResponseBuf) AppendFloat(v float64) { r.B = strconv.AppendFloat(r.B, v,
 func (r *ResponseBuf) AppendBool(v bool)     { r.B = strconv.AppendBool(r.B, v) }
 func (r *ResponseBuf) AppendBytes(b []byte)  { r.B = append(r.B, b...) }
 
+// AppendJSON writes any scalar value as JSON. Used for non-model return values.
+func (r *ResponseBuf) AppendJSON(v any) {
+	switch val := v.(type) {
+	case int64:
+		r.AppendInt(val)
+	case float64:
+		r.AppendFloat(val)
+	case bool:
+		r.AppendBool(val)
+	case string:
+		r.AppendJSONString(val)
+	default:
+		// Fallback: use strconv or fmt for unknown types
+		r.AppendString("null")
+	}
+}
+
 // AppendJSONString writes a JSON-escaped string directly into the buffer.
-// Zero allocation for strings without control characters.
+// Uses a byte-level fast path for ASCII — bulk-appends runs of safe bytes.
+// Falls through to rune handling only for bytes >= 0x80 or special chars.
 func (r *ResponseBuf) AppendJSONString(s string) {
 	r.B = append(r.B, '"')
-	for i := 0; i < len(s); i++ {
+	i := 0
+	for i < len(s) {
+		// Fast path: scan for longest run of safe ASCII bytes.
+		start := i
+		for i < len(s) {
+			c := s[i]
+			if c < 0x20 || c == '"' || c == '\\' || c >= 0x80 {
+				break
+			}
+			i++
+		}
+		if start < i {
+			r.B = append(r.B, s[start:i]...)
+		}
+		if i >= len(s) {
+			break
+		}
 		c := s[i]
+		if c >= 0x80 {
+			// Multi-byte UTF-8: decode rune and append.
+			ru, size := utf8.DecodeRuneInString(s[i:])
+			r.B = utf8.AppendRune(r.B, ru)
+			i += size
+			continue
+		}
+		// Special ASCII byte requiring escape.
 		switch c {
 		case '"':
 			r.B = append(r.B, '\\', '"')
@@ -61,12 +105,17 @@ func (r *ResponseBuf) AppendJSONString(s string) {
 		case '\t':
 			r.B = append(r.B, '\\', 't')
 		default:
-			if c < 0x20 {
-				r.B = append(r.B, '\\', 'u', '0', '0', hexDigits[c>>4], hexDigits[c&0x0f])
-			} else {
-				r.B = append(r.B, c)
-			}
+			r.B = append(r.B, '\\', 'u', '0', '0', hexDigits[c>>4], hexDigits[c&0x0f])
 		}
+		i++
 	}
+	r.B = append(r.B, '"')
+}
+
+// AppendTime writes a time value as a JSON string using the given layout.
+// Uses time.AppendFormat to avoid intermediate string allocation.
+func (r *ResponseBuf) AppendTime(t time.Time, layout string) {
+	r.B = append(r.B, '"')
+	r.B = t.AppendFormat(r.B, layout)
 	r.B = append(r.B, '"')
 }

@@ -45,7 +45,7 @@ func TestGenerateWriteJSONBasic(t *testing.T) {
 		"buf.AppendJSONString(u.Name)",
 		`case "active":`,
 		"buf.AppendBool(u.Active)",
-		"sonic.Marshal(u)",
+		"if fields == nil",
 		// List wrapper
 		"type userListJSON []*User",
 		"func (l userListJSON) WriteJSON",

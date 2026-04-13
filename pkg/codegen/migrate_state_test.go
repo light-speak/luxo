@@ -405,7 +405,7 @@ func TestBuildColumnStateEnumDefault(t *testing.T) {
 	f := &ast.FieldDecl{
 		Name:    "role",
 		Type:    &ast.TypeRef{Name: "Role"},
-		Default: &ast.Ident{Name: "Role.USER"},
+		Default: &ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "USER"},
 	}
 	cs := buildColumnState(f, d)
 	if cs == nil {

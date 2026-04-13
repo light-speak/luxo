@@ -176,19 +176,16 @@ func TestLoadMissingKey(t *testing.T) {
 	}
 }
 
-func TestLoadMany(t *testing.T) {
-	var calls int32
-
+func TestLoadAll(t *testing.T) {
 	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
-		atomic.AddInt32(&calls, 1)
 		result := make(map[int]string)
 		for _, k := range keys {
 			result[k] = fmt.Sprintf("v%d", k)
 		}
 		return result, nil
-	}, Config{Wait: 10 * time.Millisecond, MaxBatch: 100})
+	}, DefaultConfig())
 
-	results, err := loader.LoadMany(context.Background(), []int{1, 2, 3}, []string{"name"})
+	results, err := loader.LoadAll(context.Background(), []int{1, 2, 3}, []string{"name"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,6 +194,32 @@ func TestLoadMany(t *testing.T) {
 	}
 	if results[1] != "v1" || results[2] != "v2" || results[3] != "v3" {
 		t.Errorf("results = %v", results)
+	}
+}
+
+func TestLoadAllEmpty(t *testing.T) {
+	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+		t.Fatal("should not be called for empty keys")
+		return nil, nil
+	}, DefaultConfig())
+
+	results, err := loader.LoadAll(context.Background(), []int{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results != nil {
+		t.Errorf("expected nil for empty keys, got %v", results)
+	}
+}
+
+func TestLoadAllError(t *testing.T) {
+	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+		return nil, fmt.Errorf("batch error")
+	}, DefaultConfig())
+
+	_, err := loader.LoadAll(context.Background(), []int{1, 2}, nil)
+	if err == nil || err.Error() != "batch error" {
+		t.Errorf("expected batch error, got %v", err)
 	}
 }
 
@@ -298,7 +321,7 @@ func TestLoadContextCancelDoesNotKillOthers(t *testing.T) {
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
-	if cfg.Wait != 2*time.Millisecond {
+	if cfg.Wait != 1*time.Millisecond {
 		t.Errorf("default wait = %v", cfg.Wait)
 	}
 	if cfg.MaxBatch != 100 {
@@ -312,7 +335,7 @@ func TestNewZeroWaitUsesDefault(t *testing.T) {
 		return map[int]string{1: "ok"}, nil
 	}, Config{Wait: 0, MaxBatch: 10})
 
-	if loader.wait != 2*time.Millisecond {
+	if loader.wait != 1*time.Millisecond {
 		t.Errorf("zero wait should default to 2ms, got %v", loader.wait)
 	}
 }
@@ -322,64 +345,7 @@ func TestNewNegativeWaitUsesDefault(t *testing.T) {
 		return map[int]string{1: "ok"}, nil
 	}, Config{Wait: -5 * time.Millisecond, MaxBatch: 10})
 
-	if loader.wait != 2*time.Millisecond {
+	if loader.wait != 1*time.Millisecond {
 		t.Errorf("negative wait should default to 2ms, got %v", loader.wait)
-	}
-}
-
-func TestLoadManyMaxBatch(t *testing.T) {
-	var calls int32
-
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
-		atomic.AddInt32(&calls, 1)
-		result := make(map[int]string)
-		for _, k := range keys {
-			result[k] = fmt.Sprintf("v%d", k)
-		}
-		return result, nil
-	}, Config{Wait: 100 * time.Millisecond, MaxBatch: 3})
-
-	// LoadMany with 3 keys should trigger immediate dispatch (size >= maxBatch)
-	results, err := loader.LoadMany(context.Background(), []int{1, 2, 3}, []string{"name"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(results) != 3 {
-		t.Fatalf("expected 3 results, got %d", len(results))
-	}
-	if results[1] != "v1" || results[2] != "v2" || results[3] != "v3" {
-		t.Errorf("results = %v", results)
-	}
-}
-
-func TestLoadManyContextCancel(t *testing.T) {
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
-		time.Sleep(50 * time.Millisecond)
-		return map[int]string{1: "ok", 2: "ok"}, nil
-	}, Config{Wait: 5 * time.Millisecond, MaxBatch: 100})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel immediately
-
-	_, err := loader.LoadMany(ctx, []int{1, 2}, nil)
-	if err == nil {
-		t.Fatal("expected error from cancelled context")
-	}
-	if err != context.Canceled {
-		t.Errorf("expected context.Canceled, got %v", err)
-	}
-}
-
-func TestLoadManyBatchError(t *testing.T) {
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
-		return nil, fmt.Errorf("batch error")
-	}, DefaultConfig())
-
-	_, err := loader.LoadMany(context.Background(), []int{1, 2}, nil)
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if err.Error() != "batch error" {
-		t.Errorf("error = %v", err)
 	}
 }

@@ -3,6 +3,7 @@ package str
 import (
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // === Case conversion (used by codegen + runtime) ===
@@ -33,7 +34,8 @@ func Capitalize(s string) string {
 	if s == "" {
 		return s
 	}
-	return string(unicode.ToUpper(rune(s[0]))) + s[1:]
+	r, size := utf8.DecodeRuneInString(s)
+	return string(unicode.ToUpper(r)) + s[size:]
 }
 
 // LowerFirst returns the string with the first character lowercased.
@@ -41,7 +43,8 @@ func LowerFirst(s string) string {
 	if s == "" {
 		return s
 	}
-	return strings.ToLower(s[:1]) + s[1:]
+	r, size := utf8.DecodeRuneInString(s)
+	return string(unicode.ToLower(r)) + s[size:]
 }
 
 // === Luxo String standard library (compiled from .luxo expressions) ===

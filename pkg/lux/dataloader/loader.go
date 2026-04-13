@@ -32,7 +32,7 @@ type Config struct {
 // DefaultConfig returns the default Loader configuration.
 func DefaultConfig() Config {
 	return Config{
-		Wait:     2 * time.Millisecond,
+		Wait:     1 * time.Millisecond,
 		MaxBatch: 100,
 	}
 }
@@ -40,7 +40,7 @@ func DefaultConfig() Config {
 // New creates a Loader with the given batch function and config.
 func New[K comparable, V any](fn BatchFn[K, V], cfg Config) *Loader[K, V] {
 	if cfg.Wait <= 0 {
-		cfg.Wait = 2 * time.Millisecond
+		cfg.Wait = 1 * time.Millisecond
 	}
 	return &Loader[K, V]{
 		batchFn:  fn,
@@ -56,7 +56,8 @@ func (l *Loader[K, V]) Load(ctx context.Context, key K, fields []string) (V, err
 
 	if l.batch == nil {
 		l.batch = newBatch[K, V]()
-		go l.scheduleBatch(l.batch)
+		b := l.batch
+		time.AfterFunc(l.wait, func() { l.flushBatch(b) })
 	}
 	b := l.batch
 	req := b.add(key, fields)
@@ -79,49 +80,19 @@ func (l *Loader[K, V]) Load(ctx context.Context, key K, fields []string) (V, err
 	}
 }
 
-// LoadMany loads multiple keys with the same fields.
-// Adds all keys to the same batch in a single lock — no per-key goroutine.
-func (l *Loader[K, V]) LoadMany(ctx context.Context, keys []K, fields []string) (map[K]V, error) {
-	l.mu.Lock()
-	if l.batch == nil {
-		l.batch = newBatch[K, V]()
-		go l.scheduleBatch(l.batch)
+// LoadAll loads multiple keys immediately — bypasses batch window.
+// Used by LIST handlers where all keys are known upfront.
+// Zero wait, direct dispatch.
+func (l *Loader[K, V]) LoadAll(ctx context.Context, keys []K, fields []string) (map[K]V, error) {
+	if len(keys) == 0 {
+		return nil, nil
 	}
-	b := l.batch
-	reqs := make([]*request[K, V], len(keys))
-	for i, key := range keys {
-		reqs[i] = b.add(key, fields)
-	}
-	if l.maxBatch > 0 && b.size() >= l.maxBatch {
-		l.batch = nil
-		l.mu.Unlock()
-		l.dispatchBatch(b)
-	} else {
-		l.mu.Unlock()
-	}
-
-	results := make(map[K]V, len(keys))
-	var firstErr error
-	for i, req := range reqs {
-		select {
-		case <-req.done:
-			if req.err != nil && firstErr == nil {
-				firstErr = req.err
-			}
-			results[keys[i]] = req.value
-		case <-ctx.Done():
-			if firstErr == nil {
-				firstErr = ctx.Err()
-			}
-		}
-	}
-	return results, firstErr
+	return l.batchFn(ctx, keys, fields)
 }
 
-// scheduleBatch waits for the batch window then dispatches.
-func (l *Loader[K, V]) scheduleBatch(b *batch[K, V]) {
-	time.Sleep(l.wait)
-
+// flushBatch dispatches a batch after the wait window expires.
+// Called by time.AfterFunc — no goroutine blocked during wait.
+func (l *Loader[K, V]) flushBatch(b *batch[K, V]) {
 	l.mu.Lock()
 	if l.batch == b {
 		l.batch = nil

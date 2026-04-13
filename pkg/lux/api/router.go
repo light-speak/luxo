@@ -3,11 +3,18 @@ package api
 import (
 	"context"
 	stderrors "errors"
+	"fmt"
 	"net/http"
 
 	"github.com/bytedance/sonic"
 	"github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/light-speak/luxo/pkg/lux/i18n"
+)
+
+// Pre-allocated response framing bytes — avoids per-request []byte conversion.
+var (
+	jsonDataPrefix = []byte(`{"data":`)
+	jsonDataSuffix = []byte(`}`)
 )
 
 // HandlerFunc is the signature for API handlers.
@@ -70,19 +77,31 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	buf := GetBuf()
 	req.Buf = buf
 
-	if err := fn(r.Context(), req); err != nil {
+	herr := rt.callHandler(fn, r.Context(), req)
+	if herr != nil {
 		PutBuf(buf)
-		rt.writeAppError(w, r, err)
+		rt.writeAppError(w, r, herr)
 		return
 	}
 
 	// Write response: {"data": <buf> }
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"data":`))
+	w.Write(jsonDataPrefix)
 	w.Write(buf.B)
-	w.Write([]byte(`}`))
+	w.Write(jsonDataSuffix)
 
 	PutBuf(buf)
+}
+
+// callHandler executes a handler with panic recovery.
+// If the handler panics, the panic is caught and returned as an InternalServerError.
+func (rt *Router) callHandler(fn HandlerFunc, ctx context.Context, req *Request) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = errors.InternalError.WithCause(fmt.Errorf("panic: %v", p))
+		}
+	}()
+	return fn(ctx, req)
 }
 
 // writeAppError writes a structured error response with i18n translation and traceId.
@@ -100,29 +119,37 @@ func (rt *Router) writeAppError(w http.ResponseWriter, r *http.Request, err erro
 		message = rt.translator.Translate(locale, appErr.Message, appErr.Data)
 	}
 
-	resp := map[string]any{
-		"error":   appErr.Name,
-		"code":    appErr.Code,
-		"message": message,
-	}
+	buf := GetBuf()
+	buf.AppendString(`{"error":`)
+	buf.AppendJSONString(appErr.Name)
+	buf.AppendString(`,"code":`)
+	buf.AppendInt(int64(appErr.Code))
+	buf.AppendString(`,"message":`)
+	buf.AppendJSONString(message)
 	if traceID != "" {
-		resp["traceId"] = traceID
+		buf.AppendString(`,"traceId":`)
+		buf.AppendJSONString(traceID)
 	}
 	if appErr.Data != nil && !appErr.Internal {
-		resp["data"] = appErr.Data
+		buf.AppendString(`,"data":`)
+		dataBytes, _ := sonic.Marshal(appErr.Data)
+		buf.B = append(buf.B, dataBytes...)
 	}
 	if rt.devMode && appErr.Cause != nil {
-		resp["cause"] = appErr.Cause.Error()
+		buf.AppendString(`,"cause":`)
+		buf.AppendJSONString(appErr.Cause.Error())
 	}
+	buf.AppendByte('}')
 
 	w.WriteHeader(appErr.Code)
-	data, _ := sonic.Marshal(resp)
-	w.Write(data)
+	w.Write(buf.B)
+	PutBuf(buf)
 }
 
 // writeError writes a simple JSON error response for infrastructure errors.
 func writeError(w http.ResponseWriter, code int, msg string) {
 	w.WriteHeader(code)
-	resp, _ := sonic.Marshal(map[string]string{"error": msg})
-	w.Write(resp)
+	w.Write([]byte(`{"error":"`))
+	w.Write([]byte(msg))
+	w.Write([]byte(`"}`))
 }

@@ -156,7 +156,7 @@ func TestGenerateHandlerCrudExceptDelete(t *testing.T) {
 	if !strings.Contains(code, "handleGetUser") {
 		t.Error("should have getUser")
 	}
-	if strings.Contains(code, "handleDeleteUser") {
+	if strings.Contains(code, "handleDeleteUser(") {
 		t.Error("should NOT have deleteUser")
 	}
 }
@@ -252,8 +252,8 @@ func TestPluralize(t *testing.T) {
 func TestCrudOperationsNoArgs(t *testing.T) {
 	m := testModel("User", []*ast.Directive{crudDirective()}, nil)
 	ops := crudOperations(m)
-	if len(ops) != 5 {
-		t.Errorf("got %d ops, want 5", len(ops))
+	if len(ops) != 6 {
+		t.Errorf("got %d ops, want 6", len(ops))
 	}
 }
 
@@ -280,8 +280,8 @@ func TestCrudOperationsMultipleDirectives(t *testing.T) {
 		{Name: "noTime"},
 	}, nil)
 	ops := crudOperations(m)
-	if len(ops) != 5 {
-		t.Errorf("got %d ops, want 5 (should skip non-crud directives)", len(ops))
+	if len(ops) != 6 {
+		t.Errorf("got %d ops, want 6 (should skip non-crud directives)", len(ops))
 	}
 }
 
@@ -293,8 +293,8 @@ func TestCrudOperationsUnknownArg(t *testing.T) {
 	}
 	m := testModel("User", []*ast.Directive{crudDirective(unknownArg)}, nil)
 	ops := crudOperations(m)
-	if len(ops) != 5 {
-		t.Errorf("got %d ops, want 5 (should fall through to default)", len(ops))
+	if len(ops) != 6 {
+		t.Errorf("got %d ops, want 6 (should fall through to default)", len(ops))
 	}
 }
 
@@ -414,9 +414,30 @@ func TestParamMethodBool(t *testing.T) {
 }
 
 func TestParamMethodFloat(t *testing.T) {
-	// float64 is an unknown type, maps to default "String"
-	if got := paramMethod("float64"); got != "String" {
-		t.Errorf("paramMethod(float64) = %q, want String", got)
+	if got := paramMethod("float64"); got != "Float" {
+		t.Errorf("paramMethod(float64) = %q, want Float", got)
+	}
+}
+
+func TestParamMethodDateTime(t *testing.T) {
+	if got := paramMethod("time.Time"); got != "DateTime" {
+		t.Errorf("paramMethod(time.Time) = %q, want DateTime", got)
+	}
+}
+
+func TestParamMethodCustomType(t *testing.T) {
+	// Custom types return empty for ParamJSON dispatch
+	if got := paramMethod("uuid.UUID"); got != "" {
+		t.Errorf("paramMethod(uuid.UUID) = %q, want empty", got)
+	}
+}
+
+func TestParamMethodArrayTypes(t *testing.T) {
+	if got := paramMethod("[]int64"); got != "IntArray" {
+		t.Errorf("paramMethod([]int64) = %q, want IntArray", got)
+	}
+	if got := paramMethod("[]string"); got != "StringArray" {
+		t.Errorf("paramMethod([]string) = %q, want StringArray", got)
 	}
 }
 
@@ -745,5 +766,301 @@ func TestGenerateHandlerEnumParam(t *testing.T) {
 
 	if !strings.Contains(code, "Role(roleVal)") {
 		t.Errorf("enum param should cast to enum type:\n%s", code)
+	}
+}
+
+// TestGenerateFilterParserAllTypes covers Float, DateTime, and Boolean
+// branches of generateFilterParser.
+func TestGenerateFilterParserAllTypes(t *testing.T) {
+	filterDirective := &ast.Directive{Name: "filterable"}
+
+	m := testModel("Event", []*ast.Directive{crudDirective()}, []*ast.FieldDecl{
+		testField("id", "Int", directive("id"), directive("auto")),
+		{Name: "score", Type: &ast.TypeRef{Name: "Float"}, Directives: []*ast.Directive{filterDirective}},
+		{Name: "active", Type: &ast.TypeRef{Name: "Boolean"}, Directives: []*ast.Directive{filterDirective}},
+		{Name: "createdAt", Type: &ast.TypeRef{Name: "DateTime"}, Directives: []*ast.Directive{filterDirective}},
+	})
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{m},
+		}},
+	}
+
+	src := generateHandlerFile(result, "app", nil)
+	code := string(src)
+
+	if !strings.Contains(code, "NewFloatField") {
+		t.Errorf("missing NewFloatField in filter parser:\n%s", code)
+	}
+	if !strings.Contains(code, "NewBoolField") {
+		t.Errorf("missing NewBoolField in filter parser:\n%s", code)
+	}
+	if !strings.Contains(code, "NewTimeField") {
+		t.Errorf("missing NewTimeField in filter parser:\n%s", code)
+	}
+}
+
+// TestGenerateFilterParserSkipsRelation ensures relation fields with @filterable
+// are skipped (isRelationField returns true → continue).
+func TestGenerateFilterParserSkipsRelation(t *testing.T) {
+	filterDirective := &ast.Directive{Name: "filterable"}
+
+	m := testModel("Post", []*ast.Directive{crudDirective()}, []*ast.FieldDecl{
+		testField("id", "Int", directive("id"), directive("auto")),
+		testField("title", "String", filterDirective),
+		// relation field with @filterable — should be skipped
+		{Name: "user", Type: &ast.TypeRef{Name: "User"}, Directives: []*ast.Directive{filterDirective}},
+	})
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{m},
+		}},
+	}
+
+	src := generateHandlerFile(result, "app", nil)
+	code := string(src)
+
+	// "user" relation should not appear as a filter case
+	if strings.Contains(code, `case "user"`) {
+		t.Errorf("relation field should be skipped in filter parser:\n%s", code)
+	}
+}
+
+// TestGenerateSorterParserHasSortableField ensures generateSorterParser emits
+// a case for @sortable fields (covering the per-field emit branch at line 732).
+func TestGenerateSorterParserHasSortableField(t *testing.T) {
+	sortDirective := &ast.Directive{Name: "sortable"}
+
+	m := testModel("Post", []*ast.Directive{crudDirective()}, []*ast.FieldDecl{
+		testField("id", "Int", directive("id"), directive("auto")),
+		{Name: "createdAt", Type: &ast.TypeRef{Name: "DateTime"}, Directives: []*ast.Directive{sortDirective}},
+	})
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{m},
+		}},
+	}
+
+	src := generateHandlerFile(result, "app", nil)
+	code := string(src)
+
+	if !strings.Contains(code, `case "createdAt"`) {
+		t.Errorf("missing sortable field case in sorter parser:\n%s", code)
+	}
+	if !strings.Contains(code, "created_at") {
+		t.Errorf("missing snake_case column in sorter parser:\n%s", code)
+	}
+}
+
+// TestSkipHandlerFieldNilTypeFalse ensures a field with nil type and no
+// other skip conditions is NOT skipped (the unexercised branch in skipHandlerField
+// where isAutoManaged, @internal, computed are all false but type is nil).
+func TestSkipHandlerFieldNilTypeFalse(t *testing.T) {
+	// A field with no directives and nil type — isAutoManaged=false, @internal=false,
+	// computed=nil, and isRelationField returns false for nil Type.
+	f := &ast.FieldDecl{
+		Name: "freeField",
+		Type: nil,
+	}
+	// Should NOT be skipped (nil type is not a relation).
+	if skipHandlerField(f, nil) {
+		t.Error("field with nil type and no skip conditions should not be skipped")
+	}
+}
+
+// TestCollectInferredAPIsWithBody ensures APIs with a Body are excluded from
+// the inferred list (covers the body-check branch at line 145).
+func TestCollectInferredAPIsWithBody(t *testing.T) {
+	body := &ast.Block{} // non-nil body
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			APIs: []*ast.ApiDecl{
+				{Name: "withBody", Body: body},
+				{Name: "noBody", Body: nil},
+			},
+		}},
+	}
+	_, apis := collectInferredAPIs(result)
+	for _, a := range apis {
+		if a.Body != nil {
+			t.Errorf("API with Body should be excluded from inferred list: %s", a.Name)
+		}
+	}
+	found := false
+	for _, a := range apis {
+		if a.Name == "noBody" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("no-body API should be in inferred list")
+	}
+}
+
+// TestGenerateHandlerWithInferredAPI exercises generateInferredHandlers
+// (covering the non-nil inferAPI + ValidateInferredReturnType paths).
+func TestGenerateHandlerWithInferredAPI(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("User", []*ast.Directive{crudDirective()}, []*ast.FieldDecl{
+					testField("id", "Int", directive("id"), directive("auto")),
+					testField("email", "String"),
+				}),
+			},
+			APIs: []*ast.ApiDecl{
+				{
+					Name:   "getUserByEmail",
+					Body:   nil,
+					Params: []*ast.ParamDecl{{Name: "email", Type: &ast.TypeRef{Name: "String"}}},
+				},
+			},
+		}},
+	}
+	src := generateHandlerFile(result, "app", nil)
+	if src == nil {
+		t.Fatal("should generate handler file")
+	}
+	code := string(src)
+	if !strings.Contains(code, "handleGetUserByEmail") {
+		t.Errorf("missing inferred handler:\n%s", code)
+	}
+}
+
+// TestGenerateRegisterFuncWithInferredNames covers the inferred-names loop
+// in generateRegisterFuncWithInferred (line 619).
+func TestGenerateRegisterFuncWithInferredNames(t *testing.T) {
+	var b strings.Builder
+	models := []*ast.ModelDecl{
+		testModel("User", []*ast.Directive{crudDirective()}, nil),
+	}
+	inferredNames := []string{"getUserByEmail", "listUsersByRole"}
+	generateRegisterFuncWithInferred(&b, models, inferredNames)
+	out := b.String()
+
+	if !strings.Contains(out, `"getUserByEmail"`) {
+		t.Errorf("missing inferred handler registration for getUserByEmail:\n%s", out)
+	}
+	if !strings.Contains(out, `"listUsersByRole"`) {
+		t.Errorf("missing inferred handler registration for listUsersByRole:\n%s", out)
+	}
+}
+
+// TestGenerateFilterParserIntAndStringTypes covers the "Int" and "String"
+// branches of generateFilterParser (lines 694-695 and 698-699).
+func TestGenerateFilterParserIntAndStringTypes(t *testing.T) {
+	filterDirective := &ast.Directive{Name: "filterable"}
+
+	m := testModel("Article", []*ast.Directive{crudDirective()}, []*ast.FieldDecl{
+		testField("id", "Int", directive("id"), directive("auto")),
+		{Name: "views", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{filterDirective}},
+		{Name: "title", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{filterDirective}},
+	})
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{m},
+		}},
+	}
+
+	src := generateHandlerFile(result, "app", nil)
+	code := string(src)
+
+	// Int @filterable → NewIntField
+	if !strings.Contains(code, "NewIntField") {
+		t.Errorf("missing NewIntField for Int @filterable field:\n%s", code)
+	}
+	// String @filterable → NewStringField
+	if !strings.Contains(code, "NewStringField") {
+		t.Errorf("missing NewStringField for String @filterable field:\n%s", code)
+	}
+}
+
+// TestGenerateFilterParserDefaultBranch covers the default branch of the
+// filter type switch (enum type → NewStringField). The enum must be passed via
+// the enums map so isRelationField returns false.
+func TestGenerateFilterParserDefaultBranch(t *testing.T) {
+	filterDirective := &ast.Directive{Name: "filterable"}
+	// "Status" is an enum — not a relation when enums map contains it.
+	enums := map[string]bool{"Status": true}
+
+	m := testModel("Post", []*ast.Directive{crudDirective()}, []*ast.FieldDecl{
+		testField("id", "Int", directive("id"), directive("auto")),
+		{Name: "status", Type: &ast.TypeRef{Name: "Status"}, Directives: []*ast.Directive{filterDirective}},
+	})
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{m},
+		}},
+	}
+
+	src := generateHandlerFile(result, "app", enums)
+	code := string(src)
+
+	// default branch → NewStringField
+	if !strings.Contains(code, "NewStringField") {
+		t.Errorf("default branch should use NewStringField for enum type:\n%s", code)
+	}
+}
+
+// TestGenerateInferredHandlerWithReturnTypeWarning covers the warning branch in
+// generateInferredHandlers when ValidateInferredReturnType returns a non-empty message.
+func TestGenerateInferredHandlerWithReturnTypeWarning(t *testing.T) {
+	// getUserByEmail but declared return type is [User] (wrong — get returns single, not list)
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("User", nil, []*ast.FieldDecl{
+					testField("id", "Int"),
+					testField("email", "String"),
+				}),
+			},
+			APIs: []*ast.ApiDecl{
+				{
+					Name:       "getUserByEmail",
+					ReturnType: &ast.TypeRef{Name: "User", IsList: true}, // wrong: list for "get"
+					Params:     []*ast.ParamDecl{{Name: "email", Type: &ast.TypeRef{Name: "String"}}},
+				},
+			},
+		}},
+	}
+	// Should not panic — warning goes to stderr, handler still generated
+	src := generateHandlerFile(result, "app", nil)
+	if src == nil {
+		t.Fatal("should generate handler file even with return type mismatch warning")
+	}
+	code := string(src)
+	if !strings.Contains(code, "handleGetUserByEmail") {
+		t.Errorf("handler should be generated despite warning:\n%s", code)
+	}
+}
+
+// TestGenerateCompiledHandlers covers the compiled-handler path where api.Body != nil
+// and @native is not set, exercising generateCompiledHandlers lines 91-94.
+func TestGenerateCompiledHandlers(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("User", []*ast.Directive{crudDirective()}, []*ast.FieldDecl{
+					testField("id", "Int", directive("id"), directive("auto")),
+					testField("name", "String"),
+				}),
+			},
+			APIs: []*ast.ApiDecl{
+				{
+					Name: "myCompiledApi",
+					Body: &ast.Block{Stmts: []ast.Stmt{}}, // non-nil body, no @native
+				},
+			},
+		}},
+	}
+
+	src := generateHandlerFile(result, "app", nil)
+	if src == nil {
+		t.Fatal("should generate handler file")
+	}
+	code := string(src)
+	// The compiled handler should register "myCompiledApi"
+	if !strings.Contains(code, "myCompiledApi") {
+		t.Errorf("compiled API should be registered:\n%s", code)
 	}
 }

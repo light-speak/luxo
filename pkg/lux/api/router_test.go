@@ -428,6 +428,25 @@ func TestRouterDeleteHandler(t *testing.T) {
 	}
 }
 
+func TestRouterHandlerPanicRecovery(t *testing.T) {
+	rt := NewRouter()
+	rt.Handle("crashTest", func(ctx context.Context, req *Request) error {
+		panic("boom")
+	})
+
+	body := `{"$api":"crashTest"}`
+	r := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, r)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"error"`) {
+		t.Errorf("expected error response, got %s", w.Body.String())
+	}
+}
+
 // Suppress unused imports
 var _ = bytes.NewBuffer
 var _ = json.RawMessage{}

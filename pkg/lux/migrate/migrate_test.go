@@ -167,18 +167,6 @@ func TestBuildDatabaseURLPartialEnv(t *testing.T) {
 	}
 }
 
-func TestEnvOr(t *testing.T) {
-	t.Setenv("TEST_ENVVAR_EXISTS", "value")
-	os.Unsetenv("TEST_ENVVAR_MISSING")
-
-	if got := envOr("TEST_ENVVAR_EXISTS", "fallback"); got != "value" {
-		t.Errorf("envOr with existing: got %q, want %q", got, "value")
-	}
-	if got := envOr("TEST_ENVVAR_MISSING", "fallback"); got != "fallback" {
-		t.Errorf("envOr with missing: got %q, want %q", got, "fallback")
-	}
-}
-
 func TestSplitConcurrently(t *testing.T) {
 	sql := "CREATE TABLE users (id INT);\nCREATE INDEX CONCURRENTLY idx ON users (name);\nALTER TABLE users ADD COLUMN age INT;"
 	txSQL, nonTx := splitConcurrently(sql)

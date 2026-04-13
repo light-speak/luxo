@@ -2,6 +2,8 @@ package lsp
 
 import (
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +34,9 @@ type DocumentStore struct {
 	docs          map[string]*Document
 	debounceTimer *time.Timer
 	debounceMu    sync.Mutex
+	siblingCache  []*Document // cached sibling files (refreshed on open/close)
+	siblingDirty  bool        // true when sibling cache needs refresh
+	OnAnalyzed    func()      // called after analyzeAll completes (for pushing diagnostics)
 }
 
 const analyzeDebounce = 100 * time.Millisecond
@@ -53,6 +58,7 @@ func (s *DocumentStore) Open(uri string, version int, content string) *Document 
 
 	s.mu.Lock()
 	s.docs[uri] = doc
+	s.siblingDirty = true // new file opened, refresh sibling discovery
 	s.mu.Unlock()
 
 	s.analyzeAll()
@@ -70,6 +76,11 @@ func (s *DocumentStore) Update(uri string, version int, content string) *Documen
 	}
 	doc.Version = version
 	doc.Content = content
+	// Clear stale results immediately so diagnostics don't flicker
+	doc.lexErrors = nil
+	doc.parseErrors = nil
+	doc.File = nil
+	doc.Tokens = nil
 	s.mu.Unlock()
 
 	s.scheduleAnalysis()
@@ -99,10 +110,12 @@ func (s *DocumentStore) Get(uri string) *Document {
 func (s *DocumentStore) Close(uri string) {
 	s.mu.Lock()
 	delete(s.docs, uri)
+	s.siblingDirty = true
 	s.mu.Unlock()
 }
 
 // analyzeAll runs analysis on all open documents together for cross-file resolution.
+// Also discovers sibling .luxo files in the same origin/ directory.
 func (s *DocumentStore) analyzeAll() {
 	s.mu.RLock()
 	docs := make([]*Document, 0, len(s.docs))
@@ -111,9 +124,21 @@ func (s *DocumentStore) analyzeAll() {
 	}
 	s.mu.RUnlock()
 
+	// Discover sibling .luxo files (cached, only refreshed on open/close)
+	s.mu.RLock()
+	dirty := s.siblingDirty
+	s.mu.RUnlock()
+	if dirty || s.siblingCache == nil {
+		s.siblingCache = s.discoverSiblingFiles(docs)
+		s.mu.Lock()
+		s.siblingDirty = false
+		s.mu.Unlock()
+	}
+	allDocs := append(docs, s.siblingCache...)
+
 	// Phase 1: lex and parse each file independently
 	var files []*ast.File
-	for _, doc := range docs {
+	for _, doc := range allDocs {
 		filename := URIToPath(doc.URI)
 
 		l := lexer.New(doc.Content, filename)
@@ -131,14 +156,77 @@ func (s *DocumentStore) analyzeAll() {
 		}
 	}
 
-	// Phase 2: semantic analysis across all files together
+	// Phase 2: semantic analysis across all files together with module isolation
 	a := semantic.New()
-	result := a.Analyze(files)
+	result := a.AnalyzeWithModules(files)
 
 	// distribute results to each document
-	for _, doc := range docs {
+	for _, doc := range allDocs {
 		doc.Result = result
 	}
+
+	// notify server to push diagnostics
+	if s.OnAnalyzed != nil {
+		s.OnAnalyzed()
+	}
+}
+
+// discoverSiblingFiles finds .luxo files in the same origin/ directory
+// that aren't already open. Reads them from disk.
+func (s *DocumentStore) discoverSiblingFiles(openDocs []*Document) []*Document {
+	// Find origin/ directories from open files
+	originDirs := make(map[string]bool)
+	openPaths := make(map[string]bool)
+	for _, doc := range openDocs {
+		p := URIToPath(doc.URI)
+		openPaths[p] = true
+		dir := filepath.Dir(p)
+		// Walk up to find origin/ parent
+		for dir != "/" && dir != "." {
+			base := filepath.Base(dir)
+			if base == "origin" {
+				originDirs[dir] = true
+				break
+			}
+			// Also check if current dir IS inside origin/
+			parent := filepath.Dir(dir)
+			if filepath.Base(parent) == "origin" {
+				originDirs[parent] = true
+				break
+			}
+			dir = parent
+		}
+		// If file is directly in origin/
+		if filepath.Base(filepath.Dir(p)) == "origin" {
+			originDirs[filepath.Dir(p)] = true
+		}
+	}
+
+	var discovered []*Document
+	for originDir := range originDirs {
+		// Walk origin/ recursively for .luxo files
+		filepath.WalkDir(originDir, func(path string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			if !strings.HasSuffix(path, ".luxo") {
+				return nil
+			}
+			if openPaths[path] {
+				return nil // already open
+			}
+			content, err := os.ReadFile(path)
+			if err != nil {
+				return nil
+			}
+			discovered = append(discovered, &Document{
+				URI:     PathToURI(path),
+				Content: string(content),
+			})
+			return nil
+		})
+	}
+	return discovered
 }
 
 // Diagnostics returns all LSP diagnostics (lexer + parser + semantic errors).
