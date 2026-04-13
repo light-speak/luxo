@@ -361,17 +361,20 @@ func (p *Parser) parseAPI() *ast.ApiDecl {
 		Name: p.expectIdent(),
 	}
 
-	// params
-	p.expect(token.LParen)
-	for !p.check(token.RParen) && !p.isEOF() {
-		api.Params = append(api.Params, p.parseParam())
-		p.match(token.Comma)
+	// params (optional — inferred APIs can omit)
+	if p.check(token.LParen) {
+		p.advance()
+		for !p.check(token.RParen) && !p.isEOF() {
+			api.Params = append(api.Params, p.parseParam())
+			p.match(token.Comma)
+		}
+		p.expect(token.RParen)
 	}
-	p.expect(token.RParen)
 
-	// return type
-	p.expect(token.Colon)
-	api.ReturnType = p.parseTypeRef()
+	// return type (optional — inferred APIs can omit)
+	if p.match(token.Colon) {
+		api.ReturnType = p.parseTypeRef()
+	}
 
 	// directives
 	api.Directives = p.parseDirectives()

@@ -83,6 +83,14 @@ func (c *compiler) compileStmt(stmt ast.Stmt) {
 		c.compileExprStmt(s)
 	case *ast.EmitStmt:
 		c.compileEmit(s)
+	case *ast.ForStmt:
+		c.compileFor(s)
+	case *ast.AssignStmt:
+		c.compileAssign(s)
+	case *ast.BreakStmt:
+		c.write("break")
+	case *ast.ContinueStmt:
+		c.write("continue")
 	default:
 		c.write("// TODO: unsupported statement %T", stmt)
 	}
@@ -268,6 +276,20 @@ func (c *compiler) compileExpr(expr ast.Expr) string {
 		return fmt.Sprintf("/* elvis */ %s", c.compileExpr(e.Left))
 	case *ast.UnaryExpr:
 		return c.compileUnary(e)
+	case *ast.ListExpr:
+		return c.compileList(e)
+	case *ast.TemplateString:
+		return c.compileTemplate(e)
+	case *ast.RangeExpr:
+		return c.compileRange(e)
+	case *ast.ObjectExpr:
+		return c.compileObject(e)
+	case *ast.WhenExpr:
+		return c.compileWhen(e)
+	case *ast.LambdaExpr:
+		return c.compileLambda(e)
+	case *ast.TransactionExpr:
+		return c.compileTransaction(e)
 	default:
 		return fmt.Sprintf("/* TODO: %T */", expr)
 	}
@@ -370,36 +392,26 @@ func (c *compiler) compileModelChain(modelName string, links []chainLink) string
 			}
 			return b.String()
 
-		case "first":
-			b.WriteString(".First(ctx)")
-			return b.String()
-
-		case "all":
-			b.WriteString(".All(ctx)")
-			return b.String()
-
-		case "exists":
-			b.WriteString(".Exists(ctx)")
+		case "first", "all", "exists", "exec", "delete", "count":
+			fmt.Fprintf(&b, ".%s(ctx)", str.Capitalize(link.method))
 			return b.String()
 
 		case "create":
-			// create(field: val, ...) → Create().SetField(val)...Exec(ctx)
 			fmt.Fprintf(&b, "app.%s.Create()", modelName)
 			for _, arg := range link.args {
 				val := c.compileExpr(arg.Value)
 				fmt.Fprintf(&b, ".Set%s(%s)", str.Capitalize(arg.Name), val)
 			}
-			// Check if next link is NOT a method — auto-add .Exec(ctx)
 			if i == len(links)-1 {
 				b.WriteString(".Exec(ctx)")
 			}
 
-		case "exec":
-			b.WriteString(".Exec(ctx)")
-			return b.String()
-
 		case "select":
 			b.WriteString(".Select(selection.SQLColumns(req.Select)...)")
+
+		case "update":
+			c.compileUpdateChain(&b, link.args)
+			return b.String()
 
 		default:
 			// Unknown method — ensure model client is seeded
@@ -541,6 +553,12 @@ func (c *compiler) resolveQueryType(expr ast.Expr) valType {
 				return valType{isModel: true, name: ident.Name}
 			case "exists":
 				return valType{name: "Boolean"}
+			case "count":
+				return valType{name: "Int"}
+			case "update":
+				return valType{name: "Int"} // rows affected
+			case "delete":
+				return valType{name: "Int"} // rows affected
 			}
 		}
 	}
@@ -559,10 +577,163 @@ func (c *compiler) isModelQuery(expr ast.Expr) bool {
 			// Check terminal method
 			last := chain[len(chain)-1]
 			switch last.method {
-			case "first", "all", "create", "exec", "find", "exists":
+			case "first", "all", "create", "exec", "find", "exists", "update", "delete", "count":
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// compileUpdateChain compiles .update(field: val, ...) → .Update(ctx, SetField{...}, ...)
+func (c *compiler) compileUpdateChain(b *strings.Builder, args []*ast.NamedArg) {
+	if len(args) == 0 {
+		b.WriteString(".Update(ctx)")
+		return
+	}
+	var sets []string
+	for _, arg := range args {
+		val := c.compileExpr(arg.Value)
+		sets = append(sets, fmt.Sprintf("lux.SetField{Col: %q, Val: %s}", str.ToSnakeCase(arg.Name), val))
+	}
+	fmt.Fprintf(b, ".Update(ctx, %s)", strings.Join(sets, ", "))
+}
+
+// --- Phase 2 statement compilers ---
+
+// compileFor: for item in collection { ... }
+func (c *compiler) compileFor(s *ast.ForStmt) {
+	coll := c.compileExpr(s.Collection)
+	c.write("for _, %s := range %s {", s.VarName, coll)
+	old := c.indent
+	c.indent += "\t"
+	for _, stmt := range s.Body.Stmts {
+		c.compileStmt(stmt)
+	}
+	c.indent = old
+	c.write("}")
+}
+
+// compileAssign: x = expr, x += expr, etc.
+func (c *compiler) compileAssign(s *ast.AssignStmt) {
+	target := c.compileExpr(s.Target)
+	val := c.compileExpr(s.Value)
+	c.write("%s %s %s", target, s.Op, val)
+}
+
+// --- Phase 2 expression compilers ---
+
+// compileList: [1, 2, 3] → []any{1, 2, 3}
+func (c *compiler) compileList(e *ast.ListExpr) string {
+	var items []string
+	for _, item := range e.Items {
+		items = append(items, c.compileExpr(item))
+	}
+	return "[]any{" + strings.Join(items, ", ") + "}"
+}
+
+// compileTemplate: "hello ${name}" → "hello " + name
+func (c *compiler) compileTemplate(e *ast.TemplateString) string {
+	if len(e.Parts) == 0 {
+		return `""`
+	}
+	var parts []string
+	for _, part := range e.Parts {
+		if lit, ok := part.(*ast.Literal); ok && lit.Kind == token.String {
+			parts = append(parts, fmt.Sprintf("%q", lit.Value))
+		} else {
+			compiled := c.compileExpr(part)
+			parts = append(parts, fmt.Sprintf("fmt.Sprint(%s)", compiled))
+		}
+	}
+	return strings.Join(parts, " + ")
+}
+
+// compileRange: 1..10 → not directly expressible, used in for loops
+func (c *compiler) compileRange(e *ast.RangeExpr) string {
+	start := c.compileExpr(e.Start)
+	end := c.compileExpr(e.End)
+	return fmt.Sprintf("luxRange(%s, %s)", start, end)
+}
+
+// compileObject: { name: "lin", age: 18 } → struct literal
+func (c *compiler) compileObject(e *ast.ObjectExpr) string {
+	var fields []string
+	for _, f := range e.Fields {
+		val := c.compileExpr(f.Value)
+		fields = append(fields, fmt.Sprintf("%s: %s", str.Capitalize(f.Name), val))
+	}
+	return "{" + strings.Join(fields, ", ") + "}"
+}
+
+// compileWhen: when { cond -> expr, else -> expr }
+func (c *compiler) compileWhen(e *ast.WhenExpr) string {
+	// when is compiled inline as a helper variable + switch
+	// For simple cases, emit as if/else chain
+	var b strings.Builder
+	b.WriteString("func() any {\n")
+	if e.Subject != nil {
+		subj := c.compileExpr(e.Subject)
+		fmt.Fprintf(&b, "%s\tswitch %s {\n", c.indent, subj)
+		for _, br := range e.Branches {
+			cond := c.compileExpr(br.Condition)
+			body := c.compileExpr(br.Body)
+			fmt.Fprintf(&b, "%s\tcase %s:\n%s\t\treturn %s\n", c.indent, cond, c.indent, body)
+		}
+	} else {
+		fmt.Fprintf(&b, "%s\tswitch {\n", c.indent)
+		for _, br := range e.Branches {
+			cond := c.compileExpr(br.Condition)
+			body := c.compileExpr(br.Body)
+			fmt.Fprintf(&b, "%s\tcase %s:\n%s\t\treturn %s\n", c.indent, cond, c.indent, body)
+		}
+	}
+	if e.Else != nil {
+		elseExpr := c.compileExpr(e.Else)
+		fmt.Fprintf(&b, "%s\tdefault:\n%s\t\treturn %s\n", c.indent, c.indent, elseExpr)
+	}
+	fmt.Fprintf(&b, "%s\t}\n%s\treturn nil\n%s}()", c.indent, c.indent, c.indent)
+	return b.String()
+}
+
+// compileLambda: { it -> it.price } → func(it any) any { ... }
+func (c *compiler) compileLambda(e *ast.LambdaExpr) string {
+	params := "it"
+	if len(e.Params) > 0 {
+		params = strings.Join(e.Params, ", ")
+	}
+	sub := c.subCompiler()
+	sub.indent = c.indent + "\t"
+	for _, stmt := range e.Body.Stmts {
+		sub.compileStmt(stmt)
+	}
+	return fmt.Sprintf("func(%s any) any {\n%s%s}", params, sub.b.String(), c.indent)
+}
+
+// compileTransaction: tx { ... } → app.DB.Tx(ctx, func(ctx) error { ... })
+func (c *compiler) compileTransaction(e *ast.TransactionExpr) string {
+	sub := c.subCompiler()
+	sub.indent = c.indent + "\t"
+	for _, stmt := range e.Body.Stmts {
+		sub.compileStmt(stmt)
+	}
+	return fmt.Sprintf("app.DB.Tx(ctx, func(ctx context.Context) error {\n%s%s\treturn nil\n%s})",
+		sub.b.String(), c.indent, c.indent)
+}
+
+// subCompiler creates a child compiler with its own buffer and vars scope.
+// Inherits parent vars (read-only copy) but mutations don't leak back.
+func (c *compiler) subCompiler() *compiler {
+	var b strings.Builder
+	childVars := make(map[string]valType, len(c.vars))
+	for k, v := range c.vars {
+		childVars[k] = v
+	}
+	return &compiler{
+		b:      &b,
+		indent: c.indent,
+		models: c.models,
+		api:    c.api,
+		vars:   childVars,
+	}
 }

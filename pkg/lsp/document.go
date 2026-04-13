@@ -76,11 +76,7 @@ func (s *DocumentStore) Update(uri string, version int, content string) *Documen
 	}
 	doc.Version = version
 	doc.Content = content
-	// Clear stale results immediately so diagnostics don't flicker
-	doc.lexErrors = nil
-	doc.parseErrors = nil
-	doc.File = nil
-	doc.Tokens = nil
+	// Keep stale File/Result/Tokens for completions — analyzeAll will overwrite
 	s.mu.Unlock()
 
 	s.scheduleAnalysis()

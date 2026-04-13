@@ -241,7 +241,7 @@ func (s *Server) getCompletions(doc *Document, pos Position) []CompletionItem {
 	}
 
 	// inferred API name completions (after "api " keyword)
-	if doc.File != nil && doc.File.Models != nil {
+	if doc.File != nil {
 		if inferred := s.getInferredAPICompletions(doc, pos, word); inferred != nil {
 			items = append(items, inferred...)
 		}
@@ -2351,19 +2351,32 @@ func (s *Server) getInferredAPICompletions(doc *Document, pos Position, word str
 		return nil
 	}
 
-	// Collect models from file (not extends)
+	// Collect models from current file and all analyzed files
 	var models []*ast.ModelDecl
 	if doc.File != nil {
-		models = doc.File.Models
+		models = append(models, doc.File.Models...)
+	}
+	// Also include models from sibling files (cross-module)
+	if doc.Result != nil {
+		seen := make(map[string]bool, len(models))
+		for _, m := range models {
+			seen[m.Name] = true
+		}
+		for _, f := range doc.Result.Files {
+			for _, m := range f.Models {
+				if !seen[m.Name] {
+					seen[m.Name] = true
+					models = append(models, m)
+				}
+			}
+		}
 	}
 	if len(models) == 0 {
 		return nil
 	}
 
-	// Extract the text typed after "api " for prefix filtering.
-	// e.g. "api getUserBy|" → prefix = "getuserby"
+	// Extract the text typed after "api " — keep original case for PascalCase parsing.
 	typed := line[4:] // strip "api "
-	prefix := strings.ToLower(typed)
 
 	enumNames := make(map[string]bool)
 	if doc.File != nil {
@@ -2374,19 +2387,17 @@ func (s *Server) getInferredAPICompletions(doc *Document, pos Position, word str
 
 	var items []CompletionItem
 	for _, m := range models {
-		items = append(items, buildModelAPICompletions(m, enumNames, prefix)...)
+		items = append(items, buildModelAPICompletions(m, enumNames, typed)...)
 	}
 	return items
 }
 
-// buildModelAPICompletions generates completion items for a single model.
-// Includes single-field, And/Or compound, Boolean True/False, and OrderBy suggestions.
-func buildModelAPICompletions(m *ast.ModelDecl, enumNames map[string]bool, prefix string) []CompletionItem {
-	var items []CompletionItem
-	name := m.Name
-	plural := inferPlural(name)
-
-	var fields []string
+// buildModelAPICompletions generates incremental completion items for a model.
+// Analyzes what the user has typed so far and suggests the next logical segment.
+// e.g. "getUserBy" → suggests field names; "getUserByEmailOr" → suggests next field.
+// collectQueryableFields extracts scalar/enum fields from a model for API completion.
+func collectQueryableFields(m *ast.ModelDecl, enumNames map[string]bool) []fieldMeta {
+	var fields []fieldMeta
 	for _, f := range m.Fields {
 		if f.Type == nil || f.Computed != nil {
 			continue
@@ -2394,143 +2405,272 @@ func buildModelAPICompletions(m *ast.ModelDecl, enumNames map[string]bool, prefi
 		if !isBuiltinType(f.Type.Name) && !enumNames[f.Type.Name] {
 			continue
 		}
-		fields = append(fields, f.Name)
+		fm := fieldMeta{name: f.Name, typeName: f.Type.Name, nullable: f.Type.Nullable}
+		for _, d := range f.Directives {
+			switch d.Name {
+			case "filterable":
+				fm.filterable = true
+			case "sortable":
+				fm.sortable = true
+			case "search":
+				fm.searchable = true
+			}
+		}
+		fields = append(fields, fm)
 	}
-
-	// Generate action+field suggestions (single field + compound)
-	type apiAction struct{ prefix, detail, ret string }
-	actions := []apiAction{
-		{"get" + name + "By", "Single " + name + " query", name},
-		{"list" + plural + "By", "List " + name + " with pagination", "[" + name + "]"},
-		{"count" + plural + "By", "Count " + name, "Int"},
-		{"exists" + name + "By", "Check if " + name + " exists", "Boolean"},
-		{"delete" + name + "By", "Delete " + name, "Int"},
-		{"listTop10" + plural + "By", "Top 10 " + name, "[" + name + "]"},
+	// Implicit timestamp fields
+	has := func(n string) bool {
+		for _, f := range fields {
+			if f.name == n {
+				return true
+			}
+		}
+		return false
 	}
-	for _, action := range actions {
-		items = append(items, buildFieldSuggestions(m, fields, action.prefix, action.ret, prefix)...)
-		items = append(items, buildCompoundSuggestions(m, fields, action.prefix, action.ret, prefix)...)
+	if !has("createdAt") {
+		fields = append(fields, fieldMeta{name: "createdAt", typeName: "DateTime"})
 	}
-
-	// Boolean True/False suggestions
-	items = append(items, buildBooleanSuggestions(m, name, plural, prefix)...)
-
-	// OrderBy suggestions for list actions
-	items = append(items, buildOrderBySuggestions(m, fields, name, plural, prefix)...)
-
-	return items
+	if !has("updatedAt") {
+		fields = append(fields, fieldMeta{name: "updatedAt", typeName: "DateTime"})
+	}
+	return fields
 }
 
-// buildFieldSuggestions generates single-field completion items.
-// e.g. getUserByEmail → (email: String) -> User
-func buildFieldSuggestions(m *ast.ModelDecl, fields []string, actionPrefix, ret, prefix string) []CompletionItem {
+func buildModelAPICompletions(m *ast.ModelDecl, enumNames map[string]bool, prefix string) []CompletionItem {
+	name := m.Name
+	plural := inferPlural(name)
+	fields := collectQueryableFields(m, enumNames)
+	typedLower := strings.ToLower(prefix)
+	// Base actions without By (e.g., listUsers, countUsers)
+	baseActions := []struct{ match, label, detail string }{
+		{"list" + strings.ToLower(plural), "list" + plural, "list all " + name + " (paginated)"},
+		{"count" + strings.ToLower(plural), "count" + plural, "count all " + name},
+		{"delete" + strings.ToLower(name), "delete" + name, "delete " + name + " by id"},
+	}
+
+	// By-actions (e.g., getUserByEmail, listUsersByName)
+	byActions := []struct{ match, label string }{
+		{"get" + strings.ToLower(name) + "by", "get" + name + "By"},
+		{"list" + strings.ToLower(plural) + "by", "list" + plural + "By"},
+		{"count" + strings.ToLower(plural) + "by", "count" + plural + "By"},
+		{"exists" + strings.ToLower(name) + "by", "exists" + name + "By"},
+		{"delete" + strings.ToLower(name) + "by", "delete" + name + "By"},
+	}
+
 	var items []CompletionItem
-	for _, field := range fields {
-		suggestion := actionPrefix + capitalize(field)
-		if !matchesPrefix(suggestion, prefix) {
+
+	// Suggest base actions (no By)
+	for _, ba := range baseActions {
+		if !strings.HasPrefix(typedLower, ba.match) && !strings.HasPrefix(ba.match, typedLower) {
 			continue
 		}
-		ft := fieldTypeStr(m, field)
-		paramSig := "(" + field + ": " + ft + ")"
-		detail := paramSig + " -> " + ret
-		insertText := suggestion + paramSig + ": " + ret
 		items = append(items, CompletionItem{
-			Label:         suggestion,
-			Kind:          3,
-			Detail:        detail,
-			Documentation: insertText,
-			InsertText:    insertText,
+			Label:      ba.label,
+			Kind:       3,
+			Detail:     ba.detail,
+			InsertText: ba.label,
 		})
 	}
-	return items
-}
 
-// buildCompoundSuggestions generates 2-field And/Or combination completions.
-// e.g. getUserByNameAndEmail, getUserByEmailOrPhone
-func buildCompoundSuggestions(m *ast.ModelDecl, fields []string, actionPrefix, ret, prefix string) []CompletionItem {
-	var items []CompletionItem
-	for i := 0; i < len(fields); i++ {
-		for j := 0; j < len(fields); j++ {
-			if i == j {
-				continue
-			}
-			items = append(items, buildCompoundPair(m, fields[i], fields[j], actionPrefix, ret, prefix, "And")...)
-			items = append(items, buildCompoundPair(m, fields[i], fields[j], actionPrefix, ret, prefix, "Or")...)
-		}
-	}
-	return items
-}
-
-// buildCompoundPair builds a single And/Or pair completion item.
-func buildCompoundPair(m *ast.ModelDecl, f1, f2, actionPrefix, ret, prefix, sep string) []CompletionItem {
-	suggestion := actionPrefix + capitalize(f1) + sep + capitalize(f2)
-	if !matchesPrefix(suggestion, prefix) {
-		return nil
-	}
-	t1 := fieldTypeStr(m, f1)
-	t2 := fieldTypeStr(m, f2)
-	paramSig := "(" + f1 + ": " + t1 + ", " + f2 + ": " + t2 + ")"
-	detail := paramSig + " -> " + ret
-	insertText := suggestion + paramSig + ": " + ret
-	return []CompletionItem{{
-		Label:         suggestion,
-		Kind:          3,
-		Detail:        detail,
-		Documentation: insertText,
-		InsertText:    insertText,
-	}}
-}
-
-// buildBooleanSuggestions generates True/False suffix completions for Boolean fields.
-func buildBooleanSuggestions(m *ast.ModelDecl, name, plural, prefix string) []CompletionItem {
-	var items []CompletionItem
-	ret := "[" + name + "]"
-	for _, f := range m.Fields {
-		if f.Type == nil || f.Type.Name != "Boolean" {
+	// Suggest By-actions with field completions
+	for _, action := range byActions {
+		if !strings.HasPrefix(typedLower, action.match) && !strings.HasPrefix(action.match, typedLower) {
 			continue
 		}
-		for _, val := range []string{"True", "False"} {
-			suggestion := "list" + plural + "By" + capitalize(f.Name) + val
-			if !matchesPrefix(suggestion, prefix) {
-				continue
-			}
-			detail := "() -> " + ret
-			insertText := suggestion + "(): " + ret
-			items = append(items, CompletionItem{
-				Label:         suggestion,
-				Kind:          3,
-				Detail:        detail,
-				Documentation: "List " + name + " where " + f.Name + " = " + strings.ToLower(val),
-				InsertText:    insertText,
-			})
+
+		if len(typedLower) <= len(action.match) {
+			// User is still typing → show field-level options directly
+			items = append(items, buildContinuations(action.label, "", fields)...)
+			continue
 		}
+
+		// User has typed past "By" → suggest field continuations
+		afterBy := prefix[len(action.label):]
+		items = append(items, buildContinuations(action.label, afterBy, fields)...)
 	}
+
 	return items
 }
 
-// buildOrderBySuggestions generates OrderBy completions for list actions.
-func buildOrderBySuggestions(m *ast.ModelDecl, fields []string, name, plural, prefix string) []CompletionItem {
+type fieldMeta struct {
+	name       string
+	typeName   string
+	filterable bool // has @filterable
+	sortable   bool // has @sortable
+	searchable bool // has @search
+	nullable   bool // is nullable (T?)
+}
+
+// buildContinuations suggests the next segment after the current typed text.
+// afterBy is the text after "By" — could be "", "Email", "EmailOr", "EmailOrName", etc.
+func buildContinuations(base, afterBy string, fields []fieldMeta) []CompletionItem {
 	var items []CompletionItem
-	ret := "[" + name + "]"
-	listPrefix := "list" + plural
-	for _, field := range fields {
-		for _, dir := range []string{"Asc", "Desc"} {
-			suggestion := listPrefix + "OrderBy" + capitalize(field) + dir
-			if !matchesPrefix(suggestion, prefix) {
+	afterLower := strings.ToLower(afterBy)
+
+	// Check if afterBy ends with "And" or "Or" → suggest next field
+	endsWithAnd := strings.HasSuffix(afterBy, "And")
+	endsWithOr := strings.HasSuffix(afterBy, "Or")
+
+	if afterBy == "" || endsWithAnd || endsWithOr {
+		// Suggest field names
+		for _, f := range fields {
+			label := base + afterBy + capitalize(f.name)
+			items = append(items, CompletionItem{
+				Label:      label,
+				Kind:       3,
+				Detail:     f.name + ": " + f.typeName,
+				InsertText: label,
+			})
+		}
+		return items
+	}
+
+	// Check if afterBy ends with a complete field name → suggest operators + And/Or
+	for _, f := range fields {
+		capField := capitalize(f.name)
+		if !strings.HasSuffix(afterBy, capField) {
+			// Check if user is mid-typing a field name
+			if strings.HasPrefix(strings.ToLower(capField), afterLower) ||
+				(len(afterBy) > 0 && strings.HasPrefix(strings.ToLower(capField), lastSegmentLower(afterBy))) {
+				label := base + afterBy[:len(afterBy)-len(lastSegment(afterBy))] + capField
+				items = append(items, CompletionItem{
+					Label:      label,
+					Kind:       3,
+					Detail:     f.name + ": " + f.typeName,
+					InsertText: label,
+				})
+			}
+			continue
+		}
+
+		// Field is complete — suggest operators, And/Or, OrderBy
+		items = append(items, suggestAfterField(base, afterBy, f, fields)...)
+		break
+	}
+
+	return items
+}
+
+// lastSegment extracts the last PascalCase segment from a string.
+// "EmailOr" → "Or", "EmailOrName" → "Name", "Email" → "Email"
+func lastSegment(s string) string {
+	for i := len(s) - 1; i > 0; i-- {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			return s[i:]
+		}
+	}
+	return s
+}
+
+// suggestAfterField generates completions after a complete field name.
+func suggestAfterField(base, afterBy string, f fieldMeta, fields []fieldMeta) []CompletionItem {
+	var items []CompletionItem
+	fieldBase := base + afterBy
+
+	// And/Or + next field
+	for _, sep := range []string{"And", "Or"} {
+		for _, f2 := range fields {
+			if f2.name == f.name {
 				continue
 			}
-			detail := "() -> " + ret
-			insertText := suggestion + "(): " + ret
+			label := fieldBase + sep + capitalize(f2.name)
 			items = append(items, CompletionItem{
-				Label:         suggestion,
-				Kind:          3,
-				Detail:        detail,
-				Documentation: "List " + name + " ordered by " + field + " " + strings.ToLower(dir),
-				InsertText:    insertText,
+				Label: label, Kind: 3, Detail: sep + " " + f2.name, InsertText: label,
 			})
 		}
 	}
+
+	// Type-appropriate operators
+	for _, op := range getFieldOperators(f) {
+		label := fieldBase + op.name
+		items = append(items, CompletionItem{
+			Label: label, Kind: 3, Detail: op.detail, InsertText: label,
+		})
+	}
+
+	// OrderBy for list actions
+	if strings.HasPrefix(base, "list") {
+		for _, f2 := range fields {
+			for _, dir := range []string{"Asc", "Desc"} {
+				label := fieldBase + "OrderBy" + capitalize(f2.name) + dir
+				items = append(items, CompletionItem{
+					Label: label, Kind: 3, Detail: "order by " + f2.name + " " + strings.ToLower(dir), InsertText: label,
+				})
+			}
+		}
+	}
+
 	return items
+}
+
+func lastSegmentLower(s string) string {
+	return strings.ToLower(lastSegment(s))
+}
+
+type opSuggestion struct {
+	name   string
+	detail string
+}
+
+// getFieldOperators returns type-appropriate operators for a field.
+func getFieldOperators(f fieldMeta) []opSuggestion {
+	var ops []opSuggestion
+
+	switch f.typeName {
+	case "String":
+		// String: Like/Containing always available, @search makes them indexed
+		ops = append(ops,
+			opSuggestion{"Containing", "LIKE %...% (text search)"},
+			opSuggestion{"StartingWith", "LIKE ...%"},
+			opSuggestion{"EndingWith", "LIKE %..."},
+			opSuggestion{"Like", "LIKE pattern"},
+			opSuggestion{"IgnoreCase", "ILIKE (case-insensitive)"},
+			opSuggestion{"NotContaining", "NOT LIKE"},
+			opSuggestion{"In", "IN (...)"},
+			opSuggestion{"NotIn", "NOT IN (...)"},
+		)
+	case "Int", "Float", "Decimal":
+		ops = append(ops,
+			opSuggestion{"GreaterThan", "> value"},
+			opSuggestion{"GreaterThanEqual", ">= value"},
+			opSuggestion{"LessThan", "< value"},
+			opSuggestion{"LessThanEqual", "<= value"},
+			opSuggestion{"Between", "BETWEEN from AND to"},
+			opSuggestion{"In", "IN (...)"},
+			opSuggestion{"NotIn", "NOT IN (...)"},
+			opSuggestion{"Not", "!= value"},
+		)
+	case "Boolean":
+		ops = append(ops,
+			opSuggestion{"True", "= true"},
+			opSuggestion{"False", "= false"},
+		)
+	case "DateTime":
+		ops = append(ops,
+			opSuggestion{"After", "> time"},
+			opSuggestion{"Before", "< time"},
+			opSuggestion{"Between", "BETWEEN from AND to"},
+			opSuggestion{"GreaterThan", "> time"},
+			opSuggestion{"LessThan", "< time"},
+		)
+	default:
+		// Enum or other: equality + In
+		ops = append(ops,
+			opSuggestion{"In", "IN (...)"},
+			opSuggestion{"NotIn", "NOT IN (...)"},
+			opSuggestion{"Not", "!= value"},
+		)
+	}
+
+	// Null check for nullable fields
+	if f.nullable {
+		ops = append(ops,
+			opSuggestion{"IsNull", "IS NULL"},
+			opSuggestion{"IsNotNull", "IS NOT NULL"},
+		)
+	}
+
+	return ops
 }
 
 // matchesPrefix checks if suggestion matches the typed prefix (case-insensitive).

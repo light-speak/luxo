@@ -45,7 +45,7 @@ func TestInferAPIBasic(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			inf := inferAPI(tt.name, models)
+			inf := InferAPI(tt.name, models)
 			if inf == nil {
 				t.Fatal("inferAPI returned nil")
 			}
@@ -94,7 +94,7 @@ func TestInferAPIOperators(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			inf := inferAPI(tt.name, models)
+			inf := InferAPI(tt.name, models)
 			if inf == nil {
 				t.Fatal("inferAPI returned nil")
 			}
@@ -150,7 +150,7 @@ func TestBuildInferredParamsBasic(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.apiName, func(t *testing.T) {
-			inf := inferAPI(tt.apiName, models)
+			inf := InferAPI(tt.apiName, models)
 			if inf == nil {
 				t.Fatal("inferAPI returned nil")
 			}
@@ -186,7 +186,7 @@ func TestBuildInferredParamsZeroParamOps(t *testing.T) {
 
 	for _, apiName := range tests {
 		t.Run(apiName, func(t *testing.T) {
-			inf := inferAPI(apiName, models)
+			inf := InferAPI(apiName, models)
 			if inf == nil {
 				t.Fatal("inferAPI returned nil")
 			}
@@ -264,7 +264,7 @@ func TestInferAPIWithOrderBy(t *testing.T) {
 			testField("createdAt", "DateTime"),
 		}),
 	)
-	inf := inferAPI("listUsersByNameOrderByCreatedAtDesc", models)
+	inf := InferAPI("listUsersByNameOrderByCreatedAtDesc", models)
 	if inf == nil {
 		t.Fatal("inferAPI returned nil")
 	}
@@ -282,7 +282,7 @@ func TestInferAPITopN(t *testing.T) {
 			testField("name", "String"),
 		}),
 	)
-	inf := inferAPI("listTop5UsersByName", models)
+	inf := InferAPI("listTop5UsersByName", models)
 	if inf == nil {
 		t.Fatal("inferAPI returned nil")
 	}
@@ -304,7 +304,7 @@ func TestInferAPIInvalidName(t *testing.T) {
 
 	for _, name := range tests {
 		t.Run(name, func(t *testing.T) {
-			inf := inferAPI(name, models)
+			inf := InferAPI(name, models)
 			if inf != nil {
 				t.Errorf("expected nil for %q, got %+v", name, inf)
 			}
@@ -914,7 +914,7 @@ func TestInferAPINoByClause(t *testing.T) {
 		}),
 	)
 	// "listUsers" has no "By" section — fieldsPart stays empty.
-	inf := inferAPI("listUsers", models)
+	inf := InferAPI("listUsers", models)
 	if inf == nil {
 		t.Fatal("inferAPI returned nil for listUsers")
 	}
@@ -937,7 +937,7 @@ func TestInferAPIInvalidOrderByField(t *testing.T) {
 		}),
 	)
 	// "ghost" is not a field on User → inferAPI returns nil.
-	inf := inferAPI("listUsersOrderByGhost", models)
+	inf := InferAPI("listUsersOrderByGhost", models)
 	if inf != nil {
 		t.Errorf("expected nil for unknown OrderBy field, got %+v", inf)
 	}
@@ -1069,7 +1069,7 @@ func TestBuildInferredParamsInNotInStringOps(t *testing.T) {
 	models := inferModels(m)
 
 	t.Run("in — array param", func(t *testing.T) {
-		inf := inferAPI("listPostsByIdIn", models)
+		inf := InferAPI("listPostsByIdIn", models)
 		if inf == nil {
 			t.Fatal("inferAPI returned nil")
 		}
@@ -1086,7 +1086,7 @@ func TestBuildInferredParamsInNotInStringOps(t *testing.T) {
 	})
 
 	t.Run("notIn — array param", func(t *testing.T) {
-		inf := inferAPI("listPostsByIdNotIn", models)
+		inf := InferAPI("listPostsByIdNotIn", models)
 		if inf == nil {
 			t.Fatal("inferAPI returned nil")
 		}
@@ -1109,7 +1109,7 @@ func TestBuildInferredParamsNotContainingStartEnd(t *testing.T) {
 	models := inferModels(m)
 
 	t.Run("notContaining", func(t *testing.T) {
-		inf := inferAPI("listPostsByTitleNotContaining", models)
+		inf := InferAPI("listPostsByTitleNotContaining", models)
 		if inf == nil {
 			t.Fatal("inferAPI returned nil")
 		}
@@ -1123,7 +1123,7 @@ func TestBuildInferredParamsNotContainingStartEnd(t *testing.T) {
 	})
 
 	t.Run("startswith", func(t *testing.T) {
-		inf := inferAPI("listPostsByTitleStartingWith", models)
+		inf := InferAPI("listPostsByTitleStartingWith", models)
 		if inf == nil {
 			t.Fatal("inferAPI returned nil")
 		}
@@ -1137,7 +1137,7 @@ func TestBuildInferredParamsNotContainingStartEnd(t *testing.T) {
 	})
 
 	t.Run("endswith", func(t *testing.T) {
-		inf := inferAPI("listPostsByTitleEndingWith", models)
+		inf := InferAPI("listPostsByTitleEndingWith", models)
 		if inf == nil {
 			t.Fatal("inferAPI returned nil")
 		}
@@ -1159,7 +1159,7 @@ func TestBuildInferredParamsStringPatternOps(t *testing.T) {
 	models := inferModels(m)
 
 	t.Run("like — String param", func(t *testing.T) {
-		inf := inferAPI("listPostsByTitleLike", models)
+		inf := InferAPI("listPostsByTitleLike", models)
 		if inf == nil {
 			t.Fatal("inferAPI returned nil")
 		}
@@ -1173,7 +1173,7 @@ func TestBuildInferredParamsStringPatternOps(t *testing.T) {
 	})
 
 	t.Run("ignoreCase — String param", func(t *testing.T) {
-		inf := inferAPI("listPostsByTitleIgnoreCase", models)
+		inf := InferAPI("listPostsByTitleIgnoreCase", models)
 		if inf == nil {
 			t.Fatal("inferAPI returned nil")
 		}

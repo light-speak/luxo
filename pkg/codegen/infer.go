@@ -33,9 +33,9 @@ type InferClause struct {
 	Op    string // "eq", "containing", "gt", "lt", "gte", "lte", "between", "isNull", "isNotNull", "true", "false"
 }
 
-// inferAPI tries to parse an API name into a structured query.
+// InferAPI tries to parse an API name into a structured query.
 // Returns nil if the name doesn't match any known pattern.
-func inferAPI(name string, models map[string]*ast.ModelDecl) *InferredAPI {
+func InferAPI(name string, models map[string]*ast.ModelDecl) *InferredAPI {
 	result := &InferredAPI{}
 
 	rest := extractActionPrefix(name, result)

@@ -190,9 +190,8 @@ model Post { title: String }`
 }
 
 func TestErrorRecoveryIncompleteDecl(t *testing.T) {
-	// Incomplete "api test" (no params, return type, or body) followed by
-	// valid declarations. The parser should report the error for the
-	// incomplete api but still parse the subsequent model and enum.
+	// "api test" with no params or return type is now valid (inferred API).
+	// All declarations should parse without error.
 	input := `
 api test
 
@@ -210,14 +209,17 @@ enum Status {
 	p := New(tokens)
 	file, errs := p.Parse("test.luxo")
 
-	if len(errs) == 0 {
-		t.Error("expected parse errors for incomplete api declaration")
+	if len(errs) != 0 {
+		t.Errorf("expected no parse errors for bare api declaration, got %v", errs)
+	}
+	if len(file.APIs) != 1 {
+		t.Errorf("expected 1 api, got %d", len(file.APIs))
 	}
 	if len(file.Models) != 1 {
-		t.Errorf("expected 1 model after recovery, got %d", len(file.Models))
+		t.Errorf("expected 1 model, got %d", len(file.Models))
 	}
 	if len(file.Enums) != 1 {
-		t.Errorf("expected 1 enum after recovery, got %d", len(file.Enums))
+		t.Errorf("expected 1 enum, got %d", len(file.Enums))
 	}
 }
 

@@ -86,7 +86,7 @@ func generateCRUDHandlers(b *strings.Builder, models []*ast.ModelDecl, enums map
 func generateInferredHandlers(b *strings.Builder, apis []*ast.ApiDecl, modelMap map[string]*ast.ModelDecl, enums map[string]bool) []string {
 	var names []string
 	for _, api := range apis {
-		inf := inferAPI(api.Name, modelMap)
+		inf := InferAPI(api.Name, modelMap)
 		if inf != nil {
 			if errMsg := ValidateInferredReturnType(api, inf); errMsg != "" {
 				fmt.Fprintf(os.Stderr, "warning: %s:%d: %s\n", api.Pos.File, api.Pos.Line, errMsg)

@@ -304,8 +304,8 @@ func TestCompileElvisExprStandalone(t *testing.T) {
 
 func TestCompileExprUnknownType(t *testing.T) {
 	c := newCompiler(nil)
-	// Use a type not handled by the switch
-	got := c.compileExpr(&ast.ListExpr{Items: nil})
+	// Use a type not handled by the switch (YieldExpr is not compiled)
+	got := c.compileExpr(&ast.YieldExpr{})
 	if !strings.Contains(got, "/* TODO:") {
 		t.Fatalf("expected TODO fallback, got %q", got)
 	}
@@ -1128,8 +1128,8 @@ func TestCompileStmtEmitNoArgs(t *testing.T) {
 
 func TestCompileStmtUnknown(t *testing.T) {
 	c := newCompiler(nil)
-	// BreakStmt is not handled in the switch → hits default
-	c.compileStmt(&ast.BreakStmt{})
+	// OnDecl is not handled in the switch → hits default
+	c.compileStmt(&ast.OnDecl{})
 	out := compilerOut(c)
 	if !strings.Contains(out, "// TODO: unsupported statement") {
 		t.Fatalf("expected TODO fallback, got %q", out)
@@ -1620,5 +1620,264 @@ func TestResolveQueryTypeNonModel(t *testing.T) {
 	vt := c.resolveQueryType(&ast.Ident{Name: "x"})
 	if vt.isModel || vt.name != "" {
 		t.Errorf("resolveQueryType(non-model) = %+v", vt)
+	}
+}
+
+// --- Phase 2 compiler tests ---
+
+func TestCompileFor(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.ForStmt{
+		VarName:    "item",
+		Collection: &ast.Ident{Name: "items"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.CallExpr{
+				Func: &ast.Ident{Name: "process"},
+				Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "item"}}},
+			}},
+		}},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "for _, item := range items {") {
+		t.Fatalf("missing for range, got %q", out)
+	}
+	if !strings.Contains(out, "process(item)") {
+		t.Fatalf("missing body, got %q", out)
+	}
+}
+
+func TestCompileAssign(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.AssignStmt{
+		Target: &ast.Ident{Name: "count"},
+		Op:     "+=",
+		Value:  &ast.Literal{Kind: token.Int, Value: "1"},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "count += 1") {
+		t.Fatalf("missing assign, got %q", out)
+	}
+}
+
+func TestCompileBreakContinue(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.BreakStmt{})
+	c.compileStmt(&ast.ContinueStmt{})
+	out := compilerOut(c)
+	if !strings.Contains(out, "break") || !strings.Contains(out, "continue") {
+		t.Fatalf("missing break/continue, got %q", out)
+	}
+}
+
+func TestCompileList(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.ListExpr{Items: []ast.Expr{
+		&ast.Literal{Kind: token.Int, Value: "1"},
+		&ast.Literal{Kind: token.Int, Value: "2"},
+	}})
+	if got != "[]any{1, 2}" {
+		t.Fatalf("expected []any{1, 2}, got %q", got)
+	}
+}
+
+func TestCompileListEmpty(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.ListExpr{Items: nil})
+	if got != "[]any{}" {
+		t.Fatalf("expected []any{}, got %q", got)
+	}
+}
+
+func TestCompileTemplate(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.TemplateString{Parts: []ast.Expr{
+		&ast.Literal{Kind: token.String, Value: "hello "},
+		&ast.Ident{Name: "name"},
+		&ast.Literal{Kind: token.String, Value: "!"},
+	}})
+	if !strings.Contains(got, `"hello "`) && !strings.Contains(got, "fmt.Sprint(name)") {
+		t.Fatalf("unexpected template output: %q", got)
+	}
+}
+
+func TestCompileRange(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.RangeExpr{
+		Start: &ast.Literal{Kind: token.Int, Value: "1"},
+		End:   &ast.Literal{Kind: token.Int, Value: "10"},
+	})
+	if got != "luxRange(1, 10)" {
+		t.Fatalf("expected luxRange(1, 10), got %q", got)
+	}
+}
+
+func TestCompileObject(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.ObjectExpr{Fields: []*ast.NamedArg{
+		{Name: "name", Value: &ast.Literal{Kind: token.String, Value: "lin"}},
+		{Name: "age", Value: &ast.Literal{Kind: token.Int, Value: "18"}},
+	}})
+	if !strings.Contains(got, "Name:") || !strings.Contains(got, "Age:") {
+		t.Fatalf("missing field names, got %q", got)
+	}
+}
+
+func TestCompileWhenWithSubject(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.WhenExpr{
+		Subject: &ast.Ident{Name: "role"},
+		Branches: []*ast.WhenBranch{
+			{Condition: &ast.Literal{Kind: token.String, Value: "ADMIN"}, Body: &ast.Literal{Kind: token.True}},
+		},
+		Else: &ast.Literal{Kind: token.False},
+	})
+	if !strings.Contains(got, "switch role") {
+		t.Fatalf("missing switch, got %q", got)
+	}
+	if !strings.Contains(got, "default:") {
+		t.Fatalf("missing else/default, got %q", got)
+	}
+}
+
+func TestCompileWhenWithoutSubject(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.WhenExpr{
+		Branches: []*ast.WhenBranch{
+			{Condition: &ast.BinaryExpr{Left: &ast.Ident{Name: "x"}, Op: ">", Right: &ast.Literal{Kind: token.Int, Value: "0"}},
+				Body: &ast.Literal{Kind: token.String, Value: "positive"}},
+		},
+	})
+	if !strings.Contains(got, "switch {") {
+		t.Fatalf("missing switch {, got %q", got)
+	}
+}
+
+func TestCompileLambda(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.LambdaExpr{
+		Params: []string{"x"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ReturnStmt{Value: &ast.Ident{Name: "x"}},
+		}},
+	})
+	if !strings.Contains(got, "func(x any) any {") {
+		t.Fatalf("missing lambda signature, got %q", got)
+	}
+}
+
+func TestCompileLambdaImplicitIt(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.LambdaExpr{
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ReturnStmt{Value: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "price"}},
+		}},
+	})
+	if !strings.Contains(got, "func(it any) any {") {
+		t.Fatalf("missing implicit it, got %q", got)
+	}
+}
+
+func TestCompileTransaction(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.TransactionExpr{
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.Ident{Name: "doSomething"}},
+		}},
+	})
+	if !strings.Contains(got, "app.DB.Tx(ctx, func(ctx context.Context) error {") {
+		t.Fatalf("missing Tx wrapper, got %q", got)
+	}
+	if !strings.Contains(got, "return nil") {
+		t.Fatalf("missing return nil, got %q", got)
+	}
+}
+
+func TestCompileModelUpdate(t *testing.T) {
+	models := map[string]*ast.ModelDecl{"User": {Name: "User"}}
+	c := newCompiler(models)
+	got := c.compileExpr(&ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+				Args: []*ast.NamedArg{},
+			},
+			Field: "update",
+		},
+		Args: []*ast.NamedArg{
+			{Name: "name", Value: &ast.Literal{Kind: token.String, Value: "new"}},
+		},
+	})
+	if !strings.Contains(got, ".Update(ctx,") {
+		t.Fatalf("missing .Update(ctx, ...), got %q", got)
+	}
+	if !strings.Contains(got, `lux.SetField{Col: "name"`) {
+		t.Fatalf("missing SetField, got %q", got)
+	}
+}
+
+func TestCompileModelDelete(t *testing.T) {
+	models := map[string]*ast.ModelDecl{"User": {Name: "User"}}
+	c := newCompiler(models)
+	got := c.compileExpr(&ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+				Args: []*ast.NamedArg{},
+			},
+			Field: "delete",
+		},
+		Args: []*ast.NamedArg{},
+	})
+	if !strings.Contains(got, ".Delete(ctx)") {
+		t.Fatalf("missing .Delete(ctx), got %q", got)
+	}
+}
+
+func TestCompileModelCount(t *testing.T) {
+	models := map[string]*ast.ModelDecl{"User": {Name: "User"}}
+	c := newCompiler(models)
+	got := c.compileExpr(&ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+				Args: []*ast.NamedArg{},
+			},
+			Field: "count",
+		},
+		Args: []*ast.NamedArg{},
+	})
+	if !strings.Contains(got, ".Count(ctx)") {
+		t.Fatalf("missing .Count(ctx), got %q", got)
+	}
+}
+
+func TestResolveQueryTypeUpdateDeleteCount(t *testing.T) {
+	models := map[string]*ast.ModelDecl{"User": {Name: "User"}}
+	c := newCompiler(models)
+
+	mkChain := func(method string) ast.Expr {
+		return &ast.CallExpr{
+			Func: &ast.MemberExpr{
+				Object: &ast.CallExpr{
+					Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+					Args: []*ast.NamedArg{},
+				},
+				Field: method,
+			},
+			Args: []*ast.NamedArg{},
+		}
+	}
+
+	vt := c.resolveQueryType(mkChain("update"))
+	if vt.name != "Int" {
+		t.Errorf("update type = %q, want Int", vt.name)
+	}
+	vt = c.resolveQueryType(mkChain("delete"))
+	if vt.name != "Int" {
+		t.Errorf("delete type = %q, want Int", vt.name)
+	}
+	vt = c.resolveQueryType(mkChain("count"))
+	if vt.name != "Int" {
+		t.Errorf("count type = %q, want Int", vt.name)
 	}
 }
