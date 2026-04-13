@@ -433,3 +433,493 @@ func TestParseInt64(t *testing.T) {
 		}
 	}
 }
+
+// --- FloatField ---
+
+func TestFloatFieldIsNullIsNotNull(t *testing.T) {
+	t.Run("is null", func(t *testing.T) {
+		sql, args := NewFloatField("score").IsNull().ToSQL(1)
+		if sql != "score IS NULL" {
+			t.Errorf("SQL = %q", sql)
+		}
+		if len(args) != 0 {
+			t.Errorf("args should be empty")
+		}
+	})
+	t.Run("is not null", func(t *testing.T) {
+		sql, args := NewFloatField("score").IsNotNull().ToSQL(1)
+		if sql != "score IS NOT NULL" {
+			t.Errorf("SQL = %q", sql)
+		}
+		if len(args) != 0 {
+			t.Errorf("args should be empty")
+		}
+	})
+}
+
+func TestFloatFieldIn(t *testing.T) {
+	sql, args := NewFloatField("score").In(1.1, 2.2, 3.3).ToSQL(1)
+	if sql != "score IN ($1, $2, $3)" {
+		t.Errorf("SQL = %q", sql)
+	}
+	if len(args) != 3 {
+		t.Errorf("args len = %d, want 3", len(args))
+	}
+	if args[0] != 1.1 || args[1] != 2.2 || args[2] != 3.3 {
+		t.Errorf("args = %v", args)
+	}
+}
+
+func TestFloatFieldNotIn(t *testing.T) {
+	sql, args := NewFloatField("score").NotIn(9.9, 8.8).ToSQL(2)
+	if sql != "score NOT IN ($2, $3)" {
+		t.Errorf("SQL = %q", sql)
+	}
+	if len(args) != 2 {
+		t.Errorf("args len = %d, want 2", len(args))
+	}
+}
+
+func TestFloatFieldFilterOp(t *testing.T) {
+	f := NewFloatField("price")
+	tests := []struct {
+		op, val, wantSQL string
+	}{
+		{"eq", "9.99", "price = $1"},
+		{"ne", "9.99", "price != $1"},
+		{"gt", "5.0", "price > $1"},
+		{"gte", "5.0", "price >= $1"},
+		{"lt", "100.0", "price < $1"},
+		{"lte", "100.0", "price <= $1"},
+		{"unknown", "1.0", "price = $1"},
+	}
+	for _, tt := range tests {
+		sql, _ := f.FilterOp(tt.op, tt.val).ToSQL(1)
+		if sql != tt.wantSQL {
+			t.Errorf("FloatField.FilterOp(%q, %q) = %q, want %q", tt.op, tt.val, sql, tt.wantSQL)
+		}
+	}
+}
+
+func TestFloatFieldFilterOpParseError(t *testing.T) {
+	sql, args := NewFloatField("price").FilterOp("eq", "not-a-float").ToSQL(1)
+	if sql != "FALSE" {
+		t.Errorf("SQL = %q, want FALSE", sql)
+	}
+	if len(args) != 0 {
+		t.Errorf("args should be nil for false cond")
+	}
+}
+
+// --- DecimalField ---
+
+func TestDecimalFieldIn(t *testing.T) {
+	a := decimal.NewFromFloat(1.0)
+	b := decimal.NewFromFloat(2.0)
+	sql, args := NewDecimalField("amount").In(a, b).ToSQL(1)
+	if sql != "amount IN ($1, $2)" {
+		t.Errorf("SQL = %q", sql)
+	}
+	if len(args) != 2 {
+		t.Errorf("args len = %d, want 2", len(args))
+	}
+}
+
+func TestDecimalFieldNotIn(t *testing.T) {
+	a := decimal.NewFromFloat(5.0)
+	b := decimal.NewFromFloat(10.0)
+	sql, args := NewDecimalField("amount").NotIn(a, b).ToSQL(1)
+	if sql != "amount NOT IN ($1, $2)" {
+		t.Errorf("SQL = %q", sql)
+	}
+	if len(args) != 2 {
+		t.Errorf("args len = %d, want 2", len(args))
+	}
+}
+
+func TestDecimalFieldIsNullIsNotNull(t *testing.T) {
+	t.Run("is null", func(t *testing.T) {
+		sql, args := NewDecimalField("amount").IsNull().ToSQL(1)
+		if sql != "amount IS NULL" {
+			t.Errorf("SQL = %q", sql)
+		}
+		if len(args) != 0 {
+			t.Errorf("args should be empty")
+		}
+	})
+	t.Run("is not null", func(t *testing.T) {
+		sql, args := NewDecimalField("amount").IsNotNull().ToSQL(1)
+		if sql != "amount IS NOT NULL" {
+			t.Errorf("SQL = %q", sql)
+		}
+		if len(args) != 0 {
+			t.Errorf("args should be empty")
+		}
+	})
+}
+
+// --- UUIDField ---
+
+func TestUUIDFieldNotIn(t *testing.T) {
+	id1 := uuid.MustParse("550e8400-e29b-41d4-a716-446655440000")
+	id2 := uuid.MustParse("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+	sql, args := NewUUIDField("id").NotIn(id1, id2).ToSQL(1)
+	if sql != "id NOT IN ($1, $2)" {
+		t.Errorf("SQL = %q", sql)
+	}
+	if len(args) != 2 {
+		t.Errorf("args len = %d, want 2", len(args))
+	}
+}
+
+func TestUUIDFieldIsNullIsNotNull(t *testing.T) {
+	t.Run("is null", func(t *testing.T) {
+		sql, args := NewUUIDField("user_id").IsNull().ToSQL(1)
+		if sql != "user_id IS NULL" {
+			t.Errorf("SQL = %q", sql)
+		}
+		if len(args) != 0 {
+			t.Errorf("args should be empty")
+		}
+	})
+	t.Run("is not null", func(t *testing.T) {
+		sql, args := NewUUIDField("user_id").IsNotNull().ToSQL(1)
+		if sql != "user_id IS NOT NULL" {
+			t.Errorf("SQL = %q", sql)
+		}
+		if len(args) != 0 {
+			t.Errorf("args should be empty")
+		}
+	})
+}
+
+// --- IntField ---
+
+func TestIntFieldIsNullIsNotNull(t *testing.T) {
+	t.Run("is null", func(t *testing.T) {
+		sql, args := NewIntField("count").IsNull().ToSQL(1)
+		if sql != "count IS NULL" {
+			t.Errorf("SQL = %q", sql)
+		}
+		if len(args) != 0 {
+			t.Errorf("args should be empty")
+		}
+	})
+	t.Run("is not null", func(t *testing.T) {
+		sql, args := NewIntField("count").IsNotNull().ToSQL(1)
+		if sql != "count IS NOT NULL" {
+			t.Errorf("SQL = %q", sql)
+		}
+		if len(args) != 0 {
+			t.Errorf("args should be empty")
+		}
+	})
+}
+
+func TestIntFieldNotIn(t *testing.T) {
+	sql, args := NewIntField("id").NotIn(10, 20, 30).ToSQL(1)
+	if sql != "id NOT IN ($1, $2, $3)" {
+		t.Errorf("SQL = %q", sql)
+	}
+	if len(args) != 3 {
+		t.Errorf("args len = %d, want 3", len(args))
+	}
+	if args[0] != int64(10) || args[1] != int64(20) || args[2] != int64(30) {
+		t.Errorf("args = %v", args)
+	}
+}
+
+func TestIntFieldFilterOpParseError(t *testing.T) {
+	sql, args := NewIntField("age").FilterOp("eq", "not-a-number").ToSQL(1)
+	if sql != "FALSE" {
+		t.Errorf("SQL = %q, want FALSE", sql)
+	}
+	if len(args) != 0 {
+		t.Errorf("args should be nil for false cond")
+	}
+}
+
+// --- StringField ---
+
+func TestStringFieldNotLike(t *testing.T) {
+	sql, args := NewStringField("name").NotLike("%test%").ToSQL(1)
+	if sql != "name NOT LIKE $1" {
+		t.Errorf("SQL = %q", sql)
+	}
+	if args[0] != "%test%" {
+		t.Errorf("args[0] = %v", args[0])
+	}
+}
+
+func TestStringFieldILike(t *testing.T) {
+	sql, args := NewStringField("name").ILike("%Test%").ToSQL(1)
+	if sql != "name ILIKE $1" {
+		t.Errorf("SQL = %q", sql)
+	}
+	if args[0] != "%Test%" {
+		t.Errorf("args[0] = %v", args[0])
+	}
+}
+
+func TestStringFieldNotIn(t *testing.T) {
+	sql, args := NewStringField("status").NotIn("deleted", "banned").ToSQL(3)
+	if sql != "status NOT IN ($3, $4)" {
+		t.Errorf("SQL = %q", sql)
+	}
+	if len(args) != 2 {
+		t.Errorf("args len = %d, want 2", len(args))
+	}
+	if args[0] != "deleted" || args[1] != "banned" {
+		t.Errorf("args = %v", args)
+	}
+}
+
+func TestStringFieldIsNullIsNotNull(t *testing.T) {
+	t.Run("is null", func(t *testing.T) {
+		sql, args := NewStringField("bio").IsNull().ToSQL(1)
+		if sql != "bio IS NULL" {
+			t.Errorf("SQL = %q", sql)
+		}
+		if len(args) != 0 {
+			t.Errorf("args should be empty")
+		}
+	})
+	t.Run("is not null", func(t *testing.T) {
+		sql, args := NewStringField("bio").IsNotNull().ToSQL(1)
+		if sql != "bio IS NOT NULL" {
+			t.Errorf("SQL = %q", sql)
+		}
+		if len(args) != 0 {
+			t.Errorf("args should be empty")
+		}
+	})
+}
+
+func TestStringFieldFilterOpEscapeLike(t *testing.T) {
+	f := NewStringField("title")
+	// Special chars in LIKE values must be escaped
+	_, args := f.FilterOp("contains", "100%off").ToSQL(1)
+	if args[0] != "%100\\%off%" {
+		t.Errorf("contains escaped = %q, want %%100\\%%off%%", args[0])
+	}
+	_, args = f.FilterOp("startswith", "under_score").ToSQL(1)
+	if args[0] != "under\\_score%" {
+		t.Errorf("startswith escaped = %q, want under\\_score%%", args[0])
+	}
+	_, args = f.FilterOp("endswith", "50%").ToSQL(1)
+	if args[0] != "%50\\%" {
+		t.Errorf("endswith escaped = %q, want %%50\\%%", args[0])
+	}
+}
+
+// --- TimeField ---
+
+func TestTimeFieldFilterOpParseError(t *testing.T) {
+	sql, args := NewTimeField("created_at").FilterOp("eq", "not-a-time").ToSQL(1)
+	if sql != "FALSE" {
+		t.Errorf("SQL = %q, want FALSE", sql)
+	}
+	if len(args) != 0 {
+		t.Errorf("args should be nil for false cond")
+	}
+}
+
+// --- BoolField ---
+
+func TestBoolFieldFilterOpNe(t *testing.T) {
+	f := NewBoolField("active")
+	// "ne" with true value → eq(!true) = false
+	sql, args := f.FilterOp("ne", "true").ToSQL(1)
+	if sql != "active = $1" {
+		t.Errorf("SQL = %q, want active = $1", sql)
+	}
+	if args[0] != false {
+		t.Errorf("args[0] = %v, want false", args[0])
+	}
+	// "ne" with false value → eq(!false) = true
+	sql, args = f.FilterOp("ne", "false").ToSQL(1)
+	if sql != "active = $1" {
+		t.Errorf("SQL = %q, want active = $1", sql)
+	}
+	if args[0] != true {
+		t.Errorf("args[0] = %v, want true", args[0])
+	}
+	// "ne" with "1" → eq(!true) = false
+	sql, args = f.FilterOp("ne", "1").ToSQL(1)
+	if args[0] != false {
+		t.Errorf("ne '1' args[0] = %v, want false", args[0])
+	}
+}
+
+// --- falseCond ---
+
+func TestFalseCondToSQL(t *testing.T) {
+	var c falseCond
+	sql, args := c.ToSQL(1)
+	if sql != "FALSE" {
+		t.Errorf("SQL = %q, want FALSE", sql)
+	}
+	if len(args) != 0 {
+		t.Errorf("args should be nil")
+	}
+	// Also test via FilterOp parse-error paths
+	sql, _ = NewIntField("x").FilterOp("eq", "bad").ToSQL(5)
+	if sql != "FALSE" {
+		t.Errorf("IntField parse error: SQL = %q, want FALSE", sql)
+	}
+	sql, _ = NewFloatField("x").FilterOp("eq", "bad").ToSQL(5)
+	if sql != "FALSE" {
+		t.Errorf("FloatField parse error: SQL = %q, want FALSE", sql)
+	}
+	sql, _ = NewTimeField("x").FilterOp("eq", "bad").ToSQL(5)
+	if sql != "FALSE" {
+		t.Errorf("TimeField parse error: SQL = %q, want FALSE", sql)
+	}
+}
+
+// --- EscapeLike ---
+
+func TestEscapeLike(t *testing.T) {
+	tests := []struct {
+		input, want string
+	}{
+		{"hello", "hello"},
+		{"100%", "100\\%"},
+		{"under_score", "under\\_score"},
+		{"%_both_%", "\\%\\_both\\_\\%"},
+		{"", ""},
+		{"no special chars", "no special chars"},
+	}
+	for _, tt := range tests {
+		got := EscapeLike(tt.input)
+		if got != tt.want {
+			t.Errorf("EscapeLike(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+// --- notInCond ---
+
+func TestNotInCondEmptyReturnsTrue(t *testing.T) {
+	// Empty NotIn → TRUE (match everything)
+	cond := NewIntField("id").NotIn()
+	sql, args := cond.ToSQL(1)
+	if sql != "TRUE" {
+		t.Errorf("SQL = %q, want TRUE", sql)
+	}
+	if len(args) != 0 {
+		t.Errorf("args should be nil")
+	}
+}
+
+func TestNotInCondNonEmpty(t *testing.T) {
+	cond := NewStringField("role").NotIn("admin", "superuser")
+	sql, args := cond.ToSQL(1)
+	if sql != "role NOT IN ($1, $2)" {
+		t.Errorf("SQL = %q", sql)
+	}
+	if len(args) != 2 {
+		t.Errorf("args len = %d, want 2", len(args))
+	}
+}
+
+// --- inCond empty case ---
+
+func TestInCondEmptyReturnsFalse(t *testing.T) {
+	cond := NewIntField("id").In()
+	sql, args := cond.ToSQL(1)
+	if sql != "FALSE" {
+		t.Errorf("SQL = %q, want FALSE", sql)
+	}
+	if len(args) != 0 {
+		t.Errorf("args should be nil")
+	}
+}
+
+// --- betweenCond with argOffset > 1 ---
+
+func TestBetweenCondArgOffset(t *testing.T) {
+	sql, args := NewIntField("age").Between(18, 65).ToSQL(5)
+	if sql != "age BETWEEN $5 AND $6" {
+		t.Errorf("SQL = %q", sql)
+	}
+	if len(args) != 2 || args[0] != int64(18) || args[1] != int64(65) {
+		t.Errorf("args = %v", args)
+	}
+}
+
+// --- cmpCond argOffset edge ---
+
+func TestCmpCondArgOffsetLarge(t *testing.T) {
+	sql, args := NewIntField("id").Eq(42).ToSQL(10)
+	if sql != "id = $10" {
+		t.Errorf("SQL = %q, want id = $10", sql)
+	}
+	if args[0] != int64(42) {
+		t.Errorf("args[0] = %v", args[0])
+	}
+}
+
+// --- RawCondition / rawCond.ToSQL ---
+
+func TestRawConditionBasic(t *testing.T) {
+	cond := RawCondition("id = $1 AND role = $2", int64(7), "admin")
+	sql, args := cond.ToSQL(1)
+	if sql != "(id = $1 AND role = $2)" {
+		t.Errorf("SQL = %q", sql)
+	}
+	if len(args) != 2 || args[0] != int64(7) || args[1] != "admin" {
+		t.Errorf("args = %v", args)
+	}
+}
+
+func TestRawConditionArgRebase(t *testing.T) {
+	// When used at argOffset=3, $1/$2 should become $3/$4
+	cond := RawCondition("a = $1 AND b = $2", "x", "y")
+	sql, args := cond.ToSQL(3)
+	if sql != "(a = $3 AND b = $4)" {
+		t.Errorf("SQL = %q, want (a = $3 AND b = $4)", sql)
+	}
+	if len(args) != 2 || args[0] != "x" || args[1] != "y" {
+		t.Errorf("args = %v", args)
+	}
+}
+
+func TestRawConditionMultiDigitPlaceholders(t *testing.T) {
+	// $10 should not be mis-parsed as $1 followed by "0"
+	cond := RawCondition("x IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)", 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+	sql, _ := cond.ToSQL(1)
+	want := "(x IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10))"
+	if sql != want {
+		t.Errorf("SQL = %q, want %q", sql, want)
+	}
+}
+
+func TestRawConditionMultiDigitRebase(t *testing.T) {
+	cond := RawCondition("a = $1 AND b = $10", "v1", "v2")
+	sql, _ := cond.ToSQL(5)
+	// $1→$5, $10→$14
+	if sql != "(a = $5 AND b = $14)" {
+		t.Errorf("SQL = %q, want (a = $5 AND b = $14)", sql)
+	}
+}
+
+func TestRawConditionNoPlaceholders(t *testing.T) {
+	cond := RawCondition("1=1")
+	sql, args := cond.ToSQL(1)
+	if sql != "(1=1)" {
+		t.Errorf("SQL = %q, want (1=1)", sql)
+	}
+	if len(args) != 0 {
+		t.Errorf("args should be empty")
+	}
+}
+
+func TestRawConditionDollarAtEnd(t *testing.T) {
+	// A trailing $ with no digit after it — must not panic
+	cond := RawCondition("col LIKE 'foo$'")
+	sql, _ := cond.ToSQL(1)
+	if sql != "(col LIKE 'foo$')" {
+		t.Errorf("SQL = %q", sql)
+	}
+}

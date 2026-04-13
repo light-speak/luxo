@@ -185,3 +185,74 @@ func TestBuildSelectOffsetOnly(t *testing.T) {
 		t.Errorf("args len = %d", len(args))
 	}
 }
+
+// ===== BuildExistsSQL =====
+
+func TestBuildExistsSQLNoConditions(t *testing.T) {
+	sql, args := BuildExistsSQL("users", nil)
+	want := "SELECT EXISTS(SELECT 1 FROM users LIMIT 1)"
+	if sql != want {
+		t.Errorf("SQL = %q, want %q", sql, want)
+	}
+	if len(args) != 0 {
+		t.Errorf("args = %v, want empty", args)
+	}
+}
+
+func TestBuildExistsSQLWithCondition(t *testing.T) {
+	conds := []Condition{NewIntField("id").Eq(42)}
+	sql, args := BuildExistsSQL("users", conds)
+	want := "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 LIMIT 1)"
+	if sql != want {
+		t.Errorf("SQL = %q, want %q", sql, want)
+	}
+	if len(args) != 1 || args[0] != int64(42) {
+		t.Errorf("args = %v, want [42]", args)
+	}
+}
+
+func TestBuildExistsSQLWithMultipleConditions(t *testing.T) {
+	conds := []Condition{
+		NewStringField("role").Eq("ADMIN"),
+		NewBoolField("active").IsTrue(),
+	}
+	sql, args := BuildExistsSQL("users", conds)
+	want := "SELECT EXISTS(SELECT 1 FROM users WHERE role = $1 AND active = $2 LIMIT 1)"
+	if sql != want {
+		t.Errorf("SQL = %q, want %q", sql, want)
+	}
+	if len(args) != 2 {
+		t.Errorf("args len = %d, want 2", len(args))
+	}
+}
+
+// ===== BuildUpdateSQL — verify strconv.AppendInt path =====
+
+func TestBuildUpdateSQLNoConditions(t *testing.T) {
+	sets := []SetField{{Col: "name", Val: "bob"}}
+	sql, args := BuildUpdateSQL("users", sets, nil)
+	want := "UPDATE users SET name = $1"
+	if sql != want {
+		t.Errorf("SQL = %q, want %q", sql, want)
+	}
+	if len(args) != 1 || args[0] != "bob" {
+		t.Errorf("args = %v", args)
+	}
+}
+
+func TestBuildUpdateSQLManyFields(t *testing.T) {
+	sets := []SetField{
+		{Col: "a", Val: 1},
+		{Col: "b", Val: 2},
+		{Col: "c", Val: 3},
+	}
+	conds := []Condition{NewIntField("id").Eq(99)}
+	sql, args := BuildUpdateSQL("posts", sets, conds)
+	want := "UPDATE posts SET a = $1, b = $2, c = $3 WHERE id = $4"
+	if sql != want {
+		t.Errorf("SQL = %q, want %q", sql, want)
+	}
+	if len(args) != 4 {
+		t.Errorf("args len = %d, want 4", len(args))
+	}
+}

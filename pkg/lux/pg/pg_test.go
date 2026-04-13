@@ -2,12 +2,12 @@ package pg
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
-	"errors"
-
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/light-speak/luxo/pkg/lux"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 )
@@ -670,5 +670,36 @@ func TestQueryAllWithCount(t *testing.T) {
 	}
 	if total < 3 {
 		t.Errorf("total = %d, want >= 3", total)
+	}
+}
+
+// ===== pgxTracer unit tests (pure — no DB required) =====
+
+func TestTraceQueryEndMissingContextKey(t *testing.T) {
+	// TraceQueryEnd should return early without panic when the context
+	// does not contain the traceStartKey value (type assertion fails, ok=false).
+	tr := &pgxTracer{}
+	ctx := context.Background() // no traceStartData stored
+	// Must not panic.
+	tr.TraceQueryEnd(ctx, nil, pgx.TraceQueryEndData{})
+}
+
+func TestTraceQueryStartStoresData(t *testing.T) {
+	tr := &pgxTracer{}
+	ctx := context.Background()
+	startData := pgx.TraceQueryStartData{
+		SQL:  "SELECT 1",
+		Args: []any{42},
+	}
+	ctx2 := tr.TraceQueryStart(ctx, nil, startData)
+	sd, ok := ctx2.Value(traceStartKey{}).(traceStartData)
+	if !ok {
+		t.Fatal("expected traceStartData to be stored in context")
+	}
+	if sd.sql != "SELECT 1" {
+		t.Errorf("sql = %q, want SELECT 1", sd.sql)
+	}
+	if len(sd.args) != 1 || sd.args[0] != 42 {
+		t.Errorf("args = %v", sd.args)
 	}
 }

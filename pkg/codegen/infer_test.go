@@ -902,3 +902,426 @@ func TestGetFieldTypeRefRaw(t *testing.T) {
 		}
 	})
 }
+
+// --- Tests for previously uncovered branches ---
+
+// TestInferAPINoByClause covers the "no By keyword" path (modelPart = rest, fieldsPart = "").
+func TestInferAPINoByClause(t *testing.T) {
+	models := inferModels(
+		testModel("User", nil, []*ast.FieldDecl{
+			testField("id", "Int"),
+			testField("name", "String"),
+		}),
+	)
+	// "listUsers" has no "By" section — fieldsPart stays empty.
+	inf := inferAPI("listUsers", models)
+	if inf == nil {
+		t.Fatal("inferAPI returned nil for listUsers")
+	}
+	if inf.Action != "list" {
+		t.Errorf("action = %q, want list", inf.Action)
+	}
+	if inf.ModelName != "User" {
+		t.Errorf("model = %q, want User", inf.ModelName)
+	}
+	if len(inf.Groups) != 0 {
+		t.Errorf("groups = %d, want 0", len(inf.Groups))
+	}
+}
+
+// TestInferAPIInvalidOrderByField covers the "OrderBy field not in model" branch.
+func TestInferAPIInvalidOrderByField(t *testing.T) {
+	models := inferModels(
+		testModel("User", nil, []*ast.FieldDecl{
+			testField("name", "String"),
+		}),
+	)
+	// "ghost" is not a field on User → inferAPI returns nil.
+	inf := inferAPI("listUsersOrderByGhost", models)
+	if inf != nil {
+		t.Errorf("expected nil for unknown OrderBy field, got %+v", inf)
+	}
+}
+
+// TestWriteAndClauseInAndNotIn covers the "in" and "notIn" branches of writeAndClause.
+func TestWriteAndClauseInAndNotIn(t *testing.T) {
+	m := testModel("Post", nil, []*ast.FieldDecl{
+		testField("id", "Int"),
+	})
+	params := []*ast.ParamDecl{testParamDecl("ids", "Int")}
+
+	t.Run("in", func(t *testing.T) {
+		var b strings.Builder
+		writeAndClause(&b, InferClause{Field: "id", Op: "in"}, m, params, 0)
+		out := b.String()
+		if !strings.Contains(out, ".In(ids...)") {
+			t.Errorf("missing .In(ids...) for 'in' op:\n%s", out)
+		}
+	})
+
+	t.Run("notIn", func(t *testing.T) {
+		var b strings.Builder
+		writeAndClause(&b, InferClause{Field: "id", Op: "notIn"}, m, params, 0)
+		out := b.String()
+		if !strings.Contains(out, ".NotIn(ids...)") {
+			t.Errorf("missing .NotIn(ids...) for 'notIn' op:\n%s", out)
+		}
+	})
+}
+
+// TestWriteStringMatchClauseNotContainingNotLikeIgnoreCase covers the remaining
+// string-match ops not hit in existing tests.
+func TestWriteStringMatchClauseNotContainingNotLikeIgnoreCase(t *testing.T) {
+	cases := []struct {
+		op   string
+		want string
+	}{
+		{"notContaining", "NotLike"},
+		{"notLike", "NotLike"},
+		{"ignoreCase", "ILike"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.op, func(t *testing.T) {
+			var b strings.Builder
+			ok := writeStringMatchClause(&b, tc.op, "title", "kw")
+			if !ok {
+				t.Errorf("writeStringMatchClause(%q) returned false", tc.op)
+			}
+			out := b.String()
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("writeStringMatchClause(%q) missing %q:\n%s", tc.op, tc.want, out)
+			}
+		})
+	}
+}
+
+// TestWriteClauseSQLAllOps covers all writeClauseSQL branches that were not
+// exercised by TestWriteClauseSQL (notContaining, startswith, endswith, notLike,
+// ignoreCase, between, in, notIn).
+func TestWriteClauseSQLAllOps(t *testing.T) {
+	m := testModel("Post", nil, []*ast.FieldDecl{
+		testField("title", "String"),
+		testField("views", "Int"),
+	})
+	params := []*ast.ParamDecl{
+		testParamDecl("p0", "String"),
+		testParamDecl("p1", "Int"),
+	}
+
+	cases := []struct {
+		clause InferClause
+		want   string
+	}{
+		{InferClause{Field: "title", Op: "notContaining"}, "NOT LIKE"},
+		{InferClause{Field: "title", Op: "startswith"}, "LIKE"},
+		{InferClause{Field: "title", Op: "endswith"}, "LIKE"},
+		{InferClause{Field: "title", Op: "notLike"}, "NOT LIKE"},
+		{InferClause{Field: "title", Op: "ignoreCase"}, "ILIKE"},
+		{InferClause{Field: "views", Op: "between"}, "BETWEEN"},
+		{InferClause{Field: "views", Op: "in"}, "IN"},
+		{InferClause{Field: "views", Op: "notIn"}, "NOT IN"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.clause.Field+"_"+tc.clause.Op, func(t *testing.T) {
+			var b strings.Builder
+			writeClauseSQL(&b, tc.clause, m, params, 0)
+			out := b.String()
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("writeClauseSQL(%+v) missing %q:\n%s", tc.clause, tc.want, out)
+			}
+		})
+	}
+}
+
+// TestWriteClauseSQLSetDirect directly exercises writeClauseSQLSet.
+func TestWriteClauseSQLSetDirect(t *testing.T) {
+	t.Run("IN", func(t *testing.T) {
+		var b strings.Builder
+		writeClauseSQLSet(&b, "title", "IN", "titles")
+		out := b.String()
+		if !strings.Contains(out, "title IN") {
+			t.Errorf("missing IN clause:\n%s", out)
+		}
+		if !strings.Contains(out, "strings.Join") {
+			t.Errorf("missing strings.Join:\n%s", out)
+		}
+	})
+
+	t.Run("NOT IN", func(t *testing.T) {
+		var b strings.Builder
+		writeClauseSQLSet(&b, "id", "NOT IN", "ids")
+		out := b.String()
+		if !strings.Contains(out, "id NOT IN") {
+			t.Errorf("missing NOT IN clause:\n%s", out)
+		}
+	})
+}
+
+// TestBuildInferredParamsInNotInStringOps covers the "in", "notIn" and
+// various string-op branches of buildInferredParams.
+func TestBuildInferredParamsInNotInStringOps(t *testing.T) {
+	m := testModel("Post", nil, []*ast.FieldDecl{
+		testField("id", "Int"),
+		testField("title", "String"),
+		testField("views", "Int"),
+	})
+	models := inferModels(m)
+
+	t.Run("in — array param", func(t *testing.T) {
+		inf := inferAPI("listPostsByIdIn", models)
+		if inf == nil {
+			t.Fatal("inferAPI returned nil")
+		}
+		params := buildInferredParams(inf, m)
+		if len(params) != 1 {
+			t.Fatalf("params = %d, want 1", len(params))
+		}
+		if !params[0].Type.IsList {
+			t.Error("in param should be a list type")
+		}
+		if params[0].Name != "ids" {
+			t.Errorf("param name = %q, want ids", params[0].Name)
+		}
+	})
+
+	t.Run("notIn — array param", func(t *testing.T) {
+		inf := inferAPI("listPostsByIdNotIn", models)
+		if inf == nil {
+			t.Fatal("inferAPI returned nil")
+		}
+		params := buildInferredParams(inf, m)
+		if len(params) != 1 {
+			t.Fatalf("params = %d, want 1", len(params))
+		}
+		if !params[0].Type.IsList {
+			t.Error("notIn param should be a list type")
+		}
+	})
+
+}
+
+func TestBuildInferredParamsNotContainingStartEnd(t *testing.T) {
+	m := testModel("Post", nil, []*ast.FieldDecl{
+		testField("id", "Int"),
+		testField("title", "String"),
+	})
+	models := inferModels(m)
+
+	t.Run("notContaining", func(t *testing.T) {
+		inf := inferAPI("listPostsByTitleNotContaining", models)
+		if inf == nil {
+			t.Fatal("inferAPI returned nil")
+		}
+		params := buildInferredParams(inf, m)
+		if len(params) != 1 {
+			t.Fatalf("params = %d, want 1", len(params))
+		}
+		if params[0].Name != "keyword" {
+			t.Errorf("param name = %q, want keyword", params[0].Name)
+		}
+	})
+
+	t.Run("startswith", func(t *testing.T) {
+		inf := inferAPI("listPostsByTitleStartingWith", models)
+		if inf == nil {
+			t.Fatal("inferAPI returned nil")
+		}
+		params := buildInferredParams(inf, m)
+		if len(params) != 1 {
+			t.Fatalf("params = %d, want 1", len(params))
+		}
+		if params[0].Name != "titlePrefix" {
+			t.Errorf("param name = %q, want titlePrefix", params[0].Name)
+		}
+	})
+
+	t.Run("endswith", func(t *testing.T) {
+		inf := inferAPI("listPostsByTitleEndingWith", models)
+		if inf == nil {
+			t.Fatal("inferAPI returned nil")
+		}
+		params := buildInferredParams(inf, m)
+		if len(params) != 1 {
+			t.Fatalf("params = %d, want 1", len(params))
+		}
+		if params[0].Name != "titleSuffix" {
+			t.Errorf("param name = %q, want titleSuffix", params[0].Name)
+		}
+	})
+}
+
+func TestBuildInferredParamsStringPatternOps(t *testing.T) {
+	m := testModel("Post", nil, []*ast.FieldDecl{
+		testField("id", "Int"),
+		testField("title", "String"),
+	})
+	models := inferModels(m)
+
+	t.Run("like — String param", func(t *testing.T) {
+		inf := inferAPI("listPostsByTitleLike", models)
+		if inf == nil {
+			t.Fatal("inferAPI returned nil")
+		}
+		params := buildInferredParams(inf, m)
+		if len(params) != 1 {
+			t.Fatalf("params = %d, want 1", len(params))
+		}
+		if params[0].Type.Name != "String" {
+			t.Errorf("param type = %q, want String", params[0].Type.Name)
+		}
+	})
+
+	t.Run("ignoreCase — String param", func(t *testing.T) {
+		inf := inferAPI("listPostsByTitleIgnoreCase", models)
+		if inf == nil {
+			t.Fatal("inferAPI returned nil")
+		}
+		params := buildInferredParams(inf, m)
+		if len(params) != 1 {
+			t.Fatalf("params = %d, want 1", len(params))
+		}
+		if params[0].Type.Name != "String" {
+			t.Errorf("param type = %q, want String", params[0].Type.Name)
+		}
+	})
+}
+
+// TestSplitBySeparatorLowercaseAfterSep covers the else-break branch where
+// the separator is found in the middle but the character immediately after
+// is lowercase — the loop breaks without splitting.
+func TestSplitBySeparatorLowercaseAfterSep(t *testing.T) {
+	// "EmailOrphone" split by "Or": idx=5, char after "Or" is 'p' (lowercase)
+	// → else-break, no split occurs, whole string returned as one part.
+	parts := splitBySeparator("EmailOrphone", "Or")
+	if len(parts) != 1 {
+		t.Errorf("expected 1 part for lowercase-after-sep, got %d: %v", len(parts), parts)
+	}
+	if parts[0] != "EmailOrphone" {
+		t.Errorf("expected EmailOrphone, got %q", parts[0])
+	}
+}
+
+// TestInferParamNameNotInAndNotLike covers the "notIn" and other missing
+// inferParamName branches.
+func TestInferParamNameNotInAndNotLike(t *testing.T) {
+	cases := []struct {
+		clause InferClause
+		want   string
+	}{
+		{InferClause{Field: "id", Op: "notIn"}, "ids"},
+		{InferClause{Field: "name", Op: "notContaining"}, "keyword"},
+		{InferClause{Field: "score", Op: "gt"}, "score"}, // default
+	}
+	for _, tc := range cases {
+		got := inferParamName(tc.clause)
+		if got != tc.want {
+			t.Errorf("inferParamName(%+v) = %q, want %q", tc.clause, got, tc.want)
+		}
+	}
+}
+
+// TestGenerateInferredHandlerORGroupAllOps covers the OR-group path in writeClauseSQL
+// for zero-param, string-match, between, in, notIn, and default ops.
+func TestGenerateInferredHandlerORGroupAllOps(t *testing.T) {
+	m := testModel("Post", nil, []*ast.FieldDecl{
+		testField("title", "String"),
+		testField("views", "Int"),
+		testField("active", "Boolean"),
+		testField("deletedAt", "DateTime"),
+		testField("id", "Int"),
+	})
+
+	// Two groups forces the OR code path in writeInferredConditions → writeClauseSQL.
+	mkOR := func(c1, c2 InferClause, params []*ast.ParamDecl) string {
+		api := &ast.ApiDecl{Name: "test", Params: params}
+		inf := &InferredAPI{
+			Action:    "list",
+			ModelName: "Post",
+			Groups: []ClauseGroup{
+				{Clauses: []InferClause{c1}},
+				{Clauses: []InferClause{c2}},
+			},
+		}
+		var b strings.Builder
+		generateInferredHandler(&b, api, inf, map[string]bool{}, m)
+		return b.String()
+	}
+
+	t.Run("OR with zero-param true", func(t *testing.T) {
+		out := mkOR(
+			InferClause{Field: "active", Op: "true"},
+			InferClause{Field: "views", Op: "eq"},
+			[]*ast.ParamDecl{testParamDecl("views", "Int")},
+		)
+		if !strings.Contains(out, "active = true") {
+			t.Errorf("missing 'active = true' in OR group:\n%s", out)
+		}
+	})
+
+	t.Run("OR with zero-param isNull", func(t *testing.T) {
+		out := mkOR(
+			InferClause{Field: "deletedAt", Op: "isNull"},
+			InferClause{Field: "views", Op: "eq"},
+			[]*ast.ParamDecl{testParamDecl("views", "Int")},
+		)
+		if !strings.Contains(out, "IS NULL") {
+			t.Errorf("missing IS NULL in OR group:\n%s", out)
+		}
+	})
+
+	t.Run("OR with containing (string match)", func(t *testing.T) {
+		out := mkOR(
+			InferClause{Field: "title", Op: "containing"},
+			InferClause{Field: "views", Op: "eq"},
+			[]*ast.ParamDecl{testParamDecl("keyword", "String"), testParamDecl("views", "Int")},
+		)
+		if !strings.Contains(out, "LIKE") {
+			t.Errorf("missing LIKE in OR group:\n%s", out)
+		}
+	})
+
+	t.Run("OR with between", func(t *testing.T) {
+		out := mkOR(
+			InferClause{Field: "views", Op: "between"},
+			InferClause{Field: "id", Op: "eq"},
+			[]*ast.ParamDecl{testParamDecl("viewsFrom", "Int"), testParamDecl("viewsTo", "Int"), testParamDecl("id", "Int")},
+		)
+		if !strings.Contains(out, "BETWEEN") {
+			t.Errorf("missing BETWEEN in OR group:\n%s", out)
+		}
+	})
+
+	t.Run("OR with in", func(t *testing.T) {
+		out := mkOR(
+			InferClause{Field: "id", Op: "in"},
+			InferClause{Field: "views", Op: "eq"},
+			[]*ast.ParamDecl{testParamDecl("ids", "Int"), testParamDecl("views", "Int")},
+		)
+		if !strings.Contains(out, "IN") {
+			t.Errorf("missing IN in OR group:\n%s", out)
+		}
+	})
+
+	t.Run("OR with notIn", func(t *testing.T) {
+		out := mkOR(
+			InferClause{Field: "id", Op: "notIn"},
+			InferClause{Field: "views", Op: "eq"},
+			[]*ast.ParamDecl{testParamDecl("ids", "Int"), testParamDecl("views", "Int")},
+		)
+		if !strings.Contains(out, "NOT IN") {
+			t.Errorf("missing NOT IN in OR group:\n%s", out)
+		}
+	})
+
+	t.Run("OR with default eq", func(t *testing.T) {
+		out := mkOR(
+			InferClause{Field: "views", Op: "ne"},
+			InferClause{Field: "id", Op: "eq"},
+			[]*ast.ParamDecl{testParamDecl("views", "Int"), testParamDecl("id", "Int")},
+		)
+		if !strings.Contains(out, "!=") {
+			t.Errorf("missing != in OR group:\n%s", out)
+		}
+	})
+}
