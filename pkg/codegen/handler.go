@@ -248,7 +248,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		writeFKEnsure(b, rels)
 		fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(%sWhere.Id.Eq(id)).Select(cols...).First(ctx)\n", name, name)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		fmt.Fprintf(b, "\t\tif result == nil {\n\t\t\treturn errors.NotFound.WithData(map[string]any{\"resource\": %q, \"id\": id})\n\t\t}\n", name)
+		fmt.Fprintf(b, "\t\tif result == nil {\n\t\t\treturn errors.NotFound.WithData(errors.ResourceError{Resource: %q, ID: id})\n\t\t}\n", name)
 		if hasRels {
 			fmt.Fprintf(b, "\t\tif err := resolve%sRelations(ctx, app, result, req.Select); err != nil {\n", name)
 			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
@@ -305,7 +305,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 			fmt.Fprintf(b, "\t\tn, err := app.%s.Where(%sWhere.Id.Eq(id)).Delete(ctx)\n", name, name)
 		}
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		fmt.Fprintf(b, "\t\tif n == 0 {\n\t\t\treturn errors.NotFound.WithData(map[string]any{\"resource\": %q, \"id\": id})\n\t\t}\n", name)
+		fmt.Fprintf(b, "\t\tif n == 0 {\n\t\t\treturn errors.NotFound.WithData(errors.ResourceError{Resource: %q, ID: id})\n\t\t}\n", name)
 		fmt.Fprintf(b, "\t\treq.Buf.AppendString(`{\"deleted\":`)\n")
 		fmt.Fprintf(b, "\t\treq.Buf.AppendInt(n)\n")
 		fmt.Fprintf(b, "\t\treq.Buf.AppendByte('}')\n")
@@ -372,7 +372,7 @@ func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType
 	writeParamID(b, idType, "\t\t")
 	fmt.Fprintf(b, "\t\texisting, err := app.%s.Find(ctx, id)\n", name)
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-	fmt.Fprintf(b, "\t\tif existing == nil {\n\t\t\treturn errors.NotFound.WithData(map[string]any{\"resource\": %q, \"id\": id})\n\t\t}\n", name)
+	fmt.Fprintf(b, "\t\tif existing == nil {\n\t\t\treturn errors.NotFound.WithData(errors.ResourceError{Resource: %q, ID: id})\n\t\t}\n", name)
 	tableName := str.ToSnakeCase(name) + "s"
 	fmt.Fprintf(b, "\t\tbuilder := new%sUpdateBuilder(app.%s.db, %q, id)\n", name, name, tableName)
 

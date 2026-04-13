@@ -580,7 +580,18 @@ func (a *Analyzer) resolveApiTypes(file *ast.File) {
 			a.resolveTypeRef(p.Type, api.Pos)
 		}
 		a.checkDirectives(api.Directives, OnApi)
+		a.validateNativeReturnType(api)
 		a.validateScopeDirective(api)
+	}
+}
+
+// validateNativeReturnType checks that @native APIs declare a return type.
+func (a *Analyzer) validateNativeReturnType(api *ast.ApiDecl) {
+	for _, d := range api.Directives {
+		if d.Name == "native" && api.ReturnType == nil {
+			a.addError(api.Pos, "@native API must declare a return type")
+			return
+		}
 	}
 }
 

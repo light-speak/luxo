@@ -36,7 +36,7 @@ func TestAppErrorUnwrapNil(t *testing.T) {
 }
 
 func TestErrorsAs(t *testing.T) {
-	e := NotFound.WithData(map[string]any{"resource": "User"})
+	e := NotFound.WithData(ResourceError{Resource: "User"})
 	var wrapped error = e
 
 	var appErr *AppError
@@ -46,19 +46,21 @@ func TestErrorsAs(t *testing.T) {
 	if appErr.Code != 404 {
 		t.Errorf("code = %d, want 404", appErr.Code)
 	}
-	if appErr.Data["resource"] != "User" {
+	re, ok := appErr.Data.(ResourceError)
+	if !ok || re.Resource != "User" {
 		t.Error("data should contain resource")
 	}
 }
 
 func TestWithDataCopies(t *testing.T) {
 	original := NotFound
-	derived := original.WithData(map[string]any{"resource": "Post"})
+	derived := original.WithData(ResourceError{Resource: "Post"})
 
 	if original.Data != nil {
 		t.Error("original should not be modified")
 	}
-	if derived.Data["resource"] != "Post" {
+	re, ok := derived.Data.(ResourceError)
+	if !ok || re.Resource != "Post" {
 		t.Error("derived should have data")
 	}
 	if derived.Name != "NotFound" || derived.Code != 404 {
@@ -127,7 +129,7 @@ func TestBuiltinErrors(t *testing.T) {
 
 func TestErrorsAsChain(t *testing.T) {
 	// AppError wrapped in fmt.Errorf should still be extractable via errors.As
-	inner := NotFound.WithData(map[string]any{"resource": "Order"})
+	inner := NotFound.WithData(ResourceError{Resource: "Order"})
 	wrapped := fmt.Errorf("handler: %w", inner)
 
 	var appErr *AppError

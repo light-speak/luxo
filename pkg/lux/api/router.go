@@ -67,9 +67,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	fn, ok := rt.handlers[req.API]
 	if !ok {
-		rt.writeAppError(w, r, errors.NotFound.WithData(map[string]any{
-			"resource": req.API,
-		}))
+		rt.writeAppError(w, r, errors.NotFound.WithData(errors.ResourceError{Resource: req.API}))
 		return
 	}
 
@@ -116,7 +114,11 @@ func (rt *Router) writeAppError(w http.ResponseWriter, r *http.Request, err erro
 	message := appErr.Message
 	if rt.translator != nil && !appErr.Internal {
 		locale := i18n.ParseAcceptLanguage(r.Header.Get("Accept-Language"))
-		message = rt.translator.Translate(locale, appErr.Message, appErr.Data)
+		if dataMap, ok := appErr.Data.(map[string]any); ok {
+			message = rt.translator.Translate(locale, appErr.Message, dataMap)
+		} else {
+			message = rt.translator.Translate(locale, appErr.Message, nil)
+		}
 	}
 
 	buf := GetBuf()

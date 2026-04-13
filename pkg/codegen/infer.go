@@ -392,7 +392,7 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 			fmt.Fprintf(b, "\t\tn, err := app.%s.Where(conds...).Delete(ctx)\n", modelName)
 		}
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		fmt.Fprintf(b, "\t\tif n == 0 {\n\t\t\treturn errors.NotFound.WithData(map[string]any{\"resource\": %q})\n\t\t}\n", modelName)
+		fmt.Fprintf(b, "\t\tif n == 0 {\n\t\t\treturn errors.NotFound.WithData(errors.ResourceError{Resource: %q})\n\t\t}\n", modelName)
 		fmt.Fprintf(b, "\t\treq.Buf.AppendString(`{\"deleted\":`)\n")
 		fmt.Fprintf(b, "\t\treq.Buf.AppendInt(n)\n")
 		fmt.Fprintf(b, "\t\treq.Buf.AppendByte('}')\n")
@@ -431,7 +431,7 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 	default: // get
 		fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(conds...).Select(selection.SQLColumns(req.Select)...).First(ctx)\n", modelName)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		fmt.Fprintf(b, "\t\tif result == nil {\n\t\t\treturn errors.NotFound.WithData(map[string]any{\"resource\": %q})\n\t\t}\n", modelName)
+		fmt.Fprintf(b, "\t\tif result == nil {\n\t\t\treturn errors.NotFound.WithData(errors.ResourceError{Resource: %q})\n\t\t}\n", modelName)
 		fmt.Fprintf(b, "\t\tresult.WriteJSON(req.Buf, req.Select)\n")
 	}
 

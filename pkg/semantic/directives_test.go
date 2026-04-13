@@ -105,6 +105,23 @@ func TestDirectiveNativeOnApi(t *testing.T) {
 	expectNoErrors(t, result)
 }
 
+func TestDirectiveNativeOnApiNoReturnType(t *testing.T) {
+	// Construct AST directly since the parser enforces return type syntax.
+	// This covers override/extend scenarios where ReturnType might be nil.
+	file := &ast.File{
+		Name: "test.luxo",
+		APIs: []*ast.ApiDecl{{
+			Name:       "oauthLogin",
+			Pos:        token.Position{File: "test.luxo", Line: 1, Col: 1},
+			Directives: []*ast.Directive{{Name: "native", Pos: token.Position{File: "test.luxo", Line: 1, Col: 20}}},
+			ReturnType: nil,
+		}},
+	}
+	a := New()
+	result := a.Analyze([]*ast.File{file})
+	expectError(t, result, "@native API must declare a return type")
+}
+
 func TestDirectiveCorrectContextApi(t *testing.T) {
 	// @auth on api (correct)
 	result := analyze(t, `api getUser(): Int @auth`)

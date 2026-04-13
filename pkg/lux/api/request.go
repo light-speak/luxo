@@ -1,16 +1,39 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/bytedance/sonic"
 	"github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/light-speak/luxo/pkg/lux/selection"
 )
+
+// bodyPool reuses byte buffers for reading request bodies.
+var bodyPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 4096)
+		return &b
+	},
+}
+
+// readBody reads the full contents of r into a pooled buffer.
+// Returns the data, the pool handle (caller must return via bodyPool.Put), and any error.
+func readBody(r io.Reader) ([]byte, *[]byte, error) {
+	bp := bodyPool.Get().(*[]byte)
+	buf := bytes.NewBuffer((*bp)[:0])
+	_, err := buf.ReadFrom(r)
+	if err != nil {
+		return nil, bp, err
+	}
+	*bp = buf.Bytes()
+	return *bp, bp, nil
+}
 
 // reservedKeys are protocol fields that should not appear in user params.
 var reservedKeys = map[string]bool{
@@ -46,10 +69,14 @@ type Request struct {
 // ParseRequest reads an HTTP request body and extracts $api, $select, and params.
 func ParseRequest(r *http.Request) (*Request, error) {
 	defer r.Body.Close()
-	body, err := io.ReadAll(r.Body)
+	body, bp, err := readBody(r.Body)
 	if err != nil {
+		if bp != nil {
+			bodyPool.Put(bp)
+		}
 		return nil, fmt.Errorf("read body: %w", err)
 	}
+	defer bodyPool.Put(bp)
 
 	if len(body) == 0 {
 		return nil, fmt.Errorf("empty request body")
@@ -142,11 +169,11 @@ func (req *Request) parseListParams(raw map[string]json.RawMessage) error {
 func (r *Request) ParamInt(name string) (int64, error) {
 	raw, ok := r.Params[name]
 	if !ok {
-		return 0, errors.BadRequest.WithData(map[string]any{"param": name, "error": "missing"})
+		return 0, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
 	var v int64
 	if err := sonic.Unmarshal(raw, &v); err != nil {
-		return 0, errors.BadRequest.WithData(map[string]any{"param": name, "error": "must be an integer"})
+		return 0, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be an integer"})
 	}
 	return v, nil
 }
@@ -155,11 +182,11 @@ func (r *Request) ParamInt(name string) (int64, error) {
 func (r *Request) ParamString(name string) (string, error) {
 	raw, ok := r.Params[name]
 	if !ok {
-		return "", errors.BadRequest.WithData(map[string]any{"param": name, "error": "missing"})
+		return "", errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
 	var v string
 	if err := sonic.Unmarshal(raw, &v); err != nil {
-		return "", errors.BadRequest.WithData(map[string]any{"param": name, "error": "must be a string"})
+		return "", errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be a string"})
 	}
 	return v, nil
 }
@@ -168,15 +195,15 @@ func (r *Request) ParamString(name string) (string, error) {
 func (r *Request) ParamDateTime(name string) (time.Time, error) {
 	raw, ok := r.Params[name]
 	if !ok {
-		return time.Time{}, errors.BadRequest.WithData(map[string]any{"param": name, "error": "missing"})
+		return time.Time{}, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
 	var s string
 	if err := sonic.Unmarshal(raw, &s); err != nil {
-		return time.Time{}, errors.BadRequest.WithData(map[string]any{"param": name, "error": "must be a string"})
+		return time.Time{}, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be a string"})
 	}
 	t, err := time.Parse(time.RFC3339, s)
 	if err != nil {
-		return time.Time{}, errors.BadRequest.WithData(map[string]any{"param": name, "error": "must be RFC3339 format"})
+		return time.Time{}, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be RFC3339 format"})
 	}
 	return t, nil
 }
@@ -185,11 +212,11 @@ func (r *Request) ParamDateTime(name string) (time.Time, error) {
 func (r *Request) ParamFloat(name string) (float64, error) {
 	raw, ok := r.Params[name]
 	if !ok {
-		return 0, errors.BadRequest.WithData(map[string]any{"param": name, "error": "missing"})
+		return 0, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
 	var v float64
 	if err := sonic.Unmarshal(raw, &v); err != nil {
-		return 0, errors.BadRequest.WithData(map[string]any{"param": name, "error": "must be a number"})
+		return 0, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be a number"})
 	}
 	return v, nil
 }
@@ -198,11 +225,11 @@ func (r *Request) ParamFloat(name string) (float64, error) {
 func (r *Request) ParamBool(name string) (bool, error) {
 	raw, ok := r.Params[name]
 	if !ok {
-		return false, errors.BadRequest.WithData(map[string]any{"param": name, "error": "missing"})
+		return false, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
 	var v bool
 	if err := sonic.Unmarshal(raw, &v); err != nil {
-		return false, errors.BadRequest.WithData(map[string]any{"param": name, "error": "must be a boolean"})
+		return false, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be a boolean"})
 	}
 	return v, nil
 }
@@ -211,11 +238,11 @@ func (r *Request) ParamBool(name string) (bool, error) {
 func (r *Request) ParamIntArray(name string) ([]int64, error) {
 	raw, ok := r.Params[name]
 	if !ok {
-		return nil, errors.BadRequest.WithData(map[string]any{"param": name, "error": "missing"})
+		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
 	var v []int64
 	if err := sonic.Unmarshal(raw, &v); err != nil {
-		return nil, errors.BadRequest.WithData(map[string]any{"param": name, "error": "must be an array of integers"})
+		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be an array of integers"})
 	}
 	return v, nil
 }
@@ -224,11 +251,11 @@ func (r *Request) ParamIntArray(name string) ([]int64, error) {
 func (r *Request) ParamStringArray(name string) ([]string, error) {
 	raw, ok := r.Params[name]
 	if !ok {
-		return nil, errors.BadRequest.WithData(map[string]any{"param": name, "error": "missing"})
+		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
 	var v []string
 	if err := sonic.Unmarshal(raw, &v); err != nil {
-		return nil, errors.BadRequest.WithData(map[string]any{"param": name, "error": "must be an array of strings"})
+		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be an array of strings"})
 	}
 	return v, nil
 }
@@ -237,10 +264,10 @@ func (r *Request) ParamStringArray(name string) ([]string, error) {
 func (r *Request) ParamJSON(name string, target any) error {
 	raw, ok := r.Params[name]
 	if !ok {
-		return errors.BadRequest.WithData(map[string]any{"param": name, "error": "missing"})
+		return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
 	if err := sonic.Unmarshal(raw, target); err != nil {
-		return errors.BadRequest.WithData(map[string]any{"param": name, "error": "invalid format"})
+		return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "invalid format"})
 	}
 	return nil
 }

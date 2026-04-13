@@ -125,31 +125,37 @@ func (s *DocumentStore) analyzeAll() {
 	s.mu.RUnlock()
 
 	// Discover sibling .luxo files (cached, only refreshed on open/close)
-	s.mu.RLock()
+	s.mu.Lock()
 	dirty := s.siblingDirty
-	s.mu.RUnlock()
 	if dirty || s.siblingCache == nil {
 		s.siblingCache = s.discoverSiblingFiles(docs)
-		s.mu.Lock()
 		s.siblingDirty = false
-		s.mu.Unlock()
 	}
-	allDocs := append(docs, s.siblingCache...)
+	siblings := s.siblingCache // copy slice header under lock
+	s.mu.Unlock()
+	allDocs := append(docs, siblings...)
 
-	// Phase 1: lex and parse each file independently
+	// Phase 1: lex and parse each file independently — collect results locally
+	type docResult struct {
+		tokens    []token.Token
+		lexErrs   []lexer.Error
+		file      *ast.File
+		parseErrs []parser.Error
+	}
+	results := make([]docResult, len(allDocs))
 	var files []*ast.File
-	for _, doc := range allDocs {
+	for i, doc := range allDocs {
 		filename := URIToPath(doc.URI)
 
 		l := lexer.New(doc.Content, filename)
 		tokens, lexErrs := l.Tokenize()
-		doc.Tokens = tokens
-		doc.lexErrors = lexErrs
+		results[i].tokens = tokens
+		results[i].lexErrs = lexErrs
 
 		p := parser.New(tokens)
 		file, parseErrs := p.Parse(filename)
-		doc.File = file
-		doc.parseErrors = parseErrs
+		results[i].file = file
+		results[i].parseErrs = parseErrs
 
 		if file != nil {
 			files = append(files, file)
@@ -158,12 +164,18 @@ func (s *DocumentStore) analyzeAll() {
 
 	// Phase 2: semantic analysis across all files together with module isolation
 	a := semantic.New()
-	result := a.AnalyzeWithModules(files)
+	semResult := a.AnalyzeWithModules(files)
 
-	// distribute results to each document
-	for _, doc := range allDocs {
-		doc.Result = result
+	// Write all results under lock to avoid races with server goroutine
+	s.mu.Lock()
+	for i, doc := range allDocs {
+		doc.Tokens = results[i].tokens
+		doc.lexErrors = results[i].lexErrs
+		doc.File = results[i].file
+		doc.parseErrors = results[i].parseErrs
+		doc.Result = semResult
 	}
+	s.mu.Unlock()
 
 	// notify server to push diagnostics
 	if s.OnAnalyzed != nil {
