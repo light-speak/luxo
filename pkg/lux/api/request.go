@@ -56,14 +56,16 @@ type Sorter struct {
 
 // Request represents a parsed Luvia API request.
 type Request struct {
-	API      string                     // $api field
-	Select   []*selection.Field         // parsed $select
-	Params   map[string]json.RawMessage // remaining fields as raw JSON
-	Buf      *ResponseBuf               // response buffer — handler writes directly here
-	Filters  []Filter                   // parsed $filters
-	Sorters  []Sorter                   // parsed $sorters
-	Page     int                        // page number (default 1)
-	PageSize int                        // page size (default 20)
+	API        string                     // $api field
+	Select     []*selection.Field         // parsed $select (JSON mode)
+	Params     map[string]json.RawMessage // remaining fields as raw JSON
+	Buf        *ResponseBuf               // response buffer — handler writes directly here
+	Filters    []Filter                   // parsed $filters
+	Sorters    []Sorter                   // parsed $sorters
+	Page       int                        // page number (default 1)
+	PageSize   int                        // page size (default 20)
+	BinaryMode bool                       // true when X-Luxo-Mode: binary
+	FieldMask  []byte                     // binary field mask (binary mode)
 }
 
 // ParseRequest reads an HTTP request body and extracts $api, $select, and params.
@@ -159,9 +161,10 @@ func (req *Request) parseListParams(raw map[string]json.RawMessage) error {
 	if req.Page < 1 {
 		req.Page = 1
 	}
-	if req.PageSize < 1 || req.PageSize > 100 {
+	if req.PageSize < 0 || req.PageSize > 100 {
 		req.PageSize = 20
 	}
+	// pageSize == 0 → return all (no pagination)
 	return nil
 }
 

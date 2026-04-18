@@ -90,7 +90,7 @@ func analyzeRelations(m *ast.ModelDecl, enums map[string]bool) []Relation {
 }
 
 // generateDataLoaderFile produces dataloader.gen.go with loader types and batch function signatures.
-func generateDataLoaderFile(result *semantic.Result, packageName string, enums map[string]bool, externalSoftModels map[string]bool) []byte {
+func generateDataLoaderFile(result *semantic.Result, packageName string, enums map[string]bool, externalSoftModels map[string]bool, driver DBDriver) []byte {
 	var allRelations []struct {
 		modelName string
 		relations []Relation
@@ -131,7 +131,7 @@ func generateDataLoaderFile(result *semantic.Result, packageName string, enums m
 	b.WriteString("\t\"context\"\n\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/dataloader\"\n")
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/pg\"\n")
+	fmt.Fprintf(&b, "\tpg %q\n", driver.DriverImport())
 	b.WriteString(")\n\n")
 
 	// Generate batch function types (deduplicate by type name)

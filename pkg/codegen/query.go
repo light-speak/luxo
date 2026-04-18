@@ -43,6 +43,72 @@ func generateQueryBuilder(b *strings.Builder, m *ast.ModelDecl, enums map[string
 	generateUpdateBuilder(b, name, dbFields)
 }
 
+// generateExtendQueryBuilder generates minimal query support for extend models:
+// scanner, client (read-only: Find/Where), field constants, and where helpers.
+// No create/update builders — extend models are read-only from the referencing module.
+func generateExtendQueryBuilder(b *strings.Builder, ext *ast.ExtendDecl) {
+	name := ext.Name
+	tableName := str.ToSnakeCase(name) + "s"
+
+	// Filter out relation fields
+	var dbFields []*ast.FieldDecl
+	for _, f := range ext.Fields {
+		if f.Computed != nil || f.Type == nil {
+			continue
+		}
+		// Skip relation fields (type is a model name — capitalized, not a primitive)
+		typeName := f.Type.Name
+		if typeName != "" && typeName[0] >= 'A' && typeName[0] <= 'Z' {
+			switch typeName {
+			case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "JSON", "Decimal", "Bytes":
+				// primitive — keep
+			default:
+				if !f.Type.IsList {
+					continue // skip single-model relation fields
+				}
+				continue // skip list-model relation fields too
+			}
+		}
+		dbFields = append(dbFields, f)
+	}
+
+	generateScanner(b, &ast.ModelDecl{Name: name, Fields: dbFields})
+	generateExtendClient(b, name, tableName, dbFields)
+	generateFieldConstants(b, name, dbFields)
+	generateWhereFields(b, name, dbFields)
+}
+
+func generateExtendClient(b *strings.Builder, name, tableName string, fields []*ast.FieldDecl) {
+	scanFn := "scan" + name
+
+	idType := "int64"
+	for _, f := range fields {
+		if f.Name == "id" && f.Type != nil {
+			idType = resolveGoType(f.Type)
+			break
+		}
+	}
+
+	fmt.Fprintf(b, `// %sClient provides read-only query access for the external %s model.
+type %sClient struct {
+	db *pg.DB
+}
+
+// Find returns a %s by primary key.
+func (c *%sClient) Find(ctx context.Context, id %s) (*%s, error) {
+	return c.Where(%sWhere.Id.Eq(id)).First(ctx)
+}
+
+// Where starts a query with conditions.
+func (c *%sClient) Where(conds ...lux.Condition) *pg.Query[%s] {
+	return pg.NewQuery(c.db, %q, %s, conds)
+}
+
+`, name, name, name,
+		name, name, idType, name, name,
+		name, name, tableName, scanFn)
+}
+
 // --- Client ---
 
 func generateClient(b *strings.Builder, name, tableName string, fields []*ast.FieldDecl, soft bool) {

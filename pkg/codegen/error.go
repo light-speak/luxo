@@ -51,7 +51,7 @@ func generateErrorConstructor(b *strings.Builder, e *ast.ErrorDecl) {
 	fmt.Fprintf(b, "\treturn errors.New(%q, %d, %q)", name, e.Code, e.Message)
 
 	if len(e.Fields) > 0 {
-		b.WriteString(".WithData(map[string]any{\n")
+		b.WriteString(".WithData(errors.MapData{\n")
 		for _, p := range e.Fields {
 			fmt.Fprintf(b, "\t\t%q: %s,\n", p.Name, p.Name)
 		}

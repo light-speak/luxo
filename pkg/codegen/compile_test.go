@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lux"
 	"github.com/light-speak/luxo/pkg/token"
 )
 
@@ -686,15 +687,71 @@ func TestCompileModelChainUnknownMethod(t *testing.T) {
 	c := newCompiler(models)
 
 	call := &ast.CallExpr{
-		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "orderBy"},
-		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "createdAt"}}},
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "paginate"},
+		Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "10"}}},
 	}
 	got := c.compileExpr(call)
-	if !strings.Contains(got, ".OrderBy(") {
-		t.Fatalf("expected .OrderBy( in output, got %q", got)
+	if !strings.Contains(got, ".Paginate(") {
+		t.Fatalf("expected .Paginate( in output, got %q", got)
 	}
-	if !strings.Contains(got, "createdAt") {
-		t.Fatalf("expected createdAt in output, got %q", got)
+}
+
+func TestCompileModelChainOrderBy(t *testing.T) {
+	models := makeModels("User")
+	c := newCompiler(models)
+
+	// User.where(...).orderBy(name.desc).all()
+	call := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{
+					Object: &ast.CallExpr{
+						Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+						Args: []*ast.NamedArg{},
+					},
+					Field: "orderBy",
+				},
+				Args: []*ast.NamedArg{{Value: &ast.MemberExpr{Object: &ast.Ident{Name: "name"}, Field: "desc"}}},
+			},
+			Field: "all",
+		},
+		Args: []*ast.NamedArg{},
+	}
+	got := c.compileExpr(call)
+	if !strings.Contains(got, `.OrderBy("name DESC")`) {
+		t.Fatalf("expected OrderBy with DESC, got %q", got)
+	}
+	if !strings.Contains(got, ".All(ctx)") {
+		t.Fatalf("expected .All(ctx), got %q", got)
+	}
+}
+
+func TestCompileModelChainLimitOffset(t *testing.T) {
+	models := makeModels("User")
+	c := newCompiler(models)
+
+	call := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{
+					Object: &ast.CallExpr{
+						Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+						Args: []*ast.NamedArg{},
+					},
+					Field: "limit",
+				},
+				Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "10"}}},
+			},
+			Field: "offset",
+		},
+		Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "20"}}},
+	}
+	got := c.compileExpr(call)
+	if !strings.Contains(got, ".Limit(10)") {
+		t.Fatalf("expected .Limit(10), got %q", got)
+	}
+	if !strings.Contains(got, ".Offset(20)") {
+		t.Fatalf("expected .Offset(20), got %q", got)
 	}
 }
 
@@ -852,8 +909,8 @@ func TestCompileStmtValNonModel(t *testing.T) {
 	}
 	c.compileStmt(stmt)
 	out := compilerOut(c)
-	if !strings.Contains(out, "x := 42") {
-		t.Fatalf("expected 'x := 42', got %q", out)
+	if !strings.Contains(out, "x := int64(42)") {
+		t.Fatalf("expected 'x := int64(42)', got %q", out)
 	}
 }
 
@@ -970,7 +1027,7 @@ func TestCompileStmtReturnWithAPIReturnType(t *testing.T) {
 	}
 	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "count"}})
 	out := compilerOut(c)
-	if !strings.Contains(out, "req.Buf.AppendInt(count)") {
+	if !strings.Contains(out, "req.Buf.AppendInt(int64(count))") {
 		t.Fatalf("expected AppendInt for Int return type, got %q", out)
 	}
 }
@@ -1185,7 +1242,7 @@ func TestCompileAPIBodyMinimal(t *testing.T) {
 		},
 	}
 	var b strings.Builder
-	compileAPIBody(&b, api, nil)
+	compileAPIBody(&b, api, nil, nil)
 	out := b.String()
 
 	if !strings.Contains(out, "func handlePing(app *App) api.HandlerFunc {") {
@@ -1208,7 +1265,7 @@ func TestCompileAPIBodyWithPrimitiveParam(t *testing.T) {
 		Body: &ast.Block{Stmts: nil},
 	}
 	var b strings.Builder
-	compileAPIBody(&b, api, nil)
+	compileAPIBody(&b, api, nil, nil)
 	out := b.String()
 
 	if !strings.Contains(out, `req.ParamInt("id")`) {
@@ -1228,7 +1285,7 @@ func TestCompileAPIBodyWithCustomTypeParam(t *testing.T) {
 		Body: &ast.Block{Stmts: nil},
 	}
 	var b strings.Builder
-	compileAPIBody(&b, api, nil)
+	compileAPIBody(&b, api, nil, nil)
 	out := b.String()
 
 	if !strings.Contains(out, "var input PostInput") {
@@ -1248,7 +1305,7 @@ func TestCompileAPIBodyWithStringParam(t *testing.T) {
 		Body: &ast.Block{Stmts: nil},
 	}
 	var b strings.Builder
-	compileAPIBody(&b, api, nil)
+	compileAPIBody(&b, api, nil, nil)
 	out := b.String()
 
 	if !strings.Contains(out, `req.ParamString("query")`) {
@@ -1265,7 +1322,7 @@ func TestCompileAPIBodyWithBoolParam(t *testing.T) {
 		Body: &ast.Block{Stmts: nil},
 	}
 	var b strings.Builder
-	compileAPIBody(&b, api, nil)
+	compileAPIBody(&b, api, nil, nil)
 	out := b.String()
 
 	if !strings.Contains(out, `req.ParamBool("active")`) {
@@ -1282,7 +1339,7 @@ func TestCompileAPIBodyWithFloatParam(t *testing.T) {
 		Body: &ast.Block{Stmts: nil},
 	}
 	var b strings.Builder
-	compileAPIBody(&b, api, nil)
+	compileAPIBody(&b, api, nil, nil)
 	out := b.String()
 
 	if !strings.Contains(out, `req.ParamFloat("amount")`) {
@@ -1321,7 +1378,7 @@ func TestCompileAPIBodyFullFlow(t *testing.T) {
 	}
 
 	var b strings.Builder
-	compileAPIBody(&b, api, models)
+	compileAPIBody(&b, api, models, nil)
 	out := b.String()
 
 	if !strings.Contains(out, "func handleGetUser(app *App) api.HandlerFunc {") {
@@ -1695,7 +1752,7 @@ func TestCompileTemplate(t *testing.T) {
 		&ast.Ident{Name: "name"},
 		&ast.Literal{Kind: token.String, Value: "!"},
 	}})
-	if !strings.Contains(got, `"hello "`) && !strings.Contains(got, "fmt.Sprint(name)") {
+	if !strings.Contains(got, `"hello "`) || !strings.Contains(got, "name") || !strings.Contains(got, "_sb.") {
 		t.Fatalf("unexpected template output: %q", got)
 	}
 }
@@ -1706,8 +1763,8 @@ func TestCompileRange(t *testing.T) {
 		Start: &ast.Literal{Kind: token.Int, Value: "1"},
 		End:   &ast.Literal{Kind: token.Int, Value: "10"},
 	})
-	if got != "luxRange(1, 10)" {
-		t.Fatalf("expected luxRange(1, 10), got %q", got)
+	if got != "lux.IntRange(1, 10)" {
+		t.Fatalf("expected lux.IntRange(1, 10), got %q", got)
 	}
 }
 
@@ -1879,5 +1936,3084 @@ func TestResolveQueryTypeUpdateDeleteCount(t *testing.T) {
 	vt = c.resolveQueryType(mkChain("count"))
 	if vt.name != "Int" {
 		t.Errorf("count type = %q, want Int", vt.name)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// A. Real-world API scenarios (full compileAPIBody)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// TestCompileRegisterAPI — User registration:
+//
+//	api register(name: String, email: String, password: String): User {
+//	  val exists = User.where(it.email == email).exists()
+//	  !exists ?: throw error.Conflict
+//	  val user = User.create(name: name, email: email, password: password)
+//	  return user
+//	}
+func TestCompileRegisterAPI(t *testing.T) {
+	models := makeModels("User")
+	api := &ast.ApiDecl{
+		Name: "register",
+		Params: []*ast.ParamDecl{
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "password", Type: &ast.TypeRef{Name: "String"}},
+		},
+		ReturnType: &ast.TypeRef{Name: "User"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			// val exists = User.where(it.email == email).exists()
+			&ast.ValStmt{
+				Name: "exists",
+				Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{
+						Object: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+							Args: []*ast.NamedArg{{
+								Value: &ast.BinaryExpr{
+									Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "email"},
+									Op:    "==",
+									Right: &ast.Ident{Name: "email"},
+								},
+							}},
+						},
+						Field: "exists",
+					},
+				},
+			},
+			// !exists ?: throw error.Conflict
+			&ast.ExprStmt{
+				Expr: &ast.ElvisExpr{
+					Left:  &ast.UnaryExpr{Op: "!", Value: &ast.Ident{Name: "exists"}},
+					Right: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "conflict"},
+				},
+			},
+			// val user = User.create(name: name, email: email, password: password)
+			&ast.ValStmt{
+				Name: "user",
+				Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "create"},
+					Args: []*ast.NamedArg{
+						{Name: "name", Value: &ast.Ident{Name: "name"}},
+						{Name: "email", Value: &ast.Ident{Name: "email"}},
+						{Name: "password", Value: &ast.Ident{Name: "password"}},
+					},
+				},
+			},
+			// return user
+			&ast.ReturnStmt{Value: &ast.Ident{Name: "user"}},
+		}},
+	}
+
+	var b strings.Builder
+	compileAPIBody(&b, api, models, nil)
+	out := b.String()
+
+	// Check function signature
+	if !strings.Contains(out, "func handleRegister(app *App) api.HandlerFunc") {
+		t.Fatalf("missing handleRegister signature, got:\n%s", out)
+	}
+	// Check param extraction
+	if !strings.Contains(out, `req.ParamString("name")`) {
+		t.Fatalf("missing ParamString for name, got:\n%s", out)
+	}
+	if !strings.Contains(out, `req.ParamString("email")`) {
+		t.Fatalf("missing ParamString for email, got:\n%s", out)
+	}
+	if !strings.Contains(out, `req.ParamString("password")`) {
+		t.Fatalf("missing ParamString for password, got:\n%s", out)
+	}
+	// Check exists query
+	if !strings.Contains(out, "UserWhere.Email.Eq(email)") {
+		t.Fatalf("missing where clause, got:\n%s", out)
+	}
+	if !strings.Contains(out, ".Exists(ctx)") {
+		t.Fatalf("missing .Exists(ctx), got:\n%s", out)
+	}
+	// Check elvis guard: !exists ?: throw error.Conflict → if exists { return errors.Conflict }
+	if !strings.Contains(out, "if exists {") {
+		t.Fatalf("missing elvis guard, got:\n%s", out)
+	}
+	if !strings.Contains(out, "return errors.Conflict") {
+		t.Fatalf("missing throw error.Conflict, got:\n%s", out)
+	}
+	// Check create chain
+	if !strings.Contains(out, "app.User.Create()") {
+		t.Fatalf("missing Create(), got:\n%s", out)
+	}
+	if !strings.Contains(out, ".SetName(name)") {
+		t.Fatalf("missing .SetName(name), got:\n%s", out)
+	}
+	if !strings.Contains(out, ".SetEmail(email)") {
+		t.Fatalf("missing .SetEmail(email), got:\n%s", out)
+	}
+	if !strings.Contains(out, ".SetPassword(password)") {
+		t.Fatalf("missing .SetPassword(password), got:\n%s", out)
+	}
+	// Check return — user is model (from create) → WriteJSON
+	if !strings.Contains(out, "user.WriteJSON(req.Buf, req.Select)") {
+		t.Fatalf("missing WriteJSON return, got:\n%s", out)
+	}
+}
+
+// TestCompileUpdateProfileAPI — Update with field assignment:
+//
+//	api updateProfile(id: Int, name: String, bio: String): User {
+//	  val user = User.find(id)
+//	  user.name = name
+//	  user.bio = bio
+//	  return user
+//	}
+func TestCompileUpdateProfileAPI(t *testing.T) {
+	models := makeModels("User")
+	api := &ast.ApiDecl{
+		Name: "updateProfile",
+		Params: []*ast.ParamDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "bio", Type: &ast.TypeRef{Name: "String"}},
+		},
+		ReturnType: &ast.TypeRef{Name: "User"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			// val user = User.find(id)
+			&ast.ValStmt{
+				Name: "user",
+				Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "find"},
+					Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
+				},
+			},
+			// user.name = name
+			&ast.AssignStmt{
+				Target: &ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "name"},
+				Op:     "=",
+				Value:  &ast.Ident{Name: "name"},
+			},
+			// user.bio = bio
+			&ast.AssignStmt{
+				Target: &ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "bio"},
+				Op:     "=",
+				Value:  &ast.Ident{Name: "bio"},
+			},
+			// return user
+			&ast.ReturnStmt{Value: &ast.Ident{Name: "user"}},
+		}},
+	}
+
+	var b strings.Builder
+	compileAPIBody(&b, api, models, nil)
+	out := b.String()
+
+	if !strings.Contains(out, "func handleUpdateProfile(app *App) api.HandlerFunc") {
+		t.Fatalf("missing function signature, got:\n%s", out)
+	}
+	if !strings.Contains(out, `req.ParamInt("id")`) {
+		t.Fatalf("missing ParamInt for id, got:\n%s", out)
+	}
+	if !strings.Contains(out, `req.ParamString("name")`) {
+		t.Fatalf("missing ParamString for name, got:\n%s", out)
+	}
+	// Check find
+	if !strings.Contains(out, "app.User.Where(UserWhere.Id.Eq(id)).First(ctx)") {
+		t.Fatalf("missing find chain, got:\n%s", out)
+	}
+	// Check assignments
+	if !strings.Contains(out, "user.Name = name") {
+		t.Fatalf("missing user.Name = name, got:\n%s", out)
+	}
+	if !strings.Contains(out, "user.Bio = bio") {
+		t.Fatalf("missing user.Bio = bio, got:\n%s", out)
+	}
+	// Check return — user is model from find → WriteJSON
+	if !strings.Contains(out, "user.WriteJSON(req.Buf, req.Select)") {
+		t.Fatalf("missing WriteJSON return, got:\n%s", out)
+	}
+}
+
+// TestCompileDeleteWithCheckAPI — Delete with existence check:
+//
+//	api deleteUser(id: Int): Int {
+//	  val user = User.find(id)
+//	  user ?: throw error.NotFound
+//	  val count = User.where(it.id == id).delete()
+//	  return count
+//	}
+func TestCompileDeleteWithCheckAPI(t *testing.T) {
+	models := makeModels("User")
+	api := &ast.ApiDecl{
+		Name: "deleteUser",
+		Params: []*ast.ParamDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+		},
+		ReturnType: &ast.TypeRef{Name: "Int"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			// val user = User.find(id)
+			&ast.ValStmt{
+				Name: "user",
+				Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "find"},
+					Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
+				},
+			},
+			// user ?: throw error.NotFound
+			&ast.ExprStmt{
+				Expr: &ast.ElvisExpr{
+					Left:  &ast.Ident{Name: "user"},
+					Right: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "notFound"},
+				},
+			},
+			// val count = User.where(it.id == id).delete()
+			&ast.ValStmt{
+				Name: "count",
+				Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{
+						Object: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+							Args: []*ast.NamedArg{{
+								Value: &ast.BinaryExpr{
+									Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "id"},
+									Op:    "==",
+									Right: &ast.Ident{Name: "id"},
+								},
+							}},
+						},
+						Field: "delete",
+					},
+				},
+			},
+			// return count
+			&ast.ReturnStmt{Value: &ast.Ident{Name: "count"}},
+		}},
+	}
+
+	var b strings.Builder
+	compileAPIBody(&b, api, models, nil)
+	out := b.String()
+
+	if !strings.Contains(out, "func handleDeleteUser(app *App) api.HandlerFunc") {
+		t.Fatalf("missing function signature, got:\n%s", out)
+	}
+	// Check find
+	if !strings.Contains(out, "app.User.Where(UserWhere.Id.Eq(id)).First(ctx)") {
+		t.Fatalf("missing find, got:\n%s", out)
+	}
+	// Check elvis nil guard
+	if !strings.Contains(out, "if user == nil {") {
+		t.Fatalf("missing nil check, got:\n%s", out)
+	}
+	if !strings.Contains(out, "return errors.NotFound") {
+		t.Fatalf("missing throw NotFound, got:\n%s", out)
+	}
+	// Check delete
+	if !strings.Contains(out, ".Delete(ctx)") {
+		t.Fatalf("missing .Delete(ctx), got:\n%s", out)
+	}
+	// Check return count — count is Int type from delete → AppendInt
+	if !strings.Contains(out, "req.Buf.AppendInt(int64(count))") {
+		t.Fatalf("missing AppendInt for count, got:\n%s", out)
+	}
+}
+
+// TestCompileListWithFilterAPI — List with for loop and conditional:
+//
+//	api processUsers(): Boolean {
+//	  val users = User.where(it.role == "ADMIN").all()
+//	  for user in users {
+//	    if user.active == false {
+//	      User.where(it.id == user.id).delete()
+//	    }
+//	  }
+//	  return true
+//	}
+func TestCompileListWithFilterAPI(t *testing.T) {
+	models := makeModels("User")
+	api := &ast.ApiDecl{
+		Name:       "processUsers",
+		Params:     nil,
+		ReturnType: &ast.TypeRef{Name: "Boolean"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			// val users = User.where(it.role == "ADMIN").all()
+			&ast.ValStmt{
+				Name: "users",
+				Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{
+						Object: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+							Args: []*ast.NamedArg{{
+								Value: &ast.BinaryExpr{
+									Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "role"},
+									Op:    "==",
+									Right: &ast.Literal{Kind: token.String, Value: "ADMIN"},
+								},
+							}},
+						},
+						Field: "all",
+					},
+				},
+			},
+			// for user in users { if user.active == false { User.where(it.id == user.id).delete() } }
+			&ast.ForStmt{
+				VarName:    "user",
+				Collection: &ast.Ident{Name: "users"},
+				Body: &ast.Block{Stmts: []ast.Stmt{
+					&ast.IfStmt{
+						Condition: &ast.BinaryExpr{
+							Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "active"},
+							Op:    "==",
+							Right: &ast.Literal{Kind: token.False, Value: "false"},
+						},
+						Then: &ast.Block{Stmts: []ast.Stmt{
+							&ast.ExprStmt{
+								Expr: &ast.CallExpr{
+									Func: &ast.MemberExpr{
+										Object: &ast.CallExpr{
+											Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+											Args: []*ast.NamedArg{{
+												Value: &ast.BinaryExpr{
+													Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "id"},
+													Op:    "==",
+													Right: &ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "id"},
+												},
+											}},
+										},
+										Field: "delete",
+									},
+								},
+							},
+						}},
+					},
+				}},
+			},
+			// return true
+			&ast.ReturnStmt{Value: &ast.Literal{Kind: token.True, Value: "true"}},
+		}},
+	}
+
+	var b strings.Builder
+	compileAPIBody(&b, api, models, nil)
+	out := b.String()
+
+	if !strings.Contains(out, "func handleProcessUsers(app *App) api.HandlerFunc") {
+		t.Fatalf("missing function signature, got:\n%s", out)
+	}
+	// Check all query
+	if !strings.Contains(out, `UserWhere.Role.Eq("ADMIN")`) {
+		t.Fatalf("missing where role ADMIN, got:\n%s", out)
+	}
+	if !strings.Contains(out, ".All(ctx)") {
+		t.Fatalf("missing .All(ctx), got:\n%s", out)
+	}
+	// Check for loop
+	if !strings.Contains(out, "for _, user := range users {") {
+		t.Fatalf("missing for range, got:\n%s", out)
+	}
+	// Check if condition
+	if !strings.Contains(out, "if user.Active == false {") {
+		t.Fatalf("missing if condition, got:\n%s", out)
+	}
+	// Check nested delete
+	if !strings.Contains(out, "UserWhere.Id.Eq(user.Id)") {
+		t.Fatalf("missing nested where for delete, got:\n%s", out)
+	}
+	if !strings.Contains(out, ".Delete(ctx)") {
+		t.Fatalf("missing .Delete(ctx), got:\n%s", out)
+	}
+	// Check return
+	if !strings.Contains(out, "req.Buf.AppendBool(true)") {
+		t.Fatalf("missing AppendBool(true), got:\n%s", out)
+	}
+}
+
+// TestCompileBatchCreateAPI — Create in a loop with emit:
+//
+//	api batchNotify(message: String): Int {
+//	  val users = User.where(it.active == true).all()
+//	  val count = 0
+//	  for user in users {
+//	    emit UserNotified(userId: user.id, message: message)
+//	    count += 1
+//	  }
+//	  return count
+//	}
+func TestCompileBatchCreateAPI(t *testing.T) {
+	models := makeModels("User")
+	api := &ast.ApiDecl{
+		Name: "batchNotify",
+		Params: []*ast.ParamDecl{
+			{Name: "message", Type: &ast.TypeRef{Name: "String"}},
+		},
+		ReturnType: &ast.TypeRef{Name: "Int"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			// val users = User.where(it.active == true).all()
+			&ast.ValStmt{
+				Name: "users",
+				Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{
+						Object: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+							Args: []*ast.NamedArg{{
+								Value: &ast.BinaryExpr{
+									Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "active"},
+									Op:    "==",
+									Right: &ast.Literal{Kind: token.True, Value: "true"},
+								},
+							}},
+						},
+						Field: "all",
+					},
+				},
+			},
+			// val count = 0
+			&ast.ValStmt{
+				Name:  "count",
+				Value: &ast.Literal{Kind: token.Int, Value: "0"},
+			},
+			// for user in users { emit UserNotified(...); count += 1 }
+			&ast.ForStmt{
+				VarName:    "user",
+				Collection: &ast.Ident{Name: "users"},
+				Body: &ast.Block{Stmts: []ast.Stmt{
+					&ast.EmitStmt{
+						EventName: "UserNotified",
+						Args: []*ast.NamedArg{
+							{Name: "userId", Value: &ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "id"}},
+							{Name: "message", Value: &ast.Ident{Name: "message"}},
+						},
+					},
+					&ast.AssignStmt{
+						Target: &ast.Ident{Name: "count"},
+						Op:     "+=",
+						Value:  &ast.Literal{Kind: token.Int, Value: "1"},
+					},
+				}},
+			},
+			// return count
+			&ast.ReturnStmt{Value: &ast.Ident{Name: "count"}},
+		}},
+	}
+
+	var b strings.Builder
+	compileAPIBody(&b, api, models, nil)
+	out := b.String()
+
+	if !strings.Contains(out, "func handleBatchNotify(app *App) api.HandlerFunc") {
+		t.Fatalf("missing function signature, got:\n%s", out)
+	}
+	if !strings.Contains(out, `req.ParamString("message")`) {
+		t.Fatalf("missing ParamString for message, got:\n%s", out)
+	}
+	// Check users query
+	if !strings.Contains(out, "UserWhere.Active.Eq(true)") {
+		t.Fatalf("missing where active, got:\n%s", out)
+	}
+	if !strings.Contains(out, ".All(ctx)") {
+		t.Fatalf("missing .All(ctx), got:\n%s", out)
+	}
+	// Check count init
+	if !strings.Contains(out, "count := int64(0)") {
+		t.Fatalf("missing count := 0, got:\n%s", out)
+	}
+	// Check for loop
+	if !strings.Contains(out, "for _, user := range users {") {
+		t.Fatalf("missing for range, got:\n%s", out)
+	}
+	// Check emit
+	if !strings.Contains(out, "EmitUserNotified") {
+		t.Fatalf("missing EmitUserNotified, got:\n%s", out)
+	}
+	if !strings.Contains(out, "UserNotifiedEvent{") {
+		t.Fatalf("missing UserNotifiedEvent{, got:\n%s", out)
+	}
+	if !strings.Contains(out, "UserId: user.Id") {
+		t.Fatalf("missing UserId: user.Id, got:\n%s", out)
+	}
+	if !strings.Contains(out, "Message: message") {
+		t.Fatalf("missing Message: message, got:\n%s", out)
+	}
+	// Check count increment
+	if !strings.Contains(out, "count += 1") {
+		t.Fatalf("missing count += 1, got:\n%s", out)
+	}
+	// Check return — count is plain val not model query, api returns Int → AppendInt
+	if !strings.Contains(out, "req.Buf.AppendInt(int64(count))") {
+		t.Fatalf("missing AppendInt(count), got:\n%s", out)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// B. Mixed expression tests (newCompiler + compileExpr/compileStmt)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// TestCompileNestedForWithBreak — for with if/break inside
+func TestCompileNestedForWithBreak(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.ForStmt{
+		VarName:    "item",
+		Collection: &ast.Ident{Name: "items"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.IfStmt{
+				Condition: &ast.BinaryExpr{
+					Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "item"}, Field: "done"},
+					Op:    "==",
+					Right: &ast.Literal{Kind: token.True, Value: "true"},
+				},
+				Then: &ast.Block{Stmts: []ast.Stmt{
+					&ast.BreakStmt{},
+				}},
+			},
+		}},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "for _, item := range items {") {
+		t.Fatalf("missing for range, got:\n%s", out)
+	}
+	if !strings.Contains(out, "if item.Done == true {") {
+		t.Fatalf("missing if condition, got:\n%s", out)
+	}
+	if !strings.Contains(out, "break") {
+		t.Fatalf("missing break, got:\n%s", out)
+	}
+}
+
+// TestCompileForWithContinue — for with continue
+func TestCompileForWithContinue(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.ForStmt{
+		VarName:    "user",
+		Collection: &ast.Ident{Name: "users"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.IfStmt{
+				Condition: &ast.BinaryExpr{
+					Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "active"},
+					Op:    "==",
+					Right: &ast.Literal{Kind: token.False, Value: "false"},
+				},
+				Then: &ast.Block{Stmts: []ast.Stmt{
+					&ast.ContinueStmt{},
+				}},
+			},
+			&ast.ExprStmt{Expr: &ast.CallExpr{
+				Func: &ast.Ident{Name: "process"},
+				Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "user"}}},
+			}},
+		}},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "for _, user := range users {") {
+		t.Fatalf("missing for range, got:\n%s", out)
+	}
+	if !strings.Contains(out, "continue") {
+		t.Fatalf("missing continue, got:\n%s", out)
+	}
+	if !strings.Contains(out, "process(user)") {
+		t.Fatalf("missing process call after continue block, got:\n%s", out)
+	}
+}
+
+// TestCompileWhenAsStatement — when used inside an if body
+func TestCompileWhenAsStatement(t *testing.T) {
+	c := newCompiler(nil)
+	whenExpr := &ast.WhenExpr{
+		Subject: &ast.Ident{Name: "status"},
+		Branches: []*ast.WhenBranch{
+			{Condition: &ast.Literal{Kind: token.String, Value: "ACTIVE"}, Body: &ast.Literal{Kind: token.Int, Value: "1"}},
+			{Condition: &ast.Literal{Kind: token.String, Value: "INACTIVE"}, Body: &ast.Literal{Kind: token.Int, Value: "0"}},
+		},
+		Else: &ast.Literal{Kind: token.Int, Value: "-1"},
+	}
+	c.compileStmt(&ast.ValStmt{Name: "code", Value: whenExpr})
+	out := compilerOut(c)
+	if !strings.Contains(out, "code :=") {
+		t.Fatalf("missing code :=, got:\n%s", out)
+	}
+	if !strings.Contains(out, "switch status") {
+		t.Fatalf("missing switch, got:\n%s", out)
+	}
+	if !strings.Contains(out, `case "ACTIVE"`) {
+		t.Fatalf("missing case ACTIVE, got:\n%s", out)
+	}
+	if !strings.Contains(out, `case "INACTIVE"`) {
+		t.Fatalf("missing case INACTIVE, got:\n%s", out)
+	}
+	if !strings.Contains(out, "default:") {
+		t.Fatalf("missing default, got:\n%s", out)
+	}
+}
+
+// TestCompileTemplateStringComplex — template with expressions
+func TestCompileTemplateStringComplex(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.TemplateString{Parts: []ast.Expr{
+		&ast.Literal{Kind: token.String, Value: "User "},
+		&ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "name"},
+		&ast.Literal{Kind: token.String, Value: " has "},
+		&ast.Ident{Name: "count"},
+		&ast.Literal{Kind: token.String, Value: " posts"},
+	}})
+	if !strings.Contains(got, `"User "`) {
+		t.Fatalf("missing literal part, got:\n%s", got)
+	}
+	if !strings.Contains(got, "_sb.WriteString(") {
+		t.Fatalf("missing _sb.WriteString calls, got:\n%s", got)
+	}
+	if !strings.Contains(got, "user.Name") {
+		t.Fatalf("missing user.Name, got:\n%s", got)
+	}
+	if !strings.Contains(got, "count") {
+		t.Fatalf("missing count, got:\n%s", got)
+	}
+	if !strings.Contains(got, `" posts"`) {
+		t.Fatalf("missing posts literal, got:\n%s", got)
+	}
+	// Check strings.Builder pattern
+	if !strings.Contains(got, "strings.Builder") {
+		t.Fatalf("missing strings.Builder, got:\n%s", got)
+	}
+}
+
+// TestCompileListWithExpressions — [user.id, user.id + 1, 42]
+func TestCompileListWithExpressions(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.ListExpr{Items: []ast.Expr{
+		&ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "id"},
+		&ast.BinaryExpr{
+			Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "id"},
+			Op:    "+",
+			Right: &ast.Literal{Kind: token.Int, Value: "1"},
+		},
+		&ast.Literal{Kind: token.Int, Value: "42"},
+	}})
+	if !strings.Contains(got, "[]any{") {
+		t.Fatalf("missing []any{, got:\n%s", got)
+	}
+	if !strings.Contains(got, "user.Id") {
+		t.Fatalf("missing user.Id, got:\n%s", got)
+	}
+	if !strings.Contains(got, "user.Id + 1") {
+		t.Fatalf("missing user.Id + 1, got:\n%s", got)
+	}
+	if !strings.Contains(got, "42") {
+		t.Fatalf("missing 42, got:\n%s", got)
+	}
+}
+
+// TestCompileAssignCompound — count += 1, total -= price
+func TestCompileAssignCompound(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.AssignStmt{
+		Target: &ast.Ident{Name: "count"},
+		Op:     "+=",
+		Value:  &ast.Literal{Kind: token.Int, Value: "1"},
+	})
+	c.compileStmt(&ast.AssignStmt{
+		Target: &ast.Ident{Name: "total"},
+		Op:     "-=",
+		Value:  &ast.Ident{Name: "price"},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "count += 1") {
+		t.Fatalf("missing count += 1, got:\n%s", out)
+	}
+	if !strings.Contains(out, "total -= price") {
+		t.Fatalf("missing total -= price, got:\n%s", out)
+	}
+}
+
+// TestCompileTransactionWithModelOps — tx { create + update }
+func TestCompileTransactionWithModelOps(t *testing.T) {
+	models := makeModels("User")
+	c := newCompiler(models)
+	got := c.compileExpr(&ast.TransactionExpr{
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ValStmt{
+				Name: "user",
+				Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "create"},
+					Args: []*ast.NamedArg{
+						{Name: "name", Value: &ast.Literal{Kind: token.String, Value: "lin"}},
+					},
+				},
+			},
+			&ast.AssignStmt{
+				Target: &ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "active"},
+				Op:     "=",
+				Value:  &ast.Literal{Kind: token.True, Value: "true"},
+			},
+		}},
+	})
+	if !strings.Contains(got, "app.DB.Tx(ctx, func(ctx context.Context) error {") {
+		t.Fatalf("missing Tx wrapper, got:\n%s", got)
+	}
+	if !strings.Contains(got, "app.User.Create()") {
+		t.Fatalf("missing Create(), got:\n%s", got)
+	}
+	if !strings.Contains(got, `.SetName("lin")`) {
+		t.Fatalf("missing SetName, got:\n%s", got)
+	}
+	if !strings.Contains(got, "user.Active = true") {
+		t.Fatalf("missing assignment, got:\n%s", got)
+	}
+	if !strings.Contains(got, "return nil") {
+		t.Fatalf("missing return nil, got:\n%s", got)
+	}
+}
+
+// TestCompileAsyncFireAndForget — async { emit ... }
+func TestCompileAsyncFireAndForget(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.AsyncExpr{
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.EmitStmt{
+				EventName: "EmailSent",
+				Args: []*ast.NamedArg{
+					{Name: "to", Value: &ast.Ident{Name: "email"}},
+				},
+			},
+		}},
+	})
+	if !strings.Contains(got, "go func() {") {
+		t.Fatalf("missing go func(), got:\n%s", got)
+	}
+	if !strings.Contains(got, "EmitEmailSent") {
+		t.Fatalf("missing EmitEmailSent, got:\n%s", got)
+	}
+	if !strings.Contains(got, "EmailSentEvent{") {
+		t.Fatalf("missing EmailSentEvent{, got:\n%s", got)
+	}
+	if !strings.Contains(got, "To: email") {
+		t.Fatalf("missing To: email, got:\n%s", got)
+	}
+}
+
+// TestCompileAwaitParallelQueries — await with multiple model queries → errgroup
+func TestCompileAwaitParallelQueries(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"User": {Name: "User"},
+		"Post": {Name: "Post"},
+	}
+	c := newCompiler(models)
+	// await { val user = User.find(id); val posts = Post.where(...).all() }
+	c.compileExpr(&ast.AwaitExpr{
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ValStmt{
+				Name: "user",
+				Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "find"},
+					Args: []*ast.NamedArg{{Name: "id", Value: &ast.Ident{Name: "id"}}},
+				},
+			},
+			&ast.ValStmt{
+				Name: "posts",
+				Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{
+						Object: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "where"},
+							Args: []*ast.NamedArg{},
+						},
+						Field: "all",
+					},
+					Args: []*ast.NamedArg{},
+				},
+			},
+		}},
+	})
+	out := compilerOut(c)
+	// Should declare vars in outer scope
+	if !strings.Contains(out, "var user *User") {
+		t.Fatalf("missing var user *User, got:\n%s", out)
+	}
+	if !strings.Contains(out, "var posts []*Post") {
+		t.Fatalf("missing var posts []*Post, got:\n%s", out)
+	}
+	// Should use errgroup
+	if !strings.Contains(out, "errgroup.WithContext(ctx)") {
+		t.Fatalf("missing errgroup, got:\n%s", out)
+	}
+	if !strings.Contains(out, "g.Go(func() error {") {
+		t.Fatalf("missing g.Go, got:\n%s", out)
+	}
+	// Should use gctx instead of ctx inside goroutines
+	if !strings.Contains(out, "gctx") {
+		t.Fatalf("missing gctx, got:\n%s", out)
+	}
+	// Should wait and check error
+	if !strings.Contains(out, "g.Wait()") {
+		t.Fatalf("missing g.Wait(), got:\n%s", out)
+	}
+	// Vars should be tracked
+	if vt, ok := c.vars["user"]; !ok || !vt.isModel {
+		t.Error("user var not tracked as model")
+	}
+	if vt, ok := c.vars["posts"]; !ok || !vt.isList {
+		t.Error("posts var not tracked as list")
+	}
+}
+
+// TestCompileAwaitNoVals — await with no val statements → sequential
+func TestCompileAwaitNoVals(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileExpr(&ast.AwaitExpr{
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.Ident{Name: "doSomething"}},
+		}},
+	})
+	out := compilerOut(c)
+	if strings.Contains(out, "errgroup") {
+		t.Fatalf("should not use errgroup for non-val stmts, got:\n%s", out)
+	}
+	if !strings.Contains(out, "doSomething") {
+		t.Fatalf("missing sequential stmt, got:\n%s", out)
+	}
+}
+
+// TestCompileAwaitNonQueryVal — await with non-model-query val → no error handling
+func TestCompileAwaitNonQueryVal(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileExpr(&ast.AwaitExpr{
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ValStmt{
+				Name:  "x",
+				Value: &ast.Literal{Kind: token.Int, Value: "42"},
+			},
+		}},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "var x any") {
+		t.Fatalf("missing var declaration, got:\n%s", out)
+	}
+	if !strings.Contains(out, "x = 42") {
+		t.Fatalf("missing assignment, got:\n%s", out)
+	}
+	if !strings.Contains(out, "return nil") {
+		t.Fatalf("missing return nil in non-query task, got:\n%s", out)
+	}
+}
+
+// TestCompileElvisWithThrow — user ?: throw error.NotFound
+func TestCompileElvisWithThrow(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.ExprStmt{
+		Expr: &ast.ElvisExpr{
+			Left: &ast.Ident{Name: "user"},
+			Right: &ast.MemberExpr{
+				Object: &ast.Ident{Name: "error"},
+				Field:  "notFound",
+			},
+		},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "if user == nil {") {
+		t.Fatalf("missing nil check, got:\n%s", out)
+	}
+	if !strings.Contains(out, "return errors.NotFound") {
+		t.Fatalf("missing return errors.NotFound, got:\n%s", out)
+	}
+}
+
+// TestCompileChainedModelOps — User.where(...).select(...).first()
+func TestCompileChainedModelOps(t *testing.T) {
+	models := makeModels("User")
+	c := newCompiler(models)
+
+	// User.where(it.id == id).select(...).first()
+	whereCall := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+		Args: []*ast.NamedArg{{
+			Value: &ast.BinaryExpr{
+				Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "id"},
+				Op:    "==",
+				Right: &ast.Ident{Name: "id"},
+			},
+		}},
+	}
+	selectCall := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: whereCall, Field: "select"},
+		Args: nil,
+	}
+	firstCall := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: selectCall, Field: "first"},
+		Args: nil,
+	}
+	got := c.compileExpr(firstCall)
+	if !strings.Contains(got, "app.User.Where(UserWhere.Id.Eq(id))") {
+		t.Fatalf("missing where clause, got:\n%s", got)
+	}
+	if !strings.Contains(got, ".Select(selection.SQLColumns(req.Select)...)") {
+		t.Fatalf("missing select, got:\n%s", got)
+	}
+	if !strings.Contains(got, ".First(ctx)") {
+		t.Fatalf("missing .First(ctx), got:\n%s", got)
+	}
+}
+
+// TestCompileModelCountExpr — User.where(...).count()
+func TestCompileModelCountExpr(t *testing.T) {
+	models := makeModels("User")
+	c := newCompiler(models)
+
+	got := c.compileExpr(&ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+				Args: []*ast.NamedArg{{
+					Value: &ast.BinaryExpr{
+						Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "active"},
+						Op:    "==",
+						Right: &ast.Literal{Kind: token.True, Value: "true"},
+					},
+				}},
+			},
+			Field: "count",
+		},
+	})
+	if !strings.Contains(got, "app.User.Where(UserWhere.Active.Eq(true))") {
+		t.Fatalf("missing where clause, got:\n%s", got)
+	}
+	if !strings.Contains(got, ".Count(ctx)") {
+		t.Fatalf("missing .Count(ctx), got:\n%s", got)
+	}
+}
+
+// TestCompileModelDeleteExpr — User.where(...).delete()
+func TestCompileModelDeleteExpr(t *testing.T) {
+	models := makeModels("User")
+	c := newCompiler(models)
+
+	got := c.compileExpr(&ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+				Args: []*ast.NamedArg{{
+					Value: &ast.BinaryExpr{
+						Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "id"},
+						Op:    "==",
+						Right: &ast.Literal{Kind: token.Int, Value: "5"},
+					},
+				}},
+			},
+			Field: "delete",
+		},
+	})
+	if !strings.Contains(got, "app.User.Where(UserWhere.Id.Eq(5))") {
+		t.Fatalf("missing where clause, got:\n%s", got)
+	}
+	if !strings.Contains(got, ".Delete(ctx)") {
+		t.Fatalf("missing .Delete(ctx), got:\n%s", got)
+	}
+}
+
+// TestCompileModelUpdateExpr — User.where(...).update(name: "new")
+func TestCompileModelUpdateExpr(t *testing.T) {
+	models := makeModels("User")
+	c := newCompiler(models)
+
+	got := c.compileExpr(&ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+				Args: []*ast.NamedArg{{
+					Value: &ast.BinaryExpr{
+						Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "id"},
+						Op:    "==",
+						Right: &ast.Ident{Name: "id"},
+					},
+				}},
+			},
+			Field: "update",
+		},
+		Args: []*ast.NamedArg{
+			{Name: "name", Value: &ast.Literal{Kind: token.String, Value: "new"}},
+		},
+	})
+	if !strings.Contains(got, "app.User.Where(UserWhere.Id.Eq(id))") {
+		t.Fatalf("missing where clause, got:\n%s", got)
+	}
+	if !strings.Contains(got, `.Update(ctx, lux.SetField{Col: "name"`) {
+		t.Fatalf("missing .Update with SetField, got:\n%s", got)
+	}
+}
+
+// TestCompileNestedIf — if inside if
+func TestCompileNestedIf(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.IfStmt{
+		Condition: &ast.BinaryExpr{
+			Left:  &ast.Ident{Name: "x"},
+			Op:    ">",
+			Right: &ast.Literal{Kind: token.Int, Value: "0"},
+		},
+		Then: &ast.Block{Stmts: []ast.Stmt{
+			&ast.IfStmt{
+				Condition: &ast.BinaryExpr{
+					Left:  &ast.Ident{Name: "x"},
+					Op:    "<",
+					Right: &ast.Literal{Kind: token.Int, Value: "100"},
+				},
+				Then: &ast.Block{Stmts: []ast.Stmt{
+					&ast.ExprStmt{Expr: &ast.CallExpr{
+						Func: &ast.Ident{Name: "doWork"},
+						Args: nil,
+					}},
+				}},
+			},
+		}},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "if x > 0 {") {
+		t.Fatalf("missing outer if, got:\n%s", out)
+	}
+	if !strings.Contains(out, "if x < 100 {") {
+		t.Fatalf("missing inner if, got:\n%s", out)
+	}
+	if !strings.Contains(out, "doWork()") {
+		t.Fatalf("missing doWork(), got:\n%s", out)
+	}
+}
+
+// TestCompileIfWithElvisGuard — if + elvis in same body
+func TestCompileIfWithElvisGuard(t *testing.T) {
+	c := newCompiler(nil)
+	// First: elvis guard
+	c.compileStmt(&ast.ExprStmt{
+		Expr: &ast.ElvisExpr{
+			Left:  &ast.Ident{Name: "data"},
+			Right: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "badRequest"},
+		},
+	})
+	// Then: if check
+	c.compileStmt(&ast.IfStmt{
+		Condition: &ast.BinaryExpr{
+			Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "data"}, Field: "valid"},
+			Op:    "==",
+			Right: &ast.Literal{Kind: token.True, Value: "true"},
+		},
+		Then: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ReturnStmt{Value: &ast.Ident{Name: "data"}},
+		}},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "if data == nil {") {
+		t.Fatalf("missing elvis guard, got:\n%s", out)
+	}
+	if !strings.Contains(out, "return errors.BadRequest") {
+		t.Fatalf("missing throw, got:\n%s", out)
+	}
+	if !strings.Contains(out, "if data.Valid == true {") {
+		t.Fatalf("missing if condition, got:\n%s", out)
+	}
+}
+
+// TestCompileObjectExprFields — { name: "lin", age: 18, active: true }
+func TestCompileObjectExprFields(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.ObjectExpr{Fields: []*ast.NamedArg{
+		{Name: "name", Value: &ast.Literal{Kind: token.String, Value: "lin"}},
+		{Name: "age", Value: &ast.Literal{Kind: token.Int, Value: "18"}},
+		{Name: "active", Value: &ast.Literal{Kind: token.True, Value: "true"}},
+	}})
+	if !strings.Contains(got, `Name: "lin"`) {
+		t.Fatalf("missing Name field, got:\n%s", got)
+	}
+	if !strings.Contains(got, "Age: 18") {
+		t.Fatalf("missing Age field, got:\n%s", got)
+	}
+	if !strings.Contains(got, "Active: true") {
+		t.Fatalf("missing Active field, got:\n%s", got)
+	}
+}
+
+// TestCompileReturnList — return [1, 2, 3]
+func TestCompileReturnList(t *testing.T) {
+	c := newCompiler(nil)
+	c.api = &ast.ApiDecl{Name: "getIds", ReturnType: &ast.TypeRef{Name: "CustomList"}}
+	c.compileStmt(&ast.ReturnStmt{
+		Value: &ast.ListExpr{Items: []ast.Expr{
+			&ast.Literal{Kind: token.Int, Value: "1"},
+			&ast.Literal{Kind: token.Int, Value: "2"},
+			&ast.Literal{Kind: token.Int, Value: "3"},
+		}},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "[]any{1, 2, 3}") {
+		t.Fatalf("missing list literal, got:\n%s", out)
+	}
+	if !strings.Contains(out, "AppendJSON") {
+		t.Fatalf("missing AppendJSON for list return, got:\n%s", out)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// C. Edge cases
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// TestCompileEmptyBody — API with no statements
+func TestCompileEmptyBody(t *testing.T) {
+	api := &ast.ApiDecl{
+		Name:   "noop",
+		Params: nil,
+		Body:   &ast.Block{Stmts: nil},
+	}
+	var b strings.Builder
+	compileAPIBody(&b, api, nil, nil)
+	out := b.String()
+	if !strings.Contains(out, "func handleNoop(app *App) api.HandlerFunc") {
+		t.Fatalf("missing function signature, got:\n%s", out)
+	}
+	if !strings.Contains(out, "return func(ctx context.Context, req *api.Request) error {") {
+		t.Fatalf("missing inner func, got:\n%s", out)
+	}
+}
+
+// TestCompileMultipleReturns — early return + final return
+func TestCompileMultipleReturns(t *testing.T) {
+	c := newCompiler(nil)
+	c.api = &ast.ApiDecl{Name: "check", ReturnType: &ast.TypeRef{Name: "Boolean"}}
+	// if x == 0 { return false }
+	c.compileStmt(&ast.IfStmt{
+		Condition: &ast.BinaryExpr{
+			Left:  &ast.Ident{Name: "x"},
+			Op:    "==",
+			Right: &ast.Literal{Kind: token.Int, Value: "0"},
+		},
+		Then: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ReturnStmt{Value: &ast.Literal{Kind: token.False, Value: "false"}},
+		}},
+	})
+	// return true
+	c.compileStmt(&ast.ReturnStmt{Value: &ast.Literal{Kind: token.True, Value: "true"}})
+	out := compilerOut(c)
+	if !strings.Contains(out, "if x == 0 {") {
+		t.Fatalf("missing if, got:\n%s", out)
+	}
+	if !strings.Contains(out, "req.Buf.AppendBool(false)") {
+		t.Fatalf("missing early return false, got:\n%s", out)
+	}
+	if !strings.Contains(out, "req.Buf.AppendBool(true)") {
+		t.Fatalf("missing final return true, got:\n%s", out)
+	}
+}
+
+// TestCompileForEmptyBody — for with empty body
+func TestCompileForEmptyBody(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.ForStmt{
+		VarName:    "x",
+		Collection: &ast.Ident{Name: "items"},
+		Body:       &ast.Block{Stmts: nil},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "for _, x := range items {") {
+		t.Fatalf("missing for range, got:\n%s", out)
+	}
+	if !strings.Contains(out, "}") {
+		t.Fatalf("missing closing brace, got:\n%s", out)
+	}
+}
+
+// TestCompileTemplateStringEmpty — empty template
+func TestCompileTemplateStringEmpty(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.TemplateString{Parts: nil})
+	if got != `""` {
+		t.Fatalf("expected empty string, got %q", got)
+	}
+}
+
+// TestCompileAssignSimple — x = 5
+func TestCompileAssignSimple(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.AssignStmt{
+		Target: &ast.Ident{Name: "x"},
+		Op:     "=",
+		Value:  &ast.Literal{Kind: token.Int, Value: "5"},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "x = 5") {
+		t.Fatalf("missing x = 5, got:\n%s", out)
+	}
+}
+
+// TestCompileParallelProfileAPI — full API with await for parallel queries
+func TestCompileParallelProfileAPI(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"User": {Name: "User", Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+		}},
+		"Post": {Name: "Post", Fields: []*ast.FieldDecl{
+			{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+		}},
+	}
+
+	api := &ast.ApiDecl{
+		Name:       "getUserProfile",
+		ReturnType: &ast.TypeRef{Name: "User"},
+		Params: []*ast.ParamDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+		},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			// await { val user = User.find(id); val posts = Post.where(...).all() }
+			&ast.ExprStmt{Expr: &ast.AwaitExpr{
+				Body: &ast.Block{Stmts: []ast.Stmt{
+					&ast.ValStmt{
+						Name: "user",
+						Value: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "find"},
+							Args: []*ast.NamedArg{{Name: "id", Value: &ast.Ident{Name: "id"}}},
+						},
+					},
+					&ast.ValStmt{
+						Name: "posts",
+						Value: &ast.CallExpr{
+							Func: &ast.MemberExpr{
+								Object: &ast.CallExpr{
+									Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "where"},
+									Args: []*ast.NamedArg{},
+								},
+								Field: "all",
+							},
+							Args: []*ast.NamedArg{},
+						},
+					},
+				}},
+			}},
+			// return user
+			&ast.ReturnStmt{Value: &ast.Ident{Name: "user"}},
+		}},
+	}
+
+	var b strings.Builder
+	compileAPIBody(&b, api, models, nil)
+	out := b.String()
+
+	// Should have function signature
+	if !strings.Contains(out, "func handleGetUserProfile") {
+		t.Fatalf("missing handler func, got:\n%s", out)
+	}
+	// Should have param extraction
+	if !strings.Contains(out, "req.ParamInt") {
+		t.Fatalf("missing ParamInt, got:\n%s", out)
+	}
+	// Should have var declarations
+	if !strings.Contains(out, "var user *User") {
+		t.Fatalf("missing var user, got:\n%s", out)
+	}
+	if !strings.Contains(out, "var posts []*Post") {
+		t.Fatalf("missing var posts, got:\n%s", out)
+	}
+	// Should have errgroup
+	if !strings.Contains(out, "errgroup.WithContext") {
+		t.Fatalf("missing errgroup, got:\n%s", out)
+	}
+	// Should use gctx in goroutines
+	if !strings.Contains(out, "gctx") {
+		t.Fatalf("missing gctx, got:\n%s", out)
+	}
+	// Should have WriteJSON for return
+	if !strings.Contains(out, "WriteJSON") {
+		t.Fatalf("missing WriteJSON, got:\n%s", out)
+	}
+}
+
+// TestCompileForRangeExpr — for i in 0..10 { ... } → C-style for loop
+func TestCompileForRangeExpr(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.ForStmt{
+		VarName: "i",
+		Collection: &ast.RangeExpr{
+			Start: &ast.Literal{Kind: token.Int, Value: "0"},
+			End:   &ast.Literal{Kind: token.Int, Value: "10"},
+		},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.CallExpr{
+				Func: &ast.Ident{Name: "process"},
+				Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "i"}}},
+			}},
+		}},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "for i := int64(0); i <= 10; i++") {
+		t.Fatalf("expected C-style for loop, got:\n%s", out)
+	}
+	if !strings.Contains(out, "process(i)") {
+		t.Fatalf("missing body, got:\n%s", out)
+	}
+}
+
+// TestCompileForRangeWithExprBounds — for i in start..end
+func TestCompileForRangeWithExprBounds(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.ForStmt{
+		VarName: "idx",
+		Collection: &ast.RangeExpr{
+			Start: &ast.Ident{Name: "offset"},
+			End:   &ast.BinaryExpr{Left: &ast.Ident{Name: "offset"}, Op: "+", Right: &ast.Ident{Name: "limit"}},
+		},
+		Body: &ast.Block{Stmts: []ast.Stmt{}},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "for idx := int64(offset); idx <= offset + limit; idx++") {
+		t.Fatalf("expected range with expr bounds, got:\n%s", out)
+	}
+}
+
+// TestCompileForAsExpression — val doubled = for item in items { item * 2 }
+func TestCompileForAsExpression(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.ForStmt{
+		VarName:    "item",
+		Collection: &ast.Ident{Name: "items"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.BinaryExpr{
+				Left:  &ast.Ident{Name: "item"},
+				Op:    "*",
+				Right: &ast.Literal{Kind: token.Int, Value: "2"},
+			}},
+		}},
+	})
+	if !strings.Contains(got, "var _result []any") {
+		t.Fatalf("missing result slice, got:\n%s", got)
+	}
+	if !strings.Contains(got, "for _, item := range items") {
+		t.Fatalf("missing range loop, got:\n%s", got)
+	}
+	if !strings.Contains(got, "item * 2") {
+		t.Fatalf("missing collected expression, got:\n%s", got)
+	}
+	if !strings.Contains(got, "_result = append(_result,") {
+		t.Fatalf("missing append, got:\n%s", got)
+	}
+}
+
+// TestCompileForExprWithRange — val squares = for i in 0..5 { i * i }
+func TestCompileForExprWithRange(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.ForStmt{
+		VarName: "i",
+		Collection: &ast.RangeExpr{
+			Start: &ast.Literal{Kind: token.Int, Value: "0"},
+			End:   &ast.Literal{Kind: token.Int, Value: "5"},
+		},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.BinaryExpr{
+				Left:  &ast.Ident{Name: "i"},
+				Op:    "*",
+				Right: &ast.Ident{Name: "i"},
+			}},
+		}},
+	})
+	if !strings.Contains(got, "for i := int64(0); i <= 5; i++") {
+		t.Fatalf("expected C-style range in for expr, got:\n%s", got)
+	}
+	if !strings.Contains(got, "i * i") {
+		t.Fatalf("missing expression, got:\n%s", got)
+	}
+}
+
+// TestCompileForExprEmpty — for in empty → []any{}
+func TestCompileForExprEmpty(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.ForStmt{
+		VarName:    "x",
+		Collection: &ast.Ident{Name: "items"},
+		Body:       &ast.Block{Stmts: nil},
+	})
+	if got != "[]any{}" {
+		t.Fatalf("expected []any{}, got %q", got)
+	}
+}
+
+// TestCompileIntRange — lux.IntRange runtime function
+func TestIntRange(t *testing.T) {
+	result := lux.IntRange(0, 5)
+	if len(result) != 6 {
+		t.Fatalf("IntRange(0,5) len = %d, want 6", len(result))
+	}
+	if result[0] != 0 || result[5] != 5 {
+		t.Errorf("IntRange(0,5) = %v", result)
+	}
+}
+
+func TestIntRangeReverse(t *testing.T) {
+	result := lux.IntRange(10, 5)
+	if result != nil {
+		t.Errorf("IntRange(10,5) should be nil, got %v", result)
+	}
+}
+
+func TestIntRangeSingle(t *testing.T) {
+	result := lux.IntRange(3, 3)
+	if len(result) != 1 || result[0] != 3 {
+		t.Errorf("IntRange(3,3) = %v, want [3]", result)
+	}
+}
+
+// === ? operator tests ===
+
+func TestCompileValWithQuestion(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.ValStmt{
+		Name: "x",
+		Value: &ast.UnaryExpr{Op: "?", Value: &ast.CallExpr{
+			Func: &ast.Ident{Name: "riskyCall"}, Args: []*ast.NamedArg{},
+		}},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "x, err := riskyCall()") {
+		t.Fatalf("missing err assignment, got:\n%s", out)
+	}
+	if !strings.Contains(out, "return err") {
+		t.Fatalf("missing error propagation, got:\n%s", out)
+	}
+}
+
+func TestCompileExprStmtWithQuestion(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.ExprStmt{Expr: &ast.UnaryExpr{Op: "?", Value: &ast.CallExpr{
+		Func: &ast.Ident{Name: "doSomething"}, Args: []*ast.NamedArg{},
+	}}})
+	out := compilerOut(c)
+	if !strings.Contains(out, "if err := doSomething()") {
+		t.Fatalf("missing inline err check, got:\n%s", out)
+	}
+}
+
+// === New chain methods ===
+
+func TestCompileChainOrderByDesc(t *testing.T) {
+	models := makeModels("User")
+	c := newCompiler(models)
+	call := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{
+					Object: &ast.CallExpr{
+						Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+						Args: []*ast.NamedArg{},
+					},
+					Field: "orderBy",
+				},
+				Args: []*ast.NamedArg{{Value: &ast.MemberExpr{Object: &ast.Ident{Name: "name"}, Field: "desc"}}},
+			},
+			Field: "all",
+		},
+		Args: []*ast.NamedArg{},
+	}
+	got := c.compileExpr(call)
+	if !strings.Contains(got, `.OrderBy("name DESC")`) {
+		t.Fatalf("expected OrderBy DESC, got %q", got)
+	}
+}
+
+func TestCompileChainLimitAll(t *testing.T) {
+	models := makeModels("User")
+	c := newCompiler(models)
+	call := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{
+					Object: &ast.CallExpr{
+						Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+						Args: []*ast.NamedArg{},
+					},
+					Field: "limit",
+				},
+				Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "10"}}},
+			},
+			Field: "all",
+		},
+		Args: []*ast.NamedArg{},
+	}
+	got := c.compileExpr(call)
+	if !strings.Contains(got, ".Limit(10)") {
+		t.Fatalf("expected Limit, got %q", got)
+	}
+}
+
+func TestCompileModelChainSum(t *testing.T) {
+	models := makeModels("Order")
+	c := newCompiler(models)
+	call := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Order"}, Field: "where"},
+				Args: []*ast.NamedArg{},
+			},
+			Field: "sum",
+		},
+		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "total"}}},
+	}
+	got := c.compileExpr(call)
+	if !strings.Contains(got, `.Sum(ctx, "total")`) {
+		t.Fatalf("expected Sum, got %q", got)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// D. Real-world mixed scenarios (full compileAPIBody)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// TestCompileTransferAPI — Bank transfer with tx + await + error check:
+//
+//	api transfer(fromId: Int, toId: Int, amount: Float) {
+//	  val from = User.find(fromId)
+//	  from ?: throw error.NotFound
+//	  tx {
+//	    val balance = getBalance(from)?
+//	    if balance < amount {
+//	      throw error.InsufficientFunds
+//	    }
+//	    from.balance -= amount
+//	  }
+//	  emit TransferCompleted(fromId: fromId, toId: toId, amount: amount)
+//	}
+func TestCompileTransferAPI(t *testing.T) {
+	models := makeModels("User")
+	api := &ast.ApiDecl{
+		Name: "transfer",
+		Params: []*ast.ParamDecl{
+			{Name: "fromId", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "toId", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "amount", Type: &ast.TypeRef{Name: "Float"}},
+		},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			// val from = User.find(fromId)
+			&ast.ValStmt{
+				Name: "from",
+				Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "find"},
+					Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "fromId"}}},
+				},
+			},
+			// from ?: throw error.NotFound
+			&ast.ExprStmt{
+				Expr: &ast.ElvisExpr{
+					Left:  &ast.Ident{Name: "from"},
+					Right: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "notFound"},
+				},
+			},
+			// tx { val balance = getBalance(from)?; if balance < amount { throw error.InsufficientFunds }; from.balance -= amount }
+			&ast.ExprStmt{
+				Expr: &ast.TransactionExpr{
+					Body: &ast.Block{Stmts: []ast.Stmt{
+						&ast.ValStmt{
+							Name: "balance",
+							Value: &ast.UnaryExpr{
+								Op: "?",
+								Value: &ast.CallExpr{
+									Func: &ast.Ident{Name: "getBalance"},
+									Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "from"}}},
+								},
+							},
+						},
+						&ast.IfStmt{
+							Condition: &ast.BinaryExpr{
+								Left:  &ast.Ident{Name: "balance"},
+								Op:    "<",
+								Right: &ast.Ident{Name: "amount"},
+							},
+							Then: &ast.Block{Stmts: []ast.Stmt{
+								&ast.ThrowStmt{
+									Error: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "insufficientFunds"},
+								},
+							}},
+						},
+						&ast.AssignStmt{
+							Target: &ast.MemberExpr{Object: &ast.Ident{Name: "from"}, Field: "balance"},
+							Op:     "-=",
+							Value:  &ast.Ident{Name: "amount"},
+						},
+					}},
+				},
+			},
+			// emit TransferCompleted(fromId: fromId, toId: toId, amount: amount)
+			&ast.EmitStmt{
+				EventName: "TransferCompleted",
+				Args: []*ast.NamedArg{
+					{Name: "fromId", Value: &ast.Ident{Name: "fromId"}},
+					{Name: "toId", Value: &ast.Ident{Name: "toId"}},
+					{Name: "amount", Value: &ast.Ident{Name: "amount"}},
+				},
+			},
+		}},
+	}
+
+	var b strings.Builder
+	compileAPIBody(&b, api, models, nil)
+	out := b.String()
+
+	// Check function signature
+	if !strings.Contains(out, "func handleTransfer(app *App) api.HandlerFunc") {
+		t.Fatalf("missing handleTransfer signature, got:\n%s", out)
+	}
+	// Check param extraction
+	if !strings.Contains(out, `req.ParamInt("fromId")`) {
+		t.Fatalf("missing ParamInt for fromId, got:\n%s", out)
+	}
+	if !strings.Contains(out, `req.ParamInt("toId")`) {
+		t.Fatalf("missing ParamInt for toId, got:\n%s", out)
+	}
+	if !strings.Contains(out, `req.ParamFloat("amount")`) {
+		t.Fatalf("missing ParamFloat for amount, got:\n%s", out)
+	}
+	// Check find
+	if !strings.Contains(out, "app.User.Where(UserWhere.Id.Eq(fromId)).First(ctx)") {
+		t.Fatalf("missing User.find, got:\n%s", out)
+	}
+	// Check elvis guard
+	if !strings.Contains(out, "if from == nil {") {
+		t.Fatalf("missing elvis nil check, got:\n%s", out)
+	}
+	if !strings.Contains(out, "return errors.NotFound") {
+		t.Fatalf("missing throw NotFound, got:\n%s", out)
+	}
+	// Check transaction
+	if !strings.Contains(out, "app.DB.Tx(ctx, func(ctx context.Context) error {") {
+		t.Fatalf("missing Tx wrapper, got:\n%s", out)
+	}
+	// Check ? operator inside tx
+	if !strings.Contains(out, "balance, err := getBalance(from)") {
+		t.Fatalf("missing ? operator error propagation, got:\n%s", out)
+	}
+	// Check if condition
+	if !strings.Contains(out, "if balance < amount {") {
+		t.Fatalf("missing balance < amount check, got:\n%s", out)
+	}
+	// Check throw inside if
+	if !strings.Contains(out, "return errors.InsufficientFunds") {
+		t.Fatalf("missing throw InsufficientFunds, got:\n%s", out)
+	}
+	// Check compound assignment
+	if !strings.Contains(out, "from.Balance -= amount") {
+		t.Fatalf("missing from.balance -= amount, got:\n%s", out)
+	}
+	// Check emit
+	if !strings.Contains(out, "EmitTransferCompleted") {
+		t.Fatalf("missing EmitTransferCompleted, got:\n%s", out)
+	}
+	if !strings.Contains(out, "TransferCompletedEvent{") {
+		t.Fatalf("missing TransferCompletedEvent, got:\n%s", out)
+	}
+	if !strings.Contains(out, "FromId: fromId") {
+		t.Fatalf("missing FromId arg, got:\n%s", out)
+	}
+	if !strings.Contains(out, "ToId: toId") {
+		t.Fatalf("missing ToId arg, got:\n%s", out)
+	}
+	if !strings.Contains(out, "Amount: amount") {
+		t.Fatalf("missing Amount arg, got:\n%s", out)
+	}
+}
+
+// TestCompileSearchAPI — Search with orderBy + limit + template string:
+//
+//	api searchPosts(keyword: String, limit: Int): [Post] {
+//	  val posts = Post.where(it.title == keyword).orderBy(views.desc).limit(limit).all()
+//	  return posts
+//	}
+func TestCompileSearchAPI(t *testing.T) {
+	models := makeModels("Post")
+	api := &ast.ApiDecl{
+		Name: "searchPosts",
+		Params: []*ast.ParamDecl{
+			{Name: "keyword", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "limit", Type: &ast.TypeRef{Name: "Int"}},
+		},
+		ReturnType: &ast.TypeRef{Name: "Post", IsList: true},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			// val posts = Post.where(it.title == keyword).orderBy(views.desc).limit(limit).all()
+			&ast.ValStmt{
+				Name: "posts",
+				Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{
+						Object: &ast.CallExpr{
+							Func: &ast.MemberExpr{
+								Object: &ast.CallExpr{
+									Func: &ast.MemberExpr{
+										Object: &ast.CallExpr{
+											Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "where"},
+											Args: []*ast.NamedArg{{
+												Value: &ast.BinaryExpr{
+													Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "title"},
+													Op:    "==",
+													Right: &ast.Ident{Name: "keyword"},
+												},
+											}},
+										},
+										Field: "orderBy",
+									},
+									Args: []*ast.NamedArg{{Value: &ast.MemberExpr{Object: &ast.Ident{Name: "views"}, Field: "desc"}}},
+								},
+								Field: "limit",
+							},
+							Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "limit"}}},
+						},
+						Field: "all",
+					},
+				},
+			},
+			// return posts
+			&ast.ReturnStmt{Value: &ast.Ident{Name: "posts"}},
+		}},
+	}
+
+	var b strings.Builder
+	compileAPIBody(&b, api, models, nil)
+	out := b.String()
+
+	if !strings.Contains(out, "func handleSearchPosts(app *App) api.HandlerFunc") {
+		t.Fatalf("missing function signature, got:\n%s", out)
+	}
+	if !strings.Contains(out, `req.ParamString("keyword")`) {
+		t.Fatalf("missing ParamString for keyword, got:\n%s", out)
+	}
+	if !strings.Contains(out, `req.ParamInt("limit")`) {
+		t.Fatalf("missing ParamInt for limit, got:\n%s", out)
+	}
+	if !strings.Contains(out, "PostWhere.Title.Eq(keyword)") {
+		t.Fatalf("missing where clause, got:\n%s", out)
+	}
+	if !strings.Contains(out, `.OrderBy("views DESC")`) {
+		t.Fatalf("missing OrderBy DESC, got:\n%s", out)
+	}
+	if !strings.Contains(out, ".Limit(limit)") {
+		t.Fatalf("missing .Limit(limit), got:\n%s", out)
+	}
+	if !strings.Contains(out, ".All(ctx)") {
+		t.Fatalf("missing .All(ctx), got:\n%s", out)
+	}
+	// Check return — posts is list model → listJSON
+	if !strings.Contains(out, "postListJSON(posts).WriteJSON(req.Buf, req.Select)") {
+		t.Fatalf("missing listJSON WriteJSON, got:\n%s", out)
+	}
+}
+
+// TestCompileAnalyticsAPI — Aggregation + count + sum:
+//
+//	api getAnalytics(): Int {
+//	  val total = Order.where(it.status == "PAID").count()
+//	  val revenue = Order.where(it.status == "PAID").sum(amount)
+//	  return total
+//	}
+func TestCompileAnalyticsAPI(t *testing.T) {
+	models := makeModels("Order")
+	api := &ast.ApiDecl{
+		Name:       "getAnalytics",
+		Params:     nil,
+		ReturnType: &ast.TypeRef{Name: "Int"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			// val total = Order.where(it.status == "PAID").count()
+			&ast.ValStmt{
+				Name: "total",
+				Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{
+						Object: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Order"}, Field: "where"},
+							Args: []*ast.NamedArg{{
+								Value: &ast.BinaryExpr{
+									Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "status"},
+									Op:    "==",
+									Right: &ast.Literal{Kind: token.String, Value: "PAID"},
+								},
+							}},
+						},
+						Field: "count",
+					},
+				},
+			},
+			// val revenue = Order.where(it.status == "PAID").sum(amount)
+			&ast.ValStmt{
+				Name: "revenue",
+				Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{
+						Object: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Order"}, Field: "where"},
+							Args: []*ast.NamedArg{{
+								Value: &ast.BinaryExpr{
+									Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "status"},
+									Op:    "==",
+									Right: &ast.Literal{Kind: token.String, Value: "PAID"},
+								},
+							}},
+						},
+						Field: "sum",
+					},
+					Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "amount"}}},
+				},
+			},
+			// return total
+			&ast.ReturnStmt{Value: &ast.Ident{Name: "total"}},
+		}},
+	}
+
+	var b strings.Builder
+	compileAPIBody(&b, api, models, nil)
+	out := b.String()
+
+	if !strings.Contains(out, "func handleGetAnalytics(app *App) api.HandlerFunc") {
+		t.Fatalf("missing function signature, got:\n%s", out)
+	}
+	// Check count query
+	if !strings.Contains(out, `OrderWhere.Status.Eq("PAID")`) {
+		t.Fatalf("missing where status PAID, got:\n%s", out)
+	}
+	if !strings.Contains(out, ".Count(ctx)") {
+		t.Fatalf("missing .Count(ctx), got:\n%s", out)
+	}
+	// Check sum query
+	if !strings.Contains(out, `.Sum(ctx, "amount")`) {
+		t.Fatalf("missing .Sum(ctx, amount), got:\n%s", out)
+	}
+	// Check return — total tracked as Int from count → AppendInt
+	if !strings.Contains(out, "req.Buf.AppendInt(int64(total))") {
+		t.Fatalf("missing AppendInt(total), got:\n%s", out)
+	}
+}
+
+// TestCompileAsyncNotificationAPI — async fire-and-forget + for loop:
+//
+//	api notifyAll(message: String) {
+//	  val users = User.where(it.active == true).all()
+//	  for user in users {
+//	    async { emit Notification(userId: user.id, message: message) }
+//	  }
+//	}
+func TestCompileAsyncNotificationAPI(t *testing.T) {
+	models := makeModels("User")
+	api := &ast.ApiDecl{
+		Name: "notifyAll",
+		Params: []*ast.ParamDecl{
+			{Name: "message", Type: &ast.TypeRef{Name: "String"}},
+		},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			// val users = User.where(it.active == true).all()
+			&ast.ValStmt{
+				Name: "users",
+				Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{
+						Object: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+							Args: []*ast.NamedArg{{
+								Value: &ast.BinaryExpr{
+									Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "active"},
+									Op:    "==",
+									Right: &ast.Literal{Kind: token.True, Value: "true"},
+								},
+							}},
+						},
+						Field: "all",
+					},
+				},
+			},
+			// for user in users { async { emit Notification(...) } }
+			&ast.ForStmt{
+				VarName:    "user",
+				Collection: &ast.Ident{Name: "users"},
+				Body: &ast.Block{Stmts: []ast.Stmt{
+					&ast.ExprStmt{Expr: &ast.AsyncExpr{
+						Body: &ast.Block{Stmts: []ast.Stmt{
+							&ast.EmitStmt{
+								EventName: "Notification",
+								Args: []*ast.NamedArg{
+									{Name: "userId", Value: &ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "id"}},
+									{Name: "message", Value: &ast.Ident{Name: "message"}},
+								},
+							},
+						}},
+					}},
+				}},
+			},
+		}},
+	}
+
+	var b strings.Builder
+	compileAPIBody(&b, api, models, nil)
+	out := b.String()
+
+	if !strings.Contains(out, "func handleNotifyAll(app *App) api.HandlerFunc") {
+		t.Fatalf("missing function signature, got:\n%s", out)
+	}
+	if !strings.Contains(out, `req.ParamString("message")`) {
+		t.Fatalf("missing ParamString for message, got:\n%s", out)
+	}
+	if !strings.Contains(out, "UserWhere.Active.Eq(true)") {
+		t.Fatalf("missing where active, got:\n%s", out)
+	}
+	if !strings.Contains(out, ".All(ctx)") {
+		t.Fatalf("missing .All(ctx), got:\n%s", out)
+	}
+	if !strings.Contains(out, "for _, user := range users {") {
+		t.Fatalf("missing for range, got:\n%s", out)
+	}
+	if !strings.Contains(out, "go func() {") {
+		t.Fatalf("missing go func(), got:\n%s", out)
+	}
+	if !strings.Contains(out, "EmitNotification") {
+		t.Fatalf("missing EmitNotification, got:\n%s", out)
+	}
+	if !strings.Contains(out, "UserId: user.Id") {
+		t.Fatalf("missing UserId: user.Id, got:\n%s", out)
+	}
+	if !strings.Contains(out, "Message: message") {
+		t.Fatalf("missing Message: message, got:\n%s", out)
+	}
+}
+
+// TestCompileForRangeWithAccumulator — for in range + compound assign:
+//
+//	api sumRange(): Int {
+//	  var total = 0
+//	  for i in 1..100 { total += i }
+//	  return total
+//	}
+func TestCompileForRangeWithAccumulator(t *testing.T) {
+	api := &ast.ApiDecl{
+		Name:       "sumRange",
+		Params:     nil,
+		ReturnType: &ast.TypeRef{Name: "Int"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			// var total = 0
+			&ast.ValStmt{
+				Name:    "total",
+				Value:   &ast.Literal{Kind: token.Int, Value: "0"},
+				Mutable: true,
+			},
+			// for i in 1..100 { total += i }
+			&ast.ForStmt{
+				VarName: "i",
+				Collection: &ast.RangeExpr{
+					Start: &ast.Literal{Kind: token.Int, Value: "1"},
+					End:   &ast.Literal{Kind: token.Int, Value: "100"},
+				},
+				Body: &ast.Block{Stmts: []ast.Stmt{
+					&ast.AssignStmt{
+						Target: &ast.Ident{Name: "total"},
+						Op:     "+=",
+						Value:  &ast.Ident{Name: "i"},
+					},
+				}},
+			},
+			// return total
+			&ast.ReturnStmt{Value: &ast.Ident{Name: "total"}},
+		}},
+	}
+
+	var b strings.Builder
+	compileAPIBody(&b, api, nil, nil)
+	out := b.String()
+
+	if !strings.Contains(out, "func handleSumRange(app *App) api.HandlerFunc") {
+		t.Fatalf("missing function signature, got:\n%s", out)
+	}
+	if !strings.Contains(out, "total := int64(0)") {
+		t.Fatalf("missing total := 0, got:\n%s", out)
+	}
+	if !strings.Contains(out, "for i := int64(1); i <= 100; i++") {
+		t.Fatalf("missing C-style for loop, got:\n%s", out)
+	}
+	if !strings.Contains(out, "total += i") {
+		t.Fatalf("missing total += i, got:\n%s", out)
+	}
+	if !strings.Contains(out, "req.Buf.AppendInt(int64(total))") {
+		t.Fatalf("missing AppendInt(total), got:\n%s", out)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// E. Feature combination tests (newCompiler)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// TestCompileWhenWithModelQuery — when branches containing model queries
+func TestCompileWhenWithModelQuery(t *testing.T) {
+	models := makeModels("User")
+	c := newCompiler(models)
+	got := c.compileExpr(&ast.WhenExpr{
+		Subject: &ast.Ident{Name: "role"},
+		Branches: []*ast.WhenBranch{
+			{
+				Condition: &ast.Literal{Kind: token.String, Value: "ADMIN"},
+				Body: &ast.CallExpr{
+					Func: &ast.MemberExpr{
+						Object: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+							Args: []*ast.NamedArg{{
+								Value: &ast.BinaryExpr{
+									Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "role"},
+									Op:    "==",
+									Right: &ast.Literal{Kind: token.String, Value: "ADMIN"},
+								},
+							}},
+						},
+						Field: "count",
+					},
+				},
+			},
+		},
+		Else: &ast.Literal{Kind: token.Int, Value: "0"},
+	})
+	if !strings.Contains(got, "switch role") {
+		t.Fatalf("missing switch, got:\n%s", got)
+	}
+	if !strings.Contains(got, `case "ADMIN"`) {
+		t.Fatalf("missing case ADMIN, got:\n%s", got)
+	}
+	if !strings.Contains(got, ".Count(ctx)") {
+		t.Fatalf("missing .Count(ctx) in when branch, got:\n%s", got)
+	}
+	if !strings.Contains(got, "default:") {
+		t.Fatalf("missing default, got:\n%s", got)
+	}
+}
+
+// TestCompileLambdaWithForLoop — lambda containing a for loop
+func TestCompileLambdaWithForLoop(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.LambdaExpr{
+		Params: []string{"items"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ForStmt{
+				VarName:    "item",
+				Collection: &ast.Ident{Name: "items"},
+				Body: &ast.Block{Stmts: []ast.Stmt{
+					&ast.ExprStmt{Expr: &ast.CallExpr{
+						Func: &ast.Ident{Name: "process"},
+						Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "item"}}},
+					}},
+				}},
+			},
+		}},
+	})
+	if !strings.Contains(got, "func(items any) any {") {
+		t.Fatalf("missing lambda signature, got:\n%s", got)
+	}
+	if !strings.Contains(got, "for _, item := range items {") {
+		t.Fatalf("missing for range inside lambda, got:\n%s", got)
+	}
+	if !strings.Contains(got, "process(item)") {
+		t.Fatalf("missing process(item), got:\n%s", got)
+	}
+}
+
+// TestCompileNestedTransaction — tx containing model create + update
+func TestCompileNestedTransaction(t *testing.T) {
+	models := makeModels("User", "Post")
+	c := newCompiler(models)
+	got := c.compileExpr(&ast.TransactionExpr{
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			// val user = User.create(name: "alice")
+			&ast.ValStmt{
+				Name: "user",
+				Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "create"},
+					Args: []*ast.NamedArg{{Name: "name", Value: &ast.Literal{Kind: token.String, Value: "alice"}}},
+				},
+			},
+			// Post.where(it.userId == user.id).update(authorName: user.name)
+			&ast.ExprStmt{
+				Expr: &ast.CallExpr{
+					Func: &ast.MemberExpr{
+						Object: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "where"},
+							Args: []*ast.NamedArg{{
+								Value: &ast.BinaryExpr{
+									Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "userId"},
+									Op:    "==",
+									Right: &ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "id"},
+								},
+							}},
+						},
+						Field: "update",
+					},
+					Args: []*ast.NamedArg{
+						{Name: "authorName", Value: &ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "name"}},
+					},
+				},
+			},
+		}},
+	})
+	if !strings.Contains(got, "app.DB.Tx(ctx, func(ctx context.Context) error {") {
+		t.Fatalf("missing Tx wrapper, got:\n%s", got)
+	}
+	if !strings.Contains(got, "app.User.Create()") {
+		t.Fatalf("missing User.Create(), got:\n%s", got)
+	}
+	if !strings.Contains(got, `.SetName("alice")`) {
+		t.Fatalf("missing SetName, got:\n%s", got)
+	}
+	if !strings.Contains(got, "PostWhere.UserId.Eq(user.Id)") {
+		t.Fatalf("missing where condition, got:\n%s", got)
+	}
+	if !strings.Contains(got, ".Update(ctx,") {
+		t.Fatalf("missing Update, got:\n%s", got)
+	}
+	if !strings.Contains(got, `lux.SetField{Col: "author_name"`) {
+		t.Fatalf("missing SetField for authorName, got:\n%s", got)
+	}
+}
+
+// TestCompileForExprWithTransform — for as expr: val ids = for user in users { user.id }
+func TestCompileForExprWithTransform(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.ForStmt{
+		VarName:    "user",
+		Collection: &ast.Ident{Name: "users"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "id"}},
+		}},
+	})
+	if !strings.Contains(got, "var _result []any") {
+		t.Fatalf("missing result slice, got:\n%s", got)
+	}
+	if !strings.Contains(got, "for _, user := range users") {
+		t.Fatalf("missing range loop, got:\n%s", got)
+	}
+	if !strings.Contains(got, "user.Id") {
+		t.Fatalf("missing user.Id, got:\n%s", got)
+	}
+	if !strings.Contains(got, "_result = append(_result,") {
+		t.Fatalf("missing append, got:\n%s", got)
+	}
+}
+
+// TestCompileAwaitWithThreeQueries — await with 3 parallel model queries
+func TestCompileAwaitWithThreeQueries(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"User":  {Name: "User"},
+		"Post":  {Name: "Post"},
+		"Order": {Name: "Order"},
+	}
+	c := newCompiler(models)
+	c.compileExpr(&ast.AwaitExpr{
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ValStmt{
+				Name: "user",
+				Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "find"},
+					Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
+				},
+			},
+			&ast.ValStmt{
+				Name: "posts",
+				Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{
+						Object: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "where"},
+							Args: []*ast.NamedArg{},
+						},
+						Field: "all",
+					},
+				},
+			},
+			&ast.ValStmt{
+				Name: "orderCount",
+				Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{
+						Object: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Order"}, Field: "where"},
+							Args: []*ast.NamedArg{},
+						},
+						Field: "count",
+					},
+				},
+			},
+		}},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "var user *User") {
+		t.Fatalf("missing var user, got:\n%s", out)
+	}
+	if !strings.Contains(out, "var posts []*Post") {
+		t.Fatalf("missing var posts, got:\n%s", out)
+	}
+	if !strings.Contains(out, "var orderCount int64") {
+		t.Fatalf("missing var orderCount int64, got:\n%s", out)
+	}
+	// Should have 3 g.Go calls
+	count := strings.Count(out, "g.Go(func() error {")
+	if count != 3 {
+		t.Fatalf("expected 3 g.Go calls, got %d in:\n%s", count, out)
+	}
+	if !strings.Contains(out, "g.Wait()") {
+		t.Fatalf("missing g.Wait(), got:\n%s", out)
+	}
+}
+
+// TestCompileIfWithQuestionOperator — if + ? in same body
+func TestCompileIfWithQuestionOperator(t *testing.T) {
+	c := newCompiler(nil)
+	// val result = riskyCall()?
+	c.compileStmt(&ast.ValStmt{
+		Name: "result",
+		Value: &ast.UnaryExpr{Op: "?", Value: &ast.CallExpr{
+			Func: &ast.Ident{Name: "riskyCall"},
+			Args: nil,
+		}},
+	})
+	// if result > 0 { return result }
+	c.compileStmt(&ast.IfStmt{
+		Condition: &ast.BinaryExpr{
+			Left:  &ast.Ident{Name: "result"},
+			Op:    ">",
+			Right: &ast.Literal{Kind: token.Int, Value: "0"},
+		},
+		Then: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ReturnStmt{Value: &ast.Ident{Name: "result"}},
+		}},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "result, err := riskyCall()") {
+		t.Fatalf("missing ? err assignment, got:\n%s", out)
+	}
+	if !strings.Contains(out, "if err != nil") {
+		t.Fatalf("missing err check, got:\n%s", out)
+	}
+	if !strings.Contains(out, "if result > 0 {") {
+		t.Fatalf("missing if condition, got:\n%s", out)
+	}
+}
+
+// TestCompileChainWhereOrderByLimitAll — full chain: where().orderBy().limit().offset().all()
+func TestCompileChainWhereOrderByLimitAll(t *testing.T) {
+	models := makeModels("Post")
+	c := newCompiler(models)
+	// Post.where(it.views > 100).orderBy(views.desc).limit(10).offset(20).all()
+	whereCall := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "where"},
+		Args: []*ast.NamedArg{{
+			Value: &ast.BinaryExpr{
+				Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "views"},
+				Op:    ">",
+				Right: &ast.Literal{Kind: token.Int, Value: "100"},
+			},
+		}},
+	}
+	orderByCall := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: whereCall, Field: "orderBy"},
+		Args: []*ast.NamedArg{{Value: &ast.MemberExpr{Object: &ast.Ident{Name: "views"}, Field: "desc"}}},
+	}
+	limitCall := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: orderByCall, Field: "limit"},
+		Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "10"}}},
+	}
+	offsetCall := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: limitCall, Field: "offset"},
+		Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "20"}}},
+	}
+	allCall := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: offsetCall, Field: "all"},
+		Args: nil,
+	}
+	got := c.compileExpr(allCall)
+	if !strings.Contains(got, "app.Post.Where(PostWhere.Views.Gt(100))") {
+		t.Fatalf("missing where clause, got:\n%s", got)
+	}
+	if !strings.Contains(got, `.OrderBy("views DESC")`) {
+		t.Fatalf("missing OrderBy, got:\n%s", got)
+	}
+	if !strings.Contains(got, ".Limit(10)") {
+		t.Fatalf("missing Limit, got:\n%s", got)
+	}
+	if !strings.Contains(got, ".Offset(20)") {
+		t.Fatalf("missing Offset, got:\n%s", got)
+	}
+	if !strings.Contains(got, ".All(ctx)") {
+		t.Fatalf("missing All, got:\n%s", got)
+	}
+}
+
+// TestCompileAssignToMember — user.name = "new" (member assignment)
+func TestCompileAssignToMember(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.AssignStmt{
+		Target: &ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "name"},
+		Op:     "=",
+		Value:  &ast.Literal{Kind: token.String, Value: "new"},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, `user.Name = "new"`) {
+		t.Fatalf("missing member assignment, got:\n%s", out)
+	}
+}
+
+// TestCompileTemplateWithMemberAccess — "Hello ${user.name}, you have ${post.count} posts"
+func TestCompileTemplateWithMemberAccess(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.TemplateString{Parts: []ast.Expr{
+		&ast.Literal{Kind: token.String, Value: "Hello "},
+		&ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "name"},
+		&ast.Literal{Kind: token.String, Value: ", you have "},
+		&ast.MemberExpr{Object: &ast.Ident{Name: "post"}, Field: "count"},
+		&ast.Literal{Kind: token.String, Value: " posts"},
+	}})
+	if !strings.Contains(got, `"Hello "`) {
+		t.Fatalf("missing Hello literal, got:\n%s", got)
+	}
+	if !strings.Contains(got, "user.Name") {
+		t.Fatalf("missing user.Name, got:\n%s", got)
+	}
+	if !strings.Contains(got, `", you have "`) {
+		t.Fatalf("missing middle literal, got:\n%s", got)
+	}
+	if !strings.Contains(got, "post.Count") {
+		t.Fatalf("missing post.Count, got:\n%s", got)
+	}
+	if !strings.Contains(got, `" posts"`) {
+		t.Fatalf("missing posts literal, got:\n%s", got)
+	}
+	// Should use strings.Builder pattern
+	if !strings.Contains(got, "strings.Builder") {
+		t.Fatalf("missing strings.Builder, got:\n%s", got)
+	}
+	// Should have 5 WriteString calls
+	count := strings.Count(got, "_sb.WriteString(")
+	if count != 5 {
+		t.Fatalf("expected 5 WriteString calls, got %d:\n%s", count, got)
+	}
+}
+
+// TestCompileListOfObjects — [{name: "a"}, {name: "b"}]
+func TestCompileListOfObjects(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.ListExpr{Items: []ast.Expr{
+		&ast.ObjectExpr{Fields: []*ast.NamedArg{
+			{Name: "name", Value: &ast.Literal{Kind: token.String, Value: "a"}},
+		}},
+		&ast.ObjectExpr{Fields: []*ast.NamedArg{
+			{Name: "name", Value: &ast.Literal{Kind: token.String, Value: "b"}},
+		}},
+	}})
+	if !strings.Contains(got, "[]any{") {
+		t.Fatalf("missing []any{, got:\n%s", got)
+	}
+	if !strings.Contains(got, `Name: "a"`) {
+		t.Fatalf("missing first object, got:\n%s", got)
+	}
+	if !strings.Contains(got, `Name: "b"`) {
+		t.Fatalf("missing second object, got:\n%s", got)
+	}
+}
+
+// TestCompileElvisChainedGuards — multiple x ?: throw in sequence
+func TestCompileElvisChainedGuards(t *testing.T) {
+	c := newCompiler(nil)
+	// user ?: throw error.NotFound
+	c.compileStmt(&ast.ExprStmt{
+		Expr: &ast.ElvisExpr{
+			Left:  &ast.Ident{Name: "user"},
+			Right: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "notFound"},
+		},
+	})
+	// profile ?: throw error.NotFound
+	c.compileStmt(&ast.ExprStmt{
+		Expr: &ast.ElvisExpr{
+			Left:  &ast.Ident{Name: "profile"},
+			Right: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "notFound"},
+		},
+	})
+	// token ?: throw error.Unauthorized
+	c.compileStmt(&ast.ExprStmt{
+		Expr: &ast.ElvisExpr{
+			Left:  &ast.Ident{Name: "token"},
+			Right: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "unauthorized"},
+		},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "if user == nil {") {
+		t.Fatalf("missing user nil check, got:\n%s", out)
+	}
+	if !strings.Contains(out, "if profile == nil {") {
+		t.Fatalf("missing profile nil check, got:\n%s", out)
+	}
+	if !strings.Contains(out, "if token == nil {") {
+		t.Fatalf("missing token nil check, got:\n%s", out)
+	}
+	if !strings.Contains(out, "return errors.Unauthorized") {
+		t.Fatalf("missing errors.Unauthorized, got:\n%s", out)
+	}
+	// All three should have return errors.NotFound (first two)
+	notFoundCount := strings.Count(out, "return errors.NotFound")
+	if notFoundCount != 2 {
+		t.Fatalf("expected 2 return errors.NotFound, got %d in:\n%s", notFoundCount, out)
+	}
+}
+
+// TestCompileForWithNestedIf — for > if > break pattern
+func TestCompileForWithNestedIf(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.ForStmt{
+		VarName:    "item",
+		Collection: &ast.Ident{Name: "items"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.IfStmt{
+				Condition: &ast.BinaryExpr{
+					Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "item"}, Field: "found"},
+					Op:    "==",
+					Right: &ast.Literal{Kind: token.True, Value: "true"},
+				},
+				Then: &ast.Block{Stmts: []ast.Stmt{
+					&ast.ExprStmt{Expr: &ast.CallExpr{
+						Func: &ast.Ident{Name: "log"},
+						Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "item"}}},
+					}},
+					&ast.BreakStmt{},
+				}},
+			},
+		}},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "for _, item := range items {") {
+		t.Fatalf("missing for range, got:\n%s", out)
+	}
+	if !strings.Contains(out, "if item.Found == true {") {
+		t.Fatalf("missing if condition, got:\n%s", out)
+	}
+	if !strings.Contains(out, "log(item)") {
+		t.Fatalf("missing log(item), got:\n%s", out)
+	}
+	if !strings.Contains(out, "break") {
+		t.Fatalf("missing break, got:\n%s", out)
+	}
+}
+
+// TestCompileQuestionWithModelFind — val user = User.find(id)?
+func TestCompileQuestionWithModelFind(t *testing.T) {
+	models := makeModels("User")
+	c := newCompiler(models)
+	c.compileStmt(&ast.ValStmt{
+		Name: "user",
+		Value: &ast.UnaryExpr{
+			Op: "?",
+			Value: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "find"},
+				Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
+			},
+		},
+	})
+	out := compilerOut(c)
+	// ? takes priority: val x = expr? → x, err := expr
+	if !strings.Contains(out, "user, err :=") {
+		t.Fatalf("missing user, err :=, got:\n%s", out)
+	}
+	if !strings.Contains(out, "app.User.Where(UserWhere.Id.Eq(id)).First(ctx)") {
+		t.Fatalf("missing find chain, got:\n%s", out)
+	}
+	if !strings.Contains(out, "if err != nil") {
+		t.Fatalf("missing err check, got:\n%s", out)
+	}
+}
+
+// TestCompileAsyncWithMultipleEmits — async { emit A; emit B }
+func TestCompileAsyncWithMultipleEmits(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.AsyncExpr{
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.EmitStmt{
+				EventName: "TaskStarted",
+				Args:      []*ast.NamedArg{{Name: "taskId", Value: &ast.Ident{Name: "id"}}},
+			},
+			&ast.EmitStmt{
+				EventName: "TaskLogged",
+				Args:      []*ast.NamedArg{{Name: "message", Value: &ast.Literal{Kind: token.String, Value: "started"}}},
+			},
+		}},
+	})
+	if !strings.Contains(got, "go func() {") {
+		t.Fatalf("missing go func(), got:\n%s", got)
+	}
+	if !strings.Contains(got, "EmitTaskStarted") {
+		t.Fatalf("missing EmitTaskStarted, got:\n%s", got)
+	}
+	if !strings.Contains(got, "TaskStartedEvent{") {
+		t.Fatalf("missing TaskStartedEvent, got:\n%s", got)
+	}
+	if !strings.Contains(got, "EmitTaskLogged") {
+		t.Fatalf("missing EmitTaskLogged, got:\n%s", got)
+	}
+	if !strings.Contains(got, "TaskLoggedEvent{") {
+		t.Fatalf("missing TaskLoggedEvent, got:\n%s", got)
+	}
+}
+
+// TestCompileModelDeleteWithCondition — User.where(it.active == false).delete()
+func TestCompileModelDeleteWithCondition(t *testing.T) {
+	models := makeModels("User")
+	c := newCompiler(models)
+	got := c.compileExpr(&ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+				Args: []*ast.NamedArg{{
+					Value: &ast.BinaryExpr{
+						Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "active"},
+						Op:    "==",
+						Right: &ast.Literal{Kind: token.False, Value: "false"},
+					},
+				}},
+			},
+			Field: "delete",
+		},
+	})
+	if !strings.Contains(got, "app.User.Where(UserWhere.Active.Eq(false))") {
+		t.Fatalf("missing where clause, got:\n%s", got)
+	}
+	if !strings.Contains(got, ".Delete(ctx)") {
+		t.Fatalf("missing .Delete(ctx), got:\n%s", got)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// F. Edge cases
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// TestCompileEmptyTransaction — tx { } (empty body)
+func TestCompileEmptyTransaction(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.TransactionExpr{
+		Body: &ast.Block{Stmts: nil},
+	})
+	if !strings.Contains(got, "app.DB.Tx(ctx, func(ctx context.Context) error {") {
+		t.Fatalf("missing Tx wrapper, got:\n%s", got)
+	}
+	if !strings.Contains(got, "return nil") {
+		t.Fatalf("missing return nil, got:\n%s", got)
+	}
+	if !strings.Contains(got, "})") {
+		t.Fatalf("missing closing, got:\n%s", got)
+	}
+}
+
+// TestCompileEmptyAsync — async { } (empty body)
+func TestCompileEmptyAsync(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.AsyncExpr{
+		Body: &ast.Block{Stmts: nil},
+	})
+	if !strings.Contains(got, "go func() {") {
+		t.Fatalf("missing go func(), got:\n%s", got)
+	}
+	if !strings.Contains(got, "}()") {
+		t.Fatalf("missing }(), got:\n%s", got)
+	}
+}
+
+// TestCompileEmptyAwait — await { } (empty body)
+func TestCompileEmptyAwait(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileExpr(&ast.AwaitExpr{
+		Body: &ast.Block{Stmts: nil},
+	})
+	out := compilerOut(c)
+	// Empty await with no val stmts → no errgroup, just empty
+	if strings.Contains(out, "errgroup") {
+		t.Fatalf("empty await should not produce errgroup, got:\n%s", out)
+	}
+}
+
+// TestCompileEmptyLambda — { -> } (empty body)
+func TestCompileEmptyLambda(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.LambdaExpr{
+		Params: nil,
+		Body:   &ast.Block{Stmts: nil},
+	})
+	if !strings.Contains(got, "func(it any) any {") {
+		t.Fatalf("missing lambda signature with implicit it, got:\n%s", got)
+	}
+	if !strings.Contains(got, "}") {
+		t.Fatalf("missing closing brace, got:\n%s", got)
+	}
+}
+
+// TestCompileReturnNullExplicit — return null
+func TestCompileReturnNullExplicit(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.ReturnStmt{
+		Value: &ast.Literal{Kind: token.Null, Value: "null"},
+	})
+	out := compilerOut(c)
+	// null literal compiles to nil, then goes through writeScalarReturn
+	if !strings.Contains(out, "nil") {
+		t.Fatalf("missing nil for null literal, got:\n%s", out)
+	}
+}
+
+// TestCompileMultipleAssignments — x = 1; y = 2; z = x + y
+func TestCompileMultipleAssignments(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.AssignStmt{
+		Target: &ast.Ident{Name: "x"},
+		Op:     "=",
+		Value:  &ast.Literal{Kind: token.Int, Value: "1"},
+	})
+	c.compileStmt(&ast.AssignStmt{
+		Target: &ast.Ident{Name: "y"},
+		Op:     "=",
+		Value:  &ast.Literal{Kind: token.Int, Value: "2"},
+	})
+	c.compileStmt(&ast.AssignStmt{
+		Target: &ast.Ident{Name: "z"},
+		Op:     "=",
+		Value: &ast.BinaryExpr{
+			Left:  &ast.Ident{Name: "x"},
+			Op:    "+",
+			Right: &ast.Ident{Name: "y"},
+		},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "x = 1") {
+		t.Fatalf("missing x = 1, got:\n%s", out)
+	}
+	if !strings.Contains(out, "y = 2") {
+		t.Fatalf("missing y = 2, got:\n%s", out)
+	}
+	if !strings.Contains(out, "z = x + y") {
+		t.Fatalf("missing z = x + y, got:\n%s", out)
+	}
+}
+
+// TestCompileForBreakImmediately — for { break }
+func TestCompileForBreakImmediately(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.ForStmt{
+		VarName:    "x",
+		Collection: &ast.Ident{Name: "items"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.BreakStmt{},
+		}},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "for _, x := range items {") {
+		t.Fatalf("missing for range, got:\n%s", out)
+	}
+	if !strings.Contains(out, "break") {
+		t.Fatalf("missing break, got:\n%s", out)
+	}
+}
+
+// TestCompileNestedForLoops — for > for
+func TestCompileNestedForLoops(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.ForStmt{
+		VarName:    "row",
+		Collection: &ast.Ident{Name: "matrix"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ForStmt{
+				VarName:    "cell",
+				Collection: &ast.Ident{Name: "row"},
+				Body: &ast.Block{Stmts: []ast.Stmt{
+					&ast.ExprStmt{Expr: &ast.CallExpr{
+						Func: &ast.Ident{Name: "process"},
+						Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "cell"}}},
+					}},
+				}},
+			},
+		}},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "for _, row := range matrix {") {
+		t.Fatalf("missing outer for, got:\n%s", out)
+	}
+	if !strings.Contains(out, "for _, cell := range row {") {
+		t.Fatalf("missing inner for, got:\n%s", out)
+	}
+	if !strings.Contains(out, "process(cell)") {
+		t.Fatalf("missing process(cell), got:\n%s", out)
+	}
+}
+
+// TestCompileWhenWithoutElse — when with no else clause
+func TestCompileWhenWithoutElse(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.WhenExpr{
+		Subject: &ast.Ident{Name: "status"},
+		Branches: []*ast.WhenBranch{
+			{Condition: &ast.Literal{Kind: token.String, Value: "OK"}, Body: &ast.Literal{Kind: token.Int, Value: "200"}},
+			{Condition: &ast.Literal{Kind: token.String, Value: "ERR"}, Body: &ast.Literal{Kind: token.Int, Value: "500"}},
+		},
+		Else: nil,
+	})
+	if !strings.Contains(got, "switch status") {
+		t.Fatalf("missing switch, got:\n%s", got)
+	}
+	if !strings.Contains(got, `case "OK"`) {
+		t.Fatalf("missing case OK, got:\n%s", got)
+	}
+	if !strings.Contains(got, `case "ERR"`) {
+		t.Fatalf("missing case ERR, got:\n%s", got)
+	}
+	if strings.Contains(got, "default:") {
+		t.Fatalf("should NOT have default clause when no else, got:\n%s", got)
+	}
+	// Should still have return nil as fallback
+	if !strings.Contains(got, "return nil") {
+		t.Fatalf("missing return nil fallback, got:\n%s", got)
+	}
+}
+
+// TestCompileUnaryNegation — val x = -count
+func TestCompileUnaryNegation(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.ValStmt{
+		Name: "x",
+		Value: &ast.UnaryExpr{
+			Op:    "-",
+			Value: &ast.Ident{Name: "count"},
+		},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "x := -count") {
+		t.Fatalf("missing x := -count, got:\n%s", out)
+	}
+}
+
+// ─── Channel ───────────────────────────────────────────────────────────────
+
+func TestCompileChannelConstruct(t *testing.T) {
+	c := newCompiler(nil)
+	// val ch = Channel(10)
+	c.compileStmt(&ast.ValStmt{
+		Name: "ch",
+		Value: &ast.CallExpr{
+			Func: &ast.Ident{Name: "Channel"},
+			Args: []*ast.NamedArg{{Value: &ast.Literal{Value: "10"}}},
+		},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "ch := make(chan any, 10)") {
+		t.Fatalf("want make(chan any, 10), got:\n%s", out)
+	}
+	// ch should be tracked as channel
+	if vt, ok := c.vars["ch"]; !ok || !vt.isChan {
+		t.Fatal("ch should be tracked as channel variable")
+	}
+}
+
+func TestCompileChannelConstructNoArgs(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileStmt(&ast.ValStmt{
+		Name:  "ch",
+		Value: &ast.CallExpr{Func: &ast.Ident{Name: "Channel"}},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "ch := make(chan any, 0)") {
+		t.Fatalf("want make(chan any, 0), got:\n%s", out)
+	}
+}
+
+func TestCompileChannelSend(t *testing.T) {
+	c := newCompiler(nil)
+	// ch <- 42 as ExprStmt (BinaryExpr with op "<-")
+	c.compileStmt(&ast.ExprStmt{
+		Expr: &ast.BinaryExpr{
+			Left:  &ast.Ident{Name: "ch"},
+			Op:    "<-",
+			Right: &ast.Literal{Value: "42"},
+		},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "ch <- 42") {
+		t.Fatalf("want 'ch <- 42', got:\n%s", out)
+	}
+}
+
+func TestCompileChannelReceive(t *testing.T) {
+	c := newCompiler(nil)
+	// val value = <-ch
+	c.compileStmt(&ast.ValStmt{
+		Name: "value",
+		Value: &ast.UnaryExpr{
+			Op:    "<-",
+			Value: &ast.Ident{Name: "ch"},
+		},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "value := <-ch") {
+		t.Fatalf("want 'value := <-ch', got:\n%s", out)
+	}
+}
+
+func TestCompileChannelClose(t *testing.T) {
+	c := newCompiler(nil)
+	// First create a channel variable so it's tracked
+	c.vars["ch"] = valType{isChan: true}
+	// ch.close()
+	c.compileStmt(&ast.ExprStmt{
+		Expr: &ast.CallExpr{
+			Func: &ast.MemberExpr{
+				Object: &ast.Ident{Name: "ch"},
+				Field:  "close",
+			},
+		},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "close(ch)") {
+		t.Fatalf("want 'close(ch)', got:\n%s", out)
+	}
+}
+
+func TestCompileChannelForRange(t *testing.T) {
+	c := newCompiler(nil)
+	c.vars["ch"] = valType{isChan: true}
+	// for value in ch { ... }
+	c.compileStmt(&ast.ForStmt{
+		VarName:    "value",
+		Collection: &ast.Ident{Name: "ch"},
+		Body: &ast.Block{
+			Stmts: []ast.Stmt{
+				&ast.ExprStmt{Expr: &ast.CallExpr{
+					Func: &ast.Ident{Name: "process"},
+					Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "value"}}},
+				}},
+			},
+		},
+	})
+	out := compilerOut(c)
+	// Should use single-variable range for channels
+	if !strings.Contains(out, "for value := range ch {") {
+		t.Fatalf("want 'for value := range ch', got:\n%s", out)
+	}
+	// Should NOT have the _, prefix
+	if strings.Contains(out, "for _, value") {
+		t.Fatal("channel range should not have _ prefix")
+	}
+}
+
+func TestCompileChannelForRangeSlice(t *testing.T) {
+	c := newCompiler(nil)
+	// Non-channel: for item in items { ... } — should keep _, prefix
+	c.compileStmt(&ast.ForStmt{
+		VarName:    "item",
+		Collection: &ast.Ident{Name: "items"},
+		Body:       &ast.Block{Stmts: []ast.Stmt{}},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "for _, item := range items {") {
+		t.Fatalf("slice range should have _, prefix, got:\n%s", out)
+	}
+}
+
+func TestCompileChannelSelect(t *testing.T) {
+	c := newCompiler(nil)
+	// when { <-ch1 -> { process(it) }, <-ch2 -> { handle(it) } }
+	got := c.compileExpr(&ast.WhenExpr{
+		Branches: []*ast.WhenBranch{
+			{
+				Condition: &ast.UnaryExpr{Op: "<-", Value: &ast.Ident{Name: "ch1"}},
+				Body: &ast.LambdaExpr{
+					Params: []string{"msg"},
+					Body: &ast.Block{
+						Stmts: []ast.Stmt{
+							&ast.ExprStmt{Expr: &ast.CallExpr{
+								Func: &ast.Ident{Name: "process"},
+								Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "msg"}}},
+							}},
+						},
+					},
+				},
+			},
+			{
+				Condition: &ast.UnaryExpr{Op: "<-", Value: &ast.Ident{Name: "ch2"}},
+				Body: &ast.LambdaExpr{
+					Params: []string{"data"},
+					Body: &ast.Block{
+						Stmts: []ast.Stmt{
+							&ast.ExprStmt{Expr: &ast.CallExpr{
+								Func: &ast.Ident{Name: "handle"},
+								Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "data"}}},
+							}},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	if !strings.Contains(got, "select {") {
+		t.Fatalf("should generate select, got:\n%s", got)
+	}
+	if !strings.Contains(got, "case msg := <-ch1:") {
+		t.Fatalf("should have 'case msg := <-ch1:', got:\n%s", got)
+	}
+	if !strings.Contains(got, "case data := <-ch2:") {
+		t.Fatalf("should have 'case data := <-ch2:', got:\n%s", got)
+	}
+	if !strings.Contains(got, "process(msg)") {
+		t.Fatalf("should call process(msg), got:\n%s", got)
+	}
+}
+
+func TestCompileChannelSelectWithDefault(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.WhenExpr{
+		Branches: []*ast.WhenBranch{
+			{
+				Condition: &ast.UnaryExpr{Op: "<-", Value: &ast.Ident{Name: "ch"}},
+				Body: &ast.LambdaExpr{
+					Params: []string{"v"},
+					Body:   &ast.Block{Stmts: []ast.Stmt{}},
+				},
+			},
+		},
+		Else: &ast.Literal{Value: `"timeout"`},
+	})
+
+	if !strings.Contains(got, "select {") {
+		t.Fatalf("should generate select, got:\n%s", got)
+	}
+	if !strings.Contains(got, "default:") {
+		t.Fatalf("should have default branch, got:\n%s", got)
+	}
+}
+
+func TestCompileChannelSelectNoLambda(t *testing.T) {
+	c := newCompiler(nil)
+	// Branch body is a plain expression, not a lambda
+	got := c.compileExpr(&ast.WhenExpr{
+		Branches: []*ast.WhenBranch{
+			{
+				Condition: &ast.UnaryExpr{Op: "<-", Value: &ast.Ident{Name: "ch"}},
+				Body:      &ast.Literal{Value: `"received"`},
+			},
+		},
+	})
+
+	if !strings.Contains(got, "select {") {
+		t.Fatalf("should generate select, got:\n%s", got)
+	}
+	if !strings.Contains(got, "case <-ch:") {
+		t.Fatalf("should have 'case <-ch:' for no-lambda branch, got:\n%s", got)
+	}
+}
+
+func TestCompileChannelSelectMixed(t *testing.T) {
+	// Mix of channel receive and non-channel condition
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.WhenExpr{
+		Branches: []*ast.WhenBranch{
+			{
+				Condition: &ast.UnaryExpr{Op: "<-", Value: &ast.Ident{Name: "ch1"}},
+				Body: &ast.LambdaExpr{
+					Params: []string{"msg"},
+					Body:   &ast.Block{Stmts: []ast.Stmt{}},
+				},
+			},
+			{
+				// Non-channel branch: timeout case
+				Condition: &ast.CallExpr{
+					Func: &ast.MemberExpr{
+						Object: &ast.Ident{Name: "time"},
+						Field:  "After",
+					},
+					Args: []*ast.NamedArg{{Value: &ast.Literal{Value: "1000"}}},
+				},
+				Body: &ast.Literal{Value: `"timeout"`},
+			},
+		},
+	})
+
+	if !strings.Contains(got, "select {") {
+		t.Fatalf("should generate select, got:\n%s", got)
+	}
+	if !strings.Contains(got, "case msg := <-ch1:") {
+		t.Fatalf("should have channel case, got:\n%s", got)
+	}
+	if !strings.Contains(got, "case time.After(1000):") {
+		t.Fatalf("should have non-channel case, got:\n%s", got)
+	}
+}
+
+func TestCompileChannelForRangeNonIdent(t *testing.T) {
+	// for item in getChannel() { ... } — non-Ident collection, isChannelVar should return false
+	c := newCompiler(nil)
+	c.compileStmt(&ast.ForStmt{
+		VarName: "item",
+		Collection: &ast.CallExpr{
+			Func: &ast.Ident{Name: "getItems"},
+		},
+		Body: &ast.Block{Stmts: []ast.Stmt{}},
+	})
+	out := compilerOut(c)
+	// Should use _, prefix since it's not a known channel var
+	if !strings.Contains(out, "for _, item := range") {
+		t.Fatalf("non-ident collection should use _, prefix, got:\n%s", out)
+	}
+}
+
+func TestCompileChannelCloseNonChannel(t *testing.T) {
+	// obj.close() where obj is NOT a channel — should NOT generate close(obj)
+	c := newCompiler(nil)
+	c.compileStmt(&ast.ExprStmt{
+		Expr: &ast.CallExpr{
+			Func: &ast.MemberExpr{
+				Object: &ast.Ident{Name: "conn"},
+				Field:  "close",
+			},
+		},
+	})
+	out := compilerOut(c)
+	if strings.Contains(out, "close(conn)") {
+		t.Fatal("non-channel .close() should NOT become close()")
+	}
+	if !strings.Contains(out, "conn.Close()") {
+		t.Fatalf("should keep original method call, got:\n%s", out)
+	}
+}
+
+func TestCompileChannelReceiveExpr(t *testing.T) {
+	// <-ch as standalone expression (not val assignment)
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.UnaryExpr{
+		Op:    "<-",
+		Value: &ast.Ident{Name: "ch"},
+	})
+	if got != "<-ch" {
+		t.Fatalf("want '<-ch', got %q", got)
+	}
+}
+
+func TestCompileIsChannelConstructorNonCall(t *testing.T) {
+	c := newCompiler(nil)
+	// Non-CallExpr should return false
+	if c.isChannelConstructor(&ast.Ident{Name: "x"}) {
+		t.Fatal("Ident should not be a channel constructor")
+	}
+	// CallExpr with non-Channel name
+	if c.isChannelConstructor(&ast.CallExpr{Func: &ast.Ident{Name: "foo"}}) {
+		t.Fatal("foo() should not be a channel constructor")
+	}
+	// CallExpr with Channel name
+	if !c.isChannelConstructor(&ast.CallExpr{Func: &ast.Ident{Name: "Channel"}}) {
+		t.Fatal("Channel() should be a channel constructor")
+	}
+}
+
+func TestCompileHasChannelBranchFalse(t *testing.T) {
+	c := newCompiler(nil)
+	// When with no channel branches
+	when := &ast.WhenExpr{
+		Branches: []*ast.WhenBranch{
+			{Condition: &ast.Literal{Value: "true"}, Body: &ast.Literal{Value: "1"}},
+		},
+	}
+	if c.hasChannelBranch(when) {
+		t.Fatal("should return false for non-channel branches")
+	}
+}
+
+func TestCompileChannelProducerConsumer(t *testing.T) {
+	c := newCompiler(nil)
+	// Full producer-consumer pattern:
+	// val ch = Channel(10)
+	// async { ch <- 42; ch.close() }
+	// for value in ch { process(value) }
+	c.compileStmt(&ast.ValStmt{
+		Name: "ch",
+		Value: &ast.CallExpr{
+			Func: &ast.Ident{Name: "Channel"},
+			Args: []*ast.NamedArg{{Value: &ast.Literal{Value: "10"}}},
+		},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "make(chan any, 10)") {
+		t.Fatalf("missing channel creation, got:\n%s", out)
 	}
 }

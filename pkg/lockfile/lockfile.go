@@ -14,6 +14,7 @@ import (
 type LockFile struct {
 	Version int                   `json:"version"`
 	Models  map[string]*ModelLock `json:"models"`
+	Events  map[string]*ModelLock `json:"events,omitempty"`
 	APIs    map[string]int        `json:"apis"`
 	nextAPI int                   // transient: next API ID to assign
 }
@@ -72,6 +73,7 @@ func New() *LockFile {
 	return &LockFile{
 		Version: currentVersion,
 		Models:  make(map[string]*ModelLock),
+		Events:  make(map[string]*ModelLock),
 		APIs:    make(map[string]int),
 		nextAPI: 0,
 	}
@@ -111,7 +113,59 @@ func (lf *LockFile) Save(path string) error {
 // New APIs get the next available API ID.
 func (lf *LockFile) Update(files []*ast.File) {
 	lf.updateModels(files)
+	lf.updateEvents(files)
 	lf.updateAPIs(files)
+}
+
+// updateEvents assigns param IDs to all event declarations.
+// Uses the same ModelLock structure (param name → stable ID).
+func (lf *LockFile) updateEvents(files []*ast.File) {
+	if lf.Events == nil {
+		lf.Events = make(map[string]*ModelLock)
+	}
+
+	// Collect current events
+	currentEvents := make(map[string]map[string]bool)
+	for _, file := range files {
+		for _, e := range file.Events {
+			params := make(map[string]bool, len(e.Params))
+			for _, p := range e.Params {
+				params[p.Name] = true
+			}
+			currentEvents[e.Name] = params
+		}
+	}
+
+	// Reserve removed params
+	for name, el := range lf.Events {
+		current, exists := currentEvents[name]
+		if !exists {
+			lf.reserveAllFields(el)
+			continue
+		}
+		lf.reserveRemovedFields(el, current)
+	}
+
+	// Assign IDs to new params
+	for _, file := range files {
+		for _, e := range file.Events {
+			el, exists := lf.Events[e.Name]
+			if !exists {
+				el = &ModelLock{
+					NextID: 1,
+					Fields: make(map[string]int),
+				}
+				lf.Events[e.Name] = el
+			}
+			for _, p := range e.Params {
+				if _, ok := el.Fields[p.Name]; ok {
+					continue
+				}
+				el.Fields[p.Name] = el.NextID
+				el.NextID++
+			}
+		}
+	}
 }
 
 // updateModels assigns field IDs to all model fields.
@@ -247,4 +301,16 @@ func (lf *LockFile) FieldID(model, field string) int {
 // APIID returns the assigned API ID, or 0 if not found.
 func (lf *LockFile) APIID(name string) int {
 	return lf.APIs[name]
+}
+
+// EventFieldID returns the assigned param ID for an event param, or 0 if not found.
+func (lf *LockFile) EventFieldID(eventName, paramName string) int {
+	if lf.Events == nil {
+		return 0
+	}
+	el, ok := lf.Events[eventName]
+	if !ok {
+		return 0
+	}
+	return el.Fields[paramName]
 }

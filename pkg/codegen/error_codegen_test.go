@@ -47,7 +47,7 @@ func TestGenerateErrorFileWithParams(t *testing.T) {
 		`"github.com/light-speak/luxo/pkg/lux/errors"`,
 		"func NewOutOfStock(productId int64, available int64) *errors.AppError",
 		`errors.New("OutOfStock", 409, "error.out_of_stock")`,
-		`.WithData(map[string]any{`,
+		`.WithData(errors.MapData{`,
 		`"productId": productId,`,
 		`"available": available,`,
 	}

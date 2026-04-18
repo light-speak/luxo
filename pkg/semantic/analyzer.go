@@ -120,6 +120,13 @@ func (a *Analyzer) analyzeInternal(files []*ast.File) *Result {
 		a.checkModuleVisibility()
 	}
 
+	// Pass 3.7: validate bare API names (after ALL model fields are resolved)
+	for _, file := range files {
+		for _, api := range file.APIs {
+			a.validateBareAPI(api)
+		}
+	}
+
 	// Pass 4: check api/fn bodies (expressions, statements)
 	for _, file := range files {
 		a.checkBodies(file)
@@ -582,7 +589,6 @@ func (a *Analyzer) resolveApiTypes(file *ast.File) {
 		a.checkDirectives(api.Directives, OnApi)
 		a.validateNativeReturnType(api)
 		a.validateScopeDirective(api)
-		a.validateBareAPI(api)
 	}
 }
 
@@ -675,6 +681,12 @@ func (a *Analyzer) validateAfterModel(pos token.Position, apiName, afterModel st
 	}
 
 	afterBy := afterModel[2:]
+
+	// Strip trailing OrderBy... clause before field validation
+	if idx := strings.Index(afterBy, "OrderBy"); idx > 0 {
+		afterBy = afterBy[:idx]
+	}
+
 	if afterBy == "" {
 		a.addError(pos, "inferred API '%s' is incomplete — missing field name after By", apiName)
 		return

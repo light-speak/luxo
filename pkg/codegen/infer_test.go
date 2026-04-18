@@ -622,7 +622,7 @@ func TestWriteInferredAction(t *testing.T) {
 	t.Run("count", func(t *testing.T) {
 		inf := &InferredAPI{Action: "count", ModelName: "User"}
 		var b strings.Builder
-		writeInferredAction(&b, inf, "User", false)
+		writeInferredAction(&b, inf, "User", false, nil)
 		out := b.String()
 		if !strings.Contains(out, "app.User.Where(conds...).Count(ctx)") {
 			t.Errorf("count: missing Count call:\n%s", out)
@@ -635,7 +635,7 @@ func TestWriteInferredAction(t *testing.T) {
 	t.Run("exists", func(t *testing.T) {
 		inf := &InferredAPI{Action: "exists", ModelName: "User"}
 		var b strings.Builder
-		writeInferredAction(&b, inf, "User", false)
+		writeInferredAction(&b, inf, "User", false, nil)
 		out := b.String()
 		if !strings.Contains(out, "app.User.Where(conds...).Exists(ctx)") {
 			t.Errorf("exists: missing Exists call:\n%s", out)
@@ -648,7 +648,7 @@ func TestWriteInferredAction(t *testing.T) {
 	t.Run("delete hard", func(t *testing.T) {
 		inf := &InferredAPI{Action: "delete", ModelName: "Post"}
 		var b strings.Builder
-		writeInferredAction(&b, inf, "Post", false)
+		writeInferredAction(&b, inf, "Post", false, nil)
 		out := b.String()
 		if !strings.Contains(out, "app.Post.Where(conds...).Delete(ctx)") {
 			t.Errorf("delete hard: missing Delete call:\n%s", out)
@@ -658,7 +658,7 @@ func TestWriteInferredAction(t *testing.T) {
 	t.Run("delete soft", func(t *testing.T) {
 		inf := &InferredAPI{Action: "delete", ModelName: "Post"}
 		var b strings.Builder
-		writeInferredAction(&b, inf, "Post", true)
+		writeInferredAction(&b, inf, "Post", true, nil)
 		out := b.String()
 		if !strings.Contains(out, "app.Post.SoftDelete(ctx, conds...)") {
 			t.Errorf("delete soft: missing SoftDelete call:\n%s", out)
@@ -668,7 +668,7 @@ func TestWriteInferredAction(t *testing.T) {
 	t.Run("get default", func(t *testing.T) {
 		inf := &InferredAPI{Action: "get", ModelName: "User"}
 		var b strings.Builder
-		writeInferredAction(&b, inf, "User", false)
+		writeInferredAction(&b, inf, "User", false, nil)
 		out := b.String()
 		if !strings.Contains(out, "First(ctx)") {
 			t.Errorf("get: missing First(ctx):\n%s", out)
@@ -681,7 +681,7 @@ func TestWriteInferredAction(t *testing.T) {
 	t.Run("list with orderBy asc", func(t *testing.T) {
 		inf := &InferredAPI{Action: "list", ModelName: "User", OrderBy: "name", OrderDesc: false}
 		var b strings.Builder
-		writeInferredAction(&b, inf, "User", false)
+		writeInferredAction(&b, inf, "User", false, nil)
 		out := b.String()
 		if !strings.Contains(out, "name ASC") {
 			t.Errorf("list: missing ASC order:\n%s", out)
@@ -694,7 +694,7 @@ func TestWriteInferredAction(t *testing.T) {
 	t.Run("list topN no pagination", func(t *testing.T) {
 		inf := &InferredAPI{Action: "list", ModelName: "User", TopN: 10}
 		var b strings.Builder
-		writeInferredAction(&b, inf, "User", false)
+		writeInferredAction(&b, inf, "User", false, nil)
 		out := b.String()
 		if !strings.Contains(out, "Limit(10)") {
 			t.Errorf("list topN: missing Limit(10):\n%s", out)

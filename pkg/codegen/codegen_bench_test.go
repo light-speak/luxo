@@ -60,7 +60,7 @@ func BenchmarkGenerate(b *testing.B) {
 	result := buildBenchResult()
 	b.ResetTimer()
 	for b.Loop() {
-		Generate(result, "gen")
+		Generate(result, "gen", DriverPG)
 	}
 }
 

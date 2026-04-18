@@ -17,7 +17,7 @@ func buildResult(files ...*ast.File) *semantic.Result {
 
 func TestGenerateEmpty(t *testing.T) {
 	result := buildResult(&ast.File{Name: "test.luxo"})
-	gr := Generate(result, "gen")
+	gr := Generate(result, "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 	if !strings.Contains(src, "package gen") {
 		t.Errorf("missing package declaration:\n%s", src)
@@ -46,7 +46,7 @@ func TestGenerateEnumAndModel(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 
 	if !strings.Contains(src, "type Role string") {
@@ -81,7 +81,7 @@ func TestGenerateWithTimeImport(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 	if !strings.Contains(src, `"time"`) {
 		t.Errorf("missing time import:\n%s", src)
@@ -102,7 +102,7 @@ func TestGenerateNoTimeImportWhenNotNeeded(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 	if strings.Contains(src, `"time"`) {
 		t.Errorf("unexpected time import:\n%s", src)
@@ -123,7 +123,7 @@ func TestGenerateDBFile(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	dbSrc := string(gr.Files["db.gen.go"])
 	if !strings.Contains(dbSrc, "UserClient") {
 		t.Errorf("missing UserClient in db.gen.go:\n%s", dbSrc)
@@ -141,7 +141,7 @@ func TestGenerateNoDBFileWhenNoModels(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	if _, ok := gr.Files["db.gen.go"]; ok {
 		t.Errorf("db.gen.go should not be generated when no models exist")
 	}
@@ -161,7 +161,7 @@ func TestGenerateWithDurationImport(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 	if !strings.Contains(src, `"time"`) {
 		t.Errorf("missing time import for Duration:\n%s", src)
@@ -182,7 +182,7 @@ func TestGenerateComputedDateTimeNoTimeImport(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 	if strings.Contains(src, `"time"`) {
 		t.Errorf("computed DateTime should not trigger time import:\n%s", src)
@@ -203,7 +203,7 @@ func TestGenerateWithUUIDImport(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 	if !strings.Contains(src, `"github.com/google/uuid"`) {
 		t.Errorf("missing uuid import:\n%s", src)
@@ -224,7 +224,7 @@ func TestGenerateWithDecimalImport(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 	if !strings.Contains(src, `"github.com/shopspring/decimal"`) {
 		t.Errorf("missing decimal import:\n%s", src)
@@ -245,7 +245,7 @@ func TestGenerateWithBytesType(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 	if !strings.Contains(src, "[]byte") {
 		t.Errorf("missing []byte type:\n%s", src)
@@ -267,7 +267,7 @@ func TestGenerateAutoUUIDDBImports(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	dbSrc := string(gr.Files["db.gen.go"])
 	if !strings.Contains(dbSrc, `"github.com/google/uuid"`) {
 		t.Errorf("missing uuid import in db.gen.go:\n%s", dbSrc)
@@ -294,7 +294,7 @@ func TestGenerateNilTypeField(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 	if !strings.Contains(src, "any") {
 		t.Errorf("nil type should map to any:\n%s", src)
@@ -315,7 +315,7 @@ func TestGenerateHiddenFieldJsonTag(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 	if !strings.Contains(src, `json:"-"`) {
 		t.Errorf("@hidden should generate json:\"-\":\n%s", src)
@@ -336,7 +336,7 @@ func TestGenerateUUIDPrimaryKeyFind(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	dbSrc := string(gr.Files["db.gen.go"])
 	if !strings.Contains(dbSrc, "Find(ctx context.Context, id uuid.UUID)") {
 		t.Errorf("Find should use uuid.UUID for UUID pk:\n%s", dbSrc)
@@ -361,7 +361,7 @@ func TestGenerateSoftDeleteModel(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	modelSrc := string(gr.Files["model.gen.go"])
 	dbSrc := string(gr.Files["db.gen.go"])
 
@@ -410,7 +410,7 @@ func TestGenerateSoftDeleteWithExistingDeletedAt(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	modelSrc := string(gr.Files["model.gen.go"])
 
 	// Should not duplicate deletedAt
@@ -441,7 +441,7 @@ func TestGenerateAppFile(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	appSrc := string(gr.Files["app.gen.go"])
 
 	checks := []string{
@@ -475,7 +475,7 @@ func TestGenerateAppFileNoModels(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	if _, ok := gr.Files["app.gen.go"]; ok {
 		t.Error("app.gen.go should not be generated when no models exist")
 	}
@@ -503,7 +503,7 @@ func TestGenerateAppFileWithRelations(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	appSrc := string(gr.Files["app.gen.go"])
 
 	// Should have loaders field since there are relations
@@ -545,7 +545,7 @@ func TestGenerateFullWithHandlerAndDataloader(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 
 	// Should generate all files
 	if _, ok := gr.Files["handler.gen.go"]; !ok {
@@ -582,7 +582,7 @@ func TestGenerateModelFileWithExtend(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 
 	if !strings.Contains(src, "type ExternalUser struct") {
@@ -614,7 +614,7 @@ func TestGenerateModelFileExtendSkipsExistingModel(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 
 	// Should not generate a stub for User since it already exists as a model
@@ -636,7 +636,7 @@ func TestGenerateAppFileSingleModel(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen")
+	gr := Generate(result(file), "gen", DriverPG)
 	appSrc := string(gr.Files["app.gen.go"])
 
 	if !strings.Contains(appSrc, "Post *PostClient") {
@@ -675,7 +675,7 @@ func TestGenerateWithSoftModelsParam(t *testing.T) {
 
 	// Pass softModels map (external soft model info)
 	softModels := map[string]bool{"User": true}
-	gr := Generate(result(file), "gen", softModels)
+	gr := Generate(result(file), "gen", DriverPG, softModels)
 
 	// dataloader.gen.go should contain soft delete filter
 	dlSrc := string(gr.Files["dataloader.gen.go"])

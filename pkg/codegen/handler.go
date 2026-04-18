@@ -13,6 +13,85 @@ import (
 // crudOps defines the 6 CRUD operations.
 var crudOps = []string{"get", "list", "create", "update", "delete", "deleteMany"}
 
+// handlerFeatures holds feature detection flags for handler imports.
+type handlerFeatures struct {
+	hasOrGroups    bool
+	hasSortable    bool
+	hasAwait       bool
+	hasTransaction bool
+	hasTemplateStr bool
+	hasAuth        bool
+}
+
+// detectHandlerFeatures scans models and APIs to determine which imports are needed.
+func detectHandlerFeatures(result *semantic.Result, models []*ast.ModelDecl, inferredAPIs []*ast.ApiDecl, modelMap map[string]*ast.ModelDecl) handlerFeatures {
+	var f handlerFeatures
+
+	// Check if any inferred API has OR groups (need strconv import)
+	for _, api := range inferredAPIs {
+		inf := InferAPI(api.Name, modelMap)
+		if inf != nil && len(inf.Groups) > 1 {
+			f.hasOrGroups = true
+			break
+		}
+	}
+
+	// Check if any CRUD model has sortable fields (need "strings" import)
+	for _, m := range models {
+		for _, fd := range m.Fields {
+			if hasDirective(fd.Directives, "sortable") && fd.Type != nil && fd.Computed == nil {
+				f.hasSortable = true
+				break
+			}
+		}
+		if f.hasSortable {
+			break
+		}
+	}
+
+	// Check compiled APIs for await, transaction, and template strings
+	for _, file := range result.Files {
+		for _, api := range file.APIs {
+			if api.Body != nil && !hasDirective(api.Directives, "native") {
+				if bodyContainsAwait(api.Body) {
+					f.hasAwait = true
+				}
+				if bodyContainsTransaction(api.Body) {
+					f.hasTransaction = true
+				}
+			}
+			if api.Body != nil && bodyContainsTemplateString(api.Body) {
+				f.hasTemplateStr = true
+			}
+		}
+	}
+
+	// Check if auth is needed:
+	// 1. CRUD models with @withAuth
+	// 2. Compiled APIs with @auth
+	for _, m := range models {
+		if hasDirective(m.Directives, "withAuth") {
+			f.hasAuth = true
+			break
+		}
+	}
+	if !f.hasAuth {
+		for _, file := range result.Files {
+			for _, api := range file.APIs {
+				if hasDirective(api.Directives, "auth") {
+					f.hasAuth = true
+					break
+				}
+			}
+			if f.hasAuth {
+				break
+			}
+		}
+	}
+
+	return f
+}
+
 // generateHandlerFile produces handler.gen.go containing CRUD handlers,
 // inferred handlers (zero-body APIs), and RegisterHandlers.
 func generateHandlerFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
@@ -45,9 +124,12 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 		return nil
 	}
 
+	features := detectHandlerFeatures(result, models, inferredAPIs, modelMap)
+
 	var b strings.Builder
 	writeHeader(&b, packageName, "handler.gen.go")
-	writeHandlerImports(&b, models)
+
+	writeHandlerImports(&b, models, features.hasOrGroups, features.hasSortable, features.hasAwait, features.hasTransaction, features.hasTemplateStr, features.hasAuth, modelMap)
 
 	// Generate defaultCols for models with @hidden fields (excludes hidden from SELECT *)
 	for _, m := range models {
@@ -99,11 +181,12 @@ func generateInferredHandlers(b *strings.Builder, apis []*ast.ApiDecl, modelMap 
 }
 
 func generateCompiledHandlers(b *strings.Builder, result *semantic.Result, modelMap map[string]*ast.ModelDecl) []string {
+	enumSet := CollectEnumsFromResult(result)
 	var names []string
 	for _, file := range result.Files {
 		for _, api := range file.APIs {
 			if api.Body != nil && !hasDirective(api.Directives, "native") {
-				compileAPIBody(b, api, modelMap)
+				compileAPIBody(b, api, modelMap, enumSet)
 				names = append(names, api.Name)
 			}
 		}
@@ -114,15 +197,21 @@ func generateCompiledHandlers(b *strings.Builder, result *semantic.Result, model
 // writeFKEnsure generates ensureField calls for relation key columns.
 // BelongsTo needs the FK column (e.g., user_id); HasOne/HasMany need the local key (e.g., id).
 func writeFKEnsure(b *strings.Builder, rels []Relation) {
+	seen := make(map[string]bool)
 	for _, rel := range rels {
 		col := str.ToSnakeCase(rel.LocalKey)
+		if seen[col] {
+			continue
+		}
+		seen[col] = true
 		fmt.Fprintf(b, "\t\tcols = ensureField(cols, %q)\n", col)
 	}
 }
 
 // writeHandlerImports writes handler.gen.go imports.
-func writeHandlerImports(b *strings.Builder, models []*ast.ModelDecl) {
+func writeHandlerImports(b *strings.Builder, models []*ast.ModelDecl, hasOrGroups, hasSortable, hasAwait, hasTransaction, hasTemplateStr, hasAuth bool, allModels map[string]*ast.ModelDecl) {
 	hasHash := false
+	// Check CRUD models for @hash
 	for _, m := range models {
 		for _, f := range m.Fields {
 			if hasDirective(f.Directives, "hash") {
@@ -130,18 +219,47 @@ func writeHandlerImports(b *strings.Builder, models []*ast.ModelDecl) {
 			}
 		}
 	}
+	// Also check all models (for compiled APIs referencing @hash fields)
+	if !hasHash {
+		for _, m := range allModels {
+			for _, f := range m.Fields {
+				if hasDirective(f.Directives, "hash") {
+					hasHash = true
+					break
+				}
+			}
+			if hasHash {
+				break
+			}
+		}
+	}
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
 	b.WriteString("\t\"fmt\"\n")
-	b.WriteString("\t\"strings\"\n")
+	if hasOrGroups || hasTemplateStr {
+		b.WriteString("\t\"strconv\"\n")
+	}
+	if hasSortable || hasTemplateStr {
+		b.WriteString("\t\"strings\"\n")
+	}
 	b.WriteString("\n\t\"github.com/bytedance/sonic\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
 	if hasHash {
 		b.WriteString("\tluxocrypto \"github.com/light-speak/luxo/pkg/lux/crypto\"\n")
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/errors\"\n")
+	if hasAuth {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
+	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
+	if hasAwait {
+		b.WriteString("\t\"golang.org/x/sync/errgroup\"\n")
+	}
+	if hasTransaction {
+		fmt.Fprintf(b, "\t%q\n", DriverPG.DriverImport())
+	}
 	b.WriteString(")\n\n")
 }
 
@@ -151,6 +269,15 @@ func collectInferredAPIs(result *semantic.Result) (map[string]*ast.ModelDecl, []
 	for _, file := range result.Files {
 		for _, m := range file.Models {
 			modelMap[m.Name] = m
+		}
+		// Include extend stubs so compiled APIs can reference cross-module models
+		for _, ext := range file.Extends {
+			if _, exists := modelMap[ext.Name]; !exists {
+				modelMap[ext.Name] = &ast.ModelDecl{
+					Name:   ext.Name,
+					Fields: ext.Fields,
+				}
+			}
 		}
 	}
 	var apis []*ast.ApiDecl
@@ -239,10 +366,16 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		colsExpr = fmt.Sprintf("selection.SQLColumnsOr(req.Select, default%sCols)", name)
 	}
 
+	// @withAuth on model → all CRUD handlers require auth
+	needAuth := hasDirective(m.Directives, "withAuth")
+
 	switch op {
 	case "get":
 		fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
+		if needAuth {
+			writeAuthCheck(b, "\t\t")
+		}
 		writeParamID(b, idType, "\t\t")
 		fmt.Fprintf(b, "\t\tcols := %s\n", colsExpr)
 		writeFKEnsure(b, rels)
@@ -253,13 +386,20 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 			fmt.Fprintf(b, "\t\tif err := resolve%sRelations(ctx, app, result, req.Select); err != nil {\n", name)
 			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 		}
-		fmt.Fprintf(b, "\t\tresult.WriteJSON(req.Buf, req.Select)\n")
+		fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
+		fmt.Fprintf(b, "\t\t\tresult.WriteLuxo(req.Buf)\n")
+		fmt.Fprintf(b, "\t\t} else {\n")
+		fmt.Fprintf(b, "\t\t\tresult.WriteJSON(req.Buf, req.Select)\n")
+		fmt.Fprintf(b, "\t\t}\n")
 		fmt.Fprintf(b, "\t\treturn nil\n")
 		fmt.Fprintf(b, "\t}\n}\n\n")
 
 	case "list":
 		fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
+		if needAuth {
+			writeAuthCheck(b, "\t\t")
+		}
 		fmt.Fprintf(b, "\t\tcols := %s\n", colsExpr)
 		writeFKEnsure(b, rels)
 		fmt.Fprintf(b, "\t\tconds := parse%sFilters(req.Filters)\n", name)
@@ -274,30 +414,43 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 			fmt.Fprintf(b, "\t\tif err := resolve%sListRelations(ctx, app, results, req.Select); err != nil {\n", name)
 			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 		}
-		// Write paginated response: {items: [...], total: N, page: N, pageSize: N}
+		// Write paginated response
 		lower := str.LowerFirst(name)
-		fmt.Fprintf(b, "\t\treq.Buf.AppendString(`{\"items\":`)\n")
-		fmt.Fprintf(b, "\t\t%sListJSON(results).WriteJSON(req.Buf, req.Select)\n", lower)
-		fmt.Fprintf(b, "\t\treq.Buf.AppendString(`,\"total\":`)\n")
-		fmt.Fprintf(b, "\t\treq.Buf.AppendInt(total)\n")
-		fmt.Fprintf(b, "\t\treq.Buf.AppendString(`,\"page\":`)\n")
-		fmt.Fprintf(b, "\t\treq.Buf.AppendInt(int64(req.Page))\n")
-		fmt.Fprintf(b, "\t\treq.Buf.AppendString(`,\"pageSize\":`)\n")
-		fmt.Fprintf(b, "\t\treq.Buf.AppendInt(int64(req.PageSize))\n")
-		fmt.Fprintf(b, "\t\treq.Buf.AppendByte('}')\n")
+		fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(results)))\n")
+		fmt.Fprintf(b, "\t\t\tfor _, item := range results {\n")
+		fmt.Fprintf(b, "\t\t\t\titem.WriteLuxo(req.Buf)\n")
+		fmt.Fprintf(b, "\t\t\t}\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, total)\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.Page))\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.PageSize))\n")
+		fmt.Fprintf(b, "\t\t} else {\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`{\"items\":`)\n")
+		fmt.Fprintf(b, "\t\t\t%sListJSON(results).WriteJSON(req.Buf, req.Select)\n", lower)
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`,\"total\":`)\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendInt(total)\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`,\"page\":`)\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendInt(int64(req.Page))\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`,\"pageSize\":`)\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendInt(int64(req.PageSize))\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendByte('}')\n")
+		fmt.Fprintf(b, "\t\t}\n")
 		fmt.Fprintf(b, "\t\treturn nil\n")
 		fmt.Fprintf(b, "\t}\n}\n\n")
 
 	case "create":
-		generateCreateHandler(b, m, apiName, enums)
+		generateCreateHandler(b, m, apiName, enums, needAuth)
 
 	case "update":
-		generateUpdateHandler(b, m, apiName, idType, enums)
+		generateUpdateHandler(b, m, apiName, idType, enums, needAuth)
 
 	case "delete":
 		soft := isSoftDelete(m)
 		fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
+		if needAuth {
+			writeAuthCheck(b, "\t\t")
+		}
 		writeParamID(b, idType, "\t\t")
 		if soft {
 			fmt.Fprintf(b, "\t\tn, err := app.%s.SoftDelete(ctx, %sWhere.Id.Eq(id))\n", name, name)
@@ -306,9 +459,13 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		}
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		fmt.Fprintf(b, "\t\tif n == 0 {\n\t\t\treturn errors.NotFound.WithData(errors.ResourceError{Resource: %q, ID: id})\n\t\t}\n", name)
-		fmt.Fprintf(b, "\t\treq.Buf.AppendString(`{\"deleted\":`)\n")
-		fmt.Fprintf(b, "\t\treq.Buf.AppendInt(n)\n")
-		fmt.Fprintf(b, "\t\treq.Buf.AppendByte('}')\n")
+		fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, n)\n")
+		fmt.Fprintf(b, "\t\t} else {\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`{\"deleted\":`)\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendInt(n)\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendByte('}')\n")
+		fmt.Fprintf(b, "\t\t}\n")
 		fmt.Fprintf(b, "\t\treturn nil\n")
 		fmt.Fprintf(b, "\t}\n}\n\n")
 
@@ -316,6 +473,9 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		soft := isSoftDelete(m)
 		fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
+		if needAuth {
+			writeAuthCheck(b, "\t\t")
+		}
 		fmt.Fprintf(b, "\t\tvar ids []%s\n", idType)
 		fmt.Fprintf(b, "\t\tif err := sonic.Unmarshal(req.Params[\"ids\"], &ids); err != nil {\n")
 		fmt.Fprintf(b, "\t\t\treturn fmt.Errorf(\"param ids: %%w\", err)\n")
@@ -326,19 +486,26 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 			fmt.Fprintf(b, "\t\tn, err := app.%s.Where(%sWhere.Id.In(ids...)).Delete(ctx)\n", name, name)
 		}
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		fmt.Fprintf(b, "\t\treq.Buf.AppendString(`{\"deleted\":`)\n")
-		fmt.Fprintf(b, "\t\treq.Buf.AppendInt(n)\n")
-		fmt.Fprintf(b, "\t\treq.Buf.AppendByte('}')\n")
+		fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, n)\n")
+		fmt.Fprintf(b, "\t\t} else {\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`{\"deleted\":`)\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendInt(n)\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendByte('}')\n")
+		fmt.Fprintf(b, "\t\t}\n")
 		fmt.Fprintf(b, "\t\treturn nil\n")
 		fmt.Fprintf(b, "\t}\n}\n\n")
 	}
 }
 
 // generateCreateHandler generates a create handler that reads params and calls Create().
-func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string, enums map[string]bool) {
+func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string, enums map[string]bool, needAuth bool) {
 	name := m.Name
 	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
+	if needAuth {
+		writeAuthCheck(b, "\t\t")
+	}
 	fmt.Fprintf(b, "\t\tbuilder := app.%s.Create()\n", name)
 
 	for _, f := range m.Fields {
@@ -356,19 +523,38 @@ func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string,
 		}
 	}
 
+	// @beforeSave hooks — run before persisting
+	for _, f := range m.Fields {
+		for _, d := range f.Directives {
+			if d.Name == "beforeSave" && d.Body != nil {
+				fmt.Fprintf(b, "\t\t// @beforeSave on %s\n", f.Name)
+				for _, stmt := range d.Body.Stmts {
+					_ = stmt // TODO: compile beforeSave body when expression compiler supports field context
+				}
+			}
+		}
+	}
+
 	fmt.Fprintf(b, "\t\tresult, err := builder.Exec(ctx)\n")
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-	fmt.Fprintf(b, "\t\tresult.WriteJSON(req.Buf, req.Select)\n")
+	fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
+	fmt.Fprintf(b, "\t\t\tresult.WriteLuxo(req.Buf)\n")
+	fmt.Fprintf(b, "\t\t} else {\n")
+	fmt.Fprintf(b, "\t\t\tresult.WriteJSON(req.Buf, req.Select)\n")
+	fmt.Fprintf(b, "\t\t}\n")
 	fmt.Fprintf(b, "\t\treturn nil\n")
 	fmt.Fprintf(b, "\t}\n")
 	fmt.Fprintf(b, "}\n\n")
 }
 
 // generateUpdateHandler generates an update handler.
-func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType string, enums map[string]bool) {
+func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType string, enums map[string]bool, needAuth bool) {
 	name := m.Name
 	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
+	if needAuth {
+		writeAuthCheck(b, "\t\t")
+	}
 	writeParamID(b, idType, "\t\t")
 	fmt.Fprintf(b, "\t\texisting, err := app.%s.Find(ctx, id)\n", name)
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
@@ -387,7 +573,11 @@ func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType
 	}
 	fmt.Fprintf(b, "\t\tresult, err := builder.Exec(ctx)\n")
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-	fmt.Fprintf(b, "\t\tresult.WriteJSON(req.Buf, req.Select)\n")
+	fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
+	fmt.Fprintf(b, "\t\t\tresult.WriteLuxo(req.Buf)\n")
+	fmt.Fprintf(b, "\t\t} else {\n")
+	fmt.Fprintf(b, "\t\t\tresult.WriteJSON(req.Buf, req.Select)\n")
+	fmt.Fprintf(b, "\t\t}\n")
 	fmt.Fprintf(b, "\t\treturn nil\n")
 	fmt.Fprintf(b, "\t}\n")
 	fmt.Fprintf(b, "}\n\n")
@@ -429,7 +619,13 @@ func isRelationField(f *ast.FieldDecl, enums map[string]bool) bool {
 // generateParamSet writes a param extraction + setter call.
 func generateParamSet(b *strings.Builder, f *ast.FieldDecl, setter, indent string, enums map[string]bool) {
 	varName := f.Name + "Val"
-	goType := resolveGoType(f.Type)
+
+	// For nullable fields, use the base type for param extraction, then take pointer
+	baseType := f.Type
+	if f.Type != nil && f.Type.Nullable {
+		baseType = &ast.TypeRef{Name: f.Type.Name} // strip nullable
+	}
+	goType := resolveGoType(baseType)
 
 	// Enum fields are strings in JSON
 	isEnum := f.Type != nil && enums[f.Type.Name]
@@ -736,9 +932,26 @@ func generateFilterParser(b *strings.Builder, m *ast.ModelDecl, enums map[string
 // api.Sorter to ORDER BY clauses, only allowing @sortable fields.
 func generateSorterParser(b *strings.Builder, m *ast.ModelDecl) {
 	name := m.Name
+
+	// Check if any @sortable fields exist
+	hasSortable := false
+	for _, f := range m.Fields {
+		if hasDirective(f.Directives, "sortable") && f.Type != nil && f.Computed == nil {
+			hasSortable = true
+			break
+		}
+	}
+
 	fmt.Fprintf(b, "// parse%sSorters converts request sorters to ORDER BY clauses.\n", name)
 	fmt.Fprintf(b, "// Only @sortable fields are allowed.\n")
 	fmt.Fprintf(b, "func parse%sSorters(sorters []api.Sorter) []string {\n", name)
+
+	if !hasSortable {
+		fmt.Fprintf(b, "\treturn nil\n")
+		fmt.Fprintf(b, "}\n\n")
+		return
+	}
+
 	fmt.Fprintf(b, "\tvar clauses []string\n")
 	fmt.Fprintf(b, "\tfor _, s := range sorters {\n")
 	fmt.Fprintf(b, "\t\tvar col string\n")
@@ -764,6 +977,76 @@ func generateSorterParser(b *strings.Builder, m *ast.ModelDecl) {
 	fmt.Fprintf(b, "\t}\n") // end for
 	fmt.Fprintf(b, "\treturn clauses\n")
 	fmt.Fprintf(b, "}\n\n")
+}
+
+// bodyContainsAwait checks if an API body block contains any AwaitExpr.
+func bodyContainsAwait(block *ast.Block) bool {
+	if block == nil {
+		return false
+	}
+	for _, stmt := range block.Stmts {
+		if es, ok := stmt.(*ast.ExprStmt); ok {
+			if _, ok := es.Expr.(*ast.AwaitExpr); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// bodyContainsTransaction checks if an API body block contains a transaction call.
+// transaction { ... } is parsed as CallExpr("transaction", lambda).
+func bodyContainsTransaction(block *ast.Block) bool {
+	if block == nil {
+		return false
+	}
+	for _, stmt := range block.Stmts {
+		if es, ok := stmt.(*ast.ExprStmt); ok {
+			if call, ok := es.Expr.(*ast.CallExpr); ok {
+				if ident, ok := call.Func.(*ast.Ident); ok && ident.Name == "transaction" {
+					return true
+				}
+			}
+		}
+		// Also check val assignments: val result = transaction { ... }
+		if vs, ok := stmt.(*ast.ValStmt); ok {
+			if call, ok := vs.Value.(*ast.CallExpr); ok {
+				if ident, ok := call.Func.(*ast.Ident); ok && ident.Name == "transaction" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// bodyContainsTemplateString checks if an API body uses template strings.
+func bodyContainsTemplateString(block *ast.Block) bool {
+	if block == nil {
+		return false
+	}
+	for _, stmt := range block.Stmts {
+		if vs, ok := stmt.(*ast.ValStmt); ok {
+			if _, ok := vs.Value.(*ast.TemplateString); ok {
+				return true
+			}
+		}
+		if rs, ok := stmt.(*ast.ReturnStmt); ok && rs.Value != nil {
+			if _, ok := rs.Value.(*ast.TemplateString); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// writeAuthCheck generates the identity nil-check guard at the start of a handler.
+// Used by CRUD handlers (@withAuth on model) and compiled APIs (@auth on API).
+func writeAuthCheck(b *strings.Builder, indent string) {
+	fmt.Fprintf(b, "%sidentity := luvia.Identity(ctx)\n", indent)
+	fmt.Fprintf(b, "%sif identity == nil {\n", indent)
+	fmt.Fprintf(b, "%s\treturn errors.Unauthorized\n", indent)
+	fmt.Fprintf(b, "%s}\n", indent)
 }
 
 // pluralize adds "s" to a name (simple English pluralization).

@@ -165,17 +165,14 @@ func TestGenerateEntryFileWithEvents(t *testing.T) {
 	}
 	code := string(src)
 
-	// Should have event bus wiring
-	if !strings.Contains(code, "event.Bus") {
-		t.Errorf("should declare eventBus:\n%s", code)
+	// Should have event bus wiring via framework function
+	if !strings.Contains(code, "event.NewFromEnv()") {
+		t.Errorf("should use event.NewFromEnv():\n%s", code)
 	}
 	if !strings.Contains(code, "RegisterEvents") {
 		t.Errorf("should call RegisterEvents:\n%s", code)
 	}
-	if !strings.Contains(code, "NATS_URL") {
-		t.Errorf("should check NATS_URL env:\n%s", code)
-	}
-	if !strings.Contains(code, "NewChanBus") {
-		t.Errorf("should fallback to ChanBus:\n%s", code)
+	if !strings.Contains(code, "eventBus.Close()") {
+		t.Errorf("should defer eventBus.Close():\n%s", code)
 	}
 }

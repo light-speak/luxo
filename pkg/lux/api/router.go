@@ -26,12 +26,14 @@ type Router struct {
 	handlers   map[string]HandlerFunc
 	translator *i18n.Translator
 	devMode    bool
+	Registry   *APIRegistry // binary protocol API ID mapping
 }
 
 // NewRouter creates an empty router.
 func NewRouter() *Router {
 	return &Router{
 		handlers: make(map[string]HandlerFunc),
+		Registry: NewAPIRegistry(),
 	}
 }
 
@@ -51,15 +53,28 @@ func (rt *Router) SetDevMode(dev bool) {
 }
 
 // ServeHTTP implements http.Handler for the /luvia endpoint.
+// Supports JSON (default) and Luxo binary (X-Luxo-Mode: binary) protocols.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
 
-	req, err := ParseRequest(r)
+	binaryMode := r.Header.Get("X-Luxo-Mode") == "binary"
+
+	var req *Request
+	var err error
+	if binaryMode {
+		body, bp, readErr := readBody(r.Body)
+		if readErr != nil {
+			writeError(w, http.StatusBadRequest, readErr.Error())
+			return
+		}
+		defer bodyPool.Put(bp)
+		req, err = rt.Registry.ParseBinaryRequest(body)
+	} else {
+		req, err = ParseRequest(r)
+	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -82,11 +97,20 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Write response: {"data": <buf> }
-	w.WriteHeader(http.StatusOK)
-	w.Write(jsonDataPrefix)
-	w.Write(buf.B)
-	w.Write(jsonDataSuffix)
+	if binaryMode {
+		// Binary response: raw bytes from handler (already binary-encoded)
+		w.Header().Set("Content-Type", "application/x-luxo")
+		w.Header().Set("X-Luxo-Mode", "binary")
+		w.WriteHeader(http.StatusOK)
+		w.Write(buf.B)
+	} else {
+		// JSON response: {"data": <buf> }
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(jsonDataPrefix)
+		w.Write(buf.B)
+		w.Write(jsonDataSuffix)
+	}
 
 	PutBuf(buf)
 }
@@ -114,8 +138,8 @@ func (rt *Router) writeAppError(w http.ResponseWriter, r *http.Request, err erro
 	message := appErr.Message
 	if rt.translator != nil && !appErr.Internal {
 		locale := i18n.ParseAcceptLanguage(r.Header.Get("Accept-Language"))
-		if dataMap, ok := appErr.Data.(map[string]any); ok {
-			message = rt.translator.Translate(locale, appErr.Message, dataMap)
+		if appErr.Data != nil {
+			message = rt.translator.Translate(locale, appErr.Message, appErr.Data.I18nData())
 		} else {
 			message = rt.translator.Translate(locale, appErr.Message, nil)
 		}

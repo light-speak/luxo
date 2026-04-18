@@ -145,7 +145,7 @@ func TestRouterEmptyBody(t *testing.T) {
 func TestRouterAppError(t *testing.T) {
 	rt := NewRouter()
 	rt.Handle("fail", func(ctx context.Context, req *Request) error {
-		return errors.NotFound.WithData(map[string]any{"resource": "User"})
+		return errors.NotFound.WithData(errors.MapData{"resource": "User"})
 	})
 
 	body := `{"$api":"fail"}`
@@ -184,7 +184,7 @@ error:
 	rt := NewRouter()
 	rt.SetTranslator(tr)
 	rt.Handle("fail", func(ctx context.Context, req *Request) error {
-		return errors.NotFound.WithData(map[string]any{"resource": "User"})
+		return errors.NotFound.WithData(errors.MapData{"resource": "User"})
 	})
 
 	body := `{"$api":"fail"}`

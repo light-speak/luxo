@@ -8,7 +8,9 @@ import (
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/codegen"
 	"github.com/light-speak/luxo/pkg/formatter"
+	"github.com/light-speak/luxo/pkg/lux/str"
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
 )
@@ -1126,6 +1128,10 @@ func (s *Server) handleHover(req *Request) error {
 
 // resolveHover returns a hover string for the word at the given position, or "" if none.
 func (s *Server) resolveHover(doc *Document, word string, pos Position) string {
+	// Inferred API SQL preview
+	if hover := s.resolveInferredAPIHover(doc, word, pos); hover != "" {
+		return hover
+	}
 	if hover := s.resolveContextualHover(doc, word, pos); hover != "" {
 		return hover
 	}
@@ -2713,4 +2719,295 @@ func fieldTypeStr(m *ast.ModelDecl, name string) string {
 		}
 	}
 	return "String"
+}
+
+// resolveInferredAPIHover generates SQL preview for inferred API declarations.
+func (s *Server) resolveInferredAPIHover(doc *Document, word string, pos Position) string {
+	if doc.File == nil {
+		return ""
+	}
+
+	// Check if cursor is on an API name (line starts with "api ")
+	lines := strings.Split(doc.Content, "\n")
+	if pos.Line >= len(lines) {
+		return ""
+	}
+	line := strings.TrimSpace(lines[pos.Line])
+	if !strings.HasPrefix(line, "api ") {
+		return ""
+	}
+	// Only for bare API declarations (no params, no return type, no body)
+	rest := strings.TrimSpace(line[4:])
+	if strings.ContainsAny(rest, "(:{") {
+		return ""
+	}
+
+	// Extract API name from line
+	apiName := strings.TrimSpace(line[4:])
+	// Strip params/return type if present
+	if idx := strings.IndexAny(apiName, "(:{ "); idx > 0 {
+		apiName = apiName[:idx]
+	}
+	if apiName == "" || apiName != word {
+		return ""
+	}
+
+	// Collect all models from analyzed files
+	modelMap := make(map[string]*ast.ModelDecl)
+	if doc.Result != nil {
+		for _, f := range doc.Result.Files {
+			for _, m := range f.Models {
+				modelMap[m.Name] = m
+			}
+		}
+	}
+	// Also from current file
+	for _, m := range doc.File.Models {
+		modelMap[m.Name] = m
+	}
+
+	if len(modelMap) == 0 {
+		return ""
+	}
+
+	// Try to parse as inferred API
+	inf := codegen.InferAPI(apiName, modelMap)
+	if inf == nil {
+		return ""
+	}
+
+	// Build SQL preview
+	return buildSQLPreview(inf, modelMap)
+}
+
+// buildSQLPreview generates a SQL preview for an inferred API.
+func buildSQLPreview(inf *codegen.InferredAPI, models map[string]*ast.ModelDecl) string {
+	model := models[inf.ModelName]
+	if model == nil {
+		return ""
+	}
+
+	tableName := str.ToSnakeCase(inf.ModelName) + "s"
+
+	// Check if model has @soft
+	soft := false
+	for _, d := range model.Directives {
+		if d.Name == "soft" {
+			soft = true
+			break
+		}
+	}
+
+	var b strings.Builder
+
+	// Header
+	b.WriteString("**Inferred API** `")
+	b.WriteString(inf.Action)
+	b.WriteString("` on `")
+	b.WriteString(inf.ModelName)
+	b.WriteString("`\n\n")
+
+	// SQL preview
+	b.WriteString("```sql\n")
+
+	switch inf.Action {
+	case "count":
+		b.WriteString("SELECT COUNT(*) FROM ")
+		b.WriteString(tableName)
+		writeWherePreview(&b, inf, model, soft)
+	case "exists":
+		b.WriteString("SELECT EXISTS(\n  SELECT 1 FROM ")
+		b.WriteString(tableName)
+		writeWherePreview(&b, inf, model, soft)
+		b.WriteString("\n  LIMIT 1\n)")
+	case "delete":
+		if soft {
+			b.WriteString("UPDATE ")
+			b.WriteString(tableName)
+			b.WriteString("\nSET deleted_at = NOW()")
+			writeWherePreview(&b, inf, model, soft)
+		} else {
+			b.WriteString("DELETE FROM ")
+			b.WriteString(tableName)
+			writeWherePreview(&b, inf, model, soft)
+		}
+	case "list":
+		b.WriteString("SELECT ")
+		b.WriteString(selectCols(model))
+		b.WriteString("\nFROM ")
+		b.WriteString(tableName)
+		writeWherePreview(&b, inf, model, soft)
+		if inf.OrderBy != "" {
+			b.WriteString("\nORDER BY ")
+			b.WriteString(str.ToSnakeCase(inf.OrderBy))
+			if inf.OrderDesc {
+				b.WriteString(" DESC")
+			} else {
+				b.WriteString(" ASC")
+			}
+		}
+		if inf.TopN > 0 {
+			fmt.Fprintf(&b, "\nLIMIT %d", inf.TopN)
+		} else {
+			b.WriteString("\nLIMIT $N OFFSET $M")
+		}
+		b.WriteString("\n\n-- + COUNT(*) for pagination")
+	default: // get
+		b.WriteString("SELECT ")
+		b.WriteString(selectCols(model))
+		b.WriteString("\nFROM ")
+		b.WriteString(tableName)
+		writeWherePreview(&b, inf, model, soft)
+		b.WriteString("\nLIMIT 1")
+	}
+
+	b.WriteString("\n```")
+
+	// Parameters
+	if len(inf.Groups) > 0 {
+		b.WriteString("\n\n**Parameters:**\n")
+		paramIdx := 1
+		for _, group := range inf.Groups {
+			for _, clause := range group.Clauses {
+				switch clause.Op {
+				case "true", "false", "isNull", "isNotNull":
+					continue
+				case "between":
+					fmt.Fprintf(&b, "- `$%d` — %s (from)\n", paramIdx, clause.Field)
+					paramIdx++
+					fmt.Fprintf(&b, "- `$%d` — %s (to)\n", paramIdx, clause.Field)
+					paramIdx++
+				default:
+					fmt.Fprintf(&b, "- `$%d` — %s\n", paramIdx, clause.Field)
+					paramIdx++
+				}
+			}
+		}
+	}
+
+	return b.String()
+}
+
+// writeWherePreview writes the WHERE clause preview.
+func writeWherePreview(b *strings.Builder, inf *codegen.InferredAPI, model *ast.ModelDecl, soft bool) {
+	hasConditions := len(inf.Groups) > 0 || soft
+
+	if !hasConditions {
+		return
+	}
+	b.WriteString("\nWHERE ")
+
+	paramIdx := 1
+	if len(inf.Groups) == 1 {
+		// Simple AND group
+		for i, clause := range inf.Groups[0].Clauses {
+			if i > 0 {
+				b.WriteString("\n  AND ")
+			}
+			writeClausePreview(b, clause, &paramIdx)
+		}
+	} else if len(inf.Groups) > 1 {
+		// OR groups
+		b.WriteString("(")
+		for gi, group := range inf.Groups {
+			if gi > 0 {
+				b.WriteString("\n  OR ")
+			}
+			b.WriteString("(")
+			for ci, clause := range group.Clauses {
+				if ci > 0 {
+					b.WriteString(" AND ")
+				}
+				writeClausePreview(b, clause, &paramIdx)
+			}
+			b.WriteString(")")
+		}
+		b.WriteString(")")
+	}
+
+	if soft {
+		if len(inf.Groups) > 0 {
+			b.WriteString("\n  AND ")
+		}
+		b.WriteString("deleted_at IS NULL")
+	}
+}
+
+// writeClausePreview writes a single WHERE clause.
+func writeClausePreview(b *strings.Builder, clause codegen.InferClause, paramIdx *int) {
+	col := str.ToSnakeCase(clause.Field)
+	switch clause.Op {
+	case "eq":
+		fmt.Fprintf(b, "%s = $%d", col, *paramIdx)
+		*paramIdx++
+	case "ne":
+		fmt.Fprintf(b, "%s != $%d", col, *paramIdx)
+		*paramIdx++
+	case "gt":
+		fmt.Fprintf(b, "%s > $%d", col, *paramIdx)
+		*paramIdx++
+	case "gte":
+		fmt.Fprintf(b, "%s >= $%d", col, *paramIdx)
+		*paramIdx++
+	case "lt":
+		fmt.Fprintf(b, "%s < $%d", col, *paramIdx)
+		*paramIdx++
+	case "lte":
+		fmt.Fprintf(b, "%s <= $%d", col, *paramIdx)
+		*paramIdx++
+	case "containing":
+		fmt.Fprintf(b, "%s LIKE '%%' || $%d || '%%'", col, *paramIdx)
+		*paramIdx++
+	case "startswith":
+		fmt.Fprintf(b, "%s LIKE $%d || '%%'", col, *paramIdx)
+		*paramIdx++
+	case "endswith":
+		fmt.Fprintf(b, "%s LIKE '%%' || $%d", col, *paramIdx)
+		*paramIdx++
+	case "between":
+		fmt.Fprintf(b, "%s BETWEEN $%d AND $%d", col, *paramIdx, *paramIdx+1)
+		*paramIdx += 2
+	case "in":
+		fmt.Fprintf(b, "%s IN ($%d...)", col, *paramIdx)
+		*paramIdx++
+	case "notIn":
+		fmt.Fprintf(b, "%s NOT IN ($%d...)", col, *paramIdx)
+		*paramIdx++
+	case "true":
+		fmt.Fprintf(b, "%s = true", col)
+	case "false":
+		fmt.Fprintf(b, "%s = false", col)
+	case "isNull":
+		fmt.Fprintf(b, "%s IS NULL", col)
+	case "isNotNull":
+		fmt.Fprintf(b, "%s IS NOT NULL", col)
+	case "ignoreCase":
+		fmt.Fprintf(b, "%s ILIKE $%d", col, *paramIdx)
+		*paramIdx++
+	default:
+		fmt.Fprintf(b, "%s = $%d", col, *paramIdx)
+		*paramIdx++
+	}
+}
+
+// selectCols returns a comma-separated list of column names for preview.
+func selectCols(m *ast.ModelDecl) string {
+	var cols []string
+	for _, f := range m.Fields {
+		if f.Type == nil || f.Computed != nil {
+			continue
+		}
+		// Skip relation fields
+		if f.Type.IsList || (!isBuiltinType(f.Type.Name) && f.Type.Name != "Boolean") {
+			continue
+		}
+		cols = append(cols, str.ToSnakeCase(f.Name))
+	}
+	if len(cols) == 0 {
+		return "*"
+	}
+	if len(cols) > 5 {
+		return strings.Join(cols[:5], ", ") + ", ..."
+	}
+	return strings.Join(cols, ", ")
 }

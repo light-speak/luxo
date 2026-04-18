@@ -1034,6 +1034,132 @@ func TestGenerateInferredHandlerWithReturnTypeWarning(t *testing.T) {
 	}
 }
 
+// TestGenerateHandlerWithAuth verifies that @withAuth on model injects
+// luvia.Identity auth guard into all CRUD handlers.
+func TestGenerateHandlerWithAuth(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("User",
+					[]*ast.Directive{crudDirective(), {Name: "withAuth", Args: []*ast.NamedArg{{Name: "stores", Value: &ast.ListExpr{Items: []ast.Expr{&ast.Ident{Name: "id"}}}}}}},
+					[]*ast.FieldDecl{
+						testField("id", "Int", directive("id"), directive("auto")),
+						testField("name", "String"),
+					},
+				),
+			},
+		}},
+	}
+	src := generateHandlerFile(result, "luxo", nil)
+	if src == nil {
+		t.Fatal("should generate handler file")
+	}
+	code := string(src)
+
+	// All CRUD handlers should have auth check
+	if !strings.Contains(code, "luvia.Identity(ctx)") {
+		t.Error("@withAuth model should inject luvia.Identity check")
+	}
+	if !strings.Contains(code, "errors.Unauthorized") {
+		t.Error("@withAuth model should return errors.Unauthorized")
+	}
+	// Should import luvia
+	if !strings.Contains(code, `"github.com/light-speak/luxo/pkg/lux/luvia"`) {
+		t.Error("should import luvia when @withAuth is used")
+	}
+}
+
+// TestGenerateHandlerWithoutAuth verifies that models without @withAuth
+// do NOT inject auth guards.
+func TestGenerateHandlerWithoutAuth(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("Post",
+					[]*ast.Directive{crudDirective()},
+					[]*ast.FieldDecl{
+						testField("id", "Int", directive("id"), directive("auto")),
+						testField("title", "String"),
+					},
+				),
+			},
+		}},
+	}
+	src := generateHandlerFile(result, "luxo", nil)
+	if src == nil {
+		t.Fatal("should generate handler file")
+	}
+	code := string(src)
+
+	if strings.Contains(code, "luvia.Identity") {
+		t.Error("model without @withAuth should NOT inject auth check")
+	}
+}
+
+// TestGenerateCompiledAPIWithAuth verifies @auth on compiled API handlers.
+func TestGenerateCompiledAPIWithAuth(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("User", nil, []*ast.FieldDecl{
+					testField("id", "Int", directive("id")),
+					testField("name", "String"),
+				}),
+			},
+			APIs: []*ast.ApiDecl{
+				{
+					Name:       "updateProfile",
+					Directives: []*ast.Directive{{Name: "auth"}},
+					Params:     []*ast.ParamDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}},
+					ReturnType: &ast.TypeRef{Name: "Boolean"},
+					Body: &ast.Block{Stmts: []ast.Stmt{
+						&ast.ReturnStmt{Value: &ast.Literal{Kind: token.True, Value: "true"}},
+					}},
+				},
+			},
+		}},
+	}
+	src := generateHandlerFile(result, "luxo", nil)
+	if src == nil {
+		t.Fatal("should generate handler file")
+	}
+	code := string(src)
+
+	if !strings.Contains(code, "luvia.Identity(ctx)") {
+		t.Error("@auth API should inject luvia.Identity check")
+	}
+	if !strings.Contains(code, "errors.Unauthorized") {
+		t.Error("@auth API should return errors.Unauthorized")
+	}
+}
+
+// TestGenerateCompiledAPIWithoutAuth verifies compiled APIs without @auth
+// do NOT inject auth guards.
+func TestGenerateCompiledAPIWithoutAuth(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			APIs: []*ast.ApiDecl{
+				{
+					Name:       "register",
+					ReturnType: &ast.TypeRef{Name: "Boolean"},
+					Body: &ast.Block{Stmts: []ast.Stmt{
+						&ast.ReturnStmt{Value: &ast.Literal{Kind: token.True, Value: "true"}},
+					}},
+				},
+			},
+		}},
+	}
+	src := generateHandlerFile(result, "luxo", nil)
+	if src == nil {
+		t.Fatal("should generate handler file")
+	}
+	code := string(src)
+
+	if strings.Contains(code, "luvia.Identity") {
+		t.Error("API without @auth should NOT inject auth check")
+	}
+}
+
 // TestGenerateCompiledHandlers covers the compiled-handler path where api.Body != nil
 // and @native is not set, exercising generateCompiledHandlers lines 91-94.
 func TestGenerateCompiledHandlers(t *testing.T) {

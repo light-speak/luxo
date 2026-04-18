@@ -13,8 +13,89 @@ type GenerateResult struct {
 	Files map[string][]byte // filename → Go source
 }
 
+// DBDriver represents the database backend for codegen.
+type DBDriver string
+
+const (
+	DriverPG     DBDriver = "pg"
+	DriverMySQL  DBDriver = "mysql"
+	DriverSQLite DBDriver = "sqlite"
+	DriverMongo  DBDriver = "mongo"
+)
+
+// DriverImport returns the Go import path for the database driver package.
+func (d DBDriver) DriverImport() string {
+	switch d {
+	case DriverMySQL:
+		return "github.com/light-speak/luxo/pkg/lux/mysql"
+	case DriverSQLite:
+		return "github.com/light-speak/luxo/pkg/lux/sqlite"
+	case DriverMongo:
+		return "github.com/light-speak/luxo/pkg/lux/mongo"
+	default:
+		return "github.com/light-speak/luxo/pkg/lux/pg"
+	}
+}
+
+// DriverPkg returns the short package name for the driver.
+func (d DBDriver) DriverPkg() string {
+	switch d {
+	case DriverMySQL:
+		return "mysql"
+	case DriverSQLite:
+		return "sqlite"
+	case DriverMongo:
+		return "mongo"
+	default:
+		return "pg"
+	}
+}
+
+// dbPkg is the short package name for the database driver (pg/mysql/sqlite/mongo).
+// Set by Generate(), used by all codegen functions to emit correct package references.
+var dbPkg = "pg"
+
+// eventFieldIDs maps event_name → param_name → stable field ID from luxo.lock.
+var eventFieldIDs map[string]map[string]int
+
+// modelFieldIDs maps model_name → field_name → stable field ID from luxo.lock.
+var modelFieldIDs map[string]map[string]int
+
+// SetEventFieldIDs sets the event field ID map from lock file data.
+func SetEventFieldIDs(ids map[string]map[string]int) {
+	eventFieldIDs = ids
+}
+
+// SetModelFieldIDs sets the model field ID map from lock file data.
+func SetModelFieldIDs(ids map[string]map[string]int) {
+	modelFieldIDs = ids
+}
+
+// getModelFieldID returns the stable field ID for a model field, or 0 if not found.
+func getModelFieldID(modelName, fieldName string) int {
+	if modelFieldIDs == nil {
+		return 0
+	}
+	if m, ok := modelFieldIDs[modelName]; ok {
+		return m[fieldName]
+	}
+	return 0
+}
+
+// getEventFieldID returns the stable field ID for an event param, or 0 if not found.
+func getEventFieldID(eventName, paramName string) int {
+	if eventFieldIDs == nil {
+		return 0
+	}
+	if m, ok := eventFieldIDs[eventName]; ok {
+		return m[paramName]
+	}
+	return 0
+}
+
 // Generate produces Go source files from semantic analysis result.
-func Generate(result *semantic.Result, packageName string, softModels ...map[string]bool) *GenerateResult {
+func Generate(result *semantic.Result, packageName string, driver DBDriver, softModels ...map[string]bool) *GenerateResult {
+	dbPkg = driver.DriverPkg()
 	gr := &GenerateResult{
 		Files: make(map[string][]byte),
 	}
@@ -22,17 +103,17 @@ func Generate(result *semantic.Result, packageName string, softModels ...map[str
 
 	gr.Files["model.gen.go"] = generateModelFile(result, packageName, enums)
 
-	if dbSrc := generateDBFile(result, packageName, enums); dbSrc != nil {
+	if dbSrc := generateDBFile(result, packageName, enums, driver); dbSrc != nil {
 		gr.Files["db.gen.go"] = dbSrc
 	}
-	if appSrc := generateAppFile(result, packageName, enums); appSrc != nil {
+	if appSrc := generateAppFile(result, packageName, enums, driver); appSrc != nil {
 		gr.Files["app.gen.go"] = appSrc
 	}
 	var soft map[string]bool
 	if len(softModels) > 0 {
 		soft = softModels[0]
 	}
-	if dlSrc := generateDataLoaderFile(result, packageName, enums, soft); dlSrc != nil {
+	if dlSrc := generateDataLoaderFile(result, packageName, enums, soft, driver); dlSrc != nil {
 		gr.Files["dataloader.gen.go"] = dlSrc
 	}
 	if handlerSrc := generateHandlerFile(result, packageName, enums); handlerSrc != nil {
@@ -165,7 +246,7 @@ func writeImports(b *strings.Builder, files []*ast.File) {
 
 // generateDBFile produces the db.gen.go file containing query builders.
 // Returns nil if there are no models.
-func generateDBFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
+func generateDBFile(result *semantic.Result, packageName string, enums map[string]bool, driver DBDriver) []byte {
 	hasModels := false
 	for _, file := range result.Files {
 		if len(file.Models) > 0 {
@@ -190,13 +271,13 @@ func generateDBFile(result *semantic.Result, packageName string, enums map[strin
 		}
 	}
 
-	// Generate scanners for extend stubs (needed by DataLoader batch functions)
+	// Generate query support for extend stubs (needed by compiled APIs and DataLoader)
 	for _, file := range result.Files {
 		for _, ext := range file.Extends {
 			if modelNames[ext.Name] {
-				continue // full model exists, has its own scanner
+				continue // full model exists, has its own builder
 			}
-			generateScanner(&b, &ast.ModelDecl{Name: ext.Name, Fields: ext.Fields})
+			generateExtendQueryBuilder(&b, ext)
 			b.WriteByte('\n')
 		}
 	}
@@ -253,26 +334,29 @@ func scanDBFieldImports(f *ast.FieldDecl, needs *dbImportNeeds) {
 
 // generateAppFile produces app.gen.go containing the App struct that wires all Clients.
 // Returns nil if there are no models.
-func generateAppFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
+func generateAppFile(result *semantic.Result, packageName string, enums map[string]bool, driver DBDriver) []byte {
+	modelSet := make(map[string]bool)
 	var models []string
 	for _, file := range result.Files {
 		for _, m := range file.Models {
 			models = append(models, m.Name)
+			modelSet[m.Name] = true
 		}
 	}
 	if len(models) == 0 {
 		return nil
 	}
 
-	var b strings.Builder
-	writeHeader(&b, packageName, "app.gen.go")
-
-	b.WriteString("import (\n")
-	b.WriteString("\t\"context\"\n")
-	b.WriteString("\t\"fmt\"\n")
-	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux\"\n")
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/pg\"\n")
-	b.WriteString(")\n\n")
+	// Collect extend model names (cross-module stubs with read-only clients)
+	var extendModels []string
+	for _, file := range result.Files {
+		for _, ext := range file.Extends {
+			if !modelSet[ext.Name] {
+				extendModels = append(extendModels, ext.Name)
+				modelSet[ext.Name] = true
+			}
+		}
+	}
 
 	// Check if any model has relations (needs loaders field)
 	hasRelations := false
@@ -285,11 +369,39 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 		}
 	}
 
+	// Check if any file has events (needs EventBus field)
+	hasEvents := false
+	for _, file := range result.Files {
+		if len(file.Events) > 0 {
+			hasEvents = true
+			break
+		}
+	}
+
+	var b strings.Builder
+	writeHeader(&b, packageName, "app.gen.go")
+
+	b.WriteString("import (\n")
+	b.WriteString("\t\"context\"\n")
+	b.WriteString("\t\"fmt\"\n")
+	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux\"\n")
+	if hasEvents {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/event\"\n")
+	}
+	fmt.Fprintf(&b, "\tpg %q\n", driver.DriverImport())
+	b.WriteString(")\n\n")
+
 	// App struct
 	b.WriteString("// App is the entry point for all database operations.\n")
 	b.WriteString("type App struct {\n")
 	b.WriteString("\tDB *pg.DB\n")
+	if hasEvents {
+		b.WriteString("\tEventBus event.Bus\n")
+	}
 	for _, name := range models {
+		fmt.Fprintf(&b, "\t%s *%sClient\n", name, name)
+	}
+	for _, name := range extendModels {
 		fmt.Fprintf(&b, "\t%s *%sClient\n", name, name)
 	}
 	if hasRelations {
@@ -315,6 +427,9 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 	b.WriteString("\treturn &App{\n")
 	b.WriteString("\t\tDB: db,\n")
 	for _, name := range models {
+		fmt.Fprintf(&b, "\t\t%s: &%sClient{db: db},\n", name, name)
+	}
+	for _, name := range extendModels {
 		fmt.Fprintf(&b, "\t\t%s: &%sClient{db: db},\n", name, name)
 	}
 	b.WriteString("\t}\n")
@@ -356,7 +471,7 @@ func writeDBImports(b *strings.Builder, files []*ast.File) {
 		b.WriteString("\t\"time\"\n")
 	}
 	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux\"\n")
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/pg\"\n")
+	fmt.Fprintf(b, "\tpg %q\n", DBDriver(dbPkg).DriverImport())
 	if needs.uuid {
 		b.WriteString("\n\t\"github.com/google/uuid\"\n")
 	}

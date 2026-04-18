@@ -45,12 +45,14 @@ func generateWriteJSONFile(result *semantic.Result, packageName string, enums ma
 
 	for _, m := range models {
 		generateWriteJSON(&b, m, enums)
+		generateWriteLuxo(&b, m, enums)
 		generateListJSONWrapper(&b, m)
 	}
 
 	// Extend stubs: WriteJSON with direct field append (same as full models)
 	for _, s := range stubs {
 		generateWriteJSON(&b, s, enums)
+		generateWriteLuxo(&b, s, enums)
 		generateListJSONWrapper(&b, s)
 	}
 
@@ -97,6 +99,7 @@ func writeWriteJSONImports(b *strings.Builder, models []*ast.ModelDecl, stubs []
 		b.WriteString("\t\"time\"\n")
 	}
 	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
 	if needs.uuid {
 		b.WriteString("\n\t\"github.com/google/uuid\"\n")
@@ -306,4 +309,84 @@ func writeAllFieldsFallback(b *strings.Builder, m *ast.ModelDecl, recv string, e
 	fmt.Fprintf(b, "\t\tbuf.AppendByte('}')\n")
 	fmt.Fprintf(b, "\t\treturn\n")
 	fmt.Fprintf(b, "\t}\n")
+}
+
+// generateWriteLuxo generates a WriteLuxo method for Luxo binary serialization.
+// Field IDs come from luxo.lock via getModelFieldID().
+// Writes all non-hidden, non-relation scalar fields.
+func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
+	name := m.Name
+	recv := strings.ToLower(name[:1])
+
+	fmt.Fprintf(b, "// WriteLuxo writes %s as Luxo binary. Zero marshal, field IDs from luxo.lock.\n", name)
+	fmt.Fprintf(b, "func (%s *%s) WriteLuxo(buf *api.ResponseBuf) {\n", recv, name)
+	fmt.Fprintf(b, "\tvar enc codec.Encoder\n")
+
+	for _, f := range m.Fields {
+		if f.Type == nil || f.Computed != nil {
+			continue
+		}
+		if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
+			continue
+		}
+		if isRelationField(f, enums) {
+			continue
+		}
+
+		fieldID := getModelFieldID(name, f.Name)
+		if fieldID == 0 {
+			continue
+		}
+		goField := recv + "." + str.Capitalize(f.Name)
+
+		// Use base type name for matching, nullable handled separately
+		baseType := f.Type.Name
+
+		// Enum → encode as string
+		if enums[f.Type.Name] {
+			if f.Type.Nullable {
+				fmt.Fprintf(b, "\tif %s != nil {\n", goField)
+				fmt.Fprintf(b, "\t\tenc.WriteFieldString(%d, string(*%s))\n", fieldID, goField)
+				fmt.Fprintf(b, "\t} else {\n")
+				fmt.Fprintf(b, "\t\tenc.WriteFieldStringPtr(%d, nil)\n", fieldID)
+				fmt.Fprintf(b, "\t}\n")
+			} else {
+				fmt.Fprintf(b, "\tenc.WriteFieldString(%d, string(%s))\n", fieldID, goField)
+			}
+			continue
+		}
+
+		switch baseType {
+		case "Int", "DateTime", "Duration":
+			if f.Type.Nullable {
+				fmt.Fprintf(b, "\tenc.WriteFieldIntPtr(%d, %s)\n", fieldID, goField)
+			} else {
+				fmt.Fprintf(b, "\tenc.WriteFieldInt(%d, %s)\n", fieldID, goField)
+			}
+		case "Float":
+			if f.Type.Nullable {
+				fmt.Fprintf(b, "\tenc.WriteFieldFloatPtr(%d, %s)\n", fieldID, goField)
+			} else {
+				fmt.Fprintf(b, "\tenc.WriteFieldFloat(%d, %s)\n", fieldID, goField)
+			}
+		case "String":
+			if f.Type.Nullable {
+				fmt.Fprintf(b, "\tenc.WriteFieldStringPtr(%d, %s)\n", fieldID, goField)
+			} else {
+				fmt.Fprintf(b, "\tenc.WriteFieldString(%d, %s)\n", fieldID, goField)
+			}
+		case "Boolean":
+			if f.Type.Nullable {
+				fmt.Fprintf(b, "\tenc.WriteFieldBoolPtr(%d, %s)\n", fieldID, goField)
+			} else {
+				fmt.Fprintf(b, "\tenc.WriteFieldBool(%d, %s)\n", fieldID, goField)
+			}
+		default:
+			fmt.Fprintf(b, "\t// TODO: binary encoding for type %s (field %s)\n", baseType, f.Name)
+		}
+	}
+
+	fmt.Fprintf(b, "\tenc.WriteEnd()\n")
+	fmt.Fprintf(b, "\tbuf.B = append(buf.B, enc.Bytes()...)\n")
+	fmt.Fprintf(b, "}\n\n")
 }
