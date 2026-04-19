@@ -318,10 +318,17 @@ func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bo
 	name := m.Name
 	recv := strings.ToLower(name[:1])
 
-	fmt.Fprintf(b, "// WriteLuxo writes %s as Luxo binary. Field mask filters output (nil = all fields).\n", name)
+	fmt.Fprintf(b, "// WriteLuxo writes %s as Luxo binary directly to buf. Zero intermediate allocation.\n", name)
 	fmt.Fprintf(b, "func (%s *%s) WriteLuxo(buf *api.ResponseBuf, mask []byte) {\n", recv, name)
-	fmt.Fprintf(b, "\tvar enc codec.Encoder\n")
 
+	// Generate nil-mask fast path: write all fields without FieldMaskHas checks
+	fmt.Fprintf(b, "\tif len(mask) == 0 {\n")
+	generateWriteLuxoAllFields(b, m, recv, enums)
+	fmt.Fprintf(b, "\t\tbuf.B = append(buf.B, 0x00)\n")
+	fmt.Fprintf(b, "\t\treturn\n")
+	fmt.Fprintf(b, "\t}\n")
+
+	// Slow path with mask checks
 	for _, f := range m.Fields {
 		if f.Type == nil || f.Computed != nil {
 			continue
@@ -338,24 +345,25 @@ func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bo
 			continue
 		}
 
-		// Field mask check: skip if field not selected
 		fmt.Fprintf(b, "\tif codec.FieldMaskHas(mask, %d) {\n", fieldID)
 
 		goField := recv + "." + str.Capitalize(f.Name)
-
-		// Use base type name for matching, nullable handled separately
 		baseType := f.Type.Name
+		fid := fmt.Sprintf("%d", fieldID)
 
-		// Enum → encode as string
+		// All fields write directly to buf.B — zero intermediate buffer
 		if enums[f.Type.Name] {
 			if f.Type.Nullable {
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
 				fmt.Fprintf(b, "\t\tif %s != nil {\n", goField)
-				fmt.Fprintf(b, "\t\t\tenc.WriteFieldString(%d, string(*%s))\n", fieldID, goField)
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendPresent(buf.B)\n")
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendString(buf.B, string(*%s))\n", goField)
 				fmt.Fprintf(b, "\t\t} else {\n")
-				fmt.Fprintf(b, "\t\t\tenc.WriteFieldStringPtr(%d, nil)\n", fieldID)
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendNull(buf.B)\n")
 				fmt.Fprintf(b, "\t\t}\n")
 			} else {
-				fmt.Fprintf(b, "\t\tenc.WriteFieldString(%d, string(%s))\n", fieldID, goField)
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendString(buf.B, string(%s))\n", goField)
 			}
 			b.WriteString("\t}\n")
 			continue
@@ -364,27 +372,55 @@ func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bo
 		switch baseType {
 		case "Int", "DateTime", "Duration":
 			if f.Type.Nullable {
-				fmt.Fprintf(b, "\t\tenc.WriteFieldIntPtr(%d, %s)\n", fieldID, goField)
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t\tif %s != nil {\n", goField)
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendPresent(buf.B)\n")
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendSvarint(buf.B, *%s)\n", goField)
+				fmt.Fprintf(b, "\t\t} else {\n")
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendNull(buf.B)\n")
+				fmt.Fprintf(b, "\t\t}\n")
 			} else {
-				fmt.Fprintf(b, "\t\tenc.WriteFieldInt(%d, %s)\n", fieldID, goField)
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendSvarint(buf.B, %s)\n", goField)
 			}
 		case "Float":
 			if f.Type.Nullable {
-				fmt.Fprintf(b, "\t\tenc.WriteFieldFloatPtr(%d, %s)\n", fieldID, goField)
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t\tif %s != nil {\n", goField)
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendPresent(buf.B)\n")
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendFixed64(buf.B, *%s)\n", goField)
+				fmt.Fprintf(b, "\t\t} else {\n")
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendNull(buf.B)\n")
+				fmt.Fprintf(b, "\t\t}\n")
 			} else {
-				fmt.Fprintf(b, "\t\tenc.WriteFieldFloat(%d, %s)\n", fieldID, goField)
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendFixed64(buf.B, %s)\n", goField)
 			}
 		case "String":
 			if f.Type.Nullable {
-				fmt.Fprintf(b, "\t\tenc.WriteFieldStringPtr(%d, %s)\n", fieldID, goField)
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t\tif %s != nil {\n", goField)
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendPresent(buf.B)\n")
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendString(buf.B, *%s)\n", goField)
+				fmt.Fprintf(b, "\t\t} else {\n")
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendNull(buf.B)\n")
+				fmt.Fprintf(b, "\t\t}\n")
 			} else {
-				fmt.Fprintf(b, "\t\tenc.WriteFieldString(%d, %s)\n", fieldID, goField)
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendString(buf.B, %s)\n", goField)
 			}
 		case "Boolean":
 			if f.Type.Nullable {
-				fmt.Fprintf(b, "\t\tenc.WriteFieldBoolPtr(%d, %s)\n", fieldID, goField)
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t\tif %s != nil {\n", goField)
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendPresent(buf.B)\n")
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendBool(buf.B, *%s)\n", goField)
+				fmt.Fprintf(b, "\t\t} else {\n")
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendNull(buf.B)\n")
+				fmt.Fprintf(b, "\t\t}\n")
 			} else {
-				fmt.Fprintf(b, "\t\tenc.WriteFieldBool(%d, %s)\n", fieldID, goField)
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendBool(buf.B, %s)\n", goField)
 			}
 		default:
 			fmt.Fprintf(b, "\t\t// TODO: binary encoding for type %s (field %s)\n", baseType, f.Name)
@@ -392,7 +428,68 @@ func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bo
 		b.WriteString("\t}\n")
 	}
 
-	fmt.Fprintf(b, "\tenc.WriteEnd()\n")
-	fmt.Fprintf(b, "\tbuf.B = append(buf.B, enc.Bytes()...)\n")
+	fmt.Fprintf(b, "\tbuf.B = append(buf.B, 0x00)\n")
 	fmt.Fprintf(b, "}\n\n")
+}
+
+// generateWriteLuxoAllFields generates the nil-mask fast path — all fields, no checks.
+func generateWriteLuxoAllFields(b *strings.Builder, m *ast.ModelDecl, recv string, enums map[string]bool) {
+	for _, f := range m.Fields {
+		if f.Type == nil || f.Computed != nil {
+			continue
+		}
+		if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
+			continue
+		}
+		if isRelationField(f, enums) {
+			continue
+		}
+		fieldID := getModelFieldID(m.Name, f.Name)
+		if fieldID == 0 {
+			continue
+		}
+		goField := recv + "." + str.Capitalize(f.Name)
+		fid := fmt.Sprintf("%d", fieldID)
+
+		if enums[f.Type.Name] {
+			if f.Type.Nullable {
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t\tif %s != nil { buf.B = codec.AppendPresent(buf.B); buf.B = codec.AppendString(buf.B, string(*%s)) } else { buf.B = codec.AppendNull(buf.B) }\n", goField, goField)
+			} else {
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s); buf.B = codec.AppendString(buf.B, string(%s))\n", fid, goField)
+			}
+			continue
+		}
+
+		switch f.Type.Name {
+		case "Int", "DateTime", "Duration":
+			if f.Type.Nullable {
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t\tif %s != nil { buf.B = codec.AppendPresent(buf.B); buf.B = codec.AppendSvarint(buf.B, *%s) } else { buf.B = codec.AppendNull(buf.B) }\n", goField, goField)
+			} else {
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s); buf.B = codec.AppendSvarint(buf.B, %s)\n", fid, goField)
+			}
+		case "Float":
+			if f.Type.Nullable {
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t\tif %s != nil { buf.B = codec.AppendPresent(buf.B); buf.B = codec.AppendFixed64(buf.B, *%s) } else { buf.B = codec.AppendNull(buf.B) }\n", goField, goField)
+			} else {
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s); buf.B = codec.AppendFixed64(buf.B, %s)\n", fid, goField)
+			}
+		case "String":
+			if f.Type.Nullable {
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t\tif %s != nil { buf.B = codec.AppendPresent(buf.B); buf.B = codec.AppendString(buf.B, *%s) } else { buf.B = codec.AppendNull(buf.B) }\n", goField, goField)
+			} else {
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s); buf.B = codec.AppendString(buf.B, %s)\n", fid, goField)
+			}
+		case "Boolean":
+			if f.Type.Nullable {
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t\tif %s != nil { buf.B = codec.AppendPresent(buf.B); buf.B = codec.AppendBool(buf.B, *%s) } else { buf.B = codec.AppendNull(buf.B) }\n", goField, goField)
+			} else {
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s); buf.B = codec.AppendBool(buf.B, %s)\n", fid, goField)
+			}
+		}
+	}
 }

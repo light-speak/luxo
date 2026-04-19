@@ -53,6 +53,11 @@ func (rt *Router) SetDevMode(dev bool) {
 	rt.devMode = dev
 }
 
+// ExportHandlers returns the handler map for sharing with RPC server.
+func (rt *Router) ExportHandlers() map[string]HandlerFunc {
+	return rt.handlers
+}
+
 // ServeHTTP implements http.Handler for the /luvia endpoint.
 // Supports JSON (default) and Luxo binary (X-Luxo-Mode: binary) protocols.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -99,13 +104,11 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if binaryMode {
-		// Binary response: raw bytes from handler (already binary-encoded)
 		w.Header().Set("Content-Type", "application/x-luxo")
 		w.Header().Set("X-Luxo-Mode", "binary")
 		w.WriteHeader(http.StatusOK)
 		w.Write(buf.B)
 	} else {
-		// JSON response: {"data": <buf> }
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write(jsonDataPrefix)

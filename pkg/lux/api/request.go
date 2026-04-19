@@ -56,17 +56,23 @@ type Sorter struct {
 
 // Request represents a parsed Luvia API request.
 type Request struct {
-	API         string                     // $api field
-	Select      []*selection.Field         // parsed $select (JSON mode)
-	Params      map[string]json.RawMessage // remaining fields as raw JSON
-	TypedParams map[string]any             // binary mode: native Go values, zero conversion
-	Buf         *ResponseBuf               // response buffer — handler writes directly here
-	Filters     []Filter                   // parsed $filters
-	Sorters     []Sorter                   // parsed $sorters
-	Page        int                        // page number (default 1)
-	PageSize    int                        // page size (default 20)
-	BinaryMode  bool                       // true when X-Luxo-Mode: binary
-	FieldMask   []byte                     // binary field mask (binary mode)
+	API        string                     // $api field
+	Select     []*selection.Field         // parsed $select (JSON mode)
+	Params     map[string]json.RawMessage // remaining fields as raw JSON
+	Buf        *ResponseBuf               // response buffer — handler writes directly here
+	Filters    []Filter                   // parsed $filters
+	Sorters    []Sorter                   // parsed $sorters
+	Page       int                        // page number (default 1)
+	PageSize   int                        // page size (default 20)
+	BinaryMode bool                       // true when X-Luxo-Mode: binary
+	FieldMask  []byte                     // binary field mask (binary mode)
+
+	// Binary params — zero-allocation inline storage
+	// paramSlots stores values by index (position in API param list)
+	// paramNames points to the static name list from Registry (never allocated per request)
+	paramSlots [16]any
+	paramNames []string // shared, not owned
+	paramCount int
 }
 
 // ParseRequest reads an HTTP request body and extracts $api, $select, and params.
@@ -169,12 +175,22 @@ func (req *Request) parseListParams(raw map[string]json.RawMessage) error {
 	return nil
 }
 
+// findParam looks up a binary param by name from the inline slot array.
+// Returns the value and true if found, nil and false otherwise.
+func (r *Request) findParam(name string) (any, bool) {
+	for i := 0; i < r.paramCount; i++ {
+		if r.paramNames[i] == name {
+			return r.paramSlots[i], true
+		}
+	}
+	return nil, false
+}
+
 // ParamInt extracts an integer parameter. Returns 400 BadRequest on error.
-// Binary mode: direct int64 from TypedParams (zero parsing).
-// JSON mode: sonic.Unmarshal from raw JSON.
+// Binary mode: inline array lookup (zero alloc). JSON mode: sonic.Unmarshal.
 func (r *Request) ParamInt(name string) (int64, error) {
-	if r.TypedParams != nil {
-		if v, ok := r.TypedParams[name]; ok {
+	if r.paramNames != nil {
+		if v, ok := r.findParam(name); ok {
 			if iv, ok := v.(int64); ok {
 				return iv, nil
 			}
@@ -194,8 +210,8 @@ func (r *Request) ParamInt(name string) (int64, error) {
 
 // ParamString extracts a string parameter. Returns 400 BadRequest on error.
 func (r *Request) ParamString(name string) (string, error) {
-	if r.TypedParams != nil {
-		if v, ok := r.TypedParams[name]; ok {
+	if r.paramNames != nil {
+		if v, ok := r.findParam(name); ok {
 			if sv, ok := v.(string); ok {
 				return sv, nil
 			}
@@ -213,10 +229,10 @@ func (r *Request) ParamString(name string) (string, error) {
 	return v, nil
 }
 
-// ParamDateTime extracts a time.Time parameter from RFC3339 string. Returns 400 BadRequest on error.
+// ParamDateTime extracts a time.Time parameter from RFC3339 string.
 func (r *Request) ParamDateTime(name string) (time.Time, error) {
-	if r.TypedParams != nil {
-		if v, ok := r.TypedParams[name]; ok {
+	if r.paramNames != nil {
+		if v, ok := r.findParam(name); ok {
 			if sv, ok := v.(string); ok {
 				t, err := time.Parse(time.RFC3339, sv)
 				if err != nil {
@@ -244,8 +260,8 @@ func (r *Request) ParamDateTime(name string) (time.Time, error) {
 
 // ParamFloat extracts a float64 parameter. Returns 400 BadRequest on error.
 func (r *Request) ParamFloat(name string) (float64, error) {
-	if r.TypedParams != nil {
-		if v, ok := r.TypedParams[name]; ok {
+	if r.paramNames != nil {
+		if v, ok := r.findParam(name); ok {
 			if fv, ok := v.(float64); ok {
 				return fv, nil
 			}
@@ -265,8 +281,8 @@ func (r *Request) ParamFloat(name string) (float64, error) {
 
 // ParamBool extracts a boolean parameter. Returns 400 BadRequest on error.
 func (r *Request) ParamBool(name string) (bool, error) {
-	if r.TypedParams != nil {
-		if v, ok := r.TypedParams[name]; ok {
+	if r.paramNames != nil {
+		if v, ok := r.findParam(name); ok {
 			if bv, ok := v.(bool); ok {
 				return bv, nil
 			}
@@ -286,8 +302,8 @@ func (r *Request) ParamBool(name string) (bool, error) {
 
 // ParamIntArray extracts an []int64 parameter. Returns 400 BadRequest on error.
 func (r *Request) ParamIntArray(name string) ([]int64, error) {
-	if r.TypedParams != nil {
-		if v, ok := r.TypedParams[name]; ok {
+	if r.paramNames != nil {
+		if v, ok := r.findParam(name); ok {
 			if iv, ok := v.([]int64); ok {
 				return iv, nil
 			}
@@ -307,8 +323,8 @@ func (r *Request) ParamIntArray(name string) ([]int64, error) {
 
 // ParamStringArray extracts a []string parameter. Returns 400 BadRequest on error.
 func (r *Request) ParamStringArray(name string) ([]string, error) {
-	if r.TypedParams != nil {
-		if v, ok := r.TypedParams[name]; ok {
+	if r.paramNames != nil {
+		if v, ok := r.findParam(name); ok {
 			if sv, ok := v.([]string); ok {
 				return sv, nil
 			}
@@ -326,16 +342,13 @@ func (r *Request) ParamStringArray(name string) ([]string, error) {
 	return v, nil
 }
 
-// ParamJSON extracts a raw JSON parameter into the target struct. Returns 400 BadRequest on error.
-// Binary mode: attempts direct type assertion from TypedParams.
+// ParamJSON extracts a parameter into the target. Returns 400 BadRequest on error.
 func (r *Request) ParamJSON(name string, target any) error {
-	if r.TypedParams != nil {
-		v, ok := r.TypedParams[name]
+	if r.paramNames != nil {
+		v, ok := r.findParam(name)
 		if !ok {
 			return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 		}
-		// Binary mode stores native Go values — try direct assignment
-		// For complex types, this requires the caller to handle the type assertion
 		if ptr, ok := target.(*any); ok {
 			*ptr = v
 			return nil
@@ -352,10 +365,24 @@ func (r *Request) ParamJSON(name string, target any) error {
 	return nil
 }
 
+// SetBinaryParams configures binary mode param storage.
+// Called by RPC server to set up paramSlots without allocation.
+func (r *Request) SetBinaryParams(names []string, count int) {
+	r.paramNames = names
+	r.paramCount = count
+}
+
+// SetParamSlot sets a param value by index (binary mode).
+func (r *Request) SetParamSlot(index int, value any) {
+	if index >= 0 && index < 16 {
+		r.paramSlots[index] = value
+	}
+}
+
 // HasParam checks if a parameter exists (supports both JSON and binary mode).
 func (r *Request) HasParam(name string) bool {
-	if r.TypedParams != nil {
-		_, ok := r.TypedParams[name]
+	if r.paramNames != nil {
+		_, ok := r.findParam(name)
 		return ok
 	}
 	_, ok := r.Params[name]

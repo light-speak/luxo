@@ -128,7 +128,7 @@ func TestBinaryRequestEmpty(t *testing.T) {
 }
 
 func TestTypedParamsInt(t *testing.T) {
-	req := &Request{TypedParams: map[string]any{"id": int64(42)}}
+	req := &Request{paramNames: []string{"id"}, paramCount: 1, paramSlots: [16]any{int64(42)}}
 	v, err := req.ParamInt("id")
 	if err != nil || v != 42 {
 		t.Fatalf("got %d, err=%v", v, err)
@@ -140,7 +140,7 @@ func TestTypedParamsInt(t *testing.T) {
 }
 
 func TestTypedParamsString(t *testing.T) {
-	req := &Request{TypedParams: map[string]any{"name": "alice"}}
+	req := &Request{paramNames: []string{"name"}, paramCount: 1, paramSlots: [16]any{"alice"}}
 	v, err := req.ParamString("name")
 	if err != nil || v != "alice" {
 		t.Fatalf("got %q, err=%v", v, err)
@@ -148,7 +148,7 @@ func TestTypedParamsString(t *testing.T) {
 }
 
 func TestTypedParamsFloat(t *testing.T) {
-	req := &Request{TypedParams: map[string]any{"amount": 99.5}}
+	req := &Request{paramNames: []string{"amount"}, paramCount: 1, paramSlots: [16]any{99.5}}
 	v, err := req.ParamFloat("amount")
 	if err != nil || v != 99.5 {
 		t.Fatalf("got %f, err=%v", v, err)
@@ -156,7 +156,7 @@ func TestTypedParamsFloat(t *testing.T) {
 }
 
 func TestTypedParamsBool(t *testing.T) {
-	req := &Request{TypedParams: map[string]any{"active": true}}
+	req := &Request{paramNames: []string{"active"}, paramCount: 1, paramSlots: [16]any{true}}
 	v, err := req.ParamBool("active")
 	if err != nil || !v {
 		t.Fatalf("got %v, err=%v", v, err)
@@ -164,7 +164,7 @@ func TestTypedParamsBool(t *testing.T) {
 }
 
 func TestTypedParamsHasParam(t *testing.T) {
-	req := &Request{TypedParams: map[string]any{"id": int64(1)}}
+	req := &Request{paramNames: []string{"id"}, paramCount: 1, paramSlots: [16]any{int64(1)}}
 	if !req.HasParam("id") {
 		t.Error("should have id")
 	}
@@ -174,7 +174,7 @@ func TestTypedParamsHasParam(t *testing.T) {
 }
 
 func TestTypedParamsDateTime(t *testing.T) {
-	req := &Request{TypedParams: map[string]any{"date": "2026-04-17T12:00:00Z"}}
+	req := &Request{paramNames: []string{"date"}, paramCount: 1, paramSlots: [16]any{"2026-04-17T12:00:00Z"}}
 	v, err := req.ParamDateTime("date")
 	if err != nil {
 		t.Fatal(err)
@@ -185,7 +185,7 @@ func TestTypedParamsDateTime(t *testing.T) {
 }
 
 func TestTypedParamsMissing(t *testing.T) {
-	req := &Request{TypedParams: map[string]any{}}
+	req := &Request{paramNames: []string{}, paramCount: 0}
 	_, err := req.ParamFloat("x")
 	if err == nil {
 		t.Fatal("should error")

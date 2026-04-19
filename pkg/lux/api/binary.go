@@ -10,10 +10,10 @@ import (
 // APIRegistry maps API IDs (from luxo.lock) to handler names and param metadata.
 // Built at startup by RegisterHandlers, used for binary protocol routing.
 type APIRegistry struct {
-	idToName map[int]string
-	nameToID map[string]int
-	// paramOrder maps api_name → ordered param names (for positional binary decoding)
+	idToName   map[int]string
+	nameToID   map[string]int
 	paramOrder map[string][]ParamMeta
+	paramNames map[string][]string // static name lists for zero-alloc param lookup
 }
 
 // ParamMeta describes an API parameter for binary decoding.
@@ -29,6 +29,7 @@ func NewAPIRegistry() *APIRegistry {
 		idToName:   make(map[int]string),
 		nameToID:   make(map[string]int),
 		paramOrder: make(map[string][]ParamMeta),
+		paramNames: make(map[string][]string),
 	}
 }
 
@@ -39,8 +40,14 @@ func (r *APIRegistry) Register(name string, id int) {
 }
 
 // RegisterParams sets the ordered parameter metadata for an API.
+// Builds a static name list for zero-alloc param lookup at request time.
 func (r *APIRegistry) RegisterParams(name string, params []ParamMeta) {
 	r.paramOrder[name] = params
+	names := make([]string, len(params))
+	for i, p := range params {
+		names[i] = p.Name
+	}
+	r.paramNames[name] = names
 }
 
 // NameByID returns the API name for a given ID.
@@ -53,6 +60,16 @@ func (r *APIRegistry) NameByID(id int) (string, bool) {
 func (r *APIRegistry) IDByName(name string) (int, bool) {
 	id, ok := r.nameToID[name]
 	return id, ok
+}
+
+// ParamOrder returns param metadata for an API (used by RPC server).
+func (r *APIRegistry) ParamOrder(name string) []ParamMeta {
+	return r.paramOrder[name]
+}
+
+// ParamNames returns the static param name list for an API (used by RPC server).
+func (r *APIRegistry) ParamNames(name string) []string {
+	return r.paramNames[name]
 }
 
 // ParseBinaryRequest decodes a Luxo binary request into a Request struct.
@@ -101,54 +118,75 @@ func (r *APIRegistry) ParseBinaryRequest(body []byte) (*Request, error) {
 		off = maskEnd
 	}
 
-	// Read params directly to native Go values — zero JSON conversion
-	typedParams := make(map[string]any)
+	// Inline decode params into Request.paramSlots — zero map allocation
 	paramMeta := r.paramOrder[apiName]
+	req := &Request{
+		API:        apiName,
+		Select:     fields,
+		Page:       1,
+		PageSize:   20,
+		BinaryMode: true,
+		paramNames: r.paramNames[apiName], // static slice, shared
+		paramCount: len(paramMeta),
+	}
 
-	dec := codec.NewDecoder(body[off:])
-	for dec.NextField() {
-		fid := dec.FieldID()
+	paramBuf := body[off:]
+	poff := 0
+	for poff < len(paramBuf) {
+		fid, n := codec.ReadVarint(paramBuf, poff)
+		if n <= 0 || fid == 0 {
+			break
+		}
+		poff += n
+
+		// Find param index by fieldID → write to paramSlots[index]
+		paramIdx := -1
 		var meta *ParamMeta
 		for i := range paramMeta {
-			if paramMeta[i].FieldID == fid {
+			if paramMeta[i].FieldID == int(fid) {
+				paramIdx = i
 				meta = &paramMeta[i]
 				break
 			}
 		}
-		if meta == nil {
-			continue
+		if meta == nil || paramIdx >= 16 {
+			break
 		}
+
 		switch meta.Type {
 		case "Int":
-			typedParams[meta.Name] = dec.ReadInt()
+			v, n := codec.ReadSvarint(paramBuf, poff)
+			if n <= 0 {
+				return nil, fmt.Errorf("param %s: truncated int", meta.Name)
+			}
+			poff += n
+			req.paramSlots[paramIdx] = v
 		case "Float":
-			typedParams[meta.Name] = dec.ReadFloat()
+			v, n := codec.ReadFixed64(paramBuf, poff)
+			if n == 0 {
+				return nil, fmt.Errorf("param %s: truncated float", meta.Name)
+			}
+			poff += n
+			req.paramSlots[paramIdx] = v
 		case "String":
-			typedParams[meta.Name] = dec.ReadString()
+			v, n := codec.ReadString(paramBuf, poff)
+			if n == 0 {
+				return nil, fmt.Errorf("param %s: truncated string", meta.Name)
+			}
+			poff += n
+			req.paramSlots[paramIdx] = v
 		case "Boolean":
-			typedParams[meta.Name] = dec.ReadBool()
-		case "IntArray":
-			typedParams[meta.Name] = dec.ReadIntArray()
-		case "StringArray":
-			typedParams[meta.Name] = dec.ReadStringArray()
-		case "FloatArray":
-			typedParams[meta.Name] = dec.ReadFloatArray()
+			v, n := codec.ReadBool(paramBuf, poff)
+			if n == 0 {
+				return nil, fmt.Errorf("param %s: truncated bool", meta.Name)
+			}
+			poff += n
+			req.paramSlots[paramIdx] = v
+		default:
+			break
 		}
 	}
 
-	if err := dec.Err(); err != nil {
-		return nil, fmt.Errorf("param decode: %w", err)
-	}
-
-	req := &Request{
-		API:         apiName,
-		Select:      fields,
-		TypedParams: typedParams,
-		Page:        1,
-		PageSize:    20,
-		BinaryMode:  true,
-		FieldMask:   nil, // TODO: pass actual field mask bytes
-	}
 	return req, nil
 }
 
