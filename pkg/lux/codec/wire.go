@@ -29,7 +29,8 @@ func AppendVarint(dst []byte, v uint64) []byte {
 }
 
 // ReadVarint reads a varint from buf at offset. Returns value and bytes consumed.
-// Returns (0, 0) if buf is too short.
+// Returns (0, 0) if buf is too short or varint overflows 64 bits.
+// Use ReadVarintErr for error details.
 func ReadVarint(buf []byte, off int) (uint64, int) {
 	var v uint64
 	var shift uint
@@ -41,10 +42,10 @@ func ReadVarint(buf []byte, off int) (uint64, int) {
 		}
 		shift += 7
 		if shift >= 64 {
-			return 0, 0 // overflow
+			return 0, -1 // overflow (distinguishable from truncation)
 		}
 	}
-	return 0, 0 // incomplete
+	return 0, 0 // incomplete/truncated
 }
 
 // --- Signed varint (zigzag encoding) ---
@@ -57,6 +58,9 @@ func AppendSvarint(dst []byte, v int64) []byte {
 // ReadSvarint reads a zigzag-encoded int64 from buf at offset.
 func ReadSvarint(buf []byte, off int) (int64, int) {
 	uv, n := ReadVarint(buf, off)
+	if n <= 0 {
+		return 0, 0
+	}
 	return int64(uv>>1) ^ -int64(uv&1), n
 }
 
@@ -96,7 +100,7 @@ func AppendString(dst []byte, v string) []byte {
 // Returns the bytes slice (pointing into buf) and total bytes consumed.
 func ReadBytes(buf []byte, off int) ([]byte, int) {
 	length, n := ReadVarint(buf, off)
-	if n == 0 {
+	if n <= 0 {
 		return nil, 0
 	}
 	start := off + n
@@ -129,7 +133,26 @@ func AppendBool(dst []byte, v bool) []byte {
 // ReadBool reads a boolean from buf at offset.
 func ReadBool(buf []byte, off int) (bool, int) {
 	v, n := ReadVarint(buf, off)
+	if n <= 0 {
+		return false, 0
+	}
 	return v != 0, n
+}
+
+// --- Array (count + items) ---
+
+// AppendArrayHeader appends the array count as a varint.
+func AppendArrayHeader(dst []byte, count int) []byte {
+	return AppendVarint(dst, uint64(count))
+}
+
+// ReadArrayHeader reads the array count from buf at offset.
+func ReadArrayHeader(buf []byte, off int) (count int, n int) {
+	v, n := ReadVarint(buf, off)
+	if n <= 0 {
+		return 0, 0
+	}
+	return int(v), n
 }
 
 // --- Nullable flag ---

@@ -387,7 +387,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 		}
 		fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
-		fmt.Fprintf(b, "\t\t\tresult.WriteLuxo(req.Buf)\n")
+		fmt.Fprintf(b, "\t\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
 		fmt.Fprintf(b, "\t\t} else {\n")
 		fmt.Fprintf(b, "\t\t\tresult.WriteJSON(req.Buf, req.Select)\n")
 		fmt.Fprintf(b, "\t\t}\n")
@@ -419,7 +419,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
 		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(results)))\n")
 		fmt.Fprintf(b, "\t\t\tfor _, item := range results {\n")
-		fmt.Fprintf(b, "\t\t\t\titem.WriteLuxo(req.Buf)\n")
+		fmt.Fprintf(b, "\t\t\t\titem.WriteLuxo(req.Buf, req.FieldMask)\n")
 		fmt.Fprintf(b, "\t\t\t}\n")
 		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, total)\n")
 		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.Page))\n")
@@ -538,7 +538,7 @@ func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string,
 	fmt.Fprintf(b, "\t\tresult, err := builder.Exec(ctx)\n")
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 	fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
-	fmt.Fprintf(b, "\t\t\tresult.WriteLuxo(req.Buf)\n")
+	fmt.Fprintf(b, "\t\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
 	fmt.Fprintf(b, "\t\t} else {\n")
 	fmt.Fprintf(b, "\t\t\tresult.WriteJSON(req.Buf, req.Select)\n")
 	fmt.Fprintf(b, "\t\t}\n")
@@ -574,7 +574,7 @@ func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType
 	fmt.Fprintf(b, "\t\tresult, err := builder.Exec(ctx)\n")
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 	fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
-	fmt.Fprintf(b, "\t\t\tresult.WriteLuxo(req.Buf)\n")
+	fmt.Fprintf(b, "\t\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
 	fmt.Fprintf(b, "\t\t} else {\n")
 	fmt.Fprintf(b, "\t\t\tresult.WriteJSON(req.Buf, req.Select)\n")
 	fmt.Fprintf(b, "\t\t}\n")
@@ -820,6 +820,7 @@ func crudAPIName(modelName, op string) string {
 }
 
 // generateRegisterFuncWithInferred generates RegisterHandlers with CRUD + inferred handlers.
+// Also registers API IDs and param metadata for binary protocol routing.
 func generateRegisterFuncWithInferred(b *strings.Builder, models []*ast.ModelDecl, inferredNames []string) {
 	b.WriteString("// RegisterHandlers registers all API handlers with the router.\n")
 	b.WriteString("func RegisterHandlers(router *api.Router, app *App) {\n")
@@ -828,14 +829,51 @@ func generateRegisterFuncWithInferred(b *strings.Builder, models []*ast.ModelDec
 		for _, op := range crudOperations(m) {
 			name := crudAPIName(m.Name, op)
 			fmt.Fprintf(b, "\trouter.Handle(%q, handle%s(app))\n", name, str.Capitalize(name))
+			writeAPIRegistration(b, name)
 		}
 	}
 
 	for _, name := range inferredNames {
 		fmt.Fprintf(b, "\trouter.Handle(%q, handle%s(app))\n", name, str.Capitalize(name))
+		writeAPIRegistration(b, name)
 	}
 
 	b.WriteString("}\n")
+}
+
+// writeAPIRegistration generates router.Registry.Register + RegisterParams calls.
+func writeAPIRegistration(b *strings.Builder, name string) {
+	id := getAPIID(name)
+	if id == 0 {
+		return
+	}
+	fmt.Fprintf(b, "\trouter.Registry.Register(%q, %d)\n", name, id)
+	params := getAPIParamIDs(name)
+	if len(params) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "\trouter.Registry.RegisterParams(%q, []api.ParamMeta{\n", name)
+	for paramName, paramID := range params {
+		// Infer type from param name (heuristic)
+		ptype := inferParamType(paramName)
+		fmt.Fprintf(b, "\t\t{Name: %q, Type: %q, FieldID: %d},\n", paramName, ptype, paramID)
+	}
+	b.WriteString("\t})\n")
+}
+
+func inferParamType(name string) string {
+	switch {
+	case name == "id" || strings.HasSuffix(name, "Id"):
+		return "Int"
+	case name == "page" || name == "pageSize" || name == "limit" || name == "offset":
+		return "Int"
+	case strings.HasPrefix(name, "is") || name == "active" || name == "published":
+		return "Boolean"
+	case name == "amount" || name == "price" || name == "balance":
+		return "Float"
+	default:
+		return "String"
+	}
 }
 
 // idGoType returns the Go type of the id field.

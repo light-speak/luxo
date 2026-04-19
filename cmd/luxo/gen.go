@@ -73,6 +73,18 @@ func runGen(cmd *cobra.Command, args []string) error {
 		}
 		codegen.SetModelFieldIDs(ids)
 	}
+	if lf.APIs != nil {
+		ids := make(map[string]int, len(lf.APIs))
+		paramIDs := make(map[string]map[string]int, len(lf.APIs))
+		for name, al := range lf.APIs {
+			ids[name] = al.ID
+			if len(al.Params) > 0 {
+				paramIDs[name] = al.Params
+			}
+		}
+		codegen.SetAPIIDs(ids)
+		codegen.SetAPIParamIDs(paramIDs)
+	}
 
 	totalFiles, err := generateModules(files, result)
 	if err != nil {

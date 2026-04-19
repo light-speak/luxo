@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"fmt"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
@@ -91,6 +90,9 @@ func (r *APIRegistry) ParseBinaryRequest(body []byte) (*Request, error) {
 
 	var fields []*selection.Field
 	if maskLen > 0 {
+		if maskLen > uint64(len(body)) {
+			return nil, fmt.Errorf("field mask length overflow")
+		}
 		maskEnd := off + int(maskLen)
 		if maskEnd > len(body) {
 			return nil, fmt.Errorf("field mask exceeds body")
@@ -99,14 +101,13 @@ func (r *APIRegistry) ParseBinaryRequest(body []byte) (*Request, error) {
 		off = maskEnd
 	}
 
-	// Read params (fieldID → value pairs, terminated by 0x00)
-	params := make(map[string]json.RawMessage)
+	// Read params directly to native Go values — zero JSON conversion
+	typedParams := make(map[string]any)
 	paramMeta := r.paramOrder[apiName]
 
 	dec := codec.NewDecoder(body[off:])
 	for dec.NextField() {
 		fid := dec.FieldID()
-		// Find param by field ID
 		var meta *ParamMeta
 		for i := range paramMeta {
 			if paramMeta[i].FieldID == fid {
@@ -115,28 +116,23 @@ func (r *APIRegistry) ParseBinaryRequest(body []byte) (*Request, error) {
 			}
 		}
 		if meta == nil {
-			// Unknown param — skip
 			continue
 		}
-		// Decode value to json.RawMessage (handler-compatible)
 		switch meta.Type {
 		case "Int":
-			v := dec.ReadInt()
-			params[meta.Name] = json.RawMessage(fmt.Sprintf("%d", v))
+			typedParams[meta.Name] = dec.ReadInt()
 		case "Float":
-			v := dec.ReadFloat()
-			params[meta.Name] = json.RawMessage(fmt.Sprintf("%g", v))
+			typedParams[meta.Name] = dec.ReadFloat()
 		case "String":
-			v := dec.ReadString()
-			raw, _ := json.Marshal(v)
-			params[meta.Name] = json.RawMessage(raw)
+			typedParams[meta.Name] = dec.ReadString()
 		case "Boolean":
-			v := dec.ReadBool()
-			if v {
-				params[meta.Name] = json.RawMessage("true")
-			} else {
-				params[meta.Name] = json.RawMessage("false")
-			}
+			typedParams[meta.Name] = dec.ReadBool()
+		case "IntArray":
+			typedParams[meta.Name] = dec.ReadIntArray()
+		case "StringArray":
+			typedParams[meta.Name] = dec.ReadStringArray()
+		case "FloatArray":
+			typedParams[meta.Name] = dec.ReadFloatArray()
 		}
 	}
 
@@ -145,13 +141,13 @@ func (r *APIRegistry) ParseBinaryRequest(body []byte) (*Request, error) {
 	}
 
 	req := &Request{
-		API:        apiName,
-		Select:     fields,
-		Params:     params,
-		Page:       1,
-		PageSize:   20,
-		BinaryMode: true,
-		FieldMask:  nil, // TODO: pass actual field mask bytes
+		API:         apiName,
+		Select:      fields,
+		TypedParams: typedParams,
+		Page:        1,
+		PageSize:    20,
+		BinaryMode:  true,
+		FieldMask:   nil, // TODO: pass actual field mask bytes
 	}
 	return req, nil
 }

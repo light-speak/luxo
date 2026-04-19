@@ -56,16 +56,17 @@ type Sorter struct {
 
 // Request represents a parsed Luvia API request.
 type Request struct {
-	API        string                     // $api field
-	Select     []*selection.Field         // parsed $select (JSON mode)
-	Params     map[string]json.RawMessage // remaining fields as raw JSON
-	Buf        *ResponseBuf               // response buffer — handler writes directly here
-	Filters    []Filter                   // parsed $filters
-	Sorters    []Sorter                   // parsed $sorters
-	Page       int                        // page number (default 1)
-	PageSize   int                        // page size (default 20)
-	BinaryMode bool                       // true when X-Luxo-Mode: binary
-	FieldMask  []byte                     // binary field mask (binary mode)
+	API         string                     // $api field
+	Select      []*selection.Field         // parsed $select (JSON mode)
+	Params      map[string]json.RawMessage // remaining fields as raw JSON
+	TypedParams map[string]any             // binary mode: native Go values, zero conversion
+	Buf         *ResponseBuf               // response buffer — handler writes directly here
+	Filters     []Filter                   // parsed $filters
+	Sorters     []Sorter                   // parsed $sorters
+	Page        int                        // page number (default 1)
+	PageSize    int                        // page size (default 20)
+	BinaryMode  bool                       // true when X-Luxo-Mode: binary
+	FieldMask   []byte                     // binary field mask (binary mode)
 }
 
 // ParseRequest reads an HTTP request body and extracts $api, $select, and params.
@@ -169,7 +170,17 @@ func (req *Request) parseListParams(raw map[string]json.RawMessage) error {
 }
 
 // ParamInt extracts an integer parameter. Returns 400 BadRequest on error.
+// Binary mode: direct int64 from TypedParams (zero parsing).
+// JSON mode: sonic.Unmarshal from raw JSON.
 func (r *Request) ParamInt(name string) (int64, error) {
+	if r.TypedParams != nil {
+		if v, ok := r.TypedParams[name]; ok {
+			if iv, ok := v.(int64); ok {
+				return iv, nil
+			}
+		}
+		return 0, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
+	}
 	raw, ok := r.Params[name]
 	if !ok {
 		return 0, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
@@ -183,6 +194,14 @@ func (r *Request) ParamInt(name string) (int64, error) {
 
 // ParamString extracts a string parameter. Returns 400 BadRequest on error.
 func (r *Request) ParamString(name string) (string, error) {
+	if r.TypedParams != nil {
+		if v, ok := r.TypedParams[name]; ok {
+			if sv, ok := v.(string); ok {
+				return sv, nil
+			}
+		}
+		return "", errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
+	}
 	raw, ok := r.Params[name]
 	if !ok {
 		return "", errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
@@ -196,6 +215,18 @@ func (r *Request) ParamString(name string) (string, error) {
 
 // ParamDateTime extracts a time.Time parameter from RFC3339 string. Returns 400 BadRequest on error.
 func (r *Request) ParamDateTime(name string) (time.Time, error) {
+	if r.TypedParams != nil {
+		if v, ok := r.TypedParams[name]; ok {
+			if sv, ok := v.(string); ok {
+				t, err := time.Parse(time.RFC3339, sv)
+				if err != nil {
+					return time.Time{}, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be RFC3339 format"})
+				}
+				return t, nil
+			}
+		}
+		return time.Time{}, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
+	}
 	raw, ok := r.Params[name]
 	if !ok {
 		return time.Time{}, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
@@ -213,6 +244,14 @@ func (r *Request) ParamDateTime(name string) (time.Time, error) {
 
 // ParamFloat extracts a float64 parameter. Returns 400 BadRequest on error.
 func (r *Request) ParamFloat(name string) (float64, error) {
+	if r.TypedParams != nil {
+		if v, ok := r.TypedParams[name]; ok {
+			if fv, ok := v.(float64); ok {
+				return fv, nil
+			}
+		}
+		return 0, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
+	}
 	raw, ok := r.Params[name]
 	if !ok {
 		return 0, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
@@ -226,6 +265,14 @@ func (r *Request) ParamFloat(name string) (float64, error) {
 
 // ParamBool extracts a boolean parameter. Returns 400 BadRequest on error.
 func (r *Request) ParamBool(name string) (bool, error) {
+	if r.TypedParams != nil {
+		if v, ok := r.TypedParams[name]; ok {
+			if bv, ok := v.(bool); ok {
+				return bv, nil
+			}
+		}
+		return false, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
+	}
 	raw, ok := r.Params[name]
 	if !ok {
 		return false, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
@@ -239,6 +286,14 @@ func (r *Request) ParamBool(name string) (bool, error) {
 
 // ParamIntArray extracts an []int64 parameter. Returns 400 BadRequest on error.
 func (r *Request) ParamIntArray(name string) ([]int64, error) {
+	if r.TypedParams != nil {
+		if v, ok := r.TypedParams[name]; ok {
+			if iv, ok := v.([]int64); ok {
+				return iv, nil
+			}
+		}
+		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
+	}
 	raw, ok := r.Params[name]
 	if !ok {
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
@@ -252,6 +307,14 @@ func (r *Request) ParamIntArray(name string) ([]int64, error) {
 
 // ParamStringArray extracts a []string parameter. Returns 400 BadRequest on error.
 func (r *Request) ParamStringArray(name string) ([]string, error) {
+	if r.TypedParams != nil {
+		if v, ok := r.TypedParams[name]; ok {
+			if sv, ok := v.([]string); ok {
+				return sv, nil
+			}
+		}
+		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
+	}
 	raw, ok := r.Params[name]
 	if !ok {
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
@@ -264,7 +327,21 @@ func (r *Request) ParamStringArray(name string) ([]string, error) {
 }
 
 // ParamJSON extracts a raw JSON parameter into the target struct. Returns 400 BadRequest on error.
+// Binary mode: attempts direct type assertion from TypedParams.
 func (r *Request) ParamJSON(name string, target any) error {
+	if r.TypedParams != nil {
+		v, ok := r.TypedParams[name]
+		if !ok {
+			return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
+		}
+		// Binary mode stores native Go values — try direct assignment
+		// For complex types, this requires the caller to handle the type assertion
+		if ptr, ok := target.(*any); ok {
+			*ptr = v
+			return nil
+		}
+		return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "binary mode: use typed param methods"})
+	}
 	raw, ok := r.Params[name]
 	if !ok {
 		return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
@@ -275,8 +352,12 @@ func (r *Request) ParamJSON(name string, target any) error {
 	return nil
 }
 
-// HasParam checks if a parameter exists.
+// HasParam checks if a parameter exists (supports both JSON and binary mode).
 func (r *Request) HasParam(name string) bool {
+	if r.TypedParams != nil {
+		_, ok := r.TypedParams[name]
+		return ok
+	}
 	_, ok := r.Params[name]
 	return ok
 }

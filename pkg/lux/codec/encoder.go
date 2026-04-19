@@ -114,6 +114,36 @@ func (e *Encoder) WriteFieldBoolPtr(fieldID int, v *bool) {
 	}
 }
 
+// --- Array field writers ---
+// Format: [fieldID varint] [count varint] [item0] [item1] ...
+
+// WriteFieldIntArray writes an int64 array field.
+func (e *Encoder) WriteFieldIntArray(fieldID int, v []int64) {
+	e.buf = AppendVarint(e.buf, uint64(fieldID))
+	e.buf = AppendArrayHeader(e.buf, len(v))
+	for _, item := range v {
+		e.buf = AppendSvarint(e.buf, item)
+	}
+}
+
+// WriteFieldStringArray writes a string array field.
+func (e *Encoder) WriteFieldStringArray(fieldID int, v []string) {
+	e.buf = AppendVarint(e.buf, uint64(fieldID))
+	e.buf = AppendArrayHeader(e.buf, len(v))
+	for _, item := range v {
+		e.buf = AppendString(e.buf, item)
+	}
+}
+
+// WriteFieldFloatArray writes a float64 array field.
+func (e *Encoder) WriteFieldFloatArray(fieldID int, v []float64) {
+	e.buf = AppendVarint(e.buf, uint64(fieldID))
+	e.buf = AppendArrayHeader(e.buf, len(v))
+	for _, item := range v {
+		e.buf = AppendFixed64(e.buf, item)
+	}
+}
+
 // WriteEnd writes the message terminator (fieldID 0).
 func (e *Encoder) WriteEnd() {
 	e.buf = append(e.buf, 0x00)

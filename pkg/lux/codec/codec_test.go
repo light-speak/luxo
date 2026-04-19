@@ -316,3 +316,291 @@ func BenchmarkDecodeEvent(b *testing.B) {
 		}
 	}
 }
+
+// --- Field Mask ---
+
+func TestFieldMaskHas(t *testing.T) {
+	mask := FieldMaskSet(nil, 1)
+	mask = FieldMaskSet(mask, 3)
+	mask = FieldMaskSet(mask, 9)
+
+	if !FieldMaskHas(mask, 1) {
+		t.Error("should have field 1")
+	}
+	if FieldMaskHas(mask, 2) {
+		t.Error("should not have field 2")
+	}
+	if !FieldMaskHas(mask, 3) {
+		t.Error("should have field 3")
+	}
+	if !FieldMaskHas(mask, 9) {
+		t.Error("should have field 9")
+	}
+}
+
+func TestFieldMaskNilIsAll(t *testing.T) {
+	if !FieldMaskHas(nil, 1) || !FieldMaskHas(nil, 999) {
+		t.Error("nil mask should include all fields")
+	}
+}
+
+func TestFieldMaskAll(t *testing.T) {
+	mask := FieldMaskAll(12)
+	for i := 1; i <= 12; i++ {
+		if !FieldMaskHas(mask, i) {
+			t.Errorf("FieldMaskAll(12) should have field %d", i)
+		}
+	}
+}
+
+// --- Array encoding ---
+
+func TestIntArrayRoundTrip(t *testing.T) {
+	var enc Encoder
+	enc.WriteFieldIntArray(1, []int64{10, 20, 30, -1, 0})
+	enc.WriteEnd()
+
+	dec := NewDecoder(enc.Bytes())
+	dec.NextField()
+	if dec.FieldID() != 1 {
+		t.Fatalf("field = %d", dec.FieldID())
+	}
+	got := dec.ReadIntArray()
+	if dec.Err() != nil {
+		t.Fatal(dec.Err())
+	}
+	if len(got) != 5 || got[0] != 10 || got[3] != -1 {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestStringArrayRoundTrip(t *testing.T) {
+	var enc Encoder
+	enc.WriteFieldStringArray(1, []string{"hello", "world", ""})
+	enc.WriteEnd()
+
+	dec := NewDecoder(enc.Bytes())
+	dec.NextField()
+	got := dec.ReadStringArray()
+	if len(got) != 3 || got[0] != "hello" || got[2] != "" {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestFloatArrayRoundTrip(t *testing.T) {
+	var enc Encoder
+	enc.WriteFieldFloatArray(1, []float64{1.1, 2.2, 3.3})
+	enc.WriteEnd()
+
+	dec := NewDecoder(enc.Bytes())
+	dec.NextField()
+	got := dec.ReadFloatArray()
+	if len(got) != 3 || got[0] != 1.1 {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestEmptyArray(t *testing.T) {
+	var enc Encoder
+	enc.WriteFieldIntArray(1, []int64{})
+	enc.WriteEnd()
+
+	dec := NewDecoder(enc.Bytes())
+	dec.NextField()
+	got := dec.ReadIntArray()
+	if len(got) != 0 {
+		t.Fatalf("empty array should have 0 elements, got %d", len(got))
+	}
+}
+
+// --- Columnar encoding ---
+
+func TestColumnarSingleRecord(t *testing.T) {
+	var w ColumnarWriter
+	w.SetCount(1)
+	w.WriteColumnInt(1, []int64{42})
+	w.WriteColumnString(2, []string{"alice"})
+	w.WriteColumnBool(3, []bool{true})
+	data := w.Bytes()
+
+	t.Logf("single record columnar: %d bytes", len(data))
+
+	r := NewColumnarReader(data)
+	if r.Count() != 1 {
+		t.Fatalf("count = %d", r.Count())
+	}
+
+	r.NextColumn()
+	if r.FieldID() != 1 {
+		t.Fatalf("field = %d", r.FieldID())
+	}
+	ids := r.ReadColumnInt()
+	if len(ids) != 1 || ids[0] != 42 {
+		t.Fatalf("ids = %v", ids)
+	}
+
+	r.NextColumn()
+	names := r.ReadColumnString()
+	if len(names) != 1 || names[0] != "alice" {
+		t.Fatalf("names = %v", names)
+	}
+
+	r.NextColumn()
+	bools := r.ReadColumnBool()
+	if len(bools) != 1 || !bools[0] {
+		t.Fatalf("bools = %v", bools)
+	}
+
+	if r.Err() != nil {
+		t.Fatal(r.Err())
+	}
+}
+
+func TestColumnarList(t *testing.T) {
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnInt(1, []int64{1, 2, 3})
+	w.WriteColumnString(2, []string{"alice", "bob", "carol"})
+	w.WriteColumnFloat(3, []float64{10.5, 20.5, 30.5})
+	data := w.Bytes()
+
+	t.Logf("3 records columnar: %d bytes", len(data))
+
+	r := NewColumnarReader(data)
+	if r.Count() != 3 {
+		t.Fatalf("count = %d", r.Count())
+	}
+
+	r.NextColumn()
+	ids := r.ReadColumnInt()
+	if len(ids) != 3 || ids[2] != 3 {
+		t.Fatalf("ids = %v", ids)
+	}
+
+	r.NextColumn()
+	names := r.ReadColumnString()
+	if len(names) != 3 || names[1] != "bob" {
+		t.Fatalf("names = %v", names)
+	}
+
+	r.NextColumn()
+	scores := r.ReadColumnFloat()
+	if len(scores) != 3 || scores[0] != 10.5 {
+		t.Fatalf("scores = %v", scores)
+	}
+}
+
+func TestColumnarNullable(t *testing.T) {
+	v1 := int64(10)
+	v3 := int64(30)
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnIntPtr(1, []*int64{&v1, nil, &v3})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	vals := r.ReadColumnIntPtr()
+	if len(vals) != 3 {
+		t.Fatalf("len = %d", len(vals))
+	}
+	if vals[0] == nil || *vals[0] != 10 {
+		t.Fatal("vals[0] should be 10")
+	}
+	if vals[1] != nil {
+		t.Fatal("vals[1] should be nil")
+	}
+	if vals[2] == nil || *vals[2] != 30 {
+		t.Fatal("vals[2] should be 30")
+	}
+}
+
+func TestColumnarVsRow(t *testing.T) {
+	// Compare sizes: 10 users with 3 fields each
+	type user struct {
+		id    int64
+		name  string
+		score float64
+	}
+	users := []user{
+		{1, "alice", 10.5}, {2, "bob", 20.5}, {3, "carol", 30.5},
+		{4, "dave", 40.5}, {5, "eve", 50.5}, {6, "frank", 60.5},
+		{7, "grace", 70.5}, {8, "hank", 80.5}, {9, "ivy", 90.5},
+		{10, "jack", 100.5},
+	}
+
+	// Row encoding
+	var rowBuf []byte
+	rowBuf = AppendVarint(rowBuf, uint64(len(users))) // count
+	for _, u := range users {
+		var enc Encoder
+		enc.WriteFieldInt(1, u.id)
+		enc.WriteFieldString(2, u.name)
+		enc.WriteFieldFloat(3, u.score)
+		enc.WriteEnd()
+		rowBuf = append(rowBuf, enc.Bytes()...)
+	}
+
+	// Columnar encoding
+	var col ColumnarWriter
+	col.SetCount(len(users))
+	ids := make([]int64, len(users))
+	names := make([]string, len(users))
+	scores := make([]float64, len(users))
+	for i, u := range users {
+		ids[i] = u.id
+		names[i] = u.name
+		scores[i] = u.score
+	}
+	col.WriteColumnInt(1, ids)
+	col.WriteColumnString(2, names)
+	col.WriteColumnFloat(3, scores)
+	colBuf := col.Bytes()
+
+	t.Logf("10 users row: %d bytes, columnar: %d bytes, saving: %d%%",
+		len(rowBuf), len(colBuf), (len(rowBuf)-len(colBuf))*100/len(rowBuf))
+}
+
+func BenchmarkColumnarWrite10(b *testing.B) {
+	ids := []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	names := []string{"alice", "bob", "carol", "dave", "eve", "frank", "grace", "hank", "ivy", "jack"}
+	scores := []float64{10.5, 20.5, 30.5, 40.5, 50.5, 60.5, 70.5, 80.5, 90.5, 100.5}
+
+	var w ColumnarWriter
+	b.ReportAllocs()
+	for b.Loop() {
+		w.Reset()
+		w.SetCount(10)
+		w.WriteColumnInt(1, ids)
+		w.WriteColumnString(2, names)
+		w.WriteColumnFloat(3, scores)
+		_ = w.Bytes()
+	}
+}
+
+func BenchmarkRowWrite10(b *testing.B) {
+	type user struct {
+		id    int64
+		name  string
+		score float64
+	}
+	users := []user{
+		{1, "alice", 10.5}, {2, "bob", 20.5}, {3, "carol", 30.5},
+		{4, "dave", 40.5}, {5, "eve", 50.5}, {6, "frank", 60.5},
+		{7, "grace", 70.5}, {8, "hank", 80.5}, {9, "ivy", 90.5},
+		{10, "jack", 100.5},
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		var buf []byte
+		buf = AppendVarint(buf, uint64(len(users)))
+		for _, u := range users {
+			var enc Encoder
+			enc.WriteFieldInt(1, u.id)
+			enc.WriteFieldString(2, u.name)
+			enc.WriteFieldFloat(3, u.score)
+			enc.WriteEnd()
+			buf = append(buf, enc.Bytes()...)
+		}
+	}
+}

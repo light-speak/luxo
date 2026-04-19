@@ -61,6 +61,38 @@ var eventFieldIDs map[string]map[string]int
 // modelFieldIDs maps model_name → field_name → stable field ID from luxo.lock.
 var modelFieldIDs map[string]map[string]int
 
+// apiIDs maps api_name → stable API ID from luxo.lock.
+var apiIDs map[string]int
+
+// apiParamIDs maps api_name → param_name → stable field ID from luxo.lock.
+var apiParamIDs map[string]map[string]int
+
+// SetAPIIDs sets the API ID map from lock file data.
+func SetAPIIDs(ids map[string]int) {
+	apiIDs = ids
+}
+
+// SetAPIParamIDs sets the API param field ID map from lock file data.
+func SetAPIParamIDs(ids map[string]map[string]int) {
+	apiParamIDs = ids
+}
+
+// getAPIID returns the stable API ID, or 0 if not found.
+func getAPIID(name string) int {
+	if apiIDs == nil {
+		return 0
+	}
+	return apiIDs[name]
+}
+
+// getAPIParamIDs returns param field IDs for an API, or nil.
+func getAPIParamIDs(name string) map[string]int {
+	if apiParamIDs == nil {
+		return nil
+	}
+	return apiParamIDs[name]
+}
+
 // SetEventFieldIDs sets the event field ID map from lock file data.
 func SetEventFieldIDs(ids map[string]map[string]int) {
 	eventFieldIDs = ids

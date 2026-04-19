@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/bytedance/sonic"
+	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/light-speak/luxo/pkg/lux/i18n"
 )
@@ -82,7 +83,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	fn, ok := rt.handlers[req.API]
 	if !ok {
-		rt.writeAppError(w, r, errors.NotFound.WithData(errors.ResourceError{Resource: req.API}))
+		rt.writeAppError(w, r, binaryMode, errors.NotFound.WithData(errors.ResourceError{Resource: req.API}))
 		return
 	}
 
@@ -93,7 +94,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	herr := rt.callHandler(fn, r.Context(), req)
 	if herr != nil {
 		PutBuf(buf)
-		rt.writeAppError(w, r, herr)
+		rt.writeAppError(w, r, binaryMode, herr)
 		return
 	}
 
@@ -127,7 +128,8 @@ func (rt *Router) callHandler(fn HandlerFunc, ctx context.Context, req *Request)
 }
 
 // writeAppError writes a structured error response with i18n translation and traceId.
-func (rt *Router) writeAppError(w http.ResponseWriter, r *http.Request, err error) {
+// Binary mode uses Luxo codec (fieldID 1=code, 2=name, 3=message); JSON mode uses JSON.
+func (rt *Router) writeAppError(w http.ResponseWriter, r *http.Request, binaryMode bool, err error) {
 	var appErr *errors.AppError
 	if !stderrors.As(err, &appErr) {
 		appErr = errors.Wrap(err)
@@ -146,26 +148,40 @@ func (rt *Router) writeAppError(w http.ResponseWriter, r *http.Request, err erro
 	}
 
 	buf := GetBuf()
-	buf.AppendString(`{"error":`)
-	buf.AppendJSONString(appErr.Name)
-	buf.AppendString(`,"code":`)
-	buf.AppendInt(int64(appErr.Code))
-	buf.AppendString(`,"message":`)
-	buf.AppendJSONString(message)
-	if traceID != "" {
-		buf.AppendString(`,"traceId":`)
-		buf.AppendJSONString(traceID)
+
+	if binaryMode {
+		// Binary error: fieldID 1=code, 2=name, 3=message
+		var enc codec.Encoder
+		enc.WriteFieldInt(1, int64(appErr.Code))
+		enc.WriteFieldString(2, appErr.Name)
+		enc.WriteFieldString(3, message)
+		enc.WriteEnd()
+		buf.B = append(buf.B, enc.Bytes()...)
+
+		w.Header().Set("Content-Type", "application/x-luxo")
+		w.Header().Set("X-Luxo-Mode", "binary")
+	} else {
+		buf.AppendString(`{"error":`)
+		buf.AppendJSONString(appErr.Name)
+		buf.AppendString(`,"code":`)
+		buf.AppendInt(int64(appErr.Code))
+		buf.AppendString(`,"message":`)
+		buf.AppendJSONString(message)
+		if traceID != "" {
+			buf.AppendString(`,"traceId":`)
+			buf.AppendJSONString(traceID)
+		}
+		if appErr.Data != nil && !appErr.Internal {
+			buf.AppendString(`,"data":`)
+			dataBytes, _ := sonic.Marshal(appErr.Data)
+			buf.B = append(buf.B, dataBytes...)
+		}
+		if rt.devMode && appErr.Cause != nil {
+			buf.AppendString(`,"cause":`)
+			buf.AppendJSONString(appErr.Cause.Error())
+		}
+		buf.AppendByte('}')
 	}
-	if appErr.Data != nil && !appErr.Internal {
-		buf.AppendString(`,"data":`)
-		dataBytes, _ := sonic.Marshal(appErr.Data)
-		buf.B = append(buf.B, dataBytes...)
-	}
-	if rt.devMode && appErr.Cause != nil {
-		buf.AppendString(`,"cause":`)
-		buf.AppendJSONString(appErr.Cause.Error())
-	}
-	buf.AppendByte('}')
 
 	w.WriteHeader(appErr.Code)
 	w.Write(buf.B)

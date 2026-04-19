@@ -109,7 +109,7 @@ func TestSaveAndLoad(t *testing.T) {
 		Fields:   map[string]int{"id": 1, "name": 2, "email": 3},
 		Reserved: []int{},
 	}
-	lf.APIs["getUser"] = 1
+	lf.APIs["getUser"] = &APILock{ID: 1}
 
 	if err := lf.Save(path); err != nil {
 		t.Fatalf("Save failed: %v", err)
@@ -128,7 +128,7 @@ func TestSaveAndLoad(t *testing.T) {
 	if loaded.Models["User"].Fields["name"] != 2 {
 		t.Error("Field name should have ID 2")
 	}
-	if loaded.APIs["getUser"] != 1 {
+	if loaded.APIs["getUser"].ID != 1 {
 		t.Error("API getUser should have ID 1")
 	}
 }
@@ -273,17 +273,17 @@ func TestUpdateAPIs(t *testing.T) {
 
 	lf.Update(f)
 
-	if lf.APIs["getUser"] != 1 {
-		t.Errorf("getUser = %d, want 1", lf.APIs["getUser"])
+	if lf.APIs["getUser"].ID != 1 {
+		t.Errorf("getUser = %d, want 1", lf.APIs["getUser"].ID)
 	}
-	if lf.APIs["listUsers"] != 2 {
-		t.Errorf("listUsers = %d, want 2", lf.APIs["listUsers"])
+	if lf.APIs["listUsers"].ID != 2 {
+		t.Errorf("listUsers = %d, want 2", lf.APIs["listUsers"].ID)
 	}
 }
 
 func TestUpdateAPIsPreservesExisting(t *testing.T) {
 	lf := New()
-	lf.APIs["getUser"] = 5
+	lf.APIs["getUser"] = &APILock{ID: 5}
 	lf.nextAPI = 5
 
 	f := files(nil, []*ast.ApiDecl{
@@ -293,11 +293,11 @@ func TestUpdateAPIsPreservesExisting(t *testing.T) {
 
 	lf.Update(f)
 
-	if lf.APIs["getUser"] != 5 {
-		t.Errorf("getUser = %d, want 5 (preserved)", lf.APIs["getUser"])
+	if lf.APIs["getUser"].ID != 5 {
+		t.Errorf("getUser = %d, want 5 (preserved)", lf.APIs["getUser"].ID)
 	}
-	if lf.APIs["createUser"] != 6 {
-		t.Errorf("createUser = %d, want 6", lf.APIs["createUser"])
+	if lf.APIs["createUser"].ID != 6 {
+		t.Errorf("createUser = %d, want 6", lf.APIs["createUser"].ID)
 	}
 }
 
@@ -321,7 +321,7 @@ func TestFieldID(t *testing.T) {
 
 func TestAPIID(t *testing.T) {
 	lf := New()
-	lf.APIs["getUser"] = 3
+	lf.APIs["getUser"] = &APILock{ID: 3}
 
 	if id := lf.APIID("getUser"); id != 3 {
 		t.Errorf("APIID = %d, want 3", id)
@@ -441,10 +441,10 @@ func TestMultipleFilesMultipleModels(t *testing.T) {
 	if lf.Models["Post"].Fields["id"] != 1 {
 		t.Error("Post.id should be 1 (per-model numbering)")
 	}
-	if lf.APIs["getUser"] != 1 {
+	if lf.APIs["getUser"].ID != 1 {
 		t.Error("getUser should be 1")
 	}
-	if lf.APIs["getPost"] != 2 {
+	if lf.APIs["getPost"].ID != 2 {
 		t.Error("getPost should be 2")
 	}
 }
@@ -489,7 +489,7 @@ func TestRoundTrip(t *testing.T) {
 	if len(ml.Reserved) != 1 || ml.Reserved[0] != 3 {
 		t.Errorf("Reserved = %v, want [3]", ml.Reserved)
 	}
-	if lf3.APIs["getUser"] != 1 || lf3.APIs["listUsers"] != 2 {
+	if lf3.APIs["getUser"].ID != 1 || lf3.APIs["listUsers"].ID != 2 {
 		t.Error("API IDs should be preserved across rounds")
 	}
 }

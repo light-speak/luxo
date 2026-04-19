@@ -32,8 +32,12 @@ func (d *Decoder) NextField() bool {
 		return false
 	}
 	id, n := ReadVarint(d.buf, d.off)
-	if n == 0 {
-		d.err = fmt.Errorf("codec: invalid varint at offset %d", d.off)
+	if n <= 0 {
+		if n < 0 {
+			d.err = fmt.Errorf("codec: varint overflow at offset %d", d.off)
+		} else {
+			d.err = fmt.Errorf("codec: truncated varint at offset %d", d.off)
+		}
 		return false
 	}
 	d.off += n
@@ -56,7 +60,7 @@ func (d *Decoder) Err() error {
 // ReadInt reads a signed int64 value.
 func (d *Decoder) ReadInt() int64 {
 	v, n := ReadSvarint(d.buf, d.off)
-	if n == 0 {
+	if n <= 0 {
 		d.err = fmt.Errorf("codec: invalid svarint at offset %d", d.off)
 		return 0
 	}
@@ -168,6 +172,62 @@ func (d *Decoder) ReadBoolPtr() *bool {
 	}
 	v := d.ReadBool()
 	return &v
+}
+
+// --- Array readers ---
+
+// ReadIntArray reads a count-prefixed int64 array.
+func (d *Decoder) ReadIntArray() []int64 {
+	count, n := ReadArrayHeader(d.buf, d.off)
+	if n == 0 {
+		d.err = fmt.Errorf("codec: invalid array header at offset %d", d.off)
+		return nil
+	}
+	d.off += n
+	result := make([]int64, 0, count)
+	for i := 0; i < count; i++ {
+		result = append(result, d.ReadInt())
+		if d.err != nil {
+			return nil
+		}
+	}
+	return result
+}
+
+// ReadStringArray reads a count-prefixed string array.
+func (d *Decoder) ReadStringArray() []string {
+	count, n := ReadArrayHeader(d.buf, d.off)
+	if n == 0 {
+		d.err = fmt.Errorf("codec: invalid array header at offset %d", d.off)
+		return nil
+	}
+	d.off += n
+	result := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		result = append(result, d.ReadString())
+		if d.err != nil {
+			return nil
+		}
+	}
+	return result
+}
+
+// ReadFloatArray reads a count-prefixed float64 array.
+func (d *Decoder) ReadFloatArray() []float64 {
+	count, n := ReadArrayHeader(d.buf, d.off)
+	if n == 0 {
+		d.err = fmt.Errorf("codec: invalid array header at offset %d", d.off)
+		return nil
+	}
+	d.off += n
+	result := make([]float64, 0, count)
+	for i := 0; i < count; i++ {
+		result = append(result, d.ReadFloat())
+		if d.err != nil {
+			return nil
+		}
+	}
+	return result
 }
 
 // SkipField skips the current field's value. Used for unknown fields (forward compat).

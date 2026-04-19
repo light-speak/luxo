@@ -318,8 +318,8 @@ func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bo
 	name := m.Name
 	recv := strings.ToLower(name[:1])
 
-	fmt.Fprintf(b, "// WriteLuxo writes %s as Luxo binary. Zero marshal, field IDs from luxo.lock.\n", name)
-	fmt.Fprintf(b, "func (%s *%s) WriteLuxo(buf *api.ResponseBuf) {\n", recv, name)
+	fmt.Fprintf(b, "// WriteLuxo writes %s as Luxo binary. Field mask filters output (nil = all fields).\n", name)
+	fmt.Fprintf(b, "func (%s *%s) WriteLuxo(buf *api.ResponseBuf, mask []byte) {\n", recv, name)
 	fmt.Fprintf(b, "\tvar enc codec.Encoder\n")
 
 	for _, f := range m.Fields {
@@ -337,6 +337,10 @@ func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bo
 		if fieldID == 0 {
 			continue
 		}
+
+		// Field mask check: skip if field not selected
+		fmt.Fprintf(b, "\tif codec.FieldMaskHas(mask, %d) {\n", fieldID)
+
 		goField := recv + "." + str.Capitalize(f.Name)
 
 		// Use base type name for matching, nullable handled separately
@@ -345,45 +349,47 @@ func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bo
 		// Enum → encode as string
 		if enums[f.Type.Name] {
 			if f.Type.Nullable {
-				fmt.Fprintf(b, "\tif %s != nil {\n", goField)
-				fmt.Fprintf(b, "\t\tenc.WriteFieldString(%d, string(*%s))\n", fieldID, goField)
-				fmt.Fprintf(b, "\t} else {\n")
-				fmt.Fprintf(b, "\t\tenc.WriteFieldStringPtr(%d, nil)\n", fieldID)
-				fmt.Fprintf(b, "\t}\n")
+				fmt.Fprintf(b, "\t\tif %s != nil {\n", goField)
+				fmt.Fprintf(b, "\t\t\tenc.WriteFieldString(%d, string(*%s))\n", fieldID, goField)
+				fmt.Fprintf(b, "\t\t} else {\n")
+				fmt.Fprintf(b, "\t\t\tenc.WriteFieldStringPtr(%d, nil)\n", fieldID)
+				fmt.Fprintf(b, "\t\t}\n")
 			} else {
-				fmt.Fprintf(b, "\tenc.WriteFieldString(%d, string(%s))\n", fieldID, goField)
+				fmt.Fprintf(b, "\t\tenc.WriteFieldString(%d, string(%s))\n", fieldID, goField)
 			}
+			b.WriteString("\t}\n")
 			continue
 		}
 
 		switch baseType {
 		case "Int", "DateTime", "Duration":
 			if f.Type.Nullable {
-				fmt.Fprintf(b, "\tenc.WriteFieldIntPtr(%d, %s)\n", fieldID, goField)
+				fmt.Fprintf(b, "\t\tenc.WriteFieldIntPtr(%d, %s)\n", fieldID, goField)
 			} else {
-				fmt.Fprintf(b, "\tenc.WriteFieldInt(%d, %s)\n", fieldID, goField)
+				fmt.Fprintf(b, "\t\tenc.WriteFieldInt(%d, %s)\n", fieldID, goField)
 			}
 		case "Float":
 			if f.Type.Nullable {
-				fmt.Fprintf(b, "\tenc.WriteFieldFloatPtr(%d, %s)\n", fieldID, goField)
+				fmt.Fprintf(b, "\t\tenc.WriteFieldFloatPtr(%d, %s)\n", fieldID, goField)
 			} else {
-				fmt.Fprintf(b, "\tenc.WriteFieldFloat(%d, %s)\n", fieldID, goField)
+				fmt.Fprintf(b, "\t\tenc.WriteFieldFloat(%d, %s)\n", fieldID, goField)
 			}
 		case "String":
 			if f.Type.Nullable {
-				fmt.Fprintf(b, "\tenc.WriteFieldStringPtr(%d, %s)\n", fieldID, goField)
+				fmt.Fprintf(b, "\t\tenc.WriteFieldStringPtr(%d, %s)\n", fieldID, goField)
 			} else {
-				fmt.Fprintf(b, "\tenc.WriteFieldString(%d, %s)\n", fieldID, goField)
+				fmt.Fprintf(b, "\t\tenc.WriteFieldString(%d, %s)\n", fieldID, goField)
 			}
 		case "Boolean":
 			if f.Type.Nullable {
-				fmt.Fprintf(b, "\tenc.WriteFieldBoolPtr(%d, %s)\n", fieldID, goField)
+				fmt.Fprintf(b, "\t\tenc.WriteFieldBoolPtr(%d, %s)\n", fieldID, goField)
 			} else {
-				fmt.Fprintf(b, "\tenc.WriteFieldBool(%d, %s)\n", fieldID, goField)
+				fmt.Fprintf(b, "\t\tenc.WriteFieldBool(%d, %s)\n", fieldID, goField)
 			}
 		default:
-			fmt.Fprintf(b, "\t// TODO: binary encoding for type %s (field %s)\n", baseType, f.Name)
+			fmt.Fprintf(b, "\t\t// TODO: binary encoding for type %s (field %s)\n", baseType, f.Name)
 		}
+		b.WriteString("\t}\n")
 	}
 
 	fmt.Fprintf(b, "\tenc.WriteEnd()\n")
