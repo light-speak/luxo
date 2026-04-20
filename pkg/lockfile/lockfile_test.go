@@ -502,6 +502,331 @@ func TestSaveError(t *testing.T) {
 	}
 }
 
+// --- APIParamID ---
+
+func TestAPIParamID(t *testing.T) {
+	lf := New()
+	lf.APIs["getUser"] = &APILock{
+		ID:     1,
+		Params: map[string]int{"id": 1, "name": 2},
+	}
+
+	if id := lf.APIParamID("getUser", "id"); id != 1 {
+		t.Errorf("APIParamID = %d, want 1", id)
+	}
+	if id := lf.APIParamID("getUser", "name"); id != 2 {
+		t.Errorf("APIParamID = %d, want 2", id)
+	}
+	if id := lf.APIParamID("getUser", "missing"); id != 0 {
+		t.Errorf("APIParamID = %d, want 0 for missing param", id)
+	}
+	if id := lf.APIParamID("noAPI", "x"); id != 0 {
+		t.Errorf("APIParamID = %d, want 0 for missing API", id)
+	}
+	// API with nil Params
+	lf.APIs["noParams"] = &APILock{ID: 2}
+	if id := lf.APIParamID("noParams", "x"); id != 0 {
+		t.Errorf("APIParamID = %d, want 0 for nil params", id)
+	}
+}
+
+// --- EventFieldID ---
+
+func TestEventFieldID(t *testing.T) {
+	lf := New()
+	lf.Events["UserCreated"] = &ModelLock{
+		NextID: 3,
+		Fields: map[string]int{"userId": 1, "email": 2},
+	}
+
+	if id := lf.EventFieldID("UserCreated", "userId"); id != 1 {
+		t.Errorf("EventFieldID = %d, want 1", id)
+	}
+	if id := lf.EventFieldID("UserCreated", "missing"); id != 0 {
+		t.Errorf("EventFieldID = %d, want 0", id)
+	}
+	if id := lf.EventFieldID("NoEvent", "x"); id != 0 {
+		t.Errorf("EventFieldID = %d, want 0 for missing event", id)
+	}
+
+	// nil Events map
+	lf2 := New()
+	lf2.Events = nil
+	if id := lf2.EventFieldID("X", "Y"); id != 0 {
+		t.Errorf("EventFieldID = %d, want 0 for nil events", id)
+	}
+}
+
+// --- updateEvents ---
+
+func TestUpdateEventsNewEvent(t *testing.T) {
+	lf := New()
+	ff := []*ast.File{{
+		Name: "test.luxo",
+		Events: []*ast.EventDecl{{
+			Pos:  pos(),
+			Name: "OrderPlaced",
+			Params: []*ast.ParamDecl{
+				{Name: "orderId", Type: &ast.TypeRef{Name: "Int"}},
+				{Name: "total", Type: &ast.TypeRef{Name: "Float"}},
+			},
+		}},
+	}}
+
+	lf.Update(ff)
+
+	el := lf.Events["OrderPlaced"]
+	if el == nil {
+		t.Fatal("event should exist")
+	}
+	if el.Fields["orderId"] != 1 || el.Fields["total"] != 2 {
+		t.Errorf("Fields = %v", el.Fields)
+	}
+	if el.NextID != 3 {
+		t.Errorf("NextID = %d, want 3", el.NextID)
+	}
+}
+
+func TestUpdateEventsPreservesExisting(t *testing.T) {
+	lf := New()
+	lf.Events["OrderPlaced"] = &ModelLock{
+		NextID: 3,
+		Fields: map[string]int{"orderId": 1, "total": 2},
+	}
+
+	ff := []*ast.File{{
+		Name: "test.luxo",
+		Events: []*ast.EventDecl{{
+			Pos:  pos(),
+			Name: "OrderPlaced",
+			Params: []*ast.ParamDecl{
+				{Name: "orderId", Type: &ast.TypeRef{Name: "Int"}},
+				{Name: "total", Type: &ast.TypeRef{Name: "Float"}},
+				{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+			},
+		}},
+	}}
+
+	lf.Update(ff)
+
+	el := lf.Events["OrderPlaced"]
+	if el.Fields["orderId"] != 1 || el.Fields["total"] != 2 {
+		t.Error("existing IDs should be preserved")
+	}
+	if el.Fields["userId"] != 3 {
+		t.Errorf("userId = %d, want 3", el.Fields["userId"])
+	}
+}
+
+func TestUpdateEventsRemovedParam(t *testing.T) {
+	lf := New()
+	lf.Events["OrderPlaced"] = &ModelLock{
+		NextID: 3,
+		Fields: map[string]int{"orderId": 1, "total": 2},
+	}
+
+	// Remove "total"
+	ff := []*ast.File{{
+		Name: "test.luxo",
+		Events: []*ast.EventDecl{{
+			Pos:  pos(),
+			Name: "OrderPlaced",
+			Params: []*ast.ParamDecl{
+				{Name: "orderId", Type: &ast.TypeRef{Name: "Int"}},
+			},
+		}},
+	}}
+
+	lf.Update(ff)
+
+	el := lf.Events["OrderPlaced"]
+	if _, ok := el.Fields["total"]; ok {
+		t.Error("total should be removed")
+	}
+	if len(el.Reserved) != 1 || el.Reserved[0] != 2 {
+		t.Errorf("Reserved = %v, want [2]", el.Reserved)
+	}
+}
+
+func TestUpdateEventsRemovedEntirely(t *testing.T) {
+	lf := New()
+	lf.Events["OldEvent"] = &ModelLock{
+		NextID: 3,
+		Fields: map[string]int{"a": 1, "b": 2},
+	}
+
+	ff := []*ast.File{{Name: "test.luxo"}}
+	lf.Update(ff)
+
+	el := lf.Events["OldEvent"]
+	if len(el.Fields) != 0 {
+		t.Errorf("Fields should be empty, got %v", el.Fields)
+	}
+	if len(el.Reserved) != 2 {
+		t.Errorf("Reserved = %v, want 2 entries", el.Reserved)
+	}
+}
+
+func TestUpdateEventsNilEventsMap(t *testing.T) {
+	lf := New()
+	lf.Events = nil
+
+	ff := []*ast.File{{
+		Name: "test.luxo",
+		Events: []*ast.EventDecl{{
+			Pos:  pos(),
+			Name: "TestEvent",
+			Params: []*ast.ParamDecl{
+				{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			},
+		}},
+	}}
+
+	lf.Update(ff)
+
+	if lf.Events == nil {
+		t.Fatal("Events should be initialized")
+	}
+	if lf.Events["TestEvent"].Fields["id"] != 1 {
+		t.Error("field id should be 1")
+	}
+}
+
+// --- updateAPIs with @crud ---
+
+func TestUpdateAPIsWithCrud(t *testing.T) {
+	lf := New()
+	m := model("Post",
+		field("title", "String"),
+		field("body", "String"),
+	)
+	m.Directives = []*ast.Directive{{
+		Pos:  pos(),
+		Name: "crud",
+	}}
+
+	ff := []*ast.File{{
+		Name:   "test.luxo",
+		Models: []*ast.ModelDecl{m},
+	}}
+
+	lf.Update(ff)
+
+	// CRUD generates: getPost, listPosts, createPost, updatePost, deletePost, deletePosts
+	expectedAPIs := []string{"getPost", "listPosts", "createPost", "updatePost", "deletePost", "deletePosts"}
+	for _, name := range expectedAPIs {
+		if lf.APIs[name] == nil {
+			t.Errorf("API %s should exist", name)
+		}
+		if lf.APIs[name].ID == 0 {
+			t.Errorf("API %s should have an ID", name)
+		}
+	}
+
+	// Check params: getPost should have "id"
+	if lf.APIs["getPost"].Params["id"] != 1 {
+		t.Errorf("getPost params = %v", lf.APIs["getPost"].Params)
+	}
+	// listPosts should have "page" and "pageSize"
+	if lf.APIs["listPosts"].Params["page"] == 0 || lf.APIs["listPosts"].Params["pageSize"] == 0 {
+		t.Errorf("listPosts params = %v", lf.APIs["listPosts"].Params)
+	}
+	// createPost should have field names
+	if lf.APIs["createPost"].Params["title"] == 0 || lf.APIs["createPost"].Params["body"] == 0 {
+		t.Errorf("createPost params = %v", lf.APIs["createPost"].Params)
+	}
+	// updatePost should have "id" + field names
+	if lf.APIs["updatePost"].Params["id"] == 0 {
+		t.Errorf("updatePost should have id param")
+	}
+}
+
+func TestUpdateAPIsWithParams(t *testing.T) {
+	lf := New()
+	ff := []*ast.File{{
+		Name: "test.luxo",
+		APIs: []*ast.ApiDecl{{
+			Pos:  pos(),
+			Name: "search",
+			Params: []*ast.ParamDecl{
+				{Name: "query", Type: &ast.TypeRef{Name: "String"}},
+				{Name: "limit", Type: &ast.TypeRef{Name: "Int"}},
+			},
+		}},
+	}}
+
+	lf.Update(ff)
+
+	al := lf.APIs["search"]
+	if al == nil {
+		t.Fatal("search API should exist")
+	}
+	if al.Params["query"] != 1 || al.Params["limit"] != 2 {
+		t.Errorf("params = %v", al.Params)
+	}
+}
+
+func TestEnsureAPIIDExistingWithNewParam(t *testing.T) {
+	lf := New()
+	lf.APIs["getUser"] = &APILock{
+		ID:     5,
+		Params: map[string]int{"id": 1},
+	}
+	lf.nextAPI = 5
+
+	// Add a new param to existing API
+	lf.ensureAPIID("getUser", []string{"id", "includeProfile"})
+
+	al := lf.APIs["getUser"]
+	if al.ID != 5 {
+		t.Error("ID should be preserved")
+	}
+	if al.Params["id"] != 1 {
+		t.Error("existing param should keep its ID")
+	}
+	if al.Params["includeProfile"] != 2 {
+		t.Errorf("new param = %d, want 2", al.Params["includeProfile"])
+	}
+}
+
+func TestHasCrudDirective(t *testing.T) {
+	// with @crud
+	m := model("User")
+	m.Directives = []*ast.Directive{{Pos: pos(), Name: "crud"}}
+	if !hasCrudDirective(m) {
+		t.Error("should detect @crud")
+	}
+
+	// without @crud
+	m2 := model("Post")
+	if hasCrudDirective(m2) {
+		t.Error("should not detect @crud on empty directives")
+	}
+
+	// with other directive
+	m3 := model("Tag")
+	m3.Directives = []*ast.Directive{{Pos: pos(), Name: "withAuth"}}
+	if hasCrudDirective(m3) {
+		t.Error("should not detect @crud for @withAuth")
+	}
+}
+
+func TestCollectFieldNames(t *testing.T) {
+	m := model("User",
+		field("id", "Int"),
+		field("name", "String"),
+		computed("fullName"),
+	)
+
+	names := collectFieldNames(m)
+	if len(names) != 2 {
+		t.Fatalf("expected 2 names, got %d: %v", len(names), names)
+	}
+	if names[0] != "id" || names[1] != "name" {
+		t.Errorf("names = %v", names)
+	}
+}
+
 func TestEmptyReservedOmitted(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "luxo.lock")

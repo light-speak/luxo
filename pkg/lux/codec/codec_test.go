@@ -578,6 +578,584 @@ func BenchmarkColumnarWrite10(b *testing.B) {
 	}
 }
 
+// --- Additional coverage tests ---
+
+func TestAppendBytesAndReadBytes(t *testing.T) {
+	cases := [][]byte{
+		nil,
+		{},
+		{1, 2, 3},
+		[]byte("hello world"),
+	}
+	for _, c := range cases {
+		buf := AppendBytes(nil, c)
+		got, n := ReadBytes(buf, 0)
+		if n == 0 && len(c) > 0 {
+			t.Fatalf("ReadBytes failed for %v", c)
+		}
+		if len(got) != len(c) {
+			t.Fatalf("ReadBytes %v: got len %d", c, len(got))
+		}
+	}
+}
+
+func TestReadBytesShortBuf(t *testing.T) {
+	// length says 100 but buf only has a few bytes
+	buf := AppendVarint(nil, 100)
+	buf = append(buf, 1, 2, 3)
+	got, n := ReadBytes(buf, 0)
+	if n != 0 || got != nil {
+		t.Fatal("should fail on short buf")
+	}
+}
+
+func TestReadBytesInvalidVarint(t *testing.T) {
+	got, n := ReadBytes(nil, 0)
+	if n != 0 || got != nil {
+		t.Fatal("should fail on empty buf")
+	}
+}
+
+func TestVarintOverflow(t *testing.T) {
+	// Build a varint with >10 continuation bytes to trigger overflow
+	buf := make([]byte, 12)
+	for i := range buf {
+		buf[i] = 0x80 // all continuation
+	}
+	_, n := ReadVarint(buf, 0)
+	if n != -1 {
+		t.Fatalf("expected overflow (n=-1), got n=%d", n)
+	}
+}
+
+func TestReadSvarintOverflow(t *testing.T) {
+	// Trigger overflow branch in ReadSvarint via varint overflow
+	buf := make([]byte, 12)
+	for i := range buf {
+		buf[i] = 0x80
+	}
+	v, n := ReadSvarint(buf, 0)
+	if n != 0 || v != 0 {
+		t.Fatalf("expected (0,0) for overflow, got (%d,%d)", v, n)
+	}
+}
+
+func TestReadBoolShort(t *testing.T) {
+	_, n := ReadBool(nil, 0)
+	if n != 0 {
+		t.Fatal("should fail on nil buf")
+	}
+}
+
+func TestEncoderWriteFieldBytes(t *testing.T) {
+	var enc Encoder
+	enc.WriteFieldBytes(1, []byte{0xDE, 0xAD, 0xBE, 0xEF})
+	enc.WriteEnd()
+
+	dec := NewDecoder(enc.Bytes())
+	dec.NextField()
+	if dec.FieldID() != 1 {
+		t.Fatalf("field = %d", dec.FieldID())
+	}
+	got := dec.ReadBytes()
+	if dec.Err() != nil {
+		t.Fatal(dec.Err())
+	}
+	if len(got) != 4 || got[0] != 0xDE || got[3] != 0xEF {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestEncoderWriteFieldFloatPtr(t *testing.T) {
+	f := 3.14
+	var enc Encoder
+	enc.WriteFieldFloatPtr(1, &f)
+	enc.WriteFieldFloatPtr(2, nil)
+	enc.WriteEnd()
+
+	dec := NewDecoder(enc.Bytes())
+	var f1, f2 *float64
+	for dec.NextField() {
+		switch dec.FieldID() {
+		case 1:
+			f1 = dec.ReadFloatPtr()
+		case 2:
+			f2 = dec.ReadFloatPtr()
+		}
+	}
+	if dec.Err() != nil {
+		t.Fatal(dec.Err())
+	}
+	if f1 == nil || *f1 != 3.14 {
+		t.Fatalf("f1 = %v", f1)
+	}
+	if f2 != nil {
+		t.Fatalf("f2 should be nil, got %v", *f2)
+	}
+}
+
+func TestEncoderWriteFieldBoolPtr(t *testing.T) {
+	b := true
+	var enc Encoder
+	enc.WriteFieldBoolPtr(1, &b)
+	enc.WriteFieldBoolPtr(2, nil)
+	enc.WriteEnd()
+
+	dec := NewDecoder(enc.Bytes())
+	var b1, b2 *bool
+	for dec.NextField() {
+		switch dec.FieldID() {
+		case 1:
+			b1 = dec.ReadBoolPtr()
+		case 2:
+			b2 = dec.ReadBoolPtr()
+		}
+	}
+	if dec.Err() != nil {
+		t.Fatal(dec.Err())
+	}
+	if b1 == nil || !*b1 {
+		t.Fatalf("b1 = %v", b1)
+	}
+	if b2 != nil {
+		t.Fatalf("b2 should be nil, got %v", *b2)
+	}
+}
+
+func TestDecoderReadBytesError(t *testing.T) {
+	// Decoder at end of buffer trying to read bytes
+	dec := NewDecoder([]byte{0x01}) // field 1
+	dec.NextField()
+	got := dec.ReadBytes()
+	if got != nil {
+		t.Fatal("should return nil on truncated data")
+	}
+	if dec.Err() == nil {
+		t.Fatal("should set error")
+	}
+}
+
+func TestDecoderReadIntError(t *testing.T) {
+	dec := NewDecoder([]byte{0x01}) // field 1, no value
+	dec.NextField()
+	v := dec.ReadInt()
+	if v != 0 || dec.Err() == nil {
+		t.Fatal("should error on truncated int")
+	}
+}
+
+func TestDecoderReadFloatError(t *testing.T) {
+	dec := NewDecoder([]byte{0x01, 0x01, 0x02}) // field 1, short float
+	dec.NextField()
+	v := dec.ReadFloat()
+	if v != 0 || dec.Err() == nil {
+		t.Fatal("should error on truncated float")
+	}
+}
+
+func TestDecoderReadStringError(t *testing.T) {
+	// field 1 + varint length says 100 but no data
+	buf := []byte{0x01}
+	buf = AppendVarint(buf, 100)
+	dec := NewDecoder(buf)
+	dec.NextField()
+	v := dec.ReadString()
+	if v != "" || dec.Err() == nil {
+		t.Fatal("should error on truncated string")
+	}
+}
+
+func TestDecoderReadBoolError(t *testing.T) {
+	dec := NewDecoder([]byte{0x01}) // field 1, no value
+	dec.NextField()
+	v := dec.ReadBool()
+	if v != false || dec.Err() == nil {
+		t.Fatal("should error on truncated bool")
+	}
+}
+
+func TestDecoderSkipField(t *testing.T) {
+	var enc Encoder
+	enc.WriteFieldInt(1, 42)
+	enc.WriteEnd()
+
+	dec := NewDecoder(enc.Bytes())
+	dec.NextField()
+	dec.SkipField()
+	if dec.Err() == nil {
+		t.Fatal("SkipField should set error")
+	}
+}
+
+func TestDecoderNextFieldOverflow(t *testing.T) {
+	// Create a varint that overflows to trigger the n<0 branch
+	buf := make([]byte, 12)
+	for i := range buf {
+		buf[i] = 0x80
+	}
+	dec := NewDecoder(buf)
+	if dec.NextField() {
+		t.Fatal("should not advance on overflow")
+	}
+	if dec.Err() == nil {
+		t.Fatal("should set overflow error")
+	}
+}
+
+func TestDecoderNextFieldTruncated(t *testing.T) {
+	// Test the truncated varint error branch (n==0 but not at buf end)
+	// Actually, for n==0 at buf end, that's already covered by empty test.
+	// We need n==0 with data in buffer that's all continuation bytes but incomplete
+	buf := []byte{0x80} // single continuation byte, incomplete varint
+	dec := NewDecoder(buf)
+	if dec.NextField() {
+		t.Fatal("should not advance on truncated varint")
+	}
+	if dec.Err() == nil {
+		t.Fatal("should set truncated error")
+	}
+}
+
+func TestDecoderReadIntPtrNullableError(t *testing.T) {
+	dec := NewDecoder([]byte{0x01})
+	dec.NextField()
+	// now off is past buffer, ReadIntPtr calls ReadNullable on empty
+	v := dec.ReadIntPtr()
+	if v != nil || dec.Err() == nil {
+		t.Fatal("should error on truncated nullable")
+	}
+}
+
+func TestDecoderReadFloatPtrNullableError(t *testing.T) {
+	dec := NewDecoder([]byte{0x01})
+	dec.NextField()
+	v := dec.ReadFloatPtr()
+	if v != nil || dec.Err() == nil {
+		t.Fatal("should error on truncated nullable")
+	}
+}
+
+func TestDecoderReadBoolPtrNullableError(t *testing.T) {
+	dec := NewDecoder([]byte{0x01})
+	dec.NextField()
+	v := dec.ReadBoolPtr()
+	if v != nil || dec.Err() == nil {
+		t.Fatal("should error on truncated nullable")
+	}
+}
+
+func TestDecoderReadStringPtrNullableError(t *testing.T) {
+	dec := NewDecoder([]byte{0x01})
+	dec.NextField()
+	v := dec.ReadStringPtr()
+	if v != nil || dec.Err() == nil {
+		t.Fatal("should error on truncated nullable")
+	}
+}
+
+func TestDecoderArrayHeaderError(t *testing.T) {
+	dec := NewDecoder([]byte{0x01})
+	dec.NextField()
+	got := dec.ReadIntArray()
+	if got != nil || dec.Err() == nil {
+		t.Fatal("should error on truncated array header")
+	}
+}
+
+func TestDecoderStringArrayHeaderError(t *testing.T) {
+	dec := NewDecoder([]byte{0x01})
+	dec.NextField()
+	got := dec.ReadStringArray()
+	if got != nil || dec.Err() == nil {
+		t.Fatal("should error")
+	}
+}
+
+func TestDecoderFloatArrayHeaderError(t *testing.T) {
+	dec := NewDecoder([]byte{0x01})
+	dec.NextField()
+	got := dec.ReadFloatArray()
+	if got != nil || dec.Err() == nil {
+		t.Fatal("should error")
+	}
+}
+
+func TestDecoderIntArrayItemError(t *testing.T) {
+	// array header says 5 items, but no item data
+	buf := []byte{0x01} // field 1
+	buf = AppendVarint(buf, 5)
+	dec := NewDecoder(buf)
+	dec.NextField()
+	got := dec.ReadIntArray()
+	if got != nil || dec.Err() == nil {
+		t.Fatal("should error on truncated array items")
+	}
+}
+
+func TestDecoderStringArrayItemError(t *testing.T) {
+	buf := []byte{0x01}
+	buf = AppendVarint(buf, 5) // 5 items, no data
+	dec := NewDecoder(buf)
+	dec.NextField()
+	got := dec.ReadStringArray()
+	if got != nil || dec.Err() == nil {
+		t.Fatal("should error on truncated string array items")
+	}
+}
+
+func TestDecoderFloatArrayItemError(t *testing.T) {
+	buf := []byte{0x01}
+	buf = AppendVarint(buf, 5) // 5 items, no data
+	dec := NewDecoder(buf)
+	dec.NextField()
+	got := dec.ReadFloatArray()
+	if got != nil || dec.Err() == nil {
+		t.Fatal("should error on truncated float array items")
+	}
+}
+
+func TestDecoderNextFieldWithExistingError(t *testing.T) {
+	dec := NewDecoder([]byte{0x01, 0x00})
+	dec.NextField()
+	dec.SkipField() // sets error
+	// NextField should return false when err is set
+	if dec.NextField() {
+		t.Fatal("should not advance when error is set")
+	}
+}
+
+// --- ColumnarWriter Reset ---
+
+func TestColumnarWriterReset(t *testing.T) {
+	var w ColumnarWriter
+	w.SetCount(2)
+	w.WriteColumnInt(1, []int64{10, 20})
+	_ = w.Bytes()
+
+	w.Reset()
+	w.SetCount(1)
+	w.WriteColumnInt(1, []int64{42})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	if r.Count() != 1 {
+		t.Fatalf("count = %d after reset, want 1", r.Count())
+	}
+	r.NextColumn()
+	vals := r.ReadColumnInt()
+	if len(vals) != 1 || vals[0] != 42 {
+		t.Fatalf("got %v", vals)
+	}
+}
+
+// --- Columnar nullable ptr columns ---
+
+func TestColumnarFloatPtrWrite(t *testing.T) {
+	f1 := 1.5
+	f3 := 3.5
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnFloatPtr(1, []*float64{&f1, nil, &f3})
+	data := w.Bytes()
+
+	// Verify we can read the data (reader for FloatPtr doesn't exist, verify no panic)
+	r := NewColumnarReader(data)
+	if r.Count() != 3 {
+		t.Fatalf("count = %d", r.Count())
+	}
+	if r.Err() != nil {
+		t.Fatal(r.Err())
+	}
+}
+
+func TestColumnarStringPtr(t *testing.T) {
+	s1 := "hello"
+	s3 := "world"
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnStringPtr(1, []*string{&s1, nil, &s3})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	vals := r.ReadColumnStringPtr()
+	if len(vals) != 3 {
+		t.Fatalf("len = %d", len(vals))
+	}
+	if vals[0] == nil || *vals[0] != "hello" {
+		t.Fatal("vals[0]")
+	}
+	if vals[1] != nil {
+		t.Fatal("vals[1] should be nil")
+	}
+	if vals[2] == nil || *vals[2] != "world" {
+		t.Fatal("vals[2]")
+	}
+}
+
+func TestColumnarBoolPtrWrite(t *testing.T) {
+	b1 := true
+	b3 := false
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnBoolPtr(1, []*bool{&b1, nil, &b3})
+	data := w.Bytes()
+
+	// Verify write produces data without error
+	r := NewColumnarReader(data)
+	if r.Count() != 3 {
+		t.Fatalf("count = %d", r.Count())
+	}
+	if r.Err() != nil {
+		t.Fatal(r.Err())
+	}
+}
+
+// --- ColumnarReader error branches ---
+
+func TestColumnarReaderInvalidHeader(t *testing.T) {
+	r := NewColumnarReader(nil)
+	if r.Err() == nil {
+		t.Fatal("should error on nil data")
+	}
+}
+
+func TestColumnarReaderIntTruncated(t *testing.T) {
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnInt(1, []int64{1}) // only 1 value, but count=3
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	vals := r.ReadColumnInt()
+	if vals != nil || r.Err() == nil {
+		t.Fatal("should error on truncated column")
+	}
+}
+
+func TestColumnarReaderFloatTruncated(t *testing.T) {
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnFloat(1, []float64{1.0}) // only 1, count=3
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	vals := r.ReadColumnFloat()
+	if vals != nil || r.Err() == nil {
+		t.Fatal("should error")
+	}
+}
+
+func TestColumnarReaderStringTruncated(t *testing.T) {
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnString(1, []string{"a"}) // only 1, count=3
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	vals := r.ReadColumnString()
+	if vals != nil || r.Err() == nil {
+		t.Fatal("should error")
+	}
+}
+
+func TestColumnarReaderBoolTruncated(t *testing.T) {
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnBool(1, []bool{true}) // only 1, count=3
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	vals := r.ReadColumnBool()
+	if vals != nil || r.Err() == nil {
+		t.Fatal("should error")
+	}
+}
+
+func TestColumnarReaderIntPtrTruncatedNullable(t *testing.T) {
+	// count=3 but only 1 value worth of data
+	v := int64(1)
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnIntPtr(1, []*int64{&v}) // only 1, count=3
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	vals := r.ReadColumnIntPtr()
+	if vals != nil || r.Err() == nil {
+		t.Fatal("should error")
+	}
+}
+
+func TestColumnarReaderStringPtrTruncated(t *testing.T) {
+	s := "a"
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnStringPtr(1, []*string{&s}) // only 1, count=3
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	vals := r.ReadColumnStringPtr()
+	if vals != nil || r.Err() == nil {
+		t.Fatal("should error")
+	}
+}
+
+func TestColumnarReaderNextColumnWithError(t *testing.T) {
+	r := NewColumnarReader(nil)
+	// error already set
+	if r.NextColumn() {
+		t.Fatal("should not advance with error")
+	}
+}
+
+// --- FieldMask edge cases ---
+
+func TestFieldMaskSetInvalid(t *testing.T) {
+	mask := FieldMaskSet(nil, 0)
+	if mask != nil {
+		t.Error("fieldID 0 should not set anything")
+	}
+	mask = FieldMaskSet(nil, -1)
+	if mask != nil {
+		t.Error("negative fieldID should not set anything")
+	}
+}
+
+func TestFieldMaskHasInvalid(t *testing.T) {
+	mask := FieldMaskSet(nil, 1)
+	if FieldMaskHas(mask, 0) {
+		t.Error("fieldID 0 should not match")
+	}
+	if FieldMaskHas(mask, -1) {
+		t.Error("negative fieldID should not match")
+	}
+}
+
+func TestFieldMaskHasBeyondLen(t *testing.T) {
+	mask := FieldMaskSet(nil, 1) // 1 byte
+	if FieldMaskHas(mask, 100) {
+		t.Error("field beyond mask length should not match")
+	}
+}
+
+func TestFieldMaskAllZero(t *testing.T) {
+	mask := FieldMaskAll(0)
+	if mask != nil {
+		t.Error("FieldMaskAll(0) should return nil")
+	}
+	mask = FieldMaskAll(-1)
+	if mask != nil {
+		t.Error("FieldMaskAll(-1) should return nil")
+	}
+}
+
 func BenchmarkRowWrite10(b *testing.B) {
 	type user struct {
 		id    int64
