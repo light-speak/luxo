@@ -103,6 +103,9 @@ func ReadBytes(buf []byte, off int) ([]byte, int) {
 	if n <= 0 {
 		return nil, 0
 	}
+	if length > uint64(len(buf)) {
+		return nil, 0 // length exceeds buffer, prevent overflow
+	}
 	start := off + n
 	end := start + int(length)
 	if end > len(buf) {

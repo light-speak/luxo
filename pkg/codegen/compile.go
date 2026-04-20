@@ -17,8 +17,8 @@ func compileAPIBody(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 
 	// @auth — require authenticated identity
-	if hasDirective(api.Directives, "auth") {
-		writeAuthCheck(b, "\t\t")
+	if d := findDirective(api.Directives, "auth"); d != nil {
+		writeAuthCheck(b, "\t\t", d)
 	}
 
 	// Parse params
@@ -986,6 +986,21 @@ func (c *compiler) compileTerminalMethod(b *strings.Builder, modelName string, l
 			fmt.Fprintf(b, "app.%s.Where(%sWhere.Id.Eq(%s)).First(ctx)", modelName, modelName, val)
 		}
 		return true
+	}
+	// Check if this is a terminal method first
+	isTerminal := false
+	switch link.method {
+	case "delete", "all", "first", "exists", "exec", "count", "update", "upsert", "save", "sum", "avg", "min", "max":
+		isTerminal = true
+	}
+	if !isTerminal {
+		return false
+	}
+	// Seed builder if empty (terminal-only chain without prior modifier)
+	if b.Len() == 0 {
+		fmt.Fprintf(b, "app.%s", modelName)
+	}
+	switch link.method {
 	case "delete":
 		if m, ok := c.models[modelName]; ok && isSoftDelete(m) {
 			fmt.Fprintf(b, ".SoftDelete(ctx)")

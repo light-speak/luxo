@@ -2,6 +2,7 @@ package event
 
 import (
 	"context"
+	"fmt"
 	"sync"
 )
 
@@ -66,6 +67,13 @@ func (b *ChanBus) Emit(ctx context.Context, name string, payload any) error {
 // On registers a handler. Starts a goroutine to consume events.
 func (b *ChanBus) On(name string, handler Handler) error {
 	b.mu.Lock()
+	// Check if bus is closed
+	select {
+	case <-b.done:
+		b.mu.Unlock()
+		return fmt.Errorf("event: bus is closed")
+	default:
+	}
 	b.subs[name] = append(b.subs[name], handler)
 
 	if _, ok := b.channels[name]; !ok {

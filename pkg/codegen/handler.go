@@ -1080,11 +1080,130 @@ func bodyContainsTemplateString(block *ast.Block) bool {
 
 // writeAuthCheck generates the identity nil-check guard at the start of a handler.
 // Used by CRUD handlers (@withAuth on model) and compiled APIs (@auth on API).
-func writeAuthCheck(b *strings.Builder, indent string) {
+//
+// Supported patterns:
+//
+//	@auth                          → nil check only (any authenticated user)
+//	@auth(Admin)                   → role == "Admin"
+//	@auth(Admin, Moderator)        → role in ["Admin", "Moderator"]
+//	@auth(own: "id")               → identity.ID() == id param
+//	@auth(Admin, own: "userId")    → role == "Admin" OR owns resource
+//	@auth(permission: { expr })    → compile permission lambda expression
+func writeAuthCheck(b *strings.Builder, indent string, directives ...*ast.Directive) {
 	fmt.Fprintf(b, "%sidentity := luvia.Identity(ctx)\n", indent)
 	fmt.Fprintf(b, "%sif identity == nil {\n", indent)
 	fmt.Fprintf(b, "%s\treturn errors.Unauthorized\n", indent)
 	fmt.Fprintf(b, "%s}\n", indent)
+
+	if len(directives) == 0 || directives[0] == nil {
+		return
+	}
+	d := directives[0]
+
+	// Collect roles (positional args) and named args
+	var roles []string
+	var ownField string
+	var permissionBody *ast.Block
+
+	for _, arg := range d.Args {
+		if arg.Name == "" {
+			// Positional arg = allowed role name
+			if ident, ok := arg.Value.(*ast.Ident); ok {
+				roles = append(roles, ident.Name)
+			}
+		} else if arg.Name == "own" {
+			// Ownership: identity.ID() must match this request param
+			if lit, ok := arg.Value.(*ast.Literal); ok {
+				ownField = lit.Value
+			} else if ident, ok := arg.Value.(*ast.Ident); ok {
+				ownField = ident.Name
+			}
+		} else if arg.Name == "permission" {
+			// Permission lambda: @auth(permission: { my.role == "SUPER" })
+			if lambda, ok := arg.Value.(*ast.LambdaExpr); ok {
+				permissionBody = lambda.Body
+			}
+		}
+	}
+
+	// No additional checks needed
+	if len(roles) == 0 && ownField == "" && permissionBody == nil {
+		return
+	}
+
+	// Generate authorization check
+	// Multiple conditions are OR'd: role match OR ownership OR permission
+	fmt.Fprintf(b, "%s_authorized := false\n", indent)
+
+	// Role check: single or multiple roles
+	if len(roles) == 1 {
+		fmt.Fprintf(b, "%sif identity.String(\"role\") == %q { _authorized = true }\n", indent, roles[0])
+	} else if len(roles) > 1 {
+		fmt.Fprintf(b, "%sswitch identity.String(\"role\") {\n", indent)
+		for _, role := range roles {
+			fmt.Fprintf(b, "%scase %q:\n", indent, role)
+		}
+		fmt.Fprintf(b, "%s\t_authorized = true\n", indent)
+		fmt.Fprintf(b, "%s}\n", indent)
+	}
+
+	// Ownership check: extract param inline for early auth
+	if ownField != "" {
+		fmt.Fprintf(b, "%sif _ownID, _ownErr := req.ParamInt(%q); _ownErr == nil && identity.ID() == _ownID { _authorized = true }\n", indent, ownField)
+	}
+
+	// Permission lambda
+	if permissionBody != nil {
+		// Compile the permission expression — simple case: single ExprStmt that evaluates to bool
+		if len(permissionBody.Stmts) == 1 {
+			if es, ok := permissionBody.Stmts[0].(*ast.ExprStmt); ok {
+				permExpr := compilePermissionExpr(es.Expr)
+				if permExpr != "" {
+					fmt.Fprintf(b, "%sif %s { _authorized = true }\n", indent, permExpr)
+				}
+			}
+		}
+	}
+
+	fmt.Fprintf(b, "%sif !_authorized {\n", indent)
+	fmt.Fprintf(b, "%s\treturn errors.Forbidden\n", indent)
+	fmt.Fprintf(b, "%s}\n", indent)
+}
+
+// compilePermissionExpr compiles a permission lambda expression to Go code.
+// Supports: my.field == "value", my.field != "value", my.field == EnumValue
+func compilePermissionExpr(expr ast.Expr) string {
+	bin, ok := expr.(*ast.BinaryExpr)
+	if !ok {
+		return ""
+	}
+
+	// Left side: my.field → identity.String("field") or identity.Int("field")
+	left := ""
+	if member, ok := bin.Left.(*ast.MemberExpr); ok {
+		if ident, ok := member.Object.(*ast.Ident); ok && ident.Name == "my" {
+			left = fmt.Sprintf("identity.String(%q)", member.Field)
+		}
+	}
+	if left == "" {
+		return ""
+	}
+
+	// Right side: string literal or ident
+	right := ""
+	if lit, ok := bin.Right.(*ast.Literal); ok {
+		right = fmt.Sprintf("%q", lit.Value)
+	} else if ident, ok := bin.Right.(*ast.Ident); ok {
+		right = fmt.Sprintf("%q", ident.Name)
+	} else if member, ok := bin.Right.(*ast.MemberExpr); ok {
+		// Enum.VALUE → "VALUE"
+		right = fmt.Sprintf("%q", member.Field)
+	}
+	if right == "" {
+		return ""
+	}
+
+	return fmt.Sprintf("%s %s %s", left, bin.Op, right)
 }
 
 // pluralize adds "s" to a name (simple English pluralization).

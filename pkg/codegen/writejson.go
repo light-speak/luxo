@@ -370,7 +370,7 @@ func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bo
 		}
 
 		switch baseType {
-		case "Int", "DateTime", "Duration":
+		case "Int":
 			if f.Type.Nullable {
 				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
 				fmt.Fprintf(b, "\t\tif %s != nil {\n", goField)
@@ -382,6 +382,32 @@ func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bo
 			} else {
 				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
 				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendSvarint(buf.B, %s)\n", goField)
+			}
+		case "DateTime":
+			if f.Type.Nullable {
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t\tif %s != nil {\n", goField)
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendPresent(buf.B)\n")
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendSvarint(buf.B, %s.Unix())\n", goField)
+				fmt.Fprintf(b, "\t\t} else {\n")
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendNull(buf.B)\n")
+				fmt.Fprintf(b, "\t\t}\n")
+			} else {
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendSvarint(buf.B, %s.Unix())\n", goField)
+			}
+		case "Duration":
+			if f.Type.Nullable {
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t\tif %s != nil {\n", goField)
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendPresent(buf.B)\n")
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendSvarint(buf.B, int64(*%s))\n", goField)
+				fmt.Fprintf(b, "\t\t} else {\n")
+				fmt.Fprintf(b, "\t\t\tbuf.B = codec.AppendNull(buf.B)\n")
+				fmt.Fprintf(b, "\t\t}\n")
+			} else {
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendSvarint(buf.B, int64(%s))\n", goField)
 			}
 		case "Float":
 			if f.Type.Nullable {
@@ -462,12 +488,26 @@ func generateWriteLuxoAllFields(b *strings.Builder, m *ast.ModelDecl, recv strin
 		}
 
 		switch f.Type.Name {
-		case "Int", "DateTime", "Duration":
+		case "Int":
 			if f.Type.Nullable {
 				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
 				fmt.Fprintf(b, "\t\tif %s != nil { buf.B = codec.AppendPresent(buf.B); buf.B = codec.AppendSvarint(buf.B, *%s) } else { buf.B = codec.AppendNull(buf.B) }\n", goField, goField)
 			} else {
 				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s); buf.B = codec.AppendSvarint(buf.B, %s)\n", fid, goField)
+			}
+		case "DateTime":
+			if f.Type.Nullable {
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t\tif %s != nil { buf.B = codec.AppendPresent(buf.B); buf.B = codec.AppendSvarint(buf.B, %s.Unix()) } else { buf.B = codec.AppendNull(buf.B) }\n", goField, goField)
+			} else {
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s); buf.B = codec.AppendSvarint(buf.B, %s.Unix())\n", fid, goField)
+			}
+		case "Duration":
+			if f.Type.Nullable {
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t\tif %s != nil { buf.B = codec.AppendPresent(buf.B); buf.B = codec.AppendSvarint(buf.B, int64(*%s)) } else { buf.B = codec.AppendNull(buf.B) }\n", goField, goField)
+			} else {
+				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s); buf.B = codec.AppendSvarint(buf.B, int64(%s))\n", fid, goField)
 			}
 		case "Float":
 			if f.Type.Nullable {

@@ -88,7 +88,7 @@ func (r *APIRegistry) ParseBinaryRequest(body []byte) (*Request, error) {
 
 	// Read API ID
 	apiID, n := codec.ReadVarint(body, off)
-	if n == 0 {
+	if n <= 0 {
 		return nil, fmt.Errorf("invalid API ID varint")
 	}
 	off += n
@@ -100,7 +100,7 @@ func (r *APIRegistry) ParseBinaryRequest(body []byte) (*Request, error) {
 
 	// Read field mask length + bytes
 	maskLen, n := codec.ReadVarint(body, off)
-	if n == 0 {
+	if n <= 0 {
 		return nil, fmt.Errorf("invalid field mask length")
 	}
 	off += n
