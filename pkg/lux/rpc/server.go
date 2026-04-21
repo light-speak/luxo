@@ -160,28 +160,28 @@ func (s *Server) processRequest(payload []byte) []byte {
 		case "Int":
 			v, n := codec.ReadSvarint(paramBuf, poff)
 			if n <= 0 {
-				break
+				return encodeError(400, "BadRequest", "truncated param: "+meta.Name)
 			}
 			poff += n
 			req.SetParamSlot(paramIdx, v)
 		case "Float":
 			v, n := codec.ReadFixed64(paramBuf, poff)
 			if n == 0 {
-				break
+				return encodeError(400, "BadRequest", "truncated param: "+meta.Name)
 			}
 			poff += n
 			req.SetParamSlot(paramIdx, v)
 		case "String":
 			v, n := codec.ReadString(paramBuf, poff)
 			if n == 0 {
-				break
+				return encodeError(400, "BadRequest", "truncated param: "+meta.Name)
 			}
 			poff += n
 			req.SetParamSlot(paramIdx, v)
 		case "Boolean":
 			v, n := codec.ReadBool(paramBuf, poff)
 			if n == 0 {
-				break
+				return encodeError(400, "BadRequest", "truncated param: "+meta.Name)
 			}
 			poff += n
 			req.SetParamSlot(paramIdx, v)
@@ -196,10 +196,10 @@ func (s *Server) processRequest(payload []byte) []byte {
 
 	buf := api.GetBuf()
 	req.Buf = buf
-	defer api.PutBuf(buf)
 
-	herr := fn(context.Background(), req)
+	herr := s.callHandler(fn, req)
 	if herr != nil {
+		api.PutBuf(buf) // release dirty buffer before building error response
 		var appErr *luxerrors.AppError
 		if stderrors.As(herr, &appErr) {
 			return encodeError(appErr.Code, appErr.Name, appErr.Message)
@@ -211,7 +211,19 @@ func (s *Server) processRequest(payload []byte) []byte {
 	resp := make([]byte, 0, 1+len(buf.B))
 	resp = append(resp, statusOK)
 	resp = append(resp, buf.B...)
+	api.PutBuf(buf)
 	return resp
+}
+
+// callHandler calls the handler with panic recovery so a panicking handler
+// does not crash the connection goroutine.
+func (s *Server) callHandler(fn api.HandlerFunc, req *api.Request) (herr error) {
+	defer func() {
+		if p := recover(); p != nil {
+			herr = fmt.Errorf("panic: %v", p)
+		}
+	}()
+	return fn(context.Background(), req)
 }
 
 func encodeError(code int, name, message string) []byte {

@@ -635,3 +635,104 @@ func BenchmarkRPC_Echo(b *testing.B) {
 		}
 	}
 }
+
+// --- Adversarial tests ---
+
+func TestRPCHandlerPanicRecovery(t *testing.T) {
+	rt := api.NewRouter()
+	rt.Handle("crash", func(ctx context.Context, req *api.Request) error {
+		panic("boom")
+	})
+	rt.Registry.Register("crash", 1)
+	rt.Registry.RegisterParams("crash", nil)
+
+	srv := NewServer(rt)
+	go srv.ListenAndServe("127.0.0.1:19890")
+	time.Sleep(100 * time.Millisecond)
+	defer srv.Close()
+
+	client := NewClient("127.0.0.1:19890")
+	defer client.Close()
+
+	// Should get error, not crash
+	_, err := client.Call(1, nil)
+	if err == nil {
+		t.Fatal("should return error on handler panic")
+	}
+	t.Logf("panic caught: %v", err)
+
+	// Connection should still work after panic
+	_, err = client.Call(1, nil)
+	if err == nil {
+		t.Fatal("second call should also return error")
+	}
+}
+
+func TestRPCTruncatedParams(t *testing.T) {
+	rt := api.NewRouter()
+	rt.Handle("need_int", func(ctx context.Context, req *api.Request) error {
+		v, _ := req.ParamInt("id")
+		req.Buf.B = codec.AppendSvarint(req.Buf.B, v)
+		return nil
+	})
+	rt.Registry.Register("need_int", 1)
+	rt.Registry.RegisterParams("need_int", []api.ParamMeta{
+		{Name: "id", Type: "Int", FieldID: 1},
+	})
+
+	srv := NewServer(rt)
+	go srv.ListenAndServe("127.0.0.1:19891")
+	time.Sleep(100 * time.Millisecond)
+	defer srv.Close()
+
+	client := NewClient("127.0.0.1:19891")
+	defer client.Close()
+
+	// Send truncated param: fieldID varint but no value bytes
+	var truncated []byte
+	truncated = codec.AppendVarint(truncated, 1) // API ID
+	truncated = codec.AppendVarint(truncated, 0) // mask len
+	truncated = codec.AppendVarint(truncated, 1) // param fieldID=1
+	// NO value bytes — truncated!
+
+	conn, err := client.pool.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	WriteFrame(conn, truncated)
+	resp, err := ReadFrame(conn, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.pool.Put(conn)
+
+	if len(resp) == 0 || resp[0] != statusError {
+		t.Fatalf("should return error for truncated params, got status=%d", resp[0])
+	}
+	t.Logf("truncated param caught: %s", string(resp[1:]))
+}
+
+func TestPoolGetAfterClose(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, e := ln.Accept()
+			if e != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+
+	pool := NewPool(ln.Addr().String(), 2)
+	pool.Close()
+
+	_, err = pool.Get()
+	if err == nil {
+		t.Fatal("Get after Close should return error")
+	}
+}

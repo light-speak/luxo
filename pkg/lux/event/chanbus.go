@@ -44,7 +44,7 @@ var _ Bus = (*ChanBus)(nil)
 func (b *ChanBus) Emit(ctx context.Context, name string, payload any) error {
 	select {
 	case <-b.done:
-		return nil // bus closed
+		return fmt.Errorf("event: bus is closed")
 	default:
 	}
 

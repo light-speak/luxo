@@ -1,8 +1,8 @@
 package rpc
 
 import (
+	"fmt"
 	"net"
-	"sync"
 	"time"
 )
 
@@ -13,9 +13,7 @@ type Pool struct {
 	maxIdle int
 	timeout time.Duration
 
-	mu    sync.Mutex
 	conns chan net.Conn
-	count int // total alive connections
 }
 
 // NewPool creates a connection pool for the given address.
@@ -34,8 +32,11 @@ func NewPool(addr string, maxIdle int) *Pool {
 // Get returns an idle connection or dials a new one.
 func (p *Pool) Get() (net.Conn, error) {
 	select {
-	case conn := <-p.conns:
-		return conn, nil
+	case conn, ok := <-p.conns:
+		if ok && conn != nil {
+			return conn, nil
+		}
+		return nil, fmt.Errorf("pool closed")
 	default:
 	}
 	return p.dial()
@@ -47,9 +48,6 @@ func (p *Pool) Put(conn net.Conn) {
 	case p.conns <- conn:
 	default:
 		conn.Close()
-		p.mu.Lock()
-		p.count--
-		p.mu.Unlock()
 	}
 }
 
@@ -70,8 +68,5 @@ func (p *Pool) dial() (net.Conn, error) {
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 	}
-	p.mu.Lock()
-	p.count++
-	p.mu.Unlock()
 	return conn, nil
 }

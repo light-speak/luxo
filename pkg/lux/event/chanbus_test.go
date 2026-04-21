@@ -246,3 +246,24 @@ func TestChanBusOnQueueMultipleGroups(t *testing.T) {
 		t.Errorf("expected 2 groups called, got %d", count.Load())
 	}
 }
+
+func TestChanBusEmitAfterClose(t *testing.T) {
+	bus := NewChanBus(10)
+	bus.On("test", func(ctx context.Context, payload any) {})
+	bus.Close()
+
+	err := bus.Emit(context.Background(), "test", "data")
+	if err == nil {
+		t.Fatal("Emit after Close should return error")
+	}
+}
+
+func TestChanBusOnAfterClose(t *testing.T) {
+	bus := NewChanBus(10)
+	bus.Close()
+
+	err := bus.On("test", func(ctx context.Context, payload any) {})
+	if err == nil {
+		t.Fatal("On after Close should return error")
+	}
+}
