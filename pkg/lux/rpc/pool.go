@@ -42,8 +42,14 @@ func (p *Pool) Get() (net.Conn, error) {
 	return p.dial()
 }
 
-// Put returns a connection to the pool. Closes it if pool is full.
+// Put returns a connection to the pool. Closes it if pool is full or closed.
 func (p *Pool) Put(conn net.Conn) {
+	defer func() {
+		if r := recover(); r != nil {
+			// Channel closed — just close the connection
+			conn.Close()
+		}
+	}()
 	select {
 	case p.conns <- conn:
 	default:

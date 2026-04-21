@@ -120,13 +120,20 @@ func (r *APIRegistry) ParseBinaryRequest(body []byte) (*Request, error) {
 
 	// Inline decode params into Request.paramSlots — zero map allocation
 	paramMeta := r.paramOrder[apiName]
+	// Preserve raw field mask bytes for WriteLuxo field filtering
+	var fieldMask []byte
+	if maskLen > 0 {
+		fieldMask = body[off-int(maskLen) : off]
+	}
+
 	req := &Request{
 		API:        apiName,
 		Select:     fields,
 		Page:       1,
 		PageSize:   20,
 		BinaryMode: true,
-		paramNames: r.paramNames[apiName], // static slice, shared
+		FieldMask:  fieldMask,
+		paramNames: r.paramNames[apiName],
 		paramCount: len(paramMeta),
 	}
 

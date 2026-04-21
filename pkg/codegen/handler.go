@@ -861,15 +861,20 @@ func writeAPIRegistration(b *strings.Builder, name string) {
 	b.WriteString("\t})\n")
 }
 
+// inferParamType infers Luxo type from param name for binary param metadata.
+// Falls back to "String" for unknown patterns. For compiled APIs with AST type info,
+// this is overridden by resolveParamType when available.
 func inferParamType(name string) string {
 	switch {
 	case name == "id" || strings.HasSuffix(name, "Id"):
 		return "Int"
-	case name == "page" || name == "pageSize" || name == "limit" || name == "offset":
+	case name == "page" || name == "pageSize" || name == "limit" || name == "offset" ||
+		name == "priority" || name == "minutes" || name == "quantity" || name == "count":
 		return "Int"
 	case strings.HasPrefix(name, "is") || name == "active" || name == "published":
 		return "Boolean"
-	case name == "amount" || name == "price" || name == "balance":
+	case name == "amount" || name == "price" || name == "balance" || name == "score" ||
+		name == "total" || name == "budget":
 		return "Float"
 	default:
 		return "String"
