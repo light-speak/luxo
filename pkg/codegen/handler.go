@@ -854,11 +854,23 @@ func writeAPIRegistration(b *strings.Builder, name string) {
 	}
 	fmt.Fprintf(b, "\trouter.Registry.RegisterParams(%q, []api.ParamMeta{\n", name)
 	for paramName, paramID := range params {
-		// Infer type from param name (heuristic)
-		ptype := inferParamType(paramName)
+		ptype := resolveParamTypeFromAST(name, paramName)
 		fmt.Fprintf(b, "\t\t{Name: %q, Type: %q, FieldID: %d},\n", paramName, ptype, paramID)
 	}
 	b.WriteString("\t})\n")
+}
+
+// resolveParamTypeFromAST looks up the actual Luxo type for a param from AST data.
+// Falls back to inferParamType heuristic if no AST info available.
+func resolveParamTypeFromAST(apiName, paramName string) string {
+	if apiParamTypes != nil {
+		if params, ok := apiParamTypes[apiName]; ok {
+			if t, ok := params[paramName]; ok {
+				return t
+			}
+		}
+	}
+	return inferParamType(paramName)
 }
 
 // inferParamType infers Luxo type from param name for binary param metadata.

@@ -156,8 +156,11 @@ func (r *APIRegistry) ParseBinaryRequest(body []byte) (*Request, error) {
 				break
 			}
 		}
-		if meta == nil || paramIdx >= 16 {
-			break
+		if meta == nil {
+			return nil, fmt.Errorf("unknown param field ID %d for API %s", fid, apiName)
+		}
+		if paramIdx >= 16 {
+			return nil, fmt.Errorf("too many params (max 16) for API %s", apiName)
 		}
 
 		switch meta.Type {

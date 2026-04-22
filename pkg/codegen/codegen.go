@@ -67,6 +67,15 @@ var apiIDs map[string]int
 // apiParamIDs maps api_name → param_name → stable field ID from luxo.lock.
 var apiParamIDs map[string]map[string]int
 
+// apiParamTypes maps api_name → param_name → Luxo type name (from AST).
+// Set by SetAPIParamTypes, used by RegisterParams codegen for accurate binary metadata.
+var apiParamTypes map[string]map[string]string
+
+// SetAPIParamTypes sets the API param type map from AST analysis.
+func SetAPIParamTypes(types map[string]map[string]string) {
+	apiParamTypes = types
+}
+
 // SetAPIIDs sets the API ID map from lock file data.
 func SetAPIIDs(ids map[string]int) {
 	apiIDs = ids

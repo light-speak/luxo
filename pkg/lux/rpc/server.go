@@ -152,8 +152,11 @@ func (s *Server) processRequest(payload []byte) []byte {
 				break
 			}
 		}
-		if meta == nil || paramIdx >= 16 {
-			break
+		if meta == nil {
+			return encodeError(400, "BadRequest", fmt.Sprintf("unknown param field ID %d", fid))
+		}
+		if paramIdx >= 16 {
+			return encodeError(400, "BadRequest", "too many params (max 16)")
 		}
 
 		switch meta.Type {

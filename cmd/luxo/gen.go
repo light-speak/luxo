@@ -86,6 +86,12 @@ func runGen(cmd *cobra.Command, args []string) error {
 		codegen.SetAPIParamIDs(paramIDs)
 	}
 
+	// Extract param types from AST for accurate binary metadata
+	paramTypes := buildParamTypesFromAST(files)
+	if len(paramTypes) > 0 {
+		codegen.SetAPIParamTypes(paramTypes)
+	}
+
 	totalFiles, err := generateModules(files, result)
 	if err != nil {
 		return err
@@ -200,6 +206,64 @@ func updateLockFileAndReturn(files []*ast.File) (*lockfile.LockFile, error) {
 	}
 	fmt.Printf("  %s✓%s luxo.lock\n", green, reset)
 	return lf, nil
+}
+
+// buildParamTypesFromAST extracts param types from AST for accurate binary metadata.
+func buildParamTypesFromAST(files []*ast.File) map[string]map[string]string {
+	types := make(map[string]map[string]string)
+	for _, file := range files {
+		for _, a := range file.APIs {
+			if len(a.Params) == 0 {
+				continue
+			}
+			m := make(map[string]string, len(a.Params))
+			for _, p := range a.Params {
+				if p.Type != nil {
+					m[p.Name] = p.Type.Name
+				}
+			}
+			types[a.Name] = m
+		}
+		for _, model := range file.Models {
+			hasCrud := false
+			for _, d := range model.Directives {
+				if d.Name == "crud" {
+					hasCrud = true
+					break
+				}
+			}
+			if !hasCrud {
+				continue
+			}
+			fieldTypes := make(map[string]string)
+			for _, f := range model.Fields {
+				if f.Type != nil && f.Computed == nil {
+					fieldTypes[f.Name] = f.Type.Name
+				}
+			}
+			name := model.Name
+			plural := name + "s"
+			idType := fieldTypes["id"]
+			if idType == "" {
+				idType = "Int"
+			}
+			types["get"+name] = map[string]string{"id": idType}
+			types["delete"+name] = map[string]string{"id": idType}
+			types["delete"+plural] = map[string]string{"ids": idType}
+			types["list"+plural] = map[string]string{"page": "Int", "pageSize": "Int"}
+			createTypes := make(map[string]string)
+			for k, v := range fieldTypes {
+				createTypes[k] = v
+			}
+			types["create"+name] = createTypes
+			updateTypes := map[string]string{"id": idType}
+			for k, v := range createTypes {
+				updateTypes[k] = v
+			}
+			types["update"+name] = updateTypes
+		}
+	}
+	return types
 }
 
 func generateModules(files []*ast.File, result *semantic.Result) (int, error) {
