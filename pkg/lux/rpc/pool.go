@@ -1,19 +1,23 @@
 package rpc
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // Pool manages reusable TCP connections to a remote service.
-// Zero-alloc Get/Put on the hot path (channel-based).
+// Zero-alloc Get/Put on the hot path (channel + atomic bool).
 type Pool struct {
 	addr    string
 	maxIdle int
 	timeout time.Duration
-
-	conns chan net.Conn
+	conns   chan net.Conn
+	closed  atomic.Bool
+	once    sync.Once
 }
 
 // NewPool creates a connection pool for the given address.
@@ -31,25 +35,35 @@ func NewPool(addr string, maxIdle int) *Pool {
 
 // Get returns an idle connection or dials a new one.
 func (p *Pool) Get() (net.Conn, error) {
+	return p.GetContext(context.Background())
+}
+
+// GetContext returns an idle connection or dials with context support.
+func (p *Pool) GetContext(ctx context.Context) (net.Conn, error) {
+	if p.closed.Load() {
+		return nil, fmt.Errorf("pool closed")
+	}
 	select {
-	case conn, ok := <-p.conns:
-		if ok && conn != nil {
+	case conn := <-p.conns:
+		if conn != nil {
 			return conn, nil
 		}
 		return nil, fmt.Errorf("pool closed")
 	default:
 	}
-	return p.dial()
+	return p.dialContext(ctx)
 }
 
 // Put returns a connection to the pool. Closes it if pool is full or closed.
+// Zero overhead: atomic bool check instead of recover.
 func (p *Pool) Put(conn net.Conn) {
-	defer func() {
-		if r := recover(); r != nil {
-			// Channel closed — just close the connection
-			conn.Close()
-		}
-	}()
+	if conn == nil {
+		return
+	}
+	if p.closed.Load() {
+		conn.Close()
+		return
+	}
 	select {
 	case p.conns <- conn:
 	default:
@@ -57,20 +71,24 @@ func (p *Pool) Put(conn net.Conn) {
 	}
 }
 
-// Close closes all idle connections.
+// Close closes all idle connections. Idempotent — safe to call multiple times.
 func (p *Pool) Close() {
-	close(p.conns)
-	for conn := range p.conns {
-		conn.Close()
-	}
+	p.once.Do(func() {
+		p.closed.Store(true)
+		close(p.conns)
+		for conn := range p.conns {
+			conn.Close()
+		}
+	})
 }
 
-func (p *Pool) dial() (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp", p.addr, p.timeout)
+// dialContext dials with context support for cancellation and deadline propagation.
+func (p *Pool) dialContext(ctx context.Context) (net.Conn, error) {
+	d := &net.Dialer{Timeout: p.timeout}
+	conn, err := d.DialContext(ctx, "tcp", p.addr)
 	if err != nil {
 		return nil, err
 	}
-	// Disable Nagle for low latency
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 	}
