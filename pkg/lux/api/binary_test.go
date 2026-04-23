@@ -222,6 +222,270 @@ func TestBinaryErrorResponse(t *testing.T) {
 	}
 }
 
+// --- APIRegistry methods ---
+
+func TestRegistryNameByID(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("getUser", 1)
+
+	name, ok := reg.NameByID(1)
+	if !ok || name != "getUser" {
+		t.Fatalf("NameByID(1) = %q, %v", name, ok)
+	}
+	_, ok = reg.NameByID(999)
+	if ok {
+		t.Fatal("NameByID(999) should return false")
+	}
+}
+
+func TestRegistryIDByName(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("getUser", 1)
+
+	id, ok := reg.IDByName("getUser")
+	if !ok || id != 1 {
+		t.Fatalf("IDByName(getUser) = %d, %v", id, ok)
+	}
+	_, ok = reg.IDByName("missing")
+	if ok {
+		t.Fatal("IDByName(missing) should return false")
+	}
+}
+
+func TestRegistryParamOrder(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("getUser", 1)
+	meta := []ParamMeta{{Name: "id", Type: "Int", FieldID: 1}}
+	reg.RegisterParams("getUser", meta)
+
+	got := reg.ParamOrder("getUser")
+	if len(got) != 1 || got[0].Name != "id" {
+		t.Fatalf("ParamOrder wrong: %v", got)
+	}
+	if reg.ParamOrder("missing") != nil {
+		t.Fatal("missing API should return nil")
+	}
+}
+
+func TestRegistryParamNames(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("getUser", 1)
+	reg.RegisterParams("getUser", []ParamMeta{
+		{Name: "id", Type: "Int", FieldID: 1},
+		{Name: "name", Type: "String", FieldID: 2},
+	})
+
+	names := reg.ParamNames("getUser")
+	if len(names) != 2 || names[0] != "id" || names[1] != "name" {
+		t.Fatalf("ParamNames wrong: %v", names)
+	}
+}
+
+// --- ParseBinaryRequest edge cases ---
+
+func TestParseBinaryRequestInvalidVarint(t *testing.T) {
+	reg := NewAPIRegistry()
+	// Invalid varint: 0x80 without continuation
+	_, err := reg.ParseBinaryRequest([]byte{0x80})
+	if err == nil {
+		t.Fatal("should error on invalid varint")
+	}
+}
+
+func TestParseBinaryRequestFieldMaskOverflow(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("test", 1)
+
+	// API ID = 1, mask length = 255 (way more than body)
+	body := []byte{0x01, 0xFF, 0x01} // varint 1, varint 255
+	_, err := reg.ParseBinaryRequest(body)
+	if err == nil {
+		t.Fatal("should error on field mask overflow")
+	}
+}
+
+func TestParseBinaryRequestTruncatedParam(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("test", 1)
+	reg.RegisterParams("test", []ParamMeta{
+		{Name: "id", Type: "Int", FieldID: 1},
+	})
+
+	// API ID = 1, mask len = 0, then param field ID 1 but no value
+	body := []byte{0x01, 0x00, 0x01}
+	_, err := reg.ParseBinaryRequest(body)
+	if err == nil {
+		t.Fatal("should error on truncated int param")
+	}
+}
+
+func TestParseBinaryRequestUnknownParamFieldID(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("test", 1)
+	reg.RegisterParams("test", []ParamMeta{
+		{Name: "id", Type: "Int", FieldID: 1},
+	})
+
+	// API ID = 1, mask len = 0, then unknown field ID 99
+	body := []byte{0x01, 0x00, 99}
+	_, err := reg.ParseBinaryRequest(body)
+	if err == nil {
+		t.Fatal("should error on unknown param field ID")
+	}
+}
+
+// --- SetBinaryParams / SetParamSlot ---
+
+func TestSetBinaryParamsAndSlot(t *testing.T) {
+	req := &Request{}
+	req.SetBinaryParams([]string{"id", "name"}, 2)
+	req.SetParamSlot(0, int64(42))
+	req.SetParamSlot(1, "alice")
+
+	id, err := req.ParamInt("id")
+	if err != nil || id != 42 {
+		t.Fatalf("id = %d, err = %v", id, err)
+	}
+	name, err := req.ParamString("name")
+	if err != nil || name != "alice" {
+		t.Fatalf("name = %q, err = %v", name, err)
+	}
+}
+
+func TestSetParamSlotOutOfRange(t *testing.T) {
+	req := &Request{}
+	req.SetBinaryParams([]string{"id"}, 1)
+	// Should not panic with out-of-range index
+	req.SetParamSlot(16, "overflow")
+	req.SetParamSlot(-1, "negative")
+}
+
+// --- ParamIntArray/StringArray with paramSlots ---
+
+func TestParamIntArrayBinary(t *testing.T) {
+	req := &Request{
+		paramNames: []string{"ids"},
+		paramCount: 1,
+		paramSlots: [16]any{[]int64{1, 2, 3}},
+	}
+	ids, err := req.ParamIntArray("ids")
+	if err != nil || len(ids) != 3 {
+		t.Fatalf("ids = %v, err = %v", ids, err)
+	}
+	// Missing param
+	_, err = req.ParamIntArray("missing")
+	if err == nil {
+		t.Fatal("should error on missing")
+	}
+	// Wrong type
+	req2 := &Request{
+		paramNames: []string{"ids"},
+		paramCount: 1,
+		paramSlots: [16]any{"not-array"},
+	}
+	_, err = req2.ParamIntArray("ids")
+	if err == nil {
+		t.Fatal("should error on wrong type")
+	}
+}
+
+func TestParamStringArrayBinary(t *testing.T) {
+	req := &Request{
+		paramNames: []string{"tags"},
+		paramCount: 1,
+		paramSlots: [16]any{[]string{"a", "b"}},
+	}
+	tags, err := req.ParamStringArray("tags")
+	if err != nil || len(tags) != 2 {
+		t.Fatalf("tags = %v, err = %v", tags, err)
+	}
+	// Missing param
+	_, err = req.ParamStringArray("missing")
+	if err == nil {
+		t.Fatal("should error on missing")
+	}
+}
+
+// --- ParamJSON with paramSlots ---
+
+func TestParamJSONBinary(t *testing.T) {
+	req := &Request{
+		paramNames: []string{"data"},
+		paramCount: 1,
+		paramSlots: [16]any{"some-value"},
+	}
+	var v any
+	err := req.ParamJSON("data", &v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != "some-value" {
+		t.Fatalf("got %v", v)
+	}
+
+	// Missing param
+	err = req.ParamJSON("missing", &v)
+	if err == nil {
+		t.Fatal("should error on missing")
+	}
+
+	// Non-*any target in binary mode
+	var s string
+	err = req.ParamJSON("data", &s)
+	if err == nil {
+		t.Fatal("should error on non-*any target in binary mode")
+	}
+}
+
+// --- ParamDateTime edge cases ---
+
+func TestParamDateTimeBinaryInvalid(t *testing.T) {
+	req := &Request{
+		paramNames: []string{"date"},
+		paramCount: 1,
+		paramSlots: [16]any{"not-a-date"},
+	}
+	_, err := req.ParamDateTime("date")
+	if err == nil {
+		t.Fatal("should error on invalid date format")
+	}
+}
+
+func TestParamDateTimeBinaryNotString(t *testing.T) {
+	req := &Request{
+		paramNames: []string{"date"},
+		paramCount: 1,
+		paramSlots: [16]any{int64(12345)},
+	}
+	_, err := req.ParamDateTime("date")
+	if err == nil {
+		t.Fatal("should error when value is not a string")
+	}
+}
+
+// --- decodeFieldMask ---
+
+func TestDecodeFieldMask(t *testing.T) {
+	// decodeFieldMask currently returns nil (stub)
+	result := decodeFieldMask([]byte{0xFF}, nil)
+	if result != nil {
+		t.Fatal("decodeFieldMask should return nil (stub)")
+	}
+}
+
+// --- ExportHandlers ---
+
+func TestExportHandlers(t *testing.T) {
+	rt := NewRouter()
+	rt.Handle("ping", func(ctx context.Context, req *Request) error {
+		return nil
+	})
+	handlers := rt.ExportHandlers()
+	if _, ok := handlers["ping"]; !ok {
+		t.Fatal("ExportHandlers should include registered handlers")
+	}
+}
+
 func TestEncodeBinaryRequestFloat(t *testing.T) {
 	reg := NewAPIRegistry()
 	reg.Register("calc", 1)

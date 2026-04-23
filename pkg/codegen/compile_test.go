@@ -5017,3 +5017,571 @@ func TestCompileChannelProducerConsumer(t *testing.T) {
 		t.Fatalf("missing channel creation, got:\n%s", out)
 	}
 }
+
+// --- compileUpdateChain ---
+
+func TestCompileUpdateChainEmpty(t *testing.T) {
+	c := newCompiler(nil)
+	var b strings.Builder
+	c.compileUpdateChain(&b, "User", nil)
+	got := b.String()
+	if got != ".Update(ctx)" {
+		t.Fatalf("empty args should produce .Update(ctx), got %q", got)
+	}
+}
+
+func TestCompileUpdateChainBasic(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	var b strings.Builder
+	c.compileUpdateChain(&b, "User", []*ast.NamedArg{
+		{Name: "name", Value: &ast.Literal{Kind: token.String, Value: "lin"}},
+	})
+	got := b.String()
+	if !strings.Contains(got, `lux.SetField{Col: "name", Val: "lin"}`) {
+		t.Fatalf("basic update chain wrong, got:\n%s", got)
+	}
+}
+
+func TestCompileUpdateChainAtomic(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	var b strings.Builder
+	c.compileUpdateChain(&b, "User", []*ast.NamedArg{
+		{Name: "score", Value: &ast.BinaryExpr{
+			Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "score"},
+			Op:    "+",
+			Right: &ast.Literal{Value: "10"},
+		}},
+	})
+	got := b.String()
+	if !strings.Contains(got, `Atomic: "+"`) {
+		t.Fatalf("atomic update should have Atomic field, got:\n%s", got)
+	}
+}
+
+func TestCompileUpdateChainHash(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"User": {
+			Name: "User",
+			Fields: []*ast.FieldDecl{
+				{Name: "password", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hash"}}},
+			},
+		},
+	}
+	c := newCompiler(models)
+	var b strings.Builder
+	c.compileUpdateChain(&b, "User", []*ast.NamedArg{
+		{Name: "password", Value: &ast.Literal{Kind: token.String, Value: "secret"}},
+	})
+	out := compilerOut(c) + b.String()
+	if !strings.Contains(out, "luxocrypto.HashPassword") {
+		t.Fatalf("hash field should generate HashPassword, got:\n%s", out)
+	}
+	if !strings.Contains(out, "hashedPassword") {
+		t.Fatalf("hash field should use hashedPassword, got:\n%s", out)
+	}
+}
+
+// --- isHashField ---
+
+func TestIsHashField(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "password", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hash"}}},
+		},
+	}
+	if !isHashField(m, "password") {
+		t.Error("password should be a hash field")
+	}
+	if isHashField(m, "name") {
+		t.Error("name should not be a hash field")
+	}
+	if isHashField(m, "missing") {
+		t.Error("missing field should return false")
+	}
+}
+
+// --- compileTerminalMethod ---
+
+func TestCompileTerminalMethodFind(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	var b strings.Builder
+	done := c.compileTerminalMethod(&b, "User", chainLink{
+		method: "find",
+		args:   []*ast.NamedArg{{Value: &ast.Literal{Value: "42"}}},
+	})
+	if !done {
+		t.Fatal("find should return true")
+	}
+	got := b.String()
+	if !strings.Contains(got, "app.User.Where(UserWhere.Id.Eq(42))") {
+		t.Fatalf("find should generate Where+First, got:\n%s", got)
+	}
+}
+
+func TestCompileTerminalMethodDelete(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	var b strings.Builder
+	done := c.compileTerminalMethod(&b, "User", chainLink{method: "delete"})
+	if !done {
+		t.Fatal("delete should return true")
+	}
+	got := b.String()
+	if !strings.Contains(got, ".Delete(ctx)") {
+		t.Fatalf("delete should generate .Delete(ctx), got:\n%s", got)
+	}
+}
+
+func TestCompileTerminalMethodDeleteSoft(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"User": {
+			Name:       "User",
+			Directives: []*ast.Directive{{Name: "soft"}},
+		},
+	}
+	c := newCompiler(models)
+	var b strings.Builder
+	done := c.compileTerminalMethod(&b, "User", chainLink{method: "delete"})
+	if !done {
+		t.Fatal("delete should return true")
+	}
+	got := b.String()
+	if !strings.Contains(got, ".SoftDelete(ctx)") {
+		t.Fatalf("soft delete should generate .SoftDelete(ctx), got:\n%s", got)
+	}
+}
+
+func TestCompileTerminalMethodAll(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	var b strings.Builder
+	done := c.compileTerminalMethod(&b, "User", chainLink{method: "all"})
+	if !done {
+		t.Fatal("all should return true")
+	}
+	if !strings.Contains(b.String(), ".All(ctx)") {
+		t.Fatalf("got: %s", b.String())
+	}
+}
+
+func TestCompileTerminalMethodAllPaginate(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	c.paginate = true
+	var b strings.Builder
+	done := c.compileTerminalMethod(&b, "User", chainLink{method: "all"})
+	if !done {
+		t.Fatal("all should return true")
+	}
+	if !strings.Contains(b.String(), "AllWithCount(ctx)") {
+		t.Fatalf("paginated all should use AllWithCount, got: %s", b.String())
+	}
+}
+
+func TestCompileTerminalMethodFirst(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	var b strings.Builder
+	done := c.compileTerminalMethod(&b, "User", chainLink{method: "first"})
+	if !done {
+		t.Fatal("first should return true")
+	}
+	if !strings.Contains(b.String(), ".First(ctx)") {
+		t.Fatalf("got: %s", b.String())
+	}
+}
+
+func TestCompileTerminalMethodExists(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	var b strings.Builder
+	done := c.compileTerminalMethod(&b, "User", chainLink{method: "exists"})
+	if !done {
+		t.Fatal("exists should return true")
+	}
+	if !strings.Contains(b.String(), ".Exists(ctx)") {
+		t.Fatalf("got: %s", b.String())
+	}
+}
+
+func TestCompileTerminalMethodCount(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	var b strings.Builder
+	done := c.compileTerminalMethod(&b, "User", chainLink{method: "count"})
+	if !done {
+		t.Fatal("count should return true")
+	}
+	if !strings.Contains(b.String(), ".Count(ctx)") {
+		t.Fatalf("got: %s", b.String())
+	}
+}
+
+func TestCompileTerminalMethodSave(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	var b strings.Builder
+	done := c.compileTerminalMethod(&b, "User", chainLink{method: "save"})
+	if !done {
+		t.Fatal("save should return true")
+	}
+	if !strings.Contains(b.String(), ".Exec(ctx)") {
+		t.Fatalf("got: %s", b.String())
+	}
+}
+
+func TestCompileTerminalMethodSumWithLambda(t *testing.T) {
+	c := newCompiler(makeModels("Order"))
+	var b strings.Builder
+	done := c.compileTerminalMethod(&b, "Order", chainLink{
+		method: "sum",
+		args: []*ast.NamedArg{{Value: &ast.LambdaExpr{
+			Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "amount"}},
+			}},
+		}}},
+	})
+	if !done {
+		t.Fatal("sum should return true")
+	}
+	if !strings.Contains(b.String(), `.Sum(ctx, "amount")`) {
+		t.Fatalf("sum with lambda should extract field, got: %s", b.String())
+	}
+}
+
+func TestCompileTerminalMethodSumNoArgs(t *testing.T) {
+	c := newCompiler(makeModels("Order"))
+	var b strings.Builder
+	done := c.compileTerminalMethod(&b, "Order", chainLink{method: "sum"})
+	if !done {
+		t.Fatal("sum should return true")
+	}
+	if !strings.Contains(b.String(), ".Sum(ctx)") {
+		t.Fatalf("sum without args, got: %s", b.String())
+	}
+}
+
+func TestCompileTerminalMethodUpdate(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	var b strings.Builder
+	done := c.compileTerminalMethod(&b, "User", chainLink{
+		method: "update",
+		args:   []*ast.NamedArg{{Name: "name", Value: &ast.Literal{Kind: token.String, Value: "x"}}},
+	})
+	if !done {
+		t.Fatal("update should return true")
+	}
+	if !strings.Contains(b.String(), ".Update(ctx,") {
+		t.Fatalf("got: %s", b.String())
+	}
+}
+
+func TestCompileTerminalMethodNonTerminal(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	var b strings.Builder
+	done := c.compileTerminalMethod(&b, "User", chainLink{method: "where"})
+	if done {
+		t.Fatal("where should not be terminal")
+	}
+}
+
+func TestCompileTerminalMethodEmptyBuilder(t *testing.T) {
+	// Terminal on empty builder — should seed with app.Model
+	c := newCompiler(makeModels("User"))
+	var b strings.Builder
+	done := c.compileTerminalMethod(&b, "User", chainLink{method: "count"})
+	if !done {
+		t.Fatal("count should return true")
+	}
+	if !strings.Contains(b.String(), "app.User") {
+		t.Fatalf("should seed builder with app.User, got: %s", b.String())
+	}
+}
+
+// --- compileScopeExpr ---
+
+func TestCompileScopeExpr(t *testing.T) {
+	c := newCompiler(makeModels("Post"))
+	scope := &ast.ScopeDecl{
+		Name: "published",
+		Expr: &ast.CallExpr{
+			Func: &ast.Ident{Name: "where"},
+			Args: []*ast.NamedArg{
+				{Name: "status", Value: &ast.Literal{Kind: token.String, Value: "PUBLISHED"}},
+			},
+		},
+	}
+	var b strings.Builder
+	c.compileScopeExpr(&b, "Post", scope)
+	got := b.String()
+	if !strings.Contains(got, "PostWhere.Status.Eq") {
+		t.Fatalf("scope should compile where condition, got:\n%s", got)
+	}
+}
+
+func TestCompileScopeExprOrderByAndLimit(t *testing.T) {
+	c := newCompiler(makeModels("Post"))
+	// scope recent = orderBy(createdAt.desc).limit(10)
+	scope := &ast.ScopeDecl{
+		Name: "recent",
+		Expr: &ast.CallExpr{
+			Func: &ast.MemberExpr{
+				Object: &ast.CallExpr{
+					Func: &ast.Ident{Name: "orderBy"},
+					Args: []*ast.NamedArg{{Value: &ast.MemberExpr{
+						Object: &ast.Ident{Name: "createdAt"},
+						Field:  "desc",
+					}}},
+				},
+				Field: "limit",
+			},
+			Args: []*ast.NamedArg{{Value: &ast.Literal{Value: "10"}}},
+		},
+	}
+	var b strings.Builder
+	c.compileScopeExpr(&b, "Post", scope)
+	got := b.String()
+	if !strings.Contains(got, "OrderBy") {
+		t.Fatalf("scope should compile orderBy, got:\n%s", got)
+	}
+	if !strings.Contains(got, "Limit(10)") {
+		t.Fatalf("scope should compile limit, got:\n%s", got)
+	}
+}
+
+// --- isStringExpr ---
+
+func TestIsStringExprLiteral(t *testing.T) {
+	c := newCompiler(nil)
+	if !c.isStringExpr(&ast.Literal{Kind: token.String, Value: "hello"}) {
+		t.Error("string literal should be string")
+	}
+	if c.isStringExpr(&ast.Literal{Kind: token.Int, Value: "42"}) {
+		t.Error("int literal should not be string")
+	}
+}
+
+func TestIsStringExprIdent(t *testing.T) {
+	c := newCompiler(nil)
+	c.vars["name"] = valType{name: "String"}
+	if !c.isStringExpr(&ast.Ident{Name: "name"}) {
+		t.Error("String var should be string")
+	}
+	c.vars["count"] = valType{name: "Int"}
+	if c.isStringExpr(&ast.Ident{Name: "count"}) {
+		t.Error("Int var should not be string")
+	}
+}
+
+func TestIsStringExprMember(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"User": {
+			Name: "User",
+			Fields: []*ast.FieldDecl{
+				{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+				{Name: "age", Type: &ast.TypeRef{Name: "Int"}},
+			},
+		},
+	}
+	c := newCompiler(models)
+	c.vars["user"] = valType{name: "User", isModel: true}
+
+	if !c.isStringExpr(&ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "name"}) {
+		t.Error("user.name should be string")
+	}
+	if c.isStringExpr(&ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "age"}) {
+		t.Error("user.age should not be string")
+	}
+}
+
+// --- inferWhenReturnType ---
+
+func TestInferWhenReturnType(t *testing.T) {
+	tests := []struct {
+		retType *ast.TypeRef
+		want    string
+	}{
+		{nil, "any"},
+		{&ast.TypeRef{Name: "String"}, "string"},
+		{&ast.TypeRef{Name: "Int"}, "int64"},
+		{&ast.TypeRef{Name: "Float"}, "float64"},
+		{&ast.TypeRef{Name: "Boolean"}, "bool"},
+		{&ast.TypeRef{Name: "User"}, "any"},
+	}
+	for _, tt := range tests {
+		c := newCompiler(nil)
+		c.api.ReturnType = tt.retType
+		got := c.inferWhenReturnType(&ast.WhenExpr{})
+		if got != tt.want {
+			name := "nil"
+			if tt.retType != nil {
+				name = tt.retType.Name
+			}
+			t.Errorf("inferWhenReturnType(%s) = %q, want %q", name, got, tt.want)
+		}
+	}
+}
+
+// --- zeroValueForType ---
+
+func TestZeroValueForType(t *testing.T) {
+	tests := []struct {
+		typ  string
+		want string
+	}{
+		{"string", `""`},
+		{"int64", "0"},
+		{"int", "0"},
+		{"float64", "0"},
+		{"bool", "false"},
+		{"any", "nil"},
+		{"*User", "nil"},
+	}
+	for _, tt := range tests {
+		if got := zeroValueForType(tt.typ); got != tt.want {
+			t.Errorf("zeroValueForType(%q) = %q, want %q", tt.typ, got, tt.want)
+		}
+	}
+}
+
+// --- extractLambdaField ---
+
+func TestExtractLambdaField(t *testing.T) {
+	// Valid: { it.minutes }
+	got := extractLambdaField(&ast.LambdaExpr{
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "minutes"}},
+		}},
+	})
+	if got != "minutes" {
+		t.Fatalf("want minutes, got %q", got)
+	}
+
+	// Non-lambda
+	if extractLambdaField(&ast.Ident{Name: "x"}) != "" {
+		t.Error("non-lambda should return empty")
+	}
+
+	// Empty body
+	if extractLambdaField(&ast.LambdaExpr{Body: &ast.Block{}}) != "" {
+		t.Error("empty body should return empty")
+	}
+
+	// Non-ExprStmt
+	if extractLambdaField(&ast.LambdaExpr{Body: &ast.Block{Stmts: []ast.Stmt{
+		&ast.ReturnStmt{},
+	}}}) != "" {
+		t.Error("non-ExprStmt should return empty")
+	}
+
+	// Non-MemberExpr
+	if extractLambdaField(&ast.LambdaExpr{Body: &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.Ident{Name: "x"}},
+	}}}) != "" {
+		t.Error("non-MemberExpr should return empty")
+	}
+
+	// Not "it" object
+	if extractLambdaField(&ast.LambdaExpr{Body: &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "other"}, Field: "x"}},
+	}}}) != "" {
+		t.Error("non-it object should return empty")
+	}
+
+	// Non-Ident object
+	if extractLambdaField(&ast.LambdaExpr{Body: &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.CallExpr{Func: &ast.Ident{Name: "x"}}, Field: "y"}},
+	}}}) != "" {
+		t.Error("non-Ident object should return empty")
+	}
+}
+
+// --- compileModelChain with @scope ---
+
+func TestCompileModelChainWithScope(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"Post": {
+			Name: "Post",
+			Scopes: []*ast.ScopeDecl{
+				{
+					Name: "published",
+					Expr: &ast.CallExpr{
+						Func: &ast.Ident{Name: "where"},
+						Args: []*ast.NamedArg{
+							{Name: "status", Value: &ast.Literal{Kind: token.String, Value: "PUBLISHED"}},
+						},
+					},
+				},
+			},
+		},
+	}
+	c := newCompiler(models)
+	c.api.Directives = []*ast.Directive{
+		{Name: "scope", Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "published"}}}},
+	}
+
+	got := c.compileModelChain("Post", []chainLink{
+		{method: "all"},
+	})
+	if !strings.Contains(got, "PostWhere.Status.Eq") {
+		t.Fatalf("scope injection should add where condition, got:\n%s", got)
+	}
+}
+
+// --- compileCreateLink ---
+
+func TestCompileCreateLinkBasic(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	var b strings.Builder
+	c.compileCreateLink(&b, "User", chainLink{
+		method: "create",
+		args: []*ast.NamedArg{
+			{Name: "name", Value: &ast.Literal{Kind: token.String, Value: "lin"}},
+		},
+	}, true)
+	got := b.String()
+	if !strings.Contains(got, `app.User.Create().SetName("lin").Exec(ctx)`) {
+		t.Fatalf("create should generate builder chain, got:\n%s", got)
+	}
+}
+
+func TestCompileCreateLinkNullable(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"Post": {
+			Name: "Post",
+			Fields: []*ast.FieldDecl{
+				{Name: "subtitle", Type: &ast.TypeRef{Name: "String", Nullable: true}},
+			},
+		},
+	}
+	c := newCompiler(models)
+	var b strings.Builder
+	c.compileCreateLink(&b, "Post", chainLink{
+		method: "create",
+		args: []*ast.NamedArg{
+			{Name: "subtitle", Value: &ast.Literal{Kind: token.String, Value: "test"}},
+		},
+	}, false)
+	got := b.String()
+	if !strings.Contains(got, `&"test"`) {
+		t.Fatalf("nullable field should wrap with &, got:\n%s", got)
+	}
+}
+
+func TestCompileCreateLinkHash(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"User": {
+			Name: "User",
+			Fields: []*ast.FieldDecl{
+				{Name: "password", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hash"}}},
+			},
+		},
+	}
+	c := newCompiler(models)
+	var b strings.Builder
+	c.compileCreateLink(&b, "User", chainLink{
+		method: "create",
+		args: []*ast.NamedArg{
+			{Name: "password", Value: &ast.Literal{Kind: token.String, Value: "secret"}},
+		},
+	}, true)
+	out := compilerOut(c)
+	if !strings.Contains(out, "luxocrypto.HashPassword") {
+		t.Fatalf("hash field should call HashPassword, got:\n%s", out)
+	}
+}

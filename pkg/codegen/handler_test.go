@@ -1160,6 +1160,478 @@ func TestGenerateCompiledAPIWithoutAuth(t *testing.T) {
 	}
 }
 
+// --- writeAuthCheck ---
+
+func TestWriteAuthCheckNilDirective(t *testing.T) {
+	var b strings.Builder
+	writeAuthCheck(&b, "\t")
+	code := b.String()
+	if !strings.Contains(code, "luvia.Identity(ctx)") {
+		t.Error("should have identity check")
+	}
+	if !strings.Contains(code, "errors.Unauthorized") {
+		t.Error("should have unauthorized check")
+	}
+	// Without directives, should NOT have _authorized
+	if strings.Contains(code, "_authorized") {
+		t.Error("nil directives should not add role/own checks")
+	}
+}
+
+func TestWriteAuthCheckSingleRole(t *testing.T) {
+	var b strings.Builder
+	d := &ast.Directive{
+		Name: "auth",
+		Args: []*ast.NamedArg{
+			{Value: &ast.Ident{Name: "Admin"}},
+		},
+	}
+	writeAuthCheck(&b, "\t", d)
+	code := b.String()
+	if !strings.Contains(code, `identity.String("role") == "Admin"`) {
+		t.Errorf("single role check missing:\n%s", code)
+	}
+	if !strings.Contains(code, "errors.Forbidden") {
+		t.Error("should have forbidden check")
+	}
+}
+
+func TestWriteAuthCheckMultipleRoles(t *testing.T) {
+	var b strings.Builder
+	d := &ast.Directive{
+		Name: "auth",
+		Args: []*ast.NamedArg{
+			{Value: &ast.Ident{Name: "Admin"}},
+			{Value: &ast.Ident{Name: "Moderator"}},
+		},
+	}
+	writeAuthCheck(&b, "\t", d)
+	code := b.String()
+	if !strings.Contains(code, "switch identity.String(\"role\")") {
+		t.Errorf("multi-role switch missing:\n%s", code)
+	}
+	if !strings.Contains(code, `case "Admin"`) || !strings.Contains(code, `case "Moderator"`) {
+		t.Errorf("role cases missing:\n%s", code)
+	}
+}
+
+func TestWriteAuthCheckOwn(t *testing.T) {
+	var b strings.Builder
+	d := &ast.Directive{
+		Name: "auth",
+		Args: []*ast.NamedArg{
+			{Name: "own", Value: &ast.Literal{Value: "userId"}},
+		},
+	}
+	writeAuthCheck(&b, "\t", d)
+	code := b.String()
+	if !strings.Contains(code, `req.ParamInt("userId")`) {
+		t.Errorf("own param check missing:\n%s", code)
+	}
+	if !strings.Contains(code, "identity.ID()") {
+		t.Errorf("own identity check missing:\n%s", code)
+	}
+}
+
+func TestWriteAuthCheckOwnIdent(t *testing.T) {
+	var b strings.Builder
+	d := &ast.Directive{
+		Name: "auth",
+		Args: []*ast.NamedArg{
+			{Name: "own", Value: &ast.Ident{Name: "id"}},
+		},
+	}
+	writeAuthCheck(&b, "\t", d)
+	code := b.String()
+	if !strings.Contains(code, `req.ParamInt("id")`) {
+		t.Errorf("own ident check missing:\n%s", code)
+	}
+}
+
+func TestWriteAuthCheckPermission(t *testing.T) {
+	var b strings.Builder
+	d := &ast.Directive{
+		Name: "auth",
+		Args: []*ast.NamedArg{
+			{Name: "permission", Value: &ast.LambdaExpr{
+				Body: &ast.Block{Stmts: []ast.Stmt{
+					&ast.ExprStmt{Expr: &ast.BinaryExpr{
+						Left: &ast.MemberExpr{
+							Object: &ast.Ident{Name: "my"},
+							Field:  "role",
+						},
+						Op:    "==",
+						Right: &ast.Literal{Value: "SUPER"},
+					}},
+				}},
+			}},
+		},
+	}
+	writeAuthCheck(&b, "\t", d)
+	code := b.String()
+	if !strings.Contains(code, `identity.String("role") == "SUPER"`) {
+		t.Errorf("permission expression missing:\n%s", code)
+	}
+}
+
+func TestWriteAuthCheckRoleAndOwn(t *testing.T) {
+	var b strings.Builder
+	d := &ast.Directive{
+		Name: "auth",
+		Args: []*ast.NamedArg{
+			{Value: &ast.Ident{Name: "Admin"}},
+			{Name: "own", Value: &ast.Literal{Value: "userId"}},
+		},
+	}
+	writeAuthCheck(&b, "\t", d)
+	code := b.String()
+	if !strings.Contains(code, `identity.String("role") == "Admin"`) {
+		t.Errorf("role check missing:\n%s", code)
+	}
+	if !strings.Contains(code, `req.ParamInt("userId")`) {
+		t.Errorf("own check missing:\n%s", code)
+	}
+}
+
+// --- compilePermissionExpr ---
+
+func TestCompilePermissionExprMemberIdent(t *testing.T) {
+	expr := &ast.BinaryExpr{
+		Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "my"}, Field: "role"},
+		Op:    "==",
+		Right: &ast.Ident{Name: "ADMIN"},
+	}
+	got := compilePermissionExpr(expr)
+	if got != `identity.String("role") == "ADMIN"` {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestCompilePermissionExprMemberMember(t *testing.T) {
+	// my.role == Enum.VALUE
+	expr := &ast.BinaryExpr{
+		Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "my"}, Field: "role"},
+		Op:    "!=",
+		Right: &ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "BANNED"},
+	}
+	got := compilePermissionExpr(expr)
+	if got != `identity.String("role") != "BANNED"` {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestCompilePermissionExprNonBinary(t *testing.T) {
+	got := compilePermissionExpr(&ast.Ident{Name: "foo"})
+	if got != "" {
+		t.Fatalf("non-binary should return empty, got %q", got)
+	}
+}
+
+func TestCompilePermissionExprLeftNotMember(t *testing.T) {
+	expr := &ast.BinaryExpr{
+		Left:  &ast.Ident{Name: "foo"},
+		Op:    "==",
+		Right: &ast.Literal{Value: "bar"},
+	}
+	got := compilePermissionExpr(expr)
+	if got != "" {
+		t.Fatalf("non-member left should return empty, got %q", got)
+	}
+}
+
+func TestCompilePermissionExprLeftNotMy(t *testing.T) {
+	expr := &ast.BinaryExpr{
+		Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "other"}, Field: "role"},
+		Op:    "==",
+		Right: &ast.Literal{Value: "x"},
+	}
+	got := compilePermissionExpr(expr)
+	if got != "" {
+		t.Fatalf("non-my left should return empty, got %q", got)
+	}
+}
+
+func TestCompilePermissionExprRightUnsupported(t *testing.T) {
+	expr := &ast.BinaryExpr{
+		Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "my"}, Field: "role"},
+		Op:    "==",
+		Right: &ast.CallExpr{Func: &ast.Ident{Name: "foo"}},
+	}
+	got := compilePermissionExpr(expr)
+	if got != "" {
+		t.Fatalf("unsupported right should return empty, got %q", got)
+	}
+}
+
+// --- bodyContains* ---
+
+func TestBodyContainsAwait(t *testing.T) {
+	if bodyContainsAwait(nil) {
+		t.Error("nil block should return false")
+	}
+	block := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.AwaitExpr{Body: &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: &ast.Ident{Name: "x"}}}}}},
+	}}
+	if !bodyContainsAwait(block) {
+		t.Error("should detect await")
+	}
+	block2 := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.Ident{Name: "x"}},
+	}}
+	if bodyContainsAwait(block2) {
+		t.Error("should not detect await in non-await stmt")
+	}
+	// Non-ExprStmt
+	block3 := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ReturnStmt{Value: &ast.Ident{Name: "x"}},
+	}}
+	if bodyContainsAwait(block3) {
+		t.Error("non-ExprStmt should return false")
+	}
+}
+
+func TestBodyContainsTransaction(t *testing.T) {
+	if bodyContainsTransaction(nil) {
+		t.Error("nil block should return false")
+	}
+	// ExprStmt with transaction call
+	block := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.CallExpr{
+			Func: &ast.Ident{Name: "transaction"},
+		}},
+	}}
+	if !bodyContainsTransaction(block) {
+		t.Error("should detect transaction ExprStmt")
+	}
+	// ValStmt with transaction call
+	block2 := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ValStmt{Name: "result", Value: &ast.CallExpr{
+			Func: &ast.Ident{Name: "transaction"},
+		}},
+	}}
+	if !bodyContainsTransaction(block2) {
+		t.Error("should detect transaction ValStmt")
+	}
+	// ExprStmt with non-transaction call
+	block3 := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.CallExpr{
+			Func: &ast.Ident{Name: "other"},
+		}},
+	}}
+	if bodyContainsTransaction(block3) {
+		t.Error("should not detect non-transaction")
+	}
+	// Non-ident func in call
+	block4 := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.CallExpr{
+			Func: &ast.MemberExpr{Object: &ast.Ident{Name: "x"}, Field: "transaction"},
+		}},
+	}}
+	if bodyContainsTransaction(block4) {
+		t.Error("member expr func should not match")
+	}
+	// ValStmt with non-call value
+	block5 := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ValStmt{Name: "x", Value: &ast.Ident{Name: "y"}},
+	}}
+	if bodyContainsTransaction(block5) {
+		t.Error("non-call val should not match")
+	}
+	// ValStmt with non-ident func
+	block6 := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ValStmt{Name: "x", Value: &ast.CallExpr{
+			Func: &ast.MemberExpr{Object: &ast.Ident{Name: "x"}, Field: "y"},
+		}},
+	}}
+	if bodyContainsTransaction(block6) {
+		t.Error("val with member func should not match")
+	}
+}
+
+func TestBodyContainsTemplateString(t *testing.T) {
+	if bodyContainsTemplateString(nil) {
+		t.Error("nil block should return false")
+	}
+	// ValStmt with TemplateString
+	block := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ValStmt{Name: "msg", Value: &ast.TemplateString{Parts: []ast.Expr{}}},
+	}}
+	if !bodyContainsTemplateString(block) {
+		t.Error("should detect template in val")
+	}
+	// ReturnStmt with TemplateString
+	block2 := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ReturnStmt{Value: &ast.TemplateString{Parts: []ast.Expr{}}},
+	}}
+	if !bodyContainsTemplateString(block2) {
+		t.Error("should detect template in return")
+	}
+	// ReturnStmt with nil value
+	block3 := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ReturnStmt{},
+	}}
+	if bodyContainsTemplateString(block3) {
+		t.Error("nil return value should not match")
+	}
+	// Non-matching stmt types
+	block4 := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.Ident{Name: "x"}},
+	}}
+	if bodyContainsTemplateString(block4) {
+		t.Error("non-matching should return false")
+	}
+}
+
+// --- inferParamType ---
+
+func TestInferParamType(t *testing.T) {
+	tests := []struct {
+		name string
+		want string
+	}{
+		{"id", "Int"},
+		{"userId", "Int"},
+		{"page", "Int"},
+		{"pageSize", "Int"},
+		{"limit", "Int"},
+		{"offset", "Int"},
+		{"priority", "Int"},
+		{"minutes", "Int"},
+		{"quantity", "Int"},
+		{"count", "Int"},
+		{"isActive", "Boolean"},
+		{"active", "Boolean"},
+		{"published", "Boolean"},
+		{"amount", "Float"},
+		{"price", "Float"},
+		{"balance", "Float"},
+		{"score", "Float"},
+		{"total", "Float"},
+		{"budget", "Float"},
+		{"name", "String"},
+		{"email", "String"},
+		{"unknown", "String"},
+	}
+	for _, tt := range tests {
+		if got := inferParamType(tt.name); got != tt.want {
+			t.Errorf("inferParamType(%q) = %q, want %q", tt.name, got, tt.want)
+		}
+	}
+}
+
+// --- resolveParamTypeFromAST ---
+
+func TestResolveParamTypeFromAST(t *testing.T) {
+	old := apiParamTypes
+	defer func() { apiParamTypes = old }()
+
+	// No AST data — falls back to heuristic
+	apiParamTypes = nil
+	if got := resolveParamTypeFromAST("getUser", "id"); got != "Int" {
+		t.Fatalf("fallback should use inferParamType, got %q", got)
+	}
+
+	// With AST data
+	apiParamTypes = map[string]map[string]string{
+		"getUser": {"id": "UUID"},
+	}
+	if got := resolveParamTypeFromAST("getUser", "id"); got != "UUID" {
+		t.Fatalf("should use AST type, got %q", got)
+	}
+	// Missing param in AST — fallback
+	if got := resolveParamTypeFromAST("getUser", "name"); got != "String" {
+		t.Fatalf("missing param should fallback, got %q", got)
+	}
+}
+
+// --- writeAPIRegistration ---
+
+func TestWriteAPIRegistration(t *testing.T) {
+	oldIDs := apiIDs
+	oldParamIDs := apiParamIDs
+	oldParamTypes := apiParamTypes
+	defer func() {
+		apiIDs = oldIDs
+		apiParamIDs = oldParamIDs
+		apiParamTypes = oldParamTypes
+	}()
+
+	// ID = 0 → early return
+	apiIDs = map[string]int{}
+	var b strings.Builder
+	writeAPIRegistration(&b, "noApi")
+	if b.Len() != 0 {
+		t.Error("zero ID should produce no output")
+	}
+
+	// With ID and params
+	apiIDs = map[string]int{"getUser": 5}
+	apiParamIDs = map[string]map[string]int{
+		"getUser": {"id": 1},
+	}
+	apiParamTypes = map[string]map[string]string{
+		"getUser": {"id": "Int"},
+	}
+	b.Reset()
+	writeAPIRegistration(&b, "getUser")
+	code := b.String()
+	if !strings.Contains(code, `Register("getUser", 5)`) {
+		t.Errorf("missing Register call:\n%s", code)
+	}
+	if !strings.Contains(code, `RegisterParams("getUser"`) {
+		t.Errorf("missing RegisterParams:\n%s", code)
+	}
+	if !strings.Contains(code, `"Int"`) {
+		t.Errorf("missing type Int:\n%s", code)
+	}
+}
+
+func TestWriteAPIRegistrationNoParams(t *testing.T) {
+	oldIDs := apiIDs
+	oldParamIDs := apiParamIDs
+	defer func() {
+		apiIDs = oldIDs
+		apiParamIDs = oldParamIDs
+	}()
+
+	apiIDs = map[string]int{"ping": 1}
+	apiParamIDs = nil
+
+	var b strings.Builder
+	writeAPIRegistration(&b, "ping")
+	code := b.String()
+	if !strings.Contains(code, `Register("ping", 1)`) {
+		t.Errorf("missing Register:\n%s", code)
+	}
+	if strings.Contains(code, "RegisterParams") {
+		t.Error("no params should skip RegisterParams")
+	}
+}
+
+// --- paramMethod ---
+
+func TestParamMethod(t *testing.T) {
+	tests := []struct {
+		goType string
+		want   string
+	}{
+		{"int64", "Int"},
+		{"float64", "Float"},
+		{"string", "String"},
+		{"time.Time", "DateTime"},
+		{"bool", "Bool"},
+		{"[]int64", "IntArray"},
+		{"[]string", "StringArray"},
+		{"CustomType", ""},
+		{"map[string]any", ""},
+	}
+	for _, tt := range tests {
+		if got := paramMethod(tt.goType); got != tt.want {
+			t.Errorf("paramMethod(%q) = %q, want %q", tt.goType, got, tt.want)
+		}
+	}
+}
+
 // TestGenerateCompiledHandlers covers the compiled-handler path where api.Body != nil
 // and @native is not set, exercising generateCompiledHandlers lines 91-94.
 func TestGenerateCompiledHandlers(t *testing.T) {

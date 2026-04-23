@@ -694,3 +694,106 @@ func TestIsSoftDeleteExported(t *testing.T) {
 		t.Error("IsSoftDelete should return false without @soft")
 	}
 }
+
+// --- Lock ID functions ---
+
+func TestSetAndGetModelFieldIDs(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"User": {"id": 1, "name": 2},
+	})
+	if got := getModelFieldID("User", "id"); got != 1 {
+		t.Fatalf("want 1, got %d", got)
+	}
+	if got := getModelFieldID("User", "name"); got != 2 {
+		t.Fatalf("want 2, got %d", got)
+	}
+	if got := getModelFieldID("User", "missing"); got != 0 {
+		t.Fatalf("want 0 for missing field, got %d", got)
+	}
+	if got := getModelFieldID("NoModel", "id"); got != 0 {
+		t.Fatalf("want 0 for missing model, got %d", got)
+	}
+}
+
+func TestSetAndGetEventFieldIDs(t *testing.T) {
+	old := eventFieldIDs
+	defer func() { eventFieldIDs = old }()
+
+	SetEventFieldIDs(map[string]map[string]int{
+		"OrderCreated": {"orderId": 1, "userId": 2},
+	})
+	if got := getEventFieldID("OrderCreated", "orderId"); got != 1 {
+		t.Fatalf("want 1, got %d", got)
+	}
+	if got := getEventFieldID("OrderCreated", "missing"); got != 0 {
+		t.Fatalf("want 0, got %d", got)
+	}
+	if got := getEventFieldID("NoEvent", "orderId"); got != 0 {
+		t.Fatalf("want 0, got %d", got)
+	}
+}
+
+func TestSetAndGetAPIIDs(t *testing.T) {
+	old := apiIDs
+	defer func() { apiIDs = old }()
+
+	SetAPIIDs(map[string]int{"getUser": 1, "listUsers": 2})
+	if got := getAPIID("getUser"); got != 1 {
+		t.Fatalf("want 1, got %d", got)
+	}
+	if got := getAPIID("missing"); got != 0 {
+		t.Fatalf("want 0, got %d", got)
+	}
+}
+
+func TestSetAndGetAPIParamIDs(t *testing.T) {
+	old := apiParamIDs
+	defer func() { apiParamIDs = old }()
+
+	SetAPIParamIDs(map[string]map[string]int{
+		"getUser": {"id": 1},
+	})
+	got := getAPIParamIDs("getUser")
+	if got == nil || got["id"] != 1 {
+		t.Fatalf("want {id:1}, got %v", got)
+	}
+	if got := getAPIParamIDs("missing"); got != nil {
+		t.Fatalf("want nil, got %v", got)
+	}
+}
+
+func TestSetAPIParamTypes(t *testing.T) {
+	old := apiParamTypes
+	defer func() { apiParamTypes = old }()
+
+	SetAPIParamTypes(map[string]map[string]string{
+		"getUser": {"id": "Int"},
+	})
+	if apiParamTypes["getUser"]["id"] != "Int" {
+		t.Fatal("SetAPIParamTypes not set correctly")
+	}
+}
+
+func TestDriverImportAndPkg(t *testing.T) {
+	tests := []struct {
+		d          DBDriver
+		wantPkg    string
+		wantImport string
+	}{
+		{DriverPG, "pg", "github.com/light-speak/luxo/pkg/lux/pg"},
+		{DriverMySQL, "mysql", "github.com/light-speak/luxo/pkg/lux/mysql"},
+		{DriverSQLite, "sqlite", "github.com/light-speak/luxo/pkg/lux/sqlite"},
+		{DriverMongo, "mongo", "github.com/light-speak/luxo/pkg/lux/mongo"},
+	}
+	for _, tt := range tests {
+		if got := tt.d.DriverPkg(); got != tt.wantPkg {
+			t.Errorf("%s.DriverPkg() = %q, want %q", tt.d, got, tt.wantPkg)
+		}
+		if got := tt.d.DriverImport(); got != tt.wantImport {
+			t.Errorf("%s.DriverImport() = %q, want %q", tt.d, got, tt.wantImport)
+		}
+	}
+}
