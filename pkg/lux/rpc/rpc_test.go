@@ -736,3 +736,291 @@ func TestPoolGetAfterClose(t *testing.T) {
 		t.Fatal("Get after Close should return error")
 	}
 }
+
+// --- Pool: Put with nil conn ---
+
+func TestPoolPutNil(t *testing.T) {
+	pool := NewPool("127.0.0.1:1234", 2)
+	defer pool.Close()
+	// Should not panic
+	pool.Put(nil)
+}
+
+// --- Pool: Put after Close ---
+
+func TestPoolPutAfterClose(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, e := ln.Accept()
+			if e != nil {
+				return
+			}
+			_ = c
+		}
+	}()
+
+	pool := NewPool(ln.Addr().String(), 2)
+	conn, err := pool.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.Close()
+	// Put after close should close the conn, not panic
+	pool.Put(conn)
+}
+
+// --- Pool: GetContext with cancelled context ---
+
+func TestPoolGetContextCancelled(t *testing.T) {
+	pool := NewPool("127.0.0.1:1", 2) // unreachable
+	defer pool.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+	_, err := pool.GetContext(ctx)
+	if err == nil {
+		t.Fatal("GetContext with cancelled context should error")
+	}
+}
+
+// --- Pool: GetContext with closed pool ---
+
+func TestPoolGetContextClosed(t *testing.T) {
+	pool := NewPool("127.0.0.1:1234", 2)
+	pool.Close()
+	_, err := pool.GetContext(context.Background())
+	if err == nil {
+		t.Fatal("GetContext on closed pool should error")
+	}
+}
+
+// --- Server: handler returns AppError (via processRequest directly) ---
+
+func TestServerProcessRequestAppError(t *testing.T) {
+	rt := api.NewRouter()
+	rt.Handle("fail", func(ctx context.Context, req *api.Request) error {
+		return &luxerrors.AppError{Code: 403, Name: "Forbidden", Message: "no access"}
+	})
+	rt.Registry.Register("fail", 1)
+	rt.Registry.RegisterParams("fail", nil)
+
+	srv := NewServer(rt)
+	var payload []byte
+	payload = codec.AppendVarint(payload, 1) // API ID
+	payload = codec.AppendVarint(payload, 0) // mask len
+	payload = append(payload, 0x00)          // params terminator
+
+	resp := srv.processRequest(payload)
+	if resp[0] != statusError {
+		t.Fatal("should return error status")
+	}
+	// Decode error
+	dec := codec.NewDecoder(resp[1:])
+	var errCode int64
+	var errName string
+	for dec.NextField() {
+		switch dec.FieldID() {
+		case 1:
+			errCode = dec.ReadInt()
+		case 2:
+			errName = dec.ReadString()
+		}
+	}
+	if errCode != 403 || errName != "Forbidden" {
+		t.Fatalf("error code=%d name=%s", errCode, errName)
+	}
+}
+
+// --- Server: handler panics (via processRequest directly) ---
+
+func TestServerProcessRequestHandlerPanic(t *testing.T) {
+	rt := api.NewRouter()
+	rt.Handle("boom", func(ctx context.Context, req *api.Request) error {
+		panic("kaboom")
+	})
+	rt.Registry.Register("boom", 1)
+	rt.Registry.RegisterParams("boom", nil)
+
+	srv := NewServer(rt)
+	var payload []byte
+	payload = codec.AppendVarint(payload, 1)
+	payload = codec.AppendVarint(payload, 0)
+	payload = append(payload, 0x00)
+
+	resp := srv.processRequest(payload)
+	if resp[0] != statusError {
+		t.Fatal("panic should return error status")
+	}
+}
+
+// --- Server: invalid frame then disconnect ---
+
+func TestServerInvalidFrameDisconnect(t *testing.T) {
+	rt := api.NewRouter()
+	rt.Handle("ping", func(ctx context.Context, req *api.Request) error {
+		req.Buf.B = append(req.Buf.B, 0x00)
+		return nil
+	})
+	rt.Registry.Register("ping", 1)
+	rt.Registry.RegisterParams("ping", nil)
+
+	srv := NewServer(rt)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.listener = ln
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			srv.wg.Add(1)
+			go srv.handleConn(conn)
+		}
+	}()
+	defer func() {
+		srv.Close()
+		ln.Close()
+	}()
+
+	// Send garbage data then close
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Write([]byte{0xFF, 0xFF}) // invalid frame header
+	conn.Close()
+
+	time.Sleep(50 * time.Millisecond) // let server process
+}
+
+// --- Client: CallWithMask — server returns error status ---
+
+func TestClientCallWithMaskServerError(t *testing.T) {
+	rt := api.NewRouter()
+	rt.Handle("err", func(ctx context.Context, req *api.Request) error {
+		return fmt.Errorf("internal failure")
+	})
+	rt.Registry.Register("err", 1)
+	rt.Registry.RegisterParams("err", nil)
+
+	srv := NewServer(rt)
+	go srv.ListenAndServe("127.0.0.1:19892")
+	time.Sleep(100 * time.Millisecond)
+	defer srv.Close()
+
+	client := NewClient("127.0.0.1:19892")
+	defer client.Close()
+
+	_, err := client.CallWithMask(1, nil, nil)
+	if err == nil {
+		t.Fatal("should get error from server")
+	}
+	if !bytes.Contains([]byte(err.Error()), []byte("internal failure")) {
+		t.Fatalf("error should contain message, got: %v", err)
+	}
+}
+
+// --- Server: truncated Float/String/Boolean params ---
+
+func TestRPCTruncatedFloatParam(t *testing.T) {
+	rt := api.NewRouter()
+	rt.Handle("calc", func(ctx context.Context, req *api.Request) error {
+		return nil
+	})
+	rt.Registry.Register("calc", 1)
+	rt.Registry.RegisterParams("calc", []api.ParamMeta{
+		{Name: "amount", Type: "Float", FieldID: 1},
+	})
+
+	srv := NewServer(rt)
+	// API ID=1, mask=0, param fieldID=1, then truncated (no 8 bytes for float)
+	var payload []byte
+	payload = codec.AppendVarint(payload, 1)
+	payload = codec.AppendVarint(payload, 0)
+	payload = codec.AppendVarint(payload, 1) // param fieldID
+	payload = append(payload, 0x01, 0x02)    // only 2 bytes, need 8
+
+	resp := srv.processRequest(payload)
+	if resp[0] != statusError {
+		t.Fatal("truncated float should return error")
+	}
+}
+
+func TestRPCTruncatedStringParam(t *testing.T) {
+	rt := api.NewRouter()
+	rt.Handle("search", func(ctx context.Context, req *api.Request) error {
+		return nil
+	})
+	rt.Registry.Register("search", 1)
+	rt.Registry.RegisterParams("search", []api.ParamMeta{
+		{Name: "query", Type: "String", FieldID: 1},
+	})
+
+	srv := NewServer(rt)
+	var payload []byte
+	payload = codec.AppendVarint(payload, 1)
+	payload = codec.AppendVarint(payload, 0)
+	payload = codec.AppendVarint(payload, 1) // param fieldID
+	// String length says 100 but no data follows
+	payload = codec.AppendVarint(payload, 100)
+
+	resp := srv.processRequest(payload)
+	if resp[0] != statusError {
+		t.Fatal("truncated string should return error")
+	}
+}
+
+func TestRPCTruncatedBoolParam(t *testing.T) {
+	rt := api.NewRouter()
+	rt.Handle("toggle", func(ctx context.Context, req *api.Request) error {
+		return nil
+	})
+	rt.Registry.Register("toggle", 1)
+	rt.Registry.RegisterParams("toggle", []api.ParamMeta{
+		{Name: "flag", Type: "Boolean", FieldID: 1},
+	})
+
+	srv := NewServer(rt)
+	var payload []byte
+	payload = codec.AppendVarint(payload, 1)
+	payload = codec.AppendVarint(payload, 0)
+	payload = codec.AppendVarint(payload, 1) // param fieldID
+	// No bool byte follows
+
+	resp := srv.processRequest(payload)
+	if resp[0] != statusError {
+		t.Fatal("truncated bool should return error")
+	}
+}
+
+// --- Server: unknown param field ID ---
+
+func TestRPCUnknownParamFieldID(t *testing.T) {
+	rt := api.NewRouter()
+	rt.Handle("test", func(ctx context.Context, req *api.Request) error {
+		return nil
+	})
+	rt.Registry.Register("test", 1)
+	rt.Registry.RegisterParams("test", []api.ParamMeta{
+		{Name: "id", Type: "Int", FieldID: 1},
+	})
+
+	srv := NewServer(rt)
+	var payload []byte
+	payload = codec.AppendVarint(payload, 1)  // API ID
+	payload = codec.AppendVarint(payload, 0)  // mask len
+	payload = codec.AppendVarint(payload, 99) // unknown param field ID
+
+	resp := srv.processRequest(payload)
+	if resp[0] != statusError {
+		t.Fatal("unknown param field ID should return error")
+	}
+}

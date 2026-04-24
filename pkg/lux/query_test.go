@@ -256,3 +256,63 @@ func TestBuildUpdateSQLManyFields(t *testing.T) {
 		t.Errorf("args len = %d, want 4", len(args))
 	}
 }
+
+func TestBuildAggregateSQLSimple(t *testing.T) {
+	sql, args := BuildAggregateSQL("orders", "SUM", "amount", nil)
+	want := "SELECT COALESCE(SUM(amount), 0) FROM orders"
+	if sql != want {
+		t.Errorf("SQL = %q, want %q", sql, want)
+	}
+	if len(args) != 0 {
+		t.Errorf("args len = %d, want 0", len(args))
+	}
+}
+
+func TestBuildAggregateSQLWithConditions(t *testing.T) {
+	conds := []Condition{NewStringField("status").Eq("paid")}
+	sql, args := BuildAggregateSQL("orders", "AVG", "total", conds)
+	want := "SELECT COALESCE(AVG(total), 0) FROM orders WHERE status = $1"
+	if sql != want {
+		t.Errorf("SQL = %q, want %q", sql, want)
+	}
+	if len(args) != 1 || args[0] != "paid" {
+		t.Errorf("args = %v", args)
+	}
+}
+
+func TestIntRangeNormal(t *testing.T) {
+	got := IntRange(1, 5)
+	if len(got) != 5 || got[0] != 1 || got[4] != 5 {
+		t.Errorf("IntRange(1,5) = %v", got)
+	}
+}
+
+func TestIntRangeInverted(t *testing.T) {
+	got := IntRange(5, 1)
+	if got != nil {
+		t.Errorf("IntRange(5,1) should return nil, got %v", got)
+	}
+}
+
+func TestIntRangeSingle(t *testing.T) {
+	got := IntRange(3, 3)
+	if len(got) != 1 || got[0] != 3 {
+		t.Errorf("IntRange(3,3) = %v", got)
+	}
+}
+
+func TestBuildUpdateSQLAtomic(t *testing.T) {
+	sets := []SetField{
+		{Col: "counter", Val: 1, Atomic: "+"},
+		{Col: "name", Val: "alice"},
+	}
+	conds := []Condition{NewIntField("id").Eq(1)}
+	sql, args := BuildUpdateSQL("users", sets, conds)
+	want := "UPDATE users SET counter = counter + $1, name = $2 WHERE id = $3"
+	if sql != want {
+		t.Errorf("SQL = %q, want %q", sql, want)
+	}
+	if len(args) != 3 {
+		t.Errorf("args len = %d, want 3", len(args))
+	}
+}

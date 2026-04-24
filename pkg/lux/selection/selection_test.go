@@ -396,3 +396,21 @@ func TestSQLColumnsOnlyRelations(t *testing.T) {
 		t.Errorf("only-relation fields should return nil (SELECT *), got %v", cols)
 	}
 }
+
+func TestSQLColumnsOrWithSelect(t *testing.T) {
+	fields := []*Field{{Name: "id"}, {Name: "name"}}
+	fallback := []string{"id", "name", "email"}
+	got := SQLColumnsOr(fields, fallback)
+	// Should use SQLColumns result, not fallback
+	if len(got) != 2 {
+		t.Fatalf("expected 2 cols from SQLColumns, got %d: %v", len(got), got)
+	}
+}
+
+func TestSQLColumnsOrWithoutSelect(t *testing.T) {
+	fallback := []string{"id", "name", "email"}
+	got := SQLColumnsOr(nil, fallback)
+	if len(got) != 3 || got[2] != "email" {
+		t.Fatalf("expected fallback cols, got %v", got)
+	}
+}

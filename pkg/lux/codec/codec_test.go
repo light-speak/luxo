@@ -1156,6 +1156,62 @@ func TestFieldMaskAllZero(t *testing.T) {
 	}
 }
 
+// --- Columnar: NextColumn with id==0 (end marker) ---
+
+func TestColumnarReaderNextColumnEndMarker(t *testing.T) {
+	// Build minimal columnar: count=1, then field ID=0 (end marker)
+	var buf []byte
+	buf = AppendVarint(buf, 1) // count=1
+	buf = AppendVarint(buf, 0) // field ID=0 → end
+	r := NewColumnarReader(buf)
+	if r.NextColumn() {
+		t.Fatal("field ID 0 should signal end of columns")
+	}
+}
+
+// --- Columnar: ReadColumnIntPtr truncated value after present ---
+
+func TestColumnarReaderIntPtrTruncatedValue(t *testing.T) {
+	// count=1, write present marker (0x01) but no int value after
+	var buf []byte
+	buf = AppendVarint(buf, 1) // count=1
+	buf = AppendVarint(buf, 1) // field ID=1
+	buf = AppendPresent(buf)   // present marker
+	// No int value follows → truncated
+
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	vals := r.ReadColumnIntPtr()
+	if vals != nil {
+		t.Fatal("should return nil on truncated int value")
+	}
+	if r.Err() == nil {
+		t.Fatal("should set error on truncated int value")
+	}
+}
+
+// --- Columnar: ReadColumnStringPtr truncated value after present ---
+
+func TestColumnarReaderStringPtrTruncatedValue(t *testing.T) {
+	// count=1, write present marker but string length says 100, no data
+	var buf []byte
+	buf = AppendVarint(buf, 1) // count=1
+	buf = AppendVarint(buf, 1) // field ID=1
+	buf = AppendPresent(buf)   // present marker
+	// String length says 100 but no data
+	buf = AppendVarint(buf, 100)
+
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	vals := r.ReadColumnStringPtr()
+	if vals != nil {
+		t.Fatal("should return nil on truncated string value")
+	}
+	if r.Err() == nil {
+		t.Fatal("should set error on truncated string value")
+	}
+}
+
 func BenchmarkRowWrite10(b *testing.B) {
 	type user struct {
 		id    int64

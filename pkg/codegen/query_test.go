@@ -539,3 +539,34 @@ func TestGenerateQueryBuilderSoftWithExistingDeletedAt(t *testing.T) {
 		t.Errorf("expected at least 3 occurrences of deleted_at, got %d:\n%s", count, got)
 	}
 }
+
+func TestGenerateExtendQueryBuilderFiltersRelations(t *testing.T) {
+	ext := &ast.ExtendDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			// Relation field (capitalized non-primitive) — should be skipped
+			{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+			// Single model relation — should be skipped
+			{Name: "profile", Type: &ast.TypeRef{Name: "Profile"}},
+			// Computed field — should be skipped
+			{Name: "fullName", Type: &ast.TypeRef{Name: "String"}, Computed: &ast.ComputedField{}},
+		},
+	}
+	var b strings.Builder
+	generateExtendQueryBuilder(&b, ext)
+	got := b.String()
+
+	// Should have id and name
+	if !strings.Contains(got, `"id"`) || !strings.Contains(got, `"name"`) {
+		t.Fatalf("should include primitive fields, got:\n%s", got)
+	}
+	// Should NOT have posts or profile as DB columns
+	if strings.Contains(got, `"posts"`) {
+		t.Fatalf("should not include list relation field 'posts', got:\n%s", got)
+	}
+	if strings.Contains(got, `"profile"`) {
+		t.Fatalf("should not include single relation field 'profile', got:\n%s", got)
+	}
+}

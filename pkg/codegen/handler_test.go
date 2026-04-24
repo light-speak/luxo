@@ -1662,3 +1662,142 @@ func TestGenerateCompiledHandlers(t *testing.T) {
 		t.Errorf("compiled API should be registered:\n%s", code)
 	}
 }
+
+// ─── generateParamSet: nullable enum ────────────────────────────────────────
+
+func TestGenerateParamSetNullableEnum(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name: "role",
+		Type: &ast.TypeRef{Name: "Role", Nullable: true},
+	}
+	enums := map[string]bool{"Role": true}
+	generateParamSet(&b, f, "SetRole", "\t\t", enums)
+	out := b.String()
+	if !strings.Contains(out, "ParamString") {
+		t.Fatalf("nullable enum should use ParamString, got:\n%s", out)
+	}
+	if !strings.Contains(out, "roleValEnum") {
+		t.Fatalf("nullable enum should create enum tmp var, got:\n%s", out)
+	}
+	if !strings.Contains(out, "&roleValEnum") {
+		t.Fatalf("nullable enum should take pointer, got:\n%s", out)
+	}
+}
+
+// ─── generateParamSet: custom JSON type ─────────────────────────────────────
+
+func TestGenerateParamSetCustomType(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name: "metadata",
+		Type: &ast.TypeRef{Name: "JSON"},
+	}
+	generateParamSet(&b, f, "SetMetadata", "\t\t", nil)
+	out := b.String()
+	if !strings.Contains(out, "ParamJSON") {
+		t.Fatalf("custom type should use ParamJSON, got:\n%s", out)
+	}
+}
+
+// ─── writeHandlerImports: all features enabled ──────────────────────────────
+
+func TestWriteHandlerImportsAllFeatures(t *testing.T) {
+	var b strings.Builder
+	models := []*ast.ModelDecl{
+		{
+			Name: "User",
+			Fields: []*ast.FieldDecl{
+				{Name: "password", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hash"}}},
+			},
+		},
+	}
+	writeHandlerImports(&b, models, true, true, true, true, true, true, nil)
+	out := b.String()
+	if !strings.Contains(out, `"strconv"`) {
+		t.Fatalf("hasOrGroups should add strconv import, got:\n%s", out)
+	}
+	if !strings.Contains(out, `"strings"`) {
+		t.Fatalf("hasSortable should add strings import, got:\n%s", out)
+	}
+	if !strings.Contains(out, "errgroup") {
+		t.Fatalf("hasAwait should add errgroup import, got:\n%s", out)
+	}
+	if !strings.Contains(out, "luvia") {
+		t.Fatalf("hasAuth should add luvia import, got:\n%s", out)
+	}
+	if !strings.Contains(out, "luxocrypto") {
+		t.Fatalf("hash model should add luxocrypto import, got:\n%s", out)
+	}
+}
+
+// ─── writeHandlerImports: hash field in allModels (not in CRUD models) ──────
+
+func TestWriteHandlerImportsHashInAllModels(t *testing.T) {
+	var b strings.Builder
+	allModels := map[string]*ast.ModelDecl{
+		"User": {
+			Name: "User",
+			Fields: []*ast.FieldDecl{
+				{Name: "password", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hash"}}},
+			},
+		},
+	}
+	// No CRUD models with hash, but allModels has one
+	writeHandlerImports(&b, nil, false, false, false, false, false, false, allModels)
+	out := b.String()
+	if !strings.Contains(out, "luxocrypto") {
+		t.Fatalf("allModels hash should add luxocrypto import, got:\n%s", out)
+	}
+}
+
+// ─── detectHandlerFeatures: sortable field ──────────────────────────────────
+
+func TestDetectHandlerFeaturesSortable(t *testing.T) {
+	models := []*ast.ModelDecl{
+		{
+			Name: "Post",
+			Fields: []*ast.FieldDecl{
+				{Name: "title", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "sortable"}}},
+			},
+		},
+	}
+	f := detectHandlerFeatures(&semantic.Result{}, models, nil, nil)
+	if !f.hasSortable {
+		t.Fatal("should detect sortable field")
+	}
+}
+
+// ─── detectHandlerFeatures: withAuth on model ───────────────────────────────
+
+func TestDetectHandlerFeaturesWithAuth(t *testing.T) {
+	models := []*ast.ModelDecl{
+		{
+			Name:       "User",
+			Directives: []*ast.Directive{{Name: "withAuth"}},
+		},
+	}
+	f := detectHandlerFeatures(&semantic.Result{}, models, nil, nil)
+	if !f.hasAuth {
+		t.Fatal("should detect withAuth")
+	}
+}
+
+// ─── writeFKEnsure: dedup and snake_case ────────────────────────────────────
+
+func TestWriteFKEnsureDedupe(t *testing.T) {
+	var b strings.Builder
+	rels := []Relation{
+		{LocalKey: "userId"},
+		{LocalKey: "userId"}, // duplicate
+		{LocalKey: "postId"},
+	}
+	writeFKEnsure(&b, rels)
+	out := b.String()
+	if strings.Count(out, "user_id") != 1 {
+		t.Fatalf("should dedupe user_id, got:\n%s", out)
+	}
+	if !strings.Contains(out, "post_id") {
+		t.Fatalf("should include post_id, got:\n%s", out)
+	}
+}

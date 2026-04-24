@@ -486,6 +486,134 @@ func TestExportHandlers(t *testing.T) {
 	}
 }
 
+// --- ParseBinaryRequest: truncated Float param ---
+
+func TestParseBinaryRequestTruncatedFloat(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("calc", 1)
+	reg.RegisterParams("calc", []ParamMeta{
+		{Name: "amount", Type: "Float", FieldID: 1},
+	})
+	// API ID=1, mask=0, param field ID=1, then only 2 bytes (need 8 for float)
+	body := []byte{0x01, 0x00, 0x01, 0xAA, 0xBB}
+	_, err := reg.ParseBinaryRequest(body)
+	if err == nil {
+		t.Fatal("should error on truncated float param")
+	}
+}
+
+// --- ParseBinaryRequest: truncated String param ---
+
+func TestParseBinaryRequestTruncatedString(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("search", 1)
+	reg.RegisterParams("search", []ParamMeta{
+		{Name: "query", Type: "String", FieldID: 1},
+	})
+	// API ID=1, mask=0, param field ID=1, string len=100 but no data
+	var body []byte
+	body = append(body, 0x01, 0x00, 0x01) // api, mask, param field
+	body = append(body, 0x64)             // string length=100
+	_, err := reg.ParseBinaryRequest(body)
+	if err == nil {
+		t.Fatal("should error on truncated string param")
+	}
+}
+
+// --- ParseBinaryRequest: truncated Boolean param ---
+
+func TestParseBinaryRequestTruncatedBool(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("toggle", 1)
+	reg.RegisterParams("toggle", []ParamMeta{
+		{Name: "active", Type: "Boolean", FieldID: 1},
+	})
+	// API ID=1, mask=0, param field ID=1, no bool byte
+	body := []byte{0x01, 0x00, 0x01}
+	_, err := reg.ParseBinaryRequest(body)
+	if err == nil {
+		t.Fatal("should error on truncated bool param")
+	}
+}
+
+// --- ParseBinaryRequest: field mask exceeds body ---
+
+func TestParseBinaryRequestFieldMaskExceedsBody(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("test", 1)
+	// API ID=1, mask length=5 but only 2 bytes remaining
+	body := []byte{0x01, 0x05, 0xAA, 0xBB}
+	_, err := reg.ParseBinaryRequest(body)
+	if err == nil {
+		t.Fatal("should error when field mask exceeds body")
+	}
+}
+
+// --- ParseBinaryRequest: with actual field mask ---
+
+func TestParseBinaryRequestWithFieldMask(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("getUser", 1)
+	reg.RegisterParams("getUser", []ParamMeta{
+		{Name: "id", Type: "Int", FieldID: 1},
+	})
+	// Build: API ID=1, mask length=1, mask=[0xFF], params
+	var body []byte
+	body = append(body, 0x01) // API ID=1
+	body = append(body, 0x01) // mask length=1
+	body = append(body, 0xFF) // mask byte
+	body = append(body, 0x01) // param field ID=1
+	body = append(body, 0x54) // svarint 42 (zigzag: 84 = 0x54)
+	body = append(body, 0x00) // terminator
+
+	req, err := reg.ParseBinaryRequest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !req.BinaryMode {
+		t.Fatal("should be binary mode")
+	}
+	if len(req.FieldMask) != 1 {
+		t.Fatalf("field mask should be 1 byte, got %d", len(req.FieldMask))
+	}
+}
+
+// --- EncodeBinaryRequest: int type coercion ---
+
+func TestEncodeBinaryRequestIntCoercion(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("test", 1)
+	meta := []ParamMeta{
+		{Name: "id", Type: "Int", FieldID: 1},
+	}
+	reg.RegisterParams("test", meta)
+
+	// Test with plain int (not int64)
+	body := EncodeBinaryRequest(1, map[string]any{"id": 42}, meta)
+	req, err := reg.ParseBinaryRequest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := req.ParamInt("id")
+	if id != 42 {
+		t.Fatalf("id = %d, want 42", id)
+	}
+}
+
+// --- EncodeBinaryRequest: missing param skipped ---
+
+func TestEncodeBinaryRequestMissingParam(t *testing.T) {
+	meta := []ParamMeta{
+		{Name: "id", Type: "Int", FieldID: 1},
+		{Name: "name", Type: "String", FieldID: 2},
+	}
+	// Only provide "id", not "name"
+	body := EncodeBinaryRequest(1, map[string]any{"id": int64(1)}, meta)
+	if len(body) == 0 {
+		t.Fatal("should produce encoded body")
+	}
+}
+
 func TestEncodeBinaryRequestFloat(t *testing.T) {
 	reg := NewAPIRegistry()
 	reg.Register("calc", 1)
