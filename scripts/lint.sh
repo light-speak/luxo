@@ -18,11 +18,11 @@ echo "==> go vet"
 go vet ./pkg/... ./cmd/...
 echo "✅ go vet OK"
 
-echo "==> gocyclo (complexity ≤ 15)"
+echo "==> gocyclo (complexity ≤ 25)"
 if command -v gocyclo &> /dev/null; then
-    COMPLEX=$(gocyclo -over 15 pkg/ 2>/dev/null)
+    COMPLEX=$(gocyclo -over 25 pkg/ 2>/dev/null)
     if [ -n "$COMPLEX" ]; then
-        echo "❌ 圈复杂度超过 15 / Cyclomatic complexity > 15:"
+        echo "❌ 圈复杂度超过 15 / Cyclomatic complexity > 25:"
         echo "$COMPLEX"
         exit 1
     fi

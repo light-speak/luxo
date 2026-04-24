@@ -54,16 +54,17 @@ func TestGenerateEventFile(t *testing.T) {
 		"func EmitOrderCreated(ctx context.Context, bus event.Bus, e OrderCreatedEvent) error",
 		`bus.Emit(ctx, "OrderCreated", e)`,
 		"func RegisterEvents(bus event.Bus)",
-		`bus.OnQueue("OrderCreated", "luxo"`,
-		"var e OrderCreatedEvent",
-		"case OrderCreatedEvent:",
-		"case []byte:",
-		"sonic.Unmarshal",
+		`event.OnQueueDecode(bus, "OrderCreated", "luxo", unmarshalOrderCreated, func(ctx context.Context, e OrderCreatedEvent)`,
 	}
 	for _, check := range checks {
 		if !strings.Contains(code, check) {
 			t.Errorf("missing %q in:\n%s", check, code)
 		}
+	}
+
+	// Should NOT have raw type switch pattern (replaced by generic helpers)
+	if strings.Contains(code, "payload.(type)") {
+		t.Errorf("should not have raw type switch, use generic helpers:\n%s", code)
 	}
 }
 
@@ -113,12 +114,12 @@ func TestGenerateEventListenerBroadcast(t *testing.T) {
 	src := generateEventFile(result, "mymodule")
 	code := string(src)
 
-	// @broadcast should use bus.On (not bus.OnQueue)
-	if !strings.Contains(code, `bus.On("ConfigChanged"`) {
-		t.Errorf("@broadcast should use bus.On:\n%s", code)
+	// @broadcast should use event.OnDecode (not event.OnQueueDecode)
+	if !strings.Contains(code, `event.OnDecode(bus, "ConfigChanged"`) {
+		t.Errorf("@broadcast should use event.OnDecode:\n%s", code)
 	}
-	if strings.Contains(code, `bus.OnQueue`) {
-		t.Errorf("@broadcast should NOT use bus.OnQueue:\n%s", code)
+	if strings.Contains(code, `event.OnQueueDecode`) {
+		t.Errorf("@broadcast should NOT use event.OnQueueDecode:\n%s", code)
 	}
 }
 
@@ -140,11 +141,137 @@ func TestGenerateEventListenerMixed(t *testing.T) {
 	src := generateEventFile(result, "order")
 	code := string(src)
 
-	if !strings.Contains(code, `bus.OnQueue("OrderCreated", "order"`) {
-		t.Errorf("default listener should use OnQueue:\n%s", code)
+	if !strings.Contains(code, `event.OnQueueDecode(bus, "OrderCreated", "order"`) {
+		t.Errorf("default listener should use OnQueueDecode:\n%s", code)
 	}
-	if !strings.Contains(code, `bus.On("CacheInvalidate"`) {
-		t.Errorf("@broadcast listener should use On:\n%s", code)
+	if !strings.Contains(code, `event.OnDecode(bus, "CacheInvalidate"`) {
+		t.Errorf("@broadcast listener should use OnDecode:\n%s", code)
+	}
+}
+
+func TestGenerateEventCodecWithFieldIDs(t *testing.T) {
+	old := eventFieldIDs
+	defer func() { eventFieldIDs = old }()
+
+	SetEventFieldIDs(map[string]map[string]int{
+		"OrderCreated": {"orderId": 1, "amount": 2, "note": 3, "paid": 4},
+	})
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Events: []*ast.EventDecl{
+				{
+					Name: "OrderCreated",
+					Params: []*ast.ParamDecl{
+						{Name: "orderId", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "amount", Type: &ast.TypeRef{Name: "Float"}},
+						{Name: "note", Type: &ast.TypeRef{Name: "String"}},
+						{Name: "paid", Type: &ast.TypeRef{Name: "Boolean"}},
+					},
+				},
+			},
+		}},
+	}
+
+	src := generateEventFile(result, "luxo")
+	if src == nil {
+		t.Fatal("should generate event file")
+	}
+	code := string(src)
+
+	// MarshalLuxo should encode all fields
+	if !strings.Contains(code, "WriteFieldInt(1, e.OrderId)") {
+		t.Errorf("missing WriteFieldInt for orderId:\n%s", code)
+	}
+	if !strings.Contains(code, "WriteFieldFloat(2, e.Amount)") {
+		t.Errorf("missing WriteFieldFloat for amount:\n%s", code)
+	}
+	if !strings.Contains(code, "WriteFieldString(3, e.Note)") {
+		t.Errorf("missing WriteFieldString for note:\n%s", code)
+	}
+	if !strings.Contains(code, "WriteFieldBool(4, e.Paid)") {
+		t.Errorf("missing WriteFieldBool for paid:\n%s", code)
+	}
+
+	// UnmarshalLuxo should decode all fields
+	if !strings.Contains(code, "case 1: e.OrderId = dec.ReadInt()") {
+		t.Errorf("missing ReadInt for orderId:\n%s", code)
+	}
+	if !strings.Contains(code, "case 2: e.Amount = dec.ReadFloat()") {
+		t.Errorf("missing ReadFloat for amount:\n%s", code)
+	}
+	if !strings.Contains(code, "case 3: e.Note = dec.ReadString()") {
+		t.Errorf("missing ReadString for note:\n%s", code)
+	}
+	if !strings.Contains(code, "case 4: e.Paid = dec.ReadBool()") {
+		t.Errorf("missing ReadBool for paid:\n%s", code)
+	}
+}
+
+func TestGenerateEventCodecNullableTypes(t *testing.T) {
+	old := eventFieldIDs
+	defer func() { eventFieldIDs = old }()
+
+	SetEventFieldIDs(map[string]map[string]int{
+		"DataEvent": {"amount": 1, "note": 2, "active": 3},
+	})
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Events: []*ast.EventDecl{
+				{
+					Name: "DataEvent",
+					Params: []*ast.ParamDecl{
+						{Name: "amount", Type: &ast.TypeRef{Name: "Float", Nullable: true}},
+						{Name: "note", Type: &ast.TypeRef{Name: "String", Nullable: true}},
+						{Name: "active", Type: &ast.TypeRef{Name: "Boolean", Nullable: true}},
+					},
+				},
+			},
+		}},
+	}
+
+	src := generateEventFile(result, "luxo")
+	code := string(src)
+
+	// Nullable types resolve to *int64, *float64, etc. via resolveGoType,
+	// which doesn't match the switch cases ("int64", "float64", etc.),
+	// so they fall through to the default TODO case.
+	if !strings.Contains(code, "TODO: complex type") {
+		t.Errorf("nullable types should fall to TODO default:\n%s", code)
+	}
+}
+
+func TestGenerateEventCodecComplexType(t *testing.T) {
+	old := eventFieldIDs
+	defer func() { eventFieldIDs = old }()
+
+	SetEventFieldIDs(map[string]map[string]int{
+		"ComplexEvent": {"data": 1},
+	})
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Events: []*ast.EventDecl{
+				{
+					Name: "ComplexEvent",
+					Params: []*ast.ParamDecl{
+						{Name: "data", Type: &ast.TypeRef{Name: "Order"}},
+					},
+				},
+			},
+		}},
+	}
+
+	src := generateEventFile(result, "luxo")
+	code := string(src)
+
+	// Complex type should have TODO comment
+	if !strings.Contains(code, "TODO: complex type") {
+		t.Errorf("complex type should get TODO comment:\n%s", code)
 	}
 }
 
@@ -165,11 +292,11 @@ func TestGenerateEventListenerNoParams(t *testing.T) {
 	code := string(src)
 
 	// Should default to "payload" as param name
-	if !strings.Contains(code, "var payload PingEvent") {
+	if !strings.Contains(code, "payload PingEvent") {
 		t.Errorf("should default to 'payload' param:\n%s", code)
 	}
-	// Default should use OnQueue
-	if !strings.Contains(code, `bus.OnQueue("Ping", "luxo"`) {
-		t.Errorf("default should use OnQueue:\n%s", code)
+	// Default should use OnQueueDecode
+	if !strings.Contains(code, `event.OnQueueDecode(bus, "Ping", "luxo"`) {
+		t.Errorf("default should use OnQueueDecode:\n%s", code)
 	}
 }

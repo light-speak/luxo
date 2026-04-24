@@ -120,6 +120,13 @@ func (a *Analyzer) analyzeInternal(files []*ast.File) *Result {
 		a.checkModuleVisibility()
 	}
 
+	// Pass 3.7: validate bare API names (after ALL model fields are resolved)
+	for _, file := range files {
+		for _, api := range file.APIs {
+			a.validateBareAPI(api)
+		}
+	}
+
 	// Pass 4: check api/fn bodies (expressions, statements)
 	for _, file := range files {
 		a.checkBodies(file)
@@ -580,7 +587,233 @@ func (a *Analyzer) resolveApiTypes(file *ast.File) {
 			a.resolveTypeRef(p.Type, api.Pos)
 		}
 		a.checkDirectives(api.Directives, OnApi)
+		a.validateNativeReturnType(api)
 		a.validateScopeDirective(api)
+	}
+}
+
+// validateBareAPI checks that APIs without body or @native have a valid inferred name.
+// Validates: action prefix + known model + valid field segments after By.
+func (a *Analyzer) validateBareAPI(api *ast.ApiDecl) {
+	if api.Body != nil || len(api.Params) > 0 || api.ReturnType != nil {
+		return
+	}
+	for _, d := range api.Directives {
+		if d.Name == "native" {
+			return
+		}
+	}
+
+	name := api.Name
+	rest, ok := extractActionPrefix(name)
+	if !ok {
+		a.addError(api.Pos, "inferred API '%s' must start with get/list/count/exists/delete + ModelName", name)
+		return
+	}
+
+	rest = stripTopFirstPrefix(rest)
+
+	modelName, modelType := a.findModelInName(rest)
+	if modelName == "" {
+		a.addError(api.Pos, "inferred API '%s' does not reference a known model", name)
+		return
+	}
+
+	a.validateAfterModel(api.Pos, name, rest[len(modelName):], modelType)
+}
+
+// extractActionPrefix extracts the rest after a valid action prefix.
+func extractActionPrefix(name string) (string, bool) {
+	for _, p := range []string{"list", "get", "count", "exists", "delete"} {
+		if strings.HasPrefix(name, p) && len(name) > len(p) {
+			return name[len(p):], true
+		}
+	}
+	return "", false
+}
+
+// stripTopFirstPrefix strips Top10/First5 prefixes from list actions.
+func stripTopFirstPrefix(rest string) string {
+	if strings.HasPrefix(rest, "Top") || strings.HasPrefix(rest, "First") {
+		i := 3
+		if strings.HasPrefix(rest, "First") {
+			i = 5
+		}
+		for i < len(rest) && rest[i] >= '0' && rest[i] <= '9' {
+			i++
+		}
+		return rest[i:]
+	}
+	return rest
+}
+
+// findModelInName finds the longest matching model name at the start of rest.
+func (a *Analyzer) findModelInName(rest string) (string, *ResolvedType) {
+	var bestName string
+	var bestType *ResolvedType
+	for mn, mt := range a.types {
+		if mt.Kind != TypeModel {
+			continue
+		}
+		plural := mn + "s"
+		if strings.HasPrefix(rest, plural) && len(plural) > len(bestName) {
+			bestName = plural
+			bestType = mt
+		} else if strings.HasPrefix(rest, mn) && len(mn) > len(bestName) {
+			bestName = mn
+			bestType = mt
+		}
+	}
+	return bestName, bestType
+}
+
+// validateAfterModel validates the part after the model name (By/OrderBy + fields).
+func (a *Analyzer) validateAfterModel(pos token.Position, apiName, afterModel string, modelType *ResolvedType) {
+	if afterModel == "" {
+		return // "listUsers" — valid
+	}
+	if strings.HasPrefix(afterModel, "OrderBy") {
+		return // "listUsersOrderByNameDesc" — valid
+	}
+	if !strings.HasPrefix(afterModel, "By") {
+		a.addError(pos, "inferred API '%s' — expected 'By' after model name", apiName)
+		return
+	}
+
+	afterBy := afterModel[2:]
+
+	// Strip trailing OrderBy... clause before field validation
+	if idx := strings.Index(afterBy, "OrderBy"); idx > 0 {
+		afterBy = afterBy[:idx]
+	}
+
+	if afterBy == "" {
+		a.addError(pos, "inferred API '%s' is incomplete — missing field name after By", apiName)
+		return
+	}
+	if strings.HasSuffix(afterBy, "And") || strings.HasSuffix(afterBy, "Or") {
+		suffix := afterBy[len(afterBy)-2:]
+		if strings.HasSuffix(afterBy, "And") {
+			suffix = "And"
+		}
+		a.addError(pos, "inferred API '%s' is incomplete — missing field name after %s", apiName, suffix)
+		return
+	}
+
+	if modelType.Fields != nil {
+		a.validateFieldSegments(pos, apiName, afterBy, modelType)
+	}
+}
+
+// validateFieldSegments checks that each field reference in a By-clause exists in the model.
+func (a *Analyzer) validateFieldSegments(pos token.Position, apiName, afterBy string, model *ResolvedType) {
+	// Known operator suffixes to strip before field matching
+	opSuffixes := []string{
+		"GreaterThanEqual", "LessThanEqual", "GreaterThan", "LessThan",
+		"NotContaining", "StartingWith", "EndingWith", "Containing",
+		"IsNotNull", "IsNull", "NotNull", "Between", "NotIn", "In",
+		"NotLike", "Like", "IgnoreCase", "Not", "True", "False",
+		"After", "Before", "OrderBy",
+	}
+
+	// Split by And/Or
+	segments := splitByAndOr(afterBy)
+
+	for _, seg := range segments {
+		// Strip operator suffix
+		field := seg
+		for _, op := range opSuffixes {
+			if strings.HasSuffix(field, op) {
+				field = field[:len(field)-len(op)]
+				break
+			}
+		}
+
+		// Strip OrderBy tail (OrderByNameDesc → before OrderBy)
+		if idx := strings.Index(field, "OrderBy"); idx >= 0 {
+			field = field[:idx]
+		}
+
+		if field == "" {
+			continue // operator-only segment like "True"/"IsNull"
+		}
+
+		// Lowercase first char to match field names
+		fieldName := strings.ToLower(field[:1]) + field[1:]
+		// Check explicit fields + implicit timestamp fields
+		if _, ok := model.Fields[fieldName]; !ok {
+			if fieldName != "createdAt" && fieldName != "updatedAt" && fieldName != "deletedAt" {
+				a.addError(pos, "inferred API '%s' — unknown field '%s'", apiName, fieldName)
+			}
+		}
+	}
+}
+
+// splitByAndOr splits "EmailAndNameOrAge" into ["Email", "Name", "Age"].
+// splitByAndOr splits "EmailAndNameOrAge" into ["Email", "Name", "Age"].
+// Only splits at PascalCase boundaries: the char before "And"/"Or" must be lowercase
+// and the char after must be uppercase, to avoid splitting field names like "OrderId".
+func splitByAndOr(s string) []string {
+	var parts []string
+	for len(s) > 0 {
+		idx, sepLen := findAndOrBoundary(s)
+		if idx < 0 {
+			parts = append(parts, s)
+			break
+		}
+		if idx > 0 {
+			parts = append(parts, s[:idx])
+		}
+		s = s[idx+sepLen:]
+	}
+	return parts
+}
+
+// findAndOrBoundary finds the first "And"/"Or" at a PascalCase word boundary.
+func findAndOrBoundary(s string) (int, int) {
+	for i := 0; i < len(s); i++ {
+		// Check "And" at position i
+		if i+3 <= len(s) && s[i:i+3] == "And" {
+			if isPascalBoundary(s, i, 3) {
+				return i, 3
+			}
+		}
+		// Check "Or" at position i
+		if i+2 <= len(s) && s[i:i+2] == "Or" {
+			if isPascalBoundary(s, i, 2) {
+				return i, 2
+			}
+		}
+	}
+	return -1, 0
+}
+
+// isPascalBoundary checks if the separator at position idx is at a PascalCase word boundary.
+func isPascalBoundary(s string, idx, sepLen int) bool {
+	// Must not be at the start (need a preceding field)
+	if idx == 0 {
+		return false
+	}
+	// Char before must be lowercase (end of previous field name)
+	prev := s[idx-1]
+	if prev < 'a' || prev > 'z' {
+		return false
+	}
+	// Char after separator must be uppercase (start of next field) or end of string
+	after := idx + sepLen
+	if after >= len(s) {
+		return true // trailing And/Or
+	}
+	return s[after] >= 'A' && s[after] <= 'Z'
+}
+
+// validateNativeReturnType checks that @native APIs declare a return type.
+func (a *Analyzer) validateNativeReturnType(api *ast.ApiDecl) {
+	for _, d := range api.Directives {
+		if d.Name == "native" && api.ReturnType == nil {
+			a.addError(api.Pos, "@native API must declare a return type")
+			return
+		}
 	}
 }
 
@@ -1599,6 +1832,10 @@ func isAutoManagedField(field *FieldInfo) bool {
 		return true
 	}
 	if hasDirective(field.Directives, "auto") || hasDirective(field.Directives, "id") {
+		return true
+	}
+	// Relation fields (model type or list of model) are not database columns
+	if field.Type != nil && (field.Type.Kind == TypeModel || field.Type.IsList) {
 		return true
 	}
 	return field.Name == "createdAt" || field.Name == "updatedAt" || field.Name == "deletedAt" || field.Name == "id"

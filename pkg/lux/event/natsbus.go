@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/bytedance/sonic"
+	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/nats-io/nats.go"
 )
 
@@ -33,11 +34,18 @@ func NewNATSBus(url string) (*NATSBus, error) {
 	return &NATSBus{conn: conn}, nil
 }
 
-// Emit serializes payload to JSON and publishes to NATS.
+// Emit serializes payload and publishes to NATS.
+// Uses Luxo binary format if the payload implements LuxoMarshaler, falls back to JSON.
 func (b *NATSBus) Emit(ctx context.Context, name string, payload any) error {
-	data, err := sonic.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("nats marshal: %w", err)
+	var data []byte
+	if m, ok := payload.(codec.LuxoMarshaler); ok {
+		data = m.MarshalLuxo()
+	} else {
+		var err error
+		data, err = sonic.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("nats marshal: %w", err)
+		}
 	}
 	return b.conn.Publish(name, data)
 }

@@ -53,8 +53,43 @@ func runGen(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if err := updateLockFile(files); err != nil {
+	lf, err := updateLockFileAndReturn(files)
+	if err != nil {
 		return err
+	}
+
+	// Pass field IDs from lock file to codegen for binary encoding
+	if lf.Events != nil {
+		ids := make(map[string]map[string]int, len(lf.Events))
+		for name, el := range lf.Events {
+			ids[name] = el.Fields
+		}
+		codegen.SetEventFieldIDs(ids)
+	}
+	if lf.Models != nil {
+		ids := make(map[string]map[string]int, len(lf.Models))
+		for name, ml := range lf.Models {
+			ids[name] = ml.Fields
+		}
+		codegen.SetModelFieldIDs(ids)
+	}
+	if lf.APIs != nil {
+		ids := make(map[string]int, len(lf.APIs))
+		paramIDs := make(map[string]map[string]int, len(lf.APIs))
+		for name, al := range lf.APIs {
+			ids[name] = al.ID
+			if len(al.Params) > 0 {
+				paramIDs[name] = al.Params
+			}
+		}
+		codegen.SetAPIIDs(ids)
+		codegen.SetAPIParamIDs(paramIDs)
+	}
+
+	// Extract param types from AST for accurate binary metadata
+	paramTypes := buildParamTypesFromAST(files)
+	if len(paramTypes) > 0 {
+		codegen.SetAPIParamTypes(paramTypes)
 	}
 
 	totalFiles, err := generateModules(files, result)
@@ -88,13 +123,47 @@ func findSchemaFiles() ([]string, error) {
 	var files []string
 	for _, e := range entries {
 		if !e.IsDir() && strings.HasSuffix(e.Name(), ".luxo") {
+			// Single-file module: origin/user.luxo
 			files = append(files, filepath.Join("origin", e.Name()))
+		} else if e.IsDir() {
+			// Directory module: origin/user/*.luxo
+			subEntries, err := os.ReadDir(filepath.Join("origin", e.Name()))
+			if err != nil {
+				continue
+			}
+			for _, se := range subEntries {
+				if !se.IsDir() && strings.HasSuffix(se.Name(), ".luxo") {
+					files = append(files, filepath.Join("origin", e.Name(), se.Name()))
+				}
+			}
 		}
 	}
 	if len(files) == 0 {
 		return nil, fmt.Errorf("no .luxo files found in origin/\norigin/ 下没有 .luxo 文件")
 	}
 	return files, nil
+}
+
+// groupByModule groups parsed files by module name.
+// origin/user.luxo → module "user" with 1 file
+// origin/user/model.luxo + origin/user/auth.luxo → module "user" with 2 merged files
+func groupByModule(files []*ast.File) map[string][]*ast.File {
+	modules := make(map[string][]*ast.File)
+	for _, file := range files {
+		// file.Name is the path like "origin/user/model.luxo" or "origin/user.luxo"
+		rel := strings.TrimPrefix(file.Name, "origin/")
+		parts := strings.Split(rel, "/")
+		var moduleName string
+		if len(parts) == 1 {
+			// Single file: origin/user.luxo → module "user"
+			moduleName = strings.TrimSuffix(parts[0], ".luxo")
+		} else {
+			// Directory: origin/user/model.luxo → module "user"
+			moduleName = parts[0]
+		}
+		modules[moduleName] = append(modules[moduleName], file)
+	}
+	return modules
 }
 
 func parseAllFiles(paths []string) ([]*ast.File, error) {
@@ -124,19 +193,77 @@ func analyzeFiles(files []*ast.File) (*semantic.Result, error) {
 	return result, nil
 }
 
-func updateLockFile(files []*ast.File) error {
+func updateLockFileAndReturn(files []*ast.File) (*lockfile.LockFile, error) {
 	green := "\033[32m"
 	reset := "\033[0m"
 	lf, err := lockfile.Load("luxo.lock")
 	if err != nil {
-		return fmt.Errorf("load luxo.lock: %w\n加载 luxo.lock 失败: %w", err, err)
+		return nil, fmt.Errorf("load luxo.lock: %w\n加载 luxo.lock 失败: %w", err, err)
 	}
 	lf.Update(files)
 	if err := lf.Save("luxo.lock"); err != nil {
-		return fmt.Errorf("save luxo.lock: %w\n保存 luxo.lock 失败: %w", err, err)
+		return nil, fmt.Errorf("save luxo.lock: %w\n保存 luxo.lock 失败: %w", err, err)
 	}
 	fmt.Printf("  %s✓%s luxo.lock\n", green, reset)
-	return nil
+	return lf, nil
+}
+
+// buildParamTypesFromAST extracts param types from AST for accurate binary metadata.
+func buildParamTypesFromAST(files []*ast.File) map[string]map[string]string {
+	types := make(map[string]map[string]string)
+	for _, file := range files {
+		for _, a := range file.APIs {
+			if len(a.Params) == 0 {
+				continue
+			}
+			m := make(map[string]string, len(a.Params))
+			for _, p := range a.Params {
+				if p.Type != nil {
+					m[p.Name] = p.Type.Name
+				}
+			}
+			types[a.Name] = m
+		}
+		for _, model := range file.Models {
+			hasCrud := false
+			for _, d := range model.Directives {
+				if d.Name == "crud" {
+					hasCrud = true
+					break
+				}
+			}
+			if !hasCrud {
+				continue
+			}
+			fieldTypes := make(map[string]string)
+			for _, f := range model.Fields {
+				if f.Type != nil && f.Computed == nil {
+					fieldTypes[f.Name] = f.Type.Name
+				}
+			}
+			name := model.Name
+			plural := name + "s"
+			idType := fieldTypes["id"]
+			if idType == "" {
+				idType = "Int"
+			}
+			types["get"+name] = map[string]string{"id": idType}
+			types["delete"+name] = map[string]string{"id": idType}
+			types["delete"+plural] = map[string]string{"ids": idType}
+			types["list"+plural] = map[string]string{"page": "Int", "pageSize": "Int"}
+			createTypes := make(map[string]string)
+			for k, v := range fieldTypes {
+				createTypes[k] = v
+			}
+			types["create"+name] = createTypes
+			updateTypes := map[string]string{"id": idType}
+			for k, v := range createTypes {
+				updateTypes[k] = v
+			}
+			types["update"+name] = updateTypes
+		}
+	}
+	return types
 }
 
 func generateModules(files []*ast.File, result *semantic.Result) (int, error) {
@@ -152,15 +279,21 @@ func generateModules(files []*ast.File, result *semantic.Result) (int, error) {
 			}
 		}
 	}
+	// Group files by module — directory name or file name without .luxo
+	modules := groupByModule(files)
+
 	total := 0
-	for _, file := range files {
-		moduleName := strings.TrimSuffix(filepath.Base(file.Name), ".luxo")
+	for moduleName, moduleFiles := range modules {
 		outDir := filepath.Join("service", moduleName, "luxo")
 		if err := os.MkdirAll(outDir, 0755); err != nil {
 			return 0, fmt.Errorf("create %s: %w", outDir, err)
 		}
-		singleResult := &semantic.Result{Files: []*ast.File{file}}
-		gr := codegen.Generate(singleResult, "luxo", softModels)
+		singleResult := &semantic.Result{Files: moduleFiles}
+		driver := codegen.DBDriver(os.Getenv("DATABASE_DRIVER"))
+		if driver == "" {
+			driver = codegen.DriverPG
+		}
+		gr := codegen.Generate(singleResult, "luxo", driver, softModels)
 		for name, src := range gr.Files {
 			outPath := filepath.Join(outDir, name)
 			if err := os.WriteFile(outPath, src, 0644); err != nil {
@@ -168,6 +301,23 @@ func generateModules(files []*ast.File, result *semantic.Result) (int, error) {
 			}
 			fmt.Printf("  %s+%s %s\n", green, reset, outPath)
 			total++
+		}
+
+		// Auto-create resolver package if it doesn't exist
+		resolverDir := filepath.Join("service", moduleName, "resolver")
+		resolverFile := filepath.Join(resolverDir, "resolver.go")
+		if _, err := os.Stat(resolverFile); os.IsNotExist(err) {
+			if err := os.MkdirAll(resolverDir, 0755); err != nil {
+				return 0, fmt.Errorf("create %s: %w", resolverDir, err)
+			}
+			// Read go.mod to get module path
+			modPath, _ := readModulePath()
+			resolverSrc := fmt.Sprintf("package resolver\n\nimport luxo %q\n\n// Setup registers @native resolvers.\nfunc Setup(app *luxo.App) {}\n",
+				modPath+"/service/"+moduleName+"/luxo")
+			if err := os.WriteFile(resolverFile, []byte(resolverSrc), 0644); err != nil {
+				return 0, fmt.Errorf("write %s: %w", resolverFile, err)
+			}
+			fmt.Printf("  %s+%s %s\n", green, reset, resolverFile)
 		}
 	}
 	return total, nil

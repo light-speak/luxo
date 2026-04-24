@@ -2,6 +2,7 @@ package event
 
 import (
 	"context"
+	"fmt"
 	"sync"
 )
 
@@ -15,6 +16,7 @@ type ChanBus struct {
 	channels map[string]chan message
 	done     chan struct{}
 	once     sync.Once
+	wg       sync.WaitGroup
 }
 
 type message struct {
@@ -42,7 +44,7 @@ var _ Bus = (*ChanBus)(nil)
 func (b *ChanBus) Emit(ctx context.Context, name string, payload any) error {
 	select {
 	case <-b.done:
-		return nil // bus closed
+		return fmt.Errorf("event: bus is closed")
 	default:
 	}
 
@@ -65,12 +67,20 @@ func (b *ChanBus) Emit(ctx context.Context, name string, payload any) error {
 // On registers a handler. Starts a goroutine to consume events.
 func (b *ChanBus) On(name string, handler Handler) error {
 	b.mu.Lock()
+	// Check if bus is closed
+	select {
+	case <-b.done:
+		b.mu.Unlock()
+		return fmt.Errorf("event: bus is closed")
+	default:
+	}
 	b.subs[name] = append(b.subs[name], handler)
 
 	if _, ok := b.channels[name]; !ok {
 		ch := make(chan message, b.bufSize)
 		b.channels[name] = ch
 		// Start dispatcher for this event
+		b.wg.Add(1)
 		go b.dispatch(name, ch)
 	}
 	b.mu.Unlock()
@@ -85,6 +95,7 @@ func (b *ChanBus) OnQueue(name string, group string, handler Handler) error {
 
 // dispatch reads from the channel and calls all handlers for the event.
 func (b *ChanBus) dispatch(name string, ch chan message) {
+	defer b.wg.Done()
 	for {
 		select {
 		case msg, ok := <-ch:
@@ -111,6 +122,7 @@ func safeCall(h Handler, ctx context.Context, payload any) {
 }
 
 // Close shuts down all dispatchers and channels.
+// Waits for all in-flight dispatchers to drain before returning.
 func (b *ChanBus) Close() {
 	b.once.Do(func() {
 		close(b.done)
@@ -119,5 +131,6 @@ func (b *ChanBus) Close() {
 			close(ch)
 		}
 		b.mu.Unlock()
+		b.wg.Wait()
 	})
 }

@@ -3,14 +3,53 @@
 // error name, i18n message key, and typed data for template substitution.
 package errors
 
+// ErrorData is the interface for typed error data attached to AppError.
+// Implementations: ParamError, ResourceError, MapData.
+type ErrorData interface {
+	// I18nData returns key-value pairs for i18n template substitution.
+	I18nData() map[string]any
+}
+
 // AppError is the structured error type for all Luxo application errors.
 type AppError struct {
-	Name     string         // PascalCase identifier: "NotFound", "OutOfStock"
-	Code     int            // HTTP status code: 404, 409, 500
-	Message  string         // i18n key: "error.not_found"
-	Data     map[string]any // template variables for i18n substitution
-	Internal bool           // if true, message/data not exposed to client
-	Cause    error          // wrapped underlying error
+	Name     string    // PascalCase identifier: "NotFound", "OutOfStock"
+	Code     int       // HTTP status code: 404, 409, 500
+	Message  string    // i18n key: "error.not_found"
+	Data     ErrorData // typed data: ParamError, ResourceError, MapData, or nil
+	Internal bool      // if true, message/data not exposed to client
+	Cause    error     // wrapped underlying error
+}
+
+// ParamError is error data for invalid parameters.
+type ParamError struct {
+	Param string `json:"param"`
+	Error string `json:"error"`
+}
+
+func (p ParamError) I18nData() map[string]any {
+	return map[string]any{"param": p.Param, "error": p.Error}
+}
+
+// ResourceError is error data for missing resources.
+type ResourceError struct {
+	Resource string `json:"resource"`
+	ID       any    `json:"id,omitempty"`
+}
+
+func (r ResourceError) I18nData() map[string]any {
+	m := map[string]any{"resource": r.Resource}
+	if r.ID != nil {
+		m["id"] = r.ID
+	}
+	return m
+}
+
+// MapData is typed error data from a key-value map.
+// Used by generated error constructors for custom error fields.
+type MapData map[string]any
+
+func (d MapData) I18nData() map[string]any {
+	return map[string]any(d)
 }
 
 func (e *AppError) Error() string {
@@ -31,7 +70,7 @@ func New(name string, code int, message string) *AppError {
 
 // WithData returns a copy with the given data fields set.
 // The original error is not modified.
-func (e *AppError) WithData(data map[string]any) *AppError {
+func (e *AppError) WithData(data ErrorData) *AppError {
 	cp := *e
 	cp.Data = data
 	return &cp

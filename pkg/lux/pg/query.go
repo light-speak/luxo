@@ -2,6 +2,7 @@ package pg
 
 import (
 	"context"
+	"time"
 
 	"github.com/light-speak/luxo/pkg/lux"
 )
@@ -22,6 +23,12 @@ type Query[T any] struct {
 // NewQuery creates a Query for the given table.
 func NewQuery[T any](db *DB, table string, scan ScanFunc[T], conds []lux.Condition) *Query[T] {
 	return &Query[T]{db: db, table: table, scan: scan, conds: conds}
+}
+
+// Where appends additional conditions to the query (chainable).
+func (q *Query[T]) Where(conds ...lux.Condition) *Query[T] {
+	q.conds = append(q.conds, conds...)
+	return q
 }
 
 // Select sets the fields to retrieve.
@@ -78,6 +85,30 @@ func (q *Query[T]) Count(ctx context.Context) (int64, error) {
 	return QueryScalar[int64](ctx, q.db, query, args...)
 }
 
+// Sum returns the SUM of the given column for matching records.
+func (q *Query[T]) Sum(ctx context.Context, col string) (int64, error) {
+	query, args := lux.BuildAggregateSQL(q.table, "SUM", col, q.conds)
+	return QueryScalar[int64](ctx, q.db, query, args...)
+}
+
+// Avg returns the AVG of the given column for matching records (truncated to int64).
+func (q *Query[T]) Avg(ctx context.Context, col string) (int64, error) {
+	query, args := lux.BuildAggregateSQL(q.table, "AVG", col, q.conds)
+	return QueryScalar[int64](ctx, q.db, query, args...)
+}
+
+// Max returns the MAX of the given column for matching records.
+func (q *Query[T]) Max(ctx context.Context, col string) (int64, error) {
+	query, args := lux.BuildAggregateSQL(q.table, "MAX", col, q.conds)
+	return QueryScalar[int64](ctx, q.db, query, args...)
+}
+
+// Min returns the MIN of the given column for matching records.
+func (q *Query[T]) Min(ctx context.Context, col string) (int64, error) {
+	query, args := lux.BuildAggregateSQL(q.table, "MIN", col, q.conds)
+	return QueryScalar[int64](ctx, q.db, query, args...)
+}
+
 // Exists returns true if any matching record exists.
 // Uses SELECT EXISTS(SELECT 1 ... LIMIT 1) — short-circuits on first match.
 func (q *Query[T]) Exists(ctx context.Context) (bool, error) {
@@ -106,6 +137,15 @@ func (q *Query[T]) Offset(n int) *Query[T] {
 // Delete deletes all matching records.
 func (q *Query[T]) Delete(ctx context.Context) (int64, error) {
 	query, args := lux.BuildDeleteSQL(q.table, q.conds)
+	return Exec(ctx, q.db, query, args...)
+}
+
+// SoftDelete marks matching records as deleted by setting deleted_at = NOW().
+// Only affects records where deleted_at IS NULL.
+func (q *Query[T]) SoftDelete(ctx context.Context) (int64, error) {
+	q.conds = append(q.conds, lux.NewTimeField("deleted_at").IsNull())
+	sets := []lux.SetField{{Col: "deleted_at", Val: time.Now()}}
+	query, args := lux.BuildUpdateSQL(q.table, sets, q.conds)
 	return Exec(ctx, q.db, query, args...)
 }
 

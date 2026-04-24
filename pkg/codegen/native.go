@@ -42,7 +42,7 @@ func GenerateNativeFile(result *semantic.Result, packageName string) []byte {
 			goType := resolveGoType(p.Type)
 			fmt.Fprintf(&b, ", %s %s", p.Name, goType)
 		}
-		retType := "any"
+		retType := "any" // fallback — now caught by semantic analyzer (@native must have return type)
 		if api.ReturnType != nil {
 			retType = resolveGoType(api.ReturnType)
 		}
@@ -140,7 +140,7 @@ func generateNativeStub(api nativeAPI) string {
 		goType := resolveGoType(p.Type)
 		fmt.Fprintf(&b, ", %s %s", p.Name, goType)
 	}
-	retType := "any"
+	retType := "any" // fallback — now caught by semantic analyzer (@native must have return type)
 	if api.ReturnType != nil {
 		retType = resolveGoType(api.ReturnType)
 	}

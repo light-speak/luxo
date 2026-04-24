@@ -160,10 +160,19 @@ func generateEnvExample() []byte {
 # ---- App ----
 APP_ENV=development                                    # environment: development / production
 APP_DEBUG=true                                         # debug logging
-APP_PORT=8080                                          # listen port
+APP_PORT=8080                                          # Luvia Gateway port (HTTP/2 h2c by default)
 APP_TIMEZONE=UTC                                       # timezone: UTC / Asia/Shanghai
 DEPLOY_MODE=embedded                                   # deploy: embedded / standalone / compose / cluster
 GEN_MODE=full                                          # codegen: full / minimal (minimal = model + db only)
+
+# ---- TLS (optional) ----
+# Without these, uses h2c (HTTP/2 cleartext, recommended for internal networks)
+# APP_TLS_CERT=./certs/server.crt                       # TLS certificate file path
+# APP_TLS_KEY=./certs/server.key                        # TLS private key file path
+
+# ---- Luxo Protocol ----
+# Auto-enabled in compose/cluster mode. All inter-service calls use Luxo protocol.
+LUXO_PORT=9000                                         # Luxo protocol port
 
 # ---- Database ----
 DATABASE_DRIVER=pg                                     # driver: pg / mysql / sqlite / mongo

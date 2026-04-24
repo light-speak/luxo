@@ -18,8 +18,9 @@ type Condition interface {
 
 // SetField represents a column=value pair for UPDATE statements.
 type SetField struct {
-	Col string
-	Val any
+	Col    string
+	Val    any
+	Atomic string // if set, generates "col = col OP $N" (e.g., "+", "-")
 }
 
 // --- Field condition types ---

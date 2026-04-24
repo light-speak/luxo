@@ -14,8 +14,16 @@ import (
 type LockFile struct {
 	Version int                   `json:"version"`
 	Models  map[string]*ModelLock `json:"models"`
-	APIs    map[string]int        `json:"apis"`
+	Events  map[string]*ModelLock `json:"events,omitempty"`
+	APIs    map[string]*APILock   `json:"apis"`
 	nextAPI int                   // transient: next API ID to assign
+}
+
+// APILock tracks ID and param field IDs for a single API.
+type APILock struct {
+	ID     int            `json:"id"`
+	Params map[string]int `json:"params,omitempty"` // param_name → stable field ID
+	nextP  int            // transient
 }
 
 // ModelLock tracks field ID assignments for a single model.
@@ -72,7 +80,8 @@ func New() *LockFile {
 	return &LockFile{
 		Version: currentVersion,
 		Models:  make(map[string]*ModelLock),
-		APIs:    make(map[string]int),
+		Events:  make(map[string]*ModelLock),
+		APIs:    make(map[string]*APILock),
 		nextAPI: 0,
 	}
 }
@@ -111,7 +120,59 @@ func (lf *LockFile) Save(path string) error {
 // New APIs get the next available API ID.
 func (lf *LockFile) Update(files []*ast.File) {
 	lf.updateModels(files)
+	lf.updateEvents(files)
 	lf.updateAPIs(files)
+}
+
+// updateEvents assigns param IDs to all event declarations.
+// Uses the same ModelLock structure (param name → stable ID).
+func (lf *LockFile) updateEvents(files []*ast.File) {
+	if lf.Events == nil {
+		lf.Events = make(map[string]*ModelLock)
+	}
+
+	// Collect current events
+	currentEvents := make(map[string]map[string]bool)
+	for _, file := range files {
+		for _, e := range file.Events {
+			params := make(map[string]bool, len(e.Params))
+			for _, p := range e.Params {
+				params[p.Name] = true
+			}
+			currentEvents[e.Name] = params
+		}
+	}
+
+	// Reserve removed params
+	for name, el := range lf.Events {
+		current, exists := currentEvents[name]
+		if !exists {
+			lf.reserveAllFields(el)
+			continue
+		}
+		lf.reserveRemovedFields(el, current)
+	}
+
+	// Assign IDs to new params
+	for _, file := range files {
+		for _, e := range file.Events {
+			el, exists := lf.Events[e.Name]
+			if !exists {
+				el = &ModelLock{
+					NextID: 1,
+					Fields: make(map[string]int),
+				}
+				lf.Events[e.Name] = el
+			}
+			for _, p := range e.Params {
+				if _, ok := el.Fields[p.Name]; ok {
+					continue
+				}
+				el.Fields[p.Name] = el.NextID
+				el.NextID++
+			}
+		}
+	}
 }
 
 // updateModels assigns field IDs to all model fields.
@@ -202,25 +263,92 @@ func (lf *LockFile) reserveRemovedFields(ml *ModelLock, current map[string]bool)
 	}
 }
 
-// updateAPIs assigns stable IDs to all API declarations.
+// updateAPIs assigns stable IDs to all API declarations, including CRUD APIs.
 func (lf *LockFile) updateAPIs(files []*ast.File) {
+	// CRUD APIs from models with @crud
 	for _, file := range files {
-		for _, api := range file.APIs {
-			if _, ok := lf.APIs[api.Name]; ok {
+		for _, m := range file.Models {
+			if !hasCrudDirective(m) {
 				continue
 			}
-			lf.APIs[api.Name] = lf.nextAPI + 1
-			lf.nextAPI++
+			name := m.Name
+			plural := name + "s"
+			// CRUD param names are well-known
+			lf.ensureAPIID("get"+name, []string{"id"})
+			lf.ensureAPIID("list"+plural, []string{"page", "pageSize"})
+			lf.ensureAPIID("create"+name, collectFieldNames(m))
+			lf.ensureAPIID("update"+name, append([]string{"id"}, collectFieldNames(m)...))
+			lf.ensureAPIID("delete"+name, []string{"id"})
+			lf.ensureAPIID("delete"+plural, []string{"ids"})
 		}
 	}
+	// Declared APIs — params from AST
+	for _, file := range files {
+		for _, api := range file.APIs {
+			var params []string
+			for _, p := range api.Params {
+				params = append(params, p.Name)
+			}
+			lf.ensureAPIID(api.Name, params)
+		}
+	}
+}
+
+func collectFieldNames(m *ast.ModelDecl) []string {
+	var names []string
+	for _, f := range m.Fields {
+		if f.Computed != nil {
+			continue
+		}
+		names = append(names, f.Name)
+	}
+	return names
+}
+
+func (lf *LockFile) ensureAPIID(name string, params []string) {
+	al, ok := lf.APIs[name]
+	if !ok {
+		lf.nextAPI++
+		al = &APILock{
+			ID:     lf.nextAPI,
+			Params: make(map[string]int),
+			nextP:  0,
+		}
+		lf.APIs[name] = al
+	}
+	if al.Params == nil {
+		al.Params = make(map[string]int)
+	}
+	// Compute nextP from existing params
+	for _, id := range al.Params {
+		if id > al.nextP {
+			al.nextP = id
+		}
+	}
+	// Assign IDs to new params
+	for _, p := range params {
+		if _, exists := al.Params[p]; !exists {
+			al.nextP++
+			al.Params[p] = al.nextP
+		}
+	}
+}
+
+func hasCrudDirective(m *ast.ModelDecl) bool {
+	for _, d := range m.Directives {
+		if d.Name == "crud" {
+			return true
+		}
+	}
+	return false
 }
 
 // computeNextAPI finds the max API ID for new assignments.
 func (lf *LockFile) computeNextAPI() {
 	maxID := 0
-	for _, id := range lf.APIs {
-		if id > maxID {
-			maxID = id
+	for _, al := range lf.APIs {
+		if al.ID > maxID {
+			maxID = al.ID
 		}
 	}
 	lf.nextAPI = maxID
@@ -246,5 +374,29 @@ func (lf *LockFile) FieldID(model, field string) int {
 
 // APIID returns the assigned API ID, or 0 if not found.
 func (lf *LockFile) APIID(name string) int {
-	return lf.APIs[name]
+	if al, ok := lf.APIs[name]; ok {
+		return al.ID
+	}
+	return 0
+}
+
+// APIParamID returns the assigned param field ID for an API param, or 0 if not found.
+func (lf *LockFile) APIParamID(apiName, paramName string) int {
+	al, ok := lf.APIs[apiName]
+	if !ok || al.Params == nil {
+		return 0
+	}
+	return al.Params[paramName]
+}
+
+// EventFieldID returns the assigned param ID for an event param, or 0 if not found.
+func (lf *LockFile) EventFieldID(eventName, paramName string) int {
+	if lf.Events == nil {
+		return 0
+	}
+	el, ok := lf.Events[eventName]
+	if !ok {
+		return 0
+	}
+	return el.Fields[paramName]
 }

@@ -387,3 +387,47 @@ func TestNATSBusEmitMarshalError(t *testing.T) {
 		t.Fatal("expected marshal error")
 	}
 }
+
+// luxoPayload implements codec.LuxoMarshaler for testing the binary path.
+type luxoPayload struct {
+	data []byte
+}
+
+func (p *luxoPayload) MarshalLuxo() []byte {
+	return p.data
+}
+
+func TestNATSBusEmitLuxoMarshaler(t *testing.T) {
+	bus, err := NewNATSBus(natsURL(t))
+	if err != nil {
+		t.Skipf("NATS not available: %v", err)
+	}
+	defer bus.Close()
+
+	var received atomic.Value
+	done := make(chan struct{})
+
+	bus.On("test.nats.luxo.marshal", func(ctx context.Context, payload any) {
+		received.Store(payload.([]byte))
+		close(done)
+	})
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Emit with LuxoMarshaler — should use binary path, not JSON
+	err = bus.Emit(context.Background(), "test.nats.luxo.marshal", &luxoPayload{data: []byte{0xDE, 0xAD}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout")
+	}
+
+	got := received.Load().([]byte)
+	if len(got) != 2 || got[0] != 0xDE || got[1] != 0xAD {
+		t.Errorf("got %v, want [0xDE 0xAD]", got)
+	}
+}

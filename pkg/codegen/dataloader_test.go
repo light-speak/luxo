@@ -144,7 +144,7 @@ func TestGenerateDataLoaderFile(t *testing.T) {
 		}},
 	}
 
-	src := generateDataLoaderFile(result, "luxo", nil, nil)
+	src := generateDataLoaderFile(result, "luxo", nil, nil, DriverPG)
 	if src == nil {
 		t.Fatal("should generate dataloader file")
 	}
@@ -176,7 +176,7 @@ func TestGenerateDataLoaderFileNoRelations(t *testing.T) {
 			}},
 		}},
 	}
-	src := generateDataLoaderFile(result, "luxo", nil, nil)
+	src := generateDataLoaderFile(result, "luxo", nil, nil, DriverPG)
 	if src != nil {
 		t.Error("should return nil when no relations")
 	}
@@ -329,7 +329,7 @@ func TestGenerateDataLoaderDedup(t *testing.T) {
 			},
 		}},
 	}
-	src := generateDataLoaderFile(result, "luxo", nil, nil)
+	src := generateDataLoaderFile(result, "luxo", nil, nil, DriverPG)
 	code := string(src)
 
 	// UserByIdLoader type should appear only once
@@ -383,7 +383,7 @@ func TestGenerateDataLoaderWithExternalSoftModels(t *testing.T) {
 
 	// User is soft-deleted externally
 	externalSoft := map[string]bool{"User": true}
-	src := generateDataLoaderFile(result, "luxo", nil, externalSoft)
+	src := generateDataLoaderFile(result, "luxo", nil, externalSoft, DriverPG)
 	if src == nil {
 		t.Fatal("should generate dataloader file")
 	}
@@ -422,7 +422,7 @@ func TestGenerateDataLoaderWithLocalSoftModel(t *testing.T) {
 		}},
 	}
 
-	src := generateDataLoaderFile(result, "luxo", nil, nil)
+	src := generateDataLoaderFile(result, "luxo", nil, nil, DriverPG)
 	if src == nil {
 		t.Fatal("should generate dataloader file")
 	}
@@ -510,7 +510,7 @@ func TestGenerateDefaultLoadersDeduplicate(t *testing.T) {
 		}},
 	}
 
-	src := generateDataLoaderFile(result, "luxo", nil, nil)
+	src := generateDataLoaderFile(result, "luxo", nil, nil, DriverPG)
 	code := string(src)
 
 	// UserByIdLoader should only appear once as a type definition
@@ -618,7 +618,7 @@ func TestGenerateDataLoaderWithStringFK(t *testing.T) {
 		}},
 	}
 
-	src := generateDataLoaderFile(result, "luxo", nil, nil)
+	src := generateDataLoaderFile(result, "luxo", nil, nil, DriverPG)
 	if src == nil {
 		t.Fatal("should generate dataloader file")
 	}
@@ -648,7 +648,7 @@ func TestGenerateDataLoaderWithUUIDFK(t *testing.T) {
 		}},
 	}
 
-	src := generateDataLoaderFile(result, "luxo", nil, nil)
+	src := generateDataLoaderFile(result, "luxo", nil, nil, DriverPG)
 	if src == nil {
 		t.Fatal("should generate dataloader file")
 	}
@@ -688,7 +688,7 @@ func TestGenerateDataLoaderDefaultLoadersDedupSeenMap(t *testing.T) {
 		}},
 	}
 
-	src := generateDataLoaderFile(result, "luxo", nil, nil)
+	src := generateDataLoaderFile(result, "luxo", nil, nil, DriverPG)
 	if src == nil {
 		t.Fatal("should generate dataloader file")
 	}

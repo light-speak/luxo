@@ -105,6 +105,23 @@ func TestDirectiveNativeOnApi(t *testing.T) {
 	expectNoErrors(t, result)
 }
 
+func TestDirectiveNativeOnApiNoReturnType(t *testing.T) {
+	// Construct AST directly since the parser enforces return type syntax.
+	// This covers override/extend scenarios where ReturnType might be nil.
+	file := &ast.File{
+		Name: "test.luxo",
+		APIs: []*ast.ApiDecl{{
+			Name:       "oauthLogin",
+			Pos:        token.Position{File: "test.luxo", Line: 1, Col: 1},
+			Directives: []*ast.Directive{{Name: "native", Pos: token.Position{File: "test.luxo", Line: 1, Col: 20}}},
+			ReturnType: nil,
+		}},
+	}
+	a := New()
+	result := a.Analyze([]*ast.File{file})
+	expectError(t, result, "@native API must declare a return type")
+}
+
 func TestDirectiveCorrectContextApi(t *testing.T) {
 	// @auth on api (correct)
 	result := analyze(t, `api getUser(): Int @auth`)
@@ -501,4 +518,240 @@ model User @withAuth {
 }
 `)
 	expectError(t, result, "requires parameter 'stores'")
+}
+
+// ========== validateBareAPI / validateFieldSegments / splitByAndOr Tests ==========
+
+func TestBareAPIValidByField(t *testing.T) {
+	// getUserByEmail — email exists on User → no error
+	result := analyze(t, `
+model User {
+  email: String
+}
+api getUserByEmail
+`)
+	expectNoErrors(t, result)
+}
+
+func TestBareAPIUnknownField(t *testing.T) {
+	// getUserByFoo — foo does NOT exist on User → error "unknown field"
+	result := analyze(t, `
+model User {
+  email: String
+}
+api getUserByFoo
+`)
+	expectError(t, result, "unknown field 'foo'")
+}
+
+func TestBareAPIIncompleteAnd(t *testing.T) {
+	// getUserByEmailAnd — trailing And without following field → error "incomplete"
+	result := analyze(t, `
+model User {
+  email: String
+}
+api getUserByEmailAnd
+`)
+	expectError(t, result, "is incomplete")
+}
+
+func TestBareAPIIncompleteOr(t *testing.T) {
+	// getUserByEmailOr — trailing Or without following field → error "incomplete"
+	result := analyze(t, `
+model User {
+  email: String
+}
+api getUserByEmailOr
+`)
+	expectError(t, result, "is incomplete")
+}
+
+func TestBareAPIIncompleteJustBy(t *testing.T) {
+	// getUserBy — nothing after By → error "incomplete"
+	result := analyze(t, `
+model User {
+  email: String
+}
+api getUserBy
+`)
+	expectError(t, result, "is incomplete")
+}
+
+func TestBareAPINoKnownModel(t *testing.T) {
+	// api get — does not start with a valid prefix+ModelName → error "does not reference a known model"
+	result := analyze(t, `
+model User {
+  email: String
+}
+api getXyz
+`)
+	expectError(t, result, "does not reference a known model")
+}
+
+func TestBareAPIImplicitCreatedAt(t *testing.T) {
+	// getUserByCreatedAtBetween — createdAt is implicit → no error
+	result := analyze(t, `
+model User {
+  email: String
+}
+api getUserByCreatedAtBetween
+`)
+	expectNoErrors(t, result)
+}
+
+func TestBareAPITwoFieldsAndOr(t *testing.T) {
+	// getUserByEmailAndName — both email and name exist → no error
+	result := analyze(t, `
+model User {
+  email: String
+  name: String
+}
+api getUserByEmailAndName
+`)
+	expectNoErrors(t, result)
+}
+
+func TestBareAPIListValid(t *testing.T) {
+	// listUsers — valid list without By clause → no error
+	result := analyze(t, `
+model User {
+  email: String
+}
+api listUsers
+`)
+	expectNoErrors(t, result)
+}
+
+func TestBareAPIOperatorSuffixStripped(t *testing.T) {
+	// getUserByEmailContaining — operator suffix "Containing" is stripped, email exists → no error
+	result := analyze(t, `
+model User {
+  email: String
+}
+api getUserByEmailContaining
+`)
+	expectNoErrors(t, result)
+}
+
+func TestBareAPIUnknownActionPrefix(t *testing.T) {
+	// fetchUser — "fetch" is not a valid prefix → error about action prefix
+	result := analyze(t, `
+model User {
+  email: String
+}
+api fetchUser
+`)
+	expectError(t, result, "must start with get/list/count/exists/delete")
+}
+
+func TestBareAPIExpectedByAfterModel(t *testing.T) {
+	// getUserNameSuffix — something after model name that is not By/OrderBy
+	result := analyze(t, `
+model User {
+  email: String
+}
+api getUserNameSuffix
+`)
+	expectError(t, result, "expected 'By' after model name")
+}
+
+func TestBareAPIOrderByValid(t *testing.T) {
+	// listUsersOrderByName — OrderBy is accepted without field validation → no error
+	result := analyze(t, `
+model User {
+  name: String
+}
+api listUsersOrderByName
+`)
+	expectNoErrors(t, result)
+}
+
+func TestBareAPIWithBody(t *testing.T) {
+	// API with body is skipped by validateBareAPI → no error
+	result := analyze(t, `
+model User {
+  email: String
+}
+api getUser(): Int {
+  1
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestBareAPIWithNativeDirective(t *testing.T) {
+	// @native API is skipped by validateBareAPI → no error
+	result := analyze(t, `
+api oauthCallback(): Int @native
+`)
+	expectNoErrors(t, result)
+}
+
+// ========== splitByAndOr unit tests ==========
+
+func TestSplitByAndOrSimple(t *testing.T) {
+	parts := splitByAndOr("EmailAndNameOrAge")
+	want := []string{"Email", "Name", "Age"}
+	if len(parts) != len(want) {
+		t.Fatalf("splitByAndOr(%q) = %v, want %v", "EmailAndNameOrAge", parts, want)
+	}
+	for i, p := range parts {
+		if p != want[i] {
+			t.Errorf("parts[%d] = %q, want %q", i, p, want[i])
+		}
+	}
+}
+
+func TestSplitByAndOrSingleSegment(t *testing.T) {
+	parts := splitByAndOr("Email")
+	if len(parts) != 1 || parts[0] != "Email" {
+		t.Errorf("splitByAndOr(%q) = %v, want [Email]", "Email", parts)
+	}
+}
+
+func TestSplitByAndOrOnlyAnd(t *testing.T) {
+	parts := splitByAndOr("EmailAndName")
+	want := []string{"Email", "Name"}
+	if len(parts) != 2 || parts[0] != want[0] || parts[1] != want[1] {
+		t.Errorf("splitByAndOr(%q) = %v, want %v", "EmailAndName", parts, want)
+	}
+}
+
+func TestSplitByAndOrOnlyOr(t *testing.T) {
+	parts := splitByAndOr("EmailOrName")
+	want := []string{"Email", "Name"}
+	if len(parts) != 2 || parts[0] != want[0] || parts[1] != want[1] {
+		t.Errorf("splitByAndOr(%q) = %v, want %v", "EmailOrName", parts, want)
+	}
+}
+
+func TestSplitByAndOrEmpty(t *testing.T) {
+	parts := splitByAndOr("")
+	if len(parts) != 0 {
+		t.Errorf("splitByAndOr(%q) = %v, want []", "", parts)
+	}
+}
+
+func TestSplitByAndOrLeadingAnd(t *testing.T) {
+	// "AndName" — no lowercase char before "And", not a word boundary, kept as one segment
+	parts := splitByAndOr("AndName")
+	if len(parts) != 1 || parts[0] != "AndName" {
+		t.Errorf("splitByAndOr(%q) = %v, want [AndName]", "AndName", parts)
+	}
+}
+
+func TestSplitByAndOrFieldWithOr(t *testing.T) {
+	// "OrderId" — "Or" inside field name, should NOT split
+	parts := splitByAndOr("OrderId")
+	if len(parts) != 1 || parts[0] != "OrderId" {
+		t.Errorf("splitByAndOr(%q) = %v, want [OrderId]", "OrderId", parts)
+	}
+}
+
+func TestSplitByAndOrFieldWithAnd(t *testing.T) {
+	// "SandyEmail" — "And" inside field name, should NOT split
+	parts := splitByAndOr("SandyEmail")
+	if len(parts) != 1 || parts[0] != "SandyEmail" {
+		t.Errorf("splitByAndOr(%q) = %v, want [SandyEmail]", "SandyEmail", parts)
+	}
 }

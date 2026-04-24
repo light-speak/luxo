@@ -1,6 +1,7 @@
 package lux
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -53,6 +54,17 @@ func BuildCountSQL(table string, conds []Condition) (string, []any) {
 	return b.String(), args
 }
 
+// BuildAggregateSQL builds a SELECT AGG(col) query (e.g., SUM, AVG, MIN, MAX).
+func BuildAggregateSQL(table, fn, col string, conds []Condition) (string, []any) {
+	var b strings.Builder
+	var args []any
+	argIdx := 1
+	fmt.Fprintf(&b, "SELECT COALESCE(%s(%s), 0) FROM %s", fn, col, table)
+	argIdx, args = appendWhere(&b, argIdx, args, conds)
+	_ = argIdx
+	return b.String(), args
+}
+
 // BuildDeleteSQL builds a DELETE query.
 func BuildDeleteSQL(table string, conds []Condition) (string, []any) {
 	var b strings.Builder
@@ -79,7 +91,16 @@ func BuildUpdateSQL(table string, sets []SetField, conds []Condition) (string, [
 			b.WriteString(", ")
 		}
 		b.WriteString(s.Col)
-		b.WriteString(" = $")
+		if s.Atomic != "" {
+			// Atomic: col = col + $N
+			b.WriteString(" = ")
+			b.WriteString(s.Col)
+			b.WriteByte(' ')
+			b.WriteString(s.Atomic)
+			b.WriteString(" $")
+		} else {
+			b.WriteString(" = $")
+		}
 		b.Write(strconv.AppendInt(tmp[:0], int64(argIdx), 10))
 		args = append(args, s.Val)
 		argIdx++

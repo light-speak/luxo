@@ -33,9 +33,9 @@ type InferClause struct {
 	Op    string // "eq", "containing", "gt", "lt", "gte", "lte", "between", "isNull", "isNotNull", "true", "false"
 }
 
-// inferAPI tries to parse an API name into a structured query.
+// InferAPI tries to parse an API name into a structured query.
 // Returns nil if the name doesn't match any known pattern.
-func inferAPI(name string, models map[string]*ast.ModelDecl) *InferredAPI {
+func InferAPI(name string, models map[string]*ast.ModelDecl) *InferredAPI {
 	result := &InferredAPI{}
 
 	rest := extractActionPrefix(name, result)
@@ -296,7 +296,8 @@ func generateInferredHandler(b *strings.Builder, api *ast.ApiDecl, inf *Inferred
 	// Build conditions
 	writeInferredConditions(b, inf, m, params)
 
-	writeInferredAction(b, inf, modelName, isSoftDelete(m))
+	rels := analyzeRelations(m, enums)
+	writeInferredAction(b, inf, modelName, isSoftDelete(m), rels)
 }
 
 // writeInferredConditions generates the WHERE conditions for an inferred handler.
@@ -369,21 +370,30 @@ func writeAndClause(b *strings.Builder, clause InferClause, m *ast.ModelDecl, pa
 }
 
 // writeInferredAction generates the query execution + response writing for an inferred handler.
-func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string, soft bool) {
+func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string, soft bool, rels []Relation) {
+	hasRels := len(rels) > 0
 	switch inf.Action {
 	case "count":
 		fmt.Fprintf(b, "\t\tcount, err := app.%s.Where(conds...).Count(ctx)\n", modelName)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		fmt.Fprintf(b, "\t\treq.Buf.AppendString(`{\"count\":`)\n")
-		fmt.Fprintf(b, "\t\treq.Buf.AppendInt(count)\n")
-		fmt.Fprintf(b, "\t\treq.Buf.AppendByte('}')\n")
+		fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, count)\n")
+		fmt.Fprintf(b, "\t\t} else {\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`{\"count\":`)\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendInt(count)\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendByte('}')\n")
+		fmt.Fprintf(b, "\t\t}\n")
 
 	case "exists":
 		fmt.Fprintf(b, "\t\texists, err := app.%s.Where(conds...).Exists(ctx)\n", modelName)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		fmt.Fprintf(b, "\t\treq.Buf.AppendString(`{\"exists\":`)\n")
-		fmt.Fprintf(b, "\t\treq.Buf.AppendBool(exists)\n")
-		fmt.Fprintf(b, "\t\treq.Buf.AppendByte('}')\n")
+		fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendBool(req.Buf.B, exists)\n")
+		fmt.Fprintf(b, "\t\t} else {\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`{\"exists\":`)\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendBool(exists)\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendByte('}')\n")
+		fmt.Fprintf(b, "\t\t}\n")
 
 	case "delete":
 		if soft {
@@ -392,13 +402,23 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 			fmt.Fprintf(b, "\t\tn, err := app.%s.Where(conds...).Delete(ctx)\n", modelName)
 		}
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		fmt.Fprintf(b, "\t\tif n == 0 {\n\t\t\treturn errors.NotFound.WithData(map[string]any{\"resource\": %q})\n\t\t}\n", modelName)
-		fmt.Fprintf(b, "\t\treq.Buf.AppendString(`{\"deleted\":`)\n")
-		fmt.Fprintf(b, "\t\treq.Buf.AppendInt(n)\n")
-		fmt.Fprintf(b, "\t\treq.Buf.AppendByte('}')\n")
+		fmt.Fprintf(b, "\t\tif n == 0 {\n\t\t\treturn errors.NotFound.WithData(errors.ResourceError{Resource: %q})\n\t\t}\n", modelName)
+		fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, n)\n")
+		fmt.Fprintf(b, "\t\t} else {\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`{\"deleted\":`)\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendInt(n)\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.AppendByte('}')\n")
+		fmt.Fprintf(b, "\t\t}\n")
 
 	case "list":
-		fmt.Fprintf(b, "\t\tq := app.%s.Where(conds...).Select(selection.SQLColumns(req.Select)...)\n", modelName)
+		if hasRels {
+			fmt.Fprintf(b, "\t\tcols := selection.SQLColumns(req.Select)\n")
+			writeInferredFKEnsure(b, rels)
+			fmt.Fprintf(b, "\t\tq := app.%s.Where(conds...).Select(cols...)\n", modelName)
+		} else {
+			fmt.Fprintf(b, "\t\tq := app.%s.Where(conds...).Select(selection.SQLColumns(req.Select)...)\n", modelName)
+		}
 		if inf.OrderBy != "" {
 			order := str.ToSnakeCase(inf.OrderBy)
 			if inf.OrderDesc {
@@ -411,32 +431,84 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 			// Top/First: fixed limit, no pagination
 			fmt.Fprintf(b, "\t\tresults, err := q.Limit(%d).All(ctx)\n", inf.TopN)
 			fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+			if hasRels {
+				fmt.Fprintf(b, "\t\tif err := resolve%sListRelations(ctx, app, results, req.Select); err != nil {\n", modelName)
+				fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
+			}
 			lower := str.LowerFirst(modelName)
-			fmt.Fprintf(b, "\t\t%sListJSON(results).WriteJSON(req.Buf, req.Select)\n", lower)
+			fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
+			fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(results)))\n")
+			fmt.Fprintf(b, "\t\t\tfor _, item := range results {\n")
+			fmt.Fprintf(b, "\t\t\t\titem.WriteLuxo(req.Buf, req.FieldMask)\n")
+			fmt.Fprintf(b, "\t\t\t}\n")
+			fmt.Fprintf(b, "\t\t} else {\n")
+			fmt.Fprintf(b, "\t\t\t%sListJSON(results).WriteJSON(req.Buf, req.Select)\n", lower)
+			fmt.Fprintf(b, "\t\t}\n")
 		} else {
 			fmt.Fprintf(b, "\t\tresults, total, err := q.Limit(req.PageSize).Offset((req.Page - 1) * req.PageSize).AllWithCount(ctx)\n")
 			fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+			if hasRels {
+				fmt.Fprintf(b, "\t\tif err := resolve%sListRelations(ctx, app, results, req.Select); err != nil {\n", modelName)
+				fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
+			}
 			lower := str.LowerFirst(modelName)
-			fmt.Fprintf(b, "\t\treq.Buf.AppendString(`{\"items\":`)\n")
-			fmt.Fprintf(b, "\t\t%sListJSON(results).WriteJSON(req.Buf, req.Select)\n", lower)
-			fmt.Fprintf(b, "\t\treq.Buf.AppendString(`,\"total\":`)\n")
-			fmt.Fprintf(b, "\t\treq.Buf.AppendInt(total)\n")
-			fmt.Fprintf(b, "\t\treq.Buf.AppendString(`,\"page\":`)\n")
-			fmt.Fprintf(b, "\t\treq.Buf.AppendInt(int64(req.Page))\n")
-			fmt.Fprintf(b, "\t\treq.Buf.AppendString(`,\"pageSize\":`)\n")
-			fmt.Fprintf(b, "\t\treq.Buf.AppendInt(int64(req.PageSize))\n")
-			fmt.Fprintf(b, "\t\treq.Buf.AppendByte('}')\n")
+			fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
+			fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(results)))\n")
+			fmt.Fprintf(b, "\t\t\tfor _, item := range results {\n")
+			fmt.Fprintf(b, "\t\t\t\titem.WriteLuxo(req.Buf, req.FieldMask)\n")
+			fmt.Fprintf(b, "\t\t\t}\n")
+			fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, total)\n")
+			fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.Page))\n")
+			fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.PageSize))\n")
+			fmt.Fprintf(b, "\t\t} else {\n")
+			fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`{\"items\":`)\n")
+			fmt.Fprintf(b, "\t\t\t%sListJSON(results).WriteJSON(req.Buf, req.Select)\n", lower)
+			fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`,\"total\":`)\n")
+			fmt.Fprintf(b, "\t\t\treq.Buf.AppendInt(total)\n")
+			fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`,\"page\":`)\n")
+			fmt.Fprintf(b, "\t\t\treq.Buf.AppendInt(int64(req.Page))\n")
+			fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`,\"pageSize\":`)\n")
+			fmt.Fprintf(b, "\t\t\treq.Buf.AppendInt(int64(req.PageSize))\n")
+			fmt.Fprintf(b, "\t\t\treq.Buf.AppendByte('}')\n")
+			fmt.Fprintf(b, "\t\t}\n")
 		}
 
 	default: // get
-		fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(conds...).Select(selection.SQLColumns(req.Select)...).First(ctx)\n", modelName)
+		if hasRels {
+			fmt.Fprintf(b, "\t\tcols := selection.SQLColumns(req.Select)\n")
+			writeInferredFKEnsure(b, rels)
+			fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(conds...).Select(cols...).First(ctx)\n", modelName)
+		} else {
+			fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(conds...).Select(selection.SQLColumns(req.Select)...).First(ctx)\n", modelName)
+		}
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		fmt.Fprintf(b, "\t\tif result == nil {\n\t\t\treturn errors.NotFound.WithData(map[string]any{\"resource\": %q})\n\t\t}\n", modelName)
-		fmt.Fprintf(b, "\t\tresult.WriteJSON(req.Buf, req.Select)\n")
+		fmt.Fprintf(b, "\t\tif result == nil {\n\t\t\treturn errors.NotFound.WithData(errors.ResourceError{Resource: %q})\n\t\t}\n", modelName)
+		if hasRels {
+			fmt.Fprintf(b, "\t\tif err := resolve%sRelations(ctx, app, result, req.Select); err != nil {\n", modelName)
+			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
+		}
+		fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
+		fmt.Fprintf(b, "\t\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
+		fmt.Fprintf(b, "\t\t} else {\n")
+		fmt.Fprintf(b, "\t\t\tresult.WriteJSON(req.Buf, req.Select)\n")
+		fmt.Fprintf(b, "\t\t}\n")
 	}
 
 	fmt.Fprintf(b, "\t\treturn nil\n")
 	fmt.Fprintf(b, "\t}\n}\n\n")
+}
+
+// writeInferredFKEnsure writes ensureField calls for relation FK columns in inferred handlers.
+func writeInferredFKEnsure(b *strings.Builder, rels []Relation) {
+	seen := make(map[string]bool)
+	for _, rel := range rels {
+		col := str.ToSnakeCase(rel.LocalKey)
+		if seen[col] {
+			continue
+		}
+		seen[col] = true
+		fmt.Fprintf(b, "\t\tcols = ensureField(cols, %q)\n", col)
+	}
 }
 
 // writeZeroParamClause writes a zero-parameter clause (true/false/isNull/isNotNull).
@@ -524,7 +596,7 @@ func writeClauseSQL(b *strings.Builder, clause InferClause, m *ast.ModelDecl, pa
 		if paramIdx+1 < len(params) {
 			param2 = params[paramIdx+1].Name
 		}
-		fmt.Fprintf(b, "\t\t\tparts = append(parts, fmt.Sprintf(\"%s BETWEEN $%%d AND $%%d\", argIdx, argIdx+1))\n", col)
+		fmt.Fprintf(b, "\t\t\tparts = append(parts, \"%s BETWEEN $\" + strconv.Itoa(argIdx) + \" AND $\" + strconv.Itoa(argIdx+1))\n", col)
 		fmt.Fprintf(b, "\t\t\torArgs = append(orArgs, %s, %s)\n", paramExpr, param2)
 		fmt.Fprintf(b, "\t\t\targIdx += 2\n")
 		return paramIdx + 2
@@ -537,7 +609,7 @@ func writeClauseSQL(b *strings.Builder, clause InferClause, m *ast.ModelDecl, pa
 	}
 
 	sqlOp := clauseOpToSQL(clause.Op)
-	fmt.Fprintf(b, "\t\t\tparts = append(parts, fmt.Sprintf(\"%s %s $%%d\", argIdx))\n", col, sqlOp)
+	fmt.Fprintf(b, "\t\t\tparts = append(parts, \"%s %s $\" + strconv.Itoa(argIdx))\n", col, sqlOp)
 	fmt.Fprintf(b, "\t\t\torArgs = append(orArgs, %s)\n", paramExpr)
 	fmt.Fprintf(b, "\t\t\targIdx++\n")
 	return paramIdx + 1
@@ -585,7 +657,7 @@ func writeClauseSQLStringMatch(b *strings.Builder, op, col, paramExpr string) bo
 
 // writeClauseSQLLike writes a LIKE/NOT LIKE/ILIKE clause for OR groups.
 func writeClauseSQLLike(b *strings.Builder, col, op, valExpr string) {
-	fmt.Fprintf(b, "\t\t\tparts = append(parts, fmt.Sprintf(\"%s %s $%%d\", argIdx))\n", col, op)
+	fmt.Fprintf(b, "\t\t\tparts = append(parts, \"%s %s $\" + strconv.Itoa(argIdx))\n", col, op)
 	fmt.Fprintf(b, "\t\t\torArgs = append(orArgs, %s)\n", valExpr)
 	fmt.Fprintf(b, "\t\t\targIdx++\n")
 }
@@ -596,7 +668,7 @@ func writeClauseSQLSet(b *strings.Builder, col, op, paramExpr string) {
 	fmt.Fprintf(b, "\t\t\t{\n")
 	fmt.Fprintf(b, "\t\t\t\tph := make([]string, len(%s))\n", paramExpr)
 	fmt.Fprintf(b, "\t\t\t\tfor i := range %s {\n", paramExpr)
-	fmt.Fprintf(b, "\t\t\t\t\tph[i] = fmt.Sprintf(\"$%%d\", argIdx+i)\n")
+	fmt.Fprintf(b, "\t\t\t\t\tph[i] = \"$\" + strconv.Itoa(argIdx+i)\n")
 	fmt.Fprintf(b, "\t\t\t\t}\n")
 	fmt.Fprintf(b, "\t\t\t\tparts = append(parts, \"%s %s (\" + strings.Join(ph, \", \") + \")\")\n", col, op)
 	fmt.Fprintf(b, "\t\t\t\tfor _, v := range %s {\n", paramExpr)

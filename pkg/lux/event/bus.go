@@ -2,7 +2,13 @@
 // Embedded mode uses Go channels, multi-service mode uses NATS.
 package event
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"os"
+
+	"github.com/light-speak/luxo/pkg/lux/env"
+)
 
 // Bus is the interface for publishing and subscribing to events.
 // ChanBus (channel) and NATSBus implement this interface.
@@ -29,3 +35,18 @@ type Bus interface {
 // For ChanBus, payload is the original struct (zero-copy).
 // For NATSBus, payload is []byte (raw JSON from wire).
 type Handler func(ctx context.Context, payload any)
+
+// NewFromEnv creates a Bus based on environment configuration.
+// If NATS_URL is set, connects to NATS (falls back to ChanBus on failure).
+// Otherwise uses ChanBus with default buffer size 256.
+func NewFromEnv() Bus {
+	if natsURL, ok := env.Get("NATS_URL"); ok {
+		bus, err := NewNATSBus(natsURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: NATS connect failed, using channel bus: %v\n", err)
+			return NewChanBus(256)
+		}
+		return bus
+	}
+	return NewChanBus(256)
+}

@@ -36,7 +36,7 @@ func TestAppErrorUnwrapNil(t *testing.T) {
 }
 
 func TestErrorsAs(t *testing.T) {
-	e := NotFound.WithData(map[string]any{"resource": "User"})
+	e := NotFound.WithData(ResourceError{Resource: "User"})
 	var wrapped error = e
 
 	var appErr *AppError
@@ -46,19 +46,21 @@ func TestErrorsAs(t *testing.T) {
 	if appErr.Code != 404 {
 		t.Errorf("code = %d, want 404", appErr.Code)
 	}
-	if appErr.Data["resource"] != "User" {
-		t.Error("data should contain resource")
+	re, ok := appErr.Data.(ResourceError)
+	if !ok || re.Resource != "User" {
+		t.Error("data should be ResourceError with Resource=User")
 	}
 }
 
 func TestWithDataCopies(t *testing.T) {
 	original := NotFound
-	derived := original.WithData(map[string]any{"resource": "Post"})
+	derived := original.WithData(ResourceError{Resource: "Post"})
 
 	if original.Data != nil {
 		t.Error("original should not be modified")
 	}
-	if derived.Data["resource"] != "Post" {
+	re, ok := derived.Data.(ResourceError)
+	if !ok || re.Resource != "Post" {
 		t.Error("derived should have data")
 	}
 	if derived.Name != "NotFound" || derived.Code != 404 {
@@ -127,7 +129,7 @@ func TestBuiltinErrors(t *testing.T) {
 
 func TestErrorsAsChain(t *testing.T) {
 	// AppError wrapped in fmt.Errorf should still be extractable via errors.As
-	inner := NotFound.WithData(map[string]any{"resource": "Order"})
+	inner := NotFound.WithData(ResourceError{Resource: "Order"})
 	wrapped := fmt.Errorf("handler: %w", inner)
 
 	var appErr *AppError
@@ -146,5 +148,47 @@ func TestNew(t *testing.T) {
 	}
 	if e.Data != nil || e.Cause != nil || e.Internal {
 		t.Error("new error should have zero optional fields")
+	}
+}
+
+func TestParamErrorI18nData(t *testing.T) {
+	p := ParamError{Param: "email", Error: "invalid format"}
+	m := p.I18nData()
+	if m["param"] != "email" || m["error"] != "invalid format" {
+		t.Errorf("got %v", m)
+	}
+}
+
+func TestResourceErrorI18nData(t *testing.T) {
+	r := ResourceError{Resource: "User", ID: int64(42)}
+	m := r.I18nData()
+	if m["resource"] != "User" || m["id"] != int64(42) {
+		t.Errorf("got %v", m)
+	}
+
+	// nil ID should be omitted
+	r2 := ResourceError{Resource: "Post"}
+	m2 := r2.I18nData()
+	if _, ok := m2["id"]; ok {
+		t.Error("nil ID should not appear in I18nData")
+	}
+}
+
+func TestMapDataI18nData(t *testing.T) {
+	d := MapData{"key": "value", "count": 3}
+	m := d.I18nData()
+	if m["key"] != "value" || m["count"] != 3 {
+		t.Errorf("got %v", m)
+	}
+}
+
+func TestWithDataMapData(t *testing.T) {
+	e := BadRequest.WithData(MapData{"field": "name", "reason": "too short"})
+	md, ok := e.Data.(MapData)
+	if !ok {
+		t.Fatal("Data should be MapData")
+	}
+	if md["field"] != "name" {
+		t.Errorf("got %v", md)
 	}
 }

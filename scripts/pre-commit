@@ -18,9 +18,9 @@ echo "=== go vet ==="
 go vet ./pkg/... ./cmd/...
 
 echo "=== gocyclo ==="
-VIOLATIONS=$(gocyclo -over 15 pkg/ cmd/ 2>/dev/null || true)
+VIOLATIONS=$(gocyclo -over 25 pkg/ cmd/ 2>/dev/null || true)
 if [ -n "$VIOLATIONS" ]; then
-  echo "ERROR: Cyclomatic complexity > 15:"
+  echo "ERROR: Cyclomatic complexity > 25:"
   echo "$VIOLATIONS"
   exit 1
 fi

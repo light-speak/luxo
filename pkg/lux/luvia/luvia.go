@@ -10,6 +10,8 @@ import (
 	"github.com/light-speak/luxo/pkg/lux/auth"
 	"github.com/light-speak/luxo/pkg/lux/env"
 	"github.com/light-speak/luxo/pkg/lux/i18n"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 // Gateway is the Luvia API gateway.
@@ -30,14 +32,27 @@ func (g *Gateway) AddModule(name string) {
 	g.modules = append(g.modules, name)
 }
 
-// Serve starts the HTTP server with banner display.
+// Serve starts the HTTP/2 server with banner display.
+// Default: h2c (HTTP/2 cleartext, no TLS, zero config).
+// If APP_TLS_CERT and APP_TLS_KEY are set, uses HTTP/2 with TLS.
 func (g *Gateway) Serve(version string) error {
 	mux, port := g.buildMux(version)
-
 	addr := ":" + port
-	fmt.Printf("  Listening on http://localhost%s\n\n", addr)
 
-	return http.ListenAndServe(addr, mux)
+	certFile := envOr("APP_TLS_CERT", "")
+	keyFile := envOr("APP_TLS_KEY", "")
+
+	if certFile != "" && keyFile != "" {
+		// HTTP/2 with TLS
+		fmt.Printf("  Listening on https://localhost%s (HTTP/2 + TLS)\n\n", addr)
+		return http.ListenAndServeTLS(addr, certFile, keyFile, mux)
+	}
+
+	// Default: h2c (HTTP/2 cleartext) — zero config, max performance
+	h2s := &http2.Server{}
+	handler := h2c.NewHandler(mux, h2s)
+	fmt.Printf("  Listening on http://localhost%s (HTTP/2 h2c)\n\n", addr)
+	return http.ListenAndServe(addr, handler)
 }
 
 // buildMux creates the HTTP mux with all routes and middleware.

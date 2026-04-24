@@ -31,15 +31,14 @@ func generateEventFile(result *semantic.Result, packageName string) []byte {
 
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
-	if len(listeners) > 0 {
-		b.WriteString("\n\t\"github.com/bytedance/sonic\"\n")
-	}
+	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/event\"\n")
 	b.WriteString(")\n\n")
 
-	// Event structs
+	// Event structs + MarshalLuxo/UnmarshalLuxo
 	for _, e := range events {
 		generateEventStruct(&b, e)
+		generateEventCodec(&b, e)
 	}
 
 	// Emit functions — pass struct directly, zero serialization
@@ -64,6 +63,102 @@ func generateEventStruct(b *strings.Builder, e *ast.EventDecl) {
 	b.WriteString("}\n\n")
 }
 
+// generateEventCodec generates MarshalLuxo/UnmarshalLuxo for binary encoding.
+// Field IDs come from luxo.lock (stable across schema evolution).
+func generateEventCodec(b *strings.Builder, e *ast.EventDecl) {
+	typeName := e.Name + "Event"
+
+	// MarshalLuxo
+	fmt.Fprintf(b, "// MarshalLuxo encodes %s to Luxo binary format.\n", typeName)
+	fmt.Fprintf(b, "func (e *%s) MarshalLuxo() []byte {\n", typeName)
+	b.WriteString("\tvar enc codec.Encoder\n")
+	for _, p := range e.Params {
+		fieldID := getEventFieldID(e.Name, p.Name)
+		if fieldID == 0 {
+			continue // no lock entry — skip (shouldn't happen after Update)
+		}
+		goField := str.Capitalize(p.Name)
+		nullable := p.Type != nil && p.Type.Nullable
+		switch resolveGoType(p.Type) {
+		case "int64":
+			if nullable {
+				fmt.Fprintf(b, "\tenc.WriteFieldIntPtr(%d, e.%s)\n", fieldID, goField)
+			} else {
+				fmt.Fprintf(b, "\tenc.WriteFieldInt(%d, e.%s)\n", fieldID, goField)
+			}
+		case "float64":
+			if nullable {
+				fmt.Fprintf(b, "\tenc.WriteFieldFloatPtr(%d, e.%s)\n", fieldID, goField)
+			} else {
+				fmt.Fprintf(b, "\tenc.WriteFieldFloat(%d, e.%s)\n", fieldID, goField)
+			}
+		case "string":
+			if nullable {
+				fmt.Fprintf(b, "\tenc.WriteFieldStringPtr(%d, e.%s)\n", fieldID, goField)
+			} else {
+				fmt.Fprintf(b, "\tenc.WriteFieldString(%d, e.%s)\n", fieldID, goField)
+			}
+		case "bool":
+			if nullable {
+				fmt.Fprintf(b, "\tenc.WriteFieldBoolPtr(%d, e.%s)\n", fieldID, goField)
+			} else {
+				fmt.Fprintf(b, "\tenc.WriteFieldBool(%d, e.%s)\n", fieldID, goField)
+			}
+		default:
+			// Complex types (models, lists) — skip for now, fall back to JSON
+			fmt.Fprintf(b, "\t// TODO: complex type %s for field %s\n", resolveGoType(p.Type), p.Name)
+		}
+	}
+	b.WriteString("\tenc.WriteEnd()\n")
+	b.WriteString("\treturn enc.Bytes()\n")
+	b.WriteString("}\n\n")
+
+	// UnmarshalLuxo
+	fmt.Fprintf(b, "// UnmarshalLuxo decodes %s from Luxo binary format.\n", typeName)
+	fmt.Fprintf(b, "func (e *%s) UnmarshalLuxo(data []byte) error {\n", typeName)
+	b.WriteString("\tdec := codec.NewDecoder(data)\n")
+	b.WriteString("\tfor dec.NextField() {\n")
+	b.WriteString("\t\tswitch dec.FieldID() {\n")
+	for _, p := range e.Params {
+		fieldID := getEventFieldID(e.Name, p.Name)
+		if fieldID == 0 {
+			continue
+		}
+		goField := str.Capitalize(p.Name)
+		nullable := p.Type != nil && p.Type.Nullable
+		switch resolveGoType(p.Type) {
+		case "int64":
+			if nullable {
+				fmt.Fprintf(b, "\t\tcase %d: e.%s = dec.ReadIntPtr()\n", fieldID, goField)
+			} else {
+				fmt.Fprintf(b, "\t\tcase %d: e.%s = dec.ReadInt()\n", fieldID, goField)
+			}
+		case "float64":
+			if nullable {
+				fmt.Fprintf(b, "\t\tcase %d: e.%s = dec.ReadFloatPtr()\n", fieldID, goField)
+			} else {
+				fmt.Fprintf(b, "\t\tcase %d: e.%s = dec.ReadFloat()\n", fieldID, goField)
+			}
+		case "string":
+			if nullable {
+				fmt.Fprintf(b, "\t\tcase %d: e.%s = dec.ReadStringPtr()\n", fieldID, goField)
+			} else {
+				fmt.Fprintf(b, "\t\tcase %d: e.%s = dec.ReadString()\n", fieldID, goField)
+			}
+		case "bool":
+			if nullable {
+				fmt.Fprintf(b, "\t\tcase %d: e.%s = dec.ReadBoolPtr()\n", fieldID, goField)
+			} else {
+				fmt.Fprintf(b, "\t\tcase %d: e.%s = dec.ReadBool()\n", fieldID, goField)
+			}
+		}
+	}
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\treturn dec.Err()\n")
+	b.WriteString("}\n\n")
+}
+
 // generateEmitFunc generates a typed emit function.
 // Passes the struct directly — ChanBus delivers zero-copy,
 // NATSBus serializes at the wire boundary.
@@ -75,9 +170,9 @@ func generateEmitFunc(b *strings.Builder, e *ast.EventDecl) {
 }
 
 // generateRegisterEvents generates RegisterEvents that wires all on-listeners.
-// Default uses OnQueue with moduleName as the queue group (competing consumers).
-// Listeners with @broadcast use On (every instance receives).
-// Handlers use type switch: struct for ChanBus, []byte for NATSBus.
+// Default uses OnQueueDecode with moduleName as the queue group (competing consumers).
+// Listeners with @broadcast use OnDecode (every instance receives).
+// Unmarshal uses Luxo binary (UnmarshalLuxo) for wire decoding.
 func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleName string) {
 	b.WriteString("// RegisterEvents registers all event listeners with the bus.\n")
 	b.WriteString("func RegisterEvents(bus event.Bus) {\n")
@@ -87,21 +182,34 @@ func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleN
 		if len(l.Params) > 0 {
 			paramName = l.Params[0]
 		}
+		eventType := l.EventName + "Event"
+		// Use generated UnmarshalLuxo wrapper as the decode function
+		unmarshalFunc := fmt.Sprintf("unmarshal%s", l.EventName)
 		if l.Broadcast {
-			fmt.Fprintf(b, "\tbus.On(%q, func(ctx context.Context, payload any) {\n", l.EventName)
+			fmt.Fprintf(b, "\tevent.OnDecode(bus, %q, %s, func(ctx context.Context, %s %s) {\n", l.EventName, unmarshalFunc, paramName, eventType)
 		} else {
-			fmt.Fprintf(b, "\tbus.OnQueue(%q, %q, func(ctx context.Context, payload any) {\n", l.EventName, moduleName)
+			fmt.Fprintf(b, "\tevent.OnQueueDecode(bus, %q, %q, %s, func(ctx context.Context, %s %s) {\n", l.EventName, moduleName, unmarshalFunc, paramName, eventType)
 		}
-		fmt.Fprintf(b, "\t\tvar %s %sEvent\n", paramName, l.EventName)
-		fmt.Fprintf(b, "\t\tswitch v := payload.(type) {\n")
-		fmt.Fprintf(b, "\t\tcase %sEvent:\n", l.EventName)
-		fmt.Fprintf(b, "\t\t\t%s = v\n", paramName)
-		fmt.Fprintf(b, "\t\tcase []byte:\n")
-		fmt.Fprintf(b, "\t\t\tsonic.Unmarshal(v, &%s)\n", paramName)
-		fmt.Fprintf(b, "\t\t}\n")
 		fmt.Fprintf(b, "\t\t_ = %s\n", paramName)
 		b.WriteString("\t})\n")
 	}
 
-	b.WriteString("}\n")
+	b.WriteString("}\n\n")
+
+	// Generate unmarshal adapter functions for each event type
+	// These match the func([]byte, any) error signature required by OnDecode
+	seen := make(map[string]bool)
+	for _, l := range listeners {
+		if seen[l.EventName] {
+			continue
+		}
+		seen[l.EventName] = true
+		eventType := l.EventName + "Event"
+		fmt.Fprintf(b, "func unmarshal%s(data []byte, v any) error {\n", l.EventName)
+		fmt.Fprintf(b, "\tif e, ok := v.(*%s); ok {\n", eventType)
+		fmt.Fprintf(b, "\t\treturn e.UnmarshalLuxo(data)\n")
+		b.WriteString("\t}\n")
+		b.WriteString("\treturn nil\n")
+		b.WriteString("}\n\n")
+	}
 }

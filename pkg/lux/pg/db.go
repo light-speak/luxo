@@ -265,7 +265,15 @@ func UpdateReturning[T any, ID comparable](ctx context.Context, db *DB, scan Sca
 			b.WriteString(", ")
 		}
 		b.WriteString(s.Col)
-		b.WriteString(" = $")
+		if s.Atomic != "" {
+			b.WriteString(" = ")
+			b.WriteString(s.Col)
+			b.WriteByte(' ')
+			b.WriteString(s.Atomic)
+			b.WriteString(" $")
+		} else {
+			b.WriteString(" = $")
+		}
 		b.Write(strconv.AppendInt(tmp[:0], int64(argIdx), 10))
 		args = append(args, s.Val)
 		argIdx++

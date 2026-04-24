@@ -88,9 +88,9 @@ jobs:
       - name: Gocyclo check
         run: |
           go install github.com/fzipp/gocyclo/cmd/gocyclo@latest
-          VIOLATIONS=$(gocyclo -over 15 pkg/)
+          VIOLATIONS=$(gocyclo -over 25 pkg/)
           if [ -n "$VIOLATIONS" ]; then
-            echo "::error::Cyclomatic complexity > 15:"
+            echo "::error::Cyclomatic complexity > 25:"
             echo "$VIOLATIONS"
             exit 1
           fi

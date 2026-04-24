@@ -18,25 +18,47 @@ type moduleInfo struct {
 
 func collectModules(result *semantic.Result) []moduleInfo {
 	enums := collectEnums(result)
-	var modules []moduleInfo
+
+	// Group files by module name (directory or single file)
+	grouped := make(map[string]*moduleInfo)
+	var order []string
 	for _, file := range result.Files {
-		name := strings.TrimSuffix(file.Name, ".luxo")
-		if idx := strings.LastIndex(name, "/"); idx >= 0 {
-			name = name[idx+1:]
+		modName := moduleNameFromFile(file.Name)
+		if _, ok := grouped[modName]; !ok {
+			grouped[modName] = &moduleInfo{name: modName}
+			order = append(order, modName)
 		}
-		crud, loaders := false, false
+		info := grouped[modName]
 		for _, m := range file.Models {
 			if hasDirective(m.Directives, "crud") {
-				crud = true
+				info.hasCrud = true
 			}
 			if len(analyzeRelations(m, enums)) > 0 {
-				loaders = true
+				info.hasLoaders = true
 			}
 		}
-		events := len(file.Events) > 0 || len(file.Listeners) > 0
-		modules = append(modules, moduleInfo{name: name, hasCrud: crud, hasLoaders: loaders, hasEvents: events})
+		if len(file.Events) > 0 || len(file.Listeners) > 0 {
+			info.hasEvents = true
+		}
+	}
+
+	var modules []moduleInfo
+	for _, name := range order {
+		modules = append(modules, *grouped[name])
 	}
 	return modules
+}
+
+// moduleNameFromFile extracts the module name from a file path.
+// "origin/user.luxo" → "user"
+// "origin/user/model.luxo" → "user"
+func moduleNameFromFile(path string) string {
+	rel := strings.TrimPrefix(path, "origin/")
+	parts := strings.Split(rel, "/")
+	if len(parts) == 1 {
+		return strings.TrimSuffix(parts[0], ".luxo")
+	}
+	return parts[0]
 }
 
 func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
@@ -144,22 +166,12 @@ func writeDataLoaderWiring(b *strings.Builder, modules []moduleInfo) {
 }
 
 func writeEventBusWiring(b *strings.Builder, modules []moduleInfo) {
-	b.WriteString("\tvar eventBus event.Bus\n")
-	b.WriteString("\tif natsURL, ok := env.Get(\"NATS_URL\"); ok {\n")
-	b.WriteString("\t\tbus, err := event.NewNATSBus(natsURL)\n")
-	b.WriteString("\t\tif err != nil {\n")
-	b.WriteString("\t\t\tfmt.Fprintf(os.Stderr, \"warning: NATS connect failed, using channel bus: %v\\n\", err)\n")
-	b.WriteString("\t\t\teventBus = event.NewChanBus(256)\n")
-	b.WriteString("\t\t} else {\n")
-	b.WriteString("\t\t\teventBus = bus\n")
-	b.WriteString("\t\t}\n")
-	b.WriteString("\t} else {\n")
-	b.WriteString("\t\teventBus = event.NewChanBus(256)\n")
-	b.WriteString("\t}\n")
+	b.WriteString("\teventBus := event.NewFromEnv()\n")
 	b.WriteString("\tdefer eventBus.Close()\n\n")
 
 	for _, m := range modules {
 		if m.hasEvents {
+			fmt.Fprintf(b, "\t%sApp.EventBus = eventBus\n", m.name)
 			fmt.Fprintf(b, "\t%s_luxo.RegisterEvents(eventBus)\n", m.name)
 		}
 	}
