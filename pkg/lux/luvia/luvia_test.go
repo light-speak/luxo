@@ -288,3 +288,77 @@ func TestBuildMuxLuviaRoute(t *testing.T) {
 		t.Error("/luvia route should be registered")
 	}
 }
+
+func TestCORSPreflightOptions(t *testing.T) {
+	handler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("OPTIONS should not reach inner handler")
+	}))
+
+	r := httptest.NewRequest(http.MethodOptions, "/luvia", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+
+	if w.Code != http.StatusNoContent {
+		t.Errorf("OPTIONS should return 204, got %d", w.Code)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("CORS origin = %q, want *", got)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Methods"); got != "POST, OPTIONS" {
+		t.Errorf("CORS methods = %q", got)
+	}
+}
+
+func TestCORSCustomOrigin(t *testing.T) {
+	os.Setenv("CORS_ORIGIN", "https://example.com")
+	defer os.Unsetenv("CORS_ORIGIN")
+
+	handler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	r := httptest.NewRequest(http.MethodPost, "/luvia", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://example.com" {
+		t.Errorf("CORS origin = %q, want https://example.com", got)
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	handler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	r := httptest.NewRequest(http.MethodPost, "/luvia", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+
+	checks := map[string]string{
+		"X-Content-Type-Options":  "nosniff",
+		"X-Frame-Options":         "DENY",
+		"X-XSS-Protection":        "1; mode=block",
+		"Content-Security-Policy": "default-src 'none'",
+	}
+	for header, want := range checks {
+		if got := w.Header().Get(header); got != want {
+			t.Errorf("%s = %q, want %q", header, got, want)
+		}
+	}
+}
+
+func TestCORSPassThroughNonOptions(t *testing.T) {
+	called := false
+	handler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	r := httptest.NewRequest(http.MethodPost, "/luvia", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+
+	if !called {
+		t.Error("POST should reach inner handler")
+	}
+	if w.Code != http.StatusOK {
+		t.Errorf("POST should return 200, got %d", w.Code)
+	}
+}

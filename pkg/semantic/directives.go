@@ -343,6 +343,10 @@ var builtinDirectives = []DirectiveDef{
 		Description: "implementation provided by Go (not Luxo)",
 	},
 	{
+		Name: "service", Contexts: OnFn,
+		Description: "expose fn as RPC endpoint via Luxo protocol for cross-service calls",
+	},
+	{
 		Name: "cache", Contexts: OnApi | OnComputed,
 		Params:      []ParamDef{{Name: "ttl"}},
 		MaxArgs:     1,

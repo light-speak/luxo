@@ -10,10 +10,11 @@ import (
 // GenerateEntryFile produces luxis/app/main.gen.go — the embedded entry point
 // that imports all modules, registers handlers, and starts the Luvia gateway.
 type moduleInfo struct {
-	name       string
-	hasCrud    bool
-	hasLoaders bool
-	hasEvents  bool
+	name          string
+	hasCrud       bool
+	hasLoaders    bool
+	hasEvents     bool
+	hasServiceFns bool
 }
 
 func collectModules(result *semantic.Result) []moduleInfo {
@@ -37,8 +38,18 @@ func collectModules(result *semantic.Result) []moduleInfo {
 				info.hasLoaders = true
 			}
 		}
+		// Extend declarations need DataLoaders (cross-module load)
+		if len(file.Extends) > 0 {
+			info.hasLoaders = true
+		}
 		if len(file.Events) > 0 || len(file.Listeners) > 0 {
 			info.hasEvents = true
+		}
+		for _, fn := range file.Functions {
+			if hasDirective(fn.Directives, "service") {
+				info.hasServiceFns = true
+				break
+			}
 		}
 	}
 
@@ -86,12 +97,15 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 		fmt.Fprintf(&b, "\t%s_resolver \"%s/service/%s/resolver\"\n", m.name, modulePath, m.name)
 	}
 
-	// Check if any module has events
+	// Check if any module has events or service fns
 	anyEvents := false
+	anyServiceFns := false
 	for _, m := range modules {
 		if m.hasEvents {
 			anyEvents = true
-			break
+		}
+		if m.hasServiceFns {
+			anyServiceFns = true
 		}
 	}
 
@@ -101,6 +115,8 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/event\"\n")
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
+	// rpc needed for fn @service or cluster mode DataLoaders
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/rpc\"\n")
 	b.WriteString(")\n\n")
 
 	// Version variable
@@ -121,6 +137,12 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 	// Create Luvia gateway
 	b.WriteString("\tgw := luvia.New()\n\n")
 
+	// Register schema for Binary↔JSON conversion
+	for _, m := range modules {
+		fmt.Fprintf(&b, "\t%s_luxo.RegisterSchema(gw.Router.Schema)\n", m.name)
+	}
+	b.WriteString("\n")
+
 	// Register modules and handlers
 	for _, m := range modules {
 		fmt.Fprintf(&b, "\tgw.AddModule(%q)\n", m.name)
@@ -128,9 +150,36 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 			fmt.Fprintf(&b, "\t%s_luxo.RegisterHandlers(gw.Router, %sApp)\n", m.name, m.name)
 		}
 	}
-	b.WriteString("\n")
 
-	// Start server
+	// Register service fns + batch loaders + RPC server (cluster mode only)
+	if anyServiceFns {
+		b.WriteString("\t// fn @service + batch load endpoints — registered on router for both modes\n")
+		b.WriteString("\t// Embedded: called in-process. Cluster: called via RPC.\n")
+		for _, m := range modules {
+			if m.hasServiceFns {
+				fmt.Fprintf(&b, "\t%s_luxo.RegisterServiceFns(gw.Router, %sApp)\n", m.name, m.name)
+			}
+		}
+		for _, m := range modules {
+			if m.hasCrud {
+				fmt.Fprintf(&b, "\t%s_luxo.RegisterBatchLoaders(gw.Router, %sApp)\n", m.name, m.name)
+			}
+		}
+		b.WriteString("\n")
+		b.WriteString("\t// RPC server — only in cluster mode (other services call via Luxo protocol)\n")
+		b.WriteString("\tif deployMode == \"cluster\" {\n")
+		b.WriteString("\t\trpcServer := rpc.NewServer(gw.Router)\n")
+		b.WriteString("\t\tgo func() {\n")
+		b.WriteString("\t\t\trpcAddr := \":\" + env.GetOrDefault(\"LUXO_PORT\", \"9000\")\n")
+		b.WriteString("\t\t\tif err := rpcServer.ListenAndServe(rpcAddr); err != nil {\n")
+		b.WriteString("\t\t\t\tfmt.Fprintf(os.Stderr, \"rpc: %v\\n\", err)\n")
+		b.WriteString("\t\t\t}\n")
+		b.WriteString("\t\t}()\n")
+		b.WriteString("\t\tdefer rpcServer.Close()\n")
+		b.WriteString("\t}\n\n")
+	}
+
+	// Start HTTP server
 	b.WriteString("\tif err := gw.Serve(Version); err != nil {\n")
 	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"fatal: %v\\n\", err)\n")
 	b.WriteString("\t\tos.Exit(1)\n")
@@ -157,12 +206,49 @@ func writeModuleApps(b *strings.Builder, modules []moduleInfo) {
 
 func writeDataLoaderWiring(b *strings.Builder, modules []moduleInfo) {
 	b.WriteString("\tdlCfg := dataloader.DefaultConfig()\n")
+	b.WriteString("\tdeployMode := env.GetOrDefault(\"DEPLOY_MODE\", \"embedded\")\n\n")
+
+	// Check if any module needs remote loaders
+	hasRemote := false
 	for _, m := range modules {
 		if m.hasLoaders {
-			fmt.Fprintf(b, "\t%sApp.SetLoaders(%s_luxo.NewDefaultLoaders(%sApp, dlCfg))\n", m.name, m.name, m.name)
+			hasRemote = true
+			break
 		}
 	}
-	b.WriteString("\n")
+
+	if hasRemote {
+		b.WriteString("\tif deployMode == \"cluster\" {\n")
+		b.WriteString("\t\t// Cluster mode: extend models use RPC-backed DataLoaders\n")
+		b.WriteString("\t\trpcClients := make(map[string]*rpc.Client)\n")
+		for _, m := range modules {
+			envKey := strings.ToUpper(m.name) + "_SERVICE_ADDR"
+			defaultAddr := m.name + ":9000"
+			fmt.Fprintf(b, "\t\trpcClients[%q] = rpc.NewClient(env.GetOrDefault(%q, %q))\n",
+				m.name, envKey, defaultAddr)
+		}
+		for _, m := range modules {
+			if m.hasLoaders {
+				fmt.Fprintf(b, "\t\t%sApp.SetLoaders(%s_luxo.NewRemoteLoaders(%sApp, rpcClients, dlCfg))\n", m.name, m.name, m.name)
+			}
+		}
+		b.WriteString("\t} else {\n")
+		b.WriteString("\t\t// Embedded mode: all DataLoaders use local DB\n")
+		for _, m := range modules {
+			if m.hasLoaders {
+				fmt.Fprintf(b, "\t\t%sApp.SetLoaders(%s_luxo.NewDefaultLoaders(%sApp, dlCfg))\n", m.name, m.name, m.name)
+			}
+		}
+		b.WriteString("\t}\n")
+	} else {
+		for _, m := range modules {
+			if m.hasLoaders {
+				fmt.Fprintf(b, "\t%sApp.SetLoaders(%s_luxo.NewDefaultLoaders(%sApp, dlCfg))\n", m.name, m.name, m.name)
+			}
+		}
+	}
+
+	b.WriteString("\t_ = deployMode\n\n")
 }
 
 func writeEventBusWiring(b *strings.Builder, modules []moduleInfo) {
@@ -176,4 +262,291 @@ func writeEventBusWiring(b *strings.Builder, modules []moduleInfo) {
 		}
 	}
 	b.WriteString("\n")
+}
+
+// GenerateModuleEntryFiles produces per-module entry points for cluster mode.
+// Each module gets its own main.gen.go under luxis/<module>/.
+// Returns map[moduleName][]byte.
+func GenerateModuleEntryFiles(result *semantic.Result, modulePath string) map[string][]byte {
+	allModules := collectModules(result)
+	if len(allModules) == 0 {
+		return nil
+	}
+
+	entries := make(map[string][]byte)
+	for _, target := range allModules {
+		src := generateSingleModuleEntry(target, allModules, result, modulePath)
+		if src != nil {
+			entries[target.name] = src
+		}
+	}
+	return entries
+}
+
+// generateSingleModuleEntry generates a standalone entry point for one module.
+// Imports only this module. Cross-module DataLoaders use RPC clients.
+func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, result *semantic.Result, modulePath string) []byte {
+	var b strings.Builder
+	b.WriteString("// Code generated by luxo. DO NOT EDIT.\n")
+	fmt.Fprintf(&b, "// Source: %s/main.gen.go (cluster entry for %s module)\n\n", target.name, target.name)
+	b.WriteString("package main\n\n")
+	b.WriteString("import (\n")
+	b.WriteString("\t\"context\"\n")
+	b.WriteString("\t\"fmt\"\n")
+	b.WriteString("\t\"os\"\n\n")
+
+	// Import only this module
+	fmt.Fprintf(&b, "\t%s_luxo \"%s/service/%s/luxo\"\n", target.name, modulePath, target.name)
+	fmt.Fprintf(&b, "\t%s_resolver \"%s/service/%s/resolver\"\n", target.name, modulePath, target.name)
+
+	b.WriteString("\n")
+	if target.hasLoaders {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/dataloader\"\n")
+	}
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/env\"\n")
+	if target.hasEvents {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/event\"\n")
+	}
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/migrate\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/rpc\"\n")
+	b.WriteString(")\n\n")
+
+	b.WriteString("var Version = \"dev\"\n\n")
+
+	b.WriteString("func main() {\n")
+	b.WriteString("\tctx := context.Background()\n\n")
+	b.WriteString("\tif err := env.Load(\".env\"); err != nil {\n")
+	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"warning: %v\\n\", err)\n")
+	b.WriteString("\t}\n\n")
+
+	// Cluster mode: DB name = PROJECT_MODULE (e.g., wechat_user)
+	fmt.Fprintf(&b, "\tif prefix := os.Getenv(\"DATABASE_PREFIX\"); prefix != \"\" {\n")
+	fmt.Fprintf(&b, "\t\tos.Setenv(\"DATABASE_PREFIX\", prefix+\"_%s\")\n", target.name)
+	fmt.Fprintf(&b, "\t}\n\n")
+
+	// Auto-migrate on startup (create database if not exists + run migrations)
+	b.WriteString("\tif env.GetOrDefault(\"AUTO_MIGRATE\", \"true\") == \"true\" {\n")
+	b.WriteString("\t\tif err := migrate.EnsureDatabase(ctx); err != nil {\n")
+	b.WriteString("\t\t\tfmt.Fprintf(os.Stderr, \"ensure db: %v\\n\", err)\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t\tmigrator, err := migrate.New(ctx, \"migrations\")\n")
+	b.WriteString("\t\tif err != nil {\n")
+	b.WriteString("\t\t\tfmt.Fprintf(os.Stderr, \"migrate: %v\\n\", err)\n")
+	b.WriteString("\t\t} else {\n")
+	b.WriteString("\t\t\tif applied, err := migrator.Up(ctx); err != nil {\n")
+	b.WriteString("\t\t\t\tfmt.Fprintf(os.Stderr, \"migrate: %v\\n\", err)\n")
+	b.WriteString("\t\t\t} else if len(applied) > 0 {\n")
+	b.WriteString("\t\t\t\tfmt.Fprintf(os.Stderr, \"migrate: applied %d migration(s)\\n\", len(applied))\n")
+	b.WriteString("\t\t\t}\n")
+	b.WriteString("\t\t\tmigrator.Close()\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t}\n\n")
+
+	// Create app
+	fmt.Fprintf(&b, "\tapp, err := %s_luxo.New(ctx)\n", target.name)
+	b.WriteString("\tif err != nil {\n")
+	fmt.Fprintf(&b, "\t\tfmt.Fprintf(os.Stderr, \"fatal: %s: %%v\\n\", err)\n", target.name)
+	b.WriteString("\t\tos.Exit(1)\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\tdefer app.Close()\n\n")
+	fmt.Fprintf(&b, "\t%s_resolver.Setup(app)\n\n", target.name)
+
+	// DataLoader — RemoteLoaders for cross-module
+	if target.hasLoaders {
+		b.WriteString("\tdlCfg := dataloader.DefaultConfig()\n")
+		b.WriteString("\trpcClients := make(map[string]*rpc.Client)\n")
+		for _, other := range allModules {
+			if other.name == target.name {
+				continue
+			}
+			envKey := strings.ToUpper(other.name) + "_SERVICE_ADDR"
+			defaultAddr := other.name + ":9000"
+			fmt.Fprintf(&b, "\trpcClients[%q] = rpc.NewClient(env.GetOrDefault(%q, %q))\n",
+				other.name, envKey, defaultAddr)
+		}
+		fmt.Fprintf(&b, "\tapp.SetLoaders(%s_luxo.NewRemoteLoaders(app, rpcClients, dlCfg))\n\n", target.name)
+	}
+
+	// Events
+	if target.hasEvents {
+		b.WriteString("\teventBus := event.NewFromEnv()\n")
+		b.WriteString("\tdefer eventBus.Close()\n")
+		b.WriteString("\tapp.EventBus = eventBus\n")
+		fmt.Fprintf(&b, "\t%s_luxo.RegisterEvents(eventBus)\n\n", target.name)
+	}
+
+	// Gateway + handlers
+	b.WriteString("\tgw := luvia.New()\n")
+	fmt.Fprintf(&b, "\tgw.AddModule(%q)\n", target.name)
+	if target.hasCrud {
+		fmt.Fprintf(&b, "\t%s_luxo.RegisterHandlers(gw.Router, app)\n", target.name)
+		fmt.Fprintf(&b, "\t%s_luxo.RegisterBatchLoaders(gw.Router, app)\n", target.name)
+	}
+	if target.hasServiceFns {
+		fmt.Fprintf(&b, "\t%s_luxo.RegisterServiceFns(gw.Router, app)\n", target.name)
+	}
+	b.WriteString("\n")
+
+	// RPC server (cluster mode — other services call us)
+	b.WriteString("\trpcServer := rpc.NewServer(gw.Router)\n")
+	b.WriteString("\tgo func() {\n")
+	b.WriteString("\t\trpcAddr := \":\" + env.GetOrDefault(\"LUXO_PORT\", \"9000\")\n")
+	b.WriteString("\t\tif err := rpcServer.ListenAndServe(rpcAddr); err != nil {\n")
+	b.WriteString("\t\t\tfmt.Fprintf(os.Stderr, \"rpc: %v\\n\", err)\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t}()\n")
+	b.WriteString("\tdefer rpcServer.Close()\n\n")
+
+	// Start HTTP
+	b.WriteString("\tif err := gw.Serve(Version); err != nil {\n")
+	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"fatal: %v\\n\", err)\n")
+	b.WriteString("\t\tos.Exit(1)\n")
+	b.WriteString("\t}\n")
+	b.WriteString("}\n")
+
+	return []byte(b.String())
+}
+
+// GenerateGatewayEntry produces luxis/gateway/main.gen.go — a pure routing gateway.
+// Routes API requests to the correct backend service via Luxo RPC.
+// Owns the full schema for Binary↔JSON conversion. No handler code.
+func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
+	allModules := collectModules(result)
+	if len(allModules) == 0 {
+		return nil
+	}
+
+	// Build API → module mapping
+	type apiRoute struct {
+		apiName    string
+		moduleName string
+	}
+	var routes []apiRoute
+	for _, file := range result.Files {
+		modName := moduleNameFromFile(file.Name)
+		for _, m := range file.Models {
+			if !hasCrud(m) {
+				continue
+			}
+			for _, op := range crudOperations(m) {
+				routes = append(routes, apiRoute{crudAPIName(m.Name, op), modName})
+			}
+		}
+		for _, a := range file.APIs {
+			routes = append(routes, apiRoute{a.Name, modName})
+		}
+		for _, fn := range file.Functions {
+			if hasDirective(fn.Directives, "service") {
+				routes = append(routes, apiRoute{"svc:" + fn.Name, modName})
+			}
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("// Code generated by luxo. DO NOT EDIT.\n")
+	b.WriteString("// Source: gateway/main.gen.go (Luvia Gateway — API router)\n\n")
+	b.WriteString("package main\n\n")
+	b.WriteString("import (\n")
+	b.WriteString("\t\"context\"\n")
+	b.WriteString("\t\"fmt\"\n")
+	b.WriteString("\t\"os\"\n\n")
+
+	for _, m := range allModules {
+		fmt.Fprintf(&b, "\t%s_luxo \"%s/service/%s/luxo\"\n", m.name, modulePath, m.name)
+	}
+
+	b.WriteString("\n\t\"encoding/json\"\n\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/env\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/rpc\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/schema\"\n")
+	b.WriteString(")\n\n")
+
+	b.WriteString("var Version = \"dev\"\n\n")
+
+	b.WriteString("func main() {\n")
+	b.WriteString("\tif err := env.Load(\".env\"); err != nil {\n")
+	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"warning: %v\\n\", err)\n")
+	b.WriteString("\t}\n\n")
+
+	// RPC clients — default address = moduleName:9000 (Docker/K8s DNS)
+	b.WriteString("\trpcClients := map[string]*rpc.Client{}\n")
+	for _, m := range allModules {
+		envKey := strings.ToUpper(m.name) + "_SERVICE_ADDR"
+		defaultAddr := m.name + ":9000"
+		fmt.Fprintf(&b, "\trpcClients[%q] = rpc.NewClient(env.GetOrDefault(%q, %q))\n",
+			m.name, envKey, defaultAddr)
+	}
+	b.WriteString("\n")
+
+	// Gateway
+	b.WriteString("\tgw := luvia.New()\n\n")
+
+	// Schema
+	for _, m := range allModules {
+		fmt.Fprintf(&b, "\t%s_luxo.RegisterSchema(gw.Router.Schema)\n", m.name)
+	}
+	b.WriteString("\n")
+
+	// Routing table
+	b.WriteString("\trouting := map[string]string{\n")
+	for _, r := range routes {
+		fmt.Fprintf(&b, "\t\t%q: %q,\n", r.apiName, r.moduleName)
+	}
+	b.WriteString("\t}\n")
+	b.WriteString("\tfor apiName, moduleName := range routing {\n")
+	b.WriteString("\t\tclient := rpcClients[moduleName]\n")
+	b.WriteString("\t\tif client == nil {\n")
+	b.WriteString("\t\t\tcontinue\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t\tgw.Router.Handle(apiName, proxyHandler(client, gw.Router.Schema, apiName))\n")
+	b.WriteString("\t}\n\n")
+
+	for _, m := range allModules {
+		fmt.Fprintf(&b, "\tgw.AddModule(%q)\n", m.name)
+	}
+	b.WriteString("\n")
+
+	b.WriteString("\t_ = context.Background\n\n")
+
+	b.WriteString("\tif err := gw.Serve(Version); err != nil {\n")
+	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"fatal: %v\\n\", err)\n")
+	b.WriteString("\t\tos.Exit(1)\n")
+	b.WriteString("\t}\n")
+	b.WriteString("}\n\n")
+
+	// proxyHandler with full param encoding
+	b.WriteString("// proxyHandler forwards requests to a backend service via Luxo RPC.\n")
+	b.WriteString("// Encodes JSON params to binary using schema, calls RPC, returns binary response.\n")
+	b.WriteString("func proxyHandler(client *rpc.Client, s *schema.Schema, apiName string) api.HandlerFunc {\n")
+	b.WriteString("\tapiMeta := s.APIs[apiName]\n")
+	b.WriteString("\tapiID := 0\n")
+	b.WriteString("\tif apiMeta != nil {\n")
+	b.WriteString("\t\tapiID = apiMeta.ID\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\treturn func(ctx context.Context, req *api.Request) error {\n")
+	b.WriteString("\t\t// Encode params: JSON raw params → binary using schema\n")
+	b.WriteString("\t\tvar params []byte\n")
+	b.WriteString("\t\tif apiMeta != nil && len(req.Params) > 0 {\n")
+	b.WriteString("\t\t\tjsonParams := make(map[string]any, len(req.Params))\n")
+	b.WriteString("\t\t\tfor k, v := range req.Params {\n")
+	b.WriteString("\t\t\t\tvar val any\n")
+	b.WriteString("\t\t\t\tif err := json.Unmarshal(v, &val); err == nil {\n")
+	b.WriteString("\t\t\t\t\tjsonParams[k] = val\n")
+	b.WriteString("\t\t\t\t}\n")
+	b.WriteString("\t\t\t}\n")
+	b.WriteString("\t\t\tparams = schema.JSONParamsToBinary(jsonParams, apiMeta)\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t\tresp, err := client.Call(apiID, params)\n")
+	b.WriteString("\t\tif err != nil {\n")
+	b.WriteString("\t\t\treturn err\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t\treq.Buf.B = append(req.Buf.B, resp...)\n")
+	b.WriteString("\t\treturn nil\n")
+	b.WriteString("\t}\n")
+	b.WriteString("}\n")
+
+	return []byte(b.String())
 }

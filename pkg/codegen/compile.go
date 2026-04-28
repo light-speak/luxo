@@ -53,6 +53,21 @@ func compileAPIBody(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast
 	fmt.Fprintf(b, "\t}\n}\n\n")
 }
 
+// compileFnBody generates Go handler code from a .luxo fn body.
+// Reuses the same compilation pipeline as API bodies.
+func compileFnBody(b *strings.Builder, fn *ast.FnDecl, models map[string]*ast.ModelDecl, enums map[string]bool) {
+	// Convert FnDecl to ApiDecl for code reuse — they share the same structure
+	api := &ast.ApiDecl{
+		Pos:        fn.Pos,
+		Name:       fn.Name,
+		Params:     fn.Params,
+		ReturnType: fn.ReturnType,
+		Directives: fn.Directives,
+		Body:       fn.Body,
+	}
+	compileAPIBody(b, api, models, enums)
+}
+
 // valType tracks the resolved type of a val variable.
 type valType struct {
 	isModel bool   // true if this is a *Model or []*Model
@@ -182,25 +197,16 @@ func (c *compiler) compileReturn(s *ast.ReturnStmt) {
 	}
 	expr := c.compileExpr(s.Value)
 
-	// 1. Direct model query chain — WriteJSON / WriteLuxo
+	// 1. Direct model query chain — extract to temp var, then WriteJSON / WriteLuxo
 	if c.isModelQuery(s.Value) {
 		qt := c.resolveQueryType(s.Value)
+		// Extract query result to temp variable (query returns (result, error))
+		c.write("_result, err := %s", expr)
+		c.write("if err != nil {\n%s\treturn err\n%s}", c.indent, c.indent)
 		if qt.isList {
-			lower := str.LowerFirst(qt.name)
-			c.write("if req.BinaryMode {")
-			c.write("\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(%s)))", expr)
-			c.write("\tfor _, item := range %s {", expr)
-			c.write("\t\titem.WriteLuxo(req.Buf, req.FieldMask)")
-			c.write("\t}")
-			c.write("} else {")
-			c.write("\t%sListJSON(%s).WriteJSON(req.Buf, req.Select)", lower, expr)
-			c.write("}")
+			c.write("WriteColumnar%s(req.Buf, _result, req.FieldMask)", qt.name)
 		} else {
-			c.write("if req.BinaryMode {")
-			c.write("\t%s.WriteLuxo(req.Buf, req.FieldMask)", expr)
-			c.write("} else {")
-			c.write("\t%s.WriteJSON(req.Buf, req.Select)", expr)
-			c.write("}")
+			c.write("_result.WriteLuxo(req.Buf, req.FieldMask)")
 		}
 		c.write("return nil")
 		return
@@ -220,116 +226,56 @@ func (c *compiler) compileReturn(s *ast.ReturnStmt) {
 	c.write("return nil")
 }
 
-// writeReturnByType emits the correct output code based on tracked variable type.
+// writeReturnByType emits binary output code based on tracked variable type.
+// Always writes Luxo binary — Luvia converts to JSON if needed.
 func (c *compiler) writeReturnByType(expr string, vt valType) {
 	if vt.isModel {
 		if vt.isList {
-			lower := str.LowerFirst(vt.name)
 			if c.paginate {
-				// Page response
-				c.write("if req.BinaryMode {")
-				c.write("\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(%s)))", expr)
-				c.write("\tfor _, item := range %s {", expr)
-				c.write("\t\titem.WriteLuxo(req.Buf, req.FieldMask)")
-				c.write("\t}")
-				c.write("\treq.Buf.B = codec.AppendSvarint(req.Buf.B, _total)")
-				c.write("\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.Page))")
-				c.write("\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.PageSize))")
-				c.write("} else {")
-				c.write("\treq.Buf.AppendString(`{\"items\":`)")
-				c.write("\t%sListJSON(%s).WriteJSON(req.Buf, req.Select)", lower, expr)
-				c.write("\treq.Buf.AppendString(`,\"total\":`)")
-				c.write("\treq.Buf.AppendInt(_total)")
-				c.write("\treq.Buf.AppendString(`,\"page\":`)")
-				c.write("\treq.Buf.AppendInt(int64(req.Page))")
-				c.write("\treq.Buf.AppendString(`,\"pageSize\":`)")
-				c.write("\treq.Buf.AppendInt(int64(req.PageSize))")
-				c.write("\treq.Buf.AppendByte('}')")
-				c.write("}")
+				c.write("WriteColumnar%s(req.Buf, %s, req.FieldMask)", vt.name, expr)
+				c.write("req.Buf.B = codec.AppendSvarint(req.Buf.B, _total)")
+				c.write("req.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.Page))")
+				c.write("req.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.PageSize))")
 			} else {
-				c.write("if req.BinaryMode {")
-				c.write("\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(%s)))", expr)
-				c.write("\tfor _, item := range %s {", expr)
-				c.write("\t\titem.WriteLuxo(req.Buf, req.FieldMask)")
-				c.write("\t}")
-				c.write("} else {")
-				c.write("\t%sListJSON(%s).WriteJSON(req.Buf, req.Select)", lower, expr)
-				c.write("}")
+				c.write("WriteColumnar%s(req.Buf, %s, req.FieldMask)", vt.name, expr)
 			}
 		} else {
-			c.write("if req.BinaryMode {")
-			c.write("\t%s.WriteLuxo(req.Buf, req.FieldMask)", expr)
-			c.write("} else {")
-			c.write("\t%s.WriteJSON(req.Buf, req.Select)", expr)
-			c.write("}")
+			c.write("%s.WriteLuxo(req.Buf, req.FieldMask)", expr)
 		}
 		return
 	}
 	switch vt.name {
 	case "Int":
-		c.write("if req.BinaryMode {")
-		c.write("\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(%s))", expr)
-		c.write("} else {")
-		c.write("\treq.Buf.AppendInt(int64(%s))", expr)
-		c.write("}")
+		c.write("req.Buf.B = codec.AppendSvarint(req.Buf.B, int64(%s))", expr)
 	case "Float":
-		c.write("if req.BinaryMode {")
-		c.write("\treq.Buf.B = codec.AppendFixed64(req.Buf.B, %s)", expr)
-		c.write("} else {")
-		c.write("\treq.Buf.AppendFloat(%s)", expr)
-		c.write("}")
+		c.write("req.Buf.B = codec.AppendFixed64(req.Buf.B, %s)", expr)
 	case "Boolean":
-		c.write("if req.BinaryMode {")
-		c.write("\treq.Buf.B = codec.AppendBool(req.Buf.B, %s)", expr)
-		c.write("} else {")
-		c.write("\treq.Buf.AppendBool(%s)", expr)
-		c.write("}")
+		c.write("req.Buf.B = codec.AppendBool(req.Buf.B, %s)", expr)
 	case "String":
-		c.write("if req.BinaryMode {")
-		c.write("\treq.Buf.B = codec.AppendString(req.Buf.B, %s)", expr)
-		c.write("} else {")
-		c.write("\treq.Buf.AppendJSONString(%s)", expr)
-		c.write("}")
+		c.write("req.Buf.B = codec.AppendString(req.Buf.B, %s)", expr)
 	default:
 		c.write("req.Buf.AppendJSON(%s)", expr)
 	}
 }
 
-// writeScalarReturn emits the correct typed append for non-model return values.
+// writeScalarReturn emits binary output for non-model return values.
 func (c *compiler) writeScalarReturn(expr string) {
 	if c.api != nil && c.api.ReturnType != nil {
 		switch c.api.ReturnType.Name {
 		case "Int":
-			c.write("if req.BinaryMode {")
-			c.write("\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(%s))", expr)
-			c.write("} else {")
-			c.write("\treq.Buf.AppendInt(int64(%s))", expr)
-			c.write("}")
+			c.write("req.Buf.B = codec.AppendSvarint(req.Buf.B, int64(%s))", expr)
 			return
 		case "Float":
-			c.write("if req.BinaryMode {")
-			c.write("\treq.Buf.B = codec.AppendFixed64(req.Buf.B, %s)", expr)
-			c.write("} else {")
-			c.write("\treq.Buf.AppendFloat(%s)", expr)
-			c.write("}")
+			c.write("req.Buf.B = codec.AppendFixed64(req.Buf.B, %s)", expr)
 			return
 		case "Boolean":
-			c.write("if req.BinaryMode {")
-			c.write("\treq.Buf.B = codec.AppendBool(req.Buf.B, %s)", expr)
-			c.write("} else {")
-			c.write("\treq.Buf.AppendBool(%s)", expr)
-			c.write("}")
+			c.write("req.Buf.B = codec.AppendBool(req.Buf.B, %s)", expr)
 			return
 		case "String":
-			c.write("if req.BinaryMode {")
-			c.write("\treq.Buf.B = codec.AppendString(req.Buf.B, %s)", expr)
-			c.write("} else {")
-			c.write("\treq.Buf.AppendJSONString(%s)", expr)
-			c.write("}")
+			c.write("req.Buf.B = codec.AppendString(req.Buf.B, %s)", expr)
 			return
 		}
 	}
-	// Fallback for unknown types
 	c.write("req.Buf.AppendJSON(%s)", expr)
 }
 
@@ -879,6 +825,19 @@ func (c *compiler) resolveQueryType(expr ast.Expr) valType {
 			switch last.method {
 			case "first", "find":
 				return valType{isModel: true, name: ident.Name}
+			case "load":
+				// PK load (no named args) → single model; FK load (named args) → list
+				hasNamed := false
+				for _, arg := range last.args {
+					if arg.Name != "" {
+						hasNamed = true
+						break
+					}
+				}
+				if hasNamed {
+					return valType{isModel: true, isList: true, name: ident.Name}
+				}
+				return valType{isModel: true, name: ident.Name}
 			case "all":
 				return valType{isModel: true, isList: true, name: ident.Name}
 			case "create", "exec":
@@ -911,7 +870,7 @@ func (c *compiler) isModelQuery(expr ast.Expr) bool {
 			// Check terminal method
 			last := chain[len(chain)-1]
 			switch last.method {
-			case "first", "all", "create", "exec", "find", "exists", "update", "delete", "count",
+			case "first", "all", "create", "exec", "find", "load", "exists", "update", "delete", "count",
 				"sum", "avg", "min", "max":
 				return true
 			}
@@ -978,6 +937,67 @@ func isHashField(model *ast.ModelDecl, fieldName string) bool {
 }
 
 // compileTerminalMethod handles chain methods that terminate the chain and return a result.
+// compileLoad generates DataLoader calls for Model.load(...).
+// Supports three patterns:
+//   - PK load:         User.load(id)         → app.loaders.ExtendUser.Load(ctx, id, nil)
+//   - FK load:         Post.load(userId: x)  → app.loaders.PostByUserId.Load(ctx, x, nil)
+//   - Multi-condition: Post.load(userId: x, type: y) → app.loaders.PostByUserIdAndType.Load(ctx, PostByUserIdAndTypeKey{x, y}, nil)
+func (c *compiler) compileLoad(b *strings.Builder, modelName string, args []*ast.NamedArg) {
+	if len(args) == 0 {
+		return
+	}
+
+	// Check if this is a PK load (no named args) or FK/multi-condition load
+	hasNamedArgs := false
+	for _, arg := range args {
+		if arg.Name != "" {
+			hasNamedArgs = true
+			break
+		}
+	}
+
+	if !hasNamedArgs {
+		// PK load: User.load(id) → app.loaders.ExtendUser.Load(ctx, id, nil)
+		val := c.compileExpr(args[0].Value)
+		fmt.Fprintf(b, "app.loaders.Extend%s.Load(ctx, %s, nil)", modelName, val)
+		return
+	}
+
+	// Collect named args
+	var names []string
+	var vals []string
+	for _, arg := range args {
+		names = append(names, arg.Name)
+		vals = append(vals, c.compileExpr(arg.Value))
+	}
+
+	// Build loader name: PostByUserIdAndType
+	loaderName := modelName + "By"
+	for i, name := range names {
+		if i > 0 {
+			loaderName += "And"
+		}
+		loaderName += str.Capitalize(name)
+	}
+
+	if len(names) == 1 {
+		// Single FK: Post.load(userId: x) → app.loaders.PostByUserId.Load(ctx, x, nil)
+		fmt.Fprintf(b, "app.loaders.%s.Load(ctx, %s, nil)", loaderName, vals[0])
+	} else {
+		// Composite key: Post.load(userId: x, type: y)
+		// → app.loaders.PostByUserIdAndType.Load(ctx, PostByUserIdAndTypeKey{UserId: x, Type: y}, nil)
+		keyType := loaderName + "Key"
+		fmt.Fprintf(b, "app.loaders.%s.Load(ctx, %s{", loaderName, keyType)
+		for i, name := range names {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(b, "%s: %s", str.Capitalize(name), vals[i])
+		}
+		b.WriteString("}, nil)")
+	}
+}
+
 func (c *compiler) compileTerminalMethod(b *strings.Builder, modelName string, link chainLink) bool {
 	switch link.method {
 	case "find":
@@ -985,6 +1005,9 @@ func (c *compiler) compileTerminalMethod(b *strings.Builder, modelName string, l
 			val := c.compileExpr(link.args[0].Value)
 			fmt.Fprintf(b, "app.%s.Where(%sWhere.Id.Eq(%s)).First(ctx)", modelName, modelName, val)
 		}
+		return true
+	case "load":
+		c.compileLoad(b, modelName, link.args)
 		return true
 	}
 	// Check if this is a terminal method first

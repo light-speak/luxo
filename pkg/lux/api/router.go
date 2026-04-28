@@ -10,6 +10,7 @@ import (
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/light-speak/luxo/pkg/lux/i18n"
+	"github.com/light-speak/luxo/pkg/lux/schema"
 )
 
 // Pre-allocated response framing bytes — avoids per-request []byte conversion.
@@ -27,7 +28,8 @@ type Router struct {
 	handlers   map[string]HandlerFunc
 	translator *i18n.Translator
 	devMode    bool
-	Registry   *APIRegistry // binary protocol API ID mapping
+	Registry   *APIRegistry   // binary protocol API ID mapping
+	Schema     *schema.Schema // model/API metadata for Binary↔JSON conversion
 }
 
 // NewRouter creates an empty router.
@@ -35,6 +37,7 @@ func NewRouter() *Router {
 	return &Router{
 		handlers: make(map[string]HandlerFunc),
 		Registry: NewAPIRegistry(),
+		Schema:   schema.New(),
 	}
 }
 
@@ -92,6 +95,21 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Force handler to always write Luxo binary.
+	// Luvia converts to JSON if client wants JSON.
+	req.BinaryMode = true
+
+	// Convert $select to FieldMask for binary mode WriteLuxo
+	if !binaryMode && req.Select != nil && rt.Schema != nil {
+		apiMeta := rt.Schema.APIs[req.API]
+		if apiMeta != nil && apiMeta.ReturnType != "" {
+			model := rt.Schema.Models[apiMeta.ReturnType]
+			if model != nil {
+				req.FieldMask = schema.SelectToFieldMask(req.Select, model)
+			}
+		}
+	}
+
 	// Get pooled buffer, set on request, handler writes directly
 	buf := GetBuf()
 	req.Buf = buf
@@ -104,19 +122,53 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if binaryMode {
+		// Client wants binary: handler wrote Luxo binary, pass through
 		w.Header().Set("Content-Type", "application/x-luxo")
 		w.Header().Set("X-Luxo-Mode", "binary")
 		w.WriteHeader(http.StatusOK)
 		w.Write(buf.B)
 	} else {
+		// Client wants JSON: convert handler's Luxo binary → JSON via schema
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write(jsonDataPrefix)
-		w.Write(buf.B)
+		w.Write(rt.convertBinaryToJSON(req.API, buf.B))
 		w.Write(jsonDataSuffix)
 	}
 
 	PutBuf(buf)
+}
+
+// convertBinaryToJSON converts handler's Luxo binary response to JSON using schema.
+// Handles model, list, paginated list, and scalar return types.
+func (rt *Router) convertBinaryToJSON(apiName string, data []byte) []byte {
+	if rt.Schema == nil || len(data) == 0 {
+		return data
+	}
+	apiMeta := rt.Schema.APIs[apiName]
+	if apiMeta == nil {
+		return data
+	}
+
+	// No return type → scalar passthrough (delete returns count, etc.)
+	if apiMeta.ReturnType == "" {
+		return schema.BinaryScalarToJSON(nil, data)
+	}
+
+	// Check if return type is a model or a scalar type name
+	model := rt.Schema.Models[apiMeta.ReturnType]
+	if model == nil {
+		// Scalar return (Int, Float, String, Boolean)
+		return schema.BinaryScalarToJSON(nil, data)
+	}
+
+	if apiMeta.ReturnList {
+		if apiMeta.Paginated {
+			return schema.BinaryPaginatedListToJSON(nil, data, model)
+		}
+		return schema.BinaryListToJSON(nil, data, model)
+	}
+	return schema.BinaryToJSON(nil, data, model)
 }
 
 // callHandler executes a handler with panic recovery.

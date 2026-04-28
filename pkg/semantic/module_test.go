@@ -412,3 +412,172 @@ func TestModuleNilTypeRefDoesNotPanic(t *testing.T) {
 	result := a.AnalyzeWithModules([]*ast.File{fileA})
 	_ = result // just ensure no panic
 }
+
+// ========== load + Cross-Module Restriction Tests ==========
+
+func TestCrossModuleLoadAllowed(t *testing.T) {
+	fileUser := parseFileWithName(t, `
+model User {
+	id: Int
+	phone: String
+}
+`, "origin/user.luxo")
+
+	filePost := parseFileWithName(t, `
+model Post {
+	id: Int
+	userId: Int
+}
+
+extend User {
+	phone: String
+}
+
+api getAuthorPhone(postId: Int): String {
+	val post = Post.find(postId)
+	val author = User.load(post.userId)
+	return author.phone
+}
+`, "origin/post.luxo")
+
+	result := analyzeModules(t, []*ast.File{fileUser, filePost})
+	for _, e := range result.Errors {
+		// load should be allowed, no errors about "can only use load"
+		if strings.Contains(e.Message, "can only use 'load'") {
+			t.Errorf("unexpected error: %s", e.Message)
+		}
+	}
+}
+
+func TestCrossModuleFindForbidden(t *testing.T) {
+	fileUser := parseFileWithName(t, `
+model User {
+	id: Int
+	phone: String
+}
+`, "origin/user.luxo")
+
+	filePost := parseFileWithName(t, `
+model Post {
+	id: Int
+	userId: Int
+}
+
+extend User {
+	phone: String
+}
+
+api getAuthorPhone(postId: Int): String {
+	val post = Post.find(postId)
+	val author = User.find(post.userId)
+	return author.phone
+}
+`, "origin/post.luxo")
+
+	result := analyzeModules(t, []*ast.File{fileUser, filePost})
+	found := false
+	for _, e := range result.Errors {
+		if strings.Contains(e.Message, "can only use 'load'") && strings.Contains(e.Message, "'find'") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected error: cross-module model 'User' can only use 'load', not 'find'")
+	}
+}
+
+func TestCrossModuleFieldVisibility(t *testing.T) {
+	fileUser := parseFileWithName(t, `
+model User {
+	id: Int
+	phone: String
+	email: String
+}
+`, "origin/user.luxo")
+
+	filePost := parseFileWithName(t, `
+model Post {
+	id: Int
+	userId: Int
+}
+
+extend User {
+	phone: String
+}
+
+api getAuthorEmail(postId: Int): String {
+	val post = Post.find(postId)
+	val author = User.load(post.userId)
+	return author.email
+}
+`, "origin/post.luxo")
+
+	result := analyzeModules(t, []*ast.File{fileUser, filePost})
+	found := false
+	for _, e := range result.Errors {
+		if strings.Contains(e.Message, "not declared in extend") && strings.Contains(e.Message, "email") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected error: field 'email' not declared in extend User")
+	}
+}
+
+func TestCrossModuleExtendFieldAccessAllowed(t *testing.T) {
+	fileUser := parseFileWithName(t, `
+model User {
+	id: Int
+	phone: String
+	email: String
+}
+`, "origin/user.luxo")
+
+	filePost := parseFileWithName(t, `
+model Post {
+	id: Int
+	userId: Int
+}
+
+extend User {
+	phone: String
+	email: String
+}
+
+api getAuthorInfo(postId: Int): String {
+	val post = Post.find(postId)
+	val author = User.load(post.userId)
+	return author.phone
+}
+`, "origin/post.luxo")
+
+	result := analyzeModules(t, []*ast.File{fileUser, filePost})
+	for _, e := range result.Errors {
+		if strings.Contains(e.Message, "not declared in extend") {
+			t.Errorf("unexpected extend field error: %s", e.Message)
+		}
+	}
+}
+
+func TestSameModuleFindAllowed(t *testing.T) {
+	// Same-module model operations should not be restricted
+	fileUser := parseFileWithName(t, `
+model User {
+	id: Int
+	name: String
+}
+
+api getUser(id: Int): User {
+	return User.find(id)
+}
+`, "origin/user.luxo")
+
+	result := analyzeModules(t, []*ast.File{fileUser})
+	for _, e := range result.Errors {
+		if strings.Contains(e.Message, "can only use 'load'") {
+			t.Errorf("same-module find should be allowed: %s", e.Message)
+		}
+	}
+}

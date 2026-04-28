@@ -700,3 +700,258 @@ func TestGenerateDataLoaderDefaultLoadersDedupSeenMap(t *testing.T) {
 		t.Errorf("deduplicated default loader should appear once, got %d", count)
 	}
 }
+
+// --- Extend DataLoader load-by-PK ---
+
+func TestGenerateDataLoaderExtendByPK(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{
+			{
+				Name: "origin/user.luxo",
+				Models: []*ast.ModelDecl{{
+					Pos:  pos0(),
+					Name: "User",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "phone", Type: &ast.TypeRef{Name: "String"}},
+					},
+				}},
+			},
+			{
+				Name: "origin/post.luxo",
+				Models: []*ast.ModelDecl{{
+					Pos:  pos0(),
+					Name: "Post",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+					},
+				}},
+				Extends: []*ast.ExtendDecl{{
+					Name: "User",
+					Fields: []*ast.FieldDecl{
+						{Name: "phone", Type: &ast.TypeRef{Name: "String"}},
+					},
+				}},
+			},
+		},
+	}
+
+	src := generateDataLoaderFile(result, "post_luxo", map[string]bool{}, nil, DriverPG)
+	if src == nil {
+		t.Fatal("expected dataloader file")
+	}
+	code := string(src)
+
+	// Should have ExtendUser loader in struct
+	if !strings.Contains(code, "ExtendUser *dataloader.Loader[int64, *User]") {
+		t.Error("missing ExtendUser loader in struct")
+	}
+
+	// Should have load-by-PK batch function
+	if !strings.Contains(code, `lux.NewIntField("id").In(keys...)`) {
+		t.Error("missing PK condition in extend batch function")
+	}
+
+	// Should query users table
+	if !strings.Contains(code, `"users"`) {
+		t.Error("missing users table in extend batch function")
+	}
+
+	// Should use scanUser
+	if !strings.Contains(code, "scanUser") {
+		t.Error("missing scanUser in extend batch function")
+	}
+
+	// Should have type alias
+	if !strings.Contains(code, "ExtendUserByIdLoader") {
+		t.Error("missing ExtendUserByIdLoader type")
+	}
+}
+
+func TestGenerateDataLoaderFKLoad(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{
+			{
+				Name: "origin/post.luxo",
+				Models: []*ast.ModelDecl{{
+					Pos:  pos0(),
+					Name: "Post",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+					},
+				}},
+				APIs: []*ast.ApiDecl{{
+					Name:   "getPostsByUser",
+					Params: []*ast.ParamDecl{{Name: "userId", Type: &ast.TypeRef{Name: "Int"}}},
+					Body: &ast.Block{Stmts: []ast.Stmt{
+						&ast.ValStmt{
+							Name: "posts",
+							Value: &ast.CallExpr{
+								Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "load"},
+								Args: []*ast.NamedArg{{Name: "userId", Value: &ast.Ident{Name: "userId"}}},
+							},
+						},
+					}},
+				}},
+			},
+		},
+	}
+
+	src := generateDataLoaderFile(result, "post_luxo", map[string]bool{}, nil, DriverPG)
+	if src == nil {
+		t.Fatal("expected dataloader file for FK load")
+	}
+	code := string(src)
+
+	// Should have PostByUserId loader
+	if !strings.Contains(code, "PostByUserId") {
+		t.Error("missing PostByUserId loader")
+	}
+	// Should have batch function with user_id condition
+	if !strings.Contains(code, `"user_id"`) {
+		t.Error("missing user_id FK condition")
+	}
+}
+
+func TestGenerateDataLoaderCompositeKeyLoad(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{
+			{
+				Name: "origin/post.luxo",
+				Models: []*ast.ModelDecl{{
+					Pos:  pos0(),
+					Name: "Post",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "type", Type: &ast.TypeRef{Name: "String"}},
+					},
+				}},
+				APIs: []*ast.ApiDecl{{
+					Name: "getArticles",
+					Body: &ast.Block{Stmts: []ast.Stmt{
+						&ast.ValStmt{
+							Name: "articles",
+							Value: &ast.CallExpr{
+								Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "load"},
+								Args: []*ast.NamedArg{
+									{Name: "userId", Value: &ast.Ident{Name: "uid"}},
+									{Name: "type", Value: &ast.Literal{Kind: token.String, Value: "article"}},
+								},
+							},
+						},
+					}},
+				}},
+			},
+		},
+	}
+
+	src := generateDataLoaderFile(result, "post_luxo", map[string]bool{}, nil, DriverPG)
+	if src == nil {
+		t.Fatal("expected dataloader file for composite load")
+	}
+	code := string(src)
+
+	// Should have composite key struct
+	if !strings.Contains(code, "PostByUserIdAndTypeKey") {
+		t.Error("missing composite key struct")
+	}
+	// Should have composite loader
+	if !strings.Contains(code, "PostByUserIdAndType") {
+		t.Error("missing composite loader")
+	}
+	// Should have multi-condition WHERE
+	if !strings.Contains(code, `"user_id"`) && !strings.Contains(code, `"type"`) {
+		t.Error("missing multi-condition WHERE")
+	}
+}
+
+func TestCollectLoadCalls(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			APIs: []*ast.ApiDecl{
+				{
+					Name: "api1",
+					Body: &ast.Block{Stmts: []ast.Stmt{
+						&ast.ValStmt{Name: "u", Value: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
+							Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}}, // PK
+						}},
+						&ast.ValStmt{Name: "p", Value: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "load"},
+							Args: []*ast.NamedArg{{Name: "userId", Value: &ast.Ident{Name: "uid"}}}, // FK
+						}},
+					}},
+				},
+			},
+		}},
+	}
+
+	calls := collectLoadCalls(result)
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 load calls, got %d", len(calls))
+	}
+
+	// PK call
+	found := false
+	for _, c := range calls {
+		if c.modelName == "User" && len(c.argNames) == 0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("missing PK load call for User")
+	}
+
+	// FK call
+	found = false
+	for _, c := range calls {
+		if c.modelName == "Post" && len(c.argNames) == 1 && c.argNames[0] == "userId" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("missing FK load call for Post")
+	}
+}
+
+func TestGenerateDataLoaderExtendOnlyModule(t *testing.T) {
+	// Module with no same-module relations, only extend
+	result := &semantic.Result{
+		Files: []*ast.File{
+			{Name: "origin/user.luxo", Models: []*ast.ModelDecl{{Name: "User"}}},
+			{
+				Name: "origin/notification.luxo",
+				Models: []*ast.ModelDecl{{
+					Pos:  pos0(),
+					Name: "Notification",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+					},
+				}},
+				Extends: []*ast.ExtendDecl{{
+					Name:   "User",
+					Fields: []*ast.FieldDecl{{Name: "name", Type: &ast.TypeRef{Name: "String"}}},
+				}},
+			},
+		},
+	}
+
+	src := generateDataLoaderFile(result, "notification_luxo", map[string]bool{}, nil, DriverPG)
+	if src == nil {
+		t.Fatal("expected dataloader file even for extend-only module")
+	}
+	code := string(src)
+
+	if !strings.Contains(code, "ExtendUser") {
+		t.Error("missing ExtendUser loader")
+	}
+	if !strings.Contains(code, "NewDefaultLoaders") {
+		t.Error("missing NewDefaultLoaders")
+	}
+}

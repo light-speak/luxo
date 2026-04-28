@@ -981,8 +981,8 @@ func TestCompileStmtReturnModelVar(t *testing.T) {
 	c.b.Reset()
 	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "user"}})
 	out := compilerOut(c)
-	if !strings.Contains(out, "user.WriteJSON(req.Buf, req.Select)") {
-		t.Fatalf("expected WriteJSON for model var, got %q", out)
+	if !strings.Contains(out, "user.WriteLuxo(req.Buf, req.FieldMask)") {
+		t.Fatalf("expected WriteLuxo for model var, got %q", out)
 	}
 }
 
@@ -1013,8 +1013,8 @@ func TestCompileStmtReturnModelList(t *testing.T) {
 	c.b.Reset()
 	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "users"}})
 	out := compilerOut(c)
-	if !strings.Contains(out, "userListJSON(users).WriteJSON(req.Buf, req.Select)") {
-		t.Fatalf("expected listJSON WriteJSON for list var, got %q", out)
+	if !strings.Contains(out, "WriteColumnar") {
+		t.Fatalf("expected WriteColumnar for list var, got %q", out)
 	}
 }
 
@@ -1027,7 +1027,7 @@ func TestCompileStmtReturnWithAPIReturnType(t *testing.T) {
 	}
 	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "count"}})
 	out := compilerOut(c)
-	if !strings.Contains(out, "req.Buf.AppendInt(int64(count))") {
+	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, int64(count))") {
 		t.Fatalf("expected AppendInt for Int return type, got %q", out)
 	}
 }
@@ -1041,7 +1041,7 @@ func TestCompileStmtReturnBooleanType(t *testing.T) {
 	}
 	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "exists"}})
 	out := compilerOut(c)
-	if !strings.Contains(out, "req.Buf.AppendBool(exists)") {
+	if !strings.Contains(out, "codec.AppendBool(req.Buf.B, exists)") {
 		t.Fatalf("expected AppendBool for Boolean return type, got %q", out)
 	}
 }
@@ -1067,8 +1067,8 @@ func TestCompileStmtReturnDirectQuery(t *testing.T) {
 	}
 	c.compileStmt(&ast.ReturnStmt{Value: retExpr})
 	out := compilerOut(c)
-	if !strings.Contains(out, "userListJSON") {
-		t.Fatalf("expected userListJSON for direct .all() return, got %q", out)
+	if !strings.Contains(out, "WriteColumnar") {
+		t.Fatalf("expected WriteColumnar for direct .all() return, got %q", out)
 	}
 }
 
@@ -1390,8 +1390,8 @@ func TestCompileAPIBodyFullFlow(t *testing.T) {
 	if !strings.Contains(out, "if user == nil {") {
 		t.Fatalf("expected nil check, got %q", out)
 	}
-	if !strings.Contains(out, "user.WriteJSON(req.Buf, req.Select)") {
-		t.Fatalf("expected WriteJSON, got %q", out)
+	if !strings.Contains(out, "user.WriteLuxo(req.Buf, req.FieldMask)") {
+		t.Fatalf("expected WriteLuxo, got %q", out)
 	}
 }
 
@@ -1507,7 +1507,7 @@ func TestCompileReturnFloatType(t *testing.T) {
 	c.api = &ast.ApiDecl{Name: "getPrice", ReturnType: &ast.TypeRef{Name: "Float"}}
 	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "price"}})
 	out := compilerOut(c)
-	if !strings.Contains(out, "req.Buf.AppendFloat(price)") {
+	if !strings.Contains(out, "codec.AppendFixed64(req.Buf.B, price)") {
 		t.Fatalf("expected AppendFloat, got %q", out)
 	}
 }
@@ -1517,7 +1517,7 @@ func TestCompileReturnStringType(t *testing.T) {
 	c.api = &ast.ApiDecl{Name: "getName", ReturnType: &ast.TypeRef{Name: "String"}}
 	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "name"}})
 	out := compilerOut(c)
-	if !strings.Contains(out, "req.Buf.AppendJSONString(name)") {
+	if !strings.Contains(out, "codec.AppendString(req.Buf.B, name)") {
 		t.Fatalf("expected AppendJSONString, got %q", out)
 	}
 }
@@ -1565,7 +1565,7 @@ func TestCompileReturnExistsQueryVar(t *testing.T) {
 	c.b.Reset()
 	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "exists"}})
 	out := compilerOut(c)
-	if !strings.Contains(out, "req.Buf.AppendBool(exists)") {
+	if !strings.Contains(out, "codec.AppendBool(req.Buf.B, exists)") {
 		t.Fatalf("expected AppendBool for exists var, got %q", out)
 	}
 }
@@ -1587,8 +1587,8 @@ func TestCompileReturnCreateQueryVar(t *testing.T) {
 	c.b.Reset()
 	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "user"}})
 	out := compilerOut(c)
-	if !strings.Contains(out, "user.WriteJSON(req.Buf, req.Select)") {
-		t.Fatalf("expected WriteJSON for create result, got %q", out)
+	if !strings.Contains(out, "user.WriteLuxo(req.Buf, req.FieldMask)") {
+		t.Fatalf("expected WriteLuxo for create result, got %q", out)
 	}
 }
 
@@ -1597,10 +1597,10 @@ func TestWriteReturnByTypeScalars(t *testing.T) {
 		vt   valType
 		want string
 	}{
-		{valType{name: "Int"}, "AppendInt"},
-		{valType{name: "Float"}, "AppendFloat"},
+		{valType{name: "Int"}, "AppendSvarint"},
+		{valType{name: "Float"}, "AppendFixed64"},
 		{valType{name: "Boolean"}, "AppendBool"},
-		{valType{name: "String"}, "AppendJSONString"},
+		{valType{name: "String"}, "AppendString"},
 		{valType{name: "Unknown"}, "AppendJSON"},
 	}
 	for _, tt := range tests {
@@ -1644,8 +1644,8 @@ func TestCompileReturnDirectFirstQuery(t *testing.T) {
 	}
 	c.compileStmt(&ast.ReturnStmt{Value: retExpr})
 	out := compilerOut(c)
-	if !strings.Contains(out, ".WriteJSON(req.Buf, req.Select)") {
-		t.Fatalf("expected WriteJSON for direct .first() return, got %q", out)
+	if !strings.Contains(out, ".WriteLuxo(req.Buf, req.FieldMask)") {
+		t.Fatalf("expected WriteLuxo for direct .first() return, got %q", out)
 	}
 	if strings.Contains(out, "ListJSON") {
 		t.Fatalf("should NOT use ListJSON for .first(), got %q", out)
@@ -2050,9 +2050,9 @@ func TestCompileRegisterAPI(t *testing.T) {
 	if !strings.Contains(out, ".SetPassword(password)") {
 		t.Fatalf("missing .SetPassword(password), got:\n%s", out)
 	}
-	// Check return — user is model (from create) → WriteJSON
-	if !strings.Contains(out, "user.WriteJSON(req.Buf, req.Select)") {
-		t.Fatalf("missing WriteJSON return, got:\n%s", out)
+	// Check return — user is model (from create) → WriteLuxo
+	if !strings.Contains(out, "user.WriteLuxo(req.Buf, req.FieldMask)") {
+		t.Fatalf("missing WriteLuxo return, got:\n%s", out)
 	}
 }
 
@@ -2124,9 +2124,9 @@ func TestCompileUpdateProfileAPI(t *testing.T) {
 	if !strings.Contains(out, "user.Bio = bio") {
 		t.Fatalf("missing user.Bio = bio, got:\n%s", out)
 	}
-	// Check return — user is model from find → WriteJSON
-	if !strings.Contains(out, "user.WriteJSON(req.Buf, req.Select)") {
-		t.Fatalf("missing WriteJSON return, got:\n%s", out)
+	// Check return — user is model from find → WriteLuxo
+	if !strings.Contains(out, "user.WriteLuxo(req.Buf, req.FieldMask)") {
+		t.Fatalf("missing WriteLuxo return, got:\n%s", out)
 	}
 }
 
@@ -2209,7 +2209,7 @@ func TestCompileDeleteWithCheckAPI(t *testing.T) {
 		t.Fatalf("missing .Delete(ctx), got:\n%s", out)
 	}
 	// Check return count — count is Int type from delete → AppendInt
-	if !strings.Contains(out, "req.Buf.AppendInt(int64(count))") {
+	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, int64(count))") {
 		t.Fatalf("missing AppendInt for count, got:\n%s", out)
 	}
 }
@@ -2319,7 +2319,7 @@ func TestCompileListWithFilterAPI(t *testing.T) {
 		t.Fatalf("missing .Delete(ctx), got:\n%s", out)
 	}
 	// Check return
-	if !strings.Contains(out, "req.Buf.AppendBool(true)") {
+	if !strings.Contains(out, "codec.AppendBool(req.Buf.B, true)") {
 		t.Fatalf("missing AppendBool(true), got:\n%s", out)
 	}
 }
@@ -2435,7 +2435,7 @@ func TestCompileBatchCreateAPI(t *testing.T) {
 		t.Fatalf("missing count += 1, got:\n%s", out)
 	}
 	// Check return — count is plain val not model query, api returns Int → AppendInt
-	if !strings.Contains(out, "req.Buf.AppendInt(int64(count))") {
+	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, int64(count))") {
 		t.Fatalf("missing AppendInt(count), got:\n%s", out)
 	}
 }
@@ -3085,10 +3085,10 @@ func TestCompileMultipleReturns(t *testing.T) {
 	if !strings.Contains(out, "if x == 0 {") {
 		t.Fatalf("missing if, got:\n%s", out)
 	}
-	if !strings.Contains(out, "req.Buf.AppendBool(false)") {
+	if !strings.Contains(out, "codec.AppendBool(req.Buf.B, false)") {
 		t.Fatalf("missing early return false, got:\n%s", out)
 	}
-	if !strings.Contains(out, "req.Buf.AppendBool(true)") {
+	if !strings.Contains(out, "codec.AppendBool(req.Buf.B, true)") {
 		t.Fatalf("missing final return true, got:\n%s", out)
 	}
 }
@@ -3208,9 +3208,9 @@ func TestCompileParallelProfileAPI(t *testing.T) {
 	if !strings.Contains(out, "gctx") {
 		t.Fatalf("missing gctx, got:\n%s", out)
 	}
-	// Should have WriteJSON for return
-	if !strings.Contains(out, "WriteJSON") {
-		t.Fatalf("missing WriteJSON, got:\n%s", out)
+	// Should have WriteLuxo for return
+	if !strings.Contains(out, "WriteLuxo") {
+		t.Fatalf("missing WriteLuxo, got:\n%s", out)
 	}
 }
 
@@ -3682,8 +3682,8 @@ func TestCompileSearchAPI(t *testing.T) {
 		t.Fatalf("missing .All(ctx), got:\n%s", out)
 	}
 	// Check return — posts is list model → listJSON
-	if !strings.Contains(out, "postListJSON(posts).WriteJSON(req.Buf, req.Select)") {
-		t.Fatalf("missing listJSON WriteJSON, got:\n%s", out)
+	if !strings.Contains(out, "WriteColumnar") {
+		t.Fatalf("missing WriteColumnar, got:\n%s", out)
 	}
 }
 
@@ -3764,7 +3764,7 @@ func TestCompileAnalyticsAPI(t *testing.T) {
 		t.Fatalf("missing .Sum(ctx, amount), got:\n%s", out)
 	}
 	// Check return — total tracked as Int from count → AppendInt
-	if !strings.Contains(out, "req.Buf.AppendInt(int64(total))") {
+	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, int64(total))") {
 		t.Fatalf("missing AppendInt(total), got:\n%s", out)
 	}
 }
@@ -3913,7 +3913,7 @@ func TestCompileForRangeWithAccumulator(t *testing.T) {
 	if !strings.Contains(out, "total += i") {
 		t.Fatalf("missing total += i, got:\n%s", out)
 	}
-	if !strings.Contains(out, "req.Buf.AppendInt(int64(total))") {
+	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, int64(total))") {
 		t.Fatalf("missing AppendInt(total), got:\n%s", out)
 	}
 }
@@ -5595,10 +5595,10 @@ func TestWriteReturnByTypeModelSingle(t *testing.T) {
 	if !strings.Contains(out, "user.WriteLuxo(req.Buf, req.FieldMask)") {
 		t.Fatalf("missing WriteLuxo for model single binary, got:\n%s", out)
 	}
-	if !strings.Contains(out, "user.WriteJSON(req.Buf, req.Select)") {
-		t.Fatalf("missing WriteJSON for model single json, got:\n%s", out)
+	if !strings.Contains(out, "user.WriteLuxo(req.Buf, req.FieldMask)") {
+		t.Fatalf("missing WriteLuxo for model single json, got:\n%s", out)
 	}
-	if !strings.Contains(out, "req.BinaryMode") {
+	if !strings.Contains(out, "req.Buf") {
 		t.Fatalf("missing BinaryMode check, got:\n%s", out)
 	}
 }
@@ -5607,14 +5607,8 @@ func TestWriteReturnByTypeModelList(t *testing.T) {
 	c := newCompiler(nil)
 	c.writeReturnByType("users", valType{isModel: true, isList: true, name: "User"})
 	out := compilerOut(c)
-	if !strings.Contains(out, "codec.AppendVarint(req.Buf.B, uint64(len(users)))") {
-		t.Fatalf("missing list count varint in binary mode, got:\n%s", out)
-	}
-	if !strings.Contains(out, "item.WriteLuxo(req.Buf, req.FieldMask)") {
-		t.Fatalf("missing WriteLuxo in list loop, got:\n%s", out)
-	}
-	if !strings.Contains(out, "userListJSON(users).WriteJSON(req.Buf, req.Select)") {
-		t.Fatalf("missing WriteJSON for list json mode, got:\n%s", out)
+	if !strings.Contains(out, "WriteColumnarUser(req.Buf, users, req.FieldMask)") {
+		t.Fatalf("missing WriteColumnarUser call, got:\n%s", out)
 	}
 }
 
@@ -5633,12 +5627,9 @@ func TestWriteReturnByTypePaginatedList(t *testing.T) {
 	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, int64(req.PageSize))") {
 		t.Fatalf("missing pageSize in binary paginated response, got:\n%s", out)
 	}
-	// JSON mode paginated response
-	if !strings.Contains(out, `"items"`) {
-		t.Fatalf("missing items key in JSON paginated response, got:\n%s", out)
-	}
-	if !strings.Contains(out, `"total"`) {
-		t.Fatalf("missing total key in JSON paginated response, got:\n%s", out)
+	// Binary-only — no JSON keys expected (Luvia converts via schema)
+	if strings.Contains(out, `"items"`) {
+		t.Fatalf("should not have JSON items key in binary-only mode, got:\n%s", out)
 	}
 }
 
@@ -5647,12 +5638,11 @@ func TestWriteReturnByTypeScalarsBinaryMode(t *testing.T) {
 		name   string
 		vt     valType
 		binary string
-		json   string
 	}{
-		{"Int", valType{name: "Int"}, "codec.AppendSvarint", "AppendInt"},
-		{"Float", valType{name: "Float"}, "codec.AppendFixed64", "AppendFloat"},
-		{"Boolean", valType{name: "Boolean"}, "codec.AppendBool", "AppendBool"},
-		{"String", valType{name: "String"}, "codec.AppendString", "AppendJSONString"},
+		{"Int", valType{name: "Int"}, "codec.AppendSvarint"},
+		{"Float", valType{name: "Float"}, "codec.AppendFixed64"},
+		{"Boolean", valType{name: "Boolean"}, "codec.AppendBool"},
+		{"String", valType{name: "String"}, "codec.AppendString"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -5662,11 +5652,8 @@ func TestWriteReturnByTypeScalarsBinaryMode(t *testing.T) {
 			if !strings.Contains(out, tt.binary) {
 				t.Errorf("missing binary %q, got:\n%s", tt.binary, out)
 			}
-			if !strings.Contains(out, tt.json) {
-				t.Errorf("missing json %q, got:\n%s", tt.json, out)
-			}
-			if !strings.Contains(out, "req.BinaryMode") {
-				t.Errorf("missing BinaryMode check, got:\n%s", out)
+			if !strings.Contains(out, "req.Buf") {
+				t.Errorf("missing req.Buf, got:\n%s", out)
 			}
 		})
 	}

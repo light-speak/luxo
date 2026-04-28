@@ -55,6 +55,11 @@ func (d *Decoder) Err() error {
 	return d.err
 }
 
+// Offset returns the current read position.
+func (d *Decoder) Offset() int {
+	return d.off
+}
+
 // --- Typed readers ---
 
 // ReadInt reads a signed int64 value.

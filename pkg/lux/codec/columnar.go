@@ -200,6 +200,11 @@ func (r *ColumnarReader) Err() error {
 	return r.err
 }
 
+// Offset returns the current read position (after all columns + end marker).
+func (r *ColumnarReader) Offset() int {
+	return r.off
+}
+
 // ReadColumnInt reads count int64 values from the current column.
 func (r *ColumnarReader) ReadColumnInt() []int64 {
 	result := make([]int64, 0, r.count)

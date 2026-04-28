@@ -53,7 +53,7 @@ func GenerateNativeFile(result *semantic.Result, packageName string) []byte {
 	return []byte(b.String())
 }
 
-// collectNativeAPIs finds all @native API declarations.
+// collectNativeAPIs finds all @native API and fn declarations.
 func collectNativeAPIs(result *semantic.Result) []nativeAPI {
 	var apis []nativeAPI
 	for _, file := range result.Files {
@@ -63,6 +63,15 @@ func collectNativeAPIs(result *semantic.Result) []nativeAPI {
 					Name:       a.Name,
 					Params:     a.Params,
 					ReturnType: a.ReturnType,
+				})
+			}
+		}
+		for _, fn := range file.Functions {
+			if hasDirective(fn.Directives, "native") {
+				apis = append(apis, nativeAPI{
+					Name:       fn.Name,
+					Params:     fn.Params,
+					ReturnType: fn.ReturnType,
 				})
 			}
 		}

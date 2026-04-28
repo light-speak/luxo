@@ -1801,3 +1801,130 @@ func TestWriteFKEnsureDedupe(t *testing.T) {
 		t.Fatalf("should include post_id, got:\n%s", out)
 	}
 }
+
+// --- fn @service ---
+
+func TestGenerateServiceFnHandler(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/user.luxo",
+			Models: []*ast.ModelDecl{
+				testModel("User", []*ast.Directive{crudDirective()}, []*ast.FieldDecl{
+					testField("id", "Int", directive("id"), directive("auto")),
+					testField("name", "String"),
+					testField("score", "Float"),
+				}),
+			},
+			Functions: []*ast.FnDecl{
+				{
+					Name: "getUserScore",
+					Params: []*ast.ParamDecl{
+						{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+					},
+					ReturnType: &ast.TypeRef{Name: "Float"},
+					Directives: []*ast.Directive{{Name: "service"}},
+					Body: &ast.Block{
+						Stmts: []ast.Stmt{
+							&ast.ReturnStmt{Value: &ast.Literal{Kind: token.Float, Value: "1.5"}},
+						},
+					},
+				},
+			},
+		}},
+	}
+
+	src := generateHandlerFile(result, "luxo", nil)
+	if src == nil {
+		t.Fatal("should generate handler file")
+	}
+	code := string(src)
+
+	// Should have fn handler
+	if !strings.Contains(code, "handleGetUserScore") {
+		t.Error("missing fn @service handler: handleGetUserScore")
+	}
+
+	// Should have RegisterServiceFns
+	if !strings.Contains(code, "func RegisterServiceFns") {
+		t.Error("missing RegisterServiceFns function")
+	}
+
+	// Should register with svc: prefix
+	if !strings.Contains(code, `"svc:getUserScore"`) {
+		t.Error("missing svc: prefix in registration")
+	}
+}
+
+func TestGenerateNativeServiceFnHandler(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/user.luxo",
+			Functions: []*ast.FnDecl{
+				{
+					Name: "processPayment",
+					Params: []*ast.ParamDecl{
+						{Name: "orderId", Type: &ast.TypeRef{Name: "Int"}},
+					},
+					ReturnType: &ast.TypeRef{Name: "Boolean"},
+					Directives: []*ast.Directive{{Name: "native"}, {Name: "service"}},
+					// Body is nil for @native
+				},
+			},
+		}},
+	}
+
+	src := generateHandlerFile(result, "luxo", nil)
+	if src == nil {
+		t.Fatal("should generate handler file for @native @service fn")
+	}
+	code := string(src)
+
+	// Should have native handler delegating to Resolver
+	if !strings.Contains(code, "handleProcessPayment") {
+		t.Error("missing @native @service handler")
+	}
+	if !strings.Contains(code, "app.Resolver.ProcessPayment") {
+		t.Error("missing NativeResolver delegation")
+	}
+	if !strings.Contains(code, `"svc:processPayment"`) {
+		t.Error("missing svc: prefix")
+	}
+}
+
+func TestServiceFnNotRegisteredWithoutAnnotation(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/user.luxo",
+			Models: []*ast.ModelDecl{
+				testModel("User", []*ast.Directive{crudDirective()}, []*ast.FieldDecl{
+					testField("id", "Int", directive("id"), directive("auto")),
+				}),
+			},
+			Functions: []*ast.FnDecl{
+				{
+					Name:       "internalHelper",
+					Params:     []*ast.ParamDecl{},
+					ReturnType: &ast.TypeRef{Name: "Int"},
+					Body: &ast.Block{
+						Stmts: []ast.Stmt{
+							&ast.ReturnStmt{Value: &ast.Literal{Kind: token.Int, Value: "42"}},
+						},
+					},
+					// No @service directive
+				},
+			},
+		}},
+	}
+
+	src := generateHandlerFile(result, "luxo", nil)
+	code := string(src)
+
+	// Internal fn without @service should NOT be registered
+	if strings.Contains(code, "svc:internalHelper") {
+		t.Error("fn without @service should not be registered as RPC")
+	}
+	// Should NOT have RegisterServiceFns (no service fns)
+	if strings.Contains(code, "RegisterServiceFns") {
+		t.Error("no service fns, should not generate RegisterServiceFns")
+	}
+}

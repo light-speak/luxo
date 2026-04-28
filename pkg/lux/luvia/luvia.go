@@ -1,10 +1,14 @@
 package luvia
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/api"
 	"github.com/light-speak/luxo/pkg/lux/auth"
@@ -18,6 +22,7 @@ import (
 type Gateway struct {
 	Router  *api.Router
 	modules []string
+	server  *http.Server
 }
 
 // New creates a new Luvia gateway.
@@ -32,9 +37,10 @@ func (g *Gateway) AddModule(name string) {
 	g.modules = append(g.modules, name)
 }
 
-// Serve starts the HTTP/2 server with banner display.
+// Serve starts the HTTP/2 server with graceful shutdown support.
 // Default: h2c (HTTP/2 cleartext, no TLS, zero config).
 // If APP_TLS_CERT and APP_TLS_KEY are set, uses HTTP/2 with TLS.
+// Handles SIGTERM/SIGINT for graceful shutdown — drains active connections.
 func (g *Gateway) Serve(version string) error {
 	mux, port := g.buildMux(version)
 	addr := ":" + port
@@ -42,17 +48,56 @@ func (g *Gateway) Serve(version string) error {
 	certFile := envOr("APP_TLS_CERT", "")
 	keyFile := envOr("APP_TLS_KEY", "")
 
+	var server *http.Server
+
 	if certFile != "" && keyFile != "" {
-		// HTTP/2 with TLS
+		server = &http.Server{Addr: addr, Handler: mux}
 		fmt.Printf("  Listening on https://localhost%s (HTTP/2 + TLS)\n\n", addr)
-		return http.ListenAndServeTLS(addr, certFile, keyFile, mux)
+		go func() {
+			if err := server.ListenAndServeTLS(certFile, keyFile); err != nil && err != http.ErrServerClosed {
+				fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
+				os.Exit(1)
+			}
+		}()
+	} else {
+		h2s := &http2.Server{}
+		handler := h2c.NewHandler(mux, h2s)
+		server = &http.Server{Addr: addr, Handler: handler}
+		fmt.Printf("  Listening on http://localhost%s (HTTP/2 h2c)\n\n", addr)
+		go func() {
+			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
+				os.Exit(1)
+			}
+		}()
 	}
 
-	// Default: h2c (HTTP/2 cleartext) — zero config, max performance
-	h2s := &http2.Server{}
-	handler := h2c.NewHandler(mux, h2s)
-	fmt.Printf("  Listening on http://localhost%s (HTTP/2 h2c)\n\n", addr)
-	return http.ListenAndServe(addr, handler)
+	g.server = server
+	return g.waitForShutdown()
+}
+
+// waitForShutdown blocks until SIGTERM or SIGINT, then gracefully shuts down.
+func (g *Gateway) waitForShutdown() error {
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+	sig := <-quit
+	fmt.Printf("\n  Received %s, shutting down...\n", sig)
+
+	timeout := 30 * time.Second
+	if v := envOr("SHUTDOWN_TIMEOUT", ""); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			timeout = d
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	if err := g.server.Shutdown(ctx); err != nil {
+		return fmt.Errorf("shutdown: %w", err)
+	}
+	fmt.Println("  Server stopped gracefully.")
+	return nil
 }
 
 // buildMux creates the HTTP mux with all routes and middleware.
@@ -88,16 +133,42 @@ func (g *Gateway) buildMux(version string) (*http.ServeMux, string) {
 		g.Router.SetDevMode(true)
 	}
 
-	// Middleware chain: trace → auth → router
+	// Middleware chain: CORS → trace → auth → router
 	var handler http.Handler = g.Router
 	handler = api.TraceMiddleware(handler)
 	jwtCfg, err := auth.LoadConfig()
 	if err == nil {
 		handler = AuthMiddleware(jwtCfg, handler)
 	}
+	handler = corsMiddleware(handler)
 	mux.Handle("/luvia", handler)
 
 	return mux, port
+}
+
+// corsMiddleware handles CORS preflight, response headers, and security headers (XSS, CSP, etc.).
+// Configurable via CORS_ORIGIN env var (default: "*").
+func corsMiddleware(next http.Handler) http.Handler {
+	origin := envOr("CORS_ORIGIN", "*")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// CORS
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Luxo-Mode, X-Request-Id")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+
+		// Security headers — XSS, clickjacking, MIME sniffing protection
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {

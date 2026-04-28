@@ -176,3 +176,72 @@ func TestGenerateEntryFileWithEvents(t *testing.T) {
 		t.Errorf("should defer eventBus.Close():\n%s", code)
 	}
 }
+
+func TestGenerateEntryFileWithServiceFns(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{
+			{
+				Name: "origin/user.luxo",
+				Models: []*ast.ModelDecl{{
+					Pos:        token.Position{File: "test.luxo", Line: 1, Col: 1},
+					Name:       "User",
+					Directives: []*ast.Directive{{Name: "crud"}},
+				}},
+				Functions: []*ast.FnDecl{{
+					Name:       "getUserScore",
+					Directives: []*ast.Directive{{Name: "service"}},
+					Body:       &ast.Block{},
+				}},
+			},
+		},
+	}
+
+	src := GenerateEntryFile(result, "myapp")
+	code := string(src)
+
+	// Should register service fns
+	if !strings.Contains(code, "user_luxo.RegisterServiceFns(gw.Router, userApp)") {
+		t.Errorf("missing RegisterServiceFns:\n%s", code)
+	}
+
+	// Should start RPC server
+	if !strings.Contains(code, "rpc.NewServer(gw.Router)") {
+		t.Errorf("missing RPC server creation:\n%s", code)
+	}
+	if !strings.Contains(code, "rpcServer.ListenAndServe") {
+		t.Errorf("missing RPC server start:\n%s", code)
+	}
+
+	// Should import rpc package
+	if !strings.Contains(code, `"github.com/light-speak/luxo/pkg/lux/rpc"`) {
+		t.Errorf("missing rpc import:\n%s", code)
+	}
+
+	// Should use LUXO_PORT
+	if !strings.Contains(code, "LUXO_PORT") {
+		t.Errorf("missing LUXO_PORT env:\n%s", code)
+	}
+}
+
+func TestGenerateEntryFileNoServiceFns(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/user.luxo",
+			Models: []*ast.ModelDecl{{
+				Name:       "User",
+				Directives: []*ast.Directive{{Name: "crud"}},
+			}},
+		}},
+	}
+
+	src := GenerateEntryFile(result, "myapp")
+	code := string(src)
+
+	// Should NOT have RPC server or service fn registration
+	if strings.Contains(code, "RegisterServiceFns") {
+		t.Error("no service fns, should not have RegisterServiceFns")
+	}
+	if strings.Contains(code, "rpc.NewServer") {
+		t.Error("no service fns, should not have RPC server")
+	}
+}
