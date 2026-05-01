@@ -306,21 +306,35 @@ Luxo 不只是代码更短 — 它是 **AI 写后端最可靠的语言**。
 - [x] Dialect 接口可插拔（PG 已实现，MySQL 占位）
 - [ ] 部署生成（`luxo deploy compose` / `luxo deploy helm`）
 
-### Phase 3 — 多服务 + Binary
-- [ ] Schema 组装 · 服务发现
-- [ ] @service RPC（类型安全跨服务调用）
-- [ ] extend 字段聚合（并行扇出）
-- [ ] Binary 协议（field ID · varint · field mask）
-- [ ] 客户端 SDK 生成（TypeScript · Dart）
-- [ ] WebSocket 流式 · Batch 请求
-- [ ] 事件系统（emit / on · NATS）
+### Phase 3 — 多服务 + Binary ✅
+- [x] Binary 协议（varint · svarint · fixed64 · field mask · 列式编码）
+- [x] Luvia Gateway — schema 驱动 Binary↔JSON（handler 全程 binary，Luvia 翻译）
+- [x] `fn @service` — 函数暴露为 RPC 端点（Luxo 协议）
+- [x] `extend` + `Model.load()` — 跨模块 DataLoader + 可见性控制
+- [x] 多条件 DataLoader（FK · 复合键 · 静态分析）
+- [x] 集群模式 — 模块独立 binary、Gateway 路由、`DEPLOY_MODE` 切换
+- [x] `luxo deploy compose` — Dockerfile + docker-compose.yml 生成
+- [x] 自动建库迁移（`EnsureDatabase` + `migrate.Up`）
+- [x] RPC 默认地址推断（`模块名:9000` Docker DNS）
+- [x] Schema introspection（`GET /luvia?$schema&key=xxx`）
+- [x] `luxo.schema.json` 导出（SDK 工具链使用）
+- [x] Graceful Shutdown · CORS · XSS 安全头
+- [x] 事件系统（emit / on · ChanBus + NATSBus · Luxo binary 编码）
 
-### Phase 4 — AI + 生态
+### Phase 4 — 客户端 SDK ✅
+- [x] `@luxo/client` — Transport 接口 + FetchTransport + WxTransport + LuxoError
+- [x] `@luxo/vite-plugin` — 编译期字段追踪 + 自动 `$select` 注入
+- [x] `@luxo/react` — `useLuxoQuery` hook + `LuxoProvider`
+- [ ] Dart SDK（Flutter + build_runner 编译期追踪）
+- [ ] Kotlin SDK（Android + Gradle/KCP 编译期追踪）
+- [ ] Swift SDK（iOS）
+
+### Phase 5 — AI + 生态
 - [ ] MCP Server（AI 直接读写 .luxo 项目）
 - [ ] luxo-ai（自然语言 → .luxo → 运行中的 API）
 - [ ] Luxo Studio（监控 · 追踪 · API Playground）
-- [ ] Cache / Queue / Storage / Mail / Search
-- [ ] Helm Chart 生成（每服务独立 Chart + helmfile）
+- [ ] `luxo deploy helm` — Helm Chart 生成
+- [ ] WebSocket 流式（`@stream`）· Batch 请求
 
 ## 贡献
 

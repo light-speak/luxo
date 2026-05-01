@@ -182,7 +182,11 @@ func (r *ColumnarReader) NextColumn() bool {
 		return false
 	}
 	id, n := ReadVarint(r.buf, r.off)
-	if n <= 0 || id == 0 {
+	if n <= 0 {
+		return false
+	}
+	if id == 0 {
+		r.off += n // advance past 0x00 end marker
 		return false
 	}
 	r.off += n

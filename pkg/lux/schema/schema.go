@@ -1,6 +1,8 @@
 package schema
 
 import (
+	"encoding/json"
+
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/selection"
 )
@@ -9,27 +11,27 @@ import (
 // Used by Luvia to convert responses without requiring model structs.
 // Loaded from luxo.lock + codegen-emitted schema registration.
 type Schema struct {
-	Models map[string]*Model // modelName → model metadata
-	APIs   map[string]*API   // apiName → API metadata
+	Models map[string]*Model `json:"models"`
+	APIs   map[string]*API   `json:"apis"`
 }
 
 // Model describes a model's fields for binary ↔ JSON conversion.
 type Model struct {
-	Name   string
-	Fields []Field // ordered by field ID
+	Name   string  `json:"name"`
+	Fields []Field `json:"fields"`
 	byID   map[int]*Field
 	byName map[string]*Field
 }
 
 // Field describes a single model field.
 type Field struct {
-	ID       int
-	Name     string // JSON/luxo field name (camelCase)
-	Type     FieldType
-	Nullable bool
-	IsList   bool
+	ID       int       `json:"id"`
+	Name     string    `json:"name"`
+	Type     FieldType `json:"type"`
+	Nullable bool      `json:"nullable,omitempty"`
+	IsList   bool      `json:"isList,omitempty"`
 	// Pre-computed JSON prefix: `"name":` as bytes for zero-alloc writing
-	JSONPrefix []byte
+	JSONPrefix []byte `json:"-"`
 }
 
 // FieldType identifies the wire type for binary encoding/decoding.
@@ -49,20 +51,46 @@ const (
 
 // API describes an API's params and return type.
 type API struct {
-	ID         int // stable API ID from luxo.lock (for RPC routing)
-	Name       string
-	Module     string // owning module name
-	ReturnType string // model name or scalar type
-	ReturnList bool   // true for list return
-	Paginated  bool   // true for CRUD list (items + total + page + pageSize)
-	Params     []Param
+	ID         int     `json:"id"`
+	Name       string  `json:"name"`
+	Module     string  `json:"module"`
+	ReturnType string  `json:"returnType,omitempty"`
+	ReturnList bool    `json:"returnList,omitempty"`
+	Paginated  bool    `json:"paginated,omitempty"`
+	Params     []Param `json:"params,omitempty"`
 }
 
 // Param describes an API parameter.
 type Param struct {
-	ID   int
-	Name string
-	Type FieldType
+	ID   int       `json:"id"`
+	Name string    `json:"name"`
+	Type FieldType `json:"type"`
+}
+
+// fieldTypeNames maps FieldType to its string representation for JSON.
+var fieldTypeNames = [...]string{
+	FieldInt:      "Int",
+	FieldFloat:    "Float",
+	FieldString:   "String",
+	FieldBool:     "Boolean",
+	FieldDateTime: "DateTime",
+	FieldDuration: "Duration",
+	FieldBytes:    "Bytes",
+	FieldEnum:     "Enum",
+	FieldModel:    "Model",
+}
+
+// MarshalJSON outputs FieldType as a string.
+func (t FieldType) MarshalJSON() ([]byte, error) {
+	if int(t) < len(fieldTypeNames) {
+		return json.Marshal(fieldTypeNames[t])
+	}
+	return json.Marshal("Unknown")
+}
+
+// ToJSON serializes the schema to JSON for introspection.
+func (s *Schema) ToJSON() ([]byte, error) {
+	return json.Marshal(s)
 }
 
 // New creates an empty schema.

@@ -174,7 +174,7 @@ func Generate(result *semantic.Result, packageName string, driver DBDriver, soft
 		gr.Files["error.gen.go"] = errorSrc
 	}
 
-	// writejson.gen.go — per-model WriteJSON for single-pass field-filtered serialization
+	// writejson.gen.go — per-model WriteLuxo + ReadLuxo + WriteColumnar for binary serialization
 	if wjSrc := generateWriteJSONFile(result, packageName, enums); wjSrc != nil {
 		gr.Files["writejson.gen.go"] = wjSrc
 	}

@@ -843,11 +843,7 @@ func generateListRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []R
 		}
 
 		// LoadAll — direct dispatch, zero wait
-		if rel.IsList {
-			fmt.Fprintf(b, "\t\t\tresultMap, err := app.loaders.%s.LoadAll(ctx, keys, childCols)\n", loaderField)
-		} else {
-			fmt.Fprintf(b, "\t\t\tresultMap, err := app.loaders.%s.LoadAll(ctx, keys, childCols)\n", loaderField)
-		}
+		fmt.Fprintf(b, "\t\t\tresultMap, err := app.loaders.%s.LoadAll(ctx, keys, childCols)\n", loaderField)
 		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
 
 		// Map results back

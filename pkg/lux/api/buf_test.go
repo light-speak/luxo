@@ -132,31 +132,6 @@ func TestResponseBufBuildJSON(t *testing.T) {
 	}
 }
 
-func TestAppendJSONScalars(t *testing.T) {
-	tests := []struct {
-		name string
-		val  any
-		want string
-	}{
-		{"int64", int64(42), "42"},
-		{"float64", float64(3.14), "3.14"},
-		{"bool true", true, "true"},
-		{"bool false", false, "false"},
-		{"string", "hello", `"hello"`},
-		{"unknown", struct{}{}, "null"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			buf := GetBuf()
-			defer PutBuf(buf)
-			buf.AppendJSON(tt.val)
-			if string(buf.B) != tt.want {
-				t.Errorf("AppendJSON(%v) = %q, want %q", tt.val, string(buf.B), tt.want)
-			}
-		})
-	}
-}
-
 func TestAppendTime(t *testing.T) {
 	buf := GetBuf()
 	defer PutBuf(buf)

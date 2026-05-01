@@ -948,8 +948,8 @@ func TestCompileStmtReturnScalar(t *testing.T) {
 	c := newCompiler(nil)
 	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "count"}})
 	out := compilerOut(c)
-	if !strings.Contains(out, "req.Buf.AppendJSON(count)") {
-		t.Fatalf("expected AppendJSON for scalar, got %q", out)
+	if !strings.Contains(out, "unsupported return type") {
+		t.Fatalf("expected unsupported for scalar, got %q", out)
 	}
 }
 
@@ -1527,8 +1527,8 @@ func TestCompileReturnUnknownType(t *testing.T) {
 	c.api = &ast.ApiDecl{Name: "getCustom", ReturnType: &ast.TypeRef{Name: "CustomType"}}
 	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "data"}})
 	out := compilerOut(c)
-	if !strings.Contains(out, "req.Buf.AppendJSON(data)") {
-		t.Fatalf("expected AppendJSON fallback, got %q", out)
+	if !strings.Contains(out, "unsupported return type") {
+		t.Fatalf("expected unsupported fallback, got %q", out)
 	}
 }
 
@@ -1537,8 +1537,8 @@ func TestCompileReturnNoAPIContext(t *testing.T) {
 	c.api = nil
 	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "x"}})
 	out := compilerOut(c)
-	if !strings.Contains(out, "req.Buf.AppendJSON(x)") {
-		t.Fatalf("expected AppendJSON fallback when no api, got %q", out)
+	if !strings.Contains(out, "unsupported return type") {
+		t.Fatalf("expected unsupported fallback when no api, got %q", out)
 	}
 }
 
@@ -1601,7 +1601,7 @@ func TestWriteReturnByTypeScalars(t *testing.T) {
 		{valType{name: "Float"}, "AppendFixed64"},
 		{valType{name: "Boolean"}, "AppendBool"},
 		{valType{name: "String"}, "AppendString"},
-		{valType{name: "Unknown"}, "AppendJSON"},
+		{valType{name: "Unknown"}, "unsupported return type"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.vt.name, func(t *testing.T) {
@@ -3037,8 +3037,8 @@ func TestCompileReturnList(t *testing.T) {
 	if !strings.Contains(out, "[]any{1, 2, 3}") {
 		t.Fatalf("missing list literal, got:\n%s", out)
 	}
-	if !strings.Contains(out, "AppendJSON") {
-		t.Fatalf("missing AppendJSON for list return, got:\n%s", out)
+	if !strings.Contains(out, "unsupported return type") {
+		t.Fatalf("missing unsupported marker for list return, got:\n%s", out)
 	}
 }
 
@@ -5615,6 +5615,7 @@ func TestWriteReturnByTypeModelList(t *testing.T) {
 func TestWriteReturnByTypePaginatedList(t *testing.T) {
 	c := newCompiler(nil)
 	c.paginate = true
+	c.hasTotalVar = true
 	c.writeReturnByType("posts", valType{isModel: true, isList: true, name: "Post"})
 	out := compilerOut(c)
 	// Binary mode paginated response
@@ -6051,5 +6052,203 @@ func TestCompileAwaitWithNonValStmts(t *testing.T) {
 	}
 	if !strings.Contains(out, "doSomething()") {
 		t.Fatalf("non-val stmt in await should be compiled after, got:\n%s", out)
+	}
+}
+
+// ─── compileLoad ───────────────────────────────────────────────────────────
+
+func TestWriteReturnByTypePaginatedList_NoTotal(t *testing.T) {
+	// @paginate set but _total not assigned — should fall through to non-paginated
+	c := newCompiler(nil)
+	c.paginate = true
+	c.hasTotalVar = false
+	c.writeReturnByType("posts", valType{isModel: true, isList: true, name: "Post"})
+	out := compilerOut(c)
+	// Should write columnar but NOT append _total
+	if !strings.Contains(out, "WriteColumnarPost(req.Buf, posts, req.FieldMask)") {
+		t.Fatalf("missing WriteColumnar, got:\n%s", out)
+	}
+	if strings.Contains(out, "_total") {
+		t.Fatalf("should not reference _total when hasTotalVar is false, got:\n%s", out)
+	}
+}
+
+func TestCompileLoad_PK(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	var b strings.Builder
+	c.compileLoad(&b, "User", []*ast.NamedArg{
+		{Value: &ast.Ident{Name: "userId"}},
+	})
+	got := b.String()
+	if !strings.Contains(got, "app.loaders.ExtendUser.Load(ctx, userId, nil)") {
+		t.Errorf("PK load: got %q", got)
+	}
+}
+
+func TestCompileLoad_SingleFK(t *testing.T) {
+	c := newCompiler(makeModels("Post"))
+	var b strings.Builder
+	c.compileLoad(&b, "Post", []*ast.NamedArg{
+		{Name: "userId", Value: &ast.Ident{Name: "uid"}},
+	})
+	got := b.String()
+	if !strings.Contains(got, "app.loaders.PostByUserId.Load(ctx, uid, nil)") {
+		t.Errorf("FK load: got %q", got)
+	}
+}
+
+func TestCompileLoad_CompositeKey(t *testing.T) {
+	c := newCompiler(makeModels("Post"))
+	var b strings.Builder
+	c.compileLoad(&b, "Post", []*ast.NamedArg{
+		{Name: "userId", Value: &ast.Ident{Name: "uid"}},
+		{Name: "type", Value: &ast.Literal{Kind: token.String, Value: "article"}},
+	})
+	got := b.String()
+	if !strings.Contains(got, "PostByUserIdAndType") {
+		t.Errorf("composite load: got %q", got)
+	}
+	if !strings.Contains(got, "PostByUserIdAndTypeKey{") {
+		t.Errorf("composite key struct: got %q", got)
+	}
+}
+
+func TestCompileLoad_Empty(t *testing.T) {
+	c := newCompiler(nil)
+	var b strings.Builder
+	c.compileLoad(&b, "User", nil)
+	if b.Len() != 0 {
+		t.Error("empty args should produce no output")
+	}
+}
+
+// ─── resolveQueryType ──────────────────────────────────────────────────────
+
+func TestResolveQueryType_Load_PK(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
+		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
+	}
+	vt := c.resolveQueryType(expr)
+	if !vt.isModel || vt.name != "User" {
+		t.Errorf("PK load should return model User, got %+v", vt)
+	}
+	if vt.isList {
+		t.Error("PK load should not be a list")
+	}
+}
+
+func TestResolveQueryType_Load_FK(t *testing.T) {
+	c := newCompiler(makeModels("Post"))
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "load"},
+		Args: []*ast.NamedArg{{Name: "userId", Value: &ast.Ident{Name: "uid"}}},
+	}
+	vt := c.resolveQueryType(expr)
+	if !vt.isModel || vt.name != "Post" {
+		t.Errorf("FK load should return model Post, got %+v", vt)
+	}
+	if !vt.isList {
+		t.Error("FK load should be a list")
+	}
+}
+
+func TestResolveQueryType_Exists(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+				Args: []*ast.NamedArg{{Name: "id", Value: &ast.Literal{Kind: token.Int, Value: "1"}}},
+			},
+			Field: "exists",
+		},
+	}
+	vt := c.resolveQueryType(expr)
+	if vt.name != "Boolean" {
+		t.Errorf("exists should return Boolean, got %+v", vt)
+	}
+}
+
+func TestResolveQueryType_Count(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+			},
+			Field: "count",
+		},
+	}
+	vt := c.resolveQueryType(expr)
+	if vt.name != "Int" {
+		t.Errorf("count should return Int, got %+v", vt)
+	}
+}
+
+func TestResolveQueryType_Sum(t *testing.T) {
+	c := newCompiler(makeModels("Order"))
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.Ident{Name: "Order"},
+			Field:  "sum",
+		},
+		Args: []*ast.NamedArg{{Value: &ast.Literal{Value: "amount"}}},
+	}
+	vt := c.resolveQueryType(expr)
+	if vt.name != "Int" {
+		t.Errorf("sum should return Int, got %+v", vt)
+	}
+}
+
+func TestResolveQueryType_Update(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+			},
+			Field: "update",
+		},
+	}
+	vt := c.resolveQueryType(expr)
+	if vt.name != "Int" {
+		t.Errorf("update should return Int, got %+v", vt)
+	}
+}
+
+func TestResolveQueryType_Delete(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+			},
+			Field: "delete",
+		},
+	}
+	vt := c.resolveQueryType(expr)
+	if vt.name != "Int" {
+		t.Errorf("delete should return Int, got %+v", vt)
+	}
+}
+
+func TestResolveQueryType_NonModel(t *testing.T) {
+	c := newCompiler(nil)
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "notAModel"}, Field: "find"},
+	}
+	vt := c.resolveQueryType(expr)
+	if vt.isModel || vt.name != "" {
+		t.Errorf("non-model should return empty, got %+v", vt)
+	}
+}
+
+func TestResolveQueryType_ShortChain(t *testing.T) {
+	c := newCompiler(nil)
+	vt := c.resolveQueryType(&ast.Ident{Name: "x"})
+	if vt.isModel || vt.name != "" {
+		t.Errorf("short chain should return empty, got %+v", vt)
 	}
 }

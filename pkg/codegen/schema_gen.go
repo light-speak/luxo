@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/ast"
-	"github.com/light-speak/luxo/pkg/lux/str"
+	"github.com/light-speak/luxo/pkg/lux/schema"
 	"github.com/light-speak/luxo/pkg/semantic"
 )
 
@@ -208,5 +208,130 @@ func luxoTypeToSchemaType(typeName string, enums map[string]bool) string {
 	}
 }
 
-// Suppress unused import
-var _ = str.Capitalize
+// BuildSchemaJSON builds the runtime Schema and serializes to JSON.
+// Used by `luxo gen` to export luxo.schema.json for SDK tooling.
+func BuildSchemaJSON(result *semantic.Result, enums map[string]bool) ([]byte, error) {
+	s := schema.New()
+
+	// Models
+	var models []*ast.ModelDecl
+	modelNames := make(map[string]bool)
+	for _, file := range result.Files {
+		for _, m := range file.Models {
+			models = append(models, m)
+			modelNames[m.Name] = true
+		}
+	}
+	// Extend stubs
+	for _, file := range result.Files {
+		for _, ext := range file.Extends {
+			if !modelNames[ext.Name] {
+				models = append(models, &ast.ModelDecl{Name: ext.Name, Fields: ext.Fields})
+				modelNames[ext.Name] = true
+			}
+		}
+	}
+	for _, m := range models {
+		sm := &schema.Model{Name: m.Name}
+		for _, f := range m.Fields {
+			if f.Type == nil || f.Computed != nil {
+				continue
+			}
+			if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
+				continue
+			}
+			if isRelationField(f, enums) {
+				continue
+			}
+			fid := getModelFieldID(m.Name, f.Name)
+			if fid == 0 {
+				continue
+			}
+			sm.Fields = append(sm.Fields, schema.Field{
+				ID:       fid,
+				Name:     f.Name,
+				Type:     luxoTypeToSchemaFieldType(f.Type.Name, enums),
+				Nullable: f.Type.Nullable,
+			})
+		}
+		s.RegisterModel(sm)
+	}
+
+	// APIs: CRUD + declared + fn @service
+	for _, file := range result.Files {
+		modName := moduleNameFromFile(file.Name)
+		for _, m := range file.Models {
+			if !hasCrud(m) {
+				continue
+			}
+			for _, op := range crudOperations(m) {
+				apiName := crudAPIName(m.Name, op)
+				a := &schema.API{
+					ID:     getAPIID(apiName),
+					Name:   apiName,
+					Module: modName,
+				}
+				switch op {
+				case "get":
+					a.ReturnType = m.Name
+				case "list":
+					a.ReturnType = m.Name
+					a.ReturnList = true
+					a.Paginated = true
+				case "create", "update":
+					a.ReturnType = m.Name
+				}
+				s.RegisterAPI(a)
+			}
+		}
+		for _, api := range file.APIs {
+			a := &schema.API{
+				ID:     getAPIID(api.Name),
+				Name:   api.Name,
+				Module: modName,
+			}
+			if api.ReturnType != nil {
+				a.ReturnType = api.ReturnType.Name
+				a.ReturnList = api.ReturnType.IsList
+			}
+			a.Paginated = hasDirective(api.Directives, "paginate")
+			for _, p := range api.Params {
+				a.Params = append(a.Params, schema.Param{
+					ID:   getAPIParamID(api.Name, p.Name),
+					Name: p.Name,
+					Type: luxoTypeToSchemaFieldType(p.Type.Name, enums),
+				})
+			}
+			s.RegisterAPI(a)
+		}
+	}
+
+	// Enums — export as string arrays
+	// (field type is already "Enum" / "String" in the schema)
+
+	return s.ToJSON()
+}
+
+func luxoTypeToSchemaFieldType(typeName string, enums map[string]bool) schema.FieldType {
+	if enums != nil && enums[typeName] {
+		return schema.FieldEnum
+	}
+	switch typeName {
+	case "Int":
+		return schema.FieldInt
+	case "Float":
+		return schema.FieldFloat
+	case "String":
+		return schema.FieldString
+	case "Boolean":
+		return schema.FieldBool
+	case "DateTime":
+		return schema.FieldDateTime
+	case "Duration":
+		return schema.FieldDuration
+	case "Bytes":
+		return schema.FieldBytes
+	default:
+		return schema.FieldString
+	}
+}

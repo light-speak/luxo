@@ -133,6 +133,11 @@ func (g *Gateway) buildMux(version string) (*http.ServeMux, string) {
 		g.Router.SetDevMode(true)
 	}
 
+	// Schema introspection key
+	if key := envOr("INTROSPECTION_KEY", ""); key != "" {
+		g.Router.IntrospectionKey = key
+	}
+
 	// Middleware chain: CORS → trace → auth → router
 	var handler http.Handler = g.Router
 	handler = api.TraceMiddleware(handler)

@@ -919,6 +919,164 @@ func TestCollectLoadCalls(t *testing.T) {
 	}
 }
 
+func TestScanLoadCalls_IfStmt(t *testing.T) {
+	seen := make(map[string]bool)
+	var calls []loadCallInfo
+	stmt := &ast.IfStmt{
+		Then: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ValStmt{Name: "x", Value: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
+				Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
+			}},
+		}},
+	}
+	scanLoadCalls(stmt, seen, &calls)
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 call from if body, got %d", len(calls))
+	}
+}
+
+func TestScanLoadCalls_ForStmt(t *testing.T) {
+	seen := make(map[string]bool)
+	var calls []loadCallInfo
+	stmt := &ast.ForStmt{
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "load"},
+				Args: []*ast.NamedArg{{Name: "userId", Value: &ast.Ident{Name: "u"}}},
+			}},
+		}},
+	}
+	scanLoadCalls(stmt, seen, &calls)
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 call from for body, got %d", len(calls))
+	}
+}
+
+func TestScanLoadCalls_ReturnStmt(t *testing.T) {
+	seen := make(map[string]bool)
+	var calls []loadCallInfo
+	stmt := &ast.ReturnStmt{
+		Value: &ast.CallExpr{
+			Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
+			Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
+		},
+	}
+	scanLoadCalls(stmt, seen, &calls)
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 call from return, got %d", len(calls))
+	}
+}
+
+func TestScanLoadCalls_Dedup(t *testing.T) {
+	seen := make(map[string]bool)
+	var calls []loadCallInfo
+	// Same load twice
+	for i := 0; i < 2; i++ {
+		stmt := &ast.ValStmt{Name: "x", Value: &ast.CallExpr{
+			Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
+			Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
+		}}
+		scanLoadCalls(stmt, seen, &calls)
+	}
+	if len(calls) != 1 {
+		t.Errorf("duplicate load calls should be deduped, got %d", len(calls))
+	}
+}
+
+func TestScanLoadCallsExpr_NotCall(t *testing.T) {
+	seen := make(map[string]bool)
+	var calls []loadCallInfo
+	// Not a CallExpr
+	scanLoadCallsExpr(&ast.Ident{Name: "x"}, seen, &calls)
+	if len(calls) != 0 {
+		t.Error("non-call expr should produce no calls")
+	}
+}
+
+func TestScanLoadCallsExpr_LowercaseModel(t *testing.T) {
+	seen := make(map[string]bool)
+	var calls []loadCallInfo
+	// lowercase model name — should be skipped
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "load"},
+		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
+	}
+	scanLoadCallsExpr(expr, seen, &calls)
+	if len(calls) != 0 {
+		t.Error("lowercase model name should be skipped")
+	}
+}
+
+func TestScanLoadCallsExpr_NotMember(t *testing.T) {
+	seen := make(map[string]bool)
+	var calls []loadCallInfo
+	// Call on non-member expr
+	expr := &ast.CallExpr{
+		Func: &ast.Ident{Name: "load"},
+	}
+	scanLoadCallsExpr(expr, seen, &calls)
+	if len(calls) != 0 {
+		t.Error("non-member call should produce no calls")
+	}
+}
+
+func TestScanLoadCallsExpr_NotLoadMethod(t *testing.T) {
+	seen := make(map[string]bool)
+	var calls []loadCallInfo
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "find"},
+	}
+	scanLoadCallsExpr(expr, seen, &calls)
+	if len(calls) != 0 {
+		t.Error("non-load method should produce no calls")
+	}
+}
+
+func TestScanLoadCallsExpr_Nil(t *testing.T) {
+	seen := make(map[string]bool)
+	var calls []loadCallInfo
+	scanLoadCallsExpr(nil, seen, &calls)
+	if len(calls) != 0 {
+		t.Error("nil expr should produce no calls")
+	}
+}
+
+func TestCollectLoadCalls_FromFnBody(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Functions: []*ast.FnDecl{{
+				Name: "helper",
+				Body: &ast.Block{Stmts: []ast.Stmt{
+					&ast.ReturnStmt{Value: &ast.CallExpr{
+						Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
+						Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
+					}},
+				}},
+			}},
+		}},
+	}
+	calls := collectLoadCalls(result)
+	if len(calls) != 1 {
+		t.Errorf("expected 1 call from fn body, got %d", len(calls))
+	}
+}
+
+func TestCollectLoadCalls_NilBodies(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name:      "test.luxo",
+			APIs:      []*ast.ApiDecl{{Name: "a1", Body: nil}},
+			Functions: []*ast.FnDecl{{Name: "f1", Body: nil}},
+		}},
+	}
+	calls := collectLoadCalls(result)
+	if len(calls) != 0 {
+		t.Error("nil bodies should produce no calls")
+	}
+}
+
 func TestGenerateDataLoaderExtendOnlyModule(t *testing.T) {
 	// Module with no same-module relations, only extend
 	result := &semantic.Result{

@@ -1,10 +1,9 @@
 package schema
 
 import (
-	"fmt"
-	"math"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
 )
@@ -172,7 +171,36 @@ func BinaryPaginatedListToJSON(dst []byte, data []byte, model *Model) []byte {
 	r := codec.NewColumnarReader(data)
 	count := r.Count()
 	if count == 0 {
-		return append(dst, `{"items":[],"total":0,"page":1,"pageSize":20}`...)
+		// Still read pagination metadata from after the end marker.
+		// When count=0, NextColumn is never called, so skip the 0x00 end marker manually.
+		off := r.Offset()
+		if off < len(data) && data[off] == 0x00 {
+			off++
+		}
+		dst = append(dst, `{"items":[]`...)
+		remaining := data[off:]
+		roff := 0
+		if total, tn := codec.ReadSvarint(remaining, roff); tn > 0 {
+			roff += tn
+			dst = append(dst, `,"total":`...)
+			dst = strconv.AppendInt(dst, total, 10)
+		} else {
+			dst = append(dst, `,"total":0`...)
+		}
+		if page, pn := codec.ReadSvarint(remaining, roff); pn > 0 {
+			roff += pn
+			dst = append(dst, `,"page":`...)
+			dst = strconv.AppendInt(dst, page, 10)
+		} else {
+			dst = append(dst, `,"page":1`...)
+		}
+		if pageSize, psn := codec.ReadSvarint(remaining, roff); psn > 0 {
+			dst = append(dst, `,"pageSize":`...)
+			dst = strconv.AppendInt(dst, pageSize, 10)
+		} else {
+			dst = append(dst, `,"pageSize":20`...)
+		}
+		return append(dst, '}')
 	}
 
 	// Read columns
@@ -238,26 +266,6 @@ func BinaryPaginatedListToJSON(dst []byte, data []byte, model *Model) []byte {
 	}
 	_ = psn
 
-	dst = append(dst, '}')
-	return dst
-}
-
-// binaryModelToJSON decodes one model from a streaming decoder and writes JSON.
-func binaryModelToJSON(dst []byte, dec *codec.Decoder, model *Model) []byte {
-	dst = append(dst, '{')
-	first := true
-	for dec.NextField() {
-		f := model.FieldByID(dec.FieldID())
-		if f == nil {
-			continue
-		}
-		if !first {
-			dst = append(dst, ',')
-		}
-		first = false
-		dst = append(dst, f.JSONPrefix...)
-		dst = appendFieldValueJSON(dst, dec, f)
-	}
 	dst = append(dst, '}')
 	return dst
 }
@@ -347,45 +355,74 @@ func appendNullableFieldJSON(dst []byte, dec *codec.Decoder, f *Field) []byte {
 }
 
 // BinaryScalarToJSON converts a single scalar binary value to JSON.
-// Tries svarint (Int), then falls back to raw byte output.
-// Used for delete (count), fn @service returns, etc.
-func BinaryScalarToJSON(dst []byte, data []byte) []byte {
+// Uses the declared return type for precise decoding — no guessing.
+func BinaryScalarToJSON(dst []byte, data []byte, typeName string) []byte {
 	if len(data) == 0 {
 		return append(dst, "null"...)
 	}
-	// Try svarint (most common scalar: Int, count, etc.)
+	switch typeName {
+	case "Int", "Duration", "":
+		v, n := codec.ReadSvarint(data, 0)
+		if n > 0 {
+			return strconv.AppendInt(dst, v, 10)
+		}
+	case "Float":
+		v, n := codec.ReadFixed64(data, 0)
+		if n > 0 {
+			return strconv.AppendFloat(dst, v, 'f', -1, 64)
+		}
+	case "Boolean":
+		v, n := codec.ReadBool(data, 0)
+		if n > 0 {
+			if v {
+				return append(dst, "true"...)
+			}
+			return append(dst, "false"...)
+		}
+	case "String", "DateTime", "UUID", "Decimal":
+		v, n := codec.ReadString(data, 0)
+		if n > 0 {
+			return appendJSONString(dst, v)
+		}
+	}
+	// Fallback: try svarint
 	v, n := codec.ReadSvarint(data, 0)
-	if n > 0 && n == len(data) {
+	if n > 0 {
 		return strconv.AppendInt(dst, v, 10)
 	}
-	// Try bool (1 byte)
-	if len(data) == 1 {
-		if data[0] == 1 {
-			return append(dst, "true"...)
-		}
-		return append(dst, "false"...)
-	}
-	// Try fixed64 (float, 8 bytes)
-	if len(data) == 8 {
-		fv, fn := codec.ReadFixed64(data, 0)
-		if fn == 8 {
-			return strconv.AppendFloat(dst, fv, 'f', -1, 64)
-		}
-	}
-	// Try string (length-prefixed)
-	sv, sn := codec.ReadString(data, 0)
-	if sn > 0 && sn == len(data) {
-		return appendJSONString(dst, sv)
-	}
-	// Fallback: raw number
-	return strconv.AppendInt(dst, v, 10)
+	return append(dst, "null"...)
 }
 
 // appendJSONString appends a JSON-escaped string.
+// Uses a byte-level fast path for ASCII; falls through to rune handling for bytes >= 0x80.
 func appendJSONString(dst []byte, s string) []byte {
 	dst = append(dst, '"')
-	for i := 0; i < len(s); i++ {
+	i := 0
+	for i < len(s) {
+		// Fast path: scan for longest run of safe ASCII bytes.
+		start := i
+		for i < len(s) {
+			c := s[i]
+			if c < 0x20 || c == '"' || c == '\\' || c >= 0x80 {
+				break
+			}
+			i++
+		}
+		if start < i {
+			dst = append(dst, s[start:i]...)
+		}
+		if i >= len(s) {
+			break
+		}
 		c := s[i]
+		if c >= 0x80 {
+			// Multi-byte UTF-8: decode rune and append.
+			ru, size := utf8.DecodeRuneInString(s[i:])
+			dst = utf8.AppendRune(dst, ru)
+			i += size
+			continue
+		}
+		// Special ASCII byte requiring escape.
 		switch c {
 		case '"':
 			dst = append(dst, '\\', '"')
@@ -398,14 +435,9 @@ func appendJSONString(dst []byte, s string) []byte {
 		case '\t':
 			dst = append(dst, '\\', 't')
 		default:
-			if c < 0x20 {
-				dst = append(dst, '\\', 'u', '0', '0')
-				dst = append(dst, "0123456789abcdef"[c>>4])
-				dst = append(dst, "0123456789abcdef"[c&0xf])
-			} else {
-				dst = append(dst, c)
-			}
+			dst = append(dst, '\\', 'u', '0', '0', "0123456789abcdef"[c>>4], "0123456789abcdef"[c&0xf])
 		}
+		i++
 	}
 	dst = append(dst, '"')
 	return dst
@@ -445,7 +477,3 @@ func JSONParamsToBinary(jsonParams map[string]any, api *API) []byte {
 	enc.WriteEnd()
 	return enc.Bytes()
 }
-
-// Suppress unused import warning
-var _ = math.Float64frombits
-var _ = fmt.Sprintf

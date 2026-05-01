@@ -147,6 +147,7 @@ func generateServiceMethod(b *strings.Builder, clientName string, fn serviceFnIn
 		fmt.Fprintf(b, "\tv, n := codec.ReadBool(resp, 0)\n")
 		fmt.Fprintf(b, "\tif n == 0 {\n\t\treturn false, fmt.Errorf(\"rpc %s: invalid bool response\")\n\t}\n", svcName)
 		fmt.Fprintf(b, "\treturn v, nil\n")
+
 	default:
 		// Model type — decode with ReadLuxo
 		fmt.Fprintf(b, "\tvar result %s\n", retType)

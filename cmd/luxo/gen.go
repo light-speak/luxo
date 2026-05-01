@@ -140,6 +140,12 @@ func runGen(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Export luxo.schema.json for SDK generation (vite plugin / dart / kotlin)
+	if err := exportSchemaJSON(result); err != nil {
+		return fmt.Errorf("export schema: %w", err)
+	}
+	totalFiles++
+
 	green := "\033[32m"
 	dim := "\033[2m"
 	bold := "\033[1m"
@@ -373,6 +379,21 @@ func generateEntry(result *semantic.Result, modulePath string) error {
 		return fmt.Errorf("write %s: %w", outPath, err)
 	}
 	fmt.Printf("  %s+%s %s\n", green, reset, outPath)
+	return nil
+}
+
+func exportSchemaJSON(result *semantic.Result) error {
+	enums := codegen.CollectEnumsFromResult(result)
+	data, err := codegen.BuildSchemaJSON(result, enums)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile("luxo.schema.json", data, 0644); err != nil {
+		return err
+	}
+	green := "\033[32m"
+	reset := "\033[0m"
+	fmt.Printf("  %s✓%s luxo.schema.json\n", green, reset)
 	return nil
 }
 

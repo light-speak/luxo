@@ -526,8 +526,9 @@ func EnsureDatabase(ctx context.Context) error {
 	}
 
 	// Create database (can't use parameterized query for CREATE DATABASE)
+	// Ignore "already exists" error for concurrent startup safety
 	_, err = conn.Exec(ctx, fmt.Sprintf("CREATE DATABASE %q", targetDB))
-	if err != nil {
+	if err != nil && !strings.Contains(err.Error(), "already exists") {
 		return fmt.Errorf("ensure db: create %s: %w", targetDB, err)
 	}
 	return nil

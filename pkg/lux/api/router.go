@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	stderrors "errors"
 	"fmt"
 	"net/http"
@@ -25,11 +26,12 @@ type HandlerFunc func(ctx context.Context, req *Request) error
 
 // Router maps API names to handlers and serves the /luvia endpoint.
 type Router struct {
-	handlers   map[string]HandlerFunc
-	translator *i18n.Translator
-	devMode    bool
-	Registry   *APIRegistry   // binary protocol API ID mapping
-	Schema     *schema.Schema // model/API metadata for Binary↔JSON conversion
+	handlers         map[string]HandlerFunc
+	translator       *i18n.Translator
+	devMode          bool
+	Registry         *APIRegistry   // binary protocol API ID mapping
+	Schema           *schema.Schema // model/API metadata for Binary↔JSON conversion
+	IntrospectionKey string         // key for schema introspection (empty = disabled)
 }
 
 // NewRouter creates an empty router.
@@ -64,6 +66,12 @@ func (rt *Router) ExportHandlers() map[string]HandlerFunc {
 // ServeHTTP implements http.Handler for the /luvia endpoint.
 // Supports JSON (default) and Luxo binary (X-Luxo-Mode: binary) protocols.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Schema introspection: GET /luvia?$schema&key=xxx
+	if r.URL.Query().Has("$schema") {
+		rt.handleIntrospection(w, r)
+		return
+	}
+
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST only")
 		return
@@ -139,6 +147,33 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	PutBuf(buf)
 }
 
+// handleIntrospection serves the schema as JSON for SDK generation.
+// Protected by INTROSPECTION_KEY — returns 403 without valid key.
+func (rt *Router) handleIntrospection(w http.ResponseWriter, r *http.Request) {
+	if rt.IntrospectionKey == "" {
+		writeError(w, http.StatusForbidden, "introspection disabled")
+		return
+	}
+	key := r.URL.Query().Get("key")
+	if subtle.ConstantTimeCompare([]byte(key), []byte(rt.IntrospectionKey)) != 1 {
+		writeError(w, http.StatusForbidden, "invalid introspection key")
+		return
+	}
+	if rt.Schema == nil {
+		writeError(w, http.StatusInternalServerError, "no schema registered")
+		return
+	}
+	data, err := rt.Schema.ToJSON()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	w.Write(data)
+}
+
 // convertBinaryToJSON converts handler's Luxo binary response to JSON using schema.
 // Handles model, list, paginated list, and scalar return types.
 func (rt *Router) convertBinaryToJSON(apiName string, data []byte) []byte {
@@ -150,16 +185,16 @@ func (rt *Router) convertBinaryToJSON(apiName string, data []byte) []byte {
 		return data
 	}
 
-	// No return type → scalar passthrough (delete returns count, etc.)
+	// No return type → scalar (delete returns count as Int)
 	if apiMeta.ReturnType == "" {
-		return schema.BinaryScalarToJSON(nil, data)
+		return schema.BinaryScalarToJSON(nil, data, "Int")
 	}
 
 	// Check if return type is a model or a scalar type name
 	model := rt.Schema.Models[apiMeta.ReturnType]
 	if model == nil {
-		// Scalar return (Int, Float, String, Boolean)
-		return schema.BinaryScalarToJSON(nil, data)
+		// Scalar return — use declared type for precise decoding
+		return schema.BinaryScalarToJSON(nil, data, apiMeta.ReturnType)
 	}
 
 	if apiMeta.ReturnList {

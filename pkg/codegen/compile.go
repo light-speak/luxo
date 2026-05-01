@@ -78,14 +78,15 @@ type valType struct {
 
 // compiler holds state during body compilation.
 type compiler struct {
-	b        *strings.Builder
-	indent   string
-	models   map[string]*ast.ModelDecl
-	enums    map[string]bool // enum type names
-	api      *ast.ApiDecl
-	vars     map[string]valType // variable name → resolved type
-	inAsync  bool               // true inside async { } — no return err
-	paginate bool               // true when API has @paginate
+	b           *strings.Builder
+	indent      string
+	models      map[string]*ast.ModelDecl
+	enums       map[string]bool // enum type names
+	api         *ast.ApiDecl
+	vars        map[string]valType // variable name → resolved type
+	inAsync     bool               // true inside async { } — no return err
+	paginate    bool               // true when API has @paginate
+	hasTotalVar bool               // true after _total is assigned (paginated query)
 }
 
 func (c *compiler) write(format string, args ...any) {
@@ -139,6 +140,7 @@ func (c *compiler) compileVal(s *ast.ValStmt) {
 		// @paginate + all → AllWithCount returns (results, total, error)
 		if c.paginate && qt.isList {
 			c.write("%s, _total, err := %s", s.Name, expr)
+			c.hasTotalVar = true
 		} else {
 			c.write("%s, err := %s", s.Name, expr)
 		}
@@ -197,7 +199,7 @@ func (c *compiler) compileReturn(s *ast.ReturnStmt) {
 	}
 	expr := c.compileExpr(s.Value)
 
-	// 1. Direct model query chain — extract to temp var, then WriteJSON / WriteLuxo
+	// 1. Direct model query chain — extract to temp var, then WriteLuxo
 	if c.isModelQuery(s.Value) {
 		qt := c.resolveQueryType(s.Value)
 		// Extract query result to temp variable (query returns (result, error))
@@ -231,7 +233,7 @@ func (c *compiler) compileReturn(s *ast.ReturnStmt) {
 func (c *compiler) writeReturnByType(expr string, vt valType) {
 	if vt.isModel {
 		if vt.isList {
-			if c.paginate {
+			if c.paginate && c.hasTotalVar {
 				c.write("WriteColumnar%s(req.Buf, %s, req.FieldMask)", vt.name, expr)
 				c.write("req.Buf.B = codec.AppendSvarint(req.Buf.B, _total)")
 				c.write("req.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.Page))")
@@ -254,7 +256,7 @@ func (c *compiler) writeReturnByType(expr string, vt valType) {
 	case "String":
 		c.write("req.Buf.B = codec.AppendString(req.Buf.B, %s)", expr)
 	default:
-		c.write("req.Buf.AppendJSON(%s)", expr)
+		c.write("_ = %s // unsupported return type for binary encoding", expr)
 	}
 }
 
@@ -276,7 +278,7 @@ func (c *compiler) writeScalarReturn(expr string) {
 			return
 		}
 	}
-	c.write("req.Buf.AppendJSON(%s)", expr)
+	c.write("_ = %s // unsupported return type for binary encoding", expr)
 }
 
 // compileThrow: throw ErrorName(args)
