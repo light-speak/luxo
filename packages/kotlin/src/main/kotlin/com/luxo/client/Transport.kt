@@ -33,6 +33,9 @@ data class ParamSchema(
  */
 interface Transport {
     suspend fun call(api: String, params: Map<String, Any?> = emptyMap()): Any
+    fun setSchema(schema: Map<String, APISchemaEntry>)
+    fun setMode(mode: TransportMode)
+    fun setToken(token: String)
 }
 
 /** OkHttp-based transport for Android / JVM. */
@@ -47,8 +50,8 @@ class OkHttpTransport(
 
     private val client: OkHttpClient = client ?: OkHttpClient()
     private val extraHeaders = ConcurrentHashMap<String, String>()
-    @Volatile var mode: TransportMode = mode
-        private set
+    @Volatile private var currentMode: TransportMode = mode
+    private var currentSchema: Map<String, APISchemaEntry> = schema
 
     init {
         extraHeaders.putAll(headers)
@@ -61,8 +64,12 @@ class OkHttpTransport(
      * Call a Luxo API. Returns JsonElement (JSON mode) or ByteArray (binary mode).
      * Generated client code handles both transparently.
      */
+    override fun setSchema(schema: Map<String, APISchemaEntry>) { currentSchema = schema }
+    override fun setMode(mode: TransportMode) { currentMode = mode }
+    override fun setToken(token: String) { extraHeaders["Authorization"] = "Bearer $token" }
+
     override suspend fun call(api: String, params: Map<String, Any?>): Any {
-        return if (mode == TransportMode.BINARY) callBinary(api, params) else callJSON(api, params)
+        return if (currentMode == TransportMode.BINARY) callBinary(api, params) else callJSON(api, params)
     }
 
     private suspend fun callJSON(api: String, params: Map<String, Any?>): JsonElement {
@@ -109,7 +116,7 @@ class OkHttpTransport(
     }
 
     private suspend fun callBinary(api: String, params: Map<String, Any?>): ByteArray {
-        val meta = schema[api]
+        val meta = currentSchema[api]
             ?: throw LuxoError("ConfigError", 0, "no schema for API \"$api\" — binary mode requires schema")
 
         val enc = LuxoEncoder()
@@ -140,15 +147,6 @@ class OkHttpTransport(
         return client.awaitBinaryCall(request)
     }
 
-    /** Update authorization token. */
-    fun setToken(token: String) {
-        extraHeaders["Authorization"] = "Bearer $token"
-    }
-
-    /** Switch transport mode at runtime. */
-    fun setMode(newMode: TransportMode) {
-        mode = newMode
-    }
 
     companion object {
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()

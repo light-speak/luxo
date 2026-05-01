@@ -197,10 +197,19 @@ String _genClient(LuxoSchema schema) {
   b.writeln("import '_select_hints.g.dart' as hints show selectHints;\n");
   b.writeln('class LuxoClient {');
   b.writeln('  final Transport transport;');
-  b.writeln('  static final schema = luxoSchema;');
-  b.writeln('  LuxoClient(this.transport);\n');
-  b.writeln('  /// Get auto-detected \$select for an API (from build_runner analysis).');
-  b.writeln("  String? _hint(String api) => hints.selectHints[api];\n");
+  b.writeln('  static final schema = luxoSchema;\n');
+  b.writeln('  LuxoClient(Transport transport) : transport = transport {');
+  b.writeln('    transport.setSchema(luxoSchema);');
+  b.writeln('  }\n');
+  b.writeln('  /// Create client from URL — auto-detects HTTP vs WebSocket.');
+  b.writeln("  factory LuxoClient.create(String endpoint, {TransportOptions? options}) {");
+  b.writeln("    final transport = endpoint.startsWith('ws') ? WsTransport(endpoint, options: options) : HttpTransport(endpoint, options: options);");
+  b.writeln('    return LuxoClient(transport);');
+  b.writeln('  }\n');
+  b.writeln('  void setMode(TransportMode mode) => transport.setMode(mode);');
+  b.writeln('  void setToken(String token) => transport.setToken(token);');
+  b.writeln('  void close() => transport.close();\n');
+  b.writeln('  String? _hint(String api) => hints.selectHints[api];\n');
 
   for (final api in schema.apis.values) {
     if (api.name.startsWith('svc:')) continue;

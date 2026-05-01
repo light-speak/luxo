@@ -1,4 +1,4 @@
-export { FetchTransport } from './transport'
+export { FetchTransport, WsTransport } from './transport'
 export { LuxoError } from './error'
 export { Encoder, Decoder, fieldMaskSet, fieldMaskHas } from './codec'
 export type { Transport, TransportMode, TransportOptions, APISchema } from './transport'
