@@ -50,7 +50,6 @@ func (c *wsConn) writeBinary(ctx context.Context, data []byte) error {
 //	  Response: [seq varint][status: 0x01=ok | 0x00=error][payload]
 func (rt *Router) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		// Allow all origins — CORS is handled at the middleware layer.
 		InsecureSkipVerify: true,
 	})
 	if err != nil {
@@ -59,25 +58,221 @@ func (rt *Router) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	ws := &wsConn{conn: conn}
-	ctx := r.Context()
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
 
-	// Auth: extract token from query param (WS can't set custom headers)
-	// Token is set before upgrade, identity is in r.Context() from AuthMiddleware.
+	// Track this connection's stream subscriptions for cleanup on disconnect
+	var connSubs []connStreamSub
+	defer func() {
+		for _, cs := range connSubs {
+			rt.Streams.Unsubscribe(cs.apiName, cs.sub)
+		}
+	}()
 
 	for {
 		msgType, data, err := conn.Read(ctx)
 		if err != nil {
-			return // connection closed or error
+			return
 		}
 
 		if msgType == websocket.MessageText {
-			// JSON mode — dispatch in goroutine for concurrency
-			go rt.handleWSJSON(ctx, ws, data)
+			// Check for $sub/$unsub before dispatching as request
+			if isStreamMsg(data) {
+				rt.handleWSStreamJSON(ctx, ws, data, &connSubs)
+			} else {
+				go rt.handleWSJSON(ctx, ws, data)
+			}
 		} else {
-			// Binary mode
-			go rt.handleWSBinary(ctx, ws, data)
+			// Binary: check prefix byte for stream messages
+			if len(data) > 0 && (data[0] == 0xFE || data[0] == 0xFF) {
+				rt.handleWSStreamBinary(ctx, ws, data, &connSubs)
+			} else {
+				go rt.handleWSBinary(ctx, ws, data)
+			}
 		}
 	}
+}
+
+// connStreamSub tracks a subscription belonging to this WS connection.
+type connStreamSub struct {
+	apiName string
+	sub     *StreamSub
+}
+
+// isStreamMsg checks if a JSON message has "$sub" or "$unsub" as a top-level key.
+// Uses fast byte scan for `"$sub":` or `"$unsub":` — the colon after quote ensures it's a key, not a value.
+func isStreamMsg(data []byte) bool {
+	// Look for `"$sub":` or `"$unsub":` pattern (key must be followed by colon)
+	for i := 0; i < len(data)-6; i++ {
+		if data[i] == '"' && data[i+1] == '$' {
+			if i+6 < len(data) && data[i+2] == 's' && data[i+3] == 'u' && data[i+4] == 'b' && data[i+5] == '"' {
+				return true
+			}
+			if i+8 < len(data) && data[i+2] == 'u' && data[i+3] == 'n' && data[i+4] == 's' && data[i+5] == 'u' && data[i+6] == 'b' && data[i+7] == '"' {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// handleWSStreamJSON handles JSON $sub/$unsub messages.
+func (rt *Router) handleWSStreamJSON(ctx context.Context, ws *wsConn, data []byte, connSubs *[]connStreamSub) {
+	var raw map[string]json.RawMessage
+	if err := sonic.Unmarshal(data, &raw); err != nil {
+		return
+	}
+
+	// Subscribe: {"$sub": "watchDanmaku", "roomId": 123}
+	if subRaw, ok := raw["$sub"]; ok {
+		var apiName string
+		sonic.Unmarshal(subRaw, &apiName)
+		if apiName == "" {
+			return
+		}
+
+		// Extract params (non-reserved keys)
+		params := make(map[string]any)
+		for k, v := range raw {
+			if k == "$sub" || k == "$select" {
+				continue
+			}
+			var val any
+			sonic.Unmarshal(v, &val)
+			params[k] = val
+		}
+
+		// Extract identity from context
+		identity := identityFromCtx(ctx)
+
+		sub := rt.Streams.Subscribe(apiName, params, identity, nil)
+		*connSubs = append(*connSubs, connStreamSub{apiName: apiName, sub: sub})
+
+		// Start write pump
+		go WritePumpJSON(ctx, ws, apiName, sub)
+		return
+	}
+
+	// Unsubscribe: {"$unsub": "watchDanmaku"}
+	if unsubRaw, ok := raw["$unsub"]; ok {
+		var apiName string
+		sonic.Unmarshal(unsubRaw, &apiName)
+		for i, cs := range *connSubs {
+			if cs.apiName == apiName {
+				rt.Streams.Unsubscribe(apiName, cs.sub)
+				*connSubs = append((*connSubs)[:i], (*connSubs)[i+1:]...)
+				return
+			}
+		}
+	}
+}
+
+// handleWSStreamBinary handles binary stream subscribe/unsubscribe.
+// 0xFE = subscribe: [0xFE][API ID varint][FieldMask len][mask][Params][0x00]
+// 0xFF = unsubscribe: [0xFF][API ID varint]
+func (rt *Router) handleWSStreamBinary(ctx context.Context, ws *wsConn, data []byte, connSubs *[]connStreamSub) {
+	if len(data) < 2 {
+		return
+	}
+
+	prefix := data[0]
+	off := 1
+
+	apiID, n := codec.ReadVarint(data, off)
+	if n <= 0 {
+		return
+	}
+	off += n
+
+	apiName, ok := rt.Registry.NameByID(int(apiID))
+	if !ok {
+		return
+	}
+
+	if prefix == 0xFF {
+		// Unsubscribe
+		for i, cs := range *connSubs {
+			if cs.apiName == apiName {
+				rt.Streams.Unsubscribe(apiName, cs.sub)
+				*connSubs = append((*connSubs)[:i], (*connSubs)[i+1:]...)
+				return
+			}
+		}
+		return
+	}
+
+	// Subscribe (0xFE)
+	// Read field mask
+	var fieldMask []byte
+	maskLen, mn := codec.ReadVarint(data, off)
+	if mn > 0 {
+		off += mn
+		if maskLen > 0 && off+int(maskLen) <= len(data) {
+			fieldMask = data[off : off+int(maskLen)]
+			off += int(maskLen)
+		}
+	}
+
+	// Read params
+	params := make(map[string]any)
+	paramMeta := rt.Registry.ParamOrder(apiName)
+	paramBuf := data[off:]
+	poff := 0
+	for poff < len(paramBuf) {
+		fid, pn := codec.ReadVarint(paramBuf, poff)
+		if pn <= 0 || fid == 0 {
+			break
+		}
+		poff += pn
+		for _, pm := range paramMeta {
+			if pm.FieldID == int(fid) {
+				switch pm.Type {
+				case "Int":
+					v, vn := codec.ReadSvarint(paramBuf, poff)
+					if vn > 0 {
+						poff += vn
+						params[pm.Name] = v
+					}
+				case "Float":
+					v, vn := codec.ReadFixed64(paramBuf, poff)
+					if vn > 0 {
+						poff += vn
+						params[pm.Name] = v
+					}
+				case "String":
+					v, vn := codec.ReadString(paramBuf, poff)
+					if vn > 0 {
+						poff += vn
+						params[pm.Name] = v
+					}
+				case "Boolean":
+					v, vn := codec.ReadBool(paramBuf, poff)
+					if vn > 0 {
+						poff += vn
+						params[pm.Name] = v
+					}
+				}
+				break
+			}
+		}
+	}
+
+	identity := identityFromCtx(ctx)
+	sub := rt.Streams.Subscribe(apiName, params, identity, fieldMask)
+	*connSubs = append(*connSubs, connStreamSub{apiName: apiName, sub: sub})
+
+	go WritePumpBinary(ctx, ws, int(apiID), sub)
+}
+
+// IdentityExtractor extracts identity from context.
+// Set by luvia package at init to avoid circular imports.
+var IdentityExtractor func(ctx context.Context) any
+
+func identityFromCtx(ctx context.Context) any {
+	if IdentityExtractor != nil {
+		return IdentityExtractor(ctx)
+	}
+	return nil
 }
 
 // handleWSJSON processes a JSON WebSocket message.

@@ -27,20 +27,31 @@ type HandlerFunc func(ctx context.Context, req *Request) error
 // Router maps API names to handlers and serves the /luvia endpoint.
 type Router struct {
 	handlers         map[string]HandlerFunc
+	streamMatchers   map[string]StreamMatcher // @stream API name → matcher function
 	translator       *i18n.Translator
 	devMode          bool
 	Registry         *APIRegistry   // binary protocol API ID mapping
 	Schema           *schema.Schema // model/API metadata for Binary↔JSON conversion
+	Streams          *StreamHub     // WebSocket stream subscription manager
 	IntrospectionKey string         // key for schema introspection (empty = disabled)
 }
 
 // NewRouter creates an empty router.
 func NewRouter() *Router {
 	return &Router{
-		handlers: make(map[string]HandlerFunc),
-		Registry: NewAPIRegistry(),
-		Schema:   schema.New(),
+		handlers:       make(map[string]HandlerFunc),
+		streamMatchers: make(map[string]StreamMatcher),
+		Registry:       NewAPIRegistry(),
+		Schema:         schema.New(),
+		Streams:        NewStreamHub(),
 	}
+}
+
+// HandleStream registers a matcher for a @stream API.
+// When events are dispatched, the matcher decides per-subscriber whether to push.
+// matcher can be nil for broadcast (all subscribers receive).
+func (rt *Router) HandleStream(apiName string, matcher StreamMatcher) {
+	rt.streamMatchers[apiName] = matcher
 }
 
 // Handle registers a handler for an API name.

@@ -366,7 +366,9 @@ var builtinDirectives = []DirectiveDef{
 	},
 	{
 		Name: "stream", Contexts: OnApi,
-		Description: "enable streaming response",
+		Params:      []ParamDef{{Name: "event"}},
+		MaxArgs:     1,
+		Description: "enable WebSocket streaming; optional event source binding",
 	},
 	{
 		Name: "paginate", Contexts: OnApi,
