@@ -1,5 +1,5 @@
 name: luxo_client
-description: Luxo client SDK — type-safe API calls with pluggable transport
+description: Luxo client SDK — type-safe API calls with pluggable transport, compile-time field tracking
 version: 0.1.0
 homepage: https://github.com/light-speak/luxo
 
@@ -8,3 +8,6 @@ environment:
 
 dependencies:
   http: ^1.2.0
+  analyzer: ^7.0.0
+  build: ^2.4.0
+  glob: ^2.1.0
