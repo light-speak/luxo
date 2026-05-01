@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 
 export interface UseLuxoQueryResult<T> {
   data: T | null
@@ -13,8 +13,7 @@ export interface UseLuxoQueryResult<T> {
  *
  * @example
  * ```tsx
- * const { data: user, loading } = useLuxoQuery(() => client.getUser(1))
- * // With vite plugin: automatically injects $select based on field usage
+ * const { data: user, loading } = useLuxoQuery(() => client.getUser(1), [1])
  * return <div>{user?.name}</div>
  * ```
  */
@@ -25,22 +24,37 @@ export function useLuxoQuery<T>(
   const [data, setData] = useState<T | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<Error | null>(null)
+  const mountedRef = useRef(true)
+  const versionRef = useRef(0)
 
   const execute = useCallback(async () => {
+    const version = ++versionRef.current
     setLoading(true)
     setError(null)
     try {
       const result = await queryFn()
-      setData(result)
+      // Only update if still mounted and this is the latest request
+      if (mountedRef.current && version === versionRef.current) {
+        setData(result)
+      }
     } catch (e) {
-      setError(e instanceof Error ? e : new Error(String(e)))
+      if (mountedRef.current && version === versionRef.current) {
+        setError(e instanceof Error ? e : new Error(String(e)))
+      }
     } finally {
-      setLoading(false)
+      if (mountedRef.current && version === versionRef.current) {
+        setLoading(false)
+      }
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, deps)
 
   useEffect(() => {
+    mountedRef.current = true
     execute()
+    return () => {
+      mountedRef.current = false
+    }
   }, [execute])
 
   return { data, loading, error, refetch: execute }

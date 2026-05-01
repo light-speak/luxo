@@ -31,10 +31,11 @@ function genTypes(schema: LuxoSchema): string {
     out += `export interface ${model.name} {\n`
     for (const field of model.fields) {
       const ts = luxoTypeToTS(field.type)
+      const type = field.isList ? `${ts}[]` : ts
       if (field.nullable) {
-        out += `  ${field.name}: ${ts} | null\n`
+        out += `  ${field.name}: ${type} | null\n`
       } else {
-        out += `  ${field.name}: ${ts}\n`
+        out += `  ${field.name}: ${type}\n`
       }
     }
     out += '}\n\n'
@@ -76,8 +77,8 @@ function genClient(schema: LuxoSchema): string {
 function genMethod(api: LuxoAPI, schema: LuxoSchema): string {
   const retTS = getReturnType(api)
 
-  // Detect CRUD patterns by name
-  if (api.name.startsWith('get') && !api.returnList) {
+  // Detect CRUD patterns (only match if no explicit params — CRUD uses implicit id)
+  if (api.name.startsWith('get') && !api.returnList && (!api.params || api.params.length === 0)) {
     return `  async ${api.name}(id: number, opts?: { $select?: string }): Promise<${retTS}> {\n` +
            `    return this.transport.call('${api.name}', { id, ...opts })\n  }\n\n`
   }
@@ -98,10 +99,6 @@ function genMethod(api: LuxoAPI, schema: LuxoSchema): string {
   }
 
   if (api.name.startsWith('delete')) {
-    if (api.name.endsWith('s')) {
-      return `  async ${api.name}(ids: number[]): Promise<number> {\n` +
-             `    return this.transport.call('${api.name}', { ids })\n  }\n\n`
-    }
     return `  async ${api.name}(id: number): Promise<number> {\n` +
            `    return this.transport.call('${api.name}', { id })\n  }\n\n`
   }
@@ -126,5 +123,5 @@ function getReturnType(api: LuxoAPI): string {
 }
 
 function isScalar(type: string): boolean {
-  return ['Int', 'Float', 'String', 'Boolean', 'DateTime', 'Duration', 'UUID', 'Bytes', 'Decimal'].includes(type)
+  return ['Int', 'Float', 'String', 'Boolean', 'DateTime', 'Duration', 'UUID', 'Bytes', 'Decimal', 'Enum'].includes(type)
 }

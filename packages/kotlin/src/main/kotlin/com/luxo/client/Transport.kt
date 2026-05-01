@@ -6,6 +6,7 @@ import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -29,7 +30,7 @@ class OkHttpTransport(
 ) : Transport {
 
     private val client: OkHttpClient = client ?: OkHttpClient()
-    private val extraHeaders = mutableMapOf<String, String>()
+    private val extraHeaders = ConcurrentHashMap<String, String>()
 
     init {
         extraHeaders.putAll(headers)
@@ -53,8 +54,13 @@ class OkHttpTransport(
             }
             .build()
 
-        val response = client.awaitCall(request)
-        val json = Json.parseToJsonElement(response).jsonObject
+        val responseBody = client.awaitCall(request)
+
+        val json = try {
+            Json.parseToJsonElement(responseBody).jsonObject
+        } catch (e: Exception) {
+            throw LuxoError("ParseError", 0, "invalid JSON response: ${e.message}")
+        }
 
         val error = json["error"]
         if (error != null && error is JsonPrimitive) {
@@ -90,8 +96,10 @@ private suspend fun OkHttpClient.awaitCall(request: Request): String =
             }
 
             override fun onResponse(call: Call, response: Response) {
-                val body = response.body?.string() ?: "{}"
-                cont.resume(body)
+                response.use { resp ->
+                    val body = resp.body?.string() ?: "{}"
+                    cont.resume(body)
+                }
             }
         })
     }

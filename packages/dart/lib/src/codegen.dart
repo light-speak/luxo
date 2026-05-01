@@ -12,20 +12,33 @@ Future<void> generate({
   String outDir = 'lib/src/luxo',
 }) async {
   final client = HttpClient();
-  final uri = Uri.parse('$endpoint?\$schema&key=$key');
-  final request = await client.getUrl(uri);
-  final response = await request.close();
-  final body = await response.transform(utf8.decoder).join();
-  client.close();
+  try {
+    final uri = Uri.parse('$endpoint?\$schema&key=$key');
+    final request = await client.getUrl(uri);
+    final response = await request.close();
+    if (response.statusCode != 200) {
+      throw Exception('introspection failed: HTTP ${response.statusCode}');
+    }
+    final body = await response.transform(utf8.decoder).join();
 
-  final schema = LuxoSchema.fromJson(jsonDecode(body) as Map<String, dynamic>);
+    final Map<String, dynamic> json;
+    try {
+      json = jsonDecode(body) as Map<String, dynamic>;
+    } catch (e) {
+      throw Exception('introspection returned invalid JSON: $e');
+    }
+
+    final schema = LuxoSchema.fromJson(json);
 
   final dir = Directory(outDir);
   if (!dir.existsSync()) dir.createSync(recursive: true);
 
-  File('$outDir/types.dart').writeAsStringSync(_genTypes(schema));
-  File('$outDir/client.dart').writeAsStringSync(_genClient(schema));
-  print('[luxo] Generated types -> $outDir/');
+    File('$outDir/types.dart').writeAsStringSync(_genTypes(schema));
+    File('$outDir/client.dart').writeAsStringSync(_genClient(schema));
+    print('[luxo] Generated types -> $outDir/');
+  } finally {
+    client.close();
+  }
 }
 
 String _luxoTypeToDart(String type) {

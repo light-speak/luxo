@@ -19,8 +19,16 @@ object LuxoCodegen {
 
     fun generate(endpoint: String, key: String, outDir: String, packageName: String = "com.luxo.generated") {
         val url = URI("$endpoint?\$schema&key=$key").toURL()
-        val body = url.readText()
-        val schema = Json.decodeFromString<LuxoSchema>(body)
+        val body = try {
+            url.readText()
+        } catch (e: Exception) {
+            throw RuntimeException("luxo introspection failed: ${e.message}", e)
+        }
+        val schema = try {
+            Json.decodeFromString<LuxoSchema>(body)
+        } catch (e: Exception) {
+            throw RuntimeException("luxo introspection returned invalid JSON: ${e.message}", e)
+        }
 
         File(outDir).mkdirs()
         File("$outDir/Types.kt").writeText(genTypes(schema, packageName))

@@ -27,19 +27,34 @@ export class FetchTransport implements Transport {
       Object.assign(body, params)
     }
 
-    const resp = await fetch(this.endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...this.headers,
-      },
-      body: JSON.stringify(body),
-    })
+    let resp: Response
+    try {
+      resp = await fetch(this.endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...this.headers,
+        },
+        body: JSON.stringify(body),
+      })
+    } catch (e) {
+      throw new LuxoError('NetworkError', 0, e instanceof Error ? e.message : String(e))
+    }
 
-    const json = await resp.json()
+    let json: Record<string, unknown>
+    try {
+      json = await resp.json()
+    } catch {
+      throw new LuxoError('ParseError', resp.status, `invalid JSON response (HTTP ${resp.status})`)
+    }
 
     if (json.error) {
-      throw new LuxoError(json.error, json.code, json.message, json.traceId)
+      throw new LuxoError(
+        json.error as string,
+        (json.code as number) ?? resp.status,
+        (json.message as string) ?? '',
+        json.traceId as string | undefined,
+      )
     }
 
     return json.data as T

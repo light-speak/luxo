@@ -28,19 +28,29 @@ class HttpTransport implements Transport {
     final body = <String, dynamic>{r'$api': api};
     if (params != null) body.addAll(params);
 
-    final resp = await _client.post(
-      Uri.parse(endpoint),
-      headers: _headers,
-      body: jsonEncode(body),
-    );
+    final http.Response resp;
+    try {
+      resp = await _client.post(
+        Uri.parse(endpoint),
+        headers: _headers,
+        body: jsonEncode(body),
+      );
+    } catch (e) {
+      throw LuxoError('NetworkError', 0, e.toString());
+    }
 
-    final json = jsonDecode(resp.body) as Map<String, dynamic>;
+    final Map<String, dynamic> json;
+    try {
+      json = jsonDecode(resp.body) as Map<String, dynamic>;
+    } catch (e) {
+      throw LuxoError('ParseError', resp.statusCode, 'invalid JSON response: ${e.toString()}');
+    }
 
     if (json.containsKey('error')) {
       throw LuxoError(
-        json['error'] as String,
-        json['code'] as int,
-        json['message'] as String,
+        (json['error'] ?? 'Unknown') as String,
+        (json['code'] ?? 0) as int,
+        (json['message'] ?? '') as String,
         json['traceId'] as String?,
       );
     }

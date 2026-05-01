@@ -38,13 +38,28 @@ export class WxTransport implements Transport {
         header: { 'Content-Type': 'application/json', ...this.headers },
         data: JSON.stringify(body),
         success(res) {
-          const json = res.data as Record<string, unknown>
+          // wx.request may return string or object depending on dataType
+          let json: Record<string, unknown>
+          if (typeof res.data === 'string') {
+            try {
+              json = JSON.parse(res.data)
+            } catch {
+              reject(new LuxoError('ParseError', res.statusCode, 'invalid JSON response'))
+              return
+            }
+          } else if (res.data && typeof res.data === 'object') {
+            json = res.data as Record<string, unknown>
+          } else {
+            reject(new LuxoError('ParseError', res.statusCode, 'unexpected response type'))
+            return
+          }
+
           if (json.error) {
             reject(new LuxoError(
-              json.error as string,
-              json.code as number,
-              json.message as string,
-              json.traceId as string,
+              String(json.error),
+              Number(json.code ?? 0),
+              String(json.message ?? ''),
+              json.traceId != null ? String(json.traceId) : undefined,
             ))
             return
           }
