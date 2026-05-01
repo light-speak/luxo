@@ -260,14 +260,30 @@ String _returnType(LuxoAPI api) {
   return t;
 }
 
+/// Generates a decoder lambda that handles both JSON (Map/int/etc) and binary (Uint8List).
 String _decoder(LuxoAPI api) {
-  if (api.returnType == null) return '(d) => d as int';
+  if (api.returnType == null) {
+    return '(d) => d is Uint8List ? (LuxoDecoder(d)..nextField()).readInt() : d as int';
+  }
   final t = api.returnType!;
   if (_isScalar(t)) {
-    if (t == 'Float') return '(d) => (d as num).toDouble()';
-    return '(d) => d as ${_luxoTypeToDart(t)}';
+    final dartType = _luxoTypeToDart(t);
+    final binaryRead = switch (t) {
+      'Float' => '(LuxoDecoder(d)..nextField()).readFloat()',
+      'Boolean' => '(LuxoDecoder(d)..nextField()).readBool()',
+      'Int' || 'Duration' => '(LuxoDecoder(d)..nextField()).readInt()',
+      _ => '(LuxoDecoder(d)..nextField()).readString()',
+    };
+    final jsonRead = t == 'Float' ? '(d as num).toDouble()' : 'd as $dartType';
+    return '(d) => d is Uint8List ? $binaryRead : $jsonRead';
   }
-  if (api.paginated) return "(d) => Page.fromJson(d as Map<String, dynamic>, (e) => $t.fromJson(e))";
-  if (api.returnList) return "(d) => (d as List).map((e) => $t.fromJson(e as Map<String, dynamic>)).toList()";
-  return "(d) => $t.fromJson(d as Map<String, dynamic>)";
+  // Model type — binary uses decode{Model}, JSON uses fromJson
+  final binaryDecode = 'decode$t(LuxoDecoder(d))';
+  if (api.paginated) {
+    return "(d) => d is Uint8List ? $binaryDecode : Page.fromJson(d as Map<String, dynamic>, (e) => $t.fromJson(e))";
+  }
+  if (api.returnList) {
+    return "(d) => d is Uint8List ? $binaryDecode : (d as List).map((e) => $t.fromJson(e as Map<String, dynamic>)).toList()";
+  }
+  return "(d) => d is Uint8List ? $binaryDecode : $t.fromJson(d as Map<String, dynamic>)";
 }

@@ -133,42 +133,65 @@ function genClient(schema: LuxoSchema): string {
   return out
 }
 
+function genDecode(api: LuxoAPI): string {
+  const t = api.returnType
+  if (!t) return 'd instanceof Uint8Array ? new Decoder(d).readInt() : d as number'
+
+  if (isScalar(t)) {
+    const ts = luxoTypeToTS(t)
+    const br = t === 'Float' ? 'new Decoder(d).readFloat()'
+      : t === 'Boolean' ? 'new Decoder(d).readBool()'
+      : (t === 'Int' || t === 'Duration') ? 'new Decoder(d).readInt()'
+      : 'new Decoder(d).readString()'
+    return `d instanceof Uint8Array ? ${br} : d as ${ts}`
+  }
+
+  const binDec = `decode${t}(new Decoder(d))`
+  return `d instanceof Uint8Array ? ${binDec} : d as ${t}`
+}
+
 function genMethod(api: LuxoAPI): string {
   const retTS = getReturnType(api)
+  const decode = genDecode(api)
+  const call = (params: string) =>
+    `    const d = await this.transport.call('${api.name}'${params ? `, ${params}` : ''})\n` +
+    `    return ${decode}\n`
 
   if (api.name.startsWith('get') && !api.returnList && (!api.params || api.params.length === 0)) {
     return `  async ${api.name}(id: number, opts?: { $select?: string }): Promise<${retTS}> {\n` +
-           `    return this.transport.call('${api.name}', { id, ...opts })\n  }\n\n`
+           call('{ id, ...opts }') + `  }\n\n`
   }
 
   if (api.name.startsWith('list')) {
     return `  async ${api.name}(params?: { page?: number; pageSize?: number; $select?: string; $filters?: unknown[]; $sorters?: unknown[] }): Promise<${retTS}> {\n` +
-           `    return this.transport.call('${api.name}', params)\n  }\n\n`
+           call('params') + `  }\n\n`
   }
 
   if (api.name.startsWith('create') && api.returnType) {
     return `  async ${api.name}(input: Partial<${api.returnType}>): Promise<${retTS}> {\n` +
-           `    return this.transport.call('${api.name}', input)\n  }\n\n`
+           call('input') + `  }\n\n`
   }
 
   if (api.name.startsWith('update') && api.returnType) {
     return `  async ${api.name}(id: number, input: Partial<${api.returnType}>): Promise<${retTS}> {\n` +
-           `    return this.transport.call('${api.name}', { id, ...input })\n  }\n\n`
+           call('{ id, ...input }') + `  }\n\n`
   }
 
   if (api.name.startsWith('delete')) {
     return `  async ${api.name}(id: number): Promise<number> {\n` +
-           `    return this.transport.call('${api.name}', { id })\n  }\n\n`
+           `    const d = await this.transport.call('${api.name}', { id })\n` +
+           `    return d instanceof Uint8Array ? new Decoder(d).readInt() : d as number\n` +
+           `  }\n\n`
   }
 
   if (api.params && api.params.length > 0) {
     const paramStr = api.params.map(p => `${p.name}: ${luxoTypeToTS(p.type)}`).join('; ')
     return `  async ${api.name}(params: { ${paramStr} }): Promise<${retTS}> {\n` +
-           `    return this.transport.call('${api.name}', params)\n  }\n\n`
+           call('params') + `  }\n\n`
   }
 
   return `  async ${api.name}(): Promise<${retTS}> {\n` +
-         `    return this.transport.call('${api.name}')\n  }\n\n`
+         call('') + `  }\n\n`
 }
 
 function getReturnType(api: LuxoAPI): string {

@@ -126,6 +126,7 @@ object LuxoCodegen {
         appendLine("import com.luxo.client.*")
         appendLine("import kotlinx.serialization.json.*\n")
         appendLine("class LuxoClient(private val transport: Transport) {\n")
+        appendLine("    companion object { val schema = LUXO_SCHEMA }\n")
 
         for (api in schema.apis.values) {
             if (api.name.startsWith("svc:")) continue
@@ -137,68 +138,97 @@ object LuxoCodegen {
 
     private fun genMethod(b: StringBuilder, api: LuxoAPI) {
         val ret = returnType(api)
-        val dec = decode(api)
+
+        // All methods: call transport, then decode based on response type (JSON or binary)
+        fun emitDecode() {
+            b.appendLine("        return decode_${api.name}(data)")
+        }
 
         when {
             api.name.startsWith("get") && !api.returnList && api.params.isEmpty() -> {
                 b.appendLine("    suspend fun ${api.name}(id: Int, select: String? = null): $ret {")
-                b.appendLine("        val params = buildMap<String, JsonElement> {")
-                b.appendLine("            put(\"id\", JsonPrimitive(id))")
-                b.appendLine("            if (select != null) put(\"\\\$select\", JsonPrimitive(select))")
-                b.appendLine("        }")
-                b.appendLine("        val data = transport.call(\"${api.name}\", params)")
-                b.appendLine("        return $dec")
+                b.appendLine("        val data = transport.call(\"${api.name}\", mapOf(\"id\" to id, \"\\\$select\" to select))")
+                emitDecode()
                 b.appendLine("    }\n")
             }
             api.name.startsWith("list") -> {
                 b.appendLine("    suspend fun ${api.name}(page: Int? = null, pageSize: Int? = null, select: String? = null): $ret {")
-                b.appendLine("        val params = buildMap<String, JsonElement> {")
-                b.appendLine("            if (page != null) put(\"page\", JsonPrimitive(page))")
-                b.appendLine("            if (pageSize != null) put(\"pageSize\", JsonPrimitive(pageSize))")
-                b.appendLine("            if (select != null) put(\"\\\$select\", JsonPrimitive(select))")
-                b.appendLine("        }")
-                b.appendLine("        val data = transport.call(\"${api.name}\", params)")
-                b.appendLine("        return $dec")
+                b.appendLine("        val data = transport.call(\"${api.name}\", mapOf(\"page\" to page, \"pageSize\" to pageSize, \"\\\$select\" to select))")
+                emitDecode()
                 b.appendLine("    }\n")
             }
             api.name.startsWith("create") && api.returnType != null -> {
-                b.appendLine("    suspend fun ${api.name}(input: Map<String, JsonElement>): $ret {")
+                b.appendLine("    suspend fun ${api.name}(input: Map<String, Any?>): $ret {")
                 b.appendLine("        val data = transport.call(\"${api.name}\", input)")
-                b.appendLine("        return $dec")
+                emitDecode()
                 b.appendLine("    }\n")
             }
             api.name.startsWith("update") && api.returnType != null -> {
-                b.appendLine("    suspend fun ${api.name}(id: Int, input: Map<String, JsonElement>): $ret {")
-                b.appendLine("        val params = buildMap<String, JsonElement> { put(\"id\", JsonPrimitive(id)); putAll(input) }")
-                b.appendLine("        val data = transport.call(\"${api.name}\", params)")
-                b.appendLine("        return $dec")
+                b.appendLine("    suspend fun ${api.name}(id: Int, input: Map<String, Any?>): $ret {")
+                b.appendLine("        val data = transport.call(\"${api.name}\", mapOf(\"id\" to id) + input)")
+                emitDecode()
                 b.appendLine("    }\n")
             }
             api.name.startsWith("delete") -> {
                 b.appendLine("    suspend fun ${api.name}(id: Int): Int {")
-                b.appendLine("        val data = transport.call(\"${api.name}\", mapOf(\"id\" to JsonPrimitive(id)))")
-                b.appendLine("        return data.jsonPrimitive.int")
+                b.appendLine("        val data = transport.call(\"${api.name}\", mapOf(\"id\" to id))")
+                b.appendLine("        return if (data is ByteArray) { val d = LuxoDecoder(data); d.nextField(); d.readInt().toInt() } else (data as JsonElement).jsonPrimitive.int")
                 b.appendLine("    }\n")
             }
             api.params.isNotEmpty() -> {
                 val ps = api.params.joinToString(", ") { "${it.name}: ${luxoTypeToKt(it.type)}" }
                 b.appendLine("    suspend fun ${api.name}($ps): $ret {")
-                b.appendLine("        val params = buildMap<String, JsonElement> {")
-                for (p in api.params) {
-                    b.appendLine("            put(\"${p.name}\", JsonPrimitive(${p.name}))")
-                }
-                b.appendLine("        }")
-                b.appendLine("        val data = transport.call(\"${api.name}\", params)")
-                b.appendLine("        return $dec")
+                val paramMap = api.params.joinToString(", ") { "\"${it.name}\" to ${it.name}" }
+                b.appendLine("        val data = transport.call(\"${api.name}\", mapOf($paramMap))")
+                emitDecode()
                 b.appendLine("    }\n")
             }
             else -> {
                 b.appendLine("    suspend fun ${api.name}(): $ret {")
                 b.appendLine("        val data = transport.call(\"${api.name}\")")
-                b.appendLine("        return $dec")
+                emitDecode()
                 b.appendLine("    }\n")
             }
         }
+
+        // Private decode helper — dispatches JSON vs binary
+        genDecodeHelper(b, api)
+    }
+
+    private fun genDecodeHelper(b: StringBuilder, api: LuxoAPI) {
+        val ret = returnType(api)
+        val t = api.returnType
+        b.appendLine("    private fun decode_${api.name}(data: Any): $ret = when (data) {")
+
+        if (t == null || isScalar(t)) {
+            // Scalar decode
+            val jsonDecode = when (t) {
+                null, "Int", "Duration" -> "(data as JsonElement).jsonPrimitive.int"
+                "Float" -> "(data as JsonElement).jsonPrimitive.double"
+                "Boolean" -> "(data as JsonElement).jsonPrimitive.boolean"
+                else -> "(data as JsonElement).jsonPrimitive.content"
+            }
+            val binaryDecode = when (t) {
+                null, "Int", "Duration" -> "LuxoDecoder(data).let { d -> d.nextField(); d.readInt().toInt() }"
+                "Float" -> "LuxoDecoder(data).let { d -> d.nextField(); d.readFloat() }"
+                "Boolean" -> "LuxoDecoder(data).let { d -> d.nextField(); d.readBool() }"
+                else -> "LuxoDecoder(data).let { d -> d.nextField(); d.readString() }"
+            }
+            b.appendLine("        is ByteArray -> $binaryDecode")
+            b.appendLine("        else -> $jsonDecode")
+        } else {
+            // Model decode
+            val jsonDecode = when {
+                api.paginated -> "Json.decodeFromJsonElement<Page<$t>>(data as JsonElement)"
+                api.returnList -> "Json.decodeFromJsonElement<List<$t>>(data as JsonElement)"
+                else -> "Json.decodeFromJsonElement<$t>(data as JsonElement)"
+            }
+            val binaryDecode = "decode$t(LuxoDecoder(data))"
+            b.appendLine("        is ByteArray -> $binaryDecode")
+            b.appendLine("        else -> $jsonDecode")
+        }
+
+        b.appendLine("    }\n")
     }
 
     private fun returnType(api: LuxoAPI): String {
@@ -208,22 +238,6 @@ object LuxoCodegen {
             api.paginated -> "Page<$t>"
             api.returnList -> "List<$t>"
             else -> t
-        }
-    }
-
-    private fun decode(api: LuxoAPI): String {
-        if (api.returnType == null) return "data.jsonPrimitive.int"
-        val t = api.returnType!!
-        if (isScalar(t)) return when (t) {
-            "Int", "Duration" -> "data.jsonPrimitive.int"
-            "Float" -> "data.jsonPrimitive.double"
-            "Boolean" -> "data.jsonPrimitive.boolean"
-            else -> "data.jsonPrimitive.content"
-        }
-        return when {
-            api.paginated -> "Json.decodeFromJsonElement<Page<$t>>(data)"
-            api.returnList -> "Json.decodeFromJsonElement<List<$t>>(data)"
-            else -> "Json.decodeFromJsonElement<$t>(data)"
         }
     }
 }

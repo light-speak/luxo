@@ -60,11 +60,14 @@ export class Encoder {
 
   /** Write signed zigzag-encoded varint (matches Go: (v<<1) ^ (v>>63)) */
   writeSvarint(v: number): void {
-    // zigzag: map signed to unsigned
-    // For JS numbers (53-bit safe): (v * 2) ^ (v < 0 ? -1 : 0)
-    // This correctly handles the full 53-bit signed range
-    const zz = v < 0 ? (-v * 2 - 1) : (v * 2)
-    this.writeVarint(zz)
+    // Zigzag: map signed → unsigned. Safe for |v| < 2^52.
+    // JS number precision: 53 bits → zigzag doubles the magnitude → safe up to 2^52.
+    // API params rarely exceed this. For snowflake IDs > 2^52, use string type instead.
+    if (v >= 0) {
+      this.writeVarint(v * 2)
+    } else {
+      this.writeVarint(-v * 2 - 1)
+    }
   }
 
   /** Write float64 as 8 bytes little-endian */

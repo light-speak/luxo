@@ -25,11 +25,14 @@ data class ParamSchema(
     val type: String,
 )
 
-/** Transport interface -- implement for different runtimes. */
+/**
+ * Transport interface — single call() method, mode handled internally.
+ *
+ * JSON mode: returns parsed JsonElement (for kotlinx.serialization decode).
+ * Binary mode: returns raw ByteArray (for generated decode{Model} functions).
+ */
 interface Transport {
-    suspend fun call(api: String, params: Map<String, JsonElement> = emptyMap()): JsonElement
-    /** Binary call — returns raw bytes for generated ReadLuxo decoding. */
-    suspend fun callBinary(api: String, params: Map<String, Any?> = emptyMap()): ByteArray
+    suspend fun call(api: String, params: Map<String, Any?> = emptyMap()): Any
 }
 
 /** OkHttp-based transport for Android / JVM. */
@@ -39,13 +42,13 @@ class OkHttpTransport(
     headers: Map<String, String> = emptyMap(),
     client: OkHttpClient? = null,
     mode: TransportMode = TransportMode.JSON,
-    schema: Map<String, APISchemaEntry> = emptyMap(),
+    private val schema: Map<String, APISchemaEntry> = emptyMap(),
 ) : Transport {
 
     private val client: OkHttpClient = client ?: OkHttpClient()
     private val extraHeaders = ConcurrentHashMap<String, String>()
-    @Volatile private var mode: TransportMode = mode
-    private val schema: Map<String, APISchemaEntry> = schema
+    @Volatile var mode: TransportMode = mode
+        private set
 
     init {
         extraHeaders.putAll(headers)
@@ -54,10 +57,25 @@ class OkHttpTransport(
         }
     }
 
-    override suspend fun call(api: String, params: Map<String, JsonElement>): JsonElement {
+    /**
+     * Call a Luxo API. Returns JsonElement (JSON mode) or ByteArray (binary mode).
+     * Generated client code handles both transparently.
+     */
+    override suspend fun call(api: String, params: Map<String, Any?>): Any {
+        return if (mode == TransportMode.BINARY) callBinary(api, params) else callJSON(api, params)
+    }
+
+    private suspend fun callJSON(api: String, params: Map<String, Any?>): JsonElement {
         val body = buildJsonObject {
             put("\$api", JsonPrimitive(api))
-            for ((k, v) in params) put(k, v)
+            for ((k, v) in params) {
+                when (v) {
+                    is Number -> put(k, JsonPrimitive(v))
+                    is String -> put(k, JsonPrimitive(v))
+                    is Boolean -> put(k, JsonPrimitive(v))
+                    null -> put(k, JsonNull)
+                }
+            }
         }
 
         val request = Request.Builder()
@@ -69,7 +87,7 @@ class OkHttpTransport(
             }
             .build()
 
-        val responseBody = client.awaitCall(request)
+        val responseBody = client.awaitStringCall(request)
 
         val json = try {
             Json.parseToJsonElement(responseBody).jsonObject
@@ -90,11 +108,10 @@ class OkHttpTransport(
         return json["data"] ?: JsonNull
     }
 
-    override suspend fun callBinary(api: String, params: Map<String, Any?>): ByteArray {
+    private suspend fun callBinary(api: String, params: Map<String, Any?>): ByteArray {
         val meta = schema[api]
             ?: throw LuxoError("ConfigError", 0, "no schema for API \"$api\" — binary mode requires schema")
 
-        // Encode binary request
         val enc = LuxoEncoder()
         enc.writeVarint(meta.id.toLong())
         enc.writeVarint(0) // field mask = 0 (SELECT *)
@@ -139,8 +156,7 @@ class OkHttpTransport(
     }
 }
 
-/** Suspend wrapper for OkHttp async call — returns response body as String. */
-private suspend fun OkHttpClient.awaitCall(request: Request): String =
+private suspend fun OkHttpClient.awaitStringCall(request: Request): String =
     suspendCancellableCoroutine { cont ->
         val call = newCall(request)
         cont.invokeOnCancellation { call.cancel() }
@@ -148,17 +164,14 @@ private suspend fun OkHttpClient.awaitCall(request: Request): String =
             override fun onFailure(call: Call, e: IOException) {
                 cont.resumeWithException(LuxoError("NetworkError", 0, e.message ?: "network error"))
             }
-
             override fun onResponse(call: Call, response: Response) {
                 response.use { resp ->
-                    val body = resp.body?.string() ?: "{}"
-                    cont.resume(body)
+                    cont.resume(resp.body?.string() ?: "{}")
                 }
             }
         })
     }
 
-/** Suspend wrapper for OkHttp async call — returns response body as ByteArray. */
 private suspend fun OkHttpClient.awaitBinaryCall(request: Request): ByteArray =
     suspendCancellableCoroutine { cont ->
         val call = newCall(request)
@@ -167,11 +180,9 @@ private suspend fun OkHttpClient.awaitBinaryCall(request: Request): ByteArray =
             override fun onFailure(call: Call, e: IOException) {
                 cont.resumeWithException(LuxoError("NetworkError", 0, e.message ?: "network error"))
             }
-
             override fun onResponse(call: Call, response: Response) {
                 response.use { resp ->
                     if (!resp.isSuccessful) {
-                        // Error responses are JSON
                         val body = resp.body?.string() ?: ""
                         try {
                             val json = Json.parseToJsonElement(body).jsonObject
@@ -186,8 +197,7 @@ private suspend fun OkHttpClient.awaitBinaryCall(request: Request): ByteArray =
                         }
                         return
                     }
-                    val bytes = resp.body?.bytes() ?: ByteArray(0)
-                    cont.resume(bytes)
+                    cont.resume(resp.body?.bytes() ?: ByteArray(0))
                 }
             }
         })
