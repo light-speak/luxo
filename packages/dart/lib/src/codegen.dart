@@ -35,6 +35,14 @@ Future<void> generate({
 
     File('$outDir/types.dart').writeAsStringSync(_genTypes(schema));
     File('$outDir/schema.dart').writeAsStringSync(_genSchemaMap(schema));
+    // Placeholder for _select_hints.g.dart — build_runner overwrites with real hints
+    final hintsFile = File('$outDir/_select_hints.g.dart');
+    if (!hintsFile.existsSync()) {
+      hintsFile.writeAsStringSync(
+        '// GENERATED placeholder. Run `dart run build_runner build` for real hints.\n'
+        'const selectHints = <String, String>{};\n',
+      );
+    }
     File('$outDir/client.dart').writeAsStringSync(_genClient(schema));
     print('[luxo] Generated types -> $outDir/');
   } finally {

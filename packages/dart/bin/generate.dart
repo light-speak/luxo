@@ -10,6 +10,10 @@ void main(List<String> args) async {
   String outDir = 'lib/src/luxo';
 
   for (int i = 0; i < args.length; i++) {
+    if (i + 1 >= args.length && args[i].startsWith('--')) {
+      print('Error: ${args[i]} requires a value');
+      return;
+    }
     switch (args[i]) {
       case '--endpoint':
         endpoint = args[++i];

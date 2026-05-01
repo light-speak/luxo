@@ -1,11 +1,11 @@
-import { createContext, useContext, type ReactNode } from 'react'
+import { createContext, useContext, createElement, type ReactNode } from 'react'
 import type { Transport } from '@luxo/client'
 
 const LuxoContext = createContext<Transport | null>(null)
 
 /** Provide Luxo transport to the component tree */
 export function LuxoProvider({ transport, children }: { transport: Transport; children: ReactNode }) {
-  return LuxoContext.Provider({ value: transport, children })
+  return createElement(LuxoContext.Provider, { value: transport }, children)
 }
 
 /** Get Luxo transport from context */

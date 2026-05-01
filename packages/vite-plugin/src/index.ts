@@ -25,10 +25,11 @@ export function luxo(options: LuxoPluginOptions = {}): Plugin {
     async buildStart() {
       // Load schema from endpoint or local file
       schema = await loadSchema(options)
-      if (schema) {
-        // Generate TypeScript types + client from schema
-        await generateTypes(schema, outDir)
+      if (!schema) {
+        console.warn('[luxo] No schema available — skipping codegen. Set endpoint + key or schemaFile option.')
+        return
       }
+      await generateTypes(schema, outDir)
     },
 
     transform(code: string, id: string) {

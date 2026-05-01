@@ -126,7 +126,8 @@ object LuxoCodegen {
         appendLine("import com.luxo.client.*")
         appendLine("import kotlinx.serialization.json.*\n")
         appendLine("class LuxoClient(private val transport: Transport) {\n")
-        appendLine("    companion object { val schema = LUXO_SCHEMA }\n")
+        appendLine("    companion object { val schema = LUXO_SCHEMA }")
+        appendLine("    private fun hint(api: String): String? = try { SelectHints.hints[api] } catch (_: Exception) { null }\n")
 
         for (api in schema.apis.values) {
             if (api.name.startsWith("svc:")) continue
@@ -147,13 +148,15 @@ object LuxoCodegen {
         when {
             api.name.startsWith("get") && !api.returnList && api.params.isEmpty() -> {
                 b.appendLine("    suspend fun ${api.name}(id: Int, select: String? = null): $ret {")
-                b.appendLine("        val data = transport.call(\"${api.name}\", mapOf(\"id\" to id, \"\\\$select\" to select))")
+                b.appendLine("        val sel = select ?: hint(\"${api.name}\")")
+                b.appendLine("        val data = transport.call(\"${api.name}\", mapOf(\"id\" to id, \"\\\$select\" to sel))")
                 emitDecode()
                 b.appendLine("    }\n")
             }
             api.name.startsWith("list") -> {
                 b.appendLine("    suspend fun ${api.name}(page: Int? = null, pageSize: Int? = null, select: String? = null): $ret {")
-                b.appendLine("        val data = transport.call(\"${api.name}\", mapOf(\"page\" to page, \"pageSize\" to pageSize, \"\\\$select\" to select))")
+                b.appendLine("        val sel = select ?: hint(\"${api.name}\")")
+                b.appendLine("        val data = transport.call(\"${api.name}\", mapOf(\"page\" to page, \"pageSize\" to pageSize, \"\\\$select\" to sel))")
                 emitDecode()
                 b.appendLine("    }\n")
             }
