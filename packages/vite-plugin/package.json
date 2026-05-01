@@ -1,0 +1,20 @@
+{
+  "name": "@luxo/vite-plugin",
+  "version": "0.1.0",
+  "description": "Luxo Vite plugin — compile-time field tracking + auto $select injection",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "files": ["src"],
+  "license": "Apache-2.0",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "peerDependencies": {
+    "vite": ">=5.0",
+    "typescript": ">=5.0"
+  },
+  "devDependencies": {
+    "vitest": "^3.0.0"
+  }
+}

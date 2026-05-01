@@ -80,6 +80,14 @@ var fieldTypeNames = [...]string{
 	FieldModel:    "Model",
 }
 
+// String returns the Luxo type name for the field type.
+func (t FieldType) String() string {
+	if int(t) < len(fieldTypeNames) {
+		return fieldTypeNames[t]
+	}
+	return "Unknown"
+}
+
 // MarshalJSON outputs FieldType as a string.
 func (t FieldType) MarshalJSON() ([]byte, error) {
 	if int(t) < len(fieldTypeNames) {

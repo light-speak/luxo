@@ -1,0 +1,10 @@
+name: luxo_client
+description: Luxo client SDK — type-safe API calls with pluggable transport
+version: 0.1.0
+homepage: https://github.com/light-speak/luxo
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  http: ^1.2.0
