@@ -64,8 +64,14 @@ func (rt *Router) ExportHandlers() map[string]HandlerFunc {
 }
 
 // ServeHTTP implements http.Handler for the /luvia endpoint.
-// Supports JSON (default) and Luxo binary (X-Luxo-Mode: binary) protocols.
+// Supports JSON, Luxo binary, and WebSocket protocols on the same endpoint.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// WebSocket upgrade: GET /luvia with Upgrade: websocket
+	if r.Header.Get("Upgrade") == "websocket" {
+		rt.handleWebSocket(w, r)
+		return
+	}
+
 	// Schema introspection: GET /luvia?$schema&key=xxx
 	if r.URL.Query().Has("$schema") {
 		rt.handleIntrospection(w, r)
