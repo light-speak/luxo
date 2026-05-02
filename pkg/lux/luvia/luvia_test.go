@@ -1,13 +1,22 @@
 package luvia
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestMaskDSN(t *testing.T) {
@@ -286,5 +295,239 @@ func TestBuildMuxLuviaRoute(t *testing.T) {
 	// since the route is registered
 	if w.Code == http.StatusNotFound && strings.Contains(w.Body.String(), "page not found") {
 		t.Error("/luvia route should be registered")
+	}
+}
+
+func TestCORSPreflightOptions(t *testing.T) {
+	handler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("OPTIONS should not reach inner handler")
+	}))
+
+	r := httptest.NewRequest(http.MethodOptions, "/luvia", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+
+	if w.Code != http.StatusNoContent {
+		t.Errorf("OPTIONS should return 204, got %d", w.Code)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("CORS origin = %q, want *", got)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Methods"); got != "POST, OPTIONS" {
+		t.Errorf("CORS methods = %q", got)
+	}
+}
+
+func TestCORSCustomOrigin(t *testing.T) {
+	os.Setenv("CORS_ORIGIN", "https://example.com")
+	defer os.Unsetenv("CORS_ORIGIN")
+
+	handler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	r := httptest.NewRequest(http.MethodPost, "/luvia", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://example.com" {
+		t.Errorf("CORS origin = %q, want https://example.com", got)
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	handler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	r := httptest.NewRequest(http.MethodPost, "/luvia", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+
+	checks := map[string]string{
+		"X-Content-Type-Options":  "nosniff",
+		"X-Frame-Options":         "DENY",
+		"X-XSS-Protection":        "1; mode=block",
+		"Content-Security-Policy": "default-src 'none'",
+	}
+	for header, want := range checks {
+		if got := w.Header().Get(header); got != want {
+			t.Errorf("%s = %q, want %q", header, got, want)
+		}
+	}
+}
+
+func TestPrintBanner(t *testing.T) {
+	// printBanner just calls fmt.Print(buildBanner(...)) — verify no panic
+	// Capture by redirecting is overkill; just ensure it doesn't crash
+	printBanner("1.0", "4000", "embedded", "json", "", []string{"test"})
+}
+
+func TestBuildMuxIntrospectionKey(t *testing.T) {
+	t.Setenv("INTROSPECTION_KEY", "my-secret-key")
+
+	gw := New()
+	gw.buildMux("v1")
+
+	if gw.Router.IntrospectionKey != "my-secret-key" {
+		t.Errorf("IntrospectionKey = %q, want my-secret-key", gw.Router.IntrospectionKey)
+	}
+}
+
+func TestBuildMuxDevMode(t *testing.T) {
+	t.Setenv("APP_ENV", "development")
+
+	gw := New()
+	gw.buildMux("v1")
+
+	// In dev mode, router should be in dev mode
+	// We can't easily check this without exposing state, but ensure no crash
+}
+
+func TestBuildBannerDatabaseDisplay(t *testing.T) {
+	// With full DATABASE_* fields
+	t.Setenv("DATABASE_HOST", "localhost")
+	t.Setenv("DATABASE_PORT", "5432")
+	t.Setenv("DATABASE_USER", "admin")
+	t.Setenv("DATABASE_PREFIX", "myapp")
+
+	gw := New()
+	gw.AddModule("user")
+	// buildMux constructs DB display from env
+	_, _ = gw.buildMux("v1")
+}
+
+func TestServe_H2C(t *testing.T) {
+	gw := New()
+	gw.AddModule("test")
+
+	// Use a random high port
+	t.Setenv("APP_PORT", "0")
+
+	// Start Serve in goroutine and stop with signal
+	done := make(chan error, 1)
+	go func() {
+		done <- gw.Serve("test-v1")
+	}()
+
+	// Give server time to start then send interrupt
+	time.Sleep(50 * time.Millisecond)
+	proc, _ := os.FindProcess(os.Getpid())
+	proc.Signal(syscall.SIGINT)
+
+	err := <-done
+	if err != nil {
+		t.Errorf("Serve should shut down cleanly, got: %v", err)
+	}
+}
+
+func TestServe_CustomShutdownTimeout(t *testing.T) {
+	t.Setenv("SHUTDOWN_TIMEOUT", "1s")
+	t.Setenv("APP_PORT", "0")
+
+	gw := New()
+	done := make(chan error, 1)
+	go func() {
+		done <- gw.Serve("test-v1")
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	proc, _ := os.FindProcess(os.Getpid())
+	proc.Signal(syscall.SIGINT)
+
+	err := <-done
+	if err != nil {
+		t.Errorf("got: %v", err)
+	}
+}
+
+func TestServe_TLS(t *testing.T) {
+	// Generate self-signed cert for testing
+	certFile, keyFile := generateTestCert(t)
+	t.Setenv("APP_TLS_CERT", certFile)
+	t.Setenv("APP_TLS_KEY", keyFile)
+	t.Setenv("APP_PORT", "0")
+
+	gw := New()
+	done := make(chan error, 1)
+	go func() {
+		done <- gw.Serve("test-tls")
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	proc, _ := os.FindProcess(os.Getpid())
+	proc.Signal(syscall.SIGINT)
+
+	err := <-done
+	if err != nil {
+		t.Errorf("TLS Serve should shut down cleanly, got: %v", err)
+	}
+}
+
+func generateTestCert(t *testing.T) (certFile, keyFile string) {
+	t.Helper()
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "cert.pem")
+	keyPath := filepath.Join(dir, "key.pem")
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{Organization: []string{"Test"}},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(time.Hour),
+		DNSNames:     []string{"localhost"},
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
+	os.WriteFile(certPath, certPEM, 0600)
+	os.WriteFile(keyPath, keyPEM, 0600)
+	return certPath, keyPath
+}
+
+func TestServe_InvalidShutdownTimeout(t *testing.T) {
+	t.Setenv("SHUTDOWN_TIMEOUT", "not-a-duration")
+	t.Setenv("APP_PORT", "0")
+
+	gw := New()
+	done := make(chan error, 1)
+	go func() {
+		done <- gw.Serve("test-v1")
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	proc, _ := os.FindProcess(os.Getpid())
+	proc.Signal(syscall.SIGINT)
+
+	err := <-done
+	if err != nil {
+		t.Errorf("got: %v", err)
+	}
+}
+
+func TestCORSPassThroughNonOptions(t *testing.T) {
+	called := false
+	handler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	r := httptest.NewRequest(http.MethodPost, "/luvia", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+
+	if !called {
+		t.Error("POST should reach inner handler")
+	}
+	if w.Code != http.StatusOK {
+		t.Errorf("POST should return 200, got %d", w.Code)
 	}
 }

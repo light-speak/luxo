@@ -97,14 +97,54 @@ func runGen(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Generate embedded entry point: luxis/app/main.gen.go
+	// Generate entry points
 	modulePath, _ := readModulePath()
 	if modulePath != "" {
+		// Embedded entry: luxis/app/main.gen.go (all modules, single process)
 		if err := generateEntry(result, modulePath); err != nil {
 			return err
 		}
 		totalFiles++
+
+		// Per-module entries: luxis/<module>/main.gen.go (cluster mode, one binary per module)
+		moduleEntries := codegen.GenerateModuleEntryFiles(result, modulePath)
+		for modName, src := range moduleEntries {
+			outDir := filepath.Join("luxis", modName)
+			if err := os.MkdirAll(outDir, 0755); err != nil {
+				return fmt.Errorf("create %s: %w", outDir, err)
+			}
+			outPath := filepath.Join(outDir, "main.gen.go")
+			if err := os.WriteFile(outPath, src, 0644); err != nil {
+				return fmt.Errorf("write %s: %w", outPath, err)
+			}
+			green := "\033[32m"
+			reset := "\033[0m"
+			fmt.Printf("  %s+%s %s\n", green, reset, outPath)
+			totalFiles++
+		}
+
+		// Gateway entry: luxis/gateway/main.gen.go (pure router, no handler code)
+		if gwSrc := codegen.GenerateGatewayEntry(result, modulePath); gwSrc != nil {
+			outDir := filepath.Join("luxis", "gateway")
+			if err := os.MkdirAll(outDir, 0755); err != nil {
+				return fmt.Errorf("create %s: %w", outDir, err)
+			}
+			outPath := filepath.Join(outDir, "main.gen.go")
+			if err := os.WriteFile(outPath, gwSrc, 0644); err != nil {
+				return fmt.Errorf("write %s: %w", outPath, err)
+			}
+			green := "\033[32m"
+			reset := "\033[0m"
+			fmt.Printf("  %s+%s %s\n", green, reset, outPath)
+			totalFiles++
+		}
 	}
+
+	// Export luxo.schema.json for SDK generation (vite plugin / dart / kotlin)
+	if err := exportSchemaJSON(result); err != nil {
+		return fmt.Errorf("export schema: %w", err)
+	}
+	totalFiles++
 
 	green := "\033[32m"
 	dim := "\033[2m"
@@ -339,6 +379,21 @@ func generateEntry(result *semantic.Result, modulePath string) error {
 		return fmt.Errorf("write %s: %w", outPath, err)
 	}
 	fmt.Printf("  %s+%s %s\n", green, reset, outPath)
+	return nil
+}
+
+func exportSchemaJSON(result *semantic.Result) error {
+	enums := codegen.CollectEnumsFromResult(result)
+	data, err := codegen.BuildSchemaJSON(result, enums)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile("luxo.schema.json", data, 0644); err != nil {
+		return err
+	}
+	green := "\033[32m"
+	reset := "\033[0m"
+	fmt.Printf("  %s✓%s luxo.schema.json\n", green, reset)
 	return nil
 }
 

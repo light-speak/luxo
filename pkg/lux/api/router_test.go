@@ -13,8 +13,10 @@ import (
 	"testing"
 
 	"github.com/bytedance/sonic"
+	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/light-speak/luxo/pkg/lux/i18n"
+	"github.com/light-speak/luxo/pkg/lux/schema"
 	"github.com/light-speak/luxo/pkg/lux/selection"
 )
 
@@ -444,6 +446,248 @@ func TestRouterHandlerPanicRecovery(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), `"error"`) {
 		t.Errorf("expected error response, got %s", w.Body.String())
+	}
+}
+
+// --- Introspection Tests ---
+
+func TestIntrospectionDisabledByDefault(t *testing.T) {
+	rt := NewRouter()
+	r := httptest.NewRequest(http.MethodGet, "/luvia?$schema", nil)
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d", w.Code)
+	}
+}
+
+func TestIntrospectionWrongKey(t *testing.T) {
+	rt := NewRouter()
+	rt.IntrospectionKey = "correct-key"
+
+	r := httptest.NewRequest(http.MethodGet, "/luvia?$schema&key=wrong", nil)
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d", w.Code)
+	}
+}
+
+func TestIntrospectionSuccess(t *testing.T) {
+	rt := NewRouter()
+	rt.IntrospectionKey = "test-key"
+	rt.Schema.RegisterModel(&schema.Model{
+		Name: "User",
+		Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt},
+			{ID: 2, Name: "name", Type: schema.FieldString},
+		},
+	})
+	rt.Schema.RegisterAPI(&schema.API{
+		ID: 1, Name: "getUser", Module: "user",
+		ReturnType: "User",
+	})
+
+	r := httptest.NewRequest(http.MethodGet, "/luvia?$schema&key=test-key", nil)
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	ct := w.Header().Get("Content-Type")
+	if ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	models, ok := result["models"].(map[string]any)
+	if !ok {
+		t.Fatal("missing models in schema")
+	}
+	if _, ok := models["User"]; !ok {
+		t.Error("missing User model")
+	}
+
+	apis, ok := result["apis"].(map[string]any)
+	if !ok {
+		t.Fatal("missing apis in schema")
+	}
+	if _, ok := apis["getUser"]; !ok {
+		t.Error("missing getUser API")
+	}
+}
+
+func TestIntrospectionFieldTypes(t *testing.T) {
+	rt := NewRouter()
+	rt.IntrospectionKey = "key"
+	rt.Schema.RegisterModel(&schema.Model{
+		Name: "Post",
+		Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt},
+			{ID: 2, Name: "title", Type: schema.FieldString},
+			{ID: 3, Name: "score", Type: schema.FieldFloat},
+			{ID: 4, Name: "active", Type: schema.FieldBool},
+			{ID: 5, Name: "tags", Type: schema.FieldEnum},
+			{ID: 6, Name: "bio", Type: schema.FieldString, Nullable: true},
+		},
+	})
+
+	r := httptest.NewRequest(http.MethodGet, "/luvia?$schema&key=key", nil)
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, r)
+
+	body := w.Body.String()
+	// Field types should be strings, not numbers
+	if !strings.Contains(body, `"Int"`) {
+		t.Error("FieldInt should serialize as 'Int'")
+	}
+	if !strings.Contains(body, `"String"`) {
+		t.Error("FieldString should serialize as 'String'")
+	}
+	if !strings.Contains(body, `"Float"`) {
+		t.Error("FieldFloat should serialize as 'Float'")
+	}
+	if !strings.Contains(body, `"Boolean"`) {
+		t.Error("FieldBool should serialize as 'Boolean'")
+	}
+	if !strings.Contains(body, `"Enum"`) {
+		t.Error("FieldEnum should serialize as 'Enum'")
+	}
+	if !strings.Contains(body, `"nullable":true`) {
+		t.Error("nullable field should have nullable:true")
+	}
+}
+
+// --- Schema Binary→JSON Conversion Tests ---
+
+func TestRouterSchemaConversion(t *testing.T) {
+	rt := NewRouter()
+	rt.Schema.RegisterModel(&schema.Model{
+		Name: "User",
+		Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt},
+			{ID: 2, Name: "name", Type: schema.FieldString},
+		},
+	})
+	rt.Schema.RegisterAPI(&schema.API{
+		ID: 1, Name: "getUser", Module: "user",
+		ReturnType: "User",
+	})
+
+	// Handler writes binary (WriteLuxo style)
+	rt.Handle("getUser", func(ctx context.Context, req *Request) error {
+		var enc codec.Encoder
+		enc.WriteFieldInt(1, 42)
+		enc.WriteFieldString(2, "Alice")
+		enc.WriteEnd()
+		req.Buf.B = append(req.Buf.B, enc.Bytes()...)
+		return nil
+	})
+
+	// JSON request → handler writes binary → Router converts to JSON via schema
+	body := `{"$api":"getUser","id":1}`
+	r := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Response should be JSON converted from binary via schema
+	resp := w.Body.String()
+	if !strings.Contains(resp, `"id":42`) {
+		t.Errorf("missing id in response: %s", resp)
+	}
+	if !strings.Contains(resp, `"Alice"`) {
+		t.Errorf("missing name in response: %s", resp)
+	}
+}
+
+func TestIntrospectionViaHeader(t *testing.T) {
+	rt := NewRouter()
+	rt.IntrospectionKey = "secret-key"
+	rt.Schema.RegisterModel(&schema.Model{
+		Name:   "User",
+		Fields: []schema.Field{{ID: 1, Name: "id", Type: schema.FieldInt}},
+	})
+	rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "getUser", Module: "user", ReturnType: "User"})
+
+	// Header takes priority — query param wrong but header correct should succeed
+	r := httptest.NewRequest(http.MethodGet, "/luvia?$schema&key=wrong", nil)
+	r.Header.Set("X-Introspection-Key", "secret-key")
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("header auth should succeed, got %d", w.Code)
+	}
+
+	// Neither header nor query — should fail
+	r2 := httptest.NewRequest(http.MethodGet, "/luvia?$schema", nil)
+	w2 := httptest.NewRecorder()
+	rt.ServeHTTP(w2, r2)
+
+	if w2.Code != http.StatusForbidden {
+		t.Errorf("empty key should be forbidden, got %d", w2.Code)
+	}
+}
+
+func TestConvertBinaryToJSON_EmptyData(t *testing.T) {
+	rt := NewRouter()
+	// Empty data should return null regardless of schema
+	result := rt.convertBinaryToJSON("getUser", nil)
+	if string(result) != "null" {
+		t.Errorf("expected null for empty data, got %q", result)
+	}
+	result = rt.convertBinaryToJSON("getUser", []byte{})
+	if string(result) != "null" {
+		t.Errorf("expected null for zero-length data, got %q", result)
+	}
+}
+
+func TestConvertBinaryToJSON_NoSchema(t *testing.T) {
+	rt := NewRouter()
+	rt.Schema = nil
+	// Without schema, should pass data through (handler wrote JSON directly)
+	input := []byte(`{"id":1,"name":"test"}`)
+	result := rt.convertBinaryToJSON("getUser", input)
+	if string(result) != string(input) {
+		t.Errorf("expected passthrough, got %q", result)
+	}
+}
+
+func TestConvertBinaryToJSON_UnknownAPI(t *testing.T) {
+	rt := NewRouter()
+	// Schema exists but API not registered — pass through
+	input := []byte(`{"id":1}`)
+	result := rt.convertBinaryToJSON("nonExistent", input)
+	if string(result) != string(input) {
+		t.Errorf("unknown API should passthrough, got %q", result)
+	}
+}
+
+func TestWriteErrorEscapesJSON(t *testing.T) {
+	w := httptest.NewRecorder()
+	// Message with quotes and newlines should be properly escaped
+	writeError(w, http.StatusBadRequest, "invalid \"field\"\nnewline")
+
+	body := w.Body.String()
+	// Should be valid JSON
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Errorf("writeError produced invalid JSON: %s (body: %s)", err, body)
+	}
+	if parsed["error"] != "invalid \"field\"\nnewline" {
+		t.Errorf("error message not preserved: %q", parsed["error"])
 	}
 }
 

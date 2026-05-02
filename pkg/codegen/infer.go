@@ -376,24 +376,12 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 	case "count":
 		fmt.Fprintf(b, "\t\tcount, err := app.%s.Where(conds...).Count(ctx)\n", modelName)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, count)\n")
-		fmt.Fprintf(b, "\t\t} else {\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`{\"count\":`)\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendInt(count)\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendByte('}')\n")
-		fmt.Fprintf(b, "\t\t}\n")
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, count)\n")
 
 	case "exists":
 		fmt.Fprintf(b, "\t\texists, err := app.%s.Where(conds...).Exists(ctx)\n", modelName)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendBool(req.Buf.B, exists)\n")
-		fmt.Fprintf(b, "\t\t} else {\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`{\"exists\":`)\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendBool(exists)\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendByte('}')\n")
-		fmt.Fprintf(b, "\t\t}\n")
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendBool(req.Buf.B, exists)\n")
 
 	case "delete":
 		if soft {
@@ -403,13 +391,7 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 		}
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		fmt.Fprintf(b, "\t\tif n == 0 {\n\t\t\treturn errors.NotFound.WithData(errors.ResourceError{Resource: %q})\n\t\t}\n", modelName)
-		fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, n)\n")
-		fmt.Fprintf(b, "\t\t} else {\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`{\"deleted\":`)\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendInt(n)\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendByte('}')\n")
-		fmt.Fprintf(b, "\t\t}\n")
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, n)\n")
 
 	case "list":
 		if hasRels {
@@ -435,15 +417,7 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 				fmt.Fprintf(b, "\t\tif err := resolve%sListRelations(ctx, app, results, req.Select); err != nil {\n", modelName)
 				fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 			}
-			lower := str.LowerFirst(modelName)
-			fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
-			fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(results)))\n")
-			fmt.Fprintf(b, "\t\t\tfor _, item := range results {\n")
-			fmt.Fprintf(b, "\t\t\t\titem.WriteLuxo(req.Buf, req.FieldMask)\n")
-			fmt.Fprintf(b, "\t\t\t}\n")
-			fmt.Fprintf(b, "\t\t} else {\n")
-			fmt.Fprintf(b, "\t\t\t%sListJSON(results).WriteJSON(req.Buf, req.Select)\n", lower)
-			fmt.Fprintf(b, "\t\t}\n")
+			fmt.Fprintf(b, "\t\tWriteColumnar%s(req.Buf, results, req.FieldMask)\n", modelName)
 		} else {
 			fmt.Fprintf(b, "\t\tresults, total, err := q.Limit(req.PageSize).Offset((req.Page - 1) * req.PageSize).AllWithCount(ctx)\n")
 			fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
@@ -451,26 +425,10 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 				fmt.Fprintf(b, "\t\tif err := resolve%sListRelations(ctx, app, results, req.Select); err != nil {\n", modelName)
 				fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 			}
-			lower := str.LowerFirst(modelName)
-			fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
-			fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(results)))\n")
-			fmt.Fprintf(b, "\t\t\tfor _, item := range results {\n")
-			fmt.Fprintf(b, "\t\t\t\titem.WriteLuxo(req.Buf, req.FieldMask)\n")
-			fmt.Fprintf(b, "\t\t\t}\n")
-			fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, total)\n")
-			fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.Page))\n")
-			fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.PageSize))\n")
-			fmt.Fprintf(b, "\t\t} else {\n")
-			fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`{\"items\":`)\n")
-			fmt.Fprintf(b, "\t\t\t%sListJSON(results).WriteJSON(req.Buf, req.Select)\n", lower)
-			fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`,\"total\":`)\n")
-			fmt.Fprintf(b, "\t\t\treq.Buf.AppendInt(total)\n")
-			fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`,\"page\":`)\n")
-			fmt.Fprintf(b, "\t\t\treq.Buf.AppendInt(int64(req.Page))\n")
-			fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`,\"pageSize\":`)\n")
-			fmt.Fprintf(b, "\t\t\treq.Buf.AppendInt(int64(req.PageSize))\n")
-			fmt.Fprintf(b, "\t\t\treq.Buf.AppendByte('}')\n")
-			fmt.Fprintf(b, "\t\t}\n")
+			fmt.Fprintf(b, "\t\tWriteColumnar%s(req.Buf, results, req.FieldMask)\n", modelName)
+			fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, total)\n")
+			fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.Page))\n")
+			fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.PageSize))\n")
 		}
 
 	default: // get
@@ -487,11 +445,7 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 			fmt.Fprintf(b, "\t\tif err := resolve%sRelations(ctx, app, result, req.Select); err != nil {\n", modelName)
 			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 		}
-		fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
-		fmt.Fprintf(b, "\t\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
-		fmt.Fprintf(b, "\t\t} else {\n")
-		fmt.Fprintf(b, "\t\t\tresult.WriteJSON(req.Buf, req.Select)\n")
-		fmt.Fprintf(b, "\t\t}\n")
+		fmt.Fprintf(b, "\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
 	}
 
 	fmt.Fprintf(b, "\t\treturn nil\n")

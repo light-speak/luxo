@@ -700,3 +700,416 @@ func TestGenerateDataLoaderDefaultLoadersDedupSeenMap(t *testing.T) {
 		t.Errorf("deduplicated default loader should appear once, got %d", count)
 	}
 }
+
+// --- Extend DataLoader load-by-PK ---
+
+func TestGenerateDataLoaderExtendByPK(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{
+			{
+				Name: "origin/user.luxo",
+				Models: []*ast.ModelDecl{{
+					Pos:  pos0(),
+					Name: "User",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "phone", Type: &ast.TypeRef{Name: "String"}},
+					},
+				}},
+			},
+			{
+				Name: "origin/post.luxo",
+				Models: []*ast.ModelDecl{{
+					Pos:  pos0(),
+					Name: "Post",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+					},
+				}},
+				Extends: []*ast.ExtendDecl{{
+					Name: "User",
+					Fields: []*ast.FieldDecl{
+						{Name: "phone", Type: &ast.TypeRef{Name: "String"}},
+					},
+				}},
+			},
+		},
+	}
+
+	src := generateDataLoaderFile(result, "post_luxo", map[string]bool{}, nil, DriverPG)
+	if src == nil {
+		t.Fatal("expected dataloader file")
+	}
+	code := string(src)
+
+	// Should have ExtendUser loader in struct
+	if !strings.Contains(code, "ExtendUser *dataloader.Loader[int64, *User]") {
+		t.Error("missing ExtendUser loader in struct")
+	}
+
+	// Should have load-by-PK batch function
+	if !strings.Contains(code, `lux.NewIntField("id").In(keys...)`) {
+		t.Error("missing PK condition in extend batch function")
+	}
+
+	// Should query users table
+	if !strings.Contains(code, `"users"`) {
+		t.Error("missing users table in extend batch function")
+	}
+
+	// Should use scanUser
+	if !strings.Contains(code, "scanUser") {
+		t.Error("missing scanUser in extend batch function")
+	}
+
+	// Should have type alias
+	if !strings.Contains(code, "ExtendUserByIdLoader") {
+		t.Error("missing ExtendUserByIdLoader type")
+	}
+}
+
+func TestGenerateDataLoaderFKLoad(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{
+			{
+				Name: "origin/post.luxo",
+				Models: []*ast.ModelDecl{{
+					Pos:  pos0(),
+					Name: "Post",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+					},
+				}},
+				APIs: []*ast.ApiDecl{{
+					Name:   "getPostsByUser",
+					Params: []*ast.ParamDecl{{Name: "userId", Type: &ast.TypeRef{Name: "Int"}}},
+					Body: &ast.Block{Stmts: []ast.Stmt{
+						&ast.ValStmt{
+							Name: "posts",
+							Value: &ast.CallExpr{
+								Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "load"},
+								Args: []*ast.NamedArg{{Name: "userId", Value: &ast.Ident{Name: "userId"}}},
+							},
+						},
+					}},
+				}},
+			},
+		},
+	}
+
+	src := generateDataLoaderFile(result, "post_luxo", map[string]bool{}, nil, DriverPG)
+	if src == nil {
+		t.Fatal("expected dataloader file for FK load")
+	}
+	code := string(src)
+
+	// Should have PostByUserId loader
+	if !strings.Contains(code, "PostByUserId") {
+		t.Error("missing PostByUserId loader")
+	}
+	// Should have batch function with user_id condition
+	if !strings.Contains(code, `"user_id"`) {
+		t.Error("missing user_id FK condition")
+	}
+}
+
+func TestGenerateDataLoaderCompositeKeyLoad(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{
+			{
+				Name: "origin/post.luxo",
+				Models: []*ast.ModelDecl{{
+					Pos:  pos0(),
+					Name: "Post",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "type", Type: &ast.TypeRef{Name: "String"}},
+					},
+				}},
+				APIs: []*ast.ApiDecl{{
+					Name: "getArticles",
+					Body: &ast.Block{Stmts: []ast.Stmt{
+						&ast.ValStmt{
+							Name: "articles",
+							Value: &ast.CallExpr{
+								Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "load"},
+								Args: []*ast.NamedArg{
+									{Name: "userId", Value: &ast.Ident{Name: "uid"}},
+									{Name: "type", Value: &ast.Literal{Kind: token.String, Value: "article"}},
+								},
+							},
+						},
+					}},
+				}},
+			},
+		},
+	}
+
+	src := generateDataLoaderFile(result, "post_luxo", map[string]bool{}, nil, DriverPG)
+	if src == nil {
+		t.Fatal("expected dataloader file for composite load")
+	}
+	code := string(src)
+
+	// Should have composite key struct
+	if !strings.Contains(code, "PostByUserIdAndTypeKey") {
+		t.Error("missing composite key struct")
+	}
+	// Should have composite loader
+	if !strings.Contains(code, "PostByUserIdAndType") {
+		t.Error("missing composite loader")
+	}
+	// Should have multi-condition WHERE
+	if !strings.Contains(code, `"user_id"`) && !strings.Contains(code, `"type"`) {
+		t.Error("missing multi-condition WHERE")
+	}
+}
+
+func TestCollectLoadCalls(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			APIs: []*ast.ApiDecl{
+				{
+					Name: "api1",
+					Body: &ast.Block{Stmts: []ast.Stmt{
+						&ast.ValStmt{Name: "u", Value: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
+							Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}}, // PK
+						}},
+						&ast.ValStmt{Name: "p", Value: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "load"},
+							Args: []*ast.NamedArg{{Name: "userId", Value: &ast.Ident{Name: "uid"}}}, // FK
+						}},
+					}},
+				},
+			},
+		}},
+	}
+
+	calls := collectLoadCalls(result)
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 load calls, got %d", len(calls))
+	}
+
+	// PK call
+	found := false
+	for _, c := range calls {
+		if c.modelName == "User" && len(c.argNames) == 0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("missing PK load call for User")
+	}
+
+	// FK call
+	found = false
+	for _, c := range calls {
+		if c.modelName == "Post" && len(c.argNames) == 1 && c.argNames[0] == "userId" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("missing FK load call for Post")
+	}
+}
+
+func TestScanLoadCalls_IfStmt(t *testing.T) {
+	seen := make(map[string]bool)
+	var calls []loadCallInfo
+	stmt := &ast.IfStmt{
+		Then: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ValStmt{Name: "x", Value: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
+				Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
+			}},
+		}},
+	}
+	scanLoadCalls(stmt, seen, &calls)
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 call from if body, got %d", len(calls))
+	}
+}
+
+func TestScanLoadCalls_ForStmt(t *testing.T) {
+	seen := make(map[string]bool)
+	var calls []loadCallInfo
+	stmt := &ast.ForStmt{
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "load"},
+				Args: []*ast.NamedArg{{Name: "userId", Value: &ast.Ident{Name: "u"}}},
+			}},
+		}},
+	}
+	scanLoadCalls(stmt, seen, &calls)
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 call from for body, got %d", len(calls))
+	}
+}
+
+func TestScanLoadCalls_ReturnStmt(t *testing.T) {
+	seen := make(map[string]bool)
+	var calls []loadCallInfo
+	stmt := &ast.ReturnStmt{
+		Value: &ast.CallExpr{
+			Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
+			Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
+		},
+	}
+	scanLoadCalls(stmt, seen, &calls)
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 call from return, got %d", len(calls))
+	}
+}
+
+func TestScanLoadCalls_Dedup(t *testing.T) {
+	seen := make(map[string]bool)
+	var calls []loadCallInfo
+	// Same load twice
+	for i := 0; i < 2; i++ {
+		stmt := &ast.ValStmt{Name: "x", Value: &ast.CallExpr{
+			Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
+			Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
+		}}
+		scanLoadCalls(stmt, seen, &calls)
+	}
+	if len(calls) != 1 {
+		t.Errorf("duplicate load calls should be deduped, got %d", len(calls))
+	}
+}
+
+func TestScanLoadCallsExpr_NotCall(t *testing.T) {
+	seen := make(map[string]bool)
+	var calls []loadCallInfo
+	// Not a CallExpr
+	scanLoadCallsExpr(&ast.Ident{Name: "x"}, seen, &calls)
+	if len(calls) != 0 {
+		t.Error("non-call expr should produce no calls")
+	}
+}
+
+func TestScanLoadCallsExpr_LowercaseModel(t *testing.T) {
+	seen := make(map[string]bool)
+	var calls []loadCallInfo
+	// lowercase model name — should be skipped
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "load"},
+		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
+	}
+	scanLoadCallsExpr(expr, seen, &calls)
+	if len(calls) != 0 {
+		t.Error("lowercase model name should be skipped")
+	}
+}
+
+func TestScanLoadCallsExpr_NotMember(t *testing.T) {
+	seen := make(map[string]bool)
+	var calls []loadCallInfo
+	// Call on non-member expr
+	expr := &ast.CallExpr{
+		Func: &ast.Ident{Name: "load"},
+	}
+	scanLoadCallsExpr(expr, seen, &calls)
+	if len(calls) != 0 {
+		t.Error("non-member call should produce no calls")
+	}
+}
+
+func TestScanLoadCallsExpr_NotLoadMethod(t *testing.T) {
+	seen := make(map[string]bool)
+	var calls []loadCallInfo
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "find"},
+	}
+	scanLoadCallsExpr(expr, seen, &calls)
+	if len(calls) != 0 {
+		t.Error("non-load method should produce no calls")
+	}
+}
+
+func TestScanLoadCallsExpr_Nil(t *testing.T) {
+	seen := make(map[string]bool)
+	var calls []loadCallInfo
+	scanLoadCallsExpr(nil, seen, &calls)
+	if len(calls) != 0 {
+		t.Error("nil expr should produce no calls")
+	}
+}
+
+func TestCollectLoadCalls_FromFnBody(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Functions: []*ast.FnDecl{{
+				Name: "helper",
+				Body: &ast.Block{Stmts: []ast.Stmt{
+					&ast.ReturnStmt{Value: &ast.CallExpr{
+						Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
+						Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
+					}},
+				}},
+			}},
+		}},
+	}
+	calls := collectLoadCalls(result)
+	if len(calls) != 1 {
+		t.Errorf("expected 1 call from fn body, got %d", len(calls))
+	}
+}
+
+func TestCollectLoadCalls_NilBodies(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name:      "test.luxo",
+			APIs:      []*ast.ApiDecl{{Name: "a1", Body: nil}},
+			Functions: []*ast.FnDecl{{Name: "f1", Body: nil}},
+		}},
+	}
+	calls := collectLoadCalls(result)
+	if len(calls) != 0 {
+		t.Error("nil bodies should produce no calls")
+	}
+}
+
+func TestGenerateDataLoaderExtendOnlyModule(t *testing.T) {
+	// Module with no same-module relations, only extend
+	result := &semantic.Result{
+		Files: []*ast.File{
+			{Name: "origin/user.luxo", Models: []*ast.ModelDecl{{Name: "User"}}},
+			{
+				Name: "origin/notification.luxo",
+				Models: []*ast.ModelDecl{{
+					Pos:  pos0(),
+					Name: "Notification",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+					},
+				}},
+				Extends: []*ast.ExtendDecl{{
+					Name:   "User",
+					Fields: []*ast.FieldDecl{{Name: "name", Type: &ast.TypeRef{Name: "String"}}},
+				}},
+			},
+		},
+	}
+
+	src := generateDataLoaderFile(result, "notification_luxo", map[string]bool{}, nil, DriverPG)
+	if src == nil {
+		t.Fatal("expected dataloader file even for extend-only module")
+	}
+	code := string(src)
+
+	if !strings.Contains(code, "ExtendUser") {
+		t.Error("missing ExtendUser loader")
+	}
+	if !strings.Contains(code, "NewDefaultLoaders") {
+		t.Error("missing NewDefaultLoaders")
+	}
+}

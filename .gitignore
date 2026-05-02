@@ -5,13 +5,12 @@
 *.swo
 
 # Go
-bin/
+/bin/
 vendor/
 
-# VS Code Extension
+# Node
+node_modules/
 *.vsix
-editors/vscode/node_modules/
-editors/vscode/package-lock.json
 
 # OS
 .DS_Store
@@ -20,5 +19,5 @@ Thumbs.db
 
 # Examples (local testing only)
 examples/
-luxo
+/luxo
 cover.out

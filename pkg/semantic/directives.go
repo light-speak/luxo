@@ -343,6 +343,10 @@ var builtinDirectives = []DirectiveDef{
 		Description: "implementation provided by Go (not Luxo)",
 	},
 	{
+		Name: "service", Contexts: OnFn,
+		Description: "expose fn as RPC endpoint via Luxo protocol for cross-service calls",
+	},
+	{
 		Name: "cache", Contexts: OnApi | OnComputed,
 		Params:      []ParamDef{{Name: "ttl"}},
 		MaxArgs:     1,
@@ -362,7 +366,9 @@ var builtinDirectives = []DirectiveDef{
 	},
 	{
 		Name: "stream", Contexts: OnApi,
-		Description: "enable streaming response",
+		Params:      []ParamDef{{Name: "event"}},
+		MaxArgs:     1,
+		Description: "enable WebSocket streaming; optional event source binding",
 	},
 	{
 		Name: "paginate", Contexts: OnApi,

@@ -827,6 +827,174 @@ func TestCollectFieldNames(t *testing.T) {
 	}
 }
 
+// --- updateExtends ---
+
+func TestUpdateExtendsAssignsFieldIDs(t *testing.T) {
+	lf := New()
+	ff := []*ast.File{
+		{
+			Name: "origin/user.luxo",
+			Models: []*ast.ModelDecl{model("User",
+				field("id", "Int"),
+				field("name", "String"),
+			)},
+		},
+		{
+			Name: "origin/post.luxo",
+			Models: []*ast.ModelDecl{model("Post",
+				field("id", "Int"),
+				field("title", "String"),
+				field("userId", "Int"),
+			)},
+			Extends: []*ast.ExtendDecl{
+				{Pos: pos(), Name: "User", Fields: []*ast.FieldDecl{
+					{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+				}},
+			},
+		},
+	}
+
+	lf.Update(ff)
+
+	ml := lf.Models["User"]
+	if ml == nil {
+		t.Fatal("expected User ModelLock")
+	}
+	if ml.Fields["id"] == 0 || ml.Fields["name"] == 0 {
+		t.Error("model fields should have IDs")
+	}
+	if ml.Fields["posts"] == 0 {
+		t.Error("extend field 'posts' should have an ID")
+	}
+	// All IDs distinct
+	ids := make(map[int]string)
+	for name, id := range ml.Fields {
+		if prev, exists := ids[id]; exists {
+			t.Errorf("duplicate ID %d for %q and %q", id, prev, name)
+		}
+		ids[id] = name
+	}
+}
+
+func TestUpdateExtendsMultipleModules(t *testing.T) {
+	lf := New()
+	ff := []*ast.File{
+		{
+			Name:   "origin/user.luxo",
+			Models: []*ast.ModelDecl{model("User", field("id", "Int"))},
+		},
+		{
+			Name: "origin/post.luxo",
+			Extends: []*ast.ExtendDecl{
+				{Name: "User", Fields: []*ast.FieldDecl{
+					{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+				}},
+			},
+		},
+		{
+			Name: "origin/order.luxo",
+			Extends: []*ast.ExtendDecl{
+				{Name: "User", Fields: []*ast.FieldDecl{
+					{Name: "orders", Type: &ast.TypeRef{Name: "Order", IsList: true}},
+				}},
+			},
+		},
+	}
+
+	lf.Update(ff)
+
+	ml := lf.Models["User"]
+	if len(ml.Fields) != 3 { // id + posts + orders
+		t.Fatalf("expected 3 fields, got %d: %v", len(ml.Fields), ml.Fields)
+	}
+	if ml.Fields["posts"] == 0 || ml.Fields["orders"] == 0 {
+		t.Errorf("extend fields missing: %v", ml.Fields)
+	}
+}
+
+func TestUpdateExtendsIdempotent(t *testing.T) {
+	lf := New()
+	ff := []*ast.File{
+		{
+			Name:   "origin/user.luxo",
+			Models: []*ast.ModelDecl{model("User", field("id", "Int"))},
+		},
+		{
+			Name: "origin/post.luxo",
+			Extends: []*ast.ExtendDecl{
+				{Name: "User", Fields: []*ast.FieldDecl{
+					{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+				}},
+			},
+		},
+	}
+
+	lf.Update(ff)
+	postsID := lf.Models["User"].Fields["posts"]
+	nextID := lf.Models["User"].NextID
+
+	lf.Update(ff)
+	if lf.Models["User"].Fields["posts"] != postsID {
+		t.Error("posts ID changed after second update")
+	}
+	if lf.Models["User"].NextID != nextID {
+		t.Error("NextID changed after second update")
+	}
+}
+
+func TestUpdateExtendsComputedSkipped(t *testing.T) {
+	lf := New()
+	ff := []*ast.File{
+		{
+			Name:   "origin/user.luxo",
+			Models: []*ast.ModelDecl{model("User", field("id", "Int"))},
+		},
+		{
+			Name: "origin/post.luxo",
+			Extends: []*ast.ExtendDecl{
+				{Name: "User", Fields: []*ast.FieldDecl{
+					{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+					{Name: "postCount", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{}},
+				}},
+			},
+		},
+	}
+
+	lf.Update(ff)
+	ml := lf.Models["User"]
+	if _, ok := ml.Fields["postCount"]; ok {
+		t.Error("computed extend field should not get ID")
+	}
+	if ml.Fields["posts"] == 0 {
+		t.Error("non-computed extend field should get ID")
+	}
+}
+
+func TestUpdateExtendsParentNotDeclared(t *testing.T) {
+	// Extend targets a model not defined in current files
+	lf := New()
+	ff := []*ast.File{
+		{
+			Name: "origin/post.luxo",
+			Extends: []*ast.ExtendDecl{
+				{Name: "User", Fields: []*ast.FieldDecl{
+					{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+				}},
+			},
+		},
+	}
+
+	lf.Update(ff)
+
+	ml := lf.Models["User"]
+	if ml == nil {
+		t.Fatal("User ModelLock should be created for extend even without model decl")
+	}
+	if ml.Fields["posts"] == 0 {
+		t.Error("posts should have ID")
+	}
+}
+
 func TestEmptyReservedOmitted(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "luxo.lock")

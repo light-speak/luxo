@@ -2,14 +2,17 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	stderrors "errors"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/bytedance/sonic"
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/light-speak/luxo/pkg/lux/i18n"
+	"github.com/light-speak/luxo/pkg/lux/schema"
 )
 
 // Pre-allocated response framing bytes — avoids per-request []byte conversion.
@@ -24,18 +27,33 @@ type HandlerFunc func(ctx context.Context, req *Request) error
 
 // Router maps API names to handlers and serves the /luvia endpoint.
 type Router struct {
-	handlers   map[string]HandlerFunc
-	translator *i18n.Translator
-	devMode    bool
-	Registry   *APIRegistry // binary protocol API ID mapping
+	handlers         map[string]HandlerFunc
+	streamMatchers   map[string]StreamMatcher // @stream API name → matcher function
+	translator       *i18n.Translator
+	devMode          bool
+	Registry         *APIRegistry   // binary protocol API ID mapping
+	Schema           *schema.Schema // model/API metadata for Binary↔JSON conversion
+	Streams          *StreamHub     // WebSocket stream subscription manager
+	IntrospectionKey string         // key for schema introspection (empty = disabled)
+	WSOrigins        []string       // allowed WebSocket origins (empty = allow all in dev mode)
 }
 
 // NewRouter creates an empty router.
 func NewRouter() *Router {
 	return &Router{
-		handlers: make(map[string]HandlerFunc),
-		Registry: NewAPIRegistry(),
+		handlers:       make(map[string]HandlerFunc),
+		streamMatchers: make(map[string]StreamMatcher),
+		Registry:       NewAPIRegistry(),
+		Schema:         schema.New(),
+		Streams:        NewStreamHub(),
 	}
+}
+
+// HandleStream registers a matcher for a @stream API.
+// When events are dispatched, the matcher decides per-subscriber whether to push.
+// matcher can be nil for broadcast (all subscribers receive).
+func (rt *Router) HandleStream(apiName string, matcher StreamMatcher) {
+	rt.streamMatchers[apiName] = matcher
 }
 
 // Handle registers a handler for an API name.
@@ -59,8 +77,20 @@ func (rt *Router) ExportHandlers() map[string]HandlerFunc {
 }
 
 // ServeHTTP implements http.Handler for the /luvia endpoint.
-// Supports JSON (default) and Luxo binary (X-Luxo-Mode: binary) protocols.
+// Supports JSON, Luxo binary, and WebSocket protocols on the same endpoint.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// WebSocket upgrade: GET /luvia with Upgrade: websocket
+	if r.Header.Get("Upgrade") == "websocket" {
+		rt.handleWebSocket(w, r)
+		return
+	}
+
+	// Schema introspection: GET /luvia?$schema&key=xxx
+	if r.URL.Query().Has("$schema") {
+		rt.handleIntrospection(w, r)
+		return
+	}
+
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST only")
 		return
@@ -92,6 +122,21 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Force handler to always write Luxo binary.
+	// Luvia converts to JSON if client wants JSON.
+	req.BinaryMode = true
+
+	// Convert $select to FieldMask for binary mode WriteLuxo
+	if !binaryMode && req.Select != nil && rt.Schema != nil {
+		apiMeta := rt.Schema.APIs[req.API]
+		if apiMeta != nil && apiMeta.ReturnType != "" {
+			model := rt.Schema.Models[apiMeta.ReturnType]
+			if model != nil {
+				req.FieldMask = schema.SelectToFieldMask(req.Select, model)
+			}
+		}
+	}
+
 	// Get pooled buffer, set on request, handler writes directly
 	buf := GetBuf()
 	req.Buf = buf
@@ -104,19 +149,86 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if binaryMode {
+		// Client wants binary: handler wrote Luxo binary, pass through
 		w.Header().Set("Content-Type", "application/x-luxo")
 		w.Header().Set("X-Luxo-Mode", "binary")
 		w.WriteHeader(http.StatusOK)
 		w.Write(buf.B)
 	} else {
+		// Client wants JSON: convert handler's Luxo binary → JSON via schema
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write(jsonDataPrefix)
-		w.Write(buf.B)
+		w.Write(rt.convertBinaryToJSON(req.API, buf.B))
 		w.Write(jsonDataSuffix)
 	}
 
 	PutBuf(buf)
+}
+
+// handleIntrospection serves the schema as JSON for SDK generation.
+// Protected by INTROSPECTION_KEY — returns 403 without valid key.
+func (rt *Router) handleIntrospection(w http.ResponseWriter, r *http.Request) {
+	if rt.IntrospectionKey == "" {
+		writeError(w, http.StatusForbidden, "introspection disabled")
+		return
+	}
+	key := r.Header.Get("X-Introspection-Key")
+	if key == "" {
+		key = r.URL.Query().Get("key") // fallback for backward compatibility
+	}
+	if subtle.ConstantTimeCompare([]byte(key), []byte(rt.IntrospectionKey)) != 1 {
+		writeError(w, http.StatusForbidden, "invalid introspection key")
+		return
+	}
+	if rt.Schema == nil {
+		writeError(w, http.StatusInternalServerError, "no schema registered")
+		return
+	}
+	data, err := rt.Schema.ToJSON()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	w.Write(data)
+}
+
+// convertBinaryToJSON converts handler's Luxo binary response to JSON using schema.
+// Handles model, list, paginated list, and scalar return types.
+func (rt *Router) convertBinaryToJSON(apiName string, data []byte) []byte {
+	if len(data) == 0 {
+		return []byte("null")
+	}
+	if rt.Schema == nil {
+		return data // no schema — assume handler wrote JSON directly
+	}
+	apiMeta := rt.Schema.APIs[apiName]
+	if apiMeta == nil {
+		return data // unknown API — pass through as-is
+	}
+
+	// No return type → scalar (delete returns count as Int)
+	if apiMeta.ReturnType == "" {
+		return schema.BinaryScalarToJSON(nil, data, "Int")
+	}
+
+	// Check if return type is a model or a scalar type name
+	model := rt.Schema.Models[apiMeta.ReturnType]
+	if model == nil {
+		// Scalar return — use declared type for precise decoding
+		return schema.BinaryScalarToJSON(nil, data, apiMeta.ReturnType)
+	}
+
+	if apiMeta.ReturnList {
+		if apiMeta.Paginated {
+			return schema.BinaryPaginatedListToJSON(nil, data, model)
+		}
+		return schema.BinaryListToJSON(nil, data, model)
+	}
+	return schema.BinaryToJSON(nil, data, model)
 }
 
 // callHandler executes a handler with panic recovery.
@@ -193,8 +305,9 @@ func (rt *Router) writeAppError(w http.ResponseWriter, r *http.Request, binaryMo
 
 // writeError writes a simple JSON error response for infrastructure errors.
 func writeError(w http.ResponseWriter, code int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	w.Write([]byte(`{"error":"`))
-	w.Write([]byte(msg))
-	w.Write([]byte(`"}`))
+	// Escape msg to prevent JSON injection
+	escaped := strconv.Quote(msg)
+	w.Write([]byte(`{"error":` + escaped + `}`))
 }

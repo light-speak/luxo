@@ -174,9 +174,19 @@ func Generate(result *semantic.Result, packageName string, driver DBDriver, soft
 		gr.Files["error.gen.go"] = errorSrc
 	}
 
-	// writejson.gen.go — per-model WriteJSON for single-pass field-filtered serialization
+	// writejson.gen.go — per-model WriteLuxo + ReadLuxo + WriteColumnar for binary serialization
 	if wjSrc := generateWriteJSONFile(result, packageName, enums); wjSrc != nil {
 		gr.Files["writejson.gen.go"] = wjSrc
+	}
+
+	// service_client.gen.go — type-safe RPC client stubs for fn @service
+	if scSrc := generateServiceClientFile(result, packageName); scSrc != nil {
+		gr.Files["service_client.gen.go"] = scSrc
+	}
+
+	// schema.gen.go — model/API metadata for Luvia schema-driven Binary↔JSON conversion
+	if schemaSrc := generateSchemaFile(result, packageName, enums); schemaSrc != nil {
+		gr.Files["schema.gen.go"] = schemaSrc
 	}
 
 	return gr
@@ -399,7 +409,7 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 		}
 	}
 
-	// Check if any model has relations (needs loaders field)
+	// Check if any model has relations or extend DataLoaders (needs loaders field)
 	hasRelations := false
 	for _, file := range result.Files {
 		for _, m := range file.Models {
@@ -407,6 +417,9 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 				hasRelations = true
 				break
 			}
+		}
+		if len(file.Extends) > 0 {
+			hasRelations = true
 		}
 	}
 

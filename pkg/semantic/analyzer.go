@@ -50,20 +50,23 @@ type Analyzer struct {
 	inAwait       bool // true when checking inside an await block
 	inCallFunc    bool // true when checking the Func part of a CallExpr
 	files         []*ast.File
+	currentFile   *ast.File // file being analyzed in Pass 4
 
 	// module isolation
-	moduleMap     FileModuleMap              // file → module info
-	typeOwners    *typeOwnership             // type name → owning module
-	extendVisible map[string]map[string]bool // module → set of type names visible via extend
+	moduleMap          FileModuleMap                         // file → module info
+	typeOwners         *typeOwnership                        // type name → owning module
+	extendVisible      map[string]map[string]bool            // module → set of type names visible via extend
+	extendFieldVisible map[string]map[string]map[string]bool // module → modelName → set of field names visible via extend
 }
 
 // New creates a new Analyzer.
 func New() *Analyzer {
 	a := &Analyzer{
-		scope:         NewScope(),
-		types:         make(map[string]*ResolvedType),
-		typeOwners:    newTypeOwnership(),
-		extendVisible: make(map[string]map[string]bool),
+		scope:              NewScope(),
+		types:              make(map[string]*ResolvedType),
+		typeOwners:         newTypeOwnership(),
+		extendVisible:      make(map[string]map[string]bool),
+		extendFieldVisible: make(map[string]map[string]map[string]bool),
 	}
 	// register built-in types
 	for name, typ := range BuiltinTypes() {
@@ -129,8 +132,10 @@ func (a *Analyzer) analyzeInternal(files []*ast.File) *Result {
 
 	// Pass 4: check api/fn bodies (expressions, statements)
 	for _, file := range files {
+		a.currentFile = file
 		a.checkBodies(file)
 	}
+	a.currentFile = nil
 
 	// Pass 5: check circular event dependencies
 	a.checkEventCycles()
@@ -234,7 +239,7 @@ func (a *Analyzer) fileModule(filename string) string {
 }
 
 // collectExtendVisibility scans all files for extend declarations and records
-// which types are made visible in each module via extend.
+// which types and fields are made visible in each module via extend.
 func (a *Analyzer) collectExtendVisibility() {
 	for _, file := range a.files {
 		modName := a.fileModule(file.Name)
@@ -246,6 +251,17 @@ func (a *Analyzer) collectExtendVisibility() {
 				a.extendVisible[modName] = make(map[string]bool)
 			}
 			a.extendVisible[modName][ext.Name] = true
+
+			// Track which fields are visible per extend model
+			if a.extendFieldVisible[modName] == nil {
+				a.extendFieldVisible[modName] = make(map[string]map[string]bool)
+			}
+			if a.extendFieldVisible[modName][ext.Name] == nil {
+				a.extendFieldVisible[modName][ext.Name] = make(map[string]bool)
+			}
+			for _, f := range ext.Fields {
+				a.extendFieldVisible[modName][ext.Name][f.Name] = true
+			}
 		}
 	}
 }
@@ -1453,6 +1469,9 @@ func (a *Analyzer) resolveFieldAccess(e *ast.MemberExpr, objType *ResolvedType) 
 		return nil
 	}
 
+	// Cross-module field visibility: only extend-declared fields are accessible
+	a.checkExtendFieldVisibility(e, objType)
+
 	// method fields require () to call
 	if field.IsMethod && !a.inCallFunc {
 		a.addError(e.Pos, "'%s' is a method, use %s() / '%s' 是方法，请使用 %s()", e.Field, e.Field, e.Field, e.Field)
@@ -1464,6 +1483,29 @@ func (a *Analyzer) resolveFieldAccess(e *ast.MemberExpr, objType *ResolvedType) 
 		result = result.AsNullable()
 	}
 	return result
+}
+
+// checkExtendFieldVisibility checks that field access on cross-module model types
+// only accesses fields declared in the extend block.
+func (a *Analyzer) checkExtendFieldVisibility(e *ast.MemberExpr, objType *ResolvedType) {
+	if a.moduleMap == nil || a.currentFile == nil || objType.Kind != TypeModel {
+		return
+	}
+	ownerMod := a.typeOwners.ownerOf(objType.Name)
+	if ownerMod == "" {
+		return
+	}
+	mi := a.moduleMap[a.currentFile.Name]
+	if mi == nil || ownerMod == mi.Name || a.isCommonModule(ownerMod) || mi.IsCommon {
+		return
+	}
+	// Cross-module model: check if field is declared in extend
+	fields := a.extendFieldVisible[mi.Name]
+	if fields == nil || fields[objType.Name] == nil || !fields[objType.Name][e.Field] {
+		a.addError(e.Pos,
+			"field '%s' not declared in extend %s — add it to your extend block / 字段 '%s' 未在 extend %s 中声明",
+			e.Field, objType.Name, e.Field, objType.Name)
+	}
 }
 
 func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
@@ -1488,6 +1530,9 @@ func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
 	if a.isMyMethodCall(e) {
 		return nil
 	}
+
+	// Cross-module model restriction: only load() allowed, not find/where/create etc.
+	a.checkCrossModuleCRUD(e)
 
 	callScope := a.injectCRUDScope(e, scope)
 	isCRUD := isCRUDIdent(e)
@@ -1748,6 +1793,23 @@ func (a *Analyzer) inferFindReturnType(e *ast.CallExpr, modelType *ResolvedType)
 	return modelType
 }
 
+// inferLoadReturnType infers the return type for Model.load(...).
+// No named args → PK load → nullable model (single result)
+// Named args → FK/multi-condition load → list of models
+func (a *Analyzer) inferLoadReturnType(e *ast.CallExpr, modelType *ResolvedType) *ResolvedType {
+	hasNamedArgs := false
+	for _, arg := range e.Args {
+		if arg.Name != "" {
+			hasNamedArgs = true
+			break
+		}
+	}
+	if hasNamedArgs {
+		return modelType.AsList() // FK load returns list
+	}
+	return modelType // PK load returns single (nullable)
+}
+
 // inferChainCRUDReturnType infers the return type for chain-style CRUD: Model.find(...), Model.create(...), etc.
 func (a *Analyzer) inferChainCRUDReturnType(e *ast.CallExpr, method string, modelName string) *ResolvedType {
 	if isDynamicReturnCRUD(method) {
@@ -1760,6 +1822,8 @@ func (a *Analyzer) inferChainCRUDReturnType(e *ast.CallExpr, method string, mode
 	switch method {
 	case "find":
 		return a.inferFindReturnType(e, modelType)
+	case "load":
+		return a.inferLoadReturnType(e, modelType)
 	case "findFirst":
 		return modelType.AsNullable()
 	case "findMany", "createMany":
@@ -1891,6 +1955,36 @@ func chainCRUDInfo(e *ast.CallExpr) (method string, modelName string) {
 	return member.Field, ""
 }
 
+// checkCrossModuleCRUD restricts cross-module models to load() only.
+// e.g., User.find(id) in post module → error; User.load(id) → ok.
+func (a *Analyzer) checkCrossModuleCRUD(e *ast.CallExpr) {
+	if a.moduleMap == nil || a.currentFile == nil {
+		return
+	}
+	method, modelName := chainCRUDInfo(e)
+	if modelName == "" {
+		return
+	}
+	ownerMod := a.typeOwners.ownerOf(modelName)
+	if ownerMod == "" {
+		return
+	}
+	mi := a.moduleMap[a.currentFile.Name]
+	if mi == nil {
+		return
+	}
+	// Same module or common module — all ops allowed
+	if ownerMod == mi.Name || a.isCommonModule(ownerMod) || mi.IsCommon {
+		return
+	}
+	// Cross-module: only load is allowed
+	if method != "load" {
+		a.addError(e.Pos,
+			"cross-module model '%s' can only use 'load', not '%s' — use %s.load(id) / 跨模块 model '%s' 只能用 load，不能用 '%s'",
+			modelName, method, modelName, modelName, method)
+	}
+}
+
 // resolveChainModelType resolves the underlying model type from a chain call on a variable.
 // e.g., orders.sum(total) where orders: TypeQueryBuilder → returns the model type.
 func (a *Analyzer) resolveChainModelType(e *ast.CallExpr, scope *Scope) *ResolvedType {
@@ -1959,7 +2053,7 @@ func isCRUDOp(name string) bool {
 		"delete", "deleteMany",
 		"upsert", "count", "exists",
 		"aggregate", "groupBy", "raw", "paginate",
-		"save":
+		"save", "load":
 		return true
 	}
 	return false
@@ -1974,7 +2068,7 @@ func isDBQueryOp(name string) bool {
 		"create", "createMany",
 		"update", "updateMany",
 		"delete", "deleteMany",
-		"upsert", "raw":
+		"upsert", "raw", "load":
 		return true
 	}
 	return false

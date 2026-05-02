@@ -120,8 +120,36 @@ func (lf *LockFile) Save(path string) error {
 // New APIs get the next available API ID.
 func (lf *LockFile) Update(files []*ast.File) {
 	lf.updateModels(files)
+	lf.updateExtends(files)
 	lf.updateEvents(files)
 	lf.updateAPIs(files)
+}
+
+// updateExtends assigns field IDs for extend fields in the parent model's ID space.
+// For `extend User { posts: [Post] }`, "posts" gets a field ID under the User ModelLock.
+func (lf *LockFile) updateExtends(files []*ast.File) {
+	for _, file := range files {
+		for _, ext := range file.Extends {
+			ml, exists := lf.Models[ext.Name]
+			if !exists {
+				ml = &ModelLock{
+					NextID: 1,
+					Fields: make(map[string]int),
+				}
+				lf.Models[ext.Name] = ml
+			}
+			for _, f := range ext.Fields {
+				if f.Computed != nil {
+					continue
+				}
+				if _, ok := ml.Fields[f.Name]; ok {
+					continue // already assigned
+				}
+				ml.Fields[f.Name] = ml.NextID
+				ml.NextID++
+			}
+		}
+	}
 }
 
 // updateEvents assigns param IDs to all event declarations.
@@ -189,6 +217,18 @@ func (lf *LockFile) updateModels(files []*ast.File) {
 				fields[f.Name] = true
 			}
 			currentModels[m.Name] = fields
+		}
+		// Include extend field names so they are not reserved as "removed".
+		for _, ext := range file.Extends {
+			if currentModels[ext.Name] == nil {
+				currentModels[ext.Name] = make(map[string]bool)
+			}
+			for _, f := range ext.Fields {
+				if f.Computed != nil {
+					continue
+				}
+				currentModels[ext.Name][f.Name] = true
+			}
 		}
 	}
 
@@ -292,6 +332,28 @@ func (lf *LockFile) updateAPIs(files []*ast.File) {
 			lf.ensureAPIID(api.Name, params)
 		}
 	}
+	// fn @service — exposed as RPC endpoints with svc: prefix
+	for _, file := range files {
+		for _, fn := range file.Functions {
+			if !hasServiceDirective(fn) {
+				continue
+			}
+			var params []string
+			for _, p := range fn.Params {
+				params = append(params, p.Name)
+			}
+			lf.ensureAPIID("svc:"+fn.Name, params)
+		}
+	}
+}
+
+func hasServiceDirective(fn *ast.FnDecl) bool {
+	for _, d := range fn.Directives {
+		if d.Name == "service" {
+			return true
+		}
+	}
+	return false
 }
 
 func collectFieldNames(m *ast.ModelDecl) []string {

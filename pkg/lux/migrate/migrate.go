@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/light-speak/luxo/pkg/lux"
 )
 
@@ -494,4 +495,41 @@ func (r *Runner) loadExpectedTables() []string {
 // BuildDatabaseURL constructs a connection string from DATABASE_* env vars.
 func BuildDatabaseURL() string {
 	return lux.DBConfigFromEnv().ConnectionString()
+}
+
+// EnsureDatabase creates the target database if it doesn't exist.
+// Connects to the default "postgres" database to run CREATE DATABASE.
+func EnsureDatabase(ctx context.Context) error {
+	cfg := lux.DBConfigFromEnv()
+	targetDB := cfg.DBName
+	if targetDB == "" || targetDB == "postgres" {
+		return nil // already using default
+	}
+
+	// Connect to default "postgres" database
+	adminCfg := cfg
+	adminCfg.DBName = "postgres"
+	conn, err := pgx.Connect(ctx, adminCfg.ConnectionString())
+	if err != nil {
+		return fmt.Errorf("ensure db: connect to postgres: %w", err)
+	}
+	defer conn.Close(ctx)
+
+	// Check if database exists
+	var exists bool
+	err = conn.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", targetDB).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("ensure db: check exists: %w", err)
+	}
+	if exists {
+		return nil
+	}
+
+	// Create database (can't use parameterized query for CREATE DATABASE)
+	// Ignore "already exists" error for concurrent startup safety
+	_, err = conn.Exec(ctx, fmt.Sprintf("CREATE DATABASE %q", targetDB))
+	if err != nil && !strings.Contains(err.Error(), "already exists") {
+		return fmt.Errorf("ensure db: create %s: %w", targetDB, err)
+	}
+	return nil
 }

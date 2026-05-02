@@ -1493,7 +1493,7 @@ func directiveDescription(name string) string {
 		"retry":     "`@retry(max, delay)` — Retry on failure\n\n失败重试",
 		"broadcast": "`@broadcast` — All instances receive event\n\n所有实例都接收事件",
 		"scope":     "`@scope(scopeNames...)` — Apply query scope(s) to API\n\n应用查询预设",
-		"stream":    "`@stream` — Enable streaming response via WebSocket\n\n启用 WebSocket 流式推送",
+		"stream":    "`@stream(EventName?)` — WebSocket streaming with optional event source\n\n启用 WebSocket 流式推送，可选绑定事件源\n\n```luxo\n// 全局广播\napi watch: T @stream(EventName)\n// 带过滤\napi watch(id: Int): T @stream(EventName) {\n    data -> data.id == id\n}\n// Go 控制\napi watch: T @stream @native\n```",
 		"paginate":  "`@paginate` / `@paginate(defaultPageSize: 50)` — Auto-inject page/pageSize params, wrap return type [T] → Page<T>\n\n自动注入分页参数，返回类型从 [T] 包装为 Page<T>",
 	}
 	if desc, ok := descriptions[name]; ok {

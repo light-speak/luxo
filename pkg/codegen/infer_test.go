@@ -627,8 +627,8 @@ func TestWriteInferredAction(t *testing.T) {
 		if !strings.Contains(out, "app.User.Where(conds...).Count(ctx)") {
 			t.Errorf("count: missing Count call:\n%s", out)
 		}
-		if !strings.Contains(out, `"count"`) {
-			t.Errorf("count: missing count JSON key:\n%s", out)
+		if !strings.Contains(out, "codec.AppendSvarint") {
+			t.Errorf("count: missing binary AppendSvarint:\n%s", out)
 		}
 	})
 
@@ -640,8 +640,8 @@ func TestWriteInferredAction(t *testing.T) {
 		if !strings.Contains(out, "app.User.Where(conds...).Exists(ctx)") {
 			t.Errorf("exists: missing Exists call:\n%s", out)
 		}
-		if !strings.Contains(out, `"exists"`) {
-			t.Errorf("exists: missing exists JSON key:\n%s", out)
+		if !strings.Contains(out, "codec.AppendBool") {
+			t.Errorf("exists: missing binary AppendBool:\n%s", out)
 		}
 	})
 

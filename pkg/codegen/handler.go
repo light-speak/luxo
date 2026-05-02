@@ -106,21 +106,23 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 
 	modelMap, inferredAPIs := collectInferredAPIs(result)
 
-	// Check if there are any compiled APIs (body != nil, not @native)
+	// Check if there are any compiled APIs or service fns
 	hasCompiledAPIs := false
+	hasServiceFns := false
 	for _, file := range result.Files {
 		for _, api := range file.APIs {
 			if api.Body != nil && !hasDirective(api.Directives, "native") {
 				hasCompiledAPIs = true
-				break
 			}
 		}
-		if hasCompiledAPIs {
-			break
+		for _, fn := range file.Functions {
+			if hasDirective(fn.Directives, "service") {
+				hasServiceFns = true
+			}
 		}
 	}
 
-	if len(models) == 0 && len(inferredAPIs) == 0 && !hasCompiledAPIs {
+	if len(models) == 0 && len(inferredAPIs) == 0 && !hasCompiledAPIs && !hasServiceFns {
 		return nil
 	}
 
@@ -145,6 +147,13 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	// RegisterHandlers function (CRUD + inferred + compiled)
 	allInferred := append(inferredNames, compiledNames...)
 	generateRegisterFuncWithInferred(&b, models, allInferred)
+
+	// fn @service handlers
+	serviceNames := generateServiceFnHandlers(&b, result, modelMap)
+	generateRegisterServiceFns(&b, serviceNames)
+
+	// DataLoader RPC endpoints — batch load for each model (cluster mode)
+	generateBatchLoadHandlers(&b, models)
 
 	return []byte(b.String())
 }
@@ -192,6 +201,98 @@ func generateCompiledHandlers(b *strings.Builder, result *semantic.Result, model
 		}
 	}
 	return names
+}
+
+// generateServiceFnHandlers compiles fn @service bodies to Go handlers.
+// Handles both compiled fn (with body) and @native fn (delegating to NativeResolver).
+// Returns service fn names for RegisterServiceFns generation.
+func generateServiceFnHandlers(b *strings.Builder, result *semantic.Result, modelMap map[string]*ast.ModelDecl) []string {
+	enumSet := CollectEnumsFromResult(result)
+	var names []string
+	for _, file := range result.Files {
+		for _, fn := range file.Functions {
+			if !hasDirective(fn.Directives, "service") {
+				continue
+			}
+			if hasDirective(fn.Directives, "native") {
+				// @native @service — delegate to NativeResolver
+				generateNativeServiceHandler(b, fn)
+			} else if fn.Body != nil {
+				// Compiled fn @service
+				compileFnBody(b, fn, modelMap, enumSet)
+			}
+			names = append(names, fn.Name)
+		}
+	}
+	return names
+}
+
+// generateNativeServiceHandler generates a handler that delegates to NativeResolver.
+func generateNativeServiceHandler(b *strings.Builder, fn *ast.FnDecl) {
+	name := fn.Name
+	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(name))
+	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
+
+	// Parse params
+	var paramNames []string
+	for _, p := range fn.Params {
+		goType := resolveGoType(p.Type)
+		method := paramMethod(goType)
+		if method == "" {
+			fmt.Fprintf(b, "\t\tvar %s %s\n", p.Name, goType)
+			fmt.Fprintf(b, "\t\tif err := req.ParamJSON(%q, &%s); err != nil {\n", p.Name, p.Name)
+			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
+		} else {
+			fmt.Fprintf(b, "\t\t%s, err := req.Param%s(%q)\n", p.Name, method, p.Name)
+			fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+		}
+		paramNames = append(paramNames, p.Name)
+	}
+
+	// Call NativeResolver
+	fmt.Fprintf(b, "\t\tresult, err := app.Resolver.%s(ctx", str.Capitalize(name))
+	for _, pn := range paramNames {
+		fmt.Fprintf(b, ", %s", pn)
+	}
+	fmt.Fprintf(b, ")\n")
+	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+
+	// Write response — always binary (Luvia converts to JSON if needed)
+	if fn.ReturnType != nil {
+		goType := resolveGoType(fn.ReturnType)
+		switch goType {
+		case "int64":
+			fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, result)\n")
+		case "float64":
+			fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendFixed64(req.Buf.B, result)\n")
+		case "string":
+			fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendString(req.Buf.B, result)\n")
+		case "bool":
+			fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendBool(req.Buf.B, result)\n")
+		default:
+			fmt.Fprintf(b, "\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
+		}
+	}
+	fmt.Fprintf(b, "\t\treturn nil\n")
+	fmt.Fprintf(b, "\t}\n}\n\n")
+}
+
+// generateRegisterServiceFns generates RegisterServiceFns with svc: prefix.
+func generateRegisterServiceFns(b *strings.Builder, serviceNames []string) {
+	if len(serviceNames) == 0 {
+		return
+	}
+	b.WriteString("// RegisterServiceFns registers fn @service handlers with the router.\n")
+	b.WriteString("// Service fns use svc: prefix to distinguish from API handlers.\n")
+	b.WriteString("func RegisterServiceFns(router *api.Router, app *App) {\n")
+
+	for _, name := range serviceNames {
+		svcName := "svc:" + name
+		fmt.Fprintf(b, "\trouter.Handle(%q, handle%s(app))\n", svcName, str.Capitalize(name))
+		writeAPIRegistration(b, svcName)
+	}
+
+	b.WriteString("}\n\n")
 }
 
 // writeFKEnsure generates ensureField calls for relation key columns.
@@ -257,7 +358,10 @@ func writeHandlerImports(b *strings.Builder, models []*ast.ModelDecl, hasOrGroup
 	if hasAwait {
 		b.WriteString("\t\"golang.org/x/sync/errgroup\"\n")
 	}
-	if hasTransaction {
+	// pg import: batchLoad handlers need pg.QueryRows, transaction needs pg driver
+	if len(models) > 0 {
+		fmt.Fprintf(b, "\tpg %q\n", DriverPG.DriverImport())
+	} else if hasTransaction {
 		fmt.Fprintf(b, "\t%q\n", DriverPG.DriverImport())
 	}
 	b.WriteString(")\n\n")
@@ -386,11 +490,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 			fmt.Fprintf(b, "\t\tif err := resolve%sRelations(ctx, app, result, req.Select); err != nil {\n", name)
 			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 		}
-		fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
-		fmt.Fprintf(b, "\t\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
-		fmt.Fprintf(b, "\t\t} else {\n")
-		fmt.Fprintf(b, "\t\t\tresult.WriteJSON(req.Buf, req.Select)\n")
-		fmt.Fprintf(b, "\t\t}\n")
+		fmt.Fprintf(b, "\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
 		fmt.Fprintf(b, "\t\treturn nil\n")
 		fmt.Fprintf(b, "\t}\n}\n\n")
 
@@ -414,27 +514,12 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 			fmt.Fprintf(b, "\t\tif err := resolve%sListRelations(ctx, app, results, req.Select); err != nil {\n", name)
 			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 		}
-		// Write paginated response
-		lower := str.LowerFirst(name)
-		fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(results)))\n")
-		fmt.Fprintf(b, "\t\t\tfor _, item := range results {\n")
-		fmt.Fprintf(b, "\t\t\t\titem.WriteLuxo(req.Buf, req.FieldMask)\n")
-		fmt.Fprintf(b, "\t\t\t}\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, total)\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.Page))\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.PageSize))\n")
-		fmt.Fprintf(b, "\t\t} else {\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`{\"items\":`)\n")
-		fmt.Fprintf(b, "\t\t\t%sListJSON(results).WriteJSON(req.Buf, req.Select)\n", lower)
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`,\"total\":`)\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendInt(total)\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`,\"page\":`)\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendInt(int64(req.Page))\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`,\"pageSize\":`)\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendInt(int64(req.PageSize))\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendByte('}')\n")
-		fmt.Fprintf(b, "\t\t}\n")
+		// Write paginated response — columnar encoding for lists
+		fmt.Fprintf(b, "\t\tWriteColumnar%s(req.Buf, results, req.FieldMask)\n", name)
+		// Append pagination metadata after columnar data
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, total)\n")
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.Page))\n")
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.PageSize))\n")
 		fmt.Fprintf(b, "\t\treturn nil\n")
 		fmt.Fprintf(b, "\t}\n}\n\n")
 
@@ -459,13 +544,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		}
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		fmt.Fprintf(b, "\t\tif n == 0 {\n\t\t\treturn errors.NotFound.WithData(errors.ResourceError{Resource: %q, ID: id})\n\t\t}\n", name)
-		fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, n)\n")
-		fmt.Fprintf(b, "\t\t} else {\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`{\"deleted\":`)\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendInt(n)\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendByte('}')\n")
-		fmt.Fprintf(b, "\t\t}\n")
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, n)\n")
 		fmt.Fprintf(b, "\t\treturn nil\n")
 		fmt.Fprintf(b, "\t}\n}\n\n")
 
@@ -486,13 +565,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 			fmt.Fprintf(b, "\t\tn, err := app.%s.Where(%sWhere.Id.In(ids...)).Delete(ctx)\n", name, name)
 		}
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, n)\n")
-		fmt.Fprintf(b, "\t\t} else {\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendString(`{\"deleted\":`)\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendInt(n)\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.AppendByte('}')\n")
-		fmt.Fprintf(b, "\t\t}\n")
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, n)\n")
 		fmt.Fprintf(b, "\t\treturn nil\n")
 		fmt.Fprintf(b, "\t}\n}\n\n")
 	}
@@ -537,11 +610,7 @@ func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string,
 
 	fmt.Fprintf(b, "\t\tresult, err := builder.Exec(ctx)\n")
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-	fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
-	fmt.Fprintf(b, "\t\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
-	fmt.Fprintf(b, "\t\t} else {\n")
-	fmt.Fprintf(b, "\t\t\tresult.WriteJSON(req.Buf, req.Select)\n")
-	fmt.Fprintf(b, "\t\t}\n")
+	fmt.Fprintf(b, "\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
 	fmt.Fprintf(b, "\t\treturn nil\n")
 	fmt.Fprintf(b, "\t}\n")
 	fmt.Fprintf(b, "}\n\n")
@@ -573,11 +642,7 @@ func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType
 	}
 	fmt.Fprintf(b, "\t\tresult, err := builder.Exec(ctx)\n")
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-	fmt.Fprintf(b, "\t\tif req.BinaryMode {\n")
-	fmt.Fprintf(b, "\t\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
-	fmt.Fprintf(b, "\t\t} else {\n")
-	fmt.Fprintf(b, "\t\t\tresult.WriteJSON(req.Buf, req.Select)\n")
-	fmt.Fprintf(b, "\t\t}\n")
+	fmt.Fprintf(b, "\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
 	fmt.Fprintf(b, "\t\treturn nil\n")
 	fmt.Fprintf(b, "\t}\n")
 	fmt.Fprintf(b, "}\n\n")
@@ -778,11 +843,7 @@ func generateListRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []R
 		}
 
 		// LoadAll — direct dispatch, zero wait
-		if rel.IsList {
-			fmt.Fprintf(b, "\t\t\tresultMap, err := app.loaders.%s.LoadAll(ctx, keys, childCols)\n", loaderField)
-		} else {
-			fmt.Fprintf(b, "\t\t\tresultMap, err := app.loaders.%s.LoadAll(ctx, keys, childCols)\n", loaderField)
-		}
+		fmt.Fprintf(b, "\t\t\tresultMap, err := app.loaders.%s.LoadAll(ctx, keys, childCols)\n", loaderField)
 		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
 
 		// Map results back
@@ -839,6 +900,49 @@ func generateRegisterFuncWithInferred(b *strings.Builder, models []*ast.ModelDec
 	}
 
 	b.WriteString("}\n")
+}
+
+// generateBatchLoadHandlers generates svc:batchLoad:Model RPC endpoints for each model.
+// These endpoints allow remote services to batch-load model data via DataLoader.
+// Used in cluster mode: remote service's DataLoader calls this endpoint instead of querying DB.
+func generateBatchLoadHandlers(b *strings.Builder, models []*ast.ModelDecl) {
+	if len(models) == 0 {
+		return
+	}
+
+	for _, m := range models {
+		name := m.Name
+		tableName := str.ToSnakeCase(name) + "s"
+		scanFn := "scan" + name
+
+		fmt.Fprintf(b, "// handleBatchLoad%s handles svc:batchLoad:%s — batch load by PK for remote DataLoaders.\n", name, name)
+		fmt.Fprintf(b, "func handleBatchLoad%s(app *App) api.HandlerFunc {\n", name)
+		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
+		fmt.Fprintf(b, "\t\tkeys, err := req.ParamIntArray(\"keys\")\n")
+		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+		fmt.Fprintf(b, "\t\tfields, _ := req.ParamStringArray(\"fields\")\n")
+		fmt.Fprintf(b, "\t\tconds := []lux.Condition{lux.NewIntField(\"id\").In(keys...)}\n")
+		fmt.Fprintf(b, "\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", tableName)
+		fmt.Fprintf(b, "\t\trows, err := %s.QueryRows(ctx, app.DB, %s, query, args...)\n", dbPkg, scanFn)
+		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+		// Write response: binary array of models
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(rows)))\n")
+		fmt.Fprintf(b, "\t\tfor _, row := range rows {\n")
+		fmt.Fprintf(b, "\t\t\trow.WriteLuxo(req.Buf, req.FieldMask)\n")
+		fmt.Fprintf(b, "\t\t}\n")
+		fmt.Fprintf(b, "\t\treturn nil\n")
+		fmt.Fprintf(b, "\t}\n}\n\n")
+	}
+
+	// RegisterBatchLoaders registers batch load endpoints
+	b.WriteString("// RegisterBatchLoaders registers batch load RPC endpoints for all models.\n")
+	b.WriteString("// Remote services call these endpoints to batch-load model data (cluster mode).\n")
+	b.WriteString("func RegisterBatchLoaders(router *api.Router, app *App) {\n")
+	for _, m := range models {
+		svcName := "svc:batchLoad:" + m.Name
+		fmt.Fprintf(b, "\trouter.Handle(%q, handleBatchLoad%s(app))\n", svcName, m.Name)
+	}
+	b.WriteString("}\n\n")
 }
 
 // writeAPIRegistration generates router.Registry.Register + RegisterParams calls.

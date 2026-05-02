@@ -182,7 +182,11 @@ func (r *ColumnarReader) NextColumn() bool {
 		return false
 	}
 	id, n := ReadVarint(r.buf, r.off)
-	if n <= 0 || id == 0 {
+	if n <= 0 {
+		return false
+	}
+	if id == 0 {
+		r.off += n // advance past 0x00 end marker
 		return false
 	}
 	r.off += n
@@ -198,6 +202,11 @@ func (r *ColumnarReader) FieldID() int {
 // Err returns any error.
 func (r *ColumnarReader) Err() error {
 	return r.err
+}
+
+// Offset returns the current read position (after all columns + end marker).
+func (r *ColumnarReader) Offset() int {
+	return r.off
 }
 
 // ReadColumnInt reads count int64 values from the current column.
