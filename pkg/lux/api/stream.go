@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
@@ -73,7 +74,11 @@ type Stream struct {
 	ctx context.Context
 }
 
+// ErrStreamFull is returned when the subscriber channel is full (client too slow).
+var ErrStreamFull = fmt.Errorf("stream: subscriber channel full, client too slow")
+
 // Send pushes encoded data to the client.
+// Returns ErrStreamFull immediately if channel is full — caller should stop pushing.
 func (s *Stream) Send(data []byte) error {
 	select {
 	case s.sub.Ch <- data:
@@ -81,14 +86,45 @@ func (s *Stream) Send(data []byte) error {
 	case <-s.ctx.Done():
 		return s.ctx.Err()
 	default:
-		// chan full — client too slow, drop
-		return nil
+		return ErrStreamFull
 	}
 }
 
 // Context returns the stream's context (cancelled when client disconnects).
 func (s *Stream) Context() context.Context {
 	return s.ctx
+}
+
+// IdentityClaims provides field access for stream matcher identity.
+// The identity stored in StreamSub is a Claims-like object with Int/String methods.
+type IdentityClaims interface {
+	ID() int64
+	Int(key string) int64
+	String(key string) string
+}
+
+// IdentityID extracts int64 ID from identity (nil-safe).
+func IdentityID(identity any) int64 {
+	if c, ok := identity.(IdentityClaims); ok {
+		return c.ID()
+	}
+	return 0
+}
+
+// IdentityInt extracts an int64 claim from identity by key (nil-safe).
+func IdentityInt(identity any, key string) int64 {
+	if c, ok := identity.(IdentityClaims); ok {
+		return c.Int(key)
+	}
+	return 0
+}
+
+// IdentityString extracts a string claim from identity by key (nil-safe).
+func IdentityString(identity any, key string) string {
+	if c, ok := identity.(IdentityClaims); ok {
+		return c.String(key)
+	}
+	return ""
 }
 
 // NewStreamHub creates an empty hub.
@@ -99,13 +135,15 @@ func NewStreamHub() *StreamHub {
 }
 
 // Subscribe adds a subscriber for an API.
-// Returns the StreamSub (caller starts writePump goroutine).
-func (h *StreamHub) Subscribe(apiName string, params map[string]any, identity any, fieldMask []byte) *StreamSub {
+// The provided cancel function is called when the subscriber is too slow (channel full).
+// Typically this cancels the subscriber's context, causing WritePump to exit.
+func (h *StreamHub) Subscribe(apiName string, params map[string]any, identity any, fieldMask []byte, cancel context.CancelFunc) *StreamSub {
 	sub := &StreamSub{
 		Ch:        make(chan []byte, 64), // buffered to absorb bursts
 		Params:    &StreamParams{values: params},
 		Identity:  identity,
 		FieldMask: fieldMask,
+		cancel:    cancel,
 	}
 
 	h.mu.Lock()
@@ -134,8 +172,6 @@ func (h *StreamHub) Unsubscribe(apiName string, sub *StreamSub) {
 }
 
 // Dispatch sends data to all matching subscribers of an API.
-// matcher can be nil (broadcast to all).
-// encodeFn encodes the raw event data per subscriber's fieldMask.
 // Dispatch sends data to all matching subscribers of an API.
 // matcher can be nil (broadcast to all).
 // encodeFn encodes the raw event data per subscriber's fieldMask.
@@ -174,12 +210,15 @@ func (h *StreamHub) Dispatch(apiName string, rawData any, matcher StreamMatcher,
 		select {
 		case sub.Ch <- encoded:
 		default:
+			// Client too slow — disconnect
+			sub.cancel()
 		}
 	}
 }
 
 // DispatchEncoded sends pre-encoded data to all matching subscribers.
 // Used when data is already Luxo binary (from event bus).
+// Slow subscribers (channel full) are disconnected immediately.
 func (h *StreamHub) DispatchEncoded(apiName string, encoded []byte, matcher StreamMatcher) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -191,6 +230,8 @@ func (h *StreamHub) DispatchEncoded(apiName string, encoded []byte, matcher Stre
 		select {
 		case sub.Ch <- encoded:
 		default:
+			// Client too slow — disconnect by cancelling context
+			sub.cancel()
 		}
 	}
 }

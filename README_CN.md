@@ -236,12 +236,12 @@ getUser(1) {
 ```luxo
 // 事件驱动 + 过滤器
 api watchDanmaku(roomId: Int): Danmaku @stream(DanmakuSent) {
-  danmaku -> danmaku.roomId == roomId
+  it.roomId == roomId
 }
 
 // 身份过滤
 api watchNotifications: Notification @stream(NotificationCreated) @auth {
-  notification -> notification.userId == my.id
+  it.userId == my.id
 }
 
 // Go 完全控制

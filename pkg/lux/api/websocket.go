@@ -193,13 +193,21 @@ func (rt *Router) handleWSStreamJSON(ctx context.Context, ws *wsConn, data []byt
 		// Extract identity from context
 		identity := identityFromCtx(ctx)
 
-		// JSON mode: fieldMask requires model context to convert field names → bitmap.
-		// Stream dispatch handles JSON encoding without fieldMask for now.
-		sub := rt.Streams.Subscribe(apiName, params, identity, nil)
+		// Per-subscription context — cancelled on slow consumer or connection close.
+		subCtx, subCancel := context.WithCancel(ctx)
+
+		sub := rt.Streams.Subscribe(apiName, params, identity, nil, subCancel)
 		*connSubs = append(*connSubs, connStreamSub{apiName: apiName, sub: sub})
 
 		// Start write pump
-		go WritePumpJSON(ctx, ws, apiName, sub)
+		go WritePumpJSON(subCtx, ws, apiName, sub)
+
+		// If @stream @native without event source, invoke handler
+		if handler, ok := rt.streamHandlers[apiName]; ok {
+			streamParams := &StreamParams{values: params}
+			stream := &Stream{sub: sub, ctx: subCtx}
+			go handler(subCtx, streamParams, identity, stream)
+		}
 		return
 	}
 
@@ -317,10 +325,19 @@ func (rt *Router) handleWSStreamBinary(ctx context.Context, ws *wsConn, data []b
 	}
 
 	identity := identityFromCtx(ctx)
-	sub := rt.Streams.Subscribe(apiName, params, identity, fieldMask)
+	subCtx, subCancel := context.WithCancel(ctx)
+
+	sub := rt.Streams.Subscribe(apiName, params, identity, fieldMask, subCancel)
 	*connSubs = append(*connSubs, connStreamSub{apiName: apiName, sub: sub})
 
-	go WritePumpBinary(ctx, ws, int(apiID), sub)
+	go WritePumpBinary(subCtx, ws, int(apiID), sub)
+
+	// If @stream @native without event source, invoke handler
+	if handler, ok := rt.streamHandlers[apiName]; ok {
+		streamParams := &StreamParams{values: params}
+		stream := &Stream{sub: sub, ctx: subCtx}
+		go handler(subCtx, streamParams, identity, stream)
+	}
 }
 
 // IdentityExtractor extracts identity from context.

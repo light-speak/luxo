@@ -25,10 +25,15 @@ var (
 // Handlers write their response directly to req.Buf — zero allocation, zero any.
 type HandlerFunc func(ctx context.Context, req *Request) error
 
+// StreamHandlerFunc is called when a client subscribes to a @stream @native API without event source.
+// The handler receives a Stream and pushes data via stream.Send(). Return when done or context cancelled.
+type StreamHandlerFunc func(ctx context.Context, params *StreamParams, identity any, stream *Stream)
+
 // Router maps API names to handlers and serves the /luvia endpoint.
 type Router struct {
 	handlers         map[string]HandlerFunc
-	streamMatchers   map[string]StreamMatcher // @stream API name → matcher function
+	streamMatchers   map[string]StreamMatcher     // @stream API name → matcher function
+	streamHandlers   map[string]StreamHandlerFunc // @stream @native (no event) → handler
 	translator       *i18n.Translator
 	devMode          bool
 	Registry         *APIRegistry   // binary protocol API ID mapping
@@ -43,6 +48,7 @@ func NewRouter() *Router {
 	return &Router{
 		handlers:       make(map[string]HandlerFunc),
 		streamMatchers: make(map[string]StreamMatcher),
+		streamHandlers: make(map[string]StreamHandlerFunc),
 		Registry:       NewAPIRegistry(),
 		Schema:         schema.New(),
 		Streams:        NewStreamHub(),
@@ -54,6 +60,12 @@ func NewRouter() *Router {
 // matcher can be nil for broadcast (all subscribers receive).
 func (rt *Router) HandleStream(apiName string, matcher StreamMatcher) {
 	rt.streamMatchers[apiName] = matcher
+}
+
+// HandleStreamNative registers a handler for @stream @native without event source.
+// The handler is invoked per subscription and controls push timing via stream.Send().
+func (rt *Router) HandleStreamNative(apiName string, handler StreamHandlerFunc) {
+	rt.streamHandlers[apiName] = handler
 }
 
 // Handle registers a handler for an API name.
