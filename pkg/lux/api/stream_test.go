@@ -371,3 +371,43 @@ func TestWSJSON_DisconnectCleansUpSubs(t *testing.T) {
 		t.Errorf("should have 0 subs after disconnect, got %d", rt.Streams.SubCount("watchCleanup"))
 	}
 }
+
+func TestWSBinary_UnknownFieldID(t *testing.T) {
+	rt := testWSRouter()
+	rt.Registry.Register("watchUnknown", 60)
+	rt.Registry.RegisterParams("watchUnknown", []ParamMeta{
+		{Name: "roomId", Type: "Int", FieldID: 1},
+	})
+
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	// Binary subscribe with unknown field ID 99 — should stop parsing but still subscribe
+	var reqBuf []byte
+	reqBuf = append(reqBuf, 0xFE)
+	reqBuf = codec.AppendVarint(reqBuf, 60) // API ID
+	reqBuf = codec.AppendVarint(reqBuf, 0)  // no mask
+	var enc codec.Encoder
+	enc.WriteFieldInt(1, 42)  // known: roomId=42
+	enc.WriteFieldInt(99, 77) // unknown field ID 99 — should trigger break
+	enc.WriteEnd()
+	reqBuf = append(reqBuf, enc.Bytes()...)
+
+	conn.Write(ctx, websocket.MessageBinary, reqBuf)
+	time.Sleep(50 * time.Millisecond)
+
+	// Should still subscribe (unknown field just stops param parsing)
+	if rt.Streams.SubCount("watchUnknown") != 1 {
+		t.Errorf("sub count = %d, want 1", rt.Streams.SubCount("watchUnknown"))
+	}
+}

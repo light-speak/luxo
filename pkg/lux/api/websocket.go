@@ -104,35 +104,50 @@ type connStreamSub struct {
 }
 
 // isStreamMsg checks if a JSON message has "$sub" or "$unsub" as a top-level key.
-// Validates: preceding char is '{' or ',' (top-level key), and trailing char after closing quote is ':'.
+// Tracks brace depth to ensure the key is at the root object level (depth == 1).
 func isStreamMsg(data []byte) bool {
-	for i := 0; i < len(data)-6; i++ {
-		if data[i] != '"' || data[i+1] != '$' {
+	depth := 0
+	inString := false
+	escape := false
+	for i := 0; i < len(data); i++ {
+		if escape {
+			escape = false
 			continue
 		}
-		// Check preceding non-space char is '{' or ',' (top-level key position)
-		topLevel := false
-		for j := i - 1; j >= 0; j-- {
-			if data[j] == ' ' || data[j] == '\t' || data[j] == '\n' || data[j] == '\r' {
-				continue
+		ch := data[i]
+		if inString {
+			if ch == '\\' {
+				escape = true
+			} else if ch == '"' {
+				inString = false
 			}
-			topLevel = data[j] == '{' || data[j] == ','
-			break
-		}
-		if !topLevel {
 			continue
 		}
-		// Match "$sub" or "$unsub" and verify colon follows
-		if i+6 <= len(data) && data[i+2] == 's' && data[i+3] == 'u' && data[i+4] == 'b' && data[i+5] == '"' {
-			if hasColonAfter(data, i+6) {
+		switch ch {
+		case '{':
+			depth++
+		case '}':
+			depth--
+		case '"':
+			if depth == 1 && matchStreamKey(data, i) {
 				return true
 			}
+			inString = true
 		}
-		if i+8 <= len(data) && data[i+2] == 'u' && data[i+3] == 'n' && data[i+4] == 's' && data[i+5] == 'u' && data[i+6] == 'b' && data[i+7] == '"' {
-			if hasColonAfter(data, i+8) {
-				return true
-			}
-		}
+	}
+	return false
+}
+
+// matchStreamKey checks if data[i:] starts with "$sub": or "$unsub":.
+func matchStreamKey(data []byte, i int) bool {
+	if i+1 >= len(data) || data[i+1] != '$' {
+		return false
+	}
+	if i+6 <= len(data) && data[i+2] == 's' && data[i+3] == 'u' && data[i+4] == 'b' && data[i+5] == '"' {
+		return hasColonAfter(data, i+6)
+	}
+	if i+8 <= len(data) && data[i+2] == 'u' && data[i+3] == 'n' && data[i+4] == 's' && data[i+5] == 'u' && data[i+6] == 'b' && data[i+7] == '"' {
+		return hasColonAfter(data, i+8)
 	}
 	return false
 }

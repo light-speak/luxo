@@ -647,3 +647,73 @@ func TestWSUpgradeViaHTTP(t *testing.T) {
 		t.Errorf("HTTP POST should work, got %d", w.Code)
 	}
 }
+
+func TestIsStreamMsg(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want bool
+	}{
+		// Top-level key detection
+		{"top-level $sub", `{"$sub":"watchDanmaku","roomId":1}`, true},
+		{"top-level $unsub", `{"$unsub":"watchDanmaku"}`, true},
+		{"second key after comma", `{"roomId":1,"$sub":"watch"}`, true},
+
+		// Must NOT match $sub/$unsub inside string values (injection/false positive)
+		{"$sub as string value", `{"action":"$sub","target":"x"}`, false},
+		{"$sub embedded in nested object value", `{"data":{"$sub":"x"}}`, false},
+		{"$sub in array value", `{"list":["$sub"]}`, false},
+
+		// Whitespace tolerance (real JSON formatters add spaces/newlines)
+		{"spaces around colon", `{ "$sub" : "watch" }`, true},
+		{"newline before key", "{\n\"$sub\": \"watch\"}", true},
+		{"tab indented", "{\t\"$sub\":\t\"x\"}", true},
+
+		// Edge cases that previously caused false positives
+		{"key ending with $sub suffix", `{"my$sub":"val"}`, false},
+		{"partial match $su", `{"$su":"val"}`, false},
+
+		// Minimal/boundary inputs
+		{"too short to match", `{"$s"}`, false},
+		{"exact minimum $sub", `{"$sub":"x"}`, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isStreamMsg([]byte(tt.data))
+			if got != tt.want {
+				t.Errorf("isStreamMsg(%q) = %v, want %v", tt.data, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHasColonAfter(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		pos  int
+		want bool
+	}{
+		// Normal JSON key-value separator
+		{"immediate colon", `"key":val`, 5, true},
+		{"colon after spaces", `"key" : val`, 5, true},
+		{"colon after tab", "\"key\"\t:", 5, true},
+
+		// No colon — means the match was inside a value, not a key
+		{"no more data after pos", `"key"`, 5, false},
+		{"next char is comma (value context)", `"key",`, 5, false},
+		{"next char is closing brace", `"key"}`, 5, false},
+
+		// Pos at end of buffer
+		{"pos equals len", `abc`, 3, false},
+		{"pos beyond len", `ab`, 5, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hasColonAfter([]byte(tt.data), tt.pos)
+			if got != tt.want {
+				t.Errorf("hasColonAfter(%q, %d) = %v, want %v", tt.data, tt.pos, got, tt.want)
+			}
+		})
+	}
+}

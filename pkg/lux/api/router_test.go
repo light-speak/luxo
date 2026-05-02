@@ -612,6 +612,85 @@ func TestRouterSchemaConversion(t *testing.T) {
 	}
 }
 
+func TestIntrospectionViaHeader(t *testing.T) {
+	rt := NewRouter()
+	rt.IntrospectionKey = "secret-key"
+	rt.Schema.RegisterModel(&schema.Model{
+		Name:   "User",
+		Fields: []schema.Field{{ID: 1, Name: "id", Type: schema.FieldInt}},
+	})
+	rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "getUser", Module: "user", ReturnType: "User"})
+
+	// Header takes priority — query param wrong but header correct should succeed
+	r := httptest.NewRequest(http.MethodGet, "/luvia?$schema&key=wrong", nil)
+	r.Header.Set("X-Introspection-Key", "secret-key")
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("header auth should succeed, got %d", w.Code)
+	}
+
+	// Neither header nor query — should fail
+	r2 := httptest.NewRequest(http.MethodGet, "/luvia?$schema", nil)
+	w2 := httptest.NewRecorder()
+	rt.ServeHTTP(w2, r2)
+
+	if w2.Code != http.StatusForbidden {
+		t.Errorf("empty key should be forbidden, got %d", w2.Code)
+	}
+}
+
+func TestConvertBinaryToJSON_EmptyData(t *testing.T) {
+	rt := NewRouter()
+	// Empty data should return null regardless of schema
+	result := rt.convertBinaryToJSON("getUser", nil)
+	if string(result) != "null" {
+		t.Errorf("expected null for empty data, got %q", result)
+	}
+	result = rt.convertBinaryToJSON("getUser", []byte{})
+	if string(result) != "null" {
+		t.Errorf("expected null for zero-length data, got %q", result)
+	}
+}
+
+func TestConvertBinaryToJSON_NoSchema(t *testing.T) {
+	rt := NewRouter()
+	rt.Schema = nil
+	// Without schema, should pass data through (handler wrote JSON directly)
+	input := []byte(`{"id":1,"name":"test"}`)
+	result := rt.convertBinaryToJSON("getUser", input)
+	if string(result) != string(input) {
+		t.Errorf("expected passthrough, got %q", result)
+	}
+}
+
+func TestConvertBinaryToJSON_UnknownAPI(t *testing.T) {
+	rt := NewRouter()
+	// Schema exists but API not registered — pass through
+	input := []byte(`{"id":1}`)
+	result := rt.convertBinaryToJSON("nonExistent", input)
+	if string(result) != string(input) {
+		t.Errorf("unknown API should passthrough, got %q", result)
+	}
+}
+
+func TestWriteErrorEscapesJSON(t *testing.T) {
+	w := httptest.NewRecorder()
+	// Message with quotes and newlines should be properly escaped
+	writeError(w, http.StatusBadRequest, "invalid \"field\"\nnewline")
+
+	body := w.Body.String()
+	// Should be valid JSON
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Errorf("writeError produced invalid JSON: %s (body: %s)", err, body)
+	}
+	if parsed["error"] != "invalid \"field\"\nnewline" {
+		t.Errorf("error message not preserved: %q", parsed["error"])
+	}
+}
+
 // Suppress unused imports
 var _ = bytes.NewBuffer
 var _ = json.RawMessage{}
