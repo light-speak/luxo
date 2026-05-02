@@ -353,6 +353,16 @@ func TestCompileStreamExpr(t *testing.T) {
 			want: `!params.Int("roomId")`,
 		},
 		{
+			name: "bare my ident",
+			expr: &ast.Ident{Name: "my"},
+			want: "identity",
+		},
+		{
+			name: "unknown bare ident",
+			expr: &ast.Ident{Name: "unknown"},
+			want: "unknown",
+		},
+		{
 			name: "unsupported expr",
 			expr: &ast.CallExpr{Func: &ast.Ident{Name: "foo"}},
 			want: "false /* unsupported expr */",
@@ -370,33 +380,158 @@ func TestCompileStreamExpr(t *testing.T) {
 }
 
 func TestStreamFieldTypes(t *testing.T) {
-	// streamFieldGoType
-	if streamFieldGoType("Float") != "float64" {
-		t.Error("Float should map to float64")
+	// streamFieldGoType — all branches
+	cases := []struct{ in, want string }{
+		{"Int", "int64"}, {"Float", "float64"}, {"String", "string"},
+		{"Boolean", "bool"}, {"Unknown", "int64"},
 	}
-	if streamFieldGoType("String") != "string" {
-		t.Error("String should map to string")
-	}
-	if streamFieldGoType("Boolean") != "bool" {
-		t.Error("Boolean should map to bool")
-	}
-
-	// streamReadMethod
-	if streamReadMethod("Float") != "ReadFloat" {
-		t.Error("Float should map to ReadFloat")
-	}
-	if streamReadMethod("String") != "ReadString" {
-		t.Error("String should map to ReadString")
-	}
-	if streamReadMethod("Boolean") != "ReadBool" {
-		t.Error("Boolean should map to ReadBool")
+	for _, c := range cases {
+		if got := streamFieldGoType(c.in); got != c.want {
+			t.Errorf("streamFieldGoType(%q) = %q, want %q", c.in, got, c.want)
+		}
 	}
 
-	// streamParamMethod
-	if streamParamMethod("String") != "String" {
-		t.Error("String param should use String method")
+	// streamReadMethod — all branches
+	readCases := []struct{ in, want string }{
+		{"Int", "ReadInt"}, {"Float", "ReadFloat"}, {"String", "ReadString"},
+		{"Boolean", "ReadBool"}, {"Unknown", "ReadInt"},
 	}
-	if streamParamMethod("Boolean") != "Get" {
-		t.Error("Unknown param type should use Get method")
+	for _, c := range readCases {
+		if got := streamReadMethod(c.in); got != c.want {
+			t.Errorf("streamReadMethod(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+
+	// streamParamMethod — all branches
+	paramCases := []struct{ in, want string }{
+		{"Int", "Int"}, {"String", "String"}, {"Boolean", "Get"},
+	}
+	for _, c := range paramCases {
+		if got := streamParamMethod(c.in); got != c.want {
+			t.Errorf("streamParamMethod(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestExtractMatcherExpr_EdgeCases(t *testing.T) {
+	// nil body
+	if extractMatcherExpr(nil) != nil {
+		t.Error("nil body should return nil")
+	}
+	// empty stmts
+	if extractMatcherExpr(&ast.Block{}) != nil {
+		t.Error("empty stmts should return nil")
+	}
+	// all nil exprs (non-ExprStmt statements)
+	block := &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: nil}}}
+	if extractMatcherExpr(block) != nil {
+		t.Error("all nil exprs should return nil")
+	}
+}
+
+func TestGenerateLuxoStreamMatcher_EmptyBody(t *testing.T) {
+	var b strings.Builder
+	si := streamInfo{
+		apiName: "watchEmpty",
+		hasBody: true,
+		body:    &ast.Block{}, // no stmts
+	}
+	generateLuxoStreamMatcher(&b, si)
+	code := b.String()
+	if !strings.Contains(code, "STREAM_MATCHER_EMPTY") {
+		t.Error("empty body should generate STREAM_MATCHER_EMPTY error")
+	}
+}
+
+func TestGenerateLuxoStreamMatcher_UnknownItField(t *testing.T) {
+	// it.unknownField — field not in event params
+	// Var declaration is skipped, but reference remains → Go compile error (correct behavior)
+	SetEventFieldIDs(map[string]map[string]int{
+		"TestEvent": {"knownField": 1},
+	})
+	defer SetEventFieldIDs(nil)
+
+	var b strings.Builder
+	si := streamInfo{
+		apiName:   "watchUnknown",
+		eventName: "TestEvent",
+		hasBody:   true,
+		body: &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: &ast.BinaryExpr{
+			Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "unknownField"},
+			Op:    "==",
+			Right: &ast.Literal{Kind: token.Int, Value: "1"},
+		}}}},
+		eventParams: []*ast.ParamDecl{
+			{Name: "knownField", Type: &ast.TypeRef{Name: "Int"}},
+		},
+	}
+	generateLuxoStreamMatcher(&b, si)
+	code := b.String()
+	// Should generate decoder
+	if !strings.Contains(code, "codec.NewDecoder") {
+		t.Error("should still generate decoder")
+	}
+	// No var declaration for unknownField (not in event params)
+	if strings.Contains(code, "var ev_unknownField") {
+		t.Error("unknown field should not have var declaration")
+	}
+	// No switch case for unknownField
+	if strings.Contains(code, "case 0:") && strings.Contains(code, "ev_unknownField = dec") {
+		t.Error("unknown field should not have decoder case")
+	}
+	// Reference still exists (will fail Go compile — semantic should catch this)
+	if !strings.Contains(code, "ev_unknownField") {
+		t.Error("expression reference should still compile to ev_unknownField")
+	}
+}
+
+func TestWalkExpr_AllBranches(t *testing.T) {
+	// Test that walkExpr visits all node types
+	var visited []string
+	expr := &ast.BinaryExpr{
+		Left: &ast.UnaryExpr{
+			Op:    "!",
+			Value: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "x"},
+		},
+		Right: &ast.CallExpr{
+			Func: &ast.Ident{Name: "foo"},
+			Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "1"}}},
+		},
+	}
+	walkExpr(expr, func(e ast.Expr) {
+		switch e.(type) {
+		case *ast.BinaryExpr:
+			visited = append(visited, "binary")
+		case *ast.UnaryExpr:
+			visited = append(visited, "unary")
+		case *ast.MemberExpr:
+			visited = append(visited, "member")
+		case *ast.Ident:
+			visited = append(visited, "ident")
+		case *ast.CallExpr:
+			visited = append(visited, "call")
+		case *ast.Literal:
+			visited = append(visited, "literal")
+		}
+	})
+	// Should visit: binary, unary, member, ident(it), call, ident(foo), literal(1)
+	if len(visited) != 7 {
+		t.Errorf("expected 7 nodes visited, got %d: %v", len(visited), visited)
+	}
+
+	// walkExpr with nil — should not panic
+	walkExpr(nil, func(e ast.Expr) { t.Error("should not visit nil") })
+}
+
+func TestCompileStreamExpr_GenericMember(t *testing.T) {
+	// obj.field where obj is not "it" or "my"
+	params := map[string]*ast.ParamDecl{}
+	expr := &ast.MemberExpr{
+		Object: &ast.Ident{Name: "other"},
+		Field:  "value",
+	}
+	got := compileStreamExpr(expr, params)
+	if got != "other.Value" {
+		t.Errorf("generic member = %q, want %q", got, "other.Value")
 	}
 }
