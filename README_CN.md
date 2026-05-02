@@ -234,7 +234,18 @@ getUser(1) {
 ### 实时流
 
 ```luxo
-api watchComments(postId: Int): stream Comment
+// 事件驱动 + 过滤器
+api watchDanmaku(roomId: Int): Danmaku @stream(DanmakuSent) {
+  danmaku -> danmaku.roomId == roomId
+}
+
+// 身份过滤
+api watchNotifications: Notification @stream(NotificationCreated) @auth {
+  notification -> notification.userId == my.id
+}
+
+// Go 完全控制
+api watchLiveScore(matchId: Int): ScoreEvent @stream @native
 ```
 
 ## 快速开始
@@ -304,7 +315,7 @@ Luxo 不只是代码更短 — 它是 **AI 写后端最可靠的语言**。
 - [x] 标准库（str · slice · math · datetime · crypto · jsonutil · httputil · convert）
 - [x] 项目骨架（`luxo init` + `luxo add` + `luxo gen` + `luxo run`）
 - [x] Dialect 接口可插拔（PG 已实现，MySQL 占位）
-- [ ] 部署生成（`luxo deploy compose` / `luxo deploy helm`）
+- [x] `luxo deploy compose` — Dockerfile + docker-compose.yml 生成
 
 ### Phase 3 — 多服务 + Binary ✅
 - [x] Binary 协议（varint · svarint · fixed64 · field mask · 列式编码）
@@ -320,21 +331,23 @@ Luxo 不只是代码更短 — 它是 **AI 写后端最可靠的语言**。
 - [x] `luxo.schema.json` 导出（SDK 工具链使用）
 - [x] Graceful Shutdown · CORS · XSS 安全头
 - [x] 事件系统（emit / on · ChanBus + NATSBus · Luxo binary 编码）
+- [x] WebSocket 传输 — JSON/Binary 双模式，并发 dispatch
+- [x] `@stream` 订阅 — 事件驱动推送 + lambda 过滤器 + 字段选择
 
 ### Phase 4 — 客户端 SDK ✅
 - [x] `@luxo/client` — Transport 接口 + FetchTransport + WxTransport + LuxoError
 - [x] `@luxo/vite-plugin` — 编译期字段追踪 + 自动 `$select` 注入
 - [x] `@luxo/react` — `useLuxoQuery` hook + `LuxoProvider`
-- [ ] Dart SDK（Flutter + build_runner 编译期追踪）
-- [ ] Kotlin SDK（Android + Gradle/KCP 编译期追踪）
+- [x] Dart SDK（`luxo_client` — HttpTransport + WsTransport + Luxo binary 编解码 + build_runner 字段追踪）
+- [x] Kotlin SDK（`com.luxo.client` — OkHttp + 协程 + Luxo binary 编解码 + Gradle 字段追踪）
 - [ ] Swift SDK（iOS）
 
-### Phase 5 — AI + 生态
+### Phase 5 — 生产 + 生态
+- [ ] HTTP/3 (QUIC) 支持
 - [ ] MCP Server（AI 直接读写 .luxo 项目）
 - [ ] luxo-ai（自然语言 → .luxo → 运行中的 API）
 - [ ] Luxo Studio（监控 · 追踪 · API Playground）
 - [ ] `luxo deploy helm` — Helm Chart 生成
-- [ ] WebSocket 流式（`@stream`）· Batch 请求
 
 ## 贡献
 

@@ -235,7 +235,18 @@ Client selects fields → API serializes only those → SQL queries only those. 
 ### Real-time Streams
 
 ```luxo
-api watchComments(postId: Int): stream Comment
+// Event-driven stream with filter
+api watchDanmaku(roomId: Int): Danmaku @stream(DanmakuSent) {
+  danmaku -> danmaku.roomId == roomId
+}
+
+// Auth-filtered stream
+api watchNotifications: Notification @stream(NotificationCreated) @auth {
+  notification -> notification.userId == my.id
+}
+
+// Go-controlled stream
+api watchLiveScore(matchId: Int): ScoreEvent @stream @native
 ```
 
 ## Quick Start
@@ -305,6 +316,7 @@ Same task in TypeScript? 150+ lines, 4 packages, no compile-time safety.
 - [x] Standard library (str · slice · math · datetime · crypto · jsonutil · httputil · convert)
 - [x] Project scaffold (`luxo init` + `luxo add` + `luxo gen` + `luxo run`)
 - [x] Dialect interface (PG implemented, MySQL placeholder)
+- [x] `luxo deploy compose` — Dockerfile + docker-compose.yml generation
 
 ### Phase 3 — Multi-service + Binary ✅
 - [x] Binary protocol (varint · svarint · fixed64 · field mask · columnar encoding)
@@ -320,21 +332,23 @@ Same task in TypeScript? 150+ lines, 4 packages, no compile-time safety.
 - [x] `luxo.schema.json` export for SDK tooling
 - [x] Graceful shutdown · CORS · XSS security headers
 - [x] Event system (emit / on · ChanBus + NATSBus · Luxo binary codec)
+- [x] WebSocket transport — JSON/Binary dual-mode, concurrent dispatch
+- [x] `@stream` subscription — event-driven push with lambda matcher + field mask
 
 ### Phase 4 — Client SDK ✅
 - [x] `@luxo/client` — Transport interface + FetchTransport + WxTransport + LuxoError
 - [x] `@luxo/vite-plugin` — compile-time field tracking + auto `$select` injection
 - [x] `@luxo/react` — `useLuxoQuery` hook + `LuxoProvider`
-- [ ] Dart SDK (Flutter + build_runner compile-time tracking)
-- [ ] Kotlin SDK (Android + Gradle/KCP compile-time tracking)
+- [x] Dart SDK (`luxo_client` — HttpTransport + WsTransport + Luxo binary codec + build_runner field tracking)
+- [x] Kotlin SDK (`com.luxo.client` — OkHttp + coroutine + Luxo binary codec + Gradle field tracking)
 - [ ] Swift SDK (iOS)
 
-### Phase 5 — AI + Ecosystem
+### Phase 5 — Production + Ecosystem
+- [ ] HTTP/3 (QUIC) support
 - [ ] MCP Server (AI reads/writes .luxo projects natively)
 - [ ] luxo-ai (natural language → .luxo → running API)
 - [ ] Luxo Studio (monitoring · tracing · API playground)
 - [ ] `luxo deploy helm` — Helm Chart generation
-- [ ] WebSocket stream (`@stream`) · Batch requests
 
 ## Contributing
 
