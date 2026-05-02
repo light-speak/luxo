@@ -58,10 +58,21 @@ func generateStreamFile(result *semantic.Result, packageName string) []byte {
 		return nil
 	}
 
+	// Check if any stream has an event source (needs context import for bus.On callback)
+	hasEventSource := false
+	for _, si := range streams {
+		if si.eventName != "" {
+			hasEventSource = true
+			break
+		}
+	}
+
 	var b strings.Builder
 	writeHeader(&b, packageName, "stream.gen.go")
 	b.WriteString("import (\n")
-	b.WriteString("\t\"context\"\n\n")
+	if hasEventSource {
+		b.WriteString("\t\"context\"\n\n")
+	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/event\"\n")
 	b.WriteString(")\n\n")
@@ -133,15 +144,14 @@ func generateLuxoStreamMatcher(b *strings.Builder, si streamInfo) {
 	fmt.Fprintf(b, "// %s — compiled from @stream body lambda.\n", name)
 	fmt.Fprintf(b, "func %s(data []byte, params *api.StreamParams, identity any) bool {\n", name)
 
-	// The lambda body needs to be compiled.
-	// For now, generate a placeholder that always returns true.
-	// Full lambda compilation requires the expression compiler with stream context.
-	// TODO: compile lambda body (data -> bool expression)
-	fmt.Fprintf(b, "\t// TODO: compile @stream lambda body\n")
+	// Lambda body compilation not yet implemented.
+	// Generate a deliberate compile-time error so this is never silently deployed.
+	// Use @native and implement Match<ApiName> in resolver instead.
 	fmt.Fprintf(b, "\t_ = data\n")
 	fmt.Fprintf(b, "\t_ = params\n")
 	fmt.Fprintf(b, "\t_ = identity\n")
-	fmt.Fprintf(b, "\treturn true\n")
+	fmt.Fprintf(b, "\tSTREAM_LAMBDA_NOT_IMPLEMENTED() // @stream lambda compilation pending — use @native instead\n")
+	fmt.Fprintf(b, "\treturn false\n")
 
 	fmt.Fprintf(b, "}\n\n")
 }

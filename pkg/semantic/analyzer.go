@@ -2068,7 +2068,7 @@ func isDBQueryOp(name string) bool {
 		"create", "createMany",
 		"update", "updateMany",
 		"delete", "deleteMany",
-		"upsert", "raw":
+		"upsert", "raw", "load":
 		return true
 	}
 	return false

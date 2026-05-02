@@ -242,8 +242,11 @@ func WritePumpBinary(ctx context.Context, ws *wsConn, apiID int, sub *StreamSub)
 			buf.B = append(buf.B, 0xFD) // stream push marker
 			buf.B = codec.AppendVarint(buf.B, uint64(apiID))
 			buf.B = append(buf.B, data...)
-			ws.writeBinary(ctx, buf.B)
+			err := ws.writeBinary(ctx, buf.B)
 			PutBuf(buf)
+			if err != nil {
+				return
+			}
 		case <-ctx.Done():
 			return
 		}

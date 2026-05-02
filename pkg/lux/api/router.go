@@ -6,6 +6,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/bytedance/sonic"
 	"github.com/light-speak/luxo/pkg/lux/codec"
@@ -34,6 +35,7 @@ type Router struct {
 	Schema           *schema.Schema // model/API metadata for Binary↔JSON conversion
 	Streams          *StreamHub     // WebSocket stream subscription manager
 	IntrospectionKey string         // key for schema introspection (empty = disabled)
+	WSOrigins        []string       // allowed WebSocket origins (empty = allow all in dev mode)
 }
 
 // NewRouter creates an empty router.
@@ -171,7 +173,10 @@ func (rt *Router) handleIntrospection(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "introspection disabled")
 		return
 	}
-	key := r.URL.Query().Get("key")
+	key := r.Header.Get("X-Introspection-Key")
+	if key == "" {
+		key = r.URL.Query().Get("key") // fallback for backward compatibility
+	}
 	if subtle.ConstantTimeCompare([]byte(key), []byte(rt.IntrospectionKey)) != 1 {
 		writeError(w, http.StatusForbidden, "invalid introspection key")
 		return
@@ -194,12 +199,15 @@ func (rt *Router) handleIntrospection(w http.ResponseWriter, r *http.Request) {
 // convertBinaryToJSON converts handler's Luxo binary response to JSON using schema.
 // Handles model, list, paginated list, and scalar return types.
 func (rt *Router) convertBinaryToJSON(apiName string, data []byte) []byte {
-	if rt.Schema == nil || len(data) == 0 {
-		return data
+	if len(data) == 0 {
+		return []byte("null")
+	}
+	if rt.Schema == nil {
+		return data // no schema — assume handler wrote JSON directly
 	}
 	apiMeta := rt.Schema.APIs[apiName]
 	if apiMeta == nil {
-		return data
+		return data // unknown API — pass through as-is
 	}
 
 	// No return type → scalar (delete returns count as Int)
@@ -297,8 +305,9 @@ func (rt *Router) writeAppError(w http.ResponseWriter, r *http.Request, binaryMo
 
 // writeError writes a simple JSON error response for infrastructure errors.
 func writeError(w http.ResponseWriter, code int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	w.Write([]byte(`{"error":"`))
-	w.Write([]byte(msg))
-	w.Write([]byte(`"}`))
+	// Escape msg to prevent JSON injection
+	escaped := strconv.Quote(msg)
+	w.Write([]byte(`{"error":` + escaped + `}`))
 }

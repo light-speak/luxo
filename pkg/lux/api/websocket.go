@@ -49,9 +49,13 @@ func (c *wsConn) writeBinary(ctx context.Context, data []byte) error {
 //	  Request:  [seq varint][API ID varint][FieldMask len][mask][Params...][0x00]
 //	  Response: [seq varint][status: 0x01=ok | 0x00=error][payload]
 func (rt *Router) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: true,
-	})
+	opts := &websocket.AcceptOptions{}
+	if len(rt.WSOrigins) > 0 {
+		opts.OriginPatterns = rt.WSOrigins
+	} else if rt.devMode {
+		opts.InsecureSkipVerify = true
+	}
+	conn, err := websocket.Accept(w, r, opts)
 	if err != nil {
 		return
 	}
@@ -100,18 +104,47 @@ type connStreamSub struct {
 }
 
 // isStreamMsg checks if a JSON message has "$sub" or "$unsub" as a top-level key.
-// Uses fast byte scan for `"$sub":` or `"$unsub":` — the colon after quote ensures it's a key, not a value.
+// Validates: preceding char is '{' or ',' (top-level key), and trailing char after closing quote is ':'.
 func isStreamMsg(data []byte) bool {
-	// Look for `"$sub":` or `"$unsub":` pattern (key must be followed by colon)
 	for i := 0; i < len(data)-6; i++ {
-		if data[i] == '"' && data[i+1] == '$' {
-			if i+6 < len(data) && data[i+2] == 's' && data[i+3] == 'u' && data[i+4] == 'b' && data[i+5] == '"' {
-				return true
+		if data[i] != '"' || data[i+1] != '$' {
+			continue
+		}
+		// Check preceding non-space char is '{' or ',' (top-level key position)
+		topLevel := false
+		for j := i - 1; j >= 0; j-- {
+			if data[j] == ' ' || data[j] == '\t' || data[j] == '\n' || data[j] == '\r' {
+				continue
 			}
-			if i+8 < len(data) && data[i+2] == 'u' && data[i+3] == 'n' && data[i+4] == 's' && data[i+5] == 'u' && data[i+6] == 'b' && data[i+7] == '"' {
+			topLevel = data[j] == '{' || data[j] == ','
+			break
+		}
+		if !topLevel {
+			continue
+		}
+		// Match "$sub" or "$unsub" and verify colon follows
+		if i+6 <= len(data) && data[i+2] == 's' && data[i+3] == 'u' && data[i+4] == 'b' && data[i+5] == '"' {
+			if hasColonAfter(data, i+6) {
 				return true
 			}
 		}
+		if i+8 <= len(data) && data[i+2] == 'u' && data[i+3] == 'n' && data[i+4] == 's' && data[i+5] == 'u' && data[i+6] == 'b' && data[i+7] == '"' {
+			if hasColonAfter(data, i+8) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasColonAfter checks if the next non-whitespace byte at or after pos is ':'.
+func hasColonAfter(data []byte, pos int) bool {
+	for pos < len(data) {
+		if data[pos] == ' ' || data[pos] == '\t' || data[pos] == '\n' || data[pos] == '\r' {
+			pos++
+			continue
+		}
+		return data[pos] == ':'
 	}
 	return false
 }
@@ -145,6 +178,8 @@ func (rt *Router) handleWSStreamJSON(ctx context.Context, ws *wsConn, data []byt
 		// Extract identity from context
 		identity := identityFromCtx(ctx)
 
+		// JSON mode: fieldMask requires model context to convert field names → bitmap.
+		// Stream dispatch handles JSON encoding without fieldMask for now.
 		sub := rt.Streams.Subscribe(apiName, params, identity, nil)
 		*connSubs = append(*connSubs, connStreamSub{apiName: apiName, sub: sub})
 
@@ -224,8 +259,10 @@ func (rt *Router) handleWSStreamBinary(ctx context.Context, ws *wsConn, data []b
 			break
 		}
 		poff += pn
+		matched := false
 		for _, pm := range paramMeta {
 			if pm.FieldID == int(fid) {
+				matched = true
 				switch pm.Type {
 				case "Int":
 					v, vn := codec.ReadSvarint(paramBuf, poff)
@@ -251,9 +288,16 @@ func (rt *Router) handleWSStreamBinary(ctx context.Context, ws *wsConn, data []b
 						poff += vn
 						params[pm.Name] = v
 					}
+				default:
+					// Unsupported type — stop parsing
+					return
 				}
 				break
 			}
+		}
+		if !matched {
+			// Unknown field ID — stop parsing to avoid desync
+			break
 		}
 	}
 
