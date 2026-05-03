@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/bytedance/sonic"
+	"encoding/json"
+
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/nats-io/nats.go"
 )
@@ -42,7 +43,7 @@ func (b *NATSBus) Emit(ctx context.Context, name string, payload any) error {
 		data = m.MarshalLuxo()
 	} else {
 		var err error
-		data, err = sonic.Marshal(payload)
+		data, err = json.Marshal(payload)
 		if err != nil {
 			return fmt.Errorf("nats marshal: %w", err)
 		}

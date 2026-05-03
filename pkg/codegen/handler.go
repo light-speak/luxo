@@ -343,7 +343,7 @@ func writeHandlerImports(b *strings.Builder, models []*ast.ModelDecl, hasOrGroup
 	if hasSortable || hasTemplateStr {
 		b.WriteString("\t\"strings\"\n")
 	}
-	b.WriteString("\n\t\"github.com/bytedance/sonic\"\n")
+	b.WriteString("\n\t\"encoding/json\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
@@ -556,7 +556,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 			writeAuthCheck(b, "\t\t")
 		}
 		fmt.Fprintf(b, "\t\tvar ids []%s\n", idType)
-		fmt.Fprintf(b, "\t\tif err := sonic.Unmarshal(req.Params[\"ids\"], &ids); err != nil {\n")
+		fmt.Fprintf(b, "\t\tif err := json.Unmarshal(req.Params[\"ids\"], &ids); err != nil {\n")
 		fmt.Fprintf(b, "\t\t\treturn fmt.Errorf(\"param ids: %%w\", err)\n")
 		fmt.Fprintf(b, "\t\t}\n")
 		if soft {

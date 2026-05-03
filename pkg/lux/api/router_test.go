@@ -12,7 +12,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bytedance/sonic"
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/light-speak/luxo/pkg/lux/i18n"
@@ -37,7 +36,7 @@ func TestRouterBasic(t *testing.T) {
 	}
 
 	var resp map[string]json.RawMessage
-	sonic.Unmarshal(w.Body.Bytes(), &resp)
+	json.Unmarshal(w.Body.Bytes(), &resp)
 	if _, ok := resp["data"]; !ok {
 		t.Fatal("response should have data field")
 	}
@@ -72,9 +71,9 @@ func TestRouterWithSelect(t *testing.T) {
 	}
 
 	var resp map[string]json.RawMessage
-	sonic.Unmarshal(w.Body.Bytes(), &resp)
+	json.Unmarshal(w.Body.Bytes(), &resp)
 	var data map[string]any
-	sonic.Unmarshal(resp["data"], &data)
+	json.Unmarshal(resp["data"], &data)
 	if _, ok := data["email"]; ok {
 		t.Error("email should be filtered out")
 	}
@@ -160,7 +159,7 @@ func TestRouterAppError(t *testing.T) {
 	}
 
 	var resp map[string]any
-	sonic.Unmarshal(w.Body.Bytes(), &resp)
+	json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp["error"] != "NotFound" {
 		t.Errorf("error = %v", resp["error"])
 	}
@@ -196,7 +195,7 @@ error:
 	rt.ServeHTTP(w, r)
 
 	var resp map[string]any
-	sonic.Unmarshal(w.Body.Bytes(), &resp)
+	json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp["message"] != "资源 User 不存在" {
 		t.Errorf("message = %v", resp["message"])
 	}
@@ -218,7 +217,7 @@ func TestRouterPlainErrorWrapped(t *testing.T) {
 	}
 
 	var resp map[string]any
-	sonic.Unmarshal(w.Body.Bytes(), &resp)
+	json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp["error"] != "Internal" {
 		t.Errorf("error = %v", resp["error"])
 	}
@@ -240,7 +239,7 @@ func TestRouterDevModeShowsCause(t *testing.T) {
 	rt.ServeHTTP(w, r)
 
 	var resp map[string]any
-	sonic.Unmarshal(w.Body.Bytes(), &resp)
+	json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp["cause"] != "disk full" {
 		t.Errorf("cause = %v", resp["cause"])
 	}
@@ -259,7 +258,7 @@ func TestRouterDevModeNoCauseWhenNil(t *testing.T) {
 	rt.ServeHTTP(w, r)
 
 	var resp map[string]any
-	sonic.Unmarshal(w.Body.Bytes(), &resp)
+	json.Unmarshal(w.Body.Bytes(), &resp)
 	if _, ok := resp["cause"]; ok {
 		t.Error("should not include cause when nil")
 	}
@@ -277,7 +276,7 @@ func TestRouterUnknownAPIUsesAppError(t *testing.T) {
 	}
 
 	var resp map[string]any
-	sonic.Unmarshal(w.Body.Bytes(), &resp)
+	json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp["error"] != "NotFound" {
 		t.Errorf("error = %v", resp["error"])
 	}
@@ -301,7 +300,7 @@ func TestRouterTraceIdInError(t *testing.T) {
 	handler.ServeHTTP(w, r)
 
 	var resp map[string]any
-	sonic.Unmarshal(w.Body.Bytes(), &resp)
+	json.Unmarshal(w.Body.Bytes(), &resp)
 	traceID, ok := resp["traceId"].(string)
 	if !ok || traceID == "" {
 		t.Error("error response should include traceId")
@@ -320,7 +319,7 @@ func TestRouterNoTraceIdWithoutMiddleware(t *testing.T) {
 	rt.ServeHTTP(w, r)
 
 	var resp map[string]any
-	sonic.Unmarshal(w.Body.Bytes(), &resp)
+	json.Unmarshal(w.Body.Bytes(), &resp)
 	if _, ok := resp["traceId"]; ok {
 		t.Error("should not include traceId without middleware")
 	}
@@ -340,7 +339,7 @@ func TestRouterInternalErrorNoMessage(t *testing.T) {
 	rt.ServeHTTP(w, r)
 
 	var resp map[string]any
-	sonic.Unmarshal(w.Body.Bytes(), &resp)
+	json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp["message"] != "error.internal" {
 		t.Errorf("message = %v, want raw key for internal error", resp["message"])
 	}

@@ -8,7 +8,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/bytedance/sonic"
+	"encoding/json"
+
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/light-speak/luxo/pkg/lux/i18n"
@@ -300,7 +301,7 @@ func (rt *Router) writeAppError(w http.ResponseWriter, r *http.Request, binaryMo
 		}
 		if appErr.Data != nil && !appErr.Internal {
 			buf.AppendString(`,"data":`)
-			dataBytes, _ := sonic.Marshal(appErr.Data)
+			dataBytes, _ := json.Marshal(appErr.Data)
 			buf.B = append(buf.B, dataBytes...)
 		}
 		if rt.devMode && appErr.Cause != nil {

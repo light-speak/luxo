@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bytedance/sonic"
+	"encoding/json"
 )
 
 func natsURL(t *testing.T) string {
@@ -54,9 +54,9 @@ func TestNATSBusEmitOn(t *testing.T) {
 	}
 
 	got := received.Load().(string)
-	// sonic.Marshal produces JSON
+	// json.Marshal produces JSON
 	var obj map[string]any
-	sonic.Unmarshal([]byte(got), &obj)
+	json.Unmarshal([]byte(got), &obj)
 	if obj["id"].(float64) != 42 {
 		t.Errorf("got %v", got)
 	}
@@ -108,7 +108,7 @@ func TestNATSBusTypedPayload(t *testing.T) {
 	var got OrderEvent
 
 	bus.On("test.nats.typed", func(ctx context.Context, payload any) {
-		sonic.Unmarshal(payload.([]byte), &got)
+		json.Unmarshal(payload.([]byte), &got)
 		close(done)
 	})
 

@@ -8,7 +8,6 @@ import (
 
 	stderrors "errors"
 
-	"github.com/bytedance/sonic"
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/light-speak/luxo/pkg/lux/schema"
@@ -167,14 +166,14 @@ func hasColonAfter(data []byte, pos int) bool {
 // handleWSStreamJSON handles JSON $sub/$unsub messages.
 func (rt *Router) handleWSStreamJSON(ctx context.Context, ws *wsConn, data []byte, connSubs *[]connStreamSub) {
 	var raw map[string]json.RawMessage
-	if err := sonic.Unmarshal(data, &raw); err != nil {
+	if err := json.Unmarshal(data, &raw); err != nil {
 		return
 	}
 
 	// Subscribe: {"$sub": "watchDanmaku", "roomId": 123}
 	if subRaw, ok := raw["$sub"]; ok {
 		var apiName string
-		sonic.Unmarshal(subRaw, &apiName)
+		json.Unmarshal(subRaw, &apiName)
 		if apiName == "" {
 			return
 		}
@@ -186,7 +185,7 @@ func (rt *Router) handleWSStreamJSON(ctx context.Context, ws *wsConn, data []byt
 				continue
 			}
 			var val any
-			sonic.Unmarshal(v, &val)
+			json.Unmarshal(v, &val)
 			params[k] = val
 		}
 
@@ -214,7 +213,7 @@ func (rt *Router) handleWSStreamJSON(ctx context.Context, ws *wsConn, data []byt
 	// Unsubscribe: {"$unsub": "watchDanmaku"}
 	if unsubRaw, ok := raw["$unsub"]; ok {
 		var apiName string
-		sonic.Unmarshal(unsubRaw, &apiName)
+		json.Unmarshal(unsubRaw, &apiName)
 		for i, cs := range *connSubs {
 			if cs.apiName == apiName {
 				rt.Streams.Unsubscribe(apiName, cs.sub)
@@ -355,20 +354,20 @@ func identityFromCtx(ctx context.Context) any {
 func (rt *Router) handleWSJSON(ctx context.Context, ws *wsConn, data []byte) {
 	// Parse: {"$id": N, "$api": "name", ...params}
 	var raw map[string]json.RawMessage
-	if err := sonic.Unmarshal(data, &raw); err != nil {
+	if err := json.Unmarshal(data, &raw); err != nil {
 		return // malformed, drop
 	}
 
 	// Extract $id
 	var seqID int64
 	if idRaw, ok := raw["$id"]; ok {
-		sonic.Unmarshal(idRaw, &seqID)
+		json.Unmarshal(idRaw, &seqID)
 	}
 
 	// Extract $api
 	var apiName string
 	if apiRaw, ok := raw["$api"]; ok {
-		sonic.Unmarshal(apiRaw, &apiName)
+		json.Unmarshal(apiRaw, &apiName)
 	}
 	if apiName == "" {
 		rt.writeWSJSONError(ctx, ws, seqID, "BadRequest", 400, "missing $api")
@@ -402,7 +401,7 @@ func (rt *Router) handleWSJSON(ctx context.Context, ws *wsConn, data []byte) {
 	// Parse $select
 	if selRaw, ok := raw["$select"]; ok {
 		var selStr string
-		if sonic.Unmarshal(selRaw, &selStr) == nil && selStr != "" {
+		if json.Unmarshal(selRaw, &selStr) == nil && selStr != "" {
 			fields, _ := selection.Parse(selStr)
 			req.Select = fields
 		}
