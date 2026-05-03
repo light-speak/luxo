@@ -96,7 +96,8 @@ func columnarToJSON(dst []byte, data []byte, model *Model) []byte {
 		}
 		dst = append(dst, '{')
 		first := true
-		for _, col := range columns {
+		for ci := range columns {
+			col := &columns[ci]
 			if !first {
 				dst = append(dst, ',')
 			}
@@ -111,7 +112,7 @@ func columnarToJSON(dst []byte, data []byte, model *Model) []byte {
 }
 
 // appendColumnValueJSON appends the JSON value for record i from a typed column.
-func appendColumnValueJSON(dst []byte, col typedColumn, i int) []byte {
+func appendColumnValueJSON(dst []byte, col *typedColumn, i int) []byte {
 	f := col.field
 	switch {
 	case col.ints != nil:
@@ -265,7 +266,8 @@ func BinaryPaginatedListToJSON(dst []byte, data []byte, model *Model) []byte {
 		}
 		dst = append(dst, '{')
 		first := true
-		for _, col := range columns {
+		for ci := range columns {
+			col := &columns[ci]
 			if !first {
 				dst = append(dst, ',')
 			}

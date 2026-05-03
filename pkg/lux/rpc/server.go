@@ -113,7 +113,10 @@ func (s *Server) processRequest(conn io.Writer, payload []byte) error {
 	}
 	off += n
 	var fieldMask []byte
-	if maskLen > 0 && off+int(maskLen) <= len(payload) {
+	if maskLen > 0 {
+		if off+int(maskLen) > len(payload) {
+			return WriteFrame(conn, encodeError(400, "BadRequest", "truncated field mask"))
+		}
 		fieldMask = payload[off : off+int(maskLen)]
 		off += int(maskLen)
 	}
@@ -135,8 +138,11 @@ func (s *Server) processRequest(conn io.Writer, payload []byte) error {
 	poff := 0
 	for poff < len(paramBuf) {
 		fid, n := codec.ReadVarint(paramBuf, poff)
-		if n <= 0 || fid == 0 {
-			break
+		if n <= 0 {
+			return WriteFrame(conn, encodeError(400, "BadRequest", "truncated param field ID"))
+		}
+		if fid == 0 {
+			break // end-of-params marker
 		}
 		poff += n
 
