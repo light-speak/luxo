@@ -363,6 +363,24 @@ func TestCompileStreamExpr(t *testing.T) {
 			want: "unknown",
 		},
 		{
+			name: "my.role == string literal → IdentityString",
+			expr: &ast.BinaryExpr{
+				Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "my"}, Field: "role"},
+				Op:    "==",
+				Right: &ast.Literal{Kind: token.String, Value: "admin"},
+			},
+			want: `api.IdentityString(identity, "role") == "admin"`,
+		},
+		{
+			name: "my.level == int → stays IdentityInt",
+			expr: &ast.BinaryExpr{
+				Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "my"}, Field: "level"},
+				Op:    ">=",
+				Right: &ast.Literal{Kind: token.Int, Value: "5"},
+			},
+			want: `api.IdentityInt(identity, "level") >= 5`,
+		},
+		{
 			name: "unsupported expr",
 			expr: &ast.CallExpr{Func: &ast.Ident{Name: "foo"}},
 			want: "false /* unsupported expr */",

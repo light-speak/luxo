@@ -172,7 +172,6 @@ func (h *StreamHub) Unsubscribe(apiName string, sub *StreamSub) {
 }
 
 // Dispatch sends data to all matching subscribers of an API.
-// Dispatch sends data to all matching subscribers of an API.
 // matcher can be nil (broadcast to all).
 // encodeFn encodes the raw event data per subscriber's fieldMask.
 // Holds RLock during send — safe because sends are non-blocking (select/default).
@@ -210,8 +209,9 @@ func (h *StreamHub) Dispatch(apiName string, rawData any, matcher StreamMatcher,
 		select {
 		case sub.Ch <- encoded:
 		default:
-			// Client too slow — disconnect
-			sub.cancel()
+			if sub.cancel != nil {
+				sub.cancel()
+			}
 		}
 	}
 }
@@ -230,8 +230,9 @@ func (h *StreamHub) DispatchEncoded(apiName string, encoded []byte, matcher Stre
 		select {
 		case sub.Ch <- encoded:
 		default:
-			// Client too slow — disconnect by cancelling context
-			sub.cancel()
+			if sub.cancel != nil {
+				sub.cancel()
+			}
 		}
 	}
 }
