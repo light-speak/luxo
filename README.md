@@ -237,12 +237,12 @@ Client selects fields → API serializes only those → SQL queries only those. 
 ```luxo
 // Event-driven stream with filter
 api watchDanmaku(roomId: Int): Danmaku @stream(DanmakuSent) {
-  danmaku -> danmaku.roomId == roomId
+  it.roomId == roomId
 }
 
 // Auth-filtered stream
 api watchNotifications: Notification @stream(NotificationCreated) @auth {
-  notification -> notification.userId == my.id
+  it.userId == my.id
 }
 
 // Go-controlled stream

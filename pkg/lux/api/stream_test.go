@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -14,7 +15,7 @@ import (
 func TestStreamHub_SubscribeUnsubscribe(t *testing.T) {
 	hub := NewStreamHub()
 
-	sub := hub.Subscribe("watchDanmaku", map[string]any{"roomId": int64(1)}, nil, nil)
+	sub := hub.Subscribe("watchDanmaku", map[string]any{"roomId": int64(1)}, nil, nil, func() {})
 	if hub.SubCount("watchDanmaku") != 1 {
 		t.Errorf("sub count = %d, want 1", hub.SubCount("watchDanmaku"))
 	}
@@ -28,8 +29,8 @@ func TestStreamHub_SubscribeUnsubscribe(t *testing.T) {
 func TestStreamHub_Broadcast(t *testing.T) {
 	hub := NewStreamHub()
 
-	sub1 := hub.Subscribe("announce", nil, nil, nil)
-	sub2 := hub.Subscribe("announce", nil, nil, nil)
+	sub1 := hub.Subscribe("announce", nil, nil, nil, func() {})
+	sub2 := hub.Subscribe("announce", nil, nil, nil, func() {})
 
 	// Broadcast — no matcher
 	hub.DispatchEncoded("announce", []byte("hello"), nil)
@@ -59,8 +60,8 @@ func TestStreamHub_Broadcast(t *testing.T) {
 func TestStreamHub_MatcherFilter(t *testing.T) {
 	hub := NewStreamHub()
 
-	sub1 := hub.Subscribe("watchDanmaku", map[string]any{"roomId": int64(1)}, nil, nil)
-	sub2 := hub.Subscribe("watchDanmaku", map[string]any{"roomId": int64(2)}, nil, nil)
+	sub1 := hub.Subscribe("watchDanmaku", map[string]any{"roomId": int64(1)}, nil, nil, func() {})
+	sub2 := hub.Subscribe("watchDanmaku", map[string]any{"roomId": int64(2)}, nil, nil, func() {})
 
 	// Matcher: only push to roomId == 1
 	matcher := func(data []byte, params *StreamParams, identity any) bool {
@@ -93,7 +94,7 @@ func TestStreamHub_MatcherFilter(t *testing.T) {
 
 func TestStreamHub_DispatchWithEncode(t *testing.T) {
 	hub := NewStreamHub()
-	sub := hub.Subscribe("test", nil, nil, nil)
+	sub := hub.Subscribe("test", nil, nil, nil, func() {})
 
 	hub.Dispatch("test", "rawData", nil, func(data any, fieldMask []byte) []byte {
 		return []byte(data.(string) + ":encoded")
@@ -113,14 +114,20 @@ func TestStreamHub_DispatchWithEncode(t *testing.T) {
 
 func TestStreamHub_ChanFull(t *testing.T) {
 	hub := NewStreamHub()
-	sub := hub.Subscribe("test", nil, nil, nil)
+	cancelled := make(chan struct{}, 1)
+	sub := hub.Subscribe("test", nil, nil, nil, func() {
+		select {
+		case cancelled <- struct{}{}:
+		default:
+		}
+	})
 
 	// Fill the channel
 	for i := 0; i < 64; i++ {
 		hub.DispatchEncoded("test", []byte("x"), nil)
 	}
 
-	// Next dispatch should not block (drops message)
+	// Next dispatch should not block — and should cancel the slow subscriber
 	done := make(chan bool, 1)
 	go func() {
 		hub.DispatchEncoded("test", []byte("overflow"), nil)
@@ -132,6 +139,14 @@ func TestStreamHub_ChanFull(t *testing.T) {
 		// good — didn't block
 	case <-time.After(time.Second):
 		t.Error("dispatch should not block on full chan")
+	}
+
+	// Verify subscriber was cancelled (disconnected)
+	select {
+	case <-cancelled:
+		// good — slow subscriber disconnected
+	case <-time.After(100 * time.Millisecond):
+		t.Error("slow subscriber should have been cancelled")
 	}
 
 	hub.Unsubscribe("test", sub)
@@ -409,5 +424,59 @@ func TestWSBinary_UnknownFieldID(t *testing.T) {
 	// Should still subscribe (unknown field just stops param parsing)
 	if rt.Streams.SubCount("watchUnknown") != 1 {
 		t.Errorf("sub count = %d, want 1", rt.Streams.SubCount("watchUnknown"))
+	}
+}
+
+func TestWSJSON_StreamNativeHandler(t *testing.T) {
+	rt := testWSRouter()
+
+	// Register a native stream handler that pushes 3 messages then stops
+	handlerCalled := make(chan struct{}, 1)
+	rt.HandleStreamNative("watchNative", func(ctx context.Context, params *StreamParams, identity any, stream *Stream) {
+		handlerCalled <- struct{}{}
+		for i := 0; i < 3; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				stream.Send([]byte(`{"score":` + fmt.Sprintf("%d", i) + `}`))
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+	})
+
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	// Subscribe
+	subMsg := `{"$sub":"watchNative","matchId":1}`
+	conn.Write(ctx, websocket.MessageText, []byte(subMsg))
+
+	// Wait for handler to be called
+	select {
+	case <-handlerCalled:
+	case <-time.After(1 * time.Second):
+		t.Fatal("handler was not called on subscribe")
+	}
+
+	// Should receive pushed messages
+	for i := 0; i < 3; i++ {
+		_, data, err := conn.Read(ctx)
+		if err != nil {
+			t.Fatalf("read[%d]: %v", i, err)
+		}
+		if !strings.Contains(string(data), `"score"`) {
+			t.Errorf("expected score in message, got %s", data)
+		}
 	}
 }
