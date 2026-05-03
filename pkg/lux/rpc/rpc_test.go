@@ -329,6 +329,20 @@ func TestClientCallWithMask(t *testing.T) {
 	}
 }
 
+// testProcessRequest is a helper that calls processRequest with a buffer and reads the response frame.
+func testProcessRequest(t *testing.T, srv *Server, payload []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := srv.processRequest(&buf, payload); err != nil {
+		t.Fatalf("processRequest: %v", err)
+	}
+	resp, err := ReadFrame(&buf, nil)
+	if err != nil {
+		t.Fatalf("ReadFrame: %v", err)
+	}
+	return resp
+}
+
 // --- Server malformed request tests ---
 
 func TestServerMalformedAPIID(t *testing.T) {
@@ -336,7 +350,7 @@ func TestServerMalformedAPIID(t *testing.T) {
 	srv := NewServer(rt)
 
 	// Completely invalid payload
-	resp := srv.processRequest([]byte{})
+	resp := testProcessRequest(t, srv, []byte{})
 	if resp[0] != statusError {
 		t.Fatal("should return error for empty payload")
 	}
@@ -347,7 +361,7 @@ func TestServerUnknownAPIID(t *testing.T) {
 	srv := NewServer(rt)
 
 	payload := codec.AppendVarint(nil, 9999) // unknown API
-	resp := srv.processRequest(payload)
+	resp := testProcessRequest(t, srv, payload)
 	if resp[0] != statusError {
 		t.Fatal("should return error for unknown API")
 	}
@@ -361,7 +375,7 @@ func TestServerMalformedFieldMask(t *testing.T) {
 
 	// API ID valid but no field mask follows
 	payload := codec.AppendVarint(nil, 1)
-	resp := srv.processRequest(payload)
+	resp := testProcessRequest(t, srv, payload)
 	if resp[0] != statusError {
 		t.Fatal("should return error for missing field mask")
 	}
@@ -378,7 +392,7 @@ func TestServerHandlerNotFound(t *testing.T) {
 	payload = codec.AppendVarint(payload, 1) // API ID
 	payload = codec.AppendVarint(payload, 0) // mask len = 0
 	payload = append(payload, 0x00)          // params terminator
-	resp := srv.processRequest(payload)
+	resp := testProcessRequest(t, srv, payload)
 	if resp[0] != statusError {
 		t.Fatal("should return error for missing handler")
 	}
@@ -815,7 +829,7 @@ func TestServerProcessRequestAppError(t *testing.T) {
 	payload = codec.AppendVarint(payload, 0) // mask len
 	payload = append(payload, 0x00)          // params terminator
 
-	resp := srv.processRequest(payload)
+	resp := testProcessRequest(t, srv, payload)
 	if resp[0] != statusError {
 		t.Fatal("should return error status")
 	}
@@ -852,7 +866,7 @@ func TestServerProcessRequestHandlerPanic(t *testing.T) {
 	payload = codec.AppendVarint(payload, 0)
 	payload = append(payload, 0x00)
 
-	resp := srv.processRequest(payload)
+	resp := testProcessRequest(t, srv, payload)
 	if resp[0] != statusError {
 		t.Fatal("panic should return error status")
 	}
@@ -948,7 +962,7 @@ func TestRPCTruncatedFloatParam(t *testing.T) {
 	payload = codec.AppendVarint(payload, 1) // param fieldID
 	payload = append(payload, 0x01, 0x02)    // only 2 bytes, need 8
 
-	resp := srv.processRequest(payload)
+	resp := testProcessRequest(t, srv, payload)
 	if resp[0] != statusError {
 		t.Fatal("truncated float should return error")
 	}
@@ -972,7 +986,7 @@ func TestRPCTruncatedStringParam(t *testing.T) {
 	// String length says 100 but no data follows
 	payload = codec.AppendVarint(payload, 100)
 
-	resp := srv.processRequest(payload)
+	resp := testProcessRequest(t, srv, payload)
 	if resp[0] != statusError {
 		t.Fatal("truncated string should return error")
 	}
@@ -995,7 +1009,7 @@ func TestRPCTruncatedBoolParam(t *testing.T) {
 	payload = codec.AppendVarint(payload, 1) // param fieldID
 	// No bool byte follows
 
-	resp := srv.processRequest(payload)
+	resp := testProcessRequest(t, srv, payload)
 	if resp[0] != statusError {
 		t.Fatal("truncated bool should return error")
 	}
@@ -1019,7 +1033,7 @@ func TestRPCUnknownParamFieldID(t *testing.T) {
 	payload = codec.AppendVarint(payload, 0)  // mask len
 	payload = codec.AppendVarint(payload, 99) // unknown param field ID
 
-	resp := srv.processRequest(payload)
+	resp := testProcessRequest(t, srv, payload)
 	if resp[0] != statusError {
 		t.Fatal("unknown param field ID should return error")
 	}

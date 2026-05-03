@@ -935,3 +935,63 @@ func TestBinaryScalarToJSON_Decimal(t *testing.T) {
 		t.Errorf("got %s", result)
 	}
 }
+
+func TestBinaryListToJSON_NullableStringColumn(t *testing.T) {
+	s := New()
+	m := &Model{
+		Name: "Item",
+		Fields: []Field{
+			{ID: 1, Name: "note", Type: FieldString, Nullable: true},
+		},
+	}
+	s.RegisterModel(m)
+
+	w := &codec.ColumnarWriter{}
+	w.SetCount(3)
+	s1 := "hello"
+	w.WriteColumnStringPtr(1, []*string{&s1, nil, &s1})
+
+	result := BinaryListToJSON(nil, w.Bytes(), m)
+	got := string(result)
+	// First and third should be "hello", second should be null
+	if !strings.Contains(got, `"hello"`) {
+		t.Errorf("missing string value: %s", got)
+	}
+	if !strings.Contains(got, "null") {
+		t.Errorf("missing null for nil string: %s", got)
+	}
+}
+
+func TestAppendColumnValueJSON_Default(t *testing.T) {
+	// typedColumn with no typed slices set — should output "null"
+	col := &typedColumn{field: &Field{ID: 1, Name: "unknown", Type: FieldInt}}
+	dst := appendColumnValueJSON(nil, col, 0)
+	if string(dst) != "null" {
+		t.Errorf("default branch should output null, got %q", dst)
+	}
+}
+
+func TestBinaryListToJSON_NullableDateTimeColumn(t *testing.T) {
+	s := New()
+	m := &Model{
+		Name: "Log",
+		Fields: []Field{
+			{ID: 1, Name: "deletedAt", Type: FieldDateTime, Nullable: true},
+		},
+	}
+	s.RegisterModel(m)
+
+	ts := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC).Unix()
+	w := &codec.ColumnarWriter{}
+	w.SetCount(2)
+	w.WriteColumnIntPtr(1, []*int64{&ts, nil})
+
+	result := BinaryListToJSON(nil, w.Bytes(), m)
+	got := string(result)
+	if !strings.Contains(got, "2026") {
+		t.Errorf("missing datetime: %s", got)
+	}
+	if !strings.Contains(got, "null") {
+		t.Errorf("missing null: %s", got)
+	}
+}
