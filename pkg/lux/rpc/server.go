@@ -85,34 +85,31 @@ func (s *Server) handleConn(conn net.Conn) {
 		}
 		readBuf = payload[:0] // reuse buffer
 
-		// Parse request
-		resp := s.processRequest(payload)
-
-		// Write response frame
-		if err := WriteFrame(conn, resp); err != nil {
+		// Parse and dispatch request, write response directly to conn
+		if err := s.processRequest(conn, payload); err != nil {
 			return
 		}
 	}
 }
 
-func (s *Server) processRequest(payload []byte) []byte {
+func (s *Server) processRequest(conn io.Writer, payload []byte) error {
 	// Decode: [API ID varint] [field mask len varint] [field mask] [params binary]
 	off := 0
 	apiID, n := codec.ReadVarint(payload, off)
 	if n <= 0 {
-		return encodeError(400, "BadRequest", "invalid API ID")
+		return WriteFrame(conn, encodeError(400, "BadRequest", "invalid API ID"))
 	}
 	off += n
 
 	apiName, ok := s.registry.NameByID(int(apiID))
 	if !ok {
-		return encodeError(404, "NotFound", fmt.Sprintf("unknown API ID: %d", apiID))
+		return WriteFrame(conn, encodeError(404, "NotFound", fmt.Sprintf("unknown API ID: %d", apiID)))
 	}
 
 	// Field mask
 	maskLen, n := codec.ReadVarint(payload, off)
 	if n <= 0 {
-		return encodeError(400, "BadRequest", "invalid field mask")
+		return WriteFrame(conn, encodeError(400, "BadRequest", "invalid field mask"))
 	}
 	off += n
 	var fieldMask []byte
@@ -153,38 +150,38 @@ func (s *Server) processRequest(payload []byte) []byte {
 			}
 		}
 		if meta == nil {
-			return encodeError(400, "BadRequest", fmt.Sprintf("unknown param field ID %d", fid))
+			return WriteFrame(conn, encodeError(400, "BadRequest", fmt.Sprintf("unknown param field ID %d", fid)))
 		}
 		if paramIdx >= 16 {
-			return encodeError(400, "BadRequest", "too many params (max 16)")
+			return WriteFrame(conn, encodeError(400, "BadRequest", "too many params (max 16)"))
 		}
 
 		switch meta.Type {
 		case "Int":
 			v, n := codec.ReadSvarint(paramBuf, poff)
 			if n <= 0 {
-				return encodeError(400, "BadRequest", "truncated param: "+meta.Name)
+				return WriteFrame(conn, encodeError(400, "BadRequest", "truncated param: "+meta.Name))
 			}
 			poff += n
 			req.SetParamSlot(paramIdx, v)
 		case "Float":
 			v, n := codec.ReadFixed64(paramBuf, poff)
 			if n == 0 {
-				return encodeError(400, "BadRequest", "truncated param: "+meta.Name)
+				return WriteFrame(conn, encodeError(400, "BadRequest", "truncated param: "+meta.Name))
 			}
 			poff += n
 			req.SetParamSlot(paramIdx, v)
 		case "String":
 			v, n := codec.ReadString(paramBuf, poff)
 			if n == 0 {
-				return encodeError(400, "BadRequest", "truncated param: "+meta.Name)
+				return WriteFrame(conn, encodeError(400, "BadRequest", "truncated param: "+meta.Name))
 			}
 			poff += n
 			req.SetParamSlot(paramIdx, v)
 		case "Boolean":
 			v, n := codec.ReadBool(paramBuf, poff)
 			if n == 0 {
-				return encodeError(400, "BadRequest", "truncated param: "+meta.Name)
+				return WriteFrame(conn, encodeError(400, "BadRequest", "truncated param: "+meta.Name))
 			}
 			poff += n
 			req.SetParamSlot(paramIdx, v)
@@ -194,28 +191,28 @@ func (s *Server) processRequest(payload []byte) []byte {
 	// Dispatch to handler
 	fn, ok := s.handlers[apiName]
 	if !ok {
-		return encodeError(404, "NotFound", "handler not found: "+apiName)
+		return WriteFrame(conn, encodeError(404, "NotFound", "handler not found: "+apiName))
 	}
 
 	buf := api.GetBuf()
+	// Reserve 1 byte for status prefix — handler appends after it
+	buf.B = append(buf.B, statusOK)
 	req.Buf = buf
 
 	herr := s.callHandler(fn, req)
 	if herr != nil {
-		api.PutBuf(buf) // release dirty buffer before building error response
+		api.PutBuf(buf)
 		var appErr *luxerrors.AppError
 		if stderrors.As(herr, &appErr) {
-			return encodeError(appErr.Code, appErr.Name, appErr.Message)
+			return WriteFrame(conn, encodeError(appErr.Code, appErr.Name, appErr.Message))
 		}
-		return encodeError(500, "Internal", herr.Error())
+		return WriteFrame(conn, encodeError(500, "Internal", herr.Error()))
 	}
 
-	// Success response: [0x00 status] [body]
-	resp := make([]byte, 0, 1+len(buf.B))
-	resp = append(resp, statusOK)
-	resp = append(resp, buf.B...)
+	// Zero-copy: write [frame header][statusOK + handler payload] directly from pooled buf
+	err := WriteFrame(conn, buf.B)
 	api.PutBuf(buf)
-	return resp
+	return err
 }
 
 // callHandler calls the handler with panic recovery so a panicking handler

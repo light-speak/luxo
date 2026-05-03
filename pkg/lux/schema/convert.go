@@ -40,47 +40,69 @@ func BinaryListToJSON(dst []byte, data []byte, model *Model) []byte {
 	return columnarToJSON(dst, data, model)
 }
 
+// typedColumn holds a decoded column's values in typed slices (no map[string]any).
+type typedColumn struct {
+	field   *Field
+	ints    []int64
+	intPtrs []*int64
+	floats  []float64
+	strings []string
+	strPtrs []*string
+	bools   []bool
+}
+
 // columnarToJSON decodes columnar binary to JSON array.
+// Uses typed column slices instead of map[string]any per record — zero map allocation.
 func columnarToJSON(dst []byte, data []byte, model *Model) []byte {
 	r := codec.NewColumnarReader(data)
 	count := r.Count()
 	if count == 0 {
 		return append(dst, '[', ']')
 	}
-
-	// Read all columns into per-record maps
-	records := make([]map[string]any, count)
-	for i := range records {
-		records[i] = make(map[string]any)
-	}
+	columns := make([]typedColumn, 0, len(model.Fields))
 
 	for r.NextColumn() {
 		f := model.FieldByID(r.FieldID())
 		if f == nil {
 			break
 		}
-		readColumnIntoRecords(r, f, records)
+		col := typedColumn{field: f}
+		switch f.Type {
+		case FieldInt, FieldDateTime, FieldDuration:
+			if f.Nullable {
+				col.intPtrs = r.ReadColumnIntPtr()
+			} else {
+				col.ints = r.ReadColumnInt()
+			}
+		case FieldFloat:
+			col.floats = r.ReadColumnFloat()
+		case FieldString, FieldEnum:
+			if f.Nullable {
+				col.strPtrs = r.ReadColumnStringPtr()
+			} else {
+				col.strings = r.ReadColumnString()
+			}
+		case FieldBool:
+			col.bools = r.ReadColumnBool()
+		}
+		columns = append(columns, col)
 	}
 
-	// Write JSON array
+	// Write JSON array — iterate records, for each record iterate columns
 	dst = append(dst, '[')
-	for i, rec := range records {
+	for i := 0; i < count; i++ {
 		if i > 0 {
 			dst = append(dst, ',')
 		}
 		dst = append(dst, '{')
 		first := true
-		for _, f := range model.Fields {
-			v, ok := rec[f.Name]
-			if !ok {
-				continue
-			}
+		for _, col := range columns {
 			if !first {
 				dst = append(dst, ',')
 			}
 			first = false
-			dst = append(dst, f.JSONPrefix...)
-			dst = appendAnyJSON(dst, v, &f)
+			dst = append(dst, col.field.JSONPrefix...)
+			dst = appendColumnValueJSON(dst, col, i)
 		}
 		dst = append(dst, '}')
 	}
@@ -88,42 +110,45 @@ func columnarToJSON(dst []byte, data []byte, model *Model) []byte {
 	return dst
 }
 
-func readColumnIntoRecords(r *codec.ColumnarReader, f *Field, records []map[string]any) {
-	switch f.Type {
-	case FieldInt, FieldDateTime, FieldDuration:
-		if f.Nullable {
-			vals := r.ReadColumnIntPtr()
-			for i, v := range vals {
-				records[i][f.Name] = v
-			}
-		} else {
-			vals := r.ReadColumnInt()
-			for i, v := range vals {
-				records[i][f.Name] = v
-			}
+// appendColumnValueJSON appends the JSON value for record i from a typed column.
+func appendColumnValueJSON(dst []byte, col typedColumn, i int) []byte {
+	f := col.field
+	switch {
+	case col.ints != nil:
+		if f.Type == FieldDateTime {
+			dst = append(dst, '"')
+			dst = time.Unix(col.ints[i], 0).UTC().AppendFormat(dst, time.RFC3339Nano)
+			dst = append(dst, '"')
+			return dst
 		}
-	case FieldFloat:
-		vals := r.ReadColumnFloat()
-		for i, v := range vals {
-			records[i][f.Name] = v
+		return strconv.AppendInt(dst, col.ints[i], 10)
+	case col.intPtrs != nil:
+		if col.intPtrs[i] == nil {
+			return append(dst, "null"...)
 		}
-	case FieldString, FieldEnum:
-		if f.Nullable {
-			vals := r.ReadColumnStringPtr()
-			for i, v := range vals {
-				records[i][f.Name] = v
-			}
-		} else {
-			vals := r.ReadColumnString()
-			for i, v := range vals {
-				records[i][f.Name] = v
-			}
+		if f.Type == FieldDateTime {
+			dst = append(dst, '"')
+			dst = time.Unix(*col.intPtrs[i], 0).UTC().AppendFormat(dst, time.RFC3339Nano)
+			dst = append(dst, '"')
+			return dst
 		}
-	case FieldBool:
-		vals := r.ReadColumnBool()
-		for i, v := range vals {
-			records[i][f.Name] = v
+		return strconv.AppendInt(dst, *col.intPtrs[i], 10)
+	case col.floats != nil:
+		return strconv.AppendFloat(dst, col.floats[i], 'f', -1, 64)
+	case col.strings != nil:
+		return appendJSONString(dst, col.strings[i])
+	case col.strPtrs != nil:
+		if col.strPtrs[i] == nil {
+			return append(dst, "null"...)
 		}
+		return appendJSONString(dst, *col.strPtrs[i])
+	case col.bools != nil:
+		if col.bools[i] {
+			return append(dst, "true"...)
+		}
+		return append(dst, "false"...)
+	default:
+		return append(dst, "null"...)
 	}
 }
 
@@ -203,38 +228,50 @@ func BinaryPaginatedListToJSON(dst []byte, data []byte, model *Model) []byte {
 		return append(dst, '}')
 	}
 
-	// Read columns
-	records := make([]map[string]any, count)
-	for i := range records {
-		records[i] = make(map[string]any)
-	}
+	// Read columns into typed slices (zero map allocation)
+	columns := make([]typedColumn, 0, len(model.Fields))
 	for r.NextColumn() {
 		f := model.FieldByID(r.FieldID())
 		if f == nil {
 			break
 		}
-		readColumnIntoRecords(r, f, records)
+		col := typedColumn{field: f}
+		switch f.Type {
+		case FieldInt, FieldDateTime, FieldDuration:
+			if f.Nullable {
+				col.intPtrs = r.ReadColumnIntPtr()
+			} else {
+				col.ints = r.ReadColumnInt()
+			}
+		case FieldFloat:
+			col.floats = r.ReadColumnFloat()
+		case FieldString, FieldEnum:
+			if f.Nullable {
+				col.strPtrs = r.ReadColumnStringPtr()
+			} else {
+				col.strings = r.ReadColumnString()
+			}
+		case FieldBool:
+			col.bools = r.ReadColumnBool()
+		}
+		columns = append(columns, col)
 	}
 
 	// Write JSON items
 	dst = append(dst, `{"items":[`...)
-	for i, rec := range records {
+	for i := 0; i < count; i++ {
 		if i > 0 {
 			dst = append(dst, ',')
 		}
 		dst = append(dst, '{')
 		first := true
-		for _, f := range model.Fields {
-			v, ok := rec[f.Name]
-			if !ok {
-				continue
-			}
+		for _, col := range columns {
 			if !first {
 				dst = append(dst, ',')
 			}
 			first = false
-			dst = append(dst, f.JSONPrefix...)
-			dst = appendAnyJSON(dst, v, &f)
+			dst = append(dst, col.field.JSONPrefix...)
+			dst = appendColumnValueJSON(dst, col, i)
 		}
 		dst = append(dst, '}')
 	}
