@@ -343,7 +343,7 @@ func writeHandlerImports(b *strings.Builder, models []*ast.ModelDecl, hasOrGroup
 	if hasSortable || hasTemplateStr {
 		b.WriteString("\t\"strings\"\n")
 	}
-	b.WriteString("\n\t\"github.com/bytedance/sonic\"\n")
+	b.WriteString("\n\t\"encoding/json\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
@@ -555,10 +555,19 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		if needAuth {
 			writeAuthCheck(b, "\t\t")
 		}
-		fmt.Fprintf(b, "\t\tvar ids []%s\n", idType)
-		fmt.Fprintf(b, "\t\tif err := sonic.Unmarshal(req.Params[\"ids\"], &ids); err != nil {\n")
-		fmt.Fprintf(b, "\t\t\treturn fmt.Errorf(\"param ids: %%w\", err)\n")
-		fmt.Fprintf(b, "\t\t}\n")
+		switch idType {
+		case "int64":
+			fmt.Fprintf(b, "\t\tids, err := req.ParamIntArray(\"ids\")\n")
+			fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+		case "string":
+			fmt.Fprintf(b, "\t\tids, err := req.ParamStringArray(\"ids\")\n")
+			fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+		default:
+			fmt.Fprintf(b, "\t\tvar ids []%s\n", idType)
+			fmt.Fprintf(b, "\t\tif err := json.Unmarshal(req.Params[\"ids\"], &ids); err != nil {\n")
+			fmt.Fprintf(b, "\t\t\treturn fmt.Errorf(\"param ids: %%w\", err)\n")
+			fmt.Fprintf(b, "\t\t}\n")
+		}
 		if soft {
 			fmt.Fprintf(b, "\t\tn, err := app.%s.SoftDelete(ctx, %sWhere.Id.In(ids...))\n", name, name)
 		} else {

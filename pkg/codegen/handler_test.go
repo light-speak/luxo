@@ -1928,3 +1928,54 @@ func TestServiceFnNotRegisteredWithoutAnnotation(t *testing.T) {
 		t.Error("no service fns, should not generate RegisterServiceFns")
 	}
 }
+
+func TestGenerateHandlerDeleteMany_IntID(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("User", []*ast.Directive{crudDirective(
+					&ast.NamedArg{Name: "only", Value: &ast.ListExpr{Items: []ast.Expr{
+						&ast.Ident{Name: "deleteMany"},
+					}}},
+				)}, []*ast.FieldDecl{
+					testField("id", "Int", directive("id"), directive("auto")),
+					testField("name", "String"),
+				}),
+			},
+		}},
+	}
+	src := generateHandlerFile(result, "luxo", nil)
+	code := string(src)
+
+	// Should use ParamIntArray for int64 ids
+	if !strings.Contains(code, "req.ParamIntArray") {
+		t.Error("deleteMany with Int ID should use ParamIntArray")
+	}
+	if strings.Contains(code, "json.Unmarshal") {
+		t.Error("deleteMany with Int ID should NOT use json.Unmarshal")
+	}
+}
+
+func TestGenerateHandlerDeleteMany_StringID(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("Product", []*ast.Directive{crudDirective(
+					&ast.NamedArg{Name: "only", Value: &ast.ListExpr{Items: []ast.Expr{
+						&ast.Ident{Name: "deleteMany"},
+					}}},
+				)}, []*ast.FieldDecl{
+					testField("id", "String", directive("id")),
+					testField("name", "String"),
+				}),
+			},
+		}},
+	}
+	src := generateHandlerFile(result, "luxo", nil)
+	code := string(src)
+
+	// Should use ParamStringArray for string ids
+	if !strings.Contains(code, "req.ParamStringArray") {
+		t.Error("deleteMany with String ID should use ParamStringArray")
+	}
+}

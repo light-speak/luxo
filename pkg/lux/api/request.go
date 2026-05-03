@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bytedance/sonic"
 	"github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/light-speak/luxo/pkg/lux/selection"
 )
@@ -92,7 +91,7 @@ func ParseRequest(r *http.Request) (*Request, error) {
 	}
 
 	var raw map[string]json.RawMessage
-	if err := sonic.Unmarshal(body, &raw); err != nil {
+	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("invalid JSON: %w", err)
 	}
 
@@ -105,7 +104,7 @@ func ParseRequest(r *http.Request) (*Request, error) {
 	if !ok {
 		return nil, fmt.Errorf("missing $api field")
 	}
-	if err := sonic.Unmarshal(apiRaw, &req.API); err != nil {
+	if err := json.Unmarshal(apiRaw, &req.API); err != nil {
 		return nil, fmt.Errorf("$api must be a string")
 	}
 	if req.API == "" {
@@ -115,7 +114,7 @@ func ParseRequest(r *http.Request) (*Request, error) {
 	// Extract $select (optional)
 	if selRaw, ok := raw["$select"]; ok {
 		var selStr string
-		if err := sonic.Unmarshal(selRaw, &selStr); err != nil {
+		if err := json.Unmarshal(selRaw, &selStr); err != nil {
 			return nil, fmt.Errorf("$select must be a string")
 		}
 		fields, err := selection.Parse(selStr)
@@ -144,24 +143,24 @@ func ParseRequest(r *http.Request) (*Request, error) {
 // parseListParams extracts $filters, $sorters, page, pageSize from raw request.
 func (req *Request) parseListParams(raw map[string]json.RawMessage) error {
 	if filtersRaw, ok := raw["$filters"]; ok {
-		if err := sonic.Unmarshal(filtersRaw, &req.Filters); err != nil {
+		if err := json.Unmarshal(filtersRaw, &req.Filters); err != nil {
 			return fmt.Errorf("$filters: %w", err)
 		}
 	}
 	if sortersRaw, ok := raw["$sorters"]; ok {
-		if err := sonic.Unmarshal(sortersRaw, &req.Sorters); err != nil {
+		if err := json.Unmarshal(sortersRaw, &req.Sorters); err != nil {
 			return fmt.Errorf("$sorters: %w", err)
 		}
 	}
 	req.Page = 1
 	req.PageSize = 20
 	if pageRaw, ok := raw["page"]; ok {
-		if err := sonic.Unmarshal(pageRaw, &req.Page); err != nil {
+		if err := json.Unmarshal(pageRaw, &req.Page); err != nil {
 			return fmt.Errorf("page must be an integer")
 		}
 	}
 	if psRaw, ok := raw["pageSize"]; ok {
-		if err := sonic.Unmarshal(psRaw, &req.PageSize); err != nil {
+		if err := json.Unmarshal(psRaw, &req.PageSize); err != nil {
 			return fmt.Errorf("pageSize must be an integer")
 		}
 	}
@@ -187,7 +186,7 @@ func (r *Request) findParam(name string) (any, bool) {
 }
 
 // ParamInt extracts an integer parameter. Returns 400 BadRequest on error.
-// Binary mode: inline array lookup (zero alloc). JSON mode: sonic.Unmarshal.
+// Binary mode: inline array lookup (zero alloc). JSON mode: json.Unmarshal.
 func (r *Request) ParamInt(name string) (int64, error) {
 	if r.paramNames != nil {
 		if v, ok := r.findParam(name); ok {
@@ -202,7 +201,7 @@ func (r *Request) ParamInt(name string) (int64, error) {
 		return 0, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
 	var v int64
-	if err := sonic.Unmarshal(raw, &v); err != nil {
+	if err := json.Unmarshal(raw, &v); err != nil {
 		return 0, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be an integer"})
 	}
 	return v, nil
@@ -223,7 +222,7 @@ func (r *Request) ParamString(name string) (string, error) {
 		return "", errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
 	var v string
-	if err := sonic.Unmarshal(raw, &v); err != nil {
+	if err := json.Unmarshal(raw, &v); err != nil {
 		return "", errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be a string"})
 	}
 	return v, nil
@@ -248,7 +247,7 @@ func (r *Request) ParamDateTime(name string) (time.Time, error) {
 		return time.Time{}, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
 	var s string
-	if err := sonic.Unmarshal(raw, &s); err != nil {
+	if err := json.Unmarshal(raw, &s); err != nil {
 		return time.Time{}, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be a string"})
 	}
 	t, err := time.Parse(time.RFC3339, s)
@@ -273,7 +272,7 @@ func (r *Request) ParamFloat(name string) (float64, error) {
 		return 0, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
 	var v float64
-	if err := sonic.Unmarshal(raw, &v); err != nil {
+	if err := json.Unmarshal(raw, &v); err != nil {
 		return 0, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be a number"})
 	}
 	return v, nil
@@ -294,7 +293,7 @@ func (r *Request) ParamBool(name string) (bool, error) {
 		return false, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
 	var v bool
-	if err := sonic.Unmarshal(raw, &v); err != nil {
+	if err := json.Unmarshal(raw, &v); err != nil {
 		return false, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be a boolean"})
 	}
 	return v, nil
@@ -315,7 +314,7 @@ func (r *Request) ParamIntArray(name string) ([]int64, error) {
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
 	var v []int64
-	if err := sonic.Unmarshal(raw, &v); err != nil {
+	if err := json.Unmarshal(raw, &v); err != nil {
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be an array of integers"})
 	}
 	return v, nil
@@ -336,7 +335,7 @@ func (r *Request) ParamStringArray(name string) ([]string, error) {
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
 	var v []string
-	if err := sonic.Unmarshal(raw, &v); err != nil {
+	if err := json.Unmarshal(raw, &v); err != nil {
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be an array of strings"})
 	}
 	return v, nil
@@ -359,7 +358,7 @@ func (r *Request) ParamJSON(name string, target any) error {
 	if !ok {
 		return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
-	if err := sonic.Unmarshal(raw, target); err != nil {
+	if err := json.Unmarshal(raw, target); err != nil {
 		return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "invalid format"})
 	}
 	return nil
