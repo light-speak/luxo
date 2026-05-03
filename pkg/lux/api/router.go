@@ -300,9 +300,11 @@ func (rt *Router) writeAppError(w http.ResponseWriter, r *http.Request, binaryMo
 			buf.AppendJSONString(traceID)
 		}
 		if appErr.Data != nil && !appErr.Internal {
-			buf.AppendString(`,"data":`)
-			dataBytes, _ := json.Marshal(appErr.Data)
-			buf.B = append(buf.B, dataBytes...)
+			dataBytes, marshalErr := json.Marshal(appErr.Data)
+			if marshalErr == nil {
+				buf.AppendString(`,"data":`)
+				buf.B = append(buf.B, dataBytes...)
+			}
 		}
 		if rt.devMode && appErr.Cause != nil {
 			buf.AppendString(`,"cause":`)
