@@ -962,6 +962,15 @@ func TestBinaryListToJSON_NullableStringColumn(t *testing.T) {
 	}
 }
 
+func TestAppendColumnValueJSON_Default(t *testing.T) {
+	// typedColumn with no typed slices set — should output "null"
+	col := typedColumn{field: &Field{ID: 1, Name: "unknown", Type: FieldInt}}
+	dst := appendColumnValueJSON(nil, col, 0)
+	if string(dst) != "null" {
+		t.Errorf("default branch should output null, got %q", dst)
+	}
+}
+
 func TestBinaryListToJSON_NullableDateTimeColumn(t *testing.T) {
 	s := New()
 	m := &Model{
