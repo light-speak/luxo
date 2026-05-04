@@ -1706,7 +1706,8 @@ func TestWriteHandlerImportsAllFeatures(t *testing.T) {
 	var b strings.Builder
 	models := []*ast.ModelDecl{
 		{
-			Name: "User",
+			Name:       "User",
+			Directives: []*ast.Directive{{Name: "crud"}},
 			Fields: []*ast.FieldDecl{
 				{Name: "password", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hash"}}},
 			},
@@ -1732,16 +1733,29 @@ func TestWriteHandlerImportsAllFeatures(t *testing.T) {
 	}
 }
 
-// ─── writeHandlerImports: hash only from CRUD models ──────
+// ─── writeHandlerImports: hash only when CRUD has write ops ──────
 
-func TestWriteHandlerImportsNoHashWithoutCRUD(t *testing.T) {
+func TestWriteHandlerImportsNoHashWithoutWriteOps(t *testing.T) {
 	var b strings.Builder
 	result := &semantic.Result{Files: []*ast.File{{}}}
-	// No CRUD models — should NOT add luxocrypto even if model has @hash
-	writeHandlerImports(&b, result, nil, false, false, false, false, false, false)
+	// Model has @hash but CRUD only has get/list (no create/update) — no luxocrypto needed
+	models := []*ast.ModelDecl{{
+		Name: "User",
+		Directives: []*ast.Directive{{
+			Name: "crud",
+			Args: []*ast.NamedArg{{
+				Name:  "only",
+				Value: &ast.ListExpr{Items: []ast.Expr{&ast.Ident{Name: "get"}, &ast.Ident{Name: "list"}}},
+			}},
+		}},
+		Fields: []*ast.FieldDecl{
+			{Name: "password", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hash"}}},
+		},
+	}}
+	writeHandlerImports(&b, result, models, false, false, false, false, false, false)
 	out := b.String()
 	if strings.Contains(out, "luxocrypto") {
-		t.Fatalf("no CRUD models should not add luxocrypto import, got:\n%s", out)
+		t.Fatalf("read-only CRUD with @hash should not add luxocrypto, got:\n%s", out)
 	}
 }
 

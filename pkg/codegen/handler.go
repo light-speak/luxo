@@ -1331,11 +1331,26 @@ func detectAuthNeeded(result *semantic.Result, models []*ast.ModelDecl) bool {
 	return false
 }
 
-// scanModelsForHash checks if any CRUD model has @hash fields.
+// scanModelsForHash checks if any CRUD model has @hash fields AND generates write operations.
+// Only returns true when generated code will actually call luxocrypto.HashPassword.
 func scanModelsForHash(models []*ast.ModelDecl) bool {
 	for _, m := range models {
+		if !hasCrud(m) {
+			continue
+		}
+		hasHash := false
 		for _, f := range m.Fields {
 			if hasDirective(f.Directives, "hash") {
+				hasHash = true
+				break
+			}
+		}
+		if !hasHash {
+			continue
+		}
+		// Only need luxocrypto if CRUD includes write operations
+		for _, op := range crudOperations(m) {
+			if op == "create" || op == "update" || op == "createMany" || op == "updateMany" || op == "upsert" {
 				return true
 			}
 		}
