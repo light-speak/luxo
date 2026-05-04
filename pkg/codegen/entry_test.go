@@ -357,12 +357,12 @@ func TestGenerateModuleEntryFiles_WithLoaders(t *testing.T) {
 	entries := GenerateModuleEntryFiles(result, "myapp")
 	userSrc := string(entries["user"])
 
-	// Module with relations should set up remote loaders
-	if !strings.Contains(userSrc, "NewRemoteLoaders") {
-		t.Errorf("should use NewRemoteLoaders:\n%s", userSrc)
+	// Module with same-module relations (no extend) should use DefaultLoaders
+	if !strings.Contains(userSrc, "NewDefaultLoaders") {
+		t.Errorf("same-module relations should use NewDefaultLoaders:\n%s", userSrc)
 	}
-	if !strings.Contains(userSrc, "rpcClients") {
-		t.Errorf("should create RPC clients:\n%s", userSrc)
+	if strings.Contains(userSrc, "NewRemoteLoaders") {
+		t.Errorf("no extend — should NOT use NewRemoteLoaders:\n%s", userSrc)
 	}
 }
 

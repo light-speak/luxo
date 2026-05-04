@@ -1800,15 +1800,28 @@ func TestScanForTimeImport_FnDurationParam(t *testing.T) {
 }
 
 func TestScanForTimeImport_ApiDateTimeParam(t *testing.T) {
-	// API with DateTime param
+	// API with DateTime param — does NOT need time import (uses int64 Unix timestamp internally)
 	result := &semantic.Result{Files: []*ast.File{{
 		APIs: []*ast.ApiDecl{{
 			Name:   "listByDate",
 			Params: []*ast.ParamDecl{{Name: "since", Type: &ast.TypeRef{Name: "DateTime"}}},
 		}},
 	}}}
+	if scanForTimeImport(result, nil) {
+		t.Error("DateTime param should NOT trigger time import (uses ParamDateTime, no explicit time.Time)")
+	}
+}
+
+func TestScanForTimeImport_ApiDurationParam(t *testing.T) {
+	// API with Duration param — needs time import (time.Duration type in generated code)
+	result := &semantic.Result{Files: []*ast.File{{
+		APIs: []*ast.ApiDecl{{
+			Name:   "delay",
+			Params: []*ast.ParamDecl{{Name: "d", Type: &ast.TypeRef{Name: "Duration"}}},
+		}},
+	}}}
 	if !scanForTimeImport(result, nil) {
-		t.Error("API with DateTime param should trigger time import")
+		t.Error("Duration param should trigger time import")
 	}
 }
 

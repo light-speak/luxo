@@ -1359,11 +1359,11 @@ func scanModelsForHash(models []*ast.ModelDecl) bool {
 }
 
 // scanForTimeImport checks if generated handler code will emit time.* identifiers.
-// Covers: CRUD model DateTime/Duration fields + native fn/api Duration params.
+// Only Duration fields/params need time package. DateTime uses int64 (Unix timestamp).
 func scanForTimeImport(result *semantic.Result, models []*ast.ModelDecl) bool {
 	for _, m := range models {
 		for _, f := range m.Fields {
-			if f.Type != nil && (f.Type.Name == "DateTime" || f.Type.Name == "Duration") {
+			if f.Type != nil && f.Type.Name == "Duration" {
 				return true
 			}
 		}
@@ -1371,14 +1371,14 @@ func scanForTimeImport(result *semantic.Result, models []*ast.ModelDecl) bool {
 	for _, file := range result.Files {
 		for _, fn := range file.Functions {
 			for _, p := range fn.Params {
-				if p.Type != nil && (p.Type.Name == "DateTime" || p.Type.Name == "Duration") {
+				if p.Type != nil && p.Type.Name == "Duration" {
 					return true
 				}
 			}
 		}
 		for _, api := range file.APIs {
 			for _, p := range api.Params {
-				if p.Type != nil && (p.Type.Name == "DateTime" || p.Type.Name == "Duration") {
+				if p.Type != nil && p.Type.Name == "Duration" {
 					return true
 				}
 			}

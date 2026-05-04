@@ -13,6 +13,7 @@ type moduleInfo struct {
 	name          string
 	hasCrud       bool
 	hasLoaders    bool
+	hasExtend     bool // has cross-module extend (needs remote loaders in cluster mode)
 	hasEvents     bool
 	hasServiceFns bool
 }
@@ -41,6 +42,7 @@ func collectModules(result *semantic.Result) []moduleInfo {
 		// Extend declarations need DataLoaders (cross-module load)
 		if len(file.Extends) > 0 {
 			info.hasLoaders = true
+			info.hasExtend = true
 		}
 		if len(file.Events) > 0 || len(file.Listeners) > 0 {
 			info.hasEvents = true
@@ -208,10 +210,10 @@ func writeDataLoaderWiring(b *strings.Builder, modules []moduleInfo) {
 	b.WriteString("\tdlCfg := dataloader.DefaultConfig()\n")
 	b.WriteString("\tdeployMode := env.GetOrDefault(\"DEPLOY_MODE\", \"embedded\")\n\n")
 
-	// Check if any module needs remote loaders
+	// Check if any module has cross-module extends (needs remote loaders in cluster mode)
 	hasRemote := false
 	for _, m := range modules {
-		if m.hasLoaders {
+		if m.hasExtend {
 			hasRemote = true
 			break
 		}
@@ -228,8 +230,15 @@ func writeDataLoaderWiring(b *strings.Builder, modules []moduleInfo) {
 				m.name, envKey, defaultAddr)
 		}
 		for _, m := range modules {
-			if m.hasLoaders {
+			if !m.hasLoaders {
+				continue
+			}
+			if m.hasExtend {
+				// Module with cross-module extends: use RPC-backed loaders
 				fmt.Fprintf(b, "\t\t%sApp.SetLoaders(%s_luxo.NewRemoteLoaders(%sApp, rpcClients, dlCfg))\n", m.name, m.name, m.name)
+			} else {
+				// Module with only same-module relations: use local DB
+				fmt.Fprintf(b, "\t\t%sApp.SetLoaders(%s_luxo.NewDefaultLoaders(%sApp, dlCfg))\n", m.name, m.name, m.name)
 			}
 		}
 		b.WriteString("\t} else {\n")
@@ -352,20 +361,26 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 	b.WriteString("\tdefer app.Close()\n\n")
 	fmt.Fprintf(&b, "\t%s_resolver.Setup(app)\n\n", target.name)
 
-	// DataLoader — RemoteLoaders for cross-module
+	// DataLoader
 	if target.hasLoaders {
 		b.WriteString("\tdlCfg := dataloader.DefaultConfig()\n")
-		b.WriteString("\trpcClients := make(map[string]*rpc.Client)\n")
-		for _, other := range allModules {
-			if other.name == target.name {
-				continue
+		if target.hasExtend {
+			// Module with cross-module extends: use RPC-backed loaders
+			b.WriteString("\trpcClients := make(map[string]*rpc.Client)\n")
+			for _, other := range allModules {
+				if other.name == target.name {
+					continue
+				}
+				envKey := strings.ToUpper(other.name) + "_SERVICE_ADDR"
+				defaultAddr := other.name + ":9000"
+				fmt.Fprintf(&b, "\trpcClients[%q] = rpc.NewClient(env.GetOrDefault(%q, %q))\n",
+					other.name, envKey, defaultAddr)
 			}
-			envKey := strings.ToUpper(other.name) + "_SERVICE_ADDR"
-			defaultAddr := other.name + ":9000"
-			fmt.Fprintf(&b, "\trpcClients[%q] = rpc.NewClient(env.GetOrDefault(%q, %q))\n",
-				other.name, envKey, defaultAddr)
+			fmt.Fprintf(&b, "\tapp.SetLoaders(%s_luxo.NewRemoteLoaders(app, rpcClients, dlCfg))\n\n", target.name)
+		} else {
+			// Module with only same-module relations: use local DB
+			fmt.Fprintf(&b, "\tapp.SetLoaders(%s_luxo.NewDefaultLoaders(app, dlCfg))\n\n", target.name)
 		}
-		fmt.Fprintf(&b, "\tapp.SetLoaders(%s_luxo.NewRemoteLoaders(app, rpcClients, dlCfg))\n\n", target.name)
 	}
 
 	// Events

@@ -322,16 +322,7 @@ func generateDBFile(result *semantic.Result, packageName string, enums map[strin
 		}
 	}
 
-	// Generate query support for extend stubs (needed by compiled APIs and DataLoader)
-	for _, file := range result.Files {
-		for _, ext := range file.Extends {
-			if modelNames[ext.Name] {
-				continue // full model exists, has its own builder
-			}
-			generateExtendQueryBuilder(&b, ext)
-			b.WriteByte('\n')
-		}
-	}
+	generateExtendScanners(&b, result.Files, modelNames)
 
 	for _, file := range result.Files {
 		for _, m := range file.Models {
@@ -398,17 +389,6 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 		return nil
 	}
 
-	// Collect extend model names (cross-module stubs with read-only clients)
-	var extendModels []string
-	for _, file := range result.Files {
-		for _, ext := range file.Extends {
-			if !modelSet[ext.Name] {
-				extendModels = append(extendModels, ext.Name)
-				modelSet[ext.Name] = true
-			}
-		}
-	}
-
 	// Check if any model has relations or extend DataLoaders (needs loaders field)
 	hasRelations := false
 	for _, file := range result.Files {
@@ -455,9 +435,7 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 	for _, name := range models {
 		fmt.Fprintf(&b, "\t%s *%sClient\n", name, name)
 	}
-	for _, name := range extendModels {
-		fmt.Fprintf(&b, "\t%s *%sClient\n", name, name)
-	}
+	// Extend models are accessed via DataLoader only — no Client field.
 	if hasRelations {
 		b.WriteString("\tloaders Loaders\n")
 	}
@@ -481,9 +459,6 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 	b.WriteString("\treturn &App{\n")
 	b.WriteString("\t\tDB: db,\n")
 	for _, name := range models {
-		fmt.Fprintf(&b, "\t\t%s: &%sClient{db: db},\n", name, name)
-	}
-	for _, name := range extendModels {
 		fmt.Fprintf(&b, "\t\t%s: &%sClient{db: db},\n", name, name)
 	}
 	b.WriteString("\t}\n")
@@ -533,4 +508,42 @@ func writeDBImports(b *strings.Builder, files []*ast.File) {
 		b.WriteString("\t\"github.com/shopspring/decimal\"\n")
 	}
 	b.WriteString(")\n\n")
+}
+
+// generateExtendScanners generates scanners for extend models (Id + data fields only).
+// Used by embedded mode DataLoader to scan DB rows for cross-module models.
+func generateExtendScanners(b *strings.Builder, files []*ast.File, modelNames map[string]bool) {
+	seen := make(map[string]bool)
+	for _, file := range files {
+		for _, ext := range file.Extends {
+			if modelNames[ext.Name] || seen[ext.Name] {
+				continue
+			}
+			seen[ext.Name] = true
+			fields := []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}}
+			for _, f := range ext.Fields {
+				if f.Computed != nil || f.Type == nil || f.Type.IsList {
+					continue
+				}
+				if isRelationType(f.Type.Name) {
+					continue
+				}
+				fields = append(fields, f)
+			}
+			generateScanner(b, &ast.ModelDecl{Name: ext.Name, Fields: fields})
+			b.WriteByte('\n')
+		}
+	}
+}
+
+// isRelationType returns true for model/enum type names (not primitive types).
+func isRelationType(name string) bool {
+	if name == "" || name[0] < 'A' || name[0] > 'Z' {
+		return false
+	}
+	switch name {
+	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes":
+		return false
+	}
+	return true
 }
