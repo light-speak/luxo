@@ -1712,7 +1712,8 @@ func TestWriteHandlerImportsAllFeatures(t *testing.T) {
 			},
 		},
 	}
-	writeHandlerImports(&b, models, true, true, true, true, true, true, nil)
+	result := &semantic.Result{Files: []*ast.File{{}}}
+	writeHandlerImports(&b, result, models, true, true, true, true, true, true)
 	out := b.String()
 	if !strings.Contains(out, `"strconv"`) {
 		t.Fatalf("hasOrGroups should add strconv import, got:\n%s", out)
@@ -1731,23 +1732,16 @@ func TestWriteHandlerImportsAllFeatures(t *testing.T) {
 	}
 }
 
-// ─── writeHandlerImports: hash field in allModels (not in CRUD models) ──────
+// ─── writeHandlerImports: hash only from CRUD models ──────
 
-func TestWriteHandlerImportsHashInAllModels(t *testing.T) {
+func TestWriteHandlerImportsNoHashWithoutCRUD(t *testing.T) {
 	var b strings.Builder
-	allModels := map[string]*ast.ModelDecl{
-		"User": {
-			Name: "User",
-			Fields: []*ast.FieldDecl{
-				{Name: "password", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hash"}}},
-			},
-		},
-	}
-	// No CRUD models with hash, but allModels has one
-	writeHandlerImports(&b, nil, false, false, false, false, false, false, allModels)
+	result := &semantic.Result{Files: []*ast.File{{}}}
+	// No CRUD models — should NOT add luxocrypto even if model has @hash
+	writeHandlerImports(&b, result, nil, false, false, false, false, false, false)
 	out := b.String()
-	if !strings.Contains(out, "luxocrypto") {
-		t.Fatalf("allModels hash should add luxocrypto import, got:\n%s", out)
+	if strings.Contains(out, "luxocrypto") {
+		t.Fatalf("no CRUD models should not add luxocrypto import, got:\n%s", out)
 	}
 }
 

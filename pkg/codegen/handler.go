@@ -110,7 +110,7 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	var b strings.Builder
 	writeHeader(&b, packageName, "handler.gen.go")
 
-	writeHandlerImports(&b, models, features.hasOrGroups, features.hasSortable, features.hasAwait, features.hasTransaction, features.hasTemplateStr, features.hasAuth, modelMap)
+	writeHandlerImports(&b, result, models, features.hasOrGroups, features.hasSortable, features.hasAwait, features.hasTransaction, features.hasTemplateStr, features.hasAuth)
 
 	// Generate defaultCols for models with @hidden fields (excludes hidden from SELECT *)
 	for _, m := range models {
@@ -289,9 +289,9 @@ func writeFKEnsure(b *strings.Builder, rels []Relation) {
 }
 
 // writeHandlerImports writes handler.gen.go imports.
-func writeHandlerImports(b *strings.Builder, models []*ast.ModelDecl, hasOrGroups, hasSortable, hasAwait, hasTransaction, hasTemplateStr, hasAuth bool, allModels map[string]*ast.ModelDecl) {
-	hasHash := scanModelsForHash(models, allModels)
-	hasTime := scanModelsForTime(models)
+func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*ast.ModelDecl, hasOrGroups, hasSortable, hasAwait, hasTransaction, hasTemplateStr, hasAuth bool) {
+	hasHash := scanModelsForHash(models)
+	hasTime := scanForTimeImport(result, models)
 	needsJSON := scanModelsForJSON(models)
 
 	b.WriteString("import (\n")
@@ -1331,16 +1331,9 @@ func detectAuthNeeded(result *semantic.Result, models []*ast.ModelDecl) bool {
 	return false
 }
 
-// scanModelsForHash checks if any model has @hash fields.
-func scanModelsForHash(models []*ast.ModelDecl, allModels map[string]*ast.ModelDecl) bool {
+// scanModelsForHash checks if any CRUD model has @hash fields.
+func scanModelsForHash(models []*ast.ModelDecl) bool {
 	for _, m := range models {
-		for _, f := range m.Fields {
-			if hasDirective(f.Directives, "hash") {
-				return true
-			}
-		}
-	}
-	for _, m := range allModels {
 		for _, f := range m.Fields {
 			if hasDirective(f.Directives, "hash") {
 				return true
@@ -1350,12 +1343,29 @@ func scanModelsForHash(models []*ast.ModelDecl, allModels map[string]*ast.ModelD
 	return false
 }
 
-// scanModelsForTime checks if any CRUD model has DateTime/Duration fields.
-func scanModelsForTime(models []*ast.ModelDecl) bool {
+// scanForTimeImport checks if generated handler code will emit time.* identifiers.
+// Covers: CRUD model DateTime/Duration fields + native fn/api Duration params.
+func scanForTimeImport(result *semantic.Result, models []*ast.ModelDecl) bool {
 	for _, m := range models {
 		for _, f := range m.Fields {
 			if f.Type != nil && (f.Type.Name == "DateTime" || f.Type.Name == "Duration") {
 				return true
+			}
+		}
+	}
+	for _, file := range result.Files {
+		for _, fn := range file.Functions {
+			for _, p := range fn.Params {
+				if p.Type != nil && (p.Type.Name == "DateTime" || p.Type.Name == "Duration") {
+					return true
+				}
+			}
+		}
+		for _, api := range file.APIs {
+			for _, p := range api.Params {
+				if p.Type != nil && (p.Type.Name == "DateTime" || p.Type.Name == "Duration") {
+					return true
+				}
 			}
 		}
 	}
