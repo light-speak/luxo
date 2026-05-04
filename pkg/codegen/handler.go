@@ -66,28 +66,7 @@ func detectHandlerFeatures(result *semantic.Result, models []*ast.ModelDecl, inf
 		}
 	}
 
-	// Check if auth is needed:
-	// 1. CRUD models with @withAuth
-	// 2. Compiled APIs with @auth
-	for _, m := range models {
-		if hasDirective(m.Directives, "withAuth") {
-			f.hasAuth = true
-			break
-		}
-	}
-	if !f.hasAuth {
-		for _, file := range result.Files {
-			for _, api := range file.APIs {
-				if hasDirective(api.Directives, "auth") {
-					f.hasAuth = true
-					break
-				}
-			}
-			if f.hasAuth {
-				break
-			}
-		}
-	}
+	f.hasAuth = detectAuthNeeded(result, models)
 
 	return f
 }
@@ -131,7 +110,7 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	var b strings.Builder
 	writeHeader(&b, packageName, "handler.gen.go")
 
-	writeHandlerImports(&b, models, features.hasOrGroups, features.hasSortable, features.hasAwait, features.hasTransaction, features.hasTemplateStr, features.hasAuth, modelMap)
+	writeHandlerImports(&b, result, models, features.hasOrGroups, features.hasSortable, features.hasAwait, features.hasTransaction, features.hasTemplateStr, features.hasAuth)
 
 	// Generate defaultCols for models with @hidden fields (excludes hidden from SELECT *)
 	for _, m := range models {
@@ -310,30 +289,11 @@ func writeFKEnsure(b *strings.Builder, rels []Relation) {
 }
 
 // writeHandlerImports writes handler.gen.go imports.
-func writeHandlerImports(b *strings.Builder, models []*ast.ModelDecl, hasOrGroups, hasSortable, hasAwait, hasTransaction, hasTemplateStr, hasAuth bool, allModels map[string]*ast.ModelDecl) {
-	hasHash := false
-	// Check CRUD models for @hash
-	for _, m := range models {
-		for _, f := range m.Fields {
-			if hasDirective(f.Directives, "hash") {
-				hasHash = true
-			}
-		}
-	}
-	// Also check all models (for compiled APIs referencing @hash fields)
-	if !hasHash {
-		for _, m := range allModels {
-			for _, f := range m.Fields {
-				if hasDirective(f.Directives, "hash") {
-					hasHash = true
-					break
-				}
-			}
-			if hasHash {
-				break
-			}
-		}
-	}
+func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*ast.ModelDecl, hasOrGroups, hasSortable, hasAwait, hasTransaction, hasTemplateStr, hasAuth bool) {
+	hasHash := scanModelsForHash(models)
+	hasTime := scanForTimeImport(result, models)
+	needsJSON := scanModelsForJSON(models)
+
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
 	b.WriteString("\t\"fmt\"\n")
@@ -343,7 +303,14 @@ func writeHandlerImports(b *strings.Builder, models []*ast.ModelDecl, hasOrGroup
 	if hasSortable || hasTemplateStr {
 		b.WriteString("\t\"strings\"\n")
 	}
-	b.WriteString("\n\t\"encoding/json\"\n")
+	if hasTime {
+		b.WriteString("\t\"time\"\n")
+	}
+	if needsJSON {
+		b.WriteString("\n\t\"encoding/json\"\n")
+	} else {
+		b.WriteString("\n")
+	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
@@ -1345,4 +1312,94 @@ func pluralize(name string) string {
 		return name[:len(name)-1] + "ies"
 	}
 	return name + "s"
+}
+
+// detectAuthNeeded checks if luvia import is needed in handler.gen.go.
+func detectAuthNeeded(result *semantic.Result, models []*ast.ModelDecl) bool {
+	for _, m := range models {
+		if hasDirective(m.Directives, "withAuth") {
+			return true
+		}
+	}
+	for _, file := range result.Files {
+		for _, api := range file.APIs {
+			if hasDirective(api.Directives, "auth") && !hasDirective(api.Directives, "native") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// scanModelsForHash checks if any CRUD model has @hash fields AND generates write operations.
+// Only returns true when generated code will actually call luxocrypto.HashPassword.
+func scanModelsForHash(models []*ast.ModelDecl) bool {
+	for _, m := range models {
+		if !hasCrud(m) {
+			continue
+		}
+		hasHash := false
+		for _, f := range m.Fields {
+			if hasDirective(f.Directives, "hash") {
+				hasHash = true
+				break
+			}
+		}
+		if !hasHash {
+			continue
+		}
+		// Only need luxocrypto if CRUD includes write operations
+		for _, op := range crudOperations(m) {
+			if op == "create" || op == "update" || op == "createMany" || op == "updateMany" || op == "upsert" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// scanForTimeImport checks if generated handler code will emit time.* identifiers.
+// Covers: CRUD model DateTime/Duration fields + native fn/api Duration params.
+func scanForTimeImport(result *semantic.Result, models []*ast.ModelDecl) bool {
+	for _, m := range models {
+		for _, f := range m.Fields {
+			if f.Type != nil && (f.Type.Name == "DateTime" || f.Type.Name == "Duration") {
+				return true
+			}
+		}
+	}
+	for _, file := range result.Files {
+		for _, fn := range file.Functions {
+			for _, p := range fn.Params {
+				if p.Type != nil && (p.Type.Name == "DateTime" || p.Type.Name == "Duration") {
+					return true
+				}
+			}
+		}
+		for _, api := range file.APIs {
+			for _, p := range api.Params {
+				if p.Type != nil && (p.Type.Name == "DateTime" || p.Type.Name == "Duration") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// scanModelsForJSON checks if any CRUD model has deleteMany with non-standard ID type.
+func scanModelsForJSON(models []*ast.ModelDecl) bool {
+	for _, m := range models {
+		if hasCrud(m) {
+			idType := idGoType(m)
+			if idType != "int64" && idType != "string" {
+				for _, op := range crudOperations(m) {
+					if op == "deleteMany" {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
 }

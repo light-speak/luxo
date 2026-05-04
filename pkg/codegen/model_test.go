@@ -406,5 +406,28 @@ func TestGenerateExtendStubWithComputed(t *testing.T) {
 	}
 }
 
+func TestGenerateExtendStubAutoId(t *testing.T) {
+	// extend without explicit id — should auto-inject Id int64
+	// Use short field name "x" with type "bool" (4 chars < "int64" 5 chars)
+	// so Id/int64 become the longest columns (covers maxName/maxType branches)
+	ext := &ast.ExtendDecl{
+		Name: "T",
+		Fields: []*ast.FieldDecl{
+			{Name: "x", Type: &ast.TypeRef{Name: "Boolean"}},
+		},
+	}
+
+	var b strings.Builder
+	generateExtendStub(&b, ext)
+	got := b.String()
+
+	if !strings.Contains(got, "Id") || !strings.Contains(got, "int64") {
+		t.Errorf("extend stub without id should auto-inject Id int64:\n%s", got)
+	}
+	if !strings.Contains(got, `db:"id"`) {
+		t.Errorf("auto Id should have db tag:\n%s", got)
+	}
+}
+
 // suppress unused import warning
 var _ = token.Position{}

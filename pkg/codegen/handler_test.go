@@ -1706,13 +1706,15 @@ func TestWriteHandlerImportsAllFeatures(t *testing.T) {
 	var b strings.Builder
 	models := []*ast.ModelDecl{
 		{
-			Name: "User",
+			Name:       "User",
+			Directives: []*ast.Directive{{Name: "crud"}},
 			Fields: []*ast.FieldDecl{
 				{Name: "password", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hash"}}},
 			},
 		},
 	}
-	writeHandlerImports(&b, models, true, true, true, true, true, true, nil)
+	result := &semantic.Result{Files: []*ast.File{{}}}
+	writeHandlerImports(&b, result, models, true, true, true, true, true, true)
 	out := b.String()
 	if !strings.Contains(out, `"strconv"`) {
 		t.Fatalf("hasOrGroups should add strconv import, got:\n%s", out)
@@ -1731,23 +1733,82 @@ func TestWriteHandlerImportsAllFeatures(t *testing.T) {
 	}
 }
 
-// ─── writeHandlerImports: hash field in allModels (not in CRUD models) ──────
+// ─── writeHandlerImports: hash only when CRUD has write ops ──────
 
-func TestWriteHandlerImportsHashInAllModels(t *testing.T) {
+func TestWriteHandlerImportsNoHashWithoutWriteOps(t *testing.T) {
 	var b strings.Builder
-	allModels := map[string]*ast.ModelDecl{
-		"User": {
-			Name: "User",
-			Fields: []*ast.FieldDecl{
-				{Name: "password", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hash"}}},
-			},
+	result := &semantic.Result{Files: []*ast.File{{}}}
+	// Model has @hash but CRUD only has get/list (no create/update) — no luxocrypto needed
+	models := []*ast.ModelDecl{{
+		Name: "User",
+		Directives: []*ast.Directive{{
+			Name: "crud",
+			Args: []*ast.NamedArg{{
+				Name:  "only",
+				Value: &ast.ListExpr{Items: []ast.Expr{&ast.Ident{Name: "get"}, &ast.Ident{Name: "list"}}},
+			}},
+		}},
+		Fields: []*ast.FieldDecl{
+			{Name: "password", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hash"}}},
 		},
-	}
-	// No CRUD models with hash, but allModels has one
-	writeHandlerImports(&b, nil, false, false, false, false, false, false, allModels)
+	}}
+	writeHandlerImports(&b, result, models, false, false, false, false, false, false)
 	out := b.String()
-	if !strings.Contains(out, "luxocrypto") {
-		t.Fatalf("allModels hash should add luxocrypto import, got:\n%s", out)
+	if strings.Contains(out, "luxocrypto") {
+		t.Fatalf("read-only CRUD with @hash should not add luxocrypto, got:\n%s", out)
+	}
+}
+
+func TestScanModelsForHash_NoCrud(t *testing.T) {
+	// Model without @crud — should not trigger hash import
+	models := []*ast.ModelDecl{{
+		Name: "Config",
+		Fields: []*ast.FieldDecl{
+			{Name: "secret", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hash"}}},
+		},
+	}}
+	if scanModelsForHash(models) {
+		t.Error("model without @crud should not trigger hash import")
+	}
+}
+
+func TestScanModelsForHash_CrudNoHash(t *testing.T) {
+	// CRUD model without @hash — should not trigger
+	models := []*ast.ModelDecl{{
+		Name:       "Post",
+		Directives: []*ast.Directive{{Name: "crud"}},
+		Fields: []*ast.FieldDecl{
+			{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}}
+	if scanModelsForHash(models) {
+		t.Error("CRUD model without @hash should not trigger hash import")
+	}
+}
+
+func TestScanForTimeImport_FnDurationParam(t *testing.T) {
+	// fn with Duration param — should trigger time import
+	result := &semantic.Result{Files: []*ast.File{{
+		Functions: []*ast.FnDecl{{
+			Name:   "sleep",
+			Params: []*ast.ParamDecl{{Name: "d", Type: &ast.TypeRef{Name: "Duration"}}},
+		}},
+	}}}
+	if !scanForTimeImport(result, nil) {
+		t.Error("fn with Duration param should trigger time import")
+	}
+}
+
+func TestScanForTimeImport_ApiDateTimeParam(t *testing.T) {
+	// API with DateTime param
+	result := &semantic.Result{Files: []*ast.File{{
+		APIs: []*ast.ApiDecl{{
+			Name:   "listByDate",
+			Params: []*ast.ParamDecl{{Name: "since", Type: &ast.TypeRef{Name: "DateTime"}}},
+		}},
+	}}}
+	if !scanForTimeImport(result, nil) {
+		t.Error("API with DateTime param should trigger time import")
 	}
 }
 
