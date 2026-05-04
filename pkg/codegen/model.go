@@ -73,6 +73,24 @@ func generateExtendStub(b *strings.Builder, ext *ast.ExtendDecl) {
 
 	fmt.Fprintf(b, "// %s is a stub for the external %s model (from extend).\n", ext.Name, ext.Name)
 	fmt.Fprintf(b, "type %s struct {\n", ext.Name)
+	// Always include Id field — extend stubs need it for foreign key references and dataloader
+	hasId := false
+	for _, fi := range fields {
+		if fi.goName == "Id" {
+			hasId = true
+		}
+	}
+	if !hasId {
+		idName := "Id"
+		idType := "int64"
+		if len(idName) > maxName {
+			maxName = len(idName)
+		}
+		if len(idType) > maxType {
+			maxType = len(idType)
+		}
+		fmt.Fprintf(b, "\t%-*s %-*s `db:%q json:%q`\n", maxName, idName, maxType, idType, "id", "id")
+	}
 	for _, fi := range fields {
 		fmt.Fprintf(b, "\t%-*s %-*s `db:%q json:%q`\n",
 			maxName, fi.goName,
