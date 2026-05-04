@@ -1759,6 +1759,59 @@ func TestWriteHandlerImportsNoHashWithoutWriteOps(t *testing.T) {
 	}
 }
 
+func TestScanModelsForHash_NoCrud(t *testing.T) {
+	// Model without @crud — should not trigger hash import
+	models := []*ast.ModelDecl{{
+		Name: "Config",
+		Fields: []*ast.FieldDecl{
+			{Name: "secret", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hash"}}},
+		},
+	}}
+	if scanModelsForHash(models) {
+		t.Error("model without @crud should not trigger hash import")
+	}
+}
+
+func TestScanModelsForHash_CrudNoHash(t *testing.T) {
+	// CRUD model without @hash — should not trigger
+	models := []*ast.ModelDecl{{
+		Name:       "Post",
+		Directives: []*ast.Directive{{Name: "crud"}},
+		Fields: []*ast.FieldDecl{
+			{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}}
+	if scanModelsForHash(models) {
+		t.Error("CRUD model without @hash should not trigger hash import")
+	}
+}
+
+func TestScanForTimeImport_FnDurationParam(t *testing.T) {
+	// fn with Duration param — should trigger time import
+	result := &semantic.Result{Files: []*ast.File{{
+		Functions: []*ast.FnDecl{{
+			Name:   "sleep",
+			Params: []*ast.ParamDecl{{Name: "d", Type: &ast.TypeRef{Name: "Duration"}}},
+		}},
+	}}}
+	if !scanForTimeImport(result, nil) {
+		t.Error("fn with Duration param should trigger time import")
+	}
+}
+
+func TestScanForTimeImport_ApiDateTimeParam(t *testing.T) {
+	// API with DateTime param
+	result := &semantic.Result{Files: []*ast.File{{
+		APIs: []*ast.ApiDecl{{
+			Name:   "listByDate",
+			Params: []*ast.ParamDecl{{Name: "since", Type: &ast.TypeRef{Name: "DateTime"}}},
+		}},
+	}}}
+	if !scanForTimeImport(result, nil) {
+		t.Error("API with DateTime param should trigger time import")
+	}
+}
+
 // ─── detectHandlerFeatures: sortable field ──────────────────────────────────
 
 func TestDetectHandlerFeaturesSortable(t *testing.T) {
