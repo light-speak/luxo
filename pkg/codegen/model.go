@@ -44,6 +44,18 @@ func generateModel(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) 
 		}
 	}
 	b.WriteString("}\n")
+
+	// Generate VerifyPassword methods for @hash fields
+	for _, f := range m.Fields {
+		if hasDirective(f.Directives, "hash") {
+			goField := str.Capitalize(f.Name)
+			methodName := "Verify" + goField
+			recv := strings.ToLower(m.Name[:1])
+			fmt.Fprintf(b, "\nfunc (%s *%s) %s(plaintext string) bool {\n", recv, m.Name, methodName)
+			fmt.Fprintf(b, "\treturn luxocrypto.VerifyPassword(plaintext, %s.%s)\n", recv, goField)
+			fmt.Fprintf(b, "}\n")
+		}
+	}
 }
 
 // generateExtendStub generates a minimal Go struct for an extend declaration.

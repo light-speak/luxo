@@ -6577,3 +6577,30 @@ func TestCompileFieldExpr_MemberNonIt(t *testing.T) {
 		t.Errorf("non-it member should return empty, got %q", got)
 	}
 }
+
+func TestCompileBangElvisGuard(t *testing.T) {
+	c := newCompiler(nil)
+	c.indent = "\t\t"
+	e := &ast.BangElvisExpr{
+		Left:  &ast.Ident{Name: "exists"},
+		Right: &ast.Ident{Name: "AlreadySetup"},
+	}
+	c.compileBangElvisGuard(e)
+	out := c.b.String()
+	if !strings.Contains(out, "if exists {") {
+		t.Errorf("should check if true: %s", out)
+	}
+	if !strings.Contains(out, "NewAlreadySetup()") {
+		t.Errorf("should compile throw: %s", out)
+	}
+}
+
+func TestCompileBangElvisExpr(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.BangElvisExpr{
+		Left: &ast.Ident{Name: "x"},
+	})
+	if !strings.Contains(got, "!:") {
+		t.Errorf("expr should contain !: marker, got %q", got)
+	}
+}

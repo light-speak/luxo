@@ -54,6 +54,7 @@ const (
 	DotDot        // ..
 	DotDotDot     // ...
 	Elvis         // ?:
+	BangElvis     // !:
 	SafeDot       // ?.
 	ChanSend      // <-
 	PlusAssign    // +=
@@ -157,6 +158,7 @@ var tokenNames = map[Type]string{
 	DotDot:        "..",
 	DotDotDot:     "...",
 	Elvis:         "?:",
+	BangElvis:     "!:",
 	SafeDot:       "?.",
 	ChanSend:      "<-",
 	PlusAssign:    "+=",

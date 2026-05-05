@@ -947,3 +947,35 @@ func TestIsRelationType(t *testing.T) {
 		t.Error("lowercase should not be relation")
 	}
 }
+
+func TestWriteImports_Hash(t *testing.T) {
+	var b strings.Builder
+	files := []*ast.File{{
+		Models: []*ast.ModelDecl{{
+			Name: "User",
+			Fields: []*ast.FieldDecl{
+				{Name: "password", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hash"}}},
+			},
+		}},
+	}}
+	writeImports(&b, files)
+	if !strings.Contains(b.String(), "luxocrypto") {
+		t.Errorf("@hash should import luxocrypto: %s", b.String())
+	}
+}
+
+func TestWriteImports_NoHash(t *testing.T) {
+	var b strings.Builder
+	files := []*ast.File{{
+		Models: []*ast.ModelDecl{{
+			Name: "Post",
+			Fields: []*ast.FieldDecl{
+				{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+			},
+		}},
+	}}
+	writeImports(&b, files)
+	if strings.Contains(b.String(), "luxocrypto") {
+		t.Errorf("no @hash should not import luxocrypto: %s", b.String())
+	}
+}

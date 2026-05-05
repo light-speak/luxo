@@ -1331,6 +1331,11 @@ func (p *Parser) parseInfixExpr(left ast.Expr) ast.Expr {
 		p.advance()
 		return &ast.ElvisExpr{Pos: pos, Left: left, Right: p.parseExpr(precElvis)}
 
+	// BangElvis: expr !: fallback
+	case p.check(token.BangElvis):
+		p.advance()
+		return &ast.BangElvisExpr{Pos: pos, Left: left, Right: p.parseExpr(precElvis)}
+
 	// Range: 1..10
 	case p.check(token.DotDot):
 		p.advance()
@@ -1546,7 +1551,7 @@ func (p *Parser) currentPrec() int {
 		return precOr
 	case token.And:
 		return precAnd
-	case token.Elvis:
+	case token.Elvis, token.BangElvis:
 		return precElvis
 	case token.Eq, token.Neq:
 		return precEquality

@@ -274,6 +274,13 @@ type ElvisExpr struct {
 	Right Expr
 }
 
+// BangElvisExpr: expr !: fallback
+type BangElvisExpr struct {
+	Pos   token.Position
+	Left  Expr
+	Right Expr
+}
+
 // WhenExpr: when(x) { in 90..100 -> "A", else -> "D" }
 type WhenExpr struct {
 	Pos      token.Position
@@ -437,6 +444,7 @@ func (n *CallExpr) exprNode()        {}
 func (n *BinaryExpr) exprNode()      {}
 func (n *UnaryExpr) exprNode()       {}
 func (n *ElvisExpr) exprNode()       {}
+func (n *BangElvisExpr) exprNode()   {}
 func (n *WhenExpr) exprNode()        {}
 func (n *LambdaExpr) exprNode()      {}
 func (n *ListExpr) exprNode()        {}
@@ -468,6 +476,7 @@ func (n *CallExpr) GetPos() token.Position        { return n.Pos }
 func (n *BinaryExpr) GetPos() token.Position      { return n.Pos }
 func (n *UnaryExpr) GetPos() token.Position       { return n.Pos }
 func (n *ElvisExpr) GetPos() token.Position       { return n.Pos }
+func (n *BangElvisExpr) GetPos() token.Position   { return n.Pos }
 func (n *WhenExpr) GetPos() token.Position        { return n.Pos }
 func (n *LambdaExpr) GetPos() token.Position      { return n.Pos }
 func (n *ListExpr) GetPos() token.Position        { return n.Pos }
