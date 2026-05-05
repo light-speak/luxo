@@ -1132,3 +1132,15 @@ func TestParseBangElvis(t *testing.T) {
 		t.Fatalf("expected BangElvisExpr, got %T", es.Expr)
 	}
 }
+
+func TestParseBangElvisInForCondition(t *testing.T) {
+	input := `api test: Boolean {
+  val x = true
+  x !: throw error.Conflict
+  return true
+}`
+	file := parse(t, input)
+	if len(file.APIs) != 1 {
+		t.Fatal("expected 1 API")
+	}
+}

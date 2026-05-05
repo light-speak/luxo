@@ -1517,11 +1517,6 @@ func (p *Parser) parseForCondition() ast.Expr {
 			p.advance()
 			right := p.parseForCondition()
 			left = &ast.ElvisExpr{Pos: pos, Left: left, Right: right}
-		case p.check(token.BangElvis):
-			pos := p.current().Pos
-			p.advance()
-			right := p.parseForCondition()
-			left = &ast.BangElvisExpr{Pos: pos, Left: left, Right: right}
 		default:
 			return left
 		}
