@@ -5737,8 +5737,8 @@ func TestCompileMemberEnumValue(t *testing.T) {
 		Object: &ast.Ident{Name: "Role"},
 		Field:  "admin",
 	})
-	if got != "string(RoleADMIN)" {
-		t.Fatalf("enum member should be string(RoleADMIN), got %q", got)
+	if got != "RoleADMIN" {
+		t.Fatalf("enum member should be RoleADMIN, got %q", got)
 	}
 }
 
