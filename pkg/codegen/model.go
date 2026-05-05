@@ -189,18 +189,25 @@ func mapBaseType(name string) string {
 
 // isAutoManaged returns true if the field value is auto-generated, not user-provided.
 // These fields are skipped in Create/Update builders.
-func isAutoManaged(f *ast.FieldDecl) bool {
-	// @serial — database auto-increment
+// Pass modelDirectives to check for @noTime (model-level directive).
+func isAutoManaged(f *ast.FieldDecl, modelDirectives ...[]*ast.Directive) bool {
 	if hasDirective(f.Directives, "serial") {
 		return true
 	}
-	// @auto — code-level auto-generation (UUID, etc.)
 	if hasDirective(f.Directives, "auto") {
 		return true
 	}
-	// createdAt/updatedAt — auto time.Now() by convention
+	// createdAt/updatedAt — auto time.Now() unless @noTime on model
 	if f.Type != nil && f.Type.Name == "DateTime" {
 		if f.Name == "createdAt" || f.Name == "updatedAt" {
+			// Check if model has @noTime
+			if len(modelDirectives) > 0 {
+				for _, d := range modelDirectives[0] {
+					if d.Name == "noTime" {
+						return false
+					}
+				}
+			}
 			return true
 		}
 	}
@@ -208,8 +215,18 @@ func isAutoManaged(f *ast.FieldDecl) bool {
 }
 
 // isAutoOnUpdate returns true if the field is auto-filled on UPDATE.
-func isAutoOnUpdate(f *ast.FieldDecl) bool {
-	return f.Name == "updatedAt" && f.Type != nil && f.Type.Name == "DateTime"
+func isAutoOnUpdate(f *ast.FieldDecl, modelDirectives ...[]*ast.Directive) bool {
+	if f.Name != "updatedAt" || f.Type == nil || f.Type.Name != "DateTime" {
+		return false
+	}
+	if len(modelDirectives) > 0 {
+		for _, d := range modelDirectives[0] {
+			if d.Name == "noTime" {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // isSoftDelete returns true if the model has @soft directive.

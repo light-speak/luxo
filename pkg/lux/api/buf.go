@@ -13,7 +13,8 @@ const hexDigits = "0123456789abcdef"
 // ResponseBuf is a pooled, zero-allocation response buffer.
 // Uses []byte with direct append — no bytes.Buffer overhead.
 type ResponseBuf struct {
-	B []byte
+	B        []byte
+	Identity any // authenticated user, set by handler for @visible/@mask checks
 }
 
 // bufPool reuses ResponseBuf across requests. Pre-allocates 4KB.
@@ -27,12 +28,14 @@ var bufPool = sync.Pool{
 func GetBuf() *ResponseBuf {
 	buf := bufPool.Get().(*ResponseBuf)
 	buf.B = buf.B[:0]
+	buf.Identity = nil
 	return buf
 }
 
 // PutBuf returns a ResponseBuf to the pool.
 func PutBuf(buf *ResponseBuf) {
-	if cap(buf.B) > 1<<20 { // don't pool buffers > 1MB
+	buf.Identity = nil // clear PII before pooling
+	if cap(buf.B) > 1<<20 {
 		return
 	}
 	bufPool.Put(buf)

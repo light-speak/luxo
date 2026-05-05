@@ -150,3 +150,15 @@ func FloatToString(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64
 
 // BoolToString converts a bool to "true" or "false".
 func BoolToString(v bool) string { return strconv.FormatBool(v) }
+
+// StringToInt converts a string to int64. Returns 0 on parse error. Zero allocation.
+func StringToInt(s string) int64 {
+	v, _ := strconv.ParseInt(s, 10, 64)
+	return v
+}
+
+// StringToFloat converts a string to float64. Returns 0 on parse error. Zero allocation.
+func StringToFloat(s string) float64 {
+	v, _ := strconv.ParseFloat(s, 64)
+	return v
+}

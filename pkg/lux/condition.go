@@ -491,3 +491,38 @@ func (c *rawCond) ToSQL(argOffset int) (string, []any) {
 	}
 	return "(" + b.String() + ")", c.args
 }
+
+// SearchBuilder generates search SQL for a specific database backend.
+// Default: PostgreSQL tsvector/tsquery. Override for MySQL FULLTEXT, ES, etc.
+type SearchBuilder func(col string, argOffset int) string
+
+// DefaultSearchBuilder generates PostgreSQL full-text search SQL.
+var DefaultSearchBuilder SearchBuilder = func(col string, argOffset int) string {
+	return "to_tsvector('simple', " + col + ") @@ plainto_tsquery('simple', $" + strconv.Itoa(argOffset) + ")"
+}
+
+// SearchField provides full-text search conditions for @search columns.
+// Pluggable: set DefaultSearchBuilder to change backend (PG/MySQL/ES).
+type SearchField struct{ col string }
+
+// NewSearchField creates a SearchField for the given column.
+func NewSearchField(col string) SearchField { return SearchField{col: col} }
+
+// Match generates a full-text search condition using the configured backend.
+func (f SearchField) Match(query string) Condition {
+	return &searchCond{col: f.col, query: query}
+}
+
+// FilterOp applies a search filter (used by @filterable @search).
+func (f SearchField) FilterOp(op, val string) Condition {
+	return f.Match(val)
+}
+
+type searchCond struct {
+	col   string
+	query string
+}
+
+func (c *searchCond) ToSQL(offset int) (string, []any) {
+	return DefaultSearchBuilder(c.col, offset), []any{c.query}
+}

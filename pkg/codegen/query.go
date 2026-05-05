@@ -173,6 +173,34 @@ func (c *%sClient) CreateMany() *%sCreateManyBuilder {
 `, name, name, name, name, tableName, scanFn,
 		name, name, name, tableName)
 
+	// Count — returns total count (optionally with conditions)
+	if soft {
+		fmt.Fprintf(b, `// Count returns the number of non-deleted records matching conditions.
+func (c *%sClient) Count(ctx context.Context, conds ...lux.Condition) (int64, error) {
+	conds = append(conds, lux.NewTimeField("deleted_at").IsNull())
+	return pg.NewQuery[%s](c.db, %q, %s, conds).Count(ctx)
+}
+
+// Exists returns true if any non-deleted record matches conditions.
+func (c *%sClient) Exists(ctx context.Context, conds ...lux.Condition) (bool, error) {
+	return c.Where(conds...).Exists(ctx)
+}
+
+`, name, name, tableName, scanFn, name)
+	} else {
+		fmt.Fprintf(b, `// Count returns the number of records matching conditions.
+func (c *%sClient) Count(ctx context.Context, conds ...lux.Condition) (int64, error) {
+	return pg.NewQuery[%s](c.db, %q, %s, conds).Count(ctx)
+}
+
+// Exists returns true if any record matches conditions.
+func (c *%sClient) Exists(ctx context.Context, conds ...lux.Condition) (bool, error) {
+	return c.Where(conds...).Exists(ctx)
+}
+
+`, name, name, tableName, scanFn, name)
+	}
+
 	// @soft: SoftDelete and ForceDelete
 	if soft {
 		fmt.Fprintf(b, `// SoftDelete marks matching records as deleted (sets deleted_at).

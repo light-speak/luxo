@@ -340,9 +340,8 @@ func compileStreamExpr(expr ast.Expr, params map[string]*ast.ParamDecl) string {
 	case *ast.BinaryExpr:
 		left := compileStreamExpr(e.Left, params)
 		right := compileStreamExpr(e.Right, params)
-		// Infer my.field type from comparison context: if comparing with string → use IdentityString
-		left = inferIdentityType(left, e.Left, e.Right)
-		right = inferIdentityType(right, e.Right, e.Left)
+		left = inferMyFieldType(left, e.Left, e.Right, "identity")
+		right = inferMyFieldType(right, e.Right, e.Left, "identity")
 		return fmt.Sprintf("%s %s %s", left, e.Op, right)
 
 	case *ast.UnaryExpr:
@@ -354,11 +353,7 @@ func compileStreamExpr(expr ast.Expr, params map[string]*ast.ParamDecl) string {
 			return "ev_" + e.Field
 		}
 		if ident, ok := e.Object.(*ast.Ident); ok && ident.Name == "my" {
-			if e.Field == "id" {
-				return "api.IdentityID(identity)"
-			}
-			// Default to Int unless called via WithHint and hint is string
-			return fmt.Sprintf("api.IdentityInt(identity, %q)", e.Field)
+			return compileMyField(e.Field, "identity")
 		}
 		obj := compileStreamExpr(e.Object, params)
 		return fmt.Sprintf("%s.%s", obj, str.Capitalize(e.Field))
@@ -435,21 +430,4 @@ func streamParamMethod(luxoType string) string {
 	}
 }
 
-// inferIdentityType checks if compiled code is api.IdentityInt but the comparison
-// other side is a string (literal or String param) — if so, switch to IdentityString.
-func inferIdentityType(compiled string, self ast.Expr, other ast.Expr) string {
-	// Only apply to my.field (non-id) expressions
-	me, ok := self.(*ast.MemberExpr)
-	if !ok {
-		return compiled
-	}
-	ident, ok := me.Object.(*ast.Ident)
-	if !ok || ident.Name != "my" || me.Field == "id" {
-		return compiled
-	}
-	// Check if the other side is a string literal
-	if lit, ok := other.(*ast.Literal); ok && lit.Kind == token.String {
-		return fmt.Sprintf("api.IdentityString(identity, %q)", me.Field)
-	}
-	return compiled
-}
+// Removed: inferIdentityType — now uses shared inferMyFieldType from identity.go

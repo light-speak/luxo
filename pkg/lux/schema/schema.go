@@ -51,13 +51,15 @@ const (
 
 // API describes an API's params and return type.
 type API struct {
-	ID         int     `json:"id"`
-	Name       string  `json:"name"`
-	Module     string  `json:"module"`
-	ReturnType string  `json:"returnType,omitempty"`
-	ReturnList bool    `json:"returnList,omitempty"`
-	Paginated  bool    `json:"paginated,omitempty"`
-	Params     []Param `json:"params,omitempty"`
+	ID               int     `json:"id"`
+	Name             string  `json:"name"`
+	Module           string  `json:"module"`
+	ReturnType       string  `json:"returnType,omitempty"`
+	ReturnList       bool    `json:"returnList,omitempty"`
+	Paginated        bool    `json:"paginated,omitempty"`
+	Params           []Param `json:"params,omitempty"`
+	Deprecated       bool    `json:"deprecated,omitempty"`
+	DeprecatedReason string  `json:"deprecatedReason,omitempty"`
 }
 
 // Param describes an API parameter.

@@ -7,6 +7,7 @@ import (
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lux/str"
 	"github.com/light-speak/luxo/pkg/semantic"
+	"github.com/light-speak/luxo/pkg/token"
 )
 
 // generateWriteJSONFile produces writejson.gen.go containing per-model
@@ -161,9 +162,18 @@ func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bo
 
 		fmt.Fprintf(b, "\tif codec.FieldMaskHas(mask, %d) {\n", fieldID)
 
+		// @visible: conditional field visibility based on identity
+		hasVisible := writeVisibleDirective(b, f)
+
 		goField := recv + "." + str.Capitalize(f.Name)
 		baseType := f.Type.Name
 		fid := fmt.Sprintf("%d", fieldID)
+
+		// @transform: apply value transformation before writing
+		goField = writeTransformDirective(b, f, goField)
+
+		// @mask: apply masking before writing string fields
+		goField = writeMaskDirective(b, f, goField, baseType)
 
 		// All fields write directly to buf.B — zero intermediate buffer
 		if enums[f.Type.Name] {
@@ -178,6 +188,9 @@ func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bo
 			} else {
 				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
 				fmt.Fprintf(b, "\t\tbuf.B = codec.AppendString(buf.B, string(%s))\n", goField)
+			}
+			if hasVisible {
+				b.WriteString("\t }\n")
 			}
 			b.WriteString("\t}\n")
 			continue
@@ -264,6 +277,9 @@ func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bo
 			}
 		default:
 			fmt.Fprintf(b, "\t\t// TODO: binary encoding for type %s (field %s)\n", baseType, f.Name)
+		}
+		if hasVisible {
+			b.WriteString("\t }\n")
 		}
 		b.WriteString("\t}\n")
 	}
@@ -568,3 +584,94 @@ func writeColumnarNullableField(b *strings.Builder, goName string, fieldID int, 
 		fmt.Fprintf(b, "\t\tw.WriteColumnBoolPtr(%d, vals)\n\t}\n", fieldID)
 	}
 }
+
+// writeMaskDirective generates @mask logic for a field. Returns the (possibly modified) goField name.
+func writeMaskDirective(b *strings.Builder, f *ast.FieldDecl, goField, baseType string) string {
+	maskDir := findDirective(f.Directives, "mask")
+	if maskDir == nil || baseType != "String" || f.Type.Nullable {
+		return goField
+	}
+	maskedVar := f.Name + "Masked"
+	if hasDirective(f.Directives, "email") {
+		fmt.Fprintf(b, "\t\t%s := str.MaskEmail(%s)\n", maskedVar, goField)
+	} else if len(maskDir.Args) >= 2 {
+		prefixLit, _ := maskDir.Args[0].Value.(*ast.Literal)
+		suffixLit, _ := maskDir.Args[1].Value.(*ast.Literal)
+		if prefixLit != nil && suffixLit != nil {
+			fmt.Fprintf(b, "\t\t%s := str.Mask(%s, %s, %s)\n", maskedVar, goField, prefixLit.Value, suffixLit.Value)
+		} else {
+			return goField
+		}
+	} else {
+		fmt.Fprintf(b, "\t\t%s := str.Mask(%s, 3, 4)\n", maskedVar, goField)
+	}
+	return maskedVar
+}
+
+// writeVisibleDirective generates @visible condition check.
+// @visible { my.role == "admin" } → skip field if identity doesn't match.
+func writeVisibleDirective(b *strings.Builder, f *ast.FieldDecl) bool {
+	visibleDir := findDirective(f.Directives, "visible")
+	if visibleDir == nil || visibleDir.Body == nil || len(visibleDir.Body.Stmts) == 0 {
+		return false
+	}
+	es, ok := visibleDir.Body.Stmts[0].(*ast.ExprStmt)
+	if !ok || es.Expr == nil {
+		return false
+	}
+	cond := compileVisibleExpr(es.Expr)
+	if cond == "" {
+		return false
+	}
+	fmt.Fprintf(b, "\t if %s {\n", cond)
+	return true
+}
+
+// compileVisibleExpr compiles a @visible body expression to Go.
+// Supports: my.role == "admin", my.id == someField
+func compileVisibleExpr(expr ast.Expr) string {
+	switch e := expr.(type) {
+	case *ast.BinaryExpr:
+		left := compileVisibleExpr(e.Left)
+		right := compileVisibleExpr(e.Right)
+		if left == "" || right == "" {
+			return ""
+		}
+		left = inferMyFieldType(left, e.Left, e.Right, "buf.Identity")
+		right = inferMyFieldType(right, e.Right, e.Left, "buf.Identity")
+		return fmt.Sprintf("%s %s %s", left, e.Op, right)
+	case *ast.MemberExpr:
+		if ident, ok := e.Object.(*ast.Ident); ok && ident.Name == "my" {
+			return compileMyField(e.Field, "buf.Identity")
+		}
+	case *ast.Literal:
+		if e.Kind == token.String {
+			return fmt.Sprintf("%q", e.Value)
+		}
+		return e.Value
+	case *ast.Ident:
+		return e.Name
+	}
+	return ""
+}
+
+// writeTransformDirective generates @transform { body } value transformation.
+func writeTransformDirective(b *strings.Builder, f *ast.FieldDecl, goField string) string {
+	transformDir := findDirective(f.Directives, "transform")
+	if transformDir == nil || transformDir.Body == nil || len(transformDir.Body.Stmts) == 0 {
+		return goField
+	}
+	es, ok := transformDir.Body.Stmts[0].(*ast.ExprStmt)
+	if !ok || es.Expr == nil {
+		return goField
+	}
+	code := compileFieldExpr(es.Expr, goField)
+	if code == "" {
+		return goField
+	}
+	transformedVar := f.Name + "Transformed"
+	fmt.Fprintf(b, "\t\t%s := %s\n", transformedVar, code)
+	return transformedVar
+}
+
+// Removed: inferVisibleIdentityType — now uses shared inferMyFieldType from identity.go

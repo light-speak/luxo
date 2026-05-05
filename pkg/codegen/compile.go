@@ -423,6 +423,11 @@ func (c *compiler) compileBlockExpr(expr ast.Expr) string {
 		return ""
 	case *ast.ForStmt:
 		return c.compileForExpr(e)
+	case *ast.YieldExpr:
+		val := c.compileExpr(e.Value)
+		c.write("_yieldResult = %s\n", val)
+		c.write("break\n")
+		return "_yieldResult"
 	default:
 		return fmt.Sprintf("/* TODO: %T */", expr)
 	}
@@ -450,9 +455,16 @@ func (c *compiler) compileMember(e *ast.MemberExpr) string {
 		if ident.Name == "error" {
 			return fmt.Sprintf("errors.%s", str.Capitalize(e.Field))
 		}
-		// Enum.VALUE → string(EnumVALUE) (Go enum constant, cast for Where conditions)
+		// my.id → identity.ID(), my.field → identity.String("field")
+		if ident.Name == "my" {
+			if e.Field == "id" {
+				return "identity.ID()"
+			}
+			return fmt.Sprintf("identity.String(%q)", e.Field)
+		}
+		// Enum.VALUE → EnumVALUE (Go enum constant)
 		if c.enums[ident.Name] {
-			return "string(" + ident.Name + strings.ToUpper(e.Field) + ")"
+			return ident.Name + strings.ToUpper(e.Field)
 		}
 	}
 	obj := c.compileExpr(e.Object)
@@ -461,6 +473,11 @@ func (c *compiler) compileMember(e *ast.MemberExpr) string {
 
 // compileCall: handles Model.where(...).first(), Model.create(...), etc.
 func (c *compiler) compileCall(e *ast.CallExpr) string {
+	// String methods: obj.lowercase() → strings.ToLower(obj)
+	if result := c.compileStringMethod(e); result != "" {
+		return result
+	}
+
 	// Channel(n) → make(chan any, n)
 	if ident, ok := e.Func.(*ast.Ident); ok && ident.Name == "Channel" {
 		size := "0"
@@ -732,6 +749,12 @@ func (c *compiler) compileWhereArg(modelName string, expr ast.Expr) string {
 
 	field := ""
 	val := c.compileExpr(bin.Right)
+	// Enum values need string() cast for Where conditions (StringField.Eq expects string)
+	if member, ok := bin.Right.(*ast.MemberExpr); ok {
+		if ident, ok := member.Object.(*ast.Ident); ok && c.enums[ident.Name] {
+			val = "string(" + val + ")"
+		}
+	}
 
 	// it.field == value → field from member expr
 	if member, ok := bin.Left.(*ast.MemberExpr); ok {
@@ -797,6 +820,12 @@ func (c *compiler) compileThrowExpr(expr ast.Expr) string {
 		// error.NotFound → errors.NotFound
 		if ident, ok := e.Object.(*ast.Ident); ok && ident.Name == "error" {
 			return fmt.Sprintf("errors.%s", str.Capitalize(e.Field))
+		}
+		return c.compileExpr(expr)
+	case *ast.Ident:
+		// AlreadySetup → NewAlreadySetup() (custom error without args, PascalCase)
+		if len(e.Name) > 0 && e.Name[0] >= 'A' && e.Name[0] <= 'Z' {
+			return fmt.Sprintf("New%s()", e.Name)
 		}
 		return c.compileExpr(expr)
 	case *ast.CallExpr:
@@ -1569,4 +1598,119 @@ func (c *compiler) compileAwaitStmt(e *ast.AwaitExpr) {
 	for _, stmt := range afterStmts {
 		c.compileStmt(stmt)
 	}
+}
+
+// compileStringMethod compiles Luxo string methods to Go standard library calls.
+// Returns "" if the call is not a recognized string method.
+func (c *compiler) compileStringMethod(e *ast.CallExpr) string {
+	member, ok := e.Func.(*ast.MemberExpr)
+	if !ok {
+		return ""
+	}
+	obj := c.compileExpr(member.Object)
+	arg := func(i int) string {
+		if i < len(e.Args) {
+			return c.compileExpr(e.Args[i].Value)
+		}
+		return ""
+	}
+	nargs := len(e.Args)
+
+	if result := compileStringTransform(member.Field, obj, arg, nargs); result != "" {
+		return result
+	}
+	if result := compileStringQuery(member.Field, obj, arg, nargs); result != "" {
+		return result
+	}
+	return compileStringConvert(member.Field, obj)
+}
+
+// compileStringTransform handles string transform methods (returns string).
+func compileStringTransform(method, obj string, arg func(int) string, nargs int) string {
+	switch method {
+	case "lowercase":
+		return fmt.Sprintf("strings.ToLower(%s)", obj)
+	case "uppercase":
+		return fmt.Sprintf("strings.ToUpper(%s)", obj)
+	case "trim":
+		return fmt.Sprintf("strings.TrimSpace(%s)", obj)
+	case "trimStart":
+		if nargs > 0 {
+			return fmt.Sprintf("strings.TrimLeft(%s, %s)", obj, arg(0))
+		}
+		return fmt.Sprintf("strings.TrimLeft(%s, \" \")", obj)
+	case "trimEnd":
+		if nargs > 0 {
+			return fmt.Sprintf("strings.TrimRight(%s, %s)", obj, arg(0))
+		}
+		return fmt.Sprintf("strings.TrimRight(%s, \" \")", obj)
+	case "reversed":
+		return fmt.Sprintf("str.Reverse(%s)", obj)
+	case "replace", "replaceAll":
+		if nargs >= 2 {
+			return fmt.Sprintf("strings.ReplaceAll(%s, %s, %s)", obj, arg(0), arg(1))
+		}
+	case "substring":
+		if nargs >= 2 {
+			return fmt.Sprintf("%s[%s:%s]", obj, arg(0), arg(1))
+		}
+		if nargs == 1 {
+			return fmt.Sprintf("%s[%s:]", obj, arg(0))
+		}
+	case "repeat":
+		if nargs > 0 {
+			return fmt.Sprintf("strings.Repeat(%s, int(%s))", obj, arg(0))
+		}
+	case "padStart":
+		if nargs >= 2 {
+			return fmt.Sprintf("str.PadLeft(%s, int(%s), %s)", obj, arg(0), arg(1))
+		}
+	case "padEnd":
+		if nargs >= 2 {
+			return fmt.Sprintf("str.PadRight(%s, int(%s), %s)", obj, arg(0), arg(1))
+		}
+	case "split":
+		if nargs > 0 {
+			return fmt.Sprintf("strings.Split(%s, %s)", obj, arg(0))
+		}
+	}
+	return ""
+}
+
+// compileStringQuery handles string query methods (returns bool/int).
+func compileStringQuery(method, obj string, arg func(int) string, nargs int) string {
+	switch method {
+	case "contains":
+		if nargs > 0 {
+			return fmt.Sprintf("strings.Contains(%s, %s)", obj, arg(0))
+		}
+	case "startsWith":
+		if nargs > 0 {
+			return fmt.Sprintf("strings.HasPrefix(%s, %s)", obj, arg(0))
+		}
+	case "endsWith":
+		if nargs > 0 {
+			return fmt.Sprintf("strings.HasSuffix(%s, %s)", obj, arg(0))
+		}
+	case "isEmpty":
+		return fmt.Sprintf("(len(%s) == 0)", obj)
+	case "matches":
+		if nargs > 0 {
+			return fmt.Sprintf("str.Matches(%s, %s)", arg(0), obj)
+		}
+	case "length", "size":
+		return fmt.Sprintf("int64(len(%s))", obj)
+	}
+	return ""
+}
+
+// compileStringConvert handles string type conversion methods.
+func compileStringConvert(method, obj string) string {
+	switch method {
+	case "toInt":
+		return fmt.Sprintf("convert.StringToInt(%s)", obj)
+	case "toFloat":
+		return fmt.Sprintf("convert.StringToFloat(%s)", obj)
+	}
+	return ""
 }

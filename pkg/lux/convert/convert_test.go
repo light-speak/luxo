@@ -263,3 +263,24 @@ func TestBoolToString(t *testing.T) {
 		t.Errorf("BoolToString(false) = %q, want %q", got, "false")
 	}
 }
+
+func TestStringToInt(t *testing.T) {
+	if got := StringToInt("42"); got != 42 {
+		t.Errorf("got %d", got)
+	}
+	if got := StringToInt("invalid"); got != 0 {
+		t.Errorf("invalid should return 0, got %d", got)
+	}
+	if got := StringToInt(""); got != 0 {
+		t.Errorf("empty should return 0, got %d", got)
+	}
+}
+
+func TestStringToFloat(t *testing.T) {
+	if got := StringToFloat("3.14"); got != 3.14 {
+		t.Errorf("got %f", got)
+	}
+	if got := StringToFloat("invalid"); got != 0 {
+		t.Errorf("invalid should return 0, got %f", got)
+	}
+}

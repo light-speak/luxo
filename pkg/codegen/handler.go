@@ -8,6 +8,7 @@ import (
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lux/str"
 	"github.com/light-speak/luxo/pkg/semantic"
+	"github.com/light-speak/luxo/pkg/token"
 )
 
 // crudOps defines the 6 CRUD operations.
@@ -123,9 +124,12 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	inferredNames := generateInferredHandlers(&b, inferredAPIs, modelMap, enums)
 	compiledNames := generateCompiledHandlers(&b, result, modelMap)
 
+	// Collect API directives for middleware wrapping
+	apiDirectives := collectAPIDirectives(result)
+
 	// RegisterHandlers function (CRUD + inferred + compiled)
 	allInferred := append(inferredNames, compiledNames...)
-	generateRegisterFuncWithInferred(&b, models, allInferred)
+	generateRegisterFuncWithInferred(&b, models, allInferred, apiDirectives)
 
 	// fn @service handlers
 	serviceNames := generateServiceFnHandlers(&b, result, modelMap)
@@ -293,6 +297,7 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 	hasHash := scanModelsForHash(models)
 	hasTime := scanForTimeImport(result, models)
 	needsJSON := scanModelsForJSON(models)
+	hasValidation, hasPattern := scanModelsForValidation(models)
 
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
@@ -300,8 +305,11 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 	if hasOrGroups || hasTemplateStr {
 		b.WriteString("\t\"strconv\"\n")
 	}
-	if hasSortable || hasTemplateStr {
+	if hasSortable || hasTemplateStr || hasValidation {
 		b.WriteString("\t\"strings\"\n")
+	}
+	if hasPattern {
+		b.WriteString("\t\"regexp\"\n")
 	}
 	if hasTime {
 		b.WriteString("\t\"time\"\n")
@@ -457,6 +465,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 			fmt.Fprintf(b, "\t\tif err := resolve%sRelations(ctx, app, result, req.Select); err != nil {\n", name)
 			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 		}
+		generateAggregateFields(b, m, "result", "\t\t")
 		fmt.Fprintf(b, "\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
 		fmt.Fprintf(b, "\t\treturn nil\n")
 		fmt.Fprintf(b, "\t}\n}\n\n")
@@ -688,6 +697,12 @@ func generateParamSet(b *strings.Builder, f *ast.FieldDecl, setter, indent strin
 		fmt.Fprintf(b, "%s}\n", indent)
 	}
 
+	// Field validation directives
+	generateFieldValidation(b, f, varName, indent)
+
+	// @beforeSave: transform field value before persistence
+	generateBeforeSave(b, f, varName, indent)
+
 	// @hash: auto-hash password before save
 	if hasDirective(f.Directives, "hash") {
 		fmt.Fprintf(b, "%s%s, err = luxocrypto.HashPassword(%s)\n", indent, varName, varName)
@@ -858,24 +873,66 @@ func crudAPIName(modelName, op string) string {
 
 // generateRegisterFuncWithInferred generates RegisterHandlers with CRUD + inferred handlers.
 // Also registers API IDs and param metadata for binary protocol routing.
-func generateRegisterFuncWithInferred(b *strings.Builder, models []*ast.ModelDecl, inferredNames []string) {
+// Wraps handlers with @cache/@rateLimit middleware when present.
+func generateRegisterFuncWithInferred(b *strings.Builder, models []*ast.ModelDecl, inferredNames []string, apiDirs map[string][]*ast.Directive) {
 	b.WriteString("// RegisterHandlers registers all API handlers with the router.\n")
 	b.WriteString("func RegisterHandlers(router *api.Router, app *App) {\n")
 
 	for _, m := range models {
 		for _, op := range crudOperations(m) {
 			name := crudAPIName(m.Name, op)
-			fmt.Fprintf(b, "\trouter.Handle(%q, handle%s(app))\n", name, str.Capitalize(name))
+			writeHandlerRegistration(b, name, apiDirs[name])
 			writeAPIRegistration(b, name)
 		}
 	}
 
 	for _, name := range inferredNames {
-		fmt.Fprintf(b, "\trouter.Handle(%q, handle%s(app))\n", name, str.Capitalize(name))
+		writeHandlerRegistration(b, name, apiDirs[name])
 		writeAPIRegistration(b, name)
 	}
 
 	b.WriteString("}\n")
+}
+
+// writeHandlerRegistration writes router.Handle with optional @cache/@rateLimit wrapping.
+func writeHandlerRegistration(b *strings.Builder, name string, directives []*ast.Directive) {
+	handler := fmt.Sprintf("handle%s(app)", str.Capitalize(name))
+
+	// @cache(ttl) wrapping
+	for _, d := range directives {
+		if d.Name == "cache" && len(d.Args) > 0 {
+			if lit, ok := d.Args[0].Value.(*ast.Literal); ok {
+				// ttl is a Duration literal (e.g., "60" seconds or "5m")
+				handler = fmt.Sprintf("api.WithCache(%s*time.Second, %s)", lit.Value, handler)
+			}
+		}
+	}
+
+	// @rateLimit(max, window) wrapping
+	for _, d := range directives {
+		if d.Name == "rateLimit" && len(d.Args) >= 2 {
+			maxLit, _ := d.Args[0].Value.(*ast.Literal)
+			windowLit, _ := d.Args[1].Value.(*ast.Literal)
+			if maxLit != nil && windowLit != nil {
+				handler = fmt.Sprintf("api.WithRateLimit(ratelimit.New(%s, %s*time.Second), %s)", maxLit.Value, windowLit.Value, handler)
+			}
+		}
+	}
+
+	fmt.Fprintf(b, "\trouter.Handle(%q, %s)\n", name, handler)
+}
+
+// collectAPIDirectives collects directives for each API by name.
+func collectAPIDirectives(result *semantic.Result) map[string][]*ast.Directive {
+	m := make(map[string][]*ast.Directive)
+	for _, file := range result.Files {
+		for _, api := range file.APIs {
+			if len(api.Directives) > 0 {
+				m[api.Name] = api.Directives
+			}
+		}
+	}
+	return m
 }
 
 // generateBatchLoadHandlers generates svc:batchLoad:Model RPC endpoints for each model.
@@ -1046,7 +1103,11 @@ func generateFilterParser(b *strings.Builder, m *ast.ModelDecl, enums map[string
 		case "Float":
 			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewFloatField(%q).FilterOp(f.Operator, f.Value))\n", col)
 		case "String":
-			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewStringField(%q).FilterOp(f.Operator, f.Value))\n", col)
+			if hasDirective(f.Directives, "search") {
+				fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewSearchField(%q).FilterOp(f.Operator, f.Value))\n", col)
+			} else {
+				fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewStringField(%q).FilterOp(f.Operator, f.Value))\n", col)
+			}
 		case "Boolean":
 			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewBoolField(%q).FilterOp(f.Operator, f.Value))\n", col)
 		case "DateTime":
@@ -1191,6 +1252,7 @@ func writeAuthCheck(b *strings.Builder, indent string, directives ...*ast.Direct
 	fmt.Fprintf(b, "%sif identity == nil {\n", indent)
 	fmt.Fprintf(b, "%s\treturn errors.Unauthorized\n", indent)
 	fmt.Fprintf(b, "%s}\n", indent)
+	fmt.Fprintf(b, "%sreq.Buf.Identity = identity\n", indent)
 
 	if len(directives) == 0 || directives[0] == nil {
 		return
@@ -1402,4 +1464,208 @@ func scanModelsForJSON(models []*ast.ModelDecl) bool {
 		}
 	}
 	return false
+}
+
+// generateFieldValidation generates validation code for field directives.
+// Runs after param extraction, before setter call.
+func generateFieldValidation(b *strings.Builder, f *ast.FieldDecl, varName, indent string) {
+	isString := f.Type != nil && f.Type.Name == "String"
+	if isString {
+		generateStringValidation(b, f, varName, indent)
+	}
+	if f.Type != nil && (f.Type.Name == "Int" || f.Type.Name == "Float") {
+		generateNumericValidation(b, f, varName, indent)
+	}
+}
+
+func generateStringValidation(b *strings.Builder, f *ast.FieldDecl, varName, indent string) {
+	name := f.Name
+	if hasDirective(f.Directives, "notBlank") {
+		writeValidationCheck(b, indent, name,
+			fmt.Sprintf("strings.TrimSpace(%s) == \"\"", varName), "must not be blank")
+	}
+	if hasDirective(f.Directives, "email") {
+		writeValidationCheck(b, indent, name,
+			fmt.Sprintf("!strings.Contains(%s, \"@\") || !strings.Contains(%s, \".\")", varName, varName), "invalid email format")
+	}
+	for _, d := range f.Directives {
+		if d.Name == "minLength" && len(d.Args) > 0 {
+			if lit, ok := d.Args[0].Value.(*ast.Literal); ok {
+				writeValidationCheck(b, indent, name,
+					fmt.Sprintf("len(%s) < %s", varName, lit.Value), "too short, min "+lit.Value)
+			}
+		}
+		if d.Name == "maxLength" && len(d.Args) > 0 {
+			if lit, ok := d.Args[0].Value.(*ast.Literal); ok {
+				writeValidationCheck(b, indent, name,
+					fmt.Sprintf("len(%s) > %s", varName, lit.Value), "too long, max "+lit.Value)
+			}
+		}
+		if d.Name == "pattern" && len(d.Args) > 0 {
+			if lit, ok := d.Args[0].Value.(*ast.Literal); ok {
+				fmt.Fprintf(b, "%sif matched, _ := regexp.MatchString(%q, %s); !matched {\n", indent, lit.Value, varName)
+				fmt.Fprintf(b, "%s\treturn errors.BadRequest.WithData(errors.ParamError{Param: %q, Error: \"invalid format\"})\n", indent, name)
+				fmt.Fprintf(b, "%s}\n", indent)
+			}
+		}
+	}
+}
+
+func generateNumericValidation(b *strings.Builder, f *ast.FieldDecl, varName, indent string) {
+	for _, d := range f.Directives {
+		if d.Name == "range" && len(d.Args) >= 2 {
+			minLit, minOk := d.Args[0].Value.(*ast.Literal)
+			maxLit, maxOk := d.Args[1].Value.(*ast.Literal)
+			if minOk && maxOk {
+				writeValidationCheck(b, indent, f.Name,
+					fmt.Sprintf("%s < %s || %s > %s", varName, minLit.Value, varName, maxLit.Value),
+					"out of range ["+minLit.Value+", "+maxLit.Value+"]")
+			}
+		}
+	}
+}
+
+func writeValidationCheck(b *strings.Builder, indent, field, cond, errMsg string) {
+	fmt.Fprintf(b, "%sif %s {\n", indent, cond)
+	fmt.Fprintf(b, "%s\treturn errors.BadRequest.WithData(errors.ParamError{Param: %q, Error: %q})\n", indent, field, errMsg)
+	fmt.Fprintf(b, "%s}\n", indent)
+}
+
+// scanModelsForValidation checks if any CRUD model has validation directives.
+// Returns (hasValidation, hasPattern) — hasValidation needs strings, hasPattern needs regexp.
+func scanModelsForValidation(models []*ast.ModelDecl) (bool, bool) {
+	hasValidation := false
+	hasPattern := false
+	for _, m := range models {
+		if !hasCrud(m) {
+			continue
+		}
+		for _, f := range m.Fields {
+			for _, d := range f.Directives {
+				switch d.Name {
+				case "notBlank", "email", "minLength", "maxLength":
+					hasValidation = true
+				case "pattern":
+					hasPattern = true
+					hasValidation = true
+				}
+			}
+		}
+	}
+	return hasValidation, hasPattern
+}
+
+// generateBeforeSave compiles @beforeSave { body } for a field.
+// `it` in the body refers to the field variable.
+func generateBeforeSave(b *strings.Builder, f *ast.FieldDecl, varName, indent string) {
+	for _, d := range f.Directives {
+		if d.Name != "beforeSave" || d.Body == nil || len(d.Body.Stmts) == 0 {
+			continue
+		}
+		es, ok := d.Body.Stmts[0].(*ast.ExprStmt)
+		if !ok || es.Expr == nil {
+			continue
+		}
+		code := compileFieldExpr(es.Expr, varName)
+		if code != "" {
+			fmt.Fprintf(b, "%s%s = %s\n", indent, varName, code)
+		}
+	}
+}
+
+// compileFieldExpr compiles a field-level expression where `it` refers to the field variable.
+func compileFieldExpr(expr ast.Expr, itVar string) string {
+	switch e := expr.(type) {
+	case *ast.CallExpr:
+		if member, ok := e.Func.(*ast.MemberExpr); ok {
+			obj := compileFieldExpr(member.Object, itVar)
+			nargs := len(e.Args)
+			arg := func(i int) string {
+				if i < nargs {
+					return compileFieldExpr(e.Args[i].Value, itVar)
+				}
+				return ""
+			}
+			if result := compileStringTransform(member.Field, obj, arg, nargs); result != "" {
+				return result
+			}
+			if result := compileStringQuery(member.Field, obj, arg, nargs); result != "" {
+				return result
+			}
+			if result := compileStringConvert(member.Field, obj); result != "" {
+				return result
+			}
+		}
+	case *ast.MemberExpr:
+		if ident, ok := e.Object.(*ast.Ident); ok && ident.Name == "it" {
+			return itVar + "." + str.Capitalize(e.Field)
+		}
+	case *ast.Ident:
+		if e.Name == "it" {
+			return itVar
+		}
+		return e.Name
+	case *ast.Literal:
+		if e.Kind == token.Int || e.Kind == token.Float {
+			return e.Value
+		}
+		return fmt.Sprintf("%q", e.Value)
+	}
+	return ""
+}
+
+// generateAggregateFields generates SQL sub-queries for @count/@sum/@avg/@min/@max computed fields.
+func generateAggregateFields(b *strings.Builder, m *ast.ModelDecl, resultVar, indent string) {
+	for _, f := range m.Fields {
+		if f.Computed == nil {
+			continue
+		}
+		for _, d := range f.Computed.Directives {
+			aggFn := ""
+			switch d.Name {
+			case "count":
+				aggFn = "COUNT"
+			case "sum":
+				aggFn = "SUM"
+			case "avg":
+				aggFn = "AVG"
+			case "min":
+				aggFn = "MIN"
+			case "max":
+				aggFn = "MAX"
+			default:
+				continue
+			}
+
+			// @count(relation) → table = relation table, fkCol = modelName_id
+			if len(d.Args) == 0 {
+				continue
+			}
+			relationName := ""
+			targetCol := ""
+			if ident, ok := d.Args[0].Value.(*ast.Ident); ok {
+				relationName = ident.Name
+			}
+			if member, ok := d.Args[0].Value.(*ast.MemberExpr); ok {
+				if ident, ok := member.Object.(*ast.Ident); ok {
+					relationName = ident.Name
+					targetCol = str.ToSnakeCase(member.Field)
+				}
+			}
+			if relationName == "" {
+				continue
+			}
+
+			table := str.ToSnakeCase(relationName) + "s"
+			fkCol := str.ToSnakeCase(m.Name) + "_id"
+			goField := str.Capitalize(f.Name)
+
+			sql := fmt.Sprintf("lux.AggregateSQL(%q, %q, %q, %q)", aggFn, table, fkCol, targetCol)
+			fmt.Fprintf(b, "%s{\n", indent)
+			fmt.Fprintf(b, "%s\tvar aggVal int64\n", indent)
+			fmt.Fprintf(b, "%s\t_ = pg.QueryRow(ctx, app.DB, %s, %s.Id).Scan(&aggVal)\n", indent, sql, resultVar)
+			fmt.Fprintf(b, "%s\t%s.%s = aggVal\n", indent, resultVar, goField)
+			fmt.Fprintf(b, "%s}\n", indent)
+		}
+	}
 }

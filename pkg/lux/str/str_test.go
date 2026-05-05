@@ -125,3 +125,70 @@ func BenchmarkToSnakeCase(b *testing.B) {
 		ToSnakeCase("createdAt")
 	}
 }
+
+func TestReverse(t *testing.T) {
+	if got := Reverse("hello"); got != "olleh" {
+		t.Errorf("got %q", got)
+	}
+	if got := Reverse(""); got != "" {
+		t.Errorf("empty = %q", got)
+	}
+	if got := Reverse("a"); got != "a" {
+		t.Errorf("single = %q", got)
+	}
+}
+
+func TestMask(t *testing.T) {
+	if got := Mask("13812345678", 3, 4); got != "138****5678" {
+		t.Errorf("phone mask = %q", got)
+	}
+	if got := Mask("ab", 3, 4); got != "ab" {
+		t.Errorf("short string should not mask = %q", got)
+	}
+	if got := Mask("abcdef", 1, 1); got != "a****f" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestMaskEmail(t *testing.T) {
+	if got := MaskEmail("user@example.com"); got != "u***@example.com" {
+		t.Errorf("email mask = %q", got)
+	}
+	if got := MaskEmail("a@b.com"); got != "a@b.com" {
+		t.Errorf("short email should not mask = %q", got)
+	}
+}
+
+func TestPadLeft(t *testing.T) {
+	if got := PadLeft("42", 5, "0"); got != "00042" {
+		t.Errorf("padleft = %q", got)
+	}
+	if got := PadLeft("hello", 3, "x"); got != "hello" {
+		t.Errorf("already long = %q", got)
+	}
+	if got := PadLeft("a", 5, ""); got != "a" {
+		t.Errorf("empty pad = %q", got)
+	}
+}
+
+func TestPadRight(t *testing.T) {
+	if got := PadRight("42", 5, "0"); got != "42000" {
+		t.Errorf("padright = %q", got)
+	}
+}
+
+func TestMatches(t *testing.T) {
+	if !Matches("^[a-z]+$", "hello") {
+		t.Error("should match")
+	}
+	if Matches("^[a-z]+$", "Hello") {
+		t.Error("should not match")
+	}
+	if Matches("[invalid", "x") {
+		t.Error("invalid regex should not match")
+	}
+	// Second call should hit cache
+	if !Matches("^[a-z]+$", "world") {
+		t.Error("cached regex should match")
+	}
+}
