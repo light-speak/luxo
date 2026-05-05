@@ -551,7 +551,9 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 			fmt.Fprintf(b, "\t\tn, err := app.%s.Where(%sWhere.Id.In(ids...)).Delete(ctx)\n", name, name)
 		}
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		fmt.Fprintf(b, "\t\tapi.InvalidateCache(%q)\n", name)
+		fmt.Fprintf(b, "\t\tif n > 0 {\n")
+		fmt.Fprintf(b, "\t\t\tapi.InvalidateCache(%q)\n", name)
+		fmt.Fprintf(b, "\t\t}\n")
 		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, n)\n")
 		fmt.Fprintf(b, "\t\treturn nil\n")
 		fmt.Fprintf(b, "\t}\n}\n\n")
