@@ -4,11 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/cache"
-	"github.com/light-speak/luxo/pkg/lux/ratelimit"
 )
 
 // DefaultCache is the shared cache instance for @cache directive.
@@ -37,22 +35,11 @@ func InvalidateCache(model string) {
 }
 
 func cacheKey(req *Request) string {
-	// Key format: "ModelName:hash" so Invalidate("ModelName:") clears all for that model
 	h := sha256.New()
 	h.Write([]byte(req.API))
 	for k, v := range req.Params {
 		h.Write([]byte(k))
 		h.Write(v)
 	}
-	return hex.EncodeToString(h.Sum(nil))
-}
-
-// WithRateLimit wraps a handler with rate limiting per API name.
-func WithRateLimit(limiter *ratelimit.Limiter, handler HandlerFunc) HandlerFunc {
-	return func(ctx context.Context, req *Request) error {
-		if !limiter.Allow(req.API) {
-			return fmt.Errorf("rate limited: too many requests")
-		}
-		return handler(ctx, req)
-	}
+	return req.API + ":" + hex.EncodeToString(h.Sum(nil))
 }

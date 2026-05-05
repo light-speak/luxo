@@ -3,10 +3,9 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
-
-	"github.com/light-speak/luxo/pkg/lux/ratelimit"
 )
 
 func TestWithCache(t *testing.T) {
@@ -44,17 +43,14 @@ func TestInvalidateCache(t *testing.T) {
 	}
 }
 
-func TestWithRateLimit(t *testing.T) {
-	handler := func(ctx context.Context, req *Request) error { return nil }
-	limiter := ratelimit.New(1, time.Second)
-	limited := WithRateLimit(limiter, handler)
-
-	req := &Request{API: "rateTest", Buf: GetBuf()}
-	if err := limited(context.Background(), req); err != nil {
-		t.Fatal(err)
+func TestWithCache_Error(t *testing.T) {
+	handler := func(ctx context.Context, req *Request) error {
+		return fmt.Errorf("db error")
 	}
-	if err := limited(context.Background(), req); err == nil {
-		t.Error("should be rate limited")
+	cached := WithCache(time.Minute, handler)
+	req := &Request{API: "errorTest", Buf: GetBuf(), Params: map[string]json.RawMessage{}}
+	if err := cached(context.Background(), req); err == nil {
+		t.Error("should propagate error")
 	}
 }
 

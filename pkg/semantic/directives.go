@@ -353,12 +353,6 @@ var builtinDirectives = []DirectiveDef{
 		Description: "cache response with TTL",
 	},
 	{
-		Name: "rateLimit", Contexts: OnApi,
-		Params:      []ParamDef{{Name: "max"}, {Name: "window"}},
-		MaxArgs:     2,
-		Description: "rate limit API endpoint",
-	},
-	{
 		Name: "scope", Contexts: OnApi,
 		Params:      []ParamDef{}, // positional scope names
 		MaxArgs:     -1,

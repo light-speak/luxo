@@ -520,6 +520,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		}
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		fmt.Fprintf(b, "\t\tif n == 0 {\n\t\t\treturn errors.NotFound.WithData(errors.ResourceError{Resource: %q, ID: id})\n\t\t}\n", name)
+		fmt.Fprintf(b, "\t\tapi.InvalidateCache(%q)\n", name)
 		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, n)\n")
 		fmt.Fprintf(b, "\t\treturn nil\n")
 		fmt.Fprintf(b, "\t}\n}\n\n")
@@ -550,6 +551,9 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 			fmt.Fprintf(b, "\t\tn, err := app.%s.Where(%sWhere.Id.In(ids...)).Delete(ctx)\n", name, name)
 		}
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+		fmt.Fprintf(b, "\t\tif n > 0 {\n")
+		fmt.Fprintf(b, "\t\t\tapi.InvalidateCache(%q)\n", name)
+		fmt.Fprintf(b, "\t\t}\n")
 		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, n)\n")
 		fmt.Fprintf(b, "\t\treturn nil\n")
 		fmt.Fprintf(b, "\t}\n}\n\n")
@@ -595,6 +599,7 @@ func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string,
 
 	fmt.Fprintf(b, "\t\tresult, err := builder.Exec(ctx)\n")
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+	fmt.Fprintf(b, "\t\tapi.InvalidateCache(%q)\n", m.Name)
 	fmt.Fprintf(b, "\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
 	fmt.Fprintf(b, "\t\treturn nil\n")
 	fmt.Fprintf(b, "\t}\n")
@@ -627,6 +632,7 @@ func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType
 	}
 	fmt.Fprintf(b, "\t\tresult, err := builder.Exec(ctx)\n")
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+	fmt.Fprintf(b, "\t\tapi.InvalidateCache(%q)\n", m.Name)
 	fmt.Fprintf(b, "\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
 	fmt.Fprintf(b, "\t\treturn nil\n")
 	fmt.Fprintf(b, "\t}\n")
@@ -904,17 +910,6 @@ func writeHandlerRegistration(b *strings.Builder, name string, directives []*ast
 			if lit, ok := d.Args[0].Value.(*ast.Literal); ok {
 				// ttl is a Duration literal (e.g., "60" seconds or "5m")
 				handler = fmt.Sprintf("api.WithCache(%s*time.Second, %s)", lit.Value, handler)
-			}
-		}
-	}
-
-	// @rateLimit(max, window) wrapping
-	for _, d := range directives {
-		if d.Name == "rateLimit" && len(d.Args) >= 2 {
-			maxLit, _ := d.Args[0].Value.(*ast.Literal)
-			windowLit, _ := d.Args[1].Value.(*ast.Literal)
-			if maxLit != nil && windowLit != nil {
-				handler = fmt.Sprintf("api.WithRateLimit(ratelimit.New(%s, %s*time.Second), %s)", maxLit.Value, windowLit.Value, handler)
 			}
 		}
 	}
