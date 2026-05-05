@@ -148,7 +148,7 @@ func writeModelRegistration(b *strings.Builder, m *ast.ModelDecl, enums map[stri
 }
 
 // writeAPIRegistrationSchema generates schema.RegisterAPI for one API.
-func writeAPIRegistrationSchema(b *strings.Builder, name, moduleName string, params []*ast.ParamDecl, returnType *ast.TypeRef, paginated bool) {
+func writeAPIRegistrationSchema(b *strings.Builder, name, moduleName string, params []*ast.ParamDecl, returnType *ast.TypeRef, paginated bool, directives ...[]*ast.Directive) {
 	apiID := getAPIID(name)
 	fmt.Fprintf(b, "\ts.RegisterAPI(&schema.API{\n")
 	fmt.Fprintf(b, "\t\tID: %d, Name: %q, Module: %q,\n", apiID, name, moduleName)
@@ -157,6 +157,19 @@ func writeAPIRegistrationSchema(b *strings.Builder, name, moduleName string, par
 	}
 	if paginated {
 		fmt.Fprintf(b, "\t\tPaginated: true,\n")
+	}
+	// @deprecated
+	if len(directives) > 0 {
+		for _, d := range directives[0] {
+			if d.Name == "deprecated" {
+				fmt.Fprintf(b, "\t\tDeprecated: true,\n")
+				if len(d.Args) > 0 {
+					if lit, ok := d.Args[0].Value.(*ast.Literal); ok {
+						fmt.Fprintf(b, "\t\tDeprecatedReason: %q,\n", lit.Value)
+					}
+				}
+			}
+		}
 	}
 	if len(params) > 0 {
 		fmt.Fprintf(b, "\t\tParams: []schema.Param{\n")

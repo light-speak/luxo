@@ -423,6 +423,11 @@ func (c *compiler) compileBlockExpr(expr ast.Expr) string {
 		return ""
 	case *ast.ForStmt:
 		return c.compileForExpr(e)
+	case *ast.YieldExpr:
+		val := c.compileExpr(e.Value)
+		c.write("_yieldResult = %s\n", val)
+		c.write("break\n")
+		return "_yieldResult"
 	default:
 		return fmt.Sprintf("/* TODO: %T */", expr)
 	}
@@ -1595,15 +1600,34 @@ func (c *compiler) compileAwaitStmt(e *ast.AwaitExpr) {
 	}
 }
 
-// compileStringMethod compiles Luxo string methods to Go strings package calls.
-// Returns "" if the call is not a string method.
+// compileStringMethod compiles Luxo string methods to Go standard library calls.
+// Returns "" if the call is not a recognized string method.
 func (c *compiler) compileStringMethod(e *ast.CallExpr) string {
 	member, ok := e.Func.(*ast.MemberExpr)
 	if !ok {
 		return ""
 	}
 	obj := c.compileExpr(member.Object)
-	switch member.Field {
+	arg := func(i int) string {
+		if i < len(e.Args) {
+			return c.compileExpr(e.Args[i].Value)
+		}
+		return ""
+	}
+	nargs := len(e.Args)
+
+	if result := compileStringTransform(member.Field, obj, arg, nargs); result != "" {
+		return result
+	}
+	if result := compileStringQuery(member.Field, obj, arg, nargs); result != "" {
+		return result
+	}
+	return compileStringConvert(member.Field, obj)
+}
+
+// compileStringTransform handles string transform methods (returns string).
+func compileStringTransform(method, obj string, arg func(int) string, nargs int) string {
+	switch method {
 	case "lowercase":
 		return fmt.Sprintf("strings.ToLower(%s)", obj)
 	case "uppercase":
@@ -1611,33 +1635,82 @@ func (c *compiler) compileStringMethod(e *ast.CallExpr) string {
 	case "trim":
 		return fmt.Sprintf("strings.TrimSpace(%s)", obj)
 	case "trimStart":
-		if len(e.Args) > 0 {
-			return fmt.Sprintf("strings.TrimLeft(%s, %s)", obj, c.compileExpr(e.Args[0].Value))
+		if nargs > 0 {
+			return fmt.Sprintf("strings.TrimLeft(%s, %s)", obj, arg(0))
 		}
 		return fmt.Sprintf("strings.TrimLeft(%s, \" \")", obj)
 	case "trimEnd":
-		if len(e.Args) > 0 {
-			return fmt.Sprintf("strings.TrimRight(%s, %s)", obj, c.compileExpr(e.Args[0].Value))
+		if nargs > 0 {
+			return fmt.Sprintf("strings.TrimRight(%s, %s)", obj, arg(0))
 		}
 		return fmt.Sprintf("strings.TrimRight(%s, \" \")", obj)
-	case "replace":
-		if len(e.Args) >= 2 {
-			return fmt.Sprintf("strings.ReplaceAll(%s, %s, %s)", obj, c.compileExpr(e.Args[0].Value), c.compileExpr(e.Args[1].Value))
+	case "reversed":
+		return fmt.Sprintf("str.Reverse(%s)", obj)
+	case "replace", "replaceAll":
+		if nargs >= 2 {
+			return fmt.Sprintf("strings.ReplaceAll(%s, %s, %s)", obj, arg(0), arg(1))
 		}
+	case "substring":
+		if nargs >= 2 {
+			return fmt.Sprintf("%s[%s:%s]", obj, arg(0), arg(1))
+		}
+		if nargs == 1 {
+			return fmt.Sprintf("%s[%s:]", obj, arg(0))
+		}
+	case "repeat":
+		if nargs > 0 {
+			return fmt.Sprintf("strings.Repeat(%s, int(%s))", obj, arg(0))
+		}
+	case "padStart":
+		if nargs >= 2 {
+			return fmt.Sprintf("str.PadLeft(%s, int(%s), %s)", obj, arg(0), arg(1))
+		}
+	case "padEnd":
+		if nargs >= 2 {
+			return fmt.Sprintf("str.PadRight(%s, int(%s), %s)", obj, arg(0), arg(1))
+		}
+	case "split":
+		if nargs > 0 {
+			return fmt.Sprintf("strings.Split(%s, %s)", obj, arg(0))
+		}
+	}
+	return ""
+}
+
+// compileStringQuery handles string query methods (returns bool/int).
+func compileStringQuery(method, obj string, arg func(int) string, nargs int) string {
+	switch method {
 	case "contains":
-		if len(e.Args) > 0 {
-			return fmt.Sprintf("strings.Contains(%s, %s)", obj, c.compileExpr(e.Args[0].Value))
+		if nargs > 0 {
+			return fmt.Sprintf("strings.Contains(%s, %s)", obj, arg(0))
 		}
 	case "startsWith":
-		if len(e.Args) > 0 {
-			return fmt.Sprintf("strings.HasPrefix(%s, %s)", obj, c.compileExpr(e.Args[0].Value))
+		if nargs > 0 {
+			return fmt.Sprintf("strings.HasPrefix(%s, %s)", obj, arg(0))
 		}
 	case "endsWith":
-		if len(e.Args) > 0 {
-			return fmt.Sprintf("strings.HasSuffix(%s, %s)", obj, c.compileExpr(e.Args[0].Value))
+		if nargs > 0 {
+			return fmt.Sprintf("strings.HasSuffix(%s, %s)", obj, arg(0))
 		}
-	case "length":
+	case "isEmpty":
+		return fmt.Sprintf("(len(%s) == 0)", obj)
+	case "matches":
+		if nargs > 0 {
+			return fmt.Sprintf("str.Matches(%s, %s)", arg(0), obj)
+		}
+	case "length", "size":
 		return fmt.Sprintf("int64(len(%s))", obj)
+	}
+	return ""
+}
+
+// compileStringConvert handles string type conversion methods.
+func compileStringConvert(method, obj string) string {
+	switch method {
+	case "toInt":
+		return fmt.Sprintf("convert.StringToInt(%s)", obj)
+	case "toFloat":
+		return fmt.Sprintf("convert.StringToFloat(%s)", obj)
 	}
 	return ""
 }

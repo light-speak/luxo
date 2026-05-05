@@ -925,3 +925,25 @@ func TestBuildSchemaJSON_NoSvcAPIs(t *testing.T) {
 	// This test documents current behavior
 	_ = data
 }
+
+func TestIsRelationType(t *testing.T) {
+	// Primitive types → false
+	for _, name := range []string{"Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes"} {
+		if isRelationType(name) {
+			t.Errorf("%s should not be relation type", name)
+		}
+	}
+	// Model names → true
+	for _, name := range []string{"User", "Post", "Team"} {
+		if !isRelationType(name) {
+			t.Errorf("%s should be relation type", name)
+		}
+	}
+	// Empty/lowercase → false
+	if isRelationType("") {
+		t.Error("empty should not be relation")
+	}
+	if isRelationType("user") {
+		t.Error("lowercase should not be relation")
+	}
+}

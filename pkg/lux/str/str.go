@@ -104,18 +104,66 @@ func Repeat(s string, n int) string {
 	return strings.Repeat(s, n)
 }
 
-// PadLeft pads s on the left with pad to reach length n.
+// PadLeft pads s on the left with pad to reach length n. Single allocation.
 func PadLeft(s string, n int, pad string) string {
-	for len(s) < n {
-		s = pad + s
+	diff := n - len(s)
+	if diff <= 0 || pad == "" {
+		return s
 	}
-	return s
+	var b strings.Builder
+	b.Grow(n)
+	for b.Len() < diff {
+		b.WriteString(pad)
+	}
+	prefix := b.String()[:diff]
+	return prefix + s
 }
 
-// PadRight pads s on the right with pad to reach length n.
+// PadRight pads s on the right with pad to reach length n. Single allocation.
 func PadRight(s string, n int, pad string) string {
-	for len(s) < n {
-		s = s + pad
+	diff := n - len(s)
+	if diff <= 0 || pad == "" {
+		return s
 	}
-	return s
+	var b strings.Builder
+	b.Grow(n)
+	b.WriteString(s)
+	for b.Len() < n {
+		b.WriteString(pad)
+	}
+	return b.String()[:n]
+}
+
+// Mask applies partial masking, preserving prefix and suffix characters.
+// Mask("13812345678", 3, 4) → "138****5678"
+func Mask(s string, keepPrefix, keepSuffix int) string {
+	runes := []rune(s)
+	n := len(runes)
+	if keepPrefix+keepSuffix >= n {
+		return s
+	}
+	masked := make([]rune, n)
+	copy(masked, runes)
+	for i := keepPrefix; i < n-keepSuffix; i++ {
+		masked[i] = '*'
+	}
+	return string(masked)
+}
+
+// MaskEmail masks an email: "user@example.com" → "u***@example.com"
+func MaskEmail(s string) string {
+	at := strings.IndexByte(s, '@')
+	if at <= 1 {
+		return s
+	}
+	return s[:1] + strings.Repeat("*", at-1) + s[at:]
+}
+
+// Reverse returns s with its UTF-8 runes in reverse order.
+func Reverse(s string) string {
+	runes := []rune(s)
+	for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
+		runes[i], runes[j] = runes[j], runes[i]
+	}
+	return string(runes)
 }

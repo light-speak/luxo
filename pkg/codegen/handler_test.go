@@ -935,7 +935,7 @@ func TestGenerateRegisterFuncWithInferredNames(t *testing.T) {
 		testModel("User", []*ast.Directive{crudDirective()}, nil),
 	}
 	inferredNames := []string{"getUserByEmail", "listUsersByRole"}
-	generateRegisterFuncWithInferred(&b, models, inferredNames)
+	generateRegisterFuncWithInferred(&b, models, inferredNames, nil)
 	out := b.String()
 
 	if !strings.Contains(out, `"getUserByEmail"`) {
@@ -2051,5 +2051,256 @@ func TestGenerateHandlerDeleteMany_StringID(t *testing.T) {
 	// Should use ParamStringArray for string ids
 	if !strings.Contains(code, "req.ParamStringArray") {
 		t.Error("deleteMany with String ID should use ParamStringArray")
+	}
+}
+
+// ─── Validation directive tests ──────────────────────────────────────────────
+
+func TestGenerateStringValidation_NotBlank(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name:       "name",
+		Type:       &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{{Name: "notBlank"}},
+	}
+	generateStringValidation(&b, f, "nameVal", "\t")
+	if !strings.Contains(b.String(), "TrimSpace") {
+		t.Error("@notBlank should generate TrimSpace check")
+	}
+}
+
+func TestGenerateStringValidation_Email(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name:       "email",
+		Type:       &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{{Name: "email"}},
+	}
+	generateStringValidation(&b, f, "emailVal", "\t")
+	if !strings.Contains(b.String(), "@") {
+		t.Error("@email should check for @")
+	}
+}
+
+func TestGenerateStringValidation_MinMaxLength(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name: "username",
+		Type: &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{
+			{Name: "minLength", Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "3"}}}},
+			{Name: "maxLength", Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "20"}}}},
+		},
+	}
+	generateStringValidation(&b, f, "usernameVal", "\t")
+	out := b.String()
+	if !strings.Contains(out, "< 3") {
+		t.Error("@minLength should check < 3")
+	}
+	if !strings.Contains(out, "> 20") {
+		t.Error("@maxLength should check > 20")
+	}
+}
+
+func TestGenerateStringValidation_Pattern(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name: "code",
+		Type: &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{
+			{Name: "pattern", Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.String, Value: "^[A-Z]{3}$"}}}},
+		},
+	}
+	generateStringValidation(&b, f, "codeVal", "\t")
+	if !strings.Contains(b.String(), "regexp.MatchString") {
+		t.Error("@pattern should use regexp")
+	}
+}
+
+func TestGenerateNumericValidation_Range(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name: "age",
+		Type: &ast.TypeRef{Name: "Int"},
+		Directives: []*ast.Directive{
+			{Name: "range", Args: []*ast.NamedArg{
+				{Value: &ast.Literal{Kind: token.Int, Value: "0"}},
+				{Value: &ast.Literal{Kind: token.Int, Value: "150"}},
+			}},
+		},
+	}
+	generateNumericValidation(&b, f, "ageVal", "\t")
+	if !strings.Contains(b.String(), "< 0") || !strings.Contains(b.String(), "> 150") {
+		t.Error("@range should check bounds")
+	}
+}
+
+func TestWriteValidationCheck(t *testing.T) {
+	var b strings.Builder
+	writeValidationCheck(&b, "\t", "name", `nameVal == ""`, "must not be empty")
+	out := b.String()
+	if !strings.Contains(out, `nameVal == ""`) || !strings.Contains(out, "must not be empty") {
+		t.Errorf("unexpected output: %s", out)
+	}
+}
+
+// ─── Handler registration with @cache/@rateLimit ─────────────────────────────
+
+func TestWriteHandlerRegistration_Cache(t *testing.T) {
+	var b strings.Builder
+	dirs := []*ast.Directive{
+		{Name: "cache", Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "60"}}}},
+	}
+	writeHandlerRegistration(&b, "getUser", dirs)
+	out := b.String()
+	if !strings.Contains(out, "api.WithCache") {
+		t.Errorf("@cache should wrap with WithCache: %s", out)
+	}
+}
+
+func TestWriteHandlerRegistration_RateLimit(t *testing.T) {
+	var b strings.Builder
+	dirs := []*ast.Directive{
+		{Name: "rateLimit", Args: []*ast.NamedArg{
+			{Value: &ast.Literal{Kind: token.Int, Value: "100"}},
+			{Value: &ast.Literal{Kind: token.Int, Value: "60"}},
+		}},
+	}
+	writeHandlerRegistration(&b, "createUser", dirs)
+	out := b.String()
+	if !strings.Contains(out, "ratelimit.New") {
+		t.Errorf("@rateLimit should wrap with WithRateLimit: %s", out)
+	}
+}
+
+func TestWriteHandlerRegistration_Plain(t *testing.T) {
+	var b strings.Builder
+	writeHandlerRegistration(&b, "getUser", nil)
+	out := b.String()
+	if strings.Contains(out, "WithCache") || strings.Contains(out, "WithRateLimit") {
+		t.Errorf("no directives should not wrap: %s", out)
+	}
+	if !strings.Contains(out, "handleGetUser(app)") {
+		t.Errorf("should register plain handler: %s", out)
+	}
+}
+
+// ─── @beforeSave tests ──────────────────────────────────────────────────────
+
+func TestGenerateBeforeSave_WithBody(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name: "name",
+		Type: &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{
+			{Name: "beforeSave", Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ExprStmt{Expr: &ast.CallExpr{
+					Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "trim"},
+				}},
+			}}},
+		},
+	}
+	generateBeforeSave(&b, f, "nameVal", "\t")
+	if !strings.Contains(b.String(), "strings.TrimSpace") {
+		t.Errorf("@beforeSave { it.trim() } should generate TrimSpace: %s", b.String())
+	}
+}
+
+func TestGenerateBeforeSave_NoDirective(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{Name: "name", Type: &ast.TypeRef{Name: "String"}}
+	generateBeforeSave(&b, f, "nameVal", "\t")
+	if b.Len() > 0 {
+		t.Error("no @beforeSave should generate nothing")
+	}
+}
+
+// ─── Aggregate computed fields ──────────────────────────────────────────────
+
+func TestGenerateAggregateFields_Count(t *testing.T) {
+	var b strings.Builder
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "postCount", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{
+				Directives: []*ast.Directive{
+					{Name: "count", Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "posts"}}}},
+				},
+			}},
+		},
+	}
+	generateAggregateFields(&b, m, "result", "\t\t")
+	out := b.String()
+	if !strings.Contains(out, "AggregateSQL") {
+		t.Errorf("@count should generate AggregateSQL call: %s", out)
+	}
+	if !strings.Contains(out, "PostCount") {
+		t.Errorf("should set PostCount: %s", out)
+	}
+}
+
+func TestGenerateAggregateFields_Sum(t *testing.T) {
+	var b strings.Builder
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "totalSpent", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{
+				Directives: []*ast.Directive{
+					{Name: "sum", Args: []*ast.NamedArg{{Value: &ast.MemberExpr{
+						Object: &ast.Ident{Name: "orders"},
+						Field:  "amount",
+					}}}},
+				},
+			}},
+		},
+	}
+	generateAggregateFields(&b, m, "result", "\t\t")
+	out := b.String()
+	if !strings.Contains(out, `"SUM"`) {
+		t.Errorf("@sum should use SUM: %s", out)
+	}
+	if !strings.Contains(out, "amount") {
+		t.Errorf("@sum(orders.amount) should target amount column: %s", out)
+	}
+}
+
+func TestGenerateAggregateFields_NoComputed(t *testing.T) {
+	var b strings.Builder
+	m := &ast.ModelDecl{
+		Name:   "User",
+		Fields: []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}},
+	}
+	generateAggregateFields(&b, m, "result", "\t\t")
+	if b.Len() > 0 {
+		t.Error("no computed fields should generate nothing")
+	}
+}
+
+func TestScanModelsForValidation_Pattern(t *testing.T) {
+	models := []*ast.ModelDecl{{
+		Name:       "User",
+		Directives: []*ast.Directive{{Name: "crud"}},
+		Fields: []*ast.FieldDecl{
+			{Name: "code", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "pattern"}}},
+		},
+	}}
+	hasVal, hasPat := scanModelsForValidation(models)
+	if !hasVal || !hasPat {
+		t.Error("@pattern should set both hasValidation and hasPattern")
+	}
+}
+
+func TestScanModelsForValidation_NoCrud(t *testing.T) {
+	models := []*ast.ModelDecl{{
+		Name: "Config",
+		Fields: []*ast.FieldDecl{
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "notBlank"}}},
+		},
+	}}
+	hasVal, _ := scanModelsForValidation(models)
+	if hasVal {
+		t.Error("non-CRUD model should not trigger validation")
 	}
 }

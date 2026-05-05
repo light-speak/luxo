@@ -303,12 +303,13 @@ func TestCompileElvisExprStandalone(t *testing.T) {
 
 // ─── compileExpr — unknown type ─────────────────────────────────────────────
 
-func TestCompileExprUnknownType(t *testing.T) {
+func TestCompileYieldExpr(t *testing.T) {
 	c := newCompiler(nil)
-	// Use a type not handled by the switch (YieldExpr is not compiled)
-	got := c.compileExpr(&ast.YieldExpr{})
-	if !strings.Contains(got, "/* TODO:") {
-		t.Fatalf("expected TODO fallback, got %q", got)
+	got := c.compileExpr(&ast.YieldExpr{
+		Value: &ast.Ident{Name: "item"},
+	})
+	if got != "_yieldResult" {
+		t.Fatalf("yield should return _yieldResult, got %q", got)
 	}
 }
 
@@ -6250,5 +6251,260 @@ func TestResolveQueryType_ShortChain(t *testing.T) {
 	vt := c.resolveQueryType(&ast.Ident{Name: "x"})
 	if vt.isModel || vt.name != "" {
 		t.Errorf("short chain should return empty, got %+v", vt)
+	}
+}
+
+// ─── String method compilation tests ─────────────────────────────────────────
+
+func TestCompileStringTransformAll(t *testing.T) {
+	tests := []struct {
+		method string
+		nargs  int
+		args   []string
+		want   string
+	}{
+		{"lowercase", 0, nil, "strings.ToLower(s)"},
+		{"uppercase", 0, nil, "strings.ToUpper(s)"},
+		{"trim", 0, nil, "strings.TrimSpace(s)"},
+		{"trimStart", 0, nil, `strings.TrimLeft(s, " ")`},
+		{"trimStart", 1, []string{`"-"`}, `strings.TrimLeft(s, "-")`},
+		{"trimEnd", 0, nil, `strings.TrimRight(s, " ")`},
+		{"trimEnd", 1, []string{`"-"`}, `strings.TrimRight(s, "-")`},
+		{"reversed", 0, nil, "str.Reverse(s)"},
+		{"replace", 2, []string{`"a"`, `"b"`}, `strings.ReplaceAll(s, "a", "b")`},
+		{"replaceAll", 2, []string{`"a"`, `"b"`}, `strings.ReplaceAll(s, "a", "b")`},
+		{"substring", 2, []string{"1", "5"}, "s[1:5]"},
+		{"substring", 1, []string{"3"}, "s[3:]"},
+		{"repeat", 1, []string{"3"}, "strings.Repeat(s, int(3))"},
+		{"padStart", 2, []string{"10", `" "`}, `str.PadLeft(s, int(10), " ")`},
+		{"padEnd", 2, []string{"10", `" "`}, `str.PadRight(s, int(10), " ")`},
+		{"split", 1, []string{`","`}, `strings.Split(s, ",")`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method, func(t *testing.T) {
+			arg := func(i int) string {
+				if i < len(tt.args) {
+					return tt.args[i]
+				}
+				return ""
+			}
+			got := compileStringTransform(tt.method, "s", arg, tt.nargs)
+			if got != tt.want {
+				t.Errorf("compileStringTransform(%q) = %q, want %q", tt.method, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCompileStringQueryAll(t *testing.T) {
+	tests := []struct {
+		method string
+		nargs  int
+		args   []string
+		want   string
+	}{
+		{"contains", 1, []string{`"x"`}, `strings.Contains(s, "x")`},
+		{"startsWith", 1, []string{`"pre"`}, `strings.HasPrefix(s, "pre")`},
+		{"endsWith", 1, []string{`".go"`}, `strings.HasSuffix(s, ".go")`},
+		{"isEmpty", 0, nil, "(len(s) == 0)"},
+		{"matches", 1, []string{`"^[a-z]+$"`}, `str.Matches("^[a-z]+$", s)`},
+		{"length", 0, nil, "int64(len(s))"},
+		{"size", 0, nil, "int64(len(s))"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method, func(t *testing.T) {
+			arg := func(i int) string {
+				if i < len(tt.args) {
+					return tt.args[i]
+				}
+				return ""
+			}
+			got := compileStringQuery(tt.method, "s", arg, tt.nargs)
+			if got != tt.want {
+				t.Errorf("compileStringQuery(%q) = %q, want %q", tt.method, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCompileStringConvertAll(t *testing.T) {
+	if got := compileStringConvert("toInt", "s"); got != `convert.StringToInt(s)` {
+		t.Errorf("toInt = %q", got)
+	}
+	if got := compileStringConvert("toFloat", "s"); got != `convert.StringToFloat(s)` {
+		t.Errorf("toFloat = %q", got)
+	}
+	if got := compileStringConvert("unknown", "s"); got != "" {
+		t.Errorf("unknown should return empty, got %q", got)
+	}
+}
+
+func TestCompileFieldExpr_ChainedMethods(t *testing.T) {
+	// it.trim().lowercase() → strings.ToLower(strings.TrimSpace(varName))
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{
+					Object: &ast.Ident{Name: "it"},
+					Field:  "trim",
+				},
+			},
+			Field: "lowercase",
+		},
+	}
+	got := compileFieldExpr(expr, "nameVal")
+	if got != "strings.ToLower(strings.TrimSpace(nameVal))" {
+		t.Errorf("chained = %q", got)
+	}
+}
+
+func TestCompileFieldExpr_ItIdent(t *testing.T) {
+	got := compileFieldExpr(&ast.Ident{Name: "it"}, "val")
+	if got != "val" {
+		t.Errorf("it → %q, want val", got)
+	}
+}
+
+func TestCompileFieldExpr_Literal(t *testing.T) {
+	got := compileFieldExpr(&ast.Literal{Kind: token.String, Value: "hello"}, "v")
+	if got != `"hello"` {
+		t.Errorf("literal = %q", got)
+	}
+	got = compileFieldExpr(&ast.Literal{Kind: token.Int, Value: "42"}, "v")
+	if got != "42" {
+		t.Errorf("int literal = %q", got)
+	}
+}
+
+func TestCompileMyField(t *testing.T) {
+	if got := compileMyField("id", "identity"); got != "api.IdentityID(identity)" {
+		t.Errorf("my.id = %q", got)
+	}
+	if got := compileMyField("role", "identity"); got != `api.IdentityInt(identity, "role")` {
+		t.Errorf("my.role = %q", got)
+	}
+}
+
+func TestInferMyFieldType(t *testing.T) {
+	myRole := &ast.MemberExpr{Object: &ast.Ident{Name: "my"}, Field: "role"}
+	// String literal → IdentityString
+	compiled := `api.IdentityInt(identity, "role")`
+	got := inferMyFieldType(compiled, myRole, &ast.Literal{Kind: token.String, Value: "admin"}, "identity")
+	if !strings.Contains(got, "IdentityString") {
+		t.Errorf("string context should use IdentityString, got %q", got)
+	}
+	// Int literal → stays IdentityInt
+	got = inferMyFieldType(compiled, myRole, &ast.Literal{Kind: token.Int, Value: "5"}, "identity")
+	if !strings.Contains(got, "IdentityInt") {
+		t.Errorf("int context should use IdentityInt, got %q", got)
+	}
+	// Non-my expr → unchanged
+	got = inferMyFieldType("something", &ast.Ident{Name: "x"}, &ast.Literal{Kind: token.String, Value: "a"}, "identity")
+	if got != "something" {
+		t.Errorf("non-my should be unchanged, got %q", got)
+	}
+}
+
+// ─── compileStringMethod integration (dispatches to sub-functions) ──────────
+
+func TestCompileStringMethod_ViaCallExpr(t *testing.T) {
+	c := newCompiler(nil)
+	// s.lowercase() → strings.ToLower(s)
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "s"}, Field: "lowercase"},
+	}
+	got := c.compileStringMethod(expr)
+	if got != "strings.ToLower(s)" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestCompileStringMethod_NotMember(t *testing.T) {
+	c := newCompiler(nil)
+	// Plain function call → not a string method
+	expr := &ast.CallExpr{Func: &ast.Ident{Name: "foo"}}
+	got := c.compileStringMethod(expr)
+	if got != "" {
+		t.Errorf("non-member should return empty, got %q", got)
+	}
+}
+
+func TestCompileStringMethod_Unknown(t *testing.T) {
+	c := newCompiler(nil)
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "s"}, Field: "unknownMethod"},
+	}
+	got := c.compileStringMethod(expr)
+	if got != "" {
+		t.Errorf("unknown method should return empty, got %q", got)
+	}
+}
+
+func TestCompileStringMethod_Contains(t *testing.T) {
+	c := newCompiler(nil)
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "s"}, Field: "contains"},
+		Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.String, Value: "x"}}},
+	}
+	got := c.compileStringMethod(expr)
+	if !strings.Contains(got, "strings.Contains") {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestCompileStringMethod_ToInt(t *testing.T) {
+	c := newCompiler(nil)
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "s"}, Field: "toInt"},
+	}
+	got := c.compileStringMethod(expr)
+	if !strings.Contains(got, "convert.StringToInt") {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestCompileFieldExpr_MemberExpr(t *testing.T) {
+	got := compileFieldExpr(&ast.MemberExpr{
+		Object: &ast.Ident{Name: "it"},
+		Field:  "name",
+	}, "val")
+	if got != "val.Name" {
+		t.Errorf("it.name = %q", got)
+	}
+}
+
+func TestCompileFieldExpr_OtherIdent(t *testing.T) {
+	got := compileFieldExpr(&ast.Ident{Name: "other"}, "val")
+	if got != "other" {
+		t.Errorf("other ident = %q", got)
+	}
+}
+
+func TestCompileFieldExpr_QueryMethod(t *testing.T) {
+	// it.isEmpty() → (len(val) == 0)
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "isEmpty"},
+	}
+	got := compileFieldExpr(expr, "val")
+	if got != "(len(val) == 0)" {
+		t.Errorf("isEmpty = %q", got)
+	}
+}
+
+func TestCompileFieldExpr_ConvertMethod(t *testing.T) {
+	// it.toInt() → convert.StringToInt(val)
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "toInt"},
+	}
+	got := compileFieldExpr(expr, "val")
+	if got != "convert.StringToInt(val)" {
+		t.Errorf("toInt = %q", got)
+	}
+}
+
+func TestCompileFieldExpr_Unsupported(t *testing.T) {
+	got := compileFieldExpr(&ast.BinaryExpr{Left: &ast.Ident{Name: "a"}, Op: "+", Right: &ast.Ident{Name: "b"}}, "val")
+	if got != "" {
+		t.Errorf("unsupported should be empty, got %q", got)
 	}
 }
