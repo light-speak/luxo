@@ -6604,3 +6604,89 @@ func TestCompileBangElvisExpr(t *testing.T) {
 		t.Errorf("expr should contain !: marker, got %q", got)
 	}
 }
+
+func TestCompileElvisGuard_BoolMethod(t *testing.T) {
+	c := newCompiler(nil)
+	c.indent = "\t\t"
+	e := &ast.ElvisExpr{
+		Left: &ast.CallExpr{
+			Func: &ast.MemberExpr{Object: &ast.Ident{Name: "member"}, Field: "verifyPassword"},
+			Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "password"}}},
+		},
+		Right: &ast.Ident{Name: "InvalidCredentials"},
+	}
+	c.compileElvisGuard(e)
+	out := c.b.String()
+	if !strings.Contains(out, "!member.VerifyPassword") {
+		t.Errorf("bool ?: should generate if !val: %s", out)
+	}
+}
+
+func TestCompileElvisGuard_ErrorReturningBool(t *testing.T) {
+	c := newCompiler(nil)
+	c.indent = "\t\t"
+	e := &ast.ElvisExpr{
+		Left: &ast.CallExpr{
+			Func: &ast.MemberExpr{Object: &ast.Ident{Name: "app"}, Field: "exists"},
+			Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "ctx"}}},
+		},
+		Right: &ast.Ident{Name: "NotFound"},
+	}
+	c.compileElvisGuard(e)
+	out := c.b.String()
+	if !strings.Contains(out, "_ok, _err :=") {
+		t.Errorf("should generate _ok, _err: %s", out)
+	}
+	if !strings.Contains(out, "if !_ok") {
+		t.Errorf("should check !_ok: %s", out)
+	}
+}
+
+func TestCompileBangElvisGuard_ErrorReturning(t *testing.T) {
+	c := newCompiler(nil)
+	c.indent = "\t\t"
+	e := &ast.BangElvisExpr{
+		Left: &ast.CallExpr{
+			Func: &ast.MemberExpr{Object: &ast.Ident{Name: "app"}, Field: "exists"},
+			Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "ctx"}}},
+		},
+		Right: &ast.Ident{Name: "AlreadySetup"},
+	}
+	c.compileBangElvisGuard(e)
+	out := c.b.String()
+	if !strings.Contains(out, "_ok, _err :=") {
+		t.Errorf("should generate _ok, _err: %s", out)
+	}
+	if !strings.Contains(out, "if _ok {") {
+		t.Errorf("should check if _ok: %s", out)
+	}
+}
+
+func TestIsErrorReturningBool(t *testing.T) {
+	if !isErrorReturningBool(&ast.CallExpr{Func: &ast.MemberExpr{Field: "exists"}}) {
+		t.Error("exists should be error-returning")
+	}
+	if isErrorReturningBool(&ast.CallExpr{Func: &ast.MemberExpr{Field: "verifyPassword"}}) {
+		t.Error("verifyPassword should NOT be error-returning")
+	}
+	if isErrorReturningBool(&ast.Ident{Name: "x"}) {
+		t.Error("ident should not be error-returning")
+	}
+	if isErrorReturningBool(&ast.CallExpr{Func: &ast.Ident{Name: "foo"}}) {
+		t.Error("non-member should not be error-returning")
+	}
+}
+
+func TestIsBoolExpr(t *testing.T) {
+	for _, name := range []string{"verifyPassword", "contains", "startsWith", "endsWith", "isEmpty", "matches"} {
+		if !isBoolExpr(&ast.CallExpr{Func: &ast.MemberExpr{Field: name}}) {
+			t.Errorf("%s should be bool", name)
+		}
+	}
+	if isBoolExpr(&ast.CallExpr{Func: &ast.MemberExpr{Field: "find"}}) {
+		t.Error("find should not be bool")
+	}
+	if isBoolExpr(&ast.Ident{Name: "x"}) {
+		t.Error("ident should not be bool")
+	}
+}

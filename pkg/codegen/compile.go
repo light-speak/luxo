@@ -340,14 +340,14 @@ func (c *compiler) compileIf(s *ast.IfStmt) {
 }
 
 // compileElvisGuard: x ?: throw Error
-// For pointers: x == nil → throw
-// For !x (bool negation): !x is false (x is true) → throw
+// - nullable: x == nil → throw
+// - bool: !x → throw
+// - (bool, error): val, err := x; if err → return err; if !val → throw
 func (c *compiler) compileElvisGuard(e *ast.ElvisExpr) {
 	right := c.compileExpr(e.Right)
 
-	// Check if left is !expr (UnaryExpr with !)
+	// !expr ?: throw → if expr { return ... }
 	if unary, ok := e.Left.(*ast.UnaryExpr); ok && unary.Op == "!" {
-		// !exists ?: throw → if exists { return ... }
 		inner := c.compileExpr(unary.Value)
 		c.write("if %s {", inner)
 		c.write("\treturn %s", right)
@@ -355,21 +355,85 @@ func (c *compiler) compileElvisGuard(e *ast.ElvisExpr) {
 		return
 	}
 
+	// Bool method call (returns (bool, error)): val, err := x; if !val { throw }
+	if isErrorReturningBool(e.Left) {
+		left := c.compileExpr(e.Left)
+		c.write("_ok, _err := %s", left)
+		c.write("if _err != nil {")
+		c.write("\treturn _err")
+		c.write("}")
+		c.write("if !_ok {")
+		c.write("\treturn %s", right)
+		c.write("}")
+		return
+	}
+
 	// Default: pointer nil check — x ?: throw → if x == nil { return ... }
 	left := c.compileExpr(e.Left)
-	c.write("if %s == nil {", left)
+	// Bool (non-error): if !val { throw }
+	if isBoolExpr(e.Left) {
+		c.write("if !%s {", left)
+	} else {
+		c.write("if %s == nil {", left)
+	}
 	c.write("\treturn %s", right)
 	c.write("}")
 }
 
 // compileBangElvisGuard: x !: throw Error
-// Left is a bool condition; if true → throw right.
+// - bool: if x → throw
+// - (bool, error): val, err := x; if err → return err; if val → throw
 func (c *compiler) compileBangElvisGuard(e *ast.BangElvisExpr) {
-	left := c.compileExpr(e.Left)
 	right := c.compileThrowExpr(e.Right)
+
+	if isErrorReturningBool(e.Left) {
+		left := c.compileExpr(e.Left)
+		c.write("_ok, _err := %s", left)
+		c.write("if _err != nil {")
+		c.write("\treturn _err")
+		c.write("}")
+		c.write("if _ok {")
+		c.write("\treturn %s", right)
+		c.write("}")
+		return
+	}
+
+	left := c.compileExpr(e.Left)
 	c.write("if %s {", left)
 	c.write("\treturn %s", right)
 	c.write("}")
+}
+
+// isErrorReturningBool checks if an expression is a method call that returns (bool, error).
+// Detects: Model.exists(), Model.where(...).exists(), query chain ending in exists/count.
+func isErrorReturningBool(expr ast.Expr) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	if member, ok := call.Func.(*ast.MemberExpr); ok {
+		switch member.Field {
+		case "exists":
+			return true
+		}
+	}
+	return false
+}
+
+// isBoolExpr checks if an expression returns a plain bool (not nullable, not error).
+// Detects: member.verifyPassword(), it.contains(), etc.
+func isBoolExpr(expr ast.Expr) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	if member, ok := call.Func.(*ast.MemberExpr); ok {
+		switch member.Field {
+		case "verifyPassword", "contains", "startsWith", "endsWith", "isEmpty", "matches":
+			return true
+		}
+	}
+	return false
 }
 
 // compileEmit: emit EventName(args)
