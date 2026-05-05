@@ -678,3 +678,17 @@ func TestModelNameConflictWithBuiltinFields(t *testing.T) {
 	result := analyze(t, `model String { value: Int }`)
 	expectError(t, result, "already declared")
 }
+
+func TestBangElvisExpr(t *testing.T) {
+	result := analyze(t, `
+model User @crud {
+  id: Int @id @auto
+  name: String
+}
+api test: Boolean {
+  User.exists() !: throw error.Conflict
+  return true
+}
+`)
+	expectNoErrors(t, result)
+}
