@@ -40,6 +40,7 @@ func generateSchemaFile(result *semantic.Result, packageName string, enums map[s
 		params     []*ast.ParamDecl
 		returnType *ast.TypeRef
 		paginated  bool
+		directives []*ast.Directive
 	}
 	var apis []apiInfo
 
@@ -73,6 +74,7 @@ func generateSchemaFile(result *semantic.Result, packageName string, enums map[s
 				moduleName: modName,
 				params:     api.Params,
 				returnType: api.ReturnType,
+				directives: api.Directives,
 			})
 		}
 		for _, fn := range file.Functions {
@@ -107,7 +109,7 @@ func generateSchemaFile(result *semantic.Result, packageName string, enums map[s
 
 	// Register APIs
 	for _, api := range apis {
-		writeAPIRegistrationSchema(&b, api.name, api.moduleName, api.params, api.returnType, api.paginated)
+		writeAPIRegistrationSchema(&b, api.name, api.moduleName, api.params, api.returnType, api.paginated, api.directives)
 	}
 
 	b.WriteString("}\n")

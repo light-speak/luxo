@@ -183,8 +183,7 @@ func (c *%sClient) Count(ctx context.Context, conds ...lux.Condition) (int64, er
 
 // Exists returns true if any non-deleted record matches conditions.
 func (c *%sClient) Exists(ctx context.Context, conds ...lux.Condition) (bool, error) {
-	n, err := c.Count(ctx, conds...)
-	return n > 0, err
+	return c.Where(conds...).Exists(ctx)
 }
 
 `, name, name, tableName, scanFn, name)
@@ -196,8 +195,7 @@ func (c *%sClient) Count(ctx context.Context, conds ...lux.Condition) (int64, er
 
 // Exists returns true if any record matches conditions.
 func (c *%sClient) Exists(ctx context.Context, conds ...lux.Condition) (bool, error) {
-	n, err := c.Count(ctx, conds...)
-	return n > 0, err
+	return c.Where(conds...).Exists(ctx)
 }
 
 `, name, name, tableName, scanFn, name)

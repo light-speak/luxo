@@ -34,7 +34,8 @@ func GetBuf() *ResponseBuf {
 
 // PutBuf returns a ResponseBuf to the pool.
 func PutBuf(buf *ResponseBuf) {
-	if cap(buf.B) > 1<<20 { // don't pool buffers > 1MB
+	buf.Identity = nil // clear PII before pooling
+	if cap(buf.B) > 1<<20 {
 		return
 	}
 	bufPool.Put(buf)
