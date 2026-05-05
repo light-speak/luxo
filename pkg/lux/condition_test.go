@@ -1,6 +1,7 @@
 package lux
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -921,5 +922,40 @@ func TestRawConditionDollarAtEnd(t *testing.T) {
 	sql, _ := cond.ToSQL(1)
 	if sql != "(col LIKE 'foo$')" {
 		t.Errorf("SQL = %q", sql)
+	}
+}
+
+func TestSearchField_Match(t *testing.T) {
+	f := NewSearchField("title")
+	cond := f.Match("hello world")
+	sql, args := cond.ToSQL(1)
+	if !strings.Contains(sql, "to_tsvector") || !strings.Contains(sql, "plainto_tsquery") {
+		t.Errorf("search SQL = %s", sql)
+	}
+	if len(args) != 1 || args[0] != "hello world" {
+		t.Errorf("args = %v", args)
+	}
+}
+
+func TestSearchField_FilterOp(t *testing.T) {
+	f := NewSearchField("content")
+	cond := f.FilterOp("match", "test query")
+	sql, _ := cond.ToSQL(1)
+	if !strings.Contains(sql, "$1") {
+		t.Errorf("should use placeholder: %s", sql)
+	}
+}
+
+func TestSearchField_CustomBuilder(t *testing.T) {
+	old := DefaultSearchBuilder
+	defer func() { DefaultSearchBuilder = old }()
+	DefaultSearchBuilder = func(col string, offset int) string {
+		return "MATCH(" + col + ") AGAINST(?)"
+	}
+	f := NewSearchField("title")
+	cond := f.Match("test")
+	sql, _ := cond.ToSQL(1)
+	if !strings.Contains(sql, "MATCH(title)") {
+		t.Errorf("custom builder = %s", sql)
 	}
 }
