@@ -431,3 +431,37 @@ func TestGenerateExtendStubAutoId(t *testing.T) {
 
 // suppress unused import warning
 var _ = token.Position{}
+
+func TestGenerateModelVerifyPassword(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "password", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hash"}}},
+		},
+	}
+	var b strings.Builder
+	generateModel(&b, m, nil)
+	out := b.String()
+	if !strings.Contains(out, "VerifyPassword") {
+		t.Errorf("@hash should generate VerifyPassword: %s", out)
+	}
+	if !strings.Contains(out, "luxocrypto.VerifyPassword") {
+		t.Errorf("should call luxocrypto.VerifyPassword: %s", out)
+	}
+}
+
+func TestGenerateModelNoVerifyWithoutHash(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "Post",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}
+	var b strings.Builder
+	generateModel(&b, m, nil)
+	if strings.Contains(b.String(), "Verify") {
+		t.Error("no @hash should not generate Verify method")
+	}
+}

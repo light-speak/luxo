@@ -978,3 +978,20 @@ func TestStringTemplateWithEscape(t *testing.T) {
 		t.Errorf("expected 'hello \\\"', got %q", tokens[0].Val)
 	}
 }
+
+func TestBangElvisToken(t *testing.T) {
+	l := New("x !: y", "test.luxo")
+	tokens, _ := l.Tokenize()
+	found := false
+	for _, tok := range tokens {
+		if tok.Type == token.BangElvis {
+			found = true
+			if tok.Val != "!:" {
+				t.Errorf("expected !:, got %q", tok.Val)
+			}
+		}
+	}
+	if !found {
+		t.Error("!: token not found")
+	}
+}
