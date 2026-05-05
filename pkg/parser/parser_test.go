@@ -1109,3 +1109,26 @@ func testApiParamDocUnicode(t *testing.T) {
 		t.Errorf("param doc = %q, want %q", api.Params[0].Doc, "干嘛的")
 	}
 }
+
+func TestParseBangElvis(t *testing.T) {
+	input := `api test: Boolean {
+  Member.exists() !: throw AlreadySetup
+  return true
+}`
+	file := parse(t, input)
+	if len(file.APIs) != 1 {
+		t.Fatalf("expected 1 API, got %d", len(file.APIs))
+	}
+	api := file.APIs[0]
+	if api.Body == nil || len(api.Body.Stmts) < 1 {
+		t.Fatal("expected body stmts")
+	}
+	es, ok := api.Body.Stmts[0].(*ast.ExprStmt)
+	if !ok {
+		t.Fatalf("expected ExprStmt, got %T", api.Body.Stmts[0])
+	}
+	_, ok = es.Expr.(*ast.BangElvisExpr)
+	if !ok {
+		t.Fatalf("expected BangElvisExpr, got %T", es.Expr)
+	}
+}
