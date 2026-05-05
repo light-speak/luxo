@@ -545,6 +545,10 @@ func (a *Analyzer) resolveModelFields(file *ast.File) {
 				}
 				typ.Fields[fi.Name] = fi
 			}
+			// @visible requires nullable field — non-nullable fields can't be conditionally hidden
+			if hasModelDirective(f.Directives, "visible") && f.Type != nil && !f.Type.Nullable {
+				a.addError(f.Pos, "@visible requires nullable field (use %s? instead of %s) / @visible 字段必须可空", f.Type.Name, f.Type.Name)
+			}
 		}
 		a.checkDirectives(m.Directives, OnModel)
 		// @withAuth: inject .createToken(), .verify(), .refreshToken() methods

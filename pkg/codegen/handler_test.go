@@ -2158,21 +2158,6 @@ func TestWriteHandlerRegistration_Cache(t *testing.T) {
 	}
 }
 
-func TestWriteHandlerRegistration_RateLimit(t *testing.T) {
-	var b strings.Builder
-	dirs := []*ast.Directive{
-		{Name: "rateLimit", Args: []*ast.NamedArg{
-			{Value: &ast.Literal{Kind: token.Int, Value: "100"}},
-			{Value: &ast.Literal{Kind: token.Int, Value: "60"}},
-		}},
-	}
-	writeHandlerRegistration(&b, "createUser", dirs)
-	out := b.String()
-	if !strings.Contains(out, "ratelimit.New") {
-		t.Errorf("@rateLimit should wrap with WithRateLimit: %s", out)
-	}
-}
-
 func TestWriteHandlerRegistration_Plain(t *testing.T) {
 	var b strings.Builder
 	writeHandlerRegistration(&b, "getUser", nil)

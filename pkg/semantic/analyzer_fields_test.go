@@ -692,3 +692,23 @@ api test: Boolean {
 `)
 	expectNoErrors(t, result)
 }
+
+func TestVisibleRequiresNullable(t *testing.T) {
+	result := analyze(t, `
+model User {
+  name: String
+  salary: Float @visible { my.role == "admin" }
+}
+`)
+	expectError(t, result, "@visible requires nullable")
+}
+
+func TestVisibleNullableOk(t *testing.T) {
+	result := analyze(t, `
+model User {
+  name: String
+  salary: Float? @visible { my.role == "admin" }
+}
+`)
+	expectNoErrors(t, result)
+}
