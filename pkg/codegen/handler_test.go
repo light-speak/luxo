@@ -2304,3 +2304,146 @@ func TestScanModelsForValidation_NoCrud(t *testing.T) {
 		t.Error("non-CRUD model should not trigger validation")
 	}
 }
+
+func TestGenerateAggregateFields_NoArgs(t *testing.T) {
+	var b strings.Builder
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "score", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{
+				Directives: []*ast.Directive{{Name: "count"}}, // no args
+			}},
+		},
+	}
+	generateAggregateFields(&b, m, "result", "\t\t")
+	if b.Len() > 0 {
+		t.Error("@count without args should generate nothing")
+	}
+}
+
+func TestGenerateBeforeSave_EmptyBody(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name: "name",
+		Type: &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{
+			{Name: "beforeSave", Body: &ast.Block{}},
+		},
+	}
+	generateBeforeSave(&b, f, "nameVal", "\t")
+	if b.Len() > 0 {
+		t.Error("empty body should generate nothing")
+	}
+}
+
+func TestGenerateAggregateFields_Avg(t *testing.T) {
+	var b strings.Builder
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "avgScore", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{
+				Directives: []*ast.Directive{
+					{Name: "avg", Args: []*ast.NamedArg{{Value: &ast.MemberExpr{
+						Object: &ast.Ident{Name: "reviews"},
+						Field:  "score",
+					}}}},
+				},
+			}},
+		},
+	}
+	generateAggregateFields(&b, m, "result", "\t\t")
+	if !strings.Contains(b.String(), `"AVG"`) {
+		t.Errorf("should use AVG: %s", b.String())
+	}
+}
+
+func TestGenerateAggregateFields_Min(t *testing.T) {
+	var b strings.Builder
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "minPrice", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{
+				Directives: []*ast.Directive{
+					{Name: "min", Args: []*ast.NamedArg{{Value: &ast.MemberExpr{
+						Object: &ast.Ident{Name: "products"},
+						Field:  "price",
+					}}}},
+				},
+			}},
+		},
+	}
+	generateAggregateFields(&b, m, "result", "\t\t")
+	if !strings.Contains(b.String(), `"MIN"`) {
+		t.Errorf("should use MIN: %s", b.String())
+	}
+}
+
+func TestGenerateAggregateFields_Max(t *testing.T) {
+	var b strings.Builder
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "maxAge", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{
+				Directives: []*ast.Directive{
+					{Name: "max", Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "members"}}}},
+				},
+			}},
+		},
+	}
+	generateAggregateFields(&b, m, "result", "\t\t")
+	if !strings.Contains(b.String(), `"MAX"`) {
+		t.Errorf("should use MAX: %s", b.String())
+	}
+}
+
+func TestGenerateAggregateFields_UnknownDirective(t *testing.T) {
+	var b strings.Builder
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "x", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{
+				Directives: []*ast.Directive{{Name: "native"}},
+			}},
+		},
+	}
+	generateAggregateFields(&b, m, "result", "\t\t")
+	if b.Len() > 0 {
+		t.Error("@native computed should generate nothing")
+	}
+}
+
+func TestGenerateAggregateFields_EmptyRelation(t *testing.T) {
+	var b strings.Builder
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "x", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{
+				Directives: []*ast.Directive{
+					{Name: "count", Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "42"}}}},
+				},
+			}},
+		},
+	}
+	generateAggregateFields(&b, m, "result", "\t\t")
+	if b.Len() > 0 {
+		t.Error("non-ident/member arg should generate nothing")
+	}
+}
+
+func TestGenerateBeforeSave_NonExprBody(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name: "name",
+		Type: &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{
+			{Name: "beforeSave", Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{}}}},
+		},
+	}
+	generateBeforeSave(&b, f, "nameVal", "\t")
+	if b.Len() > 0 {
+		t.Error("non-ExprStmt body should generate nothing")
+	}
+}

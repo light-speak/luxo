@@ -6508,3 +6508,72 @@ func TestCompileFieldExpr_Unsupported(t *testing.T) {
 		t.Errorf("unsupported should be empty, got %q", got)
 	}
 }
+
+func TestCompileFieldExpr_CallNonMember(t *testing.T) {
+	// foo() — CallExpr with Ident func (not MemberExpr)
+	expr := &ast.CallExpr{Func: &ast.Ident{Name: "foo"}}
+	got := compileFieldExpr(expr, "val")
+	if got != "" {
+		t.Errorf("non-member call should return empty, got %q", got)
+	}
+}
+
+func TestCompileFieldExpr_QueryViaCall(t *testing.T) {
+	// it.contains("x") — query method in field context
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "contains"},
+		Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.String, Value: "x"}}},
+	}
+	got := compileFieldExpr(expr, "val")
+	if !strings.Contains(got, "strings.Contains") {
+		t.Errorf("contains = %q", got)
+	}
+}
+
+func TestCompileFieldExpr_ConvertViaCall(t *testing.T) {
+	// it.toFloat() — convert method in field context
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "toFloat"},
+	}
+	got := compileFieldExpr(expr, "val")
+	if !strings.Contains(got, "convert.StringToFloat") {
+		t.Errorf("toFloat = %q", got)
+	}
+}
+
+func TestCompileFieldExpr_UnknownMethod(t *testing.T) {
+	// it.unknownMethod() — falls through all three dispatchers
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "unknownMethod"},
+	}
+	got := compileFieldExpr(expr, "val")
+	if got != "" {
+		t.Errorf("unknown method should return empty, got %q", got)
+	}
+}
+
+func TestCompileFieldExpr_ArgFallback(t *testing.T) {
+	// it.replace("a", "b") — tests arg() helper inside compileFieldExpr
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "replace"},
+		Args: []*ast.NamedArg{
+			{Value: &ast.Literal{Kind: token.String, Value: "a"}},
+			{Value: &ast.Literal{Kind: token.String, Value: "b"}},
+		},
+	}
+	got := compileFieldExpr(expr, "val")
+	if !strings.Contains(got, "strings.ReplaceAll") {
+		t.Errorf("replace = %q", got)
+	}
+}
+
+func TestCompileFieldExpr_MemberNonIt(t *testing.T) {
+	// other.field — MemberExpr with non-it object
+	got := compileFieldExpr(&ast.MemberExpr{
+		Object: &ast.Ident{Name: "other"},
+		Field:  "name",
+	}, "val")
+	if got != "" {
+		t.Errorf("non-it member should return empty, got %q", got)
+	}
+}

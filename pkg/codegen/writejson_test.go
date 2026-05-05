@@ -467,3 +467,167 @@ func TestWriteTransformDirective_WithBody(t *testing.T) {
 		t.Errorf("should compile it.uppercase(): %s", b.String())
 	}
 }
+
+func TestWriteVisibleDirective_EmptyBody(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name: "salary",
+		Type: &ast.TypeRef{Name: "Float"},
+		Directives: []*ast.Directive{
+			{Name: "visible", Body: &ast.Block{}},
+		},
+	}
+	got := writeVisibleDirective(&b, f)
+	if got {
+		t.Error("empty body should return false")
+	}
+}
+
+func TestWriteVisibleDirective_NonExprStmt(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name: "salary",
+		Type: &ast.TypeRef{Name: "Float"},
+		Directives: []*ast.Directive{
+			{Name: "visible", Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ReturnStmt{},
+			}}},
+		},
+	}
+	got := writeVisibleDirective(&b, f)
+	if got {
+		t.Error("non-ExprStmt should return false")
+	}
+}
+
+func TestWriteTransformDirective_EmptyBody(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name: "name",
+		Type: &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{
+			{Name: "transform", Body: &ast.Block{}},
+		},
+	}
+	got := writeTransformDirective(&b, f, "u.Name")
+	if got != "u.Name" {
+		t.Errorf("empty body should return original, got %q", got)
+	}
+}
+
+func TestWriteMaskDirective_Nullable(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name:       "phone",
+		Type:       &ast.TypeRef{Name: "String", Nullable: true},
+		Directives: []*ast.Directive{{Name: "mask"}},
+	}
+	got := writeMaskDirective(&b, f, "u.Phone", "String")
+	if got != "u.Phone" {
+		t.Errorf("nullable @mask should be skipped, got %q", got)
+	}
+}
+
+func TestCompileVisibleExpr_AndOr(t *testing.T) {
+	// my.role == "admin" && my.level > 5
+	expr := &ast.BinaryExpr{
+		Left: &ast.BinaryExpr{
+			Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "my"}, Field: "role"},
+			Op:    "==",
+			Right: &ast.Literal{Kind: token.String, Value: "admin"},
+		},
+		Op: "&&",
+		Right: &ast.BinaryExpr{
+			Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "my"}, Field: "level"},
+			Op:    ">",
+			Right: &ast.Literal{Kind: token.Int, Value: "5"},
+		},
+	}
+	got := compileVisibleExpr(expr)
+	if !strings.Contains(got, "&&") {
+		t.Errorf("should support &&: %q", got)
+	}
+	if !strings.Contains(got, "IdentityString") && !strings.Contains(got, "IdentityInt") {
+		t.Errorf("should use Identity helpers: %q", got)
+	}
+}
+
+func TestWriteTransformDirective_NonExprStmt(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name: "name",
+		Type: &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{
+			{Name: "transform", Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{}}}},
+		},
+	}
+	got := writeTransformDirective(&b, f, "u.Name")
+	if got != "u.Name" {
+		t.Errorf("non-ExprStmt body should return original, got %q", got)
+	}
+}
+
+func TestWriteTransformDirective_EmptyCompile(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name: "name",
+		Type: &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{
+			{Name: "transform", Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ExprStmt{Expr: &ast.BinaryExpr{Left: &ast.Ident{Name: "a"}, Op: "+", Right: &ast.Ident{Name: "b"}}},
+			}}},
+		},
+	}
+	got := writeTransformDirective(&b, f, "u.Name")
+	if got != "u.Name" {
+		t.Errorf("unsupported expr should return original, got %q", got)
+	}
+}
+
+func TestWriteMaskDirective_BadArgs(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name: "phone",
+		Type: &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{
+			{Name: "mask", Args: []*ast.NamedArg{
+				{Value: &ast.Ident{Name: "x"}},
+				{Value: &ast.Ident{Name: "y"}},
+			}},
+		},
+	}
+	got := writeMaskDirective(&b, f, "u.Phone", "String")
+	if got != "u.Phone" {
+		t.Errorf("non-literal args should return original, got %q", got)
+	}
+}
+
+func TestCompileVisibleExpr_EmptyBinary(t *testing.T) {
+	// Binary with unsupported left → empty
+	expr := &ast.BinaryExpr{
+		Left:  &ast.CallExpr{},
+		Op:    "==",
+		Right: &ast.Literal{Kind: token.Int, Value: "1"},
+	}
+	got := compileVisibleExpr(expr)
+	if got != "" {
+		t.Errorf("unsupported left should return empty, got %q", got)
+	}
+}
+
+func TestWriteVisibleDirective_UnsupportedExpr(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name: "salary",
+		Type: &ast.TypeRef{Name: "Float"},
+		Directives: []*ast.Directive{
+			{Name: "visible", Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ExprStmt{Expr: &ast.CallExpr{}},
+			}}},
+		},
+	}
+	got := writeVisibleDirective(&b, f)
+	if got {
+		t.Error("unsupported expr should return false")
+	}
+}
