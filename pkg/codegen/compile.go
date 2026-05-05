@@ -293,6 +293,10 @@ func (c *compiler) compileExprStmt(s *ast.ExprStmt) {
 		c.compileElvisGuard(elvis)
 		return
 	}
+	if bang, ok := s.Expr.(*ast.BangElvisExpr); ok {
+		c.compileBangElvisGuard(bang)
+		return
+	}
 	// Standalone ? operator: riskyCall()? — check and propagate error
 	if inner, hasQ := unwrapQuestion(s.Expr); hasQ {
 		expr := c.compileExpr(inner)
@@ -358,6 +362,16 @@ func (c *compiler) compileElvisGuard(e *ast.ElvisExpr) {
 	c.write("}")
 }
 
+// compileBangElvisGuard: x !: throw Error
+// Left is a bool condition; if true → throw right.
+func (c *compiler) compileBangElvisGuard(e *ast.BangElvisExpr) {
+	left := c.compileExpr(e.Left)
+	right := c.compileThrowExpr(e.Right)
+	c.write("if %s {", left)
+	c.write("\treturn %s", right)
+	c.write("}")
+}
+
 // compileEmit: emit EventName(args)
 func (c *compiler) compileEmit(s *ast.EmitStmt) {
 	var args []string
@@ -392,6 +406,8 @@ func (c *compiler) compileExpr(expr ast.Expr) string {
 	case *ast.ElvisExpr:
 		// Standalone elvis (not as guard) — not common in Phase 1
 		return fmt.Sprintf("/* elvis */ %s", c.compileExpr(e.Left))
+	case *ast.BangElvisExpr:
+		return fmt.Sprintf("/* !: */ %s", c.compileExpr(e.Left))
 	case *ast.UnaryExpr:
 		return c.compileUnary(e)
 	case *ast.ListExpr:

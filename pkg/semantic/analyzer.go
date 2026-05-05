@@ -1299,6 +1299,10 @@ func (a *Analyzer) checkExpr(expr ast.Expr, scope *Scope) *ResolvedType {
 		return a.checkUnaryExpr(e, scope)
 	case *ast.ElvisExpr:
 		return a.checkElvisExpr(e, scope)
+	case *ast.BangElvisExpr:
+		a.checkExpr(e.Left, scope)
+		a.checkExpr(e.Right, scope)
+		return nil
 	case *ast.WhenExpr:
 		return a.checkWhenExpr(e, scope)
 	case *ast.LambdaExpr:

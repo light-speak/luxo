@@ -247,6 +247,7 @@ type modelImportNeeds struct {
 	time    bool
 	uuid    bool
 	decimal bool
+	hash    bool
 }
 
 // scanModelFieldImports checks a single field for import needs in model.gen.go.
@@ -274,11 +275,14 @@ func writeImports(b *strings.Builder, files []*ast.File) {
 			}
 			for _, f := range m.Fields {
 				scanModelFieldImports(f, &needs)
+				if hasDirective(f.Directives, "hash") {
+					needs.hash = true
+				}
 			}
 		}
 	}
 
-	if !needs.time && !needs.uuid && !needs.decimal {
+	if !needs.time && !needs.uuid && !needs.decimal && !needs.hash {
 		return
 	}
 
@@ -291,6 +295,9 @@ func writeImports(b *strings.Builder, files []*ast.File) {
 	}
 	if needs.decimal {
 		b.WriteString("\t\"github.com/shopspring/decimal\"\n")
+	}
+	if needs.hash {
+		b.WriteString("\n\tluxocrypto \"github.com/light-speak/luxo/pkg/lux/crypto\"\n")
 	}
 	b.WriteString(")\n\n")
 }

@@ -249,6 +249,10 @@ func (l *Lexer) readBang(pos token.Position) token.Token {
 		l.advance()
 		return l.makeToken(token.Neq, "!=", pos)
 	}
+	if l.peek() == ':' {
+		l.advance()
+		return l.makeToken(token.BangElvis, "!:", pos)
+	}
 	return l.makeToken(token.Bang, "!", pos)
 }
 
