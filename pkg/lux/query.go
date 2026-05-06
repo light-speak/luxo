@@ -155,8 +155,10 @@ func BuildGroupBySQL(table string, groupCols []string, aggs []GroupAgg, conds []
 		b.WriteString(", ")
 		if agg.Col == "" {
 			fmt.Fprintf(&b, "%s(*)", agg.Fn)
-		} else {
+		} else if agg.Fn == "SUM" || agg.Fn == "AVG" {
 			fmt.Fprintf(&b, "COALESCE(%s(%s), 0)", agg.Fn, agg.Col)
+		} else {
+			fmt.Fprintf(&b, "%s(%s)", agg.Fn, agg.Col)
 		}
 		if agg.Alias != "" {
 			b.WriteString(" AS ")

@@ -6736,8 +6736,10 @@ func TestCompileDateTimePlusDuration(t *testing.T) {
 	c := newCompiler(nil)
 	dur := &ast.MemberExpr{Object: &ast.Literal{Kind: token.Int, Value: "7"}, Field: "days"}
 	dur.SetTypeTag("Duration")
+	nowCall := &ast.CallExpr{Func: &ast.Ident{Name: "now"}}
+	nowCall.SetTypeTag("DateTime")
 	expr := &ast.BinaryExpr{
-		Left:  &ast.CallExpr{Func: &ast.Ident{Name: "now"}},
+		Left:  nowCall,
 		Op:    "+",
 		Right: dur,
 	}
@@ -6754,8 +6756,10 @@ func TestCompileDateTimeMinusDuration(t *testing.T) {
 	c := newCompiler(nil)
 	dur := &ast.MemberExpr{Object: &ast.Literal{Kind: token.Int, Value: "7"}, Field: "days"}
 	dur.SetTypeTag("Duration")
+	nowCall := &ast.CallExpr{Func: &ast.Ident{Name: "now"}}
+	nowCall.SetTypeTag("DateTime")
 	expr := &ast.BinaryExpr{
-		Left:  &ast.CallExpr{Func: &ast.Ident{Name: "now"}},
+		Left:  nowCall,
 		Op:    "-",
 		Right: dur,
 	}

@@ -1449,7 +1449,8 @@ func (a *Analyzer) checkMemberExpr(e *ast.MemberExpr, scope *Scope) *ResolvedTyp
 	a.warnStringContains(e, objType)
 
 	// Duration properties: Int.days, Int.hours, Int.minutes, Int.seconds, Int.milliseconds
-	if objType.IsNumeric() {
+	// Only Int, not Float — duration multiplier must be integer
+	if objType.Kind == TypeInt {
 		switch e.Field {
 		case "days", "hours", "minutes", "seconds", "milliseconds":
 			return a.types["Duration"]

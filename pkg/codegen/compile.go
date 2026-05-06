@@ -1014,7 +1014,8 @@ func (c *compiler) compileBinary(e *ast.BinaryExpr) string {
 	left := c.compileExpr(e.Left)
 	right := c.compileExpr(e.Right)
 	// DateTime +/- Duration → time.Add(duration) / time.Add(-duration)
-	if isDurationExpr(e.Right) && (e.Op == "+" || e.Op == "-") {
+	// Only rewrite when left is DateTime (via TypeTag) and right is Duration
+	if e.Left.GetTypeTag() == "DateTime" && isDurationExpr(e.Right) && (e.Op == "+" || e.Op == "-") {
 		if e.Op == "-" {
 			return fmt.Sprintf("%s.Add(-%s)", left, right)
 		}
