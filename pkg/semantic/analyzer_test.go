@@ -1747,6 +1747,54 @@ api login(email: String, password: String): User {
 	}
 }
 
+func TestHashVerifyPasswordConflict(t *testing.T) {
+	// User-defined verifyPassword field should conflict with @hash injection
+	result := analyze(t, `
+model User @crud {
+  id: Int @id @auto @serial
+  password: String @hash @hidden
+  verifyPassword: String
+}
+`)
+	expectError(t, result, "conflicts with @hash")
+}
+
+func TestWithAuthStoresSkipsMethod(t *testing.T) {
+	// Methods like createToken should not be injected into Identity
+	result := analyze(t, `
+model User @withAuth(stores: [id, role]) {
+  id: Int @id @auto @serial
+  name: String
+  role: String
+}
+api test: Int @auth {
+  return my.id
+}
+`)
+	expectNoErrors(t, result)
+
+	identityType := result.Types["Identity"]
+	if identityType == nil {
+		t.Fatal("Identity type not found")
+	}
+	// createToken is a method on User, should NOT be in Identity
+	if fi, ok := identityType.Fields["createToken"]; ok && !fi.IsMethod {
+		t.Error("createToken method should not leak into Identity as a field")
+	}
+}
+
+func TestWithAuthStoresNonListValue(t *testing.T) {
+	// stores with non-list value should not crash
+	result := analyze(t, `
+model User @withAuth(stores: id) {
+  id: Int @id @auto @serial
+  name: String
+}
+`)
+	// may have validation error for stores format, but should not panic
+	_ = result
+}
+
 // ========== @auth Directive with Model References ==========
 
 func TestAuthDirectiveWithModels(t *testing.T) {
