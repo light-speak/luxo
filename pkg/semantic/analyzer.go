@@ -1442,6 +1442,14 @@ func (a *Analyzer) checkMemberExpr(e *ast.MemberExpr, scope *Scope) *ResolvedTyp
 
 	a.warnStringContains(e, objType)
 
+	// Duration properties: Int.days, Int.hours, Int.minutes, Int.seconds, Int.milliseconds
+	if objType.IsNumeric() {
+		switch e.Field {
+		case "days", "hours", "minutes", "seconds", "milliseconds":
+			return a.types["Duration"]
+		}
+	}
+
 	if result, ok := a.resolveMemberMethod(e, objType); ok {
 		return result
 	}
@@ -1546,6 +1554,14 @@ func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
 	// check CRUD inside lambda (function-style and chain-style)
 	if a.inLambda && isCRUDCall(e) {
 		a.addError(e.Pos, "database query inside collection lambda is forbidden, use batch query instead / 集合 lambda 内禁止数据库查询，请使用批量查询")
+	}
+
+	// Built-in function return types: now() → DateTime, today() → DateTime
+	if ident, ok := e.Func.(*ast.Ident); ok {
+		switch ident.Name {
+		case "now", "today":
+			return a.types["DateTime"]
+		}
 	}
 
 	// transaction { ... } — parsed as CallExpr(Ident("transaction"), [LambdaExpr])

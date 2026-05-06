@@ -5792,10 +5792,12 @@ func TestCompileModifierMethodGroupBy(t *testing.T) {
 	c := newCompiler(models)
 	got := c.compileModelChain("User", []chainLink{
 		{method: "groupBy", args: []*ast.NamedArg{{Value: &ast.Ident{Name: "status"}}}},
-		{method: "all"},
 	})
-	if !strings.Contains(got, `.GroupBy("status")`) {
-		t.Fatalf("groupBy should use snake_case column, got %q", got)
+	if !strings.Contains(got, `"status"`) {
+		t.Fatalf("groupBy should contain column name, got %q", got)
+	}
+	if !strings.Contains(got, "GroupBy(ctx") {
+		t.Fatalf("groupBy should call GroupBy(ctx, ...), got %q", got)
 	}
 }
 
@@ -6688,5 +6690,217 @@ func TestIsBoolExpr(t *testing.T) {
 	}
 	if isBoolExpr(&ast.Ident{Name: "x"}) {
 		t.Error("ident should not be bool")
+	}
+}
+
+// ─── Duration arithmetic ────────────────────────────────────────────────────
+
+func TestCompileDurationProperties(t *testing.T) {
+	c := newCompiler(nil)
+	tests := []struct {
+		field string
+		want  string
+	}{
+		{"days", "(time.Duration(7) * 24 * time.Hour)"},
+		{"hours", "(time.Duration(7) * time.Hour)"},
+		{"minutes", "(time.Duration(7) * time.Minute)"},
+		{"seconds", "(time.Duration(7) * time.Second)"},
+		{"milliseconds", "(time.Duration(7) * time.Millisecond)"},
+	}
+	for _, tt := range tests {
+		expr := &ast.MemberExpr{
+			Object: &ast.Literal{Kind: token.Int, Value: "7"},
+			Field:  tt.field,
+		}
+		got := c.compileExpr(expr)
+		if got != tt.want {
+			t.Errorf("%s: got %q, want %q", tt.field, got, tt.want)
+		}
+	}
+}
+
+func TestCompileNow(t *testing.T) {
+	c := newCompiler(nil)
+	expr := &ast.CallExpr{
+		Func: &ast.Ident{Name: "now"},
+	}
+	got := c.compileExpr(expr)
+	if got != "time.Now()" {
+		t.Errorf("now(): got %q, want %q", got, "time.Now()")
+	}
+}
+
+func TestCompileDateTimePlusDuration(t *testing.T) {
+	c := newCompiler(nil)
+	expr := &ast.BinaryExpr{
+		Left:  &ast.CallExpr{Func: &ast.Ident{Name: "now"}},
+		Op:    "+",
+		Right: &ast.MemberExpr{Object: &ast.Literal{Kind: token.Int, Value: "7"}, Field: "days"},
+	}
+	got := c.compileExpr(expr)
+	if !strings.Contains(got, ".Add(") {
+		t.Errorf("DateTime + Duration should use .Add(): got %q", got)
+	}
+	if strings.Contains(got, ".Add(-") {
+		t.Error("+ should not negate")
+	}
+}
+
+func TestCompileDateTimeMinusDuration(t *testing.T) {
+	c := newCompiler(nil)
+	expr := &ast.BinaryExpr{
+		Left:  &ast.CallExpr{Func: &ast.Ident{Name: "now"}},
+		Op:    "-",
+		Right: &ast.MemberExpr{Object: &ast.Literal{Kind: token.Int, Value: "7"}, Field: "days"},
+	}
+	got := c.compileExpr(expr)
+	if !strings.Contains(got, ".Add(-") {
+		t.Errorf("DateTime - Duration should use .Add(-): got %q", got)
+	}
+}
+
+func TestIsDurationExpr(t *testing.T) {
+	if !isDurationExpr(&ast.MemberExpr{Field: "days"}) {
+		t.Error("days should be duration")
+	}
+	if !isDurationExpr(&ast.MemberExpr{Field: "seconds"}) {
+		t.Error("seconds should be duration")
+	}
+	if isDurationExpr(&ast.MemberExpr{Field: "name"}) {
+		t.Error("name should not be duration")
+	}
+	if !isDurationExpr(&ast.Literal{Kind: token.Duration, Value: "5m"}) {
+		t.Error("5m literal should be duration")
+	}
+	if isDurationExpr(&ast.Literal{Kind: token.Int, Value: "42"}) {
+		t.Error("int literal should not be duration")
+	}
+}
+
+func TestIsModelRef(t *testing.T) {
+	if !isModelRef(&ast.Ident{Name: "User"}) {
+		t.Error("User should be model ref")
+	}
+	if isModelRef(&ast.Ident{Name: "user"}) {
+		t.Error("user should not be model ref")
+	}
+	if isModelRef(&ast.Literal{Kind: token.Int, Value: "7"}) {
+		t.Error("literal should not be model ref")
+	}
+}
+
+func TestDurationSkipsModelField(t *testing.T) {
+	// Model.days should NOT be compiled as duration
+	c := newCompiler(nil)
+	c.enums = map[string]bool{}
+	expr := &ast.MemberExpr{
+		Object: &ast.Ident{Name: "Project"},
+		Field:  "days",
+	}
+	got := c.compileExpr(expr)
+	if strings.Contains(got, "time.Duration") {
+		t.Errorf("Model.days should not be duration: got %q", got)
+	}
+	if !strings.Contains(got, "Project.Days") {
+		t.Errorf("should be normal field access: got %q", got)
+	}
+}
+
+// ─── GroupBy ────────────────────────────────────────────────────────────────
+
+func TestFindGroupByLink(t *testing.T) {
+	links := []chainLink{
+		{method: "where"},
+		{method: "groupBy"},
+		{method: "select"},
+	}
+	idx := findGroupByLink(links)
+	if idx != 1 {
+		t.Errorf("expected 1, got %d", idx)
+	}
+	if findGroupByLink([]chainLink{{method: "where"}, {method: "all"}}) != -1 {
+		t.Error("should be -1 when no groupBy")
+	}
+}
+
+func TestExtractGroupByCols(t *testing.T) {
+	c := newCompiler(nil)
+	// Single field: groupBy { it.apiName }
+	link := chainLink{
+		method: "groupBy",
+		args: []*ast.NamedArg{{Value: &ast.LambdaExpr{
+			Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "apiName"}},
+			}},
+		}}},
+	}
+	cols := c.extractGroupByCols(link)
+	if len(cols) != 1 || cols[0] != `"api_name"` {
+		t.Errorf("expected [\"api_name\"], got %v", cols)
+	}
+}
+
+func TestIsGroupKeyRef(t *testing.T) {
+	if !isGroupKeyRef(&ast.MemberExpr{Field: "key"}) {
+		t.Error("it.key should be key ref")
+	}
+	if isGroupKeyRef(&ast.MemberExpr{Field: "count"}) {
+		t.Error("it.count should not be key ref")
+	}
+}
+
+func TestExtractSelectAggs(t *testing.T) {
+	c := newCompiler(nil)
+	// .select { count: it.count(), totalSum: it.sum { it.total } }
+	link := chainLink{
+		method: "select",
+		args: []*ast.NamedArg{{Value: &ast.LambdaExpr{
+			Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ExprStmt{Expr: &ast.ObjectExpr{
+					Fields: []*ast.NamedArg{
+						{Name: "apiName", Value: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "key"}},
+						{Name: "count", Value: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "count"},
+						}},
+						{Name: "totalSum", Value: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "sum"},
+							Args: []*ast.NamedArg{{Value: &ast.LambdaExpr{
+								Body: &ast.Block{Stmts: []ast.Stmt{
+									&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "total"}},
+								}},
+							}}},
+						}},
+					},
+				}},
+			}},
+		}}},
+	}
+	aggs := c.extractSelectAggs(link)
+	if len(aggs) != 2 {
+		t.Fatalf("expected 2 aggs, got %d: %v", len(aggs), aggs)
+	}
+	if !strings.Contains(aggs[0], "COUNT") {
+		t.Errorf("first agg should be COUNT: %s", aggs[0])
+	}
+	if !strings.Contains(aggs[1], "SUM") || !strings.Contains(aggs[1], "total") {
+		t.Errorf("second agg should be SUM(total): %s", aggs[1])
+	}
+}
+
+func TestCompileCryptoRandomHex(t *testing.T) {
+	c := newCompiler(nil)
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.Ident{Name: "crypto"},
+			Field:  "randomHex",
+		},
+		Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "32"}}},
+	}
+	got := c.compileExpr(expr)
+	if !strings.Contains(got, "luxocrypto.RandomBytes(32)") {
+		t.Errorf("crypto.randomHex: got %q", got)
+	}
+	if !strings.Contains(got, "hex.EncodeToString") {
+		t.Errorf("should use hex.EncodeToString: got %q", got)
 	}
 }

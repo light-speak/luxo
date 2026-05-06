@@ -1,6 +1,7 @@
 package lux
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -276,6 +277,43 @@ func TestBuildAggregateSQLWithConditions(t *testing.T) {
 		t.Errorf("SQL = %q, want %q", sql, want)
 	}
 	if len(args) != 1 || args[0] != "paid" {
+		t.Errorf("args = %v", args)
+	}
+}
+
+func TestBuildGroupBySQL(t *testing.T) {
+	sql, args := BuildGroupBySQL("orders", []string{"status"}, []GroupAgg{
+		{Fn: "COUNT", Alias: "cnt"},
+		{Fn: "SUM", Col: "total", Alias: "total_sum"},
+	}, nil, nil, 0)
+	want := "SELECT status, COUNT(*) AS cnt, COALESCE(SUM(total), 0) AS total_sum FROM orders GROUP BY status"
+	if sql != want {
+		t.Errorf("SQL = %q, want %q", sql, want)
+	}
+	if len(args) != 0 {
+		t.Errorf("args = %v, want empty", args)
+	}
+}
+
+func TestBuildGroupBySQLWithConditions(t *testing.T) {
+	conds := []Condition{NewIntField("project_id").Eq(1)}
+	sql, args := BuildGroupBySQL("traces", []string{"api_name", "status_code"}, []GroupAgg{
+		{Fn: "COUNT", Alias: "cnt"},
+		{Fn: "MAX", Col: "timestamp", Alias: "last_seen"},
+	}, conds, []string{"cnt DESC"}, 10)
+	if !strings.Contains(sql, "GROUP BY api_name, status_code") {
+		t.Errorf("missing GROUP BY: %s", sql)
+	}
+	if !strings.Contains(sql, "WHERE project_id = $1") {
+		t.Errorf("missing WHERE: %s", sql)
+	}
+	if !strings.Contains(sql, "ORDER BY cnt DESC") {
+		t.Errorf("missing ORDER BY: %s", sql)
+	}
+	if !strings.Contains(sql, "LIMIT $2") {
+		t.Errorf("missing LIMIT: %s", sql)
+	}
+	if len(args) != 2 || args[0] != int64(1) {
 		t.Errorf("args = %v", args)
 	}
 }

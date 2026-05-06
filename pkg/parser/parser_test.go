@@ -1154,6 +1154,59 @@ func TestParseIfConditionWithMemberExpr(t *testing.T) {
 	}
 }
 
+func TestParseWhenSubjectNoParen(t *testing.T) {
+	input := `api test(status: Int): String {
+  val result = when status {
+    1 -> "active"
+    2 -> "inactive"
+    else -> "unknown"
+  }
+  return result
+}`
+	file := parse(t, input)
+	val := file.APIs[0].Body.Stmts[0].(*ast.ValStmt)
+	when, ok := val.Value.(*ast.WhenExpr)
+	if !ok {
+		t.Fatalf("expected WhenExpr, got %T", val.Value)
+	}
+	if when.Subject == nil {
+		t.Error("expected when subject")
+	}
+	if len(when.Branches) != 2 {
+		t.Errorf("expected 2 branches, got %d", len(when.Branches))
+	}
+	if when.Else == nil {
+		t.Error("expected else branch")
+	}
+}
+
+func TestParseWhenMemberExprSubject(t *testing.T) {
+	// when rule.metric { ... } — MemberExpr as subject without parens
+	input := `api test(): String {
+  val result = when rule.metric {
+    1 -> "a"
+    2 -> "b"
+  }
+  return result
+}`
+	file := parse(t, input)
+	val := file.APIs[0].Body.Stmts[0].(*ast.ValStmt)
+	when, ok := val.Value.(*ast.WhenExpr)
+	if !ok {
+		t.Fatalf("expected WhenExpr, got %T", val.Value)
+	}
+	if when.Subject == nil {
+		t.Error("expected when subject")
+	}
+	member, ok := when.Subject.(*ast.MemberExpr)
+	if !ok {
+		t.Fatalf("expected MemberExpr subject, got %T", when.Subject)
+	}
+	if member.Field != "metric" {
+		t.Errorf("expected field 'metric', got %q", member.Field)
+	}
+}
+
 func TestParseBangElvisInForCondition(t *testing.T) {
 	input := `api test: Boolean {
   val x = true

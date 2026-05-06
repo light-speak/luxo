@@ -135,6 +135,45 @@ func appendOrderBy(b *strings.Builder, orderBy []string) {
 	b.WriteString(strings.Join(orderBy, ", "))
 }
 
+// GroupAgg represents a single aggregation in a GROUP BY query.
+type GroupAgg struct {
+	Fn    string // "SUM", "AVG", "COUNT", "MAX", "MIN"
+	Col   string // column to aggregate, empty for COUNT(*)
+	Alias string // result alias in output
+}
+
+// BuildGroupBySQL builds a GROUP BY query with multiple aggregations.
+// SELECT groupCols..., AGG(col) AS alias, ... FROM table WHERE ... GROUP BY groupCols... ORDER BY ...
+func BuildGroupBySQL(table string, groupCols []string, aggs []GroupAgg, conds []Condition, orderBy []string, limit int) (string, []any) {
+	var b strings.Builder
+	var args []any
+	argIdx := 1
+
+	b.WriteString("SELECT ")
+	b.WriteString(strings.Join(groupCols, ", "))
+	for _, agg := range aggs {
+		b.WriteString(", ")
+		if agg.Col == "" {
+			fmt.Fprintf(&b, "%s(*)", agg.Fn)
+		} else {
+			fmt.Fprintf(&b, "COALESCE(%s(%s), 0)", agg.Fn, agg.Col)
+		}
+		if agg.Alias != "" {
+			b.WriteString(" AS ")
+			b.WriteString(agg.Alias)
+		}
+	}
+	b.WriteString(" FROM ")
+	b.WriteString(table)
+	argIdx, args = appendWhere(&b, argIdx, args, conds)
+	b.WriteString(" GROUP BY ")
+	b.WriteString(strings.Join(groupCols, ", "))
+	appendOrderBy(&b, orderBy)
+	appendLimitOffset(&b, &argIdx, &args, limit, 0)
+
+	return b.String(), args
+}
+
 func appendLimitOffset(b *strings.Builder, argIdx *int, args *[]any, limit, offset int) {
 	var tmp [20]byte
 	if limit > 0 {
