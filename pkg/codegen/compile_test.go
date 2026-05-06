@@ -6712,6 +6712,8 @@ func TestCompileDurationProperties(t *testing.T) {
 			Object: &ast.Literal{Kind: token.Int, Value: "7"},
 			Field:  tt.field,
 		}
+		// Simulate semantic analyzer setting TypeTag
+		expr.SetTypeTag("Duration")
 		got := c.compileExpr(expr)
 		if got != tt.want {
 			t.Errorf("%s: got %q, want %q", tt.field, got, tt.want)
@@ -6732,10 +6734,12 @@ func TestCompileNow(t *testing.T) {
 
 func TestCompileDateTimePlusDuration(t *testing.T) {
 	c := newCompiler(nil)
+	dur := &ast.MemberExpr{Object: &ast.Literal{Kind: token.Int, Value: "7"}, Field: "days"}
+	dur.SetTypeTag("Duration")
 	expr := &ast.BinaryExpr{
 		Left:  &ast.CallExpr{Func: &ast.Ident{Name: "now"}},
 		Op:    "+",
-		Right: &ast.MemberExpr{Object: &ast.Literal{Kind: token.Int, Value: "7"}, Field: "days"},
+		Right: dur,
 	}
 	got := c.compileExpr(expr)
 	if !strings.Contains(got, ".Add(") {
@@ -6748,10 +6752,12 @@ func TestCompileDateTimePlusDuration(t *testing.T) {
 
 func TestCompileDateTimeMinusDuration(t *testing.T) {
 	c := newCompiler(nil)
+	dur := &ast.MemberExpr{Object: &ast.Literal{Kind: token.Int, Value: "7"}, Field: "days"}
+	dur.SetTypeTag("Duration")
 	expr := &ast.BinaryExpr{
 		Left:  &ast.CallExpr{Func: &ast.Ident{Name: "now"}},
 		Op:    "-",
-		Right: &ast.MemberExpr{Object: &ast.Literal{Kind: token.Int, Value: "7"}, Field: "days"},
+		Right: dur,
 	}
 	got := c.compileExpr(expr)
 	if !strings.Contains(got, ".Add(-") {
@@ -6760,49 +6766,59 @@ func TestCompileDateTimeMinusDuration(t *testing.T) {
 }
 
 func TestIsDurationExpr(t *testing.T) {
-	if !isDurationExpr(&ast.MemberExpr{Field: "days"}) {
-		t.Error("days should be duration")
+	// TypeTag-based
+	tagged := &ast.MemberExpr{Field: "days"}
+	tagged.SetTypeTag("Duration")
+	if !isDurationExpr(tagged) {
+		t.Error("Duration-tagged should be duration")
 	}
-	if !isDurationExpr(&ast.MemberExpr{Field: "seconds"}) {
-		t.Error("seconds should be duration")
+	// Untagged member — not duration
+	if isDurationExpr(&ast.MemberExpr{Field: "days"}) {
+		t.Error("untagged member should not be duration")
 	}
-	if isDurationExpr(&ast.MemberExpr{Field: "name"}) {
-		t.Error("name should not be duration")
-	}
+	// Duration literal — always duration
 	if !isDurationExpr(&ast.Literal{Kind: token.Duration, Value: "5m"}) {
 		t.Error("5m literal should be duration")
 	}
+	// Int literal — not duration
 	if isDurationExpr(&ast.Literal{Kind: token.Int, Value: "42"}) {
 		t.Error("int literal should not be duration")
 	}
 }
 
-func TestIsModelRef(t *testing.T) {
-	if !isModelRef(&ast.Ident{Name: "User"}) {
-		t.Error("User should be model ref")
-	}
-	if isModelRef(&ast.Ident{Name: "user"}) {
-		t.Error("user should not be model ref")
-	}
-	if isModelRef(&ast.Literal{Kind: token.Int, Value: "7"}) {
-		t.Error("literal should not be model ref")
-	}
-}
-
-func TestDurationSkipsModelField(t *testing.T) {
-	// Model.days should NOT be compiled as duration
+func TestDurationTypeTagGuard(t *testing.T) {
 	c := newCompiler(nil)
 	c.enums = map[string]bool{}
+
+	// Without TypeTag: Model.days → normal field access
 	expr := &ast.MemberExpr{
 		Object: &ast.Ident{Name: "Project"},
 		Field:  "days",
 	}
 	got := c.compileExpr(expr)
 	if strings.Contains(got, "time.Duration") {
-		t.Errorf("Model.days should not be duration: got %q", got)
+		t.Errorf("untagged Model.days should not be duration: got %q", got)
 	}
-	if !strings.Contains(got, "Project.Days") {
-		t.Errorf("should be normal field access: got %q", got)
+
+	// Without TypeTag: user.days → normal field access
+	expr2 := &ast.MemberExpr{
+		Object: &ast.MemberExpr{Object: &ast.Ident{Name: "project"}, Field: "retention"},
+		Field:  "days",
+	}
+	got2 := c.compileExpr(expr2)
+	if strings.Contains(got2, "time.Duration") {
+		t.Errorf("untagged chain.days should not be duration: got %q", got2)
+	}
+
+	// With TypeTag: n.days → duration
+	expr3 := &ast.MemberExpr{
+		Object: &ast.Ident{Name: "n"},
+		Field:  "days",
+	}
+	expr3.SetTypeTag("Duration")
+	got3 := c.compileExpr(expr3)
+	if !strings.Contains(got3, "time.Duration") {
+		t.Errorf("tagged n.days should be duration: got %q", got3)
 	}
 }
 

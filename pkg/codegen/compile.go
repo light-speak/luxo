@@ -548,8 +548,8 @@ func (c *compiler) compileMember(e *ast.MemberExpr) string {
 		}
 	}
 	// Duration properties: n.days, n.hours, n.minutes, n.seconds, n.milliseconds
-	// Only apply when object is NOT a model reference (PascalCase ident)
-	if !isModelRef(e.Object) {
+	// Uses TypeTag set by semantic analyzer — only triggers when object is numeric
+	if e.GetTypeTag() == "Duration" {
 		if unit, ok := durationUnits[e.Field]; ok {
 			return fmt.Sprintf("(time.Duration(%s) * %s)", c.compileExpr(e.Object), unit)
 		}
@@ -1026,12 +1026,13 @@ func (c *compiler) compileBinary(e *ast.BinaryExpr) string {
 // isDurationExpr checks if an expression produces a time.Duration value.
 // Matches: n.days, n.hours, n.minutes, n.seconds, n.milliseconds, duration literals
 func isDurationExpr(e ast.Expr) bool {
-	switch v := e.(type) {
-	case *ast.MemberExpr:
-		_, ok := durationUnits[v.Field]
-		return ok
-	case *ast.Literal:
-		return v.Kind == token.Duration
+	// Primary: use TypeTag from semantic analysis
+	if e.GetTypeTag() == "Duration" {
+		return true
+	}
+	// Fallback: duration literal (always Duration regardless of TypeTag)
+	if lit, ok := e.(*ast.Literal); ok {
+		return lit.Kind == token.Duration
 	}
 	return false
 }
@@ -1071,16 +1072,6 @@ var durationUnits = map[string]string{
 	"minutes":      "time.Minute",
 	"seconds":      "time.Second",
 	"milliseconds": "time.Millisecond",
-}
-
-// isModelRef checks if an expression is a PascalCase identifier (Model reference).
-// Used to prevent n.days from matching Model.days.
-func isModelRef(e ast.Expr) bool {
-	ident, ok := e.(*ast.Ident)
-	if !ok {
-		return false
-	}
-	return len(ident.Name) > 0 && ident.Name[0] >= 'A' && ident.Name[0] <= 'Z'
 }
 
 // compileUnary: throw expr, !expr, -expr

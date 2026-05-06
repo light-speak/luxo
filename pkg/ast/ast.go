@@ -216,10 +216,22 @@ type Directive struct {
 type Expr interface {
 	exprNode()
 	GetPos() token.Position
+	GetTypeTag() string
+	SetTypeTag(string)
 }
+
+// TypeTagged provides type tag storage for all Expr nodes via embedding.
+// Semantic analyzer writes the tag; codegen reads it. O(1) access, zero allocation.
+type TypeTagged struct {
+	TypeTag string
+}
+
+func (t *TypeTagged) GetTypeTag() string  { return t.TypeTag }
+func (t *TypeTagged) SetTypeTag(s string) { t.TypeTag = s }
 
 // Literal: 42, 3.14, "hello", true, false, null, 7d
 type Literal struct {
+	TypeTagged
 	Pos   token.Position
 	Kind  token.Type // Int, Float, String, Duration, True, False, Null
 	Value string
@@ -227,12 +239,14 @@ type Literal struct {
 
 // Ident: user, currentUser, Role.ADMIN
 type Ident struct {
+	TypeTagged
 	Pos  token.Position
 	Name string
 }
 
 // MemberExpr: user.name, user?.address?.city
 type MemberExpr struct {
+	TypeTagged
 	Pos      token.Position
 	Object   Expr
 	Field    string
@@ -241,6 +255,7 @@ type MemberExpr struct {
 
 // CallExpr: find(User, id: 1), encrypt(password)
 type CallExpr struct {
+	TypeTagged
 	Pos  token.Position
 	Func Expr
 	Args []*NamedArg
@@ -254,6 +269,7 @@ type NamedArg struct {
 
 // BinaryExpr: a + b, a == b, a && b, a in 1..10
 type BinaryExpr struct {
+	TypeTagged
 	Pos   token.Position
 	Left  Expr
 	Op    string
@@ -262,6 +278,7 @@ type BinaryExpr struct {
 
 // UnaryExpr: !a, -b
 type UnaryExpr struct {
+	TypeTagged
 	Pos   token.Position
 	Op    string
 	Value Expr
@@ -269,6 +286,7 @@ type UnaryExpr struct {
 
 // ElvisExpr: expr ?: fallback
 type ElvisExpr struct {
+	TypeTagged
 	Pos   token.Position
 	Left  Expr
 	Right Expr
@@ -276,6 +294,7 @@ type ElvisExpr struct {
 
 // BangElvisExpr: expr !: fallback
 type BangElvisExpr struct {
+	TypeTagged
 	Pos   token.Position
 	Left  Expr
 	Right Expr
@@ -283,6 +302,7 @@ type BangElvisExpr struct {
 
 // WhenExpr: when(x) { in 90..100 -> "A", else -> "D" }
 type WhenExpr struct {
+	TypeTagged
 	Pos      token.Position
 	Subject  Expr // when(x), nil for when { }
 	Branches []*WhenBranch
@@ -297,6 +317,7 @@ type WhenBranch struct {
 
 // LambdaExpr: { it.name } or { x -> x.name } or { a, b -> a + b }
 type LambdaExpr struct {
+	TypeTagged
 	Pos    token.Position
 	Params []string // named params: { x -> ... }, nil = use implicit 'it'
 	Body   *Block
@@ -304,24 +325,28 @@ type LambdaExpr struct {
 
 // ListExpr: [1, 2, 3]
 type ListExpr struct {
+	TypeTagged
 	Pos   token.Position
 	Items []Expr
 }
 
 // ObjectExpr: { name: "lin", age: 18 }
 type ObjectExpr struct {
+	TypeTagged
 	Pos    token.Position
 	Fields []*NamedArg
 }
 
 // TemplateString: "hello ${user.name}, age ${user.age}"
 type TemplateString struct {
+	TypeTagged
 	Pos   token.Position
 	Parts []Expr // alternating StringLiteral and expressions
 }
 
 // RangeExpr: 1..10
 type RangeExpr struct {
+	TypeTagged
 	Pos   token.Position
 	Start Expr
 	End   Expr
@@ -329,24 +354,28 @@ type RangeExpr struct {
 
 // TransactionExpr: transaction { ... }
 type TransactionExpr struct {
+	TypeTagged
 	Pos  token.Position
 	Body *Block
 }
 
 // YieldExpr: yield expr
 type YieldExpr struct {
+	TypeTagged
 	Pos   token.Position
 	Value Expr
 }
 
 // AsyncExpr: async { ... }
 type AsyncExpr struct {
+	TypeTagged
 	Pos  token.Position
 	Body *Block
 }
 
 // AwaitExpr: await { ... }
 type AwaitExpr struct {
+	TypeTagged
 	Pos  token.Position
 	Body *Block
 }
@@ -378,6 +407,7 @@ type IfStmt struct {
 
 // ForStmt: for item in collection { ... }
 type ForStmt struct {
+	TypeTagged
 	Pos        token.Position
 	VarName    string
 	Collection Expr
