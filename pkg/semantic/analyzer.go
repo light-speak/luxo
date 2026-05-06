@@ -555,6 +555,22 @@ func (a *Analyzer) resolveModelFields(file *ast.File) {
 		if hasModelDirective(m.Directives, "withAuth") {
 			a.injectWithAuthMethods(typ, m.Directives)
 		}
+		// @hash: inject .verifyPassword() method on the model
+		for _, f := range m.Fields {
+			if hasModelDirective(f.Directives, "hash") {
+				if existing, exists := typ.Fields["verifyPassword"]; exists && !existing.IsMethod {
+					a.addError(f.Pos, "field 'verifyPassword' conflicts with @hash injected method / 字段 'verifyPassword' 与 @hash 注入方法冲突")
+					break
+				}
+				typ.Fields["verifyPassword"] = &FieldInfo{
+					Name:     "verifyPassword",
+					Type:     a.types["Boolean"],
+					IsMethod: true,
+					Doc:      ".verifyPassword(plain: String): Boolean — Verify plaintext against @hash field / 校验明文与 @hash 字段",
+				}
+				break
+			}
+		}
 	}
 }
 
@@ -2399,6 +2415,41 @@ func (a *Analyzer) injectWithAuthMethods(typ *ResolvedType, directives []*ast.Di
 		Type:     a.types["String"],
 		IsMethod: true,
 		Doc:      ".refreshToken(token: String): String — Refresh JWT token / 刷新 JWT 令牌",
+	}
+
+	// Inject stores fields into Identity type so my.<field> works for all stored fields
+	identityType := a.types["Identity"]
+	for _, d := range directives {
+		if d.Name != "withAuth" {
+			continue
+		}
+		for _, arg := range d.Args {
+			if arg.Name != "stores" {
+				continue
+			}
+			list, ok := arg.Value.(*ast.ListExpr)
+			if !ok {
+				break
+			}
+			for _, elem := range list.Items {
+				ident, ok := elem.(*ast.Ident)
+				if !ok {
+					continue
+				}
+				// skip fields already defined in Identity (id, role, load)
+				if _, exists := identityType.Fields[ident.Name]; exists {
+					continue
+				}
+				// resolve type from the model's fields, skip methods
+				fieldType := typ.Fields[ident.Name]
+				if fieldType != nil && !fieldType.IsMethod {
+					identityType.Fields[ident.Name] = &FieldInfo{
+						Name: ident.Name,
+						Type: fieldType.Type,
+					}
+				}
+			}
+		}
 	}
 }
 
