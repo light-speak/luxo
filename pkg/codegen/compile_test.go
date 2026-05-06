@@ -6903,6 +6903,122 @@ func TestExtractSelectAggs(t *testing.T) {
 	}
 }
 
+func TestCompileGroupByChainWithWhere(t *testing.T) {
+	models := makeModels("Order")
+	c := newCompiler(models)
+	// Order.where(...).groupBy { it.status }.select { count: it.count() }
+	got := c.compileModelChain("Order", []chainLink{
+		{method: "where", args: []*ast.NamedArg{{Value: &ast.BinaryExpr{
+			Left: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "total"},
+			Op:   ">", Right: &ast.Literal{Kind: token.Int, Value: "100"},
+		}}}},
+		{method: "groupBy", args: []*ast.NamedArg{{Value: &ast.LambdaExpr{
+			Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "status"}},
+			}},
+		}}}},
+		{method: "select", args: []*ast.NamedArg{{Value: &ast.LambdaExpr{
+			Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ExprStmt{Expr: &ast.ObjectExpr{
+					Fields: []*ast.NamedArg{
+						{Name: "status", Value: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "key"}},
+						{Name: "count", Value: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "count"},
+						}},
+					},
+				}},
+			}},
+		}}}},
+	})
+	if !strings.Contains(got, "GroupBy(ctx") {
+		t.Errorf("should call GroupBy: got %q", got)
+	}
+	if !strings.Contains(got, `"status"`) {
+		t.Errorf("should contain group column: got %q", got)
+	}
+	if !strings.Contains(got, "COUNT") {
+		t.Errorf("should contain COUNT agg: got %q", got)
+	}
+}
+
+func TestExtractGroupByColsList(t *testing.T) {
+	c := newCompiler(nil)
+	// groupBy { [it.status, it.apiName] } — multi-column
+	link := chainLink{
+		method: "groupBy",
+		args: []*ast.NamedArg{{Value: &ast.LambdaExpr{
+			Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ExprStmt{Expr: &ast.ListExpr{Items: []ast.Expr{
+					&ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "status"},
+					&ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "apiName"},
+				}}},
+			}},
+		}}},
+	}
+	cols := c.extractGroupByCols(link)
+	if len(cols) != 2 {
+		t.Fatalf("expected 2 cols, got %d: %v", len(cols), cols)
+	}
+}
+
+func TestExtractGroupByColsEmpty(t *testing.T) {
+	c := newCompiler(nil)
+	cols := c.extractGroupByCols(chainLink{method: "groupBy"})
+	if len(cols) != 0 {
+		t.Errorf("empty args should return nil: got %v", cols)
+	}
+}
+
+func TestCompileBuiltinCryptoRandomBytes(t *testing.T) {
+	c := newCompiler(nil)
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.Ident{Name: "crypto"},
+			Field:  "randomBytes",
+		},
+		Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "16"}}},
+	}
+	got := c.compileExpr(expr)
+	if !strings.Contains(got, "luxocrypto.RandomBytes(16)") {
+		t.Errorf("crypto.randomBytes: got %q", got)
+	}
+	if strings.Contains(got, "hex.EncodeToString") {
+		t.Error("randomBytes should NOT use hex encoding")
+	}
+}
+
+func TestCompileBuiltinNonCrypto(t *testing.T) {
+	c := newCompiler(nil)
+	// crypto.unknownMethod → should return empty (not a builtin)
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.Ident{Name: "crypto"},
+			Field:  "unknownMethod",
+		},
+	}
+	got := c.compileBuiltinCall(expr)
+	if got != "" {
+		t.Errorf("unknown crypto method should return empty: got %q", got)
+	}
+	// Non-crypto member → should return empty
+	expr2 := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.Ident{Name: "math"},
+			Field:  "abs",
+		},
+	}
+	got2 := c.compileBuiltinCall(expr2)
+	if got2 != "" {
+		t.Errorf("non-crypto member should return empty: got %q", got2)
+	}
+	// Simple ident (not now) → should return empty
+	expr3 := &ast.CallExpr{Func: &ast.Ident{Name: "print"}}
+	got3 := c.compileBuiltinCall(expr3)
+	if got3 != "" {
+		t.Errorf("print should return empty: got %q", got3)
+	}
+}
+
 func TestCompileCryptoRandomHex(t *testing.T) {
 	c := newCompiler(nil)
 	expr := &ast.CallExpr{
