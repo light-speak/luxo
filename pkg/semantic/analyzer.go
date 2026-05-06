@@ -558,6 +558,10 @@ func (a *Analyzer) resolveModelFields(file *ast.File) {
 		// @hash: inject .verifyPassword() method on the model
 		for _, f := range m.Fields {
 			if hasModelDirective(f.Directives, "hash") {
+				if existing, exists := typ.Fields["verifyPassword"]; exists && !existing.IsMethod {
+					a.addError(f.Pos, "field 'verifyPassword' conflicts with @hash injected method / 字段 'verifyPassword' 与 @hash 注入方法冲突")
+					break
+				}
 				typ.Fields["verifyPassword"] = &FieldInfo{
 					Name:     "verifyPassword",
 					Type:     a.types["Boolean"],
@@ -2436,9 +2440,9 @@ func (a *Analyzer) injectWithAuthMethods(typ *ResolvedType, directives []*ast.Di
 				if _, exists := identityType.Fields[ident.Name]; exists {
 					continue
 				}
-				// resolve type from the model's fields
+				// resolve type from the model's fields, skip methods
 				fieldType := typ.Fields[ident.Name]
-				if fieldType != nil {
+				if fieldType != nil && !fieldType.IsMethod {
 					identityType.Fields[ident.Name] = &FieldInfo{
 						Name: ident.Name,
 						Type: fieldType.Type,
