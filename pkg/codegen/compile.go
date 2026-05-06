@@ -1161,6 +1161,10 @@ func (c *compiler) resolveQueryType(expr ast.Expr) valType {
 			case "sum", "avg", "min", "max":
 				return valType{name: "Int"}
 			}
+			// groupBy chain → returns ([]map[string]any, error)
+			if findGroupByLink(chain) >= 0 {
+				return valType{isList: true, name: "GroupResult"}
+			}
 		}
 	}
 	return valType{}
@@ -1180,6 +1184,10 @@ func (c *compiler) isModelQuery(expr ast.Expr) bool {
 			switch last.method {
 			case "first", "all", "create", "exec", "find", "load", "exists", "update", "delete", "count",
 				"sum", "avg", "min", "max":
+				return true
+			}
+			// groupBy chain: check if any link is groupBy (not necessarily last)
+			if findGroupByLink(chain) >= 0 {
 				return true
 			}
 		}
