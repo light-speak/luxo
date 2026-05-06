@@ -712,3 +712,23 @@ model User {
 `)
 	expectNoErrors(t, result)
 }
+
+func TestUsedVarInCreateNamedArg(t *testing.T) {
+	result := analyze(t, `
+model Team @crud {
+  id: Int @id @auto
+  name: String
+  slug: String
+}
+api test(teamName: String): Team {
+  val slug = teamName
+  val team = Team.create(name: teamName, slug: slug)
+  return team
+}
+`)
+	for _, w := range result.Warnings {
+		if strings.Contains(w.Message, "slug") && strings.Contains(w.Message, "never used") {
+			t.Errorf("slug used in create() named arg should NOT be flagged as unused: %s", w.Message)
+		}
+	}
+}

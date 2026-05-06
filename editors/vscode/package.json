@@ -2,7 +2,7 @@
   "name": "luxo",
   "displayName": "Luxo",
   "description": "Language support for Luxo (.luxo) - Build APIs at the speed of light",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "light-speak",
   "repository": {
     "type": "git",
