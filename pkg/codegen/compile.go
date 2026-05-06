@@ -547,12 +547,24 @@ func (c *compiler) compileMember(e *ast.MemberExpr) string {
 			return ident.Name + strings.ToUpper(e.Field)
 		}
 	}
+	// Duration properties: n.days, n.hours, n.minutes, n.seconds, n.milliseconds
+	// Uses TypeTag set by semantic analyzer — only triggers when object is numeric
+	if e.GetTypeTag() == "Duration" {
+		if unit, ok := durationUnits[e.Field]; ok {
+			return fmt.Sprintf("(time.Duration(%s) * %s)", c.compileExpr(e.Object), unit)
+		}
+	}
 	obj := c.compileExpr(e.Object)
 	return fmt.Sprintf("%s.%s", obj, str.Capitalize(e.Field))
 }
 
 // compileCall: handles Model.where(...).first(), Model.create(...), etc.
 func (c *compiler) compileCall(e *ast.CallExpr) string {
+	// Built-in functions: now(), crypto.randomHex(), etc.
+	if result := c.compileBuiltinCall(e); result != "" {
+		return result
+	}
+
 	// String methods: obj.lowercase() → strings.ToLower(obj)
 	if result := c.compileStringMethod(e); result != "" {
 		return result
@@ -704,6 +716,12 @@ func (c *compiler) compileModelChain(modelName string, links []chainLink) string
 		}
 	}
 
+	// Detect groupBy chain: Model.where(...).groupBy { it.field }.select { ... }
+	if idx := findGroupByLink(links); idx >= 0 {
+		c.compileGroupByChain(&b, modelName, links, idx, scopeInjected)
+		return b.String()
+	}
+
 	for i, link := range links {
 		// Terminal methods — return immediately
 		if done := c.compileTerminalMethod(&b, modelName, link); done {
@@ -749,6 +767,127 @@ func (c *compiler) compileModifierMethod(b *strings.Builder, modelName string, l
 		b.WriteString(strings.Join(args, ", "))
 		b.WriteString(")")
 	}
+}
+
+// findGroupByLink returns the index of a groupBy link, or -1.
+func findGroupByLink(links []chainLink) int {
+	for i, l := range links {
+		if l.method == "groupBy" {
+			return i
+		}
+	}
+	return -1
+}
+
+// compileGroupByChain compiles Model.where(...).groupBy { it.field }.select { aggs... }
+// into a Query.GroupBy(ctx, cols, aggs) call returning []map[string]any.
+func (c *compiler) compileGroupByChain(b *strings.Builder, modelName string, links []chainLink, groupByIdx int, scopeInjected bool) {
+	// Compile preceding where/filter links
+	for i := 0; i < groupByIdx; i++ {
+		c.compileModifierMethod(b, modelName, links[i], i, len(links), scopeInjected)
+	}
+	if b.Len() == 0 {
+		fmt.Fprintf(b, "app.%s", modelName)
+	}
+
+	// Extract group column(s) from groupBy lambda
+	groupLink := links[groupByIdx]
+	groupCols := c.extractGroupByCols(groupLink)
+
+	// Extract aggregations from .select lambda (if present)
+	var aggs []string
+	for i := groupByIdx + 1; i < len(links); i++ {
+		if links[i].method == "select" && len(links[i].args) > 0 {
+			aggs = c.extractSelectAggs(links[i])
+			break
+		}
+	}
+
+	// Generate: .GroupBy(ctx, []string{"col"}, []lux.GroupAgg{...})
+	fmt.Fprintf(b, ".GroupBy(ctx, []string{%s}, []lux.GroupAgg{%s})",
+		strings.Join(groupCols, ", "),
+		strings.Join(aggs, ", "))
+}
+
+// extractGroupByCols extracts column names from groupBy { it.field } or groupBy { [it.f1, it.f2] }.
+func (c *compiler) extractGroupByCols(link chainLink) []string {
+	if len(link.args) == 0 {
+		return nil
+	}
+	arg := link.args[0].Value
+	// Lambda wrapper: unwrap body
+	if lambda, ok := arg.(*ast.LambdaExpr); ok && lambda.Body != nil && len(lambda.Body.Stmts) > 0 {
+		if es, ok := lambda.Body.Stmts[0].(*ast.ExprStmt); ok {
+			arg = es.Expr
+		}
+	}
+	switch e := arg.(type) {
+	case *ast.MemberExpr:
+		return []string{fmt.Sprintf("%q", str.ToSnakeCase(e.Field))}
+	case *ast.ListExpr:
+		var cols []string
+		for _, item := range e.Items {
+			if m, ok := item.(*ast.MemberExpr); ok {
+				cols = append(cols, fmt.Sprintf("%q", str.ToSnakeCase(m.Field)))
+			}
+		}
+		return cols
+	default:
+		val := c.compileExpr(arg)
+		return []string{fmt.Sprintf("%q", str.ToSnakeCase(val))}
+	}
+}
+
+// extractSelectAggs extracts aggregation definitions from .select { key: it.key, count: it.count(), sum: it.sum { it.col } }.
+func (c *compiler) extractSelectAggs(link chainLink) []string {
+	if len(link.args) == 0 {
+		return nil
+	}
+	arg := link.args[0].Value
+	// Unwrap lambda body
+	if lambda, ok := arg.(*ast.LambdaExpr); ok && lambda.Body != nil && len(lambda.Body.Stmts) > 0 {
+		if es, ok := lambda.Body.Stmts[0].(*ast.ExprStmt); ok {
+			arg = es.Expr
+		}
+	}
+	obj, ok := arg.(*ast.ObjectExpr)
+	if !ok {
+		return nil
+	}
+	var aggs []string
+	for _, field := range obj.Fields {
+		// Skip key fields (it.key, it.key[0], etc) — those come from GROUP BY columns
+		if isGroupKeyRef(field.Value) {
+			continue
+		}
+		// Parse aggregation calls: it.count(), it.sum { it.col }, it.avg { it.col }, etc.
+		if call, ok := field.Value.(*ast.CallExpr); ok {
+			if member, ok := call.Func.(*ast.MemberExpr); ok {
+				fn := strings.ToUpper(member.Field)
+				col := ""
+				// Lambda arg: it.sum { it.total } → col = "total"
+				if len(call.Args) > 0 {
+					col = extractLambdaField(call.Args[0].Value)
+				}
+				alias := str.ToSnakeCase(field.Name)
+				if col == "" {
+					aggs = append(aggs, fmt.Sprintf(`{Fn: %q, Alias: %q}`, fn, alias))
+				} else {
+					aggs = append(aggs, fmt.Sprintf(`{Fn: %q, Col: %q, Alias: %q}`, fn, str.ToSnakeCase(col), alias))
+				}
+			}
+		}
+	}
+	return aggs
+}
+
+// isGroupKeyRef checks if an expression references the group key (it.key or it.key[N]).
+func isGroupKeyRef(e ast.Expr) bool {
+	if m, ok := e.(*ast.MemberExpr); ok {
+		return m.Field == "key"
+	}
+	// it.key[0] — IndexExpr on MemberExpr
+	return false
 }
 
 // compileCreateLink compiles a create() link with @hash and nullable field handling.
@@ -874,7 +1013,66 @@ func (c *compiler) compileWhereArg(modelName string, expr ast.Expr) string {
 func (c *compiler) compileBinary(e *ast.BinaryExpr) string {
 	left := c.compileExpr(e.Left)
 	right := c.compileExpr(e.Right)
+	// DateTime +/- Duration → time.Add(duration) / time.Add(-duration)
+	// Only rewrite when left is DateTime (via TypeTag) and right is Duration
+	if e.Left.GetTypeTag() == "DateTime" && isDurationExpr(e.Right) && (e.Op == "+" || e.Op == "-") {
+		if e.Op == "-" {
+			return fmt.Sprintf("%s.Add(-%s)", left, right)
+		}
+		return fmt.Sprintf("%s.Add(%s)", left, right)
+	}
 	return fmt.Sprintf("%s %s %s", left, e.Op, right)
+}
+
+// isDurationExpr checks if an expression produces a time.Duration value.
+// Matches: n.days, n.hours, n.minutes, n.seconds, n.milliseconds, duration literals
+func isDurationExpr(e ast.Expr) bool {
+	// Primary: use TypeTag from semantic analysis
+	if e.GetTypeTag() == "Duration" {
+		return true
+	}
+	// Fallback: duration literal (always Duration regardless of TypeTag)
+	if lit, ok := e.(*ast.Literal); ok {
+		return lit.Kind == token.Duration
+	}
+	return false
+}
+
+// compileBuiltinCall compiles built-in function calls: now(), crypto.randomHex(), etc.
+func (c *compiler) compileBuiltinCall(e *ast.CallExpr) string {
+	// now() → time.Now()
+	if ident, ok := e.Func.(*ast.Ident); ok && ident.Name == "now" {
+		return "time.Now()"
+	}
+	// crypto.randomHex(n) / crypto.randomBytes(n)
+	member, ok := e.Func.(*ast.MemberExpr)
+	if !ok {
+		return ""
+	}
+	ident, ok := member.Object.(*ast.Ident)
+	if !ok || ident.Name != "crypto" {
+		return ""
+	}
+	n := "32"
+	if len(e.Args) > 0 {
+		n = c.compileExpr(e.Args[0].Value)
+	}
+	switch member.Field {
+	case "randomHex":
+		return fmt.Sprintf("hex.EncodeToString(luxocrypto.RandomBytes(%s))", n)
+	case "randomBytes":
+		return fmt.Sprintf("luxocrypto.RandomBytes(%s)", n)
+	}
+	return ""
+}
+
+// durationUnits maps Luxo duration property names to Go time constants.
+var durationUnits = map[string]string{
+	"days":         "24 * time.Hour",
+	"hours":        "time.Hour",
+	"minutes":      "time.Minute",
+	"seconds":      "time.Second",
+	"milliseconds": "time.Millisecond",
 }
 
 // compileUnary: throw expr, !expr, -expr
@@ -964,6 +1162,10 @@ func (c *compiler) resolveQueryType(expr ast.Expr) valType {
 			case "sum", "avg", "min", "max":
 				return valType{name: "Int"}
 			}
+			// groupBy chain → returns ([]map[string]any, error)
+			if findGroupByLink(chain) >= 0 {
+				return valType{isList: true, name: "GroupResult"}
+			}
 		}
 	}
 	return valType{}
@@ -983,6 +1185,10 @@ func (c *compiler) isModelQuery(expr ast.Expr) bool {
 			switch last.method {
 			case "first", "all", "create", "exec", "find", "load", "exists", "update", "delete", "count",
 				"sum", "avg", "min", "max":
+				return true
+			}
+			// groupBy chain: check if any link is groupBy (not necessarily last)
+			if findGroupByLink(chain) >= 0 {
 				return true
 			}
 		}

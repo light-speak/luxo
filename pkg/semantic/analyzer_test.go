@@ -1795,6 +1795,40 @@ model User @withAuth(stores: id) {
 	_ = result
 }
 
+func TestDurationProperties(t *testing.T) {
+	// Duration properties on Int variables: n.days, n.hours, n.minutes, n.seconds
+	// Note: literal 7.days is lexed as FLOAT("7.") + IDENT("days"), use variable instead
+	result := analyze(t, `
+model Task @crud {
+  id: Int @id @auto @serial
+  name: String
+}
+api test(n: Int): Boolean {
+  val d = n.days
+  val h = n.hours
+  val m = n.minutes
+  val s = n.seconds
+  val ms = n.milliseconds
+  return true
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestNowReturnsDateTime(t *testing.T) {
+	result := analyze(t, `
+model Log @crud {
+  id: Int @id @auto @serial
+  timestamp: DateTime
+}
+api test: Boolean {
+  val t = now()
+  return true
+}
+`)
+	expectNoErrors(t, result)
+}
+
 // ========== @auth Directive with Model References ==========
 
 func TestAuthDirectiveWithModels(t *testing.T) {

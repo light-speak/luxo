@@ -134,6 +134,32 @@ func (q *Query[T]) Offset(n int) *Query[T] {
 	return q
 }
 
+// GroupBy executes a GROUP BY query with aggregations and returns rows as []map[string]any.
+// Each map contains group column values + aggregation results.
+func (q *Query[T]) GroupBy(ctx context.Context, groupCols []string, aggs []lux.GroupAgg) ([]map[string]any, error) {
+	query, args := lux.BuildGroupBySQL(q.table, groupCols, aggs, q.conds, q.orderBy, q.limit)
+	rows, err := q.db.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []map[string]any
+	for rows.Next() {
+		vals, err := rows.Values()
+		if err != nil {
+			return nil, err
+		}
+		descs := rows.FieldDescriptions()
+		m := make(map[string]any, len(descs))
+		for i, desc := range descs {
+			m[string(desc.Name)] = vals[i]
+		}
+		results = append(results, m)
+	}
+	return results, rows.Err()
+}
+
 // Delete deletes all matching records.
 func (q *Query[T]) Delete(ctx context.Context) (int64, error) {
 	query, args := lux.BuildDeleteSQL(q.table, q.conds)

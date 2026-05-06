@@ -5792,10 +5792,12 @@ func TestCompileModifierMethodGroupBy(t *testing.T) {
 	c := newCompiler(models)
 	got := c.compileModelChain("User", []chainLink{
 		{method: "groupBy", args: []*ast.NamedArg{{Value: &ast.Ident{Name: "status"}}}},
-		{method: "all"},
 	})
-	if !strings.Contains(got, `.GroupBy("status")`) {
-		t.Fatalf("groupBy should use snake_case column, got %q", got)
+	if !strings.Contains(got, `"status"`) {
+		t.Fatalf("groupBy should contain column name, got %q", got)
+	}
+	if !strings.Contains(got, "GroupBy(ctx") {
+		t.Fatalf("groupBy should call GroupBy(ctx, ...), got %q", got)
 	}
 }
 
@@ -6688,5 +6690,353 @@ func TestIsBoolExpr(t *testing.T) {
 	}
 	if isBoolExpr(&ast.Ident{Name: "x"}) {
 		t.Error("ident should not be bool")
+	}
+}
+
+// ─── Duration arithmetic ────────────────────────────────────────────────────
+
+func TestCompileDurationProperties(t *testing.T) {
+	c := newCompiler(nil)
+	tests := []struct {
+		field string
+		want  string
+	}{
+		{"days", "(time.Duration(7) * 24 * time.Hour)"},
+		{"hours", "(time.Duration(7) * time.Hour)"},
+		{"minutes", "(time.Duration(7) * time.Minute)"},
+		{"seconds", "(time.Duration(7) * time.Second)"},
+		{"milliseconds", "(time.Duration(7) * time.Millisecond)"},
+	}
+	for _, tt := range tests {
+		expr := &ast.MemberExpr{
+			Object: &ast.Literal{Kind: token.Int, Value: "7"},
+			Field:  tt.field,
+		}
+		// Simulate semantic analyzer setting TypeTag
+		expr.SetTypeTag("Duration")
+		got := c.compileExpr(expr)
+		if got != tt.want {
+			t.Errorf("%s: got %q, want %q", tt.field, got, tt.want)
+		}
+	}
+}
+
+func TestCompileNow(t *testing.T) {
+	c := newCompiler(nil)
+	expr := &ast.CallExpr{
+		Func: &ast.Ident{Name: "now"},
+	}
+	got := c.compileExpr(expr)
+	if got != "time.Now()" {
+		t.Errorf("now(): got %q, want %q", got, "time.Now()")
+	}
+}
+
+func TestCompileDateTimePlusDuration(t *testing.T) {
+	c := newCompiler(nil)
+	dur := &ast.MemberExpr{Object: &ast.Literal{Kind: token.Int, Value: "7"}, Field: "days"}
+	dur.SetTypeTag("Duration")
+	nowCall := &ast.CallExpr{Func: &ast.Ident{Name: "now"}}
+	nowCall.SetTypeTag("DateTime")
+	expr := &ast.BinaryExpr{
+		Left:  nowCall,
+		Op:    "+",
+		Right: dur,
+	}
+	got := c.compileExpr(expr)
+	if !strings.Contains(got, ".Add(") {
+		t.Errorf("DateTime + Duration should use .Add(): got %q", got)
+	}
+	if strings.Contains(got, ".Add(-") {
+		t.Error("+ should not negate")
+	}
+}
+
+func TestCompileDateTimeMinusDuration(t *testing.T) {
+	c := newCompiler(nil)
+	dur := &ast.MemberExpr{Object: &ast.Literal{Kind: token.Int, Value: "7"}, Field: "days"}
+	dur.SetTypeTag("Duration")
+	nowCall := &ast.CallExpr{Func: &ast.Ident{Name: "now"}}
+	nowCall.SetTypeTag("DateTime")
+	expr := &ast.BinaryExpr{
+		Left:  nowCall,
+		Op:    "-",
+		Right: dur,
+	}
+	got := c.compileExpr(expr)
+	if !strings.Contains(got, ".Add(-") {
+		t.Errorf("DateTime - Duration should use .Add(-): got %q", got)
+	}
+}
+
+func TestIsDurationExpr(t *testing.T) {
+	// TypeTag-based
+	tagged := &ast.MemberExpr{Field: "days"}
+	tagged.SetTypeTag("Duration")
+	if !isDurationExpr(tagged) {
+		t.Error("Duration-tagged should be duration")
+	}
+	// Untagged member — not duration
+	if isDurationExpr(&ast.MemberExpr{Field: "days"}) {
+		t.Error("untagged member should not be duration")
+	}
+	// Duration literal — always duration
+	if !isDurationExpr(&ast.Literal{Kind: token.Duration, Value: "5m"}) {
+		t.Error("5m literal should be duration")
+	}
+	// Int literal — not duration
+	if isDurationExpr(&ast.Literal{Kind: token.Int, Value: "42"}) {
+		t.Error("int literal should not be duration")
+	}
+}
+
+func TestDurationTypeTagGuard(t *testing.T) {
+	c := newCompiler(nil)
+	c.enums = map[string]bool{}
+
+	// Without TypeTag: Model.days → normal field access
+	expr := &ast.MemberExpr{
+		Object: &ast.Ident{Name: "Project"},
+		Field:  "days",
+	}
+	got := c.compileExpr(expr)
+	if strings.Contains(got, "time.Duration") {
+		t.Errorf("untagged Model.days should not be duration: got %q", got)
+	}
+
+	// Without TypeTag: user.days → normal field access
+	expr2 := &ast.MemberExpr{
+		Object: &ast.MemberExpr{Object: &ast.Ident{Name: "project"}, Field: "retention"},
+		Field:  "days",
+	}
+	got2 := c.compileExpr(expr2)
+	if strings.Contains(got2, "time.Duration") {
+		t.Errorf("untagged chain.days should not be duration: got %q", got2)
+	}
+
+	// With TypeTag: n.days → duration
+	expr3 := &ast.MemberExpr{
+		Object: &ast.Ident{Name: "n"},
+		Field:  "days",
+	}
+	expr3.SetTypeTag("Duration")
+	got3 := c.compileExpr(expr3)
+	if !strings.Contains(got3, "time.Duration") {
+		t.Errorf("tagged n.days should be duration: got %q", got3)
+	}
+}
+
+// ─── GroupBy ────────────────────────────────────────────────────────────────
+
+func TestFindGroupByLink(t *testing.T) {
+	links := []chainLink{
+		{method: "where"},
+		{method: "groupBy"},
+		{method: "select"},
+	}
+	idx := findGroupByLink(links)
+	if idx != 1 {
+		t.Errorf("expected 1, got %d", idx)
+	}
+	if findGroupByLink([]chainLink{{method: "where"}, {method: "all"}}) != -1 {
+		t.Error("should be -1 when no groupBy")
+	}
+}
+
+func TestExtractGroupByCols(t *testing.T) {
+	c := newCompiler(nil)
+	// Single field: groupBy { it.apiName }
+	link := chainLink{
+		method: "groupBy",
+		args: []*ast.NamedArg{{Value: &ast.LambdaExpr{
+			Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "apiName"}},
+			}},
+		}}},
+	}
+	cols := c.extractGroupByCols(link)
+	if len(cols) != 1 || cols[0] != `"api_name"` {
+		t.Errorf("expected [\"api_name\"], got %v", cols)
+	}
+}
+
+func TestIsGroupKeyRef(t *testing.T) {
+	if !isGroupKeyRef(&ast.MemberExpr{Field: "key"}) {
+		t.Error("it.key should be key ref")
+	}
+	if isGroupKeyRef(&ast.MemberExpr{Field: "count"}) {
+		t.Error("it.count should not be key ref")
+	}
+}
+
+func TestExtractSelectAggs(t *testing.T) {
+	c := newCompiler(nil)
+	// .select { count: it.count(), totalSum: it.sum { it.total } }
+	link := chainLink{
+		method: "select",
+		args: []*ast.NamedArg{{Value: &ast.LambdaExpr{
+			Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ExprStmt{Expr: &ast.ObjectExpr{
+					Fields: []*ast.NamedArg{
+						{Name: "apiName", Value: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "key"}},
+						{Name: "count", Value: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "count"},
+						}},
+						{Name: "totalSum", Value: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "sum"},
+							Args: []*ast.NamedArg{{Value: &ast.LambdaExpr{
+								Body: &ast.Block{Stmts: []ast.Stmt{
+									&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "total"}},
+								}},
+							}}},
+						}},
+					},
+				}},
+			}},
+		}}},
+	}
+	aggs := c.extractSelectAggs(link)
+	if len(aggs) != 2 {
+		t.Fatalf("expected 2 aggs, got %d: %v", len(aggs), aggs)
+	}
+	if !strings.Contains(aggs[0], "COUNT") {
+		t.Errorf("first agg should be COUNT: %s", aggs[0])
+	}
+	if !strings.Contains(aggs[1], "SUM") || !strings.Contains(aggs[1], "total") {
+		t.Errorf("second agg should be SUM(total): %s", aggs[1])
+	}
+}
+
+func TestCompileGroupByChainWithWhere(t *testing.T) {
+	models := makeModels("Order")
+	c := newCompiler(models)
+	// Order.where(...).groupBy { it.status }.select { count: it.count() }
+	got := c.compileModelChain("Order", []chainLink{
+		{method: "where", args: []*ast.NamedArg{{Value: &ast.BinaryExpr{
+			Left: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "total"},
+			Op:   ">", Right: &ast.Literal{Kind: token.Int, Value: "100"},
+		}}}},
+		{method: "groupBy", args: []*ast.NamedArg{{Value: &ast.LambdaExpr{
+			Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "status"}},
+			}},
+		}}}},
+		{method: "select", args: []*ast.NamedArg{{Value: &ast.LambdaExpr{
+			Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ExprStmt{Expr: &ast.ObjectExpr{
+					Fields: []*ast.NamedArg{
+						{Name: "status", Value: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "key"}},
+						{Name: "count", Value: &ast.CallExpr{
+							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "count"},
+						}},
+					},
+				}},
+			}},
+		}}}},
+	})
+	if !strings.Contains(got, "GroupBy(ctx") {
+		t.Errorf("should call GroupBy: got %q", got)
+	}
+	if !strings.Contains(got, `"status"`) {
+		t.Errorf("should contain group column: got %q", got)
+	}
+	if !strings.Contains(got, "COUNT") {
+		t.Errorf("should contain COUNT agg: got %q", got)
+	}
+}
+
+func TestExtractGroupByColsList(t *testing.T) {
+	c := newCompiler(nil)
+	// groupBy { [it.status, it.apiName] } — multi-column
+	link := chainLink{
+		method: "groupBy",
+		args: []*ast.NamedArg{{Value: &ast.LambdaExpr{
+			Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ExprStmt{Expr: &ast.ListExpr{Items: []ast.Expr{
+					&ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "status"},
+					&ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "apiName"},
+				}}},
+			}},
+		}}},
+	}
+	cols := c.extractGroupByCols(link)
+	if len(cols) != 2 {
+		t.Fatalf("expected 2 cols, got %d: %v", len(cols), cols)
+	}
+}
+
+func TestExtractGroupByColsEmpty(t *testing.T) {
+	c := newCompiler(nil)
+	cols := c.extractGroupByCols(chainLink{method: "groupBy"})
+	if len(cols) != 0 {
+		t.Errorf("empty args should return nil: got %v", cols)
+	}
+}
+
+func TestCompileBuiltinCryptoRandomBytes(t *testing.T) {
+	c := newCompiler(nil)
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.Ident{Name: "crypto"},
+			Field:  "randomBytes",
+		},
+		Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "16"}}},
+	}
+	got := c.compileExpr(expr)
+	if !strings.Contains(got, "luxocrypto.RandomBytes(16)") {
+		t.Errorf("crypto.randomBytes: got %q", got)
+	}
+	if strings.Contains(got, "hex.EncodeToString") {
+		t.Error("randomBytes should NOT use hex encoding")
+	}
+}
+
+func TestCompileBuiltinNonCrypto(t *testing.T) {
+	c := newCompiler(nil)
+	// crypto.unknownMethod → should return empty (not a builtin)
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.Ident{Name: "crypto"},
+			Field:  "unknownMethod",
+		},
+	}
+	got := c.compileBuiltinCall(expr)
+	if got != "" {
+		t.Errorf("unknown crypto method should return empty: got %q", got)
+	}
+	// Non-crypto member → should return empty
+	expr2 := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.Ident{Name: "math"},
+			Field:  "abs",
+		},
+	}
+	got2 := c.compileBuiltinCall(expr2)
+	if got2 != "" {
+		t.Errorf("non-crypto member should return empty: got %q", got2)
+	}
+	// Simple ident (not now) → should return empty
+	expr3 := &ast.CallExpr{Func: &ast.Ident{Name: "print"}}
+	got3 := c.compileBuiltinCall(expr3)
+	if got3 != "" {
+		t.Errorf("print should return empty: got %q", got3)
+	}
+}
+
+func TestCompileCryptoRandomHex(t *testing.T) {
+	c := newCompiler(nil)
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.Ident{Name: "crypto"},
+			Field:  "randomHex",
+		},
+		Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "32"}}},
+	}
+	got := c.compileExpr(expr)
+	if !strings.Contains(got, "luxocrypto.RandomBytes(32)") {
+		t.Errorf("crypto.randomHex: got %q", got)
+	}
+	if !strings.Contains(got, "hex.EncodeToString") {
+		t.Errorf("should use hex.EncodeToString: got %q", got)
 	}
 }

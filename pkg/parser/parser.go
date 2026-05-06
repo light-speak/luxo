@@ -1412,10 +1412,13 @@ func (p *Parser) parseWhenExpr(pos token.Position) ast.Expr {
 	p.expect(token.When)
 	when := &ast.WhenExpr{Pos: pos}
 
-	// when(subject)
+	// when(subject) { ... } or when subject { ... } or when { ... }
 	if p.match(token.LParen) {
 		when.Subject = p.parseExpr(precNone)
 		p.expect(token.RParen)
+	} else if !p.check(token.LBrace) {
+		// when subject { ... } — parse subject expression stopping before {
+		when.Subject = p.parseConditionExpr()
 	}
 
 	p.expect(token.LBrace)

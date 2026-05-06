@@ -1304,32 +1304,38 @@ func (a *Analyzer) checkExpr(expr ast.Expr, scope *Scope) *ResolvedType {
 		return nil
 	}
 
+	var resolved *ResolvedType
 	switch e := expr.(type) {
 	case *ast.Literal:
-		return a.checkLiteralExpr(e)
+		resolved = a.checkLiteralExpr(e)
 	case *ast.Ident:
-		return a.checkIdentExpr(e, scope)
+		resolved = a.checkIdentExpr(e, scope)
 	case *ast.MemberExpr:
-		return a.checkMemberExpr(e, scope)
+		resolved = a.checkMemberExpr(e, scope)
 	case *ast.CallExpr:
-		return a.checkCallExpr(e, scope)
+		resolved = a.checkCallExpr(e, scope)
 	case *ast.BinaryExpr:
-		return a.checkBinaryExpr(e, scope)
+		resolved = a.checkBinaryExpr(e, scope)
 	case *ast.UnaryExpr:
-		return a.checkUnaryExpr(e, scope)
+		resolved = a.checkUnaryExpr(e, scope)
 	case *ast.ElvisExpr:
-		return a.checkElvisExpr(e, scope)
+		resolved = a.checkElvisExpr(e, scope)
 	case *ast.BangElvisExpr:
 		a.checkExpr(e.Left, scope)
 		a.checkExpr(e.Right, scope)
-		return nil
 	case *ast.WhenExpr:
-		return a.checkWhenExpr(e, scope)
+		resolved = a.checkWhenExpr(e, scope)
 	case *ast.LambdaExpr:
-		return a.checkLambdaExpr(e, scope)
+		resolved = a.checkLambdaExpr(e, scope)
 	default:
-		return a.checkCompositeExpr(expr, scope)
+		resolved = a.checkCompositeExpr(expr, scope)
 	}
+
+	// Write type tag into AST node for codegen to read
+	if resolved != nil {
+		expr.SetTypeTag(resolved.Name)
+	}
+	return resolved
 }
 
 // checkCompositeExpr handles composite expression types (list, object, range, transaction, template).
@@ -1442,6 +1448,15 @@ func (a *Analyzer) checkMemberExpr(e *ast.MemberExpr, scope *Scope) *ResolvedTyp
 
 	a.warnStringContains(e, objType)
 
+	// Duration properties: Int.days, Int.hours, Int.minutes, Int.seconds, Int.milliseconds
+	// Only Int, not Float — duration multiplier must be integer
+	if objType.Kind == TypeInt {
+		switch e.Field {
+		case "days", "hours", "minutes", "seconds", "milliseconds":
+			return a.types["Duration"]
+		}
+	}
+
 	if result, ok := a.resolveMemberMethod(e, objType); ok {
 		return result
 	}
@@ -1546,6 +1561,14 @@ func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
 	// check CRUD inside lambda (function-style and chain-style)
 	if a.inLambda && isCRUDCall(e) {
 		a.addError(e.Pos, "database query inside collection lambda is forbidden, use batch query instead / 集合 lambda 内禁止数据库查询，请使用批量查询")
+	}
+
+	// Built-in function return types: now() → DateTime, today() → DateTime
+	if ident, ok := e.Func.(*ast.Ident); ok {
+		switch ident.Name {
+		case "now", "today":
+			return a.types["DateTime"]
+		}
 	}
 
 	// transaction { ... } — parsed as CallExpr(Ident("transaction"), [LambdaExpr])
