@@ -1395,10 +1395,15 @@ func (a *Analyzer) checkIdentExpr(e *ast.Ident, scope *Scope) *ResolvedType {
 	// check local scope (includes parent scopes)
 	resolved := scope.ResolvedTypeOf(e.Name)
 	if resolved != nil {
+		// mark variable as used
+		if sym := scope.Lookup(e.Name); sym != nil {
+			sym.Used = true
+		}
 		return resolved
 	}
 	sym := scope.Lookup(e.Name)
 	if sym != nil {
+		sym.Used = true
 		return sym.Type
 	}
 	// don't error on built-in operations used as expressions
@@ -1556,6 +1561,15 @@ func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
 			continue
 		}
 		a.checkExpr(arg.Value, callScope)
+		// Named args in CRUD create: also mark variable usage in outer scope
+		// (callScope may shadow variables with model fields)
+		if isCRUD && arg.Name != "" {
+			if ident, ok := arg.Value.(*ast.Ident); ok {
+				if sym := scope.Lookup(ident.Name); sym != nil && sym.Kind == SymVariable {
+					sym.Used = true
+				}
+			}
+		}
 	}
 
 	// 1.3: check create required fields (function-style and chain-style)
