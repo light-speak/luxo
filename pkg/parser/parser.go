@@ -1294,7 +1294,8 @@ func (p *Parser) parseInfixExpr(left ast.Expr) ast.Expr {
 			return p.parseCallArgs(pos, member)
 		}
 		// Lambda call: items.map { it.name } or items.map { x -> x.name }
-		if p.check(token.LBrace) {
+		// Skip in condition context (noBraceLambda) to avoid consuming if/for block
+		if p.check(token.LBrace) && !p.noBraceLambda {
 			return &ast.CallExpr{
 				Pos:  pos,
 				Func: member,

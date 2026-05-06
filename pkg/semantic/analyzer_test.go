@@ -1696,6 +1696,57 @@ model User @withAuth(stores: [id, role]) {
 	}
 }
 
+func TestWithAuthStoresInjectIdentityFields(t *testing.T) {
+	// Regression: my.teamId should work when teamId is in @withAuth(stores: [...])
+	result := analyze(t, `
+model Member @crud @withAuth(stores: [id, teamId, role]) {
+  id: Int @id @auto @serial
+  teamId: Int
+  name: String
+  role: String
+}
+api test: [Member] @auth {
+  val members = Member.where(it.teamId == my.teamId).all()
+  return members
+}
+`)
+	expectNoErrors(t, result)
+
+	identityType := result.Types["Identity"]
+	if identityType == nil {
+		t.Fatal("Identity type not found")
+	}
+	if _, ok := identityType.Fields["teamId"]; !ok {
+		t.Error("teamId should be injected into Identity from @withAuth stores")
+	}
+}
+
+func TestHashInjectsVerifyPassword(t *testing.T) {
+	// Regression: @hash field should inject verifyPassword method on model
+	result := analyze(t, `
+model User @crud @withAuth(stores: [id]) {
+  id: Int @id @auto @serial
+  email: String
+  password: String @hash @hidden
+}
+api login(email: String, password: String): User {
+  val user = User.where(it.email == email).first()
+  user ?: throw error.NotFound
+  user.verifyPassword(password) ?: throw error.NotFound
+  return user
+}
+`)
+	expectNoErrors(t, result)
+
+	userType := result.Types["User"]
+	if userType == nil {
+		t.Fatal("User type not found")
+	}
+	if _, ok := userType.Fields["verifyPassword"]; !ok {
+		t.Error("verifyPassword should be injected for @hash field")
+	}
+}
+
 // ========== @auth Directive with Model References ==========
 
 func TestAuthDirectiveWithModels(t *testing.T) {

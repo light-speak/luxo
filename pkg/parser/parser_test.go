@@ -1133,6 +1133,27 @@ func TestParseBangElvis(t *testing.T) {
 	}
 }
 
+func TestParseIfConditionWithMemberExpr(t *testing.T) {
+	// Regression: MemberRole.OWNER followed by { was parsed as lambda call
+	input := `api test(role: Int): Int {
+  if role != MemberRole.OWNER {
+    val x = 1
+  }
+  return 0
+}`
+	file := parse(t, input)
+	if len(file.APIs) != 1 {
+		t.Fatal("expected 1 API")
+	}
+	if len(file.APIs[0].Body.Stmts) != 2 {
+		t.Fatalf("expected 2 stmts (if + return), got %d", len(file.APIs[0].Body.Stmts))
+	}
+	_, ok := file.APIs[0].Body.Stmts[0].(*ast.IfStmt)
+	if !ok {
+		t.Fatalf("expected IfStmt, got %T", file.APIs[0].Body.Stmts[0])
+	}
+}
+
 func TestParseBangElvisInForCondition(t *testing.T) {
 	input := `api test: Boolean {
   val x = true
