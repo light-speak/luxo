@@ -55,6 +55,14 @@ func generateWriteJSONFile(result *semantic.Result, packageName string, enums ma
 		generateReadLuxo(&b, s, enums)
 	}
 
+	// type declarations — generate WriteLuxo for plain data types (AuthPayload, etc.)
+	for _, file := range result.Files {
+		for _, t := range file.Types {
+			pseudo := &ast.ModelDecl{Name: t.Name, Fields: t.Fields}
+			generateWriteLuxo(&b, pseudo, enums)
+		}
+	}
+
 	return []byte(b.String())
 }
 

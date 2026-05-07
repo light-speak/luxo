@@ -120,9 +120,18 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 		}
 	}
 
-	generateCRUDHandlers(&b, models, enums)
-	inferredNames := generateInferredHandlers(&b, inferredAPIs, modelMap, enums)
 	compiledNames := generateCompiledHandlers(&b, result, modelMap)
+	inferredNames := generateInferredHandlers(&b, inferredAPIs, modelMap, enums)
+
+	// Build set of compiled/inferred names to avoid generating duplicate CRUD handlers
+	compiledSet := make(map[string]bool, len(compiledNames)+len(inferredNames))
+	for _, n := range compiledNames {
+		compiledSet[n] = true
+	}
+	for _, n := range inferredNames {
+		compiledSet[n] = true
+	}
+	generateCRUDHandlers(&b, models, enums, compiledSet)
 
 	// Collect API directives for middleware wrapping
 	apiDirectives := collectAPIDirectives(result)
@@ -141,11 +150,15 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	return []byte(b.String())
 }
 
-func generateCRUDHandlers(b *strings.Builder, models []*ast.ModelDecl, enums map[string]bool) {
+func generateCRUDHandlers(b *strings.Builder, models []*ast.ModelDecl, enums map[string]bool, skipNames map[string]bool) {
 	for _, m := range models {
 		rels := analyzeRelations(m, enums)
 		ops := crudOperations(m)
 		for _, op := range ops {
+			// Skip if a compiled/inferred API with the same name exists
+			if skipNames[crudAPIName(m.Name, op)] {
+				continue
+			}
 			generateHandler(b, m, op, enums, rels)
 		}
 		generateFilterParser(b, m, enums)
@@ -884,9 +897,19 @@ func generateRegisterFuncWithInferred(b *strings.Builder, models []*ast.ModelDec
 	b.WriteString("// RegisterHandlers registers all API handlers with the router.\n")
 	b.WriteString("func RegisterHandlers(router *api.Router, app *App) {\n")
 
+	// Build set of compiled/inferred names to skip duplicate CRUD handlers
+	compiledSet := make(map[string]bool, len(inferredNames))
+	for _, name := range inferredNames {
+		compiledSet[name] = true
+	}
+
 	for _, m := range models {
 		for _, op := range crudOperations(m) {
 			name := crudAPIName(m.Name, op)
+			// Skip CRUD handler if a compiled API with the same name exists
+			if compiledSet[name] {
+				continue
+			}
 			writeHandlerRegistration(b, name, apiDirs[name])
 			writeAPIRegistration(b, name)
 		}

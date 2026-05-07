@@ -1523,13 +1523,14 @@ func TestCompileReturnStringType(t *testing.T) {
 	}
 }
 
-func TestCompileReturnUnknownType(t *testing.T) {
+func TestCompileReturnCustomType(t *testing.T) {
+	// PascalCase return types are now treated as type declarations with WriteLuxo
 	c := newCompiler(nil)
 	c.api = &ast.ApiDecl{Name: "getCustom", ReturnType: &ast.TypeRef{Name: "CustomType"}}
 	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "data"}})
 	out := compilerOut(c)
-	if !strings.Contains(out, "unsupported return type") {
-		t.Fatalf("expected unsupported fallback, got %q", out)
+	if !strings.Contains(out, "WriteLuxo") {
+		t.Fatalf("expected WriteLuxo for custom type, got %q", out)
 	}
 }
 
@@ -1602,7 +1603,7 @@ func TestWriteReturnByTypeScalars(t *testing.T) {
 		{valType{name: "Float"}, "AppendFixed64"},
 		{valType{name: "Boolean"}, "AppendBool"},
 		{valType{name: "String"}, "AppendString"},
-		{valType{name: "Unknown"}, "unsupported return type"},
+		{valType{name: ""}, "unsupported return type"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.vt.name, func(t *testing.T) {
@@ -3026,7 +3027,7 @@ func TestCompileObjectExprFields(t *testing.T) {
 // TestCompileReturnList — return [1, 2, 3]
 func TestCompileReturnList(t *testing.T) {
 	c := newCompiler(nil)
-	c.api = &ast.ApiDecl{Name: "getIds", ReturnType: &ast.TypeRef{Name: "CustomList"}}
+	c.api = &ast.ApiDecl{Name: "getIds", ReturnType: &ast.TypeRef{Name: "Int", IsList: true}}
 	c.compileStmt(&ast.ReturnStmt{
 		Value: &ast.ListExpr{Items: []ast.Expr{
 			&ast.Literal{Kind: token.Int, Value: "1"},
@@ -3037,9 +3038,6 @@ func TestCompileReturnList(t *testing.T) {
 	out := compilerOut(c)
 	if !strings.Contains(out, "[]any{1, 2, 3}") {
 		t.Fatalf("missing list literal, got:\n%s", out)
-	}
-	if !strings.Contains(out, "unsupported return type") {
-		t.Fatalf("missing unsupported marker for list return, got:\n%s", out)
 	}
 }
 

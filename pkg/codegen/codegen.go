@@ -233,6 +233,14 @@ func generateModelFile(result *semantic.Result, packageName string, enums map[st
 		}
 	}
 
+	// type structs (non-DB plain data types like AuthPayload, ProjectOverview)
+	for _, file := range result.Files {
+		for _, t := range file.Types {
+			generateTypeStruct(&b, t, enums)
+			b.WriteByte('\n')
+		}
+	}
+
 	return []byte(b.String())
 }
 

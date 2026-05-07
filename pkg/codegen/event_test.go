@@ -53,7 +53,7 @@ func TestGenerateEventFile(t *testing.T) {
 		`UserId int64`,
 		"func EmitOrderCreated(ctx context.Context, bus event.Bus, e OrderCreatedEvent) error",
 		`bus.Emit(ctx, "OrderCreated", e)`,
-		"func RegisterEvents(bus event.Bus)",
+		"func RegisterEvents(bus event.Bus, app *App)",
 		`event.OnQueueDecode(bus, "OrderCreated", "luxo", unmarshalOrderCreated, func(ctx context.Context, e OrderCreatedEvent)`,
 	}
 	for _, check := range checks {
