@@ -3519,3 +3519,31 @@ api test(): Int {
 `)
 	expectNoErrors(t, result)
 }
+
+func TestDateTimeDurationArithmetic(t *testing.T) {
+	result := analyze(t, `
+model Log @crud {
+  id: Int @id @auto @serial
+  timestamp: DateTime
+  retentionDays: Int
+}
+api test(logId: Int): Boolean {
+  val log = Log.find(id: logId)
+  log ?: throw error.NotFound
+  val cutoff = now() - log.retentionDays.days
+  val future = now() + log.retentionDays.hours
+  return true
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestDurationDurationArithmetic(t *testing.T) {
+	result := analyze(t, `
+api test(a: Int, b: Int): Boolean {
+  val total = a.hours + b.minutes
+  return true
+}
+`)
+	expectNoErrors(t, result)
+}
