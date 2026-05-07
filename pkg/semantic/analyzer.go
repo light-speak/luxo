@@ -1059,6 +1059,8 @@ func (a *Analyzer) checkBodies(file *ast.File) {
 				Kind: SymVariable,
 				Type: a.types["Identity"],
 			})
+			// @stream(EventName): inject `it` with event's field types
+			a.injectStreamIt(api, scope, file)
 			a.checkBlock(api.Body, scope)
 			a.checkUnusedVariables(scope)
 		}
@@ -2424,6 +2426,45 @@ func hasModelDirective(directives []*ast.Directive, name string) bool {
 		}
 	}
 	return false
+}
+
+// injectStreamIt injects `it` into scope for @stream API bodies.
+// `it` has the event's fields so `it.projectId == projectId` works.
+func (a *Analyzer) injectStreamIt(api *ast.ApiDecl, scope *Scope, file *ast.File) {
+	var eventName string
+	for _, d := range api.Directives {
+		if d.Name == "stream" && len(d.Args) > 0 {
+			if ident, ok := d.Args[0].Value.(*ast.Ident); ok {
+				eventName = ident.Name
+			}
+		}
+	}
+	if eventName == "" {
+		return
+	}
+	// Find the event declaration to build `it` type
+	var event *ast.EventDecl
+	for _, ev := range file.Events {
+		if ev.Name == eventName {
+			event = ev
+			break
+		}
+	}
+	if event == nil {
+		return
+	}
+	// Build a type for `it` with event's params as fields
+	itType := &ResolvedType{Kind: TypeModel, Name: eventName, Fields: make(map[string]*FieldInfo)}
+	for _, p := range event.Params {
+		pType := a.resolveTypeRef(p.Type, api.Pos)
+		itType.Fields[p.Name] = &FieldInfo{Name: p.Name, Type: pType}
+	}
+	scope.Define(&Symbol{
+		Name: "it",
+		Kind: SymVariable,
+		Type: itType,
+		Used: true, // implicit, don't warn unused
+	})
 }
 
 func (a *Analyzer) injectWithAuthMethods(typ *ResolvedType, directives []*ast.Directive) {

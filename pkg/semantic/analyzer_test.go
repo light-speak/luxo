@@ -3547,3 +3547,35 @@ api test(a: Int, b: Int): Boolean {
 `)
 	expectNoErrors(t, result)
 }
+
+func TestStreamItInjected(t *testing.T) {
+	result := analyze(t, `
+event TraceIngested(projectId: Int, traceId: String)
+
+api liveTraces(projectId: Int): Int @stream(TraceIngested) {
+  it.projectId == projectId
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestStreamItFieldAccess(t *testing.T) {
+	result := analyze(t, `
+event AlertFired(projectId: Int, severity: String)
+
+api liveAlerts(projectId: Int): Int @stream(AlertFired) {
+  it.projectId == projectId
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestStreamWithoutEventNoIt(t *testing.T) {
+	// @stream without event name — no `it` injected, body should still work
+	result := analyze(t, `
+api watch(): Int @stream {
+  return 1
+}
+`)
+	expectNoErrors(t, result)
+}
