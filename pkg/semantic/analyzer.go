@@ -2362,6 +2362,14 @@ func (a *Analyzer) checkArithmeticOp(op string, left, right *ResolvedType, pos t
 	if right.Nullable {
 		a.addError(pos, "cannot use '%s' on nullable '%s?', unwrap first with ?: / 不能对可空类型 '%s?' 使用 '%s'，请先用 ?: 解包", op, right.Name, right.Name, op)
 	}
+	// DateTime +/- Duration → DateTime
+	if left.Kind == TypeDateTime && right.Kind == TypeDuration && (op == "+" || op == "-") {
+		return a.types["DateTime"]
+	}
+	// Duration + Duration → Duration
+	if left.Kind == TypeDuration && right.Kind == TypeDuration && (op == "+" || op == "-") {
+		return a.types["Duration"]
+	}
 	if !left.IsNumeric() || !right.IsNumeric() {
 		if op == "+" && left.Kind == TypeString {
 			return left // string concatenation
