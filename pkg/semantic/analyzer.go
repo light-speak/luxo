@@ -2442,11 +2442,16 @@ func (a *Analyzer) injectStreamIt(api *ast.ApiDecl, scope *Scope, file *ast.File
 	if eventName == "" {
 		return
 	}
-	// Find the event declaration to build `it` type
+	// Find the event declaration across all files (event may be in another file)
 	var event *ast.EventDecl
-	for _, ev := range file.Events {
-		if ev.Name == eventName {
-			event = ev
+	for _, f := range a.files {
+		for _, ev := range f.Events {
+			if ev.Name == eventName {
+				event = ev
+				break
+			}
+		}
+		if event != nil {
 			break
 		}
 	}
