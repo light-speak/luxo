@@ -208,7 +208,8 @@ func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleN
 				enums:  make(map[string]bool),
 				vars:   make(map[string]valType),
 			}
-			// Make event fields accessible: payload.projectId → payload.ProjectId
+			// Register event param as a known variable so event.field compiles correctly
+			c.vars[paramName] = valType{name: l.EventName + "Event"}
 			for _, stmt := range l.Body.Stmts {
 				c.compileStmt(stmt)
 			}
