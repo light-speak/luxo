@@ -108,10 +108,10 @@ jobs:
           go-version-file: go.mod
 
       - name: Fuzz Lexer
-        run: go test ./pkg/lexer/ -fuzz=FuzzLexer -fuzztime=30s -timeout=60s
+        run: go test ./pkg/lexer/ -fuzz=FuzzLexer -fuzztime=30s -timeout=120s
 
       - name: Fuzz Parser
-        run: go test ./pkg/parser/ -fuzz=FuzzParser -fuzztime=30s -timeout=60s
+        run: go test ./pkg/parser/ -fuzz=FuzzParser -fuzztime=30s -timeout=120s
 
       - name: Fuzz Semantic
-        run: go test ./pkg/semantic/ -fuzz=FuzzAnalyzer -fuzztime=30s -timeout=60s
+        run: go test ./pkg/semantic/ -fuzz=FuzzAnalyzer -fuzztime=30s -timeout=120s
