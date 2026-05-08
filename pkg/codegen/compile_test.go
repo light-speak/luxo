@@ -7065,11 +7065,38 @@ func TestCompileInstanceUpdate(t *testing.T) {
 		},
 	}
 	got := c.compileExpr(expr)
-	if !strings.Contains(got, "app.Project.Where(ProjectWhere.Id.Eq(project.Id)).Update()") {
+	if !strings.Contains(got, "app.Project.Where(ProjectWhere.Id.Eq(project.Id)).Update(ctx") {
 		t.Errorf("instance update: got %q", got)
 	}
-	if !strings.Contains(got, `.SetName("new")`) {
-		t.Errorf("instance update missing SetName: got %q", got)
+	if !strings.Contains(got, `lux.SetField{Col: "name"`) {
+		t.Errorf("instance update missing SetField: got %q", got)
+	}
+}
+
+func TestCompileMyRoleEnumCast(t *testing.T) {
+	c := newCompiler(nil)
+	c.enums = map[string]bool{"MemberRole": true}
+	expr := &ast.MemberExpr{
+		Object: &ast.Ident{Name: "my"},
+		Field:  "role",
+	}
+	expr.SetTypeTag("MemberRole")
+	got := c.compileExpr(expr)
+	if got != `MemberRole(identity.String("role"))` {
+		t.Errorf("my.role enum cast: got %q", got)
+	}
+}
+
+func TestCompileMyFieldNoEnum(t *testing.T) {
+	c := newCompiler(nil)
+	c.enums = map[string]bool{}
+	expr := &ast.MemberExpr{
+		Object: &ast.Ident{Name: "my"},
+		Field:  "teamId",
+	}
+	got := c.compileExpr(expr)
+	if got != `identity.String("teamId")` {
+		t.Errorf("my.teamId: got %q", got)
 	}
 }
 

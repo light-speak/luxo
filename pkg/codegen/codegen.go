@@ -214,12 +214,14 @@ func generateModelFile(result *semantic.Result, packageName string, enums map[st
 		}
 	}
 
-	// extend stubs — generate minimal structs for external types
+	// extend stubs — generate minimal structs for external types (deduplicated)
+	extendDone := make(map[string]bool)
 	for _, file := range result.Files {
 		for _, ext := range file.Extends {
-			if modelNames[ext.Name] {
-				continue // already defined as a full model in this file
+			if modelNames[ext.Name] || extendDone[ext.Name] {
+				continue
 			}
+			extendDone[ext.Name] = true
 			generateExtendStub(&b, ext)
 			b.WriteByte('\n')
 		}
@@ -256,6 +258,7 @@ type modelImportNeeds struct {
 	uuid    bool
 	decimal bool
 	hash    bool
+	auth    bool
 }
 
 // scanModelFieldImports checks a single field for import needs in model.gen.go.
@@ -287,6 +290,9 @@ func writeImports(b *strings.Builder, files []*ast.File) {
 					needs.hash = true
 				}
 			}
+			if hasDirective(m.Directives, "withAuth") {
+				needs.auth = true
+			}
 		}
 		// type declarations may also need imports (DateTime, UUID, Decimal)
 		for _, t := range file.Types {
@@ -296,7 +302,7 @@ func writeImports(b *strings.Builder, files []*ast.File) {
 		}
 	}
 
-	if !needs.time && !needs.uuid && !needs.decimal && !needs.hash {
+	if !needs.time && !needs.uuid && !needs.decimal && !needs.hash && !needs.auth {
 		return
 	}
 
@@ -312,6 +318,9 @@ func writeImports(b *strings.Builder, files []*ast.File) {
 	}
 	if needs.hash {
 		b.WriteString("\n\tluxocrypto \"github.com/light-speak/luxo/pkg/lux/crypto\"\n")
+	}
+	if needs.auth {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/auth\"\n")
 	}
 	b.WriteString(")\n\n")
 }

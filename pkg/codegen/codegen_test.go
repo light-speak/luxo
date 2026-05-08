@@ -1005,3 +1005,37 @@ func TestGenerateModelFileWithTypes(t *testing.T) {
 		t.Error("missing AuthPayload struct")
 	}
 }
+
+func TestWriteImportsWithAuth(t *testing.T) {
+	files := []*ast.File{{
+		Models: []*ast.ModelDecl{{
+			Name:       "User",
+			Fields:     []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}},
+			Directives: []*ast.Directive{{Name: "withAuth"}},
+		}},
+	}}
+	var b strings.Builder
+	writeImports(&b, files)
+	out := b.String()
+	if !strings.Contains(out, "auth") {
+		t.Errorf("@withAuth model should add auth import: %s", out)
+	}
+}
+
+func TestExtendStubDedup(t *testing.T) {
+	r := buildResult(
+		&ast.File{
+			Name:    "a.luxo",
+			Extends: []*ast.ExtendDecl{{Name: "Project", Fields: []*ast.FieldDecl{{Name: "rules", Type: &ast.TypeRef{Name: "Rule", IsList: true}}}}},
+		},
+		&ast.File{
+			Name:    "b.luxo",
+			Extends: []*ast.ExtendDecl{{Name: "Project", Fields: []*ast.FieldDecl{{Name: "events", Type: &ast.TypeRef{Name: "Event", IsList: true}}}}},
+		},
+	)
+	src := generateModelFile(r, "luxo", nil)
+	code := string(src)
+	if strings.Count(code, "type Project struct") > 1 {
+		t.Error("Project struct should appear only once")
+	}
+}

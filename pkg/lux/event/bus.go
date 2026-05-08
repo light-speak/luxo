@@ -31,10 +31,11 @@ type Bus interface {
 	Close()
 }
 
-// Handler processes an event payload.
+// Handler processes an event payload and returns an error if processing fails.
 // For ChanBus, payload is the original struct (zero-copy).
 // For NATSBus, payload is []byte (raw JSON from wire).
-type Handler func(ctx context.Context, payload any)
+// Returning an error signals a delivery failure — the bus may retry or dead-letter.
+type Handler func(ctx context.Context, payload any) error
 
 // NewFromEnv creates a Bus based on environment configuration.
 // If NATS_URL is set, connects to NATS (falls back to ChanBus on failure).
