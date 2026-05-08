@@ -233,6 +233,14 @@ func generateModelFile(result *semantic.Result, packageName string, enums map[st
 		}
 	}
 
+	// type structs (non-DB plain data types like AuthPayload, ProjectOverview)
+	for _, file := range result.Files {
+		for _, t := range file.Types {
+			generateTypeStruct(&b, t, enums)
+			b.WriteByte('\n')
+		}
+	}
+
 	return []byte(b.String())
 }
 
@@ -278,6 +286,12 @@ func writeImports(b *strings.Builder, files []*ast.File) {
 				if hasDirective(f.Directives, "hash") {
 					needs.hash = true
 				}
+			}
+		}
+		// type declarations may also need imports (DateTime, UUID, Decimal)
+		for _, t := range file.Types {
+			for _, f := range t.Fields {
+				scanModelFieldImports(f, &needs)
 			}
 		}
 	}

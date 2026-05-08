@@ -1090,11 +1090,40 @@ func (a *Analyzer) checkBodies(file *ast.File) {
 	for _, on := range file.Listeners {
 		if on.Body != nil {
 			scope := a.scope.Child()
-			// add lambda-style params to scope
-			for _, p := range on.Params {
+			// Build event type from event declaration
+			var eventType *ResolvedType
+			for _, f := range a.files {
+				for _, ev := range f.Events {
+					if ev.Name == on.EventName {
+						evType := &ResolvedType{Kind: TypeModel, Name: ev.Name, Fields: make(map[string]*FieldInfo)}
+						for _, p := range ev.Params {
+							pType := a.resolveTypeRef(p.Type, on.Pos)
+							evType.Fields[p.Name] = &FieldInfo{Name: p.Name, Type: pType}
+						}
+						eventType = evType
+						break
+					}
+				}
+				if eventType != nil {
+					break
+				}
+			}
+			// add lambda-style params to scope with event type
+			if len(on.Params) > 0 {
+				for _, p := range on.Params {
+					scope.Define(&Symbol{
+						Name: p,
+						Kind: SymParam,
+						Type: eventType,
+					})
+				}
+			} else if eventType != nil {
+				// No named params — inject `it` with event type
 				scope.Define(&Symbol{
-					Name: p,
-					Kind: SymParam,
+					Name: "it",
+					Kind: SymVariable,
+					Type: eventType,
+					Used: true,
 				})
 			}
 			a.checkBlock(on.Body, scope)

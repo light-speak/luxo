@@ -465,3 +465,29 @@ func TestGenerateModelNoVerifyWithoutHash(t *testing.T) {
 		t.Error("no @hash should not generate Verify method")
 	}
 }
+
+func TestGenerateTypeStruct(t *testing.T) {
+	var b strings.Builder
+	td := &ast.TypeDecl{
+		Name: "AuthPayload",
+		Fields: []*ast.FieldDecl{
+			{Name: "member", Type: &ast.TypeRef{Name: "Member"}},
+			{Name: "token", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}
+	generateTypeStruct(&b, td, nil)
+	out := b.String()
+	if !strings.Contains(out, "type AuthPayload struct") {
+		t.Errorf("missing struct: %s", out)
+	}
+	if !strings.Contains(out, "*Member") || !strings.Contains(out, "json:\"member\"") {
+		t.Errorf("missing Member pointer field: %s", out)
+	}
+	if !strings.Contains(out, "Token") || !strings.Contains(out, "string") || !strings.Contains(out, "json:\"token\"") {
+		t.Errorf("missing Token field: %s", out)
+	}
+	// Should have json tags but NOT db tags
+	if strings.Contains(out, "db:") {
+		t.Errorf("type struct should not have db tags: %s", out)
+	}
+}

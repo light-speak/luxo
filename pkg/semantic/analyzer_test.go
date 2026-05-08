@@ -3579,3 +3579,30 @@ api watch(): Int @stream {
 `)
 	expectNoErrors(t, result)
 }
+
+func TestOnHandlerNamedParam(t *testing.T) {
+	result := analyze(t, `
+event ProjectDeleted(projectId: Int)
+
+model Trace @crud {
+  id: Int @id @auto @serial
+  projectId: Int @filterable
+}
+
+on ProjectDeleted { ev ->
+  Trace.where(it.projectId == ev.projectId).deleteMany()
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestOnHandlerImplicitIt(t *testing.T) {
+	result := analyze(t, `
+event UserCreated(name: String)
+
+on UserCreated {
+  val n = it.name
+}
+`)
+	expectNoErrors(t, result)
+}

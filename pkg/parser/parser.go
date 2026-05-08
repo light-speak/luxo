@@ -1608,7 +1608,7 @@ func (p *Parser) isTypeName(name string) bool {
 
 func (p *Parser) parseObjectConstruction(pos token.Position, typeName string) ast.Expr {
 	p.expect(token.LBrace)
-	obj := &ast.ObjectExpr{Pos: pos}
+	obj := &ast.ObjectExpr{Pos: pos, TypeName: typeName}
 	for !p.check(token.RBrace) && !p.isEOF() {
 		arg := &ast.NamedArg{}
 		if p.check(token.Ident) && p.peekType() == token.Colon {

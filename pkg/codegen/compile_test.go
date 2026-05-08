@@ -1523,13 +1523,14 @@ func TestCompileReturnStringType(t *testing.T) {
 	}
 }
 
-func TestCompileReturnUnknownType(t *testing.T) {
+func TestCompileReturnCustomType(t *testing.T) {
+	// PascalCase return types are now treated as type declarations with WriteLuxo
 	c := newCompiler(nil)
 	c.api = &ast.ApiDecl{Name: "getCustom", ReturnType: &ast.TypeRef{Name: "CustomType"}}
 	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "data"}})
 	out := compilerOut(c)
-	if !strings.Contains(out, "unsupported return type") {
-		t.Fatalf("expected unsupported fallback, got %q", out)
+	if !strings.Contains(out, "WriteLuxo") {
+		t.Fatalf("expected WriteLuxo for custom type, got %q", out)
 	}
 }
 
@@ -1602,7 +1603,7 @@ func TestWriteReturnByTypeScalars(t *testing.T) {
 		{valType{name: "Float"}, "AppendFixed64"},
 		{valType{name: "Boolean"}, "AppendBool"},
 		{valType{name: "String"}, "AppendString"},
-		{valType{name: "Unknown"}, "unsupported return type"},
+		{valType{name: ""}, "unsupported return type"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.vt.name, func(t *testing.T) {
@@ -3026,7 +3027,7 @@ func TestCompileObjectExprFields(t *testing.T) {
 // TestCompileReturnList — return [1, 2, 3]
 func TestCompileReturnList(t *testing.T) {
 	c := newCompiler(nil)
-	c.api = &ast.ApiDecl{Name: "getIds", ReturnType: &ast.TypeRef{Name: "CustomList"}}
+	c.api = &ast.ApiDecl{Name: "getIds", ReturnType: &ast.TypeRef{Name: "Int", IsList: true}}
 	c.compileStmt(&ast.ReturnStmt{
 		Value: &ast.ListExpr{Items: []ast.Expr{
 			&ast.Literal{Kind: token.Int, Value: "1"},
@@ -3037,9 +3038,6 @@ func TestCompileReturnList(t *testing.T) {
 	out := compilerOut(c)
 	if !strings.Contains(out, "[]any{1, 2, 3}") {
 		t.Fatalf("missing list literal, got:\n%s", out)
-	}
-	if !strings.Contains(out, "unsupported return type") {
-		t.Fatalf("missing unsupported marker for list return, got:\n%s", out)
 	}
 }
 
@@ -7038,5 +7036,145 @@ func TestCompileCryptoRandomHex(t *testing.T) {
 	}
 	if !strings.Contains(got, "hex.EncodeToString") {
 		t.Errorf("should use hex.EncodeToString: got %q", got)
+	}
+}
+
+// ─── Instance methods ─────────────────────────────────────────────────────────
+
+func TestCompileInstanceDelete(t *testing.T) {
+	models := makeModels("Project")
+	c := newCompiler(models)
+	c.vars["project"] = valType{isModel: true, name: "Project"}
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "project"}, Field: "delete"},
+	}
+	got := c.compileExpr(expr)
+	if !strings.Contains(got, "app.Project.Where(ProjectWhere.Id.Eq(project.Id)).Delete(ctx)") {
+		t.Errorf("instance delete: got %q", got)
+	}
+}
+
+func TestCompileInstanceUpdate(t *testing.T) {
+	models := makeModels("Project")
+	c := newCompiler(models)
+	c.vars["project"] = valType{isModel: true, name: "Project"}
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "project"}, Field: "update"},
+		Args: []*ast.NamedArg{
+			{Name: "name", Value: &ast.Literal{Kind: token.String, Value: "new"}},
+		},
+	}
+	got := c.compileExpr(expr)
+	if !strings.Contains(got, "app.Project.Where(ProjectWhere.Id.Eq(project.Id)).Update()") {
+		t.Errorf("instance update: got %q", got)
+	}
+	if !strings.Contains(got, `.SetName("new")`) {
+		t.Errorf("instance update missing SetName: got %q", got)
+	}
+}
+
+func TestCompileInstanceMethodNonModel(t *testing.T) {
+	c := newCompiler(nil)
+	// Non-model variable → should not match
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "str"}, Field: "delete"},
+	}
+	got := c.compileInstanceMethod(expr)
+	if got != "" {
+		t.Errorf("non-model should return empty: got %q", got)
+	}
+}
+
+func TestCompileInstanceMethodNonMember(t *testing.T) {
+	c := newCompiler(nil)
+	// Direct call (not member) → should not match
+	expr := &ast.CallExpr{Func: &ast.Ident{Name: "delete"}}
+	got := c.compileInstanceMethod(expr)
+	if got != "" {
+		t.Errorf("non-member should return empty: got %q", got)
+	}
+}
+
+// ─── isTypeDecl ────────────────────────────────────────────────────────────────
+
+func TestIsTypeDeclVariants(t *testing.T) {
+	c := newCompiler(nil)
+	c.enums = map[string]bool{"Status": true}
+
+	// Enum → not a type
+	if c.isTypeDecl("Status") {
+		t.Error("enum should not be type")
+	}
+	// Primitive → not a type
+	if c.isTypeDecl("Int") {
+		t.Error("Int should not be type")
+	}
+	// Empty → not a type
+	if c.isTypeDecl("") {
+		t.Error("empty should not be type")
+	}
+	// lowercase → not a type
+	if c.isTypeDecl("result") {
+		t.Error("lowercase should not be type")
+	}
+	// PascalCase unknown → IS a type
+	if !c.isTypeDecl("AuthPayload") {
+		t.Error("AuthPayload should be type")
+	}
+	// With explicit types map
+	c.types = map[string]bool{"MyType": true}
+	if !c.isTypeDecl("MyType") {
+		t.Error("MyType in types map should be type")
+	}
+	if c.isTypeDecl("OtherType") {
+		t.Error("OtherType not in types map should not be type")
+	}
+}
+
+// ─── deleteMany terminal ───────────────────────────────────────────────────────
+
+func TestCompileDeleteManyTerminal(t *testing.T) {
+	models := makeModels("Trace")
+	c := newCompiler(models)
+	got := c.compileModelChain("Trace", []chainLink{
+		{method: "where", args: []*ast.NamedArg{{Value: &ast.BinaryExpr{
+			Left: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "projectId"},
+			Op:   "==", Right: &ast.Literal{Kind: token.Int, Value: "1"},
+		}}}},
+		{method: "deleteMany"},
+	})
+	if !strings.Contains(got, ".Delete(ctx)") {
+		t.Errorf("deleteMany should compile to .Delete(ctx): got %q", got)
+	}
+}
+
+// ─── compileObject TypeName ─────────────────────────────────────────────────────
+
+func TestCompileObjectWithTypeName(t *testing.T) {
+	c := newCompiler(nil)
+	expr := &ast.ObjectExpr{
+		TypeName: "AuthPayload",
+		Fields: []*ast.NamedArg{
+			{Name: "token", Value: &ast.Literal{Kind: token.String, Value: "abc"}},
+		},
+	}
+	got := c.compileExpr(expr)
+	if !strings.Contains(got, "AuthPayload{") {
+		t.Errorf("should prefix with TypeName: got %q", got)
+	}
+}
+
+func TestCompileObjectWithoutTypeName(t *testing.T) {
+	c := newCompiler(nil)
+	c.api = &ast.ApiDecl{ReturnType: &ast.TypeRef{Name: "MyResult"}}
+	expr := &ast.ObjectExpr{
+		Fields: []*ast.NamedArg{
+			{Name: "value", Value: &ast.Literal{Kind: token.Int, Value: "1"}},
+		},
+	}
+	got := c.compileExpr(expr)
+	// Should infer type from api return type
+	if !strings.Contains(got, "MyResult{") {
+		t.Errorf("should infer TypeName from api return: got %q", got)
 	}
 }

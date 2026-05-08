@@ -58,6 +58,20 @@ func generateModel(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) 
 	}
 }
 
+// generateTypeStruct generates a Go struct for a `type` declaration (non-DB plain data).
+// No db tags, no auto timestamps, no @hash — just json fields.
+func generateTypeStruct(b *strings.Builder, t *ast.TypeDecl, enums map[string]bool) {
+	fields, maxName, maxType := collectFieldInfos(t.Fields, enums)
+	fmt.Fprintf(b, "type %s struct {\n", t.Name)
+	for _, fi := range fields {
+		fmt.Fprintf(b, "\t%-*s %-*s `json:%q`\n",
+			maxName, fi.goName,
+			maxType, fi.goType,
+			fi.jsonTag)
+	}
+	b.WriteString("}\n")
+}
+
 // generateExtendStub generates a minimal Go struct for an extend declaration.
 // This provides type information for cross-module references.
 func generateExtendStub(b *strings.Builder, ext *ast.ExtendDecl) {

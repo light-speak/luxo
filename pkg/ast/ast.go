@@ -330,11 +330,12 @@ type ListExpr struct {
 	Items []Expr
 }
 
-// ObjectExpr: { name: "lin", age: 18 }
+// ObjectExpr: { name: "lin", age: 18 } or TypeName { name: "lin", age: 18 }
 type ObjectExpr struct {
 	TypeTagged
-	Pos    token.Position
-	Fields []*NamedArg
+	Pos      token.Position
+	TypeName string // set when constructed with TypeName { ... }, e.g. AuthPayload { ... }
+	Fields   []*NamedArg
 }
 
 // TemplateString: "hello ${user.name}, age ${user.age}"

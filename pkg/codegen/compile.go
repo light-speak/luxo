@@ -81,6 +81,7 @@ type compiler struct {
 	b           *strings.Builder
 	indent      string
 	models      map[string]*ast.ModelDecl
+	types       map[string]bool // type declaration names (AuthPayload, etc.)
 	enums       map[string]bool // enum type names
 	api         *ast.ApiDecl
 	vars        map[string]valType // variable name → resolved type
@@ -256,7 +257,12 @@ func (c *compiler) writeReturnByType(expr string, vt valType) {
 	case "String":
 		c.write("req.Buf.B = codec.AppendString(req.Buf.B, %s)", expr)
 	default:
-		c.write("_ = %s // unsupported return type for binary encoding", expr)
+		// Try as type with WriteLuxo (AuthPayload, ProjectOverview, etc.)
+		if c.isTypeDecl(vt.name) {
+			c.write("%s.WriteLuxo(req.Buf, req.FieldMask)", expr)
+		} else {
+			c.write("_ = %s // unsupported return type for binary encoding", expr)
+		}
 	}
 }
 
@@ -277,8 +283,33 @@ func (c *compiler) writeScalarReturn(expr string) {
 			c.write("req.Buf.B = codec.AppendString(req.Buf.B, %s)", expr)
 			return
 		}
+		// Try as type with WriteLuxo
+		if c.isTypeDecl(c.api.ReturnType.Name) {
+			c.write("%s.WriteLuxo(req.Buf, req.FieldMask)", expr)
+			return
+		}
 	}
 	c.write("_ = %s // unsupported return type for binary encoding", expr)
+}
+
+// isTypeDecl checks if a name is a known `type` declaration (has WriteLuxo but is not a model).
+func (c *compiler) isTypeDecl(name string) bool {
+	if c.types != nil {
+		return c.types[name]
+	}
+	// Fallback: if not a model, not a primitive, not an enum — assume it's a type
+	if _, isModel := c.models[name]; isModel {
+		return false
+	}
+	if c.enums[name] {
+		return false
+	}
+	switch name {
+	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes", "", "GroupResult":
+		return false
+	}
+	// PascalCase and not recognized — likely a type declaration
+	return len(name) > 0 && name[0] >= 'A' && name[0] <= 'Z'
 }
 
 // compileThrow: throw ErrorName(args)
@@ -558,10 +589,54 @@ func (c *compiler) compileMember(e *ast.MemberExpr) string {
 	return fmt.Sprintf("%s.%s", obj, str.Capitalize(e.Field))
 }
 
+// compileInstanceMethod compiles model instance methods like variable.delete(), variable.update(...).
+// Returns empty string if not a model instance method.
+func (c *compiler) compileInstanceMethod(e *ast.CallExpr) string {
+	member, ok := e.Func.(*ast.MemberExpr)
+	if !ok {
+		return ""
+	}
+	ident, ok := member.Object.(*ast.Ident)
+	if !ok {
+		return ""
+	}
+	// Check if variable is a model instance via vars map
+	vt, known := c.vars[ident.Name]
+	if !known || !vt.isModel || vt.isList {
+		return ""
+	}
+	modelName := vt.name
+	varName := ident.Name
+	switch member.Field {
+	case "delete":
+		if m, ok := c.models[modelName]; ok && isSoftDelete(m) {
+			return fmt.Sprintf("app.%s.Where(%sWhere.Id.Eq(%s.Id)).SoftDelete(ctx)", modelName, modelName, varName)
+		}
+		return fmt.Sprintf("app.%s.Where(%sWhere.Id.Eq(%s.Id)).Delete(ctx)", modelName, modelName, varName)
+	case "update":
+		var b strings.Builder
+		fmt.Fprintf(&b, "app.%s.Where(%sWhere.Id.Eq(%s.Id)).Update()", modelName, modelName, varName)
+		for _, arg := range e.Args {
+			if arg.Name != "" {
+				val := c.compileExpr(arg.Value)
+				fmt.Fprintf(&b, ".Set%s(%s)", str.Capitalize(arg.Name), val)
+			}
+		}
+		b.WriteString(".Exec(ctx)")
+		return b.String()
+	}
+	return ""
+}
+
 // compileCall: handles Model.where(...).first(), Model.create(...), etc.
 func (c *compiler) compileCall(e *ast.CallExpr) string {
 	// Built-in functions: now(), crypto.randomHex(), etc.
 	if result := c.compileBuiltinCall(e); result != "" {
+		return result
+	}
+
+	// Model instance methods: variable.delete() → app.Model.Where(Id.Eq(variable.Id)).Delete(ctx)
+	if result := c.compileInstanceMethod(e); result != "" {
 		return result
 	}
 
@@ -1157,7 +1232,7 @@ func (c *compiler) resolveQueryType(expr ast.Expr) valType {
 				return valType{name: "Int"}
 			case "update":
 				return valType{name: "Int"} // rows affected
-			case "delete":
+			case "delete", "deleteMany":
 				return valType{name: "Int"} // rows affected
 			case "sum", "avg", "min", "max":
 				return valType{name: "Int"}
@@ -1183,7 +1258,7 @@ func (c *compiler) isModelQuery(expr ast.Expr) bool {
 			// Check terminal method
 			last := chain[len(chain)-1]
 			switch last.method {
-			case "first", "all", "create", "exec", "find", "load", "exists", "update", "delete", "count",
+			case "first", "all", "create", "exec", "find", "load", "exists", "update", "delete", "deleteMany", "count",
 				"sum", "avg", "min", "max":
 				return true
 			}
@@ -1330,7 +1405,7 @@ func (c *compiler) compileTerminalMethod(b *strings.Builder, modelName string, l
 	// Check if this is a terminal method first
 	isTerminal := false
 	switch link.method {
-	case "delete", "all", "first", "exists", "exec", "count", "update", "upsert", "save", "sum", "avg", "min", "max":
+	case "delete", "deleteMany", "all", "first", "exists", "exec", "count", "update", "upsert", "save", "sum", "avg", "min", "max":
 		isTerminal = true
 	}
 	if !isTerminal {
@@ -1342,6 +1417,13 @@ func (c *compiler) compileTerminalMethod(b *strings.Builder, modelName string, l
 	}
 	switch link.method {
 	case "delete":
+		if m, ok := c.models[modelName]; ok && isSoftDelete(m) {
+			fmt.Fprintf(b, ".SoftDelete(ctx)")
+		} else {
+			fmt.Fprintf(b, ".Delete(ctx)")
+		}
+		return true
+	case "deleteMany":
 		if m, ok := c.models[modelName]; ok && isSoftDelete(m) {
 			fmt.Fprintf(b, ".SoftDelete(ctx)")
 		} else {
@@ -1566,7 +1648,13 @@ func (c *compiler) compileObject(e *ast.ObjectExpr) string {
 		val := c.compileExpr(f.Value)
 		fields = append(fields, fmt.Sprintf("%s: %s", str.Capitalize(f.Name), val))
 	}
-	return "{" + strings.Join(fields, ", ") + "}"
+	prefix := ""
+	if e.TypeName != "" {
+		prefix = e.TypeName
+	} else if c.api != nil && c.api.ReturnType != nil && c.isTypeDecl(c.api.ReturnType.Name) {
+		prefix = c.api.ReturnType.Name
+	}
+	return prefix + "{" + strings.Join(fields, ", ") + "}"
 }
 
 // compileWhen: when { cond -> expr, else -> expr }

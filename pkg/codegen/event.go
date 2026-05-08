@@ -46,8 +46,21 @@ func generateEventFile(result *semantic.Result, packageName string) []byte {
 		generateEmitFunc(&b, e)
 	}
 
+	// Collect models for compiling on-handler bodies
+	var models []*ast.ModelDecl
+	for _, file := range result.Files {
+		models = append(models, file.Models...)
+	}
+	modelMap := make(map[string]*ast.ModelDecl, len(models))
+	for _, m := range models {
+		modelMap[m.Name] = m
+	}
+
+	// Collect enums for on-handler body compilation
+	enums := CollectEnumsFromResult(result)
+
 	// RegisterEvents function — wires all on-listeners
-	generateRegisterEvents(&b, listeners, packageName)
+	generateRegisterEvents(&b, listeners, packageName, modelMap, enums)
 
 	return []byte(b.String())
 }
@@ -173,9 +186,9 @@ func generateEmitFunc(b *strings.Builder, e *ast.EventDecl) {
 // Default uses OnQueueDecode with moduleName as the queue group (competing consumers).
 // Listeners with @broadcast use OnDecode (every instance receives).
 // Unmarshal uses Luxo binary (UnmarshalLuxo) for wire decoding.
-func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleName string) {
+func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleName string, models map[string]*ast.ModelDecl, enums map[string]bool) {
 	b.WriteString("// RegisterEvents registers all event listeners with the bus.\n")
-	b.WriteString("func RegisterEvents(bus event.Bus) {\n")
+	b.WriteString("func RegisterEvents(bus event.Bus, app *App) {\n")
 
 	for _, l := range listeners {
 		paramName := "payload"
@@ -183,14 +196,29 @@ func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleN
 			paramName = l.Params[0]
 		}
 		eventType := l.EventName + "Event"
-		// Use generated UnmarshalLuxo wrapper as the decode function
 		unmarshalFunc := fmt.Sprintf("unmarshal%s", l.EventName)
 		if l.Broadcast {
 			fmt.Fprintf(b, "\tevent.OnDecode(bus, %q, %s, func(ctx context.Context, %s %s) {\n", l.EventName, unmarshalFunc, paramName, eventType)
 		} else {
 			fmt.Fprintf(b, "\tevent.OnQueueDecode(bus, %q, %q, %s, func(ctx context.Context, %s %s) {\n", l.EventName, moduleName, unmarshalFunc, paramName, eventType)
 		}
-		fmt.Fprintf(b, "\t\t_ = %s\n", paramName)
+		// Compile on-handler body if present
+		if l.Body != nil && len(l.Body.Stmts) > 0 {
+			c := &compiler{
+				b:      b,
+				indent: "\t\t",
+				models: models,
+				enums:  enums,
+				vars:   make(map[string]valType),
+			}
+			// Register event param as a known variable so event.field compiles correctly
+			c.vars[paramName] = valType{name: l.EventName + "Event"}
+			for _, stmt := range l.Body.Stmts {
+				c.compileStmt(stmt)
+			}
+		} else {
+			fmt.Fprintf(b, "\t\t_ = %s\n", paramName)
+		}
 		b.WriteString("\t})\n")
 	}
 
