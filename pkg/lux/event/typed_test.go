@@ -20,9 +20,10 @@ func TestOnDecodeDirectPayload(t *testing.T) {
 	var got testEvent
 	done := make(chan struct{})
 
-	OnDecode(bus, "test.event", json.Unmarshal, func(ctx context.Context, payload testEvent) {
+	OnDecode(bus, "test.event", json.Unmarshal, func(ctx context.Context, payload testEvent) error {
 		got = payload
 		close(done)
+		return nil
 	})
 
 	bus.Emit(context.Background(), "test.event", testEvent{UserID: 42, Name: "alice"})
@@ -45,9 +46,10 @@ func TestOnDecodeFromBytes(t *testing.T) {
 	var got testEvent
 	done := make(chan struct{})
 
-	OnDecode(bus, "test.bytes", json.Unmarshal, func(ctx context.Context, payload testEvent) {
+	OnDecode(bus, "test.bytes", json.Unmarshal, func(ctx context.Context, payload testEvent) error {
 		got = payload
 		close(done)
+		return nil
 	})
 
 	// Simulate NATSBus by emitting []byte
@@ -72,9 +74,10 @@ func TestOnQueueDecodeDirectPayload(t *testing.T) {
 	var got testEvent
 	done := make(chan struct{})
 
-	OnQueueDecode(bus, "queue.test", "group1", json.Unmarshal, func(ctx context.Context, payload testEvent) {
+	OnQueueDecode(bus, "queue.test", "group1", json.Unmarshal, func(ctx context.Context, payload testEvent) error {
 		got = payload
 		close(done)
+		return nil
 	})
 
 	bus.Emit(context.Background(), "queue.test", testEvent{UserID: 99, Name: "carol"})
@@ -95,8 +98,9 @@ func TestOnDecodeIgnoresUnknownType(t *testing.T) {
 	defer bus.Close()
 
 	var count atomic.Int32
-	OnDecode(bus, "typed.only", json.Unmarshal, func(ctx context.Context, payload testEvent) {
+	OnDecode(bus, "typed.only", json.Unmarshal, func(ctx context.Context, payload testEvent) error {
 		count.Add(1)
+		return nil
 	})
 
 	// Emit a completely different type — handler should not fire
@@ -115,9 +119,10 @@ func TestOnQueueDecodeFromBytes(t *testing.T) {
 	var got testEvent
 	done := make(chan struct{})
 
-	OnQueueDecode(bus, "queue.bytes", "group1", json.Unmarshal, func(ctx context.Context, payload testEvent) {
+	OnQueueDecode(bus, "queue.bytes", "group1", json.Unmarshal, func(ctx context.Context, payload testEvent) error {
 		got = payload
 		close(done)
+		return nil
 	})
 
 	// Simulate NATSBus by emitting []byte
@@ -140,8 +145,9 @@ func TestOnQueueDecodeIgnoresUnknownType(t *testing.T) {
 	defer bus.Close()
 
 	var count atomic.Int32
-	OnQueueDecode(bus, "queue.typed", "g1", json.Unmarshal, func(ctx context.Context, payload testEvent) {
+	OnQueueDecode(bus, "queue.typed", "g1", json.Unmarshal, func(ctx context.Context, payload testEvent) error {
 		count.Add(1)
+		return nil
 	})
 
 	bus.Emit(context.Background(), "queue.typed", 12345)
@@ -157,8 +163,9 @@ func TestOnQueueDecodeInvalidJSON(t *testing.T) {
 	defer bus.Close()
 
 	var count atomic.Int32
-	OnQueueDecode(bus, "queue.bad", "g1", json.Unmarshal, func(ctx context.Context, payload testEvent) {
+	OnQueueDecode(bus, "queue.bad", "g1", json.Unmarshal, func(ctx context.Context, payload testEvent) error {
 		count.Add(1)
+		return nil
 	})
 
 	bus.Emit(context.Background(), "queue.bad", []byte("{invalid"))
@@ -174,8 +181,9 @@ func TestOnDecodeInvalidJSON(t *testing.T) {
 	defer bus.Close()
 
 	var count atomic.Int32
-	OnDecode(bus, "bad.json", json.Unmarshal, func(ctx context.Context, payload testEvent) {
+	OnDecode(bus, "bad.json", json.Unmarshal, func(ctx context.Context, payload testEvent) error {
 		count.Add(1)
+		return nil
 	})
 
 	// Emit invalid JSON bytes — handler should not fire

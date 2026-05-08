@@ -3,6 +3,7 @@ package event
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 )
 
@@ -107,7 +108,9 @@ func (b *ChanBus) dispatch(name string, ch chan message) {
 			b.mu.RUnlock()
 
 			for _, h := range handlers {
-				safeCall(h, msg.ctx, msg.payload)
+				if err := safeCall(h, msg.ctx, msg.payload); err != nil {
+					fmt.Fprintf(os.Stderr, "event %s handler error: %v\n", name, err)
+				}
 			}
 		case <-b.done:
 			return
@@ -116,9 +119,14 @@ func (b *ChanBus) dispatch(name string, ch chan message) {
 }
 
 // safeCall calls handler with panic recovery to prevent one handler from killing the dispatcher.
-func safeCall(h Handler, ctx context.Context, payload any) {
-	defer func() { recover() }()
-	h(ctx, payload)
+// Returns the handler's error, or a panic-wrapped error if the handler panicked.
+func safeCall(h Handler, ctx context.Context, payload any) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("event handler panic: %v", r)
+		}
+	}()
+	return h(ctx, payload)
 }
 
 // Close shuts down all dispatchers and channels.

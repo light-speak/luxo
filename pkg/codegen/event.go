@@ -198,9 +198,9 @@ func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleN
 		eventType := l.EventName + "Event"
 		unmarshalFunc := fmt.Sprintf("unmarshal%s", l.EventName)
 		if l.Broadcast {
-			fmt.Fprintf(b, "\tevent.OnDecode(bus, %q, %s, func(ctx context.Context, %s %s) {\n", l.EventName, unmarshalFunc, paramName, eventType)
+			fmt.Fprintf(b, "\tevent.OnDecode(bus, %q, %s, func(ctx context.Context, %s %s) error {\n", l.EventName, unmarshalFunc, paramName, eventType)
 		} else {
-			fmt.Fprintf(b, "\tevent.OnQueueDecode(bus, %q, %q, %s, func(ctx context.Context, %s %s) {\n", l.EventName, moduleName, unmarshalFunc, paramName, eventType)
+			fmt.Fprintf(b, "\tevent.OnQueueDecode(bus, %q, %q, %s, func(ctx context.Context, %s %s) error {\n", l.EventName, moduleName, unmarshalFunc, paramName, eventType)
 		}
 		// Compile on-handler body if present
 		if l.Body != nil && len(l.Body.Stmts) > 0 {
@@ -216,8 +216,10 @@ func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleN
 			for _, stmt := range l.Body.Stmts {
 				c.compileStmt(stmt)
 			}
+			fmt.Fprintf(b, "\t\treturn nil\n")
 		} else {
 			fmt.Fprintf(b, "\t\t_ = %s\n", paramName)
+			fmt.Fprintf(b, "\t\treturn nil\n")
 		}
 		b.WriteString("\t})\n")
 	}

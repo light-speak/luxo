@@ -567,11 +567,17 @@ func (c *compiler) compileMember(e *ast.MemberExpr) string {
 			return fmt.Sprintf("errors.%s", str.Capitalize(e.Field))
 		}
 		// my.id → identity.ID(), my.field → identity.String("field")
+		// my.role (enum) → MemberRole(identity.String("role"))
 		if ident.Name == "my" {
 			if e.Field == "id" {
 				return "identity.ID()"
 			}
-			return fmt.Sprintf("identity.String(%q)", e.Field)
+			accessor := fmt.Sprintf("identity.String(%q)", e.Field)
+			// If the MemberExpr has a TypeTag that's an enum, wrap with type cast
+			if tag := e.GetTypeTag(); tag != "" && c.enums[tag] {
+				return fmt.Sprintf("%s(%s)", tag, accessor)
+			}
+			return accessor
 		}
 		// Enum.VALUE → EnumVALUE (Go enum constant)
 		if c.enums[ident.Name] {
@@ -614,16 +620,15 @@ func (c *compiler) compileInstanceMethod(e *ast.CallExpr) string {
 		}
 		return fmt.Sprintf("app.%s.Where(%sWhere.Id.Eq(%s.Id)).Delete(ctx)", modelName, modelName, varName)
 	case "update":
-		var b strings.Builder
-		fmt.Fprintf(&b, "app.%s.Where(%sWhere.Id.Eq(%s.Id)).Update()", modelName, modelName, varName)
+		var sets []string
 		for _, arg := range e.Args {
 			if arg.Name != "" {
 				val := c.compileExpr(arg.Value)
-				fmt.Fprintf(&b, ".Set%s(%s)", str.Capitalize(arg.Name), val)
+				sets = append(sets, fmt.Sprintf("lux.SetField{Col: %q, Val: %s}", str.ToSnakeCase(arg.Name), val))
 			}
 		}
-		b.WriteString(".Exec(ctx)")
-		return b.String()
+		return fmt.Sprintf("app.%s.Where(%sWhere.Id.Eq(%s.Id)).Update(ctx, %s)",
+			modelName, modelName, varName, strings.Join(sets, ", "))
 	}
 	return ""
 }

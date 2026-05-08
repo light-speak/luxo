@@ -7065,11 +7065,11 @@ func TestCompileInstanceUpdate(t *testing.T) {
 		},
 	}
 	got := c.compileExpr(expr)
-	if !strings.Contains(got, "app.Project.Where(ProjectWhere.Id.Eq(project.Id)).Update()") {
+	if !strings.Contains(got, "app.Project.Where(ProjectWhere.Id.Eq(project.Id)).Update(ctx") {
 		t.Errorf("instance update: got %q", got)
 	}
-	if !strings.Contains(got, `.SetName("new")`) {
-		t.Errorf("instance update missing SetName: got %q", got)
+	if !strings.Contains(got, `lux.SetField{Col: "name"`) {
+		t.Errorf("instance update missing SetField: got %q", got)
 	}
 }
 

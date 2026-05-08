@@ -15,9 +15,10 @@ func TestChanBusEmitOn(t *testing.T) {
 	var received atomic.Value
 	done := make(chan struct{})
 
-	bus.On("user.created", func(ctx context.Context, payload any) {
+	bus.On("user.created", func(ctx context.Context, payload any) error {
 		received.Store(payload)
 		close(done)
+		return nil
 	})
 
 	bus.Emit(context.Background(), "user.created", map[string]any{"id": 1})
@@ -42,13 +43,15 @@ func TestChanBusMultipleHandlers(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	bus.On("order.placed", func(ctx context.Context, payload any) {
+	bus.On("order.placed", func(ctx context.Context, payload any) error {
 		count.Add(1)
 		wg.Done()
+		return nil
 	})
-	bus.On("order.placed", func(ctx context.Context, payload any) {
+	bus.On("order.placed", func(ctx context.Context, payload any) error {
 		count.Add(1)
 		wg.Done()
+		return nil
 	})
 
 	bus.Emit(context.Background(), "order.placed", "test")
@@ -74,8 +77,9 @@ func TestChanBusBufferFull(t *testing.T) {
 	defer bus.Close()
 
 	block := make(chan struct{})
-	bus.On("slow", func(ctx context.Context, payload any) {
+	bus.On("slow", func(ctx context.Context, payload any) error {
 		<-block
+		return nil
 	})
 
 	bus.Emit(context.Background(), "slow", "1")
@@ -90,7 +94,7 @@ func TestChanBusBufferFull(t *testing.T) {
 func TestChanBusClose(t *testing.T) {
 	bus := NewChanBus(10)
 
-	bus.On("test", func(ctx context.Context, payload any) {})
+	bus.On("test", func(ctx context.Context, payload any) error { return nil })
 	bus.Close()
 	bus.Close() // double close should not panic
 
@@ -110,9 +114,10 @@ func TestChanBusTypedPayload(t *testing.T) {
 	done := make(chan struct{})
 	var got OrderEvent
 
-	bus.On("order.created", func(ctx context.Context, payload any) {
+	bus.On("order.created", func(ctx context.Context, payload any) error {
 		got = payload.(OrderEvent) // direct type assertion, zero serialization
 		close(done)
+		return nil
 	})
 
 	bus.Emit(context.Background(), "order.created", OrderEvent{OrderID: 1, UserID: 42, Total: 99.99})
@@ -130,9 +135,10 @@ func TestChanBusConcurrent(t *testing.T) {
 	var count atomic.Int32
 	var wg sync.WaitGroup
 
-	bus.On("concurrent", func(ctx context.Context, payload any) {
+	bus.On("concurrent", func(ctx context.Context, payload any) error {
 		count.Add(1)
 		wg.Done()
+		return nil
 	})
 
 	n := 100
@@ -154,13 +160,14 @@ func TestChanBusHandlerPanicRecovery(t *testing.T) {
 	var count atomic.Int32
 	done := make(chan struct{})
 
-	bus.On("crash", func(ctx context.Context, payload any) {
+	bus.On("crash", func(ctx context.Context, payload any) error {
 		count.Add(1)
 		panic("boom")
 	})
-	bus.On("crash", func(ctx context.Context, payload any) {
+	bus.On("crash", func(ctx context.Context, payload any) error {
 		count.Add(1)
 		close(done)
+		return nil
 	})
 
 	bus.Emit(context.Background(), "crash", "test")
@@ -177,7 +184,7 @@ func TestChanBusHandlerPanicRecovery(t *testing.T) {
 }
 
 func TestSafeCall(t *testing.T) {
-	safeCall(func(ctx context.Context, payload any) {
+	safeCall(func(ctx context.Context, payload any) error {
 		panic("should not crash")
 	}, context.Background(), nil)
 }
@@ -203,9 +210,10 @@ func TestChanBusOnQueue(t *testing.T) {
 	var received atomic.Value
 	done := make(chan struct{})
 
-	bus.OnQueue("user.created", "user-service", func(ctx context.Context, payload any) {
+	bus.OnQueue("user.created", "user-service", func(ctx context.Context, payload any) error {
 		received.Store(payload)
 		close(done)
+		return nil
 	})
 
 	bus.Emit(context.Background(), "user.created", map[string]any{"id": 1})
@@ -230,13 +238,15 @@ func TestChanBusOnQueueMultipleGroups(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	bus.OnQueue("order.created", "user-service", func(ctx context.Context, payload any) {
+	bus.OnQueue("order.created", "user-service", func(ctx context.Context, payload any) error {
 		count.Add(1)
 		wg.Done()
+		return nil
 	})
-	bus.OnQueue("order.created", "post-service", func(ctx context.Context, payload any) {
+	bus.OnQueue("order.created", "post-service", func(ctx context.Context, payload any) error {
 		count.Add(1)
 		wg.Done()
+		return nil
 	})
 
 	bus.Emit(context.Background(), "order.created", "test")
@@ -249,7 +259,7 @@ func TestChanBusOnQueueMultipleGroups(t *testing.T) {
 
 func TestChanBusEmitAfterClose(t *testing.T) {
 	bus := NewChanBus(10)
-	bus.On("test", func(ctx context.Context, payload any) {})
+	bus.On("test", func(ctx context.Context, payload any) error { return nil })
 	bus.Close()
 
 	err := bus.Emit(context.Background(), "test", "data")
@@ -262,7 +272,7 @@ func TestChanBusOnAfterClose(t *testing.T) {
 	bus := NewChanBus(10)
 	bus.Close()
 
-	err := bus.On("test", func(ctx context.Context, payload any) {})
+	err := bus.On("test", func(ctx context.Context, payload any) error { return nil })
 	if err == nil {
 		t.Fatal("On after Close should return error")
 	}

@@ -37,10 +37,11 @@ func TestNATSBusEmitOn(t *testing.T) {
 	var received atomic.Value
 	done := make(chan struct{})
 
-	bus.On("test.nats.emit", func(ctx context.Context, payload any) {
+	bus.On("test.nats.emit", func(ctx context.Context, payload any) error {
 		// NATSBus delivers []byte from wire
 		received.Store(string(payload.([]byte)))
 		close(done)
+		return nil
 	})
 
 	time.Sleep(50 * time.Millisecond)
@@ -73,13 +74,15 @@ func TestNATSBusMultipleHandlers(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	bus.On("test.nats.multi", func(ctx context.Context, payload any) {
+	bus.On("test.nats.multi", func(ctx context.Context, payload any) error {
 		count.Add(1)
 		wg.Done()
+		return nil
 	})
-	bus.On("test.nats.multi", func(ctx context.Context, payload any) {
+	bus.On("test.nats.multi", func(ctx context.Context, payload any) error {
 		count.Add(1)
 		wg.Done()
+		return nil
 	})
 
 	time.Sleep(50 * time.Millisecond)
@@ -107,9 +110,10 @@ func TestNATSBusTypedPayload(t *testing.T) {
 	done := make(chan struct{})
 	var got OrderEvent
 
-	bus.On("test.nats.typed", func(ctx context.Context, payload any) {
+	bus.On("test.nats.typed", func(ctx context.Context, payload any) error {
 		json.Unmarshal(payload.([]byte), &got)
 		close(done)
+		return nil
 	})
 
 	time.Sleep(50 * time.Millisecond)
@@ -136,11 +140,12 @@ func TestNATSBusHandlerPanicRecovery(t *testing.T) {
 
 	done := make(chan struct{})
 
-	bus.On("test.nats.panic", func(ctx context.Context, payload any) {
+	bus.On("test.nats.panic", func(ctx context.Context, payload any) error {
 		panic("boom")
 	})
-	bus.On("test.nats.after.panic", func(ctx context.Context, payload any) {
+	bus.On("test.nats.after.panic", func(ctx context.Context, payload any) error {
 		close(done)
+		return nil
 	})
 
 	time.Sleep(50 * time.Millisecond)
@@ -162,7 +167,7 @@ func TestNATSBusClose(t *testing.T) {
 		t.Skipf("NATS not available: %v", err)
 	}
 
-	bus.On("test.nats.close", func(ctx context.Context, payload any) {})
+	bus.On("test.nats.close", func(ctx context.Context, payload any) error { return nil })
 	bus.Close()
 	bus.Close() // double close should not panic
 }
@@ -175,7 +180,7 @@ func TestNATSBusOnAfterClose(t *testing.T) {
 
 	bus.Close()
 
-	err = bus.On("test.nats.closed", func(ctx context.Context, payload any) {})
+	err = bus.On("test.nats.closed", func(ctx context.Context, payload any) error { return nil })
 	if err == nil {
 		t.Fatal("expected error subscribing on closed bus")
 	}
@@ -185,8 +190,9 @@ func TestChanBusDispatchChannelClose(t *testing.T) {
 	bus := NewChanBus(1)
 
 	block := make(chan struct{})
-	bus.On("dispatch.close", func(ctx context.Context, payload any) {
+	bus.On("dispatch.close", func(ctx context.Context, payload any) error {
 		<-block
+		return nil
 	})
 
 	bus.Emit(context.Background(), "dispatch.close", "1")
@@ -210,9 +216,10 @@ func TestNATSBusOnQueue(t *testing.T) {
 	var received atomic.Value
 	done := make(chan struct{})
 
-	bus.OnQueue("test.nats.queue.basic", "user-service", func(ctx context.Context, payload any) {
+	bus.OnQueue("test.nats.queue.basic", "user-service", func(ctx context.Context, payload any) error {
 		received.Store(string(payload.([]byte)))
 		close(done)
+		return nil
 	})
 
 	time.Sleep(50 * time.Millisecond)
@@ -243,13 +250,15 @@ func TestNATSBusOnQueueCompeting(t *testing.T) {
 	n := 50
 	wg.Add(n)
 
-	bus.OnQueue("test.nats.queue.compete", "same-group", func(ctx context.Context, payload any) {
+	bus.OnQueue("test.nats.queue.compete", "same-group", func(ctx context.Context, payload any) error {
 		count.Add(1)
 		wg.Done()
+		return nil
 	})
-	bus.OnQueue("test.nats.queue.compete", "same-group", func(ctx context.Context, payload any) {
+	bus.OnQueue("test.nats.queue.compete", "same-group", func(ctx context.Context, payload any) error {
 		count.Add(1)
 		wg.Done()
+		return nil
 	})
 
 	time.Sleep(50 * time.Millisecond)
@@ -277,13 +286,15 @@ func TestNATSBusOnQueueCrossGroup(t *testing.T) {
 	n := 20
 	wg.Add(n * 2)
 
-	bus.OnQueue("test.nats.queue.cross", "user-service", func(ctx context.Context, payload any) {
+	bus.OnQueue("test.nats.queue.cross", "user-service", func(ctx context.Context, payload any) error {
 		userCount.Add(1)
 		wg.Done()
+		return nil
 	})
-	bus.OnQueue("test.nats.queue.cross", "post-service", func(ctx context.Context, payload any) {
+	bus.OnQueue("test.nats.queue.cross", "post-service", func(ctx context.Context, payload any) error {
 		postCount.Add(1)
 		wg.Done()
+		return nil
 	})
 
 	time.Sleep(50 * time.Millisecond)
@@ -309,7 +320,7 @@ func TestNATSBusOnQueueAfterClose(t *testing.T) {
 
 	bus.Close()
 
-	err = bus.OnQueue("test.nats.queue.closed", "group", func(ctx context.Context, payload any) {})
+	err = bus.OnQueue("test.nats.queue.closed", "group", func(ctx context.Context, payload any) error { return nil })
 	if err == nil {
 		t.Fatal("expected error on closed bus")
 	}
@@ -324,11 +335,12 @@ func TestNATSBusOnQueuePanicRecovery(t *testing.T) {
 
 	done := make(chan struct{})
 
-	bus.OnQueue("test.nats.queue.panic", "group", func(ctx context.Context, payload any) {
+	bus.OnQueue("test.nats.queue.panic", "group", func(ctx context.Context, payload any) error {
 		panic("boom in queue handler")
 	})
-	bus.On("test.nats.queue.panic.after", func(ctx context.Context, payload any) {
+	bus.On("test.nats.queue.panic.after", func(ctx context.Context, payload any) error {
 		close(done)
+		return nil
 	})
 
 	time.Sleep(50 * time.Millisecond)
@@ -357,9 +369,10 @@ func TestNATSBusConcurrent(t *testing.T) {
 	n := 50
 	wg.Add(n)
 
-	bus.On("test.nats.concurrent", func(ctx context.Context, payload any) {
+	bus.On("test.nats.concurrent", func(ctx context.Context, payload any) error {
 		count.Add(1)
 		wg.Done()
+		return nil
 	})
 
 	time.Sleep(50 * time.Millisecond)
@@ -407,9 +420,10 @@ func TestNATSBusEmitLuxoMarshaler(t *testing.T) {
 	var received atomic.Value
 	done := make(chan struct{})
 
-	bus.On("test.nats.luxo.marshal", func(ctx context.Context, payload any) {
+	bus.On("test.nats.luxo.marshal", func(ctx context.Context, payload any) error {
 		received.Store(payload.([]byte))
 		close(done)
+		return nil
 	})
 
 	time.Sleep(50 * time.Millisecond)
