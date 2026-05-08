@@ -2432,3 +2432,38 @@ func TestGenerateBeforeSave_NonExprBody(t *testing.T) {
 		t.Error("non-ExprStmt body should generate nothing")
 	}
 }
+
+func TestCRUDHandlerSkipDuplicate(t *testing.T) {
+	models := []*ast.ModelDecl{
+		{Name: "Project", Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}, {Name: "auto"}, {Name: "serial"}}},
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+		}, Directives: []*ast.Directive{{Name: "crud"}}},
+	}
+	skipNames := map[string]bool{"createProject": true, "deleteProject": true}
+	var b strings.Builder
+	generateCRUDHandlers(&b, models, nil, skipNames)
+	code := b.String()
+	if strings.Contains(code, "func handleCreateProject(") {
+		t.Error("should skip createProject (overridden by compiled API)")
+	}
+	if strings.Contains(code, "func handleDeleteProject(") {
+		t.Error("should skip deleteProject (overridden by compiled API)")
+	}
+	if !strings.Contains(code, "func handleGetProject(") {
+		t.Error("should still have getProject")
+	}
+}
+
+func TestCRUDHandlerSkipDebug(t *testing.T) {
+	models := []*ast.ModelDecl{
+		{Name: "Project", Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}, {Name: "auto"}, {Name: "serial"}}},
+		}, Directives: []*ast.Directive{{Name: "crud"}}},
+	}
+	ops := crudOperations(models[0])
+	t.Logf("ops: %v", ops)
+	for _, op := range ops {
+		t.Logf("crudAPIName(Project, %s) = %s", op, crudAPIName("Project", op))
+	}
+}

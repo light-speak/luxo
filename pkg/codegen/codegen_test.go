@@ -979,3 +979,29 @@ func TestWriteImports_NoHash(t *testing.T) {
 		t.Errorf("no @hash should not import luxocrypto: %s", b.String())
 	}
 }
+
+func TestGenerateModelFileWithTypes(t *testing.T) {
+	r := buildResult(&ast.File{
+		Name: "test.luxo",
+		Models: []*ast.ModelDecl{
+			{Name: "User", Fields: []*ast.FieldDecl{
+				{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+				{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			}},
+		},
+		Types: []*ast.TypeDecl{
+			{Name: "AuthPayload", Fields: []*ast.FieldDecl{
+				{Name: "user", Type: &ast.TypeRef{Name: "User"}},
+				{Name: "token", Type: &ast.TypeRef{Name: "String"}},
+			}},
+		},
+	})
+	src := generateModelFile(r, "luxo", nil)
+	code := string(src)
+	if !strings.Contains(code, "type User struct") {
+		t.Error("missing User struct")
+	}
+	if !strings.Contains(code, "type AuthPayload struct") {
+		t.Error("missing AuthPayload struct")
+	}
+}
