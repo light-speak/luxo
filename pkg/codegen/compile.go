@@ -602,7 +602,7 @@ func (c *compiler) compileInstanceMethod(e *ast.CallExpr) string {
 	}
 	// Check if variable is a model instance via vars map
 	vt, known := c.vars[ident.Name]
-	if !known || !vt.isModel {
+	if !known || !vt.isModel || vt.isList {
 		return ""
 	}
 	modelName := vt.name

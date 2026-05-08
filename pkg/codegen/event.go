@@ -56,8 +56,11 @@ func generateEventFile(result *semantic.Result, packageName string) []byte {
 		modelMap[m.Name] = m
 	}
 
+	// Collect enums for on-handler body compilation
+	enums := CollectEnumsFromResult(result)
+
 	// RegisterEvents function — wires all on-listeners
-	generateRegisterEvents(&b, listeners, packageName, modelMap)
+	generateRegisterEvents(&b, listeners, packageName, modelMap, enums)
 
 	return []byte(b.String())
 }
@@ -183,7 +186,7 @@ func generateEmitFunc(b *strings.Builder, e *ast.EventDecl) {
 // Default uses OnQueueDecode with moduleName as the queue group (competing consumers).
 // Listeners with @broadcast use OnDecode (every instance receives).
 // Unmarshal uses Luxo binary (UnmarshalLuxo) for wire decoding.
-func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleName string, models map[string]*ast.ModelDecl) {
+func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleName string, models map[string]*ast.ModelDecl, enums map[string]bool) {
 	b.WriteString("// RegisterEvents registers all event listeners with the bus.\n")
 	b.WriteString("func RegisterEvents(bus event.Bus, app *App) {\n")
 
@@ -205,7 +208,7 @@ func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleN
 				b:      b,
 				indent: "\t\t",
 				models: models,
-				enums:  make(map[string]bool),
+				enums:  enums,
 				vars:   make(map[string]valType),
 			}
 			// Register event param as a known variable so event.field compiles correctly

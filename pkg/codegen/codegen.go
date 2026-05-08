@@ -288,6 +288,12 @@ func writeImports(b *strings.Builder, files []*ast.File) {
 				}
 			}
 		}
+		// type declarations may also need imports (DateTime, UUID, Decimal)
+		for _, t := range file.Types {
+			for _, f := range t.Fields {
+				scanModelFieldImports(f, &needs)
+			}
+		}
 	}
 
 	if !needs.time && !needs.uuid && !needs.decimal && !needs.hash {
