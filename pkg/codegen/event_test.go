@@ -300,3 +300,63 @@ func TestGenerateEventListenerNoParams(t *testing.T) {
 		t.Errorf("default should use OnQueueDecode:\n%s", code)
 	}
 }
+
+func TestGenerateEventFileOnBody(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Events: []*ast.EventDecl{
+				{
+					Pos:  token.Position{File: "test.luxo", Line: 1, Col: 1},
+					Name: "ProjectDeleted",
+					Params: []*ast.ParamDecl{
+						{Name: "projectId", Type: &ast.TypeRef{Name: "Int"}},
+					},
+				},
+			},
+			Models: []*ast.ModelDecl{
+				{Name: "Trace", Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "projectId", Type: &ast.TypeRef{Name: "Int"}},
+				}},
+			},
+			Listeners: []*ast.OnDecl{
+				{
+					Pos:       token.Position{File: "test.luxo", Line: 5, Col: 1},
+					EventName: "ProjectDeleted",
+					Params:    []string{"ev"},
+					Body: &ast.Block{
+						Stmts: []ast.Stmt{
+							&ast.ExprStmt{Expr: &ast.CallExpr{
+								Func: &ast.MemberExpr{
+									Object: &ast.CallExpr{
+										Func: &ast.MemberExpr{
+											Object: &ast.MemberExpr{
+												Object: &ast.Ident{Name: "Trace"},
+												Field:  "where",
+											},
+											Field: "deleteMany",
+										},
+									},
+								},
+							}},
+						},
+					},
+				},
+			},
+		}},
+	}
+
+	src := generateEventFile(result, "luxo")
+	if src == nil {
+		t.Fatal("should generate event file")
+	}
+	code := string(src)
+
+	if !strings.Contains(code, "func RegisterEvents(bus event.Bus, app *App)") {
+		t.Errorf("missing RegisterEvents with app: %s", code)
+	}
+	if strings.Contains(code, "_ = ev") {
+		t.Errorf("on body should be compiled, not empty: %s", code)
+	}
+}
