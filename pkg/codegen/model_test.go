@@ -480,10 +480,10 @@ func TestGenerateTypeStruct(t *testing.T) {
 	if !strings.Contains(out, "type AuthPayload struct") {
 		t.Errorf("missing struct: %s", out)
 	}
-	if !strings.Contains(out, "Member") || !strings.Contains(out, "json:\"member\"") {
-		t.Errorf("missing Member field: %s", out)
+	if !strings.Contains(out, "*Member") || !strings.Contains(out, "json:\"member\"") {
+		t.Errorf("missing Member pointer field: %s", out)
 	}
-	if !strings.Contains(out, "Token  string") {
+	if !strings.Contains(out, "Token") || !strings.Contains(out, "string") || !strings.Contains(out, "json:\"token\"") {
 		t.Errorf("missing Token field: %s", out)
 	}
 	// Should have json tags but NOT db tags
