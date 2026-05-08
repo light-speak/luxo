@@ -98,6 +98,7 @@ func generateModel(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) 
 		fmt.Fprintf(b, "\tif err != nil {\n\t\treturn \"\"\n\t}\n")
 		fmt.Fprintf(b, "\treturn token\n")
 		fmt.Fprintf(b, "}\n")
+		break // only generate once even if @withAuth appears multiple times
 	}
 }
 

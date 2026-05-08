@@ -2,6 +2,7 @@ package event
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -184,9 +185,15 @@ func TestChanBusHandlerPanicRecovery(t *testing.T) {
 }
 
 func TestSafeCall(t *testing.T) {
-	safeCall(func(ctx context.Context, payload any) error {
+	err := safeCall(func(ctx context.Context, payload any) error {
 		panic("should not crash")
 	}, context.Background(), nil)
+	if err == nil {
+		t.Error("safeCall should return panic-converted error")
+	}
+	if !strings.Contains(err.Error(), "panic") {
+		t.Errorf("error should mention panic: %v", err)
+	}
 }
 
 func TestNewChanBusDefaultBufSize(t *testing.T) {
