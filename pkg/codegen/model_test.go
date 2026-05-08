@@ -491,3 +491,63 @@ func TestGenerateTypeStruct(t *testing.T) {
 		t.Errorf("type struct should not have db tags: %s", out)
 	}
 }
+
+func TestGenerateModelWithAuth(t *testing.T) {
+	var b strings.Builder
+	m := &ast.ModelDecl{
+		Name: "Member",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}, {Name: "auto"}, {Name: "serial"}}},
+			{Name: "role", Type: &ast.TypeRef{Name: "String"}},
+		},
+		Directives: []*ast.Directive{
+			{Name: "withAuth", Args: []*ast.NamedArg{
+				{Name: "stores", Value: &ast.ListExpr{Items: []ast.Expr{
+					&ast.Ident{Name: "id"},
+					&ast.Ident{Name: "role"},
+				}}},
+			}},
+		},
+	}
+	generateModel(&b, m, nil)
+	out := b.String()
+	if !strings.Contains(out, "func (m *Member) CreateToken() string") {
+		t.Errorf("missing CreateToken: %s", out)
+	}
+	if !strings.Contains(out, "func (m *Member) RefreshToken(oldToken string) string") {
+		t.Errorf("missing RefreshToken: %s", out)
+	}
+	if !strings.Contains(out, `"id": m.Id`) {
+		t.Errorf("missing id in data map: %s", out)
+	}
+	if !strings.Contains(out, `"role": m.Role`) {
+		t.Errorf("missing role in data map: %s", out)
+	}
+	if !strings.Contains(out, "auth.Sign(cfg, data)") {
+		t.Errorf("missing auth.Sign call: %s", out)
+	}
+	if !strings.Contains(out, "auth.Verify(cfg, oldToken)") {
+		t.Errorf("missing auth.Verify call: %s", out)
+	}
+}
+
+func TestGenerateModelWithAuthNoStores(t *testing.T) {
+	var b strings.Builder
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}}},
+		},
+		Directives: []*ast.Directive{
+			{Name: "withAuth", Args: []*ast.NamedArg{
+				{Name: "stores", Value: &ast.Literal{Kind: token.String, Value: "id"}},
+			}},
+		},
+	}
+	generateModel(&b, m, nil)
+	out := b.String()
+	// stores is not a ListExpr, so no fields extracted — should still generate methods
+	if !strings.Contains(out, "CreateToken") {
+		t.Errorf("should still generate CreateToken: %s", out)
+	}
+}

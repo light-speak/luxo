@@ -7073,6 +7073,33 @@ func TestCompileInstanceUpdate(t *testing.T) {
 	}
 }
 
+func TestCompileMyRoleEnumCast(t *testing.T) {
+	c := newCompiler(nil)
+	c.enums = map[string]bool{"MemberRole": true}
+	expr := &ast.MemberExpr{
+		Object: &ast.Ident{Name: "my"},
+		Field:  "role",
+	}
+	expr.SetTypeTag("MemberRole")
+	got := c.compileExpr(expr)
+	if got != `MemberRole(identity.String("role"))` {
+		t.Errorf("my.role enum cast: got %q", got)
+	}
+}
+
+func TestCompileMyFieldNoEnum(t *testing.T) {
+	c := newCompiler(nil)
+	c.enums = map[string]bool{}
+	expr := &ast.MemberExpr{
+		Object: &ast.Ident{Name: "my"},
+		Field:  "teamId",
+	}
+	got := c.compileExpr(expr)
+	if got != `identity.String("teamId")` {
+		t.Errorf("my.teamId: got %q", got)
+	}
+}
+
 func TestCompileInstanceMethodNonModel(t *testing.T) {
 	c := newCompiler(nil)
 	// Non-model variable → should not match
