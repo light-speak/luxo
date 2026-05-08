@@ -1650,9 +1650,9 @@ func (c *compiler) compileObject(e *ast.ObjectExpr) string {
 	}
 	prefix := ""
 	if e.TypeName != "" {
-		prefix = e.TypeName
+		prefix = "&" + e.TypeName
 	} else if c.api != nil && c.api.ReturnType != nil && c.isTypeDecl(c.api.ReturnType.Name) {
-		prefix = c.api.ReturnType.Name
+		prefix = "&" + c.api.ReturnType.Name
 	}
 	return prefix + "{" + strings.Join(fields, ", ") + "}"
 }

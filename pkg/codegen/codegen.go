@@ -214,12 +214,14 @@ func generateModelFile(result *semantic.Result, packageName string, enums map[st
 		}
 	}
 
-	// extend stubs — generate minimal structs for external types
+	// extend stubs — generate minimal structs for external types (deduplicated)
+	extendDone := make(map[string]bool)
 	for _, file := range result.Files {
 		for _, ext := range file.Extends {
-			if modelNames[ext.Name] {
-				continue // already defined as a full model in this file
+			if modelNames[ext.Name] || extendDone[ext.Name] {
+				continue
 			}
+			extendDone[ext.Name] = true
 			generateExtendStub(&b, ext)
 			b.WriteByte('\n')
 		}

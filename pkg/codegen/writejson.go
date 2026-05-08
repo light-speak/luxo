@@ -29,13 +29,15 @@ func generateWriteJSONFile(result *semantic.Result, packageName string, enums ma
 		modelNames[m.Name] = true
 	}
 
-	// Collect extend stubs (cross-module types)
+	// Collect extend stubs (cross-module types, deduplicated)
+	stubDone := make(map[string]bool)
 	var stubs []*ast.ModelDecl
 	for _, file := range result.Files {
 		for _, ext := range file.Extends {
-			if modelNames[ext.Name] {
+			if modelNames[ext.Name] || stubDone[ext.Name] {
 				continue
 			}
+			stubDone[ext.Name] = true
 			stubs = append(stubs, &ast.ModelDecl{Name: ext.Name, Fields: ext.Fields})
 		}
 	}
