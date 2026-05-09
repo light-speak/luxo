@@ -117,7 +117,7 @@ function collectNestedFields(
     if (segments.length === 0) continue
 
     // Walk segments, validating against schema models
-    let currentModel = rootModel
+    let currentModel: typeof rootModel | undefined = rootModel
     let currentNode = root
 
     for (const seg of segments) {
@@ -127,11 +127,7 @@ function collectNestedFields(
       currentNode = currentNode.addChild(seg)
 
       // Resolve next model type for nested fields
-      if (field.type && schema.models[field.type]) {
-        currentModel = schema.models[field.type]
-      } else {
-        currentModel = null as unknown as typeof rootModel
-      }
+      currentModel = field.type ? schema.models[field.type] : undefined
     }
   }
 
