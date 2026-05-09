@@ -345,7 +345,7 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 	if hasTime || feat.hasTimeFunc {
 		b.WriteString("\t\"time\"\n")
 	}
-	_ = feat.hasCrypto // crypto uses luxocrypto.RandomHex (no hex import needed)
+	// crypto.randomHex uses luxocrypto import (covered by hasHash || hasCrypto check)
 	if needsJSON {
 		b.WriteString("\n\t\"encoding/json\"\n")
 	} else {

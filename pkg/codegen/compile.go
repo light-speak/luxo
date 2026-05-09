@@ -46,6 +46,14 @@ func compileAPIBody(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast
 		vars:     make(map[string]valType),
 		paginate: hasDirective(api.Directives, "paginate"),
 	}
+	// Register API params in vars with nullable info
+	for _, p := range api.Params {
+		vt := valType{name: resolveGoType(p.Type)}
+		if p.Type != nil && p.Type.Nullable {
+			vt.nullable = true
+		}
+		c.vars[p.Name] = vt
+	}
 	for _, stmt := range api.Body.Stmts {
 		c.compileStmt(stmt)
 	}
@@ -70,10 +78,11 @@ func compileFnBody(b *strings.Builder, fn *ast.FnDecl, models map[string]*ast.Mo
 
 // valType tracks the resolved type of a val variable.
 type valType struct {
-	isModel bool   // true if this is a *Model or []*Model
-	isList  bool   // true if this is a list (e.g., []*Model)
-	isChan  bool   // true if this is a channel (Channel<T>)
-	name    string // model name or luxo type name (Int/String/Boolean/Float)
+	isModel  bool   // true if this is a *Model or []*Model
+	isList   bool   // true if this is a list (e.g., []*Model)
+	isChan   bool   // true if this is a channel (Channel<T>)
+	nullable bool   // true if this is a pointer type (nullable param/field)
+	name     string // model name or luxo type name (Int/String/Boolean/Float)
 }
 
 // compiler holds state during body compilation.
@@ -257,10 +266,9 @@ func (c *compiler) writeReturnByType(expr string, vt valType) {
 	case "String":
 		c.write("req.Buf.B = codec.AppendString(req.Buf.B, %s)", expr)
 	default:
-		// Try as type with WriteLuxo (AuthPayload, ProjectOverview, etc.)
+		// Try as type with WriteLuxo — value receiver, can call on literal directly
 		if c.isTypeDecl(vt.name) {
-			c.write("_typeResult := %s", expr)
-			c.write("_typeResult.WriteLuxo(req.Buf, req.FieldMask)")
+			c.write("%s.WriteLuxo(req.Buf, req.FieldMask)", expr)
 		} else {
 			c.write("_ = %s // unsupported return type for binary encoding", expr)
 		}
@@ -284,10 +292,9 @@ func (c *compiler) writeScalarReturn(expr string) {
 			c.write("req.Buf.B = codec.AppendString(req.Buf.B, %s)", expr)
 			return
 		}
-		// Try as type with WriteLuxo
+		// Try as type with WriteLuxo — value receiver
 		if c.isTypeDecl(c.api.ReturnType.Name) {
-			c.write("_typeResult := %s", expr)
-			c.write("_typeResult.WriteLuxo(req.Buf, req.FieldMask)")
+			c.write("%s.WriteLuxo(req.Buf, req.FieldMask)", expr)
 			return
 		}
 	}
@@ -1000,27 +1007,17 @@ func (c *compiler) compileCreateLink(b *strings.Builder, modelName string, link 
 			}
 		}
 		// Wrap with & if the model field is nullable (SetXxx expects pointer)
-		// but skip if the value is already a pointer (nullable API param parsed as *string)
+		// but skip if the value is already a pointer (tracked via vars nullable flag)
 		if m != nil {
 			for _, f := range m.Fields {
 				if f.Name == arg.Name && f.Type != nil && f.Type.Nullable {
-					// Check if the arg value is an API param that's already a pointer
+					alreadyPtr := false
 					if ident, ok := arg.Value.(*ast.Ident); ok {
-						if c.api != nil {
-							alreadyPtr := false
-							for _, p := range c.api.Params {
-								if p.Name == ident.Name && p.Type != nil && p.Type.Nullable {
-									alreadyPtr = true
-									break
-								}
-							}
-							if !alreadyPtr {
-								val = "&" + val
-							}
-						} else {
-							val = "&" + val
+						if vt, ok := c.vars[ident.Name]; ok && vt.nullable {
+							alreadyPtr = true
 						}
-					} else {
+					}
+					if !alreadyPtr {
 						val = "&" + val
 					}
 					break
@@ -1680,9 +1677,9 @@ func (c *compiler) compileObject(e *ast.ObjectExpr) string {
 	}
 	prefix := ""
 	if e.TypeName != "" {
-		prefix = "&" + e.TypeName
+		prefix = e.TypeName
 	} else if c.api != nil && c.api.ReturnType != nil && c.isTypeDecl(c.api.ReturnType.Name) {
-		prefix = "&" + c.api.ReturnType.Name
+		prefix = c.api.ReturnType.Name
 	}
 	return prefix + "{" + strings.Join(fields, ", ") + "}"
 }

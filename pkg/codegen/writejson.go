@@ -57,11 +57,11 @@ func generateWriteJSONFile(result *semantic.Result, packageName string, enums ma
 		generateReadLuxo(&b, s, enums)
 	}
 
-	// type declarations — generate WriteLuxo for plain data types (AuthPayload, etc.)
+	// type declarations — generate WriteLuxo with VALUE receiver (can call on literal)
 	for _, file := range result.Files {
 		for _, t := range file.Types {
 			pseudo := &ast.ModelDecl{Name: t.Name, Fields: t.Fields}
-			generateWriteLuxo(&b, pseudo, enums)
+			generateTypeWriteLuxo(&b, pseudo, enums)
 		}
 	}
 
@@ -376,6 +376,19 @@ func generateWriteLuxoAllFields(b *strings.Builder, m *ast.ModelDecl, recv strin
 
 // generateReadLuxo generates a ReadLuxo method that decodes a model from Luxo binary.
 // This is the inverse of WriteLuxo — used by remote DataLoaders to decode RPC responses.
+// generateTypeWriteLuxo generates WriteLuxo with value receiver for type declarations.
+// Value receiver allows calling on literals: AuthPayload{...}.WriteLuxo(...)
+// Type fields always write all — no FieldMask, no @visible/@transform/@mask.
+func generateTypeWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
+	name := m.Name
+	recv := strings.ToLower(name[:1])
+	fmt.Fprintf(b, "// WriteLuxo writes %s as Luxo binary directly to buf.\n", name)
+	fmt.Fprintf(b, "func (%s %s) WriteLuxo(buf *api.ResponseBuf, mask []byte) {\n", recv, name)
+	generateWriteLuxoAllFields(b, m, recv, enums)
+	fmt.Fprintf(b, "\tbuf.B = append(buf.B, 0x00)\n")
+	fmt.Fprintf(b, "}\n\n")
+}
+
 func generateReadLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
 	name := m.Name
 	recv := strings.ToLower(name[:1])
