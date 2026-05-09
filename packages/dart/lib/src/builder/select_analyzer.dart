@@ -26,10 +26,18 @@ class SelectAnalyzer extends RecursiveAstVisitor<void> {
 
   SelectAnalyzer(this.modelFields);
 
+  static const maxNestingDepth = 5;
+
   /// Build the $select string from collected hints.
+  /// Warns if nesting exceeds maxNestingDepth.
   Map<String, String> buildSelectStrings() {
     final result = <String, String>{};
     for (final entry in hints.entries) {
+      final depth = entry.value.maxDepth();
+      if (depth > maxNestingDepth) {
+        print('[luxo] Warning: ${entry.key} has $depth-level nested field selection '
+            '(max recommended: $maxNestingDepth). Consider restructuring your query.');
+      }
       final selectStr = entry.value.toSelectString();
       if (selectStr.isNotEmpty) {
         result[entry.key] = selectStr;
@@ -185,6 +193,17 @@ class FieldNode {
 
   FieldNode addChild(String fieldName) {
     return children.putIfAbsent(fieldName, () => FieldNode(fieldName));
+  }
+
+  /// Max depth of the tree
+  int maxDepth() {
+    if (children.isEmpty) return 0;
+    int max = 0;
+    for (final child in children.values) {
+      final d = child.maxDepth();
+      if (d > max) max = d;
+    }
+    return max + 1;
   }
 
   /// Build $select string: "name,email,comments{content,user{id}}"
