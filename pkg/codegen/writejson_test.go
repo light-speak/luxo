@@ -631,3 +631,35 @@ func TestWriteVisibleDirective_UnsupportedExpr(t *testing.T) {
 		t.Error("unsupported expr should return false")
 	}
 }
+
+func TestGenerateTypeWriteLuxo(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "AuthPayload",
+		Fields: []*ast.FieldDecl{
+			{Name: "token", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+		},
+	}
+	// Set field IDs for the test
+	SetModelFieldIDs(map[string]map[string]int{
+		"AuthPayload": {"token": 1, "userId": 2},
+	})
+	defer SetModelFieldIDs(nil)
+
+	var b strings.Builder
+	generateTypeWriteLuxo(&b, m, nil)
+	out := b.String()
+	// Value receiver, not pointer
+	if !strings.Contains(out, "func (a AuthPayload) WriteLuxo") {
+		t.Errorf("should use value receiver: %s", out)
+	}
+	if strings.Contains(out, "*AuthPayload") {
+		t.Errorf("should NOT use pointer receiver: %s", out)
+	}
+	if !strings.Contains(out, "AppendString") {
+		t.Errorf("should write String field: %s", out)
+	}
+	if !strings.Contains(out, "AppendSvarint") {
+		t.Errorf("should write Int field: %s", out)
+	}
+}

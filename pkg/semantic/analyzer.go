@@ -2542,8 +2542,9 @@ func (a *Analyzer) injectWithAuthMethods(typ *ResolvedType, directives []*ast.Di
 				if !ok {
 					continue
 				}
-				// skip fields already defined in Identity (id, role, load)
-				if _, exists := identityType.Fields[ident.Name]; exists {
+				// skip fields already defined with type (id, load)
+				// but override nil-typed defaults (role) with actual type
+				if existing, exists := identityType.Fields[ident.Name]; exists && existing.Type != nil {
 					continue
 				}
 				// resolve type from the model's fields, skip methods

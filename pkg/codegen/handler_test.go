@@ -1714,7 +1714,7 @@ func TestWriteHandlerImportsAllFeatures(t *testing.T) {
 		},
 	}
 	result := &semantic.Result{Files: []*ast.File{{}}}
-	writeHandlerImports(&b, result, models, true, true, true, true, true, true)
+	writeHandlerImports(&b, result, models, handlerFeatures{hasOrGroups: true, hasSortable: true, hasAwait: true, hasTransaction: true, hasTemplateStr: true, hasAuth: true})
 	out := b.String()
 	if !strings.Contains(out, `"strconv"`) {
 		t.Fatalf("hasOrGroups should add strconv import, got:\n%s", out)
@@ -1752,7 +1752,7 @@ func TestWriteHandlerImportsNoHashWithoutWriteOps(t *testing.T) {
 			{Name: "password", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hash"}}},
 		},
 	}}
-	writeHandlerImports(&b, result, models, false, false, false, false, false, false)
+	writeHandlerImports(&b, result, models, handlerFeatures{})
 	out := b.String()
 	if strings.Contains(out, "luxocrypto") {
 		t.Fatalf("read-only CRUD with @hash should not add luxocrypto, got:\n%s", out)
@@ -2465,5 +2465,50 @@ func TestCRUDHandlerSkipDebug(t *testing.T) {
 	t.Logf("ops: %v", ops)
 	for _, op := range ops {
 		t.Logf("crudAPIName(Project, %s) = %s", op, crudAPIName("Project", op))
+	}
+}
+
+func TestScanBodyForBuiltins(t *testing.T) {
+	// crypto.randomHex() → hasCrypto
+	body := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.CallExpr{
+			Func: &ast.MemberExpr{Object: &ast.Ident{Name: "crypto"}, Field: "randomHex"},
+		}},
+	}}
+	var f handlerFeatures
+	scanBodyForBuiltins(body, &f)
+	if !f.hasCrypto {
+		t.Error("should detect crypto usage")
+	}
+
+	// now() → hasTimeFunc
+	body2 := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ValStmt{Name: "t", Value: &ast.CallExpr{
+			Func: &ast.Ident{Name: "now"},
+		}},
+	}}
+	var f2 handlerFeatures
+	scanBodyForBuiltins(body2, &f2)
+	if !f2.hasTimeFunc {
+		t.Error("should detect now() usage")
+	}
+
+	// n.days → hasTimeFunc
+	body3 := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ValStmt{Name: "d", Value: &ast.MemberExpr{
+			Object: &ast.Ident{Name: "n"}, Field: "days",
+		}},
+	}}
+	var f3 handlerFeatures
+	scanBodyForBuiltins(body3, &f3)
+	if !f3.hasTimeFunc {
+		t.Error("should detect duration property usage")
+	}
+
+	// nil body
+	var f4 handlerFeatures
+	scanBodyForBuiltins(nil, &f4)
+	if f4.hasCrypto || f4.hasTimeFunc {
+		t.Error("nil body should not set flags")
 	}
 }

@@ -7031,11 +7031,15 @@ func TestCompileCryptoRandomHex(t *testing.T) {
 		Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "32"}}},
 	}
 	got := c.compileExpr(expr)
-	if !strings.Contains(got, "luxocrypto.RandomBytes(32)") {
-		t.Errorf("crypto.randomHex: got %q", got)
+	if got != "_hex" {
+		t.Errorf("crypto.randomHex should return temp var: got %q", got)
 	}
-	if !strings.Contains(got, "hex.EncodeToString") {
-		t.Errorf("should use hex.EncodeToString: got %q", got)
+	out := compilerOut(c)
+	if !strings.Contains(out, "luxocrypto.RandomHex(32)") {
+		t.Errorf("should call luxocrypto.RandomHex: %s", out)
+	}
+	if !strings.Contains(out, "_hexErr") {
+		t.Errorf("should handle error: %s", out)
 	}
 }
 

@@ -267,7 +267,7 @@ func writeEventBusWiring(b *strings.Builder, modules []moduleInfo) {
 	for _, m := range modules {
 		if m.hasEvents {
 			fmt.Fprintf(b, "\t%sApp.EventBus = eventBus\n", m.name)
-			fmt.Fprintf(b, "\t%s_luxo.RegisterEvents(eventBus)\n", m.name)
+			fmt.Fprintf(b, "\t%s_luxo.RegisterEvents(eventBus, %sApp)\n", m.name, m.name)
 		}
 	}
 	b.WriteString("\n")
@@ -388,7 +388,7 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 		b.WriteString("\teventBus := event.NewFromEnv()\n")
 		b.WriteString("\tdefer eventBus.Close()\n")
 		b.WriteString("\tapp.EventBus = eventBus\n")
-		fmt.Fprintf(&b, "\t%s_luxo.RegisterEvents(eventBus)\n\n", target.name)
+		fmt.Fprintf(&b, "\t%s_luxo.RegisterEvents(eventBus, app)\n\n", target.name)
 	}
 
 	// Gateway + handlers

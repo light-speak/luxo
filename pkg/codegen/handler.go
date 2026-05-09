@@ -22,6 +22,8 @@ type handlerFeatures struct {
 	hasTransaction bool
 	hasTemplateStr bool
 	hasAuth        bool
+	hasCrypto      bool
+	hasTimeFunc    bool
 }
 
 // detectHandlerFeatures scans models and APIs to determine which imports are needed.
@@ -69,6 +71,16 @@ func detectHandlerFeatures(result *semantic.Result, models []*ast.ModelDecl, inf
 
 	f.hasAuth = detectAuthNeeded(result, models)
 
+	// Scan compiled API bodies for crypto and time function usage
+	for _, file := range result.Files {
+		for _, api := range file.APIs {
+			if api.Body == nil {
+				continue
+			}
+			scanBodyForBuiltins(api.Body, &f)
+		}
+	}
+
 	return f
 }
 
@@ -111,7 +123,7 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	var b strings.Builder
 	writeHeader(&b, packageName, "handler.gen.go")
 
-	writeHandlerImports(&b, result, models, features.hasOrGroups, features.hasSortable, features.hasAwait, features.hasTransaction, features.hasTemplateStr, features.hasAuth)
+	writeHandlerImports(&b, result, models, features)
 
 	// Generate defaultCols for models with @hidden fields (excludes hidden from SELECT *)
 	for _, m := range models {
@@ -151,6 +163,20 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 }
 
 func generateCRUDHandlers(b *strings.Builder, models []*ast.ModelDecl, enums map[string]bool, skipNames map[string]bool) {
+	// Collect all model relations for recursive resolve support
+	modelRels := make(map[string]bool)
+	for _, m := range models {
+		rels := analyzeRelations(m, enums)
+		if len(rels) > 0 {
+			modelRels[m.Name] = true
+		}
+	}
+
+	// Generate MaxRelationDepth constant
+	b.WriteString("// MaxRelationDepth limits recursive relation resolution to prevent infinite loops.\n")
+	b.WriteString("// Override via RELATION_MAX_DEPTH env var.\n")
+	b.WriteString("var MaxRelationDepth = 5\n\n")
+
 	for _, m := range models {
 		rels := analyzeRelations(m, enums)
 		ops := crudOperations(m)
@@ -164,8 +190,8 @@ func generateCRUDHandlers(b *strings.Builder, models []*ast.ModelDecl, enums map
 		generateFilterParser(b, m, enums)
 		generateSorterParser(b, m)
 		if len(rels) > 0 {
-			generateRelationResolver(b, m, rels)
-			generateListRelationResolver(b, m, rels)
+			generateRelationResolver(b, m, rels, modelRels)
+			generateListRelationResolver(b, m, rels, modelRels)
 		}
 	}
 }
@@ -306,7 +332,13 @@ func writeFKEnsure(b *strings.Builder, rels []Relation) {
 }
 
 // writeHandlerImports writes handler.gen.go imports.
-func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*ast.ModelDecl, hasOrGroups, hasSortable, hasAwait, hasTransaction, hasTemplateStr, hasAuth bool) {
+func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*ast.ModelDecl, feat handlerFeatures) {
+	hasOrGroups := feat.hasOrGroups
+	hasSortable := feat.hasSortable
+	hasAwait := feat.hasAwait
+	hasTransaction := feat.hasTransaction
+	hasTemplateStr := feat.hasTemplateStr
+	hasAuth := feat.hasAuth
 	hasHash := scanModelsForHash(models)
 	hasTime := scanForTimeImport(result, models)
 	needsJSON := scanModelsForJSON(models)
@@ -324,9 +356,10 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 	if hasPattern {
 		b.WriteString("\t\"regexp\"\n")
 	}
-	if hasTime {
+	if hasTime || feat.hasTimeFunc {
 		b.WriteString("\t\"time\"\n")
 	}
+	// crypto.randomHex uses luxocrypto import (covered by hasHash || hasCrypto check)
 	if needsJSON {
 		b.WriteString("\n\t\"encoding/json\"\n")
 	} else {
@@ -335,7 +368,7 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
-	if hasHash {
+	if hasHash || feat.hasCrypto {
 		b.WriteString("\tluxocrypto \"github.com/light-speak/luxo/pkg/lux/crypto\"\n")
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/errors\"\n")
@@ -775,13 +808,17 @@ func generateDefaultCols(b *strings.Builder, m *ast.ModelDecl, enums map[string]
 
 // generateRelationResolver generates a resolve<Model>Relations function
 // that loads relation fields via DataLoader based on $select.
-func generateRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relation) {
+func generateRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relation, modelRels map[string]bool) {
 	name := m.Name
 	lower := strings.ToLower(name[:1]) + name[1:]
 
 	fmt.Fprintf(b, "// resolve%sRelations loads relation fields for %s based on $select.\n", name, name)
-	fmt.Fprintf(b, "func resolve%sRelations(ctx context.Context, app *App, %s *%s, fields []*selection.Field) error {\n", name, lower, name)
+	fmt.Fprintf(b, "// depth limits recursive resolution to prevent infinite loops.\n")
+	fmt.Fprintf(b, "func resolve%sRelations(ctx context.Context, app *App, %s *%s, fields []*selection.Field, depth ...int) error {\n", name, lower, name)
 	fmt.Fprintf(b, "\tif %s == nil {\n\t\treturn nil\n\t}\n", lower)
+	fmt.Fprintf(b, "\td := MaxRelationDepth\n")
+	fmt.Fprintf(b, "\tif len(depth) > 0 {\n\t\td = depth[0]\n\t}\n")
+	fmt.Fprintf(b, "\tif d <= 0 {\n\t\treturn nil\n\t}\n")
 
 	for _, rel := range rels {
 		fieldName := rel.FieldName
@@ -799,12 +836,26 @@ func generateRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relat
 				loaderField, lower, goLocalKey)
 			fmt.Fprintf(b, "\t\t\t\tif err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n")
 			fmt.Fprintf(b, "\t\t\t\t%s.%s = result\n", lower, goFieldName)
+			// Recursive resolve for child's relations
+			if modelRels[rel.TargetName] {
+				fmt.Fprintf(b, "\t\t\t\tif err := resolve%sRelations(ctx, app, result, f.Children, d-1); err != nil {\n", rel.TargetName)
+				fmt.Fprintf(b, "\t\t\t\t\treturn err\n\t\t\t\t}\n")
+			}
 			fmt.Fprintf(b, "\t\t\t}\n")
 		} else {
 			fmt.Fprintf(b, "\t\t\tresult, err := app.loaders.%s.Load(ctx, %s.%s, childCols)\n",
 				loaderField, lower, goLocalKey)
 			fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
 			fmt.Fprintf(b, "\t\t\t%s.%s = result\n", lower, goFieldName)
+			// Recursive resolve for child's relations
+			if modelRels[rel.TargetName] {
+				if rel.IsList {
+					fmt.Fprintf(b, "\t\t\tif err := resolve%sListRelations(ctx, app, %s.%s, f.Children, d-1); err != nil {\n", rel.TargetName, lower, goFieldName)
+				} else {
+					fmt.Fprintf(b, "\t\t\tif err := resolve%sRelations(ctx, app, result, f.Children, d-1); err != nil {\n", rel.TargetName)
+				}
+				fmt.Fprintf(b, "\t\t\t\treturn err\n\t\t\t}\n")
+			}
 		}
 
 		fmt.Fprintf(b, "\t\t\tbreak\n")
@@ -818,14 +869,15 @@ func generateRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relat
 
 // generateListRelationResolver generates a batch resolve function for LIST handlers.
 // Uses LoadAll (direct dispatch, zero wait) instead of per-item Load.
-func generateListRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relation) {
+func generateListRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relation, modelRels map[string]bool) {
 	name := m.Name
-	lower := strings.ToLower(name[:1]) + name[1:]
-	_ = lower
 
 	fmt.Fprintf(b, "// resolve%sListRelations batch-loads all relation fields for a list of %s.\n", name, name)
 	fmt.Fprintf(b, "// Uses LoadAll — direct dispatch, zero wait.\n")
-	fmt.Fprintf(b, "func resolve%sListRelations(ctx context.Context, app *App, items []*%s, fields []*selection.Field) error {\n", name, name)
+	fmt.Fprintf(b, "func resolve%sListRelations(ctx context.Context, app *App, items []*%s, fields []*selection.Field, depth ...int) error {\n", name, name)
+	fmt.Fprintf(b, "\td := MaxRelationDepth\n")
+	fmt.Fprintf(b, "\tif len(depth) > 0 {\n\t\td = depth[0]\n\t}\n")
+	fmt.Fprintf(b, "\tif d <= 0 {\n\t\treturn nil\n\t}\n")
 
 	for _, rel := range rels {
 		fieldName := rel.FieldName
@@ -867,6 +919,21 @@ func generateListRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []R
 			fmt.Fprintf(b, "\t\t\tfor _, item := range items {\n")
 			fmt.Fprintf(b, "\t\t\t\titem.%s = resultMap[item.%s]\n", goFieldName, goLocalKey)
 			fmt.Fprintf(b, "\t\t\t}\n")
+		}
+
+		// Recursive resolve for child's relations
+		if modelRels[rel.TargetName] {
+			if rel.IsList {
+				fmt.Fprintf(b, "\t\t\tfor _, item := range items {\n")
+				fmt.Fprintf(b, "\t\t\t\tif err := resolve%sListRelations(ctx, app, item.%s, f.Children, d-1); err != nil {\n", rel.TargetName, goFieldName)
+				fmt.Fprintf(b, "\t\t\t\t\treturn err\n\t\t\t\t}\n")
+				fmt.Fprintf(b, "\t\t\t}\n")
+			} else {
+				fmt.Fprintf(b, "\t\t\tfor _, item := range items {\n")
+				fmt.Fprintf(b, "\t\t\t\tif err := resolve%sRelations(ctx, app, item.%s, f.Children, d-1); err != nil {\n", rel.TargetName, goFieldName)
+				fmt.Fprintf(b, "\t\t\t\t\treturn err\n\t\t\t\t}\n")
+				fmt.Fprintf(b, "\t\t\t}\n")
+			}
 		}
 
 		fmt.Fprintf(b, "\t\t\tbreak\n")
@@ -1686,4 +1753,28 @@ func generateAggregateFields(b *strings.Builder, m *ast.ModelDecl, resultVar, in
 			fmt.Fprintf(b, "%s}\n", indent)
 		}
 	}
+}
+
+// scanBodyForBuiltins walks AST to find crypto.*, now(), duration property usage.
+func scanBodyForBuiltins(block *ast.Block, f *handlerFeatures) {
+	if block == nil {
+		return
+	}
+	ast.WalkExprs(block, func(e ast.Expr) {
+		switch v := e.(type) {
+		case *ast.MemberExpr:
+			if ident, ok := v.Object.(*ast.Ident); ok && ident.Name == "crypto" {
+				f.hasCrypto = true
+			}
+			// Duration properties → need time import
+			switch v.Field {
+			case "days", "hours", "minutes", "seconds", "milliseconds":
+				f.hasTimeFunc = true
+			}
+		case *ast.CallExpr:
+			if ident, ok := v.Func.(*ast.Ident); ok && ident.Name == "now" {
+				f.hasTimeFunc = true
+			}
+		}
+	})
 }
