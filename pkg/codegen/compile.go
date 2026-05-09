@@ -259,7 +259,8 @@ func (c *compiler) writeReturnByType(expr string, vt valType) {
 	default:
 		// Try as type with WriteLuxo (AuthPayload, ProjectOverview, etc.)
 		if c.isTypeDecl(vt.name) {
-			c.write("%s.WriteLuxo(req.Buf, req.FieldMask)", expr)
+			c.write("_typeResult := %s", expr)
+			c.write("_typeResult.WriteLuxo(req.Buf, req.FieldMask)")
 		} else {
 			c.write("_ = %s // unsupported return type for binary encoding", expr)
 		}
@@ -285,7 +286,8 @@ func (c *compiler) writeScalarReturn(expr string) {
 		}
 		// Try as type with WriteLuxo
 		if c.isTypeDecl(c.api.ReturnType.Name) {
-			c.write("%s.WriteLuxo(req.Buf, req.FieldMask)", expr)
+			c.write("_typeResult := %s", expr)
+			c.write("_typeResult.WriteLuxo(req.Buf, req.FieldMask)")
 			return
 		}
 	}
@@ -998,10 +1000,29 @@ func (c *compiler) compileCreateLink(b *strings.Builder, modelName string, link 
 			}
 		}
 		// Wrap with & if the model field is nullable (SetXxx expects pointer)
+		// but skip if the value is already a pointer (nullable API param parsed as *string)
 		if m != nil {
 			for _, f := range m.Fields {
 				if f.Name == arg.Name && f.Type != nil && f.Type.Nullable {
-					val = "&" + val
+					// Check if the arg value is an API param that's already a pointer
+					if ident, ok := arg.Value.(*ast.Ident); ok {
+						if c.api != nil {
+							alreadyPtr := false
+							for _, p := range c.api.Params {
+								if p.Name == ident.Name && p.Type != nil && p.Type.Nullable {
+									alreadyPtr = true
+									break
+								}
+							}
+							if !alreadyPtr {
+								val = "&" + val
+							}
+						} else {
+							val = "&" + val
+						}
+					} else {
+						val = "&" + val
+					}
 					break
 				}
 			}
@@ -1139,7 +1160,11 @@ func (c *compiler) compileBuiltinCall(e *ast.CallExpr) string {
 	}
 	switch member.Field {
 	case "randomHex":
-		return fmt.Sprintf("hex.EncodeToString(luxocrypto.RandomBytes(%s))", n)
+		// RandomHex returns (string, error) — assign to temp var with error check
+		varName := "_hex"
+		c.write("%s, _hexErr := luxocrypto.RandomHex(%s)", varName, n)
+		c.write("if _hexErr != nil {\n%s\treturn _hexErr\n%s}", c.indent, c.indent)
+		return varName
 	case "randomBytes":
 		return fmt.Sprintf("luxocrypto.RandomBytes(%s)", n)
 	}

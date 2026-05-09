@@ -22,6 +22,8 @@ type handlerFeatures struct {
 	hasTransaction bool
 	hasTemplateStr bool
 	hasAuth        bool
+	hasCrypto      bool
+	hasTimeFunc    bool
 }
 
 // detectHandlerFeatures scans models and APIs to determine which imports are needed.
@@ -69,6 +71,16 @@ func detectHandlerFeatures(result *semantic.Result, models []*ast.ModelDecl, inf
 
 	f.hasAuth = detectAuthNeeded(result, models)
 
+	// Scan compiled API bodies for crypto and time function usage
+	for _, file := range result.Files {
+		for _, api := range file.APIs {
+			if api.Body == nil {
+				continue
+			}
+			scanBodyForBuiltins(api.Body, &f)
+		}
+	}
+
 	return f
 }
 
@@ -111,7 +123,7 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	var b strings.Builder
 	writeHeader(&b, packageName, "handler.gen.go")
 
-	writeHandlerImports(&b, result, models, features.hasOrGroups, features.hasSortable, features.hasAwait, features.hasTransaction, features.hasTemplateStr, features.hasAuth)
+	writeHandlerImports(&b, result, models, features)
 
 	// Generate defaultCols for models with @hidden fields (excludes hidden from SELECT *)
 	for _, m := range models {
@@ -306,7 +318,13 @@ func writeFKEnsure(b *strings.Builder, rels []Relation) {
 }
 
 // writeHandlerImports writes handler.gen.go imports.
-func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*ast.ModelDecl, hasOrGroups, hasSortable, hasAwait, hasTransaction, hasTemplateStr, hasAuth bool) {
+func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*ast.ModelDecl, feat handlerFeatures) {
+	hasOrGroups := feat.hasOrGroups
+	hasSortable := feat.hasSortable
+	hasAwait := feat.hasAwait
+	hasTransaction := feat.hasTransaction
+	hasTemplateStr := feat.hasTemplateStr
+	hasAuth := feat.hasAuth
 	hasHash := scanModelsForHash(models)
 	hasTime := scanForTimeImport(result, models)
 	needsJSON := scanModelsForJSON(models)
@@ -324,9 +342,10 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 	if hasPattern {
 		b.WriteString("\t\"regexp\"\n")
 	}
-	if hasTime {
+	if hasTime || feat.hasTimeFunc {
 		b.WriteString("\t\"time\"\n")
 	}
+	_ = feat.hasCrypto // crypto uses luxocrypto.RandomHex (no hex import needed)
 	if needsJSON {
 		b.WriteString("\n\t\"encoding/json\"\n")
 	} else {
@@ -335,7 +354,7 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
-	if hasHash {
+	if hasHash || feat.hasCrypto {
 		b.WriteString("\tluxocrypto \"github.com/light-speak/luxo/pkg/lux/crypto\"\n")
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/errors\"\n")
@@ -1686,4 +1705,28 @@ func generateAggregateFields(b *strings.Builder, m *ast.ModelDecl, resultVar, in
 			fmt.Fprintf(b, "%s}\n", indent)
 		}
 	}
+}
+
+// scanBodyForBuiltins walks AST to find crypto.*, now(), duration property usage.
+func scanBodyForBuiltins(block *ast.Block, f *handlerFeatures) {
+	if block == nil {
+		return
+	}
+	ast.WalkExprs(block, func(e ast.Expr) {
+		switch v := e.(type) {
+		case *ast.MemberExpr:
+			if ident, ok := v.Object.(*ast.Ident); ok && ident.Name == "crypto" {
+				f.hasCrypto = true
+			}
+			// Duration properties → need time import
+			switch v.Field {
+			case "days", "hours", "minutes", "seconds", "milliseconds":
+				f.hasTimeFunc = true
+			}
+		case *ast.CallExpr:
+			if ident, ok := v.Func.(*ast.Ident); ok && ident.Name == "now" {
+				f.hasTimeFunc = true
+			}
+		}
+	})
 }

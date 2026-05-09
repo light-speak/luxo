@@ -531,3 +531,86 @@ func (n *ContinueStmt) GetPos() token.Position { return n.Pos }
 func (n *ExprStmt) GetPos() token.Position     { return n.Pos }
 func (n *EventDecl) GetPos() token.Position    { return n.Pos }
 func (n *OnDecl) GetPos() token.Position       { return n.Pos }
+
+// WalkExprs calls fn for every Expr node in the block (recursive).
+func WalkExprs(block *Block, fn func(Expr)) {
+	if block == nil {
+		return
+	}
+	for _, stmt := range block.Stmts {
+		walkStmtExprs(stmt, fn)
+	}
+}
+
+func walkStmtExprs(stmt Stmt, fn func(Expr)) {
+	switch s := stmt.(type) {
+	case *ValStmt:
+		walkExpr(s.Value, fn)
+	case *AssignStmt:
+		walkExpr(s.Value, fn)
+	case *ReturnStmt:
+		walkExpr(s.Value, fn)
+	case *ThrowStmt:
+		walkExpr(s.Error, fn)
+	case *ExprStmt:
+		walkExpr(s.Expr, fn)
+	case *IfStmt:
+		walkExpr(s.Condition, fn)
+		WalkExprs(s.Then, fn)
+	case *ForStmt:
+		walkExpr(s.Collection, fn)
+		WalkExprs(s.Body, fn)
+	case *EmitStmt:
+		for _, a := range s.Args {
+			walkExpr(a.Value, fn)
+		}
+	}
+}
+
+func walkExpr(e Expr, fn func(Expr)) {
+	if e == nil {
+		return
+	}
+	fn(e)
+	switch v := e.(type) {
+	case *MemberExpr:
+		walkExpr(v.Object, fn)
+	case *CallExpr:
+		walkExpr(v.Func, fn)
+		for _, a := range v.Args {
+			walkExpr(a.Value, fn)
+		}
+	case *BinaryExpr:
+		walkExpr(v.Left, fn)
+		walkExpr(v.Right, fn)
+	case *UnaryExpr:
+		walkExpr(v.Value, fn)
+	case *ElvisExpr:
+		walkExpr(v.Left, fn)
+		walkExpr(v.Right, fn)
+	case *BangElvisExpr:
+		walkExpr(v.Left, fn)
+		walkExpr(v.Right, fn)
+	case *LambdaExpr:
+		WalkExprs(v.Body, fn)
+	case *ListExpr:
+		for _, item := range v.Items {
+			walkExpr(item, fn)
+		}
+	case *ObjectExpr:
+		for _, f := range v.Fields {
+			walkExpr(f.Value, fn)
+		}
+	case *WhenExpr:
+		walkExpr(v.Subject, fn)
+		for _, b := range v.Branches {
+			walkExpr(b.Condition, fn)
+			walkExpr(b.Body, fn)
+		}
+		walkExpr(v.Else, fn)
+	case *TemplateString:
+		for _, p := range v.Parts {
+			walkExpr(p, fn)
+		}
+	}
+}

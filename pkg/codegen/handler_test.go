@@ -1714,7 +1714,7 @@ func TestWriteHandlerImportsAllFeatures(t *testing.T) {
 		},
 	}
 	result := &semantic.Result{Files: []*ast.File{{}}}
-	writeHandlerImports(&b, result, models, true, true, true, true, true, true)
+	writeHandlerImports(&b, result, models, handlerFeatures{hasOrGroups: true, hasSortable: true, hasAwait: true, hasTransaction: true, hasTemplateStr: true, hasAuth: true})
 	out := b.String()
 	if !strings.Contains(out, `"strconv"`) {
 		t.Fatalf("hasOrGroups should add strconv import, got:\n%s", out)
@@ -1752,7 +1752,7 @@ func TestWriteHandlerImportsNoHashWithoutWriteOps(t *testing.T) {
 			{Name: "password", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hash"}}},
 		},
 	}}
-	writeHandlerImports(&b, result, models, false, false, false, false, false, false)
+	writeHandlerImports(&b, result, models, handlerFeatures{})
 	out := b.String()
 	if strings.Contains(out, "luxocrypto") {
 		t.Fatalf("read-only CRUD with @hash should not add luxocrypto, got:\n%s", out)

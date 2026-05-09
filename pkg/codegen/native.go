@@ -31,7 +31,23 @@ func GenerateNativeFile(result *semantic.Result, packageName string) []byte {
 
 	var b strings.Builder
 	writeHeader(&b, packageName, "native.gen.go")
-	b.WriteString("import \"context\"\n\n")
+	// Scan for time import need (DateTime params/return)
+	needsTime := false
+	for _, api := range apis {
+		for _, p := range api.Params {
+			if p.Type != nil && p.Type.Name == "DateTime" {
+				needsTime = true
+			}
+		}
+		if api.ReturnType != nil && api.ReturnType.Name == "DateTime" {
+			needsTime = true
+		}
+	}
+	if needsTime {
+		b.WriteString("import (\n\t\"context\"\n\t\"time\"\n)\n\n")
+	} else {
+		b.WriteString("import \"context\"\n\n")
+	}
 
 	b.WriteString("// NativeResolver is the interface for @native API implementations.\n")
 	b.WriteString("// Implement this interface in your resolver package.\n")
