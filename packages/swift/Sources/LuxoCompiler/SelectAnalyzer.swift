@@ -1,24 +1,17 @@
 import Foundation
+import SwiftSyntax
+import SwiftParser
 
-/// Compile-time field access analyzer for Swift.
+/// Compile-time field access analyzer using SwiftSyntax AST.
 ///
-/// Swift doesn't have a Vite/KCP-style build plugin ecosystem,
-/// so we use a source-level analyzer that runs as a build phase script:
-///
-/// ```bash
-/// swift run LuxoAnalyze --source-dir Sources/ --output Sources/Generated/SelectHints.swift
-/// ```
-///
-/// Tracks nested field access patterns:
+/// Tracks nested field access patterns on LuxoClient API responses:
 ///   post.user.name          → "user{name}"
 ///   post.comments[0].content → "comments{content}"
 ///   post.comments.forEach { $0.user.id } → "comments{user{id}}"
 ///
-/// Uses SwiftSyntax AST for accurate parsing.
-///
-/// NOTE: For production use, integrate with swift-syntax package.
-/// This is the standalone text-level analyzer (fallback).
-public final class SelectAnalyzer {
+/// Run as build phase:
+///   swift run LuxoAnalyze --source-dir Sources/ --output Sources/Generated/SelectHints.swift
+public final class SelectAnalyzer: SyntaxVisitor {
 
     /// API name → field tree
     private var trees: [String: FieldNode] = [:]
@@ -26,84 +19,27 @@ public final class SelectAnalyzer {
     /// Variable name → API name
     private var varToAPI: [String: String] = [:]
 
-    /// Variable name → parent chain
+    /// Variable name → parent source (for alias/closure tracking)
     private var varToParent: [String: (parentVar: String, field: String)] = [:]
 
     public static let maxNestingDepth = 5
 
-    public init() {}
+    public init() {
+        super.init(viewMode: .sourceAccurate)
+    }
+
+    // MARK: - Public API
+
+    /// Analyze a Swift source string.
+    public func analyzeSource(_ source: String) {
+        let tree = Parser.parse(source: source)
+        walk(tree)
+    }
 
     /// Analyze a Swift source file.
-    public func analyzeFile(_ source: String) {
-        // Phase 1: find API call assignments
-        // Pattern: let/var user = await client.getUser(1)
-        let callPattern = try! NSRegularExpression(
-            pattern: #"(?:let|var)\s+(\w+)\s*=\s*(?:try\s+)?(?:await\s+)?\w+\.(\w+)\s*\("#
-        )
-        let matches = callPattern.matches(in: source, range: NSRange(source.startIndex..., in: source))
-        for match in matches {
-            let varName = String(source[Range(match.range(at: 1), in: source)!])
-            let apiName = String(source[Range(match.range(at: 2), in: source)!])
-            varToAPI[varName] = apiName
-            trees[apiName] = trees[apiName] ?? FieldNode.root()
-        }
-
-        // Phase 2: find nested property chains
-        for (varName, apiName) in varToAPI {
-            let chainPattern = try! NSRegularExpression(
-                pattern: #"\b\#(NSRegularExpression.escapedPattern(for: varName))((?:\??\.\w+|\[\w+\])+)"#
-            )
-            let chainMatches = chainPattern.matches(in: source, range: NSRange(source.startIndex..., in: source))
-            for match in chainMatches {
-                let chainStr = String(source[Range(match.range(at: 1), in: source)!])
-                let segments = chainStr
-                    .components(separatedBy: CharacterSet(charactersIn: ".?[]"))
-                    .filter { !$0.isEmpty && Int($0) == nil }
-
-                guard !segments.isEmpty, let tree = trees[apiName] else { continue }
-                var node = tree
-                for seg in segments {
-                    node = node.addChild(seg)
-                }
-            }
-        }
-
-        // Phase 3: track closure params ($0, named params in forEach/map)
-        let closurePattern = try! NSRegularExpression(
-            pattern: #"(\w+)\.(\w+)\.(?:forEach|map|filter|compactMap)\s*\{\s*(?:(\w+)\s+in\s+)?"#
-        )
-        let closureMatches = closurePattern.matches(in: source, range: NSRange(source.startIndex..., in: source))
-        for match in closureMatches {
-            let parentVar = String(source[Range(match.range(at: 1), in: source)!])
-            let fieldName = String(source[Range(match.range(at: 2), in: source)!])
-            let paramName: String
-            if match.range(at: 3).location != NSNotFound {
-                paramName = String(source[Range(match.range(at: 3), in: source)!])
-            } else {
-                paramName = "$0"
-            }
-
-            guard varToAPI[parentVar] != nil else { continue }
-            varToParent[paramName] = (parentVar: parentVar, field: fieldName)
-
-            // Find field accesses on the closure param
-            let escapedParam = paramName == "$0" ? "\\$0" : NSRegularExpression.escapedPattern(for: paramName)
-            let paramChainPattern = try! NSRegularExpression(
-                pattern: "\(escapedParam)((?:\\??\\.\\w+)+)"
-            )
-            let paramMatches = paramChainPattern.matches(in: source, range: NSRange(source.startIndex..., in: source))
-            for pm in paramMatches {
-                let chainStr = String(source[Range(pm.range(at: 1), in: source)!])
-                let segments = chainStr.components(separatedBy: CharacterSet(charactersIn: ".?"))
-                    .filter { !$0.isEmpty }
-
-                guard let apiName = varToAPI[parentVar], let tree = trees[apiName] else { continue }
-                var node = tree.addChild(fieldName)
-                for seg in segments {
-                    node = node.addChild(seg)
-                }
-            }
-        }
+    public func analyzeFile(at path: String) throws {
+        let source = try String(contentsOfFile: path, encoding: .utf8)
+        analyzeSource(source)
     }
 
     /// Build select hints: API name → $select string.
@@ -136,37 +72,176 @@ public final class SelectAnalyzer {
         out += "}\n"
         return out
     }
-}
 
-// MARK: - FieldNode
+    // MARK: - SyntaxVisitor overrides
 
-/// Tree node for nested field selection.
-public final class FieldNode {
-    public let name: String
-    public private(set) var children: [String: FieldNode] = [:]
+    /// Track: let user = await client.getUser(1)
+    public override func visit(_ node: VariableDeclSyntax) -> SyntaxVisitorContinueKind {
+        for binding in node.bindings {
+            guard let pattern = binding.pattern.as(IdentifierPatternSyntax.self),
+                  let init_ = binding.initializer?.value else { continue }
 
-    private init(_ name: String) { self.name = name }
+            let varName = pattern.identifier.text
 
-    public static func root() -> FieldNode { FieldNode("") }
+            // Unwrap await/try
+            let expr = unwrapAwaitTry(init_)
 
-    @discardableResult
-    public func addChild(_ fieldName: String) -> FieldNode {
-        if let existing = children[fieldName] { return existing }
-        let child = FieldNode(fieldName)
-        children[fieldName] = child
-        return child
+            // Check if it's a method call on a client
+            if let call = expr.as(FunctionCallExprSyntax.self),
+               let member = call.calledExpression.as(MemberAccessExprSyntax.self) {
+                let apiName = member.declName.baseName.text
+                varToAPI[varName] = apiName
+                trees[apiName] = trees[apiName] ?? FieldNode.root()
+            }
+
+            // Check if it's a member access alias: let author = post.user
+            if let member = expr.as(MemberAccessExprSyntax.self) {
+                let fieldName = member.declName.baseName.text
+                if let base = member.base?.as(DeclReferenceExprSyntax.self) {
+                    let parentVar = base.baseName.text
+                    if varToAPI[parentVar] != nil || varToParent[parentVar] != nil {
+                        varToParent[varName] = (parentVar: parentVar, field: fieldName)
+                    }
+                }
+            }
+        }
+        return .visitChildren
     }
 
-    public func maxDepth() -> Int {
-        if children.isEmpty { return 0 }
-        return children.values.map { $0.maxDepth() }.max()! + 1
+    /// Track: post.user.name (member access chains)
+    public override func visit(_ node: MemberAccessExprSyntax) -> SyntaxVisitorContinueKind {
+        let chain = extractChain(ExprSyntax(node))
+        if chain.count >= 2 {
+            processChain(chain)
+        }
+        return .visitChildren
     }
 
-    public func toSelectString() -> String {
-        if children.isEmpty { return "" }
-        return children.values.map { child in
-            let nested = child.toSelectString()
-            return nested.isEmpty ? child.name : "\(child.name){\(nested)}"
-        }.joined(separator: ",")
+    /// Track: post.comments.forEach { item in item.user.name }
+    public override func visit(_ node: FunctionCallExprSyntax) -> SyntaxVisitorContinueKind {
+        // Check if it's a collection method: arr.forEach { ... }
+        guard let member = node.calledExpression.as(MemberAccessExprSyntax.self) else {
+            return .visitChildren
+        }
+        let methodName = member.declName.baseName.text
+        let collectionMethods: Set<String> = [
+            "forEach", "map", "filter", "compactMap", "flatMap",
+            "first", "contains", "allSatisfy", "sorted",
+        ]
+        guard collectionMethods.contains(methodName) else { return .visitChildren }
+
+        // Get the source: post.comments
+        guard let base = member.base else { return .visitChildren }
+        let sourceChain = extractChain(base)
+        guard sourceChain.count >= 2 else { return .visitChildren }
+
+        let rootVar = sourceChain[0]
+        guard varToAPI[rootVar] != nil else { return .visitChildren }
+
+        // Get closure param name
+        let closureArg = node.arguments.first(where: { arg in
+            arg.expression.is(ClosureExprSyntax.self)
+        })
+        let trailingClosure = node.trailingClosure
+
+        let closure = closureArg?.expression.as(ClosureExprSyntax.self) ?? trailingClosure
+        guard let closure = closure else { return .visitChildren }
+
+        // Get param name (explicit or $0)
+        var paramName = "$0"
+        if let sig = closure.signature,
+           let params = sig.parameterClause?.as(ClosureParameterClauseSyntax.self) {
+            if let first = params.parameters.first {
+                paramName = first.firstName.text
+            }
+        } else if let sig = closure.signature,
+                  let shorthand = sig.parameterClause?.as(ClosureShorthandParameterListSyntax.self) {
+            if let first = shorthand.first {
+                paramName = first.name.text
+            }
+        }
+
+        // Link param to source field
+        let sourceField = sourceChain.last!
+        varToParent[paramName] = (parentVar: rootVar, field: sourceField)
+
+        return .visitChildren
+    }
+
+    // MARK: - Helpers
+
+    private func unwrapAwaitTry(_ expr: ExprSyntax) -> ExprSyntax {
+        if let await_ = expr.as(AwaitExprSyntax.self) {
+            return unwrapAwaitTry(await_.expression)
+        }
+        if let try_ = expr.as(TryExprSyntax.self) {
+            return unwrapAwaitTry(try_.expression)
+        }
+        return expr
+    }
+
+    /// Extract property chain: post.user.name → ["post", "user", "name"]
+    private func extractChain(_ expr: ExprSyntax) -> [String] {
+        var chain: [String] = []
+        var current = expr
+
+        while true {
+            if let member = current.as(MemberAccessExprSyntax.self) {
+                chain.insert(member.declName.baseName.text, at: 0)
+                if let base = member.base {
+                    current = base
+                } else {
+                    break
+                }
+            } else if let subscript_ = current.as(SubscriptCallExprSyntax.self) {
+                // arr[0] → skip index, continue with arr
+                current = subscript_.calledExpression
+            } else if let ref = current.as(DeclReferenceExprSyntax.self) {
+                chain.insert(ref.baseName.text, at: 0)
+                break
+            } else {
+                break
+            }
+        }
+        return chain
+    }
+
+    private func processChain(_ chain: [String]) {
+        let rootVar = chain[0]
+        let apiName: String
+        let fieldChain: [String]
+
+        if let api = varToAPI[rootVar] {
+            apiName = api
+            fieldChain = Array(chain.dropFirst())
+        } else if let resolved = resolveParentChain(rootVar) {
+            guard let api = varToAPI[resolved.rootVar] else { return }
+            apiName = api
+            fieldChain = resolved.fields + Array(chain.dropFirst())
+        } else {
+            return
+        }
+
+        guard let tree = trees[apiName] else { return }
+        var node = tree
+        for field in fieldChain {
+            node = node.addChild(field)
+        }
+    }
+
+    private func resolveParentChain(_ varName: String) -> (rootVar: String, fields: [String])? {
+        var fields: [String] = []
+        var current = varName
+        var seen = Set<String>()
+
+        while let parent = varToParent[current] {
+            if seen.contains(current) { break }
+            seen.insert(current)
+            fields.insert(parent.field, at: 0)
+            current = parent.parentVar
+        }
+
+        guard !fields.isEmpty else { return nil }
+        return (rootVar: current, fields: fields)
     }
 }

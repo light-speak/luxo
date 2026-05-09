@@ -154,6 +154,81 @@ class OkHttpTransport(
     }
 }
 
+// MARK: - WebSocket Transport
+
+/**
+ * OkHttp WebSocket transport for streaming (subscriptions).
+ * Usage:
+ *   val ws = LuxoWebSocket("ws://localhost:4000/luvia/ws", client)
+ *   ws.connect()
+ *   ws.subscribe("liveTraces", mapOf("projectId" to 1)) { data -> ... }
+ *   ws.close()
+ */
+class LuxoWebSocket(
+    private val url: String,
+    private val client: OkHttpClient = OkHttpClient(),
+    private val token: String? = null,
+) {
+    private var ws: WebSocket? = null
+    private val handlers = ConcurrentHashMap<String, (JsonElement) -> Unit>()
+
+    fun connect() {
+        val request = Request.Builder()
+            .url(url)
+            .apply { token?.let { header("Authorization", "Bearer $it") } }
+            .build()
+
+        ws = client.newWebSocket(request, object : WebSocketListener() {
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                try {
+                    val json = Json.parseToJsonElement(text).jsonObject
+                    val api = json["api"]?.jsonPrimitive?.content ?: return
+                    val data = json["data"] ?: return
+                    handlers[api]?.invoke(data)
+                } catch (_: Exception) {}
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                // Reconnect logic can be added here
+            }
+        })
+    }
+
+    fun subscribe(api: String, params: Map<String, Any?> = emptyMap(), handler: (JsonElement) -> Unit) {
+        handlers[api] = handler
+        val msg = buildJsonObject {
+            put("type", JsonPrimitive("subscribe"))
+            put("api", JsonPrimitive(api))
+            put("params", buildJsonObject {
+                for ((k, v) in params) {
+                    when (v) {
+                        is Number -> put(k, JsonPrimitive(v))
+                        is String -> put(k, JsonPrimitive(v))
+                        is Boolean -> put(k, JsonPrimitive(v))
+                        null -> put(k, JsonNull)
+                    }
+                }
+            })
+        }
+        ws?.send(msg.toString())
+    }
+
+    fun unsubscribe(api: String) {
+        handlers.remove(api)
+        val msg = buildJsonObject {
+            put("type", JsonPrimitive("unsubscribe"))
+            put("api", JsonPrimitive(api))
+        }
+        ws?.send(msg.toString())
+    }
+
+    fun close() {
+        ws?.close(1000, "client close")
+        ws = null
+        handlers.clear()
+    }
+}
+
 private suspend fun OkHttpClient.awaitStringCall(request: Request): String =
     suspendCancellableCoroutine { cont ->
         val call = newCall(request)
