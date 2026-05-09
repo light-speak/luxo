@@ -147,7 +147,7 @@ console.log(post.user.name)
     expect(result).toContain('user{name}')
   })
 
-  it('should track deeply nested fields', () => {
+  it('should track forEach lambda params', () => {
     const code = `
 const post = await client.getPost(1)
 console.log(post.title)
@@ -159,8 +159,21 @@ post.comments.forEach(c => {
     const result = analyzeAndTransform(code, 'test.ts', schema)
     expect(result).not.toBeNull()
     expect(result).toContain('title')
-    // comments with nested content and user{name}
-    expect(result).toContain('comments')
+    expect(result).toContain('comments{content,user{name}}')
+  })
+
+  it('should track variable alias', () => {
+    const code = `
+const post = await client.getPost(1)
+const author = post.user
+console.log(post.title)
+console.log(author.name)
+console.log(author.email)
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).not.toBeNull()
+    expect(result).toContain('title')
+    expect(result).toContain('user{name,email}')
   })
 
   it('should track index access on nested relations', () => {
