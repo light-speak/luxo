@@ -11,8 +11,22 @@ import (
 // Used by Luvia to convert responses without requiring model structs.
 // Loaded from luxo.lock + codegen-emitted schema registration.
 type Schema struct {
-	Models map[string]*Model `json:"models"`
-	APIs   map[string]*API   `json:"apis"`
+	Models map[string]*Model    `json:"models"`
+	APIs   map[string]*API      `json:"apis"`
+	Enums  map[string]*Enum     `json:"enums,omitempty"`
+	Types  map[string]*TypeDecl `json:"types,omitempty"`
+}
+
+// Enum describes an enum type with its values.
+type Enum struct {
+	Name   string   `json:"name"`
+	Values []string `json:"values"`
+}
+
+// TypeDecl describes a plain data type (non-DB, like AuthPayload).
+type TypeDecl struct {
+	Name   string  `json:"name"`
+	Fields []Field `json:"fields"`
 }
 
 // Model describes a model's fields for binary ↔ JSON conversion.
@@ -28,8 +42,10 @@ type Field struct {
 	ID       int       `json:"id"`
 	Name     string    `json:"name"`
 	Type     FieldType `json:"type"`
+	TypeName string    `json:"typeName,omitempty"` // original Luxo type name (User, MemberRole, etc.)
 	Nullable bool      `json:"nullable,omitempty"`
 	IsList   bool      `json:"isList,omitempty"`
+	Relation bool      `json:"relation,omitempty"` // true if this is a relation field (not a DB column)
 	// Pre-computed JSON prefix: `"name":` as bytes for zero-alloc writing
 	JSONPrefix []byte `json:"-"`
 }
@@ -108,7 +124,19 @@ func New() *Schema {
 	return &Schema{
 		Models: make(map[string]*Model),
 		APIs:   make(map[string]*API),
+		Enums:  make(map[string]*Enum),
+		Types:  make(map[string]*TypeDecl),
 	}
+}
+
+// RegisterEnum adds an enum definition to the schema.
+func (s *Schema) RegisterEnum(e *Enum) {
+	s.Enums[e.Name] = e
+}
+
+// RegisterType adds a type declaration to the schema.
+func (s *Schema) RegisterType(t *TypeDecl) {
+	s.Types[t.Name] = t
 }
 
 // RegisterModel adds a model definition to the schema.

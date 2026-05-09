@@ -377,9 +377,12 @@ func TestBuildSchemaJSON_SkipsHiddenAndRelation(t *testing.T) {
 	if strings.Contains(s, "password") {
 		t.Error("@internal field should be excluded")
 	}
-	// "posts" is a relation field (non-scalar) so should be excluded
-	if strings.Contains(s, "posts") {
-		t.Error("relation field should be excluded")
+	// "posts" is a relation field — should be included but marked relation:true
+	if !strings.Contains(s, "posts") {
+		t.Error("relation field should be included in schema")
+	}
+	if !strings.Contains(s, `"relation":true`) {
+		t.Error("relation field should have relation:true flag")
 	}
 }
 
