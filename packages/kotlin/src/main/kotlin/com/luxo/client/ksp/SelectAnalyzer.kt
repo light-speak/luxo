@@ -7,102 +7,160 @@ import kotlin.io.path.extension
 import kotlin.io.path.readText
 
 /**
- * Standalone source scanner — analyzes .kt files to find LuxoClient API calls
- * and trace field access on return values. Generates SelectHints.kt.
+ * Source scanner — analyzes .kt files to find LuxoClient API calls
+ * and trace nested field access on return values.
  *
- * This is a text-level heuristic analyzer (like @luxo/vite-plugin for TypeScript).
- * No KSP/KCP needed — runs as a Gradle task or CLI tool.
+ * Supports nested field tracking:
+ *   post.user.name          → "user{name}"
+ *   post.comments[0].content → "comments{content}"
+ *   post.comments[0].user.id → "comments{user{id}}"
  *
  * Usage:
  *   SelectAnalyzer.analyze(
  *     sourceDir = "src/main/kotlin",
  *     outFile = "src/main/kotlin/com/example/luxo/SelectHints.kt",
  *     packageName = "com.example.luxo",
+ *     modelFields = mapOf("Post" to mapOf("title" to "String", "user" to "User"), ...)
  *   )
- *
- * Pattern detection:
- *   val user = client.getUser(1)     → tracks var "user" from API "getUser"
- *   val (name, email) = ...          → destructuring (not tracked)
- *   println(user.name)               → records "name" for "getUser"
- *   user.email                       → records "email" for "getUser"
  */
 object SelectAnalyzer {
 
     // Matches: val/var <name> = <expr>.someApiMethod(...)
-    // Captures: group(1) = variable name, group(2) = method name
     private val callPattern = Regex(
         """(?:val|var)\s+(\w+)\s*=\s*(?:.*?)\.(\w+)\s*\("""
     )
 
-    // Matches: <variable>.<property> (property access)
-    // Captures: group(1) = variable name, group(2) = property name
-    private val accessPattern = Regex(
-        """(\w+)\.(\w+)"""
-    )
-
-    // Known API method prefixes (from CRUD patterns)
     private val apiPrefixes = setOf("get", "list", "create", "update", "delete", "find")
 
-    fun analyze(sourceDir: String, outFile: String, packageName: String) {
-        val hints = mutableMapOf<String, MutableSet<String>>()
+    fun analyze(
+        sourceDir: String,
+        outFile: String,
+        packageName: String,
+        modelFields: Map<String, Map<String, String>> = emptyMap(),
+    ) {
+        val hints = mutableMapOf<String, FieldNode>()
         val sourceRoot = Path.of(sourceDir)
 
-        // Scan all .kt files
         Files.walk(sourceRoot)
             .filter { it.extension == "kt" }
-            .filter { !it.toString().contains("SelectHints") } // skip generated
+            .filter { !it.toString().contains("SelectHints") }
             .forEach { path ->
-                analyzeFile(path.readText(), hints)
+                analyzeFile(path.readText(), hints, modelFields)
             }
 
-        // Generate output
         File(outFile).parentFile?.mkdirs()
         File(outFile).writeText(generateHints(hints, packageName))
         println("[luxo] Generated select hints -> $outFile")
     }
 
-    internal fun analyzeFile(source: String, hints: MutableMap<String, MutableSet<String>>) {
-        // Phase 1: find variable → API method mappings
+    internal fun analyzeFile(
+        source: String,
+        hints: MutableMap<String, FieldNode>,
+        modelFields: Map<String, Map<String, String>> = emptyMap(),
+    ) {
+        // Phase 1: find variable → API method + type mappings
         val varToApi = mutableMapOf<String, String>()
+        val varToType = mutableMapOf<String, String>()
 
         for (match in callPattern.findAll(source)) {
             val varName = match.groupValues[1]
             val methodName = match.groupValues[2]
 
-            // Only track if method name looks like a Luxo API call
             if (apiPrefixes.any { methodName.startsWith(it) } || methodName.length > 3) {
                 varToApi[varName] = methodName
-                hints.putIfAbsent(methodName, mutableSetOf())
+                hints.putIfAbsent(methodName, FieldNode.root())
+
+                // Infer type from method name: getUser → User, listPosts → Post
+                val typeName = inferTypeFromMethod(methodName)
+                if (typeName != null) {
+                    varToType[varName] = typeName
+                }
             }
         }
 
-        // Phase 2: find property accesses on tracked variables
-        for (match in accessPattern.findAll(source)) {
-            val varName = match.groupValues[1]
-            val propName = match.groupValues[2]
+        // Phase 2: find nested property access chains
+        // Match: varName.field1.field2, varName.field1[0].field2, varName?.field1
+        for ((varName, apiName) in varToApi) {
+            val chainRegex = Regex("""\b${Regex.escape(varName)}((?:\??\.\w+|\[\w+])+)""")
+            for (match in chainRegex.findAll(source)) {
+                val chainStr = match.groupValues[1]
+                val segments = chainStr.split(Regex("""[.?\[\]]+"""))
+                    .filter { it.isNotEmpty() && !it.all { c -> c.isDigit() } }
 
-            val apiName = varToApi[varName] ?: continue
+                if (segments.isEmpty()) continue
 
-            // Skip common non-field accesses
-            if (propName in setOf("toString", "hashCode", "let", "also", "apply", "run", "takeIf")) continue
+                val root = hints[apiName] ?: continue
+                var currentType = varToType[varName]
+                var currentNode = root
 
-            hints[apiName]?.add(propName)
+                for (seg in segments) {
+                    // Skip non-field accesses
+                    if (seg in setOf("toString", "hashCode", "let", "also", "apply", "run", "takeIf")) break
+
+                    // Validate against model fields if available
+                    if (currentType != null && modelFields.containsKey(currentType)) {
+                        val fields = modelFields[currentType]!!
+                        if (!fields.containsKey(seg)) break
+
+                        currentNode = currentNode.addChild(seg)
+                        currentType = fields[seg]
+                    } else {
+                        currentNode = currentNode.addChild(seg)
+                        currentType = null
+                    }
+                }
+            }
         }
     }
 
-    private fun generateHints(hints: Map<String, Set<String>>, packageName: String): String = buildString {
+    private fun inferTypeFromMethod(method: String): String? {
+        for (prefix in apiPrefixes) {
+            if (method.startsWith(prefix) && method.length > prefix.length) {
+                var typeName = method.removePrefix(prefix)
+                // listPosts → Post (remove trailing 's' for list)
+                if (prefix == "list" && typeName.endsWith("s")) {
+                    typeName = typeName.dropLast(1)
+                }
+                return typeName
+            }
+        }
+        return null
+    }
+
+    private fun generateHints(hints: Map<String, FieldNode>, packageName: String): String = buildString {
         appendLine("// GENERATED BY luxo_client. DO NOT EDIT.")
         appendLine("// Rebuild with: ./gradlew luxoAnalyze\n")
         appendLine("package $packageName\n")
-        appendLine("/** Field access hints — auto-detected from your code. */")
+        appendLine("/** Nested field access hints — auto-detected from your code. */")
         appendLine("object SelectHints {")
         appendLine("    val hints: Map<String, String> = mapOf(")
-        for ((api, fields) in hints) {
-            if (fields.isEmpty()) continue
-            val sorted = fields.sorted().joinToString(",")
-            appendLine("        \"$api\" to \"$sorted\",")
+        for ((api, node) in hints) {
+            val selectStr = node.toSelectString()
+            if (selectStr.isEmpty()) continue
+            appendLine("        \"$api\" to \"$selectStr\",")
         }
         appendLine("    )")
         appendLine("}")
+    }
+}
+
+/** Tree node for nested field selection. */
+class FieldNode private constructor(val name: String) {
+    val children = mutableMapOf<String, FieldNode>()
+
+    companion object {
+        fun root() = FieldNode("")
+    }
+
+    fun addChild(fieldName: String): FieldNode {
+        return children.getOrPut(fieldName) { FieldNode(fieldName) }
+    }
+
+    fun toSelectString(): String {
+        if (children.isEmpty()) return ""
+        return children.values.joinToString(",") { child ->
+            val nested = child.toSelectString()
+            if (nested.isNotEmpty()) "${child.name}{$nested}" else child.name
+        }
     }
 }
