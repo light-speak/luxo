@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/env"
@@ -27,8 +28,29 @@ type Config struct {
 	RefreshExpires time.Duration
 }
 
+var (
+	cachedConfig *Config
+	configOnce   sync.Once
+	configErr    error
+)
+
 // LoadConfig reads JWT config from environment.
+// Config is cached after first load — zero allocation on subsequent calls.
 func LoadConfig() (*Config, error) {
+	configOnce.Do(func() {
+		cachedConfig, configErr = loadConfigFromEnv()
+	})
+	return cachedConfig, configErr
+}
+
+// ResetConfig clears the cached config (for testing only).
+func ResetConfig() {
+	configOnce = sync.Once{}
+	cachedConfig = nil
+	configErr = nil
+}
+
+func loadConfigFromEnv() (*Config, error) {
 	secret, ok := env.Get("JWT_SECRET")
 	if !ok {
 		return nil, fmt.Errorf("JWT_SECRET is not set")

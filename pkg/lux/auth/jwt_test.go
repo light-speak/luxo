@@ -123,6 +123,7 @@ func TestSignRefreshDisabled(t *testing.T) {
 }
 
 func TestLoadConfig(t *testing.T) {
+	ResetConfig()
 	os.Setenv("JWT_SECRET", "my-secret")
 	os.Setenv("JWT_EXPIRES", "2h")
 	os.Setenv("JWT_REFRESH", "true")
@@ -150,6 +151,7 @@ func TestLoadConfig(t *testing.T) {
 }
 
 func TestLoadConfigMissing(t *testing.T) {
+	ResetConfig()
 	os.Unsetenv("JWT_SECRET")
 	_, err := LoadConfig()
 	if err == nil {
@@ -158,6 +160,7 @@ func TestLoadConfigMissing(t *testing.T) {
 }
 
 func TestLoadConfigBadExpires(t *testing.T) {
+	ResetConfig()
 	os.Setenv("JWT_SECRET", "s")
 	os.Setenv("JWT_EXPIRES", "not-a-duration")
 	defer func() {
@@ -186,6 +189,7 @@ func TestVerifyBadBase64Payload(t *testing.T) {
 }
 
 func TestLoadConfigBadRefreshExpires(t *testing.T) {
+	ResetConfig()
 	os.Setenv("JWT_SECRET", "s")
 	os.Setenv("JWT_REFRESH_EXPIRES", "bad")
 	defer func() {
