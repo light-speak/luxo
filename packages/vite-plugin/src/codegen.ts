@@ -195,7 +195,7 @@ function genClient(schema: LuxoSchema): string {
 
   for (const api of Object.values(schema.apis)) {
     if (api.name.startsWith('svc:')) continue
-    out += genMethod(api)
+    out += genMethod(api, schema)
   }
 
   out += '}\n'
@@ -219,7 +219,14 @@ function genDecode(api: LuxoAPI): string {
   return `d instanceof Uint8Array ? ${binDec} : d as ${t}`
 }
 
-function genMethod(api: LuxoAPI): string {
+function resolveParamType(p: { type: string; name: string }, schema: LuxoSchema): string {
+  if (schema.enums?.[p.type]) return p.type
+  if (schema.models[p.type]) return p.type
+  if (schema.types?.[p.type]) return p.type
+  return luxoTypeToTS(p.type)
+}
+
+function genMethod(api: LuxoAPI, schema: LuxoSchema): string {
   const retTS = getReturnType(api)
   const decode = genDecode(api)
   const call = (params: string) =>
@@ -254,7 +261,10 @@ function genMethod(api: LuxoAPI): string {
   }
 
   if (api.params && api.params.length > 0) {
-    const paramStr = api.params.map(p => `${p.name}: ${luxoTypeToTS(p.type)}`).join('; ')
+    const paramStr = api.params.map(p => {
+      const t = resolveParamType(p, schema)
+      return `${p.name}${p.required === false ? '?' : ''}: ${t}`
+    }).join('; ')
     return `  async ${api.name}(params: { ${paramStr} }): Promise<${retTS}> {\n` +
            call('params') + `  }\n\n`
   }
