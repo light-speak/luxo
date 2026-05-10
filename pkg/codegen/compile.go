@@ -836,6 +836,10 @@ func (c *compiler) compileModifierMethod(b *strings.Builder, modelName string, l
 	case "limit", "offset":
 		if len(link.args) > 0 {
 			val := c.compileExpr(link.args[0].Value)
+			// Cast to int if the value is a variable (int64 from ParamInt)
+			if _, isLit := link.args[0].Value.(*ast.Literal); !isLit {
+				val = "int(" + val + ")"
+			}
 			fmt.Fprintf(b, ".%s(%s)", str.Capitalize(link.method), val)
 		}
 	case "groupBy":
@@ -1275,6 +1279,20 @@ func (c *compiler) resolveQueryType(expr ast.Expr) valType {
 
 // isModelQuery checks if an expression is a Model query chain (returns (*T, error)).
 func (c *compiler) isModelQuery(expr ast.Expr) bool {
+	// Instance method: variable.delete(), variable.update(...)
+	if call, ok := expr.(*ast.CallExpr); ok {
+		if member, ok := call.Func.(*ast.MemberExpr); ok {
+			if ident, ok := member.Object.(*ast.Ident); ok {
+				if vt, ok := c.vars[ident.Name]; ok && vt.isModel && !vt.isList {
+					switch member.Field {
+					case "delete", "update":
+						return true
+					}
+				}
+			}
+		}
+	}
+
 	chain := flattenChain(expr)
 	if len(chain) < 2 {
 		return false

@@ -3674,8 +3674,8 @@ func TestCompileSearchAPI(t *testing.T) {
 	if !strings.Contains(out, `.OrderBy("views DESC")`) {
 		t.Fatalf("missing OrderBy DESC, got:\n%s", out)
 	}
-	if !strings.Contains(out, ".Limit(limit)") {
-		t.Fatalf("missing .Limit(limit), got:\n%s", out)
+	if !strings.Contains(out, ".Limit(int(limit))") {
+		t.Fatalf("missing .Limit(int(limit)), got:\n%s", out)
 	}
 	if !strings.Contains(out, ".All(ctx)") {
 		t.Fatalf("missing .All(ctx), got:\n%s", out)
