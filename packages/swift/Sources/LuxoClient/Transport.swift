@@ -142,6 +142,7 @@ public final class WebSocketTransport: @unchecked Sendable {
     private var task: URLSessionWebSocketTask?
     private let session: URLSession
     private var handlers: [String: (Any) -> Void] = [:]
+    private let lock = NSLock()
 
     public init(url: String) {
         self.url = URL(string: url)!
@@ -155,7 +156,9 @@ public final class WebSocketTransport: @unchecked Sendable {
     }
 
     public func subscribe(_ api: String, params: [String: Any]? = nil, handler: @escaping (Any) -> Void) {
+        lock.lock()
         handlers[api] = handler
+        lock.unlock()
         let msg: [String: Any] = [
             "type": "subscribe",
             "api": api,
@@ -169,6 +172,9 @@ public final class WebSocketTransport: @unchecked Sendable {
     public func close() {
         task?.cancel(with: .normalClosure, reason: nil)
         task = nil
+        lock.lock()
+        handlers.removeAll()
+        lock.unlock()
     }
 
     private func receiveLoop() {
@@ -180,14 +186,20 @@ public final class WebSocketTransport: @unchecked Sendable {
                     if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                        let api = json["api"] as? String,
                        let payload = json["data"] {
-                        self?.handlers[api]?(payload)
+                        self?.lock.lock()
+                        let handler = self?.handlers[api]
+                        self?.lock.unlock()
+                        handler?(payload)
                     }
                 case .string(let text):
                     if let data = text.data(using: .utf8),
                        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                        let api = json["api"] as? String,
                        let payload = json["data"] {
-                        self?.handlers[api]?(payload)
+                        self?.lock.lock()
+                        let handler = self?.handlers[api]
+                        self?.lock.unlock()
+                        handler?(payload)
                     }
                 @unknown default:
                     break

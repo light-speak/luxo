@@ -134,27 +134,32 @@ class SelectCollector(
     }
 
     private fun recordFieldAccess(call: IrCall) {
-        // Property getter: post.user → IrCall(getUser, dispatchReceiver=post)
         val propName = extractPropertyName(call) ?: return
         val receiver = call.dispatchReceiver ?: return
 
-        val chain = buildAccessChain(receiver, propName)
-        if (chain.isEmpty()) return
+        val (apiName, chain) = buildAccessChain(receiver, propName) ?: return
 
-        addChainToTree(chain)
+        val tree = apiTrees[apiName] ?: return
+        var node = tree
+        for (field in chain) {
+            node = node.addChild(field)
+        }
     }
 
     private fun recordFieldAccessFromGetField(expr: IrGetField) {
         val fieldName = expr.symbol.owner.name.asString()
         val receiver = expr.receiver ?: return
 
-        val chain = buildAccessChain(receiver, fieldName)
-        if (chain.isEmpty()) return
+        val (apiName, chain) = buildAccessChain(receiver, fieldName) ?: return
 
-        addChainToTree(chain)
+        val tree = apiTrees[apiName] ?: return
+        var node = tree
+        for (field in chain) {
+            node = node.addChild(field)
+        }
     }
 
-    private fun buildAccessChain(receiver: IrExpression, fieldName: String): List<String> {
+    private fun buildAccessChain(receiver: IrExpression, fieldName: String): Pair<String, List<String>>? {
         val chain = mutableListOf(fieldName)
         var current: IrExpression = receiver
 
@@ -174,14 +179,21 @@ class SelectCollector(
                 is IrGetValue -> {
                     val variable = current.symbol.owner
                     if (variable is IrVariable) {
-                        // Check if this variable is tracked
-                        if (varToAPI.containsKey(variable)) {
-                            return chain
+                        val apiName = varToAPI[variable]
+                        if (apiName != null) {
+                            return Pair(apiName, chain)
                         }
-                        // Resolve through parent chain
                         val parentChain = resolveParentChain(variable)
                         if (parentChain != null) {
-                            return parentChain + chain
+                            // Find root variable's API
+                            var root = variable
+                            val seen = mutableSetOf<IrVariable>()
+                            while (varToParent.containsKey(root) && root !in seen) {
+                                seen.add(root)
+                                root = varToParent[root]!!.parentVar
+                            }
+                            val rootAPI = varToAPI[root] ?: break
+                            return Pair(rootAPI, parentChain + chain)
                         }
                     }
                     break
@@ -190,7 +202,7 @@ class SelectCollector(
             }
         }
 
-        return emptyList()
+        return null
     }
 
     private fun resolveParentChain(variable: IrVariable): List<String>? {
@@ -209,19 +221,7 @@ class SelectCollector(
         return if (varToAPI.containsKey(current) && fields.isNotEmpty()) fields else null
     }
 
-    private fun addChainToTree(chain: List<String>) {
-        // Find which API this chain belongs to
-        // The chain doesn't include the root variable — we need to match it
-        // This is simplified; in practice the chain is already resolved
-        for ((_, apiName) in varToAPI) {
-            val tree = apiTrees[apiName] ?: continue
-            var node = tree
-            for (field in chain) {
-                node = node.addChild(field)
-            }
-            return
-        }
-    }
+    // addChainToTree removed — chain resolution now happens inline in recordFieldAccess
 
     // ─── Result builders ────────────────────────────────────────────────────
 
