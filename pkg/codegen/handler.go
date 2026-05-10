@@ -218,7 +218,7 @@ func generateCompiledHandlers(b *strings.Builder, result *semantic.Result, model
 	var names []string
 	for _, file := range result.Files {
 		for _, api := range file.APIs {
-			if api.Body != nil && !hasDirective(api.Directives, "native") {
+			if api.Body != nil && !hasDirective(api.Directives, "native") && !hasDirective(api.Directives, "stream") {
 				compileAPIBody(b, api, modelMap, enumSet)
 				names = append(names, api.Name)
 			}
@@ -346,9 +346,25 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 	needsJSON := scanModelsForJSON(models)
 	hasValidation, hasPattern := scanModelsForValidation(models)
 
+	// Check if fmt is needed (CRUD create/update handlers use fmt.Errorf for validation)
+	needsFmt := feat.hasEmit
+	for _, m := range models {
+		ops := crudOperations(m)
+		for _, op := range ops {
+			if op == "create" || op == "update" {
+				needsFmt = true
+				break
+			}
+		}
+		if needsFmt {
+			break
+		}
+	}
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
-	b.WriteString("\t\"fmt\"\n")
+	if needsFmt {
+		b.WriteString("\t\"fmt\"\n")
+	}
 	if hasOrGroups || hasTemplateStr {
 		b.WriteString("\t\"strconv\"\n")
 	}

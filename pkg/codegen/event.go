@@ -35,37 +35,26 @@ func generateEventFile(result *semantic.Result, packageName string) []byte {
 	var b strings.Builder
 	writeHeader(&b, packageName, "event.gen.go")
 
-	// Collect cross-module event imports
-	crossModuleImports := make(map[string]string) // module → import alias
-	if globalEventCtx != nil {
-		for _, l := range listeners {
-			evModule := globalEventCtx.EventModule[l.EventName]
-			if evModule != "" && evModule != currentModule {
-				alias := evModule + "_luxo"
-				crossModuleImports[evModule] = alias
-			}
-		}
-		// Also check emit statements in API bodies
-		for _, file := range result.Files {
-			for _, api := range file.APIs {
-				if api.Body != nil {
-					ast.WalkExprs(api.Body, func(e ast.Expr) {})
-					for _, stmt := range api.Body.Stmts {
-						if emit, ok := stmt.(*ast.EmitStmt); ok {
-							evModule := globalEventCtx.EventModule[emit.EventName]
-							if evModule != "" && evModule != currentModule {
-								alias := evModule + "_luxo"
-								crossModuleImports[evModule] = alias
-							}
-						}
-					}
-				}
+	crossModuleImports := collectCrossModuleEventImports(result, listeners, currentModule)
+
+	// Check if listener bodies need time import
+	needsTime := false
+	for _, l := range listeners {
+		if l.Body != nil {
+			var feat handlerFeatures
+			scanBodyForBuiltins(l.Body, &feat)
+			if feat.hasTimeFunc {
+				needsTime = true
+				break
 			}
 		}
 	}
 
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
+	if needsTime {
+		b.WriteString("\t\"time\"\n")
+	}
 	if len(events) > 0 {
 		b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
 	}
@@ -294,4 +283,34 @@ func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleN
 	b.WriteString("}\n\n")
 
 	// Note: Unmarshal functions are generated in generateEventFile, not here
+}
+
+// collectCrossModuleEventImports finds which event modules need to be imported.
+func collectCrossModuleEventImports(result *semantic.Result, listeners []*ast.OnDecl, currentModule string) map[string]string {
+	imports := make(map[string]string)
+	if globalEventCtx == nil {
+		return imports
+	}
+	for _, l := range listeners {
+		evModule := globalEventCtx.EventModule[l.EventName]
+		if evModule != "" && evModule != currentModule {
+			imports[evModule] = evModule + "_luxo"
+		}
+	}
+	for _, file := range result.Files {
+		for _, api := range file.APIs {
+			if api.Body == nil {
+				continue
+			}
+			for _, stmt := range api.Body.Stmts {
+				if emit, ok := stmt.(*ast.EmitStmt); ok {
+					evModule := globalEventCtx.EventModule[emit.EventName]
+					if evModule != "" && evModule != currentModule {
+						imports[evModule] = evModule + "_luxo"
+					}
+				}
+			}
+		}
+	}
+	return imports
 }

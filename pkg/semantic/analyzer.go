@@ -1365,6 +1365,7 @@ func (a *Analyzer) checkExpr(expr ast.Expr, scope *Scope) *ResolvedType {
 	// Write type tag into AST node for codegen to read
 	if resolved != nil {
 		expr.SetTypeTag(resolved.Name)
+		expr.SetNullable(resolved.Nullable)
 	}
 	return resolved
 }

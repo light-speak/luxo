@@ -1025,10 +1025,15 @@ func (c *compiler) compileCreateLink(b *strings.Builder, modelName string, link 
 		if m != nil {
 			for _, f := range m.Fields {
 				if f.Name == arg.Name && f.Type != nil && f.Type.Nullable {
-					alreadyPtr := false
-					if ident, ok := arg.Value.(*ast.Ident); ok {
-						if vt, ok := c.vars[ident.Name]; ok && vt.nullable {
-							alreadyPtr = true
+					// Check if value expression is already a pointer (nullable)
+					// Uses NullableTag from semantic analyzer — zero guessing
+					alreadyPtr := arg.Value.IsNullable()
+					if !alreadyPtr {
+						// Also check vars map for API params
+						if ident, ok := arg.Value.(*ast.Ident); ok {
+							if vt, ok := c.vars[ident.Name]; ok && vt.nullable {
+								alreadyPtr = true
+							}
 						}
 					}
 					if !alreadyPtr {
