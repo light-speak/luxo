@@ -2,6 +2,7 @@ package schema
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
@@ -303,5 +304,69 @@ func TestRegisterModelNoFields(t *testing.T) {
 	}
 	if got.FieldByID(1) != nil {
 		t.Error("empty model should have no fields")
+	}
+}
+
+func TestRegisterEnum(t *testing.T) {
+	s := New()
+	s.RegisterEnum(&Enum{Name: "Status", Values: []string{"ACTIVE", "INACTIVE"}})
+
+	if s.Enums["Status"] == nil {
+		t.Fatal("enum should be registered")
+	}
+	if len(s.Enums["Status"].Values) != 2 {
+		t.Errorf("expected 2 values, got %d", len(s.Enums["Status"].Values))
+	}
+}
+
+func TestRegisterType(t *testing.T) {
+	s := New()
+	s.RegisterType(&TypeDecl{
+		Name: "AuthPayload",
+		Fields: []Field{
+			{ID: 1, Name: "token", Type: FieldString},
+			{ID: 2, Name: "userId", Type: FieldInt},
+		},
+	})
+
+	if s.Types["AuthPayload"] == nil {
+		t.Fatal("type should be registered")
+	}
+	if len(s.Types["AuthPayload"].Fields) != 2 {
+		t.Errorf("expected 2 fields, got %d", len(s.Types["AuthPayload"].Fields))
+	}
+}
+
+func TestSchemaToJSONWithEnumsAndTypes(t *testing.T) {
+	s := New()
+	s.RegisterModel(&Model{Name: "User", Fields: []Field{{ID: 1, Name: "id", Type: FieldInt}}})
+	s.RegisterEnum(&Enum{Name: "Role", Values: []string{"ADMIN", "USER"}})
+	s.RegisterType(&TypeDecl{Name: "Token", Fields: []Field{{ID: 1, Name: "value", Type: FieldString}}})
+
+	data, err := s.ToJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := string(data)
+	if !strings.Contains(j, `"Role"`) {
+		t.Error("JSON should contain enum")
+	}
+	if !strings.Contains(j, `"ADMIN"`) {
+		t.Error("JSON should contain enum value")
+	}
+	if !strings.Contains(j, `"Token"`) {
+		t.Error("JSON should contain type")
+	}
+}
+
+func TestFieldTypeString(t *testing.T) {
+	if FieldInt.String() != "Int" {
+		t.Errorf("FieldInt.String() = %q", FieldInt.String())
+	}
+	if FieldString.String() != "String" {
+		t.Errorf("FieldString.String() = %q", FieldString.String())
+	}
+	if FieldEnum.String() != "Enum" {
+		t.Errorf("FieldEnum.String() = %q", FieldEnum.String())
 	}
 }
