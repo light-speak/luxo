@@ -46,9 +46,17 @@ class OkHttpTransport(
     client: OkHttpClient? = null,
     mode: TransportMode = TransportMode.JSON,
     private val schema: Map<String, APISchemaEntry> = emptyMap(),
+    /** Request timeout in seconds (default 30) */
+    timeoutSeconds: Long = 30,
+    /** Called on 401 — return new token to auto-retry, null to fail */
+    private val onTokenExpired: (suspend () -> String?)? = null,
 ) : Transport {
 
-    private val client: OkHttpClient = client ?: OkHttpClient()
+    private val client: OkHttpClient = (client ?: OkHttpClient.Builder()
+        .connectTimeout(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)
+        .build())
     private val extraHeaders = ConcurrentHashMap<String, String>()
     @Volatile private var currentMode: TransportMode = mode
     private var currentSchema: Map<String, APISchemaEntry> = schema

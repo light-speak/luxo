@@ -23,6 +23,10 @@ export interface TransportOptions {
   token?: string
   headers?: Record<string, string>
   mode?: TransportMode
+  /** Request timeout in milliseconds (default: 30000) */
+  timeout?: number
+  /** Called when token expires (401). Return new token to auto-retry. */
+  onTokenExpired?: () => Promise<string | null>
 }
 
 // --- Fetch Transport (HTTP/2) ---
@@ -33,9 +37,13 @@ export class FetchTransport implements Transport {
   private headers: Record<string, string> = {}
   private mode: TransportMode = 'json'
   private schema: Record<string, APISchema> = {}
+  private timeout: number
+  private onTokenExpired?: () => Promise<string | null>
 
   constructor(private endpoint: string, options?: TransportOptions) {
     this.mode = options?.mode ?? 'json'
+    this.timeout = options?.timeout ?? 30000
+    this.onTokenExpired = options?.onTokenExpired
     if (options?.headers) this.headers = { ...options.headers }
     if (options?.token) this.headers['Authorization'] = `Bearer ${options.token}`
   }
@@ -52,15 +60,33 @@ export class FetchTransport implements Transport {
     const body: Record<string, unknown> = { $api: api }
     if (params) Object.assign(body, params)
 
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), this.timeout)
+
     let resp: Response
     try {
       resp = await fetch(this.endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...this.headers },
         body: JSON.stringify(body),
+        signal: controller.signal,
       })
     } catch (e) {
+      clearTimeout(timer)
+      if (e instanceof DOMException && e.name === 'AbortError') {
+        throw new LuxoError('TimeoutError', 0, `request timed out after ${this.timeout}ms`)
+      }
       throw new LuxoError('NetworkError', 0, e instanceof Error ? e.message : String(e))
+    }
+    clearTimeout(timer)
+
+    // 401 auto-refresh: call onTokenExpired, get new token, retry once
+    if (resp.status === 401 && this.onTokenExpired) {
+      const newToken = await this.onTokenExpired()
+      if (newToken) {
+        this.setToken(newToken)
+        return this.jsonCall(api, params) // retry with new token
+      }
     }
 
     let json: Record<string, unknown>
@@ -130,6 +156,10 @@ export class WsTransport implements Transport {
   private seq = 0
   private connectPromise: Promise<void> | null = null
   private token: string | undefined
+  private closed = false
+  private reconnectAttempts = 0
+  private maxReconnectAttempts = 10
+  private reconnectDelay = 1000 // ms, doubles each attempt (exponential backoff)
 
   constructor(private endpoint: string, options?: TransportOptions) {
     this.mode = options?.mode ?? 'json'
@@ -152,6 +182,7 @@ export class WsTransport implements Transport {
       ws.onopen = () => {
         this.ws = ws
         this.connectPromise = null
+        this.reconnectAttempts = 0
         resolve()
       }
 
@@ -170,11 +201,18 @@ export class WsTransport implements Transport {
 
       ws.onclose = () => {
         this.ws = null
+        this.connectPromise = null
         // Reject all pending requests
         for (const [, p] of this.pending) {
           p.reject(new LuxoError('NetworkError', 0, 'WebSocket closed'))
         }
         this.pending.clear()
+        // Auto-reconnect with exponential backoff
+        if (!this.closed && this.reconnectAttempts < this.maxReconnectAttempts) {
+          const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts)
+          this.reconnectAttempts++
+          setTimeout(() => this.connect(), Math.min(delay, 30000))
+        }
       }
     })
     return this.connectPromise
@@ -251,6 +289,7 @@ export class WsTransport implements Transport {
   }
 
   close(): void {
+    this.closed = true
     this.ws?.close()
     this.ws = null
   }

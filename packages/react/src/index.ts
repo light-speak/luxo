@@ -1,3 +1,5 @@
 export { useLuxoQuery } from './use-query'
+export { useLuxoMutation } from './use-mutation'
 export { LuxoProvider, useLuxoClient } from './provider'
 export type { UseLuxoQueryResult } from './use-query'
+export type { UseLuxoMutationResult } from './use-mutation'

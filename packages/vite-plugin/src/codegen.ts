@@ -88,7 +88,7 @@ function genTypes(schema: LuxoSchema): string {
     out += `    switch (dec.fieldID) {\n`
     for (const field of model.fields) {
       out += `      case ${field.id}: obj['${field.name}'] = `
-      out += genFieldRead(field) + '; break\n'
+      out += genFieldRead(field, schema) + '; break\n'
     }
     out += `      default: break\n`
     out += `    }\n`
@@ -101,7 +101,7 @@ function genTypes(schema: LuxoSchema): string {
   return out
 }
 
-function genFieldRead(field: { type: string; nullable?: boolean }): string {
+function genFieldRead(field: { type: string; typeName?: string; nullable?: boolean; isList?: boolean; relation?: boolean }, schema: LuxoSchema): string {
   const n = field.nullable
   switch (field.type) {
     case 'Int': case 'Duration': return n ? 'dec.readIntPtr()' : 'dec.readInt()'
@@ -109,7 +109,17 @@ function genFieldRead(field: { type: string; nullable?: boolean }): string {
     case 'String': case 'DateTime': case 'UUID': case 'Decimal': case 'Enum':
       return n ? 'dec.readStringPtr()' : 'dec.readString()'
     case 'Boolean': return n ? 'dec.readBoolPtr()' : 'dec.readBool()'
-    default: return 'null' // nested model — TODO
+    default: {
+      // Nested model — decode recursively
+      const tn = field.typeName || field.type
+      if (schema.models[tn]) {
+        if (field.isList) {
+          return `dec.readArray(() => decode${tn}(dec))`
+        }
+        return n ? `dec.readNullable(() => decode${tn}(dec))` : `decode${tn}(dec)`
+      }
+      return 'null'
+    }
   }
 }
 

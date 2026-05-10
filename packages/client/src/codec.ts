@@ -230,6 +230,23 @@ export class Decoder {
     return this.readBool()
   }
 
+  /** Read a nested model using a decoder function. */
+  readNullable<T>(decode: () => T): T | null {
+    const present = this.readVarint()
+    if (present === 0n) return null
+    return decode()
+  }
+
+  /** Read an array of items using a decoder function. */
+  readArray<T>(decode: () => T): T[] {
+    const count = Number(this.readVarint())
+    const items: T[] = []
+    for (let i = 0; i < count; i++) {
+      items.push(decode())
+    }
+    return items
+  }
+
   /** Skip remaining bytes (useful when encountering unknown fields) */
   get remaining(): number {
     return this.data.length - this.off
