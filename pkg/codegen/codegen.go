@@ -415,7 +415,17 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 			modelSet[m.Name] = true
 		}
 	}
-	if len(models) == 0 {
+	// Check if there are @native APIs (need App even without models)
+	hasNative := false
+	for _, file := range result.Files {
+		for _, api := range file.APIs {
+			if hasDirective(api.Directives, "native") {
+				hasNative = true
+				break
+			}
+		}
+	}
+	if len(models) == 0 && !hasNative {
 		return nil
 	}
 
