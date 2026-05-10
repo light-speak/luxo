@@ -466,3 +466,70 @@ func TestWriteAPIRegistrationSchema_Paginated(t *testing.T) {
 		t.Errorf("missing ReturnList:\n%s", src)
 	}
 }
+
+func TestBuildSchemaJSON_WithEnumsAndTypes(t *testing.T) {
+	oldFieldIDs := modelFieldIDs
+	modelFieldIDs = map[string]map[string]int{
+		"User":        {"id": 1, "name": 2, "role": 3},
+		"AuthPayload": {"member": 1, "token": 2},
+	}
+	defer func() { modelFieldIDs = oldFieldIDs }()
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/auth.luxo",
+			Enums: []*ast.EnumDecl{
+				{Name: "MemberRole", Values: []string{"OWNER", "ADMIN", "VIEWER"}},
+			},
+			Models: []*ast.ModelDecl{{
+				Pos:  token.Position{File: "test.luxo", Line: 1, Col: 1},
+				Name: "User",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+					{Name: "role", Type: &ast.TypeRef{Name: "MemberRole"}},
+				},
+			}},
+			Types: []*ast.TypeDecl{{
+				Name: "AuthPayload",
+				Fields: []*ast.FieldDecl{
+					{Name: "member", Type: &ast.TypeRef{Name: "User"}},
+					{Name: "token", Type: &ast.TypeRef{Name: "String"}},
+				},
+			}},
+		}},
+	}
+
+	enums := map[string]bool{"MemberRole": true}
+	data, err := BuildSchemaJSON(result, enums)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(data)
+
+	// Enum
+	if !strings.Contains(s, `"MemberRole"`) {
+		t.Error("should contain enum name")
+	}
+	if !strings.Contains(s, `"OWNER"`) {
+		t.Error("should contain enum value")
+	}
+
+	// Type
+	if !strings.Contains(s, `"AuthPayload"`) {
+		t.Error("should contain type name")
+	}
+	if !strings.Contains(s, `"token"`) {
+		t.Error("should contain type field")
+	}
+
+	// Model field with enum type
+	if !strings.Contains(s, `"typeName":"MemberRole"`) {
+		t.Error("should contain typeName for enum field")
+	}
+
+	// Relation flag
+	if !strings.Contains(s, `"typeName":"User"`) {
+		t.Error("should contain typeName for type field referencing model")
+	}
+}
