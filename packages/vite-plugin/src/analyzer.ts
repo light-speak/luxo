@@ -241,21 +241,32 @@ export function analyzeAndTransform(
       if (model && tree.children.size >= model.fields.length) continue
     }
 
-    // Find and replace the API call
-    const callRegex = new RegExp(
-      `(await\\s+\\w+\\.${escapeRegex(apiName)}\\()([^)]*)\\)`,
-    )
-    const match = callRegex.exec(result)
-    if (!match) continue
-    const [fullMatch, prefix, args] = match
-    if (args.includes('$select')) continue
+    // Find and replace the API call — use balanced paren matching
+    const callStart = new RegExp(`await\\s+\\w+\\.${escapeRegex(apiName)}\\(`)
+    const startMatch = callStart.exec(result)
+    if (!startMatch) continue
+    const startIdx = startMatch.index
+    const argsStart = startIdx + startMatch[0].length
+    // Find matching closing paren (balanced)
+    let parenDepth = 1
+    let i = argsStart
+    while (i < result.length && parenDepth > 0) {
+      if (result[i] === '(') parenDepth++
+      else if (result[i] === ')') parenDepth--
+      if (parenDepth > 0) i++
+    }
+    if (parenDepth !== 0) continue
+    const argsStr = result.substring(argsStart, i)
+    if (argsStr.includes('$select')) continue
 
-    const trimmed = args.trim()
-    const replacement = trimmed === ''
-      ? `${prefix}{ $select: '${selectStr}' })`
-      : `${prefix}${args}, { $select: '${selectStr}' })`
+    const trimmed = argsStr.trim()
+    const before = result.substring(0, argsStart)
+    const after = result.substring(i) // starts with ')'
+    const injection = trimmed === ''
+      ? `{ $select: '${selectStr}' }`
+      : `${argsStr}, { $select: '${selectStr}' }`
 
-    result = result.replace(fullMatch, replacement)
+    result = before + injection + after
     modified = true
   }
 

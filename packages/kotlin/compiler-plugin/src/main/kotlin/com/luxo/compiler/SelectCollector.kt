@@ -24,19 +24,19 @@ class SelectCollector(
     private val pluginContext: IrPluginContext
 ) : IrElementVisitorVoid() {
 
-    // variable (IrVariable) → API name
-    private val varToAPI = mutableMapOf<IrVariable, String>()
+    // variable/param → API name
+    private val varToAPI = mutableMapOf<IrValueDeclaration, String>()
 
-    // variable → return type FqName (for model field validation)
-    private val varToType = mutableMapOf<IrVariable, String>()
+    // variable/param → return type FqName
+    private val varToType = mutableMapOf<IrValueDeclaration, String>()
 
-    // variable → parent source (for alias/lambda tracking)
-    private val varToParent = mutableMapOf<IrVariable, ParentRef>()
+    // variable/param → parent source (for alias/lambda tracking)
+    private val varToParent = mutableMapOf<IrValueDeclaration, ParentRef>()
 
     // API name → field tree
     private val apiTrees = mutableMapOf<String, FieldNode>()
 
-    data class ParentRef(val parentVar: IrVariable, val field: String)
+    data class ParentRef(val parentVar: IrValueDeclaration, val field: String)
 
     fun visitModule(module: IrModuleFragment) {
         module.acceptChildrenVoid(this)
@@ -74,13 +74,11 @@ class SelectCollector(
             if (memberAccess != null) {
                 val (receiver, fieldName) = memberAccess
                 if (receiver is IrGetValue) {
-                    val parentVar = receiver.symbol.owner as? IrVariable
-                    if (parentVar != null && (varToAPI.containsKey(parentVar) || varToParent.containsKey(parentVar))) {
-                        varToParent[declaration] = ParentRef(parentVar, fieldName)
-                        // Resolve nested type
-                        val parentType = varToType[parentVar]
+                    val parentDecl = receiver.symbol.owner as? IrValueDeclaration
+                    if (parentDecl != null && (varToAPI.containsKey(parentDecl) || varToParent.containsKey(parentDecl))) {
+                        varToParent[declaration] = ParentRef(parentDecl, fieldName)
+                        val parentType = varToType[parentDecl]
                         if (parentType != null) {
-                            // Type resolution would need schema info — simplified here
                             varToType[declaration] = fieldName
                         }
                     }
@@ -123,11 +121,8 @@ class SelectCollector(
             if (memberAccess != null) {
                 val (receiver, fieldName) = memberAccess
                 if (receiver is IrGetValue) {
-                    val parentVar = receiver.symbol.owner as? IrVariable
-                    if (parentVar != null) {
-                        // Create a synthetic variable reference for the lambda param
-                        varToParent[param as? IrVariable ?: return] = ParentRef(parentVar, fieldName)
-                    }
+                    val parentDecl = receiver.symbol.owner as? IrValueDeclaration ?: return
+                    varToParent[param] = ParentRef(parentDecl, fieldName)
                 }
             }
         }
@@ -177,24 +172,21 @@ class SelectCollector(
                     current = current.receiver ?: break
                 }
                 is IrGetValue -> {
-                    val variable = current.symbol.owner
-                    if (variable is IrVariable) {
-                        val apiName = varToAPI[variable]
-                        if (apiName != null) {
-                            return Pair(apiName, chain)
+                    val decl = current.symbol.owner as? IrValueDeclaration ?: break
+                    val apiName = varToAPI[decl]
+                    if (apiName != null) {
+                        return Pair(apiName, chain)
+                    }
+                    val parentChain = resolveParentChain(decl)
+                    if (parentChain != null) {
+                        var root: IrValueDeclaration = decl
+                        val seen = mutableSetOf<IrValueDeclaration>()
+                        while (varToParent.containsKey(root) && root !in seen) {
+                            seen.add(root)
+                            root = varToParent[root]!!.parentVar
                         }
-                        val parentChain = resolveParentChain(variable)
-                        if (parentChain != null) {
-                            // Find root variable's API
-                            var root = variable
-                            val seen = mutableSetOf<IrVariable>()
-                            while (varToParent.containsKey(root) && root !in seen) {
-                                seen.add(root)
-                                root = varToParent[root]!!.parentVar
-                            }
-                            val rootAPI = varToAPI[root] ?: break
-                            return Pair(rootAPI, parentChain + chain)
-                        }
+                        val rootAPI = varToAPI[root] ?: break
+                        return Pair(rootAPI, parentChain + chain)
                     }
                     break
                 }
@@ -205,10 +197,10 @@ class SelectCollector(
         return null
     }
 
-    private fun resolveParentChain(variable: IrVariable): List<String>? {
+    private fun resolveParentChain(variable: IrValueDeclaration): List<String>? {
         val fields = mutableListOf<String>()
-        var current = variable
-        val seen = mutableSetOf<IrVariable>()
+        var current: IrValueDeclaration = variable
+        val seen = mutableSetOf<IrValueDeclaration>()
 
         while (varToParent.containsKey(current)) {
             if (current in seen) break
