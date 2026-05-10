@@ -322,6 +322,14 @@ func generateModules(files []*ast.File, result *semantic.Result) (int, error) {
 	// Group files by module — directory name or file name without .luxo
 	modules := groupByModule(files)
 
+	// Build cross-module event context — needed for emit/on across modules
+	modulePath := goModulePath()
+	if modulePath != "" {
+		modulePath += "/service"
+	}
+	evCtx := codegen.BuildEventContext(files, modulePath)
+	codegen.SetEventContext(evCtx)
+
 	total := 0
 	for moduleName, moduleFiles := range modules {
 		outDir := filepath.Join("service", moduleName, "luxo")
@@ -361,6 +369,11 @@ func generateModules(files []*ast.File, result *semantic.Result) (int, error) {
 		}
 	}
 	return total, nil
+}
+
+func goModulePath() string {
+	p, _ := readModulePath()
+	return p
 }
 
 func generateEntry(result *semantic.Result, modulePath string) error {

@@ -476,19 +476,29 @@ func isBoolExpr(expr ast.Expr) bool {
 	return false
 }
 
-// compileEmit: emit EventName(args)
+// compileEmit: emit EventName(args) — handles cross-module events
 func (c *compiler) compileEmit(s *ast.EmitStmt) {
 	var args []string
 	for _, a := range s.Args {
 		args = append(args, fmt.Sprintf("%s: %s", str.Capitalize(a.Name), c.compileExpr(a.Value)))
 	}
+
+	// Check if event is cross-module
+	prefix := ""
+	if globalEventCtx != nil && c.api != nil {
+		currentMod := moduleNameFromFile(c.api.Pos.File)
+		evModule := globalEventCtx.EventModule[s.EventName]
+		if evModule != "" && evModule != currentMod {
+			prefix = evModule + "_luxo."
+		}
+	}
+
 	if c.inAsync {
-		// Inside async goroutine — ignore emit error (cannot return)
-		c.write("Emit%s(ctx, app.EventBus, %sEvent{%s})",
-			s.EventName, s.EventName, strings.Join(args, ", "))
+		c.write("%sEmit%s(ctx, app.EventBus, %s%sEvent{%s})",
+			prefix, s.EventName, prefix, s.EventName, strings.Join(args, ", "))
 	} else {
-		c.write("if err := Emit%s(ctx, app.EventBus, %sEvent{%s}); err != nil {",
-			s.EventName, s.EventName, strings.Join(args, ", "))
+		c.write("if err := %sEmit%s(ctx, app.EventBus, %s%sEvent{%s}); err != nil {",
+			prefix, s.EventName, prefix, s.EventName, strings.Join(args, ", "))
 		c.write("\treturn err")
 		c.write("}")
 	}

@@ -16,14 +16,16 @@ var crudOps = []string{"get", "list", "create", "update", "delete", "deleteMany"
 
 // handlerFeatures holds feature detection flags for handler imports.
 type handlerFeatures struct {
-	hasOrGroups    bool
-	hasSortable    bool
-	hasAwait       bool
-	hasTransaction bool
-	hasTemplateStr bool
-	hasAuth        bool
-	hasCrypto      bool
-	hasTimeFunc    bool
+	hasOrGroups       bool
+	hasSortable       bool
+	hasAwait          bool
+	hasTransaction    bool
+	hasTemplateStr    bool
+	hasAuth           bool
+	hasCrypto         bool
+	hasTimeFunc       bool
+	hasEmit           bool
+	crossEventImports map[string]string // module → alias for cross-module emit
 }
 
 // detectHandlerFeatures scans models and APIs to determine which imports are needed.
@@ -376,6 +378,12 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
+	// Cross-module event imports for emit statements
+	for modName, alias := range feat.crossEventImports {
+		if globalEventCtx != nil {
+			fmt.Fprintf(b, "\t%s \"%s/%s/luxo\"\n", alias, globalEventCtx.ModulePath, modName)
+		}
+	}
 	if hasAwait {
 		b.WriteString("\t\"golang.org/x/sync/errgroup\"\n")
 	}
@@ -1760,13 +1768,13 @@ func scanBodyForBuiltins(block *ast.Block, f *handlerFeatures) {
 	if block == nil {
 		return
 	}
+	// Scan expressions
 	ast.WalkExprs(block, func(e ast.Expr) {
 		switch v := e.(type) {
 		case *ast.MemberExpr:
 			if ident, ok := v.Object.(*ast.Ident); ok && ident.Name == "crypto" {
 				f.hasCrypto = true
 			}
-			// Duration properties → need time import
 			switch v.Field {
 			case "days", "hours", "minutes", "seconds", "milliseconds":
 				f.hasTimeFunc = true
@@ -1777,4 +1785,21 @@ func scanBodyForBuiltins(block *ast.Block, f *handlerFeatures) {
 			}
 		}
 	})
+	// Scan statements for emit
+	for _, stmt := range block.Stmts {
+		if emit, ok := stmt.(*ast.EmitStmt); ok {
+			f.hasEmit = true
+			if globalEventCtx != nil {
+				evModule := globalEventCtx.EventModule[emit.EventName]
+				currentMod := ""
+				// currentModule is tricky here — use file from features detection
+				if evModule != "" && evModule != currentMod {
+					if f.crossEventImports == nil {
+						f.crossEventImports = make(map[string]string)
+					}
+					f.crossEventImports[evModule] = evModule + "_luxo"
+				}
+			}
+		}
+	}
 }

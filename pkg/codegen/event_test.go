@@ -54,7 +54,7 @@ func TestGenerateEventFile(t *testing.T) {
 		"func EmitOrderCreated(ctx context.Context, bus event.Bus, e OrderCreatedEvent) error",
 		`bus.Emit(ctx, "OrderCreated", e)`,
 		"func RegisterEvents(bus event.Bus, app *App)",
-		`event.OnQueueDecode(bus, "OrderCreated", "luxo", unmarshalOrderCreated, func(ctx context.Context, e OrderCreatedEvent)`,
+		`event.OnQueueDecode(bus, "OrderCreated", "luxo", UnmarshalOrderCreated, func(ctx context.Context, e OrderCreatedEvent)`,
 	}
 	for _, check := range checks {
 		if !strings.Contains(code, check) {

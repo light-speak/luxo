@@ -22,17 +22,57 @@ func generateEventFile(result *semantic.Result, packageName string) []byte {
 		listeners = append(listeners, file.Listeners...)
 	}
 
-	if len(events) == 0 {
+	if len(events) == 0 && len(listeners) == 0 {
 		return nil
+	}
+
+	// Determine current module name
+	currentModule := ""
+	if len(result.Files) > 0 {
+		currentModule = moduleNameFromFile(result.Files[0].Name)
 	}
 
 	var b strings.Builder
 	writeHeader(&b, packageName, "event.gen.go")
 
+	// Collect cross-module event imports
+	crossModuleImports := make(map[string]string) // module → import alias
+	if globalEventCtx != nil {
+		for _, l := range listeners {
+			evModule := globalEventCtx.EventModule[l.EventName]
+			if evModule != "" && evModule != currentModule {
+				alias := evModule + "_luxo"
+				crossModuleImports[evModule] = alias
+			}
+		}
+		// Also check emit statements in API bodies
+		for _, file := range result.Files {
+			for _, api := range file.APIs {
+				if api.Body != nil {
+					ast.WalkExprs(api.Body, func(e ast.Expr) {})
+					for _, stmt := range api.Body.Stmts {
+						if emit, ok := stmt.(*ast.EmitStmt); ok {
+							evModule := globalEventCtx.EventModule[emit.EventName]
+							if evModule != "" && evModule != currentModule {
+								alias := evModule + "_luxo"
+								crossModuleImports[evModule] = alias
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
-	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
+	if len(events) > 0 {
+		b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
+	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/event\"\n")
+	for modName, alias := range crossModuleImports {
+		fmt.Fprintf(&b, "\t%s \"%s/%s/luxo\"\n", alias, globalEventCtx.ModulePath, modName)
+	}
 	b.WriteString(")\n\n")
 
 	// Event structs + MarshalLuxo/UnmarshalLuxo
@@ -60,7 +100,19 @@ func generateEventFile(result *semantic.Result, packageName string) []byte {
 	enums := CollectEnumsFromResult(result)
 
 	// RegisterEvents function — wires all on-listeners
-	generateRegisterEvents(&b, listeners, packageName, modelMap, enums)
+	generateRegisterEvents(&b, listeners, packageName, currentModule, modelMap, enums)
+
+	// Generate Unmarshal functions for LOCAL events (exported for cross-module use)
+	for _, e := range events {
+		eventType := e.Name + "Event"
+		fmt.Fprintf(&b, "// Unmarshal%s is the wire decoder for %s events.\n", e.Name, e.Name)
+		fmt.Fprintf(&b, "func Unmarshal%s(data []byte, v any) error {\n", e.Name)
+		fmt.Fprintf(&b, "\tif e, ok := v.(*%s); ok {\n", eventType)
+		fmt.Fprintf(&b, "\t\treturn e.UnmarshalLuxo(data)\n")
+		b.WriteString("\t}\n")
+		b.WriteString("\treturn nil\n")
+		b.WriteString("}\n\n")
+	}
 
 	return []byte(b.String())
 }
@@ -186,7 +238,12 @@ func generateEmitFunc(b *strings.Builder, e *ast.EventDecl) {
 // Default uses OnQueueDecode with moduleName as the queue group (competing consumers).
 // Listeners with @broadcast use OnDecode (every instance receives).
 // Unmarshal uses Luxo binary (UnmarshalLuxo) for wire decoding.
-func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleName string, models map[string]*ast.ModelDecl, enums map[string]bool) {
+func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleName string, currentModule string, models map[string]*ast.ModelDecl, enums map[string]bool) {
+	if len(listeners) == 0 {
+		b.WriteString("// RegisterEvents — no listeners in this module.\n")
+		b.WriteString("func RegisterEvents(bus event.Bus, app *App) {}\n\n")
+		return
+	}
 	b.WriteString("// RegisterEvents registers all event listeners with the bus.\n")
 	b.WriteString("func RegisterEvents(bus event.Bus, app *App) {\n")
 
@@ -195,8 +252,18 @@ func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleN
 		if len(l.Params) > 0 {
 			paramName = l.Params[0]
 		}
-		eventType := l.EventName + "Event"
-		unmarshalFunc := fmt.Sprintf("unmarshal%s", l.EventName)
+
+		// Check if event is cross-module
+		eventTypePrefix := ""
+		unmarshalFunc := fmt.Sprintf("Unmarshal%s", l.EventName)
+		if globalEventCtx != nil {
+			evModule := globalEventCtx.EventModule[l.EventName]
+			if evModule != "" && evModule != currentModule {
+				eventTypePrefix = evModule + "_luxo."
+				unmarshalFunc = evModule + "_luxo.Unmarshal" + l.EventName
+			}
+		}
+		eventType := eventTypePrefix + l.EventName + "Event"
 		if l.Broadcast {
 			fmt.Fprintf(b, "\tevent.OnDecode(bus, %q, %s, func(ctx context.Context, %s %s) error {\n", l.EventName, unmarshalFunc, paramName, eventType)
 		} else {
@@ -226,20 +293,5 @@ func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleN
 
 	b.WriteString("}\n\n")
 
-	// Generate unmarshal adapter functions for each event type
-	// These match the func([]byte, any) error signature required by OnDecode
-	seen := make(map[string]bool)
-	for _, l := range listeners {
-		if seen[l.EventName] {
-			continue
-		}
-		seen[l.EventName] = true
-		eventType := l.EventName + "Event"
-		fmt.Fprintf(b, "func unmarshal%s(data []byte, v any) error {\n", l.EventName)
-		fmt.Fprintf(b, "\tif e, ok := v.(*%s); ok {\n", eventType)
-		fmt.Fprintf(b, "\t\treturn e.UnmarshalLuxo(data)\n")
-		b.WriteString("\t}\n")
-		b.WriteString("\treturn nil\n")
-		b.WriteString("}\n\n")
-	}
+	// Note: Unmarshal functions are generated in generateEventFile, not here
 }
