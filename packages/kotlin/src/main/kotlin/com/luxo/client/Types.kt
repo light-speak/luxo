@@ -16,6 +16,20 @@ data class Page<T>(
 data class LuxoSchema(
     val models: Map<String, LuxoModel> = emptyMap(),
     val apis: Map<String, LuxoAPI> = emptyMap(),
+    val enums: Map<String, LuxoEnum> = emptyMap(),
+    val types: Map<String, LuxoTypeDecl> = emptyMap(),
+)
+
+@Serializable
+data class LuxoEnum(
+    val name: String,
+    val values: List<String> = emptyList(),
+)
+
+@Serializable
+data class LuxoTypeDecl(
+    val name: String,
+    val fields: List<LuxoField> = emptyList(),
 )
 
 @Serializable
@@ -29,8 +43,10 @@ data class LuxoField(
     val id: Int,
     val name: String,
     val type: String,
+    val typeName: String? = null,
     val nullable: Boolean = false,
     val isList: Boolean = false,
+    val relation: Boolean = false,
 )
 
 @Serializable

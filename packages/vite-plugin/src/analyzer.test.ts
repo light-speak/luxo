@@ -22,6 +22,16 @@ const schema: LuxoSchema = {
         { id: 3, name: 'content', type: 'String', nullable: true },
         { id: 4, name: 'authorId', type: 'Int' },
         { id: 5, name: 'status', type: 'Enum' },
+        { id: 6, name: 'user', type: 'User' },
+        { id: 7, name: 'comments', type: 'Comment', list: true },
+      ],
+    },
+    Comment: {
+      name: 'Comment',
+      fields: [
+        { id: 1, name: 'id', type: 'Int' },
+        { id: 2, name: 'content', type: 'String' },
+        { id: 3, name: 'user', type: 'User' },
       ],
     },
   },
@@ -123,6 +133,57 @@ const msg = \`Hello \${user.name}\`
     const result = analyzeAndTransform(code, 'test.ts', schema)
     expect(result).not.toBeNull()
     expect(result).toContain('name')
+  })
+
+  it('should track nested relation fields', () => {
+    const code = `
+const post = await client.getPost(1)
+console.log(post.title)
+console.log(post.user.name)
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).not.toBeNull()
+    expect(result).toContain('title')
+    expect(result).toContain('user{name}')
+  })
+
+  it('should track forEach lambda params', () => {
+    const code = `
+const post = await client.getPost(1)
+console.log(post.title)
+post.comments.forEach(c => {
+  console.log(c.content)
+  console.log(c.user.name)
+})
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).not.toBeNull()
+    expect(result).toContain('title')
+    expect(result).toContain('comments{content,user{name}}')
+  })
+
+  it('should track variable alias', () => {
+    const code = `
+const post = await client.getPost(1)
+const author = post.user
+console.log(post.title)
+console.log(author.name)
+console.log(author.email)
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).not.toBeNull()
+    expect(result).toContain('title')
+    expect(result).toContain('user{name,email}')
+  })
+
+  it('should track index access on nested relations', () => {
+    const code = `
+const post = await client.getPost(1)
+console.log(post.comments[0].content)
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).not.toBeNull()
+    expect(result).toContain('comments{content}')
   })
 
   it('should skip non-model field access', () => {

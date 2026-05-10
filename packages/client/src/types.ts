@@ -10,6 +10,8 @@ export interface Page<T> {
 export interface LuxoSchema {
   models: Record<string, LuxoModel>
   apis: Record<string, LuxoAPI>
+  enums?: Record<string, LuxoEnum>
+  types?: Record<string, LuxoTypeDecl>
 }
 
 export interface LuxoModel {
@@ -21,8 +23,21 @@ export interface LuxoField {
   id: number
   name: string
   type: string
+  typeName?: string // original Luxo type (User, MemberRole, etc.)
   nullable?: boolean
   isList?: boolean
+  list?: boolean // alias for isList
+  relation?: boolean // true if relation field (not DB column)
+}
+
+export interface LuxoEnum {
+  name: string
+  values: string[]
+}
+
+export interface LuxoTypeDecl {
+  name: string
+  fields: LuxoField[]
 }
 
 export interface LuxoAPI {

@@ -46,6 +46,15 @@ object LuxoCodegen {
         else -> type
     }
 
+    private fun resolveFieldType(f: LuxoField, schema: LuxoSchema): String {
+        val tn = f.typeName ?: f.type
+        if (schema.enums.containsKey(tn)) return if (f.isList) "List<$tn>" else tn
+        if (schema.models.containsKey(tn)) return if (f.isList) "List<$tn>" else tn
+        if (schema.types.containsKey(tn)) return if (f.isList) "List<$tn>" else tn
+        val base = luxoTypeToKt(f.type)
+        return if (f.isList) "List<$base>" else base
+    }
+
     private fun isScalar(type: String): Boolean =
         type in setOf("Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Bytes", "Decimal")
 
@@ -56,7 +65,13 @@ object LuxoCodegen {
             "Float" -> if (n) "dec.readFloatPtr()" else "dec.readFloat()"
             "Boolean" -> if (n) "dec.readBoolPtr()" else "dec.readBool()"
             "String", "DateTime", "UUID", "Decimal", "Enum" -> if (n) "dec.readStringPtr()" else "dec.readString()"
-            else -> "null"
+            else -> {
+                // Nested model — decode recursively
+                val tn = f.typeName ?: f.type
+                if (f.isList) "dec.readArray { decode$tn(dec) }"
+                else if (n) "dec.readNullable { decode$tn(dec) }"
+                else "decode$tn(dec)"
+            }
         }
     }
 
@@ -66,6 +81,31 @@ object LuxoCodegen {
         appendLine("import com.luxo.client.LuxoDecoder")
         appendLine("import kotlinx.serialization.Serializable\n")
 
+        // Enums
+        for (e in schema.enums.values) {
+            appendLine("/** ${e.name} enum values */")
+            appendLine("typealias ${e.name} = String")
+            appendLine("object ${e.name}Values {")
+            for (v in e.values) {
+                appendLine("    const val $v: ${e.name} = \"$v\"")
+            }
+            appendLine("    val all = listOf(${e.values.joinToString(", ") { "\"$it\"" }})")
+            appendLine("}\n")
+        }
+
+        // Type declarations (non-DB)
+        for (t in schema.types.values) {
+            appendLine("@Serializable\ndata class ${t.name}(")
+            for ((i, f) in t.fields.withIndex()) {
+                val kt = resolveFieldType(f, schema)
+                val nullable = if (f.nullable) "? = null" else ""
+                val comma = if (i < t.fields.size - 1) "," else ""
+                appendLine("    val ${f.name}: $kt$nullable$comma")
+            }
+            appendLine(")\n")
+        }
+
+        // Models
         for (m in schema.models.values) {
             appendLine("@Serializable\ndata class ${m.name}(")
             for ((i, f) in m.fields.withIndex()) {

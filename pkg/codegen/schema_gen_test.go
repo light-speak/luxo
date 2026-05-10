@@ -377,9 +377,12 @@ func TestBuildSchemaJSON_SkipsHiddenAndRelation(t *testing.T) {
 	if strings.Contains(s, "password") {
 		t.Error("@internal field should be excluded")
 	}
-	// "posts" is a relation field (non-scalar) so should be excluded
-	if strings.Contains(s, "posts") {
-		t.Error("relation field should be excluded")
+	// "posts" is a relation field — should be included but marked relation:true
+	if !strings.Contains(s, "posts") {
+		t.Error("relation field should be included in schema")
+	}
+	if !strings.Contains(s, `"relation":true`) {
+		t.Error("relation field should have relation:true flag")
 	}
 }
 
@@ -461,5 +464,157 @@ func TestWriteAPIRegistrationSchema_Paginated(t *testing.T) {
 	}
 	if !strings.Contains(src, "ReturnList: true") {
 		t.Errorf("missing ReturnList:\n%s", src)
+	}
+}
+
+func TestBuildSchemaJSON_WithEnumsAndTypes(t *testing.T) {
+	oldFieldIDs := modelFieldIDs
+	modelFieldIDs = map[string]map[string]int{
+		"User":        {"id": 1, "name": 2, "role": 3},
+		"AuthPayload": {"member": 1, "token": 2},
+	}
+	defer func() { modelFieldIDs = oldFieldIDs }()
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/auth.luxo",
+			Enums: []*ast.EnumDecl{
+				{Name: "MemberRole", Values: []string{"OWNER", "ADMIN", "VIEWER"}},
+			},
+			Models: []*ast.ModelDecl{{
+				Pos:  token.Position{File: "test.luxo", Line: 1, Col: 1},
+				Name: "User",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+					{Name: "role", Type: &ast.TypeRef{Name: "MemberRole"}},
+				},
+			}},
+			Types: []*ast.TypeDecl{{
+				Name: "AuthPayload",
+				Fields: []*ast.FieldDecl{
+					{Name: "member", Type: &ast.TypeRef{Name: "User"}},
+					{Name: "token", Type: &ast.TypeRef{Name: "String"}},
+				},
+			}},
+		}},
+	}
+
+	enums := map[string]bool{"MemberRole": true}
+	data, err := BuildSchemaJSON(result, enums)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(data)
+
+	// Enum
+	if !strings.Contains(s, `"MemberRole"`) {
+		t.Error("should contain enum name")
+	}
+	if !strings.Contains(s, `"OWNER"`) {
+		t.Error("should contain enum value")
+	}
+
+	// Type
+	if !strings.Contains(s, `"AuthPayload"`) {
+		t.Error("should contain type name")
+	}
+	if !strings.Contains(s, `"token"`) {
+		t.Error("should contain type field")
+	}
+
+	// Model field with enum type
+	if !strings.Contains(s, `"typeName":"MemberRole"`) {
+		t.Error("should contain typeName for enum field")
+	}
+
+	// Relation flag
+	if !strings.Contains(s, `"typeName":"User"`) {
+		t.Error("should contain typeName for type field referencing model")
+	}
+}
+
+func TestBuildSchemaTypes_NilTypeSkipped(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Types: []*ast.TypeDecl{{
+				Name: "Broken",
+				Fields: []*ast.FieldDecl{
+					{Name: "ok", Type: &ast.TypeRef{Name: "String"}},
+					{Name: "noType", Type: nil},
+				},
+			}},
+		}},
+	}
+	data, err := BuildSchemaJSON(result, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(data)
+	if !strings.Contains(s, "ok") {
+		t.Error("should contain ok field")
+	}
+	if strings.Contains(s, "noType") {
+		t.Error("nil type field should be skipped")
+	}
+}
+
+func TestBuildSchemaModels_IsList(t *testing.T) {
+	oldFieldIDs := modelFieldIDs
+	modelFieldIDs = map[string]map[string]int{
+		"Post": {"id": 1, "tags": 2},
+	}
+	defer func() { modelFieldIDs = oldFieldIDs }()
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/post.luxo",
+			Models: []*ast.ModelDecl{{
+				Pos:  token.Position{File: "test.luxo", Line: 1, Col: 1},
+				Name: "Post",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "tags", Type: &ast.TypeRef{Name: "String", IsList: true}},
+				},
+			}},
+		}},
+	}
+	data, err := BuildSchemaJSON(result, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"isList":true`) {
+		t.Error("should have isList:true for list field")
+	}
+}
+
+func TestBuildSchemaModels_SkipsComputed(t *testing.T) {
+	oldFieldIDs := modelFieldIDs
+	modelFieldIDs = map[string]map[string]int{
+		"User": {"id": 1, "name": 2},
+	}
+	defer func() { modelFieldIDs = oldFieldIDs }()
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/user.luxo",
+			Models: []*ast.ModelDecl{{
+				Pos:  token.Position{File: "test.luxo", Line: 1, Col: 1},
+				Name: "User",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+					{Name: "fullName", Type: &ast.TypeRef{Name: "String"}, Computed: &ast.ComputedField{}},
+				},
+			}},
+		}},
+	}
+	data, err := BuildSchemaJSON(result, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "fullName") {
+		t.Error("computed field should be skipped")
 	}
 }

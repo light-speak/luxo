@@ -188,6 +188,18 @@ class LuxoDecoder(private val buf: ByteArray) {
         return readBool()
     }
 
+    /** Read a nullable nested model using a decoder lambda. */
+    fun <T> readNullable(decode: () -> T): T? {
+        if (!readNullFlag()) return null
+        return decode()
+    }
+
+    /** Read an array of items using a decoder lambda. */
+    fun <T> readArray(decode: () -> T): List<T> {
+        val count = readVarint().toInt()
+        return List(count) { decode() }
+    }
+
     // -- internal ---------------------------------------------------------
 
     /** Read unsigned LEB128 varint. */

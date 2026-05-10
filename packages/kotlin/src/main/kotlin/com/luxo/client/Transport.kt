@@ -46,9 +46,17 @@ class OkHttpTransport(
     client: OkHttpClient? = null,
     mode: TransportMode = TransportMode.JSON,
     private val schema: Map<String, APISchemaEntry> = emptyMap(),
+    /** Request timeout in seconds (default 30) */
+    timeoutSeconds: Long = 30,
+    /** Called on 401 — return new token to auto-retry, null to fail */
+    private val onTokenExpired: (suspend () -> String?)? = null,
 ) : Transport {
 
-    private val client: OkHttpClient = client ?: OkHttpClient()
+    private val client: OkHttpClient = (client ?: OkHttpClient.Builder()
+        .connectTimeout(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)
+        .build())
     private val extraHeaders = ConcurrentHashMap<String, String>()
     @Volatile private var currentMode: TransportMode = mode
     private var currentSchema: Map<String, APISchemaEntry> = schema
@@ -151,6 +159,81 @@ class OkHttpTransport(
     companion object {
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private val BINARY_MEDIA_TYPE = "application/x-luxo".toMediaType()
+    }
+}
+
+// MARK: - WebSocket Transport
+
+/**
+ * OkHttp WebSocket transport for streaming (subscriptions).
+ * Usage:
+ *   val ws = LuxoWebSocket("ws://localhost:4000/luvia/ws", client)
+ *   ws.connect()
+ *   ws.subscribe("liveTraces", mapOf("projectId" to 1)) { data -> ... }
+ *   ws.close()
+ */
+class LuxoWebSocket(
+    private val url: String,
+    private val client: OkHttpClient = OkHttpClient(),
+    private val token: String? = null,
+) {
+    private var ws: WebSocket? = null
+    private val handlers = ConcurrentHashMap<String, (JsonElement) -> Unit>()
+
+    fun connect() {
+        val request = Request.Builder()
+            .url(url)
+            .apply { token?.let { header("Authorization", "Bearer $it") } }
+            .build()
+
+        ws = client.newWebSocket(request, object : WebSocketListener() {
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                try {
+                    val json = Json.parseToJsonElement(text).jsonObject
+                    val api = json["api"]?.jsonPrimitive?.content ?: return
+                    val data = json["data"] ?: return
+                    handlers[api]?.invoke(data)
+                } catch (_: Exception) {}
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                // Reconnect logic can be added here
+            }
+        })
+    }
+
+    fun subscribe(api: String, params: Map<String, Any?> = emptyMap(), handler: (JsonElement) -> Unit) {
+        handlers[api] = handler
+        val msg = buildJsonObject {
+            put("type", JsonPrimitive("subscribe"))
+            put("api", JsonPrimitive(api))
+            put("params", buildJsonObject {
+                for ((k, v) in params) {
+                    when (v) {
+                        is Number -> put(k, JsonPrimitive(v))
+                        is String -> put(k, JsonPrimitive(v))
+                        is Boolean -> put(k, JsonPrimitive(v))
+                        null -> put(k, JsonNull)
+                    }
+                }
+            })
+        }
+        ws?.send(msg.toString())
+    }
+
+    fun unsubscribe(api: String) {
+        handlers.remove(api)
+        val msg = buildJsonObject {
+            put("type", JsonPrimitive("unsubscribe"))
+            put("api", JsonPrimitive(api))
+        }
+        ws?.send(msg.toString())
+    }
+
+    fun close() {
+        ws?.close(1000, "client close")
+        ws = null
+        handlers.clear()
     }
 }
 

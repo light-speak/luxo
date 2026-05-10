@@ -338,6 +338,18 @@ class LuxoDecoder {
     }
     return _bytes[_off++] != 0;
   }
+
+  /// Read a nullable nested model using a decoder function.
+  T? readNullable<T>(T Function() decode) {
+    if (!_readNullableFlag()) return null;
+    return decode();
+  }
+
+  /// Read an array of items using a decoder function.
+  List<T> readArray<T>(T Function() decode) {
+    final count = readVarint();
+    return List.generate(count, (_) => decode());
+  }
 }
 
 // --- Field mask utilities ---

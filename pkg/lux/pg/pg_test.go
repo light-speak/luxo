@@ -703,3 +703,43 @@ func TestTraceQueryStartStoresData(t *testing.T) {
 		t.Errorf("args = %v", sd.args)
 	}
 }
+
+func TestQueryGroupBy(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	// Insert test data
+	for _, d := range []struct {
+		name, email string
+		age         int64
+	}{
+		{"Alice", "alice@t.com", 25},
+		{"Bob", "bob@t.com", 30},
+		{"Alice", "alice2@t.com", 35},
+	} {
+		_, _ = InsertReturning(ctx, db, scanUser, "users",
+			[]string{"id", "name", "email", "age"},
+			[]any{uuid.Must(uuid.NewV7()), d.name, d.email, d.age},
+		)
+	}
+
+	q := NewQuery[testUser](db, "users", scanUser, nil)
+	results, err := q.GroupBy(ctx, []string{"name"}, []lux.GroupAgg{
+		{Fn: "COUNT", Alias: "cnt"},
+		{Fn: "SUM", Col: "age", Alias: "total_age"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) < 2 {
+		t.Fatalf("expected at least 2 groups, got %d", len(results))
+	}
+	for _, r := range results {
+		if r["name"] == "Alice" {
+			cnt, _ := r["cnt"].(int64)
+			if cnt != 2 {
+				t.Errorf("Alice count = %d, want 2", cnt)
+			}
+		}
+	}
+}

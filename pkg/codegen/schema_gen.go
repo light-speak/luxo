@@ -227,8 +227,14 @@ func luxoTypeToSchemaType(typeName string, enums map[string]bool) string {
 // Used by `luxo gen` to export luxo.schema.json for SDK tooling.
 func BuildSchemaJSON(result *semantic.Result, enums map[string]bool) ([]byte, error) {
 	s := schema.New()
+	buildSchemaModels(s, result, enums)
+	buildSchemaAPIs(s, result, enums)
+	buildSchemaEnums(s, result)
+	buildSchemaTypes(s, result, enums)
+	return s.ToJSON()
+}
 
-	// Models
+func buildSchemaModels(s *schema.Schema, result *semantic.Result, enums map[string]bool) {
 	var models []*ast.ModelDecl
 	modelNames := make(map[string]bool)
 	for _, file := range result.Files {
@@ -237,7 +243,6 @@ func BuildSchemaJSON(result *semantic.Result, enums map[string]bool) ([]byte, er
 			modelNames[m.Name] = true
 		}
 	}
-	// Extend stubs
 	for _, file := range result.Files {
 		for _, ext := range file.Extends {
 			if !modelNames[ext.Name] {
@@ -255,24 +260,21 @@ func BuildSchemaJSON(result *semantic.Result, enums map[string]bool) ([]byte, er
 			if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
 				continue
 			}
-			if isRelationField(f, enums) {
-				continue
-			}
-			fid := getModelFieldID(m.Name, f.Name)
-			if fid == 0 {
-				continue
-			}
 			sm.Fields = append(sm.Fields, schema.Field{
-				ID:       fid,
+				ID:       getModelFieldID(m.Name, f.Name),
 				Name:     f.Name,
 				Type:     luxoTypeToSchemaFieldType(f.Type.Name, enums),
+				TypeName: f.Type.Name,
 				Nullable: f.Type.Nullable,
+				IsList:   f.Type.IsList,
+				Relation: isRelationField(f, enums),
 			})
 		}
 		s.RegisterModel(sm)
 	}
+}
 
-	// APIs: CRUD + declared + fn @service
+func buildSchemaAPIs(s *schema.Schema, result *semantic.Result, enums map[string]bool) {
 	for _, file := range result.Files {
 		modName := moduleNameFromFile(file.Name)
 		for _, m := range file.Models {
@@ -281,11 +283,7 @@ func BuildSchemaJSON(result *semantic.Result, enums map[string]bool) ([]byte, er
 			}
 			for _, op := range crudOperations(m) {
 				apiName := crudAPIName(m.Name, op)
-				a := &schema.API{
-					ID:     getAPIID(apiName),
-					Name:   apiName,
-					Module: modName,
-				}
+				a := &schema.API{ID: getAPIID(apiName), Name: apiName, Module: modName}
 				switch op {
 				case "get":
 					a.ReturnType = m.Name
@@ -300,11 +298,7 @@ func BuildSchemaJSON(result *semantic.Result, enums map[string]bool) ([]byte, er
 			}
 		}
 		for _, api := range file.APIs {
-			a := &schema.API{
-				ID:     getAPIID(api.Name),
-				Name:   api.Name,
-				Module: modName,
-			}
+			a := &schema.API{ID: getAPIID(api.Name), Name: api.Name, Module: modName}
 			if api.ReturnType != nil {
 				a.ReturnType = api.ReturnType.Name
 				a.ReturnList = api.ReturnType.IsList
@@ -312,19 +306,40 @@ func BuildSchemaJSON(result *semantic.Result, enums map[string]bool) ([]byte, er
 			a.Paginated = hasDirective(api.Directives, "paginate")
 			for _, p := range api.Params {
 				a.Params = append(a.Params, schema.Param{
-					ID:   getAPIParamID(api.Name, p.Name),
-					Name: p.Name,
+					ID: getAPIParamID(api.Name, p.Name), Name: p.Name,
 					Type: luxoTypeToSchemaFieldType(p.Type.Name, enums),
 				})
 			}
 			s.RegisterAPI(a)
 		}
 	}
+}
 
-	// Enums — export as string arrays
-	// (field type is already "Enum" / "String" in the schema)
+func buildSchemaEnums(s *schema.Schema, result *semantic.Result) {
+	for _, file := range result.Files {
+		for _, e := range file.Enums {
+			s.RegisterEnum(&schema.Enum{Name: e.Name, Values: e.Values})
+		}
+	}
+}
 
-	return s.ToJSON()
+func buildSchemaTypes(s *schema.Schema, result *semantic.Result, enums map[string]bool) {
+	for _, file := range result.Files {
+		for _, t := range file.Types {
+			st := &schema.TypeDecl{Name: t.Name}
+			for _, f := range t.Fields {
+				if f.Type == nil {
+					continue
+				}
+				st.Fields = append(st.Fields, schema.Field{
+					ID: getModelFieldID(t.Name, f.Name), Name: f.Name,
+					Type: luxoTypeToSchemaFieldType(f.Type.Name, enums), TypeName: f.Type.Name,
+					Nullable: f.Type.Nullable, IsList: f.Type.IsList,
+				})
+			}
+			s.RegisterType(st)
+		}
+	}
 }
 
 func luxoTypeToSchemaFieldType(typeName string, enums map[string]bool) schema.FieldType {
