@@ -533,3 +533,88 @@ func TestBuildSchemaJSON_WithEnumsAndTypes(t *testing.T) {
 		t.Error("should contain typeName for type field referencing model")
 	}
 }
+
+func TestBuildSchemaTypes_NilTypeSkipped(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Types: []*ast.TypeDecl{{
+				Name: "Broken",
+				Fields: []*ast.FieldDecl{
+					{Name: "ok", Type: &ast.TypeRef{Name: "String"}},
+					{Name: "noType", Type: nil},
+				},
+			}},
+		}},
+	}
+	data, err := BuildSchemaJSON(result, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(data)
+	if !strings.Contains(s, "ok") {
+		t.Error("should contain ok field")
+	}
+	if strings.Contains(s, "noType") {
+		t.Error("nil type field should be skipped")
+	}
+}
+
+func TestBuildSchemaModels_IsList(t *testing.T) {
+	oldFieldIDs := modelFieldIDs
+	modelFieldIDs = map[string]map[string]int{
+		"Post": {"id": 1, "tags": 2},
+	}
+	defer func() { modelFieldIDs = oldFieldIDs }()
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/post.luxo",
+			Models: []*ast.ModelDecl{{
+				Pos:  token.Position{File: "test.luxo", Line: 1, Col: 1},
+				Name: "Post",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "tags", Type: &ast.TypeRef{Name: "String", IsList: true}},
+				},
+			}},
+		}},
+	}
+	data, err := BuildSchemaJSON(result, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"isList":true`) {
+		t.Error("should have isList:true for list field")
+	}
+}
+
+func TestBuildSchemaModels_SkipsComputed(t *testing.T) {
+	oldFieldIDs := modelFieldIDs
+	modelFieldIDs = map[string]map[string]int{
+		"User": {"id": 1, "name": 2},
+	}
+	defer func() { modelFieldIDs = oldFieldIDs }()
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/user.luxo",
+			Models: []*ast.ModelDecl{{
+				Pos:  token.Position{File: "test.luxo", Line: 1, Col: 1},
+				Name: "User",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+					{Name: "fullName", Type: &ast.TypeRef{Name: "String"}, Computed: &ast.ComputedField{}},
+				},
+			}},
+		}},
+	}
+	data, err := BuildSchemaJSON(result, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "fullName") {
+		t.Error("computed field should be skipped")
+	}
+}
