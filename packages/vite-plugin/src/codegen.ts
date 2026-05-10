@@ -112,13 +112,13 @@ function genFieldRead(field: { type: string; typeName?: string; nullable?: boole
     default: {
       // Nested model — decode recursively
       const tn = field.typeName || field.type
-      if (schema.models[tn]) {
+      if (schema.models[tn] || schema.types?.[tn]) {
         if (field.isList) {
           return `dec.readArray(() => decode${tn}(dec))`
         }
         return n ? `dec.readNullable(() => decode${tn}(dec))` : `decode${tn}(dec)`
       }
-      return 'null'
+      return 'null' // unknown type — should not happen with valid schema
     }
   }
 }

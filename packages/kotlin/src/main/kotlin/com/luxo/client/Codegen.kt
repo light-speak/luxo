@@ -65,7 +65,13 @@ object LuxoCodegen {
             "Float" -> if (n) "dec.readFloatPtr()" else "dec.readFloat()"
             "Boolean" -> if (n) "dec.readBoolPtr()" else "dec.readBool()"
             "String", "DateTime", "UUID", "Decimal", "Enum" -> if (n) "dec.readStringPtr()" else "dec.readString()"
-            else -> "null"
+            else -> {
+                // Nested model — decode recursively
+                val tn = f.typeName ?: f.type
+                if (f.isList) "dec.readArray { decode$tn(dec) }"
+                else if (n) "dec.readNullable { decode$tn(dec) }"
+                else "decode$tn(dec)"
+            }
         }
     }
 

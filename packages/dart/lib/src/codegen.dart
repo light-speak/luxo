@@ -172,7 +172,11 @@ String _binaryRead(LuxoField f) {
     case 'Boolean': return n ? 'dec.readBoolPtr()' : 'dec.readBool()';
     case 'String': case 'DateTime': case 'UUID': case 'Decimal': case 'Enum':
       return n ? 'dec.readStringPtr()' : 'dec.readString()';
-    default: return 'null'; // nested model TODO
+    default:
+      // Nested model — decode recursively
+      final tn = f.typeName ?? f.type;
+      if (f.isList) return 'dec.readArray(() => decode$tn(dec))';
+      return n ? 'dec.readNullable(() => decode$tn(dec))' : 'decode$tn(dec)';
   }
 }
 
