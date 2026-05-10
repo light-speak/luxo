@@ -50,6 +50,16 @@ Future<void> generate({
   }
 }
 
+
+String _resolveFieldType(LuxoField f, LuxoSchema schema) {
+  final tn = f.typeName ?? f.type;
+  if (schema.enums.containsKey(tn)) return tn;
+  if (schema.models.containsKey(tn)) return f.isList ? 'List<$tn>' : tn;
+  if (schema.types.containsKey(tn)) return tn;
+  final base = _luxoTypeToDart(f.type);
+  return f.isList ? 'List<$base>' : base;
+}
+
 String _luxoTypeToDart(String type) {
   switch (type) {
     case 'Int':

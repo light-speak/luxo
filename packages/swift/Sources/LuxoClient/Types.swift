@@ -22,6 +22,18 @@ public struct Cursor<T: Decodable>: Decodable {
 public struct LuxoSchema: Codable, Sendable {
     public let models: [String: LuxoModel]
     public let apis: [String: LuxoAPI]
+    public let enums: [String: LuxoEnum]?
+    public let types: [String: LuxoTypeDecl]?
+}
+
+public struct LuxoEnum: Codable, Sendable {
+    public let name: String
+    public let values: [String]
+}
+
+public struct LuxoTypeDecl: Codable, Sendable {
+    public let name: String
+    public let fields: [LuxoField]
 }
 
 public struct LuxoModel: Codable, Sendable {
@@ -33,8 +45,10 @@ public struct LuxoField: Codable, Sendable {
     public let id: Int
     public let name: String
     public let type: String
+    public let typeName: String?
     public let nullable: Bool?
-    public let list: Bool?
+    public let isList: Bool?
+    public let relation: Bool?
 }
 
 public struct LuxoAPI: Codable, Sendable {
