@@ -16,6 +16,7 @@ type moduleInfo struct {
 	hasExtend     bool // has cross-module extend (needs remote loaders in cluster mode)
 	hasEvents     bool
 	hasServiceFns bool
+	hasSchema     bool // has models or APIs (generates RegisterSchema)
 }
 
 func collectModules(result *semantic.Result) []moduleInfo {
@@ -46,6 +47,9 @@ func collectModules(result *semantic.Result) []moduleInfo {
 		}
 		if len(file.Events) > 0 || len(file.Listeners) > 0 {
 			info.hasEvents = true
+		}
+		if len(file.Models) > 0 || len(file.APIs) > 0 {
+			info.hasSchema = true
 		}
 		for _, fn := range file.Functions {
 			if hasDirective(fn.Directives, "service") {
@@ -139,9 +143,11 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 	// Create Luvia gateway
 	b.WriteString("\tgw := luvia.New()\n\n")
 
-	// Register schema for Binary↔JSON conversion
+	// Register schema for Binary↔JSON conversion (skip event-only modules)
 	for _, m := range modules {
-		fmt.Fprintf(&b, "\t%s_luxo.RegisterSchema(gw.Router.Schema)\n", m.name)
+		if m.hasSchema {
+			fmt.Fprintf(&b, "\t%s_luxo.RegisterSchema(gw.Router.Schema)\n", m.name)
+		}
 	}
 	b.WriteString("\n")
 
@@ -433,11 +439,23 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	}
 
 	// Build API → module mapping
-	type apiRoute struct {
-		apiName    string
-		moduleName string
+	// Collect compiled API names first for dedup
+	compiledAPIs := make(map[string]bool)
+	for _, file := range result.Files {
+		for _, a := range file.APIs {
+			compiledAPIs[a.Name] = true
+		}
 	}
-	var routes []apiRoute
+
+	routeMap := make(map[string]string) // apiName → moduleName (deduplicates)
+	var routeOrder []string
+	addRoute := func(name, mod string) {
+		if _, exists := routeMap[name]; !exists {
+			routeOrder = append(routeOrder, name)
+		}
+		routeMap[name] = mod
+	}
+
 	for _, file := range result.Files {
 		modName := moduleNameFromFile(file.Name)
 		for _, m := range file.Models {
@@ -445,15 +463,22 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 				continue
 			}
 			for _, op := range crudOperations(m) {
-				routes = append(routes, apiRoute{crudAPIName(m.Name, op), modName})
+				apiName := crudAPIName(m.Name, op)
+				if compiledAPIs[apiName] {
+					continue // compiled API overrides CRUD
+				}
+				addRoute(apiName, modName)
 			}
 		}
 		for _, a := range file.APIs {
-			routes = append(routes, apiRoute{a.Name, modName})
+			if hasDirective(a.Directives, "stream") {
+				continue // stream APIs registered separately
+			}
+			addRoute(a.Name, modName)
 		}
 		for _, fn := range file.Functions {
 			if hasDirective(fn.Directives, "service") {
-				routes = append(routes, apiRoute{"svc:" + fn.Name, modName})
+				addRoute("svc:"+fn.Name, modName)
 			}
 		}
 	}
@@ -468,7 +493,9 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t\"os\"\n\n")
 
 	for _, m := range allModules {
-		fmt.Fprintf(&b, "\t%s_luxo \"%s/service/%s/luxo\"\n", m.name, modulePath, m.name)
+		if m.hasSchema || m.hasCrud || m.hasServiceFns {
+			fmt.Fprintf(&b, "\t%s_luxo \"%s/service/%s/luxo\"\n", m.name, modulePath, m.name)
+		}
 	}
 
 	b.WriteString("\n\t\"encoding/json\"\n\n")
@@ -499,16 +526,18 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	// Gateway
 	b.WriteString("\tgw := luvia.New()\n\n")
 
-	// Schema
+	// Schema (skip event-only modules)
 	for _, m := range allModules {
-		fmt.Fprintf(&b, "\t%s_luxo.RegisterSchema(gw.Router.Schema)\n", m.name)
+		if m.hasSchema {
+			fmt.Fprintf(&b, "\t%s_luxo.RegisterSchema(gw.Router.Schema)\n", m.name)
+		}
 	}
 	b.WriteString("\n")
 
-	// Routing table
+	// Routing table (deduplicated)
 	b.WriteString("\trouting := map[string]string{\n")
-	for _, r := range routes {
-		fmt.Fprintf(&b, "\t\t%q: %q,\n", r.apiName, r.moduleName)
+	for _, name := range routeOrder {
+		fmt.Fprintf(&b, "\t\t%q: %q,\n", name, routeMap[name])
 	}
 	b.WriteString("\t}\n")
 	b.WriteString("\tfor apiName, moduleName := range routing {\n")
