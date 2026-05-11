@@ -134,6 +134,79 @@ func TestGenerateEntryFileWithLoaders(t *testing.T) {
 	}
 }
 
+func TestGenerateEntryFileWithExtends(t *testing.T) {
+	// Test that modules with cross-module extends trigger cluster/embedded mode branching
+	result := &semantic.Result{
+		Files: []*ast.File{
+			{
+				Name: "origin/user.luxo",
+				Models: []*ast.ModelDecl{
+					{
+						Pos:        token.Position{File: "test.luxo", Line: 1, Col: 1},
+						Name:       "User",
+						Directives: []*ast.Directive{{Name: "crud"}},
+						Fields: []*ast.FieldDecl{
+							{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+							{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+						},
+					},
+					{
+						Pos:  token.Position{File: "test.luxo", Line: 1, Col: 1},
+						Name: "Post",
+						Fields: []*ast.FieldDecl{
+							{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+							{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+						},
+					},
+				},
+			},
+			{
+				Name: "origin/monitoring.luxo",
+				Models: []*ast.ModelDecl{{
+					Pos:        token.Position{File: "test.luxo", Line: 1, Col: 1},
+					Name:       "Trace",
+					Directives: []*ast.Directive{{Name: "crud"}},
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					},
+				}},
+				Extends: []*ast.ExtendDecl{{
+					Name:   "User",
+					Fields: []*ast.FieldDecl{{Name: "traces", Type: &ast.TypeRef{Name: "Trace", IsList: true}}},
+				}},
+			},
+			{
+				// Module without loaders — tests the !hasLoaders skip in cluster mode
+				Name:   "origin/common.luxo",
+				Events: []*ast.EventDecl{{Name: "PurgeRequested"}},
+			},
+		},
+	}
+
+	src := GenerateEntryFile(result, "myapp")
+	if src == nil {
+		t.Fatal("should generate entry file")
+	}
+	code := string(src)
+
+	// Should have cluster/embedded mode branching
+	if !strings.Contains(code, "DEPLOY_MODE") {
+		t.Errorf("should have DEPLOY_MODE check:\n%s", code)
+	}
+	if !strings.Contains(code, `deployMode == "cluster"`) {
+		t.Errorf("should have cluster mode branch:\n%s", code)
+	}
+	if !strings.Contains(code, "NewRemoteLoaders") {
+		t.Errorf("should have NewRemoteLoaders for cluster mode:\n%s", code)
+	}
+	if !strings.Contains(code, "NewDefaultLoaders") {
+		t.Errorf("should have NewDefaultLoaders for embedded mode:\n%s", code)
+	}
+	if !strings.Contains(code, "rpc.NewClient") {
+		t.Errorf("should have RPC client setup:\n%s", code)
+	}
+}
+
 func TestGenerateEntryFileWithEvents(t *testing.T) {
 	result := &semantic.Result{
 		Files: []*ast.File{
@@ -547,5 +620,220 @@ func TestCollectModules(t *testing.T) {
 	post := modules[1]
 	if post.hasCrud {
 		t.Error("post should not have crud")
+	}
+}
+
+func TestCollectModulesWithExtends(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/monitoring/trace.luxo",
+			Models: []*ast.ModelDecl{{
+				Pos:  token.Position{File: "test.luxo", Line: 1, Col: 1},
+				Name: "Trace",
+			}},
+			Extends: []*ast.ExtendDecl{{
+				Name:   "Project",
+				Fields: []*ast.FieldDecl{{Name: "traces", Type: &ast.TypeRef{Name: "Trace", IsList: true}}},
+			}},
+		}},
+	}
+	modules := collectModules(result)
+	if len(modules) != 1 {
+		t.Fatalf("expected 1 module, got %d", len(modules))
+	}
+	if !modules[0].hasLoaders {
+		t.Error("module with extends should have loaders")
+	}
+	if !modules[0].hasExtend {
+		t.Error("module with extends should have hasExtend")
+	}
+}
+
+func TestCollectModulesHasSchema(t *testing.T) {
+	// Event-only module: no models, no APIs → hasSchema = false
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name:   "origin/common/events.luxo",
+			Events: []*ast.EventDecl{{Name: "PurgeRequested"}},
+		}},
+	}
+	modules := collectModules(result)
+	if len(modules) != 1 {
+		t.Fatalf("expected 1 module, got %d", len(modules))
+	}
+	if modules[0].hasSchema {
+		t.Error("event-only module should not have schema")
+	}
+
+	// Module with models → hasSchema = true
+	result2 := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/user.luxo",
+			Models: []*ast.ModelDecl{{
+				Pos:  token.Position{File: "test.luxo", Line: 1, Col: 1},
+				Name: "User",
+			}},
+		}},
+	}
+	modules2 := collectModules(result2)
+	if !modules2[0].hasSchema {
+		t.Error("module with models should have schema")
+	}
+}
+
+func TestGenerateSingleModuleEntryWithExtends(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{
+			{
+				Name: "origin/monitoring/trace.luxo",
+				Models: []*ast.ModelDecl{{
+					Pos:        token.Position{File: "test.luxo", Line: 1, Col: 1},
+					Name:       "Trace",
+					Directives: []*ast.Directive{{Name: "crud"}},
+				}},
+				Extends: []*ast.ExtendDecl{{
+					Name:   "Project",
+					Fields: []*ast.FieldDecl{{Name: "traces", Type: &ast.TypeRef{Name: "Trace", IsList: true}}},
+				}},
+			},
+			{
+				Name: "origin/project/project.luxo",
+				Models: []*ast.ModelDecl{{
+					Pos:        token.Position{File: "test.luxo", Line: 1, Col: 1},
+					Name:       "Project",
+					Directives: []*ast.Directive{{Name: "crud"}},
+				}},
+			},
+		},
+	}
+
+	modules := collectModules(result)
+	// Find monitoring module
+	var target moduleInfo
+	for _, m := range modules {
+		if m.name == "monitoring" {
+			target = m
+			break
+		}
+	}
+	code := generateSingleModuleEntry(target, modules, result, "myapp")
+	src := string(code)
+
+	// Should have RPC-backed loader wiring with project service
+	if !strings.Contains(src, "rpc.NewClient") {
+		t.Errorf("extends module should use RPC client:\n%s", src)
+	}
+	if !strings.Contains(src, "NewRemoteLoaders") {
+		t.Errorf("extends module should use NewRemoteLoaders:\n%s", src)
+	}
+	if !strings.Contains(src, "PROJECT_SERVICE_ADDR") {
+		t.Errorf("should reference project service addr:\n%s", src)
+	}
+}
+
+func TestGenerateGatewayEntryEventOnly(t *testing.T) {
+	// Gateway with an event-only module — should NOT generate RegisterSchema for it
+	result := &semantic.Result{
+		Files: []*ast.File{
+			{
+				Name: "origin/user.luxo",
+				Models: []*ast.ModelDecl{{
+					Pos:        token.Position{File: "test.luxo", Line: 1, Col: 1},
+					Name:       "User",
+					Directives: []*ast.Directive{{Name: "crud"}},
+				}},
+			},
+			{
+				Name:   "origin/common/events.luxo",
+				Events: []*ast.EventDecl{{Name: "PurgeRequested"}},
+			},
+		},
+	}
+
+	code := GenerateGatewayEntry(result, "myapp")
+	src := string(code)
+
+	if !strings.Contains(src, "user_luxo.RegisterSchema") {
+		t.Errorf("should have RegisterSchema for user module:\n%s", src)
+	}
+	// common module is event-only, should not appear in gateway routing
+	if strings.Contains(src, "common_luxo.RegisterSchema") {
+		t.Errorf("event-only module should NOT have RegisterSchema:\n%s", src)
+	}
+}
+
+func TestGenerateGatewayEntryStreamSkip(t *testing.T) {
+	// Stream APIs should not appear in normal routing
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/user.luxo",
+			Models: []*ast.ModelDecl{{
+				Pos:        token.Position{File: "test.luxo", Line: 1, Col: 1},
+				Name:       "User",
+				Directives: []*ast.Directive{{Name: "crud"}},
+			}},
+			APIs: []*ast.ApiDecl{{
+				Name:       "watchUsers",
+				Directives: []*ast.Directive{{Name: "stream"}},
+				Body:       &ast.Block{Stmts: []ast.Stmt{}},
+			}},
+		}},
+	}
+
+	code := GenerateGatewayEntry(result, "myapp")
+	src := string(code)
+
+	if strings.Contains(src, `"watchUsers"`) {
+		t.Errorf("stream API should not be in routing table:\n%s", src)
+	}
+}
+
+func TestGenerateGatewayEntryNoCrudModel(t *testing.T) {
+	// Model without @crud should not generate routes
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/user.luxo",
+			Models: []*ast.ModelDecl{{
+				Pos:  token.Position{File: "test.luxo", Line: 1, Col: 1},
+				Name: "User",
+				// no @crud directive
+			}},
+		}},
+	}
+
+	code := GenerateGatewayEntry(result, "myapp")
+	src := string(code)
+
+	// Should not have CRUD routes
+	if strings.Contains(src, `"getUser"`) {
+		t.Errorf("non-crud model should not have routes:\n%s", src)
+	}
+}
+
+func TestGenerateGatewayEntryCompiledAPIDedup(t *testing.T) {
+	// When a compiled API has the same name as a CRUD API, compiled wins
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/user.luxo",
+			Models: []*ast.ModelDecl{{
+				Pos:        token.Position{File: "test.luxo", Line: 1, Col: 1},
+				Name:       "User",
+				Directives: []*ast.Directive{{Name: "crud"}},
+			}},
+			APIs: []*ast.ApiDecl{{
+				Name:       "getUser",
+				ReturnType: &ast.TypeRef{Name: "User"},
+				Body:       &ast.Block{Stmts: []ast.Stmt{}},
+			}},
+		}},
+	}
+
+	code := GenerateGatewayEntry(result, "myapp")
+	src := string(code)
+
+	// getUser should appear exactly once in routing
+	count := strings.Count(src, `"getUser"`)
+	if count != 1 {
+		t.Errorf("getUser should appear exactly once (dedup), appeared %d times:\n%s", count, src)
 	}
 }

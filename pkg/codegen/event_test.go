@@ -441,3 +441,37 @@ func TestGenerateEventFileCrossModule(t *testing.T) {
 		t.Errorf("should use cross-module unmarshal:\n%s", code)
 	}
 }
+
+func TestGenerateEventFileNeedsTime(t *testing.T) {
+	// Listener body uses now() → should import "time"
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Events: []*ast.EventDecl{
+				{Name: "SessionExpired"},
+			},
+			Listeners: []*ast.OnDecl{
+				{
+					EventName: "SessionExpired",
+					Params:    []string{"ev"},
+					Body: &ast.Block{Stmts: []ast.Stmt{
+						&ast.ValStmt{
+							Name:  "t",
+							Value: &ast.CallExpr{Func: &ast.Ident{Name: "now"}},
+						},
+					}},
+				},
+			},
+		}},
+	}
+
+	src := generateEventFile(result, "auth")
+	if src == nil {
+		t.Fatal("should generate event file")
+	}
+	code := string(src)
+
+	if !strings.Contains(code, `"time"`) {
+		t.Errorf("listener with now() should import time:\n%s", code)
+	}
+}
