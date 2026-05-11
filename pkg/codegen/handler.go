@@ -73,13 +73,17 @@ func detectHandlerFeatures(result *semantic.Result, models []*ast.ModelDecl, inf
 
 	f.hasAuth = detectAuthNeeded(result, models)
 
-	// Scan compiled API bodies for crypto and time function usage
+	// Scan compiled API bodies for crypto, time, and cross-module emit usage
+	curModule := ""
+	if len(result.Files) > 0 {
+		curModule = moduleNameFromFile(result.Files[0].Name)
+	}
 	for _, file := range result.Files {
 		for _, api := range file.APIs {
 			if api.Body == nil {
 				continue
 			}
-			scanBodyForBuiltins(api.Body, &f)
+			scanBodyForBuiltins(api.Body, &f, curModule)
 		}
 	}
 
@@ -1780,7 +1784,7 @@ func generateAggregateFields(b *strings.Builder, m *ast.ModelDecl, resultVar, in
 }
 
 // scanBodyForBuiltins walks AST to find crypto.*, now(), duration property usage.
-func scanBodyForBuiltins(block *ast.Block, f *handlerFeatures) {
+func scanBodyForBuiltins(block *ast.Block, f *handlerFeatures, currentModule ...string) {
 	if block == nil {
 		return
 	}
@@ -1807,9 +1811,11 @@ func scanBodyForBuiltins(block *ast.Block, f *handlerFeatures) {
 			f.hasEmit = true
 			if globalEventCtx != nil {
 				evModule := globalEventCtx.EventModule[emit.EventName]
-				currentMod := ""
-				// currentModule is tricky here — use file from features detection
-				if evModule != "" && evModule != currentMod {
+				curMod := ""
+				if len(currentModule) > 0 {
+					curMod = currentModule[0]
+				}
+				if evModule != "" && evModule != curMod {
 					if f.crossEventImports == nil {
 						f.crossEventImports = make(map[string]string)
 					}

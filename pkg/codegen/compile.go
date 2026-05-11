@@ -1244,6 +1244,20 @@ func (c *compiler) compileThrowExpr(expr ast.Expr) string {
 
 // resolveQueryType determines the return type of a model query chain.
 func (c *compiler) resolveQueryType(expr ast.Expr) valType {
+	// Instance method: variable.update() → Int (rows affected), variable.delete() → Int
+	if call, ok := expr.(*ast.CallExpr); ok {
+		if member, ok := call.Func.(*ast.MemberExpr); ok {
+			if ident, ok := member.Object.(*ast.Ident); ok {
+				if vt, ok := c.vars[ident.Name]; ok && vt.isModel && !vt.isList {
+					switch member.Field {
+					case "update", "delete":
+						return valType{name: "Int"}
+					}
+				}
+			}
+		}
+	}
+
 	chain := flattenChain(expr)
 	if len(chain) < 2 {
 		return valType{}
