@@ -1965,6 +1965,112 @@ func TestGenerateNativeServiceFnHandler(t *testing.T) {
 	}
 }
 
+func TestNativeAPIHandler(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/monitoring.luxo",
+			Models: []*ast.ModelDecl{
+				testModel("MetricBucket", []*ast.Directive{crudDirective()}, []*ast.FieldDecl{
+					testField("id", "Int", directive("id"), directive("auto")),
+				}),
+			},
+			APIs: []*ast.ApiDecl{
+				{
+					Name:       "getDashboardOverview",
+					Directives: []*ast.Directive{{Name: "native"}, {Name: "auth"}},
+					Params: []*ast.ParamDecl{
+						{Name: "projectId", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "startTime", Type: &ast.TypeRef{Name: "DateTime"}},
+						{Name: "endTime", Type: &ast.TypeRef{Name: "DateTime"}},
+					},
+					ReturnType: &ast.TypeRef{Name: "DashboardOverview"},
+				},
+				{
+					Name:       "getErrorBreakdown",
+					Directives: []*ast.Directive{{Name: "native"}},
+					Params: []*ast.ParamDecl{
+						{Name: "projectId", Type: &ast.TypeRef{Name: "Int"}},
+					},
+					ReturnType: &ast.TypeRef{Name: "ErrorBreakdown", IsList: true},
+				},
+				{
+					Name:       "countActiveUsers",
+					Directives: []*ast.Directive{{Name: "native"}},
+					ReturnType: &ast.TypeRef{Name: "Int"},
+				},
+			},
+		}},
+	}
+
+	code := string(generateHandlerFile(result, "luxo", nil))
+
+	// Handler functions
+	if !strings.Contains(code, "handleGetDashboardOverview(app *App)") {
+		t.Error("missing native API handler for getDashboardOverview")
+	}
+	if !strings.Contains(code, "handleGetErrorBreakdown(app *App)") {
+		t.Error("missing native API handler for getErrorBreakdown")
+	}
+
+	// @auth check
+	if !strings.Contains(code, "luvia.Identity(ctx)") {
+		t.Error("@auth native API should have identity check")
+	}
+
+	// Resolver delegation
+	if !strings.Contains(code, "app.Resolver.GetDashboardOverview(ctx") {
+		t.Error("should delegate to Resolver")
+	}
+
+	// Scalar return encoding
+	if !strings.Contains(code, "codec.AppendSvarint(req.Buf.B, result)") {
+		t.Error("Int return should use AppendSvarint")
+	}
+
+	// Struct return encoding
+	if !strings.Contains(code, "result.WriteLuxo(req.Buf, req.FieldMask)") {
+		t.Error("struct return should use WriteLuxo")
+	}
+
+	// List return encoding — length prefix + per-item WriteLuxo
+	if !strings.Contains(code, "codec.AppendSvarint(req.Buf.B, int64(len(result)))") {
+		t.Error("list return should write length prefix")
+	}
+	if !strings.Contains(code, "result[i].WriteLuxo(req.Buf, req.FieldMask)") {
+		t.Error("list return should write each item via WriteLuxo")
+	}
+
+	// Registration in RegisterHandlers
+	if !strings.Contains(code, `router.Handle("getDashboardOverview"`) {
+		t.Error("native API should be registered in RegisterHandlers")
+	}
+	if !strings.Contains(code, `router.Handle("getErrorBreakdown"`) {
+		t.Error("native API should be registered in RegisterHandlers")
+	}
+}
+
+func TestNativeAPIHandlerReturnTypes(t *testing.T) {
+	tests := []struct {
+		retType  *ast.TypeRef
+		contains string
+	}{
+		{&ast.TypeRef{Name: "Float"}, "codec.AppendFixed64"},
+		{&ast.TypeRef{Name: "String"}, "codec.AppendString"},
+		{&ast.TypeRef{Name: "Boolean"}, "codec.AppendBool"},
+	}
+	for _, tt := range tests {
+		var b strings.Builder
+		generateNativeAPIHandler(&b, &ast.ApiDecl{
+			Name:       "test",
+			Directives: []*ast.Directive{{Name: "native"}},
+			ReturnType: tt.retType,
+		})
+		if !strings.Contains(b.String(), tt.contains) {
+			t.Errorf("return type %s should contain %q, got:\n%s", tt.retType.Name, tt.contains, b.String())
+		}
+	}
+}
+
 func TestServiceFnNotRegisteredWithoutAnnotation(t *testing.T) {
 	result := &semantic.Result{
 		Files: []*ast.File{{

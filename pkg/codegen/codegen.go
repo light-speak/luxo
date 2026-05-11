@@ -530,6 +530,7 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 	}
 
 	hasEvents := appNeedsEvents(result)
+	hasNativeAPIs := len(collectNativeAPIs(result)) > 0
 
 	var b strings.Builder
 	writeHeader(&b, packageName, "app.gen.go")
@@ -550,6 +551,9 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 	b.WriteString("\tDB *pg.DB\n")
 	if hasEvents {
 		b.WriteString("\tEventBus event.Bus\n")
+	}
+	if hasNativeAPIs {
+		b.WriteString("\tResolver NativeResolver\n")
 	}
 	for _, name := range models {
 		fmt.Fprintf(&b, "\t%s *%sClient\n", name, name)

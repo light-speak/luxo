@@ -140,14 +140,18 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	}
 
 	compiledNames := generateCompiledHandlers(&b, result, modelMap)
+	nativeNames := generateNativeAPIHandlers(&b, result)
 	inferredNames := generateInferredHandlers(&b, inferredAPIs, modelMap, enums)
 
 	// Build set of compiled/inferred names to avoid generating duplicate CRUD handlers
-	compiledSet := make(map[string]bool, len(compiledNames)+len(inferredNames))
+	compiledSet := make(map[string]bool, len(compiledNames)+len(inferredNames)+len(nativeNames))
 	for _, n := range compiledNames {
 		compiledSet[n] = true
 	}
 	for _, n := range inferredNames {
+		compiledSet[n] = true
+	}
+	for _, n := range nativeNames {
 		compiledSet[n] = true
 	}
 	generateCRUDHandlers(&b, models, enums, compiledSet)
@@ -155,8 +159,9 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	// Collect API directives for middleware wrapping
 	apiDirectives := collectAPIDirectives(result)
 
-	// RegisterHandlers function (CRUD + inferred + compiled)
+	// RegisterHandlers function (CRUD + inferred + compiled + native)
 	allInferred := append(inferredNames, compiledNames...)
+	allInferred = append(allInferred, nativeNames...)
 	generateRegisterFuncWithInferred(&b, models, allInferred, apiDirectives)
 
 	// fn @service handlers
@@ -254,6 +259,95 @@ func generateServiceFnHandlers(b *strings.Builder, result *semantic.Result, mode
 		}
 	}
 	return names
+}
+
+// generateNativeAPIHandlers generates handlers for api @native declarations.
+// Returns native API names for registration in RegisterHandlers.
+func generateNativeAPIHandlers(b *strings.Builder, result *semantic.Result) []string {
+	var names []string
+	for _, file := range result.Files {
+		for _, api := range file.APIs {
+			if !hasDirective(api.Directives, "native") {
+				continue
+			}
+			generateNativeAPIHandler(b, api)
+			names = append(names, api.Name)
+		}
+	}
+	return names
+}
+
+// generateNativeAPIHandler generates a single handler for an api @native declaration.
+func generateNativeAPIHandler(b *strings.Builder, api *ast.ApiDecl) {
+	name := api.Name
+	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(name))
+	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
+
+	// @auth check
+	if hasDirective(api.Directives, "auth") {
+		fmt.Fprintf(b, "\t\tidentity := luvia.Identity(ctx)\n")
+		fmt.Fprintf(b, "\t\tif identity == nil {\n")
+		fmt.Fprintf(b, "\t\t\treturn errors.Unauthorized\n")
+		fmt.Fprintf(b, "\t\t}\n")
+		fmt.Fprintf(b, "\t\treq.Buf.Identity = identity\n")
+	}
+
+	// Parse params
+	var paramNames []string
+	for _, p := range api.Params {
+		goType := resolveGoType(p.Type)
+		method := paramMethod(goType)
+		if method == "" {
+			fmt.Fprintf(b, "\t\tvar %s %s\n", p.Name, goType)
+			fmt.Fprintf(b, "\t\tif err := req.ParamJSON(%q, &%s); err != nil {\n", p.Name, p.Name)
+			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
+		} else {
+			fmt.Fprintf(b, "\t\t%s, err := req.Param%s(%q)\n", p.Name, method, p.Name)
+			fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+		}
+		paramNames = append(paramNames, p.Name)
+	}
+
+	// Call NativeResolver
+	fmt.Fprintf(b, "\t\tresult, err := app.Resolver.%s(ctx", str.Capitalize(name))
+	for _, pn := range paramNames {
+		fmt.Fprintf(b, ", %s", pn)
+	}
+	fmt.Fprintf(b, ")\n")
+	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+
+	// Write response
+	if api.ReturnType != nil {
+		writeNativeReturnEncoding(b, api.ReturnType)
+	}
+	fmt.Fprintf(b, "\t\treturn nil\n")
+	fmt.Fprintf(b, "\t}\n}\n\n")
+}
+
+// writeNativeReturnEncoding writes the binary encoding for a native API return value.
+func writeNativeReturnEncoding(b *strings.Builder, rt *ast.TypeRef) {
+	if rt.IsList {
+		// List of structs — write length + each item
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(len(result)))\n")
+		fmt.Fprintf(b, "\t\tfor i := range result {\n")
+		fmt.Fprintf(b, "\t\t\tresult[i].WriteLuxo(req.Buf, req.FieldMask)\n")
+		fmt.Fprintf(b, "\t\t}\n")
+		return
+	}
+	goType := resolveGoType(rt)
+	switch goType {
+	case "int64":
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, result)\n")
+	case "float64":
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendFixed64(req.Buf.B, result)\n")
+	case "string":
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendString(req.Buf.B, result)\n")
+	case "bool":
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendBool(req.Buf.B, result)\n")
+	default:
+		// Struct type — use WriteLuxo
+		fmt.Fprintf(b, "\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
+	}
 }
 
 // generateNativeServiceHandler generates a handler that delegates to NativeResolver.
@@ -1511,7 +1605,7 @@ func detectAuthNeeded(result *semantic.Result, models []*ast.ModelDecl) bool {
 	}
 	for _, file := range result.Files {
 		for _, api := range file.APIs {
-			if hasDirective(api.Directives, "auth") && !hasDirective(api.Directives, "native") {
+			if hasDirective(api.Directives, "auth") {
 				return true
 			}
 		}
