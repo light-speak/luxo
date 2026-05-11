@@ -121,6 +121,7 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/event\"\n")
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/migrate\"\n")
 	// rpc needed for fn @service or cluster mode DataLoaders
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/rpc\"\n")
 	b.WriteString(")\n\n")
@@ -132,6 +133,24 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\tctx := context.Background()\n\n")
 	b.WriteString("\tif err := env.Load(\".env\"); err != nil {\n")
 	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"warning: %v\\n\", err)\n")
+	b.WriteString("\t}\n\n")
+
+	// Database initialization: create database + run migrations
+	b.WriteString("\tif env.GetOrDefault(\"AUTO_MIGRATE\", \"true\") == \"true\" {\n")
+	b.WriteString("\t\tif err := migrate.EnsureDatabase(ctx); err != nil {\n")
+	b.WriteString("\t\t\tfmt.Fprintf(os.Stderr, \"ensure db: %v\\n\", err)\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t\tmigrator, err := migrate.New(ctx, \"migrations\")\n")
+	b.WriteString("\t\tif err != nil {\n")
+	b.WriteString("\t\t\tfmt.Fprintf(os.Stderr, \"migrate: %v\\n\", err)\n")
+	b.WriteString("\t\t} else {\n")
+	b.WriteString("\t\t\tif applied, err := migrator.Up(ctx); err != nil {\n")
+	b.WriteString("\t\t\t\tfmt.Fprintf(os.Stderr, \"migrate: %v\\n\", err)\n")
+	b.WriteString("\t\t\t} else if len(applied) > 0 {\n")
+	b.WriteString("\t\t\t\tfmt.Fprintf(os.Stderr, \"migrate: applied %d migration(s)\\n\", len(applied))\n")
+	b.WriteString("\t\t\t}\n")
+	b.WriteString("\t\t\tmigrator.Close()\n")
+	b.WriteString("\t\t}\n")
 	b.WriteString("\t}\n\n")
 
 	writeModuleApps(&b, modules)

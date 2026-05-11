@@ -105,7 +105,6 @@ func (g *Gateway) waitForShutdown() error {
 func (g *Gateway) buildMux(version string) (*http.ServeMux, string) {
 	port := envOr("APP_PORT", "4000")
 	mode := envOr("DEPLOY_MODE", "embedded")
-	transport := envOr("TRANSPORT_MODE", "json")
 
 	// Build DB display string from DATABASE_* fields
 	dbHost := envOr("DATABASE_HOST", "")
@@ -117,7 +116,7 @@ func (g *Gateway) buildMux(version string) (*http.ServeMux, string) {
 		dbDisplay = fmt.Sprintf("%s@%s:%s/%s", dbUser, dbHost, dbPort, dbPrefix)
 	}
 
-	printBanner(version, port, mode, transport, dbDisplay, g.modules)
+	printBanner(version, port, mode, dbDisplay, g.modules)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", handleHealth)
@@ -185,12 +184,12 @@ func envOr(key, fallback string) string {
 	return env.GetOrDefault(key, fallback)
 }
 
-func printBanner(version, port, mode, transport, dbURL string, modules []string) {
-	fmt.Print(buildBanner(version, port, mode, transport, dbURL, modules))
+func printBanner(version, port, mode, dbURL string, modules []string) {
+	fmt.Print(buildBanner(version, port, mode, dbURL, modules))
 }
 
 // buildBanner builds the full banner string without printing it.
-func buildBanner(version, port, mode, transport, dbURL string, modules []string) string {
+func buildBanner(version, port, mode, dbURL string, modules []string) string {
 	rgb := func(r, g, b int) string {
 		return fmt.Sprintf("\033[38;2;%d;%d;%dm", r, g, b)
 	}
@@ -219,7 +218,6 @@ func buildBanner(version, port, mode, transport, dbURL string, modules []string)
 	fmt.Fprintf(&sb, "  %sVersion%s  %s\n\n", dim, reset, version)
 
 	fmt.Fprintf(&sb, "  %sMode%s       %s\n", dim, reset, mode)
-	fmt.Fprintf(&sb, "  %sTransport%s  %s\n", dim, reset, transport)
 	fmt.Fprintf(&sb, "  %sPort%s       %s%s%s\n", dim, reset, bold, port, reset)
 
 	if dbURL != "" {
