@@ -2,6 +2,7 @@ package codegen
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/ast"
@@ -59,8 +60,14 @@ func generateEventFile(result *semantic.Result, packageName string) []byte {
 		b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/event\"\n")
-	for modName, alias := range crossModuleImports {
-		fmt.Fprintf(&b, "\t%s \"%s/%s/luxo\"\n", alias, globalEventCtx.ModulePath, modName)
+	// Sort cross-module imports for deterministic output
+	modNames := make([]string, 0, len(crossModuleImports))
+	for modName := range crossModuleImports {
+		modNames = append(modNames, modName)
+	}
+	sort.Strings(modNames)
+	for _, modName := range modNames {
+		fmt.Fprintf(&b, "\t%s \"%s/%s/luxo\"\n", crossModuleImports[modName], globalEventCtx.ModulePath, modName)
 	}
 	b.WriteString(")\n\n")
 

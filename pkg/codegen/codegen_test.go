@@ -7,6 +7,7 @@ import (
 
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/semantic"
+	"github.com/light-speak/luxo/pkg/token"
 )
 
 // buildResult creates a semantic.Result from manually constructed AST.
@@ -1120,9 +1121,40 @@ func TestAppNeedsEvents(t *testing.T) {
 		t.Error("should need events with emit statement")
 	}
 
+	// Nested emit inside if
+	r4 := &semantic.Result{Files: []*ast.File{{APIs: []*ast.ApiDecl{{
+		Name: "test",
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.IfStmt{
+				Condition: &ast.Literal{Kind: token.Int, Value: "1"},
+				Then: &ast.Block{Stmts: []ast.Stmt{
+					&ast.EmitStmt{EventName: "Test"},
+				}},
+			},
+		}},
+	}}}}}
+	if !appNeedsEvents(r4) {
+		t.Error("should detect emit nested inside if")
+	}
+
+	// Nested emit inside transaction
+	r5 := &semantic.Result{Files: []*ast.File{{APIs: []*ast.ApiDecl{{
+		Name: "test",
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.TransactionExpr{
+				Body: &ast.Block{Stmts: []ast.Stmt{
+					&ast.EmitStmt{EventName: "Test"},
+				}},
+			}},
+		}},
+	}}}}}
+	if !appNeedsEvents(r5) {
+		t.Error("should detect emit nested inside transaction")
+	}
+
 	// Empty
-	r4 := &semantic.Result{Files: []*ast.File{{}}}
-	if appNeedsEvents(r4) {
+	r6 := &semantic.Result{Files: []*ast.File{{}}}
+	if appNeedsEvents(r6) {
 		t.Error("should not need events when empty")
 	}
 }

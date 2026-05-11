@@ -468,11 +468,41 @@ func appNeedsEvents(result *semantic.Result) bool {
 			return true
 		}
 		for _, api := range file.APIs {
-			if api.Body != nil {
-				for _, stmt := range api.Body.Stmts {
-					if _, ok := stmt.(*ast.EmitStmt); ok {
-						return true
-					}
+			if api.Body != nil && stmtsContainEmit(api.Body.Stmts) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// stmtsContainEmit recursively checks whether any EmitStmt exists in nested blocks.
+func stmtsContainEmit(stmts []ast.Stmt) bool {
+	for _, stmt := range stmts {
+		switch s := stmt.(type) {
+		case *ast.EmitStmt:
+			return true
+		case *ast.IfStmt:
+			if s.Then != nil && stmtsContainEmit(s.Then.Stmts) {
+				return true
+			}
+		case *ast.ForStmt:
+			if s.Body != nil && stmtsContainEmit(s.Body.Stmts) {
+				return true
+			}
+		case *ast.ExprStmt:
+			switch expr := s.Expr.(type) {
+			case *ast.TransactionExpr:
+				if expr.Body != nil && stmtsContainEmit(expr.Body.Stmts) {
+					return true
+				}
+			case *ast.AsyncExpr:
+				if expr.Body != nil && stmtsContainEmit(expr.Body.Stmts) {
+					return true
+				}
+			case *ast.AwaitExpr:
+				if expr.Body != nil && stmtsContainEmit(expr.Body.Stmts) {
+					return true
 				}
 			}
 		}
