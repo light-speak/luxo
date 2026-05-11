@@ -2032,12 +2032,12 @@ func TestNativeAPIHandler(t *testing.T) {
 		t.Error("struct return should use WriteLuxo")
 	}
 
-	// List return encoding — length prefix + per-item WriteLuxo
+	// List of struct return — length prefix + per-item WriteLuxo
 	if !strings.Contains(code, "codec.AppendSvarint(req.Buf.B, int64(len(result)))") {
 		t.Error("list return should write length prefix")
 	}
 	if !strings.Contains(code, "result[i].WriteLuxo(req.Buf, req.FieldMask)") {
-		t.Error("list return should write each item via WriteLuxo")
+		t.Error("list of struct should write each item via WriteLuxo")
 	}
 
 	// Registration in RegisterHandlers
@@ -2068,6 +2068,42 @@ func TestNativeAPIHandlerReturnTypes(t *testing.T) {
 		if !strings.Contains(b.String(), tt.contains) {
 			t.Errorf("return type %s should contain %q, got:\n%s", tt.retType.Name, tt.contains, b.String())
 		}
+	}
+}
+
+func TestNativeAPIHandlerListPrimitive(t *testing.T) {
+	var b strings.Builder
+	generateNativeAPIHandler(&b, &ast.ApiDecl{
+		Name:       "getIds",
+		Directives: []*ast.Directive{{Name: "native"}},
+		ReturnType: &ast.TypeRef{Name: "Int", IsList: true},
+	})
+	code := b.String()
+	if !strings.Contains(code, "codec.AppendSvarint(req.Buf.B, v)") {
+		t.Errorf("[Int] should encode each element with AppendSvarint:\n%s", code)
+	}
+
+	var b2 strings.Builder
+	generateNativeAPIHandler(&b2, &ast.ApiDecl{
+		Name:       "getNames",
+		Directives: []*ast.Directive{{Name: "native"}},
+		ReturnType: &ast.TypeRef{Name: "String", IsList: true},
+	})
+	if !strings.Contains(b2.String(), "codec.AppendString(req.Buf.B, v)") {
+		t.Errorf("[String] should encode each element with AppendString:\n%s", b2.String())
+	}
+}
+
+func TestNativeAPIHandlerNoReturn(t *testing.T) {
+	var b strings.Builder
+	generateNativeAPIHandler(&b, &ast.ApiDecl{
+		Name:       "purge",
+		Directives: []*ast.Directive{{Name: "native"}},
+		// no ReturnType
+	})
+	code := b.String()
+	if !strings.Contains(code, "_, err := app.Resolver.Purge(ctx)") {
+		t.Errorf("no-return should use _ for result:\n%s", code)
 	}
 }
 

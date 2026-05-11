@@ -283,13 +283,12 @@ func generateNativeAPIHandler(b *strings.Builder, api *ast.ApiDecl) {
 	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(name))
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 
-	// @auth check
-	if hasDirective(api.Directives, "auth") {
-		fmt.Fprintf(b, "\t\tidentity := luvia.Identity(ctx)\n")
-		fmt.Fprintf(b, "\t\tif identity == nil {\n")
-		fmt.Fprintf(b, "\t\t\treturn errors.Unauthorized\n")
-		fmt.Fprintf(b, "\t\t}\n")
-		fmt.Fprintf(b, "\t\treq.Buf.Identity = identity\n")
+	// @auth check (reuse writeAuthCheck for role/own/permission support)
+	for _, d := range api.Directives {
+		if d.Name == "auth" {
+			writeAuthCheck(b, "\t\t", d)
+			break
+		}
 	}
 
 	// Parse params
@@ -309,7 +308,11 @@ func generateNativeAPIHandler(b *strings.Builder, api *ast.ApiDecl) {
 	}
 
 	// Call NativeResolver
-	fmt.Fprintf(b, "\t\tresult, err := app.Resolver.%s(ctx", str.Capitalize(name))
+	if api.ReturnType != nil {
+		fmt.Fprintf(b, "\t\tresult, err := app.Resolver.%s(ctx", str.Capitalize(name))
+	} else {
+		fmt.Fprintf(b, "\t\t_, err := app.Resolver.%s(ctx", str.Capitalize(name))
+	}
 	for _, pn := range paramNames {
 		fmt.Fprintf(b, ", %s", pn)
 	}
@@ -327,26 +330,58 @@ func generateNativeAPIHandler(b *strings.Builder, api *ast.ApiDecl) {
 // writeNativeReturnEncoding writes the binary encoding for a native API return value.
 func writeNativeReturnEncoding(b *strings.Builder, rt *ast.TypeRef) {
 	if rt.IsList {
-		// List of structs — write length + each item
-		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(len(result)))\n")
+		writeNativeListEncoding(b, rt)
+		return
+	}
+	writeNativeScalarEncoding(b, rt, "result")
+}
+
+// writeNativeListEncoding writes length-prefixed list encoding.
+func writeNativeListEncoding(b *strings.Builder, rt *ast.TypeRef) {
+	fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(len(result)))\n")
+	// Check if element is a primitive type
+	elemRef := &ast.TypeRef{Name: rt.Name}
+	goType := resolveGoType(elemRef)
+	switch goType {
+	case "int64":
+		fmt.Fprintf(b, "\t\tfor _, v := range result {\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, v)\n")
+		fmt.Fprintf(b, "\t\t}\n")
+	case "float64":
+		fmt.Fprintf(b, "\t\tfor _, v := range result {\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendFixed64(req.Buf.B, v)\n")
+		fmt.Fprintf(b, "\t\t}\n")
+	case "string":
+		fmt.Fprintf(b, "\t\tfor _, v := range result {\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendString(req.Buf.B, v)\n")
+		fmt.Fprintf(b, "\t\t}\n")
+	case "bool":
+		fmt.Fprintf(b, "\t\tfor _, v := range result {\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendBool(req.Buf.B, v)\n")
+		fmt.Fprintf(b, "\t\t}\n")
+	default:
+		// Struct type — use WriteLuxo per element
 		fmt.Fprintf(b, "\t\tfor i := range result {\n")
 		fmt.Fprintf(b, "\t\t\tresult[i].WriteLuxo(req.Buf, req.FieldMask)\n")
 		fmt.Fprintf(b, "\t\t}\n")
-		return
 	}
+}
+
+// writeNativeScalarEncoding writes encoding for a single return value.
+func writeNativeScalarEncoding(b *strings.Builder, rt *ast.TypeRef, varName string) {
 	goType := resolveGoType(rt)
 	switch goType {
 	case "int64":
-		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, result)\n")
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, %s)\n", varName)
 	case "float64":
-		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendFixed64(req.Buf.B, result)\n")
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendFixed64(req.Buf.B, %s)\n", varName)
 	case "string":
-		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendString(req.Buf.B, result)\n")
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendString(req.Buf.B, %s)\n", varName)
 	case "bool":
-		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendBool(req.Buf.B, result)\n")
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendBool(req.Buf.B, %s)\n", varName)
 	default:
 		// Struct type — use WriteLuxo
-		fmt.Fprintf(b, "\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
+		fmt.Fprintf(b, "\t\t%s.WriteLuxo(req.Buf, req.FieldMask)\n", varName)
 	}
 }
 
