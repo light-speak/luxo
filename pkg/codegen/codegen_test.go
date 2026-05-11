@@ -650,6 +650,41 @@ func TestGenerateAppFileSingleModel(t *testing.T) {
 	}
 }
 
+func TestGenerateAppFileWithNativeAPIs(t *testing.T) {
+	file := &ast.File{
+		Name: "test.luxo",
+		APIs: []*ast.ApiDecl{{
+			Name:       "getStats",
+			Directives: []*ast.Directive{{Name: "native"}},
+			ReturnType: &ast.TypeRef{Name: "Int"},
+		}},
+	}
+
+	gr := Generate(result(file), "gen", DriverPG)
+	appSrc := string(gr.Files["app.gen.go"])
+
+	if !strings.Contains(appSrc, "Resolver NativeResolver") {
+		t.Errorf("App struct should have Resolver field:\n%s", appSrc)
+	}
+}
+
+func TestGenerateAppFileWithoutNativeAPIs(t *testing.T) {
+	file := &ast.File{
+		Name: "test.luxo",
+		Models: []*ast.ModelDecl{{
+			Name:   "User",
+			Fields: []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}},
+		}},
+	}
+
+	gr := Generate(result(file), "gen", DriverPG)
+	appSrc := string(gr.Files["app.gen.go"])
+
+	if strings.Contains(appSrc, "Resolver") {
+		t.Errorf("App struct should NOT have Resolver field without native APIs:\n%s", appSrc)
+	}
+}
+
 func TestGenerateWithSoftModelsParam(t *testing.T) {
 	// Test Generate() with the optional softModels parameter
 	file := &ast.File{
