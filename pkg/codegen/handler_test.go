@@ -2641,3 +2641,60 @@ func TestScanBodyForBuiltinsLocalEmit(t *testing.T) {
 		t.Error("local emit should not generate cross-module import")
 	}
 }
+
+func TestWriteSortedCrossModuleImports(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+
+	globalEventCtx = &EventContext{
+		ModulePath: "github.com/test/service",
+	}
+
+	var b strings.Builder
+	imports := map[string]string{
+		"common":     "common_luxo",
+		"monitoring": "monitoring_luxo",
+		"auth":       "auth_luxo",
+	}
+	writeSortedCrossModuleImports(&b, imports)
+	out := b.String()
+
+	// Should be sorted alphabetically: auth, common, monitoring
+	authIdx := strings.Index(out, "auth_luxo")
+	commonIdx := strings.Index(out, "common_luxo")
+	monitorIdx := strings.Index(out, "monitoring_luxo")
+	if authIdx < 0 || commonIdx < 0 || monitorIdx < 0 {
+		t.Fatalf("missing imports in:\n%s", out)
+	}
+	if !(authIdx < commonIdx && commonIdx < monitorIdx) {
+		t.Errorf("imports not sorted:\n%s", out)
+	}
+
+	// No context → no output
+	globalEventCtx = nil
+	var b2 strings.Builder
+	writeSortedCrossModuleImports(&b2, imports)
+	if b2.Len() != 0 {
+		t.Error("should produce nothing without event context")
+	}
+
+	// Empty imports → no output
+	globalEventCtx = &EventContext{ModulePath: "github.com/test/service"}
+	var b3 strings.Builder
+	writeSortedCrossModuleImports(&b3, nil)
+	if b3.Len() != 0 {
+		t.Error("should produce nothing with empty imports")
+	}
+}
+
+func TestNeedsFmtImport(t *testing.T) {
+	// With emit
+	if !needsFmtImport(nil, true) {
+		t.Error("emit should need fmt")
+	}
+
+	// No emit, no models
+	if needsFmtImport(nil, false) {
+		t.Error("should not need fmt without emit or create/update")
+	}
+}

@@ -1152,9 +1152,84 @@ func TestAppNeedsEvents(t *testing.T) {
 		t.Error("should detect emit nested inside transaction")
 	}
 
+	// Nested emit inside for
+	r6 := &semantic.Result{Files: []*ast.File{{APIs: []*ast.ApiDecl{{
+		Name: "test",
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ForStmt{
+				VarName:    "item",
+				Collection: &ast.Ident{Name: "items"},
+				Body: &ast.Block{Stmts: []ast.Stmt{
+					&ast.EmitStmt{EventName: "Test"},
+				}},
+			},
+		}},
+	}}}}}
+	if !appNeedsEvents(r6) {
+		t.Error("should detect emit nested inside for")
+	}
+
+	// Nested emit inside async
+	r7 := &semantic.Result{Files: []*ast.File{{APIs: []*ast.ApiDecl{{
+		Name: "test",
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.AsyncExpr{
+				Body: &ast.Block{Stmts: []ast.Stmt{
+					&ast.EmitStmt{EventName: "Test"},
+				}},
+			}},
+		}},
+	}}}}}
+	if !appNeedsEvents(r7) {
+		t.Error("should detect emit nested inside async")
+	}
+
+	// Nested emit inside await
+	r8 := &semantic.Result{Files: []*ast.File{{APIs: []*ast.ApiDecl{{
+		Name: "test",
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.AwaitExpr{
+				Body: &ast.Block{Stmts: []ast.Stmt{
+					&ast.EmitStmt{EventName: "Test"},
+				}},
+			}},
+		}},
+	}}}}}
+	if !appNeedsEvents(r8) {
+		t.Error("should detect emit nested inside await")
+	}
+
+	// No emit (non-emit statements only)
+	r9 := &semantic.Result{Files: []*ast.File{{APIs: []*ast.ApiDecl{{
+		Name: "test",
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.IfStmt{
+				Condition: &ast.Literal{Kind: token.Int, Value: "1"},
+				Then:      &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{}}},
+			},
+			&ast.ForStmt{
+				VarName:    "x",
+				Collection: &ast.Ident{Name: "xs"},
+				Body:       &ast.Block{Stmts: []ast.Stmt{&ast.BreakStmt{}}},
+			},
+			&ast.ExprStmt{Expr: &ast.AsyncExpr{
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{}}},
+			}},
+			&ast.ExprStmt{Expr: &ast.AwaitExpr{
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{}}},
+			}},
+			&ast.ExprStmt{Expr: &ast.TransactionExpr{
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{}}},
+			}},
+		}},
+	}}}}}
+	if appNeedsEvents(r9) {
+		t.Error("should not need events without any emit")
+	}
+
 	// Empty
-	r6 := &semantic.Result{Files: []*ast.File{{}}}
-	if appNeedsEvents(r6) {
+	r10 := &semantic.Result{Files: []*ast.File{{}}}
+	if appNeedsEvents(r10) {
 		t.Error("should not need events when empty")
 	}
 }

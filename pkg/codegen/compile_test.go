@@ -1170,6 +1170,64 @@ func TestCompileStmtEmit(t *testing.T) {
 	}
 }
 
+func TestCompileStmtEmitCrossModule(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+
+	globalEventCtx = &EventContext{
+		EventModule: map[string]string{"ProjectDeleted": "common"},
+		ModulePath:  "github.com/test/service",
+	}
+
+	c := newCompiler(nil)
+	// Set api.Pos.File to simulate a module file path
+	c.api = &ast.ApiDecl{
+		Name: "purgeData",
+		Pos:  token.Position{File: "origin/monitoring/trace.luxo"},
+	}
+	c.compileStmt(&ast.EmitStmt{
+		EventName: "ProjectDeleted",
+		Args:      []*ast.NamedArg{{Name: "projectId", Value: &ast.Ident{Name: "pid"}}},
+	})
+	out := compilerOut(c)
+
+	// Cross-module emit should have prefix
+	if !strings.Contains(out, "common_luxo.EmitProjectDeleted") {
+		t.Fatalf("expected cross-module prefix, got:\n%s", out)
+	}
+	if !strings.Contains(out, "common_luxo.ProjectDeletedEvent{") {
+		t.Fatalf("expected cross-module event type, got:\n%s", out)
+	}
+}
+
+func TestCompileStmtEmitSameModule(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+
+	globalEventCtx = &EventContext{
+		EventModule: map[string]string{"TraceIngested": "monitoring"},
+		ModulePath:  "github.com/test/service",
+	}
+
+	c := newCompiler(nil)
+	c.api = &ast.ApiDecl{
+		Name: "ingest",
+		Pos:  token.Position{File: "origin/monitoring/trace.luxo"},
+	}
+	c.compileStmt(&ast.EmitStmt{
+		EventName: "TraceIngested",
+	})
+	out := compilerOut(c)
+
+	// Same-module emit should NOT have prefix
+	if strings.Contains(out, "monitoring_luxo.") {
+		t.Fatalf("same-module should not have prefix, got:\n%s", out)
+	}
+	if !strings.Contains(out, "EmitTraceIngested") {
+		t.Fatalf("expected EmitTraceIngested, got:\n%s", out)
+	}
+}
+
 func TestCompileStmtEmitNoArgs(t *testing.T) {
 	c := newCompiler(nil)
 	c.compileStmt(&ast.EmitStmt{
