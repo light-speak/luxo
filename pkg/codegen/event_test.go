@@ -360,3 +360,43 @@ func TestGenerateEventFileOnBody(t *testing.T) {
 		t.Errorf("on body should be compiled, not empty: %s", code)
 	}
 }
+
+func TestCollectCrossModuleEventImports(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+
+	globalEventCtx = &EventContext{
+		EventModule: map[string]string{"ProjectDeleted": "common"},
+		ModulePath:  "github.com/test/service",
+	}
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name:      "origin/monitoring/trace.luxo",
+			Listeners: []*ast.OnDecl{{EventName: "ProjectDeleted"}},
+			APIs: []*ast.ApiDecl{{
+				Name: "deleteProject",
+				Body: &ast.Block{Stmts: []ast.Stmt{
+					&ast.EmitStmt{EventName: "ProjectDeleted"},
+				}},
+			}},
+		}},
+	}
+	listeners := result.Files[0].Listeners
+
+	imports := collectCrossModuleEventImports(result, listeners, "monitoring")
+	if imports["common"] != "common_luxo" {
+		t.Errorf("expected common_luxo import, got %v", imports)
+	}
+}
+
+func TestCollectCrossModuleEventImports_NoContext(t *testing.T) {
+	old := globalEventCtx
+	globalEventCtx = nil
+	defer func() { globalEventCtx = old }()
+
+	imports := collectCrossModuleEventImports(&semantic.Result{}, nil, "test")
+	if len(imports) != 0 {
+		t.Error("should return empty without context")
+	}
+}
