@@ -400,3 +400,44 @@ func TestCollectCrossModuleEventImports_NoContext(t *testing.T) {
 		t.Error("should return empty without context")
 	}
 }
+
+func TestGenerateEventFileCrossModule(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+
+	globalEventCtx = &EventContext{
+		EventModule: map[string]string{"ProjectDeleted": "common"},
+		ModulePath:  "github.com/test/service",
+	}
+
+	// Module with listener for cross-module event (no local events)
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/monitoring/trace.luxo",
+			Listeners: []*ast.OnDecl{{
+				EventName: "ProjectDeleted",
+				Params:    []string{"ev"},
+				Body:      &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: &ast.Literal{Kind: token.Int, Value: "1"}}}},
+			}},
+			Models: []*ast.ModelDecl{{Name: "Trace", Fields: []*ast.FieldDecl{
+				{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			}}},
+		}},
+	}
+
+	src := generateEventFile(result, "luxo")
+	if src == nil {
+		t.Fatal("should generate event file for cross-module listener")
+	}
+	code := string(src)
+
+	if !strings.Contains(code, `common_luxo "github.com/test/service/common/luxo"`) {
+		t.Errorf("should import common_luxo:\n%s", code)
+	}
+	if !strings.Contains(code, "common_luxo.ProjectDeletedEvent") {
+		t.Errorf("should use cross-module event type:\n%s", code)
+	}
+	if !strings.Contains(code, "common_luxo.UnmarshalProjectDeleted") {
+		t.Errorf("should use cross-module unmarshal:\n%s", code)
+	}
+}

@@ -2512,3 +2512,46 @@ func TestScanBodyForBuiltins(t *testing.T) {
 		t.Error("nil body should not set flags")
 	}
 }
+
+func TestScanBodyForBuiltinsEmit(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+
+	globalEventCtx = &EventContext{
+		EventModule: map[string]string{"ProjectDeleted": "common"},
+		ModulePath:  "github.com/test/service",
+	}
+
+	body := &ast.Block{Stmts: []ast.Stmt{
+		&ast.EmitStmt{EventName: "ProjectDeleted"},
+	}}
+	var f handlerFeatures
+	scanBodyForBuiltins(body, &f, "project")
+	if !f.hasEmit {
+		t.Error("should detect emit")
+	}
+	if f.crossEventImports["common"] != "common_luxo" {
+		t.Errorf("should have cross-module import, got %v", f.crossEventImports)
+	}
+}
+
+func TestScanBodyForBuiltinsLocalEmit(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+
+	globalEventCtx = &EventContext{
+		EventModule: map[string]string{"TraceIngested": "monitoring"},
+	}
+
+	body := &ast.Block{Stmts: []ast.Stmt{
+		&ast.EmitStmt{EventName: "TraceIngested"},
+	}}
+	var f handlerFeatures
+	scanBodyForBuiltins(body, &f, "monitoring")
+	if !f.hasEmit {
+		t.Error("should detect emit")
+	}
+	if len(f.crossEventImports) != 0 {
+		t.Error("local emit should not generate cross-module import")
+	}
+}

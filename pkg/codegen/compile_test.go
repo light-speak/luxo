@@ -7209,3 +7209,46 @@ func TestCompileObjectWithoutTypeName(t *testing.T) {
 		t.Errorf("should infer TypeName from api return: got %q", got)
 	}
 }
+
+func TestIsModelQueryInstanceMethod(t *testing.T) {
+	models := makeModels("Project")
+	c := newCompiler(models)
+	c.vars["project"] = valType{isModel: true, name: "Project"}
+
+	// instance delete
+	del := &ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "project"}, Field: "delete"}}
+	if !c.isModelQuery(del) {
+		t.Error("project.delete() should be model query")
+	}
+
+	// instance update
+	upd := &ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "project"}, Field: "update"}}
+	if !c.isModelQuery(upd) {
+		t.Error("project.update() should be model query")
+	}
+
+	// non-model variable
+	c.vars["str"] = valType{name: "String"}
+	nonModel := &ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "str"}, Field: "delete"}}
+	if c.isModelQuery(nonModel) {
+		t.Error("str.delete() should not be model query")
+	}
+}
+
+func TestResolveQueryTypeInstanceMethod(t *testing.T) {
+	models := makeModels("Project")
+	c := newCompiler(models)
+	c.vars["project"] = valType{isModel: true, name: "Project"}
+
+	del := &ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "project"}, Field: "delete"}}
+	vt := c.resolveQueryType(del)
+	if vt.name != "Int" {
+		t.Errorf("project.delete() type = %q, want Int", vt.name)
+	}
+
+	upd := &ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "project"}, Field: "update"}}
+	vt2 := c.resolveQueryType(upd)
+	if vt2.name != "Int" {
+		t.Errorf("project.update() type = %q, want Int", vt2.name)
+	}
+}
