@@ -959,3 +959,18 @@ func TestSearchField_CustomBuilder(t *testing.T) {
 		t.Errorf("custom builder = %s", sql)
 	}
 }
+
+func TestTimeFieldLtGt(t *testing.T) {
+	f := NewTimeField("created_at")
+	now := time.Now()
+	lt := f.Lt(now)
+	gt := f.Gt(now)
+	sqlLt, _ := lt.ToSQL(1)
+	sqlGt, _ := gt.ToSQL(1)
+	if sqlLt != "created_at < $1" {
+		t.Errorf("Lt: %s", sqlLt)
+	}
+	if sqlGt != "created_at > $1" {
+		t.Errorf("Gt: %s", sqlGt)
+	}
+}

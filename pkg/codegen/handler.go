@@ -3,6 +3,7 @@ package codegen
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/ast"
@@ -16,14 +17,16 @@ var crudOps = []string{"get", "list", "create", "update", "delete", "deleteMany"
 
 // handlerFeatures holds feature detection flags for handler imports.
 type handlerFeatures struct {
-	hasOrGroups    bool
-	hasSortable    bool
-	hasAwait       bool
-	hasTransaction bool
-	hasTemplateStr bool
-	hasAuth        bool
-	hasCrypto      bool
-	hasTimeFunc    bool
+	hasOrGroups       bool
+	hasSortable       bool
+	hasAwait          bool
+	hasTransaction    bool
+	hasTemplateStr    bool
+	hasAuth           bool
+	hasCrypto         bool
+	hasTimeFunc       bool
+	hasEmit           bool
+	crossEventImports map[string]string // module → alias for cross-module emit
 }
 
 // detectHandlerFeatures scans models and APIs to determine which imports are needed.
@@ -71,13 +74,17 @@ func detectHandlerFeatures(result *semantic.Result, models []*ast.ModelDecl, inf
 
 	f.hasAuth = detectAuthNeeded(result, models)
 
-	// Scan compiled API bodies for crypto and time function usage
+	// Scan compiled API bodies for crypto, time, and cross-module emit usage
+	curModule := ""
+	if len(result.Files) > 0 {
+		curModule = moduleNameFromFile(result.Files[0].Name)
+	}
 	for _, file := range result.Files {
 		for _, api := range file.APIs {
 			if api.Body == nil {
 				continue
 			}
-			scanBodyForBuiltins(api.Body, &f)
+			scanBodyForBuiltins(api.Body, &f, curModule)
 		}
 	}
 
@@ -216,7 +223,7 @@ func generateCompiledHandlers(b *strings.Builder, result *semantic.Result, model
 	var names []string
 	for _, file := range result.Files {
 		for _, api := range file.APIs {
-			if api.Body != nil && !hasDirective(api.Directives, "native") {
+			if api.Body != nil && !hasDirective(api.Directives, "native") && !hasDirective(api.Directives, "stream") {
 				compileAPIBody(b, api, modelMap, enumSet)
 				names = append(names, api.Name)
 			}
@@ -332,6 +339,37 @@ func writeFKEnsure(b *strings.Builder, rels []Relation) {
 }
 
 // writeHandlerImports writes handler.gen.go imports.
+// writeSortedCrossModuleImports writes cross-module event imports in deterministic order.
+func writeSortedCrossModuleImports(b *strings.Builder, imports map[string]string) {
+	if globalEventCtx == nil || len(imports) == 0 {
+		return
+	}
+	modNames := make([]string, 0, len(imports))
+	for modName := range imports {
+		modNames = append(modNames, modName)
+	}
+	sort.Strings(modNames)
+	for _, modName := range modNames {
+		fmt.Fprintf(b, "\t%s \"%s/%s/luxo\"\n", imports[modName], globalEventCtx.ModulePath, modName)
+	}
+}
+
+// needsFmtImport checks if fmt package is needed (emit + CRUD create/update validation).
+func needsFmtImport(models []*ast.ModelDecl, hasEmit bool) bool {
+	if hasEmit {
+		return true
+	}
+	for _, m := range models {
+		ops := crudOperations(m)
+		for _, op := range ops {
+			if op == "create" || op == "update" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*ast.ModelDecl, feat handlerFeatures) {
 	hasOrGroups := feat.hasOrGroups
 	hasSortable := feat.hasSortable
@@ -343,10 +381,12 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 	hasTime := scanForTimeImport(result, models)
 	needsJSON := scanModelsForJSON(models)
 	hasValidation, hasPattern := scanModelsForValidation(models)
-
+	needsFmt := needsFmtImport(models, feat.hasEmit)
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
-	b.WriteString("\t\"fmt\"\n")
+	if needsFmt {
+		b.WriteString("\t\"fmt\"\n")
+	}
 	if hasOrGroups || hasTemplateStr {
 		b.WriteString("\t\"strconv\"\n")
 	}
@@ -376,6 +416,7 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
+	writeSortedCrossModuleImports(b, feat.crossEventImports)
 	if hasAwait {
 		b.WriteString("\t\"golang.org/x/sync/errgroup\"\n")
 	}
@@ -1756,17 +1797,17 @@ func generateAggregateFields(b *strings.Builder, m *ast.ModelDecl, resultVar, in
 }
 
 // scanBodyForBuiltins walks AST to find crypto.*, now(), duration property usage.
-func scanBodyForBuiltins(block *ast.Block, f *handlerFeatures) {
+func scanBodyForBuiltins(block *ast.Block, f *handlerFeatures, currentModule ...string) {
 	if block == nil {
 		return
 	}
+	// Scan expressions
 	ast.WalkExprs(block, func(e ast.Expr) {
 		switch v := e.(type) {
 		case *ast.MemberExpr:
 			if ident, ok := v.Object.(*ast.Ident); ok && ident.Name == "crypto" {
 				f.hasCrypto = true
 			}
-			// Duration properties → need time import
 			switch v.Field {
 			case "days", "hours", "minutes", "seconds", "milliseconds":
 				f.hasTimeFunc = true
@@ -1777,4 +1818,53 @@ func scanBodyForBuiltins(block *ast.Block, f *handlerFeatures) {
 			}
 		}
 	})
+	// Scan statements for emit (recursive into nested blocks)
+	curMod := ""
+	if len(currentModule) > 0 {
+		curMod = currentModule[0]
+	}
+	scanStmtsForEmit(block.Stmts, f, curMod)
+}
+
+// scanStmtsForEmit recursively walks statements to find EmitStmt in nested blocks.
+func scanStmtsForEmit(stmts []ast.Stmt, f *handlerFeatures, curMod string) {
+	for _, stmt := range stmts {
+		switch s := stmt.(type) {
+		case *ast.EmitStmt:
+			f.hasEmit = true
+			if globalEventCtx != nil {
+				evModule := globalEventCtx.EventModule[s.EventName]
+				if evModule != "" && evModule != curMod {
+					if f.crossEventImports == nil {
+						f.crossEventImports = make(map[string]string)
+					}
+					f.crossEventImports[evModule] = evModule + "_luxo"
+				}
+			}
+		case *ast.IfStmt:
+			if s.Then != nil {
+				scanStmtsForEmit(s.Then.Stmts, f, curMod)
+			}
+		case *ast.ForStmt:
+			if s.Body != nil {
+				scanStmtsForEmit(s.Body.Stmts, f, curMod)
+			}
+		case *ast.ExprStmt:
+			// Transaction/Async/Await expressions contain nested blocks
+			switch expr := s.Expr.(type) {
+			case *ast.TransactionExpr:
+				if expr.Body != nil {
+					scanStmtsForEmit(expr.Body.Stmts, f, curMod)
+				}
+			case *ast.AsyncExpr:
+				if expr.Body != nil {
+					scanStmtsForEmit(expr.Body.Stmts, f, curMod)
+				}
+			case *ast.AwaitExpr:
+				if expr.Body != nil {
+					scanStmtsForEmit(expr.Body.Stmts, f, curMod)
+				}
+			}
+		}
+	}
 }

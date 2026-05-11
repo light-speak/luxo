@@ -1170,6 +1170,64 @@ func TestCompileStmtEmit(t *testing.T) {
 	}
 }
 
+func TestCompileStmtEmitCrossModule(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+
+	globalEventCtx = &EventContext{
+		EventModule: map[string]string{"ProjectDeleted": "common"},
+		ModulePath:  "github.com/test/service",
+	}
+
+	c := newCompiler(nil)
+	// Set api.Pos.File to simulate a module file path
+	c.api = &ast.ApiDecl{
+		Name: "purgeData",
+		Pos:  token.Position{File: "origin/monitoring/trace.luxo"},
+	}
+	c.compileStmt(&ast.EmitStmt{
+		EventName: "ProjectDeleted",
+		Args:      []*ast.NamedArg{{Name: "projectId", Value: &ast.Ident{Name: "pid"}}},
+	})
+	out := compilerOut(c)
+
+	// Cross-module emit should have prefix
+	if !strings.Contains(out, "common_luxo.EmitProjectDeleted") {
+		t.Fatalf("expected cross-module prefix, got:\n%s", out)
+	}
+	if !strings.Contains(out, "common_luxo.ProjectDeletedEvent{") {
+		t.Fatalf("expected cross-module event type, got:\n%s", out)
+	}
+}
+
+func TestCompileStmtEmitSameModule(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+
+	globalEventCtx = &EventContext{
+		EventModule: map[string]string{"TraceIngested": "monitoring"},
+		ModulePath:  "github.com/test/service",
+	}
+
+	c := newCompiler(nil)
+	c.api = &ast.ApiDecl{
+		Name: "ingest",
+		Pos:  token.Position{File: "origin/monitoring/trace.luxo"},
+	}
+	c.compileStmt(&ast.EmitStmt{
+		EventName: "TraceIngested",
+	})
+	out := compilerOut(c)
+
+	// Same-module emit should NOT have prefix
+	if strings.Contains(out, "monitoring_luxo.") {
+		t.Fatalf("same-module should not have prefix, got:\n%s", out)
+	}
+	if !strings.Contains(out, "EmitTraceIngested") {
+		t.Fatalf("expected EmitTraceIngested, got:\n%s", out)
+	}
+}
+
 func TestCompileStmtEmitNoArgs(t *testing.T) {
 	c := newCompiler(nil)
 	c.compileStmt(&ast.EmitStmt{
@@ -3674,8 +3732,8 @@ func TestCompileSearchAPI(t *testing.T) {
 	if !strings.Contains(out, `.OrderBy("views DESC")`) {
 		t.Fatalf("missing OrderBy DESC, got:\n%s", out)
 	}
-	if !strings.Contains(out, ".Limit(limit)") {
-		t.Fatalf("missing .Limit(limit), got:\n%s", out)
+	if !strings.Contains(out, ".Limit(int(limit))") {
+		t.Fatalf("missing .Limit(int(limit)), got:\n%s", out)
 	}
 	if !strings.Contains(out, ".All(ctx)") {
 		t.Fatalf("missing .All(ctx), got:\n%s", out)
@@ -7207,5 +7265,48 @@ func TestCompileObjectWithoutTypeName(t *testing.T) {
 	// Should infer type from api return type
 	if !strings.Contains(got, "MyResult{") {
 		t.Errorf("should infer TypeName from api return: got %q", got)
+	}
+}
+
+func TestIsModelQueryInstanceMethod(t *testing.T) {
+	models := makeModels("Project")
+	c := newCompiler(models)
+	c.vars["project"] = valType{isModel: true, name: "Project"}
+
+	// instance delete
+	del := &ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "project"}, Field: "delete"}}
+	if !c.isModelQuery(del) {
+		t.Error("project.delete() should be model query")
+	}
+
+	// instance update
+	upd := &ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "project"}, Field: "update"}}
+	if !c.isModelQuery(upd) {
+		t.Error("project.update() should be model query")
+	}
+
+	// non-model variable
+	c.vars["str"] = valType{name: "String"}
+	nonModel := &ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "str"}, Field: "delete"}}
+	if c.isModelQuery(nonModel) {
+		t.Error("str.delete() should not be model query")
+	}
+}
+
+func TestResolveQueryTypeInstanceMethod(t *testing.T) {
+	models := makeModels("Project")
+	c := newCompiler(models)
+	c.vars["project"] = valType{isModel: true, name: "Project"}
+
+	del := &ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "project"}, Field: "delete"}}
+	vt := c.resolveQueryType(del)
+	if vt.name != "Int" {
+		t.Errorf("project.delete() type = %q, want Int", vt.name)
+	}
+
+	upd := &ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "project"}, Field: "update"}}
+	vt2 := c.resolveQueryType(upd)
+	if vt2.name != "Int" {
+		t.Errorf("project.update() type = %q, want Int", vt2.name)
 	}
 }

@@ -135,6 +135,38 @@ func getEventFieldID(eventName, paramName string) int {
 }
 
 // Generate produces Go source files from semantic analysis result.
+// EventContext holds cross-module event information for codegen.
+// Built once from all modules, passed to each module's Generate call.
+type EventContext struct {
+	// EventModule maps event name → defining module name
+	EventModule map[string]string
+	// ModulePath is the Go module import path prefix (e.g., "github.com/luxo-studio/service")
+	ModulePath string
+}
+
+// BuildEventContext scans all files to build the event → module mapping.
+func BuildEventContext(allFiles []*ast.File, modulePath string) *EventContext {
+	ctx := &EventContext{
+		EventModule: make(map[string]string),
+		ModulePath:  modulePath,
+	}
+	for _, file := range allFiles {
+		modName := moduleNameFromFile(file.Name)
+		for _, ev := range file.Events {
+			ctx.EventModule[ev.Name] = modName
+		}
+	}
+	return ctx
+}
+
+// Global event context — set before Generate calls for cross-module event support
+var globalEventCtx *EventContext
+
+// SetEventContext sets the global event context for cross-module event codegen.
+func SetEventContext(ctx *EventContext) {
+	globalEventCtx = ctx
+}
+
 func Generate(result *semantic.Result, packageName string, driver DBDriver, softModels ...map[string]bool) *GenerateResult {
 	dbPkg = driver.DriverPkg()
 	gr := &GenerateResult{
@@ -406,20 +438,84 @@ func scanDBFieldImports(f *ast.FieldDecl, needs *dbImportNeeds) {
 
 // generateAppFile produces app.gen.go containing the App struct that wires all Clients.
 // Returns nil if there are no models.
-func generateAppFile(result *semantic.Result, packageName string, enums map[string]bool, driver DBDriver) []byte {
-	modelSet := make(map[string]bool)
-	var models []string
+func appNeedsGeneration(result *semantic.Result) (models []string, modelSet map[string]bool, needed bool) {
+	modelSet = make(map[string]bool)
 	for _, file := range result.Files {
 		for _, m := range file.Models {
 			models = append(models, m.Name)
 			modelSet[m.Name] = true
 		}
 	}
-	if len(models) == 0 {
+	if len(models) > 0 {
+		return models, modelSet, true
+	}
+	for _, file := range result.Files {
+		for _, api := range file.APIs {
+			if hasDirective(api.Directives, "native") {
+				return models, modelSet, true
+			}
+		}
+		if len(file.Events) > 0 {
+			return models, modelSet, true
+		}
+	}
+	return models, modelSet, false
+}
+
+func appNeedsEvents(result *semantic.Result) bool {
+	for _, file := range result.Files {
+		if len(file.Events) > 0 || len(file.Listeners) > 0 {
+			return true
+		}
+		for _, api := range file.APIs {
+			if api.Body != nil && stmtsContainEmit(api.Body.Stmts) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// stmtsContainEmit recursively checks whether any EmitStmt exists in nested blocks.
+func stmtsContainEmit(stmts []ast.Stmt) bool {
+	for _, stmt := range stmts {
+		switch s := stmt.(type) {
+		case *ast.EmitStmt:
+			return true
+		case *ast.IfStmt:
+			if s.Then != nil && stmtsContainEmit(s.Then.Stmts) {
+				return true
+			}
+		case *ast.ForStmt:
+			if s.Body != nil && stmtsContainEmit(s.Body.Stmts) {
+				return true
+			}
+		case *ast.ExprStmt:
+			switch expr := s.Expr.(type) {
+			case *ast.TransactionExpr:
+				if expr.Body != nil && stmtsContainEmit(expr.Body.Stmts) {
+					return true
+				}
+			case *ast.AsyncExpr:
+				if expr.Body != nil && stmtsContainEmit(expr.Body.Stmts) {
+					return true
+				}
+			case *ast.AwaitExpr:
+				if expr.Body != nil && stmtsContainEmit(expr.Body.Stmts) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func generateAppFile(result *semantic.Result, packageName string, enums map[string]bool, driver DBDriver) []byte {
+	models, _, needed := appNeedsGeneration(result)
+	if !needed {
 		return nil
 	}
 
-	// Check if any model has relations or extend DataLoaders (needs loaders field)
 	hasRelations := false
 	for _, file := range result.Files {
 		for _, m := range file.Models {
@@ -433,14 +529,7 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 		}
 	}
 
-	// Check if any file has events (needs EventBus field)
-	hasEvents := false
-	for _, file := range result.Files {
-		if len(file.Events) > 0 {
-			hasEvents = true
-			break
-		}
-	}
+	hasEvents := appNeedsEvents(result)
 
 	var b strings.Builder
 	writeHeader(&b, packageName, "app.gen.go")

@@ -155,6 +155,8 @@ func (f TimeField) Eq(v time.Time) Condition     { return &cmpCond{col: f.col, o
 func (f TimeField) Neq(v time.Time) Condition    { return &cmpCond{col: f.col, op: "!=", val: v} }
 func (f TimeField) Before(v time.Time) Condition { return &cmpCond{col: f.col, op: "<", val: v} }
 func (f TimeField) After(v time.Time) Condition  { return &cmpCond{col: f.col, op: ">", val: v} }
+func (f TimeField) Lt(v time.Time) Condition     { return f.Before(v) }
+func (f TimeField) Gt(v time.Time) Condition     { return f.After(v) }
 func (f TimeField) Gte(v time.Time) Condition    { return &cmpCond{col: f.col, op: ">=", val: v} }
 func (f TimeField) Lte(v time.Time) Condition    { return &cmpCond{col: f.col, op: "<=", val: v} }
 func (f TimeField) IsNull() Condition            { return &nullCond{col: f.col, isNull: true} }

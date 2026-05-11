@@ -476,19 +476,29 @@ func isBoolExpr(expr ast.Expr) bool {
 	return false
 }
 
-// compileEmit: emit EventName(args)
+// compileEmit: emit EventName(args) — handles cross-module events
 func (c *compiler) compileEmit(s *ast.EmitStmt) {
 	var args []string
 	for _, a := range s.Args {
 		args = append(args, fmt.Sprintf("%s: %s", str.Capitalize(a.Name), c.compileExpr(a.Value)))
 	}
+
+	// Check if event is cross-module
+	prefix := ""
+	if globalEventCtx != nil && c.api != nil {
+		currentMod := moduleNameFromFile(c.api.Pos.File)
+		evModule := globalEventCtx.EventModule[s.EventName]
+		if evModule != "" && evModule != currentMod {
+			prefix = evModule + "_luxo."
+		}
+	}
+
 	if c.inAsync {
-		// Inside async goroutine — ignore emit error (cannot return)
-		c.write("Emit%s(ctx, app.EventBus, %sEvent{%s})",
-			s.EventName, s.EventName, strings.Join(args, ", "))
+		c.write("%sEmit%s(ctx, app.EventBus, %s%sEvent{%s})",
+			prefix, s.EventName, prefix, s.EventName, strings.Join(args, ", "))
 	} else {
-		c.write("if err := Emit%s(ctx, app.EventBus, %sEvent{%s}); err != nil {",
-			s.EventName, s.EventName, strings.Join(args, ", "))
+		c.write("if err := %sEmit%s(ctx, app.EventBus, %s%sEvent{%s}); err != nil {",
+			prefix, s.EventName, prefix, s.EventName, strings.Join(args, ", "))
 		c.write("\treturn err")
 		c.write("}")
 	}
@@ -836,6 +846,10 @@ func (c *compiler) compileModifierMethod(b *strings.Builder, modelName string, l
 	case "limit", "offset":
 		if len(link.args) > 0 {
 			val := c.compileExpr(link.args[0].Value)
+			// Cast to int if the value is a variable (int64 from ParamInt)
+			if _, isLit := link.args[0].Value.(*ast.Literal); !isLit {
+				val = "int(" + val + ")"
+			}
 			fmt.Fprintf(b, ".%s(%s)", str.Capitalize(link.method), val)
 		}
 	case "groupBy":
@@ -1011,10 +1025,15 @@ func (c *compiler) compileCreateLink(b *strings.Builder, modelName string, link 
 		if m != nil {
 			for _, f := range m.Fields {
 				if f.Name == arg.Name && f.Type != nil && f.Type.Nullable {
-					alreadyPtr := false
-					if ident, ok := arg.Value.(*ast.Ident); ok {
-						if vt, ok := c.vars[ident.Name]; ok && vt.nullable {
-							alreadyPtr = true
+					// Check if value expression is already a pointer (nullable)
+					// Uses NullableTag from semantic analyzer — zero guessing
+					alreadyPtr := arg.Value.IsNullable()
+					if !alreadyPtr {
+						// Also check vars map for API params
+						if ident, ok := arg.Value.(*ast.Ident); ok {
+							if vt, ok := c.vars[ident.Name]; ok && vt.nullable {
+								alreadyPtr = true
+							}
 						}
 					}
 					if !alreadyPtr {
@@ -1225,6 +1244,20 @@ func (c *compiler) compileThrowExpr(expr ast.Expr) string {
 
 // resolveQueryType determines the return type of a model query chain.
 func (c *compiler) resolveQueryType(expr ast.Expr) valType {
+	// Instance method: variable.update() → Int (rows affected), variable.delete() → Int
+	if call, ok := expr.(*ast.CallExpr); ok {
+		if member, ok := call.Func.(*ast.MemberExpr); ok {
+			if ident, ok := member.Object.(*ast.Ident); ok {
+				if vt, ok := c.vars[ident.Name]; ok && vt.isModel && !vt.isList {
+					switch member.Field {
+					case "update", "delete":
+						return valType{name: "Int"}
+					}
+				}
+			}
+		}
+	}
+
 	chain := flattenChain(expr)
 	if len(chain) < 2 {
 		return valType{}
@@ -1275,6 +1308,20 @@ func (c *compiler) resolveQueryType(expr ast.Expr) valType {
 
 // isModelQuery checks if an expression is a Model query chain (returns (*T, error)).
 func (c *compiler) isModelQuery(expr ast.Expr) bool {
+	// Instance method: variable.delete(), variable.update(...)
+	if call, ok := expr.(*ast.CallExpr); ok {
+		if member, ok := call.Func.(*ast.MemberExpr); ok {
+			if ident, ok := member.Object.(*ast.Ident); ok {
+				if vt, ok := c.vars[ident.Name]; ok && vt.isModel && !vt.isList {
+					switch member.Field {
+					case "delete", "update":
+						return true
+					}
+				}
+			}
+		}
+	}
+
 	chain := flattenChain(expr)
 	if len(chain) < 2 {
 		return false

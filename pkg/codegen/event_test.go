@@ -54,7 +54,7 @@ func TestGenerateEventFile(t *testing.T) {
 		"func EmitOrderCreated(ctx context.Context, bus event.Bus, e OrderCreatedEvent) error",
 		`bus.Emit(ctx, "OrderCreated", e)`,
 		"func RegisterEvents(bus event.Bus, app *App)",
-		`event.OnQueueDecode(bus, "OrderCreated", "luxo", unmarshalOrderCreated, func(ctx context.Context, e OrderCreatedEvent)`,
+		`event.OnQueueDecode(bus, "OrderCreated", "luxo", UnmarshalOrderCreated, func(ctx context.Context, e OrderCreatedEvent)`,
 	}
 	for _, check := range checks {
 		if !strings.Contains(code, check) {
@@ -358,5 +358,120 @@ func TestGenerateEventFileOnBody(t *testing.T) {
 	}
 	if strings.Contains(code, "_ = ev") {
 		t.Errorf("on body should be compiled, not empty: %s", code)
+	}
+}
+
+func TestCollectCrossModuleEventImports(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+
+	globalEventCtx = &EventContext{
+		EventModule: map[string]string{"ProjectDeleted": "common"},
+		ModulePath:  "github.com/test/service",
+	}
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name:      "origin/monitoring/trace.luxo",
+			Listeners: []*ast.OnDecl{{EventName: "ProjectDeleted"}},
+			APIs: []*ast.ApiDecl{{
+				Name: "deleteProject",
+				Body: &ast.Block{Stmts: []ast.Stmt{
+					&ast.EmitStmt{EventName: "ProjectDeleted"},
+				}},
+			}},
+		}},
+	}
+	listeners := result.Files[0].Listeners
+
+	imports := collectCrossModuleEventImports(result, listeners, "monitoring")
+	if imports["common"] != "common_luxo" {
+		t.Errorf("expected common_luxo import, got %v", imports)
+	}
+}
+
+func TestCollectCrossModuleEventImports_NoContext(t *testing.T) {
+	old := globalEventCtx
+	globalEventCtx = nil
+	defer func() { globalEventCtx = old }()
+
+	imports := collectCrossModuleEventImports(&semantic.Result{}, nil, "test")
+	if len(imports) != 0 {
+		t.Error("should return empty without context")
+	}
+}
+
+func TestGenerateEventFileCrossModule(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+
+	globalEventCtx = &EventContext{
+		EventModule: map[string]string{"ProjectDeleted": "common"},
+		ModulePath:  "github.com/test/service",
+	}
+
+	// Module with listener for cross-module event (no local events)
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/monitoring/trace.luxo",
+			Listeners: []*ast.OnDecl{{
+				EventName: "ProjectDeleted",
+				Params:    []string{"ev"},
+				Body:      &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: &ast.Literal{Kind: token.Int, Value: "1"}}}},
+			}},
+			Models: []*ast.ModelDecl{{Name: "Trace", Fields: []*ast.FieldDecl{
+				{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			}}},
+		}},
+	}
+
+	src := generateEventFile(result, "luxo")
+	if src == nil {
+		t.Fatal("should generate event file for cross-module listener")
+	}
+	code := string(src)
+
+	if !strings.Contains(code, `common_luxo "github.com/test/service/common/luxo"`) {
+		t.Errorf("should import common_luxo:\n%s", code)
+	}
+	if !strings.Contains(code, "common_luxo.ProjectDeletedEvent") {
+		t.Errorf("should use cross-module event type:\n%s", code)
+	}
+	if !strings.Contains(code, "common_luxo.UnmarshalProjectDeleted") {
+		t.Errorf("should use cross-module unmarshal:\n%s", code)
+	}
+}
+
+func TestGenerateEventFileNeedsTime(t *testing.T) {
+	// Listener body uses now() → should import "time"
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Events: []*ast.EventDecl{
+				{Name: "SessionExpired"},
+			},
+			Listeners: []*ast.OnDecl{
+				{
+					EventName: "SessionExpired",
+					Params:    []string{"ev"},
+					Body: &ast.Block{Stmts: []ast.Stmt{
+						&ast.ValStmt{
+							Name:  "t",
+							Value: &ast.CallExpr{Func: &ast.Ident{Name: "now"}},
+						},
+					}},
+				},
+			},
+		}},
+	}
+
+	src := generateEventFile(result, "auth")
+	if src == nil {
+		t.Fatal("should generate event file")
+	}
+	code := string(src)
+
+	if !strings.Contains(code, `"time"`) {
+		t.Errorf("listener with now() should import time:\n%s", code)
 	}
 }

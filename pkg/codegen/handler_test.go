@@ -2512,3 +2512,189 @@ func TestScanBodyForBuiltins(t *testing.T) {
 		t.Error("nil body should not set flags")
 	}
 }
+
+func TestScanBodyForBuiltinsEmit(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+
+	globalEventCtx = &EventContext{
+		EventModule: map[string]string{"ProjectDeleted": "common"},
+		ModulePath:  "github.com/test/service",
+	}
+
+	body := &ast.Block{Stmts: []ast.Stmt{
+		&ast.EmitStmt{EventName: "ProjectDeleted"},
+	}}
+	var f handlerFeatures
+	scanBodyForBuiltins(body, &f, "project")
+	if !f.hasEmit {
+		t.Error("should detect emit")
+	}
+	if f.crossEventImports["common"] != "common_luxo" {
+		t.Errorf("should have cross-module import, got %v", f.crossEventImports)
+	}
+}
+
+func TestScanBodyForBuiltinsNestedEmit(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+
+	globalEventCtx = &EventContext{
+		EventModule: map[string]string{"ProjectDeleted": "common"},
+		ModulePath:  "github.com/test/service",
+	}
+
+	// Emit inside IfStmt
+	body := &ast.Block{Stmts: []ast.Stmt{
+		&ast.IfStmt{
+			Condition: &ast.Literal{Kind: token.Int, Value: "1"},
+			Then: &ast.Block{Stmts: []ast.Stmt{
+				&ast.EmitStmt{EventName: "ProjectDeleted"},
+			}},
+		},
+	}}
+	var f handlerFeatures
+	scanBodyForBuiltins(body, &f, "project")
+	if !f.hasEmit {
+		t.Error("should detect emit inside if")
+	}
+	if f.crossEventImports["common"] != "common_luxo" {
+		t.Error("should detect cross-module import from nested emit")
+	}
+
+	// Emit inside ForStmt
+	body2 := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ForStmt{
+			VarName:    "item",
+			Collection: &ast.Ident{Name: "items"},
+			Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.EmitStmt{EventName: "ProjectDeleted"},
+			}},
+		},
+	}}
+	var f2 handlerFeatures
+	scanBodyForBuiltins(body2, &f2, "project")
+	if !f2.hasEmit {
+		t.Error("should detect emit inside for")
+	}
+
+	// Emit inside TransactionExpr
+	body3 := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.TransactionExpr{
+			Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.EmitStmt{EventName: "ProjectDeleted"},
+			}},
+		}},
+	}}
+	var f3 handlerFeatures
+	scanBodyForBuiltins(body3, &f3, "project")
+	if !f3.hasEmit {
+		t.Error("should detect emit inside transaction")
+	}
+
+	// Emit inside AsyncExpr
+	body4 := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.AsyncExpr{
+			Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.EmitStmt{EventName: "ProjectDeleted"},
+			}},
+		}},
+	}}
+	var f4 handlerFeatures
+	scanBodyForBuiltins(body4, &f4, "project")
+	if !f4.hasEmit {
+		t.Error("should detect emit inside async")
+	}
+
+	// Emit inside AwaitExpr
+	body5 := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.AwaitExpr{
+			Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.EmitStmt{EventName: "ProjectDeleted"},
+			}},
+		}},
+	}}
+	var f5 handlerFeatures
+	scanBodyForBuiltins(body5, &f5, "project")
+	if !f5.hasEmit {
+		t.Error("should detect emit inside await")
+	}
+}
+
+func TestScanBodyForBuiltinsLocalEmit(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+
+	globalEventCtx = &EventContext{
+		EventModule: map[string]string{"TraceIngested": "monitoring"},
+	}
+
+	body := &ast.Block{Stmts: []ast.Stmt{
+		&ast.EmitStmt{EventName: "TraceIngested"},
+	}}
+	var f handlerFeatures
+	scanBodyForBuiltins(body, &f, "monitoring")
+	if !f.hasEmit {
+		t.Error("should detect emit")
+	}
+	if len(f.crossEventImports) != 0 {
+		t.Error("local emit should not generate cross-module import")
+	}
+}
+
+func TestWriteSortedCrossModuleImports(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+
+	globalEventCtx = &EventContext{
+		ModulePath: "github.com/test/service",
+	}
+
+	var b strings.Builder
+	imports := map[string]string{
+		"common":     "common_luxo",
+		"monitoring": "monitoring_luxo",
+		"auth":       "auth_luxo",
+	}
+	writeSortedCrossModuleImports(&b, imports)
+	out := b.String()
+
+	// Should be sorted alphabetically: auth, common, monitoring
+	authIdx := strings.Index(out, "auth_luxo")
+	commonIdx := strings.Index(out, "common_luxo")
+	monitorIdx := strings.Index(out, "monitoring_luxo")
+	if authIdx < 0 || commonIdx < 0 || monitorIdx < 0 {
+		t.Fatalf("missing imports in:\n%s", out)
+	}
+	if !(authIdx < commonIdx && commonIdx < monitorIdx) {
+		t.Errorf("imports not sorted:\n%s", out)
+	}
+
+	// No context → no output
+	globalEventCtx = nil
+	var b2 strings.Builder
+	writeSortedCrossModuleImports(&b2, imports)
+	if b2.Len() != 0 {
+		t.Error("should produce nothing without event context")
+	}
+
+	// Empty imports → no output
+	globalEventCtx = &EventContext{ModulePath: "github.com/test/service"}
+	var b3 strings.Builder
+	writeSortedCrossModuleImports(&b3, nil)
+	if b3.Len() != 0 {
+		t.Error("should produce nothing with empty imports")
+	}
+}
+
+func TestNeedsFmtImport(t *testing.T) {
+	// With emit
+	if !needsFmtImport(nil, true) {
+		t.Error("emit should need fmt")
+	}
+
+	// No emit, no models
+	if needsFmtImport(nil, false) {
+		t.Error("should not need fmt without emit or create/update")
+	}
+}

@@ -7,6 +7,7 @@ import (
 
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/semantic"
+	"github.com/light-speak/luxo/pkg/token"
 )
 
 // buildResult creates a semantic.Result from manually constructed AST.
@@ -1037,5 +1038,198 @@ func TestExtendStubDedup(t *testing.T) {
 	code := string(src)
 	if strings.Count(code, "type Project struct") > 1 {
 		t.Error("Project struct should appear only once")
+	}
+}
+
+func TestBuildEventContext(t *testing.T) {
+	files := []*ast.File{
+		{Name: "origin/common/events.luxo", Events: []*ast.EventDecl{{Name: "ProjectDeleted"}}},
+		{Name: "origin/monitoring/trace.luxo", Events: []*ast.EventDecl{{Name: "TraceIngested"}}},
+	}
+	ctx := BuildEventContext(files, "github.com/test/service")
+	if ctx.EventModule["ProjectDeleted"] != "common" {
+		t.Errorf("ProjectDeleted module = %q", ctx.EventModule["ProjectDeleted"])
+	}
+	if ctx.EventModule["TraceIngested"] != "monitoring" {
+		t.Errorf("TraceIngested module = %q", ctx.EventModule["TraceIngested"])
+	}
+	if ctx.ModulePath != "github.com/test/service" {
+		t.Errorf("ModulePath = %q", ctx.ModulePath)
+	}
+}
+
+func TestSetEventContext(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+
+	ctx := &EventContext{EventModule: map[string]string{"Test": "test"}, ModulePath: "test"}
+	SetEventContext(ctx)
+	if globalEventCtx != ctx {
+		t.Error("SetEventContext should set global")
+	}
+}
+
+func TestAppNeedsGeneration(t *testing.T) {
+	// With models
+	r := &semantic.Result{Files: []*ast.File{{Models: []*ast.ModelDecl{{Name: "User"}}}}}
+	_, _, needed := appNeedsGeneration(r)
+	if !needed {
+		t.Error("should need generation with models")
+	}
+
+	// With native API
+	r2 := &semantic.Result{Files: []*ast.File{{APIs: []*ast.ApiDecl{{Name: "test", Directives: []*ast.Directive{{Name: "native"}}}}}}}
+	_, _, needed2 := appNeedsGeneration(r2)
+	if !needed2 {
+		t.Error("should need generation with native API")
+	}
+
+	// With events
+	r3 := &semantic.Result{Files: []*ast.File{{Events: []*ast.EventDecl{{Name: "Test"}}}}}
+	_, _, needed3 := appNeedsGeneration(r3)
+	if !needed3 {
+		t.Error("should need generation with events")
+	}
+
+	// Empty
+	r4 := &semantic.Result{Files: []*ast.File{{}}}
+	_, _, needed4 := appNeedsGeneration(r4)
+	if needed4 {
+		t.Error("should not need generation when empty")
+	}
+}
+
+func TestAppNeedsEvents(t *testing.T) {
+	// With events
+	r := &semantic.Result{Files: []*ast.File{{Events: []*ast.EventDecl{{Name: "Test"}}}}}
+	if !appNeedsEvents(r) {
+		t.Error("should need events with event declarations")
+	}
+
+	// With listeners
+	r2 := &semantic.Result{Files: []*ast.File{{Listeners: []*ast.OnDecl{{EventName: "Test"}}}}}
+	if !appNeedsEvents(r2) {
+		t.Error("should need events with listeners")
+	}
+
+	// With emit
+	r3 := &semantic.Result{Files: []*ast.File{{APIs: []*ast.ApiDecl{{
+		Name: "test",
+		Body: &ast.Block{Stmts: []ast.Stmt{&ast.EmitStmt{EventName: "Test"}}},
+	}}}}}
+	if !appNeedsEvents(r3) {
+		t.Error("should need events with emit statement")
+	}
+
+	// Nested emit inside if
+	r4 := &semantic.Result{Files: []*ast.File{{APIs: []*ast.ApiDecl{{
+		Name: "test",
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.IfStmt{
+				Condition: &ast.Literal{Kind: token.Int, Value: "1"},
+				Then: &ast.Block{Stmts: []ast.Stmt{
+					&ast.EmitStmt{EventName: "Test"},
+				}},
+			},
+		}},
+	}}}}}
+	if !appNeedsEvents(r4) {
+		t.Error("should detect emit nested inside if")
+	}
+
+	// Nested emit inside transaction
+	r5 := &semantic.Result{Files: []*ast.File{{APIs: []*ast.ApiDecl{{
+		Name: "test",
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.TransactionExpr{
+				Body: &ast.Block{Stmts: []ast.Stmt{
+					&ast.EmitStmt{EventName: "Test"},
+				}},
+			}},
+		}},
+	}}}}}
+	if !appNeedsEvents(r5) {
+		t.Error("should detect emit nested inside transaction")
+	}
+
+	// Nested emit inside for
+	r6 := &semantic.Result{Files: []*ast.File{{APIs: []*ast.ApiDecl{{
+		Name: "test",
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ForStmt{
+				VarName:    "item",
+				Collection: &ast.Ident{Name: "items"},
+				Body: &ast.Block{Stmts: []ast.Stmt{
+					&ast.EmitStmt{EventName: "Test"},
+				}},
+			},
+		}},
+	}}}}}
+	if !appNeedsEvents(r6) {
+		t.Error("should detect emit nested inside for")
+	}
+
+	// Nested emit inside async
+	r7 := &semantic.Result{Files: []*ast.File{{APIs: []*ast.ApiDecl{{
+		Name: "test",
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.AsyncExpr{
+				Body: &ast.Block{Stmts: []ast.Stmt{
+					&ast.EmitStmt{EventName: "Test"},
+				}},
+			}},
+		}},
+	}}}}}
+	if !appNeedsEvents(r7) {
+		t.Error("should detect emit nested inside async")
+	}
+
+	// Nested emit inside await
+	r8 := &semantic.Result{Files: []*ast.File{{APIs: []*ast.ApiDecl{{
+		Name: "test",
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.AwaitExpr{
+				Body: &ast.Block{Stmts: []ast.Stmt{
+					&ast.EmitStmt{EventName: "Test"},
+				}},
+			}},
+		}},
+	}}}}}
+	if !appNeedsEvents(r8) {
+		t.Error("should detect emit nested inside await")
+	}
+
+	// No emit (non-emit statements only)
+	r9 := &semantic.Result{Files: []*ast.File{{APIs: []*ast.ApiDecl{{
+		Name: "test",
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.IfStmt{
+				Condition: &ast.Literal{Kind: token.Int, Value: "1"},
+				Then:      &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{}}},
+			},
+			&ast.ForStmt{
+				VarName:    "x",
+				Collection: &ast.Ident{Name: "xs"},
+				Body:       &ast.Block{Stmts: []ast.Stmt{&ast.BreakStmt{}}},
+			},
+			&ast.ExprStmt{Expr: &ast.AsyncExpr{
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{}}},
+			}},
+			&ast.ExprStmt{Expr: &ast.AwaitExpr{
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{}}},
+			}},
+			&ast.ExprStmt{Expr: &ast.TransactionExpr{
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{}}},
+			}},
+		}},
+	}}}}}
+	if appNeedsEvents(r9) {
+		t.Error("should not need events without any emit")
+	}
+
+	// Empty
+	r10 := &semantic.Result{Files: []*ast.File{{}}}
+	if appNeedsEvents(r10) {
+		t.Error("should not need events when empty")
 	}
 }

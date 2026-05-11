@@ -3,6 +3,7 @@ package pg
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -741,5 +742,74 @@ func TestQueryGroupBy(t *testing.T) {
 				t.Errorf("Alice count = %d, want 2", cnt)
 			}
 		}
+	}
+}
+
+func TestQuerySumAvgMinMax(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	for _, age := range []int64{10, 20, 30} {
+		_, _ = InsertReturning(ctx, db, scanUser, "users",
+			[]string{"id", "name", "email", "age"},
+			[]any{uuid.Must(uuid.NewV7()), "u", fmt.Sprintf("u%d@t.com", age), age},
+		)
+	}
+
+	q := NewQuery[testUser](db, "users", scanUser, nil)
+
+	sum, err := q.Sum(ctx, "age")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum != 60 {
+		t.Errorf("Sum = %d, want 60", sum)
+	}
+
+	avg, err := q.Avg(ctx, "age")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if avg != 20 {
+		t.Errorf("Avg = %d, want 20", avg)
+	}
+
+	max, err := q.Max(ctx, "age")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if max != 30 {
+		t.Errorf("Max = %d, want 30", max)
+	}
+
+	min, err := q.Min(ctx, "age")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if min != 10 {
+		t.Errorf("Min = %d, want 10", min)
+	}
+}
+
+func TestQueryWhere(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	_, _ = InsertReturning(ctx, db, scanUser, "users",
+		[]string{"id", "name", "email", "age"},
+		[]any{uuid.Must(uuid.NewV7()), "alice", "a@t.com", int64(25)},
+	)
+	_, _ = InsertReturning(ctx, db, scanUser, "users",
+		[]string{"id", "name", "email", "age"},
+		[]any{uuid.Must(uuid.NewV7()), "bob", "b@t.com", int64(30)},
+	)
+
+	q := NewQuery[testUser](db, "users", scanUser, nil).Where(lux.NewStringField("name").Eq("alice"))
+	results, err := q.All(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Name != "alice" {
+		t.Errorf("Where filter failed: got %d results", len(results))
 	}
 }

@@ -218,16 +218,21 @@ type Expr interface {
 	GetPos() token.Position
 	GetTypeTag() string
 	SetTypeTag(string)
+	IsNullable() bool
+	SetNullable(bool)
 }
 
 // TypeTagged provides type tag storage for all Expr nodes via embedding.
 // Semantic analyzer writes the tag; codegen reads it. O(1) access, zero allocation.
 type TypeTagged struct {
-	TypeTag string
+	TypeTag     string
+	NullableTag bool
 }
 
 func (t *TypeTagged) GetTypeTag() string  { return t.TypeTag }
 func (t *TypeTagged) SetTypeTag(s string) { t.TypeTag = s }
+func (t *TypeTagged) IsNullable() bool    { return t.NullableTag }
+func (t *TypeTagged) SetNullable(v bool)  { t.NullableTag = v }
 
 // Literal: 42, 3.14, "hello", true, false, null, 7d
 type Literal struct {
