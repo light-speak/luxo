@@ -1,7 +1,7 @@
 import { parse } from '@babel/parser'
 import _traverse from '@babel/traverse'
 import * as t from '@babel/types'
-import type { LuxoSchema, LuxoModel } from '@luxo/client'
+import type { LuxoSchema, LuxoModel } from '@luxojs/client'
 
 // babel/traverse CJS/ESM interop
 const traverse = (_traverse as unknown as { default: typeof _traverse }).default ?? _traverse

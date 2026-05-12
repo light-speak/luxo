@@ -341,13 +341,13 @@ Same task in TypeScript? 150+ lines, 4 packages, no compile-time safety.
 - [x] `@luxo/react` — `useLuxoQuery` hook + `LuxoProvider`
 - [x] Dart SDK (`luxo_client` — HttpTransport + WsTransport + Luxo binary codec + build_runner field tracking)
 - [x] Kotlin SDK (`com.luxo.client` — OkHttp + coroutine + Luxo binary codec + Gradle field tracking)
-- [ ] Swift SDK (iOS)
+- [x] Swift SDK (`LuxoClient` — URLSession + async/await + Luxo binary codec + SwiftSyntax field tracking)
 
 ### Phase 5 — Production + Ecosystem
+- [x] Luxo Studio (monitoring dashboard · distributed tracing · API playground · schema browser · cluster management)
 - [ ] HTTP/3 (QUIC) support
 - [ ] MCP Server (AI reads/writes .luxo projects natively)
 - [ ] luxo-ai (natural language → .luxo → running API)
-- [ ] Luxo Studio (monitoring · tracing · API playground)
 - [ ] `luxo deploy helm` — Helm Chart generation
 
 ## Contributing

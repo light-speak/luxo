@@ -196,7 +196,7 @@ class LuxoDecoder(private val buf: ByteArray) {
 
     /** Read an array of items using a decoder lambda. */
     fun <T> readArray(decode: () -> T): List<T> {
-        val count = readVarint().toInt()
+        val count = readVarintRaw().toInt()
         return List(count) { decode() }
     }
 

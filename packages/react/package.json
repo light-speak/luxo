@@ -1,13 +1,44 @@
 {
-  "name": "@luxo/react",
-  "version": "0.1.0",
-  "description": "Luxo React hooks — useLuxoQuery with automatic field tracking",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
-  "files": ["src"],
+  "name": "@luxojs/react",
+  "version": "0.1.0-dev.3",
+  "description": "Luxo React hooks — useLuxoQuery / useLuxoMutation with compile-time field tracking",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
   "license": "Apache-2.0",
+  "keywords": ["luxo", "react", "hooks", "query", "mutation", "field-selection", "api"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/light-speak/luxo.git",
+    "directory": "packages/react"
+  },
+  "homepage": "https://github.com/light-speak/luxo",
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "pnpm build"
+  },
   "peerDependencies": {
-    "react": ">=18.0",
-    "@luxo/client": ">=0.1.0"
+    "@luxojs/client": ">=0.1.0-dev.1",
+    "react": ">=18.0"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.2",
+    "jsdom": "^26.1.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
+    "tsup": "^8.5.1",
+    "typescript": "^6.0.3",
+    "vitest": "^3.2.4"
   }
 }

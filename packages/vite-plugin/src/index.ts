@@ -1,7 +1,7 @@
 import type { Plugin } from 'vite'
 import { analyzeAndTransform } from './analyzer'
 import { generateTypes } from './codegen'
-import type { LuxoSchema } from '@luxo/client'
+import type { LuxoSchema } from '@luxojs/client'
 
 export interface LuxoPluginOptions {
   /** Luvia endpoint URL for schema introspection */

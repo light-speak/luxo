@@ -1,25 +1,43 @@
 {
-  "name": "@luxo/vite-plugin",
-  "version": "0.1.0",
-  "description": "Luxo Vite plugin — compile-time field tracking + auto $select injection",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "name": "@luxojs/vite-plugin",
+  "version": "0.1.0-dev.1",
+  "description": "Luxo Vite plugin — compile-time field tracking, auto $select injection, and typed client generation",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
   "files": [
-    "src"
+    "dist"
   ],
   "license": "Apache-2.0",
+  "keywords": ["luxo", "vite", "plugin", "codegen", "field-tracking", "select", "babel", "ast"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/light-speak/luxo.git",
+    "directory": "packages/vite-plugin"
+  },
+  "homepage": "https://github.com/light-speak/luxo",
   "scripts": {
+    "build": "tsup",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepublishOnly": "pnpm build"
   },
   "peerDependencies": {
     "typescript": ">=5.0",
     "vite": ">=5.0"
   },
-  "devDependencies": {
+  "dependencies": {
     "@babel/parser": "^7.29.3",
     "@babel/traverse": "^7.29.0",
-    "@babel/types": "^7.29.0",
+    "@babel/types": "^7.29.0"
+  },
+  "devDependencies": {
+    "tsup": "^8.5.1",
     "vitest": "^3.0.0"
   }
 }

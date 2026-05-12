@@ -14,6 +14,13 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    testImplementation(kotlin("test"))
+    testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
 
 // --- Luxo codegen tasks (for user projects) ---
@@ -21,34 +28,27 @@ dependencies {
 //   ./gradlew luxoGenerate -Pluxo.endpoint=http://localhost:4000/luvia -Pluxo.key=YOUR_KEY
 //   ./gradlew luxoAnalyze
 
-tasks.register("luxoGenerate") {
+tasks.register<JavaExec>("luxoGenerate") {
     group = "luxo"
     description = "Generate typed client from Luxo schema introspection"
-    doLast {
-        val endpoint = project.findProperty("luxo.endpoint")?.toString()
-            ?: error("Set -Pluxo.endpoint=http://...")
-        val key = project.findProperty("luxo.key")?.toString()
-            ?: error("Set -Pluxo.key=YOUR_KEY")
-        val outDir = project.findProperty("luxo.outDir")?.toString()
-            ?: "src/main/kotlin/com/luxo/generated"
-        val pkg = project.findProperty("luxo.package")?.toString()
-            ?: "com.luxo.generated"
-
-        com.luxo.client.Codegen.LuxoCodegen.generate(endpoint, key, outDir, pkg)
-    }
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.luxo.client.LuxoCodegenCli")
+    args(
+        project.findProperty("luxo.endpoint")?.toString() ?: "http://localhost:4000/luvia",
+        project.findProperty("luxo.key")?.toString() ?: "",
+        project.findProperty("luxo.outDir")?.toString() ?: "src/main/kotlin/com/luxo/generated",
+        project.findProperty("luxo.package")?.toString() ?: "com.luxo.generated",
+    )
 }
 
-tasks.register("luxoAnalyze") {
+tasks.register<JavaExec>("luxoAnalyze") {
     group = "luxo"
     description = "Analyze source code for field access patterns and generate SelectHints"
-    doLast {
-        val srcDir = project.findProperty("luxo.srcDir")?.toString()
-            ?: "src/main/kotlin"
-        val outFile = project.findProperty("luxo.hintsFile")?.toString()
-            ?: "src/main/kotlin/com/luxo/generated/SelectHints.kt"
-        val pkg = project.findProperty("luxo.package")?.toString()
-            ?: "com.luxo.generated"
-
-        com.luxo.client.ksp.SelectAnalyzer.analyze(srcDir, outFile, pkg)
-    }
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.luxo.client.SelectAnalyzerCli")
+    args(
+        project.findProperty("luxo.srcDir")?.toString() ?: "src/main/kotlin",
+        project.findProperty("luxo.hintsFile")?.toString() ?: "src/main/kotlin/com/luxo/generated/SelectHints.kt",
+        project.findProperty("luxo.package")?.toString() ?: "com.luxo.generated",
+    )
 }

@@ -2,7 +2,7 @@ import 'dart:async';
 import 'package:build/build.dart';
 import 'package:analyzer/dart/analysis/utilities.dart';
 import 'package:glob/glob.dart';
-import 'package:source_gen/source_gen.dart' show InvalidGenerationSourceError;
+// source_gen not needed — using build runner directly
 import 'select_analyzer.dart';
 
 /// Build runner builder that scans user code for LuxoClient API calls,
@@ -17,8 +17,8 @@ import 'select_analyzer.dart';
 ///         enabled: true
 /// ```
 class SelectHintsBuilder implements Builder {
-  /// Model field names from generated types (populated from schema)
-  final Map<String, Set<String>> modelFields;
+  /// Model field type map from generated types (populated from schema)
+  final Map<String, Map<String, String>> modelFields;
 
   SelectHintsBuilder(this.modelFields);
 
@@ -29,30 +29,25 @@ class SelectHintsBuilder implements Builder {
 
   @override
   Future<void> build(BuildStep buildStep) async {
-    final hints = <String, Set<String>>{};
+    final allHints = <String, FieldNode>{};
 
     // Scan all .dart files in lib/
     await for (final input in buildStep.findAssets(Glob('lib/**.dart'))) {
-      // Skip generated files
       if (input.path.endsWith('.g.dart')) continue;
-      if (input.path.contains('/luxo/')) continue; // skip generated luxo dir
+      if (input.path.contains('/luxo/')) continue;
 
       final content = await buildStep.readAsString(input);
-
-      // Parse with analyzer — resolve types if possible
       final result = parseString(content: content);
       final unit = result.unit;
 
       final analyzer = SelectAnalyzer(modelFields);
       unit.visitChildren(analyzer);
 
-      // Merge hints
       for (final entry in analyzer.hints.entries) {
-        hints.putIfAbsent(entry.key, () => {}).addAll(entry.value);
+        allHints[entry.key] = entry.value;
       }
     }
 
-    // Generate _select_hints.g.dart
     final output = AssetId(
       buildStep.inputId.package,
       'lib/src/luxo/_select_hints.g.dart',
@@ -64,10 +59,10 @@ class SelectHintsBuilder implements Builder {
     code.writeln('/// Field access hints — auto-detected from your code.');
     code.writeln('/// Used by LuxoClient to inject \$select for optimal queries.');
     code.writeln('const selectHints = <String, String>{');
-    for (final entry in hints.entries) {
-      if (entry.value.isEmpty) continue;
-      final fields = entry.value.toList()..sort();
-      code.writeln("  '${entry.key}': '${fields.join(',')}',");
+    for (final entry in allHints.entries) {
+      final select = entry.value.toSelectString();
+      if (select.isEmpty) continue;
+      code.writeln("  '${entry.key}': '$select',");
     }
     code.writeln('};');
 
@@ -79,5 +74,5 @@ class SelectHintsBuilder implements Builder {
 Builder selectHintsBuilder(BuilderOptions options) {
   // Model fields can be populated from the generated types
   // For now, empty map = accept all field accesses
-  return SelectHintsBuilder({});
+  return SelectHintsBuilder(<String, Map<String, String>>{});
 }

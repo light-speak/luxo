@@ -1,5 +1,5 @@
 import { createContext, useContext, createElement, type ReactNode } from 'react'
-import type { Transport } from '@luxo/client'
+import type { Transport } from '@luxojs/client'
 
 const LuxoContext = createContext<Transport | null>(null)
 

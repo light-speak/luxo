@@ -347,7 +347,7 @@ class LuxoDecoder {
 
   /// Read an array of items using a decoder function.
   List<T> readArray<T>(T Function() decode) {
-    final count = readVarint();
+    final count = _readVarint();
     return List.generate(count, (_) => decode());
   }
 }

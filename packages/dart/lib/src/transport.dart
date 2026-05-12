@@ -47,11 +47,17 @@ class HttpTransport implements Transport {
   final String endpoint;
   final Map<String, String> _headers = {'Content-Type': 'application/json'};
   final http.Client _client;
+  final Duration timeout;
+  final Future<String?> Function()? onTokenExpired;
   TransportMode _mode;
   Map<String, APISchemaEntry> _schema;
 
-  HttpTransport(this.endpoint, {TransportOptions? options, http.Client? client})
-      : _client = client ?? http.Client(),
+  HttpTransport(this.endpoint, {
+    TransportOptions? options,
+    http.Client? client,
+    this.timeout = const Duration(seconds: 30),
+    this.onTokenExpired,
+  })  : _client = client ?? http.Client(),
         _mode = options?.mode ?? TransportMode.json,
         _schema = {} {
     if (options?.headers != null) _headers.addAll(options!.headers!);
@@ -72,15 +78,28 @@ class HttpTransport implements Transport {
     return _mode == TransportMode.binary ? _binaryCall(api, params) : _jsonCall(api, params);
   }
 
-  Future<dynamic> _jsonCall(String api, Map<String, dynamic>? params) async {
+  Future<dynamic> _jsonCall(String api, Map<String, dynamic>? params, {bool isRetry = false}) async {
     final body = <String, dynamic>{r'$api': api};
     if (params != null) body.addAll(params);
 
     final http.Response resp;
     try {
-      resp = await _client.post(Uri.parse(endpoint), headers: _headers, body: jsonEncode(body));
+      resp = await _client
+          .post(Uri.parse(endpoint), headers: _headers, body: jsonEncode(body))
+          .timeout(timeout);
+    } on TimeoutException {
+      throw LuxoError('TimeoutError', 0, 'request timed out after $timeout');
     } catch (e) {
       throw LuxoError('NetworkError', 0, e.toString());
+    }
+
+    // 401 auto-refresh: call onTokenExpired, retry once with new token.
+    if (resp.statusCode == 401 && !isRetry && onTokenExpired != null) {
+      final newToken = await onTokenExpired!();
+      if (newToken != null) {
+        setToken(newToken);
+        return _jsonCall(api, params, isRetry: true);
+      }
     }
 
     final Map<String, dynamic> json;
@@ -97,7 +116,7 @@ class HttpTransport implements Transport {
     return json['data'];
   }
 
-  Future<dynamic> _binaryCall(String api, Map<String, dynamic>? params) async {
+  Future<dynamic> _binaryCall(String api, Map<String, dynamic>? params, {bool isRetry = false}) async {
     final meta = _schema[api];
     if (meta == null) throw LuxoError('ConfigError', 0, 'no schema for "$api" — use LuxoClient.create()');
 
@@ -122,9 +141,21 @@ class HttpTransport implements Transport {
     try {
       resp = await _client.post(Uri.parse(endpoint),
           headers: {'Content-Type': 'application/x-luxo', 'X-Luxo-Mode': 'binary', ..._headers},
-          body: enc.bytes());
+          body: enc.bytes())
+          .timeout(timeout);
+    } on TimeoutException {
+      throw LuxoError('TimeoutError', 0, 'request timed out after $timeout');
     } catch (e) {
       throw LuxoError('NetworkError', 0, e.toString());
+    }
+
+    // 401 auto-refresh: call onTokenExpired, retry once with new token.
+    if (resp.statusCode == 401 && !isRetry && onTokenExpired != null) {
+      final newToken = await onTokenExpired!();
+      if (newToken != null) {
+        setToken(newToken);
+        return _binaryCall(api, params, isRetry: true);
+      }
     }
 
     if (resp.statusCode != 200) {
@@ -144,6 +175,7 @@ class HttpTransport implements Transport {
 // --- WebSocket Transport ---
 
 /// WebSocket transport — persistent connection, multiplexed requests.
+/// Supports automatic reconnection with exponential backoff.
 class WsTransport implements Transport {
   final String endpoint;
   TransportMode _mode;
@@ -155,9 +187,17 @@ class WsTransport implements Transport {
   final _pending = <int, Completer<dynamic>>{};
   Completer<void>? _connectCompleter;
 
-  WsTransport(this.endpoint, {TransportOptions? options})
+  // Reconnection state
+  bool _autoReconnect;
+  bool _closed = false;
+  int _reconnectAttempts = 0;
+  static const int _maxBackoffSeconds = 30;
+  Timer? _reconnectTimer;
+
+  WsTransport(this.endpoint, {TransportOptions? options, bool autoReconnect = true})
       : _mode = options?.mode ?? TransportMode.json,
-        _token = options?.token;
+        _token = options?.token,
+        _autoReconnect = autoReconnect;
 
   @override
   void setSchema(Map<String, APISchemaEntry> schema) => _schema = schema;
@@ -177,6 +217,7 @@ class WsTransport implements Transport {
       // Use dart:io WebSocket
       final ws = await _platformConnect(url);
       _ws = ws;
+      _reconnectAttempts = 0; // Reset backoff on successful connect
       _listenWs(ws);
       _connectCompleter!.complete();
     } catch (e) {
@@ -210,6 +251,25 @@ class WsTransport implements Transport {
         c.completeError(LuxoError('NetworkError', 0, 'WebSocket closed'));
       }
       _pending.clear();
+      _scheduleReconnect();
+    });
+  }
+
+  /// Schedule a reconnection attempt with exponential backoff.
+  void _scheduleReconnect() {
+    if (_closed || !_autoReconnect) return;
+
+    final delaySeconds = (1 << _reconnectAttempts).clamp(1, _maxBackoffSeconds);
+    _reconnectAttempts++;
+
+    _reconnectTimer = Timer(Duration(seconds: delaySeconds), () async {
+      if (_closed) return;
+      try {
+        await _connect();
+      } catch (_) {
+        // _connect failed, onDone will fire again or we schedule manually
+        _scheduleReconnect();
+      }
     });
   }
 
@@ -284,6 +344,10 @@ class WsTransport implements Transport {
 
   @override
   void close() {
+    _closed = true;
+    _autoReconnect = false;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
     (_ws as dynamic)?.close();
     _ws = null;
   }

@@ -294,3 +294,16 @@ object LuxoCodegen {
         }
     }
 }
+
+/** CLI entry point for gradle JavaExec task. */
+object LuxoCodegenCli {
+    @JvmStatic
+    fun main(args: Array<String>) {
+        require(args.size >= 2) { "Usage: LuxoCodegenCli <endpoint> <key> [outDir] [package]" }
+        val endpoint = args[0]
+        val key = args[1]
+        val outDir = args.getOrElse(2) { "src/main/kotlin/com/luxo/generated" }
+        val pkg = args.getOrElse(3) { "com.luxo.generated" }
+        LuxoCodegen.generate(endpoint, key, outDir, pkg)
+    }
+}

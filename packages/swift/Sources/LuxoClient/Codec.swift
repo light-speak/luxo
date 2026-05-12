@@ -99,7 +99,7 @@ public struct Decoder {
 
     public mutating func readFixed64() -> Double {
         guard offset + 8 <= data.count else { return 0 }
-        let bits = data[offset..<offset+8].withUnsafeBytes { $0.load(as: UInt64.self) }
+        let bits = data[offset..<offset+8].withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
         offset += 8
         return Double(bitPattern: bits)
     }
@@ -132,6 +132,54 @@ public struct Decoder {
         guard !isAtEnd else { return 0 }
         let id = Int(readVarint())
         return id
+    }
+
+    // MARK: - Nullable Readers
+
+    /// Read nullable flag byte. Returns true if value is present (0x01).
+    private mutating func readNullFlag() -> Bool {
+        guard offset < data.count else { return false }
+        let flag = data[offset]
+        offset += 1
+        return flag != 0x00
+    }
+
+    /// Read a nullable Int64 (null flag + zigzag varint).
+    public mutating func readIntPtr() -> Int64? {
+        if !readNullFlag() { return nil }
+        return readSvarint()
+    }
+
+    /// Read a nullable Double (null flag + fixed64).
+    public mutating func readFloatPtr() -> Double? {
+        if !readNullFlag() { return nil }
+        return readFixed64()
+    }
+
+    /// Read a nullable String (null flag + length-prefixed UTF-8).
+    public mutating func readStringPtr() -> String? {
+        if !readNullFlag() { return nil }
+        return readString()
+    }
+
+    /// Read a nullable Bool (null flag + bool byte).
+    public mutating func readBoolPtr() -> Bool? {
+        if !readNullFlag() { return nil }
+        return readBool()
+    }
+
+    // MARK: - Array Reader
+
+    /// Read an array of items using a decoder closure.
+    /// Format: varint count, then count items decoded by the closure.
+    public mutating func readArray<T>(_ decode: (inout Decoder) -> T) -> [T] {
+        let count = Int(readVarint())
+        var items: [T] = []
+        items.reserveCapacity(count)
+        for _ in 0..<count {
+            items.append(decode(&self))
+        }
+        return items
     }
 }
 

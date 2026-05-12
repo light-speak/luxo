@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { analyzeAndTransform } from './analyzer'
-import type { LuxoSchema } from '@luxo/client'
+import type { LuxoSchema } from '@luxojs/client'
 
 const schema: LuxoSchema = {
   models: {

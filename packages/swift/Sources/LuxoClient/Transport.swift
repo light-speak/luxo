@@ -31,15 +31,21 @@ public struct APISchema: Sendable {
 
 /// HTTP/2 transport using URLSession. Single connection, multiplexed requests.
 /// Supports both JSON and binary (Luxo codec) modes.
+/// Supports timeout configuration and 401 auto-refresh.
 public final class URLSessionTransport: Transport, @unchecked Sendable {
     private let endpoint: URL
     private let session: URLSession
     private var headers: [String: String] = [:]
     private var mode: TransportMode = .json
     private var schema: [String: APISchema] = [:]
+    private let timeout: TimeInterval
 
-    public init(endpoint: String, token: String? = nil) {
+    /// Callback invoked on 401 response. Return a new token to retry, or nil to propagate error.
+    public var onTokenExpired: (() async -> String?)?
+
+    public init(endpoint: String, token: String? = nil, timeout: TimeInterval = 30) {
         self.endpoint = URL(string: endpoint)!
+        self.timeout = timeout
         // HTTP/2 multiplexing via shared URLSession
         let config = URLSessionConfiguration.default
         config.httpAdditionalHeaders = ["Content-Type": "application/json"]
@@ -62,6 +68,19 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
     }
 
     public func call(_ api: String, params: [String: Any]? = nil) async throws -> Any {
+        do {
+            return try await doCall(api, params: params)
+        } catch let error as LuxoError where error.code == 401 {
+            // Attempt token refresh on 401
+            if let refresh = onTokenExpired, let newToken = await refresh() {
+                setToken(newToken)
+                return try await doCall(api, params: params)
+            }
+            throw error
+        }
+    }
+
+    private func doCall(_ api: String, params: [String: Any]?) async throws -> Any {
         switch mode {
         case .json:
             return try await jsonCall(api, params: params)
@@ -78,6 +97,7 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
+        request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -92,7 +112,9 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
             let errorBody = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             throw LuxoError(
                 code: errorBody?["code"] as? Int ?? httpResponse.statusCode,
-                message: errorBody?["message"] as? String ?? "HTTP \(httpResponse.statusCode)"
+                message: errorBody?["message"] as? String ?? "HTTP \(httpResponse.statusCode)",
+                name: errorBody?["name"] as? String ?? "Error",
+                traceId: errorBody?["traceId"] as? String
             )
         }
 
@@ -119,6 +141,7 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
+        request.timeoutInterval = timeout
         request.setValue("application/x-luxo", forHTTPHeaderField: "Content-Type")
         request.setValue("binary", forHTTPHeaderField: "X-Luxo-Mode")
         for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
@@ -137,6 +160,7 @@ public final class URLSessionTransport: Transport, @unchecked Sendable {
 // MARK: - WebSocket Transport
 
 /// WebSocket transport for streaming (subscriptions) and bidirectional communication.
+/// Supports exponential backoff auto-reconnect on disconnect.
 public final class WebSocketTransport: @unchecked Sendable {
     private let url: URL
     private var task: URLSessionWebSocketTask?
@@ -144,15 +168,21 @@ public final class WebSocketTransport: @unchecked Sendable {
     private var handlers: [String: (Any) -> Void] = [:]
     private let lock = NSLock()
 
+    // Auto-reconnect state
+    private var shouldReconnect: Bool = true
+    private var reconnectAttempt: Int = 0
+    private let maxBackoff: TimeInterval = 30.0
+    private let baseBackoff: TimeInterval = 1.0
+
     public init(url: String) {
         self.url = URL(string: url)!
         self.session = URLSession(configuration: .default)
     }
 
     public func connect() {
-        task = session.webSocketTask(with: url)
-        task?.resume()
-        receiveLoop()
+        shouldReconnect = true
+        reconnectAttempt = 0
+        openConnection()
     }
 
     public func subscribe(_ api: String, params: [String: Any]? = nil, handler: @escaping (Any) -> Void) {
@@ -170,6 +200,7 @@ public final class WebSocketTransport: @unchecked Sendable {
     }
 
     public func close() {
+        shouldReconnect = false
         task?.cancel(with: .normalClosure, reason: nil)
         task = nil
         lock.lock()
@@ -177,37 +208,63 @@ public final class WebSocketTransport: @unchecked Sendable {
         lock.unlock()
     }
 
+    // MARK: - Internal
+
+    private func openConnection() {
+        task = session.webSocketTask(with: url)
+        task?.resume()
+        receiveLoop()
+    }
+
     private func receiveLoop() {
         task?.receive { [weak self] result in
+            guard let self = self else { return }
             switch result {
             case .success(let message):
-                switch message {
-                case .data(let data):
-                    if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                       let api = json["api"] as? String,
-                       let payload = json["data"] {
-                        self?.lock.lock()
-                        let handler = self?.handlers[api]
-                        self?.lock.unlock()
-                        handler?(payload)
-                    }
-                case .string(let text):
-                    if let data = text.data(using: .utf8),
-                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                       let api = json["api"] as? String,
-                       let payload = json["data"] {
-                        self?.lock.lock()
-                        let handler = self?.handlers[api]
-                        self?.lock.unlock()
-                        handler?(payload)
-                    }
-                @unknown default:
-                    break
-                }
-                self?.receiveLoop()
+                // Reset backoff on successful receive
+                self.reconnectAttempt = 0
+                self.handleMessage(message)
+                self.receiveLoop()
             case .failure:
-                break
+                self.scheduleReconnect()
             }
+        }
+    }
+
+    private func handleMessage(_ message: URLSessionWebSocketTask.Message) {
+        switch message {
+        case .data(let data):
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let api = json["api"] as? String,
+               let payload = json["data"] {
+                lock.lock()
+                let handler = handlers[api]
+                lock.unlock()
+                handler?(payload)
+            }
+        case .string(let text):
+            if let data = text.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let api = json["api"] as? String,
+               let payload = json["data"] {
+                lock.lock()
+                let handler = handlers[api]
+                lock.unlock()
+                handler?(payload)
+            }
+        @unknown default:
+            break
+        }
+    }
+
+    /// Exponential backoff: 1s, 2s, 4s, 8s... up to 30s max.
+    private func scheduleReconnect() {
+        guard shouldReconnect else { return }
+        let delay = min(baseBackoff * pow(2.0, Double(reconnectAttempt)), maxBackoff)
+        reconnectAttempt += 1
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self = self, self.shouldReconnect else { return }
+            self.openConnection()
         }
     }
 }
