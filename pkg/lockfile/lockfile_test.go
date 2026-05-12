@@ -1021,3 +1021,134 @@ func TestEmptyReservedOmitted(t *testing.T) {
 		t.Error("Empty reserved should be omitted from JSON")
 	}
 }
+
+func TestUpdateTypesNewType(t *testing.T) {
+	lf := New()
+	files := []*ast.File{{
+		Name: "origin/auth.luxo",
+		Types: []*ast.TypeDecl{{
+			Name: "AuthPayload",
+			Fields: []*ast.FieldDecl{
+				field("token", "String"),
+				field("expiresAt", "DateTime"),
+			},
+		}},
+	}}
+
+	lf.updateTypes(files)
+
+	ml, ok := lf.Types["AuthPayload"]
+	if !ok {
+		t.Fatal("Types should contain AuthPayload")
+	}
+	if len(ml.Fields) != 2 {
+		t.Fatalf("want 2 fields, got %d", len(ml.Fields))
+	}
+	if ml.Fields["token"] != 1 {
+		t.Errorf("token ID = %d, want 1", ml.Fields["token"])
+	}
+	if ml.Fields["expiresAt"] != 2 {
+		t.Errorf("expiresAt ID = %d, want 2", ml.Fields["expiresAt"])
+	}
+	if ml.NextID != 3 {
+		t.Errorf("NextID = %d, want 3", ml.NextID)
+	}
+}
+
+func TestUpdateTypesPreservesExistingIDs(t *testing.T) {
+	lf := New()
+	lf.Types = map[string]*ModelLock{
+		"AuthPayload": {
+			NextID: 3,
+			Fields: map[string]int{"token": 1, "expiresAt": 2},
+		},
+	}
+
+	// Same fields + a new one
+	files := []*ast.File{{
+		Name: "origin/auth.luxo",
+		Types: []*ast.TypeDecl{{
+			Name: "AuthPayload",
+			Fields: []*ast.FieldDecl{
+				field("token", "String"),
+				field("expiresAt", "DateTime"),
+				field("refreshToken", "String"),
+			},
+		}},
+	}}
+
+	lf.updateTypes(files)
+
+	ml := lf.Types["AuthPayload"]
+	if ml.Fields["token"] != 1 {
+		t.Errorf("token ID should stay 1, got %d", ml.Fields["token"])
+	}
+	if ml.Fields["expiresAt"] != 2 {
+		t.Errorf("expiresAt ID should stay 2, got %d", ml.Fields["expiresAt"])
+	}
+	if ml.Fields["refreshToken"] != 3 {
+		t.Errorf("refreshToken ID = %d, want 3", ml.Fields["refreshToken"])
+	}
+	if ml.NextID != 4 {
+		t.Errorf("NextID = %d, want 4", ml.NextID)
+	}
+}
+
+func TestUpdateTypesMultipleTypes(t *testing.T) {
+	lf := New()
+	files := []*ast.File{{
+		Name: "origin/auth.luxo",
+		Types: []*ast.TypeDecl{
+			{
+				Name: "AuthPayload",
+				Fields: []*ast.FieldDecl{
+					field("token", "String"),
+				},
+			},
+			{
+				Name: "PaginationInfo",
+				Fields: []*ast.FieldDecl{
+					field("total", "Int"),
+					field("page", "Int"),
+				},
+			},
+		},
+	}}
+
+	lf.updateTypes(files)
+
+	if _, ok := lf.Types["AuthPayload"]; !ok {
+		t.Error("missing AuthPayload")
+	}
+	if _, ok := lf.Types["PaginationInfo"]; !ok {
+		t.Error("missing PaginationInfo")
+	}
+	pi := lf.Types["PaginationInfo"]
+	if pi.Fields["total"] != 1 || pi.Fields["page"] != 2 {
+		t.Errorf("PaginationInfo fields wrong: %+v", pi.Fields)
+	}
+}
+
+func TestUpdateTypesNilTypesMap(t *testing.T) {
+	lf := New()
+	lf.Types = nil // explicitly nil
+
+	files := []*ast.File{{
+		Name: "origin/auth.luxo",
+		Types: []*ast.TypeDecl{{
+			Name: "Token",
+			Fields: []*ast.FieldDecl{
+				field("value", "String"),
+			},
+		}},
+	}}
+
+	lf.updateTypes(files)
+
+	if lf.Types == nil {
+		t.Fatal("Types should be initialized")
+	}
+	if _, ok := lf.Types["Token"]; !ok {
+		t.Fatal("missing Token type")
+	}
+}

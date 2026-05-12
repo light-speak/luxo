@@ -618,3 +618,92 @@ func TestBuildSchemaModels_SkipsComputed(t *testing.T) {
 		t.Error("computed field should be skipped")
 	}
 }
+
+func TestWriteTypeRegistration(t *testing.T) {
+	oldFieldIDs := modelFieldIDs
+	modelFieldIDs = map[string]map[string]int{
+		"AuthPayload": {"token": 1, "user": 2},
+	}
+	defer func() { modelFieldIDs = oldFieldIDs }()
+
+	td := &ast.TypeDecl{
+		Name: "AuthPayload",
+		Fields: []*ast.FieldDecl{
+			{Name: "token", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "user", Type: &ast.TypeRef{Name: "User", IsList: false}},
+		},
+	}
+	enums := map[string]bool{}
+
+	var b strings.Builder
+	writeTypeRegistration(&b, td, enums)
+	src := b.String()
+
+	checks := []string{
+		"RegisterType",
+		`Name: "AuthPayload"`,
+		`Name: "token"`,
+		"schema.FieldString",
+		`Name: "user"`,
+		`TypeName: "User"`,
+	}
+	for _, check := range checks {
+		if !strings.Contains(src, check) {
+			t.Errorf("missing %q in output:\n%s", check, src)
+		}
+	}
+}
+
+func TestGenerateSchemaFile_WithTypes(t *testing.T) {
+	oldFieldIDs := modelFieldIDs
+	oldAPIIDs := apiIDs
+	modelFieldIDs = map[string]map[string]int{
+		"User":        {"id": 1},
+		"AuthPayload": {"token": 1, "expiresAt": 2},
+	}
+	apiIDs = map[string]int{}
+	defer func() {
+		modelFieldIDs = oldFieldIDs
+		apiIDs = oldAPIIDs
+	}()
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/auth.luxo",
+			Models: []*ast.ModelDecl{{
+				Pos:  token.Position{File: "test.luxo", Line: 1, Col: 1},
+				Name: "User",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+				},
+			}},
+			Types: []*ast.TypeDecl{{
+				Name: "AuthPayload",
+				Fields: []*ast.FieldDecl{
+					{Name: "token", Type: &ast.TypeRef{Name: "String"}},
+					{Name: "expiresAt", Type: &ast.TypeRef{Name: "DateTime"}},
+				},
+			}},
+		}},
+	}
+
+	code := generateSchemaFile(result, "luxo", nil)
+	if code == nil {
+		t.Fatal("should generate schema file with types")
+	}
+	src := string(code)
+
+	checks := []string{
+		"RegisterType",
+		`Name: "AuthPayload"`,
+		`Name: "token"`,
+		"schema.FieldString",
+		`Name: "expiresAt"`,
+		"schema.FieldDateTime",
+	}
+	for _, check := range checks {
+		if !strings.Contains(src, check) {
+			t.Errorf("missing %q in schema:\n%s", check, src)
+		}
+	}
+}
