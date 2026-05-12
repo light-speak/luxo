@@ -58,7 +58,7 @@ func loadConfigFromEnv() (*Config, error) {
 
 	expires := 7 * 24 * time.Hour // default 7d
 	if v, ok := env.Get("JWT_EXPIRES"); ok {
-		d, err := time.ParseDuration(v)
+		d, err := parseDuration(v)
 		if err != nil {
 			return nil, fmt.Errorf("invalid JWT_EXPIRES: %w", err)
 		}
@@ -72,7 +72,7 @@ func loadConfigFromEnv() (*Config, error) {
 
 	refreshExpires := 30 * 24 * time.Hour // default 30d
 	if v, ok := env.Get("JWT_REFRESH_EXPIRES"); ok {
-		d, err := time.ParseDuration(v)
+		d, err := parseDuration(v)
 		if err != nil {
 			return nil, fmt.Errorf("invalid JWT_REFRESH_EXPIRES: %w", err)
 		}
@@ -164,4 +164,68 @@ func base64Encode(data []byte) string {
 
 func base64Decode(s string) ([]byte, error) {
 	return base64.RawURLEncoding.DecodeString(s)
+}
+
+// parseDuration extends time.ParseDuration with support for "d" (days) and "w" (weeks).
+// Examples: "7d" → 168h, "2w" → 336h, "1d12h" → 36h, "30m" → 30m.
+func parseDuration(s string) (time.Duration, error) {
+	// Replace "d" and "w" with hour equivalents before parsing
+	var result string
+	i := 0
+	for i < len(s) {
+		j := i
+		// Scan digits
+		for j < len(s) && (s[j] >= '0' && s[j] <= '9' || s[j] == '.') {
+			j++
+		}
+		if j < len(s) && s[j] == 'd' {
+			// Convert days to hours
+			result += s[i:j] + "*24h+"
+			i = j + 1
+		} else if j < len(s) && s[j] == 'w' {
+			// Convert weeks to hours
+			result += s[i:j] + "*168h+"
+			i = j + 1
+		} else {
+			result += string(s[i])
+			i++
+		}
+	}
+	result = strings.TrimSuffix(result, "+")
+
+	// If simple substitution (e.g. "7*24h"), evaluate manually
+	if strings.Contains(result, "*") {
+		return parseDurationWithMultiplier(result)
+	}
+	return time.ParseDuration(result)
+}
+
+func parseDurationWithMultiplier(s string) (time.Duration, error) {
+	var total time.Duration
+	for _, part := range strings.Split(s, "+") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if idx := strings.Index(part, "*"); idx >= 0 {
+			numStr := part[:idx]
+			durStr := part[idx+1:]
+			var num float64
+			if _, err := fmt.Sscanf(numStr, "%f", &num); err != nil {
+				return 0, fmt.Errorf("invalid duration %q", s)
+			}
+			d, err := time.ParseDuration(durStr)
+			if err != nil {
+				return 0, fmt.Errorf("invalid duration %q: %w", s, err)
+			}
+			total += time.Duration(num * float64(d))
+		} else {
+			d, err := time.ParseDuration(part)
+			if err != nil {
+				return 0, fmt.Errorf("invalid duration %q: %w", s, err)
+			}
+			total += d
+		}
+	}
+	return total, nil
 }

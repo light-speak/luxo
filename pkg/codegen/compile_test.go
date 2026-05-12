@@ -4320,10 +4320,14 @@ func TestCompileTemplateWithMemberAccess(t *testing.T) {
 	if !strings.Contains(got, "strings.Builder") {
 		t.Fatalf("missing strings.Builder, got:\n%s", got)
 	}
-	// Should have 5 WriteString calls
-	count := strings.Count(got, "_sb.WriteString(")
-	if count != 5 {
-		t.Fatalf("expected 5 WriteString calls, got %d:\n%s", count, got)
+	// 3 literal WriteStrings + 2 fmt.Fprintf for unknown-type member access
+	wsCount := strings.Count(got, "_sb.WriteString(")
+	fmtCount := strings.Count(got, "fmt.Fprintf(&_sb")
+	if wsCount != 3 {
+		t.Fatalf("expected 3 WriteString calls for literals, got %d:\n%s", wsCount, got)
+	}
+	if fmtCount != 2 {
+		t.Fatalf("expected 2 fmt.Fprintf for unknown member access, got %d:\n%s", fmtCount, got)
 	}
 }
 
@@ -5932,6 +5936,7 @@ func TestCompileForExprWithReturnStmt(t *testing.T) {
 
 func TestCompileTemplateWithIntExpr(t *testing.T) {
 	c := newCompiler(nil)
+	c.vars["count"] = valType{name: "Int"}
 	got := c.compileExpr(&ast.TemplateString{
 		Parts: []ast.Expr{
 			&ast.Literal{Kind: token.String, Value: "count: "},

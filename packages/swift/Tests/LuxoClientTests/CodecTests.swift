@@ -194,6 +194,145 @@ final class CodecTests: XCTestCase {
         XCTAssertEqual(mask.count, 8) // 63/8 = 7, need index 7 => 8 bytes
     }
 
+    // MARK: - ColumnarDecoder Tests
+
+    func testColumnarDecode2Records() {
+        var enc = Encoder()
+        // count = 2
+        enc.writeVarint(2)
+        // Column 1: fieldID=1, int values [42, -7]
+        enc.writeVarint(1)
+        enc.writeSvarint(42)
+        enc.writeSvarint(-7)
+        // Column 2: fieldID=2, string values ["hello", "world"]
+        enc.writeVarint(2)
+        enc.writeString("hello")
+        enc.writeString("world")
+        // Column 3: fieldID=3, float values [3.14, 2.718]
+        enc.writeVarint(3)
+        enc.writeFixed64(3.14)
+        enc.writeFixed64(2.718)
+        // End marker
+        enc.writeEnd()
+
+        var dec = ColumnarDecoder(data: enc.data)
+        XCTAssertEqual(dec.count, 2)
+
+        XCTAssertTrue(dec.nextColumn())
+        XCTAssertEqual(dec.fieldID, 1)
+        let ints = dec.readColumnInt()
+        XCTAssertEqual(ints, [42, -7])
+
+        XCTAssertTrue(dec.nextColumn())
+        XCTAssertEqual(dec.fieldID, 2)
+        let strings = dec.readColumnString()
+        XCTAssertEqual(strings, ["hello", "world"])
+
+        XCTAssertTrue(dec.nextColumn())
+        XCTAssertEqual(dec.fieldID, 3)
+        let floats = dec.readColumnFloat()
+        XCTAssertEqual(floats[0], 3.14, accuracy: 0.0001)
+        XCTAssertEqual(floats[1], 2.718, accuracy: 0.0001)
+
+        XCTAssertFalse(dec.nextColumn())
+    }
+
+    func testColumnarEmptyList() {
+        var enc = Encoder()
+        enc.writeVarint(0) // count=0
+        enc.writeEnd()     // end marker
+
+        var dec = ColumnarDecoder(data: enc.data)
+        XCTAssertEqual(dec.count, 0)
+        XCTAssertFalse(dec.nextColumn())
+    }
+
+    func testColumnarNullableColumns() {
+        var data = Data()
+        // count = 3
+        appendVarint(&data, 3)
+        // Column 1: fieldID=1, nullable int [null, 99, null]
+        appendVarint(&data, 1)
+        data.append(0x00) // null
+        data.append(0x01); appendSvarint(&data, 99) // present
+        data.append(0x00) // null
+        // Column 2: fieldID=2, nullable string [null, "hi", ""]
+        appendVarint(&data, 2)
+        data.append(0x00) // null
+        data.append(0x01); appendString(&data, "hi") // present
+        data.append(0x01); appendString(&data, "")   // present empty
+        // End marker
+        data.append(0x00)
+
+        var dec = ColumnarDecoder(data: data)
+        XCTAssertEqual(dec.count, 3)
+
+        XCTAssertTrue(dec.nextColumn())
+        XCTAssertEqual(dec.fieldID, 1)
+        let nullInts = dec.readColumnIntPtr()
+        XCTAssertNil(nullInts[0])
+        XCTAssertEqual(nullInts[1], 99)
+        XCTAssertNil(nullInts[2])
+
+        XCTAssertTrue(dec.nextColumn())
+        XCTAssertEqual(dec.fieldID, 2)
+        let nullStrings = dec.readColumnStringPtr()
+        XCTAssertNil(nullStrings[0])
+        XCTAssertEqual(nullStrings[1], "hi")
+        XCTAssertEqual(nullStrings[2], "")
+
+        XCTAssertFalse(dec.nextColumn())
+    }
+
+    func testColumnarBoolColumn() {
+        var enc = Encoder()
+        enc.writeVarint(3) // count=3
+        enc.writeVarint(1) // fieldID=1
+        enc.writeVarint(1) // true
+        enc.writeVarint(0) // false
+        enc.writeVarint(1) // true
+        enc.writeEnd()
+
+        var dec = ColumnarDecoder(data: enc.data)
+        XCTAssertEqual(dec.count, 3)
+        XCTAssertTrue(dec.nextColumn())
+        XCTAssertEqual(dec.readColumnBool(), [true, false, true])
+        XCTAssertFalse(dec.nextColumn())
+    }
+
+    func testColumnarOffsetAndReadSvarint() {
+        var enc = Encoder()
+        enc.writeVarint(0) // count=0
+        enc.writeEnd()     // end marker
+        enc.writeSvarint(-42) // pagination metadata
+
+        var dec = ColumnarDecoder(data: enc.data)
+        XCTAssertFalse(dec.nextColumn())
+        XCTAssertEqual(dec.readSvarint(), -42)
+    }
+
+    // MARK: - Columnar Test Helpers
+
+    private func appendVarint(_ data: inout Data, _ value: UInt64) {
+        var v = value
+        while v > 0x7F {
+            data.append(UInt8(v & 0x7F) | 0x80)
+            v >>= 7
+        }
+        data.append(UInt8(v))
+    }
+
+    private func appendSvarint(_ data: inout Data, _ value: Int64) {
+        let encoded = UInt64(bitPattern: (value << 1) ^ (value >> 63))
+        appendVarint(&data, encoded)
+    }
+
+    private func appendString(_ data: inout Data, _ value: String) {
+        let bytes = Array(value.utf8)
+        appendVarint(&data, UInt64(bytes.count))
+        data.append(contentsOf: bytes)
+    }
+
     func testMultipleStrings() {
         var encoder = Encoder()
         encoder.writeString("alpha")

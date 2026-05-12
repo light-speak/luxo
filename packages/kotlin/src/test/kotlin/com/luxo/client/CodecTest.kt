@@ -282,6 +282,149 @@ class LuxoEncoderDecoderTest {
     }
 }
 
+class ColumnarDecoderTest {
+
+    /** Helper: write unsigned varint to a list. */
+    private fun MutableList<Byte>.writeVarint(v: Long) {
+        var uv = v
+        while (uv and 0x7FL.inv() != 0L) {
+            add(((uv and 0x7F) or 0x80).toByte())
+            uv = uv ushr 7
+        }
+        add((uv and 0x7F).toByte())
+    }
+
+    /** Helper: write zigzag svarint to a list. */
+    private fun MutableList<Byte>.writeSvarint(v: Long) {
+        writeVarint((v shl 1) xor (v shr 63))
+    }
+
+    /** Helper: write fixed64 (LE float64) to a list. */
+    private fun MutableList<Byte>.writeFixed64(v: Double) {
+        val bits = java.lang.Double.doubleToRawLongBits(v)
+        for (i in 0 until 8) {
+            add((bits ushr (i * 8)).toByte())
+        }
+    }
+
+    /** Helper: write length-prefixed string to a list. */
+    private fun MutableList<Byte>.writeString(v: String) {
+        val bytes = v.toByteArray(Charsets.UTF_8)
+        writeVarint(bytes.size.toLong())
+        bytes.forEach { add(it) }
+    }
+
+    @Test
+    fun `decode 2 records with int, string, float columns`() {
+        val buf = mutableListOf<Byte>()
+        buf.writeVarint(2) // count=2
+        // Column 1: fieldID=1, int values [42, -7]
+        buf.writeVarint(1)
+        buf.writeSvarint(42)
+        buf.writeSvarint(-7)
+        // Column 2: fieldID=2, string values ["hello", "world"]
+        buf.writeVarint(2)
+        buf.writeString("hello")
+        buf.writeString("world")
+        // Column 3: fieldID=3, float values [3.14, 2.718]
+        buf.writeVarint(3)
+        buf.writeFixed64(3.14)
+        buf.writeFixed64(2.718)
+        // End marker
+        buf.add(0x00)
+
+        val dec = ColumnarDecoder(buf.toByteArray())
+        assertEquals(2, dec.count)
+
+        assertTrue(dec.nextColumn())
+        assertEquals(1, dec.fieldID)
+        assertEquals(listOf(42L, -7L), dec.readColumnInt())
+
+        assertTrue(dec.nextColumn())
+        assertEquals(2, dec.fieldID)
+        assertEquals(listOf("hello", "world"), dec.readColumnString())
+
+        assertTrue(dec.nextColumn())
+        assertEquals(3, dec.fieldID)
+        val floats = dec.readColumnFloat()
+        assertEquals(3.14, floats[0], 0.0001)
+        assertEquals(2.718, floats[1], 0.0001)
+
+        assertFalse(dec.nextColumn())
+    }
+
+    @Test
+    fun `empty list (count=0)`() {
+        val buf = mutableListOf<Byte>()
+        buf.writeVarint(0) // count=0
+        buf.add(0x00) // end marker
+
+        val dec = ColumnarDecoder(buf.toByteArray())
+        assertEquals(0, dec.count)
+        assertFalse(dec.nextColumn())
+    }
+
+    @Test
+    fun `nullable columns`() {
+        val buf = mutableListOf<Byte>()
+        buf.writeVarint(3) // count=3
+        // Column 1: fieldID=1, nullable int [null, 99, null]
+        buf.writeVarint(1)
+        buf.add(0x00) // null
+        buf.add(0x01); buf.writeSvarint(99) // present
+        buf.add(0x00) // null
+        // Column 2: fieldID=2, nullable string [null, "hi", ""]
+        buf.writeVarint(2)
+        buf.add(0x00) // null
+        buf.add(0x01); buf.writeString("hi") // present
+        buf.add(0x01); buf.writeString("") // present empty
+        // End marker
+        buf.add(0x00)
+
+        val dec = ColumnarDecoder(buf.toByteArray())
+        assertEquals(3, dec.count)
+
+        assertTrue(dec.nextColumn())
+        assertEquals(1, dec.fieldID)
+        assertEquals(listOf(null, 99L, null), dec.readColumnIntPtr())
+
+        assertTrue(dec.nextColumn())
+        assertEquals(2, dec.fieldID)
+        assertEquals(listOf(null, "hi", ""), dec.readColumnStringPtr())
+
+        assertFalse(dec.nextColumn())
+    }
+
+    @Test
+    fun `bool column`() {
+        val buf = mutableListOf<Byte>()
+        buf.writeVarint(3) // count=3
+        buf.writeVarint(1) // fieldID=1
+        buf.writeVarint(1) // true
+        buf.writeVarint(0) // false
+        buf.writeVarint(1) // true
+        buf.add(0x00)
+
+        val dec = ColumnarDecoder(buf.toByteArray())
+        assertEquals(3, dec.count)
+        assertTrue(dec.nextColumn())
+        assertEquals(listOf(true, false, true), dec.readColumnBool())
+        assertFalse(dec.nextColumn())
+    }
+
+    @Test
+    fun `offset and readSvarint`() {
+        val buf = mutableListOf<Byte>()
+        buf.writeVarint(0) // count=0
+        buf.add(0x00) // end marker
+        buf.writeSvarint(-42) // pagination metadata
+
+        val dec = ColumnarDecoder(buf.toByteArray())
+        assertFalse(dec.nextColumn())
+        assertEquals(-42L, dec.readSvarint())
+    }
+}
+
 class FieldMaskTest {
 
     @Test

@@ -14,6 +14,7 @@ import (
 type LockFile struct {
 	Version int                   `json:"version"`
 	Models  map[string]*ModelLock `json:"models"`
+	Types   map[string]*ModelLock `json:"types,omitempty"`
 	Events  map[string]*ModelLock `json:"events,omitempty"`
 	APIs    map[string]*APILock   `json:"apis"`
 	nextAPI int                   // transient: next API ID to assign
@@ -120,9 +121,37 @@ func (lf *LockFile) Save(path string) error {
 // New APIs get the next available API ID.
 func (lf *LockFile) Update(files []*ast.File) {
 	lf.updateModels(files)
+	lf.updateTypes(files)
 	lf.updateExtends(files)
 	lf.updateEvents(files)
 	lf.updateAPIs(files)
+}
+
+// updateTypes assigns field IDs for type declarations (non-DB, e.g. AuthPayload).
+// Types have their own independent ID space in lf.Types, separate from Models.
+func (lf *LockFile) updateTypes(files []*ast.File) {
+	if lf.Types == nil {
+		lf.Types = make(map[string]*ModelLock)
+	}
+	for _, file := range files {
+		for _, td := range file.Types {
+			ml, exists := lf.Types[td.Name]
+			if !exists {
+				ml = &ModelLock{
+					NextID: 1,
+					Fields: make(map[string]int),
+				}
+				lf.Types[td.Name] = ml
+			}
+			for _, f := range td.Fields {
+				if _, ok := ml.Fields[f.Name]; ok {
+					continue
+				}
+				ml.Fields[f.Name] = ml.NextID
+				ml.NextID++
+			}
+		}
+	}
 }
 
 // updateExtends assigns field IDs for extend fields in the parent model's ID space.

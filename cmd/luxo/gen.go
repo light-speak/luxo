@@ -66,10 +66,14 @@ func runGen(cmd *cobra.Command, args []string) error {
 		}
 		codegen.SetEventFieldIDs(ids)
 	}
-	if lf.Models != nil {
-		ids := make(map[string]map[string]int, len(lf.Models))
+	if lf.Models != nil || lf.Types != nil {
+		ids := make(map[string]map[string]int, len(lf.Models)+len(lf.Types))
 		for name, ml := range lf.Models {
 			ids[name] = ml.Fields
+		}
+		// Types have independent ID space but codegen uses the same lookup
+		for name, tl := range lf.Types {
+			ids[name] = tl.Fields
 		}
 		codegen.SetModelFieldIDs(ids)
 	}

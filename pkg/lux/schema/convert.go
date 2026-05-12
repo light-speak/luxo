@@ -11,16 +11,20 @@ import (
 // BinaryToJSON converts a Luxo binary-encoded model to JSON using schema metadata.
 // No model struct needed — pure schema-driven conversion.
 // Returns the JSON bytes appended to dst.
-func BinaryToJSON(dst []byte, data []byte, model *Model) []byte {
-	dst = append(dst, '{')
+// schema is optional — needed for nested model/type resolution.
+func BinaryToJSON(dst []byte, data []byte, model *Model, schemas ...*Schema) []byte {
 	dec := codec.NewDecoder(data)
+	return binaryToJSONFromDecoder(dst, dec, model, schemas...)
+}
+
+// binaryToJSONFromDecoder reads fields from a decoder and produces JSON.
+// Used by both top-level and nested model decoding (sharing the same decoder stream).
+func binaryToJSONFromDecoder(dst []byte, dec *codec.Decoder, model *Model, schemas ...*Schema) []byte {
+	dst = append(dst, '{')
 	first := true
 	for dec.NextField() {
 		f := model.FieldByID(dec.FieldID())
 		if f == nil {
-			// Unknown field — schema should be complete, but just in case
-			// we can't skip because Luxo binary isn't self-describing.
-			// Break to avoid corrupting the stream.
 			break
 		}
 		if !first {
@@ -28,10 +32,32 @@ func BinaryToJSON(dst []byte, data []byte, model *Model) []byte {
 		}
 		first = false
 		dst = append(dst, f.JSONPrefix...)
-		dst = appendFieldValueJSON(dst, dec, f)
+
+		// Nested model/type — recurse using same decoder
+		if f.Relation && len(schemas) > 0 && schemas[0] != nil {
+			dst = appendNestedModelJSON(dst, dec, f, schemas[0])
+		} else {
+			dst = appendFieldValueJSON(dst, dec, f)
+		}
 	}
 	dst = append(dst, '}')
 	return dst
+}
+
+// appendNestedModelJSON decodes an inline nested model/type from the same decoder stream.
+func appendNestedModelJSON(dst []byte, dec *codec.Decoder, f *Field, s *Schema) []byte {
+	nested := s.Models[f.TypeName]
+	if nested == nil {
+		if td := s.Types[f.TypeName]; td != nil {
+			nested = td.AsModel()
+		}
+	}
+	if nested == nil {
+		return append(dst, "null"...)
+	}
+	// The nested model's fields are inline in the same byte stream,
+	// terminated by 0x00 (which NextField handles).
+	return binaryToJSONFromDecoder(dst, dec, nested, s)
 }
 
 // BinaryListToJSON converts a columnar-encoded list of models to JSON.

@@ -352,7 +352,9 @@ func writeImports(b *strings.Builder, files []*ast.File) {
 		b.WriteString("\n\tluxocrypto \"github.com/light-speak/luxo/pkg/lux/crypto\"\n")
 	}
 	if needs.auth {
-		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/auth\"\n")
+		b.WriteString("\t\"fmt\"\n")
+		b.WriteString("\t\"os\"\n")
+		b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/auth\"\n")
 	}
 	b.WriteString(")\n\n")
 }

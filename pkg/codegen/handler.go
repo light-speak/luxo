@@ -26,6 +26,7 @@ type handlerFeatures struct {
 	hasCrypto         bool
 	hasTimeFunc       bool
 	hasEmit           bool
+	hasLog            bool
 	crossEventImports map[string]string // module → alias for cross-module emit
 }
 
@@ -541,6 +542,9 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 		b.WriteString("\tluxocrypto \"github.com/light-speak/luxo/pkg/lux/crypto\"\n")
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/errors\"\n")
+	if feat.hasLog {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luxolog\"\n")
+	}
 	if hasAuth {
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
 	}
@@ -1940,6 +1944,8 @@ func scanBodyForBuiltins(block *ast.Block, f *handlerFeatures, currentModule ...
 			switch v.Field {
 			case "days", "hours", "minutes", "seconds", "milliseconds":
 				f.hasTimeFunc = true
+			case "i", "d", "w", "e":
+				f.hasLog = true
 			}
 		case *ast.CallExpr:
 			if ident, ok := v.Func.(*ast.Ident); ok && ident.Name == "now" {

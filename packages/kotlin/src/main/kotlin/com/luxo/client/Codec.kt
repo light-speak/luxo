@@ -252,4 +252,179 @@ object FieldMask {
     }
 }
 
+/**
+ * Columnar binary decoder for Luxo list responses.
+ *
+ * Columnar format:
+ *   [count varint]
+ *   [fieldID varint][val0][val1]...[valN]  // column 1
+ *   [fieldID varint][val0][val1]...[valN]  // column 2
+ *   ...
+ *   [0x00]  // end marker
+ */
+class ColumnarDecoder(private val buf: ByteArray) {
+
+    private var off: Int = 0
+
+    /** Number of rows in this columnar batch. */
+    val count: Int
+
+    /** The current column's field ID after calling [nextColumn]. */
+    var fieldID: Int = 0
+        private set
+
+    init {
+        count = readVarintRaw().toInt()
+    }
+
+    /** Advance to next column. Returns false at end marker (0x00) or EOF. */
+    fun nextColumn(): Boolean {
+        if (off >= buf.size) return false
+        val id = readVarintRaw().toInt()
+        fieldID = id
+        return id != 0
+    }
+
+    /** Read [count] zigzag-encoded signed int64 values. */
+    fun readColumnInt(): List<Long> {
+        val result = LongArray(count)
+        for (i in 0 until count) {
+            val uv = readVarintRaw()
+            result[i] = (uv ushr 1) xor -(uv and 1L)
+        }
+        return result.asList()
+    }
+
+    /** Read [count] fixed64 (8-byte LE) float values. */
+    fun readColumnFloat(): List<Double> {
+        val result = DoubleArray(count)
+        for (i in 0 until count) {
+            checkRemaining(8)
+            var bits: Long = 0
+            bits = bits or ((buf[off++].toLong() and 0xFF))
+            bits = bits or ((buf[off++].toLong() and 0xFF) shl 8)
+            bits = bits or ((buf[off++].toLong() and 0xFF) shl 16)
+            bits = bits or ((buf[off++].toLong() and 0xFF) shl 24)
+            bits = bits or ((buf[off++].toLong() and 0xFF) shl 32)
+            bits = bits or ((buf[off++].toLong() and 0xFF) shl 40)
+            bits = bits or ((buf[off++].toLong() and 0xFF) shl 48)
+            bits = bits or ((buf[off++].toLong() and 0xFF) shl 56)
+            result[i] = java.lang.Double.longBitsToDouble(bits)
+        }
+        return result.asList()
+    }
+
+    /** Read [count] length-prefixed UTF-8 string values. */
+    fun readColumnString(): List<String> {
+        val result = Array(count) { "" }
+        for (i in 0 until count) {
+            val len = readVarintRaw().toInt()
+            if (len == 0) { result[i] = ""; continue }
+            checkRemaining(len)
+            result[i] = String(buf, off, len, Charsets.UTF_8)
+            off += len
+        }
+        return result.asList()
+    }
+
+    /** Read [count] boolean values (varint 0/1). */
+    fun readColumnBool(): List<Boolean> {
+        val result = BooleanArray(count)
+        for (i in 0 until count) {
+            result[i] = readVarintRaw() != 0L
+        }
+        return result.asList()
+    }
+
+    /** Read [count] nullable int values (0x00=null, 0x01+svarint). */
+    fun readColumnIntPtr(): List<Long?> {
+        val result = arrayOfNulls<Long>(count)
+        for (i in 0 until count) {
+            checkRemaining(1)
+            if (buf[off++] == 0x00.toByte()) continue
+            val uv = readVarintRaw()
+            result[i] = (uv ushr 1) xor -(uv and 1L)
+        }
+        return result.asList()
+    }
+
+    /** Read [count] nullable float values (0x00=null, 0x01+fixed64). */
+    fun readColumnFloatPtr(): List<Double?> {
+        val result = arrayOfNulls<Double>(count)
+        for (i in 0 until count) {
+            checkRemaining(1)
+            if (buf[off++] == 0x00.toByte()) continue
+            checkRemaining(8)
+            var bits: Long = 0
+            bits = bits or ((buf[off++].toLong() and 0xFF))
+            bits = bits or ((buf[off++].toLong() and 0xFF) shl 8)
+            bits = bits or ((buf[off++].toLong() and 0xFF) shl 16)
+            bits = bits or ((buf[off++].toLong() and 0xFF) shl 24)
+            bits = bits or ((buf[off++].toLong() and 0xFF) shl 32)
+            bits = bits or ((buf[off++].toLong() and 0xFF) shl 40)
+            bits = bits or ((buf[off++].toLong() and 0xFF) shl 48)
+            bits = bits or ((buf[off++].toLong() and 0xFF) shl 56)
+            result[i] = java.lang.Double.longBitsToDouble(bits)
+        }
+        return result.asList()
+    }
+
+    /** Read [count] nullable string values (0x00=null, 0x01+string). */
+    fun readColumnStringPtr(): List<String?> {
+        val result = arrayOfNulls<String>(count)
+        for (i in 0 until count) {
+            checkRemaining(1)
+            if (buf[off++] == 0x00.toByte()) continue
+            val len = readVarintRaw().toInt()
+            if (len == 0) { result[i] = ""; continue }
+            checkRemaining(len)
+            result[i] = String(buf, off, len, Charsets.UTF_8)
+            off += len
+        }
+        return result.asList()
+    }
+
+    /** Read [count] nullable boolean values (0x00=null, 0x01+varint). */
+    fun readColumnBoolPtr(): List<Boolean?> {
+        val result = arrayOfNulls<Boolean>(count)
+        for (i in 0 until count) {
+            checkRemaining(1)
+            if (buf[off++] == 0x00.toByte()) continue
+            result[i] = readVarintRaw() != 0L
+        }
+        return result.asList()
+    }
+
+    /** Current read position (for reading pagination metadata after 0x00). */
+    fun offset(): Int = off
+
+    /** Read one signed zigzag-encoded varint at current position. */
+    fun readSvarint(): Long {
+        val uv = readVarintRaw()
+        return (uv ushr 1) xor -(uv and 1L)
+    }
+
+    // -- internal ---------------------------------------------------------
+
+    private fun readVarintRaw(): Long {
+        var result: Long = 0
+        var shift = 0
+        while (true) {
+            checkRemaining(1)
+            val b = buf[off++].toLong() and 0xFF
+            result = result or ((b and 0x7F) shl shift)
+            if (b and 0x80 == 0L) break
+            shift += 7
+            if (shift >= 64) throw LuxoCodecException("varint overflow")
+        }
+        return result
+    }
+
+    private fun checkRemaining(n: Int) {
+        if (off + n > buf.size) {
+            throw LuxoCodecException("unexpected end of buffer at offset $off, need $n bytes")
+        }
+    }
+}
+
 class LuxoCodecException(message: String) : RuntimeException(message)

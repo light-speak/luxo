@@ -378,15 +378,94 @@ func generateWriteLuxoAllFields(b *strings.Builder, m *ast.ModelDecl, recv strin
 // This is the inverse of WriteLuxo — used by remote DataLoaders to decode RPC responses.
 // generateTypeWriteLuxo generates WriteLuxo with value receiver for type declarations.
 // Value receiver allows calling on literals: AuthPayload{...}.WriteLuxo(...)
-// Type fields always write all — no FieldMask, no @visible/@transform/@mask.
+// Type fields write ALL fields unconditionally — including nested model references.
+// Unlike model WriteLuxo, type fields don't skip "relations" since types have no DB semantics.
 func generateTypeWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
 	name := m.Name
 	recv := strings.ToLower(name[:1])
 	fmt.Fprintf(b, "// WriteLuxo writes %s as Luxo binary directly to buf.\n", name)
 	fmt.Fprintf(b, "func (%s %s) WriteLuxo(buf *api.ResponseBuf, mask []byte) {\n", recv, name)
-	generateWriteLuxoAllFields(b, m, recv, enums)
+
+	for _, f := range m.Fields {
+		if f.Type == nil {
+			continue
+		}
+		fieldID := getModelFieldID(name, f.Name)
+		if fieldID == 0 {
+			continue
+		}
+		goField := recv + "." + str.Capitalize(f.Name)
+		fid := fmt.Sprintf("%d", fieldID)
+
+		if isRelationField(f, enums) {
+			// Nested model/type reference — write inline with WriteLuxo
+			if f.Type.IsList {
+				fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\tbuf.B = codec.AppendSvarint(buf.B, int64(len(%s)))\n", goField)
+				fmt.Fprintf(b, "\tfor i := range %s { %s[i].WriteLuxo(buf, nil) }\n", goField, goField)
+			} else if f.Type.Nullable {
+				fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\tif %s != nil { buf.B = codec.AppendPresent(buf.B); %s.WriteLuxo(buf, nil) } else { buf.B = codec.AppendNull(buf.B) }\n", goField, goField)
+			} else {
+				fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+				fmt.Fprintf(b, "\t%s.WriteLuxo(buf, nil)\n", goField)
+			}
+			continue
+		}
+
+		// Scalar/enum fields — same as generateWriteLuxoAllFields
+		if enums[f.Type.Name] {
+			fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s); buf.B = codec.AppendString(buf.B, string(%s))\n", fid, goField)
+			continue
+		}
+
+		writeTypeScalarField(b, f, fid, goField)
+	}
+
 	fmt.Fprintf(b, "\tbuf.B = append(buf.B, 0x00)\n")
 	fmt.Fprintf(b, "}\n\n")
+}
+
+// writeTypeScalarField writes a single scalar field for type WriteLuxo, handling nullable.
+func writeTypeScalarField(b *strings.Builder, f *ast.FieldDecl, fid, goField string) {
+	n := f.Type.Nullable
+	switch f.Type.Name {
+	case "Int":
+		if n {
+			fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+			fmt.Fprintf(b, "\tif %s != nil { buf.B = codec.AppendPresent(buf.B); buf.B = codec.AppendSvarint(buf.B, *%s) } else { buf.B = codec.AppendNull(buf.B) }\n", goField, goField)
+		} else {
+			fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s); buf.B = codec.AppendSvarint(buf.B, %s)\n", fid, goField)
+		}
+	case "Float":
+		if n {
+			fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+			fmt.Fprintf(b, "\tif %s != nil { buf.B = codec.AppendPresent(buf.B); buf.B = codec.AppendFixed64(buf.B, *%s) } else { buf.B = codec.AppendNull(buf.B) }\n", goField, goField)
+		} else {
+			fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s); buf.B = codec.AppendFixed64(buf.B, %s)\n", fid, goField)
+		}
+	case "String":
+		if n {
+			fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+			fmt.Fprintf(b, "\tif %s != nil { buf.B = codec.AppendPresent(buf.B); buf.B = codec.AppendString(buf.B, *%s) } else { buf.B = codec.AppendNull(buf.B) }\n", goField, goField)
+		} else {
+			fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s); buf.B = codec.AppendString(buf.B, %s)\n", fid, goField)
+		}
+	case "Boolean":
+		if n {
+			fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+			fmt.Fprintf(b, "\tif %s != nil { buf.B = codec.AppendPresent(buf.B); buf.B = codec.AppendBool(buf.B, *%s) } else { buf.B = codec.AppendNull(buf.B) }\n", goField, goField)
+		} else {
+			fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s); buf.B = codec.AppendBool(buf.B, %s)\n", fid, goField)
+		}
+	case "DateTime":
+		if n {
+			fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+			fmt.Fprintf(b, "\tif %s != nil { buf.B = codec.AppendPresent(buf.B); buf.B = codec.AppendSvarint(buf.B, %s.Unix()) } else { buf.B = codec.AppendNull(buf.B) }\n", goField, goField)
+		} else {
+			fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s); buf.B = codec.AppendSvarint(buf.B, %s.Unix())\n", fid, goField)
+		}
+	}
 }
 
 func generateReadLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {

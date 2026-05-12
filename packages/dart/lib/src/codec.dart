@@ -352,6 +352,171 @@ class LuxoDecoder {
   }
 }
 
+/// Columnar binary decoder for Luxo list responses.
+///
+/// Columnar format:
+/// ```
+/// [count varint]
+/// [fieldID varint][val0][val1]...[valN]  // column 1
+/// [fieldID varint][val0][val1]...[valN]  // column 2
+/// ...
+/// [0x00]  // end marker
+/// ```
+class ColumnarDecoder {
+  final ByteData _data;
+  final Uint8List _bytes;
+  int _off;
+
+  /// Number of rows in this columnar batch.
+  int count;
+
+  /// The current column's field ID after calling [nextColumn].
+  int fieldID = 0;
+
+  /// Creates a columnar decoder from raw bytes. Reads the row count varint.
+  ColumnarDecoder(Uint8List data)
+      : _data = ByteData.sublistView(data),
+        _bytes = data,
+        _off = 0,
+        count = 0 {
+    count = _readVarint();
+  }
+
+  /// Advances to the next column. Returns false at end marker (0x00) or EOF.
+  bool nextColumn() {
+    if (_off >= _data.lengthInBytes) return false;
+    final id = _readVarint();
+    if (id < 0) return false;
+    fieldID = id;
+    return id != 0;
+  }
+
+  /// Reads [count] svarint values (zigzag-encoded int column).
+  List<int> readColumnInt() {
+    final result = List<int>.filled(count, 0);
+    for (var i = 0; i < count; i++) {
+      result[i] = _readSvarint();
+    }
+    return result;
+  }
+
+  /// Reads [count] fixed64 float values.
+  List<double> readColumnFloat() {
+    final result = List<double>.filled(count, 0.0);
+    for (var i = 0; i < count; i++) {
+      if (_off + 8 > _data.lengthInBytes) break;
+      result[i] = _data.getFloat64(_off, Endian.little);
+      _off += 8;
+    }
+    return result;
+  }
+
+  /// Reads [count] length-prefixed string values.
+  List<String> readColumnString() {
+    final result = List<String>.filled(count, '');
+    for (var i = 0; i < count; i++) {
+      final len = _readVarint();
+      if (len <= 0) {
+        result[i] = '';
+        continue;
+      }
+      if (_off + len > _data.lengthInBytes) break;
+      result[i] = utf8.decode(Uint8List.sublistView(_bytes, _off, _off + len));
+      _off += len;
+    }
+    return result;
+  }
+
+  /// Reads [count] boolean values (varint 0/1).
+  List<bool> readColumnBool() {
+    final result = List<bool>.filled(count, false);
+    for (var i = 0; i < count; i++) {
+      result[i] = _readVarint() != 0;
+    }
+    return result;
+  }
+
+  /// Reads [count] nullable int values (0x00=null, 0x01+svarint).
+  List<int?> readColumnIntPtr() {
+    final result = List<int?>.filled(count, null);
+    for (var i = 0; i < count; i++) {
+      if (_off >= _data.lengthInBytes) break;
+      if (_bytes[_off++] == 0x00) continue;
+      result[i] = _readSvarint();
+    }
+    return result;
+  }
+
+  /// Reads [count] nullable float values (0x00=null, 0x01+fixed64).
+  List<double?> readColumnFloatPtr() {
+    final result = List<double?>.filled(count, null);
+    for (var i = 0; i < count; i++) {
+      if (_off >= _data.lengthInBytes) break;
+      if (_bytes[_off++] == 0x00) continue;
+      if (_off + 8 > _data.lengthInBytes) break;
+      result[i] = _data.getFloat64(_off, Endian.little);
+      _off += 8;
+    }
+    return result;
+  }
+
+  /// Reads [count] nullable string values (0x00=null, 0x01+string).
+  List<String?> readColumnStringPtr() {
+    final result = List<String?>.filled(count, null);
+    for (var i = 0; i < count; i++) {
+      if (_off >= _data.lengthInBytes) break;
+      if (_bytes[_off++] == 0x00) continue;
+      final len = _readVarint();
+      if (len <= 0) {
+        result[i] = '';
+        continue;
+      }
+      if (_off + len > _data.lengthInBytes) break;
+      result[i] = utf8.decode(Uint8List.sublistView(_bytes, _off, _off + len));
+      _off += len;
+    }
+    return result;
+  }
+
+  /// Reads [count] nullable boolean values (0x00=null, 0x01+varint).
+  List<bool?> readColumnBoolPtr() {
+    final result = List<bool?>.filled(count, null);
+    for (var i = 0; i < count; i++) {
+      if (_off >= _data.lengthInBytes) break;
+      if (_bytes[_off++] == 0x00) continue;
+      result[i] = _readVarint() != 0;
+    }
+    return result;
+  }
+
+  /// Current read position (for reading pagination metadata after 0x00).
+  int get offset => _off;
+
+  /// Reads one signed zigzag-encoded varint at current position.
+  int readSvarint() => _readSvarint();
+
+  // --- Internal ---
+
+  int _readSvarint() {
+    final uv = _readVarint();
+    return (uv >>> 1) ^ -(uv & 1);
+  }
+
+  /// Reads unsigned varint (LEB128). Returns -1 on error.
+  int _readVarint() {
+    var v = 0;
+    var shift = 0;
+    while (_off < _data.lengthInBytes) {
+      final b = _bytes[_off++];
+      v |= (b & 0x7F) << shift;
+      if (b < 0x80) return v;
+      shift += 7;
+      if (shift >= 64) return -1;
+    }
+    return -1;
+  }
+}
+
 // --- Field mask utilities ---
 
 /// Sets a bit in the field mask for the given fieldID. Returns the (possibly grown) mask.
