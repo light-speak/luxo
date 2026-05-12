@@ -111,12 +111,11 @@ func TestBuildGradientLineMultiChar(t *testing.T) {
 }
 
 func TestBuildBannerWithModules(t *testing.T) {
-	got := buildBanner("1.0.0", "4000", "embedded", "json", "postgres://user:pass@host/db", []string{"user", "post"})
+	got := buildBanner("1.0.0", "4000", "embedded", "postgres://user:pass@host/db", []string{"user", "post"})
 
 	checks := []string{
 		"1.0.0",
 		"embedded",
-		"json",
 		"4000",
 		"user:***@host/db", // masked DSN
 		"user",
@@ -131,7 +130,7 @@ func TestBuildBannerWithModules(t *testing.T) {
 }
 
 func TestBuildBannerNoDatabase(t *testing.T) {
-	got := buildBanner("dev", "3000", "standalone", "binary", "", nil)
+	got := buildBanner("dev", "3000", "standalone", "", nil)
 
 	if !strings.Contains(got, "(not configured)") {
 		t.Error("should show (not configured) when no DB URL")
@@ -142,7 +141,7 @@ func TestBuildBannerNoDatabase(t *testing.T) {
 }
 
 func TestBuildBannerEmptyModules(t *testing.T) {
-	got := buildBanner("dev", "3000", "standalone", "binary", "", []string{})
+	got := buildBanner("dev", "3000", "standalone", "", []string{})
 
 	if !strings.Contains(got, "(no modules)") {
 		t.Error("should show (no modules) when modules is empty")
@@ -356,7 +355,7 @@ func TestSecurityHeaders(t *testing.T) {
 func TestPrintBanner(t *testing.T) {
 	// printBanner just calls fmt.Print(buildBanner(...)) — verify no panic
 	// Capture by redirecting is overkill; just ensure it doesn't crash
-	printBanner("1.0", "4000", "embedded", "json", "", []string{"test"})
+	printBanner("1.0", "4000", "embedded", "", []string{"test"})
 }
 
 func TestBuildMuxIntrospectionKey(t *testing.T) {

@@ -43,6 +43,15 @@ func TestGenerateEntryFile(t *testing.T) {
 		`post_luxo "myapp/service/post/luxo"`,
 		`user_resolver "myapp/service/user/resolver"`,
 		`post_resolver "myapp/service/post/resolver"`,
+		"migrate.EnsureDatabase",
+		"migrate.New(ctx",
+		"migrator.Up(ctx)",
+		// Shared DB — one pool, all modules use NewFromDB
+		"lux.DBConfigFromEnv()",
+		"pg.NewDBWithConfig(ctx",
+		"defer db.Close()",
+		"user_luxo.NewFromDB(db)",
+		"post_luxo.NewFromDB(db)",
 		"luvia.New()",
 		"user_luxo.RegisterHandlers(gw.Router, userApp)",
 		"post_luxo.RegisterHandlers(gw.Router, postApp)",
@@ -56,6 +65,10 @@ func TestGenerateEntryFile(t *testing.T) {
 		if !strings.Contains(code, check) {
 			t.Errorf("missing %q in entry:\n%s", check, code)
 		}
+	}
+	// Should NOT create separate pools per module
+	if strings.Contains(code, "user_luxo.New(ctx)") || strings.Contains(code, "post_luxo.New(ctx)") {
+		t.Errorf("embedded mode should use NewFromDB(db), not New(ctx):\n%s", code)
 	}
 }
 

@@ -19,8 +19,8 @@ type DBConfig struct {
 	Password string        // DATABASE_PASSWORD
 	DBName   string        // DATABASE_PREFIX (default: luxo)
 	SSL      string        // DATABASE_SSL (default: disable)
-	Pool     int           // DATABASE_POOL — max connections (default: 50)
-	Idle     int           // DATABASE_IDLE — idle connections (default: 10)
+	Pool     int           // DATABASE_POOL — max connections (default: 20)
+	Idle     int           // DATABASE_IDLE — min idle connections (default: 2)
 	Timeout  time.Duration // DATABASE_TIMEOUT (default: 5s)
 	DebugSQL bool          // DEBUG_SQL — print all queries with timing
 }
@@ -33,8 +33,8 @@ func DefaultDBConfig() DBConfig {
 		User:    "postgres",
 		DBName:  "luxo",
 		SSL:     "disable",
-		Pool:    50,
-		Idle:    10,
+		Pool:    20,
+		Idle:    2,
 		Timeout: 5 * time.Second,
 	}
 }

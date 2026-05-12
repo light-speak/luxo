@@ -29,11 +29,11 @@ func TestDefaultDBConfig(t *testing.T) {
 	if cfg.SSL != "disable" {
 		t.Errorf("SSL = %q, want disable", cfg.SSL)
 	}
-	if cfg.Pool != 50 {
-		t.Errorf("Pool = %d, want 50", cfg.Pool)
+	if cfg.Pool != 20 {
+		t.Errorf("Pool = %d, want 20", cfg.Pool)
 	}
-	if cfg.Idle != 10 {
-		t.Errorf("Idle = %d, want 10", cfg.Idle)
+	if cfg.Idle != 2 {
+		t.Errorf("Idle = %d, want 2", cfg.Idle)
 	}
 	if cfg.Timeout != 5*time.Second {
 		t.Errorf("Timeout = %v, want 5s", cfg.Timeout)
