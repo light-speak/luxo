@@ -52,8 +52,27 @@ export class FetchTransport implements Transport {
   setMode(mode: TransportMode): void { this.mode = mode }
   setToken(token: string): void { this.headers['Authorization'] = `Bearer ${token}` }
 
+  /** Enable/disable request logging */
+  debug = false
+
   async call(api: string, params?: Record<string, unknown>): Promise<unknown> {
-    return this.mode === 'binary' ? this.binaryCall(api, params) : this.jsonCall(api, params)
+    const start = performance.now()
+    try {
+      const result = await (this.mode === 'binary' ? this.binaryCall(api, params) : this.jsonCall(api, params))
+      const ms = (performance.now() - start).toFixed(1)
+      if (this.debug) {
+        const mode = this.mode === 'binary' ? '🔵' : '🟢'
+        const size = result instanceof Uint8Array ? `${result.length}B` : 'json'
+        console.log(`${mode} ${api} ${ms}ms → ${size}`, params ?? '')
+      }
+      return result
+    } catch (e) {
+      const ms = (performance.now() - start).toFixed(1)
+      if (this.debug) {
+        console.error(`🔴 ${api} ${ms}ms ✗`, e instanceof LuxoError ? e.message : e, params ?? '')
+      }
+      throw e
+    }
   }
 
   private async jsonCall(api: string, params?: Record<string, unknown>): Promise<unknown> {

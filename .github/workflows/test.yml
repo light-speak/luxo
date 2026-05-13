@@ -138,7 +138,11 @@ jobs:
   sdk-swift:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout Swift SDK
+        uses: actions/checkout@v6
+        with:
+          repository: light-speak/luxo-swift
+          ref: main
 
       - name: Test Swift SDK
-        run: cd packages/swift && swift test
+        run: swift test

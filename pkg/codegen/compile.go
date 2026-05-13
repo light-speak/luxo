@@ -11,6 +11,52 @@ import (
 
 // compileAPIBody generates Go handler code from a .luxo API body.
 // The generated function reads params from req, executes the body, and writes the result.
+// compileDefaultValue converts an AST default value expression to Go code.
+func compileDefaultValue(expr ast.Expr, goType string, enums map[string]bool) string {
+	switch e := expr.(type) {
+	case *ast.Literal:
+		switch e.Kind {
+		case token.Int:
+			return e.Value
+		case token.Float:
+			return e.Value
+		case token.String:
+			return fmt.Sprintf("%q", e.Value)
+		case token.True:
+			return "true"
+		case token.False:
+			return "false"
+		}
+	case *ast.Ident:
+		if e.Name == "true" {
+			return "true"
+		}
+		if e.Name == "false" {
+			return "false"
+		}
+	case *ast.MemberExpr:
+		// Enum.VALUE → EnumVALUE
+		if ident, ok := e.Object.(*ast.Ident); ok {
+			if enums[ident.Name] {
+				return ident.Name + strings.ToUpper(e.Field)
+			}
+		}
+	}
+	// Fallback: zero value
+	switch goType {
+	case "int64":
+		return "0"
+	case "float64":
+		return "0"
+	case "string":
+		return `""`
+	case "bool":
+		return "false"
+	default:
+		return goType + "{}"
+	}
+}
+
 func compileAPIBody(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast.ModelDecl, enums map[string]bool) {
 	name := api.Name
 	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(name))
@@ -21,11 +67,23 @@ func compileAPIBody(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast
 		writeAuthCheck(b, "\t\t", d)
 	}
 
-	// Parse params
+	// Parse params (with default value support)
 	for _, p := range api.Params {
 		goType := resolveGoType(p.Type)
 		method := paramMethod(goType)
-		if method == "" {
+
+		if p.Default != nil {
+			// Parameter with default value — optional
+			defaultVal := compileDefaultValue(p.Default, goType, enums)
+			if method == "" {
+				// Custom type with default
+				fmt.Fprintf(b, "\t\tvar %s %s = %s\n", p.Name, goType, defaultVal)
+				fmt.Fprintf(b, "\t\t_ = req.ParamJSON(%q, &%s)\n", p.Name, p.Name)
+			} else {
+				fmt.Fprintf(b, "\t\t%s, _err_%s := req.Param%s(%q)\n", p.Name, p.Name, method, p.Name)
+				fmt.Fprintf(b, "\t\tif _err_%s != nil { %s = %s }\n", p.Name, p.Name, defaultVal)
+			}
+		} else if method == "" {
 			// Custom type — use ParamJSON with struct target
 			fmt.Fprintf(b, "\t\tvar %s %s\n", p.Name, goType)
 			fmt.Fprintf(b, "\t\tif err := req.ParamJSON(%q, &%s); err != nil {\n", p.Name, p.Name)
@@ -46,9 +104,13 @@ func compileAPIBody(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast
 		vars:     make(map[string]valType),
 		paginate: hasDirective(api.Directives, "paginate"),
 	}
-	// Register API params in vars with nullable info
+	// Register API params in vars with Luxo type name for type-aware compilation
 	for _, p := range api.Params {
-		vt := valType{name: resolveGoType(p.Type)}
+		typeName := "string"
+		if p.Type != nil {
+			typeName = p.Type.Name
+		}
+		vt := valType{name: typeName}
 		if p.Type != nil && p.Type.Nullable {
 			vt.nullable = true
 		}
@@ -610,6 +672,20 @@ func (c *compiler) compileMember(e *ast.MemberExpr) string {
 			return fmt.Sprintf("(time.Duration(%s) * %s)", c.compileExpr(e.Object), unit)
 		}
 	}
+	// Log methods: "message".i / .d / .w / .e — only on string literals or template strings
+	if isLogTarget(e.Object) {
+		switch e.Field {
+		case "i":
+			return fmt.Sprintf("luxolog.Info(%s)", c.compileExpr(e.Object))
+		case "d":
+			return fmt.Sprintf("luxolog.Debug(%s)", c.compileExpr(e.Object))
+		case "w":
+			return fmt.Sprintf("luxolog.Warn(%s)", c.compileExpr(e.Object))
+		case "e":
+			return fmt.Sprintf("luxolog.Error(%s)", c.compileExpr(e.Object))
+		}
+	}
+
 	obj := c.compileExpr(e.Object)
 	return fmt.Sprintf("%s.%s", obj, str.Capitalize(e.Field))
 }
@@ -1667,11 +1743,14 @@ func (c *compiler) compileTemplate(e *ast.TemplateString) string {
 			fmt.Fprintf(&b, "%s\t_sb.WriteString(%q)\n", c.indent, lit.Value)
 		} else {
 			compiled := c.compileExpr(part)
-			// Check if the expression is likely a string (member access on string field, or string var)
-			if c.isStringExpr(part) {
+			if c.isEnumExpr(part) {
+				fmt.Fprintf(&b, "%s\t_sb.WriteString(string(%s))\n", c.indent, compiled)
+			} else if c.isStringExpr(part) {
 				fmt.Fprintf(&b, "%s\t_sb.WriteString(%s)\n", c.indent, compiled)
-			} else {
+			} else if c.isIntExpr(part) {
 				fmt.Fprintf(&b, "%s\t_sb.WriteString(strconv.FormatInt(int64(%s), 10))\n", c.indent, compiled)
+			} else {
+				fmt.Fprintf(&b, "%s\tfmt.Fprintf(&_sb, \"%%v\", %s)\n", c.indent, compiled)
 			}
 		}
 	}
@@ -1684,7 +1763,6 @@ func (c *compiler) compileTemplate(e *ast.TemplateString) string {
 func (c *compiler) isStringExpr(expr ast.Expr) bool {
 	switch e := expr.(type) {
 	case *ast.MemberExpr:
-		// Check if the field is a known string field on a model
 		if ident, ok := e.Object.(*ast.Ident); ok {
 			if vt, ok := c.vars[ident.Name]; ok && vt.isModel {
 				if m, ok := c.models[vt.name]; ok {
@@ -1697,12 +1775,81 @@ func (c *compiler) isStringExpr(expr ast.Expr) bool {
 			}
 		}
 	case *ast.Ident:
-		// Check if the variable is known to be a string
-		if vt, ok := c.vars[e.Name]; ok && vt.name == "String" {
-			return true
+		if vt, ok := c.vars[e.Name]; ok {
+			if vt.name == "String" || vt.name == "string" {
+				return true
+			}
 		}
 	case *ast.Literal:
 		return e.Kind == token.String
+	case *ast.CallExpr:
+		// String method calls (e.g. .trim(), .lowercase())
+		if member, ok := e.Func.(*ast.MemberExpr); ok {
+			return c.isStringExpr(member.Object)
+		}
+	}
+	return false
+}
+
+// isLogTarget checks if an expression is a valid target for .i/.d/.w/.e log methods.
+// Only string literals and template strings are valid — not arbitrary member access like obj.i.
+func isLogTarget(expr ast.Expr) bool {
+	switch e := expr.(type) {
+	case *ast.Literal:
+		return e.Kind == token.String
+	case *ast.TemplateString:
+		return true
+	}
+	return false
+}
+
+// isEnumExpr checks if an expression is an enum type (needs string() cast).
+func (c *compiler) isEnumExpr(expr ast.Expr) bool {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		if vt, ok := c.vars[e.Name]; ok {
+			return c.enums[vt.name]
+		}
+	case *ast.MemberExpr:
+		if ident, ok := e.Object.(*ast.Ident); ok {
+			if vt, ok := c.vars[ident.Name]; ok && vt.isModel {
+				if m, ok := c.models[vt.name]; ok {
+					for _, f := range m.Fields {
+						if f.Name == e.Field && f.Type != nil {
+							return c.enums[f.Type.Name]
+						}
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+// isIntExpr checks if an expression is known to be an integer.
+func (c *compiler) isIntExpr(expr ast.Expr) bool {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		if vt, ok := c.vars[e.Name]; ok {
+			switch vt.name {
+			case "Int", "int64":
+				return true
+			}
+		}
+	case *ast.Literal:
+		return e.Kind == token.Int
+	case *ast.MemberExpr:
+		if ident, ok := e.Object.(*ast.Ident); ok {
+			if vt, ok := c.vars[ident.Name]; ok && vt.isModel {
+				if m, ok := c.models[vt.name]; ok {
+					for _, f := range m.Fields {
+						if f.Name == e.Field && f.Type != nil && f.Type.Name == "Int" {
+							return true
+						}
+					}
+				}
+			}
+		}
 	}
 	return false
 }

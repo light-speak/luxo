@@ -3,12 +3,14 @@ package api
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	stderrors "errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
-
-	"encoding/json"
+	"sync"
+	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
@@ -154,12 +156,17 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	buf := GetBuf()
 	req.Buf = buf
 
+	start := time.Now()
 	herr := rt.callHandler(fn, r.Context(), req)
+	duration := time.Since(start)
+
 	if herr != nil {
+		rt.logRequest(req.API, duration, herr)
 		PutBuf(buf)
 		rt.writeAppError(w, r, binaryMode, herr)
 		return
 	}
+	rt.logRequest(req.API, duration, nil)
 
 	if binaryMode {
 		// Client wants binary: handler wrote Luxo binary, pass through
@@ -228,8 +235,14 @@ func (rt *Router) convertBinaryToJSON(apiName string, data []byte) []byte {
 		return schema.BinaryScalarToJSON(nil, data, "Int")
 	}
 
-	// Check if return type is a model or a scalar type name
+	// Check if return type is a model, type declaration, or scalar
 	model := rt.Schema.Models[apiMeta.ReturnType]
+	if model == nil {
+		// Try type declarations (non-DB types like AuthPayload)
+		if td := rt.Schema.Types[apiMeta.ReturnType]; td != nil {
+			model = td.AsModel()
+		}
+	}
 	if model == nil {
 		// Scalar return — use declared type for precise decoding
 		return schema.BinaryScalarToJSON(nil, data, apiMeta.ReturnType)
@@ -241,7 +254,7 @@ func (rt *Router) convertBinaryToJSON(apiName string, data []byte) []byte {
 		}
 		return schema.BinaryListToJSON(nil, data, model)
 	}
-	return schema.BinaryToJSON(nil, data, model)
+	return schema.BinaryToJSON(nil, data, model, rt.Schema)
 }
 
 // callHandler executes a handler with panic recovery.
@@ -316,6 +329,100 @@ func (rt *Router) writeAppError(w http.ResponseWriter, r *http.Request, binaryMo
 	w.WriteHeader(appErr.Code)
 	w.Write(buf.B)
 	PutBuf(buf)
+}
+
+// ANSI color codes for module tags
+var moduleColors = []string{
+	"\033[36m", // cyan
+	"\033[33m", // yellow
+	"\033[35m", // magenta
+	"\033[32m", // green
+	"\033[34m", // blue
+	"\033[91m", // bright red
+	"\033[92m", // bright green
+	"\033[93m", // bright yellow
+	"\033[94m", // bright blue
+	"\033[95m", // bright magenta
+	"\033[96m", // bright cyan
+}
+
+const (
+	colorReset = "\033[0m"
+	colorDim   = "\033[2m"
+	colorRed   = "\033[31m"
+	colorGreen = "\033[32m"
+)
+
+// logEnabled controls whether request logging is active (LOG_REQUESTS env, opt-in).
+var logEnabled = os.Getenv("LOG_REQUESTS") == "true"
+
+// moduleColorMap caches color assignment per module name.
+var (
+	moduleColorMu  sync.Mutex
+	moduleColorMap = make(map[string]string)
+	moduleColorIdx int
+)
+
+func moduleColor(mod string) string {
+	moduleColorMu.Lock()
+	defer moduleColorMu.Unlock()
+	if c, ok := moduleColorMap[mod]; ok {
+		return c
+	}
+	c := moduleColors[moduleColorIdx%len(moduleColors)]
+	moduleColorMap[mod] = c
+	moduleColorIdx++
+	return c
+}
+
+// logRequest prints a colored request log line:
+//
+//	12:34:56 [auth] login 2.3ms ✓
+//	12:34:56 [auth] login 1.2ms ✗ InvalidCredentials
+func (rt *Router) logRequest(apiName string, duration time.Duration, err error) {
+	if !logEnabled {
+		return
+	}
+	mod := ""
+	if rt.Schema != nil {
+		if a, ok := rt.Schema.APIs[apiName]; ok {
+			mod = a.Module
+		}
+	}
+	if mod == "" {
+		mod = "api"
+	}
+
+	ts := time.Now().Format("15:04:05")
+	ms := float64(duration.Microseconds()) / 1000.0
+	mc := moduleColor(mod)
+
+	var durColor string
+	if ms > 500 {
+		durColor = colorRed
+	} else if ms > 100 {
+		durColor = "\033[33m" // yellow
+	} else {
+		durColor = colorDim
+	}
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s %s[%s]%s %s %s%.1fms%s %s✗ %s%s\n",
+			colorDim+ts+colorReset,
+			mc, mod, colorReset,
+			apiName,
+			durColor, ms, colorReset,
+			colorRed, err.Error(), colorReset,
+		)
+	} else {
+		fmt.Fprintf(os.Stderr, "%s %s[%s]%s %s %s%.1fms%s %s✓%s\n",
+			colorDim+ts+colorReset,
+			mc, mod, colorReset,
+			apiName,
+			durColor, ms, colorReset,
+			colorGreen, colorReset,
+		)
+	}
 }
 
 // writeError writes a simple JSON error response for infrastructure errors.

@@ -202,3 +202,36 @@ func TestLoadConfigBadRefreshExpires(t *testing.T) {
 		t.Fatal("should error on bad JWT_REFRESH_EXPIRES")
 	}
 }
+
+func TestParseDuration(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected time.Duration
+		wantErr  bool
+	}{
+		{"7d", 7 * 24 * time.Hour, false},
+		{"2w", 2 * 7 * 24 * time.Hour, false},
+		{"1d12h", 36 * time.Hour, false},
+		{"30m", 30 * time.Minute, false},
+		{"168h", 168 * time.Hour, false},
+		{"500ms", 500 * time.Millisecond, false},
+		{"0.5d", 12 * time.Hour, false},
+		{"bad", 0, true},
+	}
+	for _, tt := range tests {
+		got, err := parseDuration(tt.input)
+		if tt.wantErr {
+			if err == nil {
+				t.Errorf("parseDuration(%q) should error", tt.input)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseDuration(%q) error: %v", tt.input, err)
+			continue
+		}
+		if got != tt.expected {
+			t.Errorf("parseDuration(%q) = %v, want %v", tt.input, got, tt.expected)
+		}
+	}
+}

@@ -120,9 +120,9 @@ export class Encoder {
     this.buf[this.pos++] = 0x00
   }
 
-  /** Return a trimmed view of the encoded data (no copy if possible) */
+  /** Return a trimmed copy of the encoded data (safe for fetch body) */
   bytes(): Uint8Array {
-    return this.buf.subarray(0, this.pos)
+    return this.buf.slice(0, this.pos)
   }
 
   /** Reset encoder for reuse without reallocating */
@@ -161,15 +161,15 @@ export class Decoder {
   /** Read unsigned LEB128 varint */
   private readVarintRaw(): number {
     let v = 0
-    let shift = 0
+    let mul = 1
     while (this.off < this.data.length) {
       const b = this.data[this.off++]
-      v += (b & 0x7F) * (2 ** shift) // use multiply to avoid 32-bit limit of <<
+      v += (b & 0x7F) * mul
       if (b < 0x80) return v
-      shift += 7
-      if (shift >= 56) return 0 // overflow guard (beyond 53-bit safe range)
+      mul *= 128
+      if (mul > 562949953421312) return 0 // 2^49 overflow guard
     }
-    return 0 // truncated
+    return 0
   }
 
   /** Read signed zigzag-encoded int */
@@ -250,6 +250,144 @@ export class Decoder {
   /** Skip remaining bytes (useful when encountering unknown fields) */
   get remaining(): number {
     return this.data.length - this.off
+  }
+}
+
+// --- Columnar Decoder ---
+// Reads columnar-encoded list data: [count varint][fieldID][vals...][fieldID][vals...]...[0x00]
+
+export class ColumnarDecoder {
+  private buf: Uint8Array
+  private view: DataView
+  private off: number
+  readonly count: number
+  fieldID: number
+
+  constructor(data: Uint8Array) {
+    this.buf = data
+    this.view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+    this.off = 0
+    this.fieldID = 0
+    this.count = this.readVarintRaw()
+  }
+
+  /** Advance to next column. Returns false at end marker (0x00) or EOF. */
+  nextColumn(): boolean {
+    if (this.off >= this.buf.length) return false
+    const id = this.readVarintRaw()
+    this.fieldID = id
+    if (id === 0) return false
+    return true
+  }
+
+  /** Read count svarint values (zigzag-encoded int column). */
+  readColumnInt(): number[] {
+    const result: number[] = new Array(this.count)
+    for (let i = 0; i < this.count; i++) {
+      result[i] = this.readSvarint()
+    }
+    return result
+  }
+
+  /** Read count fixed64 float values. */
+  readColumnFloat(): number[] {
+    const result: number[] = new Array(this.count)
+    for (let i = 0; i < this.count; i++) {
+      result[i] = this.view.getFloat64(this.off, true)
+      this.off += 8
+    }
+    return result
+  }
+
+  /** Read count length-prefixed string values. */
+  readColumnString(): string[] {
+    const result: string[] = new Array(this.count)
+    for (let i = 0; i < this.count; i++) {
+      const len = this.readVarintRaw()
+      if (len === 0) { result[i] = ''; continue }
+      result[i] = textDecoder.decode(this.buf.subarray(this.off, this.off + len))
+      this.off += len
+    }
+    return result
+  }
+
+  /** Read count boolean values (varint 0/1). */
+  readColumnBool(): boolean[] {
+    const result: boolean[] = new Array(this.count)
+    for (let i = 0; i < this.count; i++) {
+      result[i] = this.readVarintRaw() !== 0
+    }
+    return result
+  }
+
+  /** Read count nullable int values (0x00=null, 0x01+svarint). */
+  readColumnIntPtr(): (number | null)[] {
+    const result: (number | null)[] = new Array(this.count)
+    for (let i = 0; i < this.count; i++) {
+      if (this.buf[this.off++] === 0x00) { result[i] = null; continue }
+      result[i] = this.readSvarint()
+    }
+    return result
+  }
+
+  /** Read count nullable float values (0x00=null, 0x01+fixed64). */
+  readColumnFloatPtr(): (number | null)[] {
+    const result: (number | null)[] = new Array(this.count)
+    for (let i = 0; i < this.count; i++) {
+      if (this.buf[this.off++] === 0x00) { result[i] = null; continue }
+      result[i] = this.view.getFloat64(this.off, true)
+      this.off += 8
+    }
+    return result
+  }
+
+  /** Read count nullable string values (0x00=null, 0x01+string). */
+  readColumnStringPtr(): (string | null)[] {
+    const result: (string | null)[] = new Array(this.count)
+    for (let i = 0; i < this.count; i++) {
+      if (this.buf[this.off++] === 0x00) { result[i] = null; continue }
+      const len = this.readVarintRaw()
+      if (len === 0) { result[i] = ''; continue }
+      result[i] = textDecoder.decode(this.buf.subarray(this.off, this.off + len))
+      this.off += len
+    }
+    return result
+  }
+
+  /** Read count nullable boolean values (0x00=null, 0x01+varint). */
+  readColumnBoolPtr(): (boolean | null)[] {
+    const result: (boolean | null)[] = new Array(this.count)
+    for (let i = 0; i < this.count; i++) {
+      if (this.buf[this.off++] === 0x00) { result[i] = null; continue }
+      result[i] = this.readVarintRaw() !== 0
+    }
+    return result
+  }
+
+  /** Current read position (for reading pagination metadata after 0x00). */
+  offset(): number {
+    return this.off
+  }
+
+  /** Read one signed zigzag-encoded varint at current position. */
+  readSvarint(): number {
+    const uv = this.readVarintRaw()
+    const half = Math.floor(uv / 2)
+    return (uv & 1) ? -(half + 1) : half
+  }
+
+  /** Read unsigned LEB128 varint. */
+  private readVarintRaw(): number {
+    let v = 0
+    let mul = 1 // multiplier: 1, 128, 16384, ... — avoids 2**shift per iteration
+    while (this.off < this.buf.length) {
+      const b = this.buf[this.off++]
+      v += (b & 0x7F) * mul
+      if (b < 0x80) return v
+      mul *= 128
+      if (mul > 562949953421312) return 0 // 2^49 overflow guard
+    }
+    return 0
   }
 }
 

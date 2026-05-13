@@ -339,9 +339,15 @@ func writeImports(b *strings.Builder, files []*ast.File) {
 	}
 
 	b.WriteString("import (\n")
+	// stdlib group
+	if needs.auth {
+		b.WriteString("\t\"fmt\"\n")
+		b.WriteString("\t\"os\"\n")
+	}
 	if needs.time {
 		b.WriteString("\t\"time\"\n")
 	}
+	// third-party group
 	if needs.uuid {
 		b.WriteString("\n\t\"github.com/google/uuid\"\n")
 	}

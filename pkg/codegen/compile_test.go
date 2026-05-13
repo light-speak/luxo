@@ -4320,10 +4320,14 @@ func TestCompileTemplateWithMemberAccess(t *testing.T) {
 	if !strings.Contains(got, "strings.Builder") {
 		t.Fatalf("missing strings.Builder, got:\n%s", got)
 	}
-	// Should have 5 WriteString calls
-	count := strings.Count(got, "_sb.WriteString(")
-	if count != 5 {
-		t.Fatalf("expected 5 WriteString calls, got %d:\n%s", count, got)
+	// 3 literal WriteStrings + 2 fmt.Fprintf for unknown-type member access
+	wsCount := strings.Count(got, "_sb.WriteString(")
+	fmtCount := strings.Count(got, "fmt.Fprintf(&_sb")
+	if wsCount != 3 {
+		t.Fatalf("expected 3 WriteString calls for literals, got %d:\n%s", wsCount, got)
+	}
+	if fmtCount != 2 {
+		t.Fatalf("expected 2 fmt.Fprintf for unknown member access, got %d:\n%s", fmtCount, got)
 	}
 }
 
@@ -5932,6 +5936,7 @@ func TestCompileForExprWithReturnStmt(t *testing.T) {
 
 func TestCompileTemplateWithIntExpr(t *testing.T) {
 	c := newCompiler(nil)
+	c.vars["count"] = valType{name: "Int"}
 	got := c.compileExpr(&ast.TemplateString{
 		Parts: []ast.Expr{
 			&ast.Literal{Kind: token.String, Value: "count: "},
@@ -7308,5 +7313,270 @@ func TestResolveQueryTypeInstanceMethod(t *testing.T) {
 	vt2 := c.resolveQueryType(upd)
 	if vt2.name != "Int" {
 		t.Errorf("project.update() type = %q, want Int", vt2.name)
+	}
+}
+
+// ─── compileDefaultValue ────────────────────────────────────────────────────
+
+func TestCompileDefaultValueIntLiteral(t *testing.T) {
+	got := compileDefaultValue(&ast.Literal{Kind: token.Int, Value: "42"}, "int64", nil)
+	if got != "42" {
+		t.Fatalf("want %q, got %q", "42", got)
+	}
+}
+
+func TestCompileDefaultValueFloatLiteral(t *testing.T) {
+	got := compileDefaultValue(&ast.Literal{Kind: token.Float, Value: "0.1"}, "float64", nil)
+	if got != "0.1" {
+		t.Fatalf("want %q, got %q", "0.1", got)
+	}
+}
+
+func TestCompileDefaultValueStringLiteral(t *testing.T) {
+	got := compileDefaultValue(&ast.Literal{Kind: token.String, Value: "hello"}, "string", nil)
+	if got != `"hello"` {
+		t.Fatalf("want %q, got %q", `"hello"`, got)
+	}
+}
+
+func TestCompileDefaultValueBoolTrue(t *testing.T) {
+	got := compileDefaultValue(&ast.Ident{Name: "true"}, "bool", nil)
+	if got != "true" {
+		t.Fatalf("want %q, got %q", "true", got)
+	}
+}
+
+func TestCompileDefaultValueBoolFalse(t *testing.T) {
+	got := compileDefaultValue(&ast.Ident{Name: "false"}, "bool", nil)
+	if got != "false" {
+		t.Fatalf("want %q, got %q", "false", got)
+	}
+}
+
+func TestCompileDefaultValueEnumMember(t *testing.T) {
+	enums := map[string]bool{"DeployMode": true}
+	expr := &ast.MemberExpr{
+		Object: &ast.Ident{Name: "DeployMode"},
+		Field:  "EMBEDDED",
+	}
+	got := compileDefaultValue(expr, "DeployMode", enums)
+	if got != "DeployModeEMBEDDED" {
+		t.Fatalf("want %q, got %q", "DeployModeEMBEDDED", got)
+	}
+}
+
+func TestCompileDefaultValueFallbackInt(t *testing.T) {
+	// Unknown expr → fallback zero value for int64
+	got := compileDefaultValue(&ast.Ident{Name: "unknownVar"}, "int64", nil)
+	if got != "0" {
+		t.Fatalf("want %q, got %q", "0", got)
+	}
+}
+
+func TestCompileDefaultValueFallbackFloat(t *testing.T) {
+	got := compileDefaultValue(&ast.Ident{Name: "unknownVar"}, "float64", nil)
+	if got != "0" {
+		t.Fatalf("want %q, got %q", "0", got)
+	}
+}
+
+func TestCompileDefaultValueFallbackString(t *testing.T) {
+	got := compileDefaultValue(&ast.Ident{Name: "unknownVar"}, "string", nil)
+	if got != `""` {
+		t.Fatalf("want %q, got %q", `""`, got)
+	}
+}
+
+func TestCompileDefaultValueFallbackBool(t *testing.T) {
+	got := compileDefaultValue(&ast.Ident{Name: "unknownVar"}, "bool", nil)
+	if got != "false" {
+		t.Fatalf("want %q, got %q", "false", got)
+	}
+}
+
+func TestCompileDefaultValueFallbackCustomType(t *testing.T) {
+	got := compileDefaultValue(&ast.Ident{Name: "unknownVar"}, "MyStruct", nil)
+	if got != "MyStruct{}" {
+		t.Fatalf("want %q, got %q", "MyStruct{}", got)
+	}
+}
+
+func TestCompileDefaultValueEnumMemberNotInEnums(t *testing.T) {
+	// MemberExpr but not an enum → falls through to fallback
+	expr := &ast.MemberExpr{
+		Object: &ast.Ident{Name: "Pkg"},
+		Field:  "VALUE",
+	}
+	got := compileDefaultValue(expr, "string", nil)
+	if got != `""` {
+		t.Fatalf("want empty string fallback, got %q", got)
+	}
+}
+
+// ─── compileMember — log methods (.i / .d / .w / .e) ────────────────────────
+
+func TestCompileMemberLogInfo(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.MemberExpr{
+		Object: &ast.Literal{Kind: token.String, Value: "hello"},
+		Field:  "i",
+	})
+	if got != `luxolog.Info("hello")` {
+		t.Fatalf("want luxolog.Info(\"hello\"), got %q", got)
+	}
+}
+
+func TestCompileMemberLogDebug(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.MemberExpr{
+		Object: &ast.Literal{Kind: token.String, Value: "msg"},
+		Field:  "d",
+	})
+	if got != `luxolog.Debug("msg")` {
+		t.Fatalf("want luxolog.Debug(\"msg\"), got %q", got)
+	}
+}
+
+func TestCompileMemberLogWarn(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.MemberExpr{
+		Object: &ast.Literal{Kind: token.String, Value: "warning"},
+		Field:  "w",
+	})
+	if got != `luxolog.Warn("warning")` {
+		t.Fatalf("want luxolog.Warn(\"warning\"), got %q", got)
+	}
+}
+
+func TestCompileMemberLogError(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.MemberExpr{
+		Object: &ast.Literal{Kind: token.String, Value: "fail"},
+		Field:  "e",
+	})
+	if got != `luxolog.Error("fail")` {
+		t.Fatalf("want luxolog.Error(\"fail\"), got %q", got)
+	}
+}
+
+// ─── isEnumExpr ─────────────────────────────────────────────────────────────
+
+func TestIsEnumExprTrueForEnumVar(t *testing.T) {
+	c := newCompiler(nil)
+	c.enums = map[string]bool{"Role": true}
+	c.vars["role"] = valType{name: "Role"}
+	if !c.isEnumExpr(&ast.Ident{Name: "role"}) {
+		t.Fatal("isEnumExpr should be true for enum variable")
+	}
+}
+
+func TestIsEnumExprFalseForStringVar(t *testing.T) {
+	c := newCompiler(nil)
+	c.enums = map[string]bool{"Role": true}
+	c.vars["name"] = valType{name: "String"}
+	if c.isEnumExpr(&ast.Ident{Name: "name"}) {
+		t.Fatal("isEnumExpr should be false for string variable")
+	}
+}
+
+func TestIsEnumExprFalseForUnknownVar(t *testing.T) {
+	c := newCompiler(nil)
+	c.enums = map[string]bool{"Role": true}
+	if c.isEnumExpr(&ast.Ident{Name: "unknown"}) {
+		t.Fatal("isEnumExpr should be false for unknown variable")
+	}
+}
+
+func TestIsEnumExprMemberField(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"User": {
+			Name: "User",
+			Fields: []*ast.FieldDecl{
+				{Name: "role", Type: &ast.TypeRef{Name: "Role"}},
+				{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			},
+		},
+	}
+	c := newCompiler(models)
+	c.enums = map[string]bool{"Role": true}
+	c.vars["user"] = valType{isModel: true, name: "User"}
+
+	// user.role → enum field → true
+	if !c.isEnumExpr(&ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "role"}) {
+		t.Fatal("isEnumExpr should be true for model enum field")
+	}
+	// user.name → string field → false
+	if c.isEnumExpr(&ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "name"}) {
+		t.Fatal("isEnumExpr should be false for model string field")
+	}
+}
+
+// ─── isIntExpr ──────────────────────────────────────────────────────────────
+
+func TestIsIntExprTrueForIntVar(t *testing.T) {
+	c := newCompiler(nil)
+	c.vars["count"] = valType{name: "Int"}
+	if !c.isIntExpr(&ast.Ident{Name: "count"}) {
+		t.Fatal("isIntExpr should be true for Int variable")
+	}
+}
+
+func TestIsIntExprTrueForInt64Var(t *testing.T) {
+	c := newCompiler(nil)
+	c.vars["n"] = valType{name: "int64"}
+	if !c.isIntExpr(&ast.Ident{Name: "n"}) {
+		t.Fatal("isIntExpr should be true for int64 variable")
+	}
+}
+
+func TestIsIntExprFalseForStringVar(t *testing.T) {
+	c := newCompiler(nil)
+	c.vars["name"] = valType{name: "String"}
+	if c.isIntExpr(&ast.Ident{Name: "name"}) {
+		t.Fatal("isIntExpr should be false for string variable")
+	}
+}
+
+func TestIsIntExprTrueForIntLiteral(t *testing.T) {
+	c := newCompiler(nil)
+	if !c.isIntExpr(&ast.Literal{Kind: token.Int, Value: "42"}) {
+		t.Fatal("isIntExpr should be true for int literal")
+	}
+}
+
+func TestIsIntExprFalseForStringLiteral(t *testing.T) {
+	c := newCompiler(nil)
+	if c.isIntExpr(&ast.Literal{Kind: token.String, Value: "hello"}) {
+		t.Fatal("isIntExpr should be false for string literal")
+	}
+}
+
+func TestIsIntExprMemberFieldInt(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"User": {
+			Name: "User",
+			Fields: []*ast.FieldDecl{
+				{Name: "age", Type: &ast.TypeRef{Name: "Int"}},
+				{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			},
+		},
+	}
+	c := newCompiler(models)
+	c.vars["user"] = valType{isModel: true, name: "User"}
+
+	// user.age → Int field → true
+	if !c.isIntExpr(&ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "age"}) {
+		t.Fatal("isIntExpr should be true for model Int field")
+	}
+	// user.name → String field → false
+	if c.isIntExpr(&ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "name"}) {
+		t.Fatal("isIntExpr should be false for model String field")
+	}
+}
+
+func TestIsIntExprFalseForUnknownVar(t *testing.T) {
+	c := newCompiler(nil)
+	if c.isIntExpr(&ast.Ident{Name: "unknown"}) {
+		t.Fatal("isIntExpr should be false for unknown variable")
 	}
 }

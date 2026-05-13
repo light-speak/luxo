@@ -112,6 +112,13 @@ func generateSchemaFile(result *semantic.Result, packageName string, enums map[s
 		writeAPIRegistrationSchema(&b, api.name, api.moduleName, api.params, api.returnType, api.paginated, api.directives)
 	}
 
+	// Register type declarations (non-DB types like AuthPayload)
+	for _, file := range result.Files {
+		for _, t := range file.Types {
+			writeTypeRegistration(&b, t, enums)
+		}
+	}
+
 	b.WriteString("}\n")
 
 	return []byte(b.String())
@@ -143,6 +150,30 @@ func writeModelRegistration(b *strings.Builder, m *ast.ModelDecl, enums map[stri
 		fieldType := luxoTypeToSchemaType(f.Type.Name, enums)
 		fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, Nullable: %v},\n",
 			fieldID, f.Name, fieldType, f.Type.Nullable)
+	}
+
+	fmt.Fprintf(b, "\t\t},\n")
+	fmt.Fprintf(b, "\t})\n")
+}
+
+// writeTypeRegistration generates schema.RegisterType for a type declaration.
+func writeTypeRegistration(b *strings.Builder, t *ast.TypeDecl, enums map[string]bool) {
+	fmt.Fprintf(b, "\ts.RegisterType(&schema.TypeDecl{\n")
+	fmt.Fprintf(b, "\t\tName: %q,\n", t.Name)
+	fmt.Fprintf(b, "\t\tFields: []schema.Field{\n")
+
+	for _, f := range t.Fields {
+		if f.Type == nil {
+			continue
+		}
+		fieldID := getModelFieldID(t.Name, f.Name)
+		if fieldID == 0 {
+			continue
+		}
+		fieldType := luxoTypeToSchemaType(f.Type.Name, enums)
+		relation := isRelationField(f, enums)
+		fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, TypeName: %q, Nullable: %v, IsList: %v, Relation: %v},\n",
+			fieldID, f.Name, fieldType, f.Type.Name, f.Type.Nullable, f.Type.IsList, relation)
 	}
 
 	fmt.Fprintf(b, "\t\t},\n")
