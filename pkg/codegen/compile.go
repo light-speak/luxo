@@ -22,6 +22,10 @@ func compileDefaultValue(expr ast.Expr, goType string, enums map[string]bool) st
 			return e.Value
 		case token.String:
 			return fmt.Sprintf("%q", e.Value)
+		case token.True:
+			return "true"
+		case token.False:
+			return "false"
 		}
 	case *ast.Ident:
 		if e.Name == "true" {

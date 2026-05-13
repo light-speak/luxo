@@ -3,14 +3,14 @@ package api
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	stderrors "errors"
 	"fmt"
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
-
-	"encoding/json"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
@@ -353,14 +353,19 @@ const (
 	colorGreen = "\033[32m"
 )
 
-// logEnabled controls whether request logging is active (LOG_REQUESTS env).
-var logEnabled = os.Getenv("LOG_REQUESTS") != "false"
+// logEnabled controls whether request logging is active (LOG_REQUESTS env, opt-in).
+var logEnabled = os.Getenv("LOG_REQUESTS") == "true"
 
 // moduleColorMap caches color assignment per module name.
-var moduleColorMap = make(map[string]string)
-var moduleColorIdx int
+var (
+	moduleColorMu  sync.Mutex
+	moduleColorMap = make(map[string]string)
+	moduleColorIdx int
+)
 
 func moduleColor(mod string) string {
+	moduleColorMu.Lock()
+	defer moduleColorMu.Unlock()
 	if c, ok := moduleColorMap[mod]; ok {
 		return c
 	}

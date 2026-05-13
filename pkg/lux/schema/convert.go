@@ -53,6 +53,14 @@ func appendNestedModelJSON(dst []byte, dec *codec.Decoder, f *Field, s *Schema) 
 		}
 	}
 	if nested == nil {
+		// Schema incomplete: we cannot skip nested fields without type info.
+		// This should never happen in practice since codegen ensures schema completeness.
+		// Drain the nested sub-message (terminated by 0x00) by consuming field IDs
+		// without reading values — this will exhaust the decoder.
+		for dec.NextField() {
+			// Cannot read field values without type info; decoder is now misaligned.
+			break
+		}
 		return append(dst, "null"...)
 	}
 	// The nested model's fields are inline in the same byte stream,

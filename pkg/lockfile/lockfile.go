@@ -133,6 +133,30 @@ func (lf *LockFile) updateTypes(files []*ast.File) {
 	if lf.Types == nil {
 		lf.Types = make(map[string]*ModelLock)
 	}
+
+	// Collect current type→field names from AST.
+	currentTypes := make(map[string]map[string]bool)
+	for _, file := range files {
+		for _, td := range file.Types {
+			fields := make(map[string]bool, len(td.Fields))
+			for _, f := range td.Fields {
+				fields[f.Name] = true
+			}
+			currentTypes[td.Name] = fields
+		}
+	}
+
+	// Reserve IDs for removed fields.
+	for name, ml := range lf.Types {
+		current, exists := currentTypes[name]
+		if !exists {
+			lf.reserveAllFields(ml)
+			continue
+		}
+		lf.reserveRemovedFields(ml, current)
+	}
+
+	// Assign IDs to new fields.
 	for _, file := range files {
 		for _, td := range file.Types {
 			ml, exists := lf.Types[td.Name]

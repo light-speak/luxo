@@ -379,7 +379,8 @@ class ColumnarDecoder {
         _bytes = data,
         _off = 0,
         count = 0 {
-    count = _readVarint();
+    final raw = _readVarint();
+    count = raw < 0 ? 0 : raw;
   }
 
   /// Advances to the next column. Returns false at end marker (0x00) or EOF.

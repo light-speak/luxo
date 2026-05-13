@@ -32,12 +32,15 @@ type TypeDecl struct {
 // AsModel converts TypeDecl to a Model for Binary↔JSON conversion.
 // Types use the same field-based binary encoding as models.
 func (td *TypeDecl) AsModel() *Model {
-	m := &Model{Name: td.Name, Fields: td.Fields}
+	// Copy the fields slice so we don't mutate td.Fields (JSONPrefix append).
+	fields := make([]Field, len(td.Fields))
+	copy(fields, td.Fields)
+	m := &Model{Name: td.Name, Fields: fields}
 	m.byID = make(map[int]*Field, len(m.Fields))
 	m.byName = make(map[string]*Field, len(m.Fields))
 	for i := range m.Fields {
 		f := &m.Fields[i]
-		f.JSONPrefix = append(f.JSONPrefix, '"')
+		f.JSONPrefix = append(f.JSONPrefix[:0:0], '"')
 		f.JSONPrefix = append(f.JSONPrefix, f.Name...)
 		f.JSONPrefix = append(f.JSONPrefix, '"', ':')
 		m.byID[f.ID] = f

@@ -1945,7 +1945,13 @@ func scanBodyForBuiltins(block *ast.Block, f *handlerFeatures, currentModule ...
 			case "days", "hours", "minutes", "seconds", "milliseconds":
 				f.hasTimeFunc = true
 			case "i", "d", "w", "e":
-				f.hasLog = true
+				// Only count as log if object is a string literal or template
+				if _, isLit := v.Object.(*ast.Literal); isLit {
+					f.hasLog = true
+				}
+				if _, isTmpl := v.Object.(*ast.TemplateString); isTmpl {
+					f.hasLog = true
+				}
 			}
 		case *ast.CallExpr:
 			if ident, ok := v.Func.(*ast.Ident); ok && ident.Name == "now" {

@@ -465,6 +465,13 @@ func writeTypeScalarField(b *strings.Builder, f *ast.FieldDecl, fid, goField str
 		} else {
 			fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s); buf.B = codec.AppendSvarint(buf.B, %s.Unix())\n", fid, goField)
 		}
+	case "Duration":
+		if n {
+			fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+			fmt.Fprintf(b, "\tif %s != nil { buf.B = codec.AppendPresent(buf.B); buf.B = codec.AppendSvarint(buf.B, int64(*%s)) } else { buf.B = codec.AppendNull(buf.B) }\n", goField, goField)
+		} else {
+			fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s); buf.B = codec.AppendSvarint(buf.B, int64(%s))\n", fid, goField)
+		}
 	}
 }
 

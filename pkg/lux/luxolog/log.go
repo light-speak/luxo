@@ -3,6 +3,7 @@ package luxolog
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -28,7 +29,7 @@ const (
 )
 
 func parseLevel(s string) int {
-	switch s {
+	switch strings.ToLower(s) {
 	case "debug":
 		return LevelDebug
 	case "warn":

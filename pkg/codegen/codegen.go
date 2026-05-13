@@ -339,9 +339,15 @@ func writeImports(b *strings.Builder, files []*ast.File) {
 	}
 
 	b.WriteString("import (\n")
+	// stdlib group
+	if needs.auth {
+		b.WriteString("\t\"fmt\"\n")
+		b.WriteString("\t\"os\"\n")
+	}
 	if needs.time {
 		b.WriteString("\t\"time\"\n")
 	}
+	// third-party group
 	if needs.uuid {
 		b.WriteString("\n\t\"github.com/google/uuid\"\n")
 	}
@@ -352,9 +358,7 @@ func writeImports(b *strings.Builder, files []*ast.File) {
 		b.WriteString("\n\tluxocrypto \"github.com/light-speak/luxo/pkg/lux/crypto\"\n")
 	}
 	if needs.auth {
-		b.WriteString("\t\"fmt\"\n")
-		b.WriteString("\t\"os\"\n")
-		b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/auth\"\n")
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/auth\"\n")
 	}
 	b.WriteString(")\n\n")
 }
