@@ -396,6 +396,7 @@ class ColumnarDecoder {
   List<int> readColumnInt() {
     final result = List<int>.filled(count, 0);
     for (var i = 0; i < count; i++) {
+      if (_off >= _data.lengthInBytes) break;
       result[i] = _readSvarint();
     }
     return result;
@@ -432,7 +433,10 @@ class ColumnarDecoder {
   List<bool> readColumnBool() {
     final result = List<bool>.filled(count, false);
     for (var i = 0; i < count; i++) {
-      result[i] = _readVarint() != 0;
+      if (_off >= _data.lengthInBytes) break;
+      final v = _readVarint();
+      if (v < 0) break; // truncated
+      result[i] = v != 0;
     }
     return result;
   }

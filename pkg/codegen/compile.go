@@ -672,17 +672,18 @@ func (c *compiler) compileMember(e *ast.MemberExpr) string {
 			return fmt.Sprintf("(time.Duration(%s) * %s)", c.compileExpr(e.Object), unit)
 		}
 	}
-	// Log methods: "message".i / .d / .w / .e
-	// .i = info, .d = debug, .w = warn, .e = error
-	switch e.Field {
-	case "i":
-		return fmt.Sprintf("luxolog.Info(%s)", c.compileExpr(e.Object))
-	case "d":
-		return fmt.Sprintf("luxolog.Debug(%s)", c.compileExpr(e.Object))
-	case "w":
-		return fmt.Sprintf("luxolog.Warn(%s)", c.compileExpr(e.Object))
-	case "e":
-		return fmt.Sprintf("luxolog.Error(%s)", c.compileExpr(e.Object))
+	// Log methods: "message".i / .d / .w / .e — only on string literals or template strings
+	if isLogTarget(e.Object) {
+		switch e.Field {
+		case "i":
+			return fmt.Sprintf("luxolog.Info(%s)", c.compileExpr(e.Object))
+		case "d":
+			return fmt.Sprintf("luxolog.Debug(%s)", c.compileExpr(e.Object))
+		case "w":
+			return fmt.Sprintf("luxolog.Warn(%s)", c.compileExpr(e.Object))
+		case "e":
+			return fmt.Sprintf("luxolog.Error(%s)", c.compileExpr(e.Object))
+		}
 	}
 
 	obj := c.compileExpr(e.Object)
@@ -1786,6 +1787,18 @@ func (c *compiler) isStringExpr(expr ast.Expr) bool {
 		if member, ok := e.Func.(*ast.MemberExpr); ok {
 			return c.isStringExpr(member.Object)
 		}
+	}
+	return false
+}
+
+// isLogTarget checks if an expression is a valid target for .i/.d/.w/.e log methods.
+// Only string literals and template strings are valid — not arbitrary member access like obj.i.
+func isLogTarget(expr ast.Expr) bool {
+	switch e := expr.(type) {
+	case *ast.Literal:
+		return e.Kind == token.String
+	case *ast.TemplateString:
+		return true
 	}
 	return false
 }
