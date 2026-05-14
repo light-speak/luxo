@@ -127,6 +127,12 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		req, err = ParseRequest(r)
 	}
 	if err != nil {
+		if isLogEnabled() {
+			fmt.Fprintf(os.Stderr, "%s%s%s %s[parse]%s %s %s✗ %s%s\n",
+				colorDim, time.Now().Format("15:04:05"), colorReset,
+				colorRed, colorReset, "binary",
+				colorRed, err.Error(), colorReset)
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -162,6 +168,12 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if herr != nil {
 		rt.logRequest(req.API, duration, herr)
+		// Debug: log param details on error
+		if isLogEnabled() && req.paramNames != nil {
+			for i := 0; i < req.paramCount; i++ {
+				fmt.Fprintf(os.Stderr, "    param[%d] %s = %v\n", i, req.paramNames[i], req.paramSlots[i])
+			}
+		}
 		PutBuf(buf)
 		rt.writeAppError(w, r, binaryMode, herr)
 		return
@@ -353,8 +365,17 @@ const (
 	colorGreen = "\033[32m"
 )
 
-// logEnabled controls whether request logging is active (LOG_REQUESTS env, opt-in).
-var logEnabled = os.Getenv("LOG_REQUESTS") == "true"
+// logEnabled controls whether request logging is active (LOG_REQUESTS env).
+// Lazy-initialized on first check so .env is loaded before reading.
+var logEnabled *bool
+
+func isLogEnabled() bool {
+	if logEnabled == nil {
+		v := os.Getenv("LOG_REQUESTS") != "false"
+		logEnabled = &v
+	}
+	return *logEnabled
+}
 
 // moduleColorMap caches color assignment per module name.
 var (
@@ -380,7 +401,7 @@ func moduleColor(mod string) string {
 //	12:34:56 [auth] login 2.3ms ✓
 //	12:34:56 [auth] login 1.2ms ✗ InvalidCredentials
 func (rt *Router) logRequest(apiName string, duration time.Duration, err error) {
-	if !logEnabled {
+	if !isLogEnabled() {
 		return
 	}
 	mod := ""

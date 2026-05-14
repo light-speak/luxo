@@ -140,6 +140,12 @@ export class FetchTransport implements Transport {
     }
     enc.writeEnd()
 
+    if (this.debug) {
+      const b = enc.bytes()
+      const hex = Array.from(b).map(x => x.toString(16).padStart(2, '0')).join(' ')
+      console.log(`🔧 ${api} binary ${b.length}B: ${hex}`, params)
+    }
+
     let resp: Response
     try {
       resp = await fetch(this.endpoint, {

@@ -19,7 +19,15 @@ const (
 )
 
 // Level controls minimum log level. Set via LOG_LEVEL env (debug/info/warn/error).
-var Level = parseLevel(os.Getenv("LOG_LEVEL"))
+// Lazy-initialized so .env is loaded before reading.
+var Level = -1
+
+func level() int {
+	if Level == -1 {
+		Level = parseLevel(os.Getenv("LOG_LEVEL"))
+	}
+	return Level
+}
 
 const (
 	LevelDebug = 0
@@ -43,7 +51,7 @@ func parseLevel(s string) int {
 
 // Debug prints a debug message (blue).
 func Debug(msg string) string {
-	if Level <= LevelDebug {
+	if level() <= LevelDebug {
 		ts := time.Now().Format("15:04:05")
 		fmt.Fprintf(os.Stderr, "%s%s%s %sDEBUG%s %s\n", dim, ts, reset, blue, reset, msg)
 	}
@@ -52,7 +60,7 @@ func Debug(msg string) string {
 
 // Info prints an info message (cyan).
 func Info(msg string) string {
-	if Level <= LevelInfo {
+	if level() <= LevelInfo {
 		ts := time.Now().Format("15:04:05")
 		fmt.Fprintf(os.Stderr, "%s%s%s %sINFO%s  %s\n", dim, ts, reset, cyan, reset, msg)
 	}
@@ -61,7 +69,7 @@ func Info(msg string) string {
 
 // Warn prints a warning message (yellow).
 func Warn(msg string) string {
-	if Level <= LevelWarn {
+	if level() <= LevelWarn {
 		ts := time.Now().Format("15:04:05")
 		fmt.Fprintf(os.Stderr, "%s%s%s %sWARN%s  %s\n", dim, ts, reset, yellow, reset, msg)
 	}
@@ -70,7 +78,7 @@ func Warn(msg string) string {
 
 // Error prints an error message (red).
 func Error(msg string) string {
-	if Level <= LevelError {
+	if level() <= LevelError {
 		ts := time.Now().Format("15:04:05")
 		fmt.Fprintf(os.Stderr, "%s%s%s %sERROR%s %s\n", dim, ts, reset, red, reset, msg)
 	}

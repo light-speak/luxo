@@ -380,12 +380,23 @@ function genMethod(api: LuxoAPI, schema: LuxoSchema): string {
     `    const d = await this.transport.call('${api.name}'${params ? `, ${params}` : ''})\n` +
     `    return ${decode}\n`
 
-  if (api.name.startsWith('get') && !api.returnList && (!api.params || api.params.length === 0)) {
-    return `  async ${api.name}(id: number, opts?: { $select?: string }): Promise<${retTS}> {\n` +
-           call('{ id, ...opts }') + `  }\n\n`
+  // If API has explicit params, always use them for the signature (no guessing by name prefix)
+  if (api.params && api.params.length > 0) {
+    // Build typed params object
+    const paramFields = api.params.map(p => `${p.name}: ${resolveParamType(p, schema)}`).join('; ')
+
+    // list APIs with page/pageSize get optional params + pagination extras
+    if (api.name.startsWith('list') && api.paginated) {
+      return `  async ${api.name}(params?: { ${paramFields}; $select?: string; $filters?: unknown[]; $sorters?: unknown[] }): Promise<${retTS}> {\n` +
+             call('params') + `  }\n\n`
+    }
+
+    return `  async ${api.name}(params: { ${paramFields} }): Promise<${retTS}> {\n` +
+           call('params') + `  }\n\n`
   }
 
-  if (api.name.startsWith('list')) {
+  // No params — zero-arg methods
+  if (api.name.startsWith('list') && api.paginated) {
     return `  async ${api.name}(params?: { page?: number; pageSize?: number; $select?: string; $filters?: unknown[]; $sorters?: unknown[] }): Promise<${retTS}> {\n` +
            call('params') + `  }\n\n`
   }
@@ -400,22 +411,7 @@ function genMethod(api: LuxoAPI, schema: LuxoSchema): string {
            call('{ id, ...input }') + `  }\n\n`
   }
 
-  if (api.name.startsWith('delete')) {
-    return `  async ${api.name}(id: number): Promise<number> {\n` +
-           `    const d = await this.transport.call('${api.name}', { id })\n` +
-           `    return d instanceof Uint8Array ? new Decoder(d).readInt() : d as number\n` +
-           `  }\n\n`
-  }
-
-  if (api.params && api.params.length > 0) {
-    const paramStr = api.params.map(p => {
-      const t = resolveParamType(p, schema)
-      return `${p.name}${p.required === false ? '?' : ''}: ${t}`
-    }).join('; ')
-    return `  async ${api.name}(params: { ${paramStr} }): Promise<${retTS}> {\n` +
-           call('params') + `  }\n\n`
-  }
-
+  // No params, no special prefix — zero-arg method
   return `  async ${api.name}(): Promise<${retTS}> {\n` +
          call('') + `  }\n\n`
 }
