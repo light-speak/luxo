@@ -232,14 +232,14 @@ export class Decoder {
 
   /** Read a nested model using a decoder function. */
   readNullable<T>(decode: () => T): T | null {
-    const present = this.readVarint()
-    if (present === 0n) return null
+    const present = this.readVarintRaw()
+    if (present === 0) return null
     return decode()
   }
 
   /** Read an array of items using a decoder function. */
   readArray<T>(decode: () => T): T[] {
-    const count = Number(this.readVarint())
+    const count = this.readVarintRaw()
     const items: T[] = []
     for (let i = 0; i < count; i++) {
       items.push(decode())
