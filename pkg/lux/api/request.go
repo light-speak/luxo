@@ -345,18 +345,21 @@ func (r *Request) ParamStringArray(name string) ([]string, error) {
 func (r *Request) ParamJSON(name string, target any) error {
 	if r.paramNames != nil {
 		v, ok := r.findParam(name)
-		if !ok {
-			return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
+		if !ok || v == nil {
+			// Not found or nil — for pointer targets this is valid (nullable param)
+			return nil
 		}
 		if ptr, ok := target.(*any); ok {
 			*ptr = v
 			return nil
 		}
-		return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "binary mode: use typed param methods"})
+		// Try to assign string to *string, int64 to *int64, etc.
+		return assignBinaryParam(v, target)
 	}
 	raw, ok := r.Params[name]
 	if !ok {
-		return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
+		// For JSON mode, missing nullable params return null — target stays zero
+		return nil
 	}
 	if err := json.Unmarshal(raw, target); err != nil {
 		return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "invalid format"})
@@ -386,4 +389,51 @@ func (r *Request) HasParam(name string) bool {
 	}
 	_, ok := r.Params[name]
 	return ok
+}
+
+// assignBinaryParam assigns a binary-decoded value to a typed pointer target.
+func assignBinaryParam(v any, target any) error {
+	switch t := target.(type) {
+	case **string:
+		if sv, ok := v.(string); ok {
+			*t = &sv
+			return nil
+		}
+	case **int64:
+		if iv, ok := v.(int64); ok {
+			*t = &iv
+			return nil
+		}
+	case **float64:
+		if fv, ok := v.(float64); ok {
+			*t = &fv
+			return nil
+		}
+	case **bool:
+		if bv, ok := v.(bool); ok {
+			*t = &bv
+			return nil
+		}
+	case *string:
+		if sv, ok := v.(string); ok {
+			*t = sv
+			return nil
+		}
+	case *int64:
+		if iv, ok := v.(int64); ok {
+			*t = iv
+			return nil
+		}
+	case *float64:
+		if fv, ok := v.(float64); ok {
+			*t = fv
+			return nil
+		}
+	case *bool:
+		if bv, ok := v.(bool); ok {
+			*t = bv
+			return nil
+		}
+	}
+	return nil
 }
