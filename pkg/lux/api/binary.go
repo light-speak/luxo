@@ -163,38 +163,12 @@ func (r *APIRegistry) ParseBinaryRequest(body []byte) (*Request, error) {
 			return nil, fmt.Errorf("too many params (max 16) for API %s", apiName)
 		}
 
-		switch meta.Type {
-		case "Int":
-			v, n := codec.ReadSvarint(paramBuf, poff)
-			if n <= 0 {
-				return nil, fmt.Errorf("param %s: truncated int", meta.Name)
-			}
-			poff += n
-			req.paramSlots[paramIdx] = v
-		case "Float":
-			v, n := codec.ReadFixed64(paramBuf, poff)
-			if n == 0 {
-				return nil, fmt.Errorf("param %s: truncated float", meta.Name)
-			}
-			poff += n
-			req.paramSlots[paramIdx] = v
-		case "String":
-			v, n := codec.ReadString(paramBuf, poff)
-			if n == 0 {
-				return nil, fmt.Errorf("param %s: truncated string", meta.Name)
-			}
-			poff += n
-			req.paramSlots[paramIdx] = v
-		case "Boolean":
-			v, n := codec.ReadBool(paramBuf, poff)
-			if n == 0 {
-				return nil, fmt.Errorf("param %s: truncated bool", meta.Name)
-			}
-			poff += n
-			req.paramSlots[paramIdx] = v
-		default:
-			break
+		val, n, err := readBinaryParam(paramBuf, poff, *meta)
+		if err != nil {
+			return nil, err
 		}
+		poff += n
+		req.paramSlots[paramIdx] = val
 	}
 
 	return req, nil
@@ -255,4 +229,36 @@ func EncodeBinaryRequest(apiID int, params map[string]any, paramMeta []ParamMeta
 	buf = append(buf, enc.Bytes()...)
 
 	return buf
+}
+
+// readBinaryParam reads a single typed parameter value from binary data.
+func readBinaryParam(buf []byte, off int, meta ParamMeta) (any, int, error) {
+	switch meta.Type {
+	case "Int", "Duration":
+		v, n := codec.ReadSvarint(buf, off)
+		if n <= 0 {
+			return nil, 0, fmt.Errorf("param %s: truncated int", meta.Name)
+		}
+		return v, n, nil
+	case "Float":
+		v, n := codec.ReadFixed64(buf, off)
+		if n == 0 {
+			return nil, 0, fmt.Errorf("param %s: truncated float", meta.Name)
+		}
+		return v, n, nil
+	case "String", "DateTime", "Enum", "UUID", "Decimal":
+		v, n := codec.ReadString(buf, off)
+		if n == 0 {
+			return nil, 0, fmt.Errorf("param %s: truncated string", meta.Name)
+		}
+		return v, n, nil
+	case "Boolean":
+		v, n := codec.ReadBool(buf, off)
+		if n == 0 {
+			return nil, 0, fmt.Errorf("param %s: truncated bool", meta.Name)
+		}
+		return v, n, nil
+	default:
+		return nil, 0, fmt.Errorf("param %s: unknown type %s", meta.Name, meta.Type)
+	}
 }
