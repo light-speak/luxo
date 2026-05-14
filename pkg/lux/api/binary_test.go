@@ -423,17 +423,20 @@ func TestParamJSONBinary(t *testing.T) {
 		t.Fatalf("got %v", v)
 	}
 
-	// Missing param
+	// Missing param in binary mode — returns nil (nullable semantics)
 	err = req.ParamJSON("missing", &v)
-	if err == nil {
-		t.Fatal("should error on missing")
+	if err != nil {
+		t.Fatal("binary mode missing param should not error (nullable)")
 	}
 
-	// Non-*any target in binary mode
+	// Non-*any target in binary mode — assignBinaryParam handles typed assignment
 	var s string
 	err = req.ParamJSON("data", &s)
-	if err == nil {
-		t.Fatal("should error on non-*any target in binary mode")
+	if err != nil {
+		t.Fatal("should assign string target in binary mode")
+	}
+	if s != "some-value" {
+		t.Fatalf("expected some-value, got %q", s)
 	}
 }
 

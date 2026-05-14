@@ -358,8 +358,7 @@ func (r *Request) ParamJSON(name string, target any) error {
 	}
 	raw, ok := r.Params[name]
 	if !ok {
-		// For JSON mode, missing nullable params return null — target stays zero
-		return nil
+		return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
 	if err := json.Unmarshal(raw, target); err != nil {
 		return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "invalid format"})
