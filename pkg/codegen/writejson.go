@@ -19,7 +19,15 @@ func generateWriteJSONFile(result *semantic.Result, packageName string, enums ma
 	for _, file := range result.Files {
 		models = append(models, file.Models...)
 	}
-	if len(models) == 0 {
+	// Check if any types exist (non-DB declarations also need WriteLuxo)
+	hasTypes := false
+	for _, file := range result.Files {
+		if len(file.Types) > 0 {
+			hasTypes = true
+			break
+		}
+	}
+	if len(models) == 0 && !hasTypes {
 		return nil
 	}
 

@@ -106,12 +106,15 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 
 	modelMap, inferredAPIs := collectInferredAPIs(result)
 
-	// Check if there are any compiled APIs or service fns
+	// Check if there are any compiled APIs, native APIs, or service fns
 	hasCompiledAPIs := false
+	hasNativeAPIs := false
 	hasServiceFns := false
 	for _, file := range result.Files {
 		for _, api := range file.APIs {
-			if api.Body != nil && !hasDirective(api.Directives, "native") {
+			if hasDirective(api.Directives, "native") {
+				hasNativeAPIs = true
+			} else if api.Body != nil {
 				hasCompiledAPIs = true
 			}
 		}
@@ -122,7 +125,7 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 		}
 	}
 
-	if len(models) == 0 && len(inferredAPIs) == 0 && !hasCompiledAPIs && !hasServiceFns {
+	if len(models) == 0 && len(inferredAPIs) == 0 && !hasCompiledAPIs && !hasNativeAPIs && !hasServiceFns {
 		return nil
 	}
 

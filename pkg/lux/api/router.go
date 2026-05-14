@@ -32,6 +32,11 @@ type HandlerFunc func(ctx context.Context, req *Request) error
 // The handler receives a Stream and pushes data via stream.Send(). Return when done or context cancelled.
 type StreamHandlerFunc func(ctx context.Context, params *StreamParams, identity any, stream *Stream)
 
+// MetricsRecorder is called for each completed request to collect metrics.
+type MetricsRecorder interface {
+	Record(apiName string, duration time.Duration, isError bool)
+}
+
 // Router maps API names to handlers and serves the /luvia endpoint.
 type Router struct {
 	handlers         map[string]HandlerFunc
@@ -39,11 +44,17 @@ type Router struct {
 	streamHandlers   map[string]StreamHandlerFunc // @stream @native (no event) → handler
 	translator       *i18n.Translator
 	devMode          bool
-	Registry         *APIRegistry   // binary protocol API ID mapping
-	Schema           *schema.Schema // model/API metadata for Binary↔JSON conversion
-	Streams          *StreamHub     // WebSocket stream subscription manager
-	IntrospectionKey string         // key for schema introspection (empty = disabled)
-	WSOrigins        []string       // allowed WebSocket origins (empty = allow all in dev mode)
+	Registry         *APIRegistry    // binary protocol API ID mapping
+	Schema           *schema.Schema  // model/API metadata for Binary↔JSON conversion
+	Streams          *StreamHub      // WebSocket stream subscription manager
+	IntrospectionKey string          // key for schema introspection (empty = disabled)
+	WSOrigins        []string        // allowed WebSocket origins (empty = allow all in dev mode)
+	metrics          MetricsRecorder // optional metrics collector
+}
+
+// SetMetricsCollector configures request metrics collection.
+func (rt *Router) SetMetricsCollector(mc MetricsRecorder) {
+	rt.metrics = mc
 }
 
 // NewRouter creates an empty router.
@@ -165,6 +176,10 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	herr := rt.callHandler(fn, r.Context(), req)
 	duration := time.Since(start)
+
+	if rt.metrics != nil {
+		rt.metrics.Record(req.API, duration, herr != nil)
+	}
 
 	if herr != nil {
 		rt.logRequest(req.API, duration, herr)
