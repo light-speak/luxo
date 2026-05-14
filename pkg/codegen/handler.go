@@ -538,7 +538,9 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 	} else {
 		b.WriteString("\n")
 	}
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux\"\n")
+	if len(models) > 0 {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux\"\n")
+	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
 	if hasHash || feat.hasCrypto {
@@ -551,7 +553,9 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 	if hasAuth {
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
 	}
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
+	if len(models) > 0 {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
+	}
 	writeSortedCrossModuleImports(b, feat.crossEventImports)
 	if hasAwait {
 		b.WriteString("\t\"golang.org/x/sync/errgroup\"\n")

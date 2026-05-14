@@ -139,7 +139,6 @@ func (mc *MetricsCollector) flush() {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+mc.apiKey)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"runtime"
 	"time"
 )
 
@@ -96,10 +97,16 @@ func (gr *GatewayRegistrar) heartbeatLoop() {
 }
 
 func (gr *GatewayRegistrar) heartbeat() {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	memMB := float64(m.Alloc) / 1024 / 1024
+
 	body, _ := json.Marshal(map[string]any{
 		"$api":       "heartbeat",
 		"apiKey":     gr.apiKey,
 		"instanceId": gr.instanceID,
+		"memoryMB":   memMB,
+		"cpuPercent": 0.0, // CPU percent requires sampling over time — placeholder
 	})
 
 	req, err := http.NewRequest("POST", gr.studioURL+"/luvia", bytes.NewReader(body))

@@ -421,7 +421,13 @@ func generateTypeWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[strin
 			continue
 		}
 
-		// Scalar/enum fields — same as generateWriteLuxoAllFields
+		// List of scalars: [String], [Int], [Enum], etc.
+		if f.Type.IsList {
+			writeTypeListScalarField(b, f, fid, goField, enums)
+			continue
+		}
+
+		// Scalar/enum fields
 		if enums[f.Type.Name] {
 			fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s); buf.B = codec.AppendString(buf.B, string(%s))\n", fid, goField)
 			continue
@@ -480,6 +486,33 @@ func writeTypeScalarField(b *strings.Builder, f *ast.FieldDecl, fid, goField str
 		} else {
 			fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s); buf.B = codec.AppendSvarint(buf.B, int64(%s))\n", fid, goField)
 		}
+	}
+}
+
+// writeTypeListScalarField writes a list of scalar values for type WriteLuxo.
+func writeTypeListScalarField(b *strings.Builder, f *ast.FieldDecl, fid, goField string, enums map[string]bool) {
+	fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
+	fmt.Fprintf(b, "\tbuf.B = codec.AppendSvarint(buf.B, int64(len(%s)))\n", goField)
+
+	elemType := f.Type.Name
+	if enums[elemType] {
+		fmt.Fprintf(b, "\tfor _, v := range %s { buf.B = codec.AppendString(buf.B, string(v)) }\n", goField)
+		return
+	}
+	switch elemType {
+	case "Int":
+		fmt.Fprintf(b, "\tfor _, v := range %s { buf.B = codec.AppendSvarint(buf.B, v) }\n", goField)
+	case "Float":
+		fmt.Fprintf(b, "\tfor _, v := range %s { buf.B = codec.AppendFixed64(buf.B, v) }\n", goField)
+	case "String", "DateTime", "UUID", "Decimal":
+		fmt.Fprintf(b, "\tfor _, v := range %s { buf.B = codec.AppendString(buf.B, v) }\n", goField)
+	case "Boolean":
+		fmt.Fprintf(b, "\tfor _, v := range %s { buf.B = codec.AppendBool(buf.B, v) }\n", goField)
+	case "Duration":
+		fmt.Fprintf(b, "\tfor _, v := range %s { buf.B = codec.AppendSvarint(buf.B, int64(v)) }\n", goField)
+	default:
+		// Unknown list element — write as nested model
+		fmt.Fprintf(b, "\tfor i := range %s { %s[i].WriteLuxo(buf, nil) }\n", goField, goField)
 	}
 }
 
