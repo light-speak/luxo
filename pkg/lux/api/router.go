@@ -168,8 +168,8 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if herr != nil {
 		rt.logRequest(req.API, duration, herr)
-		// Debug: log param details on error
-		if isLogEnabled() && req.paramNames != nil {
+		// Debug level only: log param details on error
+		if isLogEnabled() && os.Getenv("LOG_LEVEL") == "debug" && req.paramNames != nil {
 			for i := 0; i < req.paramCount; i++ {
 				fmt.Fprintf(os.Stderr, "    param[%d] %s = %v\n", i, req.paramNames[i], req.paramSlots[i])
 			}
