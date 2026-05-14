@@ -148,9 +148,9 @@ class OkHttpTransport(
         for (pm in meta.params) {
             val v = params[pm.name] ?: continue
             when (pm.type) {
-                "Int" -> enc.writeFieldInt(pm.fieldID, (v as Number).toLong())
+                "Int", "Duration" -> enc.writeFieldInt(pm.fieldID, (v as Number).toLong())
                 "Float" -> enc.writeFieldFloat(pm.fieldID, (v as Number).toDouble())
-                "String" -> enc.writeFieldString(pm.fieldID, v as String)
+                "String", "Enum", "UUID", "Decimal", "DateTime" -> enc.writeFieldString(pm.fieldID, v as String)
                 "Boolean" -> enc.writeFieldBool(pm.fieldID, v as Boolean)
             }
         }

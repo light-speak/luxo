@@ -131,10 +131,17 @@ export class FetchTransport implements Transport {
         const v = params[pm.name]
         if (v === undefined || v === null) continue
         switch (pm.type) {
-          case 'Int': enc.writeFieldInt(pm.fieldID, v as number); break
-          case 'Float': enc.writeFieldFloat(pm.fieldID, v as number); break
-          case 'String': enc.writeFieldString(pm.fieldID, v as string); break
-          case 'Boolean': enc.writeFieldBool(pm.fieldID, v as boolean); break
+          case 'Int': case 'Duration':
+            enc.writeFieldInt(pm.fieldID, v as number); break
+          case 'Float':
+            enc.writeFieldFloat(pm.fieldID, v as number); break
+          case 'String': case 'Enum': case 'UUID': case 'Decimal':
+            enc.writeFieldString(pm.fieldID, v as string); break
+          case 'Boolean':
+            enc.writeFieldBool(pm.fieldID, v as boolean); break
+          case 'DateTime':
+            // DateTime sent as ISO string, server parses it
+            enc.writeFieldString(pm.fieldID, v as string); break
         }
       }
     }
