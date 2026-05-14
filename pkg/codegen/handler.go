@@ -1629,8 +1629,14 @@ func pluralize(name string) string {
 	if strings.HasSuffix(name, "s") || strings.HasSuffix(name, "x") || strings.HasSuffix(name, "z") {
 		return name + "es"
 	}
-	if strings.HasSuffix(name, "y") {
-		return name[:len(name)-1] + "ies"
+	if strings.HasSuffix(name, "y") && len(name) >= 2 {
+		// Only consonant+y → ies (e.g. History→Histories)
+		// Vowel+y → just add s (e.g. Gateway→Gateways, Key→Keys)
+		prev := name[len(name)-2]
+		if prev != 'a' && prev != 'e' && prev != 'i' && prev != 'o' && prev != 'u' &&
+			prev != 'A' && prev != 'E' && prev != 'I' && prev != 'O' && prev != 'U' {
+			return name[:len(name)-1] + "ies"
+		}
 	}
 	return name + "s"
 }
