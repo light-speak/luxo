@@ -2840,3 +2840,71 @@ func TestNeedsFmtImport(t *testing.T) {
 		t.Error("should not need fmt without emit or create/update")
 	}
 }
+
+// ─── Native-only module generates handler.gen.go ─────────────────────────────
+
+func TestNativeOnlyModuleGeneratesHandler(t *testing.T) {
+	// Module with ONLY native APIs (no models, no CRUD, no compiled APIs)
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/admin.luxo",
+			APIs: []*ast.ApiDecl{
+				{
+					Name:       "getStats",
+					Directives: []*ast.Directive{{Name: "native"}},
+					ReturnType: &ast.TypeRef{Name: "Stats"},
+				},
+				{
+					Name:       "resetCache",
+					Directives: []*ast.Directive{{Name: "native"}},
+				},
+			},
+		}},
+	}
+
+	src := generateHandlerFile(result, "luxo", nil)
+	if src == nil {
+		t.Fatal("native-only module should generate handler file")
+	}
+	code := string(src)
+
+	if !strings.Contains(code, "handleGetStats") {
+		t.Error("missing native API handler for getStats")
+	}
+	if !strings.Contains(code, "handleResetCache") {
+		t.Error("missing native API handler for resetCache")
+	}
+	if !strings.Contains(code, "RegisterHandlers") {
+		t.Error("missing RegisterHandlers")
+	}
+}
+
+func TestHandlerImportsNoModels(t *testing.T) {
+	// Module with no models should NOT import lux/selection or lux
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/admin.luxo",
+			APIs: []*ast.ApiDecl{
+				{
+					Name:       "ping",
+					Directives: []*ast.Directive{{Name: "native"}},
+				},
+			},
+		}},
+	}
+
+	src := generateHandlerFile(result, "luxo", nil)
+	if src == nil {
+		t.Fatal("should generate handler file")
+	}
+	code := string(src)
+
+	// Should NOT have "lux/selection" import when no models
+	if strings.Contains(code, `"github.com/light-speak/luxo/pkg/lux/selection"`) {
+		t.Error("should not import lux/selection when no models")
+	}
+	// Should NOT have standalone lux import when no models
+	if strings.Contains(code, `"github.com/light-speak/luxo/pkg/lux"`) && !strings.Contains(code, `"github.com/light-speak/luxo/pkg/lux/`) {
+		t.Error("should not import lux when no models")
+	}
+}
