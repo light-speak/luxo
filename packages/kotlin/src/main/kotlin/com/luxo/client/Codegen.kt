@@ -195,52 +195,75 @@ object LuxoCodegen {
             b.appendLine("        return decode_${api.name}(data)")
         }
 
-        when {
-            api.name.startsWith("get") && !api.returnList && api.params.isEmpty() -> {
-                b.appendLine("    suspend fun ${api.name}(id: Int, select: String? = null): $ret {")
-                b.appendLine("        val sel = select ?: hint(\"${api.name}\")")
-                b.appendLine("        val data = transport.call(\"${api.name}\", mapOf(\"id\" to id, \"\\\$select\" to sel))")
-                emitDecode()
-                b.appendLine("    }\n")
+        // If API has explicit params, always use them (no guessing by name prefix)
+        if (api.params.isNotEmpty()) {
+            val isPaginated = api.name.startsWith("list") && api.paginated
+            val paginationNames = setOf("page", "pageSize")
+            // page/pageSize are optional for list APIs
+            val ps = api.params.joinToString(", ") {
+                if (isPaginated && it.name in paginationNames) "${it.name}: ${luxoTypeToKt(it.type)}? = null"
+                else "${it.name}: ${luxoTypeToKt(it.type)}"
             }
-            api.name.startsWith("list") -> {
-                b.appendLine("    suspend fun ${api.name}(page: Int? = null, pageSize: Int? = null, select: String? = null): $ret {")
-                b.appendLine("        val sel = select ?: hint(\"${api.name}\")")
-                b.appendLine("        val data = transport.call(\"${api.name}\", mapOf(\"page\" to page, \"pageSize\" to pageSize, \"\\\$select\" to sel))")
-                emitDecode()
-                b.appendLine("    }\n")
+            val paramMap = api.params.joinToString(", ") { "\"${it.name}\" to ${it.name}" }
+
+            when {
+                // list APIs with pagination get optional pagination + select extras
+                isPaginated -> {
+                    val existingNames = api.params.map { it.name }.toSet()
+                    val extraParams = listOf("page", "pageSize").filter { it !in existingNames }.joinToString(", ") { "$it: Int? = null" }
+                    val extraParamStr = if (extraParams.isNotEmpty()) ", $extraParams" else ""
+                    val extraMap = listOf("page", "pageSize").filter { it !in existingNames }.joinToString(", ") { "\"$it\" to $it" }
+                    val extraMapStr = if (extraMap.isNotEmpty()) ", $extraMap" else ""
+                    b.appendLine("    suspend fun ${api.name}($ps$extraParamStr, select: String? = null): $ret {")
+                    b.appendLine("        val sel = select ?: hint(\"${api.name}\")")
+                    b.appendLine("        val data = transport.call(\"${api.name}\", mapOf($paramMap$extraMapStr, \"\\\$select\" to sel))")
+                    emitDecode()
+                    b.appendLine("    }\n")
+                }
+                // get APIs with select hint support
+                api.name.startsWith("get") && !api.returnList -> {
+                    b.appendLine("    suspend fun ${api.name}($ps, select: String? = null): $ret {")
+                    b.appendLine("        val sel = select ?: hint(\"${api.name}\")")
+                    b.appendLine("        val data = transport.call(\"${api.name}\", mapOf($paramMap, \"\\\$select\" to sel))")
+                    emitDecode()
+                    b.appendLine("    }\n")
+                }
+                // Generic params — all other APIs with explicit params
+                else -> {
+                    b.appendLine("    suspend fun ${api.name}($ps): $ret {")
+                    b.appendLine("        val data = transport.call(\"${api.name}\", mapOf($paramMap))")
+                    emitDecode()
+                    b.appendLine("    }\n")
+                }
             }
-            api.name.startsWith("create") && api.returnType != null -> {
-                b.appendLine("    suspend fun ${api.name}(input: Map<String, Any?>): $ret {")
-                b.appendLine("        val data = transport.call(\"${api.name}\", input)")
-                emitDecode()
-                b.appendLine("    }\n")
-            }
-            api.name.startsWith("update") && api.returnType != null -> {
-                b.appendLine("    suspend fun ${api.name}(id: Int, input: Map<String, Any?>): $ret {")
-                b.appendLine("        val data = transport.call(\"${api.name}\", mapOf(\"id\" to id) + input)")
-                emitDecode()
-                b.appendLine("    }\n")
-            }
-            api.name.startsWith("delete") -> {
-                b.appendLine("    suspend fun ${api.name}(id: Int): Int {")
-                b.appendLine("        val data = transport.call(\"${api.name}\", mapOf(\"id\" to id))")
-                b.appendLine("        return if (data is ByteArray) { val d = LuxoDecoder(data); d.nextField(); d.readInt().toInt() } else (data as JsonElement).jsonPrimitive.int")
-                b.appendLine("    }\n")
-            }
-            api.params.isNotEmpty() -> {
-                val ps = api.params.joinToString(", ") { "${it.name}: ${luxoTypeToKt(it.type)}" }
-                b.appendLine("    suspend fun ${api.name}($ps): $ret {")
-                val paramMap = api.params.joinToString(", ") { "\"${it.name}\" to ${it.name}" }
-                b.appendLine("        val data = transport.call(\"${api.name}\", mapOf($paramMap))")
-                emitDecode()
-                b.appendLine("    }\n")
-            }
-            else -> {
-                b.appendLine("    suspend fun ${api.name}(): $ret {")
-                b.appendLine("        val data = transport.call(\"${api.name}\")")
-                emitDecode()
-                b.appendLine("    }\n")
+        } else {
+            // No explicit params — fall back to heuristics by name prefix
+            when {
+                api.name.startsWith("list") && api.paginated -> {
+                    b.appendLine("    suspend fun ${api.name}(page: Int? = null, pageSize: Int? = null, select: String? = null): $ret {")
+                    b.appendLine("        val sel = select ?: hint(\"${api.name}\")")
+                    b.appendLine("        val data = transport.call(\"${api.name}\", mapOf(\"page\" to page, \"pageSize\" to pageSize, \"\\\$select\" to sel))")
+                    emitDecode()
+                    b.appendLine("    }\n")
+                }
+                api.name.startsWith("create") && api.returnType != null -> {
+                    b.appendLine("    suspend fun ${api.name}(input: Map<String, Any?>): $ret {")
+                    b.appendLine("        val data = transport.call(\"${api.name}\", input)")
+                    emitDecode()
+                    b.appendLine("    }\n")
+                }
+                api.name.startsWith("update") && api.returnType != null -> {
+                    b.appendLine("    suspend fun ${api.name}(id: Int, input: Map<String, Any?>): $ret {")
+                    b.appendLine("        val data = transport.call(\"${api.name}\", mapOf(\"id\" to id) + input)")
+                    emitDecode()
+                    b.appendLine("    }\n")
+                }
+                else -> {
+                    b.appendLine("    suspend fun ${api.name}(): $ret {")
+                    b.appendLine("        val data = transport.call(\"${api.name}\")")
+                    emitDecode()
+                    b.appendLine("    }\n")
+                }
             }
         }
 

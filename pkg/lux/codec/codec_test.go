@@ -1238,3 +1238,155 @@ func BenchmarkRowWrite10(b *testing.B) {
 		}
 	}
 }
+
+func TestColumnarNullableFloat(t *testing.T) {
+	v1 := 1.5
+	v3 := 3.14
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnFloatPtr(1, []*float64{&v1, nil, &v3})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	vals := r.ReadColumnFloatPtr()
+	if len(vals) != 3 {
+		t.Fatalf("len = %d", len(vals))
+	}
+	if vals[0] == nil || *vals[0] != 1.5 {
+		t.Fatalf("vals[0] = %v, want 1.5", vals[0])
+	}
+	if vals[1] != nil {
+		t.Fatal("vals[1] should be nil")
+	}
+	if vals[2] == nil || *vals[2] != 3.14 {
+		t.Fatalf("vals[2] = %v, want 3.14", vals[2])
+	}
+}
+
+func TestColumnarNullableBool(t *testing.T) {
+	tr := true
+	fa := false
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnBoolPtr(1, []*bool{&tr, nil, &fa})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	vals := r.ReadColumnBoolPtr()
+	if len(vals) != 3 {
+		t.Fatalf("len = %d", len(vals))
+	}
+	if vals[0] == nil || !*vals[0] {
+		t.Fatal("vals[0] should be true")
+	}
+	if vals[1] != nil {
+		t.Fatal("vals[1] should be nil")
+	}
+	if vals[2] == nil || *vals[2] {
+		t.Fatal("vals[2] should be false")
+	}
+}
+
+func TestDecoderReadBytesPtr(t *testing.T) {
+	// Present bytes
+	var enc Encoder
+	enc.WriteFieldBytes(1, []byte{0xCA, 0xFE})
+	enc.WriteEnd()
+	data := enc.Bytes()
+
+	dec := NewDecoder(data)
+	if !dec.NextField() || dec.FieldID() != 1 {
+		t.Fatal("expected field 1")
+	}
+	got := dec.ReadBytes()
+	if len(got) != 2 || got[0] != 0xCA || got[1] != 0xFE {
+		t.Fatalf("got = %x", got)
+	}
+}
+
+func TestDecoderReadBytesPtrNullable(t *testing.T) {
+	// Nullable bytes: present
+	buf := AppendVarint(nil, 1) // field ID
+	buf = AppendVarint(buf, 1)  // present marker
+	buf = AppendBytes(buf, []byte{0xDE, 0xAD})
+	buf = append(buf, 0x00) // end
+
+	dec := NewDecoder(buf)
+	if !dec.NextField() || dec.FieldID() != 1 {
+		t.Fatal("expected field 1")
+	}
+	got := dec.ReadBytesPtr()
+	if got == nil || len(got) != 2 || got[0] != 0xDE {
+		t.Fatalf("got = %v", got)
+	}
+
+	// Nullable bytes: null
+	buf2 := AppendVarint(nil, 1) // field ID
+	buf2 = AppendVarint(buf2, 0) // null marker
+	buf2 = append(buf2, 0x00)    // end
+
+	dec2 := NewDecoder(buf2)
+	if !dec2.NextField() || dec2.FieldID() != 1 {
+		t.Fatal("expected field 1")
+	}
+	got2 := dec2.ReadBytesPtr()
+	if got2 != nil {
+		t.Fatalf("expected nil, got %v", got2)
+	}
+}
+
+func TestColumnarFloatPtrTruncated(t *testing.T) {
+	// Write header but truncate the float data
+	buf := AppendVarint(nil, 2) // count=2
+	buf = AppendVarint(buf, 1)  // fieldID=1
+	buf = AppendVarint(buf, 1)  // present marker
+	// Missing float64 bytes — truncated
+
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	vals := r.ReadColumnFloatPtr()
+	if vals != nil {
+		t.Fatal("expected nil on truncated data")
+	}
+}
+
+func TestColumnarBoolPtrTruncated(t *testing.T) {
+	buf := AppendVarint(nil, 2) // count=2
+	buf = AppendVarint(buf, 1)  // fieldID=1
+	buf = AppendVarint(buf, 1)  // present marker
+	// Missing bool byte — truncated
+
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	vals := r.ReadColumnBoolPtr()
+	if vals != nil {
+		t.Fatal("expected nil on truncated data")
+	}
+}
+
+func TestArraySizeLimit(t *testing.T) {
+	// Craft a buffer with count exceeding MaxArrayElements (varint encoded)
+	buf := AppendVarint(nil, uint64(MaxArrayElements+1))
+	dec := NewDecoder(buf)
+	got := dec.ReadIntArray()
+	if got != nil {
+		t.Fatal("expected nil for oversized array")
+	}
+	if dec.Err() == nil {
+		t.Fatal("expected error for oversized array")
+	}
+}
+
+func TestColumnarCountLimit(t *testing.T) {
+	// Craft columnar data with count exceeding MaxColumnarRecords
+	buf := AppendVarint(nil, uint64(MaxColumnarRecords+1))
+	r := NewColumnarReader(buf)
+	if r.Err() == nil {
+		t.Fatal("expected error for oversized columnar count")
+	}
+	if r.Count() != 0 {
+		t.Errorf("count should be 0, got %d", r.Count())
+	}
+}

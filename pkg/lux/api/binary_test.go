@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
 )
 
@@ -423,17 +424,20 @@ func TestParamJSONBinary(t *testing.T) {
 		t.Fatalf("got %v", v)
 	}
 
-	// Missing param
+	// Missing param in binary mode — returns nil (nullable semantics)
 	err = req.ParamJSON("missing", &v)
-	if err == nil {
-		t.Fatal("should error on missing")
+	if err != nil {
+		t.Fatal("binary mode missing param should not error (nullable)")
 	}
 
-	// Non-*any target in binary mode
+	// Non-*any target in binary mode — assignBinaryParam handles typed assignment
 	var s string
 	err = req.ParamJSON("data", &s)
-	if err == nil {
-		t.Fatal("should error on non-*any target in binary mode")
+	if err != nil {
+		t.Fatal("should assign string target in binary mode")
+	}
+	if s != "some-value" {
+		t.Fatalf("expected some-value, got %q", s)
 	}
 }
 
@@ -639,5 +643,206 @@ func TestEncodeBinaryRequestFloat(t *testing.T) {
 	active, _ := req.ParamBool("active")
 	if !active {
 		t.Fatal("active should be true")
+	}
+}
+
+// --- readBinaryParam: DateTime, Enum, Duration, UUID, Decimal ---
+
+func TestReadBinaryParamDateTime(t *testing.T) {
+	// DateTime is encoded as a string
+	var buf []byte
+	buf = codec.AppendString(buf, "2026-04-17T12:00:00Z")
+
+	val, n, err := readBinaryParam(buf, 0, ParamMeta{Name: "date", Type: "DateTime"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n == 0 {
+		t.Fatal("should consume bytes")
+	}
+	if val != "2026-04-17T12:00:00Z" {
+		t.Fatalf("got %v, want 2026-04-17T12:00:00Z", val)
+	}
+}
+
+func TestReadBinaryParamEnum(t *testing.T) {
+	var buf []byte
+	buf = codec.AppendString(buf, "admin")
+
+	val, n, err := readBinaryParam(buf, 0, ParamMeta{Name: "role", Type: "Enum"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n == 0 {
+		t.Fatal("should consume bytes")
+	}
+	if val != "admin" {
+		t.Fatalf("got %v, want admin", val)
+	}
+}
+
+func TestReadBinaryParamDuration(t *testing.T) {
+	var buf []byte
+	buf = codec.AppendSvarint(buf, 3600)
+
+	val, n, err := readBinaryParam(buf, 0, ParamMeta{Name: "dur", Type: "Duration"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n == 0 {
+		t.Fatal("should consume bytes")
+	}
+	if val != int64(3600) {
+		t.Fatalf("got %v, want 3600", val)
+	}
+}
+
+func TestReadBinaryParamUUID(t *testing.T) {
+	var buf []byte
+	buf = codec.AppendString(buf, "550e8400-e29b-41d4-a716-446655440000")
+
+	val, n, err := readBinaryParam(buf, 0, ParamMeta{Name: "id", Type: "UUID"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n == 0 {
+		t.Fatal("should consume bytes")
+	}
+	if val != "550e8400-e29b-41d4-a716-446655440000" {
+		t.Fatalf("got %v", val)
+	}
+}
+
+func TestReadBinaryParamDecimal(t *testing.T) {
+	var buf []byte
+	buf = codec.AppendString(buf, "123.456")
+
+	val, n, err := readBinaryParam(buf, 0, ParamMeta{Name: "price", Type: "Decimal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n == 0 {
+		t.Fatal("should consume bytes")
+	}
+	if val != "123.456" {
+		t.Fatalf("got %v", val)
+	}
+}
+
+func TestReadBinaryParamUnknownType(t *testing.T) {
+	_, _, err := readBinaryParam([]byte{0x01}, 0, ParamMeta{Name: "x", Type: "UnknownType"})
+	if err == nil {
+		t.Fatal("should error on unknown type")
+	}
+}
+
+// --- assignBinaryParam ---
+
+func TestAssignBinaryParamStringPtr(t *testing.T) {
+	var s *string
+	err := assignBinaryParam("hello", &s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s == nil || *s != "hello" {
+		t.Fatalf("got %v", s)
+	}
+}
+
+func TestAssignBinaryParamInt64Ptr(t *testing.T) {
+	var i *int64
+	err := assignBinaryParam(int64(42), &i)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if i == nil || *i != 42 {
+		t.Fatalf("got %v", i)
+	}
+}
+
+func TestAssignBinaryParamFloat64Ptr(t *testing.T) {
+	var f *float64
+	err := assignBinaryParam(float64(3.14), &f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f == nil || *f != 3.14 {
+		t.Fatalf("got %v", f)
+	}
+}
+
+func TestAssignBinaryParamBoolPtr(t *testing.T) {
+	var b *bool
+	err := assignBinaryParam(true, &b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b == nil || !*b {
+		t.Fatalf("got %v", b)
+	}
+}
+
+func TestAssignBinaryParamStringDirect(t *testing.T) {
+	var s string
+	err := assignBinaryParam("world", &s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s != "world" {
+		t.Fatalf("got %q", s)
+	}
+}
+
+func TestAssignBinaryParamInt64Direct(t *testing.T) {
+	var i int64
+	err := assignBinaryParam(int64(99), &i)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if i != 99 {
+		t.Fatalf("got %d", i)
+	}
+}
+
+func TestAssignBinaryParamFloat64Direct(t *testing.T) {
+	var f float64
+	err := assignBinaryParam(float64(2.71), &f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f != 2.71 {
+		t.Fatalf("got %f", f)
+	}
+}
+
+func TestAssignBinaryParamBoolDirect(t *testing.T) {
+	var b bool
+	err := assignBinaryParam(true, &b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !b {
+		t.Fatal("should be true")
+	}
+}
+
+func TestAssignBinaryParamTypeMismatch(t *testing.T) {
+	// Assigning int64 to *string should silently return nil (no error, no assignment)
+	var s string
+	err := assignBinaryParam(int64(42), &s)
+	if err != nil {
+		t.Fatal("should not error on type mismatch")
+	}
+	if s != "" {
+		t.Fatalf("should not assign, got %q", s)
+	}
+}
+
+func TestAssignBinaryParamUnknownTarget(t *testing.T) {
+	// Unknown target type — should return nil
+	var x struct{ Name string }
+	err := assignBinaryParam("val", &x)
+	if err != nil {
+		t.Fatal("should not error for unknown target type")
 	}
 }

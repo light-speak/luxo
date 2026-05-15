@@ -20,9 +20,11 @@ import (
 
 // Gateway is the Luvia API gateway.
 type Gateway struct {
-	Router  *api.Router
-	modules []string
-	server  *http.Server
+	Router    *api.Router
+	modules   []string
+	server    *http.Server
+	metrics   *MetricsCollector
+	registrar *GatewayRegistrar
 }
 
 // New creates a new Luvia gateway.
@@ -44,6 +46,13 @@ func (g *Gateway) AddModule(name string) {
 func (g *Gateway) Serve(version string) error {
 	mux, port := g.buildMux(version)
 	addr := ":" + port
+
+	// Start metrics collection + gateway registration if Studio is configured
+	g.metrics = NewMetricsCollector()
+	if g.metrics != nil {
+		g.Router.SetMetricsCollector(g.metrics)
+	}
+	g.registrar = NewGatewayRegistrar(port)
 
 	certFile := envOr("APP_TLS_CERT", "")
 	keyFile := envOr("APP_TLS_KEY", "")
@@ -93,6 +102,12 @@ func (g *Gateway) waitForShutdown() error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
+	if g.metrics != nil {
+		g.metrics.Close()
+	}
+	if g.registrar != nil {
+		g.registrar.Close()
+	}
 	if err := g.server.Shutdown(ctx); err != nil {
 		return fmt.Errorf("shutdown: %w", err)
 	}

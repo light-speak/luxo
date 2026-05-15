@@ -238,14 +238,74 @@ void _genMethod(StringBuffer b, LuxoAPI api) {
   final ret = _returnType(api);
   final dec = _decoder(api);
 
-  if (api.name.startsWith('get') && !api.returnList && api.params.isEmpty) {
-    b.writeln("  Future<$ret> ${api.name}(int id, {String? select}) async {");
-    b.writeln("    final sel = select ?? _hint('${api.name}');");
-    b.writeln("    return transport.call('${api.name}', params: {'id': id, if (sel != null) r'\$select': sel}, decoder: $dec);");
+  // If API has explicit params, always use them (no guessing by name prefix)
+  if (api.params.isNotEmpty) {
+    // page/pageSize are always optional for list APIs
+    final paginationNames = {'page', 'pageSize'};
+    final isPaginated = api.name.startsWith('list') && api.paginated;
+    final paramParts = api.params.map((p) {
+      if (isPaginated && paginationNames.contains(p.name)) {
+        return '${_luxoTypeToDart(p.type)}? ${p.name}';
+      }
+      return 'required ${_luxoTypeToDart(p.type)} ${p.name}';
+    }).toList();
+
+    // list APIs with pagination get optional pagination + select extras
+    if (api.name.startsWith('list') && api.paginated) {
+      final existingNames = api.params.map((p) => p.name).toSet();
+      if (!existingNames.contains('page')) paramParts.add('int? page');
+      if (!existingNames.contains('pageSize')) paramParts.add('int? pageSize');
+      paramParts.add('String? select');
+      b.writeln("  Future<$ret> ${api.name}({${paramParts.join(', ')}}) async {");
+      b.writeln("    final sel = select ?? _hint('${api.name}');");
+      b.writeln("    return transport.call('${api.name}', params: {");
+      for (final p in api.params) {
+        if (paginationNames.contains(p.name)) {
+          b.writeln("      if (${p.name} != null) '${p.name}': ${p.name},");
+        } else {
+          b.writeln("      '${p.name}': ${p.name},");
+        }
+      }
+      if (!existingNames.contains('page')) {
+        b.writeln("      if (page != null) 'page': page,");
+      }
+      if (!existingNames.contains('pageSize')) {
+        b.writeln("      if (pageSize != null) 'pageSize': pageSize,");
+      }
+      b.writeln("      if (sel != null) r'\$select': sel,");
+      b.writeln('    }, decoder: $dec);');
+      b.writeln('  }\n');
+      return;
+    }
+
+    // get APIs with select hint support
+    if (api.name.startsWith('get') && !api.returnList) {
+      paramParts.add('String? select');
+      b.writeln("  Future<$ret> ${api.name}({${paramParts.join(', ')}}) async {");
+      b.writeln("    final sel = select ?? _hint('${api.name}');");
+      b.writeln("    return transport.call('${api.name}', params: {");
+      for (final p in api.params) {
+        b.writeln("      '${p.name}': ${p.name},");
+      }
+      b.writeln("      if (sel != null) r'\$select': sel,");
+      b.writeln('    }, decoder: $dec);');
+      b.writeln('  }\n');
+      return;
+    }
+
+    // Generic params — all other APIs with explicit params
+    b.writeln("  Future<$ret> ${api.name}({${paramParts.join(', ')}}) async {");
+    b.writeln("    return transport.call('${api.name}', params: {");
+    for (final p in api.params) {
+      b.writeln("      '${p.name}': ${p.name},");
+    }
+    b.writeln('    }, decoder: $dec);');
     b.writeln('  }\n');
     return;
   }
-  if (api.name.startsWith('list')) {
+
+  // No explicit params — fall back to heuristics by name prefix
+  if (api.name.startsWith('list') && api.paginated) {
     b.writeln("  Future<$ret> ${api.name}({int? page, int? pageSize, String? select}) async {");
     b.writeln("    final sel = select ?? _hint('${api.name}');");
     b.writeln("    return transport.call('${api.name}', params: {");
@@ -268,23 +328,8 @@ void _genMethod(StringBuffer b, LuxoAPI api) {
     b.writeln('  }\n');
     return;
   }
-  if (api.name.startsWith('delete')) {
-    b.writeln("  Future<int> ${api.name}(int id) async {");
-    b.writeln("    return transport.call('${api.name}', params: {'id': id}, decoder: (d) => d as int);");
-    b.writeln('  }\n');
-    return;
-  }
-  if (api.params.isNotEmpty) {
-    final params = api.params.map((p) => '${_luxoTypeToDart(p.type)} ${p.name}').join(', ');
-    b.writeln("  Future<$ret> ${api.name}({$params}) async {");
-    b.writeln("    return transport.call('${api.name}', params: {");
-    for (final p in api.params) {
-      b.writeln("      '${p.name}': ${p.name},");
-    }
-    b.writeln('    }, decoder: $dec);');
-    b.writeln('  }\n');
-    return;
-  }
+
+  // No params, no special prefix — zero-arg method
   b.writeln("  Future<$ret> ${api.name}() async {");
   b.writeln("    return transport.call('${api.name}', decoder: $dec);");
   b.writeln('  }\n');

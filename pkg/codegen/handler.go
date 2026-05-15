@@ -106,12 +106,15 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 
 	modelMap, inferredAPIs := collectInferredAPIs(result)
 
-	// Check if there are any compiled APIs or service fns
+	// Check if there are any compiled APIs, native APIs, or service fns
 	hasCompiledAPIs := false
+	hasNativeAPIs := false
 	hasServiceFns := false
 	for _, file := range result.Files {
 		for _, api := range file.APIs {
-			if api.Body != nil && !hasDirective(api.Directives, "native") {
+			if hasDirective(api.Directives, "native") {
+				hasNativeAPIs = true
+			} else if api.Body != nil {
 				hasCompiledAPIs = true
 			}
 		}
@@ -122,7 +125,7 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 		}
 	}
 
-	if len(models) == 0 && len(inferredAPIs) == 0 && !hasCompiledAPIs && !hasServiceFns {
+	if len(models) == 0 && len(inferredAPIs) == 0 && !hasCompiledAPIs && !hasNativeAPIs && !hasServiceFns {
 		return nil
 	}
 
@@ -535,7 +538,9 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 	} else {
 		b.WriteString("\n")
 	}
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux\"\n")
+	if len(models) > 0 {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux\"\n")
+	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
 	if hasHash || feat.hasCrypto {
@@ -548,7 +553,9 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 	if hasAuth {
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
 	}
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
+	if len(models) > 0 {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
+	}
 	writeSortedCrossModuleImports(b, feat.crossEventImports)
 	if hasAwait {
 		b.WriteString("\t\"golang.org/x/sync/errgroup\"\n")
@@ -1629,8 +1636,14 @@ func pluralize(name string) string {
 	if strings.HasSuffix(name, "s") || strings.HasSuffix(name, "x") || strings.HasSuffix(name, "z") {
 		return name + "es"
 	}
-	if strings.HasSuffix(name, "y") {
-		return name[:len(name)-1] + "ies"
+	if strings.HasSuffix(name, "y") && len(name) >= 2 {
+		// Only consonant+y → ies (e.g. History→Histories)
+		// Vowel+y → just add s (e.g. Gateway→Gateways, Key→Keys)
+		prev := name[len(name)-2]
+		if prev != 'a' && prev != 'e' && prev != 'i' && prev != 'o' && prev != 'u' &&
+			prev != 'A' && prev != 'E' && prev != 'I' && prev != 'O' && prev != 'U' {
+			return name[:len(name)-1] + "ies"
+		}
 	}
 	return name + "s"
 }

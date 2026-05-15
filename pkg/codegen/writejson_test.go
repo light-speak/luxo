@@ -663,3 +663,63 @@ func TestGenerateTypeWriteLuxo(t *testing.T) {
 		t.Errorf("should write Int field: %s", out)
 	}
 }
+
+func TestGenerateWriteLuxoUUIDDecimalBytesJSON(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"Doc": {"id": 1, "uuid": 2, "price": 3, "data": 4, "meta": 5,
+			"optUuid": 6, "optPrice": 7, "optData": 8, "optMeta": 9},
+	})
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Models: []*ast.ModelDecl{{
+				Name: "Doc",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "uuid", Type: &ast.TypeRef{Name: "UUID"}},
+					{Name: "price", Type: &ast.TypeRef{Name: "Decimal"}},
+					{Name: "data", Type: &ast.TypeRef{Name: "Bytes"}},
+					{Name: "meta", Type: &ast.TypeRef{Name: "JSON"}},
+					{Name: "optUuid", Type: &ast.TypeRef{Name: "UUID", Nullable: true}},
+					{Name: "optPrice", Type: &ast.TypeRef{Name: "Decimal", Nullable: true}},
+					{Name: "optData", Type: &ast.TypeRef{Name: "Bytes", Nullable: true}},
+					{Name: "optMeta", Type: &ast.TypeRef{Name: "JSON", Nullable: true}},
+				},
+			}},
+		}},
+	}
+
+	src := generateWriteJSONFile(result, "app", nil)
+	code := string(src)
+
+	// WriteLuxo checks
+	if !strings.Contains(code, ".String()") {
+		t.Errorf("UUID/Decimal should use .String():\n%s", code)
+	}
+	if !strings.Contains(code, "AppendBytes") {
+		t.Errorf("Bytes/JSON should use AppendBytes:\n%s", code)
+	}
+
+	// ReadLuxo checks
+	if !strings.Contains(code, "uuid.MustParse") {
+		t.Errorf("UUID ReadLuxo should use uuid.MustParse:\n%s", code)
+	}
+	if !strings.Contains(code, "decimal.RequireFromString") {
+		t.Errorf("Decimal ReadLuxo should use decimal.RequireFromString:\n%s", code)
+	}
+	if !strings.Contains(code, "ReadBytes()") {
+		t.Errorf("Bytes ReadLuxo should use ReadBytes:\n%s", code)
+	}
+	if !strings.Contains(code, "ReadBytesPtr()") {
+		t.Errorf("nullable Bytes ReadLuxo should use ReadBytesPtr:\n%s", code)
+	}
+
+	// WriteColumnar checks
+	if !strings.Contains(code, "WriteColumnString") {
+		t.Errorf("UUID/Decimal columnar should use WriteColumnString:\n%s", code)
+	}
+}

@@ -12,6 +12,15 @@ import (
 // generateSchemaFile produces schema.gen.go containing RegisterSchema
 // that registers model and API metadata with the Luvia schema registry.
 // This enables schema-driven Binary↔JSON conversion at the Luvia layer.
+type schemaAPIInfo struct {
+	name       string
+	moduleName string
+	params     []*ast.ParamDecl
+	returnType *ast.TypeRef
+	paginated  bool
+	directives []*ast.Directive
+}
+
 func generateSchemaFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
 	var models []*ast.ModelDecl
 	for _, file := range result.Files {
@@ -33,16 +42,7 @@ func generateSchemaFile(result *semantic.Result, packageName string, enums map[s
 		}
 	}
 
-	// Collect APIs (CRUD + declared + fn @service)
-	type apiInfo struct {
-		name       string
-		moduleName string
-		params     []*ast.ParamDecl
-		returnType *ast.TypeRef
-		paginated  bool
-		directives []*ast.Directive
-	}
-	var apis []apiInfo
+	var apis []schemaAPIInfo
 
 	for _, file := range result.Files {
 		modName := moduleNameFromFile(file.Name)
@@ -50,26 +50,12 @@ func generateSchemaFile(result *semantic.Result, packageName string, enums map[s
 			if !hasCrud(m) {
 				continue
 			}
-			// CRUD APIs
 			for _, op := range crudOperations(m) {
-				apiName := crudAPIName(m.Name, op)
-				ai := apiInfo{name: apiName, moduleName: modName}
-				switch op {
-				case "get":
-					ai.returnType = &ast.TypeRef{Name: m.Name}
-				case "list":
-					ai.returnType = &ast.TypeRef{Name: m.Name, IsList: true}
-					ai.paginated = true
-				case "create":
-					ai.returnType = &ast.TypeRef{Name: m.Name}
-				case "update":
-					ai.returnType = &ast.TypeRef{Name: m.Name}
-				}
-				apis = append(apis, ai)
+				apis = append(apis, buildCrudAPIInfo(m.Name, op, modName))
 			}
 		}
 		for _, api := range file.APIs {
-			apis = append(apis, apiInfo{
+			apis = append(apis, schemaAPIInfo{
 				name:       api.Name,
 				moduleName: modName,
 				params:     api.Params,
@@ -79,7 +65,7 @@ func generateSchemaFile(result *semantic.Result, packageName string, enums map[s
 		}
 		for _, fn := range file.Functions {
 			if hasDirective(fn.Directives, "service") {
-				apis = append(apis, apiInfo{
+				apis = append(apis, schemaAPIInfo{
 					name:       "svc:" + fn.Name,
 					moduleName: modName,
 					params:     fn.Params,
@@ -122,6 +108,30 @@ func generateSchemaFile(result *semantic.Result, packageName string, enums map[s
 	b.WriteString("}\n")
 
 	return []byte(b.String())
+}
+
+// buildCrudAPIInfo constructs schemaAPIInfo for a single CRUD operation.
+func buildCrudAPIInfo(modelName, op, modName string) schemaAPIInfo {
+	apiName := crudAPIName(modelName, op)
+	ai := schemaAPIInfo{name: apiName, moduleName: modName}
+	idParam := []*ast.ParamDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}}
+	switch op {
+	case "get":
+		ai.returnType = &ast.TypeRef{Name: modelName}
+		ai.params = idParam
+	case "list":
+		ai.returnType = &ast.TypeRef{Name: modelName, IsList: true}
+		ai.paginated = true
+		ai.params = []*ast.ParamDecl{
+			{Name: "page", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "pageSize", Type: &ast.TypeRef{Name: "Int"}},
+		}
+	case "create", "update":
+		ai.returnType = &ast.TypeRef{Name: modelName}
+	case "delete":
+		ai.params = idParam
+	}
+	return ai
 }
 
 // writeModelRegistration generates schema.RegisterModel for one model.
@@ -318,12 +328,19 @@ func buildSchemaAPIs(s *schema.Schema, result *semantic.Result, enums map[string
 				switch op {
 				case "get":
 					a.ReturnType = m.Name
+					a.Params = []schema.Param{{ID: getAPIParamID(apiName, "id"), Name: "id", Type: schema.FieldInt}}
 				case "list":
 					a.ReturnType = m.Name
 					a.ReturnList = true
 					a.Paginated = true
+					a.Params = []schema.Param{
+						{ID: getAPIParamID(apiName, "page"), Name: "page", Type: schema.FieldInt},
+						{ID: getAPIParamID(apiName, "pageSize"), Name: "pageSize", Type: schema.FieldInt},
+					}
 				case "create", "update":
 					a.ReturnType = m.Name
+				case "delete":
+					a.Params = []schema.Param{{ID: getAPIParamID(apiName, "id"), Name: "id", Type: schema.FieldInt}}
 				}
 				s.RegisterAPI(a)
 			}

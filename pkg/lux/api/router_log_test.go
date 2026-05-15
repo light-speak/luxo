@@ -12,7 +12,8 @@ import (
 func TestLogRequest_WithError(t *testing.T) {
 	// Enable logging temporarily
 	old := logEnabled
-	logEnabled = true
+	v := true
+	logEnabled = &v
 	defer func() { logEnabled = old }()
 
 	rt := NewRouter()
@@ -44,7 +45,8 @@ func TestLogRequest_WithError(t *testing.T) {
 
 func TestLogRequest_SlowDuration(t *testing.T) {
 	old := logEnabled
-	logEnabled = true
+	v := true
+	logEnabled = &v
 	defer func() { logEnabled = old }()
 
 	rt := NewRouter()
@@ -72,7 +74,8 @@ func TestLogRequest_SlowDuration(t *testing.T) {
 
 func TestLogRequest_MediumDuration(t *testing.T) {
 	old := logEnabled
-	logEnabled = true
+	v := true
+	logEnabled = &v
 	defer func() { logEnabled = old }()
 
 	rt := NewRouter()
@@ -99,7 +102,8 @@ func TestLogRequest_MediumDuration(t *testing.T) {
 
 func TestLogRequest_Disabled(t *testing.T) {
 	old := logEnabled
-	logEnabled = false
+	vf := false
+	logEnabled = &vf
 	defer func() { logEnabled = old }()
 
 	rt := NewRouter()
@@ -109,7 +113,8 @@ func TestLogRequest_Disabled(t *testing.T) {
 
 func TestLogRequest_NoModule(t *testing.T) {
 	old := logEnabled
-	logEnabled = true
+	v := true
+	logEnabled = &v
 	defer func() { logEnabled = old }()
 
 	rt := NewRouter()

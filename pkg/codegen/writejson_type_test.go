@@ -328,3 +328,153 @@ func TestGenerateWriteJSONFile_TypeDecls(t *testing.T) {
 		t.Errorf("missing AuthPayload type WriteLuxo:\n%s", code)
 	}
 }
+
+// ─── writeTypeListScalarField — [String], [Int], [Boolean], [Float] ─────────
+
+func TestWriteTypeListScalarField_StringList(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"Tags": {"names": 1},
+	})
+
+	pseudo := &ast.ModelDecl{
+		Name: "Tags",
+		Fields: []*ast.FieldDecl{
+			{Name: "names", Type: &ast.TypeRef{Name: "String", IsList: true}},
+		},
+	}
+
+	var b strings.Builder
+	generateTypeWriteLuxo(&b, pseudo, nil)
+	code := b.String()
+
+	if !strings.Contains(code, "len(t.Names)") {
+		t.Errorf("should append list length:\n%s", code)
+	}
+	if !strings.Contains(code, "AppendString(buf.B, v)") {
+		t.Errorf("should AppendString for each element:\n%s", code)
+	}
+}
+
+func TestWriteTypeListScalarField_IntList(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"Nums": {"values": 1},
+	})
+
+	pseudo := &ast.ModelDecl{
+		Name: "Nums",
+		Fields: []*ast.FieldDecl{
+			{Name: "values", Type: &ast.TypeRef{Name: "Int", IsList: true}},
+		},
+	}
+
+	var b strings.Builder
+	generateTypeWriteLuxo(&b, pseudo, nil)
+	code := b.String()
+
+	if !strings.Contains(code, "AppendSvarint(buf.B, v)") {
+		t.Errorf("should AppendSvarint for each element:\n%s", code)
+	}
+}
+
+func TestWriteTypeListScalarField_BooleanList(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"Flags": {"active": 1},
+	})
+
+	pseudo := &ast.ModelDecl{
+		Name: "Flags",
+		Fields: []*ast.FieldDecl{
+			{Name: "active", Type: &ast.TypeRef{Name: "Boolean", IsList: true}},
+		},
+	}
+
+	var b strings.Builder
+	generateTypeWriteLuxo(&b, pseudo, nil)
+	code := b.String()
+
+	if !strings.Contains(code, "AppendBool(buf.B, v)") {
+		t.Errorf("should AppendBool for each element:\n%s", code)
+	}
+}
+
+func TestWriteTypeListScalarField_FloatList(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"Scores": {"points": 1},
+	})
+
+	pseudo := &ast.ModelDecl{
+		Name: "Scores",
+		Fields: []*ast.FieldDecl{
+			{Name: "points", Type: &ast.TypeRef{Name: "Float", IsList: true}},
+		},
+	}
+
+	var b strings.Builder
+	generateTypeWriteLuxo(&b, pseudo, nil)
+	code := b.String()
+
+	if !strings.Contains(code, "AppendFixed64(buf.B, v)") {
+		t.Errorf("should AppendFixed64 for each element:\n%s", code)
+	}
+}
+
+func TestWriteTypeListScalarField_EnumList(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"Perms": {"roles": 1},
+	})
+
+	pseudo := &ast.ModelDecl{
+		Name: "Perms",
+		Fields: []*ast.FieldDecl{
+			{Name: "roles", Type: &ast.TypeRef{Name: "Role", IsList: true}},
+		},
+	}
+
+	enums := map[string]bool{"Role": true}
+	var b strings.Builder
+	generateTypeWriteLuxo(&b, pseudo, enums)
+	code := b.String()
+
+	if !strings.Contains(code, "string(v)") {
+		t.Errorf("should convert enum to string:\n%s", code)
+	}
+}
+
+func TestWriteTypeListScalarField_DurationList(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"Timers": {"durations": 1},
+	})
+
+	pseudo := &ast.ModelDecl{
+		Name: "Timers",
+		Fields: []*ast.FieldDecl{
+			{Name: "durations", Type: &ast.TypeRef{Name: "Duration", IsList: true}},
+		},
+	}
+
+	var b strings.Builder
+	generateTypeWriteLuxo(&b, pseudo, nil)
+	code := b.String()
+
+	if !strings.Contains(code, "int64(v)") {
+		t.Errorf("should cast Duration to int64:\n%s", code)
+	}
+}

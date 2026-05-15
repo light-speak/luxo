@@ -32,6 +32,11 @@ type HandlerFunc func(ctx context.Context, req *Request) error
 // The handler receives a Stream and pushes data via stream.Send(). Return when done or context cancelled.
 type StreamHandlerFunc func(ctx context.Context, params *StreamParams, identity any, stream *Stream)
 
+// MetricsRecorder is called for each completed request to collect metrics.
+type MetricsRecorder interface {
+	Record(apiName string, duration time.Duration, isError bool)
+}
+
 // Router maps API names to handlers and serves the /luvia endpoint.
 type Router struct {
 	handlers         map[string]HandlerFunc
@@ -39,11 +44,17 @@ type Router struct {
 	streamHandlers   map[string]StreamHandlerFunc // @stream @native (no event) → handler
 	translator       *i18n.Translator
 	devMode          bool
-	Registry         *APIRegistry   // binary protocol API ID mapping
-	Schema           *schema.Schema // model/API metadata for Binary↔JSON conversion
-	Streams          *StreamHub     // WebSocket stream subscription manager
-	IntrospectionKey string         // key for schema introspection (empty = disabled)
-	WSOrigins        []string       // allowed WebSocket origins (empty = allow all in dev mode)
+	Registry         *APIRegistry    // binary protocol API ID mapping
+	Schema           *schema.Schema  // model/API metadata for Binary↔JSON conversion
+	Streams          *StreamHub      // WebSocket stream subscription manager
+	IntrospectionKey string          // key for schema introspection (empty = disabled)
+	WSOrigins        []string        // allowed WebSocket origins (empty = allow all in dev mode)
+	metrics          MetricsRecorder // optional metrics collector
+}
+
+// SetMetricsCollector configures request metrics collection.
+func (rt *Router) SetMetricsCollector(mc MetricsRecorder) {
+	rt.metrics = mc
 }
 
 // NewRouter creates an empty router.
@@ -121,12 +132,22 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, readErr.Error())
 			return
 		}
-		defer bodyPool.Put(bp)
+		defer putBody(bp)
 		req, err = rt.Registry.ParseBinaryRequest(body)
 	} else {
 		req, err = ParseRequest(r)
 	}
 	if err != nil {
+		if isLogEnabled() {
+			mode := "json"
+			if binaryMode {
+				mode = "binary"
+			}
+			fmt.Fprintf(os.Stderr, "%s%s%s %s[parse]%s %s %s✗ %s%s\n",
+				colorDim, time.Now().Format("15:04:05"), colorReset,
+				colorRed, colorReset, mode,
+				colorRed, err.Error(), colorReset)
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -160,8 +181,18 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	herr := rt.callHandler(fn, r.Context(), req)
 	duration := time.Since(start)
 
+	if rt.metrics != nil {
+		rt.metrics.Record(req.API, duration, herr != nil)
+	}
+
 	if herr != nil {
 		rt.logRequest(req.API, duration, herr)
+		// Debug level: log param details for debugging (user explicitly opts in)
+		if isLogEnabled() && os.Getenv("LOG_LEVEL") == "debug" && req.paramNames != nil {
+			for i := 0; i < req.paramCount; i++ {
+				fmt.Fprintf(os.Stderr, "    param[%d] %s = %v\n", i, req.paramNames[i], req.paramSlots[i])
+			}
+		}
 		PutBuf(buf)
 		rt.writeAppError(w, r, binaryMode, herr)
 		return
@@ -353,8 +384,17 @@ const (
 	colorGreen = "\033[32m"
 )
 
-// logEnabled controls whether request logging is active (LOG_REQUESTS env, opt-in).
-var logEnabled = os.Getenv("LOG_REQUESTS") == "true"
+// logEnabled controls whether request logging is active (LOG_REQUESTS env).
+// Lazy-initialized on first check so .env is loaded before reading.
+var logEnabled *bool
+
+func isLogEnabled() bool {
+	if logEnabled == nil {
+		v := os.Getenv("LOG_REQUESTS") != "false"
+		logEnabled = &v
+	}
+	return *logEnabled
+}
 
 // moduleColorMap caches color assignment per module name.
 var (
@@ -380,7 +420,7 @@ func moduleColor(mod string) string {
 //	12:34:56 [auth] login 2.3ms ✓
 //	12:34:56 [auth] login 1.2ms ✗ InvalidCredentials
 func (rt *Router) logRequest(apiName string, duration time.Duration, err error) {
-	if !logEnabled {
+	if !isLogEnabled() {
 		return
 	}
 	mod := ""

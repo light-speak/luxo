@@ -14,6 +14,9 @@ import (
 	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
 )
 
+// MaxRPCConnections limits concurrent RPC connections to prevent goroutine exhaustion.
+const MaxRPCConnections = 10000
+
 // Server handles internal RPC connections using Luxo binary protocol.
 // Dispatches requests to the same handlers as the HTTP router.
 type Server struct {
@@ -22,6 +25,7 @@ type Server struct {
 	listener net.Listener
 	wg       sync.WaitGroup
 	done     chan struct{}
+	sem      chan struct{} // connection semaphore
 }
 
 // NewServer creates an RPC server that shares handlers with the HTTP router.
@@ -30,6 +34,7 @@ func NewServer(router *api.Router) *Server {
 		handlers: router.ExportHandlers(),
 		registry: router.Registry,
 		done:     make(chan struct{}),
+		sem:      make(chan struct{}, MaxRPCConnections),
 	}
 }
 
@@ -55,8 +60,18 @@ func (s *Server) ListenAndServe(addr string) error {
 		if tc, ok := conn.(*net.TCPConn); ok {
 			tc.SetNoDelay(true)
 		}
+		// Limit concurrent connections via semaphore
+		select {
+		case s.sem <- struct{}{}:
+		default:
+			conn.Close() // at capacity, reject
+			continue
+		}
 		s.wg.Add(1)
-		go s.handleConn(conn)
+		go func() {
+			defer func() { <-s.sem }()
+			s.handleConn(conn)
+		}()
 	}
 }
 

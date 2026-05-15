@@ -480,3 +480,30 @@ func TestWSJSON_StreamNativeHandler(t *testing.T) {
 		}
 	}
 }
+
+func TestStreamHubSubscribeLimit(t *testing.T) {
+	hub := NewStreamHub()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_ = ctx
+
+	// Fill up to the limit
+	for i := 0; i < MaxSubscribersPerAPI; i++ {
+		sub := hub.Subscribe("testAPI", nil, nil, nil, cancel)
+		if sub == nil {
+			t.Fatalf("subscribe should succeed at %d", i)
+		}
+	}
+
+	// Next one should be rejected
+	sub := hub.Subscribe("testAPI", nil, nil, nil, cancel)
+	if sub != nil {
+		t.Fatal("subscribe should return nil when at capacity")
+	}
+
+	// Different API should still work
+	sub2 := hub.Subscribe("otherAPI", nil, nil, nil, cancel)
+	if sub2 == nil {
+		t.Fatal("subscribe to different API should succeed")
+	}
+}

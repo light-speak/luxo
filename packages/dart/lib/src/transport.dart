@@ -128,9 +128,9 @@ class HttpTransport implements Transport {
         final v = params[pm.name];
         if (v == null) continue;
         switch (pm.type) {
-          case 'Int': enc.writeFieldInt(pm.fieldID, v as int);
+          case 'Int' || 'Duration': enc.writeFieldInt(pm.fieldID, v as int);
           case 'Float': enc.writeFieldFloat(pm.fieldID, (v as num).toDouble());
-          case 'String': enc.writeFieldString(pm.fieldID, v as String);
+          case 'String' || 'Enum' || 'UUID' || 'Decimal' || 'DateTime': enc.writeFieldString(pm.fieldID, v as String);
           case 'Boolean': enc.writeFieldBool(pm.fieldID, v as bool);
         }
       }
@@ -293,9 +293,9 @@ class WsTransport implements Transport {
           final v = params[pm.name];
           if (v == null) continue;
           switch (pm.type) {
-            case 'Int': enc.writeFieldInt(pm.fieldID, v as int);
+            case 'Int' || 'Duration': enc.writeFieldInt(pm.fieldID, v as int);
             case 'Float': enc.writeFieldFloat(pm.fieldID, (v as num).toDouble());
-            case 'String': enc.writeFieldString(pm.fieldID, v as String);
+            case 'String' || 'Enum' || 'UUID' || 'Decimal' || 'DateTime': enc.writeFieldString(pm.fieldID, v as String);
             case 'Boolean': enc.writeFieldBool(pm.fieldID, v as bool);
           }
         }

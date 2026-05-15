@@ -1,6 +1,7 @@
 package schema
 
 import (
+	"encoding/base64"
 	"strconv"
 	"time"
 	"unicode/utf8"
@@ -76,13 +77,15 @@ func BinaryListToJSON(dst []byte, data []byte, model *Model) []byte {
 
 // typedColumn holds a decoded column's values in typed slices (no map[string]any).
 type typedColumn struct {
-	field   *Field
-	ints    []int64
-	intPtrs []*int64
-	floats  []float64
-	strings []string
-	strPtrs []*string
-	bools   []bool
+	field     *Field
+	ints      []int64
+	intPtrs   []*int64
+	floats    []float64
+	floatPtrs []*float64
+	strings   []string
+	strPtrs   []*string
+	bools     []bool
+	boolPtrs  []*bool
 }
 
 // columnarToJSON decodes columnar binary to JSON array.
@@ -109,7 +112,11 @@ func columnarToJSON(dst []byte, data []byte, model *Model) []byte {
 				col.ints = r.ReadColumnInt()
 			}
 		case FieldFloat:
-			col.floats = r.ReadColumnFloat()
+			if f.Nullable {
+				col.floatPtrs = r.ReadColumnFloatPtr()
+			} else {
+				col.floats = r.ReadColumnFloat()
+			}
 		case FieldString, FieldEnum:
 			if f.Nullable {
 				col.strPtrs = r.ReadColumnStringPtr()
@@ -117,7 +124,11 @@ func columnarToJSON(dst []byte, data []byte, model *Model) []byte {
 				col.strings = r.ReadColumnString()
 			}
 		case FieldBool:
-			col.bools = r.ReadColumnBool()
+			if f.Nullable {
+				col.boolPtrs = r.ReadColumnBoolPtr()
+			} else {
+				col.bools = r.ReadColumnBool()
+			}
 		}
 		columns = append(columns, col)
 	}
@@ -170,6 +181,11 @@ func appendColumnValueJSON(dst []byte, col *typedColumn, i int) []byte {
 		return strconv.AppendInt(dst, *col.intPtrs[i], 10)
 	case col.floats != nil:
 		return strconv.AppendFloat(dst, col.floats[i], 'f', -1, 64)
+	case col.floatPtrs != nil:
+		if col.floatPtrs[i] == nil {
+			return append(dst, "null"...)
+		}
+		return strconv.AppendFloat(dst, *col.floatPtrs[i], 'f', -1, 64)
 	case col.strings != nil:
 		return appendJSONString(dst, col.strings[i])
 	case col.strPtrs != nil:
@@ -179,6 +195,14 @@ func appendColumnValueJSON(dst []byte, col *typedColumn, i int) []byte {
 		return appendJSONString(dst, *col.strPtrs[i])
 	case col.bools != nil:
 		if col.bools[i] {
+			return append(dst, "true"...)
+		}
+		return append(dst, "false"...)
+	case col.boolPtrs != nil:
+		if col.boolPtrs[i] == nil {
+			return append(dst, "null"...)
+		}
+		if *col.boolPtrs[i] {
 			return append(dst, "true"...)
 		}
 		return append(dst, "false"...)
@@ -279,7 +303,11 @@ func BinaryPaginatedListToJSON(dst []byte, data []byte, model *Model) []byte {
 				col.ints = r.ReadColumnInt()
 			}
 		case FieldFloat:
-			col.floats = r.ReadColumnFloat()
+			if f.Nullable {
+				col.floatPtrs = r.ReadColumnFloatPtr()
+			} else {
+				col.floats = r.ReadColumnFloat()
+			}
 		case FieldString, FieldEnum:
 			if f.Nullable {
 				col.strPtrs = r.ReadColumnStringPtr()
@@ -287,7 +315,11 @@ func BinaryPaginatedListToJSON(dst []byte, data []byte, model *Model) []byte {
 				col.strings = r.ReadColumnString()
 			}
 		case FieldBool:
-			col.bools = r.ReadColumnBool()
+			if f.Nullable {
+				col.boolPtrs = r.ReadColumnBoolPtr()
+			} else {
+				col.bools = r.ReadColumnBool()
+			}
 		}
 		columns = append(columns, col)
 	}
@@ -375,8 +407,14 @@ func appendFieldValueJSON(dst []byte, dec *codec.Decoder, f *Field) []byte {
 		v := dec.ReadInt()
 		return strconv.AppendInt(dst, v, 10)
 	case FieldBytes:
-		_ = dec.ReadBytes()
-		return append(dst, "null"...) // TODO: base64 encode
+		raw := dec.ReadBytes()
+		if raw == nil {
+			return append(dst, "null"...)
+		}
+		dst = append(dst, '"')
+		dst = append(dst, base64.StdEncoding.EncodeToString(raw)...)
+		dst = append(dst, '"')
+		return dst
 	default:
 		return append(dst, "null"...)
 	}
@@ -420,6 +458,21 @@ func appendNullableFieldJSON(dst []byte, dec *codec.Decoder, f *Field) []byte {
 		t := time.Unix(*v, 0).UTC()
 		dst = append(dst, '"')
 		dst = t.AppendFormat(dst, time.RFC3339Nano)
+		dst = append(dst, '"')
+		return dst
+	case FieldDuration:
+		v := dec.ReadIntPtr()
+		if v == nil {
+			return append(dst, "null"...)
+		}
+		return strconv.AppendInt(dst, *v, 10)
+	case FieldBytes:
+		raw := dec.ReadBytesPtr()
+		if raw == nil {
+			return append(dst, "null"...)
+		}
+		dst = append(dst, '"')
+		dst = append(dst, base64.StdEncoding.EncodeToString(raw)...)
 		dst = append(dst, '"')
 		return dst
 	default:
