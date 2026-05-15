@@ -382,11 +382,19 @@ function genMethod(api: LuxoAPI, schema: LuxoSchema): string {
 
   // If API has explicit params, always use them for the signature (no guessing by name prefix)
   if (api.params && api.params.length > 0) {
-    // Build typed params object
-    const paramFields = api.params.map(p => `${p.name}: ${resolveParamType(p, schema)}`).join('; ')
+    const isPaginated = api.name.startsWith('list') && api.paginated
+    const paginationNames = new Set(['page', 'pageSize'])
 
-    // list APIs with page/pageSize get optional params + pagination extras
-    if (api.name.startsWith('list') && api.paginated) {
+    // Build typed params: page/pageSize are optional for list APIs
+    const paramFields = api.params.map(p => {
+      if (isPaginated && paginationNames.has(p.name)) {
+        return `${p.name}?: ${resolveParamType(p, schema)}`
+      }
+      return `${p.name}: ${resolveParamType(p, schema)}`
+    }).join('; ')
+
+    // list APIs with page/pageSize get optional pagination extras
+    if (isPaginated) {
       return `  async ${api.name}(params?: { ${paramFields}; $select?: string; $filters?: unknown[]; $sorters?: unknown[] }): Promise<${retTS}> {\n` +
              call('params') + `  }\n\n`
     }

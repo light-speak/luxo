@@ -197,15 +197,26 @@ object LuxoCodegen {
 
         // If API has explicit params, always use them (no guessing by name prefix)
         if (api.params.isNotEmpty()) {
-            val ps = api.params.joinToString(", ") { "${it.name}: ${luxoTypeToKt(it.type)}" }
+            val isPaginated = api.name.startsWith("list") && api.paginated
+            val paginationNames = setOf("page", "pageSize")
+            // page/pageSize are optional for list APIs
+            val ps = api.params.joinToString(", ") {
+                if (isPaginated && it.name in paginationNames) "${it.name}: ${luxoTypeToKt(it.type)}? = null"
+                else "${it.name}: ${luxoTypeToKt(it.type)}"
+            }
             val paramMap = api.params.joinToString(", ") { "\"${it.name}\" to ${it.name}" }
 
             when {
                 // list APIs with pagination get optional pagination + select extras
-                api.name.startsWith("list") && api.paginated -> {
-                    b.appendLine("    suspend fun ${api.name}($ps, page: Int? = null, pageSize: Int? = null, select: String? = null): $ret {")
+                isPaginated -> {
+                    val existingNames = api.params.map { it.name }.toSet()
+                    val extraParams = listOf("page", "pageSize").filter { it !in existingNames }.joinToString(", ") { "$it: Int? = null" }
+                    val extraParamStr = if (extraParams.isNotEmpty()) ", $extraParams" else ""
+                    val extraMap = listOf("page", "pageSize").filter { it !in existingNames }.joinToString(", ") { "\"$it\" to $it" }
+                    val extraMapStr = if (extraMap.isNotEmpty()) ", $extraMap" else ""
+                    b.appendLine("    suspend fun ${api.name}($ps$extraParamStr, select: String? = null): $ret {")
                     b.appendLine("        val sel = select ?: hint(\"${api.name}\")")
-                    b.appendLine("        val data = transport.call(\"${api.name}\", mapOf($paramMap, \"page\" to page, \"pageSize\" to pageSize, \"\\\$select\" to sel))")
+                    b.appendLine("        val data = transport.call(\"${api.name}\", mapOf($paramMap$extraMapStr, \"\\\$select\" to sel))")
                     emitDecode()
                     b.appendLine("    }\n")
                 }

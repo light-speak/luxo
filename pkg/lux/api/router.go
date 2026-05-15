@@ -132,16 +132,20 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, readErr.Error())
 			return
 		}
-		defer bodyPool.Put(bp)
+		defer putBody(bp)
 		req, err = rt.Registry.ParseBinaryRequest(body)
 	} else {
 		req, err = ParseRequest(r)
 	}
 	if err != nil {
 		if isLogEnabled() {
+			mode := "json"
+			if binaryMode {
+				mode = "binary"
+			}
 			fmt.Fprintf(os.Stderr, "%s%s%s %s[parse]%s %s %s✗ %s%s\n",
 				colorDim, time.Now().Format("15:04:05"), colorReset,
-				colorRed, colorReset, "binary",
+				colorRed, colorReset, mode,
 				colorRed, err.Error(), colorReset)
 		}
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -183,7 +187,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if herr != nil {
 		rt.logRequest(req.API, duration, herr)
-		// Debug level only: log param details on error
+		// Debug level: log param details for debugging (user explicitly opts in)
 		if isLogEnabled() && os.Getenv("LOG_LEVEL") == "debug" && req.paramNames != nil {
 			for i := 0; i < req.paramCount; i++ {
 				fmt.Fprintf(os.Stderr, "    param[%d] %s = %v\n", i, req.paramNames[i], req.paramSlots[i])

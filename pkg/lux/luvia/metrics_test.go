@@ -87,35 +87,45 @@ func TestPercentile(t *testing.T) {
 	}
 }
 
-func TestQuickSelect(t *testing.T) {
-	// Single element
-	if got := quickSelect([]float64{5.0}, 0); got != 5.0 {
-		t.Errorf("quickSelect([5], 0) = %f, want 5", got)
+func TestPercentileSorted(t *testing.T) {
+	// Verify sort-based percentile gives correct results
+	data := []float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	if got := percentile(data, 0.0); got != 1 {
+		t.Errorf("p0 = %f, want 1", got)
 	}
+	if got := percentile(data, 1.0); got != 10 {
+		t.Errorf("p100 = %f, want 10", got)
+	}
+}
 
-	// k=0 means smallest
-	arr := []float64{30, 10, 20}
-	if got := quickSelect(arr, 0); got != 10 {
-		t.Errorf("quickSelect min = %f, want 10", got)
+func TestMetricsLatenciesCapped(t *testing.T) {
+	mc := &MetricsCollector{
+		buckets: make(map[string]*metricBucket),
+		done:    make(chan struct{}),
 	}
+	// Record more than maxLatencySamples
+	for i := 0; i < maxLatencySamples+100; i++ {
+		mc.Record("highQPS", time.Millisecond, false)
+	}
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	for _, b := range mc.buckets {
+		if len(b.latencies) > maxLatencySamples {
+			t.Errorf("latencies len = %d, should be capped at %d", len(b.latencies), maxLatencySamples)
+		}
+		if b.totalCount != int64(maxLatencySamples+100) {
+			t.Errorf("totalCount = %d, want %d", b.totalCount, maxLatencySamples+100)
+		}
+	}
+}
 
-	// k=2 means largest
-	arr2 := []float64{30, 10, 20}
-	if got := quickSelect(arr2, 2); got != 30 {
-		t.Errorf("quickSelect max = %f, want 30", got)
+func TestMetricsDoubleClose(t *testing.T) {
+	mc := &MetricsCollector{
+		buckets: make(map[string]*metricBucket),
+		done:    make(chan struct{}),
 	}
-
-	// Equal elements
-	arr3 := []float64{5, 5, 5}
-	if got := quickSelect(arr3, 1); got != 5 {
-		t.Errorf("quickSelect equal = %f, want 5", got)
-	}
-
-	// Mixed with duplicates, exercise lo/eq/hi partitioning
-	arr4 := []float64{3, 1, 4, 1, 5, 9, 2, 6}
-	if got := quickSelect(arr4, 3); got != 3 {
-		t.Errorf("quickSelect(k=3) = %f, want 3", got)
-	}
+	mc.Close()
+	mc.Close() // should not panic
 }
 
 func TestNewMetricsCollectorNilWhenNoEnv(t *testing.T) {
@@ -186,6 +196,7 @@ func TestMetricsCollectorCloseFlush(t *testing.T) {
 		apiKey:    "test",
 		buckets:   make(map[string]*metricBucket),
 		done:      make(chan struct{}),
+		client:    &http.Client{Timeout: 5 * time.Second},
 	}
 
 	mc.Record("getUser", 10*time.Millisecond, false)
@@ -219,6 +230,7 @@ func TestMetricsFlushHTTPError(t *testing.T) {
 		apiKey:    "test",
 		buckets:   make(map[string]*metricBucket),
 		done:      make(chan struct{}),
+		client:    &http.Client{Timeout: 1 * time.Second},
 	}
 	mc.Record("getUser", 10*time.Millisecond, false)
 	// flush should not panic on HTTP error

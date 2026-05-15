@@ -134,9 +134,13 @@ func NewStreamHub() *StreamHub {
 	}
 }
 
+// MaxSubscribersPerAPI limits subscribers per API to prevent memory exhaustion.
+const MaxSubscribersPerAPI = 10000
+
 // Subscribe adds a subscriber for an API.
 // The provided cancel function is called when the subscriber is too slow (channel full).
 // Typically this cancels the subscriber's context, causing WritePump to exit.
+// Returns nil if the per-API subscriber limit is reached.
 func (h *StreamHub) Subscribe(apiName string, params map[string]any, identity any, fieldMask []byte, cancel context.CancelFunc) *StreamSub {
 	sub := &StreamSub{
 		Ch:        make(chan []byte, 64), // buffered to absorb bursts
@@ -147,6 +151,10 @@ func (h *StreamHub) Subscribe(apiName string, params map[string]any, identity an
 	}
 
 	h.mu.Lock()
+	if len(h.subs[apiName]) >= MaxSubscribersPerAPI {
+		h.mu.Unlock()
+		return nil
+	}
 	h.subs[apiName] = append(h.subs[apiName], sub)
 	h.mu.Unlock()
 

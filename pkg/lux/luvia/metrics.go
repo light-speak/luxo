@@ -6,9 +6,14 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
 	"sync"
 	"time"
 )
+
+// maxLatencySamples caps the number of latency samples per bucket to prevent
+// unbounded memory growth under high QPS (10k req/s = ~2.4MB per bucket max).
+const maxLatencySamples = 30000
 
 // MetricsCollector aggregates request metrics in memory and periodically
 // flushes them to a Luxo Studio instance via the ingestMetrics API.
@@ -21,6 +26,9 @@ type MetricsCollector struct {
 	mu      sync.Mutex
 	buckets map[string]*metricBucket // key: "apiName:minute"
 	done    chan struct{}
+	closed  bool
+
+	client *http.Client // dedicated client with timeout
 }
 
 type metricBucket struct {
@@ -29,7 +37,7 @@ type metricBucket struct {
 	totalCount int64
 	errCount   int64
 	totalMs    float64
-	latencies  []float64 // for percentile calculation
+	latencies  []float64 // for percentile calculation, capped at maxLatencySamples
 }
 
 // NewMetricsCollector creates a collector from environment variables.
@@ -53,6 +61,7 @@ func NewMetricsCollector() *MetricsCollector {
 		instanceID: instanceID,
 		buckets:    make(map[string]*metricBucket),
 		done:       make(chan struct{}),
+		client:     &http.Client{Timeout: 10 * time.Second},
 	}
 	go mc.flushLoop()
 	return mc
@@ -75,14 +84,25 @@ func (mc *MetricsCollector) Record(apiName string, duration time.Duration, isErr
 	ms := float64(duration.Microseconds()) / 1000.0
 	b.totalCount++
 	b.totalMs += ms
-	b.latencies = append(b.latencies, ms)
+	// Cap latency samples to prevent unbounded memory growth
+	if len(b.latencies) < maxLatencySamples {
+		b.latencies = append(b.latencies, ms)
+	}
 	if isError {
 		b.errCount++
 	}
 }
 
-// Close stops the flush loop.
+// Close stops the flush loop and performs a final flush.
 func (mc *MetricsCollector) Close() {
+	mc.mu.Lock()
+	if mc.closed {
+		mc.mu.Unlock()
+		return
+	}
+	mc.closed = true
+	mc.mu.Unlock()
+
 	close(mc.done)
 	mc.flush() // final flush
 }
@@ -129,9 +149,10 @@ func (mc *MetricsCollector) flush() {
 	}
 
 	body, _ := json.Marshal(map[string]any{
-		"$api":      "ingestMetrics",
-		"projectId": mc.projectID,
-		"buckets":   bucketList,
+		"$api":       "ingestMetrics",
+		"projectId":  mc.projectID,
+		"instanceId": mc.instanceID,
+		"buckets":    bucketList,
 	})
 
 	req, err := http.NewRequest("POST", mc.studioURL+"/luvia", bytes.NewReader(body))
@@ -139,50 +160,33 @@ func (mc *MetricsCollector) flush() {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+mc.apiKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := mc.client.Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[metrics] flush failed: %v\n", err)
+		// Re-enqueue buckets on failure so data is not lost
+		mc.mu.Lock()
+		for k, b := range old {
+			if _, exists := mc.buckets[k]; !exists {
+				mc.buckets[k] = b
+			}
+		}
+		mc.mu.Unlock()
 		return
 	}
 	resp.Body.Close()
 }
 
-func percentile(sorted []float64, p float64) float64 {
-	if len(sorted) == 0 {
+func percentile(data []float64, p float64) float64 {
+	if len(data) == 0 {
 		return 0
 	}
-	// Simple percentile — not sorted, use selection
-	n := len(sorted)
-	idx := int(float64(n) * p)
-	if idx >= n {
-		idx = n - 1
-	}
-	// Partial sort: find k-th smallest
-	return quickSelect(sorted, idx)
-}
+	// Sort a copy — don't mutate the original
+	sorted := make([]float64, len(data))
+	copy(sorted, data)
+	sort.Float64s(sorted)
 
-func quickSelect(arr []float64, k int) float64 {
-	if len(arr) <= 1 {
-		return arr[0]
-	}
-	pivot := arr[len(arr)/2]
-	var lo, hi, eq []float64
-	for _, v := range arr {
-		switch {
-		case v < pivot:
-			lo = append(lo, v)
-		case v > pivot:
-			hi = append(hi, v)
-		default:
-			eq = append(eq, v)
-		}
-	}
-	if k < len(lo) {
-		return quickSelect(lo, k)
-	}
-	if k < len(lo)+len(eq) {
-		return pivot
-	}
-	return quickSelect(hi, k-len(lo)-len(eq))
+	idx := int(float64(len(sorted)-1) * p)
+	return sorted[idx]
 }

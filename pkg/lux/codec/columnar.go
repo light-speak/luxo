@@ -166,6 +166,10 @@ func NewColumnarReader(buf []byte) *ColumnarReader {
 		r.err = fmt.Errorf("codec: invalid columnar record count")
 		return r
 	}
+	if count > MaxColumnarRecords {
+		r.err = fmt.Errorf("codec: columnar count %d exceeds limit %d", count, MaxColumnarRecords)
+		return r
+	}
 	r.count = int(count)
 	r.off = n
 	return r
@@ -311,6 +315,56 @@ func (r *ColumnarReader) ReadColumnStringPtr() []*string {
 		v, n := ReadString(r.buf, r.off)
 		if n == 0 {
 			r.err = fmt.Errorf("codec: truncated string value at record %d", i)
+			return nil
+		}
+		r.off += n
+		result = append(result, &v)
+	}
+	return result
+}
+
+// ReadColumnFloatPtr reads count nullable float64 values.
+func (r *ColumnarReader) ReadColumnFloatPtr() []*float64 {
+	result := make([]*float64, 0, r.count)
+	for i := 0; i < r.count; i++ {
+		present, n := ReadNullable(r.buf, r.off)
+		if n == 0 {
+			r.err = fmt.Errorf("codec: truncated nullable at record %d", i)
+			return nil
+		}
+		r.off += n
+		if !present {
+			result = append(result, nil)
+			continue
+		}
+		v, n := ReadFixed64(r.buf, r.off)
+		if n == 0 {
+			r.err = fmt.Errorf("codec: truncated float value at record %d", i)
+			return nil
+		}
+		r.off += n
+		result = append(result, &v)
+	}
+	return result
+}
+
+// ReadColumnBoolPtr reads count nullable bool values.
+func (r *ColumnarReader) ReadColumnBoolPtr() []*bool {
+	result := make([]*bool, 0, r.count)
+	for i := 0; i < r.count; i++ {
+		present, n := ReadNullable(r.buf, r.off)
+		if n == 0 {
+			r.err = fmt.Errorf("codec: truncated nullable at record %d", i)
+			return nil
+		}
+		r.off += n
+		if !present {
+			result = append(result, nil)
+			continue
+		}
+		v, n := ReadBool(r.buf, r.off)
+		if n == 0 {
+			r.err = fmt.Errorf("codec: truncated bool value at record %d", i)
 			return nil
 		}
 		r.off += n

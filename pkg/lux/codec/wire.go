@@ -17,6 +17,14 @@ import (
 	"math"
 )
 
+// Safety limits to prevent OOM from malicious/corrupted wire data.
+const (
+	// MaxArrayElements caps decoded array/list size (1M elements).
+	MaxArrayElements = 1_000_000
+	// MaxColumnarRecords caps columnar record count (10M rows).
+	MaxColumnarRecords = 10_000_000
+)
+
 // --- Varint (unsigned LEB128) ---
 
 // AppendVarint appends a varint-encoded uint64 to dst.

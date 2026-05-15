@@ -473,9 +473,9 @@ func TestBinaryToJSON_AllFieldTypes(t *testing.T) {
 	if !strings.Contains(got, `"enumVal":"ACTIVE"`) {
 		t.Errorf("missing enum: %s", got)
 	}
-	// bytes currently returns null (TODO: base64)
-	if !strings.Contains(got, `"bytesVal":null`) {
-		t.Errorf("missing bytes (null): %s", got)
+	// bytes → base64 encoded (0xDEAD = "3q0=")
+	if !strings.Contains(got, `"bytesVal":"3q0="`) {
+		t.Errorf("missing bytes (base64): %s", got)
 	}
 }
 
@@ -993,5 +993,103 @@ func TestBinaryListToJSON_NullableDateTimeColumn(t *testing.T) {
 	}
 	if !strings.Contains(got, "null") {
 		t.Errorf("missing null: %s", got)
+	}
+}
+
+func TestBinaryListToJSON_NullableFloatColumn(t *testing.T) {
+	s := New()
+	m := &Model{
+		Name: "Item",
+		Fields: []Field{
+			{ID: 1, Name: "score", Type: FieldFloat, Nullable: true},
+		},
+	}
+	s.RegisterModel(m)
+
+	v1 := 1.5
+	var w codec.ColumnarWriter
+	w.SetCount(2)
+	w.WriteColumnFloatPtr(1, []*float64{&v1, nil})
+	data := w.Bytes()
+
+	result := BinaryListToJSON(nil, data, m)
+	got := string(result)
+	if !strings.Contains(got, "1.5") {
+		t.Errorf("missing float value: %s", got)
+	}
+	if !strings.Contains(got, "null") {
+		t.Errorf("missing null: %s", got)
+	}
+}
+
+func TestBinaryListToJSON_NullableBoolColumn(t *testing.T) {
+	s := New()
+	m := &Model{
+		Name: "Flag",
+		Fields: []Field{
+			{ID: 1, Name: "active", Type: FieldBool, Nullable: true},
+		},
+	}
+	s.RegisterModel(m)
+
+	tr := true
+	var w codec.ColumnarWriter
+	w.SetCount(2)
+	w.WriteColumnBoolPtr(1, []*bool{&tr, nil})
+	data := w.Bytes()
+
+	result := BinaryListToJSON(nil, data, m)
+	got := string(result)
+	if !strings.Contains(got, "true") {
+		t.Errorf("missing bool value: %s", got)
+	}
+	if !strings.Contains(got, "null") {
+		t.Errorf("missing null: %s", got)
+	}
+}
+
+func TestBinaryToJSON_NullableDuration(t *testing.T) {
+	s := New()
+	m := &Model{
+		Name: "Task",
+		Fields: []Field{
+			{ID: 1, Name: "timeout", Type: FieldDuration, Nullable: true},
+		},
+	}
+	s.RegisterModel(m)
+
+	// Nullable duration: present (fieldID + present marker + svarint value + end)
+	buf := codec.AppendVarint(nil, 1) // fieldID
+	buf = codec.AppendVarint(buf, 1)  // present
+	buf = codec.AppendSvarint(buf, 5000)
+	buf = append(buf, 0x00) // end
+
+	result := BinaryToJSON(nil, buf, m)
+	got := string(result)
+	if !strings.Contains(got, "5000") {
+		t.Errorf("expected 5000, got: %s", got)
+	}
+}
+
+func TestBinaryToJSON_NullableBytes(t *testing.T) {
+	s := New()
+	m := &Model{
+		Name: "File",
+		Fields: []Field{
+			{ID: 1, Name: "data", Type: FieldBytes, Nullable: true},
+		},
+	}
+	s.RegisterModel(m)
+
+	// Present nullable bytes
+	buf := codec.AppendVarint(nil, 1) // fieldID
+	buf = codec.AppendVarint(buf, 1)  // present
+	buf = codec.AppendBytes(buf, []byte{0xCA, 0xFE})
+	buf = append(buf, 0x00) // end
+
+	result := BinaryToJSON(nil, buf, m)
+	got := string(result)
+	if !strings.Contains(got, `"yv4="`) {
+		t.Errorf("expected base64 encoded bytes, got: %s", got)
 	}
 }

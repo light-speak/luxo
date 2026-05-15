@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestNewGatewayRegistrarNilWhenNoEnv(t *testing.T) {
@@ -41,7 +42,11 @@ func TestGatewayRegistrarRegisterBody(t *testing.T) {
 			t.Errorf("Content-Type = %q", r.Header.Get("Content-Type"))
 		}
 		var body map[string]any
-		json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("failed to decode body: %v", err)
+			w.WriteHeader(400)
+			return
+		}
 		mu.Lock()
 		received = append(received, body)
 		mu.Unlock()
@@ -66,10 +71,12 @@ func TestGatewayRegistrarRegisterBody(t *testing.T) {
 		t.Errorf("projectID = %d, want 7", gr.projectID)
 	}
 
+	// register is async now — wait briefly for it to complete
+	time.Sleep(100 * time.Millisecond)
+
 	mu.Lock()
 	defer mu.Unlock()
 
-	// register() is called on startup
 	if len(received) == 0 {
 		t.Fatal("register should be called on startup")
 	}
@@ -89,10 +96,16 @@ func TestGatewayRegistrarRegisterBody(t *testing.T) {
 func TestGatewayRegistrarHeartbeatBody(t *testing.T) {
 	var mu sync.Mutex
 	var received []map[string]any
+	var authHeader string
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeader = r.Header.Get("Authorization")
 		var body map[string]any
-		json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("failed to decode body: %v", err)
+			w.WriteHeader(400)
+			return
+		}
 		mu.Lock()
 		received = append(received, body)
 		mu.Unlock()
@@ -107,9 +120,9 @@ func TestGatewayRegistrarHeartbeatBody(t *testing.T) {
 		instanceID: "test-instance",
 		endpoint:   "http://test-instance:8080",
 		done:       make(chan struct{}),
+		client:     &http.Client{Timeout: 5 * time.Second},
 	}
 
-	// Call heartbeat directly
 	gr.heartbeat()
 
 	mu.Lock()
@@ -123,14 +136,15 @@ func TestGatewayRegistrarHeartbeatBody(t *testing.T) {
 	if hb["$api"] != "heartbeat" {
 		t.Errorf("$api = %v, want heartbeat", hb["$api"])
 	}
-	if hb["apiKey"] != "test-key" {
-		t.Errorf("apiKey = %v, want test-key", hb["apiKey"])
-	}
 	if hb["instanceId"] != "test-instance" {
 		t.Errorf("instanceId = %v, want test-instance", hb["instanceId"])
 	}
 	if _, ok := hb["memoryMB"]; !ok {
 		t.Error("memoryMB should be present")
+	}
+	// Auth should be in header, not body
+	if authHeader != "Bearer test-key" {
+		t.Errorf("Authorization header = %q, want Bearer test-key", authHeader)
 	}
 }
 
@@ -140,6 +154,7 @@ func TestGatewayRegistrarRegisterHTTPError(t *testing.T) {
 		apiKey:     "test",
 		instanceID: "test",
 		done:       make(chan struct{}),
+		client:     &http.Client{Timeout: 1 * time.Second},
 	}
 	// Should not panic on HTTP error
 	gr.register()
@@ -151,6 +166,7 @@ func TestGatewayRegistrarHeartbeatHTTPError(t *testing.T) {
 		apiKey:     "test",
 		instanceID: "test",
 		done:       make(chan struct{}),
+		client:     &http.Client{Timeout: 1 * time.Second},
 	}
 	// Should not panic on HTTP error
 	gr.heartbeat()
@@ -169,6 +185,7 @@ func TestGatewayRegistrarRegisterAuthHeader(t *testing.T) {
 		apiKey:     "my-secret-key",
 		instanceID: "test",
 		done:       make(chan struct{}),
+		client:     &http.Client{Timeout: 5 * time.Second},
 	}
 	gr.register()
 
@@ -181,7 +198,6 @@ func TestGatewayRegistrarClose(t *testing.T) {
 	gr := &GatewayRegistrar{
 		done: make(chan struct{}),
 	}
-	// Close should not panic
 	gr.Close()
 
 	// Verify channel is closed
@@ -190,5 +206,37 @@ func TestGatewayRegistrarClose(t *testing.T) {
 		// ok
 	default:
 		t.Fatal("done channel should be closed")
+	}
+}
+
+func TestGatewayRegistrarDoubleClose(t *testing.T) {
+	gr := &GatewayRegistrar{
+		done: make(chan struct{}),
+	}
+	gr.Close()
+	gr.Close() // should not panic
+}
+
+func TestGatewayRegistrarCustomEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	os.Setenv("LUXO_STUDIO_URL", srv.URL)
+	os.Setenv("LUXO_API_KEY", "test-key")
+	os.Setenv("LUXO_GATEWAY_ENDPOINT", "https://my-gateway.example.com")
+	defer os.Unsetenv("LUXO_STUDIO_URL")
+	defer os.Unsetenv("LUXO_API_KEY")
+	defer os.Unsetenv("LUXO_GATEWAY_ENDPOINT")
+
+	gr := NewGatewayRegistrar("8080")
+	if gr == nil {
+		t.Fatal("should create registrar")
+	}
+	defer gr.Close()
+
+	if gr.endpoint != "https://my-gateway.example.com" {
+		t.Errorf("endpoint = %q, want https://my-gateway.example.com", gr.endpoint)
 	}
 }

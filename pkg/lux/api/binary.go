@@ -105,8 +105,12 @@ func (r *APIRegistry) ParseBinaryRequest(body []byte) (*Request, error) {
 	}
 	off += n
 
+	const maxFieldMaskSize = 10 * 1024 // 10KB = 80,000 fields max
 	var fields []*selection.Field
 	if maskLen > 0 {
+		if maskLen > maxFieldMaskSize {
+			return nil, fmt.Errorf("field mask size %d exceeds limit %d", maskLen, maxFieldMaskSize)
+		}
 		if maskLen > uint64(len(body)) {
 			return nil, fmt.Errorf("field mask length overflow")
 		}
@@ -202,7 +206,7 @@ func EncodeBinaryRequest(apiID int, params map[string]any, paramMeta []ParamMeta
 			continue
 		}
 		switch meta.Type {
-		case "Int":
+		case "Int", "Duration":
 			switch iv := v.(type) {
 			case int:
 				enc.WriteFieldInt(meta.FieldID, int64(iv))
@@ -215,7 +219,7 @@ func EncodeBinaryRequest(apiID int, params map[string]any, paramMeta []ParamMeta
 			if fv, ok := v.(float64); ok {
 				enc.WriteFieldFloat(meta.FieldID, fv)
 			}
-		case "String":
+		case "String", "DateTime", "Enum", "UUID", "Decimal":
 			if sv, ok := v.(string); ok {
 				enc.WriteFieldString(meta.FieldID, sv)
 			}

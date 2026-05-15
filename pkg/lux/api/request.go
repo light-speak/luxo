@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -21,14 +22,29 @@ var bodyPool = sync.Pool{
 	},
 }
 
+// putBody returns a body buffer to the pool, discarding oversized buffers
+// to prevent a single large request from permanently inflating pool memory.
+func putBody(bp *[]byte) {
+	if cap(*bp) > 1<<20 { // >1MB: discard, don't pollute pool
+		return
+	}
+	bodyPool.Put(bp)
+}
+
 // readBody reads the full contents of r into a pooled buffer.
 // Returns the data, the pool handle (caller must return via bodyPool.Put), and any error.
+// MaxRequestBodySize limits binary request body to 100MB to prevent OOM.
+const MaxRequestBodySize = 100 * 1024 * 1024
+
 func readBody(r io.Reader) ([]byte, *[]byte, error) {
 	bp := bodyPool.Get().(*[]byte)
 	buf := bytes.NewBuffer((*bp)[:0])
-	_, err := buf.ReadFrom(r)
+	n, err := buf.ReadFrom(io.LimitReader(r, MaxRequestBodySize+1))
 	if err != nil {
 		return nil, bp, err
+	}
+	if n > MaxRequestBodySize {
+		return nil, bp, fmt.Errorf("request body exceeds %d bytes limit", MaxRequestBodySize)
 	}
 	*bp = buf.Bytes()
 	return *bp, bp, nil
@@ -75,19 +91,25 @@ type Request struct {
 }
 
 // ParseRequest reads an HTTP request body and extracts $api, $select, and params.
+// MaxJSONBodySize limits JSON request body to 10MB (smaller than binary).
+const MaxJSONBodySize = 10 * 1024 * 1024
+
 func ParseRequest(r *http.Request) (*Request, error) {
 	defer r.Body.Close()
 	body, bp, err := readBody(r.Body)
 	if err != nil {
 		if bp != nil {
-			bodyPool.Put(bp)
+			putBody(bp)
 		}
 		return nil, fmt.Errorf("read body: %w", err)
 	}
-	defer bodyPool.Put(bp)
+	defer putBody(bp)
 
 	if len(body) == 0 {
 		return nil, fmt.Errorf("empty request body")
+	}
+	if len(body) > MaxJSONBodySize {
+		return nil, fmt.Errorf("JSON body exceeds %d bytes limit", MaxJSONBodySize)
 	}
 
 	var raw map[string]json.RawMessage
@@ -146,10 +168,16 @@ func (req *Request) parseListParams(raw map[string]json.RawMessage) error {
 		if err := json.Unmarshal(filtersRaw, &req.Filters); err != nil {
 			return fmt.Errorf("$filters: %w", err)
 		}
+		if len(req.Filters) > 1000 {
+			return fmt.Errorf("$filters exceeds limit: %d > 1000", len(req.Filters))
+		}
 	}
 	if sortersRaw, ok := raw["$sorters"]; ok {
 		if err := json.Unmarshal(sortersRaw, &req.Sorters); err != nil {
 			return fmt.Errorf("$sorters: %w", err)
+		}
+		if len(req.Sorters) > 100 {
+			return fmt.Errorf("$sorters exceeds limit: %d > 100", len(req.Sorters))
 		}
 	}
 	req.Page = 1
@@ -433,6 +461,9 @@ func assignBinaryParam(v any, target any) error {
 			*t = bv
 			return nil
 		}
+	}
+	if isLogEnabled() {
+		fmt.Fprintf(os.Stderr, "[debug] assignBinaryParam: unsupported target %T for value %T\n", target, v)
 	}
 	return nil
 }

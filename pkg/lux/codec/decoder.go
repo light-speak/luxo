@@ -179,6 +179,20 @@ func (d *Decoder) ReadBoolPtr() *bool {
 	return &v
 }
 
+// ReadBytesPtr reads nullable bytes. Returns nil for null.
+func (d *Decoder) ReadBytesPtr() []byte {
+	present, n := ReadNullable(d.buf, d.off)
+	if n == 0 {
+		d.err = fmt.Errorf("codec: invalid nullable at offset %d", d.off)
+		return nil
+	}
+	d.off += n
+	if !present {
+		return nil
+	}
+	return d.ReadBytes()
+}
+
 // --- Array readers ---
 
 // ReadIntArray reads a count-prefixed int64 array.
@@ -186,6 +200,10 @@ func (d *Decoder) ReadIntArray() []int64 {
 	count, n := ReadArrayHeader(d.buf, d.off)
 	if n == 0 {
 		d.err = fmt.Errorf("codec: invalid array header at offset %d", d.off)
+		return nil
+	}
+	if count > MaxArrayElements {
+		d.err = fmt.Errorf("codec: array size %d exceeds limit %d at offset %d", count, MaxArrayElements, d.off)
 		return nil
 	}
 	d.off += n
@@ -206,6 +224,10 @@ func (d *Decoder) ReadStringArray() []string {
 		d.err = fmt.Errorf("codec: invalid array header at offset %d", d.off)
 		return nil
 	}
+	if count > MaxArrayElements {
+		d.err = fmt.Errorf("codec: array size %d exceeds limit %d at offset %d", count, MaxArrayElements, d.off)
+		return nil
+	}
 	d.off += n
 	result := make([]string, 0, count)
 	for i := 0; i < count; i++ {
@@ -222,6 +244,10 @@ func (d *Decoder) ReadFloatArray() []float64 {
 	count, n := ReadArrayHeader(d.buf, d.off)
 	if n == 0 {
 		d.err = fmt.Errorf("codec: invalid array header at offset %d", d.off)
+		return nil
+	}
+	if count > MaxArrayElements {
+		d.err = fmt.Errorf("codec: array size %d exceeds limit %d at offset %d", count, MaxArrayElements, d.off)
 		return nil
 	}
 	d.off += n

@@ -58,6 +58,7 @@ func (rt *Router) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	conn.SetReadLimit(1 << 20) // 1MB max incoming message
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	ws := &wsConn{conn: conn}

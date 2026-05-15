@@ -240,21 +240,38 @@ void _genMethod(StringBuffer b, LuxoAPI api) {
 
   // If API has explicit params, always use them (no guessing by name prefix)
   if (api.params.isNotEmpty) {
-    final paramParts = api.params.map((p) => 'required ${_luxoTypeToDart(p.type)} ${p.name}').toList();
+    // page/pageSize are always optional for list APIs
+    final paginationNames = {'page', 'pageSize'};
+    final isPaginated = api.name.startsWith('list') && api.paginated;
+    final paramParts = api.params.map((p) {
+      if (isPaginated && paginationNames.contains(p.name)) {
+        return '${_luxoTypeToDart(p.type)}? ${p.name}';
+      }
+      return 'required ${_luxoTypeToDart(p.type)} ${p.name}';
+    }).toList();
 
     // list APIs with pagination get optional pagination + select extras
     if (api.name.startsWith('list') && api.paginated) {
-      paramParts.add('int? page');
-      paramParts.add('int? pageSize');
+      final existingNames = api.params.map((p) => p.name).toSet();
+      if (!existingNames.contains('page')) paramParts.add('int? page');
+      if (!existingNames.contains('pageSize')) paramParts.add('int? pageSize');
       paramParts.add('String? select');
       b.writeln("  Future<$ret> ${api.name}({${paramParts.join(', ')}}) async {");
       b.writeln("    final sel = select ?? _hint('${api.name}');");
       b.writeln("    return transport.call('${api.name}', params: {");
       for (final p in api.params) {
-        b.writeln("      '${p.name}': ${p.name},");
+        if (paginationNames.contains(p.name)) {
+          b.writeln("      if (${p.name} != null) '${p.name}': ${p.name},");
+        } else {
+          b.writeln("      '${p.name}': ${p.name},");
+        }
       }
-      b.writeln("      if (page != null) 'page': page,");
-      b.writeln("      if (pageSize != null) 'pageSize': pageSize,");
+      if (!existingNames.contains('page')) {
+        b.writeln("      if (page != null) 'page': page,");
+      }
+      if (!existingNames.contains('pageSize')) {
+        b.writeln("      if (pageSize != null) 'pageSize': pageSize,");
+      }
       b.writeln("      if (sel != null) r'\$select': sel,");
       b.writeln('    }, decoder: $dec);');
       b.writeln('  }\n');

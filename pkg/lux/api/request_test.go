@@ -424,3 +424,47 @@ func TestParseRequestReservedNotInParams(t *testing.T) {
 		t.Error("reserved fields should not be in params")
 	}
 }
+
+func TestPutBodyDiscardOversized(t *testing.T) {
+	// Small buffer should be returned to pool
+	small := make([]byte, 0, 1024)
+	bp := &small
+	putBody(bp)
+	// No panic means success
+
+	// Large buffer (>1MB) should be discarded, not pooled
+	large := make([]byte, 0, 2<<20) // 2MB
+	bp2 := &large
+	putBody(bp2)
+	// No panic means success
+}
+
+func TestParseRequestJSONBodySizeLimit(t *testing.T) {
+	// Body exceeding MaxJSONBodySize should be rejected
+	bigBody := strings.Repeat("x", MaxJSONBodySize+1)
+	r := makeReq(bigBody)
+	_, err := ParseRequest(r)
+	if err == nil {
+		t.Fatal("expected error for oversized JSON body")
+	}
+	if !strings.Contains(err.Error(), "JSON body exceeds") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestParseRequestFiltersSortersLimit(t *testing.T) {
+	// Build a request with >1000 filters
+	var filters []string
+	for i := 0; i < 1001; i++ {
+		filters = append(filters, fmt.Sprintf(`{"field":"f%d","op":"=","value":"v"}`, i))
+	}
+	body := fmt.Sprintf(`{"$api":"listUsers","$filters":[%s]}`, strings.Join(filters, ","))
+	r := makeReq(body)
+	_, err := ParseRequest(r)
+	if err == nil {
+		t.Fatal("expected error for >1000 filters")
+	}
+	if !strings.Contains(err.Error(), "exceeds limit") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
