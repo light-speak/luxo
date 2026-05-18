@@ -1,0 +1,19 @@
+{
+  "": {
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoCompiler.build/primary.swiftdeps"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/Sources/LuxoCompiler/FieldNode.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoCompiler.build/FieldNode.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoCompiler.build/FieldNode.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoCompiler.build/FieldNode~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoCompiler.build/FieldNode.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoCompiler.build/FieldNode.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/Sources/LuxoCompiler/SelectAnalyzer.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoCompiler.build/SelectAnalyzer.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoCompiler.build/SelectAnalyzer.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoCompiler.build/SelectAnalyzer~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoCompiler.build/SelectAnalyzer.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoCompiler.build/SelectAnalyzer.dia"
+  }
+}

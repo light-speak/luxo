@@ -1,0 +1,47 @@
+{
+  "": {
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/primary.swiftdeps"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftCompilerPluginMessageHandling/CompilerPluginMessageHandler.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/CompilerPluginMessageHandler.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/CompilerPluginMessageHandler.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/CompilerPluginMessageHandler~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/CompilerPluginMessageHandler.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/CompilerPluginMessageHandler.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftCompilerPluginMessageHandling/Diagnostics.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/Diagnostics.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/Diagnostics.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/Diagnostics~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/Diagnostics.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/Diagnostics.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftCompilerPluginMessageHandling/Macros.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/Macros.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/Macros.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/Macros~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/Macros.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/Macros.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftCompilerPluginMessageHandling/PluginMacroExpansionContext.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/PluginMacroExpansionContext.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/PluginMacroExpansionContext.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/PluginMacroExpansionContext~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/PluginMacroExpansionContext.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/PluginMacroExpansionContext.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftCompilerPluginMessageHandling/PluginMessageCompatibility.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/PluginMessageCompatibility.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/PluginMessageCompatibility.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/PluginMessageCompatibility~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/PluginMessageCompatibility.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/PluginMessageCompatibility.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftCompilerPluginMessageHandling/PluginMessages.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/PluginMessages.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/PluginMessages.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/PluginMessages~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/PluginMessages.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftCompilerPluginMessageHandling.build/PluginMessages.dia"
+  }
+}

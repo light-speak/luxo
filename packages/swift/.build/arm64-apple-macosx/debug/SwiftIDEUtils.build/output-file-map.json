@@ -1,0 +1,33 @@
+{
+  "": {
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/primary.swiftdeps"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftIDEUtils/SwiftIDEUtilsCompatibility.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/SwiftIDEUtilsCompatibility.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/SwiftIDEUtilsCompatibility.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/SwiftIDEUtilsCompatibility~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/SwiftIDEUtilsCompatibility.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/SwiftIDEUtilsCompatibility.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftIDEUtils/Syntax+Classifications.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/Syntax+Classifications.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/Syntax+Classifications.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/Syntax+Classifications~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/Syntax+Classifications.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/Syntax+Classifications.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftIDEUtils/SyntaxClassification.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/SyntaxClassification.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/SyntaxClassification.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/SyntaxClassification~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/SyntaxClassification.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/SyntaxClassification.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftIDEUtils/SyntaxClassifier.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/SyntaxClassifier.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/SyntaxClassifier.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/SyntaxClassifier~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/SyntaxClassifier.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftIDEUtils.build/SyntaxClassifier.dia"
+  }
+}

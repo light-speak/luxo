@@ -1,0 +1,12 @@
+{
+  "": {
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacrosTestSupport.build/primary.swiftdeps"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftSyntaxMacrosTestSupport/Assertions.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacrosTestSupport.build/Assertions.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacrosTestSupport.build/Assertions.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacrosTestSupport.build/Assertions~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacrosTestSupport.build/Assertions.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacrosTestSupport.build/Assertions.dia"
+  }
+}

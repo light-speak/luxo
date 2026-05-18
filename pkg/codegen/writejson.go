@@ -144,9 +144,109 @@ func writeWriteJSONImports(b *strings.Builder, models []*ast.ModelDecl, stubs []
 	}
 }
 
+// isArenaField returns true if the field's value is stored as a Go string and
+// benefits from arena allocation during decoding. Includes String, String?, Enum, Enum?.
+// Excludes UUID/Decimal (parsed to non-string types after decoding).
+// Excludes fields with @transform/@mask/@visible — these directives can change the
+// written string length at runtime, causing a mismatch between the pre-calculated
+// totalStringLen and the actual bytes on wire.
+func isArenaField(f *ast.FieldDecl, enums map[string]bool) bool {
+	if f.Type == nil || f.Computed != nil {
+		return false
+	}
+	if f.Type.IsList {
+		return false
+	}
+	// Directives that modify the wire value or conditionally skip the field
+	if hasDirective(f.Directives, "transform") || hasDirective(f.Directives, "mask") || hasDirective(f.Directives, "visible") {
+		return false
+	}
+	if f.Type.Name == "String" {
+		return true
+	}
+	if enums[f.Type.Name] {
+		return true
+	}
+	return false
+}
+
+// writeArenaLenCalc generates code to calculate totalStringLen for arena allocation.
+// Emits: var _arenaLen int; _arenaLen += len(...); ...
+// Returns true if any arena fields exist (totalStringLen prefix should be written).
+func writeArenaLenCalc(b *strings.Builder, m *ast.ModelDecl, recv string, enums map[string]bool, masked bool, indent string) bool {
+	var arenaFields []struct {
+		goField  string
+		nullable bool
+		isEnum   bool
+		fieldID  int
+	}
+	for _, f := range m.Fields {
+		if !isArenaField(f, enums) {
+			continue
+		}
+		if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
+			continue
+		}
+		if isRelationField(f, enums) {
+			continue
+		}
+		fieldID := getModelFieldID(m.Name, f.Name)
+		if fieldID == 0 {
+			continue
+		}
+		arenaFields = append(arenaFields, struct {
+			goField  string
+			nullable bool
+			isEnum   bool
+			fieldID  int
+		}{
+			goField:  recv + "." + str.Capitalize(f.Name),
+			nullable: f.Type.Nullable,
+			isEnum:   enums[f.Type.Name],
+			fieldID:  fieldID,
+		})
+	}
+
+	if len(arenaFields) == 0 {
+		fmt.Fprintf(b, "%sbuf.B = codec.AppendVarint(buf.B, 0)\n", indent)
+		return false
+	}
+
+	fmt.Fprintf(b, "%svar _arenaLen int\n", indent)
+	for _, af := range arenaFields {
+		lenExpr := fmt.Sprintf("len(%s)", af.goField)
+		if af.isEnum {
+			lenExpr = fmt.Sprintf("len(string(%s))", af.goField)
+		}
+		ptrLenExpr := fmt.Sprintf("len(*%s)", af.goField)
+		if af.isEnum {
+			ptrLenExpr = fmt.Sprintf("len(string(*%s))", af.goField)
+		}
+
+		if masked {
+			if af.nullable {
+				fmt.Fprintf(b, "%sif codec.FieldMaskHas(mask, %d) && %s != nil { _arenaLen += %s }\n",
+					indent, af.fieldID, af.goField, ptrLenExpr)
+			} else {
+				fmt.Fprintf(b, "%sif codec.FieldMaskHas(mask, %d) { _arenaLen += %s }\n",
+					indent, af.fieldID, lenExpr)
+			}
+		} else {
+			if af.nullable {
+				fmt.Fprintf(b, "%sif %s != nil { _arenaLen += %s }\n", indent, af.goField, ptrLenExpr)
+			} else {
+				fmt.Fprintf(b, "%s_arenaLen += %s\n", indent, lenExpr)
+			}
+		}
+	}
+	fmt.Fprintf(b, "%sbuf.B = codec.AppendVarint(buf.B, uint64(_arenaLen))\n", indent)
+	return true
+}
+
 // generateWriteLuxo generates a WriteLuxo method for Luxo binary serialization.
 // Field IDs come from luxo.lock via getModelFieldID().
 // Writes all non-hidden, non-relation scalar fields.
+// Prefixes field data with totalStringLen varint for arena allocation on decode.
 func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
 	name := m.Name
 	recv := strings.ToLower(name[:1])
@@ -156,12 +256,15 @@ func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bo
 
 	// Generate nil-mask fast path: write all fields without FieldMaskHas checks
 	fmt.Fprintf(b, "\tif len(mask) == 0 {\n")
+	writeArenaLenCalc(b, m, recv, enums, false, "\t\t")
 	generateWriteLuxoAllFields(b, m, recv, enums)
 	fmt.Fprintf(b, "\t\tbuf.B = append(buf.B, 0x00)\n")
 	fmt.Fprintf(b, "\t\treturn\n")
 	fmt.Fprintf(b, "\t}\n")
 
-	// Slow path with mask checks
+	// Slow path: arena len with mask checks, then field encoding
+	writeArenaLenCalc(b, m, recv, enums, true, "\t")
+
 	for _, f := range m.Fields {
 		if f.Type == nil || f.Computed != nil {
 			continue
@@ -312,6 +415,9 @@ func generateTypeWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[strin
 	fmt.Fprintf(b, "// WriteLuxo writes %s as Luxo binary directly to buf.\n", name)
 	fmt.Fprintf(b, "func (%s %s) WriteLuxo(buf *api.ResponseBuf, mask []byte) {\n", recv, name)
 
+	// Arena header for type declarations (always write all fields, no mask)
+	writeArenaLenCalc(b, m, recv, enums, false, "\t")
+
 	for _, f := range m.Fields {
 		if f.Type == nil {
 			continue
@@ -398,12 +504,44 @@ func writeTypeListScalarField(b *strings.Builder, f *ast.FieldDecl, fid, goField
 	}
 }
 
+// hasArenaFields returns true if the model has any arena-eligible fields.
+func hasArenaFields(m *ast.ModelDecl, enums map[string]bool) bool {
+	for _, f := range m.Fields {
+		if isArenaField(f, enums) {
+			if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
+				continue
+			}
+			if isRelationField(f, enums) {
+				continue
+			}
+			if getModelFieldID(m.Name, f.Name) == 0 {
+				continue
+			}
+			return true
+		}
+	}
+	return false
+}
+
 func generateReadLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
 	name := m.Name
 	recv := strings.ToLower(name[:1])
+	useArena := hasArenaFields(m, enums)
 
 	fmt.Fprintf(b, "// ReadLuxo decodes %s from Luxo binary format.\n", name)
 	fmt.Fprintf(b, "func (%s *%s) ReadLuxo(dec *codec.Decoder) {\n", recv, name)
+
+	if useArena {
+		fmt.Fprintf(b, "\t_arenaSize := dec.ReadArenaSize()\n")
+		fmt.Fprintf(b, "\tvar _arena []byte\n")
+		fmt.Fprintf(b, "\tvar _arenaOff int\n")
+		fmt.Fprintf(b, "\tif _arenaSize > 0 {\n")
+		fmt.Fprintf(b, "\t\t_arena = make([]byte, _arenaSize)\n")
+		fmt.Fprintf(b, "\t}\n")
+	} else {
+		fmt.Fprintf(b, "\tdec.SkipArenaHeader()\n")
+	}
+
 	fmt.Fprintf(b, "\tfor dec.NextField() {\n")
 	fmt.Fprintf(b, "\t\tswitch dec.FieldID() {\n")
 
@@ -425,12 +563,35 @@ func generateReadLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]boo
 
 		goField := recv + "." + str.Capitalize(f.Name)
 
-		writeReadLuxoField(b, f, fieldID, goField, enums)
+		if useArena && isArenaField(f, enums) {
+			writeReadLuxoFieldArena(b, f, fieldID, goField, enums)
+		} else {
+			writeReadLuxoField(b, f, fieldID, goField, enums)
+		}
 	}
 
 	fmt.Fprintf(b, "\t\t}\n") // end switch
 	fmt.Fprintf(b, "\t}\n")   // end for
 	fmt.Fprintf(b, "}\n\n")
+}
+
+// writeReadLuxoFieldArena writes a single field's decode case using arena allocation.
+// Only called for String and Enum fields (isArenaField == true).
+func writeReadLuxoFieldArena(b *strings.Builder, f *ast.FieldDecl, fieldID int, goField string, enums map[string]bool) {
+	if enums[f.Type.Name] {
+		if f.Type.Nullable {
+			fmt.Fprintf(b, "\t\tcase %d:\n\t\t\tif v := dec.ReadStringArenaPtr(_arena, &_arenaOff); v != nil { tmp := %s(*v); %s = &tmp }\n", fieldID, f.Type.Name, goField)
+		} else {
+			fmt.Fprintf(b, "\t\tcase %d: %s = %s(dec.ReadStringArena(_arena, &_arenaOff))\n", fieldID, goField, f.Type.Name)
+		}
+		return
+	}
+	// String / String?
+	if f.Type.Nullable {
+		fmt.Fprintf(b, "\t\tcase %d: %s = dec.ReadStringArenaPtr(_arena, &_arenaOff)\n", fieldID, goField)
+	} else {
+		fmt.Fprintf(b, "\t\tcase %d: %s = dec.ReadStringArena(_arena, &_arenaOff)\n", fieldID, goField)
+	}
 }
 
 // writeReadLuxoField writes a single field's decode case for ReadLuxo.

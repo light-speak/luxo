@@ -1,0 +1,40 @@
+{
+  "": {
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/primary.swiftdeps"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/Sources/LuxoClient/Codec.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Codec.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Codec.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Codec~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Codec.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Codec.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/Sources/LuxoClient/Codegen.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Codegen.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Codegen.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Codegen~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Codegen.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Codegen.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/Sources/LuxoClient/Error.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Error.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Error.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Error~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Error.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Error.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/Sources/LuxoClient/Transport.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Transport.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Transport.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Transport~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Transport.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Transport.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/Sources/LuxoClient/Types.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Types.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Types.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Types~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Types.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoClient.build/Types.dia"
+  }
+}

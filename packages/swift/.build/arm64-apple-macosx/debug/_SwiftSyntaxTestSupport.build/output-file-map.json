@@ -1,0 +1,61 @@
+{
+  "": {
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/primary.swiftdeps"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/_SwiftSyntaxTestSupport/AssertEqualWithDiff.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/AssertEqualWithDiff.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/AssertEqualWithDiff.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/AssertEqualWithDiff~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/AssertEqualWithDiff.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/AssertEqualWithDiff.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/_SwiftSyntaxTestSupport/IncrementalParseTestUtils.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/IncrementalParseTestUtils.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/IncrementalParseTestUtils.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/IncrementalParseTestUtils~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/IncrementalParseTestUtils.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/IncrementalParseTestUtils.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/_SwiftSyntaxTestSupport/LocationMarkers.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/LocationMarkers.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/LocationMarkers.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/LocationMarkers~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/LocationMarkers.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/LocationMarkers.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/_SwiftSyntaxTestSupport/String+TrimmingTrailingWhitespace.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/String+TrimmingTrailingWhitespace.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/String+TrimmingTrailingWhitespace.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/String+TrimmingTrailingWhitespace~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/String+TrimmingTrailingWhitespace.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/String+TrimmingTrailingWhitespace.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/_SwiftSyntaxTestSupport/Syntax+Assertions.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/Syntax+Assertions.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/Syntax+Assertions.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/Syntax+Assertions~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/Syntax+Assertions.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/Syntax+Assertions.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/_SwiftSyntaxTestSupport/SyntaxComparison.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/SyntaxComparison.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/SyntaxComparison.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/SyntaxComparison~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/SyntaxComparison.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/SyntaxComparison.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/_SwiftSyntaxTestSupport/SyntaxProtocol+Initializer.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/SyntaxProtocol+Initializer.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/SyntaxProtocol+Initializer.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/SyntaxProtocol+Initializer~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/SyntaxProtocol+Initializer.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/SyntaxProtocol+Initializer.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/_SwiftSyntaxTestSupport/TestUtils.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/TestUtils.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/TestUtils.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/TestUtils~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/TestUtils.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/_SwiftSyntaxTestSupport.build/TestUtils.dia"
+  }
+}

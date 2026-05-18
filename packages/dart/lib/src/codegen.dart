@@ -118,6 +118,7 @@ String _genTypes(LuxoSchema schema) {
       final t = _luxoTypeToDart(f.type);
       b.writeln('  ${f.nullable ? '$t?' : '$t?'} _${f.name};');
     }
+    b.writeln('  dec.skipArenaHeader();');
     b.writeln('  while (dec.nextField()) {');
     b.writeln('    switch (dec.fieldID) {');
     for (final f in m.fields) {

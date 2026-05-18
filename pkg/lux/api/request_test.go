@@ -468,3 +468,65 @@ func TestParseRequestFiltersSortersLimit(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+// --- SetParamSlot accumulation tests ---
+
+func TestSetParamSlotAccumulateInt(t *testing.T) {
+	req := &Request{}
+	req.SetBinaryParams([]string{"count", "keys"}, 2)
+
+	// First write to slot 1
+	req.SetParamSlot(1, int64(10))
+	// Second write — should accumulate to []int64
+	req.SetParamSlot(1, int64(20))
+	// Third write — should append
+	req.SetParamSlot(1, int64(30))
+
+	ids, err := req.ParamIntArray("keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 3 || ids[0] != 10 || ids[1] != 20 || ids[2] != 30 {
+		t.Fatalf("ids = %v, want [10 20 30]", ids)
+	}
+}
+
+func TestSetParamSlotAccumulateString(t *testing.T) {
+	req := &Request{}
+	req.SetBinaryParams([]string{"tags"}, 1)
+
+	req.SetParamSlot(0, "a")
+	req.SetParamSlot(0, "b")
+	req.SetParamSlot(0, "c")
+
+	strs, err := req.ParamStringArray("tags")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(strs) != 3 || strs[0] != "a" || strs[1] != "b" || strs[2] != "c" {
+		t.Fatalf("strs = %v, want [a b c]", strs)
+	}
+}
+
+func TestSetParamSlotSingleInt(t *testing.T) {
+	// Single write should still work as int64, not []int64
+	req := &Request{}
+	req.SetBinaryParams([]string{"id"}, 1)
+	req.SetParamSlot(0, int64(42))
+
+	id, err := req.ParamInt("id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != 42 {
+		t.Fatalf("id = %d, want 42", id)
+	}
+}
+
+func TestSetParamSlotOutOfBounds(t *testing.T) {
+	req := &Request{}
+	// Should not panic
+	req.SetParamSlot(-1, int64(1))
+	req.SetParamSlot(16, int64(1))
+	req.SetParamSlot(99, int64(1))
+}

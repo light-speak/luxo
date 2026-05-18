@@ -31,8 +31,9 @@ func testWSRouter() *Router {
 		ID: 10, Name: "getUser", Module: "user", ReturnType: "User",
 	})
 
-	// Register handler that writes a binary User
+	// Register handler that writes a binary User (with arena header)
 	rt.Handle("getUser", func(ctx context.Context, req *Request) error {
+		req.Buf.B = codec.AppendVarint(req.Buf.B, 0) // arena header (totalStringLen=0 for test)
 		var enc codec.Encoder
 		enc.WriteFieldInt(1, 42)
 		enc.WriteFieldString(2, "Alice")
@@ -276,9 +277,10 @@ func TestWSBinary_Success(t *testing.T) {
 		t.Errorf("status = %x, want 0x01 (ok)", data[n])
 	}
 
-	// Decode payload
+	// Decode payload (skip arena header first)
 	payload := data[n+1:]
 	dec := codec.NewDecoder(payload)
+	dec.SkipArenaHeader()
 	if !dec.NextField() || dec.FieldID() != 1 {
 		t.Fatal("expected field 1 (id)")
 	}

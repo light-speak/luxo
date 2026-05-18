@@ -20,7 +20,10 @@ func BinaryToJSON(dst []byte, data []byte, model *Model, schemas ...*Schema) []b
 
 // binaryToJSONFromDecoder reads fields from a decoder and produces JSON.
 // Used by both top-level and nested model decoding (sharing the same decoder stream).
+// Skips the arena header (totalStringLen varint) that WriteLuxo prepends.
 func binaryToJSONFromDecoder(dst []byte, dec *codec.Decoder, model *Model, schemas ...*Schema) []byte {
+	// Skip arena header — Binary→JSON doesn't use arena allocation
+	dec.SkipArenaHeader()
 	dst = append(dst, '{')
 	first := true
 	for dec.NextField() {
@@ -71,8 +74,9 @@ func appendNestedModelJSON(dst []byte, dec *codec.Decoder, f *Field, s *Schema) 
 
 // BinaryListToJSON converts a columnar-encoded list of models to JSON.
 // Columnar format: [count][fieldID][val0..valN][fieldID][val0..valN]...[0x00]
-func BinaryListToJSON(dst []byte, data []byte, model *Model) []byte {
-	return columnarToJSON(dst, data, model)
+// Optional schema enables federation blob column expansion.
+func BinaryListToJSON(dst []byte, data []byte, model *Model, schemas ...*Schema) []byte {
+	return columnarToJSON(dst, data, model, schemas...)
 }
 
 // typedColumn holds a decoded column's values in typed slices (no map[string]any).
@@ -86,11 +90,12 @@ type typedColumn struct {
 	strPtrs   []*string
 	bools     []bool
 	boolPtrs  []*bool
+	blobs     [][]byte // nested model/list binary data (federation extend fields)
 }
 
 // columnarToJSON decodes columnar binary to JSON array.
 // Uses typed column slices instead of map[string]any per record — zero map allocation.
-func columnarToJSON(dst []byte, data []byte, model *Model) []byte {
+func columnarToJSON(dst []byte, data []byte, model *Model, schemas ...*Schema) []byte {
 	r := codec.NewColumnarReader(data)
 	count := r.Count()
 	if count == 0 {
@@ -104,32 +109,7 @@ func columnarToJSON(dst []byte, data []byte, model *Model) []byte {
 			break
 		}
 		col := typedColumn{field: f}
-		switch f.Type {
-		case FieldInt, FieldDateTime, FieldDuration:
-			if f.Nullable {
-				col.intPtrs = r.ReadColumnIntPtr()
-			} else {
-				col.ints = r.ReadColumnInt()
-			}
-		case FieldFloat:
-			if f.Nullable {
-				col.floatPtrs = r.ReadColumnFloatPtr()
-			} else {
-				col.floats = r.ReadColumnFloat()
-			}
-		case FieldString, FieldEnum:
-			if f.Nullable {
-				col.strPtrs = r.ReadColumnStringPtr()
-			} else {
-				col.strings = r.ReadColumnString()
-			}
-		case FieldBool:
-			if f.Nullable {
-				col.boolPtrs = r.ReadColumnBoolPtr()
-			} else {
-				col.bools = r.ReadColumnBool()
-			}
-		}
+		readColumn(r, f, &col)
 		columns = append(columns, col)
 	}
 
@@ -148,7 +128,7 @@ func columnarToJSON(dst []byte, data []byte, model *Model) []byte {
 			}
 			first = false
 			dst = append(dst, col.field.JSONPrefix...)
-			dst = appendColumnValueJSON(dst, col, i)
+			dst = appendColumnValueJSON(dst, col, i, schemas...)
 		}
 		dst = append(dst, '}')
 	}
@@ -156,8 +136,40 @@ func columnarToJSON(dst []byte, data []byte, model *Model) []byte {
 	return dst
 }
 
+// readColumn reads a column's values into a typedColumn using the field's type info.
+func readColumn(r *codec.ColumnarReader, f *Field, col *typedColumn) {
+	switch f.Type {
+	case FieldInt, FieldDateTime, FieldDuration:
+		if f.Nullable {
+			col.intPtrs = r.ReadColumnIntPtr()
+		} else {
+			col.ints = r.ReadColumnInt()
+		}
+	case FieldFloat:
+		if f.Nullable {
+			col.floatPtrs = r.ReadColumnFloatPtr()
+		} else {
+			col.floats = r.ReadColumnFloat()
+		}
+	case FieldString, FieldEnum:
+		if f.Nullable {
+			col.strPtrs = r.ReadColumnStringPtr()
+		} else {
+			col.strings = r.ReadColumnString()
+		}
+	case FieldBool:
+		if f.Nullable {
+			col.boolPtrs = r.ReadColumnBoolPtr()
+		} else {
+			col.bools = r.ReadColumnBool()
+		}
+	case FieldModel:
+		col.blobs = r.ReadColumnBytes()
+	}
+}
+
 // appendColumnValueJSON appends the JSON value for record i from a typed column.
-func appendColumnValueJSON(dst []byte, col *typedColumn, i int) []byte {
+func appendColumnValueJSON(dst []byte, col *typedColumn, i int, schemas ...*Schema) []byte {
 	f := col.field
 	switch {
 	case col.ints != nil:
@@ -206,6 +218,30 @@ func appendColumnValueJSON(dst []byte, col *typedColumn, i int) []byte {
 			return append(dst, "true"...)
 		}
 		return append(dst, "false"...)
+	case col.blobs != nil:
+		// Federation extend field — blob contains nested model/list binary data.
+		blob := col.blobs[i]
+		if len(blob) == 0 {
+			if col.field.IsList {
+				return append(dst, "[]"...)
+			}
+			return append(dst, "null"...)
+		}
+		// Decode blob using schema if available
+		if len(schemas) > 0 && schemas[0] != nil {
+			nested := schemas[0].Models[col.field.TypeName]
+			if nested != nil {
+				if col.field.IsList {
+					return BinaryListToJSON(dst, blob, nested, schemas[0])
+				}
+				return BinaryToJSON(dst, blob, nested, schemas[0])
+			}
+		}
+		// No schema — can't decode, return null
+		if col.field.IsList {
+			return append(dst, "[]"...)
+		}
+		return append(dst, "null"...)
 	default:
 		return append(dst, "null"...)
 	}
@@ -295,32 +331,7 @@ func BinaryPaginatedListToJSON(dst []byte, data []byte, model *Model) []byte {
 			break
 		}
 		col := typedColumn{field: f}
-		switch f.Type {
-		case FieldInt, FieldDateTime, FieldDuration:
-			if f.Nullable {
-				col.intPtrs = r.ReadColumnIntPtr()
-			} else {
-				col.ints = r.ReadColumnInt()
-			}
-		case FieldFloat:
-			if f.Nullable {
-				col.floatPtrs = r.ReadColumnFloatPtr()
-			} else {
-				col.floats = r.ReadColumnFloat()
-			}
-		case FieldString, FieldEnum:
-			if f.Nullable {
-				col.strPtrs = r.ReadColumnStringPtr()
-			} else {
-				col.strings = r.ReadColumnString()
-			}
-		case FieldBool:
-			if f.Nullable {
-				col.boolPtrs = r.ReadColumnBoolPtr()
-			} else {
-				col.bools = r.ReadColumnBool()
-			}
-		}
+		readColumn(r, f, &col)
 		columns = append(columns, col)
 	}
 

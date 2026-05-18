@@ -1,0 +1,3 @@
+module LuxoCompiler {
+    header "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/LuxoCompiler.build/include/LuxoCompiler-Swift.h"
+}

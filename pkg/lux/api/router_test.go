@@ -581,8 +581,9 @@ func TestRouterSchemaConversion(t *testing.T) {
 		ReturnType: "User",
 	})
 
-	// Handler writes binary (WriteLuxo style)
+	// Handler writes binary (WriteLuxo style, with arena header)
 	rt.Handle("getUser", func(ctx context.Context, req *Request) error {
+		req.Buf.B = codec.AppendVarint(req.Buf.B, 0) // arena header
 		var enc codec.Encoder
 		enc.WriteFieldInt(1, 42)
 		enc.WriteFieldString(2, "Alice")

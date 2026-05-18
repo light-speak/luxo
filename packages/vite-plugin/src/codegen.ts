@@ -73,6 +73,7 @@ function genTypes(schema: LuxoSchema): string {
       // Binary decoder for type declarations (same logic as models)
       out += `export function decode${t.name}(dec: Decoder): ${t.name} {\n`
       out += `  const obj: Record<string, unknown> = {}\n`
+      out += `  dec.skipArenaHeader()\n`
       out += `  while (dec.nextField()) {\n`
       out += `    switch (dec.fieldID) {\n`
       for (const field of t.fields) {
@@ -103,6 +104,7 @@ function genTypes(schema: LuxoSchema): string {
     // Binary decoder function — reads from Luxo binary using field IDs
     out += `export function decode${model.name}(dec: Decoder): ${model.name} {\n`
     out += `  const obj: Record<string, unknown> = {}\n`
+    out += `  dec.skipArenaHeader()\n`
     out += `  while (dec.nextField()) {\n`
     out += `    switch (dec.fieldID) {\n`
     for (const field of model.fields) {

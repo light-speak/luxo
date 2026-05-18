@@ -1,0 +1,103 @@
+{
+  "": {
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/primary.swiftdeps"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftSyntaxMacros/AbstractSourceLocation.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/AbstractSourceLocation.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/AbstractSourceLocation.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/AbstractSourceLocation~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/AbstractSourceLocation.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/AbstractSourceLocation.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftSyntaxMacros/MacroExpansionContext.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/MacroExpansionContext.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/MacroExpansionContext.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/MacroExpansionContext~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/MacroExpansionContext.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/MacroExpansionContext.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftSyntaxMacros/MacroProtocols/AccessorMacro.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/AccessorMacro.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/AccessorMacro.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/AccessorMacro~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/AccessorMacro.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/AccessorMacro.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftSyntaxMacros/MacroProtocols/AttachedMacro.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/AttachedMacro.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/AttachedMacro.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/AttachedMacro~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/AttachedMacro.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/AttachedMacro.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftSyntaxMacros/MacroProtocols/CodeItemMacro.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/CodeItemMacro.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/CodeItemMacro.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/CodeItemMacro~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/CodeItemMacro.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/CodeItemMacro.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftSyntaxMacros/MacroProtocols/DeclarationMacro.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/DeclarationMacro.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/DeclarationMacro.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/DeclarationMacro~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/DeclarationMacro.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/DeclarationMacro.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftSyntaxMacros/MacroProtocols/ExpressionMacro.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/ExpressionMacro.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/ExpressionMacro.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/ExpressionMacro~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/ExpressionMacro.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/ExpressionMacro.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftSyntaxMacros/MacroProtocols/ExtensionMacro.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/ExtensionMacro.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/ExtensionMacro.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/ExtensionMacro~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/ExtensionMacro.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/ExtensionMacro.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftSyntaxMacros/MacroProtocols/FreestandingMacro.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/FreestandingMacro.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/FreestandingMacro.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/FreestandingMacro~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/FreestandingMacro.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/FreestandingMacro.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftSyntaxMacros/MacroProtocols/Macro+Format.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/Macro+Format.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/Macro+Format.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/Macro+Format~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/Macro+Format.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/Macro+Format.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftSyntaxMacros/MacroProtocols/Macro.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/Macro.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/Macro.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/Macro~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/Macro.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/Macro.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftSyntaxMacros/MacroProtocols/MemberAttributeMacro.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/MemberAttributeMacro.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/MemberAttributeMacro.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/MemberAttributeMacro~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/MemberAttributeMacro.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/MemberAttributeMacro.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftSyntaxMacros/MacroProtocols/MemberMacro.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/MemberMacro.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/MemberMacro.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/MemberMacro~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/MemberMacro.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/MemberMacro.dia"
+  },
+  "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/checkouts/swift-syntax/Sources/SwiftSyntaxMacros/MacroProtocols/PeerMacro.swift": {
+    "dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/PeerMacro.d",
+    "object": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/PeerMacro.swift.o",
+    "swiftmodule": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/PeerMacro~partial.swiftmodule",
+    "swift-dependencies": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/PeerMacro.swiftdeps",
+    "diagnostics": "/Users/lintianyao/data/source/golang/luxo/luxo/packages/swift/.build/arm64-apple-macosx/debug/SwiftSyntaxMacros.build/PeerMacro.dia"
+  }
+}

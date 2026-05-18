@@ -147,6 +147,11 @@ export class Decoder {
     this.fieldID = 0
   }
 
+  /** Skip the arena header (totalStringLen varint) that prefixes each model's binary data. */
+  skipArenaHeader(): void {
+    this.readVarintRaw()
+  }
+
   /** Read next field ID. Returns false at end marker (0x00) or EOF. */
   nextField(): boolean {
     if (this.off >= this.data.length) {

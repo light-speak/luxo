@@ -117,6 +117,11 @@ class LuxoDecoder(private val buf: ByteArray) {
 
     // -- field iteration --------------------------------------------------
 
+    /** Skip the arena header (totalStringLen varint) that prefixes each model's binary data. */
+    fun skipArenaHeader() {
+        readVarintRaw()
+    }
+
     /**
      * Read the next field ID.  Returns false when end marker (0x00) is
      * reached or the buffer is exhausted.

@@ -1,0 +1,30 @@
+{
+  "object" : {
+    "artifacts" : [
+
+    ],
+    "dependencies" : [
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "swift-syntax",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/apple/swift-syntax.git",
+          "name" : "swift-syntax"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "2bc86522d115234d1f588efe2bcb4ce4be8f8b82",
+            "version" : "510.0.3"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "swift-syntax"
+      }
+    ],
+    "prebuilts" : [
+
+    ]
+  },
+  "version" : 7
+}
