@@ -180,10 +180,16 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 		}
 	}
 
-	// Register service fns + batch loaders + RPC server (cluster mode only)
-	if anyServiceFns {
-		b.WriteString("\t// fn @service + batch load endpoints — registered on router for both modes\n")
-		b.WriteString("\t// Embedded: called in-process. Cluster: called via RPC.\n")
+	// Register service fns + batch loaders + federation resolvers + RPC server
+	hasCrudModules := false
+	for _, m := range modules {
+		if m.hasCrud {
+			hasCrudModules = true
+			break
+		}
+	}
+	if anyServiceFns || hasCrudModules {
+		b.WriteString("\t// RPC endpoints — registered on router for both embedded and cluster modes\n")
 		for _, m := range modules {
 			if m.hasServiceFns {
 				fmt.Fprintf(&b, "\t%s_luxo.RegisterServiceFns(gw.Router, %sApp)\n", m.name, m.name)
@@ -192,10 +198,6 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 		for _, m := range modules {
 			if m.hasCrud {
 				fmt.Fprintf(&b, "\t%s_luxo.RegisterBatchLoaders(gw.Router, %sApp)\n", m.name, m.name)
-			}
-		}
-		for _, m := range modules {
-			if m.hasCrud {
 				fmt.Fprintf(&b, "\t%s_luxo.RegisterFederationResolvers(gw.Router, %sApp)\n", m.name, m.name)
 			}
 		}

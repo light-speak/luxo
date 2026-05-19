@@ -331,8 +331,11 @@ func (r *Request) ParamBool(name string) (bool, error) {
 func (r *Request) ParamIntArray(name string) ([]int64, error) {
 	if r.paramNames != nil {
 		if v, ok := r.findParam(name); ok {
-			if iv, ok := v.([]int64); ok {
+			switch iv := v.(type) {
+			case []int64:
 				return iv, nil
+			case int64:
+				return []int64{iv}, nil
 			}
 		}
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
@@ -352,8 +355,11 @@ func (r *Request) ParamIntArray(name string) ([]int64, error) {
 func (r *Request) ParamStringArray(name string) ([]string, error) {
 	if r.paramNames != nil {
 		if v, ok := r.findParam(name); ok {
-			if sv, ok := v.([]string); ok {
+			switch sv := v.(type) {
+			case []string:
 				return sv, nil
+			case string:
+				return []string{sv}, nil
 			}
 		}
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})

@@ -551,3 +551,29 @@ func TestSetParamSlotFloatOverwrite(t *testing.T) {
 		t.Fatalf("float should overwrite, got %v", v)
 	}
 }
+
+func TestParamIntArraySingleElement(t *testing.T) {
+	req := &Request{}
+	req.SetBinaryParams([]string{"keys"}, 1)
+	req.SetParamSlot(0, int64(42)) // single int, not []int64
+	ids, err := req.ParamIntArray("keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 || ids[0] != 42 {
+		t.Fatalf("single int should wrap to []int64, got %v", ids)
+	}
+}
+
+func TestParamStringArraySingleElement(t *testing.T) {
+	req := &Request{}
+	req.SetBinaryParams([]string{"tags"}, 1)
+	req.SetParamSlot(0, "hello") // single string
+	strs, err := req.ParamStringArray("tags")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(strs) != 1 || strs[0] != "hello" {
+		t.Fatalf("single string should wrap to []string, got %v", strs)
+	}
+}

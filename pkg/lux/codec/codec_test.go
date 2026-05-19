@@ -3,6 +3,7 @@ package codec
 import (
 	"math"
 	"testing"
+	"unsafe"
 )
 
 // --- Wire-level tests ---
@@ -1483,10 +1484,10 @@ func TestReadStringArena(t *testing.T) {
 		t.Fatalf("arenaOff: expected 10, got %d", arenaOff)
 	}
 	// Verify both strings share the same underlying arena
-	if &[]byte(s1)[0] != &arena[0] {
+	if unsafe.StringData(s1) != &arena[0] {
 		t.Fatal("s1 should point into arena")
 	}
-	if &[]byte(s2)[0] != &arena[5] {
+	if unsafe.StringData(s2) != &arena[5] {
 		t.Fatal("s2 should point into arena at offset 5")
 	}
 }

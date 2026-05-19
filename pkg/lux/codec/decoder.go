@@ -285,12 +285,11 @@ func (d *Decoder) ReadArenaSize() int {
 		return 0
 	}
 	d.off += n
-	size := int(v)
-	if size > MaxArenaSize {
-		d.err = fmt.Errorf("codec: arena size %d exceeds limit %d at offset %d", size, MaxArenaSize, d.off-n)
+	if v > uint64(MaxArenaSize) {
+		d.err = fmt.Errorf("codec: arena size %d exceeds limit %d at offset %d", v, MaxArenaSize, d.off-n)
 		return 0
 	}
-	return size
+	return int(v)
 }
 
 // SkipArenaHeader skips the totalStringLen varint prefix.
