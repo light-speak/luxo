@@ -690,3 +690,76 @@ func TestExtractID_UnknownFieldType(t *testing.T) {
 		t.Fatal("unknown field type should return false")
 	}
 }
+
+func TestExtractID_NotFound(t *testing.T) {
+	// All fields skipped, id field not present
+	var buf []byte
+	buf = codec.AppendVarint(buf, 0) // arena
+	buf = codec.AppendVarint(buf, 2) // field 2
+	buf = codec.AppendSvarint(buf, 42)
+	buf = append(buf, 0x00)
+
+	fieldTypes := map[int]codec.FieldSkipType{2: codec.SkipVarint}
+	_, ok := ExtractID(buf, 99, fieldTypes) // looking for field 99 which doesn't exist
+	if ok {
+		t.Fatal("should return false when id field not found")
+	}
+}
+
+func TestMerge_MultipleExtendsSomeEmpty(t *testing.T) {
+	var primary []byte
+	primary = codec.AppendVarint(primary, 0) // arena
+	primary = codec.AppendVarint(primary, 1)
+	primary = codec.AppendSvarint(primary, 1)
+	primary = append(primary, 0x00)
+
+	extends := []ExtendResult{
+		{FieldID: 10, Data: []byte{0xAA}},
+		{FieldID: 11, Data: nil},      // empty
+		{FieldID: 12, Data: []byte{}}, // empty
+		{FieldID: 13, Data: []byte{0xBB, 0xCC}},
+	}
+	result := Merge(primary, extends)
+
+	// Should include fields 10 and 13, skip 11 and 12
+	dec := codec.NewDecoder(result)
+	dec.SkipArenaHeader()
+	if !dec.NextField() || dec.FieldID() != 1 {
+		t.Fatal("expected field 1")
+	}
+	dec.ReadInt()
+	if !dec.NextField() || dec.FieldID() != 10 {
+		t.Fatal("expected field 10")
+	}
+}
+
+func TestParseGroupedResponse_MultipleKeys(t *testing.T) {
+	// 3 keys: key0=2 items, key1=0 items, key2=1 item
+	var resp []byte
+	resp = codec.AppendVarint(resp, 3) // 3 keys
+	resp = codec.AppendVarint(resp, 2) // key0: 2 items
+	resp = codec.AppendBytes(resp, []byte{0x01})
+	resp = codec.AppendBytes(resp, []byte{0x02})
+	resp = codec.AppendVarint(resp, 0) // key1: 0 items
+	resp = codec.AppendVarint(resp, 1) // key2: 1 item
+	resp = codec.AppendBytes(resp, []byte{0x03})
+
+	blobs := ParseGroupedResponse(resp, true)
+	if len(blobs) != 3 {
+		t.Fatalf("expected 3 blobs, got %d", len(blobs))
+	}
+	// key0: list with 2 items
+	if len(blobs[0]) == 0 {
+		t.Fatal("key0 blob should not be empty")
+	}
+	// key1: empty list
+	dec := codec.NewDecoder(blobs[1])
+	count := dec.ReadInt()
+	if count != 0 {
+		t.Fatalf("key1 count should be 0, got %d", count)
+	}
+	// key2: list with 1 item
+	if len(blobs[2]) == 0 {
+		t.Fatal("key2 blob should not be empty")
+	}
+}

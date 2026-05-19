@@ -984,6 +984,54 @@ func TestReadLuxoNoArenaFields(t *testing.T) {
 	}
 }
 
+func TestReadLuxoAllFieldTypes(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"Full": {"id": 1, "name": 2, "createdAt": 3, "duration": 4,
+			"data": 5, "avatar": 6, "score": 7},
+	})
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Models: []*ast.ModelDecl{{
+				Name: "Full",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+					{Name: "createdAt", Type: &ast.TypeRef{Name: "DateTime"}},
+					{Name: "duration", Type: &ast.TypeRef{Name: "Duration"}},
+					{Name: "data", Type: &ast.TypeRef{Name: "Bytes"}},
+					{Name: "avatar", Type: &ast.TypeRef{Name: "String", Nullable: true}},
+					{Name: "score", Type: &ast.TypeRef{Name: "Float", Nullable: true}},
+				},
+			}},
+		}},
+	}
+
+	src := generateWriteJSONFile(result, "app", nil)
+	code := string(src)
+
+	// ReadLuxo should handle DateTime, Duration, Bytes, nullable String, nullable Float
+	if !strings.Contains(code, "time.Unix(dec.ReadInt(), 0)") {
+		t.Errorf("DateTime ReadLuxo missing time.Unix:\n%s", code)
+	}
+	if !strings.Contains(code, "time.Duration(dec.ReadInt())") {
+		t.Errorf("Duration ReadLuxo missing:\n%s", code)
+	}
+	if !strings.Contains(code, "dec.ReadBytes()") {
+		t.Errorf("Bytes ReadLuxo missing:\n%s", code)
+	}
+	if !strings.Contains(code, "ReadStringArenaPtr") {
+		t.Errorf("nullable String should use ReadStringArenaPtr:\n%s", code)
+	}
+	if !strings.Contains(code, "dec.ReadFloatPtr()") {
+		t.Errorf("nullable Float ReadLuxo missing:\n%s", code)
+	}
+}
+
 func TestWriteLuxoArenaHeaderMaskedPath(t *testing.T) {
 	old := modelFieldIDs
 	defer func() { modelFieldIDs = old }()
