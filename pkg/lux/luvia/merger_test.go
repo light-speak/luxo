@@ -593,6 +593,55 @@ func TestMergeColumnar_EmptyBlobs(t *testing.T) {
 	}
 }
 
+func TestExtractIDColumn_WithBlobColumn(t *testing.T) {
+	// Columnar with a FieldModel (blob) column before id
+	var buf []byte
+	buf = codec.AppendVarint(buf, 1)           // count=1
+	buf = codec.AppendVarint(buf, 5)           // fieldID=5 (blob)
+	buf = codec.AppendBytes(buf, []byte{0xFF}) // one blob
+	buf = codec.AppendVarint(buf, 1)           // fieldID=1 (id)
+	buf = codec.AppendSvarint(buf, 77)
+	buf = append(buf, 0x00)
+
+	s := schema.New()
+	s.RegisterModel(&schema.Model{
+		Name: "M",
+		Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt},
+			{ID: 5, Name: "data", Type: schema.FieldModel},
+		},
+	})
+	ids := ExtractIDColumn(buf, 1, s.Models["M"])
+	if len(ids) != 1 || ids[0] != 77 {
+		t.Fatalf("ids = %v, want [77]", ids)
+	}
+}
+
+func TestExtractIDColumn_NullableEnum(t *testing.T) {
+	// Nullable string (enum) column before id
+	var buf []byte
+	buf = codec.AppendVarint(buf, 1) // count=1
+	buf = codec.AppendVarint(buf, 3) // fieldID=3 (nullable enum)
+	buf = codec.AppendPresent(buf)
+	buf = codec.AppendString(buf, "ADMIN")
+	buf = codec.AppendVarint(buf, 1) // fieldID=1 (id)
+	buf = codec.AppendSvarint(buf, 55)
+	buf = append(buf, 0x00)
+
+	s := schema.New()
+	s.RegisterModel(&schema.Model{
+		Name: "M",
+		Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt},
+			{ID: 3, Name: "role", Type: schema.FieldEnum, Nullable: true},
+		},
+	})
+	ids := ExtractIDColumn(buf, 1, s.Models["M"])
+	if len(ids) != 1 || ids[0] != 55 {
+		t.Fatalf("ids = %v, want [55]", ids)
+	}
+}
+
 func TestParseGroupedResponse_Truncated(t *testing.T) {
 	// key_count=1 but no data after
 	resp := codec.AppendVarint(nil, 1)

@@ -2163,6 +2163,33 @@ func TestDecoderSkipNullableLenPrefixed_Error(t *testing.T) {
 	}
 }
 
+func TestDecoderSkipNullableVarint_PresentTruncated(t *testing.T) {
+	buf := AppendPresent(nil) // present flag, but no varint data
+	dec := NewDecoder(buf)
+	dec.SkipNullableVarint()
+	if dec.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecoderSkipNullableFixed64_PresentTruncated(t *testing.T) {
+	buf := AppendPresent(nil) // present flag, but no fixed64 data
+	dec := NewDecoder(buf)
+	dec.SkipNullableFixed64()
+	if dec.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecoderSkipNullableLenPrefixed_PresentTruncated(t *testing.T) {
+	buf := AppendPresent(nil) // present flag, but no len-prefixed data
+	dec := NewDecoder(buf)
+	dec.SkipNullableLenPrefixed()
+	if dec.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
 func TestColumnarOffset(t *testing.T) {
 	w := &ColumnarWriter{}
 	w.SetCount(1)

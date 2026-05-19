@@ -530,3 +530,24 @@ func TestSetParamSlotOutOfBounds(t *testing.T) {
 	req.SetParamSlot(16, int64(1))
 	req.SetParamSlot(99, int64(1))
 }
+
+func TestSetParamSlotTypeMismatch(t *testing.T) {
+	req := &Request{}
+	req.SetBinaryParams([]string{"val"}, 1)
+	// Write int then string — type mismatch should overwrite
+	req.SetParamSlot(0, int64(1))
+	req.SetParamSlot(0, "hello")
+	if v, ok := req.findParam("val"); !ok || v != "hello" {
+		t.Fatalf("type mismatch should overwrite, got %v", v)
+	}
+}
+
+func TestSetParamSlotFloatOverwrite(t *testing.T) {
+	req := &Request{}
+	req.SetBinaryParams([]string{"val"}, 1)
+	req.SetParamSlot(0, 1.0)
+	req.SetParamSlot(0, 2.0) // float → overwrite (not accumulated)
+	if v, ok := req.findParam("val"); !ok || v != 2.0 {
+		t.Fatalf("float should overwrite, got %v", v)
+	}
+}
