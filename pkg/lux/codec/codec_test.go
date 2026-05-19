@@ -2163,6 +2163,55 @@ func TestDecoderSkipNullableLenPrefixed_Error(t *testing.T) {
 	}
 }
 
+func TestSkipColumnIntPtr_PresentValueTruncated(t *testing.T) {
+	buf := AppendVarint(nil, 1) // count=1
+	buf = AppendVarint(buf, 1)  // fieldID
+	buf = AppendPresent(buf)    // present but no value after
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnIntPtr()
+	if r.Err() == nil {
+		t.Fatal("expected error for present but truncated value")
+	}
+}
+
+func TestSkipColumnFloatPtr_PresentValueTruncated(t *testing.T) {
+	buf := AppendVarint(nil, 1)
+	buf = AppendVarint(buf, 1)
+	buf = AppendPresent(buf)
+	buf = append(buf, 0x01) // only 1 byte, need 8
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnFloatPtr()
+	if r.Err() == nil {
+		t.Fatal("expected error for present but truncated float")
+	}
+}
+
+func TestSkipColumnStringPtr_PresentValueTruncated(t *testing.T) {
+	buf := AppendVarint(nil, 1)
+	buf = AppendVarint(buf, 1)
+	buf = AppendPresent(buf) // present but no string data
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnStringPtr()
+	if r.Err() == nil {
+		t.Fatal("expected error for present but truncated string")
+	}
+}
+
+func TestSkipColumnBoolPtr_PresentValueTruncated(t *testing.T) {
+	buf := AppendVarint(nil, 1)
+	buf = AppendVarint(buf, 1)
+	buf = AppendPresent(buf) // present but no bool data
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnBoolPtr()
+	if r.Err() == nil {
+		t.Fatal("expected error for present but truncated bool")
+	}
+}
+
 func TestDecoderSkipNullableVarint_PresentTruncated(t *testing.T) {
 	buf := AppendPresent(nil) // present flag, but no varint data
 	dec := NewDecoder(buf)

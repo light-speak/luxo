@@ -651,3 +651,42 @@ func TestParseGroupedResponse_Truncated(t *testing.T) {
 		t.Fatalf("expected 1 blob, got %d", len(blobs))
 	}
 }
+
+func TestParseGroupedResponse_ListTruncatedItem(t *testing.T) {
+	// key_count=1, item_count=2, but only 1 item provided
+	var resp []byte
+	resp = codec.AppendVarint(resp, 1) // 1 key
+	resp = codec.AppendVarint(resp, 2) // 2 items
+	resp = codec.AppendBytes(resp, []byte{0xAA})
+	// missing second item
+	blobs := ParseGroupedResponse(resp, true)
+	if len(blobs) != 1 {
+		t.Fatalf("expected 1 blob, got %d", len(blobs))
+	}
+}
+
+func TestParseGroupedResponse_SingleTruncatedItem(t *testing.T) {
+	var resp []byte
+	resp = codec.AppendVarint(resp, 1) // 1 key
+	resp = codec.AppendVarint(resp, 1) // 1 item
+	// missing item data
+	blobs := ParseGroupedResponse(resp, false)
+	if len(blobs) != 1 {
+		t.Fatalf("expected 1 blob, got %d", len(blobs))
+	}
+}
+
+func TestExtractID_UnknownFieldType(t *testing.T) {
+	// Field type not in fieldTypes map → should return false
+	var buf []byte
+	buf = codec.AppendVarint(buf, 0) // arena
+	buf = codec.AppendVarint(buf, 2) // field 2 (unknown type)
+	buf = codec.AppendSvarint(buf, 99)
+	buf = append(buf, 0x00)
+
+	fieldTypes := map[int]codec.FieldSkipType{} // empty: field 2 unknown
+	_, ok := ExtractID(buf, 1, fieldTypes)
+	if ok {
+		t.Fatal("unknown field type should return false")
+	}
+}
