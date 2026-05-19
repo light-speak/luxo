@@ -459,3 +459,146 @@ func TestExtractIDColumn_AllColumnTypes(t *testing.T) {
 		t.Fatalf("ids = %v, want [100 200]", ids)
 	}
 }
+
+func TestExtractIDColumn_Empty(t *testing.T) {
+	ids := ExtractIDColumn(nil, 1, nil)
+	if ids != nil {
+		t.Fatal("nil data should return nil")
+	}
+}
+
+func TestExtractIDColumn_UnknownColumn(t *testing.T) {
+	w := &codec.ColumnarWriter{}
+	w.SetCount(1)
+	w.WriteColumnInt(99, []int64{1}) // unknown field
+	data := w.Bytes()
+
+	s := schema.New()
+	s.RegisterModel(&schema.Model{
+		Name:   "M",
+		Fields: []schema.Field{{ID: 1, Name: "id", Type: schema.FieldInt}},
+	})
+	ids := ExtractIDColumn(data, 1, s.Models["M"])
+	if ids != nil {
+		t.Fatal("unknown column should return nil")
+	}
+}
+
+func TestSkipColumnarColumn_AllTypes(t *testing.T) {
+	// Build columnar with every type, id at the end
+	var buf []byte
+	buf = codec.AppendVarint(buf, 1) // count = 1
+	// col 2: string
+	buf = codec.AppendVarint(buf, 2)
+	buf = codec.AppendString(buf, "test")
+	// col 3: float
+	buf = codec.AppendVarint(buf, 3)
+	buf = codec.AppendFixed64(buf, 1.5)
+	// col 4: bool
+	buf = codec.AppendVarint(buf, 4)
+	buf = codec.AppendBool(buf, true)
+	// col 5: nullable int (null)
+	buf = codec.AppendVarint(buf, 5)
+	buf = codec.AppendNull(buf)
+	// col 6: nullable float (present)
+	buf = codec.AppendVarint(buf, 6)
+	buf = codec.AppendPresent(buf)
+	buf = codec.AppendFixed64(buf, 2.5)
+	// col 7: nullable bool (null)
+	buf = codec.AppendVarint(buf, 7)
+	buf = codec.AppendNull(buf)
+	// col 8: bytes (blob)
+	buf = codec.AppendVarint(buf, 8)
+	buf = codec.AppendBytes(buf, []byte{0xFF})
+	// col 1: id
+	buf = codec.AppendVarint(buf, 1)
+	buf = codec.AppendSvarint(buf, 42)
+	buf = append(buf, 0x00)
+
+	s := schema.New()
+	s.RegisterModel(&schema.Model{
+		Name: "M",
+		Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt},
+			{ID: 2, Name: "name", Type: schema.FieldString},
+			{ID: 3, Name: "score", Type: schema.FieldFloat},
+			{ID: 4, Name: "active", Type: schema.FieldBool},
+			{ID: 5, Name: "age", Type: schema.FieldInt, Nullable: true},
+			{ID: 6, Name: "rating", Type: schema.FieldFloat, Nullable: true},
+			{ID: 7, Name: "verified", Type: schema.FieldBool, Nullable: true},
+			{ID: 8, Name: "data", Type: schema.FieldModel},
+		},
+	})
+
+	ids := ExtractIDColumn(buf, 1, s.Models["M"])
+	if len(ids) != 1 || ids[0] != 42 {
+		t.Fatalf("ids = %v, want [42]", ids)
+	}
+}
+
+func TestSchemaFieldToSkipType_AllTypes(t *testing.T) {
+	tests := []struct {
+		field schema.Field
+		want  codec.FieldSkipType
+	}{
+		{schema.Field{Type: schema.FieldInt}, codec.SkipVarint},
+		{schema.Field{Type: schema.FieldDateTime}, codec.SkipVarint},
+		{schema.Field{Type: schema.FieldDuration}, codec.SkipVarint},
+		{schema.Field{Type: schema.FieldBool}, codec.SkipVarint},
+		{schema.Field{Type: schema.FieldFloat}, codec.SkipFixed64},
+		{schema.Field{Type: schema.FieldString}, codec.SkipBytes},
+		{schema.Field{Type: schema.FieldEnum}, codec.SkipBytes},
+		{schema.Field{Type: schema.FieldBytes}, codec.SkipBytes},
+		{schema.Field{Type: schema.FieldModel}, codec.SkipBytes},
+		// Nullable
+		{schema.Field{Type: schema.FieldInt, Nullable: true}, codec.SkipNullVarint},
+		{schema.Field{Type: schema.FieldFloat, Nullable: true}, codec.SkipNullFixed64},
+		{schema.Field{Type: schema.FieldString, Nullable: true}, codec.SkipNullBytes},
+		{schema.Field{Type: schema.FieldBool, Nullable: true}, codec.SkipNullVarint},
+	}
+	for _, tt := range tests {
+		got := schemaFieldToSkipType(&tt.field)
+		if got != tt.want {
+			t.Errorf("schemaFieldToSkipType(%v) = %d, want %d", tt.field, got, tt.want)
+		}
+	}
+}
+
+func TestMerge_PrimaryNoEndMarker(t *testing.T) {
+	// Primary without trailing 0x00 — should still merge
+	primary := []byte{0x01, 0x02}
+	extends := []ExtendResult{{FieldID: 10, Data: []byte{0xAA}}}
+	result := Merge(primary, extends)
+	// Should append extend + end marker
+	if result[len(result)-1] != 0x00 {
+		t.Fatal("merged should end with 0x00")
+	}
+}
+
+func TestMergeColumnar_NoExtends(t *testing.T) {
+	primary := []byte{0x01, 0x02, 0x00}
+	result := MergeColumnar(primary, nil)
+	if string(result) != string(primary) {
+		t.Fatal("no extends should return primary unchanged")
+	}
+}
+
+func TestMergeColumnar_EmptyBlobs(t *testing.T) {
+	primary := []byte{0x01, 0x02, 0x00}
+	extends := []ExtendColumnResult{{FieldID: 10, Blobs: nil}}
+	result := MergeColumnar(primary, extends)
+	// Empty blobs should be skipped
+	if result[len(result)-1] != 0x00 {
+		t.Fatal("result should end with 0x00")
+	}
+}
+
+func TestParseGroupedResponse_Truncated(t *testing.T) {
+	// key_count=1 but no data after
+	resp := codec.AppendVarint(nil, 1)
+	blobs := ParseGroupedResponse(resp, true)
+	// Should return partial result without panic
+	if len(blobs) != 1 {
+		t.Fatalf("expected 1 blob, got %d", len(blobs))
+	}
+}

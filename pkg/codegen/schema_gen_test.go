@@ -904,3 +904,32 @@ func TestBuildSchemaModels_HasExtendFields(t *testing.T) {
 		t.Error("Post should not have extend fields")
 	}
 }
+
+func TestInferForeignKey_ExplicitBy(t *testing.T) {
+	f := &ast.FieldDecl{
+		Name: "posts",
+		Type: &ast.TypeRef{Name: "Post", IsList: true},
+		Directives: []*ast.Directive{{
+			Name: "by",
+			Args: []*ast.NamedArg{
+				{Value: &ast.Ident{Name: "authorId"}},
+				{Value: &ast.Ident{Name: "id"}},
+			},
+		}},
+	}
+	fk := inferForeignKey(&ast.ModelDecl{Name: "User"}, f, nil)
+	if fk != "authorId" {
+		t.Errorf("expected authorId, got %q", fk)
+	}
+}
+
+func TestInferForeignKey_BelongsTo(t *testing.T) {
+	f := &ast.FieldDecl{
+		Name: "author",
+		Type: &ast.TypeRef{Name: "User"},
+	}
+	fk := inferForeignKey(&ast.ModelDecl{Name: "Post"}, f, nil)
+	if fk != "id" {
+		t.Errorf("belongsTo should return 'id', got %q", fk)
+	}
+}

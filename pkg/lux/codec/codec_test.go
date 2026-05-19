@@ -1920,3 +1920,256 @@ func TestReadColumnBytes(t *testing.T) {
 		t.Fatalf("blob[1] = %x", blobs[1])
 	}
 }
+
+// --- SkipColumn error path tests ---
+
+func TestSkipColumnInt_Truncated(t *testing.T) {
+	buf := AppendVarint(nil, 2)  // count=2
+	buf = AppendVarint(buf, 1)   // fieldID
+	buf = AppendSvarint(buf, 42) // only 1 value, expect 2
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnInt()
+	if r.Err() == nil {
+		t.Fatal("expected error for truncated int column")
+	}
+}
+
+func TestSkipColumnFloat_Truncated(t *testing.T) {
+	buf := AppendVarint(nil, 1)
+	buf = AppendVarint(buf, 1)
+	buf = append(buf, 0x01, 0x02) // only 2 bytes, need 8
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnFloat()
+	if r.Err() == nil {
+		t.Fatal("expected error for truncated float column")
+	}
+}
+
+func TestSkipColumnString_Truncated(t *testing.T) {
+	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 1)
+	buf = AppendString(buf, "ok") // only 1 value
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnString()
+	if r.Err() == nil {
+		t.Fatal("expected error for truncated string column")
+	}
+}
+
+func TestSkipColumnBool_Truncated(t *testing.T) {
+	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 1)
+	buf = AppendBool(buf, true) // only 1
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnBool()
+	if r.Err() == nil {
+		t.Fatal("expected error for truncated bool column")
+	}
+}
+
+func TestSkipColumnIntPtr_Truncated(t *testing.T) {
+	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 1)
+	buf = AppendPresent(buf)
+	buf = AppendSvarint(buf, 10) // 1 value, expect 2
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnIntPtr()
+	if r.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestSkipColumnFloatPtr_Truncated(t *testing.T) {
+	buf := AppendVarint(nil, 1)
+	buf = AppendVarint(buf, 1)
+	buf = AppendPresent(buf)
+	buf = append(buf, 0x01) // only 1 byte, need 8
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnFloatPtr()
+	if r.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestSkipColumnStringPtr_Truncated(t *testing.T) {
+	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 1)
+	buf = AppendNull(buf)
+	// only 1 value (null), expect 2
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnStringPtr()
+	if r.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestSkipColumnBoolPtr_Truncated(t *testing.T) {
+	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 1)
+	buf = AppendPresent(buf)
+	buf = AppendBool(buf, true) // 1 value, expect 2
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnBoolPtr()
+	if r.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestSkipColumnBytes_Truncated(t *testing.T) {
+	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 1)
+	buf = AppendBytes(buf, []byte{0x01}) // 1 value, expect 2
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnBytes()
+	if r.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestReadColumnBytes_Truncated(t *testing.T) {
+	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 1)
+	buf = AppendBytes(buf, []byte{0x01}) // 1 value, expect 2
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	blobs := r.ReadColumnBytes()
+	if blobs != nil {
+		t.Fatal("truncated should return nil")
+	}
+	if r.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecoderSkipMethods(t *testing.T) {
+	// Build: [varint][fixed64][len-prefixed string][0x00]
+	var buf []byte
+	buf = AppendVarint(buf, 1)     // field 1
+	buf = AppendSvarint(buf, 42)   // varint value
+	buf = AppendVarint(buf, 2)     // field 2
+	buf = AppendFixed64(buf, 3.14) // fixed64 value
+	buf = AppendVarint(buf, 3)     // field 3
+	buf = AppendString(buf, "hi")  // len-prefixed
+	buf = append(buf, 0x00)
+
+	dec := NewDecoder(buf)
+	dec.NextField() // field 1
+	dec.SkipVarint()
+	dec.NextField() // field 2
+	dec.SkipFixed64()
+	dec.NextField() // field 3
+	dec.SkipLenPrefixed()
+	if dec.Err() != nil {
+		t.Fatalf("unexpected error: %v", dec.Err())
+	}
+	if dec.NextField() {
+		t.Fatal("expected end")
+	}
+}
+
+func TestDecoderSkipNullable(t *testing.T) {
+	var buf []byte
+	buf = AppendVarint(buf, 1) // field 1
+	buf = AppendNull(buf)      // nullable varint = null
+	buf = AppendVarint(buf, 2) // field 2
+	buf = AppendPresent(buf)
+	buf = AppendFixed64(buf, 1.0) // nullable fixed64 = present
+	buf = AppendVarint(buf, 3)    // field 3
+	buf = AppendPresent(buf)
+	buf = AppendString(buf, "x") // nullable string = present
+	buf = append(buf, 0x00)
+
+	dec := NewDecoder(buf)
+	dec.NextField()
+	dec.SkipNullableVarint()
+	dec.NextField()
+	dec.SkipNullableFixed64()
+	dec.NextField()
+	dec.SkipNullableLenPrefixed()
+	if dec.Err() != nil {
+		t.Fatalf("unexpected error: %v", dec.Err())
+	}
+	if dec.NextField() {
+		t.Fatal("expected end")
+	}
+}
+
+func TestDecoderOffset(t *testing.T) {
+	buf := AppendVarint(nil, 42)
+	dec := NewDecoder(buf)
+	if dec.Offset() != 0 {
+		t.Fatalf("initial offset should be 0")
+	}
+	dec.NextField()
+	if dec.Offset() <= 0 {
+		t.Fatal("offset should advance after NextField")
+	}
+}
+
+func TestDecoderSkipVarint_Error(t *testing.T) {
+	dec := NewDecoder(nil)
+	dec.SkipVarint()
+	if dec.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecoderSkipFixed64_Error(t *testing.T) {
+	dec := NewDecoder([]byte{0x01})
+	dec.SkipFixed64()
+	if dec.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecoderSkipLenPrefixed_Error(t *testing.T) {
+	dec := NewDecoder(nil)
+	dec.SkipLenPrefixed()
+	if dec.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecoderSkipNullableVarint_Error(t *testing.T) {
+	dec := NewDecoder(nil)
+	dec.SkipNullableVarint()
+	if dec.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecoderSkipNullableFixed64_Error(t *testing.T) {
+	dec := NewDecoder(nil)
+	dec.SkipNullableFixed64()
+	if dec.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecoderSkipNullableLenPrefixed_Error(t *testing.T) {
+	dec := NewDecoder(nil)
+	dec.SkipNullableLenPrefixed()
+	if dec.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestColumnarOffset(t *testing.T) {
+	w := &ColumnarWriter{}
+	w.SetCount(1)
+	w.WriteColumnInt(1, []int64{42})
+	data := w.Bytes()
+	r := NewColumnarReader(data)
+	if r.Offset() <= 0 {
+		t.Fatal("offset should be > 0 after reading count")
+	}
+}
