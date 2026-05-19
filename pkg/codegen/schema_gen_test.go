@@ -933,3 +933,64 @@ func TestInferForeignKey_BelongsTo(t *testing.T) {
 		t.Errorf("belongsTo should return 'id', got %q", fk)
 	}
 }
+
+func TestGenerateSchemaFile_WithExtendResolve(t *testing.T) {
+	old := modelFieldIDs
+	oldAPIs := apiIDs
+	defer func() { modelFieldIDs = old; apiIDs = oldAPIs }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"User": {"id": 1, "name": 2, "posts": 10},
+		"Post": {"id": 1, "title": 2},
+	})
+	SetAPIIDs(map[string]int{
+		"getUser":                 1,
+		"svc:batchLoad:Post":      50,
+		"svc:resolve:Post:userId": 51,
+	})
+
+	result := &semantic.Result{
+		Files: []*ast.File{
+			{
+				Name: "user.luxo",
+				Models: []*ast.ModelDecl{{
+					Name: "User",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+						{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+					},
+					Directives: []*ast.Directive{{Name: "crud"}},
+				}},
+			},
+			{
+				Name: "post.luxo",
+				Models: []*ast.ModelDecl{{
+					Name: "Post",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+					},
+					Directives: []*ast.Directive{{Name: "crud"}},
+				}},
+				Extends: []*ast.ExtendDecl{{
+					Name: "User",
+					Fields: []*ast.FieldDecl{
+						{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+					},
+				}},
+			},
+		},
+	}
+
+	src := generateSchemaFile(result, "app", nil)
+	code := string(src)
+
+	// Should register svc:batchLoad and svc:resolve APIs
+	if !strings.Contains(code, "svc:batchLoad:Post") {
+		t.Errorf("missing batchLoad API registration:\n%s", code)
+	}
+	if !strings.Contains(code, "svc:resolve:Post:userId") {
+		t.Errorf("missing resolve API registration:\n%s", code)
+	}
+}
