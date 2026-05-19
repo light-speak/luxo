@@ -467,6 +467,72 @@ func TestExtractIDColumn_Empty(t *testing.T) {
 	}
 }
 
+func TestExtractIDColumn_ZeroCount(t *testing.T) {
+	buf := codec.AppendVarint(nil, 0) // count=0
+	buf = append(buf, 0x00)
+	s := schema.New()
+	s.RegisterModel(&schema.Model{
+		Name:   "M",
+		Fields: []schema.Field{{ID: 1, Name: "id", Type: schema.FieldInt}},
+	})
+	ids := ExtractIDColumn(buf, 1, s.Models["M"])
+	if ids != nil {
+		t.Fatal("zero count should return nil")
+	}
+}
+
+func TestExtractIDColumn_SkipError(t *testing.T) {
+	// Columnar with truncated float column → skipColumnarColumn errors
+	var buf []byte
+	buf = codec.AppendVarint(buf, 1) // count=1
+	buf = codec.AppendVarint(buf, 2) // fieldID=2 (float)
+	buf = append(buf, 0x01, 0x02)    // only 2 bytes, float needs 8
+
+	s := schema.New()
+	s.RegisterModel(&schema.Model{
+		Name: "M",
+		Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt},
+			{ID: 2, Name: "score", Type: schema.FieldFloat},
+		},
+	})
+	ids := ExtractIDColumn(buf, 1, s.Models["M"])
+	if ids != nil {
+		t.Fatal("skip error should return nil")
+	}
+}
+
+func TestSkipColumnarColumn_DurationAndDateTimeNullable(t *testing.T) {
+	// Duration and DateTime nullable columns
+	var buf []byte
+	buf = codec.AppendVarint(buf, 1) // count=1
+	// col 2: nullable DateTime
+	buf = codec.AppendVarint(buf, 2)
+	buf = codec.AppendNull(buf)
+	// col 3: nullable Duration
+	buf = codec.AppendVarint(buf, 3)
+	buf = codec.AppendPresent(buf)
+	buf = codec.AppendSvarint(buf, 5000)
+	// col 1: id
+	buf = codec.AppendVarint(buf, 1)
+	buf = codec.AppendSvarint(buf, 99)
+	buf = append(buf, 0x00)
+
+	s := schema.New()
+	s.RegisterModel(&schema.Model{
+		Name: "M",
+		Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt},
+			{ID: 2, Name: "at", Type: schema.FieldDateTime, Nullable: true},
+			{ID: 3, Name: "dur", Type: schema.FieldDuration, Nullable: true},
+		},
+	})
+	ids := ExtractIDColumn(buf, 1, s.Models["M"])
+	if len(ids) != 1 || ids[0] != 99 {
+		t.Fatalf("ids = %v, want [99]", ids)
+	}
+}
+
 func TestExtractIDColumn_UnknownColumn(t *testing.T) {
 	w := &codec.ColumnarWriter{}
 	w.SetCount(1)
