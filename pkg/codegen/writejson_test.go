@@ -723,3 +723,345 @@ func TestGenerateWriteLuxoUUIDDecimalBytesJSON(t *testing.T) {
 		t.Errorf("UUID/Decimal columnar should use WriteColumnString:\n%s", code)
 	}
 }
+
+// --- Arena header tests ---
+
+func TestWriteLuxoArenaHeader(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"User": {"id": 1, "name": 2, "email": 3, "age": 4},
+	})
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Models: []*ast.ModelDecl{{
+				Name: "User",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+					{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+					{Name: "age", Type: &ast.TypeRef{Name: "Int"}},
+				},
+			}},
+		}},
+	}
+
+	src := generateWriteJSONFile(result, "app", nil)
+	code := string(src)
+
+	// Arena length calculation should exist
+	if !strings.Contains(code, "_arenaLen") {
+		t.Errorf("WriteLuxo should calculate _arenaLen:\n%s", code)
+	}
+	// Should sum string field lengths
+	if !strings.Contains(code, "len(u.Name)") {
+		t.Errorf("should include len(u.Name):\n%s", code)
+	}
+	if !strings.Contains(code, "len(u.Email)") {
+		t.Errorf("should include len(u.Email):\n%s", code)
+	}
+	// Should NOT include non-string fields
+	if strings.Contains(code, "len(u.Age)") {
+		t.Errorf("should not include len for Int field:\n%s", code)
+	}
+	// Should write arena len to buf
+	if !strings.Contains(code, "AppendVarint(buf.B, uint64(_arenaLen))") {
+		t.Errorf("should write _arenaLen as varint:\n%s", code)
+	}
+}
+
+func TestWriteLuxoArenaHeaderNullableString(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"Post": {"id": 1, "title": 2, "subtitle": 3},
+	})
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Models: []*ast.ModelDecl{{
+				Name: "Post",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+					{Name: "subtitle", Type: &ast.TypeRef{Name: "String", Nullable: true}},
+				},
+			}},
+		}},
+	}
+
+	src := generateWriteJSONFile(result, "app", nil)
+	code := string(src)
+
+	// Nullable string should check nil before adding to arena len
+	if !strings.Contains(code, "p.Subtitle != nil") {
+		t.Errorf("nullable string should check nil for arena len:\n%s", code)
+	}
+	if !strings.Contains(code, "len(*p.Subtitle)") {
+		t.Errorf("nullable string should use len(*p.Subtitle):\n%s", code)
+	}
+}
+
+func TestWriteLuxoArenaHeaderEnumField(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"User": {"id": 1, "role": 2},
+	})
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name:  "test.luxo",
+			Enums: []*ast.EnumDecl{{Name: "Role"}},
+			Models: []*ast.ModelDecl{{
+				Name: "User",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "role", Type: &ast.TypeRef{Name: "Role"}},
+				},
+			}},
+		}},
+	}
+
+	enums := collectEnums(result)
+	src := generateWriteJSONFile(result, "app", enums)
+	code := string(src)
+
+	// Enum should be included in arena calculation
+	if !strings.Contains(code, "len(string(u.Role))") {
+		t.Errorf("enum should use len(string(u.Role)) for arena:\n%s", code)
+	}
+}
+
+func TestWriteLuxoArenaHeaderNoStringFields(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"Counter": {"id": 1, "count": 2, "active": 3},
+	})
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Models: []*ast.ModelDecl{{
+				Name: "Counter",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "count", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "active", Type: &ast.TypeRef{Name: "Boolean"}},
+				},
+			}},
+		}},
+	}
+
+	src := generateWriteJSONFile(result, "app", nil)
+	code := string(src)
+
+	// No string fields — should still write arena header (0)
+	if !strings.Contains(code, "AppendVarint(buf.B, 0)") {
+		t.Errorf("no string fields should write arena len = 0:\n%s", code)
+	}
+	// Should NOT have _arenaLen variable
+	if strings.Contains(code, "_arenaLen") {
+		t.Errorf("no string fields should not declare _arenaLen:\n%s", code)
+	}
+}
+
+func TestReadLuxoArenaDecoding(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"User": {"id": 1, "name": 2, "email": 3, "age": 4},
+	})
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Models: []*ast.ModelDecl{{
+				Name: "User",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+					{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+					{Name: "age", Type: &ast.TypeRef{Name: "Int"}},
+				},
+			}},
+		}},
+	}
+
+	src := generateWriteJSONFile(result, "app", nil)
+	code := string(src)
+
+	// ReadLuxo should read arena size
+	if !strings.Contains(code, "dec.ReadArenaSize()") {
+		t.Errorf("ReadLuxo should call ReadArenaSize:\n%s", code)
+	}
+	// Should allocate arena
+	if !strings.Contains(code, "make([]byte, _arenaSize)") {
+		t.Errorf("ReadLuxo should allocate arena:\n%s", code)
+	}
+	// String fields should use ReadStringArena
+	if !strings.Contains(code, "ReadStringArena(_arena, &_arenaOff)") {
+		t.Errorf("String fields should use ReadStringArena:\n%s", code)
+	}
+	// Int field should still use ReadInt (not arena)
+	if !strings.Contains(code, "dec.ReadInt()") {
+		t.Errorf("Int fields should still use ReadInt:\n%s", code)
+	}
+}
+
+func TestReadLuxoArenaEnumField(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"User": {"id": 1, "name": 2, "role": 3},
+	})
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name:  "test.luxo",
+			Enums: []*ast.EnumDecl{{Name: "Role"}},
+			Models: []*ast.ModelDecl{{
+				Name: "User",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+					{Name: "role", Type: &ast.TypeRef{Name: "Role"}},
+				},
+			}},
+		}},
+	}
+
+	enums := collectEnums(result)
+	src := generateWriteJSONFile(result, "app", enums)
+	code := string(src)
+
+	// Enum field should use ReadStringArena
+	if !strings.Contains(code, "Role(dec.ReadStringArena(_arena, &_arenaOff))") {
+		t.Errorf("Enum ReadLuxo should use ReadStringArena:\n%s", code)
+	}
+}
+
+func TestReadLuxoNoArenaFields(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"Counter": {"id": 1, "count": 2},
+	})
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Models: []*ast.ModelDecl{{
+				Name: "Counter",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "count", Type: &ast.TypeRef{Name: "Int"}},
+				},
+			}},
+		}},
+	}
+
+	src := generateWriteJSONFile(result, "app", nil)
+	code := string(src)
+
+	// No arena fields — should skip arena header
+	if !strings.Contains(code, "dec.SkipArenaHeader()") {
+		t.Errorf("ReadLuxo with no string fields should SkipArenaHeader:\n%s", code)
+	}
+	if strings.Contains(code, "ReadArenaSize") {
+		t.Errorf("ReadLuxo with no string fields should not call ReadArenaSize:\n%s", code)
+	}
+}
+
+func TestReadLuxoAllFieldTypes(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"Full": {"id": 1, "name": 2, "createdAt": 3, "duration": 4,
+			"data": 5, "avatar": 6, "score": 7},
+	})
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Models: []*ast.ModelDecl{{
+				Name: "Full",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+					{Name: "createdAt", Type: &ast.TypeRef{Name: "DateTime"}},
+					{Name: "duration", Type: &ast.TypeRef{Name: "Duration"}},
+					{Name: "data", Type: &ast.TypeRef{Name: "Bytes"}},
+					{Name: "avatar", Type: &ast.TypeRef{Name: "String", Nullable: true}},
+					{Name: "score", Type: &ast.TypeRef{Name: "Float", Nullable: true}},
+				},
+			}},
+		}},
+	}
+
+	src := generateWriteJSONFile(result, "app", nil)
+	code := string(src)
+
+	// ReadLuxo should handle DateTime, Duration, Bytes, nullable String, nullable Float
+	if !strings.Contains(code, "time.Unix(dec.ReadInt(), 0)") {
+		t.Errorf("DateTime ReadLuxo missing time.Unix:\n%s", code)
+	}
+	if !strings.Contains(code, "time.Duration(dec.ReadInt())") {
+		t.Errorf("Duration ReadLuxo missing:\n%s", code)
+	}
+	if !strings.Contains(code, "dec.ReadBytes()") {
+		t.Errorf("Bytes ReadLuxo missing:\n%s", code)
+	}
+	if !strings.Contains(code, "ReadStringArenaPtr") {
+		t.Errorf("nullable String should use ReadStringArenaPtr:\n%s", code)
+	}
+	if !strings.Contains(code, "dec.ReadFloatPtr()") {
+		t.Errorf("nullable Float ReadLuxo missing:\n%s", code)
+	}
+}
+
+func TestWriteLuxoArenaHeaderMaskedPath(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"User": {"id": 1, "name": 2, "bio": 3},
+	})
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Models: []*ast.ModelDecl{{
+				Name: "User",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+					{Name: "bio", Type: &ast.TypeRef{Name: "String", Nullable: true}},
+				},
+			}},
+		}},
+	}
+
+	src := generateWriteJSONFile(result, "app", nil)
+	code := string(src)
+
+	// Masked path should check FieldMaskHas for arena len
+	if !strings.Contains(code, "FieldMaskHas(mask, 2) { _arenaLen += len(u.Name)") {
+		t.Errorf("masked path should check mask for name arena len:\n%s", code)
+	}
+	if !strings.Contains(code, "FieldMaskHas(mask, 3) && u.Bio != nil") {
+		t.Errorf("masked path should check mask + nil for nullable arena len:\n%s", code)
+	}
+}

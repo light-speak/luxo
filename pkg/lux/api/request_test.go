@@ -468,3 +468,112 @@ func TestParseRequestFiltersSortersLimit(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+// --- SetParamSlot accumulation tests ---
+
+func TestSetParamSlotAccumulateInt(t *testing.T) {
+	req := &Request{}
+	req.SetBinaryParams([]string{"count", "keys"}, 2)
+
+	// First write to slot 1
+	req.SetParamSlot(1, int64(10))
+	// Second write — should accumulate to []int64
+	req.SetParamSlot(1, int64(20))
+	// Third write — should append
+	req.SetParamSlot(1, int64(30))
+
+	ids, err := req.ParamIntArray("keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 3 || ids[0] != 10 || ids[1] != 20 || ids[2] != 30 {
+		t.Fatalf("ids = %v, want [10 20 30]", ids)
+	}
+}
+
+func TestSetParamSlotAccumulateString(t *testing.T) {
+	req := &Request{}
+	req.SetBinaryParams([]string{"tags"}, 1)
+
+	req.SetParamSlot(0, "a")
+	req.SetParamSlot(0, "b")
+	req.SetParamSlot(0, "c")
+
+	strs, err := req.ParamStringArray("tags")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(strs) != 3 || strs[0] != "a" || strs[1] != "b" || strs[2] != "c" {
+		t.Fatalf("strs = %v, want [a b c]", strs)
+	}
+}
+
+func TestSetParamSlotSingleInt(t *testing.T) {
+	// Single write should still work as int64, not []int64
+	req := &Request{}
+	req.SetBinaryParams([]string{"id"}, 1)
+	req.SetParamSlot(0, int64(42))
+
+	id, err := req.ParamInt("id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != 42 {
+		t.Fatalf("id = %d, want 42", id)
+	}
+}
+
+func TestSetParamSlotOutOfBounds(t *testing.T) {
+	req := &Request{}
+	// Should not panic
+	req.SetParamSlot(-1, int64(1))
+	req.SetParamSlot(16, int64(1))
+	req.SetParamSlot(99, int64(1))
+}
+
+func TestSetParamSlotTypeMismatch(t *testing.T) {
+	req := &Request{}
+	req.SetBinaryParams([]string{"val"}, 1)
+	// Write int then string — type mismatch should overwrite
+	req.SetParamSlot(0, int64(1))
+	req.SetParamSlot(0, "hello")
+	if v, ok := req.findParam("val"); !ok || v != "hello" {
+		t.Fatalf("type mismatch should overwrite, got %v", v)
+	}
+}
+
+func TestSetParamSlotFloatOverwrite(t *testing.T) {
+	req := &Request{}
+	req.SetBinaryParams([]string{"val"}, 1)
+	req.SetParamSlot(0, 1.0)
+	req.SetParamSlot(0, 2.0) // float → overwrite (not accumulated)
+	if v, ok := req.findParam("val"); !ok || v != 2.0 {
+		t.Fatalf("float should overwrite, got %v", v)
+	}
+}
+
+func TestParamIntArraySingleElement(t *testing.T) {
+	req := &Request{}
+	req.SetBinaryParams([]string{"keys"}, 1)
+	req.SetParamSlot(0, int64(42)) // single int, not []int64
+	ids, err := req.ParamIntArray("keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 || ids[0] != 42 {
+		t.Fatalf("single int should wrap to []int64, got %v", ids)
+	}
+}
+
+func TestParamStringArraySingleElement(t *testing.T) {
+	req := &Request{}
+	req.SetBinaryParams([]string{"tags"}, 1)
+	req.SetParamSlot(0, "hello") // single string
+	strs, err := req.ParamStringArray("tags")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(strs) != 1 || strs[0] != "hello" {
+		t.Fatalf("single string should wrap to []string, got %v", strs)
+	}
+}

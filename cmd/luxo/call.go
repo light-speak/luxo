@@ -136,6 +136,7 @@ func decodeBinaryResponse(data []byte) {
 	}
 
 	dec := codec.NewDecoder(data)
+	dec.SkipArenaHeader()
 	for dec.NextField() {
 		fid := dec.FieldID()
 		// Try reading as different types — peek at raw bytes

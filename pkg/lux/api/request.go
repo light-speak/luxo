@@ -331,8 +331,11 @@ func (r *Request) ParamBool(name string) (bool, error) {
 func (r *Request) ParamIntArray(name string) ([]int64, error) {
 	if r.paramNames != nil {
 		if v, ok := r.findParam(name); ok {
-			if iv, ok := v.([]int64); ok {
+			switch iv := v.(type) {
+			case []int64:
 				return iv, nil
+			case int64:
+				return []int64{iv}, nil
 			}
 		}
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
@@ -352,8 +355,11 @@ func (r *Request) ParamIntArray(name string) ([]int64, error) {
 func (r *Request) ParamStringArray(name string) ([]string, error) {
 	if r.paramNames != nil {
 		if v, ok := r.findParam(name); ok {
-			if sv, ok := v.([]string); ok {
+			switch sv := v.(type) {
+			case []string:
 				return sv, nil
+			case string:
+				return []string{sv}, nil
 			}
 		}
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
@@ -402,10 +408,42 @@ func (r *Request) SetBinaryParams(names []string, count int) {
 }
 
 // SetParamSlot sets a param value by index (binary mode).
+// If a slot already has a value, repeated calls accumulate into a slice.
+// This supports array params encoded as repeated field IDs (e.g. batchLoad keys).
 func (r *Request) SetParamSlot(index int, value any) {
-	if index >= 0 && index < 16 {
-		r.paramSlots[index] = value
+	if index < 0 || index >= 16 {
+		return
 	}
+	existing := r.paramSlots[index]
+	if existing == nil {
+		r.paramSlots[index] = value
+		return
+	}
+	// Accumulate into slice
+	switch ev := existing.(type) {
+	case int64:
+		if iv, ok := value.(int64); ok {
+			r.paramSlots[index] = []int64{ev, iv}
+			return
+		}
+	case []int64:
+		if iv, ok := value.(int64); ok {
+			r.paramSlots[index] = append(ev, iv)
+			return
+		}
+	case string:
+		if sv, ok := value.(string); ok {
+			r.paramSlots[index] = []string{ev, sv}
+			return
+		}
+	case []string:
+		if sv, ok := value.(string); ok {
+			r.paramSlots[index] = append(ev, sv)
+			return
+		}
+	}
+	// Type mismatch or unsupported — overwrite
+	r.paramSlots[index] = value
 }
 
 // HasParam checks if a parameter exists (supports both JSON and binary mode).

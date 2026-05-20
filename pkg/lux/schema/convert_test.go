@@ -25,6 +25,12 @@ func userModel() *Model {
 	return m
 }
 
+// withArenaHeader prepends a totalStringLen varint (value 0) to binary data.
+// Used in tests to match the arena header that WriteLuxo now writes.
+func withArenaHeader(data []byte) []byte {
+	return append(codec.AppendVarint(nil, 0), data...)
+}
+
 func encodeUser(id int64, name, email string, score float64, phone *string, active bool) []byte {
 	var enc codec.Encoder
 	enc.WriteFieldInt(1, id)
@@ -38,7 +44,7 @@ func encodeUser(id int64, name, email string, score float64, phone *string, acti
 	}
 	enc.WriteFieldBool(6, active)
 	enc.WriteEnd()
-	return enc.Bytes()
+	return withArenaHeader(enc.Bytes())
 }
 
 func TestBinaryToJSON_Basic(t *testing.T) {
@@ -394,7 +400,7 @@ func TestBinaryToJSON_EmptyModel(t *testing.T) {
 	// No fields encoded
 	var enc codec.Encoder
 	enc.WriteEnd()
-	data := enc.Bytes()
+	data := withArenaHeader(enc.Bytes())
 
 	m := userModel()
 	result := BinaryToJSON(nil, data, m)
@@ -408,7 +414,7 @@ func TestBinaryToJSON_UnknownFieldID(t *testing.T) {
 	var enc codec.Encoder
 	enc.WriteFieldInt(99, 42) // field 99 not in userModel
 	enc.WriteEnd()
-	data := enc.Bytes()
+	data := withArenaHeader(enc.Bytes())
 
 	m := userModel()
 	result := BinaryToJSON(nil, data, m)
@@ -449,7 +455,7 @@ func TestBinaryToJSON_AllFieldTypes(t *testing.T) {
 	enc.WriteFieldBytes(8, []byte{0xDE, 0xAD})
 	enc.WriteEnd()
 
-	result := BinaryToJSON(nil, enc.Bytes(), m)
+	result := BinaryToJSON(nil, withArenaHeader(enc.Bytes()), m)
 	got := string(result)
 
 	if !strings.Contains(got, `"intVal":-42`) {
@@ -502,7 +508,7 @@ func TestBinaryToJSON_NullableFields(t *testing.T) {
 	enc.WriteFieldIntPtr(5, nil)
 	enc.WriteEnd()
 
-	result := BinaryToJSON(nil, enc.Bytes(), m)
+	result := BinaryToJSON(nil, withArenaHeader(enc.Bytes()), m)
 	got := string(result)
 
 	// All values should be null
@@ -526,7 +532,7 @@ func TestBinaryToJSON_NullableFields(t *testing.T) {
 	enc.WriteFieldIntPtr(5, &dv)
 	enc.WriteEnd()
 
-	result = BinaryToJSON(nil, enc.Bytes(), m)
+	result = BinaryToJSON(nil, withArenaHeader(enc.Bytes()), m)
 	got = string(result)
 
 	if !strings.Contains(got, `"intVal":10`) {
@@ -866,7 +872,7 @@ func TestBinaryToJSON_NullableDefaultBranch(t *testing.T) {
 	enc.WriteFieldBytes(1, nil) // nullable bytes
 	enc.WriteEnd()
 
-	result := BinaryToJSON(nil, enc.Bytes(), m)
+	result := BinaryToJSON(nil, withArenaHeader(enc.Bytes()), m)
 	// Should produce valid JSON
 	if result[0] != '{' {
 		t.Errorf("expected JSON object, got %s", result)
@@ -888,7 +894,7 @@ func TestBinaryToJSON_FieldTypeDefault(t *testing.T) {
 	enc.WriteFieldString(1, "ignored") // wire type doesn't matter
 	enc.WriteEnd()
 
-	result := BinaryToJSON(nil, enc.Bytes(), m)
+	result := BinaryToJSON(nil, withArenaHeader(enc.Bytes()), m)
 	// Should produce valid JSON without crashing
 	if result[0] != '{' {
 		t.Errorf("expected JSON object, got %s", result)
@@ -1064,7 +1070,7 @@ func TestBinaryToJSON_NullableDuration(t *testing.T) {
 	buf = codec.AppendSvarint(buf, 5000)
 	buf = append(buf, 0x00) // end
 
-	result := BinaryToJSON(nil, buf, m)
+	result := BinaryToJSON(nil, withArenaHeader(buf), m)
 	got := string(result)
 	if !strings.Contains(got, "5000") {
 		t.Errorf("expected 5000, got: %s", got)
@@ -1087,7 +1093,7 @@ func TestBinaryToJSON_NullableBytes(t *testing.T) {
 	buf = codec.AppendBytes(buf, []byte{0xCA, 0xFE})
 	buf = append(buf, 0x00) // end
 
-	result := BinaryToJSON(nil, buf, m)
+	result := BinaryToJSON(nil, withArenaHeader(buf), m)
 	got := string(result)
 	if !strings.Contains(got, `"yv4="`) {
 		t.Errorf("expected base64 encoded bytes, got: %s", got)

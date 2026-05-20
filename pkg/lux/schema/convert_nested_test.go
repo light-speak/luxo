@@ -27,14 +27,16 @@ func TestBinaryToJSON_NestedModel(t *testing.T) {
 	})
 
 	// Encode: AuthPayload { token: "abc", member: User { id: 42, name: "Alice" } }
-	// Build binary manually: field 1 (string "abc"), field 2 (nested User)
+	// Build binary manually: [arenaHeader] field 1 (string "abc"), field 2 (nested User [arenaHeader] ...)
 	var data []byte
+	data = codec.AppendVarint(data, 0) // arena header for AuthPayload
 	// Field 1: token = "abc"
 	data = codec.AppendVarint(data, 1)
 	data = codec.AppendString(data, "abc")
 	// Field 2: member = nested User
 	data = codec.AppendVarint(data, 2)
-	// Nested User fields inline
+	// Nested User: [arenaHeader] fields... [0x00]
+	data = codec.AppendVarint(data, 0) // arena header for User
 	data = codec.AppendVarint(data, 1) // User.id
 	data = codec.AppendSvarint(data, 42)
 	data = codec.AppendVarint(data, 2) // User.name
@@ -75,11 +77,13 @@ func TestBinaryToJSON_NestedType(t *testing.T) {
 	})
 
 	var data []byte
+	data = codec.AppendVarint(data, 0) // arena header for Outer
 	// Field 1: name = "test"
 	data = codec.AppendVarint(data, 1)
 	data = codec.AppendString(data, "test")
 	// Field 2: inner = nested Inner
 	data = codec.AppendVarint(data, 2)
+	data = codec.AppendVarint(data, 0) // arena header for Inner
 	data = codec.AppendVarint(data, 1) // Inner.value
 	data = codec.AppendString(data, "hello")
 	data = append(data, 0x00) // end of Inner
@@ -109,11 +113,13 @@ func TestBinaryToJSON_UnknownNestedType(t *testing.T) {
 	})
 
 	var data []byte
+	data = codec.AppendVarint(data, 0) // arena header for Container
 	// Field 1: label = "box"
 	data = codec.AppendVarint(data, 1)
 	data = codec.AppendString(data, "box")
 	// Field 2: unknown = nested (will be drained)
 	data = codec.AppendVarint(data, 2)
+	data = codec.AppendVarint(data, 0) // arena header for nested (unknown type)
 	data = codec.AppendVarint(data, 1)
 	data = codec.AppendString(data, "data")
 	data = append(data, 0x00) // end of nested
@@ -142,6 +148,7 @@ func TestBinaryToJSON_NestedNoSchema(t *testing.T) {
 	})
 
 	var data []byte
+	data = codec.AppendVarint(data, 0) // arena header
 	data = codec.AppendVarint(data, 1)
 	data = codec.AppendString(data, "ignored")
 	data = append(data, 0x00)

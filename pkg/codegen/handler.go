@@ -175,6 +175,9 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	// DataLoader RPC endpoints — batch load for each model (cluster mode)
 	generateBatchLoadHandlers(&b, models)
 
+	// Federation resolve endpoints — svc:resolve:{Model}:{FK} for cross-module extends
+	generateFederationResolvers(&b, result, models, enums)
+
 	return []byte(b.String())
 }
 
@@ -1240,6 +1243,11 @@ func generateBatchLoadHandlers(b *strings.Builder, models []*ast.ModelDecl) {
 	for _, m := range models {
 		svcName := "svc:batchLoad:" + m.Name
 		fmt.Fprintf(b, "\trouter.Handle(%q, handleBatchLoad%s(app))\n", svcName, m.Name)
+		apiID := getAPIID(svcName)
+		if apiID > 0 {
+			fmt.Fprintf(b, "\trouter.Registry.Register(%q, %d)\n", svcName, apiID)
+			fmt.Fprintf(b, "\trouter.Registry.RegisterParams(%q, []api.ParamMeta{{FieldID: 1, Name: \"count\", Type: \"Int\"}, {FieldID: 2, Name: \"keys\", Type: \"Int\"}})\n", svcName)
+		}
 	}
 	b.WriteString("}\n\n")
 }
@@ -2021,4 +2029,147 @@ func scanStmtsForEmit(stmts []ast.Stmt, f *handlerFeatures, curMod string) {
 			}
 		}
 	}
+}
+
+// --- Federation resolve endpoints ---
+
+// resolveEndpoint describes a svc:resolve:{Model}:{FK} endpoint to generate.
+type resolveEndpoint struct {
+	modelName string // model being resolved (e.g. "Post")
+	tableName string // SQL table (e.g. "posts")
+	fkField   string // FK field on the model (e.g. "userId")
+	fkColumn  string // FK SQL column (e.g. "user_id")
+	svcName   string // endpoint name (e.g. "svc:resolve:Post:userId")
+	scanFn    string // scan function (e.g. "scanPost")
+	isList    bool   // true for hasMany (multiple items per FK)
+}
+
+// generateFederationResolvers generates svc:resolve:{Model}:{FK} endpoints
+// for each cross-module extend relationship defined in this module.
+//
+// Example: Post module has `extend User { posts: [Post] @hasMany }`
+// → generates svc:resolve:Post:userId handler that does:
+//
+//	WHERE user_id IN (keys) → group by user_id → write grouped response
+//
+// Response format:
+//
+//	[key_count varint]
+//	For each key (in request order):
+//	  [item_count varint]
+//	  [item1 WriteLuxo] [item2 WriteLuxo] ...
+func generateFederationResolvers(b *strings.Builder, result *semantic.Result, models []*ast.ModelDecl, enums map[string]bool) {
+	curModule := ""
+	if len(result.Files) > 0 {
+		curModule = moduleNameFromFile(result.Files[0].Name)
+	}
+
+	// Find model names owned by this module (for FK inference)
+	modelNames := make(map[string]bool)
+	for _, m := range models {
+		modelNames[m.Name] = true
+	}
+
+	// Collect resolve endpoints from extends in this module
+	var endpoints []resolveEndpoint
+	for _, file := range result.Files {
+		modName := moduleNameFromFile(file.Name)
+		if modName != curModule {
+			continue
+		}
+		for _, ext := range file.Extends {
+			// Only generate if the extended model is NOT owned by this module
+			// (cross-module extend)
+			if modelNames[ext.Name] {
+				continue
+			}
+			for _, f := range ext.Fields {
+				if f.Type == nil || !isRelationField(f, enums) {
+					continue
+				}
+				// This field is a relation (e.g. posts: [Post])
+				// The target model must be in this module
+				if !modelNames[f.Type.Name] {
+					continue
+				}
+				fk := inferForeignKey(&ast.ModelDecl{Name: ext.Name}, f, enums)
+				ep := resolveEndpoint{
+					modelName: f.Type.Name,
+					tableName: str.ToSnakeCase(f.Type.Name) + "s",
+					fkField:   fk,
+					fkColumn:  str.ToSnakeCase(fk),
+					svcName:   "svc:resolve:" + f.Type.Name + ":" + fk,
+					scanFn:    "scan" + f.Type.Name,
+					isList:    f.Type.IsList,
+				}
+				endpoints = append(endpoints, ep)
+			}
+		}
+	}
+
+	if len(endpoints) == 0 {
+		return
+	}
+
+	// Generate handler for each endpoint
+	for _, ep := range endpoints {
+		fmt.Fprintf(b, "// handleResolve%sBy%s handles %s — federation resolve.\n",
+			ep.modelName, str.Capitalize(ep.fkField), ep.svcName)
+		fmt.Fprintf(b, "// WHERE %s IN (keys) → group by %s → write grouped response.\n",
+			ep.fkColumn, ep.fkColumn)
+		fmt.Fprintf(b, "func handleResolve%sBy%s(app *App) api.HandlerFunc {\n",
+			ep.modelName, str.Capitalize(ep.fkField))
+		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
+		fmt.Fprintf(b, "\t\tkeys, err := req.ParamIntArray(\"keys\")\n")
+		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+		// Query: WHERE fk_column IN (keys)
+		fmt.Fprintf(b, "\t\tconds := []lux.Condition{lux.NewIntField(%q).In(keys...)}\n", ep.fkColumn)
+		fmt.Fprintf(b, "\t\tquery, args := lux.BuildSelectSQL(%q, nil, conds, nil, 0, 0)\n", ep.tableName)
+		fmt.Fprintf(b, "\t\trows, err := %s.QueryRows(ctx, app.DB, %s, query, args...)\n", dbPkg, ep.scanFn)
+		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\n")
+
+		// Group by FK field
+		fmt.Fprintf(b, "\t\t// Group results by FK value, preserving request key order\n")
+		fmt.Fprintf(b, "\t\tgrouped := make(map[int64][]*%s, len(keys))\n", ep.modelName)
+		fmt.Fprintf(b, "\t\tfor _, row := range rows {\n")
+		fmt.Fprintf(b, "\t\t\tfk := row.%s\n", str.Capitalize(ep.fkField))
+		fmt.Fprintf(b, "\t\t\tgrouped[fk] = append(grouped[fk], row)\n")
+		fmt.Fprintf(b, "\t\t}\n\n")
+
+		// Write grouped response: [key_count][per-key: [item_count][len+item1][len+item2]...]
+		// Each item is length-prefixed so gateway can split without schema knowledge.
+		fmt.Fprintf(b, "\t\t// Write grouped response (key order matches request order)\n")
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(keys)))\n")
+		fmt.Fprintf(b, "\t\tfor _, key := range keys {\n")
+		fmt.Fprintf(b, "\t\t\titems := grouped[key]\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(items)))\n")
+		fmt.Fprintf(b, "\t\t\ttmp := api.GetBuf()\n")
+		fmt.Fprintf(b, "\t\t\tfor _, item := range items {\n")
+		fmt.Fprintf(b, "\t\t\t\t// Length-prefix: write to pooled buf, then [len][data]\n")
+		fmt.Fprintf(b, "\t\t\t\ttmp.Reset()\n")
+		fmt.Fprintf(b, "\t\t\t\titem.WriteLuxo(tmp, req.FieldMask)\n")
+		fmt.Fprintf(b, "\t\t\t\treq.Buf.B = codec.AppendBytes(req.Buf.B, tmp.B)\n")
+		fmt.Fprintf(b, "\t\t\t}\n")
+		fmt.Fprintf(b, "\t\t\tapi.PutBuf(tmp)\n")
+		fmt.Fprintf(b, "\t\t}\n")
+		fmt.Fprintf(b, "\t\treturn nil\n")
+		fmt.Fprintf(b, "\t}\n}\n\n")
+	}
+
+	// RegisterFederationResolvers function
+	b.WriteString("// RegisterFederationResolvers registers federation resolve RPC endpoints.\n")
+	b.WriteString("// Gateway calls these to resolve cross-module extend fields.\n")
+	b.WriteString("func RegisterFederationResolvers(router *api.Router, app *App) {\n")
+	for _, ep := range endpoints {
+		fmt.Fprintf(b, "\trouter.Handle(%q, handleResolve%sBy%s(app))\n",
+			ep.svcName, ep.modelName, str.Capitalize(ep.fkField))
+		// Register with API ID so gateway RPC can call by ID
+		apiID := getAPIID(ep.svcName)
+		if apiID > 0 {
+			fmt.Fprintf(b, "\trouter.Registry.Register(%q, %d)\n", ep.svcName, apiID)
+			// Params: field 1 = count (Int), field 2 = keys (Int, repeated)
+			fmt.Fprintf(b, "\trouter.Registry.RegisterParams(%q, []api.ParamMeta{{FieldID: 1, Name: \"count\", Type: \"Int\"}, {FieldID: 2, Name: \"keys\", Type: \"Int\"}})\n", ep.svcName)
+		}
+	}
+	b.WriteString("}\n\n")
 }

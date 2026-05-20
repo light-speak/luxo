@@ -174,6 +174,11 @@ class LuxoDecoder {
         _bytes = data,
         _off = 0;
 
+  /// Skips the arena header (totalStringLen varint) that prefixes each model's binary data.
+  void skipArenaHeader() {
+    _readVarint();
+  }
+
   /// Advances to the next field. Returns false at end or on error.
   bool nextField() {
     if (error != null || _off >= _data.lengthInBytes) return false;

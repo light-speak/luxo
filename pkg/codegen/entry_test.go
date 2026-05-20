@@ -323,12 +323,13 @@ func TestGenerateEntryFileNoServiceFns(t *testing.T) {
 	src := GenerateEntryFile(result, "myapp")
 	code := string(src)
 
-	// Should NOT have RPC server or service fn registration
+	// Should NOT have service fn registration
 	if strings.Contains(code, "RegisterServiceFns") {
 		t.Error("no service fns, should not have RegisterServiceFns")
 	}
-	if strings.Contains(code, "rpc.NewServer") {
-		t.Error("no service fns, should not have RPC server")
+	// Should still have RPC server (batchLoad + federation resolvers need it)
+	if !strings.Contains(code, "RegisterBatchLoaders") {
+		t.Error("crud model should have RegisterBatchLoaders")
 	}
 }
 

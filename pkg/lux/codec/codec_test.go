@@ -3,6 +3,7 @@ package codec
 import (
 	"math"
 	"testing"
+	"unsafe"
 )
 
 // --- Wire-level tests ---
@@ -1388,5 +1389,864 @@ func TestColumnarCountLimit(t *testing.T) {
 	}
 	if r.Count() != 0 {
 		t.Errorf("count should be 0, got %d", r.Count())
+	}
+}
+
+// --- Arena tests ---
+
+func TestReadArenaSize(t *testing.T) {
+	buf := AppendVarint(nil, 42)
+	dec := NewDecoder(buf)
+	size := dec.ReadArenaSize()
+	if size != 42 {
+		t.Fatalf("expected arena size 42, got %d", size)
+	}
+	if dec.Err() != nil {
+		t.Fatalf("unexpected error: %v", dec.Err())
+	}
+}
+
+func TestReadArenaSizeEmpty(t *testing.T) {
+	dec := NewDecoder(nil)
+	size := dec.ReadArenaSize()
+	if size != 0 {
+		t.Fatalf("expected 0 for empty buf, got %d", size)
+	}
+	if dec.Err() == nil {
+		t.Fatal("expected error for empty buf")
+	}
+}
+
+func TestSkipArenaHeader(t *testing.T) {
+	// Build: [arena_size varint] [fieldID=1] [int value]
+	var buf []byte
+	buf = AppendVarint(buf, 100) // arena size
+	buf = AppendVarint(buf, 1)   // field ID 1
+	buf = AppendSvarint(buf, 42) // int value
+
+	dec := NewDecoder(buf)
+	dec.SkipArenaHeader()
+	if dec.Err() != nil {
+		t.Fatalf("unexpected error: %v", dec.Err())
+	}
+	if !dec.NextField() {
+		t.Fatal("expected field after skipping arena header")
+	}
+	if dec.FieldID() != 1 {
+		t.Fatalf("expected field ID 1, got %d", dec.FieldID())
+	}
+	v := dec.ReadInt()
+	if v != 42 {
+		t.Fatalf("expected 42, got %d", v)
+	}
+}
+
+func TestSkipArenaHeaderEmpty(t *testing.T) {
+	dec := NewDecoder(nil)
+	dec.SkipArenaHeader()
+	if dec.Err() == nil {
+		t.Fatal("expected error for empty buf")
+	}
+}
+
+func TestReadStringArena(t *testing.T) {
+	// Encode two strings
+	var buf []byte
+	buf = AppendVarint(buf, 1) // field ID 1
+	buf = AppendString(buf, "hello")
+	buf = AppendVarint(buf, 2) // field ID 2
+	buf = AppendString(buf, "world")
+	buf = append(buf, 0x00) // end marker
+
+	arena := make([]byte, 10) // "hello"(5) + "world"(5)
+	arenaOff := 0
+
+	dec := NewDecoder(buf)
+	var s1, s2 string
+	for dec.NextField() {
+		switch dec.FieldID() {
+		case 1:
+			s1 = dec.ReadStringArena(arena, &arenaOff)
+		case 2:
+			s2 = dec.ReadStringArena(arena, &arenaOff)
+		}
+	}
+	if dec.Err() != nil {
+		t.Fatalf("unexpected error: %v", dec.Err())
+	}
+	if s1 != "hello" {
+		t.Fatalf("s1: expected %q, got %q", "hello", s1)
+	}
+	if s2 != "world" {
+		t.Fatalf("s2: expected %q, got %q", "world", s2)
+	}
+	if arenaOff != 10 {
+		t.Fatalf("arenaOff: expected 10, got %d", arenaOff)
+	}
+	// Verify both strings share the same underlying arena
+	if unsafe.StringData(s1) != &arena[0] {
+		t.Fatal("s1 should point into arena")
+	}
+	if unsafe.StringData(s2) != &arena[5] {
+		t.Fatal("s2 should point into arena at offset 5")
+	}
+}
+
+func TestReadStringArenaEmpty(t *testing.T) {
+	// Empty string should work without advancing arena offset
+	var buf []byte
+	buf = AppendVarint(buf, 1)
+	buf = AppendString(buf, "")
+	buf = append(buf, 0x00)
+
+	arena := make([]byte, 0)
+	arenaOff := 0
+
+	dec := NewDecoder(buf)
+	dec.NextField()
+	s := dec.ReadStringArena(arena, &arenaOff)
+	if s != "" {
+		t.Fatalf("expected empty string, got %q", s)
+	}
+	if arenaOff != 0 {
+		t.Fatalf("arenaOff should be 0 for empty string, got %d", arenaOff)
+	}
+}
+
+func TestReadStringArenaPtr(t *testing.T) {
+	// Non-null string
+	var buf []byte
+	buf = AppendPresent(buf)
+	buf = AppendString(buf, "hello")
+
+	arena := make([]byte, 5)
+	arenaOff := 0
+
+	dec := NewDecoder(buf)
+	v := dec.ReadStringArenaPtr(arena, &arenaOff)
+	if dec.Err() != nil {
+		t.Fatalf("unexpected error: %v", dec.Err())
+	}
+	if v == nil {
+		t.Fatal("expected non-nil")
+	}
+	if *v != "hello" {
+		t.Fatalf("expected %q, got %q", "hello", *v)
+	}
+	if arenaOff != 5 {
+		t.Fatalf("arenaOff: expected 5, got %d", arenaOff)
+	}
+}
+
+func TestReadStringArenaPtrNull(t *testing.T) {
+	buf := AppendNull(nil)
+
+	arena := make([]byte, 10)
+	arenaOff := 0
+
+	dec := NewDecoder(buf)
+	v := dec.ReadStringArenaPtr(arena, &arenaOff)
+	if dec.Err() != nil {
+		t.Fatalf("unexpected error: %v", dec.Err())
+	}
+	if v != nil {
+		t.Fatalf("expected nil, got %q", *v)
+	}
+	if arenaOff != 0 {
+		t.Fatalf("arenaOff should be 0 for null, got %d", arenaOff)
+	}
+}
+
+func TestReadStringArenaOverflow(t *testing.T) {
+	// Arena too small — should fall back to regular allocation, not panic
+	var buf []byte
+	buf = AppendVarint(buf, 1)
+	buf = AppendString(buf, "hello world") // 11 bytes
+	buf = append(buf, 0x00)
+
+	arena := make([]byte, 3) // too small for "hello world"
+	arenaOff := 0
+
+	dec := NewDecoder(buf)
+	dec.NextField()
+	s := dec.ReadStringArena(arena, &arenaOff)
+	if s != "hello world" {
+		t.Fatalf("expected %q, got %q", "hello world", s)
+	}
+	// arenaOff should NOT have advanced (fallback path)
+	if arenaOff != 0 {
+		t.Fatalf("arenaOff should be 0 on fallback, got %d", arenaOff)
+	}
+}
+
+func TestReadArenaSizeLimit(t *testing.T) {
+	// Arena size exceeding MaxArenaSize should error
+	buf := AppendVarint(nil, uint64(MaxArenaSize+1))
+	dec := NewDecoder(buf)
+	size := dec.ReadArenaSize()
+	if size != 0 {
+		t.Fatalf("expected 0 for oversized arena, got %d", size)
+	}
+	if dec.Err() == nil {
+		t.Fatal("expected error for oversized arena")
+	}
+}
+
+func TestReadStringArenaInvalidData(t *testing.T) {
+	// Truncated string data
+	dec := NewDecoder([]byte{0xFF}) // invalid varint-like
+	arena := make([]byte, 10)
+	arenaOff := 0
+	s := dec.ReadStringArena(arena, &arenaOff)
+	if s != "" {
+		t.Fatalf("expected empty string for invalid data, got %q", s)
+	}
+	if dec.Err() == nil {
+		t.Fatal("expected error for invalid data")
+	}
+}
+
+func TestReadStringArenaPtrInvalid(t *testing.T) {
+	dec := NewDecoder(nil)
+	arena := make([]byte, 10)
+	arenaOff := 0
+	v := dec.ReadStringArenaPtr(arena, &arenaOff)
+	if v != nil {
+		t.Fatal("expected nil for empty buffer")
+	}
+	if dec.Err() == nil {
+		t.Fatal("expected error for empty buffer")
+	}
+}
+
+func TestReadStringArenaFullRoundTrip(t *testing.T) {
+	// Simulate a full model encode/decode with arena header
+	name := "Alice"
+	email := "alice@example.com"
+	totalStringLen := len(name) + len(email) // 5 + 17 = 22
+
+	// Encode: [totalStringLen] [field1: name] [field2: age] [field3: email] [0x00]
+	var buf []byte
+	buf = AppendVarint(buf, uint64(totalStringLen))
+	buf = AppendVarint(buf, 1)
+	buf = AppendString(buf, name)
+	buf = AppendVarint(buf, 2)
+	buf = AppendSvarint(buf, 30) // age (non-string field)
+	buf = AppendVarint(buf, 3)
+	buf = AppendString(buf, email)
+	buf = append(buf, 0x00)
+
+	// Decode with arena
+	dec := NewDecoder(buf)
+	arenaSize := dec.ReadArenaSize()
+	if arenaSize != totalStringLen {
+		t.Fatalf("arena size: expected %d, got %d", totalStringLen, arenaSize)
+	}
+	arena := make([]byte, arenaSize)
+	arenaOff := 0
+
+	var gotName, gotEmail string
+	var gotAge int64
+	for dec.NextField() {
+		switch dec.FieldID() {
+		case 1:
+			gotName = dec.ReadStringArena(arena, &arenaOff)
+		case 2:
+			gotAge = dec.ReadInt()
+		case 3:
+			gotEmail = dec.ReadStringArena(arena, &arenaOff)
+		}
+	}
+	if dec.Err() != nil {
+		t.Fatalf("decode error: %v", dec.Err())
+	}
+	if gotName != name {
+		t.Fatalf("name: expected %q, got %q", name, gotName)
+	}
+	if gotAge != 30 {
+		t.Fatalf("age: expected 30, got %d", gotAge)
+	}
+	if gotEmail != email {
+		t.Fatalf("email: expected %q, got %q", email, gotEmail)
+	}
+	if arenaOff != totalStringLen {
+		t.Fatalf("arenaOff: expected %d, got %d", totalStringLen, arenaOff)
+	}
+}
+
+func TestReadStringArenaUTF8(t *testing.T) {
+	s := "你好世界🌍"
+	var buf []byte
+	buf = AppendVarint(buf, 1)
+	buf = AppendString(buf, s)
+	buf = append(buf, 0x00)
+
+	arena := make([]byte, len(s))
+	arenaOff := 0
+
+	dec := NewDecoder(buf)
+	dec.NextField()
+	got := dec.ReadStringArena(arena, &arenaOff)
+	if got != s {
+		t.Fatalf("expected %q, got %q", s, got)
+	}
+	if arenaOff != len(s) {
+		t.Fatalf("arenaOff: expected %d, got %d", len(s), arenaOff)
+	}
+}
+
+func BenchmarkReadStringVsArena(b *testing.B) {
+	// Build a message with 5 string fields
+	var buf []byte
+	strs := []string{"Alice", "alice@example.com", "New York", "Engineer", "Bio text here"}
+	totalLen := 0
+	for _, s := range strs {
+		totalLen += len(s)
+	}
+	// With arena header
+	arenaBuf := AppendVarint(nil, uint64(totalLen))
+	for i, s := range strs {
+		arenaBuf = AppendVarint(arenaBuf, uint64(i+1))
+		arenaBuf = AppendString(arenaBuf, s)
+	}
+	arenaBuf = append(arenaBuf, 0x00)
+
+	// Without arena header
+	for i, s := range strs {
+		buf = AppendVarint(buf, uint64(i+1))
+		buf = AppendString(buf, s)
+	}
+	buf = append(buf, 0x00)
+
+	b.Run("NoArena", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			dec := NewDecoder(buf)
+			for dec.NextField() {
+				_ = dec.ReadString()
+			}
+		}
+	})
+
+	b.Run("Arena", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			dec := NewDecoder(arenaBuf)
+			size := dec.ReadArenaSize()
+			arena := make([]byte, size)
+			off := 0
+			for dec.NextField() {
+				_ = dec.ReadStringArena(arena, &off)
+			}
+		}
+	})
+}
+
+// --- SkipColumn* tests ---
+
+func TestSkipColumnInt(t *testing.T) {
+	w := &ColumnarWriter{}
+	w.SetCount(3)
+	w.WriteColumnInt(1, []int64{10, 20, 30})
+	w.WriteColumnString(2, []string{"a", "b", "c"})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	// Skip int column, read string column
+	r.NextColumn()
+	r.SkipColumnInt()
+	if r.Err() != nil {
+		t.Fatalf("SkipColumnInt error: %v", r.Err())
+	}
+	r.NextColumn()
+	strs := r.ReadColumnString()
+	if len(strs) != 3 || strs[0] != "a" {
+		t.Fatalf("after skip, strings = %v", strs)
+	}
+}
+
+func TestSkipColumnFloat(t *testing.T) {
+	w := &ColumnarWriter{}
+	w.SetCount(2)
+	w.WriteColumnFloat(1, []float64{1.1, 2.2})
+	w.WriteColumnInt(2, []int64{42, 43})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	r.SkipColumnFloat()
+	if r.Err() != nil {
+		t.Fatalf("SkipColumnFloat error: %v", r.Err())
+	}
+	r.NextColumn()
+	ints := r.ReadColumnInt()
+	if len(ints) != 2 || ints[0] != 42 {
+		t.Fatalf("after skip, ints = %v", ints)
+	}
+}
+
+func TestSkipColumnString(t *testing.T) {
+	w := &ColumnarWriter{}
+	w.SetCount(2)
+	w.WriteColumnString(1, []string{"hello", "world"})
+	w.WriteColumnInt(2, []int64{1, 2})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	r.SkipColumnString()
+	if r.Err() != nil {
+		t.Fatalf("SkipColumnString error: %v", r.Err())
+	}
+	r.NextColumn()
+	ints := r.ReadColumnInt()
+	if len(ints) != 2 || ints[0] != 1 {
+		t.Fatalf("after skip, ints = %v", ints)
+	}
+}
+
+func TestSkipColumnBool(t *testing.T) {
+	w := &ColumnarWriter{}
+	w.SetCount(2)
+	w.WriteColumnBool(1, []bool{true, false})
+	w.WriteColumnInt(2, []int64{7, 8})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	r.SkipColumnBool()
+	if r.Err() != nil {
+		t.Fatalf("SkipColumnBool error: %v", r.Err())
+	}
+	r.NextColumn()
+	ints := r.ReadColumnInt()
+	if len(ints) != 2 || ints[0] != 7 {
+		t.Fatalf("after skip, ints = %v", ints)
+	}
+}
+
+func TestSkipColumnNullable(t *testing.T) {
+	w := &ColumnarWriter{}
+	w.SetCount(3)
+	v1 := int64(10)
+	w.WriteColumnIntPtr(1, []*int64{&v1, nil, &v1})
+	s1 := "hi"
+	w.WriteColumnStringPtr(2, []*string{&s1, nil, &s1})
+	f1 := 3.14
+	w.WriteColumnFloatPtr(3, []*float64{&f1, nil, nil})
+	b1 := true
+	w.WriteColumnBoolPtr(4, []*bool{&b1, nil, &b1})
+	w.WriteColumnInt(5, []int64{99, 88, 77})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	// Skip all nullable columns
+	r.NextColumn()
+	r.SkipColumnIntPtr()
+	if r.Err() != nil {
+		t.Fatalf("SkipColumnIntPtr: %v", r.Err())
+	}
+	r.NextColumn()
+	r.SkipColumnStringPtr()
+	if r.Err() != nil {
+		t.Fatalf("SkipColumnStringPtr: %v", r.Err())
+	}
+	r.NextColumn()
+	r.SkipColumnFloatPtr()
+	if r.Err() != nil {
+		t.Fatalf("SkipColumnFloatPtr: %v", r.Err())
+	}
+	r.NextColumn()
+	r.SkipColumnBoolPtr()
+	if r.Err() != nil {
+		t.Fatalf("SkipColumnBoolPtr: %v", r.Err())
+	}
+	// Read the last column
+	r.NextColumn()
+	ints := r.ReadColumnInt()
+	if len(ints) != 3 || ints[0] != 99 || ints[1] != 88 || ints[2] != 77 {
+		t.Fatalf("after skipping nullable cols, ints = %v", ints)
+	}
+}
+
+func TestSkipColumnBytes(t *testing.T) {
+	// Manually build columnar data with a bytes column
+	var col []byte
+	col = AppendVarint(col, 1) // fieldID
+	col = AppendBytes(col, []byte{0xCA, 0xFE})
+	col = AppendBytes(col, []byte{0xDE, 0xAD})
+	// Rebuild: [count=2][col][int col][0x00]
+	var buf []byte
+	buf = AppendVarint(buf, 2) // count
+	buf = append(buf, col...)
+	buf = AppendVarint(buf, 2) // fieldID 2
+	buf = AppendSvarint(buf, 42)
+	buf = AppendSvarint(buf, 43)
+	buf = append(buf, 0x00)
+
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnBytes()
+	if r.Err() != nil {
+		t.Fatalf("SkipColumnBytes: %v", r.Err())
+	}
+	r.NextColumn()
+	ints := r.ReadColumnInt()
+	if len(ints) != 2 || ints[0] != 42 {
+		t.Fatalf("after skip bytes, ints = %v", ints)
+	}
+}
+
+func TestReadColumnBytes(t *testing.T) {
+	var buf []byte
+	buf = AppendVarint(buf, 2) // count = 2
+	buf = AppendVarint(buf, 1) // fieldID = 1
+	buf = AppendBytes(buf, []byte{0x01, 0x02, 0x03})
+	buf = AppendBytes(buf, []byte{0x04, 0x05})
+	buf = append(buf, 0x00)
+
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	blobs := r.ReadColumnBytes()
+	if r.Err() != nil {
+		t.Fatalf("ReadColumnBytes error: %v", r.Err())
+	}
+	if len(blobs) != 2 {
+		t.Fatalf("expected 2 blobs, got %d", len(blobs))
+	}
+	if len(blobs[0]) != 3 || blobs[0][0] != 0x01 {
+		t.Fatalf("blob[0] = %x", blobs[0])
+	}
+	if len(blobs[1]) != 2 || blobs[1][0] != 0x04 {
+		t.Fatalf("blob[1] = %x", blobs[1])
+	}
+}
+
+// --- SkipColumn error path tests ---
+
+func TestSkipColumnInt_Truncated(t *testing.T) {
+	buf := AppendVarint(nil, 2)  // count=2
+	buf = AppendVarint(buf, 1)   // fieldID
+	buf = AppendSvarint(buf, 42) // only 1 value, expect 2
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnInt()
+	if r.Err() == nil {
+		t.Fatal("expected error for truncated int column")
+	}
+}
+
+func TestSkipColumnFloat_Truncated(t *testing.T) {
+	buf := AppendVarint(nil, 1)
+	buf = AppendVarint(buf, 1)
+	buf = append(buf, 0x01, 0x02) // only 2 bytes, need 8
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnFloat()
+	if r.Err() == nil {
+		t.Fatal("expected error for truncated float column")
+	}
+}
+
+func TestSkipColumnString_Truncated(t *testing.T) {
+	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 1)
+	buf = AppendString(buf, "ok") // only 1 value
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnString()
+	if r.Err() == nil {
+		t.Fatal("expected error for truncated string column")
+	}
+}
+
+func TestSkipColumnBool_Truncated(t *testing.T) {
+	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 1)
+	buf = AppendBool(buf, true) // only 1
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnBool()
+	if r.Err() == nil {
+		t.Fatal("expected error for truncated bool column")
+	}
+}
+
+func TestSkipColumnIntPtr_Truncated(t *testing.T) {
+	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 1)
+	buf = AppendPresent(buf)
+	buf = AppendSvarint(buf, 10) // 1 value, expect 2
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnIntPtr()
+	if r.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestSkipColumnFloatPtr_Truncated(t *testing.T) {
+	buf := AppendVarint(nil, 1)
+	buf = AppendVarint(buf, 1)
+	buf = AppendPresent(buf)
+	buf = append(buf, 0x01) // only 1 byte, need 8
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnFloatPtr()
+	if r.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestSkipColumnStringPtr_Truncated(t *testing.T) {
+	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 1)
+	buf = AppendNull(buf)
+	// only 1 value (null), expect 2
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnStringPtr()
+	if r.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestSkipColumnBoolPtr_Truncated(t *testing.T) {
+	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 1)
+	buf = AppendPresent(buf)
+	buf = AppendBool(buf, true) // 1 value, expect 2
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnBoolPtr()
+	if r.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestSkipColumnBytes_Truncated(t *testing.T) {
+	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 1)
+	buf = AppendBytes(buf, []byte{0x01}) // 1 value, expect 2
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnBytes()
+	if r.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestReadColumnBytes_Truncated(t *testing.T) {
+	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 1)
+	buf = AppendBytes(buf, []byte{0x01}) // 1 value, expect 2
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	blobs := r.ReadColumnBytes()
+	if blobs != nil {
+		t.Fatal("truncated should return nil")
+	}
+	if r.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecoderSkipMethods(t *testing.T) {
+	// Build: [varint][fixed64][len-prefixed string][0x00]
+	var buf []byte
+	buf = AppendVarint(buf, 1)     // field 1
+	buf = AppendSvarint(buf, 42)   // varint value
+	buf = AppendVarint(buf, 2)     // field 2
+	buf = AppendFixed64(buf, 3.14) // fixed64 value
+	buf = AppendVarint(buf, 3)     // field 3
+	buf = AppendString(buf, "hi")  // len-prefixed
+	buf = append(buf, 0x00)
+
+	dec := NewDecoder(buf)
+	dec.NextField() // field 1
+	dec.SkipVarint()
+	dec.NextField() // field 2
+	dec.SkipFixed64()
+	dec.NextField() // field 3
+	dec.SkipLenPrefixed()
+	if dec.Err() != nil {
+		t.Fatalf("unexpected error: %v", dec.Err())
+	}
+	if dec.NextField() {
+		t.Fatal("expected end")
+	}
+}
+
+func TestDecoderSkipNullable(t *testing.T) {
+	var buf []byte
+	buf = AppendVarint(buf, 1) // field 1
+	buf = AppendNull(buf)      // nullable varint = null
+	buf = AppendVarint(buf, 2) // field 2
+	buf = AppendPresent(buf)
+	buf = AppendFixed64(buf, 1.0) // nullable fixed64 = present
+	buf = AppendVarint(buf, 3)    // field 3
+	buf = AppendPresent(buf)
+	buf = AppendString(buf, "x") // nullable string = present
+	buf = append(buf, 0x00)
+
+	dec := NewDecoder(buf)
+	dec.NextField()
+	dec.SkipNullableVarint()
+	dec.NextField()
+	dec.SkipNullableFixed64()
+	dec.NextField()
+	dec.SkipNullableLenPrefixed()
+	if dec.Err() != nil {
+		t.Fatalf("unexpected error: %v", dec.Err())
+	}
+	if dec.NextField() {
+		t.Fatal("expected end")
+	}
+}
+
+func TestDecoderOffset(t *testing.T) {
+	buf := AppendVarint(nil, 42)
+	dec := NewDecoder(buf)
+	if dec.Offset() != 0 {
+		t.Fatalf("initial offset should be 0")
+	}
+	dec.NextField()
+	if dec.Offset() <= 0 {
+		t.Fatal("offset should advance after NextField")
+	}
+}
+
+func TestDecoderSkipVarint_Error(t *testing.T) {
+	dec := NewDecoder(nil)
+	dec.SkipVarint()
+	if dec.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecoderSkipFixed64_Error(t *testing.T) {
+	dec := NewDecoder([]byte{0x01})
+	dec.SkipFixed64()
+	if dec.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecoderSkipLenPrefixed_Error(t *testing.T) {
+	dec := NewDecoder(nil)
+	dec.SkipLenPrefixed()
+	if dec.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecoderSkipNullableVarint_Error(t *testing.T) {
+	dec := NewDecoder(nil)
+	dec.SkipNullableVarint()
+	if dec.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecoderSkipNullableFixed64_Error(t *testing.T) {
+	dec := NewDecoder(nil)
+	dec.SkipNullableFixed64()
+	if dec.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecoderSkipNullableLenPrefixed_Error(t *testing.T) {
+	dec := NewDecoder(nil)
+	dec.SkipNullableLenPrefixed()
+	if dec.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestSkipColumnIntPtr_PresentValueTruncated(t *testing.T) {
+	buf := AppendVarint(nil, 1) // count=1
+	buf = AppendVarint(buf, 1)  // fieldID
+	buf = AppendPresent(buf)    // present but no value after
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnIntPtr()
+	if r.Err() == nil {
+		t.Fatal("expected error for present but truncated value")
+	}
+}
+
+func TestSkipColumnFloatPtr_PresentValueTruncated(t *testing.T) {
+	buf := AppendVarint(nil, 1)
+	buf = AppendVarint(buf, 1)
+	buf = AppendPresent(buf)
+	buf = append(buf, 0x01) // only 1 byte, need 8
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnFloatPtr()
+	if r.Err() == nil {
+		t.Fatal("expected error for present but truncated float")
+	}
+}
+
+func TestSkipColumnStringPtr_PresentValueTruncated(t *testing.T) {
+	buf := AppendVarint(nil, 1)
+	buf = AppendVarint(buf, 1)
+	buf = AppendPresent(buf) // present but no string data
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnStringPtr()
+	if r.Err() == nil {
+		t.Fatal("expected error for present but truncated string")
+	}
+}
+
+func TestSkipColumnBoolPtr_PresentValueTruncated(t *testing.T) {
+	buf := AppendVarint(nil, 1)
+	buf = AppendVarint(buf, 1)
+	buf = AppendPresent(buf) // present but no bool data
+	r := NewColumnarReader(buf)
+	r.NextColumn()
+	r.SkipColumnBoolPtr()
+	if r.Err() == nil {
+		t.Fatal("expected error for present but truncated bool")
+	}
+}
+
+func TestDecoderSkipNullableVarint_PresentTruncated(t *testing.T) {
+	buf := AppendPresent(nil) // present flag, but no varint data
+	dec := NewDecoder(buf)
+	dec.SkipNullableVarint()
+	if dec.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecoderSkipNullableFixed64_PresentTruncated(t *testing.T) {
+	buf := AppendPresent(nil) // present flag, but no fixed64 data
+	dec := NewDecoder(buf)
+	dec.SkipNullableFixed64()
+	if dec.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDecoderSkipNullableLenPrefixed_PresentTruncated(t *testing.T) {
+	buf := AppendPresent(nil) // present flag, but no len-prefixed data
+	dec := NewDecoder(buf)
+	dec.SkipNullableLenPrefixed()
+	if dec.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestColumnarOffset(t *testing.T) {
+	w := &ColumnarWriter{}
+	w.SetCount(1)
+	w.WriteColumnInt(1, []int64{42})
+	data := w.Bytes()
+	r := NewColumnarReader(data)
+	if r.Offset() <= 0 {
+		t.Fatal("offset should be > 0 after reading count")
 	}
 }

@@ -1,6 +1,9 @@
 package codec
 
-import "fmt"
+import (
+	"fmt"
+	"unsafe"
+)
 
 // Decoder reads fields from a binary message.
 // Generated code uses NextField() to iterate and typed Read methods to extract values.
@@ -259,6 +262,171 @@ func (d *Decoder) ReadFloatArray() []float64 {
 		}
 	}
 	return result
+}
+
+// --- Arena readers ---
+// Arena methods reduce allocations by copying all string data into a single
+// pre-allocated []byte (the arena). Strings returned by these methods are
+// backed by unsafe.String pointing into the arena. The arena is immutable
+// after decoding — generated code guarantees no writes after construction.
+
+// MaxArenaSize caps arena allocation to prevent OOM from malicious wire data.
+// 64MB — larger than any practical single model's total string content.
+const MaxArenaSize = 64 * 1024 * 1024
+
+// ReadArenaSize reads the totalStringLen varint that prefixes a model's binary
+// encoding. The caller allocates make([]byte, size) and passes it to
+// ReadStringArena / ReadStringArenaPtr.
+// Returns 0 (with error) if the size exceeds MaxArenaSize.
+func (d *Decoder) ReadArenaSize() int {
+	v, n := ReadVarint(d.buf, d.off)
+	if n <= 0 {
+		d.err = fmt.Errorf("codec: invalid arena size varint at offset %d", d.off)
+		return 0
+	}
+	d.off += n
+	if v > uint64(MaxArenaSize) {
+		d.err = fmt.Errorf("codec: arena size %d exceeds limit %d at offset %d", v, MaxArenaSize, d.off-n)
+		return 0
+	}
+	return int(v)
+}
+
+// SkipArenaHeader skips the totalStringLen varint prefix.
+// Used by code paths that don't need arena allocation (e.g. Binary→JSON conversion).
+func (d *Decoder) SkipArenaHeader() {
+	_, n := ReadVarint(d.buf, d.off)
+	if n <= 0 {
+		d.err = fmt.Errorf("codec: invalid arena header varint at offset %d", d.off)
+		return
+	}
+	d.off += n
+}
+
+// ReadStringArena reads a length-prefixed string, copies the bytes into arena
+// at *arenaOff, and returns an unsafe.String pointing into the arena.
+// Advances *arenaOff by the string length.
+// Falls back to a regular string allocation if the arena is too small
+// (defensive: should not happen with correct totalStringLen).
+func (d *Decoder) ReadStringArena(arena []byte, arenaOff *int) string {
+	b, n := ReadBytes(d.buf, d.off)
+	if n == 0 {
+		d.err = fmt.Errorf("codec: invalid string at offset %d", d.off)
+		return ""
+	}
+	d.off += n
+	if len(b) == 0 {
+		return ""
+	}
+	start := *arenaOff
+	end := start + len(b)
+	if end > len(arena) {
+		// Arena too small — fall back to regular allocation (no panic)
+		return string(b)
+	}
+	copy(arena[start:end], b)
+	*arenaOff = end
+	return unsafe.String(&arena[start], len(b))
+}
+
+// ReadStringArenaPtr reads a nullable string using arena allocation.
+// Returns nil for null values. Non-null strings are arena-backed.
+func (d *Decoder) ReadStringArenaPtr(arena []byte, arenaOff *int) *string {
+	present, n := ReadNullable(d.buf, d.off)
+	if n == 0 {
+		d.err = fmt.Errorf("codec: invalid nullable at offset %d", d.off)
+		return nil
+	}
+	d.off += n
+	if !present {
+		return nil
+	}
+	v := d.ReadStringArena(arena, arenaOff)
+	return &v
+}
+
+// FieldSkipType identifies how to skip a field value in the binary stream.
+// Used by merger/planner to advance past fields without full decoding.
+type FieldSkipType int
+
+const (
+	SkipVarint      FieldSkipType = iota // Int, DateTime, Duration, Enum, Bool (varint)
+	SkipFixed64                          // Float (8 bytes)
+	SkipBytes                            // String, Bytes, JSON, UUID, Decimal (length-prefixed)
+	SkipNullVarint                       // Nullable varint (1 byte flag + optional varint)
+	SkipNullFixed64                      // Nullable float (1 byte flag + optional 8 bytes)
+	SkipNullBytes                        // Nullable string/bytes (1 byte flag + optional length-prefixed)
+)
+
+// --- Zero-allocation skip methods ---
+// Used by federation's ExtractID to advance past fields without allocating.
+
+// SkipVarint advances past a varint value without allocating.
+func (d *Decoder) SkipVarint() {
+	_, n := ReadVarint(d.buf, d.off)
+	if n <= 0 {
+		d.err = fmt.Errorf("codec: invalid varint at offset %d", d.off)
+		return
+	}
+	d.off += n
+}
+
+// SkipFixed64 advances past an 8-byte fixed64 value.
+func (d *Decoder) SkipFixed64() {
+	if d.off+8 > len(d.buf) {
+		d.err = fmt.Errorf("codec: truncated fixed64 at offset %d", d.off)
+		return
+	}
+	d.off += 8
+}
+
+// SkipLenPrefixed advances past a length-prefixed value (string/bytes) without allocating.
+func (d *Decoder) SkipLenPrefixed() {
+	_, n := ReadBytes(d.buf, d.off)
+	if n == 0 {
+		d.err = fmt.Errorf("codec: invalid length-prefixed at offset %d", d.off)
+		return
+	}
+	d.off += n
+}
+
+// SkipNullableVarint advances past a nullable varint (flag + optional value).
+func (d *Decoder) SkipNullableVarint() {
+	present, n := ReadNullable(d.buf, d.off)
+	if n == 0 {
+		d.err = fmt.Errorf("codec: invalid nullable at offset %d", d.off)
+		return
+	}
+	d.off += n
+	if present {
+		d.SkipVarint()
+	}
+}
+
+// SkipNullableFixed64 advances past a nullable fixed64.
+func (d *Decoder) SkipNullableFixed64() {
+	present, n := ReadNullable(d.buf, d.off)
+	if n == 0 {
+		d.err = fmt.Errorf("codec: invalid nullable at offset %d", d.off)
+		return
+	}
+	d.off += n
+	if present {
+		d.SkipFixed64()
+	}
+}
+
+// SkipNullableLenPrefixed advances past a nullable length-prefixed value.
+func (d *Decoder) SkipNullableLenPrefixed() {
+	present, n := ReadNullable(d.buf, d.off)
+	if n == 0 {
+		d.err = fmt.Errorf("codec: invalid nullable at offset %d", d.off)
+		return
+	}
+	d.off += n
+	if present {
+		d.SkipLenPrefixed()
+	}
 }
 
 // SkipField skips the current field's value. Used for unknown fields (forward compat).

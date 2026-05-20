@@ -676,7 +676,9 @@ func generateRemoteExtendByPKBatchFunc(b *strings.Builder, modelName string) {
 	fmt.Fprintf(b, "\t\t\t\tenc.WriteFieldInt(2, k)\n")
 	fmt.Fprintf(b, "\t\t\t}\n")
 	fmt.Fprintf(b, "\t\t\tenc.WriteEnd()\n")
-	fmt.Fprintf(b, "\t\t\tresp, err := client.Call(0, enc.Bytes())\n")
+	svcName := "svc:batchLoad:" + modelName
+	apiID := getAPIID(svcName)
+	fmt.Fprintf(b, "\t\t\tresp, err := client.Call(%d, enc.Bytes())\n", apiID)
 	fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
 	// Decode response: [varint count][model1 ReadLuxo][model2 ReadLuxo]...
 	fmt.Fprintf(b, "\t\t\tcount, n := codec.ReadVarint(resp, 0)\n")

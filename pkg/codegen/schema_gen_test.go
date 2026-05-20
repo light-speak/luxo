@@ -707,3 +707,290 @@ func TestGenerateSchemaFile_WithTypes(t *testing.T) {
 		}
 	}
 }
+
+// --- Federation tests ---
+
+func TestBuildSchemaModels_ExtendFieldModule(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"User": {"id": 1, "name": 2, "posts": 10},
+		"Post": {"id": 1, "title": 2},
+	})
+
+	result := &semantic.Result{
+		Files: []*ast.File{
+			{
+				Name: "user.luxo",
+				Models: []*ast.ModelDecl{{
+					Name: "User",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+						// posts is added by extend from post.luxo, but appears here after semantic merge
+						{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+					},
+				}},
+			},
+			{
+				Name: "post.luxo",
+				Models: []*ast.ModelDecl{{
+					Name: "Post",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+					},
+				}},
+				Extends: []*ast.ExtendDecl{{
+					Name: "User",
+					Fields: []*ast.FieldDecl{
+						{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+					},
+				}},
+			},
+		},
+	}
+
+	s := schema.New()
+	buildSchemaModels(s, result, nil)
+
+	user := s.Models["User"]
+	if user == nil {
+		t.Fatal("User model not registered")
+	}
+
+	// Find the posts field
+	var postsField *schema.Field
+	for i := range user.Fields {
+		if user.Fields[i].Name == "posts" {
+			postsField = &user.Fields[i]
+			break
+		}
+	}
+	if postsField == nil {
+		t.Fatal("posts field not found in User model")
+	}
+	if postsField.Module != "post" {
+		t.Errorf("posts.Module = %q, want %q", postsField.Module, "post")
+	}
+	if postsField.ForeignKey != "userId" {
+		t.Errorf("posts.ForeignKey = %q, want %q", postsField.ForeignKey, "userId")
+	}
+	if !postsField.Relation {
+		t.Error("posts should be a relation field")
+	}
+
+	// name field should have no module (same module as model)
+	nameField := user.FieldByName("name")
+	if nameField == nil {
+		t.Fatal("name field not found")
+	}
+	if nameField.Module != "" {
+		t.Errorf("name.Module should be empty, got %q", nameField.Module)
+	}
+}
+
+func TestWriteModelRegistration_ExtendRelation(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"User": {"id": 1, "name": 2, "posts": 10},
+	})
+
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+		},
+	}
+
+	extendModules := map[string]string{
+		"posts": "post",
+	}
+
+	var b strings.Builder
+	writeModelRegistration(&b, m, nil, extendModules)
+	code := b.String()
+
+	// Should include relation field with Module and ForeignKey
+	if !strings.Contains(code, `Module: "post"`) {
+		t.Errorf("missing Module in relation field:\n%s", code)
+	}
+	if !strings.Contains(code, `ForeignKey: "userId"`) {
+		t.Errorf("missing ForeignKey in relation field:\n%s", code)
+	}
+	if !strings.Contains(code, `Relation: true`) {
+		t.Errorf("missing Relation: true:\n%s", code)
+	}
+	if !strings.Contains(code, `IsList: true`) {
+		t.Errorf("missing IsList: true:\n%s", code)
+	}
+}
+
+func TestBuildSchemaModels_SameModuleRelationNoModule(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"User": {"id": 1, "name": 2, "posts": 10},
+		"Post": {"id": 1, "title": 2},
+	})
+
+	// User and Post in same file — relation is NOT cross-module
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "user.luxo",
+			Models: []*ast.ModelDecl{
+				{
+					Name: "User",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+						{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+					},
+				},
+				{
+					Name: "Post",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+					},
+				},
+			},
+		}},
+	}
+
+	s := schema.New()
+	buildSchemaModels(s, result, nil)
+
+	user := s.Models["User"]
+	for i := range user.Fields {
+		if user.Fields[i].Name == "posts" {
+			if user.Fields[i].Module != "" {
+				t.Errorf("same-module relation should have empty Module, got %q", user.Fields[i].Module)
+			}
+			return
+		}
+	}
+}
+
+func TestBuildSchemaModels_HasExtendFields(t *testing.T) {
+	s := schema.New()
+	s.RegisterModel(&schema.Model{
+		Name: "User",
+		Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt},
+			{ID: 2, Name: "name", Type: schema.FieldString},
+			{ID: 10, Name: "posts", Type: schema.FieldModel, Relation: true, Module: "post"},
+		},
+	})
+
+	if !s.Models["User"].HasExtendFields() {
+		t.Error("User should have extend fields")
+	}
+
+	s.RegisterModel(&schema.Model{
+		Name: "Post",
+		Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt},
+		},
+	})
+
+	if s.Models["Post"].HasExtendFields() {
+		t.Error("Post should not have extend fields")
+	}
+}
+
+func TestInferForeignKey_ExplicitBy(t *testing.T) {
+	f := &ast.FieldDecl{
+		Name: "posts",
+		Type: &ast.TypeRef{Name: "Post", IsList: true},
+		Directives: []*ast.Directive{{
+			Name: "by",
+			Args: []*ast.NamedArg{
+				{Value: &ast.Ident{Name: "authorId"}},
+				{Value: &ast.Ident{Name: "id"}},
+			},
+		}},
+	}
+	fk := inferForeignKey(&ast.ModelDecl{Name: "User"}, f, nil)
+	if fk != "authorId" {
+		t.Errorf("expected authorId, got %q", fk)
+	}
+}
+
+func TestInferForeignKey_BelongsTo(t *testing.T) {
+	f := &ast.FieldDecl{
+		Name: "author",
+		Type: &ast.TypeRef{Name: "User"},
+	}
+	fk := inferForeignKey(&ast.ModelDecl{Name: "Post"}, f, nil)
+	if fk != "id" {
+		t.Errorf("belongsTo should return 'id', got %q", fk)
+	}
+}
+
+func TestGenerateSchemaFile_WithExtendResolve(t *testing.T) {
+	old := modelFieldIDs
+	oldAPIs := apiIDs
+	defer func() { modelFieldIDs = old; apiIDs = oldAPIs }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"User": {"id": 1, "name": 2, "posts": 10},
+		"Post": {"id": 1, "title": 2},
+	})
+	SetAPIIDs(map[string]int{
+		"getUser":                 1,
+		"svc:batchLoad:Post":      50,
+		"svc:resolve:Post:userId": 51,
+	})
+
+	result := &semantic.Result{
+		Files: []*ast.File{
+			{
+				Name: "user.luxo",
+				Models: []*ast.ModelDecl{{
+					Name: "User",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+						{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+					},
+					Directives: []*ast.Directive{{Name: "crud"}},
+				}},
+			},
+			{
+				Name: "post.luxo",
+				Models: []*ast.ModelDecl{{
+					Name: "Post",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+					},
+					Directives: []*ast.Directive{{Name: "crud"}},
+				}},
+				Extends: []*ast.ExtendDecl{{
+					Name: "User",
+					Fields: []*ast.FieldDecl{
+						{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+					},
+				}},
+			},
+		},
+	}
+
+	src := generateSchemaFile(result, "app", nil)
+	code := string(src)
+
+	// Should register svc:batchLoad and svc:resolve APIs
+	if !strings.Contains(code, "svc:batchLoad:Post") {
+		t.Errorf("missing batchLoad API registration:\n%s", code)
+	}
+	if !strings.Contains(code, "svc:resolve:Post:userId") {
+		t.Errorf("missing resolve API registration:\n%s", code)
+	}
+}

@@ -372,3 +372,157 @@ func (r *ColumnarReader) ReadColumnBoolPtr() []*bool {
 	}
 	return result
 }
+
+// SkipColumnInt skips count int64 values without allocating.
+func (r *ColumnarReader) SkipColumnInt() {
+	for i := 0; i < r.count; i++ {
+		_, n := ReadSvarint(r.buf, r.off)
+		if n <= 0 {
+			r.err = fmt.Errorf("codec: truncated int column at record %d", i)
+			return
+		}
+		r.off += n
+	}
+}
+
+// SkipColumnFloat skips count float64 values without allocating.
+func (r *ColumnarReader) SkipColumnFloat() {
+	for i := 0; i < r.count; i++ {
+		if r.off+8 > len(r.buf) {
+			r.err = fmt.Errorf("codec: truncated float column at record %d", i)
+			return
+		}
+		r.off += 8
+	}
+}
+
+// SkipColumnString skips count length-prefixed strings without allocating.
+func (r *ColumnarReader) SkipColumnString() {
+	for i := 0; i < r.count; i++ {
+		_, n := ReadBytes(r.buf, r.off)
+		if n == 0 {
+			r.err = fmt.Errorf("codec: truncated string column at record %d", i)
+			return
+		}
+		r.off += n
+	}
+}
+
+// SkipColumnBool skips count boolean values without allocating.
+func (r *ColumnarReader) SkipColumnBool() {
+	for i := 0; i < r.count; i++ {
+		_, n := ReadBool(r.buf, r.off)
+		if n == 0 {
+			r.err = fmt.Errorf("codec: truncated bool column at record %d", i)
+			return
+		}
+		r.off += n
+	}
+}
+
+// SkipColumnIntPtr skips count nullable int64 values without allocating.
+func (r *ColumnarReader) SkipColumnIntPtr() {
+	for i := 0; i < r.count; i++ {
+		present, n := ReadNullable(r.buf, r.off)
+		if n == 0 {
+			r.err = fmt.Errorf("codec: truncated nullable at record %d", i)
+			return
+		}
+		r.off += n
+		if present {
+			_, sn := ReadSvarint(r.buf, r.off)
+			if sn <= 0 {
+				r.err = fmt.Errorf("codec: truncated int value at record %d", i)
+				return
+			}
+			r.off += sn
+		}
+	}
+}
+
+// SkipColumnFloatPtr skips count nullable float64 values without allocating.
+func (r *ColumnarReader) SkipColumnFloatPtr() {
+	for i := 0; i < r.count; i++ {
+		present, n := ReadNullable(r.buf, r.off)
+		if n == 0 {
+			r.err = fmt.Errorf("codec: truncated nullable at record %d", i)
+			return
+		}
+		r.off += n
+		if present {
+			if r.off+8 > len(r.buf) {
+				r.err = fmt.Errorf("codec: truncated float value at record %d", i)
+				return
+			}
+			r.off += 8
+		}
+	}
+}
+
+// SkipColumnStringPtr skips count nullable string values without allocating.
+func (r *ColumnarReader) SkipColumnStringPtr() {
+	for i := 0; i < r.count; i++ {
+		present, n := ReadNullable(r.buf, r.off)
+		if n == 0 {
+			r.err = fmt.Errorf("codec: truncated nullable at record %d", i)
+			return
+		}
+		r.off += n
+		if present {
+			_, sn := ReadBytes(r.buf, r.off)
+			if sn == 0 {
+				r.err = fmt.Errorf("codec: truncated string value at record %d", i)
+				return
+			}
+			r.off += sn
+		}
+	}
+}
+
+// SkipColumnBoolPtr skips count nullable bool values without allocating.
+func (r *ColumnarReader) SkipColumnBoolPtr() {
+	for i := 0; i < r.count; i++ {
+		present, n := ReadNullable(r.buf, r.off)
+		if n == 0 {
+			r.err = fmt.Errorf("codec: truncated nullable at record %d", i)
+			return
+		}
+		r.off += n
+		if present {
+			_, bn := ReadBool(r.buf, r.off)
+			if bn == 0 {
+				r.err = fmt.Errorf("codec: truncated bool value at record %d", i)
+				return
+			}
+			r.off += bn
+		}
+	}
+}
+
+// SkipColumnBytes skips count length-prefixed byte blobs without allocating.
+func (r *ColumnarReader) SkipColumnBytes() {
+	for i := 0; i < r.count; i++ {
+		_, n := ReadBytes(r.buf, r.off)
+		if n == 0 {
+			r.err = fmt.Errorf("codec: truncated bytes column at record %d", i)
+			return
+		}
+		r.off += n
+	}
+}
+
+// ReadColumnBytes reads count length-prefixed byte blobs from the current column.
+// Used for federated extend fields: each blob contains nested model/list binary data.
+func (r *ColumnarReader) ReadColumnBytes() [][]byte {
+	result := make([][]byte, 0, r.count)
+	for i := 0; i < r.count; i++ {
+		v, n := ReadBytes(r.buf, r.off)
+		if n == 0 {
+			r.err = fmt.Errorf("codec: truncated bytes column at record %d", i)
+			return nil
+		}
+		r.off += n
+		result = append(result, v)
+	}
+	return result
+}

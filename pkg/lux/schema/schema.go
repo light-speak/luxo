@@ -66,6 +66,10 @@ type Field struct {
 	Nullable bool      `json:"nullable,omitempty"`
 	IsList   bool      `json:"isList,omitempty"`
 	Relation bool      `json:"relation,omitempty"` // true if this is a relation field (not a DB column)
+	// Federation: which module defined this field (empty = same module as the model)
+	Module string `json:"module,omitempty"`
+	// Federation: FK field name for resolving cross-module relations (e.g. "userId")
+	ForeignKey string `json:"foreignKey,omitempty"`
 	// Pre-computed JSON prefix: `"name":` as bytes for zero-alloc writing
 	JSONPrefix []byte `json:"-"`
 }
@@ -188,6 +192,16 @@ func (m *Model) FieldByID(id int) *Field {
 // FieldByName returns a model field by its name.
 func (m *Model) FieldByName(name string) *Field {
 	return m.byName[name]
+}
+
+// HasExtendFields returns true if any field belongs to a different module.
+func (m *Model) HasExtendFields() bool {
+	for i := range m.Fields {
+		if m.Fields[i].Module != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // SelectToFieldMask converts a selection.Field list to a binary FieldMask.

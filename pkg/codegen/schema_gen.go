@@ -6,6 +6,7 @@ import (
 
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lux/schema"
+	"github.com/light-speak/luxo/pkg/lux/str"
 	"github.com/light-speak/luxo/pkg/semantic"
 )
 
@@ -23,18 +24,37 @@ type schemaAPIInfo struct {
 
 func generateSchemaFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
 	var models []*ast.ModelDecl
+	// Track which module owns each model
+	modelOwner := make(map[string]string)
 	for _, file := range result.Files {
+		modName := moduleNameFromFile(file.Name)
+		for _, m := range file.Models {
+			modelOwner[m.Name] = modName
+		}
 		models = append(models, file.Models...)
 	}
 
-	// Collect extend stubs (cross-module models)
+	// Collect extend stubs + build per-model extend field→module map
+	// extendFieldModules[modelName][fieldName] = sourceModule
+	extendFieldModules := make(map[string]map[string]string)
 	modelNames := make(map[string]bool)
 	for _, m := range models {
 		modelNames[m.Name] = true
 	}
 	var stubs []*ast.ModelDecl
 	for _, file := range result.Files {
+		modName := moduleNameFromFile(file.Name)
 		for _, ext := range file.Extends {
+			// Record extend field → module mapping (only cross-module)
+			owner := modelOwner[ext.Name]
+			if modName != owner {
+				if extendFieldModules[ext.Name] == nil {
+					extendFieldModules[ext.Name] = make(map[string]string)
+				}
+				for _, f := range ext.Fields {
+					extendFieldModules[ext.Name][f.Name] = modName
+				}
+			}
 			if !modelNames[ext.Name] {
 				stubs = append(stubs, &ast.ModelDecl{Name: ext.Name, Fields: ext.Fields})
 				modelNames[ext.Name] = true
@@ -42,38 +62,7 @@ func generateSchemaFile(result *semantic.Result, packageName string, enums map[s
 		}
 	}
 
-	var apis []schemaAPIInfo
-
-	for _, file := range result.Files {
-		modName := moduleNameFromFile(file.Name)
-		for _, m := range file.Models {
-			if !hasCrud(m) {
-				continue
-			}
-			for _, op := range crudOperations(m) {
-				apis = append(apis, buildCrudAPIInfo(m.Name, op, modName))
-			}
-		}
-		for _, api := range file.APIs {
-			apis = append(apis, schemaAPIInfo{
-				name:       api.Name,
-				moduleName: modName,
-				params:     api.Params,
-				returnType: api.ReturnType,
-				directives: api.Directives,
-			})
-		}
-		for _, fn := range file.Functions {
-			if hasDirective(fn.Directives, "service") {
-				apis = append(apis, schemaAPIInfo{
-					name:       "svc:" + fn.Name,
-					moduleName: modName,
-					params:     fn.Params,
-					returnType: fn.ReturnType,
-				})
-			}
-		}
-	}
+	apis := collectSchemaAPIs(result, enums, modelOwner)
 
 	if len(models) == 0 && len(stubs) == 0 && len(apis) == 0 {
 		return nil
@@ -90,7 +79,7 @@ func generateSchemaFile(result *semantic.Result, packageName string, enums map[s
 	// Register models
 	allModels := append(models, stubs...)
 	for _, m := range allModels {
-		writeModelRegistration(&b, m, enums)
+		writeModelRegistration(&b, m, enums, extendFieldModules[m.Name])
 	}
 
 	// Register APIs
@@ -111,6 +100,56 @@ func generateSchemaFile(result *semantic.Result, packageName string, enums map[s
 }
 
 // buildCrudAPIInfo constructs schemaAPIInfo for a single CRUD operation.
+// collectSchemaAPIs collects all API metadata (CRUD + compiled + service + batchLoad + resolve).
+func collectSchemaAPIs(result *semantic.Result, enums map[string]bool, modelOwner map[string]string) []schemaAPIInfo {
+	var apis []schemaAPIInfo
+	for _, file := range result.Files {
+		modName := moduleNameFromFile(file.Name)
+		for _, m := range file.Models {
+			if !hasCrud(m) {
+				continue
+			}
+			for _, op := range crudOperations(m) {
+				apis = append(apis, buildCrudAPIInfo(m.Name, op, modName))
+			}
+			apis = append(apis, schemaAPIInfo{
+				name: "svc:batchLoad:" + m.Name, moduleName: modName,
+				returnType: &ast.TypeRef{Name: m.Name, IsList: true},
+			})
+		}
+		for _, api := range file.APIs {
+			apis = append(apis, schemaAPIInfo{
+				name: api.Name, moduleName: modName,
+				params: api.Params, returnType: api.ReturnType, directives: api.Directives,
+			})
+		}
+		for _, fn := range file.Functions {
+			if hasDirective(fn.Directives, "service") {
+				apis = append(apis, schemaAPIInfo{
+					name: "svc:" + fn.Name, moduleName: modName,
+					params: fn.Params, returnType: fn.ReturnType,
+				})
+			}
+		}
+		for _, ext := range file.Extends {
+			if modelOwner[ext.Name] == modName {
+				continue
+			}
+			for _, f := range ext.Fields {
+				if f.Type == nil || !isRelationField(f, enums) {
+					continue
+				}
+				fk := inferForeignKey(&ast.ModelDecl{Name: ext.Name}, f, enums)
+				apis = append(apis, schemaAPIInfo{
+					name: "svc:resolve:" + f.Type.Name + ":" + fk, moduleName: modName,
+					returnType: &ast.TypeRef{Name: f.Type.Name, IsList: true},
+				})
+			}
+		}
+	}
+	return apis
+}
+
 func buildCrudAPIInfo(modelName, op, modName string) schemaAPIInfo {
 	apiName := crudAPIName(modelName, op)
 	ai := schemaAPIInfo{name: apiName, moduleName: modName}
@@ -135,7 +174,8 @@ func buildCrudAPIInfo(modelName, op, modName string) schemaAPIInfo {
 }
 
 // writeModelRegistration generates schema.RegisterModel for one model.
-func writeModelRegistration(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
+// extendModules maps fieldName → source module for extend fields.
+func writeModelRegistration(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool, extendModules map[string]string) {
 	name := m.Name
 	fmt.Fprintf(b, "\ts.RegisterModel(&schema.Model{\n")
 	fmt.Fprintf(b, "\t\tName: %q,\n", name)
@@ -148,18 +188,31 @@ func writeModelRegistration(b *strings.Builder, m *ast.ModelDecl, enums map[stri
 		if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
 			continue
 		}
-		if isRelationField(f, enums) {
-			continue
-		}
 
 		fieldID := getModelFieldID(name, f.Name)
 		if fieldID == 0 {
 			continue
 		}
 
-		fieldType := luxoTypeToSchemaType(f.Type.Name, enums)
-		fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, Nullable: %v},\n",
-			fieldID, f.Name, fieldType, f.Type.Nullable)
+		relation := isRelationField(f, enums)
+
+		// Scalar fields: write type info for Binary↔JSON
+		if !relation {
+			fieldType := luxoTypeToSchemaType(f.Type.Name, enums)
+			fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, Nullable: %v},\n",
+				fieldID, f.Name, fieldType, f.Type.Nullable)
+			continue
+		}
+
+		// Relation fields: include for federation (Module + ForeignKey)
+		fieldType := "FieldModel"
+		module := extendModules[f.Name]
+		fk := ""
+		if module != "" {
+			fk = inferForeignKey(m, f, enums)
+		}
+		fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, TypeName: %q, IsList: %v, Relation: true, Module: %q, ForeignKey: %q},\n",
+			fieldID, f.Name, fieldType, f.Type.Name, f.Type.IsList, module, fk)
 	}
 
 	fmt.Fprintf(b, "\t\t},\n")
@@ -276,24 +329,43 @@ func BuildSchemaJSON(result *semantic.Result, enums map[string]bool) ([]byte, er
 }
 
 func buildSchemaModels(s *schema.Schema, result *semantic.Result, enums map[string]bool) {
+	// Collect models and track which module owns each model
 	var models []*ast.ModelDecl
+	modelModule := make(map[string]string) // modelName → owning module
 	modelNames := make(map[string]bool)
 	for _, file := range result.Files {
+		modName := moduleNameFromFile(file.Name)
 		for _, m := range file.Models {
 			models = append(models, m)
 			modelNames[m.Name] = true
+			modelModule[m.Name] = modName
 		}
 	}
+
+	// Collect extend fields with their source module
+	// extendFields[modelName] = [{field, module}]
+	type extendFieldInfo struct {
+		field  *ast.FieldDecl
+		module string
+	}
+	extendFields := make(map[string][]extendFieldInfo)
 	for _, file := range result.Files {
+		modName := moduleNameFromFile(file.Name)
 		for _, ext := range file.Extends {
+			for _, f := range ext.Fields {
+				extendFields[ext.Name] = append(extendFields[ext.Name], extendFieldInfo{field: f, module: modName})
+			}
 			if !modelNames[ext.Name] {
+				// Cross-module stub — model defined in another module
 				models = append(models, &ast.ModelDecl{Name: ext.Name, Fields: ext.Fields})
 				modelNames[ext.Name] = true
 			}
 		}
 	}
+
 	for _, m := range models {
 		sm := &schema.Model{Name: m.Name}
+		ownerModule := modelModule[m.Name]
 		for _, f := range m.Fields {
 			if f.Type == nil || f.Computed != nil {
 				continue
@@ -301,7 +373,7 @@ func buildSchemaModels(s *schema.Schema, result *semantic.Result, enums map[stri
 			if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
 				continue
 			}
-			sm.Fields = append(sm.Fields, schema.Field{
+			sf := schema.Field{
 				ID:       getModelFieldID(m.Name, f.Name),
 				Name:     f.Name,
 				Type:     luxoTypeToSchemaFieldType(f.Type.Name, enums),
@@ -309,10 +381,36 @@ func buildSchemaModels(s *schema.Schema, result *semantic.Result, enums map[stri
 				Nullable: f.Type.Nullable,
 				IsList:   f.Type.IsList,
 				Relation: isRelationField(f, enums),
-			})
+			}
+			// Check if this field comes from an extend (different module)
+			for _, ef := range extendFields[m.Name] {
+				if ef.field.Name == f.Name && ef.module != ownerModule {
+					sf.Module = ef.module
+					sf.ForeignKey = inferForeignKey(m, f, enums)
+					break
+				}
+			}
+			sm.Fields = append(sm.Fields, sf)
 		}
 		s.RegisterModel(sm)
 	}
+}
+
+// inferForeignKey determines the FK field name for a relation field.
+// For hasMany: remoteKey = lowerFirst(modelName) + "Id" (e.g., User → "userId")
+// For belongsTo: localKey = lowerFirst(targetName) + "Id" (e.g., Post → "postId")
+func inferForeignKey(m *ast.ModelDecl, f *ast.FieldDecl, enums map[string]bool) string {
+	// Check explicit @by directive
+	byDir := findDirective(f.Directives, "by")
+	if byDir != nil {
+		remoteKey, _ := extractByArgs(byDir)
+		return remoteKey
+	}
+	// Auto-infer: hasMany → "{modelName}Id", belongsTo → "id"
+	if f.Type != nil && f.Type.IsList {
+		return str.LowerFirst(m.Name) + "Id"
+	}
+	return "id"
 }
 
 func buildSchemaAPIs(s *schema.Schema, result *semantic.Result, enums map[string]bool) {

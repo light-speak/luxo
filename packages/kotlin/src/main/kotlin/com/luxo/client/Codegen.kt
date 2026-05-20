@@ -122,6 +122,7 @@ object LuxoCodegen {
                 val kt = luxoTypeToKt(f.type)
                 appendLine("    var _${f.name}: $kt? = null")
             }
+            appendLine("    dec.skipArenaHeader()")
             appendLine("    while (dec.nextField()) {")
             appendLine("        when (dec.fieldID) {")
             for (f in m.fields) {
