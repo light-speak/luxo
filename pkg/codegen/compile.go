@@ -157,6 +157,7 @@ type compiler struct {
 	api         *ast.ApiDecl
 	vars        map[string]valType // variable name → resolved type
 	inAsync     bool               // true inside async { } — no return err
+	inForExpr   bool               // true inside for-as-expression with yield — yield compiles to return
 	paginate    bool               // true when API has @paginate
 	hasTotalVar bool               // true after _total is assigned (paginated query)
 }
@@ -617,9 +618,14 @@ func (c *compiler) compileBlockExpr(expr ast.Expr) string {
 		return c.compileForExpr(e)
 	case *ast.YieldExpr:
 		val := c.compileExpr(e.Value)
-		c.write("_yieldResult = %s\n", val)
-		c.write("break\n")
-		return "_yieldResult"
+		if c.inForExpr {
+			// Inside for-as-expression closure: yield → return value from closure
+			c.write("return %s", val)
+		} else {
+			c.write("_yieldResult = %s", val)
+			c.write("break")
+		}
+		return ""
 	default:
 		return fmt.Sprintf("/* TODO: %T */", expr)
 	}
@@ -1153,7 +1159,14 @@ func (c *compiler) compileWhereChain(b *strings.Builder, modelName string, args 
 // compileWhereArg compiles a where condition:
 // it.email == email → ModelWhere.Email.Eq(email)
 // email == email    → ModelWhere.Email.Eq(email) (legacy, both same name)
+// it.title.contains("x") → ModelWhere.Title.Match("x")  (@search field)
+// it.title.contains("x") → ModelWhere.Title.Like("%" + lux.EscapeLike("x") + "%")  (non-search)
 func (c *compiler) compileWhereArg(modelName string, expr ast.Expr) string {
+	// Handle method call conditions: it.field.contains/startsWith/endsWith(arg)
+	if result := c.compileWhereMethodCall(modelName, expr); result != "" {
+		return result
+	}
+
 	bin, ok := expr.(*ast.BinaryExpr)
 	if !ok {
 		return c.compileExpr(expr)
@@ -1200,6 +1213,71 @@ func (c *compiler) compileWhereArg(modelName string, expr ast.Expr) string {
 	}
 
 	return fmt.Sprintf("%sWhere.%s.%s(%s)", modelName, str.Capitalize(field), op, val)
+}
+
+// compileWhereMethodCall handles string method calls in where context:
+//
+//	it.title.contains("x")  → ModelWhere.Title.Match(x)   if @search
+//	it.title.contains("x")  → ModelWhere.Title.Like("%" + lux.EscapeLike(x) + "%")  otherwise
+//	it.name.startsWith("x") → ModelWhere.Name.Like(lux.EscapeLike(x) + "%")
+//	it.name.endsWith("x")   → ModelWhere.Name.Like("%" + lux.EscapeLike(x))
+//
+// Returns "" if expr is not a recognized method call pattern.
+func (c *compiler) compileWhereMethodCall(modelName string, expr ast.Expr) string {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok || len(call.Args) == 0 {
+		return ""
+	}
+	member, ok := call.Func.(*ast.MemberExpr)
+	if !ok {
+		return ""
+	}
+
+	method := member.Field
+	if method != "contains" && method != "startsWith" && method != "endsWith" {
+		return ""
+	}
+
+	// Extract field name from it.field.method(arg) pattern
+	innerMember, ok := member.Object.(*ast.MemberExpr)
+	if !ok {
+		return ""
+	}
+	if ident, ok := innerMember.Object.(*ast.Ident); !ok || ident.Name != "it" {
+		return ""
+	}
+	fieldName := innerMember.Field
+	argVal := c.compileExpr(call.Args[0].Value)
+
+	// Check if the field has @search directive
+	if method == "contains" && c.fieldHasSearch(modelName, fieldName) {
+		return fmt.Sprintf("%sWhere.%s.Match(%s)", modelName, str.Capitalize(fieldName), argVal)
+	}
+
+	// Non-search: generate LIKE conditions
+	switch method {
+	case "contains":
+		return fmt.Sprintf(`%sWhere.%s.Like("%%%%" + lux.EscapeLike(%s) + "%%%%")`, modelName, str.Capitalize(fieldName), argVal)
+	case "startsWith":
+		return fmt.Sprintf(`%sWhere.%s.Like(lux.EscapeLike(%s) + "%%%%")`, modelName, str.Capitalize(fieldName), argVal)
+	case "endsWith":
+		return fmt.Sprintf(`%sWhere.%s.Like("%%%%" + lux.EscapeLike(%s))`, modelName, str.Capitalize(fieldName), argVal)
+	}
+	return ""
+}
+
+// fieldHasSearch checks if a field on the given model has the @search directive.
+func (c *compiler) fieldHasSearch(modelName, fieldName string) bool {
+	m, ok := c.models[modelName]
+	if !ok {
+		return false
+	}
+	for _, f := range m.Fields {
+		if f.Name == fieldName {
+			return hasDirective(f.Directives, "search")
+		}
+	}
+	return false
 }
 
 // compileBinary: a + b, a == b, etc.
@@ -1658,16 +1736,98 @@ func (c *compiler) compileForRange(varName string, r *ast.RangeExpr, body *ast.B
 	c.write("}")
 }
 
-// compileForExpr: for as expression — collects results into a slice.
-// val doubled = for item in items { item * 2 } → []any{...}
+// containsYield walks an AST block and returns true if any YieldExpr is found.
+func containsYield(block *ast.Block) bool {
+	if block == nil {
+		return false
+	}
+	for _, stmt := range block.Stmts {
+		if containsYieldStmt(stmt) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsYieldStmt checks a single statement for yield expressions.
+func containsYieldStmt(stmt ast.Stmt) bool {
+	switch s := stmt.(type) {
+	case *ast.ExprStmt:
+		return containsYieldExpr(s.Expr)
+	case *ast.ValStmt:
+		return containsYieldExpr(s.Value)
+	case *ast.IfStmt:
+		if containsYield(s.Then) {
+			return true
+		}
+	case *ast.ForStmt:
+		if containsYield(s.Body) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsYieldExpr checks if an expression is or contains a yield.
+func containsYieldExpr(expr ast.Expr) bool {
+	if expr == nil {
+		return false
+	}
+	if _, ok := expr.(*ast.YieldExpr); ok {
+		return true
+	}
+	return false
+}
+
+// compileForExpr compiles a for-as-expression.
+// Two modes:
+//   - yield mode: for item in items { if cond { yield item } } → single nullable value
+//   - map mode: for item in items { item.id } → collect all into []any
 func (c *compiler) compileForExpr(s *ast.ForStmt) string {
+	if len(s.Body.Stmts) == 0 {
+		return "nil"
+	}
+
+	// Detect yield mode: body contains at least one YieldExpr
+	if containsYield(s.Body) {
+		return c.compileForExprYield(s)
+	}
+	return c.compileForExprCollect(s)
+}
+
+// compileForExprYield generates a closure returning the first yielded value (or nil).
+// val found = for item in items { if item.id == targetId { yield item } }
+// → func() any { for _, item := range items { if ... { return item } }; return nil }()
+func (c *compiler) compileForExprYield(s *ast.ForStmt) string {
+	sub := c.subCompiler()
+	sub.indent = c.indent + "\t\t"
+	sub.inForExpr = true
+
+	// Compile entire body — YieldExpr will emit "return <value>"
+	for _, stmt := range s.Body.Stmts {
+		sub.compileStmt(stmt)
+	}
+
+	if rangeExpr, ok := s.Collection.(*ast.RangeExpr); ok {
+		start := c.compileExpr(rangeExpr.Start)
+		end := c.compileExpr(rangeExpr.End)
+		return fmt.Sprintf("func() any {\n%s\tfor %s := int64(%s); %s <= %s; %s++ {\n%s%s\t}\n%s\treturn nil\n%s}()",
+			c.indent, s.VarName, start, s.VarName, end, s.VarName,
+			sub.b.String(), c.indent, c.indent, c.indent)
+	}
+
+	coll := c.compileExpr(s.Collection)
+	return fmt.Sprintf("func() any {\n%s\tfor _, %s := range %s {\n%s%s\t}\n%s\treturn nil\n%s}()",
+		c.indent, s.VarName, coll,
+		sub.b.String(), c.indent, c.indent, c.indent)
+}
+
+// compileForExprCollect generates a closure collecting all values into []any (map mode).
+// val ids = for user in users { user.id } → func() []any { ... }()
+func (c *compiler) compileForExprCollect(s *ast.ForStmt) string {
 	sub := c.subCompiler()
 	sub.indent = c.indent + "\t\t"
 
-	// The last statement in the body is the "yield" expression
-	if len(s.Body.Stmts) == 0 {
-		return "[]any{}"
-	}
 	// Compile all but last statement normally
 	for i := 0; i < len(s.Body.Stmts)-1; i++ {
 		sub.compileStmt(s.Body.Stmts[i])

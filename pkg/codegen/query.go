@@ -260,7 +260,7 @@ func generateWhereFields(b *strings.Builder, name string, fields []*ast.FieldDec
 			continue
 		}
 		goFieldName := str.Capitalize(f.Name)
-		condType := fieldConditionType(f.Type)
+		condType := fieldConditionTypeWithDirectives(f)
 		fmt.Fprintf(b, "\t%s lux.%s\n", goFieldName, condType)
 	}
 	b.WriteString("}{\n")
@@ -269,7 +269,7 @@ func generateWhereFields(b *strings.Builder, name string, fields []*ast.FieldDec
 			continue
 		}
 		col := str.ToSnakeCase(f.Name)
-		condType := fieldConditionType(f.Type)
+		condType := fieldConditionTypeWithDirectives(f)
 		fmt.Fprintf(b, "\t%s: lux.New%s(%q),\n", str.Capitalize(f.Name), condType, col)
 	}
 	b.WriteString("}\n\n")
@@ -297,6 +297,15 @@ func fieldConditionType(t *ast.TypeRef) string {
 	default:
 		return "StringField" // enum and others use string comparison
 	}
+}
+
+// fieldConditionTypeWithDirectives returns the condition type considering @search.
+// String fields with @search use SearchField for tsvector-backed full-text search.
+func fieldConditionTypeWithDirectives(f *ast.FieldDecl) string {
+	if f.Type != nil && f.Type.Name == "String" && hasDirective(f.Directives, "search") {
+		return "SearchField"
+	}
+	return fieldConditionType(f.Type)
 }
 
 // --- Create builder ---

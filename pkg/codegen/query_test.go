@@ -570,3 +570,71 @@ func TestGenerateExtendQueryBuilderFiltersRelations(t *testing.T) {
 		t.Fatalf("should not include single relation field 'profile', got:\n%s", got)
 	}
 }
+
+// ─── fieldConditionTypeWithDirectives ────────────────────────────────────────
+
+func TestFieldConditionTypeWithDirectives_SearchField(t *testing.T) {
+	f := &ast.FieldDecl{
+		Name:       "title",
+		Type:       &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{{Name: "search"}},
+	}
+	got := fieldConditionTypeWithDirectives(f)
+	if got != "SearchField" {
+		t.Errorf("expected SearchField, got %q", got)
+	}
+}
+
+func TestFieldConditionTypeWithDirectives_StringWithoutSearch(t *testing.T) {
+	f := &ast.FieldDecl{
+		Name: "name",
+		Type: &ast.TypeRef{Name: "String"},
+	}
+	got := fieldConditionTypeWithDirectives(f)
+	if got != "StringField" {
+		t.Errorf("expected StringField, got %q", got)
+	}
+}
+
+func TestFieldConditionTypeWithDirectives_IntField(t *testing.T) {
+	f := &ast.FieldDecl{
+		Name: "age",
+		Type: &ast.TypeRef{Name: "Int"},
+	}
+	got := fieldConditionTypeWithDirectives(f)
+	if got != "IntField" {
+		t.Errorf("expected IntField, got %q", got)
+	}
+}
+
+func TestFieldConditionTypeWithDirectives_NilType(t *testing.T) {
+	f := &ast.FieldDecl{Name: "unknown"}
+	got := fieldConditionTypeWithDirectives(f)
+	if got != "StringField" {
+		t.Errorf("expected StringField for nil type, got %q", got)
+	}
+}
+
+func TestGenerateWhereFieldsWithSearch(t *testing.T) {
+	fields := []*ast.FieldDecl{
+		{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+		{Name: "title", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "search"}}},
+		{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+	}
+
+	var b strings.Builder
+	generateWhereFields(&b, "Post", fields)
+	got := b.String()
+
+	// @search String field should use SearchField
+	if !strings.Contains(got, "Title lux.SearchField") {
+		t.Errorf("expected SearchField for @search field:\n%s", got)
+	}
+	if !strings.Contains(got, `Title: lux.NewSearchField("title")`) {
+		t.Errorf("expected NewSearchField constructor:\n%s", got)
+	}
+	// Non-search String field should remain StringField
+	if !strings.Contains(got, "Name lux.StringField") {
+		t.Errorf("expected StringField for non-search field:\n%s", got)
+	}
+}

@@ -8,8 +8,10 @@ import (
 	"log"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/codegen"
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
 )
@@ -5728,5 +5730,1041 @@ func TestLastSegmentEmpty(t *testing.T) {
 	got := lastSegment("")
 	if got != "" {
 		t.Errorf("lastSegment(%q) = %q, want %q", "", got, "")
+	}
+}
+
+// ========== File Watching Tests ==========
+
+func TestInitializedRegistersFileWatchers(t *testing.T) {
+	server, output := newTestServer()
+
+	err := server.handleMessage(&Request{Method: "initialized"})
+	if err != nil {
+		t.Fatalf("handleInitialized error: %v", err)
+	}
+
+	resp := output.String()
+	if !strings.Contains(resp, "client/registerCapability") {
+		t.Error("expected client/registerCapability notification")
+	}
+	if !strings.Contains(resp, "workspace/didChangeWatchedFiles") {
+		t.Error("expected didChangeWatchedFiles registration")
+	}
+	if !strings.Contains(resp, "**/*.gen.go") {
+		t.Error("expected *.gen.go glob pattern")
+	}
+	if !strings.Contains(resp, "**/*.luxo") {
+		t.Error("expected *.luxo glob pattern")
+	}
+}
+
+func TestDidChangeWatchedFilesTriggersReanalysis(t *testing.T) {
+	server, output := newTestServer()
+
+	// Open a document (openDoc resets the output buffer)
+	openDoc(server, output, "file:///test.luxo", "model User { name: String }")
+
+	// Simulate a watched file change event (e.g., after `luxo gen`)
+	params, _ := json.Marshal(DidChangeWatchedFilesParams{
+		Changes: []FileEvent{
+			{URI: "file:///service/user/luxo/model.gen.go", Type: 2},
+		},
+	})
+	err := server.handleMessage(&Request{
+		Method: "workspace/didChangeWatchedFiles",
+		Params: params,
+	})
+	if err != nil {
+		t.Fatalf("handleDidChangeWatchedFiles error: %v", err)
+	}
+
+	// Wait for debounced analysis to complete
+	// The debounce period is 100ms, give it some extra time
+	<-time.After(250 * time.Millisecond)
+
+	resp := output.String()
+	if !strings.Contains(resp, "publishDiagnostics") {
+		t.Error("expected diagnostics to be republished after watched file change")
+	}
+}
+
+func TestDidChangeWatchedFilesEmptyChanges(t *testing.T) {
+	server, output := newTestServer()
+
+	// Send empty changes — should be a no-op
+	params, _ := json.Marshal(DidChangeWatchedFilesParams{
+		Changes: []FileEvent{},
+	})
+	err := server.handleMessage(&Request{
+		Method: "workspace/didChangeWatchedFiles",
+		Params: params,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	resp := output.String()
+	if strings.Contains(resp, "publishDiagnostics") {
+		t.Error("did not expect diagnostics for empty file changes")
+	}
+}
+
+func TestDidChangeWatchedFilesInvalidParams(t *testing.T) {
+	server, _ := newTestServer()
+
+	err := server.handleMessage(&Request{
+		Method: "workspace/didChangeWatchedFiles",
+		Params: json.RawMessage(`{invalid`),
+	})
+	if err == nil {
+		t.Error("expected error for invalid params")
+	}
+}
+
+// ========== SQL Preview & Inferred API Hover Tests ==========
+
+func testModelWithFields() *ast.ModelDecl {
+	return &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "UUID"}},
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "age", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "active", Type: &ast.TypeRef{Name: "Boolean"}},
+			{Name: "score", Type: &ast.TypeRef{Name: "Float"}},
+		},
+	}
+}
+
+func testModelWithSoft() *ast.ModelDecl {
+	m := testModelWithFields()
+	m.Directives = []*ast.Directive{{Name: "soft"}}
+	return m
+}
+
+func testModelMap() map[string]*ast.ModelDecl {
+	return map[string]*ast.ModelDecl{"User": testModelWithFields()}
+}
+
+func TestSelectCols(t *testing.T) {
+	// Normal model with scalar fields
+	m := testModelWithFields()
+	cols := selectCols(m)
+	if cols == "" || cols == "*" {
+		t.Error("expected column names for model with fields")
+	}
+	if !strings.Contains(cols, "name") {
+		t.Error("expected 'name' in selectCols")
+	}
+	if !strings.Contains(cols, "email") {
+		t.Error("expected 'email' in selectCols")
+	}
+}
+
+func TestSelectColsEmpty(t *testing.T) {
+	m := &ast.ModelDecl{Name: "Empty"}
+	cols := selectCols(m)
+	if cols != "*" {
+		t.Errorf("expected '*' for empty model, got %q", cols)
+	}
+}
+
+func TestSelectColsSkipsComputed(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "M",
+		Fields: []*ast.FieldDecl{
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "fullName", Type: &ast.TypeRef{Name: "String"}, Computed: &ast.ComputedField{}},
+		},
+	}
+	cols := selectCols(m)
+	if strings.Contains(cols, "full_name") {
+		t.Error("computed fields should be skipped")
+	}
+}
+
+func TestSelectColsSkipsList(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "M",
+		Fields: []*ast.FieldDecl{
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "tags", Type: &ast.TypeRef{Name: "Tag", IsList: true}},
+		},
+	}
+	cols := selectCols(m)
+	if strings.Contains(cols, "tags") {
+		t.Error("list fields should be skipped")
+	}
+}
+
+func TestSelectColsMoreThan5(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "M",
+		Fields: []*ast.FieldDecl{
+			{Name: "a", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "b", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "c", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "d", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "e", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "f", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}
+	cols := selectCols(m)
+	if !strings.HasSuffix(cols, ", ...") {
+		t.Errorf("expected '...' suffix for >5 cols, got %q", cols)
+	}
+}
+
+func TestSelectColsSkipsNonBuiltinRelation(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "M",
+		Fields: []*ast.FieldDecl{
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "author", Type: &ast.TypeRef{Name: "User"}}, // relation, not builtin
+		},
+	}
+	cols := selectCols(m)
+	if strings.Contains(cols, "author") {
+		t.Error("relation fields should be skipped")
+	}
+}
+
+func TestFieldTypeStr(t *testing.T) {
+	m := testModelWithFields()
+	if got := fieldTypeStr(m, "email"); got != "String" {
+		t.Errorf("expected String, got %q", got)
+	}
+	if got := fieldTypeStr(m, "age"); got != "Int" {
+		t.Errorf("expected Int, got %q", got)
+	}
+	// Unknown field returns "String" default
+	if got := fieldTypeStr(m, "unknown"); got != "String" {
+		t.Errorf("expected default String, got %q", got)
+	}
+}
+
+func TestFieldTypeStrNilType(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "M",
+		Fields: []*ast.FieldDecl{
+			{Name: "broken", Type: nil},
+		},
+	}
+	if got := fieldTypeStr(m, "broken"); got != "String" {
+		t.Errorf("expected default String for nil type, got %q", got)
+	}
+}
+
+func TestBuildSQLPreviewGet(t *testing.T) {
+	models := testModelMap()
+	inf := &codegen.InferredAPI{
+		Action:    "get",
+		ModelName: "User",
+		Groups: []codegen.ClauseGroup{
+			{Clauses: []codegen.InferClause{{Field: "email", Op: "eq"}}},
+		},
+	}
+	result := buildSQLPreview(inf, models)
+	if result == "" {
+		t.Fatal("expected non-empty SQL preview")
+	}
+	if !strings.Contains(result, "SELECT") {
+		t.Error("expected SELECT in get preview")
+	}
+	if !strings.Contains(result, "LIMIT 1") {
+		t.Error("expected LIMIT 1 in get preview")
+	}
+	if !strings.Contains(result, "email = $1") {
+		t.Error("expected email = $1 in WHERE clause")
+	}
+}
+
+func TestBuildSQLPreviewList(t *testing.T) {
+	models := testModelMap()
+	inf := &codegen.InferredAPI{
+		Action:    "list",
+		ModelName: "User",
+		Groups:    []codegen.ClauseGroup{},
+	}
+	result := buildSQLPreview(inf, models)
+	if !strings.Contains(result, "LIMIT $N OFFSET $M") {
+		t.Error("expected pagination in list preview")
+	}
+	if !strings.Contains(result, "COUNT(*)") {
+		t.Error("expected COUNT(*) comment for pagination")
+	}
+}
+
+func TestBuildSQLPreviewListWithOrderBy(t *testing.T) {
+	models := testModelMap()
+	inf := &codegen.InferredAPI{
+		Action:    "list",
+		ModelName: "User",
+		OrderBy:   "createdAt",
+		OrderDesc: true,
+	}
+	result := buildSQLPreview(inf, models)
+	if !strings.Contains(result, "ORDER BY") {
+		t.Error("expected ORDER BY")
+	}
+	if !strings.Contains(result, "DESC") {
+		t.Error("expected DESC")
+	}
+}
+
+func TestBuildSQLPreviewListWithOrderByAsc(t *testing.T) {
+	models := testModelMap()
+	inf := &codegen.InferredAPI{
+		Action:    "list",
+		ModelName: "User",
+		OrderBy:   "name",
+		OrderDesc: false,
+	}
+	result := buildSQLPreview(inf, models)
+	if !strings.Contains(result, "ASC") {
+		t.Error("expected ASC")
+	}
+}
+
+func TestBuildSQLPreviewListWithTopN(t *testing.T) {
+	models := testModelMap()
+	inf := &codegen.InferredAPI{
+		Action:    "list",
+		ModelName: "User",
+		TopN:      10,
+	}
+	result := buildSQLPreview(inf, models)
+	if !strings.Contains(result, "LIMIT 10") {
+		t.Error("expected LIMIT 10")
+	}
+}
+
+func TestBuildSQLPreviewCount(t *testing.T) {
+	models := testModelMap()
+	inf := &codegen.InferredAPI{
+		Action:    "count",
+		ModelName: "User",
+		Groups: []codegen.ClauseGroup{
+			{Clauses: []codegen.InferClause{{Field: "active", Op: "true"}}},
+		},
+	}
+	result := buildSQLPreview(inf, models)
+	if !strings.Contains(result, "SELECT COUNT(*)") {
+		t.Error("expected COUNT(*)")
+	}
+	if !strings.Contains(result, "active = true") {
+		t.Error("expected active = true")
+	}
+}
+
+func TestBuildSQLPreviewExists(t *testing.T) {
+	models := testModelMap()
+	inf := &codegen.InferredAPI{
+		Action:    "exists",
+		ModelName: "User",
+		Groups: []codegen.ClauseGroup{
+			{Clauses: []codegen.InferClause{{Field: "email", Op: "eq"}}},
+		},
+	}
+	result := buildSQLPreview(inf, models)
+	if !strings.Contains(result, "SELECT EXISTS") {
+		t.Error("expected EXISTS")
+	}
+	if !strings.Contains(result, "LIMIT 1") {
+		t.Error("expected LIMIT 1 in EXISTS")
+	}
+}
+
+func TestBuildSQLPreviewDeleteHard(t *testing.T) {
+	models := testModelMap()
+	inf := &codegen.InferredAPI{
+		Action:    "delete",
+		ModelName: "User",
+		Groups: []codegen.ClauseGroup{
+			{Clauses: []codegen.InferClause{{Field: "id", Op: "eq"}}},
+		},
+	}
+	result := buildSQLPreview(inf, models)
+	if !strings.Contains(result, "DELETE FROM") {
+		t.Error("expected DELETE FROM")
+	}
+}
+
+func TestBuildSQLPreviewDeleteSoft(t *testing.T) {
+	softModel := testModelWithSoft()
+	models := map[string]*ast.ModelDecl{"User": softModel}
+	inf := &codegen.InferredAPI{
+		Action:    "delete",
+		ModelName: "User",
+		Groups: []codegen.ClauseGroup{
+			{Clauses: []codegen.InferClause{{Field: "id", Op: "eq"}}},
+		},
+	}
+	result := buildSQLPreview(inf, models)
+	if !strings.Contains(result, "UPDATE") {
+		t.Error("expected UPDATE for soft delete")
+	}
+	if !strings.Contains(result, "SET deleted_at = NOW()") {
+		t.Error("expected SET deleted_at = NOW()")
+	}
+}
+
+func TestBuildSQLPreviewSoftDeletedAt(t *testing.T) {
+	softModel := testModelWithSoft()
+	models := map[string]*ast.ModelDecl{"User": softModel}
+	inf := &codegen.InferredAPI{
+		Action:    "get",
+		ModelName: "User",
+		Groups: []codegen.ClauseGroup{
+			{Clauses: []codegen.InferClause{{Field: "email", Op: "eq"}}},
+		},
+	}
+	result := buildSQLPreview(inf, models)
+	if !strings.Contains(result, "deleted_at IS NULL") {
+		t.Error("expected deleted_at IS NULL for @soft model")
+	}
+}
+
+func TestBuildSQLPreviewUnknownModel(t *testing.T) {
+	models := testModelMap()
+	inf := &codegen.InferredAPI{Action: "get", ModelName: "Unknown"}
+	result := buildSQLPreview(inf, models)
+	if result != "" {
+		t.Errorf("expected empty for unknown model, got %q", result)
+	}
+}
+
+func TestBuildSQLPreviewParameters(t *testing.T) {
+	models := testModelMap()
+	inf := &codegen.InferredAPI{
+		Action:    "get",
+		ModelName: "User",
+		Groups: []codegen.ClauseGroup{
+			{Clauses: []codegen.InferClause{
+				{Field: "email", Op: "eq"},
+				{Field: "name", Op: "containing"},
+			}},
+		},
+	}
+	result := buildSQLPreview(inf, models)
+	if !strings.Contains(result, "**Parameters:**") {
+		t.Error("expected Parameters section")
+	}
+	if !strings.Contains(result, "$1") {
+		t.Error("expected $1 parameter")
+	}
+	if !strings.Contains(result, "$2") {
+		t.Error("expected $2 parameter")
+	}
+}
+
+func TestBuildSQLPreviewBetweenParameter(t *testing.T) {
+	models := testModelMap()
+	inf := &codegen.InferredAPI{
+		Action:    "list",
+		ModelName: "User",
+		Groups: []codegen.ClauseGroup{
+			{Clauses: []codegen.InferClause{
+				{Field: "age", Op: "between"},
+			}},
+		},
+	}
+	result := buildSQLPreview(inf, models)
+	if !strings.Contains(result, "(from)") {
+		t.Error("expected (from) for between parameter")
+	}
+	if !strings.Contains(result, "(to)") {
+		t.Error("expected (to) for between parameter")
+	}
+}
+
+func TestBuildSQLPreviewTrueParam(t *testing.T) {
+	models := testModelMap()
+	inf := &codegen.InferredAPI{
+		Action:    "count",
+		ModelName: "User",
+		Groups: []codegen.ClauseGroup{
+			{Clauses: []codegen.InferClause{{Field: "active", Op: "true"}}},
+		},
+	}
+	result := buildSQLPreview(inf, models)
+	// true/false/isNull/isNotNull don't increment param index, but the section may still appear
+	if !strings.Contains(result, "active = true") {
+		t.Error("expected active = true in clause preview")
+	}
+}
+
+func TestBuildSQLPreviewOrGroups(t *testing.T) {
+	models := testModelMap()
+	inf := &codegen.InferredAPI{
+		Action:    "get",
+		ModelName: "User",
+		Groups: []codegen.ClauseGroup{
+			{Clauses: []codegen.InferClause{{Field: "email", Op: "eq"}}},
+			{Clauses: []codegen.InferClause{{Field: "name", Op: "eq"}}},
+		},
+	}
+	result := buildSQLPreview(inf, models)
+	if !strings.Contains(result, "OR") {
+		t.Error("expected OR in WHERE clause for multiple groups")
+	}
+}
+
+func TestBuildSQLPreviewNoGroups(t *testing.T) {
+	models := testModelMap()
+	inf := &codegen.InferredAPI{
+		Action:    "get",
+		ModelName: "User",
+		Groups:    []codegen.ClauseGroup{},
+	}
+	result := buildSQLPreview(inf, models)
+	// No WHERE when no groups and no @soft
+	if strings.Contains(result, "WHERE") {
+		t.Error("expected no WHERE clause when no groups and no @soft")
+	}
+}
+
+func TestBuildSQLPreviewSoftNoGroups(t *testing.T) {
+	softModel := testModelWithSoft()
+	models := map[string]*ast.ModelDecl{"User": softModel}
+	inf := &codegen.InferredAPI{
+		Action:    "list",
+		ModelName: "User",
+		Groups:    []codegen.ClauseGroup{},
+	}
+	result := buildSQLPreview(inf, models)
+	if !strings.Contains(result, "WHERE deleted_at IS NULL") {
+		t.Error("expected WHERE deleted_at IS NULL for @soft with no groups")
+	}
+}
+
+// ========== writeClausePreview Tests ==========
+
+func TestWriteClausePreviewAllOps(t *testing.T) {
+	ops := []struct {
+		op       string
+		expected string
+	}{
+		{"eq", "= $1"},
+		{"ne", "!= $1"},
+		{"gt", "> $1"},
+		{"gte", ">= $1"},
+		{"lt", "< $1"},
+		{"lte", "<= $1"},
+		{"containing", "LIKE"},
+		{"startswith", "LIKE $1"},
+		{"endswith", "LIKE '%'"},
+		{"between", "BETWEEN $1 AND $2"},
+		{"in", "IN ($1...)"},
+		{"notIn", "NOT IN ($1...)"},
+		{"true", "= true"},
+		{"false", "= false"},
+		{"isNull", "IS NULL"},
+		{"isNotNull", "IS NOT NULL"},
+		{"ignoreCase", "ILIKE $1"},
+		{"unknownOp", "= $1"}, // default case
+	}
+
+	for _, tc := range ops {
+		var b strings.Builder
+		idx := 1
+		writeClausePreview(&b, codegen.InferClause{Field: "email", Op: tc.op}, &idx)
+		result := b.String()
+		if !strings.Contains(result, tc.expected) {
+			t.Errorf("op=%q: expected %q in %q", tc.op, tc.expected, result)
+		}
+	}
+}
+
+// ========== resolveInferredAPIHover Tests ==========
+
+func TestResolveInferredAPIHoverNoFile(t *testing.T) {
+	server, _ := newTestServer()
+	doc := &Document{Content: "api getUserByEmail", URI: "test.luxo"}
+	result := server.resolveInferredAPIHover(doc, "getUserByEmail", Position{Line: 0, Character: 5})
+	if result != "" {
+		t.Error("expected empty for nil File")
+	}
+}
+
+func TestResolveInferredAPIHoverNonAPILine(t *testing.T) {
+	server, _ := newTestServer()
+	doc := &Document{
+		Content: "model User { name: String }",
+		URI:     "test.luxo",
+		File:    &ast.File{},
+	}
+	result := server.resolveInferredAPIHover(doc, "User", Position{Line: 0, Character: 6})
+	if result != "" {
+		t.Error("expected empty for non-api line")
+	}
+}
+
+func TestResolveInferredAPIHoverLineOutOfRange(t *testing.T) {
+	server, _ := newTestServer()
+	doc := &Document{
+		Content: "api getUserByEmail",
+		URI:     "test.luxo",
+		File:    &ast.File{},
+	}
+	result := server.resolveInferredAPIHover(doc, "getUserByEmail", Position{Line: 5, Character: 5})
+	if result != "" {
+		t.Error("expected empty for out-of-range line")
+	}
+}
+
+func TestResolveInferredAPIHoverAPIWithParams(t *testing.T) {
+	server, _ := newTestServer()
+	doc := &Document{
+		Content: "api getUserByEmail(email: String): User",
+		URI:     "test.luxo",
+		File:    &ast.File{},
+	}
+	result := server.resolveInferredAPIHover(doc, "getUserByEmail", Position{Line: 0, Character: 5})
+	if result != "" {
+		t.Error("expected empty for api with params")
+	}
+}
+
+func TestResolveInferredAPIHoverWordMismatch(t *testing.T) {
+	server, _ := newTestServer()
+	doc := &Document{
+		Content: "api getUserByEmail",
+		URI:     "test.luxo",
+		File:    &ast.File{},
+	}
+	result := server.resolveInferredAPIHover(doc, "otherWord", Position{Line: 0, Character: 5})
+	if result != "" {
+		t.Error("expected empty for word mismatch")
+	}
+}
+
+func TestResolveInferredAPIHoverNoModels(t *testing.T) {
+	server, _ := newTestServer()
+	doc := &Document{
+		Content: "api getUserByEmail",
+		URI:     "test.luxo",
+		File:    &ast.File{},
+	}
+	result := server.resolveInferredAPIHover(doc, "getUserByEmail", Position{Line: 0, Character: 5})
+	if result != "" {
+		t.Error("expected empty when no models")
+	}
+}
+
+func TestResolveInferredAPIHoverSuccess(t *testing.T) {
+	server, _ := newTestServer()
+	userModel := testModelWithFields()
+	doc := &Document{
+		Content: "api getUserByEmail",
+		URI:     "test.luxo",
+		File:    &ast.File{Models: []*ast.ModelDecl{userModel}},
+	}
+	result := server.resolveInferredAPIHover(doc, "getUserByEmail", Position{Line: 0, Character: 5})
+	if result == "" {
+		t.Error("expected SQL preview for valid inferred API hover")
+	}
+	if !strings.Contains(result, "SELECT") {
+		t.Error("expected SELECT in hover preview")
+	}
+}
+
+func TestResolveInferredAPIHoverFromResult(t *testing.T) {
+	server, _ := newTestServer()
+	userModel := testModelWithFields()
+	a := semantic.New()
+	file := &ast.File{Models: []*ast.ModelDecl{userModel}}
+	semResult := a.AnalyzeWithModules([]*ast.File{file})
+	doc := &Document{
+		Content: "api getUserByEmail",
+		URI:     "test.luxo",
+		File:    &ast.File{},
+		Result:  semResult,
+	}
+	result := server.resolveInferredAPIHover(doc, "getUserByEmail", Position{Line: 0, Character: 5})
+	if result == "" {
+		t.Error("expected SQL preview from Result models")
+	}
+}
+
+func TestResolveInferredAPIHoverUnresolvable(t *testing.T) {
+	server, _ := newTestServer()
+	// Model named "Post" but API references "User"
+	postModel := &ast.ModelDecl{
+		Name: "Post",
+		Fields: []*ast.FieldDecl{
+			{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}
+	doc := &Document{
+		Content: "api getUserByEmail",
+		URI:     "test.luxo",
+		File:    &ast.File{Models: []*ast.ModelDecl{postModel}},
+	}
+	result := server.resolveInferredAPIHover(doc, "getUserByEmail", Position{Line: 0, Character: 5})
+	if result != "" {
+		t.Error("expected empty for unresolvable API (no User model)")
+	}
+}
+
+// ========== getInferredAPICompletions Tests ==========
+
+func TestGetInferredAPICompletionsBasic(t *testing.T) {
+	server, _ := newTestServer()
+	userModel := testModelWithFields()
+	doc := &Document{
+		Content: "api get",
+		URI:     "test.luxo",
+		File:    &ast.File{Models: []*ast.ModelDecl{userModel}},
+	}
+	items := server.getInferredAPICompletions(doc, Position{Line: 0, Character: 7}, "get")
+	if len(items) == 0 {
+		t.Fatal("expected completions for 'api get'")
+	}
+}
+
+func TestGetInferredAPICompletionsNonAPILine(t *testing.T) {
+	server, _ := newTestServer()
+	doc := &Document{
+		Content: "model User { name: String }",
+		URI:     "test.luxo",
+		File:    &ast.File{},
+	}
+	items := server.getInferredAPICompletions(doc, Position{Line: 0, Character: 6}, "User")
+	if len(items) != 0 {
+		t.Error("expected no completions for non-api line")
+	}
+}
+
+func TestGetInferredAPICompletionsOutOfRange(t *testing.T) {
+	server, _ := newTestServer()
+	doc := &Document{
+		Content: "api get",
+		URI:     "test.luxo",
+		File:    &ast.File{},
+	}
+	items := server.getInferredAPICompletions(doc, Position{Line: 5, Character: 0}, "get")
+	if items != nil {
+		t.Error("expected nil for out-of-range line")
+	}
+}
+
+func TestGetInferredAPICompletionsNoModels(t *testing.T) {
+	server, _ := newTestServer()
+	doc := &Document{
+		Content: "api get",
+		URI:     "test.luxo",
+		File:    &ast.File{},
+	}
+	items := server.getInferredAPICompletions(doc, Position{Line: 0, Character: 7}, "get")
+	if items != nil {
+		t.Error("expected nil when no models")
+	}
+}
+
+func TestGetInferredAPICompletionsFromResult(t *testing.T) {
+	server, _ := newTestServer()
+	userModel := testModelWithFields()
+	a := semantic.New()
+	file := &ast.File{Models: []*ast.ModelDecl{userModel}}
+	semResult := a.AnalyzeWithModules([]*ast.File{file})
+	doc := &Document{
+		Content: "api get",
+		URI:     "test.luxo",
+		File:    &ast.File{},
+		Result:  semResult,
+	}
+	items := server.getInferredAPICompletions(doc, Position{Line: 0, Character: 7}, "get")
+	if len(items) == 0 {
+		t.Fatal("expected completions from Result models")
+	}
+}
+
+func TestGetInferredAPICompletionsWithEnums(t *testing.T) {
+	server, _ := newTestServer()
+	doc := &Document{
+		Content: "api get",
+		URI:     "test.luxo",
+		File: &ast.File{
+			Models: []*ast.ModelDecl{{
+				Name: "User",
+				Fields: []*ast.FieldDecl{
+					{Name: "role", Type: &ast.TypeRef{Name: "Role"}},
+				},
+			}},
+			Enums: []*ast.EnumDecl{{Name: "Role"}},
+		},
+	}
+	items := server.getInferredAPICompletions(doc, Position{Line: 0, Character: 7}, "get")
+	if len(items) == 0 {
+		t.Fatal("expected completions with enum fields")
+	}
+	// Role field should appear since "Role" is in enumNames
+	hasRole := false
+	for _, item := range items {
+		if strings.Contains(item.Label, "Role") {
+			hasRole = true
+		}
+	}
+	if !hasRole {
+		t.Error("expected Role field in completions")
+	}
+}
+
+func TestGetInferredAPICompletionsDeduplicateModels(t *testing.T) {
+	server, _ := newTestServer()
+	userModel := testModelWithFields()
+	a := semantic.New()
+	file := &ast.File{Models: []*ast.ModelDecl{userModel}}
+	semResult := a.AnalyzeWithModules([]*ast.File{file})
+	doc := &Document{
+		Content: "api get",
+		URI:     "test.luxo",
+		File:    &ast.File{Models: []*ast.ModelDecl{userModel}},
+		Result:  semResult,
+	}
+	items := server.getInferredAPICompletions(doc, Position{Line: 0, Character: 7}, "get")
+	// Count items matching "getUserBy" — should not be doubled
+	count := 0
+	for _, item := range items {
+		if item.Label == "getUserByName" {
+			count++
+		}
+	}
+	if count > 1 {
+		t.Errorf("expected at most 1 getUserByName, got %d (dedup failed)", count)
+	}
+}
+
+// ========== collectQueryableFields Tests ==========
+
+func TestCollectQueryableFieldsWithDirectives(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{
+				Name: "email",
+				Type: &ast.TypeRef{Name: "String"},
+				Directives: []*ast.Directive{
+					{Name: "filterable"},
+					{Name: "sortable"},
+					{Name: "search"},
+				},
+			},
+		},
+	}
+	fields := collectQueryableFields(m, map[string]bool{})
+	if len(fields) == 0 {
+		t.Fatal("expected fields")
+	}
+	var emailField fieldMeta
+	for _, f := range fields {
+		if f.name == "email" {
+			emailField = f
+			break
+		}
+	}
+	if !emailField.filterable {
+		t.Error("expected filterable")
+	}
+	if !emailField.sortable {
+		t.Error("expected sortable")
+	}
+	if !emailField.searchable {
+		t.Error("expected searchable")
+	}
+}
+
+func TestCollectQueryableFieldsWithEnum(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "role", Type: &ast.TypeRef{Name: "Role"}},
+			{Name: "profile", Type: &ast.TypeRef{Name: "Profile"}}, // not enum, not builtin → skip
+		},
+	}
+	fields := collectQueryableFields(m, map[string]bool{"Role": true})
+	hasRole := false
+	hasProfile := false
+	for _, f := range fields {
+		if f.name == "role" {
+			hasRole = true
+		}
+		if f.name == "profile" {
+			hasProfile = true
+		}
+	}
+	if !hasRole {
+		t.Error("expected role (enum) in queryable fields")
+	}
+	if hasProfile {
+		t.Error("expected profile (non-builtin, non-enum) to be skipped")
+	}
+}
+
+func TestCollectQueryableFieldsNullable(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "bio", Type: &ast.TypeRef{Name: "String", Nullable: true}},
+		},
+	}
+	fields := collectQueryableFields(m, map[string]bool{})
+	hasBio := false
+	for _, f := range fields {
+		if f.name == "bio" {
+			hasBio = true
+			if !f.nullable {
+				t.Error("expected nullable=true for bio")
+			}
+		}
+	}
+	if !hasBio {
+		t.Error("expected bio in fields")
+	}
+}
+
+func TestCollectQueryableFieldsSkipsNilType(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "M",
+		Fields: []*ast.FieldDecl{
+			{Name: "broken", Type: nil},
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}
+	fields := collectQueryableFields(m, map[string]bool{})
+	for _, f := range fields {
+		if f.name == "broken" {
+			t.Error("expected nil-type field to be skipped")
+		}
+	}
+}
+
+func TestCollectQueryableFieldsSkipsComputed(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "M",
+		Fields: []*ast.FieldDecl{
+			{Name: "fullName", Type: &ast.TypeRef{Name: "String"}, Computed: &ast.ComputedField{}},
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}
+	fields := collectQueryableFields(m, map[string]bool{})
+	for _, f := range fields {
+		if f.name == "fullName" {
+			t.Error("expected computed field to be skipped")
+		}
+	}
+}
+
+// ========== Small Utility Function Tests ==========
+
+func TestCapitalizeEmpty(t *testing.T) {
+	if got := capitalize(""); got != "" {
+		t.Errorf("expected empty, got %q", got)
+	}
+}
+
+func TestIsBuiltinTypeAll(t *testing.T) {
+	builtins := []string{"Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes"}
+	for _, b := range builtins {
+		if !isBuiltinType(b) {
+			t.Errorf("expected %q to be builtin", b)
+		}
+	}
+	nonBuiltins := []string{"User", "Role", "Custom", ""}
+	for _, nb := range nonBuiltins {
+		if isBuiltinType(nb) {
+			t.Errorf("expected %q to NOT be builtin", nb)
+		}
+	}
+}
+
+func TestInferPluralSuffix(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"Category", "Categories"},
+		{"User", "Users"},
+		{"Address", "Addresses"},
+		{"Box", "Boxes"},
+		{"Quiz", "Quizes"},
+	}
+	for _, tc := range cases {
+		if got := inferPlural(tc.in); got != tc.want {
+			t.Errorf("inferPlural(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// ========== resolveHover additional branch Tests ==========
+
+func TestResolveHoverInferredAPITakesPrecedence(t *testing.T) {
+	server, _ := newTestServer()
+	userModel := testModelWithFields()
+	doc := &Document{
+		Content: "api getUserByEmail",
+		URI:     "test.luxo",
+		File:    &ast.File{Models: []*ast.ModelDecl{userModel}},
+		Tokens:  []token.Token{},
+	}
+	result := server.resolveHover(doc, "getUserByEmail", Position{Line: 0, Character: 10})
+	if result == "" {
+		t.Error("expected hover for inferred API")
+	}
+	if !strings.Contains(result, "SELECT") {
+		t.Error("expected SQL preview in hover result")
+	}
+}
+
+// ========== Additional buildContinuations branch Tests ==========
+
+func TestBuildContinuationsMidTypingField(t *testing.T) {
+	fields := []fieldMeta{
+		{name: "email", typeName: "String"},
+		{name: "name", typeName: "String"},
+	}
+	// User typed "Em" after "By" — should match "Email"
+	items := buildContinuations("getUserBy", "Em", fields)
+	hasEmail := false
+	for _, item := range items {
+		if strings.Contains(item.Label, "Email") {
+			hasEmail = true
+		}
+	}
+	if !hasEmail {
+		t.Error("expected Email suggestion while mid-typing 'Em'")
+	}
+}
+
+func TestDidChangeWatchedFilesMarksSiblingsDirty(t *testing.T) {
+	server, output := newTestServer()
+
+	// Open a document so there's something to re-analyze
+	openDoc(server, output, "file:///origin/test.luxo", "model User { name: String }")
+
+	// Verify sibling cache is clean after initial analysis
+	server.docs.mu.RLock()
+	dirtyBefore := server.docs.siblingDirty
+	server.docs.mu.RUnlock()
+	if dirtyBefore {
+		t.Error("expected siblingDirty=false after initial open")
+	}
+
+	// Send a .luxo file creation event
+	params, _ := json.Marshal(DidChangeWatchedFilesParams{
+		Changes: []FileEvent{
+			{URI: "file:///origin/new_model.luxo", Type: 1}, // Created
+		},
+	})
+	server.handleMessage(&Request{
+		Method: "workspace/didChangeWatchedFiles",
+		Params: params,
+	})
+
+	// siblingDirty should be true immediately (before debounce fires)
+	server.docs.mu.RLock()
+	dirtyAfter := server.docs.siblingDirty
+	server.docs.mu.RUnlock()
+	if !dirtyAfter {
+		t.Error("expected siblingDirty=true after watched file change")
 	}
 }

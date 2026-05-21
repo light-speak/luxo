@@ -424,6 +424,7 @@ func TestExtractIDColumn_AllColumnTypes(t *testing.T) {
 	// Columnar with float, bool, nullable string cols before id
 	var buf []byte
 	buf = codec.AppendVarint(buf, 2) // count = 2
+	buf = codec.AppendVarint(buf, 0) // totalStringLen = 0 (no arena)
 	// col 2: float
 	buf = codec.AppendVarint(buf, 2)
 	buf = codec.AppendFixed64(buf, 1.0)
@@ -485,6 +486,7 @@ func TestExtractIDColumn_SkipError(t *testing.T) {
 	// Columnar with truncated float column → skipColumnarColumn errors
 	var buf []byte
 	buf = codec.AppendVarint(buf, 1) // count=1
+	buf = codec.AppendVarint(buf, 0) // totalStringLen = 0 (no arena)
 	buf = codec.AppendVarint(buf, 2) // fieldID=2 (float)
 	buf = append(buf, 0x01, 0x02)    // only 2 bytes, float needs 8
 
@@ -506,6 +508,7 @@ func TestSkipColumnarColumn_DurationAndDateTimeNullable(t *testing.T) {
 	// Duration and DateTime nullable columns
 	var buf []byte
 	buf = codec.AppendVarint(buf, 1) // count=1
+	buf = codec.AppendVarint(buf, 0) // totalStringLen = 0 (no arena)
 	// col 2: nullable DateTime
 	buf = codec.AppendVarint(buf, 2)
 	buf = codec.AppendNull(buf)
@@ -554,6 +557,7 @@ func TestSkipColumnarColumn_AllTypes(t *testing.T) {
 	// Build columnar with every type, id at the end
 	var buf []byte
 	buf = codec.AppendVarint(buf, 1) // count = 1
+	buf = codec.AppendVarint(buf, 0) // totalStringLen = 0 (no arena)
 	// col 2: string
 	buf = codec.AppendVarint(buf, 2)
 	buf = codec.AppendString(buf, "test")
@@ -663,6 +667,7 @@ func TestExtractIDColumn_WithBlobColumn(t *testing.T) {
 	// Columnar with a FieldModel (blob) column before id
 	var buf []byte
 	buf = codec.AppendVarint(buf, 1)           // count=1
+	buf = codec.AppendVarint(buf, 0)           // totalStringLen = 0 (no arena)
 	buf = codec.AppendVarint(buf, 5)           // fieldID=5 (blob)
 	buf = codec.AppendBytes(buf, []byte{0xFF}) // one blob
 	buf = codec.AppendVarint(buf, 1)           // fieldID=1 (id)
@@ -687,6 +692,7 @@ func TestExtractIDColumn_NullableEnum(t *testing.T) {
 	// Nullable string (enum) column before id
 	var buf []byte
 	buf = codec.AppendVarint(buf, 1) // count=1
+	buf = codec.AppendVarint(buf, 0) // totalStringLen = 0 (no arena)
 	buf = codec.AppendVarint(buf, 3) // fieldID=3 (nullable enum)
 	buf = codec.AppendPresent(buf)
 	buf = codec.AppendString(buf, "ADMIN")
@@ -796,6 +802,207 @@ func TestMerge_MultipleExtendsSomeEmpty(t *testing.T) {
 	dec.ReadInt()
 	if !dec.NextField() || dec.FieldID() != 10 {
 		t.Fatal("expected field 10")
+	}
+}
+
+func TestParseGroupedResponse_SingleWithMultipleItems(t *testing.T) {
+	// Single mode with >1 items per key — tests the skip-remaining-items path
+	var resp []byte
+	resp = codec.AppendVarint(resp, 1) // 1 key
+	resp = codec.AppendVarint(resp, 3) // 3 items (only first should be used)
+	resp = codec.AppendBytes(resp, []byte{0x01, 0x02})
+	resp = codec.AppendBytes(resp, []byte{0x03, 0x04}) // should be skipped
+	resp = codec.AppendBytes(resp, []byte{0x05})       // should be skipped
+
+	blobs := ParseGroupedResponse(resp, false)
+	if len(blobs) != 1 {
+		t.Fatalf("expected 1 blob, got %d", len(blobs))
+	}
+	if len(blobs[0]) != 2 || blobs[0][0] != 0x01 || blobs[0][1] != 0x02 {
+		t.Fatalf("blob[0] = %x, want [01 02]", blobs[0])
+	}
+}
+
+func TestParseGroupedResponse_SingleSkipRemainingTruncated(t *testing.T) {
+	// Single mode: 1 key, 3 items, first item present, second truncated
+	var resp []byte
+	resp = codec.AppendVarint(resp, 1) // 1 key
+	resp = codec.AppendVarint(resp, 3) // 3 items
+	resp = codec.AppendBytes(resp, []byte{0xAA})
+	// remaining items truncated — no more data
+	blobs := ParseGroupedResponse(resp, false)
+	if len(blobs) != 1 {
+		t.Fatalf("expected 1 blob, got %d", len(blobs))
+	}
+	if blobs[0][0] != 0xAA {
+		t.Fatalf("blob[0] = %x, want [AA]", blobs[0])
+	}
+}
+
+func TestParseGroupedResponse_InvalidVarint(t *testing.T) {
+	// Invalid varint — should return nil
+	blobs := ParseGroupedResponse([]byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, true)
+	if blobs != nil {
+		t.Fatal("invalid varint should return nil")
+	}
+}
+
+func TestMergeColumnar_PrimaryNoEndMarker(t *testing.T) {
+	// Primary without trailing 0x00
+	primary := []byte{0x01, 0x02}
+	extends := []ExtendColumnResult{
+		{FieldID: 10, Blobs: [][]byte{{0xAA}}},
+	}
+	result := MergeColumnar(primary, extends)
+	// Should append extend + end marker
+	if result[len(result)-1] != 0x00 {
+		t.Fatal("merged should end with 0x00")
+	}
+}
+
+func TestSkipColumnarColumn_DefaultType(t *testing.T) {
+	// Use a field type that falls through to default case in skipColumnarColumn
+	// FieldBytes type hits the default case
+	var buf []byte
+	buf = codec.AppendVarint(buf, 1) // count=1
+	buf = codec.AppendVarint(buf, 0) // totalStringLen = 0 (no arena)
+	buf = codec.AppendVarint(buf, 2) // fieldID=2 (FieldBytes)
+	buf = codec.AppendBytes(buf, []byte{0xAA, 0xBB})
+	buf = codec.AppendVarint(buf, 1) // fieldID=1 (id)
+	buf = codec.AppendSvarint(buf, 88)
+	buf = append(buf, 0x00)
+
+	s := schema.New()
+	s.RegisterModel(&schema.Model{
+		Name: "M",
+		Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt},
+			{ID: 2, Name: "payload", Type: schema.FieldBytes},
+		},
+	})
+	ids := ExtractIDColumn(buf, 1, s.Models["M"])
+	if len(ids) != 1 || ids[0] != 88 {
+		t.Fatalf("ids = %v, want [88]", ids)
+	}
+}
+
+func TestSchemaFieldToSkipType_Default(t *testing.T) {
+	// Test the default case with an unknown field type
+	f := &schema.Field{Type: schema.FieldType(99)} // unknown type
+	got := schemaFieldToSkipType(f)
+	if got != codec.SkipBytes {
+		t.Errorf("default skip type = %d, want SkipBytes (%d)", got, codec.SkipBytes)
+	}
+}
+
+func TestExtractID_SkipFieldError(t *testing.T) {
+	// Build a buffer where skipField encounters an error (truncated string)
+	// field 2 is a string but data is truncated — skipField will fail
+	var buf []byte
+	buf = codec.AppendVarint(buf, 0)   // arena
+	buf = codec.AppendVarint(buf, 2)   // field 2 (string)
+	buf = codec.AppendVarint(buf, 100) // len-prefix says 100 bytes, but no data follows
+
+	fieldTypes := map[int]codec.FieldSkipType{
+		2: codec.SkipBytes,
+	}
+	_, ok := ExtractID(buf, 1, fieldTypes)
+	if ok {
+		t.Fatal("skip error should return false")
+	}
+}
+
+func TestExtractIDColumn_IDNotFound(t *testing.T) {
+	// All columns are iterated but id column is not found
+	w := &codec.ColumnarWriter{}
+	w.SetCount(1)
+	w.WriteColumnString(2, []string{"hello"})
+	data := w.Bytes()
+
+	s := schema.New()
+	s.RegisterModel(&schema.Model{
+		Name: "M",
+		Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt},
+			{ID: 2, Name: "name", Type: schema.FieldString},
+		},
+	})
+	// Look for field 1 (id) but only field 2 exists in data
+	ids := ExtractIDColumn(data, 1, s.Models["M"])
+	if ids != nil {
+		t.Fatal("should return nil when id column not found")
+	}
+}
+
+func TestExtractID_DecoderError(t *testing.T) {
+	// Build a buffer where the id field value is truncated, causing a decoder error
+	// This tests the dec.Err() == nil check on line 75
+	var buf []byte
+	buf = codec.AppendVarint(buf, 0) // arena
+	buf = codec.AppendVarint(buf, 1) // field 1 (id)
+	// No value data after field ID — truncated, ReadInt will fail
+	id, ok := ExtractID(buf, 1, nil)
+	if ok {
+		t.Fatalf("expected not ok, got id=%d", id)
+	}
+}
+
+func TestExtractIDColumn_ColumnarReaderError(t *testing.T) {
+	// Minimal invalid data (just some garbage bytes that fail ColumnarReader init)
+	ids := ExtractIDColumn([]byte{0xFF, 0xFF}, 1, nil)
+	if ids != nil {
+		t.Fatal("invalid data should return nil")
+	}
+}
+
+func TestSkipColumnarColumn_NonNullableIntBeforeID(t *testing.T) {
+	// Non-nullable FieldInt column (not the id) before the actual id column
+	// Tests the else branch of FieldInt/DateTime/Duration nullable check
+	var buf []byte
+	buf = codec.AppendVarint(buf, 1) // count=1
+	buf = codec.AppendVarint(buf, 0) // totalStringLen = 0
+	buf = codec.AppendVarint(buf, 2) // fieldID=2 (age, non-nullable int)
+	buf = codec.AppendSvarint(buf, 25)
+	buf = codec.AppendVarint(buf, 1) // fieldID=1 (id)
+	buf = codec.AppendSvarint(buf, 42)
+	buf = append(buf, 0x00)
+
+	s := schema.New()
+	s.RegisterModel(&schema.Model{
+		Name: "M",
+		Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt},
+			{ID: 2, Name: "age", Type: schema.FieldInt},
+		},
+	})
+	ids := ExtractIDColumn(buf, 1, s.Models["M"])
+	if len(ids) != 1 || ids[0] != 42 {
+		t.Fatalf("ids = %v, want [42]", ids)
+	}
+}
+
+func TestSkipColumnarColumn_EnumNonNullable(t *testing.T) {
+	// Enum (non-nullable) column before id — tests FieldEnum + !Nullable path
+	var buf []byte
+	buf = codec.AppendVarint(buf, 1) // count=1
+	buf = codec.AppendVarint(buf, 0) // totalStringLen = 0
+	buf = codec.AppendVarint(buf, 2) // fieldID=2 (enum)
+	buf = codec.AppendString(buf, "ADMIN")
+	buf = codec.AppendVarint(buf, 1) // fieldID=1 (id)
+	buf = codec.AppendSvarint(buf, 77)
+	buf = append(buf, 0x00)
+
+	s := schema.New()
+	s.RegisterModel(&schema.Model{
+		Name: "M",
+		Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt},
+			{ID: 2, Name: "role", Type: schema.FieldEnum},
+		},
+	})
+	ids := ExtractIDColumn(buf, 1, s.Models["M"])
+	if len(ids) != 1 || ids[0] != 77 {
+		t.Fatalf("ids = %v, want [77]", ids)
 	}
 }
 

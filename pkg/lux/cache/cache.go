@@ -1,50 +1,93 @@
-// Package cache provides a simple in-memory TTL cache for @cache directive.
+// Package cache provides a pluggable caching layer for @cache directive.
+// Default implementation is in-memory with TTL. Redis backend available.
 package cache
 
 import (
+	"context"
 	"sync"
 	"time"
 )
 
+// Cache is the pluggable cache interface used by @cache directive.
+// Implementations must be safe for concurrent use.
+// All methods are best-effort: cache failures should not break the application.
+type Cache interface {
+	// Get returns cached data for the key. Returns nil, nil on cache miss.
+	Get(ctx context.Context, key string) ([]byte, error)
+	// Set stores data with a TTL. Zero TTL means no expiration.
+	Set(ctx context.Context, key string, value []byte, ttl time.Duration) error
+	// Del removes specific keys.
+	Del(ctx context.Context, keys ...string) error
+	// Invalidate removes all keys matching a prefix (e.g., "luxo:api:getUser:").
+	Invalidate(ctx context.Context, prefix string) error
+	// Close releases resources.
+	Close() error
+}
+
+// entry stores cached data with expiration time.
 type entry struct {
 	data      []byte
 	expiresAt time.Time
 }
 
-// Cache is a concurrency-safe in-memory cache with TTL.
-type Cache struct {
-	mu    sync.RWMutex
-	items map[string]entry
+// MemoryCache is a concurrency-safe in-memory cache with TTL.
+// Suitable for single-instance deployments or development.
+type MemoryCache struct {
+	mu      sync.RWMutex
+	items   map[string]entry
+	closeCh chan struct{}
 }
 
-// New creates a new Cache.
-func New() *Cache {
-	c := &Cache{items: make(map[string]entry)}
+// NewMemory creates a new in-memory cache with background cleanup.
+func NewMemory() *MemoryCache {
+	c := &MemoryCache{
+		items:   make(map[string]entry),
+		closeCh: make(chan struct{}),
+	}
 	go c.cleanup()
 	return c
 }
 
-// Get returns cached data if not expired. Returns nil if miss.
-func (c *Cache) Get(key string) []byte {
+// Get returns cached data if not expired. Returns nil, nil on miss.
+func (c *MemoryCache) Get(_ context.Context, key string) ([]byte, error) {
 	c.mu.RLock()
 	e, ok := c.items[key]
 	c.mu.RUnlock()
-	if !ok || time.Now().After(e.expiresAt) {
-		return nil
+	if !ok || (!e.expiresAt.IsZero() && time.Now().After(e.expiresAt)) {
+		return nil, nil
 	}
-	return e.data
+	// Return a copy to prevent caller mutation.
+	cp := make([]byte, len(e.data))
+	copy(cp, e.data)
+	return cp, nil
 }
 
 // Set stores data with a TTL.
-func (c *Cache) Set(key string, data []byte, ttl time.Duration) {
+func (c *MemoryCache) Set(_ context.Context, key string, value []byte, ttl time.Duration) error {
+	cp := make([]byte, len(value))
+	copy(cp, value)
+	var expiresAt time.Time
+	if ttl > 0 {
+		expiresAt = time.Now().Add(ttl)
+	}
 	c.mu.Lock()
-	c.items[key] = entry{data: data, expiresAt: time.Now().Add(ttl)}
+	c.items[key] = entry{data: cp, expiresAt: expiresAt}
 	c.mu.Unlock()
+	return nil
+}
+
+// Del removes specific keys.
+func (c *MemoryCache) Del(_ context.Context, keys ...string) error {
+	c.mu.Lock()
+	for _, k := range keys {
+		delete(c.items, k)
+	}
+	c.mu.Unlock()
+	return nil
 }
 
 // Invalidate removes all cache entries whose key starts with prefix.
-// Used by write operations (create/update/delete) to clear stale read caches.
-func (c *Cache) Invalidate(prefix string) {
+func (c *MemoryCache) Invalidate(_ context.Context, prefix string) error {
 	c.mu.Lock()
 	for k := range c.items {
 		if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
@@ -52,26 +95,54 @@ func (c *Cache) Invalidate(prefix string) {
 		}
 	}
 	c.mu.Unlock()
+	return nil
 }
 
-// InvalidateAll clears all cached entries.
-func (c *Cache) InvalidateAll() {
-	c.mu.Lock()
-	c.items = make(map[string]entry)
-	c.mu.Unlock()
+// Close stops the background cleanup goroutine.
+func (c *MemoryCache) Close() error {
+	select {
+	case <-c.closeCh:
+		// Already closed.
+	default:
+		close(c.closeCh)
+	}
+	return nil
+}
+
+// Len returns the number of entries (for testing).
+func (c *MemoryCache) Len() int {
+	c.mu.RLock()
+	n := len(c.items)
+	c.mu.RUnlock()
+	return n
 }
 
 // cleanup periodically removes expired entries.
-func (c *Cache) cleanup() {
+func (c *MemoryCache) cleanup() {
 	ticker := time.NewTicker(60 * time.Second)
-	for range ticker.C {
-		now := time.Now()
-		c.mu.Lock()
-		for k, e := range c.items {
-			if now.After(e.expiresAt) {
-				delete(c.items, k)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.closeCh:
+			return
+		case <-ticker.C:
+			now := time.Now()
+			c.mu.Lock()
+			for k, e := range c.items {
+				if !e.expiresAt.IsZero() && now.After(e.expiresAt) {
+					delete(c.items, k)
+				}
 			}
+			c.mu.Unlock()
 		}
-		c.mu.Unlock()
 	}
 }
+
+// Nop is a no-op cache that never stores anything. Useful for disabling cache.
+type Nop struct{}
+
+func (Nop) Get(context.Context, string) ([]byte, error)              { return nil, nil }
+func (Nop) Set(context.Context, string, []byte, time.Duration) error { return nil }
+func (Nop) Del(context.Context, ...string) error                     { return nil }
+func (Nop) Invalidate(context.Context, string) error                 { return nil }
+func (Nop) Close() error                                             { return nil }

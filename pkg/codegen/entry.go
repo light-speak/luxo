@@ -124,6 +124,7 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/migrate\"\n")
 	b.WriteString("\tpg \"github.com/light-speak/luxo/pkg/lux/pg\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/queue\"\n")
 	// rpc needed for fn @service or cluster mode DataLoaders
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/rpc\"\n")
 	b.WriteString(")\n\n")
@@ -160,6 +161,7 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 	if anyEvents {
 		writeEventBusWiring(&b, modules)
 	}
+	writeQueueWiring(&b, modules)
 
 	// Create Luvia gateway
 	b.WriteString("\tgw := luvia.New()\n\n")
@@ -312,6 +314,16 @@ func writeEventBusWiring(b *strings.Builder, modules []moduleInfo) {
 	b.WriteString("\n")
 }
 
+func writeQueueWiring(b *strings.Builder, modules []moduleInfo) {
+	b.WriteString("\ttaskQueue := queue.NewFromEnv(queue.DefaultConfig())\n")
+	b.WriteString("\tdefer taskQueue.Close()\n\n")
+
+	for _, m := range modules {
+		fmt.Fprintf(b, "\t%sApp.Queue = taskQueue\n", m.name)
+	}
+	b.WriteString("\n")
+}
+
 // GenerateModuleEntryFiles produces per-module entry points for cluster mode.
 // Each module gets its own main.gen.go under luxis/<module>/.
 // Returns map[moduleName][]byte.
@@ -357,6 +369,7 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/migrate\"\n")
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/queue\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/rpc\"\n")
 	b.WriteString(")\n\n")
 
@@ -429,6 +442,11 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 		b.WriteString("\tapp.EventBus = eventBus\n")
 		fmt.Fprintf(&b, "\t%s_luxo.RegisterEvents(eventBus, app)\n\n", target.name)
 	}
+
+	// Queue
+	b.WriteString("\ttaskQueue := queue.NewFromEnv(queue.DefaultConfig())\n")
+	b.WriteString("\tdefer taskQueue.Close()\n")
+	b.WriteString("\tapp.Queue = taskQueue\n\n")
 
 	// Gateway + handlers
 	b.WriteString("\tgw := luvia.New()\n")

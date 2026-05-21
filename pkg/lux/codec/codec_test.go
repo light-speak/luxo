@@ -1160,9 +1160,10 @@ func TestFieldMaskAllZero(t *testing.T) {
 // --- Columnar: NextColumn with id==0 (end marker) ---
 
 func TestColumnarReaderNextColumnEndMarker(t *testing.T) {
-	// Build minimal columnar: count=1, then field ID=0 (end marker)
+	// Build minimal columnar: count=1, arenaSize=0, then field ID=0 (end marker)
 	var buf []byte
 	buf = AppendVarint(buf, 1) // count=1
+	buf = AppendVarint(buf, 0) // arena size=0
 	buf = AppendVarint(buf, 0) // field ID=0 → end
 	r := NewColumnarReader(buf)
 	if r.NextColumn() {
@@ -1176,6 +1177,7 @@ func TestColumnarReaderIntPtrTruncatedValue(t *testing.T) {
 	// count=1, write present marker (0x01) but no int value after
 	var buf []byte
 	buf = AppendVarint(buf, 1) // count=1
+	buf = AppendVarint(buf, 0) // arena size=0
 	buf = AppendVarint(buf, 1) // field ID=1
 	buf = AppendPresent(buf)   // present marker
 	// No int value follows → truncated
@@ -1197,6 +1199,7 @@ func TestColumnarReaderStringPtrTruncatedValue(t *testing.T) {
 	// count=1, write present marker but string length says 100, no data
 	var buf []byte
 	buf = AppendVarint(buf, 1) // count=1
+	buf = AppendVarint(buf, 0) // arena size=0
 	buf = AppendVarint(buf, 1) // field ID=1
 	buf = AppendPresent(buf)   // present marker
 	// String length says 100 but no data
@@ -1875,9 +1878,10 @@ func TestSkipColumnBytes(t *testing.T) {
 	col = AppendVarint(col, 1) // fieldID
 	col = AppendBytes(col, []byte{0xCA, 0xFE})
 	col = AppendBytes(col, []byte{0xDE, 0xAD})
-	// Rebuild: [count=2][col][int col][0x00]
+	// Rebuild: [count=2][arenaSize=0][col][int col][0x00]
 	var buf []byte
 	buf = AppendVarint(buf, 2) // count
+	buf = AppendVarint(buf, 0) // arena size (no strings)
 	buf = append(buf, col...)
 	buf = AppendVarint(buf, 2) // fieldID 2
 	buf = AppendSvarint(buf, 42)
@@ -1900,6 +1904,7 @@ func TestSkipColumnBytes(t *testing.T) {
 func TestReadColumnBytes(t *testing.T) {
 	var buf []byte
 	buf = AppendVarint(buf, 2) // count = 2
+	buf = AppendVarint(buf, 0) // arena size (no strings)
 	buf = AppendVarint(buf, 1) // fieldID = 1
 	buf = AppendBytes(buf, []byte{0x01, 0x02, 0x03})
 	buf = AppendBytes(buf, []byte{0x04, 0x05})
@@ -1926,6 +1931,7 @@ func TestReadColumnBytes(t *testing.T) {
 
 func TestSkipColumnInt_Truncated(t *testing.T) {
 	buf := AppendVarint(nil, 2)  // count=2
+	buf = AppendVarint(buf, 0)   // arena size=0
 	buf = AppendVarint(buf, 1)   // fieldID
 	buf = AppendSvarint(buf, 42) // only 1 value, expect 2
 	r := NewColumnarReader(buf)
@@ -1938,6 +1944,7 @@ func TestSkipColumnInt_Truncated(t *testing.T) {
 
 func TestSkipColumnFloat_Truncated(t *testing.T) {
 	buf := AppendVarint(nil, 1)
+	buf = AppendVarint(buf, 0) // arena size=0
 	buf = AppendVarint(buf, 1)
 	buf = append(buf, 0x01, 0x02) // only 2 bytes, need 8
 	r := NewColumnarReader(buf)
@@ -1950,6 +1957,7 @@ func TestSkipColumnFloat_Truncated(t *testing.T) {
 
 func TestSkipColumnString_Truncated(t *testing.T) {
 	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 0) // arena size=0
 	buf = AppendVarint(buf, 1)
 	buf = AppendString(buf, "ok") // only 1 value
 	r := NewColumnarReader(buf)
@@ -1962,6 +1970,7 @@ func TestSkipColumnString_Truncated(t *testing.T) {
 
 func TestSkipColumnBool_Truncated(t *testing.T) {
 	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 0) // arena size=0
 	buf = AppendVarint(buf, 1)
 	buf = AppendBool(buf, true) // only 1
 	r := NewColumnarReader(buf)
@@ -1974,6 +1983,7 @@ func TestSkipColumnBool_Truncated(t *testing.T) {
 
 func TestSkipColumnIntPtr_Truncated(t *testing.T) {
 	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 0) // arena size=0
 	buf = AppendVarint(buf, 1)
 	buf = AppendPresent(buf)
 	buf = AppendSvarint(buf, 10) // 1 value, expect 2
@@ -1987,6 +1997,7 @@ func TestSkipColumnIntPtr_Truncated(t *testing.T) {
 
 func TestSkipColumnFloatPtr_Truncated(t *testing.T) {
 	buf := AppendVarint(nil, 1)
+	buf = AppendVarint(buf, 0) // arena size=0
 	buf = AppendVarint(buf, 1)
 	buf = AppendPresent(buf)
 	buf = append(buf, 0x01) // only 1 byte, need 8
@@ -2000,6 +2011,7 @@ func TestSkipColumnFloatPtr_Truncated(t *testing.T) {
 
 func TestSkipColumnStringPtr_Truncated(t *testing.T) {
 	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 0) // arena size=0
 	buf = AppendVarint(buf, 1)
 	buf = AppendNull(buf)
 	// only 1 value (null), expect 2
@@ -2013,6 +2025,7 @@ func TestSkipColumnStringPtr_Truncated(t *testing.T) {
 
 func TestSkipColumnBoolPtr_Truncated(t *testing.T) {
 	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 0) // arena size=0
 	buf = AppendVarint(buf, 1)
 	buf = AppendPresent(buf)
 	buf = AppendBool(buf, true) // 1 value, expect 2
@@ -2026,6 +2039,7 @@ func TestSkipColumnBoolPtr_Truncated(t *testing.T) {
 
 func TestSkipColumnBytes_Truncated(t *testing.T) {
 	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 0) // arena size=0
 	buf = AppendVarint(buf, 1)
 	buf = AppendBytes(buf, []byte{0x01}) // 1 value, expect 2
 	r := NewColumnarReader(buf)
@@ -2038,6 +2052,7 @@ func TestSkipColumnBytes_Truncated(t *testing.T) {
 
 func TestReadColumnBytes_Truncated(t *testing.T) {
 	buf := AppendVarint(nil, 2)
+	buf = AppendVarint(buf, 0) // arena size=0
 	buf = AppendVarint(buf, 1)
 	buf = AppendBytes(buf, []byte{0x01}) // 1 value, expect 2
 	r := NewColumnarReader(buf)
@@ -2166,6 +2181,7 @@ func TestDecoderSkipNullableLenPrefixed_Error(t *testing.T) {
 
 func TestSkipColumnIntPtr_PresentValueTruncated(t *testing.T) {
 	buf := AppendVarint(nil, 1) // count=1
+	buf = AppendVarint(buf, 0)  // arena size=0
 	buf = AppendVarint(buf, 1)  // fieldID
 	buf = AppendPresent(buf)    // present but no value after
 	r := NewColumnarReader(buf)
@@ -2178,6 +2194,7 @@ func TestSkipColumnIntPtr_PresentValueTruncated(t *testing.T) {
 
 func TestSkipColumnFloatPtr_PresentValueTruncated(t *testing.T) {
 	buf := AppendVarint(nil, 1)
+	buf = AppendVarint(buf, 0) // arena size=0
 	buf = AppendVarint(buf, 1)
 	buf = AppendPresent(buf)
 	buf = append(buf, 0x01) // only 1 byte, need 8
@@ -2191,6 +2208,7 @@ func TestSkipColumnFloatPtr_PresentValueTruncated(t *testing.T) {
 
 func TestSkipColumnStringPtr_PresentValueTruncated(t *testing.T) {
 	buf := AppendVarint(nil, 1)
+	buf = AppendVarint(buf, 0) // arena size=0
 	buf = AppendVarint(buf, 1)
 	buf = AppendPresent(buf) // present but no string data
 	r := NewColumnarReader(buf)
@@ -2203,6 +2221,7 @@ func TestSkipColumnStringPtr_PresentValueTruncated(t *testing.T) {
 
 func TestSkipColumnBoolPtr_PresentValueTruncated(t *testing.T) {
 	buf := AppendVarint(nil, 1)
+	buf = AppendVarint(buf, 0) // arena size=0
 	buf = AppendVarint(buf, 1)
 	buf = AppendPresent(buf) // present but no bool data
 	r := NewColumnarReader(buf)
@@ -2248,5 +2267,409 @@ func TestColumnarOffset(t *testing.T) {
 	r := NewColumnarReader(data)
 	if r.Offset() <= 0 {
 		t.Fatal("offset should be > 0 after reading count")
+	}
+}
+
+// --- Columnar Arena tests ---
+
+func TestColumnarArenaSize(t *testing.T) {
+	w := &ColumnarWriter{}
+	w.SetCount(3)
+	w.WriteColumnString(1, []string{"hello", "world", "!"})
+	w.WriteColumnInt(2, []int64{1, 2, 3})
+	data := w.Bytes()
+
+	if w.TotalStringLen() != 11 { // "hello"(5) + "world"(5) + "!"(1)
+		t.Fatalf("TotalStringLen: expected 11, got %d", w.TotalStringLen())
+	}
+
+	r := NewColumnarReader(data)
+	if r.Err() != nil {
+		t.Fatalf("NewColumnarReader error: %v", r.Err())
+	}
+	if r.ArenaSize() != 11 {
+		t.Fatalf("ArenaSize: expected 11, got %d", r.ArenaSize())
+	}
+}
+
+func TestColumnarArenaSizeWithPtr(t *testing.T) {
+	s1 := "foo"
+	s2 := "barbaz"
+	w := &ColumnarWriter{}
+	w.SetCount(3)
+	w.WriteColumnStringPtr(1, []*string{&s1, nil, &s2})
+	data := w.Bytes()
+
+	if w.TotalStringLen() != 9 { // "foo"(3) + "barbaz"(6), nil doesn't count
+		t.Fatalf("TotalStringLen: expected 9, got %d", w.TotalStringLen())
+	}
+
+	r := NewColumnarReader(data)
+	if r.ArenaSize() != 9 {
+		t.Fatalf("ArenaSize: expected 9, got %d", r.ArenaSize())
+	}
+}
+
+func TestColumnarReadColumnStringArena(t *testing.T) {
+	w := &ColumnarWriter{}
+	w.SetCount(3)
+	w.WriteColumnString(1, []string{"alpha", "beta", "gamma"})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	arena := make([]byte, r.ArenaSize())
+	arenaOff := 0
+
+	r.NextColumn()
+	vals := r.ReadColumnStringArena(arena, &arenaOff)
+	if r.Err() != nil {
+		t.Fatalf("ReadColumnStringArena error: %v", r.Err())
+	}
+	if len(vals) != 3 {
+		t.Fatalf("expected 3 values, got %d", len(vals))
+	}
+	if vals[0] != "alpha" || vals[1] != "beta" || vals[2] != "gamma" {
+		t.Fatalf("values mismatch: %v", vals)
+	}
+	// Verify all strings share the arena
+	if unsafe.StringData(vals[0]) != &arena[0] {
+		t.Fatal("vals[0] should point into arena")
+	}
+	if unsafe.StringData(vals[1]) != &arena[5] {
+		t.Fatal("vals[1] should point into arena at offset 5")
+	}
+	if unsafe.StringData(vals[2]) != &arena[9] {
+		t.Fatal("vals[2] should point into arena at offset 9")
+	}
+	expectedOff := 5 + 4 + 5 // "alpha"(5) + "beta"(4) + "gamma"(5)
+	if arenaOff != expectedOff {
+		t.Fatalf("arenaOff: expected %d, got %d", expectedOff, arenaOff)
+	}
+}
+
+func TestColumnarReadColumnStringArenaEmpty(t *testing.T) {
+	w := &ColumnarWriter{}
+	w.SetCount(2)
+	w.WriteColumnString(1, []string{"", "hi"})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	arena := make([]byte, r.ArenaSize())
+	arenaOff := 0
+
+	r.NextColumn()
+	vals := r.ReadColumnStringArena(arena, &arenaOff)
+	if r.Err() != nil {
+		t.Fatalf("error: %v", r.Err())
+	}
+	if vals[0] != "" {
+		t.Fatalf("expected empty string, got %q", vals[0])
+	}
+	if vals[1] != "hi" {
+		t.Fatalf("expected 'hi', got %q", vals[1])
+	}
+	if arenaOff != 2 { // only "hi" goes into arena
+		t.Fatalf("arenaOff: expected 2, got %d", arenaOff)
+	}
+}
+
+func TestColumnarReadColumnStringArenaOverflow(t *testing.T) {
+	w := &ColumnarWriter{}
+	w.SetCount(2)
+	w.WriteColumnString(1, []string{"hello", "world"})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	// Allocate arena too small
+	arena := make([]byte, 3)
+	arenaOff := 0
+
+	r.NextColumn()
+	vals := r.ReadColumnStringArena(arena, &arenaOff)
+	if r.Err() != nil {
+		t.Fatalf("error: %v", r.Err())
+	}
+	// Should fall back to regular allocation
+	if vals[0] != "hello" || vals[1] != "world" {
+		t.Fatalf("values mismatch: %v", vals)
+	}
+	// arenaOff should not advance
+	if arenaOff != 0 {
+		t.Fatalf("arenaOff should be 0 on fallback, got %d", arenaOff)
+	}
+}
+
+func TestColumnarReadColumnStringPtrArena(t *testing.T) {
+	s1 := "foo"
+	s2 := "bar"
+	w := &ColumnarWriter{}
+	w.SetCount(3)
+	w.WriteColumnStringPtr(1, []*string{&s1, nil, &s2})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	arena := make([]byte, r.ArenaSize())
+	arenaOff := 0
+
+	r.NextColumn()
+	vals := r.ReadColumnStringPtrArena(arena, &arenaOff)
+	if r.Err() != nil {
+		t.Fatalf("error: %v", r.Err())
+	}
+	if len(vals) != 3 {
+		t.Fatalf("expected 3, got %d", len(vals))
+	}
+	if vals[0] == nil || *vals[0] != "foo" {
+		t.Fatalf("vals[0]: expected 'foo', got %v", vals[0])
+	}
+	if vals[1] != nil {
+		t.Fatalf("vals[1]: expected nil, got %v", vals[1])
+	}
+	if vals[2] == nil || *vals[2] != "bar" {
+		t.Fatalf("vals[2]: expected 'bar', got %v", vals[2])
+	}
+	// Verify arena usage
+	if unsafe.StringData(*vals[0]) != &arena[0] {
+		t.Fatal("vals[0] should point into arena")
+	}
+	if unsafe.StringData(*vals[2]) != &arena[3] {
+		t.Fatal("vals[2] should point into arena at offset 3")
+	}
+	if arenaOff != 6 { // "foo"(3) + "bar"(3)
+		t.Fatalf("arenaOff: expected 6, got %d", arenaOff)
+	}
+}
+
+func TestColumnarReadColumnStringPtrArenaEmptyString(t *testing.T) {
+	s := ""
+	w := &ColumnarWriter{}
+	w.SetCount(1)
+	w.WriteColumnStringPtr(1, []*string{&s})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	arena := make([]byte, r.ArenaSize())
+	arenaOff := 0
+
+	r.NextColumn()
+	vals := r.ReadColumnStringPtrArena(arena, &arenaOff)
+	if r.Err() != nil {
+		t.Fatalf("error: %v", r.Err())
+	}
+	if vals[0] == nil || *vals[0] != "" {
+		t.Fatalf("expected empty string ptr, got %v", vals[0])
+	}
+	if arenaOff != 0 {
+		t.Fatalf("arenaOff should be 0 for empty string, got %d", arenaOff)
+	}
+}
+
+func TestColumnarReadColumnStringPtrArenaOverflow(t *testing.T) {
+	s := "hello world"
+	w := &ColumnarWriter{}
+	w.SetCount(1)
+	w.WriteColumnStringPtr(1, []*string{&s})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	arena := make([]byte, 3) // too small
+	arenaOff := 0
+
+	r.NextColumn()
+	vals := r.ReadColumnStringPtrArena(arena, &arenaOff)
+	if r.Err() != nil {
+		t.Fatalf("error: %v", r.Err())
+	}
+	if vals[0] == nil || *vals[0] != "hello world" {
+		t.Fatalf("expected 'hello world', got %v", vals[0])
+	}
+	if arenaOff != 0 {
+		t.Fatalf("arenaOff should be 0 on fallback, got %d", arenaOff)
+	}
+}
+
+func TestColumnarArenaFullRoundTrip(t *testing.T) {
+	// Multi-column with mixed types including strings
+	w := &ColumnarWriter{}
+	w.SetCount(2)
+	w.WriteColumnInt(1, []int64{10, 20})
+	w.WriteColumnString(2, []string{"alice", "bob"})
+	w.WriteColumnString(3, []string{"x@example.com", "y@test.org"})
+	w.WriteColumnFloat(4, []float64{1.5, 2.5})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	if r.ArenaSize() != 5+3+13+10 { // alice(5)+bob(3)+x@example.com(13)+y@test.org(10)
+		t.Fatalf("ArenaSize: expected %d, got %d", 5+3+13+10, r.ArenaSize())
+	}
+	arena := make([]byte, r.ArenaSize())
+	arenaOff := 0
+
+	r.NextColumn() // fieldID=1, int
+	ints := r.ReadColumnInt()
+	if ints[0] != 10 || ints[1] != 20 {
+		t.Fatalf("ints: %v", ints)
+	}
+
+	r.NextColumn() // fieldID=2, string
+	names := r.ReadColumnStringArena(arena, &arenaOff)
+	if names[0] != "alice" || names[1] != "bob" {
+		t.Fatalf("names: %v", names)
+	}
+
+	r.NextColumn() // fieldID=3, string
+	emails := r.ReadColumnStringArena(arena, &arenaOff)
+	if emails[0] != "x@example.com" || emails[1] != "y@test.org" {
+		t.Fatalf("emails: %v", emails)
+	}
+
+	r.NextColumn() // fieldID=4, float
+	floats := r.ReadColumnFloat()
+	if floats[0] != 1.5 || floats[1] != 2.5 {
+		t.Fatalf("floats: %v", floats)
+	}
+
+	if !r.NextColumn() {
+		// end
+	}
+	if r.Err() != nil {
+		t.Fatalf("unexpected error: %v", r.Err())
+	}
+	if arenaOff != r.ArenaSize() {
+		t.Fatalf("arenaOff: expected %d, got %d", r.ArenaSize(), arenaOff)
+	}
+}
+
+func TestColumnarArenaNoStrings(t *testing.T) {
+	w := &ColumnarWriter{}
+	w.SetCount(2)
+	w.WriteColumnInt(1, []int64{1, 2})
+	w.WriteColumnBool(2, []bool{true, false})
+	data := w.Bytes()
+
+	if w.TotalStringLen() != 0 {
+		t.Fatalf("TotalStringLen should be 0, got %d", w.TotalStringLen())
+	}
+
+	r := NewColumnarReader(data)
+	if r.ArenaSize() != 0 {
+		t.Fatalf("ArenaSize should be 0, got %d", r.ArenaSize())
+	}
+}
+
+func TestColumnarWriterReset_ClearsArena(t *testing.T) {
+	w := &ColumnarWriter{}
+	w.SetCount(1)
+	w.WriteColumnString(1, []string{"hello"})
+	if w.TotalStringLen() != 5 {
+		t.Fatalf("expected 5, got %d", w.TotalStringLen())
+	}
+	w.Reset()
+	if w.TotalStringLen() != 0 {
+		t.Fatalf("after reset, expected 0, got %d", w.TotalStringLen())
+	}
+}
+
+func TestColumnarReaderInvalidArenaSize(t *testing.T) {
+	// Arena size varint is truncated
+	buf := AppendVarint(nil, 1) // count=1, then nothing for arena size
+	r := NewColumnarReader(buf)
+	if r.Err() == nil {
+		t.Fatal("expected error for missing arena size")
+	}
+}
+
+func TestColumnarReaderArenaSizeExceedsLimit(t *testing.T) {
+	buf := AppendVarint(nil, 1)                     // count=1
+	buf = AppendVarint(buf, uint64(MaxArenaSize+1)) // arena size exceeds limit
+	r := NewColumnarReader(buf)
+	if r.Err() == nil {
+		t.Fatal("expected error for oversized arena")
+	}
+}
+
+func TestColumnarReadColumnStringArenaTruncated(t *testing.T) {
+	// Manually craft: count=3, arena=0, fieldID=1, then only 1 string with length > remaining buf
+	var buf []byte
+	buf = AppendVarint(buf, 3)    // count=3
+	buf = AppendVarint(buf, 0)    // arena size=0
+	buf = AppendVarint(buf, 1)    // fieldID=1
+	buf = AppendString(buf, "ok") // 1st value
+	buf = AppendVarint(buf, 100)  // 2nd value: length=100 but no data → truncated
+
+	r := NewColumnarReader(buf)
+	arena := make([]byte, 10)
+	arenaOff := 0
+	r.NextColumn()
+	vals := r.ReadColumnStringArena(arena, &arenaOff)
+	if vals != nil {
+		t.Fatal("expected nil on truncated column")
+	}
+	if r.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestColumnarReadColumnStringPtrArenaTruncated(t *testing.T) {
+	// Manually craft: count=2, arena=0, fieldID=1, present+string, then truncated
+	var buf []byte
+	buf = AppendVarint(buf, 2)   // count=2
+	buf = AppendVarint(buf, 0)   // arena size=0
+	buf = AppendVarint(buf, 1)   // fieldID=1
+	buf = AppendPresent(buf)     // present
+	buf = AppendString(buf, "x") // 1st value
+	buf = AppendPresent(buf)     // present
+	buf = AppendVarint(buf, 100) // length=100 but no data → truncated
+
+	r := NewColumnarReader(buf)
+	arena := make([]byte, 10)
+	arenaOff := 0
+	r.NextColumn()
+	vals := r.ReadColumnStringPtrArena(arena, &arenaOff)
+	if vals != nil {
+		t.Fatal("expected nil on truncated column")
+	}
+	if r.Err() == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func BenchmarkColumnarStringNoArena(b *testing.B) {
+	w := &ColumnarWriter{}
+	w.SetCount(100)
+	vals := make([]string, 100)
+	for i := range vals {
+		vals[i] = "user_name_value_" + string(rune('A'+i%26))
+	}
+	w.WriteColumnString(1, vals)
+	data := w.Bytes()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		r := NewColumnarReader(data)
+		r.NextColumn()
+		_ = r.ReadColumnString()
+	}
+}
+
+func BenchmarkColumnarStringArena(b *testing.B) {
+	w := &ColumnarWriter{}
+	w.SetCount(100)
+	vals := make([]string, 100)
+	for i := range vals {
+		vals[i] = "user_name_value_" + string(rune('A'+i%26))
+	}
+	w.WriteColumnString(1, vals)
+	data := w.Bytes()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		r := NewColumnarReader(data)
+		arena := make([]byte, r.ArenaSize())
+		arenaOff := 0
+		r.NextColumn()
+		_ = r.ReadColumnStringArena(arena, &arenaOff)
 	}
 }

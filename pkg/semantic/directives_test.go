@@ -217,17 +217,17 @@ func TestDirectiveScopeUnlimitedArgs(t *testing.T) {
 
 func TestDirectiveTypoSuggestion(t *testing.T) {
 	result := analyze(t, `model User { name: String @uniuqe }`)
-	expectWarning(t, result, "did you mean '@unique'")
+	expectError(t, result, "did you mean '@unique'")
 }
 
 func TestDirectiveTypoSuggestionApi(t *testing.T) {
 	result := analyze(t, `api test(): Int @autth`)
-	expectWarning(t, result, "did you mean '@auth'")
+	expectError(t, result, "did you mean '@auth'")
 }
 
 func TestDirectiveTypoSuggestionModel(t *testing.T) {
 	result := analyze(t, `model User @sof { name: String }`)
-	expectWarning(t, result, "did you mean '@soft'")
+	expectError(t, result, "did you mean '@soft'")
 }
 
 // ========== Computed Field Directives ==========
@@ -323,7 +323,7 @@ func TestDirectiveCacheTtl(t *testing.T) {
 
 func TestDirectiveRateLimit(t *testing.T) {
 	result := analyze(t, `api limited(): Int @rateLimit(max: 100, window: 1m)`)
-	expectNoErrors(t, result)
+	expectError(t, result, "unknown directive '@rateLimit'")
 }
 
 func TestDirectiveIndexFields(t *testing.T) {
@@ -754,4 +754,47 @@ func TestSplitByAndOrFieldWithAnd(t *testing.T) {
 	if len(parts) != 1 || parts[0] != "SandyEmail" {
 		t.Errorf("splitByAndOr(%q) = %v, want [SandyEmail]", "SandyEmail", parts)
 	}
+}
+
+// ========== @upload Directive ==========
+
+func TestDirectiveUploadLookup(t *testing.T) {
+	d := LookupDirective("upload")
+	if d == nil {
+		t.Fatal("expected to find @upload")
+	}
+	if d.Contexts&OnField == 0 {
+		t.Error("@upload should be allowed on field")
+	}
+	if len(d.TypeConstraint) != 1 || d.TypeConstraint[0] != "String" {
+		t.Errorf("@upload type constraint = %v, want [String]", d.TypeConstraint)
+	}
+	if d.MaxArgs != 3 {
+		t.Errorf("@upload maxArgs = %d, want 3", d.MaxArgs)
+	}
+}
+
+func TestDirectiveUploadOnString(t *testing.T) {
+	result := analyze(t, `model User { avatar: String @upload }`)
+	expectNoErrors(t, result)
+}
+
+func TestDirectiveUploadOnInt(t *testing.T) {
+	result := analyze(t, `model User { avatar: Int @upload }`)
+	expectError(t, result, "@upload can only be used on String")
+}
+
+func TestDirectiveUploadWithParams(t *testing.T) {
+	result := analyze(t, `model User { avatar: String @upload(bucket: "avatars", maxSize: "5mb", accept: "image/*") }`)
+	expectNoErrors(t, result)
+}
+
+func TestDirectiveUploadTooManyArgs(t *testing.T) {
+	result := analyze(t, `model User { avatar: String @upload(bucket: "a", maxSize: "5mb", accept: "image/*", extra: "bad") }`)
+	expectError(t, result, "at most 3")
+}
+
+func TestDirectiveUploadOnModel(t *testing.T) {
+	result := analyze(t, `model User @upload { name: String }`)
+	expectError(t, result, "@upload cannot be used on model")
 }

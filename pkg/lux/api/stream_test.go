@@ -481,6 +481,227 @@ func TestWSJSON_StreamNativeHandler(t *testing.T) {
 	}
 }
 
+// --- Stream.Send / Stream.Context tests ---
+
+func TestStream_Send_Success(t *testing.T) {
+	ch := make(chan []byte, 1)
+	sub := &StreamSub{Ch: ch}
+	ctx := context.Background()
+	s := &Stream{sub: sub, ctx: ctx}
+
+	err := s.Send([]byte("hello"))
+	if err != nil {
+		t.Fatalf("Send should succeed: %v", err)
+	}
+	got := <-ch
+	if string(got) != "hello" {
+		t.Errorf("got %q, want hello", got)
+	}
+}
+
+func TestStream_Send_ContextCancelled(t *testing.T) {
+	ch := make(chan []byte) // unbuffered, will block
+	sub := &StreamSub{Ch: ch}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+	s := &Stream{sub: sub, ctx: ctx}
+
+	err := s.Send([]byte("data"))
+	if err == nil {
+		t.Fatal("Send should return error when context cancelled")
+	}
+}
+
+func TestStream_Send_Full(t *testing.T) {
+	ch := make(chan []byte, 1)
+	ch <- []byte("full") // fill channel
+	sub := &StreamSub{Ch: ch}
+	ctx := context.Background()
+	s := &Stream{sub: sub, ctx: ctx}
+
+	err := s.Send([]byte("overflow"))
+	if err != ErrStreamFull {
+		t.Fatalf("expected ErrStreamFull, got %v", err)
+	}
+}
+
+func TestStream_Context(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := &Stream{ctx: ctx}
+	if s.Context() != ctx {
+		t.Error("Context() should return the stream's context")
+	}
+}
+
+// --- Identity helpers ---
+
+type mockClaims struct {
+	id   int64
+	data map[string]any
+}
+
+func (m *mockClaims) ID() int64 { return m.id }
+func (m *mockClaims) Int(key string) int64 {
+	if v, ok := m.data[key].(int64); ok {
+		return v
+	}
+	return 0
+}
+func (m *mockClaims) String(key string) string {
+	if v, ok := m.data[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func TestIdentityID(t *testing.T) {
+	// With valid IdentityClaims
+	claims := &mockClaims{id: 42}
+	if got := IdentityID(claims); got != 42 {
+		t.Errorf("IdentityID = %d, want 42", got)
+	}
+	// With nil
+	if got := IdentityID(nil); got != 0 {
+		t.Errorf("IdentityID(nil) = %d, want 0", got)
+	}
+	// With non-claims type
+	if got := IdentityID("not-claims"); got != 0 {
+		t.Errorf("IdentityID(string) = %d, want 0", got)
+	}
+}
+
+func TestIdentityInt(t *testing.T) {
+	claims := &mockClaims{data: map[string]any{"age": int64(30)}}
+	if got := IdentityInt(claims, "age"); got != 30 {
+		t.Errorf("IdentityInt = %d, want 30", got)
+	}
+	if got := IdentityInt(nil, "age"); got != 0 {
+		t.Errorf("IdentityInt(nil) = %d, want 0", got)
+	}
+	if got := IdentityInt("not-claims", "age"); got != 0 {
+		t.Errorf("IdentityInt(string) = %d, want 0", got)
+	}
+}
+
+func TestIdentityString(t *testing.T) {
+	claims := &mockClaims{data: map[string]any{"role": "admin"}}
+	if got := IdentityString(claims, "role"); got != "admin" {
+		t.Errorf("IdentityString = %q, want admin", got)
+	}
+	if got := IdentityString(nil, "role"); got != "" {
+		t.Errorf("IdentityString(nil) = %q, want empty", got)
+	}
+}
+
+// --- StreamParams additional paths ---
+
+func TestStreamParams_Int_Float64(t *testing.T) {
+	// When JSON numbers are parsed, they come as float64
+	p := &StreamParams{values: map[string]any{"count": float64(7)}}
+	if got := p.Int("count"); got != 7 {
+		t.Errorf("Int(float64) = %d, want 7", got)
+	}
+}
+
+func TestStreamParams_Int_WrongType(t *testing.T) {
+	p := &StreamParams{values: map[string]any{"count": "not-int"}}
+	if got := p.Int("count"); got != 0 {
+		t.Errorf("Int(string) = %d, want 0", got)
+	}
+}
+
+func TestStreamParams_String_Missing(t *testing.T) {
+	p := &StreamParams{values: map[string]any{"x": int64(1)}}
+	if got := p.String("x"); got != "" {
+		t.Errorf("String(int) = %q, want empty", got)
+	}
+}
+
+func TestStreamParams_Get_Exists(t *testing.T) {
+	p := &StreamParams{values: map[string]any{"key": "val"}}
+	if got := p.Get("key"); got != "val" {
+		t.Errorf("Get = %v, want val", got)
+	}
+	if got := p.Get("missing"); got != nil {
+		t.Errorf("Get(missing) = %v, want nil", got)
+	}
+}
+
+// --- Dispatch with matcher + fieldMask ---
+
+func TestStreamHub_DispatchWithMatcherAndFieldMask(t *testing.T) {
+	hub := NewStreamHub()
+
+	// sub with fieldMask
+	sub := hub.Subscribe("test", nil, nil, []byte{0x01}, func() {})
+
+	hub.Dispatch("test", "data", func(data []byte, params *StreamParams, identity any) bool {
+		return true
+	}, func(data any, fieldMask []byte) []byte {
+		if fieldMask != nil {
+			return []byte("masked:" + data.(string))
+		}
+		return []byte("full:" + data.(string))
+	})
+
+	select {
+	case got := <-sub.Ch:
+		if string(got) != "masked:data" {
+			t.Errorf("expected masked:data, got %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Error("timeout")
+	}
+	hub.Unsubscribe("test", sub)
+}
+
+func TestStreamHub_DispatchChanFull(t *testing.T) {
+	hub := NewStreamHub()
+	cancelled := make(chan struct{}, 1)
+	sub := hub.Subscribe("test", nil, nil, nil, func() {
+		cancelled <- struct{}{}
+	})
+
+	// Fill the channel
+	for i := 0; i < 64; i++ {
+		sub.Ch <- []byte("x")
+	}
+
+	// Dispatch should trigger cancel on full channel
+	hub.Dispatch("test", "overflow", nil, func(data any, mask []byte) []byte {
+		return []byte("enc")
+	})
+
+	select {
+	case <-cancelled:
+		// good
+	case <-time.After(100 * time.Millisecond):
+		t.Error("subscriber should be cancelled when channel full")
+	}
+	hub.Unsubscribe("test", sub)
+}
+
+func TestStreamHub_UnsubscribeNilCancel(t *testing.T) {
+	hub := NewStreamHub()
+	// Subscribe with nil cancel
+	sub := hub.Subscribe("test", nil, nil, nil, nil)
+	// Should not panic
+	hub.Unsubscribe("test", sub)
+}
+
+func TestStreamHub_DispatchEncodedNilCancel(t *testing.T) {
+	hub := NewStreamHub()
+	sub := hub.Subscribe("test", nil, nil, nil, nil)
+	// Fill channel
+	for i := 0; i < 64; i++ {
+		sub.Ch <- []byte("x")
+	}
+	// Dispatch should not panic even with nil cancel
+	hub.DispatchEncoded("test", []byte("overflow"), nil)
+	hub.Unsubscribe("test", sub)
+}
+
 func TestStreamHubSubscribeLimit(t *testing.T) {
 	hub := NewStreamHub()
 	ctx, cancel := context.WithCancel(context.Background())

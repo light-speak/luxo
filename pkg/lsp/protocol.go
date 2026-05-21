@@ -51,13 +51,14 @@ type ServerInfo struct {
 }
 
 type ServerCapabilities struct {
-	TextDocumentSync           int            `json:"textDocumentSync"` // 1=Full, 2=Incremental
-	CompletionProvider         *CompletionOpt `json:"completionProvider,omitempty"`
-	HoverProvider              bool           `json:"hoverProvider"`
-	DefinitionProvider         bool           `json:"definitionProvider"`
-	ReferencesProvider         bool           `json:"referencesProvider"`
-	DocumentFormattingProvider bool           `json:"documentFormattingProvider"`
-	InlayHintProvider          bool           `json:"inlayHintProvider"`
+	TextDocumentSync           int                    `json:"textDocumentSync"` // 1=Full, 2=Incremental
+	CompletionProvider         *CompletionOpt         `json:"completionProvider,omitempty"`
+	HoverProvider              bool                   `json:"hoverProvider"`
+	DefinitionProvider         bool                   `json:"definitionProvider"`
+	ReferencesProvider         bool                   `json:"referencesProvider"`
+	DocumentFormattingProvider bool                   `json:"documentFormattingProvider"`
+	InlayHintProvider          bool                   `json:"inlayHintProvider"`
+	Workspace                  *WorkspaceCapabilities `json:"workspace,omitempty"`
 }
 
 type CompletionOpt struct {
@@ -208,4 +209,45 @@ type InlayHint struct {
 	Kind         int      `json:"kind"` // 1=Type, 2=Parameter
 	Tooltip      string   `json:"tooltip,omitempty"`
 	PaddingRight bool     `json:"paddingRight,omitempty"`
+}
+
+// ========== Workspace ==========
+
+// WorkspaceCapabilities advertises workspace-level server capabilities.
+type WorkspaceCapabilities struct {
+	DidChangeWatchedFiles *DidChangeWatchedFilesRegistrationOptions `json:"didChangeWatchedFiles,omitempty"`
+}
+
+// DidChangeWatchedFilesRegistrationOptions defines file watchers.
+type DidChangeWatchedFilesRegistrationOptions struct {
+	Watchers []FileSystemWatcher `json:"watchers"`
+}
+
+// FileSystemWatcher defines a glob pattern to watch.
+type FileSystemWatcher struct {
+	GlobPattern string `json:"globPattern"`
+	Kind        int    `json:"kind,omitempty"` // 1=Created, 2=Changed, 4=Deleted (bitmask)
+}
+
+// DidChangeWatchedFilesParams is sent when watched files change.
+type DidChangeWatchedFilesParams struct {
+	Changes []FileEvent `json:"changes"`
+}
+
+// FileEvent represents a file change event.
+type FileEvent struct {
+	URI  string `json:"uri"`
+	Type int    `json:"type"` // 1=Created, 2=Changed, 3=Deleted
+}
+
+// Registration is used for dynamic capability registration.
+type Registration struct {
+	ID              string `json:"id"`
+	Method          string `json:"method"`
+	RegisterOptions any    `json:"registerOptions,omitempty"`
+}
+
+// RegistrationParams wraps registrations for client/registerCapability.
+type RegistrationParams struct {
+	Registrations []Registration `json:"registrations"`
 }

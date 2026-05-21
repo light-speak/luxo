@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -835,6 +836,183 @@ func TestAssignBinaryParamTypeMismatch(t *testing.T) {
 	}
 	if s != "" {
 		t.Fatalf("should not assign, got %q", s)
+	}
+}
+
+// --- EncodeBinaryRequest: Duration, DateTime, Enum, UUID, Decimal types ---
+
+func TestEncodeBinaryRequestDuration(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("setTimer", 1)
+	meta := []ParamMeta{
+		{Name: "dur", Type: "Duration", FieldID: 1},
+	}
+	reg.RegisterParams("setTimer", meta)
+
+	body := EncodeBinaryRequest(1, map[string]any{"dur": int64(3600)}, meta)
+	req, err := reg.ParseBinaryRequest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, _ := req.ParamInt("dur")
+	if v != 3600 {
+		t.Fatalf("dur = %d, want 3600", v)
+	}
+}
+
+func TestEncodeBinaryRequestDateTime(t *testing.T) {
+	meta := []ParamMeta{
+		{Name: "date", Type: "DateTime", FieldID: 1},
+	}
+	body := EncodeBinaryRequest(1, map[string]any{"date": "2026-01-01T00:00:00Z"}, meta)
+	if len(body) == 0 {
+		t.Fatal("should encode DateTime")
+	}
+}
+
+func TestEncodeBinaryRequestEnum(t *testing.T) {
+	meta := []ParamMeta{
+		{Name: "role", Type: "Enum", FieldID: 1},
+	}
+	body := EncodeBinaryRequest(1, map[string]any{"role": "ADMIN"}, meta)
+	if len(body) == 0 {
+		t.Fatal("should encode Enum")
+	}
+}
+
+func TestEncodeBinaryRequestUUID(t *testing.T) {
+	meta := []ParamMeta{
+		{Name: "id", Type: "UUID", FieldID: 1},
+	}
+	body := EncodeBinaryRequest(1, map[string]any{"id": "550e8400-e29b-41d4-a716-446655440000"}, meta)
+	if len(body) == 0 {
+		t.Fatal("should encode UUID")
+	}
+}
+
+func TestEncodeBinaryRequestDecimal(t *testing.T) {
+	meta := []ParamMeta{
+		{Name: "price", Type: "Decimal", FieldID: 1},
+	}
+	body := EncodeBinaryRequest(1, map[string]any{"price": "99.99"}, meta)
+	if len(body) == 0 {
+		t.Fatal("should encode Decimal")
+	}
+}
+
+func TestEncodeBinaryRequestIntFloat64(t *testing.T) {
+	// float64 coercion for Int type (common from JSON)
+	reg := NewAPIRegistry()
+	reg.Register("test", 1)
+	meta := []ParamMeta{
+		{Name: "id", Type: "Int", FieldID: 1},
+	}
+	reg.RegisterParams("test", meta)
+
+	body := EncodeBinaryRequest(1, map[string]any{"id": float64(42)}, meta)
+	req, err := reg.ParseBinaryRequest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := req.ParamInt("id")
+	if id != 42 {
+		t.Fatalf("id = %d, want 42", id)
+	}
+}
+
+func TestEncodeBinaryRequestDurationInt(t *testing.T) {
+	// Duration with plain int
+	meta := []ParamMeta{
+		{Name: "dur", Type: "Duration", FieldID: 1},
+	}
+	body := EncodeBinaryRequest(1, map[string]any{"dur": 100}, meta)
+	if len(body) == 0 {
+		t.Fatal("should encode Duration with plain int")
+	}
+}
+
+func TestEncodeBinaryRequestDurationFloat64(t *testing.T) {
+	// Duration with float64
+	meta := []ParamMeta{
+		{Name: "dur", Type: "Duration", FieldID: 1},
+	}
+	body := EncodeBinaryRequest(1, map[string]any{"dur": float64(500)}, meta)
+	if len(body) == 0 {
+		t.Fatal("should encode Duration with float64")
+	}
+}
+
+// --- ParseBinaryRequest: field mask size exceeds limit ---
+
+func TestParseBinaryRequestFieldMaskSizeLimit(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("test", 1)
+
+	// Build body: API ID=1, mask length = maxFieldMaskSize+1
+	var body []byte
+	body = codec.AppendVarint(body, 1)     // API ID
+	body = codec.AppendVarint(body, 10241) // mask length > 10*1024
+	// Append enough bytes to make it valid
+	body = append(body, make([]byte, 10241)...)
+
+	_, err := reg.ParseBinaryRequest(body)
+	if err == nil {
+		t.Fatal("should error on field mask size exceeding limit")
+	}
+	if !strings.Contains(err.Error(), "exceeds limit") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// --- ParseBinaryRequest: field mask length > body length ---
+
+func TestParseBinaryRequestFieldMaskLenOverflow(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("test", 1)
+
+	// mask length > remaining body
+	var body []byte
+	body = codec.AppendVarint(body, 1)    // API ID
+	body = codec.AppendVarint(body, 5000) // mask length = 5000 but body is small
+
+	_, err := reg.ParseBinaryRequest(body)
+	if err == nil {
+		t.Fatal("should error on mask length overflow")
+	}
+}
+
+// --- ParseBinaryRequest: too many params ---
+
+func TestParseBinaryRequestTooManyParams(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("test", 1)
+
+	// Register 17 params (> 16 limit)
+	var params []ParamMeta
+	for i := 0; i < 17; i++ {
+		params = append(params, ParamMeta{
+			Name:    fmt.Sprintf("p%d", i),
+			Type:    "Int",
+			FieldID: i + 1,
+		})
+	}
+	reg.RegisterParams("test", params)
+
+	// Build request with param at index 16 (exceeds limit)
+	var body []byte
+	body = codec.AppendVarint(body, 1) // API ID
+	body = codec.AppendVarint(body, 0) // mask=0
+	// Write param with field ID 17 (index 16)
+	body = codec.AppendVarint(body, 17)        // field ID 17
+	body = codec.AppendSvarint(body, int64(1)) // value
+	body = append(body, 0x00)                  // end
+
+	_, err := reg.ParseBinaryRequest(body)
+	if err == nil {
+		t.Fatal("should error when param index >= 16")
+	}
+	if !strings.Contains(err.Error(), "too many params") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 

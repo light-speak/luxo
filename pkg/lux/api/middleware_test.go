@@ -36,9 +36,10 @@ func TestWithCache(t *testing.T) {
 }
 
 func TestInvalidateCache(t *testing.T) {
-	DefaultCache.Set("User:test123", []byte("data"), time.Minute)
+	ctx := context.Background()
+	DefaultCache.Set(ctx, "User:test123", []byte("data"), time.Minute)
 	InvalidateCache("User")
-	if DefaultCache.Get("User:test123") != nil {
+	if got, _ := DefaultCache.Get(ctx, "User:test123"); got != nil {
 		t.Error("should be invalidated")
 	}
 }

@@ -194,20 +194,20 @@ func TestValidDirectives(t *testing.T) {
 	expectNoErrors(t, result)
 }
 
-func TestUnknownDirectiveWarning(t *testing.T) {
+func TestUnknownDirectiveError(t *testing.T) {
 	result := analyze(t, `
 model User @foobar {
   name: String
 }
 `)
-	expectWarning(t, result, "unknown directive '@foobar'")
+	expectError(t, result, "unknown directive '@foobar'")
 }
 
-func TestApiUnknownDirectiveWarning(t *testing.T) {
+func TestApiUnknownDirectiveError(t *testing.T) {
 	result := analyze(t, `
 api test(): Int @unknownDir
 `)
-	expectWarning(t, result, "unknown directive '@unknownDir'")
+	expectError(t, result, "unknown directive '@unknownDir'")
 }
 
 func TestResolveFieldDeclDefaultValue(t *testing.T) {

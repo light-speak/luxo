@@ -80,13 +80,17 @@ func (s *Server) handleMessage(req *Request) error {
 	switch req.Method {
 	case "initialize":
 		return s.handleInitialize(req)
-	case "initialized", "textDocument/didSave":
+	case "initialized":
+		return s.handleInitialized()
+	case "textDocument/didSave":
 		return nil
 	case "shutdown":
 		s.shutdown = true
 		return s.transport.SendResponse(req.ID, nil)
 	case "exit":
 		return nil
+	case "workspace/didChangeWatchedFiles":
+		return s.handleDidChangeWatchedFiles(req)
 	default:
 		return s.handleTextDocument(req)
 	}
@@ -140,6 +144,48 @@ func (s *Server) handleInitialize(req *Request) error {
 			Version: "0.2.0",
 		},
 	})
+}
+
+// handleInitialized registers dynamic capabilities after the client is ready.
+func (s *Server) handleInitialized() error {
+	// Register file watchers for .gen.go and .luxo files
+	return s.transport.SendNotification("client/registerCapability", RegistrationParams{
+		Registrations: []Registration{
+			{
+				ID:     "file-watcher",
+				Method: "workspace/didChangeWatchedFiles",
+				RegisterOptions: DidChangeWatchedFilesRegistrationOptions{
+					Watchers: []FileSystemWatcher{
+						{GlobPattern: "**/*.gen.go", Kind: 7}, // Created|Changed|Deleted
+						{GlobPattern: "**/*.luxo", Kind: 7},
+					},
+				},
+			},
+		},
+	})
+}
+
+// handleDidChangeWatchedFiles re-analyzes open documents when watched files change.
+func (s *Server) handleDidChangeWatchedFiles(req *Request) error {
+	var params DidChangeWatchedFilesParams
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return err
+	}
+
+	if len(params.Changes) == 0 {
+		return nil
+	}
+
+	s.logger.Printf("watched files changed: %d events", len(params.Changes))
+
+	// Mark sibling cache as dirty so new/deleted .luxo files are picked up
+	s.docs.mu.Lock()
+	s.docs.siblingDirty = true
+	s.docs.mu.Unlock()
+
+	// Debounce re-analysis (reuses the same debounce mechanism as didChange)
+	s.docs.scheduleAnalysis()
+	return nil
 }
 
 // ========== Document Sync ==========

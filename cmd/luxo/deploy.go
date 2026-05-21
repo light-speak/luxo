@@ -37,8 +37,7 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 	case "compose":
 		return runDeployCompose()
 	case "helm":
-		fmt.Println("luxo deploy helm is not yet implemented / luxo deploy helm 尚未实现")
-		return nil
+		return runDeployHelm()
 	default:
 		return fmt.Errorf("unknown deploy target: %s", target)
 	}
@@ -89,5 +88,56 @@ func runDeployCompose() error {
 
 	fmt.Printf("\n%s✓ Deploy files generated%s\n", green, reset)
 	fmt.Printf("  Run: docker-compose up -d\n\n")
+	return nil
+}
+
+func runDeployHelm() error {
+	schemaFiles, err := findSchemaFiles()
+	if err != nil {
+		return err
+	}
+	files, err := parseAllFiles(schemaFiles)
+	if err != nil {
+		return err
+	}
+	result, err := analyzeFiles(files)
+	if err != nil {
+		return err
+	}
+
+	modulePath, _ := readModulePath()
+	projectName := modulePath
+	if idx := strings.LastIndex(projectName, "/"); idx >= 0 {
+		projectName = projectName[idx+1:]
+	}
+	if projectName == "" {
+		projectName = "luxo"
+	}
+
+	helm := codegen.GenerateHelmFiles(result, projectName)
+	if helm == nil {
+		fmt.Println("No modules found / 未找到模块")
+		return nil
+	}
+
+	green := "\033[32m"
+	reset := "\033[0m"
+
+	for path, data := range helm.Files {
+		fullPath := "deploy/helm/" + path
+		// Ensure parent directory exists
+		if dir := fullPath[:strings.LastIndex(fullPath, "/")]; dir != "" {
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return fmt.Errorf("mkdir %s: %w", dir, err)
+			}
+		}
+		if err := os.WriteFile(fullPath, data, 0644); err != nil {
+			return fmt.Errorf("write %s: %w", fullPath, err)
+		}
+		fmt.Printf("  %s+%s %s\n", green, reset, fullPath)
+	}
+
+	fmt.Printf("\n%s✓ Helm chart generated%s\n", green, reset)
+	fmt.Printf("  Run: helm install %s deploy/helm/\n\n", projectName)
 	return nil
 }

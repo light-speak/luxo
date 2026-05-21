@@ -689,6 +689,477 @@ func TestIsStreamMsg(t *testing.T) {
 	}
 }
 
+// --- identityFromCtx ---
+
+func TestIdentityFromCtx_WithExtractor(t *testing.T) {
+	old := IdentityExtractor
+	defer func() { IdentityExtractor = old }()
+
+	IdentityExtractor = func(ctx context.Context) any {
+		return "user-42"
+	}
+
+	got := identityFromCtx(context.Background())
+	if got != "user-42" {
+		t.Errorf("expected user-42, got %v", got)
+	}
+}
+
+func TestIdentityFromCtx_NilExtractor(t *testing.T) {
+	old := IdentityExtractor
+	defer func() { IdentityExtractor = old }()
+
+	IdentityExtractor = nil
+	got := identityFromCtx(context.Background())
+	if got != nil {
+		t.Errorf("expected nil, got %v", got)
+	}
+}
+
+// --- WSBinary stream with different param types ---
+
+func TestWSBinary_SubscribeWithFloatParam(t *testing.T) {
+	rt := testWSRouter()
+	rt.Registry.Register("watchFloat", 61)
+	rt.Registry.RegisterParams("watchFloat", []ParamMeta{
+		{Name: "rate", Type: "Float", FieldID: 1},
+	})
+
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	var reqBuf []byte
+	reqBuf = append(reqBuf, 0xFE)
+	reqBuf = codec.AppendVarint(reqBuf, 61) // API ID
+	reqBuf = codec.AppendVarint(reqBuf, 0)  // no mask
+	var enc codec.Encoder
+	enc.WriteFieldFloat(1, 3.14)
+	enc.WriteEnd()
+	reqBuf = append(reqBuf, enc.Bytes()...)
+
+	conn.Write(ctx, websocket.MessageBinary, reqBuf)
+	time.Sleep(50 * time.Millisecond)
+
+	if rt.Streams.SubCount("watchFloat") != 1 {
+		t.Errorf("sub count = %d, want 1", rt.Streams.SubCount("watchFloat"))
+	}
+}
+
+func TestWSBinary_SubscribeWithStringParam(t *testing.T) {
+	rt := testWSRouter()
+	rt.Registry.Register("watchStr", 62)
+	rt.Registry.RegisterParams("watchStr", []ParamMeta{
+		{Name: "channel", Type: "String", FieldID: 1},
+	})
+
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	var reqBuf []byte
+	reqBuf = append(reqBuf, 0xFE)
+	reqBuf = codec.AppendVarint(reqBuf, 62) // API ID
+	reqBuf = codec.AppendVarint(reqBuf, 0)  // no mask
+	var enc codec.Encoder
+	enc.WriteFieldString(1, "general")
+	enc.WriteEnd()
+	reqBuf = append(reqBuf, enc.Bytes()...)
+
+	conn.Write(ctx, websocket.MessageBinary, reqBuf)
+	time.Sleep(50 * time.Millisecond)
+
+	if rt.Streams.SubCount("watchStr") != 1 {
+		t.Errorf("sub count = %d, want 1", rt.Streams.SubCount("watchStr"))
+	}
+}
+
+func TestWSBinary_SubscribeWithBoolParam(t *testing.T) {
+	rt := testWSRouter()
+	rt.Registry.Register("watchBool", 63)
+	rt.Registry.RegisterParams("watchBool", []ParamMeta{
+		{Name: "active", Type: "Boolean", FieldID: 1},
+	})
+
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	var reqBuf []byte
+	reqBuf = append(reqBuf, 0xFE)
+	reqBuf = codec.AppendVarint(reqBuf, 63) // API ID
+	reqBuf = codec.AppendVarint(reqBuf, 0)  // no mask
+	var enc codec.Encoder
+	enc.WriteFieldBool(1, true)
+	enc.WriteEnd()
+	reqBuf = append(reqBuf, enc.Bytes()...)
+
+	conn.Write(ctx, websocket.MessageBinary, reqBuf)
+	time.Sleep(50 * time.Millisecond)
+
+	if rt.Streams.SubCount("watchBool") != 1 {
+		t.Errorf("sub count = %d, want 1", rt.Streams.SubCount("watchBool"))
+	}
+}
+
+// --- WSBinary stream with unsupported param type ---
+
+func TestWSBinary_SubscribeWithUnsupportedParamType(t *testing.T) {
+	rt := testWSRouter()
+	rt.Registry.Register("watchUnsup", 64)
+	rt.Registry.RegisterParams("watchUnsup", []ParamMeta{
+		{Name: "data", Type: "JSON", FieldID: 1}, // unsupported type
+	})
+
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	var reqBuf []byte
+	reqBuf = append(reqBuf, 0xFE)
+	reqBuf = codec.AppendVarint(reqBuf, 64)
+	reqBuf = codec.AppendVarint(reqBuf, 0)
+	var enc codec.Encoder
+	enc.WriteFieldString(1, "{}") // some data for the unsupported field
+	enc.WriteEnd()
+	reqBuf = append(reqBuf, enc.Bytes()...)
+
+	conn.Write(ctx, websocket.MessageBinary, reqBuf)
+	time.Sleep(50 * time.Millisecond)
+
+	// Unsupported type causes early return — should NOT subscribe
+	if rt.Streams.SubCount("watchUnsup") != 0 {
+		t.Errorf("should not subscribe with unsupported param type, got %d", rt.Streams.SubCount("watchUnsup"))
+	}
+}
+
+// --- WSBinary stream with native handler ---
+
+func TestWSBinary_SubscribeNativeHandler(t *testing.T) {
+	rt := testWSRouter()
+	rt.Registry.Register("watchNativeBin", 65)
+	rt.Registry.RegisterParams("watchNativeBin", nil)
+
+	handlerCalled := make(chan struct{}, 1)
+	rt.HandleStreamNative("watchNativeBin", func(ctx context.Context, params *StreamParams, identity any, stream *Stream) {
+		handlerCalled <- struct{}{}
+	})
+
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	var reqBuf []byte
+	reqBuf = append(reqBuf, 0xFE)
+	reqBuf = codec.AppendVarint(reqBuf, 65) // API ID
+	reqBuf = codec.AppendVarint(reqBuf, 0)  // no mask
+	reqBuf = append(reqBuf, 0x00)           // end params
+
+	conn.Write(ctx, websocket.MessageBinary, reqBuf)
+
+	select {
+	case <-handlerCalled:
+		// good
+	case <-time.After(1 * time.Second):
+		t.Fatal("native handler was not called for binary stream subscribe")
+	}
+}
+
+// --- WSBinary stream with field mask ---
+
+func TestWSBinary_SubscribeWithFieldMask(t *testing.T) {
+	rt := testWSRouter()
+	rt.Registry.Register("watchMask", 66)
+	rt.Registry.RegisterParams("watchMask", nil)
+
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	var reqBuf []byte
+	reqBuf = append(reqBuf, 0xFE)
+	reqBuf = codec.AppendVarint(reqBuf, 66) // API ID
+	reqBuf = codec.AppendVarint(reqBuf, 2)  // mask length=2
+	reqBuf = append(reqBuf, 0xFF, 0x01)     // mask bytes
+	reqBuf = append(reqBuf, 0x00)           // end params
+
+	conn.Write(ctx, websocket.MessageBinary, reqBuf)
+	time.Sleep(50 * time.Millisecond)
+
+	if rt.Streams.SubCount("watchMask") != 1 {
+		t.Errorf("sub count = %d, want 1", rt.Streams.SubCount("watchMask"))
+	}
+}
+
+// --- WSBinary stream: too short data ---
+
+func TestWSBinary_StreamTooShort(t *testing.T) {
+	rt := testWSRouter()
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	// Send stream message with only 1 byte (too short)
+	conn.Write(ctx, websocket.MessageBinary, []byte{0xFE})
+	time.Sleep(50 * time.Millisecond)
+
+	// Should not crash, connection alive
+	conn.Write(ctx, websocket.MessageText, []byte(`{"$id":1,"$api":"getUser"}`))
+	_, _, err = conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("connection should survive: %v", err)
+	}
+}
+
+// --- WSBinary stream: unknown API ID ---
+
+func TestWSBinary_StreamUnknownAPIID(t *testing.T) {
+	rt := testWSRouter()
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	var reqBuf []byte
+	reqBuf = append(reqBuf, 0xFE)
+	reqBuf = codec.AppendVarint(reqBuf, 999) // unknown API ID
+	reqBuf = codec.AppendVarint(reqBuf, 0)
+	reqBuf = append(reqBuf, 0x00)
+
+	conn.Write(ctx, websocket.MessageBinary, reqBuf)
+	time.Sleep(50 * time.Millisecond)
+
+	// Should not crash, no subscription created
+	conn.Write(ctx, websocket.MessageText, []byte(`{"$id":1,"$api":"getUser"}`))
+	_, _, err = conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("connection should survive: %v", err)
+	}
+}
+
+// --- WSBinary stream: invalid varint in stream message ---
+
+func TestWSBinary_StreamInvalidVarint(t *testing.T) {
+	rt := testWSRouter()
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	// 0xFE + invalid varint
+	conn.Write(ctx, websocket.MessageBinary, []byte{0xFE, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02})
+	time.Sleep(50 * time.Millisecond)
+
+	// Should not crash
+	conn.Write(ctx, websocket.MessageText, []byte(`{"$id":1,"$api":"getUser"}`))
+	_, _, err = conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("connection should survive: %v", err)
+	}
+}
+
+// --- WSBinary unsubscribe non-existent ---
+
+func TestWSBinary_UnsubscribeNonExistent(t *testing.T) {
+	rt := testWSRouter()
+	rt.Registry.Register("watchGhost", 67)
+
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	// Unsubscribe without subscribing first
+	var unsubBuf []byte
+	unsubBuf = append(unsubBuf, 0xFF)
+	unsubBuf = codec.AppendVarint(unsubBuf, 67)
+	conn.Write(ctx, websocket.MessageBinary, unsubBuf)
+	time.Sleep(50 * time.Millisecond)
+
+	// Should not crash
+	conn.Write(ctx, websocket.MessageText, []byte(`{"$id":1,"$api":"getUser"}`))
+	_, _, err = conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("connection should survive: %v", err)
+	}
+}
+
+// --- isStreamMsg with escape in string ---
+
+func TestIsStreamMsg_EscapeInString(t *testing.T) {
+	// String value with escaped quote shouldn't break parsing
+	got := isStreamMsg([]byte(`{"key":"val\"ue","$sub":"x"}`))
+	if !got {
+		t.Error("should find $sub after escaped quote in string value")
+	}
+}
+
+// --- WSJSON subscribe with empty $sub name ---
+
+func TestWSJSON_SubscribeEmptyName(t *testing.T) {
+	rt := testWSRouter()
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	// Empty $sub name — should be ignored
+	conn.Write(ctx, websocket.MessageText, []byte(`{"$sub":""}`))
+	time.Sleep(50 * time.Millisecond)
+
+	// Should not crash, and no subscription created
+	conn.Write(ctx, websocket.MessageText, []byte(`{"$id":1,"$api":"getUser"}`))
+	_, _, err = conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("connection should survive: %v", err)
+	}
+}
+
+// --- WSJSON unsubscribe non-existent ---
+
+func TestWSJSON_UnsubscribeNonExistent(t *testing.T) {
+	rt := testWSRouter()
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	conn.Write(ctx, websocket.MessageText, []byte(`{"$unsub":"nonexistent"}`))
+	time.Sleep(50 * time.Millisecond)
+
+	// Should not crash
+	conn.Write(ctx, websocket.MessageText, []byte(`{"$id":1,"$api":"getUser"}`))
+	_, _, err = conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("connection should survive: %v", err)
+	}
+}
+
+// --- WS origins config ---
+
+func TestWSOrigins(t *testing.T) {
+	rt := testWSRouter()
+	rt.WSOrigins = []string{"http://example.com"}
+
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// This should fail because origin doesn't match
+	_, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{"http://evil.com"}},
+	})
+	if err == nil {
+		t.Error("should reject connection with wrong origin")
+	}
+}
+
 func TestHasColonAfter(t *testing.T) {
 	tests := []struct {
 		name string

@@ -140,6 +140,99 @@ func TestPlan_MultipleExtendModules(t *testing.T) {
 	}
 }
 
+func TestPlan_ExtendFieldNonRelation(t *testing.T) {
+	// Test the case where a field has Module set but is NOT a relation
+	// (e.g., a scalar extend field like postCount) — should be skipped
+	s := schema.New()
+	s.RegisterModel(&schema.Model{
+		Name: "User",
+		Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt},
+			{ID: 2, Name: "name", Type: schema.FieldString},
+			// Scalar extend field (non-relation) — no FK, not resolvable
+			{ID: 10, Name: "postCount", Type: schema.FieldInt, Module: "post"},
+			// Relation extend field — resolvable
+			{ID: 11, Name: "posts", Type: schema.FieldModel, TypeName: "Post",
+				IsList: true, Relation: true, Module: "post", ForeignKey: "userId"},
+		},
+	})
+	m := s.Models["User"]
+
+	// Request all fields including the scalar extend
+	p := Plan(m, nil, "user")
+	if p == nil {
+		t.Fatal("expected non-nil plan (has relation extend)")
+	}
+	// Only the relation extend should be in the plan
+	if len(p.Extends) != 1 {
+		t.Fatalf("expected 1 extend step, got %d", len(p.Extends))
+	}
+	if p.Extends[0].FieldName != "posts" {
+		t.Errorf("extend field = %q, want posts", p.Extends[0].FieldName)
+	}
+}
+
+func TestPlan_NoIDField(t *testing.T) {
+	// Model without an "id" field — IDFieldID should be 0
+	s := schema.New()
+	s.RegisterModel(&schema.Model{
+		Name: "Event",
+		Fields: []schema.Field{
+			{ID: 1, Name: "key", Type: schema.FieldString},
+			{ID: 10, Name: "user", Type: schema.FieldModel, TypeName: "User",
+				IsList: false, Relation: true, Module: "user", ForeignKey: "eventKey"},
+		},
+	})
+	m := s.Models["Event"]
+	p := Plan(m, nil, "event")
+	if p == nil {
+		t.Fatal("expected non-nil plan")
+	}
+	if p.IDFieldID != 0 {
+		t.Errorf("IDFieldID = %d, want 0 (no id field)", p.IDFieldID)
+	}
+}
+
+func TestSchemaFieldToSkipType_NullableEnum(t *testing.T) {
+	f := &schema.Field{Type: schema.FieldEnum, Nullable: true}
+	got := schemaFieldToSkipType(f)
+	if got != codec.SkipNullBytes {
+		t.Errorf("nullable enum skip type = %d, want SkipNullBytes", got)
+	}
+}
+
+func TestSchemaFieldToSkipType_NullableBytes(t *testing.T) {
+	f := &schema.Field{Type: schema.FieldBytes, Nullable: true}
+	got := schemaFieldToSkipType(f)
+	if got != codec.SkipNullBytes {
+		t.Errorf("nullable bytes skip type = %d, want SkipNullBytes", got)
+	}
+}
+
+func TestSchemaFieldToSkipType_NullableModel(t *testing.T) {
+	f := &schema.Field{Type: schema.FieldModel, Nullable: true}
+	got := schemaFieldToSkipType(f)
+	if got != codec.SkipNullBytes {
+		t.Errorf("nullable model skip type = %d, want SkipNullBytes", got)
+	}
+}
+
+func TestSchemaFieldToSkipType_NullableDateTime(t *testing.T) {
+	f := &schema.Field{Type: schema.FieldDateTime, Nullable: true}
+	got := schemaFieldToSkipType(f)
+	if got != codec.SkipNullVarint {
+		t.Errorf("nullable datetime skip type = %d, want SkipNullVarint", got)
+	}
+}
+
+func TestSchemaFieldToSkipType_NullableDuration(t *testing.T) {
+	f := &schema.Field{Type: schema.FieldDuration, Nullable: true}
+	got := schemaFieldToSkipType(f)
+	if got != codec.SkipNullVarint {
+		t.Errorf("nullable duration skip type = %d, want SkipNullVarint", got)
+	}
+}
+
 func TestPlan_NilMaskSelectAll(t *testing.T) {
 	m := userModelWithExtend()
 	// nil mask = select all → should include extend fields
