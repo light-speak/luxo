@@ -99,23 +99,18 @@ func (m *MemoryQueue) Subscribe(queue string, handler Handler) error {
 }
 
 // worker reads tasks from the channel and executes the handler with retry.
+// Channels are never closed; workers detect shutdown exclusively via m.done.
 func (m *MemoryQueue) worker(name string, mq *memQueue) {
 	defer m.wg.Done()
 	for {
 		select {
-		case payload, ok := <-mq.ch:
-			if !ok {
-				return
-			}
+		case payload := <-mq.ch:
 			m.executeWithRetry(name, mq.handler, payload)
 		case <-m.done:
 			// Drain remaining messages in the channel before exiting.
 			for {
 				select {
-				case payload, ok := <-mq.ch:
-					if !ok {
-						return
-					}
+				case payload := <-mq.ch:
 					m.executeWithRetry(name, mq.handler, payload)
 				default:
 					return
@@ -181,12 +176,8 @@ func (m *MemoryQueue) Close() error {
 
 		close(m.done)
 
-		// Close all channels so workers drain and exit.
-		m.mu.Lock()
-		for _, mq := range m.queues {
-			close(mq.ch)
-		}
-		m.mu.Unlock()
+		// Do NOT close mq.ch here — Publish may still be in a select
+		// racing to send on mq.ch. Workers detect shutdown via m.done.
 
 		// Wait with timeout.
 		ch := make(chan struct{})

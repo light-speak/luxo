@@ -357,3 +357,38 @@ func TestMemoryGracefulShutdown(t *testing.T) {
 		t.Error("expected at least some tasks to be processed before close returned")
 	}
 }
+
+func TestMemoryConcurrentPublishClose(t *testing.T) {
+	// Verify that concurrent Publish and Close do not panic (race condition regression test).
+	for range 50 {
+		q := NewMemoryQueue(testConfig())
+		err := q.Subscribe("race", func(ctx context.Context, payload []byte) error {
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+
+		// Spawn publishers.
+		for range 10 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for range 100 {
+					_ = q.Publish(context.Background(), "race", []byte("data"))
+				}
+			}()
+		}
+
+		// Concurrently close.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = q.Close()
+		}()
+
+		wg.Wait()
+	}
+}

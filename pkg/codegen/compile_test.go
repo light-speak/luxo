@@ -973,6 +973,11 @@ func TestCompileWhereArgContainsWithoutSearch(t *testing.T) {
 	if !strings.Contains(got, "EscapeLike") {
 		t.Fatalf("expected EscapeLike in output, got %q", got)
 	}
+	// Verify single % (not %%) in the generated Go code
+	want := `UserWhere.Name.Like("%" + lux.EscapeLike(query) + "%")`
+	if got != want {
+		t.Fatalf("LIKE pattern wrong:\n  got  %q\n  want %q", got, want)
+	}
 }
 
 func TestCompileWhereArgStartsWith(t *testing.T) {

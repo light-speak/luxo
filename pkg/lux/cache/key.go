@@ -59,10 +59,49 @@ func writeValue(h hash.Hash64, v any) {
 	switch val := v.(type) {
 	case string:
 		h.Write([]byte(val))
+	case int:
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(val))
+		h.Write(buf[:])
+	case int8:
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(val))
+		h.Write(buf[:])
+	case int16:
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(val))
+		h.Write(buf[:])
+	case int32:
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(val))
+		h.Write(buf[:])
 	case int64:
 		var buf [8]byte
 		binary.LittleEndian.PutUint64(buf[:], uint64(val))
 		h.Write(buf[:])
+	case uint:
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(val))
+		h.Write(buf[:])
+	case uint8:
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(val))
+		h.Write(buf[:])
+	case uint16:
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(val))
+		h.Write(buf[:])
+	case uint32:
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(val))
+		h.Write(buf[:])
+	case uint64:
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(val))
+		h.Write(buf[:])
+	case float32:
+		s := strconv.FormatFloat(float64(val), 'f', -1, 32)
+		h.Write([]byte(s))
 	case float64:
 		s := strconv.FormatFloat(val, 'f', -1, 64)
 		h.Write([]byte(s))

@@ -39,11 +39,12 @@ type PGTsvector struct {
 // Example: to_tsvector('simple', title) @@ plainto_tsquery('simple', $1)
 func (p *PGTsvector) BuildSearchCondition(column, query string, paramIdx int) (string, []any) {
 	cfg := p.config()
+	qcol := quoteIdent(column)
 	var b strings.Builder
 	b.WriteString("to_tsvector('")
 	b.WriteString(cfg)
 	b.WriteString("', ")
-	b.WriteString(column)
+	b.WriteString(qcol)
 	b.WriteString(") @@ plainto_tsquery('")
 	b.WriteString(cfg)
 	b.WriteString("', $")
@@ -57,9 +58,11 @@ func (p *PGTsvector) BuildSearchCondition(column, query string, paramIdx int) (s
 func (p *PGTsvector) MigrationSQL(table, column string) []string {
 	cfg := p.config()
 	idxName := fmt.Sprintf("idx_%s_%s_search", table, column)
+	qtable := quoteIdent(table)
+	qcol := quoteIdent(column)
 	return []string{
 		fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s USING gin(to_tsvector('%s', %s));",
-			idxName, table, cfg, column),
+			idxName, qtable, cfg, qcol),
 	}
 }
 
@@ -73,4 +76,10 @@ func (p *PGTsvector) config() string {
 		return "simple"
 	}
 	return p.Config
+}
+
+// quoteIdent quotes a SQL identifier with double quotes,
+// escaping any embedded double quotes per SQL standard.
+func quoteIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }

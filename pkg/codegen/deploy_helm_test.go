@@ -228,7 +228,7 @@ func TestHelmModuleService_Ports(t *testing.T) {
 		"type: ClusterIP",
 		"name: http",
 		"name: rpc",
-		"port: 9000",
+		".Values.modules.user.rpcPort",
 		"targetPort: rpc",
 		"component: user",
 	}
@@ -236,6 +236,10 @@ func TestHelmModuleService_Ports(t *testing.T) {
 		if !strings.Contains(svc, check) {
 			t.Errorf("module-user-service.yaml missing %q", check)
 		}
+	}
+	// Ensure no hardcoded 9000
+	if strings.Contains(svc, "port: 9000") {
+		t.Error("module-user-service.yaml should not have hardcoded port: 9000")
 	}
 }
 
@@ -253,11 +257,17 @@ func TestHelmConfigMap_ServiceDiscovery(t *testing.T) {
 		"REDIS_HOST:",
 		"USER_SERVICE_ADDR:",
 		"POST_SERVICE_ADDR:",
+		".Values.modules.user.rpcPort",
+		".Values.modules.post.rpcPort",
 	}
 	for _, check := range checks {
 		if !strings.Contains(cm, check) {
 			t.Errorf("configmap.yaml missing %q", check)
 		}
+	}
+	// Ensure no hardcoded :9000
+	if strings.Contains(cm, ":9000") {
+		t.Error("configmap.yaml should not have hardcoded :9000")
 	}
 }
 
@@ -334,6 +344,40 @@ func TestHelmServiceAccount(t *testing.T) {
 		if !strings.Contains(sa, check) {
 			t.Errorf("serviceaccount.yaml missing %q", check)
 		}
+	}
+}
+
+func TestHelmNormalizeChartName(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"myapp", "myapp"},
+		{"MyApp", "myapp"},
+		{"My_App", "my-app"},
+		{"my.app.io", "my-app-io"},
+		{"MY APP", "my-app"},
+		{"---test---", "test"},
+		{"", "luxo-app"},
+		{"___", "luxo-app"},
+		{strings.Repeat("a", 60), strings.Repeat("a", 53)},
+		{"Hello World!", "hello-world"},
+		{"app@v2.0", "app-v2-0"},
+	}
+	for _, tt := range tests {
+		got := normalizeChartName(tt.input)
+		if got != tt.want {
+			t.Errorf("normalizeChartName(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestHelmNormalizeChartNameApplied(t *testing.T) {
+	result := makeHelmResult("user")
+	helm := GenerateHelmFiles(result, "My_App")
+	chart := string(helm.Files["Chart.yaml"])
+	if !strings.Contains(chart, "name: my-app") {
+		t.Errorf("Chart.yaml should use normalized name, got:\n%s", chart)
 	}
 }
 

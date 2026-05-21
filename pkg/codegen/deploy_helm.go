@@ -2,10 +2,34 @@ package codegen
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/semantic"
 )
+
+// invalidChartChars matches any character that is not lowercase alphanumeric or hyphen.
+var invalidChartChars = regexp.MustCompile(`[^a-z0-9-]`)
+
+// normalizeChartName converts a project name into a valid Helm chart name.
+// Chart names must be lowercase RFC 1123 labels: [a-z0-9-], max 53 chars.
+func normalizeChartName(name string) string {
+	name = strings.ToLower(name)
+	name = invalidChartChars.ReplaceAllString(name, "-")
+	// Collapse consecutive hyphens
+	for strings.Contains(name, "--") {
+		name = strings.ReplaceAll(name, "--", "-")
+	}
+	name = strings.Trim(name, "-")
+	if len(name) > 53 {
+		name = name[:53]
+		name = strings.TrimRight(name, "-")
+	}
+	if name == "" {
+		name = "luxo-app"
+	}
+	return name
+}
 
 // HelmFiles holds generated Helm chart files.
 // Keys are relative paths from the chart root (e.g. "Chart.yaml", "templates/gateway-deployment.yaml").
@@ -35,6 +59,8 @@ func GenerateHelmFiles(result *semantic.Result, projectName string) *HelmFiles {
 	if len(modules) == 0 {
 		return nil
 	}
+
+	projectName = normalizeChartName(projectName)
 
 	hasEvents := false
 	for _, m := range modules {
@@ -264,7 +290,7 @@ func generateConfigMap(modules []moduleInfo, hasEvents bool) []byte {
 	for _, m := range modules {
 		envKey := strings.ToUpper(m.name) + "_SERVICE_ADDR"
 		// Kubernetes DNS: <service-name>.<namespace>.svc.cluster.local:port
-		fmt.Fprintf(&b, "  %s: {{ include \"luxo.fullname\" . }}-%s:9000\n", envKey, m.name)
+		fmt.Fprintf(&b, "  %s: {{ include \"luxo.fullname\" . }}-%s:{{ .Values.modules.%s.rpcPort }}\n", envKey, m.name, m.name)
 	}
 
 	return []byte(b.String())
@@ -566,7 +592,7 @@ func generateModuleService(m moduleInfo) []byte {
 	b.WriteString("      targetPort: http\n")
 	b.WriteString("      protocol: TCP\n")
 	b.WriteString("      name: http\n")
-	b.WriteString("    - port: 9000\n")
+	fmt.Fprintf(&b, "    - port: {{ .Values.modules.%s.rpcPort }}\n", m.name)
 	b.WriteString("      targetPort: rpc\n")
 	b.WriteString("      protocol: TCP\n")
 	b.WriteString("      name: rpc\n")

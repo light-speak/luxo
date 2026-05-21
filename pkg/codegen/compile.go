@@ -1257,11 +1257,11 @@ func (c *compiler) compileWhereMethodCall(modelName string, expr ast.Expr) strin
 	// Non-search: generate LIKE conditions
 	switch method {
 	case "contains":
-		return fmt.Sprintf(`%sWhere.%s.Like("%%%%" + lux.EscapeLike(%s) + "%%%%")`, modelName, str.Capitalize(fieldName), argVal)
+		return fmt.Sprintf(`%sWhere.%s.Like("%%" + lux.EscapeLike(%s) + "%%")`, modelName, str.Capitalize(fieldName), argVal)
 	case "startsWith":
-		return fmt.Sprintf(`%sWhere.%s.Like(lux.EscapeLike(%s) + "%%%%")`, modelName, str.Capitalize(fieldName), argVal)
+		return fmt.Sprintf(`%sWhere.%s.Like(lux.EscapeLike(%s) + "%%")`, modelName, str.Capitalize(fieldName), argVal)
 	case "endsWith":
-		return fmt.Sprintf(`%sWhere.%s.Like("%%%%" + lux.EscapeLike(%s))`, modelName, str.Capitalize(fieldName), argVal)
+		return fmt.Sprintf(`%sWhere.%s.Like("%%" + lux.EscapeLike(%s))`, modelName, str.Capitalize(fieldName), argVal)
 	}
 	return ""
 }

@@ -257,3 +257,129 @@ func TestRedisCache_InvalidateError(t *testing.T) {
 		t.Error("should return error on unreachable Redis")
 	}
 }
+
+// ─── Issue 2: NewRedisFromEnv URL parsing ──────────────────────────────────
+
+func TestNewRedisFromEnv_RedisURL(t *testing.T) {
+	origURL := os.Getenv("REDIS_URL")
+	origPW := os.Getenv("REDIS_PASSWORD")
+	origPfx := os.Getenv("REDIS_PREFIX")
+	defer func() {
+		restoreEnv("REDIS_URL", origURL)
+		restoreEnv("REDIS_PASSWORD", origPW)
+		restoreEnv("REDIS_PREFIX", origPfx)
+	}()
+
+	os.Setenv("REDIS_URL", "redis://localhost:6379/0")
+	os.Unsetenv("REDIS_PASSWORD")
+	os.Unsetenv("REDIS_PREFIX")
+	c := NewRedisFromEnv()
+	if c == nil {
+		t.Fatal("should create cache from redis:// URL")
+	}
+	defer c.Close()
+}
+
+func TestNewRedisFromEnv_RedissURL(t *testing.T) {
+	origURL := os.Getenv("REDIS_URL")
+	origPW := os.Getenv("REDIS_PASSWORD")
+	origPfx := os.Getenv("REDIS_PREFIX")
+	defer func() {
+		restoreEnv("REDIS_URL", origURL)
+		restoreEnv("REDIS_PASSWORD", origPW)
+		restoreEnv("REDIS_PREFIX", origPfx)
+	}()
+
+	os.Setenv("REDIS_URL", "rediss://localhost:6380/1")
+	os.Unsetenv("REDIS_PASSWORD")
+	os.Setenv("REDIS_PREFIX", "myprefix")
+	c := NewRedisFromEnv()
+	if c == nil {
+		t.Fatal("should create cache from rediss:// URL")
+	}
+	defer c.Close()
+	if c.prefix != "myprefix" {
+		t.Errorf("prefix = %q, want %q", c.prefix, "myprefix")
+	}
+}
+
+func TestNewRedisFromEnv_InvalidURL(t *testing.T) {
+	origURL := os.Getenv("REDIS_URL")
+	origPW := os.Getenv("REDIS_PASSWORD")
+	origPfx := os.Getenv("REDIS_PREFIX")
+	defer func() {
+		restoreEnv("REDIS_URL", origURL)
+		restoreEnv("REDIS_PASSWORD", origPW)
+		restoreEnv("REDIS_PREFIX", origPfx)
+	}()
+
+	os.Setenv("REDIS_URL", "redis://invalid url with spaces")
+	os.Unsetenv("REDIS_PASSWORD")
+	os.Unsetenv("REDIS_PREFIX")
+	c := NewRedisFromEnv()
+	if c != nil {
+		c.Close()
+		t.Error("should return nil for invalid redis:// URL")
+	}
+}
+
+func TestNewRedisFromEnv_URLWithPassword(t *testing.T) {
+	origURL := os.Getenv("REDIS_URL")
+	origPW := os.Getenv("REDIS_PASSWORD")
+	origPfx := os.Getenv("REDIS_PREFIX")
+	defer func() {
+		restoreEnv("REDIS_URL", origURL)
+		restoreEnv("REDIS_PASSWORD", origPW)
+		restoreEnv("REDIS_PREFIX", origPfx)
+	}()
+
+	// Password in URL, but REDIS_PASSWORD env overrides.
+	os.Setenv("REDIS_URL", "redis://:urlpass@localhost:6379/0")
+	os.Setenv("REDIS_PASSWORD", "envpass")
+	os.Unsetenv("REDIS_PREFIX")
+	c := NewRedisFromEnv()
+	if c == nil {
+		t.Fatal("should create cache from redis:// URL with password override")
+	}
+	defer c.Close()
+}
+
+// ─── Issue 3: Wildcard invalidate guard ────────────────────────────────────
+
+func TestRedisCache_InvalidateWildcardGuard(t *testing.T) {
+	// No prefix + empty pattern = bare "*" should be rejected.
+	c := NewRedis("localhost:6379")
+	defer c.Close()
+	ctx := context.Background()
+
+	err := c.Invalidate(ctx, "")
+	if err != ErrWildcardInvalidate {
+		t.Errorf("expected ErrWildcardInvalidate, got %v", err)
+	}
+}
+
+func TestRedisCache_InvalidateWithPrefixAllowed(t *testing.T) {
+	// With a prefix configured, empty pattern becomes "prefix:*" which is safe.
+	c := NewRedis("invalid:0", WithPrefix("myapp"), WithTimeout(100*time.Millisecond))
+	defer c.Close()
+	ctx := context.Background()
+
+	err := c.Invalidate(ctx, "")
+	// Should NOT return ErrWildcardInvalidate; it will fail with connection error instead.
+	if err == ErrWildcardInvalidate {
+		t.Error("invalidate with prefix should not be blocked")
+	}
+}
+
+func TestRedisCache_InvalidateNonEmptyPatternAllowed(t *testing.T) {
+	// No prefix but non-empty pattern = "User:*" which is safe.
+	c := NewRedis("invalid:0", WithTimeout(100*time.Millisecond))
+	defer c.Close()
+	ctx := context.Background()
+
+	err := c.Invalidate(ctx, "User:")
+	// Should NOT return ErrWildcardInvalidate; it will fail with connection error instead.
+	if err == ErrWildcardInvalidate {
+		t.Error("invalidate with non-empty pattern should not be blocked")
+	}
+}

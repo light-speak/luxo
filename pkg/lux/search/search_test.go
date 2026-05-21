@@ -10,7 +10,7 @@ import (
 func TestPGTsvector_BuildSearchCondition_Default(t *testing.T) {
 	pg := &PGTsvector{}
 	sql, args := pg.BuildSearchCondition("title", "hello world", 1)
-	want := "to_tsvector('simple', title) @@ plainto_tsquery('simple', $1)"
+	want := `to_tsvector('simple', "title") @@ plainto_tsquery('simple', $1)`
 	if sql != want {
 		t.Errorf("SQL =\n  %q\nwant\n  %q", sql, want)
 	}
@@ -57,8 +57,11 @@ func TestPGTsvector_MigrationSQL_Default(t *testing.T) {
 	if !strings.Contains(stmt, "USING gin") {
 		t.Errorf("missing GIN: %s", stmt)
 	}
-	if !strings.Contains(stmt, "to_tsvector('simple', title)") {
+	if !strings.Contains(stmt, `to_tsvector('simple', "title")`) {
 		t.Errorf("missing tsvector expression: %s", stmt)
+	}
+	if !strings.Contains(stmt, `ON "posts"`) {
+		t.Errorf("missing quoted table: %s", stmt)
 	}
 }
 
@@ -87,4 +90,31 @@ func TestPGTsvector_Name(t *testing.T) {
 
 func TestPGTsvector_ImplementsSearchBackend(t *testing.T) {
 	var _ SearchBackend = (*PGTsvector)(nil)
+}
+
+// ─── quoteIdent ─────────────────────────────────────────────────────────────
+
+func TestQuoteIdent(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"title", `"title"`},
+		{"user_name", `"user_name"`},
+		{`col"x`, `"col""x"`},
+		{"", `""`},
+	}
+	for _, tt := range tests {
+		got := quoteIdent(tt.in)
+		if got != tt.want {
+			t.Errorf("quoteIdent(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestPGTsvector_BuildSearchCondition_QuotedColumn(t *testing.T) {
+	pg := &PGTsvector{}
+	sql, _ := pg.BuildSearchCondition(`col"x`, "test", 1)
+	if !strings.Contains(sql, `"col""x"`) {
+		t.Errorf("expected escaped column in SQL: %s", sql)
+	}
 }

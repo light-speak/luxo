@@ -518,7 +518,8 @@ func TestS3StorageURLWithExplicitBucket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if url != "https://cdn.example.com/key" {
+	// custom-bucket differs from default, so bucket is included in path
+	if url != "https://cdn.example.com/custom-bucket/key" {
 		t.Errorf("url = %q", url)
 	}
 }
@@ -563,6 +564,16 @@ func newTestS3Storage(mc *mockS3Client, bucket, publicURL string) *S3Storage {
 	}
 }
 
+// newTestS3StorageWithRegion builds an S3Storage with a mock client and region.
+func newTestS3StorageWithRegion(mc *mockS3Client, bucket, publicURL, region string) *S3Storage {
+	return &S3Storage{
+		client:    mc,
+		bucket:    bucket,
+		region:    region,
+		publicURL: publicURL,
+	}
+}
+
 // ========== Upload tests ==========
 
 func TestS3StorageUploadSuccess(t *testing.T) {
@@ -579,7 +590,8 @@ func TestS3StorageUploadSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if u != "https://cdn.example.com/obj/key.txt" {
+	// mybucket differs from default bucket, so bucket is included in path
+	if u != "https://cdn.example.com/mybucket/obj/key.txt" {
 		t.Errorf("url = %q", u)
 	}
 }
@@ -783,6 +795,85 @@ func TestS3StorageEnsureBucketEmptyFallback(t *testing.T) {
 	}
 	if checkedBucket != "fallback-bucket" {
 		t.Errorf("checked bucket = %q, want %q", checkedBucket, "fallback-bucket")
+	}
+}
+
+// ========== EnsureBucket region propagation ==========
+
+func TestS3StorageEnsureBucketPassesRegion(t *testing.T) {
+	var capturedRegion string
+	mc := &mockS3Client{
+		bucketExistsFn: func(_ context.Context, _ string) (bool, error) {
+			return false, nil
+		},
+		makeBucketFn: func(_ context.Context, _ string, opts minio.MakeBucketOptions) error {
+			capturedRegion = opts.Region
+			return nil
+		},
+	}
+	s := newTestS3StorageWithRegion(mc, "default", "", "ap-southeast-1")
+
+	if err := s.EnsureBucket(context.Background(), "new-bucket"); err != nil {
+		t.Fatal(err)
+	}
+	if capturedRegion != "ap-southeast-1" {
+		t.Errorf("region = %q, want %q", capturedRegion, "ap-southeast-1")
+	}
+}
+
+func TestS3StorageEnsureBucketEmptyRegion(t *testing.T) {
+	var capturedRegion string
+	mc := &mockS3Client{
+		bucketExistsFn: func(_ context.Context, _ string) (bool, error) {
+			return false, nil
+		},
+		makeBucketFn: func(_ context.Context, _ string, opts minio.MakeBucketOptions) error {
+			capturedRegion = opts.Region
+			return nil
+		},
+	}
+	s := newTestS3Storage(mc, "default", "")
+
+	if err := s.EnsureBucket(context.Background(), "b"); err != nil {
+		t.Fatal(err)
+	}
+	if capturedRegion != "" {
+		t.Errorf("region = %q, want empty", capturedRegion)
+	}
+}
+
+// ========== buildURL with non-default bucket ==========
+
+func TestS3StorageBuildURLNonDefaultBucket(t *testing.T) {
+	s := &S3Storage{
+		bucket:    "default",
+		publicURL: "https://cdn.example.com",
+	}
+	url := s.buildURL("other-bucket", "key.txt")
+	if url != "https://cdn.example.com/other-bucket/key.txt" {
+		t.Errorf("url = %q, want https://cdn.example.com/other-bucket/key.txt", url)
+	}
+}
+
+func TestS3StorageBuildURLDefaultBucketNoPrefix(t *testing.T) {
+	s := &S3Storage{
+		bucket:    "mybucket",
+		publicURL: "https://cdn.example.com",
+	}
+	url := s.buildURL("mybucket", "key.txt")
+	if url != "https://cdn.example.com/key.txt" {
+		t.Errorf("url = %q, want https://cdn.example.com/key.txt", url)
+	}
+}
+
+func TestS3StorageBuildURLEmptyBucketNoPrefix(t *testing.T) {
+	s := &S3Storage{
+		bucket:    "default",
+		publicURL: "https://cdn.example.com",
+	}
+	url := s.buildURL("", "key.txt")
+	if url != "https://cdn.example.com/key.txt" {
+		t.Errorf("url = %q, want https://cdn.example.com/key.txt", url)
 	}
 }
 

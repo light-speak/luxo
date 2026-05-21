@@ -104,6 +104,53 @@ func TestBuildKeyRaw_Different(t *testing.T) {
 	}
 }
 
+func TestBuildKey_IntTypes(t *testing.T) {
+	// Go untyped integer (map[string]any{"id": 1}) produces int, not int64.
+	// All integer types with the same value should produce the same hash.
+	base := BuildKey("api", map[string]any{"id": int(42)})
+	cases := []struct {
+		name string
+		val  any
+	}{
+		{"int", int(42)},
+		{"int8", int8(42)},
+		{"int16", int16(42)},
+		{"int32", int32(42)},
+		{"int64", int64(42)},
+		{"uint", uint(42)},
+		{"uint8", uint8(42)},
+		{"uint16", uint16(42)},
+		{"uint32", uint32(42)},
+		{"uint64", uint64(42)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			key := BuildKey("api", map[string]any{"id": tc.val})
+			if key != base {
+				t.Errorf("%s: got %q, want %q", tc.name, key, base)
+			}
+		})
+	}
+}
+
+func TestBuildKey_IntVsDefault(t *testing.T) {
+	// Before the fix, int would fall through to default "?" branch.
+	// Verify int(1) and int(2) produce different keys (not both "?").
+	k1 := BuildKey("api", map[string]any{"id": int(1)})
+	k2 := BuildKey("api", map[string]any{"id": int(2)})
+	if k1 == k2 {
+		t.Error("int(1) and int(2) should produce different keys")
+	}
+}
+
+func TestBuildKey_Float32(t *testing.T) {
+	k1 := BuildKey("api", map[string]any{"val": float32(1.5)})
+	k2 := BuildKey("api", map[string]any{"val": float32(2.5)})
+	if k1 == k2 {
+		t.Error("different float32 values should produce different keys")
+	}
+}
+
 func TestInvalidatePrefix(t *testing.T) {
 	prefix := InvalidatePrefix("User")
 	if prefix != "luxo:api:user" {

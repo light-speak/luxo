@@ -26,6 +26,7 @@ type s3Client interface {
 type S3Storage struct {
 	client    s3Client
 	bucket    string
+	region    string // region for bucket creation
 	publicURL string // base URL for public access (no trailing slash)
 }
 
@@ -57,6 +58,7 @@ func NewS3Storage(cfg Config) (*S3Storage, error) {
 	return &S3Storage{
 		client:    client,
 		bucket:    cfg.Bucket,
+		region:    cfg.Region,
 		publicURL: publicURL,
 	}, nil
 }
@@ -117,7 +119,7 @@ func (s *S3Storage) EnsureBucket(ctx context.Context, bucket string) error {
 		return fmt.Errorf("storage: check bucket %s: %w", bucket, err)
 	}
 	if !exists {
-		if err := s.client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{Region: ""}); err != nil {
+		if err := s.client.MakeBucket(ctx, bucket, minio.MakeBucketOptions{Region: s.region}); err != nil {
 			return fmt.Errorf("storage: create bucket %s: %w", bucket, err)
 		}
 	}
@@ -125,8 +127,13 @@ func (s *S3Storage) EnsureBucket(ctx context.Context, bucket string) error {
 }
 
 // buildURL constructs the public URL for an object.
+// When publicURL is set and bucket differs from the default, the bucket is
+// included in the path so that multi-bucket setups resolve correctly.
 func (s *S3Storage) buildURL(bucket, key string) string {
 	if s.publicURL != "" {
+		if bucket != "" && bucket != s.bucket {
+			return s.publicURL + "/" + bucket + "/" + key
+		}
 		return s.publicURL + "/" + key
 	}
 	// Fallback: use endpoint URL from minio client
