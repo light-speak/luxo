@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/light-speak/luxo/pkg/lux/auth"
 )
 
 func TestMaskDSN(t *testing.T) {
@@ -266,6 +268,8 @@ func TestBuildMuxCustomPort(t *testing.T) {
 
 func TestBuildMuxWithAuth(t *testing.T) {
 	t.Setenv("JWT_SECRET", "test-secret-key")
+	auth.ResetConfig() // clear sync.Once cache
+	defer auth.ResetConfig()
 
 	gw := New()
 	mux, _ := gw.buildMux("v1")
@@ -494,6 +498,77 @@ func generateTestCert(t *testing.T) (certFile, keyFile string) {
 
 func TestServe_InvalidShutdownTimeout(t *testing.T) {
 	t.Setenv("SHUTDOWN_TIMEOUT", "not-a-duration")
+	t.Setenv("APP_PORT", "0")
+
+	gw := New()
+	done := make(chan error, 1)
+	go func() {
+		done <- gw.Serve("test-v1")
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	proc, _ := os.FindProcess(os.Getpid())
+	proc.Signal(syscall.SIGINT)
+
+	err := <-done
+	if err != nil {
+		t.Errorf("got: %v", err)
+	}
+}
+
+func TestBuildMuxWithI18nDir(t *testing.T) {
+	// Create a temp dir with i18n translations to test the success path
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origDir)
+
+	dir := t.TempDir()
+	os.Chdir(dir)
+
+	// Create i18n directory with a translation file
+	i18nDir := filepath.Join(dir, "i18n")
+	os.Mkdir(i18nDir, 0755)
+	os.WriteFile(filepath.Join(i18nDir, "en.json"), []byte(`{"hello": "Hello"}`), 0644)
+
+	gw := New()
+	mux, _ := gw.buildMux("v1")
+	if mux == nil {
+		t.Fatal("mux should not be nil")
+	}
+}
+
+func TestServeWithMetricsAndRegistrar(t *testing.T) {
+	// Test Serve with Studio env vars set to test metrics/registrar init paths
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	t.Setenv("LUXO_STUDIO_URL", srv.URL)
+	t.Setenv("LUXO_API_KEY", "test-key")
+	t.Setenv("APP_PORT", "0")
+
+	gw := New()
+	done := make(chan error, 1)
+	go func() {
+		done <- gw.Serve("test-v1")
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	proc, _ := os.FindProcess(os.Getpid())
+	proc.Signal(syscall.SIGINT)
+
+	err := <-done
+	if err != nil {
+		t.Errorf("Serve should shut down cleanly, got: %v", err)
+	}
+}
+
+func TestWaitForShutdown_NilMetricsAndRegistrar(t *testing.T) {
+	// Test waitForShutdown with nil metrics and registrar (already covered
+	// by the basic Serve tests, but explicitly verify the nil guard paths)
 	t.Setenv("APP_PORT", "0")
 
 	gw := New()

@@ -542,6 +542,112 @@ func TestSetParamSlotTypeMismatch(t *testing.T) {
 	}
 }
 
+// --- parseListParams additional paths ---
+
+func TestParseRequestBadPageType(t *testing.T) {
+	body := `{"$api":"test","page":"not-int"}`
+	_, err := ParseRequest(makeReq(body))
+	if err == nil {
+		t.Fatal("expected error for non-integer page")
+	}
+	if !strings.Contains(err.Error(), "page must be an integer") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestParseRequestBadPageSizeType(t *testing.T) {
+	body := `{"$api":"test","pageSize":"not-int"}`
+	_, err := ParseRequest(makeReq(body))
+	if err == nil {
+		t.Fatal("expected error for non-integer pageSize")
+	}
+	if !strings.Contains(err.Error(), "pageSize must be an integer") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestParseRequestSortersLimit(t *testing.T) {
+	var sorters []string
+	for i := 0; i < 101; i++ {
+		sorters = append(sorters, fmt.Sprintf(`{"field":"f%d","order":"asc"}`, i))
+	}
+	body := fmt.Sprintf(`{"$api":"test","$sorters":[%s]}`, strings.Join(sorters, ","))
+	_, err := ParseRequest(makeReq(body))
+	if err == nil {
+		t.Fatal("expected error for >100 sorters")
+	}
+	if !strings.Contains(err.Error(), "exceeds limit") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestParseRequestPageSizeZero(t *testing.T) {
+	body := `{"$api":"test","pageSize":0}`
+	req, err := ParseRequest(makeReq(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// pageSize 0 means return all
+	if req.PageSize != 0 {
+		t.Errorf("pageSize should be 0 (return all), got %d", req.PageSize)
+	}
+}
+
+func TestParseRequestPageSizeNegative(t *testing.T) {
+	body := `{"$api":"test","pageSize":-5}`
+	req, err := ParseRequest(makeReq(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Negative pageSize resets to 20
+	if req.PageSize != 20 {
+		t.Errorf("negative pageSize should reset to 20, got %d", req.PageSize)
+	}
+}
+
+// --- ParamString binary mode wrong type ---
+
+func TestParamStringBinaryWrongType(t *testing.T) {
+	req := &Request{
+		paramNames: []string{"name"},
+		paramCount: 1,
+		paramSlots: [16]any{int64(123)}, // wrong type
+	}
+	_, err := req.ParamString("name")
+	if err == nil {
+		t.Fatal("should error when binary param is wrong type")
+	}
+}
+
+// --- readBody size limit ---
+
+func TestReadBodySizeLimit(t *testing.T) {
+	// Create a reader that produces more than MaxRequestBodySize
+	bigReader := strings.NewReader(strings.Repeat("x", MaxRequestBodySize+1))
+	_, _, err := readBody(bigReader)
+	if err == nil {
+		t.Fatal("should error on oversized body")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// --- ParamJSON binary nil value ---
+
+func TestParamJSONBinaryNilValue(t *testing.T) {
+	req := &Request{
+		paramNames: []string{"data"},
+		paramCount: 1,
+		paramSlots: [16]any{nil}, // nil value
+	}
+	var v any
+	err := req.ParamJSON("data", &v)
+	if err != nil {
+		t.Fatal("nil param should not error (nullable)")
+	}
+}
+
 func TestSetParamSlotFloatOverwrite(t *testing.T) {
 	req := &Request{}
 	req.SetBinaryParams([]string{"val"}, 1)

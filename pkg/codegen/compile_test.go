@@ -308,8 +308,30 @@ func TestCompileYieldExpr(t *testing.T) {
 	got := c.compileExpr(&ast.YieldExpr{
 		Value: &ast.Ident{Name: "item"},
 	})
-	if got != "_yieldResult" {
-		t.Fatalf("yield should return _yieldResult, got %q", got)
+	if got != "" {
+		t.Fatalf("yield outside for-expr should return empty, got %q", got)
+	}
+	out := compilerOut(c)
+	if !strings.Contains(out, "_yieldResult = item") {
+		t.Fatalf("yield outside for-expr should assign _yieldResult, got:\n%s", out)
+	}
+	if !strings.Contains(out, "break") {
+		t.Fatalf("yield outside for-expr should break, got:\n%s", out)
+	}
+}
+
+func TestCompileYieldExprInForExpr(t *testing.T) {
+	c := newCompiler(nil)
+	c.inForExpr = true
+	got := c.compileExpr(&ast.YieldExpr{
+		Value: &ast.Ident{Name: "item"},
+	})
+	if got != "" {
+		t.Fatalf("yield in for-expr should return empty, got %q", got)
+	}
+	out := compilerOut(c)
+	if !strings.Contains(out, "return item") {
+		t.Fatalf("yield in for-expr should emit return, got:\n%s", out)
 	}
 }
 
@@ -897,6 +919,201 @@ func TestCompileWhereArgMemberNonIt(t *testing.T) {
 	}
 	if !strings.Contains(got, "Eq(email)") {
 		t.Fatalf("expected 'Eq(email)' in output, got %q", got)
+	}
+}
+
+// ─── compileWhereArg — method calls (contains/startsWith/endsWith) ───────────
+
+func TestCompileWhereArgContainsWithSearch(t *testing.T) {
+	// Model with @search on title field
+	models := map[string]*ast.ModelDecl{
+		"Post": testModel("Post", nil, []*ast.FieldDecl{
+			testField("id", "Int", directive("serial")),
+			testField("title", "String", directive("search")),
+		}),
+	}
+	c := newCompiler(models)
+
+	// it.title.contains(keyword) → PostWhere.Title.Match(keyword) because @search
+	call := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "title"},
+			Field:  "contains",
+		},
+		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "keyword"}}},
+	}
+	got := c.compileWhereArg("Post", call)
+	if got != "PostWhere.Title.Match(keyword)" {
+		t.Fatalf("want PostWhere.Title.Match(keyword), got %q", got)
+	}
+}
+
+func TestCompileWhereArgContainsWithoutSearch(t *testing.T) {
+	// Model without @search on name field
+	models := map[string]*ast.ModelDecl{
+		"User": testModel("User", nil, []*ast.FieldDecl{
+			testField("id", "Int", directive("serial")),
+			testField("name", "String"),
+		}),
+	}
+	c := newCompiler(models)
+
+	// it.name.contains(query) → UserWhere.Name.Like("%" + lux.EscapeLike(query) + "%")
+	call := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "name"},
+			Field:  "contains",
+		},
+		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "query"}}},
+	}
+	got := c.compileWhereArg("User", call)
+	if !strings.Contains(got, "UserWhere.Name.Like") {
+		t.Fatalf("expected Like condition, got %q", got)
+	}
+	if !strings.Contains(got, "EscapeLike") {
+		t.Fatalf("expected EscapeLike in output, got %q", got)
+	}
+	// Verify single % (not %%) in the generated Go code
+	want := `UserWhere.Name.Like("%" + lux.EscapeLike(query) + "%")`
+	if got != want {
+		t.Fatalf("LIKE pattern wrong:\n  got  %q\n  want %q", got, want)
+	}
+}
+
+func TestCompileWhereArgStartsWith(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"User": testModel("User", nil, []*ast.FieldDecl{
+			testField("email", "String"),
+		}),
+	}
+	c := newCompiler(models)
+
+	call := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "email"},
+			Field:  "startsWith",
+		},
+		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "prefix"}}},
+	}
+	got := c.compileWhereArg("User", call)
+	if !strings.Contains(got, "UserWhere.Email.Like") {
+		t.Fatalf("expected Like condition, got %q", got)
+	}
+	if !strings.Contains(got, "EscapeLike(prefix)") {
+		t.Fatalf("expected EscapeLike(prefix), got %q", got)
+	}
+}
+
+func TestCompileWhereArgEndsWith(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"User": testModel("User", nil, []*ast.FieldDecl{
+			testField("email", "String"),
+		}),
+	}
+	c := newCompiler(models)
+
+	call := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "email"},
+			Field:  "endsWith",
+		},
+		Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.String, Value: "@gmail.com"}}},
+	}
+	got := c.compileWhereArg("User", call)
+	if !strings.Contains(got, "UserWhere.Email.Like") {
+		t.Fatalf("expected Like condition, got %q", got)
+	}
+}
+
+func TestCompileWhereArgMethodCallNotIt(t *testing.T) {
+	// Object is not "it" — should not match, falls through to compileExpr
+	c := newCompiler(nil)
+	call := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.MemberExpr{Object: &ast.Ident{Name: "other"}, Field: "title"},
+			Field:  "contains",
+		},
+		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "x"}}},
+	}
+	got := c.compileWhereArg("User", call)
+	// Falls through to compileExpr — should not contain "Where"
+	if strings.Contains(got, "Where") {
+		t.Fatalf("should not produce Where condition: %q", got)
+	}
+}
+
+func TestCompileWhereArgMethodCallNoArgs(t *testing.T) {
+	// No args to .contains() — should not match
+	c := newCompiler(nil)
+	call := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "title"},
+			Field:  "contains",
+		},
+		Args: nil,
+	}
+	got := c.compileWhereArg("User", call)
+	if strings.Contains(got, "Where") {
+		t.Fatalf("should not produce Where condition for no-arg call: %q", got)
+	}
+}
+
+func TestCompileWhereArgMethodCallUnknownMethod(t *testing.T) {
+	// Unknown method — should not match
+	c := newCompiler(nil)
+	call := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "title"},
+			Field:  "uppercase",
+		},
+		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "x"}}},
+	}
+	got := c.compileWhereArg("User", call)
+	if strings.Contains(got, "Where") {
+		t.Fatalf("should not produce Where condition for unknown method: %q", got)
+	}
+}
+
+func TestFieldHasSearch_Found(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"Post": testModel("Post", nil, []*ast.FieldDecl{
+			testField("title", "String", directive("search")),
+		}),
+	}
+	c := newCompiler(models)
+	if !c.fieldHasSearch("Post", "title") {
+		t.Fatal("expected fieldHasSearch to return true for @search field")
+	}
+}
+
+func TestFieldHasSearch_NotFound(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"Post": testModel("Post", nil, []*ast.FieldDecl{
+			testField("title", "String"),
+		}),
+	}
+	c := newCompiler(models)
+	if c.fieldHasSearch("Post", "title") {
+		t.Fatal("expected fieldHasSearch to return false without @search")
+	}
+}
+
+func TestFieldHasSearch_UnknownModel(t *testing.T) {
+	c := newCompiler(nil)
+	if c.fieldHasSearch("NonExistent", "title") {
+		t.Fatal("expected false for unknown model")
+	}
+}
+
+func TestFieldHasSearch_UnknownField(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"Post": testModel("Post", nil, []*ast.FieldDecl{
+			testField("title", "String", directive("search")),
+		}),
+	}
+	c := newCompiler(models)
+	if c.fieldHasSearch("Post", "nonexistent") {
+		t.Fatal("expected false for unknown field")
 	}
 }
 
@@ -3366,7 +3583,7 @@ func TestCompileForExprWithRange(t *testing.T) {
 	}
 }
 
-// TestCompileForExprEmpty — for in empty → []any{}
+// TestCompileForExprEmpty — for in empty → nil
 func TestCompileForExprEmpty(t *testing.T) {
 	c := newCompiler(nil)
 	got := c.compileExpr(&ast.ForStmt{
@@ -3374,8 +3591,8 @@ func TestCompileForExprEmpty(t *testing.T) {
 		Collection: &ast.Ident{Name: "items"},
 		Body:       &ast.Block{Stmts: nil},
 	})
-	if got != "[]any{}" {
-		t.Fatalf("expected []any{}, got %q", got)
+	if got != "nil" {
+		t.Fatalf("expected nil, got %q", got)
 	}
 }
 
@@ -5932,6 +6149,124 @@ func TestCompileForExprWithReturnStmt(t *testing.T) {
 	}
 }
 
+// ─── compileForExpr — yield mode (single value) ────────────────────────────
+
+// TestCompileForExprWithYield — yield exits loop, returns single value
+func TestCompileForExprWithYield(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.ForStmt{
+		VarName:    "item",
+		Collection: &ast.Ident{Name: "items"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.YieldExpr{Value: &ast.Ident{Name: "item"}}},
+		}},
+	})
+	// Should be a closure returning single any, not []any
+	if strings.Contains(got, "[]any") {
+		t.Fatalf("yield for-expr should NOT collect into []any, got:\n%s", got)
+	}
+	if !strings.Contains(got, "func() any") {
+		t.Fatalf("yield for-expr should return func() any, got:\n%s", got)
+	}
+	if !strings.Contains(got, "return item") {
+		t.Fatalf("yield should compile to return inside closure, got:\n%s", got)
+	}
+	if !strings.Contains(got, "return nil") {
+		t.Fatalf("yield for-expr should return nil as fallback, got:\n%s", got)
+	}
+	if !strings.Contains(got, "for _, item := range items") {
+		t.Fatalf("missing range loop, got:\n%s", got)
+	}
+}
+
+// TestCompileForExprNoYield — loop completes without yield (map mode)
+func TestCompileForExprNoYield(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.ForStmt{
+		VarName:    "item",
+		Collection: &ast.Ident{Name: "items"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "item"}, Field: "id"}},
+		}},
+	})
+	// Map mode: should collect into []any
+	if !strings.Contains(got, "[]any") {
+		t.Fatalf("non-yield for-expr should collect into []any, got:\n%s", got)
+	}
+	if !strings.Contains(got, "_result = append(_result,") {
+		t.Fatalf("non-yield for-expr should append to _result, got:\n%s", got)
+	}
+}
+
+// TestCompileYieldInNestedIf — yield inside if inside for
+func TestCompileYieldInNestedIf(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.ForStmt{
+		VarName:    "item",
+		Collection: &ast.Ident{Name: "items"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.IfStmt{
+				Condition: &ast.BinaryExpr{
+					Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "item"}, Field: "id"},
+					Op:    "==",
+					Right: &ast.Ident{Name: "targetId"},
+				},
+				Then: &ast.Block{Stmts: []ast.Stmt{
+					&ast.ExprStmt{Expr: &ast.YieldExpr{Value: &ast.Ident{Name: "item"}}},
+				}},
+			},
+		}},
+	})
+	if !strings.Contains(got, "func() any") {
+		t.Fatalf("yield in nested if should use single-value closure, got:\n%s", got)
+	}
+	if !strings.Contains(got, "return item") {
+		t.Fatalf("yield in nested if should compile to return, got:\n%s", got)
+	}
+	if !strings.Contains(got, "return nil") {
+		t.Fatalf("should have nil fallback, got:\n%s", got)
+	}
+	if strings.Contains(got, "[]any") {
+		t.Fatalf("yield for-expr should NOT use []any, got:\n%s", got)
+	}
+}
+
+// TestCompileForExprYieldWithRange — yield with range collection
+func TestCompileForExprYieldWithRange(t *testing.T) {
+	c := newCompiler(nil)
+	got := c.compileExpr(&ast.ForStmt{
+		VarName: "i",
+		Collection: &ast.RangeExpr{
+			Start: &ast.Literal{Kind: token.Int, Value: "0"},
+			End:   &ast.Literal{Kind: token.Int, Value: "10"},
+		},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.IfStmt{
+				Condition: &ast.BinaryExpr{
+					Left:  &ast.Ident{Name: "i"},
+					Op:    ">",
+					Right: &ast.Literal{Kind: token.Int, Value: "5"},
+				},
+				Then: &ast.Block{Stmts: []ast.Stmt{
+					&ast.ExprStmt{Expr: &ast.YieldExpr{Value: &ast.Ident{Name: "i"}}},
+				}},
+			},
+		}},
+	})
+	if !strings.Contains(got, "func() any") {
+		t.Fatalf("yield range for-expr should use single-value closure, got:\n%s", got)
+	}
+	if !strings.Contains(got, "for i := int64(0); i <= 10; i++") {
+		t.Fatalf("missing C-style range loop, got:\n%s", got)
+	}
+	if !strings.Contains(got, "return i") {
+		t.Fatalf("yield should compile to return, got:\n%s", got)
+	}
+	if !strings.Contains(got, "return nil") {
+		t.Fatalf("should have nil fallback, got:\n%s", got)
+	}
+}
+
 // ─── compileTemplate — non-string expression ────────────────────────────────
 
 func TestCompileTemplateWithIntExpr(t *testing.T) {
@@ -6573,11 +6908,32 @@ func TestCompileFieldExpr_Unsupported(t *testing.T) {
 }
 
 func TestCompileFieldExpr_CallNonMember(t *testing.T) {
-	// foo() — CallExpr with Ident func (not MemberExpr)
+	// foo() — CallExpr with Ident func (free function call, no args)
 	expr := &ast.CallExpr{Func: &ast.Ident{Name: "foo"}}
 	got := compileFieldExpr(expr, "val")
+	if got != "foo()" {
+		t.Errorf("free function call should compile to foo(), got %q", got)
+	}
+}
+
+func TestCompileFieldExpr_CallNonMemberWithArgs(t *testing.T) {
+	// slugify(it) — free function with argument
+	expr := &ast.CallExpr{
+		Func: &ast.Ident{Name: "slugify"},
+		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "it"}}},
+	}
+	got := compileFieldExpr(expr, "val")
+	if got != "slugify(val)" {
+		t.Errorf("slugify(it) should compile to slugify(val), got %q", got)
+	}
+}
+
+func TestCompileFieldExpr_CallNonIdentFunc(t *testing.T) {
+	// CallExpr with non-Ident, non-MemberExpr func — should return empty
+	expr := &ast.CallExpr{Func: &ast.Literal{Kind: token.Int, Value: "42"}}
+	got := compileFieldExpr(expr, "val")
 	if got != "" {
-		t.Errorf("non-member call should return empty, got %q", got)
+		t.Errorf("non-ident/member call should return empty, got %q", got)
 	}
 }
 

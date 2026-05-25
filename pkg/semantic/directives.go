@@ -300,6 +300,15 @@ var builtinDirectives = []DirectiveDef{
 		Description: "vector embedding column (pgvector)",
 	},
 
+	// ===== Field-level directives — file upload =====
+	{
+		Name: "upload", Contexts: OnField,
+		Params:         []ParamDef{{Name: "bucket"}, {Name: "maxSize"}, {Name: "accept"}},
+		MaxArgs:        3,
+		TypeConstraint: []string{"String"},
+		Description:    "file upload field, stored as URL",
+	},
+
 	// ===== Computed field directives =====
 	{
 		Name: "count", Contexts: OnComputed,
@@ -400,7 +409,7 @@ func AllDirectiveNames() []string {
 func (a *Analyzer) validateDirective(d *ast.Directive, ctx DirectiveContext, fieldTypeName string) {
 	def := LookupDirective(d.Name)
 	if def == nil {
-		a.warnUnknownDirective(d)
+		a.errorUnknownDirective(d)
 		return
 	}
 	if def.Contexts&ctx == 0 {
@@ -413,13 +422,13 @@ func (a *Analyzer) validateDirective(d *ast.Directive, ctx DirectiveContext, fie
 	a.checkDirectiveType(d, def, fieldTypeName)
 }
 
-// warnUnknownDirective reports an unknown directive with typo suggestion.
-func (a *Analyzer) warnUnknownDirective(d *ast.Directive) {
+// errorUnknownDirective reports an unknown directive as a compile error with typo suggestion.
+func (a *Analyzer) errorUnknownDirective(d *ast.Directive) {
 	closest := findClosestString(d.Name, AllDirectiveNames())
 	if closest != "" {
-		a.addWarning(d.Pos, "unknown directive '@%s', did you mean '@%s'? / 未知指令 '@%s'，你是不是想写 '@%s'？", d.Name, closest, d.Name, closest)
+		a.addError(d.Pos, "unknown directive '@%s', did you mean '@%s'? / 未知指令 '@%s'，你是不是想写 '@%s'？", d.Name, closest, d.Name, closest)
 	} else {
-		a.addWarning(d.Pos, "unknown directive '@%s' / 未知指令 '@%s'", d.Name, d.Name)
+		a.addError(d.Pos, "unknown directive '@%s' / 未知指令 '@%s'", d.Name, d.Name)
 	}
 }
 

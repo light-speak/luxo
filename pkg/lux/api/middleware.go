@@ -10,13 +10,20 @@ import (
 )
 
 // DefaultCache is the shared cache instance for @cache directive.
-var DefaultCache = cache.New()
+// Defaults to in-memory cache. Set to a RedisCache for multi-instance deployments.
+var DefaultCache cache.Cache = cache.NewMemory()
+
+// SetCache replaces the default cache backend.
+// Call this at startup before registering handlers.
+func SetCache(c cache.Cache) {
+	DefaultCache = c
+}
 
 // WithCache wraps a handler with TTL caching. Cache key = API name + params hash.
 func WithCache(ttl time.Duration, handler HandlerFunc) HandlerFunc {
 	return func(ctx context.Context, req *Request) error {
 		key := cacheKey(req)
-		if data := DefaultCache.Get(key); data != nil {
+		if data, _ := DefaultCache.Get(ctx, key); data != nil {
 			req.Buf.B = append(req.Buf.B, data...)
 			return nil
 		}
@@ -24,14 +31,15 @@ func WithCache(ttl time.Duration, handler HandlerFunc) HandlerFunc {
 		if err := handler(ctx, req); err != nil {
 			return err
 		}
-		DefaultCache.Set(key, req.Buf.B[startLen:], ttl)
+		// Best-effort: ignore cache set errors.
+		DefaultCache.Set(ctx, key, req.Buf.B[startLen:], ttl)
 		return nil
 	}
 }
 
 // InvalidateCache clears cache entries for a model (called after create/update/delete).
 func InvalidateCache(model string) {
-	DefaultCache.Invalidate(model + ":")
+	DefaultCache.Invalidate(context.Background(), model+":")
 }
 
 func cacheKey(req *Request) string {

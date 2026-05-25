@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
@@ -688,6 +689,270 @@ func TestWriteErrorEscapesJSON(t *testing.T) {
 	}
 	if parsed["error"] != "invalid \"field\"\nnewline" {
 		t.Errorf("error message not preserved: %q", parsed["error"])
+	}
+}
+
+// --- SetMetricsCollector / HandleStream ---
+
+type mockMetrics struct {
+	calls []struct {
+		api      string
+		duration time.Duration
+		isError  bool
+	}
+}
+
+func (m *mockMetrics) Record(api string, duration time.Duration, isError bool) {
+	m.calls = append(m.calls, struct {
+		api      string
+		duration time.Duration
+		isError  bool
+	}{api, duration, isError})
+}
+
+func TestSetMetricsCollector(t *testing.T) {
+	rt := NewRouter()
+	mc := &mockMetrics{}
+	rt.SetMetricsCollector(mc)
+
+	rt.Handle("ping", func(ctx context.Context, req *Request) error {
+		req.Buf.AppendString(`"pong"`)
+		return nil
+	})
+
+	body := `{"$api":"ping"}`
+	r := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, r)
+
+	if len(mc.calls) != 1 {
+		t.Fatalf("metrics should be called once, got %d", len(mc.calls))
+	}
+	if mc.calls[0].api != "ping" {
+		t.Errorf("api = %q, want ping", mc.calls[0].api)
+	}
+	if mc.calls[0].isError {
+		t.Error("should not be error")
+	}
+}
+
+func TestMetricsCollectorOnError(t *testing.T) {
+	rt := NewRouter()
+	mc := &mockMetrics{}
+	rt.SetMetricsCollector(mc)
+
+	rt.Handle("fail", func(ctx context.Context, req *Request) error {
+		return fmt.Errorf("oops")
+	})
+
+	body := `{"$api":"fail"}`
+	r := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, r)
+
+	if len(mc.calls) != 1 || !mc.calls[0].isError {
+		t.Error("metrics should record error")
+	}
+}
+
+func TestHandleStream(t *testing.T) {
+	rt := NewRouter()
+	matcher := func(data []byte, params *StreamParams, identity any) bool {
+		return true
+	}
+	rt.HandleStream("watchTest", matcher)
+	if rt.streamMatchers["watchTest"] == nil {
+		t.Error("matcher should be registered")
+	}
+}
+
+// --- convertBinaryToJSON: scalar, type declaration, list, paginated ---
+
+func TestConvertBinaryToJSON_ScalarNoReturnType(t *testing.T) {
+	rt := NewRouter()
+	rt.Schema.RegisterAPI(&schema.API{
+		ID: 1, Name: "deleteUser", Module: "user",
+		ReturnType: "", // no return type = scalar
+	})
+
+	// Encode an int scalar
+	var data []byte
+	data = codec.AppendSvarint(data, 42)
+
+	result := rt.convertBinaryToJSON("deleteUser", data)
+	if string(result) != "42" {
+		t.Errorf("scalar should be 42, got %q", result)
+	}
+}
+
+func TestConvertBinaryToJSON_TypeDeclaration(t *testing.T) {
+	rt := NewRouter()
+	rt.Schema.RegisterType(&schema.TypeDecl{
+		Name: "AuthPayload",
+		Fields: []schema.Field{
+			{ID: 1, Name: "token", Type: schema.FieldString},
+			{ID: 2, Name: "userId", Type: schema.FieldInt},
+		},
+	})
+	rt.Schema.RegisterAPI(&schema.API{
+		ID: 1, Name: "login", Module: "auth",
+		ReturnType: "AuthPayload",
+	})
+
+	// Encode binary: arena header + fields
+	var data []byte
+	data = codec.AppendVarint(data, 0) // arena header
+	var enc codec.Encoder
+	enc.WriteFieldString(1, "abc123")
+	enc.WriteFieldInt(2, 99)
+	enc.WriteEnd()
+	data = append(data, enc.Bytes()...)
+
+	result := rt.convertBinaryToJSON("login", data)
+	got := string(result)
+	if !strings.Contains(got, `"token":"abc123"`) {
+		t.Errorf("should contain token: %s", got)
+	}
+	if !strings.Contains(got, `"userId":99`) {
+		t.Errorf("should contain userId: %s", got)
+	}
+}
+
+func TestConvertBinaryToJSON_ScalarReturnType(t *testing.T) {
+	rt := NewRouter()
+	rt.Schema.RegisterAPI(&schema.API{
+		ID: 1, Name: "count", Module: "stats",
+		ReturnType: "String", // scalar type, not a model
+	})
+
+	var data []byte
+	data = codec.AppendString(data, "hello")
+
+	result := rt.convertBinaryToJSON("count", data)
+	if string(result) != `"hello"` {
+		t.Errorf("scalar string should be quoted, got %q", result)
+	}
+}
+
+func TestConvertBinaryToJSON_ListPath(t *testing.T) {
+	rt := NewRouter()
+	rt.Schema.RegisterModel(&schema.Model{
+		Name: "Item",
+		Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt},
+		},
+	})
+	rt.Schema.RegisterAPI(&schema.API{
+		ID: 1, Name: "listItems", Module: "item",
+		ReturnType: "Item", ReturnList: true,
+	})
+
+	// Empty list — just test that the list path is reached
+	var data []byte
+	data = codec.AppendVarint(data, 0) // arena header (totalStringLen)
+	data = codec.AppendVarint(data, 0) // count=0
+
+	result := rt.convertBinaryToJSON("listItems", data)
+	got := string(result)
+	if got != "[]" {
+		t.Errorf("empty list should be [], got %q", got)
+	}
+}
+
+func TestConvertBinaryToJSON_PaginatedListPath(t *testing.T) {
+	rt := NewRouter()
+	rt.Schema.RegisterModel(&schema.Model{
+		Name: "Item",
+		Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt},
+		},
+	})
+	rt.Schema.RegisterAPI(&schema.API{
+		ID: 1, Name: "listItems", Module: "item",
+		ReturnType: "Item", ReturnList: true, Paginated: true,
+	})
+
+	// Empty paginated list
+	var data []byte
+	data = codec.AppendVarint(data, 0)  // arena header
+	data = codec.AppendVarint(data, 0)  // total=0
+	data = codec.AppendVarint(data, 1)  // page=1
+	data = codec.AppendVarint(data, 20) // pageSize=20
+	data = codec.AppendVarint(data, 0)  // count=0
+
+	result := rt.convertBinaryToJSON("listItems", data)
+	got := string(result)
+	if !strings.Contains(got, "total") {
+		t.Errorf("paginated should have total: %s", got)
+	}
+}
+
+// --- Introspection: no schema registered ---
+
+func TestIntrospectionNoSchema(t *testing.T) {
+	rt := NewRouter()
+	rt.IntrospectionKey = "key"
+	rt.Schema = nil
+
+	r := httptest.NewRequest(http.MethodGet, "/luvia?$schema&key=key", nil)
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, r)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500 for nil schema, got %d", w.Code)
+	}
+}
+
+// --- Binary mode error with binary writeAppError ---
+
+func TestRouterBinaryModeParseError(t *testing.T) {
+	rt := NewRouter()
+	// Send invalid binary body
+	r := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(""))
+	r.Header.Set("X-Luxo-Mode", "binary")
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, r)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+// --- ServeHTTP: JSON request with schema conversion + FieldMask ---
+
+func TestRouterJSONWithFieldMaskConversion(t *testing.T) {
+	rt := NewRouter()
+	rt.Schema.RegisterModel(&schema.Model{
+		Name: "User",
+		Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt},
+			{ID: 2, Name: "name", Type: schema.FieldString},
+			{ID: 3, Name: "email", Type: schema.FieldString},
+		},
+	})
+	rt.Schema.RegisterAPI(&schema.API{
+		ID: 1, Name: "getUser", Module: "user",
+		ReturnType: "User",
+	})
+
+	rt.Handle("getUser", func(ctx context.Context, req *Request) error {
+		// Handler writes binary with field mask
+		req.Buf.B = codec.AppendVarint(req.Buf.B, 0)
+		var enc codec.Encoder
+		enc.WriteFieldInt(1, 1)
+		enc.WriteFieldString(2, "Lin")
+		enc.WriteEnd()
+		req.Buf.B = append(req.Buf.B, enc.Bytes()...)
+		return nil
+	})
+
+	body := `{"$api":"getUser","$select":"id,name","id":1}`
+	r := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

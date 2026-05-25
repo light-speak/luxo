@@ -815,17 +815,7 @@ func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string,
 		}
 	}
 
-	// @beforeSave hooks — run before persisting
-	for _, f := range m.Fields {
-		for _, d := range f.Directives {
-			if d.Name == "beforeSave" && d.Body != nil {
-				fmt.Fprintf(b, "\t\t// @beforeSave on %s\n", f.Name)
-				for _, stmt := range d.Body.Stmts {
-					_ = stmt // TODO: compile beforeSave body when expression compiler supports field context
-				}
-			}
-		}
-	}
+	// @beforeSave hooks are compiled per-field inside generateParamSet
 
 	fmt.Fprintf(b, "\t\tresult, err := builder.Exec(ctx)\n")
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
@@ -1842,13 +1832,27 @@ func generateBeforeSave(b *strings.Builder, f *ast.FieldDecl, varName, indent st
 		if d.Name != "beforeSave" || d.Body == nil || len(d.Body.Stmts) == 0 {
 			continue
 		}
-		es, ok := d.Body.Stmts[0].(*ast.ExprStmt)
-		if !ok || es.Expr == nil {
-			continue
-		}
-		code := compileFieldExpr(es.Expr, varName)
-		if code != "" {
-			fmt.Fprintf(b, "%s%s = %s\n", indent, varName, code)
+		for _, stmt := range d.Body.Stmts {
+			switch s := stmt.(type) {
+			case *ast.AssignStmt:
+				// it = expr → varName = compiledExpr
+				if s.Value == nil {
+					continue
+				}
+				code := compileFieldExpr(s.Value, varName)
+				if code != "" {
+					fmt.Fprintf(b, "%s%s = %s\n", indent, varName, code)
+				}
+			case *ast.ExprStmt:
+				// it.trim() → varName = strings.TrimSpace(varName)
+				if s.Expr == nil {
+					continue
+				}
+				code := compileFieldExpr(s.Expr, varName)
+				if code != "" {
+					fmt.Fprintf(b, "%s%s = %s\n", indent, varName, code)
+				}
+			}
 		}
 	}
 }
@@ -1875,6 +1879,18 @@ func compileFieldExpr(expr ast.Expr, itVar string) string {
 			if result := compileStringConvert(member.Field, obj); result != "" {
 				return result
 			}
+		}
+		// Free function call: slugify(it) → slugify(varName)
+		if ident, ok := e.Func.(*ast.Ident); ok {
+			args := make([]string, 0, len(e.Args))
+			for _, a := range e.Args {
+				compiled := compileFieldExpr(a.Value, itVar)
+				if compiled == "" {
+					return ""
+				}
+				args = append(args, compiled)
+			}
+			return fmt.Sprintf("%s(%s)", ident.Name, strings.Join(args, ", "))
 		}
 	case *ast.MemberExpr:
 		if ident, ok := e.Object.(*ast.Ident); ok && ident.Name == "it" {

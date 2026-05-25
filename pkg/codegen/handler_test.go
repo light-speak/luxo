@@ -2575,6 +2575,148 @@ func TestGenerateBeforeSave_NonExprBody(t *testing.T) {
 	}
 }
 
+func TestGenerateBeforeSave_AssignTrim(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name: "name",
+		Type: &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{
+			{Name: "beforeSave", Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.AssignStmt{
+					Target: &ast.Ident{Name: "it"},
+					Op:     "=",
+					Value: &ast.CallExpr{
+						Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "trim"},
+					},
+				},
+			}}},
+		},
+	}
+	generateBeforeSave(&b, f, "nameVal", "\t")
+	if !strings.Contains(b.String(), "strings.TrimSpace(nameVal)") {
+		t.Errorf("@beforeSave { it = it.trim() } should generate TrimSpace: %s", b.String())
+	}
+}
+
+func TestGenerateBeforeSave_AssignFreeFunc(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name: "slug",
+		Type: &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{
+			{Name: "beforeSave", Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.AssignStmt{
+					Target: &ast.Ident{Name: "it"},
+					Op:     "=",
+					Value: &ast.CallExpr{
+						Func: &ast.Ident{Name: "slugify"},
+						Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "it"}}},
+					},
+				},
+			}}},
+		},
+	}
+	generateBeforeSave(&b, f, "slugVal", "\t")
+	out := b.String()
+	if !strings.Contains(out, "slugify(slugVal)") {
+		t.Errorf("@beforeSave { it = slugify(it) } should generate slugify call: %s", out)
+	}
+}
+
+func TestGenerateBeforeSave_AssignChained(t *testing.T) {
+	var b strings.Builder
+	// it = it.trim().lowercase()
+	f := &ast.FieldDecl{
+		Name: "email",
+		Type: &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{
+			{Name: "beforeSave", Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.AssignStmt{
+					Target: &ast.Ident{Name: "it"},
+					Op:     "=",
+					Value: &ast.CallExpr{
+						Func: &ast.MemberExpr{
+							Object: &ast.CallExpr{
+								Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "trim"},
+							},
+							Field: "lowercase",
+						},
+					},
+				},
+			}}},
+		},
+	}
+	generateBeforeSave(&b, f, "emailVal", "\t")
+	out := b.String()
+	if !strings.Contains(out, "strings.ToLower(strings.TrimSpace(emailVal))") {
+		t.Errorf("@beforeSave { it = it.trim().lowercase() } should chain: %s", out)
+	}
+}
+
+func TestGenerateBeforeSave_MultipleStmts(t *testing.T) {
+	var b strings.Builder
+	// Two statements: it = it.trim(); it = it.lowercase()
+	f := &ast.FieldDecl{
+		Name: "name",
+		Type: &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{
+			{Name: "beforeSave", Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.AssignStmt{
+					Target: &ast.Ident{Name: "it"},
+					Op:     "=",
+					Value: &ast.CallExpr{
+						Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "trim"},
+					},
+				},
+				&ast.AssignStmt{
+					Target: &ast.Ident{Name: "it"},
+					Op:     "=",
+					Value: &ast.CallExpr{
+						Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "lowercase"},
+					},
+				},
+			}}},
+		},
+	}
+	generateBeforeSave(&b, f, "nameVal", "\t")
+	out := b.String()
+	if !strings.Contains(out, "TrimSpace") {
+		t.Errorf("should contain TrimSpace: %s", out)
+	}
+	if !strings.Contains(out, "ToLower") {
+		t.Errorf("should contain ToLower: %s", out)
+	}
+}
+
+func TestGenerateBeforeSave_FreeFuncMultiArgs(t *testing.T) {
+	var b strings.Builder
+	// it = concat(it, "suffix")
+	f := &ast.FieldDecl{
+		Name: "title",
+		Type: &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{
+			{Name: "beforeSave", Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.AssignStmt{
+					Target: &ast.Ident{Name: "it"},
+					Op:     "=",
+					Value: &ast.CallExpr{
+						Func: &ast.Ident{Name: "concat"},
+						Args: []*ast.NamedArg{
+							{Value: &ast.Ident{Name: "it"}},
+							{Value: &ast.Literal{Kind: token.String, Value: "suffix"}},
+						},
+					},
+				},
+			}}},
+		},
+	}
+	generateBeforeSave(&b, f, "titleVal", "\t")
+	out := b.String()
+	if !strings.Contains(out, `concat(titleVal, "suffix")`) {
+		t.Errorf("should generate concat with two args: %s", out)
+	}
+}
+
 func TestCRUDHandlerSkipDuplicate(t *testing.T) {
 	models := []*ast.ModelDecl{
 		{Name: "Project", Fields: []*ast.FieldDecl{

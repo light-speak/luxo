@@ -548,6 +548,7 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 	if hasEvents {
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/event\"\n")
 	}
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/queue\"\n")
 	fmt.Fprintf(&b, "\tpg %q\n", driver.DriverImport())
 	b.WriteString(")\n\n")
 
@@ -558,6 +559,7 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 	if hasEvents {
 		b.WriteString("\tEventBus event.Bus\n")
 	}
+	b.WriteString("\tQueue queue.Queue\n")
 	if hasNativeAPIs {
 		b.WriteString("\tResolver NativeResolver\n")
 	}

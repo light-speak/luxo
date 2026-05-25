@@ -217,6 +217,46 @@ func TestGatewayRegistrarDoubleClose(t *testing.T) {
 	gr.Close() // should not panic
 }
 
+func TestGatewayRegistrarRegisterInvalidURL(t *testing.T) {
+	// Test register with an invalid URL that causes http.NewRequest to fail
+	gr := &GatewayRegistrar{
+		studioURL:  "://invalid", // invalid scheme
+		apiKey:     "test",
+		instanceID: "test",
+		done:       make(chan struct{}),
+		client:     &http.Client{Timeout: 1 * time.Second},
+	}
+	// Should not panic — register exits early on NewRequest error
+	gr.register()
+}
+
+func TestGatewayRegistrarHeartbeatInvalidURL(t *testing.T) {
+	// Test heartbeat with an invalid URL that causes http.NewRequest to fail
+	gr := &GatewayRegistrar{
+		studioURL:  "://invalid", // invalid scheme
+		apiKey:     "test",
+		instanceID: "test",
+		done:       make(chan struct{}),
+		client:     &http.Client{Timeout: 1 * time.Second},
+	}
+	// Should not panic — heartbeat exits early on NewRequest error
+	gr.heartbeat()
+}
+
+func TestGatewayRegistrarHeartbeatLoopDone(t *testing.T) {
+	gr := &GatewayRegistrar{
+		studioURL:  "http://127.0.0.1:1",
+		apiKey:     "test",
+		instanceID: "test",
+		done:       make(chan struct{}),
+		client:     &http.Client{Timeout: 100 * time.Millisecond},
+	}
+	// Close done channel immediately — heartbeatLoop should exit
+	close(gr.done)
+	// heartbeatLoop should return without blocking
+	gr.heartbeatLoop()
+}
+
 func TestGatewayRegistrarCustomEndpoint(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
