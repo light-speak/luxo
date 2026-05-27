@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest'
-import { Encoder, Decoder, fieldMaskSet, fieldMaskHas } from './codec'
+import {
+  Encoder, Decoder, ColumnarDecoder, fieldMaskSet, fieldMaskHas,
+  formatUUID, parseUUID, decodeScalarArray,
+} from './codec'
 
 describe('Encoder', () => {
   it('writeVarint encodes small values in 1 byte', () => {

@@ -192,7 +192,10 @@ func (c *compiler) compileStmt(stmt ast.Stmt) {
 	case *ast.ContinueStmt:
 		c.write("continue")
 	default:
-		c.write("// TODO: unsupported statement %T", stmt)
+		// Unreachable: every ast.Stmt implementation has a case above. A new
+		// statement type added to the AST without a case here is a compiler bug —
+		// fail loud at gen time rather than silently emitting broken Go.
+		panic(fmt.Sprintf("codegen: unhandled statement type %T", stmt))
 	}
 }
 
@@ -627,7 +630,10 @@ func (c *compiler) compileBlockExpr(expr ast.Expr) string {
 		}
 		return ""
 	default:
-		return fmt.Sprintf("/* TODO: %T */", expr)
+		// Unreachable: compileExpr + compileBlockExpr cover every ast.Expr
+		// implementation. A new expression type without a case here is a
+		// compiler bug — fail loud at gen time rather than emit broken Go.
+		panic(fmt.Sprintf("codegen: unhandled expression type %T", expr))
 	}
 }
 

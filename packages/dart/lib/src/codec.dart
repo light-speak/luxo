@@ -84,6 +84,14 @@ class LuxoEncoder {
     _pos += v.length;
   }
 
+  /// Writes a fixed 16-byte UUID (no length prefix) from a canonical
+  /// "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" string.
+  void writeUuid(String v) {
+    _ensureCapacity(16);
+    parseUuidInto(v, _buf, _pos);
+    _pos += 16;
+  }
+
   /// Writes a null marker (0x00).
   void writeNull() {
     _ensureCapacity(1);
@@ -126,6 +134,60 @@ class LuxoEncoder {
   void writeFieldBytes(int fieldID, Uint8List v) {
     writeVarint(fieldID);
     writeBytes(v);
+  }
+
+  /// Writes field header + fixed 16-byte UUID value.
+  void writeFieldUuid(int fieldID, String v) {
+    writeVarint(fieldID);
+    writeUuid(v);
+  }
+
+  // --- Array field writers ---
+  // Array layout: [varint count][item0][item1]... (count uses plain varint).
+
+  /// Writes field header + count-prefixed int64 array (zigzag items).
+  void writeFieldIntArray(int fieldID, List<int> v) {
+    writeVarint(fieldID);
+    writeVarint(v.length);
+    for (final e in v) {
+      writeSvarint(e);
+    }
+  }
+
+  /// Writes field header + count-prefixed float64 array (fixed64 items).
+  void writeFieldFloatArray(int fieldID, List<double> v) {
+    writeVarint(fieldID);
+    writeVarint(v.length);
+    for (final e in v) {
+      writeFixed64(e);
+    }
+  }
+
+  /// Writes field header + count-prefixed string array (length-prefixed items).
+  void writeFieldStringArray(int fieldID, List<String> v) {
+    writeVarint(fieldID);
+    writeVarint(v.length);
+    for (final e in v) {
+      writeString(e);
+    }
+  }
+
+  /// Writes field header + count-prefixed bool array (1 byte per item).
+  void writeFieldBoolArray(int fieldID, List<bool> v) {
+    writeVarint(fieldID);
+    writeVarint(v.length);
+    for (final e in v) {
+      writeBool(e);
+    }
+  }
+
+  /// Writes field header + count-prefixed UUID array (16-byte items).
+  void writeFieldUuidArray(int fieldID, List<String> v) {
+    writeVarint(fieldID);
+    writeVarint(v.length);
+    for (final e in v) {
+      writeUuid(e);
+    }
   }
 
   /// Writes the end marker (fieldID 0).
@@ -239,6 +301,18 @@ class LuxoDecoder {
     return v;
   }
 
+  /// Reads a fixed 16-byte UUID and formats it as a canonical
+  /// "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" string.
+  String readUuid() {
+    if (_off + 16 > _data.lengthInBytes) {
+      error = 'truncated uuid at offset $_off';
+      return '';
+    }
+    final s = formatUuid(_bytes, _off);
+    _off += 16;
+    return s;
+  }
+
   // --- Nullable readers ---
 
   /// Reads a nullable int. Returns null if the null marker is present.
@@ -263,6 +337,12 @@ class LuxoDecoder {
   bool? readBoolPtr() {
     if (!_readNullableFlag()) return null;
     return readBool();
+  }
+
+  /// Reads a nullable UUID. Returns null if the null marker is present.
+  String? readUuidPtr() {
+    if (!_readNullableFlag()) return null;
+    return readUuid();
   }
 
   // --- Array readers ---
@@ -307,6 +387,51 @@ class LuxoDecoder {
     final result = <double>[];
     for (var i = 0; i < count; i++) {
       result.add(readFloat());
+      if (error != null) return const [];
+    }
+    return result;
+  }
+
+  /// Reads a count-prefixed bool array.
+  List<bool> readBoolArray() {
+    final count = _readVarint();
+    if (count < 0) {
+      error = 'invalid array header at offset $_off';
+      return const [];
+    }
+    final result = <bool>[];
+    for (var i = 0; i < count; i++) {
+      result.add(readBool());
+      if (error != null) return const [];
+    }
+    return result;
+  }
+
+  /// Reads a count-prefixed UUID array (16-byte items → canonical strings).
+  List<String> readUuidArray() {
+    final count = _readVarint();
+    if (count < 0) {
+      error = 'invalid array header at offset $_off';
+      return const [];
+    }
+    final result = <String>[];
+    for (var i = 0; i < count; i++) {
+      result.add(readUuid());
+      if (error != null) return const [];
+    }
+    return result;
+  }
+
+  /// Reads a count-prefixed bytes array (length-prefixed items).
+  List<Uint8List> readBytesArray() {
+    final count = _readVarint();
+    if (count < 0) {
+      error = 'invalid array header at offset $_off';
+      return const [];
+    }
+    final result = <Uint8List>[];
+    for (var i = 0; i < count; i++) {
+      result.add(readBytes());
       if (error != null) return const [];
     }
     return result;
@@ -499,6 +624,46 @@ class ColumnarDecoder {
     return result;
   }
 
+  /// Reads [count] fixed 16-byte UUID values as canonical strings.
+  List<String> readColumnUuid() {
+    final result = List<String>.filled(count, '');
+    for (var i = 0; i < count; i++) {
+      if (_off + 16 > _data.lengthInBytes) break;
+      result[i] = formatUuid(_bytes, _off);
+      _off += 16;
+    }
+    return result;
+  }
+
+  /// Reads [count] nullable UUID values (0x00=null, 0x01+16 bytes).
+  List<String?> readColumnUuidPtr() {
+    final result = List<String?>.filled(count, null);
+    for (var i = 0; i < count; i++) {
+      if (_off >= _data.lengthInBytes) break;
+      if (_bytes[_off++] == 0x00) continue;
+      if (_off + 16 > _data.lengthInBytes) break;
+      result[i] = formatUuid(_bytes, _off);
+      _off += 16;
+    }
+    return result;
+  }
+
+  /// Reads [count] length-prefixed byte blobs (one per cell).
+  ///
+  /// Used for scalar array columns and nested/federation columns: each cell is
+  /// a length-prefixed blob. For scalar arrays the blob holds an inline
+  /// [count][items...] array, decoded with a fresh [LuxoDecoder].
+  List<Uint8List> readColumnBytes() {
+    final result = List<Uint8List>.filled(count, _emptyBytes, growable: false);
+    for (var i = 0; i < count; i++) {
+      final len = _readVarint();
+      if (len < 0 || _off + len > _data.lengthInBytes) break;
+      result[i] = Uint8List.sublistView(_bytes, _off, _off + len);
+      _off += len;
+    }
+    return result;
+  }
+
   /// Current read position (for reading pagination metadata after 0x00).
   int get offset => _off;
 
@@ -525,6 +690,64 @@ class ColumnarDecoder {
     }
     return -1;
   }
+}
+
+// --- UUID helpers ---
+
+final Uint8List _emptyBytes = Uint8List(0);
+
+const String _hexDigits = '0123456789abcdef';
+
+/// Formats 16 bytes starting at [off] in [bytes] as a canonical lowercase
+/// UUID string "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
+String formatUuid(Uint8List bytes, int off) {
+  // 32 hex chars + 4 dashes = 36.
+  final out = Uint8List(36);
+  var o = 0;
+  for (var i = 0; i < 16; i++) {
+    if (i == 4 || i == 6 || i == 8 || i == 10) {
+      out[o++] = 0x2D; // '-'
+    }
+    final b = bytes[off + i];
+    out[o++] = _hexDigits.codeUnitAt(b >> 4);
+    out[o++] = _hexDigits.codeUnitAt(b & 0x0F);
+  }
+  return String.fromCharCodes(out);
+}
+
+/// Parses a canonical 36-char UUID string into 16 bytes written into [dst]
+/// starting at [off]. Throws [FormatException] on malformed input.
+void parseUuidInto(String s, Uint8List dst, int off) {
+  if (s.length != 36) {
+    throw FormatException('invalid UUID length: ${s.length}', s);
+  }
+  var j = 0;
+  var i = 0;
+  while (i < s.length) {
+    final c = s.codeUnitAt(i);
+    if (c == 0x2D) {
+      i++;
+      continue;
+    }
+    if (i + 1 >= s.length || j >= 16) {
+      throw FormatException('malformed UUID', s);
+    }
+    final hi = _hexNibble(s.codeUnitAt(i));
+    final lo = _hexNibble(s.codeUnitAt(i + 1));
+    dst[off + j] = (hi << 4) | lo;
+    j++;
+    i += 2;
+  }
+  if (j != 16) {
+    throw FormatException('malformed UUID', s);
+  }
+}
+
+int _hexNibble(int c) {
+  if (c >= 0x30 && c <= 0x39) return c - 0x30; // 0-9
+  if (c >= 0x61 && c <= 0x66) return c - 0x61 + 10; // a-f
+  if (c >= 0x41 && c <= 0x46) return c - 0x41 + 10; // A-F
+  throw const FormatException('invalid hex digit in UUID');
 }
 
 // --- Field mask utilities ---

@@ -65,4 +65,6 @@ data class LuxoParam(
     val id: Int,
     val name: String,
     val type: String,
+    /** True when the param is an array ([T]). */
+    val isList: Boolean = false,
 )

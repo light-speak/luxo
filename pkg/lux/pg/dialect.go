@@ -25,6 +25,12 @@ func (Dialect) ColumnType(luxoType string, serial bool, directives []lux.Directi
 	return pgApplyDirective(base, luxoType, directives)
 }
 
+// ArrayColumnType maps a [T] field to a native PostgreSQL array column,
+// e.g. [String] → TEXT[], [Int] → BIGINT[], [UUID] → UUID[].
+func (Dialect) ArrayColumnType(luxoType string) string {
+	return pgBaseType(luxoType) + "[]"
+}
+
 func pgBaseType(name string) string {
 	switch name {
 	case "Int":

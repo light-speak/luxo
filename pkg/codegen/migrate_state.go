@@ -114,8 +114,19 @@ func ComputeState(result *semantic.Result, enums map[string]bool, dialect lux.Di
 
 // buildColumnState creates a ColumnState from a field declaration.
 func buildColumnState(f *ast.FieldDecl, dialect lux.Dialect) *ColumnState {
-	if f.Type == nil || f.Type.IsList {
+	if f.Type == nil {
 		return nil
+	}
+	// Scalar array field ([T]) → native array / JSON column (per dialect).
+	// Relation lists never reach here (ComputeState skips relation fields).
+	// Array columns are always nullable at the DB level: a nil Go slice maps to
+	// SQL NULL, and NULL / empty array are treated alike (the wire encodes both
+	// as count 0). The `?` on [T] carries no extra semantics.
+	if f.Type.IsList {
+		return &ColumnState{
+			Type:     dialect.ArrayColumnType(f.Type.Name),
+			Nullable: true,
+		}
 	}
 
 	isSerial := hasDirective(f.Directives, "serial")

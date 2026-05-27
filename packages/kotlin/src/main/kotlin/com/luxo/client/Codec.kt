@@ -66,6 +66,14 @@ class LuxoEncoder(initialCapacity: Int = 1024) {
         writeVarint(if (v) 1L else 0L)
     }
 
+    /** Write a canonical UUID string as a fixed 16-byte value (no length prefix). */
+    fun writeUuid(v: String) {
+        val raw = UuidCodec.parse(v)
+        ensure(16)
+        System.arraycopy(raw, 0, buf, pos, 16)
+        pos += 16
+    }
+
     // -- field writers ----------------------------------------------------
 
     fun writeFieldInt(fieldID: Int, v: Long) {
@@ -86,6 +94,21 @@ class LuxoEncoder(initialCapacity: Int = 1024) {
     fun writeFieldBool(fieldID: Int, v: Boolean) {
         writeVarint(fieldID.toLong())
         writeBool(v)
+    }
+
+    fun writeFieldUuid(fieldID: Int, v: String) {
+        writeVarint(fieldID.toLong())
+        writeUuid(v)
+    }
+
+    /**
+     * Write a scalar-array field: [fieldID][count][item0][item1]...
+     * [encode] writes one element per item using the element type's encoding.
+     */
+    fun <T> writeFieldArray(fieldID: Int, items: List<T>, encode: (T) -> Unit) {
+        writeVarint(fieldID.toLong())
+        writeVarint(items.size.toLong())
+        for (item in items) encode(item)
     }
 
     /** Write end-of-struct marker (fieldID 0). */
@@ -171,6 +194,14 @@ class LuxoDecoder(private val buf: ByteArray) {
     /** Read boolean (varint 0 = false, anything else = true). */
     fun readBool(): Boolean = readVarintRaw() != 0L
 
+    /** Read a fixed 16-byte UUID and format it as a canonical lowercase string. */
+    fun readUuid(): String {
+        checkRemaining(16)
+        val s = UuidCodec.format(buf, off)
+        off += 16
+        return s
+    }
+
     // -- nullable readers -------------------------------------------------
 
     fun readIntPtr(): Long? {
@@ -191,6 +222,11 @@ class LuxoDecoder(private val buf: ByteArray) {
     fun readBoolPtr(): Boolean? {
         if (!readNullFlag()) return null
         return readBool()
+    }
+
+    fun readUuidPtr(): String? {
+        if (!readNullFlag()) return null
+        return readUuid()
     }
 
     /** Read a nullable nested model using a decoder lambda. */
@@ -400,6 +436,46 @@ class ColumnarDecoder(private val buf: ByteArray) {
         return result.asList()
     }
 
+    /** Read [count] fixed 16-byte UUID values as canonical lowercase strings. */
+    fun readColumnUuid(): List<String> {
+        val result = Array(count) { "" }
+        for (i in 0 until count) {
+            checkRemaining(16)
+            result[i] = UuidCodec.format(buf, off)
+            off += 16
+        }
+        return result.asList()
+    }
+
+    /** Read [count] nullable UUID values (0x00=null, 0x01+16 bytes). */
+    fun readColumnUuidPtr(): List<String?> {
+        val result = arrayOfNulls<String>(count)
+        for (i in 0 until count) {
+            checkRemaining(1)
+            if (buf[off++] == 0x00.toByte()) continue
+            checkRemaining(16)
+            result[i] = UuidCodec.format(buf, off)
+            off += 16
+        }
+        return result.asList()
+    }
+
+    /**
+     * Read [count] length-prefixed byte blobs. Each cell holds an inline
+     * scalar-array encoding ([count][items...]) or a nested-model blob. Used
+     * for list columns (scalar arrays and relation lists) in columnar form.
+     */
+    fun readColumnBytes(): List<ByteArray> {
+        val result = Array(count) { ByteArray(0) }
+        for (i in 0 until count) {
+            val len = readVarintRaw().toInt()
+            checkRemaining(len)
+            result[i] = buf.copyOfRange(off, off + len)
+            off += len
+        }
+        return result.asList()
+    }
+
     /** Current read position (for reading pagination metadata after 0x00). */
     fun offset(): Int = off
 
@@ -429,6 +505,62 @@ class ColumnarDecoder(private val buf: ByteArray) {
         if (off + n > buf.size) {
             throw LuxoCodecException("unexpected end of buffer at offset $off, need $n bytes")
         }
+    }
+}
+
+/**
+ * UUID wire-format helpers.
+ *
+ * On the Luxo binary wire a UUID is a fixed 16-byte value with no length
+ * prefix. JSON / API surfaces use the canonical 36-char lowercase string
+ * "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
+ */
+object UuidCodec {
+
+    private val HEX = "0123456789abcdef".toCharArray()
+
+    /** Format 16 bytes of [buf] starting at [off] as a canonical lowercase UUID. */
+    fun format(buf: ByteArray, off: Int): String {
+        val out = CharArray(36)
+        var j = 0
+        for (i in 0 until 16) {
+            if (i == 4 || i == 6 || i == 8 || i == 10) {
+                out[j++] = '-'
+            }
+            val b = buf[off + i].toInt() and 0xFF
+            out[j++] = HEX[b ushr 4]
+            out[j++] = HEX[b and 0x0F]
+        }
+        return String(out)
+    }
+
+    /**
+     * Parse a canonical 36-char UUID string into 16 bytes.
+     * Throws [LuxoCodecException] if the string is not a valid UUID.
+     */
+    fun parse(s: String): ByteArray {
+        if (s.length != 36) throw LuxoCodecException("invalid UUID length: ${s.length}")
+        val out = ByteArray(16)
+        var j = 0
+        var i = 0
+        while (i < s.length) {
+            val c = s[i]
+            if (c == '-') { i++; continue }
+            if (i + 1 >= s.length || j >= 16) throw LuxoCodecException("invalid UUID: $s")
+            val hi = nibble(s[i])
+            val lo = nibble(s[i + 1])
+            out[j++] = ((hi shl 4) or lo).toByte()
+            i += 2
+        }
+        if (j != 16) throw LuxoCodecException("invalid UUID: $s")
+        return out
+    }
+
+    private fun nibble(c: Char): Int = when (c) {
+        in '0'..'9' -> c - '0'
+        in 'a'..'f' -> c - 'a' + 10
+        in 'A'..'F' -> c - 'A' + 10
+        else -> throw LuxoCodecException("invalid hex digit: $c")
     }
 }
 

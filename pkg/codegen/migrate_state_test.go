@@ -429,8 +429,23 @@ func TestBuildColumnStateListType(t *testing.T) {
 	d := pgDialect()
 	f := &ast.FieldDecl{Name: "tags", Type: &ast.TypeRef{Name: "String", IsList: true}}
 	cs := buildColumnState(f, d)
-	if cs != nil {
-		t.Error("list type should return nil")
+	if cs == nil {
+		t.Fatal("scalar array field should build an array column")
+	}
+	if cs.Type != "TEXT[]" {
+		t.Errorf("[String] should map to TEXT[], got %q", cs.Type)
+	}
+}
+
+func TestBuildColumnStateListTypeUUID(t *testing.T) {
+	d := pgDialect()
+	f := &ast.FieldDecl{Name: "ids", Type: &ast.TypeRef{Name: "UUID", IsList: true, Nullable: true}}
+	cs := buildColumnState(f, d)
+	if cs == nil || cs.Type != "UUID[]" {
+		t.Fatalf("[UUID] should map to UUID[], got %v", cs)
+	}
+	if !cs.Nullable {
+		t.Error("nullable list should be nullable")
 	}
 }
 

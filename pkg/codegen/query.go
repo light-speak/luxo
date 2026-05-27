@@ -256,7 +256,9 @@ func generateWhereFields(b *strings.Builder, name string, fields []*ast.FieldDec
 	fmt.Fprintf(b, "// %sWhere provides type-safe field conditions.\n", name)
 	fmt.Fprintf(b, "var %sWhere = struct {\n", name)
 	for _, f := range fields {
-		if f.Computed != nil {
+		// Array fields ([T]) have no scalar Condition — exclude from Where.
+		// (Array containment queries are a separate, future feature.)
+		if f.Computed != nil || (f.Type != nil && f.Type.IsList) {
 			continue
 		}
 		goFieldName := str.Capitalize(f.Name)
@@ -265,7 +267,7 @@ func generateWhereFields(b *strings.Builder, name string, fields []*ast.FieldDec
 	}
 	b.WriteString("}{\n")
 	for _, f := range fields {
-		if f.Computed != nil {
+		if f.Computed != nil || (f.Type != nil && f.Type.IsList) {
 			continue
 		}
 		col := str.ToSnakeCase(f.Name)

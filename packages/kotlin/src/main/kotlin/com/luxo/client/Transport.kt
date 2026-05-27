@@ -26,6 +26,8 @@ data class ParamSchema(
     val fieldID: Int,
     val name: String,
     val type: String,
+    /** True when the param is an array ([T]) — encoded as [count][items...]. */
+    val isList: Boolean = false,
 )
 
 /**
@@ -147,11 +149,10 @@ class OkHttpTransport(
 
         for (pm in meta.params) {
             val v = params[pm.name] ?: continue
-            when (pm.type) {
-                "Int", "Duration" -> enc.writeFieldInt(pm.fieldID, (v as Number).toLong())
-                "Float" -> enc.writeFieldFloat(pm.fieldID, (v as Number).toDouble())
-                "String", "Enum", "UUID", "Decimal", "DateTime" -> enc.writeFieldString(pm.fieldID, v as String)
-                "Boolean" -> enc.writeFieldBool(pm.fieldID, v as Boolean)
+            if (pm.isList) {
+                encodeListParam(enc, pm, v)
+            } else {
+                encodeScalarParam(enc, pm, v)
             }
         }
         enc.writeEnd()
@@ -178,6 +179,34 @@ class OkHttpTransport(
         }
 
         return response.body
+    }
+
+    /** Encode a single scalar param to binary using its declared type. */
+    private fun encodeScalarParam(enc: LuxoEncoder, pm: ParamSchema, v: Any) {
+        when (pm.type) {
+            "Int", "Duration" -> enc.writeFieldInt(pm.fieldID, (v as Number).toLong())
+            "Float" -> enc.writeFieldFloat(pm.fieldID, (v as Number).toDouble())
+            "UUID" -> enc.writeFieldUuid(pm.fieldID, v as String)
+            "String", "Enum", "Decimal", "DateTime" -> enc.writeFieldString(pm.fieldID, v as String)
+            "Boolean" -> enc.writeFieldBool(pm.fieldID, v as Boolean)
+        }
+    }
+
+    /** Encode a list param ([count][items...]) to binary using its element type. */
+    private fun encodeListParam(enc: LuxoEncoder, pm: ParamSchema, v: Any) {
+        val items = v as List<*>
+        when (pm.type) {
+            "Int", "Duration" ->
+                enc.writeFieldArray(pm.fieldID, items) { enc.writeSvarint((it as Number).toLong()) }
+            "Float" ->
+                enc.writeFieldArray(pm.fieldID, items) { enc.writeFixed64((it as Number).toDouble()) }
+            "UUID" ->
+                enc.writeFieldArray(pm.fieldID, items) { enc.writeUuid(it as String) }
+            "String", "Enum", "Decimal", "DateTime" ->
+                enc.writeFieldArray(pm.fieldID, items) { enc.writeString(it as String) }
+            "Boolean" ->
+                enc.writeFieldArray(pm.fieldID, items) { enc.writeBool(it as Boolean) }
+        }
     }
 
 

@@ -54,4 +54,5 @@ export interface LuxoParam {
   id: number
   name: string
   type: string
+  isList?: boolean // true for array params (in/notIn → [T])
 }

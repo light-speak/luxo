@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart' as http_testing;
 import 'package:test/test.dart';
 import 'package:luxo_client/src/transport.dart';
+import 'package:luxo_client/src/codec.dart';
 import 'package:luxo_client/src/error.dart';
 
 void main() {
@@ -258,6 +260,80 @@ void main() {
         await transport.call('test.api');
         expect(capturedAuth, equals('Bearer my-token'));
         transport.close();
+      });
+    });
+
+    group('binary param encoding', () {
+      test('UUID param encodes as fixed 16 bytes', () async {
+        const uuid = '550e8400-e29b-41d4-a716-446655440000';
+        late Uint8List captured;
+        final mockClient = http_testing.MockClient((request) async {
+          captured = request.bodyBytes;
+          // minimal valid binary response (UUID scalar): 16 bytes
+          return http.Response.bytes(List.filled(16, 0), 200);
+        });
+        final transport = HttpTransport('http://localhost:8080',
+            client: mockClient, options: TransportOptions(mode: TransportMode.binary));
+        transport.setSchema({
+          'user.get': APISchemaEntry(7, [ParamSchema(1, 'id', 'UUID')]),
+        });
+        await transport.call('user.get', params: {'id': uuid});
+
+        // Layout: varint apiID(7) | varint seq(0) | fieldID(1) | 16 bytes uuid | end(0)
+        expect(captured[0], equals(7)); // apiID
+        expect(captured[1], equals(0)); // seq
+        expect(captured[2], equals(1)); // fieldID
+        // 16 raw UUID bytes follow; first byte = 0x55
+        expect(captured[3], equals(0x55));
+        // total: 3 header + 16 + 1 end = 20
+        expect(captured.length, equals(20));
+        transport.close();
+      });
+
+      test('list param encodes as count-prefixed array', () async {
+        late Uint8List captured;
+        final mockClient = http_testing.MockClient((request) async {
+          captured = request.bodyBytes;
+          return http.Response.bytes(List.filled(8, 0), 200);
+        });
+        final transport = HttpTransport('http://localhost:8080',
+            client: mockClient, options: TransportOptions(mode: TransportMode.binary));
+        transport.setSchema({
+          'user.list': APISchemaEntry(9, [ParamSchema(1, 'ids', 'Int', true)]),
+        });
+        await transport.call('user.list', params: {'ids': [1, 2, 3]});
+
+        // varint apiID(9) | seq(0) | fieldID(1) | count(3) | sv(1) sv(2) sv(3) | end(0)
+        expect(captured[0], equals(9));
+        expect(captured[1], equals(0));
+        expect(captured[2], equals(1)); // fieldID
+        expect(captured[3], equals(3)); // count
+        // zigzag(1)=2, zigzag(2)=4, zigzag(3)=6
+        expect(captured[4], equals(2));
+        expect(captured[5], equals(4));
+        expect(captured[6], equals(6));
+        expect(captured[7], equals(0)); // end
+        transport.close();
+      });
+
+      test('string list param round-trips through encodeParam', () {
+        final enc = LuxoEncoder();
+        encodeParam(enc, const ParamSchema(1, 'tags', 'String', true), ['a', 'bb']);
+        enc.writeEnd();
+        final dec = LuxoDecoder(enc.bytes());
+        expect(dec.nextField(), isTrue);
+        expect(dec.fieldID, equals(1));
+        expect(dec.readStringArray(), equals(['a', 'bb']));
+      });
+
+      test('UUID list param round-trips through encodeParam', () {
+        const a = '550e8400-e29b-41d4-a716-446655440000';
+        final enc = LuxoEncoder();
+        encodeParam(enc, const ParamSchema(1, 'ids', 'UUID', true), [a]);
+        enc.writeEnd();
+        final dec = LuxoDecoder(enc.bytes());
+        expect(dec.nextField(), isTrue);
+        expect(dec.readUuidArray(), equals([a]));
       });
     });
   });

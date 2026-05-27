@@ -312,6 +312,12 @@ func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bo
 // Handles enums, all scalar types (Int/Float/String/Boolean/DateTime/Duration/UUID/Decimal/Bytes/JSON),
 // both nullable and non-nullable variants.
 func writeModelFieldEncoding(b *strings.Builder, f *ast.FieldDecl, fid, goField string, enums map[string]bool, indent string) {
+	// Scalar array field ([String], [Int], [UUID], ...). Relation lists are
+	// excluded by the caller via isRelationField.
+	if f.Type.IsList {
+		writeListScalarField(b, f, fid, goField, enums, indent)
+		return
+	}
 	if enums[f.Type.Name] {
 		if f.Type.Nullable {
 			fmt.Fprintf(b, "%sbuf.B = codec.AppendVarint(buf.B, %s)\n", indent, fid)
@@ -344,7 +350,7 @@ func writeScalarEncoding(b *strings.Builder, typeName string, nullable bool, fid
 		"Float":    {"AppendFixed64", "%s", "*%s"},
 		"String":   {"AppendString", "%s", "*%s"},
 		"Boolean":  {"AppendBool", "%s", "*%s"},
-		"UUID":     {"AppendString", "%s.String()", "%s.String()"},
+		"UUID":     {"AppendUUID", "[16]byte(%s)", "[16]byte(*%s)"},
 		"Decimal":  {"AppendString", "%s.String()", "%s.String()"},
 	}
 
@@ -447,7 +453,7 @@ func generateTypeWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[strin
 
 		// List of scalars: [String], [Int], [Enum], etc.
 		if f.Type.IsList {
-			writeTypeListScalarField(b, f, fid, goField, enums)
+			writeListScalarField(b, f, fid, goField, enums, "\t")
 			continue
 		}
 
@@ -469,38 +475,40 @@ func writeTypeScalarField(b *strings.Builder, f *ast.FieldDecl, fid, goField str
 	writeScalarEncoding(b, f.Type.Name, f.Type.Nullable, fid, goField, "\t")
 }
 
-// writeTypeListScalarField writes a list of scalar values for type WriteLuxo.
-func writeTypeListScalarField(b *strings.Builder, f *ast.FieldDecl, fid, goField string, enums map[string]bool) {
-	fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
-	fmt.Fprintf(b, "\tbuf.B = codec.AppendSvarint(buf.B, int64(len(%s)))\n", goField)
+// writeListScalarField writes a list of scalar values (count + items) for
+// WriteLuxo, per the protocol array encoding: [varint count][items...].
+// Shared by model and type declarations; indent positions the emitted code.
+func writeListScalarField(b *strings.Builder, f *ast.FieldDecl, fid, goField string, enums map[string]bool, indent string) {
+	fmt.Fprintf(b, "%sbuf.B = codec.AppendVarint(buf.B, %s)\n", indent, fid)
+	fmt.Fprintf(b, "%sbuf.B = codec.AppendArrayHeader(buf.B, len(%s))\n", indent, goField)
 
 	elemType := f.Type.Name
 	if enums[elemType] {
-		fmt.Fprintf(b, "\tfor _, v := range %s { buf.B = codec.AppendString(buf.B, string(v)) }\n", goField)
+		fmt.Fprintf(b, "%sfor _, v := range %s { buf.B = codec.AppendString(buf.B, string(v)) }\n", indent, goField)
 		return
 	}
 	switch elemType {
 	case "Int":
-		fmt.Fprintf(b, "\tfor _, v := range %s { buf.B = codec.AppendSvarint(buf.B, v) }\n", goField)
+		fmt.Fprintf(b, "%sfor _, v := range %s { buf.B = codec.AppendSvarint(buf.B, v) }\n", indent, goField)
 	case "Float":
-		fmt.Fprintf(b, "\tfor _, v := range %s { buf.B = codec.AppendFixed64(buf.B, v) }\n", goField)
+		fmt.Fprintf(b, "%sfor _, v := range %s { buf.B = codec.AppendFixed64(buf.B, v) }\n", indent, goField)
 	case "String":
-		fmt.Fprintf(b, "\tfor _, v := range %s { buf.B = codec.AppendString(buf.B, v) }\n", goField)
+		fmt.Fprintf(b, "%sfor _, v := range %s { buf.B = codec.AppendString(buf.B, v) }\n", indent, goField)
 	case "DateTime":
-		fmt.Fprintf(b, "\tfor _, v := range %s { buf.B = codec.AppendSvarint(buf.B, v.Unix()) }\n", goField)
+		fmt.Fprintf(b, "%sfor _, v := range %s { buf.B = codec.AppendSvarint(buf.B, v.Unix()) }\n", indent, goField)
 	case "UUID":
-		fmt.Fprintf(b, "\tfor _, v := range %s { buf.B = codec.AppendString(buf.B, v.String()) }\n", goField)
+		fmt.Fprintf(b, "%sfor _, v := range %s { buf.B = codec.AppendUUID(buf.B, [16]byte(v)) }\n", indent, goField)
 	case "Decimal":
-		fmt.Fprintf(b, "\tfor _, v := range %s { buf.B = codec.AppendString(buf.B, v.String()) }\n", goField)
-	case "Bytes":
-		fmt.Fprintf(b, "\tfor _, v := range %s { buf.B = codec.AppendBytes(buf.B, v) }\n", goField)
+		fmt.Fprintf(b, "%sfor _, v := range %s { buf.B = codec.AppendString(buf.B, v.String()) }\n", indent, goField)
+	case "Bytes", "JSON":
+		fmt.Fprintf(b, "%sfor _, v := range %s { buf.B = codec.AppendBytes(buf.B, v) }\n", indent, goField)
 	case "Boolean":
-		fmt.Fprintf(b, "\tfor _, v := range %s { buf.B = codec.AppendBool(buf.B, v) }\n", goField)
+		fmt.Fprintf(b, "%sfor _, v := range %s { buf.B = codec.AppendBool(buf.B, v) }\n", indent, goField)
 	case "Duration":
-		fmt.Fprintf(b, "\tfor _, v := range %s { buf.B = codec.AppendSvarint(buf.B, int64(v)) }\n", goField)
+		fmt.Fprintf(b, "%sfor _, v := range %s { buf.B = codec.AppendSvarint(buf.B, int64(v)) }\n", indent, goField)
 	default:
 		// Unknown list element — write as nested model
-		fmt.Fprintf(b, "\tfor i := range %s { %s[i].WriteLuxo(buf, nil) }\n", goField, goField)
+		fmt.Fprintf(b, "%sfor i := range %s { %s[i].WriteLuxo(buf, nil) }\n", indent, goField, goField)
 	}
 }
 
@@ -596,6 +604,10 @@ func writeReadLuxoFieldArena(b *strings.Builder, f *ast.FieldDecl, fieldID int, 
 
 // writeReadLuxoField writes a single field's decode case for ReadLuxo.
 func writeReadLuxoField(b *strings.Builder, f *ast.FieldDecl, fieldID int, goField string, enums map[string]bool) {
+	if f.Type.IsList {
+		writeReadLuxoListField(b, f, fieldID, goField, enums)
+		return
+	}
 	if enums[f.Type.Name] {
 		if f.Type.Nullable {
 			fmt.Fprintf(b, "\t\tcase %d:\n\t\t\tif v := dec.ReadStringPtr(); v != nil { tmp := %s(*v); %s = &tmp }\n", fieldID, f.Type.Name, goField)
@@ -624,6 +636,12 @@ func writeReadLuxoField(b *strings.Builder, f *ast.FieldDecl, fieldID int, goFie
 		}
 		return
 	}
+	writeReadLuxoTypedField(b, f, fieldID, goField)
+}
+
+// writeReadLuxoTypedField decodes scalar types that need a conversion wrapper
+// (DateTime/Duration/UUID/Decimal/Bytes/JSON) for ReadLuxo.
+func writeReadLuxoTypedField(b *strings.Builder, f *ast.FieldDecl, fieldID int, goField string) {
 	switch f.Type.Name {
 	case "DateTime":
 		if f.Type.Nullable {
@@ -639,9 +657,9 @@ func writeReadLuxoField(b *strings.Builder, f *ast.FieldDecl, fieldID int, goFie
 		}
 	case "UUID":
 		if f.Type.Nullable {
-			fmt.Fprintf(b, "\t\tcase %d:\n\t\t\tif v := dec.ReadStringPtr(); v != nil { u := uuid.MustParse(*v); %s = &u }\n", fieldID, goField)
+			fmt.Fprintf(b, "\t\tcase %d:\n\t\t\tif v := dec.ReadUUIDPtr(); v != nil { u := uuid.UUID(*v); %s = &u }\n", fieldID, goField)
 		} else {
-			fmt.Fprintf(b, "\t\tcase %d: %s = uuid.MustParse(dec.ReadString())\n", fieldID, goField)
+			fmt.Fprintf(b, "\t\tcase %d: %s = uuid.UUID(dec.ReadUUID())\n", fieldID, goField)
 		}
 	case "Decimal":
 		if f.Type.Nullable {
@@ -655,6 +673,38 @@ func writeReadLuxoField(b *strings.Builder, f *ast.FieldDecl, fieldID int, goFie
 		} else {
 			fmt.Fprintf(b, "\t\tcase %d: %s = dec.ReadBytes()\n", fieldID, goField)
 		}
+	}
+}
+
+// writeReadLuxoListField writes the decode case for a scalar array field ([T]),
+// the inverse of writeListScalarField. Types that aren't a direct Go slice
+// (DateTime/Duration/UUID/Decimal/Enum) decode into a temp slice and convert.
+func writeReadLuxoListField(b *strings.Builder, f *ast.FieldDecl, fieldID int, goField string, enums map[string]bool) {
+	elemType := f.Type.Name
+	if enums[elemType] {
+		fmt.Fprintf(b, "\t\tcase %d:\n\t\t\t{ _a := dec.ReadStringArray(); %s = make([]%s, len(_a)); for i, v := range _a { %s[i] = %s(v) } }\n",
+			fieldID, goField, elemType, goField, elemType)
+		return
+	}
+	switch elemType {
+	case "Int":
+		fmt.Fprintf(b, "\t\tcase %d: %s = dec.ReadIntArray()\n", fieldID, goField)
+	case "Float":
+		fmt.Fprintf(b, "\t\tcase %d: %s = dec.ReadFloatArray()\n", fieldID, goField)
+	case "String":
+		fmt.Fprintf(b, "\t\tcase %d: %s = dec.ReadStringArray()\n", fieldID, goField)
+	case "Boolean":
+		fmt.Fprintf(b, "\t\tcase %d: %s = dec.ReadBoolArray()\n", fieldID, goField)
+	case "Bytes", "JSON":
+		fmt.Fprintf(b, "\t\tcase %d: %s = dec.ReadBytesArray()\n", fieldID, goField)
+	case "DateTime":
+		fmt.Fprintf(b, "\t\tcase %d:\n\t\t\t{ _a := dec.ReadIntArray(); %s = make([]time.Time, len(_a)); for i, v := range _a { %s[i] = time.Unix(v, 0) } }\n", fieldID, goField, goField)
+	case "Duration":
+		fmt.Fprintf(b, "\t\tcase %d:\n\t\t\t{ _a := dec.ReadIntArray(); %s = make([]time.Duration, len(_a)); for i, v := range _a { %s[i] = time.Duration(v) } }\n", fieldID, goField, goField)
+	case "UUID":
+		fmt.Fprintf(b, "\t\tcase %d:\n\t\t\t{ _a := dec.ReadUUIDArray(); %s = make([]uuid.UUID, len(_a)); for i, v := range _a { %s[i] = uuid.UUID(v) } }\n", fieldID, goField, goField)
+	case "Decimal":
+		fmt.Fprintf(b, "\t\tcase %d:\n\t\t\t{ _a := dec.ReadStringArray(); %s = make([]decimal.Decimal, len(_a)); for i, v := range _a { %s[i] = decimal.RequireFromString(v) } }\n", fieldID, goField, goField)
 	}
 }
 
@@ -672,6 +722,7 @@ func generateWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[strin
 		typeName string
 		nullable bool
 		isEnum   bool
+		isList   bool
 	}
 	var fields []fieldMeta
 	for _, f := range m.Fields {
@@ -695,6 +746,7 @@ func generateWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[strin
 			typeName: f.Type.Name,
 			nullable: f.Type.Nullable,
 			isEnum:   enums[f.Type.Name],
+			isList:   f.Type.IsList,
 		})
 	}
 
@@ -710,7 +762,9 @@ func generateWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[strin
 
 	for _, f := range fields {
 		fmt.Fprintf(b, "\tif len(mask) == 0 || codec.FieldMaskHas(mask, %d) {\n", f.fieldID)
-		if f.nullable || f.isEnum {
+		if f.isList {
+			writeColumnarArrayField(b, f.goName, f.fieldID, f.typeName, f.isEnum)
+		} else if f.nullable || f.isEnum {
 			writeColumnarNullableField(b, f.goName, f.fieldID, f.typeName, f.isEnum, f.nullable)
 		} else {
 			writeColumnarField(b, f.goName, f.fieldID, f.typeName)
@@ -749,13 +803,17 @@ func writeColumnarField(b *strings.Builder, goName string, fieldID int, typeName
 		fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = int64(item.%s) }\n", goName)
 		fmt.Fprintf(b, "\t\tw.WriteColumnInt(%d, vals)\n\t}\n", fieldID)
 	case "UUID":
-		fmt.Fprintf(b, "\t{\n\t\tvals := make([]string, len(items))\n")
-		fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = item.%s.String() }\n", goName)
-		fmt.Fprintf(b, "\t\tw.WriteColumnString(%d, vals)\n\t}\n", fieldID)
+		fmt.Fprintf(b, "\t{\n\t\tvals := make([][16]byte, len(items))\n")
+		fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = [16]byte(item.%s) }\n", goName)
+		fmt.Fprintf(b, "\t\tw.WriteColumnUUID(%d, vals)\n\t}\n", fieldID)
 	case "Decimal":
 		fmt.Fprintf(b, "\t{\n\t\tvals := make([]string, len(items))\n")
 		fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = item.%s.String() }\n", goName)
 		fmt.Fprintf(b, "\t\tw.WriteColumnString(%d, vals)\n\t}\n", fieldID)
+	case "Bytes", "JSON":
+		fmt.Fprintf(b, "\t{\n\t\tvals := make([][]byte, len(items))\n")
+		fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = item.%s }\n", goName)
+		fmt.Fprintf(b, "\t\tw.WriteColumnBytes(%d, vals)\n\t}\n", fieldID)
 	}
 }
 
@@ -805,18 +863,61 @@ func writeColumnarNullableField(b *strings.Builder, goName string, fieldID int, 
 		fmt.Fprintf(b, "\t\t}\n")
 		fmt.Fprintf(b, "\t\tw.WriteColumnIntPtr(%d, vals)\n\t}\n", fieldID)
 	case "UUID":
-		fmt.Fprintf(b, "\t{\n\t\tvals := make([]*string, len(items))\n")
+		fmt.Fprintf(b, "\t{\n\t\tvals := make([]*[16]byte, len(items))\n")
 		fmt.Fprintf(b, "\t\tfor i, item := range items {\n")
-		fmt.Fprintf(b, "\t\t\tif item.%s != nil { s := item.%s.String(); vals[i] = &s }\n", goName, goName)
+		fmt.Fprintf(b, "\t\t\tif item.%s != nil { u := [16]byte(*item.%s); vals[i] = &u }\n", goName, goName)
 		fmt.Fprintf(b, "\t\t}\n")
-		fmt.Fprintf(b, "\t\tw.WriteColumnStringPtr(%d, vals)\n\t}\n", fieldID)
+		fmt.Fprintf(b, "\t\tw.WriteColumnUUIDPtr(%d, vals)\n\t}\n", fieldID)
 	case "Decimal":
 		fmt.Fprintf(b, "\t{\n\t\tvals := make([]*string, len(items))\n")
 		fmt.Fprintf(b, "\t\tfor i, item := range items {\n")
 		fmt.Fprintf(b, "\t\t\tif item.%s != nil { s := item.%s.String(); vals[i] = &s }\n", goName, goName)
 		fmt.Fprintf(b, "\t\t}\n")
 		fmt.Fprintf(b, "\t\tw.WriteColumnStringPtr(%d, vals)\n\t}\n", fieldID)
+	case "Bytes", "JSON":
+		fmt.Fprintf(b, "\t{\n\t\tvals := make([]*[]byte, len(items))\n")
+		fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = item.%s }\n", goName)
+		fmt.Fprintf(b, "\t\tw.WriteColumnBytesPtr(%d, vals)\n\t}\n", fieldID)
 	}
+}
+
+// writeColumnarArrayField encodes a scalar array field ([T]) as a Bytes column:
+// each record's cell is an inline array encoding [count][items...], per the
+// protocol's columnar array-field definition.
+func writeColumnarArrayField(b *strings.Builder, goName string, fieldID int, elemType string, isEnum bool) {
+	var itemExpr string
+	switch {
+	case isEnum:
+		itemExpr = "codec.AppendString(cb, string(v))"
+	case elemType == "Int":
+		itemExpr = "codec.AppendSvarint(cb, v)"
+	case elemType == "Float":
+		itemExpr = "codec.AppendFixed64(cb, v)"
+	case elemType == "String":
+		itemExpr = "codec.AppendString(cb, v)"
+	case elemType == "Boolean":
+		itemExpr = "codec.AppendBool(cb, v)"
+	case elemType == "DateTime":
+		itemExpr = "codec.AppendSvarint(cb, v.Unix())"
+	case elemType == "Duration":
+		itemExpr = "codec.AppendSvarint(cb, int64(v))"
+	case elemType == "UUID":
+		itemExpr = "codec.AppendUUID(cb, [16]byte(v))"
+	case elemType == "Decimal":
+		itemExpr = "codec.AppendString(cb, v.String())"
+	case elemType == "Bytes", elemType == "JSON":
+		itemExpr = "codec.AppendBytes(cb, v)"
+	default:
+		return // unknown element type — relation lists are excluded by the caller
+	}
+	fmt.Fprintf(b, "\t{\n\t\tcells := make([][]byte, len(items))\n")
+	fmt.Fprintf(b, "\t\tfor i, item := range items {\n")
+	fmt.Fprintf(b, "\t\t\tvar cb []byte\n")
+	fmt.Fprintf(b, "\t\t\tcb = codec.AppendArrayHeader(cb, len(item.%s))\n", goName)
+	fmt.Fprintf(b, "\t\t\tfor _, v := range item.%s { cb = %s }\n", goName, itemExpr)
+	fmt.Fprintf(b, "\t\t\tcells[i] = cb\n")
+	fmt.Fprintf(b, "\t\t}\n")
+	fmt.Fprintf(b, "\t\tw.WriteColumnBytes(%d, cells)\n\t}\n", fieldID)
 }
 
 // writeMaskDirective generates @mask logic for a field. Returns the (possibly modified) goField name.

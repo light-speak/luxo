@@ -2123,9 +2123,9 @@ func generateFederationResolvers(b *strings.Builder, result *semantic.Result, mo
 		}
 	}
 
-	if len(endpoints) == 0 {
-		return
-	}
+	// Always emit RegisterFederationResolvers below (even with zero endpoints)
+	// so the entry point's unconditional per-module call compiles. Endpoint
+	// handlers are only generated when cross-module extends exist.
 
 	// Generate handler for each endpoint
 	for _, ep := range endpoints {

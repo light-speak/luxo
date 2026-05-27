@@ -140,6 +140,54 @@ func (w *ColumnarWriter) WriteColumnBoolPtr(fieldID int, values []*bool) {
 	w.columns = append(w.columns, column{fieldID: fieldID, data: data})
 }
 
+// WriteColumnBytes writes a full []byte column (length-prefixed blobs).
+// Also serves scalar array-field columns: each cell is a length-prefixed inline
+// array encoding ([count][items...]).
+func (w *ColumnarWriter) WriteColumnBytes(fieldID int, values [][]byte) {
+	var data []byte
+	for _, v := range values {
+		data = AppendBytes(data, v)
+	}
+	w.columns = append(w.columns, column{fieldID: fieldID, data: data})
+}
+
+// WriteColumnBytesPtr writes a nullable []byte column.
+func (w *ColumnarWriter) WriteColumnBytesPtr(fieldID int, values []*[]byte) {
+	var data []byte
+	for _, v := range values {
+		if v == nil {
+			data = AppendNull(data)
+		} else {
+			data = AppendPresent(data)
+			data = AppendBytes(data, *v)
+		}
+	}
+	w.columns = append(w.columns, column{fieldID: fieldID, data: data})
+}
+
+// WriteColumnUUID writes a full UUID column (fixed 16-byte values).
+func (w *ColumnarWriter) WriteColumnUUID(fieldID int, values [][16]byte) {
+	var data []byte
+	for _, v := range values {
+		data = AppendUUID(data, v)
+	}
+	w.columns = append(w.columns, column{fieldID: fieldID, data: data})
+}
+
+// WriteColumnUUIDPtr writes a nullable UUID column.
+func (w *ColumnarWriter) WriteColumnUUIDPtr(fieldID int, values []*[16]byte) {
+	var data []byte
+	for _, v := range values {
+		if v == nil {
+			data = AppendNull(data)
+		} else {
+			data = AppendPresent(data)
+			data = AppendUUID(data, *v)
+		}
+	}
+	w.columns = append(w.columns, column{fieldID: fieldID, data: data})
+}
+
 // Bytes returns the complete columnar-encoded message.
 // Format: [count varint][totalStringLen varint][col1...][col2...][0x00]
 func (w *ColumnarWriter) Bytes() []byte {
@@ -560,6 +608,122 @@ func (r *ColumnarReader) ReadColumnBytes() [][]byte {
 		result = append(result, v)
 	}
 	return result
+}
+
+// ReadColumnBytesPtr reads count nullable []byte blobs.
+func (r *ColumnarReader) ReadColumnBytesPtr() []*[]byte {
+	result := make([]*[]byte, 0, r.count)
+	for i := 0; i < r.count; i++ {
+		present, n := ReadNullable(r.buf, r.off)
+		if n == 0 {
+			r.err = fmt.Errorf("codec: truncated nullable at record %d", i)
+			return nil
+		}
+		r.off += n
+		if !present {
+			result = append(result, nil)
+			continue
+		}
+		v, bn := ReadBytes(r.buf, r.off)
+		if bn == 0 {
+			r.err = fmt.Errorf("codec: truncated bytes value at record %d", i)
+			return nil
+		}
+		r.off += bn
+		b := v
+		result = append(result, &b)
+	}
+	return result
+}
+
+// ReadColumnUUID reads count fixed 16-byte UUID values.
+func (r *ColumnarReader) ReadColumnUUID() [][16]byte {
+	result := make([][16]byte, 0, r.count)
+	for i := 0; i < r.count; i++ {
+		u, n := ReadUUID(r.buf, r.off)
+		if n == 0 {
+			r.err = fmt.Errorf("codec: truncated uuid column at record %d", i)
+			return nil
+		}
+		r.off += n
+		result = append(result, u)
+	}
+	return result
+}
+
+// ReadColumnUUIDPtr reads count nullable UUID values.
+func (r *ColumnarReader) ReadColumnUUIDPtr() []*[16]byte {
+	result := make([]*[16]byte, 0, r.count)
+	for i := 0; i < r.count; i++ {
+		present, n := ReadNullable(r.buf, r.off)
+		if n == 0 {
+			r.err = fmt.Errorf("codec: truncated nullable at record %d", i)
+			return nil
+		}
+		r.off += n
+		if !present {
+			result = append(result, nil)
+			continue
+		}
+		u, un := ReadUUID(r.buf, r.off)
+		if un == 0 {
+			r.err = fmt.Errorf("codec: truncated uuid value at record %d", i)
+			return nil
+		}
+		r.off += un
+		result = append(result, &u)
+	}
+	return result
+}
+
+// SkipColumnBytesPtr skips count nullable byte blobs without allocating.
+func (r *ColumnarReader) SkipColumnBytesPtr() {
+	for i := 0; i < r.count; i++ {
+		present, n := ReadNullable(r.buf, r.off)
+		if n == 0 {
+			r.err = fmt.Errorf("codec: truncated nullable at record %d", i)
+			return
+		}
+		r.off += n
+		if present {
+			_, bn := ReadBytes(r.buf, r.off)
+			if bn == 0 {
+				r.err = fmt.Errorf("codec: truncated bytes value at record %d", i)
+				return
+			}
+			r.off += bn
+		}
+	}
+}
+
+// SkipColumnUUID skips count fixed 16-byte UUID values without allocating.
+func (r *ColumnarReader) SkipColumnUUID() {
+	for i := 0; i < r.count; i++ {
+		if r.off+16 > len(r.buf) {
+			r.err = fmt.Errorf("codec: truncated uuid column at record %d", i)
+			return
+		}
+		r.off += 16
+	}
+}
+
+// SkipColumnUUIDPtr skips count nullable UUID values without allocating.
+func (r *ColumnarReader) SkipColumnUUIDPtr() {
+	for i := 0; i < r.count; i++ {
+		present, n := ReadNullable(r.buf, r.off)
+		if n == 0 {
+			r.err = fmt.Errorf("codec: truncated nullable at record %d", i)
+			return
+		}
+		r.off += n
+		if present {
+			if r.off+16 > len(r.buf) {
+				r.err = fmt.Errorf("codec: truncated uuid value at record %d", i)
+				return
+			}
+			r.off += 16
+		}
+	}
 }
 
 // --- Arena-based column readers ---

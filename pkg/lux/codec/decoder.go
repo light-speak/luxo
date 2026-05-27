@@ -264,6 +264,107 @@ func (d *Decoder) ReadFloatArray() []float64 {
 	return result
 }
 
+// ReadBoolArray reads a count-prefixed bool array.
+func (d *Decoder) ReadBoolArray() []bool {
+	count, n := ReadArrayHeader(d.buf, d.off)
+	if n == 0 {
+		d.err = fmt.Errorf("codec: invalid array header at offset %d", d.off)
+		return nil
+	}
+	if count > MaxArrayElements {
+		d.err = fmt.Errorf("codec: array size %d exceeds limit %d at offset %d", count, MaxArrayElements, d.off)
+		return nil
+	}
+	d.off += n
+	result := make([]bool, 0, count)
+	for i := 0; i < count; i++ {
+		result = append(result, d.ReadBool())
+		if d.err != nil {
+			return nil
+		}
+	}
+	return result
+}
+
+// ReadBytesArray reads a count-prefixed [][]byte array (inverse of
+// Encoder.WriteFieldBytesArray). Each element is a length-prefixed byte blob.
+func (d *Decoder) ReadBytesArray() [][]byte {
+	count, n := ReadArrayHeader(d.buf, d.off)
+	if n == 0 {
+		d.err = fmt.Errorf("codec: invalid array header at offset %d", d.off)
+		return nil
+	}
+	if count > MaxArrayElements {
+		d.err = fmt.Errorf("codec: array size %d exceeds limit %d at offset %d", count, MaxArrayElements, d.off)
+		return nil
+	}
+	d.off += n
+	result := make([][]byte, 0, count)
+	for i := 0; i < count; i++ {
+		result = append(result, d.ReadBytes())
+		if d.err != nil {
+			return nil
+		}
+	}
+	return result
+}
+
+// ReadUUID reads a fixed 16-byte UUID value.
+func (d *Decoder) ReadUUID() [16]byte {
+	u, n := ReadUUID(d.buf, d.off)
+	if n == 0 {
+		d.err = fmt.Errorf("codec: truncated uuid at offset %d", d.off)
+		return u
+	}
+	d.off += n
+	return u
+}
+
+// ReadUUIDPtr reads a nullable UUID. Returns nil if the value is null.
+func (d *Decoder) ReadUUIDPtr() *[16]byte {
+	present, n := ReadNullable(d.buf, d.off)
+	if n == 0 {
+		d.err = fmt.Errorf("codec: truncated nullable uuid at offset %d", d.off)
+		return nil
+	}
+	d.off += n
+	if !present {
+		return nil
+	}
+	u, un := ReadUUID(d.buf, d.off)
+	if un == 0 {
+		d.err = fmt.Errorf("codec: truncated uuid value at offset %d", d.off)
+		return nil
+	}
+	d.off += un
+	return &u
+}
+
+// ReadUUIDArray reads a count-prefixed UUID array (fixed 16-byte items).
+func (d *Decoder) ReadUUIDArray() [][16]byte {
+	count, n := ReadArrayHeader(d.buf, d.off)
+	if n == 0 {
+		d.err = fmt.Errorf("codec: invalid array header at offset %d", d.off)
+		return nil
+	}
+	if count > MaxArrayElements {
+		d.err = fmt.Errorf("codec: array size %d exceeds limit %d at offset %d", count, MaxArrayElements, d.off)
+		return nil
+	}
+	d.off += n
+	result := make([][16]byte, 0, count)
+	for i := 0; i < count; i++ {
+		u, un := ReadUUID(d.buf, d.off)
+		if un == 0 {
+			d.err = fmt.Errorf("codec: truncated uuid at array index %d", i)
+			return nil
+		}
+		d.off += un
+		result = append(result, u)
+	}
+	return result
+}
+
 // --- Arena readers ---
 // Arena methods reduce allocations by copying all string data into a single
 // pre-allocated []byte (the arena). Strings returned by these methods are

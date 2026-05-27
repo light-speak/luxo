@@ -1461,12 +1461,17 @@ func TestCompileStmtEmitNoArgs(t *testing.T) {
 
 func TestCompileStmtUnknown(t *testing.T) {
 	c := newCompiler(nil)
-	// OnDecl is not handled in the switch → hits default
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on unhandled statement type")
+		}
+		if msg, ok := r.(string); !ok || !strings.Contains(msg, "unhandled statement type") {
+			t.Fatalf("expected unhandled statement panic, got %v", r)
+		}
+	}()
+	// OnDecl is not a statement → hits default → panics (compiler bug guard)
 	c.compileStmt(&ast.OnDecl{})
-	out := compilerOut(c)
-	if !strings.Contains(out, "// TODO: unsupported statement") {
-		t.Fatalf("expected TODO fallback, got %q", out)
-	}
 }
 
 // ─── compileElvisGuard ───────────────────────────────────────────────────────

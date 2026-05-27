@@ -414,6 +414,65 @@ func TestEmptyArray(t *testing.T) {
 	}
 }
 
+func TestBoolArrayRoundTrip(t *testing.T) {
+	var enc Encoder
+	enc.WriteFieldBoolArray(1, []bool{true, false, true, true})
+	enc.WriteEnd()
+
+	dec := NewDecoder(enc.Bytes())
+	dec.NextField()
+	if dec.FieldID() != 1 {
+		t.Fatalf("field = %d", dec.FieldID())
+	}
+	got := dec.ReadBoolArray()
+	if dec.Err() != nil {
+		t.Fatal(dec.Err())
+	}
+	if len(got) != 4 || got[0] != true || got[1] != false || got[3] != true {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestBytesArrayRoundTrip(t *testing.T) {
+	var enc Encoder
+	enc.WriteFieldBytesArray(1, [][]byte{[]byte("alpha"), {}, []byte("\x00\x01\x02")})
+	enc.WriteEnd()
+
+	dec := NewDecoder(enc.Bytes())
+	dec.NextField()
+	got := dec.ReadBytesArray()
+	if dec.Err() != nil {
+		t.Fatal(dec.Err())
+	}
+	if len(got) != 3 || string(got[0]) != "alpha" || len(got[1]) != 0 || got[2][2] != 0x02 {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestBoolArrayEmpty(t *testing.T) {
+	var enc Encoder
+	enc.WriteFieldBoolArray(1, nil)
+	enc.WriteEnd()
+
+	dec := NewDecoder(enc.Bytes())
+	dec.NextField()
+	if got := dec.ReadBoolArray(); len(got) != 0 {
+		t.Fatalf("empty bool array should be 0, got %d", len(got))
+	}
+}
+
+func TestBytesArrayEmpty(t *testing.T) {
+	var enc Encoder
+	enc.WriteFieldBytesArray(1, nil)
+	enc.WriteEnd()
+
+	dec := NewDecoder(enc.Bytes())
+	dec.NextField()
+	if got := dec.ReadBytesArray(); len(got) != 0 {
+		t.Fatalf("empty bytes array should be 0, got %d", len(got))
+	}
+}
+
 // --- Columnar encoding ---
 
 func TestColumnarSingleRecord(t *testing.T) {
@@ -881,6 +940,62 @@ func TestDecoderFloatArrayHeaderError(t *testing.T) {
 	}
 }
 
+func TestDecoderBoolArrayHeaderError(t *testing.T) {
+	dec := NewDecoder([]byte{0x01})
+	dec.NextField()
+	if got := dec.ReadBoolArray(); got != nil || dec.Err() == nil {
+		t.Fatal("should error on truncated bool array header")
+	}
+}
+
+func TestDecoderBytesArrayHeaderError(t *testing.T) {
+	dec := NewDecoder([]byte{0x01})
+	dec.NextField()
+	if got := dec.ReadBytesArray(); got != nil || dec.Err() == nil {
+		t.Fatal("should error on truncated bytes array header")
+	}
+}
+
+func TestDecoderBoolArrayItemError(t *testing.T) {
+	buf := []byte{0x01}
+	buf = AppendVarint(buf, 5) // 5 items, no data
+	dec := NewDecoder(buf)
+	dec.NextField()
+	if got := dec.ReadBoolArray(); got != nil || dec.Err() == nil {
+		t.Fatal("should error on truncated bool array items")
+	}
+}
+
+func TestDecoderBytesArrayItemError(t *testing.T) {
+	buf := []byte{0x01}
+	buf = AppendVarint(buf, 5) // 5 items, no data
+	dec := NewDecoder(buf)
+	dec.NextField()
+	if got := dec.ReadBytesArray(); got != nil || dec.Err() == nil {
+		t.Fatal("should error on truncated bytes array items")
+	}
+}
+
+func TestDecoderBoolArraySizeLimit(t *testing.T) {
+	buf := []byte{0x01}
+	buf = AppendVarint(buf, uint64(MaxArrayElements+1))
+	dec := NewDecoder(buf)
+	dec.NextField()
+	if got := dec.ReadBoolArray(); got != nil || dec.Err() == nil {
+		t.Fatal("should error when bool array exceeds size limit")
+	}
+}
+
+func TestDecoderBytesArraySizeLimit(t *testing.T) {
+	buf := []byte{0x01}
+	buf = AppendVarint(buf, uint64(MaxArrayElements+1))
+	dec := NewDecoder(buf)
+	dec.NextField()
+	if got := dec.ReadBytesArray(); got != nil || dec.Err() == nil {
+		t.Fatal("should error when bytes array exceeds size limit")
+	}
+}
+
 func TestDecoderIntArrayItemError(t *testing.T) {
 	// array header says 5 items, but no item data
 	buf := []byte{0x01} // field 1
@@ -1113,6 +1228,388 @@ func TestColumnarReaderNextColumnWithError(t *testing.T) {
 	// error already set
 	if r.NextColumn() {
 		t.Fatal("should not advance with error")
+	}
+}
+
+// --- UUID (16-byte fixed) ---
+
+var (
+	uuidA = [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	uuidB = [16]byte{0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0}
+)
+
+func TestUUIDFieldRoundTrip(t *testing.T) {
+	var enc Encoder
+	enc.WriteFieldUUID(1, uuidA)
+	enc.WriteEnd()
+
+	dec := NewDecoder(enc.Bytes())
+	dec.NextField()
+	if got := dec.ReadUUID(); got != uuidA {
+		t.Fatalf("got %v want %v", got, uuidA)
+	}
+	if dec.Err() != nil {
+		t.Fatal(dec.Err())
+	}
+}
+
+func TestUUIDPtrRoundTrip(t *testing.T) {
+	var enc Encoder
+	enc.WriteFieldUUIDPtr(1, &uuidA)
+	enc.WriteFieldUUIDPtr(2, nil)
+	enc.WriteEnd()
+
+	dec := NewDecoder(enc.Bytes())
+	dec.NextField()
+	if got := dec.ReadUUIDPtr(); got == nil || *got != uuidA {
+		t.Fatalf("field 1 should be uuidA, got %v", got)
+	}
+	dec.NextField()
+	if got := dec.ReadUUIDPtr(); got != nil {
+		t.Fatalf("field 2 should be nil, got %v", got)
+	}
+	if dec.Err() != nil {
+		t.Fatal(dec.Err())
+	}
+}
+
+func TestUUIDArrayRoundTrip(t *testing.T) {
+	var enc Encoder
+	enc.WriteFieldUUIDArray(1, [][16]byte{uuidA, uuidB})
+	enc.WriteEnd()
+
+	dec := NewDecoder(enc.Bytes())
+	dec.NextField()
+	got := dec.ReadUUIDArray()
+	if dec.Err() != nil {
+		t.Fatal(dec.Err())
+	}
+	if len(got) != 2 || got[0] != uuidA || got[1] != uuidB {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestUUIDArrayEmpty(t *testing.T) {
+	var enc Encoder
+	enc.WriteFieldUUIDArray(1, nil)
+	enc.WriteEnd()
+
+	dec := NewDecoder(enc.Bytes())
+	dec.NextField()
+	if got := dec.ReadUUIDArray(); len(got) != 0 {
+		t.Fatalf("empty uuid array should be 0, got %d", len(got))
+	}
+}
+
+func TestWireReadUUIDTruncated(t *testing.T) {
+	if _, n := ReadUUID([]byte{1, 2, 3}, 0); n != 0 {
+		t.Fatal("short buffer should return 0")
+	}
+	if _, n := ReadUUID(uuidA[:], -1); n != 0 {
+		t.Fatal("negative offset should return 0")
+	}
+}
+
+func TestDecoderReadUUIDTruncated(t *testing.T) {
+	raw := AppendVarint(nil, 1) // fieldID only, no value
+	dec := NewDecoder(raw)
+	dec.NextField()
+	dec.ReadUUID()
+	if dec.Err() == nil {
+		t.Fatal("should error on truncated uuid")
+	}
+}
+
+func TestDecoderReadUUIDPtrErrors(t *testing.T) {
+	// nullable flag truncated
+	raw := AppendVarint(nil, 1)
+	dec := NewDecoder(raw)
+	dec.NextField()
+	if dec.ReadUUIDPtr(); dec.Err() == nil {
+		t.Fatal("should error on truncated nullable flag")
+	}
+
+	// present but value truncated
+	raw2 := AppendVarint(nil, 1)
+	raw2 = AppendPresent(raw2)
+	dec2 := NewDecoder(raw2)
+	dec2.NextField()
+	if dec2.ReadUUIDPtr(); dec2.Err() == nil {
+		t.Fatal("should error on truncated uuid value")
+	}
+}
+
+func TestDecoderUUIDArrayErrors(t *testing.T) {
+	// header error
+	raw := AppendVarint(nil, 1)
+	dec := NewDecoder(raw)
+	dec.NextField()
+	if dec.ReadUUIDArray(); dec.Err() == nil {
+		t.Fatal("should error on missing array header")
+	}
+
+	// size limit
+	raw2 := AppendVarint(nil, 1)
+	raw2 = AppendVarint(raw2, uint64(MaxArrayElements+1))
+	dec2 := NewDecoder(raw2)
+	dec2.NextField()
+	if dec2.ReadUUIDArray(); dec2.Err() == nil {
+		t.Fatal("should error on array size limit")
+	}
+
+	// item truncated: count=2, only 1 uuid present
+	raw3 := AppendVarint(nil, 1)
+	raw3 = AppendArrayHeader(raw3, 2)
+	raw3 = AppendUUID(raw3, uuidA)
+	dec3 := NewDecoder(raw3)
+	dec3.NextField()
+	if dec3.ReadUUIDArray(); dec3.Err() == nil {
+		t.Fatal("should error on truncated array item")
+	}
+}
+
+// --- Columnar UUID / Bytes columns ---
+
+func TestColumnarUUID(t *testing.T) {
+	var w ColumnarWriter
+	w.SetCount(2)
+	w.WriteColumnUUID(1, [][16]byte{uuidA, uuidB})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	got := r.ReadColumnUUID()
+	if r.Err() != nil {
+		t.Fatal(r.Err())
+	}
+	if len(got) != 2 || got[0] != uuidA || got[1] != uuidB {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestColumnarUUIDPtr(t *testing.T) {
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnUUIDPtr(1, []*[16]byte{&uuidA, nil, &uuidB})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	got := r.ReadColumnUUIDPtr()
+	if r.Err() != nil {
+		t.Fatal(r.Err())
+	}
+	if len(got) != 3 || got[0] == nil || *got[0] != uuidA || got[1] != nil || got[2] == nil || *got[2] != uuidB {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestColumnarBytes(t *testing.T) {
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnBytes(1, [][]byte{[]byte("a"), {}, []byte("\x00\x01")})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	got := r.ReadColumnBytes()
+	if r.Err() != nil {
+		t.Fatal(r.Err())
+	}
+	if len(got) != 3 || string(got[0]) != "a" || len(got[1]) != 0 || got[2][1] != 0x01 {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestColumnarBytesPtr(t *testing.T) {
+	blob := []byte("payload")
+	var w ColumnarWriter
+	w.SetCount(2)
+	w.WriteColumnBytesPtr(1, []*[]byte{&blob, nil})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	got := r.ReadColumnBytesPtr()
+	if r.Err() != nil {
+		t.Fatal(r.Err())
+	}
+	if len(got) != 2 || got[0] == nil || string(*got[0]) != "payload" || got[1] != nil {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestColumnarSkipUUIDBytes(t *testing.T) {
+	u := uuidB
+	blob := []byte("x")
+	var w ColumnarWriter
+	w.SetCount(1)
+	w.WriteColumnUUID(1, [][16]byte{uuidA})
+	w.WriteColumnUUIDPtr(2, []*[16]byte{&u})
+	w.WriteColumnBytesPtr(3, []*[]byte{&blob})
+	w.WriteColumnInt(4, []int64{99})
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	r.SkipColumnUUID()
+	r.NextColumn()
+	r.SkipColumnUUIDPtr()
+	r.NextColumn()
+	r.SkipColumnBytesPtr()
+	r.NextColumn()
+	vals := r.ReadColumnInt()
+	if r.Err() != nil {
+		t.Fatal(r.Err())
+	}
+	if len(vals) != 1 || vals[0] != 99 {
+		t.Fatalf("after skips, int col = %v", vals)
+	}
+}
+
+func TestColumnarUUIDTruncated(t *testing.T) {
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnUUID(1, [][16]byte{uuidA}) // only 1, count=3
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	if r.ReadColumnUUID(); r.Err() == nil {
+		t.Fatal("should error on truncated uuid column")
+	}
+}
+
+func TestColumnarUUIDPtrTruncated(t *testing.T) {
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnUUIDPtr(1, []*[16]byte{&uuidA}) // only 1, count=3
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	if r.ReadColumnUUIDPtr(); r.Err() == nil {
+		t.Fatal("should error on truncated uuid ptr column")
+	}
+}
+
+func TestColumnarBytesPtrTruncated(t *testing.T) {
+	blob := []byte("x")
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnBytesPtr(1, []*[]byte{&blob}) // only 1, count=3
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	if r.ReadColumnBytesPtr(); r.Err() == nil {
+		t.Fatal("should error on truncated bytes ptr column")
+	}
+}
+
+func TestColumnarSkipUUIDTruncated(t *testing.T) {
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnUUID(1, [][16]byte{uuidA}) // only 1, count=3
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	r.SkipColumnUUID()
+	if r.Err() == nil {
+		t.Fatal("skip should error on truncated uuid column")
+	}
+}
+
+func TestColumnarSkipUUIDPtrTruncated(t *testing.T) {
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnUUIDPtr(1, []*[16]byte{&uuidA}) // only 1, count=3
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	r.SkipColumnUUIDPtr()
+	if r.Err() == nil {
+		t.Fatal("skip should error on truncated uuid ptr column")
+	}
+}
+
+func TestColumnarSkipBytesPtrTruncated(t *testing.T) {
+	blob := []byte("x")
+	var w ColumnarWriter
+	w.SetCount(3)
+	w.WriteColumnBytesPtr(1, []*[]byte{&blob}) // only 1, count=3
+	data := w.Bytes()
+
+	r := NewColumnarReader(data)
+	r.NextColumn()
+	r.SkipColumnBytesPtr()
+	if r.Err() == nil {
+		t.Fatal("skip should error on truncated bytes ptr column")
+	}
+}
+
+// colHdr builds a columnar header for 1 record, 1 column (fieldID 1),
+// positioned exactly at the start of the column data — for truncation tests.
+func colHdr() []byte {
+	b := AppendVarint(nil, 1) // count = 1
+	b = AppendVarint(b, 0)    // arenaSize = 0
+	b = AppendVarint(b, 1)    // fieldID = 1
+	return b
+}
+
+func TestColumnarBytesPtrErrors(t *testing.T) {
+	// nullable flag truncated (buffer ends at column start)
+	r := NewColumnarReader(colHdr())
+	r.NextColumn()
+	if r.ReadColumnBytesPtr(); r.Err() == nil {
+		t.Fatal("should error on truncated nullable flag")
+	}
+	// present marker but value truncated
+	r2 := NewColumnarReader(append(colHdr(), 0x01))
+	r2.NextColumn()
+	if r2.ReadColumnBytesPtr(); r2.Err() == nil {
+		t.Fatal("should error on truncated bytes value")
+	}
+}
+
+func TestColumnarUUIDPtrErrors(t *testing.T) {
+	r := NewColumnarReader(colHdr())
+	r.NextColumn()
+	if r.ReadColumnUUIDPtr(); r.Err() == nil {
+		t.Fatal("should error on truncated nullable flag")
+	}
+	r2 := NewColumnarReader(append(colHdr(), 0x01))
+	r2.NextColumn()
+	if r2.ReadColumnUUIDPtr(); r2.Err() == nil {
+		t.Fatal("should error on truncated uuid value")
+	}
+}
+
+func TestColumnarSkipBytesPtrErrors(t *testing.T) {
+	r := NewColumnarReader(colHdr())
+	r.NextColumn()
+	if r.SkipColumnBytesPtr(); r.Err() == nil {
+		t.Fatal("skip should error on truncated nullable flag")
+	}
+	r2 := NewColumnarReader(append(colHdr(), 0x01))
+	r2.NextColumn()
+	if r2.SkipColumnBytesPtr(); r2.Err() == nil {
+		t.Fatal("skip should error on truncated bytes value")
+	}
+}
+
+func TestColumnarSkipUUIDPtrErrors(t *testing.T) {
+	r := NewColumnarReader(colHdr())
+	r.NextColumn()
+	if r.SkipColumnUUIDPtr(); r.Err() == nil {
+		t.Fatal("skip should error on truncated nullable flag")
+	}
+	r2 := NewColumnarReader(append(colHdr(), 0x01))
+	r2.NextColumn()
+	if r2.SkipColumnUUIDPtr(); r2.Err() == nil {
+		t.Fatal("skip should error on truncated uuid value")
 	}
 }
 
