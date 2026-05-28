@@ -925,11 +925,83 @@ func TestBinaryListToJSON_UnknownFieldColumn(t *testing.T) {
 }
 
 func TestBinaryScalarToJSON_UUID(t *testing.T) {
-	var buf []byte
-	buf = codec.AppendString(buf, "550e8400-e29b-41d4-a716-446655440000")
-	result := BinaryScalarToJSON(nil, buf, "UUID")
-	if !strings.Contains(string(result), "550e8400") {
-		t.Errorf("UUID not decoded: %s", result)
+	// UUID is a 16-byte fixed value on the wire (per protocol), not a string.
+	data := []byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
+	result := BinaryScalarToJSON(nil, data, "UUID")
+	if string(result) != `"550e8400-e29b-41d4-a716-446655440000"` {
+		t.Errorf("UUID 16-byte decode: got %s", result)
+	}
+}
+
+func TestUUIDRoundTrip(t *testing.T) {
+	s := "550e8400-e29b-41d4-a716-446655440000"
+	u, ok := parseUUID(s)
+	if !ok {
+		t.Fatal("parseUUID should accept canonical UUID")
+	}
+	if out := appendUUIDString(nil, u); string(out) != `"`+s+`"` {
+		t.Errorf("round trip mismatch: %s", out)
+	}
+	if _, ok := parseUUID("too-short"); ok {
+		t.Error("should reject wrong length")
+	}
+	if _, ok := parseUUID("550e8400e29b41d4a716446655440000zzzz"); ok {
+		t.Error("should reject 36-len without dashes / bad layout")
+	}
+	if _, ok := parseUUID("550e8400-e29b-41d4-a716-44665544zzzz"); ok {
+		t.Error("should reject non-hex digits")
+	}
+}
+
+func TestJSONParamsToBinary_IntArray(t *testing.T) {
+	api := &API{Params: []Param{{ID: 1, Name: "ids", Type: FieldInt, IsList: true}}}
+	bin := JSONParamsToBinary(map[string]any{"ids": []any{float64(1), float64(2), float64(3)}}, api)
+	dec := codec.NewDecoder(bin)
+	dec.NextField()
+	got := dec.ReadIntArray()
+	if len(got) != 3 || got[0] != 1 || got[2] != 3 {
+		t.Errorf("int array param: got %v", got)
+	}
+}
+
+func TestJSONParamsToBinary_StringArray(t *testing.T) {
+	api := &API{Params: []Param{{ID: 1, Name: "tags", Type: FieldString, IsList: true}}}
+	bin := JSONParamsToBinary(map[string]any{"tags": []any{"a", "b"}}, api)
+	dec := codec.NewDecoder(bin)
+	dec.NextField()
+	got := dec.ReadStringArray()
+	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Errorf("string array param: got %v", got)
+	}
+}
+
+func TestColumnarScalarArrayToJSON(t *testing.T) {
+	// Model with a [String] field, encoded columnar, decoded to JSON.
+	m := &Model{Name: "Tagged", Fields: []Field{{ID: 1, Name: "tags", Type: FieldString, IsList: true}}}
+	New().RegisterModel(m) // initializes byID + JSONPrefix
+	var w codec.ColumnarWriter
+	w.SetCount(2)
+	// record 0: ["x","y"], record 1: []
+	cell0 := codec.AppendArrayHeader(nil, 2)
+	cell0 = codec.AppendString(cell0, "x")
+	cell0 = codec.AppendString(cell0, "y")
+	cell1 := codec.AppendArrayHeader(nil, 0)
+	w.WriteColumnBytes(1, [][]byte{cell0, cell1})
+	out := columnarToJSON(nil, w.Bytes(), m)
+	want := `[{"tags":["x","y"]},{"tags":[]}]`
+	if string(out) != want {
+		t.Errorf("columnar scalar array:\n got %s\nwant %s", out, want)
+	}
+}
+
+func TestJSONParamsToBinary_UUID(t *testing.T) {
+	api := &API{Params: []Param{{ID: 1, Name: "id", Type: FieldUUID}}}
+	bin := JSONParamsToBinary(map[string]any{"id": "550e8400-e29b-41d4-a716-446655440000"}, api)
+	dec := codec.NewDecoder(bin)
+	dec.NextField()
+	u := dec.ReadUUID()
+	if got := string(appendUUIDString(nil, u)); got != `"550e8400-e29b-41d4-a716-446655440000"` {
+		t.Errorf("param UUID round trip failed: %s", got)
 	}
 }
 
@@ -1097,5 +1169,219 @@ func TestBinaryToJSON_NullableBytes(t *testing.T) {
 	got := string(result)
 	if !strings.Contains(got, `"yv4="`) {
 		t.Errorf("expected base64 encoded bytes, got: %s", got)
+	}
+}
+
+// --- appendArrayFieldJSON: cover every element type for inline scalar arrays ---
+
+func TestAppendArrayFieldJSON_AllTypes(t *testing.T) {
+	cases := []struct {
+		name string
+		ft   FieldType
+		cell func() []byte
+		want string
+	}{
+		{"Int", FieldInt, func() []byte {
+			c := codec.AppendArrayHeader(nil, 2)
+			c = codec.AppendSvarint(c, 1)
+			c = codec.AppendSvarint(c, -3)
+			return c
+		}, `[1,-3]`},
+		{"Duration", FieldDuration, func() []byte {
+			c := codec.AppendArrayHeader(nil, 1)
+			c = codec.AppendSvarint(c, 1000000)
+			return c
+		}, `[1000000]`},
+		{"DateTime", FieldDateTime, func() []byte {
+			c := codec.AppendArrayHeader(nil, 1)
+			c = codec.AppendSvarint(c, 1776427200) // 2026-04-17T12:00:00Z
+			return c
+		}, `["2026-04-17T12:00:00Z"]`},
+		{"Float", FieldFloat, func() []byte {
+			c := codec.AppendArrayHeader(nil, 2)
+			c = codec.AppendFixed64(c, 1.5)
+			c = codec.AppendFixed64(c, -2.25)
+			return c
+		}, `[1.5,-2.25]`},
+		{"Bool", FieldBool, func() []byte {
+			c := codec.AppendArrayHeader(nil, 3)
+			c = codec.AppendBool(c, true)
+			c = codec.AppendBool(c, false)
+			c = codec.AppendBool(c, true)
+			return c
+		}, `[true,false,true]`},
+		{"UUID", FieldUUID, func() []byte {
+			c := codec.AppendArrayHeader(nil, 1)
+			c = codec.AppendUUID(c, [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00})
+			return c
+		}, `["550e8400-e29b-41d4-a716-446655440000"]`},
+		{"Bytes", FieldBytes, func() []byte {
+			c := codec.AppendArrayHeader(nil, 1)
+			c = codec.AppendBytes(c, []byte{0xff, 0x00})
+			return c
+		}, `["/wA="]`},
+		{"Enum", FieldEnum, func() []byte {
+			c := codec.AppendArrayHeader(nil, 2)
+			c = codec.AppendString(c, "ADMIN")
+			c = codec.AppendString(c, "USER")
+			return c
+		}, `["ADMIN","USER"]`},
+		{"Unknown_emptyArray", FieldModel, func() []byte {
+			return codec.AppendArrayHeader(nil, 0)
+		}, `[]`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &Field{Type: tc.ft, IsList: true}
+			out := appendArrayFieldJSON(nil, codec.NewDecoder(tc.cell()), f)
+			if string(out) != tc.want {
+				t.Errorf("got %s want %s", out, tc.want)
+			}
+		})
+	}
+}
+
+// --- JSONParamsToBinary: cover all scalar and array param types ---
+
+func TestJSONParamsToBinary_AllScalars(t *testing.T) {
+	api := &API{Params: []Param{
+		{ID: 1, Name: "i", Type: FieldInt},
+		{ID: 2, Name: "f", Type: FieldFloat},
+		{ID: 3, Name: "s", Type: FieldString},
+		{ID: 4, Name: "b", Type: FieldBool},
+		{ID: 5, Name: "dt", Type: FieldDateTime},
+		{ID: 6, Name: "du", Type: FieldDuration},
+		{ID: 7, Name: "byt", Type: FieldBytes},
+	}}
+	bin := JSONParamsToBinary(map[string]any{
+		"i":   float64(42),
+		"f":   3.14,
+		"s":   "hello",
+		"b":   true,
+		"dt":  "2026-04-17T12:00:00Z",
+		"du":  float64(1000),
+		"byt": "/wA=", // base64 of {0xff, 0x00}
+	}, api)
+	if len(bin) == 0 {
+		t.Fatal("empty binary")
+	}
+	dec := codec.NewDecoder(bin)
+	seen := map[int]bool{}
+	for dec.NextField() {
+		seen[dec.FieldID()] = true
+		switch dec.FieldID() {
+		case 1:
+			if v := dec.ReadInt(); v != 42 {
+				t.Errorf("i = %d", v)
+			}
+		case 2:
+			if v := dec.ReadFloat(); v != 3.14 {
+				t.Errorf("f = %f", v)
+			}
+		case 3:
+			if v := dec.ReadString(); v != "hello" {
+				t.Errorf("s = %q", v)
+			}
+		case 4:
+			if v := dec.ReadBool(); !v {
+				t.Errorf("b = %v", v)
+			}
+		case 5:
+			if v := dec.ReadInt(); v != 1776427200 {
+				t.Errorf("dt = %d", v)
+			}
+		case 6:
+			if v := dec.ReadInt(); v != 1000 {
+				t.Errorf("du = %d", v)
+			}
+		case 7:
+			if v := dec.ReadBytes(); len(v) != 2 || v[0] != 0xff || v[1] != 0x00 {
+				t.Errorf("byt = %v", v)
+			}
+		}
+	}
+	for _, id := range []int{1, 2, 3, 4, 5, 6, 7} {
+		if !seen[id] {
+			t.Errorf("missing field %d", id)
+		}
+	}
+}
+
+func TestJSONParamsToBinary_AllArrays(t *testing.T) {
+	api := &API{Params: []Param{
+		{ID: 1, Name: "ints", Type: FieldInt, IsList: true},
+		{ID: 2, Name: "floats", Type: FieldFloat, IsList: true},
+		{ID: 3, Name: "bools", Type: FieldBool, IsList: true},
+		{ID: 4, Name: "uuids", Type: FieldUUID, IsList: true},
+		{ID: 5, Name: "dates", Type: FieldDateTime, IsList: true},
+	}}
+	bin := JSONParamsToBinary(map[string]any{
+		"ints":   []any{float64(1), float64(2)},
+		"floats": []any{1.5, 2.5},
+		"bools":  []any{true, false},
+		"uuids":  []any{"550e8400-e29b-41d4-a716-446655440000"},
+		"dates":  []any{float64(1776427200)},
+	}, api)
+	dec := codec.NewDecoder(bin)
+	for dec.NextField() {
+		switch dec.FieldID() {
+		case 1:
+			if vs := dec.ReadIntArray(); len(vs) != 2 || vs[0] != 1 || vs[1] != 2 {
+				t.Errorf("ints = %v", vs)
+			}
+		case 2:
+			if vs := dec.ReadFloatArray(); len(vs) != 2 {
+				t.Errorf("floats = %v", vs)
+			}
+		case 3:
+			if vs := dec.ReadBoolArray(); len(vs) != 2 || !vs[0] || vs[1] {
+				t.Errorf("bools = %v", vs)
+			}
+		case 4:
+			if vs := dec.ReadUUIDArray(); len(vs) != 1 {
+				t.Errorf("uuids = %v", vs)
+			}
+		case 5:
+			if vs := dec.ReadIntArray(); len(vs) != 1 || vs[0] != 1776427200 {
+				t.Errorf("dates = %v", vs)
+			}
+		}
+	}
+}
+
+func TestJSONParamsToBinary_WrongTypeIgnored(t *testing.T) {
+	api := &API{Params: []Param{{ID: 1, Name: "x", Type: FieldUUID, IsList: true}}}
+	// non-array value for list param → ignored, empty output
+	bin := JSONParamsToBinary(map[string]any{"x": "not-an-array"}, api)
+	if len(bin) > 1 { // just the WriteEnd terminator
+		t.Errorf("expected empty payload, got %d bytes", len(bin))
+	}
+}
+
+// --- columnar Model blob (federation extend) decode path ---
+
+func TestColumnarModelBlobToJSON(t *testing.T) {
+	// Inner model "Sub" with one Int field.
+	sub := &Model{Name: "Sub", Fields: []Field{{ID: 1, Name: "n", Type: FieldInt}}}
+	s := New()
+	s.RegisterModel(sub)
+
+	// Outer field is FieldModel (non-list) so blob decodes via BinaryToJSON.
+	outer := &Model{Name: "Outer", Fields: []Field{{ID: 1, Name: "sub", Type: FieldModel, TypeName: "Sub", Relation: true}}}
+	s.RegisterModel(outer)
+
+	// Inner blob: arena=0, field 1 = svarint 7, end marker.
+	inner := codec.AppendVarint(nil, 0)
+	inner = codec.AppendVarint(inner, 1)
+	inner = codec.AppendSvarint(inner, 7)
+	inner = append(inner, 0x00)
+
+	var w codec.ColumnarWriter
+	w.SetCount(1)
+	w.WriteColumnBytes(1, [][]byte{inner})
+	out := columnarToJSON(nil, w.Bytes(), outer, s)
+	want := `[{"sub":{"n":7}}]`
+	if string(out) != want {
+		t.Errorf("got %s want %s", out, want)
 	}
 }

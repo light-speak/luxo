@@ -3,10 +3,57 @@ import { Encoder } from './codec'
 
 export type TransportMode = 'json' | 'binary'
 
+/** Encode a single API param (scalar or list) to binary using the schema metadata. */
+function encodeParam(
+  enc: Encoder,
+  pm: { fieldID: number; type: string; isList?: boolean },
+  v: unknown,
+): void {
+  if (pm.isList) {
+    const arr = v as unknown[]
+    switch (pm.type) {
+      case 'Int': case 'Duration':
+        enc.writeFieldIntArray(pm.fieldID, arr as number[]); break
+      case 'DateTime':
+        // Accept ISO string elements (parity with the scalar DateTime branch).
+        enc.writeFieldIntArray(pm.fieldID, (arr as (number | string)[]).map(v =>
+          typeof v === 'number' ? Math.floor(v) : Math.floor(new Date(v).getTime() / 1000)
+        )); break
+      case 'Float':
+        enc.writeFieldFloatArray(pm.fieldID, arr as number[]); break
+      case 'String': case 'Enum': case 'Decimal':
+        enc.writeFieldStringArray(pm.fieldID, arr as string[]); break
+      case 'Boolean':
+        enc.writeFieldBoolArray(pm.fieldID, arr as boolean[]); break
+      case 'UUID':
+        enc.writeFieldUUIDArray(pm.fieldID, arr as string[]); break
+    }
+    return
+  }
+  switch (pm.type) {
+    case 'Int': case 'Duration':
+      enc.writeFieldInt(pm.fieldID, v as number); break
+    case 'Float':
+      enc.writeFieldFloat(pm.fieldID, v as number); break
+    case 'String': case 'Enum': case 'Decimal':
+      enc.writeFieldString(pm.fieldID, v as string); break
+    case 'Boolean':
+      enc.writeFieldBool(pm.fieldID, v as boolean); break
+    case 'UUID':
+      // UUID is a fixed 16-byte value on the wire (not a length-prefixed string).
+      enc.writeFieldUUID(pm.fieldID, v as string); break
+    case 'DateTime': {
+      // Per protocol: DateTime = svarint(unix seconds). Accept ISO string or number.
+      const sec = typeof v === 'number' ? Math.floor(v) : Math.floor(new Date(v as string).getTime() / 1000)
+      enc.writeFieldInt(pm.fieldID, sec); break
+    }
+  }
+}
+
 /** API schema metadata for binary encoding */
 export interface APISchema {
   id: number
-  params?: Array<{ fieldID: number; name: string; type: string }>
+  params?: Array<{ fieldID: number; name: string; type: string; isList?: boolean }>
 }
 
 /** Transport interface — implemented by HTTP, WebSocket, etc. */
@@ -130,19 +177,7 @@ export class FetchTransport implements Transport {
       for (const pm of meta.params) {
         const v = params[pm.name]
         if (v === undefined || v === null) continue
-        switch (pm.type) {
-          case 'Int': case 'Duration':
-            enc.writeFieldInt(pm.fieldID, v as number); break
-          case 'Float':
-            enc.writeFieldFloat(pm.fieldID, v as number); break
-          case 'String': case 'Enum': case 'UUID': case 'Decimal':
-            enc.writeFieldString(pm.fieldID, v as string); break
-          case 'Boolean':
-            enc.writeFieldBool(pm.fieldID, v as boolean); break
-          case 'DateTime':
-            // DateTime sent as ISO string, server parses it
-            enc.writeFieldString(pm.fieldID, v as string); break
-        }
+        encodeParam(enc, pm, v)
       }
     }
     enc.writeEnd()
@@ -271,18 +306,7 @@ export class WsTransport implements Transport {
           for (const pm of meta.params) {
             const v = params[pm.name]
             if (v === undefined || v === null) continue
-            switch (pm.type) {
-              case 'Int': case 'Duration':
-                enc.writeFieldInt(pm.fieldID, v as number); break
-              case 'Float':
-                enc.writeFieldFloat(pm.fieldID, v as number); break
-              case 'String': case 'Enum': case 'UUID': case 'Decimal':
-                enc.writeFieldString(pm.fieldID, v as string); break
-              case 'Boolean':
-                enc.writeFieldBool(pm.fieldID, v as boolean); break
-              case 'DateTime':
-                enc.writeFieldString(pm.fieldID, v as string); break
-            }
+            encodeParam(enc, pm, v)
           }
         }
         enc.writeEnd()

@@ -19,7 +19,8 @@ class ParamSchema {
   final int fieldID;
   final String name;
   final String type;
-  const ParamSchema(this.fieldID, this.name, this.type);
+  final bool isList;
+  const ParamSchema(this.fieldID, this.name, this.type, [this.isList = false]);
 }
 
 /// Transport options.
@@ -28,6 +29,53 @@ class TransportOptions {
   final TransportMode mode;
   final Map<String, String>? headers;
   const TransportOptions({this.token, this.mode = TransportMode.json, this.headers});
+}
+
+/// Encodes a single API param onto [enc] using its schema metadata.
+/// Handles scalar and list ([T]) params. UUID is encoded as fixed 16 bytes.
+int _toUnixSeconds(dynamic value) {
+  if (value is int) return value;
+  if (value is DateTime) return value.toUtc().millisecondsSinceEpoch ~/ 1000;
+  if (value is String) {
+    final dt = DateTime.parse(value).toUtc();
+    return dt.millisecondsSinceEpoch ~/ 1000;
+  }
+  throw FormatException('invalid DateTime param: ${value.runtimeType}');
+}
+
+void encodeParam(LuxoEncoder enc, ParamSchema pm, dynamic v) {
+  if (pm.isList) {
+    final list = v as List;
+    switch (pm.type) {
+      case 'Int' || 'Duration':
+        enc.writeFieldIntArray(pm.fieldID, list.cast<int>());
+      case 'DateTime':
+        enc.writeFieldIntArray(pm.fieldID, list.map(_toUnixSeconds).toList());
+      case 'Float':
+        enc.writeFieldFloatArray(pm.fieldID, list.map((e) => (e as num).toDouble()).toList());
+      case 'String' || 'Enum' || 'Decimal':
+        enc.writeFieldStringArray(pm.fieldID, list.cast<String>());
+      case 'Boolean':
+        enc.writeFieldBoolArray(pm.fieldID, list.cast<bool>());
+      case 'UUID':
+        enc.writeFieldUuidArray(pm.fieldID, list.cast<String>());
+    }
+    return;
+  }
+  switch (pm.type) {
+    case 'Int' || 'Duration':
+      enc.writeFieldInt(pm.fieldID, v as int);
+    case 'DateTime':
+      enc.writeFieldInt(pm.fieldID, _toUnixSeconds(v));
+    case 'Float':
+      enc.writeFieldFloat(pm.fieldID, (v as num).toDouble());
+    case 'String' || 'Enum' || 'Decimal':
+      enc.writeFieldString(pm.fieldID, v as String);
+    case 'Boolean':
+      enc.writeFieldBool(pm.fieldID, v as bool);
+    case 'UUID':
+      enc.writeFieldUuid(pm.fieldID, v as String);
+  }
 }
 
 /// Transport interface — implemented by HTTP and WebSocket.
@@ -127,12 +175,7 @@ class HttpTransport implements Transport {
       for (final pm in meta.params) {
         final v = params[pm.name];
         if (v == null) continue;
-        switch (pm.type) {
-          case 'Int' || 'Duration': enc.writeFieldInt(pm.fieldID, v as int);
-          case 'Float': enc.writeFieldFloat(pm.fieldID, (v as num).toDouble());
-          case 'String' || 'Enum' || 'UUID' || 'Decimal' || 'DateTime': enc.writeFieldString(pm.fieldID, v as String);
-          case 'Boolean': enc.writeFieldBool(pm.fieldID, v as bool);
-        }
+        encodeParam(enc, pm, v);
       }
     }
     enc.writeEnd();
@@ -292,12 +335,7 @@ class WsTransport implements Transport {
         for (final pm in meta.params) {
           final v = params[pm.name];
           if (v == null) continue;
-          switch (pm.type) {
-            case 'Int' || 'Duration': enc.writeFieldInt(pm.fieldID, v as int);
-            case 'Float': enc.writeFieldFloat(pm.fieldID, (v as num).toDouble());
-            case 'String' || 'Enum' || 'UUID' || 'Decimal' || 'DateTime': enc.writeFieldString(pm.fieldID, v as String);
-            case 'Boolean': enc.writeFieldBool(pm.fieldID, v as bool);
-          }
+          encodeParam(enc, pm, v);
         }
       }
       enc.writeEnd();

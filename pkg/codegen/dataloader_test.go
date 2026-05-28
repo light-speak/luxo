@@ -867,6 +867,65 @@ func TestGenerateDataLoaderCompositeKeyLoad(t *testing.T) {
 	if !strings.Contains(code, `"user_id"`) && !strings.Contains(code, `"type"`) {
 		t.Error("missing multi-condition WHERE")
 	}
+	// Composite key field types must be resolved from the model declaration:
+	// userId is Int → int64, type is String → string (not hardcoded int64).
+	if !strings.Contains(code, "Type string") {
+		t.Errorf("composite key 'type' field should be string, not int64:\n%s", code)
+	}
+	if !strings.Contains(code, `lux.NewStringField("type")`) {
+		t.Errorf("composite key 'type' condition should use NewStringField:\n%s", code)
+	}
+	if !strings.Contains(code, "typeSet := make(map[string]bool") {
+		t.Errorf("composite key 'type' dedup set should be map[string]:\n%s", code)
+	}
+}
+
+// TestGenerateDataLoaderSingleStringFKLoad verifies a single-arg load() on a
+// String FK column generates a string-keyed loader (not hardcoded int64).
+func TestGenerateDataLoaderSingleStringFKLoad(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{
+			{
+				Name: "origin/post.luxo",
+				Models: []*ast.ModelDecl{{
+					Pos:  pos0(),
+					Name: "Post",
+					Fields: []*ast.FieldDecl{
+						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+						{Name: "slug", Type: &ast.TypeRef{Name: "String"}},
+					},
+				}},
+				APIs: []*ast.ApiDecl{{
+					Name: "getBySlug",
+					Body: &ast.Block{Stmts: []ast.Stmt{
+						&ast.ValStmt{
+							Name: "posts",
+							Value: &ast.CallExpr{
+								Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "load"},
+								Args: []*ast.NamedArg{{Name: "slug", Value: &ast.Ident{Name: "s"}}},
+							},
+						},
+					}},
+				}},
+			},
+		},
+	}
+
+	src := generateDataLoaderFile(result, "post_luxo", map[string]bool{}, nil, DriverPG)
+	if src == nil {
+		t.Fatal("expected dataloader file for string FK load")
+	}
+	code := string(src)
+
+	if !strings.Contains(code, "PostBySlug *dataloader.Loader[string, []*Post]") {
+		t.Errorf("string FK load should produce string-keyed loader:\n%s", code)
+	}
+	if !strings.Contains(code, `lux.NewStringField("slug").In(keys...)`) {
+		t.Errorf("string FK load should use NewStringField:\n%s", code)
+	}
+	if !strings.Contains(code, "keys []string") {
+		t.Errorf("string FK batch func should take keys []string:\n%s", code)
+	}
 }
 
 func TestCollectLoadCalls(t *testing.T) {
@@ -930,7 +989,7 @@ func TestScanLoadCalls_IfStmt(t *testing.T) {
 			}},
 		}},
 	}
-	scanLoadCalls(stmt, seen, &calls)
+	scanLoadCalls(stmt, seen, &calls, nil)
 	if len(calls) != 1 {
 		t.Fatalf("expected 1 call from if body, got %d", len(calls))
 	}
@@ -947,7 +1006,7 @@ func TestScanLoadCalls_ForStmt(t *testing.T) {
 			}},
 		}},
 	}
-	scanLoadCalls(stmt, seen, &calls)
+	scanLoadCalls(stmt, seen, &calls, nil)
 	if len(calls) != 1 {
 		t.Fatalf("expected 1 call from for body, got %d", len(calls))
 	}
@@ -962,7 +1021,7 @@ func TestScanLoadCalls_ReturnStmt(t *testing.T) {
 			Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
 		},
 	}
-	scanLoadCalls(stmt, seen, &calls)
+	scanLoadCalls(stmt, seen, &calls, nil)
 	if len(calls) != 1 {
 		t.Fatalf("expected 1 call from return, got %d", len(calls))
 	}
@@ -977,7 +1036,7 @@ func TestScanLoadCalls_Dedup(t *testing.T) {
 			Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
 			Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
 		}}
-		scanLoadCalls(stmt, seen, &calls)
+		scanLoadCalls(stmt, seen, &calls, nil)
 	}
 	if len(calls) != 1 {
 		t.Errorf("duplicate load calls should be deduped, got %d", len(calls))
@@ -988,7 +1047,7 @@ func TestScanLoadCallsExpr_NotCall(t *testing.T) {
 	seen := make(map[string]bool)
 	var calls []loadCallInfo
 	// Not a CallExpr
-	scanLoadCallsExpr(&ast.Ident{Name: "x"}, seen, &calls)
+	scanLoadCallsExpr(&ast.Ident{Name: "x"}, seen, &calls, nil)
 	if len(calls) != 0 {
 		t.Error("non-call expr should produce no calls")
 	}
@@ -1002,7 +1061,7 @@ func TestScanLoadCallsExpr_LowercaseModel(t *testing.T) {
 		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "load"},
 		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
 	}
-	scanLoadCallsExpr(expr, seen, &calls)
+	scanLoadCallsExpr(expr, seen, &calls, nil)
 	if len(calls) != 0 {
 		t.Error("lowercase model name should be skipped")
 	}
@@ -1015,7 +1074,7 @@ func TestScanLoadCallsExpr_NotMember(t *testing.T) {
 	expr := &ast.CallExpr{
 		Func: &ast.Ident{Name: "load"},
 	}
-	scanLoadCallsExpr(expr, seen, &calls)
+	scanLoadCallsExpr(expr, seen, &calls, nil)
 	if len(calls) != 0 {
 		t.Error("non-member call should produce no calls")
 	}
@@ -1027,7 +1086,7 @@ func TestScanLoadCallsExpr_NotLoadMethod(t *testing.T) {
 	expr := &ast.CallExpr{
 		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "find"},
 	}
-	scanLoadCallsExpr(expr, seen, &calls)
+	scanLoadCallsExpr(expr, seen, &calls, nil)
 	if len(calls) != 0 {
 		t.Error("non-load method should produce no calls")
 	}
@@ -1036,7 +1095,7 @@ func TestScanLoadCallsExpr_NotLoadMethod(t *testing.T) {
 func TestScanLoadCallsExpr_Nil(t *testing.T) {
 	seen := make(map[string]bool)
 	var calls []loadCallInfo
-	scanLoadCallsExpr(nil, seen, &calls)
+	scanLoadCallsExpr(nil, seen, &calls, nil)
 	if len(calls) != 0 {
 		t.Error("nil expr should produce no calls")
 	}

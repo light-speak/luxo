@@ -2,6 +2,9 @@ package api
 
 import (
 	"fmt"
+	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/selection"
@@ -219,7 +222,11 @@ func EncodeBinaryRequest(apiID int, params map[string]any, paramMeta []ParamMeta
 			if fv, ok := v.(float64); ok {
 				enc.WriteFieldFloat(meta.FieldID, fv)
 			}
-		case "String", "DateTime", "Enum", "UUID", "Decimal":
+		case "DateTime":
+			encodeDateTimeParam(&enc, meta.FieldID, v)
+		case "UUID":
+			encodeUUIDParam(&enc, meta.FieldID, v)
+		case "String", "Enum", "Decimal":
 			if sv, ok := v.(string); ok {
 				enc.WriteFieldString(meta.FieldID, sv)
 			}
@@ -233,6 +240,54 @@ func EncodeBinaryRequest(apiID int, params map[string]any, paramMeta []ParamMeta
 	buf = append(buf, enc.Bytes()...)
 
 	return buf
+}
+
+// encodeDateTimeParam encodes a DateTime param as svarint(unix seconds).
+// Accepts time.Time, int64, float64, or RFC3339 string. Skips on parse failure
+// rather than silently encoding epoch 0.
+func encodeDateTimeParam(enc *codec.Encoder, fieldID int, v any) {
+	var (
+		sec int64
+		ok  bool
+	)
+	switch tv := v.(type) {
+	case time.Time:
+		sec, ok = tv.Unix(), true
+	case int64:
+		sec, ok = tv, true
+	case float64:
+		sec, ok = int64(tv), true
+	case string:
+		if t, err := time.Parse(time.RFC3339, tv); err == nil {
+			sec, ok = t.Unix(), true
+		}
+	}
+	if ok {
+		enc.WriteFieldInt(fieldID, sec)
+	}
+}
+
+// encodeUUIDParam encodes a UUID param as 16-byte fixed.
+// Accepts canonical string, uuid.UUID, or [16]byte. Skips on parse failure
+// rather than writing the zero UUID.
+func encodeUUIDParam(enc *codec.Encoder, fieldID int, v any) {
+	var (
+		u  [16]byte
+		ok bool
+	)
+	switch tv := v.(type) {
+	case string:
+		if parsed, err := uuid.Parse(tv); err == nil {
+			u, ok = [16]byte(parsed), true
+		}
+	case uuid.UUID:
+		u, ok = [16]byte(tv), true
+	case [16]byte:
+		u, ok = tv, true
+	}
+	if ok {
+		enc.WriteFieldUUID(fieldID, u)
+	}
 }
 
 // readBinaryParam reads a single typed parameter value from binary data.
@@ -250,7 +305,24 @@ func readBinaryParam(buf []byte, off int, meta ParamMeta) (any, int, error) {
 			return nil, 0, fmt.Errorf("param %s: truncated float", meta.Name)
 		}
 		return v, n, nil
-	case "String", "DateTime", "Enum", "UUID", "Decimal":
+	case "DateTime":
+		// Per protocol: DateTime = svarint(unix seconds). Format back to RFC3339
+		// string so existing *string slots and ParamString stay source-compatible
+		// with the previous string-wire behavior (handlers unchanged).
+		v, n := codec.ReadSvarint(buf, off)
+		if n <= 0 {
+			return nil, 0, fmt.Errorf("param %s: truncated datetime", meta.Name)
+		}
+		return time.Unix(v, 0).UTC().Format(time.RFC3339), n, nil
+	case "UUID":
+		// Per protocol: UUID = 16-byte fixed. Format back to canonical string
+		// so ParamString stays source-compatible (handlers unchanged).
+		u, n := codec.ReadUUID(buf, off)
+		if n == 0 {
+			return nil, 0, fmt.Errorf("param %s: truncated uuid", meta.Name)
+		}
+		return uuid.UUID(u).String(), n, nil
+	case "String", "Enum", "Decimal":
 		v, n := codec.ReadString(buf, off)
 		if n == 0 {
 			return nil, 0, fmt.Errorf("param %s: truncated string", meta.Name)

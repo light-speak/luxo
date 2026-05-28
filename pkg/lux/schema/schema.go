@@ -87,6 +87,7 @@ const (
 	FieldBytes
 	FieldEnum  // string on wire
 	FieldModel // nested model (sub-message)
+	FieldUUID  // 16-byte fixed value
 )
 
 // API describes an API's params and return type.
@@ -104,9 +105,10 @@ type API struct {
 
 // Param describes an API parameter.
 type Param struct {
-	ID   int       `json:"id"`
-	Name string    `json:"name"`
-	Type FieldType `json:"type"`
+	ID     int       `json:"id"`
+	Name   string    `json:"name"`
+	Type   FieldType `json:"type"`
+	IsList bool      `json:"isList,omitempty"` // true for array params (in/notIn → [T])
 }
 
 // fieldTypeNames maps FieldType to its string representation for JSON.
@@ -120,6 +122,7 @@ var fieldTypeNames = [...]string{
 	FieldBytes:    "Bytes",
 	FieldEnum:     "Enum",
 	FieldModel:    "Model",
+	FieldUUID:     "UUID",
 }
 
 // String returns the Luxo type name for the field type.

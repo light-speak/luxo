@@ -160,12 +160,14 @@ class LuxoParam {
   final int id;
   final String name;
   final String type;
+  final bool isList;
 
-  const LuxoParam({required this.id, required this.name, required this.type});
+  const LuxoParam({required this.id, required this.name, required this.type, this.isList = false});
 
   factory LuxoParam.fromJson(Map<String, dynamic> json) => LuxoParam(
         id: json['id'] as int,
         name: json['name'] as String,
         type: json['type'] as String,
+        isList: json['isList'] as bool? ?? false,
       );
 }

@@ -16,6 +16,67 @@ const textDecoder = new TextDecoder()
 
 const INITIAL_BUF_SIZE = 1024
 
+// --- UUID helpers ---
+// On the wire a UUID is a fixed 16-byte value (no length prefix). In JS it is
+// represented as the canonical 36-char lowercase string "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
+
+const HEX = '0123456789abcdef'
+
+// Precomputed byte → 2-char hex lookup (avoids per-byte string ops on hot path).
+const BYTE_HEX: string[] = new Array(256)
+for (let i = 0; i < 256; i++) BYTE_HEX[i] = HEX[i >> 4] + HEX[i & 0x0f]
+
+/** Format 16 bytes (read from `data` at `off`) as a canonical UUID string. */
+export function formatUUID(data: Uint8Array, off: number): string {
+  // Insert '-' after the 4th, 6th, 8th and 10th byte. Matches Go appendUUIDString.
+  let s = ''
+  for (let i = 0; i < 16; i++) {
+    if (i === 4 || i === 6 || i === 8 || i === 10) s += '-'
+    s += BYTE_HEX[data[off + i]]
+  }
+  return s
+}
+
+// --- DateTime helpers ---
+// On the wire a DateTime is svarint(unix seconds). In JS it is represented as
+// an RFC3339 string (e.g. "2026-05-28T12:00:00Z"), matching the Go JSON output
+// which formats time.Unix(sec, 0).UTC() with RFC3339Nano. Since wire values
+// carry only whole seconds, the fractional ".000" produced by Date.toISOString()
+// is stripped so binary and JSON modes yield byte-identical strings.
+
+/** Convert unix seconds to an RFC3339 string, matching Go's DateTime JSON output. */
+export function unixSecondsToISO(seconds: number): string {
+  // Date expects milliseconds; whole-second timestamps never have a fractional part.
+  return new Date(seconds * 1000).toISOString().replace('.000Z', 'Z')
+}
+
+/** Decode a single hex digit, or -1 if not a hex char. */
+function hexNibble(c: number): number {
+  if (c >= 0x30 && c <= 0x39) return c - 0x30 // 0-9
+  if (c >= 0x61 && c <= 0x66) return c - 0x61 + 10 // a-f
+  if (c >= 0x41 && c <= 0x46) return c - 0x41 + 10 // A-F
+  return -1
+}
+
+/** Parse a canonical 36-char UUID string into 16 bytes. Returns null on malformed input. */
+export function parseUUID(s: string): Uint8Array | null {
+  if (s.length !== 36) return null
+  const out = new Uint8Array(16)
+  let j = 0
+  let i = 0
+  while (i < s.length) {
+    const c = s.charCodeAt(i)
+    if (c === 0x2d) { i++; continue } // '-'
+    if (i + 1 >= s.length || j >= 16) return null
+    const hi = hexNibble(c)
+    const lo = hexNibble(s.charCodeAt(i + 1))
+    if (hi < 0 || lo < 0) return null
+    out[j++] = (hi << 4) | lo
+    i += 2
+  }
+  return j === 16 ? out : null
+}
+
 // --- Encoder ---
 
 export class Encoder {
@@ -92,6 +153,15 @@ export class Encoder {
     this.buf[this.pos++] = v ? 1 : 0
   }
 
+  /** Write a fixed 16-byte UUID (no length prefix). Accepts a canonical string or raw bytes. */
+  writeUUID(v: string | Uint8Array): void {
+    const bytes = typeof v === 'string' ? parseUUID(v) : v
+    if (!bytes || bytes.length !== 16) throw new Error(`invalid UUID: ${typeof v === 'string' ? v : '[bytes]'}`)
+    this.grow(16)
+    this.buf.set(bytes, this.pos)
+    this.pos += 16
+  }
+
   // --- Field writers (fieldID + value) ---
 
   writeFieldInt(fieldID: number, v: number): void {
@@ -112,6 +182,44 @@ export class Encoder {
   writeFieldBool(fieldID: number, v: boolean): void {
     this.writeVarint(fieldID)
     this.writeBool(v)
+  }
+
+  writeFieldUUID(fieldID: number, v: string | Uint8Array): void {
+    this.writeVarint(fieldID)
+    this.writeUUID(v)
+  }
+
+  // --- Array field writers (fieldID + [count][items...]) ---
+  // Array count is a plain varint (not zigzag); each item is encoded per element type.
+
+  writeFieldIntArray(fieldID: number, v: number[]): void {
+    this.writeVarint(fieldID)
+    this.writeVarint(v.length)
+    for (const item of v) this.writeSvarint(item)
+  }
+
+  writeFieldFloatArray(fieldID: number, v: number[]): void {
+    this.writeVarint(fieldID)
+    this.writeVarint(v.length)
+    for (const item of v) this.writeFixed64(item)
+  }
+
+  writeFieldStringArray(fieldID: number, v: string[]): void {
+    this.writeVarint(fieldID)
+    this.writeVarint(v.length)
+    for (const item of v) this.writeString(item)
+  }
+
+  writeFieldBoolArray(fieldID: number, v: boolean[]): void {
+    this.writeVarint(fieldID)
+    this.writeVarint(v.length)
+    for (const item of v) this.writeBool(item)
+  }
+
+  writeFieldUUIDArray(fieldID: number, v: (string | Uint8Array)[]): void {
+    this.writeVarint(fieldID)
+    this.writeVarint(v.length)
+    for (const item of v) this.writeUUID(item)
   }
 
   /** Write end marker (fieldID 0) */
@@ -209,6 +317,52 @@ export class Decoder {
     return this.readVarintRaw() !== 0
   }
 
+  /** Read a fixed 16-byte UUID, returning the canonical 36-char string. */
+  readUUID(): string {
+    if (this.off + 16 > this.data.length) return '00000000-0000-0000-0000-000000000000'
+    const s = formatUUID(this.data, this.off)
+    this.off += 16
+    return s
+  }
+
+  // --- Scalar array readers (row mode: [count][item0][item1]...) ---
+  // count is a plain varint; each item is encoded per element type.
+
+  readIntArray(): number[] {
+    const count = this.readVarintRaw()
+    const out: number[] = new Array(count)
+    for (let i = 0; i < count; i++) out[i] = this.readInt()
+    return out
+  }
+
+  readFloatArray(): number[] {
+    const count = this.readVarintRaw()
+    const out: number[] = new Array(count)
+    for (let i = 0; i < count; i++) out[i] = this.readFloat()
+    return out
+  }
+
+  readStringArray(): string[] {
+    const count = this.readVarintRaw()
+    const out: string[] = new Array(count)
+    for (let i = 0; i < count; i++) out[i] = this.readString()
+    return out
+  }
+
+  readBoolArray(): boolean[] {
+    const count = this.readVarintRaw()
+    const out: boolean[] = new Array(count)
+    for (let i = 0; i < count; i++) out[i] = this.readBool()
+    return out
+  }
+
+  readUUIDArray(): string[] {
+    const count = this.readVarintRaw()
+    const out: string[] = new Array(count)
+    for (let i = 0; i < count; i++) out[i] = this.readUUID()
+    return out
+  }
+
   // --- Nullable readers (1-byte flag + value if present) ---
 
   readIntPtr(): number | null {
@@ -233,6 +387,24 @@ export class Decoder {
     if (this.off >= this.data.length) return null
     if (this.data[this.off++] === 0x00) return null
     return this.readBool()
+  }
+
+  readUUIDPtr(): string | null {
+    if (this.off >= this.data.length) return null
+    if (this.data[this.off++] === 0x00) return null
+    return this.readUUID()
+  }
+
+  /** Read a DateTime: svarint(unix seconds) → RFC3339 string (matches Go JSON output). */
+  readDateTime(): string {
+    return unixSecondsToISO(this.readInt())
+  }
+
+  /** Read a nullable DateTime (0x00=null, else svarint seconds → RFC3339 string). */
+  readDateTimePtr(): string | null {
+    if (this.off >= this.data.length) return null
+    if (this.data[this.off++] === 0x00) return null
+    return unixSecondsToISO(this.readInt())
   }
 
   /** Read a nested model using a decoder function. */
@@ -325,12 +497,64 @@ export class ColumnarDecoder {
     return result
   }
 
+  /** Read count fixed 16-byte UUID values (canonical strings). */
+  readColumnUUID(): string[] {
+    const result: string[] = new Array(this.count)
+    for (let i = 0; i < this.count; i++) {
+      result[i] = formatUUID(this.buf, this.off)
+      this.off += 16
+    }
+    return result
+  }
+
+  /** Read count length-prefixed byte blobs. Each cell is a length-prefixed blob —
+   *  used for scalar array columns ([T]), where each cell holds [count][items...]. */
+  readColumnBytes(): Uint8Array[] {
+    const result: Uint8Array[] = new Array(this.count)
+    for (let i = 0; i < this.count; i++) {
+      const len = this.readVarintRaw()
+      result[i] = this.buf.subarray(this.off, this.off + len)
+      this.off += len
+    }
+    return result
+  }
+
+  /** Read count nullable UUID values (0x00=null, 0x01+16 bytes). */
+  readColumnUUIDPtr(): (string | null)[] {
+    const result: (string | null)[] = new Array(this.count)
+    for (let i = 0; i < this.count; i++) {
+      if (this.buf[this.off++] === 0x00) { result[i] = null; continue }
+      result[i] = formatUUID(this.buf, this.off)
+      this.off += 16
+    }
+    return result
+  }
+
   /** Read count nullable int values (0x00=null, 0x01+svarint). */
   readColumnIntPtr(): (number | null)[] {
     const result: (number | null)[] = new Array(this.count)
     for (let i = 0; i < this.count; i++) {
       if (this.buf[this.off++] === 0x00) { result[i] = null; continue }
       result[i] = this.readSvarint()
+    }
+    return result
+  }
+
+  /** Read count DateTime values (svarint seconds → RFC3339 strings). */
+  readColumnDateTime(): string[] {
+    const result: string[] = new Array(this.count)
+    for (let i = 0; i < this.count; i++) {
+      result[i] = unixSecondsToISO(this.readSvarint())
+    }
+    return result
+  }
+
+  /** Read count nullable DateTime values (0x00=null, 0x01+svarint → RFC3339 string). */
+  readColumnDateTimePtr(): (string | null)[] {
+    const result: (string | null)[] = new Array(this.count)
+    for (let i = 0; i < this.count; i++) {
+      if (this.buf[this.off++] === 0x00) { result[i] = null; continue }
+      result[i] = unixSecondsToISO(this.readSvarint())
     }
     return result
   }
@@ -417,4 +641,36 @@ export function fieldMaskHas(mask: Uint8Array, fieldID: number): boolean {
   const byteIdx = fieldID >>> 3
   if (byteIdx >= mask.length) return false
   return (mask[byteIdx] & (1 << (fieldID & 7))) !== 0
+}
+
+// --- Scalar array helpers ---
+
+/** Luxo wire field type names (matches Go schema.FieldType.String()). */
+export type FieldType =
+  | 'Int' | 'Float' | 'String' | 'Boolean' | 'DateTime'
+  | 'Duration' | 'Bytes' | 'Enum' | 'Model' | 'UUID'
+
+/** Decode a scalar array cell ([count][items...]) into a JS array, by element type.
+ *  Used both for row-mode list fields and for columnar list cells (each cell is a
+ *  length-prefixed blob read via ColumnarDecoder.readColumnBytes). Duration values
+ *  are returned as raw numbers (nanoseconds); DateTime values are returned as RFC3339
+ *  strings, matching the Go JSON output and the row/columnar scalar decoders. */
+export function decodeScalarArray(cell: Uint8Array, type: FieldType): unknown[] {
+  const dec = new Decoder(cell)
+  switch (type) {
+    case 'DateTime':
+      return dec.readIntArray().map(unixSecondsToISO)
+    case 'Int': case 'Duration':
+      return dec.readIntArray()
+    case 'Float':
+      return dec.readFloatArray()
+    case 'String': case 'Enum':
+      return dec.readStringArray()
+    case 'Boolean':
+      return dec.readBoolArray()
+    case 'UUID':
+      return dec.readUUIDArray()
+    default:
+      return []
+  }
 }

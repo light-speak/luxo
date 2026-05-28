@@ -460,11 +460,13 @@ func TestParamDateTimeBinaryNotString(t *testing.T) {
 	req := &Request{
 		paramNames: []string{"date"},
 		paramCount: 1,
-		paramSlots: [16]any{int64(12345)},
+		// int64 is now the binary-mode raw form (svarint unix seconds) — valid.
+		// Use a type the binary path doesn't accept (bool) to provoke the error.
+		paramSlots: [16]any{true},
 	}
 	_, err := req.ParamDateTime("date")
 	if err == nil {
-		t.Fatal("should error when value is not a string")
+		t.Fatal("should error when value is neither int64 nor string")
 	}
 }
 
@@ -650,9 +652,11 @@ func TestEncodeBinaryRequestFloat(t *testing.T) {
 // --- readBinaryParam: DateTime, Enum, Duration, UUID, Decimal ---
 
 func TestReadBinaryParamDateTime(t *testing.T) {
-	// DateTime is encoded as a string
+	// Per protocol: DateTime = svarint(unix seconds);
+	// readBinaryParam formats back to RFC3339 string for handler compatibility.
+	unixSec := int64(1776427200) // 2026-04-17T12:00:00Z
 	var buf []byte
-	buf = codec.AppendString(buf, "2026-04-17T12:00:00Z")
+	buf = codec.AppendSvarint(buf, unixSec)
 
 	val, n, err := readBinaryParam(buf, 0, ParamMeta{Name: "date", Type: "DateTime"})
 	if err != nil {
@@ -699,8 +703,10 @@ func TestReadBinaryParamDuration(t *testing.T) {
 }
 
 func TestReadBinaryParamUUID(t *testing.T) {
+	// Per protocol: UUID = 16-byte fixed; readBinaryParam formats back to
+	// canonical string for ParamString compatibility.
 	var buf []byte
-	buf = codec.AppendString(buf, "550e8400-e29b-41d4-a716-446655440000")
+	buf = codec.AppendUUID(buf, [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00})
 
 	val, n, err := readBinaryParam(buf, 0, ParamMeta{Name: "id", Type: "UUID"})
 	if err != nil {

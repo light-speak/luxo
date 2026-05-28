@@ -84,6 +84,14 @@ class LuxoEncoder {
     _pos += v.length;
   }
 
+  /// Writes a fixed 16-byte UUID (no length prefix) from a canonical
+  /// "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" string.
+  void writeUuid(String v) {
+    _ensureCapacity(16);
+    parseUuidInto(v, _buf, _pos);
+    _pos += 16;
+  }
+
   /// Writes a null marker (0x00).
   void writeNull() {
     _ensureCapacity(1);
@@ -126,6 +134,60 @@ class LuxoEncoder {
   void writeFieldBytes(int fieldID, Uint8List v) {
     writeVarint(fieldID);
     writeBytes(v);
+  }
+
+  /// Writes field header + fixed 16-byte UUID value.
+  void writeFieldUuid(int fieldID, String v) {
+    writeVarint(fieldID);
+    writeUuid(v);
+  }
+
+  // --- Array field writers ---
+  // Array layout: [varint count][item0][item1]... (count uses plain varint).
+
+  /// Writes field header + count-prefixed int64 array (zigzag items).
+  void writeFieldIntArray(int fieldID, List<int> v) {
+    writeVarint(fieldID);
+    writeVarint(v.length);
+    for (final e in v) {
+      writeSvarint(e);
+    }
+  }
+
+  /// Writes field header + count-prefixed float64 array (fixed64 items).
+  void writeFieldFloatArray(int fieldID, List<double> v) {
+    writeVarint(fieldID);
+    writeVarint(v.length);
+    for (final e in v) {
+      writeFixed64(e);
+    }
+  }
+
+  /// Writes field header + count-prefixed string array (length-prefixed items).
+  void writeFieldStringArray(int fieldID, List<String> v) {
+    writeVarint(fieldID);
+    writeVarint(v.length);
+    for (final e in v) {
+      writeString(e);
+    }
+  }
+
+  /// Writes field header + count-prefixed bool array (1 byte per item).
+  void writeFieldBoolArray(int fieldID, List<bool> v) {
+    writeVarint(fieldID);
+    writeVarint(v.length);
+    for (final e in v) {
+      writeBool(e);
+    }
+  }
+
+  /// Writes field header + count-prefixed UUID array (16-byte items).
+  void writeFieldUuidArray(int fieldID, List<String> v) {
+    writeVarint(fieldID);
+    writeVarint(v.length);
+    for (final e in v) {
+      writeUuid(e);
+    }
   }
 
   /// Writes the end marker (fieldID 0).
@@ -198,6 +260,18 @@ class LuxoDecoder {
     return (uv >>> 1) ^ -(uv & 1);
   }
 
+  /// Reads a DateTime field encoded as svarint(unix seconds) and converts it
+  /// to an ISO 8601 UTC string — matching the JSON wire representation
+  /// (RFC3339). Keeps binary and JSON decoding type-consistent (both String).
+  String readDateTime() => dateTimeStringFromUnixSeconds(readInt());
+
+  /// Reads a nullable DateTime field. Returns null when the null marker is set,
+  /// otherwise svarint(unix seconds) converted to an ISO 8601 UTC string.
+  String? readDateTimePtr() {
+    if (!_readNullableFlag()) return null;
+    return readDateTime();
+  }
+
   /// Reads a float64 (8 bytes little-endian).
   double readFloat() {
     if (_off + 8 > _data.lengthInBytes) {
@@ -239,6 +313,18 @@ class LuxoDecoder {
     return v;
   }
 
+  /// Reads a fixed 16-byte UUID and formats it as a canonical
+  /// "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" string.
+  String readUuid() {
+    if (_off + 16 > _data.lengthInBytes) {
+      error = 'truncated uuid at offset $_off';
+      return '';
+    }
+    final s = formatUuid(_bytes, _off);
+    _off += 16;
+    return s;
+  }
+
   // --- Nullable readers ---
 
   /// Reads a nullable int. Returns null if the null marker is present.
@@ -265,6 +351,12 @@ class LuxoDecoder {
     return readBool();
   }
 
+  /// Reads a nullable UUID. Returns null if the null marker is present.
+  String? readUuidPtr() {
+    if (!_readNullableFlag()) return null;
+    return readUuid();
+  }
+
   // --- Array readers ---
 
   /// Reads a count-prefixed int64 array.
@@ -278,6 +370,23 @@ class LuxoDecoder {
     for (var i = 0; i < count; i++) {
       result.add(readInt());
       if (error != null) return const [];
+    }
+    return result;
+  }
+
+  /// Reads a count-prefixed DateTime array (svarint unix-seconds items),
+  /// converting each element to an ISO 8601 UTC string to match JSON mode.
+  List<String> readDateTimeArray() {
+    final count = _readVarint();
+    if (count < 0) {
+      error = 'invalid array header at offset $_off';
+      return const [];
+    }
+    final result = <String>[];
+    for (var i = 0; i < count; i++) {
+      final seconds = readInt();
+      if (error != null) return const [];
+      result.add(dateTimeStringFromUnixSeconds(seconds));
     }
     return result;
   }
@@ -307,6 +416,51 @@ class LuxoDecoder {
     final result = <double>[];
     for (var i = 0; i < count; i++) {
       result.add(readFloat());
+      if (error != null) return const [];
+    }
+    return result;
+  }
+
+  /// Reads a count-prefixed bool array.
+  List<bool> readBoolArray() {
+    final count = _readVarint();
+    if (count < 0) {
+      error = 'invalid array header at offset $_off';
+      return const [];
+    }
+    final result = <bool>[];
+    for (var i = 0; i < count; i++) {
+      result.add(readBool());
+      if (error != null) return const [];
+    }
+    return result;
+  }
+
+  /// Reads a count-prefixed UUID array (16-byte items → canonical strings).
+  List<String> readUuidArray() {
+    final count = _readVarint();
+    if (count < 0) {
+      error = 'invalid array header at offset $_off';
+      return const [];
+    }
+    final result = <String>[];
+    for (var i = 0; i < count; i++) {
+      result.add(readUuid());
+      if (error != null) return const [];
+    }
+    return result;
+  }
+
+  /// Reads a count-prefixed bytes array (length-prefixed items).
+  List<Uint8List> readBytesArray() {
+    final count = _readVarint();
+    if (count < 0) {
+      error = 'invalid array header at offset $_off';
+      return const [];
+    }
+    final result = <Uint8List>[];
+    for (var i = 0; i < count; i++) {
+      result.add(readBytes());
       if (error != null) return const [];
     }
     return result;
@@ -407,6 +561,29 @@ class ColumnarDecoder {
     return result;
   }
 
+  /// Reads [count] DateTime values from an Int (svarint unix-seconds) column,
+  /// converting each to an ISO 8601 UTC string to match the JSON wire format.
+  List<String> readColumnDateTime() {
+    final result = List<String>.filled(count, '');
+    for (var i = 0; i < count; i++) {
+      if (_off >= _data.lengthInBytes) break;
+      result[i] = dateTimeStringFromUnixSeconds(_readSvarint());
+    }
+    return result;
+  }
+
+  /// Reads [count] nullable DateTime values (0x00=null, 0x01+svarint seconds),
+  /// each non-null value converted to an ISO 8601 UTC string.
+  List<String?> readColumnDateTimePtr() {
+    final result = List<String?>.filled(count, null);
+    for (var i = 0; i < count; i++) {
+      if (_off >= _data.lengthInBytes) break;
+      if (_bytes[_off++] == 0x00) continue;
+      result[i] = dateTimeStringFromUnixSeconds(_readSvarint());
+    }
+    return result;
+  }
+
   /// Reads [count] fixed64 float values.
   List<double> readColumnFloat() {
     final result = List<double>.filled(count, 0.0);
@@ -499,6 +676,46 @@ class ColumnarDecoder {
     return result;
   }
 
+  /// Reads [count] fixed 16-byte UUID values as canonical strings.
+  List<String> readColumnUuid() {
+    final result = List<String>.filled(count, '');
+    for (var i = 0; i < count; i++) {
+      if (_off + 16 > _data.lengthInBytes) break;
+      result[i] = formatUuid(_bytes, _off);
+      _off += 16;
+    }
+    return result;
+  }
+
+  /// Reads [count] nullable UUID values (0x00=null, 0x01+16 bytes).
+  List<String?> readColumnUuidPtr() {
+    final result = List<String?>.filled(count, null);
+    for (var i = 0; i < count; i++) {
+      if (_off >= _data.lengthInBytes) break;
+      if (_bytes[_off++] == 0x00) continue;
+      if (_off + 16 > _data.lengthInBytes) break;
+      result[i] = formatUuid(_bytes, _off);
+      _off += 16;
+    }
+    return result;
+  }
+
+  /// Reads [count] length-prefixed byte blobs (one per cell).
+  ///
+  /// Used for scalar array columns and nested/federation columns: each cell is
+  /// a length-prefixed blob. For scalar arrays the blob holds an inline
+  /// [count][items...] array, decoded with a fresh [LuxoDecoder].
+  List<Uint8List> readColumnBytes() {
+    final result = List<Uint8List>.filled(count, _emptyBytes, growable: false);
+    for (var i = 0; i < count; i++) {
+      final len = _readVarint();
+      if (len < 0 || _off + len > _data.lengthInBytes) break;
+      result[i] = Uint8List.sublistView(_bytes, _off, _off + len);
+      _off += len;
+    }
+    return result;
+  }
+
   /// Current read position (for reading pagination metadata after 0x00).
   int get offset => _off;
 
@@ -525,6 +742,73 @@ class ColumnarDecoder {
     }
     return -1;
   }
+}
+
+// --- DateTime helpers ---
+
+/// Converts a unix-seconds timestamp (as carried by the Luxo binary wire as
+/// svarint) to an ISO 8601 UTC string, matching the RFC3339 representation the
+/// JSON wire format uses. This keeps DateTime fields the same Dart type
+/// (String) regardless of transport mode.
+String dateTimeStringFromUnixSeconds(int seconds) =>
+    DateTime.fromMillisecondsSinceEpoch(seconds * 1000, isUtc: true)
+        .toIso8601String();
+
+// --- UUID helpers ---
+
+final Uint8List _emptyBytes = Uint8List(0);
+
+const String _hexDigits = '0123456789abcdef';
+
+/// Formats 16 bytes starting at [off] in [bytes] as a canonical lowercase
+/// UUID string "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
+String formatUuid(Uint8List bytes, int off) {
+  // 32 hex chars + 4 dashes = 36.
+  final out = Uint8List(36);
+  var o = 0;
+  for (var i = 0; i < 16; i++) {
+    if (i == 4 || i == 6 || i == 8 || i == 10) {
+      out[o++] = 0x2D; // '-'
+    }
+    final b = bytes[off + i];
+    out[o++] = _hexDigits.codeUnitAt(b >> 4);
+    out[o++] = _hexDigits.codeUnitAt(b & 0x0F);
+  }
+  return String.fromCharCodes(out);
+}
+
+/// Parses a canonical 36-char UUID string into 16 bytes written into [dst]
+/// starting at [off]. Throws [FormatException] on malformed input.
+void parseUuidInto(String s, Uint8List dst, int off) {
+  if (s.length != 36) {
+    throw FormatException('invalid UUID length: ${s.length}', s);
+  }
+  // Enforce dashes at the canonical 8-4-4-4-12 boundaries; malformed
+  // 36-char strings with misplaced dashes must not silently encode.
+  if (s.codeUnitAt(8) != 0x2D ||
+      s.codeUnitAt(13) != 0x2D ||
+      s.codeUnitAt(18) != 0x2D ||
+      s.codeUnitAt(23) != 0x2D) {
+    throw FormatException('invalid UUID format', s);
+  }
+  var j = 0;
+  for (var i = 0; i < s.length;) {
+    if (i == 8 || i == 13 || i == 18 || i == 23) {
+      i++;
+      continue;
+    }
+    final hi = _hexNibble(s.codeUnitAt(i));
+    final lo = _hexNibble(s.codeUnitAt(i + 1));
+    dst[off + j++] = (hi << 4) | lo;
+    i += 2;
+  }
+}
+
+int _hexNibble(int c) {
+  if (c >= 0x30 && c <= 0x39) return c - 0x30; // 0-9
+  if (c >= 0x61 && c <= 0x66) return c - 0x61 + 10; // a-f
+  if (c >= 0x41 && c <= 0x46) return c - 0x41 + 10; // A-F
+  throw const FormatException('invalid hex digit in UUID');
 }
 
 // --- Field mask utilities ---

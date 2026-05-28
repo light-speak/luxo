@@ -93,6 +93,8 @@ func analyzeRelations(m *ast.ModelDecl, enums map[string]bool) []Relation {
 type loadCallInfo struct {
 	modelName string   // "Post"
 	argNames  []string // ["userId", "type"] — named args; empty = PK load
+	argTypes  []string // Go type per argName, resolved from the model field decl
+	//          (e.g. ["int64", "string"]); parallel to argNames.
 }
 
 // loaderNameFromLoadCall returns the DataLoader field name for a load call.
@@ -113,11 +115,27 @@ func loaderNameFromLoadCall(lc loadCallInfo) string {
 	return name
 }
 
+// buildModelFieldIndex maps each model name to its field declarations, merging
+// in extend fields. Used to resolve load() argument types from the schema.
+func buildModelFieldIndex(result *semantic.Result) map[string][]*ast.FieldDecl {
+	idx := make(map[string][]*ast.FieldDecl)
+	for _, file := range result.Files {
+		for _, m := range file.Models {
+			idx[m.Name] = append(idx[m.Name], m.Fields...)
+		}
+		for _, e := range file.Extends {
+			idx[e.Name] = append(idx[e.Name], e.Fields...)
+		}
+	}
+	return idx
+}
+
 // collectLoadCalls scans all API/fn bodies for Model.load(...) calls
 // and returns unique (model, args) combinations for DataLoader generation.
 func collectLoadCalls(result *semantic.Result) []loadCallInfo {
 	seen := make(map[string]bool) // dedup key: "Post:userId,type"
 	var calls []loadCallInfo
+	fieldIndex := buildModelFieldIndex(result)
 
 	for _, file := range result.Files {
 		// Scan API bodies
@@ -126,7 +144,7 @@ func collectLoadCalls(result *semantic.Result) []loadCallInfo {
 				continue
 			}
 			for _, stmt := range api.Body.Stmts {
-				scanLoadCalls(stmt, seen, &calls)
+				scanLoadCalls(stmt, seen, &calls, fieldIndex)
 			}
 		}
 		// Scan fn bodies
@@ -135,7 +153,7 @@ func collectLoadCalls(result *semantic.Result) []loadCallInfo {
 				continue
 			}
 			for _, stmt := range fn.Body.Stmts {
-				scanLoadCalls(stmt, seen, &calls)
+				scanLoadCalls(stmt, seen, &calls, fieldIndex)
 			}
 		}
 	}
@@ -143,33 +161,33 @@ func collectLoadCalls(result *semantic.Result) []loadCallInfo {
 }
 
 // scanLoadCalls recursively scans an AST statement for Model.load(...) calls.
-func scanLoadCalls(stmt ast.Stmt, seen map[string]bool, calls *[]loadCallInfo) {
+func scanLoadCalls(stmt ast.Stmt, seen map[string]bool, calls *[]loadCallInfo, fieldIndex map[string][]*ast.FieldDecl) {
 	switch s := stmt.(type) {
 	case *ast.ValStmt:
-		scanLoadCallsExpr(s.Value, seen, calls)
+		scanLoadCallsExpr(s.Value, seen, calls, fieldIndex)
 	case *ast.ReturnStmt:
 		if s.Value != nil {
-			scanLoadCallsExpr(s.Value, seen, calls)
+			scanLoadCallsExpr(s.Value, seen, calls, fieldIndex)
 		}
 	case *ast.ExprStmt:
-		scanLoadCallsExpr(s.Expr, seen, calls)
+		scanLoadCallsExpr(s.Expr, seen, calls, fieldIndex)
 	case *ast.IfStmt:
 		if s.Then != nil {
 			for _, st := range s.Then.Stmts {
-				scanLoadCalls(st, seen, calls)
+				scanLoadCalls(st, seen, calls, fieldIndex)
 			}
 		}
 	case *ast.ForStmt:
 		if s.Body != nil {
 			for _, st := range s.Body.Stmts {
-				scanLoadCalls(st, seen, calls)
+				scanLoadCalls(st, seen, calls, fieldIndex)
 			}
 		}
 	}
 }
 
 // scanLoadCallsExpr recursively scans an expression for Model.load(...) calls.
-func scanLoadCallsExpr(expr ast.Expr, seen map[string]bool, calls *[]loadCallInfo) {
+func scanLoadCallsExpr(expr ast.Expr, seen map[string]bool, calls *[]loadCallInfo, fieldIndex map[string][]*ast.FieldDecl) {
 	if expr == nil {
 		return
 	}
@@ -191,10 +209,15 @@ func scanLoadCallsExpr(expr ast.Expr, seen map[string]bool, calls *[]loadCallInf
 		return
 	}
 
+	fields := fieldIndex[modelName]
 	var argNames []string
+	var argTypes []string
 	for _, arg := range call.Args {
 		if arg.Name != "" {
 			argNames = append(argNames, arg.Name)
+			// Resolve the key type from the model field decl (defaults to int64
+			// for FK columns when the field can't be found).
+			argTypes = append(argTypes, fkGoType(fields, arg.Name))
 		}
 	}
 
@@ -210,7 +233,7 @@ func scanLoadCallsExpr(expr ast.Expr, seen map[string]bool, calls *[]loadCallInf
 		return
 	}
 	seen[key] = true
-	*calls = append(*calls, loadCallInfo{modelName: modelName, argNames: argNames})
+	*calls = append(*calls, loadCallInfo{modelName: modelName, argNames: argNames, argTypes: argTypes})
 }
 
 // collectExtendModels finds cross-module extended model names for load-by-PK DataLoader.
@@ -346,18 +369,17 @@ func generateDataLoaderFile(result *semantic.Result, packageName string, enums m
 		seenTypes[typeName] = true
 
 		if len(lc.argNames) == 1 {
-			// Single FK: BatchFn[int64, []*Post]
+			// Single FK: BatchFn[<keyType>, []*Post]
 			fmt.Fprintf(&b, "// %s is the batch function for %s.load(%s: ...).\n", typeName, lc.modelName, lc.argNames[0])
-			fmt.Fprintf(&b, "type %s = dataloader.BatchFn[int64, []*%s]\n\n", typeName, lc.modelName)
+			fmt.Fprintf(&b, "type %s = dataloader.BatchFn[%s, []*%s]\n\n", typeName, lc.argTypes[0], lc.modelName)
 		} else {
 			// Composite key: generate key struct + BatchFn
 			keyType := loaderName + "Key"
 			fmt.Fprintf(&b, "// %s is the composite key for %s.load(%s).\n", keyType, lc.modelName, strings.Join(lc.argNames, ", "))
 			fmt.Fprintf(&b, "type %s struct {\n", keyType)
-			for _, arg := range lc.argNames {
-				// Default to int64 for FK fields, string for others
-				// TODO: resolve actual types from model field declarations
-				fmt.Fprintf(&b, "\t%s int64\n", str.Capitalize(arg))
+			for i, arg := range lc.argNames {
+				// Field type resolved from the model declaration (FK → int64, etc.).
+				fmt.Fprintf(&b, "\t%s %s\n", str.Capitalize(arg), lc.argTypes[i])
 			}
 			fmt.Fprintf(&b, "}\n\n")
 			fmt.Fprintf(&b, "// %s is the batch function for %s.load(%s).\n", typeName, lc.modelName, strings.Join(lc.argNames, ", "))
@@ -442,7 +464,7 @@ func generateLoadersStruct(b *strings.Builder, allRelations []struct {
 	for _, lc := range fkLoadCalls {
 		loaderName := loaderNameFromLoadCall(lc)
 		if len(lc.argNames) == 1 {
-			fmt.Fprintf(b, "\t%s *dataloader.Loader[int64, []*%s]\n", loaderName, lc.modelName)
+			fmt.Fprintf(b, "\t%s *dataloader.Loader[%s, []*%s]\n", loaderName, lc.argTypes[0], lc.modelName)
 		} else {
 			keyType := loaderName + "Key"
 			fmt.Fprintf(b, "\t%s *dataloader.Loader[%s, []*%s]\n", loaderName, keyType, lc.modelName)
@@ -546,16 +568,18 @@ func generateFKLoadBatchFunc(b *strings.Builder, lc loadCallInfo, softTarget boo
 		// Single FK: WHERE col IN (keys)
 		col := str.ToSnakeCase(lc.argNames[0])
 		goField := str.Capitalize(lc.argNames[0])
-		fmt.Fprintf(b, "\t\tfunc(ctx context.Context, keys []int64, fields []string) (map[int64][]*%s, error) {\n", lc.modelName)
+		keyType := lc.argTypes[0]
+		condField := goTypeToCondField(keyType)
+		fmt.Fprintf(b, "\t\tfunc(ctx context.Context, keys []%s, fields []string) (map[%s][]*%s, error) {\n", keyType, keyType, lc.modelName)
 		fmt.Fprintf(b, "\t\t\tfields = ensureField(fields, %q)\n", col)
-		fmt.Fprintf(b, "\t\t\tconds := []lux.Condition{lux.NewIntField(%q).In(keys...)}\n", col)
+		fmt.Fprintf(b, "\t\t\tconds := []lux.Condition{lux.New%s(%q).In(keys...)}\n", condField, col)
 		if softTarget {
 			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewTimeField(\"deleted_at\").IsNull())\n")
 		}
 		fmt.Fprintf(b, "\t\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", tableName)
 		fmt.Fprintf(b, "\t\t\trows, err := %s.QueryRows(ctx, app.DB, %s, query, args...)\n", dbPkg, scanFn)
 		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
-		fmt.Fprintf(b, "\t\t\tresult := make(map[int64][]*%s, len(keys))\n", lc.modelName)
+		fmt.Fprintf(b, "\t\t\tresult := make(map[%s][]*%s, len(keys))\n", keyType, lc.modelName)
 		fmt.Fprintf(b, "\t\t\tfor _, row := range rows {\n")
 		fmt.Fprintf(b, "\t\t\t\tresult[row.%s] = append(result[row.%s], row)\n", goField, goField)
 		fmt.Fprintf(b, "\t\t\t}\n")
@@ -566,20 +590,17 @@ func generateFKLoadBatchFunc(b *strings.Builder, lc loadCallInfo, softTarget boo
 		keyType := loaderName + "Key"
 		fmt.Fprintf(b, "\t\tfunc(ctx context.Context, keys []%s, fields []string) (map[%s][]*%s, error) {\n", keyType, keyType, lc.modelName)
 
-		// Build conditions from all keys
+		// Build per-column distinct key slices (typed per the model field decl).
 		for i, arg := range lc.argNames {
 			col := str.ToSnakeCase(arg)
-			fmt.Fprintf(b, "\t\t\tfields = ensureField(fields, %q)\n", col)
-			fmt.Fprintf(b, "\t\t\t%sSet := make(map[int64]bool, len(keys))\n", arg)
-			fmt.Fprintf(b, "\t\t\tfor _, k := range keys {\n")
+			argType := lc.argTypes[i]
 			goKeyField := str.Capitalize(arg)
+			fmt.Fprintf(b, "\t\t\tfields = ensureField(fields, %q)\n", col)
+			fmt.Fprintf(b, "\t\t\t%sSet := make(map[%s]bool, len(keys))\n", arg, argType)
+			fmt.Fprintf(b, "\t\t\tfor _, k := range keys {\n")
 			fmt.Fprintf(b, "\t\t\t\t%sSet[k.%s] = true\n", arg, goKeyField)
 			fmt.Fprintf(b, "\t\t\t}\n")
-			if i == 0 {
-				fmt.Fprintf(b, "\t\t\t%sKeys := make([]int64, 0, len(%sSet))\n", arg, arg)
-			} else {
-				fmt.Fprintf(b, "\t\t\t%sKeys := make([]int64, 0, len(%sSet))\n", arg, arg)
-			}
+			fmt.Fprintf(b, "\t\t\t%sKeys := make([]%s, 0, len(%sSet))\n", arg, argType, arg)
 			fmt.Fprintf(b, "\t\t\tfor v := range %sSet {\n", arg)
 			fmt.Fprintf(b, "\t\t\t\t%sKeys = append(%sKeys, v)\n", arg, arg)
 			fmt.Fprintf(b, "\t\t\t}\n")
@@ -587,9 +608,10 @@ func generateFKLoadBatchFunc(b *strings.Builder, lc loadCallInfo, softTarget boo
 
 		// Build WHERE clause
 		fmt.Fprintf(b, "\t\t\tconds := []lux.Condition{\n")
-		for _, arg := range lc.argNames {
+		for i, arg := range lc.argNames {
 			col := str.ToSnakeCase(arg)
-			fmt.Fprintf(b, "\t\t\t\tlux.NewIntField(%q).In(%sKeys...),\n", col, arg)
+			condField := goTypeToCondField(lc.argTypes[i])
+			fmt.Fprintf(b, "\t\t\t\tlux.New%s(%q).In(%sKeys...),\n", condField, col, arg)
 		}
 		fmt.Fprintf(b, "\t\t\t}\n")
 		if softTarget {

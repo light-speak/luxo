@@ -278,6 +278,172 @@ void main() {
         expect(dec.readString(), equals('a' * 100));
       });
     });
+
+    group('UUID 16-byte fixed', () {
+      const sample = '550e8400-e29b-41d4-a716-446655440000';
+      const zero = '00000000-0000-0000-0000-000000000000';
+      const upper = 'AB12CD34-EF56-7890-ABCD-EF1234567890';
+
+      test('round-trip canonical UUID is 16 bytes on the wire', () {
+        final enc = LuxoEncoder();
+        enc.writeFieldUuid(1, sample);
+        enc.writeEnd();
+        final bytes = enc.bytes();
+        // fieldID(1 byte) + 16 bytes + end(1 byte) = 18
+        expect(bytes.length, equals(18));
+
+        final dec = LuxoDecoder(bytes);
+        expect(dec.nextField(), isTrue);
+        expect(dec.fieldID, equals(1));
+        expect(dec.readUuid(), equals(sample));
+        expect(dec.nextField(), isFalse);
+      });
+
+      test('all-zero UUID', () {
+        final enc = LuxoEncoder();
+        enc.writeFieldUuid(1, zero);
+        enc.writeEnd();
+        final dec = LuxoDecoder(enc.bytes());
+        dec.nextField();
+        expect(dec.readUuid(), equals(zero));
+      });
+
+      test('uppercase input is normalized to lowercase canonical', () {
+        final enc = LuxoEncoder();
+        enc.writeFieldUuid(1, upper);
+        enc.writeEnd();
+        final dec = LuxoDecoder(enc.bytes());
+        dec.nextField();
+        expect(dec.readUuid(), equals(upper.toLowerCase()));
+      });
+
+      test('exact wire bytes match raw 16-byte layout', () {
+        final enc = LuxoEncoder();
+        enc.writeUuid(sample); // 550e8400-e29b-41d4-a716-446655440000
+        final bytes = enc.bytes();
+        expect(bytes.length, equals(16));
+        expect(bytes[0], equals(0x55));
+        expect(bytes[1], equals(0x0e));
+        expect(bytes[2], equals(0x84));
+        expect(bytes[3], equals(0x00));
+        expect(bytes[15], equals(0x00));
+      });
+
+      test('nullable UUID null', () {
+        final enc = LuxoEncoder();
+        enc.writeVarint(1);
+        enc.writeNull();
+        enc.writeEnd();
+        final dec = LuxoDecoder(enc.bytes());
+        dec.nextField();
+        expect(dec.readUuidPtr(), isNull);
+      });
+
+      test('nullable UUID present', () {
+        final enc = LuxoEncoder();
+        enc.writeVarint(1);
+        enc.writePresent();
+        enc.writeUuid(sample);
+        enc.writeEnd();
+        final dec = LuxoDecoder(enc.bytes());
+        dec.nextField();
+        expect(dec.readUuidPtr(), equals(sample));
+      });
+
+      test('invalid length throws', () {
+        final enc = LuxoEncoder();
+        expect(() => enc.writeUuid('too-short'), throwsFormatException);
+      });
+
+      test('invalid hex digit throws', () {
+        final enc = LuxoEncoder();
+        expect(() => enc.writeUuid('zz0e8400-e29b-41d4-a716-446655440000'),
+            throwsFormatException);
+      });
+
+      test('truncated wire data sets error', () {
+        final dec = LuxoDecoder(Uint8List.fromList([0x01, 0x02, 0x03]));
+        expect(dec.readUuid(), equals(''));
+        expect(dec.error, isNotNull);
+      });
+    });
+
+    group('scalar array fields (row format)', () {
+      test('int array round-trip', () {
+        final enc = LuxoEncoder();
+        enc.writeFieldIntArray(1, [1, -2, 300, 0]);
+        enc.writeEnd();
+        final dec = LuxoDecoder(enc.bytes());
+        expect(dec.nextField(), isTrue);
+        expect(dec.readIntArray(), equals([1, -2, 300, 0]));
+        expect(dec.nextField(), isFalse);
+      });
+
+      test('empty int array', () {
+        final enc = LuxoEncoder();
+        enc.writeFieldIntArray(1, const []);
+        enc.writeEnd();
+        final dec = LuxoDecoder(enc.bytes());
+        dec.nextField();
+        expect(dec.readIntArray(), isEmpty);
+      });
+
+      test('string array round-trip', () {
+        final enc = LuxoEncoder();
+        enc.writeFieldStringArray(1, ['a', '你好', '']);
+        enc.writeEnd();
+        final dec = LuxoDecoder(enc.bytes());
+        dec.nextField();
+        expect(dec.readStringArray(), equals(['a', '你好', '']));
+      });
+
+      test('float array round-trip', () {
+        final enc = LuxoEncoder();
+        enc.writeFieldFloatArray(1, [1.5, -2.25]);
+        enc.writeEnd();
+        final dec = LuxoDecoder(enc.bytes());
+        dec.nextField();
+        expect(dec.readFloatArray(), equals([1.5, -2.25]));
+      });
+
+      test('bool array round-trip', () {
+        final enc = LuxoEncoder();
+        enc.writeFieldBoolArray(1, [true, false, true]);
+        enc.writeEnd();
+        final dec = LuxoDecoder(enc.bytes());
+        dec.nextField();
+        expect(dec.readBoolArray(), equals([true, false, true]));
+      });
+
+      test('UUID array round-trip', () {
+        const a = '550e8400-e29b-41d4-a716-446655440000';
+        const b = '00000000-0000-0000-0000-000000000001';
+        final enc = LuxoEncoder();
+        enc.writeFieldUuidArray(1, [a, b]);
+        enc.writeEnd();
+        final dec = LuxoDecoder(enc.bytes());
+        dec.nextField();
+        expect(dec.readUuidArray(), equals([a, b]));
+      });
+
+      test('bytes array round-trip', () {
+        final enc = LuxoEncoder();
+        final items = [
+          Uint8List.fromList([1, 2, 3]),
+          Uint8List(0),
+          Uint8List.fromList([0xFF]),
+        ];
+        enc.writeVarint(1); // fieldID
+        enc.writeVarint(items.length);
+        for (final it in items) {
+          enc.writeBytes(it);
+        }
+        enc.writeEnd();
+        final dec = LuxoDecoder(enc.bytes());
+        dec.nextField();
+        expect(dec.readBytesArray(), equals(items));
+      });
+    });
   });
 
   group('ColumnarDecoder', () {
@@ -396,6 +562,71 @@ void main() {
       expect(dec.offset, equals(bb.length));
     });
 
+    test('UUID column (16 bytes each)', () {
+      const a = '550e8400-e29b-41d4-a716-446655440000';
+      const b = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+      final bb = BytesBuilder();
+      _writeVarint(bb, 2); // count=2
+      _writeVarint(bb, 1); // fieldID=1
+      _writeUuid(bb, a);
+      _writeUuid(bb, b);
+      bb.addByte(0x00); // end
+
+      final dec = ColumnarDecoder(Uint8List.fromList(bb.toBytes()));
+      expect(dec.count, equals(2));
+      expect(dec.nextColumn(), isTrue);
+      expect(dec.readColumnUuid(), equals([a, b]));
+      expect(dec.nextColumn(), isFalse);
+    });
+
+    test('nullable UUID column', () {
+      const a = '11111111-1111-1111-1111-111111111111';
+      final bb = BytesBuilder();
+      _writeVarint(bb, 3); // count=3
+      _writeVarint(bb, 1); // fieldID=1
+      bb.addByte(0x00); // null
+      bb.addByte(0x01); _writeUuid(bb, a); // present
+      bb.addByte(0x00); // null
+      bb.addByte(0x00); // end
+
+      final dec = ColumnarDecoder(Uint8List.fromList(bb.toBytes()));
+      expect(dec.nextColumn(), isTrue);
+      expect(dec.readColumnUuidPtr(), equals([null, a, null]));
+      expect(dec.nextColumn(), isFalse);
+    });
+
+    test('scalar array column — each cell is a length-prefixed [count][items] blob', () {
+      // Column where each cell is a string-array blob: [count][string...]
+      final cell0 = BytesBuilder();
+      _writeVarint(cell0, 2); // 2 items
+      _writeString(cell0, 'x');
+      _writeString(cell0, 'y');
+      final cell1 = BytesBuilder();
+      _writeVarint(cell1, 0); // empty array
+
+      final bb = BytesBuilder();
+      _writeVarint(bb, 2); // count=2 rows
+      _writeVarint(bb, 1); // fieldID=1
+      // cell 0 as length-prefixed blob
+      final c0 = cell0.toBytes();
+      _writeVarint(bb, c0.length);
+      bb.add(c0);
+      // cell 1 as length-prefixed blob
+      final c1 = cell1.toBytes();
+      _writeVarint(bb, c1.length);
+      bb.add(c1);
+      bb.addByte(0x00); // end
+
+      final dec = ColumnarDecoder(Uint8List.fromList(bb.toBytes()));
+      expect(dec.nextColumn(), isTrue);
+      final blobs = dec.readColumnBytes();
+      expect(blobs.length, equals(2));
+      // Decode each cell blob with a row decoder.
+      expect(LuxoDecoder(blobs[0]).readStringArray(), equals(['x', 'y']));
+      expect(LuxoDecoder(blobs[1]).readStringArray(), isEmpty);
+      expect(dec.nextColumn(), isFalse);
+    });
+
     test('readSvarint public method', () {
       final bb = BytesBuilder();
       _writeVarint(bb, 0); // count=0
@@ -406,6 +637,111 @@ void main() {
       final dec = ColumnarDecoder(Uint8List.fromList(bb.toBytes()));
       expect(dec.nextColumn(), isFalse);
       expect(dec.readSvarint(), equals(-42));
+    });
+  });
+
+  group('DateTime svarint decoding', () {
+    // 2021-01-01T00:00:00Z == 1609459200 unix seconds.
+    const seconds = 1609459200;
+    const iso = '2021-01-01T00:00:00.000Z';
+
+    test('dateTimeStringFromUnixSeconds matches JSON ISO 8601 UTC', () {
+      expect(dateTimeStringFromUnixSeconds(seconds), equals(iso));
+      expect(
+          dateTimeStringFromUnixSeconds(0), equals('1970-01-01T00:00:00.000Z'));
+    });
+
+    test('readDateTime decodes svarint seconds to ISO string', () {
+      final enc = LuxoEncoder();
+      enc.writeFieldInt(1, seconds); // svarint(unix seconds)
+      enc.writeEnd();
+
+      final dec = LuxoDecoder(enc.bytes());
+      expect(dec.nextField(), isTrue);
+      expect(dec.fieldID, equals(1));
+      expect(dec.readDateTime(), equals(iso));
+      expect(dec.nextField(), isFalse);
+    });
+
+    test('readDateTimePtr returns null on null marker', () {
+      final enc = LuxoEncoder();
+      enc.writeVarint(1); // fieldID
+      enc.writeNull();
+      enc.writeEnd();
+
+      final dec = LuxoDecoder(enc.bytes());
+      expect(dec.nextField(), isTrue);
+      expect(dec.readDateTimePtr(), isNull);
+    });
+
+    test('readDateTimePtr decodes present svarint seconds', () {
+      final enc = LuxoEncoder();
+      enc.writeVarint(1); // fieldID
+      enc.writePresent();
+      enc.writeSvarint(seconds);
+      enc.writeEnd();
+
+      final dec = LuxoDecoder(enc.bytes());
+      expect(dec.nextField(), isTrue);
+      expect(dec.readDateTimePtr(), equals(iso));
+    });
+
+    test('readDateTimeArray decodes svarint seconds list to ISO strings', () {
+      final enc = LuxoEncoder();
+      enc.writeFieldIntArray(1, [seconds, 0]);
+      enc.writeEnd();
+
+      final dec = LuxoDecoder(enc.bytes());
+      expect(dec.nextField(), isTrue);
+      expect(
+          dec.readDateTimeArray(), equals([iso, '1970-01-01T00:00:00.000Z']));
+    });
+
+    test('binary and JSON DateTime representations are identical', () {
+      // JSON mode surfaces DateTime as the RFC3339 string the server sends.
+      final jsonValue =
+          DateTime.fromMillisecondsSinceEpoch(seconds * 1000, isUtc: true)
+              .toIso8601String();
+
+      final enc = LuxoEncoder();
+      enc.writeFieldInt(1, seconds);
+      enc.writeEnd();
+      final dec = LuxoDecoder(enc.bytes());
+      dec.nextField();
+      final binaryValue = dec.readDateTime();
+
+      expect(binaryValue, equals(jsonValue));
+      expect(binaryValue, isA<String>());
+    });
+
+    test('readColumnDateTime decodes int column to ISO strings', () {
+      final bb = BytesBuilder();
+      _writeVarint(bb, 2); // count
+      _writeVarint(bb, 1); // fieldID
+      _writeSvarint(bb, seconds);
+      _writeSvarint(bb, 0);
+      bb.addByte(0x00); // end
+
+      final dec = ColumnarDecoder(Uint8List.fromList(bb.toBytes()));
+      expect(dec.nextColumn(), isTrue);
+      expect(
+          dec.readColumnDateTime(), equals([iso, '1970-01-01T00:00:00.000Z']));
+      expect(dec.nextColumn(), isFalse);
+    });
+
+    test('readColumnDateTimePtr decodes nullable int column', () {
+      final bb = BytesBuilder();
+      _writeVarint(bb, 3); // count
+      _writeVarint(bb, 1); // fieldID
+      bb.addByte(0x00); // null
+      bb.addByte(0x01); _writeSvarint(bb, seconds); // present
+      bb.addByte(0x00); // null
+      bb.addByte(0x00); // end
+
+      final dec = ColumnarDecoder(Uint8List.fromList(bb.toBytes()));
+      expect(dec.nextColumn(), isTrue);
+      expect(dec.readColumnDateTimePtr(), equals([null, iso, null]));
+      expect(dec.nextColumn(), isFalse);
     });
   });
 
@@ -468,4 +804,11 @@ void _writeString(BytesBuilder bb, String v) {
   final encoded = utf8.encode(v);
   _writeVarint(bb, encoded.length);
   bb.add(encoded);
+}
+
+void _writeUuid(BytesBuilder bb, String v) {
+  final hex = v.replaceAll('-', '');
+  for (var i = 0; i < 16; i++) {
+    bb.addByte(int.parse(hex.substring(i * 2, i * 2 + 2), radix: 16));
+  }
 }

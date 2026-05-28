@@ -55,16 +55,39 @@ object LuxoCodegen {
         return if (f.isList) "List<$base>" else base
     }
 
+    /** Kotlin type for an API param, wrapping list params in List<>. */
+    private fun paramKtType(p: LuxoParam): String {
+        val base = luxoTypeToKt(p.type)
+        return if (p.isList) "List<$base>" else base
+    }
+
     private fun isScalar(type: String): Boolean =
         type in setOf("Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Bytes", "Decimal")
 
+    /** Element reader expression for a scalar type (used inside readArray). */
+    private fun scalarElementRead(type: String): String = when (type) {
+        "Int", "Duration" -> "dec.readInt()"
+        "Float" -> "dec.readFloat()"
+        "Boolean" -> "dec.readBool()"
+        "UUID" -> "dec.readUuid()"
+        "DateTime" -> "dec.readDateTime()" // svarint(unix seconds) -> ISO string
+        else -> "dec.readString()" // String, Decimal, Enum, Bytes
+    }
+
     private fun binaryRead(f: LuxoField): String {
         val n = f.nullable
+        // Scalar arrays: [count][items...] — decode element-by-element.
+        if (f.isList && isScalar(f.type)) {
+            return "dec.readArray { ${scalarElementRead(f.type)} }"
+        }
         return when (f.type) {
             "Int", "Duration" -> if (n) "dec.readIntPtr()" else "dec.readInt()"
             "Float" -> if (n) "dec.readFloatPtr()" else "dec.readFloat()"
             "Boolean" -> if (n) "dec.readBoolPtr()" else "dec.readBool()"
-            "String", "DateTime", "UUID", "Decimal", "Enum" -> if (n) "dec.readStringPtr()" else "dec.readString()"
+            "UUID" -> if (n) "dec.readUuidPtr()" else "dec.readUuid()"
+            // DateTime: svarint(unix seconds) on the wire -> ISO string (matches JSON mode).
+            "DateTime" -> if (n) "dec.readDateTimePtr()" else "dec.readDateTime()"
+            "String", "Decimal", "Enum" -> if (n) "dec.readStringPtr()" else "dec.readString()"
             else -> {
                 // Nested model — decode recursively
                 val tn = f.typeName ?: f.type
@@ -109,7 +132,7 @@ object LuxoCodegen {
         for (m in schema.models.values) {
             appendLine("@Serializable\ndata class ${m.name}(")
             for ((i, f) in m.fields.withIndex()) {
-                val kt = luxoTypeToKt(f.type)
+                val kt = resolveFieldType(f, schema)
                 val nullable = if (f.nullable) "? = null" else ""
                 val comma = if (i < m.fields.size - 1) "," else ""
                 appendLine("    val ${f.name}: $kt$nullable$comma")
@@ -119,7 +142,7 @@ object LuxoCodegen {
             // Binary decoder function
             appendLine("fun decode${m.name}(dec: LuxoDecoder): ${m.name} {")
             for (f in m.fields) {
-                val kt = luxoTypeToKt(f.type)
+                val kt = resolveFieldType(f, schema)
                 appendLine("    var _${f.name}: $kt? = null")
             }
             appendLine("    dec.skipArenaHeader()")
@@ -152,7 +175,8 @@ object LuxoCodegen {
             if (api.params.isNotEmpty()) {
                 appendLine(", listOf(")
                 for (p in api.params) {
-                    appendLine("        ParamSchema(${p.id}, \"${p.name}\", \"${p.type}\"),")
+                    val listArg = if (p.isList) ", isList = true" else ""
+                    appendLine("        ParamSchema(${p.id}, \"${p.name}\", \"${p.type}\"$listArg),")
                 }
                 append("    )")
             }
@@ -202,8 +226,9 @@ object LuxoCodegen {
             val paginationNames = setOf("page", "pageSize")
             // page/pageSize are optional for list APIs
             val ps = api.params.joinToString(", ") {
-                if (isPaginated && it.name in paginationNames) "${it.name}: ${luxoTypeToKt(it.type)}? = null"
-                else "${it.name}: ${luxoTypeToKt(it.type)}"
+                val pt = paramKtType(it)
+                if (isPaginated && it.name in paginationNames) "${it.name}: $pt? = null"
+                else "${it.name}: $pt"
             }
             val paramMap = api.params.joinToString(", ") { "\"${it.name}\" to ${it.name}" }
 
@@ -289,6 +314,7 @@ object LuxoCodegen {
                 null, "Int", "Duration" -> "LuxoDecoder(data).let { d -> d.nextField(); d.readInt().toInt() }"
                 "Float" -> "LuxoDecoder(data).let { d -> d.nextField(); d.readFloat() }"
                 "Boolean" -> "LuxoDecoder(data).let { d -> d.nextField(); d.readBool() }"
+                "DateTime" -> "LuxoDecoder(data).let { d -> d.nextField(); d.readDateTime() }"
                 else -> "LuxoDecoder(data).let { d -> d.nextField(); d.readString() }"
             }
             b.appendLine("        is ByteArray -> $binaryDecode")

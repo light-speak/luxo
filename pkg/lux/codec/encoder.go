@@ -144,6 +144,53 @@ func (e *Encoder) WriteFieldFloatArray(fieldID int, v []float64) {
 	}
 }
 
+// WriteFieldBoolArray writes a bool array field.
+func (e *Encoder) WriteFieldBoolArray(fieldID int, v []bool) {
+	e.buf = AppendVarint(e.buf, uint64(fieldID))
+	e.buf = AppendArrayHeader(e.buf, len(v))
+	for _, item := range v {
+		e.buf = AppendBool(e.buf, item)
+	}
+}
+
+// WriteFieldBytesArray writes a [][]byte array field. Each element is a
+// length-prefixed byte blob — used for lists of nested models (each element is
+// a model's Luxo binary) and for [Bytes]/[JSON] lists.
+func (e *Encoder) WriteFieldBytesArray(fieldID int, v [][]byte) {
+	e.buf = AppendVarint(e.buf, uint64(fieldID))
+	e.buf = AppendArrayHeader(e.buf, len(v))
+	for _, item := range v {
+		e.buf = AppendBytes(e.buf, item)
+	}
+}
+
+// WriteFieldUUID writes a fixed 16-byte UUID field.
+func (e *Encoder) WriteFieldUUID(fieldID int, v [16]byte) {
+	e.buf = AppendVarint(e.buf, uint64(fieldID))
+	e.buf = AppendUUID(e.buf, v)
+}
+
+// WriteFieldUUIDPtr writes a nullable UUID field.
+func (e *Encoder) WriteFieldUUIDPtr(fieldID int, v *[16]byte) {
+	e.buf = AppendVarint(e.buf, uint64(fieldID))
+	if v == nil {
+		e.buf = AppendNull(e.buf)
+	} else {
+		e.buf = AppendPresent(e.buf)
+		e.buf = AppendUUID(e.buf, *v)
+	}
+}
+
+// WriteFieldUUIDArray writes a UUID array field. Each element is a fixed
+// 16-byte value (no per-item length prefix), per the protocol UUID encoding.
+func (e *Encoder) WriteFieldUUIDArray(fieldID int, v [][16]byte) {
+	e.buf = AppendVarint(e.buf, uint64(fieldID))
+	e.buf = AppendArrayHeader(e.buf, len(v))
+	for _, item := range v {
+		e.buf = AppendUUID(e.buf, item)
+	}
+}
+
 // WriteEnd writes the message terminator (fieldID 0).
 func (e *Encoder) WriteEnd() {
 	e.buf = append(e.buf, 0x00)

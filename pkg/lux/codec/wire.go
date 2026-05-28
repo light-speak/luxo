@@ -185,3 +185,23 @@ func ReadNullable(buf []byte, off int) (present bool, n int) {
 	}
 	return buf[off] != 0, 1
 }
+
+// --- Fixed 16-byte (UUID) ---
+
+// AppendUUID appends a fixed 16-byte UUID without a length prefix.
+func AppendUUID(dst []byte, v [16]byte) []byte {
+	return append(dst, v[:]...)
+}
+
+// ReadUUID reads a fixed 16-byte UUID from buf at offset.
+// Returns the value and 16 (bytes consumed), or the zero value and 0 on truncation.
+// Bounds check is overflow-safe: a hostile off near MaxInt would wrap `off+16`
+// to a negative value and bypass a naive guard, so we compare via `len(buf)-off`.
+func ReadUUID(buf []byte, off int) ([16]byte, int) {
+	var u [16]byte
+	if off < 0 || off > len(buf) || len(buf)-off < 16 {
+		return u, 0
+	}
+	copy(u[:], buf[off:off+16])
+	return u, 16
+}

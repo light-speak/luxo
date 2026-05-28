@@ -211,11 +211,6 @@ func Generate(result *semantic.Result, packageName string, driver DBDriver, soft
 		gr.Files["writejson.gen.go"] = wjSrc
 	}
 
-	// service_client.gen.go — type-safe RPC client stubs for fn @service
-	if scSrc := generateServiceClientFile(result, packageName); scSrc != nil {
-		gr.Files["service_client.gen.go"] = scSrc
-	}
-
 	// schema.gen.go — model/API metadata for Luvia schema-driven Binary↔JSON conversion
 	if schemaSrc := generateSchemaFile(result, packageName, enums); schemaSrc != nil {
 		gr.Files["schema.gen.go"] = schemaSrc

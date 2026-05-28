@@ -697,16 +697,19 @@ func TestGenerateWriteLuxoUUIDDecimalBytesJSON(t *testing.T) {
 	code := string(src)
 
 	// WriteLuxo checks
+	if !strings.Contains(code, "AppendUUID") {
+		t.Errorf("UUID should use AppendUUID (16-byte fixed, per protocol):\n%s", code)
+	}
 	if !strings.Contains(code, ".String()") {
-		t.Errorf("UUID/Decimal should use .String():\n%s", code)
+		t.Errorf("Decimal should use .String():\n%s", code)
 	}
 	if !strings.Contains(code, "AppendBytes") {
 		t.Errorf("Bytes/JSON should use AppendBytes:\n%s", code)
 	}
 
 	// ReadLuxo checks
-	if !strings.Contains(code, "uuid.MustParse") {
-		t.Errorf("UUID ReadLuxo should use uuid.MustParse:\n%s", code)
+	if !strings.Contains(code, "uuid.UUID(dec.ReadUUID())") {
+		t.Errorf("UUID ReadLuxo should use ReadUUID (16-byte fixed):\n%s", code)
 	}
 	if !strings.Contains(code, "decimal.RequireFromString") {
 		t.Errorf("Decimal ReadLuxo should use decimal.RequireFromString:\n%s", code)
@@ -719,8 +722,66 @@ func TestGenerateWriteLuxoUUIDDecimalBytesJSON(t *testing.T) {
 	}
 
 	// WriteColumnar checks
+	if !strings.Contains(code, "WriteColumnUUID") {
+		t.Errorf("UUID columnar should use WriteColumnUUID (16-byte fixed):\n%s", code)
+	}
+	if !strings.Contains(code, "WriteColumnUUIDPtr") {
+		t.Errorf("nullable UUID columnar should use WriteColumnUUIDPtr:\n%s", code)
+	}
 	if !strings.Contains(code, "WriteColumnString") {
-		t.Errorf("UUID/Decimal columnar should use WriteColumnString:\n%s", code)
+		t.Errorf("Decimal columnar should use WriteColumnString:\n%s", code)
+	}
+	if !strings.Contains(code, "WriteColumnBytes") {
+		t.Errorf("Bytes columnar should use WriteColumnBytes:\n%s", code)
+	}
+}
+
+func TestGenerateScalarArrayFields(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+
+	SetModelFieldIDs(map[string]map[string]int{
+		"Tagged": {"id": 1, "tags": 2, "scores": 3, "ids": 4, "roles": 5},
+	})
+
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "test.luxo",
+			Models: []*ast.ModelDecl{{
+				Name: "Tagged",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "tags", Type: &ast.TypeRef{Name: "String", IsList: true}},
+					{Name: "scores", Type: &ast.TypeRef{Name: "Int", IsList: true}},
+					{Name: "ids", Type: &ast.TypeRef{Name: "UUID", IsList: true}},
+					{Name: "roles", Type: &ast.TypeRef{Name: "Role", IsList: true}},
+				},
+			}},
+		}},
+	}
+	enums := map[string]bool{"Role": true}
+	code := string(generateWriteJSONFile(result, "app", enums))
+
+	checks := []string{
+		// WriteLuxo: array header + per-type item append
+		"codec.AppendArrayHeader(buf.B, len(t.Tags))",
+		"codec.AppendUUID(buf.B, [16]byte(v))", // [UUID]
+		"codec.AppendString(buf.B, string(v))", // [Role] enum
+		// ReadLuxo: array readers + conversions
+		"dec.ReadStringArray()",
+		"dec.ReadIntArray()",
+		"dec.ReadUUIDArray()",
+		"uuid.UUID(v)",
+		"make([]Role, len(_a))",
+		// Columnar: array field encoded as a Bytes column of inline-array cells
+		"w.WriteColumnBytes",
+		"cells := make([][]byte, len(items))",
+		"cb = codec.AppendArrayHeader(cb, len(item.Tags))",
+	}
+	for _, c := range checks {
+		if !strings.Contains(code, c) {
+			t.Errorf("generated code missing %q:\n%s", c, code)
+		}
 	}
 }
 

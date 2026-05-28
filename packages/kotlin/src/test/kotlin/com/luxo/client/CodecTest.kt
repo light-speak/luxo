@@ -269,6 +269,206 @@ class LuxoEncoderDecoderTest {
         assertFalse(dec.nextField())
     }
 
+    // -- UUID round-trip (16-byte fixed) --
+
+    @Test
+    fun `uuid round-trip canonical string`() {
+        val uuid = "550e8400-e29b-41d4-a716-446655440000"
+        val enc = LuxoEncoder()
+        enc.writeFieldUuid(1, uuid)
+        enc.writeEnd()
+
+        // Wire size: fieldID(1) + 16 bytes + end(1) = 18 bytes
+        assertEquals(18, enc.bytes().size)
+
+        val dec = LuxoDecoder(enc.bytes())
+        assertTrue(dec.nextField())
+        assertEquals(1, dec.fieldID)
+        assertEquals(uuid, dec.readUuid())
+        assertFalse(dec.nextField())
+    }
+
+    @Test
+    fun `uuid uppercase input formats to lowercase`() {
+        val enc = LuxoEncoder()
+        enc.writeFieldUuid(1, "AABBCCDD-EEFF-0011-2233-445566778899")
+        enc.writeEnd()
+
+        val dec = LuxoDecoder(enc.bytes())
+        assertTrue(dec.nextField())
+        assertEquals("aabbccdd-eeff-0011-2233-445566778899", dec.readUuid())
+    }
+
+    @Test
+    fun `uuid nullable present and null`() {
+        val uuid = "00112233-4455-6677-8899-aabbccddeeff"
+        val enc = LuxoEncoder()
+        enc.writeVarint(1)            // fieldID 1
+        enc.writeBool(true)           // present flag
+        enc.writeUuid(uuid)
+        enc.writeVarint(2)            // fieldID 2
+        enc.writeBool(false)          // null flag
+        enc.writeEnd()
+
+        val dec = LuxoDecoder(enc.bytes())
+        assertTrue(dec.nextField())
+        assertEquals(uuid, dec.readUuidPtr())
+        assertTrue(dec.nextField())
+        assertEquals(null, dec.readUuidPtr())
+        assertFalse(dec.nextField())
+    }
+
+    @Test
+    fun `uuid parse rejects bad input`() {
+        assertFailsWith<LuxoCodecException> { UuidCodec.parse("too-short") }
+        assertFailsWith<LuxoCodecException> { UuidCodec.parse("zz0e8400-e29b-41d4-a716-446655440000") }
+    }
+
+    @Test
+    fun `uuid format matches Go canonical layout`() {
+        // bytes 0..15 -> dashes after byte index 3,5,7,9 (the 4/6/8/10 positions)
+        val raw = ByteArray(16) { it.toByte() }
+        val s = UuidCodec.format(raw, 0)
+        assertEquals("00010203-0405-0607-0809-0a0b0c0d0e0f", s)
+    }
+
+    // -- Scalar array fields (row form: [count][items]) --
+
+    @Test
+    fun `scalar string array round-trip`() {
+        val tags = listOf("a", "bb", "ccc")
+        val enc = LuxoEncoder()
+        enc.writeFieldArray(1, tags) { enc.writeString(it) }
+        enc.writeEnd()
+
+        val dec = LuxoDecoder(enc.bytes())
+        assertTrue(dec.nextField())
+        assertEquals(tags, dec.readArray { dec.readString() })
+        assertFalse(dec.nextField())
+    }
+
+    @Test
+    fun `scalar int array round-trip`() {
+        val nums = listOf(1L, -2L, 300L)
+        val enc = LuxoEncoder()
+        enc.writeFieldArray(1, nums) { enc.writeSvarint(it) }
+        enc.writeEnd()
+
+        val dec = LuxoDecoder(enc.bytes())
+        assertTrue(dec.nextField())
+        assertEquals(nums, dec.readArray { dec.readInt() })
+    }
+
+    @Test
+    fun `scalar uuid array round-trip`() {
+        val ids = listOf(
+            "550e8400-e29b-41d4-a716-446655440000",
+            "00112233-4455-6677-8899-aabbccddeeff",
+        )
+        val enc = LuxoEncoder()
+        enc.writeFieldArray(1, ids) { enc.writeUuid(it) }
+        enc.writeEnd()
+
+        val dec = LuxoDecoder(enc.bytes())
+        assertTrue(dec.nextField())
+        assertEquals(ids, dec.readArray { dec.readUuid() })
+    }
+
+    @Test
+    fun `empty scalar array`() {
+        val enc = LuxoEncoder()
+        enc.writeFieldArray(1, emptyList<String>()) { enc.writeString(it) }
+        enc.writeEnd()
+
+        val dec = LuxoDecoder(enc.bytes())
+        assertTrue(dec.nextField())
+        assertEquals(emptyList(), dec.readArray { dec.readString() })
+    }
+
+    // -- DateTime (svarint unix seconds -> ISO string) --
+
+    @Test
+    fun `datetime decodes svarint seconds to ISO string`() {
+        // Go wire: DateTime = svarint(unix seconds). 1748424000 == 2025-05-28T09:20:00Z.
+        val enc = LuxoEncoder()
+        enc.writeFieldInt(1, 1748424000L)
+        enc.writeEnd()
+
+        val dec = LuxoDecoder(enc.bytes())
+        assertTrue(dec.nextField())
+        assertEquals(1, dec.fieldID)
+        assertEquals("2025-05-28T09:20:00Z", dec.readDateTime())
+        assertFalse(dec.nextField())
+    }
+
+    @Test
+    fun `datetime epoch zero`() {
+        val enc = LuxoEncoder()
+        enc.writeFieldInt(1, 0L)
+        enc.writeEnd()
+
+        val dec = LuxoDecoder(enc.bytes())
+        assertTrue(dec.nextField())
+        assertEquals("1970-01-01T00:00:00Z", dec.readDateTime())
+    }
+
+    @Test
+    fun `datetime negative seconds (pre-epoch)`() {
+        val enc = LuxoEncoder()
+        enc.writeFieldInt(1, -1L)
+        enc.writeEnd()
+
+        val dec = LuxoDecoder(enc.bytes())
+        assertTrue(dec.nextField())
+        assertEquals("1969-12-31T23:59:59Z", dec.readDateTime())
+    }
+
+    @Test
+    fun `nullable datetime present`() {
+        val enc = LuxoEncoder()
+        enc.writeVarint(1) // fieldID
+        enc.writeBool(true) // null flag = present
+        enc.writeSvarint(1748424000L)
+        enc.writeEnd()
+
+        val dec = LuxoDecoder(enc.bytes())
+        assertTrue(dec.nextField())
+        assertEquals("2025-05-28T09:20:00Z", dec.readDateTimePtr())
+    }
+
+    @Test
+    fun `nullable datetime null`() {
+        val enc = LuxoEncoder()
+        enc.writeVarint(1) // fieldID
+        enc.writeBool(false) // null flag = absent
+        enc.writeEnd()
+
+        val dec = LuxoDecoder(enc.bytes())
+        assertTrue(dec.nextField())
+        assertEquals(null, dec.readDateTimePtr())
+    }
+
+    @Test
+    fun `datetime scalar array round-trip`() {
+        val secs = listOf(0L, 1748424000L, -1L)
+        val enc = LuxoEncoder()
+        enc.writeFieldArray(1, secs) { enc.writeSvarint(it) }
+        enc.writeEnd()
+
+        val dec = LuxoDecoder(enc.bytes())
+        assertTrue(dec.nextField())
+        assertEquals(
+            listOf("1970-01-01T00:00:00Z", "2025-05-28T09:20:00Z", "1969-12-31T23:59:59Z"),
+            dec.readArray { dec.readDateTime() },
+        )
+    }
+
+    @Test
+    fun `datetime codec toIso`() {
+        assertEquals("1970-01-01T00:00:00Z", DateTimeCodec.toIso(0L))
+        assertEquals("2025-05-28T09:20:00Z", DateTimeCodec.toIso(1748424000L))
+    }
+
     @Test
     fun `encoder grows buffer beyond initial capacity`() {
         val enc = LuxoEncoder(initialCapacity = 4)
@@ -396,6 +596,45 @@ class ColumnarDecoderTest {
     }
 
     @Test
+    fun `datetime column (int svarint seconds to ISO)`() {
+        val buf = mutableListOf<Byte>()
+        buf.writeVarint(3) // count=3
+        buf.writeVarint(1) // fieldID=1
+        buf.writeSvarint(0)
+        buf.writeSvarint(1748424000)
+        buf.writeSvarint(-1)
+        buf.add(0x00)
+
+        val dec = ColumnarDecoder(buf.toByteArray())
+        assertEquals(3, dec.count)
+        assertTrue(dec.nextColumn())
+        assertEquals(1, dec.fieldID)
+        assertEquals(
+            listOf("1970-01-01T00:00:00Z", "2025-05-28T09:20:00Z", "1969-12-31T23:59:59Z"),
+            dec.readColumnDateTime(),
+        )
+        assertFalse(dec.nextColumn())
+    }
+
+    @Test
+    fun `nullable datetime column`() {
+        val buf = mutableListOf<Byte>()
+        buf.writeVarint(3) // count=3
+        buf.writeVarint(1) // fieldID=1
+        buf.add(0x00) // null
+        buf.add(0x01); buf.writeSvarint(1748424000) // present
+        buf.add(0x00) // null
+        buf.add(0x00) // end marker
+
+        val dec = ColumnarDecoder(buf.toByteArray())
+        assertEquals(3, dec.count)
+        assertTrue(dec.nextColumn())
+        assertEquals(1, dec.fieldID)
+        assertEquals(listOf(null, "2025-05-28T09:20:00Z", null), dec.readColumnDateTimePtr())
+        assertFalse(dec.nextColumn())
+    }
+
+    @Test
     fun `bool column`() {
         val buf = mutableListOf<Byte>()
         buf.writeVarint(3) // count=3
@@ -409,6 +648,85 @@ class ColumnarDecoderTest {
         assertEquals(3, dec.count)
         assertTrue(dec.nextColumn())
         assertEquals(listOf(true, false, true), dec.readColumnBool())
+        assertFalse(dec.nextColumn())
+    }
+
+    @Test
+    fun `uuid column (16 bytes each)`() {
+        val u1 = UuidCodec.parse("550e8400-e29b-41d4-a716-446655440000")
+        val u2 = UuidCodec.parse("00112233-4455-6677-8899-aabbccddeeff")
+        val buf = mutableListOf<Byte>()
+        buf.writeVarint(2) // count=2
+        buf.writeVarint(1) // fieldID=1
+        u1.forEach { buf.add(it) }
+        u2.forEach { buf.add(it) }
+        buf.add(0x00)
+
+        val dec = ColumnarDecoder(buf.toByteArray())
+        assertEquals(2, dec.count)
+        assertTrue(dec.nextColumn())
+        assertEquals(1, dec.fieldID)
+        assertEquals(
+            listOf(
+                "550e8400-e29b-41d4-a716-446655440000",
+                "00112233-4455-6677-8899-aabbccddeeff",
+            ),
+            dec.readColumnUuid(),
+        )
+        assertFalse(dec.nextColumn())
+    }
+
+    @Test
+    fun `nullable uuid column`() {
+        val u = UuidCodec.parse("00112233-4455-6677-8899-aabbccddeeff")
+        val buf = mutableListOf<Byte>()
+        buf.writeVarint(2) // count=2
+        buf.writeVarint(1) // fieldID=1
+        buf.add(0x00)               // record 0: null
+        buf.add(0x01); u.forEach { buf.add(it) } // record 1: present
+        buf.add(0x00)
+
+        val dec = ColumnarDecoder(buf.toByteArray())
+        assertTrue(dec.nextColumn())
+        assertEquals(
+            listOf(null, "00112233-4455-6677-8899-aabbccddeeff"),
+            dec.readColumnUuidPtr(),
+        )
+        assertFalse(dec.nextColumn())
+    }
+
+    @Test
+    fun `scalar array column (bytes cells holding inline arrays)`() {
+        // Each cell is a length-prefixed blob containing [count][items...].
+        // Build two cells: ["x","yy"] and [] (empty).
+        fun cell(items: List<String>): ByteArray {
+            val inner = mutableListOf<Byte>()
+            inner.writeVarint(items.size.toLong())
+            items.forEach { inner.writeString(it) }
+            return inner.toByteArray()
+        }
+        val cell0 = cell(listOf("x", "yy"))
+        val cell1 = cell(emptyList())
+
+        val buf = mutableListOf<Byte>()
+        buf.writeVarint(2) // count=2
+        buf.writeVarint(1) // fieldID=1
+        // cell0 length-prefixed
+        buf.writeVarint(cell0.size.toLong()); cell0.forEach { buf.add(it) }
+        buf.writeVarint(cell1.size.toLong()); cell1.forEach { buf.add(it) }
+        buf.add(0x00)
+
+        val dec = ColumnarDecoder(buf.toByteArray())
+        assertTrue(dec.nextColumn())
+        val cells = dec.readColumnBytes()
+        assertEquals(2, cells.size)
+
+        // Decode each cell as an inline string array.
+        val d0 = LuxoDecoder(cells[0])
+        assertEquals(listOf("x", "yy"), d0.readArray { d0.readString() })
+        val d1 = LuxoDecoder(cells[1])
+        assertEquals(emptyList(), d1.readArray { d1.readString() })
+
         assertFalse(dec.nextColumn())
     }
 

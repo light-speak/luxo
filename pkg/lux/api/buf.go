@@ -32,6 +32,13 @@ func GetBuf() *ResponseBuf {
 	return buf
 }
 
+// Reset clears the buffer for reuse, keeping the underlying capacity.
+// Used by generated handlers that write multiple items into one pooled buffer.
+func (r *ResponseBuf) Reset() {
+	r.B = r.B[:0]
+	r.Identity = nil
+}
+
 // PutBuf returns a ResponseBuf to the pool.
 func PutBuf(buf *ResponseBuf) {
 	buf.Identity = nil // clear PII before pooling

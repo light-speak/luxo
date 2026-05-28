@@ -272,10 +272,16 @@ func writeAPIRegistrationSchema(b *strings.Builder, name, moduleName string, par
 		for _, p := range params {
 			paramID := getAPIParamID(name, p.Name)
 			pType := "FieldString"
+			isList := false
 			if p.Type != nil {
 				pType = luxoTypeToSchemaType(p.Type.Name, nil)
+				isList = p.Type.IsList
 			}
-			fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s},\n", paramID, p.Name, pType)
+			if isList {
+				fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, IsList: true},\n", paramID, p.Name, pType)
+			} else {
+				fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s},\n", paramID, p.Name, pType)
+			}
 		}
 		fmt.Fprintf(b, "\t\t},\n")
 	}
@@ -312,6 +318,8 @@ func luxoTypeToSchemaType(typeName string, enums map[string]bool) string {
 		return "FieldDuration"
 	case "Bytes":
 		return "FieldBytes"
+	case "UUID":
+		return "FieldUUID"
 	default:
 		return "FieldString" // enum/unknown → string
 	}
@@ -453,7 +461,8 @@ func buildSchemaAPIs(s *schema.Schema, result *semantic.Result, enums map[string
 			for _, p := range api.Params {
 				a.Params = append(a.Params, schema.Param{
 					ID: getAPIParamID(api.Name, p.Name), Name: p.Name,
-					Type: luxoTypeToSchemaFieldType(p.Type.Name, enums),
+					Type:   luxoTypeToSchemaFieldType(p.Type.Name, enums),
+					IsList: p.Type.IsList,
 				})
 			}
 			s.RegisterAPI(a)
@@ -507,6 +516,8 @@ func luxoTypeToSchemaFieldType(typeName string, enums map[string]bool) schema.Fi
 		return schema.FieldDuration
 	case "Bytes":
 		return schema.FieldBytes
+	case "UUID":
+		return schema.FieldUUID
 	default:
 		return schema.FieldString
 	}

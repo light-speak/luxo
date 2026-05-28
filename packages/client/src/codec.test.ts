@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest'
-import { Encoder, Decoder, fieldMaskSet, fieldMaskHas } from './codec'
+import {
+  Encoder, Decoder, ColumnarDecoder, fieldMaskSet, fieldMaskHas,
+  formatUUID, parseUUID, decodeScalarArray, unixSecondsToISO,
+} from './codec'
 
 describe('Encoder', () => {
   it('writeVarint encodes small values in 1 byte', () => {
@@ -269,5 +272,91 @@ describe('fieldMask', () => {
   it('fieldMaskHas returns false for out-of-range field IDs', () => {
     const mask = new Uint8Array(1)
     expect(fieldMaskHas(mask, 100)).toBe(false)
+  })
+})
+
+describe('DateTime (svarint unix seconds → RFC3339 string)', () => {
+  // 2026-05-28T12:00:00Z = 1779710400 unix seconds (whole seconds, no fractional part).
+  const SECONDS = Math.floor(Date.UTC(2026, 4, 28, 12, 0, 0) / 1000)
+  const ISO = '2026-05-28T12:00:00Z'
+
+  it('unixSecondsToISO matches Go RFC3339 output (no .000 millis)', () => {
+    expect(unixSecondsToISO(SECONDS)).toBe(ISO)
+    expect(unixSecondsToISO(0)).toBe('1970-01-01T00:00:00Z')
+  })
+
+  it('readDateTime decodes svarint(seconds) to ISO string', () => {
+    const enc = new Encoder()
+    enc.writeSvarint(SECONDS)
+    const dec = new Decoder(enc.bytes())
+    expect(dec.readDateTime()).toBe(ISO)
+  })
+
+  it('readDateTime handles epoch and pre-epoch (negative) values', () => {
+    const enc = new Encoder()
+    enc.writeSvarint(0)
+    enc.writeSvarint(-1)
+    const dec = new Decoder(enc.bytes())
+    expect(dec.readDateTime()).toBe('1970-01-01T00:00:00Z')
+    expect(dec.readDateTime()).toBe('1969-12-31T23:59:59Z')
+  })
+
+  it('readDateTimePtr returns null for 0x00 flag', () => {
+    const data = new Uint8Array([0x00])
+    expect(new Decoder(data).readDateTimePtr()).toBe(null)
+  })
+
+  it('readDateTimePtr decodes present value (0x01 + svarint)', () => {
+    const enc = new Encoder()
+    enc.writeBool(true) // 0x01 present flag
+    enc.writeSvarint(SECONDS)
+    const dec = new Decoder(enc.bytes())
+    expect(dec.readDateTimePtr()).toBe(ISO)
+  })
+
+  it('readDateTimePtr returns null at EOF', () => {
+    expect(new Decoder(new Uint8Array(0)).readDateTimePtr()).toBe(null)
+  })
+
+  it('ColumnarDecoder.readColumnDateTime decodes a DateTime column', () => {
+    const enc = new Encoder()
+    enc.writeVarint(2) // count
+    enc.writeVarint(5) // fieldID
+    enc.writeSvarint(SECONDS)
+    enc.writeSvarint(0)
+    enc.writeEnd()
+    const r = new ColumnarDecoder(enc.bytes())
+    expect(r.nextColumn()).toBe(true)
+    expect(r.fieldID).toBe(5)
+    expect(r.readColumnDateTime()).toEqual([ISO, '1970-01-01T00:00:00Z'])
+  })
+
+  it('ColumnarDecoder.readColumnDateTimePtr handles nulls', () => {
+    const enc = new Encoder()
+    enc.writeVarint(2) // count
+    enc.writeVarint(5) // fieldID
+    enc.writeBool(false) // null flag for first
+    enc.writeBool(true) // present flag for second
+    enc.writeSvarint(SECONDS)
+    enc.writeEnd()
+    const r = new ColumnarDecoder(enc.bytes())
+    expect(r.nextColumn()).toBe(true)
+    expect(r.readColumnDateTimePtr()).toEqual([null, ISO])
+  })
+
+  it('decodeScalarArray returns ISO strings for DateTime', () => {
+    const enc = new Encoder()
+    enc.writeVarint(2) // array count
+    enc.writeSvarint(SECONDS)
+    enc.writeSvarint(0)
+    expect(decodeScalarArray(enc.bytes(), 'DateTime')).toEqual([ISO, '1970-01-01T00:00:00Z'])
+  })
+
+  it('decodeScalarArray keeps Duration as raw nanosecond numbers', () => {
+    const enc = new Encoder()
+    enc.writeVarint(2)
+    enc.writeSvarint(1000000000)
+    enc.writeSvarint(500)
+    expect(decodeScalarArray(enc.bytes(), 'Duration')).toEqual([1000000000, 500])
   })
 })

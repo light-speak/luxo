@@ -5,6 +5,11 @@ type Dialect interface {
 	// ColumnType maps a Luxo type name + directives to a SQL column type.
 	ColumnType(luxoType string, serial bool, directives []DirectiveInfo) string
 
+	// ArrayColumnType maps a scalar Luxo type to the column type for a list
+	// field ([T]). PG uses native arrays (e.g. TEXT[]); other backends (MySQL,
+	// SQLite) may store JSON.
+	ArrayColumnType(luxoType string) string
+
 	// ColumnDef produces a full column definition.
 	ColumnDef(name string, col ColumnInfo) string
 
