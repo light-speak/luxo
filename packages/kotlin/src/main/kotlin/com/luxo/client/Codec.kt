@@ -202,6 +202,12 @@ class LuxoDecoder(private val buf: ByteArray) {
         return s
     }
 
+    /**
+     * Read a DateTime: svarint(unix seconds) on the wire, returned as an
+     * ISO-8601 string to match the JSON-mode representation (Kotlin `String`).
+     */
+    fun readDateTime(): String = DateTimeCodec.toIso(readInt())
+
     // -- nullable readers -------------------------------------------------
 
     fun readIntPtr(): Long? {
@@ -227,6 +233,12 @@ class LuxoDecoder(private val buf: ByteArray) {
     fun readUuidPtr(): String? {
         if (!readNullFlag()) return null
         return readUuid()
+    }
+
+    /** Read a nullable DateTime (0x00=null, else svarint seconds -> ISO string). */
+    fun readDateTimePtr(): String? {
+        if (!readNullFlag()) return null
+        return readDateTime()
     }
 
     /** Read a nullable nested model using a decoder lambda. */
@@ -332,6 +344,33 @@ class ColumnarDecoder(private val buf: ByteArray) {
         for (i in 0 until count) {
             val uv = readVarintRaw()
             result[i] = (uv ushr 1) xor -(uv and 1L)
+        }
+        return result.asList()
+    }
+
+    /**
+     * Read [count] DateTime values from an Int column (svarint unix seconds),
+     * converting each to its ISO-8601 string representation.
+     */
+    fun readColumnDateTime(): List<String> {
+        val result = Array(count) { "" }
+        for (i in 0 until count) {
+            val uv = readVarintRaw()
+            val sec = (uv ushr 1) xor -(uv and 1L)
+            result[i] = DateTimeCodec.toIso(sec)
+        }
+        return result.asList()
+    }
+
+    /** Read [count] nullable DateTime values (0x00=null, else svarint seconds). */
+    fun readColumnDateTimePtr(): List<String?> {
+        val result = arrayOfNulls<String>(count)
+        for (i in 0 until count) {
+            checkRemaining(1)
+            if (buf[off++] == 0x00.toByte()) continue
+            val uv = readVarintRaw()
+            val sec = (uv ushr 1) xor -(uv and 1L)
+            result[i] = DateTimeCodec.toIso(sec)
         }
         return result.asList()
     }
@@ -562,6 +601,19 @@ object UuidCodec {
         in 'A'..'F' -> c - 'A' + 10
         else -> throw LuxoCodecException("invalid hex digit: $c")
     }
+}
+
+/**
+ * DateTime wire-format helpers.
+ *
+ * On the Luxo binary wire a DateTime is svarint(unix seconds). JSON / API
+ * surfaces use an ISO-8601 string. Both SDK modes expose DateTime as a Kotlin
+ * `String`, so binary decoding converts seconds to the canonical ISO form.
+ */
+object DateTimeCodec {
+
+    /** Convert Unix seconds to an ISO-8601 (UTC) string, e.g. "2026-05-28T10:00:00Z". */
+    fun toIso(seconds: Long): String = java.time.Instant.ofEpochSecond(seconds).toString()
 }
 
 class LuxoCodecException(message: String) : RuntimeException(message)

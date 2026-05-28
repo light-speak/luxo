@@ -70,7 +70,8 @@ object LuxoCodegen {
         "Float" -> "dec.readFloat()"
         "Boolean" -> "dec.readBool()"
         "UUID" -> "dec.readUuid()"
-        else -> "dec.readString()" // String, DateTime, Decimal, Enum, Bytes
+        "DateTime" -> "dec.readDateTime()" // svarint(unix seconds) -> ISO string
+        else -> "dec.readString()" // String, Decimal, Enum, Bytes
     }
 
     private fun binaryRead(f: LuxoField): String {
@@ -84,7 +85,9 @@ object LuxoCodegen {
             "Float" -> if (n) "dec.readFloatPtr()" else "dec.readFloat()"
             "Boolean" -> if (n) "dec.readBoolPtr()" else "dec.readBool()"
             "UUID" -> if (n) "dec.readUuidPtr()" else "dec.readUuid()"
-            "String", "DateTime", "Decimal", "Enum" -> if (n) "dec.readStringPtr()" else "dec.readString()"
+            // DateTime: svarint(unix seconds) on the wire -> ISO string (matches JSON mode).
+            "DateTime" -> if (n) "dec.readDateTimePtr()" else "dec.readDateTime()"
+            "String", "Decimal", "Enum" -> if (n) "dec.readStringPtr()" else "dec.readString()"
             else -> {
                 // Nested model — decode recursively
                 val tn = f.typeName ?: f.type
@@ -311,6 +314,7 @@ object LuxoCodegen {
                 null, "Int", "Duration" -> "LuxoDecoder(data).let { d -> d.nextField(); d.readInt().toInt() }"
                 "Float" -> "LuxoDecoder(data).let { d -> d.nextField(); d.readFloat() }"
                 "Boolean" -> "LuxoDecoder(data).let { d -> d.nextField(); d.readBool() }"
+                "DateTime" -> "LuxoDecoder(data).let { d -> d.nextField(); d.readDateTime() }"
                 else -> "LuxoDecoder(data).let { d -> d.nextField(); d.readString() }"
             }
             b.appendLine("        is ByteArray -> $binaryDecode")

@@ -822,9 +822,20 @@ func writeJSONScalarParam(enc *codec.Encoder, p Param, v any) {
 		if bv, ok := v.(bool); ok {
 			enc.WriteFieldBool(p.ID, bv)
 		}
-	case FieldDateTime, FieldDuration:
+	case FieldDuration:
 		if fv, ok := v.(float64); ok {
 			enc.WriteFieldInt(p.ID, int64(fv))
+		}
+	case FieldDateTime:
+		// JSON callers send DateTime as RFC3339 string; parse to unix seconds.
+		// Tolerate raw unix-seconds number too.
+		switch dv := v.(type) {
+		case string:
+			if t, err := time.Parse(time.RFC3339, dv); err == nil {
+				enc.WriteFieldInt(p.ID, t.Unix())
+			}
+		case float64:
+			enc.WriteFieldInt(p.ID, int64(dv))
 		}
 	case FieldUUID:
 		if sv, ok := v.(string); ok {

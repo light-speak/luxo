@@ -2,6 +2,9 @@ package api
 
 import (
 	"fmt"
+	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/selection"
@@ -219,7 +222,39 @@ func EncodeBinaryRequest(apiID int, params map[string]any, paramMeta []ParamMeta
 			if fv, ok := v.(float64); ok {
 				enc.WriteFieldFloat(meta.FieldID, fv)
 			}
-		case "String", "DateTime", "Enum", "UUID", "Decimal":
+		case "DateTime":
+			// Per protocol: DateTime = svarint(unix seconds). Accept time.Time,
+			// int64, float64, or RFC3339 string from the caller.
+			var sec int64
+			switch tv := v.(type) {
+			case time.Time:
+				sec = tv.Unix()
+			case int64:
+				sec = tv
+			case float64:
+				sec = int64(tv)
+			case string:
+				if t, err := time.Parse(time.RFC3339, tv); err == nil {
+					sec = t.Unix()
+				}
+			}
+			enc.WriteFieldInt(meta.FieldID, sec)
+		case "UUID":
+			// Per protocol: UUID = 16-byte fixed. Accept canonical string,
+			// uuid.UUID, or [16]byte.
+			var u [16]byte
+			switch tv := v.(type) {
+			case string:
+				if parsed, err := uuid.Parse(tv); err == nil {
+					u = [16]byte(parsed)
+				}
+			case uuid.UUID:
+				u = [16]byte(tv)
+			case [16]byte:
+				u = tv
+			}
+			enc.WriteFieldUUID(meta.FieldID, u)
+		case "String", "Enum", "Decimal":
 			if sv, ok := v.(string); ok {
 				enc.WriteFieldString(meta.FieldID, sv)
 			}
@@ -250,7 +285,24 @@ func readBinaryParam(buf []byte, off int, meta ParamMeta) (any, int, error) {
 			return nil, 0, fmt.Errorf("param %s: truncated float", meta.Name)
 		}
 		return v, n, nil
-	case "String", "DateTime", "Enum", "UUID", "Decimal":
+	case "DateTime":
+		// Per protocol: DateTime = svarint(unix seconds). Format back to RFC3339
+		// string so existing *string slots and ParamString stay source-compatible
+		// with the previous string-wire behavior (handlers unchanged).
+		v, n := codec.ReadSvarint(buf, off)
+		if n <= 0 {
+			return nil, 0, fmt.Errorf("param %s: truncated datetime", meta.Name)
+		}
+		return time.Unix(v, 0).UTC().Format(time.RFC3339), n, nil
+	case "UUID":
+		// Per protocol: UUID = 16-byte fixed. Format back to canonical string
+		// so ParamString stays source-compatible (handlers unchanged).
+		u, n := codec.ReadUUID(buf, off)
+		if n == 0 {
+			return nil, 0, fmt.Errorf("param %s: truncated uuid", meta.Name)
+		}
+		return uuid.UUID(u).String(), n, nil
+	case "String", "Enum", "Decimal":
 		v, n := codec.ReadString(buf, off)
 		if n == 0 {
 			return nil, 0, fmt.Errorf("param %s: truncated string", meta.Name)

@@ -191,7 +191,10 @@ String _binaryRead(LuxoField f) {
   // Scalar array field ([T]) — inline [count][items...] in the row stream.
   if (f.isList && _isScalar(f.type)) {
     switch (f.type) {
-      case 'Int': case 'Duration': case 'DateTime': return 'dec.readIntArray()';
+      case 'Int': case 'Duration': return 'dec.readIntArray()';
+      // DateTime arrays are svarint(unix seconds) on the wire but surface as
+      // List<String> (ISO 8601) to match JSON mode.
+      case 'DateTime': return 'dec.readDateTimeArray()';
       case 'Float': return 'dec.readFloatArray()';
       case 'Boolean': return 'dec.readBoolArray()';
       case 'UUID': return 'dec.readUuidArray()';
@@ -203,7 +206,10 @@ String _binaryRead(LuxoField f) {
     case 'Float': return n ? 'dec.readFloatPtr()' : 'dec.readFloat()';
     case 'Boolean': return n ? 'dec.readBoolPtr()' : 'dec.readBool()';
     case 'UUID': return n ? 'dec.readUuidPtr()' : 'dec.readUuid()';
-    case 'String': case 'DateTime': case 'Decimal': case 'Enum':
+    // DateTime is svarint(unix seconds) on the binary wire; decode to an
+    // ISO 8601 string so the field type matches JSON mode (String).
+    case 'DateTime': return n ? 'dec.readDateTimePtr()' : 'dec.readDateTime()';
+    case 'String': case 'Decimal': case 'Enum':
       return n ? 'dec.readStringPtr()' : 'dec.readString()';
     default:
       // Nested model — decode recursively
@@ -392,6 +398,8 @@ String _decoder(LuxoAPI api) {
       'Float' => '(LuxoDecoder(d)..nextField()).readFloat()',
       'Boolean' => '(LuxoDecoder(d)..nextField()).readBool()',
       'Int' || 'Duration' => '(LuxoDecoder(d)..nextField()).readInt()',
+      // DateTime: svarint(unix seconds) -> ISO 8601 string (matches JSON mode).
+      'DateTime' => '(LuxoDecoder(d)..nextField()).readDateTime()',
       _ => '(LuxoDecoder(d)..nextField()).readString()',
     };
     final jsonRead = t == 'Float' ? '(d as num).toDouble()' : 'd as $dartType';

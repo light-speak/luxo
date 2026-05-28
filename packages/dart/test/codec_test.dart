@@ -640,6 +640,111 @@ void main() {
     });
   });
 
+  group('DateTime svarint decoding', () {
+    // 2021-01-01T00:00:00Z == 1609459200 unix seconds.
+    const seconds = 1609459200;
+    const iso = '2021-01-01T00:00:00.000Z';
+
+    test('dateTimeStringFromUnixSeconds matches JSON ISO 8601 UTC', () {
+      expect(dateTimeStringFromUnixSeconds(seconds), equals(iso));
+      expect(
+          dateTimeStringFromUnixSeconds(0), equals('1970-01-01T00:00:00.000Z'));
+    });
+
+    test('readDateTime decodes svarint seconds to ISO string', () {
+      final enc = LuxoEncoder();
+      enc.writeFieldInt(1, seconds); // svarint(unix seconds)
+      enc.writeEnd();
+
+      final dec = LuxoDecoder(enc.bytes());
+      expect(dec.nextField(), isTrue);
+      expect(dec.fieldID, equals(1));
+      expect(dec.readDateTime(), equals(iso));
+      expect(dec.nextField(), isFalse);
+    });
+
+    test('readDateTimePtr returns null on null marker', () {
+      final enc = LuxoEncoder();
+      enc.writeVarint(1); // fieldID
+      enc.writeNull();
+      enc.writeEnd();
+
+      final dec = LuxoDecoder(enc.bytes());
+      expect(dec.nextField(), isTrue);
+      expect(dec.readDateTimePtr(), isNull);
+    });
+
+    test('readDateTimePtr decodes present svarint seconds', () {
+      final enc = LuxoEncoder();
+      enc.writeVarint(1); // fieldID
+      enc.writePresent();
+      enc.writeSvarint(seconds);
+      enc.writeEnd();
+
+      final dec = LuxoDecoder(enc.bytes());
+      expect(dec.nextField(), isTrue);
+      expect(dec.readDateTimePtr(), equals(iso));
+    });
+
+    test('readDateTimeArray decodes svarint seconds list to ISO strings', () {
+      final enc = LuxoEncoder();
+      enc.writeFieldIntArray(1, [seconds, 0]);
+      enc.writeEnd();
+
+      final dec = LuxoDecoder(enc.bytes());
+      expect(dec.nextField(), isTrue);
+      expect(
+          dec.readDateTimeArray(), equals([iso, '1970-01-01T00:00:00.000Z']));
+    });
+
+    test('binary and JSON DateTime representations are identical', () {
+      // JSON mode surfaces DateTime as the RFC3339 string the server sends.
+      final jsonValue =
+          DateTime.fromMillisecondsSinceEpoch(seconds * 1000, isUtc: true)
+              .toIso8601String();
+
+      final enc = LuxoEncoder();
+      enc.writeFieldInt(1, seconds);
+      enc.writeEnd();
+      final dec = LuxoDecoder(enc.bytes());
+      dec.nextField();
+      final binaryValue = dec.readDateTime();
+
+      expect(binaryValue, equals(jsonValue));
+      expect(binaryValue, isA<String>());
+    });
+
+    test('readColumnDateTime decodes int column to ISO strings', () {
+      final bb = BytesBuilder();
+      _writeVarint(bb, 2); // count
+      _writeVarint(bb, 1); // fieldID
+      _writeSvarint(bb, seconds);
+      _writeSvarint(bb, 0);
+      bb.addByte(0x00); // end
+
+      final dec = ColumnarDecoder(Uint8List.fromList(bb.toBytes()));
+      expect(dec.nextColumn(), isTrue);
+      expect(
+          dec.readColumnDateTime(), equals([iso, '1970-01-01T00:00:00.000Z']));
+      expect(dec.nextColumn(), isFalse);
+    });
+
+    test('readColumnDateTimePtr decodes nullable int column', () {
+      final bb = BytesBuilder();
+      _writeVarint(bb, 3); // count
+      _writeVarint(bb, 1); // fieldID
+      bb.addByte(0x00); // null
+      bb.addByte(0x01); _writeSvarint(bb, seconds); // present
+      bb.addByte(0x00); // null
+      bb.addByte(0x00); // end
+
+      final dec = ColumnarDecoder(Uint8List.fromList(bb.toBytes()));
+      expect(dec.nextColumn(), isTrue);
+      expect(dec.readColumnDateTimePtr(), equals([null, iso, null]));
+      expect(dec.nextColumn(), isFalse);
+    });
+  });
+
   group('fieldMask utilities', () {
     test('set and check single field', () {
       var mask = Uint8List(0);

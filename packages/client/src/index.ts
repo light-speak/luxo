@@ -1,6 +1,6 @@
 export { FetchTransport, WsTransport } from './transport'
 export { LuxoError } from './error'
-export { Encoder, Decoder, ColumnarDecoder, fieldMaskSet, fieldMaskHas, formatUUID, parseUUID, decodeScalarArray } from './codec'
+export { Encoder, Decoder, ColumnarDecoder, fieldMaskSet, fieldMaskHas, formatUUID, parseUUID, decodeScalarArray, unixSecondsToISO } from './codec'
 export type { FieldType } from './codec'
 export type { Transport, TransportMode, TransportOptions, APISchema } from './transport'
 export type { Page, LuxoSchema, LuxoModel, LuxoField, LuxoAPI, LuxoParam } from './types'

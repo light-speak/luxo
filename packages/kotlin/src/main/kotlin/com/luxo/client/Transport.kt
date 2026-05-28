@@ -187,7 +187,17 @@ class OkHttpTransport(
             "Int", "Duration" -> enc.writeFieldInt(pm.fieldID, (v as Number).toLong())
             "Float" -> enc.writeFieldFloat(pm.fieldID, (v as Number).toDouble())
             "UUID" -> enc.writeFieldUuid(pm.fieldID, v as String)
-            "String", "Enum", "Decimal", "DateTime" -> enc.writeFieldString(pm.fieldID, v as String)
+            // Per protocol: DateTime = svarint(unix seconds). Accept ISO string or number.
+            "DateTime" -> {
+                val sec = when (v) {
+                    is Long -> v
+                    is Number -> v.toLong()
+                    is String -> java.time.Instant.parse(v).epochSecond
+                    else -> 0L
+                }
+                enc.writeFieldInt(pm.fieldID, sec)
+            }
+            "String", "Enum", "Decimal" -> enc.writeFieldString(pm.fieldID, v as String)
             "Boolean" -> enc.writeFieldBool(pm.fieldID, v as Boolean)
         }
     }
@@ -202,7 +212,17 @@ class OkHttpTransport(
                 enc.writeFieldArray(pm.fieldID, items) { enc.writeFixed64((it as Number).toDouble()) }
             "UUID" ->
                 enc.writeFieldArray(pm.fieldID, items) { enc.writeUuid(it as String) }
-            "String", "Enum", "Decimal", "DateTime" ->
+            "DateTime" ->
+                enc.writeFieldArray(pm.fieldID, items) {
+                    val sec = when (it) {
+                        is Long -> it
+                        is Number -> it.toLong()
+                        is String -> java.time.Instant.parse(it).epochSecond
+                        else -> 0L
+                    }
+                    enc.writeSvarint(sec)
+                }
+            "String", "Enum", "Decimal" ->
                 enc.writeFieldArray(pm.fieldID, items) { enc.writeString(it as String) }
             "Boolean" ->
                 enc.writeFieldArray(pm.fieldID, items) { enc.writeBool(it as Boolean) }

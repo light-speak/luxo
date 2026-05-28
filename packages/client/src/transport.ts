@@ -37,9 +37,11 @@ function encodeParam(
     case 'UUID':
       // UUID is a fixed 16-byte value on the wire (not a length-prefixed string).
       enc.writeFieldUUID(pm.fieldID, v as string); break
-    case 'DateTime':
-      // DateTime sent as ISO string, server parses it
-      enc.writeFieldString(pm.fieldID, v as string); break
+    case 'DateTime': {
+      // Per protocol: DateTime = svarint(unix seconds). Accept ISO string or number.
+      const sec = typeof v === 'number' ? Math.floor(v) : Math.floor(new Date(v as string).getTime() / 1000)
+      enc.writeFieldInt(pm.fieldID, sec); break
+    }
   }
 }
 

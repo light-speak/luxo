@@ -132,9 +132,10 @@ function genTypes(schema: LuxoSchema): string {
 function columnTSType(field: { type: string; nullable?: boolean }): string {
   const n = field.nullable
   switch (field.type) {
-    case 'Int': case 'Duration': case 'DateTime': case 'Float':
+    case 'Int': case 'Duration': case 'Float':
       return n ? '(number | null)[]' : 'number[]'
-    case 'String': case 'Enum': case 'UUID': case 'Decimal':
+    // DateTime is represented as an RFC3339 string in both JSON and binary modes.
+    case 'String': case 'Enum': case 'UUID': case 'Decimal': case 'DateTime':
       return n ? '(string | null)[]' : 'string[]'
     case 'Boolean':
       return n ? '(boolean | null)[]' : 'boolean[]'
@@ -147,8 +148,9 @@ function columnTSType(field: { type: string; nullable?: boolean }): string {
 function columnDefault(field: { type: string; nullable?: boolean }): string {
   if (field.nullable) return 'null'
   switch (field.type) {
-    case 'Int': case 'Duration': case 'DateTime': case 'Float': return '0'
+    case 'Int': case 'Duration': case 'Float': return '0'
     case 'Boolean': return 'false'
+    // DateTime is a string (RFC3339) — default to empty string like other string columns.
     default: return "''"
   }
 }
@@ -156,8 +158,11 @@ function columnDefault(field: { type: string; nullable?: boolean }): string {
 function genColumnRead(field: { type: string; nullable?: boolean }): string {
   const n = field.nullable
   switch (field.type) {
-    case 'Int': case 'Duration': case 'DateTime':
+    case 'Int': case 'Duration':
       return n ? 'r.readColumnIntPtr()' : 'r.readColumnInt()'
+    // DateTime columns are svarint(unix seconds), decoded to RFC3339 strings (matches JSON mode).
+    case 'DateTime':
+      return n ? 'r.readColumnDateTimePtr()' : 'r.readColumnDateTime()'
     case 'Float':
       return n ? 'r.readColumnFloatPtr()' : 'r.readColumnFloat()'
     case 'String': case 'Enum': case 'UUID': case 'Decimal':
@@ -244,7 +249,9 @@ function genFieldRead(field: { type: string; typeName?: string; nullable?: boole
   switch (field.type) {
     case 'Int': case 'Duration': return n ? 'dec.readIntPtr()' : 'dec.readInt()'
     case 'Float': return n ? 'dec.readFloatPtr()' : 'dec.readFloat()'
-    case 'String': case 'DateTime': case 'UUID': case 'Decimal': case 'Enum':
+    // DateTime is svarint(unix seconds) on the wire, decoded to an RFC3339 string (matches JSON mode).
+    case 'DateTime': return n ? 'dec.readDateTimePtr()' : 'dec.readDateTime()'
+    case 'String': case 'UUID': case 'Decimal': case 'Enum':
       return n ? 'dec.readStringPtr()' : 'dec.readString()'
     case 'Boolean': return n ? 'dec.readBoolPtr()' : 'dec.readBool()'
     default: {
@@ -353,6 +360,8 @@ function genDecode(api: LuxoAPI): string {
     const br = t === 'Float' ? 'new Decoder(d).readFloat()'
       : t === 'Boolean' ? 'new Decoder(d).readBool()'
       : (t === 'Int' || t === 'Duration') ? 'new Decoder(d).readInt()'
+      // DateTime: svarint(unix seconds) → RFC3339 string (matches JSON mode).
+      : t === 'DateTime' ? 'new Decoder(d).readDateTime()'
       : 'new Decoder(d).readString()'
     return `d instanceof Uint8Array ? ${br} : d as ${ts}`
   }

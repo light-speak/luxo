@@ -260,6 +260,18 @@ class LuxoDecoder {
     return (uv >>> 1) ^ -(uv & 1);
   }
 
+  /// Reads a DateTime field encoded as svarint(unix seconds) and converts it
+  /// to an ISO 8601 UTC string — matching the JSON wire representation
+  /// (RFC3339). Keeps binary and JSON decoding type-consistent (both String).
+  String readDateTime() => dateTimeStringFromUnixSeconds(readInt());
+
+  /// Reads a nullable DateTime field. Returns null when the null marker is set,
+  /// otherwise svarint(unix seconds) converted to an ISO 8601 UTC string.
+  String? readDateTimePtr() {
+    if (!_readNullableFlag()) return null;
+    return readDateTime();
+  }
+
   /// Reads a float64 (8 bytes little-endian).
   double readFloat() {
     if (_off + 8 > _data.lengthInBytes) {
@@ -358,6 +370,23 @@ class LuxoDecoder {
     for (var i = 0; i < count; i++) {
       result.add(readInt());
       if (error != null) return const [];
+    }
+    return result;
+  }
+
+  /// Reads a count-prefixed DateTime array (svarint unix-seconds items),
+  /// converting each element to an ISO 8601 UTC string to match JSON mode.
+  List<String> readDateTimeArray() {
+    final count = _readVarint();
+    if (count < 0) {
+      error = 'invalid array header at offset $_off';
+      return const [];
+    }
+    final result = <String>[];
+    for (var i = 0; i < count; i++) {
+      final seconds = readInt();
+      if (error != null) return const [];
+      result.add(dateTimeStringFromUnixSeconds(seconds));
     }
     return result;
   }
@@ -532,6 +561,29 @@ class ColumnarDecoder {
     return result;
   }
 
+  /// Reads [count] DateTime values from an Int (svarint unix-seconds) column,
+  /// converting each to an ISO 8601 UTC string to match the JSON wire format.
+  List<String> readColumnDateTime() {
+    final result = List<String>.filled(count, '');
+    for (var i = 0; i < count; i++) {
+      if (_off >= _data.lengthInBytes) break;
+      result[i] = dateTimeStringFromUnixSeconds(_readSvarint());
+    }
+    return result;
+  }
+
+  /// Reads [count] nullable DateTime values (0x00=null, 0x01+svarint seconds),
+  /// each non-null value converted to an ISO 8601 UTC string.
+  List<String?> readColumnDateTimePtr() {
+    final result = List<String?>.filled(count, null);
+    for (var i = 0; i < count; i++) {
+      if (_off >= _data.lengthInBytes) break;
+      if (_bytes[_off++] == 0x00) continue;
+      result[i] = dateTimeStringFromUnixSeconds(_readSvarint());
+    }
+    return result;
+  }
+
   /// Reads [count] fixed64 float values.
   List<double> readColumnFloat() {
     final result = List<double>.filled(count, 0.0);
@@ -691,6 +743,16 @@ class ColumnarDecoder {
     return -1;
   }
 }
+
+// --- DateTime helpers ---
+
+/// Converts a unix-seconds timestamp (as carried by the Luxo binary wire as
+/// svarint) to an ISO 8601 UTC string, matching the RFC3339 representation the
+/// JSON wire format uses. This keeps DateTime fields the same Dart type
+/// (String) regardless of transport mode.
+String dateTimeStringFromUnixSeconds(int seconds) =>
+    DateTime.fromMillisecondsSinceEpoch(seconds * 1000, isUtc: true)
+        .toIso8601String();
 
 // --- UUID helpers ---
 

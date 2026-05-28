@@ -260,6 +260,12 @@ func (r *Request) ParamString(name string) (string, error) {
 func (r *Request) ParamDateTime(name string) (time.Time, error) {
 	if r.paramNames != nil {
 		if v, ok := r.findParam(name); ok {
+			// Binary path: readBinaryParam returns int64 (unix seconds, svarint).
+			if iv, ok := v.(int64); ok {
+				return time.Unix(iv, 0).UTC(), nil
+			}
+			// Tolerate string-form params too (e.g. mixed-mode gateways or older
+			// callers that still pass RFC3339 strings).
 			if sv, ok := v.(string); ok {
 				t, err := time.Parse(time.RFC3339, sv)
 				if err != nil {

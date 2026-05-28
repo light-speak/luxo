@@ -37,6 +37,19 @@ export function formatUUID(data: Uint8Array, off: number): string {
   return s
 }
 
+// --- DateTime helpers ---
+// On the wire a DateTime is svarint(unix seconds). In JS it is represented as
+// an RFC3339 string (e.g. "2026-05-28T12:00:00Z"), matching the Go JSON output
+// which formats time.Unix(sec, 0).UTC() with RFC3339Nano. Since wire values
+// carry only whole seconds, the fractional ".000" produced by Date.toISOString()
+// is stripped so binary and JSON modes yield byte-identical strings.
+
+/** Convert unix seconds to an RFC3339 string, matching Go's DateTime JSON output. */
+export function unixSecondsToISO(seconds: number): string {
+  // Date expects milliseconds; whole-second timestamps never have a fractional part.
+  return new Date(seconds * 1000).toISOString().replace('.000Z', 'Z')
+}
+
 /** Decode a single hex digit, or -1 if not a hex char. */
 function hexNibble(c: number): number {
   if (c >= 0x30 && c <= 0x39) return c - 0x30 // 0-9
@@ -382,6 +395,18 @@ export class Decoder {
     return this.readUUID()
   }
 
+  /** Read a DateTime: svarint(unix seconds) → RFC3339 string (matches Go JSON output). */
+  readDateTime(): string {
+    return unixSecondsToISO(this.readInt())
+  }
+
+  /** Read a nullable DateTime (0x00=null, else svarint seconds → RFC3339 string). */
+  readDateTimePtr(): string | null {
+    if (this.off >= this.data.length) return null
+    if (this.data[this.off++] === 0x00) return null
+    return unixSecondsToISO(this.readInt())
+  }
+
   /** Read a nested model using a decoder function. */
   readNullable<T>(decode: () => T): T | null {
     const present = this.readVarintRaw()
@@ -515,6 +540,25 @@ export class ColumnarDecoder {
     return result
   }
 
+  /** Read count DateTime values (svarint seconds → RFC3339 strings). */
+  readColumnDateTime(): string[] {
+    const result: string[] = new Array(this.count)
+    for (let i = 0; i < this.count; i++) {
+      result[i] = unixSecondsToISO(this.readSvarint())
+    }
+    return result
+  }
+
+  /** Read count nullable DateTime values (0x00=null, 0x01+svarint → RFC3339 string). */
+  readColumnDateTimePtr(): (string | null)[] {
+    const result: (string | null)[] = new Array(this.count)
+    for (let i = 0; i < this.count; i++) {
+      if (this.buf[this.off++] === 0x00) { result[i] = null; continue }
+      result[i] = unixSecondsToISO(this.readSvarint())
+    }
+    return result
+  }
+
   /** Read count nullable float values (0x00=null, 0x01+fixed64). */
   readColumnFloatPtr(): (number | null)[] {
     const result: (number | null)[] = new Array(this.count)
@@ -608,12 +652,15 @@ export type FieldType =
 
 /** Decode a scalar array cell ([count][items...]) into a JS array, by element type.
  *  Used both for row-mode list fields and for columnar list cells (each cell is a
- *  length-prefixed blob read via ColumnarDecoder.readColumnBytes). DateTime/Duration
- *  values are returned as raw numbers (unix seconds / nanoseconds) like the row scalars. */
+ *  length-prefixed blob read via ColumnarDecoder.readColumnBytes). Duration values
+ *  are returned as raw numbers (nanoseconds); DateTime values are returned as RFC3339
+ *  strings, matching the Go JSON output and the row/columnar scalar decoders. */
 export function decodeScalarArray(cell: Uint8Array, type: FieldType): unknown[] {
   const dec = new Decoder(cell)
   switch (type) {
-    case 'Int': case 'DateTime': case 'Duration':
+    case 'DateTime':
+      return dec.readIntArray().map(unixSecondsToISO)
+    case 'Int': case 'Duration':
       return dec.readIntArray()
     case 'Float':
       return dec.readFloatArray()

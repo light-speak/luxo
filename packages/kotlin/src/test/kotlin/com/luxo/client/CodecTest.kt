@@ -385,6 +385,90 @@ class LuxoEncoderDecoderTest {
         assertEquals(emptyList(), dec.readArray { dec.readString() })
     }
 
+    // -- DateTime (svarint unix seconds -> ISO string) --
+
+    @Test
+    fun `datetime decodes svarint seconds to ISO string`() {
+        // Go wire: DateTime = svarint(unix seconds). 1748424000 == 2025-05-28T09:20:00Z.
+        val enc = LuxoEncoder()
+        enc.writeFieldInt(1, 1748424000L)
+        enc.writeEnd()
+
+        val dec = LuxoDecoder(enc.bytes())
+        assertTrue(dec.nextField())
+        assertEquals(1, dec.fieldID)
+        assertEquals("2025-05-28T09:20:00Z", dec.readDateTime())
+        assertFalse(dec.nextField())
+    }
+
+    @Test
+    fun `datetime epoch zero`() {
+        val enc = LuxoEncoder()
+        enc.writeFieldInt(1, 0L)
+        enc.writeEnd()
+
+        val dec = LuxoDecoder(enc.bytes())
+        assertTrue(dec.nextField())
+        assertEquals("1970-01-01T00:00:00Z", dec.readDateTime())
+    }
+
+    @Test
+    fun `datetime negative seconds (pre-epoch)`() {
+        val enc = LuxoEncoder()
+        enc.writeFieldInt(1, -1L)
+        enc.writeEnd()
+
+        val dec = LuxoDecoder(enc.bytes())
+        assertTrue(dec.nextField())
+        assertEquals("1969-12-31T23:59:59Z", dec.readDateTime())
+    }
+
+    @Test
+    fun `nullable datetime present`() {
+        val enc = LuxoEncoder()
+        enc.writeVarint(1) // fieldID
+        enc.writeBool(true) // null flag = present
+        enc.writeSvarint(1748424000L)
+        enc.writeEnd()
+
+        val dec = LuxoDecoder(enc.bytes())
+        assertTrue(dec.nextField())
+        assertEquals("2025-05-28T09:20:00Z", dec.readDateTimePtr())
+    }
+
+    @Test
+    fun `nullable datetime null`() {
+        val enc = LuxoEncoder()
+        enc.writeVarint(1) // fieldID
+        enc.writeBool(false) // null flag = absent
+        enc.writeEnd()
+
+        val dec = LuxoDecoder(enc.bytes())
+        assertTrue(dec.nextField())
+        assertEquals(null, dec.readDateTimePtr())
+    }
+
+    @Test
+    fun `datetime scalar array round-trip`() {
+        val secs = listOf(0L, 1748424000L, -1L)
+        val enc = LuxoEncoder()
+        enc.writeFieldArray(1, secs) { enc.writeSvarint(it) }
+        enc.writeEnd()
+
+        val dec = LuxoDecoder(enc.bytes())
+        assertTrue(dec.nextField())
+        assertEquals(
+            listOf("1970-01-01T00:00:00Z", "2025-05-28T09:20:00Z", "1969-12-31T23:59:59Z"),
+            dec.readArray { dec.readDateTime() },
+        )
+    }
+
+    @Test
+    fun `datetime codec toIso`() {
+        assertEquals("1970-01-01T00:00:00Z", DateTimeCodec.toIso(0L))
+        assertEquals("2025-05-28T09:20:00Z", DateTimeCodec.toIso(1748424000L))
+    }
+
     @Test
     fun `encoder grows buffer beyond initial capacity`() {
         val enc = LuxoEncoder(initialCapacity = 4)
@@ -508,6 +592,45 @@ class ColumnarDecoderTest {
         assertEquals(2, dec.fieldID)
         assertEquals(listOf(null, "hi", ""), dec.readColumnStringPtr())
 
+        assertFalse(dec.nextColumn())
+    }
+
+    @Test
+    fun `datetime column (int svarint seconds to ISO)`() {
+        val buf = mutableListOf<Byte>()
+        buf.writeVarint(3) // count=3
+        buf.writeVarint(1) // fieldID=1
+        buf.writeSvarint(0)
+        buf.writeSvarint(1748424000)
+        buf.writeSvarint(-1)
+        buf.add(0x00)
+
+        val dec = ColumnarDecoder(buf.toByteArray())
+        assertEquals(3, dec.count)
+        assertTrue(dec.nextColumn())
+        assertEquals(1, dec.fieldID)
+        assertEquals(
+            listOf("1970-01-01T00:00:00Z", "2025-05-28T09:20:00Z", "1969-12-31T23:59:59Z"),
+            dec.readColumnDateTime(),
+        )
+        assertFalse(dec.nextColumn())
+    }
+
+    @Test
+    fun `nullable datetime column`() {
+        val buf = mutableListOf<Byte>()
+        buf.writeVarint(3) // count=3
+        buf.writeVarint(1) // fieldID=1
+        buf.add(0x00) // null
+        buf.add(0x01); buf.writeSvarint(1748424000) // present
+        buf.add(0x00) // null
+        buf.add(0x00) // end marker
+
+        val dec = ColumnarDecoder(buf.toByteArray())
+        assertEquals(3, dec.count)
+        assertTrue(dec.nextColumn())
+        assertEquals(1, dec.fieldID)
+        assertEquals(listOf(null, "2025-05-28T09:20:00Z", null), dec.readColumnDateTimePtr())
         assertFalse(dec.nextColumn())
     }
 
