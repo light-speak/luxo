@@ -193,7 +193,7 @@ class OkHttpTransport(
                     is Long -> v
                     is Number -> v.toLong()
                     is String -> java.time.Instant.parse(v).epochSecond
-                    else -> 0L
+                    else -> throw IllegalArgumentException("invalid DateTime param: ${v::class}")
                 }
                 enc.writeFieldInt(pm.fieldID, sec)
             }
@@ -218,7 +218,7 @@ class OkHttpTransport(
                         is Long -> it
                         is Number -> it.toLong()
                         is String -> java.time.Instant.parse(it).epochSecond
-                        else -> 0L
+                        else -> throw IllegalArgumentException("invalid DateTime param: ${v::class}")
                     }
                     enc.writeSvarint(sec)
                 }

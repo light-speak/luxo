@@ -699,7 +699,7 @@ func (r *ColumnarReader) SkipColumnBytesPtr() {
 // SkipColumnUUID skips count fixed 16-byte UUID values without allocating.
 func (r *ColumnarReader) SkipColumnUUID() {
 	for i := 0; i < r.count; i++ {
-		if r.off+16 > len(r.buf) {
+		if r.off < 0 || r.off > len(r.buf) || len(r.buf)-r.off < 16 {
 			r.err = fmt.Errorf("codec: truncated uuid column at record %d", i)
 			return
 		}
@@ -717,7 +717,7 @@ func (r *ColumnarReader) SkipColumnUUIDPtr() {
 		}
 		r.off += n
 		if present {
-			if r.off+16 > len(r.buf) {
+			if r.off < 0 || r.off > len(r.buf) || len(r.buf)-r.off < 16 {
 				r.err = fmt.Errorf("codec: truncated uuid value at record %d", i)
 				return
 			}

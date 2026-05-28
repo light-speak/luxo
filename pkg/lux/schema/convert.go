@@ -859,11 +859,26 @@ func writeJSONArrayParam(enc *codec.Encoder, p Param, v any) {
 		return
 	}
 	switch p.Type {
-	case FieldInt, FieldDateTime, FieldDuration:
+	case FieldInt, FieldDuration:
 		vs := make([]int64, 0, len(arr))
 		for _, e := range arr {
 			if fv, ok := e.(float64); ok {
 				vs = append(vs, int64(fv))
+			}
+		}
+		enc.WriteFieldIntArray(p.ID, vs)
+	case FieldDateTime:
+		// JSON clients may send DateTime arrays as RFC3339 strings or as raw
+		// unix-seconds numbers; accept both, like the scalar param path.
+		vs := make([]int64, 0, len(arr))
+		for _, e := range arr {
+			switch ev := e.(type) {
+			case float64:
+				vs = append(vs, int64(ev))
+			case string:
+				if t, err := time.Parse(time.RFC3339, ev); err == nil {
+					vs = append(vs, t.Unix())
+				}
 			}
 		}
 		enc.WriteFieldIntArray(p.ID, vs)

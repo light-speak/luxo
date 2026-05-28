@@ -12,8 +12,13 @@ function encodeParam(
   if (pm.isList) {
     const arr = v as unknown[]
     switch (pm.type) {
-      case 'Int': case 'Duration': case 'DateTime':
+      case 'Int': case 'Duration':
         enc.writeFieldIntArray(pm.fieldID, arr as number[]); break
+      case 'DateTime':
+        // Accept ISO string elements (parity with the scalar DateTime branch).
+        enc.writeFieldIntArray(pm.fieldID, (arr as (number | string)[]).map(v =>
+          typeof v === 'number' ? Math.floor(v) : Math.floor(new Date(v).getTime() / 1000)
+        )); break
       case 'Float':
         enc.writeFieldFloatArray(pm.fieldID, arr as number[]); break
       case 'String': case 'Enum': case 'Decimal':

@@ -223,37 +223,9 @@ func EncodeBinaryRequest(apiID int, params map[string]any, paramMeta []ParamMeta
 				enc.WriteFieldFloat(meta.FieldID, fv)
 			}
 		case "DateTime":
-			// Per protocol: DateTime = svarint(unix seconds). Accept time.Time,
-			// int64, float64, or RFC3339 string from the caller.
-			var sec int64
-			switch tv := v.(type) {
-			case time.Time:
-				sec = tv.Unix()
-			case int64:
-				sec = tv
-			case float64:
-				sec = int64(tv)
-			case string:
-				if t, err := time.Parse(time.RFC3339, tv); err == nil {
-					sec = t.Unix()
-				}
-			}
-			enc.WriteFieldInt(meta.FieldID, sec)
+			encodeDateTimeParam(&enc, meta.FieldID, v)
 		case "UUID":
-			// Per protocol: UUID = 16-byte fixed. Accept canonical string,
-			// uuid.UUID, or [16]byte.
-			var u [16]byte
-			switch tv := v.(type) {
-			case string:
-				if parsed, err := uuid.Parse(tv); err == nil {
-					u = [16]byte(parsed)
-				}
-			case uuid.UUID:
-				u = [16]byte(tv)
-			case [16]byte:
-				u = tv
-			}
-			enc.WriteFieldUUID(meta.FieldID, u)
+			encodeUUIDParam(&enc, meta.FieldID, v)
 		case "String", "Enum", "Decimal":
 			if sv, ok := v.(string); ok {
 				enc.WriteFieldString(meta.FieldID, sv)
@@ -268,6 +240,54 @@ func EncodeBinaryRequest(apiID int, params map[string]any, paramMeta []ParamMeta
 	buf = append(buf, enc.Bytes()...)
 
 	return buf
+}
+
+// encodeDateTimeParam encodes a DateTime param as svarint(unix seconds).
+// Accepts time.Time, int64, float64, or RFC3339 string. Skips on parse failure
+// rather than silently encoding epoch 0.
+func encodeDateTimeParam(enc *codec.Encoder, fieldID int, v any) {
+	var (
+		sec int64
+		ok  bool
+	)
+	switch tv := v.(type) {
+	case time.Time:
+		sec, ok = tv.Unix(), true
+	case int64:
+		sec, ok = tv, true
+	case float64:
+		sec, ok = int64(tv), true
+	case string:
+		if t, err := time.Parse(time.RFC3339, tv); err == nil {
+			sec, ok = t.Unix(), true
+		}
+	}
+	if ok {
+		enc.WriteFieldInt(fieldID, sec)
+	}
+}
+
+// encodeUUIDParam encodes a UUID param as 16-byte fixed.
+// Accepts canonical string, uuid.UUID, or [16]byte. Skips on parse failure
+// rather than writing the zero UUID.
+func encodeUUIDParam(enc *codec.Encoder, fieldID int, v any) {
+	var (
+		u  [16]byte
+		ok bool
+	)
+	switch tv := v.(type) {
+	case string:
+		if parsed, err := uuid.Parse(tv); err == nil {
+			u, ok = [16]byte(parsed), true
+		}
+	case uuid.UUID:
+		u, ok = [16]byte(tv), true
+	case [16]byte:
+		u, ok = tv, true
+	}
+	if ok {
+		enc.WriteFieldUUID(fieldID, u)
+	}
 }
 
 // readBinaryParam reads a single typed parameter value from binary data.

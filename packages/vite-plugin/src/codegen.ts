@@ -251,7 +251,10 @@ function genFieldRead(field: { type: string; typeName?: string; nullable?: boole
     case 'Float': return n ? 'dec.readFloatPtr()' : 'dec.readFloat()'
     // DateTime is svarint(unix seconds) on the wire, decoded to an RFC3339 string (matches JSON mode).
     case 'DateTime': return n ? 'dec.readDateTimePtr()' : 'dec.readDateTime()'
-    case 'String': case 'UUID': case 'Decimal': case 'Enum':
+    // UUID is a fixed 16-byte wire value (not a length-prefixed string) — use the
+    // dedicated codec method so generated code matches the protocol.
+    case 'UUID': return n ? 'dec.readUUIDPtr()' : 'dec.readUUID()'
+    case 'String': case 'Decimal': case 'Enum':
       return n ? 'dec.readStringPtr()' : 'dec.readString()'
     case 'Boolean': return n ? 'dec.readBoolPtr()' : 'dec.readBool()'
     default: {

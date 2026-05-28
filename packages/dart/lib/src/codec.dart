@@ -783,25 +783,24 @@ void parseUuidInto(String s, Uint8List dst, int off) {
   if (s.length != 36) {
     throw FormatException('invalid UUID length: ${s.length}', s);
   }
+  // Enforce dashes at the canonical 8-4-4-4-12 boundaries; malformed
+  // 36-char strings with misplaced dashes must not silently encode.
+  if (s.codeUnitAt(8) != 0x2D ||
+      s.codeUnitAt(13) != 0x2D ||
+      s.codeUnitAt(18) != 0x2D ||
+      s.codeUnitAt(23) != 0x2D) {
+    throw FormatException('invalid UUID format', s);
+  }
   var j = 0;
-  var i = 0;
-  while (i < s.length) {
-    final c = s.codeUnitAt(i);
-    if (c == 0x2D) {
+  for (var i = 0; i < s.length;) {
+    if (i == 8 || i == 13 || i == 18 || i == 23) {
       i++;
       continue;
     }
-    if (i + 1 >= s.length || j >= 16) {
-      throw FormatException('malformed UUID', s);
-    }
     final hi = _hexNibble(s.codeUnitAt(i));
     final lo = _hexNibble(s.codeUnitAt(i + 1));
-    dst[off + j] = (hi << 4) | lo;
-    j++;
+    dst[off + j++] = (hi << 4) | lo;
     i += 2;
-  }
-  if (j != 16) {
-    throw FormatException('malformed UUID', s);
   }
 }
 
