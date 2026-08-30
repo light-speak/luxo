@@ -5,5 +5,5 @@ export default defineConfig({
   format: ['cjs', 'esm'],
   dts: false,
   clean: true,
-  external: ['vite', '@luxo/client', '@babel/parser', '@babel/traverse', '@babel/types'],
+  external: ['vite', '@luxojs/client', '@babel/parser', '@babel/traverse', '@babel/types'],
 })

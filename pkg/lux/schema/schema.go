@@ -20,12 +20,14 @@ type Schema struct {
 // Enum describes an enum type with its values.
 type Enum struct {
 	Name   string   `json:"name"`
+	Module string   `json:"module,omitempty"`
 	Values []string `json:"values"`
 }
 
 // TypeDecl describes a plain data type (non-DB, like AuthPayload).
 type TypeDecl struct {
 	Name   string  `json:"name"`
+	Module string  `json:"module,omitempty"`
 	Fields []Field `json:"fields"`
 }
 
@@ -35,7 +37,7 @@ func (td *TypeDecl) AsModel() *Model {
 	// Copy the fields slice so we don't mutate td.Fields (JSONPrefix append).
 	fields := make([]Field, len(td.Fields))
 	copy(fields, td.Fields)
-	m := &Model{Name: td.Name, Fields: fields}
+	m := &Model{Name: td.Name, Module: td.Module, Fields: fields}
 	m.byID = make(map[int]*Field, len(m.Fields))
 	m.byName = make(map[string]*Field, len(m.Fields))
 	for i := range m.Fields {
@@ -52,6 +54,7 @@ func (td *TypeDecl) AsModel() *Model {
 // Model describes a model's fields for binary ↔ JSON conversion.
 type Model struct {
 	Name   string  `json:"name"`
+	Module string  `json:"module,omitempty"`
 	Fields []Field `json:"fields"`
 	byID   map[int]*Field
 	byName map[string]*Field
@@ -98,6 +101,7 @@ type API struct {
 	ReturnType       string  `json:"returnType,omitempty"`
 	ReturnList       bool    `json:"returnList,omitempty"`
 	Paginated        bool    `json:"paginated,omitempty"`
+	Stream           bool    `json:"stream,omitempty"`
 	Params           []Param `json:"params,omitempty"`
 	Deprecated       bool    `json:"deprecated,omitempty"`
 	DeprecatedReason string  `json:"deprecatedReason,omitempty"`
@@ -105,10 +109,13 @@ type API struct {
 
 // Param describes an API parameter.
 type Param struct {
-	ID     int       `json:"id"`
-	Name   string    `json:"name"`
-	Type   FieldType `json:"type"`
-	IsList bool      `json:"isList,omitempty"` // true for array params (in/notIn → [T])
+	ID         int       `json:"id"`
+	Name       string    `json:"name"`
+	Type       FieldType `json:"type"`
+	TypeName   string    `json:"typeName,omitempty"`
+	IsList     bool      `json:"isList,omitempty"`     // true for array params (in/notIn → [T])
+	Nullable   bool      `json:"nullable,omitempty"`   // true when the DSL type has a ? suffix
+	HasDefault bool      `json:"hasDefault,omitempty"` // true when the DSL parameter declares a default
 }
 
 // fieldTypeNames maps FieldType to its string representation for JSON.

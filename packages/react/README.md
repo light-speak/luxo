@@ -69,6 +69,7 @@ function UserList() {
   const { data: users, loading, error, refetch } = useLuxoQuery(
     () => transport.call('listUsers', { page: 1 }),
     [],
+    { queryKey: ['users', 1] },
   )
 
   if (loading) return <p>Loading...</p>
@@ -85,16 +86,31 @@ function UserList() {
 
 ## API
 
-### `useLuxoQuery<T>(queryFn, deps)`
+### `useLuxoQuery<T>(queryFn, deps, options)`
 
-**Declarative** — auto-executes on mount, re-fetches when `deps` change. Handles loading, error, race conditions, and memory leak prevention.
+**Declarative** — auto-executes on mount, re-fetches when `deps` change. Concurrent requests with the same key share one Promise. React StrictMode effect replay never duplicates a request.
 
 ```tsx
 const { data, loading, error, refetch } = useLuxoQuery<User[]>(
   () => transport.call('listUsers', { page }),
-  [page], // re-fetches when page changes
+  [page],
+  {
+    queryKey: ['users', page],
+    staleTime: 5_000,
+    gcTime: 60_000,
+  },
 )
 ```
+
+Without a `queryKey`, the hook still deduplicates its own StrictMode replay. Add a structural key to share in-flight or fresh data across components. Object key order does not affect identity.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `queryKey` | hook-local | Structural cache and deduplication key |
+| `enabled` | `true` | Disable automatic execution while false |
+| `staleTime` | `0` | Time in milliseconds that completed data stays fresh |
+| `gcTime` | `0` | Time in milliseconds to retain an unobserved query |
+| `queryClient` | context client | Override the nearest QueryClient |
 
 | Return | Type | Description |
 |--------|------|-------------|
@@ -103,20 +119,18 @@ const { data, loading, error, refetch } = useLuxoQuery<User[]>(
 | `error` | `Error \| null` | Error object if request failed |
 | `refetch` | `() => Promise<void>` | Manually trigger re-fetch |
 
-### `useLuxoMutation<T>(mutationFn)`
+### `useLuxoMutation<T>(mutationFn, options)`
 
 **Imperative** — only runs when you call `mutate()`. For writes: create, update, delete, login.
 
 ```tsx
-const { mutate, loading, error, reset } = useLuxoMutation<AuthResult>(
-  (params) => transport.call('login', params),
+const { mutate, loading, error, reset } = useLuxoMutation<Project, CreateProject>(
+  (params) => client.createProject(params),
+  { invalidateQueries: [['projects']] },
 )
-
-async function handleLogin() {
-  const result = await mutate({ username: 'admin', password: '123' })
-  transport.setToken(result.token)
-}
 ```
+
+Mutations are never deduplicated or cached. `loading` remains true until every concurrent mutation settles. `invalidateQueries` accepts static keys or a function derived from the mutation result.
 
 | Return | Type | Description |
 |--------|------|-------------|
@@ -125,24 +139,48 @@ async function handleLogin() {
 | `error` | `Error \| null` | Error if mutation failed |
 | `reset` | `() => void` | Clear error state |
 
-### `LuxoProvider` + `useLuxoClient`
+### `QueryClient`
+
+`QueryClient` owns in-flight requests and optional memory caching. Completed responses are not retained by default.
+
+```tsx
+const queryClient = new QueryClient({ staleTime: 0, gcTime: 0 })
+
+queryClient.prefetchQuery({
+  queryKey: ['project', id],
+  queryFn: ({ signal }) => fetchProject(id, signal),
+  staleTime: 10_000,
+})
+
+queryClient.invalidateQueries({ queryKey: ['project'] })
+queryClient.cancelQueries({ queryKey: ['project', id], exact: true })
+queryClient.setQueryData(['project', id], updatedProject)
+```
+
+Supported operations include `fetchQuery`, `prefetchQuery`, `getQueryData`, `getQueryState`, `setQueryData`, `invalidateQueries`, `cancelQueries`, `removeQueries`, and `clear`.
+
+### `LuxoProvider` + `useLuxoClient` + `useQueryClient`
 
 Optional context-based transport injection:
 
 ```tsx
-import { LuxoProvider, useLuxoClient } from '@luxojs/react'
+import { LuxoProvider, QueryClient, useLuxoClient, useQueryClient } from '@luxojs/react'
+
+const queryClient = new QueryClient()
 
 // Root
-<LuxoProvider transport={transport}>
+<LuxoProvider transport={transport} queryClient={queryClient}>
   <App />
 </LuxoProvider>
 
 // Any child component
 function Dashboard() {
   const client = useLuxoClient()
-  // client is the Transport instance
+  const queryClient = useQueryClient()
 }
 ```
+
+Use a separate QueryClient per server-rendered request. Browser applications may rely on the default client when no provider is present.
 
 ## Full Example — With Vite Plugin
 

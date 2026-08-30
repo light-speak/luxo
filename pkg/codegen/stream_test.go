@@ -17,6 +17,20 @@ func TestGenerateStreamFileNoStreams(t *testing.T) {
 	}
 }
 
+func TestGenerateAuthenticatedStreamRejectsAnonymousIdentity(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "test.luxo",
+		APIs: []*ast.ApiDecl{{
+			Name:       "watchPrivate",
+			Directives: []*ast.Directive{{Name: "stream"}, {Name: "auth"}},
+		}},
+	}}}
+	code := string(generateStreamFile(result, "luxo"))
+	if !strings.Contains(code, "if api.IdentityID(identity) == 0") {
+		t.Fatalf("authenticated stream has no identity guard:\n%s", code)
+	}
+}
+
 func TestGenerateStreamFileWithEventSource(t *testing.T) {
 	result := &semantic.Result{
 		Files: []*ast.File{{

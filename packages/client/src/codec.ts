@@ -153,6 +153,13 @@ export class Encoder {
     this.buf[this.pos++] = v ? 1 : 0
   }
 
+  /** Write bytes without a length prefix. */
+  writeRawBytes(v: Uint8Array): void {
+    this.grow(v.length)
+    this.buf.set(v, this.pos)
+    this.pos += v.length
+  }
+
   /** Write a fixed 16-byte UUID (no length prefix). Accepts a canonical string or raw bytes. */
   writeUUID(v: string | Uint8Array): void {
     const bytes = typeof v === 'string' ? parseUUID(v) : v

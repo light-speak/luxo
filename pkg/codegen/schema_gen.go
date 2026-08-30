@@ -19,6 +19,7 @@ type schemaAPIInfo struct {
 	params     []*ast.ParamDecl
 	returnType *ast.TypeRef
 	paginated  bool
+	stream     bool
 	directives []*ast.Directive
 }
 
@@ -64,7 +65,11 @@ func generateSchemaFile(result *semantic.Result, packageName string, enums map[s
 
 	apis := collectSchemaAPIs(result, enums, modelOwner)
 
-	if len(models) == 0 && len(stubs) == 0 && len(apis) == 0 {
+	declarationCount := 0
+	for _, file := range result.Files {
+		declarationCount += len(file.Types) + len(file.Enums)
+	}
+	if len(models) == 0 && len(stubs) == 0 && len(apis) == 0 && declarationCount == 0 {
 		return nil
 	}
 
@@ -79,18 +84,22 @@ func generateSchemaFile(result *semantic.Result, packageName string, enums map[s
 	// Register models
 	allModels := append(models, stubs...)
 	for _, m := range allModels {
-		writeModelRegistration(&b, m, enums, extendFieldModules[m.Name])
+		writeModelRegistration(&b, m, modelOwner[m.Name], enums, extendFieldModules[m.Name])
 	}
 
 	// Register APIs
 	for _, api := range apis {
-		writeAPIRegistrationSchema(&b, api.name, api.moduleName, api.params, api.returnType, api.paginated, api.directives)
+		writeAPIRegistrationSchema(&b, api.name, api.moduleName, api.params, api.returnType, api.paginated, api.stream, api.directives)
 	}
 
 	// Register type declarations (non-DB types like AuthPayload)
 	for _, file := range result.Files {
+		moduleName := moduleNameFromFile(file.Name)
 		for _, t := range file.Types {
-			writeTypeRegistration(&b, t, enums)
+			writeTypeRegistration(&b, t, moduleName, enums)
+		}
+		for _, enumDecl := range file.Enums {
+			writeEnumRegistration(&b, enumDecl, moduleName)
 		}
 	}
 
@@ -120,7 +129,7 @@ func collectSchemaAPIs(result *semantic.Result, enums map[string]bool, modelOwne
 		for _, api := range file.APIs {
 			apis = append(apis, schemaAPIInfo{
 				name: api.Name, moduleName: modName,
-				params: api.Params, returnType: api.ReturnType, directives: api.Directives,
+				params: api.Params, returnType: api.ReturnType, stream: hasDirective(api.Directives, "stream"), directives: api.Directives,
 			})
 		}
 		for _, fn := range file.Functions {
@@ -175,10 +184,13 @@ func buildCrudAPIInfo(modelName, op, modName string) schemaAPIInfo {
 
 // writeModelRegistration generates schema.RegisterModel for one model.
 // extendModules maps fieldName → source module for extend fields.
-func writeModelRegistration(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool, extendModules map[string]string) {
+func writeModelRegistration(b *strings.Builder, m *ast.ModelDecl, moduleName string, enums map[string]bool, extendModules map[string]string) {
 	name := m.Name
 	fmt.Fprintf(b, "\ts.RegisterModel(&schema.Model{\n")
 	fmt.Fprintf(b, "\t\tName: %q,\n", name)
+	if moduleName != "" {
+		fmt.Fprintf(b, "\t\tModule: %q,\n", moduleName)
+	}
 	fmt.Fprintf(b, "\t\tFields: []schema.Field{\n")
 
 	for _, f := range m.Fields {
@@ -220,9 +232,10 @@ func writeModelRegistration(b *strings.Builder, m *ast.ModelDecl, enums map[stri
 }
 
 // writeTypeRegistration generates schema.RegisterType for a type declaration.
-func writeTypeRegistration(b *strings.Builder, t *ast.TypeDecl, enums map[string]bool) {
+func writeTypeRegistration(b *strings.Builder, t *ast.TypeDecl, moduleName string, enums map[string]bool) {
 	fmt.Fprintf(b, "\ts.RegisterType(&schema.TypeDecl{\n")
 	fmt.Fprintf(b, "\t\tName: %q,\n", t.Name)
+	fmt.Fprintf(b, "\t\tModule: %q,\n", moduleName)
 	fmt.Fprintf(b, "\t\tFields: []schema.Field{\n")
 
 	for _, f := range t.Fields {
@@ -233,8 +246,14 @@ func writeTypeRegistration(b *strings.Builder, t *ast.TypeDecl, enums map[string
 		if fieldID == 0 {
 			continue
 		}
-		fieldType := luxoTypeToSchemaType(f.Type.Name, enums)
 		relation := isRelationField(f, enums)
+		fieldType := luxoTypeToSchemaType(f.Type.Name, enums)
+		if relation {
+			// Nested type/model reference — the converter dispatches blob
+			// decoding on Type==FieldModel; FieldString would misread the
+			// blob as a scalar string array.
+			fieldType = "FieldModel"
+		}
 		fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, TypeName: %q, Nullable: %v, IsList: %v, Relation: %v},\n",
 			fieldID, f.Name, fieldType, f.Type.Name, f.Type.Nullable, f.Type.IsList, relation)
 	}
@@ -243,8 +262,19 @@ func writeTypeRegistration(b *strings.Builder, t *ast.TypeDecl, enums map[string
 	fmt.Fprintf(b, "\t})\n")
 }
 
+func writeEnumRegistration(b *strings.Builder, enumDecl *ast.EnumDecl, moduleName string) {
+	fmt.Fprintf(b, "\ts.RegisterEnum(&schema.Enum{Name: %q, Module: %q, Values: []string{", enumDecl.Name, moduleName)
+	for index, value := range enumDecl.Values {
+		if index > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(b, "%q", value)
+	}
+	b.WriteString("}})\n")
+}
+
 // writeAPIRegistrationSchema generates schema.RegisterAPI for one API.
-func writeAPIRegistrationSchema(b *strings.Builder, name, moduleName string, params []*ast.ParamDecl, returnType *ast.TypeRef, paginated bool, directives ...[]*ast.Directive) {
+func writeAPIRegistrationSchema(b *strings.Builder, name, moduleName string, params []*ast.ParamDecl, returnType *ast.TypeRef, paginated, stream bool, directives ...[]*ast.Directive) {
 	apiID := getAPIID(name)
 	fmt.Fprintf(b, "\ts.RegisterAPI(&schema.API{\n")
 	fmt.Fprintf(b, "\t\tID: %d, Name: %q, Module: %q,\n", apiID, name, moduleName)
@@ -253,6 +283,9 @@ func writeAPIRegistrationSchema(b *strings.Builder, name, moduleName string, par
 	}
 	if paginated {
 		fmt.Fprintf(b, "\t\tPaginated: true,\n")
+	}
+	if stream {
+		fmt.Fprintf(b, "\t\tStream: true,\n")
 	}
 	// @deprecated
 	if len(directives) > 0 {
@@ -273,15 +306,23 @@ func writeAPIRegistrationSchema(b *strings.Builder, name, moduleName string, par
 			paramID := getAPIParamID(name, p.Name)
 			pType := "FieldString"
 			isList := false
+			nullable := false
 			if p.Type != nil {
 				pType = luxoTypeToSchemaType(p.Type.Name, nil)
 				isList = p.Type.IsList
+				nullable = p.Type.Nullable
 			}
+			fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, TypeName: %q", paramID, p.Name, pType, p.Type.Name)
 			if isList {
-				fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, IsList: true},\n", paramID, p.Name, pType)
-			} else {
-				fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s},\n", paramID, p.Name, pType)
+				b.WriteString(", IsList: true")
 			}
+			if nullable {
+				b.WriteString(", Nullable: true")
+			}
+			if p.Default != nil {
+				b.WriteString(", HasDefault: true")
+			}
+			b.WriteString("},\n")
 		}
 		fmt.Fprintf(b, "\t\t},\n")
 	}
@@ -372,7 +413,7 @@ func buildSchemaModels(s *schema.Schema, result *semantic.Result, enums map[stri
 	}
 
 	for _, m := range models {
-		sm := &schema.Model{Name: m.Name}
+		sm := &schema.Model{Name: m.Name, Module: modelModule[m.Name]}
 		ownerModule := modelModule[m.Name]
 		for _, f := range m.Fields {
 			if f.Type == nil || f.Computed != nil {
@@ -458,11 +499,15 @@ func buildSchemaAPIs(s *schema.Schema, result *semantic.Result, enums map[string
 				a.ReturnList = api.ReturnType.IsList
 			}
 			a.Paginated = hasDirective(api.Directives, "paginate")
+			a.Stream = hasDirective(api.Directives, "stream")
 			for _, p := range api.Params {
 				a.Params = append(a.Params, schema.Param{
 					ID: getAPIParamID(api.Name, p.Name), Name: p.Name,
-					Type:   luxoTypeToSchemaFieldType(p.Type.Name, enums),
-					IsList: p.Type.IsList,
+					Type:       luxoTypeToSchemaFieldType(p.Type.Name, enums),
+					TypeName:   p.Type.Name,
+					IsList:     p.Type.IsList,
+					Nullable:   p.Type.Nullable,
+					HasDefault: p.Default != nil,
 				})
 			}
 			s.RegisterAPI(a)
@@ -473,7 +518,7 @@ func buildSchemaAPIs(s *schema.Schema, result *semantic.Result, enums map[string
 func buildSchemaEnums(s *schema.Schema, result *semantic.Result) {
 	for _, file := range result.Files {
 		for _, e := range file.Enums {
-			s.RegisterEnum(&schema.Enum{Name: e.Name, Values: e.Values})
+			s.RegisterEnum(&schema.Enum{Name: e.Name, Module: moduleNameFromFile(file.Name), Values: e.Values})
 		}
 	}
 }
@@ -481,7 +526,7 @@ func buildSchemaEnums(s *schema.Schema, result *semantic.Result) {
 func buildSchemaTypes(s *schema.Schema, result *semantic.Result, enums map[string]bool) {
 	for _, file := range result.Files {
 		for _, t := range file.Types {
-			st := &schema.TypeDecl{Name: t.Name}
+			st := &schema.TypeDecl{Name: t.Name, Module: moduleNameFromFile(file.Name)}
 			for _, f := range t.Fields {
 				if f.Type == nil {
 					continue

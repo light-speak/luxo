@@ -1,8 +1,10 @@
 package luvia
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -21,8 +23,10 @@ func TestAuthMiddlewareValidToken(t *testing.T) {
 	token, _ := auth.Sign(cfg, map[string]any{"id": float64(42), "role": "admin"})
 
 	var gotIdentity *Claims
+	var gotToken string
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotIdentity = Identity(r.Context())
+		gotToken = BearerToken(r.Context())
 		w.WriteHeader(200)
 	})
 
@@ -41,6 +45,39 @@ func TestAuthMiddlewareValidToken(t *testing.T) {
 	}
 	if gotIdentity.String("role") != "admin" {
 		t.Errorf("role = %v", gotIdentity.String("role"))
+	}
+	if gotToken != token {
+		t.Errorf("bearer token = %q, want signed token", gotToken)
+	}
+}
+
+func TestAuthMiddlewareAcceptsWebSocketQueryToken(t *testing.T) {
+	cfg := testCfg()
+	token, _ := auth.Sign(cfg, map[string]any{"id": float64(42)})
+	var identity *Claims
+	handler := AuthMiddleware(cfg, http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		identity = Identity(r.Context())
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/luvia?token="+url.QueryEscape(token), nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+	if identity == nil || identity.ID() != 42 {
+		t.Fatalf("websocket query token identity = %#v", identity)
+	}
+}
+
+func TestAuthMiddlewareRejectsHTTPQueryToken(t *testing.T) {
+	cfg := testCfg()
+	token, _ := auth.Sign(cfg, map[string]any{"id": float64(42)})
+	var identity *Claims
+	handler := AuthMiddleware(cfg, http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		identity = Identity(r.Context())
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/luvia?token="+url.QueryEscape(token), nil)
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+	if identity != nil {
+		t.Fatal("ordinary HTTP request must not accept query token")
 	}
 }
 
@@ -112,6 +149,12 @@ func TestIdentityNoContext(t *testing.T) {
 	id := Identity(r.Context())
 	if id != nil {
 		t.Error("should return nil for no identity")
+	}
+}
+
+func TestBearerTokenEmptyContext(t *testing.T) {
+	if got := BearerToken(context.Background()); got != "" {
+		t.Fatalf("BearerToken() = %q, want empty", got)
 	}
 }
 

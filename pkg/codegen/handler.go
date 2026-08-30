@@ -131,10 +131,10 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 
 	features := detectHandlerFeatures(result, models, inferredAPIs, modelMap)
 
+	// Body is generated into its own builder first so the import block can be
+	// derived from what the generated code actually references (e.g. a module
+	// whose native list handlers all became columnar no longer needs codec).
 	var b strings.Builder
-	writeHeader(&b, packageName, "handler.gen.go")
-
-	writeHandlerImports(&b, result, models, features)
 
 	// Generate defaultCols for models with @hidden fields (excludes hidden from SELECT *)
 	for _, m := range models {
@@ -178,7 +178,12 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	// Federation resolve endpoints — svc:resolve:{Model}:{FK} for cross-module extends
 	generateFederationResolvers(&b, result, models, enums)
 
-	return []byte(b.String())
+	body := b.String()
+	var out strings.Builder
+	writeHeader(&out, packageName, "handler.gen.go")
+	writeHandlerImports(&out, result, models, features, strings.Contains(body, "codec."), body)
+	out.WriteString(body)
+	return []byte(out.String())
 }
 
 func generateCRUDHandlers(b *strings.Builder, models []*ast.ModelDecl, enums map[string]bool, skipNames map[string]bool) {
@@ -271,13 +276,21 @@ func generateServiceFnHandlers(b *strings.Builder, result *semantic.Result, mode
 // generateNativeAPIHandlers generates handlers for api @native declarations.
 // Returns native API names for registration in RegisterHandlers.
 func generateNativeAPIHandlers(b *strings.Builder, result *semantic.Result) []string {
+	// Model names — list returns need the []Model → []*Model adapter for
+	// WriteColumnar (types get a value-slice writer, models a pointer-slice one)
+	models := make(map[string]bool)
+	for _, file := range result.Files {
+		for _, m := range file.Models {
+			models[m.Name] = true
+		}
+	}
 	var names []string
 	for _, file := range result.Files {
 		for _, api := range file.APIs {
 			if !hasDirective(api.Directives, "native") {
 				continue
 			}
-			generateNativeAPIHandler(b, api)
+			generateNativeAPIHandler(b, api, models)
 			names = append(names, api.Name)
 		}
 	}
@@ -285,7 +298,7 @@ func generateNativeAPIHandlers(b *strings.Builder, result *semantic.Result) []st
 }
 
 // generateNativeAPIHandler generates a single handler for an api @native declaration.
-func generateNativeAPIHandler(b *strings.Builder, api *ast.ApiDecl) {
+func generateNativeAPIHandler(b *strings.Builder, api *ast.ApiDecl, models map[string]bool) {
 	name := api.Name
 	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(name))
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
@@ -328,49 +341,62 @@ func generateNativeAPIHandler(b *strings.Builder, api *ast.ApiDecl) {
 
 	// Write response
 	if api.ReturnType != nil {
-		writeNativeReturnEncoding(b, api.ReturnType)
+		writeNativeReturnEncoding(b, api.ReturnType, models)
 	}
 	fmt.Fprintf(b, "\t\treturn nil\n")
 	fmt.Fprintf(b, "\t}\n}\n\n")
 }
 
 // writeNativeReturnEncoding writes the binary encoding for a native API return value.
-func writeNativeReturnEncoding(b *strings.Builder, rt *ast.TypeRef) {
+func writeNativeReturnEncoding(b *strings.Builder, rt *ast.TypeRef, models map[string]bool) {
 	if rt.IsList {
-		writeNativeListEncoding(b, rt)
+		writeNativeListEncoding(b, rt, models)
 		return
 	}
 	writeNativeScalarEncoding(b, rt, "result")
 }
 
-// writeNativeListEncoding writes length-prefixed list encoding.
-func writeNativeListEncoding(b *strings.Builder, rt *ast.TypeRef) {
-	fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(len(result)))\n")
+// writeNativeListEncoding writes list encoding. Primitive lists are
+// length-prefixed; struct lists are columnar — the wire protocol for all
+// list responses (Luvia's BinaryListToJSON reads columnar).
+func writeNativeListEncoding(b *strings.Builder, rt *ast.TypeRef, models map[string]bool) {
 	// Check if element is a primitive type
 	elemRef := &ast.TypeRef{Name: rt.Name}
 	goType := resolveGoType(elemRef)
 	switch goType {
 	case "int64":
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(len(result)))\n")
 		fmt.Fprintf(b, "\t\tfor _, v := range result {\n")
 		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, v)\n")
 		fmt.Fprintf(b, "\t\t}\n")
 	case "float64":
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(len(result)))\n")
 		fmt.Fprintf(b, "\t\tfor _, v := range result {\n")
 		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendFixed64(req.Buf.B, v)\n")
 		fmt.Fprintf(b, "\t\t}\n")
 	case "string":
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(len(result)))\n")
 		fmt.Fprintf(b, "\t\tfor _, v := range result {\n")
 		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendString(req.Buf.B, v)\n")
 		fmt.Fprintf(b, "\t\t}\n")
 	case "bool":
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(len(result)))\n")
 		fmt.Fprintf(b, "\t\tfor _, v := range result {\n")
 		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendBool(req.Buf.B, v)\n")
 		fmt.Fprintf(b, "\t\t}\n")
 	default:
-		// Struct type — use WriteLuxo per element
-		fmt.Fprintf(b, "\t\tfor i := range result {\n")
-		fmt.Fprintf(b, "\t\t\tresult[i].WriteLuxo(req.Buf, req.FieldMask)\n")
-		fmt.Fprintf(b, "\t\t}\n")
+		if models[rt.Name] {
+			// Model list — resolver returns []Model but WriteColumnarModel
+			// takes []*Model (DB loaders produce pointer slices); adapt.
+			fmt.Fprintf(b, "\t\t_ptrs := make([]*%s, len(result))\n", rt.Name)
+			fmt.Fprintf(b, "\t\tfor i := range result {\n")
+			fmt.Fprintf(b, "\t\t\t_ptrs[i] = &result[i]\n")
+			fmt.Fprintf(b, "\t\t}\n")
+			fmt.Fprintf(b, "\t\tWriteColumnar%s(req.Buf, _ptrs, req.FieldMask)\n", rt.Name)
+		} else {
+			// Type declaration list — value-slice columnar writer
+			fmt.Fprintf(b, "\t\tWriteColumnar%s(req.Buf, result, req.FieldMask)\n", rt.Name)
+		}
 	}
 }
 
@@ -506,7 +532,7 @@ func needsFmtImport(models []*ast.ModelDecl, hasEmit bool) bool {
 	return false
 }
 
-func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*ast.ModelDecl, feat handlerFeatures) {
+func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*ast.ModelDecl, feat handlerFeatures, needsCodec bool, generatedBody ...string) {
 	hasOrGroups := feat.hasOrGroups
 	hasSortable := feat.hasSortable
 	hasAwait := feat.hasAwait
@@ -518,6 +544,20 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 	needsJSON := scanModelsForJSON(models)
 	hasValidation, hasPattern := scanModelsForValidation(models)
 	needsFmt := needsFmtImport(models, feat.hasEmit)
+	if len(generatedBody) > 0 {
+		body := generatedBody[0]
+		hasOrGroups = strings.Contains(body, "strconv.")
+		hasSortable = strings.Contains(body, "strings.")
+		hasTemplateStr = false
+		hasAuth = strings.Contains(body, "luvia.")
+		hasHash = false
+		feat.hasCrypto = strings.Contains(body, "luxocrypto.")
+		hasTime = strings.Contains(body, "time.")
+		needsJSON = strings.Contains(body, "json.")
+		needsFmt = strings.Contains(body, "fmt.")
+		hasValidation = false
+		hasPattern = strings.Contains(body, "regexp.")
+	}
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
 	if needsFmt {
@@ -545,7 +585,9 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux\"\n")
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
+	if needsCodec {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
+	}
 	if hasHash || feat.hasCrypto {
 		b.WriteString("\tluxocrypto \"github.com/light-speak/luxo/pkg/lux/crypto\"\n")
 	}
@@ -675,15 +717,16 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		colsExpr = fmt.Sprintf("selection.SQLColumnsOr(req.Select, default%sCols)", name)
 	}
 
-	// @withAuth on model → all CRUD handlers require auth
-	needAuth := hasDirective(m.Directives, "withAuth")
+	// @withAuth marks the identity model; @auth protects arbitrary model CRUD.
+	modelAuth := findDirective(m.Directives, "auth")
+	needAuth := hasDirective(m.Directives, "withAuth") || modelAuth != nil
 
 	switch op {
 	case "get":
 		fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 		if needAuth {
-			writeAuthCheck(b, "\t\t")
+			writeCRUDAuthCheck(b, "\t\t", modelAuth)
 		}
 		writeParamID(b, idType, "\t\t")
 		fmt.Fprintf(b, "\t\tcols := %s\n", colsExpr)
@@ -704,7 +747,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 		if needAuth {
-			writeAuthCheck(b, "\t\t")
+			writeCRUDAuthCheck(b, "\t\t", modelAuth)
 		}
 		fmt.Fprintf(b, "\t\tcols := %s\n", colsExpr)
 		writeFKEnsure(b, rels)
@@ -730,17 +773,17 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		fmt.Fprintf(b, "\t}\n}\n\n")
 
 	case "create":
-		generateCreateHandler(b, m, apiName, enums, needAuth)
+		generateCreateHandler(b, m, apiName, enums, needAuth, modelAuth)
 
 	case "update":
-		generateUpdateHandler(b, m, apiName, idType, enums, needAuth)
+		generateUpdateHandler(b, m, apiName, idType, enums, needAuth, modelAuth)
 
 	case "delete":
 		soft := isSoftDelete(m)
 		fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 		if needAuth {
-			writeAuthCheck(b, "\t\t")
+			writeCRUDAuthCheck(b, "\t\t", modelAuth)
 		}
 		writeParamID(b, idType, "\t\t")
 		if soft {
@@ -760,7 +803,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 		if needAuth {
-			writeAuthCheck(b, "\t\t")
+			writeCRUDAuthCheck(b, "\t\t", modelAuth)
 		}
 		switch idType {
 		case "int64":
@@ -791,12 +834,12 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 }
 
 // generateCreateHandler generates a create handler that reads params and calls Create().
-func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string, enums map[string]bool, needAuth bool) {
+func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string, enums map[string]bool, needAuth bool, modelAuth *ast.Directive) {
 	name := m.Name
 	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 	if needAuth {
-		writeAuthCheck(b, "\t\t")
+		writeCRUDAuthCheck(b, "\t\t", modelAuth)
 	}
 	fmt.Fprintf(b, "\t\tbuilder := app.%s.Create()\n", name)
 
@@ -827,12 +870,12 @@ func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string,
 }
 
 // generateUpdateHandler generates an update handler.
-func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType string, enums map[string]bool, needAuth bool) {
+func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType string, enums map[string]bool, needAuth bool, modelAuth *ast.Directive) {
 	name := m.Name
 	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 	if needAuth {
-		writeAuthCheck(b, "\t\t")
+		writeCRUDAuthCheck(b, "\t\t", modelAuth)
 	}
 	writeParamID(b, idType, "\t\t")
 	fmt.Fprintf(b, "\t\texisting, err := app.%s.Find(ctx, id)\n", name)
@@ -1265,7 +1308,8 @@ func writeAPIRegistration(b *strings.Builder, name string) {
 // Falls back to inferParamType heuristic if no AST info available.
 func resolveParamTypeFromAST(apiName, paramName string) string {
 	if apiParamTypes != nil {
-		if params, ok := apiParamTypes[apiName]; ok {
+		lookupName := strings.TrimPrefix(apiName, "svc:")
+		if params, ok := apiParamTypes[lookupName]; ok {
 			if t, ok := params[paramName]; ok {
 				return t
 			}
@@ -1500,6 +1544,14 @@ func bodyContainsTemplateString(block *ast.Block) bool {
 	return false
 }
 
+func writeCRUDAuthCheck(b *strings.Builder, indent string, modelAuth *ast.Directive) {
+	if modelAuth != nil {
+		writeAuthCheck(b, indent, modelAuth)
+		return
+	}
+	writeAuthCheck(b, indent)
+}
+
 // writeAuthCheck generates the identity nil-check guard at the start of a handler.
 // Used by CRUD handlers (@withAuth on model) and compiled APIs (@auth on API).
 //
@@ -1563,9 +1615,14 @@ func writeAuthCheck(b *strings.Builder, indent string, directives ...*ast.Direct
 		fmt.Fprintf(b, "%sif identity.String(\"role\") == %q { _authorized = true }\n", indent, roles[0])
 	} else if len(roles) > 1 {
 		fmt.Fprintf(b, "%sswitch identity.String(\"role\") {\n", indent)
-		for _, role := range roles {
-			fmt.Fprintf(b, "%scase %q:\n", indent, role)
+		fmt.Fprintf(b, "%scase ", indent)
+		for index, role := range roles {
+			if index > 0 {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(b, "%q", role)
 		}
+		b.WriteString(":\n")
 		fmt.Fprintf(b, "%s\t_authorized = true\n", indent)
 		fmt.Fprintf(b, "%s}\n", indent)
 	}
@@ -1649,7 +1706,7 @@ func pluralize(name string) string {
 // detectAuthNeeded checks if luvia import is needed in handler.gen.go.
 func detectAuthNeeded(result *semantic.Result, models []*ast.ModelDecl) bool {
 	for _, m := range models {
-		if hasDirective(m.Directives, "withAuth") {
+		if hasDirective(m.Directives, "withAuth") || hasDirective(m.Directives, "auth") {
 			return true
 		}
 	}

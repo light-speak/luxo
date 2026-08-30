@@ -268,6 +268,18 @@ func buildParamTypesFromAST(files []*ast.File) map[string]map[string]string {
 			}
 			types[a.Name] = m
 		}
+		for _, fn := range file.Functions {
+			if !hasASTDirective(fn.Directives, "service") || len(fn.Params) == 0 {
+				continue
+			}
+			m := make(map[string]string, len(fn.Params))
+			for _, p := range fn.Params {
+				if p.Type != nil {
+					m[p.Name] = p.Type.Name
+				}
+			}
+			types[fn.Name] = m
+		}
 		for _, model := range file.Models {
 			hasCrud := false
 			for _, d := range model.Directives {
@@ -308,6 +320,15 @@ func buildParamTypesFromAST(files []*ast.File) map[string]map[string]string {
 		}
 	}
 	return types
+}
+
+func hasASTDirective(directives []*ast.Directive, name string) bool {
+	for _, directive := range directives {
+		if directive.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func generateModules(files []*ast.File, result *semantic.Result) (int, error) {
@@ -355,6 +376,17 @@ func generateModules(files []*ast.File, result *semantic.Result) (int, error) {
 			total++
 		}
 
+		// Remove stale .gen.go files whose declarations were removed from the
+		// origin — a generator returning nil no longer overwrites its old output.
+		removed, err := cleanStaleGenFiles(outDir, gr.Files)
+		if err != nil {
+			return 0, err
+		}
+		for _, name := range removed {
+			red := "\033[31m"
+			fmt.Printf("  %s-%s %s\n", red, reset, filepath.Join(outDir, name))
+		}
+
 		// Auto-create resolver package if it doesn't exist
 		resolverDir := filepath.Join("service", moduleName, "resolver")
 		resolverFile := filepath.Join(resolverDir, "resolver.go")
@@ -373,6 +405,32 @@ func generateModules(files []*ast.File, result *semantic.Result) (int, error) {
 		}
 	}
 	return total, nil
+}
+
+// cleanStaleGenFiles deletes *.gen.go files in dir that are not part of the
+// current generation run (their origin declarations were removed). Handwritten
+// files are never touched — only the .gen.go suffix is eligible.
+// Returns the removed file names.
+func cleanStaleGenFiles(dir string, written map[string][]byte) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", dir, err)
+	}
+	var removed []string
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".gen.go") {
+			continue
+		}
+		if _, ok := written[name]; ok {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, name)); err != nil {
+			return nil, fmt.Errorf("remove stale %s: %w", name, err)
+		}
+		removed = append(removed, name)
+	}
+	return removed, nil
 }
 
 func goModulePath() string {

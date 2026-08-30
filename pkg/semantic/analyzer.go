@@ -979,6 +979,7 @@ func (a *Analyzer) resolveFieldDecl(f *ast.FieldDecl) *FieldInfo {
 	}
 
 	a.checkFieldDirectives(f)
+	a.checkTransformDirective(f, fi.Type)
 	return fi
 }
 

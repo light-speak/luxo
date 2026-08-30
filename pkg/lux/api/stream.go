@@ -22,6 +22,7 @@ type StreamSub struct {
 	Params    *StreamParams      // subscription parameters (roomId, etc.)
 	Identity  any                // authenticated user (nil if no @auth)
 	FieldMask []byte             // which fields the client wants
+	Binary    bool               // negotiated Luxo binary mode
 	cancel    context.CancelFunc // cancel this sub's write pump
 }
 
@@ -142,11 +143,17 @@ const MaxSubscribersPerAPI = 10000
 // Typically this cancels the subscriber's context, causing WritePump to exit.
 // Returns nil if the per-API subscriber limit is reached.
 func (h *StreamHub) Subscribe(apiName string, params map[string]any, identity any, fieldMask []byte, cancel context.CancelFunc) *StreamSub {
+	return h.SubscribeMode(apiName, params, identity, fieldMask, false, cancel)
+}
+
+// SubscribeMode adds a subscriber and records its negotiated wire mode.
+func (h *StreamHub) SubscribeMode(apiName string, params map[string]any, identity any, fieldMask []byte, binary bool, cancel context.CancelFunc) *StreamSub {
 	sub := &StreamSub{
 		Ch:        make(chan []byte, 64), // buffered to absorb bursts
 		Params:    &StreamParams{values: params},
 		Identity:  identity,
 		FieldMask: fieldMask,
+		Binary:    binary,
 		cancel:    cancel,
 	}
 
@@ -214,6 +221,28 @@ func (h *StreamHub) Dispatch(apiName string, rawData any, matcher StreamMatcher,
 			encoded = encodeFn(rawData, sub.FieldMask)
 		}
 
+		select {
+		case sub.Ch <- encoded:
+		default:
+			if sub.cancel != nil {
+				sub.cancel()
+			}
+		}
+	}
+}
+
+// DispatchEvent sends an event-derived API result using each subscriber's
+// negotiated JSON or binary mode. matchData is the binary event payload used
+// by generated matchers; encodeFn encodes the stream API's return value.
+func (h *StreamHub) DispatchEvent(apiName string, matchData []byte, matcher StreamMatcher, encodeFn func(fieldMask []byte, binary bool) []byte) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	for _, sub := range h.subs[apiName] {
+		if matcher != nil && !matcher(matchData, sub.Params, sub.Identity) {
+			continue
+		}
+		encoded := encodeFn(sub.FieldMask, sub.Binary)
 		select {
 		case sub.Ch <- encoded:
 		default:

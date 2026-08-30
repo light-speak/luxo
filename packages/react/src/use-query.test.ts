@@ -1,8 +1,84 @@
 import { describe, it, expect, vi } from 'vitest'
 import { renderHook, waitFor, act } from '@testing-library/react'
+import { createElement, StrictMode, type ReactNode } from 'react'
+import { QueryClient } from './query-client'
 import { useLuxoQuery } from './use-query'
 
 describe('useLuxoQuery', () => {
+  it('deduplicates React StrictMode effect replay', async () => {
+    const queryFn = vi.fn(() => Promise.resolve('ready'))
+    const wrapper = ({ children }: { children: ReactNode }) => createElement(StrictMode, null, children)
+    const { result } = renderHook(() => useLuxoQuery(queryFn, []), { wrapper })
+
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    expect(result.current.data).toBe('ready')
+    expect(queryFn).toHaveBeenCalledOnce()
+  })
+
+  it('deduplicates explicit query keys across hook consumers', async () => {
+    const client = new QueryClient()
+    const queryFn = vi.fn(() => Promise.resolve('shared'))
+    const { result } = renderHook(() => {
+      const first = useLuxoQuery(queryFn, [], { queryKey: ['shared'], queryClient: client })
+      const second = useLuxoQuery(queryFn, [], { queryKey: ['shared'], queryClient: client })
+      return { first, second }
+    })
+
+    await waitFor(() => expect(result.current.second.loading).toBe(false))
+    expect(result.current.first.data).toBe('shared')
+    expect(result.current.second.data).toBe('shared')
+    expect(queryFn).toHaveBeenCalledOnce()
+  })
+
+  it('refetches active queries after prefix invalidation', async () => {
+    const client = new QueryClient({ gcTime: Infinity })
+    const queryFn = vi.fn().mockResolvedValueOnce('old').mockResolvedValueOnce('new')
+    const { result } = renderHook(() => useLuxoQuery(queryFn, [], {
+      queryKey: ['project', 1],
+      queryClient: client,
+      staleTime: Infinity,
+    }))
+    await waitFor(() => expect(result.current.data).toBe('old'))
+
+    act(() => client.invalidateQueries({ queryKey: ['project'] }))
+    await waitFor(() => expect(result.current.data).toBe('new'))
+    expect(queryFn).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not execute disabled queries', () => {
+    const queryFn = vi.fn(() => Promise.resolve('never'))
+    const { result } = renderHook(() => useLuxoQuery(queryFn, [], { enabled: false }))
+
+    expect(result.current.loading).toBe(false)
+    expect(queryFn).not.toHaveBeenCalled()
+  })
+
+  it('aborts an unobserved request after a real unmount', async () => {
+    let signal: AbortSignal | undefined
+    const { unmount } = renderHook(() => useLuxoQuery(context => {
+      signal = context.signal
+      return new Promise<string>(() => {})
+    }, []))
+
+    expect(signal?.aborted).toBe(false)
+    unmount()
+    await act(async () => { await Promise.resolve() })
+    expect(signal?.aborted).toBe(true)
+  })
+
+  it('leaves loading state after external cancellation', async () => {
+    const client = new QueryClient({ gcTime: Infinity })
+    const { result } = renderHook(() => useLuxoQuery(
+      () => new Promise<string>(() => {}),
+      [],
+      { queryKey: ['cancelled'], queryClient: client },
+    ))
+    expect(result.current.loading).toBe(true)
+
+    act(() => client.cancelQueries({ queryKey: ['cancelled'], exact: true }))
+    await waitFor(() => expect(result.current.loading).toBe(false))
+  })
+
   it('starts in loading state', () => {
     const queryFn = vi.fn(() => new Promise<string>(() => {})) // never resolves
     const { result } = renderHook(() => useLuxoQuery(queryFn, []))

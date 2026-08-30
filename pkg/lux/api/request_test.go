@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func makeReq(body string) *http.Request {
@@ -310,6 +311,65 @@ func TestParamJSON(t *testing.T) {
 	}
 }
 
+func TestParamJSONNullableMissing(t *testing.T) {
+	// Nullable params (double-pointer targets) tolerate a missing key —
+	// omitting an optional param must NOT 400, matching the binary path.
+	req, _ := ParseRequest(makeReq(`{"$api":"test"}`))
+
+	var s *string
+	if err := req.ParamJSON("name", &s); err != nil {
+		t.Fatalf("missing nullable string param should not error: %v", err)
+	}
+	if s != nil {
+		t.Errorf("missing param should leave target nil, got %v", *s)
+	}
+
+	var i *int64
+	if err := req.ParamJSON("count", &i); err != nil {
+		t.Fatalf("missing nullable int param should not error: %v", err)
+	}
+	var f *float64
+	if err := req.ParamJSON("ratio", &f); err != nil {
+		t.Fatalf("missing nullable float param should not error: %v", err)
+	}
+	var b *bool
+	if err := req.ParamJSON("flag", &b); err != nil {
+		t.Fatalf("missing nullable bool param should not error: %v", err)
+	}
+	var tm *time.Time
+	if err := req.ParamJSON("at", &tm); err != nil {
+		t.Fatalf("missing nullable datetime param should not error: %v", err)
+	}
+	var d *time.Duration
+	if err := req.ParamJSON("ttl", &d); err != nil {
+		t.Fatalf("missing nullable duration param should not error: %v", err)
+	}
+}
+
+func TestParamJSONNullableNull(t *testing.T) {
+	// Explicit null is equivalent to omitting the param.
+	req, _ := ParseRequest(makeReq(`{"$api":"test","name":null}`))
+	var s *string
+	if err := req.ParamJSON("name", &s); err != nil {
+		t.Fatalf("null nullable param should not error: %v", err)
+	}
+	if s != nil {
+		t.Errorf("null param should leave target nil, got %v", *s)
+	}
+}
+
+func TestParamJSONRequiredStillMissing(t *testing.T) {
+	// Required custom-type params (single-pointer struct targets) must still
+	// report missing.
+	req, _ := ParseRequest(makeReq(`{"$api":"test"}`))
+	var target struct {
+		Name string `json:"name"`
+	}
+	if err := req.ParamJSON("input", &target); err == nil {
+		t.Fatal("missing required param should error")
+	}
+}
+
 func TestParamJSONWrongType(t *testing.T) {
 	req, _ := ParseRequest(makeReq(`{"$api":"test","input":"not_object"}`))
 	var target struct {
@@ -332,6 +392,17 @@ func TestParseRequestWithFilters(t *testing.T) {
 	}
 	if req.Filters[0].Field != "role" || req.Filters[0].Operator != "eq" || req.Filters[0].Value != "ADMIN" {
 		t.Errorf("filter = %+v", req.Filters[0])
+	}
+}
+
+func TestParseRequestWithScalarFilterValues(t *testing.T) {
+	body := `{"$api":"listNodes","$filters":[{"field":"projectId","op":"eq","value":42},{"field":"enabled","op":"eq","value":true}]}`
+	req, err := ParseRequest(makeReq(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(req.Filters) != 2 || req.Filters[0].Value != "42" || req.Filters[1].Value != "true" {
+		t.Fatalf("filters = %+v", req.Filters)
 	}
 }
 

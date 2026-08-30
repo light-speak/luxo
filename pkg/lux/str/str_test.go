@@ -150,12 +150,57 @@ func TestMask(t *testing.T) {
 	}
 }
 
+func TestMaskPattern(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		pattern string
+		want    string
+	}{
+		{name: "phone", value: "13812345678", pattern: "###****####", want: "138****5678"},
+		{name: "identity", value: "11010519491231002X", pattern: "####**********####", want: "1101**********002X"},
+		{name: "unicode", value: "张三丰", pattern: "#**", want: "张**"},
+		{name: "length mismatch", value: "13812345678", pattern: "###****###", want: "***********"},
+		{name: "invalid pattern", value: "secret", pattern: "##x***", want: "******"},
+		{name: "empty pattern", value: "secret", pattern: "", want: "******"},
+		{name: "empty value", value: "", pattern: "", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := MaskPattern(tt.value, tt.pattern); got != tt.want {
+				t.Errorf("MaskPattern(%q, %q) = %q, want %q", tt.value, tt.pattern, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestMaskEmail(t *testing.T) {
 	if got := MaskEmail("user@example.com"); got != "u***@example.com" {
 		t.Errorf("email mask = %q", got)
 	}
 	if got := MaskEmail("a@b.com"); got != "a@b.com" {
 		t.Errorf("short email should not mask = %q", got)
+	}
+}
+
+var maskPatternSink string
+
+func BenchmarkMaskPattern(b *testing.B) {
+	benchmarks := []struct {
+		name    string
+		value   string
+		pattern string
+	}{
+		{name: "ascii", value: "13812345678", pattern: "###****####"},
+		{name: "unicode", value: "张三丰", pattern: "#**"},
+	}
+	for _, benchmark := range benchmarks {
+		b.Run(benchmark.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				maskPatternSink = MaskPattern(benchmark.value, benchmark.pattern)
+			}
+		})
 	}
 }
 

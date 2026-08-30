@@ -120,8 +120,12 @@ export class WxTransport implements Transport {
     })
   }
 
-  setToken(token: string): void {
-    this.headers['Authorization'] = `Bearer ${token}`
+  setToken(token: string | null): void {
+    if (token) {
+      this.headers['Authorization'] = `Bearer ${token}`
+      return
+    }
+    delete this.headers['Authorization']
   }
 
   setMode(mode: TransportMode): void {

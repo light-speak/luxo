@@ -6,6 +6,19 @@ export interface Page<T> {
   pageSize: number
 }
 
+export type FilterOperator = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' | 'contains' | 'startswith' | 'endswith'
+
+export interface Filter {
+  field: string
+  op: FilterOperator
+  value: string | number | boolean
+}
+
+export interface Sorter {
+  field: string
+  order: 'asc' | 'desc'
+}
+
 /** Luxo schema definition (from introspection) */
 export interface LuxoSchema {
   models: Record<string, LuxoModel>
@@ -47,6 +60,7 @@ export interface LuxoAPI {
   returnType?: string
   returnList?: boolean
   paginated?: boolean
+  stream?: boolean
   params?: LuxoParam[]
 }
 
@@ -55,4 +69,6 @@ export interface LuxoParam {
   name: string
   type: string
   isList?: boolean // true for array params (in/notIn → [T])
+  nullable?: boolean
+  hasDefault?: boolean
 }

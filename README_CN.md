@@ -314,7 +314,7 @@ Luxo 不只是代码更短 — 它是 **AI 写后端最可靠的语言**。
 - [x] 认证运行时（JWT 签发/验证/刷新、Luvia `AuthMiddleware`、`Identity(ctx)`）
 - [x] 标准库（str · slice · math · datetime · crypto · jsonutil · httputil · convert）
 - [x] 项目骨架（`luxo init` + `luxo add` + `luxo gen` + `luxo run`）
-- [x] Dialect 接口可插拔（PG 已实现，MySQL 占位）
+- [x] Dialect 接口可插拔（PostgreSQL 已实现；MySQL、SQLite、MongoDB 为规划目标）
 - [x] `luxo deploy compose` — Dockerfile + docker-compose.yml 生成
 
 ### Phase 3 — 多服务 + Binary ✅
@@ -340,14 +340,14 @@ Luxo 不只是代码更短 — 它是 **AI 写后端最可靠的语言**。
 - [x] `@luxo/react` — `useLuxoQuery` hook + `LuxoProvider`
 - [x] Dart SDK（`luxo_client` — HttpTransport + WsTransport + Luxo binary 编解码 + build_runner 字段追踪）
 - [x] Kotlin SDK（`com.luxo.client` — OkHttp + 协程 + Luxo binary 编解码 + Gradle 字段追踪）
-- [ ] Swift SDK（iOS）
+- [x] Swift SDK（`LuxoClient` — URLSession + async/await + Luxo binary codec + SwiftSyntax 字段追踪）
 
-### Phase 5 — 生产 + 生态
+### Phase 5 — 生产 + 生态（进行中）
+- [ ] Luxo Studio（正在开发；后端与 React 前端基础已落地）
 - [ ] HTTP/3 (QUIC) 支持
 - [ ] MCP Server（AI 直接读写 .luxo 项目）
 - [ ] luxo-ai（自然语言 → .luxo → 运行中的 API）
-- [ ] Luxo Studio（监控 · 追踪 · API Playground）
-- [ ] `luxo deploy helm` — Helm Chart 生成
+- [x] `luxo deploy helm` — Helm Chart 生成
 
 ## 贡献
 

@@ -103,6 +103,7 @@ func TestGenerateSchemaFile_Basic(t *testing.T) {
 		"RegisterSchema",
 		"schema.Schema",
 		`Name: "User"`,
+		`Module: "user"`,
 		"schema.Field{",
 		`Name: "id"`,
 		"schema.FieldInt",
@@ -112,6 +113,19 @@ func TestGenerateSchemaFile_Basic(t *testing.T) {
 	for _, check := range checks {
 		if !strings.Contains(src, check) {
 			t.Errorf("missing %q in schema:\n%s", check, src)
+		}
+	}
+}
+
+func TestGenerateSchemaFileRegistersEnumsWithModule(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Name:  "origin/auth/member.luxo",
+		Enums: []*ast.EnumDecl{{Name: "Role", Values: []string{"USER", "ADMIN"}}},
+	}}}
+	src := string(generateSchemaFile(result, "luxo", map[string]bool{"Role": true}))
+	for _, want := range []string{`RegisterEnum`, `Name: "Role"`, `Module: "auth"`, `"USER", "ADMIN"`} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("generated schema missing %q:\n%s", want, src)
 		}
 	}
 }
@@ -268,11 +282,12 @@ func TestWriteAPIRegistrationSchema(t *testing.T) {
 	var b strings.Builder
 	params := []*ast.ParamDecl{
 		{Name: "name", Type: &ast.TypeRef{Name: "String"}},
-		{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+		{Name: "email", Type: &ast.TypeRef{Name: "String", Nullable: true}},
+		{Name: "role", Type: &ast.TypeRef{Name: "String"}, Default: &ast.Literal{Value: "MEMBER"}},
 	}
 	retType := &ast.TypeRef{Name: "User"}
 
-	writeAPIRegistrationSchema(&b, "createUser", "user", params, retType, false)
+	writeAPIRegistrationSchema(&b, "createUser", "user", params, retType, false, false)
 	src := b.String()
 
 	checks := []string{
@@ -283,11 +298,51 @@ func TestWriteAPIRegistrationSchema(t *testing.T) {
 		"schema.Param{",
 		`Name: "name"`,
 		`Name: "email"`,
+		`Name: "email", Type: schema.FieldString, TypeName: "String", Nullable: true`,
+		`Name: "role", Type: schema.FieldString, TypeName: "String", HasDefault: true`,
 	}
 	for _, check := range checks {
 		if !strings.Contains(src, check) {
 			t.Errorf("missing %q:\n%s", check, src)
 		}
+	}
+}
+
+func TestBuildSchemaJSON_PreservesOptionalParams(t *testing.T) {
+	oldAPIIDs := apiIDs
+	oldParamIDs := apiParamIDs
+	apiIDs = map[string]int{"createProject": 10}
+	apiParamIDs = map[string]map[string]int{
+		"createProject": {"name": 1, "description": 2, "environment": 3},
+	}
+	defer func() {
+		apiIDs = oldAPIIDs
+		apiParamIDs = oldParamIDs
+	}()
+
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/project.luxo",
+		APIs: []*ast.ApiDecl{{
+			Name:       "createProject",
+			ReturnType: &ast.TypeRef{Name: "Project"},
+			Params: []*ast.ParamDecl{
+				{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+				{Name: "description", Type: &ast.TypeRef{Name: "String", Nullable: true}},
+				{Name: "environment", Type: &ast.TypeRef{Name: "String"}, Default: &ast.Literal{Value: "development"}},
+			},
+		}},
+	}}}
+
+	data, err := BuildSchemaJSON(result, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(data)
+	if !strings.Contains(s, `"name":"description","type":"String","typeName":"String","nullable":true`) {
+		t.Errorf("nullable parameter metadata missing: %s", s)
+	}
+	if !strings.Contains(s, `"name":"environment","type":"String","typeName":"String","hasDefault":true`) {
+		t.Errorf("default parameter metadata missing: %s", s)
 	}
 }
 
@@ -456,7 +511,7 @@ func TestWriteAPIRegistrationSchema_Paginated(t *testing.T) {
 	defer func() { apiIDs = oldAPIIDs }()
 
 	var b strings.Builder
-	writeAPIRegistrationSchema(&b, "listUser", "user", nil, &ast.TypeRef{Name: "User", IsList: true}, true)
+	writeAPIRegistrationSchema(&b, "listUser", "user", nil, &ast.TypeRef{Name: "User", IsList: true}, true, false)
 	src := b.String()
 
 	if !strings.Contains(src, "Paginated: true") {
@@ -636,7 +691,7 @@ func TestWriteTypeRegistration(t *testing.T) {
 	enums := map[string]bool{}
 
 	var b strings.Builder
-	writeTypeRegistration(&b, td, enums)
+	writeTypeRegistration(&b, td, "test", enums)
 	src := b.String()
 
 	checks := []string{
@@ -651,6 +706,36 @@ func TestWriteTypeRegistration(t *testing.T) {
 		if !strings.Contains(src, check) {
 			t.Errorf("missing %q in output:\n%s", check, src)
 		}
+	}
+}
+
+func TestWriteTypeRegistrationRelationFieldModel(t *testing.T) {
+	oldFieldIDs := modelFieldIDs
+	modelFieldIDs = map[string]map[string]int{
+		"MetricTimeSeries": {"apiName": 1, "points": 2},
+	}
+	defer func() { modelFieldIDs = oldFieldIDs }()
+
+	td := &ast.TypeDecl{
+		Name: "MetricTimeSeries",
+		Fields: []*ast.FieldDecl{
+			{Name: "apiName", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "points", Type: &ast.TypeRef{Name: "MetricPoint", IsList: true}},
+		},
+	}
+
+	var b strings.Builder
+	writeTypeRegistration(&b, td, "test", map[string]bool{})
+	src := b.String()
+
+	// Nested type/model references must register as FieldModel — the columnar
+	// converter dispatches blob decoding on Type==FieldModel, and FieldString
+	// would make it misread the blob as a scalar string array.
+	if !strings.Contains(src, `Name: "points", Type: schema.FieldModel, TypeName: "MetricPoint"`) {
+		t.Errorf("relation field should register as FieldModel:\n%s", src)
+	}
+	if !strings.Contains(src, `Name: "apiName", Type: schema.FieldString`) {
+		t.Errorf("scalar field should stay FieldString:\n%s", src)
 	}
 }
 
@@ -813,7 +898,7 @@ func TestWriteModelRegistration_ExtendRelation(t *testing.T) {
 	}
 
 	var b strings.Builder
-	writeModelRegistration(&b, m, nil, extendModules)
+	writeModelRegistration(&b, m, "base", nil, extendModules)
 	code := b.String()
 
 	// Should include relation field with Module and ForeignKey

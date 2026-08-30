@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http/httptest"
@@ -110,6 +111,26 @@ func TestStreamHub_DispatchWithEncode(t *testing.T) {
 	}
 
 	hub.Unsubscribe("test", sub)
+}
+
+func TestStreamHubDispatchEventUsesTransportMode(t *testing.T) {
+	hub := NewStreamHub()
+	jsonSub := hub.SubscribeMode("watch", nil, nil, nil, false, nil)
+	binarySub := hub.SubscribeMode("watch", nil, nil, []byte{1}, true, nil)
+
+	hub.DispatchEvent("watch", []byte{9}, nil, func(mask []byte, binary bool) []byte {
+		if binary {
+			return append([]byte{2}, mask...)
+		}
+		return []byte(`{"id":1}`)
+	})
+
+	if got := string(<-jsonSub.Ch); got != `{"id":1}` {
+		t.Fatalf("json payload = %q", got)
+	}
+	if got := <-binarySub.Ch; !bytes.Equal(got, []byte{2, 1}) {
+		t.Fatalf("binary payload = %v", got)
+	}
 }
 
 func TestStreamHub_ChanFull(t *testing.T) {

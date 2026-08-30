@@ -293,15 +293,14 @@ func TestWriteMaskDirective_Email(t *testing.T) {
 	}
 }
 
-func TestWriteMaskDirective_WithArgs(t *testing.T) {
+func TestWriteMaskDirective_WithPattern(t *testing.T) {
 	var b strings.Builder
 	f := &ast.FieldDecl{
 		Name: "phone",
 		Type: &ast.TypeRef{Name: "String"},
 		Directives: []*ast.Directive{
 			{Name: "mask", Args: []*ast.NamedArg{
-				{Value: &ast.Literal{Kind: token.Int, Value: "3"}},
-				{Value: &ast.Literal{Kind: token.Int, Value: "4"}},
+				{Value: &ast.Literal{Kind: token.String, Value: "###****####"}},
 			}},
 		},
 	}
@@ -309,8 +308,8 @@ func TestWriteMaskDirective_WithArgs(t *testing.T) {
 	if result != "phoneMasked" {
 		t.Errorf("should return masked var, got %q", result)
 	}
-	if !strings.Contains(b.String(), "str.Mask") {
-		t.Errorf("should use str.Mask: %s", b.String())
+	if !strings.Contains(b.String(), `str.MaskPattern(u.Phone, "###****####")`) {
+		t.Errorf("should use str.MaskPattern: %s", b.String())
 	}
 }
 
@@ -327,6 +326,143 @@ func TestWriteMaskDirective_Default(t *testing.T) {
 	}
 	if !strings.Contains(b.String(), "3, 4") {
 		t.Errorf("default should mask with 3,4: %s", b.String())
+	}
+}
+
+func TestWriteColumnarMaskedStringField(t *testing.T) {
+	var b strings.Builder
+	field := &ast.FieldDecl{Name: "secret", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "mask"}}}
+	writeColumnarMaskedStringField(&b, field, "Secret", 3)
+	code := b.String()
+	if !strings.Contains(code, "str.Mask(item.Secret, 3, 4)") || !strings.Contains(code, "WriteColumnString(3, vals)") {
+		t.Fatalf("masked columnar field is incomplete:\n%s", code)
+	}
+}
+
+func TestWriteColumnarMaskedStringFieldWithPattern(t *testing.T) {
+	var b strings.Builder
+	field := &ast.FieldDecl{
+		Name: "phone",
+		Type: &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{{Name: "mask", Args: []*ast.NamedArg{
+			{Value: &ast.Literal{Kind: token.String, Value: "###****####"}},
+		}}},
+	}
+	writeColumnarMaskedStringField(&b, field, "Phone", 3)
+	code := b.String()
+	if !strings.Contains(code, `str.MaskPattern(item.Phone, "###****####")`) || !strings.Contains(code, "WriteColumnString(3, vals)") {
+		t.Fatalf("pattern-masked columnar field is incomplete:\n%s", code)
+	}
+}
+
+func TestGenerateWriteLuxoTransformImportsAndSelectAll(t *testing.T) {
+	SetModelFieldIDs(map[string]map[string]int{"User": {"name": 1}})
+	defer SetModelFieldIDs(nil)
+
+	transform := &ast.Directive{Name: "transform", Body: &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.CallExpr{Func: &ast.MemberExpr{
+			Object: &ast.Ident{Name: "it"}, Field: "uppercase",
+		}}},
+	}}}
+	result := &semantic.Result{Files: []*ast.File{{Models: []*ast.ModelDecl{{
+		Name: "User",
+		Fields: []*ast.FieldDecl{{
+			Name: "name", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{transform, {Name: "mask"}},
+		}},
+	}}}}}
+	code := string(generateWriteJSONFile(result, "app", nil))
+
+	if !strings.Contains(code, `"strings"`) {
+		t.Fatalf("@transform string methods must import strings:\n%s", code)
+	}
+	if !strings.Contains(code, `"github.com/light-speak/luxo/pkg/lux/str"`) {
+		t.Fatalf("@mask must import the string runtime:\n%s", code)
+	}
+	if !strings.Contains(code, "nameTransformed := strings.ToUpper(u.Name)") {
+		t.Fatalf("single-object writer must transform the field:\n%s", code)
+	}
+	if strings.Contains(code, "if len(mask) == 0 {") {
+		t.Fatalf("SELECT * must not bypass output directives:\n%s", code)
+	}
+}
+
+func TestGenerateWriteColumnarAppliesTransformBeforeMask(t *testing.T) {
+	SetModelFieldIDs(map[string]map[string]int{"User": {"name": 1}})
+	defer SetModelFieldIDs(nil)
+
+	transform := &ast.Directive{Name: "transform", Body: &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.CallExpr{Func: &ast.MemberExpr{
+			Object: &ast.Ident{Name: "it"}, Field: "uppercase",
+		}}},
+	}}}
+	model := &ast.ModelDecl{Name: "User", Fields: []*ast.FieldDecl{{
+		Name: "name", Type: &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{transform, {Name: "mask"}},
+	}}}
+	var b strings.Builder
+	generateWriteColumnar(&b, model, nil)
+	code := b.String()
+
+	if !strings.Contains(code, "str.Mask(strings.ToUpper(item.Name), 3, 4)") {
+		t.Fatalf("columnar writer must transform before masking:\n%s", code)
+	}
+	if !strings.Contains(code, "w.WriteColumnString(1, vals)") {
+		t.Fatalf("transformed values must stay columnar:\n%s", code)
+	}
+}
+
+func TestGenerateWriteColumnarNullableTransform(t *testing.T) {
+	SetModelFieldIDs(map[string]map[string]int{"User": {"nickname": 1}})
+	defer SetModelFieldIDs(nil)
+
+	transform := &ast.Directive{Name: "transform", Body: &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.CallExpr{Func: &ast.MemberExpr{
+			Object: &ast.Ident{Name: "it"}, Field: "trim",
+		}}},
+	}}}
+	model := &ast.ModelDecl{Name: "User", Fields: []*ast.FieldDecl{{
+		Name: "nickname", Type: &ast.TypeRef{Name: "String", Nullable: true},
+		Directives: []*ast.Directive{transform},
+	}}}
+	result := &semantic.Result{Files: []*ast.File{{Models: []*ast.ModelDecl{model}}}}
+	code := string(generateWriteJSONFile(result, "app", nil))
+
+	if !strings.Contains(code, "if item.Nickname != nil { v := strings.TrimSpace(*item.Nickname); vals[i] = &v }") {
+		t.Fatalf("nullable transform must preserve nulls:\n%s", code)
+	}
+	if !strings.Contains(code, "w.WriteColumnStringPtr(1, vals)") {
+		t.Fatalf("nullable transform must use the nullable column encoding:\n%s", code)
+	}
+	if !strings.Contains(code, "if u.Nickname != nil { nicknameTransformedValue := strings.TrimSpace(*u.Nickname)") {
+		t.Fatalf("single-object nullable transform must preserve nulls:\n%s", code)
+	}
+}
+
+func TestGenerateWriteColumnarHonorsVisible(t *testing.T) {
+	SetModelFieldIDs(map[string]map[string]int{"User": {"salary": 1}})
+	defer SetModelFieldIDs(nil)
+
+	visible := &ast.Directive{Name: "visible", Body: &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.BinaryExpr{
+			Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "my"}, Field: "role"},
+			Op:    "==",
+			Right: &ast.Literal{Kind: token.String, Value: "admin"},
+		}},
+	}}}
+	model := &ast.ModelDecl{Name: "User", Fields: []*ast.FieldDecl{{
+		Name: "salary", Type: &ast.TypeRef{Name: "Float", Nullable: true},
+		Directives: []*ast.Directive{visible},
+	}}}
+	var b strings.Builder
+	generateWriteColumnar(&b, model, nil)
+	code := b.String()
+
+	condition := `if api.IdentityString(buf.Identity, "role") == "admin" {`
+	if !strings.Contains(code, condition) {
+		t.Fatalf("columnar writer must omit invisible columns:\n%s", code)
+	}
+	if !strings.Contains(code, "w.WriteColumnFloatPtr(1, vals)") {
+		t.Fatalf("visible nullable field must preserve nullable column encoding:\n%s", code)
 	}
 }
 
@@ -523,8 +659,29 @@ func TestWriteMaskDirective_Nullable(t *testing.T) {
 		Directives: []*ast.Directive{{Name: "mask"}},
 	}
 	got := writeMaskDirective(&b, f, "u.Phone", "String")
-	if got != "u.Phone" {
-		t.Errorf("nullable @mask should be skipped, got %q", got)
+	if got != "phoneMasked" {
+		t.Errorf("nullable @mask should return a masked pointer, got %q", got)
+	}
+	if !strings.Contains(b.String(), "if u.Phone != nil { phoneMaskedValue := str.Mask(*u.Phone, 3, 4)") {
+		t.Errorf("nullable @mask must preserve null and mask present values: %s", b.String())
+	}
+}
+
+func TestWriteMaskDirective_NullablePattern(t *testing.T) {
+	var b strings.Builder
+	f := &ast.FieldDecl{
+		Name: "phone",
+		Type: &ast.TypeRef{Name: "String", Nullable: true},
+		Directives: []*ast.Directive{{Name: "mask", Args: []*ast.NamedArg{
+			{Value: &ast.Literal{Kind: token.String, Value: "###****####"}},
+		}}},
+	}
+	got := writeMaskDirective(&b, f, "u.Phone", "String")
+	if got != "phoneMasked" {
+		t.Errorf("nullable pattern @mask should return a masked pointer, got %q", got)
+	}
+	if code := b.String(); !strings.Contains(code, `str.MaskPattern(*u.Phone, "###****####")`) || !strings.Contains(code, "if u.Phone != nil") {
+		t.Errorf("nullable pattern @mask must preserve null and mask present values: %s", code)
 	}
 }
 
@@ -592,13 +749,12 @@ func TestWriteMaskDirective_BadArgs(t *testing.T) {
 		Directives: []*ast.Directive{
 			{Name: "mask", Args: []*ast.NamedArg{
 				{Value: &ast.Ident{Name: "x"}},
-				{Value: &ast.Ident{Name: "y"}},
 			}},
 		},
 	}
 	got := writeMaskDirective(&b, f, "u.Phone", "String")
-	if got != "u.Phone" {
-		t.Errorf("non-literal args should return original, got %q", got)
+	if got != "phoneMasked" || !strings.Contains(b.String(), `str.MaskPattern(u.Phone, "")`) {
+		t.Errorf("invalid args should fail closed, got %q: %s", got, b.String())
 	}
 }
 
@@ -661,6 +817,194 @@ func TestGenerateTypeWriteLuxo(t *testing.T) {
 	}
 	if !strings.Contains(out, "AppendSvarint") {
 		t.Errorf("should write Int field: %s", out)
+	}
+}
+
+func TestGenerateTypeWriteColumnar(t *testing.T) {
+	m := &ast.ModelDecl{
+		Name: "ServiceSummary",
+		Fields: []*ast.FieldDecl{
+			{Name: "serviceName", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "apiCount", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "version", Type: &ast.TypeRef{Name: "String", Nullable: true}},
+		},
+	}
+	SetModelFieldIDs(map[string]map[string]int{
+		"ServiceSummary": {"serviceName": 1, "apiCount": 2, "version": 3},
+	})
+	defer SetModelFieldIDs(nil)
+
+	var b strings.Builder
+	generateTypeWriteColumnar(&b, m, nil)
+	out := b.String()
+
+	// Value slice — native resolvers return []Type, not []*Type
+	if !strings.Contains(out, "func WriteColumnarServiceSummary(buf *api.ResponseBuf, items []ServiceSummary, mask []byte)") {
+		t.Errorf("should take value slice: %s", out)
+	}
+	if !strings.Contains(out, "w.WriteColumnString(1, vals)") {
+		t.Errorf("should write serviceName column: %s", out)
+	}
+	if !strings.Contains(out, "w.WriteColumnInt(2, vals)") {
+		t.Errorf("should write apiCount column: %s", out)
+	}
+	if !strings.Contains(out, "WriteColumnStringPtr(3, vals)") {
+		t.Errorf("should write nullable version column: %s", out)
+	}
+}
+
+func TestGenerateTypeOutputDirectives(t *testing.T) {
+	SetModelFieldIDs(map[string]map[string]int{"Profile": {"displayName": 1, "secret": 2, "hidden": 3}})
+	defer SetModelFieldIDs(nil)
+
+	transform := &ast.Directive{Name: "transform", Body: &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.CallExpr{Func: &ast.MemberExpr{
+			Object: &ast.Ident{Name: "it"}, Field: "trim",
+		}}},
+	}}}
+	visible := &ast.Directive{Name: "visible", Body: &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.BinaryExpr{
+			Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "my"}, Field: "role"},
+			Op:    "==",
+			Right: &ast.Literal{Kind: token.String, Value: "admin"},
+		}},
+	}}}
+	result := &semantic.Result{Files: []*ast.File{{Types: []*ast.TypeDecl{{
+		Name: "Profile",
+		Fields: []*ast.FieldDecl{
+			{Name: "displayName", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{transform}},
+			{Name: "secret", Type: &ast.TypeRef{Name: "String", Nullable: true}, Directives: []*ast.Directive{{Name: "mask"}, visible}},
+			{Name: "hidden", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hidden"}}},
+			{Name: "noFieldID", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}}}}}
+	code := string(generateWriteJSONFile(result, "app", nil))
+
+	if !strings.Contains(code, "displayNameTransformed := strings.TrimSpace(p.DisplayName)") {
+		t.Fatalf("type row writer must apply @transform:\n%s", code)
+	}
+	if !strings.Contains(code, "vals[i] = strings.TrimSpace(item.DisplayName)") {
+		t.Fatalf("type columnar writer must apply @transform:\n%s", code)
+	}
+	if !strings.Contains(code, `if api.IdentityString(buf.Identity, "role") == "admin" {`) {
+		t.Fatalf("type writers must honor @visible:\n%s", code)
+	}
+	if !strings.Contains(code, "secretMaskedValue := str.Mask(*p.Secret, 3, 4)") {
+		t.Fatalf("type row writer must mask nullable strings:\n%s", code)
+	}
+	if strings.Contains(code, "p.Hidden") || strings.Contains(code, "item.Hidden") {
+		t.Fatalf("type writers must omit hidden fields:\n%s", code)
+	}
+}
+
+func TestGenerateTypeWriteColumnarNestedList(t *testing.T) {
+	// MetricTimeSeries { apiName: String, points: [MetricPoint] } —
+	// nested type list becomes a blob column where each cell is the
+	// columnar encoding of that record's nested items.
+	m := &ast.ModelDecl{
+		Name: "MetricTimeSeries",
+		Fields: []*ast.FieldDecl{
+			{Name: "apiName", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "points", Type: &ast.TypeRef{Name: "MetricPoint", IsList: true}},
+		},
+	}
+	SetModelFieldIDs(map[string]map[string]int{
+		"MetricTimeSeries": {"apiName": 1, "points": 2},
+	})
+	defer SetModelFieldIDs(nil)
+
+	var b strings.Builder
+	generateTypeWriteColumnar(&b, m, nil)
+	out := b.String()
+
+	if !strings.Contains(out, "WriteColumnarMetricPoint(") {
+		t.Errorf("nested list cell should encode via nested columnar writer: %s", out)
+	}
+	if !strings.Contains(out, "w.WriteColumnBytes(2, vals)") {
+		t.Errorf("nested list should be a blob column: %s", out)
+	}
+}
+
+func TestGenerateTypeWriteColumnarNestedSingle(t *testing.T) {
+	// Single nested type — blob cell holds the nested WriteLuxo bytes.
+	m := &ast.ModelDecl{
+		Name: "Outer",
+		Fields: []*ast.FieldDecl{
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "inner", Type: &ast.TypeRef{Name: "Inner"}},
+		},
+	}
+	SetModelFieldIDs(map[string]map[string]int{
+		"Outer": {"name": 1, "inner": 2},
+	})
+	defer SetModelFieldIDs(nil)
+
+	var b strings.Builder
+	generateTypeWriteColumnar(&b, m, nil)
+	out := b.String()
+
+	if !strings.Contains(out, ".WriteLuxo(") {
+		t.Errorf("nested single cell should encode via WriteLuxo: %s", out)
+	}
+	if !strings.Contains(out, "w.WriteColumnBytes(2, vals)") {
+		t.Errorf("nested single should be a blob column: %s", out)
+	}
+}
+
+func TestGenerateTypeWriteColumnarNestedNullable(t *testing.T) {
+	var b strings.Builder
+	writeColumnarNestedBlobField(&b, "Child", 4, &ast.TypeRef{Name: "Child", Nullable: true})
+	code := b.String()
+	if !strings.Contains(code, "if items[i].Child != nil") || !strings.Contains(code, "items[i].Child.WriteLuxo") {
+		t.Fatalf("nullable nested type must preserve null cells:\n%s", code)
+	}
+}
+
+func TestGenerateTypeWriteColumnarNoFields(t *testing.T) {
+	SetModelFieldIDs(nil)
+	var b strings.Builder
+	generateTypeWriteColumnar(&b, &ast.ModelDecl{
+		Name:   "Empty",
+		Fields: []*ast.FieldDecl{{Name: "value", Type: &ast.TypeRef{Name: "String"}}},
+	}, nil)
+	if b.Len() != 0 {
+		t.Fatalf("type without protocol field IDs should not generate a writer:\n%s", b.String())
+	}
+}
+
+func TestColumnarWritersIgnoreUnsupportedTypes(t *testing.T) {
+	var valueBuilder strings.Builder
+	writeColumnarValueField(&valueBuilder, "item.Value", 1, "Unsupported", false)
+	if valueBuilder.Len() != 0 {
+		t.Fatalf("unsupported scalar should not generate invalid code: %s", valueBuilder.String())
+	}
+
+	var nullableBuilder strings.Builder
+	writeColumnarNullableValueField(&nullableBuilder, "item.Value", "*item.Value", 1, "Unsupported", false)
+	if nullableBuilder.Len() != 0 {
+		t.Fatalf("unsupported nullable scalar should not generate invalid code: %s", nullableBuilder.String())
+	}
+}
+
+func TestWriteColumnarArrayFieldAllScalarTypes(t *testing.T) {
+	types := []string{"Float", "Boolean", "DateTime", "Duration", "Decimal", "Bytes", "JSON", "Unsupported"}
+	var b strings.Builder
+	for id, typeName := range types {
+		writeColumnarArrayField(&b, "item.Values", id+1, typeName, false)
+	}
+	code := b.String()
+	checks := []string{
+		"codec.AppendFixed64(cb, v)",
+		"codec.AppendBool(cb, v)",
+		"codec.AppendSvarint(cb, v.Unix())",
+		"codec.AppendSvarint(cb, int64(v))",
+		"codec.AppendString(cb, v.String())",
+		"codec.AppendBytes(cb, v)",
+	}
+	for _, check := range checks {
+		if !strings.Contains(code, check) {
+			t.Errorf("missing scalar array encoding %q:\n%s", check, code)
+		}
 	}
 }
 
@@ -776,7 +1120,8 @@ func TestGenerateScalarArrayFields(t *testing.T) {
 		// Columnar: array field encoded as a Bytes column of inline-array cells
 		"w.WriteColumnBytes",
 		"cells := make([][]byte, len(items))",
-		"cb = codec.AppendArrayHeader(cb, len(item.Tags))",
+		"values := item.Tags",
+		"cb = codec.AppendArrayHeader(cb, len(values))",
 	}
 	for _, c := range checks {
 		if !strings.Contains(code, c) {

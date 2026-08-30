@@ -11,6 +11,7 @@ import (
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
+	"github.com/light-speak/luxo/pkg/lux/schema"
 )
 
 func TestBinaryRequestRoundTrip(t *testing.T) {
@@ -473,10 +474,38 @@ func TestParamDateTimeBinaryNotString(t *testing.T) {
 // --- decodeFieldMask ---
 
 func TestDecodeFieldMask(t *testing.T) {
-	// decodeFieldMask currently returns nil (stub)
-	result := decodeFieldMask([]byte{0xFF}, nil)
-	if result != nil {
-		t.Fatal("decodeFieldMask should return nil (stub)")
+	model := &schema.Model{Fields: []schema.Field{
+		{ID: 1, Name: "id"},
+		{ID: 2, Name: "name"},
+		{ID: 3, Name: "posts", Relation: true},
+	}}
+	result := decodeFieldMask([]byte{0b00001100}, model)
+	if len(result) != 2 || result[0].Name != "name" || result[1].Name != "posts" {
+		t.Fatalf("decoded fields = %#v", result)
+	}
+	if result[0].Children != nil {
+		t.Fatal("scalar field should be a leaf")
+	}
+	if result[1].Children == nil {
+		t.Fatal("relation field should be marked non-leaf for SQL selection")
+	}
+}
+
+func TestParseBinaryRequestDecodesFieldMaskFromSchema(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("getUser", 1)
+	s := schema.New()
+	s.RegisterModel(&schema.Model{Name: "User", Fields: []schema.Field{{ID: 1, Name: "id"}, {ID: 2, Name: "name"}}})
+	s.RegisterAPI(&schema.API{Name: "getUser", ReturnType: "User"})
+	reg.SetSchema(s)
+
+	body := []byte{1, 1, 0b00000100, 0}
+	req, err := reg.ParseBinaryRequest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(req.Select) != 1 || req.Select[0].Name != "name" {
+		t.Fatalf("request selection = %#v", req.Select)
 	}
 }
 

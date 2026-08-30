@@ -113,35 +113,43 @@ func SignWithExpiry(cfg *Config, data map[string]any, expires time.Duration) (st
 }
 
 // Verify parses and validates a JWT token. Returns the claims data if valid.
+// Per-request paths should use VerifyCached instead.
 func Verify(cfg *Config, token string) (map[string]any, error) {
+	data, _, err := verifyFull(cfg, token)
+	return data, err
+}
+
+// verifyFull validates a token and returns the claims data plus its expiry
+// unix timestamp — the expiry lets VerifyCached bound cache entry lifetime.
+func verifyFull(cfg *Config, token string) (map[string]any, int64, error) {
 	parts := strings.SplitN(token, ".", 3)
 	if len(parts) != 3 {
-		return nil, fmt.Errorf("invalid token format")
+		return nil, 0, fmt.Errorf("invalid token format")
 	}
 
 	// Verify signature
 	expectedSig := hmacSign(parts[0]+"."+parts[1], cfg.Secret)
 	if !hmac.Equal([]byte(parts[2]), []byte(expectedSig)) {
-		return nil, fmt.Errorf("invalid signature")
+		return nil, 0, fmt.Errorf("invalid signature")
 	}
 
 	// Decode payload
 	payload, err := base64Decode(parts[1])
 	if err != nil {
-		return nil, fmt.Errorf("decode payload: %w", err)
+		return nil, 0, fmt.Errorf("decode payload: %w", err)
 	}
 
 	var claims Claims
 	if err := json.Unmarshal(payload, &claims); err != nil {
-		return nil, fmt.Errorf("unmarshal claims: %w", err)
+		return nil, 0, fmt.Errorf("unmarshal claims: %w", err)
 	}
 
 	// Check expiry
 	if time.Now().Unix() > claims.ExpiresAt {
-		return nil, fmt.Errorf("token expired")
+		return nil, 0, fmt.Errorf("token expired")
 	}
 
-	return claims.Data, nil
+	return claims.Data, claims.ExpiresAt, nil
 }
 
 // SignRefresh creates a refresh token with longer expiry.

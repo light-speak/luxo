@@ -5,5 +5,5 @@ export default defineConfig({
   format: ['cjs', 'esm'],
   dts: false,
   clean: true,
-  external: ['react', '@luxo/client'],
+  external: ['react', '@luxojs/client'],
 })

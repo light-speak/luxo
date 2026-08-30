@@ -5840,9 +5840,65 @@ func TestCompileCreateLinkNullable(t *testing.T) {
 			{Name: "subtitle", Value: &ast.Literal{Kind: token.String, Value: "test"}},
 		},
 	}, false)
-	got := b.String()
-	if !strings.Contains(got, `&"test"`) {
-		t.Fatalf("nullable field should wrap with &, got:\n%s", got)
+	// Literals are not addressable — the value must be hoisted into a temp
+	// var first (`&"test"` is invalid Go).
+	out := compilerOut(c)
+	if !strings.Contains(out, `subtitlePtr0 := "test"`) {
+		t.Fatalf("nullable literal should hoist to temp var, got:\n%s", out)
+	}
+	if !strings.Contains(b.String(), ".SetSubtitle(&subtitlePtr0)") {
+		t.Fatalf("nullable field should pass temp var pointer, got:\n%s", b.String())
+	}
+}
+
+func TestCompileCreateLinkNullableCall(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"Gateway": {
+			Name: "Gateway",
+			Fields: []*ast.FieldDecl{
+				{Name: "lastPing", Type: &ast.TypeRef{Name: "DateTime", Nullable: true}},
+			},
+		},
+	}
+	c := newCompiler(models)
+	var b strings.Builder
+	c.compileCreateLink(&b, "Gateway", chainLink{
+		method: "create",
+		args: []*ast.NamedArg{
+			{Name: "lastPing", Value: &ast.CallExpr{Func: &ast.Ident{Name: "now"}}},
+		},
+	}, true)
+	// Function call results are not addressable — `&time.Now()` is invalid Go.
+	out := compilerOut(c)
+	if !strings.Contains(out, "lastPingPtr0 := time.Now()") {
+		t.Fatalf("nullable call should hoist to temp var, got:\n%s", out)
+	}
+	if !strings.Contains(b.String(), ".SetLastPing(&lastPingPtr0)") {
+		t.Fatalf("nullable field should pass temp var pointer, got:\n%s", b.String())
+	}
+}
+
+func TestCompileCreateLinkNullableIdent(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"Post": {
+			Name: "Post",
+			Fields: []*ast.FieldDecl{
+				{Name: "subtitle", Type: &ast.TypeRef{Name: "String", Nullable: true}},
+			},
+		},
+	}
+	c := newCompiler(models)
+	c.vars["sub"] = valType{name: "String"}
+	var b strings.Builder
+	c.compileCreateLink(&b, "Post", chainLink{
+		method: "create",
+		args: []*ast.NamedArg{
+			{Name: "subtitle", Value: &ast.Ident{Name: "sub"}},
+		},
+	}, false)
+	// Plain identifiers are addressable — no temp var needed.
+	if !strings.Contains(b.String(), ".SetSubtitle(&sub)") {
+		t.Fatalf("nullable ident should keep direct address-of, got:\n%s", b.String())
 	}
 }
 
@@ -7498,6 +7554,32 @@ func TestCompileInstanceUpdate(t *testing.T) {
 	}
 	if !strings.Contains(got, `lux.SetField{Col: "name"`) {
 		t.Errorf("instance update missing SetField: got %q", got)
+	}
+}
+
+func TestCompileInstanceUpdateHashesProtectedField(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"Member": {
+			Name: "Member",
+			Fields: []*ast.FieldDecl{
+				{Name: "password", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hash"}}},
+			},
+		},
+	}
+	c := newCompiler(models)
+	c.vars["member"] = valType{isModel: true, name: "Member"}
+	expr := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "member"}, Field: "update"},
+		Args: []*ast.NamedArg{{Name: "password", Value: &ast.Ident{Name: "newPassword"}}},
+	}
+
+	got := c.compileExpr(expr)
+	out := compilerOut(c)
+	if !strings.Contains(out, "luxocrypto.HashPassword(newPassword)") {
+		t.Fatalf("instance update must hash @hash field, preamble:\n%s", out)
+	}
+	if !strings.Contains(got, `lux.SetField{Col: "password", Val: hashedPassword}`) {
+		t.Fatalf("instance update must persist hash, got %q", got)
 	}
 }
 
