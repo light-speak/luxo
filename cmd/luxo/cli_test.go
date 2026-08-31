@@ -5,9 +5,31 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/codegen"
 	"github.com/light-speak/luxo/pkg/lux"
 )
+
+func TestBuildParamTypesFromASTIncludesServiceFunctions(t *testing.T) {
+	files := []*ast.File{{
+		Functions: []*ast.FnDecl{{
+			Name: "heartbeat",
+			Params: []*ast.ParamDecl{
+				{Name: "cpuPercent", Type: &ast.TypeRef{Name: "Float"}},
+				{Name: "uptime", Type: &ast.TypeRef{Name: "Duration"}},
+			},
+			Directives: []*ast.Directive{{Name: "service"}},
+		}},
+	}}
+
+	types := buildParamTypesFromAST(files)
+	if got := types["heartbeat"]["cpuPercent"]; got != "Float" {
+		t.Fatalf("cpuPercent type = %q, want Float", got)
+	}
+	if got := types["heartbeat"]["uptime"]; got != "Duration" {
+		t.Fatalf("uptime type = %q, want Duration", got)
+	}
+}
 
 func TestSplitLines(t *testing.T) {
 	tests := []struct {
@@ -32,6 +54,43 @@ func TestSplitLinesContent(t *testing.T) {
 	lines := splitLines([]byte("hello\nworld"))
 	if string(lines[0]) != "hello" || string(lines[1]) != "world" {
 		t.Errorf("got %q, %q", string(lines[0]), string(lines[1]))
+	}
+}
+
+func TestCleanStaleGenFiles(t *testing.T) {
+	dir := t.TempDir()
+	// Stale generated file — its declaration was removed from the origin,
+	// so this run's Files map no longer contains it.
+	stale := filepath.Join(dir, "error.gen.go")
+	if err := os.WriteFile(stale, []byte("package x\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Freshly written generated file — must be kept.
+	kept := filepath.Join(dir, "model.gen.go")
+	if err := os.WriteFile(kept, []byte("package x\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Handwritten file — never touched, even without .gen. suffix match.
+	hand := filepath.Join(dir, "helper.go")
+	if err := os.WriteFile(hand, []byte("package x\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := cleanStaleGenFiles(dir, map[string][]byte{"model.gen.go": nil})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 1 || removed[0] != "error.gen.go" {
+		t.Errorf("removed = %v, want [error.gen.go]", removed)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Error("stale error.gen.go should be deleted")
+	}
+	if _, err := os.Stat(kept); err != nil {
+		t.Error("freshly written model.gen.go must be kept")
+	}
+	if _, err := os.Stat(hand); err != nil {
+		t.Error("handwritten helper.go must never be touched")
 	}
 }
 

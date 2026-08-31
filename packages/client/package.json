@@ -4,8 +4,10 @@
   "description": "Luxo client SDK — HTTP/2 + WebSocket transport with binary codec, type-safe API calls, and automatic field selection",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.mjs",
       "require": "./dist/index.js"
     }

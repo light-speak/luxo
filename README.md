@@ -315,7 +315,7 @@ Same task in TypeScript? 150+ lines, 4 packages, no compile-time safety.
 - [x] Auth runtime (JWT sign/verify/refresh, Luvia `AuthMiddleware`, `Identity(ctx)`)
 - [x] Standard library (str · slice · math · datetime · crypto · jsonutil · httputil · convert)
 - [x] Project scaffold (`luxo init` + `luxo add` + `luxo gen` + `luxo run`)
-- [x] Dialect interface (PG implemented, MySQL placeholder)
+- [x] Pluggable dialect interface (PostgreSQL implemented; MySQL, SQLite, and MongoDB are roadmap targets)
 - [x] `luxo deploy compose` — Dockerfile + docker-compose.yml generation
 
 ### Phase 3 — Multi-service + Binary ✅
@@ -343,12 +343,12 @@ Same task in TypeScript? 150+ lines, 4 packages, no compile-time safety.
 - [x] Kotlin SDK (`com.luxo.client` — OkHttp + coroutine + Luxo binary codec + Gradle field tracking)
 - [x] Swift SDK (`LuxoClient` — URLSession + async/await + Luxo binary codec + SwiftSyntax field tracking)
 
-### Phase 5 — Production + Ecosystem
-- [x] Luxo Studio (monitoring dashboard · distributed tracing · API playground · schema browser · cluster management)
+### Phase 5 — Production + Ecosystem (In Progress)
+- [ ] Luxo Studio (actively developing; backend and React foundations are in place)
 - [ ] HTTP/3 (QUIC) support
 - [ ] MCP Server (AI reads/writes .luxo projects natively)
 - [ ] luxo-ai (natural language → .luxo → running API)
-- [ ] `luxo deploy helm` — Helm Chart generation
+- [x] `luxo deploy helm` — Helm Chart generation
 
 ## Contributing
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/semantic"
 )
 
@@ -15,8 +16,11 @@ type moduleInfo struct {
 	hasLoaders    bool
 	hasExtend     bool // has cross-module extend (needs remote loaders in cluster mode)
 	hasEvents     bool
+	emitsEvents   bool
 	hasServiceFns bool
 	hasSchema     bool // has models or APIs (generates RegisterSchema)
+	hasAPI        bool // has non-CRUD API declarations (needs RegisterHandlers wiring even without @crud)
+	hasStreams    bool
 }
 
 func collectModules(result *semantic.Result) []moduleInfo {
@@ -48,8 +52,19 @@ func collectModules(result *semantic.Result) []moduleInfo {
 		if len(file.Events) > 0 || len(file.Listeners) > 0 {
 			info.hasEvents = true
 		}
+		if fileEmitsEvents(file) {
+			info.emitsEvents = true
+		}
 		if len(file.Models) > 0 || len(file.APIs) > 0 {
 			info.hasSchema = true
+		}
+		if len(file.APIs) > 0 {
+			info.hasAPI = true
+		}
+		for _, api := range file.APIs {
+			if hasDirective(api.Directives, "stream") {
+				info.hasStreams = true
+			}
 		}
 		for _, fn := range file.Functions {
 			if hasDirective(fn.Directives, "service") {
@@ -64,6 +79,25 @@ func collectModules(result *semantic.Result) []moduleInfo {
 		modules = append(modules, *grouped[name])
 	}
 	return modules
+}
+
+func fileEmitsEvents(file *ast.File) bool {
+	for _, api := range file.APIs {
+		if api.Body != nil && stmtsContainEmit(api.Body.Stmts) {
+			return true
+		}
+	}
+	for _, fn := range file.Functions {
+		if fn.Body != nil && stmtsContainEmit(fn.Body.Stmts) {
+			return true
+		}
+	}
+	for _, middleware := range file.Middlewares {
+		if middleware.Body != nil && stmtsContainEmit(middleware.Body.Stmts) {
+			return true
+		}
+	}
+	return false
 }
 
 // moduleNameFromFile extracts the module name from a file path.
@@ -107,7 +141,7 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 	anyEvents := false
 	anyServiceFns := false
 	for _, m := range modules {
-		if m.hasEvents {
+		if m.hasEvents || m.emitsEvents || m.hasStreams {
 			anyEvents = true
 		}
 		if m.hasServiceFns {
@@ -177,8 +211,17 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 	// Register modules and handlers
 	for _, m := range modules {
 		fmt.Fprintf(&b, "\tgw.AddModule(%q)\n", m.name)
-		if m.hasCrud {
+		// handler.gen.go generates RegisterHandlers whenever the module has
+		// any handler binding — i.e. @crud models OR plain api declarations.
+		// A "pure model, no @crud, no API" module produces no RegisterHandlers
+		// function, so we must mirror that condition here exactly. Using
+		// hasCrud alone (the old condition) drops modules with only non-CRUD
+		// APIs (e.g. schema introspection) and clients see "unknown API ID".
+		if m.hasCrud || m.hasAPI {
 			fmt.Fprintf(&b, "\t%s_luxo.RegisterHandlers(gw.Router, %sApp)\n", m.name, m.name)
+		}
+		if m.hasStreams {
+			fmt.Fprintf(&b, "\t%s_luxo.RegisterStreams(gw.Router, eventBus)\n", m.name)
 		}
 	}
 
@@ -224,7 +267,7 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t}\n")
 	b.WriteString("}\n")
 
-	return []byte(b.String())
+	return formatGenerated([]byte(b.String()))
 }
 
 func writeModuleApps(b *strings.Builder, modules []moduleInfo) {
@@ -306,8 +349,10 @@ func writeEventBusWiring(b *strings.Builder, modules []moduleInfo) {
 	b.WriteString("\tdefer eventBus.Close()\n\n")
 
 	for _, m := range modules {
-		if m.hasEvents {
+		if m.hasEvents || m.emitsEvents {
 			fmt.Fprintf(b, "\t%sApp.EventBus = eventBus\n", m.name)
+		}
+		if m.hasEvents {
 			fmt.Fprintf(b, "\t%s_luxo.RegisterEvents(eventBus, %sApp)\n", m.name, m.name)
 		}
 	}
@@ -364,7 +409,7 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/dataloader\"\n")
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/env\"\n")
-	if target.hasEvents {
+	if target.hasEvents || target.emitsEvents || target.hasStreams {
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/event\"\n")
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
@@ -436,11 +481,14 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 	}
 
 	// Events
-	if target.hasEvents {
+	if target.hasEvents || target.emitsEvents {
 		b.WriteString("\teventBus := event.NewFromEnv()\n")
 		b.WriteString("\tdefer eventBus.Close()\n")
 		b.WriteString("\tapp.EventBus = eventBus\n")
-		fmt.Fprintf(&b, "\t%s_luxo.RegisterEvents(eventBus, app)\n\n", target.name)
+		if target.hasEvents {
+			fmt.Fprintf(&b, "\t%s_luxo.RegisterEvents(eventBus, app)\n", target.name)
+		}
+		b.WriteString("\n")
 	}
 
 	// Queue
@@ -451,8 +499,15 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 	// Gateway + handlers
 	b.WriteString("\tgw := luvia.New()\n")
 	fmt.Fprintf(&b, "\tgw.AddModule(%q)\n", target.name)
-	if target.hasCrud {
+	// Same rationale as in the embedded entry: RegisterHandlers must follow
+	// handler.gen.go's own trigger (@crud OR non-CRUD APIs), not hasCrud alone.
+	if target.hasCrud || target.hasAPI {
 		fmt.Fprintf(&b, "\t%s_luxo.RegisterHandlers(gw.Router, app)\n", target.name)
+	}
+	if target.hasStreams {
+		fmt.Fprintf(&b, "\t%s_luxo.RegisterStreams(gw.Router, eventBus)\n", target.name)
+	}
+	if target.hasCrud {
 		fmt.Fprintf(&b, "\t%s_luxo.RegisterBatchLoaders(gw.Router, app)\n", target.name)
 	}
 	if target.hasServiceFns {
@@ -477,7 +532,7 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 	b.WriteString("\t}\n")
 	b.WriteString("}\n")
 
-	return []byte(b.String())
+	return formatGenerated([]byte(b.String()))
 }
 
 // GenerateGatewayEntry produces luxis/gateway/main.gen.go — a pure routing gateway.
@@ -488,51 +543,8 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	if len(allModules) == 0 {
 		return nil
 	}
-
-	// Build API → module mapping
-	// Collect compiled API names first for dedup
-	compiledAPIs := make(map[string]bool)
-	for _, file := range result.Files {
-		for _, a := range file.APIs {
-			compiledAPIs[a.Name] = true
-		}
-	}
-
-	routeMap := make(map[string]string) // apiName → moduleName (deduplicates)
-	var routeOrder []string
-	addRoute := func(name, mod string) {
-		if _, exists := routeMap[name]; !exists {
-			routeOrder = append(routeOrder, name)
-		}
-		routeMap[name] = mod
-	}
-
-	for _, file := range result.Files {
-		modName := moduleNameFromFile(file.Name)
-		for _, m := range file.Models {
-			if !hasCrud(m) {
-				continue
-			}
-			for _, op := range crudOperations(m) {
-				apiName := crudAPIName(m.Name, op)
-				if compiledAPIs[apiName] {
-					continue // compiled API overrides CRUD
-				}
-				addRoute(apiName, modName)
-			}
-		}
-		for _, a := range file.APIs {
-			if hasDirective(a.Directives, "stream") {
-				continue // stream APIs registered separately
-			}
-			addRoute(a.Name, modName)
-		}
-		for _, fn := range file.Functions {
-			if hasDirective(fn.Directives, "service") {
-				addRoute("svc:"+fn.Name, modName)
-			}
-		}
-	}
+	anyStreams := gatewayHasStreams(allModules)
+	routeOrder, routeMap := collectGatewayRoutes(result)
 
 	var b strings.Builder
 	b.WriteString("// Code generated by luxo. DO NOT EDIT.\n")
@@ -554,6 +566,9 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/env\"\n")
+	if anyStreams {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/event\"\n")
+	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/rpc\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/schema\"\n")
@@ -578,6 +593,16 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 
 	// Gateway
 	b.WriteString("\tgw := luvia.New()\n\n")
+	if anyStreams {
+		b.WriteString("\teventBus := event.NewFromEnv()\n")
+		b.WriteString("\tdefer eventBus.Close()\n")
+		for _, module := range allModules {
+			if module.hasStreams {
+				fmt.Fprintf(&b, "\t%s_luxo.RegisterStreams(gw.Router, eventBus)\n", module.name)
+			}
+		}
+		b.WriteString("\n")
+	}
 
 	// Schema (skip event-only modules)
 	for _, m := range allModules {
@@ -773,5 +798,61 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t}\n")
 	b.WriteString("}\n")
 
-	return []byte(b.String())
+	return formatGenerated([]byte(b.String()))
+}
+
+func gatewayHasStreams(modules []moduleInfo) bool {
+	for _, module := range modules {
+		if module.hasStreams {
+			return true
+		}
+	}
+	return false
+}
+
+func collectGatewayRoutes(result *semantic.Result) ([]string, map[string]string) {
+	compiledAPIs := make(map[string]bool)
+	for _, file := range result.Files {
+		for _, api := range file.APIs {
+			compiledAPIs[api.Name] = true
+		}
+	}
+
+	routeMap := make(map[string]string)
+	var routeOrder []string
+	addRoute := func(name, module string) {
+		if _, exists := routeMap[name]; !exists {
+			routeOrder = append(routeOrder, name)
+		}
+		routeMap[name] = module
+	}
+	for _, file := range result.Files {
+		collectGatewayFileRoutes(file, compiledAPIs, addRoute)
+	}
+	return routeOrder, routeMap
+}
+
+func collectGatewayFileRoutes(file *ast.File, compiledAPIs map[string]bool, addRoute func(string, string)) {
+	moduleName := moduleNameFromFile(file.Name)
+	for _, model := range file.Models {
+		if !hasCrud(model) {
+			continue
+		}
+		for _, operation := range crudOperations(model) {
+			apiName := crudAPIName(model.Name, operation)
+			if !compiledAPIs[apiName] {
+				addRoute(apiName, moduleName)
+			}
+		}
+	}
+	for _, api := range file.APIs {
+		if !hasDirective(api.Directives, "stream") {
+			addRoute(api.Name, moduleName)
+		}
+	}
+	for _, function := range file.Functions {
+		if hasDirective(function.Directives, "service") {
+			addRoute("svc:"+function.Name, moduleName)
+		}
+	}
 }

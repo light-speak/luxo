@@ -52,7 +52,7 @@ func (g *Gateway) Serve(version string) error {
 	if g.metrics != nil {
 		g.Router.SetMetricsCollector(g.metrics)
 	}
-	g.registrar = NewGatewayRegistrar(port)
+	g.registrar = newGatewayRegistrar(port, version)
 
 	certFile := envOr("APP_TLS_CERT", "")
 	keyFile := envOr("APP_TLS_KEY", "")
@@ -118,6 +118,7 @@ func (g *Gateway) waitForShutdown() error {
 // buildMux creates the HTTP mux with all routes and middleware.
 // Returns the mux and the port string. Extracted for testability.
 func (g *Gateway) buildMux(version string) (*http.ServeMux, string) {
+	g.Router.Version = version
 	port := envOr("APP_PORT", "4000")
 	mode := envOr("DEPLOY_MODE", "embedded")
 

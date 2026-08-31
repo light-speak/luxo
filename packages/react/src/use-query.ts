@@ -1,10 +1,26 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { hashQueryKey, type QueryClient, type QueryFunction, type QueryKey } from './query-client'
+import { useQueryClient } from './provider'
 
 export interface UseLuxoQueryResult<T> {
   data: T | null
   loading: boolean
   error: Error | null
   refetch: () => Promise<void>
+}
+
+export interface UseLuxoQueryOptions {
+  queryKey?: QueryKey
+  queryClient?: QueryClient
+  enabled?: boolean
+  staleTime?: number
+  gcTime?: number
+}
+
+let nextHookID = 0
+
+function dependenciesEqual(previous: readonly unknown[], next: readonly unknown[]): boolean {
+  return previous.length === next.length && previous.every((value, index) => Object.is(value, next[index]))
 }
 
 /**
@@ -18,21 +34,44 @@ export interface UseLuxoQueryResult<T> {
  * ```
  */
 export function useLuxoQuery<T>(
-  queryFn: () => Promise<T>,
+  queryFn: QueryFunction<T>,
   deps: unknown[] = [],
+  options: UseLuxoQueryOptions = {},
 ): UseLuxoQueryResult<T> {
-  const [data, setData] = useState<T | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<Error | null>(null)
-  const mountedRef = useRef(true)
+  const contextClient = useQueryClient()
+  const queryClient = options.queryClient ?? contextClient
+  const enabled = options.enabled ?? true
+  const hookID = useRef(0)
+  if (hookID.current === 0) hookID.current = ++nextHookID
+  const dependencyState = useRef({ values: deps as readonly unknown[], generation: 0 })
+  if (!dependenciesEqual(dependencyState.current.values, deps)) {
+    dependencyState.current = { values: deps, generation: dependencyState.current.generation + 1 }
+  }
+  const queryKey = options.queryKey ?? ['@luxo/hook', hookID.current, dependencyState.current.generation]
+  const queryHash = hashQueryKey(queryKey)
+  const initialState = queryClient.getQueryState<T>(queryKey)
+  const [data, setData] = useState<T | null>(initialState.hasData ? initialState.data ?? null : null)
+  const [loading, setLoading] = useState(enabled && !initialState.hasData)
+  const [error, setError] = useState<Error | null>(initialState.error ?? null)
+  const mountedRef = useRef(false)
   const versionRef = useRef(0)
+  const queryFnRef = useRef(queryFn)
+  const queryKeyRef = useRef(queryKey)
+  queryFnRef.current = queryFn
+  queryKeyRef.current = queryKey
 
-  const execute = useCallback(async () => {
+  const execute = useCallback(async (force = false) => {
     const version = ++versionRef.current
     setLoading(true)
     setError(null)
     try {
-      const result = await queryFn()
+      const result = await queryClient.fetchQuery({
+        queryKey: queryKeyRef.current,
+        queryFn: context => queryFnRef.current(context),
+        staleTime: options.staleTime,
+        gcTime: options.gcTime,
+        force,
+      })
       // Only update if still mounted and this is the latest request
       if (mountedRef.current && version === versionRef.current) {
         setData(result)
@@ -46,16 +85,42 @@ export function useLuxoQuery<T>(
         setLoading(false)
       }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, deps)
+  }, [queryClient, queryHash, options.staleTime, options.gcTime])
 
   useEffect(() => {
     mountedRef.current = true
-    execute()
+    const syncState = () => {
+      const state = queryClient.getQueryState<T>(queryKeyRef.current)
+      setData(state.hasData ? state.data ?? null : null)
+      setError(state.error ?? null)
+      setLoading(state.isFetching)
+    }
+    const unsubscribe = queryClient.subscribe(queryKeyRef.current, event => {
+      if (!mountedRef.current) return
+      if (event.type === 'invalidated' && enabled) {
+        void execute()
+        return
+      }
+      if (
+        event.type === 'updated'
+        || event.type === 'error'
+        || event.type === 'cancelled'
+        || event.type === 'removed'
+      ) syncState()
+    })
+    if (enabled) {
+      void execute()
+    } else {
+      syncState()
+      setLoading(false)
+    }
     return () => {
       mountedRef.current = false
+      versionRef.current++
+      unsubscribe()
     }
-  }, [execute])
+  }, [enabled, execute, queryClient, queryHash])
 
-  return { data, loading, error, refetch: execute }
+  const refetch = useCallback(() => execute(true), [execute])
+  return { data, loading, error, refetch }
 }

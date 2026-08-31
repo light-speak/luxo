@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 
@@ -61,6 +60,42 @@ type Filter struct {
 	Field    string `json:"field"`
 	Operator string `json:"op"`
 	Value    string `json:"value"`
+}
+
+// UnmarshalJSON accepts JSON scalar filter values while keeping the internal
+// string representation consumed by typed FilterOp implementations.
+func (f *Filter) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Field    string          `json:"field"`
+		Operator string          `json:"op"`
+		Value    json.RawMessage `json:"value"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	value, err := parseFilterValue(raw.Value)
+	if err != nil {
+		return err
+	}
+	f.Value = value
+	f.Field = raw.Field
+	f.Operator = raw.Operator
+	return nil
+}
+
+func parseFilterValue(raw json.RawMessage) (string, error) {
+	value := bytes.TrimSpace(raw)
+	if len(value) == 0 || bytes.Equal(value, []byte("null")) || value[0] == '{' || value[0] == '[' {
+		return "", fmt.Errorf("filter value must be a string, number, or boolean")
+	}
+	if value[0] == '"' {
+		var decoded string
+		if err := json.Unmarshal(value, &decoded); err != nil {
+			return "", err
+		}
+		return decoded, nil
+	}
+	return string(value), nil
 }
 
 // Sorter represents a sort directive from $sorters.
@@ -398,12 +433,28 @@ func (r *Request) ParamJSON(name string, target any) error {
 	}
 	raw, ok := r.Params[name]
 	if !ok {
+		// Nullable params (double-pointer targets) tolerate a missing key —
+		// omitting an optional param is valid, matching the binary path above.
+		if isNullableTarget(target) {
+			return nil
+		}
 		return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
 	if err := json.Unmarshal(raw, target); err != nil {
 		return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "invalid format"})
 	}
 	return nil
+}
+
+// isNullableTarget reports whether target is a pointer to a nullable (pointer)
+// scalar — the codegen shape for optional params (String? → **string, etc.).
+// Type switch instead of reflection — this is the request hot path.
+func isNullableTarget(target any) bool {
+	switch target.(type) {
+	case **string, **int64, **float64, **bool, **time.Time, **time.Duration:
+		return true
+	}
+	return false
 }
 
 // SetBinaryParams configures binary mode param storage.
@@ -505,9 +556,6 @@ func assignBinaryParam(v any, target any) error {
 			*t = bv
 			return nil
 		}
-	}
-	if isLogEnabled() {
-		fmt.Fprintf(os.Stderr, "[debug] assignBinaryParam: unsupported target %T for value %T\n", target, v)
 	}
 	return nil
 }

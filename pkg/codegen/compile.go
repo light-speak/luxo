@@ -160,6 +160,7 @@ type compiler struct {
 	inForExpr   bool               // true inside for-as-expression with yield — yield compiles to return
 	paginate    bool               // true when API has @paginate
 	hasTotalVar bool               // true after _total is assigned (paginated query)
+	ptrTmpCount int                // counter for hoisted pointer temp vars (nullable create args)
 }
 
 func (c *compiler) write(format string, args ...any) {
@@ -731,6 +732,12 @@ func (c *compiler) compileInstanceMethod(e *ast.CallExpr) string {
 		for _, arg := range e.Args {
 			if arg.Name != "" {
 				val := c.compileExpr(arg.Value)
+				if model, ok := c.models[modelName]; ok && isHashField(model, arg.Name) {
+					hashedVar := "hashed" + str.Capitalize(arg.Name)
+					c.write("%s, err := luxocrypto.HashPassword(%s)", hashedVar, val)
+					c.write("if err != nil {\n%s\treturn err\n%s}", c.indent, c.indent)
+					val = hashedVar
+				}
 				sets = append(sets, fmt.Sprintf("lux.SetField{Col: %q, Val: %s}", str.ToSnakeCase(arg.Name), val))
 			}
 		}
@@ -1101,10 +1108,12 @@ func (c *compiler) compileCreateLink(b *strings.Builder, modelName string, link 
 	for _, arg := range link.args {
 		val := c.compileExpr(arg.Value)
 		// Use hashed value if field has @hash directive
+		hashed := false
 		if m != nil {
 			for _, f := range m.Fields {
 				if f.Name == arg.Name && hasDirective(f.Directives, "hash") {
 					val = "hashed" + str.Capitalize(arg.Name)
+					hashed = true
 				}
 			}
 		}
@@ -1125,7 +1134,20 @@ func (c *compiler) compileCreateLink(b *strings.Builder, modelName string, link 
 						}
 					}
 					if !alreadyPtr {
-						val = "&" + val
+						// Plain identifiers (and hashed temp vars) are
+						// addressable; any other expression (literal, call
+						// like now(), binary op) must be hoisted into a temp
+						// var first — Go rejects taking the address of a
+						// non-addressable value.
+						_, isIdent := arg.Value.(*ast.Ident)
+						if isIdent || hashed {
+							val = "&" + val
+						} else {
+							tmp := fmt.Sprintf("%sPtr%d", arg.Name, c.ptrTmpCount)
+							c.ptrTmpCount++
+							c.write("%s := %s", tmp, val)
+							val = "&" + tmp
+						}
 					}
 					break
 				}

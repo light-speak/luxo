@@ -52,7 +52,13 @@ func generateWriteJSONFile(result *semantic.Result, packageName string, enums ma
 
 	var b strings.Builder
 	writeHeader(&b, packageName, "writejson.gen.go")
-	writeWriteJSONImports(&b, models, stubs)
+	importDecls := append(append([]*ast.ModelDecl{}, models...), stubs...)
+	for _, file := range result.Files {
+		for _, t := range file.Types {
+			importDecls = append(importDecls, &ast.ModelDecl{Name: t.Name, Fields: t.Fields})
+		}
+	}
+	writeWriteJSONImports(&b, importDecls)
 
 	for _, m := range models {
 		generateWriteLuxo(&b, m, enums)
@@ -66,10 +72,12 @@ func generateWriteJSONFile(result *semantic.Result, packageName string, enums ma
 	}
 
 	// type declarations — generate WriteLuxo with VALUE receiver (can call on literal)
+	// plus WriteColumnar so native list responses follow the columnar protocol
 	for _, file := range result.Files {
 		for _, t := range file.Types {
 			pseudo := &ast.ModelDecl{Name: t.Name, Fields: t.Fields}
 			generateTypeWriteLuxo(&b, pseudo, enums)
+			generateTypeWriteColumnar(&b, pseudo, enums)
 		}
 	}
 
@@ -81,6 +89,8 @@ type writeJSONImportNeeds struct {
 	time    bool
 	uuid    bool
 	decimal bool
+	strings bool
+	str     bool
 }
 
 func scanWriteJSONImports(m *ast.ModelDecl, needs *writeJSONImportNeeds) {
@@ -90,6 +100,13 @@ func scanWriteJSONImports(m *ast.ModelDecl, needs *writeJSONImportNeeds) {
 		}
 		if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
 			continue
+		}
+		if hasDirective(f.Directives, "mask") {
+			needs.str = true
+		}
+		if expression := compileTransformDirectiveExpr(f, "value"); expression != "value" {
+			needs.strings = needs.strings || strings.Contains(expression, "strings.")
+			needs.str = needs.str || strings.Contains(expression, "str.")
 		}
 		switch f.Type.Name {
 		case "DateTime", "Duration":
@@ -102,21 +119,24 @@ func scanWriteJSONImports(m *ast.ModelDecl, needs *writeJSONImportNeeds) {
 	}
 }
 
-func writeWriteJSONImports(b *strings.Builder, models []*ast.ModelDecl, stubs []*ast.ModelDecl) {
+func writeWriteJSONImports(b *strings.Builder, declarations []*ast.ModelDecl) {
 	var needs writeJSONImportNeeds
-	for _, m := range models {
+	for _, m := range declarations {
 		scanWriteJSONImports(m, &needs)
-	}
-	for _, s := range stubs {
-		scanWriteJSONImports(s, &needs)
 	}
 
 	b.WriteString("import (\n")
+	if needs.strings {
+		b.WriteString("\t\"strings\"\n")
+	}
 	if needs.time {
 		b.WriteString("\t\"time\"\n")
 	}
 	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
+	if needs.str {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/str\"\n")
+	}
 	if needs.uuid {
 		b.WriteString("\n\t\"github.com/google/uuid\"\n")
 	}
@@ -254,13 +274,16 @@ func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bo
 	fmt.Fprintf(b, "// WriteLuxo writes %s as Luxo binary directly to buf. Zero intermediate allocation.\n", name)
 	fmt.Fprintf(b, "func (%s *%s) WriteLuxo(buf *api.ResponseBuf, mask []byte) {\n", recv, name)
 
-	// Generate nil-mask fast path: write all fields without FieldMaskHas checks
-	fmt.Fprintf(b, "\tif len(mask) == 0 {\n")
-	writeArenaLenCalc(b, m, recv, enums, false, "\t\t")
-	generateWriteLuxoAllFields(b, m, recv, enums)
-	fmt.Fprintf(b, "\t\tbuf.B = append(buf.B, 0x00)\n")
-	fmt.Fprintf(b, "\t\treturn\n")
-	fmt.Fprintf(b, "\t}\n")
+	// Output directives must also run for SELECT *, so those models use the
+	// directive-aware path even when the field mask is empty.
+	if !hasOutputDirectives(m) {
+		fmt.Fprintf(b, "\tif len(mask) == 0 {\n")
+		writeArenaLenCalc(b, m, recv, enums, false, "\t\t")
+		generateWriteLuxoAllFields(b, m, recv, enums)
+		fmt.Fprintf(b, "\t\tbuf.B = append(buf.B, 0x00)\n")
+		fmt.Fprintf(b, "\t\treturn\n")
+		fmt.Fprintf(b, "\t}\n")
+	}
 
 	// Slow path: arena len with mask checks, then field encoding
 	writeArenaLenCalc(b, m, recv, enums, true, "\t")
@@ -306,6 +329,15 @@ func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bo
 
 	fmt.Fprintf(b, "\tbuf.B = append(buf.B, 0x00)\n")
 	fmt.Fprintf(b, "}\n\n")
+}
+
+func hasOutputDirectives(model *ast.ModelDecl) bool {
+	for _, field := range model.Fields {
+		if hasDirective(field.Directives, "mask") || hasDirective(field.Directives, "transform") || hasDirective(field.Directives, "visible") {
+			return true
+		}
+	}
+	return false
 }
 
 // writeModelFieldEncoding writes the binary encoding for a single model field.
@@ -425,7 +457,7 @@ func generateTypeWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[strin
 	writeArenaLenCalc(b, m, recv, enums, false, "\t")
 
 	for _, f := range m.Fields {
-		if f.Type == nil {
+		if f.Type == nil || hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
 			continue
 		}
 		fieldID := getModelFieldID(name, f.Name)
@@ -434,45 +466,38 @@ func generateTypeWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[strin
 		}
 		goField := recv + "." + str.Capitalize(f.Name)
 		fid := fmt.Sprintf("%d", fieldID)
+		indent := "\t"
+		visibleExpr := compileVisibleDirectiveExpr(f)
+		if visibleExpr != "" {
+			fmt.Fprintf(b, "\tif %s {\n", visibleExpr)
+			indent = "\t\t"
+		}
+		goField = writeTransformDirectiveAt(b, f, goField, indent)
+		goField = writeMaskDirectiveAt(b, f, goField, f.Type.Name, indent)
 
 		if isRelationField(f, enums) {
 			// Nested model/type reference — write inline with WriteLuxo
 			if f.Type.IsList {
-				fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
-				fmt.Fprintf(b, "\tbuf.B = codec.AppendSvarint(buf.B, int64(len(%s)))\n", goField)
-				fmt.Fprintf(b, "\tfor i := range %s { %s[i].WriteLuxo(buf, nil) }\n", goField, goField)
+				fmt.Fprintf(b, "%sbuf.B = codec.AppendVarint(buf.B, %s)\n", indent, fid)
+				fmt.Fprintf(b, "%sbuf.B = codec.AppendSvarint(buf.B, int64(len(%s)))\n", indent, goField)
+				fmt.Fprintf(b, "%sfor i := range %s { %s[i].WriteLuxo(buf, nil) }\n", indent, goField, goField)
 			} else if f.Type.Nullable {
-				fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
-				fmt.Fprintf(b, "\tif %s != nil { buf.B = codec.AppendPresent(buf.B); %s.WriteLuxo(buf, nil) } else { buf.B = codec.AppendNull(buf.B) }\n", goField, goField)
+				fmt.Fprintf(b, "%sbuf.B = codec.AppendVarint(buf.B, %s)\n", indent, fid)
+				fmt.Fprintf(b, "%sif %s != nil { buf.B = codec.AppendPresent(buf.B); %s.WriteLuxo(buf, nil) } else { buf.B = codec.AppendNull(buf.B) }\n", indent, goField, goField)
 			} else {
-				fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s)\n", fid)
-				fmt.Fprintf(b, "\t%s.WriteLuxo(buf, nil)\n", goField)
+				fmt.Fprintf(b, "%sbuf.B = codec.AppendVarint(buf.B, %s)\n", indent, fid)
+				fmt.Fprintf(b, "%s%s.WriteLuxo(buf, nil)\n", indent, goField)
 			}
-			continue
+		} else {
+			writeModelFieldEncoding(b, f, fid, goField, enums, indent)
 		}
-
-		// List of scalars: [String], [Int], [Enum], etc.
-		if f.Type.IsList {
-			writeListScalarField(b, f, fid, goField, enums, "\t")
-			continue
+		if visibleExpr != "" {
+			fmt.Fprintf(b, "\t}\n")
 		}
-
-		// Scalar/enum fields
-		if enums[f.Type.Name] {
-			fmt.Fprintf(b, "\tbuf.B = codec.AppendVarint(buf.B, %s); buf.B = codec.AppendString(buf.B, string(%s))\n", fid, goField)
-			continue
-		}
-
-		writeTypeScalarField(b, f, fid, goField)
 	}
 
 	fmt.Fprintf(b, "\tbuf.B = append(buf.B, 0x00)\n")
 	fmt.Fprintf(b, "}\n\n")
-}
-
-// writeTypeScalarField writes a single scalar field for type WriteLuxo, handling nullable.
-func writeTypeScalarField(b *strings.Builder, f *ast.FieldDecl, fid, goField string) {
-	writeScalarEncoding(b, f.Type.Name, f.Type.Nullable, fid, goField, "\t")
 }
 
 // writeListScalarField writes a list of scalar values (count + items) for
@@ -716,6 +741,7 @@ func generateWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[strin
 
 	// Collect encodable fields
 	type fieldMeta struct {
+		decl     *ast.FieldDecl
 		name     string
 		goName   string
 		fieldID  int
@@ -740,6 +766,7 @@ func generateWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[strin
 			continue
 		}
 		fields = append(fields, fieldMeta{
+			decl:     f,
 			name:     f.Name,
 			goName:   str.Capitalize(f.Name),
 			fieldID:  fid,
@@ -762,12 +789,26 @@ func generateWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[strin
 
 	for _, f := range fields {
 		fmt.Fprintf(b, "\tif len(mask) == 0 || codec.FieldMaskHas(mask, %d) {\n", f.fieldID)
-		if f.isList {
-			writeColumnarArrayField(b, f.goName, f.fieldID, f.typeName, f.isEnum)
-		} else if f.nullable || f.isEnum {
-			writeColumnarNullableField(b, f.goName, f.fieldID, f.typeName, f.isEnum, f.nullable)
+		visibleExpr := compileVisibleDirectiveExpr(f.decl)
+		if visibleExpr != "" {
+			fmt.Fprintf(b, "\t\tif %s {\n", visibleExpr)
+		}
+		sourceExpr := "item." + f.goName
+		if f.nullable && !f.isList {
+			valueExpr := compileTransformDirectiveExpr(f.decl, "*"+sourceExpr)
+			valueExpr = compileMaskDirectiveExpr(f.decl, valueExpr, f.typeName)
+			writeColumnarNullableValueField(b, sourceExpr, valueExpr, f.fieldID, f.typeName, f.isEnum)
 		} else {
-			writeColumnarField(b, f.goName, f.fieldID, f.typeName)
+			valueExpr := compileTransformDirectiveExpr(f.decl, sourceExpr)
+			valueExpr = compileMaskDirectiveExpr(f.decl, valueExpr, f.typeName)
+			if f.isList {
+				writeColumnarArrayField(b, valueExpr, f.fieldID, f.typeName, f.isEnum)
+			} else {
+				writeColumnarValueField(b, valueExpr, f.fieldID, f.typeName, f.isEnum)
+			}
+		}
+		if visibleExpr != "" {
+			fmt.Fprintf(b, "\t\t}\n")
 		}
 		fmt.Fprintf(b, "\t}\n")
 	}
@@ -776,115 +817,164 @@ func generateWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[strin
 	fmt.Fprintf(b, "}\n\n")
 }
 
-func writeColumnarField(b *strings.Builder, goName string, fieldID int, typeName string) {
-	switch typeName {
-	case "Int":
-		fmt.Fprintf(b, "\t{\n\t\tvals := make([]int64, len(items))\n")
-		fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = item.%s }\n", goName)
-		fmt.Fprintf(b, "\t\tw.WriteColumnInt(%d, vals)\n\t}\n", fieldID)
-	case "Float":
-		fmt.Fprintf(b, "\t{\n\t\tvals := make([]float64, len(items))\n")
-		fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = item.%s }\n", goName)
-		fmt.Fprintf(b, "\t\tw.WriteColumnFloat(%d, vals)\n\t}\n", fieldID)
-	case "String":
-		fmt.Fprintf(b, "\t{\n\t\tvals := make([]string, len(items))\n")
-		fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = item.%s }\n", goName)
-		fmt.Fprintf(b, "\t\tw.WriteColumnString(%d, vals)\n\t}\n", fieldID)
-	case "Boolean":
-		fmt.Fprintf(b, "\t{\n\t\tvals := make([]bool, len(items))\n")
-		fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = item.%s }\n", goName)
-		fmt.Fprintf(b, "\t\tw.WriteColumnBool(%d, vals)\n\t}\n", fieldID)
-	case "DateTime":
-		fmt.Fprintf(b, "\t{\n\t\tvals := make([]int64, len(items))\n")
-		fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = item.%s.Unix() }\n", goName)
-		fmt.Fprintf(b, "\t\tw.WriteColumnInt(%d, vals)\n\t}\n", fieldID)
-	case "Duration":
-		fmt.Fprintf(b, "\t{\n\t\tvals := make([]int64, len(items))\n")
-		fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = int64(item.%s) }\n", goName)
-		fmt.Fprintf(b, "\t\tw.WriteColumnInt(%d, vals)\n\t}\n", fieldID)
-	case "UUID":
-		fmt.Fprintf(b, "\t{\n\t\tvals := make([][16]byte, len(items))\n")
-		fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = [16]byte(item.%s) }\n", goName)
-		fmt.Fprintf(b, "\t\tw.WriteColumnUUID(%d, vals)\n\t}\n", fieldID)
-	case "Decimal":
-		fmt.Fprintf(b, "\t{\n\t\tvals := make([]string, len(items))\n")
-		fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = item.%s.String() }\n", goName)
-		fmt.Fprintf(b, "\t\tw.WriteColumnString(%d, vals)\n\t}\n", fieldID)
-	case "Bytes", "JSON":
-		fmt.Fprintf(b, "\t{\n\t\tvals := make([][]byte, len(items))\n")
-		fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = item.%s }\n", goName)
-		fmt.Fprintf(b, "\t\tw.WriteColumnBytes(%d, vals)\n\t}\n", fieldID)
-	}
+func writeColumnarMaskedStringField(b *strings.Builder, field *ast.FieldDecl, goName string, fieldID int) {
+	expression := compileMaskDirectiveExpr(field, "item."+goName, "String")
+	writeColumnarValueField(b, expression, fieldID, "String", false)
 }
 
-func writeColumnarNullableField(b *strings.Builder, goName string, fieldID int, typeName string, isEnum, nullable bool) {
-	if isEnum {
-		if nullable {
-			fmt.Fprintf(b, "\t{\n\t\tvals := make([]*string, len(items))\n")
-			fmt.Fprintf(b, "\t\tfor i, item := range items {\n")
-			fmt.Fprintf(b, "\t\t\tif item.%s != nil { s := string(*item.%s); vals[i] = &s }\n", goName, goName)
-			fmt.Fprintf(b, "\t\t}\n")
-			fmt.Fprintf(b, "\t\tw.WriteColumnStringPtr(%d, vals)\n\t}\n", fieldID)
-		} else {
-			fmt.Fprintf(b, "\t{\n\t\tvals := make([]string, len(items))\n")
-			fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = string(item.%s) }\n", goName)
-			fmt.Fprintf(b, "\t\tw.WriteColumnString(%d, vals)\n\t}\n", fieldID)
+// generateTypeWriteColumnar generates WriteColumnar for a type declaration.
+// Lists are always columnar on the wire (protocol.md), so native APIs that
+// return [Type] need this writer. Unlike model columnar (which skips DB
+// relations — federation resolves those), type declarations own their nested
+// values, so nested type/model references become blob columns:
+//   - single nested value → cell holds its row-wise WriteLuxo bytes
+//   - nested list → cell holds the columnar encoding of that record's items
+//
+// Value-slice signature — native resolvers return []Type, not []*Type.
+func generateTypeWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
+	name := m.Name
+
+	hasFields := false
+	for _, f := range m.Fields {
+		if f.Type != nil && !hasDirective(f.Directives, "hidden") && !hasDirective(f.Directives, "internal") && getModelFieldID(name, f.Name) != 0 {
+			hasFields = true
+			break
 		}
+	}
+	if !hasFields {
 		return
 	}
-	// Nullable scalar
-	switch typeName {
-	case "Int":
-		fmt.Fprintf(b, "\t{\n\t\tvals := make([]*int64, len(items))\n")
-		fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = item.%s }\n", goName)
-		fmt.Fprintf(b, "\t\tw.WriteColumnIntPtr(%d, vals)\n\t}\n", fieldID)
-	case "Float":
-		fmt.Fprintf(b, "\t{\n\t\tvals := make([]*float64, len(items))\n")
-		fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = item.%s }\n", goName)
-		fmt.Fprintf(b, "\t\tw.WriteColumnFloatPtr(%d, vals)\n\t}\n", fieldID)
-	case "String":
-		fmt.Fprintf(b, "\t{\n\t\tvals := make([]*string, len(items))\n")
-		fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = item.%s }\n", goName)
-		fmt.Fprintf(b, "\t\tw.WriteColumnStringPtr(%d, vals)\n\t}\n", fieldID)
-	case "Boolean":
-		fmt.Fprintf(b, "\t{\n\t\tvals := make([]*bool, len(items))\n")
-		fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = item.%s }\n", goName)
-		fmt.Fprintf(b, "\t\tw.WriteColumnBoolPtr(%d, vals)\n\t}\n", fieldID)
-	case "DateTime":
-		fmt.Fprintf(b, "\t{\n\t\tvals := make([]*int64, len(items))\n")
-		fmt.Fprintf(b, "\t\tfor i, item := range items {\n")
-		fmt.Fprintf(b, "\t\t\tif item.%s != nil { v := item.%s.Unix(); vals[i] = &v }\n", goName, goName)
-		fmt.Fprintf(b, "\t\t}\n")
-		fmt.Fprintf(b, "\t\tw.WriteColumnIntPtr(%d, vals)\n\t}\n", fieldID)
-	case "Duration":
-		fmt.Fprintf(b, "\t{\n\t\tvals := make([]*int64, len(items))\n")
-		fmt.Fprintf(b, "\t\tfor i, item := range items {\n")
-		fmt.Fprintf(b, "\t\t\tif item.%s != nil { v := int64(*item.%s); vals[i] = &v }\n", goName, goName)
-		fmt.Fprintf(b, "\t\t}\n")
-		fmt.Fprintf(b, "\t\tw.WriteColumnIntPtr(%d, vals)\n\t}\n", fieldID)
-	case "UUID":
-		fmt.Fprintf(b, "\t{\n\t\tvals := make([]*[16]byte, len(items))\n")
-		fmt.Fprintf(b, "\t\tfor i, item := range items {\n")
-		fmt.Fprintf(b, "\t\t\tif item.%s != nil { u := [16]byte(*item.%s); vals[i] = &u }\n", goName, goName)
-		fmt.Fprintf(b, "\t\t}\n")
-		fmt.Fprintf(b, "\t\tw.WriteColumnUUIDPtr(%d, vals)\n\t}\n", fieldID)
-	case "Decimal":
-		fmt.Fprintf(b, "\t{\n\t\tvals := make([]*string, len(items))\n")
-		fmt.Fprintf(b, "\t\tfor i, item := range items {\n")
-		fmt.Fprintf(b, "\t\t\tif item.%s != nil { s := item.%s.String(); vals[i] = &s }\n", goName, goName)
-		fmt.Fprintf(b, "\t\t}\n")
-		fmt.Fprintf(b, "\t\tw.WriteColumnStringPtr(%d, vals)\n\t}\n", fieldID)
-	case "Bytes", "JSON":
-		fmt.Fprintf(b, "\t{\n\t\tvals := make([]*[]byte, len(items))\n")
-		fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = item.%s }\n", goName)
-		fmt.Fprintf(b, "\t\tw.WriteColumnBytesPtr(%d, vals)\n\t}\n", fieldID)
+
+	fmt.Fprintf(b, "// WriteColumnar%s writes a list of %s in columnar format.\n", name, name)
+	fmt.Fprintf(b, "// Nested type/model fields are encoded as blob columns.\n")
+	fmt.Fprintf(b, "func WriteColumnar%s(buf *api.ResponseBuf, items []%s, mask []byte) {\n", name, name)
+	fmt.Fprintf(b, "\tw := &codec.ColumnarWriter{}\n")
+	fmt.Fprintf(b, "\tw.SetCount(len(items))\n")
+
+	for _, f := range m.Fields {
+		if f.Type == nil || hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
+			continue
+		}
+		fid := getModelFieldID(name, f.Name)
+		if fid == 0 {
+			continue
+		}
+		goName := str.Capitalize(f.Name)
+		fmt.Fprintf(b, "\tif len(mask) == 0 || codec.FieldMaskHas(mask, %d) {\n", fid)
+		visibleExpr := compileVisibleDirectiveExpr(f)
+		if visibleExpr != "" {
+			fmt.Fprintf(b, "\t\tif %s {\n", visibleExpr)
+		}
+		switch {
+		case isRelationField(f, enums):
+			writeColumnarNestedBlobField(b, goName, fid, f.Type)
+		case f.Type.IsList:
+			valueExpr := compileTransformDirectiveExpr(f, "item."+goName)
+			writeColumnarArrayField(b, valueExpr, fid, f.Type.Name, enums[f.Type.Name])
+		case f.Type.Nullable && !f.Type.IsList:
+			sourceExpr := "item." + goName
+			valueExpr := compileTransformDirectiveExpr(f, "*"+sourceExpr)
+			valueExpr = compileMaskDirectiveExpr(f, valueExpr, f.Type.Name)
+			writeColumnarNullableValueField(b, sourceExpr, valueExpr, fid, f.Type.Name, enums[f.Type.Name])
+		default:
+			valueExpr := compileTransformDirectiveExpr(f, "item."+goName)
+			valueExpr = compileMaskDirectiveExpr(f, valueExpr, f.Type.Name)
+			writeColumnarValueField(b, valueExpr, fid, f.Type.Name, enums[f.Type.Name])
+		}
+		if visibleExpr != "" {
+			fmt.Fprintf(b, "\t\t}\n")
+		}
+		fmt.Fprintf(b, "\t}\n")
 	}
+
+	fmt.Fprintf(b, "\tbuf.B = append(buf.B, w.Bytes()...)\n")
+	fmt.Fprintf(b, "}\n\n")
+}
+
+// writeColumnarNestedBlobField encodes a nested type/model field as a blob column.
+func writeColumnarNestedBlobField(b *strings.Builder, goName string, fieldID int, t *ast.TypeRef) {
+	fmt.Fprintf(b, "\t{\n\t\tvals := make([][]byte, len(items))\n")
+	switch {
+	case t.IsList:
+		// Cell = columnar encoding of this record's nested items
+		fmt.Fprintf(b, "\t\tfor i := range items {\n")
+		fmt.Fprintf(b, "\t\t\tvar nb api.ResponseBuf\n")
+		fmt.Fprintf(b, "\t\t\tWriteColumnar%s(&nb, items[i].%s, nil)\n", t.Name, goName)
+		fmt.Fprintf(b, "\t\t\tvals[i] = nb.B\n")
+		fmt.Fprintf(b, "\t\t}\n")
+	case t.Nullable:
+		// Empty cell → converter renders null
+		fmt.Fprintf(b, "\t\tfor i := range items {\n")
+		fmt.Fprintf(b, "\t\t\tif items[i].%s != nil {\n", goName)
+		fmt.Fprintf(b, "\t\t\t\tvar nb api.ResponseBuf\n")
+		fmt.Fprintf(b, "\t\t\t\titems[i].%s.WriteLuxo(&nb, nil)\n", goName)
+		fmt.Fprintf(b, "\t\t\t\tvals[i] = nb.B\n")
+		fmt.Fprintf(b, "\t\t\t}\n")
+		fmt.Fprintf(b, "\t\t}\n")
+	default:
+		fmt.Fprintf(b, "\t\tfor i := range items {\n")
+		fmt.Fprintf(b, "\t\t\tvar nb api.ResponseBuf\n")
+		fmt.Fprintf(b, "\t\t\titems[i].%s.WriteLuxo(&nb, nil)\n", goName)
+		fmt.Fprintf(b, "\t\t\tvals[i] = nb.B\n")
+		fmt.Fprintf(b, "\t\t}\n")
+	}
+	fmt.Fprintf(b, "\t\tw.WriteColumnBytes(%d, vals)\n\t}\n", fieldID)
+}
+
+type columnarScalarSpec struct {
+	goType   string
+	write    string
+	valueFmt string
+}
+
+func columnarSpec(typeName string, isEnum bool) (columnarScalarSpec, bool) {
+	if isEnum {
+		return columnarScalarSpec{goType: "string", write: "String", valueFmt: "string(%s)"}, true
+	}
+	specs := map[string]columnarScalarSpec{
+		"Int":      {goType: "int64", write: "Int", valueFmt: "%s"},
+		"Float":    {goType: "float64", write: "Float", valueFmt: "%s"},
+		"String":   {goType: "string", write: "String", valueFmt: "%s"},
+		"Boolean":  {goType: "bool", write: "Bool", valueFmt: "%s"},
+		"DateTime": {goType: "int64", write: "Int", valueFmt: "(%s).Unix()"},
+		"Duration": {goType: "int64", write: "Int", valueFmt: "int64(%s)"},
+		"UUID":     {goType: "[16]byte", write: "UUID", valueFmt: "[16]byte(%s)"},
+		"Decimal":  {goType: "string", write: "String", valueFmt: "(%s).String()"},
+		"Bytes":    {goType: "[]byte", write: "Bytes", valueFmt: "%s"},
+		"JSON":     {goType: "[]byte", write: "Bytes", valueFmt: "%s"},
+	}
+	spec, ok := specs[typeName]
+	return spec, ok
+}
+
+func writeColumnarValueField(b *strings.Builder, valueExpr string, fieldID int, typeName string, isEnum bool) {
+	spec, ok := columnarSpec(typeName, isEnum)
+	if !ok {
+		return
+	}
+	encodedExpr := fmt.Sprintf(spec.valueFmt, valueExpr)
+	fmt.Fprintf(b, "\t{\n\t\tvals := make([]%s, len(items))\n", spec.goType)
+	fmt.Fprintf(b, "\t\tfor i, item := range items { vals[i] = %s }\n", encodedExpr)
+	fmt.Fprintf(b, "\t\tw.WriteColumn%s(%d, vals)\n\t}\n", spec.write, fieldID)
+}
+
+func writeColumnarNullableValueField(b *strings.Builder, pointerExpr, valueExpr string, fieldID int, typeName string, isEnum bool) {
+	spec, ok := columnarSpec(typeName, isEnum)
+	if !ok {
+		return
+	}
+	encodedExpr := fmt.Sprintf(spec.valueFmt, valueExpr)
+	fmt.Fprintf(b, "\t{\n\t\tvals := make([]*%s, len(items))\n", spec.goType)
+	fmt.Fprintf(b, "\t\tfor i, item := range items {\n")
+	fmt.Fprintf(b, "\t\t\tif %s != nil { v := %s; vals[i] = &v }\n", pointerExpr, encodedExpr)
+	fmt.Fprintf(b, "\t\t}\n")
+	fmt.Fprintf(b, "\t\tw.WriteColumn%sPtr(%d, vals)\n\t}\n", spec.write, fieldID)
 }
 
 // writeColumnarArrayField encodes a scalar array field ([T]) as a Bytes column:
 // each record's cell is an inline array encoding [count][items...], per the
 // protocol's columnar array-field definition.
-func writeColumnarArrayField(b *strings.Builder, goName string, fieldID int, elemType string, isEnum bool) {
+func writeColumnarArrayField(b *strings.Builder, valueExpr string, fieldID int, elemType string, isEnum bool) {
 	var itemExpr string
 	switch {
 	case isEnum:
@@ -912,9 +1002,10 @@ func writeColumnarArrayField(b *strings.Builder, goName string, fieldID int, ele
 	}
 	fmt.Fprintf(b, "\t{\n\t\tcells := make([][]byte, len(items))\n")
 	fmt.Fprintf(b, "\t\tfor i, item := range items {\n")
+	fmt.Fprintf(b, "\t\t\tvalues := %s\n", valueExpr)
 	fmt.Fprintf(b, "\t\t\tvar cb []byte\n")
-	fmt.Fprintf(b, "\t\t\tcb = codec.AppendArrayHeader(cb, len(item.%s))\n", goName)
-	fmt.Fprintf(b, "\t\t\tfor _, v := range item.%s { cb = %s }\n", goName, itemExpr)
+	fmt.Fprintf(b, "\t\t\tcb = codec.AppendArrayHeader(cb, len(values))\n")
+	fmt.Fprintf(b, "\t\t\tfor _, v := range values { cb = %s }\n", itemExpr)
 	fmt.Fprintf(b, "\t\t\tcells[i] = cb\n")
 	fmt.Fprintf(b, "\t\t}\n")
 	fmt.Fprintf(b, "\t\tw.WriteColumnBytes(%d, cells)\n\t}\n", fieldID)
@@ -922,44 +1013,72 @@ func writeColumnarArrayField(b *strings.Builder, goName string, fieldID int, ele
 
 // writeMaskDirective generates @mask logic for a field. Returns the (possibly modified) goField name.
 func writeMaskDirective(b *strings.Builder, f *ast.FieldDecl, goField, baseType string) string {
-	maskDir := findDirective(f.Directives, "mask")
-	if maskDir == nil || baseType != "String" || f.Type.Nullable {
+	return writeMaskDirectiveAt(b, f, goField, baseType, "\t\t")
+}
+
+func writeMaskDirectiveAt(b *strings.Builder, f *ast.FieldDecl, goField, baseType, indent string) string {
+	if f.Type != nil && f.Type.Nullable && !f.Type.IsList {
+		maskedExpr := compileMaskDirectiveExpr(f, "*"+goField, baseType)
+		if maskedExpr == "*"+goField {
+			return goField
+		}
+		maskedVar := f.Name + "Masked"
+		fmt.Fprintf(b, "%svar %s *string\n", indent, maskedVar)
+		fmt.Fprintf(b, "%sif %s != nil { %sValue := %s; %s = &%sValue }\n",
+			indent, goField, maskedVar, maskedExpr, maskedVar, maskedVar)
+		return maskedVar
+	}
+	maskedExpr := compileMaskDirectiveExpr(f, goField, baseType)
+	if maskedExpr == goField {
 		return goField
 	}
 	maskedVar := f.Name + "Masked"
-	if hasDirective(f.Directives, "email") {
-		fmt.Fprintf(b, "\t\t%s := str.MaskEmail(%s)\n", maskedVar, goField)
-	} else if len(maskDir.Args) >= 2 {
-		prefixLit, _ := maskDir.Args[0].Value.(*ast.Literal)
-		suffixLit, _ := maskDir.Args[1].Value.(*ast.Literal)
-		if prefixLit != nil && suffixLit != nil {
-			fmt.Fprintf(b, "\t\t%s := str.Mask(%s, %s, %s)\n", maskedVar, goField, prefixLit.Value, suffixLit.Value)
-		} else {
-			return goField
-		}
-	} else {
-		fmt.Fprintf(b, "\t\t%s := str.Mask(%s, 3, 4)\n", maskedVar, goField)
-	}
+	fmt.Fprintf(b, "%s%s := %s\n", indent, maskedVar, maskedExpr)
 	return maskedVar
+}
+
+func compileMaskDirectiveExpr(f *ast.FieldDecl, valueExpr, baseType string) string {
+	maskDir := findDirective(f.Directives, "mask")
+	if maskDir == nil || baseType != "String" {
+		return valueExpr
+	}
+	if hasDirective(f.Directives, "email") {
+		return fmt.Sprintf("str.MaskEmail(%s)", valueExpr)
+	}
+	if len(maskDir.Args) == 0 {
+		return fmt.Sprintf("str.Mask(%s, 3, 4)", valueExpr)
+	}
+	if len(maskDir.Args) != 1 {
+		return fmt.Sprintf("str.MaskPattern(%s, %q)", valueExpr, "")
+	}
+	pattern, ok := maskDir.Args[0].Value.(*ast.Literal)
+	if !ok || pattern.Kind != token.String {
+		return fmt.Sprintf("str.MaskPattern(%s, %q)", valueExpr, "")
+	}
+	return fmt.Sprintf("str.MaskPattern(%s, %q)", valueExpr, pattern.Value)
 }
 
 // writeVisibleDirective generates @visible condition check.
 // @visible { my.role == "admin" } → skip field if identity doesn't match.
 func writeVisibleDirective(b *strings.Builder, f *ast.FieldDecl) bool {
-	visibleDir := findDirective(f.Directives, "visible")
-	if visibleDir == nil || visibleDir.Body == nil || len(visibleDir.Body.Stmts) == 0 {
-		return false
-	}
-	es, ok := visibleDir.Body.Stmts[0].(*ast.ExprStmt)
-	if !ok || es.Expr == nil {
-		return false
-	}
-	cond := compileVisibleExpr(es.Expr)
+	cond := compileVisibleDirectiveExpr(f)
 	if cond == "" {
 		return false
 	}
 	fmt.Fprintf(b, "\t if %s {\n", cond)
 	return true
+}
+
+func compileVisibleDirectiveExpr(f *ast.FieldDecl) string {
+	visibleDir := findDirective(f.Directives, "visible")
+	if visibleDir == nil || visibleDir.Body == nil || len(visibleDir.Body.Stmts) == 0 {
+		return ""
+	}
+	es, ok := visibleDir.Body.Stmts[0].(*ast.ExprStmt)
+	if !ok || es.Expr == nil {
+		return ""
+	}
+	return compileVisibleExpr(es.Expr)
 }
 
 // compileVisibleExpr compiles a @visible body expression to Go.
@@ -992,21 +1111,45 @@ func compileVisibleExpr(expr ast.Expr) string {
 
 // writeTransformDirective generates @transform { body } value transformation.
 func writeTransformDirective(b *strings.Builder, f *ast.FieldDecl, goField string) string {
-	transformDir := findDirective(f.Directives, "transform")
-	if transformDir == nil || transformDir.Body == nil || len(transformDir.Body.Stmts) == 0 {
-		return goField
+	return writeTransformDirectiveAt(b, f, goField, "\t\t")
+}
+
+func writeTransformDirectiveAt(b *strings.Builder, f *ast.FieldDecl, goField, indent string) string {
+	valueField := goField
+	if f.Type != nil && f.Type.Nullable && !f.Type.IsList {
+		valueField = "*" + goField
 	}
-	es, ok := transformDir.Body.Stmts[0].(*ast.ExprStmt)
-	if !ok || es.Expr == nil {
-		return goField
-	}
-	code := compileFieldExpr(es.Expr, goField)
-	if code == "" {
+	code := compileTransformDirectiveExpr(f, valueField)
+	if code == valueField {
 		return goField
 	}
 	transformedVar := f.Name + "Transformed"
-	fmt.Fprintf(b, "\t\t%s := %s\n", transformedVar, code)
+	if f.Type != nil && f.Type.Nullable && !f.Type.IsList {
+		baseType := *f.Type
+		baseType.Nullable = false
+		fmt.Fprintf(b, "%svar %s *%s\n", indent, transformedVar, resolveGoType(&baseType))
+		fmt.Fprintf(b, "%sif %s != nil { %sValue := %s; %s = &%sValue }\n",
+			indent, goField, transformedVar, code, transformedVar, transformedVar)
+		return transformedVar
+	}
+	fmt.Fprintf(b, "%s%s := %s\n", indent, transformedVar, code)
 	return transformedVar
+}
+
+func compileTransformDirectiveExpr(f *ast.FieldDecl, valueExpr string) string {
+	transformDir := findDirective(f.Directives, "transform")
+	if transformDir == nil || transformDir.Body == nil || len(transformDir.Body.Stmts) == 0 {
+		return valueExpr
+	}
+	es, ok := transformDir.Body.Stmts[0].(*ast.ExprStmt)
+	if !ok || es.Expr == nil {
+		return valueExpr
+	}
+	code := compileFieldExpr(es.Expr, valueExpr)
+	if code == "" {
+		return valueExpr
+	}
+	return code
 }
 
 // Removed: inferVisibleIdentityType — now uses shared inferMyFieldType from identity.go

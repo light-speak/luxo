@@ -1,8 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"fmt"
-	"os"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,28 +13,12 @@ import (
 )
 
 func TestLogRequest_WithError(t *testing.T) {
-	// Enable logging temporarily
-	old := logEnabled
-	v := true
-	logEnabled = &v
-	defer func() { logEnabled = old }()
-
-	rt := NewRouter()
+	var logs bytes.Buffer
+	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, LogWriter: &logs})
 	rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "getUser", Module: "user"})
 
-	// Capture stderr
-	oldStderr := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
-
 	rt.logRequest("getUser", 50*time.Millisecond, fmt.Errorf("InvalidCredentials"))
-
-	w.Close()
-	os.Stderr = oldStderr
-
-	buf := make([]byte, 4096)
-	n, _ := r.Read(buf)
-	output := string(buf[:n])
+	output := logs.String()
 
 	// Should contain the error marker and error message
 	if len(output) == 0 {
@@ -44,28 +31,13 @@ func TestLogRequest_WithError(t *testing.T) {
 }
 
 func TestLogRequest_SlowDuration(t *testing.T) {
-	old := logEnabled
-	v := true
-	logEnabled = &v
-	defer func() { logEnabled = old }()
-
-	rt := NewRouter()
+	var logs bytes.Buffer
+	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, LogWriter: &logs})
 	rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "slowAPI", Module: "slow"})
-
-	// Capture stderr
-	oldStderr := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
 
 	// >500ms should be red
 	rt.logRequest("slowAPI", 600*time.Millisecond, nil)
-
-	w.Close()
-	os.Stderr = oldStderr
-
-	buf := make([]byte, 4096)
-	n, _ := r.Read(buf)
-	output := string(buf[:n])
+	output := logs.String()
 
 	if len(output) == 0 {
 		t.Error("expected log output for slow request")
@@ -73,27 +45,13 @@ func TestLogRequest_SlowDuration(t *testing.T) {
 }
 
 func TestLogRequest_MediumDuration(t *testing.T) {
-	old := logEnabled
-	v := true
-	logEnabled = &v
-	defer func() { logEnabled = old }()
-
-	rt := NewRouter()
+	var logs bytes.Buffer
+	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, LogWriter: &logs})
 	rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "medAPI", Module: "med"})
-
-	oldStderr := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
 
 	// >100ms <500ms should be yellow
 	rt.logRequest("medAPI", 200*time.Millisecond, nil)
-
-	w.Close()
-	os.Stderr = oldStderr
-
-	buf := make([]byte, 4096)
-	n, _ := r.Read(buf)
-	output := string(buf[:n])
+	output := logs.String()
 
 	if len(output) == 0 {
 		t.Error("expected log output for medium request")
@@ -101,37 +59,48 @@ func TestLogRequest_MediumDuration(t *testing.T) {
 }
 
 func TestLogRequest_Disabled(t *testing.T) {
-	old := logEnabled
-	vf := false
-	logEnabled = &vf
-	defer func() { logEnabled = old }()
-
 	rt := NewRouter()
 	// Should not panic or produce output when disabled
 	rt.logRequest("test", time.Millisecond, nil)
 }
 
-func TestLogRequest_NoModule(t *testing.T) {
-	old := logEnabled
-	v := true
-	logEnabled = &v
-	defer func() { logEnabled = old }()
+func TestServeHTTPLogsParseErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		body   string
+		binary bool
+		mode   string
+	}{
+		{name: "JSON", body: "bad", mode: "json"},
+		{name: "binary", body: "", binary: true, mode: "binary"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, LogWriter: &logs})
+			r := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(tt.body))
+			if tt.binary {
+				r.Header.Set("X-Luxo-Mode", "binary")
+			}
+			w := httptest.NewRecorder()
+			rt.ServeHTTP(w, r)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+			}
+			if output := logs.String(); !strings.Contains(output, "[parse]") || !strings.Contains(output, tt.mode) {
+				t.Fatalf("parse log = %q", output)
+			}
+		})
+	}
+}
 
-	rt := NewRouter()
+func TestLogRequest_NoModule(t *testing.T) {
+	var logs bytes.Buffer
+	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, LogWriter: &logs})
 	// API not in schema — should fall back to "api" module
 
-	oldStderr := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
-
 	rt.logRequest("unknownAPI", 5*time.Millisecond, nil)
-
-	w.Close()
-	os.Stderr = oldStderr
-
-	buf := make([]byte, 4096)
-	n, _ := r.Read(buf)
-	output := string(buf[:n])
+	output := logs.String()
 
 	if len(output) == 0 {
 		t.Error("expected log output")

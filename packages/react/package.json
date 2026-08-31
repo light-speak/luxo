@@ -4,8 +4,10 @@
   "description": "Luxo React hooks — useLuxoQuery / useLuxoMutation with compile-time field tracking",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
+  "types": "src/public.d.ts",
   "exports": {
     ".": {
+      "types": "./src/public.d.ts",
       "import": "./dist/index.mjs",
       "require": "./dist/index.js"
     }
@@ -15,7 +17,15 @@
     "src"
   ],
   "license": "Apache-2.0",
-  "keywords": ["luxo", "react", "hooks", "query", "mutation", "field-selection", "api"],
+  "keywords": [
+    "luxo",
+    "react",
+    "hooks",
+    "query",
+    "mutation",
+    "field-selection",
+    "api"
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/light-speak/luxo.git",
@@ -24,6 +34,7 @@
   "homepage": "https://github.com/light-speak/luxo",
   "scripts": {
     "build": "tsup",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "prepublishOnly": "pnpm build"
@@ -33,7 +44,9 @@
     "react": ">=18.0"
   },
   "devDependencies": {
+    "@luxojs/client": "link:../client",
     "@testing-library/react": "^16.3.2",
+    "@types/react": "^19.2.18",
     "jsdom": "^26.1.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",

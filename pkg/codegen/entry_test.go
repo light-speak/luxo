@@ -103,6 +103,32 @@ func TestGenerateEntryFileNoCrud(t *testing.T) {
 	}
 }
 
+// Regression: modules with non-CRUD APIs (e.g. schema introspection) must still
+// emit RegisterHandlers wiring — otherwise their declared APIs are unreachable
+// at runtime (clients see "unknown API ID"). Previously the entry generator
+// only emitted the call when m.hasCrud, dropping such modules silently.
+func TestGenerateEntryFileNonCrudAPIRegistersHandlers(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/schema.luxo",
+			// Pure API module — no models, no @crud, no @service fns.
+			APIs: []*ast.ApiDecl{{
+				Pos:  token.Position{File: "test.luxo", Line: 1, Col: 1},
+				Name: "listServiceSchemas",
+			}},
+		}},
+	}
+	src := GenerateEntryFile(result, "myapp")
+	code := string(src)
+
+	if !strings.Contains(code, `gw.AddModule("schema")`) {
+		t.Error("should add module")
+	}
+	if !strings.Contains(code, "schema_luxo.RegisterHandlers(gw.Router, schemaApp)") {
+		t.Errorf("non-CRUD API module must still RegisterHandlers:\n%s", code)
+	}
+}
+
 func TestGenerateEntryFileWithLoaders(t *testing.T) {
 	// Test that models with relations trigger SetLoaders + NewDefaultLoaders
 	result := &semantic.Result{
@@ -637,6 +663,46 @@ func TestCollectModules(t *testing.T) {
 	}
 }
 
+func TestCollectModulesMarksEventEmitters(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/auth/member.luxo",
+		APIs: []*ast.ApiDecl{{
+			Name: "login",
+			Body: &ast.Block{Stmts: []ast.Stmt{&ast.EmitStmt{EventName: "LoginRecorded"}}},
+		}},
+	}}}
+
+	modules := collectModules(result)
+	if len(modules) != 1 || !modules[0].emitsEvents {
+		t.Fatalf("event emitter must receive EventBus wiring: %#v", modules)
+	}
+	src := string(GenerateEntryFile(result, "myapp"))
+	if !strings.Contains(src, "authApp.EventBus = eventBus") {
+		t.Fatalf("missing emitter EventBus wiring:\n%s", src)
+	}
+}
+
+func TestFileEmitsEventsFromFunctionsAndMiddleware(t *testing.T) {
+	emitBody := func() *ast.Block {
+		return &ast.Block{Stmts: []ast.Stmt{&ast.EmitStmt{EventName: "AuditRecorded"}}}
+	}
+	tests := map[string]*ast.File{
+		"function": {
+			Functions: []*ast.FnDecl{{Name: "audit", Body: emitBody()}},
+		},
+		"middleware": {
+			Middlewares: []*ast.MiddlewareDecl{{Name: "audit", Body: emitBody()}},
+		},
+	}
+	for name, file := range tests {
+		t.Run(name, func(t *testing.T) {
+			if !fileEmitsEvents(file) {
+				t.Fatal("fileEmitsEvents() = false, want true")
+			}
+		})
+	}
+}
+
 func TestCollectModulesWithExtends(t *testing.T) {
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -799,6 +865,32 @@ func TestGenerateGatewayEntryStreamSkip(t *testing.T) {
 
 	if strings.Contains(src, `"watchUsers"`) {
 		t.Errorf("stream API should not be in routing table:\n%s", src)
+	}
+}
+
+func TestGeneratedEntriesRegisterStreams(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Name:   "origin/alert/event.luxo",
+		Events: []*ast.EventDecl{{Name: "AlertFired"}},
+		APIs: []*ast.ApiDecl{{
+			Name:       "liveAlerts",
+			Directives: []*ast.Directive{{Name: "stream", Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "AlertFired"}}}}},
+		}},
+	}}}
+
+	embedded := string(GenerateEntryFile(result, "myapp"))
+	if !strings.Contains(embedded, "alert_luxo.RegisterStreams(gw.Router, eventBus)") {
+		t.Fatalf("embedded entry does not register streams:\n%s", embedded)
+	}
+
+	module := string(GenerateModuleEntryFiles(result, "myapp")["alert"])
+	if !strings.Contains(module, "alert_luxo.RegisterStreams(gw.Router, eventBus)") {
+		t.Fatalf("module entry does not register streams:\n%s", module)
+	}
+
+	gateway := string(GenerateGatewayEntry(result, "myapp"))
+	if !strings.Contains(gateway, "alert_luxo.RegisterStreams(gw.Router, eventBus)") {
+		t.Fatalf("gateway entry does not register streams:\n%s", gateway)
 	}
 }
 

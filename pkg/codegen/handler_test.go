@@ -1069,6 +1069,33 @@ func TestGenerateHandlerWithAuth(t *testing.T) {
 	}
 }
 
+func TestGenerateCRUDHandlerWithModelAuth(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("Project",
+					[]*ast.Directive{crudDirective(), {Name: "auth"}},
+					[]*ast.FieldDecl{
+						testField("id", "Int", directive("id"), directive("auto")),
+						testField("name", "String"),
+					},
+				),
+			},
+		}},
+	}
+	src := generateHandlerFile(result, "luxo", nil)
+	if src == nil {
+		t.Fatal("should generate handler file")
+	}
+	code := string(src)
+	if got := strings.Count(code, "luvia.Identity(ctx)"); got != len(crudOps) {
+		t.Errorf("@auth model should protect all %d CRUD handlers, got %d guards", len(crudOps), got)
+	}
+	if !strings.Contains(code, `"github.com/light-speak/luxo/pkg/lux/luvia"`) {
+		t.Error("should import luvia when a CRUD model uses @auth")
+	}
+}
+
 // TestGenerateHandlerWithoutAuth verifies that models without @withAuth
 // do NOT inject auth guards.
 func TestGenerateHandlerWithoutAuth(t *testing.T) {
@@ -1210,8 +1237,8 @@ func TestWriteAuthCheckMultipleRoles(t *testing.T) {
 	if !strings.Contains(code, "switch identity.String(\"role\")") {
 		t.Errorf("multi-role switch missing:\n%s", code)
 	}
-	if !strings.Contains(code, `case "Admin"`) || !strings.Contains(code, `case "Moderator"`) {
-		t.Errorf("role cases missing:\n%s", code)
+	if !strings.Contains(code, `case "Admin", "Moderator":`) {
+		t.Errorf("roles must share one case so every role authorizes:\n%s", code)
 	}
 }
 
@@ -1538,6 +1565,9 @@ func TestResolveParamTypeFromAST(t *testing.T) {
 	if got := resolveParamTypeFromAST("getUser", "id"); got != "UUID" {
 		t.Fatalf("should use AST type, got %q", got)
 	}
+	if got := resolveParamTypeFromAST("svc:getUser", "id"); got != "UUID" {
+		t.Fatalf("service API should use the unprefixed AST type, got %q", got)
+	}
 	// Missing param in AST — fallback
 	if got := resolveParamTypeFromAST("getUser", "name"); got != "String" {
 		t.Fatalf("missing param should fallback, got %q", got)
@@ -1714,7 +1744,7 @@ func TestWriteHandlerImportsAllFeatures(t *testing.T) {
 		},
 	}
 	result := &semantic.Result{Files: []*ast.File{{}}}
-	writeHandlerImports(&b, result, models, handlerFeatures{hasOrGroups: true, hasSortable: true, hasAwait: true, hasTransaction: true, hasTemplateStr: true, hasAuth: true})
+	writeHandlerImports(&b, result, models, handlerFeatures{hasOrGroups: true, hasSortable: true, hasAwait: true, hasTransaction: true, hasTemplateStr: true, hasAuth: true}, true)
 	out := b.String()
 	if !strings.Contains(out, `"strconv"`) {
 		t.Fatalf("hasOrGroups should add strconv import, got:\n%s", out)
@@ -1752,10 +1782,24 @@ func TestWriteHandlerImportsNoHashWithoutWriteOps(t *testing.T) {
 			{Name: "password", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hash"}}},
 		},
 	}}
-	writeHandlerImports(&b, result, models, handlerFeatures{})
+	writeHandlerImports(&b, result, models, handlerFeatures{}, true)
 	out := b.String()
 	if strings.Contains(out, "luxocrypto") {
 		t.Fatalf("read-only CRUD with @hash should not add luxocrypto, got:\n%s", out)
+	}
+}
+
+func TestWriteHandlerImportsUsesGeneratedBody(t *testing.T) {
+	var b strings.Builder
+	result := &semantic.Result{Files: []*ast.File{{}}}
+	body := "func handle() { _, _ = luxocrypto.HashPassword(password) }"
+	writeHandlerImports(&b, result, nil, handlerFeatures{hasEmit: true}, false, body)
+	out := b.String()
+	if !strings.Contains(out, "luxocrypto") {
+		t.Fatalf("generated crypto reference should add import, got:\n%s", out)
+	}
+	if strings.Contains(out, `"fmt"`) || strings.Contains(out, `"strings"`) {
+		t.Fatalf("unused imports should not be inferred from declarations, got:\n%s", out)
 	}
 }
 
@@ -2032,12 +2076,13 @@ func TestNativeAPIHandler(t *testing.T) {
 		t.Error("struct return should use WriteLuxo")
 	}
 
-	// List of struct return — length prefix + per-item WriteLuxo
-	if !strings.Contains(code, "codec.AppendSvarint(req.Buf.B, int64(len(result)))") {
-		t.Error("list return should write length prefix")
+	// List of struct return — columnar (the wire protocol for ALL list
+	// responses; Luvia's BinaryListToJSON reads columnar)
+	if !strings.Contains(code, "WriteColumnarErrorBreakdown(req.Buf, result, req.FieldMask)") {
+		t.Error("list of type should encode columnar")
 	}
-	if !strings.Contains(code, "result[i].WriteLuxo(req.Buf, req.FieldMask)") {
-		t.Error("list of struct should write each item via WriteLuxo")
+	if strings.Contains(code, "result[i].WriteLuxo(req.Buf, req.FieldMask)") {
+		t.Error("list of struct must NOT be row-wise — Luvia can't decode it")
 	}
 
 	// Registration in RegisterHandlers
@@ -2046,6 +2091,34 @@ func TestNativeAPIHandler(t *testing.T) {
 	}
 	if !strings.Contains(code, `router.Handle("getErrorBreakdown"`) {
 		t.Error("native API should be registered in RegisterHandlers")
+	}
+}
+
+func TestNativeAPIHandlerModelList(t *testing.T) {
+	// Native API returning [Model] — resolver returns a VALUE slice []Model,
+	// but WriteColumnarModel takes []*Model, so the handler needs an adapter.
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Name: "origin/user.luxo",
+			Models: []*ast.ModelDecl{
+				testModel("User", []*ast.Directive{crudDirective()}, []*ast.FieldDecl{
+					testField("id", "Int", directive("id"), directive("auto")),
+				}),
+			},
+			APIs: []*ast.ApiDecl{{
+				Name:       "topUsers",
+				Directives: []*ast.Directive{{Name: "native"}},
+				ReturnType: &ast.TypeRef{Name: "User", IsList: true},
+			}},
+		}},
+	}
+
+	code := string(generateHandlerFile(result, "luxo", nil))
+	if !strings.Contains(code, "_ptrs[i] = &result[i]") {
+		t.Errorf("model list should build pointer slice adapter:\n%s", code)
+	}
+	if !strings.Contains(code, "WriteColumnarUser(req.Buf, _ptrs, req.FieldMask)") {
+		t.Errorf("model list should encode columnar via pointer slice:\n%s", code)
 	}
 }
 
@@ -2064,7 +2137,7 @@ func TestNativeAPIHandlerReturnTypes(t *testing.T) {
 			Name:       "test",
 			Directives: []*ast.Directive{{Name: "native"}},
 			ReturnType: tt.retType,
-		})
+		}, nil)
 		if !strings.Contains(b.String(), tt.contains) {
 			t.Errorf("return type %s should contain %q, got:\n%s", tt.retType.Name, tt.contains, b.String())
 		}
@@ -2077,7 +2150,7 @@ func TestNativeAPIHandlerListPrimitive(t *testing.T) {
 		Name:       "getIds",
 		Directives: []*ast.Directive{{Name: "native"}},
 		ReturnType: &ast.TypeRef{Name: "Int", IsList: true},
-	})
+	}, nil)
 	code := b.String()
 	if !strings.Contains(code, "codec.AppendSvarint(req.Buf.B, v)") {
 		t.Errorf("[Int] should encode each element with AppendSvarint:\n%s", code)
@@ -2088,9 +2161,29 @@ func TestNativeAPIHandlerListPrimitive(t *testing.T) {
 		Name:       "getNames",
 		Directives: []*ast.Directive{{Name: "native"}},
 		ReturnType: &ast.TypeRef{Name: "String", IsList: true},
-	})
+	}, nil)
 	if !strings.Contains(b2.String(), "codec.AppendString(req.Buf.B, v)") {
 		t.Errorf("[String] should encode each element with AppendString:\n%s", b2.String())
+	}
+
+	var b3 strings.Builder
+	generateNativeAPIHandler(&b3, &ast.ApiDecl{
+		Name:       "getRatios",
+		Directives: []*ast.Directive{{Name: "native"}},
+		ReturnType: &ast.TypeRef{Name: "Float", IsList: true},
+	}, nil)
+	if !strings.Contains(b3.String(), "codec.AppendFixed64(req.Buf.B, v)") {
+		t.Errorf("[Float] should encode each element with AppendFixed64:\n%s", b3.String())
+	}
+
+	var b4 strings.Builder
+	generateNativeAPIHandler(&b4, &ast.ApiDecl{
+		Name:       "getFlags",
+		Directives: []*ast.Directive{{Name: "native"}},
+		ReturnType: &ast.TypeRef{Name: "Boolean", IsList: true},
+	}, nil)
+	if !strings.Contains(b4.String(), "codec.AppendBool(req.Buf.B, v)") {
+		t.Errorf("[Boolean] should encode each element with AppendBool:\n%s", b4.String())
 	}
 }
 
@@ -2100,7 +2193,7 @@ func TestNativeAPIHandlerNoReturn(t *testing.T) {
 		Name:       "purge",
 		Directives: []*ast.Directive{{Name: "native"}},
 		// no ReturnType
-	})
+	}, nil)
 	code := b.String()
 	if !strings.Contains(code, "_, err := app.Resolver.Purge(ctx)") {
 		t.Errorf("no-return should use _ for result:\n%s", code)

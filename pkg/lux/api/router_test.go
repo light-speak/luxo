@@ -478,6 +478,7 @@ func TestIntrospectionWrongKey(t *testing.T) {
 func TestIntrospectionSuccess(t *testing.T) {
 	rt := NewRouter()
 	rt.IntrospectionKey = "test-key"
+	rt.Version = "v1.2.3"
 	rt.Schema.RegisterModel(&schema.Model{
 		Name: "User",
 		Fields: []schema.Field{
@@ -501,6 +502,9 @@ func TestIntrospectionSuccess(t *testing.T) {
 	ct := w.Header().Get("Content-Type")
 	if ct != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	if got := w.Header().Get("X-Luxo-Version"); got != "v1.2.3" {
+		t.Errorf("X-Luxo-Version = %q, want v1.2.3", got)
 	}
 
 	var result map[string]any
@@ -702,6 +706,15 @@ type mockMetrics struct {
 	}
 }
 
+type mockTraceMetrics struct {
+	mockMetrics
+	traces []TraceRecord
+}
+
+func (m *mockTraceMetrics) RecordTrace(record TraceRecord) {
+	m.traces = append(m.traces, record)
+}
+
 func (m *mockMetrics) Record(api string, duration time.Duration, isError bool) {
 	m.calls = append(m.calls, struct {
 		api      string
@@ -752,6 +765,33 @@ func TestMetricsCollectorOnError(t *testing.T) {
 
 	if len(mc.calls) != 1 || !mc.calls[0].isError {
 		t.Error("metrics should record error")
+	}
+}
+
+func TestTraceRecorderReceivesRequestMetadata(t *testing.T) {
+	rt := NewRouter()
+	mc := &mockTraceMetrics{}
+	rt.SetMetricsCollector(mc)
+	rt.Handle("fail", func(context.Context, *Request) error {
+		return errors.Forbidden
+	})
+
+	r := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(`{"$api":"fail"}`))
+	r.Header.Set("X-Request-Id", "trace-123")
+	r.Header.Set("X-Luxo-Client", "typescript")
+	r.Header.Set("X-Luxo-Client-Version", "1.2.3")
+	w := httptest.NewRecorder()
+	TraceMiddleware(rt).ServeHTTP(w, r)
+
+	if len(mc.traces) != 1 {
+		t.Fatalf("trace calls = %d, want 1", len(mc.traces))
+	}
+	got := mc.traces[0]
+	if got.TraceID != "trace-123" || got.APIName != "fail" || got.StatusCode != http.StatusForbidden {
+		t.Fatalf("trace = %+v", got)
+	}
+	if got.ClientName != "typescript" || got.ClientVersion != "1.2.3" {
+		t.Fatalf("client metadata = %q/%q", got.ClientName, got.ClientVersion)
 	}
 }
 

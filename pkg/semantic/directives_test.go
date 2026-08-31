@@ -23,6 +23,16 @@ func TestLookupDirective(t *testing.T) {
 	}
 }
 
+func TestAuthDirectiveSupportsModels(t *testing.T) {
+	d := LookupDirective("auth")
+	if d == nil {
+		t.Fatal("expected to find @auth")
+	}
+	if d.Contexts&OnModel == 0 {
+		t.Error("@auth should be allowed on models to protect generated CRUD handlers")
+	}
+}
+
 func TestLookupDirectiveUnknown(t *testing.T) {
 	d := LookupDirective("nonexistent")
 	if d != nil {
@@ -89,9 +99,9 @@ func TestContextNameSingle(t *testing.T) {
 // ========== Directive Context Validation ==========
 
 func TestDirectiveWrongContext(t *testing.T) {
-	// @auth on model (should be on api/fn)
-	result := analyze(t, `model User @auth { name: String }`)
-	expectError(t, result, "@auth cannot be used on model")
+	// @service on model (should be on fn)
+	result := analyze(t, `model User @service { name: String }`)
+	expectError(t, result, "@service cannot be used on model")
 }
 
 func TestDirectiveWrongContextField(t *testing.T) {
@@ -172,6 +182,32 @@ func TestDirectiveTypeConstraintSearch(t *testing.T) {
 func TestDirectiveTypeConstraintMask(t *testing.T) {
 	result := analyze(t, `model User { age: Int @mask }`)
 	expectError(t, result, "@mask can only be used on String")
+}
+
+func TestMaskDirectivePattern(t *testing.T) {
+	result := analyze(t, `model User {
+		phone: String @mask("###****####")
+		secret: String @mask
+	}`)
+	expectNoErrors(t, result)
+}
+
+func TestMaskDirectiveInvalidPattern(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+	}{
+		{name: "integer", schema: `model User { secret: String @mask(3) }`},
+		{name: "identifier", schema: `model User { secret: String @mask(pattern) }`},
+		{name: "empty", schema: `model User { secret: String @mask("") }`},
+		{name: "invalid character", schema: `model User { secret: String @mask("##x***") }`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := analyze(t, tt.schema)
+			expectError(t, result, "@mask pattern must be a non-empty string containing only '#' and '*'")
+		})
+	}
 }
 
 func TestDirectiveTypeConstraintEncrypt(t *testing.T) {
@@ -290,6 +326,59 @@ func TestDirectiveWithBody(t *testing.T) {
   name: String @transform { it }
 }`)
 	expectNoErrors(t, result)
+}
+
+func TestTransformDirectiveRequiresSingleExpression(t *testing.T) {
+	tests := []struct {
+		name   string
+		schema string
+	}{
+		{name: "missing body", schema: `model User { name: String @transform }`},
+		{name: "empty body", schema: `model User { name: String @transform { } }`},
+		{name: "multiple statements", schema: `model User { name: String @transform {
+  it.trim()
+  it.lowercase()
+} }`},
+		{name: "non-expression", schema: `model User { name: String @transform { return it } }`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := analyze(t, tt.schema)
+			expectError(t, result, "@transform requires exactly one expression")
+		})
+	}
+}
+
+func TestTransformDirectiveResultTypeMustMatchField(t *testing.T) {
+	result := analyze(t, `model User {
+  name: String @transform { it.length }
+}`)
+	expectError(t, result, "@transform result type 'Int' does not match field type 'String'")
+}
+
+func TestTransformDirectiveSupportsNullableValue(t *testing.T) {
+	result := analyze(t, `model User {
+  nickname: String? @transform { it.trim() }
+}`)
+	expectNoErrors(t, result)
+}
+
+func TestTransformDirectiveCoverageGuards(t *testing.T) {
+	analyzer := New()
+	field := &ast.FieldDecl{Directives: []*ast.Directive{{
+		Name: "transform",
+		Body: &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: &ast.Ident{Name: "it"}}}},
+	}}}
+	analyzer.checkTransformDirective(field, nil)
+	if len(analyzer.errors) != 0 {
+		t.Fatalf("nil field type guard should not report an error: %v", analyzer.errors)
+	}
+	if got := typeDisplayName(nil); got != "unknown" {
+		t.Fatalf("nil type display = %q", got)
+	}
+	if got := typeDisplayName(&ResolvedType{Name: "String", IsList: true}); got != "[String]" {
+		t.Fatalf("list type display = %q", got)
+	}
 }
 
 func TestDirectiveBeforeSave(t *testing.T) {

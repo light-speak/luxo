@@ -150,6 +150,47 @@ func Mask(s string, keepPrefix, keepSuffix int) string {
 	return string(masked)
 }
 
+// MaskPattern applies a positional mask where '#' preserves a rune and '*'
+// replaces it. Invalid patterns and rune-count mismatches fail closed.
+func MaskPattern(s, pattern string) string {
+	for i := range len(pattern) {
+		if pattern[i] != '#' && pattern[i] != '*' {
+			return maskAll(s)
+		}
+	}
+	if utf8.RuneCountInString(s) != len(pattern) {
+		return maskAll(s)
+	}
+
+	var b strings.Builder
+	b.Grow(len(s))
+	if len(s) == len(pattern) {
+		for i := range len(pattern) {
+			if pattern[i] == '#' {
+				b.WriteByte(s[i])
+			} else {
+				b.WriteByte('*')
+			}
+		}
+		return b.String()
+	}
+
+	position := 0
+	for _, r := range s {
+		if pattern[position] == '#' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('*')
+		}
+		position++
+	}
+	return b.String()
+}
+
+func maskAll(s string) string {
+	return strings.Repeat("*", utf8.RuneCountInString(s))
+}
+
 // MaskEmail masks an email: "user@example.com" → "u***@example.com"
 func MaskEmail(s string) string {
 	at := strings.IndexByte(s, '@')

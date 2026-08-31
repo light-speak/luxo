@@ -48,7 +48,11 @@ func binaryToJSONFromDecoder(dst []byte, dec *codec.Decoder, model *Model, schem
 	return dst
 }
 
-// appendNestedModelJSON decodes an inline nested model/type from the same decoder stream.
+// appendNestedModelJSON decodes an inline nested model/type from the same
+// decoder stream. Wire formats (matching WriteLuxo):
+//   - single:          [nested object]
+//   - nullable single: [present/null flag][nested object]
+//   - list:            [svarint count][item1][item2]...
 func appendNestedModelJSON(dst []byte, dec *codec.Decoder, f *Field, s *Schema) []byte {
 	nested := s.Models[f.TypeName]
 	if nested == nil {
@@ -66,6 +70,22 @@ func appendNestedModelJSON(dst []byte, dec *codec.Decoder, f *Field, s *Schema) 
 			break
 		}
 		return append(dst, "null"...)
+	}
+	if f.IsList {
+		count := dec.ReadInt()
+		dst = append(dst, '[')
+		for i := int64(0); i < count; i++ {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = binaryToJSONFromDecoder(dst, dec, nested, s)
+		}
+		return append(dst, ']')
+	}
+	if f.Nullable {
+		if !dec.ReadBool() { // present/null flag byte
+			return append(dst, "null"...)
+		}
 	}
 	// The nested model's fields are inline in the same byte stream,
 	// terminated by 0x00 (which NextField handles).
@@ -264,6 +284,12 @@ func appendColumnBlobJSON(dst []byte, col *typedColumn, i int, schemas ...*Schem
 	}
 	if len(schemas) > 0 && schemas[0] != nil {
 		nested := schemas[0].Models[f.TypeName]
+		if nested == nil {
+			// Type declarations (non-DB types like MetricPoint) live in Types
+			if td := schemas[0].Types[f.TypeName]; td != nil {
+				nested = td.AsModel()
+			}
+		}
 		if nested != nil {
 			if f.IsList {
 				return BinaryListToJSON(dst, blob, nested, schemas[0])

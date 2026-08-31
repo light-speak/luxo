@@ -48,15 +48,15 @@ jobs:
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1
 
-      - name: Coverage gate (minimum 94.5%)
+      - name: Coverage floor (minimum 95.0%)
         run: |
           TOTAL=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | sed 's/%//')
           echo "Total coverage: ${TOTAL}%"
-          if (( $(echo "$TOTAL < 94.5" | bc -l) )); then
-            echo "::error::Coverage ${TOTAL}% is below 94.5% threshold"
+          if (( $(echo "$TOTAL < 95.0" | bc -l) )); then
+            echo "::error::Coverage ${TOTAL}% is below 95.0% floor"
             exit 1
           fi
-          echo "Coverage ${TOTAL}% meets threshold"
+          echo "Coverage ${TOTAL}% meets floor"
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7

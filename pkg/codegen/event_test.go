@@ -17,6 +17,22 @@ func TestGenerateEventFileNoEvents(t *testing.T) {
 	}
 }
 
+func TestEventJSONFallbackTypes(t *testing.T) {
+	events := []*ast.EventDecl{{Params: []*ast.ParamDecl{
+		{Name: "unknown"},
+		{Name: "items", Type: &ast.TypeRef{Name: "String", IsList: true}},
+	}}}
+	if !eventsNeedJSON(events) {
+		t.Fatal("eventsNeedJSON() = false, want true")
+	}
+	if got := eventScalarType(nil); got != "" {
+		t.Fatalf("eventScalarType(nil) = %q, want empty", got)
+	}
+	if got := eventScalarType(&ast.TypeRef{Name: "String", IsList: true}); got != "" {
+		t.Fatalf("eventScalarType(list) = %q, want empty", got)
+	}
+}
+
 func TestGenerateEventFile(t *testing.T) {
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -236,11 +252,15 @@ func TestGenerateEventCodecNullableTypes(t *testing.T) {
 	src := generateEventFile(result, "luxo")
 	code := string(src)
 
-	// Nullable types resolve to *int64, *float64, etc. via resolveGoType,
-	// which doesn't match the switch cases ("int64", "float64", etc.),
-	// so they fall through to the default TODO case.
-	if !strings.Contains(code, "TODO: complex type") {
-		t.Errorf("nullable types should fall to TODO default:\n%s", code)
+	for _, want := range []string{
+		"WriteFieldFloatPtr(1, e.Amount)",
+		"WriteFieldStringPtr(2, e.Note)",
+		"WriteFieldBoolPtr(3, e.Active)",
+		"e.Amount = dec.ReadFloatPtr()",
+	} {
+		if !strings.Contains(code, want) {
+			t.Errorf("nullable codec missing %q:\n%s", want, code)
+		}
 	}
 }
 
@@ -269,9 +289,8 @@ func TestGenerateEventCodecComplexType(t *testing.T) {
 	src := generateEventFile(result, "luxo")
 	code := string(src)
 
-	// Complex type should have TODO comment
-	if !strings.Contains(code, "TODO: complex type") {
-		t.Errorf("complex type should get TODO comment:\n%s", code)
+	if !strings.Contains(code, "json.Marshal(e.Data)") || !strings.Contains(code, "json.Unmarshal(dec.ReadBytes(), &e.Data)") {
+		t.Errorf("complex type should round-trip through embedded JSON:\n%s", code)
 	}
 }
 

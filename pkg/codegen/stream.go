@@ -12,13 +12,17 @@ import (
 
 // streamInfo describes a @stream API for codegen.
 type streamInfo struct {
-	apiName     string
-	eventName   string // from @stream(EventName), empty if no event source
-	isNative    bool   // @native — Go resolver handles matching
-	hasBody     bool   // has lambda matcher body
-	params      []*ast.ParamDecl
-	body        *ast.Block       // lambda body for matcher
-	eventParams []*ast.ParamDecl // event parameters (for decoding)
+	apiName      string
+	eventName    string // from @stream(EventName), empty if no event source
+	isNative     bool   // @native — Go resolver handles matching
+	hasBody      bool   // has lambda matcher body
+	params       []*ast.ParamDecl
+	body         *ast.Block       // lambda body for matcher
+	eventParams  []*ast.ParamDecl // event parameters (for decoding)
+	eventDecl    *ast.EventDecl
+	returnType   *ast.TypeRef
+	payload      *ast.ParamDecl
+	requiresAuth bool
 }
 
 // collectStreams finds all @stream APIs in the semantic result.
@@ -38,11 +42,13 @@ func collectStreams(result *semantic.Result) []streamInfo {
 				continue
 			}
 			si := streamInfo{
-				apiName:  api.Name,
-				isNative: hasDirective(api.Directives, "native"),
-				hasBody:  api.Body != nil && len(api.Body.Stmts) > 0,
-				params:   api.Params,
-				body:     api.Body,
+				apiName:      api.Name,
+				isNative:     hasDirective(api.Directives, "native"),
+				hasBody:      api.Body != nil && len(api.Body.Stmts) > 0,
+				params:       api.Params,
+				body:         api.Body,
+				returnType:   api.ReturnType,
+				requiresAuth: hasDirective(api.Directives, "auth") || hasDirective(api.Directives, "role"),
 			}
 			// Extract event name from @stream(EventName)
 			for _, d := range api.Directives {
@@ -52,6 +58,13 @@ func collectStreams(result *semantic.Result) []streamInfo {
 						// Attach event params for decoding
 						if ev, ok := events[ident.Name]; ok {
 							si.eventParams = ev.Params
+							si.eventDecl = ev
+							for _, param := range ev.Params {
+								if sameStreamType(param.Type, api.ReturnType) {
+									si.payload = param
+									break
+								}
+							}
 						}
 					}
 				}
@@ -60,6 +73,10 @@ func collectStreams(result *semantic.Result) []streamInfo {
 		}
 	}
 	return streams
+}
+
+func sameStreamType(left, right *ast.TypeRef) bool {
+	return left != nil && right != nil && left.Name == right.Name && left.IsList == right.IsList
 }
 
 // generateStreamFile produces stream.gen.go containing:
@@ -84,6 +101,8 @@ func generateStreamFile(result *semantic.Result, packageName string) []byte {
 			generateNativeStreamMatcher(&b, si)
 		} else if si.hasBody && !si.isNative {
 			generateLuxoStreamMatcher(&b, si)
+		} else if si.requiresAuth {
+			generateAuthStreamMatcher(&b, si)
 		}
 	}
 
@@ -92,10 +111,14 @@ func generateStreamFile(result *semantic.Result, packageName string) []byte {
 
 func writeStreamImports(b *strings.Builder, streams []streamInfo) {
 	hasEventSource := false
+	hasTypedEvent := false
 	needsCodec := false
 	for _, si := range streams {
 		if si.eventName != "" {
 			hasEventSource = true
+		}
+		if si.eventDecl != nil && si.payload != nil {
+			hasTypedEvent = true
 		}
 		if si.hasBody && !si.isNative && si.eventName != "" {
 			needsCodec = true
@@ -104,7 +127,10 @@ func writeStreamImports(b *strings.Builder, streams []streamInfo) {
 
 	b.WriteString("import (\n")
 	if hasEventSource {
-		b.WriteString("\t\"context\"\n\n")
+		b.WriteString("\t\"context\"\n")
+	}
+	if hasTypedEvent {
+		b.WriteString("\t\"encoding/json\"\n\n")
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
 	if needsCodec {
@@ -125,12 +151,19 @@ func writeRegisterStreams(b *strings.Builder, streams []streamInfo) {
 		}
 
 		matcherName := "nil"
-		if si.hasBody || si.isNative {
+		if si.hasBody || si.isNative || si.requiresAuth {
 			matcherName = "match" + str.Capitalize(si.apiName)
 		}
 
 		if si.eventName != "" {
 			fmt.Fprintf(b, "\t// %s @stream(%s)\n", si.apiName, si.eventName)
+			if si.eventDecl != nil && si.payload != nil {
+				writeTypedStreamRegistration(b, si, matcherName)
+				if matcherName != "nil" {
+					fmt.Fprintf(b, "\trouter.HandleStream(%q, %s)\n", si.apiName, matcherName)
+				}
+				continue
+			}
 			fmt.Fprintf(b, "\tbus.On(%q, func(ctx context.Context, payload any) {\n", si.eventName)
 			fmt.Fprintf(b, "\t\tif data, ok := payload.([]byte); ok {\n")
 			fmt.Fprintf(b, "\t\t\trouter.Streams.DispatchEncoded(%q, data, %s)\n", si.apiName, matcherName)
@@ -152,6 +185,26 @@ func writeRegisterStreams(b *strings.Builder, streams []streamInfo) {
 	}
 
 	b.WriteString("}\n\n")
+}
+
+func writeTypedStreamRegistration(b *strings.Builder, si streamInfo, matcherName string) {
+	eventType := si.eventName + "Event"
+	payloadField := "payload." + str.Capitalize(si.payload.Name)
+	fmt.Fprintf(b, "\tevent.OnDecode[%s](bus, %q, Unmarshal%s, func(ctx context.Context, payload %s) error {\n", eventType, si.eventName, si.eventName, eventType)
+	b.WriteString("\t\tmatchData := payload.MarshalLuxo()\n")
+	fmt.Fprintf(b, "\t\trouter.Streams.DispatchEvent(%q, matchData, %s, func(mask []byte, binary bool) []byte {\n", si.apiName, matcherName)
+	b.WriteString("\t\t\tif !binary {\n")
+	fmt.Fprintf(b, "\t\t\t\tdata, _ := json.Marshal(%s)\n", payloadField)
+	b.WriteString("\t\t\t\treturn data\n")
+	b.WriteString("\t\t\t}\n")
+	b.WriteString("\t\t\tbuf := api.GetBuf()\n")
+	fmt.Fprintf(b, "\t\t\t%s.WriteLuxo(buf, mask)\n", payloadField)
+	b.WriteString("\t\t\tdata := append([]byte(nil), buf.B...)\n")
+	b.WriteString("\t\t\tapi.PutBuf(buf)\n")
+	b.WriteString("\t\t\treturn data\n")
+	b.WriteString("\t\t})\n")
+	b.WriteString("\t\treturn nil\n")
+	b.WriteString("\t})\n")
 }
 
 func writeStreamResolverInterface(b *strings.Builder, streams []streamInfo) {
@@ -186,6 +239,7 @@ func generateNativeStreamHandler(b *strings.Builder, si streamInfo) {
 
 	fmt.Fprintf(b, "// %s invokes resolver.%s on each subscription.\n", name, resolverMethod)
 	fmt.Fprintf(b, "func %s(ctx context.Context, params *api.StreamParams, identity any, stream *api.Stream) {\n", name)
+	writeStreamAuthGuard(b, si, "\t", "return")
 	fmt.Fprintf(b, "\tresolver.%s(ctx, params, identity, stream)\n", resolverMethod)
 	fmt.Fprintf(b, "}\n\n")
 }
@@ -197,6 +251,7 @@ func generateNativeStreamMatcher(b *strings.Builder, si streamInfo) {
 
 	fmt.Fprintf(b, "// %s delegates to resolver.%s (Go @native matcher).\n", name, resolverName)
 	fmt.Fprintf(b, "func %s(data []byte, params *api.StreamParams, identity any) bool {\n", name)
+	writeStreamAuthGuard(b, si, "\t", "return false")
 	fmt.Fprintf(b, "\treturn resolver.%s(data, params, identity)\n", resolverName)
 	fmt.Fprintf(b, "}\n\n")
 }
@@ -245,6 +300,7 @@ func generateLuxoStreamMatcher(b *strings.Builder, si streamInfo) {
 
 	fmt.Fprintf(b, "// %s — compiled from @stream body expression.\n", name)
 	fmt.Fprintf(b, "func %s(data []byte, params *api.StreamParams, identity any) bool {\n", name)
+	writeStreamAuthGuard(b, si, "\t", "return false")
 
 	// Declare variables for decoded event fields
 	for _, fieldName := range itFields {
@@ -277,6 +333,21 @@ func generateLuxoStreamMatcher(b *strings.Builder, si streamInfo) {
 	fmt.Fprintf(b, "\treturn %s\n", exprCode)
 
 	fmt.Fprintf(b, "}\n\n")
+}
+
+func generateAuthStreamMatcher(b *strings.Builder, si streamInfo) {
+	name := "match" + str.Capitalize(si.apiName)
+	fmt.Fprintf(b, "func %s(data []byte, params *api.StreamParams, identity any) bool {\n", name)
+	b.WriteString("\t_ = data\n\t_ = params\n")
+	writeStreamAuthGuard(b, si, "\t", "return false")
+	b.WriteString("\treturn true\n")
+	b.WriteString("}\n\n")
+}
+
+func writeStreamAuthGuard(b *strings.Builder, si streamInfo, indent, rejection string) {
+	if si.requiresAuth {
+		fmt.Fprintf(b, "%sif api.IdentityID(identity) == 0 { %s }\n", indent, rejection)
+	}
 }
 
 // extractMatcherExpr extracts the boolean expression from a @stream body.

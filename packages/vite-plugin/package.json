@@ -4,14 +4,17 @@
   "description": "Luxo Vite plugin — compile-time field tracking, auto $select injection, and typed client generation",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
+  "types": "src/public.d.ts",
   "exports": {
     ".": {
+      "types": "./src/public.d.ts",
       "import": "./dist/index.mjs",
       "require": "./dist/index.js"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "license": "Apache-2.0",
   "keywords": ["luxo", "vite", "plugin", "codegen", "field-tracking", "select", "babel", "ast"],
@@ -28,6 +31,7 @@
     "prepublishOnly": "pnpm build"
   },
   "peerDependencies": {
+    "@luxojs/client": ">=0.1.0-dev.3",
     "typescript": ">=5.0",
     "vite": ">=5.0"
   },
@@ -37,6 +41,7 @@
     "@babel/types": "^7.29.0"
   },
   "devDependencies": {
+    "@luxojs/client": "link:../client",
     "tsup": "^8.5.1",
     "vitest": "^3.0.0"
   }

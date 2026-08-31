@@ -2,6 +2,7 @@ package codegen
 
 import (
 	"fmt"
+	"go/format"
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/ast"
@@ -200,6 +201,9 @@ func Generate(result *semantic.Result, packageName string, driver DBDriver, soft
 	if eventSrc := generateEventFile(result, packageName); eventSrc != nil {
 		gr.Files["event.gen.go"] = eventSrc
 	}
+	if streamSrc := generateStreamFile(result, packageName); streamSrc != nil {
+		gr.Files["stream.gen.go"] = streamSrc
+	}
 
 	// error.gen.go — typed error constructors
 	if errorSrc := generateErrorFile(result, packageName); errorSrc != nil {
@@ -216,7 +220,23 @@ func Generate(result *semantic.Result, packageName string, driver DBDriver, soft
 		gr.Files["schema.gen.go"] = schemaSrc
 	}
 
+	for name, src := range gr.Files {
+		gr.Files[name] = formatGenerated(src)
+	}
 	return gr
+}
+
+// formatGenerated runs gofmt (go/format) on generated Go source so emitted
+// files pass the repo-wide gofmt gate without a separate formatting step.
+// On a format error — which would mean the generator produced invalid Go —
+// the raw source is returned so the compiler surfaces the real error with
+// meaningful line numbers instead of a swallowed formatting failure.
+func formatGenerated(src []byte) []byte {
+	formatted, err := format.Source(src)
+	if err != nil {
+		return src
+	}
+	return formatted
 }
 
 // generateModelFile produces the model.gen.go file containing enums and structs.

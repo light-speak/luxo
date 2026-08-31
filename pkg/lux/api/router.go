@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -37,6 +38,22 @@ type MetricsRecorder interface {
 	Record(apiName string, duration time.Duration, isError bool)
 }
 
+// TraceRecord contains the request data needed by an optional trace exporter.
+type TraceRecord struct {
+	TraceID       string
+	APIName       string
+	Duration      time.Duration
+	StatusCode    int
+	ClientName    string
+	ClientVersion string
+	Timestamp     time.Time
+}
+
+// TraceRecorder is implemented by metrics collectors that also export traces.
+type TraceRecorder interface {
+	RecordTrace(record TraceRecord)
+}
+
 // Router maps API names to handlers and serves the /luvia endpoint.
 type Router struct {
 	handlers         map[string]HandlerFunc
@@ -48,8 +65,19 @@ type Router struct {
 	Schema           *schema.Schema  // model/API metadata for Binary↔JSON conversion
 	Streams          *StreamHub      // WebSocket stream subscription manager
 	IntrospectionKey string          // key for schema introspection (empty = disabled)
+	Version          string          // application version exposed with schema introspection
 	WSOrigins        []string        // allowed WebSocket origins (empty = allow all in dev mode)
 	metrics          MetricsRecorder // optional metrics collector
+	requestLogging   bool
+	debugParamShape  bool
+	logWriter        io.Writer
+}
+
+// RouterOptions configures optional request observability outside the hot path.
+type RouterOptions struct {
+	RequestLogging      bool
+	DebugParamStructure bool
+	LogWriter           io.Writer
 }
 
 // SetMetricsCollector configures request metrics collection.
@@ -59,13 +87,31 @@ func (rt *Router) SetMetricsCollector(mc MetricsRecorder) {
 
 // NewRouter creates an empty router.
 func NewRouter() *Router {
+	return NewRouterWithOptions(RouterOptions{
+		RequestLogging:      os.Getenv("LOG_REQUESTS") == "true",
+		DebugParamStructure: os.Getenv("LOG_LEVEL") == "debug",
+	})
+}
+
+// NewRouterWithOptions creates a router with explicit observability settings.
+func NewRouterWithOptions(options RouterOptions) *Router {
+	s := schema.New()
+	registry := NewAPIRegistry()
+	registry.SetSchema(s)
+	logWriter := options.LogWriter
+	if logWriter == nil {
+		logWriter = os.Stderr
+	}
 	return &Router{
-		handlers:       make(map[string]HandlerFunc),
-		streamMatchers: make(map[string]StreamMatcher),
-		streamHandlers: make(map[string]StreamHandlerFunc),
-		Registry:       NewAPIRegistry(),
-		Schema:         schema.New(),
-		Streams:        NewStreamHub(),
+		handlers:        make(map[string]HandlerFunc),
+		streamMatchers:  make(map[string]StreamMatcher),
+		streamHandlers:  make(map[string]StreamHandlerFunc),
+		Registry:        registry,
+		Schema:          s,
+		Streams:         NewStreamHub(),
+		requestLogging:  options.RequestLogging,
+		debugParamShape: options.DebugParamStructure,
+		logWriter:       logWriter,
 	}
 }
 
@@ -138,12 +184,12 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		req, err = ParseRequest(r)
 	}
 	if err != nil {
-		if isLogEnabled() {
+		if rt.requestLogging {
 			mode := "json"
 			if binaryMode {
 				mode = "binary"
 			}
-			fmt.Fprintf(os.Stderr, "%s%s%s %s[parse]%s %s %s✗ %s%s\n",
+			fmt.Fprintf(rt.logWriter, "%s%s%s %s[parse]%s %s %s✗ %s%s\n",
 				colorDim, time.Now().Format("15:04:05"), colorReset,
 				colorRed, colorReset, mode,
 				colorRed, err.Error(), colorReset)
@@ -177,21 +223,29 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	buf := GetBuf()
 	req.Buf = buf
 
-	start := time.Now()
+	observed := rt.metrics != nil || rt.requestLogging
+	var start time.Time
+	if observed {
+		start = time.Now()
+	}
 	herr := rt.callHandler(fn, r.Context(), req)
-	duration := time.Since(start)
+	var duration time.Duration
+	if observed {
+		duration = time.Since(start)
+	}
 
 	if rt.metrics != nil {
 		rt.metrics.Record(req.API, duration, herr != nil)
+		if recorder, ok := rt.metrics.(TraceRecorder); ok {
+			recorder.RecordTrace(newTraceRecord(r, req.API, start, duration, herr))
+		}
 	}
 
 	if herr != nil {
 		rt.logRequest(req.API, duration, herr)
 		// Debug level: log param details for debugging (user explicitly opts in)
-		if isLogEnabled() && os.Getenv("LOG_LEVEL") == "debug" && req.paramNames != nil {
-			for i := 0; i < req.paramCount; i++ {
-				fmt.Fprintf(os.Stderr, "    param[%d] %s = %v\n", i, req.paramNames[i], req.paramSlots[i])
-			}
+		if rt.requestLogging && rt.debugParamShape {
+			rt.logParamStructure(req)
 		}
 		PutBuf(buf)
 		rt.writeAppError(w, r, binaryMode, herr)
@@ -217,6 +271,26 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	PutBuf(buf)
 }
 
+func newTraceRecord(r *http.Request, apiName string, startedAt time.Time, duration time.Duration, err error) TraceRecord {
+	statusCode := http.StatusOK
+	if err != nil {
+		statusCode = http.StatusInternalServerError
+		var appErr *errors.AppError
+		if stderrors.As(err, &appErr) {
+			statusCode = appErr.Code
+		}
+	}
+	return TraceRecord{
+		TraceID:       TraceID(r.Context()),
+		APIName:       apiName,
+		Duration:      duration,
+		StatusCode:    statusCode,
+		ClientName:    r.Header.Get("X-Luxo-Client"),
+		ClientVersion: r.Header.Get("X-Luxo-Client-Version"),
+		Timestamp:     startedAt.UTC(),
+	}
+}
+
 // handleIntrospection serves the schema as JSON for SDK generation.
 // Protected by INTROSPECTION_KEY — returns 403 without valid key.
 func (rt *Router) handleIntrospection(w http.ResponseWriter, r *http.Request) {
@@ -240,6 +314,9 @@ func (rt *Router) handleIntrospection(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if rt.Version != "" {
+		w.Header().Set("X-Luxo-Version", rt.Version)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
@@ -384,18 +461,6 @@ const (
 	colorGreen = "\033[32m"
 )
 
-// logEnabled controls whether request logging is active (LOG_REQUESTS env).
-// Lazy-initialized on first check so .env is loaded before reading.
-var logEnabled *bool
-
-func isLogEnabled() bool {
-	if logEnabled == nil {
-		v := os.Getenv("LOG_REQUESTS") != "false"
-		logEnabled = &v
-	}
-	return *logEnabled
-}
-
 // moduleColorMap caches color assignment per module name.
 var (
 	moduleColorMu  sync.Mutex
@@ -420,7 +485,7 @@ func moduleColor(mod string) string {
 //	12:34:56 [auth] login 2.3ms ✓
 //	12:34:56 [auth] login 1.2ms ✗ InvalidCredentials
 func (rt *Router) logRequest(apiName string, duration time.Duration, err error) {
-	if !isLogEnabled() {
+	if !rt.requestLogging {
 		return
 	}
 	mod := ""
@@ -447,15 +512,16 @@ func (rt *Router) logRequest(apiName string, duration time.Duration, err error) 
 	}
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s %s[%s]%s %s %s%.1fms%s %s✗ %s%s\n",
+		errorName := safeLogErrorName(err)
+		fmt.Fprintf(rt.logWriter, "%s %s[%s]%s %s %s%.1fms%s %s✗ %s%s\n",
 			colorDim+ts+colorReset,
 			mc, mod, colorReset,
 			apiName,
 			durColor, ms, colorReset,
-			colorRed, err.Error(), colorReset,
+			colorRed, errorName, colorReset,
 		)
 	} else {
-		fmt.Fprintf(os.Stderr, "%s %s[%s]%s %s %s%.1fms%s %s✓%s\n",
+		fmt.Fprintf(rt.logWriter, "%s %s[%s]%s %s %s%.1fms%s %s✓%s\n",
 			colorDim+ts+colorReset,
 			mc, mod, colorReset,
 			apiName,
@@ -463,6 +529,36 @@ func (rt *Router) logRequest(apiName string, duration time.Duration, err error) 
 			colorGreen, colorReset,
 		)
 	}
+}
+
+func safeLogErrorName(err error) string {
+	var appErr *errors.AppError
+	if stderrors.As(err, &appErr) {
+		return appErr.Name
+	}
+	return "Internal"
+}
+
+func (rt *Router) logParamStructure(req *Request) {
+	params := rt.Registry.ParamOrder(req.API)
+	if req.paramNames == nil {
+		for i, param := range params {
+			_, present := req.Params[param.Name]
+			rt.writeParamStructure(i, param.Name, param.Type, present)
+		}
+		return
+	}
+	for i := 0; i < req.paramCount && i < len(req.paramNames); i++ {
+		typeName := "Unknown"
+		if i < len(params) {
+			typeName = params[i].Type
+		}
+		rt.writeParamStructure(i, req.paramNames[i], typeName, req.paramSlots[i] != nil)
+	}
+}
+
+func (rt *Router) writeParamStructure(index int, name string, typeName string, present bool) {
+	fmt.Fprintf(rt.logWriter, "    param[%d] %s %s present=%t\n", index, name, typeName, present)
 }
 
 // writeError writes a simple JSON error response for infrastructure errors.

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http/httptest"
@@ -110,6 +111,68 @@ func TestStreamHub_DispatchWithEncode(t *testing.T) {
 	}
 
 	hub.Unsubscribe("test", sub)
+}
+
+func TestStreamHubDispatchEventUsesTransportMode(t *testing.T) {
+	hub := NewStreamHub()
+	jsonSub := hub.SubscribeMode("watch", nil, nil, nil, false, nil)
+	binarySub := hub.SubscribeMode("watch", nil, nil, []byte{1}, true, nil)
+
+	hub.DispatchEvent("watch", []byte{9}, nil, func(mask []byte, binary bool) []byte {
+		if binary {
+			return append([]byte{2}, mask...)
+		}
+		return []byte(`{"id":1}`)
+	})
+
+	if got := string(<-jsonSub.Ch); got != `{"id":1}` {
+		t.Fatalf("json payload = %q", got)
+	}
+	if got := <-binarySub.Ch; !bytes.Equal(got, []byte{2, 1}) {
+		t.Fatalf("binary payload = %v", got)
+	}
+}
+
+func TestStreamHubDispatchEventMatcherRejects(t *testing.T) {
+	hub := NewStreamHub()
+	sub := hub.SubscribeMode("watch", nil, nil, nil, false, nil)
+	encoded := false
+	hub.DispatchEvent("watch", []byte{9}, func([]byte, *StreamParams, any) bool {
+		return false
+	}, func([]byte, bool) []byte {
+		encoded = true
+		return []byte("unexpected")
+	})
+
+	if encoded {
+		t.Fatal("encoder called for rejected subscriber")
+	}
+	select {
+	case data := <-sub.Ch:
+		t.Fatalf("rejected subscriber received %q", data)
+	default:
+	}
+}
+
+func TestStreamHubDispatchEventCancelsSlowSubscriber(t *testing.T) {
+	hub := NewStreamHub()
+	cancelled := make(chan struct{}, 1)
+	sub := hub.SubscribeMode("watch", nil, nil, nil, false, func() {
+		cancelled <- struct{}{}
+	})
+	for range cap(sub.Ch) {
+		sub.Ch <- []byte("queued")
+	}
+
+	hub.DispatchEvent("watch", nil, nil, func([]byte, bool) []byte {
+		return []byte("overflow")
+	})
+
+	select {
+	case <-cancelled:
+	default:
+		t.Fatal("slow subscriber was not cancelled")
+	}
 }
 
 func TestStreamHub_ChanFull(t *testing.T) {

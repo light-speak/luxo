@@ -1,6 +1,9 @@
 package semantic
 
-import "github.com/light-speak/luxo/pkg/ast"
+import (
+	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/token"
+)
 
 // DirectiveContext defines where a directive can be applied.
 type DirectiveContext int
@@ -341,11 +344,11 @@ var builtinDirectives = []DirectiveDef{
 
 	// ===== API/Fn-level directives =====
 	{
-		Name: "auth", Contexts: OnApi | OnFn,
+		Name: "auth", Contexts: OnModel | OnApi | OnFn,
 		Params:      []ParamDef{{Name: "permission"}, {Name: "own"}},
 		MaxArgs:     -1,
 		HasBody:     false,
-		Description: "require authentication, optional Model... identity, permission lambda, own resource check",
+		Description: "require authentication for an API, service function, or generated model CRUD handlers; supports optional roles, permission lambda, and ownership checks",
 	},
 	{
 		Name: "native", Contexts: OnApi | OnFn | OnMiddleware,
@@ -420,6 +423,32 @@ func (a *Analyzer) validateDirective(d *ast.Directive, ctx DirectiveContext, fie
 	}
 	a.checkDirectiveArgs(d, def)
 	a.checkDirectiveType(d, def, fieldTypeName)
+	if d.Name == "mask" {
+		a.checkMaskPattern(d)
+	}
+}
+
+func (a *Analyzer) checkMaskPattern(d *ast.Directive) {
+	if len(d.Args) == 0 {
+		return
+	}
+	valid := len(d.Args) == 1
+	if valid {
+		literal, ok := d.Args[0].Value.(*ast.Literal)
+		valid = ok && literal.Kind == token.String && literal.Value != "" && isMaskPattern(literal.Value)
+	}
+	if !valid {
+		a.addError(d.Pos, "@mask pattern must be a non-empty string containing only '#' and '*' / @mask 模式必须是仅包含 '#' 和 '*' 的非空字符串")
+	}
+}
+
+func isMaskPattern(pattern string) bool {
+	for i := range len(pattern) {
+		if pattern[i] != '#' && pattern[i] != '*' {
+			return false
+		}
+	}
+	return true
 }
 
 // errorUnknownDirective reports an unknown directive as a compile error with typo suggestion.
@@ -477,6 +506,54 @@ func (a *Analyzer) checkDirectiveType(d *ast.Directive, def *DirectiveDef, field
 		a.addError(d.Pos, "@%s can only be used on numeric fields, got '%s' / @%s 只能用在数字字段上，得到 '%s'",
 			d.Name, fieldTypeName, d.Name, fieldTypeName)
 	}
+}
+
+func (a *Analyzer) checkTransformDirective(field *ast.FieldDecl, fieldType *ResolvedType) {
+	for _, directive := range field.Directives {
+		if directive.Name != "transform" {
+			continue
+		}
+		if directive.Body == nil || len(directive.Body.Stmts) != 1 {
+			a.addError(directive.Pos, "@transform requires exactly one expression / @transform 必须且只能包含一个表达式")
+			continue
+		}
+		expression, ok := directive.Body.Stmts[0].(*ast.ExprStmt)
+		if !ok || expression.Expr == nil {
+			a.addError(directive.Pos, "@transform requires exactly one expression / @transform 必须且只能包含一个表达式")
+			continue
+		}
+		if fieldType == nil {
+			continue
+		}
+		valueType := *fieldType
+		valueType.Nullable = false
+		scope := a.scope.Child()
+		scope.Define(&Symbol{Name: "it", Kind: SymVariable, Type: &valueType})
+		resultType := a.checkExpr(expression.Expr, scope)
+		if !sameTransformType(&valueType, resultType) {
+			a.addError(directive.Pos,
+				"@transform result type '%s' does not match field type '%s' / @transform 结果类型 '%s' 与字段类型 '%s' 不匹配",
+				typeDisplayName(resultType), typeDisplayName(&valueType),
+				typeDisplayName(resultType), typeDisplayName(&valueType))
+		}
+	}
+}
+
+func sameTransformType(fieldType, resultType *ResolvedType) bool {
+	if fieldType == nil || resultType == nil || resultType.Kind == TypeUnknown {
+		return true
+	}
+	return fieldType.Name == resultType.Name && fieldType.IsList == resultType.IsList
+}
+
+func typeDisplayName(resolved *ResolvedType) string {
+	if resolved == nil {
+		return "unknown"
+	}
+	if resolved.IsList {
+		return "[" + resolved.Name + "]"
+	}
+	return resolved.Name
 }
 
 // stringInSlice checks if a string exists in a slice.

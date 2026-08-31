@@ -196,7 +196,7 @@ func (rt *Router) handleWSStreamJSON(ctx context.Context, ws *wsConn, data []byt
 		// Per-subscription context — cancelled on slow consumer or connection close.
 		subCtx, subCancel := context.WithCancel(ctx)
 
-		sub := rt.Streams.Subscribe(apiName, params, identity, nil, subCancel)
+		sub := rt.Streams.SubscribeMode(apiName, params, identity, nil, false, subCancel)
 		*connSubs = append(*connSubs, connStreamSub{apiName: apiName, sub: sub})
 
 		// Start write pump
@@ -327,7 +327,7 @@ func (rt *Router) handleWSStreamBinary(ctx context.Context, ws *wsConn, data []b
 	identity := identityFromCtx(ctx)
 	subCtx, subCancel := context.WithCancel(ctx)
 
-	sub := rt.Streams.Subscribe(apiName, params, identity, fieldMask, subCancel)
+	sub := rt.Streams.SubscribeMode(apiName, params, identity, fieldMask, true, subCancel)
 	*connSubs = append(*connSubs, connStreamSub{apiName: apiName, sub: sub})
 
 	go WritePumpBinary(subCtx, ws, int(apiID), sub)

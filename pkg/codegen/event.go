@@ -53,6 +53,9 @@ func generateEventFile(result *semantic.Result, packageName string) []byte {
 
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
+	if eventsNeedJSON(events) {
+		b.WriteString("\t\"encoding/json\"\n")
+	}
 	if needsTime {
 		b.WriteString("\t\"time\"\n")
 	}
@@ -113,6 +116,22 @@ func generateEventFile(result *semantic.Result, packageName string) []byte {
 	return []byte(b.String())
 }
 
+func eventsNeedJSON(events []*ast.EventDecl) bool {
+	for _, eventDecl := range events {
+		for _, param := range eventDecl.Params {
+			if param.Type == nil || param.Type.IsList {
+				return true
+			}
+			switch param.Type.Name {
+			case "Int", "Float", "String", "Boolean":
+			default:
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // generateEventStruct generates a typed struct for an event declaration.
 func generateEventStruct(b *strings.Builder, e *ast.EventDecl) {
 	fmt.Fprintf(b, "// %sEvent is the payload for the %s event.\n", e.Name, e.Name)
@@ -134,41 +153,7 @@ func generateEventCodec(b *strings.Builder, e *ast.EventDecl) {
 	fmt.Fprintf(b, "func (e *%s) MarshalLuxo() []byte {\n", typeName)
 	b.WriteString("\tvar enc codec.Encoder\n")
 	for _, p := range e.Params {
-		fieldID := getEventFieldID(e.Name, p.Name)
-		if fieldID == 0 {
-			continue // no lock entry — skip (shouldn't happen after Update)
-		}
-		goField := str.Capitalize(p.Name)
-		nullable := p.Type != nil && p.Type.Nullable
-		switch resolveGoType(p.Type) {
-		case "int64":
-			if nullable {
-				fmt.Fprintf(b, "\tenc.WriteFieldIntPtr(%d, e.%s)\n", fieldID, goField)
-			} else {
-				fmt.Fprintf(b, "\tenc.WriteFieldInt(%d, e.%s)\n", fieldID, goField)
-			}
-		case "float64":
-			if nullable {
-				fmt.Fprintf(b, "\tenc.WriteFieldFloatPtr(%d, e.%s)\n", fieldID, goField)
-			} else {
-				fmt.Fprintf(b, "\tenc.WriteFieldFloat(%d, e.%s)\n", fieldID, goField)
-			}
-		case "string":
-			if nullable {
-				fmt.Fprintf(b, "\tenc.WriteFieldStringPtr(%d, e.%s)\n", fieldID, goField)
-			} else {
-				fmt.Fprintf(b, "\tenc.WriteFieldString(%d, e.%s)\n", fieldID, goField)
-			}
-		case "bool":
-			if nullable {
-				fmt.Fprintf(b, "\tenc.WriteFieldBoolPtr(%d, e.%s)\n", fieldID, goField)
-			} else {
-				fmt.Fprintf(b, "\tenc.WriteFieldBool(%d, e.%s)\n", fieldID, goField)
-			}
-		default:
-			// Complex types (models, lists) — skip for now, fall back to JSON
-			fmt.Fprintf(b, "\t// TODO: complex type %s for field %s\n", resolveGoType(p.Type), p.Name)
-		}
+		writeEventMarshalField(b, e.Name, p)
 	}
 	b.WriteString("\tenc.WriteEnd()\n")
 	b.WriteString("\treturn enc.Bytes()\n")
@@ -181,43 +166,76 @@ func generateEventCodec(b *strings.Builder, e *ast.EventDecl) {
 	b.WriteString("\tfor dec.NextField() {\n")
 	b.WriteString("\t\tswitch dec.FieldID() {\n")
 	for _, p := range e.Params {
-		fieldID := getEventFieldID(e.Name, p.Name)
-		if fieldID == 0 {
-			continue
-		}
-		goField := str.Capitalize(p.Name)
-		nullable := p.Type != nil && p.Type.Nullable
-		switch resolveGoType(p.Type) {
-		case "int64":
-			if nullable {
-				fmt.Fprintf(b, "\t\tcase %d: e.%s = dec.ReadIntPtr()\n", fieldID, goField)
-			} else {
-				fmt.Fprintf(b, "\t\tcase %d: e.%s = dec.ReadInt()\n", fieldID, goField)
-			}
-		case "float64":
-			if nullable {
-				fmt.Fprintf(b, "\t\tcase %d: e.%s = dec.ReadFloatPtr()\n", fieldID, goField)
-			} else {
-				fmt.Fprintf(b, "\t\tcase %d: e.%s = dec.ReadFloat()\n", fieldID, goField)
-			}
-		case "string":
-			if nullable {
-				fmt.Fprintf(b, "\t\tcase %d: e.%s = dec.ReadStringPtr()\n", fieldID, goField)
-			} else {
-				fmt.Fprintf(b, "\t\tcase %d: e.%s = dec.ReadString()\n", fieldID, goField)
-			}
-		case "bool":
-			if nullable {
-				fmt.Fprintf(b, "\t\tcase %d: e.%s = dec.ReadBoolPtr()\n", fieldID, goField)
-			} else {
-				fmt.Fprintf(b, "\t\tcase %d: e.%s = dec.ReadBool()\n", fieldID, goField)
-			}
-		}
+		writeEventUnmarshalField(b, e.Name, p)
 	}
 	b.WriteString("\t\t}\n")
 	b.WriteString("\t}\n")
 	b.WriteString("\treturn dec.Err()\n")
 	b.WriteString("}\n\n")
+}
+
+func writeEventMarshalField(b *strings.Builder, eventName string, param *ast.ParamDecl) {
+	fieldID := getEventFieldID(eventName, param.Name)
+	if fieldID == 0 {
+		return
+	}
+	goField := str.Capitalize(param.Name)
+	nullable := param.Type != nil && param.Type.Nullable
+	switch eventScalarType(param.Type) {
+	case "Int":
+		writeNullableEventCall(b, nullable, "WriteFieldInt", fieldID, goField)
+	case "Float":
+		writeNullableEventCall(b, nullable, "WriteFieldFloat", fieldID, goField)
+	case "String":
+		writeNullableEventCall(b, nullable, "WriteFieldString", fieldID, goField)
+	case "Boolean":
+		writeNullableEventCall(b, nullable, "WriteFieldBool", fieldID, goField)
+	default:
+		fmt.Fprintf(b, "\tif data, err := json.Marshal(e.%s); err == nil {\n", goField)
+		fmt.Fprintf(b, "\t\tenc.WriteFieldBytes(%d, data)\n", fieldID)
+		b.WriteString("\t}\n")
+	}
+}
+
+func writeNullableEventCall(b *strings.Builder, nullable bool, method string, fieldID int, goField string) {
+	if nullable {
+		method += "Ptr"
+	}
+	fmt.Fprintf(b, "\tenc.%s(%d, e.%s)\n", method, fieldID, goField)
+}
+
+func writeEventUnmarshalField(b *strings.Builder, eventName string, param *ast.ParamDecl) {
+	fieldID := getEventFieldID(eventName, param.Name)
+	if fieldID == 0 {
+		return
+	}
+	goField := str.Capitalize(param.Name)
+	nullable := param.Type != nil && param.Type.Nullable
+	method := eventReadMethod(eventScalarType(param.Type), nullable)
+	if method != "" {
+		fmt.Fprintf(b, "\t\tcase %d: e.%s = dec.%s()\n", fieldID, goField, method)
+		return
+	}
+	fmt.Fprintf(b, "\t\tcase %d:\n", fieldID)
+	fmt.Fprintf(b, "\t\t\tif err := json.Unmarshal(dec.ReadBytes(), &e.%s); err != nil { return err }\n", goField)
+}
+
+func eventScalarType(ref *ast.TypeRef) string {
+	if ref == nil || ref.IsList {
+		return ""
+	}
+	return ref.Name
+}
+
+func eventReadMethod(baseType string, nullable bool) string {
+	methods := map[string]string{
+		"Int": "ReadInt", "Float": "ReadFloat", "String": "ReadString", "Boolean": "ReadBool",
+	}
+	method := methods[baseType]
+	if method != "" && nullable {
+		method += "Ptr"
+	}
+	return method
 }
 
 // generateEmitFunc generates a typed emit function.

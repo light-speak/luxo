@@ -9,6 +9,7 @@ import (
 )
 
 type identityCtxKey struct{}
+type bearerTokenCtxKey struct{}
 
 var identityKey identityCtxKey
 
@@ -83,6 +84,13 @@ func Identity(ctx context.Context) *Claims {
 	return v
 }
 
+// BearerToken returns the verified bearer token associated with the request.
+// It is intended for trusted proxy handlers that must preserve end-user auth.
+func BearerToken(ctx context.Context) string {
+	token, _ := ctx.Value(bearerTokenCtxKey{}).(string)
+	return token
+}
+
 // AuthMiddleware wraps an http.Handler to extract and verify JWT from
 // the Authorization header. On success, injects claims into context.
 // On failure (invalid/expired token), the request continues without identity.
@@ -90,10 +98,16 @@ func Identity(ctx context.Context) *Claims {
 func AuthMiddleware(cfg *auth.Config, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := extractBearerToken(r)
+		if token == "" && strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			token = r.URL.Query().Get("token")
+		}
 		if token != "" {
-			data, err := auth.Verify(cfg, token)
+			// Cached verify — same Bearer token repeats across a session's
+			// requests; the cache removes HMAC + JSON decode from the hot path.
+			data, err := auth.VerifyCached(cfg, token)
 			if err == nil {
 				ctx := context.WithValue(r.Context(), identityKey, &Claims{data: data})
+				ctx = context.WithValue(ctx, bearerTokenCtxKey{}, token)
 				r = r.WithContext(ctx)
 			}
 		}

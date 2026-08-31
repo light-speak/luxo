@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
+	"github.com/light-speak/luxo/pkg/lux/schema"
 	"github.com/light-speak/luxo/pkg/lux/selection"
 )
 
@@ -17,6 +18,12 @@ type APIRegistry struct {
 	nameToID   map[string]int
 	paramOrder map[string][]ParamMeta
 	paramNames map[string][]string // static name lists for zero-alloc param lookup
+	schema     *schema.Schema
+}
+
+// SetSchema configures return-model metadata used to decode binary field masks.
+func (r *APIRegistry) SetSchema(s *schema.Schema) {
+	r.schema = s
 }
 
 // ParamMeta describes an API parameter for binary decoding.
@@ -121,7 +128,7 @@ func (r *APIRegistry) ParseBinaryRequest(body []byte) (*Request, error) {
 		if maskEnd > len(body) {
 			return nil, fmt.Errorf("field mask exceeds body")
 		}
-		fields = decodeFieldMask(body[off:maskEnd], r.paramOrder[apiName])
+		fields = r.decodeFieldMask(apiName, body[off:maskEnd])
 		off = maskEnd
 	}
 
@@ -181,13 +188,42 @@ func (r *APIRegistry) ParseBinaryRequest(body []byte) (*Request, error) {
 	return req, nil
 }
 
-// decodeFieldMask converts a bitmap to selection.Field list.
-// Each bit position corresponds to a field ID from the model.
-// For now, returns nil (SELECT *) — full bitmap support comes next.
-func decodeFieldMask(mask []byte, _ []ParamMeta) []*selection.Field {
-	// TODO: map bit positions to model field names using lock file
-	_ = mask
-	return nil
+func (r *APIRegistry) decodeFieldMask(apiName string, mask []byte) []*selection.Field {
+	if r.schema == nil {
+		return nil
+	}
+	apiMeta := r.schema.APIs[apiName]
+	if apiMeta == nil || apiMeta.ReturnType == "" {
+		return nil
+	}
+	model := r.schema.Models[apiMeta.ReturnType]
+	if model == nil {
+		if typeDecl := r.schema.Types[apiMeta.ReturnType]; typeDecl != nil {
+			model = typeDecl.AsModel()
+		}
+	}
+	return decodeFieldMask(mask, model)
+}
+
+// decodeFieldMask converts a bitmap to top-level selection fields.
+func decodeFieldMask(mask []byte, model *schema.Model) []*selection.Field {
+	if model == nil {
+		return nil
+	}
+	fields := make([]*selection.Field, 0, len(model.Fields))
+	for i := range model.Fields {
+		field := &model.Fields[i]
+		byteIndex := field.ID >> 3
+		if byteIndex >= len(mask) || mask[byteIndex]&(1<<uint(field.ID&7)) == 0 {
+			continue
+		}
+		selected := &selection.Field{Name: field.Name}
+		if field.Relation {
+			selected.Children = []*selection.Field{}
+		}
+		fields = append(fields, selected)
+	}
+	return fields
 }
 
 // EncodeBinaryRequest creates a binary request for testing/CLI.
