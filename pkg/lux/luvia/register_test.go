@@ -189,6 +189,13 @@ func TestCPUSamplerFirstAndInvalidSamples(t *testing.T) {
 	}
 }
 
+func TestCPUSamplerRejectsNonIncreasingTime(t *testing.T) {
+	s := &cpuSampler{lastBusySeconds: 10, lastSampleAt: time.Unix(100, 0)}
+	if got := s.percentAt(11, time.Unix(100, 0), 2); got != 0 {
+		t.Fatalf("non-increasing sample percentAt() = %v, want 0", got)
+	}
+}
+
 func TestGatewayRegistrarRegisterHTTPError(t *testing.T) {
 	gr := &GatewayRegistrar{
 		studioURL:  "http://127.0.0.1:1", // unreachable
@@ -199,6 +206,24 @@ func TestGatewayRegistrarRegisterHTTPError(t *testing.T) {
 	}
 	// Should not panic on HTTP error
 	gr.register()
+}
+
+func TestGatewayRegistrarRegisterNonSuccess(t *testing.T) {
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	gr := &GatewayRegistrar{
+		studioURL: srv.URL, apiKey: "test", instanceID: "test",
+		done: make(chan struct{}), client: srv.Client(),
+	}
+	gr.register()
+	if requests != 1 {
+		t.Fatalf("register requests = %d, want 1", requests)
+	}
 }
 
 func TestGatewayRegistrarHeartbeatHTTPError(t *testing.T) {

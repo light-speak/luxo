@@ -308,6 +308,24 @@ func TestWriteAPIRegistrationSchema(t *testing.T) {
 	}
 }
 
+func TestWriteAPIRegistrationSchemaListParam(t *testing.T) {
+	oldAPIIDs := apiIDs
+	oldParamIDs := apiParamIDs
+	apiIDs = map[string]int{"search": 21}
+	apiParamIDs = map[string]map[string]int{"search": {"tags": 1}}
+	defer func() {
+		apiIDs = oldAPIIDs
+		apiParamIDs = oldParamIDs
+	}()
+
+	var b strings.Builder
+	params := []*ast.ParamDecl{{Name: "tags", Type: &ast.TypeRef{Name: "String", IsList: true}}}
+	writeAPIRegistrationSchema(&b, "search", "search", params, nil, false, false)
+	if src := b.String(); !strings.Contains(src, `Name: "tags", Type: schema.FieldString, TypeName: "String", IsList: true`) {
+		t.Fatalf("list parameter metadata missing:\n%s", src)
+	}
+}
+
 func TestBuildSchemaJSON_PreservesOptionalParams(t *testing.T) {
 	oldAPIIDs := apiIDs
 	oldParamIDs := apiParamIDs

@@ -51,6 +51,13 @@ func TestGenerateEmpty(t *testing.T) {
 	}
 }
 
+func TestFormatGeneratedReturnsInvalidSourceUnchanged(t *testing.T) {
+	raw := []byte("package invalid {")
+	if got := formatGenerated(raw); !bytes.Equal(got, raw) {
+		t.Fatalf("formatGenerated() = %q, want original %q", got, raw)
+	}
+}
+
 func TestGenerateIncludesStreamFile(t *testing.T) {
 	file := &ast.File{
 		Name: "origin/alert/event.luxo",

@@ -41,9 +41,6 @@ func (s *cpuSampler) percentAt(busySeconds float64, sampledAt time.Time, process
 		return 0
 	}
 	percent := (busySeconds - previousBusy) / elapsed / float64(processors) * 100
-	if percent < 0 {
-		return 0
-	}
 	if percent > 100 {
 		return 100
 	}
@@ -56,14 +53,7 @@ func runtimeBusySeconds() float64 {
 		{Name: "/cpu/classes/idle:cpu-seconds"},
 	}
 	metrics.Read(samples)
-	if samples[0].Value.Kind() != metrics.KindFloat64 || samples[1].Value.Kind() != metrics.KindFloat64 {
-		return 0
-	}
-	busy := samples[0].Value.Float64() - samples[1].Value.Float64()
-	if busy < 0 {
-		return 0
-	}
-	return busy
+	return samples[0].Value.Float64() - samples[1].Value.Float64()
 }
 
 // GatewayRegistrar handles auto-registration and heartbeat with Luxo Studio.

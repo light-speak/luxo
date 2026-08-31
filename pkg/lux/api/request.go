@@ -73,20 +73,29 @@ func (f *Filter) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
-	value := bytes.TrimSpace(raw.Value)
-	if len(value) == 0 || bytes.Equal(value, []byte("null")) || value[0] == '{' || value[0] == '[' {
-		return fmt.Errorf("filter value must be a string, number, or boolean")
+	value, err := parseFilterValue(raw.Value)
+	if err != nil {
+		return err
 	}
-	if value[0] == '"' {
-		if err := json.Unmarshal(value, &f.Value); err != nil {
-			return err
-		}
-	} else {
-		f.Value = string(value)
-	}
+	f.Value = value
 	f.Field = raw.Field
 	f.Operator = raw.Operator
 	return nil
+}
+
+func parseFilterValue(raw json.RawMessage) (string, error) {
+	value := bytes.TrimSpace(raw)
+	if len(value) == 0 || bytes.Equal(value, []byte("null")) || value[0] == '{' || value[0] == '[' {
+		return "", fmt.Errorf("filter value must be a string, number, or boolean")
+	}
+	if value[0] == '"' {
+		var decoded string
+		if err := json.Unmarshal(value, &decoded); err != nil {
+			return "", err
+		}
+		return decoded, nil
+	}
+	return string(value), nil
 }
 
 // Sorter represents a sort directive from $sorters.

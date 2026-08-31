@@ -133,6 +133,27 @@ func TestStreamHubDispatchEventUsesTransportMode(t *testing.T) {
 	}
 }
 
+func TestStreamHubDispatchEventMatcherRejects(t *testing.T) {
+	hub := NewStreamHub()
+	sub := hub.SubscribeMode("watch", nil, nil, nil, false, nil)
+	encoded := false
+	hub.DispatchEvent("watch", []byte{9}, func([]byte, *StreamParams, any) bool {
+		return false
+	}, func([]byte, bool) []byte {
+		encoded = true
+		return []byte("unexpected")
+	})
+
+	if encoded {
+		t.Fatal("encoder called for rejected subscriber")
+	}
+	select {
+	case data := <-sub.Ch:
+		t.Fatalf("rejected subscriber received %q", data)
+	default:
+	}
+}
+
 func TestStreamHub_ChanFull(t *testing.T) {
 	hub := NewStreamHub()
 	cancelled := make(chan struct{}, 1)

@@ -427,3 +427,118 @@ func TestMetricsFlushLoopTickerBranch(t *testing.T) {
 		t.Error("flush should have been called")
 	}
 }
+
+func TestShouldSampleTraceDeterministic(t *testing.T) {
+	first := shouldSampleTrace("trace-deterministic", 0.5)
+	second := shouldSampleTrace("trace-deterministic", 0.5)
+	if first != second {
+		t.Fatalf("sampling decision changed: first=%t second=%t", first, second)
+	}
+}
+
+func TestMetricsCollectorRecordTraceCapacity(t *testing.T) {
+	mc := &MetricsCollector{
+		traceSampleRate: 1,
+		traces:          make([]api.TraceRecord, maxPendingTraces),
+	}
+	mc.RecordTrace(api.TraceRecord{TraceID: "overflow", StatusCode: http.StatusInternalServerError})
+	if len(mc.traces) != maxPendingTraces {
+		t.Fatalf("trace count = %d, want %d", len(mc.traces), maxPendingTraces)
+	}
+}
+
+func TestMetricsCollectorFlushTraceErrorPayload(t *testing.T) {
+	var received map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Error(err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	mc := newTraceCollector(srv.URL, srv.Client())
+	mc.traces = append(mc.traces, api.TraceRecord{
+		TraceID: "failed", APIName: "createUser", StatusCode: http.StatusBadRequest,
+		Timestamp: time.Unix(100, 0).UTC(),
+	})
+	mc.flushTraces()
+
+	traces := received["traces"].([]any)
+	trace := traces[0].(map[string]any)
+	if trace["status"] != "ERROR" {
+		t.Fatalf("trace status = %v, want ERROR", trace["status"])
+	}
+}
+
+func TestMetricsCollectorFlushTraceFailuresReenqueue(t *testing.T) {
+	t.Run("invalid URL", func(t *testing.T) {
+		mc := newTraceCollector("://invalid", http.DefaultClient)
+		mc.traces = append(mc.traces, api.TraceRecord{TraceID: "invalid-url"})
+		mc.flushTraces()
+		assertTraceRequeued(t, mc, "invalid-url")
+	})
+
+	t.Run("transport error", func(t *testing.T) {
+		client := &http.Client{Timeout: 100 * time.Millisecond}
+		mc := newTraceCollector("http://127.0.0.1:1", client)
+		mc.traces = append(mc.traces, api.TraceRecord{TraceID: "transport-error"})
+		mc.flushTraces()
+		assertTraceRequeued(t, mc, "transport-error")
+	})
+
+	t.Run("HTTP error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer srv.Close()
+		mc := newTraceCollector(srv.URL, srv.Client())
+		mc.traces = append(mc.traces, api.TraceRecord{TraceID: "http-error"})
+		mc.flushTraces()
+		assertTraceRequeued(t, mc, "http-error")
+	})
+}
+
+func TestMetricsCollectorReenqueueTraceLimits(t *testing.T) {
+	mc := &MetricsCollector{traces: make([]api.TraceRecord, maxPendingTraces)}
+	mc.reenqueueTraces([]api.TraceRecord{{TraceID: "dropped"}})
+	if len(mc.traces) != maxPendingTraces {
+		t.Fatalf("full queue size = %d, want %d", len(mc.traces), maxPendingTraces)
+	}
+
+	mc.traces = make([]api.TraceRecord, maxPendingTraces-1)
+	mc.reenqueueTraces([]api.TraceRecord{{TraceID: "kept"}, {TraceID: "truncated"}})
+	if len(mc.traces) != maxPendingTraces || mc.traces[0].TraceID != "kept" {
+		t.Fatalf("limited requeue = len %d first %q", len(mc.traces), mc.traces[0].TraceID)
+	}
+}
+
+func TestMetricsCollectorReenqueueFullLatencyBucket(t *testing.T) {
+	timestamp := time.Now().Truncate(5 * time.Minute)
+	key := "getUser:" + strconv.FormatInt(timestamp.Unix(), 10)
+	mc := &MetricsCollector{buckets: map[string]*metricBucket{
+		key: {latencies: make([]float64, maxLatencySamples)},
+	}}
+	mc.reenqueue(map[string]*metricBucket{
+		key: {totalCount: 1, latencies: []float64{10}},
+	})
+	if len(mc.buckets[key].latencies) != maxLatencySamples || mc.buckets[key].totalCount != 1 {
+		t.Fatalf("re-enqueued bucket = %+v", mc.buckets[key])
+	}
+}
+
+func newTraceCollector(studioURL string, client *http.Client) *MetricsCollector {
+	return &MetricsCollector{
+		studioURL: studioURL,
+		apiKey:    "secret",
+		traces:    make([]api.TraceRecord, 0, 1),
+		client:    client,
+	}
+}
+
+func assertTraceRequeued(t *testing.T, mc *MetricsCollector, traceID string) {
+	t.Helper()
+	if len(mc.traces) != 1 || mc.traces[0].TraceID != traceID {
+		t.Fatalf("requeued traces = %+v, want %q", mc.traces, traceID)
+	}
+}

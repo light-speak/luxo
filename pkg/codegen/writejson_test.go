@@ -827,10 +827,11 @@ func TestGenerateTypeWriteColumnar(t *testing.T) {
 			{Name: "serviceName", Type: &ast.TypeRef{Name: "String"}},
 			{Name: "apiCount", Type: &ast.TypeRef{Name: "Int"}},
 			{Name: "version", Type: &ast.TypeRef{Name: "String", Nullable: true}},
+			{Name: "tags", Type: &ast.TypeRef{Name: "String", IsList: true}},
 		},
 	}
 	SetModelFieldIDs(map[string]map[string]int{
-		"ServiceSummary": {"serviceName": 1, "apiCount": 2, "version": 3},
+		"ServiceSummary": {"serviceName": 1, "apiCount": 2, "version": 3, "tags": 4},
 	})
 	defer SetModelFieldIDs(nil)
 
@@ -850,6 +851,23 @@ func TestGenerateTypeWriteColumnar(t *testing.T) {
 	}
 	if !strings.Contains(out, "WriteColumnStringPtr(3, vals)") {
 		t.Errorf("should write nullable version column: %s", out)
+	}
+	if !strings.Contains(out, "w.WriteColumnBytes(4, cells)") {
+		t.Errorf("should write list tags column: %s", out)
+	}
+}
+
+func TestCompileMaskDirectiveMultipleArgs(t *testing.T) {
+	field := &ast.FieldDecl{
+		Name: "phone",
+		Type: &ast.TypeRef{Name: "String"},
+		Directives: []*ast.Directive{{Name: "mask", Args: []*ast.NamedArg{
+			{Value: &ast.Literal{Kind: token.String, Value: "first"}},
+			{Value: &ast.Literal{Kind: token.String, Value: "second"}},
+		}}},
+	}
+	if got := compileMaskDirectiveExpr(field, "value", "String"); got != `str.MaskPattern(value, "")` {
+		t.Fatalf("compileMaskDirectiveExpr() = %q", got)
 	}
 }
 

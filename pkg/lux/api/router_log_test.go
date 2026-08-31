@@ -3,6 +3,9 @@ package api
 import (
 	"bytes"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,6 +62,36 @@ func TestLogRequest_Disabled(t *testing.T) {
 	rt := NewRouter()
 	// Should not panic or produce output when disabled
 	rt.logRequest("test", time.Millisecond, nil)
+}
+
+func TestServeHTTPLogsParseErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		body   string
+		binary bool
+		mode   string
+	}{
+		{name: "JSON", body: "bad", mode: "json"},
+		{name: "binary", body: "", binary: true, mode: "binary"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, LogWriter: &logs})
+			r := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(tt.body))
+			if tt.binary {
+				r.Header.Set("X-Luxo-Mode", "binary")
+			}
+			w := httptest.NewRecorder()
+			rt.ServeHTTP(w, r)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+			}
+			if output := logs.String(); !strings.Contains(output, "[parse]") || !strings.Contains(output, tt.mode) {
+				t.Fatalf("parse log = %q", output)
+			}
+		})
+	}
 }
 
 func TestLogRequest_NoModule(t *testing.T) {

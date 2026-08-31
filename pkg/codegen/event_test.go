@@ -17,6 +17,22 @@ func TestGenerateEventFileNoEvents(t *testing.T) {
 	}
 }
 
+func TestEventJSONFallbackTypes(t *testing.T) {
+	events := []*ast.EventDecl{{Params: []*ast.ParamDecl{
+		{Name: "unknown"},
+		{Name: "items", Type: &ast.TypeRef{Name: "String", IsList: true}},
+	}}}
+	if !eventsNeedJSON(events) {
+		t.Fatal("eventsNeedJSON() = false, want true")
+	}
+	if got := eventScalarType(nil); got != "" {
+		t.Fatalf("eventScalarType(nil) = %q, want empty", got)
+	}
+	if got := eventScalarType(&ast.TypeRef{Name: "String", IsList: true}); got != "" {
+		t.Fatalf("eventScalarType(list) = %q, want empty", got)
+	}
+}
+
 func TestGenerateEventFile(t *testing.T) {
 	result := &semantic.Result{
 		Files: []*ast.File{{

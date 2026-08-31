@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -403,6 +404,31 @@ func TestParseRequestWithScalarFilterValues(t *testing.T) {
 	}
 	if len(req.Filters) != 2 || req.Filters[0].Value != "42" || req.Filters[1].Value != "true" {
 		t.Fatalf("filters = %+v", req.Filters)
+	}
+}
+
+func TestFilterRejectsNonScalarValues(t *testing.T) {
+	tests := []string{
+		`{"field":"id","op":"eq"}`,
+		`{"field":"id","op":"eq","value":null}`,
+		`{"field":"id","op":"eq","value":{}}`,
+		`{"field":"id","op":"eq","value":[]}`,
+	}
+	for _, input := range tests {
+		var filter Filter
+		if err := json.Unmarshal([]byte(input), &filter); err == nil {
+			t.Errorf("json.Unmarshal(%s) succeeded, want error", input)
+		}
+	}
+}
+
+func TestFilterRejectsMalformedJSON(t *testing.T) {
+	var filter Filter
+	if err := filter.UnmarshalJSON([]byte(`{"field":`)); err == nil {
+		t.Fatal("malformed filter JSON succeeded")
+	}
+	if _, err := parseFilterValue([]byte{'"', '\\', 'x', '"'}); err == nil {
+		t.Fatal("malformed JSON string succeeded")
 	}
 }
 

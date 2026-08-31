@@ -682,6 +682,27 @@ func TestCollectModulesMarksEventEmitters(t *testing.T) {
 	}
 }
 
+func TestFileEmitsEventsFromFunctionsAndMiddleware(t *testing.T) {
+	emitBody := func() *ast.Block {
+		return &ast.Block{Stmts: []ast.Stmt{&ast.EmitStmt{EventName: "AuditRecorded"}}}
+	}
+	tests := map[string]*ast.File{
+		"function": {
+			Functions: []*ast.FnDecl{{Name: "audit", Body: emitBody()}},
+		},
+		"middleware": {
+			Middlewares: []*ast.MiddlewareDecl{{Name: "audit", Body: emitBody()}},
+		},
+	}
+	for name, file := range tests {
+		t.Run(name, func(t *testing.T) {
+			if !fileEmitsEvents(file) {
+				t.Fatal("fileEmitsEvents() = false, want true")
+			}
+		})
+	}
+}
+
 func TestCollectModulesWithExtends(t *testing.T) {
 	result := &semantic.Result{
 		Files: []*ast.File{{

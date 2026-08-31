@@ -509,6 +509,40 @@ func TestParseBinaryRequestDecodesFieldMaskFromSchema(t *testing.T) {
 	}
 }
 
+func TestDecodeFieldMaskMissingMetadata(t *testing.T) {
+	reg := NewAPIRegistry()
+	if fields := reg.decodeFieldMask("missing", []byte{1}); fields != nil {
+		t.Fatalf("nil schema fields = %#v, want nil", fields)
+	}
+
+	s := schema.New()
+	reg.SetSchema(s)
+	if fields := reg.decodeFieldMask("missing", []byte{1}); fields != nil {
+		t.Fatalf("missing API fields = %#v, want nil", fields)
+	}
+	s.RegisterAPI(&schema.API{Name: "scalar"})
+	if fields := reg.decodeFieldMask("scalar", []byte{1}); fields != nil {
+		t.Fatalf("scalar API fields = %#v, want nil", fields)
+	}
+	s.RegisterAPI(&schema.API{Name: "unknown", ReturnType: "Missing"})
+	if fields := reg.decodeFieldMask("unknown", []byte{1}); fields != nil {
+		t.Fatalf("missing return type fields = %#v, want nil", fields)
+	}
+}
+
+func TestDecodeFieldMaskTypeDeclaration(t *testing.T) {
+	reg := NewAPIRegistry()
+	s := schema.New()
+	s.RegisterType(&schema.TypeDecl{Name: "Payload", Fields: []schema.Field{{ID: 1, Name: "id"}}})
+	s.RegisterAPI(&schema.API{Name: "payload", ReturnType: "Payload"})
+	reg.SetSchema(s)
+
+	fields := reg.decodeFieldMask("payload", []byte{0b00000010})
+	if len(fields) != 1 || fields[0].Name != "id" {
+		t.Fatalf("type declaration fields = %#v", fields)
+	}
+}
+
 // --- ExportHandlers ---
 
 func TestExportHandlers(t *testing.T) {

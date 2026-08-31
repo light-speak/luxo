@@ -228,6 +228,32 @@ func TestGenerateStreamFileLuxoMatcher(t *testing.T) {
 	}
 }
 
+func TestGenerateTypedStreamRegistersMatcher(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "test.luxo",
+		Events: []*ast.EventDecl{{
+			Name:   "AlertFired",
+			Params: []*ast.ParamDecl{{Name: "alert", Type: &ast.TypeRef{Name: "Alert"}}},
+		}},
+		APIs: []*ast.ApiDecl{{
+			Name:       "liveAlerts",
+			ReturnType: &ast.TypeRef{Name: "Alert"},
+			Directives: []*ast.Directive{
+				{Name: "stream", Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "AlertFired"}}}},
+				{Name: "auth"},
+			},
+		}},
+	}}}
+
+	code := string(generateStreamFile(result, "luxo"))
+	if !strings.Contains(code, `router.Streams.DispatchEvent("liveAlerts"`) {
+		t.Fatalf("typed stream registration missing:\n%s", code)
+	}
+	if !strings.Contains(code, `router.HandleStream("liveAlerts", matchLiveAlerts)`) {
+		t.Fatalf("typed stream matcher registration missing:\n%s", code)
+	}
+}
+
 func TestCollectStreams(t *testing.T) {
 	result := &semantic.Result{
 		Files: []*ast.File{{
