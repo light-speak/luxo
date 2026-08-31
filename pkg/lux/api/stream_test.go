@@ -154,6 +154,27 @@ func TestStreamHubDispatchEventMatcherRejects(t *testing.T) {
 	}
 }
 
+func TestStreamHubDispatchEventCancelsSlowSubscriber(t *testing.T) {
+	hub := NewStreamHub()
+	cancelled := make(chan struct{}, 1)
+	sub := hub.SubscribeMode("watch", nil, nil, nil, false, func() {
+		cancelled <- struct{}{}
+	})
+	for range cap(sub.Ch) {
+		sub.Ch <- []byte("queued")
+	}
+
+	hub.DispatchEvent("watch", nil, nil, func([]byte, bool) []byte {
+		return []byte("overflow")
+	})
+
+	select {
+	case <-cancelled:
+	default:
+		t.Fatal("slow subscriber was not cancelled")
+	}
+}
+
 func TestStreamHub_ChanFull(t *testing.T) {
 	hub := NewStreamHub()
 	cancelled := make(chan struct{}, 1)
