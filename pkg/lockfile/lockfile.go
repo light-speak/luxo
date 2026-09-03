@@ -5,6 +5,9 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/light-speak/luxo/pkg/ast"
 )
@@ -192,9 +195,6 @@ func (lf *LockFile) updateExtends(files []*ast.File) {
 				lf.Models[ext.Name] = ml
 			}
 			for _, f := range ext.Fields {
-				if f.Computed != nil {
-					continue
-				}
 				if _, ok := ml.Fields[f.Name]; ok {
 					continue // already assigned
 				}
@@ -264,9 +264,6 @@ func (lf *LockFile) updateModels(files []*ast.File) {
 		for _, m := range file.Models {
 			fields := make(map[string]bool, len(m.Fields))
 			for _, f := range m.Fields {
-				if f.Computed != nil {
-					continue // computed fields don't get IDs
-				}
 				fields[f.Name] = true
 			}
 			currentModels[m.Name] = fields
@@ -277,9 +274,6 @@ func (lf *LockFile) updateModels(files []*ast.File) {
 				currentModels[ext.Name] = make(map[string]bool)
 			}
 			for _, f := range ext.Fields {
-				if f.Computed != nil {
-					continue
-				}
 				currentModels[ext.Name][f.Name] = true
 			}
 		}
@@ -304,7 +298,7 @@ func (lf *LockFile) updateModels(files []*ast.File) {
 	}
 }
 
-// assignModelFields ensures every non-computed field in a model has an ID.
+// assignModelFields ensures every response-visible model field has a stable ID.
 func (lf *LockFile) assignModelFields(m *ast.ModelDecl) {
 	ml, exists := lf.Models[m.Name]
 	if !exists {
@@ -315,9 +309,6 @@ func (lf *LockFile) assignModelFields(m *ast.ModelDecl) {
 		lf.Models[m.Name] = ml
 	}
 	for _, f := range m.Fields {
-		if f.Computed != nil {
-			continue
-		}
 		if _, ok := ml.Fields[f.Name]; ok {
 			continue // already assigned
 		}
@@ -358,6 +349,12 @@ func (lf *LockFile) reserveRemovedFields(ml *ModelLock, current map[string]bool)
 
 // updateAPIs assigns stable IDs to all API declarations, including CRUD APIs.
 func (lf *LockFile) updateAPIs(files []*ast.File) {
+	enums := make(map[string]bool)
+	for _, file := range files {
+		for _, enum := range file.Enums {
+			enums[enum.Name] = true
+		}
+	}
 	// CRUD APIs from models with @crud
 	for _, file := range files {
 		for _, m := range file.Models {
@@ -369,12 +366,15 @@ func (lf *LockFile) updateAPIs(files []*ast.File) {
 			// CRUD param names are well-known
 			lf.ensureAPIID("get"+name, []string{"id"})
 			lf.ensureAPIID("list"+plural, []string{"page", "pageSize"})
-			lf.ensureAPIID("create"+name, collectFieldNames(m))
-			lf.ensureAPIID("update"+name, append([]string{"id"}, collectFieldNames(m)...))
+			lf.ensureAPIID("create"+name, collectCRUDFieldNames(m, enums, false))
+			lf.ensureAPIID("update"+name, append([]string{"id"}, collectCRUDFieldNames(m, enums, true)...))
 			lf.ensureAPIID("delete"+name, []string{"id"})
 			lf.ensureAPIID("delete"+plural, []string{"ids"})
+			lf.ensureAPIID("svc:batchLoad:"+name, []string{"keys"})
 		}
 	}
+	lf.updateFederationAPIs(files, enums)
+	lf.updateNamedLoadAPIs(files)
 	// Declared APIs — params from AST
 	for _, file := range files {
 		for _, api := range file.APIs {
@@ -400,6 +400,160 @@ func (lf *LockFile) updateAPIs(files []*ast.File) {
 	}
 }
 
+func (lf *LockFile) updateFederationAPIs(files []*ast.File, enums map[string]bool) {
+	primaryKeys := make(map[string]string)
+	for _, file := range files {
+		for _, model := range file.Models {
+			primaryKeys[model.Name] = modelPrimaryKeyName(model)
+		}
+	}
+	for _, file := range files {
+		for _, ext := range file.Extends {
+			lf.ensureAPIID("svc:batchLoad:"+ext.Name, []string{"keys"})
+			for _, field := range ext.Fields {
+				if field.Type == nil || field.Computed != nil || !isCRUDRelationField(field, enums) {
+					continue
+				}
+				foreignKey := federationForeignKey(ext.Name, primaryKeys[ext.Name], field)
+				lf.ensureAPIID("svc:resolve:"+field.Type.Name+":"+foreignKey, []string{"keys"})
+			}
+		}
+	}
+}
+
+func (lf *LockFile) updateNamedLoadAPIs(files []*ast.File) {
+	seen := make(map[string]bool)
+	visit := func(expr ast.Expr) {
+		call, ok := expr.(*ast.CallExpr)
+		if !ok {
+			return
+		}
+		member, ok := call.Func.(*ast.MemberExpr)
+		if !ok || member.Field != "load" {
+			return
+		}
+		model, ok := member.Object.(*ast.Ident)
+		if !ok || model.Name == "" {
+			return
+		}
+		args := namedLoadArgNames(call.Args)
+		if len(args) == 0 {
+			return
+		}
+		name := "svc:load:" + model.Name + ":" + strings.Join(args, ":")
+		if !seen[name] {
+			seen[name] = true
+			lf.ensureAPIID(name, args)
+		}
+	}
+	for _, file := range files {
+		for _, api := range file.APIs {
+			ast.WalkExprs(api.Body, visit)
+		}
+		for _, fn := range file.Functions {
+			ast.WalkExprs(fn.Body, visit)
+		}
+	}
+}
+
+func namedLoadArgNames(args []*ast.NamedArg) []string {
+	names := make([]string, 0, len(args))
+	for _, arg := range args {
+		if arg.Name == "" {
+			return nil
+		}
+		names = append(names, arg.Name)
+	}
+	return names
+}
+
+func federationForeignKey(modelName, primaryKeyName string, field *ast.FieldDecl) string {
+	for _, directive := range field.Directives {
+		if directive.Name != "by" || len(directive.Args) == 0 {
+			continue
+		}
+		if ident, ok := directive.Args[0].Value.(*ast.Ident); ok && ident.Name != "" {
+			return ident.Name
+		}
+	}
+	if field.Type.IsList {
+		if primaryKeyName == "" {
+			primaryKeyName = "id"
+		}
+		return lowerFirst(modelName) + upperFirst(primaryKeyName)
+	}
+	return "id"
+}
+
+func modelPrimaryKeyName(model *ast.ModelDecl) string {
+	for _, field := range model.Fields {
+		if hasFieldDirective(field, "id") {
+			return field.Name
+		}
+	}
+	for _, field := range model.Fields {
+		if field.Name == "id" {
+			return field.Name
+		}
+	}
+	return "id"
+}
+
+func upperFirst(value string) string {
+	if value == "" {
+		return value
+	}
+	r, size := utf8.DecodeRuneInString(value)
+	return string(unicode.ToUpper(r)) + value[size:]
+}
+
+func lowerFirst(value string) string {
+	if value == "" {
+		return value
+	}
+	r, size := utf8.DecodeRuneInString(value)
+	return string(unicode.ToLower(r)) + value[size:]
+}
+
+func collectCRUDFieldNames(m *ast.ModelDecl, enums map[string]bool, update bool) []string {
+	var names []string
+	for _, f := range m.Fields {
+		if f.Type == nil || f.Computed != nil || hasFieldDirective(f, "internal") || isCRUDManagedField(f) || isCRUDRelationField(f, enums) {
+			continue
+		}
+		if update && (f.Name == "id" || hasFieldDirective(f, "immutable")) {
+			continue
+		}
+		names = append(names, f.Name)
+	}
+	return names
+}
+
+func hasFieldDirective(field *ast.FieldDecl, name string) bool {
+	for _, directive := range field.Directives {
+		if directive.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func isCRUDManagedField(field *ast.FieldDecl) bool {
+	if hasFieldDirective(field, "serial") || hasFieldDirective(field, "auto") {
+		return true
+	}
+	return field.Type.Name == "DateTime" && (field.Name == "createdAt" || field.Name == "updatedAt")
+}
+
+func isCRUDRelationField(field *ast.FieldDecl, enums map[string]bool) bool {
+	switch field.Type.Name {
+	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes", "JSON":
+		return false
+	default:
+		return !enums[field.Type.Name]
+	}
+}
+
 func hasServiceDirective(fn *ast.FnDecl) bool {
 	for _, d := range fn.Directives {
 		if d.Name == "service" {
@@ -412,9 +566,6 @@ func hasServiceDirective(fn *ast.FnDecl) bool {
 func collectFieldNames(m *ast.ModelDecl) []string {
 	var names []string
 	for _, f := range m.Fields {
-		if f.Computed != nil {
-			continue
-		}
 		names = append(names, f.Name)
 	}
 	return names

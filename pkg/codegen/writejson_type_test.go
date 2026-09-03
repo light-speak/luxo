@@ -138,7 +138,7 @@ func TestGenerateTypeWriteLuxo_NestedModel(t *testing.T) {
 	code := b.String()
 
 	// Nested model should use inline WriteLuxo
-	if !strings.Contains(code, "a.Member.WriteLuxo(buf, nil)") {
+	if !strings.Contains(code, "a.Member.WriteLuxo(buf, _childMask2)") {
 		t.Errorf("nested model should call WriteLuxo inline:\n%s", code)
 	}
 }
@@ -167,7 +167,7 @@ func TestGenerateTypeWriteLuxo_ListRelation(t *testing.T) {
 	if !strings.Contains(code, "len(r.Items)") {
 		t.Errorf("list relation should append count:\n%s", code)
 	}
-	if !strings.Contains(code, "r.Items[i].WriteLuxo(buf, nil)") {
+	if !strings.Contains(code, "r.Items[i].WriteLuxo(buf, _childMask1)") {
 		t.Errorf("list relation should call WriteLuxo per item:\n%s", code)
 	}
 }
@@ -195,7 +195,7 @@ func TestGenerateTypeWriteLuxo_NullableRelation(t *testing.T) {
 	if !strings.Contains(code, "w.Nested != nil") {
 		t.Errorf("nullable relation should have nil check:\n%s", code)
 	}
-	if !strings.Contains(code, "w.Nested.WriteLuxo(buf, nil)") {
+	if !strings.Contains(code, "w.Nested.WriteLuxo(buf, _childMask1)") {
 		t.Errorf("nullable relation should call WriteLuxo when present:\n%s", code)
 	}
 	if !strings.Contains(code, "AppendNull") {

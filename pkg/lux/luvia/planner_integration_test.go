@@ -62,20 +62,34 @@ func encodePost(id, userID int64, title string) []byte {
 	return buf
 }
 
+func decodeIntKeys(t *testing.T, keys BinaryKeys) []int64 {
+	t.Helper()
+	dec := codec.NewDecoder(keys.EncodeParam(1))
+	if !dec.NextField() {
+		t.Fatal("encoded keys parameter is empty")
+	}
+	values := dec.ReadIntArray()
+	if dec.Err() != nil {
+		t.Fatal(dec.Err())
+	}
+	return values
+}
+
 // --- Test 1: Gateway Federation Planner Integration (single record) ---
 
 // TestIntegration_PlanSplitMerge tests the full Plan → simulate RPC → Merge path
 // for a single User with extend posts.
 func TestIntegration_PlanSplitMerge(t *testing.T) {
-	_, userModel := integrationUserModel()
+	registry, userModel := integrationUserModel()
 
 	// Client requests: id, name, posts (extend field)
 	mask := codec.FieldMaskSet(nil, 1)  // id
 	mask = codec.FieldMaskSet(mask, 2)  // name
 	mask = codec.FieldMaskSet(mask, 10) // posts (extend)
+	mask = selectionNode(mask)
 
 	// Step 1: Plan
-	plan := Plan(userModel, mask, "user")
+	plan := planForTest(t, userModel, mask, "user")
 	if plan == nil {
 		t.Fatal("expected non-nil plan for request with extend fields")
 	}
@@ -84,13 +98,13 @@ func TestIntegration_PlanSplitMerge(t *testing.T) {
 	if plan.Primary.Module != "user" {
 		t.Errorf("primary module = %q, want %q", plan.Primary.Module, "user")
 	}
-	if !codec.FieldMaskHas(plan.Primary.Mask, 1) {
+	if !codec.FieldMaskHas(selectionFields(plan.Primary.Mask), 1) {
 		t.Error("primary mask missing id (field 1)")
 	}
-	if !codec.FieldMaskHas(plan.Primary.Mask, 2) {
+	if !codec.FieldMaskHas(selectionFields(plan.Primary.Mask), 2) {
 		t.Error("primary mask missing name (field 2)")
 	}
-	if codec.FieldMaskHas(plan.Primary.Mask, 10) {
+	if codec.FieldMaskHas(selectionFields(plan.Primary.Mask), 10) {
 		t.Error("primary mask should not include extend field posts (10)")
 	}
 
@@ -109,20 +123,21 @@ func TestIntegration_PlanSplitMerge(t *testing.T) {
 	primary := encodeUser(42, "Alice", "")
 
 	// Step 3: Extract ID from primary response
-	id, ok := ExtractID(primary, plan.IDFieldID, plan.FieldTypes)
+	keys, ok := ExtractPrimaryKeys(primary, plan.PrimaryKeyField, userModel, registry)
 	if !ok {
 		t.Fatal("failed to extract ID from primary response")
 	}
-	if id != 42 {
-		t.Fatalf("extracted id = %d, want 42", id)
+	ids := decodeIntKeys(t, keys)
+	if len(ids) != 1 || ids[0] != 42 {
+		t.Fatalf("extracted ids = %v, want [42]", ids)
 	}
 
 	// Step 4: Simulate extend RPC response (post service returns 2 posts for user 42)
-	// Encode as a list: [count svarint][post1 raw][post2 raw]
+	// Encode as a list: [count varint][post1 raw][post2 raw]
 	post1 := encodePost(101, 42, "Hello World")
 	post2 := encodePost(102, 42, "Second Post")
 	var postsData []byte
-	postsData = codec.AppendSvarint(postsData, 2) // count = 2
+	postsData = codec.AppendArrayHeader(postsData, 2) // count = 2
 	postsData = append(postsData, post1...)
 	postsData = append(postsData, post2...)
 
@@ -139,7 +154,7 @@ func TestIntegration_PlanSplitMerge(t *testing.T) {
 	fieldsSeen := map[int]bool{}
 	var mergedID int64
 	var mergedName string
-	var postsCount int64
+	var postsCount int
 
 	for dec.NextField() {
 		fid := dec.FieldID()
@@ -152,7 +167,7 @@ func TestIntegration_PlanSplitMerge(t *testing.T) {
 		case 3:
 			_ = dec.ReadString() // email (may be empty)
 		case 10:
-			postsCount = dec.ReadInt() // svarint count
+			postsCount = dec.ReadArrayLength()
 		default:
 			t.Fatalf("unexpected field ID %d in merged response", fid)
 		}
@@ -201,11 +216,11 @@ func buildGroupedPostResponse() []byte {
 }
 
 // verifyBlobCounts checks the item count in each grouped response blob.
-func verifyBlobCounts(t *testing.T, blobs [][]byte, expected []int64) {
+func verifyBlobCounts(t *testing.T, blobs [][]byte, expected []int) {
 	t.Helper()
 	for i, want := range expected {
 		dec := codec.NewDecoder(blobs[i])
-		got := dec.ReadInt()
+		got := dec.ReadArrayLength()
 		if got != want {
 			t.Errorf("blob[%d] count = %d, want %d", i, got, want)
 		}
@@ -217,14 +232,18 @@ func verifyBlobCounts(t *testing.T, blobs [][]byte, expected []int64) {
 func TestIntegration_ColumnarFederation(t *testing.T) {
 	_, userModel := integrationUserModel()
 
-	plan := Plan(userModel, nil, "user")
+	plan := planForTest(t, userModel, nil, "user")
 	if plan == nil {
 		t.Fatal("expected non-nil plan")
 	}
 
 	primaryColumnar := buildColumnarPrimary()
 
-	ids := ExtractIDColumn(primaryColumnar, plan.IDFieldID, userModel)
+	keys, ok := ExtractPrimaryKeyColumn(primaryColumnar, plan.PrimaryKeyField, userModel)
+	if !ok {
+		t.Fatal("failed to extract primary-key column")
+	}
+	ids := decodeIntKeys(t, keys)
 	if len(ids) != 3 || ids[0] != 10 || ids[1] != 20 || ids[2] != 30 {
 		t.Fatalf("ids = %v, want [10 20 30]", ids)
 	}
@@ -234,7 +253,7 @@ func TestIntegration_ColumnarFederation(t *testing.T) {
 	if len(blobs) != 3 {
 		t.Fatalf("expected 3 blobs, got %d", len(blobs))
 	}
-	verifyBlobCounts(t, blobs, []int64{2, 0, 1})
+	verifyBlobCounts(t, blobs, []int{2, 0, 1})
 
 	// Step 5: MergeColumnar — add extend column to primary columnar data
 	extStep := plan.Extends[0]
@@ -281,7 +300,7 @@ func verifyMergedColumnar(t *testing.T, merged []byte) {
 	if len(postBlobs) != 3 {
 		t.Fatalf("expected 3 post blobs, got %d", len(postBlobs))
 	}
-	verifyBlobCounts(t, postBlobs, []int64{2, 0, 1})
+	verifyBlobCounts(t, postBlobs, []int{2, 0, 1})
 }
 
 // --- Test 3: Multi-module federation (User with posts + comments) ---
@@ -307,7 +326,7 @@ func TestIntegration_MultiModuleFederation(t *testing.T) {
 	userModel := s.Models["User"]
 
 	// Plan with all fields
-	plan := Plan(userModel, nil, "user")
+	plan := planForTest(t, userModel, nil, "user")
 	if plan == nil {
 		t.Fatal("expected non-nil plan")
 	}
@@ -333,12 +352,12 @@ func TestIntegration_MultiModuleFederation(t *testing.T) {
 	// Simulate extend responses
 	// Posts: 1 post
 	var postsData []byte
-	postsData = codec.AppendSvarint(postsData, 1)
+	postsData = codec.AppendArrayHeader(postsData, 1)
 	postsData = append(postsData, encodePost(100, 1, "Hello")...)
 
 	// Comments: 2 comments (encoded like posts for simplicity)
 	var commentsData []byte
-	commentsData = codec.AppendSvarint(commentsData, 2)
+	commentsData = codec.AppendArrayHeader(commentsData, 2)
 	commentsData = append(commentsData, encodePost(200, 1, "Comment1")...) // reusing encodePost format
 	commentsData = append(commentsData, encodePost(201, 1, "Comment2")...)
 
@@ -381,12 +400,12 @@ func TestIntegration_MultiModuleFederation(t *testing.T) {
 	if !dec.NextField() || dec.FieldID() != 10 {
 		t.Fatal("expected field 10 (posts)")
 	}
-	postsCount := dec.ReadInt()
+	postsCount := dec.ReadArrayLength()
 	if postsCount != 1 {
 		t.Errorf("posts count = %d, want 1", postsCount)
 	}
 	// Skip past the post items (each is a full binary message with arena header)
-	for i := int64(0); i < postsCount; i++ {
+	for i := 0; i < postsCount; i++ {
 		dec.SkipArenaHeader()
 		for dec.NextField() {
 			switch dec.FieldID() {
@@ -404,7 +423,7 @@ func TestIntegration_MultiModuleFederation(t *testing.T) {
 	if !dec.NextField() || dec.FieldID() != 11 {
 		t.Fatalf("expected field 11 (comments), got EOF or fieldID %d", dec.FieldID())
 	}
-	commentsCount := dec.ReadInt()
+	commentsCount := dec.ReadArrayLength()
 	if commentsCount != 2 {
 		t.Errorf("comments count = %d, want 2", commentsCount)
 	}
@@ -415,7 +434,7 @@ func TestIntegration_MultiModuleFederation(t *testing.T) {
 // TestIntegration_BinaryRoundtrip verifies that encoding → Plan → ExtractID → Merge
 // produces a valid binary response that can be fully decoded.
 func TestIntegration_BinaryRoundtrip(t *testing.T) {
-	_, userModel := integrationUserModel()
+	registry, userModel := integrationUserModel()
 
 	// Build a realistic User binary response
 	var primary []byte
@@ -428,20 +447,24 @@ func TestIntegration_BinaryRoundtrip(t *testing.T) {
 	primary = codec.AppendString(primary, "bob@test.com")
 	primary = append(primary, 0x00) // end
 
-	plan := Plan(userModel, nil, "user")
+	plan := planForTest(t, userModel, nil, "user")
 	if plan == nil {
 		t.Fatal("expected plan")
 	}
 
 	// Extract ID
-	id, ok := ExtractID(primary, plan.IDFieldID, plan.FieldTypes)
-	if !ok || id != 7 {
-		t.Fatalf("extracted id = %d, ok = %v", id, ok)
+	keys, ok := ExtractPrimaryKeys(primary, plan.PrimaryKeyField, userModel, registry)
+	if !ok {
+		t.Fatal("failed to extract primary key")
+	}
+	ids := decodeIntKeys(t, keys)
+	if len(ids) != 1 || ids[0] != 7 {
+		t.Fatalf("extracted ids = %v", ids)
 	}
 
 	// Simulate extend response: 3 posts for user 7
 	var postsData []byte
-	postsData = codec.AppendSvarint(postsData, 3)
+	postsData = codec.AppendArrayHeader(postsData, 3)
 	for i := int64(1); i <= 3; i++ {
 		postsData = append(postsData, encodePost(i, 7, "Post")...)
 	}
@@ -456,7 +479,7 @@ func TestIntegration_BinaryRoundtrip(t *testing.T) {
 
 	var gotID int64
 	var gotName, gotEmail string
-	var gotPostCount int64
+	var gotPostCount int
 
 	for dec.NextField() {
 		switch dec.FieldID() {
@@ -467,9 +490,9 @@ func TestIntegration_BinaryRoundtrip(t *testing.T) {
 		case 3:
 			gotEmail = dec.ReadString()
 		case 10:
-			gotPostCount = dec.ReadInt()
+			gotPostCount = dec.ReadArrayLength()
 			// Skip past the post items (each is a full message)
-			for i := int64(0); i < gotPostCount; i++ {
+			for i := 0; i < gotPostCount; i++ {
 				// Skip arena header
 				dec.SkipArenaHeader()
 				// Read each post's fields until end marker

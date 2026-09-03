@@ -2,7 +2,10 @@ package semantic
 
 import (
 	"fmt"
+	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/token"
@@ -116,6 +119,10 @@ func (a *Analyzer) analyzeInternal(files []*ast.File) *Result {
 	// Pass 3: resolve field types, check directives
 	for _, file := range files {
 		a.resolveFields(file)
+	}
+	a.validateComputedFields(files)
+	if a.moduleMap != nil {
+		a.validateFederationExtendFields()
 	}
 
 	// Pass 3.5: check cross-module type visibility
@@ -522,9 +529,36 @@ func (a *Analyzer) resolveFields(file *ast.File) {
 	a.resolveModelFields(file)
 	a.resolveInterfaceFields(file)
 	a.resolveTypeFields(file)
+	a.resolveEventTypes(file)
 	a.resolveApiTypes(file)
 	a.resolveFnTypes(file)
 	a.resolveExtendFields(file)
+}
+
+func (a *Analyzer) resolveEventTypes(file *ast.File) {
+	for _, event := range file.Events {
+		seen := make(map[string]bool, len(event.Params))
+		for _, param := range event.Params {
+			if seen[param.Name] {
+				a.addError(param.Pos, "duplicate parameter '%s' in event '%s' / 事件 '%s' 中参数 '%s' 重复", param.Name, event.Name, event.Name, param.Name)
+				continue
+			}
+			seen[param.Name] = true
+			resolved := a.resolveTypeRef(param.Type, param.Pos)
+			if resolved == nil || resolved.Kind == TypeUnknown {
+				continue
+			}
+			if param.Type.IsList && param.Type.Nullable {
+				a.addError(param.Pos, "event parameter '%s.%s' cannot be a nullable list / 事件参数 '%s.%s' 不能是可空列表", event.Name, param.Name, event.Name, param.Name)
+			}
+			switch resolved.Kind {
+			case TypeInt, TypeFloat, TypeString, TypeBool, TypeDateTime, TypeDuration, TypeUUID, TypeDecimal, TypeBytes, TypeJSON, TypeModel, TypeCustom, TypeEnum:
+			default:
+				a.addError(param.Pos, "event parameter '%s.%s' has unsupported wire type '%s' / 事件参数 '%s.%s' 使用了不支持的传输类型 '%s'",
+					event.Name, param.Name, formatTypeRef(param.Type), event.Name, param.Name, formatTypeRef(param.Type))
+			}
+		}
+	}
 }
 
 func (a *Analyzer) resolveModelFields(file *ast.File) {
@@ -550,6 +584,7 @@ func (a *Analyzer) resolveModelFields(file *ast.File) {
 				a.addError(f.Pos, "@visible requires nullable field (use %s? instead of %s) / @visible 字段必须可空", f.Type.Name, f.Type.Name)
 			}
 		}
+		a.validatePrimaryKeyFields(m)
 		a.checkDirectives(m.Directives, OnModel)
 		// @withAuth: inject .createToken(), .verify(), .refreshToken() methods
 		if hasModelDirective(m.Directives, "withAuth") {
@@ -572,6 +607,264 @@ func (a *Analyzer) resolveModelFields(file *ast.File) {
 			}
 		}
 	}
+}
+
+func (a *Analyzer) validatePrimaryKeyFields(model *ast.ModelDecl) {
+	var first *ast.FieldDecl
+	for _, field := range model.Fields {
+		if !hasModelDirective(field.Directives, "id") {
+			continue
+		}
+		if field.Type == nil || field.Type.Nullable || field.Type.IsList || !isPrimaryKeyType(field.Type.Name) {
+			typeName := "unknown"
+			if field.Type != nil {
+				typeName = field.Type.Name
+				if field.Type.IsList {
+					typeName = "[" + typeName + "]"
+				}
+				if field.Type.Nullable {
+					typeName += "?"
+				}
+			}
+			a.addError(field.Pos, "@id field '%s.%s' must be a non-null Int, String, or UUID, got '%s' / @id 字段 '%s.%s' 必须是非空 Int、String 或 UUID，实际为 '%s'",
+				model.Name, field.Name, typeName, model.Name, field.Name, typeName)
+		}
+		if first == nil {
+			first = field
+			continue
+		}
+		a.addError(field.Pos, "model '%s' has multiple @id fields ('%s' and '%s') / 模型 '%s' 有多个 @id 字段（'%s' 和 '%s'）",
+			model.Name, first.Name, field.Name, model.Name, first.Name, field.Name)
+	}
+}
+
+func isPrimaryKeyType(name string) bool {
+	return name == "Int" || name == "String" || name == "UUID"
+}
+
+func (a *Analyzer) validateComputedFields(files []*ast.File) {
+	models := make(map[string]*ast.ModelDecl)
+	modelModules := make(map[string]string)
+	for _, file := range files {
+		for _, model := range file.Models {
+			models[model.Name] = model
+			modelModules[model.Name] = a.fileModule(file.Name)
+		}
+	}
+	for _, model := range models {
+		for _, field := range model.Fields {
+			if field.Computed != nil {
+				a.validateComputedField(model, field, models, modelModules)
+			}
+		}
+	}
+}
+
+func (a *Analyzer) validateComputedField(model *ast.ModelDecl, field *ast.FieldDecl, models map[string]*ast.ModelDecl, modelModules map[string]string) {
+	var aggregate *ast.Directive
+	for _, directive := range field.Computed.Directives {
+		if !isComputedAggregateDirective(directive.Name) {
+			continue
+		}
+		if aggregate != nil {
+			a.addError(directive.Pos,
+				"computed field '%s.%s' must declare exactly one aggregate / 计算字段 '%s.%s' 只能声明一个聚合",
+				model.Name, field.Name, model.Name, field.Name)
+			return
+		}
+		aggregate = directive
+	}
+	if aggregate == nil {
+		a.addError(field.Pos,
+			"computed field '%s.%s' must declare exactly one aggregate / 计算字段 '%s.%s' 必须声明且只能声明一个聚合",
+			model.Name, field.Name, model.Name, field.Name)
+		return
+	}
+	if field.Computed.Body != nil {
+		a.addError(field.Pos,
+			"aggregate computed field '%s.%s' cannot also declare a body / 聚合计算字段 '%s.%s' 不能同时声明函数体",
+			model.Name, field.Name, model.Name, field.Name)
+		return
+	}
+	relationName, targetName, ok := computedAggregateTarget(aggregate)
+	if !ok {
+		a.addError(aggregate.Pos,
+			"@%s requires a list relation%s / @%s 需要一个列表关系%s",
+			aggregate.Name, computedAggregateTargetSuffix(aggregate.Name),
+			aggregate.Name, computedAggregateTargetSuffix(aggregate.Name))
+		return
+	}
+	relation := findModelField(model, relationName)
+	if relation == nil || relation.Computed != nil || relation.Type == nil || !relation.Type.IsList || models[relation.Type.Name] == nil {
+		a.addError(aggregate.Pos,
+			"@%s target '%s' must be a list relation / @%s 目标 '%s' 必须是列表关系",
+			aggregate.Name, relationName, aggregate.Name, relationName)
+		return
+	}
+	targetModel := models[relation.Type.Name]
+	if modelModules[model.Name] != modelModules[targetModel.Name] {
+		a.addError(aggregate.Pos,
+			"computed aggregate relation '%s.%s' must be stored in the same module / 计算聚合关系 '%s.%s' 必须存储在同一模块",
+			model.Name, relationName, model.Name, relationName)
+		return
+	}
+	if !a.validateComputedRelationKeys(model, relation, targetModel) {
+		return
+	}
+	if aggregate.Name == "count" {
+		a.validateComputedAggregateResult(model, field, aggregate.Name, "Int", "")
+		return
+	}
+	targetField := findModelField(targetModel, targetName)
+	if targetField == nil || targetField.Type == nil || targetField.Computed != nil {
+		a.addError(aggregate.Pos,
+			"aggregate target field '%s.%s' does not exist / 聚合目标字段 '%s.%s' 不存在",
+			targetModel.Name, targetName, targetModel.Name, targetName)
+		return
+	}
+	if targetField.Type.IsList || !isAggregateNumericType(targetField.Type.Name) {
+		a.addError(aggregate.Pos,
+			"@%s target field '%s.%s' must be numeric / @%s 目标字段 '%s.%s' 必须是数值类型",
+			aggregate.Name, targetModel.Name, targetName, aggregate.Name, targetModel.Name, targetName)
+		return
+	}
+	want := targetField.Type.Name
+	if aggregate.Name == "avg" {
+		want = "Float"
+	}
+	a.validateComputedAggregateResult(model, field, aggregate.Name, want, targetField.Type.Name)
+}
+
+func (a *Analyzer) validateComputedRelationKeys(model *ast.ModelDecl, relation *ast.FieldDecl, target *ast.ModelDecl) bool {
+	localName, remoteName := computedRelationKeyNames(model, relation)
+	local := findModelField(model, localName)
+	if !validComputedKey(local, false) {
+		a.addError(relation.Pos,
+			"computed relation '%s.%s' local key '%s.%s' must be a non-null Int, String, or UUID / 计算关系 '%s.%s' 的本地键 '%s.%s' 必须是非空 Int、String 或 UUID",
+			model.Name, relation.Name, model.Name, localName, model.Name, relation.Name, model.Name, localName)
+		return false
+	}
+	remote := findModelField(target, remoteName)
+	if remote == nil {
+		a.addError(relation.Pos,
+			"computed relation '%s.%s' remote key '%s.%s' does not exist / 计算关系 '%s.%s' 的远端键 '%s.%s' 不存在",
+			model.Name, relation.Name, target.Name, remoteName, model.Name, relation.Name, target.Name, remoteName)
+		return false
+	}
+	if !validComputedKey(remote, true) || local.Type.Name != remote.Type.Name {
+		a.addError(relation.Pos,
+			"computed relation '%s.%s' key types must match (%s.%s: %s, %s.%s: %s) / 计算关系 '%s.%s' 的键类型必须一致",
+			model.Name, relation.Name, model.Name, localName, local.Type.Name, target.Name, remoteName, computedFieldTypeName(remote), model.Name, relation.Name)
+		return false
+	}
+	return true
+}
+
+func computedRelationKeyNames(model *ast.ModelDecl, relation *ast.FieldDecl) (local, remote string) {
+	local = computedModelPrimaryKeyName(model)
+	for _, directive := range relation.Directives {
+		if directive.Name != "by" {
+			continue
+		}
+		if len(directive.Args) > 0 {
+			if ident, ok := directive.Args[0].Value.(*ast.Ident); ok {
+				remote = ident.Name
+			}
+		}
+		if len(directive.Args) > 1 {
+			if ident, ok := directive.Args[1].Value.(*ast.Ident); ok {
+				local = ident.Name
+			}
+		}
+		return local, remote
+	}
+	return local, lowerFirstIdentifier(model.Name) + upperFirstIdentifier(local)
+}
+
+func computedModelPrimaryKeyName(model *ast.ModelDecl) string {
+	for _, field := range model.Fields {
+		if hasModelDirective(field.Directives, "id") {
+			return field.Name
+		}
+	}
+	if findModelField(model, "id") != nil {
+		return "id"
+	}
+	return "id"
+}
+
+func validComputedKey(field *ast.FieldDecl, nullableAllowed bool) bool {
+	return field != nil && field.Type != nil && field.Computed == nil && !field.Type.IsList &&
+		(nullableAllowed || !field.Type.Nullable) && isPrimaryKeyType(field.Type.Name)
+}
+
+func computedFieldTypeName(field *ast.FieldDecl) string {
+	if field == nil || field.Type == nil {
+		return "unknown"
+	}
+	return field.Type.Name
+}
+
+func (a *Analyzer) validateComputedAggregateResult(model *ast.ModelDecl, field *ast.FieldDecl, function, want, targetType string) {
+	if field.Type != nil && !field.Type.Nullable && !field.Type.IsList && field.Type.Name == want {
+		return
+	}
+	if function == "sum" || function == "min" || function == "max" {
+		a.addError(field.Pos,
+			"@%s computed field '%s.%s' must match target type %s / @%s 计算字段 '%s.%s' 必须与目标类型 %s 一致",
+			function, model.Name, field.Name, targetType, function, model.Name, field.Name, targetType)
+		return
+	}
+	a.addError(field.Pos,
+		"@%s computed field '%s.%s' must have type %s / @%s 计算字段 '%s.%s' 必须是 %s 类型",
+		function, model.Name, field.Name, want, function, model.Name, field.Name, want)
+}
+
+func isComputedAggregateDirective(name string) bool {
+	switch name {
+	case "count", "sum", "avg", "min", "max":
+		return true
+	default:
+		return false
+	}
+}
+
+func computedAggregateTarget(directive *ast.Directive) (relation, field string, ok bool) {
+	if len(directive.Args) != 1 {
+		return "", "", false
+	}
+	switch target := directive.Args[0].Value.(type) {
+	case *ast.Ident:
+		return target.Name, "", directive.Name == "count"
+	case *ast.MemberExpr:
+		owner, ownerOK := target.Object.(*ast.Ident)
+		if !ownerOK || directive.Name == "count" {
+			return "", "", false
+		}
+		return owner.Name, target.Field, true
+	default:
+		return "", "", false
+	}
+}
+
+func computedAggregateTargetSuffix(function string) string {
+	if function == "count" {
+		return " such as @count(posts) / 例如 @count(posts)"
+	}
+	return " and numeric field such as @" + function + "(posts.amount) / 以及数值字段，例如 @" + function + "(posts.amount)"
+}
+
+func findModelField(model *ast.ModelDecl, name string) *ast.FieldDecl {
+	for _, field := range model.Fields {
+		if field.Name == name {
+			return field
+		}
+	}
+	return nil
+}
+
+func isAggregateNumericType(name string) bool {
+	return name == "Int" || name == "Float" || name == "Decimal"
 }
 
 func (a *Analyzer) resolveInterfaceFields(file *ast.File) {
@@ -623,9 +916,213 @@ func (a *Analyzer) resolveApiTypes(file *ast.File) {
 			a.resolveTypeRef(p.Type, api.Pos)
 		}
 		a.checkDirectives(api.Directives, OnApi)
+		a.validateStreamAPI(api)
 		a.validateNativeReturnType(api)
 		a.validateScopeDirective(api)
 	}
+}
+
+func (a *Analyzer) validateStreamAPI(api *ast.ApiDecl) {
+	stream, count := findAPIDirective(api.Directives, "stream")
+	if stream == nil {
+		return
+	}
+	if count > 1 {
+		a.addError(stream.Pos, "@stream may only be declared once / @stream 只能声明一次")
+	}
+	if api.ReturnType == nil {
+		a.addError(api.Pos, "@stream API must declare a return type / @stream API 必须声明返回类型")
+	} else if api.ReturnType.Nullable {
+		a.addError(api.ReturnType.Pos, "@stream return type must be non-nullable / @stream 返回类型必须非空")
+	}
+	for _, incompatible := range []string{"cache", "paginate", "scope"} {
+		if directive, _ := findAPIDirective(api.Directives, incompatible); directive != nil {
+			a.addError(directive.Pos, "@stream cannot be combined with @%s / @stream 不能与 @%s 组合使用", incompatible, incompatible)
+		}
+	}
+
+	native, _ := findAPIDirective(api.Directives, "native")
+	if native != nil && api.Body != nil {
+		a.addError(api.Body.Pos, "@native @stream API cannot declare a Luxo matcher body / @native @stream API 不能声明 Luxo 匹配器主体")
+	}
+	if len(stream.Args) == 0 {
+		if native == nil {
+			a.addError(stream.Pos, "@stream without an event source requires @native / 没有事件源的 @stream 必须使用 @native")
+		}
+		return
+	}
+
+	ident, ok := stream.Args[0].Value.(*ast.Ident)
+	if !ok || ident.Name == "" {
+		a.addError(stream.Pos, "@stream event source must be an event identifier / @stream 事件源必须是事件标识符")
+		return
+	}
+	event := a.findEvent(ident.Name)
+	if event == nil {
+		a.addError(stream.Pos, "@stream event '%s' does not exist / @stream 事件 '%s' 不存在", ident.Name, ident.Name)
+		return
+	}
+	if api.ReturnType != nil {
+		matches := 0
+		for _, param := range event.Params {
+			if sameTypeRefExact(param.Type, api.ReturnType) {
+				matches++
+			}
+		}
+		if matches != 1 {
+			a.addError(stream.Pos, "@stream event '%s' must contain exactly one payload parameter of type '%s', got %d / @stream 事件 '%s' 必须包含且仅包含一个 '%s' 类型的载荷参数，实际为 %d 个",
+				ident.Name, formatTypeRef(api.ReturnType), matches, ident.Name, formatTypeRef(api.ReturnType), matches)
+		}
+	}
+	if native == nil {
+		a.validateGeneratedStreamMatcher(api, event)
+	}
+}
+
+func findAPIDirective(directives []*ast.Directive, name string) (*ast.Directive, int) {
+	var found *ast.Directive
+	count := 0
+	for _, directive := range directives {
+		if directive.Name == name {
+			if found == nil {
+				found = directive
+			}
+			count++
+		}
+	}
+	return found, count
+}
+
+func (a *Analyzer) findEvent(name string) *ast.EventDecl {
+	for _, file := range a.files {
+		for _, event := range file.Events {
+			if event.Name == name {
+				return event
+			}
+		}
+	}
+	return nil
+}
+
+func sameTypeRefExact(left, right *ast.TypeRef) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	if left.Name != right.Name || left.Nullable != right.Nullable || left.IsList != right.IsList || len(left.TypeArgs) != len(right.TypeArgs) || len(left.Tuple) != len(right.Tuple) {
+		return false
+	}
+	for i := range left.TypeArgs {
+		if !sameTypeRefExact(left.TypeArgs[i], right.TypeArgs[i]) {
+			return false
+		}
+	}
+	for i := range left.Tuple {
+		if !sameTypeRefExact(left.Tuple[i], right.Tuple[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func formatTypeRef(ref *ast.TypeRef) string {
+	if ref == nil {
+		return ""
+	}
+	name := ref.Name
+	if ref.IsList {
+		name = "[" + name + "]"
+	}
+	if ref.Nullable {
+		name += "?"
+	}
+	return name
+}
+
+func (a *Analyzer) validateGeneratedStreamMatcher(api *ast.ApiDecl, event *ast.EventDecl) {
+	if api.Body == nil {
+		return
+	}
+	if len(api.Body.Stmts) != 1 {
+		a.addError(api.Body.Pos, "@stream matcher body must contain exactly one boolean expression / @stream 匹配器主体必须且只能包含一个布尔表达式")
+		return
+	}
+	exprStmt, ok := api.Body.Stmts[0].(*ast.ExprStmt)
+	if !ok || exprStmt.Expr == nil {
+		a.addError(api.Body.Pos, "@stream matcher body must contain exactly one boolean expression / @stream 匹配器主体必须且只能包含一个布尔表达式")
+		return
+	}
+
+	eventParams := make(map[string]*ast.ParamDecl, len(event.Params))
+	for _, param := range event.Params {
+		eventParams[param.Name] = param
+	}
+	apiParams := make(map[string]*ast.ParamDecl, len(api.Params))
+	for _, param := range api.Params {
+		apiParams[param.Name] = param
+	}
+	reported := make(map[string]bool)
+	ast.WalkExprs(api.Body, func(expr ast.Expr) {
+		a.validateStreamMatcherExpr(expr, eventParams, apiParams, reported)
+	})
+}
+
+func (a *Analyzer) validateStreamMatcherExpr(expr ast.Expr, eventParams, apiParams map[string]*ast.ParamDecl, reported map[string]bool) {
+	switch value := expr.(type) {
+	case *ast.Literal, *ast.UnaryExpr:
+		return
+	case *ast.BinaryExpr:
+		if value.Op == "in" || value.Op == "is" {
+			a.addError(value.Pos, "operator '%s' is not supported by generated @stream matchers; use @native / 生成的 @stream 匹配器不支持运算符 '%s'，请使用 @native", value.Op, value.Op)
+		}
+	case *ast.Ident:
+		if param := apiParams[value.Name]; param != nil {
+			a.validateStreamMatcherType(value.Pos, "parameter", value.Name, param.Type, reported)
+		}
+	case *ast.MemberExpr:
+		ident, ok := value.Object.(*ast.Ident)
+		if !ok {
+			a.addError(value.Pos, "generated @stream matchers only support direct it.field, my.field, and enum member access / 生成的 @stream 匹配器仅支持直接访问 it.field、my.field 和枚举成员")
+			return
+		}
+		if ident.Name == "it" {
+			if param := eventParams[value.Field]; param != nil {
+				a.validateStreamMatcherType(value.Pos, "event field", value.Field, param.Type, reported)
+			}
+			return
+		}
+		if ident.Name == "my" {
+			return
+		}
+		if typ := a.types[ident.Name]; typ != nil && typ.Kind == TypeEnum {
+			return
+		}
+		a.addError(value.Pos, "generated @stream matchers do not support member access on '%s'; use @native / 生成的 @stream 匹配器不支持访问 '%s' 的成员，请使用 @native", ident.Name, ident.Name)
+	case *ast.CallExpr, *ast.ElvisExpr, *ast.BangElvisExpr, *ast.WhenExpr, *ast.LambdaExpr, *ast.ListExpr, *ast.ObjectExpr, *ast.RangeExpr, *ast.TransactionExpr, *ast.YieldExpr, *ast.AsyncExpr, *ast.AwaitExpr:
+		a.addError(expr.GetPos(), "expression is not supported by generated @stream matchers; use @native / 生成的 @stream 匹配器不支持该表达式，请使用 @native")
+	}
+}
+
+func (a *Analyzer) validateStreamMatcherType(pos token.Position, source, name string, ref *ast.TypeRef, reported map[string]bool) {
+	key := source + ":" + name
+	if reported[key] {
+		return
+	}
+	supported := ref != nil && !ref.IsList && !ref.Nullable
+	if supported {
+		switch ref.Name {
+		case "Int", "Float", "String", "Boolean", "Duration", "UUID":
+			return
+		default:
+			typ := a.types[ref.Name]
+			if typ != nil && typ.Kind == TypeEnum {
+				return
+			}
+		}
+	}
+	reported[key] = true
+	typeName := formatTypeRef(ref)
+	a.addError(pos, "%s '%s' of type '%s' cannot be used in a generated @stream matcher; use @native / %s '%s' 的类型 '%s' 不能用于生成的 @stream 匹配器，请使用 @native",
+		source, name, typeName, source, name, typeName)
 }
 
 // validateBareAPI checks that APIs without body or @native have a valid inferred name.
@@ -957,6 +1454,121 @@ func (a *Analyzer) resolveExtendFields(file *ast.File) {
 	}
 }
 
+func (a *Analyzer) validateFederationExtendFields() {
+	for _, file := range a.files {
+		currentModule := a.fileModule(file.Name)
+		for _, ext := range file.Extends {
+			target := a.types[ext.Name]
+			if target == nil || currentModule == "" || a.typeOwners.ownerOf(ext.Name) == currentModule {
+				continue
+			}
+			for _, field := range ext.Fields {
+				a.validateFederationExtendField(currentModule, ext.Name, target, field)
+			}
+		}
+	}
+}
+
+func (a *Analyzer) validateFederationExtendField(currentModule, modelName string, target *ResolvedType, field *ast.FieldDecl) {
+	fieldType := a.resolveTypeRef(field.Type, field.Pos)
+	if fieldType == nil {
+		return
+	}
+	if ownerField := target.LookupField(field.Name); ownerField != nil {
+		if !sameResolvedType(ownerField.Type, fieldType) {
+			a.addError(field.Pos,
+				"extend projection '%s.%s' must match owner type '%s', got '%s' / extend 投影 '%s.%s' 必须匹配所属模块类型 '%s'，实际为 '%s'",
+				modelName, field.Name, formatResolvedType(ownerField.Type), formatResolvedType(fieldType),
+				modelName, field.Name, formatResolvedType(ownerField.Type), formatResolvedType(fieldType))
+		}
+		return
+	}
+	if fieldType.Kind != TypeModel {
+		a.addError(field.Pos,
+			"scalar field '%s.%s' has no federation resolver; extend fields must reference a model / 标量字段 '%s.%s' 没有 Federation resolver，新增的 extend 字段必须引用模型",
+			modelName, field.Name, modelName, field.Name)
+		return
+	}
+	if owner := a.typeOwners.ownerOf(fieldType.Name); owner != currentModule {
+		a.addError(field.Pos,
+			"extend field '%s.%s' must resolve a model owned by module '%s' / extend 字段 '%s.%s' 必须解析当前模块 '%s' 所属的模型",
+			modelName, field.Name, currentModule, modelName, field.Name, currentModule)
+		return
+	}
+	a.validateFederationForeignKey(modelName, target, fieldType, field)
+}
+
+func (a *Analyzer) validateFederationForeignKey(modelName string, owner, related *ResolvedType, field *ast.FieldDecl) {
+	primaryKey := resolvedPrimaryKeyField(owner)
+	if primaryKey == nil || primaryKey.Type == nil {
+		a.addError(field.Pos,
+			"federation model '%s' requires a primary key / Federation 模型 '%s' 必须声明主键",
+			modelName, modelName)
+		return
+	}
+	foreignKey, localKey := federationRelationKeys(modelName, primaryKey.Name, field)
+	if localKey != "" && localKey != primaryKey.Name {
+		a.addError(field.Pos,
+			"federation relation '%s.%s' must resolve by primary key '%s', got '%s' / Federation 关系 '%s.%s' 必须按主键 '%s' 解析，实际为 '%s'",
+			modelName, field.Name, primaryKey.Name, localKey, modelName, field.Name, primaryKey.Name, localKey)
+		return
+	}
+	foreignField := related.LookupField(foreignKey)
+	if foreignField == nil || foreignField.Type == nil {
+		a.addError(field.Pos,
+			"federation relation '%s.%s' requires foreign-key field '%s' on model '%s' / Federation 关系 '%s.%s' 要求模型 '%s' 声明外键字段 '%s'",
+			modelName, field.Name, foreignKey, related.Name, modelName, field.Name, related.Name, foreignKey)
+		return
+	}
+	if foreignField.Type.IsList || foreignField.Type.Kind != primaryKey.Type.Kind || foreignField.Type.Name != primaryKey.Type.Name {
+		a.addError(field.Pos,
+			"foreign-key field '%s.%s' must match primary key '%s.%s' type '%s', got '%s' / 外键字段 '%s.%s' 必须匹配主键 '%s.%s' 的类型 '%s'，实际为 '%s'",
+			related.Name, foreignKey, modelName, primaryKey.Name, formatResolvedType(primaryKey.Type), formatResolvedType(foreignField.Type),
+			related.Name, foreignKey, modelName, primaryKey.Name, formatResolvedType(primaryKey.Type), formatResolvedType(foreignField.Type))
+	}
+}
+
+func federationRelationKeys(modelName, primaryKey string, field *ast.FieldDecl) (string, string) {
+	for _, directive := range field.Directives {
+		if directive.Name != "by" {
+			continue
+		}
+		foreignKey := directiveIdentifierArg(directive, 0)
+		localKey := directiveIdentifierArg(directive, 1)
+		if foreignKey != "" {
+			return foreignKey, localKey
+		}
+	}
+	return lowerFirstIdentifier(modelName) + upperFirstIdentifier(primaryKey), primaryKey
+}
+
+func directiveIdentifierArg(directive *ast.Directive, index int) string {
+	if index >= len(directive.Args) {
+		return ""
+	}
+	identifier, _ := directive.Args[index].Value.(*ast.Ident)
+	if identifier == nil {
+		return ""
+	}
+	return identifier.Name
+}
+
+func lowerFirstIdentifier(value string) string {
+	if value == "" {
+		return ""
+	}
+	r, size := utf8.DecodeRuneInString(value)
+	return string(unicode.ToLower(r)) + value[size:]
+}
+
+func upperFirstIdentifier(value string) string {
+	if value == "" {
+		return ""
+	}
+	r, size := utf8.DecodeRuneInString(value)
+	return string(unicode.ToUpper(r)) + value[size:]
+}
+
 func (a *Analyzer) resolveFieldDecl(f *ast.FieldDecl) *FieldInfo {
 	fi := &FieldInfo{
 		Name:     f.Name,
@@ -1063,6 +1675,7 @@ func (a *Analyzer) checkBodies(file *ast.File) {
 			// @stream(EventName): inject `it` with event's field types
 			a.injectStreamIt(api, scope, file)
 			a.checkBlock(api.Body, scope)
+			a.validateStreamMatcherResult(api)
 			a.checkUnusedVariables(scope)
 		}
 	}
@@ -1129,6 +1742,26 @@ func (a *Analyzer) checkBodies(file *ast.File) {
 			}
 			a.checkBlock(on.Body, scope)
 		}
+	}
+}
+
+func (a *Analyzer) validateStreamMatcherResult(api *ast.ApiDecl) {
+	stream, _ := findAPIDirective(api.Directives, "stream")
+	native, _ := findAPIDirective(api.Directives, "native")
+	if stream == nil || native != nil || api.Body == nil || len(api.Body.Stmts) != 1 {
+		return
+	}
+	stmt, ok := api.Body.Stmts[0].(*ast.ExprStmt)
+	if !ok || stmt.Expr == nil {
+		return
+	}
+	resolved := a.resolvedExprType(stmt.Expr)
+	if resolved == nil || resolved.Kind != TypeBool || resolved.IsList || resolved.Nullable {
+		actual := "unknown"
+		if resolved != nil {
+			actual = formatResolvedType(resolved)
+		}
+		a.addError(stmt.GetPos(), "@stream matcher expression must be Boolean, got '%s' / @stream 匹配器表达式必须是 Boolean，实际为 '%s'", actual, actual)
 	}
 }
 
@@ -1207,6 +1840,16 @@ func (a *Analyzer) checkStmt(stmt ast.Stmt, scope *Scope) {
 
 func (a *Analyzer) checkValStmt(s *ast.ValStmt, scope *Scope) {
 	exprType := a.checkExpr(s.Value, scope)
+	if s.Type != nil {
+		declaredType := a.resolveTypeRef(s.Type, s.Pos)
+		if exprType != nil && !isEmptyListExpr(s.Value) && !isTypeAssignable(declaredType, exprType) {
+			a.addError(s.Pos, "variable '%s' expects '%s', got '%s' / 变量 '%s' 需要 '%s'，得到 '%s'",
+				s.Name, formatResolvedType(declaredType), formatResolvedType(exprType),
+				s.Name, formatResolvedType(declaredType), formatResolvedType(exprType))
+		}
+		exprType = declaredType
+		setExprResolvedType(s.Value, declaredType)
+	}
 	if len(s.Names) > 0 {
 		a.defineDestructured(s, exprType, scope)
 	} else {
@@ -1270,19 +1913,12 @@ func (a *Analyzer) checkAssignStmt(s *ast.AssignStmt, scope *Scope) {
 	}
 }
 
-func (a *Analyzer) checkForStmt(s *ast.ForStmt, scope *Scope) {
+func (a *Analyzer) checkForStmt(s *ast.ForStmt, scope *Scope) *ResolvedType {
 	childScope := scope.Child()
 	if s.Collection != nil {
 		collType := a.checkExpr(s.Collection, childScope)
 		if s.VarName != "" {
-			var itemType *ResolvedType
-			if collType != nil && collType.IsList {
-				itemType = &ResolvedType{
-					Kind:   collType.Kind,
-					Name:   collType.Name,
-					Fields: collType.Fields,
-				}
-			}
+			itemType := collectionElementType(collType)
 			childScope.Define(&Symbol{
 				Name: s.VarName,
 				Kind: SymVariable,
@@ -1292,6 +1928,7 @@ func (a *Analyzer) checkForStmt(s *ast.ForStmt, scope *Scope) {
 		}
 	}
 	a.checkBlock(s.Body, childScope)
+	return a.inferForExprType(s.Body)
 }
 
 // checkAwaitExpr collects the type of each expression statement in the await
@@ -1365,8 +2002,7 @@ func (a *Analyzer) checkExpr(expr ast.Expr, scope *Scope) *ResolvedType {
 
 	// Write type tag into AST node for codegen to read
 	if resolved != nil {
-		expr.SetTypeTag(resolved.Name)
-		expr.SetNullable(resolved.Nullable)
+		setExprResolvedType(expr, resolved)
 	}
 	return resolved
 }
@@ -1393,9 +2029,7 @@ func (a *Analyzer) checkCompositeExpr(expr ast.Expr, scope *Scope) *ResolvedType
 	case *ast.AwaitExpr:
 		return a.checkAwaitExpr(e, scope)
 	case *ast.ForStmt:
-		// for as expression — check like statement but return type
-		a.checkStmt(e, scope)
-		return nil // yield type inference is complex, return nil for now
+		return a.checkForStmt(e, scope)
 	}
 	// unreachable: all known ast.Expr types are covered by checkExpr + checkCompositeExpr switches;
 	// kept as defensive fallback required by Go's type system.
@@ -1403,23 +2037,282 @@ func (a *Analyzer) checkCompositeExpr(expr ast.Expr, scope *Scope) *ResolvedType
 }
 
 func (a *Analyzer) checkListExpr(e *ast.ListExpr, scope *Scope) *ResolvedType {
-	for _, item := range e.Items {
-		a.checkExpr(item, scope)
+	if len(e.Items) == 0 {
+		return &ResolvedType{Kind: TypeUnknown, IsList: true}
 	}
-	return nil
+
+	var elementType *ResolvedType
+	for _, item := range e.Items {
+		actual := a.checkExpr(item, scope)
+		if actual == nil {
+			continue
+		}
+		if actual.Kind == TypeUnknown && actual.Name == "null" {
+			a.addError(item.GetPos(), "list elements cannot be null / 列表元素不能为 null")
+			continue
+		}
+		if elementType == nil {
+			elementType = actual
+			continue
+		}
+		if !sameResolvedType(elementType, actual) {
+			a.addError(item.GetPos(), "list element type mismatch: expected '%s', got '%s' / 列表元素类型不匹配：需要 '%s'，得到 '%s'",
+				formatResolvedType(elementType), formatResolvedType(actual),
+				formatResolvedType(elementType), formatResolvedType(actual))
+		}
+	}
+	if elementType == nil {
+		return &ResolvedType{Kind: TypeUnknown, IsList: true}
+	}
+	result := cloneResolvedType(elementType)
+	result.IsList = true
+	result.Nullable = false
+	return result
+}
+
+func setExprResolvedType(expr ast.Expr, resolved *ResolvedType) {
+	if expr == nil || resolved == nil {
+		return
+	}
+	expr.SetTypeTag(resolved.Name)
+	expr.SetNullable(resolved.Nullable)
+	expr.SetListType(resolved.IsList)
+}
+
+func isEmptyListExpr(expr ast.Expr) bool {
+	list, ok := expr.(*ast.ListExpr)
+	return ok && len(list.Items) == 0
+}
+
+func cloneResolvedType(typ *ResolvedType) *ResolvedType {
+	if typ == nil {
+		return nil
+	}
+	result := *typ
+	return &result
+}
+
+func collectionElementType(collection *ResolvedType) *ResolvedType {
+	if collection == nil {
+		return nil
+	}
+	if collection.Kind == TypeGeneric && collection.Name == "Channel" && len(collection.TypeArgs) > 0 {
+		return cloneResolvedType(collection.TypeArgs[0])
+	}
+	if !collection.IsList {
+		return nil
+	}
+	result := cloneResolvedType(collection)
+	result.IsList = false
+	result.Nullable = false
+	return result
+}
+
+func sameResolvedType(left, right *ResolvedType) bool {
+	if left == nil || right == nil {
+		return true
+	}
+	return left.Name == right.Name && left.Kind == right.Kind && left.IsList == right.IsList && left.Nullable == right.Nullable &&
+		typeArgsAssignable(left.TypeArgs, right.TypeArgs) && typeArgsAssignable(right.TypeArgs, left.TypeArgs)
+}
+
+func (a *Analyzer) inferForExprType(body *ast.Block) *ResolvedType {
+	var yieldType *ResolvedType
+	hasYield := false
+	ast.WalkExprs(body, func(expr ast.Expr) {
+		yieldExpr, ok := expr.(*ast.YieldExpr)
+		if !ok {
+			return
+		}
+		hasYield = true
+		actual := a.resolvedExprType(yieldExpr.Value)
+		if actual == nil || actual.Kind == TypeUnknown && actual.Name == "null" {
+			return
+		}
+		if yieldType == nil {
+			yieldType = actual
+			return
+		}
+		if !sameResolvedType(yieldType, actual) {
+			a.addError(yieldExpr.GetPos(), "yield type mismatch: expected '%s', got '%s' / yield 类型不匹配：需要 '%s'，得到 '%s'",
+				formatResolvedType(yieldType), formatResolvedType(actual),
+				formatResolvedType(yieldType), formatResolvedType(actual))
+		}
+	})
+	if hasYield {
+		if yieldType == nil {
+			return nil
+		}
+		result := cloneResolvedType(yieldType)
+		result.Nullable = true
+		result.IsList = false
+		return result
+	}
+
+	value := blockResultExpr(body)
+	result := a.resolvedExprType(value)
+	if result == nil {
+		return nil
+	}
+	result.IsList = true
+	result.Nullable = false
+	return result
+}
+
+func blockResultExpr(body *ast.Block) ast.Expr {
+	if body == nil || len(body.Stmts) == 0 {
+		return nil
+	}
+	switch stmt := body.Stmts[len(body.Stmts)-1].(type) {
+	case *ast.ExprStmt:
+		return stmt.Expr
+	case *ast.ReturnStmt:
+		return stmt.Value
+	default:
+		return nil
+	}
+}
+
+func (a *Analyzer) resolvedExprType(expr ast.Expr) *ResolvedType {
+	if expr == nil || expr.GetTypeTag() == "" {
+		return nil
+	}
+	base := a.types[expr.GetTypeTag()]
+	if base == nil {
+		base = &ResolvedType{Kind: TypeUnknown, Name: expr.GetTypeTag()}
+	}
+	result := cloneResolvedType(base)
+	result.Nullable = expr.IsNullable()
+	result.IsList = expr.IsListType()
+	return result
 }
 
 func (a *Analyzer) checkObjectExpr(e *ast.ObjectExpr, scope *Scope) *ResolvedType {
-	for _, f := range e.Fields {
-		a.checkExpr(f.Value, scope)
+	if e.TypeName == "" {
+		for _, f := range e.Fields {
+			a.checkExpr(f.Value, scope)
+		}
+		return nil
 	}
-	return nil
+
+	typ, ok := a.types[e.TypeName]
+	if !ok {
+		for _, f := range e.Fields {
+			a.checkExpr(f.Value, scope)
+		}
+		a.addErrorWithSuggestion(e.Pos, e.TypeName, "unknown type '%s' / 未知类型 '%s'", e.TypeName, e.TypeName)
+		return nil
+	}
+	if a.moduleMap != nil && a.currentFile != nil {
+		if mi := a.moduleMap[a.currentFile.Name]; mi != nil {
+			a.checkNameVisibility(e.TypeName, mi, e.Pos)
+		}
+	}
+	a.validateObjectExprFields(e, typ, scope)
+	return typ.AsNonNull()
+}
+
+func (a *Analyzer) validateObjectExprFields(e *ast.ObjectExpr, typ *ResolvedType, scope *Scope) {
+	provided := make(map[string]bool, len(e.Fields))
+	for _, value := range e.Fields {
+		actual := a.checkExpr(value.Value, scope)
+		if provided[value.Name] {
+			a.addError(value.Value.GetPos(), "duplicate field '%s' in '%s' / '%s' 中字段 '%s' 重复", value.Name, typ.Name, typ.Name, value.Name)
+			continue
+		}
+		provided[value.Name] = true
+
+		field := typ.LookupField(value.Name)
+		if field == nil {
+			a.addFieldError(value.Value.GetPos(), typ, value.Name)
+			continue
+		}
+		if field.Type != nil && actual != nil && !isTypeAssignable(field.Type, actual) {
+			a.addError(value.Value.GetPos(), "field '%s' expects '%s', got '%s' / 字段 '%s' 需要 '%s'，得到 '%s'",
+				value.Name, formatResolvedType(field.Type), formatResolvedType(actual),
+				value.Name, formatResolvedType(field.Type), formatResolvedType(actual))
+		}
+	}
+
+	if typ.Kind == TypeCustom {
+		a.checkRequiredObjectFields(e, typ, provided)
+	}
+}
+
+func (a *Analyzer) checkRequiredObjectFields(e *ast.ObjectExpr, typ *ResolvedType, provided map[string]bool) {
+	names := make([]string, 0, len(typ.Fields))
+	for name := range typ.Fields {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		field := typ.Fields[name]
+		if provided[name] || field.Nullable || field.HasDefault || field.Computed || field.IsMethod {
+			continue
+		}
+		a.addError(e.Pos, "missing required field '%s' in '%s' / '%s' 缺少必填字段 '%s'", name, typ.Name, typ.Name, name)
+	}
+}
+
+func isTypeAssignable(expected, actual *ResolvedType) bool {
+	if expected == nil || actual == nil {
+		return true
+	}
+	if actual.Kind == TypeUnknown {
+		return actual.Name != "null" || expected.Nullable
+	}
+	if expected.Kind == TypeUnknown {
+		return true
+	}
+	if actual.Nullable && !expected.Nullable {
+		return false
+	}
+	if expected.IsList != actual.IsList {
+		return false
+	}
+	if expected.Name == actual.Name {
+		return typeArgsAssignable(expected.TypeArgs, actual.TypeArgs)
+	}
+	return actual.inheritsFrom(expected.Name)
+}
+
+func typeArgsAssignable(expected, actual []*ResolvedType) bool {
+	if len(expected) == 0 || len(actual) == 0 {
+		return true
+	}
+	if len(expected) != len(actual) {
+		return false
+	}
+	for i := range expected {
+		if !isTypeAssignable(expected[i], actual[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func formatResolvedType(typ *ResolvedType) string {
+	name := typ.Name
+	if typ.IsList {
+		name = "[" + name + "]"
+	}
+	if typ.Nullable {
+		name += "?"
+	}
+	return name
 }
 
 func (a *Analyzer) checkRangeExpr(e *ast.RangeExpr, scope *Scope) *ResolvedType {
-	a.checkExpr(e.Start, scope)
-	a.checkExpr(e.End, scope)
-	return nil
+	start := a.checkExpr(e.Start, scope)
+	end := a.checkExpr(e.End, scope)
+	intType := a.types["Int"]
+	if start != nil && !isTypeAssignable(intType, start) {
+		a.addError(e.Start.GetPos(), "range start must be Int, got '%s' / range 起点必须是 Int，得到 '%s'", formatResolvedType(start), formatResolvedType(start))
+	}
+	if end != nil && !isTypeAssignable(intType, end) {
+		a.addError(e.End.GetPos(), "range end must be Int, got '%s' / range 终点必须是 Int，得到 '%s'", formatResolvedType(end), formatResolvedType(end))
+	}
+	return intType.AsList()
 }
 
 func (a *Analyzer) checkTransactionExpr(e *ast.TransactionExpr, scope *Scope) *ResolvedType {
@@ -1627,12 +2520,13 @@ func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
 		return a.inferCallReturnType(e)
 	}
 
-	for _, arg := range e.Args {
+	argTypes := make([]*ResolvedType, len(e.Args))
+	for i, arg := range e.Args {
 		// skip order/select/include/distinct — these use query modifier syntax (field.desc)
 		if isCRUD && isQueryModifierArg(arg.Name) {
 			continue
 		}
-		a.checkExpr(arg.Value, callScope)
+		argTypes[i] = a.checkExpr(arg.Value, callScope)
 		// Named args in CRUD create: also mark variable usage in outer scope
 		// (callScope may shadow variables with model fields)
 		if isCRUD && arg.Name != "" {
@@ -1643,6 +2537,7 @@ func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
 			}
 		}
 	}
+	a.checkLoadArguments(e, argTypes)
 
 	// 1.3: check create required fields (function-style and chain-style)
 	if ident, ok := e.Func.(*ast.Ident); ok && ident.Name == "create" {
@@ -1902,6 +2797,118 @@ func (a *Analyzer) inferLoadReturnType(e *ast.CallExpr, modelType *ResolvedType)
 		return modelType.AsList() // FK load returns list
 	}
 	return modelType // PK load returns single (nullable)
+}
+
+func (a *Analyzer) checkLoadArguments(e *ast.CallExpr, argTypes []*ResolvedType) {
+	method, modelName := chainCRUDInfo(e)
+	if method != "load" {
+		return
+	}
+	modelType := a.types[modelName]
+	if modelType == nil {
+		return
+	}
+	if len(e.Args) == 0 {
+		a.addError(e.Pos, "%s.load requires one primary key or named lookup fields / %s.load 需要主键或命名查询字段", modelName, modelName)
+		return
+	}
+	namedCount := 0
+	for _, arg := range e.Args {
+		if arg.Name != "" {
+			namedCount++
+		}
+	}
+	if namedCount == 0 {
+		a.checkPrimaryKeyLoadArguments(e, modelType, argTypes)
+		return
+	}
+	if namedCount != len(e.Args) {
+		a.addError(e.Pos, "%s.load cannot mix positional and named arguments / %s.load 不能混用位置参数和命名参数", modelName, modelName)
+		return
+	}
+	a.checkNamedLoadArguments(e, modelType, argTypes)
+}
+
+func (a *Analyzer) checkPrimaryKeyLoadArguments(e *ast.CallExpr, modelType *ResolvedType, argTypes []*ResolvedType) {
+	if len(e.Args) != 1 {
+		a.addError(e.Pos, "%s.load primary-key form expects exactly one argument / %s.load 主键形式只接受一个参数", modelType.Name, modelType.Name)
+		return
+	}
+	idField := resolvedPrimaryKeyField(modelType)
+	if idField == nil || idField.Type == nil || argTypes[0] == nil {
+		return
+	}
+	if !isTypeAssignable(idField.Type, argTypes[0]) {
+		a.addError(e.Args[0].Value.GetPos(), "load key expects '%s', got '%s' / load 主键需要 '%s'，得到 '%s'",
+			formatResolvedType(idField.Type), formatResolvedType(argTypes[0]), formatResolvedType(idField.Type), formatResolvedType(argTypes[0]))
+	}
+}
+
+func resolvedPrimaryKeyField(modelType *ResolvedType) *FieldInfo {
+	if modelType == nil {
+		return nil
+	}
+	for _, field := range modelType.Fields {
+		for _, directive := range field.Directives {
+			if directive == "id" {
+				return field
+			}
+		}
+	}
+	return modelType.LookupField("id")
+}
+
+func (a *Analyzer) checkNamedLoadArguments(e *ast.CallExpr, modelType *ResolvedType, argTypes []*ResolvedType) {
+	seen := make(map[string]bool, len(e.Args))
+	for i, arg := range e.Args {
+		if seen[arg.Name] {
+			a.addError(arg.Value.GetPos(), "duplicate load field '%s' / load 字段 '%s' 重复", arg.Name, arg.Name)
+			continue
+		}
+		seen[arg.Name] = true
+		field := modelType.LookupField(arg.Name)
+		if field == nil || field.Type == nil {
+			a.addError(arg.Value.GetPos(), "model '%s' has no load field '%s' / 模型 '%s' 没有 load 字段 '%s'", modelType.Name, arg.Name, modelType.Name, arg.Name)
+			continue
+		}
+		if !isLoadKeyType(field) {
+			a.addError(arg.Value.GetPos(), "load field '%s' must be Int, String, or UUID / load 字段 '%s' 必须是 Int、String 或 UUID", arg.Name, arg.Name)
+			continue
+		}
+		if !a.isLoadFieldVisible(modelType.Name, arg.Name) {
+			a.addError(arg.Value.GetPos(), "load field '%s' not declared in extend %s / load 字段 '%s' 未在 extend %s 中声明", arg.Name, modelType.Name, arg.Name, modelType.Name)
+			continue
+		}
+		if argTypes[i] != nil && !isTypeAssignable(field.Type, argTypes[i]) {
+			a.addError(arg.Value.GetPos(), "load field '%s' expects '%s', got '%s' / load 字段 '%s' 需要 '%s'，得到 '%s'",
+				arg.Name, formatResolvedType(field.Type), formatResolvedType(argTypes[i]), arg.Name, formatResolvedType(field.Type), formatResolvedType(argTypes[i]))
+		}
+	}
+}
+
+func isLoadKeyType(field *FieldInfo) bool {
+	if field.Nullable || field.Computed || field.Type.Nullable || field.Type.IsList {
+		return false
+	}
+	switch field.Type.Kind {
+	case TypeInt, TypeString, TypeUUID:
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *Analyzer) isLoadFieldVisible(modelName, fieldName string) bool {
+	if a.moduleMap == nil || a.currentFile == nil {
+		return true
+	}
+	ownerModule := a.typeOwners.ownerOf(modelName)
+	currentModule := a.moduleMap[a.currentFile.Name]
+	if currentModule == nil || ownerModule == "" || ownerModule == currentModule.Name || a.isCommonModule(ownerModule) || currentModule.IsCommon {
+		return true
+	}
+	return a.extendFieldVisible[currentModule.Name] != nil && a.extendFieldVisible[currentModule.Name][modelName] != nil &&
+		a.extendFieldVisible[currentModule.Name][modelName][fieldName]
 }
 
 // inferChainCRUDReturnType infers the return type for chain-style CRUD: Model.find(...), Model.create(...), etc.

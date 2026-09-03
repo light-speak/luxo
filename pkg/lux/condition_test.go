@@ -1,6 +1,7 @@
 package lux
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -871,6 +872,31 @@ func TestRawConditionBasic(t *testing.T) {
 	}
 	if len(args) != 2 || args[0] != int64(7) || args[1] != "admin" {
 		t.Errorf("args = %v", args)
+	}
+}
+
+func TestConditionGroupsPreserveExactTuplesAndOffsets(t *testing.T) {
+	condition := AnyOf(
+		AllOf(NewIntField("tenant_id").Eq(10), NewStringField("email").Eq("a@example.com")),
+		AllOf(NewIntField("tenant_id").Eq(20), NewStringField("email").Eq("b@example.com")),
+	)
+	sql, args := condition.ToSQL(3)
+	wantSQL := "((tenant_id = $3 AND email = $4) OR (tenant_id = $5 AND email = $6))"
+	if sql != wantSQL {
+		t.Fatalf("group SQL = %q, want %q", sql, wantSQL)
+	}
+	wantArgs := []any{int64(10), "a@example.com", int64(20), "b@example.com"}
+	if !reflect.DeepEqual(args, wantArgs) {
+		t.Fatalf("group args = %#v, want %#v", args, wantArgs)
+	}
+}
+
+func TestEmptyConditionGroupsAreDeterministic(t *testing.T) {
+	if sql, args := AllOf().ToSQL(1); sql != "TRUE" || len(args) != 0 {
+		t.Fatalf("empty AllOf = %q, %#v", sql, args)
+	}
+	if sql, args := AnyOf().ToSQL(1); sql != "FALSE" || len(args) != 0 {
+		t.Fatalf("empty AnyOf = %q, %#v", sql, args)
 	}
 }
 

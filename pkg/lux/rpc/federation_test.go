@@ -199,6 +199,7 @@ func TestFederation_RPCBatchLoadWithMask(t *testing.T) {
 	// Send request with a field mask
 	mask := codec.FieldMaskSet(nil, 1) // id
 	mask = codec.FieldMaskSet(mask, 2) // title
+	mask = codec.AppendSelectionMask(nil, mask, nil)
 	resp, err := client.CallWithMask(101, mask, nil)
 	if err != nil {
 		t.Fatalf("RPC call failed: %v", err)

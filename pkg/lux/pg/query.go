@@ -211,9 +211,11 @@ func (b *CreateBase[T]) Exec(ctx context.Context) (*T, error) {
 type UpdateBase[T any, ID comparable] struct {
 	Db    *DB
 	Table string
-	ID    ID
-	Sets  []lux.SetField
-	Scan  ScanFunc[T]
+	// IDColumn is the schema-declared primary-key column. Empty defaults to "id".
+	IDColumn string
+	ID       ID
+	Sets     []lux.SetField
+	Scan     ScanFunc[T]
 }
 
 // Set appends a column=value pair. Called by generated Set methods.
@@ -223,5 +225,5 @@ func (b *UpdateBase[T, ID]) Set(col string, val any) {
 
 // Exec updates the record and returns it via RETURNING *.
 func (b *UpdateBase[T, ID]) Exec(ctx context.Context) (*T, error) {
-	return UpdateReturning(ctx, b.Db, b.Scan, b.Table, b.ID, b.Sets)
+	return UpdateReturningBy(ctx, b.Db, b.Scan, b.Table, b.IDColumn, b.ID, b.Sets)
 }

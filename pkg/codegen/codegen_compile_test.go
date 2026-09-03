@@ -15,12 +15,24 @@ import (
 // This is the end-to-end guard for the array + UUID codegen changes.
 func TestGeneratedCodeCompiles(t *testing.T) {
 	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
+	oldEvent := eventFieldIDs
+	defer func() {
+		modelFieldIDs = old
+		eventFieldIDs = oldEvent
+	}()
 	SetModelFieldIDs(map[string]map[string]int{
 		"Doc": {
 			"id": 1, "name": 2, "active": 3, "uid": 4, "ouid": 5,
 			"created": 6, "dur": 7, "price": 8, "data": 9,
 			"tags": 10, "scores": 11, "ids": 12, "ratings": 13, "flags": 14, "times": 15,
+			"metadata": 16, "childId": 17, "child": 18, "children": 19,
+		},
+		"Child": {"id": 1, "docId": 2, "name": 3},
+	})
+	SetEventFieldIDs(map[string]map[string]int{
+		"DocChanged": {
+			"doc": 1, "at": 2, "ttl": 3, "uid": 4, "price": 5,
+			"metadata": 6, "docs": 7, "labels": 8,
 		},
 	})
 
@@ -44,8 +56,50 @@ func TestGeneratedCodeCompiles(t *testing.T) {
 				{Name: "ratings", Type: &ast.TypeRef{Name: "Float", IsList: true}},
 				{Name: "flags", Type: &ast.TypeRef{Name: "Boolean", IsList: true}},
 				{Name: "times", Type: &ast.TypeRef{Name: "DateTime", IsList: true}},
+				{Name: "metadata", Type: &ast.TypeRef{Name: "JSON"}},
+				{Name: "childId", Type: &ast.TypeRef{Name: "Int", Nullable: true}},
+				{Name: "child", Type: &ast.TypeRef{Name: "Child", Nullable: true}},
+				{Name: "children", Type: &ast.TypeRef{Name: "Child", IsList: true}},
+			},
+		}, {
+			Name: "Child",
+			Fields: []*ast.FieldDecl{
+				{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+				{Name: "docId", Type: &ast.TypeRef{Name: "Int"}},
+				{Name: "name", Type: &ast.TypeRef{Name: "String"}},
 			},
 		}},
+		Events: []*ast.EventDecl{{
+			Name: "DocChanged",
+			Params: []*ast.ParamDecl{
+				{Name: "doc", Type: &ast.TypeRef{Name: "Doc"}},
+				{Name: "at", Type: &ast.TypeRef{Name: "DateTime"}},
+				{Name: "ttl", Type: &ast.TypeRef{Name: "Duration"}},
+				{Name: "uid", Type: &ast.TypeRef{Name: "UUID"}},
+				{Name: "price", Type: &ast.TypeRef{Name: "Decimal"}},
+				{Name: "metadata", Type: &ast.TypeRef{Name: "JSON"}},
+				{Name: "docs", Type: &ast.TypeRef{Name: "Doc", IsList: true}},
+				{Name: "labels", Type: &ast.TypeRef{Name: "String", IsList: true}},
+			},
+		}},
+		APIs: []*ast.ApiDecl{
+			{
+				Name:       "watchDoc",
+				Params:     []*ast.ParamDecl{{Name: "uid", Type: &ast.TypeRef{Name: "UUID"}}},
+				ReturnType: &ast.TypeRef{Name: "Doc"},
+				Directives: []*ast.Directive{{Name: "stream", Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "DocChanged"}}}}},
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: &ast.BinaryExpr{
+					Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "uid"},
+					Op:    "==",
+					Right: &ast.Ident{Name: "uid"},
+				}}}},
+			},
+			{
+				Name:       "watchNativeDoc",
+				ReturnType: &ast.TypeRef{Name: "Doc"},
+				Directives: []*ast.Directive{{Name: "stream"}, {Name: "native"}},
+			},
+		},
 	}
 
 	gr := Generate(result(file), "gentest", DriverPG)
@@ -67,6 +121,11 @@ func TestGeneratedCodeCompiles(t *testing.T) {
 		"db.gen.go":        true,
 		"writejson.gen.go": true,
 		"schema.gen.go":    true,
+		"event.gen.go":     true,
+		"stream.gen.go":    true,
+	}
+	if err := os.WriteFile(filepath.Join(dir, "app_stub.go"), []byte("package gentest\n\ntype App struct{}\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 	for name, src := range gr.Files {
 		if !selfContained[name] {

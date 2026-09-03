@@ -234,6 +234,9 @@ getUser(1) {
 ### 实时流
 
 ```luxo
+event DanmakuSent(danmaku: Danmaku)
+event NotificationCreated(notification: Notification)
+
 // 事件驱动 + 过滤器
 api watchDanmaku(roomId: Int): Danmaku @stream(DanmakuSent) {
   it.roomId == roomId
@@ -301,7 +304,7 @@ Luxo 不只是代码更短 — 它是 **AI 写后端最可靠的语言**。
 - [x] VS Code 扩展（语法高亮、LSP 集成）
 
 ### Phase 2 — 代码生成 + 运行时 ✅
-- [x] 代码生成（model · db · app · handler · dataloader · native · entry — 7 个 gen 文件）
+- [x] 代码生成（11 类 Schema 驱动模块产物 + embedded/service/gateway 入口）
 - [x] 类型安全查询构建器（pgx，零反射 scanner，`$select` → SQL）
 - [x] CRUD handler 生成（`@crud` → get/list/create/update/delete）
 - [x] DataLoader 运行时（2ms 批量窗口、字段合并、`@soft` 过滤）
@@ -327,20 +330,21 @@ Luxo 不只是代码更短 — 它是 **AI 写后端最可靠的语言**。
 - [x] `luxo deploy compose` — Dockerfile + docker-compose.yml 生成
 - [x] 自动建库迁移（`EnsureDatabase` + `migrate.Up`）
 - [x] RPC 默认地址推断（`模块名:9000` Docker DNS）
-- [x] Schema introspection（`GET /luvia?$schema&key=xxx`）
+- [x] Schema introspection（`GET /luvia?$schema`，使用 `X-Introspection-Key` 请求头）
 - [x] `luxo.schema.json` 导出（SDK 工具链使用）
 - [x] Graceful Shutdown · CORS · XSS 安全头
 - [x] 事件系统（emit / on · ChanBus + NATSBus · Luxo binary 编码）
 - [x] WebSocket 传输 — JSON/Binary 双模式，并发 dispatch
-- [x] `@stream` 订阅 — 事件驱动推送 + lambda 过滤器 + 字段选择
+- [x] `@stream` 订阅 — 类型安全 SDK 方法 + 服务端确认/错误 + 事件/native 数据源 + 字段选择与背压
+- [x] 纯 Schema SDK 签名 — 分页、字段选择、nullable 参数与 stream 不依赖 API 命名约定
 
 ### Phase 4 — 客户端 SDK ✅
 - [x] `@luxo/client` — Transport 接口 + FetchTransport + WxTransport + LuxoError
 - [x] `@luxo/vite-plugin` — 编译期字段追踪 + 自动 `$select` 注入
 - [x] `@luxo/react` — `useLuxoQuery` hook + `LuxoProvider`
 - [x] Dart SDK（`luxo_client` — HttpTransport + WsTransport + Luxo binary 编解码 + build_runner 字段追踪）
-- [x] Kotlin SDK（`com.luxo.client` — OkHttp + 协程 + Luxo binary 编解码 + Gradle 字段追踪）
-- [x] Swift SDK（`LuxoClient` — URLSession + async/await + Luxo binary codec + SwiftSyntax 字段追踪）
+- [x] Kotlin SDK（`com.luxo.client` — OkHttp + 协程 + Luxo binary 编解码 + Gradle 插件隔离执行编译器 AST 字段追踪）
+- [x] [Swift SDK](https://github.com/light-speak/luxo-swift)（独立 SPM 仓库；`LuxoClient` + URLSession + async/await + Luxo binary codec + SwiftSyntax 字段追踪）
 
 ### Phase 5 — 生产 + 生态（进行中）
 - [ ] Luxo Studio（正在开发；后端与 React 前端基础已落地）

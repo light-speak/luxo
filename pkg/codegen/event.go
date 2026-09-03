@@ -37,9 +37,11 @@ func generateEventFile(result *semantic.Result, packageName string) []byte {
 	writeHeader(&b, packageName, "event.gen.go")
 
 	crossModuleImports := collectCrossModuleEventImports(result, listeners, currentModule)
+	enums := CollectEnumsFromResult(result)
+	objects := collectEventObjectTypes(result)
 
 	// Check if listener bodies need time import
-	needsTime := false
+	needsTime := eventsUseType(events, "DateTime") || eventsUseType(events, "Duration")
 	for _, l := range listeners {
 		if l.Body != nil {
 			var feat handlerFeatures
@@ -53,16 +55,28 @@ func generateEventFile(result *semantic.Result, packageName string) []byte {
 
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
-	if eventsNeedJSON(events) {
+	if len(events) > 0 {
+		b.WriteString("\t\"fmt\"\n")
+	}
+	if eventsNeedJSON(events, enums, objects) {
 		b.WriteString("\t\"encoding/json\"\n")
 	}
 	if needsTime {
 		b.WriteString("\t\"time\"\n")
 	}
 	if len(events) > 0 {
+		if eventsUseObjects(events, objects) {
+			b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
+		}
 		b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/event\"\n")
+	if eventsUseType(events, "UUID") {
+		b.WriteString("\n\t\"github.com/google/uuid\"\n")
+	}
+	if eventsUseType(events, "Decimal") {
+		b.WriteString("\t\"github.com/shopspring/decimal\"\n")
+	}
 	// Sort cross-module imports for deterministic output
 	modNames := make([]string, 0, len(crossModuleImports))
 	for modName := range crossModuleImports {
@@ -77,7 +91,7 @@ func generateEventFile(result *semantic.Result, packageName string) []byte {
 	// Event structs + MarshalLuxo/UnmarshalLuxo
 	for _, e := range events {
 		generateEventStruct(&b, e)
-		generateEventCodec(&b, e)
+		generateEventCodec(&b, e, enums, objects)
 	}
 
 	// Emit functions — pass struct directly, zero serialization
@@ -95,11 +109,8 @@ func generateEventFile(result *semantic.Result, packageName string) []byte {
 		modelMap[m.Name] = m
 	}
 
-	// Collect enums for on-handler body compilation
-	enums := CollectEnumsFromResult(result)
-
 	// RegisterEvents function — wires all on-listeners
-	generateRegisterEvents(&b, listeners, packageName, currentModule, modelMap, enums)
+	generateRegisterEvents(&b, listeners, currentModule, currentModule, modelMap, enums)
 
 	// Generate Unmarshal functions for LOCAL events (exported for cross-module use)
 	for _, e := range events {
@@ -109,25 +120,69 @@ func generateEventFile(result *semantic.Result, packageName string) []byte {
 		fmt.Fprintf(&b, "\tif e, ok := v.(*%s); ok {\n", eventType)
 		fmt.Fprintf(&b, "\t\treturn e.UnmarshalLuxo(data)\n")
 		b.WriteString("\t}\n")
-		b.WriteString("\treturn nil\n")
+		fmt.Fprintf(&b, "\treturn fmt.Errorf(%q, v)\n", "event "+e.Name+": expected *"+eventType+", got %T")
 		b.WriteString("}\n\n")
 	}
 
 	return []byte(b.String())
 }
 
-func eventsNeedJSON(events []*ast.EventDecl) bool {
+func collectEventObjectTypes(result *semantic.Result) map[string]bool {
+	objects := make(map[string]bool)
+	for _, file := range result.Files {
+		for _, model := range file.Models {
+			objects[model.Name] = true
+		}
+		for _, declaration := range file.Types {
+			objects[declaration.Name] = true
+		}
+	}
+	return objects
+}
+
+func eventsUseType(events []*ast.EventDecl, name string) bool {
 	for _, eventDecl := range events {
 		for _, param := range eventDecl.Params {
-			if param.Type == nil || param.Type.IsList {
-				return true
-			}
-			switch param.Type.Name {
-			case "Int", "Float", "String", "Boolean":
-			default:
+			if param.Type != nil && param.Type.Name == name {
 				return true
 			}
 		}
+	}
+	return false
+}
+
+func eventsUseObjects(events []*ast.EventDecl, objects map[string]bool) bool {
+	for _, eventDecl := range events {
+		for _, param := range eventDecl.Params {
+			if param.Type != nil && objects[param.Type.Name] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func eventsNeedJSON(events []*ast.EventDecl, enums, objects map[string]bool) bool {
+	for _, eventDecl := range events {
+		for _, param := range eventDecl.Params {
+			if param.Type == nil {
+				return true
+			}
+			if param.Type.Name == "JSON" {
+				return true
+			}
+			if !isEventBuiltin(param.Type.Name) && !enums[param.Type.Name] && !objects[param.Type.Name] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isEventBuiltin(name string) bool {
+	switch name {
+	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes", "JSON":
+		return true
 	}
 	return false
 }
@@ -145,15 +200,15 @@ func generateEventStruct(b *strings.Builder, e *ast.EventDecl) {
 
 // generateEventCodec generates MarshalLuxo/UnmarshalLuxo for binary encoding.
 // Field IDs come from luxo.lock (stable across schema evolution).
-func generateEventCodec(b *strings.Builder, e *ast.EventDecl) {
+func generateEventCodec(b *strings.Builder, e *ast.EventDecl, enums, objects map[string]bool) {
 	typeName := e.Name + "Event"
 
 	// MarshalLuxo
 	fmt.Fprintf(b, "// MarshalLuxo encodes %s to Luxo binary format.\n", typeName)
-	fmt.Fprintf(b, "func (e *%s) MarshalLuxo() []byte {\n", typeName)
+	fmt.Fprintf(b, "func (e %s) MarshalLuxo() []byte {\n", typeName)
 	b.WriteString("\tvar enc codec.Encoder\n")
 	for _, p := range e.Params {
-		writeEventMarshalField(b, e.Name, p)
+		writeEventMarshalField(b, e.Name, p, enums[p.Type.Name], objects[p.Type.Name])
 	}
 	b.WriteString("\tenc.WriteEnd()\n")
 	b.WriteString("\treturn enc.Bytes()\n")
@@ -162,80 +217,272 @@ func generateEventCodec(b *strings.Builder, e *ast.EventDecl) {
 	// UnmarshalLuxo
 	fmt.Fprintf(b, "// UnmarshalLuxo decodes %s from Luxo binary format.\n", typeName)
 	fmt.Fprintf(b, "func (e *%s) UnmarshalLuxo(data []byte) error {\n", typeName)
+	for _, p := range e.Params {
+		if p.Type != nil && !p.Type.Nullable && getEventFieldID(e.Name, p.Name) != 0 {
+			fmt.Fprintf(b, "\tvar seen%s bool\n", str.Capitalize(p.Name))
+		}
+	}
 	b.WriteString("\tdec := codec.NewDecoder(data)\n")
 	b.WriteString("\tfor dec.NextField() {\n")
 	b.WriteString("\t\tswitch dec.FieldID() {\n")
 	for _, p := range e.Params {
-		writeEventUnmarshalField(b, e.Name, p)
+		writeEventUnmarshalField(b, e.Name, p, enums[p.Type.Name], objects[p.Type.Name])
+		if p.Type != nil && !p.Type.Nullable && getEventFieldID(e.Name, p.Name) != 0 {
+			fmt.Fprintf(b, "\t\t\tseen%s = true\n", str.Capitalize(p.Name))
+		}
 	}
+	b.WriteString("\t\tdefault: dec.SkipField()\n")
 	b.WriteString("\t\t}\n")
 	b.WriteString("\t}\n")
-	b.WriteString("\treturn dec.Err()\n")
+	b.WriteString("\tif err := dec.Err(); err != nil { return err }\n")
+	for _, p := range e.Params {
+		if p.Type != nil && !p.Type.Nullable && getEventFieldID(e.Name, p.Name) != 0 {
+			fmt.Fprintf(b, "\tif !seen%s { return fmt.Errorf(%q) }\n", str.Capitalize(p.Name), "event "+e.Name+": missing required field "+p.Name)
+		}
+	}
+	b.WriteString("\treturn nil\n")
 	b.WriteString("}\n\n")
 }
 
-func writeEventMarshalField(b *strings.Builder, eventName string, param *ast.ParamDecl) {
+func writeEventMarshalField(b *strings.Builder, eventName string, param *ast.ParamDecl, isEnum, isObject bool) {
 	fieldID := getEventFieldID(eventName, param.Name)
-	if fieldID == 0 {
+	if fieldID == 0 || param.Type == nil {
 		return
 	}
-	goField := str.Capitalize(param.Name)
-	nullable := param.Type != nil && param.Type.Nullable
-	switch eventScalarType(param.Type) {
-	case "Int":
-		writeNullableEventCall(b, nullable, "WriteFieldInt", fieldID, goField)
-	case "Float":
-		writeNullableEventCall(b, nullable, "WriteFieldFloat", fieldID, goField)
-	case "String":
-		writeNullableEventCall(b, nullable, "WriteFieldString", fieldID, goField)
-	case "Boolean":
-		writeNullableEventCall(b, nullable, "WriteFieldBool", fieldID, goField)
-	default:
-		fmt.Fprintf(b, "\tif data, err := json.Marshal(e.%s); err == nil {\n", goField)
-		fmt.Fprintf(b, "\t\tenc.WriteFieldBytes(%d, data)\n", fieldID)
+	value := "e." + str.Capitalize(param.Name)
+	if param.Type.IsList {
+		writeEventListMarshal(b, fieldID, value, param.Type.Name, isEnum, isObject)
+		return
+	}
+	if isObject {
+		writeEventObjectMarshal(b, fieldID, value, param.Type.Nullable)
+		return
+	}
+	if isEventBuiltin(param.Type.Name) || isEnum {
+		writeEventScalarMarshal(b, fieldID, value, param.Type, isEnum)
+		return
+	}
+	fmt.Fprintf(b, "\tif data, err := json.Marshal(%s); err == nil { enc.WriteFieldBytes(%d, data) }\n", value, fieldID)
+}
+
+func writeEventScalarMarshal(b *strings.Builder, fieldID int, value string, ref *ast.TypeRef, isEnum bool) {
+	fmt.Fprintf(b, "\tenc.WriteFieldHeader(%d)\n", fieldID)
+	encoded := value
+	indent := "\t"
+	if ref.Nullable {
+		fmt.Fprintf(b, "\tif %s == nil { enc.WriteNull() } else {\n", value)
+		b.WriteString("\t\tenc.WritePresent()\n")
+		encoded = "(*" + value + ")"
+		indent = "\t\t"
+	}
+	fmt.Fprintf(b, "%s%s\n", indent, eventScalarWriteStatement(ref.Name, encoded, isEnum))
+	if ref.Nullable {
 		b.WriteString("\t}\n")
 	}
 }
 
-func writeNullableEventCall(b *strings.Builder, nullable bool, method string, fieldID int, goField string) {
-	if nullable {
-		method += "Ptr"
+func eventScalarWriteStatement(typeName, value string, isEnum bool) string {
+	if isEnum {
+		return fmt.Sprintf("enc.WriteString(string(%s))", value)
 	}
-	fmt.Fprintf(b, "\tenc.%s(%d, e.%s)\n", method, fieldID, goField)
+	switch typeName {
+	case "Int":
+		return "enc.WriteInt(" + value + ")"
+	case "Float":
+		return "enc.WriteFloat(" + value + ")"
+	case "String":
+		return "enc.WriteString(" + value + ")"
+	case "Boolean":
+		return "enc.WriteBool(" + value + ")"
+	case "DateTime":
+		return "enc.WriteInt(" + value + ".Unix())"
+	case "Duration":
+		return "enc.WriteInt(int64(" + value + "))"
+	case "UUID":
+		return "enc.WriteUUID([16]byte(" + value + "))"
+	case "Decimal":
+		return "enc.WriteString(" + value + ".String())"
+	case "Bytes", "JSON":
+		return "enc.WriteBytes(" + value + ")"
+	}
+	return ""
 }
 
-func writeEventUnmarshalField(b *strings.Builder, eventName string, param *ast.ParamDecl) {
-	fieldID := getEventFieldID(eventName, param.Name)
-	if fieldID == 0 {
+func writeEventListMarshal(b *strings.Builder, fieldID int, value, typeName string, isEnum, isObject bool) {
+	fmt.Fprintf(b, "\tenc.WriteFieldHeader(%d)\n", fieldID)
+	fmt.Fprintf(b, "\tenc.WriteArrayHeader(len(%s))\n", value)
+	fmt.Fprintf(b, "\tfor i := range %s {\n", value)
+	item := value + "[i]"
+	if isObject {
+		writeEventObjectValue(b, item, "\t\t")
+	} else if isEventBuiltin(typeName) || isEnum {
+		fmt.Fprintf(b, "\t\t%s\n", eventScalarWriteStatement(typeName, item, isEnum))
+	} else {
+		fmt.Fprintf(b, "\t\tdata, _ := json.Marshal(%s)\n", item)
+		b.WriteString("\t\tenc.WriteBytes(data)\n")
+	}
+	b.WriteString("\t}\n")
+}
+
+func writeEventObjectMarshal(b *strings.Builder, fieldID int, value string, nullable bool) {
+	fmt.Fprintf(b, "\tenc.WriteFieldHeader(%d)\n", fieldID)
+	if nullable {
+		fmt.Fprintf(b, "\tif %s == nil { enc.WriteNull() } else {\n", value)
+		b.WriteString("\t\tenc.WritePresent()\n")
+		writeEventObjectValue(b, value, "\t\t")
+		b.WriteString("\t}\n")
 		return
 	}
-	goField := str.Capitalize(param.Name)
-	nullable := param.Type != nil && param.Type.Nullable
-	method := eventReadMethod(eventScalarType(param.Type), nullable)
-	if method != "" {
-		fmt.Fprintf(b, "\t\tcase %d: e.%s = dec.%s()\n", fieldID, goField, method)
+	b.WriteString("\t{\n")
+	writeEventObjectValue(b, value, "\t\t")
+	b.WriteString("\t}\n")
+}
+
+func writeEventObjectValue(b *strings.Builder, value, indent string) {
+	fmt.Fprintf(b, "%sbuf := api.GetBuf()\n", indent)
+	fmt.Fprintf(b, "%s%s.WriteLuxo(buf, nil)\n", indent, value)
+	fmt.Fprintf(b, "%senc.WriteBytes(buf.B)\n", indent)
+	fmt.Fprintf(b, "%sapi.PutBuf(buf)\n", indent)
+}
+
+func writeEventUnmarshalField(b *strings.Builder, eventName string, param *ast.ParamDecl, isEnum, isObject bool) {
+	fieldID := getEventFieldID(eventName, param.Name)
+	if fieldID == 0 || param.Type == nil {
+		return
+	}
+	value := "e." + str.Capitalize(param.Name)
+	if param.Type.IsList {
+		writeEventListUnmarshal(b, fieldID, value, param.Type.Name, isEnum, isObject)
+		return
+	}
+	if isObject {
+		writeEventObjectUnmarshal(b, fieldID, value, param.Type)
+		return
+	}
+	if isEventBuiltin(param.Type.Name) || isEnum {
+		writeEventScalarUnmarshal(b, fieldID, value, param.Type, isEnum)
 		return
 	}
 	fmt.Fprintf(b, "\t\tcase %d:\n", fieldID)
-	fmt.Fprintf(b, "\t\t\tif err := json.Unmarshal(dec.ReadBytes(), &e.%s); err != nil { return err }\n", goField)
+	fmt.Fprintf(b, "\t\t\tif err := json.Unmarshal(dec.ReadBytes(), &%s); err != nil { return err }\n", value)
 }
 
-func eventScalarType(ref *ast.TypeRef) string {
-	if ref == nil || ref.IsList {
-		return ""
+func writeEventScalarUnmarshal(b *strings.Builder, fieldID int, value string, ref *ast.TypeRef, isEnum bool) {
+	fmt.Fprintf(b, "\t\tcase %d:\n", fieldID)
+	if ref.Name == "Decimal" {
+		writeEventDecimalUnmarshal(b, value, ref.Nullable)
+		return
 	}
-	return ref.Name
+	fmt.Fprintf(b, "\t\t\t%s = %s\n", value, eventScalarReadExpression(ref.Name, isEnum, ref.Nullable))
 }
 
-func eventReadMethod(baseType string, nullable bool) string {
-	methods := map[string]string{
-		"Int": "ReadInt", "Float": "ReadFloat", "String": "ReadString", "Boolean": "ReadBool",
+func writeEventDecimalUnmarshal(b *strings.Builder, value string, nullable bool) {
+	if nullable {
+		fmt.Fprintf(b, "\t\t\tif raw := dec.ReadStringPtr(); raw != nil { parsed, err := decimal.NewFromString(*raw); if err != nil { return err }; %s = &parsed }\n", value)
+		return
 	}
-	method := methods[baseType]
-	if method != "" && nullable {
-		method += "Ptr"
+	fmt.Fprintf(b, "\t\t\tparsed, err := decimal.NewFromString(dec.ReadString()); if err != nil { return err }; %s = parsed\n", value)
+}
+
+func eventScalarReadExpression(typeName string, isEnum, nullable bool) string {
+	if nullable {
+		switch typeName {
+		case "Int":
+			return "dec.ReadIntPtr()"
+		case "Float":
+			return "dec.ReadFloatPtr()"
+		case "String":
+			return "dec.ReadStringPtr()"
+		case "Boolean":
+			return "dec.ReadBoolPtr()"
+		case "Bytes", "JSON":
+			if typeName == "JSON" {
+				return "func() *json.RawMessage { raw := dec.ReadBytesValuePtr(); if raw == nil { return nil }; value := json.RawMessage(*raw); return &value }()"
+			}
+			return "dec.ReadBytesValuePtr()"
+		default:
+			return eventNullableReadClosure(typeName, isEnum)
+		}
 	}
-	return method
+	if isEnum {
+		return typeName + "(dec.ReadString())"
+	}
+	switch typeName {
+	case "Int":
+		return "dec.ReadInt()"
+	case "Float":
+		return "dec.ReadFloat()"
+	case "String":
+		return "dec.ReadString()"
+	case "Boolean":
+		return "dec.ReadBool()"
+	case "DateTime":
+		return "time.Unix(dec.ReadInt(), 0).UTC()"
+	case "Duration":
+		return "time.Duration(dec.ReadInt())"
+	case "UUID":
+		return "uuid.UUID(dec.ReadUUID())"
+	case "Bytes":
+		return "dec.ReadBytes()"
+	case "JSON":
+		return "json.RawMessage(dec.ReadBytes())"
+	}
+	return ""
+}
+
+func eventNullableReadClosure(typeName string, isEnum bool) string {
+	goType := mapBaseType(typeName)
+	read := "dec.ReadIntPtr()"
+	conversion := "time.Duration(*raw)"
+	switch {
+	case isEnum:
+		read = "dec.ReadStringPtr()"
+		conversion = typeName + "(*raw)"
+	case typeName == "DateTime":
+		conversion = "time.Unix(*raw, 0).UTC()"
+	case typeName == "UUID":
+		read = "dec.ReadUUIDPtr()"
+		conversion = "uuid.UUID(*raw)"
+	}
+	return "func() *" + goType + " { raw := " + read + "; if raw == nil { return nil }; value := " + conversion + "; return &value }()"
+}
+
+func writeEventListUnmarshal(b *strings.Builder, fieldID int, value, typeName string, isEnum, isObject bool) {
+	fmt.Fprintf(b, "\t\tcase %d:\n", fieldID)
+	b.WriteString("\t\t\tcount := dec.ReadArrayLength()\n")
+	fmt.Fprintf(b, "\t\t\t%s = make([]%s, count)\n", value, mapBaseType(typeName))
+	fmt.Fprintf(b, "\t\t\tfor i := range %s {\n", value)
+	item := value + "[i]"
+	if isObject {
+		writeEventObjectReadValue(b, item, "\t\t\t\t")
+	} else if typeName == "Decimal" {
+		b.WriteString("\t\t\t\tparsed, err := decimal.NewFromString(dec.ReadString()); if err != nil { return err }\n")
+		fmt.Fprintf(b, "\t\t\t\t%s = parsed\n", item)
+	} else if isEventBuiltin(typeName) || isEnum {
+		fmt.Fprintf(b, "\t\t\t\t%s = %s\n", item, eventScalarReadExpression(typeName, isEnum, false))
+	} else {
+		fmt.Fprintf(b, "\t\t\t\tif err := json.Unmarshal(dec.ReadBytes(), &%s); err != nil { return err }\n", item)
+	}
+	b.WriteString("\t\t\t}\n")
+}
+
+func writeEventObjectUnmarshal(b *strings.Builder, fieldID int, value string, ref *ast.TypeRef) {
+	fmt.Fprintf(b, "\t\tcase %d:\n", fieldID)
+	if ref.Nullable {
+		b.WriteString("\t\t\tif dec.ReadBool() {\n")
+		fmt.Fprintf(b, "\t\t\t\t%s = &%s{}\n", value, ref.Name)
+		writeEventObjectReadValue(b, value, "\t\t\t\t")
+		b.WriteString("\t\t\t}\n")
+		return
+	}
+	writeEventObjectReadValue(b, value, "\t\t\t")
+}
+
+func writeEventObjectReadValue(b *strings.Builder, value, indent string) {
+	fmt.Fprintf(b, "%sraw := dec.ReadBytes()\n", indent)
+	fmt.Fprintf(b, "%snested := codec.NewDecoder(raw)\n", indent)
+	fmt.Fprintf(b, "%s%s.ReadLuxo(nested)\n", indent, value)
+	fmt.Fprintf(b, "%sif err := nested.Err(); err != nil { return err }\n", indent)
 }
 
 // generateEmitFunc generates a typed emit function.

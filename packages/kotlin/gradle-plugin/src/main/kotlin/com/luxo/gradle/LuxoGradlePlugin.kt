@@ -1,37 +1,45 @@
 package com.luxo.gradle
 
+import org.gradle.api.Plugin
 import org.gradle.api.Project
-import org.gradle.api.provider.Provider
-import org.jetbrains.kotlin.gradle.plugin.*
+import org.gradle.api.artifacts.Configuration
 
-/**
- * Luxo Gradle Plugin — configures the Kotlin compiler plugin for
- * compile-time field selection analysis.
- *
- * Usage in build.gradle.kts:
- *   plugins {
- *       id("com.luxo.select")
- *   }
- */
-class LuxoGradlePlugin : KotlinCompilerPluginSupportPlugin {
-
+/** Registers Luxo code generation and compiler-AST field analysis. */
+class LuxoGradlePlugin : Plugin<Project> {
     override fun apply(target: Project) {
-        // Plugin applied — compiler plugin will be auto-registered
-    }
+        val extension = target.extensions.create("luxo", LuxoExtension::class.java)
+        extension.applyConventions(target)
+        val codegenClasspath = target.toolingClasspath("luxoCodegenRuntimeClasspath")
+        val analyzerClasspath = target.toolingClasspath("luxoAnalyzerRuntimeClasspath", includeCompiler = true)
 
-    override fun isApplicable(kotlinCompilation: KotlinCompilation<*>): Boolean {
-        return kotlinCompilation.target.project.plugins.hasPlugin(LuxoGradlePlugin::class.java)
-    }
+        val generate = target.tasks.register("luxoGenerate", LuxoGenerateTask::class.java) {
+            it.configureFrom(extension, codegenClasspath)
+        }
+        val analyze = target.tasks.register("luxoAnalyze", LuxoAnalyzeTask::class.java) {
+            it.configureFrom(extension, analyzerClasspath)
+            it.mustRunAfter(generate)
+        }
 
-    override fun getCompilerPluginId(): String = "com.luxo.select"
-
-    override fun getPluginArtifact(): SubpluginArtifact = SubpluginArtifact(
-        groupId = "com.luxo",
-        artifactId = "luxo-compiler-plugin",
-        version = "0.1.0",
-    )
-
-    override fun applyToCompilation(kotlinCompilation: KotlinCompilation<*>): Provider<List<SubpluginOption>> {
-        return kotlinCompilation.target.project.provider { emptyList() }
+        target.tasks.configureEach {
+            if (it.name.startsWith("compile") && it.name.endsWith("Kotlin")) {
+                it.dependsOn(analyze)
+            }
+        }
     }
 }
+
+private fun Project.toolingClasspath(name: String, includeCompiler: Boolean = false): Configuration {
+    val classpath = configurations.create(name) {
+        it.isCanBeConsumed = false
+        it.isCanBeResolved = true
+        it.description = "Isolated runtime for Luxo build tooling"
+    }
+    dependencies.add(name, "com.luxo:luxo-client:$LUXO_VERSION")
+    if (includeCompiler) {
+        dependencies.add(name, "org.jetbrains.kotlin:kotlin-compiler-embeddable:$KOTLIN_COMPILER_VERSION")
+    }
+    return classpath
+}
+
+private const val LUXO_VERSION = "0.1.0"
+private const val KOTLIN_COMPILER_VERSION = "2.4.10"

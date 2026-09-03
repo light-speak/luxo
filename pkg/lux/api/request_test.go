@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 func makeReq(body string) *http.Request {
@@ -312,13 +315,50 @@ func TestParamJSON(t *testing.T) {
 	}
 }
 
-func TestParamJSONNullableMissing(t *testing.T) {
-	// Nullable params (double-pointer targets) tolerate a missing key —
-	// omitting an optional param must NOT 400, matching the binary path.
+func TestParamJSONDecodesStructuredBinaryJSON(t *testing.T) {
+	type input struct {
+		Name string `json:"name"`
+	}
+	req := &Request{
+		paramNames: []string{"input"},
+		paramCount: 1,
+		paramSlots: [16]any{json.RawMessage(`{"name":"luxo"}`)},
+	}
+	var got input
+	if err := req.ParamJSON("input", &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "luxo" {
+		t.Fatalf("input = %#v", got)
+	}
+}
+
+func TestParamJSONAssignsNativeBinaryTypes(t *testing.T) {
+	wantTime := time.Unix(1_700_000_000, 0).UTC()
+	wantUUID := uuid.MustParse("550e8400-e29b-41d4-a716-446655440000")
+	req := &Request{
+		paramNames: []string{"at", "id"},
+		paramCount: 2,
+		paramSlots: [16]any{wantTime, wantUUID},
+	}
+	var gotTime time.Time
+	var gotUUID uuid.UUID
+	if err := req.ParamJSON("at", &gotTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := req.ParamJSON("id", &gotUUID); err != nil {
+		t.Fatal(err)
+	}
+	if !gotTime.Equal(wantTime) || gotUUID != wantUUID {
+		t.Fatalf("at/id = %v/%v", gotTime, gotUUID)
+	}
+}
+
+func TestParamJSONOptionalMissing(t *testing.T) {
 	req, _ := ParseRequest(makeReq(`{"$api":"test"}`))
 
 	var s *string
-	if err := req.ParamJSON("name", &s); err != nil {
+	if err := req.ParamJSONOptional("name", &s); err != nil {
 		t.Fatalf("missing nullable string param should not error: %v", err)
 	}
 	if s != nil {
@@ -326,36 +366,54 @@ func TestParamJSONNullableMissing(t *testing.T) {
 	}
 
 	var i *int64
-	if err := req.ParamJSON("count", &i); err != nil {
+	if err := req.ParamJSONOptional("count", &i); err != nil {
 		t.Fatalf("missing nullable int param should not error: %v", err)
 	}
 	var f *float64
-	if err := req.ParamJSON("ratio", &f); err != nil {
+	if err := req.ParamJSONOptional("ratio", &f); err != nil {
 		t.Fatalf("missing nullable float param should not error: %v", err)
 	}
 	var b *bool
-	if err := req.ParamJSON("flag", &b); err != nil {
+	if err := req.ParamJSONOptional("flag", &b); err != nil {
 		t.Fatalf("missing nullable bool param should not error: %v", err)
 	}
 	var tm *time.Time
-	if err := req.ParamJSON("at", &tm); err != nil {
+	if err := req.ParamJSONOptional("at", &tm); err != nil {
 		t.Fatalf("missing nullable datetime param should not error: %v", err)
 	}
 	var d *time.Duration
-	if err := req.ParamJSON("ttl", &d); err != nil {
+	if err := req.ParamJSONOptional("ttl", &d); err != nil {
 		t.Fatalf("missing nullable duration param should not error: %v", err)
 	}
 }
 
 func TestParamJSONNullableNull(t *testing.T) {
-	// Explicit null is equivalent to omitting the param.
 	req, _ := ParseRequest(makeReq(`{"$api":"test","name":null}`))
 	var s *string
-	if err := req.ParamJSON("name", &s); err != nil {
+	if err := req.ParamJSONNullable("name", &s); err != nil {
 		t.Fatalf("null nullable param should not error: %v", err)
 	}
 	if s != nil {
 		t.Errorf("null param should leave target nil, got %v", *s)
+	}
+}
+
+func TestParamJSONNullableRequiresPresence(t *testing.T) {
+	req, _ := ParseRequest(makeReq(`{"$api":"test"}`))
+	var value *string
+	if err := req.ParamJSONNullable("name", &value); err == nil {
+		t.Fatal("required nullable param should reject absence")
+	}
+}
+
+func TestParamJSONRejectsNullForNonNullableTarget(t *testing.T) {
+	req, _ := ParseRequest(makeReq(`{"$api":"test","name":null}`))
+	var value string
+	if err := req.ParamJSON("name", &value); err == nil {
+		t.Fatal("required non-null param should reject null")
+	}
+	if err := req.ParamJSONOptional("name", &value); err == nil {
+		t.Fatal("optional non-null param should reject explicit null")
 	}
 }
 
@@ -505,6 +563,20 @@ func TestParseRequestBadSorters(t *testing.T) {
 	_, err := ParseRequest(makeReq(body))
 	if err == nil {
 		t.Fatal("expected error for bad $sorters")
+	}
+}
+
+func TestParseRequestRejectsInvalidListControls(t *testing.T) {
+	tests := []string{
+		`{"$api":"test","$filters":[{"field":"","op":"eq","value":"x"}]}`,
+		`{"$api":"test","$filters":[{"field":"name","op":"unknown","value":"x"}]}`,
+		`{"$api":"test","$sorters":[{"field":"","order":"asc"}]}`,
+		`{"$api":"test","$sorters":[{"field":"name","order":"sideways"}]}`,
+	}
+	for _, body := range tests {
+		if _, err := ParseRequest(makeReq(body)); err == nil {
+			t.Fatalf("invalid list controls accepted: %s", body)
+		}
 	}
 }
 
@@ -736,12 +808,51 @@ func TestParamJSONBinaryNilValue(t *testing.T) {
 	req := &Request{
 		paramNames: []string{"data"},
 		paramCount: 1,
-		paramSlots: [16]any{nil}, // nil value
+		paramSet:   1,
+		paramNull:  1,
 	}
 	var v any
-	err := req.ParamJSON("data", &v)
+	err := req.ParamJSONOptionalNullable("data", &v)
 	if err != nil {
 		t.Fatal("nil param should not error (nullable)")
+	}
+}
+
+type requestTestEnum string
+
+func TestParamJSONBinaryConvertsNamedAndByteTypes(t *testing.T) {
+	req := &Request{
+		paramNames: []string{"roles", "payload"},
+		paramCount: 2,
+		paramSlots: [16]any{[]string{"ADMIN", "MEMBER"}, []byte{1, 2, 3}},
+	}
+	var roles []requestTestEnum
+	if err := req.ParamJSON("roles", &roles); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(roles, []requestTestEnum{"ADMIN", "MEMBER"}) {
+		t.Fatalf("roles = %#v", roles)
+	}
+	var payload []byte
+	if err := req.ParamJSON("payload", &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(payload, []byte{1, 2, 3}) {
+		t.Fatalf("payload = %v", payload)
+	}
+}
+
+func TestHasParamBinaryDistinguishesOmittedValues(t *testing.T) {
+	req := &Request{
+		paramNames: []string{"present", "omitted"},
+		paramCount: 2,
+		paramSlots: [16]any{int64(1), nil},
+	}
+	if !req.HasParam("present") {
+		t.Fatal("present parameter was not found")
+	}
+	if req.HasParam("omitted") {
+		t.Fatal("omitted parameter must not be reported as present")
 	}
 }
 
@@ -778,5 +889,62 @@ func TestParamStringArraySingleElement(t *testing.T) {
 	}
 	if len(strs) != 1 || strs[0] != "hello" {
 		t.Fatalf("single string should wrap to []string, got %v", strs)
+	}
+}
+
+func TestParamUUIDArray(t *testing.T) {
+	first := uuid.MustParse("550e8400-e29b-41d4-a716-446655440000")
+	second := uuid.MustParse("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+	req := &Request{}
+	req.SetBinaryParams([]string{"keys"}, 1)
+	req.SetParamSlot(0, []uuid.UUID{first, second})
+
+	keys, err := req.ParamUUIDArray("keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(keys, []uuid.UUID{first, second}) {
+		t.Fatalf("UUID keys = %v", keys)
+	}
+}
+
+func TestParamUUIDArrayVariants(t *testing.T) {
+	value := uuid.MustParse("550e8400-e29b-41d4-a716-446655440000")
+
+	t.Run("single binary value", func(t *testing.T) {
+		req := &Request{}
+		req.SetBinaryParams([]string{"keys"}, 1)
+		req.SetParamSlot(0, value)
+		got, err := req.ParamUUIDArray("keys")
+		if err != nil || len(got) != 1 || got[0] != value {
+			t.Fatalf("ParamUUIDArray() = %v, %v", got, err)
+		}
+	})
+
+	t.Run("missing binary value", func(t *testing.T) {
+		req := &Request{}
+		req.SetBinaryParams([]string{"keys"}, 1)
+		if _, err := req.ParamUUIDArray("keys"); err == nil {
+			t.Fatal("missing binary UUID list was accepted")
+		}
+	})
+
+	t.Run("json value", func(t *testing.T) {
+		req := &Request{Params: map[string]json.RawMessage{"keys": json.RawMessage(fmt.Sprintf("[%q]", value.String()))}}
+		got, err := req.ParamUUIDArray("keys")
+		if err != nil || len(got) != 1 || got[0] != value {
+			t.Fatalf("ParamUUIDArray() = %v, %v", got, err)
+		}
+	})
+
+	for name, req := range map[string]*Request{
+		"missing json value": {Params: map[string]json.RawMessage{}},
+		"invalid json value": {Params: map[string]json.RawMessage{"keys": json.RawMessage(`[1]`)}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := req.ParamUUIDArray("keys"); err == nil {
+				t.Fatal("invalid UUID list was accepted")
+			}
+		})
 	}
 }

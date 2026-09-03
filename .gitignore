@@ -23,3 +23,5 @@ Thumbs.db
 examples/
 /luxo
 cover.out
+.tmp/
+packages/*/dist/

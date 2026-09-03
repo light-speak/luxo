@@ -79,7 +79,7 @@ func TestGenerateModel(t *testing.T) {
 			checks: []string{"Role ", "*Status ", `db:"role"`, `db:"status"`},
 		},
 		{
-			name: "computed fields skipped",
+			name: "computed fields are response-only",
 			model: &ast.ModelDecl{
 				Name: "Post",
 				Fields: []*ast.FieldDecl{
@@ -90,8 +90,8 @@ func TestGenerateModel(t *testing.T) {
 					}},
 				},
 			},
-			checks: []string{"type Post struct", "Title", "Id"},
-			absent: []string{"CommentCount"},
+			checks: []string{"type Post struct", "Title", "Id", "CommentCount", `json:"commentCount"`},
+			absent: []string{`db:"comment_count"`},
 		},
 	}
 
@@ -128,6 +128,7 @@ func TestResolveGoType(t *testing.T) {
 		{&ast.TypeRef{Name: "UUID"}, "uuid.UUID"},
 		{&ast.TypeRef{Name: "Decimal"}, "decimal.Decimal"},
 		{&ast.TypeRef{Name: "Bytes"}, "[]byte"},
+		{&ast.TypeRef{Name: "JSON"}, "json.RawMessage"},
 		{&ast.TypeRef{Name: "String", Nullable: true}, "*string"},
 		{&ast.TypeRef{Name: "Int", Nullable: true}, "*int64"},
 		{&ast.TypeRef{Name: "UUID", Nullable: true}, "*uuid.UUID"},
@@ -400,9 +401,8 @@ func TestGenerateExtendStubWithComputed(t *testing.T) {
 	generateExtendStub(&b, ext)
 	got := b.String()
 
-	// Computed field should be skipped
-	if strings.Contains(got, "Computed") {
-		t.Errorf("computed field should be skipped:\n%s", got)
+	if !strings.Contains(got, "Computed") || strings.Contains(got, `db:"computed"`) {
+		t.Errorf("computed extend field should be response-only:\n%s", got)
 	}
 }
 
@@ -426,6 +426,25 @@ func TestGenerateExtendStubAutoId(t *testing.T) {
 	}
 	if !strings.Contains(got, `db:"id"`) {
 		t.Errorf("auto Id should have db tag:\n%s", got)
+	}
+}
+
+func TestGenerateExtendStubUsesRemoteUUIDID(t *testing.T) {
+	oldContext := globalEventCtx
+	defer func() { globalEventCtx = oldContext }()
+	globalEventCtx = &EventContext{ModelIDType: map[string]string{"Account": "UUID"}}
+	ext := &ast.ExtendDecl{
+		Name: "Account",
+		Fields: []*ast.FieldDecl{{
+			Name: "name",
+			Type: &ast.TypeRef{Name: "String"},
+		}},
+	}
+
+	var b strings.Builder
+	generateExtendStub(&b, ext)
+	if got := b.String(); !strings.Contains(got, "uuid.UUID") || !strings.Contains(got, `db:"id"`) {
+		t.Errorf("remote UUID ID type was not preserved:\n%s", got)
 	}
 }
 

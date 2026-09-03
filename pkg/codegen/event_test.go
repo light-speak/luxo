@@ -19,17 +19,14 @@ func TestGenerateEventFileNoEvents(t *testing.T) {
 
 func TestEventJSONFallbackTypes(t *testing.T) {
 	events := []*ast.EventDecl{{Params: []*ast.ParamDecl{
-		{Name: "unknown"},
+		{Name: "unknown", Type: &ast.TypeRef{Name: "LegacyPayload"}},
 		{Name: "items", Type: &ast.TypeRef{Name: "String", IsList: true}},
 	}}}
-	if !eventsNeedJSON(events) {
+	if !eventsNeedJSON(events, nil, nil) {
 		t.Fatal("eventsNeedJSON() = false, want true")
 	}
-	if got := eventScalarType(nil); got != "" {
-		t.Fatalf("eventScalarType(nil) = %q, want empty", got)
-	}
-	if got := eventScalarType(&ast.TypeRef{Name: "String", IsList: true}); got != "" {
-		t.Fatalf("eventScalarType(list) = %q, want empty", got)
+	if !isEventBuiltin("JSON") || isEventBuiltin("LegacyPayload") {
+		t.Fatal("event builtin classification is incorrect")
 	}
 }
 
@@ -69,8 +66,10 @@ func TestGenerateEventFile(t *testing.T) {
 		`UserId int64`,
 		"func EmitOrderCreated(ctx context.Context, bus event.Bus, e OrderCreatedEvent) error",
 		`bus.Emit(ctx, "OrderCreated", e)`,
+		"func (e OrderCreatedEvent) MarshalLuxo() []byte",
+		"event OrderCreated: expected *OrderCreatedEvent, got %T",
 		"func RegisterEvents(bus event.Bus, app *App)",
-		`event.OnQueueDecode(bus, "OrderCreated", "luxo", UnmarshalOrderCreated, func(ctx context.Context, e OrderCreatedEvent)`,
+		`event.OnQueueDecode(bus, "OrderCreated", "test", UnmarshalOrderCreated, func(ctx context.Context, e OrderCreatedEvent)`,
 	}
 	for _, check := range checks {
 		if !strings.Contains(code, check) {
@@ -157,7 +156,7 @@ func TestGenerateEventListenerMixed(t *testing.T) {
 	src := generateEventFile(result, "order")
 	code := string(src)
 
-	if !strings.Contains(code, `event.OnQueueDecode(bus, "OrderCreated", "order"`) {
+	if !strings.Contains(code, `event.OnQueueDecode(bus, "OrderCreated", "test"`) {
 		t.Errorf("default listener should use OnQueueDecode:\n%s", code)
 	}
 	if !strings.Contains(code, `event.OnDecode(bus, "CacheInvalidate"`) {
@@ -197,31 +196,37 @@ func TestGenerateEventCodecWithFieldIDs(t *testing.T) {
 	code := string(src)
 
 	// MarshalLuxo should encode all fields
-	if !strings.Contains(code, "WriteFieldInt(1, e.OrderId)") {
-		t.Errorf("missing WriteFieldInt for orderId:\n%s", code)
+	if !strings.Contains(code, "enc.WriteFieldHeader(1)") || !strings.Contains(code, "enc.WriteInt(e.OrderId)") {
+		t.Errorf("missing canonical Int encoding for orderId:\n%s", code)
 	}
-	if !strings.Contains(code, "WriteFieldFloat(2, e.Amount)") {
-		t.Errorf("missing WriteFieldFloat for amount:\n%s", code)
+	if !strings.Contains(code, "enc.WriteFieldHeader(2)") || !strings.Contains(code, "enc.WriteFloat(e.Amount)") {
+		t.Errorf("missing canonical Float encoding for amount:\n%s", code)
 	}
-	if !strings.Contains(code, "WriteFieldString(3, e.Note)") {
-		t.Errorf("missing WriteFieldString for note:\n%s", code)
+	if !strings.Contains(code, "enc.WriteFieldHeader(3)") || !strings.Contains(code, "enc.WriteString(e.Note)") {
+		t.Errorf("missing canonical String encoding for note:\n%s", code)
 	}
-	if !strings.Contains(code, "WriteFieldBool(4, e.Paid)") {
-		t.Errorf("missing WriteFieldBool for paid:\n%s", code)
+	if !strings.Contains(code, "enc.WriteFieldHeader(4)") || !strings.Contains(code, "enc.WriteBool(e.Paid)") {
+		t.Errorf("missing canonical Boolean encoding for paid:\n%s", code)
 	}
 
 	// UnmarshalLuxo should decode all fields
-	if !strings.Contains(code, "case 1: e.OrderId = dec.ReadInt()") {
+	if !strings.Contains(code, "case 1:") || !strings.Contains(code, "e.OrderId = dec.ReadInt()") {
 		t.Errorf("missing ReadInt for orderId:\n%s", code)
 	}
-	if !strings.Contains(code, "case 2: e.Amount = dec.ReadFloat()") {
+	if !strings.Contains(code, "case 2:") || !strings.Contains(code, "e.Amount = dec.ReadFloat()") {
 		t.Errorf("missing ReadFloat for amount:\n%s", code)
 	}
-	if !strings.Contains(code, "case 3: e.Note = dec.ReadString()") {
+	if !strings.Contains(code, "case 3:") || !strings.Contains(code, "e.Note = dec.ReadString()") {
 		t.Errorf("missing ReadString for note:\n%s", code)
 	}
-	if !strings.Contains(code, "case 4: e.Paid = dec.ReadBool()") {
+	if !strings.Contains(code, "case 4:") || !strings.Contains(code, "e.Paid = dec.ReadBool()") {
 		t.Errorf("missing ReadBool for paid:\n%s", code)
+	}
+	if !strings.Contains(code, "seenOrderId = true") || !strings.Contains(code, "if !seenOrderId") {
+		t.Errorf("required event fields must be presence-checked:\n%s", code)
+	}
+	if !strings.Contains(code, "default:") || !strings.Contains(code, "dec.SkipField()") {
+		t.Errorf("unknown event fields must fail instead of corrupting decoder state:\n%s", code)
 	}
 }
 
@@ -253,9 +258,10 @@ func TestGenerateEventCodecNullableTypes(t *testing.T) {
 	code := string(src)
 
 	for _, want := range []string{
-		"WriteFieldFloatPtr(1, e.Amount)",
-		"WriteFieldStringPtr(2, e.Note)",
-		"WriteFieldBoolPtr(3, e.Active)",
+		"if e.Amount == nil { enc.WriteNull() } else {",
+		"enc.WriteFloat((*e.Amount))",
+		"enc.WriteString((*e.Note))",
+		"enc.WriteBool((*e.Active))",
 		"e.Amount = dec.ReadFloatPtr()",
 	} {
 		if !strings.Contains(code, want) {
@@ -275,6 +281,10 @@ func TestGenerateEventCodecComplexType(t *testing.T) {
 	result := &semantic.Result{
 		Files: []*ast.File{{
 			Name: "test.luxo",
+			Models: []*ast.ModelDecl{{
+				Name:   "Order",
+				Fields: []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}},
+			}},
 			Events: []*ast.EventDecl{
 				{
 					Name: "ComplexEvent",
@@ -289,8 +299,11 @@ func TestGenerateEventCodecComplexType(t *testing.T) {
 	src := generateEventFile(result, "luxo")
 	code := string(src)
 
-	if !strings.Contains(code, "json.Marshal(e.Data)") || !strings.Contains(code, "json.Unmarshal(dec.ReadBytes(), &e.Data)") {
-		t.Errorf("complex type should round-trip through embedded JSON:\n%s", code)
+	if !strings.Contains(code, "e.Data.WriteLuxo(buf, nil)") || !strings.Contains(code, "e.Data.ReadLuxo(nested)") {
+		t.Errorf("model event payload should use nested Luxo binary:\n%s", code)
+	}
+	if strings.Contains(code, "json.Marshal(e.Data)") {
+		t.Errorf("model event payload must not embed JSON:\n%s", code)
 	}
 }
 
@@ -315,7 +328,7 @@ func TestGenerateEventListenerNoParams(t *testing.T) {
 		t.Errorf("should default to 'payload' param:\n%s", code)
 	}
 	// Default should use OnQueueDecode
-	if !strings.Contains(code, `event.OnQueueDecode(bus, "Ping", "luxo"`) {
+	if !strings.Contains(code, `event.OnQueueDecode(bus, "Ping", "test"`) {
 		t.Errorf("default should use OnQueueDecode:\n%s", code)
 	}
 }

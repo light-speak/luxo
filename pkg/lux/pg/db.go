@@ -184,6 +184,12 @@ func QueryScalar[T any](ctx context.Context, db *DB, query string, args ...any) 
 	return result, err
 }
 
+// QueryRaw executes a row query through the active pool or transaction.
+// Generated batch resolvers use it when each row contains several aggregate values.
+func QueryRaw(ctx context.Context, db *DB, query string, args ...any) (Rows, error) {
+	return db.conn.Query(ctx, query, args...)
+}
+
 // Exec executes a statement and returns rows affected.
 func Exec(ctx context.Context, db *DB, query string, args ...any) (int64, error) {
 	tag, err := db.conn.Exec(ctx, query, args...)
@@ -252,6 +258,14 @@ func InsertManyReturning[T any](ctx context.Context, db *DB, scan ScanFunc[T], t
 
 // UpdateReturning updates a single record by ID and scans the RETURNING * result.
 func UpdateReturning[T any, ID comparable](ctx context.Context, db *DB, scan ScanFunc[T], table string, id ID, sets []lux.SetField) (*T, error) {
+	return UpdateReturningBy(ctx, db, scan, table, "id", id, sets)
+}
+
+// UpdateReturningBy updates one record by a schema-declared primary-key column.
+func UpdateReturningBy[T any, ID comparable](ctx context.Context, db *DB, scan ScanFunc[T], table, idColumn string, id ID, sets []lux.SetField) (*T, error) {
+	if idColumn == "" {
+		idColumn = "id"
+	}
 	var b strings.Builder
 	var tmp [20]byte
 	args := make([]any, 0, len(sets)+1)
@@ -278,7 +292,9 @@ func UpdateReturning[T any, ID comparable](ctx context.Context, db *DB, scan Sca
 		args = append(args, s.Val)
 		argIdx++
 	}
-	b.WriteString(" WHERE id = $")
+	b.WriteString(" WHERE ")
+	b.WriteString(idColumn)
+	b.WriteString(" = $")
 	b.Write(strconv.AppendInt(tmp[:0], int64(argIdx), 10))
 	b.WriteString(" RETURNING *")
 	args = append(args, id)

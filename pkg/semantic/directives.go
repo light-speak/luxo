@@ -315,6 +315,8 @@ var builtinDirectives = []DirectiveDef{
 	// ===== Computed field directives =====
 	{
 		Name: "count", Contexts: OnComputed,
+		Params:      []ParamDef{{Name: "relation"}},
+		MaxArgs:     1,
 		Description: "count aggregation",
 	},
 	{
@@ -359,7 +361,7 @@ var builtinDirectives = []DirectiveDef{
 		Description: "expose fn as RPC endpoint via Luxo protocol for cross-service calls",
 	},
 	{
-		Name: "cache", Contexts: OnApi | OnComputed,
+		Name: "cache", Contexts: OnApi,
 		Params:      []ParamDef{{Name: "ttl"}},
 		MaxArgs:     1,
 		Description: "cache response with TTL",

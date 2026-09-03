@@ -234,30 +234,38 @@ describe('Decoder', () => {
     dec.readInt()
     expect(dec.remaining).toBeLessThan(total)
   })
+
+  it('round-trips bytes arrays', () => {
+    const enc = new Encoder()
+    enc.writeFieldBytesArray(1, [new Uint8Array([1, 2]), new Uint8Array(0)])
+    const dec = new Decoder(enc.bytes())
+    expect(dec.nextField()).toBe(true)
+    expect(dec.readBytesArray()).toEqual([new Uint8Array([1, 2]), new Uint8Array(0)])
+  })
 })
 
 describe('fieldMask', () => {
   it('fieldMaskSet sets bits correctly', () => {
     let mask = new Uint8Array(1)
-    mask = fieldMaskSet(mask, 0)
+    mask = fieldMaskSet(mask, 1)
     expect(mask[0] & 1).toBe(1)
 
-    mask = fieldMaskSet(mask, 7)
+    mask = fieldMaskSet(mask, 8)
     expect(mask[0] & 0x80).toBe(0x80)
   })
 
   it('fieldMaskSet grows mask when needed', () => {
     let mask = new Uint8Array(1)
-    mask = fieldMaskSet(mask, 8) // needs byte index 1
+    mask = fieldMaskSet(mask, 9) // needs byte index 1
     expect(mask.length).toBe(2)
     expect(mask[1] & 1).toBe(1)
   })
 
   it('fieldMaskSet grows for large field IDs', () => {
     let mask = new Uint8Array(0)
-    mask = fieldMaskSet(mask, 16)
+    mask = fieldMaskSet(mask, 17)
     expect(mask.length).toBe(3)
-    expect(fieldMaskHas(mask, 16)).toBe(true)
+    expect(fieldMaskHas(mask, 17)).toBe(true)
   })
 
   it('fieldMaskHas returns true for set bits', () => {
@@ -271,6 +279,7 @@ describe('fieldMask', () => {
 
   it('fieldMaskHas returns false for out-of-range field IDs', () => {
     const mask = new Uint8Array(1)
+    expect(fieldMaskHas(mask, 0)).toBe(false)
     expect(fieldMaskHas(mask, 100)).toBe(false)
   })
 })
@@ -321,11 +330,13 @@ describe('DateTime (svarint unix seconds → RFC3339 string)', () => {
   it('ColumnarDecoder.readColumnDateTime decodes a DateTime column', () => {
     const enc = new Encoder()
     enc.writeVarint(2) // count
+    enc.writeVarint(0) // arena size
     enc.writeVarint(5) // fieldID
     enc.writeSvarint(SECONDS)
     enc.writeSvarint(0)
     enc.writeEnd()
     const r = new ColumnarDecoder(enc.bytes())
+    expect(r.arenaSize).toBe(0)
     expect(r.nextColumn()).toBe(true)
     expect(r.fieldID).toBe(5)
     expect(r.readColumnDateTime()).toEqual([ISO, '1970-01-01T00:00:00Z'])
@@ -334,6 +345,7 @@ describe('DateTime (svarint unix seconds → RFC3339 string)', () => {
   it('ColumnarDecoder.readColumnDateTimePtr handles nulls', () => {
     const enc = new Encoder()
     enc.writeVarint(2) // count
+    enc.writeVarint(0) // arena size
     enc.writeVarint(5) // fieldID
     enc.writeBool(false) // null flag for first
     enc.writeBool(true) // present flag for second
@@ -358,5 +370,15 @@ describe('DateTime (svarint unix seconds → RFC3339 string)', () => {
     enc.writeSvarint(1000000000)
     enc.writeSvarint(500)
     expect(decodeScalarArray(enc.bytes(), 'Duration')).toEqual([1000000000, 500])
+  })
+
+  it('rejects non-canonical boolean and nullable markers', () => {
+    const boolDecoder = new Decoder(new Uint8Array([0x02]))
+    expect(boolDecoder.readBool()).toBe(false)
+    expect(boolDecoder.error).toContain('invalid bool')
+
+    const nullableDecoder = new Decoder(new Uint8Array([0x02]))
+    expect(nullableDecoder.readIntPtr()).toBe(null)
+    expect(nullableDecoder.error).toContain('invalid nullable')
   })
 })

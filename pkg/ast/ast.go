@@ -173,13 +173,13 @@ type FieldDecl struct {
 	Type       *TypeRef
 	Default    Expr
 	Directives []*Directive
-	Computed   *ComputedField // val get { ... } or val get @native
+	Computed   *ComputedField // val get @count/@sum/@avg/@min/@max
 }
 
-// ComputedField: val postCount: Int get { posts.size } or val creditScore: Int get @native
+// ComputedField describes a response-only aggregate field.
 type ComputedField struct {
-	Body       *Block       // nil = @native or @aggregate
-	Directives []*Directive // @native, @count, @sum, @avg, etc.
+	Body       *Block       // retained for parser diagnostics; aggregate fields cannot have a body
+	Directives []*Directive // exactly one aggregate directive
 }
 
 // ParamDecl: id: Int = 0
@@ -220,6 +220,8 @@ type Expr interface {
 	SetTypeTag(string)
 	IsNullable() bool
 	SetNullable(bool)
+	IsListType() bool
+	SetListType(bool)
 }
 
 // TypeTagged provides type tag storage for all Expr nodes via embedding.
@@ -227,12 +229,15 @@ type Expr interface {
 type TypeTagged struct {
 	TypeTag     string
 	NullableTag bool
+	ListTypeTag bool
 }
 
 func (t *TypeTagged) GetTypeTag() string  { return t.TypeTag }
 func (t *TypeTagged) SetTypeTag(s string) { t.TypeTag = s }
 func (t *TypeTagged) IsNullable() bool    { return t.NullableTag }
 func (t *TypeTagged) SetNullable(v bool)  { t.NullableTag = v }
+func (t *TypeTagged) IsListType() bool    { return t.ListTypeTag }
+func (t *TypeTagged) SetListType(v bool)  { t.ListTypeTag = v }
 
 // Literal: 42, 3.14, "hello", true, false, null, 7d
 type Literal struct {
@@ -617,5 +622,19 @@ func walkExpr(e Expr, fn func(Expr)) {
 		for _, p := range v.Parts {
 			walkExpr(p, fn)
 		}
+	case *RangeExpr:
+		walkExpr(v.Start, fn)
+		walkExpr(v.End, fn)
+	case *TransactionExpr:
+		WalkExprs(v.Body, fn)
+	case *YieldExpr:
+		walkExpr(v.Value, fn)
+	case *AsyncExpr:
+		WalkExprs(v.Body, fn)
+	case *AwaitExpr:
+		WalkExprs(v.Body, fn)
+	case *ForStmt:
+		walkExpr(v.Collection, fn)
+		WalkExprs(v.Body, fn)
 	}
 }

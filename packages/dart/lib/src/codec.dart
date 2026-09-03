@@ -84,6 +84,13 @@ class LuxoEncoder {
     _pos += v.length;
   }
 
+  /// Writes raw bytes without a length prefix.
+  void writeRawBytes(Uint8List v) {
+    _ensureCapacity(v.length);
+    _buf.setRange(_pos, _pos + v.length, v);
+    _pos += v.length;
+  }
+
   /// Writes a fixed 16-byte UUID (no length prefix) from a canonical
   /// "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" string.
   void writeUuid(String v) {
@@ -187,6 +194,15 @@ class LuxoEncoder {
     writeVarint(v.length);
     for (final e in v) {
       writeUuid(e);
+    }
+  }
+
+  /// Writes field header + count-prefixed byte arrays.
+  void writeFieldBytesArray(int fieldID, List<Uint8List> v) {
+    writeVarint(fieldID);
+    writeVarint(v.length);
+    for (final e in v) {
+      writeBytes(e);
     }
   }
 
@@ -298,7 +314,10 @@ class LuxoDecoder {
   /// Reads a boolean (varint 0 or 1).
   bool readBool() {
     final v = _readVarint();
-    return v != 0;
+    if (v == 0) return false;
+    if (v == 1) return true;
+    if (error == null) error = 'invalid bool marker at offset ${_off - 1}';
+    return false;
   }
 
   /// Reads length-prefixed raw bytes. Returns a view into the input buffer.
@@ -495,7 +514,12 @@ class LuxoDecoder {
       error = 'invalid nullable at offset $_off';
       return false;
     }
-    return _bytes[_off++] != 0;
+    final markerOffset = _off;
+    final marker = _bytes[_off++];
+    if (marker == 0x00) return false;
+    if (marker == 0x01) return true;
+    error = 'invalid nullable marker at offset $markerOffset';
+    return false;
   }
 
   /// Read a nullable nested model using a decoder function.
@@ -516,6 +540,7 @@ class LuxoDecoder {
 /// Columnar format:
 /// ```
 /// [count varint]
+/// [arena size varint]
 /// [fieldID varint][val0][val1]...[valN]  // column 1
 /// [fieldID varint][val0][val1]...[valN]  // column 2
 /// ...
@@ -529,21 +554,31 @@ class ColumnarDecoder {
   /// Number of rows in this columnar batch.
   int count;
 
+  /// Total UTF-8 string bytes advertised by the server for arena allocation.
+  int arenaSize;
+
   /// The current column's field ID after calling [nextColumn].
   int fieldID = 0;
+
+  /// Any decoding error encountered.
+  String? error;
 
   /// Creates a columnar decoder from raw bytes. Reads the row count varint.
   ColumnarDecoder(Uint8List data)
       : _data = ByteData.sublistView(data),
         _bytes = data,
         _off = 0,
-        count = 0 {
+        count = 0,
+        arenaSize = 0 {
     final raw = _readVarint();
     count = raw < 0 ? 0 : raw;
+    final arena = _readVarint();
+    arenaSize = arena < 0 ? 0 : arena;
   }
 
   /// Advances to the next column. Returns false at end marker (0x00) or EOF.
   bool nextColumn() {
+    if (error != null) return false;
     if (_off >= _data.lengthInBytes) return false;
     final id = _readVarint();
     if (id < 0) return false;
@@ -577,8 +612,7 @@ class ColumnarDecoder {
   List<String?> readColumnDateTimePtr() {
     final result = List<String?>.filled(count, null);
     for (var i = 0; i < count; i++) {
-      if (_off >= _data.lengthInBytes) break;
-      if (_bytes[_off++] == 0x00) continue;
+      if (!_readCanonicalMarker('nullable')) continue;
       result[i] = dateTimeStringFromUnixSeconds(_readSvarint());
     }
     return result;
@@ -615,10 +649,7 @@ class ColumnarDecoder {
   List<bool> readColumnBool() {
     final result = List<bool>.filled(count, false);
     for (var i = 0; i < count; i++) {
-      if (_off >= _data.lengthInBytes) break;
-      final v = _readVarint();
-      if (v < 0) break; // truncated
-      result[i] = v != 0;
+      result[i] = _readCanonicalMarker('bool');
     }
     return result;
   }
@@ -627,8 +658,7 @@ class ColumnarDecoder {
   List<int?> readColumnIntPtr() {
     final result = List<int?>.filled(count, null);
     for (var i = 0; i < count; i++) {
-      if (_off >= _data.lengthInBytes) break;
-      if (_bytes[_off++] == 0x00) continue;
+      if (!_readCanonicalMarker('nullable')) continue;
       result[i] = _readSvarint();
     }
     return result;
@@ -638,8 +668,7 @@ class ColumnarDecoder {
   List<double?> readColumnFloatPtr() {
     final result = List<double?>.filled(count, null);
     for (var i = 0; i < count; i++) {
-      if (_off >= _data.lengthInBytes) break;
-      if (_bytes[_off++] == 0x00) continue;
+      if (!_readCanonicalMarker('nullable')) continue;
       if (_off + 8 > _data.lengthInBytes) break;
       result[i] = _data.getFloat64(_off, Endian.little);
       _off += 8;
@@ -651,8 +680,7 @@ class ColumnarDecoder {
   List<String?> readColumnStringPtr() {
     final result = List<String?>.filled(count, null);
     for (var i = 0; i < count; i++) {
-      if (_off >= _data.lengthInBytes) break;
-      if (_bytes[_off++] == 0x00) continue;
+      if (!_readCanonicalMarker('nullable')) continue;
       final len = _readVarint();
       if (len <= 0) {
         result[i] = '';
@@ -669,9 +697,8 @@ class ColumnarDecoder {
   List<bool?> readColumnBoolPtr() {
     final result = List<bool?>.filled(count, null);
     for (var i = 0; i < count; i++) {
-      if (_off >= _data.lengthInBytes) break;
-      if (_bytes[_off++] == 0x00) continue;
-      result[i] = _readVarint() != 0;
+      if (!_readCanonicalMarker('nullable')) continue;
+      result[i] = _readCanonicalMarker('bool');
     }
     return result;
   }
@@ -691,8 +718,7 @@ class ColumnarDecoder {
   List<String?> readColumnUuidPtr() {
     final result = List<String?>.filled(count, null);
     for (var i = 0; i < count; i++) {
-      if (_off >= _data.lengthInBytes) break;
-      if (_bytes[_off++] == 0x00) continue;
+      if (!_readCanonicalMarker('nullable')) continue;
       if (_off + 16 > _data.lengthInBytes) break;
       result[i] = formatUuid(_bytes, _off);
       _off += 16;
@@ -708,6 +734,19 @@ class ColumnarDecoder {
   List<Uint8List> readColumnBytes() {
     final result = List<Uint8List>.filled(count, _emptyBytes, growable: false);
     for (var i = 0; i < count; i++) {
+      final len = _readVarint();
+      if (len < 0 || _off + len > _data.lengthInBytes) break;
+      result[i] = Uint8List.sublistView(_bytes, _off, _off + len);
+      _off += len;
+    }
+    return result;
+  }
+
+  /// Reads [count] nullable byte blobs (0x00=null, 0x01+length+bytes).
+  List<Uint8List?> readColumnBytesPtr() {
+    final result = List<Uint8List?>.filled(count, null, growable: false);
+    for (var i = 0; i < count; i++) {
+      if (!_readCanonicalMarker('nullable')) continue;
       final len = _readVarint();
       if (len < 0 || _off + len > _data.lengthInBytes) break;
       result[i] = Uint8List.sublistView(_bytes, _off, _off + len);
@@ -742,6 +781,19 @@ class ColumnarDecoder {
     }
     return -1;
   }
+
+  bool _readCanonicalMarker(String kind) {
+    if (_off >= _data.lengthInBytes) {
+      error ??= 'truncated $kind marker at offset $_off';
+      return false;
+    }
+    final markerOffset = _off;
+    final marker = _bytes[_off++];
+    if (marker == 0x00) return false;
+    if (marker == 0x01) return true;
+    error ??= 'invalid $kind marker at offset $markerOffset';
+    return false;
+  }
 }
 
 // --- DateTime helpers ---
@@ -751,8 +803,10 @@ class ColumnarDecoder {
 /// JSON wire format uses. This keeps DateTime fields the same Dart type
 /// (String) regardless of transport mode.
 String dateTimeStringFromUnixSeconds(int seconds) =>
-    DateTime.fromMillisecondsSinceEpoch(seconds * 1000, isUtc: true)
-        .toIso8601String();
+    DateTime.fromMillisecondsSinceEpoch(
+      seconds * 1000,
+      isUtc: true,
+    ).toIso8601String();
 
 // --- UUID helpers ---
 
@@ -815,20 +869,24 @@ int _hexNibble(int c) {
 
 /// Sets a bit in the field mask for the given fieldID. Returns the (possibly grown) mask.
 Uint8List fieldMaskSet(Uint8List mask, int fieldID) {
-  final byteIndex = fieldID >> 3; // fieldID / 8
+  if (fieldID <= 0) return mask;
+  final bit = fieldID - 1;
+  final byteIndex = bit >> 3;
   if (byteIndex >= mask.length) {
     // Grow to fit.
     final newMask = Uint8List(byteIndex + 1);
     newMask.setRange(0, mask.length, mask);
     mask = newMask;
   }
-  mask[byteIndex] |= 1 << (fieldID & 7); // fieldID % 8
+  mask[byteIndex] |= 1 << (bit & 7);
   return mask;
 }
 
 /// Checks if a bit is set in the field mask for the given fieldID.
 bool fieldMaskHas(Uint8List mask, int fieldID) {
-  final byteIndex = fieldID >> 3;
+  if (fieldID <= 0) return false;
+  final bit = fieldID - 1;
+  final byteIndex = bit >> 3;
   if (byteIndex >= mask.length) return false;
-  return (mask[byteIndex] & (1 << (fieldID & 7))) != 0;
+  return (mask[byteIndex] & (1 << (bit & 7))) != 0;
 }

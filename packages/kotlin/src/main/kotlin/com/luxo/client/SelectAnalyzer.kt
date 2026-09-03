@@ -1,305 +1,303 @@
 package com.luxo.client
 
 import java.io.File
+import kotlinx.serialization.json.Json
+import org.jetbrains.kotlin.cli.common.messages.MessageCollector
+import org.jetbrains.kotlin.cli.jvm.compiler.EnvironmentConfigFiles
+import org.jetbrains.kotlin.cli.jvm.compiler.KotlinCoreEnvironment
+import org.jetbrains.kotlin.com.intellij.openapi.util.Disposer
+import org.jetbrains.kotlin.com.intellij.psi.PsiElement
+import org.jetbrains.kotlin.com.intellij.psi.PsiErrorElement
+import org.jetbrains.kotlin.com.intellij.psi.util.PsiTreeUtil
+import org.jetbrains.kotlin.config.CommonConfigurationKeys
+import org.jetbrains.kotlin.config.CompilerConfiguration
+import org.jetbrains.kotlin.psi.KtBlockExpression
+import org.jetbrains.kotlin.psi.KtCallExpression
+import org.jetbrains.kotlin.psi.KtExpression
+import org.jetbrains.kotlin.psi.KtFile
+import org.jetbrains.kotlin.psi.KtLambdaExpression
+import org.jetbrains.kotlin.psi.KtNameReferenceExpression
+import org.jetbrains.kotlin.psi.KtNamedFunction
+import org.jetbrains.kotlin.psi.KtParenthesizedExpression
+import org.jetbrains.kotlin.psi.KtProperty
+import org.jetbrains.kotlin.psi.KtPsiFactory
+import org.jetbrains.kotlin.psi.KtQualifiedExpression
+import org.jetbrains.kotlin.psi.psiUtil.collectDescendantsOfType
 
 /**
- * Static field-access analyzer for Kotlin source code.
- * Scans .kt files for property access patterns on generated model types,
- * and produces SelectHints.kt with $select strings per API call site.
+ * Kotlin syntax-tree field analyzer.
  *
- * This is a lightweight regex-based approach (no compiler plugin required).
- * It covers the common pattern: `val user = client.getUser(1); user.name; user.email`
- *
- * Nested field tracking:
- * - Tracks `user.posts.map { it.title }` → generates `"name, posts { title }"`
- * - Uses schema if available for type-aware recursion
- * - Falls back to heuristic: var.field.subfield pattern emits nested select
+ * API names, return types, and nested field types always come from the Luxo
+ * schema. Source text is parsed with the Kotlin compiler, so comments, string
+ * literals, multiline calls, and lexical shadowing cannot create false hints.
  */
 object SelectAnalyzer {
+    fun analyze(srcDir: String, outFile: String, packageName: String, schema: LuxoSchema) {
+        val root = File(srcDir)
+        val sources = root.walkTopDown()
+            .filter { it.isFile && it.extension == "kt" }
+            .filterNot { it.hasExcludedPathSegment(root) }
+            .map { it.readText() }
+        writeHints(outFile, packageName, analyzeSources(sources, schema))
+    }
 
-    /** Analyze source files and generate SelectHints.kt */
-    fun analyze(srcDir: String, outFile: String, packageName: String, schema: LuxoSchema? = null) {
-        val sourceFiles = File(srcDir).walkTopDown()
-            .filter { it.extension == "kt" }
-            .filter { !it.path.contains("generated") && !it.path.contains("test") }
-            .toList()
-
-        // Step 1: find all API call sites and their result variable names
-        // Pattern: val <var> = <client>.getUser(...) / client.listPosts(...)
-        val callPattern = Regex("""val\s+(\w+)\s*=\s*\w+\.(get\w+|list\w+|create\w+|update\w+)\(""")
-
-        // Step 2: for each variable, find field accesses
-        val hints = mutableMapOf<String, MutableSet<String>>()
-
-        // Build model field type map from schema for nested resolution
-        val fieldTypeMap = buildFieldTypeMap(schema)
-
-        for (file in sourceFiles) {
-            val content = file.readText()
-            val lines = content.lines()
-
-            // Find call sites
-            val vars = mutableMapOf<String, String>() // varName -> apiName
-            for (line in lines) {
-                val match = callPattern.find(line) ?: continue
-                val varName = match.groupValues[1]
-                val apiName = match.groupValues[2]
-                vars[varName] = apiName
+    internal fun analyzeSources(sources: Sequence<String>, schema: LuxoSchema): Map<String, String> {
+        if (schema.apis.isEmpty()) return emptyMap()
+        val trees = mutableMapOf<String, SelectionNode>()
+        KotlinSyntaxParser().use { parser ->
+            sources.forEachIndexed { index, source ->
+                val file = parser.parse("LuxoSource$index.kt", source)
+                requireValidSyntax(file)
+                analyzeFile(file, schema, trees)
             }
+        }
+        return trees.mapValues { (_, tree) -> renderSelection(tree.children) }.toSortedMap()
+    }
 
-            // Find field accesses for tracked variables (including nested)
-            for ((varName, apiName) in vars) {
-                val fieldTree = mutableMapOf<String, NestedFields>()
-                collectFieldAccesses(content, varName, fieldTree, fieldTypeMap, schema, apiName)
-                val selectStr = buildSelectString(fieldTree)
-                if (selectStr.isNotEmpty()) {
-                    hints.getOrPut(apiName) { mutableSetOf() }.addAll(selectStr.split(", "))
+    private fun analyzeFile(file: KtFile, schema: LuxoSchema, trees: MutableMap<String, SelectionNode>) {
+        for (call in file.collectDescendantsOfType<KtCallExpression>()) {
+            val apiName = call.calleeExpression?.text ?: continue
+            val api = schema.apis[apiName] ?: continue
+            val typeName = api.returnType ?: continue
+            if (!schema.isStructured(typeName)) continue
+
+            val tree = trees.getOrPut(apiName) { SelectionNode() }
+            val binding = SelectionBinding(typeName, tree, api.returnList, api.paginated)
+            val callValue = qualifiedCallValue(call)
+            followSelection(callValue, binding, schema)
+            analyzeAssignedProperty(callValue, binding, schema)
+        }
+    }
+
+    private fun analyzeAssignedProperty(
+        callValue: KtExpression,
+        binding: SelectionBinding,
+        schema: LuxoSchema,
+    ) {
+        val property = callValue.parent as? KtProperty ?: return
+        if (unwrap(property.initializer) !== callValue) return
+        val name = property.name ?: return
+        val scope = property.parent ?: return
+        val references = scope.collectDescendantsOfType<KtNameReferenceExpression>()
+        for (reference in references) {
+            if (reference.getReferencedName() != name) continue
+            if (reference.textRange.startOffset < property.textRange.endOffset) continue
+            if (visibleProperty(reference, name) !== property) continue
+            followSelection(reference, binding, schema)
+        }
+    }
+
+    private fun followSelection(expression: KtExpression, binding: SelectionBinding, schema: LuxoSchema) {
+        val qualified = expression.parent as? KtQualifiedExpression ?: return
+        if (qualified.receiverExpression !== expression) return
+        when (val selector = qualified.selectorExpression) {
+            is KtNameReferenceExpression -> followField(qualified, selector, binding, schema)
+            is KtCallExpression -> followCall(qualified, selector, binding, schema)
+        }
+    }
+
+    private fun followField(
+        qualified: KtQualifiedExpression,
+        fieldReference: KtNameReferenceExpression,
+        binding: SelectionBinding,
+        schema: LuxoSchema,
+    ) {
+        val fieldName = fieldReference.getReferencedName()
+        if (binding.paginated) {
+            if (fieldName == "items") {
+                followSelection(qualified, binding.copy(isList = true, paginated = false), schema)
+            }
+            return
+        }
+
+        val field = schema.field(binding.typeName, fieldName) ?: return
+        val node = binding.node.children.getOrPut(fieldName) { SelectionNode() }
+        val childType = field.typeName ?: field.type
+        followSelection(qualified, SelectionBinding(childType, node, field.isList, false), schema)
+    }
+
+    private fun followCall(
+        qualified: KtQualifiedExpression,
+        call: KtCallExpression,
+        binding: SelectionBinding,
+        schema: LuxoSchema,
+    ) {
+        when (call.calleeExpression?.text) {
+            in collectionLambdaMethods -> {
+                analyzeLambda(call, binding.copy(isList = false, paginated = false), schema)
+                followSelection(qualified, binding, schema)
+            }
+            in objectLambdaMethods -> {
+                analyzeLambda(call, binding.copy(paginated = false), schema)
+                followSelection(qualified, binding, schema)
+            }
+            in collectionElementMethods -> {
+                if (binding.isList) {
+                    followSelection(qualified, binding.copy(isList = false), schema)
                 }
             }
-
-            // Also scan for lambda field access: .map { it.name } / .forEach { item -> item.name }
-            scanLambdaAccess(content, hints, fieldTypeMap, schema)
         }
+    }
 
-        // Generate SelectHints.kt
-        val sb = StringBuilder()
-        sb.appendLine("// Auto-generated by luxo SelectAnalyzer. DO NOT EDIT.\n")
-        sb.appendLine("package $packageName\n")
-        sb.appendLine("/** Compile-time \$select hints per API — auto-injected by LuxoClient. */")
-        sb.appendLine("object SelectHints {")
-        sb.appendLine("    val hints: Map<String, String> = mapOf(")
-        for ((api, fields) in hints.toSortedMap()) {
-            val select = mergeFieldsToSelect(fields)
-            sb.appendLine("        \"$api\" to \"$select\",")
+    private fun analyzeLambda(call: KtCallExpression, binding: SelectionBinding, schema: LuxoSchema) {
+        val lambda = call.lambdaArguments.firstOrNull()?.getLambdaExpression()
+            ?: call.valueArguments.lastOrNull()?.getArgumentExpression() as? KtLambdaExpression
+            ?: return
+        val parameter = lambda.valueParameters.singleOrNull()?.name ?: "it"
+        val body = lambda.bodyExpression ?: return
+        for (reference in body.collectDescendantsOfType<KtNameReferenceExpression>()) {
+            if (reference.getReferencedName() != parameter) continue
+            if (!belongsToLambda(reference, lambda, parameter)) continue
+            followSelection(reference, binding, schema)
         }
-        sb.appendLine("    )")
-        sb.appendLine("}")
+    }
 
-        val outDir = File(outFile).parentFile
-        if (outDir != null && !outDir.exists()) outDir.mkdirs()
-        File(outFile).writeText(sb.toString())
+    private fun belongsToLambda(
+        reference: KtNameReferenceExpression,
+        target: KtLambdaExpression,
+        parameter: String,
+    ): Boolean {
+        var current: PsiElement? = reference.parent
+        while (current != null) {
+            if (current is KtLambdaExpression && current.bindsParameter(parameter)) {
+                return current === target
+            }
+            current = current.parent
+        }
+        return false
+    }
+
+    private fun visibleProperty(reference: KtNameReferenceExpression, name: String): KtProperty? {
+        var current: PsiElement? = reference.parent
+        while (current != null) {
+            if (current is KtLambdaExpression && current.bindsParameter(name)) return null
+            if (current is KtNamedFunction && current.valueParameters.any { it.name == name }) return null
+            val declaration = precedingProperty(current, reference, name)
+            if (declaration != null) return declaration
+            current = current.parent
+        }
+        return null
+    }
+
+    private fun precedingProperty(
+        scope: PsiElement,
+        reference: KtNameReferenceExpression,
+        name: String,
+    ): KtProperty? {
+        val properties = when (scope) {
+            is KtBlockExpression -> scope.statements.filterIsInstance<KtProperty>()
+            is KtFile -> scope.declarations.filterIsInstance<KtProperty>()
+            else -> return null
+        }
+        return properties
+            .asSequence()
+            .filter { it.name == name && it.textRange.endOffset <= reference.textRange.startOffset }
+            .maxByOrNull { it.textRange.startOffset }
+    }
+
+    private fun requireValidSyntax(file: KtFile) {
+        val errors = PsiTreeUtil.collectElementsOfType(file, PsiErrorElement::class.java)
+        require(errors.isEmpty()) {
+            val first = errors.first()
+            "invalid Kotlin source at offset ${first.textOffset}: ${first.errorDescription}"
+        }
+    }
+
+    private fun writeHints(outFile: String, packageName: String, hints: Map<String, String>) {
+        val target = File(outFile)
+        target.parentFile?.mkdirs()
+        target.writeText(LuxoCodegen.genSelectHints(packageName, hints))
         println("[luxo] SelectHints -> $outFile (${hints.size} APIs analyzed)")
     }
-
-    /**
-     * Collect field accesses for a variable, including nested paths.
-     * Populates fieldTree with entries like:
-     *   "name" -> NestedFields(children=empty)
-     *   "posts" -> NestedFields(children={"title" -> ..., "content" -> ...})
-     */
-    private fun collectFieldAccesses(
-        content: String,
-        varName: String,
-        fieldTree: MutableMap<String, NestedFields>,
-        fieldTypeMap: Map<String, Map<String, String>>,
-        schema: LuxoSchema?,
-        apiName: String,
-    ) {
-        val lines = content.lines()
-
-        // Match direct field access: varName.field
-        val fieldPattern = Regex("""\b${Regex.escape(varName)}\.(\w+)""")
-
-        // Match chained access: varName.field.subfield or varName.field.map { it.sub }
-        val chainedPattern = Regex("""\b${Regex.escape(varName)}\.(\w+)\.(\w+)""")
-
-        // Match nested lambda: varName.field.map { it.subfield }
-        val nestedLambdaPattern = Regex("""\b${Regex.escape(varName)}\.(\w+)\.\w+\s*\{\s*(?:(\w+)\s*->)?\s*(?:\2|it)\.(\w+)""")
-
-        for (line in lines) {
-            // Check for nested lambda access: var.field.map { it.sub }
-            for (match in nestedLambdaPattern.findAll(line)) {
-                val parentField = match.groupValues[1]
-                val subField = match.groupValues[3]
-                if (parentField in KOTLIN_BUILTINS || subField in KOTLIN_BUILTINS) continue
-                val node = fieldTree.getOrPut(parentField) { NestedFields() }
-                node.children.getOrPut(subField) { NestedFields() }
-            }
-
-            // Check for chained access: var.field.subfield
-            for (match in chainedPattern.findAll(line)) {
-                val parentField = match.groupValues[1]
-                val subField = match.groupValues[2]
-                if (parentField in KOTLIN_BUILTINS) continue
-                if (subField in KOTLIN_BUILTINS) {
-                    // Parent accessed but subfield is a builtin method — just record parent
-                    fieldTree.getOrPut(parentField) { NestedFields() }
-                    continue
-                }
-                // Determine if parent field is a model type (nested)
-                val isNested = isNestedField(parentField, apiName, schema, fieldTypeMap)
-                if (isNested) {
-                    val node = fieldTree.getOrPut(parentField) { NestedFields() }
-                    node.children.getOrPut(subField) { NestedFields() }
-                } else {
-                    // Not a nested model — treat both as flat fields
-                    fieldTree.getOrPut(parentField) { NestedFields() }
-                }
-            }
-
-            // Direct flat field access
-            for (match in fieldPattern.findAll(line)) {
-                val field = match.groupValues[1]
-                if (field in KOTLIN_BUILTINS) continue
-                fieldTree.getOrPut(field) { NestedFields() }
-            }
-        }
-    }
-
-    /** Check if a field on the return type of an API is a nested model (relation). */
-    private fun isNestedField(
-        fieldName: String,
-        apiName: String,
-        schema: LuxoSchema?,
-        fieldTypeMap: Map<String, Map<String, String>>,
-    ): Boolean {
-        if (schema == null) return false
-        // Infer model name from API name
-        val modelName = inferModelName(apiName)
-        val fieldTypes = fieldTypeMap[modelName] ?: return false
-        val fieldType = fieldTypes[fieldName] ?: return false
-        // If the field type refers to another model, it's nested
-        return schema.models.containsKey(fieldType)
-    }
-
-    /** Infer model name from API name (getUser -> User, listPosts -> Post) */
-    private fun inferModelName(apiName: String): String {
-        val name = when {
-            apiName.startsWith("get") -> apiName.removePrefix("get")
-            apiName.startsWith("list") -> apiName.removePrefix("list").removeSuffix("s")
-            apiName.startsWith("create") -> apiName.removePrefix("create")
-            apiName.startsWith("update") -> apiName.removePrefix("update")
-            else -> apiName
-        }
-        return name
-    }
-
-    /** Build a map: ModelName -> (fieldName -> fieldTypeName) from schema */
-    private fun buildFieldTypeMap(schema: LuxoSchema?): Map<String, Map<String, String>> {
-        if (schema == null) return emptyMap()
-        val result = mutableMapOf<String, Map<String, String>>()
-        for ((name, model) in schema.models) {
-            val fields = mutableMapOf<String, String>()
-            for (f in model.fields) {
-                fields[f.name] = f.typeName ?: f.type
-            }
-            result[name] = fields
-        }
-        return result
-    }
-
-    /** Build select string from field tree, e.g. "name, posts { title, content }" */
-    private fun buildSelectString(fieldTree: Map<String, NestedFields>): String {
-        val parts = mutableListOf<String>()
-        for ((field, node) in fieldTree.toSortedMap()) {
-            if (node.children.isEmpty()) {
-                parts.add(field)
-            } else {
-                val nested = node.children.keys.sorted().joinToString(", ")
-                parts.add("$field { $nested }")
-            }
-        }
-        return parts.joinToString(", ")
-    }
-
-    /**
-     * Merge a set of field strings (which may include nested selects like "posts { title }")
-     * into a single merged select string.
-     */
-    internal fun mergeFieldsToSelect(fields: Set<String>): String {
-        // Parse nested fields and merge
-        val tree = mutableMapOf<String, MutableSet<String>>()
-        val flatFields = mutableSetOf<String>()
-
-        for (field in fields) {
-            val nestedMatch = Regex("""(\w+)\s*\{\s*(.+)\s*}""").find(field)
-            if (nestedMatch != null) {
-                val parent = nestedMatch.groupValues[1]
-                val children = nestedMatch.groupValues[2].split(",").map { it.trim() }
-                tree.getOrPut(parent) { mutableSetOf() }.addAll(children)
-            } else {
-                flatFields.add(field.trim())
-            }
-        }
-
-        val parts = mutableListOf<String>()
-        for (f in flatFields.sorted()) {
-            if (f in tree) continue // Will be rendered as nested
-            parts.add(f)
-        }
-        for ((parent, children) in tree.toSortedMap()) {
-            val nested = children.sorted().joinToString(", ")
-            parts.add("$parent { $nested }")
-        }
-        return parts.joinToString(", ")
-    }
-
-    /** Scan lambda patterns: .map { it.field } or .forEach { item -> item.field } */
-    private fun scanLambdaAccess(
-        content: String,
-        hints: MutableMap<String, MutableSet<String>>,
-        fieldTypeMap: Map<String, Map<String, String>>,
-        schema: LuxoSchema?,
-    ) {
-        // Pattern: client.listXxx(...).map { it.fieldName }
-        val listLambda = Regex("""(list\w+)\([^)]*\)[^{]*\{[^}]*\bit\.(\w+)""")
-        for (match in listLambda.findAll(content)) {
-            val api = match.groupValues[1]
-            val field = match.groupValues[2]
-            if (field !in KOTLIN_BUILTINS) {
-                hints.getOrPut(api) { mutableSetOf() }.add(field)
-            }
-        }
-
-        // Nested lambda: client.listXxx(...).map { it.field.subfield } or
-        // client.listXxx(...).map { it.field.map { it.sub } }
-        val nestedListLambda = Regex("""(list\w+)\([^)]*\)[^{]*\{[^}]*\bit\.(\w+)\.(\w+)""")
-        for (match in nestedListLambda.findAll(content)) {
-            val api = match.groupValues[1]
-            val parentField = match.groupValues[2]
-            val subField = match.groupValues[3]
-            if (parentField in KOTLIN_BUILTINS || subField in KOTLIN_BUILTINS) continue
-
-            val isNested = isNestedField(parentField, api, schema, fieldTypeMap)
-            if (isNested) {
-                hints.getOrPut(api) { mutableSetOf() }.add("$parentField { $subField }")
-            } else {
-                hints.getOrPut(api) { mutableSetOf() }.add(parentField)
-            }
-        }
-
-        // Deeper nested: client.listXxx(...).flatMap { it.field }.map { it.sub }
-        val deepLambda = Regex("""(list\w+)\([^)]*\)[^{]*\{[^}]*\bit\.(\w+)\s*}[^{]*\{[^}]*\bit\.(\w+)""")
-        for (match in deepLambda.findAll(content)) {
-            val api = match.groupValues[1]
-            val parentField = match.groupValues[2]
-            val subField = match.groupValues[3]
-            if (parentField in KOTLIN_BUILTINS || subField in KOTLIN_BUILTINS) continue
-            hints.getOrPut(api) { mutableSetOf() }.add("$parentField { $subField }")
-        }
-    }
-
 }
 
-/** Internal tree node for tracking nested field accesses. */
-internal class NestedFields {
-    val children: MutableMap<String, NestedFields> = mutableMapOf()
+@OptIn(org.jetbrains.kotlin.K1Deprecation::class, CompilerConfiguration.Internals::class)
+private class KotlinSyntaxParser : AutoCloseable {
+    private val disposable = Disposer.newDisposable("luxo-select-analyzer")
+    private val environment: KotlinCoreEnvironment
+
+    init {
+        val configuration = CompilerConfiguration().apply {
+            put(CommonConfigurationKeys.MODULE_NAME, "luxo-select-analyzer")
+            put(CommonConfigurationKeys.MESSAGE_COLLECTOR_KEY, MessageCollector.NONE)
+        }
+        environment = KotlinCoreEnvironment.createForProduction(
+            disposable,
+            configuration,
+            EnvironmentConfigFiles.JVM_CONFIG_FILES,
+        )
+    }
+
+    fun parse(fileName: String, source: String): KtFile =
+        KtPsiFactory(environment.project, false).createFile(fileName, source)
+
+    override fun close() {
+        Disposer.dispose(disposable)
+    }
 }
 
-/** CLI entry point for gradle JavaExec task. */
+private data class SelectionBinding(
+    val typeName: String,
+    val node: SelectionNode,
+    val isList: Boolean,
+    val paginated: Boolean,
+)
+
+private class SelectionNode {
+    val children: MutableMap<String, SelectionNode> = mutableMapOf()
+}
+
+private fun LuxoSchema.isStructured(typeName: String): Boolean =
+    models.containsKey(typeName) || types.containsKey(typeName)
+
+private fun LuxoSchema.field(typeName: String, fieldName: String): LuxoField? {
+    val fields = models[typeName]?.fields ?: types[typeName]?.fields ?: return null
+    return fields.firstOrNull { it.name == fieldName }
+}
+
+private fun KtLambdaExpression.bindsParameter(name: String): Boolean =
+    if (valueParameters.isEmpty()) name == "it" else valueParameters.any { it.name == name }
+
+private fun File.hasExcludedPathSegment(root: File): Boolean {
+    val relative = relativeToOrNull(root)?.invariantSeparatorsPath ?: return true
+    return relative.split('/').any { it == "generated" || it == "test" }
+}
+
+private fun qualifiedCallValue(call: KtCallExpression): KtExpression {
+    val parent = call.parent
+    return if (parent is KtQualifiedExpression && parent.selectorExpression === call) parent else call
+}
+
+private fun unwrap(expression: KtExpression?): KtExpression? {
+    var current = expression
+    while (current is KtParenthesizedExpression) current = current.expression
+    return current
+}
+
+private fun renderSelection(fields: Map<String, SelectionNode>): String =
+    fields.toSortedMap().entries.joinToString(", ") { (name, node) ->
+        if (node.children.isEmpty()) name else "$name { ${renderSelection(node.children)} }"
+    }
+
+private val collectionLambdaMethods = setOf(
+    "all", "any", "associate", "associateBy", "count", "filter", "filterNot",
+    "flatMap", "forEach", "groupBy", "map", "mapNotNull", "none", "onEach",
+    "sortedBy", "sortedByDescending",
+)
+
+private val objectLambdaMethods = setOf("also", "apply", "let", "run", "takeIf", "takeUnless")
+private val collectionElementMethods = setOf("elementAt", "first", "firstOrNull", "last", "lastOrNull", "single", "singleOrNull")
+
+/** CLI entry point for the Gradle JavaExec task. */
 object SelectAnalyzerCli {
     @JvmStatic
     fun main(args: Array<String>) {
-        require(args.size >= 3) { "Usage: SelectAnalyzerCli <srcDir> <outFile> <package>" }
-        SelectAnalyzer.analyze(args[0], args[1], args[2])
+        require(args.size >= 4) { "Usage: SelectAnalyzerCli <srcDir> <outFile> <package> <schemaFile>" }
+        val schemaFile = File(args[3])
+        require(schemaFile.isFile) {
+            "schema file not found: ${schemaFile.path}; run luxoGenerate first or set -Pluxo.schemaFile"
+        }
+        val schema = Json.decodeFromString<LuxoSchema>(schemaFile.readText())
+        SelectAnalyzer.analyze(args[0], args[1], args[2], schema)
     }
 }
-
-private val KOTLIN_BUILTINS = setOf(
-        "toString", "hashCode", "equals", "copy", "component1", "component2",
-        "component3", "component4", "component5", "let", "also", "apply",
-        "run", "takeIf", "takeUnless", "toInt", "toLong", "toDouble",
-        "toFloat", "toBoolean", "length", "size", "isEmpty", "isNotEmpty",
-        "first", "last", "map", "filter", "forEach", "flatMap", "any",
-        "all", "none", "count", "sortedBy", "groupBy", "associate",
-    )

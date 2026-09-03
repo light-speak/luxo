@@ -256,9 +256,7 @@ api test(): String {
   user.name
 }
 `)
-	// find returns User? but we're accessing .name without ?.
-	// For now this should pass since find's return type isn't fully resolved yet
-	// TODO: stricter null safety checks
+	// find returns a non-null User because a missing record raises NotFound.
 	if len(result.Errors) > 0 {
 		// filter out expected errors
 		for _, err := range result.Errors {
@@ -282,12 +280,6 @@ api test(): String {
 }
 `)
 	// User is non-nullable, so ?. should produce a warning.
-	// Note: User{} object literal returns the User type from checkExpr,
-	// so the safe call warning should be triggered.
-	// If the analyzer does not resolve object expr to a type, skip.
-	if len(result.Warnings) == 0 {
-		t.Skip("TODO: object expression type inference not yet supported; safe call warning requires known non-null type")
-	}
 	expectWarning(t, result, "unnecessary safe call")
 }
 
@@ -582,6 +574,93 @@ func TestForStmtWithListCollection(t *testing.T) {
 	}
 }
 
+func TestListAndForExpressionTypeInference(t *testing.T) {
+	result := analyze(t, `
+api transform(items: [Int]): [Int] {
+  val literal = [1, 2, 3]
+  val mapped = for item in items { item * 2 }
+  mapped
+}
+`)
+	expectNoErrors(t, result)
+
+	body := result.Files[0].APIs[0].Body
+	literal := body.Stmts[0].(*ast.ValStmt).Value
+	if literal.GetTypeTag() != "Int" || !literal.IsListType() {
+		t.Fatalf("list literal type = %s list=%v, want [Int]", literal.GetTypeTag(), literal.IsListType())
+	}
+	mapped := body.Stmts[1].(*ast.ValStmt).Value
+	if mapped.GetTypeTag() != "Int" || !mapped.IsListType() || mapped.IsNullable() {
+		t.Fatalf("mapped for type = %s list=%v nullable=%v, want [Int]", mapped.GetTypeTag(), mapped.IsListType(), mapped.IsNullable())
+	}
+}
+
+func TestYieldForExpressionInfersNullableElementType(t *testing.T) {
+	result := analyze(t, `
+api findPositive(items: [Int]): Int? {
+  val found = for item in items {
+    if item > 0 { yield item }
+  }
+  found
+}
+`)
+	expectNoErrors(t, result)
+
+	forExpr := result.Files[0].APIs[0].Body.Stmts[0].(*ast.ValStmt).Value
+	if forExpr.GetTypeTag() != "Int" || forExpr.IsListType() || !forExpr.IsNullable() {
+		t.Fatalf("yield for type = %s list=%v nullable=%v, want Int?", forExpr.GetTypeTag(), forExpr.IsListType(), forExpr.IsNullable())
+	}
+}
+
+func TestListLiteralRejectsMixedElementTypes(t *testing.T) {
+	result := analyze(t, `
+api invalid(): [Int] {
+  val values = [1, "two"]
+  values
+}
+`)
+	expectError(t, result, "list element type mismatch")
+}
+
+func TestTypedEmptyListUsesDeclaredType(t *testing.T) {
+	result := analyze(t, `
+api empty(): [String] {
+  val values: [String] = []
+  values
+}
+`)
+	expectNoErrors(t, result)
+
+	value := result.Files[0].APIs[0].Body.Stmts[0].(*ast.ValStmt).Value
+	if value.GetTypeTag() != "String" || !value.IsListType() {
+		t.Fatalf("typed empty list = %s list=%v, want [String]", value.GetTypeTag(), value.IsListType())
+	}
+}
+
+func TestLoadUsesDeclaredPrimaryKeyFieldType(t *testing.T) {
+	result := analyze(t, `
+model Product {
+  sku: String @id
+  name: String
+}
+api invalid(): Product? {
+  Product.load(42)
+}
+`)
+	expectError(t, result, "load key expects 'String', got 'Int'")
+}
+
+func TestPrimaryKeyRequiresStableScalarType(t *testing.T) {
+	for _, source := range []string{
+		`model Product { sku: String? @id }`,
+		`model Product { sku: [String] @id }`,
+		`model Product { ratio: Float @id }`,
+	} {
+		result := analyze(t, source)
+		expectError(t, result, "@id field")
+	}
+}
+
 func TestIfStmtScoping(t *testing.T) {
 	result := analyze(t, `
 api test(): Int {
@@ -790,6 +869,140 @@ api test(): ObjResult {
 }
 `)
 	expectNoErrors(t, result)
+}
+
+func TestObjectExprUnknownType(t *testing.T) {
+	result := analyze(t, `
+api test(): String {
+  MissingResult { value: "hello" }
+  "done"
+}
+`)
+	expectError(t, result, "unknown type 'MissingResult'")
+}
+
+func TestObjectExprRejectsUnknownField(t *testing.T) {
+	result := analyze(t, `
+type ObjResult { value: String }
+api test(): ObjResult {
+  ObjResult { value: "hello", extra: 1 }
+}
+`)
+	expectError(t, result, "has no field 'extra'")
+}
+
+func TestObjectExprRejectsDuplicateField(t *testing.T) {
+	result := analyze(t, `
+type ObjResult { value: String }
+api test(): ObjResult {
+  ObjResult { value: "hello", value: "again" }
+}
+`)
+	expectError(t, result, "duplicate field 'value'")
+}
+
+func TestObjectExprRejectsFieldTypeMismatch(t *testing.T) {
+	result := analyze(t, `
+type ObjResult { value: String }
+api test(): ObjResult {
+  ObjResult { value: 42 }
+}
+`)
+	expectError(t, result, "field 'value' expects 'String', got 'Int'")
+}
+
+func TestObjectExprRequiresNonNullableTypeFields(t *testing.T) {
+	result := analyze(t, `
+type ObjResult {
+  value: String
+  optional: String?
+}
+api test(): ObjResult {
+  ObjResult {}
+}
+`)
+	expectError(t, result, "missing required field 'value'")
+}
+
+func TestObjectExprChecksModuleVisibility(t *testing.T) {
+	owner := parseFileWithName(t, `model User { id: Int }`, "origin/user.luxo")
+	caller := parseFileWithName(t, `
+api test(): String {
+  User { id: 1 }
+  "done"
+}
+`, "origin/post.luxo")
+	result := New().AnalyzeWithModules([]*ast.File{owner, caller})
+	expectError(t, result, "type 'User' is from module 'user'")
+}
+
+func TestUntypedObjectExprChecksValues(t *testing.T) {
+	analyzer := New()
+	expr := &ast.ObjectExpr{Fields: []*ast.NamedArg{{
+		Name:  "value",
+		Value: &ast.Literal{Kind: token.String, Value: "ok"},
+	}}}
+	if got := analyzer.checkObjectExpr(expr, NewScope()); got != nil {
+		t.Fatalf("untyped object resolved to %v", got)
+	}
+}
+
+func TestTypeAssignability(t *testing.T) {
+	stringType := &ResolvedType{Kind: TypeString, Name: "String"}
+	intType := &ResolvedType{Kind: TypeInt, Name: "Int"}
+	base := &ResolvedType{Kind: TypeInterface, Name: "Base"}
+	child := &ResolvedType{Kind: TypeModel, Name: "Child", Parents: []*ResolvedType{base}}
+
+	tests := []struct {
+		name     string
+		expected *ResolvedType
+		actual   *ResolvedType
+		want     bool
+	}{
+		{name: "nil expected", actual: stringType, want: true},
+		{name: "nil actual", expected: stringType, want: true},
+		{name: "unresolved actual", expected: stringType, actual: &ResolvedType{Kind: TypeUnknown, Name: "Missing"}, want: true},
+		{name: "null into nullable", expected: stringType.AsNullable(), actual: &ResolvedType{Kind: TypeUnknown, Name: "null", Nullable: true}, want: true},
+		{name: "null into required", expected: stringType, actual: &ResolvedType{Kind: TypeUnknown, Name: "null", Nullable: true}},
+		{name: "unresolved expected", expected: &ResolvedType{Kind: TypeUnknown, Name: "T"}, actual: stringType, want: true},
+		{name: "nullable into required", expected: stringType, actual: stringType.AsNullable()},
+		{name: "list mismatch", expected: stringType.AsList(), actual: stringType},
+		{name: "same type", expected: stringType, actual: stringType, want: true},
+		{name: "inherited type", expected: base, actual: child, want: true},
+		{name: "unrelated type", expected: stringType, actual: intType},
+		{
+			name:     "matching generic args",
+			expected: &ResolvedType{Kind: TypeGeneric, Name: "Page", TypeArgs: []*ResolvedType{stringType}},
+			actual:   &ResolvedType{Kind: TypeGeneric, Name: "Page", TypeArgs: []*ResolvedType{stringType}},
+			want:     true,
+		},
+		{
+			name:     "generic arg count mismatch",
+			expected: &ResolvedType{Kind: TypeGeneric, Name: "Page", TypeArgs: []*ResolvedType{stringType}},
+			actual:   &ResolvedType{Kind: TypeGeneric, Name: "Page", TypeArgs: []*ResolvedType{stringType, intType}},
+		},
+		{
+			name:     "generic arg type mismatch",
+			expected: &ResolvedType{Kind: TypeGeneric, Name: "Page", TypeArgs: []*ResolvedType{stringType}},
+			actual:   &ResolvedType{Kind: TypeGeneric, Name: "Page", TypeArgs: []*ResolvedType{intType}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isTypeAssignable(tt.expected, tt.actual); got != tt.want {
+				t.Fatalf("isTypeAssignable() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	if got := formatResolvedType((&ResolvedType{Name: "String", IsList: true, Nullable: true})); got != "[String]?" {
+		t.Fatalf("formatResolvedType() = %q", got)
+	}
+	cycle := &ResolvedType{Name: "Cycle"}
+	cycle.Parents = []*ResolvedType{nil, cycle}
+	if cycle.inheritsFrom("Missing") {
+		t.Fatal("cyclic inheritance reported an unrelated parent")
+	}
 }
 
 func TestTransactionExprCheck(t *testing.T) {
@@ -1085,7 +1298,7 @@ api feed(): (Post, Video)
 func TestStreamTypeResolution(t *testing.T) {
 	result := analyze(t, `
 model Comment { text: String }
-api comments(): Comment @stream
+api comments(): Comment @stream @native
 `)
 	expectNoErrors(t, result)
 
@@ -1267,7 +1480,10 @@ api test(): String {
 func TestVarAfterCreate(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
-type AuthResult { token: String }
+type AuthResult {
+  token: String
+  user: User
+}
 api test(): AuthResult {
   val user = User.create(name: "test")
   AuthResult { token: "abc", user: user }

@@ -83,7 +83,8 @@ void main() {
       test('negative -42', () => testRoundTrip(-42));
       test('large positive', () => testRoundTrip(2147483647));
       test('large negative', () => testRoundTrip(-2147483648));
-      test('very large positive', () => testRoundTrip(9007199254740991)); // JS max safe int
+      test('very large positive',
+          () => testRoundTrip(9007199254740991)); // JS max safe int
       test('very large negative', () => testRoundTrip(-9007199254740991));
     });
 
@@ -451,6 +452,7 @@ void main() {
       final bb = BytesBuilder();
       // count = 2
       _writeVarint(bb, 2);
+      _writeVarint(bb, 10); // arena size
       // Column 1: fieldID=1, int values [42, -7]
       _writeVarint(bb, 1);
       _writeSvarint(bb, 42);
@@ -468,6 +470,7 @@ void main() {
 
       final dec = ColumnarDecoder(Uint8List.fromList(bb.toBytes()));
       expect(dec.count, equals(2));
+      expect(dec.arenaSize, equals(10));
 
       expect(dec.nextColumn(), isTrue);
       expect(dec.fieldID, equals(1));
@@ -491,6 +494,7 @@ void main() {
     test('empty list (count=0)', () {
       final bb = BytesBuilder();
       _writeVarint(bb, 0);
+      _writeVarint(bb, 0); // arena size
       bb.addByte(0x00); // end marker immediately
 
       final dec = ColumnarDecoder(Uint8List.fromList(bb.toBytes()));
@@ -502,16 +506,20 @@ void main() {
       final bb = BytesBuilder();
       // count = 3
       _writeVarint(bb, 3);
+      _writeVarint(bb, 2); // arena size
       // Column 1: fieldID=1, nullable int [null, 99, null]
       _writeVarint(bb, 1);
       bb.addByte(0x00); // null
-      bb.addByte(0x01); _writeSvarint(bb, 99); // present
+      bb.addByte(0x01);
+      _writeSvarint(bb, 99); // present
       bb.addByte(0x00); // null
       // Column 2: fieldID=2, nullable string [null, "hi", ""]
       _writeVarint(bb, 2);
       bb.addByte(0x00); // null
-      bb.addByte(0x01); _writeString(bb, 'hi'); // present
-      bb.addByte(0x01); _writeString(bb, ''); // present empty
+      bb.addByte(0x01);
+      _writeString(bb, 'hi'); // present
+      bb.addByte(0x01);
+      _writeString(bb, ''); // present empty
       // End marker
       bb.addByte(0x00);
 
@@ -534,6 +542,7 @@ void main() {
     test('bool column', () {
       final bb = BytesBuilder();
       _writeVarint(bb, 3);
+      _writeVarint(bb, 0); // arena size
       _writeVarint(bb, 1); // fieldID=1
       _writeVarint(bb, 1); // true
       _writeVarint(bb, 0); // false
@@ -550,6 +559,7 @@ void main() {
     test('offset getter works after decoding', () {
       final bb = BytesBuilder();
       _writeVarint(bb, 1);
+      _writeVarint(bb, 0); // arena size
       _writeVarint(bb, 1); // fieldID=1
       _writeSvarint(bb, 10); // one int
       bb.addByte(0x00);
@@ -567,6 +577,7 @@ void main() {
       const b = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
       final bb = BytesBuilder();
       _writeVarint(bb, 2); // count=2
+      _writeVarint(bb, 0); // arena size
       _writeVarint(bb, 1); // fieldID=1
       _writeUuid(bb, a);
       _writeUuid(bb, b);
@@ -583,9 +594,11 @@ void main() {
       const a = '11111111-1111-1111-1111-111111111111';
       final bb = BytesBuilder();
       _writeVarint(bb, 3); // count=3
+      _writeVarint(bb, 0); // arena size
       _writeVarint(bb, 1); // fieldID=1
       bb.addByte(0x00); // null
-      bb.addByte(0x01); _writeUuid(bb, a); // present
+      bb.addByte(0x01);
+      _writeUuid(bb, a); // present
       bb.addByte(0x00); // null
       bb.addByte(0x00); // end
 
@@ -595,7 +608,9 @@ void main() {
       expect(dec.nextColumn(), isFalse);
     });
 
-    test('scalar array column — each cell is a length-prefixed [count][items] blob', () {
+    test(
+        'scalar array column — each cell is a length-prefixed [count][items] blob',
+        () {
       // Column where each cell is a string-array blob: [count][string...]
       final cell0 = BytesBuilder();
       _writeVarint(cell0, 2); // 2 items
@@ -606,6 +621,7 @@ void main() {
 
       final bb = BytesBuilder();
       _writeVarint(bb, 2); // count=2 rows
+      _writeVarint(bb, 0); // arena size
       _writeVarint(bb, 1); // fieldID=1
       // cell 0 as length-prefixed blob
       final c0 = cell0.toBytes();
@@ -630,6 +646,7 @@ void main() {
     test('readSvarint public method', () {
       final bb = BytesBuilder();
       _writeVarint(bb, 0); // count=0
+      _writeVarint(bb, 0); // arena size
       bb.addByte(0x00); // end marker
       // Append extra svarint for pagination
       _writeSvarint(bb, -42);
@@ -717,6 +734,7 @@ void main() {
     test('readColumnDateTime decodes int column to ISO strings', () {
       final bb = BytesBuilder();
       _writeVarint(bb, 2); // count
+      _writeVarint(bb, 0); // arena size
       _writeVarint(bb, 1); // fieldID
       _writeSvarint(bb, seconds);
       _writeSvarint(bb, 0);
@@ -732,9 +750,11 @@ void main() {
     test('readColumnDateTimePtr decodes nullable int column', () {
       final bb = BytesBuilder();
       _writeVarint(bb, 3); // count
+      _writeVarint(bb, 0); // arena size
       _writeVarint(bb, 1); // fieldID
       bb.addByte(0x00); // null
-      bb.addByte(0x01); _writeSvarint(bb, seconds); // present
+      bb.addByte(0x01);
+      _writeSvarint(bb, seconds); // present
       bb.addByte(0x00); // null
       bb.addByte(0x00); // end
 
@@ -748,21 +768,21 @@ void main() {
   group('fieldMask utilities', () {
     test('set and check single field', () {
       var mask = Uint8List(0);
-      mask = fieldMaskSet(mask, 0);
-      expect(fieldMaskHas(mask, 0), isTrue);
-      expect(fieldMaskHas(mask, 1), isFalse);
+      mask = fieldMaskSet(mask, 1);
+      expect(fieldMaskHas(mask, 1), isTrue);
+      expect(fieldMaskHas(mask, 2), isFalse);
     });
 
     test('set and check multiple fields', () {
       var mask = Uint8List(0);
       mask = fieldMaskSet(mask, 3);
-      mask = fieldMaskSet(mask, 7);
-      mask = fieldMaskSet(mask, 15);
+      mask = fieldMaskSet(mask, 8);
+      mask = fieldMaskSet(mask, 16);
       expect(fieldMaskHas(mask, 3), isTrue);
-      expect(fieldMaskHas(mask, 7), isTrue);
-      expect(fieldMaskHas(mask, 15), isTrue);
+      expect(fieldMaskHas(mask, 8), isTrue);
+      expect(fieldMaskHas(mask, 16), isTrue);
       expect(fieldMaskHas(mask, 0), isFalse);
-      expect(fieldMaskHas(mask, 8), isFalse);
+      expect(fieldMaskHas(mask, 9), isFalse);
     });
 
     test('fieldMaskHas returns false for out-of-range', () {
@@ -772,9 +792,23 @@ void main() {
 
     test('mask grows as needed', () {
       var mask = Uint8List(0);
-      mask = fieldMaskSet(mask, 32);
+      mask = fieldMaskSet(mask, 33);
       expect(mask.length, greaterThanOrEqualTo(5));
-      expect(fieldMaskHas(mask, 32), isTrue);
+      expect(fieldMaskHas(mask, 33), isTrue);
+    });
+  });
+
+  group('canonical markers', () {
+    test('rejects non-canonical boolean marker', () {
+      final dec = LuxoDecoder(Uint8List.fromList([0x02]));
+      expect(dec.readBool(), isFalse);
+      expect(dec.error, contains('invalid bool'));
+    });
+
+    test('rejects non-canonical nullable marker', () {
+      final dec = LuxoDecoder(Uint8List.fromList([0x02]));
+      expect(dec.readIntPtr(), isNull);
+      expect(dec.error, contains('invalid nullable'));
     });
   });
 }

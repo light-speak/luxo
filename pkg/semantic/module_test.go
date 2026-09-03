@@ -32,6 +32,29 @@ func analyzeModules(t *testing.T, files []*ast.File) *Result {
 	return a.AnalyzeWithModules(files)
 }
 
+func TestComputedAggregateRejectsCrossModuleRelation(t *testing.T) {
+	user := parseFileWithName(t, `
+extend Post {
+  userId: Int
+  likes: Int
+}
+model User {
+  id: Int @id
+  posts: [Post]
+  val avgLikes: Float get @avg(posts.likes)
+}
+`, "origin/user.luxo")
+	post := parseFileWithName(t, `
+model Post {
+  id: Int @id
+  userId: Int
+  likes: Int
+}
+`, "origin/post.luxo")
+	result := analyzeModules(t, []*ast.File{user, post})
+	expectError(t, result, "computed aggregate relation 'User.posts' must be stored in the same module")
+}
+
 // ========== FileToModule Tests ==========
 
 func TestFileToModule_FileBasedModule(t *testing.T) {
@@ -155,6 +178,47 @@ extend User {
 			t.Errorf("unexpected module visibility error: %v", err)
 		}
 	}
+}
+
+func TestFederationExtendRequiresForeignKey(t *testing.T) {
+	productFile := parseFileWithName(t, `
+model Product {
+  sku: String @id
+}
+`, "/project/origin/product.luxo")
+	reviewFile := parseFileWithName(t, `
+model Review {
+  id: Int @id
+}
+
+extend Product {
+  reviews: [Review]
+}
+`, "/project/origin/review.luxo")
+
+	result := analyzeModules(t, []*ast.File{productFile, reviewFile})
+	expectError(t, result, "requires foreign-key field 'productSku'")
+}
+
+func TestFederationExtendRequiresMatchingForeignKeyType(t *testing.T) {
+	productFile := parseFileWithName(t, `
+model Product {
+  sku: String @id
+}
+`, "/project/origin/product.luxo")
+	reviewFile := parseFileWithName(t, `
+model Review {
+  id: Int @id
+  productSku: Int
+}
+
+extend Product {
+  reviews: [Review]
+}
+`, "/project/origin/review.luxo")
+
+	result := analyzeModules(t, []*ast.File{productFile, reviewFile})
+	expectError(t, result, "foreign-key field 'Review.productSku' must match primary key 'Product.sku'")
 }
 
 func TestModuleCommonTypesVisibleEverywhere(t *testing.T) {
@@ -449,6 +513,66 @@ api getAuthorPhone(postId: Int): String {
 	}
 }
 
+func TestNamedLoadValidatesLookupFields(t *testing.T) {
+	result := analyze(t, `
+model User {
+  id: Int
+  email: String
+  active: Boolean
+}
+api byEmail(email: String): [User] {
+  User.load(email: email)
+}
+api unknown(email: String): [User] {
+  User.load(missing: email)
+}
+api mismatch(id: Int): [User] {
+  User.load(email: id)
+}
+api unsupported(active: Boolean): [User] {
+  User.load(active: active)
+}
+`)
+	expectError(t, result, "model 'User' has no load field 'missing'")
+	expectError(t, result, "load field 'email' expects 'String', got 'Int'")
+	expectError(t, result, "load field 'active' must be Int, String, or UUID")
+}
+
+func TestNamedLoadRejectsDuplicateAndMixedArguments(t *testing.T) {
+	result := analyze(t, `
+model User {
+  id: Int
+  email: String
+}
+api duplicate(email: String): [User] {
+  User.load(email: email, email: email)
+}
+api mixed(id: Int, email: String): [User] {
+  User.load(id, email: email)
+}
+`)
+	expectError(t, result, "duplicate load field 'email'")
+	expectError(t, result, "cannot mix positional and named arguments")
+}
+
+func TestCrossModuleNamedLoadRequiresVisibleField(t *testing.T) {
+	owner := parseFileWithName(t, `
+model User {
+  id: Int
+  email: String
+  name: String
+}
+`, "origin/user.luxo")
+	caller := parseFileWithName(t, `
+extend User { name: String }
+api lookup(email: String): [User] {
+  User.load(email: email)
+}
+`, "origin/post.luxo")
+	result := analyzeModules(t, []*ast.File{owner, caller})
+	expectError(t, result, "load field 'email' not declared in extend User")
+}
+
 func TestCrossModuleFindForbidden(t *testing.T) {
 	fileUser := parseFileWithName(t, `
 model User {
@@ -559,6 +683,40 @@ api getAuthorInfo(postId: Int): String {
 			t.Errorf("unexpected extend field error: %s", e.Message)
 		}
 	}
+}
+
+func TestCrossModuleScalarExtensionRequiresResolverModel(t *testing.T) {
+	owner := parseFileWithName(t, `
+model User {
+	id: Int @id
+	name: String
+}
+`, "origin/user.luxo")
+	extension := parseFileWithName(t, `
+extend User {
+	postCount: Int
+}
+`, "origin/post.luxo")
+
+	result := analyzeModules(t, []*ast.File{owner, extension})
+	expectError(t, result, "scalar field 'User.postCount' has no federation resolver")
+}
+
+func TestCrossModuleProjectionMustMatchOwnerFieldType(t *testing.T) {
+	owner := parseFileWithName(t, `
+model User {
+	id: Int @id
+	email: String
+}
+`, "origin/user.luxo")
+	projection := parseFileWithName(t, `
+extend User {
+	email: Int
+}
+`, "origin/post.luxo")
+
+	result := analyzeModules(t, []*ast.File{owner, projection})
+	expectError(t, result, "must match owner type 'String'")
 }
 
 func TestSameModuleFindAllowed(t *testing.T) {

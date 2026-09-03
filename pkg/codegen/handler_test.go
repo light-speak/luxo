@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"go/format"
 	"strings"
 	"testing"
 
@@ -9,11 +10,327 @@ import (
 	"github.com/light-speak/luxo/pkg/token"
 )
 
+func TestGenerateCRUDHandlersUseDeclaredPrimaryKey(t *testing.T) {
+	model := &ast.ModelDecl{
+		Name: "Product",
+		Fields: []*ast.FieldDecl{
+			{Name: "sku", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "id"}}},
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+		},
+		Directives: []*ast.Directive{{Name: "crud"}},
+	}
+	var b strings.Builder
+	generateCRUDHandlers(&b, []*ast.ModelDecl{model}, map[string]bool{}, nil)
+	code := b.String()
+	if strings.Contains(code, "ProductWhere.Id") {
+		t.Fatalf("custom primary key must not use synthetic Id field:\n%s", code)
+	}
+	for _, want := range []string{"ProductWhere.Sku.Eq(id)", "ProductWhere.Sku.In(ids...)"} {
+		if !strings.Contains(code, want) {
+			t.Fatalf("custom primary key output missing %q:\n%s", want, code)
+		}
+	}
+	if !strings.Contains(code, "cols := selectProductSQLColumns(req.Select)") {
+		t.Fatalf("custom primary key selection must use the generated model selector:\n%s", code)
+	}
+	if strings.Contains(code, "selection.SQLColumns(req.Select)") {
+		t.Fatalf("generic selection hardcodes id and must not be used for CRUD:\n%s", code)
+	}
+}
+
+func TestGenerateSQLColumnSelectorUsesDeclaredDatabaseFields(t *testing.T) {
+	model := &ast.ModelDecl{
+		Name: "Product",
+		Fields: []*ast.FieldDecl{
+			{Name: "sku", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "id"}}},
+			{Name: "displayName", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "secret", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hidden"}}},
+			{Name: "reviewCount", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{}},
+			{Name: "reviews", Type: &ast.TypeRef{Name: "Review", IsList: true}},
+		},
+	}
+
+	var b strings.Builder
+	generateSQLColumnSelector(&b, model, nil)
+	code := b.String()
+	for _, want := range []string{
+		"func selectProductSQLColumns(fields []*selection.Field) []string",
+		`case "sku":`,
+		`cols = ensureSelectedColumn(cols, "sku")`,
+		`case "displayName":`,
+		`cols = ensureSelectedColumn(cols, "display_name")`,
+		`if !hasPrimaryKey { cols = append(cols, "sku") }`,
+	} {
+		if !strings.Contains(code, want) {
+			t.Fatalf("model SQL selector missing %q:\n%s", want, code)
+		}
+	}
+	for _, excluded := range []string{`case "secret":`, `case "reviewCount":`, `case "reviews":`, `"id"`} {
+		if strings.Contains(code, excluded) {
+			t.Fatalf("model SQL selector contains non-database field %q:\n%s", excluded, code)
+		}
+	}
+}
+
 func crudDirective(args ...*ast.NamedArg) *ast.Directive {
 	return &ast.Directive{
 		Pos:  token.Position{File: "test.luxo", Line: 1, Col: 1},
 		Name: "crud",
 		Args: args,
+	}
+}
+
+func TestGenerateBatchLoadHandlersUsesCanonicalListAndSelection(t *testing.T) {
+	oldAPIs := apiIDs
+	oldFields := modelFieldIDs
+	defer func() {
+		apiIDs = oldAPIs
+		modelFieldIDs = oldFields
+	}()
+	apiIDs = map[string]int{"svc:batchLoad:User": 42}
+	modelFieldIDs = map[string]map[string]int{"User": {"id": 1, "name": 2, "posts": 3}}
+
+	model := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+			{Name: "displayName", Type: &ast.TypeRef{Name: "String"}, Computed: &ast.ComputedField{}},
+		},
+	}
+	var b strings.Builder
+	generateBatchLoadHandlers(&b, []*ast.ModelDecl{model})
+	code := b.String()
+
+	if !strings.Contains(code, `ParamIntArray("keys")`) {
+		t.Errorf("batch handler must decode the canonical list param:\n%s", code)
+	}
+	if !strings.Contains(code, `Name: "keys", Type: "Int", IsList: true`) {
+		t.Errorf("batch handler metadata must describe a list param:\n%s", code)
+	}
+	if !strings.Contains(code, `codec.FieldMaskHas(fieldMask, 2)`) || !strings.Contains(code, `fields = append(fields, "name")`) {
+		t.Errorf("batch handler must push the wire selection into SQL:\n%s", code)
+	}
+	if strings.Contains(code, `fields = append(fields, "posts")`) {
+		t.Errorf("batch handler must not select relation names as SQL columns:\n%s", code)
+	}
+}
+
+func TestGenerateBatchLoadHandlersSupportsUUID(t *testing.T) {
+	oldAPIs := apiIDs
+	defer func() { apiIDs = oldAPIs }()
+	apiIDs = map[string]int{"svc:batchLoad:Account": 45}
+	model := &ast.ModelDecl{
+		Name: "Account",
+		Fields: []*ast.FieldDecl{{
+			Name: "id",
+			Type: &ast.TypeRef{Name: "UUID"},
+		}},
+	}
+
+	var b strings.Builder
+	generateBatchLoadHandlers(&b, []*ast.ModelDecl{model})
+	code := b.String()
+	for _, check := range []string{
+		`ParamUUIDArray("keys")`,
+		`lux.NewUUIDField("id").In(keys...)`,
+		`Name: "keys", Type: "UUID", IsList: true`,
+	} {
+		if !strings.Contains(code, check) {
+			t.Errorf("UUID batch handler missing %q:\n%s", check, code)
+		}
+	}
+}
+
+func TestGenerateRemoteNamedLoadHandlers(t *testing.T) {
+	oldContext := globalEventCtx
+	oldAPIs := apiIDs
+	oldFields := modelFieldIDs
+	defer func() {
+		globalEventCtx = oldContext
+		apiIDs = oldAPIs
+		modelFieldIDs = oldFields
+	}()
+	globalEventCtx = &EventContext{remoteLoadCalls: map[string][]loadCallInfo{
+		"user": {{
+			modelName:    "User",
+			argNames:     []string{"tenantId", "email"},
+			argTypes:     []string{"int64", "string"},
+			argTypeNames: []string{"Int", "String"},
+		}},
+	}}
+	apiIDs = map[string]int{"svc:load:User:tenantId:email": 72}
+	apiParamIDs = map[string]map[string]int{
+		"svc:load:User:tenantId:email": {"tenantId": 4, "email": 7},
+	}
+	modelFieldIDs = map[string]map[string]int{"User": {"id": 1, "tenantId": 2, "email": 3, "name": 4}}
+
+	user := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "tenantId", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}
+	result := &semantic.Result{Files: []*ast.File{{Name: "origin/user.luxo", Models: []*ast.ModelDecl{user}}}}
+	code := string(generateHandlerFile(result, "luxo", nil))
+	if _, err := format.Source([]byte(code)); err != nil {
+		t.Fatalf("remote load handler generated invalid Go: %v\n%s", err, code)
+	}
+	checks := []string{
+		"handleLoadUserByTenantIdAndEmail",
+		`ParamIntArray("tenantId")`,
+		`ParamStringArray("email")`,
+		`fields = append(fields, "tenant_id")`,
+		`fields = append(fields, "email")`,
+		"groups[i] = lux.AllOf(",
+		"lux.AnyOf(groups...)",
+		`router.Handle("svc:load:User:tenantId:email"`,
+		`FieldID: 4, Name: "tenantId", Type: "Int", IsList: true`,
+		`FieldID: 7, Name: "email", Type: "String", IsList: true`,
+	}
+	for _, check := range checks {
+		if !strings.Contains(code, check) {
+			t.Errorf("remote load handler missing %q:\n%s", check, code)
+		}
+	}
+}
+
+func TestGenerateFederationResolversUsesCanonicalListAndSelection(t *testing.T) {
+	oldAPIs := apiIDs
+	oldFields := modelFieldIDs
+	defer func() {
+		apiIDs = oldAPIs
+		modelFieldIDs = oldFields
+	}()
+	apiIDs = map[string]int{"svc:resolve:Post:userId": 43}
+	modelFieldIDs = map[string]map[string]int{"Post": {"id": 1, "userId": 2, "title": 3}}
+
+	post := &ast.ModelDecl{
+		Name: "Post",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}
+	result := &semantic.Result{Files: []*ast.File{{
+		Name:   "origin/post.luxo",
+		Models: []*ast.ModelDecl{post},
+		Extends: []*ast.ExtendDecl{{
+			Name: "User",
+			Fields: []*ast.FieldDecl{{
+				Name: "posts",
+				Type: &ast.TypeRef{Name: "Post", IsList: true},
+			}},
+		}},
+	}}}
+
+	var b strings.Builder
+	generateFederationResolvers(&b, result, []*ast.ModelDecl{post}, nil)
+	code := b.String()
+	if !strings.Contains(code, `Name: "keys", Type: "Int", IsList: true`) {
+		t.Errorf("resolver metadata must describe one canonical list param:\n%s", code)
+	}
+	if !strings.Contains(code, `codec.FieldMaskHas(fieldMask, 3)`) || !strings.Contains(code, `fields = append(fields, "title")`) {
+		t.Errorf("resolver must push the field selection into SQL:\n%s", code)
+	}
+	if !strings.Contains(code, `fields = append(fields, "user_id")`) {
+		t.Errorf("resolver must select its grouping key:\n%s", code)
+	}
+}
+
+func TestGenerateFederationResolversUsesExtendedModelPrimaryKeyType(t *testing.T) {
+	oldContext := globalEventCtx
+	oldAPIs := apiIDs
+	defer func() {
+		globalEventCtx = oldContext
+		apiIDs = oldAPIs
+	}()
+	apiIDs = map[string]int{"svc:resolve:Review:productSku": 44}
+	globalEventCtx = &EventContext{
+		ModelIDType:  map[string]string{"Product": "String"},
+		ModelIDField: map[string]string{"Product": "sku"},
+	}
+
+	review := &ast.ModelDecl{
+		Name: "Review",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "productSku", Type: &ast.TypeRef{Name: "String"}},
+		},
+	}
+	result := &semantic.Result{Files: []*ast.File{{
+		Name:   "origin/review.luxo",
+		Models: []*ast.ModelDecl{review},
+		Extends: []*ast.ExtendDecl{{
+			Name: "Product",
+			Fields: []*ast.FieldDecl{{
+				Name: "reviews",
+				Type: &ast.TypeRef{Name: "Review", IsList: true},
+			}},
+		}},
+	}}}
+
+	var b strings.Builder
+	generateFederationResolvers(&b, result, []*ast.ModelDecl{review}, nil)
+	code := b.String()
+	for _, want := range []string{
+		`ParamStringArray("keys")`,
+		`lux.NewStringField("product_sku").In(keys...)`,
+		`make(map[string][]*Review, len(keys))`,
+		`Name: "keys", Type: "String", IsList: true`,
+	} {
+		if !strings.Contains(code, want) {
+			t.Fatalf("custom primary-key resolver missing %q:\n%s", want, code)
+		}
+	}
+}
+
+func TestGenerateFederationResolversSkipsNullForeignKeys(t *testing.T) {
+	oldContext := globalEventCtx
+	defer func() { globalEventCtx = oldContext }()
+	globalEventCtx = &EventContext{
+		ModelIDType:  map[string]string{"Product": "String"},
+		ModelIDField: map[string]string{"Product": "sku"},
+	}
+
+	review := &ast.ModelDecl{
+		Name: "Review",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "productSku", Type: &ast.TypeRef{Name: "String", Nullable: true}},
+		},
+	}
+	result := &semantic.Result{Files: []*ast.File{{
+		Name:   "origin/review.luxo",
+		Models: []*ast.ModelDecl{review},
+		Extends: []*ast.ExtendDecl{{
+			Name: "Product",
+			Fields: []*ast.FieldDecl{{
+				Name: "reviews",
+				Type: &ast.TypeRef{Name: "Review", IsList: true},
+			}},
+		}},
+	}}}
+
+	var b strings.Builder
+	generateFederationResolvers(&b, result, []*ast.ModelDecl{review}, nil)
+	code := b.String()
+	for _, want := range []string{
+		"fk := row.ProductSku",
+		"if fk == nil { continue }",
+		"grouped[*fk] = append(grouped[*fk], row)",
+	} {
+		if !strings.Contains(code, want) {
+			t.Fatalf("nullable federation key handling missing %q:\n%s", want, code)
+		}
+	}
+	if _, err := format.Source([]byte(code)); err != nil {
+		t.Fatalf("nullable federation resolver generated invalid Go: %v\n%s", err, code)
 	}
 }
 
@@ -341,6 +658,13 @@ func TestSkipHandlerFieldRelation(t *testing.T) {
 	}
 	if !skipHandlerField(f, nil) {
 		t.Error("relation field should be skipped")
+	}
+}
+
+func TestJSONFieldIsNotRelation(t *testing.T) {
+	f := &ast.FieldDecl{Name: "metadata", Type: &ast.TypeRef{Name: "JSON"}}
+	if isRelationField(f, nil) || skipHandlerField(f, nil) {
+		t.Fatal("JSON is a built-in scalar field")
 	}
 }
 
@@ -1614,6 +1938,22 @@ func TestWriteAPIRegistration(t *testing.T) {
 	if !strings.Contains(code, `"Int"`) {
 		t.Errorf("missing type Int:\n%s", code)
 	}
+
+	apiParamIDs["getUser"] = map[string]int{"ids": 2}
+	apiParamTypes["getUser"] = map[string]string{"ids": "[UUID]?"}
+	b.Reset()
+	writeAPIRegistration(&b, "getUser")
+	if code := b.String(); !strings.Contains(code, `Type: "UUID", FieldID: 2, IsList: true, Nullable: true`) {
+		t.Errorf("missing list metadata:\n%s", code)
+	}
+
+	apiParamIDs["getUser"] = map[string]int{"id": 1, "removed": 9}
+	apiParamTypes["getUser"] = map[string]string{"id": "Int"}
+	b.Reset()
+	writeAPIRegistration(&b, "getUser")
+	if code := b.String(); strings.Contains(code, `Name: "removed"`) {
+		t.Errorf("stale lock-file params must not be registered:\n%s", code)
+	}
 }
 
 func TestWriteAPIRegistrationNoParams(t *testing.T) {
@@ -2137,7 +2477,7 @@ func TestNativeAPIHandlerReturnTypes(t *testing.T) {
 			Name:       "test",
 			Directives: []*ast.Directive{{Name: "native"}},
 			ReturnType: tt.retType,
-		}, nil)
+		}, nil, nil)
 		if !strings.Contains(b.String(), tt.contains) {
 			t.Errorf("return type %s should contain %q, got:\n%s", tt.retType.Name, tt.contains, b.String())
 		}
@@ -2150,8 +2490,11 @@ func TestNativeAPIHandlerListPrimitive(t *testing.T) {
 		Name:       "getIds",
 		Directives: []*ast.Directive{{Name: "native"}},
 		ReturnType: &ast.TypeRef{Name: "Int", IsList: true},
-	}, nil)
+	}, nil, nil)
 	code := b.String()
+	if !strings.Contains(code, "codec.AppendVarint(req.Buf.B, uint64(len(result)))") {
+		t.Errorf("[Int] should use unsigned count prefix:\n%s", code)
+	}
 	if !strings.Contains(code, "codec.AppendSvarint(req.Buf.B, v)") {
 		t.Errorf("[Int] should encode each element with AppendSvarint:\n%s", code)
 	}
@@ -2161,7 +2504,7 @@ func TestNativeAPIHandlerListPrimitive(t *testing.T) {
 		Name:       "getNames",
 		Directives: []*ast.Directive{{Name: "native"}},
 		ReturnType: &ast.TypeRef{Name: "String", IsList: true},
-	}, nil)
+	}, nil, nil)
 	if !strings.Contains(b2.String(), "codec.AppendString(req.Buf.B, v)") {
 		t.Errorf("[String] should encode each element with AppendString:\n%s", b2.String())
 	}
@@ -2171,7 +2514,7 @@ func TestNativeAPIHandlerListPrimitive(t *testing.T) {
 		Name:       "getRatios",
 		Directives: []*ast.Directive{{Name: "native"}},
 		ReturnType: &ast.TypeRef{Name: "Float", IsList: true},
-	}, nil)
+	}, nil, nil)
 	if !strings.Contains(b3.String(), "codec.AppendFixed64(req.Buf.B, v)") {
 		t.Errorf("[Float] should encode each element with AppendFixed64:\n%s", b3.String())
 	}
@@ -2181,22 +2524,52 @@ func TestNativeAPIHandlerListPrimitive(t *testing.T) {
 		Name:       "getFlags",
 		Directives: []*ast.Directive{{Name: "native"}},
 		ReturnType: &ast.TypeRef{Name: "Boolean", IsList: true},
-	}, nil)
+	}, nil, nil)
 	if !strings.Contains(b4.String(), "codec.AppendBool(req.Buf.B, v)") {
 		t.Errorf("[Boolean] should encode each element with AppendBool:\n%s", b4.String())
 	}
 }
 
-func TestNativeAPIHandlerNoReturn(t *testing.T) {
+func TestNativeAPIHandlerAdvancedScalarReturns(t *testing.T) {
+	tests := []struct {
+		name string
+		want string
+	}{
+		{"DateTime", "codec.AppendSvarint(req.Buf.B, result.Unix())"},
+		{"Duration", "codec.AppendSvarint(req.Buf.B, int64(result))"},
+		{"UUID", "codec.AppendUUID(req.Buf.B, result)"},
+		{"Decimal", "codec.AppendString(req.Buf.B, result.String())"},
+		{"Bytes", "codec.AppendBytes(req.Buf.B, result)"},
+		{"JSON", "codec.AppendBytes(req.Buf.B, result)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var b strings.Builder
+			generateNativeAPIHandler(&b, &ast.ApiDecl{
+				Name:       "value",
+				Directives: []*ast.Directive{{Name: "native"}},
+				ReturnType: &ast.TypeRef{Name: tt.name},
+			}, nil, nil)
+			if got := b.String(); !strings.Contains(got, tt.want) {
+				t.Fatalf("%s return missing %q:\n%s", tt.name, tt.want, got)
+			}
+		})
+	}
+}
+
+func TestNativeServiceHandlerNoReturn(t *testing.T) {
 	var b strings.Builder
-	generateNativeAPIHandler(&b, &ast.ApiDecl{
+	generateNativeServiceHandler(&b, &ast.FnDecl{
 		Name:       "purge",
-		Directives: []*ast.Directive{{Name: "native"}},
+		Directives: []*ast.Directive{{Name: "native"}, {Name: "service"}},
 		// no ReturnType
-	}, nil)
+	}, nil, nil)
 	code := b.String()
-	if !strings.Contains(code, "_, err := app.Resolver.Purge(ctx)") {
-		t.Errorf("no-return should use _ for result:\n%s", code)
+	if !strings.Contains(code, "err := app.Resolver.Purge(ctx)") {
+		t.Errorf("void native function should only return an error:\n%s", code)
+	}
+	if strings.Contains(code, "result") {
+		t.Errorf("void native function must not create a result value:\n%s", code)
 	}
 }
 
@@ -2437,64 +2810,161 @@ func TestGenerateBeforeSave_NoDirective(t *testing.T) {
 
 // ─── Aggregate computed fields ──────────────────────────────────────────────
 
-func TestGenerateAggregateFields_Count(t *testing.T) {
-	var b strings.Builder
-	m := &ast.ModelDecl{
-		Name: "User",
+func TestGenerateComputedResolversBatchByRelation(t *testing.T) {
+	oldFields := modelFieldIDs
+	defer func() { modelFieldIDs = oldFields }()
+	modelFieldIDs = map[string]map[string]int{
+		"User": {"id": 1, "postCount": 4, "avgLikes": 5, "totalLikes": 6},
+	}
+	user := &ast.ModelDecl{
+		Name:       "User",
+		Directives: []*ast.Directive{{Name: "crud"}},
 		Fields: []*ast.FieldDecl{
 			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
-			{Name: "postCount", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{
-				Directives: []*ast.Directive{
-					{Name: "count", Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "posts"}}}},
-				},
-			}},
+			{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+			computedAggregateField("postCount", "Int", "count", &ast.Ident{Name: "posts"}),
+			computedAggregateField("avgLikes", "Float", "avg", &ast.MemberExpr{Object: &ast.Ident{Name: "posts"}, Field: "likes"}),
+			computedAggregateField("totalLikes", "Int", "sum", &ast.MemberExpr{Object: &ast.Ident{Name: "posts"}, Field: "likes"}),
 		},
 	}
-	generateAggregateFields(&b, m, "result", "\t\t")
-	out := b.String()
-	if !strings.Contains(out, "AggregateSQL") {
-		t.Errorf("@count should generate AggregateSQL call: %s", out)
+	post := &ast.ModelDecl{
+		Name:       "Post",
+		Directives: []*ast.Directive{{Name: "soft"}},
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "likes", Type: &ast.TypeRef{Name: "Int"}},
+		},
 	}
-	if !strings.Contains(out, "PostCount") {
-		t.Errorf("should set PostCount: %s", out)
+	models := map[string]*ast.ModelDecl{"User": user, "Post": post}
+
+	var b strings.Builder
+	generateComputedResolvers(&b, []*ast.ModelDecl{user, post}, models, map[string]bool{})
+	out := b.String()
+
+	for _, want := range []string{
+		"func resolveUserComputed(",
+		"codec.SelectionMaskFields(selectionMask)",
+		"codec.FieldMaskHas(fieldMask, 4)",
+		"codec.FieldMaskHas(fieldMask, 5)",
+		"codec.FieldMaskHas(fieldMask, 6)",
+		`SELECT "user_id", COUNT(*)::bigint, COALESCE(AVG("likes"), 0)::double precision, COALESCE(SUM("likes"), 0)::bigint FROM "posts" WHERE "user_id" = ANY($1) AND "deleted_at" IS NULL GROUP BY "user_id"`,
+		"pg.QueryRaw(ctx, app.DB, query, keys)",
+		"rows.Scan(&key, &value.PostCount, &value.AvgLikes, &value.TotalLikes)",
+		"values := make(map[int64]userPostsComputedValue, len(items))",
+		"item.PostCount = value.PostCount",
+		"item.AvgLikes = value.AvgLikes",
+		"item.TotalLikes = value.TotalLikes",
+		"if err := rows.Err(); err != nil { return err }",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("computed resolver missing %q:\n%s", want, out)
+		}
+	}
+	if got := strings.Count(out, "pg.QueryRaw("); got != 1 {
+		t.Fatalf("same relation must use one batch query, got %d:\n%s", got, out)
 	}
 }
 
-func TestGenerateAggregateFields_Sum(t *testing.T) {
-	var b strings.Builder
-	m := &ast.ModelDecl{
-		Name: "User",
+func TestGenerateComputedResolversCustomRelationKeys(t *testing.T) {
+	oldFields := modelFieldIDs
+	defer func() { modelFieldIDs = oldFields }()
+	modelFieldIDs = map[string]map[string]int{"Product": {"sku": 1, "tenant": 2, "reviewCount": 3}}
+	product := &ast.ModelDecl{
+		Name: "Product",
 		Fields: []*ast.FieldDecl{
-			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
-			{Name: "totalSpent", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{
-				Directives: []*ast.Directive{
-					{Name: "sum", Args: []*ast.NamedArg{{Value: &ast.MemberExpr{
-						Object: &ast.Ident{Name: "orders"},
-						Field:  "amount",
-					}}}},
-				},
-			}},
+			{Name: "sku", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "id"}}},
+			{Name: "tenant", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "reviews", Type: &ast.TypeRef{Name: "Review", IsList: true}, Directives: []*ast.Directive{{Name: "by", Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "productTenant"}}, {Value: &ast.Ident{Name: "tenant"}}}}}},
+			computedAggregateField("reviewCount", "Int", "count", &ast.Ident{Name: "reviews"}),
 		},
 	}
-	generateAggregateFields(&b, m, "result", "\t\t")
+	review := &ast.ModelDecl{Name: "Review", Fields: []*ast.FieldDecl{
+		{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+		{Name: "productTenant", Type: &ast.TypeRef{Name: "String"}},
+	}}
+
+	var b strings.Builder
+	generateComputedResolvers(&b, []*ast.ModelDecl{product, review}, map[string]*ast.ModelDecl{"Product": product, "Review": review}, map[string]bool{})
 	out := b.String()
-	if !strings.Contains(out, `"SUM"`) {
-		t.Errorf("@sum should use SUM: %s", out)
+	for _, want := range []string{
+		`SELECT "product_tenant", COUNT(*)::bigint FROM "reviews" WHERE "product_tenant" = ANY($1) GROUP BY "product_tenant"`,
+		"keys := make([]string, 0, len(items))",
+		"values := make(map[string]productReviewsComputedValue, len(items))",
+		"keys = append(keys, item.Tenant)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("custom-key resolver missing %q:\n%s", want, out)
+		}
 	}
-	if !strings.Contains(out, "amount") {
-		t.Errorf("@sum(orders.amount) should target amount column: %s", out)
+	var selector strings.Builder
+	generateSQLColumnSelector(&selector, product, map[string]bool{})
+	generateSelectedSQLFields(&selector, product, map[string]bool{})
+	for _, want := range []string{
+		`case "reviewCount":`,
+		`cols = ensureSelectedColumn(cols, "tenant")`,
+		`if codec.FieldMaskHas(fieldMask, 3) { fields = ensureSelectedColumn(fields, "tenant") }`,
+	} {
+		if !strings.Contains(selector.String(), want) {
+			t.Errorf("computed selection dependency missing %q:\n%s", want, selector.String())
+		}
 	}
 }
 
-func TestGenerateAggregateFields_NoComputed(t *testing.T) {
+func TestGenerateComputedResolversNoComputed(t *testing.T) {
 	var b strings.Builder
-	m := &ast.ModelDecl{
-		Name:   "User",
-		Fields: []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}},
-	}
-	generateAggregateFields(&b, m, "result", "\t\t")
+	m := &ast.ModelDecl{Name: "User", Fields: []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}}}
+	generateComputedResolvers(&b, []*ast.ModelDecl{m}, map[string]*ast.ModelDecl{"User": m}, map[string]bool{})
 	if b.Len() > 0 {
 		t.Error("no computed fields should generate nothing")
+	}
+}
+
+func TestNestedRelationResolvesComputedFieldsInOneBatch(t *testing.T) {
+	oldFields := modelFieldIDs
+	defer func() { modelFieldIDs = oldFields }()
+	modelFieldIDs = map[string]map[string]int{
+		"User":    {"id": 1, "posts": 2},
+		"Post":    {"id": 1, "userId": 2, "comments": 3, "commentCount": 4},
+		"Comment": {"id": 1, "postId": 2},
+	}
+	user := &ast.ModelDecl{Name: "User", Directives: []*ast.Directive{{Name: "crud"}}, Fields: []*ast.FieldDecl{
+		{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+		{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+	}}
+	post := &ast.ModelDecl{Name: "Post", Fields: []*ast.FieldDecl{
+		{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+		{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+		{Name: "comments", Type: &ast.TypeRef{Name: "Comment", IsList: true}},
+		computedAggregateField("commentCount", "Int", "count", &ast.Ident{Name: "comments"}),
+	}}
+	comment := &ast.ModelDecl{Name: "Comment", Fields: []*ast.FieldDecl{
+		{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+		{Name: "postId", Type: &ast.TypeRef{Name: "Int"}},
+	}}
+	result := &semantic.Result{Files: []*ast.File{{Models: []*ast.ModelDecl{user, post, comment}}}}
+	out := string(generateHandlerFile(result, "example", map[string]bool{}))
+	for _, want := range []string{
+		"func resolvePostComputedFields(",
+		"case \"commentCount\": needComments = true",
+		"computedItems := make([]*Post, 0)",
+		"computedItems = append(computedItems, item.Posts...)",
+		"resolvePostComputedFields(ctx, app, computedItems, f.Children)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("nested computed resolution missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func computedAggregateField(name, typeName, directive string, target ast.Expr) *ast.FieldDecl {
+	return &ast.FieldDecl{
+		Name: name,
+		Type: &ast.TypeRef{Name: typeName},
+		Computed: &ast.ComputedField{Directives: []*ast.Directive{{
+			Name: directive,
+			Args: []*ast.NamedArg{{Value: target}},
+		}}},
 	}
 }
 
@@ -2525,22 +2995,6 @@ func TestScanModelsForValidation_NoCrud(t *testing.T) {
 	}
 }
 
-func TestGenerateAggregateFields_NoArgs(t *testing.T) {
-	var b strings.Builder
-	m := &ast.ModelDecl{
-		Name: "User",
-		Fields: []*ast.FieldDecl{
-			{Name: "score", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{
-				Directives: []*ast.Directive{{Name: "count"}}, // no args
-			}},
-		},
-	}
-	generateAggregateFields(&b, m, "result", "\t\t")
-	if b.Len() > 0 {
-		t.Error("@count without args should generate nothing")
-	}
-}
-
 func TestGenerateBeforeSave_EmptyBody(t *testing.T) {
 	var b strings.Builder
 	f := &ast.FieldDecl{
@@ -2553,103 +3007,6 @@ func TestGenerateBeforeSave_EmptyBody(t *testing.T) {
 	generateBeforeSave(&b, f, "nameVal", "\t")
 	if b.Len() > 0 {
 		t.Error("empty body should generate nothing")
-	}
-}
-
-func TestGenerateAggregateFields_Avg(t *testing.T) {
-	var b strings.Builder
-	m := &ast.ModelDecl{
-		Name: "User",
-		Fields: []*ast.FieldDecl{
-			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
-			{Name: "avgScore", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{
-				Directives: []*ast.Directive{
-					{Name: "avg", Args: []*ast.NamedArg{{Value: &ast.MemberExpr{
-						Object: &ast.Ident{Name: "reviews"},
-						Field:  "score",
-					}}}},
-				},
-			}},
-		},
-	}
-	generateAggregateFields(&b, m, "result", "\t\t")
-	if !strings.Contains(b.String(), `"AVG"`) {
-		t.Errorf("should use AVG: %s", b.String())
-	}
-}
-
-func TestGenerateAggregateFields_Min(t *testing.T) {
-	var b strings.Builder
-	m := &ast.ModelDecl{
-		Name: "User",
-		Fields: []*ast.FieldDecl{
-			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
-			{Name: "minPrice", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{
-				Directives: []*ast.Directive{
-					{Name: "min", Args: []*ast.NamedArg{{Value: &ast.MemberExpr{
-						Object: &ast.Ident{Name: "products"},
-						Field:  "price",
-					}}}},
-				},
-			}},
-		},
-	}
-	generateAggregateFields(&b, m, "result", "\t\t")
-	if !strings.Contains(b.String(), `"MIN"`) {
-		t.Errorf("should use MIN: %s", b.String())
-	}
-}
-
-func TestGenerateAggregateFields_Max(t *testing.T) {
-	var b strings.Builder
-	m := &ast.ModelDecl{
-		Name: "User",
-		Fields: []*ast.FieldDecl{
-			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
-			{Name: "maxAge", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{
-				Directives: []*ast.Directive{
-					{Name: "max", Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "members"}}}},
-				},
-			}},
-		},
-	}
-	generateAggregateFields(&b, m, "result", "\t\t")
-	if !strings.Contains(b.String(), `"MAX"`) {
-		t.Errorf("should use MAX: %s", b.String())
-	}
-}
-
-func TestGenerateAggregateFields_UnknownDirective(t *testing.T) {
-	var b strings.Builder
-	m := &ast.ModelDecl{
-		Name: "User",
-		Fields: []*ast.FieldDecl{
-			{Name: "x", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{
-				Directives: []*ast.Directive{{Name: "native"}},
-			}},
-		},
-	}
-	generateAggregateFields(&b, m, "result", "\t\t")
-	if b.Len() > 0 {
-		t.Error("@native computed should generate nothing")
-	}
-}
-
-func TestGenerateAggregateFields_EmptyRelation(t *testing.T) {
-	var b strings.Builder
-	m := &ast.ModelDecl{
-		Name: "User",
-		Fields: []*ast.FieldDecl{
-			{Name: "x", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{
-				Directives: []*ast.Directive{
-					{Name: "count", Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "42"}}}},
-				},
-			}},
-		},
-	}
-	generateAggregateFields(&b, m, "result", "\t\t")
-	if b.Len() > 0 {
-		t.Error("non-ident/member arg should generate nothing")
 	}
 }
 

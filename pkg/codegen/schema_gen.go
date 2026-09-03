@@ -14,23 +14,38 @@ import (
 // that registers model and API metadata with the Luvia schema registry.
 // This enables schema-driven Binary↔JSON conversion at the Luvia layer.
 type schemaAPIInfo struct {
-	name       string
-	moduleName string
-	params     []*ast.ParamDecl
-	returnType *ast.TypeRef
-	paginated  bool
-	stream     bool
-	directives []*ast.Directive
+	name           string
+	moduleName     string
+	params         []*ast.ParamDecl
+	optionalParams map[string]bool
+	returnType     *ast.TypeRef
+	paginated      bool
+	stream         bool
+	directives     []*ast.Directive
 }
 
 func generateSchemaFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
 	var models []*ast.ModelDecl
 	// Track which module owns each model
 	modelOwner := make(map[string]string)
+	modelFields := make(map[string]map[string]bool)
+	if globalEventCtx != nil {
+		for name, module := range globalEventCtx.ModelModule {
+			modelOwner[name] = module
+		}
+		for name, fields := range globalEventCtx.ModelFields {
+			modelFields[name] = fields
+		}
+	}
 	for _, file := range result.Files {
 		modName := moduleNameFromFile(file.Name)
 		for _, m := range file.Models {
 			modelOwner[m.Name] = modName
+			fields := make(map[string]bool, len(m.Fields))
+			for _, field := range m.Fields {
+				fields[field.Name] = true
+			}
+			modelFields[m.Name] = fields
 		}
 		models = append(models, file.Models...)
 	}
@@ -53,7 +68,9 @@ func generateSchemaFile(result *semantic.Result, packageName string, enums map[s
 					extendFieldModules[ext.Name] = make(map[string]string)
 				}
 				for _, f := range ext.Fields {
-					extendFieldModules[ext.Name][f.Name] = modName
+					if !modelFields[ext.Name][f.Name] {
+						extendFieldModules[ext.Name][f.Name] = modName
+					}
 				}
 			}
 			if !modelNames[ext.Name] {
@@ -63,7 +80,7 @@ func generateSchemaFile(result *semantic.Result, packageName string, enums map[s
 		}
 	}
 
-	apis := collectSchemaAPIs(result, enums, modelOwner)
+	apis := collectSchemaAPIs(result, enums, modelOwner, modelFields)
 
 	declarationCount := 0
 	for _, file := range result.Files {
@@ -89,7 +106,7 @@ func generateSchemaFile(result *semantic.Result, packageName string, enums map[s
 
 	// Register APIs
 	for _, api := range apis {
-		writeAPIRegistrationSchema(&b, api.name, api.moduleName, api.params, api.returnType, api.paginated, api.stream, api.directives)
+		writeAPIRegistrationSchema(&b, api.name, api.moduleName, api.params, api.returnType, api.paginated, api.stream, enums, api.optionalParams, api.directives)
 	}
 
 	// Register type declarations (non-DB types like AuthPayload)
@@ -110,21 +127,23 @@ func generateSchemaFile(result *semantic.Result, packageName string, enums map[s
 
 // buildCrudAPIInfo constructs schemaAPIInfo for a single CRUD operation.
 // collectSchemaAPIs collects all API metadata (CRUD + compiled + service + batchLoad + resolve).
-func collectSchemaAPIs(result *semantic.Result, enums map[string]bool, modelOwner map[string]string) []schemaAPIInfo {
+func collectSchemaAPIs(result *semantic.Result, enums map[string]bool, modelOwner map[string]string, modelFields map[string]map[string]bool) []schemaAPIInfo {
 	var apis []schemaAPIInfo
 	for _, file := range result.Files {
 		modName := moduleNameFromFile(file.Name)
 		for _, m := range file.Models {
-			if !hasCrud(m) {
-				continue
+			if hasCrud(m) {
+				for _, op := range crudOperations(m) {
+					apis = append(apis, buildCrudAPIInfo(m, op, modName, enums))
+				}
 			}
-			for _, op := range crudOperations(m) {
-				apis = append(apis, buildCrudAPIInfo(m.Name, op, modName))
+			if hasCrud(m) || globalEventCtx != nil && globalEventCtx.remotePKModels[m.Name] {
+				apis = append(apis, schemaAPIInfo{
+					name: "svc:batchLoad:" + m.Name, moduleName: modName,
+					params:     []*ast.ParamDecl{{Name: "keys", Type: &ast.TypeRef{Name: modelIDTypeName(m), IsList: true}}},
+					returnType: &ast.TypeRef{Name: m.Name, IsList: true},
+				})
 			}
-			apis = append(apis, schemaAPIInfo{
-				name: "svc:batchLoad:" + m.Name, moduleName: modName,
-				returnType: &ast.TypeRef{Name: m.Name, IsList: true},
-			})
 		}
 		for _, api := range file.APIs {
 			apis = append(apis, schemaAPIInfo{
@@ -145,24 +164,43 @@ func collectSchemaAPIs(result *semantic.Result, enums map[string]bool, modelOwne
 				continue
 			}
 			for _, f := range ext.Fields {
-				if f.Type == nil || !isRelationField(f, enums) {
+				if f.Type == nil || modelFields[ext.Name][f.Name] || !isRelationField(f, enums) {
 					continue
 				}
-				fk := inferForeignKey(&ast.ModelDecl{Name: ext.Name}, f, enums)
+				fk := inferFederationForeignKey(&ast.ModelDecl{Name: ext.Name}, f)
 				apis = append(apis, schemaAPIInfo{
 					name: "svc:resolve:" + f.Type.Name + ":" + fk, moduleName: modName,
+					params:     []*ast.ParamDecl{{Name: "keys", Type: &ast.TypeRef{Name: externalModelIDTypeName(ext.Name), IsList: true}}},
 					returnType: &ast.TypeRef{Name: f.Type.Name, IsList: true},
 				})
 			}
 		}
 	}
+	if len(result.Files) > 0 && globalEventCtx != nil {
+		moduleName := moduleNameFromFile(result.Files[0].Name)
+		for _, call := range globalEventCtx.remoteLoadCalls[moduleName] {
+			params := make([]*ast.ParamDecl, len(call.argNames))
+			for i, argName := range call.argNames {
+				params[i] = &ast.ParamDecl{Name: argName, Type: &ast.TypeRef{Name: call.argTypeNames[i], IsList: true}}
+			}
+			apis = append(apis, schemaAPIInfo{
+				name: loadServiceName(call), moduleName: moduleName,
+				params: params, returnType: &ast.TypeRef{Name: call.modelName, IsList: true},
+			})
+		}
+	}
 	return apis
 }
 
-func buildCrudAPIInfo(modelName, op, modName string) schemaAPIInfo {
+func buildCrudAPIInfo(model *ast.ModelDecl, op, modName string, enums map[string]bool) schemaAPIInfo {
+	modelName := model.Name
 	apiName := crudAPIName(modelName, op)
 	ai := schemaAPIInfo{name: apiName, moduleName: modName}
-	idParam := []*ast.ParamDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}}
+	idType := &ast.TypeRef{Name: "Int"}
+	if field := primaryKeyField(model); field != nil {
+		idType = &ast.TypeRef{Name: field.Type.Name}
+	}
+	idParam := []*ast.ParamDecl{{Name: "id", Type: idType}}
 	switch op {
 	case "get":
 		ai.returnType = &ast.TypeRef{Name: modelName}
@@ -174,12 +212,44 @@ func buildCrudAPIInfo(modelName, op, modName string) schemaAPIInfo {
 			{Name: "page", Type: &ast.TypeRef{Name: "Int"}},
 			{Name: "pageSize", Type: &ast.TypeRef{Name: "Int"}},
 		}
-	case "create", "update":
+	case "create":
 		ai.returnType = &ast.TypeRef{Name: modelName}
+		ai.params = crudParamDecls(model, enums, false)
+		ai.optionalParams = crudOptionalParams(ai.params, false)
+	case "update":
+		ai.returnType = &ast.TypeRef{Name: modelName}
+		ai.params = append(idParam, crudParamDecls(model, enums, true)...)
+		ai.optionalParams = crudOptionalParams(ai.params, true)
 	case "delete":
+		ai.returnType = &ast.TypeRef{Name: "Int"}
 		ai.params = idParam
+	case "deleteMany":
+		ai.returnType = &ast.TypeRef{Name: "Int"}
+		ai.params = []*ast.ParamDecl{{Name: "ids", Type: &ast.TypeRef{Name: idType.Name, IsList: true}}}
 	}
 	return ai
+}
+
+func crudOptionalParams(params []*ast.ParamDecl, update bool) map[string]bool {
+	optional := make(map[string]bool)
+	for _, param := range params {
+		if param.Name != "id" && (update || param.Default != nil || (param.Type != nil && param.Type.Nullable)) {
+			optional[param.Name] = true
+		}
+	}
+	return optional
+}
+
+func crudParamDecls(model *ast.ModelDecl, enums map[string]bool, update bool) []*ast.ParamDecl {
+	params := make([]*ast.ParamDecl, 0, len(model.Fields))
+	for _, field := range model.Fields {
+		if field.Type == nil || skipHandlerField(field, enums) ||
+			(update && (field.Name == primaryKeyFieldName(model) || hasDirective(field.Directives, "immutable"))) {
+			continue
+		}
+		params = append(params, &ast.ParamDecl{Name: field.Name, Type: field.Type, Default: field.Default})
+	}
+	return params
 }
 
 // writeModelRegistration generates schema.RegisterModel for one model.
@@ -194,7 +264,7 @@ func writeModelRegistration(b *strings.Builder, m *ast.ModelDecl, moduleName str
 	fmt.Fprintf(b, "\t\tFields: []schema.Field{\n")
 
 	for _, f := range m.Fields {
-		if f.Type == nil || f.Computed != nil {
+		if f.Type == nil {
 			continue
 		}
 		if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
@@ -211,8 +281,8 @@ func writeModelRegistration(b *strings.Builder, m *ast.ModelDecl, moduleName str
 		// Scalar fields: write type info for Binary↔JSON
 		if !relation {
 			fieldType := luxoTypeToSchemaType(f.Type.Name, enums)
-			fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, Nullable: %v},\n",
-				fieldID, f.Name, fieldType, f.Type.Nullable)
+			fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, Nullable: %v, Computed: %v, PrimaryKey: %v},\n",
+				fieldID, f.Name, fieldType, f.Type.Nullable, f.Computed != nil, f.Name == primaryKeyFieldName(m))
 			continue
 		}
 
@@ -274,7 +344,7 @@ func writeEnumRegistration(b *strings.Builder, enumDecl *ast.EnumDecl, moduleNam
 }
 
 // writeAPIRegistrationSchema generates schema.RegisterAPI for one API.
-func writeAPIRegistrationSchema(b *strings.Builder, name, moduleName string, params []*ast.ParamDecl, returnType *ast.TypeRef, paginated, stream bool, directives ...[]*ast.Directive) {
+func writeAPIRegistrationSchema(b *strings.Builder, name, moduleName string, params []*ast.ParamDecl, returnType *ast.TypeRef, paginated, stream bool, enums map[string]bool, optionalParams map[string]bool, directives ...[]*ast.Directive) {
 	apiID := getAPIID(name)
 	fmt.Fprintf(b, "\ts.RegisterAPI(&schema.API{\n")
 	fmt.Fprintf(b, "\t\tID: %d, Name: %q, Module: %q,\n", apiID, name, moduleName)
@@ -305,21 +375,23 @@ func writeAPIRegistrationSchema(b *strings.Builder, name, moduleName string, par
 		for _, p := range params {
 			paramID := getAPIParamID(name, p.Name)
 			pType := "FieldString"
+			typeName := "String"
 			isList := false
 			nullable := false
 			if p.Type != nil {
-				pType = luxoTypeToSchemaType(p.Type.Name, nil)
+				typeName = p.Type.Name
+				pType = luxoParamToSchemaType(typeName, enums)
 				isList = p.Type.IsList
 				nullable = p.Type.Nullable
 			}
-			fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, TypeName: %q", paramID, p.Name, pType, p.Type.Name)
+			fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, TypeName: %q", paramID, p.Name, pType, typeName)
 			if isList {
 				b.WriteString(", IsList: true")
 			}
 			if nullable {
 				b.WriteString(", Nullable: true")
 			}
-			if p.Default != nil {
+			if p.Default != nil || optionalParams[p.Name] {
 				b.WriteString(", HasDefault: true")
 			}
 			b.WriteString("},\n")
@@ -327,6 +399,14 @@ func writeAPIRegistrationSchema(b *strings.Builder, name, moduleName string, par
 		fmt.Fprintf(b, "\t\t},\n")
 	}
 	fmt.Fprintf(b, "\t})\n")
+}
+
+func luxoParamToSchemaType(typeName string, enums map[string]bool) string {
+	typeID := luxoTypeToSchemaType(typeName, enums)
+	if typeID == "FieldModel" {
+		return "FieldJSON"
+	}
+	return typeID
 }
 
 func getAPIParamID(apiName, paramName string) int {
@@ -361,8 +441,12 @@ func luxoTypeToSchemaType(typeName string, enums map[string]bool) string {
 		return "FieldBytes"
 	case "UUID":
 		return "FieldUUID"
+	case "Decimal":
+		return "FieldDecimal"
+	case "JSON":
+		return "FieldJSON"
 	default:
-		return "FieldString" // enum/unknown → string
+		return "FieldModel"
 	}
 }
 
@@ -378,71 +462,76 @@ func BuildSchemaJSON(result *semantic.Result, enums map[string]bool) ([]byte, er
 }
 
 func buildSchemaModels(s *schema.Schema, result *semantic.Result, enums map[string]bool) {
-	// Collect models and track which module owns each model
-	var models []*ast.ModelDecl
-	modelModule := make(map[string]string) // modelName → owning module
-	modelNames := make(map[string]bool)
+	modelModule := make(map[string]string)
+	modelDecls := make(map[string]*ast.ModelDecl)
 	for _, file := range result.Files {
 		modName := moduleNameFromFile(file.Name)
 		for _, m := range file.Models {
-			models = append(models, m)
-			modelNames[m.Name] = true
 			modelModule[m.Name] = modName
+			modelDecls[m.Name] = m
+			s.RegisterModel(schemaModelFromDecl(m, modName, enums))
 		}
 	}
 
-	// Collect extend fields with their source module
-	// extendFields[modelName] = [{field, module}]
-	type extendFieldInfo struct {
-		field  *ast.FieldDecl
-		module string
-	}
-	extendFields := make(map[string][]extendFieldInfo)
 	for _, file := range result.Files {
 		modName := moduleNameFromFile(file.Name)
 		for _, ext := range file.Extends {
+			stub := &schema.Model{Name: ext.Name, Module: modelModule[ext.Name]}
+			owner := modelDecls[ext.Name]
 			for _, f := range ext.Fields {
-				extendFields[ext.Name] = append(extendFields[ext.Name], extendFieldInfo{field: f, module: modName})
-			}
-			if !modelNames[ext.Name] {
-				// Cross-module stub — model defined in another module
-				models = append(models, &ast.ModelDecl{Name: ext.Name, Fields: ext.Fields})
-				modelNames[ext.Name] = true
-			}
-		}
-	}
-
-	for _, m := range models {
-		sm := &schema.Model{Name: m.Name, Module: modelModule[m.Name]}
-		ownerModule := modelModule[m.Name]
-		for _, f := range m.Fields {
-			if f.Type == nil || f.Computed != nil {
-				continue
-			}
-			if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
-				continue
-			}
-			sf := schema.Field{
-				ID:       getModelFieldID(m.Name, f.Name),
-				Name:     f.Name,
-				Type:     luxoTypeToSchemaFieldType(f.Type.Name, enums),
-				TypeName: f.Type.Name,
-				Nullable: f.Type.Nullable,
-				IsList:   f.Type.IsList,
-				Relation: isRelationField(f, enums),
-			}
-			// Check if this field comes from an extend (different module)
-			for _, ef := range extendFields[m.Name] {
-				if ef.field.Name == f.Name && ef.module != ownerModule {
-					sf.Module = ef.module
-					sf.ForeignKey = inferForeignKey(m, f, enums)
-					break
+				field, ok := schemaFieldFromDecl(ext.Name, f, "", enums)
+				if !ok {
+					continue
 				}
+				if owner == nil || !modelDeclHasField(owner, f.Name) {
+					field.Module = modName
+					if field.Relation {
+						field.ForeignKey = inferFederationForeignKey(&ast.ModelDecl{Name: ext.Name}, f)
+					}
+				}
+				stub.Fields = append(stub.Fields, field)
 			}
-			sm.Fields = append(sm.Fields, sf)
+			s.RegisterModel(stub)
 		}
-		s.RegisterModel(sm)
 	}
+}
+
+func schemaModelFromDecl(model *ast.ModelDecl, module string, enums map[string]bool) *schema.Model {
+	result := &schema.Model{Name: model.Name, Module: module}
+	primaryKey := primaryKeyFieldName(model)
+	for _, field := range model.Fields {
+		converted, ok := schemaFieldFromDecl(model.Name, field, primaryKey, enums)
+		if ok {
+			result.Fields = append(result.Fields, converted)
+		}
+	}
+	return result
+}
+
+func schemaFieldFromDecl(modelName string, field *ast.FieldDecl, primaryKey string, enums map[string]bool) (schema.Field, bool) {
+	if field.Type == nil || hasDirective(field.Directives, "hidden") || hasDirective(field.Directives, "internal") {
+		return schema.Field{}, false
+	}
+	return schema.Field{
+		ID:         getModelFieldID(modelName, field.Name),
+		Name:       field.Name,
+		Type:       luxoTypeToSchemaFieldType(field.Type.Name, enums),
+		TypeName:   field.Type.Name,
+		Nullable:   field.Type.Nullable,
+		IsList:     field.Type.IsList,
+		Relation:   isRelationField(field, enums),
+		Computed:   field.Computed != nil,
+		PrimaryKey: field.Name == primaryKey,
+	}, true
+}
+
+func modelDeclHasField(model *ast.ModelDecl, name string) bool {
+	for _, field := range model.Fields {
+		if field.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // inferForeignKey determines the FK field name for a relation field.
@@ -455,11 +544,28 @@ func inferForeignKey(m *ast.ModelDecl, f *ast.FieldDecl, enums map[string]bool) 
 		remoteKey, _ := extractByArgs(byDir)
 		return remoteKey
 	}
-	// Auto-infer: hasMany → "{modelName}Id", belongsTo → "id"
+	// Auto-infer: hasMany/hasOne use "{modelName}{PrimaryKey}".
 	if f.Type != nil && f.Type.IsList {
-		return str.LowerFirst(m.Name) + "Id"
+		return relationForeignKeyName(m)
 	}
 	return "id"
+}
+
+func inferFederationForeignKey(model *ast.ModelDecl, field *ast.FieldDecl) string {
+	if by := findDirective(field.Directives, "by"); by != nil {
+		if remote, _ := extractByArgs(by); remote != "" {
+			return remote
+		}
+	}
+	return relationForeignKeyName(model)
+}
+
+func relationForeignKeyName(model *ast.ModelDecl) string {
+	keyName := externalModelIDFieldName(model.Name)
+	if field := primaryKeyField(model); field != nil {
+		keyName = field.Name
+	}
+	return str.LowerFirst(model.Name) + str.Capitalize(keyName)
 }
 
 func buildSchemaAPIs(s *schema.Schema, result *semantic.Result, enums map[string]bool) {
@@ -472,10 +578,11 @@ func buildSchemaAPIs(s *schema.Schema, result *semantic.Result, enums map[string
 			for _, op := range crudOperations(m) {
 				apiName := crudAPIName(m.Name, op)
 				a := &schema.API{ID: getAPIID(apiName), Name: apiName, Module: modName}
+				idParam := schemaParamForModelID(apiName, m, enums, false)
 				switch op {
 				case "get":
 					a.ReturnType = m.Name
-					a.Params = []schema.Param{{ID: getAPIParamID(apiName, "id"), Name: "id", Type: schema.FieldInt}}
+					a.Params = []schema.Param{idParam}
 				case "list":
 					a.ReturnType = m.Name
 					a.ReturnList = true
@@ -484,10 +591,18 @@ func buildSchemaAPIs(s *schema.Schema, result *semantic.Result, enums map[string
 						{ID: getAPIParamID(apiName, "page"), Name: "page", Type: schema.FieldInt},
 						{ID: getAPIParamID(apiName, "pageSize"), Name: "pageSize", Type: schema.FieldInt},
 					}
-				case "create", "update":
+				case "create":
 					a.ReturnType = m.Name
+					a.Params = schemaCRUDFieldParams(apiName, m, enums, false)
+				case "update":
+					a.ReturnType = m.Name
+					a.Params = append([]schema.Param{idParam}, schemaCRUDFieldParams(apiName, m, enums, true)...)
 				case "delete":
-					a.Params = []schema.Param{{ID: getAPIParamID(apiName, "id"), Name: "id", Type: schema.FieldInt}}
+					a.ReturnType = "Int"
+					a.Params = []schema.Param{idParam}
+				case "deleteMany":
+					a.ReturnType = "Int"
+					a.Params = []schema.Param{schemaParamForModelID(apiName, m, enums, true)}
 				}
 				s.RegisterAPI(a)
 			}
@@ -503,7 +618,7 @@ func buildSchemaAPIs(s *schema.Schema, result *semantic.Result, enums map[string
 			for _, p := range api.Params {
 				a.Params = append(a.Params, schema.Param{
 					ID: getAPIParamID(api.Name, p.Name), Name: p.Name,
-					Type:       luxoTypeToSchemaFieldType(p.Type.Name, enums),
+					Type:       luxoParamToSchemaFieldType(p.Type.Name, enums),
 					TypeName:   p.Type.Name,
 					IsList:     p.Type.IsList,
 					Nullable:   p.Type.Nullable,
@@ -513,6 +628,37 @@ func buildSchemaAPIs(s *schema.Schema, result *semantic.Result, enums map[string
 			s.RegisterAPI(a)
 		}
 	}
+}
+
+func schemaParamForModelID(apiName string, model *ast.ModelDecl, enums map[string]bool, list bool) schema.Param {
+	typeName := "Int"
+	if field := primaryKeyField(model); field != nil {
+		typeName = field.Type.Name
+	}
+	name := "id"
+	if list {
+		name = "ids"
+	}
+	return schema.Param{
+		ID: getAPIParamID(apiName, name), Name: name,
+		Type: luxoParamToSchemaFieldType(typeName, enums), TypeName: typeName, IsList: list,
+	}
+}
+
+func schemaCRUDFieldParams(apiName string, model *ast.ModelDecl, enums map[string]bool, update bool) []schema.Param {
+	params := make([]schema.Param, 0, len(model.Fields))
+	for _, field := range model.Fields {
+		if field.Type == nil || skipHandlerField(field, enums) ||
+			(update && (field.Name == primaryKeyFieldName(model) || hasDirective(field.Directives, "immutable"))) {
+			continue
+		}
+		params = append(params, schema.Param{
+			ID: getAPIParamID(apiName, field.Name), Name: field.Name,
+			Type: luxoParamToSchemaFieldType(field.Type.Name, enums), TypeName: field.Type.Name,
+			IsList: field.Type.IsList, Nullable: field.Type.Nullable, HasDefault: update || field.Type.Nullable || field.Default != nil,
+		})
+	}
+	return params
 }
 
 func buildSchemaEnums(s *schema.Schema, result *semantic.Result) {
@@ -563,7 +709,21 @@ func luxoTypeToSchemaFieldType(typeName string, enums map[string]bool) schema.Fi
 		return schema.FieldBytes
 	case "UUID":
 		return schema.FieldUUID
+	case "Decimal":
+		return schema.FieldDecimal
+	case "JSON":
+		return schema.FieldJSON
 	default:
-		return schema.FieldString
+		return schema.FieldModel
 	}
+}
+
+// luxoParamToSchemaFieldType maps structured params to their canonical JSON
+// wire representation while TypeName retains the generated SDK type.
+func luxoParamToSchemaFieldType(typeName string, enums map[string]bool) schema.FieldType {
+	typeID := luxoTypeToSchemaFieldType(typeName, enums)
+	if typeID == schema.FieldModel {
+		return schema.FieldJSON
+	}
+	return typeID
 }

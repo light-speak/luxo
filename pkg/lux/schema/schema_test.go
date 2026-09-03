@@ -87,6 +87,36 @@ func TestRegisterModelOverwrite(t *testing.T) {
 	}
 }
 
+func TestRegisterModelMergesFederationStub(t *testing.T) {
+	s := New()
+	s.RegisterModel(&Model{
+		Name:   "User",
+		Module: "user",
+		Fields: []Field{
+			{ID: 1, Name: "key", Type: FieldUUID, PrimaryKey: true},
+			{ID: 2, Name: "name", Type: FieldString},
+		},
+	})
+	s.RegisterModel(&Model{
+		Name: "User",
+		Fields: []Field{{
+			ID: 10, Name: "posts", Type: FieldModel, TypeName: "Post",
+			Relation: true, IsList: true, Module: "post", ForeignKey: "userKey",
+		}},
+	})
+
+	model := s.Models["User"]
+	if model.Module != "user" || len(model.Fields) != 3 {
+		t.Fatalf("merged model = %#v", model)
+	}
+	if model.PrimaryKeyField() == nil || model.PrimaryKeyField().Name != "key" {
+		t.Fatalf("merged primary key = %#v", model.PrimaryKeyField())
+	}
+	if model.FieldByName("posts") == nil || model.FieldByName("name") == nil {
+		t.Fatalf("merged fields = %#v", model.Fields)
+	}
+}
+
 func TestRegisterAPI(t *testing.T) {
 	s := New()
 	a := &API{ID: 1, Name: "getUser", Module: "user", ReturnType: "User"}
@@ -115,6 +145,9 @@ func TestFieldTypeMarshalJSON(t *testing.T) {
 		{FieldBytes, `"Bytes"`},
 		{FieldEnum, `"Enum"`},
 		{FieldModel, `"Model"`},
+		{FieldUUID, `"UUID"`},
+		{FieldDecimal, `"Decimal"`},
+		{FieldJSON, `"JSON"`},
 	}
 	for _, tt := range tests {
 		b, err := tt.ft.MarshalJSON()
@@ -136,6 +169,26 @@ func TestFieldTypeMarshalJSON_Unknown(t *testing.T) {
 	}
 	if string(b) != `"Unknown"` {
 		t.Errorf("got %s, want %q", b, "Unknown")
+	}
+}
+
+func TestFieldTypeUnmarshalJSON(t *testing.T) {
+	for _, want := range []FieldType{
+		FieldInt, FieldFloat, FieldString, FieldBool, FieldDateTime, FieldDuration,
+		FieldBytes, FieldEnum, FieldModel, FieldUUID, FieldDecimal, FieldJSON,
+	} {
+		var got FieldType
+		data, _ := want.MarshalJSON()
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatalf("Unmarshal(%s): %v", data, err)
+		}
+		if got != want {
+			t.Fatalf("Unmarshal(%s) = %v, want %v", data, got, want)
+		}
+	}
+	var unknown FieldType
+	if err := json.Unmarshal([]byte(`"Bogus"`), &unknown); err == nil {
+		t.Fatal("unknown field type should fail")
 	}
 }
 
@@ -211,11 +264,17 @@ func TestSchemaToJSON_FieldTypesInJSON(t *testing.T) {
 
 func TestSelectToFieldMask_Empty(t *testing.T) {
 	m := &Model{Name: "Test"}
-	mask := SelectToFieldMask(nil, m)
+	mask, err := SelectToFieldMask(nil, m, New())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if mask != nil {
 		t.Error("nil fields should return nil mask (select all)")
 	}
-	mask = SelectToFieldMask([]*selection.Field{}, m)
+	mask, err = SelectToFieldMask([]*selection.Field{}, m, New())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if mask != nil {
 		t.Error("empty fields should return nil mask")
 	}
@@ -237,7 +296,11 @@ func TestSelectToFieldMask_ScalarFields(t *testing.T) {
 		{Name: "id"},
 		{Name: "email"},
 	}
-	mask := SelectToFieldMask(fields, m)
+	mask, err := SelectToFieldMask(fields, m, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mask = codec.SelectionMaskFields(mask)
 
 	// Should include field IDs 1 and 10
 	if !codec.FieldMaskHas(mask, 1) {
@@ -251,29 +314,44 @@ func TestSelectToFieldMask_ScalarFields(t *testing.T) {
 	}
 }
 
-func TestSelectToFieldMask_SkipsRelations(t *testing.T) {
+func TestSelectToFieldMask_EncodesRelationsRecursively(t *testing.T) {
 	s := New()
+	posts := &Model{
+		Name: "Post",
+		Fields: []Field{
+			{ID: 1, Name: "id", Type: FieldInt},
+			{ID: 2, Name: "title", Type: FieldString},
+		},
+	}
 	m := &Model{
 		Name: "User",
 		Fields: []Field{
 			{ID: 1, Name: "id", Type: FieldInt},
+			{ID: 4, Name: "posts", Type: FieldModel, TypeName: "Post", IsList: true, Relation: true},
 		},
 	}
+	s.RegisterModel(posts)
 	s.RegisterModel(m)
 
 	fields := []*selection.Field{
 		{Name: "id"},
 		{Name: "posts", Children: []*selection.Field{{Name: "title"}}}, // relation
 	}
-	mask := SelectToFieldMask(fields, m)
-
-	// "posts" should be skipped (has children)
-	if !codec.FieldMaskHas(mask, 1) {
-		t.Error("should include id")
+	mask, err := SelectToFieldMask(fields, m, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := codec.SelectionMaskFields(mask)
+	if !codec.FieldMaskHas(root, 1) || !codec.FieldMaskHas(root, 4) {
+		t.Fatalf("root mask should include id and posts: %v", root)
+	}
+	child, ok := codec.SelectionMaskNested(mask, 4)
+	if !ok || !codec.FieldMaskHas(codec.SelectionMaskFields(child), 2) {
+		t.Fatalf("posts mask should include title: %v", child)
 	}
 }
 
-func TestSelectToFieldMask_UnknownFieldIgnored(t *testing.T) {
+func TestSelectToFieldMask_RejectsInvalidSelections(t *testing.T) {
 	s := New()
 	m := &Model{
 		Name: "User",
@@ -287,9 +365,57 @@ func TestSelectToFieldMask_UnknownFieldIgnored(t *testing.T) {
 		{Name: "id"},
 		{Name: "nonexistent"},
 	}
-	mask := SelectToFieldMask(fields, m)
-	if !codec.FieldMaskHas(mask, 1) {
-		t.Error("should include id")
+	if _, err := SelectToFieldMask(fields, m, s); err == nil {
+		t.Fatal("unknown fields must be rejected")
+	}
+	if _, err := SelectToFieldMask([]*selection.Field{{Name: "id", Children: []*selection.Field{{Name: "x"}}}}, m, s); err == nil {
+		t.Fatal("nested selection on scalar field must be rejected")
+	}
+	if _, err := SelectToFieldMask([]*selection.Field{{Name: "id"}, {Name: "id"}}, m, s); err == nil {
+		t.Fatal("duplicate fields must be rejected")
+	}
+	if _, err := SelectToFieldMask([]*selection.Field{{Name: "id"}}, nil, s); err == nil {
+		t.Fatal("selection without a return model must be rejected")
+	}
+}
+
+func TestSelectToFieldMaskSupportsTypeDeclarationsAndSelectAllRelations(t *testing.T) {
+	s := New()
+	s.RegisterType(&TypeDecl{Name: "Payload", Fields: []Field{{ID: 1, Name: "value", Type: FieldString}}})
+	root := &Model{Name: "Root", Fields: []Field{{ID: 1, Name: "payload", Type: FieldModel, TypeName: "Payload", Relation: true}}}
+	s.RegisterModel(root)
+	mask, err := SelectToFieldMask([]*selection.Field{{Name: "payload", Children: []*selection.Field{}}}, root, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := codec.SelectionMaskNested(mask, 1); found {
+		t.Fatal("empty child selection should use the omitted-node select-all representation")
+	}
+}
+
+func TestSelectToFieldMaskRejectsMissingNestedMetadataAndExcessiveDepth(t *testing.T) {
+	s := New()
+	root := &Model{Name: "Node", Fields: []Field{{ID: 1, Name: "child", Type: FieldModel, TypeName: "Node", Relation: true}}}
+	s.RegisterModel(root)
+	selectionRoot := &selection.Field{Name: "child"}
+	cursor := selectionRoot
+	for range 33 {
+		child := &selection.Field{Name: "child"}
+		cursor.Children = []*selection.Field{child}
+		cursor = child
+	}
+	if _, err := SelectToFieldMask([]*selection.Field{selectionRoot}, root, s); err == nil {
+		t.Fatal("selection deeper than 32 must be rejected")
+	}
+
+	missing := &Model{Name: "MissingRoot", Fields: []Field{{ID: 1, Name: "child", Type: FieldModel, TypeName: "Missing", Relation: true}}}
+	s.RegisterModel(missing)
+	fields := []*selection.Field{{Name: "child", Children: []*selection.Field{{Name: "value"}}}}
+	if _, err := SelectToFieldMask(fields, missing, s); err == nil {
+		t.Fatal("missing nested type must be rejected")
+	}
+	if _, err := SelectToFieldMask(fields, missing, nil); err == nil {
+		t.Fatal("nested selection without schema must be rejected")
 	}
 }
 
@@ -368,5 +494,18 @@ func TestFieldTypeString(t *testing.T) {
 	}
 	if FieldEnum.String() != "Enum" {
 		t.Errorf("FieldEnum.String() = %q", FieldEnum.String())
+	}
+}
+
+func TestInvalidNegativeFieldTypeIsUnknown(t *testing.T) {
+	if got := FieldType(-1).String(); got != "Unknown" {
+		t.Fatalf("String() = %q", got)
+	}
+	data, err := FieldType(-1).MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != `"Unknown"` {
+		t.Fatalf("MarshalJSON() = %s", data)
 	}
 }

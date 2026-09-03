@@ -1,3 +1,5 @@
+// ignore_for_file: experimental_member_use
+
 import 'package:analyzer/dart/ast/ast.dart';
 import 'package:analyzer/dart/ast/visitor.dart';
 import 'package:analyzer/dart/element/type.dart';
@@ -151,7 +153,8 @@ class SelectAnalyzer extends RecursiveAstVisitor<void> {
     if (targetType == null) return null;
 
     if (targetType is InterfaceType) {
-      final className = targetType.element.name;
+      final className = targetType.element3.name3;
+      if (className == null) return null;
       if (!className.contains('LuxoClient') && !className.contains('Client')) {
         return null;
       }
@@ -170,13 +173,13 @@ class SelectAnalyzer extends RecursiveAstVisitor<void> {
       if (typeArgs.isNotEmpty) {
         final inner = typeArgs.first;
         if (inner is InterfaceType) {
-          return inner.element.name;
+          return inner.element3.name3;
         }
       }
     }
 
     if (returnType is InterfaceType) {
-      return returnType.element.name;
+      return returnType.element3.name3;
     }
     return null;
   }

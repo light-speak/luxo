@@ -466,12 +466,26 @@ func TestIntrospectionWrongKey(t *testing.T) {
 	rt := NewRouter()
 	rt.IntrospectionKey = "correct-key"
 
-	r := httptest.NewRequest(http.MethodGet, "/luvia?$schema&key=wrong", nil)
+	r := httptest.NewRequest(http.MethodGet, "/luvia?$schema", nil)
+	r.Header.Set("X-Introspection-Key", "wrong")
 	w := httptest.NewRecorder()
 	rt.ServeHTTP(w, r)
 
 	if w.Code != http.StatusForbidden {
 		t.Errorf("expected 403, got %d", w.Code)
+	}
+}
+
+func TestIntrospectionRejectsQueryKey(t *testing.T) {
+	rt := NewRouter()
+	rt.IntrospectionKey = "secret-key"
+
+	r := httptest.NewRequest(http.MethodGet, "/luvia?$schema&key=secret-key", nil)
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("query-string introspection key status = %d, want 403", w.Code)
 	}
 }
 
@@ -491,7 +505,8 @@ func TestIntrospectionSuccess(t *testing.T) {
 		ReturnType: "User",
 	})
 
-	r := httptest.NewRequest(http.MethodGet, "/luvia?$schema&key=test-key", nil)
+	r := httptest.NewRequest(http.MethodGet, "/luvia?$schema", nil)
+	r.Header.Set("X-Introspection-Key", "test-key")
 	w := httptest.NewRecorder()
 	rt.ServeHTTP(w, r)
 
@@ -544,7 +559,8 @@ func TestIntrospectionFieldTypes(t *testing.T) {
 		},
 	})
 
-	r := httptest.NewRequest(http.MethodGet, "/luvia?$schema&key=key", nil)
+	r := httptest.NewRequest(http.MethodGet, "/luvia?$schema", nil)
+	r.Header.Set("X-Introspection-Key", "key")
 	w := httptest.NewRecorder()
 	rt.ServeHTTP(w, r)
 
@@ -626,8 +642,8 @@ func TestIntrospectionViaHeader(t *testing.T) {
 	})
 	rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "getUser", Module: "user", ReturnType: "User"})
 
-	// Header takes priority — query param wrong but header correct should succeed
-	r := httptest.NewRequest(http.MethodGet, "/luvia?$schema&key=wrong", nil)
+	// The canonical header authenticates introspection.
+	r := httptest.NewRequest(http.MethodGet, "/luvia?$schema", nil)
 	r.Header.Set("X-Introspection-Key", "secret-key")
 	w := httptest.NewRecorder()
 	rt.ServeHTTP(w, r)
@@ -656,6 +672,28 @@ func TestConvertBinaryToJSON_EmptyData(t *testing.T) {
 	result = rt.convertBinaryToJSON("getUser", []byte{})
 	if string(result) != "null" {
 		t.Errorf("expected null for zero-length data, got %q", result)
+	}
+}
+
+func TestStreamPayloadJSONUsesSchemaConversion(t *testing.T) {
+	rt := NewRouter()
+	rt.Schema = schema.New()
+	rt.Schema.APIs["count"] = &schema.API{Name: "count", ReturnType: "Int"}
+	data := codec.AppendSvarint(nil, 42)
+	if got := string(rt.StreamPayloadJSON("count", data)); got != "42" {
+		t.Fatalf("StreamPayloadJSON = %s", got)
+	}
+}
+
+func TestConvertBinaryToJSONScalarListAndEnum(t *testing.T) {
+	rt := NewRouter()
+	rt.Schema = schema.New()
+	rt.Schema.RegisterEnum(&schema.Enum{Name: "Role", Values: []string{"ADMIN"}})
+	rt.Schema.APIs["roles"] = &schema.API{Name: "roles", ReturnType: "Role", ReturnList: true}
+	data := codec.AppendArrayHeader(nil, 1)
+	data = codec.AppendString(data, "ADMIN")
+	if got := string(rt.convertBinaryToJSON("roles", data)); got != `["ADMIN"]` {
+		t.Fatalf("enum list = %s", got)
 	}
 }
 
@@ -804,6 +842,44 @@ func TestHandleStream(t *testing.T) {
 	if rt.streamMatchers["watchTest"] == nil {
 		t.Error("matcher should be registered")
 	}
+	if !rt.isStreamAPI("watchTest") {
+		t.Error("registered matcher should mark the API as a stream")
+	}
+}
+
+func TestIsStreamAPIUsesSchemaAndNativeRegistration(t *testing.T) {
+	rt := NewRouter()
+	rt.Schema.RegisterAPI(&schema.API{Name: "watchSchema", Stream: true})
+	rt.Schema.RegisterAPI(&schema.API{Name: "regularAPI"})
+	rt.HandleStreamNative("watchNative", func(context.Context, *StreamParams, any, *Stream) {})
+
+	if !rt.isStreamAPI("watchSchema") {
+		t.Error("schema stream should be accepted")
+	}
+	if !rt.isStreamAPI("watchNative") {
+		t.Error("native stream registration should be accepted")
+	}
+	if rt.isStreamAPI("regularAPI") || rt.isStreamAPI("missing") {
+		t.Error("regular and missing APIs must not be accepted as streams")
+	}
+}
+
+func TestRouterValidateRequiresGeneratedStreamImplementations(t *testing.T) {
+	rt := NewRouter()
+	rt.RequireStream("watchMissing")
+	if err := rt.Validate(); err == nil || !strings.Contains(err.Error(), "watchMissing") {
+		t.Fatalf("missing stream validation error = %v", err)
+	}
+	rt.HandleStream("watchMissing", nil)
+	if err := rt.Validate(); err != nil {
+		t.Fatalf("registered event stream failed validation: %v", err)
+	}
+
+	rt.RequireStream("watchNative")
+	rt.HandleStreamNative("watchNative", func(context.Context, *StreamParams, any, *Stream) {})
+	if err := rt.Validate(); err != nil {
+		t.Fatalf("registered native stream failed validation: %v", err)
+	}
 }
 
 // --- convertBinaryToJSON: scalar, type declaration, list, paginated ---
@@ -934,7 +1010,8 @@ func TestIntrospectionNoSchema(t *testing.T) {
 	rt.IntrospectionKey = "key"
 	rt.Schema = nil
 
-	r := httptest.NewRequest(http.MethodGet, "/luvia?$schema&key=key", nil)
+	r := httptest.NewRequest(http.MethodGet, "/luvia?$schema", nil)
+	r.Header.Set("X-Introspection-Key", "key")
 	w := httptest.NewRecorder()
 	rt.ServeHTTP(w, r)
 
@@ -993,6 +1070,40 @@ func TestRouterJSONWithFieldMaskConversion(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRouterJSONSelectionSupportsTypeReturn(t *testing.T) {
+	rt := NewRouter()
+	rt.Schema.RegisterType(&schema.TypeDecl{
+		Name: "AuthPayload",
+		Fields: []schema.Field{
+			{ID: 1, Name: "token", Type: schema.FieldString},
+			{ID: 2, Name: "expiresAt", Type: schema.FieldDateTime},
+		},
+	})
+	rt.Schema.RegisterAPI(&schema.API{ID: 2, Name: "login", Module: "auth", ReturnType: "AuthPayload"})
+
+	maskApplied := false
+	rt.Handle("login", func(ctx context.Context, req *Request) error {
+		maskApplied = bytes.Equal(req.FieldMask, []byte{1, 1})
+		req.Buf.B = codec.AppendVarint(req.Buf.B, 0)
+		var enc codec.Encoder
+		enc.WriteFieldString(1, "token")
+		enc.WriteEnd()
+		req.Buf.B = append(req.Buf.B, enc.Bytes()...)
+		return nil
+	})
+
+	r := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(`{"$api":"login","$select":"token"}`))
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	if !maskApplied {
+		t.Fatal("type return selection was not converted to a field mask")
 	}
 }
 

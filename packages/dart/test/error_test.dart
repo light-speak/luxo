@@ -16,9 +16,26 @@ void main() {
       expect(err.traceId, isNull);
     });
 
+    test('carries structured data and development cause', () {
+      final err = LuxoError(
+          'BadRequest',
+          400,
+          'bad',
+          'trace',
+          {
+            'param': 'email',
+          },
+          'validation failed');
+      expect(err.data, equals({'param': 'email'}));
+      expect(err.cause, equals('validation failed'));
+    });
+
     test('toString format', () {
       final err = LuxoError('Unauthorized', 401, 'invalid token');
-      expect(err.toString(), equals('LuxoError(Unauthorized, 401, invalid token)'));
+      expect(
+        err.toString(),
+        equals('LuxoError(Unauthorized, 401, invalid token)'),
+      );
     });
 
     test('toString with empty message', () {

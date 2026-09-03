@@ -1,0 +1,25 @@
+{
+  "models": {
+    "Node": {
+      "name": "Node",
+      "fields": [
+        {"id": 1, "name": "name", "type": "String"},
+        {"id": 2, "name": "posts", "type": "Post", "typeName": "Post", "isList": true, "relation": true}
+      ]
+    },
+    "Post": {
+      "name": "Post",
+      "fields": [
+        {"id": 1, "name": "title", "type": "String"}
+      ]
+    }
+  },
+  "apis": {
+    "lookupNode": {
+      "id": 1,
+      "name": "lookupNode",
+      "module": "node",
+      "returnType": "Node"
+    }
+  }
+}

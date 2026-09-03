@@ -235,6 +235,26 @@ func TestQueryScalar(t *testing.T) {
 	}
 }
 
+func TestQueryRaw(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	rows, err := QueryRaw(ctx, db, "SELECT $1::bigint", int64(42))
+	if err != nil {
+		t.Fatalf("query raw: %v", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatal("expected one row")
+	}
+	var value int64
+	if err := rows.Scan(&value); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if value != 42 {
+		t.Fatalf("value = %d, want 42", value)
+	}
+}
+
 func TestExec(t *testing.T) {
 	db := testDB(t)
 	ctx := context.Background()

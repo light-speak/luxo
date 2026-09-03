@@ -127,12 +127,29 @@ func TestCompileAPIBody_ParamWithDefaultCustomType(t *testing.T) {
 	compileAPIBody(&b, api, nil, nil)
 	out := b.String()
 
-	// Custom type with default uses var + ParamJSON
+	// Custom type with default uses the optional JSON extractor.
 	if !strings.Contains(out, "var input CreateInput") {
 		t.Fatalf("expected var declaration, got:\n%s", out)
 	}
-	if !strings.Contains(out, `req.ParamJSON("input", &input)`) {
-		t.Fatalf("expected ParamJSON, got:\n%s", out)
+	if !strings.Contains(out, `req.ParamJSONOptional("input", &input)`) {
+		t.Fatalf("expected ParamJSONOptional, got:\n%s", out)
+	}
+}
+
+func TestCompileAPIBody_NullableParamIsRequired(t *testing.T) {
+	api := &ast.ApiDecl{
+		Name: "update",
+		Params: []*ast.ParamDecl{{
+			Name: "note",
+			Type: &ast.TypeRef{Name: "String", Nullable: true},
+		}},
+		Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{}}},
+	}
+
+	var b strings.Builder
+	compileAPIBody(&b, api, nil, nil)
+	if out := b.String(); !strings.Contains(out, `req.ParamJSONNullable("note", &note)`) {
+		t.Fatalf("nullable parameter must remain required:\n%s", out)
 	}
 }
 

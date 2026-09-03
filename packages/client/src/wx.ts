@@ -1,6 +1,6 @@
+import { decodeBinaryError, encodeBinaryBody } from './transport'
 import type { Transport, TransportMode, APISchema } from './transport'
 import { LuxoError } from './error'
-import { Encoder } from './codec'
 
 declare const wx: {
   request(options: {
@@ -63,7 +63,14 @@ export class WxTransport implements Transport {
           }
 
           if (json.error) {
-            reject(new LuxoError(String(json.error), Number(json.code ?? 0), String(json.message ?? ''), json.traceId != null ? String(json.traceId) : undefined))
+			reject(new LuxoError(
+			  String(json.error),
+			  Number(json.code ?? 0),
+			  String(json.message ?? ''),
+			  json.traceId != null ? String(json.traceId) : undefined,
+			  json.data,
+			  json.cause != null ? String(json.cause) : undefined,
+			))
             return
           }
           resolve(json.data as T)
@@ -81,34 +88,18 @@ export class WxTransport implements Transport {
       return Promise.reject(new LuxoError('ConfigError', 0, `no schema for API "${api}" — binary mode requires schema`))
     }
 
-    const enc = new Encoder()
-    enc.writeVarint(apiMeta.id)
-    enc.writeVarint(0) // field mask = 0
-
-    if (params && apiMeta.params) {
-      for (const pm of apiMeta.params) {
-        const v = params[pm.name]
-        if (v === undefined) continue
-        switch (pm.type) {
-          case 'Int': enc.writeFieldInt(pm.fieldID, v as number); break
-          case 'Float': enc.writeFieldFloat(pm.fieldID, v as number); break
-          case 'String': enc.writeFieldString(pm.fieldID, v as string); break
-          case 'Boolean': enc.writeFieldBool(pm.fieldID, v as boolean); break
-        }
-      }
-    }
-    enc.writeEnd()
+	const body = encodeBinaryBody(apiMeta, params)
 
     return new Promise((resolve, reject) => {
       wx.request({
         url: this.endpoint,
         method: 'POST',
         header: { 'Content-Type': 'application/x-luxo', 'X-Luxo-Mode': 'binary', ...this.headers },
-        data: enc.bytes().buffer,
+		data: new Uint8Array(body).buffer,
         responseType: 'arraybuffer',
         success(res) {
           if (res.statusCode !== 200) {
-            reject(new LuxoError('Error', res.statusCode, `HTTP ${res.statusCode}`))
+		  reject(decodeBinaryError(new Uint8Array(res.data as ArrayBuffer), res.statusCode))
             return
           }
           resolve(new Uint8Array(res.data as ArrayBuffer) as unknown as T)
@@ -130,5 +121,17 @@ export class WxTransport implements Transport {
 
   setMode(mode: TransportMode): void {
     this.mode = mode
+  }
+
+  setSchema(schema: Record<string, APISchema>): void {
+    this.schema = schema
+  }
+
+  subscribe(
+	_api: string,
+	_params: Record<string, unknown>,
+	_onData: (data: unknown) => void,
+  ): Promise<() => void> {
+    return Promise.reject(new LuxoError('ConfigError', 0, 'subscriptions require a WebSocket endpoint'))
   }
 }

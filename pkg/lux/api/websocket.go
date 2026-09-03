@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sync"
 
@@ -10,8 +11,6 @@ import (
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
-	"github.com/light-speak/luxo/pkg/lux/schema"
-	"github.com/light-speak/luxo/pkg/lux/selection"
 	"nhooyr.io/websocket"
 )
 
@@ -19,8 +18,9 @@ import (
 // WebSocket spec: concurrent writes are not safe, so we serialize with a mutex.
 // Reads are single-goroutine (the read loop), no lock needed.
 type wsConn struct {
-	conn *websocket.Conn
-	mu   sync.Mutex // serialize writes
+	conn           *websocket.Conn
+	acceptLanguage string
+	mu             sync.Mutex // serialize writes
 }
 
 func (c *wsConn) writeText(ctx context.Context, data []byte) error {
@@ -45,11 +45,19 @@ func (c *wsConn) writeBinary(ctx context.Context, data []byte) error {
 //	  Response: {"$id": 1, "data": {...}} or {"$id": 1, "error": "...", "code": 404, ...}
 //
 //	Binary (binary frame):
-//	  Request:  [seq varint][API ID varint][FieldMask len][mask][Params...][0x00]
-//	  Response: [seq varint][status: 0x01=ok | 0x00=error][payload]
+//	  Call:      [0x01][seq varint][API ID varint][FieldMask len][mask][Params...][0x00]
+//	  Success:   [0x02][seq varint][payload]
+//	  Error:     [0x03][seq varint][Binary Error Envelope]
+//	  Subscribe: [0x04][API ID varint][FieldMask len][mask][Params...][0x00]
+//	  Unsub:     [0x05][API ID varint]
+//	  Stream:    [0x06][API ID varint][payload]
+//	  Sub OK:    [0x07][API ID varint]
+//	  Sub Error: [0x08][API ID varint][Binary Error Envelope]
 func (rt *Router) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	opts := &websocket.AcceptOptions{}
-	if len(rt.WSOrigins) > 0 {
+	if rt.WSAllowAllOrigins {
+		opts.InsecureSkipVerify = true
+	} else if len(rt.WSOrigins) > 0 {
 		opts.OriginPatterns = rt.WSOrigins
 	} else if rt.devMode {
 		opts.InsecureSkipVerify = true
@@ -61,7 +69,7 @@ func (rt *Router) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(1 << 20) // 1MB max incoming message
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
-	ws := &wsConn{conn: conn}
+	ws := &wsConn{conn: conn, acceptLanguage: r.Header.Get("Accept-Language")}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
@@ -86,11 +94,11 @@ func (rt *Router) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			} else {
 				go rt.handleWSJSON(ctx, ws, data)
 			}
-		} else {
-			// Binary: check prefix byte for stream messages
-			if len(data) > 0 && (data[0] == 0xFE || data[0] == 0xFF) {
+		} else if len(data) > 0 {
+			switch data[0] {
+			case BinaryFrameSubscribe, BinaryFrameUnsubscribe:
 				rt.handleWSStreamBinary(ctx, ws, data, &connSubs)
-			} else {
+			case BinaryFrameCallRequest:
 				go rt.handleWSBinary(ctx, ws, data)
 			}
 		}
@@ -174,40 +182,46 @@ func (rt *Router) handleWSStreamJSON(ctx context.Context, ws *wsConn, data []byt
 	// Subscribe: {"$sub": "watchDanmaku", "roomId": 123}
 	if subRaw, ok := raw["$sub"]; ok {
 		var apiName string
-		json.Unmarshal(subRaw, &apiName)
-		if apiName == "" {
+		if err := json.Unmarshal(subRaw, &apiName); err != nil || apiName == "" {
+			rt.writeWSJSONSubscriptionError(ctx, ws, apiName, errors.New("BadRequest", http.StatusBadRequest, "invalid $sub API name"))
+			return
+		}
+		req, params, err := rt.parseJSONSubscription(raw)
+		if err != nil {
+			rt.writeWSJSONSubscriptionError(ctx, ws, apiName, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
+			return
+		}
+		if !rt.isStreamAPI(apiName) {
+			rt.writeWSJSONSubscriptionError(ctx, ws, apiName, errors.New("BadRequest", http.StatusBadRequest, apiName+" is not a stream API"))
+			return
+		}
+		if hasConnectionSubscription(*connSubs, apiName) {
+			rt.writeWSJSONSubscriptionError(ctx, ws, apiName, errors.New("Conflict", http.StatusConflict, apiName+" is already subscribed"))
 			return
 		}
 
-		// Extract params (non-reserved keys)
-		params := make(map[string]any)
-		for k, v := range raw {
-			if k == "$sub" || k == "$select" {
-				continue
-			}
-			var val any
-			json.Unmarshal(v, &val)
-			params[k] = val
-		}
-
 		// Extract identity from context
-		identity := identityFromCtx(ctx)
+		identity := rt.identityFromCtx(ctx)
 
 		// Per-subscription context — cancelled on slow consumer or connection close.
 		subCtx, subCancel := context.WithCancel(ctx)
 
-		sub := rt.Streams.SubscribeMode(apiName, params, identity, nil, false, subCancel)
+		sub := rt.Streams.SubscribeMode(apiName, params, identity, req.FieldMask, false, subCancel)
+		if sub == nil {
+			subCancel()
+			rt.writeWSJSONSubscriptionError(ctx, ws, apiName, errors.New("Unavailable", http.StatusServiceUnavailable, apiName+" subscriber limit reached"))
+			return
+		}
+		sub.Params.binary = append([]byte(nil), req.BinaryParams()...)
 		*connSubs = append(*connSubs, connStreamSub{apiName: apiName, sub: sub})
+		if err := rt.writeWSJSONSubscriptionSuccess(ctx, ws, apiName); err != nil {
+			return
+		}
 
 		// Start write pump
 		go WritePumpJSON(subCtx, ws, apiName, sub)
 
-		// If @stream @native without event source, invoke handler
-		if handler, ok := rt.streamHandlers[apiName]; ok {
-			streamParams := &StreamParams{values: params}
-			stream := &Stream{sub: sub, ctx: subCtx}
-			go handler(subCtx, streamParams, identity, stream)
-		}
+		rt.startNativeStreamHandler(subCtx, apiName, params, identity, sub)
 		return
 	}
 
@@ -225,15 +239,35 @@ func (rt *Router) handleWSStreamJSON(ctx context.Context, ws *wsConn, data []byt
 	}
 }
 
+func (rt *Router) parseJSONSubscription(raw map[string]json.RawMessage) (*Request, map[string]any, error) {
+	requestRaw := make(map[string]json.RawMessage, len(raw))
+	for key, value := range raw {
+		if key != "$sub" && key != "$unsub" {
+			requestRaw[key] = value
+		}
+	}
+	requestRaw["$api"] = raw["$sub"]
+	req, err := parseRawRequest(requestRaw)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := rt.prepareRequest(req, false); err != nil {
+		return nil, nil, err
+	}
+	canonical, err := rt.Registry.ParseBinaryRequest(req.BinaryRequest())
+	if err != nil {
+		return nil, nil, err
+	}
+	return canonical, binaryStreamParams(canonical), nil
+}
+
 // handleWSStreamBinary handles binary stream subscribe/unsubscribe.
-// 0xFE = subscribe: [0xFE][API ID varint][FieldMask len][mask][Params][0x00]
-// 0xFF = unsubscribe: [0xFF][API ID varint]
 func (rt *Router) handleWSStreamBinary(ctx context.Context, ws *wsConn, data []byte, connSubs *[]connStreamSub) {
 	if len(data) < 2 {
 		return
 	}
 
-	prefix := data[0]
+	frameType := data[0]
 	off := 1
 
 	apiID, n := codec.ReadVarint(data, off)
@@ -244,10 +278,16 @@ func (rt *Router) handleWSStreamBinary(ctx context.Context, ws *wsConn, data []b
 
 	apiName, ok := rt.Registry.NameByID(int(apiID))
 	if !ok {
+		if frameType == BinaryFrameSubscribe {
+			rt.writeWSBinarySubscriptionError(ctx, ws, apiID, errors.NotFound.WithData(errors.ResourceError{Resource: fmt.Sprintf("API %d", apiID)}))
+		}
 		return
 	}
 
-	if prefix == 0xFF {
+	if frameType == BinaryFrameUnsubscribe {
+		if off != len(data) {
+			return
+		}
 		// Unsubscribe
 		for i, cs := range *connSubs {
 			if cs.apiName == apiName {
@@ -258,86 +298,50 @@ func (rt *Router) handleWSStreamBinary(ctx context.Context, ws *wsConn, data []b
 		}
 		return
 	}
-
-	// Subscribe (0xFE)
-	// Read field mask
-	var fieldMask []byte
-	maskLen, mn := codec.ReadVarint(data, off)
-	if mn > 0 {
-		off += mn
-		if maskLen > 0 && off+int(maskLen) <= len(data) {
-			fieldMask = data[off : off+int(maskLen)]
-			off += int(maskLen)
-		}
+	if !rt.isStreamAPI(apiName) {
+		rt.writeWSBinarySubscriptionError(ctx, ws, apiID, errors.New("BadRequest", http.StatusBadRequest, apiName+" is not a stream API"))
+		return
+	}
+	if hasConnectionSubscription(*connSubs, apiName) {
+		rt.writeWSBinarySubscriptionError(ctx, ws, apiID, errors.New("Conflict", http.StatusConflict, apiName+" is already subscribed"))
+		return
 	}
 
-	// Read params
-	params := make(map[string]any)
-	paramMeta := rt.Registry.ParamOrder(apiName)
-	paramBuf := data[off:]
-	poff := 0
-	for poff < len(paramBuf) {
-		fid, pn := codec.ReadVarint(paramBuf, poff)
-		if pn <= 0 || fid == 0 {
-			break
-		}
-		poff += pn
-		matched := false
-		for _, pm := range paramMeta {
-			if pm.FieldID == int(fid) {
-				matched = true
-				switch pm.Type {
-				case "Int":
-					v, vn := codec.ReadSvarint(paramBuf, poff)
-					if vn > 0 {
-						poff += vn
-						params[pm.Name] = v
-					}
-				case "Float":
-					v, vn := codec.ReadFixed64(paramBuf, poff)
-					if vn > 0 {
-						poff += vn
-						params[pm.Name] = v
-					}
-				case "String":
-					v, vn := codec.ReadString(paramBuf, poff)
-					if vn > 0 {
-						poff += vn
-						params[pm.Name] = v
-					}
-				case "Boolean":
-					v, vn := codec.ReadBool(paramBuf, poff)
-					if vn > 0 {
-						poff += vn
-						params[pm.Name] = v
-					}
-				default:
-					// Unsupported type — stop parsing
-					return
-				}
-				break
-			}
-		}
-		if !matched {
-			// Unknown field ID — stop parsing to avoid desync
-			break
-		}
+	// Subscribe body is identical to the canonical HTTP binary request body.
+	req, err := rt.Registry.ParseBinaryRequest(data[1:])
+	if err != nil {
+		rt.writeWSBinarySubscriptionError(ctx, ws, apiID, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
+		return
 	}
+	params := binaryStreamParams(req)
 
-	identity := identityFromCtx(ctx)
+	identity := rt.identityFromCtx(ctx)
 	subCtx, subCancel := context.WithCancel(ctx)
 
-	sub := rt.Streams.SubscribeMode(apiName, params, identity, fieldMask, true, subCancel)
+	sub := rt.Streams.SubscribeMode(apiName, params, identity, req.FieldMask, true, subCancel)
+	if sub == nil {
+		subCancel()
+		rt.writeWSBinarySubscriptionError(ctx, ws, apiID, errors.New("Unavailable", http.StatusServiceUnavailable, apiName+" subscriber limit reached"))
+		return
+	}
+	sub.Params.binary = append([]byte(nil), req.BinaryParams()...)
 	*connSubs = append(*connSubs, connStreamSub{apiName: apiName, sub: sub})
+	if err := rt.writeWSBinarySubscriptionSuccess(ctx, ws, apiID); err != nil {
+		return
+	}
 
 	go WritePumpBinary(subCtx, ws, int(apiID), sub)
 
-	// If @stream @native without event source, invoke handler
-	if handler, ok := rt.streamHandlers[apiName]; ok {
-		streamParams := &StreamParams{values: params}
-		stream := &Stream{sub: sub, ctx: subCtx}
-		go handler(subCtx, streamParams, identity, stream)
+	rt.startNativeStreamHandler(subCtx, apiName, params, identity, sub)
+}
+
+func hasConnectionSubscription(subscriptions []connStreamSub, apiName string) bool {
+	for _, subscription := range subscriptions {
+		if subscription.apiName == apiName {
+			return true
+		}
 	}
+	return false
 }
 
 // IdentityExtractor extracts identity from context.
@@ -349,6 +353,13 @@ func identityFromCtx(ctx context.Context) any {
 		return IdentityExtractor(ctx)
 	}
 	return nil
+}
+
+func (rt *Router) identityFromCtx(ctx context.Context) any {
+	if rt.IdentityExtractor != nil {
+		return rt.IdentityExtractor(ctx)
+	}
+	return identityFromCtx(ctx)
 }
 
 // handleWSJSON processes a JSON WebSocket message.
@@ -365,58 +376,23 @@ func (rt *Router) handleWSJSON(ctx context.Context, ws *wsConn, data []byte) {
 		json.Unmarshal(idRaw, &seqID)
 	}
 
-	// Extract $api
-	var apiName string
-	if apiRaw, ok := raw["$api"]; ok {
-		json.Unmarshal(apiRaw, &apiName)
-	}
-	if apiName == "" {
-		rt.writeWSJSONError(ctx, ws, seqID, "BadRequest", 400, "missing $api")
+	req, err := parseRawRequest(raw)
+	if err != nil {
+		rt.writeWSJSONError(ctx, ws, seqID, "BadRequest", 400, err.Error())
 		return
 	}
+	req.BinaryMode = true // handler always writes binary
 
 	// Find handler
-	fn, ok := rt.handlers[apiName]
+	fn, ok := rt.handlers[req.API]
 	if !ok {
-		rt.writeWSJSONError(ctx, ws, seqID, "NotFound", 404, apiName+" not found")
+		rt.writeWSJSONError(ctx, ws, seqID, "NotFound", 404, req.API+" not found")
 		return
 	}
 
-	// Build Request (reuse existing parsing for params)
-	req := &Request{
-		API:        apiName,
-		Params:     make(map[string]json.RawMessage),
-		BinaryMode: true, // handler always writes binary
-		Page:       1,
-		PageSize:   20,
-	}
-
-	// Extract params (non-reserved keys)
-	for k, v := range raw {
-		if k == "$id" || reservedKeys[k] {
-			continue
-		}
-		req.Params[k] = v
-	}
-
-	// Parse $select
-	if selRaw, ok := raw["$select"]; ok {
-		var selStr string
-		if json.Unmarshal(selRaw, &selStr) == nil && selStr != "" {
-			fields, _ := selection.Parse(selStr)
-			req.Select = fields
-		}
-	}
-	// Parse page, pageSize, $filters, $sorters
-	req.parseListParams(raw)
-
-	// Convert $select to FieldMask
-	if req.Select != nil && rt.Schema != nil {
-		if apiMeta := rt.Schema.APIs[apiName]; apiMeta != nil && apiMeta.ReturnType != "" {
-			if model := rt.Schema.Models[apiMeta.ReturnType]; model != nil {
-				req.FieldMask = schema.SelectToFieldMask(req.Select, model)
-			}
-		}
+	if err := rt.prepareRequest(req, false); err != nil {
+		rt.writeWSJSONError(ctx, ws, seqID, "BadRequest", 400, err.Error())
+		return
 	}
 
 	// Execute handler
@@ -439,7 +415,7 @@ func (rt *Router) handleWSJSON(ctx context.Context, ws *wsConn, data []byte) {
 	resp.AppendString(`{"$id":`)
 	resp.AppendInt(seqID)
 	resp.AppendString(`,"data":`)
-	resp.B = append(resp.B, rt.convertBinaryToJSON(apiName, buf.B)...)
+	resp.B = append(resp.B, rt.convertBinaryToJSON(req.API, buf.B)...)
 	resp.AppendByte('}')
 
 	ws.writeText(ctx, resp.B)
@@ -448,31 +424,29 @@ func (rt *Router) handleWSJSON(ctx context.Context, ws *wsConn, data []byte) {
 }
 
 // handleWSBinary processes a binary WebSocket message.
-// WS binary format: [seq varint][binary request body (same as HTTP binary)]
+// WS binary format: [frame type][seq varint][binary request body (same as HTTP binary)]
 // Reuses ParseBinaryRequest for the actual parsing.
 func (rt *Router) handleWSBinary(ctx context.Context, ws *wsConn, data []byte) {
-	if len(data) < 2 {
+	if len(data) < 3 || data[0] != BinaryFrameCallRequest {
 		return
 	}
 
-	// Read seq varint (WS-specific prefix, not part of HTTP binary format)
-	seq, n := codec.ReadVarint(data, 0)
+	seq, n := codec.ReadVarint(data, 1)
 	if n <= 0 {
 		return
 	}
 
-	// Remaining bytes = standard binary request body (same as HTTP)
-	reqBody := data[n:]
+	reqBody := data[1+n:]
 	req, err := rt.Registry.ParseBinaryRequest(reqBody)
 	if err != nil {
-		rt.writeWSBinaryError(ctx, ws, int(seq), "BadRequest", 400, err.Error())
+		rt.writeWSBinaryError(ctx, ws, seq, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
 		return
 	}
 
 	// Find handler
 	fn, ok := rt.handlers[req.API]
 	if !ok {
-		rt.writeWSBinaryError(ctx, ws, int(seq), "NotFound", 404, req.API+" not found")
+		rt.writeWSBinaryError(ctx, ws, seq, errors.NotFound.WithData(errors.ResourceError{Resource: req.API}))
 		return
 	}
 
@@ -483,18 +457,14 @@ func (rt *Router) handleWSBinary(ctx context.Context, ws *wsConn, data []byte) {
 	herr := rt.callHandler(fn, ctx, req)
 	if herr != nil {
 		PutBuf(buf)
-		var appErr *errors.AppError
-		if !stderrors.As(herr, &appErr) {
-			appErr = errors.Wrap(herr)
-		}
-		rt.writeWSBinaryError(ctx, ws, int(seq), appErr.Name, appErr.Code, appErr.Message)
+		rt.writeWSBinaryError(ctx, ws, seq, herr)
 		return
 	}
 
-	// Write binary response: [seq varint][0x01=ok][payload]
+	// Write binary response: [0x02=success][seq varint][payload]
 	resp := GetBuf()
+	resp.B = append(resp.B, BinaryFrameCallSuccess)
 	resp.B = codec.AppendVarint(resp.B, seq)
-	resp.B = append(resp.B, 0x01) // status: ok
 	resp.B = append(resp.B, buf.B...)
 
 	ws.writeBinary(ctx, resp.B)
@@ -518,14 +488,49 @@ func (rt *Router) writeWSJSONError(ctx context.Context, ws *wsConn, seqID int64,
 	PutBuf(buf)
 }
 
-// writeWSBinaryError sends a binary error frame: [seq varint][0x00=error][code svarint][name string][msg string]
-func (rt *Router) writeWSBinaryError(ctx context.Context, ws *wsConn, seq int, name string, code int, msg string) {
+// writeWSBinaryError sends [0x03][seq varint][canonical binary error envelope].
+func (rt *Router) writeWSBinaryError(ctx context.Context, ws *wsConn, seq uint64, err error) {
 	buf := GetBuf()
-	buf.B = codec.AppendVarint(buf.B, uint64(seq))
-	buf.B = append(buf.B, 0x00) // status: error
-	buf.B = codec.AppendSvarint(buf.B, int64(code))
-	buf.B = codec.AppendString(buf.B, name)
-	buf.B = codec.AppendString(buf.B, msg)
+	buf.B = append(buf.B, BinaryFrameCallError)
+	buf.B = codec.AppendVarint(buf.B, seq)
+	buf.B = appendBinaryError(buf.B, rt.buildWireError(ctx, ws.acceptLanguage, err))
 	ws.writeBinary(ctx, buf.B)
 	PutBuf(buf)
+}
+
+func (rt *Router) writeWSJSONSubscriptionSuccess(ctx context.Context, ws *wsConn, apiName string) error {
+	buf := GetBuf()
+	defer PutBuf(buf)
+	buf.AppendString(`{"$sub":`)
+	buf.AppendJSONString(apiName)
+	buf.AppendString(`,"ok":true}`)
+	return ws.writeText(ctx, buf.B)
+}
+
+func (rt *Router) writeWSJSONSubscriptionError(ctx context.Context, ws *wsConn, apiName string, err error) error {
+	buf := GetBuf()
+	defer PutBuf(buf)
+	buf.AppendString(`{"$sub":`)
+	buf.AppendJSONString(apiName)
+	buf.AppendByte(',')
+	appendJSONErrorFields(buf, rt.buildWireError(ctx, ws.acceptLanguage, err))
+	buf.AppendByte('}')
+	return ws.writeText(ctx, buf.B)
+}
+
+func (rt *Router) writeWSBinarySubscriptionSuccess(ctx context.Context, ws *wsConn, apiID uint64) error {
+	buf := GetBuf()
+	defer PutBuf(buf)
+	buf.B = append(buf.B, BinaryFrameSubscribeSuccess)
+	buf.B = codec.AppendVarint(buf.B, apiID)
+	return ws.writeBinary(ctx, buf.B)
+}
+
+func (rt *Router) writeWSBinarySubscriptionError(ctx context.Context, ws *wsConn, apiID uint64, err error) error {
+	buf := GetBuf()
+	defer PutBuf(buf)
+	buf.B = append(buf.B, BinaryFrameSubscribeError)
+	buf.B = codec.AppendVarint(buf.B, apiID)
+	buf.B = appendBinaryError(buf.B, rt.buildWireError(ctx, ws.acceptLanguage, err))
+	return ws.writeBinary(ctx, buf.B)
 }

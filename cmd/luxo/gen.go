@@ -255,6 +255,12 @@ func updateLockFileAndReturn(files []*ast.File) (*lockfile.LockFile, error) {
 // buildParamTypesFromAST extracts param types from AST for accurate binary metadata.
 func buildParamTypesFromAST(files []*ast.File) map[string]map[string]string {
 	types := make(map[string]map[string]string)
+	enums := make(map[string]bool)
+	for _, file := range files {
+		for _, enum := range file.Enums {
+			enums[enum.Name] = true
+		}
+	}
 	for _, file := range files {
 		for _, a := range file.APIs {
 			if len(a.Params) == 0 {
@@ -263,7 +269,7 @@ func buildParamTypesFromAST(files []*ast.File) map[string]map[string]string {
 			m := make(map[string]string, len(a.Params))
 			for _, p := range a.Params {
 				if p.Type != nil {
-					m[p.Name] = p.Type.Name
+					m[p.Name] = binaryParamType(p.Type, enums)
 				}
 			}
 			types[a.Name] = m
@@ -275,7 +281,7 @@ func buildParamTypesFromAST(files []*ast.File) map[string]map[string]string {
 			m := make(map[string]string, len(fn.Params))
 			for _, p := range fn.Params {
 				if p.Type != nil {
-					m[p.Name] = p.Type.Name
+					m[p.Name] = binaryParamType(p.Type, enums)
 				}
 			}
 			types[fn.Name] = m
@@ -291,35 +297,76 @@ func buildParamTypesFromAST(files []*ast.File) map[string]map[string]string {
 			if !hasCrud {
 				continue
 			}
-			fieldTypes := make(map[string]string)
+			idType := "Int"
 			for _, f := range model.Fields {
-				if f.Type != nil && f.Computed == nil {
-					fieldTypes[f.Name] = f.Type.Name
+				if f.Name == "id" && f.Type != nil {
+					idType = binaryParamType(&ast.TypeRef{Name: f.Type.Name}, enums)
+					break
+				}
+			}
+			createTypes := make(map[string]string)
+			updateTypes := map[string]string{"id": idType}
+			for _, f := range model.Fields {
+				if !isGeneratedCRUDParam(f, enums, false) {
+					continue
+				}
+				createTypes[f.Name] = binaryParamType(f.Type, enums)
+				if isGeneratedCRUDParam(f, enums, true) {
+					updateTypes[f.Name] = binaryParamType(f.Type, enums)
 				}
 			}
 			name := model.Name
 			plural := name + "s"
-			idType := fieldTypes["id"]
-			if idType == "" {
-				idType = "Int"
-			}
 			types["get"+name] = map[string]string{"id": idType}
 			types["delete"+name] = map[string]string{"id": idType}
-			types["delete"+plural] = map[string]string{"ids": idType}
+			types["delete"+plural] = map[string]string{"ids": "[" + idType + "]"}
 			types["list"+plural] = map[string]string{"page": "Int", "pageSize": "Int"}
-			createTypes := make(map[string]string)
-			for k, v := range fieldTypes {
-				createTypes[k] = v
-			}
 			types["create"+name] = createTypes
-			updateTypes := map[string]string{"id": idType}
-			for k, v := range createTypes {
-				updateTypes[k] = v
-			}
 			types["update"+name] = updateTypes
 		}
 	}
 	return types
+}
+
+func isGeneratedCRUDParam(field *ast.FieldDecl, enums map[string]bool, update bool) bool {
+	if field.Type == nil || field.Computed != nil || hasASTDirective(field.Directives, "internal") ||
+		hasASTDirective(field.Directives, "serial") || hasASTDirective(field.Directives, "auto") {
+		return false
+	}
+	if field.Type.Name == "DateTime" && (field.Name == "createdAt" || field.Name == "updatedAt") {
+		return false
+	}
+	if update && (field.Name == "id" || hasASTDirective(field.Directives, "immutable")) {
+		return false
+	}
+	if !isBinaryScalarParamType(field.Type.Name) && !enums[field.Type.Name] {
+		return false
+	}
+	return true
+}
+
+func binaryParamType(ref *ast.TypeRef, enums map[string]bool) string {
+	typeName := ref.Name
+	if enums[typeName] {
+		typeName = "Enum"
+	} else if !isBinaryScalarParamType(typeName) {
+		typeName = "JSON"
+	}
+	if ref.IsList {
+		typeName = "[" + typeName + "]"
+	}
+	if ref.Nullable {
+		typeName += "?"
+	}
+	return typeName
+}
+
+func isBinaryScalarParamType(typeName string) bool {
+	switch typeName {
+	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "Bytes", "UUID", "Decimal", "JSON":
+		return true
+	}
+	return false
 }
 
 func hasASTDirective(directives []*ast.Directive, name string) bool {

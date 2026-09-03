@@ -2,6 +2,8 @@ package schema
 
 import (
 	"encoding/json"
+	"fmt"
+	"sort"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/selection"
@@ -62,13 +64,15 @@ type Model struct {
 
 // Field describes a single model field.
 type Field struct {
-	ID       int       `json:"id"`
-	Name     string    `json:"name"`
-	Type     FieldType `json:"type"`
-	TypeName string    `json:"typeName,omitempty"` // original Luxo type name (User, MemberRole, etc.)
-	Nullable bool      `json:"nullable,omitempty"`
-	IsList   bool      `json:"isList,omitempty"`
-	Relation bool      `json:"relation,omitempty"` // true if this is a relation field (not a DB column)
+	ID         int       `json:"id"`
+	Name       string    `json:"name"`
+	Type       FieldType `json:"type"`
+	TypeName   string    `json:"typeName,omitempty"` // original Luxo type name (User, MemberRole, etc.)
+	Nullable   bool      `json:"nullable,omitempty"`
+	IsList     bool      `json:"isList,omitempty"`
+	Relation   bool      `json:"relation,omitempty"` // true if this is a relation field (not a DB column)
+	Computed   bool      `json:"computed,omitempty"` // true if this is a selectable non-persistent field
+	PrimaryKey bool      `json:"primaryKey,omitempty"`
 	// Federation: which module defined this field (empty = same module as the model)
 	Module string `json:"module,omitempty"`
 	// Federation: FK field name for resolving cross-module relations (e.g. "userId")
@@ -88,9 +92,11 @@ const (
 	FieldDateTime // int64 unix timestamp
 	FieldDuration // int64 nanoseconds
 	FieldBytes
-	FieldEnum  // string on wire
-	FieldModel // nested model (sub-message)
-	FieldUUID  // 16-byte fixed value
+	FieldEnum    // string on wire
+	FieldModel   // nested model (sub-message)
+	FieldUUID    // 16-byte fixed value
+	FieldDecimal // decimal string
+	FieldJSON    // length-prefixed raw JSON
 )
 
 // API describes an API's params and return type.
@@ -130,11 +136,13 @@ var fieldTypeNames = [...]string{
 	FieldEnum:     "Enum",
 	FieldModel:    "Model",
 	FieldUUID:     "UUID",
+	FieldDecimal:  "Decimal",
+	FieldJSON:     "JSON",
 }
 
 // String returns the Luxo type name for the field type.
 func (t FieldType) String() string {
-	if int(t) < len(fieldTypeNames) {
+	if t >= 0 && int(t) < len(fieldTypeNames) {
 		return fieldTypeNames[t]
 	}
 	return "Unknown"
@@ -142,10 +150,25 @@ func (t FieldType) String() string {
 
 // MarshalJSON outputs FieldType as a string.
 func (t FieldType) MarshalJSON() ([]byte, error) {
-	if int(t) < len(fieldTypeNames) {
+	if t >= 0 && int(t) < len(fieldTypeNames) {
 		return json.Marshal(fieldTypeNames[t])
 	}
 	return json.Marshal("Unknown")
+}
+
+// UnmarshalJSON decodes the stable string form used by luxo.schema.json.
+func (t *FieldType) UnmarshalJSON(data []byte) error {
+	var name string
+	if err := json.Unmarshal(data, &name); err != nil {
+		return err
+	}
+	for value, candidate := range fieldTypeNames {
+		if candidate == name {
+			*t = FieldType(value)
+			return nil
+		}
+	}
+	return fmt.Errorf("schema: unknown field type %q", name)
 }
 
 // ToJSON serializes the schema to JSON for introspection.
@@ -175,18 +198,59 @@ func (s *Schema) RegisterType(t *TypeDecl) {
 
 // RegisterModel adds a model definition to the schema.
 func (s *Schema) RegisterModel(m *Model) {
+	if existing := s.Models[m.Name]; existing != nil {
+		m = mergeModels(existing, m)
+	}
+	initializeModel(m)
+	s.Models[m.Name] = m
+}
+
+func mergeModels(existing, incoming *Model) *Model {
+	merged := &Model{Name: existing.Name, Module: existing.Module}
+	if incoming.Module != "" {
+		merged.Module = incoming.Module
+	}
+	merged.Fields = append(merged.Fields, existing.Fields...)
+	byID := make(map[int]int, len(merged.Fields))
+	byName := make(map[string]int, len(merged.Fields))
+	for i := range merged.Fields {
+		byID[merged.Fields[i].ID] = i
+		byName[merged.Fields[i].Name] = i
+	}
+	for _, field := range incoming.Fields {
+		index, exists := byID[field.ID]
+		if !exists {
+			index, exists = byName[field.Name]
+		}
+		if exists {
+			old := merged.Fields[index]
+			field.PrimaryKey = field.PrimaryKey || old.PrimaryKey
+			delete(byID, old.ID)
+			delete(byName, old.Name)
+			merged.Fields[index] = field
+		} else {
+			index = len(merged.Fields)
+			merged.Fields = append(merged.Fields, field)
+		}
+		byID[field.ID] = index
+		byName[field.Name] = index
+	}
+	sort.Slice(merged.Fields, func(i, j int) bool { return merged.Fields[i].ID < merged.Fields[j].ID })
+	return merged
+}
+
+func initializeModel(m *Model) {
 	m.byID = make(map[int]*Field, len(m.Fields))
 	m.byName = make(map[string]*Field, len(m.Fields))
 	for i := range m.Fields {
 		f := &m.Fields[i]
 		// Pre-compute JSON prefix: `"fieldName":`
-		f.JSONPrefix = append(f.JSONPrefix, '"')
+		f.JSONPrefix = append(f.JSONPrefix[:0], '"')
 		f.JSONPrefix = append(f.JSONPrefix, f.Name...)
 		f.JSONPrefix = append(f.JSONPrefix, '"', ':')
 		m.byID[f.ID] = f
 		m.byName[f.Name] = f
 	}
-	s.Models[m.Name] = m
 }
 
 // RegisterAPI adds an API definition to the schema.
@@ -204,6 +268,17 @@ func (m *Model) FieldByName(name string) *Field {
 	return m.byName[name]
 }
 
+// PrimaryKeyField returns the declared primary key, falling back to the
+// conventional id field for schemas generated before primary-key metadata.
+func (m *Model) PrimaryKeyField() *Field {
+	for i := range m.Fields {
+		if m.Fields[i].PrimaryKey {
+			return &m.Fields[i]
+		}
+	}
+	return m.FieldByName("id")
+}
+
 // HasExtendFields returns true if any field belongs to a different module.
 func (m *Model) HasExtendFields() bool {
 	for i := range m.Fields {
@@ -214,21 +289,57 @@ func (m *Model) HasExtendFields() bool {
 	return false
 }
 
-// SelectToFieldMask converts a selection.Field list to a binary FieldMask.
-// Maps field names to field IDs using the model schema.
-func SelectToFieldMask(fields []*selection.Field, model *Model) []byte {
+// SelectToFieldMask converts a selection tree to the canonical recursive
+// binary selection mask. Unknown fields and invalid nested selections fail.
+func SelectToFieldMask(fields []*selection.Field, model *Model, schema *Schema) ([]byte, error) {
+	return selectToFieldMask(fields, model, schema, 0)
+}
+
+func selectToFieldMask(fields []*selection.Field, model *Model, schema *Schema, depth int) ([]byte, error) {
 	if len(fields) == 0 {
-		return nil // nil = select all
+		return nil, nil // nil = select all
 	}
-	var mask []byte
+	if model == nil {
+		return nil, fmt.Errorf("selection has no return model")
+	}
+	if depth >= 32 {
+		return nil, fmt.Errorf("selection depth exceeds 32")
+	}
+	var fieldMask []byte
+	children := make([]codec.SelectionMaskChild, 0)
+	seen := make(map[string]struct{}, len(fields))
 	for _, f := range fields {
-		if f.Children != nil {
-			continue // skip relation fields
+		if _, exists := seen[f.Name]; exists {
+			return nil, fmt.Errorf("duplicate selected field %q on %s", f.Name, model.Name)
 		}
+		seen[f.Name] = struct{}{}
 		mf := model.FieldByName(f.Name)
-		if mf != nil {
-			mask = codec.FieldMaskSet(mask, mf.ID)
+		if mf == nil {
+			return nil, fmt.Errorf("unknown selected field %q on %s", f.Name, model.Name)
+		}
+		fieldMask = codec.FieldMaskSet(fieldMask, mf.ID)
+		if f.Children == nil {
+			continue
+		}
+		if !mf.Relation || schema == nil {
+			return nil, fmt.Errorf("field %s.%s does not support nested selection", model.Name, f.Name)
+		}
+		nested := schema.Models[mf.TypeName]
+		if nested == nil {
+			if decl := schema.Types[mf.TypeName]; decl != nil {
+				nested = decl.AsModel()
+			}
+		}
+		if nested == nil {
+			return nil, fmt.Errorf("nested type %q for %s.%s is not registered", mf.TypeName, model.Name, f.Name)
+		}
+		childMask, err := selectToFieldMask(f.Children, nested, schema, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		if len(childMask) > 0 {
+			children = append(children, codec.SelectionMaskChild{FieldID: mf.ID, Mask: childMask})
 		}
 	}
-	return mask
+	return codec.AppendSelectionMask(nil, fieldMask, children), nil
 }

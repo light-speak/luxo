@@ -574,7 +574,12 @@ func TestGenerateGatewayEntry(t *testing.T) {
 		"gw.Serve(Version)",
 		`gw.AddModule("user")`,
 		`gw.AddModule("post")`,
-		"JSONParamsToBinary",
+		"params := req.BinaryParams()",
+		"luvia.BearerToken(ctx)",
+		"CallWithMaskContext(ctx, bearerToken",
+		"luvia.ExtractPrimaryKeyColumn",
+		"luvia.ExtractPrimaryKeys",
+		"keys.EncodeParam(1)",
 	}
 	for _, check := range checks {
 		if !strings.Contains(src, check) {
@@ -729,6 +734,50 @@ func TestCollectModulesWithExtends(t *testing.T) {
 	}
 }
 
+func TestEntryRegistersCrossModuleLoadEndpoints(t *testing.T) {
+	oldContext := globalEventCtx
+	defer func() { globalEventCtx = oldContext }()
+	result := &semantic.Result{Files: []*ast.File{
+		{
+			Name: "origin/user.luxo",
+			Models: []*ast.ModelDecl{{
+				Name: "User",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+				},
+			}},
+		},
+		{
+			Name: "origin/post.luxo",
+			Extends: []*ast.ExtendDecl{{
+				Name:   "User",
+				Fields: []*ast.FieldDecl{{Name: "email", Type: &ast.TypeRef{Name: "String"}}},
+			}},
+			APIs: []*ast.ApiDecl{{
+				Name: "lookup",
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
+					Args: []*ast.NamedArg{{Name: "email", Value: &ast.Ident{Name: "email"}}},
+				}}}},
+			}},
+		},
+	}}
+	globalEventCtx = BuildEventContext(result.Files, "github.com/test/service")
+
+	modules := collectModules(result)
+	if len(modules) != 2 || !modules[0].hasBatchRPC || !modules[0].hasRemoteLoad {
+		t.Fatalf("module endpoint flags = %#v", modules)
+	}
+	code := string(GenerateEntryFile(result, "github.com/test"))
+	if !strings.Contains(code, "user_luxo.RegisterBatchLoaders(gw.Router, userApp)") {
+		t.Errorf("entry did not register the PK batch endpoint:\n%s", code)
+	}
+	if !strings.Contains(code, "user_luxo.RegisterRemoteLoaders(gw.Router, userApp)") {
+		t.Errorf("entry did not register the named load endpoint:\n%s", code)
+	}
+}
+
 func TestCollectModulesHasSchema(t *testing.T) {
 	// Event-only module: no models, no APIs → hasSchema = false
 	result := &semantic.Result{
@@ -879,18 +928,60 @@ func TestGeneratedEntriesRegisterStreams(t *testing.T) {
 	}}}
 
 	embedded := string(GenerateEntryFile(result, "myapp"))
-	if !strings.Contains(embedded, "alert_luxo.RegisterStreams(gw.Router, eventBus)") {
+	if !strings.Contains(embedded, "alert_luxo.RegisterStreams(gw.Router, eventBus, nil)") {
 		t.Fatalf("embedded entry does not register streams:\n%s", embedded)
 	}
 
 	module := string(GenerateModuleEntryFiles(result, "myapp")["alert"])
-	if !strings.Contains(module, "alert_luxo.RegisterStreams(gw.Router, eventBus)") {
+	if !strings.Contains(module, "alert_luxo.RegisterStreams(gw.Router, eventBus, nil)") {
 		t.Fatalf("module entry does not register streams:\n%s", module)
 	}
 
 	gateway := string(GenerateGatewayEntry(result, "myapp"))
-	if !strings.Contains(gateway, "alert_luxo.RegisterStreams(gw.Router, eventBus)") {
+	if !strings.Contains(gateway, "alert_luxo.RegisterStreams(gw.Router, eventBus, nil)") {
 		t.Fatalf("gateway entry does not register streams:\n%s", gateway)
+	}
+}
+
+func TestGeneratedEntriesBridgeNativeStreamsThroughRPC(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/score/api.luxo",
+		Models: []*ast.ModelDecl{{
+			Name:   "ScoreEvent",
+			Fields: []*ast.FieldDecl{{Name: "score", Type: &ast.TypeRef{Name: "Int"}}},
+		}},
+		APIs: []*ast.ApiDecl{{
+			Name:       "watchLiveScore",
+			ReturnType: &ast.TypeRef{Name: "ScoreEvent"},
+			Directives: []*ast.Directive{{Name: "stream"}, {Name: "native"}},
+		}},
+	}}}
+
+	embedded := string(GenerateEntryFile(result, "myapp"))
+	if !strings.Contains(embedded, "score_luxo.RegisterStreams(gw.Router, eventBus, scoreApp.Resolver)") {
+		t.Fatalf("embedded native stream resolver was not injected:\n%s", embedded)
+	}
+	module := string(GenerateModuleEntryFiles(result, "myapp")["score"])
+	if !strings.Contains(module, "score_luxo.RegisterStreams(gw.Router, eventBus, app.Resolver)") {
+		t.Fatalf("service native stream resolver was not injected:\n%s", module)
+	}
+	if !strings.Contains(module, "eventBus := event.NewFromEnv()") {
+		t.Fatalf("native stream service did not initialize its event bus:\n%s", module)
+	}
+	if !strings.Contains(module, "score_luxo.RegisterSchema(gw.Router.Schema)") {
+		t.Fatalf("standalone module did not register its runtime schema:\n%s", module)
+	}
+	gateway := string(GenerateGatewayEntry(result, "myapp"))
+	for _, want := range []string{
+		"score_luxo.RegisterStreams(gw.Router, eventBus, nil)",
+		`gw.Router.HandleStreamNative("watchLiveScore", rpcStreamProxy(rpcClients["score"]`,
+		"client.SubscribeContext(ctx, luvia.BearerToken(ctx)",
+		"params.Binary()",
+		"router.StreamPayloadJSON(apiName, data)",
+	} {
+		if !strings.Contains(gateway, want) {
+			t.Fatalf("gateway native stream bridge missing %q:\n%s", want, gateway)
+		}
 	}
 }
 

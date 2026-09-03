@@ -15,7 +15,7 @@ import (
 type Bus interface {
 	// Emit publishes an event with the given name and payload.
 	// payload can be any type — ChanBus passes it directly (zero serialization),
-	// NATSBus serializes to JSON for wire transport.
+	// NATSBus uses Luxo binary for generated events and JSON for custom payloads.
 	Emit(ctx context.Context, name string, payload any) error
 
 	// On registers a broadcast handler — every instance receives the event.
@@ -33,7 +33,7 @@ type Bus interface {
 
 // Handler processes an event payload and returns an error if processing fails.
 // For ChanBus, payload is the original struct (zero-copy).
-// For NATSBus, payload is []byte (raw JSON from wire).
+// For NATSBus, payload is []byte containing the published wire representation.
 // Returning an error signals a delivery failure — the bus may retry or dead-letter.
 type Handler func(ctx context.Context, payload any) error
 

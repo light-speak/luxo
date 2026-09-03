@@ -6,7 +6,7 @@ export interface Page<T> {
   pageSize: number
 }
 
-export type FilterOperator = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' | 'contains' | 'startswith' | 'endswith'
+export type FilterOperator = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' | 'contains' | 'startswith' | 'endswith' | 'match'
 
 export interface Filter {
   field: string
@@ -68,6 +68,7 @@ export interface LuxoParam {
   id: number
   name: string
   type: string
+  typeName?: string
   isList?: boolean // true for array params (in/notIn → [T])
   nullable?: boolean
   hasDefault?: boolean

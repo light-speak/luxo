@@ -140,7 +140,7 @@ func TestBinaryToJSON_UnknownNestedType(t *testing.T) {
 func TestBinaryToJSON_NestedTypeListRowWise(t *testing.T) {
 	// Single type response containing a nested type LIST (e.g. ServiceSchema
 	// { serviceName, types: [SchemaType] }). Row-wise wire format:
-	// [fieldID][svarint count][item1 WriteLuxo][item2 WriteLuxo]
+	// [fieldID][varint count][item1 WriteLuxo][item2 WriteLuxo]
 	s := New()
 	s.RegisterType(&TypeDecl{
 		Name: "Inner",
@@ -162,7 +162,7 @@ func TestBinaryToJSON_NestedTypeListRowWise(t *testing.T) {
 	data = codec.AppendVarint(data, 1)
 	data = codec.AppendString(data, "svc")
 	data = codec.AppendVarint(data, 2)
-	data = codec.AppendSvarint(data, 2) // 2 nested items
+	data = codec.AppendArrayHeader(data, 2) // 2 nested items
 	for _, v := range []int64{7, 8} {
 		data = codec.AppendVarint(data, 0) // arena header for Inner
 		data = codec.AppendVarint(data, 1)
@@ -341,5 +341,32 @@ func TestBinaryToJSON_NestedNoSchema(t *testing.T) {
 	got := string(result)
 	if got[0] != '{' {
 		t.Errorf("expected JSON object, got %s", got)
+	}
+}
+
+func TestBinaryListToJSON_NullableNestedColumn(t *testing.T) {
+	child := &Model{Name: "Child", Fields: []Field{{ID: 1, Name: "name", Type: FieldString}}}
+	outer := &Model{Name: "Outer", Fields: []Field{{
+		ID: 1, Name: "child", Type: FieldModel, TypeName: "Child", Nullable: true, Relation: true,
+	}}}
+	s := New()
+	s.RegisterModel(child)
+	s.RegisterModel(outer)
+
+	var childEncoder codec.Encoder
+	childData := codec.AppendVarint(nil, uint64(len("Ada")))
+	childEncoder.WriteFieldString(1, "Ada")
+	childEncoder.WriteEnd()
+	childData = append(childData, childEncoder.Bytes()...)
+
+	values := make([]*[]byte, 2)
+	values[1] = &childData
+	var writer codec.ColumnarWriter
+	writer.SetCount(2)
+	writer.WriteColumnBytesPtr(1, values)
+
+	got := string(BinaryListToJSON(nil, writer.Bytes(), outer, s))
+	if got != `[{"child":null},{"child":{"name":"Ada"}}]` {
+		t.Fatalf("nullable nested column = %s", got)
 	}
 }

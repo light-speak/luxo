@@ -12,7 +12,20 @@ class LuxoError implements Exception {
   /// Trace ID for debugging.
   final String? traceId;
 
-  const LuxoError(this.error, this.code, this.message, [this.traceId]);
+  /// Structured application error data.
+  final dynamic data;
+
+  /// Development-only underlying cause.
+  final String? cause;
+
+  const LuxoError(
+    this.error,
+    this.code,
+    this.message, [
+    this.traceId,
+    this.data,
+    this.cause,
+  ]);
 
   @override
   String toString() => 'LuxoError($error, $code, $message)';

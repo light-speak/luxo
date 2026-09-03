@@ -29,7 +29,7 @@ func generateQueryBuilder(b *strings.Builder, m *ast.ModelDecl, enums map[string
 	// Filter out relation fields — they're not DB columns
 	var dbFields []*ast.FieldDecl
 	for _, f := range fields {
-		if !isRelationField(f, enums) {
+		if f.Computed == nil && !isRelationField(f, enums) {
 			dbFields = append(dbFields, f)
 		}
 	}
@@ -82,8 +82,9 @@ func generateExtendClient(b *strings.Builder, name, tableName string, fields []*
 	scanFn := "scan" + name
 
 	idType := "int64"
+	idGoName := str.Capitalize(externalModelIDFieldName(name))
 	for _, f := range fields {
-		if f.Name == "id" && f.Type != nil {
+		if f.Name == externalModelIDFieldName(name) && f.Type != nil {
 			idType = resolveGoType(f.Type)
 			break
 		}
@@ -96,7 +97,7 @@ type %sClient struct {
 
 // Find returns a %s by primary key.
 func (c *%sClient) Find(ctx context.Context, id %s) (*%s, error) {
-	return c.Where(%sWhere.Id.Eq(id)).First(ctx)
+	return c.Where(%sWhere.%s.Eq(id)).First(ctx)
 }
 
 // Where starts a query with conditions.
@@ -105,7 +106,7 @@ func (c *%sClient) Where(conds ...lux.Condition) *pg.Query[%s] {
 }
 
 `, name, name, name,
-		name, name, idType, name, name,
+		name, name, idType, name, name, idGoName,
 		name, name, tableName, scanFn)
 }
 
@@ -114,13 +115,12 @@ func (c *%sClient) Where(conds ...lux.Condition) *pg.Query[%s] {
 func generateClient(b *strings.Builder, name, tableName string, fields []*ast.FieldDecl, soft bool) {
 	scanFn := "scan" + name
 
-	// Determine id field type for Find method.
-	idType := "int64" // default
-	for _, f := range fields {
-		if f.Name == "id" && f.Type != nil {
-			idType = resolveGoType(f.Type)
-			break
-		}
+	primaryKey := primaryKeyField(&ast.ModelDecl{Name: name, Fields: fields})
+	idType := "int64"
+	idGoName := "Id"
+	if primaryKey != nil {
+		idType = resolveGoType(primaryKey.Type)
+		idGoName = str.Capitalize(primaryKey.Name)
 	}
 
 	fmt.Fprintf(b, `// %sClient is the entry point for %s queries.
@@ -130,11 +130,11 @@ type %sClient struct {
 
 // Find returns a %s by primary key.
 func (c *%sClient) Find(ctx context.Context, id %s) (*%s, error) {
-	return c.Where(%sWhere.Id.Eq(id)).First(ctx)
+	return c.Where(%sWhere.%s.Eq(id)).First(ctx)
 }
 
 `, name, name, name,
-		name, name, idType, name, name)
+		name, name, idType, name, name, idGoName)
 
 	// Where — @soft models inject deleted_at IS NULL by default
 	if soft {
@@ -488,13 +488,12 @@ func (b *%sCreateManyBuilder) Exec(ctx context.Context) ([]*%s, error) {
 func generateUpdateBuilder(b *strings.Builder, name string, fields []*ast.FieldDecl) {
 	scanFn := "scan" + name
 
-	// Determine id field type.
+	primaryKey := primaryKeyField(&ast.ModelDecl{Name: name, Fields: fields})
 	idType := "int64"
-	for _, f := range fields {
-		if f.Name == "id" && f.Type != nil {
-			idType = resolveGoType(f.Type)
-			break
-		}
+	idColumn := "id"
+	if primaryKey != nil {
+		idType = resolveGoType(primaryKey.Type)
+		idColumn = str.ToSnakeCase(primaryKey.Name)
 	}
 
 	fmt.Fprintf(b, `// %sUpdateBuilder builds an UPDATE statement. Exec is inherited from pg.UpdateBase.
@@ -506,17 +505,17 @@ type %sUpdateBuilder struct {
 
 	fmt.Fprintf(b, `// new%sUpdateBuilder creates an update builder with the scan function pre-set.
 func new%sUpdateBuilder(db *pg.DB, table string, id %s) *%sUpdateBuilder {
-	return &%sUpdateBuilder{UpdateBase: pg.UpdateBase[%s, %s]{Db: db, Table: table, ID: id, Scan: %s}}
+	return &%sUpdateBuilder{UpdateBase: pg.UpdateBase[%s, %s]{Db: db, Table: table, IDColumn: %q, ID: id, Scan: %s}}
 }
 
-`, name, name, idType, name, name, name, idType, scanFn)
+`, name, name, idType, name, name, name, idType, idColumn, scanFn)
 
 	// Generate Set methods — skip auto-managed, @immutable, @internal, computed, relation
 	for _, f := range fields {
 		if f.Computed != nil || isAutoManaged(f) {
 			continue
 		}
-		if hasDirective(f.Directives, "immutable") || hasDirective(f.Directives, "internal") {
+		if primaryKey != nil && f.Name == primaryKey.Name || hasDirective(f.Directives, "immutable") || hasDirective(f.Directives, "internal") {
 			continue
 		}
 		goFieldName := str.Capitalize(f.Name)

@@ -55,10 +55,20 @@ class LuxoEncoder(initialCapacity: Int = 1024) {
     /** Write length-prefixed UTF-8 string. */
     fun writeString(v: String) {
         val bytes = v.toByteArray(Charsets.UTF_8)
-        writeVarint(bytes.size.toLong())
-        ensure(bytes.size)
-        System.arraycopy(bytes, 0, buf, pos, bytes.size)
-        pos += bytes.size
+        writeBytes(bytes)
+    }
+
+    /** Write length-prefixed arbitrary bytes. */
+    fun writeBytes(v: ByteArray) {
+        writeVarint(v.size.toLong())
+        writeRawBytes(v)
+    }
+
+    /** Write raw bytes without a length prefix. */
+    fun writeRawBytes(v: ByteArray) {
+        ensure(v.size)
+        System.arraycopy(v, 0, buf, pos, v.size)
+        pos += v.size
     }
 
     /** Write boolean as varint 0/1. */
@@ -99,6 +109,11 @@ class LuxoEncoder(initialCapacity: Int = 1024) {
     fun writeFieldUuid(fieldID: Int, v: String) {
         writeVarint(fieldID.toLong())
         writeUuid(v)
+    }
+
+    fun writeFieldBytes(fieldID: Int, v: ByteArray) {
+        writeVarint(fieldID.toLong())
+        writeBytes(v)
     }
 
     /**
@@ -184,15 +199,36 @@ class LuxoDecoder(private val buf: ByteArray) {
 
     /** Read a length-prefixed UTF-8 string. */
     fun readString(): String {
-        val len = readVarintRaw().toInt()
-        checkRemaining(len)
-        val s = String(buf, off, len, Charsets.UTF_8)
-        off += len
-        return s
+        return readBytes().toString(Charsets.UTF_8)
     }
 
-    /** Read boolean (varint 0 = false, anything else = true). */
-    fun readBool(): Boolean = readVarintRaw() != 0L
+    /** Read length-prefixed arbitrary bytes. */
+    fun readBytes(): ByteArray {
+        val len = readVarintRaw().toInt()
+        checkRemaining(len)
+        val result = buf.copyOfRange(off, off + len)
+        off += len
+        return result
+    }
+
+    /** Read an unsigned LEB128 value from the current offset. */
+    fun readVarint(): Long = readVarintRaw()
+
+    /** Current read position. */
+    fun offset(): Int = off
+
+    /** Number of unread bytes. */
+    fun remaining(): Int = buf.size - off
+
+    /** Return all unread bytes. */
+    fun readRemainingBytes(): ByteArray {
+        val result = buf.copyOfRange(off, buf.size)
+        off = buf.size
+        return result
+    }
+
+    /** Read a canonical boolean marker (0x00=false, 0x01=true). */
+    fun readBool(): Boolean = readCanonicalMarker("bool")
 
     /** Read a fixed 16-byte UUID and format it as a canonical lowercase string. */
     fun readUuid(): String {
@@ -271,9 +307,16 @@ class LuxoDecoder(private val buf: ByteArray) {
     }
 
     /** Read nullable flag byte. Returns true if value is present. */
-    private fun readNullFlag(): Boolean {
+    private fun readNullFlag(): Boolean = readCanonicalMarker("nullable")
+
+    private fun readCanonicalMarker(kind: String): Boolean {
         checkRemaining(1)
-        return buf[off++] != 0x00.toByte()
+        val markerOffset = off
+        return when (buf[off++].toInt() and 0xFF) {
+            0x00 -> false
+            0x01 -> true
+            else -> throw LuxoCodecException("invalid $kind marker at offset $markerOffset")
+        }
     }
 
     private fun checkRemaining(n: Int) {
@@ -291,17 +334,21 @@ object FieldMask {
      * Returns the (possibly new) mask array.
      */
     fun set(mask: ByteArray, fieldID: Int): ByteArray {
-        val byteIdx = fieldID ushr 3
+        if (fieldID <= 0) return mask
+        val bit = fieldID - 1
+        val byteIdx = bit ushr 3
         val m = if (byteIdx >= mask.size) mask.copyOf(byteIdx + 1) else mask
-        m[byteIdx] = (m[byteIdx].toInt() or (1 shl (fieldID and 7))).toByte()
+        m[byteIdx] = (m[byteIdx].toInt() or (1 shl (bit and 7))).toByte()
         return m
     }
 
     /** Check whether [fieldID] is present in [mask]. */
     fun has(mask: ByteArray, fieldID: Int): Boolean {
-        val byteIdx = fieldID ushr 3
+        if (fieldID <= 0) return false
+        val bit = fieldID - 1
+        val byteIdx = bit ushr 3
         if (byteIdx >= mask.size) return false
-        return (mask[byteIdx].toInt() and (1 shl (fieldID and 7))) != 0
+        return (mask[byteIdx].toInt() and (1 shl (bit and 7))) != 0
     }
 }
 
@@ -310,6 +357,7 @@ object FieldMask {
  *
  * Columnar format:
  *   [count varint]
+ *   [arena size varint]
  *   [fieldID varint][val0][val1]...[valN]  // column 1
  *   [fieldID varint][val0][val1]...[valN]  // column 2
  *   ...
@@ -322,12 +370,16 @@ class ColumnarDecoder(private val buf: ByteArray) {
     /** Number of rows in this columnar batch. */
     val count: Int
 
+    /** Total UTF-8 string bytes advertised for arena allocation. */
+    val arenaSize: Int
+
     /** The current column's field ID after calling [nextColumn]. */
     var fieldID: Int = 0
         private set
 
     init {
         count = readVarintRaw().toInt()
+        arenaSize = readVarintRaw().toInt()
     }
 
     /** Advance to next column. Returns false at end marker (0x00) or EOF. */
@@ -366,8 +418,7 @@ class ColumnarDecoder(private val buf: ByteArray) {
     fun readColumnDateTimePtr(): List<String?> {
         val result = arrayOfNulls<String>(count)
         for (i in 0 until count) {
-            checkRemaining(1)
-            if (buf[off++] == 0x00.toByte()) continue
+            if (!readCanonicalMarker("nullable")) continue
             val uv = readVarintRaw()
             val sec = (uv ushr 1) xor -(uv and 1L)
             result[i] = DateTimeCodec.toIso(sec)
@@ -411,7 +462,7 @@ class ColumnarDecoder(private val buf: ByteArray) {
     fun readColumnBool(): List<Boolean> {
         val result = BooleanArray(count)
         for (i in 0 until count) {
-            result[i] = readVarintRaw() != 0L
+            result[i] = readCanonicalMarker("bool")
         }
         return result.asList()
     }
@@ -420,8 +471,7 @@ class ColumnarDecoder(private val buf: ByteArray) {
     fun readColumnIntPtr(): List<Long?> {
         val result = arrayOfNulls<Long>(count)
         for (i in 0 until count) {
-            checkRemaining(1)
-            if (buf[off++] == 0x00.toByte()) continue
+            if (!readCanonicalMarker("nullable")) continue
             val uv = readVarintRaw()
             result[i] = (uv ushr 1) xor -(uv and 1L)
         }
@@ -432,8 +482,7 @@ class ColumnarDecoder(private val buf: ByteArray) {
     fun readColumnFloatPtr(): List<Double?> {
         val result = arrayOfNulls<Double>(count)
         for (i in 0 until count) {
-            checkRemaining(1)
-            if (buf[off++] == 0x00.toByte()) continue
+            if (!readCanonicalMarker("nullable")) continue
             checkRemaining(8)
             var bits: Long = 0
             bits = bits or ((buf[off++].toLong() and 0xFF))
@@ -453,8 +502,7 @@ class ColumnarDecoder(private val buf: ByteArray) {
     fun readColumnStringPtr(): List<String?> {
         val result = arrayOfNulls<String>(count)
         for (i in 0 until count) {
-            checkRemaining(1)
-            if (buf[off++] == 0x00.toByte()) continue
+            if (!readCanonicalMarker("nullable")) continue
             val len = readVarintRaw().toInt()
             if (len == 0) { result[i] = ""; continue }
             checkRemaining(len)
@@ -468,9 +516,8 @@ class ColumnarDecoder(private val buf: ByteArray) {
     fun readColumnBoolPtr(): List<Boolean?> {
         val result = arrayOfNulls<Boolean>(count)
         for (i in 0 until count) {
-            checkRemaining(1)
-            if (buf[off++] == 0x00.toByte()) continue
-            result[i] = readVarintRaw() != 0L
+            if (!readCanonicalMarker("nullable")) continue
+            result[i] = readCanonicalMarker("bool")
         }
         return result.asList()
     }
@@ -490,8 +537,7 @@ class ColumnarDecoder(private val buf: ByteArray) {
     fun readColumnUuidPtr(): List<String?> {
         val result = arrayOfNulls<String>(count)
         for (i in 0 until count) {
-            checkRemaining(1)
-            if (buf[off++] == 0x00.toByte()) continue
+            if (!readCanonicalMarker("nullable")) continue
             checkRemaining(16)
             result[i] = UuidCodec.format(buf, off)
             off += 16
@@ -507,6 +553,19 @@ class ColumnarDecoder(private val buf: ByteArray) {
     fun readColumnBytes(): List<ByteArray> {
         val result = Array(count) { ByteArray(0) }
         for (i in 0 until count) {
+            val len = readVarintRaw().toInt()
+            checkRemaining(len)
+            result[i] = buf.copyOfRange(off, off + len)
+            off += len
+        }
+        return result.asList()
+    }
+
+    /** Read [count] nullable byte blobs (0x00=null, 0x01+length+bytes). */
+    fun readColumnBytesPtr(): List<ByteArray?> {
+        val result = arrayOfNulls<ByteArray>(count)
+        for (i in 0 until count) {
+            if (!readCanonicalMarker("nullable")) continue
             val len = readVarintRaw().toInt()
             checkRemaining(len)
             result[i] = buf.copyOfRange(off, off + len)
@@ -538,6 +597,16 @@ class ColumnarDecoder(private val buf: ByteArray) {
             if (shift >= 64) throw LuxoCodecException("varint overflow")
         }
         return result
+    }
+
+    private fun readCanonicalMarker(kind: String): Boolean {
+        checkRemaining(1)
+        val markerOffset = off
+        return when (buf[off++].toInt() and 0xFF) {
+            0x00 -> false
+            0x01 -> true
+            else -> throw LuxoCodecException("invalid $kind marker at offset $markerOffset")
+        }
     }
 
     private fun checkRemaining(n: Int) {

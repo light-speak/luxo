@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
+	"github.com/light-speak/luxo/pkg/lux/schema"
 	"nhooyr.io/websocket"
 )
 
@@ -173,6 +174,33 @@ func TestStreamHubDispatchEventCancelsSlowSubscriber(t *testing.T) {
 	default:
 		t.Fatal("slow subscriber was not cancelled")
 	}
+	if hub.SubCount("watch") != 0 {
+		t.Fatal("slow subscriber was not removed")
+	}
+}
+
+func TestDispatchPreparedEventMatchesTypedDataAndCachesEncoding(t *testing.T) {
+	hub := NewStreamHub()
+	first := hub.SubscribeMode("watch", map[string]any{"id": int64(1)}, nil, []byte{1}, true, nil)
+	second := hub.SubscribeMode("watch", map[string]any{"id": int64(2)}, nil, []byte{1}, true, nil)
+	third := hub.SubscribeMode("watch", map[string]any{"id": int64(3)}, nil, []byte{2}, false, nil)
+	var matches, encodes int
+	hub.DispatchPreparedEvent("watch", func(params *StreamParams, identity any) bool {
+		matches++
+		return params.Int("id") != 2
+	}, func(mask []byte, binary bool) []byte {
+		encodes++
+		return append([]byte{byte(encodes)}, mask...)
+	})
+	if matches != 3 {
+		t.Fatalf("matcher calls = %d, want 3", matches)
+	}
+	if encodes != 2 {
+		t.Fatalf("encoding variants = %d, want 2", encodes)
+	}
+	if len(first.Ch) != 1 || len(second.Ch) != 0 || len(third.Ch) != 1 {
+		t.Fatalf("unexpected deliveries: first=%d second=%d third=%d", len(first.Ch), len(second.Ch), len(third.Ch))
+	}
 }
 
 func TestStreamHub_ChanFull(t *testing.T) {
@@ -211,6 +239,9 @@ func TestStreamHub_ChanFull(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 		t.Error("slow subscriber should have been cancelled")
 	}
+	if hub.SubCount("test") != 0 {
+		t.Fatal("slow subscriber was not removed")
+	}
 
 	hub.Unsubscribe("test", sub)
 }
@@ -220,6 +251,9 @@ func TestStreamParams(t *testing.T) {
 		"roomId": int64(42),
 		"name":   "test",
 		"rate":   float64(3.14),
+		"active": true,
+		"ttl":    "2s",
+		"uuid":   "550e8400-e29b-41d4-a716-446655440000",
 	}}
 
 	if p.Int("roomId") != 42 {
@@ -228,13 +262,22 @@ func TestStreamParams(t *testing.T) {
 	if p.String("name") != "test" {
 		t.Errorf("String(name) = %q", p.String("name"))
 	}
+	if p.Float("rate") != 3.14 || !p.Boolean("active") || p.Duration("ttl") != int64(2*time.Second) {
+		t.Fatal("typed stream parameter accessors returned incorrect values")
+	}
+	if got := p.UUID("uuid"); got == [16]byte{} {
+		t.Fatal("UUID accessor did not parse canonical UUID")
+	}
+	if _, ok := p.LookupInt("rate"); ok {
+		t.Fatal("fractional float must not be accepted as Int")
+	}
 	if p.Int("missing") != 0 {
 		t.Error("missing should be 0")
 	}
 
 	// nil params
 	var nilP *StreamParams
-	if nilP.Int("x") != 0 || nilP.String("x") != "" || nilP.Get("x") != nil {
+	if nilP.Int("x") != 0 || nilP.String("x") != "" || nilP.Float("x") != 0 || nilP.Boolean("x") || nilP.Duration("x") != 0 || nilP.UUID("x") != [16]byte{} || nilP.Get("x") != nil {
 		t.Error("nil params should return zero values")
 	}
 }
@@ -244,6 +287,105 @@ func TestStreamHub_NoSubscribers(t *testing.T) {
 	// Should not panic
 	hub.DispatchEncoded("nonexistent", []byte("data"), nil)
 	hub.Dispatch("nonexistent", "data", nil, func(data any, mask []byte) []byte { return nil })
+}
+
+func TestRouterOpenInternalStreamUsesCanonicalSubscriptionLifecycle(t *testing.T) {
+	rt := NewRouter()
+	rt.Schema.RegisterAPI(&schema.API{Name: "watchInternal", Stream: true})
+	rt.Registry.Register("watchInternal", 71)
+	rt.Registry.RegisterParams("watchInternal", []ParamMeta{{Name: "id", Type: "Int", FieldID: 1}})
+	mask := codec.AppendSelectionMask(nil, []byte{1}, nil)
+	requestData, err := EncodeBinaryRequest(71, mask, map[string]any{"id": int64(42)}, rt.Registry.ParamOrder("watchInternal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := rt.Registry.ParseBinaryRequest(requestData)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stream, err := rt.OpenInternalStream(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rt.Streams.SubCount("watchInternal") != 1 {
+		t.Fatal("internal stream was not registered")
+	}
+	rt.Streams.DispatchEncoded("watchInternal", []byte("payload"), nil)
+	if got := <-stream.Messages(); string(got) != "payload" {
+		t.Fatalf("stream payload = %q", got)
+	}
+	stream.Close()
+	if rt.Streams.SubCount("watchInternal") != 0 {
+		t.Fatal("internal stream was not removed on close")
+	}
+}
+
+func TestRouterOpenInternalNativeStreamInvokesHandler(t *testing.T) {
+	rt := NewRouter()
+	rt.Registry.Register("watchNativeInternal", 72)
+	rt.Registry.RegisterParams("watchNativeInternal", nil)
+	rt.HandleStreamNative("watchNativeInternal", func(ctx context.Context, params *StreamParams, identity any, stream *Stream) {
+		if err := stream.Send([]byte("native")); err != nil {
+			t.Errorf("native stream send: %v", err)
+		}
+	})
+	req, err := rt.Registry.ParseBinaryRequest([]byte{72, 0, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := rt.OpenInternalStream(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	select {
+	case got := <-stream.Messages():
+		if string(got) != "native" {
+			t.Fatalf("native payload = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("native stream handler was not invoked")
+	}
+	deadline := time.Now().Add(time.Second)
+	for rt.Streams.SubCount("watchNativeInternal") != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if rt.Streams.SubCount("watchNativeInternal") != 0 {
+		t.Fatal("completed native handler did not close its subscription")
+	}
+}
+
+func TestRouterOpenInternalStreamRejectsRegularAPI(t *testing.T) {
+	rt := NewRouter()
+	rt.Registry.Register("regular", 73)
+	rt.Registry.RegisterParams("regular", nil)
+	req, err := rt.Registry.ParseBinaryRequest([]byte{73, 0, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.OpenInternalStream(context.Background(), req); err == nil {
+		t.Fatal("regular API must not open an internal stream")
+	}
+}
+
+func TestTypedStreamEncodesUsingSubscriberSelectionAndMode(t *testing.T) {
+	hub := NewStreamHub()
+	mask := []byte{1, 2}
+	sub := hub.SubscribeMode("typed", nil, nil, mask, false, nil)
+	raw := &Stream{sub: sub, ctx: context.Background()}
+	typed := NewTypedStream(raw, func(value int64, gotMask []byte, binary bool) []byte {
+		if value != 42 || !bytes.Equal(gotMask, mask) || binary {
+			t.Fatalf("encoder received value=%d mask=%v binary=%v", value, gotMask, binary)
+		}
+		return []byte("encoded")
+	})
+	if err := typed.Send(42); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-sub.Ch; string(got) != "encoded" {
+		t.Fatalf("typed stream payload = %q", got)
+	}
 }
 
 func TestStreamHub_UnsubscribeNonExistent(t *testing.T) {
@@ -257,6 +399,9 @@ func TestStreamHub_UnsubscribeNonExistent(t *testing.T) {
 
 func TestWSJSON_Subscribe(t *testing.T) {
 	rt := testWSRouter()
+	rt.Registry.Register("watchTest", 11)
+	rt.Registry.RegisterParams("watchTest", []ParamMeta{{Name: "roomId", Type: "Int", FieldID: 1}})
+	rt.Schema.APIs["watchTest"].Params = []schema.Param{{ID: 1, Name: "roomId", Type: schema.FieldInt, HasDefault: true}}
 	srv := httptest.NewServer(rt)
 	defer srv.Close()
 
@@ -272,6 +417,10 @@ func TestWSJSON_Subscribe(t *testing.T) {
 
 	// Subscribe
 	conn.Write(ctx, websocket.MessageText, []byte(`{"$sub":"watchTest","roomId":1}`))
+	_, ack, err := conn.Read(ctx)
+	if err != nil || string(ack) != `{"$sub":"watchTest","ok":true}` {
+		t.Fatalf("subscription acknowledgement = %s, %v", ack, err)
+	}
 
 	// Wait for subscription to be registered
 	time.Sleep(50 * time.Millisecond)
@@ -298,8 +447,45 @@ func TestWSJSON_Subscribe(t *testing.T) {
 	}
 }
 
+func TestWSJSONSubscribeUsesCanonicalSelectionParsing(t *testing.T) {
+	rt := testWSRouter()
+	rt.Schema.RegisterAPI(&schema.API{ID: 12, Name: "watchUser", Module: "user", ReturnType: "User", Stream: true})
+	rt.Registry.Register("watchUser", 12)
+	rt.Registry.RegisterParams("watchUser", nil)
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"$sub":"watchUser","$select":"name{"}`)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if rt.Streams.SubCount("watchUser") != 0 {
+		t.Fatal("malformed selection must not create a subscription")
+	}
+	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"$sub":"watchUser","$select":"name"}`)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	rt.Streams.mu.RLock()
+	subs := rt.Streams.subs["watchUser"]
+	if len(subs) != 1 || !bytes.Equal(subs[0].FieldMask, []byte{1, 2}) {
+		t.Fatalf("subscriptions = %#v", subs)
+	}
+	rt.Streams.mu.RUnlock()
+}
+
 func TestWSJSON_Unsubscribe(t *testing.T) {
 	rt := testWSRouter()
+	rt.Registry.Register("watchTest", 11)
+	rt.Registry.RegisterParams("watchTest", nil)
 	srv := httptest.NewServer(rt)
 	defer srv.Close()
 
@@ -331,6 +517,7 @@ func TestWSJSON_Unsubscribe(t *testing.T) {
 
 func TestWSBinary_Subscribe(t *testing.T) {
 	rt := testWSRouter()
+	registerTestStream(rt, "watchBinary")
 	rt.Registry.Register("watchBinary", 50)
 	rt.Registry.RegisterParams("watchBinary", []ParamMeta{
 		{Name: "roomId", Type: "Int", FieldID: 1},
@@ -349,9 +536,9 @@ func TestWSBinary_Subscribe(t *testing.T) {
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
-	// Binary subscribe: [0xFE][API ID=50][mask=0][param field1=roomId=123][0x00]
+	// Binary subscribe: [frame][API ID=50][mask=0][param field1=roomId=123][0x00]
 	var reqBuf []byte
-	reqBuf = append(reqBuf, 0xFE)
+	reqBuf = append(reqBuf, BinaryFrameSubscribe)
 	reqBuf = codec.AppendVarint(reqBuf, 50) // API ID
 	reqBuf = codec.AppendVarint(reqBuf, 0)  // mask
 	var enc codec.Encoder
@@ -360,6 +547,10 @@ func TestWSBinary_Subscribe(t *testing.T) {
 	reqBuf = append(reqBuf, enc.Bytes()...)
 
 	conn.Write(ctx, websocket.MessageBinary, reqBuf)
+	_, ack, err := conn.Read(ctx)
+	if err != nil || !bytes.Equal(ack, []byte{BinaryFrameSubscribeSuccess, 50}) {
+		t.Fatalf("subscription acknowledgement = %v, %v", ack, err)
+	}
 	time.Sleep(50 * time.Millisecond)
 
 	if rt.Streams.SubCount("watchBinary") != 1 {
@@ -374,14 +565,43 @@ func TestWSBinary_Subscribe(t *testing.T) {
 		t.Fatalf("read: %v", err)
 	}
 
-	// Should be: [0xFD][API ID=50][payload]
-	if data[0] != 0xFD {
-		t.Errorf("first byte should be 0xFD (stream push), got %x", data[0])
+	if data[0] != BinaryFrameStream {
+		t.Errorf("first byte should be stream frame, got %x", data[0])
+	}
+}
+
+func TestWSBinarySubscribePreservesExplicitNullParam(t *testing.T) {
+	rt := testWSRouter()
+	registerTestStream(rt, "watchNullable")
+	rt.Registry.Register("watchNullable", 52)
+	rt.Registry.RegisterParams("watchNullable", []ParamMeta{{Name: "query", Type: "String", FieldID: 1, Nullable: true}})
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	frame := []byte{BinaryFrameSubscribe, 52, 0, 1, 0, 0}
+	if err := conn.Write(ctx, websocket.MessageBinary, frame); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	rt.Streams.mu.RLock()
+	subs := rt.Streams.subs["watchNullable"]
+	_, present := subs[0].Params.values["query"]
+	rt.Streams.mu.RUnlock()
+	if !present {
+		t.Fatal("explicit null parameter became absent")
 	}
 }
 
 func TestWSBinary_Unsubscribe(t *testing.T) {
 	rt := testWSRouter()
+	registerTestStream(rt, "watchBin2")
 	rt.Registry.Register("watchBin2", 51)
 
 	srv := httptest.NewServer(rt)
@@ -399,16 +619,16 @@ func TestWSBinary_Unsubscribe(t *testing.T) {
 
 	// Subscribe
 	var subBuf []byte
-	subBuf = append(subBuf, 0xFE)
+	subBuf = append(subBuf, BinaryFrameSubscribe)
 	subBuf = codec.AppendVarint(subBuf, 51)
 	subBuf = codec.AppendVarint(subBuf, 0)
 	subBuf = append(subBuf, 0x00)
 	conn.Write(ctx, websocket.MessageBinary, subBuf)
 	time.Sleep(50 * time.Millisecond)
 
-	// Unsubscribe: [0xFF][API ID=51]
+	// Unsubscribe: [frame][API ID=51]
 	var unsubBuf []byte
-	unsubBuf = append(unsubBuf, 0xFF)
+	unsubBuf = append(unsubBuf, BinaryFrameUnsubscribe)
 	unsubBuf = codec.AppendVarint(unsubBuf, 51)
 	conn.Write(ctx, websocket.MessageBinary, unsubBuf)
 	time.Sleep(50 * time.Millisecond)
@@ -418,8 +638,38 @@ func TestWSBinary_Unsubscribe(t *testing.T) {
 	}
 }
 
+func TestWSBinaryUnsubscribeRejectsTrailingBytes(t *testing.T) {
+	rt := testWSRouter()
+	registerTestStream(rt, "watchStrict")
+	rt.Registry.Register("watchStrict", 53)
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	if err := conn.Write(ctx, websocket.MessageBinary, []byte{BinaryFrameSubscribe, 53, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if err := conn.Write(ctx, websocket.MessageBinary, []byte{BinaryFrameUnsubscribe, 53, 99}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if rt.Streams.SubCount("watchStrict") != 1 {
+		t.Fatal("non-canonical unsubscribe frame must be rejected")
+	}
+}
+
 func TestWSJSON_DisconnectCleansUpSubs(t *testing.T) {
 	rt := testWSRouter()
+	registerTestStream(rt, "watchCleanup")
+	rt.Registry.Register("watchCleanup", 54)
+	rt.Registry.RegisterParams("watchCleanup", nil)
 	srv := httptest.NewServer(rt)
 	defer srv.Close()
 
@@ -452,6 +702,7 @@ func TestWSJSON_DisconnectCleansUpSubs(t *testing.T) {
 
 func TestWSBinary_UnknownFieldID(t *testing.T) {
 	rt := testWSRouter()
+	registerTestStream(rt, "watchUnknown")
 	rt.Registry.Register("watchUnknown", 60)
 	rt.Registry.RegisterParams("watchUnknown", []ParamMeta{
 		{Name: "roomId", Type: "Int", FieldID: 1},
@@ -470,9 +721,9 @@ func TestWSBinary_UnknownFieldID(t *testing.T) {
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
-	// Binary subscribe with unknown field ID 99 — should stop parsing but still subscribe
+	// Binary subscribe with unknown field ID 99 is rejected as malformed.
 	var reqBuf []byte
-	reqBuf = append(reqBuf, 0xFE)
+	reqBuf = append(reqBuf, BinaryFrameSubscribe)
 	reqBuf = codec.AppendVarint(reqBuf, 60) // API ID
 	reqBuf = codec.AppendVarint(reqBuf, 0)  // no mask
 	var enc codec.Encoder
@@ -484,14 +735,19 @@ func TestWSBinary_UnknownFieldID(t *testing.T) {
 	conn.Write(ctx, websocket.MessageBinary, reqBuf)
 	time.Sleep(50 * time.Millisecond)
 
-	// Should still subscribe (unknown field just stops param parsing)
-	if rt.Streams.SubCount("watchUnknown") != 1 {
-		t.Errorf("sub count = %d, want 1", rt.Streams.SubCount("watchUnknown"))
+	if rt.Streams.SubCount("watchUnknown") != 0 {
+		t.Errorf("malformed subscription should be rejected, got %d", rt.Streams.SubCount("watchUnknown"))
 	}
 }
 
 func TestWSJSON_StreamNativeHandler(t *testing.T) {
 	rt := testWSRouter()
+	rt.Registry.Register("watchNative", 66)
+	rt.Registry.RegisterParams("watchNative", []ParamMeta{{Name: "matchId", Type: "Int", FieldID: 1}})
+	rt.Schema.RegisterAPI(&schema.API{
+		ID: 66, Name: "watchNative", Stream: true,
+		Params: []schema.Param{{ID: 1, Name: "matchId", Type: schema.FieldInt}},
+	})
 
 	// Register a native stream handler that pushes 3 messages then stops
 	handlerCalled := make(chan struct{}, 1)
@@ -524,6 +780,10 @@ func TestWSJSON_StreamNativeHandler(t *testing.T) {
 	// Subscribe
 	subMsg := `{"$sub":"watchNative","matchId":1}`
 	conn.Write(ctx, websocket.MessageText, []byte(subMsg))
+	_, ack, err := conn.Read(ctx)
+	if err != nil || string(ack) != `{"$sub":"watchNative","ok":true}` {
+		t.Fatalf("subscription acknowledgement = %s, %v", ack, err)
+	}
 
 	// Wait for handler to be called
 	select {
@@ -742,6 +1002,9 @@ func TestStreamHub_DispatchChanFull(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 		t.Error("subscriber should be cancelled when channel full")
 	}
+	if hub.SubCount("test") != 0 {
+		t.Fatal("slow subscriber was not removed")
+	}
 	hub.Unsubscribe("test", sub)
 }
 
@@ -762,6 +1025,9 @@ func TestStreamHub_DispatchEncodedNilCancel(t *testing.T) {
 	}
 	// Dispatch should not panic even with nil cancel
 	hub.DispatchEncoded("test", []byte("overflow"), nil)
+	if hub.SubCount("test") != 0 {
+		t.Fatal("slow subscriber with nil cancel was not removed")
+	}
 	hub.Unsubscribe("test", sub)
 }
 

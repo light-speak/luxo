@@ -12,6 +12,7 @@ import (
 	"github.com/light-speak/luxo/pkg/lux/api"
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
+	"github.com/light-speak/luxo/pkg/lux/schema"
 )
 
 func TestRPCRoundTrip(t *testing.T) {
@@ -77,6 +78,188 @@ func TestRPCWithParams(t *testing.T) {
 	msg := dec.ReadString()
 	if msg != "hello world" {
 		t.Fatalf("got %q, want 'hello world'", msg)
+	}
+}
+
+func TestRPCContextEnvelopeForwardsVerifiedIdentity(t *testing.T) {
+	type identityKey struct{}
+	rt := api.NewRouter()
+	rt.InternalRequestContext = func(ctx context.Context, token string) (context.Context, error) {
+		if token != "verified-token" {
+			return nil, fmt.Errorf("unexpected bearer token %q", token)
+		}
+		return context.WithValue(ctx, identityKey{}, int64(42)), nil
+	}
+	rt.Handle("private", func(ctx context.Context, req *api.Request) error {
+		identity, _ := ctx.Value(identityKey{}).(int64)
+		if identity != 42 {
+			return fmt.Errorf("missing forwarded identity")
+		}
+		req.Buf.B = append(req.Buf.B, 0)
+		return nil
+	})
+	rt.Registry.Register("private", 7)
+	rt.Registry.RegisterParams("private", nil)
+
+	srv := NewServer(rt)
+	go srv.ListenAndServe("127.0.0.1:19880")
+	time.Sleep(100 * time.Millisecond)
+	defer srv.Close()
+
+	client := NewClient("127.0.0.1:19880")
+	defer client.Close()
+	if _, err := client.CallWithMaskContext(context.Background(), "verified-token", 7, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCanonicalRequestEnvelopeRejectsLegacyAndUnknownVersions(t *testing.T) {
+	body := encodeCallRequest(7, nil, nil)
+	payload := encodeRequestEnvelope(requestKindCall, "token", body)
+	if !bytes.Equal(payload[:3], []byte{requestEnvelopeMarker, requestEnvelopeVersion, requestKindCall}) {
+		t.Fatalf("canonical envelope prefix = %v", payload[:3])
+	}
+	envelope, err := decodeRequestEnvelope(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envelope.kind != requestKindCall || envelope.token != "token" || !bytes.Equal(envelope.body, body) {
+		t.Fatalf("decoded envelope = %+v", envelope)
+	}
+	if _, err := decodeRequestEnvelope(body); err == nil {
+		t.Fatal("legacy bare requests must be rejected")
+	}
+	payload[1]++
+	if _, err := decodeRequestEnvelope(payload); err == nil {
+		t.Fatal("unknown envelope versions must be rejected")
+	}
+}
+
+func TestRPCErrorEnvelopeRequiresCanonicalFieldsAndTermination(t *testing.T) {
+	var unknown codec.Encoder
+	unknown.WriteFieldInt(4, 1)
+	unknown.WriteEnd()
+	var missing codec.Encoder
+	missing.WriteFieldInt(1, 400)
+	missing.WriteEnd()
+
+	for name, data := range map[string][]byte{
+		"truncated": {1},
+		"unknown":   unknown.Bytes(),
+		"missing":   missing.Bytes(),
+		"trailing":  append(encodeError(400, "BadRequest", "bad")[1:], 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := decodeError(data); err == nil {
+				t.Fatal("invalid error envelope must be rejected")
+			}
+		})
+	}
+}
+
+func TestRPCStreamRoundTripAndCancellation(t *testing.T) {
+	rt := api.NewRouter()
+	rt.Schema.RegisterAPI(&schema.API{Name: "watchRPC", Stream: true})
+	rt.Registry.Register("watchRPC", 8)
+	rt.Registry.RegisterParams("watchRPC", nil)
+
+	srv := NewServer(rt)
+	go srv.ListenAndServe("127.0.0.1:19882")
+	time.Sleep(100 * time.Millisecond)
+	defer srv.Close()
+
+	client := NewClient("127.0.0.1:19882")
+	defer client.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	subscription, err := client.SubscribeContext(ctx, "", 8, nil, nil)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+
+	rt.Streams.DispatchEncoded("watchRPC", []byte("stream-data"), nil)
+	select {
+	case got := <-subscription.Messages():
+		if string(got) != "stream-data" {
+			t.Fatalf("stream payload = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for RPC stream payload")
+	}
+
+	cancel()
+	select {
+	case err := <-subscription.Errors():
+		if err != nil && err != context.Canceled {
+			t.Fatalf("stream close error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RPC stream did not stop after cancellation")
+	}
+	deadline := time.Now().Add(time.Second)
+	for rt.Streams.SubCount("watchRPC") != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if rt.Streams.SubCount("watchRPC") != 0 {
+		t.Fatal("server-side RPC subscription was not removed")
+	}
+}
+
+func TestServerCloseTerminatesActiveRPCStream(t *testing.T) {
+	rt := api.NewRouter()
+	rt.Schema.RegisterAPI(&schema.API{Name: "watchShutdown", Stream: true})
+	rt.Registry.Register("watchShutdown", 9)
+	rt.Registry.RegisterParams("watchShutdown", nil)
+	srv := NewServer(rt)
+	go srv.ListenAndServe("127.0.0.1:19883")
+	time.Sleep(100 * time.Millisecond)
+
+	client := NewClient("127.0.0.1:19883")
+	defer client.Close()
+	subscription, err := client.SubscribeContext(context.Background(), "", 9, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subscription.Close()
+
+	closed := make(chan struct{})
+	go func() {
+		srv.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("server shutdown blocked on an active RPC stream")
+	}
+	select {
+	case <-subscription.Errors():
+	case <-time.After(time.Second):
+		t.Fatal("client stream was not terminated by server shutdown")
+	}
+}
+
+func TestServerCloseTerminatesIdleRPCConnection(t *testing.T) {
+	rt := api.NewRouter()
+	srv := NewServer(rt)
+	go srv.ListenAndServe("127.0.0.1:19884")
+	time.Sleep(100 * time.Millisecond)
+	conn, err := net.Dial("tcp", "127.0.0.1:19884")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	time.Sleep(20 * time.Millisecond)
+
+	closed := make(chan struct{})
+	go func() {
+		srv.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("server shutdown blocked on an idle RPC connection")
 	}
 }
 
@@ -320,6 +503,7 @@ func TestClientCallWithMask(t *testing.T) {
 	defer client.Close()
 
 	mask := codec.FieldMaskSet(nil, 1)
+	mask = codec.AppendSelectionMask(nil, mask, nil)
 	resp, err := client.CallWithMask(1, mask, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -333,7 +517,8 @@ func TestClientCallWithMask(t *testing.T) {
 func testProcessRequest(t *testing.T, srv *Server, payload []byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
-	if err := srv.processRequest(&buf, payload); err != nil {
+	envelope := encodeRequestEnvelope(requestKindCall, "", payload)
+	if err := srv.processRequest(&buf, envelope); err != nil {
 		t.Fatalf("processRequest: %v", err)
 	}
 	resp, err := ReadFrame(&buf, nil)
@@ -713,7 +898,7 @@ func TestRPCTruncatedParams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	WriteFrame(conn, truncated)
+	WriteFrame(conn, encodeRequestEnvelope(requestKindCall, "", truncated))
 	resp, err := ReadFrame(conn, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -1120,6 +1305,29 @@ func TestClientCallEmptyResponse(t *testing.T) {
 	}
 }
 
+func TestClientRejectsNonUnaryResponseStatus(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		ReadFrame(conn, nil)
+		WriteFrame(conn, []byte{statusStream, 1})
+	}()
+
+	client := NewClient(ln.Addr().String())
+	defer client.Close()
+	if _, err := client.Call(1, nil); err == nil || !bytes.Contains([]byte(err.Error()), []byte("invalid unary response status")) {
+		t.Fatalf("unexpected response status must fail, got %v", err)
+	}
+}
+
 // --- Pool: GetContext receives nil from closed channel ---
 
 func TestPoolGetContextNilFromChannel(t *testing.T) {
@@ -1207,7 +1415,7 @@ func TestServerAtCapacity(t *testing.T) {
 	payload = codec.AppendVarint(payload, 1) // API ID
 	payload = codec.AppendVarint(payload, 0) // mask len
 	payload = append(payload, 0x00)          // params end
-	WriteFrame(c1, payload)
+	WriteFrame(c1, encodeRequestEnvelope(requestKindCall, "", payload))
 
 	// Wait for handler to be running (sem slot taken)
 	time.Sleep(50 * time.Millisecond)
@@ -1251,7 +1459,8 @@ func TestServerHandleConnProcessRequestWriteError(t *testing.T) {
 	payload = codec.AppendVarint(payload, 1) // API ID
 	payload = codec.AppendVarint(payload, 0) // mask len
 	payload = append(payload, 0x00)          // params end
-	WriteFrame(pr, payload)
+	request := encodeRequestEnvelope(requestKindCall, "", payload)
+	WriteFrame(pr, request)
 
 	resp, err := ReadFrame(pr, nil)
 	if err != nil {
@@ -1264,7 +1473,7 @@ func TestServerHandleConnProcessRequestWriteError(t *testing.T) {
 	// Now send another request but close our read end immediately after writing.
 	// This way processRequest succeeds but the WriteFrame for the response fails
 	// because the pipe is closed, causing handleConn to return from processRequest error.
-	WriteFrame(pr, payload)
+	WriteFrame(pr, request)
 	pr.Close()
 
 	srv.wg.Wait() // wait for handleConn to exit

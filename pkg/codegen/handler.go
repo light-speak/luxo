@@ -95,37 +95,11 @@ func detectHandlerFeatures(result *semantic.Result, models []*ast.ModelDecl, inf
 // generateHandlerFile produces handler.gen.go containing CRUD handlers,
 // inferred handlers (zero-body APIs), and RegisterHandlers.
 func generateHandlerFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
-	var models []*ast.ModelDecl
-	for _, file := range result.Files {
-		for _, m := range file.Models {
-			if hasCrud(m) {
-				models = append(models, m)
-			}
-		}
-	}
-
+	models, allModels := collectHandlerModels(result)
 	modelMap, inferredAPIs := collectInferredAPIs(result)
-
-	// Check if there are any compiled APIs, native APIs, or service fns
-	hasCompiledAPIs := false
-	hasNativeAPIs := false
-	hasServiceFns := false
-	for _, file := range result.Files {
-		for _, api := range file.APIs {
-			if hasDirective(api.Directives, "native") {
-				hasNativeAPIs = true
-			} else if api.Body != nil {
-				hasCompiledAPIs = true
-			}
-		}
-		for _, fn := range file.Functions {
-			if hasDirective(fn.Directives, "service") {
-				hasServiceFns = true
-			}
-		}
-	}
-
-	if len(models) == 0 && len(inferredAPIs) == 0 && !hasCompiledAPIs && !hasNativeAPIs && !hasServiceFns {
+	hasCompiledAPIs, hasNativeAPIs, hasServiceFns := handlerDeclarationKinds(result)
+	remoteLoads := remoteLoadCallsForResult(result)
+	if len(models) == 0 && len(inferredAPIs) == 0 && !hasCompiledAPIs && !hasNativeAPIs && !hasServiceFns && len(remoteLoads) == 0 {
 		return nil
 	}
 
@@ -135,6 +109,11 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	// derived from what the generated code actually references (e.g. a module
 	// whose native list handlers all became columnar no longer needs codec).
 	var b strings.Builder
+	generateSelectedColumnHelper(&b)
+	for _, model := range collectSelectionModels(result, allModels) {
+		generateSQLColumnSelector(&b, model, enums)
+	}
+	generateComputedResolvers(&b, allModels, modelMap, enums)
 
 	// Generate defaultCols for models with @hidden fields (excludes hidden from SELECT *)
 	for _, m := range models {
@@ -158,7 +137,7 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	for _, n := range nativeNames {
 		compiledSet[n] = true
 	}
-	generateCRUDHandlers(&b, models, enums, compiledSet)
+	generateCRUDHandlers(&b, models, enums, compiledSet, allModels)
 
 	// Collect API directives for middleware wrapping
 	apiDirectives := collectAPIDirectives(result)
@@ -173,7 +152,9 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	generateRegisterServiceFns(&b, serviceNames)
 
 	// DataLoader RPC endpoints — batch load for each model (cluster mode)
-	generateBatchLoadHandlers(&b, models)
+	batchModels := collectBatchLoadModels(models, allModels)
+	generateBatchLoadHandlers(&b, batchModels, enums)
+	generateRemoteNamedLoadHandlers(&b, result, allModels, remoteLoads, enums)
 
 	// Federation resolve endpoints — svc:resolve:{Model}:{FK} for cross-module extends
 	generateFederationResolvers(&b, result, models, enums)
@@ -181,12 +162,52 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	body := b.String()
 	var out strings.Builder
 	writeHeader(&out, packageName, "handler.gen.go")
-	writeHandlerImports(&out, result, models, features, strings.Contains(body, "codec."), body)
+	writeHandlerImports(&out, result, allModels, features, strings.Contains(body, "codec."), body)
 	out.WriteString(body)
 	return []byte(out.String())
 }
 
-func generateCRUDHandlers(b *strings.Builder, models []*ast.ModelDecl, enums map[string]bool, skipNames map[string]bool) {
+func collectHandlerModels(result *semantic.Result) (crudModels, allModels []*ast.ModelDecl) {
+	for _, file := range result.Files {
+		for _, model := range file.Models {
+			allModels = append(allModels, model)
+			if hasCrud(model) {
+				crudModels = append(crudModels, model)
+			}
+		}
+	}
+	return crudModels, allModels
+}
+
+func handlerDeclarationKinds(result *semantic.Result) (hasCompiled, hasNative, hasService bool) {
+	for _, file := range result.Files {
+		for _, api := range file.APIs {
+			hasNative = hasNative || hasDirective(api.Directives, "native")
+			hasCompiled = hasCompiled || api.Body != nil && !hasDirective(api.Directives, "native")
+		}
+		hasService = hasService || functionsHaveDirective(file.Functions, "service")
+	}
+	return hasCompiled, hasNative, hasService
+}
+
+func collectSelectionModels(result *semantic.Result, models []*ast.ModelDecl) []*ast.ModelDecl {
+	selectionModels := append([]*ast.ModelDecl(nil), models...)
+	seen := make(map[string]bool, len(selectionModels))
+	for _, model := range selectionModels {
+		seen[model.Name] = true
+	}
+	for _, file := range result.Files {
+		for _, ext := range file.Extends {
+			if !seen[ext.Name] {
+				selectionModels = append(selectionModels, extendStubModel(ext))
+				seen[ext.Name] = true
+			}
+		}
+	}
+	return selectionModels
+}
+
+func generateCRUDHandlers(b *strings.Builder, models []*ast.ModelDecl, enums map[string]bool, skipNames map[string]bool, universes ...[]*ast.ModelDecl) {
 	// Collect all model relations for recursive resolve support
 	modelRels := make(map[string]bool)
 	for _, m := range models {
@@ -194,6 +215,14 @@ func generateCRUDHandlers(b *strings.Builder, models []*ast.ModelDecl, enums map
 		if len(rels) > 0 {
 			modelRels[m.Name] = true
 		}
+	}
+	computedModels := make(map[string]bool)
+	computedUniverse := models
+	if len(universes) > 0 {
+		computedUniverse = universes[0]
+	}
+	for _, model := range computedUniverse {
+		computedModels[model.Name] = modelHasComputedAggregates(model)
 	}
 
 	// Generate MaxRelationDepth constant
@@ -214,8 +243,8 @@ func generateCRUDHandlers(b *strings.Builder, models []*ast.ModelDecl, enums map
 		generateFilterParser(b, m, enums)
 		generateSorterParser(b, m)
 		if len(rels) > 0 {
-			generateRelationResolver(b, m, rels, modelRels)
-			generateListRelationResolver(b, m, rels, modelRels)
+			generateRelationResolver(b, m, rels, modelRels, computedModels)
+			generateListRelationResolver(b, m, rels, modelRels, computedModels)
 		}
 	}
 }
@@ -262,7 +291,7 @@ func generateServiceFnHandlers(b *strings.Builder, result *semantic.Result, mode
 			}
 			if hasDirective(fn.Directives, "native") {
 				// @native @service — delegate to NativeResolver
-				generateNativeServiceHandler(b, fn)
+				generateNativeServiceHandler(b, fn, modelMap, enumSet)
 			} else if fn.Body != nil {
 				// Compiled fn @service
 				compileFnBody(b, fn, modelMap, enumSet)
@@ -278,10 +307,14 @@ func generateServiceFnHandlers(b *strings.Builder, result *semantic.Result, mode
 func generateNativeAPIHandlers(b *strings.Builder, result *semantic.Result) []string {
 	// Model names — list returns need the []Model → []*Model adapter for
 	// WriteColumnar (types get a value-slice writer, models a pointer-slice one)
-	models := make(map[string]bool)
+	models := make(map[string]*ast.ModelDecl)
+	enums := make(map[string]bool)
 	for _, file := range result.Files {
 		for _, m := range file.Models {
-			models[m.Name] = true
+			models[m.Name] = m
+		}
+		for _, enum := range file.Enums {
+			enums[enum.Name] = true
 		}
 	}
 	var names []string
@@ -290,7 +323,7 @@ func generateNativeAPIHandlers(b *strings.Builder, result *semantic.Result) []st
 			if !hasDirective(api.Directives, "native") {
 				continue
 			}
-			generateNativeAPIHandler(b, api, models)
+			generateNativeAPIHandler(b, api, models, enums)
 			names = append(names, api.Name)
 		}
 	}
@@ -298,7 +331,7 @@ func generateNativeAPIHandlers(b *strings.Builder, result *semantic.Result) []st
 }
 
 // generateNativeAPIHandler generates a single handler for an api @native declaration.
-func generateNativeAPIHandler(b *strings.Builder, api *ast.ApiDecl, models map[string]bool) {
+func generateNativeAPIHandler(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast.ModelDecl, enums map[string]bool) {
 	name := api.Name
 	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(name))
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
@@ -316,9 +349,13 @@ func generateNativeAPIHandler(b *strings.Builder, api *ast.ApiDecl, models map[s
 	for _, p := range api.Params {
 		goType := resolveGoType(p.Type)
 		method := paramMethod(goType)
+		if p.Type != nil && p.Type.Nullable {
+			method = ""
+		}
 		if method == "" {
 			fmt.Fprintf(b, "\t\tvar %s %s\n", p.Name, goType)
-			fmt.Fprintf(b, "\t\tif err := req.ParamJSON(%q, &%s); err != nil {\n", p.Name, p.Name)
+			methodName := paramJSONMethod(p)
+			fmt.Fprintf(b, "\t\tif err := req.%s(%q, &%s); err != nil {\n", methodName, p.Name, p.Name)
 			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 		} else {
 			fmt.Fprintf(b, "\t\t%s, err := req.Param%s(%q)\n", p.Name, method, p.Name)
@@ -341,85 +378,62 @@ func generateNativeAPIHandler(b *strings.Builder, api *ast.ApiDecl, models map[s
 
 	// Write response
 	if api.ReturnType != nil {
-		writeNativeReturnEncoding(b, api.ReturnType, models)
+		writeNativeReturnEncoding(b, api.ReturnType, models, enums)
 	}
 	fmt.Fprintf(b, "\t\treturn nil\n")
 	fmt.Fprintf(b, "\t}\n}\n\n")
 }
 
 // writeNativeReturnEncoding writes the binary encoding for a native API return value.
-func writeNativeReturnEncoding(b *strings.Builder, rt *ast.TypeRef, models map[string]bool) {
+func writeNativeReturnEncoding(b *strings.Builder, rt *ast.TypeRef, models map[string]*ast.ModelDecl, enums map[string]bool) {
 	if rt.IsList {
-		writeNativeListEncoding(b, rt, models)
+		writeNativeListEncoding(b, rt, models, enums)
 		return
 	}
-	writeNativeScalarEncoding(b, rt, "result")
+	if model := models[rt.Name]; model != nil {
+		writeComputedResolve(b, model, "[]*"+rt.Name+"{&result}", "\t\t")
+	}
+	writeNativeScalarEncoding(b, rt, "result", enums)
 }
 
 // writeNativeListEncoding writes list encoding. Primitive lists are
 // length-prefixed; struct lists are columnar — the wire protocol for all
 // list responses (Luvia's BinaryListToJSON reads columnar).
-func writeNativeListEncoding(b *strings.Builder, rt *ast.TypeRef, models map[string]bool) {
-	// Check if element is a primitive type
-	elemRef := &ast.TypeRef{Name: rt.Name}
-	goType := resolveGoType(elemRef)
-	switch goType {
-	case "int64":
-		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(len(result)))\n")
+func writeNativeListEncoding(b *strings.Builder, rt *ast.TypeRef, models map[string]*ast.ModelDecl, enums map[string]bool) {
+	if appendExpr, ok := binaryScalarAppend(rt.Name, "req.Buf.B", "v", enums[rt.Name]); ok {
+		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(result)))\n")
 		fmt.Fprintf(b, "\t\tfor _, v := range result {\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, v)\n")
+		fmt.Fprintf(b, "\t\t\treq.Buf.B = %s\n", appendExpr)
 		fmt.Fprintf(b, "\t\t}\n")
-	case "float64":
-		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(len(result)))\n")
-		fmt.Fprintf(b, "\t\tfor _, v := range result {\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendFixed64(req.Buf.B, v)\n")
+		return
+	}
+	if model := models[rt.Name]; model != nil {
+		// Model list — resolver returns []Model but WriteColumnarModel
+		// takes []*Model (DB loaders produce pointer slices); adapt.
+		fmt.Fprintf(b, "\t\t_ptrs := make([]*%s, len(result))\n", rt.Name)
+		fmt.Fprintf(b, "\t\tfor i := range result {\n")
+		fmt.Fprintf(b, "\t\t\t_ptrs[i] = &result[i]\n")
 		fmt.Fprintf(b, "\t\t}\n")
-	case "string":
-		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(len(result)))\n")
-		fmt.Fprintf(b, "\t\tfor _, v := range result {\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendString(req.Buf.B, v)\n")
-		fmt.Fprintf(b, "\t\t}\n")
-	case "bool":
-		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(len(result)))\n")
-		fmt.Fprintf(b, "\t\tfor _, v := range result {\n")
-		fmt.Fprintf(b, "\t\t\treq.Buf.B = codec.AppendBool(req.Buf.B, v)\n")
-		fmt.Fprintf(b, "\t\t}\n")
-	default:
-		if models[rt.Name] {
-			// Model list — resolver returns []Model but WriteColumnarModel
-			// takes []*Model (DB loaders produce pointer slices); adapt.
-			fmt.Fprintf(b, "\t\t_ptrs := make([]*%s, len(result))\n", rt.Name)
-			fmt.Fprintf(b, "\t\tfor i := range result {\n")
-			fmt.Fprintf(b, "\t\t\t_ptrs[i] = &result[i]\n")
-			fmt.Fprintf(b, "\t\t}\n")
-			fmt.Fprintf(b, "\t\tWriteColumnar%s(req.Buf, _ptrs, req.FieldMask)\n", rt.Name)
-		} else {
-			// Type declaration list — value-slice columnar writer
-			fmt.Fprintf(b, "\t\tWriteColumnar%s(req.Buf, result, req.FieldMask)\n", rt.Name)
-		}
+		writeComputedResolve(b, model, "_ptrs", "\t\t")
+		fmt.Fprintf(b, "\t\tWriteColumnar%s(req.Buf, _ptrs, req.FieldMask)\n", rt.Name)
+	} else {
+		// Type declaration list — value-slice columnar writer
+		fmt.Fprintf(b, "\t\tWriteColumnar%s(req.Buf, result, req.FieldMask)\n", rt.Name)
 	}
 }
 
 // writeNativeScalarEncoding writes encoding for a single return value.
-func writeNativeScalarEncoding(b *strings.Builder, rt *ast.TypeRef, varName string) {
-	goType := resolveGoType(rt)
-	switch goType {
-	case "int64":
-		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, %s)\n", varName)
-	case "float64":
-		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendFixed64(req.Buf.B, %s)\n", varName)
-	case "string":
-		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendString(req.Buf.B, %s)\n", varName)
-	case "bool":
-		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendBool(req.Buf.B, %s)\n", varName)
-	default:
-		// Struct type — use WriteLuxo
-		fmt.Fprintf(b, "\t\t%s.WriteLuxo(req.Buf, req.FieldMask)\n", varName)
+func writeNativeScalarEncoding(b *strings.Builder, rt *ast.TypeRef, varName string, enums map[string]bool) {
+	if appendExpr, ok := binaryScalarAppend(rt.Name, "req.Buf.B", varName, enums[rt.Name]); ok {
+		fmt.Fprintf(b, "\t\treq.Buf.B = %s\n", appendExpr)
+		return
 	}
+	// Struct type — use WriteLuxo.
+	fmt.Fprintf(b, "\t\t%s.WriteLuxo(req.Buf, req.FieldMask)\n", varName)
 }
 
 // generateNativeServiceHandler generates a handler that delegates to NativeResolver.
-func generateNativeServiceHandler(b *strings.Builder, fn *ast.FnDecl) {
+func generateNativeServiceHandler(b *strings.Builder, fn *ast.FnDecl, models map[string]*ast.ModelDecl, enums map[string]bool) {
 	name := fn.Name
 	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(name))
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
@@ -429,9 +443,13 @@ func generateNativeServiceHandler(b *strings.Builder, fn *ast.FnDecl) {
 	for _, p := range fn.Params {
 		goType := resolveGoType(p.Type)
 		method := paramMethod(goType)
+		if p.Type != nil && p.Type.Nullable {
+			method = ""
+		}
 		if method == "" {
 			fmt.Fprintf(b, "\t\tvar %s %s\n", p.Name, goType)
-			fmt.Fprintf(b, "\t\tif err := req.ParamJSON(%q, &%s); err != nil {\n", p.Name, p.Name)
+			methodName := paramJSONMethod(p)
+			fmt.Fprintf(b, "\t\tif err := req.%s(%q, &%s); err != nil {\n", methodName, p.Name, p.Name)
 			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 		} else {
 			fmt.Fprintf(b, "\t\t%s, err := req.Param%s(%q)\n", p.Name, method, p.Name)
@@ -441,7 +459,11 @@ func generateNativeServiceHandler(b *strings.Builder, fn *ast.FnDecl) {
 	}
 
 	// Call NativeResolver
-	fmt.Fprintf(b, "\t\tresult, err := app.Resolver.%s(ctx", str.Capitalize(name))
+	if fn.ReturnType == nil {
+		fmt.Fprintf(b, "\t\terr := app.Resolver.%s(ctx", str.Capitalize(name))
+	} else {
+		fmt.Fprintf(b, "\t\tresult, err := app.Resolver.%s(ctx", str.Capitalize(name))
+	}
 	for _, pn := range paramNames {
 		fmt.Fprintf(b, ", %s", pn)
 	}
@@ -450,19 +472,7 @@ func generateNativeServiceHandler(b *strings.Builder, fn *ast.FnDecl) {
 
 	// Write response — always binary (Luvia converts to JSON if needed)
 	if fn.ReturnType != nil {
-		goType := resolveGoType(fn.ReturnType)
-		switch goType {
-		case "int64":
-			fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, result)\n")
-		case "float64":
-			fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendFixed64(req.Buf.B, result)\n")
-		case "string":
-			fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendString(req.Buf.B, result)\n")
-		case "bool":
-			fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendBool(req.Buf.B, result)\n")
-		default:
-			fmt.Fprintf(b, "\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
-		}
+		writeNativeReturnEncoding(b, fn.ReturnType, models, enums)
 	}
 	fmt.Fprintf(b, "\t\treturn nil\n")
 	fmt.Fprintf(b, "\t}\n}\n\n")
@@ -544,6 +554,12 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 	needsJSON := scanModelsForJSON(models)
 	hasValidation, hasPattern := scanModelsForValidation(models)
 	needsFmt := needsFmtImport(models, feat.hasEmit)
+	needsLux := len(models) > 0
+	needsErrors := true
+	needsSelection := len(models) > 0
+	needsPG := len(models) > 0
+	needsUUID := false
+	needsDecimal := false
 	if len(generatedBody) > 0 {
 		body := generatedBody[0]
 		hasOrGroups = strings.Contains(body, "strconv.")
@@ -557,6 +573,12 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 		needsFmt = strings.Contains(body, "fmt.")
 		hasValidation = false
 		hasPattern = strings.Contains(body, "regexp.")
+		needsLux = strings.Contains(body, "lux.")
+		needsErrors = strings.Contains(body, "errors.")
+		needsSelection = strings.Contains(body, "selection.")
+		needsPG = strings.Contains(body, "pg.")
+		needsUUID = strings.Contains(body, "uuid.")
+		needsDecimal = strings.Contains(body, "decimal.")
 	}
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
@@ -581,7 +603,7 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 	} else {
 		b.WriteString("\n")
 	}
-	if len(models) > 0 {
+	if needsLux {
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux\"\n")
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
@@ -591,22 +613,30 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 	if hasHash || feat.hasCrypto {
 		b.WriteString("\tluxocrypto \"github.com/light-speak/luxo/pkg/lux/crypto\"\n")
 	}
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/errors\"\n")
+	if needsErrors {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/errors\"\n")
+	}
 	if feat.hasLog {
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luxolog\"\n")
 	}
 	if hasAuth {
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
 	}
-	if len(models) > 0 {
+	if needsSelection {
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
+	}
+	if needsUUID {
+		b.WriteString("\t\"github.com/google/uuid\"\n")
+	}
+	if needsDecimal {
+		b.WriteString("\t\"github.com/shopspring/decimal\"\n")
 	}
 	writeSortedCrossModuleImports(b, feat.crossEventImports)
 	if hasAwait {
 		b.WriteString("\t\"golang.org/x/sync/errgroup\"\n")
 	}
 	// pg import: batchLoad handlers need pg.QueryRows, transaction needs pg driver
-	if len(models) > 0 {
+	if needsPG {
 		fmt.Fprintf(b, "\tpg %q\n", DriverPG.DriverImport())
 	} else if hasTransaction {
 		fmt.Fprintf(b, "\t%q\n", DriverPG.DriverImport())
@@ -706,16 +736,11 @@ func filterOps(all, except []string) []string {
 func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[string]bool, rels []Relation) {
 	name := m.Name
 	idType := idGoType(m)
+	idGoName := primaryKeyGoName(m)
 
 	apiName := crudAPIName(name, op)
 	hasRels := len(rels) > 0
 	hidden := hasHiddenFields(m)
-
-	// colsExpr: uses defaultCols when no $select for models with @hidden fields
-	colsExpr := "selection.SQLColumns(req.Select)"
-	if hidden {
-		colsExpr = fmt.Sprintf("selection.SQLColumnsOr(req.Select, default%sCols)", name)
-	}
 
 	// @withAuth marks the identity model; @auth protects arbitrary model CRUD.
 	modelAuth := findDirective(m.Directives, "auth")
@@ -729,16 +754,19 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 			writeCRUDAuthCheck(b, "\t\t", modelAuth)
 		}
 		writeParamID(b, idType, "\t\t")
-		fmt.Fprintf(b, "\t\tcols := %s\n", colsExpr)
+		fmt.Fprintf(b, "\t\tcols := select%sSQLColumns(req.Select)\n", name)
+		if hidden {
+			fmt.Fprintf(b, "\t\tif cols == nil { cols = default%sCols }\n", name)
+		}
 		writeFKEnsure(b, rels)
-		fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(%sWhere.Id.Eq(id)).Select(cols...).First(ctx)\n", name, name)
+		fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(%sWhere.%s.Eq(id)).Select(cols...).First(ctx)\n", name, name, idGoName)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		fmt.Fprintf(b, "\t\tif result == nil {\n\t\t\treturn errors.NotFound.WithData(errors.ResourceError{Resource: %q, ID: id})\n\t\t}\n", name)
 		if hasRels {
 			fmt.Fprintf(b, "\t\tif err := resolve%sRelations(ctx, app, result, req.Select); err != nil {\n", name)
 			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 		}
-		generateAggregateFields(b, m, "result", "\t\t")
+		writeComputedResolve(b, m, "[]*"+name+"{result}", "\t\t")
 		fmt.Fprintf(b, "\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
 		fmt.Fprintf(b, "\t\treturn nil\n")
 		fmt.Fprintf(b, "\t}\n}\n\n")
@@ -749,7 +777,10 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		if needAuth {
 			writeCRUDAuthCheck(b, "\t\t", modelAuth)
 		}
-		fmt.Fprintf(b, "\t\tcols := %s\n", colsExpr)
+		fmt.Fprintf(b, "\t\tcols := select%sSQLColumns(req.Select)\n", name)
+		if hidden {
+			fmt.Fprintf(b, "\t\tif cols == nil { cols = default%sCols }\n", name)
+		}
 		writeFKEnsure(b, rels)
 		fmt.Fprintf(b, "\t\tconds := parse%sFilters(req.Filters)\n", name)
 		// Note: @soft deleted_at filter is already in Client.Where(), not added here
@@ -763,6 +794,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 			fmt.Fprintf(b, "\t\tif err := resolve%sListRelations(ctx, app, results, req.Select); err != nil {\n", name)
 			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 		}
+		writeComputedResolve(b, m, "results", "\t\t")
 		// Write paginated response — columnar encoding for lists
 		fmt.Fprintf(b, "\t\tWriteColumnar%s(req.Buf, results, req.FieldMask)\n", name)
 		// Append pagination metadata after columnar data
@@ -787,9 +819,9 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		}
 		writeParamID(b, idType, "\t\t")
 		if soft {
-			fmt.Fprintf(b, "\t\tn, err := app.%s.SoftDelete(ctx, %sWhere.Id.Eq(id))\n", name, name)
+			fmt.Fprintf(b, "\t\tn, err := app.%s.SoftDelete(ctx, %sWhere.%s.Eq(id))\n", name, name, idGoName)
 		} else {
-			fmt.Fprintf(b, "\t\tn, err := app.%s.Where(%sWhere.Id.Eq(id)).Delete(ctx)\n", name, name)
+			fmt.Fprintf(b, "\t\tn, err := app.%s.Where(%sWhere.%s.Eq(id)).Delete(ctx)\n", name, name, idGoName)
 		}
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		fmt.Fprintf(b, "\t\tif n == 0 {\n\t\t\treturn errors.NotFound.WithData(errors.ResourceError{Resource: %q, ID: id})\n\t\t}\n", name)
@@ -819,9 +851,9 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 			fmt.Fprintf(b, "\t\t}\n")
 		}
 		if soft {
-			fmt.Fprintf(b, "\t\tn, err := app.%s.SoftDelete(ctx, %sWhere.Id.In(ids...))\n", name, name)
+			fmt.Fprintf(b, "\t\tn, err := app.%s.SoftDelete(ctx, %sWhere.%s.In(ids...))\n", name, name, idGoName)
 		} else {
-			fmt.Fprintf(b, "\t\tn, err := app.%s.Where(%sWhere.Id.In(ids...)).Delete(ctx)\n", name, name)
+			fmt.Fprintf(b, "\t\tn, err := app.%s.Where(%sWhere.%s.In(ids...)).Delete(ctx)\n", name, name, idGoName)
 		}
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		fmt.Fprintf(b, "\t\tif n > 0 {\n")
@@ -863,6 +895,7 @@ func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string,
 	fmt.Fprintf(b, "\t\tresult, err := builder.Exec(ctx)\n")
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 	fmt.Fprintf(b, "\t\tapi.InvalidateCache(%q)\n", m.Name)
+	writeComputedResolve(b, m, "[]*"+name+"{result}", "\t\t")
 	fmt.Fprintf(b, "\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
 	fmt.Fprintf(b, "\t\treturn nil\n")
 	fmt.Fprintf(b, "\t}\n")
@@ -885,7 +918,7 @@ func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType
 	fmt.Fprintf(b, "\t\tbuilder := new%sUpdateBuilder(app.%s.db, %q, id)\n", name, name, tableName)
 
 	for _, f := range m.Fields {
-		if skipHandlerField(f, enums) || f.Name == "id" || hasDirective(f.Directives, "immutable") {
+		if skipHandlerField(f, enums) || f.Name == primaryKeyFieldName(m) || hasDirective(f.Directives, "immutable") {
 			continue
 		}
 		setter := "Set" + str.Capitalize(f.Name)
@@ -896,6 +929,7 @@ func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType
 	fmt.Fprintf(b, "\t\tresult, err := builder.Exec(ctx)\n")
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 	fmt.Fprintf(b, "\t\tapi.InvalidateCache(%q)\n", m.Name)
+	writeComputedResolve(b, m, "[]*"+name+"{result}", "\t\t")
 	fmt.Fprintf(b, "\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
 	fmt.Fprintf(b, "\t\treturn nil\n")
 	fmt.Fprintf(b, "\t}\n")
@@ -924,7 +958,7 @@ func isRelationField(f *ast.FieldDecl, enums map[string]bool) bool {
 	}
 	// Check the base type name (works for both scalar and list)
 	switch f.Type.Name {
-	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes":
+	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes", "JSON":
 		return false // String, [String], Int, [Int] etc. are never relations
 	}
 	// Enum types — not relations
@@ -937,6 +971,13 @@ func isRelationField(f *ast.FieldDecl, enums map[string]bool) bool {
 
 // generateParamSet writes a param extraction + setter call.
 func generateParamSet(b *strings.Builder, f *ast.FieldDecl, setter, indent string, enums map[string]bool) {
+	originalIndent := indent
+	if f.Type != nil && f.Type.Nullable {
+		fmt.Fprintf(b, "%sif req.ParamIsNull(%q) {\n", indent, f.Name)
+		fmt.Fprintf(b, "%s\tbuilder.%s(nil)\n", indent, setter)
+		fmt.Fprintf(b, "%s} else {\n", indent)
+		indent += "\t"
+	}
 	varName := f.Name + "Val"
 
 	// For nullable fields, use the base type for param extraction, then take pointer
@@ -992,6 +1033,9 @@ func generateParamSet(b *strings.Builder, f *ast.FieldDecl, setter, indent strin
 		argExpr = f.Type.Name + "(" + varName + ")"
 	}
 	fmt.Fprintf(b, "%sbuilder.%s(%s)\n", indent, setter, argExpr)
+	if f.Type != nil && f.Type.Nullable {
+		fmt.Fprintf(b, "%s}\n", originalIndent)
+	}
 }
 
 // hasHiddenFields checks if a model has any @hidden fields.
@@ -1023,11 +1067,113 @@ func generateDefaultCols(b *strings.Builder, m *ast.ModelDecl, enums map[string]
 	b.WriteString("}\n\n")
 }
 
+func generateSQLColumnSelector(b *strings.Builder, model *ast.ModelDecl, enums map[string]bool) {
+	primaryKey := primaryKeyFieldName(model)
+	fmt.Fprintf(b, "// select%sSQLColumns maps API fields to database columns.\n", model.Name)
+	fmt.Fprintf(b, "func select%sSQLColumns(fields []*selection.Field) []string {\n", model.Name)
+	b.WriteString("\tif len(fields) == 0 { return nil }\n")
+	b.WriteString("\tcols := make([]string, 0, len(fields)+1)\n")
+	b.WriteString("\thasPrimaryKey := false\n")
+	b.WriteString("\tfor _, field := range fields {\n")
+	b.WriteString("\t\tswitch field.Name {\n")
+	for _, field := range model.Fields {
+		if localKey, ok := computedFieldLocalKey(model, field, enums); ok {
+			fmt.Fprintf(b, "\t\tcase %q:\n", field.Name)
+			fmt.Fprintf(b, "\t\t\tcols = ensureSelectedColumn(cols, %q)\n", str.ToSnakeCase(localKey))
+			if localKey == primaryKey {
+				b.WriteString("\t\t\thasPrimaryKey = true\n")
+			}
+			continue
+		}
+		if field.Type == nil || field.Computed != nil || isRelationField(field, enums) ||
+			hasDirective(field.Directives, "hidden") || hasDirective(field.Directives, "internal") {
+			continue
+		}
+		fmt.Fprintf(b, "\t\tcase %q:\n", field.Name)
+		fmt.Fprintf(b, "\t\t\tcols = ensureSelectedColumn(cols, %q)\n", str.ToSnakeCase(field.Name))
+		if field.Name == primaryKey {
+			b.WriteString("\t\t\thasPrimaryKey = true\n")
+		}
+	}
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t}\n")
+	fmt.Fprintf(b, "\tif !hasPrimaryKey { cols = append(cols, %q) }\n", str.ToSnakeCase(primaryKey))
+	b.WriteString("\treturn cols\n")
+	b.WriteString("}\n\n")
+}
+
+func generateSelectedColumnHelper(b *strings.Builder) {
+	b.WriteString("func ensureSelectedColumn(columns []string, name string) []string {\n")
+	b.WriteString("\tfor _, column := range columns {\n")
+	b.WriteString("\t\tif column == name { return columns }\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\treturn append(columns, name)\n")
+	b.WriteString("}\n\n")
+}
+
+func computedFieldLocalKey(model *ast.ModelDecl, field *ast.FieldDecl, enums map[string]bool) (string, bool) {
+	if field.Computed == nil {
+		return "", false
+	}
+	relations := analyzeRelations(model, enums)
+	for _, directive := range field.Computed.Directives {
+		if len(directive.Args) != 1 {
+			continue
+		}
+		relationName, _, ok := computedAggregateTarget(directive.Name, directive.Args[0].Value)
+		if !ok {
+			continue
+		}
+		for _, relation := range relations {
+			if relation.FieldName == relationName && relation.IsList {
+				return relation.LocalKey, true
+			}
+		}
+	}
+	return "", false
+}
+
+func firstBoolSet(sets []map[string]bool) map[string]bool {
+	if len(sets) == 0 {
+		return nil
+	}
+	return sets[0]
+}
+
+func writeNestedComputedResolve(b *strings.Builder, relation Relation, resultExpr, indent string, computedModels map[string]bool) {
+	if !computedModels[relation.TargetName] {
+		return
+	}
+	items := resultExpr
+	if !relation.IsList {
+		items = "[]*" + relation.TargetName + "{" + resultExpr + "}"
+	}
+	fmt.Fprintf(b, "%sif err := resolve%sComputedFields(ctx, app, %s, f.Children); err != nil { return err }\n",
+		indent, relation.TargetName, items)
+}
+
+func writeNestedListComputedResolve(b *strings.Builder, relation Relation, computedModels map[string]bool) {
+	if !computedModels[relation.TargetName] {
+		return
+	}
+	goField := str.Capitalize(relation.FieldName)
+	fmt.Fprintf(b, "\t\t\tcomputedItems := make([]*%s, 0)\n", relation.TargetName)
+	b.WriteString("\t\t\tfor _, item := range items {\n")
+	if relation.IsList {
+		fmt.Fprintf(b, "\t\t\t\tcomputedItems = append(computedItems, item.%s...)\n", goField)
+	} else {
+		fmt.Fprintf(b, "\t\t\t\tif item.%s != nil { computedItems = append(computedItems, item.%s) }\n", goField, goField)
+	}
+	b.WriteString("\t\t\t}\n")
+	fmt.Fprintf(b, "\t\t\tif err := resolve%sComputedFields(ctx, app, computedItems, f.Children); err != nil { return err }\n", relation.TargetName)
+}
+
 // generateRelationResolver generates a resolve<Model>Relations function
 // that loads relation fields via DataLoader based on $select.
-func generateRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relation, modelRels map[string]bool) {
+func generateRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relation, modelRels map[string]bool, computedSets ...map[string]bool) {
 	name := m.Name
 	lower := strings.ToLower(name[:1]) + name[1:]
+	computedModels := firstBoolSet(computedSets)
 
 	fmt.Fprintf(b, "// resolve%sRelations loads relation fields for %s based on $select.\n", name, name)
 	fmt.Fprintf(b, "// depth limits recursive resolution to prevent infinite loops.\n")
@@ -1046,13 +1192,14 @@ func generateRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relat
 
 		fmt.Fprintf(b, "\tfor _, f := range fields {\n")
 		fmt.Fprintf(b, "\t\tif f.Name == %q && f.Children != nil {\n", fieldName)
-		fmt.Fprintf(b, "\t\t\tchildCols := selection.SQLColumns(f.Children)\n")
+		fmt.Fprintf(b, "\t\t\tchildCols := select%sSQLColumns(f.Children)\n", rel.TargetName)
 		if rel.FKNullable {
 			fmt.Fprintf(b, "\t\t\tif %s.%s != nil {\n", lower, goLocalKey)
 			fmt.Fprintf(b, "\t\t\t\tresult, err := app.loaders.%s.Load(ctx, *%s.%s, childCols)\n",
 				loaderField, lower, goLocalKey)
 			fmt.Fprintf(b, "\t\t\t\tif err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n")
 			fmt.Fprintf(b, "\t\t\t\t%s.%s = result\n", lower, goFieldName)
+			writeNestedComputedResolve(b, rel, "result", "\t\t\t\t", computedModels)
 			// Recursive resolve for child's relations
 			if modelRels[rel.TargetName] {
 				fmt.Fprintf(b, "\t\t\t\tif err := resolve%sRelations(ctx, app, result, f.Children, d-1); err != nil {\n", rel.TargetName)
@@ -1064,6 +1211,7 @@ func generateRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relat
 				loaderField, lower, goLocalKey)
 			fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
 			fmt.Fprintf(b, "\t\t\t%s.%s = result\n", lower, goFieldName)
+			writeNestedComputedResolve(b, rel, "result", "\t\t\t", computedModels)
 			// Recursive resolve for child's relations
 			if modelRels[rel.TargetName] {
 				if rel.IsList {
@@ -1086,8 +1234,9 @@ func generateRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relat
 
 // generateListRelationResolver generates a batch resolve function for LIST handlers.
 // Uses LoadAll (direct dispatch, zero wait) instead of per-item Load.
-func generateListRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relation, modelRels map[string]bool) {
+func generateListRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relation, modelRels map[string]bool, computedSets ...map[string]bool) {
 	name := m.Name
+	computedModels := firstBoolSet(computedSets)
 
 	fmt.Fprintf(b, "// resolve%sListRelations batch-loads all relation fields for a list of %s.\n", name, name)
 	fmt.Fprintf(b, "// Uses LoadAll — direct dispatch, zero wait.\n")
@@ -1105,7 +1254,7 @@ func generateListRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []R
 
 		fmt.Fprintf(b, "\tfor _, f := range fields {\n")
 		fmt.Fprintf(b, "\t\tif f.Name == %q && f.Children != nil {\n", fieldName)
-		fmt.Fprintf(b, "\t\t\tchildCols := selection.SQLColumns(f.Children)\n")
+		fmt.Fprintf(b, "\t\t\tchildCols := select%sSQLColumns(f.Children)\n", rel.TargetName)
 
 		// Collect all keys
 		fmt.Fprintf(b, "\t\t\tkeys := make([]%s, 0, len(items))\n", rel.KeyGoType)
@@ -1137,6 +1286,7 @@ func generateListRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []R
 			fmt.Fprintf(b, "\t\t\t\titem.%s = resultMap[item.%s]\n", goFieldName, goLocalKey)
 			fmt.Fprintf(b, "\t\t\t}\n")
 		}
+		writeNestedListComputedResolve(b, rel, computedModels)
 
 		// Recursive resolve for child's relations
 		if modelRels[rel.TargetName] {
@@ -1240,7 +1390,7 @@ func collectAPIDirectives(result *semantic.Result) map[string][]*ast.Directive {
 // generateBatchLoadHandlers generates svc:batchLoad:Model RPC endpoints for each model.
 // These endpoints allow remote services to batch-load model data via DataLoader.
 // Used in cluster mode: remote service's DataLoader calls this endpoint instead of querying DB.
-func generateBatchLoadHandlers(b *strings.Builder, models []*ast.ModelDecl) {
+func generateBatchLoadHandlers(b *strings.Builder, models []*ast.ModelDecl, enumSets ...map[string]bool) {
 	if len(models) == 0 {
 		return
 	}
@@ -1249,17 +1399,22 @@ func generateBatchLoadHandlers(b *strings.Builder, models []*ast.ModelDecl) {
 		name := m.Name
 		tableName := str.ToSnakeCase(name) + "s"
 		scanFn := "scan" + name
+		idType := modelIDTypeName(m)
+		idGoType := idGoType(m)
+		idColumn := str.ToSnakeCase(primaryKeyFieldName(m))
+		paramMethod := idArrayParamMethod(idType)
 
 		fmt.Fprintf(b, "// handleBatchLoad%s handles svc:batchLoad:%s — batch load by PK for remote DataLoaders.\n", name, name)
 		fmt.Fprintf(b, "func handleBatchLoad%s(app *App) api.HandlerFunc {\n", name)
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
-		fmt.Fprintf(b, "\t\tkeys, err := req.ParamIntArray(\"keys\")\n")
+		fmt.Fprintf(b, "\t\tkeys, err := req.Param%s(\"keys\")\n", paramMethod)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		fmt.Fprintf(b, "\t\tfields, _ := req.ParamStringArray(\"fields\")\n")
-		fmt.Fprintf(b, "\t\tconds := []lux.Condition{lux.NewIntField(\"id\").In(keys...)}\n")
+		generateSelectedSQLFields(b, m, firstBoolSet(enumSets))
+		fmt.Fprintf(b, "\t\tconds := []lux.Condition{lux.New%s(%q).In(keys...)}\n", goTypeToCondField(idGoType), idColumn)
 		fmt.Fprintf(b, "\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", tableName)
 		fmt.Fprintf(b, "\t\trows, err := %s.QueryRows(ctx, app.DB, %s, query, args...)\n", dbPkg, scanFn)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+		writeComputedResolve(b, m, "rows", "\t\t")
 		// Write response: binary array of models
 		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(rows)))\n")
 		fmt.Fprintf(b, "\t\tfor _, row := range rows {\n")
@@ -1279,10 +1434,217 @@ func generateBatchLoadHandlers(b *strings.Builder, models []*ast.ModelDecl) {
 		apiID := getAPIID(svcName)
 		if apiID > 0 {
 			fmt.Fprintf(b, "\trouter.Registry.Register(%q, %d)\n", svcName, apiID)
-			fmt.Fprintf(b, "\trouter.Registry.RegisterParams(%q, []api.ParamMeta{{FieldID: 1, Name: \"count\", Type: \"Int\"}, {FieldID: 2, Name: \"keys\", Type: \"Int\"}})\n", svcName)
+			fmt.Fprintf(b, "\trouter.Registry.RegisterParams(%q, []api.ParamMeta{{FieldID: 1, Name: \"keys\", Type: %q, IsList: true}})\n", svcName, modelIDTypeName(m))
 		}
 	}
 	b.WriteString("}\n\n")
+}
+
+func collectBatchLoadModels(crudModels, allModels []*ast.ModelDecl) []*ast.ModelDecl {
+	selected := make(map[string]bool, len(crudModels))
+	result := append([]*ast.ModelDecl(nil), crudModels...)
+	for _, model := range crudModels {
+		selected[model.Name] = true
+	}
+	if globalEventCtx == nil {
+		return result
+	}
+	for _, model := range allModels {
+		if globalEventCtx.remotePKModels[model.Name] && !selected[model.Name] {
+			selected[model.Name] = true
+			result = append(result, model)
+		}
+	}
+	return result
+}
+
+func remoteLoadCallsForResult(result *semantic.Result) []loadCallInfo {
+	if globalEventCtx == nil || len(result.Files) == 0 {
+		return nil
+	}
+	return globalEventCtx.remoteLoadCalls[moduleNameFromFile(result.Files[0].Name)]
+}
+
+// generateRemoteNamedLoadHandlers emits internal RPC endpoints used by
+// cross-module Model.load(field: value, ...) calls.
+func generateRemoteNamedLoadHandlers(b *strings.Builder, result *semantic.Result, models []*ast.ModelDecl, calls []loadCallInfo, enumSets ...map[string]bool) {
+	if len(calls) == 0 {
+		return
+	}
+	modelByName := make(map[string]*ast.ModelDecl, len(models))
+	for _, model := range models {
+		modelByName[model.Name] = model
+	}
+	seen := make(map[string]bool)
+	var generated []loadCallInfo
+	for _, call := range calls {
+		serviceName := loadServiceName(call)
+		if seen[serviceName] || modelByName[call.modelName] == nil {
+			continue
+		}
+		seen[serviceName] = true
+		generated = append(generated, call)
+		generateRemoteNamedLoadHandler(b, modelByName[call.modelName], call, firstBoolSet(enumSets))
+	}
+	if len(generated) == 0 {
+		return
+	}
+	b.WriteString("// RegisterRemoteLoaders registers named cross-module load endpoints.\n")
+	b.WriteString("func RegisterRemoteLoaders(router *api.Router, app *App) {\n")
+	for _, call := range generated {
+		serviceName := loadServiceName(call)
+		handlerName := "handleLoad" + loaderNameFromLoadCall(call)
+		fmt.Fprintf(b, "\trouter.Handle(%q, %s(app))\n", serviceName, handlerName)
+		if apiID := getAPIID(serviceName); apiID > 0 {
+			fmt.Fprintf(b, "\trouter.Registry.Register(%q, %d)\n", serviceName, apiID)
+			fmt.Fprintf(b, "\trouter.Registry.RegisterParams(%q, []api.ParamMeta{\n", serviceName)
+			for i, argName := range call.argNames {
+				fmt.Fprintf(b, "\t\t{FieldID: %d, Name: %q, Type: %q, IsList: true},\n",
+					getAPIParamID(serviceName, argName), argName, call.argTypeNames[i])
+			}
+			b.WriteString("\t})\n")
+		}
+	}
+	b.WriteString("}\n\n")
+	_ = result
+}
+
+func generateRemoteNamedLoadHandler(b *strings.Builder, model *ast.ModelDecl, call loadCallInfo, enumSets ...map[string]bool) {
+	loaderName := loaderNameFromLoadCall(call)
+	handlerName := "handleLoad" + loaderName
+	keyType := call.argTypes[0]
+	keyTypeName := ""
+	if len(call.argNames) > 1 {
+		keyTypeName = "load" + loaderName + "Key"
+		keyType = keyTypeName
+		fmt.Fprintf(b, "type %s struct {\n", keyTypeName)
+		for i, argName := range call.argNames {
+			fmt.Fprintf(b, "\t%s %s\n", str.Capitalize(argName), call.argTypes[i])
+		}
+		b.WriteString("}\n\n")
+	}
+	fmt.Fprintf(b, "// %s handles %s.\n", handlerName, loadServiceName(call))
+	fmt.Fprintf(b, "func %s(app *App) api.HandlerFunc {\n", handlerName)
+	b.WriteString("\treturn func(ctx context.Context, req *api.Request) error {\n")
+	for i, argName := range call.argNames {
+		fmt.Fprintf(b, "\t\t%sKeys, err := req.Param%s(\"%s\")\n", argName, idArrayParamMethod(call.argTypeNames[i]), argName)
+		b.WriteString("\t\tif err != nil { return err }\n")
+		if i > 0 {
+			fmt.Fprintf(b, "\t\tif len(%sKeys) != len(%sKeys) {\n", argName, call.argNames[0])
+			fmt.Fprintf(b, "\t\t\treturn errors.BadRequest.WithData(errors.ParamError{Param: %q, Error: %q})\n",
+				argName, "array length must match "+call.argNames[0])
+			b.WriteString("\t\t}\n")
+		}
+	}
+	generateSelectedSQLFields(b, model, firstBoolSet(enumSets))
+	for _, argName := range call.argNames {
+		generateRequiredSQLField(b, str.ToSnakeCase(argName))
+	}
+	if len(call.argNames) == 1 {
+		fmt.Fprintf(b, "\t\tconds := []lux.Condition{lux.New%s(%q).In(%sKeys...)}\n",
+			goTypeToCondField(call.argTypes[0]), str.ToSnakeCase(call.argNames[0]), call.argNames[0])
+	} else {
+		generateCompositeLoadConditions(b, "\t\t", call, true)
+	}
+	if isSoftDelete(model) {
+		b.WriteString("\t\tconds = append(conds, lux.NewTimeField(\"deleted_at\").IsNull())\n")
+	}
+	fmt.Fprintf(b, "\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", str.ToSnakeCase(model.Name)+"s")
+	fmt.Fprintf(b, "\t\trows, err := %s.QueryRows(ctx, app.DB, scan%s, query, args...)\n", dbPkg, model.Name)
+	b.WriteString("\t\tif err != nil { return err }\n")
+	writeComputedResolve(b, model, "rows", "\t\t")
+	fmt.Fprintf(b, "\t\tgrouped := make(map[%s][]*%s, len(%sKeys))\n", keyType, model.Name, call.argNames[0])
+	b.WriteString("\t\tfor _, row := range rows {\n")
+	fmt.Fprintf(b, "\t\t\tkey := %s\n", loadKeyExpr(call, "row."))
+	b.WriteString("\t\t\tgrouped[key] = append(grouped[key], row)\n")
+	b.WriteString("\t\t}\n")
+	fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(%sKeys)))\n", call.argNames[0])
+	fmt.Fprintf(b, "\t\tfor i := range %sKeys {\n", call.argNames[0])
+	fmt.Fprintf(b, "\t\t\tkey := %s\n", requestLoadKeyExpr(call, keyTypeName))
+	b.WriteString("\t\t\titems := grouped[key]\n")
+	b.WriteString("\t\t\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(items)))\n")
+	b.WriteString("\t\t\ttmp := api.GetBuf()\n")
+	b.WriteString("\t\t\tfor _, item := range items {\n")
+	b.WriteString("\t\t\t\ttmp.Reset()\n")
+	b.WriteString("\t\t\t\titem.WriteLuxo(tmp, req.FieldMask)\n")
+	b.WriteString("\t\t\t\treq.Buf.B = codec.AppendBytes(req.Buf.B, tmp.B)\n")
+	b.WriteString("\t\t\t}\n")
+	b.WriteString("\t\t\tapi.PutBuf(tmp)\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t\treturn nil\n")
+	b.WriteString("\t}\n")
+	b.WriteString("}\n\n")
+}
+
+func loadKeyExpr(call loadCallInfo, prefix string) string {
+	if len(call.argNames) == 1 {
+		return prefix + str.Capitalize(call.argNames[0])
+	}
+	var b strings.Builder
+	b.WriteString("load" + loaderNameFromLoadCall(call) + "Key{")
+	for i, argName := range call.argNames {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%s: %s%s", str.Capitalize(argName), prefix, str.Capitalize(argName))
+	}
+	b.WriteByte('}')
+	return b.String()
+}
+
+func requestLoadKeyExpr(call loadCallInfo, keyTypeName string) string {
+	if len(call.argNames) == 1 {
+		return call.argNames[0] + "Keys[i]"
+	}
+	var b strings.Builder
+	b.WriteString(keyTypeName + "{")
+	for i, argName := range call.argNames {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%s: %sKeys[i]", str.Capitalize(argName), argName)
+	}
+	b.WriteByte('}')
+	return b.String()
+}
+
+func idArrayParamMethod(typeName string) string {
+	switch typeName {
+	case "String":
+		return "StringArray"
+	case "UUID":
+		return "UUIDArray"
+	default:
+		return "IntArray"
+	}
+}
+
+func generateSelectedSQLFields(b *strings.Builder, model *ast.ModelDecl, enumSets ...map[string]bool) {
+	enums := firstBoolSet(enumSets)
+	b.WriteString("\t\tfieldMask := codec.SelectionMaskFields(req.FieldMask)\n")
+	b.WriteString("\t\tvar fields []string\n")
+	b.WriteString("\t\tif len(fieldMask) > 0 {\n")
+	b.WriteString("\t\t\tfields = make([]string, 0, len(fieldMask))\n")
+	fmt.Fprintf(b, "\t\t\tfields = append(fields, %q)\n", str.ToSnakeCase(primaryKeyFieldName(model)))
+	for _, field := range model.Fields {
+		if localKey, ok := computedFieldLocalKey(model, field, enums); ok {
+			if fieldID := getModelFieldID(model.Name, field.Name); fieldID > 0 {
+				fmt.Fprintf(b, "\t\t\tif codec.FieldMaskHas(fieldMask, %d) { fields = ensureSelectedColumn(fields, %q) }\n",
+					fieldID, str.ToSnakeCase(localKey))
+			}
+			continue
+		}
+		if field.Name == primaryKeyFieldName(model) || field.Computed != nil || isRelationField(field, enums) {
+			continue
+		}
+		fieldID := getModelFieldID(model.Name, field.Name)
+		if fieldID <= 0 {
+			continue
+		}
+		fmt.Fprintf(b, "\t\t\tif codec.FieldMaskHas(fieldMask, %d) { fields = append(fields, %q) }\n",
+			fieldID, str.ToSnakeCase(field.Name))
+	}
+	b.WriteString("\t\t}\n")
 }
 
 // writeAPIRegistration generates router.Registry.Register + RegisterParams calls.
@@ -1296,10 +1658,35 @@ func writeAPIRegistration(b *strings.Builder, name string) {
 	if len(params) == 0 {
 		return
 	}
-	fmt.Fprintf(b, "\trouter.Registry.RegisterParams(%q, []api.ParamMeta{\n", name)
+	type registeredParam struct {
+		name string
+		id   int
+	}
+	registered := make([]registeredParam, 0, len(params))
+	activeTypes, hasActiveTypes := apiParamTypes[strings.TrimPrefix(name, "svc:")]
 	for paramName, paramID := range params {
-		ptype := resolveParamTypeFromAST(name, paramName)
-		fmt.Fprintf(b, "\t\t{Name: %q, Type: %q, FieldID: %d},\n", paramName, ptype, paramID)
+		if hasActiveTypes {
+			if _, ok := activeTypes[paramName]; !ok {
+				continue
+			}
+		}
+		registered = append(registered, registeredParam{name: paramName, id: paramID})
+	}
+	if len(registered) == 0 {
+		return
+	}
+	sort.Slice(registered, func(i, j int) bool { return registered[i].id < registered[j].id })
+	fmt.Fprintf(b, "\trouter.Registry.RegisterParams(%q, []api.ParamMeta{\n", name)
+	for _, param := range registered {
+		ptype, isList, nullable := resolveParamMetaFromAST(name, param.name)
+		fmt.Fprintf(b, "\t\t{Name: %q, Type: %q, FieldID: %d", param.name, ptype, param.id)
+		if isList {
+			b.WriteString(", IsList: true")
+		}
+		if nullable {
+			b.WriteString(", Nullable: true")
+		}
+		b.WriteString("},\n")
 	}
 	b.WriteString("\t})\n")
 }
@@ -1307,15 +1694,25 @@ func writeAPIRegistration(b *strings.Builder, name string) {
 // resolveParamTypeFromAST looks up the actual Luxo type for a param from AST data.
 // Falls back to inferParamType heuristic if no AST info available.
 func resolveParamTypeFromAST(apiName, paramName string) string {
+	typeName, _, _ := resolveParamMetaFromAST(apiName, paramName)
+	return typeName
+}
+
+func resolveParamMetaFromAST(apiName, paramName string) (string, bool, bool) {
 	if apiParamTypes != nil {
 		lookupName := strings.TrimPrefix(apiName, "svc:")
 		if params, ok := apiParamTypes[lookupName]; ok {
 			if t, ok := params[paramName]; ok {
-				return t
+				nullable := strings.HasSuffix(t, "?")
+				t = strings.TrimSuffix(t, "?")
+				if strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]") {
+					return strings.TrimSuffix(strings.TrimPrefix(t, "["), "]"), true, nullable
+				}
+				return t, false, nullable
 			}
 		}
 	}
-	return inferParamType(paramName)
+	return inferParamType(paramName), false, false
 }
 
 // inferParamType infers Luxo type from param name for binary param metadata.
@@ -1340,10 +1737,8 @@ func inferParamType(name string) string {
 
 // idGoType returns the Go type of the id field.
 func idGoType(m *ast.ModelDecl) string {
-	for _, f := range m.Fields {
-		if f.Name == "id" && f.Type != nil {
-			return resolveGoType(f.Type)
-		}
+	if field := primaryKeyField(m); field != nil {
+		return resolveGoType(field.Type)
 	}
 	return "int64"
 }
@@ -1382,6 +1777,19 @@ func paramMethod(goType string) string {
 	default:
 		return "" // custom type — use ParamJSON
 	}
+}
+
+func paramJSONMethod(param *ast.ParamDecl) string {
+	if param.Type != nil && param.Type.Nullable {
+		if param.Default != nil {
+			return "ParamJSONOptionalNullable"
+		}
+		return "ParamJSONNullable"
+	}
+	if param.Default != nil {
+		return "ParamJSONOptional"
+	}
+	return "ParamJSON"
 }
 
 // generateFilterParser generates a parse{Model}Filters function that converts
@@ -1967,60 +2375,249 @@ func compileFieldExpr(expr ast.Expr, itVar string) string {
 	return ""
 }
 
-// generateAggregateFields generates SQL sub-queries for @count/@sum/@avg/@min/@max computed fields.
-func generateAggregateFields(b *strings.Builder, m *ast.ModelDecl, resultVar, indent string) {
-	for _, f := range m.Fields {
-		if f.Computed == nil {
+type computedAggregate struct {
+	field     *ast.FieldDecl
+	directive string
+	targetCol string
+	fieldID   int
+}
+
+type computedAggregateGroup struct {
+	relation Relation
+	target   *ast.ModelDecl
+	fields   []computedAggregate
+}
+
+func modelHasComputedAggregates(model *ast.ModelDecl) bool {
+	if model == nil {
+		return false
+	}
+	for _, field := range model.Fields {
+		if field.Computed == nil {
 			continue
 		}
-		for _, d := range f.Computed.Directives {
-			aggFn := ""
-			switch d.Name {
-			case "count":
-				aggFn = "COUNT"
-			case "sum":
-				aggFn = "SUM"
-			case "avg":
-				aggFn = "AVG"
-			case "min":
-				aggFn = "MIN"
-			case "max":
-				aggFn = "MAX"
-			default:
-				continue
+		for _, directive := range field.Computed.Directives {
+			switch directive.Name {
+			case "count", "sum", "avg", "min", "max":
+				return true
 			}
-
-			// @count(relation) → table = relation table, fkCol = modelName_id
-			if len(d.Args) == 0 {
-				continue
-			}
-			relationName := ""
-			targetCol := ""
-			if ident, ok := d.Args[0].Value.(*ast.Ident); ok {
-				relationName = ident.Name
-			}
-			if member, ok := d.Args[0].Value.(*ast.MemberExpr); ok {
-				if ident, ok := member.Object.(*ast.Ident); ok {
-					relationName = ident.Name
-					targetCol = str.ToSnakeCase(member.Field)
-				}
-			}
-			if relationName == "" {
-				continue
-			}
-
-			table := str.ToSnakeCase(relationName) + "s"
-			fkCol := str.ToSnakeCase(m.Name) + "_id"
-			goField := str.Capitalize(f.Name)
-
-			sql := fmt.Sprintf("lux.AggregateSQL(%q, %q, %q, %q)", aggFn, table, fkCol, targetCol)
-			fmt.Fprintf(b, "%s{\n", indent)
-			fmt.Fprintf(b, "%s\tvar aggVal int64\n", indent)
-			fmt.Fprintf(b, "%s\t_ = pg.QueryRow(ctx, app.DB, %s, %s.Id).Scan(&aggVal)\n", indent, sql, resultVar)
-			fmt.Fprintf(b, "%s\t%s.%s = aggVal\n", indent, resultVar, goField)
-			fmt.Fprintf(b, "%s}\n", indent)
 		}
 	}
+	return false
+}
+
+func writeComputedResolve(b *strings.Builder, model *ast.ModelDecl, itemsExpr, indent string) {
+	if !modelHasComputedAggregates(model) {
+		return
+	}
+	fmt.Fprintf(b, "%sif err := resolve%sComputed(ctx, app, %s, req.FieldMask); err != nil { return err }\n",
+		indent, model.Name, itemsExpr)
+}
+
+func generateComputedResolvers(b *strings.Builder, models []*ast.ModelDecl, modelMap map[string]*ast.ModelDecl, enums map[string]bool) {
+	for _, model := range models {
+		groups := collectComputedAggregateGroups(model, modelMap, enums)
+		if len(groups) == 0 {
+			continue
+		}
+		generateComputedResolver(b, model, groups)
+		generateComputedFieldResolver(b, model, groups)
+		for _, group := range groups {
+			generateComputedGroupResolver(b, model, group)
+		}
+	}
+}
+
+func generateComputedFieldResolver(b *strings.Builder, model *ast.ModelDecl, groups []computedAggregateGroup) {
+	fmt.Fprintf(b, "func resolve%sComputedFields(ctx context.Context, app *App, items []*%s, fields []*selection.Field) error {\n", model.Name, model.Name)
+	b.WriteString("\tif len(items) == 0 { return nil }\n")
+	fmt.Fprintf(b, "\tif len(fields) == 0 { return resolve%sComputed(ctx, app, items, nil) }\n", model.Name)
+	for _, group := range groups {
+		fmt.Fprintf(b, "\tvar need%s bool\n", str.Capitalize(group.relation.FieldName))
+	}
+	b.WriteString("\tfor _, field := range fields {\n\t\tswitch field.Name {\n")
+	for _, group := range groups {
+		for _, aggregate := range group.fields {
+			fmt.Fprintf(b, "\t\tcase %q: need%s = true\n", aggregate.field.Name, str.Capitalize(group.relation.FieldName))
+		}
+	}
+	b.WriteString("\t\t}\n\t}\n")
+	for _, group := range groups {
+		fmt.Fprintf(b, "\tif need%s {\n", str.Capitalize(group.relation.FieldName))
+		fmt.Fprintf(b, "\t\tif err := resolve%s%sComputed(ctx, app, items, nil); err != nil { return err }\n",
+			model.Name, str.Capitalize(group.relation.FieldName))
+		b.WriteString("\t}\n")
+	}
+	b.WriteString("\treturn nil\n}\n\n")
+}
+
+func collectComputedAggregateGroups(model *ast.ModelDecl, modelMap map[string]*ast.ModelDecl, enums map[string]bool) []computedAggregateGroup {
+	relations := make(map[string]Relation)
+	for _, relation := range analyzeRelations(model, enums) {
+		if relation.IsList {
+			relations[relation.FieldName] = relation
+		}
+	}
+	var groups []computedAggregateGroup
+	groupIndexes := make(map[string]int)
+	for _, field := range model.Fields {
+		aggregate, relationName, ok := parseComputedAggregate(model.Name, field)
+		relation, exists := relations[relationName]
+		if !ok || !exists || modelMap[relation.TargetName] == nil {
+			continue
+		}
+		index, exists := groupIndexes[relationName]
+		if !exists {
+			index = len(groups)
+			groupIndexes[relationName] = index
+			groups = append(groups, computedAggregateGroup{relation: relation, target: modelMap[relation.TargetName]})
+		}
+		groups[index].fields = append(groups[index].fields, aggregate)
+	}
+	return groups
+}
+
+func parseComputedAggregate(modelName string, field *ast.FieldDecl) (computedAggregate, string, bool) {
+	if field.Computed == nil || field.Type == nil {
+		return computedAggregate{}, "", false
+	}
+	fieldID := getModelFieldID(modelName, field.Name)
+	if fieldID == 0 {
+		return computedAggregate{}, "", false
+	}
+	for _, directive := range field.Computed.Directives {
+		if len(directive.Args) != 1 {
+			continue
+		}
+		relation, target, ok := computedAggregateTarget(directive.Name, directive.Args[0].Value)
+		if ok {
+			return computedAggregate{field: field, directive: directive.Name, targetCol: target, fieldID: fieldID}, relation, true
+		}
+	}
+	return computedAggregate{}, "", false
+}
+
+func computedAggregateTarget(name string, expr ast.Expr) (relation, target string, ok bool) {
+	if name == "count" {
+		ident, valid := expr.(*ast.Ident)
+		if !valid {
+			return "", "", false
+		}
+		return ident.Name, "", true
+	}
+	if name != "sum" && name != "avg" && name != "min" && name != "max" {
+		return "", "", false
+	}
+	member, valid := expr.(*ast.MemberExpr)
+	if !valid {
+		return "", "", false
+	}
+	ident, valid := member.Object.(*ast.Ident)
+	if !valid {
+		return "", "", false
+	}
+	return ident.Name, str.ToSnakeCase(member.Field), true
+}
+
+func generateComputedResolver(b *strings.Builder, model *ast.ModelDecl, groups []computedAggregateGroup) {
+	fmt.Fprintf(b, "func resolve%sComputed(ctx context.Context, app *App, items []*%s, selectionMask []byte) error {\n", model.Name, model.Name)
+	b.WriteString("\tif len(items) == 0 { return nil }\n")
+	b.WriteString("\tfieldMask := codec.SelectionMaskFields(selectionMask)\n")
+	for _, group := range groups {
+		fmt.Fprintf(b, "\tif %s {\n", computedMaskExpr(group.fields))
+		fmt.Fprintf(b, "\t\tif err := resolve%s%sComputed(ctx, app, items, fieldMask); err != nil { return err }\n",
+			model.Name, str.Capitalize(group.relation.FieldName))
+		b.WriteString("\t}\n")
+	}
+	b.WriteString("\treturn nil\n")
+	b.WriteString("}\n\n")
+}
+
+func computedMaskExpr(fields []computedAggregate) string {
+	var b strings.Builder
+	b.WriteString("len(fieldMask) == 0")
+	for _, field := range fields {
+		fmt.Fprintf(&b, " || codec.FieldMaskHas(fieldMask, %d)", field.fieldID)
+	}
+	return b.String()
+}
+
+func generateComputedGroupResolver(b *strings.Builder, model *ast.ModelDecl, group computedAggregateGroup) {
+	valueType := str.LowerFirst(model.Name) + str.Capitalize(group.relation.FieldName) + "ComputedValue"
+	fmt.Fprintf(b, "type %s struct {\n", valueType)
+	for _, aggregate := range group.fields {
+		fmt.Fprintf(b, "\t%s %s\n", str.Capitalize(aggregate.field.Name), resolveGoType(aggregate.field.Type))
+	}
+	b.WriteString("}\n\n")
+	fmt.Fprintf(b, "func resolve%s%sComputed(ctx context.Context, app *App, items []*%s, fieldMask []byte) error {\n",
+		model.Name, str.Capitalize(group.relation.FieldName), model.Name)
+	generateComputedKeys(b, model, group.relation)
+	generateComputedQuery(b, group)
+	generateComputedAssignments(b, model, group, valueType)
+	b.WriteString("\treturn nil\n")
+	b.WriteString("}\n\n")
+}
+
+func generateComputedKeys(b *strings.Builder, model *ast.ModelDecl, relation Relation) {
+	goKey := str.Capitalize(relation.LocalKey)
+	fmt.Fprintf(b, "\tkeys := make([]%s, 0, len(items))\n", relation.KeyGoType)
+	b.WriteString("\tfor _, item := range items {\n")
+	b.WriteString("\t\tif item == nil { continue }\n")
+	fmt.Fprintf(b, "\t\tkeys = append(keys, item.%s)\n", goKey)
+	b.WriteString("\t}\n")
+	b.WriteString("\tif len(keys) == 0 { return nil }\n")
+}
+
+func generateComputedQuery(b *strings.Builder, group computedAggregateGroup) {
+	query := computedGroupSQL(group)
+	fmt.Fprintf(b, "\tquery := `%s`\n", query)
+	b.WriteString("\trows, err := pg.QueryRaw(ctx, app.DB, query, keys)\n")
+	b.WriteString("\tif err != nil { return err }\n")
+	b.WriteString("\tdefer rows.Close()\n")
+}
+
+func computedGroupSQL(group computedAggregateGroup) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, `SELECT "%s"`, str.ToSnakeCase(group.relation.RemoteKey))
+	for _, aggregate := range group.fields {
+		b.WriteString(", ")
+		b.WriteString(computedAggregateSQLExpr(aggregate))
+	}
+	fmt.Fprintf(&b, ` FROM "%s" WHERE "%s" = ANY($1)`, str.ToSnakeCase(group.target.Name)+"s", str.ToSnakeCase(group.relation.RemoteKey))
+	if isSoftDelete(group.target) {
+		b.WriteString(` AND "deleted_at" IS NULL`)
+	}
+	fmt.Fprintf(&b, ` GROUP BY "%s"`, str.ToSnakeCase(group.relation.RemoteKey))
+	return b.String()
+}
+
+func computedAggregateSQLExpr(aggregate computedAggregate) string {
+	if aggregate.directive == "count" {
+		return "COUNT(*)::bigint"
+	}
+	cast := map[string]string{"Int": "bigint", "Float": "double precision", "Decimal": "numeric"}[aggregate.field.Type.Name]
+	return fmt.Sprintf(`COALESCE(%s("%s"), 0)::%s`, strings.ToUpper(aggregate.directive), aggregate.targetCol, cast)
+}
+
+func generateComputedAssignments(b *strings.Builder, model *ast.ModelDecl, group computedAggregateGroup, valueType string) {
+	fmt.Fprintf(b, "\tvalues := make(map[%s]%s, len(items))\n", group.relation.KeyGoType, valueType)
+	b.WriteString("\tfor rows.Next() {\n")
+	fmt.Fprintf(b, "\t\tvar key %s\n", group.relation.KeyGoType)
+	fmt.Fprintf(b, "\t\tvar value %s\n", valueType)
+	b.WriteString("\t\tif err := rows.Scan(&key")
+	for _, aggregate := range group.fields {
+		fmt.Fprintf(b, ", &value.%s", str.Capitalize(aggregate.field.Name))
+	}
+	b.WriteString("); err != nil { return err }\n")
+	b.WriteString("\t\tvalues[key] = value\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\tif err := rows.Err(); err != nil { return err }\n")
+	fmt.Fprintf(b, "\tfor _, item := range items {\n\t\tif item == nil { continue }\n\t\tvalue, ok := values[item.%s]\n\t\tif !ok { continue }\n", str.Capitalize(group.relation.LocalKey))
+	for _, aggregate := range group.fields {
+		fmt.Fprintf(b, "\t\tif len(fieldMask) == 0 || codec.FieldMaskHas(fieldMask, %d) { item.%s = value.%s }\n",
+			aggregate.fieldID, str.Capitalize(aggregate.field.Name), str.Capitalize(aggregate.field.Name))
+	}
+	b.WriteString("\t}\n")
 }
 
 // scanBodyForBuiltins walks AST to find crypto.*, now(), duration property usage.
@@ -2108,13 +2705,17 @@ func scanStmtsForEmit(stmts []ast.Stmt, f *handlerFeatures, curMod string) {
 
 // resolveEndpoint describes a svc:resolve:{Model}:{FK} endpoint to generate.
 type resolveEndpoint struct {
-	modelName string // model being resolved (e.g. "Post")
-	tableName string // SQL table (e.g. "posts")
-	fkField   string // FK field on the model (e.g. "userId")
-	fkColumn  string // FK SQL column (e.g. "user_id")
-	svcName   string // endpoint name (e.g. "svc:resolve:Post:userId")
-	scanFn    string // scan function (e.g. "scanPost")
-	isList    bool   // true for hasMany (multiple items per FK)
+	model      *ast.ModelDecl
+	modelName  string // model being resolved (e.g. "Post")
+	tableName  string // SQL table (e.g. "posts")
+	fkField    string // FK field on the model (e.g. "userId")
+	fkColumn   string // FK SQL column (e.g. "user_id")
+	svcName    string // endpoint name (e.g. "svc:resolve:Post:userId")
+	scanFn     string // scan function (e.g. "scanPost")
+	isList     bool   // true for hasMany (multiple items per FK)
+	keyType    string // Luxo primary-key type of the extended model
+	keyGoType  string // Go primary-key type used by the target foreign key
+	fkNullable bool   // nullable foreign keys are absent from federation groups
 }
 
 // generateFederationResolvers generates svc:resolve:{Model}:{FK} endpoints
@@ -2139,8 +2740,10 @@ func generateFederationResolvers(b *strings.Builder, result *semantic.Result, mo
 
 	// Find model names owned by this module (for FK inference)
 	modelNames := make(map[string]bool)
+	modelDecls := make(map[string]*ast.ModelDecl)
 	for _, m := range models {
 		modelNames[m.Name] = true
+		modelDecls[m.Name] = m
 	}
 
 	// Collect resolve endpoints from extends in this module
@@ -2157,7 +2760,7 @@ func generateFederationResolvers(b *strings.Builder, result *semantic.Result, mo
 				continue
 			}
 			for _, f := range ext.Fields {
-				if f.Type == nil || !isRelationField(f, enums) {
+				if f.Type == nil || ownerModelHasField(ext.Name, f.Name) || !isRelationField(f, enums) {
 					continue
 				}
 				// This field is a relation (e.g. posts: [Post])
@@ -2165,15 +2768,21 @@ func generateFederationResolvers(b *strings.Builder, result *semantic.Result, mo
 				if !modelNames[f.Type.Name] {
 					continue
 				}
-				fk := inferForeignKey(&ast.ModelDecl{Name: ext.Name}, f, enums)
+				fk := inferFederationForeignKey(&ast.ModelDecl{Name: ext.Name}, f)
+				keyType := externalModelIDTypeName(ext.Name)
+				fkField := modelFieldByName(modelDecls[f.Type.Name], fk)
 				ep := resolveEndpoint{
-					modelName: f.Type.Name,
-					tableName: str.ToSnakeCase(f.Type.Name) + "s",
-					fkField:   fk,
-					fkColumn:  str.ToSnakeCase(fk),
-					svcName:   "svc:resolve:" + f.Type.Name + ":" + fk,
-					scanFn:    "scan" + f.Type.Name,
-					isList:    f.Type.IsList,
+					model:      modelDecls[f.Type.Name],
+					modelName:  f.Type.Name,
+					tableName:  str.ToSnakeCase(f.Type.Name) + "s",
+					fkField:    fk,
+					fkColumn:   str.ToSnakeCase(fk),
+					svcName:    "svc:resolve:" + f.Type.Name + ":" + fk,
+					scanFn:     "scan" + f.Type.Name,
+					isList:     f.Type.IsList,
+					keyType:    keyType,
+					keyGoType:  mapBaseType(keyType),
+					fkNullable: fkField != nil && fkField.Type != nil && fkField.Type.Nullable,
 				}
 				endpoints = append(endpoints, ep)
 			}
@@ -2193,20 +2802,28 @@ func generateFederationResolvers(b *strings.Builder, result *semantic.Result, mo
 		fmt.Fprintf(b, "func handleResolve%sBy%s(app *App) api.HandlerFunc {\n",
 			ep.modelName, str.Capitalize(ep.fkField))
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
-		fmt.Fprintf(b, "\t\tkeys, err := req.ParamIntArray(\"keys\")\n")
+		fmt.Fprintf(b, "\t\tkeys, err := req.Param%sArray(\"keys\")\n", ep.keyType)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+		generateSelectedSQLFields(b, ep.model, enums)
+		generateRequiredSQLField(b, ep.fkColumn)
 		// Query: WHERE fk_column IN (keys)
-		fmt.Fprintf(b, "\t\tconds := []lux.Condition{lux.NewIntField(%q).In(keys...)}\n", ep.fkColumn)
-		fmt.Fprintf(b, "\t\tquery, args := lux.BuildSelectSQL(%q, nil, conds, nil, 0, 0)\n", ep.tableName)
+		fmt.Fprintf(b, "\t\tconds := []lux.Condition{lux.New%sField(%q).In(keys...)}\n", ep.keyType, ep.fkColumn)
+		fmt.Fprintf(b, "\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", ep.tableName)
 		fmt.Fprintf(b, "\t\trows, err := %s.QueryRows(ctx, app.DB, %s, query, args...)\n", dbPkg, ep.scanFn)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\n")
+		writeComputedResolve(b, ep.model, "rows", "\t\t")
 
 		// Group by FK field
 		fmt.Fprintf(b, "\t\t// Group results by FK value, preserving request key order\n")
-		fmt.Fprintf(b, "\t\tgrouped := make(map[int64][]*%s, len(keys))\n", ep.modelName)
+		fmt.Fprintf(b, "\t\tgrouped := make(map[%s][]*%s, len(keys))\n", ep.keyGoType, ep.modelName)
 		fmt.Fprintf(b, "\t\tfor _, row := range rows {\n")
 		fmt.Fprintf(b, "\t\t\tfk := row.%s\n", str.Capitalize(ep.fkField))
-		fmt.Fprintf(b, "\t\t\tgrouped[fk] = append(grouped[fk], row)\n")
+		if ep.fkNullable {
+			fmt.Fprintf(b, "\t\t\tif fk == nil { continue }\n")
+			fmt.Fprintf(b, "\t\t\tgrouped[*fk] = append(grouped[*fk], row)\n")
+		} else {
+			fmt.Fprintf(b, "\t\t\tgrouped[fk] = append(grouped[fk], row)\n")
+		}
 		fmt.Fprintf(b, "\t\t}\n\n")
 
 		// Write grouped response: [key_count][per-key: [item_count][len+item1][len+item2]...]
@@ -2240,9 +2857,28 @@ func generateFederationResolvers(b *strings.Builder, result *semantic.Result, mo
 		apiID := getAPIID(ep.svcName)
 		if apiID > 0 {
 			fmt.Fprintf(b, "\trouter.Registry.Register(%q, %d)\n", ep.svcName, apiID)
-			// Params: field 1 = count (Int), field 2 = keys (Int, repeated)
-			fmt.Fprintf(b, "\trouter.Registry.RegisterParams(%q, []api.ParamMeta{{FieldID: 1, Name: \"count\", Type: \"Int\"}, {FieldID: 2, Name: \"keys\", Type: \"Int\"}})\n", ep.svcName)
+			fmt.Fprintf(b, "\trouter.Registry.RegisterParams(%q, []api.ParamMeta{{FieldID: 1, Name: \"keys\", Type: %q, IsList: true}})\n", ep.svcName, ep.keyType)
 		}
 	}
 	b.WriteString("}\n\n")
+}
+
+func modelFieldByName(model *ast.ModelDecl, name string) *ast.FieldDecl {
+	if model == nil {
+		return nil
+	}
+	for _, field := range model.Fields {
+		if field.Name == name {
+			return field
+		}
+	}
+	return nil
+}
+
+func generateRequiredSQLField(b *strings.Builder, column string) {
+	b.WriteString("\t\tif fields != nil {\n")
+	b.WriteString("\t\t\thasRequiredField := false\n")
+	fmt.Fprintf(b, "\t\t\tfor _, field := range fields { if field == %q { hasRequiredField = true; break } }\n", column)
+	fmt.Fprintf(b, "\t\t\tif !hasRequiredField { fields = append(fields, %q) }\n", column)
+	b.WriteString("\t\t}\n")
 }

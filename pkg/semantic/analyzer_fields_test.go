@@ -85,15 +85,21 @@ func TestDuplicateField(t *testing.T) {
 // ========== Computed Field Tests ==========
 
 func TestComputedField(t *testing.T) {
-	result := analyze(t, `model Post {
-  title: String
-  val totalCount: Int get @count
-  val avgLikes: Float get @avg(field: likes)
+	result := analyze(t, `model User {
+  id: Int @id
+  posts: [Post]
+  val totalCount: Int get @count(posts)
+  val avgLikes: Float get @avg(field: posts.likes)
+}
+model Post {
+  id: Int @id
+  userId: Int
+  likes: Int
 }`)
 	expectNoErrors(t, result)
 
-	post := result.Types["Post"]
-	tc := post.Fields["totalCount"]
+	user := result.Types["User"]
+	tc := user.Fields["totalCount"]
 	if tc == nil || !tc.Computed {
 		t.Error("expected computed field totalCount")
 	}

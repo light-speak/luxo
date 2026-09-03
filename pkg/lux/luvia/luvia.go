@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -29,9 +30,27 @@ type Gateway struct {
 
 // New creates a new Luvia gateway.
 func New() *Gateway {
-	return &Gateway{
-		Router: api.NewRouter(),
+	router := api.NewRouter()
+	router.IdentityExtractor = func(ctx context.Context) any {
+		return Identity(ctx)
 	}
+	router.InternalRequestContext = internalRequestContext
+	return &Gateway{
+		Router: router,
+	}
+}
+
+func internalRequestContext(ctx context.Context, bearerToken string) (context.Context, error) {
+	cfg, err := auth.LoadConfig()
+	if err != nil {
+		return nil, err
+	}
+	data, err := auth.VerifyCached(cfg, bearerToken)
+	if err != nil {
+		return nil, err
+	}
+	ctx = context.WithValue(ctx, identityKey, &Claims{data: data})
+	return context.WithValue(ctx, bearerTokenCtxKey{}, bearerToken), nil
 }
 
 // AddModule registers a module name for display.
@@ -44,6 +63,9 @@ func (g *Gateway) AddModule(name string) {
 // If APP_TLS_CERT and APP_TLS_KEY are set, uses HTTP/2 with TLS.
 // Handles SIGTERM/SIGINT for graceful shutdown — drains active connections.
 func (g *Gateway) Serve(version string) error {
+	if err := g.Router.Validate(); err != nil {
+		return err
+	}
 	mux, port := g.buildMux(version)
 	addr := ":" + port
 
@@ -147,6 +169,7 @@ func (g *Gateway) buildMux(version string) (*http.ServeMux, string) {
 	if envOr("APP_ENV", "") == "development" {
 		g.Router.SetDevMode(true)
 	}
+	configureWebSocketOrigins(g.Router, envOr("CORS_ORIGIN", "*"))
 
 	// Schema introspection key
 	if key := envOr("INTROSPECTION_KEY", ""); key != "" {
@@ -164,6 +187,21 @@ func (g *Gateway) buildMux(version string) (*http.ServeMux, string) {
 	mux.Handle("/luvia", handler)
 
 	return mux, port
+}
+
+func configureWebSocketOrigins(router *api.Router, configured string) {
+	configured = strings.TrimSpace(configured)
+	if configured == "*" {
+		router.WSAllowAllOrigins = true
+		router.WSOrigins = nil
+		return
+	}
+	origin, err := url.Parse(configured)
+	if err != nil || origin.Scheme == "" || origin.Host == "" || origin.User != nil {
+		return
+	}
+	router.WSAllowAllOrigins = false
+	router.WSOrigins = []string{origin.Host}
 }
 
 // corsMiddleware handles CORS preflight, response headers, and security headers (XSS, CSP, etc.).

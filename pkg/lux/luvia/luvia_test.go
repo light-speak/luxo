@@ -233,6 +233,15 @@ func TestServeSetup(t *testing.T) {
 	}
 }
 
+func TestServeRejectsMissingStreamImplementationBeforeListening(t *testing.T) {
+	gw := New()
+	gw.Router.RequireStream("watchMissing")
+	err := gw.Serve("test")
+	if err == nil || !strings.Contains(err.Error(), "watchMissing") {
+		t.Fatalf("Serve validation error = %v", err)
+	}
+}
+
 func TestBuildMux(t *testing.T) {
 	gw := New()
 	gw.AddModule("user")
@@ -381,6 +390,31 @@ func TestBuildMuxDevMode(t *testing.T) {
 
 	// In dev mode, router should be in dev mode
 	// We can't easily check this without exposing state, but ensure no crash
+}
+
+func TestBuildMuxUsesCORSOriginForWebSocket(t *testing.T) {
+	t.Setenv("CORS_ORIGIN", "https://studio.example.com:8443")
+
+	gw := New()
+	gw.buildMux("v1")
+
+	if len(gw.Router.WSOrigins) != 1 || gw.Router.WSOrigins[0] != "studio.example.com:8443" {
+		t.Fatalf("WebSocket origins = %v", gw.Router.WSOrigins)
+	}
+	if gw.Router.WSAllowAllOrigins {
+		t.Fatal("specific CORS origin must not allow every WebSocket origin")
+	}
+}
+
+func TestBuildMuxUsesWildcardCORSForWebSocket(t *testing.T) {
+	t.Setenv("CORS_ORIGIN", "*")
+
+	gw := New()
+	gw.buildMux("v1")
+
+	if !gw.Router.WSAllowAllOrigins {
+		t.Fatal("wildcard CORS must apply to WebSocket origin checks")
+	}
 }
 
 func TestBuildBannerDatabaseDisplay(t *testing.T) {
