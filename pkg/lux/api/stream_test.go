@@ -386,6 +386,20 @@ func TestTypedStreamEncodesUsingSubscriberSelectionAndMode(t *testing.T) {
 	if got := <-sub.Ch; string(got) != "encoded" {
 		t.Fatalf("typed stream payload = %q", got)
 	}
+	if typed.Context() != raw.Context() {
+		t.Fatal("typed stream context does not match raw stream context")
+	}
+	if !bytes.Equal(raw.FieldMask(), mask) || raw.Binary() {
+		t.Fatalf("stream metadata mask=%v binary=%v", raw.FieldMask(), raw.Binary())
+	}
+	params := &StreamParams{binary: []byte{1, 0}}
+	if !bytes.Equal(params.Binary(), []byte{1, 0}) {
+		t.Fatalf("binary params = %v", params.Binary())
+	}
+	var nilParams *StreamParams
+	if nilParams.Binary() != nil {
+		t.Fatal("nil stream params must return nil binary data")
+	}
 }
 
 func TestStreamHub_UnsubscribeNonExistent(t *testing.T) {

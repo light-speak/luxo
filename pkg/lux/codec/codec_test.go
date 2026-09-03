@@ -1,6 +1,7 @@
 package codec
 
 import (
+	"bytes"
 	"math"
 	"testing"
 	"unsafe"
@@ -136,6 +137,42 @@ func TestEncoderDecoderRoundTrip(t *testing.T) {
 	}
 	if assigneeId != 7 {
 		t.Fatalf("assigneeId: got %d", assigneeId)
+	}
+}
+
+func TestEncoderValueWritersAndReset(t *testing.T) {
+	uuidValue := [16]byte{1, 2, 3}
+	var enc Encoder
+	enc.WriteFieldHeader(7)
+	enc.WriteNull()
+	enc.WritePresent()
+	enc.WriteInt(-3)
+	enc.WriteVarint(4)
+	enc.WriteFloat(1.5)
+	enc.WriteString("x")
+	enc.WriteBool(true)
+	enc.WriteBytes([]byte{5, 6})
+	enc.WriteUUID(uuidValue)
+	enc.WriteArrayHeader(2)
+
+	var want []byte
+	want = AppendVarint(want, 7)
+	want = AppendNull(want)
+	want = AppendPresent(want)
+	want = AppendSvarint(want, -3)
+	want = AppendVarint(want, 4)
+	want = AppendFixed64(want, 1.5)
+	want = AppendString(want, "x")
+	want = AppendBool(want, true)
+	want = AppendBytes(want, []byte{5, 6})
+	want = AppendUUID(want, uuidValue)
+	want = AppendArrayHeader(want, 2)
+	if !bytes.Equal(enc.Bytes(), want) {
+		t.Fatalf("encoded values = %v, want %v", enc.Bytes(), want)
+	}
+	enc.Reset()
+	if len(enc.Bytes()) != 0 {
+		t.Fatalf("Reset left %d bytes", len(enc.Bytes()))
 	}
 }
 
@@ -2693,6 +2730,44 @@ func TestDecoderSkipNullable(t *testing.T) {
 	}
 	if dec.NextField() {
 		t.Fatal("expected end")
+	}
+}
+
+func TestDecoderSkipValueVariants(t *testing.T) {
+	uuidValue := [16]byte{1, 2, 3}
+	tests := []struct {
+		name   string
+		typeID FieldSkipType
+		data   []byte
+	}{
+		{name: "varint", typeID: SkipVarint, data: AppendVarint(nil, 7)},
+		{name: "fixed64", typeID: SkipFixed64, data: AppendFixed64(nil, 1.5)},
+		{name: "bytes", typeID: SkipBytes, data: AppendBytes(nil, []byte("x"))},
+		{name: "nullable varint", typeID: SkipNullVarint, data: AppendVarint(AppendPresent(nil), 7)},
+		{name: "nullable fixed64", typeID: SkipNullFixed64, data: AppendFixed64(AppendPresent(nil), 1.5)},
+		{name: "nullable bytes", typeID: SkipNullBytes, data: AppendBytes(AppendPresent(nil), []byte("x"))},
+		{name: "fixed16", typeID: SkipFixed16, data: AppendUUID(nil, uuidValue)},
+		{name: "nullable fixed16", typeID: SkipNullFixed16, data: AppendUUID(AppendPresent(nil), uuidValue)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dec := NewDecoder(tt.data)
+			dec.SkipValue(tt.typeID)
+			if dec.Err() != nil || dec.Offset() != len(tt.data) {
+				t.Fatalf("skip offset = %d/%d, err = %v", dec.Offset(), len(tt.data), dec.Err())
+			}
+		})
+	}
+
+	dec := NewDecoder([]byte{2})
+	dec.SkipNullableFixed16()
+	if dec.Err() == nil {
+		t.Fatal("invalid nullable marker must fail")
+	}
+	dec = NewDecoder(nil)
+	dec.SkipValue(FieldSkipType(255))
+	if dec.Err() == nil {
+		t.Fatal("unknown skip type must fail")
 	}
 }
 

@@ -155,6 +155,54 @@ func TestPrepareJSONRequestParamsRejectsInvalidInput(t *testing.T) {
 	}
 }
 
+func TestJSONParamValueCanonicalDurationAndBytes(t *testing.T) {
+	tests := []struct {
+		name string
+		meta ParamMeta
+		raw  json.RawMessage
+		want any
+	}{
+		{name: "duration", meta: ParamMeta{Name: "ttl", Type: "Duration"}, raw: json.RawMessage(`10`), want: int64(10)},
+		{name: "duration list", meta: ParamMeta{Name: "ttls", Type: "Duration", IsList: true}, raw: json.RawMessage(`[10,20]`), want: []int64{10, 20}},
+		{name: "bytes", meta: ParamMeta{Name: "blob", Type: "Bytes"}, raw: json.RawMessage(`"AQI="`), want: []byte{1, 2}},
+		{name: "bytes list", meta: ParamMeta{Name: "blobs", Type: "Bytes", IsList: true}, raw: json.RawMessage(`["AQI=","Aw=="]`), want: [][]byte{{1, 2}, {3}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &Request{Params: map[string]json.RawMessage{tt.meta.Name: tt.raw}}
+			got, present, err := jsonParamValue(req, tt.meta)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !present || !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("value = %#v, present = %v, want %#v", got, present, tt.want)
+			}
+		})
+	}
+}
+
+func TestJSONParamValueRejectsInvalidDurationAndBytes(t *testing.T) {
+	tests := []struct {
+		name string
+		meta ParamMeta
+		raw  json.RawMessage
+	}{
+		{name: "duration type", meta: ParamMeta{Name: "ttl", Type: "Duration"}, raw: json.RawMessage(`"bad"`)},
+		{name: "duration list type", meta: ParamMeta{Name: "ttls", Type: "Duration", IsList: true}, raw: json.RawMessage(`10`)},
+		{name: "duration list item", meta: ParamMeta{Name: "ttls", Type: "Duration", IsList: true}, raw: json.RawMessage(`[10,"bad"]`)},
+		{name: "bytes", meta: ParamMeta{Name: "blob", Type: "Bytes"}, raw: json.RawMessage(`"***"`)},
+		{name: "bytes list", meta: ParamMeta{Name: "blobs", Type: "Bytes", IsList: true}, raw: json.RawMessage(`["***"]`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &Request{Params: map[string]json.RawMessage{tt.meta.Name: tt.raw}}
+			if _, _, err := jsonParamValue(req, tt.meta); err == nil {
+				t.Fatal("expected invalid parameter to fail")
+			}
+		})
+	}
+}
+
 func TestBinaryRequestRetainsCanonicalWireBytes(t *testing.T) {
 	rt := NewRouter()
 	rt.Registry.Register("get", 43)

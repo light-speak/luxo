@@ -50,6 +50,24 @@ func TestDecodeBinaryErrorGolden(t *testing.T) {
 	}
 }
 
+func TestBinaryErrorString(t *testing.T) {
+	tests := []struct {
+		name string
+		err  *BinaryError
+		want string
+	}{
+		{name: "name only", err: &BinaryError{Name: "NotFound"}, want: "NotFound"},
+		{name: "name and message", err: &BinaryError{Name: "BadRequest", Message: "invalid id"}, want: "BadRequest: invalid id"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.err.Error(); got != tt.want {
+				t.Fatalf("Error() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDecodeBinaryErrorRejectsInvalidEnvelope(t *testing.T) {
 	for _, data := range [][]byte{
 		{1, 0x80},
