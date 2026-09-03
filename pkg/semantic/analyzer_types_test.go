@@ -115,6 +115,181 @@ api test(): Int {
 	expectNoErrors(t, result)
 }
 
+func TestSemanticTypeReferenceHelpers(t *testing.T) {
+	nested := &ast.TypeRef{
+		Name:     "Page",
+		Nullable: true,
+		TypeArgs: []*ast.TypeRef{{Name: "User"}},
+		Tuple:    []*ast.TypeRef{{Name: "Post"}},
+	}
+	clone := &ast.TypeRef{
+		Name:     "Page",
+		Nullable: true,
+		TypeArgs: []*ast.TypeRef{{Name: "User"}},
+		Tuple:    []*ast.TypeRef{{Name: "Post"}},
+	}
+	if !sameTypeRefExact(nil, nil) || sameTypeRefExact(nil, nested) || !sameTypeRefExact(nested, clone) {
+		t.Fatal("exact type-reference comparison failed")
+	}
+	clone.TypeArgs[0] = &ast.TypeRef{Name: "Admin"}
+	if sameTypeRefExact(nested, clone) {
+		t.Fatal("different generic arguments compared equal")
+	}
+	clone.TypeArgs[0] = &ast.TypeRef{Name: "User"}
+	clone.Tuple[0] = &ast.TypeRef{Name: "Video"}
+	if sameTypeRefExact(nested, clone) {
+		t.Fatal("different tuple members compared equal")
+	}
+	if formatTypeRef(nil) != "" || formatTypeRef(&ast.TypeRef{Name: "User", IsList: true, Nullable: true}) != "[User]?" {
+		t.Fatal("type-reference formatting failed")
+	}
+}
+
+func TestComputedAggregateHelpers(t *testing.T) {
+	idField := &ast.FieldDecl{Name: "key", Directives: []*ast.Directive{{Name: "id"}}}
+	if got := computedModelPrimaryKeyName(&ast.ModelDecl{Fields: []*ast.FieldDecl{idField}}); got != "key" {
+		t.Fatalf("primary key = %q", got)
+	}
+	if got := computedModelPrimaryKeyName(&ast.ModelDecl{Fields: []*ast.FieldDecl{{Name: "id"}}}); got != "id" {
+		t.Fatalf("conventional primary key = %q", got)
+	}
+	if got := computedModelPrimaryKeyName(&ast.ModelDecl{}); got != "id" {
+		t.Fatalf("fallback primary key = %q", got)
+	}
+	if computedFieldTypeName(nil) != "unknown" || computedFieldTypeName(&ast.FieldDecl{}) != "unknown" ||
+		computedFieldTypeName(&ast.FieldDecl{Type: &ast.TypeRef{Name: "Decimal"}}) != "Decimal" {
+		t.Fatal("computed field type detection failed")
+	}
+
+	ident := &ast.Ident{Name: "posts"}
+	member := &ast.MemberExpr{Object: ident, Field: "amount"}
+	tests := []struct {
+		name      string
+		directive *ast.Directive
+		relation  string
+		field     string
+		ok        bool
+	}{
+		{name: "missing target", directive: &ast.Directive{Name: "count"}},
+		{name: "count relation", directive: &ast.Directive{Name: "count", Args: []*ast.NamedArg{{Value: ident}}}, relation: "posts", ok: true},
+		{name: "sum relation only", directive: &ast.Directive{Name: "sum", Args: []*ast.NamedArg{{Value: ident}}}, relation: "posts"},
+		{name: "sum field", directive: &ast.Directive{Name: "sum", Args: []*ast.NamedArg{{Value: member}}}, relation: "posts", field: "amount", ok: true},
+		{name: "count field", directive: &ast.Directive{Name: "count", Args: []*ast.NamedArg{{Value: member}}}},
+		{name: "invalid owner", directive: &ast.Directive{Name: "sum", Args: []*ast.NamedArg{{Value: &ast.MemberExpr{Object: &ast.Literal{}, Field: "amount"}}}}},
+		{name: "invalid target", directive: &ast.Directive{Name: "sum", Args: []*ast.NamedArg{{Value: &ast.Literal{}}}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			relation, field, ok := computedAggregateTarget(test.directive)
+			if relation != test.relation || field != test.field || ok != test.ok {
+				t.Fatalf("target = %q.%q, %v", relation, field, ok)
+			}
+		})
+	}
+	if computedAggregateTargetSuffix("count") == computedAggregateTargetSuffix("sum") {
+		t.Fatal("aggregate target hints must distinguish count from numeric functions")
+	}
+}
+
+func TestFederationIdentifierHelpers(t *testing.T) {
+	field := &ast.FieldDecl{Directives: []*ast.Directive{
+		{Name: "deprecated"},
+		{Name: "by", Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "authorKey"}}, {Value: &ast.Ident{Name: "key"}}}},
+	}}
+	foreign, local := federationRelationKeys("User", "id", field)
+	if foreign != "authorKey" || local != "key" {
+		t.Fatalf("explicit federation keys = %q, %q", foreign, local)
+	}
+	foreign, local = federationRelationKeys("User", "id", &ast.FieldDecl{})
+	if foreign != "userId" || local != "id" {
+		t.Fatalf("default federation keys = %q, %q", foreign, local)
+	}
+	directive := &ast.Directive{Args: []*ast.NamedArg{{Value: &ast.Literal{}}}}
+	if directiveIdentifierArg(directive, 0) != "" || directiveIdentifierArg(directive, 1) != "" {
+		t.Fatal("invalid directive identifiers were accepted")
+	}
+	if lowerFirstIdentifier("") != "" || upperFirstIdentifier("") != "" ||
+		lowerFirstIdentifier("Üser") != "üser" || upperFirstIdentifier("über") != "Über" {
+		t.Fatal("Unicode identifier case conversion failed")
+	}
+}
+
+func TestResolvedCollectionAndLoadHelpers(t *testing.T) {
+	if cloneResolvedType(nil) != nil || collectionElementType(nil) != nil {
+		t.Fatal("nil resolved type was not preserved")
+	}
+	intType := &ResolvedType{Kind: TypeInt, Name: "Int"}
+	listType := &ResolvedType{Kind: TypeInt, Name: "Int", IsList: true, Nullable: true}
+	listElement := collectionElementType(listType)
+	if listElement == listType || listElement.IsList || listElement.Nullable {
+		t.Fatal("list element type was not cloned and normalized")
+	}
+	channel := &ResolvedType{Kind: TypeGeneric, Name: "Channel", TypeArgs: []*ResolvedType{intType}}
+	if element := collectionElementType(channel); element == intType || element.Name != "Int" {
+		t.Fatal("channel element type was not cloned")
+	}
+	if collectionElementType(intType) != nil {
+		t.Fatal("scalar type exposed a collection element")
+	}
+	if !sameResolvedType(nil, intType) || sameResolvedType(intType, &ResolvedType{Kind: TypeString, Name: "String"}) {
+		t.Fatal("resolved type comparison failed")
+	}
+
+	idField := &FieldInfo{Name: "key", Type: intType, Directives: []string{"id"}}
+	model := &ResolvedType{Fields: map[string]*FieldInfo{"key": idField}}
+	if resolvedPrimaryKeyField(nil) != nil || resolvedPrimaryKeyField(model) != idField {
+		t.Fatal("directed primary key lookup failed")
+	}
+	conventional := &FieldInfo{Name: "id", Type: intType}
+	if resolvedPrimaryKeyField(&ResolvedType{Fields: map[string]*FieldInfo{"id": conventional}}) != conventional {
+		t.Fatal("conventional primary key lookup failed")
+	}
+	valid := &FieldInfo{Type: intType}
+	if !isLoadKeyType(valid) {
+		t.Fatal("valid load key was rejected")
+	}
+	invalid := []*FieldInfo{
+		{Nullable: true, Type: intType},
+		{Computed: true, Type: intType},
+		{Type: &ResolvedType{Kind: TypeInt, Nullable: true}},
+		{Type: &ResolvedType{Kind: TypeInt, IsList: true}},
+		{Type: &ResolvedType{Kind: TypeFloat}},
+	}
+	for _, field := range invalid {
+		if isLoadKeyType(field) {
+			t.Fatal("invalid load key was accepted")
+		}
+	}
+}
+
+func TestBlockResultAndDeclarationHelpers(t *testing.T) {
+	value := &ast.Ident{Name: "value"}
+	if blockResultExpr(nil) != nil || blockResultExpr(&ast.Block{}) != nil {
+		t.Fatal("empty block returned a value")
+	}
+	if got := blockResultExpr(&ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: value}}}); got != value {
+		t.Fatal("expression result was not returned")
+	}
+	if got := blockResultExpr(&ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: value}}}); got != value {
+		t.Fatal("return result was not returned")
+	}
+	if blockResultExpr(&ast.Block{Stmts: []ast.Stmt{&ast.BreakStmt{}}}) != nil {
+		t.Fatal("non-value statement returned a value")
+	}
+
+	file := &ast.File{
+		Models:     []*ast.ModelDecl{{Name: "Model"}},
+		Interfaces: []*ast.InterfaceDecl{{Name: "Interface"}},
+		Enums:      []*ast.EnumDecl{{Name: "Enum"}},
+		Sealeds:    []*ast.SealedDecl{{Name: "Sealed"}},
+		Types:      []*ast.TypeDecl{{Name: "Type"}},
+	}
+	decls := (&Analyzer{}).fileTypeDecls(file)
+	if len(decls) != 5 {
+		t.Fatalf("declaration count = %d", len(decls))
+	}
+}
+
 func TestBinaryIn(t *testing.T) {
 	result := analyze(t, `
 api test(): Boolean {

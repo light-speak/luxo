@@ -1148,3 +1148,121 @@ func TestParseGroupedResponse_MultipleKeys(t *testing.T) {
 		t.Fatal("key2 blob should not be empty")
 	}
 }
+
+func TestSkipNestedRowFieldHandlesSchemaAndWireFailures(t *testing.T) {
+	registry := schema.New()
+	missing := &schema.Field{Type: schema.FieldModel, TypeName: "Missing", Relation: true}
+	if skipNestedRowField(codec.NewDecoder(nil), missing, registry) {
+		t.Fatal("missing nested schema was accepted")
+	}
+
+	registry.RegisterType(&schema.TypeDecl{Name: "Child", Fields: []schema.Field{{ID: 1, Name: "value", Type: schema.FieldInt}}})
+	nullable := &schema.Field{Type: schema.FieldModel, TypeName: "Child", Relation: true, Nullable: true}
+	if !skipNestedRowField(codec.NewDecoder(codec.AppendNull(nil)), nullable, registry) {
+		t.Fatal("nullable nested type declaration was not skipped")
+	}
+	if skipNestedRowField(codec.NewDecoder(nil), nullable, registry) {
+		t.Fatal("truncated nullable marker was accepted")
+	}
+
+	list := &schema.Field{Type: schema.FieldModel, TypeName: "Child", Relation: true, IsList: true}
+	if skipNestedRowField(codec.NewDecoder(nil), list, registry) {
+		t.Fatal("truncated nested list header was accepted")
+	}
+	row := codec.AppendArrayHeader(nil, 1)
+	row = codec.AppendVarint(row, 0)
+	row = codec.AppendVarint(row, 1)
+	row = codec.AppendSvarint(row, 42)
+	row = append(row, 0)
+	if !skipNestedRowField(codec.NewDecoder(row), list, registry) {
+		t.Fatal("valid nested list was not skipped")
+	}
+	unknownField := codec.AppendArrayHeader(nil, 1)
+	unknownField = codec.AppendVarint(unknownField, 0)
+	unknownField = codec.AppendVarint(unknownField, 2)
+	unknownField = codec.AppendSvarint(unknownField, 42)
+	unknownField = append(unknownField, 0)
+	if skipNestedRowField(codec.NewDecoder(unknownField), list, registry) {
+		t.Fatal("unknown nested row field was accepted")
+	}
+}
+
+func TestExtractPrimaryKeysRejectsInvalidInputs(t *testing.T) {
+	registry := schema.New()
+	key := &schema.Field{ID: 1, Name: "key", Type: schema.FieldString, PrimaryKey: true}
+	model := &schema.Model{Name: "Item", Fields: []schema.Field{*key}}
+	registry.RegisterModel(model)
+	model = registry.Models[model.Name]
+	key = model.PrimaryKeyField()
+	for name, test := range map[string]struct {
+		primary  []byte
+		keyField *schema.Field
+		model    *schema.Model
+		registry *schema.Schema
+	}{
+		"empty response":   {keyField: key, model: model, registry: registry},
+		"missing key":      {primary: []byte{0}, model: model, registry: registry},
+		"missing model":    {primary: []byte{0}, keyField: key, registry: registry},
+		"missing registry": {primary: []byte{0}, keyField: key, model: model},
+		"invalid key type": {primary: []byte{0}, keyField: &schema.Field{Type: schema.FieldFloat}, model: model, registry: registry},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, ok := ExtractPrimaryKeys(test.primary, test.keyField, test.model, test.registry); ok {
+				t.Fatal("invalid primary-key extraction input was accepted")
+			}
+		})
+	}
+
+	unknownField := codec.AppendVarint(nil, 0)
+	unknownField = codec.AppendVarint(unknownField, 2)
+	unknownField = codec.AppendString(unknownField, "value")
+	unknownField = append(unknownField, 0)
+	if _, ok := ExtractPrimaryKeys(unknownField, key, model, registry); ok {
+		t.Fatal("unknown row field was accepted")
+	}
+	truncatedKey := codec.AppendVarint(nil, 0)
+	truncatedKey = codec.AppendVarint(truncatedKey, 1)
+	truncatedKey = codec.AppendVarint(truncatedKey, 10)
+	if _, ok := ExtractPrimaryKeys(truncatedKey, key, model, registry); ok {
+		t.Fatal("truncated primary key was accepted")
+	}
+}
+
+func TestExtractPrimaryKeyColumnRejectsInvalidInputs(t *testing.T) {
+	key := schema.Field{ID: 1, Name: "key", Type: schema.FieldInt, PrimaryKey: true}
+	model := &schema.Model{Name: "Item", Fields: []schema.Field{key, {ID: 2, Name: "value", Type: schema.FieldInt}}}
+	registry := schema.New()
+	registry.RegisterModel(model)
+	model = registry.Models[model.Name]
+	keyField := model.PrimaryKeyField()
+
+	if _, ok := ExtractPrimaryKeyColumn(nil, keyField, model); ok {
+		t.Fatal("empty columnar response was accepted")
+	}
+	if _, ok := ExtractPrimaryKeyColumn([]byte{0xff}, keyField, model); ok {
+		t.Fatal("malformed columnar response was accepted")
+	}
+	if _, ok := ExtractPrimaryKeyColumn(codec.AppendVarint(nil, 0), keyField, model); ok {
+		t.Fatal("zero-row columnar response was accepted")
+	}
+	if _, ok := ExtractPrimaryKeyColumn([]byte{1, 0}, &schema.Field{Type: schema.FieldFloat}, model); ok {
+		t.Fatal("invalid columnar key type was accepted")
+	}
+
+	var unknown codec.ColumnarWriter
+	unknown.SetCount(1)
+	unknown.WriteColumnInt(3, []int64{1})
+	if _, ok := ExtractPrimaryKeyColumn(unknown.Bytes(), keyField, model); ok {
+		t.Fatal("unknown column was accepted")
+	}
+	var missing codec.ColumnarWriter
+	missing.SetCount(1)
+	missing.WriteColumnInt(2, []int64{1})
+	if _, ok := ExtractPrimaryKeyColumn(missing.Bytes(), keyField, model); ok {
+		t.Fatal("response without key column was accepted")
+	}
+	truncated := []byte{1, 0, 2}
+	if _, ok := ExtractPrimaryKeyColumn(truncated, keyField, model); ok {
+		t.Fatal("truncated column was accepted")
+	}
+}

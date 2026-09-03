@@ -399,6 +399,193 @@ func TestWriteFramePayloadError(t *testing.T) {
 	}
 }
 
+func TestRequestEnvelopeRejectsMalformedShapes(t *testing.T) {
+	overLimit := []byte{requestEnvelopeMarker, requestEnvelopeVersion, requestKindCall}
+	overLimit = codec.AppendVarint(overLimit, maxBearerTokenSize+1)
+	declaredTokenTooLong := []byte{requestEnvelopeMarker, requestEnvelopeVersion, requestKindCall}
+	declaredTokenTooLong = codec.AppendVarint(declaredTokenTooLong, 2)
+	declaredTokenTooLong = append(declaredTokenTooLong, 'a')
+	tests := map[string][]byte{
+		"truncated":               {requestEnvelopeMarker},
+		"unknown request kind":    {requestEnvelopeMarker, requestEnvelopeVersion, 9, 0, 1},
+		"invalid token length":    {requestEnvelopeMarker, requestEnvelopeVersion, requestKindCall, 0x80},
+		"token over limit":        overLimit,
+		"token exceeds request":   declaredTokenTooLong,
+		"request body is missing": {requestEnvelopeMarker, requestEnvelopeVersion, requestKindCall, 0},
+	}
+	for name, payload := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := decodeRequestEnvelope(payload); err == nil {
+				t.Fatal("malformed request envelope was accepted")
+			}
+		})
+	}
+}
+
+func TestFrameWritersRejectOversizeAndWriteFailure(t *testing.T) {
+	if err := WriteFrame(&bytes.Buffer{}, make([]byte, maxFrameSize+1)); err == nil {
+		t.Fatal("oversized frame was written")
+	}
+	if err := writeStatusFrame(&bytes.Buffer{}, statusOK, make([]byte, maxFrameSize)); err == nil {
+		t.Fatal("oversized status frame was written")
+	}
+	if err := writeStatusFrame(&errWriter{}, statusOK, nil); err == nil {
+		t.Fatal("status frame write failure was ignored")
+	}
+}
+
+func TestValidateStreamAckRejectsMalformedFrames(t *testing.T) {
+	if err := validateStreamAck([]byte{statusOK}); err != nil {
+		t.Fatal(err)
+	}
+	for name, frame := range map[string][]byte{
+		"empty":          nil,
+		"invalid status": {9},
+		"trailing data":  {statusOK, 1},
+		"error":          encodeError(400, "BadRequest", "bad"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateStreamAck(frame); err == nil {
+				t.Fatal("malformed stream acknowledgment was accepted")
+			}
+		})
+	}
+}
+
+func TestSubscriptionReadLoopRejectsMalformedFrames(t *testing.T) {
+	tests := map[string][]byte{
+		"empty":          nil,
+		"invalid status": {9},
+		"error":          encodeError(400, "BadRequest", "bad"),
+	}
+	for name, frame := range tests {
+		t.Run(name, func(t *testing.T) {
+			clientConn, serverConn := net.Pipe()
+			ctx, cancel := context.WithCancel(context.Background())
+			subscription := &Subscription{
+				messages: make(chan []byte, 1),
+				errors:   make(chan error, 1),
+				conn:     clientConn,
+				cancel:   cancel,
+			}
+			go subscription.readLoop(ctx)
+			_ = WriteFrame(serverConn, frame)
+			if err := <-subscription.Errors(); err == nil {
+				t.Fatal("malformed stream frame produced no error")
+			}
+			serverConn.Close()
+		})
+	}
+}
+
+func TestSubscriptionReadLoopHandlesReadAndContextFailures(t *testing.T) {
+	for _, canceled := range []bool{false, true} {
+		clientConn, serverConn := net.Pipe()
+		ctx, cancel := context.WithCancel(context.Background())
+		subscription := &Subscription{
+			messages: make(chan []byte, 1),
+			errors:   make(chan error, 1),
+			conn:     clientConn,
+			cancel:   cancel,
+		}
+		go subscription.readLoop(ctx)
+		if canceled {
+			cancel()
+		}
+		serverConn.Close()
+		if err := <-subscription.Errors(); err == nil {
+			t.Fatal("stream read failure produced no error")
+		}
+	}
+
+	clientConn, serverConn := net.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	subscription := &Subscription{
+		messages: make(chan []byte),
+		errors:   make(chan error, 1),
+		conn:     clientConn,
+		cancel:   func() {},
+	}
+	go subscription.readLoop(ctx)
+	_ = WriteFrame(serverConn, []byte{statusStream, 1})
+	if err := <-subscription.Errors(); err != context.Canceled {
+		t.Fatalf("stream cancellation error = %v", err)
+	}
+	serverConn.Close()
+}
+
+func TestClientRejectsMalformedUnaryResponses(t *testing.T) {
+	for name, response := range map[string][]byte{
+		"empty":          nil,
+		"invalid status": {9},
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := NewClient(startSingleFrameRPCServer(t, response, true))
+			defer client.Close()
+			if _, err := client.Call(1, nil); err == nil {
+				t.Fatal("malformed unary response was accepted")
+			}
+		})
+	}
+
+	client := NewClient(startSingleFrameRPCServer(t, nil, false))
+	defer client.Close()
+	if _, err := client.Call(1, nil); err == nil {
+		t.Fatal("closed response connection produced no error")
+	}
+}
+
+func TestSubscribeContextRejectsConnectionAndAcknowledgmentErrors(t *testing.T) {
+	client := NewClient("127.0.0.1:1")
+	defer client.Close()
+	if _, err := client.SubscribeContext(context.Background(), "", 1, nil, nil); err == nil {
+		t.Fatal("stream dial failure produced no error")
+	}
+
+	for name, response := range map[string][]byte{
+		"empty":          nil,
+		"invalid status": {9},
+		"error":          encodeError(400, "BadRequest", "bad"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := NewClient(startSingleFrameRPCServer(t, response, true))
+			defer client.Close()
+			if _, err := client.SubscribeContext(context.Background(), "", 1, nil, nil); err == nil {
+				t.Fatal("malformed stream acknowledgment was accepted")
+			}
+		})
+	}
+
+	client = NewClient(startSingleFrameRPCServer(t, nil, false))
+	defer client.Close()
+	if _, err := client.SubscribeContext(context.Background(), "", 1, nil, nil); err == nil {
+		t.Fatal("closed stream acknowledgment connection produced no error")
+	}
+}
+
+func startSingleFrameRPCServer(t *testing.T, response []byte, respond bool) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(time.Second))
+		if _, readErr := ReadFrame(conn, nil); readErr != nil || !respond {
+			return
+		}
+		_ = WriteFrame(conn, response)
+	}()
+	return listener.Addr().String()
+}
+
 // --- Pool tests ---
 
 func TestPoolGetPut(t *testing.T) {

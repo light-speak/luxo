@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/schema"
 	"nhooyr.io/websocket"
@@ -962,6 +963,53 @@ func TestStreamParams_Get_Exists(t *testing.T) {
 	}
 	if got := p.Get("missing"); got != nil {
 		t.Errorf("Get(missing) = %v, want nil", got)
+	}
+}
+
+func TestStreamParamsNativeTypeVariants(t *testing.T) {
+	id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440000")
+	fixedID := [16]byte(id)
+	params := &StreamParams{values: map[string]any{
+		"int":             int(1),
+		"floatFromInt":    int(2),
+		"floatFromInt64":  int64(3),
+		"duration":        4 * time.Second,
+		"durationFromInt": int64(5),
+		"badDuration":     "invalid",
+		"nativeUUID":      id,
+		"fixedUUID":       fixedID,
+		"badUUID":         "invalid",
+		"invalid":         struct{}{},
+	}}
+	if value, ok := params.LookupInt("int"); !ok || value != 1 {
+		t.Fatalf("native int = %d, %v", value, ok)
+	}
+	for name, want := range map[string]float64{"floatFromInt": 2, "floatFromInt64": 3} {
+		if value, ok := params.LookupFloat(name); !ok || value != want {
+			t.Errorf("%s = %v, %v", name, value, ok)
+		}
+	}
+	if _, ok := params.LookupFloat("invalid"); ok {
+		t.Fatal("invalid float was accepted")
+	}
+	for name, want := range map[string]int64{"duration": int64(4 * time.Second), "durationFromInt": 5} {
+		if value, ok := params.LookupDuration(name); !ok || value != want {
+			t.Errorf("%s = %v, %v", name, value, ok)
+		}
+	}
+	if _, ok := params.LookupDuration("badDuration"); ok {
+		t.Fatal("invalid duration was accepted")
+	}
+	for name := range map[string][16]byte{"nativeUUID": fixedID, "fixedUUID": fixedID} {
+		if value, ok := params.LookupUUID(name); !ok || value != fixedID {
+			t.Errorf("%s = %v, %v", name, value, ok)
+		}
+	}
+	if _, ok := params.LookupUUID("badUUID"); ok {
+		t.Fatal("invalid UUID was accepted")
+	}
+	if _, ok := params.LookupUUID("invalid"); ok {
+		t.Fatal("unsupported UUID representation was accepted")
 	}
 }
 

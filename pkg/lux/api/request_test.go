@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 func makeReq(body string) *http.Request {
@@ -104,6 +105,108 @@ func TestParseRequestHasParam(t *testing.T) {
 	}
 	if req.HasParam("b") {
 		t.Error("should not have param b")
+	}
+}
+
+func TestParamIsNullJSONMode(t *testing.T) {
+	req, err := ParseRequest(makeReq(`{"$api":"test","nullValue":null,"value":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !req.ParamIsNull("nullValue") || req.ParamIsNull("value") || req.ParamIsNull("missing") {
+		t.Fatal("JSON null-state detection is incorrect")
+	}
+}
+
+func TestAssignBinaryNativeParams(t *testing.T) {
+	instant := time.Date(2026, 9, 4, 1, 2, 3, 0, time.UTC)
+	id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440000")
+	duration := 3 * time.Second
+	amount := decimal.RequireFromString("12.50")
+	raw := json.RawMessage(`{"ok":true}`)
+
+	var gotTime time.Time
+	var gotTimePtr *time.Time
+	var gotUUID uuid.UUID
+	var gotUUIDPtr *uuid.UUID
+	var gotRaw json.RawMessage
+	var gotDuration time.Duration
+	var gotDurationPtr *time.Duration
+	var gotDecimal decimal.Decimal
+	var gotDecimalPtr *decimal.Decimal
+	tests := []struct {
+		name   string
+		value  any
+		target any
+	}{
+		{name: "time", value: instant, target: &gotTime},
+		{name: "time pointer", value: instant, target: &gotTimePtr},
+		{name: "UUID", value: id, target: &gotUUID},
+		{name: "UUID pointer", value: id, target: &gotUUIDPtr},
+		{name: "JSON", value: raw, target: &gotRaw},
+		{name: "duration", value: duration, target: &gotDuration},
+		{name: "duration pointer", value: duration, target: &gotDurationPtr},
+		{name: "decimal", value: amount, target: &gotDecimal},
+		{name: "decimal pointer", value: amount, target: &gotDecimalPtr},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if !assignBinaryNativeParam(test.value, test.target) {
+				t.Fatalf("%s was not assigned", test.name)
+			}
+		})
+	}
+	if gotTime != instant || gotTimePtr == nil || *gotTimePtr != instant {
+		t.Fatal("time assignment failed")
+	}
+	if gotUUID != id || gotUUIDPtr == nil || *gotUUIDPtr != id {
+		t.Fatal("UUID assignment failed")
+	}
+	if !reflect.DeepEqual(gotRaw, raw) || gotDuration != duration || gotDurationPtr == nil || *gotDurationPtr != duration {
+		t.Fatal("JSON or duration assignment failed")
+	}
+	if !gotDecimal.Equal(amount) || gotDecimalPtr == nil || !gotDecimalPtr.Equal(amount) {
+		t.Fatal("decimal assignment failed")
+	}
+	if assignBinaryNativeParam("wrong", &gotTime) {
+		t.Fatal("mismatched native value was assigned")
+	}
+}
+
+func TestAssignBinarySliceParams(t *testing.T) {
+	instant := time.Date(2026, 9, 4, 1, 2, 3, 0, time.UTC)
+	id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440000")
+	amount := decimal.RequireFromString("12.50")
+	values := []struct {
+		name   string
+		value  any
+		target any
+	}{
+		{name: "bytes", value: []byte{1, 2}, target: new([]byte)},
+		{name: "integers", value: []int64{1, 2}, target: new([]int64)},
+		{name: "floats", value: []float64{1.5}, target: new([]float64)},
+		{name: "strings", value: []string{"a"}, target: new([]string)},
+		{name: "booleans", value: []bool{true}, target: new([]bool)},
+		{name: "times", value: []time.Time{instant}, target: new([]time.Time)},
+		{name: "durations", value: []time.Duration{time.Second}, target: new([]time.Duration)},
+		{name: "UUIDs", value: []uuid.UUID{id}, target: new([]uuid.UUID)},
+		{name: "decimals", value: []decimal.Decimal{amount}, target: new([]decimal.Decimal)},
+		{name: "byte arrays", value: [][]byte{{1, 2}}, target: new([][]byte)},
+		{name: "JSON values", value: []json.RawMessage{json.RawMessage(`{"ok":true}`)}, target: new([]json.RawMessage)},
+	}
+	for _, test := range values {
+		t.Run(test.name, func(t *testing.T) {
+			if !assignBinarySliceParam(test.value, test.target) {
+				t.Fatalf("%s was not assigned", test.name)
+			}
+			if !reflect.DeepEqual(reflect.ValueOf(test.target).Elem().Interface(), test.value) {
+				t.Fatalf("%s assignment mismatch", test.name)
+			}
+		})
+	}
+	var integers []int64
+	if assignBinarySliceParam([]string{"wrong"}, &integers) || assignBinarySliceParam(1, new(struct{})) {
+		t.Fatal("mismatched slice value was assigned")
 	}
 }
 

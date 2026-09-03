@@ -73,6 +73,20 @@ func TestGenerateNativeFile(t *testing.T) {
 	}
 }
 
+func TestGenerateNativeFileImportsTimeForDateTime(t *testing.T) {
+	result := &semantic.Result{Files: []*luxoast.File{{
+		APIs: []*luxoast.ApiDecl{mkNativeAPI(
+			"schedule",
+			[]*luxoast.ParamDecl{{Name: "at", Type: &luxoast.TypeRef{Name: "DateTime"}}},
+			&luxoast.TypeRef{Name: "DateTime"},
+		)},
+	}}}
+	code := string(GenerateNativeFile(result, "luxo"))
+	if !strings.Contains(code, `"time"`) {
+		t.Fatalf("DateTime native resolver did not import time:\n%s", code)
+	}
+}
+
 func TestGenerateNativeFileEmbedsTypedStreamResolver(t *testing.T) {
 	result := &semantic.Result{Files: []*luxoast.File{{
 		APIs: []*luxoast.ApiDecl{{

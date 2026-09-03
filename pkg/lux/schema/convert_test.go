@@ -219,6 +219,58 @@ func TestBinaryScalarListToJSON(t *testing.T) {
 	}
 }
 
+func TestBinaryScalarListToJSONAllWireTypes(t *testing.T) {
+	uuidValue := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
+	tests := []struct {
+		name     string
+		typeName string
+		append   func([]byte) []byte
+		want     string
+	}{
+		{name: "Int", typeName: "Int", append: func(dst []byte) []byte { return codec.AppendSvarint(dst, -2) }, want: `[-2]`},
+		{name: "Duration", typeName: "Duration", append: func(dst []byte) []byte { return codec.AppendSvarint(dst, 3) }, want: `[3]`},
+		{name: "Float", typeName: "Float", append: func(dst []byte) []byte { return codec.AppendFixed64(dst, 1.5) }, want: `[1.5]`},
+		{name: "Boolean true", typeName: "Boolean", append: func(dst []byte) []byte { return codec.AppendBool(dst, true) }, want: `[true]`},
+		{name: "Boolean false", typeName: "Boolean", append: func(dst []byte) []byte { return codec.AppendBool(dst, false) }, want: `[false]`},
+		{name: "DateTime", typeName: "DateTime", append: func(dst []byte) []byte { return codec.AppendSvarint(dst, 0) }, want: `["1970-01-01T00:00:00Z"]`},
+		{name: "UUID", typeName: "UUID", append: func(dst []byte) []byte { return codec.AppendUUID(dst, uuidValue) }, want: `["550e8400-e29b-41d4-a716-446655440000"]`},
+		{name: "Bytes", typeName: "Bytes", append: func(dst []byte) []byte { return codec.AppendBytes(dst, []byte{0xff}) }, want: `["/w=="]`},
+		{name: "JSON", typeName: "JSON", append: func(dst []byte) []byte { return codec.AppendBytes(dst, []byte(`{"ok":true}`)) }, want: `[{"ok":true}]`},
+		{name: "Decimal", typeName: "Decimal", append: func(dst []byte) []byte { return codec.AppendString(dst, "1.25") }, want: `["1.25"]`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			data := codec.AppendArrayHeader(nil, 1)
+			data = test.append(data)
+			if got := string(BinaryScalarListToJSON(nil, data, test.typeName)); got != test.want {
+				t.Fatalf("%s list = %s, want %s", test.typeName, got, test.want)
+			}
+		})
+	}
+
+	data := codec.AppendArrayHeader(nil, 1)
+	data = codec.AppendSvarint(data, 1)
+	if got := string(BinaryScalarListToJSON(nil, data, "Unknown")); got != "null" {
+		t.Fatalf("unknown scalar list = %s", got)
+	}
+}
+
+func TestBinaryScalarToJSONBlobTypesAndMalformedValues(t *testing.T) {
+	bytesData := codec.AppendBytes(nil, []byte{0xff})
+	if got := string(BinaryScalarToJSON(nil, bytesData, "Bytes")); got != `"/w=="` {
+		t.Fatalf("bytes scalar = %s", got)
+	}
+	jsonData := codec.AppendBytes(nil, []byte(`{"ok":true}`))
+	if got := string(BinaryScalarToJSON(nil, jsonData, "JSON")); got != `{"ok":true}` {
+		t.Fatalf("JSON scalar = %s", got)
+	}
+	for _, typeName := range []string{"Int", "Float", "Boolean", "UUID", "Bytes", "JSON", "DateTime", "String", "Unknown"} {
+		if got := string(BinaryScalarToJSON(nil, []byte{0x80}, typeName)); got != "null" {
+			t.Errorf("malformed %s scalar = %s", typeName, got)
+		}
+	}
+}
+
 func TestBinaryScalarToJSON_Empty(t *testing.T) {
 	result := BinaryScalarToJSON(nil, nil, "Int")
 	if string(result) != "null" {
@@ -1099,6 +1151,12 @@ func TestAppendArrayFieldJSON_AllTypes(t *testing.T) {
 			c = codec.AppendString(c, "USER")
 			return c
 		}, `["ADMIN","USER"]`},
+		{"JSON", FieldJSON, func() []byte {
+			c := codec.AppendArrayHeader(nil, 2)
+			c = codec.AppendBytes(c, []byte(`{"ok":true}`))
+			c = codec.AppendBytes(c, []byte("invalid"))
+			return c
+		}, `[{"ok":true},null]`},
 		{"Unknown_emptyArray", FieldModel, func() []byte {
 			return codec.AppendArrayHeader(nil, 0)
 		}, `[]`},
@@ -1111,6 +1169,40 @@ func TestAppendArrayFieldJSON_AllTypes(t *testing.T) {
 				t.Errorf("got %s want %s", out, tc.want)
 			}
 		})
+	}
+}
+
+func TestAppendNullableFieldJSONAllWireTypes(t *testing.T) {
+	uuidValue := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
+	tests := []struct {
+		name   string
+		field  FieldType
+		append func([]byte) []byte
+		want   string
+	}{
+		{name: "Int", field: FieldInt, append: func(dst []byte) []byte { return codec.AppendSvarint(dst, -2) }, want: `-2`},
+		{name: "Float", field: FieldFloat, append: func(dst []byte) []byte { return codec.AppendFixed64(dst, 1.5) }, want: `1.5`},
+		{name: "String", field: FieldString, append: func(dst []byte) []byte { return codec.AppendString(dst, "luxo") }, want: `"luxo"`},
+		{name: "Boolean true", field: FieldBool, append: func(dst []byte) []byte { return codec.AppendBool(dst, true) }, want: `true`},
+		{name: "Boolean false", field: FieldBool, append: func(dst []byte) []byte { return codec.AppendBool(dst, false) }, want: `false`},
+		{name: "DateTime", field: FieldDateTime, append: func(dst []byte) []byte { return codec.AppendSvarint(dst, 0) }, want: `"1970-01-01T00:00:00Z"`},
+		{name: "Duration", field: FieldDuration, append: func(dst []byte) []byte { return codec.AppendSvarint(dst, 3) }, want: `3`},
+		{name: "UUID", field: FieldUUID, append: func(dst []byte) []byte { return codec.AppendUUID(dst, uuidValue) }, want: `"550e8400-e29b-41d4-a716-446655440000"`},
+		{name: "Bytes", field: FieldBytes, append: func(dst []byte) []byte { return codec.AppendBytes(dst, []byte{0xff}) }, want: `"/w=="`},
+		{name: "JSON", field: FieldJSON, append: func(dst []byte) []byte { return codec.AppendBytes(dst, []byte(`{"ok":true}`)) }, want: `{"ok":true}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			data := codec.AppendVarint(nil, 1)
+			data = test.append(data)
+			got := appendNullableFieldJSON(nil, codec.NewDecoder(data), &Field{Type: test.field, Nullable: true})
+			if string(got) != test.want {
+				t.Fatalf("nullable %s = %s, want %s", test.name, got, test.want)
+			}
+		})
+	}
+	if got := string(appendNullableFieldJSON(nil, codec.NewDecoder(nil), &Field{Type: FieldModel, Nullable: true})); got != "null" {
+		t.Fatalf("unknown nullable field = %s", got)
 	}
 }
 

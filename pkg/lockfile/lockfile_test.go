@@ -1268,3 +1268,70 @@ func TestFederationForeignKey(t *testing.T) {
 		t.Fatalf("lowerFirst(empty) = %q", got)
 	}
 }
+
+func TestInternalAPIHelperBoundaries(t *testing.T) {
+	service := &ast.FnDecl{
+		Name:       "syncUser",
+		Directives: []*ast.Directive{{Name: "deprecated"}, {Name: "service"}},
+		Params:     []*ast.ParamDecl{{Name: "id"}},
+	}
+	regular := &ast.FnDecl{Name: "localOnly"}
+	lf := New()
+	lf.updateAPIs([]*ast.File{{Functions: []*ast.FnDecl{service, regular}}})
+	if entry := lf.APIs["svc:syncUser"]; entry == nil || entry.Params["id"] != 1 {
+		t.Fatalf("service API = %#v", entry)
+	}
+	if lf.APIs["svc:localOnly"] != nil || !hasServiceDirective(service) || hasServiceDirective(regular) {
+		t.Fatal("service directive detection failed")
+	}
+
+	if namedLoadArgNames([]*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}}) != nil {
+		t.Fatal("positional load arguments were accepted")
+	}
+	if got := modelPrimaryKeyName(&ast.ModelDecl{Fields: []*ast.FieldDecl{{Name: "key", Directives: []*ast.Directive{{Name: "id"}}}}}); got != "key" {
+		t.Fatalf("directed primary key = %q", got)
+	}
+	if got := modelPrimaryKeyName(&ast.ModelDecl{Fields: []*ast.FieldDecl{{Name: "id"}}}); got != "id" {
+		t.Fatalf("conventional primary key = %q", got)
+	}
+	if got := modelPrimaryKeyName(&ast.ModelDecl{}); got != "id" {
+		t.Fatalf("fallback primary key = %q", got)
+	}
+	listField := &ast.FieldDecl{Type: &ast.TypeRef{Name: "Post", IsList: true}}
+	if got := federationForeignKey("User", "", listField); got != "userId" {
+		t.Fatalf("empty primary-key fallback = %q", got)
+	}
+	if upperFirst("") != "" || upperFirst("über") != "Über" || lowerFirst("Üser") != "üser" {
+		t.Fatal("identifier case conversion failed")
+	}
+}
+
+func TestNamedLoadDiscoveryRejectsInvalidCallsAndDeduplicates(t *testing.T) {
+	validCall := func() ast.Expr {
+		return &ast.CallExpr{
+			Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
+			Args: []*ast.NamedArg{{Name: "email", Value: &ast.Ident{Name: "email"}}},
+		}
+	}
+	invalid := []ast.Expr{
+		&ast.Literal{},
+		&ast.CallExpr{Func: &ast.Ident{Name: "load"}},
+		&ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "find"}},
+		&ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Literal{}, Field: "load"}},
+		&ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{}, Field: "load"}},
+		&ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"}, Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}}},
+	}
+	statements := make([]ast.Stmt, 0, len(invalid)+2)
+	for _, expr := range invalid {
+		statements = append(statements, &ast.ExprStmt{Expr: expr})
+	}
+	statements = append(statements, &ast.ExprStmt{Expr: validCall()}, &ast.ExprStmt{Expr: validCall()})
+	lf := New()
+	lf.updateNamedLoadAPIs([]*ast.File{
+		{APIs: []*ast.ApiDecl{{Body: &ast.Block{Stmts: statements}}}},
+		{Functions: []*ast.FnDecl{{Body: &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: validCall()}}}}}},
+	})
+	if len(lf.APIs) != 1 || lf.APIs["svc:load:User:email"] == nil {
+		t.Fatalf("named load APIs = %#v", lf.APIs)
+	}
+}

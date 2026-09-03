@@ -278,10 +278,14 @@ func TestGenerateFederationResolversUsesCanonicalListAndSelection(t *testing.T) 
 		Models: []*ast.ModelDecl{post},
 		Extends: []*ast.ExtendDecl{{
 			Name: "User",
-			Fields: []*ast.FieldDecl{{
-				Name: "posts",
-				Type: &ast.TypeRef{Name: "Post", IsList: true},
-			}},
+			Fields: []*ast.FieldDecl{
+				{Name: "invalid"},
+				{Name: "remote", Type: &ast.TypeRef{Name: "Remote"}},
+				{
+					Name: "posts",
+					Type: &ast.TypeRef{Name: "Post", IsList: true},
+				},
+			},
 		}},
 	}}}
 
@@ -2004,10 +2008,10 @@ func TestWriteAPIRegistration(t *testing.T) {
 	// With ID and params
 	apiIDs = map[string]int{"getUser": 5}
 	apiParamIDs = map[string]map[string]int{
-		"getUser": {"id": 1},
+		"getUser": {"id": 2, "name": 1},
 	}
 	apiParamTypes = map[string]map[string]string{
-		"getUser": {"id": "Int"},
+		"getUser": {"id": "Int", "name": "String"},
 	}
 	b.Reset()
 	writeAPIRegistration(&b, "getUser")
@@ -2020,6 +2024,9 @@ func TestWriteAPIRegistration(t *testing.T) {
 	}
 	if !strings.Contains(code, `"Int"`) {
 		t.Errorf("missing type Int:\n%s", code)
+	}
+	if strings.Index(code, `Name: "name"`) > strings.Index(code, `Name: "id"`) {
+		t.Errorf("parameters are not sorted by field ID:\n%s", code)
 	}
 
 	apiParamIDs["getUser"] = map[string]int{"ids": 2}

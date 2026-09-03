@@ -497,6 +497,17 @@ func TestServe_TLS(t *testing.T) {
 	}
 }
 
+func TestServeReturnsTLSLoadError(t *testing.T) {
+	t.Setenv("APP_TLS_CERT", filepath.Join(t.TempDir(), "missing-cert.pem"))
+	t.Setenv("APP_TLS_KEY", filepath.Join(t.TempDir(), "missing-key.pem"))
+	t.Setenv("APP_PORT", "0")
+
+	err := New().Serve("test-invalid-tls")
+	if err == nil || !strings.Contains(err.Error(), "load TLS certificate") {
+		t.Fatalf("TLS load error = %v", err)
+	}
+}
+
 func generateTestCert(t *testing.T) (certFile, keyFile string) {
 	t.Helper()
 	dir := t.TempDir()

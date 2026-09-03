@@ -1760,3 +1760,135 @@ func TestAssignBinaryParamUnknownTarget(t *testing.T) {
 		t.Fatal("should not error for unknown target type")
 	}
 }
+
+func TestEncodeBinaryRequestRejectsInvalidEnvelope(t *testing.T) {
+	tests := []struct {
+		name   string
+		apiID  int
+		mask   []byte
+		params map[string]any
+		meta   []ParamMeta
+	}{
+		{name: "invalid API ID", apiID: 0},
+		{name: "oversized field mask", apiID: 1, mask: make([]byte, maxFieldMaskSize+1)},
+		{name: "malformed recursive field mask", apiID: 1, mask: []byte{0}},
+		{name: "reserved parameter field ID", apiID: 1, meta: []ParamMeta{{Name: "value", Type: "Int", FieldID: BinaryFiltersFieldID}}},
+		{name: "invalid parameter field ID", apiID: 1, params: map[string]any{"value": 1}, meta: []ParamMeta{{Name: "value", Type: "Int"}}},
+		{name: "untyped sorters", apiID: 1, params: map[string]any{"$sorters": []any{}}},
+		{name: "unknown parameter", apiID: 1, params: map[string]any{"unknown": 1}},
+		{name: "too many filters", apiID: 1, params: map[string]any{"$filters": make([]Filter, 1001)}},
+		{name: "too many sorters", apiID: 1, params: map[string]any{"$sorters": make([]Sorter, 101)}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := EncodeBinaryRequest(test.apiID, test.mask, test.params, test.meta); err == nil {
+				t.Fatal("invalid binary request was encoded")
+			}
+		})
+	}
+}
+
+func TestBinaryScalarCoercionVariants(t *testing.T) {
+	validJSON := json.RawMessage(`{"ok":true}`)
+	invalidJSON := json.RawMessage(`{"ok":`)
+	uuidValue := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
+
+	if value, ok := binaryFloat(2); !ok || value != 2 {
+		t.Fatalf("int float coercion = %v, %v", value, ok)
+	}
+	if value, ok := binaryFloat(int64(3)); !ok || value != 3 {
+		t.Fatalf("int64 float coercion = %v, %v", value, ok)
+	}
+	if value, ok := binaryJSON(validJSON); !ok || !bytes.Equal(value, validJSON) {
+		t.Fatalf("raw JSON coercion = %q, %v", value, ok)
+	}
+	if _, ok := binaryJSON(invalidJSON); ok {
+		t.Fatal("invalid raw JSON was accepted")
+	}
+	if value, ok := binaryDateTime(int64(4)); !ok || value != 4 {
+		t.Fatalf("int64 datetime coercion = %v, %v", value, ok)
+	}
+	if value, ok := binaryDateTime(float64(5)); !ok || value != 5 {
+		t.Fatalf("float datetime coercion = %v, %v", value, ok)
+	}
+	if _, ok := binaryDateTime(5.5); ok {
+		t.Fatal("fractional datetime was accepted")
+	}
+	if value, ok := binaryUUID(uuidValue); !ok || value != uuidValue {
+		t.Fatalf("fixed UUID coercion = %v, %v", value, ok)
+	}
+	if values, ok := binaryListValues([]int64{1, 2}); !ok || !reflect.DeepEqual(values, []any{int64(1), int64(2)}) {
+		t.Fatalf("int64 list coercion = %#v, %v", values, ok)
+	}
+	if values, ok := binaryListValues([][16]byte{uuidValue}); !ok || !reflect.DeepEqual(values, []any{uuidValue}) {
+		t.Fatalf("fixed UUID list coercion = %#v, %v", values, ok)
+	}
+}
+
+func TestReadBinaryParamRejectsMalformedWireValues(t *testing.T) {
+	invalidDecimal := codec.AppendString(nil, "invalid")
+	invalidJSON := codec.AppendBytes(nil, []byte(`{"ok":`))
+	tests := []struct {
+		name     string
+		typeName string
+		data     []byte
+	}{
+		{name: "int", typeName: "Int"},
+		{name: "duration", typeName: "Duration"},
+		{name: "float", typeName: "Float"},
+		{name: "datetime", typeName: "DateTime"},
+		{name: "UUID", typeName: "UUID"},
+		{name: "string", typeName: "String"},
+		{name: "decimal", typeName: "Decimal"},
+		{name: "invalid decimal", typeName: "Decimal", data: invalidDecimal},
+		{name: "boolean", typeName: "Boolean"},
+		{name: "bytes", typeName: "Bytes"},
+		{name: "JSON", typeName: "JSON"},
+		{name: "invalid JSON", typeName: "JSON", data: invalidJSON},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, _, err := readBinaryParam(test.data, 0, ParamMeta{Name: "value", Type: test.typeName}); err == nil {
+				t.Fatal("malformed binary parameter was accepted")
+			}
+		})
+	}
+}
+
+func TestReadBinaryListParamRejectsMalformedWireValues(t *testing.T) {
+	truncatedElement := codec.AppendArrayHeader(nil, 1)
+	invalidDecimal := codec.AppendArrayHeader(nil, 1)
+	invalidDecimal = codec.AppendString(invalidDecimal, "invalid")
+	invalidJSON := codec.AppendArrayHeader(nil, 1)
+	invalidJSON = codec.AppendBytes(invalidJSON, []byte(`{"ok":`))
+	overLimit := codec.AppendArrayHeader(nil, codec.MaxArrayElements+1)
+	tests := []struct {
+		name     string
+		typeName string
+		data     []byte
+	}{
+		{name: "array header", typeName: "Int"},
+		{name: "array limit", typeName: "Int", data: overLimit},
+		{name: "int", typeName: "Int", data: truncatedElement},
+		{name: "duration", typeName: "Duration", data: truncatedElement},
+		{name: "float", typeName: "Float", data: truncatedElement},
+		{name: "datetime", typeName: "DateTime", data: truncatedElement},
+		{name: "string", typeName: "String", data: truncatedElement},
+		{name: "decimal", typeName: "Decimal", data: truncatedElement},
+		{name: "invalid decimal", typeName: "Decimal", data: invalidDecimal},
+		{name: "boolean", typeName: "Boolean", data: truncatedElement},
+		{name: "UUID", typeName: "UUID", data: truncatedElement},
+		{name: "bytes", typeName: "Bytes", data: truncatedElement},
+		{name: "JSON", typeName: "JSON", data: truncatedElement},
+		{name: "invalid JSON", typeName: "JSON", data: invalidJSON},
+		{name: "unknown", typeName: "Unknown", data: codec.AppendArrayHeader(nil, 0)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			meta := ParamMeta{Name: "values", Type: test.typeName, IsList: true}
+			if _, _, err := readBinaryListParam(test.data, 0, meta); err == nil {
+				t.Fatal("malformed binary list parameter was accepted")
+			}
+		})
+	}
+}
