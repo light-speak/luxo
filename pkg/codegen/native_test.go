@@ -1,8 +1,6 @@
 package codegen
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -75,172 +73,46 @@ func TestGenerateNativeFile(t *testing.T) {
 	}
 }
 
-func TestGenerateNativeStub(t *testing.T) {
-	stub := generateNativeStub(nativeAPI{
-		Name:       "oauthLogin",
-		Params:     []*luxoast.ParamDecl{{Name: "provider", Type: &luxoast.TypeRef{Name: "String"}}},
-		ReturnType: &luxoast.TypeRef{Name: "String"},
-	})
-
-	if !strings.Contains(stub, "func OauthLogin(ctx context.Context, provider string) (string, error)") {
-		t.Errorf("bad stub:\n%s", stub)
-	}
-	if !strings.Contains(stub, "panic(\"not implemented\")") {
-		t.Error("should have panic placeholder")
-	}
-}
-
-func TestMergeResolverAppendNew(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "resolver.go")
-
-	initial := `package resolver
-
-import "context"
-
-func Setup() {
-}
-`
-	os.WriteFile(path, []byte(initial), 0644)
-
-	apis := []nativeAPI{
-		{
-			Name:       "oauthLogin",
-			Params:     []*luxoast.ParamDecl{{Name: "code", Type: &luxoast.TypeRef{Name: "String"}}},
-			ReturnType: &luxoast.TypeRef{Name: "String"},
-		},
-	}
-
-	err := MergeResolver(path, apis)
-	if err != nil {
-		t.Fatalf("merge failed: %v", err)
-	}
-
-	data, _ := os.ReadFile(path)
-	code := string(data)
-
-	if !strings.Contains(code, "func Setup()") {
-		t.Error("should preserve existing functions")
-	}
-	if !strings.Contains(code, "func OauthLogin(ctx context.Context") {
-		t.Errorf("should append new function:\n%s", code)
+func TestGenerateNativeFileImportsTimeForDateTime(t *testing.T) {
+	result := &semantic.Result{Files: []*luxoast.File{{
+		APIs: []*luxoast.ApiDecl{mkNativeAPI(
+			"schedule",
+			[]*luxoast.ParamDecl{{Name: "at", Type: &luxoast.TypeRef{Name: "DateTime"}}},
+			&luxoast.TypeRef{Name: "DateTime"},
+		)},
+	}}}
+	code := string(GenerateNativeFile(result, "luxo"))
+	if !strings.Contains(code, `"time"`) {
+		t.Fatalf("DateTime native resolver did not import time:\n%s", code)
 	}
 }
 
-func TestMergeResolverExistingSkip(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "resolver.go")
-
-	initial := `package resolver
-
-import "context"
-
-func OauthLogin(ctx context.Context, code string) (string, error) {
-	return "my-implementation", nil
-}
-`
-	os.WriteFile(path, []byte(initial), 0644)
-
-	apis := []nativeAPI{
-		{
-			Name:       "oauthLogin",
-			Params:     []*luxoast.ParamDecl{{Name: "code", Type: &luxoast.TypeRef{Name: "String"}}},
-			ReturnType: &luxoast.TypeRef{Name: "String"},
-		},
+func TestGenerateNativeFileEmbedsTypedStreamResolver(t *testing.T) {
+	result := &semantic.Result{Files: []*luxoast.File{{
+		APIs: []*luxoast.ApiDecl{{
+			Name:       "watchScores",
+			ReturnType: &luxoast.TypeRef{Name: "Score"},
+			Directives: []*luxoast.Directive{{Name: "stream"}, {Name: "native"}},
+		}},
+	}}}
+	code := string(GenerateNativeFile(result, "luxo"))
+	if !strings.Contains(code, "type NativeResolver interface {\n\tStreamResolver") {
+		t.Fatalf("native stream resolver must be embedded:\n%s", code)
 	}
-
-	err := MergeResolver(path, apis)
-	if err != nil {
-		t.Fatalf("merge failed: %v", err)
-	}
-
-	data, _ := os.ReadFile(path)
-	code := string(data)
-
-	// Should preserve user's implementation, not overwrite
-	if !strings.Contains(code, "my-implementation") {
-		t.Error("should preserve existing implementation")
-	}
-	// Should NOT have panic placeholder
-	if strings.Contains(code, "not implemented") {
-		t.Error("should not add stub for existing function")
-	}
-}
-
-func TestMergeResolverNoFile(t *testing.T) {
-	err := MergeResolver("/nonexistent/path/resolver.go", nil)
-	if err != nil {
-		t.Error("should not error for non-existent file")
-	}
-}
-
-func TestMergeResolverParseError(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "bad.go")
-
-	// Write invalid Go source that will fail to parse
-	os.WriteFile(path, []byte("this is not valid go code!!! {{{"), 0644)
-
-	apis := []nativeAPI{
-		{
-			Name:       "test",
-			Params:     nil,
-			ReturnType: &luxoast.TypeRef{Name: "String"},
-		},
-	}
-
-	err := MergeResolver(path, apis)
-	if err == nil {
-		t.Error("should return error for unparseable file")
-	}
-	if !strings.Contains(err.Error(), "parse") {
-		t.Errorf("error should mention parse, got: %v", err)
-	}
-}
-
-func TestMergeResolverFormatError(t *testing.T) {
-	// Write Go source that parses but has formatting issues
-	// (actually go/parser is lenient, so we need valid but ugly code)
-	dir := t.TempDir()
-	path := filepath.Join(dir, "resolver.go")
-
-	// This file parses fine, has a method (not a function), and we add a new API
-	initial := `package resolver
-
-import "context"
-
-type Svc struct{}
-
-func (s *Svc) Existing(ctx context.Context) {}
-`
-	os.WriteFile(path, []byte(initial), 0644)
-
-	apis := []nativeAPI{
-		{
-			Name:       "newFunc",
-			Params:     nil,
-			ReturnType: nil,
-		},
-	}
-
-	err := MergeResolver(path, apis)
-	if err != nil {
-		t.Fatalf("merge failed: %v", err)
-	}
-
-	data, _ := os.ReadFile(path)
-	code := string(data)
-	if !strings.Contains(code, "func NewFunc(ctx context.Context") {
-		t.Errorf("should append new function stub:\n%s", code)
+	if strings.Contains(code, "WatchScores(ctx context.Context") {
+		t.Fatalf("native stream must not also generate a unary resolver method:\n%s", code)
 	}
 }
 
 func TestGenerateNativeFileNoReturn(t *testing.T) {
-	// @native API with no return type → should use "any"
+	// Native functions may return Void and should expose an error-only Go method.
 	result := &semantic.Result{
 		Files: []*luxoast.File{{
-			APIs: []*luxoast.ApiDecl{
-				mkNativeAPI("doSomething", nil, nil),
+			Functions: []*luxoast.FnDecl{
+				{
+					Name:       "doSomething",
+					Directives: []*luxoast.Directive{{Name: "native"}},
+				},
 			},
 		}},
 	}
@@ -250,27 +122,11 @@ func TestGenerateNativeFileNoReturn(t *testing.T) {
 		t.Fatal("should generate native file")
 	}
 	code := string(src)
-	if !strings.Contains(code, "(any, error)") {
-		t.Errorf("no return type should default to any:\n%s", code)
+	if !strings.Contains(code, "DoSomething(ctx context.Context) error") {
+		t.Errorf("void native function should return only error:\n%s", code)
 	}
-}
-
-func TestGenerateNativeStubNoReturn(t *testing.T) {
-	stub := generateNativeStub(nativeAPI{
-		Name:       "cleanup",
-		ReturnType: nil,
-	})
-	if !strings.Contains(stub, "(any, error)") {
-		t.Errorf("no return type should default to any:\n%s", stub)
-	}
-}
-
-func TestMergeResolverReadError(t *testing.T) {
-	// Test with a path that exists but is a directory (should fail to read)
-	dir := t.TempDir()
-	err := MergeResolver(dir, nil)
-	if err == nil {
-		t.Error("should return error when path is a directory")
+	if strings.Contains(code, "any") {
+		t.Errorf("void native function must not leak any into generated code:\n%s", code)
 	}
 }
 

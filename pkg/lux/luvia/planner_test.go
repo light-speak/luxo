@@ -1,6 +1,7 @@
 package luvia
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
@@ -39,8 +40,25 @@ func simpleUserModel() *schema.Model {
 	return s.Models["User"]
 }
 
+func selectionNode(mask []byte, children ...codec.SelectionMaskChild) []byte {
+	return codec.AppendSelectionMask(nil, mask, children)
+}
+
+func selectionFields(mask []byte) []byte {
+	return codec.SelectionMaskFields(mask)
+}
+
+func planForTest(t *testing.T, model *schema.Model, mask []byte, module string) *QueryPlan {
+	t.Helper()
+	plan, err := Plan(model, mask, module)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plan
+}
+
 func TestPlan_NilModelReturnsNil(t *testing.T) {
-	p := Plan(nil, nil, "user")
+	p := planForTest(t, nil, nil, "user")
 	if p != nil {
 		t.Error("nil model should return nil plan")
 	}
@@ -48,7 +66,7 @@ func TestPlan_NilModelReturnsNil(t *testing.T) {
 
 func TestPlan_NoExtendFieldsReturnsNil(t *testing.T) {
 	m := simpleUserModel()
-	p := Plan(m, nil, "user")
+	p := planForTest(t, m, nil, "user")
 	if p != nil {
 		t.Error("model without extend fields should return nil plan")
 	}
@@ -59,7 +77,8 @@ func TestPlan_NoExtendFieldsInMaskReturnsNil(t *testing.T) {
 	// Only request name and email (no extend fields)
 	mask := codec.FieldMaskSet(nil, 2) // name
 	mask = codec.FieldMaskSet(mask, 3) // email
-	p := Plan(m, mask, "user")
+	mask = selectionNode(mask)
+	p := planForTest(t, m, mask, "user")
 	if p != nil {
 		t.Error("mask without extend fields should return nil plan")
 	}
@@ -70,7 +89,9 @@ func TestPlan_WithExtendFields(t *testing.T) {
 	// Request name + posts (extend from post module)
 	mask := codec.FieldMaskSet(nil, 2)  // name
 	mask = codec.FieldMaskSet(mask, 10) // posts (extend)
-	p := Plan(m, mask, "user")
+	postsMask := selectionNode(codec.FieldMaskSet(nil, 2))
+	mask = selectionNode(mask, codec.SelectionMaskChild{FieldID: 10, Mask: postsMask})
+	p := planForTest(t, m, mask, "user")
 	if p == nil {
 		t.Fatal("expected non-nil plan")
 	}
@@ -79,14 +100,14 @@ func TestPlan_WithExtendFields(t *testing.T) {
 	if p.Primary.Module != "user" {
 		t.Errorf("primary module = %q, want %q", p.Primary.Module, "user")
 	}
-	if !codec.FieldMaskHas(p.Primary.Mask, 2) {
+	if !codec.FieldMaskHas(selectionFields(p.Primary.Mask), 2) {
 		t.Error("primary mask should include name (field 2)")
 	}
-	if !codec.FieldMaskHas(p.Primary.Mask, 1) {
+	if !codec.FieldMaskHas(selectionFields(p.Primary.Mask), 1) {
 		t.Error("primary mask should auto-include id (field 1)")
 	}
 	// posts should NOT be in primary mask
-	if codec.FieldMaskHas(p.Primary.Mask, 10) {
+	if codec.FieldMaskHas(selectionFields(p.Primary.Mask), 10) {
 		t.Error("primary mask should not include extend field posts (10)")
 	}
 
@@ -107,9 +128,39 @@ func TestPlan_WithExtendFields(t *testing.T) {
 	if !ext.IsList {
 		t.Error("posts should be a list")
 	}
+	if !bytes.Equal(ext.Mask, postsMask) {
+		t.Errorf("extend mask = %v, want %v", ext.Mask, postsMask)
+	}
 
-	if p.IDFieldID != 1 {
-		t.Errorf("IDFieldID = %d, want 1", p.IDFieldID)
+	if p.PrimaryKeyField == nil || p.PrimaryKeyField.ID != 1 {
+		t.Errorf("PrimaryKeyField = %#v, want field 1", p.PrimaryKeyField)
+	}
+}
+
+func TestPlan_UsesDeclaredPrimaryKey(t *testing.T) {
+	s := schema.New()
+	s.RegisterModel(&schema.Model{
+		Name: "Product",
+		Fields: []schema.Field{
+			{ID: 7, Name: "sku", Type: schema.FieldString, PrimaryKey: true},
+			{ID: 8, Name: "name", Type: schema.FieldString},
+			{ID: 10, Name: "reviews", Type: schema.FieldModel, TypeName: "Review",
+				IsList: true, Relation: true, Module: "review", ForeignKey: "productSku"},
+		},
+	})
+
+	plan, err := Plan(s.Models["Product"], nil, "product")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan == nil {
+		t.Fatal("expected federation plan")
+	}
+	if plan.PrimaryKeyField == nil || plan.PrimaryKeyField.Name != "sku" {
+		t.Fatalf("primary key field = %#v, want sku", plan.PrimaryKeyField)
+	}
+	if !codec.FieldMaskHas(selectionFields(plan.Primary.Mask), 7) {
+		t.Fatal("primary mask must include the declared primary key")
 	}
 }
 
@@ -119,7 +170,8 @@ func TestPlan_MultipleExtendModules(t *testing.T) {
 	mask := codec.FieldMaskSet(nil, 2)  // name
 	mask = codec.FieldMaskSet(mask, 10) // posts (post module)
 	mask = codec.FieldMaskSet(mask, 11) // comments (comment module)
-	p := Plan(m, mask, "user")
+	mask = selectionNode(mask)
+	p := planForTest(t, m, mask, "user")
 	if p == nil {
 		t.Fatal("expected non-nil plan")
 	}
@@ -140,40 +192,23 @@ func TestPlan_MultipleExtendModules(t *testing.T) {
 	}
 }
 
-func TestPlan_ExtendFieldNonRelation(t *testing.T) {
-	// Test the case where a field has Module set but is NOT a relation
-	// (e.g., a scalar extend field like postCount) — should be skipped
+func TestPlan_ExtendFieldNonRelationReturnsError(t *testing.T) {
 	s := schema.New()
 	s.RegisterModel(&schema.Model{
 		Name: "User",
 		Fields: []schema.Field{
-			{ID: 1, Name: "id", Type: schema.FieldInt},
+			{ID: 1, Name: "id", Type: schema.FieldInt, PrimaryKey: true},
 			{ID: 2, Name: "name", Type: schema.FieldString},
-			// Scalar extend field (non-relation) — no FK, not resolvable
 			{ID: 10, Name: "postCount", Type: schema.FieldInt, Module: "post"},
-			// Relation extend field — resolvable
-			{ID: 11, Name: "posts", Type: schema.FieldModel, TypeName: "Post",
-				IsList: true, Relation: true, Module: "post", ForeignKey: "userId"},
 		},
 	})
-	m := s.Models["User"]
 
-	// Request all fields including the scalar extend
-	p := Plan(m, nil, "user")
-	if p == nil {
-		t.Fatal("expected non-nil plan (has relation extend)")
-	}
-	// Only the relation extend should be in the plan
-	if len(p.Extends) != 1 {
-		t.Fatalf("expected 1 extend step, got %d", len(p.Extends))
-	}
-	if p.Extends[0].FieldName != "posts" {
-		t.Errorf("extend field = %q, want posts", p.Extends[0].FieldName)
+	if _, err := Plan(s.Models["User"], nil, "user"); err == nil {
+		t.Fatal("unsupported scalar extend field must not be silently omitted")
 	}
 }
 
-func TestPlan_NoIDField(t *testing.T) {
-	// Model without an "id" field — IDFieldID should be 0
+func TestPlan_NoPrimaryKeyField(t *testing.T) {
 	s := schema.New()
 	s.RegisterModel(&schema.Model{
 		Name: "Event",
@@ -184,12 +219,8 @@ func TestPlan_NoIDField(t *testing.T) {
 		},
 	})
 	m := s.Models["Event"]
-	p := Plan(m, nil, "event")
-	if p == nil {
-		t.Fatal("expected non-nil plan")
-	}
-	if p.IDFieldID != 0 {
-		t.Errorf("IDFieldID = %d, want 0 (no id field)", p.IDFieldID)
+	if _, err := Plan(m, nil, "event"); err == nil {
+		t.Fatal("federation model without a primary key must fail planning")
 	}
 }
 
@@ -236,19 +267,19 @@ func TestSchemaFieldToSkipType_NullableDuration(t *testing.T) {
 func TestPlan_NilMaskSelectAll(t *testing.T) {
 	m := userModelWithExtend()
 	// nil mask = select all → should include extend fields
-	p := Plan(m, nil, "user")
+	p := planForTest(t, m, nil, "user")
 	if p == nil {
 		t.Fatal("nil mask on model with extend should produce a plan")
 	}
 
 	// All local fields in primary
-	if !codec.FieldMaskHas(p.Primary.Mask, 1) {
+	if !codec.FieldMaskHas(selectionFields(p.Primary.Mask), 1) {
 		t.Error("primary should include id")
 	}
-	if !codec.FieldMaskHas(p.Primary.Mask, 2) {
+	if !codec.FieldMaskHas(selectionFields(p.Primary.Mask), 2) {
 		t.Error("primary should include name")
 	}
-	if !codec.FieldMaskHas(p.Primary.Mask, 3) {
+	if !codec.FieldMaskHas(selectionFields(p.Primary.Mask), 3) {
 		t.Error("primary should include email")
 	}
 

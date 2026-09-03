@@ -8,6 +8,20 @@ import kotlin.test.assertFailsWith
 
 class LuxoEncoderDecoderTest {
 
+    @Test
+    fun `bytes round-trip preserves arbitrary binary data`() {
+        val expected = byteArrayOf(0, 1, 127, 0x80.toByte(), 0xff.toByte())
+        val enc = LuxoEncoder()
+        enc.writeFieldBytes(1, expected)
+        enc.writeEnd()
+
+        val dec = LuxoDecoder(enc.bytes())
+        assertTrue(dec.nextField())
+        assertEquals(1, dec.fieldID)
+        assertTrue(expected.contentEquals(dec.readBytes()))
+        assertFalse(dec.nextField())
+    }
+
     // -- Varint round-trip --
 
     @Test
@@ -518,6 +532,7 @@ class ColumnarDecoderTest {
     fun `decode 2 records with int, string, float columns`() {
         val buf = mutableListOf<Byte>()
         buf.writeVarint(2) // count=2
+        buf.writeVarint(10) // arena size
         // Column 1: fieldID=1, int values [42, -7]
         buf.writeVarint(1)
         buf.writeSvarint(42)
@@ -535,6 +550,7 @@ class ColumnarDecoderTest {
 
         val dec = ColumnarDecoder(buf.toByteArray())
         assertEquals(2, dec.count)
+        assertEquals(10, dec.arenaSize)
 
         assertTrue(dec.nextColumn())
         assertEquals(1, dec.fieldID)
@@ -557,6 +573,7 @@ class ColumnarDecoderTest {
     fun `empty list (count=0)`() {
         val buf = mutableListOf<Byte>()
         buf.writeVarint(0) // count=0
+        buf.writeVarint(0) // arena size
         buf.add(0x00) // end marker
 
         val dec = ColumnarDecoder(buf.toByteArray())
@@ -568,6 +585,7 @@ class ColumnarDecoderTest {
     fun `nullable columns`() {
         val buf = mutableListOf<Byte>()
         buf.writeVarint(3) // count=3
+        buf.writeVarint(2) // arena size
         // Column 1: fieldID=1, nullable int [null, 99, null]
         buf.writeVarint(1)
         buf.add(0x00) // null
@@ -599,6 +617,7 @@ class ColumnarDecoderTest {
     fun `datetime column (int svarint seconds to ISO)`() {
         val buf = mutableListOf<Byte>()
         buf.writeVarint(3) // count=3
+        buf.writeVarint(0) // arena size
         buf.writeVarint(1) // fieldID=1
         buf.writeSvarint(0)
         buf.writeSvarint(1748424000)
@@ -620,6 +639,7 @@ class ColumnarDecoderTest {
     fun `nullable datetime column`() {
         val buf = mutableListOf<Byte>()
         buf.writeVarint(3) // count=3
+        buf.writeVarint(0) // arena size
         buf.writeVarint(1) // fieldID=1
         buf.add(0x00) // null
         buf.add(0x01); buf.writeSvarint(1748424000) // present
@@ -638,6 +658,7 @@ class ColumnarDecoderTest {
     fun `bool column`() {
         val buf = mutableListOf<Byte>()
         buf.writeVarint(3) // count=3
+        buf.writeVarint(0) // arena size
         buf.writeVarint(1) // fieldID=1
         buf.writeVarint(1) // true
         buf.writeVarint(0) // false
@@ -657,6 +678,7 @@ class ColumnarDecoderTest {
         val u2 = UuidCodec.parse("00112233-4455-6677-8899-aabbccddeeff")
         val buf = mutableListOf<Byte>()
         buf.writeVarint(2) // count=2
+        buf.writeVarint(0) // arena size
         buf.writeVarint(1) // fieldID=1
         u1.forEach { buf.add(it) }
         u2.forEach { buf.add(it) }
@@ -681,6 +703,7 @@ class ColumnarDecoderTest {
         val u = UuidCodec.parse("00112233-4455-6677-8899-aabbccddeeff")
         val buf = mutableListOf<Byte>()
         buf.writeVarint(2) // count=2
+        buf.writeVarint(0) // arena size
         buf.writeVarint(1) // fieldID=1
         buf.add(0x00)               // record 0: null
         buf.add(0x01); u.forEach { buf.add(it) } // record 1: present
@@ -710,6 +733,7 @@ class ColumnarDecoderTest {
 
         val buf = mutableListOf<Byte>()
         buf.writeVarint(2) // count=2
+        buf.writeVarint(0) // arena size
         buf.writeVarint(1) // fieldID=1
         // cell0 length-prefixed
         buf.writeVarint(cell0.size.toLong()); cell0.forEach { buf.add(it) }
@@ -734,12 +758,23 @@ class ColumnarDecoderTest {
     fun `offset and readSvarint`() {
         val buf = mutableListOf<Byte>()
         buf.writeVarint(0) // count=0
+        buf.writeVarint(0) // arena size
         buf.add(0x00) // end marker
         buf.writeSvarint(-42) // pagination metadata
 
         val dec = ColumnarDecoder(buf.toByteArray())
         assertFalse(dec.nextColumn())
         assertEquals(-42L, dec.readSvarint())
+    }
+
+    @Test
+    fun `rejects non-canonical boolean and nullable markers`() {
+        assertFailsWith<LuxoCodecException> {
+            LuxoDecoder(byteArrayOf(0x02)).readBool()
+        }
+        assertFailsWith<LuxoCodecException> {
+            LuxoDecoder(byteArrayOf(0x02)).readIntPtr()
+        }
     }
 }
 
@@ -748,18 +783,19 @@ class FieldMaskTest {
     @Test
     fun `set and has basic`() {
         var mask = ByteArray(0)
-        mask = FieldMask.set(mask, 0)
-        mask = FieldMask.set(mask, 7)
+        mask = FieldMask.set(mask, 1)
         mask = FieldMask.set(mask, 8)
-        mask = FieldMask.set(mask, 15)
+        mask = FieldMask.set(mask, 9)
+        mask = FieldMask.set(mask, 16)
 
-        assertTrue(FieldMask.has(mask, 0))
-        assertTrue(FieldMask.has(mask, 7))
+        assertTrue(FieldMask.has(mask, 1))
         assertTrue(FieldMask.has(mask, 8))
-        assertTrue(FieldMask.has(mask, 15))
-        assertFalse(FieldMask.has(mask, 1))
-        assertFalse(FieldMask.has(mask, 9))
-        assertFalse(FieldMask.has(mask, 16))
+        assertTrue(FieldMask.has(mask, 9))
+        assertTrue(FieldMask.has(mask, 16))
+        assertFalse(FieldMask.has(mask, 0))
+        assertFalse(FieldMask.has(mask, 2))
+        assertFalse(FieldMask.has(mask, 10))
+        assertFalse(FieldMask.has(mask, 17))
     }
 
     @Test
@@ -771,8 +807,8 @@ class FieldMaskTest {
     @Test
     fun `set grows mask array`() {
         var mask = ByteArray(1)
-        mask = FieldMask.set(mask, 64)
-        assertTrue(FieldMask.has(mask, 64))
-        assertEquals(9, mask.size) // 64/8 + 1 = 9
+        mask = FieldMask.set(mask, 65)
+        assertTrue(FieldMask.has(mask, 65))
+        assertEquals(9, mask.size)
     }
 }

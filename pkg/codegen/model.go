@@ -123,14 +123,14 @@ func generateExtendStub(b *strings.Builder, ext *ast.ExtendDecl) {
 	maxName := 0
 	maxType := 0
 	for _, f := range ext.Fields {
-		if f.Computed != nil {
-			continue
-		}
 		fi := fieldInfo{
 			goName:  str.Capitalize(f.Name),
 			goType:  resolveGoType(f.Type),
 			dbTag:   str.ToSnakeCase(f.Name),
 			jsonTag: f.Name,
+		}
+		if f.Computed != nil {
+			fi.dbTag = "-"
 		}
 		if len(fi.goName) > maxName {
 			maxName = len(fi.goName)
@@ -143,23 +143,25 @@ func generateExtendStub(b *strings.Builder, ext *ast.ExtendDecl) {
 
 	fmt.Fprintf(b, "// %s is a stub for the external %s model (from extend).\n", ext.Name, ext.Name)
 	fmt.Fprintf(b, "type %s struct {\n", ext.Name)
-	// Always include Id field — extend stubs need it for foreign key references and dataloader
+	// Always include the owner's primary key for foreign-key references and DataLoader.
+	idFieldName := externalModelIDFieldName(ext.Name)
+	idGoName := str.Capitalize(idFieldName)
 	hasId := false
 	for _, fi := range fields {
-		if fi.goName == "Id" {
+		if fi.goName == idGoName {
 			hasId = true
 		}
 	}
 	if !hasId {
-		idName := "Id"
-		idType := "int64"
+		idName := idGoName
+		idType := mapBaseType(externalModelIDTypeName(ext.Name))
 		if len(idName) > maxName {
 			maxName = len(idName)
 		}
 		if len(idType) > maxType {
 			maxType = len(idType)
 		}
-		fmt.Fprintf(b, "\t%-*s %-*s `db:%q json:%q`\n", maxName, idName, maxType, idType, "id", "id")
+		fmt.Fprintf(b, "\t%-*s %-*s `db:%q json:%q`\n", maxName, idName, maxType, idType, str.ToSnakeCase(idFieldName), idFieldName)
 	}
 	for _, fi := range fields {
 		fmt.Fprintf(b, "\t%-*s %-*s `db:%q json:%q`\n",
@@ -176,9 +178,6 @@ func collectFieldInfos(fields []*ast.FieldDecl, enums map[string]bool) ([]fieldI
 	maxName := 0
 	maxType := 0
 	for _, f := range fields {
-		if f.Computed != nil {
-			continue
-		}
 		relation := isRelationField(f, enums)
 		goType := resolveGoType(f.Type)
 		// Single model references use pointer — but if already nullable (*Type),
@@ -192,7 +191,7 @@ func collectFieldInfos(fields []*ast.FieldDecl, enums map[string]bool) ([]fieldI
 			dbTag:   str.ToSnakeCase(f.Name),
 			jsonTag: f.Name,
 		}
-		if relation {
+		if relation || f.Computed != nil {
 			fi.dbTag = "-"
 		}
 		if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
@@ -252,6 +251,8 @@ func mapBaseType(name string) string {
 		return "decimal.Decimal"
 	case "Bytes":
 		return "[]byte"
+	case "JSON":
+		return "json.RawMessage"
 	default:
 		return name // enum or other model/type reference
 	}
@@ -334,4 +335,32 @@ func hasDirective(directives []*ast.Directive, name string) bool {
 		}
 	}
 	return false
+}
+
+func primaryKeyField(model *ast.ModelDecl) *ast.FieldDecl {
+	if model == nil {
+		return nil
+	}
+	for _, field := range model.Fields {
+		if field.Type != nil && hasDirective(field.Directives, "id") {
+			return field
+		}
+	}
+	for _, field := range model.Fields {
+		if field.Name == "id" && field.Type != nil {
+			return field
+		}
+	}
+	return nil
+}
+
+func primaryKeyFieldName(model *ast.ModelDecl) string {
+	if field := primaryKeyField(model); field != nil {
+		return field.Name
+	}
+	return "id"
+}
+
+func primaryKeyGoName(model *ast.ModelDecl) string {
+	return str.Capitalize(primaryKeyFieldName(model))
 }

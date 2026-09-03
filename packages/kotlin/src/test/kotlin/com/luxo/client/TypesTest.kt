@@ -87,6 +87,15 @@ class LuxoSchemaTest {
         assertEquals("Role", role.name)
         assertEquals(listOf("ADMIN", "USER"), role.values)
     }
+
+    @Test
+    fun `stream metadata is preserved during deserialization`() {
+        val schema = Json.decodeFromString<LuxoSchema>(
+            """{"apis":{"watchUser":{"id":2,"name":"watchUser","module":"user","stream":true}}}""",
+        )
+
+        assertTrue(schema.apis.getValue("watchUser").stream)
+    }
 }
 
 class LuxoFieldTest {

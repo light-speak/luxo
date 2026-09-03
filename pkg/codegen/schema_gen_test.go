@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -23,9 +24,11 @@ func TestLuxoTypeToSchemaType(t *testing.T) {
 		{"DateTime", nil, "FieldDateTime"},
 		{"Duration", nil, "FieldDuration"},
 		{"Bytes", nil, "FieldBytes"},
-		{"UnknownType", nil, "FieldString"}, // default
+		{"Decimal", nil, "FieldDecimal"},
+		{"JSON", nil, "FieldJSON"},
+		{"UnknownType", nil, "FieldModel"}, // nested model/type
 		{"Status", map[string]bool{"Status": true}, "FieldEnum"},
-		{"Status", nil, "FieldString"}, // not in enums
+		{"Status", nil, "FieldModel"}, // not in enums: nested model/type
 	}
 	for _, tt := range tests {
 		got := luxoTypeToSchemaType(tt.typeName, tt.enums)
@@ -48,7 +51,9 @@ func TestLuxoTypeToSchemaFieldType(t *testing.T) {
 		{"DateTime", nil, schema.FieldDateTime},
 		{"Duration", nil, schema.FieldDuration},
 		{"Bytes", nil, schema.FieldBytes},
-		{"Unknown", nil, schema.FieldString}, // default
+		{"Decimal", nil, schema.FieldDecimal},
+		{"JSON", nil, schema.FieldJSON},
+		{"Unknown", nil, schema.FieldModel}, // nested model/type
 		{"Status", map[string]bool{"Status": true}, schema.FieldEnum},
 	}
 	for _, tt := range tests {
@@ -159,10 +164,10 @@ func TestGenerateSchemaFile_SkipsHiddenFields(t *testing.T) {
 	}
 }
 
-func TestGenerateSchemaFile_SkipsComputedFields(t *testing.T) {
+func TestGenerateSchemaFile_IncludesComputedFields(t *testing.T) {
 	oldFieldIDs := modelFieldIDs
 	modelFieldIDs = map[string]map[string]int{
-		"User": {"id": 1},
+		"User": {"id": 1, "fullName": 2},
 	}
 	defer func() { modelFieldIDs = oldFieldIDs }()
 
@@ -182,8 +187,8 @@ func TestGenerateSchemaFile_SkipsComputedFields(t *testing.T) {
 
 	code := generateSchemaFile(result, "luxo", nil)
 	src := string(code)
-	if strings.Contains(src, "fullName") {
-		t.Error("computed field should be excluded from schema")
+	if !strings.Contains(src, `Name: "fullName"`) || !strings.Contains(src, "Computed: true") {
+		t.Error("computed field should be included in schema")
 	}
 }
 
@@ -287,7 +292,7 @@ func TestWriteAPIRegistrationSchema(t *testing.T) {
 	}
 	retType := &ast.TypeRef{Name: "User"}
 
-	writeAPIRegistrationSchema(&b, "createUser", "user", params, retType, false, false)
+	writeAPIRegistrationSchema(&b, "createUser", "user", params, retType, false, false, nil, nil)
 	src := b.String()
 
 	checks := []string{
@@ -320,7 +325,7 @@ func TestWriteAPIRegistrationSchemaListParam(t *testing.T) {
 
 	var b strings.Builder
 	params := []*ast.ParamDecl{{Name: "tags", Type: &ast.TypeRef{Name: "String", IsList: true}}}
-	writeAPIRegistrationSchema(&b, "search", "search", params, nil, false, false)
+	writeAPIRegistrationSchema(&b, "search", "search", params, nil, false, false, nil, nil)
 	if src := b.String(); !strings.Contains(src, `Name: "tags", Type: schema.FieldString, TypeName: "String", IsList: true`) {
 		t.Fatalf("list parameter metadata missing:\n%s", src)
 	}
@@ -361,6 +366,122 @@ func TestBuildSchemaJSON_PreservesOptionalParams(t *testing.T) {
 	}
 	if !strings.Contains(s, `"name":"environment","type":"String","typeName":"String","hasDefault":true`) {
 		t.Errorf("default parameter metadata missing: %s", s)
+	}
+}
+
+func TestBuildSchemaJSONUsesJSONWireTypeForStructuredParams(t *testing.T) {
+	oldAPIIDs := apiIDs
+	oldParamIDs := apiParamIDs
+	apiIDs = map[string]int{"createProject": 10}
+	apiParamIDs = map[string]map[string]int{"createProject": {"input": 1}}
+	defer func() {
+		apiIDs = oldAPIIDs
+		apiParamIDs = oldParamIDs
+	}()
+
+	result := &semantic.Result{Files: []*ast.File{{
+		Name:  "origin/project.luxo",
+		Types: []*ast.TypeDecl{{Name: "CreateProjectInput"}},
+		APIs: []*ast.ApiDecl{{
+			Name: "createProject",
+			Params: []*ast.ParamDecl{{
+				Name: "input", Type: &ast.TypeRef{Name: "CreateProjectInput"},
+			}},
+		}},
+	}}}
+
+	data, err := BuildSchemaJSON(result, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"name":"input","type":"JSON","typeName":"CreateProjectInput"`) {
+		t.Fatalf("structured param metadata = %s", data)
+	}
+}
+
+func TestLuxoParamToSchemaTypeUsesJSONForStructuredValues(t *testing.T) {
+	if got := luxoParamToSchemaType("Payload", nil); got != "FieldJSON" {
+		t.Fatalf("structured parameter type = %q", got)
+	}
+	if got := luxoParamToSchemaType("Int", nil); got != "FieldInt" {
+		t.Fatalf("integer parameter type = %q", got)
+	}
+}
+
+func TestInferFederationForeignKeyUsesExplicitRemoteField(t *testing.T) {
+	field := &ast.FieldDecl{Directives: []*ast.Directive{{
+		Name: "by", Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "tenantId"}}},
+	}}}
+	if got := inferFederationForeignKey(&ast.ModelDecl{Name: "User"}, field); got != "tenantId" {
+		t.Fatalf("federation foreign key = %q", got)
+	}
+}
+
+func TestBuildSchemaJSONSkipsInvalidExtensionField(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/post.luxo",
+		Extends: []*ast.ExtendDecl{{
+			Name:   "User",
+			Fields: []*ast.FieldDecl{{Name: "invalid"}},
+		}},
+	}}}
+	if _, err := BuildSchemaJSON(result, nil); err != nil {
+		t.Fatalf("BuildSchemaJSON() error = %v", err)
+	}
+}
+
+func TestBuildSchemaJSONIncludesCompleteCRUDParams(t *testing.T) {
+	oldAPIIDs := apiIDs
+	oldParamIDs := apiParamIDs
+	apiIDs = map[string]int{
+		"getProject": 1, "listProjects": 2, "createProject": 3,
+		"updateProject": 4, "deleteProject": 5, "deleteProjects": 6,
+	}
+	apiParamIDs = map[string]map[string]int{
+		"getProject": {"id": 1}, "listProjects": {"page": 1, "pageSize": 2},
+		"createProject": {"name": 1, "description": 2},
+		"updateProject": {"id": 1, "name": 2, "description": 3},
+		"deleteProject": {"id": 1}, "deleteProjects": {"ids": 1},
+	}
+	defer func() {
+		apiIDs = oldAPIIDs
+		apiParamIDs = oldParamIDs
+	}()
+
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/project.luxo",
+		Models: []*ast.ModelDecl{{
+			Name:       "Project",
+			Directives: []*ast.Directive{{Name: "crud"}},
+			Fields: []*ast.FieldDecl{
+				{Name: "id", Type: &ast.TypeRef{Name: "UUID"}, Directives: []*ast.Directive{{Name: "auto"}}},
+				{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+				{Name: "description", Type: &ast.TypeRef{Name: "String", Nullable: true}},
+			},
+		}},
+	}}}
+	data, err := BuildSchemaJSON(result, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got schema.Schema
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	create := got.APIs["createProject"]
+	update := got.APIs["updateProject"]
+	deleteMany := got.APIs["deleteProjects"]
+	if len(create.Params) != 2 || create.Params[1].Name != "description" || !create.Params[1].Nullable || !create.Params[1].HasDefault {
+		t.Fatalf("create params = %+v", create.Params)
+	}
+	if len(update.Params) != 3 || update.Params[0].Type != schema.FieldUUID {
+		t.Fatalf("update params = %+v", update.Params)
+	}
+	if update.Params[0].HasDefault || !update.Params[1].HasDefault || !update.Params[2].HasDefault {
+		t.Fatalf("only mutable update fields should be optional: %+v", update.Params)
+	}
+	if len(deleteMany.Params) != 1 || !deleteMany.Params[0].IsList || deleteMany.ReturnType != "Int" {
+		t.Fatalf("deleteMany = %+v", deleteMany)
 	}
 }
 
@@ -523,13 +644,82 @@ func TestBuildSchemaJSON_WithAPIPaginated(t *testing.T) {
 	}
 }
 
+func TestBuildSchemaJSONMarksDeclaredPrimaryKey(t *testing.T) {
+	oldFieldIDs := modelFieldIDs
+	modelFieldIDs = map[string]map[string]int{"Product": {"sku": 7, "name": 8}}
+	defer func() { modelFieldIDs = oldFieldIDs }()
+
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/product.luxo",
+		Models: []*ast.ModelDecl{{
+			Name: "Product",
+			Fields: []*ast.FieldDecl{
+				{Name: "sku", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "id"}}},
+				{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			},
+		}},
+	}}}
+
+	data, err := BuildSchemaJSON(result, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"name":"sku"`) || !strings.Contains(string(data), `"primaryKey":true`) {
+		t.Fatalf("schema does not mark declared primary key: %s", data)
+	}
+}
+
+func TestBuildSchemaJSONMergesExtensionAndKeepsProjectionLocal(t *testing.T) {
+	oldFieldIDs := modelFieldIDs
+	modelFieldIDs = map[string]map[string]int{
+		"User": {"id": 1, "name": 2, "posts": 10},
+		"Post": {"id": 1, "userId": 2},
+	}
+	defer func() { modelFieldIDs = oldFieldIDs }()
+
+	user := &ast.ModelDecl{Name: "User", Fields: []*ast.FieldDecl{
+		{Name: "id", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}}},
+		{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+	}}
+	post := &ast.ModelDecl{Name: "Post", Fields: []*ast.FieldDecl{
+		{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+		{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+	}}
+	result := &semantic.Result{Files: []*ast.File{
+		{Name: "origin/user.luxo", Models: []*ast.ModelDecl{user}},
+		{Name: "origin/post.luxo", Models: []*ast.ModelDecl{post}, Extends: []*ast.ExtendDecl{{
+			Name: "User",
+			Fields: []*ast.FieldDecl{
+				{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+				{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+			},
+		}}},
+	}}
+
+	data, err := BuildSchemaJSON(result, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got schema.Schema
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	fields := make(map[string]schema.Field)
+	for _, field := range got.Models["User"].Fields {
+		fields[field.Name] = field
+	}
+	if len(fields) != 3 || fields["name"].Module != "" || fields["posts"].Module != "post" {
+		t.Fatalf("merged User fields = %#v", fields)
+	}
+}
+
 func TestWriteAPIRegistrationSchema_Paginated(t *testing.T) {
 	oldAPIIDs := apiIDs
 	apiIDs = map[string]int{"listUser": 30}
 	defer func() { apiIDs = oldAPIIDs }()
 
 	var b strings.Builder
-	writeAPIRegistrationSchema(&b, "listUser", "user", nil, &ast.TypeRef{Name: "User", IsList: true}, true, false)
+	writeAPIRegistrationSchema(&b, "listUser", "user", nil, &ast.TypeRef{Name: "User", IsList: true}, true, false, nil, nil)
 	src := b.String()
 
 	if !strings.Contains(src, "Paginated: true") {
@@ -662,10 +852,10 @@ func TestBuildSchemaModels_IsList(t *testing.T) {
 	}
 }
 
-func TestBuildSchemaModels_SkipsComputed(t *testing.T) {
+func TestBuildSchemaModels_IncludesComputed(t *testing.T) {
 	oldFieldIDs := modelFieldIDs
 	modelFieldIDs = map[string]map[string]int{
-		"User": {"id": 1, "name": 2},
+		"User": {"id": 1, "name": 2, "fullName": 3},
 	}
 	defer func() { modelFieldIDs = oldFieldIDs }()
 
@@ -687,8 +877,8 @@ func TestBuildSchemaModels_SkipsComputed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "fullName") {
-		t.Error("computed field should be skipped")
+	if !strings.Contains(string(data), `"name":"fullName"`) || !strings.Contains(string(data), `"computed":true`) {
+		t.Error("computed field should be included")
 	}
 }
 
@@ -831,8 +1021,6 @@ func TestBuildSchemaModels_ExtendFieldModule(t *testing.T) {
 					Fields: []*ast.FieldDecl{
 						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
 						{Name: "name", Type: &ast.TypeRef{Name: "String"}},
-						// posts is added by extend from post.luxo, but appears here after semantic merge
-						{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
 					},
 				}},
 			},
@@ -953,7 +1141,6 @@ func TestBuildSchemaModels_SameModuleRelationNoModule(t *testing.T) {
 					Fields: []*ast.FieldDecl{
 						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
 						{Name: "name", Type: &ast.TypeRef{Name: "String"}},
-						{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
 					},
 				},
 				{
@@ -1061,7 +1248,6 @@ func TestGenerateSchemaFile_WithExtendResolve(t *testing.T) {
 					Fields: []*ast.FieldDecl{
 						{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
 						{Name: "name", Type: &ast.TypeRef{Name: "String"}},
-						{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
 					},
 					Directives: []*ast.Directive{{Name: "crud"}},
 				}},
@@ -1095,5 +1281,95 @@ func TestGenerateSchemaFile_WithExtendResolve(t *testing.T) {
 	}
 	if !strings.Contains(code, "svc:resolve:Post:userId") {
 		t.Errorf("missing resolve API registration:\n%s", code)
+	}
+}
+
+func TestGenerateSchemaFileUsesExtendedModelPrimaryKey(t *testing.T) {
+	oldContext := globalEventCtx
+	oldFields := modelFieldIDs
+	oldAPIs := apiIDs
+	defer func() {
+		globalEventCtx = oldContext
+		modelFieldIDs = oldFields
+		apiIDs = oldAPIs
+	}()
+	globalEventCtx = &EventContext{
+		ModelModule:  map[string]string{"Product": "product", "Review": "review"},
+		ModelIDField: map[string]string{"Product": "sku", "Review": "id"},
+		ModelIDType:  map[string]string{"Product": "String", "Review": "Int"},
+		ModelFields: map[string]map[string]bool{
+			"Product": {"sku": true, "name": true},
+			"Review":  {"id": true, "productSku": true},
+		},
+	}
+	modelFieldIDs = map[string]map[string]int{
+		"Product": {"sku": 1, "reviews": 10},
+		"Review":  {"id": 1, "productSku": 2},
+	}
+	apiIDs = map[string]int{"svc:resolve:Review:productSku": 51}
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/review.luxo",
+		Models: []*ast.ModelDecl{{
+			Name: "Review",
+			Fields: []*ast.FieldDecl{
+				{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+				{Name: "productSku", Type: &ast.TypeRef{Name: "String"}},
+			},
+		}},
+		Extends: []*ast.ExtendDecl{{
+			Name:   "Product",
+			Fields: []*ast.FieldDecl{{Name: "reviews", Type: &ast.TypeRef{Name: "Review", IsList: true}}},
+		}},
+	}}}
+
+	code := string(generateSchemaFile(result, "app", nil))
+	for _, want := range []string{
+		`ForeignKey: "productSku"`,
+		`Name: "svc:resolve:Review:productSku"`,
+		`Name: "keys", Type: schema.FieldString, TypeName: "String", IsList: true`,
+	} {
+		if !strings.Contains(code, want) {
+			t.Fatalf("custom primary-key schema missing %q:\n%s", want, code)
+		}
+	}
+}
+
+func TestGenerateSchemaFileWithRemoteNamedLoad(t *testing.T) {
+	oldContext := globalEventCtx
+	oldAPIs := apiIDs
+	oldParams := apiParamIDs
+	defer func() {
+		globalEventCtx = oldContext
+		apiIDs = oldAPIs
+		apiParamIDs = oldParams
+	}()
+	globalEventCtx = &EventContext{remoteLoadCalls: map[string][]loadCallInfo{
+		"user": {{
+			modelName:    "User",
+			argNames:     []string{"email"},
+			argTypeNames: []string{"String"},
+		}},
+	}}
+	apiIDs = map[string]int{"svc:load:User:email": 73}
+	apiParamIDs = map[string]map[string]int{"svc:load:User:email": {"email": 6}}
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/user.luxo",
+		Models: []*ast.ModelDecl{{
+			Name: "User",
+			Fields: []*ast.FieldDecl{
+				{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+				{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+			},
+		}},
+	}}}
+
+	code := string(generateSchemaFile(result, "luxo", nil))
+	for _, check := range []string{
+		`ID: 73, Name: "svc:load:User:email", Module: "user"`,
+		`ID: 6, Name: "email", Type: schema.FieldString, TypeName: "String", IsList: true`,
+	} {
+		if !strings.Contains(code, check) {
+			t.Errorf("named load schema missing %q:\n%s", check, code)
+		}
 	}
 }

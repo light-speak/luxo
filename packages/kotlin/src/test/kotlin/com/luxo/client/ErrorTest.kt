@@ -4,22 +4,29 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 
 class LuxoErrorTest {
 
     @Test
     fun `constructor sets all properties`() {
+        val data = buildJsonObject { put("field", "email") }
         val err = LuxoError(
             error = "NotFound",
             code = 404,
             message = "user not found",
             traceId = "abc-123",
+            data = data,
+            developmentCause = "database constraint",
         )
 
         assertEquals("NotFound", err.error)
         assertEquals(404, err.code)
         assertEquals("user not found", err.message)
         assertEquals("abc-123", err.traceId)
+        assertEquals(data, err.data)
+        assertEquals("database constraint", err.developmentCause)
     }
 
     @Test
@@ -36,7 +43,8 @@ class LuxoErrorTest {
     @Test
     fun `is an Exception`() {
         val err = LuxoError("InternalError", 500, "something went wrong")
-        assertTrue(err is Exception)
+        val exception: Exception = err
+        assertTrue(exception is LuxoError)
         assertEquals("something went wrong", err.message)
     }
 

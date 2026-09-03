@@ -2,8 +2,12 @@ package luvia
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -29,9 +33,27 @@ type Gateway struct {
 
 // New creates a new Luvia gateway.
 func New() *Gateway {
-	return &Gateway{
-		Router: api.NewRouter(),
+	router := api.NewRouter()
+	router.IdentityExtractor = func(ctx context.Context) any {
+		return Identity(ctx)
 	}
+	router.InternalRequestContext = internalRequestContext
+	return &Gateway{
+		Router: router,
+	}
+}
+
+func internalRequestContext(ctx context.Context, bearerToken string) (context.Context, error) {
+	cfg, err := auth.LoadConfig()
+	if err != nil {
+		return nil, err
+	}
+	data, err := auth.VerifyCached(cfg, bearerToken)
+	if err != nil {
+		return nil, err
+	}
+	ctx = context.WithValue(ctx, identityKey, &Claims{data: data})
+	return context.WithValue(ctx, bearerTokenCtxKey{}, bearerToken), nil
 }
 
 // AddModule registers a module name for display.
@@ -44,6 +66,9 @@ func (g *Gateway) AddModule(name string) {
 // If APP_TLS_CERT and APP_TLS_KEY are set, uses HTTP/2 with TLS.
 // Handles SIGTERM/SIGINT for graceful shutdown — drains active connections.
 func (g *Gateway) Serve(version string) error {
+	if err := g.Router.Validate(); err != nil {
+		return err
+	}
 	mux, port := g.buildMux(version)
 	addr := ":" + port
 
@@ -57,39 +82,59 @@ func (g *Gateway) Serve(version string) error {
 	certFile := envOr("APP_TLS_CERT", "")
 	keyFile := envOr("APP_TLS_KEY", "")
 
-	var server *http.Server
-
+	server, serveErr, err := startGatewayServer(addr, mux, certFile, keyFile)
+	if err != nil {
+		return err
+	}
 	if certFile != "" && keyFile != "" {
-		server = &http.Server{Addr: addr, Handler: mux}
 		fmt.Printf("  Listening on https://localhost%s (HTTP/2 + TLS)\n\n", addr)
-		go func() {
-			if err := server.ListenAndServeTLS(certFile, keyFile); err != nil && err != http.ErrServerClosed {
-				fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
-				os.Exit(1)
-			}
-		}()
 	} else {
-		h2s := &http2.Server{}
-		handler := h2c.NewHandler(mux, h2s)
-		server = &http.Server{Addr: addr, Handler: handler}
 		fmt.Printf("  Listening on http://localhost%s (HTTP/2 h2c)\n\n", addr)
-		go func() {
-			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
-				os.Exit(1)
-			}
-		}()
 	}
 
 	g.server = server
-	return g.waitForShutdown()
+	return g.waitForShutdown(serveErr)
 }
 
-// waitForShutdown blocks until SIGTERM or SIGINT, then gracefully shuts down.
-func (g *Gateway) waitForShutdown() error {
+func startGatewayServer(addr string, mux http.Handler, certFile, keyFile string) (*http.Server, <-chan error, error) {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("listen %s: %w", addr, err)
+	}
+	server := &http.Server{Addr: addr, Handler: h2c.NewHandler(mux, &http2.Server{})}
+	if certFile != "" && keyFile != "" {
+		certificate, loadErr := tls.LoadX509KeyPair(certFile, keyFile)
+		if loadErr != nil {
+			listener.Close()
+			return nil, nil, fmt.Errorf("load TLS certificate: %w", loadErr)
+		}
+		server.Handler = mux
+		server.TLSConfig = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
+		if configureErr := http2.ConfigureServer(server, &http2.Server{}); configureErr != nil {
+			listener.Close()
+			return nil, nil, fmt.Errorf("configure HTTP/2: %w", configureErr)
+		}
+		listener = tls.NewListener(listener, server.TLSConfig)
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.Serve(listener) }()
+	return server, serveErr, nil
+}
+
+// waitForShutdown blocks until SIGTERM, SIGINT, or a server failure, then gracefully shuts down.
+func (g *Gateway) waitForShutdown(serveErr <-chan error) error {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
-	sig := <-quit
+	defer signal.Stop(quit)
+	var sig os.Signal
+	select {
+	case err := <-serveErr:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return fmt.Errorf("serve: %w", err)
+	case sig = <-quit:
+	}
 	fmt.Printf("\n  Received %s, shutting down...\n", sig)
 
 	timeout := 30 * time.Second
@@ -110,6 +155,9 @@ func (g *Gateway) waitForShutdown() error {
 	}
 	if err := g.server.Shutdown(ctx); err != nil {
 		return fmt.Errorf("shutdown: %w", err)
+	}
+	if err := <-serveErr; !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("serve: %w", err)
 	}
 	fmt.Println("  Server stopped gracefully.")
 	return nil
@@ -147,6 +195,7 @@ func (g *Gateway) buildMux(version string) (*http.ServeMux, string) {
 	if envOr("APP_ENV", "") == "development" {
 		g.Router.SetDevMode(true)
 	}
+	configureWebSocketOrigins(g.Router, envOr("CORS_ORIGIN", "*"))
 
 	// Schema introspection key
 	if key := envOr("INTROSPECTION_KEY", ""); key != "" {
@@ -164,6 +213,21 @@ func (g *Gateway) buildMux(version string) (*http.ServeMux, string) {
 	mux.Handle("/luvia", handler)
 
 	return mux, port
+}
+
+func configureWebSocketOrigins(router *api.Router, configured string) {
+	configured = strings.TrimSpace(configured)
+	if configured == "*" {
+		router.WSAllowAllOrigins = true
+		router.WSOrigins = nil
+		return
+	}
+	origin, err := url.Parse(configured)
+	if err != nil || origin.Scheme == "" || origin.Host == "" || origin.User != nil {
+		return
+	}
+	router.WSAllowAllOrigins = false
+	router.WSOrigins = []string{origin.Host}
 }
 
 // corsMiddleware handles CORS preflight, response headers, and security headers (XSS, CSP, etc.).

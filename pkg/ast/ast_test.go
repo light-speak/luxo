@@ -88,6 +88,34 @@ func TestStmtNodeInterface(t *testing.T) {
 	}
 }
 
+func TestWalkExprsTraversesAllNestedExpressionBlocks(t *testing.T) {
+	blockWith := func(name string) *Block {
+		return &Block{Stmts: []Stmt{&ExprStmt{Expr: &Ident{Name: name}}}}
+	}
+	root := &Block{Stmts: []Stmt{
+		&ExprStmt{Expr: &RangeExpr{Start: &Ident{Name: "rangeStart"}, End: &Ident{Name: "rangeEnd"}}},
+		&ExprStmt{Expr: &TransactionExpr{Body: blockWith("transaction")}},
+		&ExprStmt{Expr: &YieldExpr{Value: &Ident{Name: "yield"}}},
+		&ExprStmt{Expr: &AsyncExpr{Body: blockWith("async")}},
+		&ExprStmt{Expr: &AwaitExpr{Body: blockWith("await")}},
+		&ExprStmt{Expr: &ForStmt{
+			Collection: &Ident{Name: "collection"},
+			Body:       blockWith("forBody"),
+		}},
+	}}
+	seen := make(map[string]bool)
+	WalkExprs(root, func(expr Expr) {
+		if ident, ok := expr.(*Ident); ok {
+			seen[ident.Name] = true
+		}
+	})
+	for _, name := range []string{"rangeStart", "rangeEnd", "transaction", "yield", "async", "await", "collection", "forBody"} {
+		if !seen[name] {
+			t.Errorf("WalkExprs did not visit %q", name)
+		}
+	}
+}
+
 func TestStructFieldAccessDecls(t *testing.T) {
 	m := &ModelDecl{Name: "User", Parents: []string{"Base"}}
 	if m.Name != "User" || len(m.Parents) != 1 {

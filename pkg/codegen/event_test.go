@@ -19,17 +19,124 @@ func TestGenerateEventFileNoEvents(t *testing.T) {
 
 func TestEventJSONFallbackTypes(t *testing.T) {
 	events := []*ast.EventDecl{{Params: []*ast.ParamDecl{
-		{Name: "unknown"},
+		{Name: "unknown", Type: &ast.TypeRef{Name: "LegacyPayload"}},
 		{Name: "items", Type: &ast.TypeRef{Name: "String", IsList: true}},
 	}}}
-	if !eventsNeedJSON(events) {
+	if !eventsNeedJSON(events, nil, nil) {
 		t.Fatal("eventsNeedJSON() = false, want true")
 	}
-	if got := eventScalarType(nil); got != "" {
-		t.Fatalf("eventScalarType(nil) = %q, want empty", got)
+	if !isEventBuiltin("JSON") || isEventBuiltin("LegacyPayload") {
+		t.Fatal("event builtin classification is incorrect")
 	}
-	if got := eventScalarType(&ast.TypeRef{Name: "String", IsList: true}); got != "" {
-		t.Fatalf("eventScalarType(list) = %q, want empty", got)
+}
+
+func TestEventObjectCollectionAndJSONRequirements(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Models: []*ast.ModelDecl{{Name: "User"}},
+		Types:  []*ast.TypeDecl{{Name: "Payload"}},
+	}}}
+	objects := collectEventObjectTypes(result)
+	if !objects["User"] || !objects["Payload"] {
+		t.Fatalf("event object types = %v", objects)
+	}
+	events := []*ast.EventDecl{{Params: []*ast.ParamDecl{{Name: "payload", Type: &ast.TypeRef{Name: "Payload"}}}}}
+	if !eventsUseObjects(events, objects) {
+		t.Fatal("type declarations must be treated as event objects")
+	}
+	if !eventsNeedJSON([]*ast.EventDecl{{Params: []*ast.ParamDecl{{Name: "unknown"}}}}, nil, nil) {
+		t.Fatal("an unresolved event parameter must retain the JSON fallback")
+	}
+}
+
+func TestEventScalarWriteStatements(t *testing.T) {
+	tests := []struct {
+		name, typeName, want string
+		isEnum               bool
+	}{
+		{name: "enum", typeName: "Role", isEnum: true, want: "enc.WriteString(string(value))"},
+		{name: "int", typeName: "Int", want: "enc.WriteInt(value)"},
+		{name: "float", typeName: "Float", want: "enc.WriteFloat(value)"},
+		{name: "string", typeName: "String", want: "enc.WriteString(value)"},
+		{name: "boolean", typeName: "Boolean", want: "enc.WriteBool(value)"},
+		{name: "datetime", typeName: "DateTime", want: "enc.WriteInt(value.Unix())"},
+		{name: "duration", typeName: "Duration", want: "enc.WriteInt(int64(value))"},
+		{name: "uuid", typeName: "UUID", want: "enc.WriteUUID([16]byte(value))"},
+		{name: "decimal", typeName: "Decimal", want: "enc.WriteString(value.String())"},
+		{name: "bytes", typeName: "Bytes", want: "enc.WriteBytes(value)"},
+		{name: "unknown", typeName: "Unknown", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := eventScalarWriteStatement(tt.typeName, "value", tt.isEnum); got != tt.want {
+				t.Fatalf("write statement = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEventScalarReadExpressions(t *testing.T) {
+	tests := []struct {
+		typeName string
+		isEnum   bool
+		want     string
+	}{
+		{typeName: "Int", want: "dec.ReadIntPtr()"},
+		{typeName: "Float", want: "dec.ReadFloatPtr()"},
+		{typeName: "String", want: "dec.ReadStringPtr()"},
+		{typeName: "Boolean", want: "dec.ReadBoolPtr()"},
+		{typeName: "Bytes", want: "dec.ReadBytesValuePtr()"},
+		{typeName: "JSON", want: "json.RawMessage"},
+		{typeName: "Duration", want: "time.Duration(*raw)"},
+		{typeName: "DateTime", want: "time.Unix(*raw, 0).UTC()"},
+		{typeName: "UUID", want: "uuid.UUID(*raw)"},
+		{typeName: "Role", isEnum: true, want: "Role(*raw)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.typeName, func(t *testing.T) {
+			got := eventScalarReadExpression(tt.typeName, tt.isEnum, true)
+			if !strings.Contains(got, tt.want) {
+				t.Fatalf("nullable read expression = %q, want %q", got, tt.want)
+			}
+		})
+	}
+	if got := eventScalarReadExpression("Role", true, false); got != "Role(dec.ReadString())" {
+		t.Fatalf("enum read expression = %q", got)
+	}
+	if got := eventScalarReadExpression("Bytes", false, false); got != "dec.ReadBytes()" {
+		t.Fatalf("bytes read expression = %q", got)
+	}
+	if got := eventScalarReadExpression("Unknown", false, false); got != "" {
+		t.Fatalf("unknown read expression = %q", got)
+	}
+}
+
+func TestEventCodecFallbackWriters(t *testing.T) {
+	old := eventFieldIDs
+	defer func() { eventFieldIDs = old }()
+	SetEventFieldIDs(map[string]map[string]int{"Changed": {"payload": 1}})
+	param := &ast.ParamDecl{Name: "payload", Type: &ast.TypeRef{Name: "External"}}
+	var b strings.Builder
+	writeEventMarshalField(&b, "Changed", param, false, false)
+	writeEventUnmarshalField(&b, "Changed", param, false, false)
+	writeEventListMarshal(&b, 2, "e.Payloads", "External", false, false)
+	writeEventListUnmarshal(&b, 2, "e.Payloads", "External", false, false)
+	for _, want := range []string{"json.Marshal(e.Payload)", "json.Unmarshal(dec.ReadBytes(), &e.Payload)", "json.Marshal(e.Payloads[i])", "json.Unmarshal(dec.ReadBytes(), &e.Payloads[i])"} {
+		if !strings.Contains(b.String(), want) {
+			t.Fatalf("fallback codec missing %q:\n%s", want, b.String())
+		}
+	}
+}
+
+func TestEventCodecNullableObjectAndDecimalWriters(t *testing.T) {
+	var b strings.Builder
+	writeEventObjectMarshal(&b, 1, "e.Payload", true)
+	writeEventObjectUnmarshal(&b, 1, "e.Payload", &ast.TypeRef{Name: "Payload", Nullable: true})
+	writeEventDecimalUnmarshal(&b, "e.Amount", true)
+	writeEventListUnmarshal(&b, 2, "e.Amounts", "Decimal", false, false)
+	for _, want := range []string{"e.Payload == nil", "enc.WritePresent()", "e.Payload = &Payload{}", "dec.ReadStringPtr()", "decimal.NewFromString(dec.ReadString())"} {
+		if !strings.Contains(b.String(), want) {
+			t.Fatalf("nullable/object codec missing %q:\n%s", want, b.String())
+		}
 	}
 }
 
@@ -69,8 +176,10 @@ func TestGenerateEventFile(t *testing.T) {
 		`UserId int64`,
 		"func EmitOrderCreated(ctx context.Context, bus event.Bus, e OrderCreatedEvent) error",
 		`bus.Emit(ctx, "OrderCreated", e)`,
+		"func (e OrderCreatedEvent) MarshalLuxo() []byte",
+		"event OrderCreated: expected *OrderCreatedEvent, got %T",
 		"func RegisterEvents(bus event.Bus, app *App)",
-		`event.OnQueueDecode(bus, "OrderCreated", "luxo", UnmarshalOrderCreated, func(ctx context.Context, e OrderCreatedEvent)`,
+		`event.OnQueueDecode(bus, "OrderCreated", "test", UnmarshalOrderCreated, func(ctx context.Context, e OrderCreatedEvent)`,
 	}
 	for _, check := range checks {
 		if !strings.Contains(code, check) {
@@ -157,7 +266,7 @@ func TestGenerateEventListenerMixed(t *testing.T) {
 	src := generateEventFile(result, "order")
 	code := string(src)
 
-	if !strings.Contains(code, `event.OnQueueDecode(bus, "OrderCreated", "order"`) {
+	if !strings.Contains(code, `event.OnQueueDecode(bus, "OrderCreated", "test"`) {
 		t.Errorf("default listener should use OnQueueDecode:\n%s", code)
 	}
 	if !strings.Contains(code, `event.OnDecode(bus, "CacheInvalidate"`) {
@@ -197,31 +306,37 @@ func TestGenerateEventCodecWithFieldIDs(t *testing.T) {
 	code := string(src)
 
 	// MarshalLuxo should encode all fields
-	if !strings.Contains(code, "WriteFieldInt(1, e.OrderId)") {
-		t.Errorf("missing WriteFieldInt for orderId:\n%s", code)
+	if !strings.Contains(code, "enc.WriteFieldHeader(1)") || !strings.Contains(code, "enc.WriteInt(e.OrderId)") {
+		t.Errorf("missing canonical Int encoding for orderId:\n%s", code)
 	}
-	if !strings.Contains(code, "WriteFieldFloat(2, e.Amount)") {
-		t.Errorf("missing WriteFieldFloat for amount:\n%s", code)
+	if !strings.Contains(code, "enc.WriteFieldHeader(2)") || !strings.Contains(code, "enc.WriteFloat(e.Amount)") {
+		t.Errorf("missing canonical Float encoding for amount:\n%s", code)
 	}
-	if !strings.Contains(code, "WriteFieldString(3, e.Note)") {
-		t.Errorf("missing WriteFieldString for note:\n%s", code)
+	if !strings.Contains(code, "enc.WriteFieldHeader(3)") || !strings.Contains(code, "enc.WriteString(e.Note)") {
+		t.Errorf("missing canonical String encoding for note:\n%s", code)
 	}
-	if !strings.Contains(code, "WriteFieldBool(4, e.Paid)") {
-		t.Errorf("missing WriteFieldBool for paid:\n%s", code)
+	if !strings.Contains(code, "enc.WriteFieldHeader(4)") || !strings.Contains(code, "enc.WriteBool(e.Paid)") {
+		t.Errorf("missing canonical Boolean encoding for paid:\n%s", code)
 	}
 
 	// UnmarshalLuxo should decode all fields
-	if !strings.Contains(code, "case 1: e.OrderId = dec.ReadInt()") {
+	if !strings.Contains(code, "case 1:") || !strings.Contains(code, "e.OrderId = dec.ReadInt()") {
 		t.Errorf("missing ReadInt for orderId:\n%s", code)
 	}
-	if !strings.Contains(code, "case 2: e.Amount = dec.ReadFloat()") {
+	if !strings.Contains(code, "case 2:") || !strings.Contains(code, "e.Amount = dec.ReadFloat()") {
 		t.Errorf("missing ReadFloat for amount:\n%s", code)
 	}
-	if !strings.Contains(code, "case 3: e.Note = dec.ReadString()") {
+	if !strings.Contains(code, "case 3:") || !strings.Contains(code, "e.Note = dec.ReadString()") {
 		t.Errorf("missing ReadString for note:\n%s", code)
 	}
-	if !strings.Contains(code, "case 4: e.Paid = dec.ReadBool()") {
+	if !strings.Contains(code, "case 4:") || !strings.Contains(code, "e.Paid = dec.ReadBool()") {
 		t.Errorf("missing ReadBool for paid:\n%s", code)
+	}
+	if !strings.Contains(code, "seenOrderId = true") || !strings.Contains(code, "if !seenOrderId") {
+		t.Errorf("required event fields must be presence-checked:\n%s", code)
+	}
+	if !strings.Contains(code, "default:") || !strings.Contains(code, "dec.SkipField()") {
+		t.Errorf("unknown event fields must fail instead of corrupting decoder state:\n%s", code)
 	}
 }
 
@@ -253,9 +368,10 @@ func TestGenerateEventCodecNullableTypes(t *testing.T) {
 	code := string(src)
 
 	for _, want := range []string{
-		"WriteFieldFloatPtr(1, e.Amount)",
-		"WriteFieldStringPtr(2, e.Note)",
-		"WriteFieldBoolPtr(3, e.Active)",
+		"if e.Amount == nil { enc.WriteNull() } else {",
+		"enc.WriteFloat((*e.Amount))",
+		"enc.WriteString((*e.Note))",
+		"enc.WriteBool((*e.Active))",
 		"e.Amount = dec.ReadFloatPtr()",
 	} {
 		if !strings.Contains(code, want) {
@@ -275,6 +391,10 @@ func TestGenerateEventCodecComplexType(t *testing.T) {
 	result := &semantic.Result{
 		Files: []*ast.File{{
 			Name: "test.luxo",
+			Models: []*ast.ModelDecl{{
+				Name:   "Order",
+				Fields: []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}},
+			}},
 			Events: []*ast.EventDecl{
 				{
 					Name: "ComplexEvent",
@@ -289,8 +409,11 @@ func TestGenerateEventCodecComplexType(t *testing.T) {
 	src := generateEventFile(result, "luxo")
 	code := string(src)
 
-	if !strings.Contains(code, "json.Marshal(e.Data)") || !strings.Contains(code, "json.Unmarshal(dec.ReadBytes(), &e.Data)") {
-		t.Errorf("complex type should round-trip through embedded JSON:\n%s", code)
+	if !strings.Contains(code, "e.Data.WriteLuxo(buf, nil)") || !strings.Contains(code, "e.Data.ReadLuxo(nested)") {
+		t.Errorf("model event payload should use nested Luxo binary:\n%s", code)
+	}
+	if strings.Contains(code, "json.Marshal(e.Data)") {
+		t.Errorf("model event payload must not embed JSON:\n%s", code)
 	}
 }
 
@@ -315,7 +438,7 @@ func TestGenerateEventListenerNoParams(t *testing.T) {
 		t.Errorf("should default to 'payload' param:\n%s", code)
 	}
 	// Default should use OnQueueDecode
-	if !strings.Contains(code, `event.OnQueueDecode(bus, "Ping", "luxo"`) {
+	if !strings.Contains(code, `event.OnQueueDecode(bus, "Ping", "test"`) {
 		t.Errorf("default should use OnQueueDecode:\n%s", code)
 	}
 }

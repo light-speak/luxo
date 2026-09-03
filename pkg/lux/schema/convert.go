@@ -2,6 +2,7 @@ package schema
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"strconv"
 	"time"
 	"unicode/utf8"
@@ -52,7 +53,7 @@ func binaryToJSONFromDecoder(dst []byte, dec *codec.Decoder, model *Model, schem
 // decoder stream. Wire formats (matching WriteLuxo):
 //   - single:          [nested object]
 //   - nullable single: [present/null flag][nested object]
-//   - list:            [svarint count][item1][item2]...
+//   - list:            [varint count][item1][item2]...
 func appendNestedModelJSON(dst []byte, dec *codec.Decoder, f *Field, s *Schema) []byte {
 	nested := s.Models[f.TypeName]
 	if nested == nil {
@@ -72,9 +73,9 @@ func appendNestedModelJSON(dst []byte, dec *codec.Decoder, f *Field, s *Schema) 
 		return append(dst, "null"...)
 	}
 	if f.IsList {
-		count := dec.ReadInt()
+		count := dec.ReadArrayLength()
 		dst = append(dst, '[')
-		for i := int64(0); i < count; i++ {
+		for i := 0; i < count; i++ {
 			if i > 0 {
 				dst = append(dst, ',')
 			}
@@ -111,6 +112,7 @@ type typedColumn struct {
 	bools     []bool
 	boolPtrs  []*bool
 	blobs     [][]byte    // nested model/list binary data (federation extend fields)
+	blobPtrs  []*[]byte   // nullable bytes/JSON column
 	uuids     [][16]byte  // 16-byte UUID column
 	uuidPtrs  []*[16]byte // nullable UUID column
 }
@@ -179,7 +181,7 @@ func readColumn(r *codec.ColumnarReader, f *Field, col *typedColumn) {
 		} else {
 			col.floats = r.ReadColumnFloat()
 		}
-	case FieldString, FieldEnum:
+	case FieldString, FieldEnum, FieldDecimal:
 		if f.Nullable {
 			col.strPtrs = r.ReadColumnStringPtr()
 		} else {
@@ -198,7 +200,17 @@ func readColumn(r *codec.ColumnarReader, f *Field, col *typedColumn) {
 			col.uuids = r.ReadColumnUUID()
 		}
 	case FieldModel:
-		col.blobs = r.ReadColumnBytes()
+		if f.Nullable {
+			col.blobPtrs = r.ReadColumnBytesPtr()
+		} else {
+			col.blobs = r.ReadColumnBytes()
+		}
+	case FieldBytes, FieldJSON:
+		if f.Nullable {
+			col.blobPtrs = r.ReadColumnBytesPtr()
+		} else {
+			col.blobs = r.ReadColumnBytes()
+		}
 	}
 }
 
@@ -261,6 +273,14 @@ func appendColumnValueJSON(dst []byte, col *typedColumn, i int, schemas ...*Sche
 		return appendUUIDString(dst, *col.uuidPtrs[i])
 	case col.blobs != nil:
 		return appendColumnBlobJSON(dst, col, i, schemas...)
+	case col.blobPtrs != nil:
+		if col.blobPtrs[i] == nil {
+			return append(dst, "null"...)
+		}
+		if f.Type == FieldModel {
+			return appendNestedColumnBlobJSON(dst, *col.blobPtrs[i], f, schemas...)
+		}
+		return appendBinaryBlobJSON(dst, *col.blobPtrs[i], f)
 	default:
 		return append(dst, "null"...)
 	}
@@ -272,10 +292,16 @@ func appendColumnBlobJSON(dst []byte, col *typedColumn, i int, schemas ...*Schem
 	f := col.field
 	blob := col.blobs[i]
 	// Scalar array field: each cell is an inline [count][items...] array.
-	if f.Type != FieldModel {
+	if f.IsList && f.Type != FieldModel {
 		return appendArrayFieldJSON(dst, codec.NewDecoder(blob), f)
 	}
-	// Federation extend field — blob contains nested model/list binary data.
+	if f.Type != FieldModel {
+		return appendBinaryBlobJSON(dst, blob, f)
+	}
+	return appendNestedColumnBlobJSON(dst, blob, f, schemas...)
+}
+
+func appendNestedColumnBlobJSON(dst, blob []byte, f *Field, schemas ...*Schema) []byte {
 	if len(blob) == 0 {
 		if f.IsList {
 			return append(dst, "[]"...)
@@ -301,6 +327,18 @@ func appendColumnBlobJSON(dst []byte, col *typedColumn, i int, schemas ...*Schem
 		return append(dst, "[]"...)
 	}
 	return append(dst, "null"...)
+}
+
+func appendBinaryBlobJSON(dst, blob []byte, f *Field) []byte {
+	if f.Type == FieldJSON {
+		if json.Valid(blob) {
+			return append(dst, blob...)
+		}
+		return append(dst, "null"...)
+	}
+	dst = append(dst, '"')
+	dst = append(dst, base64.StdEncoding.EncodeToString(blob)...)
+	return append(dst, '"')
 }
 
 func appendAnyJSON(dst []byte, v any, f *Field) []byte {
@@ -343,7 +381,7 @@ func appendAnyJSON(dst []byte, v any, f *Field) []byte {
 // BinaryPaginatedListToJSON converts a paginated columnar list response to JSON.
 // Binary format: [columnar data: count+columns+0x00][total svarint][page svarint][pageSize svarint]
 // JSON format: {"items":[...],"total":N,"page":N,"pageSize":N}
-func BinaryPaginatedListToJSON(dst []byte, data []byte, model *Model) []byte {
+func BinaryPaginatedListToJSON(dst []byte, data []byte, model *Model, schemas ...*Schema) []byte {
 	r := codec.NewColumnarReader(data)
 	count := r.Count()
 	if count == 0 {
@@ -406,7 +444,7 @@ func BinaryPaginatedListToJSON(dst []byte, data []byte, model *Model) []byte {
 			}
 			first = false
 			dst = append(dst, col.field.JSONPrefix...)
-			dst = appendColumnValueJSON(dst, col, i)
+			dst = appendColumnValueJSON(dst, col, i, schemas...)
 		}
 		dst = append(dst, '}')
 	}
@@ -453,7 +491,7 @@ func appendArrayFieldJSON(dst []byte, dec *codec.Decoder, f *Field) []byte {
 		return appendIntArrayJSON(dst, dec.ReadIntArray(), true)
 	case FieldFloat:
 		return appendFloatArrayJSON(dst, dec.ReadFloatArray())
-	case FieldString, FieldEnum:
+	case FieldString, FieldEnum, FieldDecimal:
 		return appendStringArrayJSON(dst, dec.ReadStringArray())
 	case FieldBool:
 		return appendBoolArrayJSON(dst, dec.ReadBoolArray())
@@ -461,6 +499,16 @@ func appendArrayFieldJSON(dst []byte, dec *codec.Decoder, f *Field) []byte {
 		return appendUUIDArrayJSON(dst, dec.ReadUUIDArray())
 	case FieldBytes:
 		return appendBytesArrayJSON(dst, dec.ReadBytesArray())
+	case FieldJSON:
+		values := dec.ReadBytesArray()
+		dst = append(dst, '[')
+		for i, raw := range values {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = appendBinaryBlobJSON(dst, raw, f)
+		}
+		return append(dst, ']')
 	}
 	return append(dst, '[', ']')
 }
@@ -558,7 +606,7 @@ func appendFieldValueJSON(dst []byte, dec *codec.Decoder, f *Field) []byte {
 	case FieldFloat:
 		v := dec.ReadFloat()
 		return strconv.AppendFloat(dst, v, 'f', -1, 64)
-	case FieldString, FieldEnum:
+	case FieldString, FieldEnum, FieldDecimal:
 		v := dec.ReadString()
 		return appendJSONString(dst, v)
 	case FieldBool:
@@ -588,6 +636,8 @@ func appendFieldValueJSON(dst []byte, dec *codec.Decoder, f *Field) []byte {
 		dst = append(dst, base64.StdEncoding.EncodeToString(raw)...)
 		dst = append(dst, '"')
 		return dst
+	case FieldJSON:
+		return appendBinaryBlobJSON(dst, dec.ReadBytes(), f)
 	default:
 		return append(dst, "null"...)
 	}
@@ -608,7 +658,7 @@ func appendNullableFieldJSON(dst []byte, dec *codec.Decoder, f *Field) []byte {
 			return append(dst, "null"...)
 		}
 		return strconv.AppendFloat(dst, *v, 'f', -1, 64)
-	case FieldString, FieldEnum:
+	case FieldString, FieldEnum, FieldDecimal:
 		v := dec.ReadStringPtr()
 		if v == nil {
 			return append(dst, "null"...)
@@ -654,6 +704,12 @@ func appendNullableFieldJSON(dst []byte, dec *codec.Decoder, f *Field) []byte {
 		dst = append(dst, base64.StdEncoding.EncodeToString(raw)...)
 		dst = append(dst, '"')
 		return dst
+	case FieldJSON:
+		raw := dec.ReadBytesPtr()
+		if raw == nil {
+			return append(dst, "null"...)
+		}
+		return appendBinaryBlobJSON(dst, raw, f)
 	default:
 		return append(dst, "null"...)
 	}
@@ -690,7 +746,25 @@ func BinaryScalarToJSON(dst []byte, data []byte, typeName string) []byte {
 			copy(u[:], data[:16])
 			return appendUUIDString(dst, u)
 		}
-	case "String", "DateTime", "Decimal":
+	case "Bytes":
+		raw, n := codec.ReadBytes(data, 0)
+		if n > 0 {
+			return appendBinaryBlobJSON(dst, raw, &Field{Type: FieldBytes})
+		}
+	case "JSON":
+		raw, n := codec.ReadBytes(data, 0)
+		if n > 0 {
+			return appendBinaryBlobJSON(dst, raw, &Field{Type: FieldJSON})
+		}
+	case "DateTime":
+		v, n := codec.ReadSvarint(data, 0)
+		if n > 0 {
+			t := time.Unix(v, 0).UTC()
+			dst = append(dst, '"')
+			dst = t.AppendFormat(dst, time.RFC3339Nano)
+			return append(dst, '"')
+		}
+	case "String", "Decimal":
 		v, n := codec.ReadString(data, 0)
 		if n > 0 {
 			return appendJSONString(dst, v)
@@ -702,6 +776,55 @@ func BinaryScalarToJSON(dst []byte, data []byte, typeName string) []byte {
 		return strconv.AppendInt(dst, v, 10)
 	}
 	return append(dst, "null"...)
+}
+
+// BinaryScalarListToJSON converts a canonical count-prefixed list of scalar
+// values. Enum callers pass String because enums share the string wire type.
+func BinaryScalarListToJSON(dst []byte, data []byte, typeName string) []byte {
+	start := len(dst)
+	dec := codec.NewDecoder(data)
+	count := dec.ReadArrayLength()
+	dst = append(dst, '[')
+	for i := 0; i < count && dec.Err() == nil; i++ {
+		if i > 0 {
+			dst = append(dst, ',')
+		}
+		dst = appendScalarValueJSON(dst, dec, typeName)
+	}
+	if dec.Err() != nil {
+		return append(dst[:start], "null"...)
+	}
+	return append(dst, ']')
+}
+
+func appendScalarValueJSON(dst []byte, dec *codec.Decoder, typeName string) []byte {
+	switch typeName {
+	case "Int", "Duration", "":
+		return strconv.AppendInt(dst, dec.ReadInt(), 10)
+	case "Float":
+		return strconv.AppendFloat(dst, dec.ReadFloat(), 'f', -1, 64)
+	case "Boolean":
+		if dec.ReadBool() {
+			return append(dst, "true"...)
+		}
+		return append(dst, "false"...)
+	case "DateTime":
+		t := time.Unix(dec.ReadInt(), 0).UTC()
+		dst = append(dst, '"')
+		dst = t.AppendFormat(dst, time.RFC3339Nano)
+		return append(dst, '"')
+	case "UUID":
+		return appendUUIDString(dst, dec.ReadUUID())
+	case "Bytes":
+		return appendBinaryBlobJSON(dst, dec.ReadBytes(), &Field{Type: FieldBytes})
+	case "JSON":
+		return appendBinaryBlobJSON(dst, dec.ReadBytes(), &Field{Type: FieldJSON})
+	case "String", "Decimal":
+		return appendJSONString(dst, dec.ReadString())
+	default:
+		dec.SkipField()
+		return dst
+	}
 }
 
 // appendUUIDString formats a 16-byte UUID as the canonical 36-char JSON string.
@@ -805,142 +928,4 @@ func appendJSONString(dst []byte, s string) []byte {
 	}
 	dst = append(dst, '"')
 	return dst
-}
-
-// JSONParamsToBinary converts JSON params to Luxo binary format using API schema.
-// Input: {"id": 1, "name": "Alice"} → binary encoded params.
-func JSONParamsToBinary(jsonParams map[string]any, api *API) []byte {
-	var enc codec.Encoder
-	for _, p := range api.Params {
-		v, ok := jsonParams[p.Name]
-		if !ok {
-			continue
-		}
-		if p.IsList {
-			writeJSONArrayParam(&enc, p, v)
-		} else {
-			writeJSONScalarParam(&enc, p, v)
-		}
-	}
-	enc.WriteEnd()
-	return enc.Bytes()
-}
-
-// writeJSONScalarParam encodes a single scalar JSON param value to binary.
-func writeJSONScalarParam(enc *codec.Encoder, p Param, v any) {
-	switch p.Type {
-	case FieldInt:
-		switch iv := v.(type) {
-		case float64:
-			enc.WriteFieldInt(p.ID, int64(iv))
-		case int64:
-			enc.WriteFieldInt(p.ID, iv)
-		}
-	case FieldFloat:
-		if fv, ok := v.(float64); ok {
-			enc.WriteFieldFloat(p.ID, fv)
-		}
-	case FieldString, FieldEnum:
-		if sv, ok := v.(string); ok {
-			enc.WriteFieldString(p.ID, sv)
-		}
-	case FieldBool:
-		if bv, ok := v.(bool); ok {
-			enc.WriteFieldBool(p.ID, bv)
-		}
-	case FieldDuration:
-		if fv, ok := v.(float64); ok {
-			enc.WriteFieldInt(p.ID, int64(fv))
-		}
-	case FieldDateTime:
-		// JSON callers send DateTime as RFC3339 string; parse to unix seconds.
-		// Tolerate raw unix-seconds number too.
-		switch dv := v.(type) {
-		case string:
-			if t, err := time.Parse(time.RFC3339, dv); err == nil {
-				enc.WriteFieldInt(p.ID, t.Unix())
-			}
-		case float64:
-			enc.WriteFieldInt(p.ID, int64(dv))
-		}
-	case FieldUUID:
-		if sv, ok := v.(string); ok {
-			if u, valid := parseUUID(sv); valid {
-				enc.WriteFieldUUID(p.ID, u)
-			}
-		}
-	case FieldBytes:
-		if sv, ok := v.(string); ok {
-			if raw, err := base64.StdEncoding.DecodeString(sv); err == nil {
-				enc.WriteFieldBytes(p.ID, raw)
-			}
-		}
-	}
-}
-
-// writeJSONArrayParam encodes a JSON array param (in/notIn → [T]) to binary.
-func writeJSONArrayParam(enc *codec.Encoder, p Param, v any) {
-	arr, ok := v.([]any)
-	if !ok {
-		return
-	}
-	switch p.Type {
-	case FieldInt, FieldDuration:
-		vs := make([]int64, 0, len(arr))
-		for _, e := range arr {
-			if fv, ok := e.(float64); ok {
-				vs = append(vs, int64(fv))
-			}
-		}
-		enc.WriteFieldIntArray(p.ID, vs)
-	case FieldDateTime:
-		// JSON clients may send DateTime arrays as RFC3339 strings or as raw
-		// unix-seconds numbers; accept both, like the scalar param path.
-		vs := make([]int64, 0, len(arr))
-		for _, e := range arr {
-			switch ev := e.(type) {
-			case float64:
-				vs = append(vs, int64(ev))
-			case string:
-				if t, err := time.Parse(time.RFC3339, ev); err == nil {
-					vs = append(vs, t.Unix())
-				}
-			}
-		}
-		enc.WriteFieldIntArray(p.ID, vs)
-	case FieldFloat:
-		vs := make([]float64, 0, len(arr))
-		for _, e := range arr {
-			if fv, ok := e.(float64); ok {
-				vs = append(vs, fv)
-			}
-		}
-		enc.WriteFieldFloatArray(p.ID, vs)
-	case FieldString, FieldEnum:
-		vs := make([]string, 0, len(arr))
-		for _, e := range arr {
-			if sv, ok := e.(string); ok {
-				vs = append(vs, sv)
-			}
-		}
-		enc.WriteFieldStringArray(p.ID, vs)
-	case FieldBool:
-		vs := make([]bool, 0, len(arr))
-		for _, e := range arr {
-			if bv, ok := e.(bool); ok {
-				vs = append(vs, bv)
-			}
-		}
-		enc.WriteFieldBoolArray(p.ID, vs)
-	case FieldUUID:
-		vs := make([][16]byte, 0, len(arr))
-		for _, e := range arr {
-			if sv, ok := e.(string); ok {
-				if u, valid := parseUUID(sv); valid {
-					vs = append(vs, u)
-				}
-			}
-		}
-		enc.WriteFieldUUIDArray(p.ID, vs)
-	}
 }

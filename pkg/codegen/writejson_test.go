@@ -175,7 +175,7 @@ func TestGenerateWriteLuxoEnumFields(t *testing.T) {
 	}
 }
 
-func TestGenerateWriteLuxoHiddenAndComputedSkipped(t *testing.T) {
+func TestGenerateWriteLuxoHiddenSkippedAndComputedEncoded(t *testing.T) {
 	old := modelFieldIDs
 	defer func() { modelFieldIDs = old }()
 
@@ -204,8 +204,8 @@ func TestGenerateWriteLuxoHiddenAndComputedSkipped(t *testing.T) {
 	if strings.Contains(code, "u.Password") {
 		t.Error("hidden field should be skipped in WriteLuxo")
 	}
-	if strings.Contains(code, "u.FullName") {
-		t.Error("computed field should be skipped in WriteLuxo")
+	if !strings.Contains(code, "u.FullName") {
+		t.Error("computed field should be encoded by WriteLuxo")
 	}
 	if strings.Contains(code, "u.Internal") {
 		t.Error("internal field should be skipped in WriteLuxo")
@@ -239,7 +239,7 @@ func TestGenerateWriteLuxoNoFieldIDs(t *testing.T) {
 	}
 }
 
-func TestGenerateWriteLuxoRelationSkipped(t *testing.T) {
+func TestGenerateWriteLuxoRelationEncoded(t *testing.T) {
 	old := modelFieldIDs
 	defer func() { modelFieldIDs = old }()
 
@@ -260,11 +260,8 @@ func TestGenerateWriteLuxoRelationSkipped(t *testing.T) {
 	generateWriteLuxo(&b, m, enums)
 	code := b.String()
 
-	// Relation field "user" should NOT appear in WriteLuxo (but UserId should)
-	// Check for "p.User " or "p.User)" - the relation accessor, not "p.UserId"
-	codeWithoutUserId := strings.ReplaceAll(code, "p.UserId", "")
-	if strings.Contains(codeWithoutUserId, "p.User") {
-		t.Errorf("relation field should be skipped in WriteLuxo:\n%s", code)
+	if !strings.Contains(code, "p.User.WriteLuxo(buf, nil)") {
+		t.Errorf("relation field should use nested row encoding:\n%s", code)
 	}
 	// Non-relation fields should appear
 	if !strings.Contains(code, "p.Id") {
@@ -971,10 +968,53 @@ func TestGenerateTypeWriteColumnarNestedSingle(t *testing.T) {
 
 func TestGenerateTypeWriteColumnarNestedNullable(t *testing.T) {
 	var b strings.Builder
-	writeColumnarNestedBlobField(&b, "Child", 4, &ast.TypeRef{Name: "Child", Nullable: true})
+	writeColumnarNestedBlobField(&b, "Child", 4, &ast.TypeRef{Name: "Child", Nullable: true}, "selectionMask")
 	code := b.String()
 	if !strings.Contains(code, "if items[i].Child != nil") || !strings.Contains(code, "items[i].Child.WriteLuxo") {
 		t.Fatalf("nullable nested type must preserve null cells:\n%s", code)
+	}
+	if !strings.Contains(code, "w.WriteColumnBytesPtr(4, vals)") {
+		t.Fatalf("nullable nested type must use canonical nullable column encoding:\n%s", code)
+	}
+}
+
+func TestGenerateModelBinaryWritersIncludeRelations(t *testing.T) {
+	model := &ast.ModelDecl{
+		Name: "Parent",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "child", Type: &ast.TypeRef{Name: "Child", Nullable: true}},
+			{Name: "children", Type: &ast.TypeRef{Name: "Child", IsList: true}},
+		},
+	}
+	SetModelFieldIDs(map[string]map[string]int{
+		"Parent": {"id": 1, "child": 2, "children": 3},
+	})
+	defer SetModelFieldIDs(nil)
+
+	var row strings.Builder
+	generateWriteLuxo(&row, model, nil)
+	rowCode := row.String()
+	if !strings.Contains(rowCode, "_childMask2, _ := codec.SelectionMaskNested(selectionMask, 2)") ||
+		!strings.Contains(rowCode, "p.Child.WriteLuxo(buf, _childMask2)") ||
+		!strings.Contains(rowCode, "p.Children[i].WriteLuxo(buf, _childMask3)") {
+		t.Fatalf("model row writer must encode selected relations:\n%s", rowCode)
+	}
+
+	var columnar strings.Builder
+	generateWriteColumnar(&columnar, model, nil)
+	columnarCode := columnar.String()
+	if !strings.Contains(columnarCode, "WriteColumnarChildValues(&nb, items[i].Children, _childMask3)") {
+		t.Fatalf("model list relation must use canonical nested columnar encoding:\n%s", columnarCode)
+	}
+	if !strings.Contains(columnarCode, "mask = codec.SelectionMaskFields(mask)") {
+		t.Fatalf("columnar writer must decode the recursive selection node:\n%s", columnarCode)
+	}
+	if !strings.Contains(columnarCode, "w.WriteColumnBytesPtr(2, vals)") {
+		t.Fatalf("nullable model relation must use nullable byte cells:\n%s", columnarCode)
+	}
+	if !strings.Contains(columnarCode, "func WriteColumnarParentValues(") {
+		t.Fatalf("model writer must expose a zero-conversion value-slice variant:\n%s", columnarCode)
 	}
 }
 
@@ -1079,8 +1119,8 @@ func TestGenerateWriteLuxoUUIDDecimalBytesJSON(t *testing.T) {
 	if !strings.Contains(code, "ReadBytes()") {
 		t.Errorf("Bytes ReadLuxo should use ReadBytes:\n%s", code)
 	}
-	if !strings.Contains(code, "ReadBytesPtr()") {
-		t.Errorf("nullable Bytes ReadLuxo should use ReadBytesPtr:\n%s", code)
+	if !strings.Contains(code, "ReadBytesValuePtr()") {
+		t.Errorf("nullable Bytes ReadLuxo should preserve null versus empty bytes:\n%s", code)
 	}
 
 	// WriteColumnar checks
@@ -1145,6 +1185,36 @@ func TestGenerateScalarArrayFields(t *testing.T) {
 		if !strings.Contains(code, c) {
 			t.Errorf("generated code missing %q:\n%s", c, code)
 		}
+	}
+}
+
+func TestGenerateNestedModelListUsesCanonicalArrayHeader(t *testing.T) {
+	old := modelFieldIDs
+	defer func() { modelFieldIDs = old }()
+	SetModelFieldIDs(map[string]map[string]int{
+		"User": {"id": 1, "posts": 2},
+		"Post": {"id": 1},
+	})
+	result := &semantic.Result{Files: []*ast.File{{Models: []*ast.ModelDecl{
+		{
+			Name: "User",
+			Fields: []*ast.FieldDecl{
+				{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+				{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+			},
+		},
+		{Name: "Post", Fields: []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}}},
+	}}}}
+
+	code := string(generateWriteJSONFile(result, "app", nil))
+	if !strings.Contains(code, "codec.AppendArrayHeader(buf.B, len(u.Posts))") {
+		t.Fatalf("nested model list must use the canonical unsigned array header:\n%s", code)
+	}
+	if !strings.Contains(code, "_n := dec.ReadArrayLength()") {
+		t.Fatalf("nested model list must read the canonical unsigned array header:\n%s", code)
+	}
+	if strings.Contains(code, "codec.AppendSvarint(buf.B, int64(len(u.Posts)))") {
+		t.Fatalf("nested model list must not zigzag-encode its length:\n%s", code)
 	}
 }
 
@@ -1487,5 +1557,31 @@ func TestWriteLuxoArenaHeaderMaskedPath(t *testing.T) {
 	}
 	if !strings.Contains(code, "FieldMaskHas(mask, 3) && u.Bio != nil") {
 		t.Errorf("masked path should check mask + nil for nullable arena len:\n%s", code)
+	}
+}
+
+func TestGenerateWriteJSONExtendStubIncludesDeclaredPrimaryKey(t *testing.T) {
+	oldContext := globalEventCtx
+	oldFields := modelFieldIDs
+	defer func() {
+		globalEventCtx = oldContext
+		modelFieldIDs = oldFields
+	}()
+	globalEventCtx = &EventContext{
+		ModelIDField: map[string]string{"Product": "sku"},
+		ModelIDType:  map[string]string{"Product": "String"},
+	}
+	modelFieldIDs = map[string]map[string]int{"Product": {"sku": 7, "name": 8}}
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/review.luxo",
+		Extends: []*ast.ExtendDecl{{
+			Name:   "Product",
+			Fields: []*ast.FieldDecl{{Name: "name", Type: &ast.TypeRef{Name: "String"}}},
+		}},
+	}}}
+
+	code := string(generateWriteJSONFile(result, "app", nil))
+	if !strings.Contains(code, "case 7: p.Sku = dec.ReadStringArena") {
+		t.Fatalf("extend codec does not decode the declared primary key:\n%s", code)
 	}
 }

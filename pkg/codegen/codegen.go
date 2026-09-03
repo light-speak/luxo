@@ -141,6 +141,25 @@ func getEventFieldID(eventName, paramName string) int {
 type EventContext struct {
 	// EventModule maps event name → defining module name
 	EventModule map[string]string
+	// Events stores declarations needed when another module binds a stream.
+	Events map[string]*ast.EventDecl
+	// ModelModule maps model name → owning module name for cross-module RPC routing.
+	ModelModule map[string]string
+	// TypeModule and EnumModule track non-model wire type ownership.
+	TypeModule map[string]string
+	EnumModule map[string]string
+	// ModelIDType maps model name → Luxo type name of its id field.
+	ModelIDType map[string]string
+	// ModelIDField maps model name → schema-declared primary-key field name.
+	ModelIDField map[string]string
+	// ModelFields records fields declared by each model's owning module. Extend
+	// projections reuse these fields; only absent names are federation additions.
+	ModelFields map[string]map[string]bool
+	// remoteLoadCalls maps the owning module to named load patterns used by
+	// another module. The owner uses these to generate internal RPC endpoints.
+	remoteLoadCalls map[string][]loadCallInfo
+	// remotePKModels marks models referenced by cross-module extend declarations.
+	remotePKModels map[string]bool
 	// ModulePath is the Go module import path prefix (e.g., "github.com/luxo-studio/service")
 	ModulePath string
 }
@@ -148,16 +167,95 @@ type EventContext struct {
 // BuildEventContext scans all files to build the event → module mapping.
 func BuildEventContext(allFiles []*ast.File, modulePath string) *EventContext {
 	ctx := &EventContext{
-		EventModule: make(map[string]string),
-		ModulePath:  modulePath,
+		EventModule:     make(map[string]string),
+		Events:          make(map[string]*ast.EventDecl),
+		ModelModule:     make(map[string]string),
+		TypeModule:      make(map[string]string),
+		EnumModule:      make(map[string]string),
+		ModelIDType:     make(map[string]string),
+		ModelIDField:    make(map[string]string),
+		ModelFields:     make(map[string]map[string]bool),
+		remoteLoadCalls: make(map[string][]loadCallInfo),
+		remotePKModels:  make(map[string]bool),
+		ModulePath:      modulePath,
 	}
 	for _, file := range allFiles {
 		modName := moduleNameFromFile(file.Name)
+		for _, model := range file.Models {
+			ctx.ModelModule[model.Name] = modName
+			ctx.ModelIDType[model.Name] = modelIDTypeName(model)
+			ctx.ModelIDField[model.Name] = primaryKeyFieldName(model)
+			fields := make(map[string]bool, len(model.Fields))
+			for _, field := range model.Fields {
+				fields[field.Name] = true
+			}
+			ctx.ModelFields[model.Name] = fields
+		}
 		for _, ev := range file.Events {
 			ctx.EventModule[ev.Name] = modName
+			ctx.Events[ev.Name] = ev
+		}
+		for _, declaration := range file.Types {
+			ctx.TypeModule[declaration.Name] = modName
+		}
+		for _, enum := range file.Enums {
+			ctx.EnumModule[enum.Name] = modName
 		}
 	}
+	for _, file := range allFiles {
+		sourceModule := moduleNameFromFile(file.Name)
+		for _, ext := range file.Extends {
+			if owner := ctx.ModelModule[ext.Name]; owner != "" && owner != sourceModule {
+				ctx.remotePKModels[ext.Name] = true
+			}
+		}
+	}
+	seenLoads := make(map[string]bool)
+	for _, call := range collectLoadCalls(&semantic.Result{Files: allFiles}) {
+		if len(call.argNames) == 0 {
+			continue
+		}
+		owner := ctx.ModelModule[call.modelName]
+		if owner == "" || owner == call.sourceModule {
+			continue
+		}
+		key := loadServiceName(call)
+		if seenLoads[key] {
+			continue
+		}
+		seenLoads[key] = true
+		ctx.remoteLoadCalls[owner] = append(ctx.remoteLoadCalls[owner], call)
+	}
 	return ctx
+}
+
+func ownerModelHasField(modelName, fieldName string) bool {
+	return globalEventCtx != nil && globalEventCtx.ModelFields[modelName][fieldName]
+}
+
+func modelIDTypeName(model *ast.ModelDecl) string {
+	if field := primaryKeyField(model); field != nil {
+		return field.Type.Name
+	}
+	return "Int"
+}
+
+func externalModelIDFieldName(modelName string) string {
+	if globalEventCtx != nil {
+		if fieldName := globalEventCtx.ModelIDField[modelName]; fieldName != "" {
+			return fieldName
+		}
+	}
+	return "id"
+}
+
+func externalModelIDTypeName(modelName string) string {
+	if globalEventCtx != nil {
+		if typeName := globalEventCtx.ModelIDType[modelName]; typeName != "" {
+			return typeName
+		}
+	}
+	return "Int"
 }
 
 // Global event context — set before Generate calls for cross-module event support
@@ -302,6 +400,7 @@ func writeHeader(b *strings.Builder, packageName, sourceFile string) {
 // modelImportNeeds tracks which imports model.gen.go requires.
 type modelImportNeeds struct {
 	time    bool
+	json    bool
 	uuid    bool
 	decimal bool
 	hash    bool
@@ -310,7 +409,7 @@ type modelImportNeeds struct {
 
 // scanModelFieldImports checks a single field for import needs in model.gen.go.
 func scanModelFieldImports(f *ast.FieldDecl, needs *modelImportNeeds) {
-	if f.Computed != nil || f.Type == nil {
+	if f.Type == nil {
 		return
 	}
 	switch f.Type.Name {
@@ -320,6 +419,8 @@ func scanModelFieldImports(f *ast.FieldDecl, needs *modelImportNeeds) {
 		needs.uuid = true
 	case "Decimal":
 		needs.decimal = true
+	case "JSON":
+		needs.json = true
 	}
 }
 
@@ -347,9 +448,15 @@ func writeImports(b *strings.Builder, files []*ast.File) {
 				scanModelFieldImports(f, &needs)
 			}
 		}
+		for _, ext := range file.Extends {
+			switch externalModelIDTypeName(ext.Name) {
+			case "UUID":
+				needs.uuid = true
+			}
+		}
 	}
 
-	if !needs.time && !needs.uuid && !needs.decimal && !needs.hash && !needs.auth {
+	if !needs.time && !needs.json && !needs.uuid && !needs.decimal && !needs.hash && !needs.auth {
 		return
 	}
 
@@ -361,6 +468,9 @@ func writeImports(b *strings.Builder, files []*ast.File) {
 	}
 	if needs.time {
 		b.WriteString("\t\"time\"\n")
+	}
+	if needs.json {
+		b.WriteString("\t\"encoding/json\"\n")
 	}
 	// third-party group
 	if needs.uuid {
@@ -420,6 +530,7 @@ func generateDBFile(result *semantic.Result, packageName string, enums map[strin
 // dbImportNeeds tracks which imports db.gen.go requires.
 type dbImportNeeds struct {
 	time    bool
+	json    bool
 	uuid    bool
 	decimal bool
 }
@@ -454,6 +565,8 @@ func scanDBFieldImports(f *ast.FieldDecl, needs *dbImportNeeds) {
 		needs.uuid = true
 	case "Decimal":
 		needs.decimal = true
+	case "JSON":
+		needs.json = true
 	}
 }
 
@@ -551,7 +664,7 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 	}
 
 	hasEvents := appNeedsEvents(result)
-	hasNativeAPIs := len(collectNativeAPIs(result)) > 0
+	hasNativeAPIs := len(collectNativeAPIs(result)) > 0 || resultHasNativeStreams(result)
 
 	var b strings.Builder
 	writeHeader(&b, packageName, "app.gen.go")
@@ -642,6 +755,9 @@ func writeDBImports(b *strings.Builder, files []*ast.File) {
 
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
+	if needs.json {
+		b.WriteString("\t\"encoding/json\"\n")
+	}
 	if needs.time {
 		b.WriteString("\t\"time\"\n")
 	}
@@ -666,9 +782,10 @@ func generateExtendScanners(b *strings.Builder, files []*ast.File, modelNames ma
 				continue
 			}
 			seen[ext.Name] = true
-			fields := []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}}
+			idFieldName := externalModelIDFieldName(ext.Name)
+			fields := []*ast.FieldDecl{{Name: idFieldName, Type: &ast.TypeRef{Name: externalModelIDTypeName(ext.Name)}, Directives: []*ast.Directive{{Name: "id"}}}}
 			for _, f := range ext.Fields {
-				if f.Computed != nil || f.Type == nil || f.Type.IsList {
+				if f.Name == idFieldName || f.Computed != nil || f.Type == nil || f.Type.IsList {
 					continue
 				}
 				if isRelationType(f.Type.Name) {
@@ -688,7 +805,7 @@ func isRelationType(name string) bool {
 		return false
 	}
 	switch name {
-	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes":
+	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes", "JSON":
 		return false
 	}
 	return true

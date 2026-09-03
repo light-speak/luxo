@@ -1,6 +1,8 @@
 package codegen
 
 import (
+	"go/format"
+	"slices"
 	"strings"
 	"testing"
 
@@ -301,6 +303,52 @@ func TestAnalyzeRelationsSkipsComputed(t *testing.T) {
 	}
 }
 
+func TestAnalyzeRelationsUsesTargetPrimaryKeyName(t *testing.T) {
+	oldContext := globalEventCtx
+	defer func() { globalEventCtx = oldContext }()
+	globalEventCtx = &EventContext{
+		ModelIDType:  map[string]string{"Product": "String"},
+		ModelIDField: map[string]string{"Product": "sku"},
+	}
+
+	review := &ast.ModelDecl{
+		Name: "Review",
+		Fields: []*ast.FieldDecl{
+			{Name: "productSku", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "product", Type: &ast.TypeRef{Name: "Product"}},
+		},
+	}
+	relations := analyzeRelations(review, nil)
+	if len(relations) != 1 {
+		t.Fatalf("got %d relations, want 1", len(relations))
+	}
+	relation := relations[0]
+	if relation.Type != BelongsTo || relation.LocalKey != "productSku" || relation.RemoteKey != "sku" || relation.KeyGoType != "string" {
+		t.Fatalf("unexpected custom-primary-key relation: %+v", relation)
+	}
+}
+
+func TestAnalyzeRelationsByDefaultsToDeclaredPrimaryKey(t *testing.T) {
+	model := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "uuid", Type: &ast.TypeRef{Name: "UUID"}, Directives: []*ast.Directive{{Name: "id"}}},
+			{
+				Name: "posts",
+				Type: &ast.TypeRef{Name: "Post", IsList: true},
+				Directives: []*ast.Directive{{
+					Name: "by",
+					Args: []*ast.NamedArg{{Name: "remote", Value: &ast.Ident{Name: "authorId"}}},
+				}},
+			},
+		},
+	}
+	relations := analyzeRelations(model, nil)
+	if len(relations) != 1 || relations[0].LocalKey != "uuid" || relations[0].RemoteKey != "authorId" {
+		t.Fatalf("relation = %+v", relations)
+	}
+}
+
 func TestGenerateDataLoaderDedup(t *testing.T) {
 	// Two models with relations to the same target via the same key
 	// should deduplicate loader types
@@ -436,10 +484,7 @@ func TestGenerateDataLoaderWithLocalSoftModel(t *testing.T) {
 
 func TestDeduplicateLoadersSkipsDuplicate(t *testing.T) {
 	// Two relations that produce the same loader field name
-	allRelations := []struct {
-		modelName string
-		relations []Relation
-	}{
+	allRelations := []modelRelations{
 		{
 			modelName: "Post",
 			relations: []Relation{
@@ -464,10 +509,7 @@ func TestDeduplicateLoadersSkipsDuplicate(t *testing.T) {
 	}
 
 	// Test with actual duplicates: same model+field produces same loaderFieldName
-	dupRelations := []struct {
-		modelName string
-		relations []Relation
-	}{
+	dupRelations := []modelRelations{
 		{
 			modelName: "Post",
 			relations: []Relation{
@@ -704,6 +746,18 @@ func TestGenerateDataLoaderDefaultLoadersDedupSeenMap(t *testing.T) {
 // --- Extend DataLoader load-by-PK ---
 
 func TestGenerateDataLoaderExtendByPK(t *testing.T) {
+	oldContext := globalEventCtx
+	oldAPIs := apiIDs
+	oldFields := modelFieldIDs
+	defer func() {
+		globalEventCtx = oldContext
+		apiIDs = oldAPIs
+		modelFieldIDs = oldFields
+	}()
+	globalEventCtx = &EventContext{ModelModule: map[string]string{"User": "user"}}
+	apiIDs = map[string]int{"svc:batchLoad:User": 42}
+	modelFieldIDs = map[string]map[string]int{"User": {"id": 1, "phone": 2}}
+
 	result := &semantic.Result{
 		Files: []*ast.File{
 			{
@@ -767,6 +821,86 @@ func TestGenerateDataLoaderExtendByPK(t *testing.T) {
 	if !strings.Contains(code, "ExtendUserByIdLoader") {
 		t.Error("missing ExtendUserByIdLoader type")
 	}
+	if !strings.Contains(code, `client := rpcClients["user"]`) {
+		t.Errorf("remote loader must route by owning module:\n%s", code)
+	}
+	if !strings.Contains(code, "enc.WriteFieldIntArray(1, keys)") {
+		t.Errorf("remote loader must encode keys as one canonical list param:\n%s", code)
+	}
+	if !strings.Contains(code, `fields = ensureField(fields, "id")`) {
+		t.Errorf("extend loader must always select its map key:\n%s", code)
+	}
+	if !strings.Contains(code, `case "phone": fieldMask = codec.FieldMaskSet(fieldMask, 2)`) {
+		t.Errorf("remote loader must translate requested fields to the wire mask:\n%s", code)
+	}
+	if !strings.Contains(code, "client.CallWithMask(42, selectionMask, enc.Bytes())") {
+		t.Errorf("remote loader must forward its field selection:\n%s", code)
+	}
+}
+
+func TestGenerateDataLoaderExtendByUUID(t *testing.T) {
+	oldContext := globalEventCtx
+	oldAPIs := apiIDs
+	oldFields := modelFieldIDs
+	defer func() {
+		globalEventCtx = oldContext
+		apiIDs = oldAPIs
+		modelFieldIDs = oldFields
+	}()
+	globalEventCtx = &EventContext{
+		ModelModule: map[string]string{"Account": "identity"},
+		ModelIDType: map[string]string{"Account": "UUID"},
+	}
+	apiIDs = map[string]int{"svc:batchLoad:Account": 44}
+	modelFieldIDs = map[string]map[string]int{"Account": {"id": 1, "name": 2}}
+
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/order.luxo",
+		Extends: []*ast.ExtendDecl{{
+			Name: "Account",
+			Fields: []*ast.FieldDecl{{
+				Name: "name",
+				Type: &ast.TypeRef{Name: "String"},
+			}},
+		}},
+	}}}
+	code := string(generateDataLoaderFile(result, "order_luxo", nil, nil, DriverPG))
+
+	checks := []string{
+		`"github.com/google/uuid"`,
+		"ExtendAccount *dataloader.Loader[uuid.UUID, *Account]",
+		"keys []uuid.UUID",
+		`lux.NewUUIDField("id").In(keys...)`,
+		"rawKeys := make([][16]byte, len(keys))",
+		"enc.WriteFieldUUIDArray(1, rawKeys)",
+		`client := rpcClients["identity"]`,
+	}
+	for _, check := range checks {
+		if !strings.Contains(code, check) {
+			t.Errorf("UUID extend loader missing %q:\n%s", check, code)
+		}
+	}
+}
+
+func TestGenerateRemoteKeyEncodingString(t *testing.T) {
+	var b strings.Builder
+	generateRemoteKeyEncoding(&b, "String")
+	if got := b.String(); !strings.Contains(got, "enc.WriteFieldStringArray(1, keys)") {
+		t.Fatalf("string key encoding = %q", got)
+	}
+}
+
+func TestDataLoaderNeedsUUIDFromRelationsAndCalls(t *testing.T) {
+	relationGroups := []modelRelations{{relations: []Relation{{KeyGoType: "uuid.UUID"}}}}
+	if !dataLoaderNeedsUUID(relationGroups, nil, nil) {
+		t.Fatal("UUID relation did not request the UUID import")
+	}
+	if !dataLoaderNeedsUUID(nil, nil, []loadCallInfo{{argTypes: []string{"string", "uuid.UUID"}}}) {
+		t.Fatal("UUID load key did not request the UUID import")
+	}
+	if dataLoaderNeedsUUID(nil, nil, []loadCallInfo{{argTypes: []string{"string"}}}) {
+		t.Fatal("non-UUID loader requested the UUID import")
+	}
 }
 
 func TestGenerateDataLoaderFKLoad(t *testing.T) {
@@ -813,6 +947,151 @@ func TestGenerateDataLoaderFKLoad(t *testing.T) {
 	// Should have batch function with user_id condition
 	if !strings.Contains(code, `"user_id"`) {
 		t.Error("missing user_id FK condition")
+	}
+}
+
+func TestGenerateDataLoaderRemoteNamedLoad(t *testing.T) {
+	oldContext := globalEventCtx
+	oldAPIs := apiIDs
+	oldParams := apiParamIDs
+	oldFields := modelFieldIDs
+	defer func() {
+		globalEventCtx = oldContext
+		apiIDs = oldAPIs
+		apiParamIDs = oldParams
+		modelFieldIDs = oldFields
+	}()
+	globalEventCtx = &EventContext{ModelModule: map[string]string{"User": "user"}}
+	apiIDs = map[string]int{"svc:load:User:email": 71}
+	apiParamIDs = map[string]map[string]int{"svc:load:User:email": {"email": 1}}
+	modelFieldIDs = map[string]map[string]int{"User": {"id": 1, "email": 2, "name": 3}}
+
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/post.luxo",
+		Extends: []*ast.ExtendDecl{{
+			Name: "User",
+			Fields: []*ast.FieldDecl{
+				{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+				{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			},
+		}},
+		APIs: []*ast.ApiDecl{{
+			Name: "findAuthors",
+			Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
+				Args: []*ast.NamedArg{{Name: "email", Value: &ast.Ident{Name: "email"}}},
+			}}}},
+		}},
+	}}}
+
+	code := string(generateDataLoaderFile(result, "post_luxo", nil, nil, DriverPG))
+	if _, err := format.Source([]byte(code)); err != nil {
+		t.Fatalf("remote named loader generated invalid Go: %v\n%s", err, code)
+	}
+	checks := []string{
+		`client := rpcClients["user"]`,
+		"enc.WriteFieldStringArray(1, keys)",
+		"client.CallWithMask(71, selectionMask, enc.Bytes())",
+		`case "email": fieldMask = codec.FieldMaskSet(fieldMask, 2)`,
+		`case "name": fieldMask = codec.FieldMaskSet(fieldMask, 3)`,
+		"groupCount != uint64(len(keys))",
+		"codec.ReadBytes(resp, off)",
+	}
+	for _, check := range checks {
+		if !strings.Contains(code, check) {
+			t.Errorf("remote named loader missing %q:\n%s", check, code)
+		}
+	}
+	if strings.Contains(code, `case "password":`) {
+		t.Errorf("remote mask exposed a field absent from extend:\n%s", code)
+	}
+}
+
+func TestGenerateRemoteCompositeNamedLoad(t *testing.T) {
+	oldContext := globalEventCtx
+	oldAPIs := apiIDs
+	oldParams := apiParamIDs
+	oldFields := modelFieldIDs
+	defer func() {
+		globalEventCtx = oldContext
+		apiIDs = oldAPIs
+		apiParamIDs = oldParams
+		modelFieldIDs = oldFields
+	}()
+	globalEventCtx = &EventContext{ModelModule: map[string]string{"Post": "post", "User": "user"}}
+	apiIDs = map[string]int{"svc:load:Post:tenantId:slug": 72}
+	apiParamIDs = map[string]map[string]int{
+		"svc:load:Post:tenantId:slug": {"tenantId": 1, "slug": 2},
+	}
+	modelFieldIDs = map[string]map[string]int{"Post": {"id": 1, "title": 2, "secret": 3}}
+	call := loadCallInfo{
+		modelName:    "Post",
+		sourceModule: "feed",
+		argNames:     []string{"tenantId", "slug"},
+		argTypes:     []string{"int64", "string"},
+		argTypeNames: []string{"Int", "String"},
+	}
+	var b strings.Builder
+	generateRemoteNamedLoadBatchFunc(&b, call, []string{"id", "title"})
+	out := b.String()
+	for _, want := range []string{
+		"keys []PostByTenantIdAndSlugKey",
+		"tenantIdKeys := make([]int64, len(keys))",
+		"slugKeys := make([]string, len(keys))",
+		"tenantIdKeys[i] = key.TenantId",
+		"enc.WriteFieldIntArray(1, tenantIdKeys)",
+		"enc.WriteFieldStringArray(2, slugKeys)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("remote composite loader missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, `case "secret":`) {
+		t.Fatalf("remote field mask exposed hidden field:\n%s", out)
+	}
+}
+
+func TestGenerateRemoteArrayEncodingUUID(t *testing.T) {
+	var b strings.Builder
+	generateRemoteArrayEncoding(&b, 7, "UUID", "keys")
+	out := b.String()
+	for _, want := range []string{
+		"keysRaw := make([][16]byte, len(keys))",
+		"for i, key := range keys { keysRaw[i] = [16]byte(key) }",
+		"enc.WriteFieldUUIDArray(7, keysRaw)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("UUID array encoding missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestGenerateRemoteLoadersKeepsLocalNamedLoadsLocal(t *testing.T) {
+	oldContext := globalEventCtx
+	defer func() { globalEventCtx = oldContext }()
+	globalEventCtx = &EventContext{ModelModule: map[string]string{"Post": "post"}}
+	call := loadCallInfo{
+		modelName:    "Post",
+		sourceModule: "post",
+		argNames:     []string{"slug"},
+		argTypes:     []string{"string"},
+		argTypeNames: []string{"String"},
+	}
+	var b strings.Builder
+	result := &semantic.Result{Files: []*ast.File{{Extends: []*ast.ExtendDecl{{Name: "User"}}}}}
+	generateRemoteLoaders(&b, result, nil, nil, []string{"User"}, []loadCallInfo{call})
+	if out := b.String(); !strings.Contains(out, `lux.NewStringField("slug").In(keys...)`) {
+		t.Fatalf("local named load did not use the database batch function:\n%s", out)
+	}
+}
+
+func TestExternalModelFieldNamesSkipsOtherExtensions(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{Extends: []*ast.ExtendDecl{
+		{Name: "Account", Fields: []*ast.FieldDecl{{Name: "name", Type: &ast.TypeRef{Name: "String"}}}},
+		{Name: "User", Fields: []*ast.FieldDecl{{Name: "email", Type: &ast.TypeRef{Name: "String"}}}},
+	}}}}
+	if got := externalModelFieldNames(result, "User"); !slices.Equal(got, []string{"id", "email"}) {
+		t.Fatalf("external fields = %v", got)
 	}
 }
 
@@ -872,11 +1151,14 @@ func TestGenerateDataLoaderCompositeKeyLoad(t *testing.T) {
 	if !strings.Contains(code, "Type string") {
 		t.Errorf("composite key 'type' field should be string, not int64:\n%s", code)
 	}
-	if !strings.Contains(code, `lux.NewStringField("type")`) {
+	if !strings.Contains(code, `lux.NewStringField("type").Eq(k.Type)`) {
 		t.Errorf("composite key 'type' condition should use NewStringField:\n%s", code)
 	}
-	if !strings.Contains(code, "typeSet := make(map[string]bool") {
-		t.Errorf("composite key 'type' dedup set should be map[string]:\n%s", code)
+	if !strings.Contains(code, "groups[i] = lux.AllOf(") || !strings.Contains(code, "lux.AnyOf(groups...)") {
+		t.Errorf("composite load must preserve exact key tuples:\n%s", code)
+	}
+	if strings.Contains(code, "typeSet :=") || strings.Contains(code, ".In(typeKeys...)") {
+		t.Errorf("composite load must not query the cross product of key columns:\n%s", code)
 	}
 }
 

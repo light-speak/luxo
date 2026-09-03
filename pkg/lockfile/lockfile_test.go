@@ -243,7 +243,7 @@ func TestUpdateModelRemovedEntirely(t *testing.T) {
 	}
 }
 
-func TestUpdateComputedFieldsSkipped(t *testing.T) {
+func TestUpdateComputedFieldsReceiveStableIDs(t *testing.T) {
 	lf := New()
 	f := files(
 		[]*ast.ModelDecl{model("Post",
@@ -256,11 +256,11 @@ func TestUpdateComputedFieldsSkipped(t *testing.T) {
 	lf.Update(f)
 
 	ml := lf.Models["Post"]
-	if _, ok := ml.Fields["totalLikes"]; ok {
-		t.Error("Computed fields should not get IDs")
+	if ml.Fields["totalLikes"] != 2 {
+		t.Errorf("computed field ID = %d, want 2", ml.Fields["totalLikes"])
 	}
-	if ml.NextID != 2 {
-		t.Errorf("NextID = %d, want 2", ml.NextID)
+	if ml.NextID != 3 {
+		t.Errorf("NextID = %d, want 3", ml.NextID)
 	}
 }
 
@@ -741,6 +741,33 @@ func TestUpdateAPIsWithCrud(t *testing.T) {
 	}
 }
 
+func TestUpdateAPIsWithCrudUsesOnlyHandlerParams(t *testing.T) {
+	lf := New()
+	relation := field("author", "User")
+	autoID := field("id", "UUID")
+	autoID.Directives = []*ast.Directive{{Pos: pos(), Name: "auto"}}
+	internal := field("secret", "String")
+	internal.Directives = []*ast.Directive{{Pos: pos(), Name: "internal"}}
+	immutable := field("slug", "String")
+	immutable.Directives = []*ast.Directive{{Pos: pos(), Name: "immutable"}}
+	m := model("Post", autoID, field("title", "String"), immutable, internal, relation)
+	m.Directives = []*ast.Directive{{Pos: pos(), Name: "crud"}}
+
+	lf.Update([]*ast.File{{
+		Name:   "test.luxo",
+		Models: []*ast.ModelDecl{m, model("User", field("id", "UUID"))},
+	}})
+
+	create := lf.APIs["createPost"].Params
+	update := lf.APIs["updatePost"].Params
+	if len(create) != 2 || create["title"] == 0 || create["slug"] == 0 {
+		t.Fatalf("create params = %v", create)
+	}
+	if len(update) != 2 || update["id"] == 0 || update["title"] == 0 {
+		t.Fatalf("update params = %v", update)
+	}
+}
+
 func TestUpdateAPIsWithParams(t *testing.T) {
 	lf := New()
 	ff := []*ast.File{{
@@ -819,10 +846,10 @@ func TestCollectFieldNames(t *testing.T) {
 	)
 
 	names := collectFieldNames(m)
-	if len(names) != 2 {
-		t.Fatalf("expected 2 names, got %d: %v", len(names), names)
+	if len(names) != 3 {
+		t.Fatalf("expected 3 names, got %d: %v", len(names), names)
 	}
-	if names[0] != "id" || names[1] != "name" {
+	if names[0] != "id" || names[1] != "name" || names[2] != "fullName" {
 		t.Errorf("names = %v", names)
 	}
 }
@@ -942,7 +969,7 @@ func TestUpdateExtendsIdempotent(t *testing.T) {
 	}
 }
 
-func TestUpdateExtendsComputedSkipped(t *testing.T) {
+func TestUpdateExtendsComputedReceivesStableID(t *testing.T) {
 	lf := New()
 	ff := []*ast.File{
 		{
@@ -962,8 +989,8 @@ func TestUpdateExtendsComputedSkipped(t *testing.T) {
 
 	lf.Update(ff)
 	ml := lf.Models["User"]
-	if _, ok := ml.Fields["postCount"]; ok {
-		t.Error("computed extend field should not get ID")
+	if ml.Fields["postCount"] == 0 {
+		t.Error("computed extend field should get ID")
 	}
 	if ml.Fields["posts"] == 0 {
 		t.Error("non-computed extend field should get ID")
@@ -1150,5 +1177,161 @@ func TestUpdateTypesNilTypesMap(t *testing.T) {
 	}
 	if _, ok := lf.Types["Token"]; !ok {
 		t.Fatal("missing Token type")
+	}
+}
+
+func TestUpdateAPIsIncludesInternalClusterEndpoints(t *testing.T) {
+	lf := New()
+	user := model("User", field("id", "Int"))
+	user.Directives = []*ast.Directive{{Name: "crud"}}
+	post := model("Post", field("id", "Int"), field("userId", "Int"))
+	post.Directives = []*ast.Directive{{Name: "crud"}}
+	allFiles := []*ast.File{
+		{Name: "origin/user.luxo", Models: []*ast.ModelDecl{user}},
+		{
+			Name:   "origin/post.luxo",
+			Models: []*ast.ModelDecl{post},
+			Extends: []*ast.ExtendDecl{{
+				Name: "User",
+				Fields: []*ast.FieldDecl{{
+					Name: "posts",
+					Type: &ast.TypeRef{Name: "Post", IsList: true},
+				}},
+			}},
+		},
+	}
+
+	lf.updateAPIs(allFiles)
+	for _, name := range []string{"svc:batchLoad:User", "svc:batchLoad:Post", "svc:resolve:Post:userId"} {
+		entry := lf.APIs[name]
+		if entry == nil {
+			t.Fatalf("missing internal API %s", name)
+		}
+		if entry.Params["keys"] != 1 {
+			t.Errorf("%s keys field ID = %d, want 1", name, entry.Params["keys"])
+		}
+	}
+}
+
+func TestUpdateAPIsIncludesNamedLoadEndpoint(t *testing.T) {
+	lf := New()
+	files := []*ast.File{{
+		Name: "origin/post.luxo",
+		APIs: []*ast.ApiDecl{{
+			Name: "findAuthors",
+			Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
+				Args: []*ast.NamedArg{
+					{Name: "tenantId", Value: &ast.Ident{Name: "tenantId"}},
+					{Name: "email", Value: &ast.Ident{Name: "email"}},
+				},
+			}}}},
+		}},
+	}}
+
+	lf.updateAPIs(files)
+	entry := lf.APIs["svc:load:User:tenantId:email"]
+	if entry == nil {
+		t.Fatal("missing named load endpoint")
+	}
+	if entry.Params["tenantId"] != 1 || entry.Params["email"] != 2 {
+		t.Fatalf("named load param IDs = %v", entry.Params)
+	}
+}
+
+func TestFederationForeignKey(t *testing.T) {
+	listField := &ast.FieldDecl{Type: &ast.TypeRef{Name: "Post", IsList: true}}
+	if got := federationForeignKey("User", "id", listField); got != "userId" {
+		t.Fatalf("list foreign key = %q", got)
+	}
+	if got := federationForeignKey("User", "id", &ast.FieldDecl{Type: &ast.TypeRef{Name: "Profile"}}); got != "id" {
+		t.Fatalf("single foreign key = %q", got)
+	}
+	explicit := &ast.FieldDecl{
+		Type: &ast.TypeRef{Name: "Post", IsList: true},
+		Directives: []*ast.Directive{{
+			Name: "by",
+			Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "authorId"}}},
+		}},
+	}
+	if got := federationForeignKey("User", "id", explicit); got != "authorId" {
+		t.Fatalf("explicit foreign key = %q", got)
+	}
+	invalidExplicit := &ast.FieldDecl{
+		Type:       &ast.TypeRef{Name: "Post", IsList: true},
+		Directives: []*ast.Directive{{Name: "by", Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.String, Value: "authorId"}}}}},
+	}
+	if got := federationForeignKey("User", "id", invalidExplicit); got != "userId" {
+		t.Fatalf("invalid explicit foreign key fallback = %q", got)
+	}
+	if got := lowerFirst(""); got != "" {
+		t.Fatalf("lowerFirst(empty) = %q", got)
+	}
+}
+
+func TestInternalAPIHelperBoundaries(t *testing.T) {
+	service := &ast.FnDecl{
+		Name:       "syncUser",
+		Directives: []*ast.Directive{{Name: "deprecated"}, {Name: "service"}},
+		Params:     []*ast.ParamDecl{{Name: "id"}},
+	}
+	regular := &ast.FnDecl{Name: "localOnly"}
+	lf := New()
+	lf.updateAPIs([]*ast.File{{Functions: []*ast.FnDecl{service, regular}}})
+	if entry := lf.APIs["svc:syncUser"]; entry == nil || entry.Params["id"] != 1 {
+		t.Fatalf("service API = %#v", entry)
+	}
+	if lf.APIs["svc:localOnly"] != nil || !hasServiceDirective(service) || hasServiceDirective(regular) {
+		t.Fatal("service directive detection failed")
+	}
+
+	if namedLoadArgNames([]*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}}) != nil {
+		t.Fatal("positional load arguments were accepted")
+	}
+	if got := modelPrimaryKeyName(&ast.ModelDecl{Fields: []*ast.FieldDecl{{Name: "key", Directives: []*ast.Directive{{Name: "id"}}}}}); got != "key" {
+		t.Fatalf("directed primary key = %q", got)
+	}
+	if got := modelPrimaryKeyName(&ast.ModelDecl{Fields: []*ast.FieldDecl{{Name: "id"}}}); got != "id" {
+		t.Fatalf("conventional primary key = %q", got)
+	}
+	if got := modelPrimaryKeyName(&ast.ModelDecl{}); got != "id" {
+		t.Fatalf("fallback primary key = %q", got)
+	}
+	listField := &ast.FieldDecl{Type: &ast.TypeRef{Name: "Post", IsList: true}}
+	if got := federationForeignKey("User", "", listField); got != "userId" {
+		t.Fatalf("empty primary-key fallback = %q", got)
+	}
+	if upperFirst("") != "" || upperFirst("über") != "Über" || lowerFirst("Üser") != "üser" {
+		t.Fatal("identifier case conversion failed")
+	}
+}
+
+func TestNamedLoadDiscoveryRejectsInvalidCallsAndDeduplicates(t *testing.T) {
+	validCall := func() ast.Expr {
+		return &ast.CallExpr{
+			Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
+			Args: []*ast.NamedArg{{Name: "email", Value: &ast.Ident{Name: "email"}}},
+		}
+	}
+	invalid := []ast.Expr{
+		&ast.Literal{},
+		&ast.CallExpr{Func: &ast.Ident{Name: "load"}},
+		&ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "find"}},
+		&ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Literal{}, Field: "load"}},
+		&ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{}, Field: "load"}},
+		&ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"}, Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}}},
+	}
+	statements := make([]ast.Stmt, 0, len(invalid)+2)
+	for _, expr := range invalid {
+		statements = append(statements, &ast.ExprStmt{Expr: expr})
+	}
+	statements = append(statements, &ast.ExprStmt{Expr: validCall()}, &ast.ExprStmt{Expr: validCall()})
+	lf := New()
+	lf.updateNamedLoadAPIs([]*ast.File{
+		{APIs: []*ast.ApiDecl{{Body: &ast.Block{Stmts: statements}}}},
+		{Functions: []*ast.FnDecl{{Body: &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: validCall()}}}}}},
+	})
+	if len(lf.APIs) != 1 || lf.APIs["svc:load:User:email"] == nil {
+		t.Fatalf("named load APIs = %#v", lf.APIs)
 	}
 }

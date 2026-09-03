@@ -1,7 +1,5 @@
 .gradle/
+.kotlin/
 build/
-gradle/
-gradlew
-gradlew.bat
 *.iml
 .idea/

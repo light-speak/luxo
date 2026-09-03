@@ -21,6 +21,9 @@ type moduleInfo struct {
 	hasSchema     bool // has models or APIs (generates RegisterSchema)
 	hasAPI        bool // has non-CRUD API declarations (needs RegisterHandlers wiring even without @crud)
 	hasStreams    bool
+	nativeStreams []string
+	hasBatchRPC   bool // owns a model exposed through an internal batch endpoint
+	hasRemoteLoad bool // owns named load endpoints used by another module
 }
 
 func collectModules(result *semantic.Result) []moduleInfo {
@@ -28,6 +31,7 @@ func collectModules(result *semantic.Result) []moduleInfo {
 
 	// Group files by module name (directory or single file)
 	grouped := make(map[string]*moduleInfo)
+	modelOwners := make(map[string]string)
 	var order []string
 	for _, file := range result.Files {
 		modName := moduleNameFromFile(file.Name)
@@ -35,42 +39,22 @@ func collectModules(result *semantic.Result) []moduleInfo {
 			grouped[modName] = &moduleInfo{name: modName}
 			order = append(order, modName)
 		}
-		info := grouped[modName]
-		for _, m := range file.Models {
-			if hasDirective(m.Directives, "crud") {
-				info.hasCrud = true
-			}
-			if len(analyzeRelations(m, enums)) > 0 {
-				info.hasLoaders = true
-			}
-		}
-		// Extend declarations need DataLoaders (cross-module load)
-		if len(file.Extends) > 0 {
-			info.hasLoaders = true
-			info.hasExtend = true
-		}
-		if len(file.Events) > 0 || len(file.Listeners) > 0 {
-			info.hasEvents = true
-		}
-		if fileEmitsEvents(file) {
-			info.emitsEvents = true
-		}
-		if len(file.Models) > 0 || len(file.APIs) > 0 {
-			info.hasSchema = true
-		}
-		if len(file.APIs) > 0 {
-			info.hasAPI = true
-		}
-		for _, api := range file.APIs {
-			if hasDirective(api.Directives, "stream") {
-				info.hasStreams = true
+		collectModuleFileInfo(grouped[modName], file, modName, enums, modelOwners)
+	}
+	for _, file := range result.Files {
+		sourceModule := moduleNameFromFile(file.Name)
+		for _, ext := range file.Extends {
+			if owner := modelOwners[ext.Name]; owner != "" && owner != sourceModule {
+				grouped[owner].hasBatchRPC = true
 			}
 		}
-		for _, fn := range file.Functions {
-			if hasDirective(fn.Directives, "service") {
-				info.hasServiceFns = true
-				break
-			}
+	}
+	for _, call := range collectLoadCalls(result) {
+		if len(call.argNames) == 0 {
+			continue
+		}
+		if owner := modelOwners[call.modelName]; owner != "" && owner != call.sourceModule {
+			grouped[owner].hasRemoteLoad = true
 		}
 	}
 
@@ -79,6 +63,52 @@ func collectModules(result *semantic.Result) []moduleInfo {
 		modules = append(modules, *grouped[name])
 	}
 	return modules
+}
+
+func collectModuleFileInfo(info *moduleInfo, file *ast.File, moduleName string, enums map[string]bool, modelOwners map[string]string) {
+	for _, model := range file.Models {
+		modelOwners[model.Name] = moduleName
+		if hasDirective(model.Directives, "crud") {
+			info.hasCrud = true
+			info.hasBatchRPC = true
+		}
+		if len(analyzeRelations(model, enums)) > 0 {
+			info.hasLoaders = true
+		}
+	}
+	if len(file.Extends) > 0 {
+		info.hasLoaders = true
+		info.hasExtend = true
+	}
+	info.hasEvents = info.hasEvents || len(file.Events) > 0 || len(file.Listeners) > 0
+	info.emitsEvents = info.emitsEvents || fileEmitsEvents(file)
+	info.hasSchema = info.hasSchema || len(file.Models) > 0 || len(file.APIs) > 0
+	info.hasAPI = info.hasAPI || len(file.APIs) > 0
+	info.hasStreams = info.hasStreams || apisHaveDirective(file.APIs, "stream")
+	for _, api := range file.APIs {
+		if hasDirective(api.Directives, "stream") && hasDirective(api.Directives, "native") {
+			info.nativeStreams = append(info.nativeStreams, api.Name)
+		}
+	}
+	info.hasServiceFns = info.hasServiceFns || functionsHaveDirective(file.Functions, "service")
+}
+
+func apisHaveDirective(apis []*ast.ApiDecl, name string) bool {
+	for _, api := range apis {
+		if hasDirective(api.Directives, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func functionsHaveDirective(functions []*ast.FnDecl, name string) bool {
+	for _, function := range functions {
+		if hasDirective(function.Directives, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func fileEmitsEvents(file *ast.File) bool {
@@ -127,27 +157,8 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t\"fmt\"\n")
 	b.WriteString("\t\"os\"\n\n")
 
-	// Import each module's luxo package
-	for _, m := range modules {
-		fmt.Fprintf(&b, "\t%s_luxo \"%s/service/%s/luxo\"\n", m.name, modulePath, m.name)
-	}
-
-	// Import each module's resolver package
-	for _, m := range modules {
-		fmt.Fprintf(&b, "\t%s_resolver \"%s/service/%s/resolver\"\n", m.name, modulePath, m.name)
-	}
-
-	// Check if any module has events or service fns
-	anyEvents := false
-	anyServiceFns := false
-	for _, m := range modules {
-		if m.hasEvents || m.emitsEvents || m.hasStreams {
-			anyEvents = true
-		}
-		if m.hasServiceFns {
-			anyServiceFns = true
-		}
-	}
+	writeEntryModuleImports(&b, modules, modulePath)
+	anyEvents, anyServiceFns := entryCapabilities(modules)
 
 	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/dataloader\"\n")
@@ -197,68 +208,7 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 	}
 	writeQueueWiring(&b, modules)
 
-	// Create Luvia gateway
-	b.WriteString("\tgw := luvia.New()\n\n")
-
-	// Register schema for Binary↔JSON conversion (skip event-only modules)
-	for _, m := range modules {
-		if m.hasSchema {
-			fmt.Fprintf(&b, "\t%s_luxo.RegisterSchema(gw.Router.Schema)\n", m.name)
-		}
-	}
-	b.WriteString("\n")
-
-	// Register modules and handlers
-	for _, m := range modules {
-		fmt.Fprintf(&b, "\tgw.AddModule(%q)\n", m.name)
-		// handler.gen.go generates RegisterHandlers whenever the module has
-		// any handler binding — i.e. @crud models OR plain api declarations.
-		// A "pure model, no @crud, no API" module produces no RegisterHandlers
-		// function, so we must mirror that condition here exactly. Using
-		// hasCrud alone (the old condition) drops modules with only non-CRUD
-		// APIs (e.g. schema introspection) and clients see "unknown API ID".
-		if m.hasCrud || m.hasAPI {
-			fmt.Fprintf(&b, "\t%s_luxo.RegisterHandlers(gw.Router, %sApp)\n", m.name, m.name)
-		}
-		if m.hasStreams {
-			fmt.Fprintf(&b, "\t%s_luxo.RegisterStreams(gw.Router, eventBus)\n", m.name)
-		}
-	}
-
-	// Register service fns + batch loaders + federation resolvers + RPC server
-	hasCrudModules := false
-	for _, m := range modules {
-		if m.hasCrud {
-			hasCrudModules = true
-			break
-		}
-	}
-	if anyServiceFns || hasCrudModules {
-		b.WriteString("\t// RPC endpoints — registered on router for both embedded and cluster modes\n")
-		for _, m := range modules {
-			if m.hasServiceFns {
-				fmt.Fprintf(&b, "\t%s_luxo.RegisterServiceFns(gw.Router, %sApp)\n", m.name, m.name)
-			}
-		}
-		for _, m := range modules {
-			if m.hasCrud {
-				fmt.Fprintf(&b, "\t%s_luxo.RegisterBatchLoaders(gw.Router, %sApp)\n", m.name, m.name)
-				fmt.Fprintf(&b, "\t%s_luxo.RegisterFederationResolvers(gw.Router, %sApp)\n", m.name, m.name)
-			}
-		}
-		b.WriteString("\n")
-		b.WriteString("\t// RPC server — only in cluster mode (other services call via Luxo protocol)\n")
-		b.WriteString("\tif deployMode == \"cluster\" {\n")
-		b.WriteString("\t\trpcServer := rpc.NewServer(gw.Router)\n")
-		b.WriteString("\t\tgo func() {\n")
-		b.WriteString("\t\t\trpcAddr := \":\" + env.GetOrDefault(\"LUXO_PORT\", \"9000\")\n")
-		b.WriteString("\t\t\tif err := rpcServer.ListenAndServe(rpcAddr); err != nil {\n")
-		b.WriteString("\t\t\t\tfmt.Fprintf(os.Stderr, \"rpc: %v\\n\", err)\n")
-		b.WriteString("\t\t\t}\n")
-		b.WriteString("\t\t}()\n")
-		b.WriteString("\t\tdefer rpcServer.Close()\n")
-		b.WriteString("\t}\n\n")
-	}
+	writeEmbeddedGatewayWiring(&b, modules, anyServiceFns)
 
 	// Start HTTP server
 	b.WriteString("\tif err := gw.Serve(Version); err != nil {\n")
@@ -268,6 +218,86 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("}\n")
 
 	return formatGenerated([]byte(b.String()))
+}
+
+func writeEntryModuleImports(b *strings.Builder, modules []moduleInfo, modulePath string) {
+	for _, module := range modules {
+		fmt.Fprintf(b, "\t%s_luxo \"%s/service/%s/luxo\"\n", module.name, modulePath, module.name)
+	}
+	for _, module := range modules {
+		fmt.Fprintf(b, "\t%s_resolver \"%s/service/%s/resolver\"\n", module.name, modulePath, module.name)
+	}
+}
+
+func entryCapabilities(modules []moduleInfo) (hasEvents, hasServiceFunctions bool) {
+	for _, module := range modules {
+		hasEvents = hasEvents || module.hasEvents || module.emitsEvents || module.hasStreams
+		hasServiceFunctions = hasServiceFunctions || module.hasServiceFns
+	}
+	return hasEvents, hasServiceFunctions
+}
+
+func writeEmbeddedGatewayWiring(b *strings.Builder, modules []moduleInfo, hasServiceFunctions bool) {
+	b.WriteString("\tgw := luvia.New()\n\n")
+	for _, module := range modules {
+		if module.hasSchema {
+			fmt.Fprintf(b, "\t%s_luxo.RegisterSchema(gw.Router.Schema)\n", module.name)
+		}
+	}
+	b.WriteString("\n")
+	for _, module := range modules {
+		fmt.Fprintf(b, "\tgw.AddModule(%q)\n", module.name)
+		if module.hasCrud || module.hasAPI {
+			fmt.Fprintf(b, "\t%s_luxo.RegisterHandlers(gw.Router, %sApp)\n", module.name, module.name)
+		}
+		if module.hasStreams {
+			resolver := "nil"
+			if len(module.nativeStreams) > 0 {
+				resolver = module.name + "App.Resolver"
+			}
+			fmt.Fprintf(b, "\t%s_luxo.RegisterStreams(gw.Router, eventBus, %s)\n", module.name, resolver)
+		}
+	}
+	writeEmbeddedRPCWiring(b, modules, hasServiceFunctions)
+}
+
+func writeEmbeddedRPCWiring(b *strings.Builder, modules []moduleInfo, hasServiceFunctions bool) {
+	hasEndpoints := hasServiceFunctions
+	for _, module := range modules {
+		hasEndpoints = hasEndpoints || module.hasBatchRPC || module.hasRemoteLoad
+	}
+	if !hasEndpoints {
+		return
+	}
+	b.WriteString("\t// RPC endpoints — registered on router for both embedded and cluster modes\n")
+	for _, module := range modules {
+		if module.hasServiceFns {
+			fmt.Fprintf(b, "\t%s_luxo.RegisterServiceFns(gw.Router, %sApp)\n", module.name, module.name)
+		}
+	}
+	for _, module := range modules {
+		if module.hasBatchRPC {
+			fmt.Fprintf(b, "\t%s_luxo.RegisterBatchLoaders(gw.Router, %sApp)\n", module.name, module.name)
+		}
+		if module.hasRemoteLoad {
+			fmt.Fprintf(b, "\t%s_luxo.RegisterRemoteLoaders(gw.Router, %sApp)\n", module.name, module.name)
+		}
+		if module.hasCrud {
+			fmt.Fprintf(b, "\t%s_luxo.RegisterFederationResolvers(gw.Router, %sApp)\n", module.name, module.name)
+		}
+	}
+	b.WriteString("\n")
+	b.WriteString("\t// RPC server — only in cluster mode (other services call via Luxo protocol)\n")
+	b.WriteString("\tif deployMode == \"cluster\" {\n")
+	b.WriteString("\t\trpcServer := rpc.NewServer(gw.Router)\n")
+	b.WriteString("\t\tgo func() {\n")
+	b.WriteString("\t\t\trpcAddr := \":\" + env.GetOrDefault(\"LUXO_PORT\", \"9000\")\n")
+	b.WriteString("\t\t\tif err := rpcServer.ListenAndServe(rpcAddr); err != nil {\n")
+	b.WriteString("\t\t\t\tfmt.Fprintf(os.Stderr, \"rpc: %v\\n\", err)\n")
+	b.WriteString("\t\t\t}\n")
+	b.WriteString("\t\t}()\n")
+	b.WriteString("\t\tdefer rpcServer.Close()\n")
+	b.WriteString("\t}\n\n")
 }
 
 func writeModuleApps(b *strings.Builder, modules []moduleInfo) {
@@ -481,10 +511,12 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 	}
 
 	// Events
-	if target.hasEvents || target.emitsEvents {
+	if target.hasEvents || target.emitsEvents || target.hasStreams {
 		b.WriteString("\teventBus := event.NewFromEnv()\n")
 		b.WriteString("\tdefer eventBus.Close()\n")
-		b.WriteString("\tapp.EventBus = eventBus\n")
+		if target.hasEvents || target.emitsEvents {
+			b.WriteString("\tapp.EventBus = eventBus\n")
+		}
 		if target.hasEvents {
 			fmt.Fprintf(&b, "\t%s_luxo.RegisterEvents(eventBus, app)\n", target.name)
 		}
@@ -499,16 +531,26 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 	// Gateway + handlers
 	b.WriteString("\tgw := luvia.New()\n")
 	fmt.Fprintf(&b, "\tgw.AddModule(%q)\n", target.name)
+	if target.hasSchema {
+		fmt.Fprintf(&b, "\t%s_luxo.RegisterSchema(gw.Router.Schema)\n", target.name)
+	}
 	// Same rationale as in the embedded entry: RegisterHandlers must follow
 	// handler.gen.go's own trigger (@crud OR non-CRUD APIs), not hasCrud alone.
 	if target.hasCrud || target.hasAPI {
 		fmt.Fprintf(&b, "\t%s_luxo.RegisterHandlers(gw.Router, app)\n", target.name)
 	}
 	if target.hasStreams {
-		fmt.Fprintf(&b, "\t%s_luxo.RegisterStreams(gw.Router, eventBus)\n", target.name)
+		resolver := "nil"
+		if len(target.nativeStreams) > 0 {
+			resolver = "app.Resolver"
+		}
+		fmt.Fprintf(&b, "\t%s_luxo.RegisterStreams(gw.Router, eventBus, %s)\n", target.name, resolver)
 	}
-	if target.hasCrud {
+	if target.hasBatchRPC {
 		fmt.Fprintf(&b, "\t%s_luxo.RegisterBatchLoaders(gw.Router, app)\n", target.name)
+	}
+	if target.hasRemoteLoad {
+		fmt.Fprintf(&b, "\t%s_luxo.RegisterRemoteLoaders(gw.Router, app)\n", target.name)
 	}
 	if target.hasServiceFns {
 		fmt.Fprintf(&b, "\t%s_luxo.RegisterServiceFns(gw.Router, app)\n", target.name)
@@ -561,10 +603,8 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 		}
 	}
 
-	b.WriteString("\n\t\"encoding/json\"\n")
-	b.WriteString("\t\"sync\"\n\n")
+	b.WriteString("\n\t\"sync\"\n\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/env\"\n")
 	if anyStreams {
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/event\"\n")
@@ -598,7 +638,7 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 		b.WriteString("\tdefer eventBus.Close()\n")
 		for _, module := range allModules {
 			if module.hasStreams {
-				fmt.Fprintf(&b, "\t%s_luxo.RegisterStreams(gw.Router, eventBus)\n", module.name)
+				fmt.Fprintf(&b, "\t%s_luxo.RegisterStreams(gw.Router, eventBus, nil)\n", module.name)
 			}
 		}
 		b.WriteString("\n")
@@ -611,6 +651,7 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 		}
 	}
 	b.WriteString("\n")
+	writeGatewayNativeStreamWiring(&b, allModules)
 
 	// Routing table (deduplicated)
 	b.WriteString("\trouting := map[string]string{\n")
@@ -652,27 +693,19 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t\tmodel = s.Models[apiMeta.ReturnType]\n")
 	b.WriteString("\t}\n")
 	b.WriteString("\treturn func(ctx context.Context, req *api.Request) error {\n")
-	b.WriteString("\t\t// Encode params: JSON raw params → binary using schema\n")
-	b.WriteString("\t\tvar params []byte\n")
-	b.WriteString("\t\tif apiMeta != nil && len(req.Params) > 0 {\n")
-	b.WriteString("\t\t\tjsonParams := make(map[string]any, len(req.Params))\n")
-	b.WriteString("\t\t\tfor k, v := range req.Params {\n")
-	b.WriteString("\t\t\t\tvar val any\n")
-	b.WriteString("\t\t\t\tif err := json.Unmarshal(v, &val); err == nil {\n")
-	b.WriteString("\t\t\t\t\tjsonParams[k] = val\n")
-	b.WriteString("\t\t\t\t}\n")
-	b.WriteString("\t\t\t}\n")
-	b.WriteString("\t\t\tparams = schema.JSONParamsToBinary(jsonParams, apiMeta)\n")
-	b.WriteString("\t\t}\n\n")
+	b.WriteString("\t\tbearerToken := luvia.BearerToken(ctx)\n")
+	b.WriteString("\t\t// Parameters were validated and encoded once at the protocol edge.\n")
+	b.WriteString("\t\tparams := req.BinaryParams()\n\n")
 
 	// Federation: query planning
 	b.WriteString("\t\t// Federation: check if request needs cross-module field resolution\n")
 	b.WriteString("\t\tvar apiModule string\n")
 	b.WriteString("\t\tif apiMeta != nil { apiModule = apiMeta.Module }\n")
-	b.WriteString("\t\tplan := luvia.Plan(model, req.FieldMask, apiModule)\n")
+	b.WriteString("\t\tplan, err := luvia.Plan(model, req.FieldMask, apiModule)\n")
+	b.WriteString("\t\tif err != nil { return err }\n")
 	b.WriteString("\t\tif plan == nil {\n")
 	b.WriteString("\t\t\t// No extend fields — direct forward with field mask\n")
-	b.WriteString("\t\t\tresp, err := client.CallWithMask(apiID, req.FieldMask, params)\n")
+	b.WriteString("\t\t\tresp, err := client.CallWithMaskContext(ctx, bearerToken, apiID, req.FieldMask, params)\n")
 	b.WriteString("\t\t\tif err != nil {\n")
 	b.WriteString("\t\t\t\treturn err\n")
 	b.WriteString("\t\t\t}\n")
@@ -682,33 +715,24 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 
 	// Federation: parallel RPC
 	b.WriteString("\t\t// Primary request with federation mask (local fields + id)\n")
-	b.WriteString("\t\tresp, err := client.CallWithMask(apiID, plan.Primary.Mask, params)\n")
+	b.WriteString("\t\tresp, err := client.CallWithMaskContext(ctx, bearerToken, apiID, plan.Primary.Mask, params)\n")
 	b.WriteString("\t\tif err != nil {\n")
 	b.WriteString("\t\t\treturn err\n")
 	b.WriteString("\t\t}\n\n")
 
-	// Helper: encode resolve keys (same format as batchLoad: field1=count, field2=keys)
-	b.WriteString("\t\t// resolveKeys encodes FK values for svc:resolve RPC\n")
-	b.WriteString("\t\tresolveKeys := func(ids []int64) []byte {\n")
-	b.WriteString("\t\t\tvar enc codec.Encoder\n")
-	b.WriteString("\t\t\tenc.WriteFieldInt(1, int64(len(ids)))\n")
-	b.WriteString("\t\t\tfor _, k := range ids { enc.WriteFieldInt(2, k) }\n")
-	b.WriteString("\t\t\tenc.WriteEnd()\n")
-	b.WriteString("\t\t\treturn enc.Bytes()\n")
-	b.WriteString("\t\t}\n\n")
-
 	b.WriteString("\t\tif apiMeta.ReturnList {\n")
-	b.WriteString("\t\t\t// List federation: extract ID column, resolve extends\n")
-	b.WriteString("\t\t\tids := luvia.ExtractIDColumn(resp, plan.IDFieldID, model)\n")
-	b.WriteString("\t\t\tif len(ids) == 0 {\n")
+	b.WriteString("\t\t\t// List federation: forward the primary-key column without decoding\n")
+	b.WriteString("\t\t\tkeys, ok := luvia.ExtractPrimaryKeyColumn(resp, plan.PrimaryKeyField, model)\n")
+	b.WriteString("\t\t\tif !ok || keys.Len() == 0 {\n")
 	b.WriteString("\t\t\t\treq.Buf.B = append(req.Buf.B, resp...)\n")
 	b.WriteString("\t\t\t\treturn nil\n")
 	b.WriteString("\t\t\t}\n")
+	b.WriteString("\t\t\tresolveParams := keys.EncodeParam(1)\n")
 	b.WriteString("\t\t\tresolveCol := func(ext luvia.ExtendStep, cl *rpc.Client) luvia.ExtendColumnResult {\n")
 	b.WriteString("\t\t\t\tsvcName := \"svc:resolve:\" + ext.ModelName + \":\" + ext.ForeignKey\n")
 	b.WriteString("\t\t\t\tresolveAPI := s.APIs[svcName]\n")
 	b.WriteString("\t\t\t\tif resolveAPI == nil { return luvia.ExtendColumnResult{} }\n")
-	b.WriteString("\t\t\t\textResp, err := cl.CallWithMask(resolveAPI.ID, req.FieldMask, resolveKeys(ids))\n")
+	b.WriteString("\t\t\t\textResp, err := cl.CallWithMaskContext(ctx, bearerToken, resolveAPI.ID, ext.Mask, resolveParams)\n")
 	b.WriteString("\t\t\t\tif err != nil { return luvia.ExtendColumnResult{} }\n")
 	b.WriteString("\t\t\t\tblobs := luvia.ParseGroupedResponse(extResp, ext.IsList)\n")
 	b.WriteString("\t\t\t\treturn luvia.ExtendColumnResult{FieldID: ext.FieldID, Blobs: blobs}\n")
@@ -737,12 +761,13 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t\t\treturn nil\n")
 	b.WriteString("\t\t}\n\n")
 
-	b.WriteString("\t\t// Single record federation: extract ID, resolve extends\n")
-	b.WriteString("\t\tprimaryID, ok := luvia.ExtractID(resp, plan.IDFieldID, plan.FieldTypes)\n")
+	b.WriteString("\t\t// Single record federation: forward the primary key without decoding\n")
+	b.WriteString("\t\tkeys, ok := luvia.ExtractPrimaryKeys(resp, plan.PrimaryKeyField, model, s)\n")
 	b.WriteString("\t\tif !ok {\n")
 	b.WriteString("\t\t\treq.Buf.B = append(req.Buf.B, resp...)\n")
 	b.WriteString("\t\t\treturn nil\n")
 	b.WriteString("\t\t}\n")
+	b.WriteString("\t\tresolveParams := keys.EncodeParam(1)\n")
 
 	// Group extends by SvcName — same resolve endpoint shares one RPC call
 	b.WriteString("\t\t// Deduplicate: group extends by resolve endpoint, parallel per unique endpoint\n")
@@ -758,7 +783,7 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t\t\t\tif cl := rpcClients[ext.Module]; cl != nil {\n")
 	b.WriteString("\t\t\t\t\tresolveAPI := s.APIs[svcName]\n")
 	b.WriteString("\t\t\t\t\tif resolveAPI != nil {\n")
-	b.WriteString("\t\t\t\t\t\tr, e := cl.CallWithMask(resolveAPI.ID, req.FieldMask, resolveKeys([]int64{primaryID}))\n")
+	b.WriteString("\t\t\t\t\t\tr, e := cl.CallWithMaskContext(ctx, bearerToken, resolveAPI.ID, ext.Mask, resolveParams)\n")
 	b.WriteString("\t\t\t\t\t\tif e == nil { svcResp[svcName] = r }\n")
 	b.WriteString("\t\t\t\t\t}\n")
 	b.WriteString("\t\t\t\t}\n")
@@ -774,11 +799,11 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t\t\t\tresolveAPI := s.APIs[svcName]\n")
 	b.WriteString("\t\t\t\tif resolveAPI == nil { continue }\n")
 	b.WriteString("\t\t\t\twg.Add(1)\n")
-	b.WriteString("\t\t\t\tgo func(name string, cl *rpc.Client, apiID int) {\n")
+	b.WriteString("\t\t\t\tgo func(name string, cl *rpc.Client, apiID int, mask []byte) {\n")
 	b.WriteString("\t\t\t\t\tdefer wg.Done()\n")
-	b.WriteString("\t\t\t\t\tr, e := cl.CallWithMask(apiID, req.FieldMask, resolveKeys([]int64{primaryID}))\n")
+	b.WriteString("\t\t\t\t\tr, e := cl.CallWithMaskContext(ctx, bearerToken, apiID, mask, resolveParams)\n")
 	b.WriteString("\t\t\t\t\tif e == nil { mu.Lock(); svcResp[name] = r; mu.Unlock() }\n")
-	b.WriteString("\t\t\t\t}(svcName, cl, resolveAPI.ID)\n")
+	b.WriteString("\t\t\t\t}(svcName, cl, resolveAPI.ID, ext.Mask)\n")
 	b.WriteString("\t\t\t}\n")
 	b.WriteString("\t\t\twg.Wait()\n")
 	b.WriteString("\t\t}\n")
@@ -797,8 +822,58 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t\treturn nil\n")
 	b.WriteString("\t}\n")
 	b.WriteString("}\n")
+	writeGatewayRPCStreamProxy(&b, allModules)
 
 	return formatGenerated([]byte(b.String()))
+}
+
+func writeGatewayNativeStreamWiring(b *strings.Builder, modules []moduleInfo) {
+	for _, module := range modules {
+		for _, apiName := range module.nativeStreams {
+			fmt.Fprintf(b, "\tgw.Router.HandleStreamNative(%q, rpcStreamProxy(rpcClients[%q], gw.Router, %q))\n", apiName, module.name, apiName)
+		}
+	}
+	if gatewayHasNativeStreams(modules) {
+		b.WriteString("\n")
+	}
+}
+
+func writeGatewayRPCStreamProxy(b *strings.Builder, modules []moduleInfo) {
+	if !gatewayHasNativeStreams(modules) {
+		return
+	}
+	b.WriteString("\n\n// rpcStreamProxy bridges a client WebSocket subscription to its owning service.\n")
+	b.WriteString("func rpcStreamProxy(client *rpc.Client, router *api.Router, apiName string) api.StreamHandlerFunc {\n")
+	b.WriteString("\tapiMeta := router.Schema.APIs[apiName]\n")
+	b.WriteString("\treturn func(ctx context.Context, params *api.StreamParams, identity any, stream *api.Stream) {\n")
+	b.WriteString("\t\t_ = identity\n")
+	b.WriteString("\t\tif client == nil || apiMeta == nil { return }\n")
+	b.WriteString("\t\tsubscription, err := client.SubscribeContext(ctx, luvia.BearerToken(ctx), apiMeta.ID, stream.FieldMask(), params.Binary())\n")
+	b.WriteString("\t\tif err != nil { return }\n")
+	b.WriteString("\t\tdefer subscription.Close()\n")
+	b.WriteString("\t\tfor {\n")
+	b.WriteString("\t\t\tselect {\n")
+	b.WriteString("\t\t\tcase data, ok := <-subscription.Messages():\n")
+	b.WriteString("\t\t\t\tif !ok { return }\n")
+	b.WriteString("\t\t\t\tif !stream.Binary() { data = router.StreamPayloadJSON(apiName, data) }\n")
+	b.WriteString("\t\t\t\tif stream.Send(data) != nil { return }\n")
+	b.WriteString("\t\t\tcase <-subscription.Errors():\n")
+	b.WriteString("\t\t\t\treturn\n")
+	b.WriteString("\t\t\tcase <-ctx.Done():\n")
+	b.WriteString("\t\t\t\treturn\n")
+	b.WriteString("\t\t\t}\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t}\n")
+	b.WriteString("}\n")
+}
+
+func gatewayHasNativeStreams(modules []moduleInfo) bool {
+	for _, module := range modules {
+		if len(module.nativeStreams) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func gatewayHasStreams(modules []moduleInfo) bool {

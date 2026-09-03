@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -52,8 +53,142 @@ func testWSRouter() *Router {
 	rt.Registry.RegisterParams("getUser", []ParamMeta{
 		{Name: "id", Type: "Int", FieldID: 1},
 	})
+	rt.Schema.RegisterAPI(&schema.API{Name: "watchTest", Stream: true})
 
 	return rt
+}
+
+func registerTestStream(rt *Router, name string) {
+	definition := rt.Schema.APIs[name]
+	if definition == nil {
+		definition = &schema.API{Name: name}
+		rt.Schema.RegisterAPI(definition)
+	}
+	definition.Stream = true
+}
+
+func TestWSRejectsSubscriptionsToNonStreamAPIs(t *testing.T) {
+	rt := testWSRouter()
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"$sub":"getUser","id":42}`)); err != nil {
+		t.Fatal(err)
+	}
+	binary := []byte{BinaryFrameSubscribe}
+	binary = codec.AppendVarint(binary, 10)
+	binary = codec.AppendVarint(binary, 0)
+	var enc codec.Encoder
+	enc.WriteFieldInt(1, 42)
+	enc.WriteEnd()
+	binary = append(binary, enc.Bytes()...)
+	if err := conn.Write(ctx, websocket.MessageBinary, binary); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	if rt.Streams.SubCount("getUser") != 0 {
+		t.Fatal("non-stream API must reject JSON and binary subscriptions")
+	}
+}
+
+func TestWSJSONSubscriptionAcknowledgesSuccessAndErrors(t *testing.T) {
+	rt := testWSRouter()
+	registerTestStream(rt, "watchAck")
+	rt.Registry.Register("watchAck", 71)
+
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"$sub":"watchAck"}`)); err != nil {
+		t.Fatal(err)
+	}
+	messageType, data, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if messageType != websocket.MessageText || string(data) != `{"$sub":"watchAck","ok":true}` {
+		t.Fatalf("unexpected subscribe acknowledgement: type=%v data=%s", messageType, data)
+	}
+
+	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"$sub":"getUser","id":42}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, data, err = conn.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response map[string]json.RawMessage
+	if err := json.Unmarshal(data, &response); err != nil {
+		t.Fatal(err)
+	}
+	if string(response["$sub"]) != `"getUser"` || string(response["error"]) != `"BadRequest"` {
+		t.Fatalf("unexpected subscription error: %s", data)
+	}
+}
+
+func TestWSBinarySubscriptionAcknowledgesSuccessAndErrors(t *testing.T) {
+	rt := testWSRouter()
+	registerTestStream(rt, "watchAck")
+	rt.Registry.Register("watchAck", 71)
+
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	request := []byte{BinaryFrameSubscribe, 71, 0, 0}
+	if err := conn.Write(ctx, websocket.MessageBinary, request); err != nil {
+		t.Fatal(err)
+	}
+	messageType, data, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if messageType != websocket.MessageBinary || !bytes.Equal(data, []byte{BinaryFrameSubscribeSuccess, 71}) {
+		t.Fatalf("unexpected subscribe acknowledgement: type=%v data=%v", messageType, data)
+	}
+
+	request = []byte{BinaryFrameSubscribe, 10, 0, 0}
+	if err := conn.Write(ctx, websocket.MessageBinary, request); err != nil {
+		t.Fatal(err)
+	}
+	_, data, err = conn.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) < 3 || data[0] != BinaryFrameSubscribeError || data[1] != 10 {
+		t.Fatalf("unexpected subscription error frame: %v", data)
+	}
+	wireErr, err := DecodeBinaryError(data[2:], 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wireErr.Name != "BadRequest" || wireErr.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected subscription error: %+v", wireErr)
+	}
 }
 
 func TestWSJSON_Success(t *testing.T) {
@@ -248,8 +383,8 @@ func TestWSBinary_Success(t *testing.T) {
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
-	// Build binary request: [seq=1][API ID=10][mask=0][param field1=42][0x00]
-	var reqBuf []byte
+	// Build binary call request.
+	reqBuf := []byte{BinaryFrameCallRequest}
 	reqBuf = codec.AppendVarint(reqBuf, 1)  // seq
 	reqBuf = codec.AppendVarint(reqBuf, 10) // API ID
 	reqBuf = codec.AppendVarint(reqBuf, 0)  // mask len
@@ -268,15 +403,13 @@ func TestWSBinary_Success(t *testing.T) {
 		t.Fatalf("read: %v", err)
 	}
 
-	// Parse response: [seq varint][0x01=ok][payload]
-	seq, n := codec.ReadVarint(data, 0)
+	if data[0] != BinaryFrameCallSuccess {
+		t.Fatalf("frame type = %x, want success", data[0])
+	}
+	seq, n := codec.ReadVarint(data, 1)
 	if seq != 1 {
 		t.Errorf("seq = %d, want 1", seq)
 	}
-	if data[n] != 0x01 {
-		t.Errorf("status = %x, want 0x01 (ok)", data[n])
-	}
-
 	// Decode payload (skip arena header first)
 	payload := data[n+1:]
 	dec := codec.NewDecoder(payload)
@@ -297,6 +430,45 @@ func TestWSBinary_Success(t *testing.T) {
 	}
 }
 
+func TestWSBinary_SequenceBoundaryDoesNotCollideWithFrameTypes(t *testing.T) {
+	rt := testWSRouter()
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	for seq := uint64(1); seq <= 300; seq++ {
+		req := []byte{BinaryFrameCallRequest}
+		req = codec.AppendVarint(req, seq)
+		req = codec.AppendVarint(req, 10)
+		req = codec.AppendVarint(req, 0)
+		req = codec.AppendVarint(req, 1)
+		req = codec.AppendSvarint(req, int64(seq))
+		req = append(req, 0)
+		if err := conn.Write(ctx, websocket.MessageBinary, req); err != nil {
+			t.Fatalf("write sequence %d: %v", seq, err)
+		}
+
+		_, data, err := conn.Read(ctx)
+		if err != nil {
+			t.Fatalf("read sequence %d: %v", seq, err)
+		}
+		if len(data) == 0 || data[0] != BinaryFrameCallSuccess {
+			t.Fatalf("sequence %d frame = %v", seq, data)
+		}
+		gotSeq, n := codec.ReadVarint(data, 1)
+		if n <= 0 || gotSeq != seq {
+			t.Fatalf("sequence = %d, want %d", gotSeq, seq)
+		}
+	}
+}
+
 func TestWSBinary_NotFound(t *testing.T) {
 	rt := testWSRouter()
 	srv := httptest.NewServer(rt)
@@ -313,7 +485,7 @@ func TestWSBinary_NotFound(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	// Unknown API ID = 999
-	var reqBuf []byte
+	reqBuf := []byte{BinaryFrameCallRequest}
 	reqBuf = codec.AppendVarint(reqBuf, 5)   // seq
 	reqBuf = codec.AppendVarint(reqBuf, 999) // unknown API ID
 	reqBuf = codec.AppendVarint(reqBuf, 0)   // mask
@@ -326,23 +498,16 @@ func TestWSBinary_NotFound(t *testing.T) {
 		t.Fatalf("read: %v", err)
 	}
 
-	// Parse error: [seq][0x00=error][code svarint][name string][msg string]
-	seq, n := codec.ReadVarint(data, 0)
+	if data[0] != BinaryFrameCallError {
+		t.Fatalf("frame type = %x, want error", data[0])
+	}
+	seq, n := codec.ReadVarint(data, 1)
 	if seq != 5 {
 		t.Errorf("seq = %d, want 5", seq)
 	}
-	if data[n] != 0x00 {
-		t.Errorf("status = %x, want 0x00 (error)", data[n])
-	}
-	off := n + 1
-	code, cn := codec.ReadSvarint(data, off)
-	if code != 400 {
-		t.Errorf("code = %d, want 400", code)
-	}
-	off += cn
-	errName, _ := codec.ReadString(data, off)
-	if errName != "BadRequest" {
-		t.Errorf("error = %q, want BadRequest", errName)
+	werr := decodeWireError(t, data[n+1:])
+	if werr.Code != 400 || werr.Name != "BadRequest" {
+		t.Errorf("error = %+v, want BadRequest 400", werr)
 	}
 }
 
@@ -401,6 +566,77 @@ func TestWSJSON_WithSelect(t *testing.T) {
 	}
 }
 
+func TestWSJSONRejectsMalformedSelectionAndListControls(t *testing.T) {
+	rt := testWSRouter()
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	requests := []string{
+		`{"$id":7,"$api":"getUser","$select":"name{"}`,
+		`{"$id":8,"$api":"getUser","$filters":[{"field":"name","op":"invalid","value":"x"}]}`,
+	}
+	for _, request := range requests {
+		if err := conn.Write(ctx, websocket.MessageText, []byte(request)); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		_, data, err := conn.Read(ctx)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if !strings.Contains(string(data), `"error":"BadRequest"`) {
+			t.Fatalf("response = %s", data)
+		}
+	}
+}
+
+func TestWSJSONSelectionSupportsTypeReturn(t *testing.T) {
+	rt := testWSRouter()
+	rt.Schema.RegisterType(&schema.TypeDecl{
+		Name: "AuthPayload",
+		Fields: []schema.Field{
+			{ID: 1, Name: "token", Type: schema.FieldString},
+			{ID: 2, Name: "expiresAt", Type: schema.FieldDateTime},
+		},
+	})
+	rt.Schema.RegisterAPI(&schema.API{ID: 11, Name: "login", Module: "auth", ReturnType: "AuthPayload"})
+	maskApplied := make(chan bool, 1)
+	rt.Handle("login", func(ctx context.Context, req *Request) error {
+		maskApplied <- bytes.Equal(req.FieldMask, []byte{1, 1})
+		req.Buf.B = codec.AppendVarint(req.Buf.B, 0)
+		var enc codec.Encoder
+		enc.WriteFieldString(1, "token")
+		enc.WriteEnd()
+		req.Buf.B = append(req.Buf.B, enc.Bytes()...)
+		return nil
+	})
+
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"$id":1,"$api":"login","$select":"token"}`)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, _, err := conn.Read(ctx); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !<-maskApplied {
+		t.Fatal("type return selection was not converted to a field mask")
+	}
+}
+
 func TestWSBinary_HandlerError(t *testing.T) {
 	rt := testWSRouter()
 	rt.Handle("failBinary", func(ctx context.Context, req *Request) error {
@@ -421,7 +657,7 @@ func TestWSBinary_HandlerError(t *testing.T) {
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
-	var reqBuf []byte
+	reqBuf := []byte{BinaryFrameCallRequest}
 	reqBuf = codec.AppendVarint(reqBuf, 7)  // seq
 	reqBuf = codec.AppendVarint(reqBuf, 99) // API ID = failBinary
 	reqBuf = codec.AppendVarint(reqBuf, 0)  // mask
@@ -434,13 +670,15 @@ func TestWSBinary_HandlerError(t *testing.T) {
 		t.Fatalf("read: %v", err)
 	}
 
-	// Error response: [seq=7][0x00=error][code][name][msg]
-	seq, n := codec.ReadVarint(data, 0)
+	if data[0] != BinaryFrameCallError {
+		t.Fatalf("frame type = %x, want error", data[0])
+	}
+	seq, n := codec.ReadVarint(data, 1)
 	if seq != 7 {
 		t.Errorf("seq = %d, want 7", seq)
 	}
-	if data[n] != 0x00 {
-		t.Errorf("status = %x, want 0x00 (error)", data[n])
+	if got := decodeWireError(t, data[n+1:]); got.Code != 404 || got.Name != "NotFound" {
+		t.Errorf("error = %+v", got)
 	}
 }
 
@@ -460,7 +698,7 @@ func TestWSBinary_InvalidVarint(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	// Send bytes that form an invalid/overflowing varint (all continuation bits set)
-	conn.Write(ctx, websocket.MessageBinary, []byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02})
+	conn.Write(ctx, websocket.MessageBinary, []byte{BinaryFrameCallRequest, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02})
 
 	// Should silently drop. Verify connection alive with a valid request.
 	conn.Write(ctx, websocket.MessageText, []byte(`{"$id":1,"$api":"getUser"}`))
@@ -488,7 +726,7 @@ func TestWSBinary_APIRegisteredButNoHandler(t *testing.T) {
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
-	var reqBuf []byte
+	reqBuf := []byte{BinaryFrameCallRequest}
 	reqBuf = codec.AppendVarint(reqBuf, 8)  // seq
 	reqBuf = codec.AppendVarint(reqBuf, 77) // ghostAPI
 	reqBuf = codec.AppendVarint(reqBuf, 0)  // mask
@@ -502,12 +740,15 @@ func TestWSBinary_APIRegisteredButNoHandler(t *testing.T) {
 	}
 
 	// Should get NotFound error
-	seq, n := codec.ReadVarint(data, 0)
+	if data[0] != BinaryFrameCallError {
+		t.Fatalf("frame type = %x, want error", data[0])
+	}
+	seq, n := codec.ReadVarint(data, 1)
 	if seq != 8 {
 		t.Errorf("seq = %d, want 8", seq)
 	}
-	if data[n] != 0x00 {
-		t.Errorf("status should be error (0x00), got %x", data[n])
+	if got := decodeWireError(t, data[n+1:]); got.Code != 404 || got.Name != "NotFound" {
+		t.Errorf("error = %+v", got)
 	}
 }
 
@@ -532,7 +773,7 @@ func TestWSBinary_PlainError(t *testing.T) {
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
-	var reqBuf []byte
+	reqBuf := []byte{BinaryFrameCallRequest}
 	reqBuf = codec.AppendVarint(reqBuf, 9)  // seq
 	reqBuf = codec.AppendVarint(reqBuf, 88) // plainFail
 	reqBuf = codec.AppendVarint(reqBuf, 0)  // mask
@@ -545,18 +786,15 @@ func TestWSBinary_PlainError(t *testing.T) {
 		t.Fatalf("read: %v", err)
 	}
 
-	seq, n := codec.ReadVarint(data, 0)
+	if data[0] != BinaryFrameCallError {
+		t.Fatalf("frame type = %x, want error", data[0])
+	}
+	seq, n := codec.ReadVarint(data, 1)
 	if seq != 9 {
 		t.Errorf("seq = %d, want 9", seq)
 	}
-	if data[n] != 0x00 {
-		t.Errorf("status should be error, got %x", data[n])
-	}
-	// Wrapped error should have InternalServerError code (500)
-	off := n + 1
-	code, _ := codec.ReadSvarint(data, off)
-	if code != 500 {
-		t.Errorf("code = %d, want 500 (plain error wraps to InternalServerError)", code)
+	if got := decodeWireError(t, data[n+1:]); got.Code != 500 || got.Name != "Internal" {
+		t.Errorf("error = %+v, want Internal 500", got)
 	}
 }
 
@@ -720,6 +958,7 @@ func TestIdentityFromCtx_NilExtractor(t *testing.T) {
 
 func TestWSBinary_SubscribeWithFloatParam(t *testing.T) {
 	rt := testWSRouter()
+	registerTestStream(rt, "watchFloat")
 	rt.Registry.Register("watchFloat", 61)
 	rt.Registry.RegisterParams("watchFloat", []ParamMeta{
 		{Name: "rate", Type: "Float", FieldID: 1},
@@ -739,7 +978,7 @@ func TestWSBinary_SubscribeWithFloatParam(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	var reqBuf []byte
-	reqBuf = append(reqBuf, 0xFE)
+	reqBuf = append(reqBuf, BinaryFrameSubscribe)
 	reqBuf = codec.AppendVarint(reqBuf, 61) // API ID
 	reqBuf = codec.AppendVarint(reqBuf, 0)  // no mask
 	var enc codec.Encoder
@@ -757,6 +996,7 @@ func TestWSBinary_SubscribeWithFloatParam(t *testing.T) {
 
 func TestWSBinary_SubscribeWithStringParam(t *testing.T) {
 	rt := testWSRouter()
+	registerTestStream(rt, "watchStr")
 	rt.Registry.Register("watchStr", 62)
 	rt.Registry.RegisterParams("watchStr", []ParamMeta{
 		{Name: "channel", Type: "String", FieldID: 1},
@@ -776,7 +1016,7 @@ func TestWSBinary_SubscribeWithStringParam(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	var reqBuf []byte
-	reqBuf = append(reqBuf, 0xFE)
+	reqBuf = append(reqBuf, BinaryFrameSubscribe)
 	reqBuf = codec.AppendVarint(reqBuf, 62) // API ID
 	reqBuf = codec.AppendVarint(reqBuf, 0)  // no mask
 	var enc codec.Encoder
@@ -794,6 +1034,7 @@ func TestWSBinary_SubscribeWithStringParam(t *testing.T) {
 
 func TestWSBinary_SubscribeWithBoolParam(t *testing.T) {
 	rt := testWSRouter()
+	registerTestStream(rt, "watchBool")
 	rt.Registry.Register("watchBool", 63)
 	rt.Registry.RegisterParams("watchBool", []ParamMeta{
 		{Name: "active", Type: "Boolean", FieldID: 1},
@@ -813,7 +1054,7 @@ func TestWSBinary_SubscribeWithBoolParam(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	var reqBuf []byte
-	reqBuf = append(reqBuf, 0xFE)
+	reqBuf = append(reqBuf, BinaryFrameSubscribe)
 	reqBuf = codec.AppendVarint(reqBuf, 63) // API ID
 	reqBuf = codec.AppendVarint(reqBuf, 0)  // no mask
 	var enc codec.Encoder
@@ -829,13 +1070,14 @@ func TestWSBinary_SubscribeWithBoolParam(t *testing.T) {
 	}
 }
 
-// --- WSBinary stream with unsupported param type ---
+// --- WSBinary stream with bytes-compatible JSON param ---
 
 func TestWSBinary_SubscribeWithUnsupportedParamType(t *testing.T) {
 	rt := testWSRouter()
+	registerTestStream(rt, "watchUnsup")
 	rt.Registry.Register("watchUnsup", 64)
 	rt.Registry.RegisterParams("watchUnsup", []ParamMeta{
-		{Name: "data", Type: "JSON", FieldID: 1}, // unsupported type
+		{Name: "data", Type: "JSON", FieldID: 1},
 	})
 
 	srv := httptest.NewServer(rt)
@@ -852,7 +1094,7 @@ func TestWSBinary_SubscribeWithUnsupportedParamType(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	var reqBuf []byte
-	reqBuf = append(reqBuf, 0xFE)
+	reqBuf = append(reqBuf, BinaryFrameSubscribe)
 	reqBuf = codec.AppendVarint(reqBuf, 64)
 	reqBuf = codec.AppendVarint(reqBuf, 0)
 	var enc codec.Encoder
@@ -863,9 +1105,8 @@ func TestWSBinary_SubscribeWithUnsupportedParamType(t *testing.T) {
 	conn.Write(ctx, websocket.MessageBinary, reqBuf)
 	time.Sleep(50 * time.Millisecond)
 
-	// Unsupported type causes early return — should NOT subscribe
-	if rt.Streams.SubCount("watchUnsup") != 0 {
-		t.Errorf("should not subscribe with unsupported param type, got %d", rt.Streams.SubCount("watchUnsup"))
+	if rt.Streams.SubCount("watchUnsup") != 1 {
+		t.Errorf("JSON bytes param should subscribe, got %d", rt.Streams.SubCount("watchUnsup"))
 	}
 }
 
@@ -895,7 +1136,7 @@ func TestWSBinary_SubscribeNativeHandler(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	var reqBuf []byte
-	reqBuf = append(reqBuf, 0xFE)
+	reqBuf = append(reqBuf, BinaryFrameSubscribe)
 	reqBuf = codec.AppendVarint(reqBuf, 65) // API ID
 	reqBuf = codec.AppendVarint(reqBuf, 0)  // no mask
 	reqBuf = append(reqBuf, 0x00)           // end params
@@ -914,6 +1155,7 @@ func TestWSBinary_SubscribeNativeHandler(t *testing.T) {
 
 func TestWSBinary_SubscribeWithFieldMask(t *testing.T) {
 	rt := testWSRouter()
+	registerTestStream(rt, "watchMask")
 	rt.Registry.Register("watchMask", 66)
 	rt.Registry.RegisterParams("watchMask", nil)
 
@@ -931,11 +1173,12 @@ func TestWSBinary_SubscribeWithFieldMask(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	var reqBuf []byte
-	reqBuf = append(reqBuf, 0xFE)
+	reqBuf = append(reqBuf, BinaryFrameSubscribe)
 	reqBuf = codec.AppendVarint(reqBuf, 66) // API ID
-	reqBuf = codec.AppendVarint(reqBuf, 2)  // mask length=2
-	reqBuf = append(reqBuf, 0xFF, 0x01)     // mask bytes
-	reqBuf = append(reqBuf, 0x00)           // end params
+	mask := codec.AppendSelectionMask(nil, []byte{0xFF, 0x01}, nil)
+	reqBuf = codec.AppendVarint(reqBuf, uint64(len(mask)))
+	reqBuf = append(reqBuf, mask...)
+	reqBuf = append(reqBuf, 0x00) // end params
 
 	conn.Write(ctx, websocket.MessageBinary, reqBuf)
 	time.Sleep(50 * time.Millisecond)
@@ -963,7 +1206,7 @@ func TestWSBinary_StreamTooShort(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	// Send stream message with only 1 byte (too short)
-	conn.Write(ctx, websocket.MessageBinary, []byte{0xFE})
+	conn.Write(ctx, websocket.MessageBinary, []byte{BinaryFrameSubscribe})
 	time.Sleep(50 * time.Millisecond)
 
 	// Should not crash, connection alive
@@ -992,7 +1235,7 @@ func TestWSBinary_StreamUnknownAPIID(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	var reqBuf []byte
-	reqBuf = append(reqBuf, 0xFE)
+	reqBuf = append(reqBuf, BinaryFrameSubscribe)
 	reqBuf = codec.AppendVarint(reqBuf, 999) // unknown API ID
 	reqBuf = codec.AppendVarint(reqBuf, 0)
 	reqBuf = append(reqBuf, 0x00)
@@ -1025,8 +1268,7 @@ func TestWSBinary_StreamInvalidVarint(t *testing.T) {
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
-	// 0xFE + invalid varint
-	conn.Write(ctx, websocket.MessageBinary, []byte{0xFE, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02})
+	conn.Write(ctx, websocket.MessageBinary, []byte{BinaryFrameSubscribe, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02})
 	time.Sleep(50 * time.Millisecond)
 
 	// Should not crash
@@ -1058,7 +1300,7 @@ func TestWSBinary_UnsubscribeNonExistent(t *testing.T) {
 
 	// Unsubscribe without subscribing first
 	var unsubBuf []byte
-	unsubBuf = append(unsubBuf, 0xFF)
+	unsubBuf = append(unsubBuf, BinaryFrameUnsubscribe)
 	unsubBuf = codec.AppendVarint(unsubBuf, 67)
 	conn.Write(ctx, websocket.MessageBinary, unsubBuf)
 	time.Sleep(50 * time.Millisecond)
@@ -1158,6 +1400,24 @@ func TestWSOrigins(t *testing.T) {
 	if err == nil {
 		t.Error("should reject connection with wrong origin")
 	}
+}
+
+func TestWSAllowAllOrigins(t *testing.T) {
+	rt := testWSRouter()
+	rt.WSAllowAllOrigins = true
+
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{"http://example.com"}},
+	})
+	if err != nil {
+		t.Fatalf("wildcard origin policy rejected connection: %v", err)
+	}
+	conn.Close(websocket.StatusNormalClosure, "")
 }
 
 func TestHasColonAfter(t *testing.T) {

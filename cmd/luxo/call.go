@@ -1,16 +1,18 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
-	"github.com/light-speak/luxo/pkg/lockfile"
 	"github.com/light-speak/luxo/pkg/lux/api"
-	"github.com/light-speak/luxo/pkg/lux/codec"
+	"github.com/light-speak/luxo/pkg/lux/schema"
+	"github.com/light-speak/luxo/pkg/lux/selection"
 	"github.com/spf13/cobra"
 )
 
@@ -73,35 +75,45 @@ func callJSONMode(apiName string, params []string) error {
 }
 
 func callBinaryMode(apiName string, params []string) error {
-	// Load luxo.lock for API IDs
-	lf, err := lockfile.Load("luxo.lock")
+	runtimeSchema, err := loadCallSchema("luxo.schema.json")
 	if err != nil {
-		return fmt.Errorf("load luxo.lock: %w (run from project root)", err)
+		return err
+	}
+	apiSchema := runtimeSchema.APIs[apiName]
+	if apiSchema == nil {
+		return fmt.Errorf("unknown API %q (not in luxo.schema.json)", apiName)
 	}
 
-	apiID := lf.APIID(apiName)
-	if apiID == 0 {
-		return fmt.Errorf("unknown API %q (not in luxo.lock)", apiName)
-	}
-
-	// Build binary request — use param field IDs from luxo.lock
 	paramMap := make(map[string]any)
-	var paramMeta []api.ParamMeta
-	for _, p := range params {
-		k, v := parseParam(p)
-		paramMap[k] = inferType(v)
-		fid := lf.APIParamID(apiName, k)
-		if fid == 0 {
-			return fmt.Errorf("unknown param %q for API %q (not in luxo.lock)", k, apiName)
-		}
+	paramMeta := make([]api.ParamMeta, 0, len(apiSchema.Params))
+	paramsByName := make(map[string]schema.Param, len(apiSchema.Params))
+	for _, param := range apiSchema.Params {
+		paramsByName[param.Name] = param
 		paramMeta = append(paramMeta, api.ParamMeta{
-			Name:    k,
-			Type:    inferLuxoType(v),
-			FieldID: fid,
+			Name: param.Name, Type: param.Type.String(), FieldID: param.ID, IsList: param.IsList, Nullable: param.Nullable,
 		})
 	}
+	for _, p := range params {
+		k, v := parseParam(p)
+		param, ok := paramsByName[k]
+		if !ok {
+			return fmt.Errorf("unknown param %q for API %q", k, apiName)
+		}
+		value, err := parseBinaryCLIValue(v, param)
+		if err != nil {
+			return fmt.Errorf("param %s: %w", k, err)
+		}
+		paramMap[k] = value
+	}
 
-	body := api.EncodeBinaryRequest(apiID, paramMap, paramMeta)
+	fieldMask, err := callFieldMask(callSelect, apiSchema, runtimeSchema)
+	if err != nil {
+		return err
+	}
+	body, err := api.EncodeBinaryRequest(apiSchema.ID, fieldMask, paramMap, paramMeta)
+	if err != nil {
+		return fmt.Errorf("encode binary request: %w", err)
+	}
 
 	req, err := http.NewRequest("POST", callHost+"/luvia", strings.NewReader(string(body)))
 	if err != nil {
@@ -118,9 +130,15 @@ func callBinaryMode(apiName string, params []string) error {
 	respBody, _ := io.ReadAll(resp.Body)
 
 	if resp.Header.Get("X-Luxo-Mode") == "binary" {
-		// Decode binary response
 		fmt.Fprintf(os.Stderr, "[binary] %d bytes, status %d\n", len(respBody), resp.StatusCode)
-		decodeBinaryResponse(respBody)
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			binaryErr, decodeErr := api.DecodeBinaryError(respBody, resp.StatusCode)
+			if decodeErr != nil {
+				return decodeErr
+			}
+			return binaryErr
+		}
+		decodeBinaryResponse(respBody, apiSchema, runtimeSchema)
 	} else {
 		// JSON response (error or fallback)
 		fmt.Println(string(respBody))
@@ -129,21 +147,28 @@ func callBinaryMode(apiName string, params []string) error {
 }
 
 // decodeBinaryResponse prints a hex + field dump of a binary response.
-func decodeBinaryResponse(data []byte) {
+func decodeBinaryResponse(data []byte, apiSchema *schema.API, runtimeSchema *schema.Schema) {
 	if len(data) == 0 {
 		fmt.Println("(empty response)")
 		return
 	}
 
-	dec := codec.NewDecoder(data)
-	dec.SkipArenaHeader()
-	for dec.NextField() {
-		fid := dec.FieldID()
-		// Try reading as different types — peek at raw bytes
-		// For now, just show field IDs and raw hex
-		fmt.Printf("  field %d: (raw bytes follow)\n", fid)
-		// We can't determine the type without schema, so just skip
-		break
+	if apiSchema.ReturnType != "" {
+		if model := responseModel(apiSchema.ReturnType, runtimeSchema); model != nil {
+			var output []byte
+			switch {
+			case apiSchema.Paginated:
+				output = schema.BinaryPaginatedListToJSON(nil, data, model, runtimeSchema)
+			case apiSchema.ReturnList:
+				output = schema.BinaryListToJSON(nil, data, model, runtimeSchema)
+			default:
+				output = schema.BinaryToJSON(nil, data, model, runtimeSchema)
+			}
+			fmt.Println(string(output))
+			return
+		}
+		fmt.Println(string(schema.BinaryScalarToJSON(nil, data, apiSchema.ReturnType)))
+		return
 	}
 
 	// Hex dump
@@ -155,6 +180,105 @@ func decodeBinaryResponse(data []byte) {
 		fmt.Printf("%02x ", b)
 	}
 	fmt.Println()
+}
+
+func loadCallSchema(path string) (*schema.Schema, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("load %s: %w (run luxo gen first)", path, err)
+	}
+	var result schema.Schema
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", path, err)
+	}
+	for _, model := range result.Models {
+		result.RegisterModel(model)
+	}
+	return &result, nil
+}
+
+func responseModel(typeName string, runtimeSchema *schema.Schema) *schema.Model {
+	if model := runtimeSchema.Models[typeName]; model != nil {
+		return model
+	}
+	if decl := runtimeSchema.Types[typeName]; decl != nil {
+		return decl.AsModel()
+	}
+	return nil
+}
+
+func callFieldMask(selectText string, apiSchema *schema.API, runtimeSchema *schema.Schema) ([]byte, error) {
+	if strings.TrimSpace(selectText) == "" {
+		return nil, nil
+	}
+	model := responseModel(apiSchema.ReturnType, runtimeSchema)
+	if model == nil {
+		return nil, fmt.Errorf("API %s does not return a selectable model", apiSchema.Name)
+	}
+	fields, err := selection.Parse(selectText)
+	if err != nil {
+		return nil, fmt.Errorf("parse --select: %w", err)
+	}
+	return schema.SelectToFieldMask(fields, model, runtimeSchema)
+}
+
+func parseBinaryCLIValue(raw string, param schema.Param) (any, error) {
+	if param.IsList {
+		var values []any
+		if err := json.Unmarshal([]byte(raw), &values); err != nil {
+			return nil, fmt.Errorf("expected JSON array: %w", err)
+		}
+		for i := range values {
+			value, err := parseBinaryJSONValue(values[i], param.Type)
+			if err != nil {
+				return nil, fmt.Errorf("element %d: %w", i, err)
+			}
+			values[i] = value
+		}
+		return values, nil
+	}
+	if param.Type == schema.FieldJSON {
+		var value any
+		if err := json.Unmarshal([]byte(raw), &value); err != nil {
+			return nil, fmt.Errorf("expected JSON value: %w", err)
+		}
+		return value, nil
+	}
+	return parseBinaryTextValue(raw, param.Type)
+}
+
+func parseBinaryJSONValue(value any, fieldType schema.FieldType) (any, error) {
+	if fieldType == schema.FieldJSON {
+		return value, nil
+	}
+	if fieldType == schema.FieldBytes {
+		text, ok := value.(string)
+		if !ok {
+			return nil, fmt.Errorf("expected base64 string")
+		}
+		return parseBinaryTextValue(text, fieldType)
+	}
+	if text, ok := value.(string); ok {
+		return parseBinaryTextValue(text, fieldType)
+	}
+	return value, nil
+}
+
+func parseBinaryTextValue(raw string, fieldType schema.FieldType) (any, error) {
+	switch fieldType {
+	case schema.FieldInt, schema.FieldDuration:
+		return strconv.ParseInt(raw, 10, 64)
+	case schema.FieldFloat:
+		return strconv.ParseFloat(raw, 64)
+	case schema.FieldBool:
+		return strconv.ParseBool(raw)
+	case schema.FieldBytes:
+		return base64.StdEncoding.DecodeString(raw)
+	case schema.FieldString, schema.FieldEnum, schema.FieldDateTime, schema.FieldUUID, schema.FieldDecimal:
+		return raw, nil
+	default:
+		return nil, fmt.Errorf("unsupported CLI type %s", fieldType.String())
+	}
 }
 
 func parseParam(s string) (string, string) {
@@ -184,19 +308,4 @@ func inferType(v string) any {
 		return false
 	}
 	return v
-}
-
-func inferLuxoType(v string) string {
-	var i int64
-	if _, err := fmt.Sscanf(v, "%d", &i); err == nil && fmt.Sprintf("%d", i) == v {
-		return "Int"
-	}
-	var f float64
-	if _, err := fmt.Sscanf(v, "%g", &f); err == nil {
-		return "Float"
-	}
-	if v == "true" || v == "false" {
-		return "Boolean"
-	}
-	return "String"
 }

@@ -51,6 +51,17 @@ func TestAuthMiddlewareValidToken(t *testing.T) {
 	}
 }
 
+func TestNewGatewayConfiguresStreamIdentityExtraction(t *testing.T) {
+	gateway := New()
+	claims := &Claims{data: map[string]any{"id": float64(42)}}
+	ctx := context.WithValue(context.Background(), identityKey, claims)
+
+	got := gateway.Router.IdentityExtractor(ctx)
+	if got != claims {
+		t.Fatalf("stream identity = %#v, want authenticated claims", got)
+	}
+}
+
 func TestAuthMiddlewareAcceptsWebSocketQueryToken(t *testing.T) {
 	cfg := testCfg()
 	token, _ := auth.Sign(cfg, map[string]any{"id": float64(42)})

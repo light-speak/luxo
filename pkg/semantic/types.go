@@ -16,6 +16,7 @@ const (
 	TypeUUID
 	TypeDecimal
 	TypeBytes
+	TypeJSON
 	TypeVoid // internal only, not user-facing
 	TypeModel
 	TypeInterface
@@ -164,6 +165,7 @@ func BuiltinTypes() map[string]*ResolvedType {
 		"UUID":     {Kind: TypeUUID, Name: "UUID", Fields: map[string]*FieldInfo{}},
 		"Decimal":  {Kind: TypeDecimal, Name: "Decimal", Fields: map[string]*FieldInfo{}},
 		"Bytes":    {Kind: TypeBytes, Name: "Bytes", Fields: map[string]*FieldInfo{}},
+		"JSON":     {Kind: TypeJSON, Name: "JSON", Fields: map[string]*FieldInfo{}},
 		"Result":   {Kind: TypeGeneric, Name: "Result", Fields: map[string]*FieldInfo{}},
 		"Channel":  {Kind: TypeGeneric, Name: "Channel", Fields: map[string]*FieldInfo{}},
 		"Page": {Kind: TypeGeneric, Name: "Page", Fields: map[string]*FieldInfo{
@@ -243,4 +245,23 @@ func (t *ResolvedType) LookupField(name string) *FieldInfo {
 		}
 	}
 	return nil
+}
+
+func (t *ResolvedType) inheritsFrom(name string) bool {
+	visited := make(map[*ResolvedType]bool)
+	pending := append([]*ResolvedType(nil), t.Parents...)
+	for len(pending) > 0 {
+		last := len(pending) - 1
+		parent := pending[last]
+		pending = pending[:last]
+		if parent == nil || visited[parent] {
+			continue
+		}
+		if parent.Name == name {
+			return true
+		}
+		visited[parent] = true
+		pending = append(pending, parent.Parents...)
+	}
+	return false
 }

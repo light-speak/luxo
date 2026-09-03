@@ -34,6 +34,61 @@ func (e *Encoder) Bytes() []byte {
 	return e.buf
 }
 
+// WriteFieldHeader writes a field ID without a value.
+func (e *Encoder) WriteFieldHeader(fieldID int) {
+	e.buf = AppendVarint(e.buf, uint64(fieldID))
+}
+
+// WriteNull writes the nullable null marker.
+func (e *Encoder) WriteNull() {
+	e.buf = AppendNull(e.buf)
+}
+
+// WritePresent writes the nullable present marker.
+func (e *Encoder) WritePresent() {
+	e.buf = AppendPresent(e.buf)
+}
+
+// WriteInt writes a signed integer value without a field header.
+func (e *Encoder) WriteInt(v int64) {
+	e.buf = AppendSvarint(e.buf, v)
+}
+
+// WriteVarint writes an unsigned integer value without a field header.
+func (e *Encoder) WriteVarint(v uint64) {
+	e.buf = AppendVarint(e.buf, v)
+}
+
+// WriteFloat writes a float value without a field header.
+func (e *Encoder) WriteFloat(v float64) {
+	e.buf = AppendFixed64(e.buf, v)
+}
+
+// WriteString writes a string value without a field header.
+func (e *Encoder) WriteString(v string) {
+	e.buf = AppendString(e.buf, v)
+}
+
+// WriteBool writes a boolean value without a field header.
+func (e *Encoder) WriteBool(v bool) {
+	e.buf = AppendBool(e.buf, v)
+}
+
+// WriteBytes writes bytes without a field header.
+func (e *Encoder) WriteBytes(v []byte) {
+	e.buf = AppendBytes(e.buf, v)
+}
+
+// WriteUUID writes a UUID without a field header.
+func (e *Encoder) WriteUUID(v [16]byte) {
+	e.buf = AppendUUID(e.buf, v)
+}
+
+// WriteArrayHeader writes an array count without a field header.
+func (e *Encoder) WriteArrayHeader(count int) {
+	e.buf = AppendArrayHeader(e.buf, count)
+}
+
 // --- Field writers ---
 // Each writes: [fieldID varint] [value]
 

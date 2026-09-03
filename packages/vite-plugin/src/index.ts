@@ -53,11 +53,12 @@ async function loadSchema(options: LuxoPluginOptions): Promise<LuxoSchema | null
   // Try endpoint first
   if (options.endpoint) {
     try {
-      let url = `${options.endpoint}?$schema`
+      const url = `${options.endpoint}?$schema`
+      const headers: Record<string, string> = {}
       if (options.introspectionKey) {
-        url += `&key=${options.introspectionKey}`
+        headers['X-Introspection-Key'] = options.introspectionKey
       }
-      const resp = await fetch(url)
+      const resp = await fetch(url, { headers })
       if (resp.ok) {
         return await resp.json() as LuxoSchema
       }

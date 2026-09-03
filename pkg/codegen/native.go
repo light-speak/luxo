@@ -2,11 +2,6 @@ package codegen
 
 import (
 	"fmt"
-	"go/ast"
-	"go/format"
-	"go/parser"
-	"go/token"
-	"os"
 	"strings"
 
 	luxoast "github.com/light-speak/luxo/pkg/ast"
@@ -25,7 +20,8 @@ type nativeAPI struct {
 // Returns nil if there are no @native APIs.
 func GenerateNativeFile(result *semantic.Result, packageName string) []byte {
 	apis := collectNativeAPIs(result)
-	if len(apis) == 0 {
+	hasNativeStreams := resultHasNativeStreams(result)
+	if len(apis) == 0 && !hasNativeStreams {
 		return nil
 	}
 
@@ -45,24 +41,27 @@ func GenerateNativeFile(result *semantic.Result, packageName string) []byte {
 	}
 	if needsTime {
 		b.WriteString("import (\n\t\"context\"\n\t\"time\"\n)\n\n")
-	} else {
+	} else if len(apis) > 0 {
 		b.WriteString("import \"context\"\n\n")
 	}
 
 	b.WriteString("// NativeResolver is the interface for @native API implementations.\n")
 	b.WriteString("// Implement this interface in your resolver package.\n")
 	b.WriteString("type NativeResolver interface {\n")
+	if hasNativeStreams {
+		b.WriteString("\tStreamResolver\n")
+	}
 	for _, api := range apis {
 		fmt.Fprintf(&b, "\t%s(ctx context.Context", str.Capitalize(api.Name))
 		for _, p := range api.Params {
 			goType := resolveGoType(p.Type)
 			fmt.Fprintf(&b, ", %s %s", p.Name, goType)
 		}
-		retType := "any" // fallback — now caught by semantic analyzer (@native must have return type)
-		if api.ReturnType != nil {
-			retType = resolveGoType(api.ReturnType)
+		if api.ReturnType == nil {
+			b.WriteString(") error\n")
+		} else {
+			fmt.Fprintf(&b, ") (%s, error)\n", resolveGoType(api.ReturnType))
 		}
-		fmt.Fprintf(&b, ") (%s, error)\n", retType)
 	}
 	b.WriteString("}\n")
 
@@ -74,7 +73,7 @@ func collectNativeAPIs(result *semantic.Result) []nativeAPI {
 	var apis []nativeAPI
 	for _, file := range result.Files {
 		for _, a := range file.APIs {
-			if hasDirective(a.Directives, "native") {
+			if hasDirective(a.Directives, "native") && !hasDirective(a.Directives, "stream") {
 				apis = append(apis, nativeAPI{
 					Name:       a.Name,
 					Params:     a.Params,
@@ -95,83 +94,13 @@ func collectNativeAPIs(result *semantic.Result) []nativeAPI {
 	return apis
 }
 
-// MergeResolver updates function signatures in a Go resolver file while preserving method bodies.
-// It reads the file, finds functions matching @native APIs, updates their signatures, and writes back.
-// New @native functions that don't exist yet are appended with a TODO body.
-func MergeResolver(filePath string, apis []nativeAPI) error {
-	src, err := os.ReadFile(filePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // no resolver file, nothing to merge
+func resultHasNativeStreams(result *semantic.Result) bool {
+	for _, file := range result.Files {
+		for _, api := range file.APIs {
+			if hasDirective(api.Directives, "native") && hasDirective(api.Directives, "stream") {
+				return true
+			}
 		}
-		return err
 	}
-
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, filePath, src, parser.ParseComments)
-	if err != nil {
-		return fmt.Errorf("parse %s: %w", filePath, err)
-	}
-
-	// Build a map of existing function names → positions
-	existingFuncs := make(map[string]*ast.FuncDecl)
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Recv != nil {
-			continue // skip methods, only look at package-level funcs
-		}
-		existingFuncs[fn.Name.Name] = fn
-	}
-
-	// Collect new functions to append
-	var toAppend []string
-	for _, api := range apis {
-		funcName := str.Capitalize(api.Name)
-		if _, exists := existingFuncs[funcName]; exists {
-			// Function exists — signature update would require AST rewriting.
-			// For now, trust the user's implementation. If signature changes,
-			// the compiler will catch it via the NativeResolver interface.
-			continue
-		}
-		// New function — generate stub
-		toAppend = append(toAppend, generateNativeStub(api))
-	}
-
-	if len(toAppend) == 0 {
-		return nil // nothing to add
-	}
-
-	// Format existing code + append new stubs
-	var buf strings.Builder
-	formatted, err := format.Source(src)
-	if err != nil {
-		formatted = src // use original if format fails
-	}
-	buf.Write(formatted)
-	for _, stub := range toAppend {
-		buf.WriteString("\n")
-		buf.WriteString(stub)
-	}
-
-	return os.WriteFile(filePath, []byte(buf.String()), 0644)
-}
-
-// generateNativeStub creates a function stub for a new @native API.
-func generateNativeStub(api nativeAPI) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "// %s implements the @native API.\n", str.Capitalize(api.Name))
-	fmt.Fprintf(&b, "func %s(ctx context.Context", str.Capitalize(api.Name))
-	for _, p := range api.Params {
-		goType := resolveGoType(p.Type)
-		fmt.Fprintf(&b, ", %s %s", p.Name, goType)
-	}
-	retType := "any" // fallback — now caught by semantic analyzer (@native must have return type)
-	if api.ReturnType != nil {
-		retType = resolveGoType(api.ReturnType)
-	}
-	fmt.Fprintf(&b, ") (%s, error) {\n", retType)
-	fmt.Fprintf(&b, "\t// TODO: implement %s\n", api.Name)
-	fmt.Fprintf(&b, "\tpanic(\"not implemented\")\n")
-	b.WriteString("}\n")
-	return b.String()
+	return false
 }

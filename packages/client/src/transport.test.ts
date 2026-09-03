@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { FetchTransport, WsTransport } from './transport'
+import { FetchTransport, WsTransport, decodeBinaryError, encodeBinaryBody, encodeParam } from './transport'
+import { Encoder } from './codec'
 import { LuxoError } from './error'
 
 // Mock global fetch
@@ -11,6 +12,58 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks()
+})
+
+describe('binary param validation', () => {
+	it('rejects non-canonical binary error envelopes', () => {
+		for (const body of [
+			new Uint8Array([1]),
+			new Uint8Array([1, 0xa0, 0x06, 0]),
+			new Uint8Array([1, 0xa0, 0x06, 2, 1, 69, 3, 1, 109]),
+			new Uint8Array([1, 0xa0, 0x06, 2, 1, 69, 3, 1, 109, 0, 1]),
+		]) {
+			expect(decodeBinaryError(body, 400).error).toBe('ParseError')
+		}
+	})
+	it('rejects unknown wire types', () => {
+		expect(() => encodeParam(new Encoder(), { fieldID: 1, type: 'Model' }, {})).toThrow('unsupported binary param type')
+		expect(() => encodeParam(new Encoder(), { fieldID: 1, type: 'Model', isList: true }, [])).toThrow('unsupported binary list param type')
+	})
+
+	it('accepts only RFC3339 strings for DateTime', () => {
+		expect(() => encodeParam(new Encoder(), { fieldID: 1, type: 'DateTime' }, 0)).toThrow('RFC3339 string')
+		expect(() => encodeParam(new Encoder(), { fieldID: 1, type: 'DateTime' }, 'not-a-date')).toThrow('RFC3339 string')
+	})
+
+	it('distinguishes nullable null, present, and absent params', () => {
+		const meta = {
+			id: 9,
+			params: [
+				{ fieldID: 1, name: 'nickname', type: 'String', nullable: true },
+				{ fieldID: 2, name: 'age', type: 'Int', nullable: true },
+			],
+		}
+		expect(Array.from(encodeBinaryBody(meta, { nickname: null, age: 42 }))).toEqual([9, 0, 1, 0, 2, 1, 84, 0])
+		expect(Array.from(encodeBinaryBody(meta, {}))).toEqual([9, 0, 0])
+	})
+
+	it('encodes filters and sorters instead of dropping binary list controls', () => {
+		const body = encodeBinaryBody({ id: 5 }, {
+			$filters: [{ field: 'age', op: 'gte', value: 18 }],
+			$sorters: [{ field: 'createdAt', order: 'desc' }],
+		})
+		expect(Array.from(body)).toEqual([
+			5, 0,
+			0xfe, 0xff, 0xff, 0xff, 0x07, 1, 3, 97, 103, 101, 4, 2, 49, 56,
+			0xff, 0xff, 0xff, 0xff, 0x07, 1, 9, 99, 114, 101, 97, 116, 101, 100, 65, 116, 1,
+			0,
+		])
+	})
+
+	it('rejects malformed binary list controls', () => {
+		expect(() => encodeBinaryBody({ id: 1 }, { $filters: [{ field: 'age', op: 'bad', value: 1 }] })).toThrow('invalid $filters')
+		expect(() => encodeBinaryBody({ id: 1 }, { $sorters: [{ field: 'age', order: 'bad' }] })).toThrow('invalid $sorters')
+	})
 })
 
 describe('FetchTransport constructor', () => {
@@ -80,7 +133,7 @@ describe('FetchTransport setToken / setMode / setSchema', () => {
 describe('FetchTransport binary field selection', () => {
   it('encodes $select into the request field mask', async () => {
     const t = new FetchTransport('http://localhost:8080/api', { mode: 'binary' })
-    t.setSchema({ getUser: { id: 1, fields: { id: 1, name: 2 } } })
+    t.setSchema({ getUser: { id: 1, fields: { id: { fieldID: 1 }, name: { fieldID: 2 } } } })
     mockFetch.mockResolvedValueOnce({
       ok: true,
       status: 200,
@@ -90,7 +143,29 @@ describe('FetchTransport binary field selection', () => {
     await t.call('getUser', { $select: 'name' })
 
     const body = new Uint8Array(mockFetch.mock.calls[0][1].body as ArrayBuffer)
-    expect(Array.from(body)).toEqual([1, 1, 4, 0])
+		expect(Array.from(body)).toEqual([1, 2, 1, 2, 0])
+  })
+
+  it('encodes nested selections recursively and rejects invalid paths', () => {
+    const meta = {
+      id: 1,
+      fields: {
+        id: { fieldID: 1 },
+        posts: { fieldID: 3, typeName: 'Post' },
+      },
+      types: {
+        Post: {
+          id: { fieldID: 1 },
+          title: { fieldID: 2 },
+        },
+      },
+    }
+    expect(Array.from(encodeBinaryBody(meta, { $select: 'id,posts{title}' }))).toEqual([
+      1, 6, 1, 5, 3, 2, 1, 2, 0,
+    ])
+    expect(() => encodeBinaryBody(meta, { $select: 'missing' })).toThrow('unknown selected field')
+    expect(() => encodeBinaryBody(meta, { $select: 'id{name}' })).toThrow('does not support nested selection')
+    expect(() => encodeBinaryBody(meta, { $select: 'id,id' })).toThrow('duplicate field')
   })
 
   it('refreshes an expired token once in binary mode', async () => {
@@ -110,6 +185,34 @@ describe('FetchTransport binary field selection', () => {
     expect(refresh).toHaveBeenCalledTimes(1)
     expect(mockFetch).toHaveBeenCalledTimes(2)
     expect(mockFetch.mock.calls[1][1].headers.Authorization).toBe('Bearer fresh-token')
+  })
+
+  it('decodes the canonical binary error envelope', async () => {
+	const t = new FetchTransport('http://localhost:8080/api', { mode: 'binary' })
+	t.setSchema({ createUser: { id: 1 } })
+	const body = new Uint8Array([
+	  1, 0xa0, 0x06,
+	  2, 10, 66, 97, 100, 82, 101, 113, 117, 101, 115, 116,
+	  3, 3, 98, 97, 100,
+	  4, 1, 116,
+	  5, 2, 123, 125,
+	  6, 1, 99,
+	  0,
+	])
+	mockFetch.mockResolvedValueOnce({
+	  ok: false,
+	  status: 400,
+	  arrayBuffer: async () => body.buffer,
+	})
+
+	await expect(t.call('createUser')).rejects.toMatchObject({
+	  error: 'BadRequest',
+	  code: 400,
+	  message: 'bad',
+	  traceId: 't',
+	  data: {},
+	  cause: 'c',
+	})
   })
 })
 
@@ -347,10 +450,17 @@ describe('FetchTransport observability', () => {
         ],
       },
     })
+    const body = new Uint8Array([
+      1, 0xa2, 0x06,
+      2, 12, 85, 110, 97, 117, 116, 104, 111, 114, 105, 122, 101, 100,
+      3, 19, 105, 110, 118, 97, 108, 105, 100, 32, 99, 114, 101, 100, 101, 110, 116, 105, 97, 108, 115,
+      4, 10, 116, 114, 97, 99, 101, 45, 115, 97, 102, 101,
+      0,
+    ])
     mockFetch.mockResolvedValueOnce({
       ok: false,
       status: 401,
-      json: async () => ({ error: 'Unauthorized', code: 401, message: 'invalid credentials', traceId: 'trace-safe' }),
+      arrayBuffer: async () => body.buffer,
     })
 
     await expect(t.call('login', { username: 'admin', password: secret })).rejects.toBeInstanceOf(LuxoError)
@@ -381,6 +491,12 @@ describe('LuxoError', () => {
   it('works without traceId', () => {
     const err = new LuxoError('NetworkError', 0, 'connection refused')
     expect(err.traceId).toBeUndefined()
+  })
+
+  it('carries structured data and development cause', () => {
+    const err = new LuxoError('BadRequest', 400, 'bad', 'trace', { param: 'email' }, 'validation failed')
+    expect(err.data).toEqual({ param: 'email' })
+    expect(err.cause).toBe('validation failed')
   })
 })
 
@@ -433,6 +549,8 @@ describe('WsTransport subscriptions', () => {
 
     expect(socket.url).toBe('ws://localhost/luvia?token=secret')
     socket.open()
+    await Promise.resolve()
+    socket.message(JSON.stringify({ $sub: 'liveAlerts', ok: true }))
     const unsubscribe = await subscribed
 
     expect(JSON.parse(socket.sent[0] as string)).toEqual({ $sub: 'liveAlerts', projectId: 7 })
@@ -451,14 +569,52 @@ describe('WsTransport subscriptions', () => {
     const subscribed = transport.subscribe('liveTraces', { projectId: 7 }, listener)
     const socket = FakeWebSocket.instances[0]
     socket.open()
+    await Promise.resolve()
+    socket.message(new Uint8Array([0x07, 12]).buffer)
     const unsubscribe = await subscribed
 
-    expect(Array.from(new Uint8Array(socket.sent[0] as ArrayBuffer))).toEqual([0xFE, 12, 0, 1, 14, 0])
-    socket.message(new Uint8Array([0xFD, 12, 9, 0]).buffer)
+	expect(Array.from(new Uint8Array(socket.sent[0] as ArrayBuffer))).toEqual([0x04, 12, 0, 1, 14, 0])
+	socket.message(new Uint8Array([0x06, 12, 9, 0]).buffer)
     expect(Array.from(listener.mock.calls[0][0] as Uint8Array)).toEqual([9, 0])
 
     unsubscribe()
-    expect(Array.from(new Uint8Array(socket.sent[1] as ArrayBuffer))).toEqual([0xFF, 12])
+	expect(Array.from(new Uint8Array(socket.sent[1] as ArrayBuffer))).toEqual([0x05, 12])
+    transport.close()
+  })
+
+  it('rejects a JSON subscription when the server rejects it', async () => {
+    const transport = new WsTransport('ws://localhost/luvia')
+    const subscribed = transport.subscribe('getUser', {}, vi.fn())
+    const socket = FakeWebSocket.instances[0]
+    socket.open()
+    await Promise.resolve()
+    socket.message(JSON.stringify({
+      $sub: 'getUser',
+      error: 'BadRequest',
+      code: 400,
+      message: 'getUser is not a stream API',
+    }))
+
+    await expect(subscribed).rejects.toMatchObject({ error: 'BadRequest', code: 400 })
+    transport.close()
+  })
+
+  it('rejects a binary subscription when the server rejects it', async () => {
+    const transport = new WsTransport('ws://localhost/luvia', { mode: 'binary' })
+    transport.setSchema({ getUser: { id: 10 } })
+    const subscribed = transport.subscribe('getUser', {}, vi.fn())
+    const socket = FakeWebSocket.instances[0]
+    socket.open()
+    await Promise.resolve()
+    socket.message(new Uint8Array([
+      0x08, 10,
+      1, 0xa0, 0x06,
+      2, 10, 66, 97, 100, 82, 101, 113, 117, 101, 115, 116,
+      3, 3, 98, 97, 100,
+      0,
+    ]).buffer)
+
+    await expect(subscribed).rejects.toMatchObject({ error: 'BadRequest', code: 400 })
     transport.close()
   })
 
@@ -467,6 +623,67 @@ describe('WsTransport subscriptions', () => {
     await expect(transport.subscribe('liveAlerts', {}, vi.fn())).rejects.toMatchObject({
       error: 'ConfigError',
     })
+  })
+
+  it('times out when a subscription acknowledgement never arrives', async () => {
+    const transport = new WsTransport('ws://localhost/luvia', { timeout: 5 })
+    const subscribed = transport.subscribe('liveAlerts', {}, vi.fn())
+    const socket = FakeWebSocket.instances[0]
+    socket.open()
+
+    await expect(subscribed).rejects.toMatchObject({ error: 'TimeoutError' })
+    transport.close()
+  })
+})
+
+describe('WsTransport binary RPC frames', () => {
+  beforeEach(() => {
+    FakeWebSocket.instances = []
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+  })
+
+  it('uses an explicit frame type at the old sequence collision boundary', async () => {
+    const transport = new WsTransport('ws://localhost/luvia', { mode: 'binary' })
+    transport.setSchema({ health: { id: 7 } })
+    ;(transport as unknown as { seq: number }).seq = 252
+    const request = transport.call('health')
+    const socket = FakeWebSocket.instances[0]
+    socket.open()
+    await Promise.resolve()
+
+    expect(Array.from(new Uint8Array(socket.sent[0] as ArrayBuffer))).toEqual([0x01, 0xfd, 0x01, 7, 0, 0])
+    socket.message(new Uint8Array([0x02, 0xfd, 0x01, 9, 0]).buffer)
+    await expect(request).resolves.toEqual(new Uint8Array([9, 0]))
+    transport.close()
+  })
+
+  it('times out when a call response never arrives', async () => {
+    const transport = new WsTransport('ws://localhost/luvia', { timeout: 5 })
+    const request = transport.call('health')
+    const socket = FakeWebSocket.instances[0]
+    socket.open()
+
+    await expect(request).rejects.toMatchObject({ error: 'TimeoutError' })
+    transport.close()
+  })
+
+  it('rejects a call from a canonical binary error frame', async () => {
+    const transport = new WsTransport('ws://localhost/luvia', { mode: 'binary' })
+    transport.setSchema({ health: { id: 7 } })
+    const request = transport.call('health')
+    const socket = FakeWebSocket.instances[0]
+    socket.open()
+    await Promise.resolve()
+    socket.message(new Uint8Array([
+      0x03, 1,
+      1, 0xa0, 0x06,
+      2, 10, 66, 97, 100, 82, 101, 113, 117, 101, 115, 116,
+      3, 3, 98, 97, 100,
+      0,
+    ]).buffer)
+
+    await expect(request).rejects.toMatchObject({ error: 'BadRequest', code: 400, message: 'bad' })
+    transport.close()
   })
 })
 

@@ -3550,9 +3550,9 @@ api test(a: Int, b: Int): Boolean {
 
 func TestStreamItInjected(t *testing.T) {
 	result := analyze(t, `
-event TraceIngested(projectId: Int, traceId: String)
+event TraceIngested(traceId: String, projectId: Int)
 
-api liveTraces(projectId: Int): Int @stream(TraceIngested) {
+api liveTraces(projectId: Int): String @stream(TraceIngested) {
   it.projectId == projectId
 }
 `)
@@ -3561,23 +3561,125 @@ api liveTraces(projectId: Int): Int @stream(TraceIngested) {
 
 func TestStreamItFieldAccess(t *testing.T) {
 	result := analyze(t, `
-event AlertFired(projectId: Int, severity: String)
+event AlertFired(alert: String, projectId: Int)
 
-api liveAlerts(projectId: Int): Int @stream(AlertFired) {
+api liveAlerts(projectId: Int): String @stream(AlertFired) {
   it.projectId == projectId
 }
 `)
 	expectNoErrors(t, result)
 }
 
-func TestStreamWithoutEventNoIt(t *testing.T) {
-	// @stream without event name — no `it` injected, body should still work
+func TestStreamWithoutEventRequiresNative(t *testing.T) {
 	result := analyze(t, `
 api watch(): Int @stream {
-  return 1
+  true
 }
 `)
-	expectNoErrors(t, result)
+	expectError(t, result, "@stream without an event source requires @native")
+}
+
+func TestStreamContractValidation(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "missing return type",
+			input: `event Changed(value: Int)\napi watch @stream(Changed)`,
+			want:  "@stream API must declare a return type",
+		},
+		{
+			name:  "event argument must be identifier",
+			input: `event Changed(value: Int)\napi watch: Int @stream("Changed")`,
+			want:  "@stream event source must be an event identifier",
+		},
+		{
+			name:  "unknown event",
+			input: `api watch: Int @stream(Missing)`,
+			want:  "@stream event 'Missing' does not exist",
+		},
+		{
+			name:  "missing payload",
+			input: `event Changed(value: String)\napi watch: Int @stream(Changed)`,
+			want:  "must contain exactly one payload parameter of type 'Int'",
+		},
+		{
+			name:  "ambiguous payload",
+			input: `event Changed(before: Int, after: Int)\napi watch: Int @stream(Changed)`,
+			want:  "must contain exactly one payload parameter of type 'Int'",
+		},
+		{
+			name:  "nullable payload mismatch",
+			input: `event Changed(value: Int?)\napi watch: Int @stream(Changed)`,
+			want:  "must contain exactly one payload parameter of type 'Int'",
+		},
+		{
+			name:  "nullable return",
+			input: `event Changed(value: Int?)\napi watch: Int? @stream(Changed)`,
+			want:  "@stream return type must be non-nullable",
+		},
+		{
+			name:  "native body",
+			input: `event Changed(value: Int)\napi watch: Int @stream(Changed) @native { true }`,
+			want:  "@native @stream API cannot declare a Luxo matcher body",
+		},
+		{
+			name:  "multiple matcher statements",
+			input: `event Changed(value: String, id: Int)\napi watch(id: Int): String @stream(Changed) { true\nit.id == id }`,
+			want:  "@stream matcher body must contain exactly one boolean expression",
+		},
+		{
+			name:  "non boolean matcher",
+			input: `event Changed(value: String, id: Int)\napi watch(id: Int): String @stream(Changed) { it.id }`,
+			want:  "@stream matcher expression must be Boolean",
+		},
+		{
+			name:  "cache conflict",
+			input: `event Changed(value: Int)\napi watch: Int @stream(Changed) @cache(10)`,
+			want:  "@stream cannot be combined with @cache",
+		},
+		{
+			name:  "paginate conflict",
+			input: `event Changed(value: Int)\napi watch: Int @stream(Changed) @paginate`,
+			want:  "@stream cannot be combined with @paginate",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := analyze(t, strings.ReplaceAll(tt.input, `\n`, "\n"))
+			expectError(t, result, tt.want)
+		})
+	}
+}
+
+func TestStreamGeneratedMatcherRejectsUnsupportedFieldTypes(t *testing.T) {
+	result := analyze(t, `
+event Changed(value: String, metadata: JSON)
+api watch(metadata: JSON): String @stream(Changed) {
+  it.metadata == metadata
+}
+`)
+	expectError(t, result, "cannot be used in a generated @stream matcher")
+}
+
+func TestEventWireTypesAreResolvedAndValidated(t *testing.T) {
+	valid := analyze(t, `
+type Payload { metadata: JSON }
+event Changed(payload: Payload, metadata: JSON, ids: [UUID])
+`)
+	expectNoErrors(t, valid)
+
+	duplicate := analyze(t, `event Changed(id: Int, id: Int)`)
+	expectError(t, duplicate, "duplicate parameter 'id' in event 'Changed'")
+
+	unsupported := analyze(t, `
+interface Payload { id: Int }
+event Changed(payload: Payload)
+`)
+	expectError(t, unsupported, "unsupported wire type 'Payload'")
 }
 
 func TestOnHandlerNamedParam(t *testing.T) {

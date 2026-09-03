@@ -6,9 +6,15 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/light-speak/luxo/pkg/lux/cache"
 )
 
 func TestWithCache(t *testing.T) {
+	previous := DefaultCache
+	SetCache(cache.NewMemory())
+	t.Cleanup(func() { SetCache(previous) })
+
 	called := 0
 	handler := func(ctx context.Context, req *Request) error {
 		called++

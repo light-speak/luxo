@@ -115,6 +115,181 @@ api test(): Int {
 	expectNoErrors(t, result)
 }
 
+func TestSemanticTypeReferenceHelpers(t *testing.T) {
+	nested := &ast.TypeRef{
+		Name:     "Page",
+		Nullable: true,
+		TypeArgs: []*ast.TypeRef{{Name: "User"}},
+		Tuple:    []*ast.TypeRef{{Name: "Post"}},
+	}
+	clone := &ast.TypeRef{
+		Name:     "Page",
+		Nullable: true,
+		TypeArgs: []*ast.TypeRef{{Name: "User"}},
+		Tuple:    []*ast.TypeRef{{Name: "Post"}},
+	}
+	if !sameTypeRefExact(nil, nil) || sameTypeRefExact(nil, nested) || !sameTypeRefExact(nested, clone) {
+		t.Fatal("exact type-reference comparison failed")
+	}
+	clone.TypeArgs[0] = &ast.TypeRef{Name: "Admin"}
+	if sameTypeRefExact(nested, clone) {
+		t.Fatal("different generic arguments compared equal")
+	}
+	clone.TypeArgs[0] = &ast.TypeRef{Name: "User"}
+	clone.Tuple[0] = &ast.TypeRef{Name: "Video"}
+	if sameTypeRefExact(nested, clone) {
+		t.Fatal("different tuple members compared equal")
+	}
+	if formatTypeRef(nil) != "" || formatTypeRef(&ast.TypeRef{Name: "User", IsList: true, Nullable: true}) != "[User]?" {
+		t.Fatal("type-reference formatting failed")
+	}
+}
+
+func TestComputedAggregateHelpers(t *testing.T) {
+	idField := &ast.FieldDecl{Name: "key", Directives: []*ast.Directive{{Name: "id"}}}
+	if got := computedModelPrimaryKeyName(&ast.ModelDecl{Fields: []*ast.FieldDecl{idField}}); got != "key" {
+		t.Fatalf("primary key = %q", got)
+	}
+	if got := computedModelPrimaryKeyName(&ast.ModelDecl{Fields: []*ast.FieldDecl{{Name: "id"}}}); got != "id" {
+		t.Fatalf("conventional primary key = %q", got)
+	}
+	if got := computedModelPrimaryKeyName(&ast.ModelDecl{}); got != "id" {
+		t.Fatalf("fallback primary key = %q", got)
+	}
+	if computedFieldTypeName(nil) != "unknown" || computedFieldTypeName(&ast.FieldDecl{}) != "unknown" ||
+		computedFieldTypeName(&ast.FieldDecl{Type: &ast.TypeRef{Name: "Decimal"}}) != "Decimal" {
+		t.Fatal("computed field type detection failed")
+	}
+
+	ident := &ast.Ident{Name: "posts"}
+	member := &ast.MemberExpr{Object: ident, Field: "amount"}
+	tests := []struct {
+		name      string
+		directive *ast.Directive
+		relation  string
+		field     string
+		ok        bool
+	}{
+		{name: "missing target", directive: &ast.Directive{Name: "count"}},
+		{name: "count relation", directive: &ast.Directive{Name: "count", Args: []*ast.NamedArg{{Value: ident}}}, relation: "posts", ok: true},
+		{name: "sum relation only", directive: &ast.Directive{Name: "sum", Args: []*ast.NamedArg{{Value: ident}}}, relation: "posts"},
+		{name: "sum field", directive: &ast.Directive{Name: "sum", Args: []*ast.NamedArg{{Value: member}}}, relation: "posts", field: "amount", ok: true},
+		{name: "count field", directive: &ast.Directive{Name: "count", Args: []*ast.NamedArg{{Value: member}}}},
+		{name: "invalid owner", directive: &ast.Directive{Name: "sum", Args: []*ast.NamedArg{{Value: &ast.MemberExpr{Object: &ast.Literal{}, Field: "amount"}}}}},
+		{name: "invalid target", directive: &ast.Directive{Name: "sum", Args: []*ast.NamedArg{{Value: &ast.Literal{}}}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			relation, field, ok := computedAggregateTarget(test.directive)
+			if relation != test.relation || field != test.field || ok != test.ok {
+				t.Fatalf("target = %q.%q, %v", relation, field, ok)
+			}
+		})
+	}
+	if computedAggregateTargetSuffix("count") == computedAggregateTargetSuffix("sum") {
+		t.Fatal("aggregate target hints must distinguish count from numeric functions")
+	}
+}
+
+func TestFederationIdentifierHelpers(t *testing.T) {
+	field := &ast.FieldDecl{Directives: []*ast.Directive{
+		{Name: "deprecated"},
+		{Name: "by", Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "authorKey"}}, {Value: &ast.Ident{Name: "key"}}}},
+	}}
+	foreign, local := federationRelationKeys("User", "id", field)
+	if foreign != "authorKey" || local != "key" {
+		t.Fatalf("explicit federation keys = %q, %q", foreign, local)
+	}
+	foreign, local = federationRelationKeys("User", "id", &ast.FieldDecl{})
+	if foreign != "userId" || local != "id" {
+		t.Fatalf("default federation keys = %q, %q", foreign, local)
+	}
+	directive := &ast.Directive{Args: []*ast.NamedArg{{Value: &ast.Literal{}}}}
+	if directiveIdentifierArg(directive, 0) != "" || directiveIdentifierArg(directive, 1) != "" {
+		t.Fatal("invalid directive identifiers were accepted")
+	}
+	if lowerFirstIdentifier("") != "" || upperFirstIdentifier("") != "" ||
+		lowerFirstIdentifier("Üser") != "üser" || upperFirstIdentifier("über") != "Über" {
+		t.Fatal("Unicode identifier case conversion failed")
+	}
+}
+
+func TestResolvedCollectionAndLoadHelpers(t *testing.T) {
+	if cloneResolvedType(nil) != nil || collectionElementType(nil) != nil {
+		t.Fatal("nil resolved type was not preserved")
+	}
+	intType := &ResolvedType{Kind: TypeInt, Name: "Int"}
+	listType := &ResolvedType{Kind: TypeInt, Name: "Int", IsList: true, Nullable: true}
+	listElement := collectionElementType(listType)
+	if listElement == listType || listElement.IsList || listElement.Nullable {
+		t.Fatal("list element type was not cloned and normalized")
+	}
+	channel := &ResolvedType{Kind: TypeGeneric, Name: "Channel", TypeArgs: []*ResolvedType{intType}}
+	if element := collectionElementType(channel); element == intType || element.Name != "Int" {
+		t.Fatal("channel element type was not cloned")
+	}
+	if collectionElementType(intType) != nil {
+		t.Fatal("scalar type exposed a collection element")
+	}
+	if !sameResolvedType(nil, intType) || sameResolvedType(intType, &ResolvedType{Kind: TypeString, Name: "String"}) {
+		t.Fatal("resolved type comparison failed")
+	}
+
+	idField := &FieldInfo{Name: "key", Type: intType, Directives: []string{"id"}}
+	model := &ResolvedType{Fields: map[string]*FieldInfo{"key": idField}}
+	if resolvedPrimaryKeyField(nil) != nil || resolvedPrimaryKeyField(model) != idField {
+		t.Fatal("directed primary key lookup failed")
+	}
+	conventional := &FieldInfo{Name: "id", Type: intType}
+	if resolvedPrimaryKeyField(&ResolvedType{Fields: map[string]*FieldInfo{"id": conventional}}) != conventional {
+		t.Fatal("conventional primary key lookup failed")
+	}
+	valid := &FieldInfo{Type: intType}
+	if !isLoadKeyType(valid) {
+		t.Fatal("valid load key was rejected")
+	}
+	invalid := []*FieldInfo{
+		{Nullable: true, Type: intType},
+		{Computed: true, Type: intType},
+		{Type: &ResolvedType{Kind: TypeInt, Nullable: true}},
+		{Type: &ResolvedType{Kind: TypeInt, IsList: true}},
+		{Type: &ResolvedType{Kind: TypeFloat}},
+	}
+	for _, field := range invalid {
+		if isLoadKeyType(field) {
+			t.Fatal("invalid load key was accepted")
+		}
+	}
+}
+
+func TestBlockResultAndDeclarationHelpers(t *testing.T) {
+	value := &ast.Ident{Name: "value"}
+	if blockResultExpr(nil) != nil || blockResultExpr(&ast.Block{}) != nil {
+		t.Fatal("empty block returned a value")
+	}
+	if got := blockResultExpr(&ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: value}}}); got != value {
+		t.Fatal("expression result was not returned")
+	}
+	if got := blockResultExpr(&ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: value}}}); got != value {
+		t.Fatal("return result was not returned")
+	}
+	if blockResultExpr(&ast.Block{Stmts: []ast.Stmt{&ast.BreakStmt{}}}) != nil {
+		t.Fatal("non-value statement returned a value")
+	}
+
+	file := &ast.File{
+		Models:     []*ast.ModelDecl{{Name: "Model"}},
+		Interfaces: []*ast.InterfaceDecl{{Name: "Interface"}},
+		Enums:      []*ast.EnumDecl{{Name: "Enum"}},
+		Sealeds:    []*ast.SealedDecl{{Name: "Sealed"}},
+		Types:      []*ast.TypeDecl{{Name: "Type"}},
+	}
+	decls := (&Analyzer{}).fileTypeDecls(file)
+	if len(decls) != 5 {
+		t.Fatalf("declaration count = %d", len(decls))
+	}
+}
+
 func TestBinaryIn(t *testing.T) {
 	result := analyze(t, `
 api test(): Boolean {
@@ -256,9 +431,7 @@ api test(): String {
   user.name
 }
 `)
-	// find returns User? but we're accessing .name without ?.
-	// For now this should pass since find's return type isn't fully resolved yet
-	// TODO: stricter null safety checks
+	// find returns a non-null User because a missing record raises NotFound.
 	if len(result.Errors) > 0 {
 		// filter out expected errors
 		for _, err := range result.Errors {
@@ -282,12 +455,6 @@ api test(): String {
 }
 `)
 	// User is non-nullable, so ?. should produce a warning.
-	// Note: User{} object literal returns the User type from checkExpr,
-	// so the safe call warning should be triggered.
-	// If the analyzer does not resolve object expr to a type, skip.
-	if len(result.Warnings) == 0 {
-		t.Skip("TODO: object expression type inference not yet supported; safe call warning requires known non-null type")
-	}
 	expectWarning(t, result, "unnecessary safe call")
 }
 
@@ -582,6 +749,93 @@ func TestForStmtWithListCollection(t *testing.T) {
 	}
 }
 
+func TestListAndForExpressionTypeInference(t *testing.T) {
+	result := analyze(t, `
+api transform(items: [Int]): [Int] {
+  val literal = [1, 2, 3]
+  val mapped = for item in items { item * 2 }
+  mapped
+}
+`)
+	expectNoErrors(t, result)
+
+	body := result.Files[0].APIs[0].Body
+	literal := body.Stmts[0].(*ast.ValStmt).Value
+	if literal.GetTypeTag() != "Int" || !literal.IsListType() {
+		t.Fatalf("list literal type = %s list=%v, want [Int]", literal.GetTypeTag(), literal.IsListType())
+	}
+	mapped := body.Stmts[1].(*ast.ValStmt).Value
+	if mapped.GetTypeTag() != "Int" || !mapped.IsListType() || mapped.IsNullable() {
+		t.Fatalf("mapped for type = %s list=%v nullable=%v, want [Int]", mapped.GetTypeTag(), mapped.IsListType(), mapped.IsNullable())
+	}
+}
+
+func TestYieldForExpressionInfersNullableElementType(t *testing.T) {
+	result := analyze(t, `
+api findPositive(items: [Int]): Int? {
+  val found = for item in items {
+    if item > 0 { yield item }
+  }
+  found
+}
+`)
+	expectNoErrors(t, result)
+
+	forExpr := result.Files[0].APIs[0].Body.Stmts[0].(*ast.ValStmt).Value
+	if forExpr.GetTypeTag() != "Int" || forExpr.IsListType() || !forExpr.IsNullable() {
+		t.Fatalf("yield for type = %s list=%v nullable=%v, want Int?", forExpr.GetTypeTag(), forExpr.IsListType(), forExpr.IsNullable())
+	}
+}
+
+func TestListLiteralRejectsMixedElementTypes(t *testing.T) {
+	result := analyze(t, `
+api invalid(): [Int] {
+  val values = [1, "two"]
+  values
+}
+`)
+	expectError(t, result, "list element type mismatch")
+}
+
+func TestTypedEmptyListUsesDeclaredType(t *testing.T) {
+	result := analyze(t, `
+api empty(): [String] {
+  val values: [String] = []
+  values
+}
+`)
+	expectNoErrors(t, result)
+
+	value := result.Files[0].APIs[0].Body.Stmts[0].(*ast.ValStmt).Value
+	if value.GetTypeTag() != "String" || !value.IsListType() {
+		t.Fatalf("typed empty list = %s list=%v, want [String]", value.GetTypeTag(), value.IsListType())
+	}
+}
+
+func TestLoadUsesDeclaredPrimaryKeyFieldType(t *testing.T) {
+	result := analyze(t, `
+model Product {
+  sku: String @id
+  name: String
+}
+api invalid(): Product? {
+  Product.load(42)
+}
+`)
+	expectError(t, result, "load key expects 'String', got 'Int'")
+}
+
+func TestPrimaryKeyRequiresStableScalarType(t *testing.T) {
+	for _, source := range []string{
+		`model Product { sku: String? @id }`,
+		`model Product { sku: [String] @id }`,
+		`model Product { ratio: Float @id }`,
+	} {
+		result := analyze(t, source)
+		expectError(t, result, "@id field")
+	}
+}
+
 func TestIfStmtScoping(t *testing.T) {
 	result := analyze(t, `
 api test(): Int {
@@ -790,6 +1044,140 @@ api test(): ObjResult {
 }
 `)
 	expectNoErrors(t, result)
+}
+
+func TestObjectExprUnknownType(t *testing.T) {
+	result := analyze(t, `
+api test(): String {
+  MissingResult { value: "hello" }
+  "done"
+}
+`)
+	expectError(t, result, "unknown type 'MissingResult'")
+}
+
+func TestObjectExprRejectsUnknownField(t *testing.T) {
+	result := analyze(t, `
+type ObjResult { value: String }
+api test(): ObjResult {
+  ObjResult { value: "hello", extra: 1 }
+}
+`)
+	expectError(t, result, "has no field 'extra'")
+}
+
+func TestObjectExprRejectsDuplicateField(t *testing.T) {
+	result := analyze(t, `
+type ObjResult { value: String }
+api test(): ObjResult {
+  ObjResult { value: "hello", value: "again" }
+}
+`)
+	expectError(t, result, "duplicate field 'value'")
+}
+
+func TestObjectExprRejectsFieldTypeMismatch(t *testing.T) {
+	result := analyze(t, `
+type ObjResult { value: String }
+api test(): ObjResult {
+  ObjResult { value: 42 }
+}
+`)
+	expectError(t, result, "field 'value' expects 'String', got 'Int'")
+}
+
+func TestObjectExprRequiresNonNullableTypeFields(t *testing.T) {
+	result := analyze(t, `
+type ObjResult {
+  value: String
+  optional: String?
+}
+api test(): ObjResult {
+  ObjResult {}
+}
+`)
+	expectError(t, result, "missing required field 'value'")
+}
+
+func TestObjectExprChecksModuleVisibility(t *testing.T) {
+	owner := parseFileWithName(t, `model User { id: Int }`, "origin/user.luxo")
+	caller := parseFileWithName(t, `
+api test(): String {
+  User { id: 1 }
+  "done"
+}
+`, "origin/post.luxo")
+	result := New().AnalyzeWithModules([]*ast.File{owner, caller})
+	expectError(t, result, "type 'User' is from module 'user'")
+}
+
+func TestUntypedObjectExprChecksValues(t *testing.T) {
+	analyzer := New()
+	expr := &ast.ObjectExpr{Fields: []*ast.NamedArg{{
+		Name:  "value",
+		Value: &ast.Literal{Kind: token.String, Value: "ok"},
+	}}}
+	if got := analyzer.checkObjectExpr(expr, NewScope()); got != nil {
+		t.Fatalf("untyped object resolved to %v", got)
+	}
+}
+
+func TestTypeAssignability(t *testing.T) {
+	stringType := &ResolvedType{Kind: TypeString, Name: "String"}
+	intType := &ResolvedType{Kind: TypeInt, Name: "Int"}
+	base := &ResolvedType{Kind: TypeInterface, Name: "Base"}
+	child := &ResolvedType{Kind: TypeModel, Name: "Child", Parents: []*ResolvedType{base}}
+
+	tests := []struct {
+		name     string
+		expected *ResolvedType
+		actual   *ResolvedType
+		want     bool
+	}{
+		{name: "nil expected", actual: stringType, want: true},
+		{name: "nil actual", expected: stringType, want: true},
+		{name: "unresolved actual", expected: stringType, actual: &ResolvedType{Kind: TypeUnknown, Name: "Missing"}, want: true},
+		{name: "null into nullable", expected: stringType.AsNullable(), actual: &ResolvedType{Kind: TypeUnknown, Name: "null", Nullable: true}, want: true},
+		{name: "null into required", expected: stringType, actual: &ResolvedType{Kind: TypeUnknown, Name: "null", Nullable: true}},
+		{name: "unresolved expected", expected: &ResolvedType{Kind: TypeUnknown, Name: "T"}, actual: stringType, want: true},
+		{name: "nullable into required", expected: stringType, actual: stringType.AsNullable()},
+		{name: "list mismatch", expected: stringType.AsList(), actual: stringType},
+		{name: "same type", expected: stringType, actual: stringType, want: true},
+		{name: "inherited type", expected: base, actual: child, want: true},
+		{name: "unrelated type", expected: stringType, actual: intType},
+		{
+			name:     "matching generic args",
+			expected: &ResolvedType{Kind: TypeGeneric, Name: "Page", TypeArgs: []*ResolvedType{stringType}},
+			actual:   &ResolvedType{Kind: TypeGeneric, Name: "Page", TypeArgs: []*ResolvedType{stringType}},
+			want:     true,
+		},
+		{
+			name:     "generic arg count mismatch",
+			expected: &ResolvedType{Kind: TypeGeneric, Name: "Page", TypeArgs: []*ResolvedType{stringType}},
+			actual:   &ResolvedType{Kind: TypeGeneric, Name: "Page", TypeArgs: []*ResolvedType{stringType, intType}},
+		},
+		{
+			name:     "generic arg type mismatch",
+			expected: &ResolvedType{Kind: TypeGeneric, Name: "Page", TypeArgs: []*ResolvedType{stringType}},
+			actual:   &ResolvedType{Kind: TypeGeneric, Name: "Page", TypeArgs: []*ResolvedType{intType}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isTypeAssignable(tt.expected, tt.actual); got != tt.want {
+				t.Fatalf("isTypeAssignable() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	if got := formatResolvedType((&ResolvedType{Name: "String", IsList: true, Nullable: true})); got != "[String]?" {
+		t.Fatalf("formatResolvedType() = %q", got)
+	}
+	cycle := &ResolvedType{Name: "Cycle"}
+	cycle.Parents = []*ResolvedType{nil, cycle}
+	if cycle.inheritsFrom("Missing") {
+		t.Fatal("cyclic inheritance reported an unrelated parent")
+	}
 }
 
 func TestTransactionExprCheck(t *testing.T) {
@@ -1085,7 +1473,7 @@ api feed(): (Post, Video)
 func TestStreamTypeResolution(t *testing.T) {
 	result := analyze(t, `
 model Comment { text: String }
-api comments(): Comment @stream
+api comments(): Comment @stream @native
 `)
 	expectNoErrors(t, result)
 
@@ -1267,7 +1655,10 @@ api test(): String {
 func TestVarAfterCreate(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
-type AuthResult { token: String }
+type AuthResult {
+  token: String
+  user: User
+}
 api test(): AuthResult {
   val user = User.create(name: "test")
   AuthResult { token: "abc", user: user }

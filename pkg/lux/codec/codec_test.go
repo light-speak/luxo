@@ -1,6 +1,7 @@
 package codec
 
 import (
+	"bytes"
 	"math"
 	"testing"
 	"unsafe"
@@ -78,6 +79,12 @@ func TestBool(t *testing.T) {
 			t.Fatalf("bool %v: got %v", c, got)
 		}
 	}
+	if _, n := ReadBool([]byte{2}, 0); n != 0 {
+		t.Fatal("non-canonical bool should fail")
+	}
+	if _, n := ReadBool([]byte{0x81, 0}, 0); n != 0 {
+		t.Fatal("overlong bool should fail")
+	}
 }
 
 func TestNullable(t *testing.T) {
@@ -93,6 +100,10 @@ func TestNullable(t *testing.T) {
 	present, n = ReadNullable(buf, 0)
 	if n != 1 || !present {
 		t.Fatal("expected present")
+	}
+
+	if _, n = ReadNullable([]byte{2}, 0); n != 0 {
+		t.Fatal("non-canonical nullable marker should fail")
 	}
 }
 
@@ -126,6 +137,42 @@ func TestEncoderDecoderRoundTrip(t *testing.T) {
 	}
 	if assigneeId != 7 {
 		t.Fatalf("assigneeId: got %d", assigneeId)
+	}
+}
+
+func TestEncoderValueWritersAndReset(t *testing.T) {
+	uuidValue := [16]byte{1, 2, 3}
+	var enc Encoder
+	enc.WriteFieldHeader(7)
+	enc.WriteNull()
+	enc.WritePresent()
+	enc.WriteInt(-3)
+	enc.WriteVarint(4)
+	enc.WriteFloat(1.5)
+	enc.WriteString("x")
+	enc.WriteBool(true)
+	enc.WriteBytes([]byte{5, 6})
+	enc.WriteUUID(uuidValue)
+	enc.WriteArrayHeader(2)
+
+	var want []byte
+	want = AppendVarint(want, 7)
+	want = AppendNull(want)
+	want = AppendPresent(want)
+	want = AppendSvarint(want, -3)
+	want = AppendVarint(want, 4)
+	want = AppendFixed64(want, 1.5)
+	want = AppendString(want, "x")
+	want = AppendBool(want, true)
+	want = AppendBytes(want, []byte{5, 6})
+	want = AppendUUID(want, uuidValue)
+	want = AppendArrayHeader(want, 2)
+	if !bytes.Equal(enc.Bytes(), want) {
+		t.Fatalf("encoded values = %v, want %v", enc.Bytes(), want)
+	}
+	enc.Reset()
+	if len(enc.Bytes()) != 0 {
+		t.Fatalf("Reset left %d bytes", len(enc.Bytes()))
 	}
 }
 
@@ -248,6 +295,40 @@ func TestDecoderInvalidData(t *testing.T) {
 	dec := NewDecoder([]byte{})
 	if dec.NextField() {
 		t.Fatal("should not read from empty buf")
+	}
+	if dec.Err() == nil {
+		t.Fatal("message without end marker should be rejected")
+	}
+}
+
+func TestDecoderRejectsMissingEndMarker(t *testing.T) {
+	var enc Encoder
+	enc.WriteFieldInt(1, 42)
+	dec := NewDecoder(enc.Bytes())
+	if !dec.NextField() || dec.ReadInt() != 42 {
+		t.Fatal("expected the complete field before the truncated tail")
+	}
+	if dec.NextField() {
+		t.Fatal("truncated message should not expose another field")
+	}
+	if dec.Err() == nil {
+		t.Fatal("message without end marker should be rejected")
+	}
+}
+
+func TestDecoderReadArrayLength(t *testing.T) {
+	data := AppendArrayHeader(nil, 3)
+	dec := NewDecoder(data)
+	if got := dec.ReadArrayLength(); got != 3 || dec.Err() != nil {
+		t.Fatalf("ReadArrayLength() = %d, err %v", got, dec.Err())
+	}
+}
+
+func TestDecoderReadArrayLengthRejectsOversize(t *testing.T) {
+	data := AppendVarint(nil, uint64(MaxArrayElements+1))
+	dec := NewDecoder(data)
+	if got := dec.ReadArrayLength(); got != 0 || dec.Err() == nil {
+		t.Fatalf("ReadArrayLength() = %d, err %v", got, dec.Err())
 	}
 }
 
@@ -1807,6 +1888,27 @@ func TestDecoderReadBytesPtr(t *testing.T) {
 	}
 }
 
+func TestDecoderReadBytesValuePtr(t *testing.T) {
+	var enc Encoder
+	enc.WritePresent()
+	enc.WriteBytes([]byte{})
+	dec := NewDecoder(enc.Bytes())
+	value := dec.ReadBytesValuePtr()
+	if value == nil || len(*value) != 0 || dec.Err() != nil {
+		t.Fatalf("empty present bytes = %v, err=%v", value, dec.Err())
+	}
+
+	dec = NewDecoder([]byte{0})
+	if value := dec.ReadBytesValuePtr(); value != nil || dec.Err() != nil {
+		t.Fatalf("null bytes = %v, err=%v", value, dec.Err())
+	}
+
+	dec = NewDecoder(nil)
+	if value := dec.ReadBytesValuePtr(); value != nil || dec.Err() == nil {
+		t.Fatalf("truncated bytes = %v, err=%v", value, dec.Err())
+	}
+}
+
 func TestDecoderReadBytesPtrNullable(t *testing.T) {
 	// Nullable bytes: present
 	buf := AppendVarint(nil, 1) // field ID
@@ -2589,6 +2691,21 @@ func TestDecoderSkipMethods(t *testing.T) {
 	}
 }
 
+func TestDecoderSkipArrayAndFixed16(t *testing.T) {
+	uuidValue := [16]byte{1, 2, 3}
+	var data []byte
+	data = AppendVarint(data, 2)
+	data = AppendString(data, "a")
+	data = AppendString(data, "b")
+	data = AppendUUID(data, uuidValue)
+	dec := NewDecoder(data)
+	dec.SkipArray(SkipBytes)
+	dec.SkipFixed16()
+	if dec.Err() != nil || dec.Offset() != len(data) {
+		t.Fatalf("skip offset = %d/%d, err %v", dec.Offset(), len(data), dec.Err())
+	}
+}
+
 func TestDecoderSkipNullable(t *testing.T) {
 	var buf []byte
 	buf = AppendVarint(buf, 1) // field 1
@@ -2613,6 +2730,44 @@ func TestDecoderSkipNullable(t *testing.T) {
 	}
 	if dec.NextField() {
 		t.Fatal("expected end")
+	}
+}
+
+func TestDecoderSkipValueVariants(t *testing.T) {
+	uuidValue := [16]byte{1, 2, 3}
+	tests := []struct {
+		name   string
+		typeID FieldSkipType
+		data   []byte
+	}{
+		{name: "varint", typeID: SkipVarint, data: AppendVarint(nil, 7)},
+		{name: "fixed64", typeID: SkipFixed64, data: AppendFixed64(nil, 1.5)},
+		{name: "bytes", typeID: SkipBytes, data: AppendBytes(nil, []byte("x"))},
+		{name: "nullable varint", typeID: SkipNullVarint, data: AppendVarint(AppendPresent(nil), 7)},
+		{name: "nullable fixed64", typeID: SkipNullFixed64, data: AppendFixed64(AppendPresent(nil), 1.5)},
+		{name: "nullable bytes", typeID: SkipNullBytes, data: AppendBytes(AppendPresent(nil), []byte("x"))},
+		{name: "fixed16", typeID: SkipFixed16, data: AppendUUID(nil, uuidValue)},
+		{name: "nullable fixed16", typeID: SkipNullFixed16, data: AppendUUID(AppendPresent(nil), uuidValue)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dec := NewDecoder(tt.data)
+			dec.SkipValue(tt.typeID)
+			if dec.Err() != nil || dec.Offset() != len(tt.data) {
+				t.Fatalf("skip offset = %d/%d, err = %v", dec.Offset(), len(tt.data), dec.Err())
+			}
+		})
+	}
+
+	dec := NewDecoder([]byte{2})
+	dec.SkipNullableFixed16()
+	if dec.Err() == nil {
+		t.Fatal("invalid nullable marker must fail")
+	}
+	dec = NewDecoder(nil)
+	dec.SkipValue(FieldSkipType(255))
+	if dec.Err() == nil {
+		t.Fatal("unknown skip type must fail")
 	}
 }
 

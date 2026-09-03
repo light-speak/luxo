@@ -7,6 +7,25 @@ import (
 	"github.com/light-speak/luxo/pkg/ast"
 )
 
+func TestGenerateQueryBuilderUsesDeclaredPrimaryKey(t *testing.T) {
+	model := &ast.ModelDecl{Name: "Product", Fields: []*ast.FieldDecl{
+		{Name: "sku", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "id"}}},
+		{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+	}}
+	var b strings.Builder
+	generateQueryBuilder(&b, model, map[string]bool{})
+	code := b.String()
+	for _, want := range []string{
+		"Find(ctx context.Context, id string)",
+		"ProductWhere.Sku.Eq(id)",
+		`IDColumn: "sku"`,
+	} {
+		if !strings.Contains(code, want) {
+			t.Fatalf("custom primary key output missing %q:\n%s", want, code)
+		}
+	}
+}
+
 func TestGenerateClient(t *testing.T) {
 	fields := []*ast.FieldDecl{
 		{Name: "id", Type: &ast.TypeRef{Name: "Int"}},

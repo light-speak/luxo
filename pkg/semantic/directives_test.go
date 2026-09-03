@@ -270,9 +270,14 @@ func TestDirectiveTypoSuggestionModel(t *testing.T) {
 
 func TestComputedDirectiveCount(t *testing.T) {
 	result := analyze(t, `
+model User {
+  id: Int @id
+  posts: [Post]
+  val postCount: Int get @count(posts)
+}
 model Post {
-  title: String
-  val totalCount: Int get @count
+  id: Int @id
+  userId: Int
 }
 `)
 	expectNoErrors(t, result)
@@ -280,12 +285,138 @@ model Post {
 
 func TestComputedDirectiveAvg(t *testing.T) {
 	result := analyze(t, `
+model User {
+  id: Int @id
+  posts: [Post]
+  val avgLikes: Float get @avg(field: posts.likes)
+}
 model Post {
-  title: String
-  val avgLikes: Float get @avg(field: likes)
+  id: Int @id
+  userId: Int
+  likes: Int
 }
 `)
 	expectNoErrors(t, result)
+}
+
+func TestComputedAggregateRequiresExplicitRelation(t *testing.T) {
+	result := analyze(t, `
+model Post {
+  id: Int @id
+  val totalCount: Int get @count
+}
+`)
+	expectError(t, result, "@count requires a list relation")
+}
+
+func TestComputedAggregateValidatesRelationAndTargetField(t *testing.T) {
+	result := analyze(t, `
+model User {
+  id: Int @id
+  name: String
+  posts: [Post]
+  val invalidRelation: Int get @count(name)
+  val missingTarget: Float get @avg(posts.missing)
+}
+model Post {
+  id: Int @id
+  userId: Int
+  likes: Int
+}
+`)
+	expectError(t, result, "@count target 'name' must be a list relation")
+	expectError(t, result, "aggregate target field 'Post.missing' does not exist")
+}
+
+func TestComputedAggregateValidatesResultType(t *testing.T) {
+	result := analyze(t, `
+model User {
+  id: Int @id
+  posts: [Post]
+  val postCount: Float get @count(posts)
+  val totalLikes: Float get @sum(posts.likes)
+  val averageLikes: Int get @avg(posts.likes)
+}
+model Post {
+  id: Int @id
+  userId: Int
+  likes: Int
+}
+`)
+	expectError(t, result, "@count computed field 'User.postCount' must have type Int")
+	expectError(t, result, "@sum computed field 'User.totalLikes' must match target type Int")
+	expectError(t, result, "@avg computed field 'User.averageLikes' must have type Float")
+}
+
+func TestComputedAggregateValidatesRelationKeys(t *testing.T) {
+	t.Run("missing inferred remote key", func(t *testing.T) {
+		result := analyze(t, `
+model User {
+  id: Int @id
+  posts: [Post]
+  val postCount: Int get @count(posts)
+}
+model Post { id: Int @id }
+`)
+		expectError(t, result, "computed relation 'User.posts' remote key 'Post.userId' does not exist")
+	})
+
+	t.Run("mismatched key types", func(t *testing.T) {
+		result := analyze(t, `
+model User {
+  id: Int @id
+  posts: [Post]
+  val postCount: Int get @count(posts)
+}
+model Post {
+  id: Int @id
+  userId: String
+}
+`)
+		expectError(t, result, "computed relation 'User.posts' key types must match")
+	})
+
+	t.Run("custom keys", func(t *testing.T) {
+		result := analyze(t, `
+model Product {
+  sku: String @id
+  reviews: [Review] @by(productSku, sku)
+  val reviewCount: Int get @count(reviews)
+}
+model Review {
+  id: Int @id
+  productSku: String
+}
+`)
+		expectNoErrors(t, result)
+	})
+}
+
+func TestComputedFieldRejectsUnimplementedExecutionModes(t *testing.T) {
+	result := analyze(t, `
+model User {
+  id: Int @id
+  val localScore: Int get { 1 }
+  val nativeScore: Int get @native
+}
+`)
+	expectError(t, result, "computed field 'User.localScore' must declare exactly one aggregate")
+	expectError(t, result, "@native cannot be used on computed")
+}
+
+func TestComputedFieldRejectsCacheWithoutInvalidationContract(t *testing.T) {
+	result := analyze(t, `
+model User {
+  id: Int @id
+  posts: [Post]
+  val postCount: Int get @count(posts) @cache(ttl: 1m)
+}
+model Post {
+  id: Int @id
+  userId: Int
+}
+`)
+	expectError(t, result, "@cache cannot be used on computed")
 }
 
 func TestComputedDirectiveWrongContext(t *testing.T) {

@@ -5,7 +5,7 @@
 // Types are known at compile time from schema — no type tags on wire.
 //
 // Encoding rules:
-//   - Int/Boolean/Enum: varint (LEB128)
+//   - Int: signed ZigZag varint; Boolean: one byte; Enum: string
 //   - Float: fixed 8 bytes (little-endian float64)
 //   - String/Bytes: length-prefixed (varint length + raw bytes)
 //   - Nullable: 1-byte flag (0x00=null, 0x01=present) + value if present
@@ -143,11 +143,17 @@ func AppendBool(dst []byte, v bool) []byte {
 
 // ReadBool reads a boolean from buf at offset.
 func ReadBool(buf []byte, off int) (bool, int) {
-	v, n := ReadVarint(buf, off)
-	if n <= 0 {
+	if off < 0 || off >= len(buf) {
 		return false, 0
 	}
-	return v != 0, n
+	switch buf[off] {
+	case 0:
+		return false, 1
+	case 1:
+		return true, 1
+	default:
+		return false, 0
+	}
 }
 
 // --- Array (count + items) ---
@@ -183,7 +189,14 @@ func ReadNullable(buf []byte, off int) (present bool, n int) {
 	if off >= len(buf) {
 		return false, 0
 	}
-	return buf[off] != 0, 1
+	switch buf[off] {
+	case 0:
+		return false, 1
+	case 1:
+		return true, 1
+	default:
+		return false, 0
+	}
 }
 
 // --- Fixed 16-byte (UUID) ---

@@ -281,7 +281,7 @@ func TestGenerateWithDurationImport(t *testing.T) {
 	}
 }
 
-func TestGenerateComputedDateTimeNoTimeImport(t *testing.T) {
+func TestGenerateComputedDateTimeUsesTimeImport(t *testing.T) {
 	file := &ast.File{
 		Name: "test.luxo",
 		Models: []*ast.ModelDecl{
@@ -297,8 +297,8 @@ func TestGenerateComputedDateTimeNoTimeImport(t *testing.T) {
 
 	gr := Generate(result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
-	if strings.Contains(src, `"time"`) {
-		t.Errorf("computed DateTime should not trigger time import:\n%s", src)
+	if !strings.Contains(src, `"time"`) {
+		t.Errorf("computed DateTime should trigger time import:\n%s", src)
 	}
 }
 
@@ -1128,6 +1128,18 @@ func TestWriteImports_NoHash(t *testing.T) {
 	}
 }
 
+func TestWriteDBImportsJSON(t *testing.T) {
+	files := []*ast.File{{Models: []*ast.ModelDecl{{
+		Name:   "Document",
+		Fields: []*ast.FieldDecl{{Name: "metadata", Type: &ast.TypeRef{Name: "JSON"}}},
+	}}}}
+	var b strings.Builder
+	writeDBImports(&b, files)
+	if !strings.Contains(b.String(), `"encoding/json"`) {
+		t.Fatalf("JSON database fields require encoding/json:\n%s", b.String())
+	}
+}
+
 func TestGenerateModelFileWithTypes(t *testing.T) {
 	r := buildResult(&ast.File{
 		Name: "test.luxo",
@@ -1190,7 +1202,19 @@ func TestExtendStubDedup(t *testing.T) {
 
 func TestBuildEventContext(t *testing.T) {
 	files := []*ast.File{
-		{Name: "origin/common/events.luxo", Events: []*ast.EventDecl{{Name: "ProjectDeleted"}}},
+		{
+			Name:   "origin/common/events.luxo",
+			Events: []*ast.EventDecl{{Name: "ProjectDeleted"}},
+			Types:  []*ast.TypeDecl{{Name: "Payload"}},
+			Enums:  []*ast.EnumDecl{{Name: "Role"}},
+			Models: []*ast.ModelDecl{{
+				Name: "Project",
+				Fields: []*ast.FieldDecl{{
+					Name: "id",
+					Type: &ast.TypeRef{Name: "UUID"},
+				}},
+			}},
+		},
 		{Name: "origin/monitoring/trace.luxo", Events: []*ast.EventDecl{{Name: "TraceIngested"}}},
 	}
 	ctx := BuildEventContext(files, "github.com/test/service")
@@ -1202,6 +1226,120 @@ func TestBuildEventContext(t *testing.T) {
 	}
 	if ctx.ModulePath != "github.com/test/service" {
 		t.Errorf("ModulePath = %q", ctx.ModulePath)
+	}
+	if ctx.ModelModule["Project"] != "common" {
+		t.Errorf("Project module = %q", ctx.ModelModule["Project"])
+	}
+	if ctx.ModelIDType["Project"] != "UUID" {
+		t.Errorf("Project ID type = %q", ctx.ModelIDType["Project"])
+	}
+	if ctx.TypeModule["Payload"] != "common" || ctx.EnumModule["Role"] != "common" {
+		t.Fatalf("type modules = %v, enum modules = %v", ctx.TypeModule, ctx.EnumModule)
+	}
+}
+
+func TestWriteImportsUsesRemoteUUIDPrimaryKey(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+	globalEventCtx = &EventContext{ModelIDType: map[string]string{"Remote": "UUID"}}
+	files := []*ast.File{{Extends: []*ast.ExtendDecl{{Name: "Remote"}}}}
+	var b strings.Builder
+	writeImports(&b, files)
+	if !strings.Contains(b.String(), `"github.com/google/uuid"`) {
+		t.Fatalf("remote UUID primary key import missing:\n%s", b.String())
+	}
+}
+
+func TestModelIDTypeNameDefaultsToInt(t *testing.T) {
+	if got := modelIDTypeName(&ast.ModelDecl{Name: "User"}); got != "Int" {
+		t.Fatalf("modelIDTypeName() = %q", got)
+	}
+}
+
+func TestBuildEventContextCollectsRemoteNamedLoads(t *testing.T) {
+	files := []*ast.File{
+		{
+			Name: "origin/user.luxo",
+			Models: []*ast.ModelDecl{{
+				Name: "User",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+				},
+			}},
+		},
+		{
+			Name: "origin/post.luxo",
+			Extends: []*ast.ExtendDecl{{
+				Name:   "User",
+				Fields: []*ast.FieldDecl{{Name: "email", Type: &ast.TypeRef{Name: "String"}}},
+			}},
+			APIs: []*ast.ApiDecl{{
+				Name: "findAuthors",
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.CallExpr{
+					Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
+					Args: []*ast.NamedArg{{Name: "email", Value: &ast.Ident{Name: "email"}}},
+				}}}},
+			}},
+		},
+	}
+
+	ctx := BuildEventContext(files, "github.com/test/service")
+	loads := ctx.remoteLoadCalls["user"]
+	if len(loads) != 1 {
+		t.Fatalf("remote user loads = %d, want 1", len(loads))
+	}
+	if loads[0].modelName != "User" || loads[0].sourceModule != "post" {
+		t.Fatalf("remote load = %#v", loads[0])
+	}
+	if len(loads[0].argTypeNames) != 1 || loads[0].argTypeNames[0] != "String" {
+		t.Fatalf("remote load types = %v", loads[0].argTypeNames)
+	}
+}
+
+func TestBuildEventContextFiltersNonRemoteAndDuplicateLoads(t *testing.T) {
+	load := func(named bool) *ast.CallExpr {
+		arg := &ast.NamedArg{Value: &ast.Ident{Name: "email"}}
+		if named {
+			arg.Name = "email"
+		}
+		return &ast.CallExpr{
+			Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
+			Args: []*ast.NamedArg{arg},
+		}
+	}
+	files := []*ast.File{
+		{
+			Name: "origin/user.luxo",
+			Models: []*ast.ModelDecl{{
+				Name: "User",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+				},
+			}},
+			APIs: []*ast.ApiDecl{{Name: "local", Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ReturnStmt{Value: load(true)},
+			}}}},
+		},
+		{
+			Name: "origin/post.luxo",
+			APIs: []*ast.ApiDecl{{Name: "remote", Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ExprStmt{Expr: load(false)},
+				&ast.ReturnStmt{Value: load(true)},
+			}}}},
+		},
+		{
+			Name: "origin/comment.luxo",
+			APIs: []*ast.ApiDecl{{Name: "duplicate", Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ReturnStmt{Value: load(true)},
+			}}}},
+		},
+	}
+	ctx := BuildEventContext(files, "github.com/test/service")
+	loads := ctx.remoteLoadCalls["user"]
+	if len(loads) != 1 || loads[0].sourceModule != "post" {
+		t.Fatalf("remote loads = %#v", loads)
 	}
 }
 

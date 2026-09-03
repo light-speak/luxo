@@ -698,7 +698,7 @@ func TestCompileModelChainSelect(t *testing.T) {
 		Args: nil,
 	}
 	got := c.compileExpr(selectCall)
-	if !strings.Contains(got, ".Select(selection.SQLColumns(req.Select)...)") {
+	if !strings.Contains(got, ".Select(selectUserSQLColumns(req.Select)...)") {
 		t.Fatalf("expected select in output, got %q", got)
 	}
 }
@@ -1245,8 +1245,8 @@ func TestCompileStmtReturnWithAPIReturnType(t *testing.T) {
 	}
 	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "count"}})
 	out := compilerOut(c)
-	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, int64(count))") {
-		t.Fatalf("expected AppendInt for Int return type, got %q", out)
+	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, count)") {
+		t.Fatalf("expected AppendSvarint for Int return type, got %q", out)
 	}
 }
 
@@ -1897,6 +1897,126 @@ func TestWriteReturnByTypeScalars(t *testing.T) {
 	}
 }
 
+func TestWriteScalarReturnCoversEveryWireScalar(t *testing.T) {
+	tests := []struct {
+		name string
+		want string
+	}{
+		{"Int", "codec.AppendSvarint(req.Buf.B, value)"},
+		{"Float", "codec.AppendFixed64(req.Buf.B, value)"},
+		{"Boolean", "codec.AppendBool(req.Buf.B, value)"},
+		{"String", "codec.AppendString(req.Buf.B, value)"},
+		{"DateTime", "codec.AppendSvarint(req.Buf.B, value.Unix())"},
+		{"Duration", "codec.AppendSvarint(req.Buf.B, int64(value))"},
+		{"UUID", "codec.AppendUUID(req.Buf.B, value)"},
+		{"Decimal", "codec.AppendString(req.Buf.B, value.String())"},
+		{"Bytes", "codec.AppendBytes(req.Buf.B, value)"},
+		{"JSON", "codec.AppendBytes(req.Buf.B, value)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newCompiler(nil)
+			c.api = &ast.ApiDecl{ReturnType: &ast.TypeRef{Name: tt.name}}
+			c.writeScalarReturn("value")
+			if got := compilerOut(c); !strings.Contains(got, tt.want) {
+				t.Fatalf("%s return missing %q:\n%s", tt.name, tt.want, got)
+			}
+		})
+	}
+}
+
+func TestWriteScalarListReturnUsesUnsignedCountAndElementCodec(t *testing.T) {
+	c := newCompiler(nil)
+	c.api = &ast.ApiDecl{ReturnType: &ast.TypeRef{Name: "Bytes", IsList: true}}
+	c.writeScalarReturn("values")
+	out := compilerOut(c)
+	if !strings.Contains(out, "codec.AppendVarint(req.Buf.B, uint64(len(values)))") {
+		t.Fatalf("list must use unsigned count prefix:\n%s", out)
+	}
+	if !strings.Contains(out, "for _, v := range values") ||
+		!strings.Contains(out, "codec.AppendBytes(req.Buf.B, v)") {
+		t.Fatalf("Bytes list must encode every element:\n%s", out)
+	}
+}
+
+func TestCompilerUsesSemanticExpressionTypes(t *testing.T) {
+	models := map[string]*ast.ModelDecl{"User": {Name: "User"}}
+	c := newCompiler(models)
+	plainString := &ast.Ident{TypeTagged: ast.TypeTagged{TypeTag: "String"}, Name: "name"}
+	if got := c.goTypeForExpr(plainString); got != "string" {
+		t.Fatalf("string Go type = %q", got)
+	}
+	modelList := &ast.Ident{TypeTagged: ast.TypeTagged{TypeTag: "User", ListTypeTag: true}, Name: "users"}
+	valueType, ok := c.valTypeFromExpr(modelList)
+	if !ok || !valueType.isModel || !valueType.isList || valueType.name != "User" {
+		t.Fatalf("model list type = %+v, %v", valueType, ok)
+	}
+	if got := c.goTypeForExpr(modelList); got != "[]*User" {
+		t.Fatalf("model list Go type = %q", got)
+	}
+	optionalInt := &ast.Ident{TypeTagged: ast.TypeTagged{TypeTag: "Int", NullableTag: true}, Name: "count"}
+	if got := c.goTypeForExpr(optionalInt); got != "*int64" {
+		t.Fatalf("nullable integer Go type = %q", got)
+	}
+	model := &ast.Ident{TypeTagged: ast.TypeTagged{TypeTag: "User", NullableTag: true}, Name: "user"}
+	if c.yieldNeedsAddress(model) {
+		t.Fatal("model values are already nilable")
+	}
+	c.compileStmt(&ast.ValStmt{Name: "copy", Value: plainString})
+	if got := c.vars["copy"]; got.name != "String" || got.isList || got.isModel {
+		t.Fatalf("tracked value type = %+v", got)
+	}
+}
+
+func TestCompilerWritesModelAndTypeDeclarationReturns(t *testing.T) {
+	user := &ast.ModelDecl{Name: "User", Fields: []*ast.FieldDecl{
+		computedAggregateField("postCount", "Int", "count", &ast.Ident{Name: "posts"}),
+	}}
+	c := newCompiler(map[string]*ast.ModelDecl{"User": user})
+	c.types = map[string]bool{"Payload": true}
+	c.enums = map[string]bool{"Role": true}
+	c.writeReturnByType("user", valType{isModel: true, name: "User"})
+	c.writeReturnByType("payloads", valType{isList: true, name: "Payload"})
+	c.writeReturnByType("payload", valType{name: "Payload"})
+	c.writeReturnByType("role", valType{name: "Role"})
+	out := compilerOut(c)
+	for _, want := range []string{
+		"resolveUserComputed", "[]*User{user}", "WriteColumnarPayload", "payload.WriteLuxo",
+		"codec.AppendString(req.Buf.B, string(role))",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("typed return missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestCompilerWritesScalarReturnForModelsAndTypes(t *testing.T) {
+	c := newCompiler(map[string]*ast.ModelDecl{"User": {Name: "User"}})
+	c.types = map[string]bool{"Payload": true}
+	c.api.ReturnType = &ast.TypeRef{Name: "User"}
+	c.writeScalarReturn("user")
+	c.api.ReturnType = &ast.TypeRef{Name: "User", IsList: true}
+	c.writeScalarReturn("users")
+	c.api.ReturnType = &ast.TypeRef{Name: "Payload", IsList: true}
+	c.writeScalarReturn("payloads")
+	out := compilerOut(c)
+	for _, want := range []string{"_result := user", "_result.WriteLuxo", "WriteColumnarUser", "WriteColumnarPayload"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("scalar return missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestCompileInstanceMethodSoftDelete(t *testing.T) {
+	user := &ast.ModelDecl{Name: "User", Directives: []*ast.Directive{{Name: "soft"}}}
+	c := newCompiler(map[string]*ast.ModelDecl{"User": user})
+	c.vars["user"] = valType{isModel: true, name: "User"}
+	expr := &ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "delete"}}
+	if got := c.compileInstanceMethod(expr); !strings.Contains(got, ".SoftDelete(ctx)") {
+		t.Fatalf("soft delete call = %q", got)
+	}
+}
+
 func TestResolveQueryTypeFind(t *testing.T) {
 	models := map[string]*ast.ModelDecl{"Post": {Name: "Post"}}
 	c := newCompiler(models)
@@ -2490,9 +2610,9 @@ func TestCompileDeleteWithCheckAPI(t *testing.T) {
 	if !strings.Contains(out, ".Delete(ctx)") {
 		t.Fatalf("missing .Delete(ctx), got:\n%s", out)
 	}
-	// Check return count — count is Int type from delete → AppendInt
-	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, int64(count))") {
-		t.Fatalf("missing AppendInt for count, got:\n%s", out)
+	// Check return count — count is Int type from delete → AppendSvarint
+	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, count)") {
+		t.Fatalf("missing AppendSvarint for count, got:\n%s", out)
 	}
 }
 
@@ -2716,9 +2836,9 @@ func TestCompileBatchCreateAPI(t *testing.T) {
 	if !strings.Contains(out, "count += 1") {
 		t.Fatalf("missing count += 1, got:\n%s", out)
 	}
-	// Check return — count is plain val not model query, api returns Int → AppendInt
-	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, int64(count))") {
-		t.Fatalf("missing AppendInt(count), got:\n%s", out)
+	// Check return — count is plain val not model query, api returns Int → AppendSvarint
+	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, count)") {
+		t.Fatalf("missing AppendSvarint(count), got:\n%s", out)
 	}
 }
 
@@ -3120,7 +3240,7 @@ func TestCompileChainedModelOps(t *testing.T) {
 	if !strings.Contains(got, "app.User.Where(UserWhere.Id.Eq(id))") {
 		t.Fatalf("missing where clause, got:\n%s", got)
 	}
-	if !strings.Contains(got, ".Select(selection.SQLColumns(req.Select)...)") {
+	if !strings.Contains(got, ".Select(selectUserSQLColumns(req.Select)...)") {
 		t.Fatalf("missing select, got:\n%s", got)
 	}
 	if !strings.Contains(got, ".First(ctx)") {
@@ -3316,8 +3436,25 @@ func TestCompileReturnList(t *testing.T) {
 		}},
 	})
 	out := compilerOut(c)
-	if !strings.Contains(out, "[]any{1, 2, 3}") {
-		t.Fatalf("missing list literal, got:\n%s", out)
+	if !strings.Contains(out, "[]int64{1, 2, 3}") {
+		t.Fatalf("missing typed list literal, got:\n%s", out)
+	}
+	if !strings.Contains(out, "codec.AppendVarint(req.Buf.B, uint64(len([]int64{1, 2, 3})))") {
+		t.Fatalf("missing canonical list encoding, got:\n%s", out)
+	}
+}
+
+func TestCompileReturnListVariableUsesDeclaredReturnElementType(t *testing.T) {
+	c := newCompiler(nil)
+	c.api = &ast.ApiDecl{Name: "getIds", ReturnType: &ast.TypeRef{Name: "Int", IsList: true}}
+	c.compileStmt(&ast.ValStmt{Name: "ids", Value: &ast.ListExpr{Items: []ast.Expr{
+		&ast.Literal{Kind: token.Int, Value: "1"},
+		&ast.Literal{Kind: token.Int, Value: "2"},
+	}}})
+	c.compileStmt(&ast.ReturnStmt{Value: &ast.Ident{Name: "ids"}})
+	out := compilerOut(c)
+	if !strings.Contains(out, "ids := []int64{1, 2}") || !strings.Contains(out, "for _, v := range ids") {
+		t.Fatalf("list variable must remain typed through return:\n%s", out)
 	}
 }
 
@@ -4042,9 +4179,9 @@ func TestCompileAnalyticsAPI(t *testing.T) {
 	if !strings.Contains(out, `.Sum(ctx, "amount")`) {
 		t.Fatalf("missing .Sum(ctx, amount), got:\n%s", out)
 	}
-	// Check return — total tracked as Int from count → AppendInt
-	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, int64(total))") {
-		t.Fatalf("missing AppendInt(total), got:\n%s", out)
+	// Check return — total tracked as Int from count → AppendSvarint
+	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, total)") {
+		t.Fatalf("missing AppendSvarint(total), got:\n%s", out)
 	}
 }
 
@@ -4192,8 +4329,8 @@ func TestCompileForRangeWithAccumulator(t *testing.T) {
 	if !strings.Contains(out, "total += i") {
 		t.Fatalf("missing total += i, got:\n%s", out)
 	}
-	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, int64(total))") {
-		t.Fatalf("missing AppendInt(total), got:\n%s", out)
+	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, total)") {
+		t.Fatalf("missing AppendSvarint(total), got:\n%s", out)
 	}
 }
 
@@ -4350,6 +4487,55 @@ func TestCompileForExprWithTransform(t *testing.T) {
 	}
 	if !strings.Contains(got, "_result = append(_result,") {
 		t.Fatalf("missing append, got:\n%s", got)
+	}
+}
+
+func TestCompileSemanticallyTypedListAndForExpressionsWithoutAny(t *testing.T) {
+	c := newCompiler(nil)
+
+	list := &ast.ListExpr{Items: []ast.Expr{
+		&ast.Literal{Kind: token.Int, Value: "1"},
+		&ast.Literal{Kind: token.Int, Value: "2"},
+	}}
+	list.SetTypeTag("Int")
+	list.SetListType(true)
+	if got := c.compileExpr(list); got != "[]int64{1, 2}" {
+		t.Fatalf("typed list = %q, want []int64 literal", got)
+	}
+
+	forExpr := &ast.ForStmt{
+		VarName:    "item",
+		Collection: &ast.Ident{Name: "items"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.Ident{Name: "item"}},
+		}},
+	}
+	forExpr.SetTypeTag("Int")
+	forExpr.SetListType(true)
+	got := c.compileExpr(forExpr)
+	if strings.Contains(got, "any") || !strings.Contains(got, "func() []int64") || !strings.Contains(got, "var _result []int64") {
+		t.Fatalf("typed for expression must not generate any:\n%s", got)
+	}
+}
+
+func TestCompileSemanticallyTypedYieldExpressionWithoutAny(t *testing.T) {
+	c := newCompiler(nil)
+	forExpr := &ast.ForStmt{
+		VarName:    "item",
+		Collection: &ast.Ident{Name: "items"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.YieldExpr{Value: &ast.Ident{Name: "item"}}},
+		}},
+	}
+	forExpr.SetTypeTag("Int")
+	forExpr.SetNullable(true)
+
+	got := c.compileExpr(forExpr)
+	if strings.Contains(got, "any") || !strings.Contains(got, "func() *int64") {
+		t.Fatalf("typed yield expression must return *int64 without any:\n%s", got)
+	}
+	if !strings.Contains(got, "_yield0 := item") || !strings.Contains(got, "return &_yield0") {
+		t.Fatalf("primitive yield must return a stable pointer:\n%s", got)
 	}
 }
 
@@ -6120,8 +6306,8 @@ func TestCompileModifierMethodSelect(t *testing.T) {
 		{method: "select"},
 		{method: "all"},
 	})
-	if !strings.Contains(got, "selection.SQLColumns(req.Select)") {
-		t.Fatalf("select should use SQLColumns, got %q", got)
+	if !strings.Contains(got, "selectUserSQLColumns(req.Select)") {
+		t.Fatalf("select should use the model SQL selector, got %q", got)
 	}
 }
 
@@ -6174,6 +6360,21 @@ func TestCompileOrderByChainPlainIdent(t *testing.T) {
 	out := b.String()
 	if !strings.Contains(out, `"created_at ASC"`) {
 		t.Fatalf("plain ident should default to ASC, got %q", out)
+	}
+}
+
+func TestCompileOrderByChainItQualifiedField(t *testing.T) {
+	c := newCompiler(nil)
+	var b strings.Builder
+	c.compileOrderByChain(&b, []*ast.NamedArg{
+		{Value: &ast.MemberExpr{
+			Object: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "createdAt"},
+			Field:  "desc",
+		}},
+	})
+	out := b.String()
+	if !strings.Contains(out, `"created_at DESC"`) {
+		t.Fatalf("it-qualified field should not become a SQL table qualifier, got %q", out)
 	}
 }
 

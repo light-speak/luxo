@@ -135,6 +135,44 @@ jobs:
       - name: Test vite-plugin
         run: cd packages/vite-plugin && pnpm test
 
+  sdk-kotlin:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+
+      - name: Verify Gradle Wrapper
+        working-directory: packages/kotlin
+        run: |
+          test "$(sha256sum gradle/wrapper/gradle-wrapper.jar | cut -d ' ' -f1)" = "7a9ce74cff467ca1bf60a4fcd9f05185acceda4d0f382434d393e17864262c5d"
+          ./gradlew --version
+
+      - name: Test Kotlin SDK and Gradle plugin
+        working-directory: packages/kotlin
+        run: ./gradlew build :gradle-plugin:validatePlugins --no-daemon --warning-mode fail
+
+      - name: Test external Kotlin consumer
+        working-directory: tests/kotlin-consumer
+        env:
+          LUXO_INTROSPECTION_KEY: ci-fixture-key
+        run: |
+          set -euo pipefail
+          python3 -m http.server 18080 --bind 127.0.0.1 --directory src/main/luxo &
+          server_pid=$!
+          trap 'kill "${server_pid}"' EXIT
+          curl --retry 20 --retry-connrefused --retry-delay 1 -fsS -o /dev/null http://127.0.0.1:18080/luxo.schema.json
+          ../../packages/kotlin/gradlew luxoGenerate build --project-cache-dir .tmp/gradle-cache --no-daemon --warning-mode fail -Pluxo.endpoint=http://127.0.0.1:18080/luxo.schema.json
+          grep -F '"lookupNode" to "name, posts { title }"' .tmp/generated/com/luxo/generated/SelectHints.kt
+          ../../packages/kotlin/gradlew luxoAnalyze --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
+          ../../packages/kotlin/gradlew luxoAnalyze --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
+
   sdk-swift:
     runs-on: macos-latest
     steps:

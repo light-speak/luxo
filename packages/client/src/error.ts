@@ -9,6 +9,10 @@ export class LuxoError extends Error {
     message: string,
     /** Trace ID for debugging */
     public readonly traceId?: string,
+	/** Structured application error data */
+	public readonly data?: unknown,
+	/** Development-only underlying cause */
+	public readonly cause?: string,
   ) {
     super(message)
     this.name = 'LuxoError'

@@ -1,6 +1,7 @@
 package luvia
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
@@ -25,7 +26,7 @@ func TestMerge_WithExtend(t *testing.T) {
 
 	// Extend: posts data (already encoded, without fieldID prefix)
 	var postsData []byte
-	postsData = codec.AppendSvarint(postsData, 2) // count = 2
+	postsData = codec.AppendArrayHeader(postsData, 2) // count = 2
 	// Post 1: [arenaHeader][field1=1][0x00]
 	postsData = codec.AppendVarint(postsData, 0) // arena
 	postsData = codec.AppendVarint(postsData, 1) // field 1
@@ -60,7 +61,7 @@ func TestMerge_WithExtend(t *testing.T) {
 		t.Fatalf("expected field 10, got %d", dec.FieldID())
 	}
 	// Read the count
-	count := dec.ReadInt() // svarint count = 2
+	count := dec.ReadArrayLength()
 	if count != 2 {
 		t.Fatalf("posts count = %d, want 2", count)
 	}
@@ -151,6 +152,117 @@ func TestExtractID_Empty(t *testing.T) {
 	_, ok := ExtractID(nil, 1, nil)
 	if ok {
 		t.Fatal("empty buffer should return false")
+	}
+}
+
+func TestExtractPrimaryKeysPreservesStringWireEncoding(t *testing.T) {
+	var enc codec.Encoder
+	enc.WriteFieldString(7, "sku-42")
+	enc.WriteEnd()
+	primary := append(codec.AppendVarint(nil, 6), enc.Bytes()...)
+	field := &schema.Field{ID: 7, Name: "sku", Type: schema.FieldString, PrimaryKey: true}
+
+	model := &schema.Model{Name: "Product", Fields: []schema.Field{*field}}
+	s := schema.New()
+	s.RegisterModel(model)
+	keys, ok := ExtractPrimaryKeys(primary, field, model, s)
+	if !ok || keys.Len() != 1 {
+		t.Fatalf("ExtractPrimaryKeys() = %#v, %v", keys, ok)
+	}
+	params := keys.EncodeParam(1)
+	dec := codec.NewDecoder(params)
+	if !dec.NextField() || dec.FieldID() != 1 {
+		t.Fatal("missing encoded keys param")
+	}
+	got := dec.ReadStringArray()
+	if dec.Err() != nil || len(got) != 1 || got[0] != "sku-42" {
+		t.Fatalf("encoded keys = %v, err %v", got, dec.Err())
+	}
+}
+
+func TestExtractPrimaryKeysSkipsListsAndNestedModels(t *testing.T) {
+	child := &schema.Model{Name: "Child", Fields: []schema.Field{{ID: 1, Name: "name", Type: schema.FieldString}}}
+	parent := &schema.Model{Name: "Parent", Fields: []schema.Field{
+		{ID: 2, Name: "tags", Type: schema.FieldString, IsList: true},
+		{ID: 3, Name: "child", Type: schema.FieldModel, TypeName: "Child", Relation: true},
+		{ID: 7, Name: "key", Type: schema.FieldString, PrimaryKey: true},
+	}}
+	s := schema.New()
+	s.RegisterModel(child)
+	s.RegisterModel(parent)
+	var primary []byte
+	primary = codec.AppendVarint(primary, 0)
+	primary = codec.AppendVarint(primary, 2)
+	primary = codec.AppendVarint(primary, 2)
+	primary = codec.AppendString(primary, "a")
+	primary = codec.AppendString(primary, "b")
+	primary = codec.AppendVarint(primary, 3)
+	primary = codec.AppendVarint(primary, 1)
+	primary = codec.AppendVarint(primary, 1)
+	primary = codec.AppendString(primary, "x")
+	primary = append(primary, 0)
+	primary = codec.AppendVarint(primary, 7)
+	primary = codec.AppendString(primary, "parent-key")
+	primary = append(primary, 0)
+
+	keys, ok := ExtractPrimaryKeys(primary, parent.PrimaryKeyField(), parent, s)
+	if !ok {
+		t.Fatal("primary key after complex fields was not extracted")
+	}
+	dec := codec.NewDecoder(keys.EncodeParam(1))
+	dec.NextField()
+	got := dec.ReadStringArray()
+	if dec.Err() != nil || !reflect.DeepEqual(got, []string{"parent-key"}) {
+		t.Fatalf("keys = %v, err %v", got, dec.Err())
+	}
+}
+
+func TestExtractPrimaryKeyColumnPreservesUUIDWireEncoding(t *testing.T) {
+	uuidA := [16]byte{1, 2, 3}
+	uuidB := [16]byte{4, 5, 6}
+	var writer codec.ColumnarWriter
+	writer.SetCount(2)
+	writer.WriteColumnUUID(7, [][16]byte{uuidA, uuidB})
+	model := &schema.Model{Name: "Account", Fields: []schema.Field{{
+		ID: 7, Name: "key", Type: schema.FieldUUID, PrimaryKey: true,
+	}}}
+	s := schema.New()
+	s.RegisterModel(model)
+
+	keys, ok := ExtractPrimaryKeyColumn(writer.Bytes(), model.FieldByID(7), model)
+	if !ok || keys.Len() != 2 {
+		t.Fatalf("ExtractPrimaryKeyColumn() = %#v, %v", keys, ok)
+	}
+	params := keys.EncodeParam(1)
+	dec := codec.NewDecoder(params)
+	if !dec.NextField() {
+		t.Fatal("missing encoded keys param")
+	}
+	got := dec.ReadUUIDArray()
+	if dec.Err() != nil || !reflect.DeepEqual(got, [][16]byte{uuidA, uuidB}) {
+		t.Fatalf("encoded UUID keys = %v, err %v", got, dec.Err())
+	}
+}
+
+func TestExtractPrimaryKeyColumnSkipsScalarListColumn(t *testing.T) {
+	var listCell []byte
+	listCell = codec.AppendVarint(listCell, 2)
+	listCell = codec.AppendString(listCell, "a")
+	listCell = codec.AppendString(listCell, "b")
+	var writer codec.ColumnarWriter
+	writer.SetCount(1)
+	writer.WriteColumnBytes(2, [][]byte{listCell})
+	writer.WriteColumnString(7, []string{"key"})
+	model := &schema.Model{Name: "Product", Fields: []schema.Field{
+		{ID: 2, Name: "tags", Type: schema.FieldString, IsList: true},
+		{ID: 7, Name: "sku", Type: schema.FieldString, PrimaryKey: true},
+	}}
+	s := schema.New()
+	s.RegisterModel(model)
+
+	keys, ok := ExtractPrimaryKeyColumn(writer.Bytes(), model.PrimaryKeyField(), model)
+	if !ok || keys.Len() != 1 {
+		t.Fatalf("keys = %#v, ok %v", keys, ok)
 	}
 }
 
@@ -331,15 +443,15 @@ func TestParseGroupedResponse_List(t *testing.T) {
 		t.Fatalf("expected 2 blobs, got %d", len(blobs))
 	}
 
-	// Blob 0: [count svarint=2][item1 raw][item2 raw]
+	// Blob 0: [count varint=2][item1 raw][item2 raw]
 	dec := codec.NewDecoder(blobs[0])
-	count := dec.ReadInt() // svarint
+	count := dec.ReadArrayLength()
 	if count != 2 {
 		t.Fatalf("blob0 count = %d, want 2", count)
 	}
-	// Blob 1: [count svarint=1][item3 raw]
+	// Blob 1: [count varint=1][item3 raw]
 	dec = codec.NewDecoder(blobs[1])
-	count = dec.ReadInt()
+	count = dec.ReadArrayLength()
 	if count != 1 {
 		t.Fatalf("blob1 count = %d, want 1", count)
 	}
@@ -1027,12 +1139,130 @@ func TestParseGroupedResponse_MultipleKeys(t *testing.T) {
 	}
 	// key1: empty list
 	dec := codec.NewDecoder(blobs[1])
-	count := dec.ReadInt()
+	count := dec.ReadArrayLength()
 	if count != 0 {
 		t.Fatalf("key1 count should be 0, got %d", count)
 	}
 	// key2: list with 1 item
 	if len(blobs[2]) == 0 {
 		t.Fatal("key2 blob should not be empty")
+	}
+}
+
+func TestSkipNestedRowFieldHandlesSchemaAndWireFailures(t *testing.T) {
+	registry := schema.New()
+	missing := &schema.Field{Type: schema.FieldModel, TypeName: "Missing", Relation: true}
+	if skipNestedRowField(codec.NewDecoder(nil), missing, registry) {
+		t.Fatal("missing nested schema was accepted")
+	}
+
+	registry.RegisterType(&schema.TypeDecl{Name: "Child", Fields: []schema.Field{{ID: 1, Name: "value", Type: schema.FieldInt}}})
+	nullable := &schema.Field{Type: schema.FieldModel, TypeName: "Child", Relation: true, Nullable: true}
+	if !skipNestedRowField(codec.NewDecoder(codec.AppendNull(nil)), nullable, registry) {
+		t.Fatal("nullable nested type declaration was not skipped")
+	}
+	if skipNestedRowField(codec.NewDecoder(nil), nullable, registry) {
+		t.Fatal("truncated nullable marker was accepted")
+	}
+
+	list := &schema.Field{Type: schema.FieldModel, TypeName: "Child", Relation: true, IsList: true}
+	if skipNestedRowField(codec.NewDecoder(nil), list, registry) {
+		t.Fatal("truncated nested list header was accepted")
+	}
+	row := codec.AppendArrayHeader(nil, 1)
+	row = codec.AppendVarint(row, 0)
+	row = codec.AppendVarint(row, 1)
+	row = codec.AppendSvarint(row, 42)
+	row = append(row, 0)
+	if !skipNestedRowField(codec.NewDecoder(row), list, registry) {
+		t.Fatal("valid nested list was not skipped")
+	}
+	unknownField := codec.AppendArrayHeader(nil, 1)
+	unknownField = codec.AppendVarint(unknownField, 0)
+	unknownField = codec.AppendVarint(unknownField, 2)
+	unknownField = codec.AppendSvarint(unknownField, 42)
+	unknownField = append(unknownField, 0)
+	if skipNestedRowField(codec.NewDecoder(unknownField), list, registry) {
+		t.Fatal("unknown nested row field was accepted")
+	}
+}
+
+func TestExtractPrimaryKeysRejectsInvalidInputs(t *testing.T) {
+	registry := schema.New()
+	key := &schema.Field{ID: 1, Name: "key", Type: schema.FieldString, PrimaryKey: true}
+	model := &schema.Model{Name: "Item", Fields: []schema.Field{*key}}
+	registry.RegisterModel(model)
+	model = registry.Models[model.Name]
+	key = model.PrimaryKeyField()
+	for name, test := range map[string]struct {
+		primary  []byte
+		keyField *schema.Field
+		model    *schema.Model
+		registry *schema.Schema
+	}{
+		"empty response":   {keyField: key, model: model, registry: registry},
+		"missing key":      {primary: []byte{0}, model: model, registry: registry},
+		"missing model":    {primary: []byte{0}, keyField: key, registry: registry},
+		"missing registry": {primary: []byte{0}, keyField: key, model: model},
+		"invalid key type": {primary: []byte{0}, keyField: &schema.Field{Type: schema.FieldFloat}, model: model, registry: registry},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, ok := ExtractPrimaryKeys(test.primary, test.keyField, test.model, test.registry); ok {
+				t.Fatal("invalid primary-key extraction input was accepted")
+			}
+		})
+	}
+
+	unknownField := codec.AppendVarint(nil, 0)
+	unknownField = codec.AppendVarint(unknownField, 2)
+	unknownField = codec.AppendString(unknownField, "value")
+	unknownField = append(unknownField, 0)
+	if _, ok := ExtractPrimaryKeys(unknownField, key, model, registry); ok {
+		t.Fatal("unknown row field was accepted")
+	}
+	truncatedKey := codec.AppendVarint(nil, 0)
+	truncatedKey = codec.AppendVarint(truncatedKey, 1)
+	truncatedKey = codec.AppendVarint(truncatedKey, 10)
+	if _, ok := ExtractPrimaryKeys(truncatedKey, key, model, registry); ok {
+		t.Fatal("truncated primary key was accepted")
+	}
+}
+
+func TestExtractPrimaryKeyColumnRejectsInvalidInputs(t *testing.T) {
+	key := schema.Field{ID: 1, Name: "key", Type: schema.FieldInt, PrimaryKey: true}
+	model := &schema.Model{Name: "Item", Fields: []schema.Field{key, {ID: 2, Name: "value", Type: schema.FieldInt}}}
+	registry := schema.New()
+	registry.RegisterModel(model)
+	model = registry.Models[model.Name]
+	keyField := model.PrimaryKeyField()
+
+	if _, ok := ExtractPrimaryKeyColumn(nil, keyField, model); ok {
+		t.Fatal("empty columnar response was accepted")
+	}
+	if _, ok := ExtractPrimaryKeyColumn([]byte{0xff}, keyField, model); ok {
+		t.Fatal("malformed columnar response was accepted")
+	}
+	if _, ok := ExtractPrimaryKeyColumn(codec.AppendVarint(nil, 0), keyField, model); ok {
+		t.Fatal("zero-row columnar response was accepted")
+	}
+	if _, ok := ExtractPrimaryKeyColumn([]byte{1, 0}, &schema.Field{Type: schema.FieldFloat}, model); ok {
+		t.Fatal("invalid columnar key type was accepted")
+	}
+
+	var unknown codec.ColumnarWriter
+	unknown.SetCount(1)
+	unknown.WriteColumnInt(3, []int64{1})
+	if _, ok := ExtractPrimaryKeyColumn(unknown.Bytes(), keyField, model); ok {
+		t.Fatal("unknown column was accepted")
+	}
+	var missing codec.ColumnarWriter
+	missing.SetCount(1)
+	missing.WriteColumnInt(2, []int64{1})
+	if _, ok := ExtractPrimaryKeyColumn(missing.Bytes(), keyField, model); ok {
+		t.Fatal("response without key column was accepted")
+	}
+	truncated := []byte{1, 0, 2}
+	if _, ok := ExtractPrimaryKeyColumn(truncated, keyField, model); ok {
+		t.Fatal("truncated column was accepted")
 	}
 }

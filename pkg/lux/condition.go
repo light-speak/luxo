@@ -454,6 +454,46 @@ type falseCond struct{}
 
 func (c falseCond) ToSQL(argOffset int) (string, []any) { return "FALSE", nil }
 
+// AllOf combines conditions with AND while preserving parameter offsets.
+// An empty group matches every row.
+func AllOf(conditions ...Condition) Condition {
+	return &conditionGroup{operator: " AND ", emptySQL: "TRUE", conditions: conditions}
+}
+
+// AnyOf combines conditions with OR while preserving parameter offsets.
+// An empty group matches no rows.
+func AnyOf(conditions ...Condition) Condition {
+	return &conditionGroup{operator: " OR ", emptySQL: "FALSE", conditions: conditions}
+}
+
+type conditionGroup struct {
+	operator   string
+	emptySQL   string
+	conditions []Condition
+}
+
+func (g *conditionGroup) ToSQL(argOffset int) (string, []any) {
+	var b strings.Builder
+	var args []any
+	written := 0
+	for _, condition := range g.conditions {
+		if condition == nil {
+			continue
+		}
+		sql, conditionArgs := condition.ToSQL(argOffset + len(args))
+		if written > 0 {
+			b.WriteString(g.operator)
+		}
+		b.WriteString(sql)
+		args = append(args, conditionArgs...)
+		written++
+	}
+	if written == 0 {
+		return g.emptySQL, nil
+	}
+	return "(" + b.String() + ")", args
+}
+
 // rawCond is a pre-built SQL condition with embedded args.
 type rawCond struct {
 	sql  string

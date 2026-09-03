@@ -1,6 +1,8 @@
 package luvia
 
 import (
+	"fmt"
+
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/schema"
 )
@@ -18,12 +20,8 @@ type QueryPlan struct {
 	// OriginalMask is the client's original field mask (for response merging).
 	OriginalMask []byte
 
-	// IDFieldID is the field ID of the "id" field in the primary model.
-	IDFieldID int
-
-	// FieldTypes maps field ID → skip type for all primary fields.
-	// Used by ExtractID to skip non-ID fields without schema lookup.
-	FieldTypes map[int]codec.FieldSkipType
+	// PrimaryKeyField identifies the schema-declared key used for federation.
+	PrimaryKeyField *schema.Field
 }
 
 // PlanStep describes a request to a single module.
@@ -52,38 +50,36 @@ type ExtendStep struct {
 //   - model: the schema model for the API's return type
 //   - mask: the client's field mask (nil = all fields)
 //   - apiModule: the module that owns the API
-func Plan(model *schema.Model, mask []byte, apiModule string) *QueryPlan {
+func Plan(model *schema.Model, mask []byte, apiModule string) (*QueryPlan, error) {
 	if model == nil {
-		return nil
+		return nil, nil
 	}
 	// Quick check: if no extend fields exist in model, skip planning entirely
 	if !model.HasExtendFields() {
-		return nil
+		return nil, nil
 	}
 
-	// Find the id field's ID first (needed for FK resolution)
-	var idFieldID int
-	for i := range model.Fields {
-		if model.Fields[i].Name == "id" {
-			idFieldID = model.Fields[i].ID
-			break
-		}
-	}
+	primaryKey := model.PrimaryKeyField()
 
 	var extends []ExtendStep
 	primaryMask := []byte{}
+	var primaryChildren []codec.SelectionMaskChild
+	selectedFields := codec.SelectionMaskFields(mask)
 
 	for i := range model.Fields {
 		f := &model.Fields[i]
 
 		// Skip fields not in the requested mask
-		if !codec.FieldMaskHas(mask, f.ID) {
+		if !codec.FieldMaskHas(selectedFields, f.ID) {
 			continue
 		}
 
 		if f.Module == "" {
 			// Local field → include in primary mask
 			primaryMask = codec.FieldMaskSet(primaryMask, f.ID)
+			if child, ok := codec.SelectionMaskNested(mask, f.ID); ok {
+				primaryChildren = append(primaryChildren, codec.SelectionMaskChild{FieldID: f.ID, Mask: child})
+			}
 		} else if f.Relation && f.ForeignKey != "" {
 			// Relation extend field (e.g. posts: [Post] @hasMany) → resolve via RPC
 			extends = append(extends, ExtendStep{
@@ -94,44 +90,45 @@ func Plan(model *schema.Model, mask []byte, apiModule string) *QueryPlan {
 				ModelName:  f.TypeName,
 				ForeignKey: f.ForeignKey,
 				IsList:     f.IsList,
-				Mask:       nil,
+				Mask:       selectionChild(mask, f.ID),
 			})
+		} else {
+			return nil, fmt.Errorf("luvia: extend field %s.%s has no executable resolver", model.Name, f.Name)
 		}
-		// Non-relation extend fields (scalar like postCount) are skipped —
-		// no resolve endpoint exists for them. They require aggregation RPC
-		// which is not yet supported.
 	}
 
 	// No extend fields in request → direct forward
 	if len(extends) == 0 {
-		return nil
+		return nil, nil
+	}
+	if primaryKey == nil {
+		return nil, fmt.Errorf("luvia: model %s requires a primary key for federation", model.Name)
+	}
+	if primaryKey.Nullable || primaryKey.IsList || !isFederationKeyType(primaryKey.Type) {
+		return nil, fmt.Errorf("luvia: model %s has unsupported federation primary key %s", model.Name, primaryKey.Name)
 	}
 
-	// Auto-include id in primary mask (needed for extend FK resolution)
-	if idFieldID > 0 {
-		primaryMask = codec.FieldMaskSet(primaryMask, idFieldID)
-	}
-
-	// Build field types map for schema-aware ID extraction
-	fieldTypes := make(map[int]codec.FieldSkipType, len(model.Fields))
-	for i := range model.Fields {
-		f := &model.Fields[i]
-		if f.Module != "" {
-			continue // extend fields not in primary response
-		}
-		fieldTypes[f.ID] = schemaFieldToSkipType(f)
-	}
+	// Auto-include the primary key in the primary mask for extend resolution.
+	primaryMask = codec.FieldMaskSet(primaryMask, primaryKey.ID)
 
 	return &QueryPlan{
 		Primary: PlanStep{
 			Module: apiModule,
-			Mask:   primaryMask,
+			Mask:   codec.AppendSelectionMask(nil, primaryMask, primaryChildren),
 		},
-		Extends:      extends,
-		OriginalMask: mask,
-		IDFieldID:    idFieldID,
-		FieldTypes:   fieldTypes,
-	}
+		Extends:         extends,
+		OriginalMask:    mask,
+		PrimaryKeyField: primaryKey,
+	}, nil
+}
+
+func isFederationKeyType(fieldType schema.FieldType) bool {
+	return fieldType == schema.FieldInt || fieldType == schema.FieldString || fieldType == schema.FieldUUID
+}
+
+func selectionChild(mask []byte, fieldID int) []byte {
+	child, _ := codec.SelectionMaskNested(mask, fieldID)
+	return child
 }
 
 // schemaFieldToSkipType maps a schema field type to a codec skip type.
@@ -147,6 +144,11 @@ func schemaFieldToSkipType(f *schema.Field) codec.FieldSkipType {
 			return codec.SkipNullFixed64
 		}
 		return codec.SkipFixed64
+	case schema.FieldUUID:
+		if f.Nullable {
+			return codec.SkipNullFixed16
+		}
+		return codec.SkipFixed16
 	case schema.FieldString, schema.FieldEnum, schema.FieldBytes, schema.FieldModel:
 		if f.Nullable {
 			return codec.SkipNullBytes

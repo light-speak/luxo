@@ -9,11 +9,11 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
 
-	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/light-speak/luxo/pkg/lux/i18n"
 	"github.com/light-speak/luxo/pkg/lux/schema"
@@ -56,21 +56,25 @@ type TraceRecorder interface {
 
 // Router maps API names to handlers and serves the /luvia endpoint.
 type Router struct {
-	handlers         map[string]HandlerFunc
-	streamMatchers   map[string]StreamMatcher     // @stream API name → matcher function
-	streamHandlers   map[string]StreamHandlerFunc // @stream @native (no event) → handler
-	translator       *i18n.Translator
-	devMode          bool
-	Registry         *APIRegistry    // binary protocol API ID mapping
-	Schema           *schema.Schema  // model/API metadata for Binary↔JSON conversion
-	Streams          *StreamHub      // WebSocket stream subscription manager
-	IntrospectionKey string          // key for schema introspection (empty = disabled)
-	Version          string          // application version exposed with schema introspection
-	WSOrigins        []string        // allowed WebSocket origins (empty = allow all in dev mode)
-	metrics          MetricsRecorder // optional metrics collector
-	requestLogging   bool
-	debugParamShape  bool
-	logWriter        io.Writer
+	handlers               map[string]HandlerFunc
+	streamMatchers         map[string]StreamMatcher     // @stream API name → matcher function
+	streamHandlers         map[string]StreamHandlerFunc // @stream @native (no event) → handler
+	requiredStreams        map[string]struct{}          // generated @stream APIs that must have an implementation
+	translator             *i18n.Translator
+	devMode                bool
+	Registry               *APIRegistry                                           // binary protocol API ID mapping
+	Schema                 *schema.Schema                                         // model/API metadata for Binary↔JSON conversion
+	Streams                *StreamHub                                             // WebSocket stream subscription manager
+	IntrospectionKey       string                                                 // key for schema introspection (empty = disabled)
+	Version                string                                                 // application version exposed with schema introspection
+	WSOrigins              []string                                               // allowed WebSocket origins (empty = allow all in dev mode)
+	WSAllowAllOrigins      bool                                                   // explicitly allow every WebSocket origin
+	IdentityExtractor      func(context.Context) any                              // extracts authenticated stream identity from request context
+	InternalRequestContext func(context.Context, string) (context.Context, error) // verifies RPC bearer metadata and enriches context
+	metrics                MetricsRecorder                                        // optional metrics collector
+	requestLogging         bool
+	debugParamShape        bool
+	logWriter              io.Writer
 }
 
 // RouterOptions configures optional request observability outside the hot path.
@@ -106,6 +110,7 @@ func NewRouterWithOptions(options RouterOptions) *Router {
 		handlers:        make(map[string]HandlerFunc),
 		streamMatchers:  make(map[string]StreamMatcher),
 		streamHandlers:  make(map[string]StreamHandlerFunc),
+		requiredStreams: make(map[string]struct{}),
 		Registry:        registry,
 		Schema:          s,
 		Streams:         NewStreamHub(),
@@ -126,6 +131,40 @@ func (rt *Router) HandleStream(apiName string, matcher StreamMatcher) {
 // The handler is invoked per subscription and controls push timing via stream.Send().
 func (rt *Router) HandleStreamNative(apiName string, handler StreamHandlerFunc) {
 	rt.streamHandlers[apiName] = handler
+}
+
+// RequireStream marks a generated stream route as requiring an implementation.
+func (rt *Router) RequireStream(apiName string) {
+	rt.requiredStreams[apiName] = struct{}{}
+}
+
+// Validate checks startup invariants that cannot be proven by code generation.
+func (rt *Router) Validate() error {
+	missing := make([]string, 0)
+	for apiName := range rt.requiredStreams {
+		if _, registered := rt.streamMatchers[apiName]; registered {
+			continue
+		}
+		if _, registered := rt.streamHandlers[apiName]; !registered {
+			missing = append(missing, apiName)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	sort.Strings(missing)
+	return fmt.Errorf("api: stream %q has no registered implementation", missing[0])
+}
+
+func (rt *Router) isStreamAPI(apiName string) bool {
+	if _, ok := rt.streamMatchers[apiName]; ok {
+		return true
+	}
+	if _, ok := rt.streamHandlers[apiName]; ok {
+		return true
+	}
+	definition := rt.Schema.APIs[apiName]
+	return definition != nil && definition.Stream
 }
 
 // Handle registers a handler for an API name.
@@ -157,25 +196,26 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Schema introspection: GET /luvia?$schema&key=xxx
+	// Schema introspection: GET /luvia?$schema with X-Introspection-Key.
 	if r.URL.Query().Has("$schema") {
 		rt.handleIntrospection(w, r)
 		return
 	}
 
+	binaryMode := r.Header.Get("X-Luxo-Mode") == "binary"
+
 	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		rt.writeAppError(w, r, binaryMode, errors.New("MethodNotAllowed", http.StatusMethodNotAllowed, "POST only"))
 		return
 	}
-
-	binaryMode := r.Header.Get("X-Luxo-Mode") == "binary"
 
 	var req *Request
 	var err error
 	if binaryMode {
 		body, bp, readErr := readBody(r.Body)
 		if readErr != nil {
-			writeError(w, http.StatusBadRequest, readErr.Error())
+			putBody(bp)
+			rt.writeAppError(w, r, true, errors.New("BadRequest", http.StatusBadRequest, readErr.Error()))
 			return
 		}
 		defer putBody(bp)
@@ -194,7 +234,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				colorRed, colorReset, mode,
 				colorRed, err.Error(), colorReset)
 		}
-		writeError(w, http.StatusBadRequest, err.Error())
+		rt.writeAppError(w, r, binaryMode, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
 		return
 	}
 
@@ -208,15 +248,9 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Luvia converts to JSON if client wants JSON.
 	req.BinaryMode = true
 
-	// Convert $select to FieldMask for binary mode WriteLuxo
-	if !binaryMode && req.Select != nil && rt.Schema != nil {
-		apiMeta := rt.Schema.APIs[req.API]
-		if apiMeta != nil && apiMeta.ReturnType != "" {
-			model := rt.Schema.Models[apiMeta.ReturnType]
-			if model != nil {
-				req.FieldMask = schema.SelectToFieldMask(req.Select, model)
-			}
-		}
+	if err = rt.prepareRequest(req, binaryMode); err != nil {
+		rt.writeAppError(w, r, binaryMode, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
+		return
 	}
 
 	// Get pooled buffer, set on request, handler writes directly
@@ -271,6 +305,35 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	PutBuf(buf)
 }
 
+func (rt *Router) prepareRequest(req *Request, binaryMode bool) error {
+	if err := rt.applyJSONSelection(req, binaryMode); err != nil {
+		return err
+	}
+	if binaryMode {
+		return nil
+	}
+	return rt.Registry.prepareJSONRequest(req)
+}
+
+func (rt *Router) applyJSONSelection(req *Request, binaryMode bool) error {
+	if binaryMode || req.Select == nil || rt.Schema == nil {
+		return nil
+	}
+	apiMeta := rt.Schema.APIs[req.API]
+	if apiMeta == nil || apiMeta.ReturnType == "" {
+		return nil
+	}
+	model := schemaObject(rt.Schema, apiMeta.ReturnType)
+	if model == nil {
+		return nil
+	}
+	mask, err := schema.SelectToFieldMask(req.Select, model, rt.Schema)
+	if err == nil {
+		req.FieldMask = mask
+	}
+	return err
+}
+
 func newTraceRecord(r *http.Request, apiName string, startedAt time.Time, duration time.Duration, err error) TraceRecord {
 	statusCode := http.StatusOK
 	if err != nil {
@@ -299,9 +362,6 @@ func (rt *Router) handleIntrospection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := r.Header.Get("X-Introspection-Key")
-	if key == "" {
-		key = r.URL.Query().Get("key") // fallback for backward compatibility
-	}
 	if subtle.ConstantTimeCompare([]byte(key), []byte(rt.IntrospectionKey)) != 1 {
 		writeError(w, http.StatusForbidden, "invalid introspection key")
 		return
@@ -344,25 +404,41 @@ func (rt *Router) convertBinaryToJSON(apiName string, data []byte) []byte {
 	}
 
 	// Check if return type is a model, type declaration, or scalar
-	model := rt.Schema.Models[apiMeta.ReturnType]
+	model := schemaObject(rt.Schema, apiMeta.ReturnType)
 	if model == nil {
-		// Try type declarations (non-DB types like AuthPayload)
-		if td := rt.Schema.Types[apiMeta.ReturnType]; td != nil {
-			model = td.AsModel()
+		wireType := apiMeta.ReturnType
+		if rt.Schema.Enums[wireType] != nil {
+			wireType = "String"
 		}
-	}
-	if model == nil {
-		// Scalar return — use declared type for precise decoding
-		return schema.BinaryScalarToJSON(nil, data, apiMeta.ReturnType)
+		if apiMeta.ReturnList {
+			return schema.BinaryScalarListToJSON(nil, data, wireType)
+		}
+		return schema.BinaryScalarToJSON(nil, data, wireType)
 	}
 
 	if apiMeta.ReturnList {
 		if apiMeta.Paginated {
-			return schema.BinaryPaginatedListToJSON(nil, data, model)
+			return schema.BinaryPaginatedListToJSON(nil, data, model, rt.Schema)
 		}
-		return schema.BinaryListToJSON(nil, data, model)
+		return schema.BinaryListToJSON(nil, data, model, rt.Schema)
 	}
 	return schema.BinaryToJSON(nil, data, model, rt.Schema)
+}
+
+// StreamPayloadJSON converts a generated binary stream payload through the
+// same schema-driven path as an ordinary API response.
+func (rt *Router) StreamPayloadJSON(apiName string, data []byte) []byte {
+	return rt.convertBinaryToJSON(apiName, data)
+}
+
+func schemaObject(s *schema.Schema, typeName string) *schema.Model {
+	if model := s.Models[typeName]; model != nil {
+		return model
+	}
+	if declaration := s.Types[typeName]; declaration != nil {
+		return declaration.AsModel()
+	}
+	return nil
 }
 
 // callHandler executes a handler with panic recovery.
@@ -377,18 +453,33 @@ func (rt *Router) callHandler(fn HandlerFunc, ctx context.Context, req *Request)
 }
 
 // writeAppError writes a structured error response with i18n translation and traceId.
-// Binary mode uses Luxo codec (fieldID 1=code, 2=name, 3=message); JSON mode uses JSON.
+// Binary mode uses the canonical binary error envelope; JSON mode uses JSON.
 func (rt *Router) writeAppError(w http.ResponseWriter, r *http.Request, binaryMode bool, err error) {
+	werr := rt.buildWireError(r.Context(), r.Header.Get("Accept-Language"), err)
+	buf := GetBuf()
+
+	if binaryMode {
+		buf.B = appendBinaryError(buf.B, werr)
+		w.Header().Set("Content-Type", "application/x-luxo")
+		w.Header().Set("X-Luxo-Mode", "binary")
+	} else {
+		appendJSONError(buf, werr)
+	}
+
+	w.WriteHeader(werr.Code)
+	w.Write(buf.B)
+	PutBuf(buf)
+}
+
+func (rt *Router) buildWireError(ctx context.Context, acceptLanguage string, err error) wireError {
 	var appErr *errors.AppError
 	if !stderrors.As(err, &appErr) {
 		appErr = errors.Wrap(err)
 	}
 
-	traceID := TraceID(r.Context())
-
 	message := appErr.Message
 	if rt.translator != nil && !appErr.Internal {
-		locale := i18n.ParseAcceptLanguage(r.Header.Get("Accept-Language"))
+		locale := i18n.ParseAcceptLanguage(acceptLanguage)
 		if appErr.Data != nil {
 			message = rt.translator.Translate(locale, appErr.Message, appErr.Data.I18nData())
 		} else {
@@ -396,47 +487,46 @@ func (rt *Router) writeAppError(w http.ResponseWriter, r *http.Request, binaryMo
 		}
 	}
 
-	buf := GetBuf()
-
-	if binaryMode {
-		// Binary error: fieldID 1=code, 2=name, 3=message
-		var enc codec.Encoder
-		enc.WriteFieldInt(1, int64(appErr.Code))
-		enc.WriteFieldString(2, appErr.Name)
-		enc.WriteFieldString(3, message)
-		enc.WriteEnd()
-		buf.B = append(buf.B, enc.Bytes()...)
-
-		w.Header().Set("Content-Type", "application/x-luxo")
-		w.Header().Set("X-Luxo-Mode", "binary")
-	} else {
-		buf.AppendString(`{"error":`)
-		buf.AppendJSONString(appErr.Name)
-		buf.AppendString(`,"code":`)
-		buf.AppendInt(int64(appErr.Code))
-		buf.AppendString(`,"message":`)
-		buf.AppendJSONString(message)
-		if traceID != "" {
-			buf.AppendString(`,"traceId":`)
-			buf.AppendJSONString(traceID)
-		}
-		if appErr.Data != nil && !appErr.Internal {
-			dataBytes, marshalErr := json.Marshal(appErr.Data)
-			if marshalErr == nil {
-				buf.AppendString(`,"data":`)
-				buf.B = append(buf.B, dataBytes...)
-			}
-		}
-		if rt.devMode && appErr.Cause != nil {
-			buf.AppendString(`,"cause":`)
-			buf.AppendJSONString(appErr.Cause.Error())
-		}
-		buf.AppendByte('}')
+	werr := wireError{
+		Code:    appErr.Code,
+		Name:    appErr.Name,
+		Message: message,
+		TraceID: TraceID(ctx),
 	}
+	if appErr.Data != nil && !appErr.Internal {
+		werr.Data, _ = json.Marshal(appErr.Data)
+	}
+	if rt.devMode && appErr.Cause != nil {
+		werr.Cause = appErr.Cause.Error()
+	}
+	return werr
+}
 
-	w.WriteHeader(appErr.Code)
-	w.Write(buf.B)
-	PutBuf(buf)
+func appendJSONError(buf *ResponseBuf, e wireError) {
+	buf.AppendByte('{')
+	appendJSONErrorFields(buf, e)
+	buf.AppendByte('}')
+}
+
+func appendJSONErrorFields(buf *ResponseBuf, e wireError) {
+	buf.AppendString(`"error":`)
+	buf.AppendJSONString(e.Name)
+	buf.AppendString(`,"code":`)
+	buf.AppendInt(int64(e.Code))
+	buf.AppendString(`,"message":`)
+	buf.AppendJSONString(e.Message)
+	if e.TraceID != "" {
+		buf.AppendString(`,"traceId":`)
+		buf.AppendJSONString(e.TraceID)
+	}
+	if len(e.Data) > 0 {
+		buf.AppendString(`,"data":`)
+		buf.B = append(buf.B, e.Data...)
+	}
+	if e.Cause != "" {
+		buf.AppendString(`,"cause":`)
+		buf.AppendJSONString(e.Cause)
+	}
 }
 
 // ANSI color codes for module tags

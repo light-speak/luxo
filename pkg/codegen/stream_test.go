@@ -35,6 +35,13 @@ func TestGenerateStreamFileWithEventSource(t *testing.T) {
 	result := &semantic.Result{
 		Files: []*ast.File{{
 			Name: "test.luxo",
+			Events: []*ast.EventDecl{{
+				Name: "DanmakuSent",
+				Params: []*ast.ParamDecl{
+					{Name: "danmaku", Type: &ast.TypeRef{Name: "Danmaku"}},
+					{Name: "roomId", Type: &ast.TypeRef{Name: "Int"}},
+				},
+			}},
 			APIs: []*ast.ApiDecl{
 				{
 					Pos:  token.Position{File: "test.luxo", Line: 1, Col: 1},
@@ -66,24 +73,28 @@ func TestGenerateStreamFileWithEventSource(t *testing.T) {
 		t.Error("should import context when event source exists")
 	}
 
-	// Should have RegisterStreams function
-	if !strings.Contains(code, "func RegisterStreams(") {
+	// Should have RegisterStreams function with injected native resolver.
+	if !strings.Contains(code, "func RegisterStreams(router *api.Router, bus event.Bus, resolver StreamResolver)") {
 		t.Error("should generate RegisterStreams function")
 	}
-
-	// Should bind event to bus.On
-	if !strings.Contains(code, `bus.On("DanmakuSent"`) {
-		t.Error("should bind event to bus.On")
+	if !strings.Contains(code, `router.RequireStream("watchDanmaku")`) {
+		t.Error("generated stream must participate in startup validation")
 	}
 
-	// Should generate native matcher delegating to resolver
-	if !strings.Contains(code, "resolver.MatchWatchDanmaku") {
-		t.Error("should delegate to resolver.MatchWatchDanmaku")
+	// Should bind the typed event decoder.
+	if !strings.Contains(code, `event.OnDecode[DanmakuSentEvent](bus, "DanmakuSent"`) {
+		t.Error("should bind event with its generated decoder")
 	}
 
-	// Should register matcher on router
-	if !strings.Contains(code, `router.HandleStream("watchDanmaku"`) {
-		t.Error("should register matcher on router")
+	// Native event matchers receive the already-decoded typed event once.
+	if !strings.Contains(code, "MatchWatchDanmaku(event DanmakuSentEvent, params *api.StreamParams, identity any) bool") {
+		t.Error("should generate a typed native event matcher contract")
+	}
+	if !strings.Contains(code, "matchWatchDanmaku(payload, params, identity, resolver)") || !strings.Contains(code, "resolver.MatchWatchDanmaku(event, params, identity)") {
+		t.Error("should delegate the decoded event to resolver.MatchWatchDanmaku")
+	}
+	if strings.Contains(code, "payload.MarshalLuxo()") || strings.Contains(code, "DispatchEvent(") {
+		t.Error("native matcher must not re-encode and decode its event per subscriber")
 	}
 }
 
@@ -128,12 +139,12 @@ func TestGenerateStreamFileNoEventSource(t *testing.T) {
 	if !strings.Contains(code, "type StreamResolver interface") {
 		t.Error("should generate StreamResolver interface")
 	}
-	if !strings.Contains(code, "HandleWatchLiveScore(ctx context.Context, params *api.StreamParams, identity any, stream *api.Stream)") {
+	if !strings.Contains(code, "HandleWatchLiveScore(ctx context.Context, params *api.StreamParams, identity any, stream *api.TypedStream[ScoreEvent])") {
 		t.Error("should generate HandleWatchLiveScore method in StreamResolver")
 	}
 
 	// Should generate handler wrapper delegating to resolver
-	if !strings.Contains(code, "resolver.HandleWatchLiveScore(ctx, params, identity, stream)") {
+	if !strings.Contains(code, "resolver.HandleWatchLiveScore(ctx, params, identity, typedStream)") {
 		t.Error("should delegate to resolver.HandleWatchLiveScore")
 	}
 }
@@ -165,7 +176,7 @@ func TestGenerateStreamFileLuxoMatcher(t *testing.T) {
 					Params: []*ast.ParamDecl{
 						{Name: "roomId", Type: &ast.TypeRef{Name: "Int"}},
 					},
-					ReturnType: &ast.TypeRef{Name: "Danmaku"},
+					ReturnType: &ast.TypeRef{Name: "String"},
 					Directives: []*ast.Directive{
 						{Name: "stream", Args: []*ast.NamedArg{
 							{Value: &ast.Ident{Name: "DanmakuSent"}},
@@ -194,36 +205,30 @@ func TestGenerateStreamFileLuxoMatcher(t *testing.T) {
 
 	code := string(src)
 
-	// Should import codec for decoding
+	// Payload encoding still uses the canonical codec.
 	if !strings.Contains(code, `"github.com/light-speak/luxo/pkg/lux/codec"`) {
 		t.Error("should import codec package")
 	}
 
-	// Should generate decoder
-	if !strings.Contains(code, "codec.NewDecoder(data)") {
-		t.Error("should generate decoder")
+	if strings.Contains(code, "codec.NewDecoder(data)") {
+		t.Error("typed event fields must not be decoded again per subscriber")
+	}
+	if !strings.Contains(code, "DispatchPreparedEvent") || !strings.Contains(code, "matchWatchDanmaku(payload.RoomId, params, identity)") {
+		t.Error("typed event field should be captured by the prepared matcher")
 	}
 
-	// Should decode roomId field (field ID 1)
-	if !strings.Contains(code, "case 1:") {
-		t.Error("should decode field ID 1")
-	}
-	if !strings.Contains(code, "dec.ReadInt()") {
-		t.Error("should use ReadInt for Int field")
-	}
-
-	// Should access subscription param
-	if !strings.Contains(code, `params.Int("roomId")`) {
-		t.Error("should access params.Int for subscription param")
+	// Should validate and decode the subscription parameter once.
+	if !strings.Contains(code, `param_roomId, ok_roomId := params.LookupInt("roomId")`) {
+		t.Error("should validate the subscription parameter")
 	}
 
 	// Should return comparison
-	if !strings.Contains(code, "ev_roomId == params.Int") {
+	if !strings.Contains(code, "ev_roomId == param_roomId") {
 		t.Error("should compare decoded field with param")
 	}
 
 	// Should have event binding
-	if !strings.Contains(code, `bus.On("DanmakuSent"`) {
+	if !strings.Contains(code, `event.OnDecode[DanmakuSentEvent](bus, "DanmakuSent"`) {
 		t.Error("should bind event to bus")
 	}
 }
@@ -246,11 +251,150 @@ func TestGenerateTypedStreamRegistersMatcher(t *testing.T) {
 	}}}
 
 	code := string(generateStreamFile(result, "luxo"))
-	if !strings.Contains(code, `router.Streams.DispatchEvent("liveAlerts"`) {
+	if !strings.Contains(code, `router.Streams.DispatchPreparedEvent("liveAlerts"`) {
 		t.Fatalf("typed stream registration missing:\n%s", code)
 	}
-	if !strings.Contains(code, `router.HandleStream("liveAlerts", matchLiveAlerts)`) {
-		t.Fatalf("typed stream matcher registration missing:\n%s", code)
+	if !strings.Contains(code, `DispatchPreparedEvent("liveAlerts", matchLiveAlerts`) {
+		t.Fatalf("authenticated stream matcher registration missing:\n%s", code)
+	}
+	if !strings.Contains(code, `return router.StreamPayloadJSON("liveAlerts", data)`) {
+		t.Fatalf("JSON streams must use schema conversion:\n%s", code)
+	}
+	if strings.Contains(code, "json.Marshal") {
+		t.Fatalf("stream payload must not bypass Luxo binary encoding:\n%s", code)
+	}
+}
+
+func TestGenerateStreamPayloadEncodings(t *testing.T) {
+	list := streamInfo{
+		returnType:  &ast.TypeRef{Name: "Int", IsList: true},
+		payloadEnum: false,
+	}
+	var b strings.Builder
+	writeStreamPayloadEncoding(&b, list, "payload.Values", "\t")
+	if code := b.String(); !strings.Contains(code, "codec.AppendArrayHeader") || !strings.Contains(code, "codec.AppendSvarint") {
+		t.Fatalf("scalar list stream encoding is not canonical:\n%s", code)
+	}
+
+	b.Reset()
+	models := streamInfo{returnType: &ast.TypeRef{Name: "Alert", IsList: true}, payloadKind: streamPayloadModel}
+	writeStreamPayloadEncoding(&b, models, "payload.Alerts", "\t")
+	if code := b.String(); !strings.Contains(code, "WriteColumnarAlertValues") {
+		t.Fatalf("model list stream encoding must be columnar:\n%s", code)
+	}
+}
+
+func TestSameStreamTypeIsExact(t *testing.T) {
+	base := &ast.TypeRef{Name: "Int"}
+	if !sameStreamType(base, &ast.TypeRef{Name: "Int"}) {
+		t.Fatal("identical stream types should match")
+	}
+	if sameStreamType(base, &ast.TypeRef{Name: "Int", Nullable: true}) || sameStreamType(base, &ast.TypeRef{Name: "Int", IsList: true}) {
+		t.Fatal("nullable and list stream payloads must not match scalar returns")
+	}
+}
+
+func TestSameStreamTypeNestedShapes(t *testing.T) {
+	if sameStreamType(nil, nil) {
+		t.Fatal("nil stream types must not match")
+	}
+	typeArg := &ast.TypeRef{Name: "Result", TypeArgs: []*ast.TypeRef{{Name: "Int"}}}
+	if !sameStreamType(typeArg, &ast.TypeRef{Name: "Result", TypeArgs: []*ast.TypeRef{{Name: "Int"}}}) {
+		t.Fatal("matching type arguments must compare equal")
+	}
+	if sameStreamType(typeArg, &ast.TypeRef{Name: "Result", TypeArgs: []*ast.TypeRef{{Name: "String"}}}) {
+		t.Fatal("different type arguments must not compare equal")
+	}
+	tuple := &ast.TypeRef{Name: "Tuple", Tuple: []*ast.TypeRef{{Name: "Int"}, {Name: "String"}}}
+	if !sameStreamType(tuple, &ast.TypeRef{Name: "Tuple", Tuple: []*ast.TypeRef{{Name: "Int"}, {Name: "String"}}}) {
+		t.Fatal("matching tuples must compare equal")
+	}
+	if sameStreamType(tuple, &ast.TypeRef{Name: "Tuple", Tuple: []*ast.TypeRef{{Name: "Int"}, {Name: "Boolean"}}}) {
+		t.Fatal("different tuples must not compare equal")
+	}
+}
+
+func TestMergeGlobalStreamTypes(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+	local := &ast.EventDecl{Name: "Local"}
+	remote := &ast.EventDecl{Name: "Remote"}
+	globalEventCtx = &EventContext{
+		Events:      map[string]*ast.EventDecl{"Local": remote, "Remote": remote},
+		ModelModule: map[string]string{"User": "accounts"},
+		TypeModule:  map[string]string{"Payload": "common"},
+		EnumModule:  map[string]string{"Role": "auth"},
+	}
+	declarations := streamTypes{
+		events: map[string]*ast.EventDecl{"Local": local},
+		models: map[string]bool{}, types: map[string]bool{}, enums: map[string]bool{},
+	}
+	mergeGlobalStreamTypes(&declarations)
+	if declarations.events["Local"] != local || declarations.events["Remote"] != remote {
+		t.Fatal("global events were not merged without replacing local declarations")
+	}
+	if !declarations.models["User"] || !declarations.types["Payload"] || !declarations.enums["Role"] {
+		t.Fatalf("global stream types were not merged: %+v", declarations)
+	}
+}
+
+func TestClassifyStreamPayloadKinds(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+	globalEventCtx = &EventContext{
+		ModelModule: map[string]string{"User": "accounts"},
+		TypeModule:  map[string]string{"Payload": "common"},
+	}
+	models := map[string]bool{"User": true}
+	types := map[string]bool{"Payload": true}
+	enums := map[string]bool{"Role": true}
+
+	var model, payload, enum streamInfo
+	classifyStreamPayload(&model, &ast.TypeRef{Name: "User"}, models, types, enums)
+	classifyStreamPayload(&payload, &ast.TypeRef{Name: "Payload"}, models, types, enums)
+	classifyStreamPayload(&enum, &ast.TypeRef{Name: "Role"}, models, types, enums)
+	classifyStreamPayload(&streamInfo{}, nil, models, types, enums)
+	if model.payloadKind != streamPayloadModel || model.payloadModule != "accounts" {
+		t.Fatalf("model payload = %+v", model)
+	}
+	if payload.payloadKind != streamPayloadType || payload.payloadModule != "common" {
+		t.Fatalf("type payload = %+v", payload)
+	}
+	if !enum.payloadEnum || enum.payloadKind != streamPayloadScalar {
+		t.Fatalf("enum payload = %+v", enum)
+	}
+}
+
+func TestGenerateCrossModuleStreamSource(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+	eventDecl := &ast.EventDecl{
+		Name:   "CountChanged",
+		Params: []*ast.ParamDecl{{Name: "count", Type: &ast.TypeRef{Name: "Int"}}},
+	}
+	globalEventCtx = &EventContext{
+		EventModule: map[string]string{"CountChanged": "common"},
+		Events:      map[string]*ast.EventDecl{"CountChanged": eventDecl},
+		ModelModule: map[string]string{}, TypeModule: map[string]string{}, EnumModule: map[string]string{},
+		ModulePath: "github.com/test/service",
+	}
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/consumer/watch.luxo",
+		APIs: []*ast.ApiDecl{{
+			Name:       "watchCount",
+			ReturnType: &ast.TypeRef{Name: "Int"},
+			Directives: []*ast.Directive{{Name: "stream", Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "CountChanged"}}}}},
+		}},
+	}}}
+	code := string(generateStreamFile(result, "luxo"))
+	for _, want := range []string{
+		`common_luxo "github.com/test/service/common/luxo"`,
+		`event.OnDecode[common_luxo.CountChangedEvent]`,
+		`common_luxo.UnmarshalCountChanged`,
+	} {
+		if !strings.Contains(code, want) {
+			t.Fatalf("cross-module stream missing %q:\n%s", want, code)
+		}
 	}
 }
 
@@ -339,12 +483,12 @@ func TestCompileStreamExpr(t *testing.T) {
 		{
 			name: "int param",
 			expr: &ast.Ident{Name: "roomId"},
-			want: `params.Int("roomId")`,
+			want: `param_roomId`,
 		},
 		{
 			name: "string param",
 			expr: &ast.Ident{Name: "name"},
-			want: `params.String("name")`,
+			want: `param_name`,
 		},
 		{
 			name: "string literal",
@@ -385,12 +529,12 @@ func TestCompileStreamExpr(t *testing.T) {
 					Right: &ast.MemberExpr{Object: &ast.Ident{Name: "my"}, Field: "id"},
 				},
 			},
-			want: `ev_roomId == params.Int("roomId") && ev_userId == api.IdentityID(identity)`,
+			want: `ev_roomId == param_roomId && ev_userId == api.IdentityID(identity)`,
 		},
 		{
 			name: "unary not",
 			expr: &ast.UnaryExpr{Op: "!", Value: &ast.Ident{Name: "roomId"}},
-			want: `!params.Int("roomId")`,
+			want: `!param_roomId`,
 		},
 		{
 			name: "bare my ident",
@@ -423,51 +567,156 @@ func TestCompileStreamExpr(t *testing.T) {
 		{
 			name: "unsupported expr",
 			expr: &ast.CallExpr{Func: &ast.Ident{Name: "foo"}},
-			want: "false /* unsupported expr */",
+			want: "",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := compileStreamExpr(tt.expr, params)
+			got, ok := compileStreamExpr(tt.expr, params, nil, "")
 			if got != tt.want {
 				t.Errorf("compileStreamExpr = %q, want %q", got, tt.want)
+			}
+			if ok == (tt.name == "unsupported expr") {
+				t.Errorf("compileStreamExpr ok = %v", ok)
 			}
 		})
 	}
 }
 
 func TestStreamFieldTypes(t *testing.T) {
-	// streamFieldGoType — all branches
 	cases := []struct{ in, want string }{
 		{"Int", "int64"}, {"Float", "float64"}, {"String", "string"},
-		{"Boolean", "bool"}, {"Unknown", "int64"},
+		{"Boolean", "bool"}, {"Duration", "int64"}, {"UUID", "[16]byte"},
 	}
 	for _, c := range cases {
-		if got := streamFieldGoType(c.in); got != c.want {
-			t.Errorf("streamFieldGoType(%q) = %q, want %q", c.in, got, c.want)
+		if got := streamFieldGoType(&ast.TypeRef{Name: c.in}, false); got != c.want {
+			t.Errorf("streamFieldGoType(%q) = %q", c.in, got)
 		}
 	}
-
-	// streamReadMethod — all branches
-	readCases := []struct{ in, want string }{
-		{"Int", "ReadInt"}, {"Float", "ReadFloat"}, {"String", "ReadString"},
-		{"Boolean", "ReadBool"}, {"Unknown", "ReadInt"},
-	}
-	for _, c := range readCases {
-		if got := streamReadMethod(c.in); got != c.want {
-			t.Errorf("streamReadMethod(%q) = %q, want %q", c.in, got, c.want)
-		}
+	if got := streamFieldGoType(&ast.TypeRef{Name: "Role"}, true); got != "string" {
+		t.Errorf("enum stream type = %q", got)
 	}
 
 	// streamParamMethod — all branches
 	paramCases := []struct{ in, want string }{
-		{"Int", "Int"}, {"String", "String"}, {"Boolean", "Get"},
+		{"Int", "Int"}, {"Float", "Float"}, {"String", "String"},
+		{"Boolean", "Boolean"}, {"Duration", "Duration"}, {"UUID", "UUID"}, {"Unknown", ""},
 	}
 	for _, c := range paramCases {
-		if got := streamParamMethod(c.in); got != c.want {
+		if got := streamParamMethod(c.in, false); got != c.want {
 			t.Errorf("streamParamMethod(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+	if got := streamParamMethod("Role", true); got != "String" {
+		t.Errorf("enum stream param method = %q", got)
+	}
+	if got := streamFieldGoType(&ast.TypeRef{Name: "Unknown"}, false); got != "" {
+		t.Errorf("unknown stream field type = %q", got)
+	}
+}
+
+func TestStreamGenerationTypeHelpers(t *testing.T) {
+	tests := []struct {
+		name   string
+		value  string
+		ref    *ast.TypeRef
+		isEnum bool
+		want   string
+	}{
+		{name: "enum", value: "payload.Role", ref: &ast.TypeRef{Name: "Role"}, isEnum: true, want: "string(payload.Role)"},
+		{name: "duration", value: "payload.TTL", ref: &ast.TypeRef{Name: "Duration"}, want: "int64(payload.TTL)"},
+		{name: "uuid", value: "payload.ID", ref: &ast.TypeRef{Name: "UUID"}, want: "[16]byte(payload.ID)"},
+		{name: "plain", value: "payload.Name", ref: &ast.TypeRef{Name: "String"}, want: "payload.Name"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := streamEventValue(tt.value, tt.ref, tt.isEnum); got != tt.want {
+				t.Fatalf("streamEventValue() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	if got := streamReturnGoType(streamInfo{}); got != "struct{}" {
+		t.Fatalf("nil return type = %q", got)
+	}
+	remote := streamInfo{returnType: &ast.TypeRef{Name: "User", IsList: true}, payloadKind: streamPayloadModel, payloadModule: "accounts", sourceModule: "feed"}
+	if got := streamReturnGoType(remote); got != "[]accounts_luxo.User" {
+		t.Fatalf("remote list return type = %q", got)
+	}
+}
+
+func TestStreamImportsCollectRemoteTypesAndEnums(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+	globalEventCtx = &EventContext{
+		EnumModule: map[string]string{"Role": "auth"},
+		ModulePath: "github.com/example/service",
+	}
+	body := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "Admin"}},
+		&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "Member"}},
+		&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "Unknown"}, Field: "Value"}},
+		&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.CallExpr{Func: &ast.Ident{Name: "value"}}, Field: "Name"}},
+	}}
+	streams := []streamInfo{{
+		eventName: "Changed", eventModule: "events", payloadKind: streamPayloadType,
+		payloadModule: "common", sourceModule: "feed", body: body,
+	}}
+	var b strings.Builder
+	writeStreamImports(&b, streams)
+	for _, module := range []string{"auth", "common", "events"} {
+		if !strings.Contains(b.String(), module+`_luxo "github.com/example/service/`+module+`/luxo"`) {
+			t.Fatalf("missing %s import:\n%s", module, b.String())
+		}
+	}
+	if got := collectStreamEnumRefs(body, globalEventCtx.EnumModule); len(got) != 1 || got[0] != "Role" {
+		t.Fatalf("enum references = %v", got)
+	}
+}
+
+func TestWriteStreamPayloadEncodingTypeList(t *testing.T) {
+	si := streamInfo{
+		returnType: &ast.TypeRef{Name: "Payload", IsList: true}, payloadKind: streamPayloadType,
+		payloadModule: "common", sourceModule: "feed",
+	}
+	var b strings.Builder
+	writeStreamPayloadEncoding(&b, si, "payload.Values", "\t")
+	if code := b.String(); !strings.Contains(code, "common_luxo.WriteColumnarPayload") {
+		t.Fatalf("type list stream encoding is not columnar:\n%s", code)
+	}
+}
+
+func TestGenerateLuxoStreamMatcherRejectsUnsupportedExpression(t *testing.T) {
+	si := streamInfo{
+		apiName: "watch", hasBody: true,
+		body: &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: &ast.CallExpr{Func: &ast.Ident{Name: "unsupported"}}}}},
+	}
+	var b strings.Builder
+	generateLuxoStreamMatcher(&b, si, nil)
+	if !strings.Contains(b.String(), "false /* rejected by semantic analysis */") {
+		t.Fatalf("unsupported matcher was not rejected:\n%s", b.String())
+	}
+}
+
+func TestCompileStreamExprRejectsUnsupportedBinaryAndQualifiesEnum(t *testing.T) {
+	unsupported := &ast.BinaryExpr{
+		Left: &ast.CallExpr{Func: &ast.Ident{Name: "call"}}, Op: "==", Right: &ast.Ident{Name: "value"},
+	}
+	if got, ok := compileStreamExpr(unsupported, nil, nil, ""); ok || got != "" {
+		t.Fatalf("unsupported binary = %q, %v", got, ok)
+	}
+	inExpr := &ast.BinaryExpr{Left: &ast.Ident{Name: "value"}, Op: "in", Right: &ast.Ident{Name: "values"}}
+	if got, ok := compileStreamExpr(inExpr, nil, nil, ""); ok || got != "" {
+		t.Fatalf("in expression = %q, %v", got, ok)
+	}
+
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+	globalEventCtx = &EventContext{EnumModule: map[string]string{"Role": "auth"}}
+	enumExpr := &ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "Admin"}
+	if got, ok := compileStreamExpr(enumExpr, nil, map[string]bool{"Role": true}, "feed"); !ok || got != "string(auth_luxo.RoleAdmin)" {
+		t.Fatalf("enum expression = %q, %v", got, ok)
 	}
 }
 
@@ -494,7 +743,7 @@ func TestGenerateLuxoStreamMatcher_EmptyBody(t *testing.T) {
 		hasBody: true,
 		body:    &ast.Block{}, // no stmts
 	}
-	generateLuxoStreamMatcher(&b, si)
+	generateLuxoStreamMatcher(&b, si, nil)
 	code := b.String()
 	if !strings.Contains(code, "STREAM_MATCHER_EMPTY") {
 		t.Error("empty body should generate STREAM_MATCHER_EMPTY error")
@@ -523,19 +772,14 @@ func TestGenerateLuxoStreamMatcher_UnknownItField(t *testing.T) {
 			{Name: "knownField", Type: &ast.TypeRef{Name: "Int"}},
 		},
 	}
-	generateLuxoStreamMatcher(&b, si)
+	generateLuxoStreamMatcher(&b, si, nil)
 	code := b.String()
-	// Should generate decoder
-	if !strings.Contains(code, "codec.NewDecoder") {
-		t.Error("should still generate decoder")
+	if strings.Contains(code, "codec.NewDecoder") {
+		t.Error("generated matchers must not decode per subscriber")
 	}
 	// No var declaration for unknownField (not in event params)
 	if strings.Contains(code, "var ev_unknownField") {
 		t.Error("unknown field should not have var declaration")
-	}
-	// No switch case for unknownField
-	if strings.Contains(code, "case 0:") && strings.Contains(code, "ev_unknownField = dec") {
-		t.Error("unknown field should not have decoder case")
 	}
 	// Reference still exists (will fail Go compile — semantic should catch this)
 	if !strings.Contains(code, "ev_unknownField") {
@@ -588,8 +832,8 @@ func TestCompileStreamExpr_GenericMember(t *testing.T) {
 		Object: &ast.Ident{Name: "other"},
 		Field:  "value",
 	}
-	got := compileStreamExpr(expr, params)
-	if got != "other.Value" {
-		t.Errorf("generic member = %q, want %q", got, "other.Value")
+	got, ok := compileStreamExpr(expr, params, nil, "")
+	if ok || got != "" {
+		t.Errorf("generic member should be rejected, got %q, ok=%v", got, ok)
 	}
 }

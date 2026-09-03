@@ -13,7 +13,7 @@ import (
 
 // NATSBus implements Bus using NATS messaging.
 // Used in multi-service mode for cross-process event delivery.
-// Serializes payloads to JSON at the wire boundary.
+// Generated events use Luxo binary; custom payloads fall back to JSON.
 type NATSBus struct {
 	conn *nats.Conn
 	subs []*nats.Subscription
@@ -51,7 +51,7 @@ func (b *NATSBus) Emit(ctx context.Context, name string, payload any) error {
 	return b.conn.Publish(name, data)
 }
 
-// On subscribes to a NATS subject. Handler receives []byte (raw JSON from wire).
+// On subscribes to a NATS subject. Handler receives the raw wire bytes.
 func (b *NATSBus) On(name string, handler Handler) error {
 	sub, err := b.conn.Subscribe(name, func(msg *nats.Msg) {
 		safeCall(handler, bgCtx, msg.Data)

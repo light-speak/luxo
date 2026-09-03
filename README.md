@@ -235,6 +235,9 @@ Client selects fields → API serializes only those → SQL queries only those. 
 ### Real-time Streams
 
 ```luxo
+event DanmakuSent(danmaku: Danmaku)
+event NotificationCreated(notification: Notification)
+
 // Event-driven stream with filter
 api watchDanmaku(roomId: Int): Danmaku @stream(DanmakuSent) {
   it.roomId == roomId
@@ -302,7 +305,7 @@ Same task in TypeScript? 150+ lines, 4 packages, no compile-time safety.
 - [x] VS Code Extension (syntax highlighting, LSP integration)
 
 ### Phase 2 — Codegen + Runtime ✅
-- [x] Code generation (model · db · app · handler · dataloader · native · entry — 8 gen files)
+- [x] Code generation (11 schema-driven module artifacts plus embedded, service, and gateway entries)
 - [x] Type-safe query builder (pgx, zero-reflection scanner, `$select` → SQL)
 - [x] CRUD handler generation (`@crud` → get/list/create/update/delete)
 - [x] DataLoader runtime (2ms batch window, field merging, `@soft` filtering)
@@ -328,20 +331,21 @@ Same task in TypeScript? 150+ lines, 4 packages, no compile-time safety.
 - [x] `luxo deploy compose` — Dockerfile + docker-compose.yml generation
 - [x] Auto-migrate on startup (`EnsureDatabase` + `migrate.Up`)
 - [x] RPC default address inference (`module:9000` Docker DNS)
-- [x] Schema introspection (`GET /luvia?$schema&key=xxx`)
+- [x] Schema introspection (`GET /luvia?$schema` with `X-Introspection-Key`)
 - [x] `luxo.schema.json` export for SDK tooling
 - [x] Graceful shutdown · CORS · XSS security headers
 - [x] Event system (emit / on · ChanBus + NATSBus · Luxo binary codec)
 - [x] WebSocket transport — JSON/Binary dual-mode, concurrent dispatch
-- [x] `@stream` subscription — event-driven push with lambda matcher + field mask
+- [x] `@stream` subscription — typed SDK methods, server acknowledgement/error, event/native sources, field mask and backpressure
+- [x] Schema-only SDK signatures — pagination, selection, nullable arguments and streams never depend on API naming conventions
 
 ### Phase 4 — Client SDK ✅
 - [x] `@luxo/client` — Transport interface + FetchTransport + WxTransport + LuxoError
 - [x] `@luxo/vite-plugin` — compile-time field tracking + auto `$select` injection
 - [x] `@luxo/react` — `useLuxoQuery` hook + `LuxoProvider`
 - [x] Dart SDK (`luxo_client` — HttpTransport + WsTransport + Luxo binary codec + build_runner field tracking)
-- [x] Kotlin SDK (`com.luxo.client` — OkHttp + coroutine + Luxo binary codec + Gradle field tracking)
-- [x] Swift SDK (`LuxoClient` — URLSession + async/await + Luxo binary codec + SwiftSyntax field tracking)
+- [x] Kotlin SDK (`com.luxo.client` — OkHttp + coroutine + Luxo binary codec + isolated compiler-AST field tracking via Gradle plugin)
+- [x] [Swift SDK](https://github.com/light-speak/luxo-swift) (`LuxoClient` — standalone SPM package with URLSession, async/await, Luxo binary codec and SwiftSyntax field tracking)
 
 ### Phase 5 — Production + Ecosystem (In Progress)
 - [ ] Luxo Studio (actively developing; backend and React foundations are in place)

@@ -71,6 +71,9 @@ func compileAPIBody(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast
 	for _, p := range api.Params {
 		goType := resolveGoType(p.Type)
 		method := paramMethod(goType)
+		if p.Type != nil && p.Type.Nullable {
+			method = ""
+		}
 
 		if p.Default != nil {
 			// Parameter with default value — optional
@@ -78,7 +81,7 @@ func compileAPIBody(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast
 			if method == "" {
 				// Custom type with default
 				fmt.Fprintf(b, "\t\tvar %s %s = %s\n", p.Name, goType, defaultVal)
-				fmt.Fprintf(b, "\t\t_ = req.ParamJSON(%q, &%s)\n", p.Name, p.Name)
+				fmt.Fprintf(b, "\t\t_ = req.%s(%q, &%s)\n", paramJSONMethod(p), p.Name, p.Name)
 			} else {
 				fmt.Fprintf(b, "\t\t%s, _err_%s := req.Param%s(%q)\n", p.Name, p.Name, method, p.Name)
 				fmt.Fprintf(b, "\t\tif _err_%s != nil { %s = %s }\n", p.Name, p.Name, defaultVal)
@@ -86,7 +89,8 @@ func compileAPIBody(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast
 		} else if method == "" {
 			// Custom type — use ParamJSON with struct target
 			fmt.Fprintf(b, "\t\tvar %s %s\n", p.Name, goType)
-			fmt.Fprintf(b, "\t\tif err := req.ParamJSON(%q, &%s); err != nil {\n", p.Name, p.Name)
+			methodName := paramJSONMethod(p)
+			fmt.Fprintf(b, "\t\tif err := req.%s(%q, &%s); err != nil {\n", methodName, p.Name, p.Name)
 			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 		} else {
 			fmt.Fprintf(b, "\t\t%s, err := req.Param%s(%q)\n", p.Name, method, p.Name)
@@ -147,6 +151,54 @@ type valType struct {
 	name     string // model name or luxo type name (Int/String/Boolean/Float)
 }
 
+func (c *compiler) valTypeFromExpr(expr ast.Expr) (valType, bool) {
+	if expr == nil || expr.GetTypeTag() == "" {
+		return valType{}, false
+	}
+	_, isModel := c.models[expr.GetTypeTag()]
+	return valType{
+		isModel:  isModel,
+		isList:   expr.IsListType(),
+		nullable: expr.IsNullable(),
+		name:     expr.GetTypeTag(),
+	}, true
+}
+
+func (c *compiler) goTypeForExpr(expr ast.Expr) string {
+	if expr == nil || expr.GetTypeTag() == "" {
+		return ""
+	}
+	name := expr.GetTypeTag()
+	base := mapBaseType(name)
+	if _, isModel := c.models[name]; isModel {
+		base = "*" + name
+	}
+	if expr.IsListType() {
+		return "[]" + base
+	}
+	if expr.IsNullable() && !isNilableGoType(base) {
+		return "*" + base
+	}
+	return base
+}
+
+func (c *compiler) yieldNeedsAddress(expr ast.Expr) bool {
+	if expr == nil || !expr.IsNullable() || expr.IsListType() {
+		return false
+	}
+	name := expr.GetTypeTag()
+	if _, isModel := c.models[name]; isModel {
+		return false
+	}
+	return !isNilableGoType(mapBaseType(name))
+}
+
+func isNilableGoType(goType string) bool {
+	return strings.HasPrefix(goType, "*") || strings.HasPrefix(goType, "[]") ||
+		strings.HasPrefix(goType, "map[") || strings.HasPrefix(goType, "chan ") ||
+		strings.HasPrefix(goType, "func(") || goType == "any"
+}
+
 // compiler holds state during body compilation.
 type compiler struct {
 	b           *strings.Builder
@@ -158,6 +210,8 @@ type compiler struct {
 	vars        map[string]valType // variable name → resolved type
 	inAsync     bool               // true inside async { } — no return err
 	inForExpr   bool               // true inside for-as-expression with yield — yield compiles to return
+	yieldAddr   bool               // true when a yielded value must be wrapped in a pointer
+	yieldTmp    int                // unique temporary counter for nullable primitive yields
 	paginate    bool               // true when API has @paginate
 	hasTotalVar bool               // true after _total is assigned (paginated query)
 	ptrTmpCount int                // counter for hoisted pointer temp vars (nullable create args)
@@ -224,11 +278,18 @@ func (c *compiler) compileVal(s *ast.ValStmt) {
 		c.write("if err != nil {\n%s\treturn err\n%s}", c.indent, c.indent)
 		c.vars[s.Name] = qt
 	} else {
+		if list, ok := s.Value.(*ast.ListExpr); ok && c.api != nil && c.api.ReturnType != nil && c.api.ReturnType.IsList {
+			expr = c.compileTypedList(list, c.api.ReturnType)
+			c.vars[s.Name] = valType{name: c.api.ReturnType.Name, isList: true}
+		}
 		// Wrap bare integer literals in int64() to match Luxo's Int = int64
 		if lit, ok := s.Value.(*ast.Literal); ok && lit.Kind == token.Int {
 			expr = fmt.Sprintf("int64(%s)", expr)
 		}
 		c.write("%s := %s", s.Name, expr)
+		if vt, ok := c.valTypeFromExpr(s.Value); ok {
+			c.vars[s.Name] = vt
+		}
 		// Track channel variables for close() and for-range codegen
 		if c.isChannelConstructor(s.Value) {
 			c.vars[s.Name] = valType{isChan: true}
@@ -275,6 +336,9 @@ func (c *compiler) compileReturn(s *ast.ReturnStmt) {
 		return
 	}
 	expr := c.compileExpr(s.Value)
+	if list, ok := s.Value.(*ast.ListExpr); ok && c.api != nil && c.api.ReturnType != nil && c.api.ReturnType.IsList {
+		expr = c.compileTypedList(list, c.api.ReturnType)
+	}
 
 	// 1. Direct model query chain — extract to temp var, then WriteLuxo
 	if c.isModelQuery(s.Value) {
@@ -282,6 +346,7 @@ func (c *compiler) compileReturn(s *ast.ReturnStmt) {
 		// Extract query result to temp variable (query returns (result, error))
 		c.write("_result, err := %s", expr)
 		c.write("if err != nil {\n%s\treturn err\n%s}", c.indent, c.indent)
+		c.writeComputedResolve(qt.name, "_result", qt.isList)
 		if qt.isList {
 			c.write("WriteColumnar%s(req.Buf, _result, req.FieldMask)", qt.name)
 		} else {
@@ -309,6 +374,7 @@ func (c *compiler) compileReturn(s *ast.ReturnStmt) {
 // Always writes Luxo binary — Luvia converts to JSON if needed.
 func (c *compiler) writeReturnByType(expr string, vt valType) {
 	if vt.isModel {
+		c.writeComputedResolve(vt.name, expr, vt.isList)
 		if vt.isList {
 			if c.paginate && c.hasTotalVar {
 				c.write("WriteColumnar%s(req.Buf, %s, req.FieldMask)", vt.name, expr)
@@ -323,49 +389,113 @@ func (c *compiler) writeReturnByType(expr string, vt valType) {
 		}
 		return
 	}
-	switch vt.name {
-	case "Int":
-		c.write("req.Buf.B = codec.AppendSvarint(req.Buf.B, int64(%s))", expr)
-	case "Float":
-		c.write("req.Buf.B = codec.AppendFixed64(req.Buf.B, %s)", expr)
-	case "Boolean":
-		c.write("req.Buf.B = codec.AppendBool(req.Buf.B, %s)", expr)
-	case "String":
-		c.write("req.Buf.B = codec.AppendString(req.Buf.B, %s)", expr)
-	default:
-		// Try as type with WriteLuxo — value receiver, can call on literal directly
-		if c.isTypeDecl(vt.name) {
-			c.write("%s.WriteLuxo(req.Buf, req.FieldMask)", expr)
-		} else {
-			c.write("_ = %s // unsupported return type for binary encoding", expr)
+	if vt.isList {
+		if c.writePrimitiveList(expr, vt.name) {
+			return
 		}
+		if c.isTypeDecl(vt.name) {
+			c.write("WriteColumnar%s(req.Buf, %s, req.FieldMask)", vt.name, expr)
+			return
+		}
+	}
+	if appendExpr, ok := binaryScalarAppend(vt.name, "req.Buf.B", expr, c.enums[vt.name]); ok {
+		c.write("req.Buf.B = %s", appendExpr)
+	} else if c.isTypeDecl(vt.name) {
+		c.write("%s.WriteLuxo(req.Buf, req.FieldMask)", expr)
+	} else {
+		c.write("_ = %s // unsupported return type for binary encoding", expr)
 	}
 }
 
 // writeScalarReturn emits binary output for non-model return values.
 func (c *compiler) writeScalarReturn(expr string) {
 	if c.api != nil && c.api.ReturnType != nil {
-		switch c.api.ReturnType.Name {
-		case "Int":
-			c.write("req.Buf.B = codec.AppendSvarint(req.Buf.B, int64(%s))", expr)
+		typeName := c.api.ReturnType.Name
+		if model := c.models[typeName]; model != nil {
+			if c.api.ReturnType.IsList {
+				c.writeComputedResolve(typeName, expr, true)
+				c.write("WriteColumnar%s(req.Buf, %s, req.FieldMask)", typeName, expr)
+			} else {
+				c.write("_result := %s", expr)
+				c.writeComputedResolve(typeName, "&_result", false)
+				c.write("_result.WriteLuxo(req.Buf, req.FieldMask)")
+			}
 			return
-		case "Float":
-			c.write("req.Buf.B = codec.AppendFixed64(req.Buf.B, %s)", expr)
-			return
-		case "Boolean":
-			c.write("req.Buf.B = codec.AppendBool(req.Buf.B, %s)", expr)
-			return
-		case "String":
-			c.write("req.Buf.B = codec.AppendString(req.Buf.B, %s)", expr)
+		}
+		if c.api.ReturnType.IsList {
+			if c.writePrimitiveList(expr, typeName) {
+				return
+			}
+			if c.isTypeDecl(typeName) {
+				c.write("WriteColumnar%s(req.Buf, %s, req.FieldMask)", typeName, expr)
+				return
+			}
+		}
+		if appendExpr, ok := binaryScalarAppend(typeName, "req.Buf.B", expr, c.enums[typeName]); ok {
+			c.write("req.Buf.B = %s", appendExpr)
 			return
 		}
 		// Try as type with WriteLuxo — value receiver
-		if c.isTypeDecl(c.api.ReturnType.Name) {
+		if c.isTypeDecl(typeName) {
 			c.write("%s.WriteLuxo(req.Buf, req.FieldMask)", expr)
 			return
 		}
 	}
 	c.write("_ = %s // unsupported return type for binary encoding", expr)
+}
+
+func (c *compiler) writeComputedResolve(modelName, expr string, list bool) {
+	if !modelHasComputedAggregates(c.models[modelName]) {
+		return
+	}
+	items := expr
+	if !list {
+		items = "[]*" + modelName + "{" + expr + "}"
+	}
+	c.write("if err := resolve%sComputed(ctx, app, %s, req.FieldMask); err != nil { return err }", modelName, items)
+}
+
+func (c *compiler) writePrimitiveList(expr, typeName string) bool {
+	appendExpr, ok := binaryScalarAppend(typeName, "req.Buf.B", "v", c.enums[typeName])
+	if !ok {
+		return false
+	}
+	c.write("req.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(%s)))", expr)
+	c.write("for _, v := range %s {", expr)
+	oldIndent := c.indent
+	c.indent += "\t"
+	c.write("req.Buf.B = %s", appendExpr)
+	c.indent = oldIndent
+	c.write("}")
+	return true
+}
+
+func binaryScalarAppend(typeName, dst, value string, isEnum bool) (string, bool) {
+	if isEnum {
+		return fmt.Sprintf("codec.AppendString(%s, string(%s))", dst, value), true
+	}
+	switch typeName {
+	case "Int":
+		return fmt.Sprintf("codec.AppendSvarint(%s, %s)", dst, value), true
+	case "Float":
+		return fmt.Sprintf("codec.AppendFixed64(%s, %s)", dst, value), true
+	case "String":
+		return fmt.Sprintf("codec.AppendString(%s, %s)", dst, value), true
+	case "Boolean":
+		return fmt.Sprintf("codec.AppendBool(%s, %s)", dst, value), true
+	case "DateTime":
+		return fmt.Sprintf("codec.AppendSvarint(%s, %s.Unix())", dst, value), true
+	case "Duration":
+		return fmt.Sprintf("codec.AppendSvarint(%s, int64(%s))", dst, value), true
+	case "UUID":
+		return fmt.Sprintf("codec.AppendUUID(%s, %s)", dst, value), true
+	case "Decimal":
+		return fmt.Sprintf("codec.AppendString(%s, %s.String())", dst, value), true
+	case "Bytes", "JSON":
+		return fmt.Sprintf("codec.AppendBytes(%s, %s)", dst, value), true
+	default:
+		return "", false
+	}
 }
 
 // isTypeDecl checks if a name is a known `type` declaration (has WriteLuxo but is not a model).
@@ -381,7 +511,7 @@ func (c *compiler) isTypeDecl(name string) bool {
 		return false
 	}
 	switch name {
-	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes", "", "GroupResult":
+	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes", "JSON", "", "GroupResult":
 		return false
 	}
 	// PascalCase and not recognized — likely a type declaration
@@ -624,7 +754,14 @@ func (c *compiler) compileBlockExpr(expr ast.Expr) string {
 		val := c.compileExpr(e.Value)
 		if c.inForExpr {
 			// Inside for-as-expression closure: yield → return value from closure
-			c.write("return %s", val)
+			if c.yieldAddr {
+				name := fmt.Sprintf("_yield%d", c.yieldTmp)
+				c.yieldTmp++
+				c.write("%s := %s", name, val)
+				c.write("return &%s", name)
+			} else {
+				c.write("return %s", val)
+			}
 		} else {
 			c.write("_yieldResult = %s", val)
 			c.write("break")
@@ -721,12 +858,14 @@ func (c *compiler) compileInstanceMethod(e *ast.CallExpr) string {
 	}
 	modelName := vt.name
 	varName := ident.Name
+	model := c.models[modelName]
+	idGoName := primaryKeyGoName(model)
 	switch member.Field {
 	case "delete":
-		if m, ok := c.models[modelName]; ok && isSoftDelete(m) {
-			return fmt.Sprintf("app.%s.Where(%sWhere.Id.Eq(%s.Id)).SoftDelete(ctx)", modelName, modelName, varName)
+		if model != nil && isSoftDelete(model) {
+			return fmt.Sprintf("app.%s.Where(%sWhere.%s.Eq(%s.%s)).SoftDelete(ctx)", modelName, modelName, idGoName, varName, idGoName)
 		}
-		return fmt.Sprintf("app.%s.Where(%sWhere.Id.Eq(%s.Id)).Delete(ctx)", modelName, modelName, varName)
+		return fmt.Sprintf("app.%s.Where(%sWhere.%s.Eq(%s.%s)).Delete(ctx)", modelName, modelName, idGoName, varName, idGoName)
 	case "update":
 		var sets []string
 		for _, arg := range e.Args {
@@ -741,8 +880,8 @@ func (c *compiler) compileInstanceMethod(e *ast.CallExpr) string {
 				sets = append(sets, fmt.Sprintf("lux.SetField{Col: %q, Val: %s}", str.ToSnakeCase(arg.Name), val))
 			}
 		}
-		return fmt.Sprintf("app.%s.Where(%sWhere.Id.Eq(%s.Id)).Update(ctx, %s)",
-			modelName, modelName, varName, strings.Join(sets, ", "))
+		return fmt.Sprintf("app.%s.Where(%sWhere.%s.Eq(%s.%s)).Update(ctx, %s)",
+			modelName, modelName, idGoName, varName, idGoName, strings.Join(sets, ", "))
 	}
 	return ""
 }
@@ -935,7 +1074,7 @@ func (c *compiler) compileModifierMethod(b *strings.Builder, modelName string, l
 	case "create":
 		c.compileCreateLink(b, modelName, link, i == totalLinks-1)
 	case "select":
-		b.WriteString(".Select(selection.SQLColumns(req.Select)...)")
+		fmt.Fprintf(b, ".Select(select%sSQLColumns(req.Select)...)", modelName)
 	case "orderBy":
 		c.compileOrderByChain(b, link.args)
 	case "limit", "offset":
@@ -1651,7 +1790,7 @@ func (c *compiler) compileTerminalMethod(b *strings.Builder, modelName string, l
 	case "find":
 		if len(link.args) > 0 {
 			val := c.compileExpr(link.args[0].Value)
-			fmt.Fprintf(b, "app.%s.Where(%sWhere.Id.Eq(%s)).First(ctx)", modelName, modelName, val)
+			fmt.Fprintf(b, "app.%s.Where(%sWhere.%s.Eq(%s)).First(ctx)", modelName, modelName, primaryKeyGoName(c.models[modelName]), val)
 		}
 		return true
 	case "load":
@@ -1721,17 +1860,25 @@ func (c *compiler) compileTerminalMethod(b *strings.Builder, modelName string, l
 func (c *compiler) compileOrderByChain(b *strings.Builder, args []*ast.NamedArg) {
 	var clauses []string
 	for _, arg := range args {
-		// field.desc → "field DESC", field.asc → "field ASC", field → "field ASC"
-		if member, ok := arg.Value.(*ast.MemberExpr); ok {
-			col := str.ToSnakeCase(c.compileExpr(member.Object))
-			dir := strings.ToUpper(member.Field)
-			clauses = append(clauses, fmt.Sprintf("%q", col+" "+dir))
-		} else {
-			col := str.ToSnakeCase(c.compileExpr(arg.Value))
-			clauses = append(clauses, fmt.Sprintf("%q", col+" ASC"))
+		expr := arg.Value
+		dir := "ASC"
+		if member, ok := expr.(*ast.MemberExpr); ok && (member.Field == "asc" || member.Field == "desc") {
+			expr = member.Object
+			dir = strings.ToUpper(member.Field)
 		}
+		col := str.ToSnakeCase(c.orderByColumn(expr))
+		clauses = append(clauses, fmt.Sprintf("%q", col+" "+dir))
 	}
 	fmt.Fprintf(b, ".OrderBy(%s)", strings.Join(clauses, ", "))
+}
+
+func (c *compiler) orderByColumn(expr ast.Expr) string {
+	if member, ok := expr.(*ast.MemberExpr); ok {
+		if ident, ok := member.Object.(*ast.Ident); ok && ident.Name == "it" {
+			return member.Field
+		}
+	}
+	return c.compileExpr(expr)
 }
 
 // --- Phase 2 statement compilers ---
@@ -1810,7 +1957,7 @@ func containsYieldExpr(expr ast.Expr) bool {
 // compileForExpr compiles a for-as-expression.
 // Two modes:
 //   - yield mode: for item in items { if cond { yield item } } → single nullable value
-//   - map mode: for item in items { item.id } → collect all into []any
+//   - map mode: for item in items { item.id } → collect all into a typed slice
 func (c *compiler) compileForExpr(s *ast.ForStmt) string {
 	if len(s.Body.Stmts) == 0 {
 		return "nil"
@@ -1824,12 +1971,15 @@ func (c *compiler) compileForExpr(s *ast.ForStmt) string {
 }
 
 // compileForExprYield generates a closure returning the first yielded value (or nil).
-// val found = for item in items { if item.id == targetId { yield item } }
-// → func() any { for _, item := range items { if ... { return item } }; return nil }()
 func (c *compiler) compileForExprYield(s *ast.ForStmt) string {
 	sub := c.subCompiler()
 	sub.indent = c.indent + "\t\t"
 	sub.inForExpr = true
+	returnType := c.goTypeForExpr(s)
+	if returnType == "" {
+		returnType = "any"
+	}
+	sub.yieldAddr = c.yieldNeedsAddress(s)
 
 	// Compile entire body — YieldExpr will emit "return <value>"
 	for _, stmt := range s.Body.Stmts {
@@ -1839,22 +1989,25 @@ func (c *compiler) compileForExprYield(s *ast.ForStmt) string {
 	if rangeExpr, ok := s.Collection.(*ast.RangeExpr); ok {
 		start := c.compileExpr(rangeExpr.Start)
 		end := c.compileExpr(rangeExpr.End)
-		return fmt.Sprintf("func() any {\n%s\tfor %s := int64(%s); %s <= %s; %s++ {\n%s%s\t}\n%s\treturn nil\n%s}()",
-			c.indent, s.VarName, start, s.VarName, end, s.VarName,
+		return fmt.Sprintf("func() %s {\n%s\tfor %s := int64(%s); %s <= %s; %s++ {\n%s%s\t}\n%s\treturn nil\n%s}()",
+			returnType, c.indent, s.VarName, start, s.VarName, end, s.VarName,
 			sub.b.String(), c.indent, c.indent, c.indent)
 	}
 
 	coll := c.compileExpr(s.Collection)
-	return fmt.Sprintf("func() any {\n%s\tfor _, %s := range %s {\n%s%s\t}\n%s\treturn nil\n%s}()",
-		c.indent, s.VarName, coll,
+	return fmt.Sprintf("func() %s {\n%s\tfor _, %s := range %s {\n%s%s\t}\n%s\treturn nil\n%s}()",
+		returnType, c.indent, s.VarName, coll,
 		sub.b.String(), c.indent, c.indent, c.indent)
 }
 
-// compileForExprCollect generates a closure collecting all values into []any (map mode).
-// val ids = for user in users { user.id } → func() []any { ... }()
+// compileForExprCollect generates a closure collecting all values into a typed slice.
 func (c *compiler) compileForExprCollect(s *ast.ForStmt) string {
 	sub := c.subCompiler()
 	sub.indent = c.indent + "\t\t"
+	resultType := c.goTypeForExpr(s)
+	if resultType == "" {
+		resultType = "[]any"
+	}
 
 	// Compile all but last statement normally
 	for i := 0; i < len(s.Body.Stmts)-1; i++ {
@@ -1871,14 +2024,14 @@ func (c *compiler) compileForExprCollect(s *ast.ForStmt) string {
 	if rangeExpr, ok := s.Collection.(*ast.RangeExpr); ok {
 		start := c.compileExpr(rangeExpr.Start)
 		end := c.compileExpr(rangeExpr.End)
-		return fmt.Sprintf("func() []any {\n%s\tvar _result []any\n%s\tfor %s := int64(%s); %s <= %s; %s++ {\n%s%s\t\t_result = append(_result, %s)\n%s\t}\n%s\treturn _result\n%s}()",
-			c.indent, c.indent, s.VarName, start, s.VarName, end, s.VarName,
+		return fmt.Sprintf("func() %s {\n%s\tvar _result %s\n%s\tfor %s := int64(%s); %s <= %s; %s++ {\n%s%s\t\t_result = append(_result, %s)\n%s\t}\n%s\treturn _result\n%s}()",
+			resultType, c.indent, resultType, c.indent, s.VarName, start, s.VarName, end, s.VarName,
 			sub.b.String(), c.indent, lastExpr, c.indent, c.indent, c.indent)
 	}
 
 	coll := c.compileExpr(s.Collection)
-	return fmt.Sprintf("func() []any {\n%s\tvar _result []any\n%s\tfor _, %s := range %s {\n%s%s\t\t_result = append(_result, %s)\n%s\t}\n%s\treturn _result\n%s}()",
-		c.indent, c.indent, s.VarName, coll,
+	return fmt.Sprintf("func() %s {\n%s\tvar _result %s\n%s\tfor _, %s := range %s {\n%s%s\t\t_result = append(_result, %s)\n%s\t}\n%s\treturn _result\n%s}()",
+		resultType, c.indent, resultType, c.indent, s.VarName, coll,
 		sub.b.String(), c.indent, lastExpr, c.indent, c.indent, c.indent)
 }
 
@@ -1901,13 +2054,25 @@ func (c *compiler) compileAssign(s *ast.AssignStmt) {
 
 // --- Phase 2 expression compilers ---
 
-// compileList: [1, 2, 3] → []any{1, 2, 3}
+// compileList emits a concrete slice when semantic analysis resolved the element type.
 func (c *compiler) compileList(e *ast.ListExpr) string {
 	var items []string
 	for _, item := range e.Items {
 		items = append(items, c.compileExpr(item))
 	}
-	return "[]any{" + strings.Join(items, ", ") + "}"
+	goType := c.goTypeForExpr(e)
+	if goType == "" {
+		goType = "[]any"
+	}
+	return goType + "{" + strings.Join(items, ", ") + "}"
+}
+
+func (c *compiler) compileTypedList(e *ast.ListExpr, listType *ast.TypeRef) string {
+	items := make([]string, 0, len(e.Items))
+	for _, item := range e.Items {
+		items = append(items, c.compileExpr(item))
+	}
+	return resolveGoType(listType) + "{" + strings.Join(items, ", ") + "}"
 }
 
 // compileTemplate: "hello ${name}: ${count} items"
@@ -2270,6 +2435,7 @@ func (c *compiler) subCompiler() *compiler {
 		b:      &b,
 		indent: c.indent,
 		models: c.models,
+		types:  c.types,
 		enums:  c.enums,
 		api:    c.api,
 		vars:   childVars,

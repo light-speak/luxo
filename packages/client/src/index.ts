@@ -1,6 +1,6 @@
 export { FetchTransport, WsTransport } from './transport'
 export { LuxoError } from './error'
-export { Encoder, Decoder, ColumnarDecoder, fieldMaskSet, fieldMaskHas, formatUUID, parseUUID, decodeScalarArray, unixSecondsToISO } from './codec'
+export { Encoder, Decoder, ColumnarDecoder, fieldMaskSet, fieldMaskHas, formatUUID, parseUUID, decodeBase64, decodeJSONValue, decodeScalarArray, unixSecondsToISO } from './codec'
 export { inspectBinaryRequest } from './wire-inspector'
 export type { FieldType } from './codec'
 export type { WireFieldInspection, WireRequestInspection } from './wire-inspector'

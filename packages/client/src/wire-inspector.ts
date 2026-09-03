@@ -1,4 +1,8 @@
+import { fieldMaskHas } from './codec'
 import type { APISchema } from './transport'
+
+const FILTERS_FIELD_ID = 0x7ffffffe
+const SORTERS_FIELD_ID = 0x7fffffff
 
 export interface WireFieldInspection {
   fieldID: number
@@ -42,6 +46,51 @@ class WireReader {
     }
     this.offset += length
   }
+
+  readBytes(length: number, label: string): Uint8Array {
+    const start = this.offset
+    this.skip(length, label)
+    return this.data.subarray(start, this.offset)
+  }
+
+  readBool(label: string): void {
+    const value = this.readBytes(1, label)[0]
+    if (value !== 0 && value !== 1) throw new Error(`invalid ${label}`)
+  }
+
+  get done(): boolean {
+    return this.offset === this.data.length
+  }
+}
+
+function skipString(reader: WireReader, label: string): void {
+  reader.skip(reader.readVarint(`${label} length`), label)
+}
+
+function inspectListControl(reader: WireReader, fieldID: number): WireFieldInspection {
+  const valueStart = reader.offset
+  const itemCount = reader.readVarint(fieldID === FILTERS_FIELD_ID ? '$filters count' : '$sorters count')
+  const isFilter = fieldID === FILTERS_FIELD_ID
+  const limit = isFilter ? 1000 : 100
+  if (itemCount > limit) throw new Error(`${isFilter ? '$filters' : '$sorters'} exceeds ${limit} entries`)
+  for (let index = 0; index < itemCount; index++) {
+    skipString(reader, `${isFilter ? 'filter' : 'sorter'} field`)
+    if (isFilter) {
+      const operatorID = reader.readVarint('filter operator')
+      if (operatorID < 1 || operatorID > 10) throw new Error(`invalid filter operator ${operatorID}`)
+      skipString(reader, 'filter value')
+    } else {
+      reader.readBool('sorter direction')
+    }
+  }
+  return {
+    fieldID,
+    name: isFilter ? '$filters' : '$sorters',
+    type: isFilter ? 'Filter' : 'Sorter',
+    isList: true,
+    itemCount,
+    encodedBytes: reader.offset - valueStart,
+  }
 }
 
 function skipScalar(reader: WireReader, type: string): void {
@@ -73,11 +122,32 @@ function skipScalar(reader: WireReader, type: string): void {
 }
 
 function selectedFieldNames(mask: Uint8Array, meta: APISchema): string[] {
-  if (!meta.fields) return []
-  const selected: string[] = []
-  for (const [name, fieldID] of Object.entries(meta.fields)) {
-    const byte = mask[fieldID >>> 3]
-    if (byte !== undefined && (byte & (1 << (fieldID & 7))) !== 0) selected.push(name)
+	if (mask.length === 0 || !meta.fields) return []
+  return selectedNodeFields(mask, meta.fields, meta.types ?? {})
+}
+
+function selectedNodeFields(
+  node: Uint8Array,
+  fields: NonNullable<APISchema['fields']>,
+  types: NonNullable<APISchema['types']>,
+): string[] {
+  const reader = new WireReader(node)
+  const bitmap = reader.readBytes(reader.readVarint('selection bitmap length'), 'selection bitmap')
+  const selected = Object.entries(fields)
+    .filter(([, field]) => fieldMaskHas(bitmap, field.fieldID))
+    .map(([name]) => name)
+  const byID = new Map(Object.entries(fields).map(([name, field]) => [field.fieldID, { name, field }]))
+  while (!reader.done) {
+    const fieldID = reader.readVarint('selection child field ID')
+    const child = reader.readBytes(reader.readVarint('selection child length'), 'selection child')
+    const parent = byID.get(fieldID)
+    if (!parent || !selected.includes(parent.name) || !parent.field.typeName) {
+      throw new Error(`invalid nested selection field ${fieldID}`)
+    }
+    const nested = types[parent.field.typeName]
+    if (!nested) throw new Error(`unknown nested selection type ${parent.field.typeName}`)
+    const children = selectedNodeFields(child, nested, types)
+    selected[selected.indexOf(parent.name)] = `${parent.name}{${children.join(',')}}`
   }
   return selected
 }
@@ -102,6 +172,10 @@ export function inspectBinaryRequest(
   while (true) {
     const fieldID = reader.readVarint('field ID')
     if (fieldID === 0) break
+    if (fieldID === FILTERS_FIELD_ID || fieldID === SORTERS_FIELD_ID) {
+      fields.push(inspectListControl(reader, fieldID))
+      continue
+    }
     const param = params.get(fieldID)
     if (!param) throw new Error(`unknown field ID ${fieldID} for API ${api}`)
     const valueStart = reader.offset

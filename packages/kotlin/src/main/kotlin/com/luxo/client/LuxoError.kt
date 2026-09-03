@@ -1,5 +1,7 @@
 package com.luxo.client
 
+import kotlinx.serialization.json.JsonElement
+
 /**
  * Luxo API error with structured error info.
  */
@@ -12,6 +14,10 @@ class LuxoError(
     override val message: String,
     /** Trace ID for debugging. */
     val traceId: String? = null,
+    /** Structured application error details. */
+    val data: JsonElement? = null,
+    /** Development-only internal cause. */
+    val developmentCause: String? = null,
 ) : Exception(message) {
 
     override fun toString(): String = "LuxoError($error, $code, $message)"

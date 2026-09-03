@@ -60,6 +60,110 @@ type ExtendResult struct {
 	Data    []byte // encoded value (list: [count][items...], single: [arenaHeader][fields][0x00])
 }
 
+// BinaryKeys stores primary-key values exactly as encoded on the wire. The
+// gateway can forward them as a list parameter without decoding, reflection,
+// or per-key allocation.
+type BinaryKeys struct {
+	count  int
+	values []byte
+}
+
+// Len returns the number of encoded keys.
+func (k BinaryKeys) Len() int {
+	return k.count
+}
+
+// EncodeParam wraps the raw values as a list parameter message.
+func (k BinaryKeys) EncodeParam(fieldID int) []byte {
+	result := make([]byte, 0, len(k.values)+22)
+	result = codec.AppendVarint(result, uint64(fieldID))
+	result = codec.AppendVarint(result, uint64(k.count))
+	result = append(result, k.values...)
+	return append(result, 0)
+}
+
+// ExtractPrimaryKeys extracts one primary key while preserving its wire
+// representation. This is the single-record federation path.
+func ExtractPrimaryKeys(primary []byte, keyField *schema.Field, model *schema.Model, registry *schema.Schema) (BinaryKeys, bool) {
+	if len(primary) == 0 || keyField == nil || model == nil || registry == nil || !isFederationKeyType(keyField.Type) {
+		return BinaryKeys{}, false
+	}
+	dec := codec.NewDecoder(primary)
+	dec.SkipArenaHeader()
+	for dec.NextField() {
+		fieldID := dec.FieldID()
+		field := model.FieldByID(fieldID)
+		if field == nil {
+			return BinaryKeys{}, false
+		}
+		if fieldID == keyField.ID {
+			start := dec.Offset()
+			if !skipSchemaRowField(dec, field, registry) {
+				return BinaryKeys{}, false
+			}
+			return BinaryKeys{count: 1, values: primary[start:dec.Offset()]}, true
+		}
+		if !skipSchemaRowField(dec, field, registry) {
+			return BinaryKeys{}, false
+		}
+	}
+	return BinaryKeys{}, false
+}
+
+func skipSchemaRowField(dec *codec.Decoder, field *schema.Field, registry *schema.Schema) bool {
+	if field.Relation {
+		return skipNestedRowField(dec, field, registry)
+	}
+	if field.IsList {
+		element := *field
+		element.Nullable = false
+		element.IsList = false
+		dec.SkipArray(schemaFieldToSkipType(&element))
+	} else {
+		dec.SkipValue(schemaFieldToSkipType(field))
+	}
+	return dec.Err() == nil
+}
+
+func skipNestedRowField(dec *codec.Decoder, field *schema.Field, registry *schema.Schema) bool {
+	nested := registry.Models[field.TypeName]
+	if nested == nil {
+		if declaration := registry.Types[field.TypeName]; declaration != nil {
+			nested = declaration.AsModel()
+		}
+	}
+	if nested == nil {
+		return false
+	}
+	if field.IsList {
+		count := dec.ReadArrayLength()
+		if dec.Err() != nil {
+			return false
+		}
+		for range count {
+			if !skipModelRow(dec, nested, registry) {
+				return false
+			}
+		}
+		return true
+	}
+	if field.Nullable && !dec.ReadBool() {
+		return dec.Err() == nil
+	}
+	return skipModelRow(dec, nested, registry)
+}
+
+func skipModelRow(dec *codec.Decoder, model *schema.Model, registry *schema.Schema) bool {
+	dec.SkipArenaHeader()
+	for dec.NextField() {
+		field := model.FieldByID(dec.FieldID())
+		if field == nil || !skipSchemaRowField(dec, field, registry) {
+			return false
+		}
+	}
+	return dec.Err() == nil
+}
+
 // ExtractID reads the id field from a primary binary response using schema type info.
 // Handles any field ordering by skipping fields of known types.
 // Returns (id, true) on success.
@@ -90,20 +194,7 @@ func ExtractID(primary []byte, idFieldID int, fieldTypes map[int]codec.FieldSkip
 // skipField advances the decoder past one field value of the given type.
 // skipField advances the decoder past one field value. Zero allocation.
 func skipField(dec *codec.Decoder, st codec.FieldSkipType) {
-	switch st {
-	case codec.SkipVarint:
-		dec.SkipVarint()
-	case codec.SkipFixed64:
-		dec.SkipFixed64()
-	case codec.SkipBytes:
-		dec.SkipLenPrefixed()
-	case codec.SkipNullVarint:
-		dec.SkipNullableVarint()
-	case codec.SkipNullFixed64:
-		dec.SkipNullableFixed64()
-	case codec.SkipNullBytes:
-		dec.SkipNullableLenPrefixed()
-	}
+	dec.SkipValue(st)
 }
 
 // --- Columnar (list) federation ---
@@ -133,8 +224,43 @@ func ExtractIDColumn(data []byte, idFieldID int, model *schema.Model) []int64 {
 	return nil
 }
 
+// ExtractPrimaryKeyColumn extracts a complete primary-key column while
+// preserving its wire representation. The returned bytes reference data.
+func ExtractPrimaryKeyColumn(data []byte, keyField *schema.Field, model *schema.Model) (BinaryKeys, bool) {
+	if len(data) == 0 || keyField == nil || model == nil || !isFederationKeyType(keyField.Type) {
+		return BinaryKeys{}, false
+	}
+	r := codec.NewColumnarReader(data)
+	if r.Err() != nil || r.Count() == 0 {
+		return BinaryKeys{}, false
+	}
+	for r.NextColumn() {
+		field := model.FieldByID(r.FieldID())
+		if field == nil {
+			return BinaryKeys{}, false
+		}
+		start := r.Offset()
+		skipColumnarColumn(r, field)
+		if r.Err() != nil {
+			return BinaryKeys{}, false
+		}
+		if field.ID == keyField.ID {
+			return BinaryKeys{count: r.Count(), values: data[start:r.Offset()]}, true
+		}
+	}
+	return BinaryKeys{}, false
+}
+
 // skipColumnarColumn advances past all values in a column without allocating.
 func skipColumnarColumn(r *codec.ColumnarReader, f *schema.Field) {
+	if f.IsList {
+		if f.Nullable {
+			r.SkipColumnBytesPtr()
+		} else {
+			r.SkipColumnBytes()
+		}
+		return
+	}
 	switch f.Type {
 	case schema.FieldInt, schema.FieldDateTime, schema.FieldDuration:
 		if f.Nullable {
@@ -159,6 +285,12 @@ func skipColumnarColumn(r *codec.ColumnarReader, f *schema.Field) {
 			r.SkipColumnBoolPtr()
 		} else {
 			r.SkipColumnBool()
+		}
+	case schema.FieldUUID:
+		if f.Nullable {
+			r.SkipColumnUUIDPtr()
+		} else {
+			r.SkipColumnUUID()
 		}
 	case schema.FieldModel:
 		r.SkipColumnBytes()
@@ -231,7 +363,7 @@ type ExtendColumnResult struct {
 //	  [item2_len varint][item2 bytes]
 //	  ...
 //
-// For list extend fields: returns per-key blob = [count svarint][item1 bytes][item2 bytes]...
+// For list extend fields: returns per-key blob = [count varint][item1 bytes][item2 bytes]...
 // For single extend fields: returns per-key blob = the single item bytes (or nil).
 func ParseGroupedResponse(resp []byte, isList bool) [][]byte {
 	if len(resp) == 0 {
@@ -253,9 +385,9 @@ func ParseGroupedResponse(resp []byte, isList bool) [][]byte {
 
 		if isList {
 			// Collect all items for this key into a list blob:
-			// [count svarint][item1 raw bytes][item2 raw bytes]...
+			// [count varint][item1 raw bytes][item2 raw bytes]...
 			var listBuf []byte
-			listBuf = codec.AppendSvarint(listBuf, int64(itemCount))
+			listBuf = codec.AppendArrayHeader(listBuf, int(itemCount))
 			for j := 0; j < int(itemCount); j++ {
 				item, rn := codec.ReadBytes(resp, off)
 				if rn == 0 {

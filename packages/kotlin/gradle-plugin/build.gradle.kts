@@ -1,6 +1,7 @@
 plugins {
-    kotlin("jvm") version "2.0.0"
+    kotlin("jvm") version "2.4.10"
     `java-gradle-plugin`
+    `maven-publish`
 }
 
 group = "com.luxo"
@@ -11,8 +12,13 @@ repositories {
 }
 
 dependencies {
-    implementation(kotlin("gradle-plugin-api"))
-    compileOnly("org.jetbrains.kotlin:kotlin-compiler-embeddable:2.0.0")
+    testImplementation(gradleTestKit())
+    testImplementation(kotlin("test"))
+    testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
 
 gradlePlugin {
@@ -20,8 +26,8 @@ gradlePlugin {
         create("luxo") {
             id = "com.luxo.select"
             implementationClass = "com.luxo.gradle.LuxoGradlePlugin"
-            displayName = "Luxo Select Optimizer"
-            description = "Compile-time field selection optimization for Luxo API calls"
+            displayName = "Luxo Kotlin"
+            description = "Luxo client generation and compiler-AST field selection"
         }
     }
 }

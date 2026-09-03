@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -8,7 +9,47 @@ import (
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/codegen"
 	"github.com/light-speak/luxo/pkg/lux"
+	"github.com/light-speak/luxo/pkg/lux/codec"
+	"github.com/light-speak/luxo/pkg/lux/schema"
 )
+
+func TestCallFieldMaskUsesStableSchemaIDs(t *testing.T) {
+	runtimeSchema := schema.New()
+	runtimeSchema.RegisterModel(&schema.Model{Name: "Payload", Fields: []schema.Field{
+		{ID: 1, Name: "id", Type: schema.FieldInt},
+		{ID: 12, Name: "metadata", Type: schema.FieldJSON},
+	}})
+	apiSchema := &schema.API{Name: "getPayload", ReturnType: "Payload"}
+
+	mask, err := callFieldMask("metadata,id", apiSchema, runtimeSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(codec.SelectionMaskFields(mask), []byte{0x01, 0x08}) {
+		t.Fatalf("mask = %x", mask)
+	}
+	if _, err := callFieldMask("missing", apiSchema, runtimeSchema); err == nil {
+		t.Fatal("unknown field should fail")
+	}
+}
+
+func TestParseBinaryCLIValueUsesSchemaType(t *testing.T) {
+	value, err := parseBinaryCLIValue(`["AQI=",""]`, schema.Param{Type: schema.FieldBytes, IsList: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := value.([]any)
+	if !bytes.Equal(items[0].([]byte), []byte{1, 2}) || len(items[1].([]byte)) != 0 {
+		t.Fatalf("bytes = %#v", items)
+	}
+	jsonValue, err := parseBinaryCLIValue(`{"ok":true}`, schema.Param{Type: schema.FieldJSON})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jsonValue.(map[string]any)["ok"] != true {
+		t.Fatalf("JSON = %#v", jsonValue)
+	}
+}
 
 func TestBuildParamTypesFromASTIncludesServiceFunctions(t *testing.T) {
 	files := []*ast.File{{
@@ -28,6 +69,80 @@ func TestBuildParamTypesFromASTIncludesServiceFunctions(t *testing.T) {
 	}
 	if got := types["heartbeat"]["uptime"]; got != "Duration" {
 		t.Fatalf("uptime type = %q, want Duration", got)
+	}
+}
+
+func TestBuildParamTypesFromASTPreservesLists(t *testing.T) {
+	files := []*ast.File{{
+		APIs: []*ast.ApiDecl{{
+			Name: "findMany",
+			Params: []*ast.ParamDecl{
+				{Name: "ids", Type: &ast.TypeRef{Name: "UUID", IsList: true}},
+				{Name: "names", Type: &ast.TypeRef{Name: "String", IsList: true, Nullable: true}},
+			},
+		}},
+	}}
+
+	types := buildParamTypesFromAST(files)
+	if got := types["findMany"]["ids"]; got != "[UUID]" {
+		t.Fatalf("ids type = %q, want [UUID]", got)
+	}
+	if got := types["findMany"]["names"]; got != "[String]?" {
+		t.Fatalf("names type = %q, want [String]?", got)
+	}
+}
+
+func TestBuildParamTypesFromASTNormalizesWireTypes(t *testing.T) {
+	files := []*ast.File{{
+		Enums: []*ast.EnumDecl{{Name: "Role"}},
+		Types: []*ast.TypeDecl{{Name: "CreateInput"}},
+		APIs: []*ast.ApiDecl{{
+			Name: "create",
+			Params: []*ast.ParamDecl{
+				{Name: "role", Type: &ast.TypeRef{Name: "Role"}},
+				{Name: "input", Type: &ast.TypeRef{Name: "CreateInput"}},
+				{Name: "inputs", Type: &ast.TypeRef{Name: "CreateInput", IsList: true}},
+			},
+		}},
+	}}
+
+	types := buildParamTypesFromAST(files)
+	if got := types["create"]["role"]; got != "Enum" {
+		t.Fatalf("role wire type = %q, want Enum", got)
+	}
+	if got := types["create"]["input"]; got != "JSON" {
+		t.Fatalf("input wire type = %q, want JSON", got)
+	}
+	if got := types["create"]["inputs"]; got != "[JSON]" {
+		t.Fatalf("inputs wire type = %q, want [JSON]", got)
+	}
+}
+
+func TestBuildParamTypesFromASTUsesOnlyGeneratedCRUDParams(t *testing.T) {
+	autoID := &ast.FieldDecl{Name: "id", Type: &ast.TypeRef{Name: "UUID"}, Directives: []*ast.Directive{{Name: "auto"}}}
+	internal := &ast.FieldDecl{Name: "secret", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "internal"}}}
+	immutable := &ast.FieldDecl{Name: "slug", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "immutable"}}}
+	files := []*ast.File{{
+		Models: []*ast.ModelDecl{
+			{Name: "Post", Directives: []*ast.Directive{{Name: "crud"}}, Fields: []*ast.FieldDecl{
+				autoID,
+				{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+				immutable,
+				internal,
+				{Name: "author", Type: &ast.TypeRef{Name: "User"}},
+			}},
+			{Name: "User", Fields: []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "UUID"}}}},
+		},
+	}}
+
+	types := buildParamTypesFromAST(files)
+	create := types["createPost"]
+	update := types["updatePost"]
+	if len(create) != 2 || create["title"] != "String" || create["slug"] != "String" {
+		t.Fatalf("create types = %v", create)
+	}
+	if len(update) != 2 || update["id"] != "UUID" || update["title"] != "String" {
+		t.Fatalf("update types = %v", update)
 	}
 }
 

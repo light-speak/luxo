@@ -279,13 +279,17 @@ func generateInferredHandler(b *strings.Builder, api *ast.ApiDecl, inf *Inferred
 	for _, p := range params {
 		goType := resolveGoType(p.Type)
 		method := paramMethod(goType)
+		if p.Type != nil && p.Type.Nullable {
+			method = ""
+		}
 		// Enum params are strings in JSON
-		if method == "" && p.Type != nil && enums[p.Type.Name] {
+		if method == "" && p.Type != nil && !p.Type.Nullable && enums[p.Type.Name] {
 			method = "String"
 		}
 		if method == "" {
 			fmt.Fprintf(b, "\t\tvar %s %s\n", p.Name, goType)
-			fmt.Fprintf(b, "\t\tif err := req.ParamJSON(%q, &%s); err != nil {\n", p.Name, p.Name)
+			methodName := paramJSONMethod(p)
+			fmt.Fprintf(b, "\t\tif err := req.%s(%q, &%s); err != nil {\n", methodName, p.Name, p.Name)
 			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 		} else {
 			fmt.Fprintf(b, "\t\t%s, err := req.Param%s(%q)\n", p.Name, method, p.Name)
@@ -297,7 +301,7 @@ func generateInferredHandler(b *strings.Builder, api *ast.ApiDecl, inf *Inferred
 	writeInferredConditions(b, inf, m, params)
 
 	rels := analyzeRelations(m, enums)
-	writeInferredAction(b, inf, modelName, isSoftDelete(m), rels)
+	writeInferredAction(b, inf, modelName, isSoftDelete(m), rels, m)
 }
 
 // writeInferredConditions generates the WHERE conditions for an inferred handler.
@@ -370,8 +374,12 @@ func writeAndClause(b *strings.Builder, clause InferClause, m *ast.ModelDecl, pa
 }
 
 // writeInferredAction generates the query execution + response writing for an inferred handler.
-func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string, soft bool, rels []Relation) {
+func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string, soft bool, rels []Relation, models ...*ast.ModelDecl) {
 	hasRels := len(rels) > 0
+	var model *ast.ModelDecl
+	if len(models) > 0 {
+		model = models[0]
+	}
 	switch inf.Action {
 	case "count":
 		fmt.Fprintf(b, "\t\tcount, err := app.%s.Where(conds...).Count(ctx)\n", modelName)
@@ -395,11 +403,11 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 
 	case "list":
 		if hasRels {
-			fmt.Fprintf(b, "\t\tcols := selection.SQLColumns(req.Select)\n")
+			fmt.Fprintf(b, "\t\tcols := select%sSQLColumns(req.Select)\n", modelName)
 			writeInferredFKEnsure(b, rels)
 			fmt.Fprintf(b, "\t\tq := app.%s.Where(conds...).Select(cols...)\n", modelName)
 		} else {
-			fmt.Fprintf(b, "\t\tq := app.%s.Where(conds...).Select(selection.SQLColumns(req.Select)...)\n", modelName)
+			fmt.Fprintf(b, "\t\tq := app.%s.Where(conds...).Select(select%sSQLColumns(req.Select)...)\n", modelName, modelName)
 		}
 		if inf.OrderBy != "" {
 			order := str.ToSnakeCase(inf.OrderBy)
@@ -417,6 +425,7 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 				fmt.Fprintf(b, "\t\tif err := resolve%sListRelations(ctx, app, results, req.Select); err != nil {\n", modelName)
 				fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 			}
+			writeComputedResolve(b, model, "results", "\t\t")
 			fmt.Fprintf(b, "\t\tWriteColumnar%s(req.Buf, results, req.FieldMask)\n", modelName)
 		} else {
 			fmt.Fprintf(b, "\t\tresults, total, err := q.Limit(req.PageSize).Offset((req.Page - 1) * req.PageSize).AllWithCount(ctx)\n")
@@ -425,6 +434,7 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 				fmt.Fprintf(b, "\t\tif err := resolve%sListRelations(ctx, app, results, req.Select); err != nil {\n", modelName)
 				fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 			}
+			writeComputedResolve(b, model, "results", "\t\t")
 			fmt.Fprintf(b, "\t\tWriteColumnar%s(req.Buf, results, req.FieldMask)\n", modelName)
 			fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, total)\n")
 			fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.Page))\n")
@@ -433,11 +443,11 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 
 	default: // get
 		if hasRels {
-			fmt.Fprintf(b, "\t\tcols := selection.SQLColumns(req.Select)\n")
+			fmt.Fprintf(b, "\t\tcols := select%sSQLColumns(req.Select)\n", modelName)
 			writeInferredFKEnsure(b, rels)
 			fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(conds...).Select(cols...).First(ctx)\n", modelName)
 		} else {
-			fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(conds...).Select(selection.SQLColumns(req.Select)...).First(ctx)\n", modelName)
+			fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(conds...).Select(select%sSQLColumns(req.Select)...).First(ctx)\n", modelName, modelName)
 		}
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		fmt.Fprintf(b, "\t\tif result == nil {\n\t\t\treturn errors.NotFound.WithData(errors.ResourceError{Resource: %q})\n\t\t}\n", modelName)
@@ -445,6 +455,7 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 			fmt.Fprintf(b, "\t\tif err := resolve%sRelations(ctx, app, result, req.Select); err != nil {\n", modelName)
 			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 		}
+		writeComputedResolve(b, model, "[]*"+modelName+"{result}", "\t\t")
 		fmt.Fprintf(b, "\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
 	}
 
