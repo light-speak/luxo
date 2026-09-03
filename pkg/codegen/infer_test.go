@@ -564,6 +564,44 @@ func TestGenerateInferredHandlerParamJSON(t *testing.T) {
 	}
 }
 
+func TestGenerateInferredHandlerNullableParamJSON(t *testing.T) {
+	model := testModel("User", nil, []*ast.FieldDecl{testField("id", "UUID")})
+	api := testApiDecl("getUserById", []*ast.ParamDecl{{
+		Name: "id",
+		Type: &ast.TypeRef{Name: "UUID", Nullable: true},
+	}})
+	inf := &InferredAPI{
+		Action:    "get",
+		ModelName: "User",
+		Groups:    []ClauseGroup{{Clauses: []InferClause{{Field: "id", Op: "eq"}}}},
+	}
+	var b strings.Builder
+	generateInferredHandler(&b, api, inf, nil, model)
+	if out := b.String(); !strings.Contains(out, "req.ParamJSONNullable") {
+		t.Fatalf("nullable UUID parameter did not use nullable JSON decoding:\n%s", out)
+	}
+}
+
+func TestGenerateInferredHandlerSelectsRelationColumns(t *testing.T) {
+	model := testModel("User", nil, []*ast.FieldDecl{
+		testField("id", "Int"),
+		{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+	})
+	for _, action := range []string{"list", "get"} {
+		t.Run(action, func(t *testing.T) {
+			api := testApiDecl(action+"Users", nil)
+			inf := &InferredAPI{Action: action, ModelName: "User"}
+			var b strings.Builder
+			generateInferredHandler(&b, api, inf, nil, model)
+			out := b.String()
+			if !strings.Contains(out, "cols := selectUserSQLColumns(req.Select)") ||
+				!strings.Contains(out, "resolveUser") {
+				t.Fatalf("%s relation selection was not generated:\n%s", action, out)
+			}
+		})
+	}
+}
+
 func TestWriteAndClause(t *testing.T) {
 	m := testModel("Post", nil, []*ast.FieldDecl{
 		testField("title", "String"),

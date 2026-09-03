@@ -72,6 +72,18 @@ func TestGenerateSQLColumnSelectorUsesDeclaredDatabaseFields(t *testing.T) {
 	}
 }
 
+func TestCollectSelectionModelsIncludesExternalExtensionOnce(t *testing.T) {
+	user := &ast.ModelDecl{Name: "User"}
+	result := &semantic.Result{Files: []*ast.File{{Extends: []*ast.ExtendDecl{
+		{Name: "User"},
+		{Name: "Post", Fields: []*ast.FieldDecl{{Name: "title", Type: &ast.TypeRef{Name: "String"}}}},
+	}}}}
+	models := collectSelectionModels(result, []*ast.ModelDecl{user})
+	if len(models) != 2 || models[0] != user || models[1].Name != "Post" {
+		t.Fatalf("selection models = %#v", models)
+	}
+}
+
 func crudDirective(args ...*ast.NamedArg) *ast.Directive {
 	return &ast.Directive{
 		Pos:  token.Position{File: "test.luxo", Line: 1, Col: 1},
@@ -195,6 +207,50 @@ func TestGenerateRemoteNamedLoadHandlers(t *testing.T) {
 	for _, check := range checks {
 		if !strings.Contains(code, check) {
 			t.Errorf("remote load handler missing %q:\n%s", check, code)
+		}
+	}
+}
+
+func TestGenerateRemoteNamedLoadHandlersSkipsUnknownModel(t *testing.T) {
+	var b strings.Builder
+	generateRemoteNamedLoadHandlers(&b, &semantic.Result{}, nil, []loadCallInfo{{
+		modelName:    "Missing",
+		argNames:     []string{"id"},
+		argTypes:     []string{"int64"},
+		argTypeNames: []string{"Int"},
+	}})
+	if b.Len() != 0 {
+		t.Fatalf("unknown model generated a remote loader:\n%s", b.String())
+	}
+}
+
+func TestGenerateRemoteNamedLoadHandlerSingleSoftKey(t *testing.T) {
+	model := &ast.ModelDecl{
+		Name:       "User",
+		Directives: []*ast.Directive{{Name: "soft"}},
+		Fields: []*ast.FieldDecl{
+			{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+			computedAggregateField("postCount", "Int", "count", &ast.Ident{Name: "posts"}),
+		},
+	}
+	call := loadCallInfo{
+		modelName:    "User",
+		argNames:     []string{"email"},
+		argTypes:     []string{"string"},
+		argTypeNames: []string{"String"},
+	}
+	var b strings.Builder
+	generateRemoteNamedLoadHandler(&b, model, call)
+	out := b.String()
+	for _, want := range []string{
+		`lux.NewStringField("email").In(emailKeys...)`,
+		`lux.NewTimeField("deleted_at").IsNull()`,
+		"resolveUserComputed(ctx, app, rows, req.FieldMask)",
+		"key := row.Email",
+		"key := emailKeys[i]",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("single-key remote handler missing %q:\n%s", want, out)
 		}
 	}
 }
@@ -1064,6 +1120,33 @@ func TestGenerateHandlerNullableParam(t *testing.T) {
 
 	if !strings.Contains(code, "&subtitleVal") {
 		t.Errorf("nullable param should use & prefix:\n%s", code)
+	}
+}
+
+func TestNativeHandlersDecodeOptionalNullableJSON(t *testing.T) {
+	param := &ast.ParamDecl{
+		Name:    "payload",
+		Type:    &ast.TypeRef{Name: "Payload", Nullable: true},
+		Default: &ast.Literal{Kind: token.Null, Value: "null"},
+	}
+	var apiBuilder strings.Builder
+	generateNativeAPIHandler(&apiBuilder, &ast.ApiDecl{
+		Name:       "submit",
+		Params:     []*ast.ParamDecl{param},
+		Directives: []*ast.Directive{{Name: "native"}},
+	}, nil, nil)
+	if out := apiBuilder.String(); !strings.Contains(out, `req.ParamJSONOptionalNullable("payload", &payload)`) {
+		t.Fatalf("native API nullable parameter decoding missing:\n%s", out)
+	}
+
+	var serviceBuilder strings.Builder
+	generateNativeServiceHandler(&serviceBuilder, &ast.FnDecl{
+		Name:       "submit",
+		Params:     []*ast.ParamDecl{param},
+		Directives: []*ast.Directive{{Name: "native"}, {Name: "service"}},
+	}, nil, nil)
+	if out := serviceBuilder.String(); !strings.Contains(out, `req.ParamJSONOptionalNullable("payload", &payload)`) {
+		t.Fatalf("native service nullable parameter decoding missing:\n%s", out)
 	}
 }
 
@@ -2103,6 +2186,14 @@ func TestWriteHandlerImportsAllFeatures(t *testing.T) {
 	}
 }
 
+func TestWriteHandlerImportsDecimalFromGeneratedBody(t *testing.T) {
+	var b strings.Builder
+	writeHandlerImports(&b, &semantic.Result{}, nil, handlerFeatures{}, false, "value := decimal.Zero")
+	if out := b.String(); !strings.Contains(out, `"github.com/shopspring/decimal"`) {
+		t.Fatalf("generated decimal use did not add import:\n%s", out)
+	}
+}
+
 // ─── writeHandlerImports: hash only when CRUD has write ops ──────
 
 func TestWriteHandlerImportsNoHashWithoutWriteOps(t *testing.T) {
@@ -2954,6 +3045,116 @@ func TestNestedRelationResolvesComputedFieldsInOneBatch(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("nested computed resolution missing %q:\n%s", want, out)
 		}
+	}
+}
+
+func TestComputedFieldLocalKeySkipsInvalidDirectives(t *testing.T) {
+	model := &ast.ModelDecl{Name: "User", Fields: []*ast.FieldDecl{
+		{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+	}}
+	field := &ast.FieldDecl{
+		Name: "invalid",
+		Type: &ast.TypeRef{Name: "Int"},
+		Computed: &ast.ComputedField{Directives: []*ast.Directive{
+			{Name: "count"},
+			{Name: "count", Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "1"}}}},
+		}},
+	}
+	if key, ok := computedFieldLocalKey(model, field, nil); ok || key != "" {
+		t.Fatalf("invalid computed directive resolved key %q", key)
+	}
+}
+
+func TestNestedComputedResolveSupportsScalarRelations(t *testing.T) {
+	relation := Relation{FieldName: "profile", TargetName: "Profile"}
+	computed := map[string]bool{"Profile": true}
+	var b strings.Builder
+	writeNestedComputedResolve(&b, relation, "item.Profile", "\t", computed)
+	writeNestedListComputedResolve(&b, relation, computed)
+	out := b.String()
+	for _, want := range []string{
+		"[]*Profile{item.Profile}",
+		"if item.Profile != nil { computedItems = append(computedItems, item.Profile) }",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("scalar computed relation missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestCollectBatchLoadModelsIncludesRemotePrimaryKeyModel(t *testing.T) {
+	oldContext := globalEventCtx
+	defer func() { globalEventCtx = oldContext }()
+	globalEventCtx = &EventContext{remotePKModels: map[string]bool{"Post": true}}
+	user := &ast.ModelDecl{Name: "User"}
+	post := &ast.ModelDecl{Name: "Post"}
+	models := collectBatchLoadModels([]*ast.ModelDecl{user}, []*ast.ModelDecl{user, post})
+	if len(models) != 2 || models[1] != post {
+		t.Fatalf("batch load models = %#v", models)
+	}
+}
+
+func TestWriteAPIRegistrationSkipsOnlyStaleParams(t *testing.T) {
+	oldAPIs := apiIDs
+	oldParams := apiParamIDs
+	oldTypes := apiParamTypes
+	defer func() {
+		apiIDs = oldAPIs
+		apiParamIDs = oldParams
+		apiParamTypes = oldTypes
+	}()
+	apiIDs = map[string]int{"svc:lookup": 9}
+	apiParamIDs = map[string]map[string]int{"svc:lookup": {"stale": 1}}
+	apiParamTypes = map[string]map[string]string{"lookup": {"active": "String"}}
+	var b strings.Builder
+	writeAPIRegistration(&b, "svc:lookup")
+	out := b.String()
+	if !strings.Contains(out, `router.Registry.Register("svc:lookup", 9)`) || strings.Contains(out, "RegisterParams") {
+		t.Fatalf("stale parameter registration output:\n%s", out)
+	}
+}
+
+func TestComputedAggregateValidationBranches(t *testing.T) {
+	oldFields := modelFieldIDs
+	defer func() { modelFieldIDs = oldFields }()
+	modelFieldIDs = map[string]map[string]int{"User": {"badArgs": 2}}
+
+	missingID := computedAggregateField("missing", "Int", "count", &ast.Ident{Name: "posts"})
+	if _, _, ok := parseComputedAggregate("User", missingID); ok {
+		t.Fatal("computed field without a field ID was accepted")
+	}
+	badArgs := &ast.FieldDecl{
+		Name:     "badArgs",
+		Type:     &ast.TypeRef{Name: "Int"},
+		Computed: &ast.ComputedField{Directives: []*ast.Directive{{Name: "count"}}},
+	}
+	if _, _, ok := parseComputedAggregate("User", badArgs); ok {
+		t.Fatal("computed field without one directive argument was accepted")
+	}
+
+	tests := []struct {
+		name string
+		expr ast.Expr
+	}{
+		{name: "count", expr: &ast.Literal{Kind: token.Int, Value: "1"}},
+		{name: "median", expr: &ast.Ident{Name: "posts"}},
+		{name: "sum", expr: &ast.Ident{Name: "posts"}},
+		{name: "sum", expr: &ast.MemberExpr{Object: &ast.Literal{Kind: token.Int, Value: "1"}, Field: "likes"}},
+	}
+	for _, test := range tests {
+		if relation, target, ok := computedAggregateTarget(test.name, test.expr); ok || relation != "" || target != "" {
+			t.Fatalf("invalid %s aggregate accepted: relation=%q target=%q", test.name, relation, target)
+		}
+	}
+}
+
+func TestModelFieldByNameHandlesNilAndMissingModel(t *testing.T) {
+	if field := modelFieldByName(nil, "id"); field != nil {
+		t.Fatalf("nil model returned field %#v", field)
+	}
+	model := &ast.ModelDecl{Name: "User", Fields: []*ast.FieldDecl{{Name: "id"}}}
+	if field := modelFieldByName(model, "missing"); field != nil {
+		t.Fatalf("missing field returned %#v", field)
 	}
 }
 

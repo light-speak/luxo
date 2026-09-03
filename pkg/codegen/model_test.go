@@ -114,6 +114,12 @@ func TestGenerateModel(t *testing.T) {
 	}
 }
 
+func TestPrimaryKeyFieldNilModel(t *testing.T) {
+	if primaryKeyField(nil) != nil {
+		t.Fatal("nil model must not have a primary key")
+	}
+}
+
 func TestResolveGoType(t *testing.T) {
 	tests := []struct {
 		typeRef *ast.TypeRef

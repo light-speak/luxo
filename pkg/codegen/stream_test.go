@@ -294,6 +294,77 @@ func TestSameStreamTypeIsExact(t *testing.T) {
 	}
 }
 
+func TestSameStreamTypeNestedShapes(t *testing.T) {
+	if sameStreamType(nil, nil) {
+		t.Fatal("nil stream types must not match")
+	}
+	typeArg := &ast.TypeRef{Name: "Result", TypeArgs: []*ast.TypeRef{{Name: "Int"}}}
+	if !sameStreamType(typeArg, &ast.TypeRef{Name: "Result", TypeArgs: []*ast.TypeRef{{Name: "Int"}}}) {
+		t.Fatal("matching type arguments must compare equal")
+	}
+	if sameStreamType(typeArg, &ast.TypeRef{Name: "Result", TypeArgs: []*ast.TypeRef{{Name: "String"}}}) {
+		t.Fatal("different type arguments must not compare equal")
+	}
+	tuple := &ast.TypeRef{Name: "Tuple", Tuple: []*ast.TypeRef{{Name: "Int"}, {Name: "String"}}}
+	if !sameStreamType(tuple, &ast.TypeRef{Name: "Tuple", Tuple: []*ast.TypeRef{{Name: "Int"}, {Name: "String"}}}) {
+		t.Fatal("matching tuples must compare equal")
+	}
+	if sameStreamType(tuple, &ast.TypeRef{Name: "Tuple", Tuple: []*ast.TypeRef{{Name: "Int"}, {Name: "Boolean"}}}) {
+		t.Fatal("different tuples must not compare equal")
+	}
+}
+
+func TestMergeGlobalStreamTypes(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+	local := &ast.EventDecl{Name: "Local"}
+	remote := &ast.EventDecl{Name: "Remote"}
+	globalEventCtx = &EventContext{
+		Events:      map[string]*ast.EventDecl{"Local": remote, "Remote": remote},
+		ModelModule: map[string]string{"User": "accounts"},
+		TypeModule:  map[string]string{"Payload": "common"},
+		EnumModule:  map[string]string{"Role": "auth"},
+	}
+	declarations := streamTypes{
+		events: map[string]*ast.EventDecl{"Local": local},
+		models: map[string]bool{}, types: map[string]bool{}, enums: map[string]bool{},
+	}
+	mergeGlobalStreamTypes(&declarations)
+	if declarations.events["Local"] != local || declarations.events["Remote"] != remote {
+		t.Fatal("global events were not merged without replacing local declarations")
+	}
+	if !declarations.models["User"] || !declarations.types["Payload"] || !declarations.enums["Role"] {
+		t.Fatalf("global stream types were not merged: %+v", declarations)
+	}
+}
+
+func TestClassifyStreamPayloadKinds(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+	globalEventCtx = &EventContext{
+		ModelModule: map[string]string{"User": "accounts"},
+		TypeModule:  map[string]string{"Payload": "common"},
+	}
+	models := map[string]bool{"User": true}
+	types := map[string]bool{"Payload": true}
+	enums := map[string]bool{"Role": true}
+
+	var model, payload, enum streamInfo
+	classifyStreamPayload(&model, &ast.TypeRef{Name: "User"}, models, types, enums)
+	classifyStreamPayload(&payload, &ast.TypeRef{Name: "Payload"}, models, types, enums)
+	classifyStreamPayload(&enum, &ast.TypeRef{Name: "Role"}, models, types, enums)
+	classifyStreamPayload(&streamInfo{}, nil, models, types, enums)
+	if model.payloadKind != streamPayloadModel || model.payloadModule != "accounts" {
+		t.Fatalf("model payload = %+v", model)
+	}
+	if payload.payloadKind != streamPayloadType || payload.payloadModule != "common" {
+		t.Fatalf("type payload = %+v", payload)
+	}
+	if !enum.payloadEnum || enum.payloadKind != streamPayloadScalar {
+		t.Fatalf("enum payload = %+v", enum)
+	}
+}
+
 func TestGenerateCrossModuleStreamSource(t *testing.T) {
 	old := globalEventCtx
 	defer func() { globalEventCtx = old }()
@@ -529,12 +600,123 @@ func TestStreamFieldTypes(t *testing.T) {
 
 	// streamParamMethod — all branches
 	paramCases := []struct{ in, want string }{
-		{"Int", "Int"}, {"String", "String"}, {"Boolean", "Boolean"},
+		{"Int", "Int"}, {"Float", "Float"}, {"String", "String"},
+		{"Boolean", "Boolean"}, {"Duration", "Duration"}, {"UUID", "UUID"}, {"Unknown", ""},
 	}
 	for _, c := range paramCases {
 		if got := streamParamMethod(c.in, false); got != c.want {
 			t.Errorf("streamParamMethod(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+	if got := streamParamMethod("Role", true); got != "String" {
+		t.Errorf("enum stream param method = %q", got)
+	}
+	if got := streamFieldGoType(&ast.TypeRef{Name: "Unknown"}, false); got != "" {
+		t.Errorf("unknown stream field type = %q", got)
+	}
+}
+
+func TestStreamGenerationTypeHelpers(t *testing.T) {
+	tests := []struct {
+		name   string
+		value  string
+		ref    *ast.TypeRef
+		isEnum bool
+		want   string
+	}{
+		{name: "enum", value: "payload.Role", ref: &ast.TypeRef{Name: "Role"}, isEnum: true, want: "string(payload.Role)"},
+		{name: "duration", value: "payload.TTL", ref: &ast.TypeRef{Name: "Duration"}, want: "int64(payload.TTL)"},
+		{name: "uuid", value: "payload.ID", ref: &ast.TypeRef{Name: "UUID"}, want: "[16]byte(payload.ID)"},
+		{name: "plain", value: "payload.Name", ref: &ast.TypeRef{Name: "String"}, want: "payload.Name"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := streamEventValue(tt.value, tt.ref, tt.isEnum); got != tt.want {
+				t.Fatalf("streamEventValue() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	if got := streamReturnGoType(streamInfo{}); got != "struct{}" {
+		t.Fatalf("nil return type = %q", got)
+	}
+	remote := streamInfo{returnType: &ast.TypeRef{Name: "User", IsList: true}, payloadKind: streamPayloadModel, payloadModule: "accounts", sourceModule: "feed"}
+	if got := streamReturnGoType(remote); got != "[]accounts_luxo.User" {
+		t.Fatalf("remote list return type = %q", got)
+	}
+}
+
+func TestStreamImportsCollectRemoteTypesAndEnums(t *testing.T) {
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+	globalEventCtx = &EventContext{
+		EnumModule: map[string]string{"Role": "auth"},
+		ModulePath: "github.com/example/service",
+	}
+	body := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "Admin"}},
+		&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "Member"}},
+		&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "Unknown"}, Field: "Value"}},
+		&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.CallExpr{Func: &ast.Ident{Name: "value"}}, Field: "Name"}},
+	}}
+	streams := []streamInfo{{
+		eventName: "Changed", eventModule: "events", payloadKind: streamPayloadType,
+		payloadModule: "common", sourceModule: "feed", body: body,
+	}}
+	var b strings.Builder
+	writeStreamImports(&b, streams)
+	for _, module := range []string{"auth", "common", "events"} {
+		if !strings.Contains(b.String(), module+`_luxo "github.com/example/service/`+module+`/luxo"`) {
+			t.Fatalf("missing %s import:\n%s", module, b.String())
+		}
+	}
+	if got := collectStreamEnumRefs(body, globalEventCtx.EnumModule); len(got) != 1 || got[0] != "Role" {
+		t.Fatalf("enum references = %v", got)
+	}
+}
+
+func TestWriteStreamPayloadEncodingTypeList(t *testing.T) {
+	si := streamInfo{
+		returnType: &ast.TypeRef{Name: "Payload", IsList: true}, payloadKind: streamPayloadType,
+		payloadModule: "common", sourceModule: "feed",
+	}
+	var b strings.Builder
+	writeStreamPayloadEncoding(&b, si, "payload.Values", "\t")
+	if code := b.String(); !strings.Contains(code, "common_luxo.WriteColumnarPayload") {
+		t.Fatalf("type list stream encoding is not columnar:\n%s", code)
+	}
+}
+
+func TestGenerateLuxoStreamMatcherRejectsUnsupportedExpression(t *testing.T) {
+	si := streamInfo{
+		apiName: "watch", hasBody: true,
+		body: &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: &ast.CallExpr{Func: &ast.Ident{Name: "unsupported"}}}}},
+	}
+	var b strings.Builder
+	generateLuxoStreamMatcher(&b, si, nil)
+	if !strings.Contains(b.String(), "false /* rejected by semantic analysis */") {
+		t.Fatalf("unsupported matcher was not rejected:\n%s", b.String())
+	}
+}
+
+func TestCompileStreamExprRejectsUnsupportedBinaryAndQualifiesEnum(t *testing.T) {
+	unsupported := &ast.BinaryExpr{
+		Left: &ast.CallExpr{Func: &ast.Ident{Name: "call"}}, Op: "==", Right: &ast.Ident{Name: "value"},
+	}
+	if got, ok := compileStreamExpr(unsupported, nil, nil, ""); ok || got != "" {
+		t.Fatalf("unsupported binary = %q, %v", got, ok)
+	}
+	inExpr := &ast.BinaryExpr{Left: &ast.Ident{Name: "value"}, Op: "in", Right: &ast.Ident{Name: "values"}}
+	if got, ok := compileStreamExpr(inExpr, nil, nil, ""); ok || got != "" {
+		t.Fatalf("in expression = %q, %v", got, ok)
+	}
+
+	old := globalEventCtx
+	defer func() { globalEventCtx = old }()
+	globalEventCtx = &EventContext{EnumModule: map[string]string{"Role": "auth"}}
+	enumExpr := &ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "Admin"}
+	if got, ok := compileStreamExpr(enumExpr, nil, map[string]bool{"Role": true}, "feed"); !ok || got != "string(auth_luxo.RoleAdmin)" {
+		t.Fatalf("enum expression = %q, %v", got, ok)
 	}
 }
 

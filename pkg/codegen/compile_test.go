@@ -1939,6 +1939,84 @@ func TestWriteScalarListReturnUsesUnsignedCountAndElementCodec(t *testing.T) {
 	}
 }
 
+func TestCompilerUsesSemanticExpressionTypes(t *testing.T) {
+	models := map[string]*ast.ModelDecl{"User": {Name: "User"}}
+	c := newCompiler(models)
+	plainString := &ast.Ident{TypeTagged: ast.TypeTagged{TypeTag: "String"}, Name: "name"}
+	if got := c.goTypeForExpr(plainString); got != "string" {
+		t.Fatalf("string Go type = %q", got)
+	}
+	modelList := &ast.Ident{TypeTagged: ast.TypeTagged{TypeTag: "User", ListTypeTag: true}, Name: "users"}
+	valueType, ok := c.valTypeFromExpr(modelList)
+	if !ok || !valueType.isModel || !valueType.isList || valueType.name != "User" {
+		t.Fatalf("model list type = %+v, %v", valueType, ok)
+	}
+	if got := c.goTypeForExpr(modelList); got != "[]*User" {
+		t.Fatalf("model list Go type = %q", got)
+	}
+	optionalInt := &ast.Ident{TypeTagged: ast.TypeTagged{TypeTag: "Int", NullableTag: true}, Name: "count"}
+	if got := c.goTypeForExpr(optionalInt); got != "*int64" {
+		t.Fatalf("nullable integer Go type = %q", got)
+	}
+	model := &ast.Ident{TypeTagged: ast.TypeTagged{TypeTag: "User", NullableTag: true}, Name: "user"}
+	if c.yieldNeedsAddress(model) {
+		t.Fatal("model values are already nilable")
+	}
+	c.compileStmt(&ast.ValStmt{Name: "copy", Value: plainString})
+	if got := c.vars["copy"]; got.name != "String" || got.isList || got.isModel {
+		t.Fatalf("tracked value type = %+v", got)
+	}
+}
+
+func TestCompilerWritesModelAndTypeDeclarationReturns(t *testing.T) {
+	user := &ast.ModelDecl{Name: "User", Fields: []*ast.FieldDecl{
+		computedAggregateField("postCount", "Int", "count", &ast.Ident{Name: "posts"}),
+	}}
+	c := newCompiler(map[string]*ast.ModelDecl{"User": user})
+	c.types = map[string]bool{"Payload": true}
+	c.enums = map[string]bool{"Role": true}
+	c.writeReturnByType("user", valType{isModel: true, name: "User"})
+	c.writeReturnByType("payloads", valType{isList: true, name: "Payload"})
+	c.writeReturnByType("payload", valType{name: "Payload"})
+	c.writeReturnByType("role", valType{name: "Role"})
+	out := compilerOut(c)
+	for _, want := range []string{
+		"resolveUserComputed", "[]*User{user}", "WriteColumnarPayload", "payload.WriteLuxo",
+		"codec.AppendString(req.Buf.B, string(role))",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("typed return missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestCompilerWritesScalarReturnForModelsAndTypes(t *testing.T) {
+	c := newCompiler(map[string]*ast.ModelDecl{"User": {Name: "User"}})
+	c.types = map[string]bool{"Payload": true}
+	c.api.ReturnType = &ast.TypeRef{Name: "User"}
+	c.writeScalarReturn("user")
+	c.api.ReturnType = &ast.TypeRef{Name: "User", IsList: true}
+	c.writeScalarReturn("users")
+	c.api.ReturnType = &ast.TypeRef{Name: "Payload", IsList: true}
+	c.writeScalarReturn("payloads")
+	out := compilerOut(c)
+	for _, want := range []string{"_result := user", "_result.WriteLuxo", "WriteColumnarUser", "WriteColumnarPayload"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("scalar return missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestCompileInstanceMethodSoftDelete(t *testing.T) {
+	user := &ast.ModelDecl{Name: "User", Directives: []*ast.Directive{{Name: "soft"}}}
+	c := newCompiler(map[string]*ast.ModelDecl{"User": user})
+	c.vars["user"] = valType{isModel: true, name: "User"}
+	expr := &ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "delete"}}
+	if got := c.compileInstanceMethod(expr); !strings.Contains(got, ".SoftDelete(ctx)") {
+		t.Fatalf("soft delete call = %q", got)
+	}
+}
+
 func TestResolveQueryTypeFind(t *testing.T) {
 	models := map[string]*ast.ModelDecl{"Post": {Name: "Post"}}
 	c := newCompiler(models)

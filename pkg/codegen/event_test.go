@@ -30,6 +30,116 @@ func TestEventJSONFallbackTypes(t *testing.T) {
 	}
 }
 
+func TestEventObjectCollectionAndJSONRequirements(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Models: []*ast.ModelDecl{{Name: "User"}},
+		Types:  []*ast.TypeDecl{{Name: "Payload"}},
+	}}}
+	objects := collectEventObjectTypes(result)
+	if !objects["User"] || !objects["Payload"] {
+		t.Fatalf("event object types = %v", objects)
+	}
+	events := []*ast.EventDecl{{Params: []*ast.ParamDecl{{Name: "payload", Type: &ast.TypeRef{Name: "Payload"}}}}}
+	if !eventsUseObjects(events, objects) {
+		t.Fatal("type declarations must be treated as event objects")
+	}
+	if !eventsNeedJSON([]*ast.EventDecl{{Params: []*ast.ParamDecl{{Name: "unknown"}}}}, nil, nil) {
+		t.Fatal("an unresolved event parameter must retain the JSON fallback")
+	}
+}
+
+func TestEventScalarWriteStatements(t *testing.T) {
+	tests := []struct {
+		name, typeName, want string
+		isEnum               bool
+	}{
+		{name: "enum", typeName: "Role", isEnum: true, want: "enc.WriteString(string(value))"},
+		{name: "int", typeName: "Int", want: "enc.WriteInt(value)"},
+		{name: "float", typeName: "Float", want: "enc.WriteFloat(value)"},
+		{name: "string", typeName: "String", want: "enc.WriteString(value)"},
+		{name: "boolean", typeName: "Boolean", want: "enc.WriteBool(value)"},
+		{name: "datetime", typeName: "DateTime", want: "enc.WriteInt(value.Unix())"},
+		{name: "duration", typeName: "Duration", want: "enc.WriteInt(int64(value))"},
+		{name: "uuid", typeName: "UUID", want: "enc.WriteUUID([16]byte(value))"},
+		{name: "decimal", typeName: "Decimal", want: "enc.WriteString(value.String())"},
+		{name: "bytes", typeName: "Bytes", want: "enc.WriteBytes(value)"},
+		{name: "unknown", typeName: "Unknown", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := eventScalarWriteStatement(tt.typeName, "value", tt.isEnum); got != tt.want {
+				t.Fatalf("write statement = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEventScalarReadExpressions(t *testing.T) {
+	tests := []struct {
+		typeName string
+		isEnum   bool
+		want     string
+	}{
+		{typeName: "Int", want: "dec.ReadIntPtr()"},
+		{typeName: "Float", want: "dec.ReadFloatPtr()"},
+		{typeName: "String", want: "dec.ReadStringPtr()"},
+		{typeName: "Boolean", want: "dec.ReadBoolPtr()"},
+		{typeName: "Bytes", want: "dec.ReadBytesValuePtr()"},
+		{typeName: "JSON", want: "json.RawMessage"},
+		{typeName: "Duration", want: "time.Duration(*raw)"},
+		{typeName: "DateTime", want: "time.Unix(*raw, 0).UTC()"},
+		{typeName: "UUID", want: "uuid.UUID(*raw)"},
+		{typeName: "Role", isEnum: true, want: "Role(*raw)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.typeName, func(t *testing.T) {
+			got := eventScalarReadExpression(tt.typeName, tt.isEnum, true)
+			if !strings.Contains(got, tt.want) {
+				t.Fatalf("nullable read expression = %q, want %q", got, tt.want)
+			}
+		})
+	}
+	if got := eventScalarReadExpression("Role", true, false); got != "Role(dec.ReadString())" {
+		t.Fatalf("enum read expression = %q", got)
+	}
+	if got := eventScalarReadExpression("Bytes", false, false); got != "dec.ReadBytes()" {
+		t.Fatalf("bytes read expression = %q", got)
+	}
+	if got := eventScalarReadExpression("Unknown", false, false); got != "" {
+		t.Fatalf("unknown read expression = %q", got)
+	}
+}
+
+func TestEventCodecFallbackWriters(t *testing.T) {
+	old := eventFieldIDs
+	defer func() { eventFieldIDs = old }()
+	SetEventFieldIDs(map[string]map[string]int{"Changed": {"payload": 1}})
+	param := &ast.ParamDecl{Name: "payload", Type: &ast.TypeRef{Name: "External"}}
+	var b strings.Builder
+	writeEventMarshalField(&b, "Changed", param, false, false)
+	writeEventUnmarshalField(&b, "Changed", param, false, false)
+	writeEventListMarshal(&b, 2, "e.Payloads", "External", false, false)
+	writeEventListUnmarshal(&b, 2, "e.Payloads", "External", false, false)
+	for _, want := range []string{"json.Marshal(e.Payload)", "json.Unmarshal(dec.ReadBytes(), &e.Payload)", "json.Marshal(e.Payloads[i])", "json.Unmarshal(dec.ReadBytes(), &e.Payloads[i])"} {
+		if !strings.Contains(b.String(), want) {
+			t.Fatalf("fallback codec missing %q:\n%s", want, b.String())
+		}
+	}
+}
+
+func TestEventCodecNullableObjectAndDecimalWriters(t *testing.T) {
+	var b strings.Builder
+	writeEventObjectMarshal(&b, 1, "e.Payload", true)
+	writeEventObjectUnmarshal(&b, 1, "e.Payload", &ast.TypeRef{Name: "Payload", Nullable: true})
+	writeEventDecimalUnmarshal(&b, "e.Amount", true)
+	writeEventListUnmarshal(&b, 2, "e.Amounts", "Decimal", false, false)
+	for _, want := range []string{"e.Payload == nil", "enc.WritePresent()", "e.Payload = &Payload{}", "dec.ReadStringPtr()", "decimal.NewFromString(dec.ReadString())"} {
+		if !strings.Contains(b.String(), want) {
+			t.Fatalf("nullable/object codec missing %q:\n%s", want, b.String())
+		}
+	}
+}
+
 func TestGenerateEventFile(t *testing.T) {
 	result := &semantic.Result{
 		Files: []*ast.File{{

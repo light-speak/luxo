@@ -399,6 +399,37 @@ func TestBuildSchemaJSONUsesJSONWireTypeForStructuredParams(t *testing.T) {
 	}
 }
 
+func TestLuxoParamToSchemaTypeUsesJSONForStructuredValues(t *testing.T) {
+	if got := luxoParamToSchemaType("Payload", nil); got != "FieldJSON" {
+		t.Fatalf("structured parameter type = %q", got)
+	}
+	if got := luxoParamToSchemaType("Int", nil); got != "FieldInt" {
+		t.Fatalf("integer parameter type = %q", got)
+	}
+}
+
+func TestInferFederationForeignKeyUsesExplicitRemoteField(t *testing.T) {
+	field := &ast.FieldDecl{Directives: []*ast.Directive{{
+		Name: "by", Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "tenantId"}}},
+	}}}
+	if got := inferFederationForeignKey(&ast.ModelDecl{Name: "User"}, field); got != "tenantId" {
+		t.Fatalf("federation foreign key = %q", got)
+	}
+}
+
+func TestBuildSchemaJSONSkipsInvalidExtensionField(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/post.luxo",
+		Extends: []*ast.ExtendDecl{{
+			Name:   "User",
+			Fields: []*ast.FieldDecl{{Name: "invalid"}},
+		}},
+	}}}
+	if _, err := BuildSchemaJSON(result, nil); err != nil {
+		t.Fatalf("BuildSchemaJSON() error = %v", err)
+	}
+}
+
 func TestBuildSchemaJSONIncludesCompleteCRUDParams(t *testing.T) {
 	oldAPIIDs := apiIDs
 	oldParamIDs := apiParamIDs

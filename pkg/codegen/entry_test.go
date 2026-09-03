@@ -776,6 +776,32 @@ func TestEntryRegistersCrossModuleLoadEndpoints(t *testing.T) {
 	if !strings.Contains(code, "user_luxo.RegisterRemoteLoaders(gw.Router, userApp)") {
 		t.Errorf("entry did not register the named load endpoint:\n%s", code)
 	}
+	entries := GenerateModuleEntryFiles(result, "github.com/test")
+	userEntry := string(entries["user"])
+	if !strings.Contains(userEntry, "user_luxo.RegisterRemoteLoaders(gw.Router, app)") {
+		t.Errorf("user service did not register the named load endpoint:\n%s", userEntry)
+	}
+}
+
+func TestCollectModulesIgnoresPrimaryKeyLoadEndpoint(t *testing.T) {
+	load := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
+		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
+	}
+	result := &semantic.Result{Files: []*ast.File{
+		{
+			Name:   "origin/user.luxo",
+			Models: []*ast.ModelDecl{{Name: "User"}},
+			APIs: []*ast.ApiDecl{{
+				Name: "lookup",
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: load}}},
+			}},
+		},
+	}}
+	modules := collectModules(result)
+	if len(modules) != 1 || modules[0].hasRemoteLoad {
+		t.Fatalf("module flags = %#v", modules)
+	}
 }
 
 func TestCollectModulesHasSchema(t *testing.T) {

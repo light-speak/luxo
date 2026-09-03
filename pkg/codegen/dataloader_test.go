@@ -2,6 +2,7 @@ package codegen
 
 import (
 	"go/format"
+	"slices"
 	"strings"
 	"testing"
 
@@ -324,6 +325,27 @@ func TestAnalyzeRelationsUsesTargetPrimaryKeyName(t *testing.T) {
 	relation := relations[0]
 	if relation.Type != BelongsTo || relation.LocalKey != "productSku" || relation.RemoteKey != "sku" || relation.KeyGoType != "string" {
 		t.Fatalf("unexpected custom-primary-key relation: %+v", relation)
+	}
+}
+
+func TestAnalyzeRelationsByDefaultsToDeclaredPrimaryKey(t *testing.T) {
+	model := &ast.ModelDecl{
+		Name: "User",
+		Fields: []*ast.FieldDecl{
+			{Name: "uuid", Type: &ast.TypeRef{Name: "UUID"}, Directives: []*ast.Directive{{Name: "id"}}},
+			{
+				Name: "posts",
+				Type: &ast.TypeRef{Name: "Post", IsList: true},
+				Directives: []*ast.Directive{{
+					Name: "by",
+					Args: []*ast.NamedArg{{Name: "remote", Value: &ast.Ident{Name: "authorId"}}},
+				}},
+			},
+		},
+	}
+	relations := analyzeRelations(model, nil)
+	if len(relations) != 1 || relations[0].LocalKey != "uuid" || relations[0].RemoteKey != "authorId" {
+		t.Fatalf("relation = %+v", relations)
 	}
 }
 
@@ -982,6 +1004,94 @@ func TestGenerateDataLoaderRemoteNamedLoad(t *testing.T) {
 	}
 	if strings.Contains(code, `case "password":`) {
 		t.Errorf("remote mask exposed a field absent from extend:\n%s", code)
+	}
+}
+
+func TestGenerateRemoteCompositeNamedLoad(t *testing.T) {
+	oldContext := globalEventCtx
+	oldAPIs := apiIDs
+	oldParams := apiParamIDs
+	oldFields := modelFieldIDs
+	defer func() {
+		globalEventCtx = oldContext
+		apiIDs = oldAPIs
+		apiParamIDs = oldParams
+		modelFieldIDs = oldFields
+	}()
+	globalEventCtx = &EventContext{ModelModule: map[string]string{"Post": "post", "User": "user"}}
+	apiIDs = map[string]int{"svc:load:Post:tenantId:slug": 72}
+	apiParamIDs = map[string]map[string]int{
+		"svc:load:Post:tenantId:slug": {"tenantId": 1, "slug": 2},
+	}
+	modelFieldIDs = map[string]map[string]int{"Post": {"id": 1, "title": 2, "secret": 3}}
+	call := loadCallInfo{
+		modelName:    "Post",
+		sourceModule: "feed",
+		argNames:     []string{"tenantId", "slug"},
+		argTypes:     []string{"int64", "string"},
+		argTypeNames: []string{"Int", "String"},
+	}
+	var b strings.Builder
+	generateRemoteNamedLoadBatchFunc(&b, call, []string{"id", "title"})
+	out := b.String()
+	for _, want := range []string{
+		"keys []PostByTenantIdAndSlugKey",
+		"tenantIdKeys := make([]int64, len(keys))",
+		"slugKeys := make([]string, len(keys))",
+		"tenantIdKeys[i] = key.TenantId",
+		"enc.WriteFieldIntArray(1, tenantIdKeys)",
+		"enc.WriteFieldStringArray(2, slugKeys)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("remote composite loader missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, `case "secret":`) {
+		t.Fatalf("remote field mask exposed hidden field:\n%s", out)
+	}
+}
+
+func TestGenerateRemoteArrayEncodingUUID(t *testing.T) {
+	var b strings.Builder
+	generateRemoteArrayEncoding(&b, 7, "UUID", "keys")
+	out := b.String()
+	for _, want := range []string{
+		"keysRaw := make([][16]byte, len(keys))",
+		"for i, key := range keys { keysRaw[i] = [16]byte(key) }",
+		"enc.WriteFieldUUIDArray(7, keysRaw)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("UUID array encoding missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestGenerateRemoteLoadersKeepsLocalNamedLoadsLocal(t *testing.T) {
+	oldContext := globalEventCtx
+	defer func() { globalEventCtx = oldContext }()
+	globalEventCtx = &EventContext{ModelModule: map[string]string{"Post": "post"}}
+	call := loadCallInfo{
+		modelName:    "Post",
+		sourceModule: "post",
+		argNames:     []string{"slug"},
+		argTypes:     []string{"string"},
+		argTypeNames: []string{"String"},
+	}
+	var b strings.Builder
+	result := &semantic.Result{Files: []*ast.File{{Extends: []*ast.ExtendDecl{{Name: "User"}}}}}
+	generateRemoteLoaders(&b, result, nil, nil, []string{"User"}, []loadCallInfo{call})
+	if out := b.String(); !strings.Contains(out, `lux.NewStringField("slug").In(keys...)`) {
+		t.Fatalf("local named load did not use the database batch function:\n%s", out)
+	}
+}
+
+func TestExternalModelFieldNamesSkipsOtherExtensions(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{Extends: []*ast.ExtendDecl{
+		{Name: "Account", Fields: []*ast.FieldDecl{{Name: "name", Type: &ast.TypeRef{Name: "String"}}}},
+		{Name: "User", Fields: []*ast.FieldDecl{{Name: "email", Type: &ast.TypeRef{Name: "String"}}}},
+	}}}}
+	if got := externalModelFieldNames(result, "User"); !slices.Equal(got, []string{"id", "email"}) {
+		t.Fatalf("external fields = %v", got)
 	}
 }
 
