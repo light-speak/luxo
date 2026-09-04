@@ -228,17 +228,13 @@ func (a *Analyzer) resolvedExprType(expr ast.Expr) *ResolvedType {
 
 func (a *Analyzer) checkObjectExpr(e *ast.ObjectExpr, scope *Scope) *ResolvedType {
 	if e.TypeName == "" {
-		for _, f := range e.Fields {
-			a.checkExpr(f.Value, scope)
-		}
+		a.checkObjectExprValues(e.Fields, scope)
 		return nil
 	}
 
 	typ, ok := a.types[e.TypeName]
 	if !ok {
-		for _, f := range e.Fields {
-			a.checkExpr(f.Value, scope)
-		}
+		a.checkObjectExprValues(e.Fields, scope)
 		a.addErrorWithSuggestion(e.Pos, e.TypeName, "unknown type '%s' / 未知类型 '%s'", e.TypeName, e.TypeName)
 		return nil
 	}
@@ -251,23 +247,43 @@ func (a *Analyzer) checkObjectExpr(e *ast.ObjectExpr, scope *Scope) *ResolvedTyp
 	return typ.AsNonNull()
 }
 
+func (a *Analyzer) checkObjectExprValues(fields []*ast.NamedArg, scope *Scope) {
+	for _, field := range fields {
+		if field != nil {
+			a.checkExpr(field.Value, scope)
+		}
+	}
+}
+
 func (a *Analyzer) validateObjectExprFields(e *ast.ObjectExpr, typ *ResolvedType, scope *Scope) {
 	provided := make(map[string]bool, len(e.Fields))
 	for _, value := range e.Fields {
-		actual := a.checkExpr(value.Value, scope)
+		if value == nil {
+			a.addError(e.Pos, "object field entry requires a name and value / 对象字段项需要名称和值")
+			continue
+		}
+		pos := e.Pos
+		if value.Value != nil {
+			pos = value.Value.GetPos()
+		}
 		if provided[value.Name] {
-			a.addError(value.Value.GetPos(), "duplicate field '%s' in '%s' / '%s' 中字段 '%s' 重复", value.Name, typ.Name, typ.Name, value.Name)
+			a.addError(pos, "duplicate field '%s' in '%s' / '%s' 中字段 '%s' 重复", value.Name, typ.Name, typ.Name, value.Name)
 			continue
 		}
 		provided[value.Name] = true
+		if value.Value == nil {
+			a.addError(pos, "field '%s' requires a value / 字段 '%s' 需要值", value.Name, value.Name)
+			continue
+		}
 
+		actual := a.checkExpr(value.Value, scope)
 		field := typ.LookupField(value.Name)
 		if field == nil {
-			a.addFieldError(value.Value.GetPos(), typ, value.Name)
+			a.addFieldError(pos, typ, value.Name)
 			continue
 		}
 		if field.Type != nil && actual != nil && !isTypeAssignable(field.Type, actual) {
-			a.addError(value.Value.GetPos(), "field '%s' expects '%s', got '%s' / 字段 '%s' 需要 '%s'，得到 '%s'",
+			a.addError(pos, "field '%s' expects '%s', got '%s' / 字段 '%s' 需要 '%s'，得到 '%s'",
 				value.Name, formatResolvedType(field.Type), formatResolvedType(actual),
 				value.Name, formatResolvedType(field.Type), formatResolvedType(actual))
 		}

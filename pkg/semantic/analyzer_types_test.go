@@ -1473,6 +1473,17 @@ api test(): String {
 	expectError(t, result, "unknown type 'MissingResult'")
 }
 
+func TestObjectExprRecoveryToleratesNilFieldEntries(t *testing.T) {
+	for _, typeName := range []string{"", "MissingResult"} {
+		t.Run(typeName, func(t *testing.T) {
+			analyzer := newAnalyzer()
+			expr := &ast.ObjectExpr{TypeName: typeName, Fields: []*ast.NamedArg{nil}}
+
+			analyzer.checkObjectExpr(expr, analyzer.scope)
+		})
+	}
+}
+
 func TestObjectExprRejectsUnknownField(t *testing.T) {
 	result := analyze(t, `
 type ObjResult { value: String }
@@ -1491,6 +1502,33 @@ api test(): ObjResult {
 }
 `)
 	expectError(t, result, "duplicate field 'value'")
+}
+
+func TestObjectExprRejectsIncompleteFields(t *testing.T) {
+	analyzer := newAnalyzer()
+	typ := &ResolvedType{
+		Kind: TypeCustom,
+		Name: "ObjResult",
+		Fields: map[string]*FieldInfo{
+			"value": {Name: "value", Type: analyzer.types["String"]},
+		},
+	}
+	expr := &ast.ObjectExpr{Fields: []*ast.NamedArg{
+		nil,
+		{Name: "value"},
+	}}
+
+	analyzer.validateObjectExprFields(expr, typ, analyzer.scope)
+
+	if len(analyzer.errors) != 2 {
+		t.Fatalf("incomplete fields produced %d errors, want 2: %v", len(analyzer.errors), analyzer.errors)
+	}
+	if !strings.Contains(analyzer.errors[0].Message, "object field entry requires a name and value") {
+		t.Fatalf("nil field error = %q", analyzer.errors[0].Message)
+	}
+	if !strings.Contains(analyzer.errors[1].Message, "field 'value' requires a value") {
+		t.Fatalf("nil field value error = %q", analyzer.errors[1].Message)
+	}
 }
 
 func TestObjectExprRejectsFieldTypeMismatch(t *testing.T) {
