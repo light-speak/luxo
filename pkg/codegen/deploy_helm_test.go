@@ -96,6 +96,8 @@ func TestHelmValuesYAML_AllModulesListed(t *testing.T) {
 		"  post:",
 		"  comment:",
 		"database:",
+		"user: postgres",
+		"password: postgres",
 		"prefix: myapp",
 		"redis:",
 		"ingress:",

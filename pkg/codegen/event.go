@@ -15,6 +15,10 @@ import (
 // moduleName is used as the queue group for competing consumers.
 // Returns nil if there are no events.
 func generateEventFile(result *semantic.Result, packageName string) []byte {
+	return defaultGenerator().generateEventFile(result, packageName)
+}
+
+func (g *GeneratorContext) generateEventFile(result *semantic.Result, packageName string) []byte {
 	var events []*ast.EventDecl
 	var listeners []*ast.OnDecl
 
@@ -36,7 +40,7 @@ func generateEventFile(result *semantic.Result, packageName string) []byte {
 	var b strings.Builder
 	writeHeader(&b, packageName, "event.gen.go")
 
-	crossModuleImports := collectCrossModuleEventImports(result, listeners, currentModule)
+	crossModuleImports := g.collectCrossModuleEventImports(result, listeners, currentModule)
 	enums := CollectEnumsFromResult(result)
 	objects := collectEventObjectTypes(result)
 
@@ -84,14 +88,14 @@ func generateEventFile(result *semantic.Result, packageName string) []byte {
 	}
 	sort.Strings(modNames)
 	for _, modName := range modNames {
-		fmt.Fprintf(&b, "\t%s \"%s/%s/luxo\"\n", crossModuleImports[modName], globalEventCtx.ModulePath, modName)
+		fmt.Fprintf(&b, "\t%s \"%s/%s/luxo\"\n", crossModuleImports[modName], g.events.ModulePath, modName)
 	}
 	b.WriteString(")\n\n")
 
 	// Event structs + MarshalLuxo/UnmarshalLuxo
 	for _, e := range events {
 		generateEventStruct(&b, e)
-		generateEventCodec(&b, e, enums, objects)
+		g.generateEventCodec(&b, e, enums, objects)
 	}
 
 	// Emit functions — pass struct directly, zero serialization
@@ -110,7 +114,7 @@ func generateEventFile(result *semantic.Result, packageName string) []byte {
 	}
 
 	// RegisterEvents function — wires all on-listeners
-	generateRegisterEvents(&b, listeners, currentModule, currentModule, modelMap, enums)
+	g.generateRegisterEvents(&b, listeners, currentModule, currentModule, modelMap, enums)
 
 	// Generate Unmarshal functions for LOCAL events (exported for cross-module use)
 	for _, e := range events {
@@ -200,7 +204,7 @@ func generateEventStruct(b *strings.Builder, e *ast.EventDecl) {
 
 // generateEventCodec generates MarshalLuxo/UnmarshalLuxo for binary encoding.
 // Field IDs come from luxo.lock (stable across schema evolution).
-func generateEventCodec(b *strings.Builder, e *ast.EventDecl, enums, objects map[string]bool) {
+func (g *GeneratorContext) generateEventCodec(b *strings.Builder, e *ast.EventDecl, enums, objects map[string]bool) {
 	typeName := e.Name + "Event"
 
 	// MarshalLuxo
@@ -208,7 +212,7 @@ func generateEventCodec(b *strings.Builder, e *ast.EventDecl, enums, objects map
 	fmt.Fprintf(b, "func (e %s) MarshalLuxo() []byte {\n", typeName)
 	b.WriteString("\tvar enc codec.Encoder\n")
 	for _, p := range e.Params {
-		writeEventMarshalField(b, e.Name, p, enums[p.Type.Name], objects[p.Type.Name])
+		g.writeEventMarshalField(b, e.Name, p, enums[p.Type.Name], objects[p.Type.Name])
 	}
 	b.WriteString("\tenc.WriteEnd()\n")
 	b.WriteString("\treturn enc.Bytes()\n")
@@ -218,7 +222,7 @@ func generateEventCodec(b *strings.Builder, e *ast.EventDecl, enums, objects map
 	fmt.Fprintf(b, "// UnmarshalLuxo decodes %s from Luxo binary format.\n", typeName)
 	fmt.Fprintf(b, "func (e *%s) UnmarshalLuxo(data []byte) error {\n", typeName)
 	for _, p := range e.Params {
-		if p.Type != nil && !p.Type.Nullable && getEventFieldID(e.Name, p.Name) != 0 {
+		if p.Type != nil && !p.Type.Nullable && g.eventFieldID(e.Name, p.Name) != 0 {
 			fmt.Fprintf(b, "\tvar seen%s bool\n", str.Capitalize(p.Name))
 		}
 	}
@@ -226,8 +230,8 @@ func generateEventCodec(b *strings.Builder, e *ast.EventDecl, enums, objects map
 	b.WriteString("\tfor dec.NextField() {\n")
 	b.WriteString("\t\tswitch dec.FieldID() {\n")
 	for _, p := range e.Params {
-		writeEventUnmarshalField(b, e.Name, p, enums[p.Type.Name], objects[p.Type.Name])
-		if p.Type != nil && !p.Type.Nullable && getEventFieldID(e.Name, p.Name) != 0 {
+		g.writeEventUnmarshalField(b, e.Name, p, enums[p.Type.Name], objects[p.Type.Name])
+		if p.Type != nil && !p.Type.Nullable && g.eventFieldID(e.Name, p.Name) != 0 {
 			fmt.Fprintf(b, "\t\t\tseen%s = true\n", str.Capitalize(p.Name))
 		}
 	}
@@ -236,7 +240,7 @@ func generateEventCodec(b *strings.Builder, e *ast.EventDecl, enums, objects map
 	b.WriteString("\t}\n")
 	b.WriteString("\tif err := dec.Err(); err != nil { return err }\n")
 	for _, p := range e.Params {
-		if p.Type != nil && !p.Type.Nullable && getEventFieldID(e.Name, p.Name) != 0 {
+		if p.Type != nil && !p.Type.Nullable && g.eventFieldID(e.Name, p.Name) != 0 {
 			fmt.Fprintf(b, "\tif !seen%s { return fmt.Errorf(%q) }\n", str.Capitalize(p.Name), "event "+e.Name+": missing required field "+p.Name)
 		}
 	}
@@ -244,8 +248,8 @@ func generateEventCodec(b *strings.Builder, e *ast.EventDecl, enums, objects map
 	b.WriteString("}\n\n")
 }
 
-func writeEventMarshalField(b *strings.Builder, eventName string, param *ast.ParamDecl, isEnum, isObject bool) {
-	fieldID := getEventFieldID(eventName, param.Name)
+func (g *GeneratorContext) writeEventMarshalField(b *strings.Builder, eventName string, param *ast.ParamDecl, isEnum, isObject bool) {
+	fieldID := g.eventFieldID(eventName, param.Name)
 	if fieldID == 0 || param.Type == nil {
 		return
 	}
@@ -345,8 +349,8 @@ func writeEventObjectValue(b *strings.Builder, value, indent string) {
 	fmt.Fprintf(b, "%sapi.PutBuf(buf)\n", indent)
 }
 
-func writeEventUnmarshalField(b *strings.Builder, eventName string, param *ast.ParamDecl, isEnum, isObject bool) {
-	fieldID := getEventFieldID(eventName, param.Name)
+func (g *GeneratorContext) writeEventUnmarshalField(b *strings.Builder, eventName string, param *ast.ParamDecl, isEnum, isObject bool) {
+	fieldID := g.eventFieldID(eventName, param.Name)
 	if fieldID == 0 || param.Type == nil {
 		return
 	}
@@ -499,7 +503,7 @@ func generateEmitFunc(b *strings.Builder, e *ast.EventDecl) {
 // Default uses OnQueueDecode with moduleName as the queue group (competing consumers).
 // Listeners with @broadcast use OnDecode (every instance receives).
 // Unmarshal uses Luxo binary (UnmarshalLuxo) for wire decoding.
-func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleName string, currentModule string, models map[string]*ast.ModelDecl, enums map[string]bool) {
+func (g *GeneratorContext) generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleName string, currentModule string, models map[string]*ast.ModelDecl, enums map[string]bool) {
 	if len(listeners) == 0 {
 		b.WriteString("// RegisterEvents — no listeners in this module.\n")
 		b.WriteString("func RegisterEvents(bus event.Bus, app *App) {}\n\n")
@@ -517,8 +521,8 @@ func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleN
 		// Check if event is cross-module
 		eventTypePrefix := ""
 		unmarshalFunc := fmt.Sprintf("Unmarshal%s", l.EventName)
-		if globalEventCtx != nil {
-			evModule := globalEventCtx.EventModule[l.EventName]
+		if g.events != nil {
+			evModule := g.events.EventModule[l.EventName]
 			if evModule != "" && evModule != currentModule {
 				eventTypePrefix = evModule + "_luxo."
 				unmarshalFunc = evModule + "_luxo.Unmarshal" + l.EventName
@@ -533,11 +537,12 @@ func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleN
 		// Compile on-handler body if present
 		if l.Body != nil && len(l.Body.Stmts) > 0 {
 			c := &compiler{
-				b:      b,
-				indent: "\t\t",
-				models: models,
-				enums:  enums,
-				vars:   make(map[string]valType),
+				generator: g,
+				b:         b,
+				indent:    "\t\t",
+				models:    models,
+				enums:     enums,
+				vars:      make(map[string]valType),
 			}
 			// Register event param as a known variable so event.field compiles correctly
 			c.vars[paramName] = valType{name: l.EventName + "Event"}
@@ -558,13 +563,13 @@ func generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleN
 }
 
 // collectCrossModuleEventImports finds which event modules need to be imported.
-func collectCrossModuleEventImports(result *semantic.Result, listeners []*ast.OnDecl, currentModule string) map[string]string {
+func (g *GeneratorContext) collectCrossModuleEventImports(result *semantic.Result, listeners []*ast.OnDecl, currentModule string) map[string]string {
 	imports := make(map[string]string)
-	if globalEventCtx == nil {
+	if g.events == nil {
 		return imports
 	}
 	for _, l := range listeners {
-		evModule := globalEventCtx.EventModule[l.EventName]
+		evModule := g.events.EventModule[l.EventName]
 		if evModule != "" && evModule != currentModule {
 			imports[evModule] = evModule + "_luxo"
 		}
@@ -576,7 +581,7 @@ func collectCrossModuleEventImports(result *semantic.Result, listeners []*ast.On
 			}
 			for _, stmt := range api.Body.Stmts {
 				if emit, ok := stmt.(*ast.EmitStmt); ok {
-					evModule := globalEventCtx.EventModule[emit.EventName]
+					evModule := g.events.EventModule[emit.EventName]
 					if evModule != "" && evModule != currentModule {
 						imports[evModule] = evModule + "_luxo"
 					}

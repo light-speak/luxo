@@ -140,7 +140,7 @@ func TestDirectiveCorrectContextApi(t *testing.T) {
 
 func TestDirectiveCorrectContextFn(t *testing.T) {
 	// @native on fn (correct)
-	result := analyze(t, `fn encrypt(value: String): String @native`)
+	result := analyze(t, `fn encrypt(value: String): Result<String> @native`)
 	expectNoErrors(t, result)
 }
 
@@ -152,7 +152,7 @@ func TestDirectiveCorrectContextMiddleware(t *testing.T) {
 
 func TestDirectiveFnAuth(t *testing.T) {
 	// @auth on fn (correct — allowed on fn)
-	result := analyze(t, `fn secureOp(): Int @auth @native`)
+	result := analyze(t, `fn secureOp(): Result<Int> @auth @native`)
 	expectNoErrors(t, result)
 }
 
@@ -543,7 +543,23 @@ func TestDirectiveCacheTtl(t *testing.T) {
 
 func TestDirectiveRateLimit(t *testing.T) {
 	result := analyze(t, `api limited(): Int @rateLimit(max: 100, window: 1m)`)
-	expectError(t, result, "unknown directive '@rateLimit'")
+	expectNoErrors(t, result)
+}
+
+func TestDirectiveRateLimitRejectsInvalidConfiguration(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{`api limited(): Int @rateLimit(max: 0, window: 1m)`, "positive integer"},
+		{`api limited(): Int @rateLimit(max: 100, window: 0s)`, "positive duration"},
+		{`api limited(): Int @rateLimit(max: "100", window: 1m)`, "positive integer"},
+		{`api limited(): Int @rateLimit(max: 100, window: "1m")`, "positive duration"},
+	}
+	for _, tt := range tests {
+		result := analyze(t, tt.input)
+		expectError(t, result, tt.want)
+	}
 }
 
 func TestDirectiveIndexFields(t *testing.T) {

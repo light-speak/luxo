@@ -52,89 +52,6 @@ func (d DBDriver) DriverPkg() string {
 	}
 }
 
-// dbPkg is the short package name for the database driver (pg/mysql/sqlite/mongo).
-// Set by Generate(), used by all codegen functions to emit correct package references.
-var dbPkg = "pg"
-
-// eventFieldIDs maps event_name → param_name → stable field ID from luxo.lock.
-var eventFieldIDs map[string]map[string]int
-
-// modelFieldIDs maps model_name → field_name → stable field ID from luxo.lock.
-var modelFieldIDs map[string]map[string]int
-
-// apiIDs maps api_name → stable API ID from luxo.lock.
-var apiIDs map[string]int
-
-// apiParamIDs maps api_name → param_name → stable field ID from luxo.lock.
-var apiParamIDs map[string]map[string]int
-
-// apiParamTypes maps api_name → param_name → Luxo type name (from AST).
-// Set by SetAPIParamTypes, used by RegisterParams codegen for accurate binary metadata.
-var apiParamTypes map[string]map[string]string
-
-// SetAPIParamTypes sets the API param type map from AST analysis.
-func SetAPIParamTypes(types map[string]map[string]string) {
-	apiParamTypes = types
-}
-
-// SetAPIIDs sets the API ID map from lock file data.
-func SetAPIIDs(ids map[string]int) {
-	apiIDs = ids
-}
-
-// SetAPIParamIDs sets the API param field ID map from lock file data.
-func SetAPIParamIDs(ids map[string]map[string]int) {
-	apiParamIDs = ids
-}
-
-// getAPIID returns the stable API ID, or 0 if not found.
-func getAPIID(name string) int {
-	if apiIDs == nil {
-		return 0
-	}
-	return apiIDs[name]
-}
-
-// getAPIParamIDs returns param field IDs for an API, or nil.
-func getAPIParamIDs(name string) map[string]int {
-	if apiParamIDs == nil {
-		return nil
-	}
-	return apiParamIDs[name]
-}
-
-// SetEventFieldIDs sets the event field ID map from lock file data.
-func SetEventFieldIDs(ids map[string]map[string]int) {
-	eventFieldIDs = ids
-}
-
-// SetModelFieldIDs sets the model field ID map from lock file data.
-func SetModelFieldIDs(ids map[string]map[string]int) {
-	modelFieldIDs = ids
-}
-
-// getModelFieldID returns the stable field ID for a model field, or 0 if not found.
-func getModelFieldID(modelName, fieldName string) int {
-	if modelFieldIDs == nil {
-		return 0
-	}
-	if m, ok := modelFieldIDs[modelName]; ok {
-		return m[fieldName]
-	}
-	return 0
-}
-
-// getEventFieldID returns the stable field ID for an event param, or 0 if not found.
-func getEventFieldID(eventName, paramName string) int {
-	if eventFieldIDs == nil {
-		return 0
-	}
-	if m, ok := eventFieldIDs[eventName]; ok {
-		return m[paramName]
-	}
-	return 0
-}
-
 // Generate produces Go source files from semantic analysis result.
 // EventContext holds cross-module event information for codegen.
 // Built once from all modules, passed to each module's Generate call.
@@ -229,10 +146,6 @@ func BuildEventContext(allFiles []*ast.File, modulePath string) *EventContext {
 	return ctx
 }
 
-func ownerModelHasField(modelName, fieldName string) bool {
-	return globalEventCtx != nil && globalEventCtx.ModelFields[modelName][fieldName]
-}
-
 func modelIDTypeName(model *ast.ModelDecl) string {
 	if field := primaryKeyField(model); field != nil {
 		return field.Type.Name
@@ -240,55 +153,39 @@ func modelIDTypeName(model *ast.ModelDecl) string {
 	return "Int"
 }
 
-func externalModelIDFieldName(modelName string) string {
-	if globalEventCtx != nil {
-		if fieldName := globalEventCtx.ModelIDField[modelName]; fieldName != "" {
-			return fieldName
-		}
-	}
-	return "id"
-}
-
-func externalModelIDTypeName(modelName string) string {
-	if globalEventCtx != nil {
-		if typeName := globalEventCtx.ModelIDType[modelName]; typeName != "" {
-			return typeName
-		}
-	}
-	return "Int"
-}
-
-// Global event context — set before Generate calls for cross-module event support
-var globalEventCtx *EventContext
-
-// SetEventContext sets the global event context for cross-module event codegen.
-func SetEventContext(ctx *EventContext) {
-	globalEventCtx = ctx
-}
-
-func Generate(result *semantic.Result, packageName string, driver DBDriver, softModels ...map[string]bool) *GenerateResult {
-	dbPkg = driver.DriverPkg()
-	gr := &GenerateResult{
-		Files: make(map[string][]byte),
-	}
-	enums := collectEnums(result)
-
-	gr.Files["model.gen.go"] = generateModelFile(result, packageName, enums)
-
-	if dbSrc := generateDBFile(result, packageName, enums, driver); dbSrc != nil {
-		gr.Files["db.gen.go"] = dbSrc
-	}
-	if appSrc := generateAppFile(result, packageName, enums, driver); appSrc != nil {
-		gr.Files["app.gen.go"] = appSrc
+// Generate creates a generator for one compilation and returns every generated
+// source file. Callers that need stable wire IDs or cross-module metadata should
+// construct a GeneratorContext with NewGenerator and call its Generate method.
+func Generate(result *semantic.Result, packageName string, driver DBDriver, softModels ...map[string]bool) (*GenerateResult, error) {
+	generator, err := NewGenerator(GeneratorConfig{Driver: driver})
+	if err != nil {
+		return nil, err
 	}
 	var soft map[string]bool
 	if len(softModels) > 0 {
 		soft = softModels[0]
 	}
-	if dlSrc := generateDataLoaderFile(result, packageName, enums, soft, driver); dlSrc != nil {
+	return generator.Generate(result, packageName, soft)
+}
+
+func (g *GeneratorContext) Generate(result *semantic.Result, packageName string, softModels map[string]bool) (*GenerateResult, error) {
+	gr := &GenerateResult{
+		Files: make(map[string][]byte),
+	}
+	enums := collectEnums(result)
+
+	gr.Files["model.gen.go"] = g.generateModelFile(result, packageName, enums)
+
+	if dbSrc := g.generateDBFile(result, packageName, enums); dbSrc != nil {
+		gr.Files["db.gen.go"] = dbSrc
+	}
+	if appSrc := generateAppFile(result, packageName, enums, g.driver); appSrc != nil {
+		gr.Files["app.gen.go"] = appSrc
+	}
+	if dlSrc := g.generateDataLoaderFile(result, packageName, enums, softModels); dlSrc != nil {
 		gr.Files["dataloader.gen.go"] = dlSrc
 	}
-	if handlerSrc := generateHandlerFile(result, packageName, enums); handlerSrc != nil {
+	if handlerSrc := g.generateHandlerFile(result, packageName, enums); handlerSrc != nil {
 		gr.Files["handler.gen.go"] = handlerSrc
 	}
 	if nativeSrc := GenerateNativeFile(result, packageName); nativeSrc != nil {
@@ -296,10 +193,10 @@ func Generate(result *semantic.Result, packageName string, driver DBDriver, soft
 	}
 
 	// event.gen.go — typed event structs + emit functions + listener registration
-	if eventSrc := generateEventFile(result, packageName); eventSrc != nil {
+	if eventSrc := g.generateEventFile(result, packageName); eventSrc != nil {
 		gr.Files["event.gen.go"] = eventSrc
 	}
-	if streamSrc := generateStreamFile(result, packageName); streamSrc != nil {
+	if streamSrc := g.generateStreamFile(result, packageName); streamSrc != nil {
 		gr.Files["stream.gen.go"] = streamSrc
 	}
 
@@ -309,19 +206,23 @@ func Generate(result *semantic.Result, packageName string, driver DBDriver, soft
 	}
 
 	// writejson.gen.go — per-model WriteLuxo + ReadLuxo + WriteColumnar for binary serialization
-	if wjSrc := generateWriteJSONFile(result, packageName, enums); wjSrc != nil {
+	if wjSrc := g.generateWriteJSONFile(result, packageName, enums); wjSrc != nil {
 		gr.Files["writejson.gen.go"] = wjSrc
 	}
 
 	// schema.gen.go — model/API metadata for Luvia schema-driven Binary↔JSON conversion
-	if schemaSrc := generateSchemaFile(result, packageName, enums); schemaSrc != nil {
+	if schemaSrc := g.generateSchemaFile(result, packageName, enums); schemaSrc != nil {
 		gr.Files["schema.gen.go"] = schemaSrc
 	}
 
 	for name, src := range gr.Files {
-		gr.Files[name] = formatGenerated(src)
+		formatted, err := formatGeneratedChecked(src)
+		if err != nil {
+			return nil, fmt.Errorf("format %s: %w", name, err)
+		}
+		gr.Files[name] = formatted
 	}
-	return gr
+	return gr, nil
 }
 
 // formatGenerated runs gofmt (go/format) on generated Go source so emitted
@@ -330,19 +231,31 @@ func Generate(result *semantic.Result, packageName string, driver DBDriver, soft
 // the raw source is returned so the compiler surfaces the real error with
 // meaningful line numbers instead of a swallowed formatting failure.
 func formatGenerated(src []byte) []byte {
-	formatted, err := format.Source(src)
+	formatted, err := formatGeneratedChecked(src)
 	if err != nil {
 		return src
 	}
 	return formatted
 }
 
+func formatGeneratedChecked(src []byte) ([]byte, error) {
+	formatted, err := format.Source(src)
+	if err != nil {
+		return nil, err
+	}
+	return formatted, nil
+}
+
 // generateModelFile produces the model.gen.go file containing enums and structs.
 func generateModelFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
+	return defaultGenerator().generateModelFile(result, packageName, enums)
+}
+
+func (g *GeneratorContext) generateModelFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
 	var b strings.Builder
 
 	writeHeader(&b, packageName, "model.gen.go")
-	writeImports(&b, result.Files)
+	g.writeImports(&b, result.Files)
 
 	// enums first (structs may reference them)
 	for _, file := range result.Files {
@@ -367,7 +280,7 @@ func generateModelFile(result *semantic.Result, packageName string, enums map[st
 				continue
 			}
 			extendDone[ext.Name] = true
-			generateExtendStub(&b, ext)
+			g.generateExtendStub(&b, ext)
 			b.WriteByte('\n')
 		}
 	}
@@ -426,6 +339,10 @@ func scanModelFieldImports(f *ast.FieldDecl, needs *modelImportNeeds) {
 
 // writeImports writes import block for model.gen.go.
 func writeImports(b *strings.Builder, files []*ast.File) {
+	defaultGenerator().writeImports(b, files)
+}
+
+func (g *GeneratorContext) writeImports(b *strings.Builder, files []*ast.File) {
 	var needs modelImportNeeds
 	for _, file := range files {
 		for _, m := range file.Models {
@@ -449,7 +366,7 @@ func writeImports(b *strings.Builder, files []*ast.File) {
 			}
 		}
 		for _, ext := range file.Extends {
-			switch externalModelIDTypeName(ext.Name) {
+			switch g.externalModelIDTypeName(ext.Name) {
 			case "UUID":
 				needs.uuid = true
 			}
@@ -490,7 +407,7 @@ func writeImports(b *strings.Builder, files []*ast.File) {
 
 // generateDBFile produces the db.gen.go file containing query builders.
 // Returns nil if there are no models.
-func generateDBFile(result *semantic.Result, packageName string, enums map[string]bool, driver DBDriver) []byte {
+func (g *GeneratorContext) generateDBFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
 	hasModels := false
 	for _, file := range result.Files {
 		if len(file.Models) > 0 {
@@ -505,7 +422,7 @@ func generateDBFile(result *semantic.Result, packageName string, enums map[strin
 	var b strings.Builder
 
 	writeHeader(&b, packageName, "db.gen.go")
-	writeDBImports(&b, result.Files)
+	g.writeDBImports(&b, result.Files)
 
 	// Collect model names to skip generating scanners for models that already exist
 	modelNames := make(map[string]bool)
@@ -515,7 +432,7 @@ func generateDBFile(result *semantic.Result, packageName string, enums map[strin
 		}
 	}
 
-	generateExtendScanners(&b, result.Files, modelNames)
+	g.generateExtendScanners(&b, result.Files, modelNames)
 
 	for _, file := range result.Files {
 		for _, m := range file.Models {
@@ -743,6 +660,10 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 
 // writeDBImports writes import block for db.gen.go.
 func writeDBImports(b *strings.Builder, files []*ast.File) {
+	defaultGenerator().writeDBImports(b, files)
+}
+
+func (g *GeneratorContext) writeDBImports(b *strings.Builder, files []*ast.File) {
 	var needs dbImportNeeds
 	for _, file := range files {
 		for _, m := range file.Models {
@@ -762,7 +683,7 @@ func writeDBImports(b *strings.Builder, files []*ast.File) {
 		b.WriteString("\t\"time\"\n")
 	}
 	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux\"\n")
-	fmt.Fprintf(b, "\tpg %q\n", DBDriver(dbPkg).DriverImport())
+	fmt.Fprintf(b, "\tpg %q\n", g.driver.DriverImport())
 	if needs.uuid {
 		b.WriteString("\n\t\"github.com/google/uuid\"\n")
 	}
@@ -774,7 +695,7 @@ func writeDBImports(b *strings.Builder, files []*ast.File) {
 
 // generateExtendScanners generates scanners for extend models (Id + data fields only).
 // Used by embedded mode DataLoader to scan DB rows for cross-module models.
-func generateExtendScanners(b *strings.Builder, files []*ast.File, modelNames map[string]bool) {
+func (g *GeneratorContext) generateExtendScanners(b *strings.Builder, files []*ast.File, modelNames map[string]bool) {
 	seen := make(map[string]bool)
 	for _, file := range files {
 		for _, ext := range file.Extends {
@@ -782,8 +703,8 @@ func generateExtendScanners(b *strings.Builder, files []*ast.File, modelNames ma
 				continue
 			}
 			seen[ext.Name] = true
-			idFieldName := externalModelIDFieldName(ext.Name)
-			fields := []*ast.FieldDecl{{Name: idFieldName, Type: &ast.TypeRef{Name: externalModelIDTypeName(ext.Name)}, Directives: []*ast.Directive{{Name: "id"}}}}
+			idFieldName := g.externalModelIDFieldName(ext.Name)
+			fields := []*ast.FieldDecl{{Name: idFieldName, Type: &ast.TypeRef{Name: g.externalModelIDTypeName(ext.Name)}, Directives: []*ast.Directive{{Name: "id"}}}}
 			for _, f := range ext.Fields {
 				if f.Name == idFieldName || f.Computed != nil || f.Type == nil || f.Type.IsList {
 					continue

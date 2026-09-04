@@ -159,9 +159,12 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 
 	writeEntryModuleImports(&b, modules, modulePath)
 	anyEvents, anyServiceFns := entryCapabilities(modules)
+	anyLoaders := modulesNeedLoaders(modules)
 
 	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux\"\n")
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/dataloader\"\n")
+	if anyLoaders {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/dataloader\"\n")
+	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/env\"\n")
 	if anyEvents {
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/event\"\n")
@@ -179,27 +182,12 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 
 	b.WriteString("func main() {\n")
 	b.WriteString("\tctx := context.Background()\n\n")
-	b.WriteString("\tif err := env.Load(\".env\"); err != nil {\n")
-	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"warning: %v\\n\", err)\n")
+	b.WriteString("\tif err := env.Load(\".env\"); err != nil && !os.IsNotExist(err) {\n")
+	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"fatal: load .env: %v\\n\", err)\n")
+	b.WriteString("\t\tos.Exit(1)\n")
 	b.WriteString("\t}\n\n")
 
-	// Database initialization: create database + run migrations
-	b.WriteString("\tif env.GetOrDefault(\"AUTO_MIGRATE\", \"true\") == \"true\" {\n")
-	b.WriteString("\t\tif err := migrate.EnsureDatabase(ctx); err != nil {\n")
-	b.WriteString("\t\t\tfmt.Fprintf(os.Stderr, \"ensure db: %v\\n\", err)\n")
-	b.WriteString("\t\t}\n")
-	b.WriteString("\t\tmigrator, err := migrate.New(ctx, \"migrations\")\n")
-	b.WriteString("\t\tif err != nil {\n")
-	b.WriteString("\t\t\tfmt.Fprintf(os.Stderr, \"migrate: %v\\n\", err)\n")
-	b.WriteString("\t\t} else {\n")
-	b.WriteString("\t\t\tif applied, err := migrator.Up(ctx); err != nil {\n")
-	b.WriteString("\t\t\t\tfmt.Fprintf(os.Stderr, \"migrate: %v\\n\", err)\n")
-	b.WriteString("\t\t\t} else if len(applied) > 0 {\n")
-	b.WriteString("\t\t\t\tfmt.Fprintf(os.Stderr, \"migrate: applied %d migration(s)\\n\", len(applied))\n")
-	b.WriteString("\t\t\t}\n")
-	b.WriteString("\t\t\tmigrator.Close()\n")
-	b.WriteString("\t\t}\n")
-	b.WriteString("\t}\n\n")
+	writeAutoMigration(&b)
 
 	writeModuleApps(&b, modules)
 	writeDataLoaderWiring(&b, modules)
@@ -218,6 +206,44 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("}\n")
 
 	return formatGenerated([]byte(b.String()))
+}
+
+// GenerateEntryFileChecked generates and validates the embedded entry point.
+func GenerateEntryFileChecked(result *semantic.Result, modulePath string) ([]byte, error) {
+	source := GenerateEntryFile(result, modulePath)
+	if source == nil {
+		return nil, nil
+	}
+	return formatGeneratedChecked(source)
+}
+
+func writeAutoMigration(b *strings.Builder) {
+	b.WriteString("\tautoMigrate := env.GetOrDefault(\"AUTO_MIGRATE\", \"true\")\n")
+	b.WriteString("\tif autoMigrate != \"true\" && autoMigrate != \"false\" {\n")
+	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"fatal: AUTO_MIGRATE must be true or false, got %q\\n\", autoMigrate)\n")
+	b.WriteString("\t\tos.Exit(1)\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\tif autoMigrate == \"true\" {\n")
+	b.WriteString("\t\tif err := migrate.EnsureDatabase(ctx); err != nil {\n")
+	b.WriteString("\t\t\tfmt.Fprintf(os.Stderr, \"fatal: ensure db: %v\\n\", err)\n")
+	b.WriteString("\t\t\tos.Exit(1)\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t\tmigrator, err := migrate.New(ctx, \"migrations\")\n")
+	b.WriteString("\t\tif err != nil {\n")
+	b.WriteString("\t\t\tfmt.Fprintf(os.Stderr, \"fatal: migrate: %v\\n\", err)\n")
+	b.WriteString("\t\t\tos.Exit(1)\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t\tapplied, err := migrator.Up(ctx)\n")
+	b.WriteString("\t\tif err != nil {\n")
+	b.WriteString("\t\t\tmigrator.Close()\n")
+	b.WriteString("\t\t\tfmt.Fprintf(os.Stderr, \"fatal: migrate: %v\\n\", err)\n")
+	b.WriteString("\t\t\tos.Exit(1)\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t\tif len(applied) > 0 {\n")
+	b.WriteString("\t\t\tfmt.Fprintf(os.Stderr, \"migrate: applied %d migration(s)\\n\", len(applied))\n")
+	b.WriteString("\t\t}\n")
+	b.WriteString("\t\tmigrator.Close()\n")
+	b.WriteString("\t}\n\n")
 }
 
 func writeEntryModuleImports(b *strings.Builder, modules []moduleInfo, modulePath string) {
@@ -321,8 +347,16 @@ func writeModuleApps(b *strings.Builder, modules []moduleInfo) {
 }
 
 func writeDataLoaderWiring(b *strings.Builder, modules []moduleInfo) {
-	b.WriteString("\tdlCfg := dataloader.DefaultConfig()\n")
-	b.WriteString("\tdeployMode := env.GetOrDefault(\"DEPLOY_MODE\", \"embedded\")\n\n")
+	b.WriteString("\tdeployMode := env.GetOrDefault(\"DEPLOY_MODE\", \"embedded\")\n")
+	b.WriteString("\tif deployMode != \"embedded\" && deployMode != \"cluster\" {\n")
+	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"fatal: DEPLOY_MODE must be embedded or cluster, got %q\\n\", deployMode)\n")
+	b.WriteString("\t\tos.Exit(1)\n")
+	b.WriteString("\t}\n")
+	if !modulesNeedLoaders(modules) {
+		b.WriteString("\n")
+		return
+	}
+	b.WriteString("\tdlCfg := dataloader.DefaultConfig()\n\n")
 
 	// Check if any module has cross-module extends (needs remote loaders in cluster mode)
 	hasRemote := false
@@ -371,7 +405,16 @@ func writeDataLoaderWiring(b *strings.Builder, modules []moduleInfo) {
 		}
 	}
 
-	b.WriteString("\t_ = deployMode\n\n")
+	b.WriteString("\n")
+}
+
+func modulesNeedLoaders(modules []moduleInfo) bool {
+	for _, module := range modules {
+		if module.hasLoaders {
+			return true
+		}
+	}
+	return false
 }
 
 func writeEventBusWiring(b *strings.Builder, modules []moduleInfo) {
@@ -418,6 +461,19 @@ func GenerateModuleEntryFiles(result *semantic.Result, modulePath string) map[st
 	return entries
 }
 
+// GenerateModuleEntryFilesChecked generates and validates every cluster entry point.
+func GenerateModuleEntryFilesChecked(result *semantic.Result, modulePath string) (map[string][]byte, error) {
+	entries := GenerateModuleEntryFiles(result, modulePath)
+	for name, source := range entries {
+		formatted, err := formatGeneratedChecked(source)
+		if err != nil {
+			return nil, fmt.Errorf("format module entry %s: %w", name, err)
+		}
+		entries[name] = formatted
+	}
+	return entries, nil
+}
+
 // generateSingleModuleEntry generates a standalone entry point for one module.
 // Imports only this module. Cross-module DataLoaders use RPC clients.
 func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, result *semantic.Result, modulePath string) []byte {
@@ -452,8 +508,9 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 
 	b.WriteString("func main() {\n")
 	b.WriteString("\tctx := context.Background()\n\n")
-	b.WriteString("\tif err := env.Load(\".env\"); err != nil {\n")
-	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"warning: %v\\n\", err)\n")
+	b.WriteString("\tif err := env.Load(\".env\"); err != nil && !os.IsNotExist(err) {\n")
+	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"fatal: load .env: %v\\n\", err)\n")
+	b.WriteString("\t\tos.Exit(1)\n")
 	b.WriteString("\t}\n\n")
 
 	// Cluster mode: DB name = PROJECT_MODULE (e.g., wechat_user)
@@ -461,23 +518,7 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 	fmt.Fprintf(&b, "\t\tos.Setenv(\"DATABASE_PREFIX\", prefix+\"_%s\")\n", target.name)
 	fmt.Fprintf(&b, "\t}\n\n")
 
-	// Auto-migrate on startup (create database if not exists + run migrations)
-	b.WriteString("\tif env.GetOrDefault(\"AUTO_MIGRATE\", \"true\") == \"true\" {\n")
-	b.WriteString("\t\tif err := migrate.EnsureDatabase(ctx); err != nil {\n")
-	b.WriteString("\t\t\tfmt.Fprintf(os.Stderr, \"ensure db: %v\\n\", err)\n")
-	b.WriteString("\t\t}\n")
-	b.WriteString("\t\tmigrator, err := migrate.New(ctx, \"migrations\")\n")
-	b.WriteString("\t\tif err != nil {\n")
-	b.WriteString("\t\t\tfmt.Fprintf(os.Stderr, \"migrate: %v\\n\", err)\n")
-	b.WriteString("\t\t} else {\n")
-	b.WriteString("\t\t\tif applied, err := migrator.Up(ctx); err != nil {\n")
-	b.WriteString("\t\t\t\tfmt.Fprintf(os.Stderr, \"migrate: %v\\n\", err)\n")
-	b.WriteString("\t\t\t} else if len(applied) > 0 {\n")
-	b.WriteString("\t\t\t\tfmt.Fprintf(os.Stderr, \"migrate: applied %d migration(s)\\n\", len(applied))\n")
-	b.WriteString("\t\t\t}\n")
-	b.WriteString("\t\t\tmigrator.Close()\n")
-	b.WriteString("\t\t}\n")
-	b.WriteString("\t}\n\n")
+	writeAutoMigration(&b)
 
 	// Create app
 	fmt.Fprintf(&b, "\tapp, err := %s_luxo.New(ctx)\n", target.name)
@@ -587,6 +628,7 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	}
 	anyStreams := gatewayHasStreams(allModules)
 	routeOrder, routeMap := collectGatewayRoutes(result)
+	rateLimits := collectGatewayRateLimits(result)
 
 	var b strings.Builder
 	b.WriteString("// Code generated by luxo. DO NOT EDIT.\n")
@@ -596,6 +638,9 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t\"context\"\n")
 	b.WriteString("\t\"fmt\"\n")
 	b.WriteString("\t\"os\"\n\n")
+	if len(rateLimits) > 0 {
+		b.WriteString("\t\"time\"\n\n")
+	}
 
 	for _, m := range allModules {
 		if m.hasSchema || m.hasCrud || m.hasServiceFns {
@@ -617,8 +662,9 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("var Version = \"dev\"\n\n")
 
 	b.WriteString("func main() {\n")
-	b.WriteString("\tif err := env.Load(\".env\"); err != nil {\n")
-	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"warning: %v\\n\", err)\n")
+	b.WriteString("\tif err := env.Load(\".env\"); err != nil && !os.IsNotExist(err) {\n")
+	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"fatal: load .env: %v\\n\", err)\n")
+	b.WriteString("\t\tos.Exit(1)\n")
 	b.WriteString("\t}\n\n")
 
 	// RPC clients — default address = moduleName:9000 (Docker/K8s DNS)
@@ -664,7 +710,20 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t\tif client == nil {\n")
 	b.WriteString("\t\t\tcontinue\n")
 	b.WriteString("\t\t}\n")
-	b.WriteString("\t\tgw.Router.Handle(apiName, proxyHandler(client, gw.Router.Schema, apiName, rpcClients))\n")
+	b.WriteString("\t\thandler := proxyHandler(client, gw.Router.Schema, apiName, rpcClients)\n")
+	if len(rateLimits) > 0 {
+		b.WriteString("\t\tswitch apiName {\n")
+		for _, apiName := range routeOrder {
+			limit, ok := rateLimits[apiName]
+			if !ok {
+				continue
+			}
+			fmt.Fprintf(&b, "\t\tcase %q:\n", apiName)
+			fmt.Fprintf(&b, "\t\t\thandler = api.WithRateLimit(%s, %s, handler)\n", limit.max, limit.window)
+		}
+		b.WriteString("\t\t}\n")
+	}
+	b.WriteString("\t\tgw.Router.Handle(apiName, handler)\n")
 	b.WriteString("\t}\n\n")
 
 	for _, m := range allModules {
@@ -825,6 +884,40 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	writeGatewayRPCStreamProxy(&b, allModules)
 
 	return formatGenerated([]byte(b.String()))
+}
+
+type gatewayRateLimit struct {
+	max    string
+	window string
+}
+
+func collectGatewayRateLimits(result *semantic.Result) map[string]gatewayRateLimit {
+	limits := make(map[string]gatewayRateLimit)
+	for _, file := range result.Files {
+		for _, apiDecl := range file.APIs {
+			for _, directive := range apiDecl.Directives {
+				if directive.Name != "rateLimit" {
+					continue
+				}
+				maxArg := findCodegenDirectiveArg(directive.Args, "max", 0)
+				maxLiteral, maxOK := maxArg.Value.(*ast.Literal)
+				window, windowOK := directiveDuration(directive, "window", 1)
+				if maxOK && windowOK {
+					limits[apiDecl.Name] = gatewayRateLimit{max: maxLiteral.Value, window: window}
+				}
+			}
+		}
+	}
+	return limits
+}
+
+// GenerateGatewayEntryChecked generates and validates the routing gateway entry point.
+func GenerateGatewayEntryChecked(result *semantic.Result, modulePath string) ([]byte, error) {
+	source := GenerateGatewayEntry(result, modulePath)
+	if source == nil {
+		return nil, nil
+	}
+	return formatGeneratedChecked(source)
 }
 
 func writeGatewayNativeStreamWiring(b *strings.Builder, modules []moduleInfo) {

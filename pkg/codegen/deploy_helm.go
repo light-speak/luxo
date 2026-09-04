@@ -170,8 +170,8 @@ func generateValuesYAML(modules []moduleInfo, projectName string, hasEvents bool
 	b.WriteString("  driver: pg\n")
 	b.WriteString("  host: postgres\n")
 	b.WriteString("  port: \"5432\"\n")
-	b.WriteString("  user: luxo\n")
-	b.WriteString("  password: luxo\n")
+	b.WriteString("  user: postgres\n")
+	b.WriteString("  password: postgres\n")
 	fmt.Fprintf(&b, "  prefix: %s\n\n", projectName)
 
 	// Redis

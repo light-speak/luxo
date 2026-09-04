@@ -111,13 +111,11 @@ func TestEventScalarReadExpressions(t *testing.T) {
 }
 
 func TestEventCodecFallbackWriters(t *testing.T) {
-	old := eventFieldIDs
-	defer func() { eventFieldIDs = old }()
-	SetEventFieldIDs(map[string]map[string]int{"Changed": {"payload": 1}})
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{EventFields: map[string]map[string]int{"Changed": {"payload": 1}}}})
 	param := &ast.ParamDecl{Name: "payload", Type: &ast.TypeRef{Name: "External"}}
 	var b strings.Builder
-	writeEventMarshalField(&b, "Changed", param, false, false)
-	writeEventUnmarshalField(&b, "Changed", param, false, false)
+	generator.writeEventMarshalField(&b, "Changed", param, false, false)
+	generator.writeEventUnmarshalField(&b, "Changed", param, false, false)
 	writeEventListMarshal(&b, 2, "e.Payloads", "External", false, false)
 	writeEventListUnmarshal(&b, 2, "e.Payloads", "External", false, false)
 	for _, want := range []string{"json.Marshal(e.Payload)", "json.Unmarshal(dec.ReadBytes(), &e.Payload)", "json.Marshal(e.Payloads[i])", "json.Unmarshal(dec.ReadBytes(), &e.Payloads[i])"} {
@@ -275,12 +273,9 @@ func TestGenerateEventListenerMixed(t *testing.T) {
 }
 
 func TestGenerateEventCodecWithFieldIDs(t *testing.T) {
-	old := eventFieldIDs
-	defer func() { eventFieldIDs = old }()
-
-	SetEventFieldIDs(map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{EventFields: map[string]map[string]int{
 		"OrderCreated": {"orderId": 1, "amount": 2, "note": 3, "paid": 4},
-	})
+	}}})
 
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -299,7 +294,7 @@ func TestGenerateEventCodecWithFieldIDs(t *testing.T) {
 		}},
 	}
 
-	src := generateEventFile(result, "luxo")
+	src := generator.generateEventFile(result, "luxo")
 	if src == nil {
 		t.Fatal("should generate event file")
 	}
@@ -341,12 +336,9 @@ func TestGenerateEventCodecWithFieldIDs(t *testing.T) {
 }
 
 func TestGenerateEventCodecNullableTypes(t *testing.T) {
-	old := eventFieldIDs
-	defer func() { eventFieldIDs = old }()
-
-	SetEventFieldIDs(map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{EventFields: map[string]map[string]int{
 		"DataEvent": {"amount": 1, "note": 2, "active": 3},
-	})
+	}}})
 
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -364,7 +356,7 @@ func TestGenerateEventCodecNullableTypes(t *testing.T) {
 		}},
 	}
 
-	src := generateEventFile(result, "luxo")
+	src := generator.generateEventFile(result, "luxo")
 	code := string(src)
 
 	for _, want := range []string{
@@ -381,12 +373,9 @@ func TestGenerateEventCodecNullableTypes(t *testing.T) {
 }
 
 func TestGenerateEventCodecComplexType(t *testing.T) {
-	old := eventFieldIDs
-	defer func() { eventFieldIDs = old }()
-
-	SetEventFieldIDs(map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{EventFields: map[string]map[string]int{
 		"ComplexEvent": {"data": 1},
-	})
+	}}})
 
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -406,7 +395,7 @@ func TestGenerateEventCodecComplexType(t *testing.T) {
 		}},
 	}
 
-	src := generateEventFile(result, "luxo")
+	src := generator.generateEventFile(result, "luxo")
 	code := string(src)
 
 	if !strings.Contains(code, "e.Data.WriteLuxo(buf, nil)") || !strings.Contains(code, "e.Data.ReadLuxo(nested)") {
@@ -504,13 +493,10 @@ func TestGenerateEventFileOnBody(t *testing.T) {
 }
 
 func TestCollectCrossModuleEventImports(t *testing.T) {
-	old := globalEventCtx
-	defer func() { globalEventCtx = old }()
-
-	globalEventCtx = &EventContext{
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		EventModule: map[string]string{"ProjectDeleted": "common"},
 		ModulePath:  "github.com/test/service",
-	}
+	}})
 
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -526,31 +512,24 @@ func TestCollectCrossModuleEventImports(t *testing.T) {
 	}
 	listeners := result.Files[0].Listeners
 
-	imports := collectCrossModuleEventImports(result, listeners, "monitoring")
+	imports := generator.collectCrossModuleEventImports(result, listeners, "monitoring")
 	if imports["common"] != "common_luxo" {
 		t.Errorf("expected common_luxo import, got %v", imports)
 	}
 }
 
 func TestCollectCrossModuleEventImports_NoContext(t *testing.T) {
-	old := globalEventCtx
-	globalEventCtx = nil
-	defer func() { globalEventCtx = old }()
-
-	imports := collectCrossModuleEventImports(&semantic.Result{}, nil, "test")
+	imports := defaultGenerator().collectCrossModuleEventImports(&semantic.Result{}, nil, "test")
 	if len(imports) != 0 {
 		t.Error("should return empty without context")
 	}
 }
 
 func TestGenerateEventFileCrossModule(t *testing.T) {
-	old := globalEventCtx
-	defer func() { globalEventCtx = old }()
-
-	globalEventCtx = &EventContext{
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		EventModule: map[string]string{"ProjectDeleted": "common"},
 		ModulePath:  "github.com/test/service",
-	}
+	}})
 
 	// Module with listener for cross-module event (no local events)
 	result := &semantic.Result{
@@ -567,7 +546,7 @@ func TestGenerateEventFileCrossModule(t *testing.T) {
 		}},
 	}
 
-	src := generateEventFile(result, "luxo")
+	src := generator.generateEventFile(result, "luxo")
 	if src == nil {
 		t.Fatal("should generate event file for cross-module listener")
 	}

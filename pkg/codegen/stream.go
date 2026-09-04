@@ -49,16 +49,20 @@ type streamTypes struct {
 
 // collectStreams finds all @stream APIs in the semantic result.
 func collectStreams(result *semantic.Result) []streamInfo {
-	declarations := collectStreamTypes(result)
+	return defaultGenerator().collectStreams(result)
+}
+
+func (g *GeneratorContext) collectStreams(result *semantic.Result) []streamInfo {
+	declarations := g.collectStreamTypes(result)
 	var streams []streamInfo
 	for _, file := range result.Files {
 		for _, api := range file.APIs {
 			if !hasDirective(api.Directives, "stream") {
 				continue
 			}
-			si := newStreamInfo(file, api, declarations)
+			si := g.newStreamInfo(file, api, declarations)
 			if si.payload == nil {
-				classifyStreamPayload(&si, api.ReturnType, declarations.models, declarations.types, declarations.enums)
+				g.classifyStreamPayload(&si, api.ReturnType, declarations.models, declarations.types, declarations.enums)
 			}
 			streams = append(streams, si)
 		}
@@ -66,7 +70,7 @@ func collectStreams(result *semantic.Result) []streamInfo {
 	return streams
 }
 
-func collectStreamTypes(result *semantic.Result) streamTypes {
+func (g *GeneratorContext) collectStreamTypes(result *semantic.Result) streamTypes {
 	declarations := streamTypes{
 		events: make(map[string]*ast.EventDecl),
 		models: make(map[string]bool),
@@ -87,31 +91,31 @@ func collectStreamTypes(result *semantic.Result) streamTypes {
 			declarations.enums[enum.Name] = true
 		}
 	}
-	mergeGlobalStreamTypes(&declarations)
+	g.mergeGlobalStreamTypes(&declarations)
 	return declarations
 }
 
-func mergeGlobalStreamTypes(declarations *streamTypes) {
-	if globalEventCtx == nil {
+func (g *GeneratorContext) mergeGlobalStreamTypes(declarations *streamTypes) {
+	if g.events == nil {
 		return
 	}
-	for name, eventDecl := range globalEventCtx.Events {
+	for name, eventDecl := range g.events.Events {
 		if declarations.events[name] == nil {
 			declarations.events[name] = eventDecl
 		}
 	}
-	for name := range globalEventCtx.ModelModule {
+	for name := range g.events.ModelModule {
 		declarations.models[name] = true
 	}
-	for name := range globalEventCtx.TypeModule {
+	for name := range g.events.TypeModule {
 		declarations.types[name] = true
 	}
-	for name := range globalEventCtx.EnumModule {
+	for name := range g.events.EnumModule {
 		declarations.enums[name] = true
 	}
 }
 
-func newStreamInfo(file *ast.File, api *ast.ApiDecl, declarations streamTypes) streamInfo {
+func (g *GeneratorContext) newStreamInfo(file *ast.File, api *ast.ApiDecl, declarations streamTypes) streamInfo {
 	si := streamInfo{
 		apiName:      api.Name,
 		isNative:     hasDirective(api.Directives, "native"),
@@ -127,10 +131,10 @@ func newStreamInfo(file *ast.File, api *ast.ApiDecl, declarations streamTypes) s
 	if si.eventName == "" {
 		return si
 	}
-	if globalEventCtx != nil {
-		si.eventModule = globalEventCtx.EventModule[si.eventName]
+	if g.events != nil {
+		si.eventModule = g.events.EventModule[si.eventName]
 	}
-	attachStreamEvent(&si, declarations.events[si.eventName], declarations)
+	g.attachStreamEvent(&si, declarations.events[si.eventName], declarations)
 	return si
 }
 
@@ -146,7 +150,7 @@ func streamEventName(api *ast.ApiDecl) string {
 	return ""
 }
 
-func attachStreamEvent(si *streamInfo, eventDecl *ast.EventDecl, declarations streamTypes) {
+func (g *GeneratorContext) attachStreamEvent(si *streamInfo, eventDecl *ast.EventDecl, declarations streamTypes) {
 	if eventDecl == nil {
 		return
 	}
@@ -155,13 +159,13 @@ func attachStreamEvent(si *streamInfo, eventDecl *ast.EventDecl, declarations st
 	for _, param := range eventDecl.Params {
 		if sameStreamType(param.Type, si.returnType) {
 			si.payload = param
-			classifyStreamPayload(si, param.Type, declarations.models, declarations.types, declarations.enums)
+			g.classifyStreamPayload(si, param.Type, declarations.models, declarations.types, declarations.enums)
 			return
 		}
 	}
 }
 
-func classifyStreamPayload(si *streamInfo, ref *ast.TypeRef, models, types, enums map[string]bool) {
+func (g *GeneratorContext) classifyStreamPayload(si *streamInfo, ref *ast.TypeRef, models, types, enums map[string]bool) {
 	if ref == nil {
 		return
 	}
@@ -171,14 +175,14 @@ func classifyStreamPayload(si *streamInfo, ref *ast.TypeRef, models, types, enum
 		si.payloadKind = streamPayloadType
 	}
 	si.payloadEnum = enums[ref.Name]
-	if globalEventCtx == nil {
+	if g.events == nil {
 		return
 	}
 	switch si.payloadKind {
 	case streamPayloadModel:
-		si.payloadModule = globalEventCtx.ModelModule[ref.Name]
+		si.payloadModule = g.events.ModelModule[ref.Name]
 	case streamPayloadType:
-		si.payloadModule = globalEventCtx.TypeModule[ref.Name]
+		si.payloadModule = g.events.TypeModule[ref.Name]
 	}
 }
 
@@ -204,14 +208,18 @@ func sameStreamType(left, right *ast.TypeRef) bool {
 // - Matcher functions for @stream APIs with lambda bodies
 // - @native matcher stubs (delegating to resolver)
 func generateStreamFile(result *semantic.Result, packageName string) []byte {
-	streams := collectStreams(result)
+	return defaultGenerator().generateStreamFile(result, packageName)
+}
+
+func (g *GeneratorContext) generateStreamFile(result *semantic.Result, packageName string) []byte {
+	streams := g.collectStreams(result)
 	if len(streams) == 0 {
 		return nil
 	}
 
 	var b strings.Builder
 	writeHeader(&b, packageName, "stream.gen.go")
-	writeStreamImports(&b, streams)
+	g.writeStreamImports(&b, streams)
 	writeRegisterStreams(&b, streams)
 	writeStreamResolverInterface(&b, streams)
 
@@ -221,7 +229,7 @@ func generateStreamFile(result *semantic.Result, packageName string) []byte {
 		if si.isNative && si.eventName != "" {
 			generateNativeStreamMatcher(&b, si)
 		} else if si.hasBody && !si.isNative {
-			generateLuxoStreamMatcher(&b, si, enums)
+			g.generateLuxoStreamMatcher(&b, si, enums)
 		} else if si.requiresAuth {
 			generateAuthStreamMatcher(&b, si)
 		}
@@ -230,7 +238,7 @@ func generateStreamFile(result *semantic.Result, packageName string) []byte {
 	return []byte(b.String())
 }
 
-func writeStreamImports(b *strings.Builder, streams []streamInfo) {
+func (g *GeneratorContext) writeStreamImports(b *strings.Builder, streams []streamInfo) {
 	needsContext := false
 	needsCodec := false
 	remoteModules := make(map[string]bool)
@@ -247,9 +255,9 @@ func writeStreamImports(b *strings.Builder, streams []streamInfo) {
 		if si.payloadKind != streamPayloadScalar && si.payloadModule != "" && si.payloadModule != si.sourceModule {
 			remoteModules[si.payloadModule] = true
 		}
-		if globalEventCtx != nil && si.body != nil {
-			for _, enumName := range collectStreamEnumRefs(si.body, globalEventCtx.EnumModule) {
-				module := globalEventCtx.EnumModule[enumName]
+		if g.events != nil && si.body != nil {
+			for _, enumName := range collectStreamEnumRefs(si.body, g.events.EnumModule) {
+				module := g.events.EnumModule[enumName]
 				if module != "" && module != si.sourceModule {
 					remoteModules[module] = true
 				}
@@ -272,7 +280,7 @@ func writeStreamImports(b *strings.Builder, streams []streamInfo) {
 	}
 	sort.Strings(modules)
 	for _, module := range modules {
-		fmt.Fprintf(b, "\t%s_luxo %q\n", module, globalEventCtx.ModulePath+"/"+module+"/luxo")
+		fmt.Fprintf(b, "\t%s_luxo %q\n", module, g.events.ModulePath+"/"+module+"/luxo")
 	}
 	b.WriteString(")\n\n")
 }
@@ -491,6 +499,10 @@ func generateNativeStreamMatcher(b *strings.Builder, si streamInfo) {
 // Body uses implicit `it` for event data, bare idents for subscription params.
 // Event values are decoded once by event.OnDecode and captured by the dispatch closure.
 func generateLuxoStreamMatcher(b *strings.Builder, si streamInfo, enums map[string]bool) {
+	defaultGenerator().generateLuxoStreamMatcher(b, si, enums)
+}
+
+func (g *GeneratorContext) generateLuxoStreamMatcher(b *strings.Builder, si streamInfo, enums map[string]bool) {
 	name := "match" + str.Capitalize(si.apiName)
 
 	// Extract the boolean expression from body
@@ -539,7 +551,7 @@ func generateLuxoStreamMatcher(b *strings.Builder, si streamInfo, enums map[stri
 	}
 
 	// Compile the boolean expression
-	exprCode, ok := compileStreamExpr(expr, paramSet, enums, si.sourceModule)
+	exprCode, ok := g.compileStreamExpr(expr, paramSet, enums, si.sourceModule)
 	if !ok {
 		exprCode = "false /* rejected by semantic analysis */"
 	}
@@ -642,10 +654,14 @@ func walkExpr(expr ast.Expr, fn func(ast.Expr)) {
 // compileStreamExpr compiles a boolean expression to Go code.
 // Resolves: it.field → ev_field, param ident → params.Type("name"), my → identity.
 func compileStreamExpr(expr ast.Expr, params map[string]*ast.ParamDecl, enums map[string]bool, sourceModule string) (string, bool) {
+	return defaultGenerator().compileStreamExpr(expr, params, enums, sourceModule)
+}
+
+func (g *GeneratorContext) compileStreamExpr(expr ast.Expr, params map[string]*ast.ParamDecl, enums map[string]bool, sourceModule string) (string, bool) {
 	switch e := expr.(type) {
 	case *ast.BinaryExpr:
-		left, leftOK := compileStreamExpr(e.Left, params, enums, sourceModule)
-		right, rightOK := compileStreamExpr(e.Right, params, enums, sourceModule)
+		left, leftOK := g.compileStreamExpr(e.Left, params, enums, sourceModule)
+		right, rightOK := g.compileStreamExpr(e.Right, params, enums, sourceModule)
 		if !leftOK || !rightOK || e.Op == "in" || e.Op == "is" {
 			return "", false
 		}
@@ -654,7 +670,7 @@ func compileStreamExpr(expr ast.Expr, params map[string]*ast.ParamDecl, enums ma
 		return fmt.Sprintf("%s %s %s", left, e.Op, right), true
 
 	case *ast.UnaryExpr:
-		val, ok := compileStreamExpr(e.Value, params, enums, sourceModule)
+		val, ok := g.compileStreamExpr(e.Value, params, enums, sourceModule)
 		return fmt.Sprintf("%s%s", e.Op, val), ok
 
 	case *ast.MemberExpr:
@@ -666,8 +682,8 @@ func compileStreamExpr(expr ast.Expr, params map[string]*ast.ParamDecl, enums ma
 		}
 		if ident, ok := e.Object.(*ast.Ident); ok && enums[ident.Name] {
 			prefix := ""
-			if globalEventCtx != nil {
-				prefix = streamModulePrefix(globalEventCtx.EnumModule[ident.Name], sourceModule)
+			if g.events != nil {
+				prefix = streamModulePrefix(g.events.EnumModule[ident.Name], sourceModule)
 			}
 			return fmt.Sprintf("string(%s%s%s)", prefix, ident.Name, e.Field), true
 		}

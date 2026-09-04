@@ -1,11 +1,39 @@
 package com.luxo.client
 
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
 /** Three-state argument for patch APIs: absent, explicit null, or a value. */
 sealed interface LuxoOptional<out T> {
     data object Absent : LuxoOptional<Nothing>
     data class Present<T>(val value: T?) : LuxoOptional<T>
+}
+
+/** Field-selected output value: unselected, selected null, or selected value. */
+@JvmInline
+value class Selected<out T> private constructor(private val storage: Any?) {
+    val isSelected: Boolean get() = storage !== Unselected
+
+    @Suppress("UNCHECKED_CAST")
+    fun value(): T {
+        check(isSelected) { "field was not selected" }
+        return storage as T
+    }
+
+    companion object {
+        private data object Unselected
+
+        fun <T> unselected(): Selected<T> = Selected(Unselected)
+        fun <T> value(value: T): Selected<T> = Selected(value)
+    }
+}
+
+@Serializable
+enum class TypeUsage {
+    @SerialName("input") INPUT,
+    @SerialName("output") OUTPUT,
+    @SerialName("inputOutput") INPUT_OUTPUT,
+    @SerialName("unused") UNUSED,
 }
 
 /** Paginated list response. */
@@ -35,12 +63,14 @@ data class LuxoEnum(
 @Serializable
 data class LuxoTypeDecl(
     val name: String,
+    val usage: TypeUsage? = null,
     val fields: List<LuxoField> = emptyList(),
 )
 
 @Serializable
 data class LuxoModel(
     val name: String,
+    val usage: TypeUsage? = null,
     val fields: List<LuxoField> = emptyList(),
 )
 

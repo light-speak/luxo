@@ -69,6 +69,8 @@ func TestGenerateDeployFiles_Basic(t *testing.T) {
 		"post:",
 		"gateway:",
 		"DATABASE_DRIVER: pg",
+		"POSTGRES_USER: ${DATABASE_USER:-postgres}",
+		"POSTGRES_PASSWORD: ${DATABASE_PASSWORD:-postgres}",
 		"DATABASE_PREFIX: myapp",
 		"APP_PORT:",
 		"LUXO_PORT:",
@@ -84,6 +86,9 @@ func TestGenerateDeployFiles_Basic(t *testing.T) {
 		if !strings.Contains(dc, check) {
 			t.Errorf("docker-compose missing %q", check)
 		}
+	}
+	if strings.Contains(dc, ":-luxo}") {
+		t.Fatal("generated compose must not use the removed luxo database credentials")
 	}
 }
 

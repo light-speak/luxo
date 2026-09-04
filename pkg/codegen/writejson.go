@@ -15,6 +15,10 @@ import (
 // Uses ResponseBuf for zero-allocation direct append.
 // Returns nil if there are no models.
 func generateWriteJSONFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
+	return defaultGenerator().generateWriteJSONFile(result, packageName, enums)
+}
+
+func (g *GeneratorContext) generateWriteJSONFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
 	var models []*ast.ModelDecl
 	for _, file := range result.Files {
 		models = append(models, file.Models...)
@@ -47,7 +51,7 @@ func generateWriteJSONFile(result *semantic.Result, packageName string, enums ma
 				continue
 			}
 			stubDone[ext.Name] = true
-			stubs = append(stubs, extendStubModel(ext))
+			stubs = append(stubs, g.extendStubModel(ext))
 		}
 	}
 
@@ -62,15 +66,15 @@ func generateWriteJSONFile(result *semantic.Result, packageName string, enums ma
 	writeWriteJSONImports(&b, importDecls)
 
 	for _, m := range models {
-		generateWriteLuxo(&b, m, enums)
-		generateReadLuxo(&b, m, enums)
-		generateWriteColumnar(&b, m, enums)
+		g.generateWriteLuxo(&b, m, enums)
+		g.generateReadLuxo(&b, m, enums)
+		g.generateWriteColumnar(&b, m, enums)
 	}
 
 	for _, s := range stubs {
-		generateWriteLuxo(&b, s, enums)
-		generateReadLuxo(&b, s, enums)
-		generateWriteColumnar(&b, s, enums)
+		g.generateWriteLuxo(&b, s, enums)
+		g.generateReadLuxo(&b, s, enums)
+		g.generateWriteColumnar(&b, s, enums)
 		modelNames[s.Name] = true
 	}
 
@@ -79,9 +83,9 @@ func generateWriteJSONFile(result *semantic.Result, packageName string, enums ma
 	for _, file := range result.Files {
 		for _, t := range file.Types {
 			pseudo := &ast.ModelDecl{Name: t.Name, Fields: t.Fields}
-			generateTypeWriteLuxo(&b, pseudo, enums)
-			generateReadLuxo(&b, pseudo, enums)
-			generateTypeWriteColumnar(&b, pseudo, enums, modelNames)
+			g.generateTypeWriteLuxo(&b, pseudo, enums)
+			g.generateReadLuxo(&b, pseudo, enums)
+			g.generateTypeWriteColumnar(&b, pseudo, enums, modelNames)
 		}
 	}
 
@@ -89,7 +93,11 @@ func generateWriteJSONFile(result *semantic.Result, packageName string, enums ma
 }
 
 func extendStubModel(ext *ast.ExtendDecl) *ast.ModelDecl {
-	keyName := externalModelIDFieldName(ext.Name)
+	return defaultGenerator().extendStubModel(ext)
+}
+
+func (g *GeneratorContext) extendStubModel(ext *ast.ExtendDecl) *ast.ModelDecl {
+	keyName := g.externalModelIDFieldName(ext.Name)
 	fields := make([]*ast.FieldDecl, 0, len(ext.Fields)+1)
 	hasKey := false
 	for _, field := range ext.Fields {
@@ -101,7 +109,7 @@ func extendStubModel(ext *ast.ExtendDecl) *ast.ModelDecl {
 	if !hasKey {
 		key := &ast.FieldDecl{
 			Name:       keyName,
-			Type:       &ast.TypeRef{Name: externalModelIDTypeName(ext.Name)},
+			Type:       &ast.TypeRef{Name: g.externalModelIDTypeName(ext.Name)},
 			Directives: []*ast.Directive{{Name: "id"}},
 		}
 		fields = append([]*ast.FieldDecl{key}, fields...)
@@ -225,6 +233,10 @@ func isArenaField(f *ast.FieldDecl, enums map[string]bool) bool {
 // Emits: var _arenaLen int; _arenaLen += len(...); ...
 // Returns true if any arena fields exist (totalStringLen prefix should be written).
 func writeArenaLenCalc(b *strings.Builder, m *ast.ModelDecl, recv string, enums map[string]bool, masked bool, indent string) bool {
+	return defaultGenerator().writeArenaLenCalc(b, m, recv, enums, masked, indent)
+}
+
+func (g *GeneratorContext) writeArenaLenCalc(b *strings.Builder, m *ast.ModelDecl, recv string, enums map[string]bool, masked bool, indent string) bool {
 	var arenaFields []struct {
 		goField  string
 		nullable bool
@@ -238,7 +250,7 @@ func writeArenaLenCalc(b *strings.Builder, m *ast.ModelDecl, recv string, enums 
 		if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
 			continue
 		}
-		fieldID := getModelFieldID(m.Name, f.Name)
+		fieldID := g.modelFieldID(m.Name, f.Name)
 		if fieldID == 0 {
 			continue
 		}
@@ -296,6 +308,10 @@ func writeArenaLenCalc(b *strings.Builder, m *ast.ModelDecl, recv string, enums 
 // Writes all non-hidden fields, including selected nested relations.
 // Prefixes field data with totalStringLen varint for arena allocation on decode.
 func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
+	defaultGenerator().generateWriteLuxo(b, m, enums)
+}
+
+func (g *GeneratorContext) generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
 	name := m.Name
 	recv := strings.ToLower(name[:1])
 
@@ -306,19 +322,19 @@ func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bo
 	// directive-aware path even when the field mask is empty.
 	if !hasOutputDirectives(m) {
 		fmt.Fprintf(b, "\tif len(mask) == 0 {\n")
-		writeArenaLenCalc(b, m, recv, enums, false, "\t\t")
-		generateWriteLuxoAllFields(b, m, recv, enums)
+		g.writeArenaLenCalc(b, m, recv, enums, false, "\t\t")
+		g.generateWriteLuxoAllFields(b, m, recv, enums)
 		fmt.Fprintf(b, "\t\tbuf.B = append(buf.B, 0x00)\n")
 		fmt.Fprintf(b, "\t\treturn\n")
 		fmt.Fprintf(b, "\t}\n")
 	}
-	if hasWriteRelation(m, enums) {
+	if g.hasWriteRelation(m, enums) {
 		b.WriteString("\tselectionMask := mask\n")
 	}
 	b.WriteString("\tmask = codec.SelectionMaskFields(mask)\n")
 
 	// Slow path: arena len with mask checks, then field encoding
-	writeArenaLenCalc(b, m, recv, enums, true, "\t")
+	g.writeArenaLenCalc(b, m, recv, enums, true, "\t")
 
 	for _, f := range m.Fields {
 		if f.Type == nil {
@@ -327,7 +343,7 @@ func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bo
 		if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
 			continue
 		}
-		fieldID := getModelFieldID(name, f.Name)
+		fieldID := g.modelFieldID(name, f.Name)
 		if fieldID == 0 {
 			continue
 		}
@@ -391,10 +407,14 @@ func hasOutputDirectives(model *ast.ModelDecl) bool {
 }
 
 func hasWriteRelation(model *ast.ModelDecl, enums map[string]bool) bool {
+	return defaultGenerator().hasWriteRelation(model, enums)
+}
+
+func (g *GeneratorContext) hasWriteRelation(model *ast.ModelDecl, enums map[string]bool) bool {
 	for _, field := range model.Fields {
 		if field.Type != nil && !hasDirective(field.Directives, "hidden") &&
 			!hasDirective(field.Directives, "internal") && isRelationField(field, enums) &&
-			getModelFieldID(model.Name, field.Name) != 0 {
+			g.modelFieldID(model.Name, field.Name) != 0 {
 			return true
 		}
 	}
@@ -481,6 +501,10 @@ func writeScalarEncoding(b *strings.Builder, typeName string, nullable bool, fid
 
 // generateWriteLuxoAllFields generates the nil-mask fast path — all fields, no checks.
 func generateWriteLuxoAllFields(b *strings.Builder, m *ast.ModelDecl, recv string, enums map[string]bool) {
+	defaultGenerator().generateWriteLuxoAllFields(b, m, recv, enums)
+}
+
+func (g *GeneratorContext) generateWriteLuxoAllFields(b *strings.Builder, m *ast.ModelDecl, recv string, enums map[string]bool) {
 	for _, f := range m.Fields {
 		if f.Type == nil {
 			continue
@@ -488,7 +512,7 @@ func generateWriteLuxoAllFields(b *strings.Builder, m *ast.ModelDecl, recv strin
 		if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
 			continue
 		}
-		fieldID := getModelFieldID(m.Name, f.Name)
+		fieldID := g.modelFieldID(m.Name, f.Name)
 		if fieldID == 0 {
 			continue
 		}
@@ -510,22 +534,26 @@ func generateWriteLuxoAllFields(b *strings.Builder, m *ast.ModelDecl, recv strin
 // Type fields write ALL fields unconditionally — including nested model references.
 // Unlike model WriteLuxo, type fields don't skip "relations" since types have no DB semantics.
 func generateTypeWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
+	defaultGenerator().generateTypeWriteLuxo(b, m, enums)
+}
+
+func (g *GeneratorContext) generateTypeWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
 	name := m.Name
 	recv := strings.ToLower(name[:1])
 	fmt.Fprintf(b, "// WriteLuxo writes %s as Luxo binary directly to buf.\n", name)
 	fmt.Fprintf(b, "func (%s %s) WriteLuxo(buf *api.ResponseBuf, mask []byte) {\n", recv, name)
 
-	if hasWriteRelation(m, enums) {
+	if g.hasWriteRelation(m, enums) {
 		b.WriteString("\tselectionMask := mask\n")
 	}
 	b.WriteString("\tmask = codec.SelectionMaskFields(mask)\n")
-	writeArenaLenCalc(b, m, recv, enums, true, "\t")
+	g.writeArenaLenCalc(b, m, recv, enums, true, "\t")
 
 	for _, f := range m.Fields {
 		if f.Type == nil || hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
 			continue
 		}
-		fieldID := getModelFieldID(name, f.Name)
+		fieldID := g.modelFieldID(name, f.Name)
 		if fieldID == 0 {
 			continue
 		}
@@ -595,6 +623,10 @@ func writeListScalarField(b *strings.Builder, f *ast.FieldDecl, fid, goField str
 
 // hasArenaFields returns true if the model has any arena-eligible fields.
 func hasArenaFields(m *ast.ModelDecl, enums map[string]bool) bool {
+	return defaultGenerator().hasArenaFields(m, enums)
+}
+
+func (g *GeneratorContext) hasArenaFields(m *ast.ModelDecl, enums map[string]bool) bool {
 	for _, f := range m.Fields {
 		if isArenaField(f, enums) {
 			if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
@@ -603,7 +635,7 @@ func hasArenaFields(m *ast.ModelDecl, enums map[string]bool) bool {
 			if isRelationField(f, enums) {
 				continue
 			}
-			if getModelFieldID(m.Name, f.Name) == 0 {
+			if g.modelFieldID(m.Name, f.Name) == 0 {
 				continue
 			}
 			return true
@@ -613,9 +645,13 @@ func hasArenaFields(m *ast.ModelDecl, enums map[string]bool) bool {
 }
 
 func generateReadLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
+	defaultGenerator().generateReadLuxo(b, m, enums)
+}
+
+func (g *GeneratorContext) generateReadLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
 	name := m.Name
 	recv := strings.ToLower(name[:1])
-	useArena := hasArenaFields(m, enums)
+	useArena := g.hasArenaFields(m, enums)
 
 	fmt.Fprintf(b, "// ReadLuxo decodes %s from Luxo binary format.\n", name)
 	fmt.Fprintf(b, "func (%s *%s) ReadLuxo(dec *codec.Decoder) {\n", recv, name)
@@ -641,7 +677,7 @@ func generateReadLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]boo
 		if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
 			continue
 		}
-		fieldID := getModelFieldID(name, f.Name)
+		fieldID := g.modelFieldID(name, f.Name)
 		if fieldID == 0 {
 			continue
 		}
@@ -810,11 +846,19 @@ func writeReadLuxoListField(b *strings.Builder, f *ast.FieldDecl, fieldID int, g
 // Writes all items in columnar format: [count][col1: fieldID + all values][col2: ...]...[0x00]
 // 2.75x faster, 19% smaller than row-by-row WriteLuxo for lists.
 func generateWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
-	generateModelWriteColumnar(b, m, enums, "WriteColumnar"+m.Name, "[]*"+m.Name)
-	generateModelWriteColumnar(b, m, enums, "WriteColumnar"+m.Name+"Values", "[]"+m.Name)
+	defaultGenerator().generateWriteColumnar(b, m, enums)
+}
+
+func (g *GeneratorContext) generateWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
+	g.generateModelWriteColumnar(b, m, enums, "WriteColumnar"+m.Name, "[]*"+m.Name)
+	g.generateModelWriteColumnar(b, m, enums, "WriteColumnar"+m.Name+"Values", "[]"+m.Name)
 }
 
 func generateModelWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool, functionName, itemsType string) {
+	defaultGenerator().generateModelWriteColumnar(b, m, enums, functionName, itemsType)
+}
+
+func (g *GeneratorContext) generateModelWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool, functionName, itemsType string) {
 	name := m.Name
 
 	// Collect encodable fields
@@ -837,7 +881,7 @@ func generateModelWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[
 		if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
 			continue
 		}
-		fid := getModelFieldID(name, f.Name)
+		fid := g.modelFieldID(name, f.Name)
 		if fid == 0 {
 			continue
 		}
@@ -922,6 +966,10 @@ func writeColumnarMaskedStringField(b *strings.Builder, field *ast.FieldDecl, go
 //
 // Value-slice signature — native resolvers return []Type, not []*Type.
 func generateTypeWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool, modelSets ...map[string]bool) {
+	defaultGenerator().generateTypeWriteColumnar(b, m, enums, modelSets...)
+}
+
+func (g *GeneratorContext) generateTypeWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool, modelSets ...map[string]bool) {
 	name := m.Name
 	var modelNames map[string]bool
 	if len(modelSets) > 0 {
@@ -930,7 +978,7 @@ func generateTypeWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[s
 
 	hasFields := false
 	for _, f := range m.Fields {
-		if f.Type != nil && !hasDirective(f.Directives, "hidden") && !hasDirective(f.Directives, "internal") && getModelFieldID(name, f.Name) != 0 {
+		if f.Type != nil && !hasDirective(f.Directives, "hidden") && !hasDirective(f.Directives, "internal") && g.modelFieldID(name, f.Name) != 0 {
 			hasFields = true
 			break
 		}
@@ -942,7 +990,7 @@ func generateTypeWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[s
 	fmt.Fprintf(b, "// WriteColumnar%s writes a list of %s in columnar format.\n", name, name)
 	fmt.Fprintf(b, "// Nested type/model fields are encoded as blob columns.\n")
 	fmt.Fprintf(b, "func WriteColumnar%s(buf *api.ResponseBuf, items []%s, mask []byte) {\n", name, name)
-	if hasWriteRelation(m, enums) {
+	if g.hasWriteRelation(m, enums) {
 		fmt.Fprintf(b, "\tselectionMask := mask\n")
 	}
 	fmt.Fprintf(b, "\tmask = codec.SelectionMaskFields(mask)\n")
@@ -953,7 +1001,7 @@ func generateTypeWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[s
 		if f.Type == nil || hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
 			continue
 		}
-		fid := getModelFieldID(name, f.Name)
+		fid := g.modelFieldID(name, f.Name)
 		if fid == 0 {
 			continue
 		}

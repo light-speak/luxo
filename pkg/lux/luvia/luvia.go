@@ -69,6 +69,16 @@ func (g *Gateway) Serve(version string) error {
 	if err := g.Router.Validate(); err != nil {
 		return err
 	}
+	shutdownTimeout, err := positiveDurationEnv("GRACEFUL_TIMEOUT", 30*time.Second)
+	if err != nil {
+		return err
+	}
+	if err := validateDeploymentMode(); err != nil {
+		return err
+	}
+	if err := validateJWTConfig(); err != nil {
+		return err
+	}
 	mux, port := g.buildMux(version)
 	addr := ":" + port
 
@@ -78,6 +88,7 @@ func (g *Gateway) Serve(version string) error {
 		g.Router.SetMetricsCollector(g.metrics)
 	}
 	g.registrar = newGatewayRegistrar(port, version)
+	defer g.closeIntegrations()
 
 	certFile := envOr("APP_TLS_CERT", "")
 	keyFile := envOr("APP_TLS_KEY", "")
@@ -93,15 +104,52 @@ func (g *Gateway) Serve(version string) error {
 	}
 
 	g.server = server
-	return g.waitForShutdown(serveErr)
+	return g.waitForShutdown(serveErr, shutdownTimeout)
+}
+
+func validateDeploymentMode() error {
+	mode := envOr("DEPLOY_MODE", "embedded")
+	if mode != "embedded" && mode != "cluster" {
+		return fmt.Errorf("DEPLOY_MODE must be embedded or cluster, got %q / DEPLOY_MODE 必须是 embedded 或 cluster，得到 %q", mode, mode)
+	}
+	return nil
+}
+
+func validateJWTConfig() error {
+	if _, configured := env.Get("JWT_SECRET"); !configured {
+		return nil
+	}
+	if _, err := auth.LoadConfig(); err != nil {
+		return fmt.Errorf("invalid JWT configuration: %w", err)
+	}
+	return nil
+}
+
+func (g *Gateway) closeIntegrations() {
+	if g.metrics != nil {
+		g.metrics.Close()
+	}
+	if g.registrar != nil {
+		g.registrar.Close()
+	}
 }
 
 func startGatewayServer(addr string, mux http.Handler, certFile, keyFile string) (*http.Server, <-chan error, error) {
+	timeouts, err := serverTimeoutsFromEnv()
+	if err != nil {
+		return nil, nil, err
+	}
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("listen %s: %w", addr, err)
 	}
-	server := &http.Server{Addr: addr, Handler: h2c.NewHandler(mux, &http2.Server{})}
+	server := &http.Server{
+		Addr:         addr,
+		Handler:      h2c.NewHandler(mux, &http2.Server{}),
+		ReadTimeout:  timeouts.read,
+		WriteTimeout: timeouts.write,
+		IdleTimeout:  timeouts.idle,
+	}
 	if certFile != "" && keyFile != "" {
 		certificate, loadErr := tls.LoadX509KeyPair(certFile, keyFile)
 		if loadErr != nil {
@@ -121,8 +169,42 @@ func startGatewayServer(addr string, mux http.Handler, certFile, keyFile string)
 	return server, serveErr, nil
 }
 
+type serverTimeouts struct {
+	read  time.Duration
+	write time.Duration
+	idle  time.Duration
+}
+
+func serverTimeoutsFromEnv() (serverTimeouts, error) {
+	read, err := positiveDurationEnv("TIMEOUT_READ", 30*time.Second)
+	if err != nil {
+		return serverTimeouts{}, err
+	}
+	write, err := positiveDurationEnv("TIMEOUT_WRITE", 30*time.Second)
+	if err != nil {
+		return serverTimeouts{}, err
+	}
+	idle, err := positiveDurationEnv("TIMEOUT_IDLE", 120*time.Second)
+	if err != nil {
+		return serverTimeouts{}, err
+	}
+	return serverTimeouts{read: read, write: write, idle: idle}, nil
+}
+
+func positiveDurationEnv(name string, fallback time.Duration) (time.Duration, error) {
+	value := envOr(name, "")
+	if value == "" {
+		return fallback, nil
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration <= 0 {
+		return 0, fmt.Errorf("%s must be a positive duration, got %q / %s 必须是正时长，得到 %q", name, value, name, value)
+	}
+	return duration, nil
+}
+
 // waitForShutdown blocks until SIGTERM, SIGINT, or a server failure, then gracefully shuts down.
-func (g *Gateway) waitForShutdown(serveErr <-chan error) error {
+func (g *Gateway) waitForShutdown(serveErr <-chan error, timeout time.Duration) error {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
 	defer signal.Stop(quit)
@@ -137,22 +219,9 @@ func (g *Gateway) waitForShutdown(serveErr <-chan error) error {
 	}
 	fmt.Printf("\n  Received %s, shutting down...\n", sig)
 
-	timeout := 30 * time.Second
-	if v := envOr("SHUTDOWN_TIMEOUT", ""); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			timeout = d
-		}
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	if g.metrics != nil {
-		g.metrics.Close()
-	}
-	if g.registrar != nil {
-		g.registrar.Close()
-	}
 	if err := g.server.Shutdown(ctx); err != nil {
 		return fmt.Errorf("shutdown: %w", err)
 	}
@@ -205,9 +274,11 @@ func (g *Gateway) buildMux(version string) (*http.ServeMux, string) {
 	// Middleware chain: CORS → trace → auth → router
 	var handler http.Handler = g.Router
 	handler = api.TraceMiddleware(handler)
-	jwtCfg, err := auth.LoadConfig()
-	if err == nil {
-		handler = AuthMiddleware(jwtCfg, handler)
+	if _, configured := env.Get("JWT_SECRET"); configured {
+		jwtCfg, err := auth.LoadConfig()
+		if err == nil {
+			handler = AuthMiddleware(jwtCfg, handler)
+		}
 	}
 	handler = corsMiddleware(handler)
 	mux.Handle("/luvia", handler)

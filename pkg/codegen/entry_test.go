@@ -46,6 +46,10 @@ func TestGenerateEntryFile(t *testing.T) {
 		"migrate.EnsureDatabase",
 		"migrate.New(ctx",
 		"migrator.Up(ctx)",
+		"fatal: ensure db:",
+		"fatal: migrate:",
+		"AUTO_MIGRATE must be true or false",
+		"DEPLOY_MODE must be embedded or cluster",
 		// Shared DB — one pool, all modules use NewFromDB
 		"lux.DBConfigFromEnv()",
 		"pg.NewDBWithConfig(ctx",
@@ -77,6 +81,67 @@ func TestGenerateEntryFileNoModels(t *testing.T) {
 	src := GenerateEntryFile(result, "myapp")
 	if src != nil {
 		t.Error("should return nil for empty files")
+	}
+}
+
+func TestGeneratedEntriesTreatDotEnvAsOptionalButRejectMalformedFiles(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/user.luxo",
+		Models: []*ast.ModelDecl{{
+			Name:       "User",
+			Directives: []*ast.Directive{{Name: "crud"}},
+		}},
+	}}}
+	sources := map[string]string{
+		"embedded": string(GenerateEntryFile(result, "myapp")),
+		"module":   string(GenerateModuleEntryFiles(result, "myapp")["user"]),
+		"gateway":  string(GenerateGatewayEntry(result, "myapp")),
+	}
+	for name, source := range sources {
+		t.Run(name, func(t *testing.T) {
+			if !strings.Contains(source, `err != nil && !os.IsNotExist(err)`) ||
+				!strings.Contains(source, `fatal: load .env: %v`) {
+				t.Fatalf("generated entry must ignore only a missing .env file:\n%s", source)
+			}
+		})
+	}
+}
+
+func TestCheckedEntryGenerationReportsInvalidGo(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Name:   "origin/user.luxo",
+		Models: []*ast.ModelDecl{{Name: "User"}},
+	}}}
+	if _, err := GenerateEntryFileChecked(result, `invalid"module`); err == nil {
+		t.Fatal("invalid generated import must be reported")
+	}
+}
+
+func TestCheckedEntryGenerationCoversEmptyValidAndInvalidProjects(t *testing.T) {
+	empty := &semantic.Result{}
+	if source, err := GenerateEntryFileChecked(empty, "myapp"); err != nil || source != nil {
+		t.Fatalf("empty embedded entry = %q, %v", source, err)
+	}
+	if entries, err := GenerateModuleEntryFilesChecked(empty, "myapp"); err != nil || entries != nil {
+		t.Fatalf("empty module entries = %#v, %v", entries, err)
+	}
+	if source, err := GenerateGatewayEntryChecked(empty, "myapp"); err != nil || source != nil {
+		t.Fatalf("empty gateway entry = %q, %v", source, err)
+	}
+
+	result := &semantic.Result{Files: []*ast.File{{Name: "origin/user.luxo", Models: []*ast.ModelDecl{{Name: "User"}}}}}
+	entries, err := GenerateModuleEntryFilesChecked(result, "myapp")
+	if err != nil || len(entries["user"]) == 0 {
+		t.Fatalf("valid module entries = %#v, %v", entries, err)
+	}
+	if _, err := GenerateModuleEntryFilesChecked(result, `invalid"module`); err == nil {
+		t.Fatal("invalid module entry import was not reported")
+	}
+	if source, err := GenerateGatewayEntryChecked(result, "myapp"); err != nil || len(source) == 0 {
+		t.Fatalf("valid gateway entry = %q, %v", source, err)
+	}
+	if _, err := GenerateGatewayEntryChecked(result, `invalid"module`); err == nil {
+		t.Fatal("invalid gateway import was not reported")
 	}
 }
 
@@ -412,6 +477,8 @@ func TestGenerateModuleEntryFiles(t *testing.T) {
 		`user_luxo "myapp/service/user/luxo"`,
 		`user_resolver "myapp/service/user/resolver"`,
 		"migrate.EnsureDatabase",
+		"fatal: ensure db:",
+		"fatal: migrate:",
 		"user_luxo.RegisterHandlers",
 		"rpc.NewServer",
 		"DATABASE_PREFIX",
@@ -596,6 +663,45 @@ func TestGenerateGatewayEntry_Empty(t *testing.T) {
 	}
 }
 
+func TestGenerateGatewayEntryAppliesRateLimitAtPublicEdge(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/user.luxo",
+		APIs: []*ast.ApiDecl{{
+			Name: "searchUsers",
+			Directives: []*ast.Directive{{Name: "rateLimit", Args: []*ast.NamedArg{
+				{Name: "max", Value: &ast.Literal{Kind: token.Int, Value: "20"}},
+				{Name: "window", Value: &ast.Literal{Kind: token.Duration, Value: "1m"}},
+			}}},
+		}},
+	}}}
+
+	src := string(GenerateGatewayEntry(result, "myapp"))
+	if !strings.Contains(src, `case "searchUsers":`) ||
+		!strings.Contains(src, "api.WithRateLimit(20, time.Minute, handler)") {
+		t.Fatalf("gateway must enforce @rateLimit before RPC forwarding:\n%s", src)
+	}
+}
+
+func TestGenerateGatewayEntrySkipsRoutesWithoutRateLimits(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/user.luxo",
+		APIs: []*ast.ApiDecl{
+			{
+				Name: "limited",
+				Directives: []*ast.Directive{{Name: "rateLimit", Args: []*ast.NamedArg{
+					{Name: "max", Value: &ast.Literal{Kind: token.Int, Value: "10"}},
+					{Name: "window", Value: &ast.Literal{Kind: token.Duration, Value: "1s"}},
+				}}},
+			},
+			{Name: "open"},
+		},
+	}}}
+	source := string(GenerateGatewayEntry(result, "myapp"))
+	if !strings.Contains(source, `case "limited":`) || strings.Contains(source, `case "open":`) {
+		t.Fatalf("gateway rate-limit switch is incorrect:\n%s", source)
+	}
+}
+
 func TestGenerateGatewayEntry_WithServiceFns(t *testing.T) {
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -735,8 +841,6 @@ func TestCollectModulesWithExtends(t *testing.T) {
 }
 
 func TestEntryRegistersCrossModuleLoadEndpoints(t *testing.T) {
-	oldContext := globalEventCtx
-	defer func() { globalEventCtx = oldContext }()
 	result := &semantic.Result{Files: []*ast.File{
 		{
 			Name: "origin/user.luxo",
@@ -763,8 +867,6 @@ func TestEntryRegistersCrossModuleLoadEndpoints(t *testing.T) {
 			}},
 		},
 	}}
-	globalEventCtx = BuildEventContext(result.Files, "github.com/test/service")
-
 	modules := collectModules(result)
 	if len(modules) != 2 || !modules[0].hasBatchRPC || !modules[0].hasRemoteLoad {
 		t.Fatalf("module endpoint flags = %#v", modules)

@@ -8,7 +8,10 @@
     "strict": true,
     "noEmit": true,
     "skipLibCheck": false,
-    "verbatimModuleSyntax": true
+    "verbatimModuleSyntax": true,
+    "paths": {
+      "@luxojs/client": ["../client/src/index.ts"]
+    }
   },
   "include": ["src/**/*.ts"],
   "exclude": ["src/**/*.test.ts", "src/**/*.bench.ts"]

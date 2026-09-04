@@ -2,6 +2,7 @@ package lockfile
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"sort"
 	"strconv"
@@ -15,26 +16,32 @@ import (
 // LockFile represents the luxo.lock file that tracks stable field IDs
 // for binary protocol compatibility.
 type LockFile struct {
-	Version int                   `json:"version"`
-	Models  map[string]*ModelLock `json:"models"`
-	Types   map[string]*ModelLock `json:"types,omitempty"`
-	Events  map[string]*ModelLock `json:"events,omitempty"`
-	APIs    map[string]*APILock   `json:"apis"`
-	nextAPI int                   // transient: next API ID to assign
+	Version     int                   `json:"version"`
+	Models      map[string]*ModelLock `json:"models"`
+	Types       map[string]*ModelLock `json:"types,omitempty"`
+	Events      map[string]*ModelLock `json:"events,omitempty"`
+	APIs        map[string]*APILock   `json:"apis"`
+	ReservedAPI []int                 `json:"reserved_api_ids,omitempty"`
+	nextAPI     int                   // transient: next API ID to assign
 }
 
 // APILock tracks ID and param field IDs for a single API.
 type APILock struct {
-	ID     int            `json:"id"`
-	Params map[string]int `json:"params,omitempty"` // param_name → stable field ID
-	nextP  int            // transient
+	ID         int               `json:"id"`
+	Params     map[string]int    `json:"params,omitempty"` // param_name → stable field ID
+	ParamTypes map[string]string `json:"param_types,omitempty"`
+	ReturnType string            `json:"return_type,omitempty"`
+	Contract   bool              `json:"contract,omitempty"`
+	Reserved   []int             `json:"reserved,omitempty"`
+	nextP      int               // transient
 }
 
 // ModelLock tracks field ID assignments for a single model.
 type ModelLock struct {
-	NextID   int            `json:"next_id"`
-	Fields   map[string]int `json:"fields"`
-	Reserved []int          `json:"reserved,omitempty"`
+	NextID     int               `json:"next_id"`
+	Fields     map[string]int    `json:"fields"`
+	FieldTypes map[string]string `json:"field_types,omitempty"`
+	Reserved   []int             `json:"reserved,omitempty"`
 }
 
 // MarshalJSON outputs fields sorted by ID value instead of alphabetically.
@@ -67,6 +74,11 @@ func (ml *ModelLock) MarshalJSON() ([]byte, error) {
 		b = strconv.AppendInt(b, int64(e.ID), 10)
 	}
 	b = append(b, '}')
+	if len(ml.FieldTypes) > 0 {
+		b = append(b, `,"field_types":`...)
+		fieldTypes, _ := json.Marshal(ml.FieldTypes)
+		b = append(b, fieldTypes...)
+	}
 
 	if len(ml.Reserved) > 0 {
 		b = append(b, `,"reserved":`...)
@@ -77,7 +89,7 @@ func (ml *ModelLock) MarshalJSON() ([]byte, error) {
 	return b, nil
 }
 
-const currentVersion = 1
+const currentVersion = 2
 
 // New creates an empty lock file.
 func New() *LockFile {
@@ -104,6 +116,10 @@ func Load(path string) (*LockFile, error) {
 	if err := json.Unmarshal(data, lf); err != nil {
 		return nil, err
 	}
+	if lf.Version > currentVersion {
+		return nil, fmt.Errorf("luxo.lock version %d is newer than supported version %d", lf.Version, currentVersion)
+	}
+	lf.Version = currentVersion
 	lf.computeNextAPI()
 	return lf, nil
 }
@@ -128,6 +144,7 @@ func (lf *LockFile) Update(files []*ast.File) {
 	lf.updateExtends(files)
 	lf.updateEvents(files)
 	lf.updateAPIs(files)
+	lf.updateContractMetadata(files)
 }
 
 // updateTypes assigns field IDs for type declarations (non-DB, e.g. AuthPayload).
@@ -349,6 +366,11 @@ func (lf *LockFile) reserveRemovedFields(ml *ModelLock, current map[string]bool)
 
 // updateAPIs assigns stable IDs to all API declarations, including CRUD APIs.
 func (lf *LockFile) updateAPIs(files []*ast.File) {
+	active := make(map[string]bool)
+	ensure := func(name string, params []string) {
+		active[name] = true
+		lf.ensureAPIID(name, params)
+	}
 	enums := make(map[string]bool)
 	for _, file := range files {
 		for _, enum := range file.Enums {
@@ -364,17 +386,17 @@ func (lf *LockFile) updateAPIs(files []*ast.File) {
 			name := m.Name
 			plural := name + "s"
 			// CRUD param names are well-known
-			lf.ensureAPIID("get"+name, []string{"id"})
-			lf.ensureAPIID("list"+plural, []string{"page", "pageSize"})
-			lf.ensureAPIID("create"+name, collectCRUDFieldNames(m, enums, false))
-			lf.ensureAPIID("update"+name, append([]string{"id"}, collectCRUDFieldNames(m, enums, true)...))
-			lf.ensureAPIID("delete"+name, []string{"id"})
-			lf.ensureAPIID("delete"+plural, []string{"ids"})
-			lf.ensureAPIID("svc:batchLoad:"+name, []string{"keys"})
+			ensure("get"+name, []string{"id"})
+			ensure("list"+plural, []string{"page", "pageSize"})
+			ensure("create"+name, collectCRUDFieldNames(m, enums, false))
+			ensure("update"+name, append([]string{"id"}, collectCRUDFieldNames(m, enums, true)...))
+			ensure("delete"+name, []string{"id"})
+			ensure("delete"+plural, []string{"ids"})
+			ensure("svc:batchLoad:"+name, []string{"keys"})
 		}
 	}
-	lf.updateFederationAPIs(files, enums)
-	lf.updateNamedLoadAPIs(files)
+	lf.updateFederationAPIs(files, enums, ensure)
+	lf.updateNamedLoadAPIsWithEnsure(files, ensure)
 	// Declared APIs — params from AST
 	for _, file := range files {
 		for _, api := range file.APIs {
@@ -382,7 +404,7 @@ func (lf *LockFile) updateAPIs(files []*ast.File) {
 			for _, p := range api.Params {
 				params = append(params, p.Name)
 			}
-			lf.ensureAPIID(api.Name, params)
+			ensure(api.Name, params)
 		}
 	}
 	// fn @service — exposed as RPC endpoints with svc: prefix
@@ -395,12 +417,13 @@ func (lf *LockFile) updateAPIs(files []*ast.File) {
 			for _, p := range fn.Params {
 				params = append(params, p.Name)
 			}
-			lf.ensureAPIID("svc:"+fn.Name, params)
+			ensure("svc:"+fn.Name, params)
 		}
 	}
+	lf.reserveRemovedAPIs(active)
 }
 
-func (lf *LockFile) updateFederationAPIs(files []*ast.File, enums map[string]bool) {
+func (lf *LockFile) updateFederationAPIs(files []*ast.File, enums map[string]bool, ensure func(string, []string)) {
 	primaryKeys := make(map[string]string)
 	for _, file := range files {
 		for _, model := range file.Models {
@@ -409,19 +432,23 @@ func (lf *LockFile) updateFederationAPIs(files []*ast.File, enums map[string]boo
 	}
 	for _, file := range files {
 		for _, ext := range file.Extends {
-			lf.ensureAPIID("svc:batchLoad:"+ext.Name, []string{"keys"})
+			ensure("svc:batchLoad:"+ext.Name, []string{"keys"})
 			for _, field := range ext.Fields {
 				if field.Type == nil || field.Computed != nil || !isCRUDRelationField(field, enums) {
 					continue
 				}
 				foreignKey := federationForeignKey(ext.Name, primaryKeys[ext.Name], field)
-				lf.ensureAPIID("svc:resolve:"+field.Type.Name+":"+foreignKey, []string{"keys"})
+				ensure("svc:resolve:"+field.Type.Name+":"+foreignKey, []string{"keys"})
 			}
 		}
 	}
 }
 
 func (lf *LockFile) updateNamedLoadAPIs(files []*ast.File) {
+	lf.updateNamedLoadAPIsWithEnsure(files, lf.ensureAPIID)
+}
+
+func (lf *LockFile) updateNamedLoadAPIsWithEnsure(files []*ast.File, ensure func(string, []string)) {
 	seen := make(map[string]bool)
 	visit := func(expr ast.Expr) {
 		call, ok := expr.(*ast.CallExpr)
@@ -443,7 +470,7 @@ func (lf *LockFile) updateNamedLoadAPIs(files []*ast.File) {
 		name := "svc:load:" + model.Name + ":" + strings.Join(args, ":")
 		if !seen[name] {
 			seen[name] = true
-			lf.ensureAPIID(name, args)
+			ensure(name, args)
 		}
 	}
 	for _, file := range files {
@@ -598,6 +625,39 @@ func (lf *LockFile) ensureAPIID(name string, params []string) {
 			al.Params[p] = al.nextP
 		}
 	}
+	current := make(map[string]bool, len(params))
+	for _, param := range params {
+		current[param] = true
+	}
+	reserved := make(map[int]bool, len(al.Reserved))
+	for _, id := range al.Reserved {
+		reserved[id] = true
+	}
+	for param, id := range al.Params {
+		if current[param] {
+			continue
+		}
+		if !reserved[id] {
+			al.Reserved = append(al.Reserved, id)
+		}
+		delete(al.Params, param)
+	}
+}
+
+func (lf *LockFile) reserveRemovedAPIs(active map[string]bool) {
+	reserved := make(map[int]bool, len(lf.ReservedAPI))
+	for _, id := range lf.ReservedAPI {
+		reserved[id] = true
+	}
+	for name, api := range lf.APIs {
+		if active[name] {
+			continue
+		}
+		if !reserved[api.ID] {
+			lf.ReservedAPI = append(lf.ReservedAPI, api.ID)
+		}
+		delete(lf.APIs, name)
+	}
 }
 
 func hasCrudDirective(m *ast.ModelDecl) bool {
@@ -617,6 +677,11 @@ func (lf *LockFile) computeNextAPI() {
 			maxID = al.ID
 		}
 	}
+	for _, id := range lf.ReservedAPI {
+		if id > maxID {
+			maxID = id
+		}
+	}
 	lf.nextAPI = maxID
 }
 
@@ -627,6 +692,22 @@ func (lf *LockFile) sortReserved() {
 			sort.Ints(ml.Reserved)
 		}
 	}
+	for _, tl := range lf.Types {
+		if len(tl.Reserved) > 0 {
+			sort.Ints(tl.Reserved)
+		}
+	}
+	for _, el := range lf.Events {
+		if len(el.Reserved) > 0 {
+			sort.Ints(el.Reserved)
+		}
+	}
+	for _, api := range lf.APIs {
+		if len(api.Reserved) > 0 {
+			sort.Ints(api.Reserved)
+		}
+	}
+	sort.Ints(lf.ReservedAPI)
 }
 
 // FieldID returns the assigned field ID for a model field, or 0 if not found.

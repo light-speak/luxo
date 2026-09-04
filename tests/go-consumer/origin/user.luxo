@@ -1,0 +1,10 @@
+model User @crud {
+  id: UUID @auto
+  name: String
+  createdAt: DateTime
+  updatedAt: DateTime
+}
+
+api greeting(name: String): String @rateLimit(max: 20, window: 1m) {
+  "Hello, ${name}"
+}

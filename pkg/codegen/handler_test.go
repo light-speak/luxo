@@ -38,6 +38,70 @@ func TestGenerateCRUDHandlersUseDeclaredPrimaryKey(t *testing.T) {
 	}
 }
 
+func TestHandlerCompatibilityFunctions(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "user.luxo",
+		Functions: []*ast.FnDecl{{
+			Name:       "lookup",
+			ReturnType: &ast.TypeRef{Name: "Result"},
+			Directives: []*ast.Directive{{Name: "native"}},
+		}},
+	}}}
+	if names := collectNativeFunctionNames(result); !names["lookup"] {
+		t.Fatalf("native function names = %#v", names)
+	}
+
+	model := &ast.ModelDecl{Name: "User", Fields: []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}}}
+	models := map[string]*ast.ModelDecl{"User": model}
+	var b strings.Builder
+	generateCompiledHandlers(&b, result, models)
+	generateServiceFnHandlers(&b, result, models)
+	generateRegisterServiceFns(&b, nil)
+	writeSortedCrossModuleImports(&b, map[string]string{"user": "user_luxo"})
+	generateBatchLoadHandlers(&b, nil)
+	if got := collectBatchLoadModels(nil, nil); len(got) != 0 {
+		t.Fatalf("batch models = %#v", got)
+	}
+	if got := remoteLoadCallsForResult(result); got != nil {
+		t.Fatalf("remote load calls = %#v", got)
+	}
+	generateSelectedSQLFields(&b, model)
+	writeAPIRegistration(&b, "getUser")
+	if typ, nullable, list := resolveParamMetaFromAST("getUser", "id"); typ == "" || nullable || list {
+		t.Fatalf("resolved param = %q, %v, %v", typ, nullable, list)
+	}
+	if groups := collectComputedAggregateGroups(model, models, nil); len(groups) != 0 {
+		t.Fatalf("computed aggregate groups = %#v", groups)
+	}
+	if _, _, ok := parseComputedAggregate("User", model.Fields[0]); ok {
+		t.Fatal("plain field parsed as a computed aggregate")
+	}
+	features := &handlerFeatures{}
+	scanStmtsForEmit(nil, features, "user")
+	generateFederationResolvers(&b, result, []*ast.ModelDecl{model}, nil)
+}
+
+func TestDirectiveDurationRejectsMalformedValues(t *testing.T) {
+	if arg := findCodegenDirectiveArg(nil, "missing", 0); arg.Value != nil {
+		t.Fatalf("missing directive argument = %#v", arg)
+	}
+	tests := []*ast.Directive{
+		{Name: "timeout"},
+		{Name: "timeout", Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.String, Value: "slow"}}}},
+		{Name: "timeout", Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Duration, Value: "forever"}}}},
+	}
+	for _, directive := range tests {
+		if got, ok := directiveDuration(directive, "value", 0); ok || got != "" {
+			t.Fatalf("directiveDuration(%#v) = %q, %v", directive, got, ok)
+		}
+	}
+	if got, ok := directiveDuration(&ast.Directive{Args: []*ast.NamedArg{{
+		Value: &ast.Literal{Kind: token.Duration, Value: "5ms"},
+	}}}, "value", 0); !ok || got != "5 * time.Millisecond" {
+		t.Fatalf("duration = %q, %v", got, ok)
+	}
+}
+
 func TestGenerateSQLColumnSelectorUsesDeclaredDatabaseFields(t *testing.T) {
 	model := &ast.ModelDecl{
 		Name: "Product",
@@ -93,14 +157,10 @@ func crudDirective(args ...*ast.NamedArg) *ast.Directive {
 }
 
 func TestGenerateBatchLoadHandlersUsesCanonicalListAndSelection(t *testing.T) {
-	oldAPIs := apiIDs
-	oldFields := modelFieldIDs
-	defer func() {
-		apiIDs = oldAPIs
-		modelFieldIDs = oldFields
-	}()
-	apiIDs = map[string]int{"svc:batchLoad:User": 42}
-	modelFieldIDs = map[string]map[string]int{"User": {"id": 1, "name": 2, "posts": 3}}
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+		APIs:        map[string]int{"svc:batchLoad:User": 42},
+		ModelFields: map[string]map[string]int{"User": {"id": 1, "name": 2, "posts": 3}},
+	}})
 
 	model := &ast.ModelDecl{
 		Name: "User",
@@ -112,7 +172,7 @@ func TestGenerateBatchLoadHandlersUsesCanonicalListAndSelection(t *testing.T) {
 		},
 	}
 	var b strings.Builder
-	generateBatchLoadHandlers(&b, []*ast.ModelDecl{model})
+	generator.generateBatchLoadHandlers(&b, []*ast.ModelDecl{model})
 	code := b.String()
 
 	if !strings.Contains(code, `ParamIntArray("keys")`) {
@@ -130,9 +190,7 @@ func TestGenerateBatchLoadHandlersUsesCanonicalListAndSelection(t *testing.T) {
 }
 
 func TestGenerateBatchLoadHandlersSupportsUUID(t *testing.T) {
-	oldAPIs := apiIDs
-	defer func() { apiIDs = oldAPIs }()
-	apiIDs = map[string]int{"svc:batchLoad:Account": 45}
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIs: map[string]int{"svc:batchLoad:Account": 45}}})
 	model := &ast.ModelDecl{
 		Name: "Account",
 		Fields: []*ast.FieldDecl{{
@@ -142,7 +200,7 @@ func TestGenerateBatchLoadHandlersSupportsUUID(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateBatchLoadHandlers(&b, []*ast.ModelDecl{model})
+	generator.generateBatchLoadHandlers(&b, []*ast.ModelDecl{model})
 	code := b.String()
 	for _, check := range []string{
 		`ParamUUIDArray("keys")`,
@@ -156,27 +214,18 @@ func TestGenerateBatchLoadHandlersSupportsUUID(t *testing.T) {
 }
 
 func TestGenerateRemoteNamedLoadHandlers(t *testing.T) {
-	oldContext := globalEventCtx
-	oldAPIs := apiIDs
-	oldFields := modelFieldIDs
-	defer func() {
-		globalEventCtx = oldContext
-		apiIDs = oldAPIs
-		modelFieldIDs = oldFields
-	}()
-	globalEventCtx = &EventContext{remoteLoadCalls: map[string][]loadCallInfo{
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{remoteLoadCalls: map[string][]loadCallInfo{
 		"user": {{
 			modelName:    "User",
 			argNames:     []string{"tenantId", "email"},
 			argTypes:     []string{"int64", "string"},
 			argTypeNames: []string{"Int", "String"},
 		}},
-	}}
-	apiIDs = map[string]int{"svc:load:User:tenantId:email": 72}
-	apiParamIDs = map[string]map[string]int{
-		"svc:load:User:tenantId:email": {"tenantId": 4, "email": 7},
-	}
-	modelFieldIDs = map[string]map[string]int{"User": {"id": 1, "tenantId": 2, "email": 3, "name": 4}}
+	}}, IDs: StableIDs{
+		APIs:        map[string]int{"svc:load:User:tenantId:email": 72},
+		APIParams:   map[string]map[string]int{"svc:load:User:tenantId:email": {"tenantId": 4, "email": 7}},
+		ModelFields: map[string]map[string]int{"User": {"id": 1, "tenantId": 2, "email": 3, "name": 4}},
+	}})
 
 	user := &ast.ModelDecl{
 		Name: "User",
@@ -188,7 +237,7 @@ func TestGenerateRemoteNamedLoadHandlers(t *testing.T) {
 		},
 	}
 	result := &semantic.Result{Files: []*ast.File{{Name: "origin/user.luxo", Models: []*ast.ModelDecl{user}}}}
-	code := string(generateHandlerFile(result, "luxo", nil))
+	code := string(generator.generateHandlerFile(result, "luxo", nil))
 	if _, err := format.Source([]byte(code)); err != nil {
 		t.Fatalf("remote load handler generated invalid Go: %v\n%s", err, code)
 	}
@@ -256,14 +305,10 @@ func TestGenerateRemoteNamedLoadHandlerSingleSoftKey(t *testing.T) {
 }
 
 func TestGenerateFederationResolversUsesCanonicalListAndSelection(t *testing.T) {
-	oldAPIs := apiIDs
-	oldFields := modelFieldIDs
-	defer func() {
-		apiIDs = oldAPIs
-		modelFieldIDs = oldFields
-	}()
-	apiIDs = map[string]int{"svc:resolve:Post:userId": 43}
-	modelFieldIDs = map[string]map[string]int{"Post": {"id": 1, "userId": 2, "title": 3}}
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+		APIs:        map[string]int{"svc:resolve:Post:userId": 43},
+		ModelFields: map[string]map[string]int{"Post": {"id": 1, "userId": 2, "title": 3}},
+	}})
 
 	post := &ast.ModelDecl{
 		Name: "Post",
@@ -290,7 +335,7 @@ func TestGenerateFederationResolversUsesCanonicalListAndSelection(t *testing.T) 
 	}}}
 
 	var b strings.Builder
-	generateFederationResolvers(&b, result, []*ast.ModelDecl{post}, nil)
+	generator.generateFederationResolvers(&b, result, []*ast.ModelDecl{post}, nil)
 	code := b.String()
 	if !strings.Contains(code, `Name: "keys", Type: "Int", IsList: true`) {
 		t.Errorf("resolver metadata must describe one canonical list param:\n%s", code)
@@ -304,17 +349,10 @@ func TestGenerateFederationResolversUsesCanonicalListAndSelection(t *testing.T) 
 }
 
 func TestGenerateFederationResolversUsesExtendedModelPrimaryKeyType(t *testing.T) {
-	oldContext := globalEventCtx
-	oldAPIs := apiIDs
-	defer func() {
-		globalEventCtx = oldContext
-		apiIDs = oldAPIs
-	}()
-	apiIDs = map[string]int{"svc:resolve:Review:productSku": 44}
-	globalEventCtx = &EventContext{
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		ModelIDType:  map[string]string{"Product": "String"},
 		ModelIDField: map[string]string{"Product": "sku"},
-	}
+	}, IDs: StableIDs{APIs: map[string]int{"svc:resolve:Review:productSku": 44}}})
 
 	review := &ast.ModelDecl{
 		Name: "Review",
@@ -336,7 +374,7 @@ func TestGenerateFederationResolversUsesExtendedModelPrimaryKeyType(t *testing.T
 	}}}
 
 	var b strings.Builder
-	generateFederationResolvers(&b, result, []*ast.ModelDecl{review}, nil)
+	generator.generateFederationResolvers(&b, result, []*ast.ModelDecl{review}, nil)
 	code := b.String()
 	for _, want := range []string{
 		`ParamStringArray("keys")`,
@@ -351,12 +389,10 @@ func TestGenerateFederationResolversUsesExtendedModelPrimaryKeyType(t *testing.T
 }
 
 func TestGenerateFederationResolversSkipsNullForeignKeys(t *testing.T) {
-	oldContext := globalEventCtx
-	defer func() { globalEventCtx = oldContext }()
-	globalEventCtx = &EventContext{
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		ModelIDType:  map[string]string{"Product": "String"},
 		ModelIDField: map[string]string{"Product": "sku"},
-	}
+	}})
 
 	review := &ast.ModelDecl{
 		Name: "Review",
@@ -378,7 +414,7 @@ func TestGenerateFederationResolversSkipsNullForeignKeys(t *testing.T) {
 	}}}
 
 	var b strings.Builder
-	generateFederationResolvers(&b, result, []*ast.ModelDecl{review}, nil)
+	generator.generateFederationResolvers(&b, result, []*ast.ModelDecl{review}, nil)
 	code := b.String()
 	for _, want := range []string{
 		"fk := row.ProductSku",
@@ -1960,27 +1996,23 @@ func TestInferParamType(t *testing.T) {
 // --- resolveParamTypeFromAST ---
 
 func TestResolveParamTypeFromAST(t *testing.T) {
-	old := apiParamTypes
-	defer func() { apiParamTypes = old }()
-
 	// No AST data — falls back to heuristic
-	apiParamTypes = nil
 	if got := resolveParamTypeFromAST("getUser", "id"); got != "Int" {
 		t.Fatalf("fallback should use inferParamType, got %q", got)
 	}
 
 	// With AST data
-	apiParamTypes = map[string]map[string]string{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIParamTypes: map[string]map[string]string{
 		"getUser": {"id": "UUID"},
-	}
-	if got := resolveParamTypeFromAST("getUser", "id"); got != "UUID" {
+	}}})
+	if got, _, _ := generator.resolveParamMetaFromAST("getUser", "id"); got != "UUID" {
 		t.Fatalf("should use AST type, got %q", got)
 	}
-	if got := resolveParamTypeFromAST("svc:getUser", "id"); got != "UUID" {
+	if got, _, _ := generator.resolveParamMetaFromAST("svc:getUser", "id"); got != "UUID" {
 		t.Fatalf("service API should use the unprefixed AST type, got %q", got)
 	}
 	// Missing param in AST — fallback
-	if got := resolveParamTypeFromAST("getUser", "name"); got != "String" {
+	if got, _, _ := generator.resolveParamMetaFromAST("getUser", "name"); got != "String" {
 		t.Fatalf("missing param should fallback, got %q", got)
 	}
 }
@@ -1988,33 +2020,24 @@ func TestResolveParamTypeFromAST(t *testing.T) {
 // --- writeAPIRegistration ---
 
 func TestWriteAPIRegistration(t *testing.T) {
-	oldIDs := apiIDs
-	oldParamIDs := apiParamIDs
-	oldParamTypes := apiParamTypes
-	defer func() {
-		apiIDs = oldIDs
-		apiParamIDs = oldParamIDs
-		apiParamTypes = oldParamTypes
-	}()
-
 	// ID = 0 → early return
-	apiIDs = map[string]int{}
+	generator := mustNewGenerator(t, GeneratorConfig{})
 	var b strings.Builder
-	writeAPIRegistration(&b, "noApi")
+	generator.writeAPIRegistration(&b, "noApi")
 	if b.Len() != 0 {
 		t.Error("zero ID should produce no output")
 	}
 
 	// With ID and params
-	apiIDs = map[string]int{"getUser": 5}
-	apiParamIDs = map[string]map[string]int{
+	generator.ids.APIs = map[string]int{"getUser": 5}
+	generator.ids.APIParams = map[string]map[string]int{
 		"getUser": {"id": 2, "name": 1},
 	}
-	apiParamTypes = map[string]map[string]string{
+	generator.ids.APIParamTypes = map[string]map[string]string{
 		"getUser": {"id": "Int", "name": "String"},
 	}
 	b.Reset()
-	writeAPIRegistration(&b, "getUser")
+	generator.writeAPIRegistration(&b, "getUser")
 	code := b.String()
 	if !strings.Contains(code, `Register("getUser", 5)`) {
 		t.Errorf("missing Register call:\n%s", code)
@@ -2029,36 +2052,28 @@ func TestWriteAPIRegistration(t *testing.T) {
 		t.Errorf("parameters are not sorted by field ID:\n%s", code)
 	}
 
-	apiParamIDs["getUser"] = map[string]int{"ids": 2}
-	apiParamTypes["getUser"] = map[string]string{"ids": "[UUID]?"}
+	generator.ids.APIParams["getUser"] = map[string]int{"ids": 2}
+	generator.ids.APIParamTypes["getUser"] = map[string]string{"ids": "[UUID]?"}
 	b.Reset()
-	writeAPIRegistration(&b, "getUser")
+	generator.writeAPIRegistration(&b, "getUser")
 	if code := b.String(); !strings.Contains(code, `Type: "UUID", FieldID: 2, IsList: true, Nullable: true`) {
 		t.Errorf("missing list metadata:\n%s", code)
 	}
 
-	apiParamIDs["getUser"] = map[string]int{"id": 1, "removed": 9}
-	apiParamTypes["getUser"] = map[string]string{"id": "Int"}
+	generator.ids.APIParams["getUser"] = map[string]int{"id": 1, "removed": 9}
+	generator.ids.APIParamTypes["getUser"] = map[string]string{"id": "Int"}
 	b.Reset()
-	writeAPIRegistration(&b, "getUser")
+	generator.writeAPIRegistration(&b, "getUser")
 	if code := b.String(); strings.Contains(code, `Name: "removed"`) {
 		t.Errorf("stale lock-file params must not be registered:\n%s", code)
 	}
 }
 
 func TestWriteAPIRegistrationNoParams(t *testing.T) {
-	oldIDs := apiIDs
-	oldParamIDs := apiParamIDs
-	defer func() {
-		apiIDs = oldIDs
-		apiParamIDs = oldParamIDs
-	}()
-
-	apiIDs = map[string]int{"ping": 1}
-	apiParamIDs = nil
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIs: map[string]int{"ping": 1}}})
 
 	var b strings.Builder
-	writeAPIRegistration(&b, "ping")
+	generator.writeAPIRegistration(&b, "ping")
 	code := b.String()
 	if !strings.Contains(code, `Register("ping", 1)`) {
 		t.Errorf("missing Register:\n%s", code)
@@ -2864,6 +2879,19 @@ func TestWriteHandlerRegistration_Cache(t *testing.T) {
 	}
 }
 
+func TestWriteHandlerRegistration_RateLimit(t *testing.T) {
+	var b strings.Builder
+	dirs := []*ast.Directive{{Name: "rateLimit", Args: []*ast.NamedArg{
+		{Name: "max", Value: &ast.Literal{Kind: token.Int, Value: "100"}},
+		{Name: "window", Value: &ast.Literal{Kind: token.Duration, Value: "1m"}},
+	}}}
+	writeHandlerRegistration(&b, "getUser", dirs)
+	out := b.String()
+	if !strings.Contains(out, "api.WithRateLimit(100, time.Minute, handleGetUser(app))") {
+		t.Fatalf("@rateLimit should wrap the handler with typed settings: %s", out)
+	}
+}
+
 func TestWriteHandlerRegistration_Plain(t *testing.T) {
 	var b strings.Builder
 	writeHandlerRegistration(&b, "getUser", nil)
@@ -2909,11 +2937,9 @@ func TestGenerateBeforeSave_NoDirective(t *testing.T) {
 // ─── Aggregate computed fields ──────────────────────────────────────────────
 
 func TestGenerateComputedResolversBatchByRelation(t *testing.T) {
-	oldFields := modelFieldIDs
-	defer func() { modelFieldIDs = oldFields }()
-	modelFieldIDs = map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"User": {"id": 1, "postCount": 4, "avgLikes": 5, "totalLikes": 6},
-	}
+	}}})
 	user := &ast.ModelDecl{
 		Name:       "User",
 		Directives: []*ast.Directive{{Name: "crud"}},
@@ -2937,7 +2963,7 @@ func TestGenerateComputedResolversBatchByRelation(t *testing.T) {
 	models := map[string]*ast.ModelDecl{"User": user, "Post": post}
 
 	var b strings.Builder
-	generateComputedResolvers(&b, []*ast.ModelDecl{user, post}, models, map[string]bool{})
+	generator.generateComputedResolvers(&b, []*ast.ModelDecl{user, post}, models, map[string]bool{})
 	out := b.String()
 
 	for _, want := range []string{
@@ -2965,9 +2991,9 @@ func TestGenerateComputedResolversBatchByRelation(t *testing.T) {
 }
 
 func TestGenerateComputedResolversCustomRelationKeys(t *testing.T) {
-	oldFields := modelFieldIDs
-	defer func() { modelFieldIDs = oldFields }()
-	modelFieldIDs = map[string]map[string]int{"Product": {"sku": 1, "tenant": 2, "reviewCount": 3}}
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
+		"Product": {"sku": 1, "tenant": 2, "reviewCount": 3},
+	}}})
 	product := &ast.ModelDecl{
 		Name: "Product",
 		Fields: []*ast.FieldDecl{
@@ -2983,7 +3009,7 @@ func TestGenerateComputedResolversCustomRelationKeys(t *testing.T) {
 	}}
 
 	var b strings.Builder
-	generateComputedResolvers(&b, []*ast.ModelDecl{product, review}, map[string]*ast.ModelDecl{"Product": product, "Review": review}, map[string]bool{})
+	generator.generateComputedResolvers(&b, []*ast.ModelDecl{product, review}, map[string]*ast.ModelDecl{"Product": product, "Review": review}, map[string]bool{})
 	out := b.String()
 	for _, want := range []string{
 		`SELECT "product_tenant", COUNT(*)::bigint FROM "reviews" WHERE "product_tenant" = ANY($1) GROUP BY "product_tenant"`,
@@ -2997,7 +3023,7 @@ func TestGenerateComputedResolversCustomRelationKeys(t *testing.T) {
 	}
 	var selector strings.Builder
 	generateSQLColumnSelector(&selector, product, map[string]bool{})
-	generateSelectedSQLFields(&selector, product, map[string]bool{})
+	generator.generateSelectedSQLFields(&selector, product, map[string]bool{})
 	for _, want := range []string{
 		`case "reviewCount":`,
 		`cols = ensureSelectedColumn(cols, "tenant")`,
@@ -3019,13 +3045,11 @@ func TestGenerateComputedResolversNoComputed(t *testing.T) {
 }
 
 func TestNestedRelationResolvesComputedFieldsInOneBatch(t *testing.T) {
-	oldFields := modelFieldIDs
-	defer func() { modelFieldIDs = oldFields }()
-	modelFieldIDs = map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"User":    {"id": 1, "posts": 2},
 		"Post":    {"id": 1, "userId": 2, "comments": 3, "commentCount": 4},
 		"Comment": {"id": 1, "postId": 2},
-	}
+	}}})
 	user := &ast.ModelDecl{Name: "User", Directives: []*ast.Directive{{Name: "crud"}}, Fields: []*ast.FieldDecl{
 		{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
 		{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
@@ -3041,7 +3065,7 @@ func TestNestedRelationResolvesComputedFieldsInOneBatch(t *testing.T) {
 		{Name: "postId", Type: &ast.TypeRef{Name: "Int"}},
 	}}
 	result := &semantic.Result{Files: []*ast.File{{Models: []*ast.ModelDecl{user, post, comment}}}}
-	out := string(generateHandlerFile(result, "example", map[string]bool{}))
+	out := string(generator.generateHandlerFile(result, "example", map[string]bool{}))
 	for _, want := range []string{
 		"func resolvePostComputedFields(",
 		"case \"commentCount\": needComments = true",
@@ -3090,31 +3114,23 @@ func TestNestedComputedResolveSupportsScalarRelations(t *testing.T) {
 }
 
 func TestCollectBatchLoadModelsIncludesRemotePrimaryKeyModel(t *testing.T) {
-	oldContext := globalEventCtx
-	defer func() { globalEventCtx = oldContext }()
-	globalEventCtx = &EventContext{remotePKModels: map[string]bool{"Post": true}}
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{remotePKModels: map[string]bool{"Post": true}}})
 	user := &ast.ModelDecl{Name: "User"}
 	post := &ast.ModelDecl{Name: "Post"}
-	models := collectBatchLoadModels([]*ast.ModelDecl{user}, []*ast.ModelDecl{user, post})
+	models := generator.collectBatchLoadModels([]*ast.ModelDecl{user}, []*ast.ModelDecl{user, post})
 	if len(models) != 2 || models[1] != post {
 		t.Fatalf("batch load models = %#v", models)
 	}
 }
 
 func TestWriteAPIRegistrationSkipsOnlyStaleParams(t *testing.T) {
-	oldAPIs := apiIDs
-	oldParams := apiParamIDs
-	oldTypes := apiParamTypes
-	defer func() {
-		apiIDs = oldAPIs
-		apiParamIDs = oldParams
-		apiParamTypes = oldTypes
-	}()
-	apiIDs = map[string]int{"svc:lookup": 9}
-	apiParamIDs = map[string]map[string]int{"svc:lookup": {"stale": 1}}
-	apiParamTypes = map[string]map[string]string{"lookup": {"active": "String"}}
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+		APIs:          map[string]int{"svc:lookup": 9},
+		APIParams:     map[string]map[string]int{"svc:lookup": {"stale": 1}},
+		APIParamTypes: map[string]map[string]string{"lookup": {"active": "String"}},
+	}})
 	var b strings.Builder
-	writeAPIRegistration(&b, "svc:lookup")
+	generator.writeAPIRegistration(&b, "svc:lookup")
 	out := b.String()
 	if !strings.Contains(out, `router.Registry.Register("svc:lookup", 9)`) || strings.Contains(out, "RegisterParams") {
 		t.Fatalf("stale parameter registration output:\n%s", out)
@@ -3122,12 +3138,10 @@ func TestWriteAPIRegistrationSkipsOnlyStaleParams(t *testing.T) {
 }
 
 func TestComputedAggregateValidationBranches(t *testing.T) {
-	oldFields := modelFieldIDs
-	defer func() { modelFieldIDs = oldFields }()
-	modelFieldIDs = map[string]map[string]int{"User": {"badArgs": 2}}
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{"User": {"badArgs": 2}}}})
 
 	missingID := computedAggregateField("missing", "Int", "count", &ast.Ident{Name: "posts"})
-	if _, _, ok := parseComputedAggregate("User", missingID); ok {
+	if _, _, ok := generator.parseComputedAggregate("User", missingID); ok {
 		t.Fatal("computed field without a field ID was accepted")
 	}
 	badArgs := &ast.FieldDecl{
@@ -3135,7 +3149,7 @@ func TestComputedAggregateValidationBranches(t *testing.T) {
 		Type:     &ast.TypeRef{Name: "Int"},
 		Computed: &ast.ComputedField{Directives: []*ast.Directive{{Name: "count"}}},
 	}
-	if _, _, ok := parseComputedAggregate("User", badArgs); ok {
+	if _, _, ok := generator.parseComputedAggregate("User", badArgs); ok {
 		t.Fatal("computed field without one directive argument was accepted")
 	}
 
@@ -3456,19 +3470,16 @@ func TestScanBodyForBuiltins(t *testing.T) {
 }
 
 func TestScanBodyForBuiltinsEmit(t *testing.T) {
-	old := globalEventCtx
-	defer func() { globalEventCtx = old }()
-
-	globalEventCtx = &EventContext{
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		EventModule: map[string]string{"ProjectDeleted": "common"},
 		ModulePath:  "github.com/test/service",
-	}
+	}})
 
 	body := &ast.Block{Stmts: []ast.Stmt{
 		&ast.EmitStmt{EventName: "ProjectDeleted"},
 	}}
 	var f handlerFeatures
-	scanBodyForBuiltins(body, &f, "project")
+	generator.scanBodyForBuiltins(body, &f, "project")
 	if !f.hasEmit {
 		t.Error("should detect emit")
 	}
@@ -3478,13 +3489,10 @@ func TestScanBodyForBuiltinsEmit(t *testing.T) {
 }
 
 func TestScanBodyForBuiltinsNestedEmit(t *testing.T) {
-	old := globalEventCtx
-	defer func() { globalEventCtx = old }()
-
-	globalEventCtx = &EventContext{
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		EventModule: map[string]string{"ProjectDeleted": "common"},
 		ModulePath:  "github.com/test/service",
-	}
+	}})
 
 	// Emit inside IfStmt
 	body := &ast.Block{Stmts: []ast.Stmt{
@@ -3496,7 +3504,7 @@ func TestScanBodyForBuiltinsNestedEmit(t *testing.T) {
 		},
 	}}
 	var f handlerFeatures
-	scanBodyForBuiltins(body, &f, "project")
+	generator.scanBodyForBuiltins(body, &f, "project")
 	if !f.hasEmit {
 		t.Error("should detect emit inside if")
 	}
@@ -3515,7 +3523,7 @@ func TestScanBodyForBuiltinsNestedEmit(t *testing.T) {
 		},
 	}}
 	var f2 handlerFeatures
-	scanBodyForBuiltins(body2, &f2, "project")
+	generator.scanBodyForBuiltins(body2, &f2, "project")
 	if !f2.hasEmit {
 		t.Error("should detect emit inside for")
 	}
@@ -3529,7 +3537,7 @@ func TestScanBodyForBuiltinsNestedEmit(t *testing.T) {
 		}},
 	}}
 	var f3 handlerFeatures
-	scanBodyForBuiltins(body3, &f3, "project")
+	generator.scanBodyForBuiltins(body3, &f3, "project")
 	if !f3.hasEmit {
 		t.Error("should detect emit inside transaction")
 	}
@@ -3543,7 +3551,7 @@ func TestScanBodyForBuiltinsNestedEmit(t *testing.T) {
 		}},
 	}}
 	var f4 handlerFeatures
-	scanBodyForBuiltins(body4, &f4, "project")
+	generator.scanBodyForBuiltins(body4, &f4, "project")
 	if !f4.hasEmit {
 		t.Error("should detect emit inside async")
 	}
@@ -3557,25 +3565,22 @@ func TestScanBodyForBuiltinsNestedEmit(t *testing.T) {
 		}},
 	}}
 	var f5 handlerFeatures
-	scanBodyForBuiltins(body5, &f5, "project")
+	generator.scanBodyForBuiltins(body5, &f5, "project")
 	if !f5.hasEmit {
 		t.Error("should detect emit inside await")
 	}
 }
 
 func TestScanBodyForBuiltinsLocalEmit(t *testing.T) {
-	old := globalEventCtx
-	defer func() { globalEventCtx = old }()
-
-	globalEventCtx = &EventContext{
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		EventModule: map[string]string{"TraceIngested": "monitoring"},
-	}
+	}})
 
 	body := &ast.Block{Stmts: []ast.Stmt{
 		&ast.EmitStmt{EventName: "TraceIngested"},
 	}}
 	var f handlerFeatures
-	scanBodyForBuiltins(body, &f, "monitoring")
+	generator.scanBodyForBuiltins(body, &f, "monitoring")
 	if !f.hasEmit {
 		t.Error("should detect emit")
 	}
@@ -3585,12 +3590,9 @@ func TestScanBodyForBuiltinsLocalEmit(t *testing.T) {
 }
 
 func TestWriteSortedCrossModuleImports(t *testing.T) {
-	old := globalEventCtx
-	defer func() { globalEventCtx = old }()
-
-	globalEventCtx = &EventContext{
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		ModulePath: "github.com/test/service",
-	}
+	}})
 
 	var b strings.Builder
 	imports := map[string]string{
@@ -3598,7 +3600,7 @@ func TestWriteSortedCrossModuleImports(t *testing.T) {
 		"monitoring": "monitoring_luxo",
 		"auth":       "auth_luxo",
 	}
-	writeSortedCrossModuleImports(&b, imports)
+	generator.writeSortedCrossModuleImports(&b, imports)
 	out := b.String()
 
 	// Should be sorted alphabetically: auth, common, monitoring
@@ -3613,17 +3615,15 @@ func TestWriteSortedCrossModuleImports(t *testing.T) {
 	}
 
 	// No context → no output
-	globalEventCtx = nil
 	var b2 strings.Builder
-	writeSortedCrossModuleImports(&b2, imports)
+	defaultGenerator().writeSortedCrossModuleImports(&b2, imports)
 	if b2.Len() != 0 {
 		t.Error("should produce nothing without event context")
 	}
 
 	// Empty imports → no output
-	globalEventCtx = &EventContext{ModulePath: "github.com/test/service"}
 	var b3 strings.Builder
-	writeSortedCrossModuleImports(&b3, nil)
+	generator.writeSortedCrossModuleImports(&b3, nil)
 	if b3.Len() != 0 {
 		t.Error("should produce nothing with empty imports")
 	}

@@ -43,6 +43,13 @@ func TestRouterBasic(t *testing.T) {
 	}
 }
 
+func TestDirectClientKeyFallsBackToUnparsedAddress(t *testing.T) {
+	const remoteAddress = "unix-client"
+	if got := directClientKey(remoteAddress); got != remoteAddress {
+		t.Fatalf("directClientKey = %q, want %q", got, remoteAddress)
+	}
+}
+
 func TestRouterWithSelect(t *testing.T) {
 	rt := NewRouter()
 	rt.Handle("getUser", func(ctx context.Context, req *Request) error {

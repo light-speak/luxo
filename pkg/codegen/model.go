@@ -119,6 +119,10 @@ func generateTypeStruct(b *strings.Builder, t *ast.TypeDecl, enums map[string]bo
 // generateExtendStub generates a minimal Go struct for an extend declaration.
 // This provides type information for cross-module references.
 func generateExtendStub(b *strings.Builder, ext *ast.ExtendDecl) {
+	defaultGenerator().generateExtendStub(b, ext)
+}
+
+func (g *GeneratorContext) generateExtendStub(b *strings.Builder, ext *ast.ExtendDecl) {
 	var fields []fieldInfo
 	maxName := 0
 	maxType := 0
@@ -144,7 +148,7 @@ func generateExtendStub(b *strings.Builder, ext *ast.ExtendDecl) {
 	fmt.Fprintf(b, "// %s is a stub for the external %s model (from extend).\n", ext.Name, ext.Name)
 	fmt.Fprintf(b, "type %s struct {\n", ext.Name)
 	// Always include the owner's primary key for foreign-key references and DataLoader.
-	idFieldName := externalModelIDFieldName(ext.Name)
+	idFieldName := g.externalModelIDFieldName(ext.Name)
 	idGoName := str.Capitalize(idFieldName)
 	hasId := false
 	for _, fi := range fields {
@@ -154,7 +158,7 @@ func generateExtendStub(b *strings.Builder, ext *ast.ExtendDecl) {
 	}
 	if !hasId {
 		idName := idGoName
-		idType := mapBaseType(externalModelIDTypeName(ext.Name))
+		idType := mapBaseType(g.externalModelIDTypeName(ext.Name))
 		if len(idName) > maxName {
 			maxName = len(idName)
 		}

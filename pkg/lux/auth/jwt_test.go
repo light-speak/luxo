@@ -203,6 +203,35 @@ func TestLoadConfigBadRefreshExpires(t *testing.T) {
 	}
 }
 
+func TestLoadConfigRejectsInvalidSecuritySettings(t *testing.T) {
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "empty secret", key: "JWT_SECRET", value: ""},
+		{name: "non-positive expiry", key: "JWT_EXPIRES", value: "0s"},
+		{name: "invalid refresh flag", key: "JWT_REFRESH", value: "yes"},
+		{name: "non-positive refresh expiry", key: "JWT_REFRESH_EXPIRES", value: "-1s"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ResetConfig()
+			t.Cleanup(ResetConfig)
+			t.Setenv("JWT_SECRET", "test-secret")
+			if tt.key != "JWT_SECRET" {
+				t.Setenv("JWT_EXPIRES", "1h")
+				t.Setenv("JWT_REFRESH", "false")
+				t.Setenv("JWT_REFRESH_EXPIRES", "24h")
+			}
+			t.Setenv(tt.key, tt.value)
+			if _, err := LoadConfig(); err == nil {
+				t.Fatal("invalid JWT configuration must be rejected")
+			}
+		})
+	}
+}
+
 func TestParseDuration(t *testing.T) {
 	tests := []struct {
 		input    string

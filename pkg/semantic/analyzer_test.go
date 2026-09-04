@@ -1,7 +1,9 @@
 package semantic
 
 import (
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/ast"
@@ -9,6 +11,39 @@ import (
 	"github.com/light-speak/luxo/pkg/parser"
 	"github.com/light-speak/luxo/pkg/token"
 )
+
+func TestConcurrentAnalysesAreIsolated(t *testing.T) {
+	const workers = 64
+	var wait sync.WaitGroup
+	errors := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			modelName := fmt.Sprintf("Model%d", index)
+			input := "model " + modelName + " { value: Int }"
+			tokens, lexErrors := lexer.New(input, modelName+".luxo").Tokenize()
+			if len(lexErrors) > 0 {
+				errors <- fmt.Errorf("worker %d lexer: %v", index, lexErrors)
+				return
+			}
+			file, parseErrors := parser.New(tokens).Parse(modelName + ".luxo")
+			if len(parseErrors) > 0 {
+				errors <- fmt.Errorf("worker %d parser: %v", index, parseErrors)
+				return
+			}
+			result := Analyze([]*ast.File{file})
+			if len(result.Errors) > 0 || result.Types[modelName] == nil {
+				errors <- fmt.Errorf("worker %d result: errors=%v types=%v", index, result.Errors, result.Types)
+			}
+		}(i)
+	}
+	wait.Wait()
+	close(errors)
+	for err := range errors {
+		t.Error(err)
+	}
+}
 
 func analyze(t *testing.T, input string) *Result {
 	t.Helper()
@@ -163,7 +198,7 @@ api listUsers(limit: Int): [User]
 }
 
 func TestFnDeclaration(t *testing.T) {
-	result := analyze(t, `fn encrypt(value: String): String @native`)
+	result := analyze(t, `fn encrypt(value: String): Result<String> @native`)
 	expectNoErrors(t, result)
 
 	sym := result.Scope.Lookup("encrypt")
@@ -214,7 +249,7 @@ api register(input: AuthResult): AuthResult {
   AuthResult { token: "abc", user: user }
 }
 
-fn encrypt(value: String): String @native
+fn encrypt(value: String): Result<String> @native
 
 extend User {
   orders: [Post]
@@ -418,7 +453,7 @@ func TestDestructuringNonTuple(t *testing.T) {
 	// destructuring from a non-tuple — all variables get the same type
 	result := analyze(t, `
 model User { name: String }
-fn getPair(): User @native
+fn getPair(): User @native @service
 api test(): User {
   val (a, b) = getPair()
   a
@@ -604,7 +639,7 @@ func TestCRUDItDisambiguation(t *testing.T) {
 	result := analyze(t, `
 model Room { roomId: Int  name: String }
 api test(roomId: Int): Room {
-  val room = Room.find(where: it.roomId == roomId)
+  val room = Room.find(where: it.roomId == roomId).firstOrNull
     ?: throw error.not_found
   room
 }
@@ -616,7 +651,7 @@ func TestCRUDItNoAmbiguity(t *testing.T) {
 	result := analyze(t, `
 model User { name: String  email: String }
 api test(input: String): User {
-  val user = User.find(where: email == input)
+  val user = User.find(where: email == input).firstOrNull
     ?: throw error.not_found
   user
 }
@@ -948,7 +983,7 @@ func TestCollectAmbiguousIdentsDifferentNames(t *testing.T) {
 	result := analyze(t, `
 model User { userId: Int  name: String }
 api test(id: Int): User {
-  val user = User.find(where: userId == id)
+  val user = User.find(where: userId == id).firstOrNull
     ?: throw error.not_found
   user
 }
@@ -968,7 +1003,7 @@ func TestCheckBinaryAmbiguityDisambiguated(t *testing.T) {
 	result := analyze(t, `
 model User { email: String  name: String }
 api test(email: String): User {
-  val user = User.find(where: it.email == email)
+  val user = User.find(where: it.email == email).firstOrNull
     ?: throw error.not_found
   user
 }

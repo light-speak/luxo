@@ -5,6 +5,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlin.test.assertFailsWith
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 
@@ -57,6 +58,7 @@ class LuxoSchemaTest {
             "models": {
                 "User": {
                     "name": "User",
+                    "usage": "output",
                     "fields": [
                         {"id": 1, "name": "id", "type": "Int"},
                         {"id": 2, "name": "name", "type": "String", "nullable": true}
@@ -76,6 +78,7 @@ class LuxoSchemaTest {
         assertEquals(1, schema.models.size)
         val user = schema.models["User"]!!
         assertEquals("User", user.name)
+        assertEquals(TypeUsage.OUTPUT, user.usage)
         assertEquals(2, user.fields.size)
         assertEquals(1, user.fields[0].id)
         assertEquals("id", user.fields[0].name)
@@ -95,6 +98,22 @@ class LuxoSchemaTest {
         )
 
         assertTrue(schema.apis.getValue("watchUser").stream)
+    }
+}
+
+class SelectedTest {
+
+    @Test
+    fun `distinguishes unselected selected null and selected value`() {
+        val absent = Selected.unselected<String?>()
+        val selectedNull = Selected.value<String?>(null)
+        val selectedValue = Selected.value<String?>("Luxo")
+
+        assertFalse(absent.isSelected)
+        assertFailsWith<IllegalStateException> { absent.value() }
+        assertTrue(selectedNull.isSelected)
+        assertNull(selectedNull.value())
+        assertEquals("Luxo", selectedValue.value())
     }
 }
 

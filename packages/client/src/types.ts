@@ -19,6 +19,15 @@ export interface Sorter {
   order: 'asc' | 'desc'
 }
 
+/** Whether a structured schema type crosses an API input/output boundary. */
+export type TypeUsage = 'input' | 'output' | 'inputOutput' | 'unused'
+
+/**
+ * A field-selected output value. `undefined` means the field was not selected;
+ * nullable fields use `null` for an explicitly selected null value.
+ */
+export type Selected<T> = T | undefined
+
 /** Luxo schema definition (from introspection) */
 export interface LuxoSchema {
   models: Record<string, LuxoModel>
@@ -29,6 +38,7 @@ export interface LuxoSchema {
 
 export interface LuxoModel {
   name: string
+  usage?: TypeUsage
   fields: LuxoField[]
 }
 
@@ -50,6 +60,7 @@ export interface LuxoEnum {
 
 export interface LuxoTypeDecl {
   name: string
+  usage?: TypeUsage
   fields: LuxoField[]
 }
 

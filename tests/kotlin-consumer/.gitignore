@@ -1,3 +1,4 @@
 .tmp/
+.kotlin/
 .gradle/
 build/

@@ -30,6 +30,56 @@ func computed(name string) *ast.FieldDecl {
 	}
 }
 
+func TestLockFileMaintenanceCoversExistingReservedIDs(t *testing.T) {
+	lf := New()
+	lf.APIs["search"] = &APILock{
+		ID:       4,
+		Params:   map[string]int{"query": 1, "page": 2, "cursor": 3},
+		Reserved: []int{2},
+	}
+	lf.ensureAPIID("search", []string{"query"})
+	if _, exists := lf.APIs["search"].Params["page"]; exists {
+		t.Fatal("removed API parameter was retained")
+	}
+	if len(lf.APIs["search"].Reserved) != 2 || lf.APIs["search"].Reserved[0] != 2 || lf.APIs["search"].Reserved[1] != 3 {
+		t.Fatalf("reserved params = %v", lf.APIs["search"].Reserved)
+	}
+
+	lf.ReservedAPI = []int{7}
+	lf.APIs["removed"] = &APILock{ID: 7}
+	lf.reserveRemovedAPIs(map[string]bool{"search": true})
+	if _, exists := lf.APIs["removed"]; exists {
+		t.Fatal("removed API was retained")
+	}
+	lf.computeNextAPI()
+	if lf.nextAPI != 7 {
+		t.Fatalf("next API ID = %d, want 7", lf.nextAPI)
+	}
+
+	lf.Models["User"] = &ModelLock{Reserved: []int{3, 1}}
+	lf.Types = make(map[string]*ModelLock)
+	lf.Events = make(map[string]*ModelLock)
+	lf.Types["Payload"] = &ModelLock{Reserved: []int{4, 2}}
+	lf.Events["Changed"] = &ModelLock{Reserved: []int{6, 5}}
+	lf.APIs["search"].Reserved = []int{9, 8}
+	lf.sortReserved()
+	if lf.Models["User"].Reserved[0] != 1 || lf.Types["Payload"].Reserved[0] != 2 ||
+		lf.Events["Changed"].Reserved[0] != 5 || lf.APIs["search"].Reserved[0] != 8 {
+		t.Fatalf("reserved IDs were not sorted: %#v", lf)
+	}
+}
+
+func TestUpdateContractMetadataToleratesMissingRegisteredAPI(t *testing.T) {
+	lf := New()
+	lf.updateContractMetadata([]*ast.File{{APIs: []*ast.ApiDecl{{
+		Name:       "missing",
+		ReturnType: &ast.TypeRef{Name: "String"},
+	}}}})
+	if len(lf.APIs) != 0 {
+		t.Fatalf("contract metadata registered an API: %#v", lf.APIs)
+	}
+}
+
 func model(name string, fields ...*ast.FieldDecl) *ast.ModelDecl {
 	return &ast.ModelDecl{
 		Pos:    pos(),
@@ -55,8 +105,8 @@ func files(models []*ast.ModelDecl, apis []*ast.ApiDecl) []*ast.File {
 
 func TestNew(t *testing.T) {
 	lf := New()
-	if lf.Version != 1 {
-		t.Errorf("Version = %d, want 1", lf.Version)
+	if lf.Version != 2 {
+		t.Errorf("Version = %d, want 2", lf.Version)
 	}
 	if len(lf.Models) != 0 {
 		t.Error("Models should be empty")
@@ -71,7 +121,7 @@ func TestLoadNonExistent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load non-existent should not error: %v", err)
 	}
-	if lf.Version != 1 {
+	if lf.Version != 2 {
 		t.Error("Should return empty lock file")
 	}
 }
@@ -119,8 +169,8 @@ func TestSaveAndLoad(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
-	if loaded.Version != 1 {
-		t.Errorf("Version = %d, want 1", loaded.Version)
+	if loaded.Version != 2 {
+		t.Errorf("Version = %d, want 2", loaded.Version)
 	}
 	if loaded.Models["User"].NextID != 4 {
 		t.Errorf("NextID = %d, want 4", loaded.Models["User"].NextID)
@@ -187,6 +237,241 @@ func TestUpdateExistingModelKeepsIDs(t *testing.T) {
 	if ml.NextID != 5 {
 		t.Errorf("NextID = %d, want 5", ml.NextID)
 	}
+}
+
+func TestBreakingChangesProtectWireContracts(t *testing.T) {
+	base := files(
+		[]*ast.ModelDecl{model("User", field("id", "Int"), field("name", "String"))},
+		[]*ast.ApiDecl{{
+			Name:       "getProfile",
+			Params:     []*ast.ParamDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}},
+			ReturnType: &ast.TypeRef{Name: "User"},
+		}},
+	)
+	lf := New()
+	lf.Update(base)
+
+	compatible := files(
+		[]*ast.ModelDecl{model("User", field("id", "Int"), field("name", "String"), field("avatar", "String"))},
+		[]*ast.ApiDecl{{
+			Name: "getProfile",
+			Params: []*ast.ParamDecl{
+				{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+				{Name: "locale", Type: &ast.TypeRef{Name: "String", Nullable: true}},
+			},
+			ReturnType: &ast.TypeRef{Name: "User"},
+		}},
+	)
+	if changes := lf.BreakingChanges(compatible); len(changes) != 0 {
+		t.Fatalf("additive fields and optional params must be compatible: %v", changes)
+	}
+
+	breaking := files(
+		[]*ast.ModelDecl{model("User", field("id", "String"))},
+		[]*ast.ApiDecl{{
+			Name:       "getProfile",
+			Params:     []*ast.ParamDecl{{Name: "tenant", Type: &ast.TypeRef{Name: "String"}}},
+			ReturnType: &ast.TypeRef{Name: "String"},
+		}},
+	)
+	changes := lf.BreakingChanges(breaking)
+	for _, path := range []string{"model User.id", "model User.name", "api getProfile.id", "api getProfile.tenant", "api getProfile return"} {
+		if !hasBreakingPath(changes, path) {
+			t.Errorf("missing breaking change for %q: %v", path, changes)
+		}
+	}
+}
+
+func TestUpdateReservesRemovedAPIIDs(t *testing.T) {
+	lf := New()
+	lf.Update(files(nil, []*ast.ApiDecl{api("oldAPI")}))
+	oldID := lf.APIID("oldAPI")
+
+	lf.Update(files(nil, []*ast.ApiDecl{api("newAPI")}))
+	if lf.APIID("oldAPI") != 0 {
+		t.Fatal("removed API must not remain active")
+	}
+	if lf.APIID("newAPI") <= oldID {
+		t.Fatalf("new API ID %d reused reserved ID %d", lf.APIID("newAPI"), oldID)
+	}
+	if changes := lf.BreakingChanges(files(nil, []*ast.ApiDecl{api("newAPI")})); len(changes) != 0 {
+		t.Fatalf("accepted removal must not be reported forever: %v", changes)
+	}
+}
+
+func TestAPIContractMetadataSurvivesJSONRoundTrip(t *testing.T) {
+	lf := New()
+	lf.Update(files(nil, []*ast.ApiDecl{{Name: "health", ReturnType: &ast.TypeRef{Name: "String"}}}))
+	data, err := json.Marshal(lf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded := New()
+	if err := json.Unmarshal(data, loaded); err != nil {
+		t.Fatal(err)
+	}
+	changed := files(nil, []*ast.ApiDecl{{Name: "health", ReturnType: &ast.TypeRef{Name: "Int"}}})
+	if changes := loaded.BreakingChanges(changed); !hasBreakingPath(changes, "api health return") {
+		t.Fatalf("return contract was lost after JSON round trip: %v", changes)
+	}
+}
+
+func TestBreakingChangeString(t *testing.T) {
+	tests := []struct {
+		name   string
+		change BreakingChange
+		want   string
+	}{
+		{name: "removed", change: BreakingChange{Path: "model User.name", Before: "String"}, want: "model User.name was removed (was String)"},
+		{name: "required addition", change: BreakingChange{Path: "api load.id", After: "Int"}, want: "api load.id was added as required (Int)"},
+		{name: "changed", change: BreakingChange{Path: "event Changed.id", Before: "Int", After: "String"}, want: "event Changed.id changed from Int to String"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.change.String(); got != tt.want {
+				t.Fatalf("String() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBreakingChangesCoverAllWireEntities(t *testing.T) {
+	service := &ast.Directive{Name: "service"}
+	base := []*ast.File{{
+		Name:   "contracts.luxo",
+		Models: []*ast.ModelDecl{model("User", field("id", "Int"))},
+		Extends: []*ast.ExtendDecl{{
+			Name:   "User",
+			Fields: []*ast.FieldDecl{field("nickname", "String")},
+		}},
+		Types: []*ast.TypeDecl{{
+			Name:   "Payload",
+			Fields: []*ast.FieldDecl{field("data", "JSON")},
+		}},
+		Events: []*ast.EventDecl{{
+			Name:   "Published",
+			Params: []*ast.ParamDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}},
+		}},
+		Functions: []*ast.FnDecl{{
+			Name:       "syncUser",
+			Params:     []*ast.ParamDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}},
+			ReturnType: &ast.TypeRef{Name: "String"},
+			Directives: []*ast.Directive{service},
+		}},
+	}}
+	lf := New()
+	lf.Update(base)
+
+	changed := []*ast.File{{
+		Name:   "contracts.luxo",
+		Models: []*ast.ModelDecl{model("User", field("id", "Int"))},
+		Extends: []*ast.ExtendDecl{{
+			Name:   "User",
+			Fields: []*ast.FieldDecl{field("nickname", "Int")},
+		}},
+		Types: []*ast.TypeDecl{{
+			Name:   "Payload",
+			Fields: []*ast.FieldDecl{field("data", "String"), field("extra", "Boolean")},
+		}},
+		Events: []*ast.EventDecl{{
+			Name: "Published",
+			Params: []*ast.ParamDecl{
+				{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+				{Name: "source", Type: &ast.TypeRef{Name: "String"}},
+			},
+		}},
+		Functions: []*ast.FnDecl{{
+			Name:       "syncUser",
+			Params:     []*ast.ParamDecl{{Name: "id", Type: &ast.TypeRef{Name: "String"}}},
+			ReturnType: &ast.TypeRef{Name: "Int"},
+			Directives: []*ast.Directive{service},
+		}},
+	}}
+	changes := lf.BreakingChanges(changed)
+	for _, path := range []string{
+		"model User.nickname",
+		"type Payload.data",
+		"event Published.source",
+		"api svc:syncUser.id",
+		"api svc:syncUser return",
+	} {
+		if !hasBreakingPath(changes, path) {
+			t.Errorf("missing breaking change for %q: %v", path, changes)
+		}
+	}
+	if hasBreakingPath(changes, "type Payload.extra") {
+		t.Error("additive response type fields must remain compatible")
+	}
+
+	removed := lf.BreakingChanges(nil)
+	if !hasBreakingPath(removed, "api svc:syncUser") {
+		t.Errorf("removed service API must be reported: %v", removed)
+	}
+
+	legacy := New()
+	legacy.Models["Old"] = &ModelLock{NextID: 8, Fields: map[string]int{"id": 7}}
+	legacyChanges := legacy.BreakingChanges(nil)
+	if len(legacyChanges) != 1 || legacyChanges[0].String() != "model Old.id was removed (was field ID 7)" {
+		t.Fatalf("legacy field contract should fall back to its stable ID: %v", legacyChanges)
+	}
+}
+
+func TestFormatTypeRef(t *testing.T) {
+	tests := []struct {
+		name string
+		ref  *ast.TypeRef
+		want string
+	}{
+		{name: "void", want: "Void"},
+		{name: "scalar", ref: &ast.TypeRef{Name: "String"}, want: "String"},
+		{name: "nullable list", ref: &ast.TypeRef{Name: "User", IsList: true, Nullable: true}, want: "[User]?"},
+		{name: "generic", ref: &ast.TypeRef{Name: "Page", TypeArgs: []*ast.TypeRef{{Name: "User"}}}, want: "Page<User>"},
+		{name: "tuple", ref: &ast.TypeRef{Tuple: []*ast.TypeRef{{Name: "Post"}, {Name: "Video"}}}, want: "(Post,Video)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := formatTypeRef(tt.ref); got != tt.want {
+				t.Fatalf("formatTypeRef() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadVersionCompatibility(t *testing.T) {
+	dir := t.TempDir()
+	legacyPath := filepath.Join(dir, "legacy.lock")
+	legacy := `{"version":1,"models":{},"apis":{"health":{"id":3}}}`
+	if err := os.WriteFile(legacyPath, []byte(legacy), 0644); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Version != currentVersion || loaded.APIID("health") != 3 {
+		t.Fatalf("legacy lock was not upgraded safely: %+v", loaded)
+	}
+	if changes := loaded.BreakingChanges(files(nil, []*ast.ApiDecl{api("health")})); len(changes) != 0 {
+		t.Fatalf("legacy lock without contract metadata must not report false positives: %v", changes)
+	}
+
+	futurePath := filepath.Join(dir, "future.lock")
+	future := `{"version":3,"models":{},"apis":{}}`
+	if err := os.WriteFile(futurePath, []byte(future), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(futurePath); err == nil {
+		t.Fatal("newer lock version must be rejected")
+	}
+}
+
+func hasBreakingPath(changes []BreakingChange, path string) bool {
+	for _, change := range changes {
+		if change.Path == path {
+			return true
+		}
+	}
+	return false
 }
 
 func TestUpdateRemovedFieldReserved(t *testing.T) {

@@ -169,6 +169,12 @@ class TransportProtocolTest {
                 mapOf("at" to 0),
             )
         }
+        assertFailsWith<LuxoError> {
+            LuxoBinaryProtocol.encodeRequest(
+                APISchemaEntry(1, listOf(ParamSchema(1, "at", "DateTime", isList = true))),
+                mapOf("at" to listOf(null)),
+            )
+        }
     }
 
     @Test

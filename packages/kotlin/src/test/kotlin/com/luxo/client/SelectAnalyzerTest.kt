@@ -79,6 +79,24 @@ class SelectAnalyzerTest {
     }
 
     @Test
+    fun `tracks fields through selected value wrappers`() {
+        val hints = SelectAnalyzer.analyzeSources(
+            sequenceOf(
+                """
+                fun render() {
+                    val node = client.lookupNode()
+                    println(node.name.value())
+                    node.posts.value().forEach { println(it.title.value()) }
+                }
+                """.trimIndent(),
+            ),
+            schema,
+        )
+
+        assertEquals("name, posts { title }", hints["lookupNode"])
+    }
+
+    @Test
     fun `ignores comments strings and shadowed variables`() {
         val hints = SelectAnalyzer.analyzeSources(
             sequenceOf(

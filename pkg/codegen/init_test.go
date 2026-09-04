@@ -49,15 +49,32 @@ func TestInitProjectEnvExample(t *testing.T) {
 
 	checks := []string{
 		"DATABASE_DRIVER=pg",
+		"DATABASE_USER=postgres",
+		"DATABASE_PASSWORD=postgres",
 		"JWT_SECRET=change-me",
 		"DEPLOY_MODE=embedded",
-		"CORS_ORIGINS=*",
+		"CORS_ORIGIN=*",
 		"LOG_LEVEL=info",
-		"HEALTH_PATH=/health",
+		"GRACEFUL_TIMEOUT=30s",
 	}
 	for _, check := range checks {
 		if !strings.Contains(src, check) {
 			t.Errorf("missing %q in .env.example:\n%s", check, src)
+		}
+	}
+
+	unsupported := []string{
+		"APP_DEBUG=",
+		"APP_TIMEZONE=",
+		"GEN_MODE=",
+		"LOG_FORMAT=",
+		"TRANSPORT_MODE=",
+		"HEALTH_PATH=",
+		"REQUEST_ID_HEADER=",
+	}
+	for _, setting := range unsupported {
+		if strings.Contains(src, setting) {
+			t.Errorf("unsupported setting %q must not be advertised:\n%s", setting, src)
 		}
 	}
 }

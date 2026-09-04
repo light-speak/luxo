@@ -33,13 +33,16 @@ void main() {
       final client = File('${output.path}/client.dart').readAsStringSync();
 
       expect(types, contains("import 'dart:typed_data';"));
-      expect(types, contains('final Uint8List data;'));
-      expect(types, contains('final Object metadata;'));
-      expect(types, contains('final List<Uint8List> chunks;'));
-      expect(types, contains('final Child child;'));
+      expect(types, contains('final Selected<Uint8List> data;'));
+      expect(types, contains('final Selected<Object> metadata;'));
+      expect(types, contains('final Selected<List<Uint8List>> chunks;'));
+      expect(types, contains('final Selected<Child> child;'));
+      expect(types, contains('class ChildInput'));
+      expect(types, contains('final ChildInput child;'));
       expect(types, contains('Child.fromJson'));
-      expect(types, contains("'data': base64Encode(data)"));
-      expect(types, contains("'child': child.toJson()"));
+      expect(types, contains("if (data.isSelected) 'data': base64Encode(data.value)"));
+      expect(types, contains("if (child.isSelected) 'child': child.value.toJson()"));
+      expect(types, isNot(contains('Uint8List(0)')));
       expect(types, contains('dec.readBytes()'));
       expect(types, contains('jsonDecode(utf8.decode(dec.readBytes()))'));
       expect(
@@ -121,12 +124,14 @@ const _schema = <String, Object>{
   'models': {
     'Child': {
       'name': 'Child',
+      'usage': 'unused',
       'fields': [
         {'id': 1, 'name': 'name', 'type': 'String'},
       ],
     },
     'Payload': {
       'name': 'Payload',
+      'usage': 'output',
       'fields': [
         {'id': 1, 'name': 'data', 'type': 'Bytes'},
         {'id': 2, 'name': 'metadata', 'type': 'JSON'},
@@ -142,6 +147,7 @@ const _schema = <String, Object>{
     },
     'CreateInput': {
       'name': 'CreateInput',
+      'usage': 'input',
       'fields': [
         {'id': 1, 'name': 'child', 'type': 'Model', 'typeName': 'Child'},
       ],

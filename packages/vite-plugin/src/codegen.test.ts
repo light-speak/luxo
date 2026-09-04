@@ -15,6 +15,7 @@ const schema: LuxoSchema = {
   models: {
     Node: {
       name: 'Node',
+      usage: 'output',
       fields: [{ id: 1, name: 'id', type: 'Int' }],
     },
   },
@@ -22,6 +23,7 @@ const schema: LuxoSchema = {
   types: {
     MetricPoint: {
       name: 'MetricPoint',
+      usage: 'output',
       fields: [
         { id: 1, name: 'totalCount', type: 'Int' },
         { id: 2, name: 'labels', type: 'String', isList: true },
@@ -29,6 +31,7 @@ const schema: LuxoSchema = {
     },
     MetricTimeSeries: {
       name: 'MetricTimeSeries',
+      usage: 'output',
       fields: [
         { id: 1, name: 'apiName', type: 'String' },
         { id: 2, name: 'points', type: 'Model', typeName: 'MetricPoint', isList: true, relation: true },
@@ -36,6 +39,7 @@ const schema: LuxoSchema = {
     },
 		CreateNodeInput: {
 			name: 'CreateNodeInput',
+			usage: 'input',
 			fields: [{ id: 1, name: 'name', type: 'String' }],
 		},
   },
@@ -131,7 +135,7 @@ describe('generateTypes', () => {
 
     const types = outputs.get('generated/types.ts') ?? ''
     expect(types).toContain('let _points: Uint8Array[] | undefined')
-    expect(types).toContain('points: _points ? decodeColumnarMetricPoint(_points[i]) : []')
+    expect(types).toContain('points: _points ? decodeColumnarMetricPoint(_points[i]) : undefined')
   })
 
   it('decodes scalar list fields in row mode', async () => {
@@ -141,7 +145,7 @@ describe('generateTypes', () => {
     expect(types).toContain("case 2: obj['labels'] = dec.readStringArray(); break")
   })
 
-  it('keeps the zero value for required enum fields type-safe', async () => {
+  it('does not fabricate a value for an unselected required enum field', async () => {
     await generateTypes({
       models: {
         User: {
@@ -156,7 +160,9 @@ describe('generateTypes', () => {
     }, 'generated')
 
     const types = outputs.get('generated/types.ts') ?? ''
-    expect(types).toContain("role: data['role'] == null ? '' as Role : data['role'] as Role")
+    expect(types).toContain('role: Selected<Role>')
+    expect(types).toContain("Object.prototype.hasOwnProperty.call(data, 'role')")
+    expect(types).not.toContain("'' as Role")
   })
 
   it('does not import an unused row decoder for list returns', async () => {
@@ -221,11 +227,48 @@ describe('generateTypes', () => {
 
     const types = outputs.get('generated/types.ts') ?? ''
     const client = outputs.get('generated/client.ts') ?? ''
-    expect(types).toContain('blob: Uint8Array')
-    expect(types).toContain('metadata: unknown')
-    expect(types).toContain("blob: data['blob'] == null ? new Uint8Array(0) : decodeBase64(data['blob'] as string)")
+    expect(types).toContain('blob: Selected<Uint8Array>')
+    expect(types).toContain('metadata: Selected<unknown>')
+    expect(types).toContain("Object.prototype.hasOwnProperty.call(data, 'blob')")
+    expect(types).not.toContain('new Uint8Array(0)')
     expect(types).toContain('decodeJSONValue(_metadata![i]!)')
     expect(client).toContain('decodeJSONPayload')
+  })
+
+  it('separates strict input DTOs from field-selected output models', async () => {
+    await generateTypes({
+      models: {},
+      types: {
+        Profile: {
+          name: 'Profile',
+          usage: 'unused',
+          fields: [
+            { id: 1, name: 'name', type: 'String' },
+            { id: 2, name: 'bio', type: 'String', nullable: true },
+          ],
+        },
+      },
+      apis: {
+        updateProfile: {
+          id: 1,
+          name: 'updateProfile',
+          module: 'profile',
+          returnType: 'Profile',
+          params: [{ id: 1, name: 'profile', type: 'Model', typeName: 'Profile' }],
+        },
+      },
+    }, 'generated')
+
+    const types = outputs.get('generated/types.ts') ?? ''
+    const client = outputs.get('generated/client.ts') ?? ''
+    expect(types).toContain('export interface Profile {')
+    expect(types).toContain('name: Selected<string>')
+    expect(types).toContain('bio: Selected<string | null>')
+    expect(types).toContain('export interface ProfileInput {')
+    expect(types).toContain('name: string')
+    expect(types).toContain('bio: string | null')
+    expect(client).toContain('profile: ProfileInput')
+    expect(client).toContain('Promise<Profile>')
   })
 })
 

@@ -25,11 +25,10 @@ func parseFileWithName(t *testing.T, input, filename string) *ast.File {
 	return file
 }
 
-// analyzeModules runs AnalyzeWithModules on multiple files.
+// analyzeModules runs the isolated package API on multiple files.
 func analyzeModules(t *testing.T, files []*ast.File) *Result {
 	t.Helper()
-	a := New()
-	return a.AnalyzeWithModules(files)
+	return AnalyzeModules(files)
 }
 
 func TestComputedAggregateRejectsCrossModuleRelation(t *testing.T) {

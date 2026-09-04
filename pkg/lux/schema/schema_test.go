@@ -262,6 +262,91 @@ func TestSchemaToJSON_FieldTypesInJSON(t *testing.T) {
 	}
 }
 
+func TestInferTypeUsageFollowsInputAndOutputGraphs(t *testing.T) {
+	s := New()
+	s.RegisterModel(&Model{
+		Name:   "User",
+		Fields: []Field{{ID: 1, Name: "profile", Type: FieldModel, TypeName: "Profile"}},
+	})
+	s.RegisterType(&TypeDecl{
+		Name:   "CreateInput",
+		Fields: []Field{{ID: 1, Name: "profile", Type: FieldModel, TypeName: "Profile"}},
+	})
+	s.RegisterType(&TypeDecl{Name: "Profile", Fields: []Field{{ID: 1, Name: "name", Type: FieldString}}})
+	s.RegisterType(&TypeDecl{Name: "Unused"})
+	s.RegisterAPI(&API{
+		ID: 1, Name: "createUser", ReturnType: "User",
+		Params: []Param{{ID: 1, Name: "input", Type: FieldJSON, TypeName: "CreateInput"}},
+	})
+	s.RegisterAPI(&API{
+		ID: 2, Name: "updateProfile", ReturnType: "Profile",
+		Params: []Param{{ID: 1, Name: "profile", Type: FieldJSON, TypeName: "Profile"}},
+	})
+
+	s.InferTypeUsage()
+
+	if got := s.Models["User"].Usage; got != TypeUsageOutput {
+		t.Fatalf("User usage = %q, want output", got)
+	}
+	if got := s.Types["CreateInput"].Usage; got != TypeUsageInput {
+		t.Fatalf("CreateInput usage = %q, want input", got)
+	}
+	if got := s.Types["Profile"].Usage; got != TypeUsageInputOutput {
+		t.Fatalf("Profile usage = %q, want inputOutput", got)
+	}
+	if got := s.Types["Unused"].Usage; got != TypeUsageUnused {
+		t.Fatalf("Unused usage = %q, want unused", got)
+	}
+}
+
+func TestMergeTypeUsage(t *testing.T) {
+	tests := []struct {
+		current TypeUsage
+		next    TypeUsage
+		want    TypeUsage
+	}{
+		{current: "", next: TypeUsageInput, want: TypeUsageInput},
+		{current: TypeUsageUnused, next: TypeUsageOutput, want: TypeUsageOutput},
+		{current: TypeUsageInput, next: TypeUsageInput, want: TypeUsageInput},
+		{current: TypeUsageInputOutput, next: TypeUsageOutput, want: TypeUsageInputOutput},
+		{current: TypeUsageInput, next: TypeUsageOutput, want: TypeUsageInputOutput},
+	}
+	for _, test := range tests {
+		if got := mergeTypeUsage(test.current, test.next); got != test.want {
+			t.Errorf("mergeTypeUsage(%q, %q) = %q, want %q", test.current, test.next, got, test.want)
+		}
+	}
+}
+
+func TestTypeUsageIsSerializedInIntrospection(t *testing.T) {
+	s := New()
+	s.RegisterModel(&Model{Name: "User"})
+	s.RegisterType(&TypeDecl{Name: "Input"})
+	s.RegisterAPI(&API{
+		ID: 1, Name: "create", ReturnType: "User",
+		Params: []Param{{ID: 1, Name: "input", Type: FieldJSON, TypeName: "Input"}},
+	})
+	s.InferTypeUsage()
+
+	data, err := s.ToJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Models map[string]Model    `json:"models"`
+		Types  map[string]TypeDecl `json:"types"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Models["User"].Usage != TypeUsageOutput {
+		t.Fatalf("model usage was not serialized: %s", data)
+	}
+	if decoded.Types["Input"].Usage != TypeUsageInput {
+		t.Fatalf("type usage was not serialized: %s", data)
+	}
+}
+
 func TestSelectToFieldMask_Empty(t *testing.T) {
 	m := &Model{Name: "Test"}
 	mask, err := SelectToFieldMask(nil, m, New())

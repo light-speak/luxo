@@ -7,7 +7,27 @@ import (
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/cache"
+	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
+	"github.com/light-speak/luxo/pkg/lux/ratelimit"
 )
+
+// WithRateLimit wraps a handler with a per-client token bucket.
+func WithRateLimit(max int, window time.Duration, handler HandlerFunc) HandlerFunc {
+	limiter := ratelimit.New(max, window)
+	return func(ctx context.Context, req *Request) error {
+		if req.Internal {
+			return handler(ctx, req)
+		}
+		key := req.ClientKey
+		if key == "" {
+			key = "internal"
+		}
+		if !limiter.Allow(key) {
+			return luxerrors.RateLimited
+		}
+		return handler(ctx, req)
+	}
+}
 
 // DefaultCache is the shared cache instance for @cache directive.
 // Defaults to in-memory cache. Set to a RedisCache for multi-instance deployments.

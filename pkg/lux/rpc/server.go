@@ -183,6 +183,7 @@ func (s *Server) processCall(conn io.Writer, envelope requestEnvelope) error {
 	if parseErr != nil {
 		return WriteFrame(conn, encodeError(400, "BadRequest", parseErr.Error()))
 	}
+	req.Internal = true
 
 	// Dispatch to handler
 	fn, ok := s.handlers[req.API]
@@ -222,6 +223,7 @@ func (s *Server) processStream(conn net.Conn, envelope requestEnvelope) {
 		WriteFrame(conn, encodeError(400, "BadRequest", err.Error()))
 		return
 	}
+	req.Internal = true
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stream, err := s.router.OpenInternalStream(streamCtx, req)

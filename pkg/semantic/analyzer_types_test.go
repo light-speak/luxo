@@ -8,6 +8,318 @@ import (
 	"github.com/light-speak/luxo/pkg/token"
 )
 
+func TestAnalyzerBodyEdgeCases(t *testing.T) {
+	analyzer := newAnalyzer()
+	if got := analyzer.symbolReturnType("missing"); got != nil {
+		t.Fatalf("missing symbol return type = %#v", got)
+	}
+
+	analyzer.checkCallableBody(&ast.Block{}, analyzer.scope.Child(), analyzer.types["Int"])
+	streamAPI := &ast.ApiDecl{
+		Directives: []*ast.Directive{{Name: "stream"}},
+		Body:       &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{}}},
+	}
+	analyzer.validateStreamMatcherResult(streamAPI)
+	streamAPI.Body.Stmts[0] = &ast.ExprStmt{}
+	analyzer.validateStreamMatcherResult(streamAPI)
+	analyzer.checkValStmt(&ast.ValStmt{
+		Name:  "count",
+		Type:  &ast.TypeRef{Name: "Int"},
+		Value: &ast.Literal{Kind: token.String, Value: "wrong"},
+	}, analyzer.scope.Child())
+	if len(analyzer.errors) < 2 {
+		t.Fatalf("body validation errors = %v", analyzer.errors)
+	}
+}
+
+func TestAnalyzerModuleVisibilityEdgeCases(t *testing.T) {
+	analyzer := newAnalyzer()
+	analyzer.moduleMap = FileModuleMap{"empty.luxo": {Name: ""}}
+	analyzer.files = []*ast.File{{Name: "missing.luxo", Extends: []*ast.ExtendDecl{{Name: "Remote"}}}}
+	if module := analyzer.fileModule("unknown.luxo"); module != "" {
+		t.Fatalf("unknown file module = %q", module)
+	}
+	analyzer.collectExtendVisibility()
+	analyzer.checkModuleVisibility()
+
+	file := &ast.File{
+		Interfaces: []*ast.InterfaceDecl{{Fields: []*ast.FieldDecl{{Type: &ast.TypeRef{Name: "Int"}}}}},
+		Types:      []*ast.TypeDecl{{Fields: []*ast.FieldDecl{{Type: &ast.TypeRef{Name: "String"}}}}},
+		Sealeds: []*ast.SealedDecl{{Variants: []*ast.SealedVariant{{Fields: []*ast.ParamDecl{
+			{Type: &ast.TypeRef{Name: "Boolean"}},
+		}}}}},
+	}
+	module := &ModuleInfo{Name: "client"}
+	analyzer.checkFileTypeRefs(file, module)
+	analyzer.checkTypeRefVisibility(nil, module, token.Position{})
+	analyzer.checkTypeRefVisibility(&ast.TypeRef{
+		Name:     "Page",
+		TypeArgs: []*ast.TypeRef{{Name: "Int"}},
+		Tuple:    []*ast.TypeRef{{Name: "String"}},
+	}, module, token.Position{})
+	analyzer.checkNameVisibility("", module, token.Position{})
+	analyzer.checkNameVisibility("Unknown", module, token.Position{})
+
+	analyzer.typeOwners.register("Shared", "common")
+	analyzer.moduleMap["common.luxo"] = &ModuleInfo{Name: "common", IsCommon: true}
+	analyzer.checkNameVisibility("Shared", module, token.Position{})
+	analyzer.typeOwners.register("Remote", "remote")
+	analyzer.checkNameVisibility("Remote", &ModuleInfo{Name: "common", IsCommon: true}, token.Position{})
+	if len(analyzer.errors) != 0 {
+		t.Fatalf("visibility edge cases produced errors: %v", analyzer.errors)
+	}
+}
+
+func TestAnalyzerCollectionExpressionEdgeCases(t *testing.T) {
+	analyzer := newAnalyzer()
+	scope := analyzer.scope.Child()
+	listType := analyzer.checkListExpr(&ast.ListExpr{Items: []ast.Expr{
+		&ast.AsyncExpr{Body: &ast.Block{}},
+		&ast.Literal{Kind: token.Null, Value: "null"},
+	}}, scope)
+	if listType == nil || !listType.IsList || listType.Kind != TypeUnknown {
+		t.Fatalf("unresolved list type = %#v", listType)
+	}
+	setExprResolvedType(nil, analyzer.types["Int"])
+	setExprResolvedType(&ast.Literal{}, nil)
+
+	untyped := &ast.Literal{Kind: token.Int, Value: "1"}
+	intValue := &ast.Literal{Kind: token.Int, Value: "1"}
+	intValue.SetTypeTag("Int")
+	stringValue := &ast.Literal{Kind: token.String, Value: "text"}
+	stringValue.SetTypeTag("String")
+	body := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.YieldExpr{Value: untyped}},
+		&ast.ExprStmt{Expr: &ast.YieldExpr{Value: intValue}},
+		&ast.ExprStmt{Expr: &ast.YieldExpr{Value: stringValue}},
+	}}
+	if result := analyzer.inferForExprType(body); result == nil || result.Name != "Int" || !result.Nullable {
+		t.Fatalf("for expression type = %#v", result)
+	}
+	onlyUntypedYield := &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.YieldExpr{Value: &ast.Literal{Kind: token.Int, Value: "1"}}},
+	}}
+	if result := analyzer.inferForExprType(onlyUntypedYield); result != nil {
+		t.Fatalf("untyped yield result = %#v", result)
+	}
+	if len(analyzer.errors) < 2 {
+		t.Fatalf("collection expression errors = %v", analyzer.errors)
+	}
+}
+
+func TestAnalyzerLoadExpressionEdgeCases(t *testing.T) {
+	analyzer := newAnalyzer()
+	scope := analyzer.scope.Child()
+	analyzer.checkRangeExpr(&ast.RangeExpr{
+		Start: &ast.Literal{Kind: token.String, Value: "start"},
+		End:   &ast.Literal{Kind: token.String, Value: "end"},
+	}, scope)
+	analyzer.moduleMap = FileModuleMap{"client.luxo": {Name: "client"}}
+	analyzer.currentFile = &ast.File{Name: "client.luxo"}
+	analyzer.checkExtendFieldVisibility(&ast.MemberExpr{Field: "name"}, &ResolvedType{Kind: TypeModel, Name: "Unknown"})
+	analyzer.collectAmbiguousIdents(nil, scope, scope)
+
+	userType := &ResolvedType{Kind: TypeModel, Name: "User", Fields: map[string]*FieldInfo{}}
+	analyzer.types["User"] = userType
+	call := func(args ...*ast.NamedArg) *ast.CallExpr {
+		return &ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"}, Args: args}
+	}
+	intValue := &ast.Literal{Kind: token.Int, Value: "1"}
+	intValue.SetTypeTag("Int")
+	if got := analyzer.inferCRUDReturnType(&ast.CallExpr{Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "User"}}}}, "unknown"); got != userType {
+		t.Fatalf("unknown CRUD fallback = %#v", got)
+	}
+	analyzer.checkLoadArguments(&ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Missing"}, Field: "load"}}, nil)
+	analyzer.checkLoadArguments(call(), nil)
+	analyzer.checkLoadArguments(call(
+		&ast.NamedArg{Value: &ast.Literal{Kind: token.Int, Value: "1"}},
+		&ast.NamedArg{Value: &ast.Literal{Kind: token.Int, Value: "2"}},
+	), []*ResolvedType{analyzer.types["Int"], analyzer.types["Int"]})
+	analyzer.checkPrimaryKeyLoadArguments(call(&ast.NamedArg{Value: intValue}), userType, []*ResolvedType{analyzer.types["Int"]})
+	analyzer.typeOwners.register("User", "owner")
+	if analyzer.isLoadFieldVisible("User", "email") {
+		t.Fatal("undeclared cross-module load field is visible")
+	}
+	analyzer.moduleMap = FileModuleMap{}
+	if !analyzer.isLoadFieldVisible("User", "email") {
+		t.Fatal("load field should remain visible when the current file has no module metadata")
+	}
+
+	analyzer.typeOwners = newTypeOwnership()
+	analyzer.checkCrossModuleCRUD(&ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "find"}})
+	analyzer.typeOwners.register("User", "owner")
+	analyzer.moduleMap = FileModuleMap{}
+	analyzer.checkCrossModuleCRUD(&ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "find"}})
+	if len(analyzer.errors) < 4 {
+		t.Fatalf("expression edge-case errors = %v", analyzer.errors)
+	}
+}
+
+func TestAnalyzerDeclarationTypeValidationEdgeCases(t *testing.T) {
+	analyzer := newAnalyzer()
+	analyzer.resolveEventTypes(&ast.File{Events: []*ast.EventDecl{{Name: "Changed", Params: []*ast.ParamDecl{
+		{Name: "unknown", Type: &ast.TypeRef{Name: "Missing"}},
+		{Name: "items", Type: &ast.TypeRef{Name: "Int", IsList: true, Nullable: true}},
+	}}}})
+	analyzer.validatePrimaryKeyFields(&ast.ModelDecl{Name: "User", Fields: []*ast.FieldDecl{
+		{Name: "first", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}}},
+		{Name: "second", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "id"}}},
+	}})
+	if len(analyzer.errors) < 3 {
+		t.Fatalf("declaration type errors = %v", analyzer.errors)
+	}
+}
+
+func TestAnalyzerComputedTypeValidationEdgeCases(t *testing.T) {
+	analyzer := newAnalyzer()
+	computed := func(name string, body *ast.Block, directives ...*ast.Directive) *ast.FieldDecl {
+		return &ast.FieldDecl{Name: name, Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{Body: body, Directives: directives}}
+	}
+	count := &ast.Directive{Name: "count", Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "posts"}}}}
+	sumLabel := &ast.Directive{Name: "sum", Args: []*ast.NamedArg{{Value: &ast.MemberExpr{Object: &ast.Ident{Name: "posts"}, Field: "label"}}}}
+	user := &ast.ModelDecl{Name: "User"}
+	post := &ast.ModelDecl{Name: "Post", Fields: []*ast.FieldDecl{
+		{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+		{Name: "label", Type: &ast.TypeRef{Name: "String"}},
+	}}
+	relation := &ast.FieldDecl{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}}
+	user.Fields = []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}, relation}
+	models := map[string]*ast.ModelDecl{"User": user, "Post": post}
+	modules := map[string]string{"User": "user", "Post": "user"}
+	analyzer.validateComputedField(user, computed("duplicate", nil, count, sumLabel), models, modules)
+	analyzer.validateComputedField(user, computed("withBody", &ast.Block{}, count), models, modules)
+	analyzer.validateComputedField(user, computed("badNumeric", nil, sumLabel), models, modules)
+
+	userWithoutKey := &ast.ModelDecl{Name: "NoKey", Fields: []*ast.FieldDecl{relation}}
+	if analyzer.validateComputedRelationKeys(userWithoutKey, relation, post) {
+		t.Fatal("computed relation without a local primary key was accepted")
+	}
+	local, remote := computedRelationKeyNames(user, &ast.FieldDecl{Directives: []*ast.Directive{{Name: "other"}}})
+	if local != "id" || remote != "userId" {
+		t.Fatalf("default computed keys = %q, %q", local, remote)
+	}
+	if len(analyzer.errors) < 4 {
+		t.Fatalf("computed type errors = %v", analyzer.errors)
+	}
+}
+
+func TestAnalyzerStreamAndInferredTypeValidationEdgeCases(t *testing.T) {
+	analyzer := newAnalyzer()
+	stream := &ast.Directive{Name: "stream"}
+	analyzer.validateStreamAPI(&ast.ApiDecl{ReturnType: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{stream, stream}})
+	event := &ast.EventDecl{Name: "Changed"}
+	analyzer.validateGeneratedStreamMatcher(&ast.ApiDecl{Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{}}}}, event)
+	reported := make(map[string]bool)
+	apiParams := map[string]*ast.ParamDecl{"state": {Name: "state", Type: &ast.TypeRef{Name: "Status"}}}
+	eventParams := map[string]*ast.ParamDecl{"payload": {Name: "payload", Type: &ast.TypeRef{Name: "JSON"}}}
+	analyzer.types["Status"] = &ResolvedType{Kind: TypeEnum, Name: "Status"}
+	matcherExprs := []ast.Expr{
+		&ast.Literal{Kind: token.True, Value: "true"},
+		&ast.UnaryExpr{Op: "!", Value: &ast.Literal{Kind: token.True, Value: "true"}},
+		&ast.BinaryExpr{Op: "in"},
+		&ast.MemberExpr{Object: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "nested"}, Field: "value"},
+		&ast.MemberExpr{Object: &ast.Ident{Name: "my"}, Field: "id"},
+		&ast.MemberExpr{Object: &ast.Ident{Name: "Status"}, Field: "ACTIVE"},
+		&ast.MemberExpr{Object: &ast.Ident{Name: "object"}, Field: "field"},
+		&ast.CallExpr{Func: &ast.Ident{Name: "unsupported"}},
+	}
+	for _, expression := range matcherExprs {
+		analyzer.validateStreamMatcherExpr(expression, eventParams, apiParams, reported)
+	}
+	analyzer.validateStreamMatcherType(token.Position{}, "event field", "payload", eventParams["payload"].Type, reported)
+	analyzer.validateStreamMatcherType(token.Position{}, "event field", "payload", eventParams["payload"].Type, reported)
+	analyzer.validateStreamMatcherType(token.Position{}, "parameter", "state", apiParams["state"].Type, reported)
+
+	if got := stripTopFirstPrefix("Top123Users"); got != "Users" {
+		t.Fatalf("Top prefix = %q", got)
+	}
+	if got := stripTopFirstPrefix("First45Users"); got != "Users" {
+		t.Fatalf("First prefix = %q", got)
+	}
+	modelType := &ResolvedType{Kind: TypeModel, Name: "User", Fields: map[string]*FieldInfo{"name": {Name: "name", Type: analyzer.types["String"]}}}
+	analyzer.validateAfterModel(token.Position{}, "listUsersByNameOrderByCreatedAt", "ByNameOrderByCreatedAt", modelType)
+	analyzer.validateAfterModel(token.Position{}, "listUsersByTrue", "ByTrue", modelType)
+	if isPascalBoundary("AndName", 0, 3) || isPascalBoundary("XAndName", 1, 3) || !isPascalBoundary("xAnd", 1, 3) {
+		t.Fatal("Pascal boundary validation is inconsistent")
+	}
+	analyzer.validateFunctionResult(&ast.FnDecl{
+		ReturnType: &ast.TypeRef{Name: "Result", IsList: true},
+		Directives: []*ast.Directive{{Name: "native"}},
+	})
+	if len(analyzer.errors) < 7 {
+		t.Fatalf("type validation errors = %v", analyzer.errors)
+	}
+}
+
+func TestAnalyzerFederationValidationEdgeCases(t *testing.T) {
+	analyzer := newAnalyzer()
+	analyzer.moduleMap = FileModuleMap{
+		"client.luxo": {Name: "client"},
+		"empty.luxo":  {Name: ""},
+	}
+	analyzer.files = []*ast.File{
+		{Name: "client.luxo", Extends: []*ast.ExtendDecl{{Name: "Missing"}}},
+		{Name: "empty.luxo", Extends: []*ast.ExtendDecl{{Name: "Known"}}},
+	}
+	analyzer.types["Known"] = &ResolvedType{Kind: TypeModel, Name: "Known"}
+	analyzer.validateFederationExtendFields()
+	analyzer.validateFederationExtendField("client", "Known", analyzer.types["Known"], &ast.FieldDecl{})
+
+	related := &ResolvedType{Kind: TypeModel, Name: "Related", Fields: map[string]*FieldInfo{}}
+	analyzer.types["Related"] = related
+	analyzer.typeOwners.register("Related", "remote")
+	analyzer.validateFederationExtendField("client", "Known", analyzer.types["Known"], &ast.FieldDecl{
+		Name: "related",
+		Type: &ast.TypeRef{Name: "Related"},
+	})
+
+	owner := &ResolvedType{Kind: TypeModel, Name: "Known", Fields: map[string]*FieldInfo{
+		"id": {Name: "id", Type: analyzer.types["Int"], Directives: []string{"id"}},
+	}}
+	analyzer.validateFederationForeignKey("Known", owner, related, &ast.FieldDecl{
+		Name: "related",
+		Directives: []*ast.Directive{{Name: "by", Args: []*ast.NamedArg{
+			{Value: &ast.Ident{Name: "knownId"}},
+			{Value: &ast.Ident{Name: "otherId"}},
+		}}},
+	})
+	if len(analyzer.errors) < 2 {
+		t.Fatalf("federation validation errors = %v", analyzer.errors)
+	}
+}
+
+func TestAnalyzerValidationAndDirectiveEdgeCases(t *testing.T) {
+	analyzer := newAnalyzer()
+	analyzer.files = []*ast.File{}
+	scope := analyzer.scope.Child()
+	analyzer.injectStreamIt(&ast.ApiDecl{Directives: []*ast.Directive{{
+		Name: "stream",
+		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "MissingEvent"}}},
+	}}}, scope, &ast.File{})
+
+	modelType := &ResolvedType{Kind: TypeModel, Name: "User", Fields: map[string]*FieldInfo{}}
+	analyzer.injectWithAuthMethods(modelType, []*ast.Directive{{
+		Name: "withAuth",
+		Args: []*ast.NamedArg{{Name: "stores", Value: &ast.ListExpr{Items: []ast.Expr{
+			&ast.Literal{Kind: token.String, Value: "not-an-identifier"},
+		}}}},
+	}})
+	if path := analyzer.buildCyclePath("start", "end", map[string]string{}); path != "start → end → start" {
+		t.Fatalf("broken-parent cycle path = %q", path)
+	}
+
+	positional := &ast.NamedArg{Value: &ast.Literal{Kind: token.Int, Value: "1"}}
+	if got := findDirectiveArg([]*ast.NamedArg{positional}, "value", 0); got != positional {
+		t.Fatalf("positional directive argument = %#v", got)
+	}
+	if got := findDirectiveArg(nil, "missing", 0); got != nil {
+		t.Fatalf("missing directive argument = %#v", got)
+	}
+	if literal, ok := directiveLiteral(nil); ok || literal != nil {
+		t.Fatalf("nil directive literal = %#v, %v", literal, ok)
+	}
+}
+
 // ========== Binary Op Type Check Tests ==========
 
 func TestBinaryOpTypeCheck(t *testing.T) {
@@ -288,6 +600,55 @@ func TestBlockResultAndDeclarationHelpers(t *testing.T) {
 	if len(decls) != 5 {
 		t.Fatalf("declaration count = %d", len(decls))
 	}
+}
+
+func TestQuestionOperatorUnwrapsResult(t *testing.T) {
+	result := analyze(t, `
+fn loadCount(): Result<Int> @native
+api count(): Int {
+  val value = loadCount()?
+  return value
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestQuestionOperatorRejectsNonResult(t *testing.T) {
+	result := analyze(t, `
+fn loadCount(): Int @native @service
+api count(): Int {
+  val value = loadCount()?
+  return value
+}
+`)
+	expectError(t, result, "operator '?' requires Result<T>")
+}
+
+func TestNativeFunctionRequiresResult(t *testing.T) {
+	result := analyze(t, `fn loadCount(): Int @native`)
+	expectError(t, result, "@native fn return type must be Result<T>")
+}
+
+func TestResultRequiresNativeFunction(t *testing.T) {
+	result := analyze(t, `fn loadCount(): Result<Int> { 1 }`)
+	expectError(t, result, "Result<T> is only valid for @native fn")
+}
+
+func TestAPIRejectsResultReturn(t *testing.T) {
+	result := analyze(t, `api count(): Result<Int> @native`)
+	expectError(t, result, "API return types must be response values")
+}
+
+func TestResultMustBeConsumedDirectly(t *testing.T) {
+	result := analyze(t, `
+fn loadCount(): Result<Int> @native
+api count(): Int {
+  val pending = loadCount()
+  return pending?
+}
+`)
+	expectError(t, result, "must be consumed directly with '?'")
+	expectError(t, result, "must be applied directly")
 }
 
 func TestBinaryIn(t *testing.T) {
@@ -907,6 +1268,62 @@ func TestReturnStmtWithoutValue(t *testing.T) {
 	}
 }
 
+func TestCallableReturnTypes(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "explicit return mismatch",
+			input: `fn wrong(): String { return 42 }`,
+			want:  "return expects 'String', got 'Int'",
+		},
+		{
+			name:  "implicit return mismatch",
+			input: `api wrong(): Int { "value" }`,
+			want:  "return expects 'Int', got 'String'",
+		},
+		{
+			name: "missing response",
+			input: `api wrong(): Int {
+  val value = 42
+}`,
+			want: "must return 'Int'",
+		},
+		{
+			name:  "value return for void callable",
+			input: `fn wrong() { return 42 }`,
+			want:  "return expects 'Void', got 'Int'",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			expectError(t, analyze(t, tt.input), tt.want)
+		})
+	}
+}
+
+func TestVoidCallableDoesNotRequireAResponse(t *testing.T) {
+	result := analyze(t, `api record() { val value = 42 }`)
+	for _, issue := range result.Errors {
+		if strings.Contains(issue.Message, "must return") {
+			t.Fatalf("Void callable should not require a response: %v", result.Errors)
+		}
+	}
+}
+
+func TestValueCallableRejectsEmptyReturnAST(t *testing.T) {
+	file := &ast.File{Functions: []*ast.FnDecl{{
+		Name:       "wrong",
+		ReturnType: &ast.TypeRef{Name: "Int"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ReturnStmt{},
+		}},
+	}}}
+	expectError(t, Analyze([]*ast.File{file}), "return expects 'Int', got 'Void'")
+}
+
 func TestThrowStmt(t *testing.T) {
 	result := analyze(t, `
 error NotFound { message: String }
@@ -1056,6 +1473,17 @@ api test(): String {
 	expectError(t, result, "unknown type 'MissingResult'")
 }
 
+func TestObjectExprRecoveryToleratesNilFieldEntries(t *testing.T) {
+	for _, typeName := range []string{"", "MissingResult"} {
+		t.Run(typeName, func(t *testing.T) {
+			analyzer := newAnalyzer()
+			expr := &ast.ObjectExpr{TypeName: typeName, Fields: []*ast.NamedArg{nil}}
+
+			analyzer.checkObjectExpr(expr, analyzer.scope)
+		})
+	}
+}
+
 func TestObjectExprRejectsUnknownField(t *testing.T) {
 	result := analyze(t, `
 type ObjResult { value: String }
@@ -1074,6 +1502,33 @@ api test(): ObjResult {
 }
 `)
 	expectError(t, result, "duplicate field 'value'")
+}
+
+func TestObjectExprRejectsIncompleteFields(t *testing.T) {
+	analyzer := newAnalyzer()
+	typ := &ResolvedType{
+		Kind: TypeCustom,
+		Name: "ObjResult",
+		Fields: map[string]*FieldInfo{
+			"value": {Name: "value", Type: analyzer.types["String"]},
+		},
+	}
+	expr := &ast.ObjectExpr{Fields: []*ast.NamedArg{
+		nil,
+		{Name: "value"},
+	}}
+
+	analyzer.validateObjectExprFields(expr, typ, analyzer.scope)
+
+	if len(analyzer.errors) != 2 {
+		t.Fatalf("incomplete fields produced %d errors, want 2: %v", len(analyzer.errors), analyzer.errors)
+	}
+	if !strings.Contains(analyzer.errors[0].Message, "object field entry requires a name and value") {
+		t.Fatalf("nil field error = %q", analyzer.errors[0].Message)
+	}
+	if !strings.Contains(analyzer.errors[1].Message, "field 'value' requires a value") {
+		t.Fatalf("nil field value error = %q", analyzer.errors[1].Message)
+	}
 }
 
 func TestObjectExprRejectsFieldTypeMismatch(t *testing.T) {

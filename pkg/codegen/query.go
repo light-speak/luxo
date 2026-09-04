@@ -47,6 +47,10 @@ func generateQueryBuilder(b *strings.Builder, m *ast.ModelDecl, enums map[string
 // scanner, client (read-only: Find/Where), field constants, and where helpers.
 // No create/update builders — extend models are read-only from the referencing module.
 func generateExtendQueryBuilder(b *strings.Builder, ext *ast.ExtendDecl) {
+	defaultGenerator().generateExtendQueryBuilder(b, ext)
+}
+
+func (g *GeneratorContext) generateExtendQueryBuilder(b *strings.Builder, ext *ast.ExtendDecl) {
 	name := ext.Name
 	tableName := str.ToSnakeCase(name) + "s"
 
@@ -73,18 +77,19 @@ func generateExtendQueryBuilder(b *strings.Builder, ext *ast.ExtendDecl) {
 	}
 
 	generateScanner(b, &ast.ModelDecl{Name: name, Fields: dbFields})
-	generateExtendClient(b, name, tableName, dbFields)
+	g.generateExtendClient(b, name, tableName, dbFields)
 	generateFieldConstants(b, name, dbFields)
 	generateWhereFields(b, name, dbFields)
 }
 
-func generateExtendClient(b *strings.Builder, name, tableName string, fields []*ast.FieldDecl) {
+func (g *GeneratorContext) generateExtendClient(b *strings.Builder, name, tableName string, fields []*ast.FieldDecl) {
 	scanFn := "scan" + name
 
 	idType := "int64"
-	idGoName := str.Capitalize(externalModelIDFieldName(name))
+	idFieldName := g.externalModelIDFieldName(name)
+	idGoName := str.Capitalize(idFieldName)
 	for _, f := range fields {
-		if f.Name == externalModelIDFieldName(name) && f.Type != nil {
+		if f.Name == idFieldName && f.Type != nil {
 			idType = resolveGoType(f.Type)
 			break
 		}

@@ -139,6 +139,11 @@ const user = await transport.call('getUser', {
 // + DataLoader: SELECT title FROM posts WHERE user_id IN (1)
 ```
 
+Generated output fields use `Selected<T>` (`T | undefined`): `undefined` means
+unselected, while `null` remains an explicitly selected nullable value. Input
+DTOs stay strict; shared input/output types generate separate `Foo` and
+`FooInput` interfaces.
+
 ### Codec Utilities
 
 Low-level binary encoding for custom protocols or advanced use:

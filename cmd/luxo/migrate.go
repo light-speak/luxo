@@ -104,8 +104,13 @@ func runMigrateDiff(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	env.Load(".env")
-	dialect := loadDialect()
+	if err := loadGenerationEnvironment(".env"); err != nil {
+		return err
+	}
+	dialect, err := loadDialect()
+	if err != nil {
+		return err
+	}
 	enums := codegen.CollectEnumsFromResult(result)
 	desired := codegen.ComputeState(result, enums, dialect)
 
@@ -218,7 +223,9 @@ func runMigrateUp(cmd *cobra.Command, args []string) error {
 	dim := "\033[2m"
 	reset := "\033[0m"
 
-	env.Load(".env")
+	if err := loadGenerationEnvironment(".env"); err != nil {
+		return err
+	}
 	ctx := cmd.Context()
 
 	runner, err := migrate.New(ctx, "migrations")
@@ -273,7 +280,9 @@ func runMigrateDown(cmd *cobra.Command, args []string) error {
 		fmt.Sscanf(args[0], "%d", &n)
 	}
 
-	env.Load(".env")
+	if err := loadGenerationEnvironment(".env"); err != nil {
+		return err
+	}
 	ctx := cmd.Context()
 
 	runner, err := migrate.New(ctx, "migrations")
@@ -306,7 +315,9 @@ func runMigrateStatus(cmd *cobra.Command, args []string) error {
 	yellow := "\033[33m"
 	reset := "\033[0m"
 
-	env.Load(".env")
+	if err := loadGenerationEnvironment(".env"); err != nil {
+		return err
+	}
 	ctx := cmd.Context()
 
 	runner, err := migrate.New(ctx, "migrations")
@@ -338,14 +349,15 @@ func runMigrateStatus(cmd *cobra.Command, args []string) error {
 }
 
 // loadDialect returns the SQL dialect based on DATABASE_DRIVER env.
-func loadDialect() lux.Dialect {
+func loadDialect() (lux.Dialect, error) {
 	driver, _ := env.Get("DATABASE_DRIVER")
 	switch driver {
-	case "mysql":
-		fmt.Fprintf(os.Stderr, "warning: MySQL dialect not yet implemented, using pg\n")
-		return pg.Dialect{}
+	case "", "pg", "postgres", "postgresql":
+		return pg.Dialect{}, nil
+	case "mysql", "sqlite", "mongo", "mongodb":
+		return nil, fmt.Errorf("DATABASE_DRIVER %q is not implemented; currently supported: pg / 数据库驱动 %q 尚未实现；当前仅支持 pg", driver, driver)
 	default:
-		return pg.Dialect{}
+		return nil, fmt.Errorf("unknown DATABASE_DRIVER %q; currently supported: pg / 未知数据库驱动 %q；当前仅支持 pg", driver, driver)
 	}
 }
 
@@ -402,7 +414,9 @@ func runMigrateVerify(cmd *cobra.Command, args []string) error {
 	bold := "\033[1m"
 	reset := "\033[0m"
 
-	env.Load(".env")
+	if err := loadGenerationEnvironment(".env"); err != nil {
+		return err
+	}
 	ctx := cmd.Context()
 
 	runner, err := migrate.New(ctx, "migrations")
@@ -435,8 +449,13 @@ func runMigrateSquash(cmd *cobra.Command, args []string) error {
 	dim := "\033[2m"
 	reset := "\033[0m"
 
-	env.Load(".env")
-	dialect := loadDialect()
+	if err := loadGenerationEnvironment(".env"); err != nil {
+		return err
+	}
+	dialect, err := loadDialect()
+	if err != nil {
+		return err
+	}
 
 	result, err := parseAndAnalyze()
 	if err != nil {

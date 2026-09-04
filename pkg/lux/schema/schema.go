@@ -26,11 +26,23 @@ type Enum struct {
 	Values []string `json:"values"`
 }
 
+// TypeUsage describes whether a structured type is used for API input,
+// output, both directions, or is currently unreachable from public APIs.
+type TypeUsage string
+
+const (
+	TypeUsageUnused      TypeUsage = "unused"
+	TypeUsageInput       TypeUsage = "input"
+	TypeUsageOutput      TypeUsage = "output"
+	TypeUsageInputOutput TypeUsage = "inputOutput"
+)
+
 // TypeDecl describes a plain data type (non-DB, like AuthPayload).
 type TypeDecl struct {
-	Name   string  `json:"name"`
-	Module string  `json:"module,omitempty"`
-	Fields []Field `json:"fields"`
+	Name   string    `json:"name"`
+	Module string    `json:"module,omitempty"`
+	Usage  TypeUsage `json:"usage,omitempty"`
+	Fields []Field   `json:"fields"`
 }
 
 // AsModel converts TypeDecl to a Model for Binary↔JSON conversion.
@@ -55,9 +67,10 @@ func (td *TypeDecl) AsModel() *Model {
 
 // Model describes a model's fields for binary ↔ JSON conversion.
 type Model struct {
-	Name   string  `json:"name"`
-	Module string  `json:"module,omitempty"`
-	Fields []Field `json:"fields"`
+	Name   string    `json:"name"`
+	Module string    `json:"module,omitempty"`
+	Usage  TypeUsage `json:"usage,omitempty"`
+	Fields []Field   `json:"fields"`
 	byID   map[int]*Field
 	byName map[string]*Field
 }
@@ -256,6 +269,68 @@ func initializeModel(m *Model) {
 // RegisterAPI adds an API definition to the schema.
 func (s *Schema) RegisterAPI(a *API) {
 	s.APIs[a.Name] = a
+}
+
+// InferTypeUsage derives input/output roles from API roots and follows nested
+// model/type fields transitively. SDK generators use this to keep input DTOs
+// strict while representing field-selected output values explicitly.
+func (s *Schema) InferTypeUsage() {
+	for _, model := range s.Models {
+		model.Usage = TypeUsageUnused
+	}
+	for _, decl := range s.Types {
+		decl.Usage = TypeUsageUnused
+	}
+
+	visited := make(map[typeUsageVisit]bool, len(s.Models)+len(s.Types))
+	for _, api := range s.APIs {
+		s.markTypeUsage(api.ReturnType, TypeUsageOutput, visited)
+		for _, param := range api.Params {
+			s.markTypeUsage(param.TypeName, TypeUsageInput, visited)
+		}
+	}
+}
+
+type typeUsageVisit struct {
+	name  string
+	usage TypeUsage
+}
+
+func (s *Schema) markTypeUsage(name string, usage TypeUsage, visited map[typeUsageVisit]bool) {
+	if name == "" {
+		return
+	}
+	visit := typeUsageVisit{name: name, usage: usage}
+	if visited[visit] {
+		return
+	}
+	visited[visit] = true
+
+	if model := s.Models[name]; model != nil {
+		model.Usage = mergeTypeUsage(model.Usage, usage)
+		s.markFieldUsage(model.Fields, usage, visited)
+		return
+	}
+	if decl := s.Types[name]; decl != nil {
+		decl.Usage = mergeTypeUsage(decl.Usage, usage)
+		s.markFieldUsage(decl.Fields, usage, visited)
+	}
+}
+
+func (s *Schema) markFieldUsage(fields []Field, usage TypeUsage, visited map[typeUsageVisit]bool) {
+	for i := range fields {
+		s.markTypeUsage(fields[i].TypeName, usage, visited)
+	}
+}
+
+func mergeTypeUsage(current, next TypeUsage) TypeUsage {
+	if current == "" || current == TypeUsageUnused {
+		return next
+	}
+	if current == next || current == TypeUsageInputOutput {
+		return current
+	}
+	return TypeUsageInputOutput
 }
 
 // FieldByID returns a model field by its binary field ID.

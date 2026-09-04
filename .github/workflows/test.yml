@@ -14,13 +14,13 @@ jobs:
       postgres:
         image: postgres:17-alpine
         env:
-          POSTGRES_USER: luxo
-          POSTGRES_PASSWORD: luxo
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
           POSTGRES_DB: luxo_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd="pg_isready -U luxo"
+          --health-cmd="pg_isready -U postgres -d luxo_test"
           --health-interval=5s
           --health-timeout=3s
           --health-retries=5
@@ -28,10 +28,11 @@ jobs:
     env:
       DATABASE_HOST: localhost
       DATABASE_PORT: 5432
-      DATABASE_USER: luxo
-      DATABASE_PASSWORD: luxo
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
       DATABASE_PREFIX: luxo_test
       DATABASE_SSL: disable
+      LUXO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
 
     steps:
       - uses: actions/checkout@v7
@@ -98,6 +99,40 @@ jobs:
       - name: Build
         run: go build ./pkg/... ./cmd/...
 
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Verify compiler state isolation
+        run: go test -race ./pkg/codegen ./pkg/semantic ./pkg/lockfile -count=1 -timeout=180s
+
+  external-go-consumer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build Luxo CLI
+        run: |
+          mkdir -p .tmp
+          go build -o .tmp/luxo ./cmd/luxo
+
+      - name: Generate and compile an external project
+        run: |
+          cp -R tests/go-consumer .tmp/go-consumer
+          cd .tmp/go-consumer
+          ../luxo gen
+          GOWORK=off go mod tidy
+          GOWORK=off go test ./... -count=1
+
   fuzz:
     runs-on: ubuntu-latest
     steps:
@@ -118,6 +153,10 @@ jobs:
 
   sdk-ts:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [client, react, vite-plugin]
     steps:
       - uses: actions/checkout@v7
 
@@ -130,10 +169,38 @@ jobs:
           node-version: 22
 
       - name: Install dependencies
-        run: cd packages/vite-plugin && pnpm install
+        working-directory: packages/${{ matrix.package }}
+        run: pnpm install --frozen-lockfile
 
-      - name: Test vite-plugin
-        run: cd packages/vite-plugin && pnpm test
+      - name: Test and build package
+        working-directory: packages/${{ matrix.package }}
+        run: |
+          pnpm test
+          pnpm build
+
+      - name: Type-check React package
+        if: matrix.package == 'react'
+        working-directory: packages/react
+        run: pnpm typecheck
+
+  sdk-dart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dart-lang/setup-dart@v1
+
+      - name: Install dependencies
+        working-directory: packages/dart
+        run: dart pub get
+
+      - name: Analyze SDK
+        working-directory: packages/dart
+        run: dart analyze --fatal-infos
+
+      - name: Test SDK
+        working-directory: packages/dart
+        run: dart test
 
   sdk-kotlin:
     runs-on: ubuntu-latest
@@ -170,17 +237,9 @@ jobs:
           curl --retry 20 --retry-connrefused --retry-delay 1 -fsS -o /dev/null http://127.0.0.1:18080/luxo.schema.json
           ../../packages/kotlin/gradlew luxoGenerate build --project-cache-dir .tmp/gradle-cache --no-daemon --warning-mode fail -Pluxo.endpoint=http://127.0.0.1:18080/luxo.schema.json
           grep -F '"lookupNode" to "name, posts { title }"' .tmp/generated/com/luxo/generated/SelectHints.kt
+          if grep -R -F '!!' .tmp/generated/com/luxo/generated; then
+            echo "::error::Generated Kotlin contains a non-null assertion"
+            exit 1
+          fi
           ../../packages/kotlin/gradlew luxoAnalyze --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
           ../../packages/kotlin/gradlew luxoAnalyze --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
-
-  sdk-swift:
-    runs-on: macos-latest
-    steps:
-      - name: Checkout Swift SDK
-        uses: actions/checkout@v7
-        with:
-          repository: light-speak/luxo-swift
-          ref: main
-
-      - name: Test Swift SDK
-        run: swift test

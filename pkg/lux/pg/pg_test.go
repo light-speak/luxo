@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,12 +16,19 @@ import (
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
-// testDB starts a PostgreSQL container and returns a connected *DB.
-// The container is automatically cleaned up when the test ends.
+// testDB uses an explicitly configured test database when available and falls
+// back to an isolated PostgreSQL container for local development.
 func testDB(t *testing.T) *DB {
 	t.Helper()
 	ctx := context.Background()
+	if connString := os.Getenv("LUXO_TEST_DATABASE_URL"); connString != "" {
+		return externalTestDB(t, ctx, connString)
+	}
+	return containerTestDB(t, ctx)
+}
 
+func containerTestDB(t *testing.T, ctx context.Context) *DB {
+	t.Helper()
 	container, err := postgres.Run(ctx, "postgres:17-alpine",
 		postgres.WithDatabase("luxo_test"),
 		postgres.WithUsername("test"),
@@ -34,12 +44,56 @@ func testDB(t *testing.T) *DB {
 	if err != nil {
 		t.Fatalf("get connection string: %v", err)
 	}
+	return connectedTestDB(t, ctx, connStr, nil)
+}
 
-	db, err := NewDB(ctx, connStr)
+func externalTestDB(t *testing.T, ctx context.Context, connString string) *DB {
+	t.Helper()
+	admin, err := pgx.Connect(ctx, connString)
 	if err != nil {
+		t.Fatalf("connect to external test database: %v", err)
+	}
+	schemaName := "luxo_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	schemaIdentifier := pgx.Identifier{schemaName}.Sanitize()
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+schemaIdentifier); err != nil {
+		admin.Close(ctx)
+		t.Fatalf("create isolated test schema: %v", err)
+	}
+
+	parsed, err := url.Parse(connString)
+	if err != nil {
+		admin.Exec(ctx, "DROP SCHEMA "+schemaIdentifier+" CASCADE")
+		admin.Close(ctx)
+		t.Fatalf("parse external test database URL: %v", err)
+	}
+	query := parsed.Query()
+	query.Set("search_path", schemaName)
+	parsed.RawQuery = query.Encode()
+	return connectedTestDB(t, ctx, parsed.String(), func(cleanupCtx context.Context) {
+		if _, err := admin.Exec(cleanupCtx, "DROP SCHEMA "+schemaIdentifier+" CASCADE"); err != nil {
+			t.Errorf("drop isolated test schema: %v", err)
+		}
+		admin.Close(cleanupCtx)
+	})
+}
+
+func connectedTestDB(t *testing.T, ctx context.Context, connString string, cleanup func(context.Context)) *DB {
+	t.Helper()
+	db, err := NewDB(ctx, connString)
+	if err != nil {
+		if cleanup != nil {
+			cleanup(ctx)
+		}
 		t.Fatalf("connect to database: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	t.Cleanup(func() {
+		db.Close()
+		if cleanup != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			cleanup(cleanupCtx)
+		}
+	})
 
 	// Create test table
 	_, execErr := db.pool.Exec(ctx, `

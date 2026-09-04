@@ -361,7 +361,10 @@ internal object LuxoBinaryProtocol {
             "Int", "Duration" -> items.forEach { enc.writeSvarint((it as Number).toLong()) }
             "Float" -> items.forEach { enc.writeFixed64((it as Number).toDouble()) }
             "UUID" -> items.forEach { enc.writeUuid(it as String) }
-            "DateTime" -> items.forEach { enc.writeSvarint(unixSeconds(it!!)) }
+            "DateTime" -> items.forEach {
+                val item = it ?: throw LuxoError("ConfigError", 0, "parameter ${param.name} contains null")
+                enc.writeSvarint(unixSeconds(item))
+            }
             "String", "Enum", "Decimal" -> items.forEach { enc.writeString(it as String) }
             "Boolean" -> items.forEach { enc.writeBool(it as Boolean) }
             "Bytes" -> items.forEach { enc.writeBytes(it as ByteArray) }

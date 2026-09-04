@@ -73,6 +73,27 @@ func TestGenerateNativeFile(t *testing.T) {
 	}
 }
 
+func TestGenerateNativeFileUnwrapsResultReturn(t *testing.T) {
+	result := &semantic.Result{Files: []*luxoast.File{{
+		Functions: []*luxoast.FnDecl{{
+			Name: "loadCount",
+			ReturnType: &luxoast.TypeRef{
+				Name:     "Result",
+				TypeArgs: []*luxoast.TypeRef{{Name: "Int"}},
+			},
+			Directives: []*luxoast.Directive{{Name: "native"}},
+		}},
+	}}}
+
+	code := string(GenerateNativeFile(result, "luxo"))
+	if !strings.Contains(code, "LoadCount(ctx context.Context) (int64, error)") {
+		t.Fatalf("Result<Int> must use Go's (int64, error) ABI:\n%s", code)
+	}
+	if strings.Contains(code, "(Result, error)") {
+		t.Fatalf("Result<T> must not leak into generated Go:\n%s", code)
+	}
+}
+
 func TestGenerateNativeFileImportsTimeForDateTime(t *testing.T) {
 	result := &semantic.Result{Files: []*luxoast.File{{
 		APIs: []*luxoast.ApiDecl{mkNativeAPI(

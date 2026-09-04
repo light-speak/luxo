@@ -47,13 +47,13 @@ api test(): Boolean {
 func TestCollectionMethodFirstOrNull(t *testing.T) {
 	result := analyze(t, `
 model Item { name: String }
-api test(): Item {
+api test(): Item? {
   val items = Item.find(where: name == "x")
   val first = items.firstOrNull
   first
 }
 `)
-	// firstOrNull returns nullable, which is fine
+	// firstOrNull returns nullable, which matches the declared API contract.
 	if len(result.Errors) > 0 {
 		for _, err := range result.Errors {
 			if !strings.Contains(err.Message, "undefined") {
@@ -281,7 +281,7 @@ model User {
   name: String
   email: String
 }
-api test(): User {
+api test(): [User] {
   val user = User.find(where: email == "test@test.com")
   user
 }
@@ -311,7 +311,7 @@ model Post {
   status: String
 }
 api test(): Post {
-  val post = Post.find(where: title == "hello")
+  val post = Post.find(id: 1)
   post.update(status: "published")
   post
 }

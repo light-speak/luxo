@@ -73,6 +73,7 @@ void main() {
     test('fromJson', () {
       final json = {
         'name': 'User',
+        'usage': 'output',
         'fields': [
           {'id': 1, 'name': 'id', 'type': 'Int'},
           {'id': 2, 'name': 'name', 'type': 'String'},
@@ -80,8 +81,23 @@ void main() {
       };
       final model = LuxoModel.fromJson(json);
       expect(model.name, equals('User'));
+      expect(model.usage, TypeUsage.output);
       expect(model.fields.length, equals(2));
       expect(model.fields[0].name, equals('id'));
+    });
+  });
+
+  group('Selected', () {
+    test('distinguishes unselected, selected null, and selected value', () {
+      const absent = Selected<String?>.unselected();
+      const selectedNull = Selected<String?>.value(null);
+      const selectedValue = Selected<String?>.value('Luxo');
+
+      expect(absent.isSelected, isFalse);
+      expect(() => absent.value, throwsStateError);
+      expect(selectedNull.isSelected, isTrue);
+      expect(selectedNull.value, isNull);
+      expect(selectedValue.value, 'Luxo');
     });
   });
 

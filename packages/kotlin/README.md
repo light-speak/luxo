@@ -46,8 +46,15 @@ val transport = OkHttpTransport(
 )
 val client = LuxoClient(transport)
 val user = client.getUser(1)
-println(user.name)
+if (user.name.isSelected) println(user.name.value())
 ```
+
+Generated output fields use the allocation-free `Selected<T>` value class:
+unselected, selected `null`, or selected value. Input DTOs remain strict; a
+shared input/output type generates `Foo` plus `FooInput`.
+
+生成的输出字段使用零额外包装分配的 `Selected<T>` value class，区分未选择、已选择且为
+`null`、已选择且有值。输入 DTO 保持严格；输入输出共用类型会分别生成 `Foo` 和 `FooInput`。
 
 ## WebSocket / 订阅
 

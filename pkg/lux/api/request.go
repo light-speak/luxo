@@ -118,6 +118,8 @@ type Request struct {
 	PageSize   int                        // page size (default 20)
 	BinaryMode bool                       // true when X-Luxo-Mode: binary
 	FieldMask  []byte                     // binary field mask (binary mode)
+	ClientKey  string                     // transport-provided key for per-client policies
+	Internal   bool                       // trusted internal RPC dispatch; public-edge policies already ran
 
 	// Binary params — zero-allocation inline storage
 	// paramSlots stores values by index (position in API param list)
