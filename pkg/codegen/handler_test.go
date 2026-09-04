@@ -38,6 +38,70 @@ func TestGenerateCRUDHandlersUseDeclaredPrimaryKey(t *testing.T) {
 	}
 }
 
+func TestHandlerCompatibilityFunctions(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "user.luxo",
+		Functions: []*ast.FnDecl{{
+			Name:       "lookup",
+			ReturnType: &ast.TypeRef{Name: "Result"},
+			Directives: []*ast.Directive{{Name: "native"}},
+		}},
+	}}}
+	if names := collectNativeFunctionNames(result); !names["lookup"] {
+		t.Fatalf("native function names = %#v", names)
+	}
+
+	model := &ast.ModelDecl{Name: "User", Fields: []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}}}
+	models := map[string]*ast.ModelDecl{"User": model}
+	var b strings.Builder
+	generateCompiledHandlers(&b, result, models)
+	generateServiceFnHandlers(&b, result, models)
+	generateRegisterServiceFns(&b, nil)
+	writeSortedCrossModuleImports(&b, map[string]string{"user": "user_luxo"})
+	generateBatchLoadHandlers(&b, nil)
+	if got := collectBatchLoadModels(nil, nil); len(got) != 0 {
+		t.Fatalf("batch models = %#v", got)
+	}
+	if got := remoteLoadCallsForResult(result); got != nil {
+		t.Fatalf("remote load calls = %#v", got)
+	}
+	generateSelectedSQLFields(&b, model)
+	writeAPIRegistration(&b, "getUser")
+	if typ, nullable, list := resolveParamMetaFromAST("getUser", "id"); typ == "" || nullable || list {
+		t.Fatalf("resolved param = %q, %v, %v", typ, nullable, list)
+	}
+	if groups := collectComputedAggregateGroups(model, models, nil); len(groups) != 0 {
+		t.Fatalf("computed aggregate groups = %#v", groups)
+	}
+	if _, _, ok := parseComputedAggregate("User", model.Fields[0]); ok {
+		t.Fatal("plain field parsed as a computed aggregate")
+	}
+	features := &handlerFeatures{}
+	scanStmtsForEmit(nil, features, "user")
+	generateFederationResolvers(&b, result, []*ast.ModelDecl{model}, nil)
+}
+
+func TestDirectiveDurationRejectsMalformedValues(t *testing.T) {
+	if arg := findCodegenDirectiveArg(nil, "missing", 0); arg.Value != nil {
+		t.Fatalf("missing directive argument = %#v", arg)
+	}
+	tests := []*ast.Directive{
+		{Name: "timeout"},
+		{Name: "timeout", Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.String, Value: "slow"}}}},
+		{Name: "timeout", Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Duration, Value: "forever"}}}},
+	}
+	for _, directive := range tests {
+		if got, ok := directiveDuration(directive, "value", 0); ok || got != "" {
+			t.Fatalf("directiveDuration(%#v) = %q, %v", directive, got, ok)
+		}
+	}
+	if got, ok := directiveDuration(&ast.Directive{Args: []*ast.NamedArg{{
+		Value: &ast.Literal{Kind: token.Duration, Value: "5ms"},
+	}}}, "value", 0); !ok || got != "5 * time.Millisecond" {
+		t.Fatalf("duration = %q, %v", got, ok)
+	}
+}
+
 func TestGenerateSQLColumnSelectorUsesDeclaredDatabaseFields(t *testing.T) {
 	model := &ast.ModelDecl{
 		Name: "Product",

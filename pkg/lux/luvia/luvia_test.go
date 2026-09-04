@@ -437,6 +437,29 @@ func TestServerTimeoutsRejectInvalidValue(t *testing.T) {
 	}
 }
 
+func TestServerTimeoutsRejectInvalidWriteAndIdleValues(t *testing.T) {
+	t.Run("write", func(t *testing.T) {
+		t.Setenv("TIMEOUT_WRITE", "never")
+		if _, err := serverTimeoutsFromEnv(); err == nil {
+			t.Fatal("invalid TIMEOUT_WRITE must fail startup")
+		}
+	})
+	t.Run("idle", func(t *testing.T) {
+		t.Setenv("TIMEOUT_IDLE", "never")
+		if _, err := serverTimeoutsFromEnv(); err == nil {
+			t.Fatal("invalid TIMEOUT_IDLE must fail startup")
+		}
+	})
+}
+
+func TestStartGatewayServerRejectsInvalidTimeoutsBeforeListening(t *testing.T) {
+	t.Setenv("TIMEOUT_WRITE", "never")
+	server, serveErr, err := startGatewayServer("127.0.0.1:0", http.NewServeMux(), "", "")
+	if err == nil || server != nil || serveErr != nil {
+		t.Fatalf("startGatewayServer = %#v, %#v, %v", server, serveErr, err)
+	}
+}
+
 func TestBuildBannerDatabaseDisplay(t *testing.T) {
 	// With full DATABASE_* fields
 	t.Setenv("DATABASE_HOST", "localhost")
@@ -586,6 +609,15 @@ func TestServeRejectsInvalidJWTConfiguration(t *testing.T) {
 	err := New().Serve("test-v1")
 	if err == nil || !strings.Contains(err.Error(), "invalid JWT configuration") {
 		t.Fatalf("invalid JWT configuration = %v", err)
+	}
+}
+
+func TestValidateJWTConfigurationAcceptsValidConfiguration(t *testing.T) {
+	auth.ResetConfig()
+	t.Cleanup(auth.ResetConfig)
+	t.Setenv("JWT_SECRET", "test-secret")
+	if err := validateJWTConfig(); err != nil {
+		t.Fatalf("valid JWT configuration rejected: %v", err)
 	}
 }
 

@@ -117,6 +117,34 @@ func TestCheckedEntryGenerationReportsInvalidGo(t *testing.T) {
 	}
 }
 
+func TestCheckedEntryGenerationCoversEmptyValidAndInvalidProjects(t *testing.T) {
+	empty := &semantic.Result{}
+	if source, err := GenerateEntryFileChecked(empty, "myapp"); err != nil || source != nil {
+		t.Fatalf("empty embedded entry = %q, %v", source, err)
+	}
+	if entries, err := GenerateModuleEntryFilesChecked(empty, "myapp"); err != nil || entries != nil {
+		t.Fatalf("empty module entries = %#v, %v", entries, err)
+	}
+	if source, err := GenerateGatewayEntryChecked(empty, "myapp"); err != nil || source != nil {
+		t.Fatalf("empty gateway entry = %q, %v", source, err)
+	}
+
+	result := &semantic.Result{Files: []*ast.File{{Name: "origin/user.luxo", Models: []*ast.ModelDecl{{Name: "User"}}}}}
+	entries, err := GenerateModuleEntryFilesChecked(result, "myapp")
+	if err != nil || len(entries["user"]) == 0 {
+		t.Fatalf("valid module entries = %#v, %v", entries, err)
+	}
+	if _, err := GenerateModuleEntryFilesChecked(result, `invalid"module`); err == nil {
+		t.Fatal("invalid module entry import was not reported")
+	}
+	if source, err := GenerateGatewayEntryChecked(result, "myapp"); err != nil || len(source) == 0 {
+		t.Fatalf("valid gateway entry = %q, %v", source, err)
+	}
+	if _, err := GenerateGatewayEntryChecked(result, `invalid"module`); err == nil {
+		t.Fatal("invalid gateway import was not reported")
+	}
+}
+
 func TestGenerateEntryFileNoCrud(t *testing.T) {
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -651,6 +679,26 @@ func TestGenerateGatewayEntryAppliesRateLimitAtPublicEdge(t *testing.T) {
 	if !strings.Contains(src, `case "searchUsers":`) ||
 		!strings.Contains(src, "api.WithRateLimit(20, time.Minute, handler)") {
 		t.Fatalf("gateway must enforce @rateLimit before RPC forwarding:\n%s", src)
+	}
+}
+
+func TestGenerateGatewayEntrySkipsRoutesWithoutRateLimits(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/user.luxo",
+		APIs: []*ast.ApiDecl{
+			{
+				Name: "limited",
+				Directives: []*ast.Directive{{Name: "rateLimit", Args: []*ast.NamedArg{
+					{Name: "max", Value: &ast.Literal{Kind: token.Int, Value: "10"}},
+					{Name: "window", Value: &ast.Literal{Kind: token.Duration, Value: "1s"}},
+				}}},
+			},
+			{Name: "open"},
+		},
+	}}}
+	source := string(GenerateGatewayEntry(result, "myapp"))
+	if !strings.Contains(source, `case "limited":`) || strings.Contains(source, `case "open":`) {
+		t.Fatalf("gateway rate-limit switch is incorrect:\n%s", source)
 	}
 }
 

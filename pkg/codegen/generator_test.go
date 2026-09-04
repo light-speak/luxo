@@ -29,6 +29,21 @@ func TestGeneratorRejectsUnsupportedDriver(t *testing.T) {
 	}
 }
 
+func TestGenerateRejectsUnsupportedDriver(t *testing.T) {
+	_, err := Generate(&semantic.Result{}, "luxo", DBDriver("oracle"))
+	if err == nil || !strings.Contains(err.Error(), "unknown database driver") {
+		t.Fatalf("Generate error = %v, want unknown database driver", err)
+	}
+}
+
+func TestGeneratorReportsInvalidGeneratedSource(t *testing.T) {
+	generator := mustNewGenerator(t, GeneratorConfig{})
+	_, err := generator.Generate(&semantic.Result{}, "invalid-package", nil)
+	if err == nil || !strings.Contains(err.Error(), "format model.gen.go") {
+		t.Fatalf("Generator.Generate error = %v, want model formatting failure", err)
+	}
+}
+
 func TestGeneratorsKeepStableIDsIsolatedConcurrently(t *testing.T) {
 	result := &semantic.Result{Files: []*ast.File{{
 		Name: "user.luxo",

@@ -18,6 +18,39 @@ func TestGenerateWriteJSONFileNoModels(t *testing.T) {
 	}
 }
 
+func TestWriteJSONCompatibilityFunctions(t *testing.T) {
+	model := &ast.ModelDecl{Name: "User", Fields: []*ast.FieldDecl{
+		{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+	}}
+	result := &semantic.Result{Files: []*ast.File{{Name: "user.luxo", Models: []*ast.ModelDecl{model}}}}
+	if src := generateWriteJSONFile(result, "luxo", nil); len(src) == 0 {
+		t.Fatal("generateWriteJSONFile returned no source")
+	}
+	stub := extendStubModel(&ast.ExtendDecl{Name: "Account"})
+	if stub.Name != "Account" {
+		t.Fatalf("extend stub name = %q", stub.Name)
+	}
+
+	var b strings.Builder
+	writeArenaLenCalc(&b, model, "u", nil, false, "")
+	generateWriteLuxo(&b, model, nil)
+	generateWriteLuxoAllFields(&b, model, "u", nil)
+	generateTypeWriteLuxo(&b, model, nil)
+	generateReadLuxo(&b, model, nil)
+	generateWriteColumnar(&b, model, nil)
+	generateModelWriteColumnar(&b, model, nil, "WriteUsers", "[]User")
+	generateTypeWriteColumnar(&b, model, nil)
+	if hasWriteRelation(model, nil) {
+		t.Fatal("scalar-only model unexpectedly has a writable relation")
+	}
+	if hasArenaFields(model, nil) {
+		t.Fatal("model without stable field IDs unexpectedly uses an arena")
+	}
+	if b.Len() == 0 {
+		t.Fatal("compatibility generators produced no source")
+	}
+}
+
 // --- WriteLuxo generation tests ---
 
 func TestGenerateWriteLuxoWithFieldIDs(t *testing.T) {

@@ -30,6 +30,56 @@ func computed(name string) *ast.FieldDecl {
 	}
 }
 
+func TestLockFileMaintenanceCoversExistingReservedIDs(t *testing.T) {
+	lf := New()
+	lf.APIs["search"] = &APILock{
+		ID:       4,
+		Params:   map[string]int{"query": 1, "page": 2, "cursor": 3},
+		Reserved: []int{2},
+	}
+	lf.ensureAPIID("search", []string{"query"})
+	if _, exists := lf.APIs["search"].Params["page"]; exists {
+		t.Fatal("removed API parameter was retained")
+	}
+	if len(lf.APIs["search"].Reserved) != 2 || lf.APIs["search"].Reserved[0] != 2 || lf.APIs["search"].Reserved[1] != 3 {
+		t.Fatalf("reserved params = %v", lf.APIs["search"].Reserved)
+	}
+
+	lf.ReservedAPI = []int{7}
+	lf.APIs["removed"] = &APILock{ID: 7}
+	lf.reserveRemovedAPIs(map[string]bool{"search": true})
+	if _, exists := lf.APIs["removed"]; exists {
+		t.Fatal("removed API was retained")
+	}
+	lf.computeNextAPI()
+	if lf.nextAPI != 7 {
+		t.Fatalf("next API ID = %d, want 7", lf.nextAPI)
+	}
+
+	lf.Models["User"] = &ModelLock{Reserved: []int{3, 1}}
+	lf.Types = make(map[string]*ModelLock)
+	lf.Events = make(map[string]*ModelLock)
+	lf.Types["Payload"] = &ModelLock{Reserved: []int{4, 2}}
+	lf.Events["Changed"] = &ModelLock{Reserved: []int{6, 5}}
+	lf.APIs["search"].Reserved = []int{9, 8}
+	lf.sortReserved()
+	if lf.Models["User"].Reserved[0] != 1 || lf.Types["Payload"].Reserved[0] != 2 ||
+		lf.Events["Changed"].Reserved[0] != 5 || lf.APIs["search"].Reserved[0] != 8 {
+		t.Fatalf("reserved IDs were not sorted: %#v", lf)
+	}
+}
+
+func TestUpdateContractMetadataToleratesMissingRegisteredAPI(t *testing.T) {
+	lf := New()
+	lf.updateContractMetadata([]*ast.File{{APIs: []*ast.ApiDecl{{
+		Name:       "missing",
+		ReturnType: &ast.TypeRef{Name: "String"},
+	}}}})
+	if len(lf.APIs) != 0 {
+		t.Fatalf("contract metadata registered an API: %#v", lf.APIs)
+	}
+}
+
 func model(name string, fields ...*ast.FieldDecl) *ast.ModelDecl {
 	return &ast.ModelDecl{
 		Pos:    pos(),

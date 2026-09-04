@@ -770,11 +770,6 @@ func (a *Analyzer) validateFieldSegments(pos token.Position, apiName, afterBy st
 			}
 		}
 
-		// Strip OrderBy tail (OrderByNameDesc → before OrderBy)
-		if idx := strings.Index(field, "OrderBy"); idx >= 0 {
-			field = field[:idx]
-		}
-
 		if field == "" {
 			continue // operator-only segment like "True"/"IsNull"
 		}
@@ -1009,10 +1004,10 @@ func (a *Analyzer) validateFederationExtendFields() {
 }
 
 func (a *Analyzer) validateFederationExtendField(currentModule, modelName string, target *ResolvedType, field *ast.FieldDecl) {
-	fieldType := a.resolveTypeRef(field.Type, field.Pos)
-	if fieldType == nil {
+	if field.Type == nil {
 		return
 	}
+	fieldType := a.resolveTypeRef(field.Type, field.Pos)
 	if ownerField := target.LookupField(field.Name); ownerField != nil {
 		if !sameResolvedType(ownerField.Type, fieldType) {
 			a.addError(field.Pos,

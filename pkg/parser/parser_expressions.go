@@ -436,11 +436,7 @@ func (p *Parser) parseConditionExpr() ast.Expr {
 		return nil
 	}
 	for p.currentPrec() > precNone && !p.check(token.LBrace) {
-		startPos := p.pos
 		left = p.parseInfixExpr(left)
-		if p.pos == startPos {
-			break // guard against infinite loop
-		}
 	}
 	return left
 }

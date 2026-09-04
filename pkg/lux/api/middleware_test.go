@@ -33,6 +33,16 @@ func TestWithRateLimit(t *testing.T) {
 	}
 }
 
+func TestWithRateLimitUsesFallbackForEmptyClientKey(t *testing.T) {
+	limited := WithRateLimit(1, time.Minute, func(context.Context, *Request) error { return nil })
+	if err := limited(context.Background(), &Request{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := limited(context.Background(), &Request{}); err != luxerrors.RateLimited {
+		t.Fatalf("second anonymous request error = %v, want RateLimited", err)
+	}
+}
+
 func TestWithRateLimitSkipsTrustedInternalDispatch(t *testing.T) {
 	called := 0
 	limited := WithRateLimit(1, time.Minute, func(context.Context, *Request) error {

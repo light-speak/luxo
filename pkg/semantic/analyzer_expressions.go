@@ -50,32 +50,29 @@ func (a *Analyzer) checkExpr(expr ast.Expr, scope *Scope) *ResolvedType {
 }
 
 // checkCompositeExpr handles composite expression types (list, object, range, transaction, template).
-func (a *Analyzer) checkCompositeExpr(expr ast.Expr, scope *Scope) *ResolvedType {
+func (a *Analyzer) checkCompositeExpr(expr ast.Expr, scope *Scope) (resolved *ResolvedType) {
 	switch e := expr.(type) {
 	case *ast.ListExpr:
-		return a.checkListExpr(e, scope)
+		resolved = a.checkListExpr(e, scope)
 	case *ast.ObjectExpr:
-		return a.checkObjectExpr(e, scope)
+		resolved = a.checkObjectExpr(e, scope)
 	case *ast.RangeExpr:
-		return a.checkRangeExpr(e, scope)
+		resolved = a.checkRangeExpr(e, scope)
 	case *ast.TransactionExpr:
-		return a.checkTransactionExpr(e, scope)
+		resolved = a.checkTransactionExpr(e, scope)
 	case *ast.TemplateString:
-		return a.checkTemplateString(e, scope)
+		resolved = a.checkTemplateString(e, scope)
 	case *ast.YieldExpr:
-		return a.checkExpr(e.Value, scope)
+		resolved = a.checkExpr(e.Value, scope)
 	case *ast.AsyncExpr:
 		childScope := scope.Child()
 		a.checkBlock(e.Body, childScope)
-		return nil
 	case *ast.AwaitExpr:
-		return a.checkAwaitExpr(e, scope)
+		resolved = a.checkAwaitExpr(e, scope)
 	case *ast.ForStmt:
-		return a.checkForStmt(e, scope)
+		resolved = a.checkForStmt(e, scope)
 	}
-	// unreachable: all known ast.Expr types are covered by checkExpr + checkCompositeExpr switches;
-	// kept as defensive fallback required by Go's type system.
-	return nil
+	return resolved
 }
 
 func (a *Analyzer) checkListExpr(e *ast.ListExpr, scope *Scope) *ResolvedType {

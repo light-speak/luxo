@@ -29,6 +29,49 @@ func compilerOut(c *compiler) string {
 	return c.b.String()
 }
 
+func TestCompileCompatibilityPaths(t *testing.T) {
+	var body strings.Builder
+	compileFnBody(&body, &ast.FnDecl{Name: "ping", Body: &ast.Block{}}, nil, nil)
+	if !strings.Contains(body.String(), "return nil") {
+		t.Fatalf("compiled function body = %q", body.String())
+	}
+
+	c := newCompiler(makeModels("User"))
+	if _, ok := c.compileTransactionCall(&ast.CallExpr{
+		Func: &ast.Ident{Name: "transaction"},
+		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "notLambda"}}},
+	}); ok {
+		t.Fatal("transaction with a non-lambda argument was accepted")
+	}
+	transaction, ok := c.compileTransactionCall(&ast.CallExpr{
+		Func: &ast.Ident{Name: "transaction"},
+		Args: []*ast.NamedArg{{Value: &ast.LambdaExpr{Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.Literal{Kind: token.Int, Value: "1"}},
+		}}}}},
+	})
+	if !ok || !strings.Contains(transaction, "app.DB.Tx") {
+		t.Fatalf("transaction = %q, %v", transaction, ok)
+	}
+
+	if _, ok := c.compileChannelClose(&ast.CallExpr{Func: &ast.MemberExpr{
+		Object: &ast.MemberExpr{Object: &ast.Ident{Name: "object"}, Field: "channel"},
+		Field:  "close",
+	}}); ok {
+		t.Fatal("close on a non-identifier receiver was accepted as a channel close")
+	}
+	if _, ok := c.compileModelCallChain(&ast.CallExpr{Func: &ast.MemberExpr{
+		Object: &ast.Literal{Kind: token.Int, Value: "1"},
+		Field:  "first",
+	}}); ok {
+		t.Fatal("call chain with a non-identifier root was accepted as a model chain")
+	}
+
+	c.generator = mustNewGenerator(t, GeneratorConfig{Driver: DriverPG})
+	if got := c.dbPackage(); got != DriverPG.DriverPkg() {
+		t.Fatalf("dbPackage = %q, want %q", got, DriverPG.DriverPkg())
+	}
+}
+
 func makeModels(names ...string) map[string]*ast.ModelDecl {
 	m := make(map[string]*ast.ModelDecl, len(names))
 	for _, n := range names {
