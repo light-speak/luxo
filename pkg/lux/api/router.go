@@ -7,6 +7,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -237,6 +238,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rt.writeAppError(w, r, binaryMode, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
 		return
 	}
+	req.ClientKey = directClientKey(r.RemoteAddr)
 
 	fn, ok := rt.handlers[req.API]
 	if !ok {
@@ -303,6 +305,14 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	PutBuf(buf)
+}
+
+func directClientKey(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err == nil {
+		return host
+	}
+	return remoteAddr
 }
 
 func (rt *Router) prepareRequest(req *Request, binaryMode bool) error {

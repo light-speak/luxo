@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"github.com/light-speak/luxo/pkg/codegen"
 	"github.com/light-speak/luxo/pkg/lexer"
 	"github.com/light-speak/luxo/pkg/lockfile"
+	luxenv "github.com/light-speak/luxo/pkg/lux/env"
 	"github.com/light-speak/luxo/pkg/parser"
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/spf13/cobra"
@@ -33,11 +35,17 @@ Example / 示例:
 	RunE: runGen,
 }
 
+var allowBreaking bool
+
 func init() {
+	genCmd.Flags().BoolVar(&allowBreaking, "allow-breaking", false, "Accept breaking wire-contract changes / 接受破坏性协议变更")
 	rootCmd.AddCommand(genCmd)
 }
 
 func runGen(cmd *cobra.Command, args []string) error {
+	if err := loadGenerationEnvironment(".env"); err != nil {
+		return err
+	}
 	schemaFiles, err := findSchemaFiles()
 	if err != nil {
 		return err
@@ -58,45 +66,12 @@ func runGen(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Pass field IDs from lock file to codegen for binary encoding
-	if lf.Events != nil {
-		ids := make(map[string]map[string]int, len(lf.Events))
-		for name, el := range lf.Events {
-			ids[name] = el.Fields
-		}
-		codegen.SetEventFieldIDs(ids)
-	}
-	if lf.Models != nil || lf.Types != nil {
-		ids := make(map[string]map[string]int, len(lf.Models)+len(lf.Types))
-		for name, ml := range lf.Models {
-			ids[name] = ml.Fields
-		}
-		// Types have independent ID space but codegen uses the same lookup
-		for name, tl := range lf.Types {
-			ids[name] = tl.Fields
-		}
-		codegen.SetModelFieldIDs(ids)
-	}
-	if lf.APIs != nil {
-		ids := make(map[string]int, len(lf.APIs))
-		paramIDs := make(map[string]map[string]int, len(lf.APIs))
-		for name, al := range lf.APIs {
-			ids[name] = al.ID
-			if len(al.Params) > 0 {
-				paramIDs[name] = al.Params
-			}
-		}
-		codegen.SetAPIIDs(ids)
-		codegen.SetAPIParamIDs(paramIDs)
+	generator, err := buildProjectGenerator(lf, files)
+	if err != nil {
+		return err
 	}
 
-	// Extract param types from AST for accurate binary metadata
-	paramTypes := buildParamTypesFromAST(files)
-	if len(paramTypes) > 0 {
-		codegen.SetAPIParamTypes(paramTypes)
-	}
-
-	totalFiles, err := generateModules(files, result)
+	totalFiles, err := generateModules(files, result, generator)
 	if err != nil {
 		return err
 	}
@@ -111,7 +86,10 @@ func runGen(cmd *cobra.Command, args []string) error {
 		totalFiles++
 
 		// Per-module entries: luxis/<module>/main.gen.go (cluster mode, one binary per module)
-		moduleEntries := codegen.GenerateModuleEntryFiles(result, modulePath)
+		moduleEntries, err := codegen.GenerateModuleEntryFilesChecked(result, modulePath)
+		if err != nil {
+			return err
+		}
 		for modName, src := range moduleEntries {
 			outDir := filepath.Join("luxis", modName)
 			if err := os.MkdirAll(outDir, 0755); err != nil {
@@ -128,7 +106,11 @@ func runGen(cmd *cobra.Command, args []string) error {
 		}
 
 		// Gateway entry: luxis/gateway/main.gen.go (pure router, no handler code)
-		if gwSrc := codegen.GenerateGatewayEntry(result, modulePath); gwSrc != nil {
+		gwSrc, err := codegen.GenerateGatewayEntryChecked(result, modulePath)
+		if err != nil {
+			return err
+		}
+		if gwSrc != nil {
 			outDir := filepath.Join("luxis", "gateway")
 			if err := os.MkdirAll(outDir, 0755); err != nil {
 				return fmt.Errorf("create %s: %w", outDir, err)
@@ -145,7 +127,7 @@ func runGen(cmd *cobra.Command, args []string) error {
 	}
 
 	// Export luxo.schema.json for SDK generation (vite plugin / dart / kotlin)
-	if err := exportSchemaJSON(result); err != nil {
+	if err := exportSchemaJSON(result, generator); err != nil {
 		return fmt.Errorf("export schema: %w", err)
 	}
 	totalFiles++
@@ -157,6 +139,52 @@ func runGen(cmd *cobra.Command, args []string) error {
 	fmt.Printf("\n%s%s✓ %d file(s) generated from %d origin(s)%s\n", bold, green, totalFiles, len(schemaFiles), reset)
 	fmt.Printf("  %s%d 个 origin 生成了 %d 个文件%s\n\n", dim, len(schemaFiles), totalFiles, reset)
 	return nil
+}
+
+func loadGenerationEnvironment(path string) error {
+	if err := luxenv.Load(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("load generation environment: %w", err)
+	}
+	return nil
+}
+
+func buildProjectGenerator(lf *lockfile.LockFile, files []*ast.File) (*codegen.GeneratorContext, error) {
+	eventIDs := make(map[string]map[string]int, len(lf.Events))
+	for name, event := range lf.Events {
+		eventIDs[name] = event.Fields
+	}
+	modelIDs := make(map[string]map[string]int, len(lf.Models)+len(lf.Types))
+	for name, model := range lf.Models {
+		modelIDs[name] = model.Fields
+	}
+	for name, declaration := range lf.Types {
+		modelIDs[name] = declaration.Fields
+	}
+	apiIDs := make(map[string]int, len(lf.APIs))
+	paramIDs := make(map[string]map[string]int, len(lf.APIs))
+	for name, api := range lf.APIs {
+		apiIDs[name] = api.ID
+		paramIDs[name] = api.Params
+	}
+
+	modulePath := goModulePath()
+	if modulePath != "" {
+		modulePath += "/service"
+	}
+	return codegen.NewGenerator(codegen.GeneratorConfig{
+		Driver: codegen.DBDriver(os.Getenv("DATABASE_DRIVER")),
+		IDs: codegen.StableIDs{
+			EventFields:   eventIDs,
+			ModelFields:   modelIDs,
+			APIs:          apiIDs,
+			APIParams:     paramIDs,
+			APIParamTypes: buildParamTypesFromAST(files),
+		},
+		Events: codegen.BuildEventContext(files, modulePath),
+	})
 }
 
 func findSchemaFiles() ([]string, error) {
@@ -223,8 +251,7 @@ func parseAllFiles(paths []string) ([]*ast.File, error) {
 }
 
 func analyzeFiles(files []*ast.File) (*semantic.Result, error) {
-	a := semantic.New()
-	result := a.Analyze(files)
+	result := semantic.AnalyzeModules(files)
 	if len(result.Errors) > 0 {
 		for _, e := range result.Errors {
 			fmt.Fprintf(os.Stderr, "error: %s:%d: %s\n", e.Pos.File, e.Pos.Line, e.Message)
@@ -244,12 +271,29 @@ func updateLockFileAndReturn(files []*ast.File) (*lockfile.LockFile, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load luxo.lock: %w\n加载 luxo.lock 失败: %w", err, err)
 	}
+	if err := validateWireCompatibility(lf, files, allowBreaking); err != nil {
+		return nil, err
+	}
 	lf.Update(files)
 	if err := lf.Save("luxo.lock"); err != nil {
 		return nil, fmt.Errorf("save luxo.lock: %w\n保存 luxo.lock 失败: %w", err, err)
 	}
 	fmt.Printf("  %s✓%s luxo.lock\n", green, reset)
 	return lf, nil
+}
+
+func validateWireCompatibility(lf *lockfile.LockFile, files []*ast.File, allow bool) error {
+	changes := lf.BreakingChanges(files)
+	if len(changes) == 0 || allow {
+		return nil
+	}
+	var message strings.Builder
+	message.WriteString("breaking binary contract changes detected / 检测到破坏性二进制协议变更:\n")
+	for _, change := range changes {
+		fmt.Fprintf(&message, "  - %s\n", change)
+	}
+	message.WriteString("rerun with --allow-breaking only after coordinating every consumer / 仅在所有消费端协调升级后使用 --allow-breaking")
+	return fmt.Errorf("%s", message.String())
 }
 
 // buildParamTypesFromAST extracts param types from AST for accurate binary metadata.
@@ -378,7 +422,7 @@ func hasASTDirective(directives []*ast.Directive, name string) bool {
 	return false
 }
 
-func generateModules(files []*ast.File, result *semantic.Result) (int, error) {
+func generateModules(files []*ast.File, result *semantic.Result, generator *codegen.GeneratorContext) (int, error) {
 	green := "\033[32m"
 	reset := "\033[0m"
 
@@ -394,14 +438,6 @@ func generateModules(files []*ast.File, result *semantic.Result) (int, error) {
 	// Group files by module — directory name or file name without .luxo
 	modules := groupByModule(files)
 
-	// Build cross-module event context — needed for emit/on across modules
-	modulePath := goModulePath()
-	if modulePath != "" {
-		modulePath += "/service"
-	}
-	evCtx := codegen.BuildEventContext(files, modulePath)
-	codegen.SetEventContext(evCtx)
-
 	total := 0
 	for moduleName, moduleFiles := range modules {
 		outDir := filepath.Join("service", moduleName, "luxo")
@@ -409,11 +445,10 @@ func generateModules(files []*ast.File, result *semantic.Result) (int, error) {
 			return 0, fmt.Errorf("create %s: %w", outDir, err)
 		}
 		singleResult := &semantic.Result{Files: moduleFiles}
-		driver := codegen.DBDriver(os.Getenv("DATABASE_DRIVER"))
-		if driver == "" {
-			driver = codegen.DriverPG
+		gr, err := generator.Generate(singleResult, "luxo", softModels)
+		if err != nil {
+			return 0, fmt.Errorf("generate module %s: %w", moduleName, err)
 		}
-		gr := codegen.Generate(singleResult, "luxo", driver, softModels)
 		for name, src := range gr.Files {
 			outPath := filepath.Join(outDir, name)
 			if err := os.WriteFile(outPath, src, 0644); err != nil {
@@ -488,7 +523,10 @@ func goModulePath() string {
 func generateEntry(result *semantic.Result, modulePath string) error {
 	green := "\033[32m"
 	reset := "\033[0m"
-	src := codegen.GenerateEntryFile(result, modulePath)
+	src, err := codegen.GenerateEntryFileChecked(result, modulePath)
+	if err != nil {
+		return fmt.Errorf("generate embedded entry: %w", err)
+	}
 	if src == nil {
 		return nil
 	}
@@ -504,9 +542,9 @@ func generateEntry(result *semantic.Result, modulePath string) error {
 	return nil
 }
 
-func exportSchemaJSON(result *semantic.Result) error {
+func exportSchemaJSON(result *semantic.Result, generator *codegen.GeneratorContext) error {
 	enums := codegen.CollectEnumsFromResult(result)
-	data, err := codegen.BuildSchemaJSON(result, enums)
+	data, err := generator.BuildSchemaJSON(result, enums)
 	if err != nil {
 		return err
 	}

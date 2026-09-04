@@ -57,15 +57,26 @@ func GenerateNativeFile(result *semantic.Result, packageName string) []byte {
 			goType := resolveGoType(p.Type)
 			fmt.Fprintf(&b, ", %s %s", p.Name, goType)
 		}
-		if api.ReturnType == nil {
+		returnType := unwrapResultType(api.ReturnType)
+		if returnType == nil {
 			b.WriteString(") error\n")
 		} else {
-			fmt.Fprintf(&b, ") (%s, error)\n", resolveGoType(api.ReturnType))
+			fmt.Fprintf(&b, ") (%s, error)\n", resolveGoType(returnType))
 		}
 	}
 	b.WriteString("}\n")
 
 	return []byte(b.String())
+}
+
+func unwrapResultType(ref *luxoast.TypeRef) *luxoast.TypeRef {
+	if ref == nil {
+		return nil
+	}
+	if ref.Name == "Result" && len(ref.TypeArgs) == 1 {
+		return ref.TypeArgs[0]
+	}
+	return ref
 }
 
 // collectNativeAPIs finds all @native API and fn declarations.

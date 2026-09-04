@@ -32,6 +32,10 @@ type handlerFeatures struct {
 
 // detectHandlerFeatures scans models and APIs to determine which imports are needed.
 func detectHandlerFeatures(result *semantic.Result, models []*ast.ModelDecl, inferredAPIs []*ast.ApiDecl, modelMap map[string]*ast.ModelDecl) handlerFeatures {
+	return defaultGenerator().detectHandlerFeatures(result, models, inferredAPIs, modelMap)
+}
+
+func (g *GeneratorContext) detectHandlerFeatures(result *semantic.Result, models []*ast.ModelDecl, inferredAPIs []*ast.ApiDecl, modelMap map[string]*ast.ModelDecl) handlerFeatures {
 	var f handlerFeatures
 
 	// Check if any inferred API has OR groups (need strconv import)
@@ -85,7 +89,7 @@ func detectHandlerFeatures(result *semantic.Result, models []*ast.ModelDecl, inf
 			if api.Body == nil {
 				continue
 			}
-			scanBodyForBuiltins(api.Body, &f, curModule)
+			g.scanBodyForBuiltins(api.Body, &f, curModule)
 		}
 	}
 
@@ -95,25 +99,29 @@ func detectHandlerFeatures(result *semantic.Result, models []*ast.ModelDecl, inf
 // generateHandlerFile produces handler.gen.go containing CRUD handlers,
 // inferred handlers (zero-body APIs), and RegisterHandlers.
 func generateHandlerFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
+	return defaultGenerator().generateHandlerFile(result, packageName, enums)
+}
+
+func (g *GeneratorContext) generateHandlerFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
 	models, allModels := collectHandlerModels(result)
 	modelMap, inferredAPIs := collectInferredAPIs(result)
 	hasCompiledAPIs, hasNativeAPIs, hasServiceFns := handlerDeclarationKinds(result)
-	remoteLoads := remoteLoadCallsForResult(result)
+	remoteLoads := g.remoteLoadCallsForResult(result)
 	if len(models) == 0 && len(inferredAPIs) == 0 && !hasCompiledAPIs && !hasNativeAPIs && !hasServiceFns && len(remoteLoads) == 0 {
 		return nil
 	}
 
-	features := detectHandlerFeatures(result, models, inferredAPIs, modelMap)
+	features := g.detectHandlerFeatures(result, models, inferredAPIs, modelMap)
 
 	// Body is generated into its own builder first so the import block can be
 	// derived from what the generated code actually references (e.g. a module
 	// whose native list handlers all became columnar no longer needs codec).
 	var b strings.Builder
 	generateSelectedColumnHelper(&b)
-	for _, model := range collectSelectionModels(result, allModels) {
+	for _, model := range g.collectSelectionModels(result, allModels) {
 		generateSQLColumnSelector(&b, model, enums)
 	}
-	generateComputedResolvers(&b, allModels, modelMap, enums)
+	g.generateComputedResolvers(&b, allModels, modelMap, enums)
 
 	// Generate defaultCols for models with @hidden fields (excludes hidden from SELECT *)
 	for _, m := range models {
@@ -122,7 +130,7 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 		}
 	}
 
-	compiledNames := generateCompiledHandlers(&b, result, modelMap)
+	compiledNames := g.generateCompiledHandlers(&b, result, modelMap)
 	nativeNames := generateNativeAPIHandlers(&b, result)
 	inferredNames := generateInferredHandlers(&b, inferredAPIs, modelMap, enums)
 
@@ -137,7 +145,7 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	for _, n := range nativeNames {
 		compiledSet[n] = true
 	}
-	generateCRUDHandlers(&b, models, enums, compiledSet, allModels)
+	g.generateCRUDHandlers(&b, models, enums, compiledSet, allModels)
 
 	// Collect API directives for middleware wrapping
 	apiDirectives := collectAPIDirectives(result)
@@ -145,24 +153,24 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 	// RegisterHandlers function (CRUD + inferred + compiled + native)
 	allInferred := append(inferredNames, compiledNames...)
 	allInferred = append(allInferred, nativeNames...)
-	generateRegisterFuncWithInferred(&b, models, allInferred, apiDirectives)
+	g.generateRegisterFuncWithInferred(&b, models, allInferred, apiDirectives)
 
 	// fn @service handlers
-	serviceNames := generateServiceFnHandlers(&b, result, modelMap)
-	generateRegisterServiceFns(&b, serviceNames)
+	serviceNames := g.generateServiceFnHandlers(&b, result, modelMap)
+	g.generateRegisterServiceFns(&b, serviceNames)
 
 	// DataLoader RPC endpoints — batch load for each model (cluster mode)
-	batchModels := collectBatchLoadModels(models, allModels)
-	generateBatchLoadHandlers(&b, batchModels, enums)
-	generateRemoteNamedLoadHandlers(&b, result, allModels, remoteLoads, enums)
+	batchModels := g.collectBatchLoadModels(models, allModels)
+	g.generateBatchLoadHandlers(&b, batchModels, enums)
+	g.generateRemoteNamedLoadHandlers(&b, result, allModels, remoteLoads, enums)
 
 	// Federation resolve endpoints — svc:resolve:{Model}:{FK} for cross-module extends
-	generateFederationResolvers(&b, result, models, enums)
+	g.generateFederationResolvers(&b, result, models, enums)
 
 	body := b.String()
 	var out strings.Builder
 	writeHeader(&out, packageName, "handler.gen.go")
-	writeHandlerImports(&out, result, allModels, features, strings.Contains(body, "codec."), body)
+	g.writeHandlerImports(&out, result, allModels, features, strings.Contains(body, "codec."), body)
 	out.WriteString(body)
 	return []byte(out.String())
 }
@@ -191,6 +199,10 @@ func handlerDeclarationKinds(result *semantic.Result) (hasCompiled, hasNative, h
 }
 
 func collectSelectionModels(result *semantic.Result, models []*ast.ModelDecl) []*ast.ModelDecl {
+	return defaultGenerator().collectSelectionModels(result, models)
+}
+
+func (g *GeneratorContext) collectSelectionModels(result *semantic.Result, models []*ast.ModelDecl) []*ast.ModelDecl {
 	selectionModels := append([]*ast.ModelDecl(nil), models...)
 	seen := make(map[string]bool, len(selectionModels))
 	for _, model := range selectionModels {
@@ -199,7 +211,7 @@ func collectSelectionModels(result *semantic.Result, models []*ast.ModelDecl) []
 	for _, file := range result.Files {
 		for _, ext := range file.Extends {
 			if !seen[ext.Name] {
-				selectionModels = append(selectionModels, extendStubModel(ext))
+				selectionModels = append(selectionModels, g.extendStubModel(ext))
 				seen[ext.Name] = true
 			}
 		}
@@ -208,10 +220,14 @@ func collectSelectionModels(result *semantic.Result, models []*ast.ModelDecl) []
 }
 
 func generateCRUDHandlers(b *strings.Builder, models []*ast.ModelDecl, enums map[string]bool, skipNames map[string]bool, universes ...[]*ast.ModelDecl) {
+	defaultGenerator().generateCRUDHandlers(b, models, enums, skipNames, universes...)
+}
+
+func (g *GeneratorContext) generateCRUDHandlers(b *strings.Builder, models []*ast.ModelDecl, enums map[string]bool, skipNames map[string]bool, universes ...[]*ast.ModelDecl) {
 	// Collect all model relations for recursive resolve support
 	modelRels := make(map[string]bool)
 	for _, m := range models {
-		rels := analyzeRelations(m, enums)
+		rels := g.analyzeRelations(m, enums)
 		if len(rels) > 0 {
 			modelRels[m.Name] = true
 		}
@@ -227,11 +243,10 @@ func generateCRUDHandlers(b *strings.Builder, models []*ast.ModelDecl, enums map
 
 	// Generate MaxRelationDepth constant
 	b.WriteString("// MaxRelationDepth limits recursive relation resolution to prevent infinite loops.\n")
-	b.WriteString("// Override via RELATION_MAX_DEPTH env var.\n")
 	b.WriteString("var MaxRelationDepth = 5\n\n")
 
 	for _, m := range models {
-		rels := analyzeRelations(m, enums)
+		rels := g.analyzeRelations(m, enums)
 		ops := crudOperations(m)
 		for _, op := range ops {
 			// Skip if a compiled/inferred API with the same name exists
@@ -265,13 +280,30 @@ func generateInferredHandlers(b *strings.Builder, apis []*ast.ApiDecl, modelMap 
 }
 
 func generateCompiledHandlers(b *strings.Builder, result *semantic.Result, modelMap map[string]*ast.ModelDecl) []string {
+	return defaultGenerator().generateCompiledHandlers(b, result, modelMap)
+}
+
+func (g *GeneratorContext) generateCompiledHandlers(b *strings.Builder, result *semantic.Result, modelMap map[string]*ast.ModelDecl) []string {
 	enumSet := CollectEnumsFromResult(result)
+	nativeFunctions := collectNativeFunctionNames(result)
 	var names []string
 	for _, file := range result.Files {
 		for _, api := range file.APIs {
 			if api.Body != nil && !hasDirective(api.Directives, "native") && !hasDirective(api.Directives, "stream") {
-				compileAPIBody(b, api, modelMap, enumSet)
+				g.compileAPIBody(b, api, modelMap, enumSet, nativeFunctions)
 				names = append(names, api.Name)
+			}
+		}
+	}
+	return names
+}
+
+func collectNativeFunctionNames(result *semantic.Result) map[string]bool {
+	names := make(map[string]bool)
+	for _, file := range result.Files {
+		for _, fn := range file.Functions {
+			if hasDirective(fn.Directives, "native") && fn.ReturnType != nil && fn.ReturnType.Name == "Result" {
+				names[fn.Name] = true
 			}
 		}
 	}
@@ -282,6 +314,10 @@ func generateCompiledHandlers(b *strings.Builder, result *semantic.Result, model
 // Handles both compiled fn (with body) and @native fn (delegating to NativeResolver).
 // Returns service fn names for RegisterServiceFns generation.
 func generateServiceFnHandlers(b *strings.Builder, result *semantic.Result, modelMap map[string]*ast.ModelDecl) []string {
+	return defaultGenerator().generateServiceFnHandlers(b, result, modelMap)
+}
+
+func (g *GeneratorContext) generateServiceFnHandlers(b *strings.Builder, result *semantic.Result, modelMap map[string]*ast.ModelDecl) []string {
 	enumSet := CollectEnumsFromResult(result)
 	var names []string
 	for _, file := range result.Files {
@@ -294,7 +330,7 @@ func generateServiceFnHandlers(b *strings.Builder, result *semantic.Result, mode
 				generateNativeServiceHandler(b, fn, modelMap, enumSet)
 			} else if fn.Body != nil {
 				// Compiled fn @service
-				compileFnBody(b, fn, modelMap, enumSet)
+				g.compileFnBody(b, fn, modelMap, enumSet)
 			}
 			names = append(names, fn.Name)
 		}
@@ -472,7 +508,7 @@ func generateNativeServiceHandler(b *strings.Builder, fn *ast.FnDecl, models map
 
 	// Write response — always binary (Luvia converts to JSON if needed)
 	if fn.ReturnType != nil {
-		writeNativeReturnEncoding(b, fn.ReturnType, models, enums)
+		writeNativeReturnEncoding(b, unwrapResultType(fn.ReturnType), models, enums)
 	}
 	fmt.Fprintf(b, "\t\treturn nil\n")
 	fmt.Fprintf(b, "\t}\n}\n\n")
@@ -480,6 +516,10 @@ func generateNativeServiceHandler(b *strings.Builder, fn *ast.FnDecl, models map
 
 // generateRegisterServiceFns generates RegisterServiceFns with svc: prefix.
 func generateRegisterServiceFns(b *strings.Builder, serviceNames []string) {
+	defaultGenerator().generateRegisterServiceFns(b, serviceNames)
+}
+
+func (g *GeneratorContext) generateRegisterServiceFns(b *strings.Builder, serviceNames []string) {
 	if len(serviceNames) == 0 {
 		return
 	}
@@ -490,7 +530,7 @@ func generateRegisterServiceFns(b *strings.Builder, serviceNames []string) {
 	for _, name := range serviceNames {
 		svcName := "svc:" + name
 		fmt.Fprintf(b, "\trouter.Handle(%q, handle%s(app))\n", svcName, str.Capitalize(name))
-		writeAPIRegistration(b, svcName)
+		g.writeAPIRegistration(b, svcName)
 	}
 
 	b.WriteString("}\n\n")
@@ -513,7 +553,11 @@ func writeFKEnsure(b *strings.Builder, rels []Relation) {
 // writeHandlerImports writes handler.gen.go imports.
 // writeSortedCrossModuleImports writes cross-module event imports in deterministic order.
 func writeSortedCrossModuleImports(b *strings.Builder, imports map[string]string) {
-	if globalEventCtx == nil || len(imports) == 0 {
+	defaultGenerator().writeSortedCrossModuleImports(b, imports)
+}
+
+func (g *GeneratorContext) writeSortedCrossModuleImports(b *strings.Builder, imports map[string]string) {
+	if g.events == nil || len(imports) == 0 {
 		return
 	}
 	modNames := make([]string, 0, len(imports))
@@ -522,7 +566,7 @@ func writeSortedCrossModuleImports(b *strings.Builder, imports map[string]string
 	}
 	sort.Strings(modNames)
 	for _, modName := range modNames {
-		fmt.Fprintf(b, "\t%s \"%s/%s/luxo\"\n", imports[modName], globalEventCtx.ModulePath, modName)
+		fmt.Fprintf(b, "\t%s \"%s/%s/luxo\"\n", imports[modName], g.events.ModulePath, modName)
 	}
 }
 
@@ -543,6 +587,10 @@ func needsFmtImport(models []*ast.ModelDecl, hasEmit bool) bool {
 }
 
 func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*ast.ModelDecl, feat handlerFeatures, needsCodec bool, generatedBody ...string) {
+	defaultGenerator().writeHandlerImports(b, result, models, feat, needsCodec, generatedBody...)
+}
+
+func (g *GeneratorContext) writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*ast.ModelDecl, feat handlerFeatures, needsCodec bool, generatedBody ...string) {
 	hasOrGroups := feat.hasOrGroups
 	hasSortable := feat.hasSortable
 	hasAwait := feat.hasAwait
@@ -631,7 +679,7 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 	if needsDecimal {
 		b.WriteString("\t\"github.com/shopspring/decimal\"\n")
 	}
-	writeSortedCrossModuleImports(b, feat.crossEventImports)
+	g.writeSortedCrossModuleImports(b, feat.crossEventImports)
 	if hasAwait {
 		b.WriteString("\t\"golang.org/x/sync/errgroup\"\n")
 	}
@@ -1328,6 +1376,10 @@ func crudAPIName(modelName, op string) string {
 // Also registers API IDs and param metadata for binary protocol routing.
 // Wraps handlers with @cache/@rateLimit middleware when present.
 func generateRegisterFuncWithInferred(b *strings.Builder, models []*ast.ModelDecl, inferredNames []string, apiDirs map[string][]*ast.Directive) {
+	defaultGenerator().generateRegisterFuncWithInferred(b, models, inferredNames, apiDirs)
+}
+
+func (g *GeneratorContext) generateRegisterFuncWithInferred(b *strings.Builder, models []*ast.ModelDecl, inferredNames []string, apiDirs map[string][]*ast.Directive) {
 	b.WriteString("// RegisterHandlers registers all API handlers with the router.\n")
 	b.WriteString("func RegisterHandlers(router *api.Router, app *App) {\n")
 
@@ -1345,13 +1397,13 @@ func generateRegisterFuncWithInferred(b *strings.Builder, models []*ast.ModelDec
 				continue
 			}
 			writeHandlerRegistration(b, name, apiDirs[name])
-			writeAPIRegistration(b, name)
+			g.writeAPIRegistration(b, name)
 		}
 	}
 
 	for _, name := range inferredNames {
 		writeHandlerRegistration(b, name, apiDirs[name])
-		writeAPIRegistration(b, name)
+		g.writeAPIRegistration(b, name)
 	}
 
 	b.WriteString("}\n")
@@ -1361,17 +1413,70 @@ func generateRegisterFuncWithInferred(b *strings.Builder, models []*ast.ModelDec
 func writeHandlerRegistration(b *strings.Builder, name string, directives []*ast.Directive) {
 	handler := fmt.Sprintf("handle%s(app)", str.Capitalize(name))
 
-	// @cache(ttl) wrapping
+	// Apply directives in declaration order so the generated middleware stack is deterministic.
 	for _, d := range directives {
-		if d.Name == "cache" && len(d.Args) > 0 {
-			if lit, ok := d.Args[0].Value.(*ast.Literal); ok {
-				// ttl is a Duration literal (e.g., "60" seconds or "5m")
-				handler = fmt.Sprintf("api.WithCache(%s*time.Second, %s)", lit.Value, handler)
+		switch d.Name {
+		case "cache":
+			if ttl, ok := directiveDuration(d, "ttl", 0); ok {
+				handler = fmt.Sprintf("api.WithCache(%s, %s)", ttl, handler)
+			}
+		case "rateLimit":
+			maxArg := findCodegenDirectiveArg(d.Args, "max", 0)
+			maxLiteral, maxOK := maxArg.Value.(*ast.Literal)
+			window, windowOK := directiveDuration(d, "window", 1)
+			if maxOK && windowOK {
+				handler = fmt.Sprintf("api.WithRateLimit(%s, %s, %s)", maxLiteral.Value, window, handler)
 			}
 		}
 	}
 
 	fmt.Fprintf(b, "\trouter.Handle(%q, %s)\n", name, handler)
+}
+
+func findCodegenDirectiveArg(args []*ast.NamedArg, name string, position int) *ast.NamedArg {
+	for _, arg := range args {
+		if arg.Name == name {
+			return arg
+		}
+	}
+	if position >= 0 && position < len(args) {
+		return args[position]
+	}
+	return &ast.NamedArg{}
+}
+
+func directiveDuration(d *ast.Directive, name string, position int) (string, bool) {
+	arg := findCodegenDirectiveArg(d.Args, name, position)
+	literal, ok := arg.Value.(*ast.Literal)
+	if !ok {
+		return "", false
+	}
+	if literal.Kind == token.Int {
+		return literal.Value + " * time.Second", true
+	}
+	if literal.Kind != token.Duration {
+		return "", false
+	}
+	units := []struct {
+		suffix string
+		goUnit string
+	}{
+		{"ms", "time.Millisecond"},
+		{"d", "24 * time.Hour"},
+		{"h", "time.Hour"},
+		{"m", "time.Minute"},
+		{"s", "time.Second"},
+	}
+	for _, unit := range units {
+		if strings.HasSuffix(literal.Value, unit.suffix) {
+			value := strings.TrimSuffix(literal.Value, unit.suffix)
+			if value == "1" {
+				return unit.goUnit, true
+			}
+			return value + " * " + unit.goUnit, true
+		}
+	}
+	return "", false
 }
 
 // collectAPIDirectives collects directives for each API by name.
@@ -1391,6 +1496,10 @@ func collectAPIDirectives(result *semantic.Result) map[string][]*ast.Directive {
 // These endpoints allow remote services to batch-load model data via DataLoader.
 // Used in cluster mode: remote service's DataLoader calls this endpoint instead of querying DB.
 func generateBatchLoadHandlers(b *strings.Builder, models []*ast.ModelDecl, enumSets ...map[string]bool) {
+	defaultGenerator().generateBatchLoadHandlers(b, models, enumSets...)
+}
+
+func (g *GeneratorContext) generateBatchLoadHandlers(b *strings.Builder, models []*ast.ModelDecl, enumSets ...map[string]bool) {
 	if len(models) == 0 {
 		return
 	}
@@ -1409,10 +1518,10 @@ func generateBatchLoadHandlers(b *strings.Builder, models []*ast.ModelDecl, enum
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 		fmt.Fprintf(b, "\t\tkeys, err := req.Param%s(\"keys\")\n", paramMethod)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		generateSelectedSQLFields(b, m, firstBoolSet(enumSets))
+		g.generateSelectedSQLFields(b, m, firstBoolSet(enumSets))
 		fmt.Fprintf(b, "\t\tconds := []lux.Condition{lux.New%s(%q).In(keys...)}\n", goTypeToCondField(idGoType), idColumn)
 		fmt.Fprintf(b, "\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", tableName)
-		fmt.Fprintf(b, "\t\trows, err := %s.QueryRows(ctx, app.DB, %s, query, args...)\n", dbPkg, scanFn)
+		fmt.Fprintf(b, "\t\trows, err := %s.QueryRows(ctx, app.DB, %s, query, args...)\n", g.dbPkg, scanFn)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		writeComputedResolve(b, m, "rows", "\t\t")
 		// Write response: binary array of models
@@ -1431,7 +1540,7 @@ func generateBatchLoadHandlers(b *strings.Builder, models []*ast.ModelDecl, enum
 	for _, m := range models {
 		svcName := "svc:batchLoad:" + m.Name
 		fmt.Fprintf(b, "\trouter.Handle(%q, handleBatchLoad%s(app))\n", svcName, m.Name)
-		apiID := getAPIID(svcName)
+		apiID := g.apiID(svcName)
 		if apiID > 0 {
 			fmt.Fprintf(b, "\trouter.Registry.Register(%q, %d)\n", svcName, apiID)
 			fmt.Fprintf(b, "\trouter.Registry.RegisterParams(%q, []api.ParamMeta{{FieldID: 1, Name: \"keys\", Type: %q, IsList: true}})\n", svcName, modelIDTypeName(m))
@@ -1441,16 +1550,20 @@ func generateBatchLoadHandlers(b *strings.Builder, models []*ast.ModelDecl, enum
 }
 
 func collectBatchLoadModels(crudModels, allModels []*ast.ModelDecl) []*ast.ModelDecl {
+	return defaultGenerator().collectBatchLoadModels(crudModels, allModels)
+}
+
+func (g *GeneratorContext) collectBatchLoadModels(crudModels, allModels []*ast.ModelDecl) []*ast.ModelDecl {
 	selected := make(map[string]bool, len(crudModels))
 	result := append([]*ast.ModelDecl(nil), crudModels...)
 	for _, model := range crudModels {
 		selected[model.Name] = true
 	}
-	if globalEventCtx == nil {
+	if g.events == nil {
 		return result
 	}
 	for _, model := range allModels {
-		if globalEventCtx.remotePKModels[model.Name] && !selected[model.Name] {
+		if g.events.remotePKModels[model.Name] && !selected[model.Name] {
 			selected[model.Name] = true
 			result = append(result, model)
 		}
@@ -1459,15 +1572,23 @@ func collectBatchLoadModels(crudModels, allModels []*ast.ModelDecl) []*ast.Model
 }
 
 func remoteLoadCallsForResult(result *semantic.Result) []loadCallInfo {
-	if globalEventCtx == nil || len(result.Files) == 0 {
+	return defaultGenerator().remoteLoadCallsForResult(result)
+}
+
+func (g *GeneratorContext) remoteLoadCallsForResult(result *semantic.Result) []loadCallInfo {
+	if g.events == nil || len(result.Files) == 0 {
 		return nil
 	}
-	return globalEventCtx.remoteLoadCalls[moduleNameFromFile(result.Files[0].Name)]
+	return g.events.remoteLoadCalls[moduleNameFromFile(result.Files[0].Name)]
 }
 
 // generateRemoteNamedLoadHandlers emits internal RPC endpoints used by
 // cross-module Model.load(field: value, ...) calls.
 func generateRemoteNamedLoadHandlers(b *strings.Builder, result *semantic.Result, models []*ast.ModelDecl, calls []loadCallInfo, enumSets ...map[string]bool) {
+	defaultGenerator().generateRemoteNamedLoadHandlers(b, result, models, calls, enumSets...)
+}
+
+func (g *GeneratorContext) generateRemoteNamedLoadHandlers(b *strings.Builder, result *semantic.Result, models []*ast.ModelDecl, calls []loadCallInfo, enumSets ...map[string]bool) {
 	if len(calls) == 0 {
 		return
 	}
@@ -1484,7 +1605,7 @@ func generateRemoteNamedLoadHandlers(b *strings.Builder, result *semantic.Result
 		}
 		seen[serviceName] = true
 		generated = append(generated, call)
-		generateRemoteNamedLoadHandler(b, modelByName[call.modelName], call, firstBoolSet(enumSets))
+		g.generateRemoteNamedLoadHandler(b, modelByName[call.modelName], call, firstBoolSet(enumSets))
 	}
 	if len(generated) == 0 {
 		return
@@ -1495,12 +1616,12 @@ func generateRemoteNamedLoadHandlers(b *strings.Builder, result *semantic.Result
 		serviceName := loadServiceName(call)
 		handlerName := "handleLoad" + loaderNameFromLoadCall(call)
 		fmt.Fprintf(b, "\trouter.Handle(%q, %s(app))\n", serviceName, handlerName)
-		if apiID := getAPIID(serviceName); apiID > 0 {
+		if apiID := g.apiID(serviceName); apiID > 0 {
 			fmt.Fprintf(b, "\trouter.Registry.Register(%q, %d)\n", serviceName, apiID)
 			fmt.Fprintf(b, "\trouter.Registry.RegisterParams(%q, []api.ParamMeta{\n", serviceName)
 			for i, argName := range call.argNames {
 				fmt.Fprintf(b, "\t\t{FieldID: %d, Name: %q, Type: %q, IsList: true},\n",
-					getAPIParamID(serviceName, argName), argName, call.argTypeNames[i])
+					g.apiParamID(serviceName, argName), argName, call.argTypeNames[i])
 			}
 			b.WriteString("\t})\n")
 		}
@@ -1510,6 +1631,10 @@ func generateRemoteNamedLoadHandlers(b *strings.Builder, result *semantic.Result
 }
 
 func generateRemoteNamedLoadHandler(b *strings.Builder, model *ast.ModelDecl, call loadCallInfo, enumSets ...map[string]bool) {
+	defaultGenerator().generateRemoteNamedLoadHandler(b, model, call, enumSets...)
+}
+
+func (g *GeneratorContext) generateRemoteNamedLoadHandler(b *strings.Builder, model *ast.ModelDecl, call loadCallInfo, enumSets ...map[string]bool) {
 	loaderName := loaderNameFromLoadCall(call)
 	handlerName := "handleLoad" + loaderName
 	keyType := call.argTypes[0]
@@ -1536,7 +1661,7 @@ func generateRemoteNamedLoadHandler(b *strings.Builder, model *ast.ModelDecl, ca
 			b.WriteString("\t\t}\n")
 		}
 	}
-	generateSelectedSQLFields(b, model, firstBoolSet(enumSets))
+	g.generateSelectedSQLFields(b, model, firstBoolSet(enumSets))
 	for _, argName := range call.argNames {
 		generateRequiredSQLField(b, str.ToSnakeCase(argName))
 	}
@@ -1550,7 +1675,7 @@ func generateRemoteNamedLoadHandler(b *strings.Builder, model *ast.ModelDecl, ca
 		b.WriteString("\t\tconds = append(conds, lux.NewTimeField(\"deleted_at\").IsNull())\n")
 	}
 	fmt.Fprintf(b, "\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", str.ToSnakeCase(model.Name)+"s")
-	fmt.Fprintf(b, "\t\trows, err := %s.QueryRows(ctx, app.DB, scan%s, query, args...)\n", dbPkg, model.Name)
+	fmt.Fprintf(b, "\t\trows, err := %s.QueryRows(ctx, app.DB, scan%s, query, args...)\n", g.dbPkg, model.Name)
 	b.WriteString("\t\tif err != nil { return err }\n")
 	writeComputedResolve(b, model, "rows", "\t\t")
 	fmt.Fprintf(b, "\t\tgrouped := make(map[%s][]*%s, len(%sKeys))\n", keyType, model.Name, call.argNames[0])
@@ -1620,6 +1745,10 @@ func idArrayParamMethod(typeName string) string {
 }
 
 func generateSelectedSQLFields(b *strings.Builder, model *ast.ModelDecl, enumSets ...map[string]bool) {
+	defaultGenerator().generateSelectedSQLFields(b, model, enumSets...)
+}
+
+func (g *GeneratorContext) generateSelectedSQLFields(b *strings.Builder, model *ast.ModelDecl, enumSets ...map[string]bool) {
 	enums := firstBoolSet(enumSets)
 	b.WriteString("\t\tfieldMask := codec.SelectionMaskFields(req.FieldMask)\n")
 	b.WriteString("\t\tvar fields []string\n")
@@ -1628,7 +1757,7 @@ func generateSelectedSQLFields(b *strings.Builder, model *ast.ModelDecl, enumSet
 	fmt.Fprintf(b, "\t\t\tfields = append(fields, %q)\n", str.ToSnakeCase(primaryKeyFieldName(model)))
 	for _, field := range model.Fields {
 		if localKey, ok := computedFieldLocalKey(model, field, enums); ok {
-			if fieldID := getModelFieldID(model.Name, field.Name); fieldID > 0 {
+			if fieldID := g.modelFieldID(model.Name, field.Name); fieldID > 0 {
 				fmt.Fprintf(b, "\t\t\tif codec.FieldMaskHas(fieldMask, %d) { fields = ensureSelectedColumn(fields, %q) }\n",
 					fieldID, str.ToSnakeCase(localKey))
 			}
@@ -1637,7 +1766,7 @@ func generateSelectedSQLFields(b *strings.Builder, model *ast.ModelDecl, enumSet
 		if field.Name == primaryKeyFieldName(model) || field.Computed != nil || isRelationField(field, enums) {
 			continue
 		}
-		fieldID := getModelFieldID(model.Name, field.Name)
+		fieldID := g.modelFieldID(model.Name, field.Name)
 		if fieldID <= 0 {
 			continue
 		}
@@ -1649,12 +1778,16 @@ func generateSelectedSQLFields(b *strings.Builder, model *ast.ModelDecl, enumSet
 
 // writeAPIRegistration generates router.Registry.Register + RegisterParams calls.
 func writeAPIRegistration(b *strings.Builder, name string) {
-	id := getAPIID(name)
+	defaultGenerator().writeAPIRegistration(b, name)
+}
+
+func (g *GeneratorContext) writeAPIRegistration(b *strings.Builder, name string) {
+	id := g.apiID(name)
 	if id == 0 {
 		return
 	}
 	fmt.Fprintf(b, "\trouter.Registry.Register(%q, %d)\n", name, id)
-	params := getAPIParamIDs(name)
+	params := g.apiParamIDs(name)
 	if len(params) == 0 {
 		return
 	}
@@ -1663,7 +1796,7 @@ func writeAPIRegistration(b *strings.Builder, name string) {
 		id   int
 	}
 	registered := make([]registeredParam, 0, len(params))
-	activeTypes, hasActiveTypes := apiParamTypes[strings.TrimPrefix(name, "svc:")]
+	activeTypes, hasActiveTypes := g.ids.APIParamTypes[strings.TrimPrefix(name, "svc:")]
 	for paramName, paramID := range params {
 		if hasActiveTypes {
 			if _, ok := activeTypes[paramName]; !ok {
@@ -1678,7 +1811,7 @@ func writeAPIRegistration(b *strings.Builder, name string) {
 	sort.Slice(registered, func(i, j int) bool { return registered[i].id < registered[j].id })
 	fmt.Fprintf(b, "\trouter.Registry.RegisterParams(%q, []api.ParamMeta{\n", name)
 	for _, param := range registered {
-		ptype, isList, nullable := resolveParamMetaFromAST(name, param.name)
+		ptype, isList, nullable := g.resolveParamMetaFromAST(name, param.name)
 		fmt.Fprintf(b, "\t\t{Name: %q, Type: %q, FieldID: %d", param.name, ptype, param.id)
 		if isList {
 			b.WriteString(", IsList: true")
@@ -1694,14 +1827,18 @@ func writeAPIRegistration(b *strings.Builder, name string) {
 // resolveParamTypeFromAST looks up the actual Luxo type for a param from AST data.
 // Falls back to inferParamType heuristic if no AST info available.
 func resolveParamTypeFromAST(apiName, paramName string) string {
-	typeName, _, _ := resolveParamMetaFromAST(apiName, paramName)
+	typeName, _, _ := defaultGenerator().resolveParamMetaFromAST(apiName, paramName)
 	return typeName
 }
 
 func resolveParamMetaFromAST(apiName, paramName string) (string, bool, bool) {
-	if apiParamTypes != nil {
+	return defaultGenerator().resolveParamMetaFromAST(apiName, paramName)
+}
+
+func (g *GeneratorContext) resolveParamMetaFromAST(apiName, paramName string) (string, bool, bool) {
+	if g.ids.APIParamTypes != nil {
 		lookupName := strings.TrimPrefix(apiName, "svc:")
-		if params, ok := apiParamTypes[lookupName]; ok {
+		if params, ok := g.ids.APIParamTypes[lookupName]; ok {
 			if t, ok := params[paramName]; ok {
 				nullable := strings.HasSuffix(t, "?")
 				t = strings.TrimSuffix(t, "?")
@@ -2415,8 +2552,12 @@ func writeComputedResolve(b *strings.Builder, model *ast.ModelDecl, itemsExpr, i
 }
 
 func generateComputedResolvers(b *strings.Builder, models []*ast.ModelDecl, modelMap map[string]*ast.ModelDecl, enums map[string]bool) {
+	defaultGenerator().generateComputedResolvers(b, models, modelMap, enums)
+}
+
+func (g *GeneratorContext) generateComputedResolvers(b *strings.Builder, models []*ast.ModelDecl, modelMap map[string]*ast.ModelDecl, enums map[string]bool) {
 	for _, model := range models {
-		groups := collectComputedAggregateGroups(model, modelMap, enums)
+		groups := g.collectComputedAggregateGroups(model, modelMap, enums)
 		if len(groups) == 0 {
 			continue
 		}
@@ -2452,8 +2593,12 @@ func generateComputedFieldResolver(b *strings.Builder, model *ast.ModelDecl, gro
 }
 
 func collectComputedAggregateGroups(model *ast.ModelDecl, modelMap map[string]*ast.ModelDecl, enums map[string]bool) []computedAggregateGroup {
+	return defaultGenerator().collectComputedAggregateGroups(model, modelMap, enums)
+}
+
+func (g *GeneratorContext) collectComputedAggregateGroups(model *ast.ModelDecl, modelMap map[string]*ast.ModelDecl, enums map[string]bool) []computedAggregateGroup {
 	relations := make(map[string]Relation)
-	for _, relation := range analyzeRelations(model, enums) {
+	for _, relation := range g.analyzeRelations(model, enums) {
 		if relation.IsList {
 			relations[relation.FieldName] = relation
 		}
@@ -2461,7 +2606,7 @@ func collectComputedAggregateGroups(model *ast.ModelDecl, modelMap map[string]*a
 	var groups []computedAggregateGroup
 	groupIndexes := make(map[string]int)
 	for _, field := range model.Fields {
-		aggregate, relationName, ok := parseComputedAggregate(model.Name, field)
+		aggregate, relationName, ok := g.parseComputedAggregate(model.Name, field)
 		relation, exists := relations[relationName]
 		if !ok || !exists || modelMap[relation.TargetName] == nil {
 			continue
@@ -2478,10 +2623,14 @@ func collectComputedAggregateGroups(model *ast.ModelDecl, modelMap map[string]*a
 }
 
 func parseComputedAggregate(modelName string, field *ast.FieldDecl) (computedAggregate, string, bool) {
+	return defaultGenerator().parseComputedAggregate(modelName, field)
+}
+
+func (g *GeneratorContext) parseComputedAggregate(modelName string, field *ast.FieldDecl) (computedAggregate, string, bool) {
 	if field.Computed == nil || field.Type == nil {
 		return computedAggregate{}, "", false
 	}
-	fieldID := getModelFieldID(modelName, field.Name)
+	fieldID := g.modelFieldID(modelName, field.Name)
 	if fieldID == 0 {
 		return computedAggregate{}, "", false
 	}
@@ -2622,6 +2771,10 @@ func generateComputedAssignments(b *strings.Builder, model *ast.ModelDecl, group
 
 // scanBodyForBuiltins walks AST to find crypto.*, now(), duration property usage.
 func scanBodyForBuiltins(block *ast.Block, f *handlerFeatures, currentModule ...string) {
+	defaultGenerator().scanBodyForBuiltins(block, f, currentModule...)
+}
+
+func (g *GeneratorContext) scanBodyForBuiltins(block *ast.Block, f *handlerFeatures, currentModule ...string) {
 	if block == nil {
 		return
 	}
@@ -2655,17 +2808,21 @@ func scanBodyForBuiltins(block *ast.Block, f *handlerFeatures, currentModule ...
 	if len(currentModule) > 0 {
 		curMod = currentModule[0]
 	}
-	scanStmtsForEmit(block.Stmts, f, curMod)
+	g.scanStmtsForEmit(block.Stmts, f, curMod)
 }
 
 // scanStmtsForEmit recursively walks statements to find EmitStmt in nested blocks.
 func scanStmtsForEmit(stmts []ast.Stmt, f *handlerFeatures, curMod string) {
+	defaultGenerator().scanStmtsForEmit(stmts, f, curMod)
+}
+
+func (g *GeneratorContext) scanStmtsForEmit(stmts []ast.Stmt, f *handlerFeatures, curMod string) {
 	for _, stmt := range stmts {
 		switch s := stmt.(type) {
 		case *ast.EmitStmt:
 			f.hasEmit = true
-			if globalEventCtx != nil {
-				evModule := globalEventCtx.EventModule[s.EventName]
+			if g.events != nil {
+				evModule := g.events.EventModule[s.EventName]
 				if evModule != "" && evModule != curMod {
 					if f.crossEventImports == nil {
 						f.crossEventImports = make(map[string]string)
@@ -2675,26 +2832,26 @@ func scanStmtsForEmit(stmts []ast.Stmt, f *handlerFeatures, curMod string) {
 			}
 		case *ast.IfStmt:
 			if s.Then != nil {
-				scanStmtsForEmit(s.Then.Stmts, f, curMod)
+				g.scanStmtsForEmit(s.Then.Stmts, f, curMod)
 			}
 		case *ast.ForStmt:
 			if s.Body != nil {
-				scanStmtsForEmit(s.Body.Stmts, f, curMod)
+				g.scanStmtsForEmit(s.Body.Stmts, f, curMod)
 			}
 		case *ast.ExprStmt:
 			// Transaction/Async/Await expressions contain nested blocks
 			switch expr := s.Expr.(type) {
 			case *ast.TransactionExpr:
 				if expr.Body != nil {
-					scanStmtsForEmit(expr.Body.Stmts, f, curMod)
+					g.scanStmtsForEmit(expr.Body.Stmts, f, curMod)
 				}
 			case *ast.AsyncExpr:
 				if expr.Body != nil {
-					scanStmtsForEmit(expr.Body.Stmts, f, curMod)
+					g.scanStmtsForEmit(expr.Body.Stmts, f, curMod)
 				}
 			case *ast.AwaitExpr:
 				if expr.Body != nil {
-					scanStmtsForEmit(expr.Body.Stmts, f, curMod)
+					g.scanStmtsForEmit(expr.Body.Stmts, f, curMod)
 				}
 			}
 		}
@@ -2733,6 +2890,10 @@ type resolveEndpoint struct {
 //	  [item_count varint]
 //	  [item1 WriteLuxo] [item2 WriteLuxo] ...
 func generateFederationResolvers(b *strings.Builder, result *semantic.Result, models []*ast.ModelDecl, enums map[string]bool) {
+	defaultGenerator().generateFederationResolvers(b, result, models, enums)
+}
+
+func (g *GeneratorContext) generateFederationResolvers(b *strings.Builder, result *semantic.Result, models []*ast.ModelDecl, enums map[string]bool) {
 	curModule := ""
 	if len(result.Files) > 0 {
 		curModule = moduleNameFromFile(result.Files[0].Name)
@@ -2760,7 +2921,7 @@ func generateFederationResolvers(b *strings.Builder, result *semantic.Result, mo
 				continue
 			}
 			for _, f := range ext.Fields {
-				if f.Type == nil || ownerModelHasField(ext.Name, f.Name) || !isRelationField(f, enums) {
+				if f.Type == nil || g.ownerModelHasField(ext.Name, f.Name) || !isRelationField(f, enums) {
 					continue
 				}
 				// This field is a relation (e.g. posts: [Post])
@@ -2768,8 +2929,8 @@ func generateFederationResolvers(b *strings.Builder, result *semantic.Result, mo
 				if !modelNames[f.Type.Name] {
 					continue
 				}
-				fk := inferFederationForeignKey(&ast.ModelDecl{Name: ext.Name}, f)
-				keyType := externalModelIDTypeName(ext.Name)
+				fk := g.inferFederationForeignKey(&ast.ModelDecl{Name: ext.Name}, f)
+				keyType := g.externalModelIDTypeName(ext.Name)
 				fkField := modelFieldByName(modelDecls[f.Type.Name], fk)
 				ep := resolveEndpoint{
 					model:      modelDecls[f.Type.Name],
@@ -2804,12 +2965,12 @@ func generateFederationResolvers(b *strings.Builder, result *semantic.Result, mo
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 		fmt.Fprintf(b, "\t\tkeys, err := req.Param%sArray(\"keys\")\n", ep.keyType)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		generateSelectedSQLFields(b, ep.model, enums)
+		g.generateSelectedSQLFields(b, ep.model, enums)
 		generateRequiredSQLField(b, ep.fkColumn)
 		// Query: WHERE fk_column IN (keys)
 		fmt.Fprintf(b, "\t\tconds := []lux.Condition{lux.New%sField(%q).In(keys...)}\n", ep.keyType, ep.fkColumn)
 		fmt.Fprintf(b, "\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", ep.tableName)
-		fmt.Fprintf(b, "\t\trows, err := %s.QueryRows(ctx, app.DB, %s, query, args...)\n", dbPkg, ep.scanFn)
+		fmt.Fprintf(b, "\t\trows, err := %s.QueryRows(ctx, app.DB, %s, query, args...)\n", g.dbPkg, ep.scanFn)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\n")
 		writeComputedResolve(b, ep.model, "rows", "\t\t")
 
@@ -2854,7 +3015,7 @@ func generateFederationResolvers(b *strings.Builder, result *semantic.Result, mo
 		fmt.Fprintf(b, "\trouter.Handle(%q, handleResolve%sBy%s(app))\n",
 			ep.svcName, ep.modelName, str.Capitalize(ep.fkField))
 		// Register with API ID so gateway RPC can call by ID
-		apiID := getAPIID(ep.svcName)
+		apiID := g.apiID(ep.svcName)
 		if apiID > 0 {
 			fmt.Fprintf(b, "\trouter.Registry.Register(%q, %d)\n", ep.svcName, apiID)
 			fmt.Fprintf(b, "\trouter.Registry.RegisterParams(%q, []api.ParamMeta{{FieldID: 1, Name: \"keys\", Type: %q, IsList: true}})\n", ep.svcName, ep.keyType)

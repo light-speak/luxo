@@ -41,7 +41,7 @@ func collapseSpaces(s string) string {
 
 func TestGenerateEmpty(t *testing.T) {
 	result := buildResult(&ast.File{Name: "test.luxo"})
-	gr := Generate(result, "gen", DriverPG)
+	gr := mustGenerate(t, result, "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 	if !strings.Contains(src, "package gen") {
 		t.Errorf("missing package declaration:\n%s", src)
@@ -75,7 +75,7 @@ func TestGenerateIncludesStreamFile(t *testing.T) {
 		}},
 	}
 
-	gr := Generate(result(file), "luxo", DriverPG)
+	gr := mustGenerate(t, result(file), "luxo", DriverPG)
 	if _, ok := gr.Files["stream.gen.go"]; !ok {
 		t.Fatal("Generate should include stream.gen.go")
 	}
@@ -100,7 +100,7 @@ func TestGenerateEnumAndModel(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 
 	if !strings.Contains(src, "type Role string") {
@@ -122,11 +122,10 @@ func result(files ...*ast.File) *semantic.Result {
 }
 
 func TestGenerateOutputIsGofmtFormatted(t *testing.T) {
-	SetModelFieldIDs(map[string]map[string]int{
+	modelIDs := map[string]map[string]int{
 		"User":        {"id": 1, "name": 2, "role": 3, "createdAt": 4, "bio": 5},
 		"AuthPayload": {"token": 1, "user": 2},
-	})
-	defer SetModelFieldIDs(nil)
+	}
 
 	file := &ast.File{
 		Name: "origin/auth/test.luxo",
@@ -164,7 +163,11 @@ func TestGenerateOutputIsGofmtFormatted(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: modelIDs}})
+	gr, err := generator.Generate(result(file), "gen", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(gr.Files) == 0 {
 		t.Fatal("no files generated")
 	}
@@ -194,7 +197,7 @@ func TestGenerateWithTimeImport(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 	if !strings.Contains(src, `"time"`) {
 		t.Errorf("missing time import:\n%s", src)
@@ -215,7 +218,7 @@ func TestGenerateNoTimeImportWhenNotNeeded(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 	if strings.Contains(src, `"time"`) {
 		t.Errorf("unexpected time import:\n%s", src)
@@ -236,7 +239,7 @@ func TestGenerateDBFile(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	dbSrc := string(gr.Files["db.gen.go"])
 	if !strings.Contains(dbSrc, "UserClient") {
 		t.Errorf("missing UserClient in db.gen.go:\n%s", dbSrc)
@@ -254,7 +257,7 @@ func TestGenerateNoDBFileWhenNoModels(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	if _, ok := gr.Files["db.gen.go"]; ok {
 		t.Errorf("db.gen.go should not be generated when no models exist")
 	}
@@ -274,7 +277,7 @@ func TestGenerateWithDurationImport(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 	if !strings.Contains(src, `"time"`) {
 		t.Errorf("missing time import for Duration:\n%s", src)
@@ -295,7 +298,7 @@ func TestGenerateComputedDateTimeUsesTimeImport(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 	if !strings.Contains(src, `"time"`) {
 		t.Errorf("computed DateTime should trigger time import:\n%s", src)
@@ -316,7 +319,7 @@ func TestGenerateWithUUIDImport(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 	if !strings.Contains(src, `"github.com/google/uuid"`) {
 		t.Errorf("missing uuid import:\n%s", src)
@@ -337,7 +340,7 @@ func TestGenerateWithDecimalImport(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 	if !strings.Contains(src, `"github.com/shopspring/decimal"`) {
 		t.Errorf("missing decimal import:\n%s", src)
@@ -358,7 +361,7 @@ func TestGenerateWithBytesType(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 	if !strings.Contains(src, "[]byte") {
 		t.Errorf("missing []byte type:\n%s", src)
@@ -380,7 +383,7 @@ func TestGenerateAutoUUIDDBImports(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	dbSrc := string(gr.Files["db.gen.go"])
 	if !strings.Contains(dbSrc, `"github.com/google/uuid"`) {
 		t.Errorf("missing uuid import in db.gen.go:\n%s", dbSrc)
@@ -407,7 +410,7 @@ func TestGenerateNilTypeField(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 	if !strings.Contains(src, "any") {
 		t.Errorf("nil type should map to any:\n%s", src)
@@ -428,7 +431,7 @@ func TestGenerateHiddenFieldJsonTag(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 	if !strings.Contains(src, `json:"-"`) {
 		t.Errorf("@hidden should generate json:\"-\":\n%s", src)
@@ -449,7 +452,7 @@ func TestGenerateUUIDPrimaryKeyFind(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	dbSrc := string(gr.Files["db.gen.go"])
 	if !strings.Contains(dbSrc, "Find(ctx context.Context, id uuid.UUID)") {
 		t.Errorf("Find should use uuid.UUID for UUID pk:\n%s", dbSrc)
@@ -474,7 +477,7 @@ func TestGenerateSoftDeleteModel(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	modelSrc := string(gr.Files["model.gen.go"])
 	dbSrc := string(gr.Files["db.gen.go"])
 
@@ -523,7 +526,7 @@ func TestGenerateSoftDeleteWithExistingDeletedAt(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	modelSrc := string(gr.Files["model.gen.go"])
 
 	// Should not duplicate deletedAt
@@ -554,7 +557,7 @@ func TestGenerateAppFile(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	// gofmt aligns struct fields — normalize runs of spaces for assertions
 	appSrc := collapseSpaces(string(gr.Files["app.gen.go"]))
 
@@ -589,7 +592,7 @@ func TestGenerateAppFileNoModels(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	if _, ok := gr.Files["app.gen.go"]; ok {
 		t.Error("app.gen.go should not be generated when no models exist")
 	}
@@ -617,7 +620,7 @@ func TestGenerateAppFileWithRelations(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	appSrc := string(gr.Files["app.gen.go"])
 
 	// Should have loaders field since there are relations
@@ -659,7 +662,7 @@ func TestGenerateFullWithHandlerAndDataloader(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 
 	// Should generate all files
 	if _, ok := gr.Files["handler.gen.go"]; !ok {
@@ -696,7 +699,7 @@ func TestGenerateModelFileWithExtend(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 
 	if !strings.Contains(src, "type ExternalUser struct") {
@@ -728,7 +731,7 @@ func TestGenerateModelFileExtendSkipsExistingModel(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	src := string(gr.Files["model.gen.go"])
 
 	// Should not generate a stub for User since it already exists as a model
@@ -750,7 +753,7 @@ func TestGenerateAppFileSingleModel(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	appSrc := collapseSpaces(string(gr.Files["app.gen.go"]))
 
 	if !strings.Contains(appSrc, "Post *PostClient") {
@@ -772,7 +775,7 @@ func TestGenerateAppFileWithNativeAPIs(t *testing.T) {
 		}},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	appSrc := string(gr.Files["app.gen.go"])
 
 	if !strings.Contains(appSrc, "Resolver NativeResolver") {
@@ -789,7 +792,7 @@ func TestGenerateAppFileWithoutNativeAPIs(t *testing.T) {
 		}},
 	}
 
-	gr := Generate(result(file), "gen", DriverPG)
+	gr := mustGenerate(t, result(file), "gen", DriverPG)
 	appSrc := string(gr.Files["app.gen.go"])
 
 	if strings.Contains(appSrc, "Resolver") {
@@ -824,7 +827,7 @@ func TestGenerateWithSoftModelsParam(t *testing.T) {
 
 	// Pass softModels map (external soft model info)
 	softModels := map[string]bool{"User": true}
-	gr := Generate(result(file), "gen", DriverPG, softModels)
+	gr := mustGenerate(t, result(file), "gen", DriverPG, softModels)
 
 	// dataloader.gen.go should contain soft delete filter
 	dlSrc := string(gr.Files["dataloader.gen.go"])
@@ -846,83 +849,68 @@ func TestIsSoftDeleteExported(t *testing.T) {
 
 // --- Lock ID functions ---
 
-func TestSetAndGetModelFieldIDs(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
-
-	SetModelFieldIDs(map[string]map[string]int{
+func TestGeneratorModelFieldIDs(t *testing.T) {
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"User": {"id": 1, "name": 2},
-	})
-	if got := getModelFieldID("User", "id"); got != 1 {
+	}}})
+	if got := generator.modelFieldID("User", "id"); got != 1 {
 		t.Fatalf("want 1, got %d", got)
 	}
-	if got := getModelFieldID("User", "name"); got != 2 {
+	if got := generator.modelFieldID("User", "name"); got != 2 {
 		t.Fatalf("want 2, got %d", got)
 	}
-	if got := getModelFieldID("User", "missing"); got != 0 {
+	if got := generator.modelFieldID("User", "missing"); got != 0 {
 		t.Fatalf("want 0 for missing field, got %d", got)
 	}
-	if got := getModelFieldID("NoModel", "id"); got != 0 {
+	if got := generator.modelFieldID("NoModel", "id"); got != 0 {
 		t.Fatalf("want 0 for missing model, got %d", got)
 	}
 }
 
-func TestSetAndGetEventFieldIDs(t *testing.T) {
-	old := eventFieldIDs
-	defer func() { eventFieldIDs = old }()
-
-	SetEventFieldIDs(map[string]map[string]int{
+func TestGeneratorEventFieldIDs(t *testing.T) {
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{EventFields: map[string]map[string]int{
 		"OrderCreated": {"orderId": 1, "userId": 2},
-	})
-	if got := getEventFieldID("OrderCreated", "orderId"); got != 1 {
+	}}})
+	if got := generator.eventFieldID("OrderCreated", "orderId"); got != 1 {
 		t.Fatalf("want 1, got %d", got)
 	}
-	if got := getEventFieldID("OrderCreated", "missing"); got != 0 {
+	if got := generator.eventFieldID("OrderCreated", "missing"); got != 0 {
 		t.Fatalf("want 0, got %d", got)
 	}
-	if got := getEventFieldID("NoEvent", "orderId"); got != 0 {
+	if got := generator.eventFieldID("NoEvent", "orderId"); got != 0 {
 		t.Fatalf("want 0, got %d", got)
 	}
 }
 
-func TestSetAndGetAPIIDs(t *testing.T) {
-	old := apiIDs
-	defer func() { apiIDs = old }()
-
-	SetAPIIDs(map[string]int{"getUser": 1, "listUsers": 2})
-	if got := getAPIID("getUser"); got != 1 {
+func TestGeneratorAPIIDs(t *testing.T) {
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIs: map[string]int{"getUser": 1, "listUsers": 2}}})
+	if got := generator.apiID("getUser"); got != 1 {
 		t.Fatalf("want 1, got %d", got)
 	}
-	if got := getAPIID("missing"); got != 0 {
+	if got := generator.apiID("missing"); got != 0 {
 		t.Fatalf("want 0, got %d", got)
 	}
 }
 
-func TestSetAndGetAPIParamIDs(t *testing.T) {
-	old := apiParamIDs
-	defer func() { apiParamIDs = old }()
-
-	SetAPIParamIDs(map[string]map[string]int{
+func TestGeneratorAPIParamIDs(t *testing.T) {
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIParams: map[string]map[string]int{
 		"getUser": {"id": 1},
-	})
-	got := getAPIParamIDs("getUser")
+	}}})
+	got := generator.apiParamIDs("getUser")
 	if got == nil || got["id"] != 1 {
 		t.Fatalf("want {id:1}, got %v", got)
 	}
-	if got := getAPIParamIDs("missing"); got != nil {
+	if got := generator.apiParamIDs("missing"); got != nil {
 		t.Fatalf("want nil, got %v", got)
 	}
 }
 
-func TestSetAPIParamTypes(t *testing.T) {
-	old := apiParamTypes
-	defer func() { apiParamTypes = old }()
-
-	SetAPIParamTypes(map[string]map[string]string{
+func TestGeneratorAPIParamTypes(t *testing.T) {
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIParamTypes: map[string]map[string]string{
 		"getUser": {"id": "Int"},
-	})
-	if apiParamTypes["getUser"]["id"] != "Int" {
-		t.Fatal("SetAPIParamTypes not set correctly")
+	}}})
+	if generator.ids.APIParamTypes["getUser"]["id"] != "Int" {
+		t.Fatal("API parameter type not copied")
 	}
 }
 
@@ -950,18 +938,11 @@ func TestDriverImportAndPkg(t *testing.T) {
 // --- BuildSchemaJSON Tests ---
 
 func TestBuildSchemaJSON(t *testing.T) {
-	SetModelFieldIDs(map[string]map[string]int{
-		"User": {"id": 1, "name": 2, "email": 3},
-	})
-	SetAPIIDs(map[string]int{"getUser": 7, "listUsers": 8})
-	SetAPIParamIDs(map[string]map[string]int{
-		"getUser": {"id": 1},
-	})
-	defer func() {
-		SetModelFieldIDs(nil)
-		SetAPIIDs(nil)
-		SetAPIParamIDs(nil)
-	}()
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+		ModelFields: map[string]map[string]int{"User": {"id": 1, "name": 2, "email": 3}},
+		APIs:        map[string]int{"getUser": 7, "listUsers": 8},
+		APIParams:   map[string]map[string]int{"getUser": {"id": 1}},
+	}})
 
 	r := result(
 		&ast.File{
@@ -978,7 +959,7 @@ func TestBuildSchemaJSON(t *testing.T) {
 		},
 	)
 
-	data, err := BuildSchemaJSON(r, map[string]bool{})
+	data, err := generator.BuildSchemaJSON(r, map[string]bool{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1019,10 +1000,9 @@ func TestBuildSchemaJSON(t *testing.T) {
 }
 
 func TestBuildSchemaJSON_HiddenFieldsExcluded(t *testing.T) {
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"User": {"id": 1, "name": 2, "password": 3},
-	})
-	defer SetModelFieldIDs(nil)
+	}}})
 
 	r := result(
 		&ast.File{
@@ -1038,7 +1018,7 @@ func TestBuildSchemaJSON_HiddenFieldsExcluded(t *testing.T) {
 		},
 	)
 
-	data, err := BuildSchemaJSON(r, map[string]bool{})
+	data, err := generator.BuildSchemaJSON(r, map[string]bool{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1049,8 +1029,7 @@ func TestBuildSchemaJSON_HiddenFieldsExcluded(t *testing.T) {
 }
 
 func TestBuildSchemaJSON_NoSvcAPIs(t *testing.T) {
-	SetAPIIDs(map[string]int{"svc:getUserScore": 15})
-	defer SetAPIIDs(nil)
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIs: map[string]int{"svc:getUserScore": 15}}})
 
 	r := result(
 		&ast.File{
@@ -1063,7 +1042,7 @@ func TestBuildSchemaJSON_NoSvcAPIs(t *testing.T) {
 		},
 	)
 
-	data, err := BuildSchemaJSON(r, map[string]bool{})
+	data, err := generator.BuildSchemaJSON(r, map[string]bool{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1239,12 +1218,10 @@ func TestBuildEventContext(t *testing.T) {
 }
 
 func TestWriteImportsUsesRemoteUUIDPrimaryKey(t *testing.T) {
-	old := globalEventCtx
-	defer func() { globalEventCtx = old }()
-	globalEventCtx = &EventContext{ModelIDType: map[string]string{"Remote": "UUID"}}
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{ModelIDType: map[string]string{"Remote": "UUID"}}})
 	files := []*ast.File{{Extends: []*ast.ExtendDecl{{Name: "Remote"}}}}
 	var b strings.Builder
-	writeImports(&b, files)
+	generator.writeImports(&b, files)
 	if !strings.Contains(b.String(), `"github.com/google/uuid"`) {
 		t.Fatalf("remote UUID primary key import missing:\n%s", b.String())
 	}
@@ -1343,14 +1320,12 @@ func TestBuildEventContextFiltersNonRemoteAndDuplicateLoads(t *testing.T) {
 	}
 }
 
-func TestSetEventContext(t *testing.T) {
-	old := globalEventCtx
-	defer func() { globalEventCtx = old }()
-
+func TestNewGeneratorClonesEventContext(t *testing.T) {
 	ctx := &EventContext{EventModule: map[string]string{"Test": "test"}, ModulePath: "test"}
-	SetEventContext(ctx)
-	if globalEventCtx != ctx {
-		t.Error("SetEventContext should set global")
+	generator := mustNewGenerator(t, GeneratorConfig{Events: ctx})
+	ctx.EventModule["Test"] = "changed"
+	if generator.events.EventModule["Test"] != "test" {
+		t.Error("generator must own an immutable event context snapshot")
 	}
 }
 

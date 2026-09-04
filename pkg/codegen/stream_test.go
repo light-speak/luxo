@@ -151,11 +151,9 @@ func TestGenerateStreamFileNoEventSource(t *testing.T) {
 
 func TestGenerateStreamFileLuxoMatcher(t *testing.T) {
 	// @stream with body `it.roomId == roomId` — should compile to decoder + comparison
-	// Set event field IDs for the test
-	SetEventFieldIDs(map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{EventFields: map[string]map[string]int{
 		"DanmakuSent": {"roomId": 1, "content": 2},
-	})
-	defer SetEventFieldIDs(nil)
+	}}})
 
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -198,7 +196,7 @@ func TestGenerateStreamFileLuxoMatcher(t *testing.T) {
 		}},
 	}
 
-	src := generateStreamFile(result, "luxo")
+	src := generator.generateStreamFile(result, "luxo")
 	if src == nil {
 		t.Fatal("should generate stream file")
 	}
@@ -315,21 +313,19 @@ func TestSameStreamTypeNestedShapes(t *testing.T) {
 }
 
 func TestMergeGlobalStreamTypes(t *testing.T) {
-	old := globalEventCtx
-	defer func() { globalEventCtx = old }()
 	local := &ast.EventDecl{Name: "Local"}
 	remote := &ast.EventDecl{Name: "Remote"}
-	globalEventCtx = &EventContext{
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		Events:      map[string]*ast.EventDecl{"Local": remote, "Remote": remote},
 		ModelModule: map[string]string{"User": "accounts"},
 		TypeModule:  map[string]string{"Payload": "common"},
 		EnumModule:  map[string]string{"Role": "auth"},
-	}
+	}})
 	declarations := streamTypes{
 		events: map[string]*ast.EventDecl{"Local": local},
 		models: map[string]bool{}, types: map[string]bool{}, enums: map[string]bool{},
 	}
-	mergeGlobalStreamTypes(&declarations)
+	generator.mergeGlobalStreamTypes(&declarations)
 	if declarations.events["Local"] != local || declarations.events["Remote"] != remote {
 		t.Fatal("global events were not merged without replacing local declarations")
 	}
@@ -339,21 +335,19 @@ func TestMergeGlobalStreamTypes(t *testing.T) {
 }
 
 func TestClassifyStreamPayloadKinds(t *testing.T) {
-	old := globalEventCtx
-	defer func() { globalEventCtx = old }()
-	globalEventCtx = &EventContext{
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		ModelModule: map[string]string{"User": "accounts"},
 		TypeModule:  map[string]string{"Payload": "common"},
-	}
+	}})
 	models := map[string]bool{"User": true}
 	types := map[string]bool{"Payload": true}
 	enums := map[string]bool{"Role": true}
 
 	var model, payload, enum streamInfo
-	classifyStreamPayload(&model, &ast.TypeRef{Name: "User"}, models, types, enums)
-	classifyStreamPayload(&payload, &ast.TypeRef{Name: "Payload"}, models, types, enums)
-	classifyStreamPayload(&enum, &ast.TypeRef{Name: "Role"}, models, types, enums)
-	classifyStreamPayload(&streamInfo{}, nil, models, types, enums)
+	generator.classifyStreamPayload(&model, &ast.TypeRef{Name: "User"}, models, types, enums)
+	generator.classifyStreamPayload(&payload, &ast.TypeRef{Name: "Payload"}, models, types, enums)
+	generator.classifyStreamPayload(&enum, &ast.TypeRef{Name: "Role"}, models, types, enums)
+	generator.classifyStreamPayload(&streamInfo{}, nil, models, types, enums)
 	if model.payloadKind != streamPayloadModel || model.payloadModule != "accounts" {
 		t.Fatalf("model payload = %+v", model)
 	}
@@ -366,18 +360,16 @@ func TestClassifyStreamPayloadKinds(t *testing.T) {
 }
 
 func TestGenerateCrossModuleStreamSource(t *testing.T) {
-	old := globalEventCtx
-	defer func() { globalEventCtx = old }()
 	eventDecl := &ast.EventDecl{
 		Name:   "CountChanged",
 		Params: []*ast.ParamDecl{{Name: "count", Type: &ast.TypeRef{Name: "Int"}}},
 	}
-	globalEventCtx = &EventContext{
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		EventModule: map[string]string{"CountChanged": "common"},
 		Events:      map[string]*ast.EventDecl{"CountChanged": eventDecl},
 		ModelModule: map[string]string{}, TypeModule: map[string]string{}, EnumModule: map[string]string{},
 		ModulePath: "github.com/test/service",
-	}
+	}})
 	result := &semantic.Result{Files: []*ast.File{{
 		Name: "origin/consumer/watch.luxo",
 		APIs: []*ast.ApiDecl{{
@@ -386,7 +378,7 @@ func TestGenerateCrossModuleStreamSource(t *testing.T) {
 			Directives: []*ast.Directive{{Name: "stream", Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "CountChanged"}}}}},
 		}},
 	}}}
-	code := string(generateStreamFile(result, "luxo"))
+	code := string(generator.generateStreamFile(result, "luxo"))
 	for _, want := range []string{
 		`common_luxo "github.com/test/service/common/luxo"`,
 		`event.OnDecode[common_luxo.CountChangedEvent]`,
@@ -647,12 +639,10 @@ func TestStreamGenerationTypeHelpers(t *testing.T) {
 }
 
 func TestStreamImportsCollectRemoteTypesAndEnums(t *testing.T) {
-	old := globalEventCtx
-	defer func() { globalEventCtx = old }()
-	globalEventCtx = &EventContext{
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		EnumModule: map[string]string{"Role": "auth"},
 		ModulePath: "github.com/example/service",
-	}
+	}})
 	body := &ast.Block{Stmts: []ast.Stmt{
 		&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "Admin"}},
 		&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "Member"}},
@@ -664,13 +654,13 @@ func TestStreamImportsCollectRemoteTypesAndEnums(t *testing.T) {
 		payloadModule: "common", sourceModule: "feed", body: body,
 	}}
 	var b strings.Builder
-	writeStreamImports(&b, streams)
+	generator.writeStreamImports(&b, streams)
 	for _, module := range []string{"auth", "common", "events"} {
 		if !strings.Contains(b.String(), module+`_luxo "github.com/example/service/`+module+`/luxo"`) {
 			t.Fatalf("missing %s import:\n%s", module, b.String())
 		}
 	}
-	if got := collectStreamEnumRefs(body, globalEventCtx.EnumModule); len(got) != 1 || got[0] != "Role" {
+	if got := collectStreamEnumRefs(body, generator.events.EnumModule); len(got) != 1 || got[0] != "Role" {
 		t.Fatalf("enum references = %v", got)
 	}
 }
@@ -711,11 +701,9 @@ func TestCompileStreamExprRejectsUnsupportedBinaryAndQualifiesEnum(t *testing.T)
 		t.Fatalf("in expression = %q, %v", got, ok)
 	}
 
-	old := globalEventCtx
-	defer func() { globalEventCtx = old }()
-	globalEventCtx = &EventContext{EnumModule: map[string]string{"Role": "auth"}}
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{EnumModule: map[string]string{"Role": "auth"}}})
 	enumExpr := &ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "Admin"}
-	if got, ok := compileStreamExpr(enumExpr, nil, map[string]bool{"Role": true}, "feed"); !ok || got != "string(auth_luxo.RoleAdmin)" {
+	if got, ok := generator.compileStreamExpr(enumExpr, nil, map[string]bool{"Role": true}, "feed"); !ok || got != "string(auth_luxo.RoleAdmin)" {
 		t.Fatalf("enum expression = %q, %v", got, ok)
 	}
 }
@@ -753,10 +741,9 @@ func TestGenerateLuxoStreamMatcher_EmptyBody(t *testing.T) {
 func TestGenerateLuxoStreamMatcher_UnknownItField(t *testing.T) {
 	// it.unknownField — field not in event params
 	// Var declaration is skipped, but reference remains → Go compile error (correct behavior)
-	SetEventFieldIDs(map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{EventFields: map[string]map[string]int{
 		"TestEvent": {"knownField": 1},
-	})
-	defer SetEventFieldIDs(nil)
+	}}})
 
 	var b strings.Builder
 	si := streamInfo{
@@ -772,7 +759,7 @@ func TestGenerateLuxoStreamMatcher_UnknownItField(t *testing.T) {
 			{Name: "knownField", Type: &ast.TypeRef{Name: "Int"}},
 		},
 	}
-	generateLuxoStreamMatcher(&b, si, nil)
+	generator.generateLuxoStreamMatcher(&b, si, nil)
 	code := b.String()
 	if strings.Contains(code, "codec.NewDecoder") {
 		t.Error("generated matchers must not decode per subscriber")

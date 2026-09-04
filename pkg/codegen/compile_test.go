@@ -47,6 +47,44 @@ func TestCompileExprIdent(t *testing.T) {
 	}
 }
 
+func TestCompileAPIBodyTreatsLastExpressionAsReturn(t *testing.T) {
+	var b strings.Builder
+	value := &ast.Literal{Kind: token.String, Value: "hello"}
+	value.SetTypeTag("String")
+	api := &ast.ApiDecl{
+		Name:       "greeting",
+		ReturnType: &ast.TypeRef{Name: "String"},
+		Body:       &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: value}}},
+	}
+	compileAPIBody(&b, api, nil, nil)
+	out := b.String()
+	if !strings.Contains(out, `codec.AppendString(req.Buf.B, "hello")`) || !strings.Contains(out, "return nil") {
+		t.Fatalf("implicit return was not encoded:\n%s", out)
+	}
+}
+
+func TestCompileQuestionCallsNativeResolverInNestedExpression(t *testing.T) {
+	c := newCompiler(nil)
+	c.nativeFunctions = map[string]bool{"loadCount": true}
+	call := &ast.CallExpr{Func: &ast.Ident{Name: "loadCount"}}
+	question := &ast.UnaryExpr{Op: "?", Value: call}
+	expr := &ast.BinaryExpr{
+		Left:  question,
+		Op:    "+",
+		Right: &ast.Literal{Kind: token.Int, Value: "1"},
+	}
+
+	got := c.compileExpr(expr)
+	out := compilerOut(c)
+	if got != "_result1 + 1" {
+		t.Fatalf("nested Result expression = %q", got)
+	}
+	if !strings.Contains(out, "_result1, err := app.Resolver.LoadCount(ctx)") ||
+		!strings.Contains(out, "if err != nil") {
+		t.Fatalf("native Result call must be lowered with error propagation:\n%s", out)
+	}
+}
+
 // ─── compileExpr — Literal ──────────────────────────────────────────────────
 
 func TestCompileLiteralString(t *testing.T) {
@@ -1388,15 +1426,13 @@ func TestCompileStmtEmit(t *testing.T) {
 }
 
 func TestCompileStmtEmitCrossModule(t *testing.T) {
-	old := globalEventCtx
-	defer func() { globalEventCtx = old }()
-
-	globalEventCtx = &EventContext{
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		EventModule: map[string]string{"ProjectDeleted": "common"},
 		ModulePath:  "github.com/test/service",
-	}
+	}})
 
 	c := newCompiler(nil)
+	c.generator = generator
 	// Set api.Pos.File to simulate a module file path
 	c.api = &ast.ApiDecl{
 		Name: "purgeData",
@@ -1418,15 +1454,13 @@ func TestCompileStmtEmitCrossModule(t *testing.T) {
 }
 
 func TestCompileStmtEmitSameModule(t *testing.T) {
-	old := globalEventCtx
-	defer func() { globalEventCtx = old }()
-
-	globalEventCtx = &EventContext{
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		EventModule: map[string]string{"TraceIngested": "monitoring"},
 		ModulePath:  "github.com/test/service",
-	}
+	}})
 
 	c := newCompiler(nil)
+	c.generator = generator
 	c.api = &ast.ApiDecl{
 		Name: "ingest",
 		Pos:  token.Position{File: "origin/monitoring/trace.luxo"},
@@ -3774,7 +3808,7 @@ func TestCompileValWithQuestion(t *testing.T) {
 		}},
 	})
 	out := compilerOut(c)
-	if !strings.Contains(out, "x, err := riskyCall()") {
+	if !strings.Contains(out, "_result1, err := riskyCall()") || !strings.Contains(out, "x := _result1") {
 		t.Fatalf("missing err assignment, got:\n%s", out)
 	}
 	if !strings.Contains(out, "return err") {
@@ -3788,7 +3822,7 @@ func TestCompileExprStmtWithQuestion(t *testing.T) {
 		Func: &ast.Ident{Name: "doSomething"}, Args: []*ast.NamedArg{},
 	}}})
 	out := compilerOut(c)
-	if !strings.Contains(out, "if err := doSomething()") {
+	if !strings.Contains(out, "_result1, err := doSomething()") || !strings.Contains(out, "_ = _result1") {
 		t.Fatalf("missing inline err check, got:\n%s", out)
 	}
 }
@@ -3987,7 +4021,7 @@ func TestCompileTransferAPI(t *testing.T) {
 		t.Fatalf("missing Tx wrapper, got:\n%s", out)
 	}
 	// Check ? operator inside tx
-	if !strings.Contains(out, "balance, err := getBalance(from)") {
+	if !strings.Contains(out, "_result1, err := getBalance(from)") || !strings.Contains(out, "balance := _result1") {
 		t.Fatalf("missing ? operator error propagation, got:\n%s", out)
 	}
 	// Check if condition
@@ -4625,7 +4659,7 @@ func TestCompileIfWithQuestionOperator(t *testing.T) {
 		}},
 	})
 	out := compilerOut(c)
-	if !strings.Contains(out, "result, err := riskyCall()") {
+	if !strings.Contains(out, "_result1, err := riskyCall()") || !strings.Contains(out, "result := _result1") {
 		t.Fatalf("missing ? err assignment, got:\n%s", out)
 	}
 	if !strings.Contains(out, "if err != nil") {
@@ -4858,8 +4892,8 @@ func TestCompileQuestionWithModelFind(t *testing.T) {
 		},
 	})
 	out := compilerOut(c)
-	// ? takes priority: val x = expr? → x, err := expr
-	if !strings.Contains(out, "user, err :=") {
+	// Result lowering happens before the val binding so nested expressions use the same path.
+	if !strings.Contains(out, "_result1, err :=") || !strings.Contains(out, "user := _result1") {
 		t.Fatalf("missing user, err :=, got:\n%s", out)
 	}
 	if !strings.Contains(out, "app.User.Where(UserWhere.Id.Eq(id)).First(ctx)") {
@@ -6246,10 +6280,10 @@ func TestCompileUnaryQuestion(t *testing.T) {
 	c := newCompiler(nil)
 	got := c.compileExpr(&ast.UnaryExpr{
 		Op:    "?",
-		Value: &ast.Ident{Name: "result"},
+		Value: &ast.CallExpr{Func: &ast.Ident{Name: "result"}},
 	})
-	if got != "result" {
-		t.Fatalf("? unary should return operand, got %q", got)
+	if got != "_result1" || !strings.Contains(compilerOut(c), "_result1, err := result()") {
+		t.Fatalf("? unary should lower the result tuple, got %q:\n%s", got, compilerOut(c))
 	}
 }
 

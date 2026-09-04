@@ -58,6 +58,10 @@ func compileDefaultValue(expr ast.Expr, goType string, enums map[string]bool) st
 }
 
 func compileAPIBody(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast.ModelDecl, enums map[string]bool) {
+	defaultGenerator().compileAPIBody(b, api, models, enums, nil)
+}
+
+func (g *GeneratorContext) compileAPIBody(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast.ModelDecl, enums map[string]bool, nativeFunctions map[string]bool) {
 	name := api.Name
 	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(name))
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
@@ -100,13 +104,15 @@ func compileAPIBody(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast
 
 	// Compile body statements
 	c := &compiler{
-		b:        b,
-		indent:   "\t\t",
-		models:   models,
-		enums:    enums,
-		api:      api,
-		vars:     make(map[string]valType),
-		paginate: hasDirective(api.Directives, "paginate"),
+		generator:       g,
+		b:               b,
+		indent:          "\t\t",
+		models:          models,
+		enums:           enums,
+		api:             api,
+		vars:            make(map[string]valType),
+		nativeFunctions: nativeFunctions,
+		paginate:        hasDirective(api.Directives, "paginate"),
 	}
 	// Register API params in vars with Luxo type name for type-aware compilation
 	for _, p := range api.Params {
@@ -120,16 +126,42 @@ func compileAPIBody(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast
 		}
 		c.vars[p.Name] = vt
 	}
-	for _, stmt := range api.Body.Stmts {
-		c.compileStmt(stmt)
-	}
+	c.compileHandlerBody(api.Body.Stmts)
 
 	fmt.Fprintf(b, "\t}\n}\n\n")
+}
+
+func (c *compiler) compileHandlerBody(statements []ast.Stmt) {
+	for index, statement := range statements {
+		if index == len(statements)-1 && c.api.ReturnType != nil {
+			if expression, ok := statement.(*ast.ExprStmt); ok {
+				c.compileReturn(&ast.ReturnStmt{Pos: expression.Pos, Value: expression.Expr})
+				return
+			}
+		}
+		c.compileStmt(statement)
+	}
+	if len(statements) == 0 || !isHandlerTerminating(statements[len(statements)-1]) {
+		c.write("return nil")
+	}
+}
+
+func isHandlerTerminating(statement ast.Stmt) bool {
+	switch statement.(type) {
+	case *ast.ReturnStmt, *ast.ThrowStmt:
+		return true
+	default:
+		return false
+	}
 }
 
 // compileFnBody generates Go handler code from a .luxo fn body.
 // Reuses the same compilation pipeline as API bodies.
 func compileFnBody(b *strings.Builder, fn *ast.FnDecl, models map[string]*ast.ModelDecl, enums map[string]bool) {
+	defaultGenerator().compileFnBody(b, fn, models, enums)
+}
+
+func (g *GeneratorContext) compileFnBody(b *strings.Builder, fn *ast.FnDecl, models map[string]*ast.ModelDecl, enums map[string]bool) {
 	// Convert FnDecl to ApiDecl for code reuse — they share the same structure
 	api := &ast.ApiDecl{
 		Pos:        fn.Pos,
@@ -139,7 +171,7 @@ func compileFnBody(b *strings.Builder, fn *ast.FnDecl, models map[string]*ast.Mo
 		Directives: fn.Directives,
 		Body:       fn.Body,
 	}
-	compileAPIBody(b, api, models, enums)
+	g.compileAPIBody(b, api, models, enums, nil)
 }
 
 // valType tracks the resolved type of a val variable.
@@ -201,20 +233,23 @@ func isNilableGoType(goType string) bool {
 
 // compiler holds state during body compilation.
 type compiler struct {
-	b           *strings.Builder
-	indent      string
-	models      map[string]*ast.ModelDecl
-	types       map[string]bool // type declaration names (AuthPayload, etc.)
-	enums       map[string]bool // enum type names
-	api         *ast.ApiDecl
-	vars        map[string]valType // variable name → resolved type
-	inAsync     bool               // true inside async { } — no return err
-	inForExpr   bool               // true inside for-as-expression with yield — yield compiles to return
-	yieldAddr   bool               // true when a yielded value must be wrapped in a pointer
-	yieldTmp    int                // unique temporary counter for nullable primitive yields
-	paginate    bool               // true when API has @paginate
-	hasTotalVar bool               // true after _total is assigned (paginated query)
-	ptrTmpCount int                // counter for hoisted pointer temp vars (nullable create args)
+	generator       *GeneratorContext
+	b               *strings.Builder
+	indent          string
+	models          map[string]*ast.ModelDecl
+	types           map[string]bool // type declaration names (AuthPayload, etc.)
+	enums           map[string]bool // enum type names
+	api             *ast.ApiDecl
+	vars            map[string]valType // variable name → resolved type
+	inAsync         bool               // true inside async { } — no return err
+	inForExpr       bool               // true inside for-as-expression with yield — yield compiles to return
+	yieldAddr       bool               // true when a yielded value must be wrapped in a pointer
+	yieldTmp        int                // unique temporary counter for nullable primitive yields
+	paginate        bool               // true when API has @paginate
+	hasTotalVar     bool               // true after _total is assigned (paginated query)
+	ptrTmpCount     int                // counter for hoisted pointer temp vars (nullable create args)
+	resultTmp       int                // counter for Result<T> values lowered from Go's (T, error)
+	nativeFunctions map[string]bool    // @native fn names available through app.Resolver
 }
 
 func (c *compiler) write(format string, args ...any) {
@@ -256,15 +291,6 @@ func (c *compiler) compileStmt(stmt ast.Stmt) {
 
 // compileVal: val x = expr
 func (c *compiler) compileVal(s *ast.ValStmt) {
-	// Check for ? operator: val x = riskyCall()? → error propagation
-	inner, hasQuestion := unwrapQuestion(s.Value)
-	if hasQuestion {
-		expr := c.compileExpr(inner)
-		c.write("%s, err := %s", s.Name, expr)
-		c.write("if err != nil {\n%s\treturn err\n%s}", c.indent, c.indent)
-		return
-	}
-
 	expr := c.compileExpr(s.Value)
 	if c.isModelQuery(s.Value) {
 		qt := c.resolveQueryType(s.Value)
@@ -534,12 +560,10 @@ func (c *compiler) compileExprStmt(s *ast.ExprStmt) {
 		c.compileBangElvisGuard(bang)
 		return
 	}
-	// Standalone ? operator: riskyCall()? — check and propagate error
-	if inner, hasQ := unwrapQuestion(s.Expr); hasQ {
-		expr := c.compileExpr(inner)
-		c.write("if err := %s; err != nil {", expr)
-		c.write("\treturn err")
-		c.write("}")
+	// Standalone Result propagation still evaluates and discards the value.
+	if _, hasQ := unwrapQuestion(s.Expr); hasQ {
+		expr := c.compileExpr(s.Expr)
+		c.write("_ = %s", expr)
 		return
 	}
 	// Model queries as standalone statements need error checking
@@ -682,9 +706,9 @@ func (c *compiler) compileEmit(s *ast.EmitStmt) {
 
 	// Check if event is cross-module
 	prefix := ""
-	if globalEventCtx != nil && c.api != nil {
+	if c.generator != nil && c.generator.events != nil && c.api != nil {
 		currentMod := moduleNameFromFile(c.api.Pos.File)
-		evModule := globalEventCtx.EventModule[s.EventName]
+		evModule := c.generator.events.EventModule[s.EventName]
 		if evModule != "" && evModule != currentMod {
 			prefix = evModule + "_luxo."
 		}
@@ -903,60 +927,108 @@ func (c *compiler) compileCall(e *ast.CallExpr) string {
 		return result
 	}
 
-	// Channel(n) → make(chan any, n)
-	if ident, ok := e.Func.(*ast.Ident); ok && ident.Name == "Channel" {
-		size := "0"
-		if len(e.Args) > 0 {
-			size = c.compileExpr(e.Args[0].Value)
-		}
-		return fmt.Sprintf("make(chan any, %s)", size)
+	if result, ok := c.compileChannelConstructor(e); ok {
+		return result
 	}
 
-	// transaction { body } → app.DB.Tx(ctx, func(tx *pg.DB) error { body; return nil })
-	if ident, ok := e.Func.(*ast.Ident); ok && ident.Name == "transaction" {
-		if len(e.Args) == 1 {
-			if lambda, ok := e.Args[0].Value.(*ast.LambdaExpr); ok {
-				sub := c.subCompiler()
-				sub.indent = c.indent + "\t"
-				for _, stmt := range lambda.Body.Stmts {
-					sub.compileStmt(stmt)
-				}
-				return fmt.Sprintf("app.DB.Tx(ctx, func(tx *%s.DB) error {\n%s%s\treturn nil\n%s})",
-					dbPkg, sub.b.String(), c.indent, c.indent)
-			}
-		}
+	if result, ok := c.compileTransactionCall(e); ok {
+		return result
 	}
 
-	// ch.close() → close(ch) for channel variables
-	if member, ok := e.Func.(*ast.MemberExpr); ok && len(e.Args) == 0 {
-		if ident, ok := member.Object.(*ast.Ident); ok {
-			if member.Field == "close" {
-				if vt, exists := c.vars[ident.Name]; exists && vt.isChan {
-					return fmt.Sprintf("close(%s)", ident.Name)
-				}
-			}
-		}
+	if result, ok := c.compileChannelClose(e); ok {
+		return result
 	}
 
-	// Flatten the call chain to detect Model.method patterns
+	if result, ok := c.compileModelCallChain(e); ok {
+		return result
+	}
+	return c.compileGenericCall(e)
+}
+
+func (c *compiler) compileChannelConstructor(e *ast.CallExpr) (string, bool) {
+	ident, ok := e.Func.(*ast.Ident)
+	if !ok || ident.Name != "Channel" {
+		return "", false
+	}
+	size := "0"
+	if len(e.Args) > 0 {
+		size = c.compileExpr(e.Args[0].Value)
+	}
+	return fmt.Sprintf("make(chan any, %s)", size), true
+}
+
+func (c *compiler) compileTransactionCall(e *ast.CallExpr) (string, bool) {
+	ident, ok := e.Func.(*ast.Ident)
+	if !ok || ident.Name != "transaction" || len(e.Args) != 1 {
+		return "", false
+	}
+	lambda, ok := e.Args[0].Value.(*ast.LambdaExpr)
+	if !ok {
+		return "", false
+	}
+	sub := c.subCompiler()
+	sub.indent = c.indent + "\t"
+	for _, stmt := range lambda.Body.Stmts {
+		sub.compileStmt(stmt)
+	}
+	return fmt.Sprintf("app.DB.Tx(ctx, func(tx *%s.DB) error {\n%s%s\treturn nil\n%s})",
+		c.dbPackage(), sub.b.String(), c.indent, c.indent), true
+}
+
+func (c *compiler) compileChannelClose(e *ast.CallExpr) (string, bool) {
+	member, ok := e.Func.(*ast.MemberExpr)
+	if !ok || len(e.Args) != 0 || member.Field != "close" {
+		return "", false
+	}
+	ident, ok := member.Object.(*ast.Ident)
+	if !ok {
+		return "", false
+	}
+	valueType, exists := c.vars[ident.Name]
+	if !exists || !valueType.isChan {
+		return "", false
+	}
+	return fmt.Sprintf("close(%s)", ident.Name), true
+}
+
+func (c *compiler) compileModelCallChain(e *ast.CallExpr) (string, bool) {
 	chain := flattenChain(e)
-
-	if len(chain) >= 2 {
-		root := chain[0]
-		if ident, ok := root.expr.(*ast.Ident); ok {
-			if _, isModel := c.models[ident.Name]; isModel {
-				return c.compileModelChain(ident.Name, chain[1:])
-			}
-		}
+	if len(chain) < 2 {
+		return "", false
 	}
+	ident, ok := chain[0].expr.(*ast.Ident)
+	if !ok {
+		return "", false
+	}
+	if _, isModel := c.models[ident.Name]; !isModel {
+		return "", false
+	}
+	return c.compileModelChain(ident.Name, chain[1:]), true
+}
 
-	// Generic call — Go does not support named args, use positional only
+func (c *compiler) compileGenericCall(e *ast.CallExpr) string {
+	// Generic call — Go does not support named args, use positional only.
 	funcExpr := c.compileExpr(e.Func)
+	ident, isIdent := e.Func.(*ast.Ident)
+	isNative := isIdent && c.nativeFunctions[ident.Name]
+	if isNative {
+		funcExpr = "app.Resolver." + str.Capitalize(ident.Name)
+	}
 	var args []string
+	if isNative {
+		args = append(args, "ctx")
+	}
 	for _, a := range e.Args {
 		args = append(args, c.compileExpr(a.Value))
 	}
 	return fmt.Sprintf("%s(%s)", funcExpr, strings.Join(args, ", "))
+}
+
+func (c *compiler) dbPackage() string {
+	if c.generator == nil {
+		return DriverPG.DriverPkg()
+	}
+	return c.generator.dbPkg
 }
 
 // compileScopeExpr compiles a scope declaration's expression into Where conditions.
@@ -1523,9 +1595,12 @@ func (c *compiler) compileUnary(e *ast.UnaryExpr) string {
 		return c.compileThrowExpr(e.Value)
 	}
 	if e.Op == "?" {
-		// ? as standalone expression — propagate error
 		operand := c.compileExpr(e.Value)
-		return operand // actual error handling is in compileVal/compileExprStmt
+		c.resultTmp++
+		name := fmt.Sprintf("_result%d", c.resultTmp)
+		c.write("%s, err := %s", name, operand)
+		c.write("if err != nil {\n%s\treturn err\n%s}", c.indent, c.indent)
+		return name
 	}
 	operand := c.compileExpr(e.Value)
 	return fmt.Sprintf("%s%s", e.Op, operand)
@@ -2432,13 +2507,14 @@ func (c *compiler) subCompiler() *compiler {
 		childVars[k] = v
 	}
 	return &compiler{
-		b:      &b,
-		indent: c.indent,
-		models: c.models,
-		types:  c.types,
-		enums:  c.enums,
-		api:    c.api,
-		vars:   childVars,
+		generator: c.generator,
+		b:         &b,
+		indent:    c.indent,
+		models:    c.models,
+		types:     c.types,
+		enums:     c.enums,
+		api:       c.api,
+		vars:      childVars,
 	}
 }
 

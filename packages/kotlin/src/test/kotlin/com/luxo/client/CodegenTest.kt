@@ -10,6 +10,7 @@ class CodegenTest {
         models = mapOf(
             "Payload" to LuxoModel(
                 name = "Payload",
+                usage = TypeUsage.OUTPUT,
                 fields = listOf(
                     LuxoField(1, "id", "Int"),
                     LuxoField(2, "blob", "Bytes"),
@@ -20,6 +21,7 @@ class CodegenTest {
         types = mapOf(
             "CreateInput" to LuxoTypeDecl(
                 name = "CreateInput",
+                usage = TypeUsage.INPUT,
                 fields = listOf(LuxoField(1, "name", "String")),
             ),
         ),
@@ -95,11 +97,14 @@ class CodegenTest {
         assertContains(types, "fun decodePaginatedPayload(data: ByteArray): Page<Payload>")
         assertContains(types, "import com.luxo.client.ColumnarDecoder")
         assertContains(types, "import com.luxo.client.Page")
-        assertContains(types, "val id: Long")
+        assertContains(types, "val id: Selected<Long> = Selected.unselected()")
+        assertContains(types, "Selected.value(dec.readInt())")
+        assertFalse(types.contains("?: 0L"))
         assertContains(types, "fun decodeJSONPayload(data: JsonObject): Payload")
         assertContains(types, "Base64.getDecoder().decode")
         assertContains(types, "dec.readColumnBytes()")
         assertContains(types, "Json.parseToJsonElement")
+        assertFalse(types.contains("!!"))
         assertContains(client, "decodeColumnarPayload(data)")
         assertContains(client, "decodePaginatedPayload(data)")
         assertContains(client, "input: CreateInput")
@@ -121,5 +126,44 @@ class CodegenTest {
         assertContains(hints, "object SelectHints")
         assertContains(hints, "emptyMap()")
         assertFalse(client.contains("try { SelectHints.hints[api] }"))
+        assertFalse(client.contains("!!"))
+    }
+
+    @Test
+    fun `separates strict input DTOs from selected output models`() {
+        val shared = LuxoSchema(
+            models = emptyMap(),
+            types = mapOf(
+                "Profile" to LuxoTypeDecl(
+                    name = "Profile",
+                    usage = TypeUsage.UNUSED,
+                    fields = listOf(
+                        LuxoField(1, "name", "String"),
+                        LuxoField(2, "bio", "String", nullable = true),
+                    ),
+                ),
+            ),
+            apis = mapOf(
+                "updateProfile" to LuxoAPI(
+                    id = 1,
+                    name = "updateProfile",
+                    module = "profile",
+                    returnType = "Profile",
+                    params = listOf(LuxoParam(1, "profile", "Model", typeName = "Profile")),
+                ),
+            ),
+        )
+
+        val types = LuxoCodegen.genTypes(shared, "com.example")
+        val client = LuxoCodegen.genClient(shared, "com.example")
+
+        assertContains(types, "data class Profile(")
+        assertContains(types, "val name: Selected<String> = Selected.unselected()")
+        assertContains(types, "val bio: Selected<String?> = Selected.unselected()")
+        assertContains(types, "@Serializable\ndata class ProfileInput(")
+        assertContains(types, "val name: String")
+        assertContains(types, "val bio: String? = null")
+        assertContains(client, "profile: ProfileInput")
+        assertContains(client, "): Profile")
     }
 }

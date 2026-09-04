@@ -13,11 +13,11 @@ var rootCmd = &cobra.Command{
 	Long: `Luxo — Build APIs at the speed of light.
 Luxo — 光速构建 API。
 
-A programming language with a built-in API framework.
-一门自带 API 框架的编程语言。
+A schema-first compiled backend language and platform.
+一门 Schema-first 的编译型后端语言与平台。
 
-One language, one protocol, one toolchain — replaces REST, GraphQL, and gRPC.
-一种语言、一套协议、一套工具链 — 取代 REST、GraphQL 和 gRPC。
+One language, one protocol, one toolchain for API and data services.
+一种语言、一套协议、一套面向 API 与数据服务的工具链。
 
 Commands / 命令:
   init <project>     Create a new project / 创建新项目

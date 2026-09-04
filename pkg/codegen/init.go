@@ -125,11 +125,9 @@ func generateEnvExample() []byte {
 
 # ---- App ----
 APP_ENV=development                                    # environment: development / production
-APP_DEBUG=true                                         # debug logging
 APP_PORT=8080                                          # Luvia Gateway port (HTTP/2 h2c by default)
-APP_TIMEZONE=UTC                                       # timezone: UTC / Asia/Shanghai
-DEPLOY_MODE=embedded                                   # deploy: embedded / standalone / compose / cluster
-GEN_MODE=full                                          # codegen: full / minimal (minimal = model + db only)
+APP_LOCALE=en                                          # response locale
+DEPLOY_MODE=embedded                                   # runtime: embedded / cluster
 
 # ---- TLS (optional) ----
 # Without these, uses h2c (HTTP/2 cleartext, recommended for internal networks)
@@ -141,16 +139,17 @@ GEN_MODE=full                                          # codegen: full / minimal
 LUXO_PORT=9000                                         # Luxo protocol port
 
 # ---- Database ----
-DATABASE_DRIVER=pg                                     # driver: pg / mysql / sqlite / mongo
+DATABASE_DRIVER=pg                                     # currently supported: pg
 DATABASE_PREFIX=myapp                                  # db name prefix
 DATABASE_HOST=localhost                                # host
 DATABASE_PORT=5432                                     # port
 DATABASE_USER=postgres                                 # username
-DATABASE_PASSWORD=secret                               # password
+DATABASE_PASSWORD=postgres                             # password
 DATABASE_POOL=20                                       # max connections
 DATABASE_IDLE=5                                        # idle connections
 DATABASE_TIMEOUT=5s                                    # connection timeout
 DATABASE_SSL=disable                                   # SSL: disable / require / verify-full
+AUTO_MIGRATE=true                                      # apply pending migrations at startup
 
 # ---- Debug ----
 # DEBUG_SQL=true                                        # print all SQL queries with timing
@@ -163,30 +162,16 @@ JWT_REFRESH_EXPIRES=30d                                # refresh token expiry
 
 # ---- Log ----
 LOG_LEVEL=info                                         # level: debug / info / warn / error
-LOG_FORMAT=text                                        # format: json / text
+# LOG_REQUESTS=true                                    # log every API request
 
 # ---- Gateway (Luvia) ----
-CORS_ORIGINS=*                                         # allowed origins
-CORS_METHODS=GET,POST,PUT,DELETE                       # allowed methods
-CORS_HEADERS=Authorization,Content-Type                # allowed headers
-CORS_CREDENTIALS=true                                  # allow credentials
-CORS_MAX_AGE=24h                                       # preflight cache
-
-RATE_LIMIT_WINDOW=1m                                   # rate limit window
-RATE_LIMIT_MAX=100                                     # max requests per client per window
+CORS_ORIGIN=*                                          # allowed origin or *
+INTROSPECTION_KEY=                                     # empty disables schema introspection
 
 TIMEOUT_READ=30s                                       # read timeout
 TIMEOUT_WRITE=30s                                      # write timeout
 TIMEOUT_IDLE=120s                                      # idle timeout
 
-MAX_DEPTH=10                                           # max field nesting depth
-MAX_FIELDS=50                                          # max fields per request
-MAX_BODY_SIZE=1mb                                      # max request body size
-MAX_BATCH=10                                           # max batch count
-
-TRANSPORT_MODE=auto                                    # transport: auto / json / binary
-HEALTH_PATH=/health                                    # health check endpoint
 GRACEFUL_TIMEOUT=30s                                   # graceful shutdown timeout
-REQUEST_ID_HEADER=X-Request-Id                         # request ID header
 `)
 }

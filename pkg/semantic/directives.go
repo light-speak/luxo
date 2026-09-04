@@ -1,6 +1,9 @@
 package semantic
 
 import (
+	"strconv"
+	"strings"
+
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/token"
 )
@@ -367,6 +370,12 @@ var builtinDirectives = []DirectiveDef{
 		Description: "cache response with TTL",
 	},
 	{
+		Name: "rateLimit", Contexts: OnApi,
+		Params:      []ParamDef{{Name: "max", Required: true}, {Name: "window", Required: true}},
+		MaxArgs:     2,
+		Description: "limit requests per client within a time window",
+	},
+	{
 		Name: "scope", Contexts: OnApi,
 		Params:      []ParamDef{}, // positional scope names
 		MaxArgs:     -1,
@@ -428,6 +437,56 @@ func (a *Analyzer) validateDirective(d *ast.Directive, ctx DirectiveContext, fie
 	if d.Name == "mask" {
 		a.checkMaskPattern(d)
 	}
+	if d.Name == "rateLimit" {
+		a.checkRateLimit(d)
+	}
+}
+
+func (a *Analyzer) checkRateLimit(d *ast.Directive) {
+	maxArg := findDirectiveArg(d.Args, "max", 0)
+	maxLiteral, ok := directiveLiteral(maxArg)
+	if !ok || maxLiteral.Kind != token.Int || !isPositiveInteger(maxLiteral.Value) {
+		a.addError(d.Pos, "@rateLimit max must be a positive integer / @rateLimit 的 max 必须是正整数")
+	}
+
+	windowArg := findDirectiveArg(d.Args, "window", 1)
+	windowLiteral, ok := directiveLiteral(windowArg)
+	if !ok || windowLiteral.Kind != token.Duration || !isPositiveDuration(windowLiteral.Value) {
+		a.addError(d.Pos, "@rateLimit window must be a positive duration / @rateLimit 的 window 必须是正时长")
+	}
+}
+
+func findDirectiveArg(args []*ast.NamedArg, name string, position int) *ast.NamedArg {
+	for _, arg := range args {
+		if arg.Name == name {
+			return arg
+		}
+	}
+	if position >= 0 && position < len(args) && args[position].Name == "" {
+		return args[position]
+	}
+	return nil
+}
+
+func directiveLiteral(arg *ast.NamedArg) (*ast.Literal, bool) {
+	if arg == nil {
+		return nil, false
+	}
+	literal, ok := arg.Value.(*ast.Literal)
+	return literal, ok
+}
+
+func isPositiveInteger(value string) bool {
+	n, err := strconv.ParseUint(value, 10, 64)
+	return err == nil && n > 0
+}
+
+func isPositiveDuration(value string) bool {
+	number := strings.TrimSuffix(value, "ms")
+	if number == value && len(value) > 0 {
+		number = value[:len(value)-1]
+	}
+	return isPositiveInteger(number)
 }
 
 func (a *Analyzer) checkMaskPattern(d *ast.Directive) {

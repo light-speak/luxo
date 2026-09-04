@@ -11,10 +11,8 @@ import (
 // ─── generateTypeWriteLuxo — all scalar types ──────────────────────────────────
 
 func TestGenerateTypeWriteLuxo_AllScalarTypes(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Payload": {
 			"intField":      1,
 			"strField":      2,
@@ -50,7 +48,7 @@ func TestGenerateTypeWriteLuxo_AllScalarTypes(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateTypeWriteLuxo(&b, pseudo, nil)
+	generator.generateTypeWriteLuxo(&b, pseudo, nil)
 	code := b.String()
 
 	// Value receiver
@@ -118,10 +116,8 @@ func TestGenerateTypeWriteLuxo_AllScalarTypes(t *testing.T) {
 }
 
 func TestGenerateTypeWriteLuxo_NestedModel(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"AuthPayload": {"token": 1, "member": 2},
 	})
 
@@ -134,7 +130,7 @@ func TestGenerateTypeWriteLuxo_NestedModel(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateTypeWriteLuxo(&b, pseudo, nil)
+	generator.generateTypeWriteLuxo(&b, pseudo, nil)
 	code := b.String()
 
 	// Nested model should use inline WriteLuxo
@@ -144,10 +140,8 @@ func TestGenerateTypeWriteLuxo_NestedModel(t *testing.T) {
 }
 
 func TestGenerateTypeWriteLuxo_ListRelation(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Result": {"items": 1, "count": 2},
 	})
 
@@ -160,7 +154,7 @@ func TestGenerateTypeWriteLuxo_ListRelation(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateTypeWriteLuxo(&b, pseudo, nil)
+	generator.generateTypeWriteLuxo(&b, pseudo, nil)
 	code := b.String()
 
 	// List relation: loop with WriteLuxo
@@ -173,10 +167,8 @@ func TestGenerateTypeWriteLuxo_ListRelation(t *testing.T) {
 }
 
 func TestGenerateTypeWriteLuxo_NullableRelation(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Wrapper": {"nested": 1},
 	})
 
@@ -188,7 +180,7 @@ func TestGenerateTypeWriteLuxo_NullableRelation(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateTypeWriteLuxo(&b, pseudo, nil)
+	generator.generateTypeWriteLuxo(&b, pseudo, nil)
 	code := b.String()
 
 	// Nullable relation: nil check + WriteLuxo or AppendNull
@@ -204,10 +196,8 @@ func TestGenerateTypeWriteLuxo_NullableRelation(t *testing.T) {
 }
 
 func TestGenerateTypeWriteLuxo_EnumField(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"WithEnum": {"role": 1},
 	})
 
@@ -220,7 +210,7 @@ func TestGenerateTypeWriteLuxo_EnumField(t *testing.T) {
 
 	enums := map[string]bool{"Role": true}
 	var b strings.Builder
-	generateTypeWriteLuxo(&b, pseudo, enums)
+	generator.generateTypeWriteLuxo(&b, pseudo, enums)
 	code := b.String()
 
 	// Enum field: string(w.Role)
@@ -230,10 +220,8 @@ func TestGenerateTypeWriteLuxo_EnumField(t *testing.T) {
 }
 
 func TestGenerateTypeWriteLuxo_NilTypeFieldSkipped(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Partial": {"name": 1},
 	})
 
@@ -246,7 +234,7 @@ func TestGenerateTypeWriteLuxo_NilTypeFieldSkipped(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateTypeWriteLuxo(&b, pseudo, nil)
+	generator.generateTypeWriteLuxo(&b, pseudo, nil)
 	code := b.String()
 
 	if strings.Contains(code, "NoType") {
@@ -255,11 +243,9 @@ func TestGenerateTypeWriteLuxo_NilTypeFieldSkipped(t *testing.T) {
 }
 
 func TestGenerateTypeWriteLuxo_NoFieldID(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
 	// No field IDs set for this type
-	SetModelFieldIDs(map[string]map[string]int{})
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{})
 
 	pseudo := &ast.ModelDecl{
 		Name: "NoIDs",
@@ -269,7 +255,7 @@ func TestGenerateTypeWriteLuxo_NoFieldID(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateTypeWriteLuxo(&b, pseudo, nil)
+	generator.generateTypeWriteLuxo(&b, pseudo, nil)
 	code := b.String()
 
 	// Should still produce a valid function, just with no field writes
@@ -285,10 +271,8 @@ func TestGenerateTypeWriteLuxo_NoFieldID(t *testing.T) {
 // ─── generateWriteJSONFile with Types ──────────────────────────────────────────
 
 func TestGenerateWriteJSONFile_TypeDecls(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"User":        {"id": 1, "name": 2},
 		"AuthPayload": {"token": 1, "userId": 2},
 	})
@@ -313,7 +297,7 @@ func TestGenerateWriteJSONFile_TypeDecls(t *testing.T) {
 		}},
 	}
 
-	src := generateWriteJSONFile(result, "app", nil)
+	src := generator.generateWriteJSONFile(result, "app", nil)
 	if src == nil {
 		t.Fatal("should generate")
 	}
@@ -332,10 +316,8 @@ func TestGenerateWriteJSONFile_TypeDecls(t *testing.T) {
 // ─── writeTypeListScalarField — [String], [Int], [Boolean], [Float] ─────────
 
 func TestWriteTypeListScalarField_StringList(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Tags": {"names": 1},
 	})
 
@@ -347,7 +329,7 @@ func TestWriteTypeListScalarField_StringList(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateTypeWriteLuxo(&b, pseudo, nil)
+	generator.generateTypeWriteLuxo(&b, pseudo, nil)
 	code := b.String()
 
 	if !strings.Contains(code, "len(t.Names)") {
@@ -359,10 +341,8 @@ func TestWriteTypeListScalarField_StringList(t *testing.T) {
 }
 
 func TestWriteTypeListScalarField_IntList(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Nums": {"values": 1},
 	})
 
@@ -374,7 +354,7 @@ func TestWriteTypeListScalarField_IntList(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateTypeWriteLuxo(&b, pseudo, nil)
+	generator.generateTypeWriteLuxo(&b, pseudo, nil)
 	code := b.String()
 
 	if !strings.Contains(code, "AppendSvarint(buf.B, v)") {
@@ -383,10 +363,8 @@ func TestWriteTypeListScalarField_IntList(t *testing.T) {
 }
 
 func TestWriteTypeListScalarField_BooleanList(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Flags": {"active": 1},
 	})
 
@@ -398,7 +376,7 @@ func TestWriteTypeListScalarField_BooleanList(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateTypeWriteLuxo(&b, pseudo, nil)
+	generator.generateTypeWriteLuxo(&b, pseudo, nil)
 	code := b.String()
 
 	if !strings.Contains(code, "AppendBool(buf.B, v)") {
@@ -407,10 +385,8 @@ func TestWriteTypeListScalarField_BooleanList(t *testing.T) {
 }
 
 func TestWriteTypeListScalarField_FloatList(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Scores": {"points": 1},
 	})
 
@@ -422,7 +398,7 @@ func TestWriteTypeListScalarField_FloatList(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateTypeWriteLuxo(&b, pseudo, nil)
+	generator.generateTypeWriteLuxo(&b, pseudo, nil)
 	code := b.String()
 
 	if !strings.Contains(code, "AppendFixed64(buf.B, v)") {
@@ -431,10 +407,8 @@ func TestWriteTypeListScalarField_FloatList(t *testing.T) {
 }
 
 func TestWriteTypeListScalarField_EnumList(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Perms": {"roles": 1},
 	})
 
@@ -447,7 +421,7 @@ func TestWriteTypeListScalarField_EnumList(t *testing.T) {
 
 	enums := map[string]bool{"Role": true}
 	var b strings.Builder
-	generateTypeWriteLuxo(&b, pseudo, enums)
+	generator.generateTypeWriteLuxo(&b, pseudo, enums)
 	code := b.String()
 
 	if !strings.Contains(code, "string(v)") {
@@ -456,10 +430,8 @@ func TestWriteTypeListScalarField_EnumList(t *testing.T) {
 }
 
 func TestWriteTypeListScalarField_DurationList(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Timers": {"durations": 1},
 	})
 
@@ -471,7 +443,7 @@ func TestWriteTypeListScalarField_DurationList(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateTypeWriteLuxo(&b, pseudo, nil)
+	generator.generateTypeWriteLuxo(&b, pseudo, nil)
 	code := b.String()
 
 	if !strings.Contains(code, "int64(v)") {

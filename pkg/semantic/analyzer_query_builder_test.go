@@ -24,8 +24,7 @@ func queryBuilderFile(expr ast.Expr) *ast.File {
 		},
 		APIs: []*ast.ApiDecl{
 			{
-				Name:       "testApi",
-				ReturnType: &ast.TypeRef{Name: "Int"},
+				Name: "testApi",
 				Body: &ast.Block{
 					Stmts: []ast.Stmt{
 						&ast.ExprStmt{Expr: expr},

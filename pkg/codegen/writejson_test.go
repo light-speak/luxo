@@ -10,8 +10,9 @@ import (
 )
 
 func TestGenerateWriteJSONFileNoModels(t *testing.T) {
+	generator := defaultGenerator()
 	result := &semantic.Result{Files: []*ast.File{{Name: "test.luxo"}}}
-	src := generateWriteJSONFile(result, "app", nil)
+	src := generator.generateWriteJSONFile(result, "app", nil)
 	if src != nil {
 		t.Error("should return nil when no models")
 	}
@@ -20,10 +21,8 @@ func TestGenerateWriteJSONFileNoModels(t *testing.T) {
 // --- WriteLuxo generation tests ---
 
 func TestGenerateWriteLuxoWithFieldIDs(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"User": {"id": 1, "name": 2, "active": 3, "score": 4},
 	})
 
@@ -42,7 +41,7 @@ func TestGenerateWriteLuxoWithFieldIDs(t *testing.T) {
 		}},
 	}
 
-	src := generateWriteJSONFile(result, "app", nil)
+	src := generator.generateWriteJSONFile(result, "app", nil)
 	if src == nil {
 		t.Fatal("should generate")
 	}
@@ -67,10 +66,8 @@ func TestGenerateWriteLuxoWithFieldIDs(t *testing.T) {
 }
 
 func TestGenerateWriteLuxoDateTimeField(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Event": {"id": 1, "createdAt": 2, "duration": 3},
 	})
 
@@ -88,7 +85,7 @@ func TestGenerateWriteLuxoDateTimeField(t *testing.T) {
 		}},
 	}
 
-	src := generateWriteJSONFile(result, "app", nil)
+	src := generator.generateWriteJSONFile(result, "app", nil)
 	code := string(src)
 
 	if !strings.Contains(code, ".Unix()") {
@@ -100,10 +97,8 @@ func TestGenerateWriteLuxoDateTimeField(t *testing.T) {
 }
 
 func TestGenerateWriteLuxoNullableFields(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Post": {"id": 1, "title": 2, "subtitle": 3, "views": 4, "rating": 5, "published": 6, "startAt": 7, "length": 8},
 	})
 
@@ -126,7 +121,7 @@ func TestGenerateWriteLuxoNullableFields(t *testing.T) {
 		}},
 	}
 
-	src := generateWriteJSONFile(result, "app", nil)
+	src := generator.generateWriteJSONFile(result, "app", nil)
 	code := string(src)
 
 	// Nullable should have AppendPresent/AppendNull pattern
@@ -139,10 +134,8 @@ func TestGenerateWriteLuxoNullableFields(t *testing.T) {
 }
 
 func TestGenerateWriteLuxoEnumFields(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"User": {"id": 1, "role": 2, "status": 3},
 	})
 
@@ -162,7 +155,7 @@ func TestGenerateWriteLuxoEnumFields(t *testing.T) {
 	}
 
 	enums := collectEnums(result)
-	src := generateWriteJSONFile(result, "app", enums)
+	src := generator.generateWriteJSONFile(result, "app", enums)
 	code := string(src)
 
 	// Non-nullable enum: string(u.Role)
@@ -176,10 +169,8 @@ func TestGenerateWriteLuxoEnumFields(t *testing.T) {
 }
 
 func TestGenerateWriteLuxoHiddenSkippedAndComputedEncoded(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"User": {"id": 1, "password": 2, "fullName": 3, "internal": 4},
 	})
 
@@ -198,7 +189,7 @@ func TestGenerateWriteLuxoHiddenSkippedAndComputedEncoded(t *testing.T) {
 		}},
 	}
 
-	src := generateWriteJSONFile(result, "app", nil)
+	src := generator.generateWriteJSONFile(result, "app", nil)
 	code := string(src)
 
 	if strings.Contains(code, "u.Password") {
@@ -213,10 +204,7 @@ func TestGenerateWriteLuxoHiddenSkippedAndComputedEncoded(t *testing.T) {
 }
 
 func TestGenerateWriteLuxoNoFieldIDs(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
-
-	modelFieldIDs = nil
+	generator := defaultGenerator()
 
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -230,7 +218,7 @@ func TestGenerateWriteLuxoNoFieldIDs(t *testing.T) {
 		}},
 	}
 
-	src := generateWriteJSONFile(result, "app", nil)
+	src := generator.generateWriteJSONFile(result, "app", nil)
 	code := string(src)
 
 	// WriteLuxo should still be generated but with no field writes
@@ -240,10 +228,8 @@ func TestGenerateWriteLuxoNoFieldIDs(t *testing.T) {
 }
 
 func TestGenerateWriteLuxoRelationEncoded(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Post": {"id": 1, "userId": 2, "user": 3},
 	})
 
@@ -257,7 +243,7 @@ func TestGenerateWriteLuxoRelationEncoded(t *testing.T) {
 		},
 	}
 	enums := map[string]bool{}
-	generateWriteLuxo(&b, m, enums)
+	generator.generateWriteLuxo(&b, m, enums)
 	code := b.String()
 
 	if !strings.Contains(code, "p.User.WriteLuxo(buf, nil)") {
@@ -353,8 +339,7 @@ func TestWriteColumnarMaskedStringFieldWithPattern(t *testing.T) {
 }
 
 func TestGenerateWriteLuxoTransformImportsAndSelectAll(t *testing.T) {
-	SetModelFieldIDs(map[string]map[string]int{"User": {"name": 1}})
-	defer SetModelFieldIDs(nil)
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{"User": {"name": 1}})
 
 	transform := &ast.Directive{Name: "transform", Body: &ast.Block{Stmts: []ast.Stmt{
 		&ast.ExprStmt{Expr: &ast.CallExpr{Func: &ast.MemberExpr{
@@ -367,7 +352,7 @@ func TestGenerateWriteLuxoTransformImportsAndSelectAll(t *testing.T) {
 			Name: "name", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{transform, {Name: "mask"}},
 		}},
 	}}}}}
-	code := string(generateWriteJSONFile(result, "app", nil))
+	code := string(generator.generateWriteJSONFile(result, "app", nil))
 
 	if !strings.Contains(code, `"strings"`) {
 		t.Fatalf("@transform string methods must import strings:\n%s", code)
@@ -384,8 +369,7 @@ func TestGenerateWriteLuxoTransformImportsAndSelectAll(t *testing.T) {
 }
 
 func TestGenerateWriteColumnarAppliesTransformBeforeMask(t *testing.T) {
-	SetModelFieldIDs(map[string]map[string]int{"User": {"name": 1}})
-	defer SetModelFieldIDs(nil)
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{"User": {"name": 1}})
 
 	transform := &ast.Directive{Name: "transform", Body: &ast.Block{Stmts: []ast.Stmt{
 		&ast.ExprStmt{Expr: &ast.CallExpr{Func: &ast.MemberExpr{
@@ -397,7 +381,7 @@ func TestGenerateWriteColumnarAppliesTransformBeforeMask(t *testing.T) {
 		Directives: []*ast.Directive{transform, {Name: "mask"}},
 	}}}
 	var b strings.Builder
-	generateWriteColumnar(&b, model, nil)
+	generator.generateWriteColumnar(&b, model, nil)
 	code := b.String()
 
 	if !strings.Contains(code, "str.Mask(strings.ToUpper(item.Name), 3, 4)") {
@@ -409,8 +393,7 @@ func TestGenerateWriteColumnarAppliesTransformBeforeMask(t *testing.T) {
 }
 
 func TestGenerateWriteColumnarNullableTransform(t *testing.T) {
-	SetModelFieldIDs(map[string]map[string]int{"User": {"nickname": 1}})
-	defer SetModelFieldIDs(nil)
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{"User": {"nickname": 1}})
 
 	transform := &ast.Directive{Name: "transform", Body: &ast.Block{Stmts: []ast.Stmt{
 		&ast.ExprStmt{Expr: &ast.CallExpr{Func: &ast.MemberExpr{
@@ -422,7 +405,7 @@ func TestGenerateWriteColumnarNullableTransform(t *testing.T) {
 		Directives: []*ast.Directive{transform},
 	}}}
 	result := &semantic.Result{Files: []*ast.File{{Models: []*ast.ModelDecl{model}}}}
-	code := string(generateWriteJSONFile(result, "app", nil))
+	code := string(generator.generateWriteJSONFile(result, "app", nil))
 
 	if !strings.Contains(code, "if item.Nickname != nil { v := strings.TrimSpace(*item.Nickname); vals[i] = &v }") {
 		t.Fatalf("nullable transform must preserve nulls:\n%s", code)
@@ -436,8 +419,7 @@ func TestGenerateWriteColumnarNullableTransform(t *testing.T) {
 }
 
 func TestGenerateWriteColumnarHonorsVisible(t *testing.T) {
-	SetModelFieldIDs(map[string]map[string]int{"User": {"salary": 1}})
-	defer SetModelFieldIDs(nil)
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{"User": {"salary": 1}})
 
 	visible := &ast.Directive{Name: "visible", Body: &ast.Block{Stmts: []ast.Stmt{
 		&ast.ExprStmt{Expr: &ast.BinaryExpr{
@@ -451,7 +433,7 @@ func TestGenerateWriteColumnarHonorsVisible(t *testing.T) {
 		Directives: []*ast.Directive{visible},
 	}}}
 	var b strings.Builder
-	generateWriteColumnar(&b, model, nil)
+	generator.generateWriteColumnar(&b, model, nil)
 	code := b.String()
 
 	condition := `if api.IdentityString(buf.Identity, "role") == "admin" {`
@@ -794,13 +776,12 @@ func TestGenerateTypeWriteLuxo(t *testing.T) {
 		},
 	}
 	// Set field IDs for the test
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"AuthPayload": {"token": 1, "userId": 2},
 	})
-	defer SetModelFieldIDs(nil)
 
 	var b strings.Builder
-	generateTypeWriteLuxo(&b, m, nil)
+	generator.generateTypeWriteLuxo(&b, m, nil)
 	out := b.String()
 	// Value receiver, not pointer
 	if !strings.Contains(out, "func (a AuthPayload) WriteLuxo") {
@@ -827,13 +808,12 @@ func TestGenerateTypeWriteColumnar(t *testing.T) {
 			{Name: "tags", Type: &ast.TypeRef{Name: "String", IsList: true}},
 		},
 	}
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"ServiceSummary": {"serviceName": 1, "apiCount": 2, "version": 3, "tags": 4},
 	})
-	defer SetModelFieldIDs(nil)
 
 	var b strings.Builder
-	generateTypeWriteColumnar(&b, m, nil)
+	generator.generateTypeWriteColumnar(&b, m, nil)
 	out := b.String()
 
 	// Value slice — native resolvers return []Type, not []*Type
@@ -869,8 +849,7 @@ func TestCompileMaskDirectiveMultipleArgs(t *testing.T) {
 }
 
 func TestGenerateTypeOutputDirectives(t *testing.T) {
-	SetModelFieldIDs(map[string]map[string]int{"Profile": {"displayName": 1, "secret": 2, "hidden": 3}})
-	defer SetModelFieldIDs(nil)
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{"Profile": {"displayName": 1, "secret": 2, "hidden": 3}})
 
 	transform := &ast.Directive{Name: "transform", Body: &ast.Block{Stmts: []ast.Stmt{
 		&ast.ExprStmt{Expr: &ast.CallExpr{Func: &ast.MemberExpr{
@@ -893,7 +872,7 @@ func TestGenerateTypeOutputDirectives(t *testing.T) {
 			{Name: "noFieldID", Type: &ast.TypeRef{Name: "String"}},
 		},
 	}}}}}
-	code := string(generateWriteJSONFile(result, "app", nil))
+	code := string(generator.generateWriteJSONFile(result, "app", nil))
 
 	if !strings.Contains(code, "displayNameTransformed := strings.TrimSpace(p.DisplayName)") {
 		t.Fatalf("type row writer must apply @transform:\n%s", code)
@@ -923,13 +902,12 @@ func TestGenerateTypeWriteColumnarNestedList(t *testing.T) {
 			{Name: "points", Type: &ast.TypeRef{Name: "MetricPoint", IsList: true}},
 		},
 	}
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"MetricTimeSeries": {"apiName": 1, "points": 2},
 	})
-	defer SetModelFieldIDs(nil)
 
 	var b strings.Builder
-	generateTypeWriteColumnar(&b, m, nil)
+	generator.generateTypeWriteColumnar(&b, m, nil)
 	out := b.String()
 
 	if !strings.Contains(out, "WriteColumnarMetricPoint(") {
@@ -949,13 +927,12 @@ func TestGenerateTypeWriteColumnarNestedSingle(t *testing.T) {
 			{Name: "inner", Type: &ast.TypeRef{Name: "Inner"}},
 		},
 	}
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Outer": {"name": 1, "inner": 2},
 	})
-	defer SetModelFieldIDs(nil)
 
 	var b strings.Builder
-	generateTypeWriteColumnar(&b, m, nil)
+	generator.generateTypeWriteColumnar(&b, m, nil)
 	out := b.String()
 
 	if !strings.Contains(out, ".WriteLuxo(") {
@@ -987,13 +964,12 @@ func TestGenerateModelBinaryWritersIncludeRelations(t *testing.T) {
 			{Name: "children", Type: &ast.TypeRef{Name: "Child", IsList: true}},
 		},
 	}
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Parent": {"id": 1, "child": 2, "children": 3},
 	})
-	defer SetModelFieldIDs(nil)
 
 	var row strings.Builder
-	generateWriteLuxo(&row, model, nil)
+	generator.generateWriteLuxo(&row, model, nil)
 	rowCode := row.String()
 	if !strings.Contains(rowCode, "_childMask2, _ := codec.SelectionMaskNested(selectionMask, 2)") ||
 		!strings.Contains(rowCode, "p.Child.WriteLuxo(buf, _childMask2)") ||
@@ -1002,7 +978,7 @@ func TestGenerateModelBinaryWritersIncludeRelations(t *testing.T) {
 	}
 
 	var columnar strings.Builder
-	generateWriteColumnar(&columnar, model, nil)
+	generator.generateWriteColumnar(&columnar, model, nil)
 	columnarCode := columnar.String()
 	if !strings.Contains(columnarCode, "WriteColumnarChildValues(&nb, items[i].Children, _childMask3)") {
 		t.Fatalf("model list relation must use canonical nested columnar encoding:\n%s", columnarCode)
@@ -1019,12 +995,13 @@ func TestGenerateModelBinaryWritersIncludeRelations(t *testing.T) {
 }
 
 func TestGenerateTypeWriteColumnarNoFields(t *testing.T) {
-	SetModelFieldIDs(nil)
+	generator := generatorWithModelFieldIDs(nil)
 	var b strings.Builder
-	generateTypeWriteColumnar(&b, &ast.ModelDecl{
+	generator.generateTypeWriteColumnar(&b, &ast.ModelDecl{
 		Name:   "Empty",
 		Fields: []*ast.FieldDecl{{Name: "value", Type: &ast.TypeRef{Name: "String"}}},
 	}, nil)
+
 	if b.Len() != 0 {
 		t.Fatalf("type without protocol field IDs should not generate a writer:\n%s", b.String())
 	}
@@ -1067,10 +1044,8 @@ func TestWriteColumnarArrayFieldAllScalarTypes(t *testing.T) {
 }
 
 func TestGenerateWriteLuxoUUIDDecimalBytesJSON(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Doc": {"id": 1, "uuid": 2, "price": 3, "data": 4, "meta": 5,
 			"optUuid": 6, "optPrice": 7, "optData": 8, "optMeta": 9},
 	})
@@ -1095,7 +1070,7 @@ func TestGenerateWriteLuxoUUIDDecimalBytesJSON(t *testing.T) {
 		}},
 	}
 
-	src := generateWriteJSONFile(result, "app", nil)
+	src := generator.generateWriteJSONFile(result, "app", nil)
 	code := string(src)
 
 	// WriteLuxo checks
@@ -1139,10 +1114,8 @@ func TestGenerateWriteLuxoUUIDDecimalBytesJSON(t *testing.T) {
 }
 
 func TestGenerateScalarArrayFields(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Tagged": {"id": 1, "tags": 2, "scores": 3, "ids": 4, "roles": 5},
 	})
 
@@ -1162,7 +1135,7 @@ func TestGenerateScalarArrayFields(t *testing.T) {
 		}},
 	}
 	enums := map[string]bool{"Role": true}
-	code := string(generateWriteJSONFile(result, "app", enums))
+	code := string(generator.generateWriteJSONFile(result, "app", enums))
 
 	checks := []string{
 		// WriteLuxo: array header + per-type item append
@@ -1189,9 +1162,7 @@ func TestGenerateScalarArrayFields(t *testing.T) {
 }
 
 func TestGenerateNestedModelListUsesCanonicalArrayHeader(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"User": {"id": 1, "posts": 2},
 		"Post": {"id": 1},
 	})
@@ -1206,7 +1177,7 @@ func TestGenerateNestedModelListUsesCanonicalArrayHeader(t *testing.T) {
 		{Name: "Post", Fields: []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}}},
 	}}}}
 
-	code := string(generateWriteJSONFile(result, "app", nil))
+	code := string(generator.generateWriteJSONFile(result, "app", nil))
 	if !strings.Contains(code, "codec.AppendArrayHeader(buf.B, len(u.Posts))") {
 		t.Fatalf("nested model list must use the canonical unsigned array header:\n%s", code)
 	}
@@ -1221,10 +1192,8 @@ func TestGenerateNestedModelListUsesCanonicalArrayHeader(t *testing.T) {
 // --- Arena header tests ---
 
 func TestWriteLuxoArenaHeader(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"User": {"id": 1, "name": 2, "email": 3, "age": 4},
 	})
 
@@ -1243,7 +1212,7 @@ func TestWriteLuxoArenaHeader(t *testing.T) {
 		}},
 	}
 
-	src := generateWriteJSONFile(result, "app", nil)
+	src := generator.generateWriteJSONFile(result, "app", nil)
 	code := string(src)
 
 	// Arena length calculation should exist
@@ -1268,10 +1237,8 @@ func TestWriteLuxoArenaHeader(t *testing.T) {
 }
 
 func TestWriteLuxoArenaHeaderNullableString(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Post": {"id": 1, "title": 2, "subtitle": 3},
 	})
 
@@ -1289,7 +1256,7 @@ func TestWriteLuxoArenaHeaderNullableString(t *testing.T) {
 		}},
 	}
 
-	src := generateWriteJSONFile(result, "app", nil)
+	src := generator.generateWriteJSONFile(result, "app", nil)
 	code := string(src)
 
 	// Nullable string should check nil before adding to arena len
@@ -1302,10 +1269,8 @@ func TestWriteLuxoArenaHeaderNullableString(t *testing.T) {
 }
 
 func TestWriteLuxoArenaHeaderEnumField(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"User": {"id": 1, "role": 2},
 	})
 
@@ -1324,7 +1289,7 @@ func TestWriteLuxoArenaHeaderEnumField(t *testing.T) {
 	}
 
 	enums := collectEnums(result)
-	src := generateWriteJSONFile(result, "app", enums)
+	src := generator.generateWriteJSONFile(result, "app", enums)
 	code := string(src)
 
 	// Enum should be included in arena calculation
@@ -1334,10 +1299,8 @@ func TestWriteLuxoArenaHeaderEnumField(t *testing.T) {
 }
 
 func TestWriteLuxoArenaHeaderNoStringFields(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Counter": {"id": 1, "count": 2, "active": 3},
 	})
 
@@ -1355,7 +1318,7 @@ func TestWriteLuxoArenaHeaderNoStringFields(t *testing.T) {
 		}},
 	}
 
-	src := generateWriteJSONFile(result, "app", nil)
+	src := generator.generateWriteJSONFile(result, "app", nil)
 	code := string(src)
 
 	// No string fields — should still write arena header (0)
@@ -1369,10 +1332,8 @@ func TestWriteLuxoArenaHeaderNoStringFields(t *testing.T) {
 }
 
 func TestReadLuxoArenaDecoding(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"User": {"id": 1, "name": 2, "email": 3, "age": 4},
 	})
 
@@ -1391,7 +1352,7 @@ func TestReadLuxoArenaDecoding(t *testing.T) {
 		}},
 	}
 
-	src := generateWriteJSONFile(result, "app", nil)
+	src := generator.generateWriteJSONFile(result, "app", nil)
 	code := string(src)
 
 	// ReadLuxo should read arena size
@@ -1413,10 +1374,8 @@ func TestReadLuxoArenaDecoding(t *testing.T) {
 }
 
 func TestReadLuxoArenaEnumField(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"User": {"id": 1, "name": 2, "role": 3},
 	})
 
@@ -1436,7 +1395,7 @@ func TestReadLuxoArenaEnumField(t *testing.T) {
 	}
 
 	enums := collectEnums(result)
-	src := generateWriteJSONFile(result, "app", enums)
+	src := generator.generateWriteJSONFile(result, "app", enums)
 	code := string(src)
 
 	// Enum field should use ReadStringArena
@@ -1446,10 +1405,8 @@ func TestReadLuxoArenaEnumField(t *testing.T) {
 }
 
 func TestReadLuxoNoArenaFields(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Counter": {"id": 1, "count": 2},
 	})
 
@@ -1466,7 +1423,7 @@ func TestReadLuxoNoArenaFields(t *testing.T) {
 		}},
 	}
 
-	src := generateWriteJSONFile(result, "app", nil)
+	src := generator.generateWriteJSONFile(result, "app", nil)
 	code := string(src)
 
 	// No arena fields — should skip arena header
@@ -1479,10 +1436,8 @@ func TestReadLuxoNoArenaFields(t *testing.T) {
 }
 
 func TestReadLuxoAllFieldTypes(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"Full": {"id": 1, "name": 2, "createdAt": 3, "duration": 4,
 			"data": 5, "avatar": 6, "score": 7},
 	})
@@ -1505,7 +1460,7 @@ func TestReadLuxoAllFieldTypes(t *testing.T) {
 		}},
 	}
 
-	src := generateWriteJSONFile(result, "app", nil)
+	src := generator.generateWriteJSONFile(result, "app", nil)
 	code := string(src)
 
 	// ReadLuxo should handle DateTime, Duration, Bytes, nullable String, nullable Float
@@ -1527,10 +1482,8 @@ func TestReadLuxoAllFieldTypes(t *testing.T) {
 }
 
 func TestWriteLuxoArenaHeaderMaskedPath(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
 
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"User": {"id": 1, "name": 2, "bio": 3},
 	})
 
@@ -1548,7 +1501,7 @@ func TestWriteLuxoArenaHeaderMaskedPath(t *testing.T) {
 		}},
 	}
 
-	src := generateWriteJSONFile(result, "app", nil)
+	src := generator.generateWriteJSONFile(result, "app", nil)
 	code := string(src)
 
 	// Masked path should check FieldMaskHas for arena len
@@ -1561,17 +1514,10 @@ func TestWriteLuxoArenaHeaderMaskedPath(t *testing.T) {
 }
 
 func TestGenerateWriteJSONExtendStubIncludesDeclaredPrimaryKey(t *testing.T) {
-	oldContext := globalEventCtx
-	oldFields := modelFieldIDs
-	defer func() {
-		globalEventCtx = oldContext
-		modelFieldIDs = oldFields
-	}()
-	globalEventCtx = &EventContext{
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		ModelIDField: map[string]string{"Product": "sku"},
 		ModelIDType:  map[string]string{"Product": "String"},
-	}
-	modelFieldIDs = map[string]map[string]int{"Product": {"sku": 7, "name": 8}}
+	}, IDs: StableIDs{ModelFields: map[string]map[string]int{"Product": {"sku": 7, "name": 8}}}})
 	result := &semantic.Result{Files: []*ast.File{{
 		Name: "origin/review.luxo",
 		Extends: []*ast.ExtendDecl{{
@@ -1580,7 +1526,7 @@ func TestGenerateWriteJSONExtendStubIncludesDeclaredPrimaryKey(t *testing.T) {
 		}},
 	}}}
 
-	code := string(generateWriteJSONFile(result, "app", nil))
+	code := string(generator.generateWriteJSONFile(result, "app", nil))
 	if !strings.Contains(code, "case 7: p.Sku = dec.ReadStringArena") {
 		t.Fatalf("extend codec does not decode the declared primary key:\n%s", code)
 	}

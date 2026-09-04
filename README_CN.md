@@ -5,8 +5,8 @@
 <h3 align="center">Build APIs at the speed of light.</h3>
 
 <p align="center">
-  一门自带 API 框架的通用编程语言。<br/>
-  一种语言、一套协议、一套工具链 — 取代 REST、GraphQL 和 gRPC。
+  Schema-first 的编译型后端语言与平台。<br/>
+  一种语言、一套协议、一套面向 API 与数据服务的工具链。
 </p>
 
 <p align="center">
@@ -46,9 +46,9 @@
 
 ## Luxo 是什么？
 
-Luxo 是一门**编程语言** — 编译到 Go，自带 API 框架、自研协议和完整工具链。
+Luxo 是一门 **Schema-first 的编译型后端语言与平台**。它把 `.luxo` 编译为 Go 服务、数据库访问、迁移、类型化 SDK 元数据和部署入口。Luvia 基于同一份 Schema，通过 HTTP、WebSocket 和原生 RPC 提供统一的 JSON 与 Luxo Binary 能力。
 
-写 `.luxo` 文件，得到：API 服务、数据库层、客户端 SDK、迁移文件、监控面板。不需要粘合代码。
+Luxo 的目标是统一通常分散在 REST、GraphQL、gRPC、ORM 和手写客户端胶水中的工作。当前已实现的数据库后端是 PostgreSQL；MySQL、SQLite、MongoDB 仍是规划目标。
 
 ```luxo
 model User @crud {
@@ -61,25 +61,25 @@ model User @crud {
 }
 ```
 
-一段定义生成一切。零样板代码。
+一份源定义驱动服务端、数据库层、迁移、Schema 与 SDK 契约。
 
 ## 为什么不用...
 
 | | GraphQL | gRPC | REST | **Luxo** |
 |---|---|---|---|---|
 | **字段选择** | ✅ 支持但过于松散，客户端可任意构造深层嵌套查询，需额外配置深度/复杂度限制防止滥用 | ❌ 不支持，响应固定为 proto 定义的完整结构（`FieldMask` 可实现但需手动处理） | ❌ 不支持，每个端点返回固定字段，需手动实现 `?fields=` 参数 | ✅ Schema 级别声明字段可见性，编译期校验选择合法性，贯穿到 SQL 只查所选列 |
-| **二进制传输** | ❌ 规范不限编码格式，但实践中几乎只用 JSON，大数据量场景序列化开销显著 | ✅ Protobuf 二进制编码，高效紧凑 | ❌ 可通过 Content Negotiation 支持任意格式，但实践中以 JSON 为主，无标准二进制方案 | ✅ 开发环境 JSON 便于调试，生产环境自动切换 Binary 提升吞吐，零配置 |
+| **二进制传输** | ❌ 规范不限编码格式，但实践中几乎只用 JSON，大数据量场景序列化开销显著 | ✅ Protobuf 二进制编码，高效紧凑 | ❌ 可通过 Content Negotiation 支持任意格式，但实践中以 JSON 为主，无标准二进制方案 | ✅ JSON 与 Luxo Binary 共用一份 Schema，由 SDK 模式或 `X-Luxo-Mode` 明确选择 wire 格式 |
 | **一份 Schema** | ❌ SDL 定义 API 接口，但仍需独立维护 ORM 数据库映射，两处定义容易不同步（code-first 工具可缓解） | ❌ `.proto` 定义接口 + ORM 定义数据库，两套定义需手动保持一致 | ❌ 无 Schema 驱动，路由 / 模型 / 文档全部手写 | ✅ 一份 `.luxo` 生成 API 接口、数据库迁移、客户端 SDK 和文档，单一事实来源 |
 | **N+1 防护** | ❌ Resolver 模式天然引发 N+1，需手动集成 DataLoader（已是标准实践，部分框架如 Hasura 可自动解决） | N/A 不涉及嵌套字段解析场景 | ❌ 嵌套资源需手动优化查询或引入预加载逻辑 | ✅ 编译器自动分析关联关系，生成 DataLoader 批量加载，无需手动干预 |
 | **空安全** | ⚠️ SDL `!` 标记非空，服务端运行时校验；客户端可通过 codegen 获得编译期类型安全 | ✅ Protobuf 字段有默认零值，编译期类型安全（但 proto3 无法区分"零值"和"未设置"） | ❌ 无任何空安全保障，null 错误只能运行时发现 | ✅ 语言级编译期空安全：`?` 可空声明、`?.` 安全访问、`?:` Elvis 兜底，空值错误编译阶段拦截 |
-| **错误处理** | ❌ `errors` 数组结构松散，仅有 message 字符串 + 可选 extensions，客户端难以结构化处理 | ✅ gRPC Status 标准 16 种状态码 + 富错误详情，类型明确 | ❌ 依赖 HTTP 状态码 + 自定义 JSON body，无统一错误结构规范 | ✅ `Result<T>` 类型化错误 + `?` 操作符自动传播，错误处理既安全又简洁 |
+| **错误处理** | ❌ `errors` 数组结构松散，仅有 message 字符串 + 可选 extensions，客户端难以结构化处理 | ✅ gRPC Status 标准 16 种状态码 + 富错误详情，类型明确 | ❌ 依赖 HTTP 状态码 + 自定义 JSON body，无统一错误结构规范 | ✅ 统一的结构化传输错误 envelope；native `Result<T>` 降级为 Go `(T, error)`，由 `?` 自动传播失败 |
 | **并发** | ⚠️ 多数实现自动并行执行独立 resolver（gqlgen / Apollo / graphql-java），但无语言级并发原语，复杂编排仍依赖宿主语言 | ❌ 支持双向流式传输，但并发编排逻辑需开发者手动管理 | ❌ 无内建并发支持，完全依赖框架或手写线程/协程管理 | ✅ 语言内建 `async` / `await` + `Channel` — 编译到 Go goroutine 和 channel，零成本并发 |
 | **多服务** | ⚠️ Apollo Federation 成熟但运维复杂，需额外网关层和服务间协调 | ⚠️ 原生点对点 RPC 调用，但多服务编排仍需服务网格/发现（Istio、Consul 等） | ❌ 服务间调用需手写 HTTP 客户端或引入额外框架 | ✅ `extend` 跨服务扩展类型 + 内建网关路由 + 原生 RPC 调用，多服务协作开箱即用 |
-| **扩展性** | ❌ 单体迁移到 Federation 需要重写 resolver、添加 `@key`/`@external` 注解、部署 Apollo Router | ❌ 服务拆分需要重新定义 `.proto`、重新生成 stub、重写调用代码 | ❌ 每次拆分都要新建路由、新写 HTTP 客户端、新建部署配置 | ✅ 单服务 → 多服务只改配置，零代码变更，Luvia 网关自动处理一切 |
+| **扩展性** | ❌ 单体迁移到 Federation 需要重写 resolver、添加 `@key`/`@external` 注解、部署 Apollo Router | ❌ 服务拆分需要重新定义 `.proto`、重新生成 stub、重写调用代码 | ❌ 每次拆分都要新建路由、新写 HTTP 客户端、新建部署配置 | ✅ 编译器从同一份 Schema 契约生成 embedded/cluster 入口、RPC 路由和 Federation loader |
 
 ## 语言特性
 
-Luxo 是一门真正的编程语言 — 不只是 Schema DSL。**32 个关键字**，9 种核心类型（`Int`、`Float`、`String`、`Boolean`、`DateTime`、`Duration`、`UUID`、`Decimal`、`Bytes`），简洁语法，编译到 Go。
+Luxo 是后端编程语言，不只是 Schema DSL。标量类型包括 `Int`、`Float`、`String`、`Boolean`、`DateTime`、`Duration`、`UUID`、`Decimal`、`Bytes`、`JSON`；泛型运行时类型包括 `Result<T>`、`Channel<T>`、`Page<T>`、`Cursor<T>`。Luxo 编译到 Go。
 
 ### 空安全
 
@@ -111,9 +111,14 @@ when(result) {
 错误用 `?` 传播 — 不需要 try/catch，不需要 async/await 传染。
 
 ```luxo
-val user = findUser(1)?              // Ok → 取值，Err → 自动 throw
-val data = http.get(url)?            // 错误自动传播
+fn loadUser(id: Int): Result<User> @native
+
+api getUser(id: Int): User {
+  loadUser(id)?                      // 成功时解包，失败时传播 error
+}
 ```
+
+`Result<T>` 是 Go-backed native 函数的 ABI。公开 API 声明的是响应 payload 类型（上例为 `User`）；传输错误使用统一的结构化错误 envelope。
 
 ### 并发 — 没有 async/await 传染
 
@@ -231,6 +236,10 @@ getUser(1) {
 
 客户端选字段 → API 只序列化这些 → SQL 只查这些。端到端。
 
+生成的 SDK 输出模型精确保留三种字段状态：未选择、已选择且为 `null`、已选择且有值；
+解码器不会为缺失字段伪造零值。输入 DTO 保持严格；同一个 Schema 类型同时用于输入和输出时，
+codegen 会生成用于选择输出的 `Foo` 和用于输入的 `FooInput`。
+
 ### 实时流
 
 ```luxo
@@ -259,8 +268,8 @@ go install github.com/light-speak/luxo/cmd/luxo@latest
 luxo init my-app
 cd my-app
 luxo add user
-luxo gen
 cp .env.example .env
+luxo gen
 luxo run
 ```
 
@@ -268,7 +277,15 @@ luxo run
 
 > [查看完整架构图](assets/architecture.svg)
 
-**Luvia 始终在线** — 单服务时内嵌运行（进程内调用，零开销），多服务时独立部署为网关。同一套代码，同一套行为，只改 `.env` 中的 `DEPLOY_MODE`。从原型到生产，不改一行代码。
+**Luvia 始终在线。** embedded 模式把所有模块和网关放在同一进程；cluster 模式使用生成的模块服务二进制和独立网关。RPC 路由与 Federation loader 都来自同一份已分析的 Schema，不需要手写传输客户端。
+
+JSON 与 Luxo Binary 都是生产传输。HTTP 客户端通过 SDK transport mode 或 `X-Luxo-Mode: json|binary` 选择；WebSocket 与原生 RPC 使用各自的 canonical binary framing。`APP_ENV` 不会静默改变 wire 契约。
+
+### Wire 兼容性
+
+`luxo.lock` v2 固定 model/type/event 字段 ID、API ID、参数 ID 及其 wire 类型。`luxo gen` 会在改写 lock 前拒绝破坏性变更；只有确定所有已部署生产者与消费者会同步重新生成时，才使用 `--allow-breaking`。
+
+这里的“兼容”指新服务端仍能接受旧客户端，因此兼容发布应先部署服务端，再发布重新生成的客户端。在这个方向上，新增 model/type 字段或可选 API 参数属于兼容变更。删除或修改字段/参数、增加必填参数、修改 API 返回类型、删除 API、修改事件 payload 都属于破坏性变更。已删除 ID 永久保留，不会复用。
 
 
 ## AI 原生设计
@@ -298,8 +315,8 @@ Luxo 不只是代码更短 — 它是 **AI 写后端最可靠的语言**。
 ## 开发进度
 
 ### Phase 1 — 编译器 ✅
-- [x] 词法分析 · 语法分析（32 关键字，Pratt Parser）
-- [x] 语义分析（类型检查、空安全、字段注入、59 个内置注解）
+- [x] 词法分析 · 语法分析（Pratt Parser）
+- [x] 语义分析（声明/类型/函数体/后分析分层 pass、类型检查、空安全、字段注入、注解校验）
 - [x] LSP 服务器（诊断、补全、悬停、跳转定义、引用查找）
 - [x] VS Code 扩展（语法高亮、LSP 集成）
 

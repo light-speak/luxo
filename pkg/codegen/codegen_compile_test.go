@@ -14,13 +14,7 @@ import (
 // verify the generated model/db/writejson/schema code is valid, type-correct Go.
 // This is the end-to-end guard for the array + UUID codegen changes.
 func TestGeneratedCodeCompiles(t *testing.T) {
-	old := modelFieldIDs
-	oldEvent := eventFieldIDs
-	defer func() {
-		modelFieldIDs = old
-		eventFieldIDs = oldEvent
-	}()
-	SetModelFieldIDs(map[string]map[string]int{
+	modelIDs := map[string]map[string]int{
 		"Doc": {
 			"id": 1, "name": 2, "active": 3, "uid": 4, "ouid": 5,
 			"created": 6, "dur": 7, "price": 8, "data": 9,
@@ -28,13 +22,13 @@ func TestGeneratedCodeCompiles(t *testing.T) {
 			"metadata": 16, "childId": 17, "child": 18, "children": 19,
 		},
 		"Child": {"id": 1, "docId": 2, "name": 3},
-	})
-	SetEventFieldIDs(map[string]map[string]int{
+	}
+	eventIDs := map[string]map[string]int{
 		"DocChanged": {
 			"doc": 1, "at": 2, "ttl": 3, "uid": 4, "price": 5,
 			"metadata": 6, "docs": 7, "labels": 8,
 		},
-	})
+	}
 
 	file := &ast.File{
 		Name: "test.luxo",
@@ -102,14 +96,25 @@ func TestGeneratedCodeCompiles(t *testing.T) {
 		},
 	}
 
-	gr := Generate(result(file), "gentest", DriverPG)
+	generator, err := NewGenerator(GeneratorConfig{IDs: StableIDs{ModelFields: modelIDs, EventFields: eventIDs}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gr, err := generator.Generate(result(file), "gentest", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	wd, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Temp dir inside the luxo module so generated imports resolve via go.mod.
-	dir, err := os.MkdirTemp(wd, "genbuild")
+	tmpRoot := filepath.Clean(filepath.Join(wd, "..", "..", ".tmp"))
+	if err := os.MkdirAll(tmpRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp(tmpRoot, "genbuild-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,8 +141,8 @@ func TestGeneratedCodeCompiles(t *testing.T) {
 		}
 	}
 
-	cmd := exec.Command("go", "build", "./"+filepath.Base(dir))
-	cmd.Dir = wd
+	cmd := exec.Command("go", "build", ".")
+	cmd.Dir = dir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("generated code failed to compile:\n%s", out)
 	}

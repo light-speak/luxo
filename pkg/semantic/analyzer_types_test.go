@@ -290,6 +290,55 @@ func TestBlockResultAndDeclarationHelpers(t *testing.T) {
 	}
 }
 
+func TestQuestionOperatorUnwrapsResult(t *testing.T) {
+	result := analyze(t, `
+fn loadCount(): Result<Int> @native
+api count(): Int {
+  val value = loadCount()?
+  return value
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestQuestionOperatorRejectsNonResult(t *testing.T) {
+	result := analyze(t, `
+fn loadCount(): Int @native @service
+api count(): Int {
+  val value = loadCount()?
+  return value
+}
+`)
+	expectError(t, result, "operator '?' requires Result<T>")
+}
+
+func TestNativeFunctionRequiresResult(t *testing.T) {
+	result := analyze(t, `fn loadCount(): Int @native`)
+	expectError(t, result, "@native fn return type must be Result<T>")
+}
+
+func TestResultRequiresNativeFunction(t *testing.T) {
+	result := analyze(t, `fn loadCount(): Result<Int> { 1 }`)
+	expectError(t, result, "Result<T> is only valid for @native fn")
+}
+
+func TestAPIRejectsResultReturn(t *testing.T) {
+	result := analyze(t, `api count(): Result<Int> @native`)
+	expectError(t, result, "API return types must be response values")
+}
+
+func TestResultMustBeConsumedDirectly(t *testing.T) {
+	result := analyze(t, `
+fn loadCount(): Result<Int> @native
+api count(): Int {
+  val pending = loadCount()
+  return pending?
+}
+`)
+	expectError(t, result, "must be consumed directly with '?'")
+	expectError(t, result, "must be applied directly")
+}
+
 func TestBinaryIn(t *testing.T) {
 	result := analyze(t, `
 api test(): Boolean {
@@ -905,6 +954,62 @@ func TestReturnStmtWithoutValue(t *testing.T) {
 	if result == nil {
 		t.Fatal("expected non-nil result")
 	}
+}
+
+func TestCallableReturnTypes(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "explicit return mismatch",
+			input: `fn wrong(): String { return 42 }`,
+			want:  "return expects 'String', got 'Int'",
+		},
+		{
+			name:  "implicit return mismatch",
+			input: `api wrong(): Int { "value" }`,
+			want:  "return expects 'Int', got 'String'",
+		},
+		{
+			name: "missing response",
+			input: `api wrong(): Int {
+  val value = 42
+}`,
+			want: "must return 'Int'",
+		},
+		{
+			name:  "value return for void callable",
+			input: `fn wrong() { return 42 }`,
+			want:  "return expects 'Void', got 'Int'",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			expectError(t, analyze(t, tt.input), tt.want)
+		})
+	}
+}
+
+func TestVoidCallableDoesNotRequireAResponse(t *testing.T) {
+	result := analyze(t, `api record() { val value = 42 }`)
+	for _, issue := range result.Errors {
+		if strings.Contains(issue.Message, "must return") {
+			t.Fatalf("Void callable should not require a response: %v", result.Errors)
+		}
+	}
+}
+
+func TestValueCallableRejectsEmptyReturnAST(t *testing.T) {
+	file := &ast.File{Functions: []*ast.FnDecl{{
+		Name:       "wrong",
+		ReturnType: &ast.TypeRef{Name: "Int"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ReturnStmt{},
+		}},
+	}}}
+	expectError(t, Analyze([]*ast.File{file}), "return expects 'Int', got 'Void'")
 }
 
 func TestThrowStmt(t *testing.T) {

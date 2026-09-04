@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/codegen"
+	"github.com/light-speak/luxo/pkg/lockfile"
 	"github.com/light-speak/luxo/pkg/lux"
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/schema"
@@ -254,17 +256,74 @@ func TestReadModulePathNoDirective(t *testing.T) {
 }
 
 func TestLoadDialect(t *testing.T) {
-	d := loadDialect()
-	if d == nil {
+	d, err := loadDialect()
+	if err != nil || d == nil {
 		t.Error("default dialect should not be nil")
 	}
 }
 
 func TestLoadDialectMySQL(t *testing.T) {
 	t.Setenv("DATABASE_DRIVER", "mysql")
-	d := loadDialect()
-	if d == nil {
-		t.Error("mysql dialect should fallback to pg")
+	d, err := loadDialect()
+	if err == nil || d != nil {
+		t.Fatalf("unsupported mysql dialect = %T, %v; want explicit error", d, err)
+	}
+}
+
+func TestValidateWireCompatibilityRequiresExplicitOverride(t *testing.T) {
+	lf := lockfile.New()
+	base := []*ast.File{{Models: []*ast.ModelDecl{{
+		Name:   "User",
+		Fields: []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}},
+	}}}}
+	lf.Update(base)
+	removed := []*ast.File{{}}
+
+	if err := validateWireCompatibility(lf, removed, false); err == nil || !strings.Contains(err.Error(), "--allow-breaking") {
+		t.Fatalf("breaking change must require explicit override: %v", err)
+	}
+	if err := validateWireCompatibility(lf, removed, true); err != nil {
+		t.Fatalf("explicit override rejected: %v", err)
+	}
+}
+
+func TestLoadGenerationEnvironment(t *testing.T) {
+	tempRoot := filepath.Join("..", "..", ".tmp")
+	if err := os.MkdirAll(tempRoot, 0755); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.CreateTemp(tempRoot, "gen-env-*.env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := file.Name()
+	t.Cleanup(func() { os.Remove(path) })
+	if _, err := file.WriteString("LUXO_TEST_GENERATION_ENV=loaded\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	previous, existed := os.LookupEnv("LUXO_TEST_GENERATION_ENV")
+	os.Unsetenv("LUXO_TEST_GENERATION_ENV")
+	t.Cleanup(func() {
+		if existed {
+			os.Setenv("LUXO_TEST_GENERATION_ENV", previous)
+		} else {
+			os.Unsetenv("LUXO_TEST_GENERATION_ENV")
+		}
+	})
+
+	if err := loadGenerationEnvironment(path); err != nil {
+		t.Fatal(err)
+	}
+	if got := os.Getenv("LUXO_TEST_GENERATION_ENV"); got != "loaded" {
+		t.Fatalf("loaded environment = %q, want loaded", got)
+	}
+	if err := loadGenerationEnvironment(filepath.Join(tempRoot, "missing.env")); err != nil {
+		t.Fatalf("missing optional environment file = %v", err)
 	}
 }
 

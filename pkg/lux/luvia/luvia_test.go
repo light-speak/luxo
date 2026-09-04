@@ -417,6 +417,26 @@ func TestBuildMuxUsesWildcardCORSForWebSocket(t *testing.T) {
 	}
 }
 
+func TestServerTimeoutsFromEnv(t *testing.T) {
+	t.Setenv("TIMEOUT_READ", "5s")
+	t.Setenv("TIMEOUT_WRITE", "7s")
+	t.Setenv("TIMEOUT_IDLE", "11s")
+	timeouts, err := serverTimeoutsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if timeouts.read != 5*time.Second || timeouts.write != 7*time.Second || timeouts.idle != 11*time.Second {
+		t.Fatalf("server timeouts = %+v", timeouts)
+	}
+}
+
+func TestServerTimeoutsRejectInvalidValue(t *testing.T) {
+	t.Setenv("TIMEOUT_READ", "never")
+	if _, err := serverTimeoutsFromEnv(); err == nil {
+		t.Fatal("invalid TIMEOUT_READ must fail startup")
+	}
+}
+
 func TestBuildBannerDatabaseDisplay(t *testing.T) {
 	// With full DATABASE_* fields
 	t.Setenv("DATABASE_HOST", "localhost")
@@ -455,7 +475,7 @@ func TestServe_H2C(t *testing.T) {
 }
 
 func TestServe_CustomShutdownTimeout(t *testing.T) {
-	t.Setenv("SHUTDOWN_TIMEOUT", "1s")
+	t.Setenv("GRACEFUL_TIMEOUT", "1s")
 	t.Setenv("APP_PORT", "0")
 
 	gw := New()
@@ -542,22 +562,30 @@ func generateTestCert(t *testing.T) (certFile, keyFile string) {
 }
 
 func TestServe_InvalidShutdownTimeout(t *testing.T) {
-	t.Setenv("SHUTDOWN_TIMEOUT", "not-a-duration")
+	t.Setenv("GRACEFUL_TIMEOUT", "not-a-duration")
 	t.Setenv("APP_PORT", "0")
 
-	gw := New()
-	done := make(chan error, 1)
-	go func() {
-		done <- gw.Serve("test-v1")
-	}()
+	err := New().Serve("test-v1")
+	if err == nil || !strings.Contains(err.Error(), "GRACEFUL_TIMEOUT must be a positive duration") {
+		t.Fatalf("invalid graceful timeout = %v", err)
+	}
+}
 
-	time.Sleep(50 * time.Millisecond)
-	proc, _ := os.FindProcess(os.Getpid())
-	proc.Signal(syscall.SIGINT)
+func TestServeRejectsInvalidDeploymentMode(t *testing.T) {
+	t.Setenv("DEPLOY_MODE", "standalone")
+	err := New().Serve("test-v1")
+	if err == nil || !strings.Contains(err.Error(), "DEPLOY_MODE must be embedded or cluster") {
+		t.Fatalf("invalid deployment mode = %v", err)
+	}
+}
 
-	err := <-done
-	if err != nil {
-		t.Errorf("got: %v", err)
+func TestServeRejectsInvalidJWTConfiguration(t *testing.T) {
+	auth.ResetConfig()
+	t.Cleanup(auth.ResetConfig)
+	t.Setenv("JWT_SECRET", "")
+	err := New().Serve("test-v1")
+	if err == nil || !strings.Contains(err.Error(), "invalid JWT configuration") {
+		t.Fatalf("invalid JWT configuration = %v", err)
 	}
 }
 

@@ -436,9 +436,7 @@ func TestGenerateExtendStubAutoId(t *testing.T) {
 }
 
 func TestGenerateExtendStubUsesRemoteUUIDID(t *testing.T) {
-	oldContext := globalEventCtx
-	defer func() { globalEventCtx = oldContext }()
-	globalEventCtx = &EventContext{ModelIDType: map[string]string{"Account": "UUID"}}
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{ModelIDType: map[string]string{"Account": "UUID"}}})
 	ext := &ast.ExtendDecl{
 		Name: "Account",
 		Fields: []*ast.FieldDecl{{
@@ -448,7 +446,7 @@ func TestGenerateExtendStubUsesRemoteUUIDID(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateExtendStub(&b, ext)
+	generator.generateExtendStub(&b, ext)
 	if got := b.String(); !strings.Contains(got, "uuid.UUID") || !strings.Contains(got, `db:"id"`) {
 		t.Errorf("remote UUID ID type was not preserved:\n%s", got)
 	}

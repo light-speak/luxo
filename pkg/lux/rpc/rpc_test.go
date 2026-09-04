@@ -95,6 +95,9 @@ func TestRPCContextEnvelopeForwardsVerifiedIdentity(t *testing.T) {
 		if identity != 42 {
 			return fmt.Errorf("missing forwarded identity")
 		}
+		if !req.Internal {
+			return fmt.Errorf("RPC request must be marked internal")
+		}
 		req.Buf.B = append(req.Buf.B, 0)
 		return nil
 	})

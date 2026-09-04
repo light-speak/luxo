@@ -123,6 +123,7 @@ object SelectAnalyzer {
         schema: LuxoSchema,
     ) {
         when (call.calleeExpression?.text) {
+            "value" -> followSelection(qualified, binding, schema)
             in collectionLambdaMethods -> {
                 analyzeLambda(call, binding.copy(isList = false, paginated = false), schema)
                 followSelection(qualified, binding, schema)

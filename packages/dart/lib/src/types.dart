@@ -13,6 +13,40 @@ class LuxoOptional<T> {
   const LuxoOptional.present(this.value) : isPresent = true;
 }
 
+/// A field-selected output value.
+///
+/// [Selected.unselected] means the field was not requested. For nullable
+/// fields, [Selected.value] may contain null to represent a selected null.
+class Selected<T> {
+  final bool isSelected;
+  final T? _value;
+
+  const Selected.unselected()
+      : isSelected = false,
+        _value = null;
+
+  const Selected.value(T value)
+      : isSelected = true,
+        _value = value;
+
+  T get value {
+    if (!isSelected) {
+      throw StateError('field was not selected');
+    }
+    return _value as T;
+  }
+}
+
+enum TypeUsage { input, output, inputOutput, unused }
+
+TypeUsage? _typeUsageFromJson(Object? value) => switch (value) {
+      'input' => TypeUsage.input,
+      'output' => TypeUsage.output,
+      'inputOutput' => TypeUsage.inputOutput,
+      'unused' => TypeUsage.unused,
+      _ => null,
+    };
+
 /// Paginated list response.
 class Page<T> {
   final List<T> items;
@@ -97,10 +131,12 @@ class LuxoEnum {
 
 class LuxoTypeDecl {
   final String name;
+  final TypeUsage? usage;
   final List<LuxoField> fields;
-  const LuxoTypeDecl({required this.name, required this.fields});
+  const LuxoTypeDecl({required this.name, this.usage, required this.fields});
   factory LuxoTypeDecl.fromJson(Map<String, dynamic> json) => LuxoTypeDecl(
         name: json['name'] as String,
+        usage: _typeUsageFromJson(json['usage']),
         fields: (json['fields'] as List)
             .map((e) => LuxoField.fromJson(e as Map<String, dynamic>))
             .toList(),
@@ -109,12 +145,14 @@ class LuxoTypeDecl {
 
 class LuxoModel {
   final String name;
+  final TypeUsage? usage;
   final List<LuxoField> fields;
 
-  const LuxoModel({required this.name, required this.fields});
+  const LuxoModel({required this.name, this.usage, required this.fields});
 
   factory LuxoModel.fromJson(Map<String, dynamic> json) => LuxoModel(
         name: json['name'] as String,
+        usage: _typeUsageFromJson(json['usage']),
         fields: (json['fields'] as List)
             .map((e) => LuxoField.fromJson(e as Map<String, dynamic>))
             .toList(),

@@ -65,20 +65,10 @@ func TestLuxoTypeToSchemaFieldType(t *testing.T) {
 }
 
 func TestGenerateSchemaFile_Basic(t *testing.T) {
-	// Set up field IDs via lockfile globals
-	oldFieldIDs := modelFieldIDs
-	oldAPIIDs := apiIDs
-	modelFieldIDs = map[string]map[string]int{
-		"User": {"id": 1, "name": 2, "email": 3},
-	}
-	apiIDs = map[string]int{
-		"getUser":  10,
-		"listUser": 11,
-	}
-	defer func() {
-		modelFieldIDs = oldFieldIDs
-		apiIDs = oldAPIIDs
-	}()
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+		ModelFields: map[string]map[string]int{"User": {"id": 1, "name": 2, "email": 3}},
+		APIs:        map[string]int{"getUser": 10, "listUser": 11},
+	}})
 
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -98,7 +88,7 @@ func TestGenerateSchemaFile_Basic(t *testing.T) {
 		}},
 	}
 
-	code := generateSchemaFile(result, "luxo", nil)
+	code := generator.generateSchemaFile(result, "luxo", nil)
 	if code == nil {
 		t.Fatal("should generate schema file")
 	}
@@ -136,11 +126,9 @@ func TestGenerateSchemaFileRegistersEnumsWithModule(t *testing.T) {
 }
 
 func TestGenerateSchemaFile_SkipsHiddenFields(t *testing.T) {
-	oldFieldIDs := modelFieldIDs
-	modelFieldIDs = map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"User": {"id": 1, "password": 2},
-	}
-	defer func() { modelFieldIDs = oldFieldIDs }()
+	}}})
 
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -156,7 +144,7 @@ func TestGenerateSchemaFile_SkipsHiddenFields(t *testing.T) {
 		}},
 	}
 
-	code := generateSchemaFile(result, "luxo", nil)
+	code := generator.generateSchemaFile(result, "luxo", nil)
 	src := string(code)
 
 	if strings.Contains(src, "password") {
@@ -165,11 +153,9 @@ func TestGenerateSchemaFile_SkipsHiddenFields(t *testing.T) {
 }
 
 func TestGenerateSchemaFile_IncludesComputedFields(t *testing.T) {
-	oldFieldIDs := modelFieldIDs
-	modelFieldIDs = map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"User": {"id": 1, "fullName": 2},
-	}
-	defer func() { modelFieldIDs = oldFieldIDs }()
+	}}})
 
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -185,7 +171,7 @@ func TestGenerateSchemaFile_IncludesComputedFields(t *testing.T) {
 		}},
 	}
 
-	code := generateSchemaFile(result, "luxo", nil)
+	code := generator.generateSchemaFile(result, "luxo", nil)
 	src := string(code)
 	if !strings.Contains(src, `Name: "fullName"`) || !strings.Contains(src, "Computed: true") {
 		t.Error("computed field should be included in schema")
@@ -201,11 +187,9 @@ func TestGenerateSchemaFile_Nil(t *testing.T) {
 }
 
 func TestGenerateSchemaFile_WithServiceFns(t *testing.T) {
-	oldAPIIDs := apiIDs
-	apiIDs = map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIs: map[string]int{
 		"svc:getUserScore": 50,
-	}
-	defer func() { apiIDs = oldAPIIDs }()
+	}}})
 
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -222,7 +206,7 @@ func TestGenerateSchemaFile_WithServiceFns(t *testing.T) {
 		}},
 	}
 
-	code := generateSchemaFile(result, "luxo", nil)
+	code := generator.generateSchemaFile(result, "luxo", nil)
 	if code == nil {
 		t.Fatal("should generate schema for service fns")
 	}
@@ -234,55 +218,41 @@ func TestGenerateSchemaFile_WithServiceFns(t *testing.T) {
 }
 
 func TestGetAPIParamID_NilMap(t *testing.T) {
-	old := apiParamIDs
-	apiParamIDs = nil
-	defer func() { apiParamIDs = old }()
-
-	id := getAPIParamID("getUser", "id")
+	id := defaultGenerator().apiParamID("getUser", "id")
 	if id != 0 {
 		t.Errorf("nil map should return 0, got %d", id)
 	}
 }
 
 func TestGetAPIParamID_MissingAPI(t *testing.T) {
-	old := apiParamIDs
-	apiParamIDs = map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIParams: map[string]map[string]int{
 		"getUser": {"id": 1},
-	}
-	defer func() { apiParamIDs = old }()
+	}}})
 
-	id := getAPIParamID("nonexistent", "id")
+	id := generator.apiParamID("nonexistent", "id")
 	if id != 0 {
 		t.Errorf("missing API should return 0, got %d", id)
 	}
 }
 
 func TestGetAPIParamID_Found(t *testing.T) {
-	old := apiParamIDs
-	apiParamIDs = map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIParams: map[string]map[string]int{
 		"getUser": {"id": 1, "name": 2},
-	}
-	defer func() { apiParamIDs = old }()
+	}}})
 
-	if id := getAPIParamID("getUser", "id"); id != 1 {
+	if id := generator.apiParamID("getUser", "id"); id != 1 {
 		t.Errorf("got %d, want 1", id)
 	}
-	if id := getAPIParamID("getUser", "name"); id != 2 {
+	if id := generator.apiParamID("getUser", "name"); id != 2 {
 		t.Errorf("got %d, want 2", id)
 	}
 }
 
 func TestWriteAPIRegistrationSchema(t *testing.T) {
-	oldAPIIDs := apiIDs
-	oldParamIDs := apiParamIDs
-	apiIDs = map[string]int{"createUser": 20}
-	apiParamIDs = map[string]map[string]int{
-		"createUser": {"name": 1, "email": 2},
-	}
-	defer func() {
-		apiIDs = oldAPIIDs
-		apiParamIDs = oldParamIDs
-	}()
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+		APIs:      map[string]int{"createUser": 20},
+		APIParams: map[string]map[string]int{"createUser": {"name": 1, "email": 2}},
+	}})
 
 	var b strings.Builder
 	params := []*ast.ParamDecl{
@@ -292,7 +262,7 @@ func TestWriteAPIRegistrationSchema(t *testing.T) {
 	}
 	retType := &ast.TypeRef{Name: "User"}
 
-	writeAPIRegistrationSchema(&b, "createUser", "user", params, retType, false, false, nil, nil)
+	generator.writeAPIRegistrationSchema(&b, "createUser", "user", params, retType, false, false, nil, nil)
 	src := b.String()
 
 	checks := []string{
@@ -314,34 +284,25 @@ func TestWriteAPIRegistrationSchema(t *testing.T) {
 }
 
 func TestWriteAPIRegistrationSchemaListParam(t *testing.T) {
-	oldAPIIDs := apiIDs
-	oldParamIDs := apiParamIDs
-	apiIDs = map[string]int{"search": 21}
-	apiParamIDs = map[string]map[string]int{"search": {"tags": 1}}
-	defer func() {
-		apiIDs = oldAPIIDs
-		apiParamIDs = oldParamIDs
-	}()
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+		APIs:      map[string]int{"search": 21},
+		APIParams: map[string]map[string]int{"search": {"tags": 1}},
+	}})
 
 	var b strings.Builder
 	params := []*ast.ParamDecl{{Name: "tags", Type: &ast.TypeRef{Name: "String", IsList: true}}}
-	writeAPIRegistrationSchema(&b, "search", "search", params, nil, false, false, nil, nil)
+	generator.writeAPIRegistrationSchema(&b, "search", "search", params, nil, false, false, nil, nil)
 	if src := b.String(); !strings.Contains(src, `Name: "tags", Type: schema.FieldString, TypeName: "String", IsList: true`) {
 		t.Fatalf("list parameter metadata missing:\n%s", src)
 	}
 }
 
 func TestBuildSchemaJSON_PreservesOptionalParams(t *testing.T) {
-	oldAPIIDs := apiIDs
-	oldParamIDs := apiParamIDs
-	apiIDs = map[string]int{"createProject": 10}
-	apiParamIDs = map[string]map[string]int{
-		"createProject": {"name": 1, "description": 2, "environment": 3},
-	}
-	defer func() {
-		apiIDs = oldAPIIDs
-		apiParamIDs = oldParamIDs
-	}()
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+		APIs: map[string]int{"createProject": 10},
+		APIParams: map[string]map[string]int{
+			"createProject": {"name": 1, "description": 2, "environment": 3},
+		}}})
 
 	result := &semantic.Result{Files: []*ast.File{{
 		Name: "origin/project.luxo",
@@ -356,7 +317,7 @@ func TestBuildSchemaJSON_PreservesOptionalParams(t *testing.T) {
 		}},
 	}}}
 
-	data, err := BuildSchemaJSON(result, nil)
+	data, err := generator.BuildSchemaJSON(result, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,14 +331,10 @@ func TestBuildSchemaJSON_PreservesOptionalParams(t *testing.T) {
 }
 
 func TestBuildSchemaJSONUsesJSONWireTypeForStructuredParams(t *testing.T) {
-	oldAPIIDs := apiIDs
-	oldParamIDs := apiParamIDs
-	apiIDs = map[string]int{"createProject": 10}
-	apiParamIDs = map[string]map[string]int{"createProject": {"input": 1}}
-	defer func() {
-		apiIDs = oldAPIIDs
-		apiParamIDs = oldParamIDs
-	}()
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+		APIs:      map[string]int{"createProject": 10},
+		APIParams: map[string]map[string]int{"createProject": {"input": 1}},
+	}})
 
 	result := &semantic.Result{Files: []*ast.File{{
 		Name:  "origin/project.luxo",
@@ -390,7 +347,7 @@ func TestBuildSchemaJSONUsesJSONWireTypeForStructuredParams(t *testing.T) {
 		}},
 	}}}
 
-	data, err := BuildSchemaJSON(result, nil)
+	data, err := generator.BuildSchemaJSON(result, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,7 +369,7 @@ func TestInferFederationForeignKeyUsesExplicitRemoteField(t *testing.T) {
 	field := &ast.FieldDecl{Directives: []*ast.Directive{{
 		Name: "by", Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "tenantId"}}},
 	}}}
-	if got := inferFederationForeignKey(&ast.ModelDecl{Name: "User"}, field); got != "tenantId" {
+	if got := defaultGenerator().inferFederationForeignKey(&ast.ModelDecl{Name: "User"}, field); got != "tenantId" {
 		t.Fatalf("federation foreign key = %q", got)
 	}
 }
@@ -425,28 +382,21 @@ func TestBuildSchemaJSONSkipsInvalidExtensionField(t *testing.T) {
 			Fields: []*ast.FieldDecl{{Name: "invalid"}},
 		}},
 	}}}
-	if _, err := BuildSchemaJSON(result, nil); err != nil {
+	if _, err := defaultGenerator().BuildSchemaJSON(result, nil); err != nil {
 		t.Fatalf("BuildSchemaJSON() error = %v", err)
 	}
 }
 
 func TestBuildSchemaJSONIncludesCompleteCRUDParams(t *testing.T) {
-	oldAPIIDs := apiIDs
-	oldParamIDs := apiParamIDs
-	apiIDs = map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIs: map[string]int{
 		"getProject": 1, "listProjects": 2, "createProject": 3,
 		"updateProject": 4, "deleteProject": 5, "deleteProjects": 6,
-	}
-	apiParamIDs = map[string]map[string]int{
+	}, APIParams: map[string]map[string]int{
 		"getProject": {"id": 1}, "listProjects": {"page": 1, "pageSize": 2},
 		"createProject": {"name": 1, "description": 2},
 		"updateProject": {"id": 1, "name": 2, "description": 3},
 		"deleteProject": {"id": 1}, "deleteProjects": {"ids": 1},
-	}
-	defer func() {
-		apiIDs = oldAPIIDs
-		apiParamIDs = oldParamIDs
-	}()
+	}}})
 
 	result := &semantic.Result{Files: []*ast.File{{
 		Name: "origin/project.luxo",
@@ -460,7 +410,7 @@ func TestBuildSchemaJSONIncludesCompleteCRUDParams(t *testing.T) {
 			},
 		}},
 	}}}
-	data, err := BuildSchemaJSON(result, nil)
+	data, err := generator.BuildSchemaJSON(result, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -486,24 +436,11 @@ func TestBuildSchemaJSONIncludesCompleteCRUDParams(t *testing.T) {
 }
 
 func TestBuildSchemaJSON_Full(t *testing.T) {
-	oldFieldIDs := modelFieldIDs
-	oldAPIIDs := apiIDs
-	oldParamIDs := apiParamIDs
-	modelFieldIDs = map[string]map[string]int{
-		"User": {"id": 1, "name": 2},
-	}
-	apiIDs = map[string]int{
-		"getUser":  10,
-		"listUser": 11,
-	}
-	apiParamIDs = map[string]map[string]int{
-		"getUser": {"id": 1},
-	}
-	defer func() {
-		modelFieldIDs = oldFieldIDs
-		apiIDs = oldAPIIDs
-		apiParamIDs = oldParamIDs
-	}()
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+		ModelFields: map[string]map[string]int{"User": {"id": 1, "name": 2}},
+		APIs:        map[string]int{"getUser": 10, "listUser": 11},
+		APIParams:   map[string]map[string]int{"getUser": {"id": 1}},
+	}})
 
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -525,7 +462,7 @@ func TestBuildSchemaJSON_Full(t *testing.T) {
 		}},
 	}
 
-	data, err := BuildSchemaJSON(result, nil)
+	data, err := generator.BuildSchemaJSON(result, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -542,11 +479,9 @@ func TestBuildSchemaJSON_Full(t *testing.T) {
 }
 
 func TestBuildSchemaJSON_SkipsHiddenAndRelation(t *testing.T) {
-	oldFieldIDs := modelFieldIDs
-	modelFieldIDs = map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"User": {"id": 1, "password": 2, "posts": 3},
-	}
-	defer func() { modelFieldIDs = oldFieldIDs }()
+	}}})
 
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -563,7 +498,7 @@ func TestBuildSchemaJSON_SkipsHiddenAndRelation(t *testing.T) {
 		}},
 	}
 
-	data, err := BuildSchemaJSON(result, nil)
+	data, err := generator.BuildSchemaJSON(result, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -581,12 +516,10 @@ func TestBuildSchemaJSON_SkipsHiddenAndRelation(t *testing.T) {
 }
 
 func TestBuildSchemaJSON_WithExtendStubs(t *testing.T) {
-	oldFieldIDs := modelFieldIDs
-	modelFieldIDs = map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"User": {"id": 1, "phone": 2},
 		"Post": {"id": 1},
-	}
-	defer func() { modelFieldIDs = oldFieldIDs }()
+	}}})
 
 	result := &semantic.Result{
 		Files: []*ast.File{
@@ -610,7 +543,7 @@ func TestBuildSchemaJSON_WithExtendStubs(t *testing.T) {
 		},
 	}
 
-	data, err := BuildSchemaJSON(result, nil)
+	data, err := generator.BuildSchemaJSON(result, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -622,9 +555,7 @@ func TestBuildSchemaJSON_WithExtendStubs(t *testing.T) {
 }
 
 func TestBuildSchemaJSON_WithAPIPaginated(t *testing.T) {
-	oldAPIIDs := apiIDs
-	apiIDs = map[string]int{"search": 1}
-	defer func() { apiIDs = oldAPIIDs }()
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIs: map[string]int{"search": 1}}})
 
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -637,7 +568,7 @@ func TestBuildSchemaJSON_WithAPIPaginated(t *testing.T) {
 		}},
 	}
 
-	data, _ := BuildSchemaJSON(result, nil)
+	data, _ := generator.BuildSchemaJSON(result, nil)
 	s := string(data)
 	if !strings.Contains(s, `"paginated":true`) {
 		t.Errorf("should mark API as paginated: %s", s)
@@ -645,9 +576,7 @@ func TestBuildSchemaJSON_WithAPIPaginated(t *testing.T) {
 }
 
 func TestBuildSchemaJSONMarksDeclaredPrimaryKey(t *testing.T) {
-	oldFieldIDs := modelFieldIDs
-	modelFieldIDs = map[string]map[string]int{"Product": {"sku": 7, "name": 8}}
-	defer func() { modelFieldIDs = oldFieldIDs }()
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{"Product": {"sku": 7, "name": 8}}}})
 
 	result := &semantic.Result{Files: []*ast.File{{
 		Name: "origin/product.luxo",
@@ -660,7 +589,7 @@ func TestBuildSchemaJSONMarksDeclaredPrimaryKey(t *testing.T) {
 		}},
 	}}}
 
-	data, err := BuildSchemaJSON(result, nil)
+	data, err := generator.BuildSchemaJSON(result, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -670,12 +599,10 @@ func TestBuildSchemaJSONMarksDeclaredPrimaryKey(t *testing.T) {
 }
 
 func TestBuildSchemaJSONMergesExtensionAndKeepsProjectionLocal(t *testing.T) {
-	oldFieldIDs := modelFieldIDs
-	modelFieldIDs = map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"User": {"id": 1, "name": 2, "posts": 10},
 		"Post": {"id": 1, "userId": 2},
-	}
-	defer func() { modelFieldIDs = oldFieldIDs }()
+	}}})
 
 	user := &ast.ModelDecl{Name: "User", Fields: []*ast.FieldDecl{
 		{Name: "id", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}}},
@@ -696,7 +623,7 @@ func TestBuildSchemaJSONMergesExtensionAndKeepsProjectionLocal(t *testing.T) {
 		}}},
 	}}
 
-	data, err := BuildSchemaJSON(result, nil)
+	data, err := generator.BuildSchemaJSON(result, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -714,12 +641,10 @@ func TestBuildSchemaJSONMergesExtensionAndKeepsProjectionLocal(t *testing.T) {
 }
 
 func TestWriteAPIRegistrationSchema_Paginated(t *testing.T) {
-	oldAPIIDs := apiIDs
-	apiIDs = map[string]int{"listUser": 30}
-	defer func() { apiIDs = oldAPIIDs }()
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIs: map[string]int{"listUser": 30}}})
 
 	var b strings.Builder
-	writeAPIRegistrationSchema(&b, "listUser", "user", nil, &ast.TypeRef{Name: "User", IsList: true}, true, false, nil, nil)
+	generator.writeAPIRegistrationSchema(&b, "listUser", "user", nil, &ast.TypeRef{Name: "User", IsList: true}, true, false, nil, nil)
 	src := b.String()
 
 	if !strings.Contains(src, "Paginated: true") {
@@ -731,12 +656,10 @@ func TestWriteAPIRegistrationSchema_Paginated(t *testing.T) {
 }
 
 func TestBuildSchemaJSON_WithEnumsAndTypes(t *testing.T) {
-	oldFieldIDs := modelFieldIDs
-	modelFieldIDs = map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"User":        {"id": 1, "name": 2, "role": 3},
 		"AuthPayload": {"member": 1, "token": 2},
-	}
-	defer func() { modelFieldIDs = oldFieldIDs }()
+	}}})
 
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -764,7 +687,7 @@ func TestBuildSchemaJSON_WithEnumsAndTypes(t *testing.T) {
 	}
 
 	enums := map[string]bool{"MemberRole": true}
-	data, err := BuildSchemaJSON(result, enums)
+	data, err := generator.BuildSchemaJSON(result, enums)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -824,11 +747,9 @@ func TestBuildSchemaTypes_NilTypeSkipped(t *testing.T) {
 }
 
 func TestBuildSchemaModels_IsList(t *testing.T) {
-	oldFieldIDs := modelFieldIDs
-	modelFieldIDs = map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"Post": {"id": 1, "tags": 2},
-	}
-	defer func() { modelFieldIDs = oldFieldIDs }()
+	}}})
 
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -843,7 +764,7 @@ func TestBuildSchemaModels_IsList(t *testing.T) {
 			}},
 		}},
 	}
-	data, err := BuildSchemaJSON(result, nil)
+	data, err := generator.BuildSchemaJSON(result, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -853,11 +774,9 @@ func TestBuildSchemaModels_IsList(t *testing.T) {
 }
 
 func TestBuildSchemaModels_IncludesComputed(t *testing.T) {
-	oldFieldIDs := modelFieldIDs
-	modelFieldIDs = map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"User": {"id": 1, "name": 2, "fullName": 3},
-	}
-	defer func() { modelFieldIDs = oldFieldIDs }()
+	}}})
 
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -873,7 +792,7 @@ func TestBuildSchemaModels_IncludesComputed(t *testing.T) {
 			}},
 		}},
 	}
-	data, err := BuildSchemaJSON(result, nil)
+	data, err := generator.BuildSchemaJSON(result, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -883,11 +802,9 @@ func TestBuildSchemaModels_IncludesComputed(t *testing.T) {
 }
 
 func TestWriteTypeRegistration(t *testing.T) {
-	oldFieldIDs := modelFieldIDs
-	modelFieldIDs = map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"AuthPayload": {"token": 1, "user": 2},
-	}
-	defer func() { modelFieldIDs = oldFieldIDs }()
+	}}})
 
 	td := &ast.TypeDecl{
 		Name: "AuthPayload",
@@ -899,7 +816,7 @@ func TestWriteTypeRegistration(t *testing.T) {
 	enums := map[string]bool{}
 
 	var b strings.Builder
-	writeTypeRegistration(&b, td, "test", enums)
+	generator.writeTypeRegistration(&b, td, "test", enums)
 	src := b.String()
 
 	checks := []string{
@@ -918,11 +835,9 @@ func TestWriteTypeRegistration(t *testing.T) {
 }
 
 func TestWriteTypeRegistrationRelationFieldModel(t *testing.T) {
-	oldFieldIDs := modelFieldIDs
-	modelFieldIDs = map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"MetricTimeSeries": {"apiName": 1, "points": 2},
-	}
-	defer func() { modelFieldIDs = oldFieldIDs }()
+	}}})
 
 	td := &ast.TypeDecl{
 		Name: "MetricTimeSeries",
@@ -933,7 +848,7 @@ func TestWriteTypeRegistrationRelationFieldModel(t *testing.T) {
 	}
 
 	var b strings.Builder
-	writeTypeRegistration(&b, td, "test", map[string]bool{})
+	generator.writeTypeRegistration(&b, td, "test", map[string]bool{})
 	src := b.String()
 
 	// Nested type/model references must register as FieldModel — the columnar
@@ -948,17 +863,10 @@ func TestWriteTypeRegistrationRelationFieldModel(t *testing.T) {
 }
 
 func TestGenerateSchemaFile_WithTypes(t *testing.T) {
-	oldFieldIDs := modelFieldIDs
-	oldAPIIDs := apiIDs
-	modelFieldIDs = map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"User":        {"id": 1},
 		"AuthPayload": {"token": 1, "expiresAt": 2},
-	}
-	apiIDs = map[string]int{}
-	defer func() {
-		modelFieldIDs = oldFieldIDs
-		apiIDs = oldAPIIDs
-	}()
+	}}})
 
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -980,7 +888,7 @@ func TestGenerateSchemaFile_WithTypes(t *testing.T) {
 		}},
 	}
 
-	code := generateSchemaFile(result, "luxo", nil)
+	code := generator.generateSchemaFile(result, "luxo", nil)
 	if code == nil {
 		t.Fatal("should generate schema file with types")
 	}
@@ -999,18 +907,58 @@ func TestGenerateSchemaFile_WithTypes(t *testing.T) {
 			t.Errorf("missing %q in schema:\n%s", check, src)
 		}
 	}
+	if !strings.Contains(src, "s.InferTypeUsage()") {
+		t.Errorf("generated schema must finalize type usage:\n%s", src)
+	}
+}
+
+func TestBuildSchemaJSONInfersTypeUsage(t *testing.T) {
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+		ModelFields: map[string]map[string]int{
+			"CreateInput": {"name": 1},
+			"Payload":     {"name": 1},
+		},
+		APIs: map[string]int{"create": 1},
+		APIParams: map[string]map[string]int{
+			"create": {"input": 1},
+		},
+	}})
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "api.luxo",
+		Types: []*ast.TypeDecl{
+			{Name: "CreateInput", Fields: []*ast.FieldDecl{{Name: "name", Type: &ast.TypeRef{Name: "String"}}}},
+			{Name: "Payload", Fields: []*ast.FieldDecl{{Name: "name", Type: &ast.TypeRef{Name: "String"}}}},
+		},
+		APIs: []*ast.ApiDecl{{
+			Name:       "create",
+			Params:     []*ast.ParamDecl{{Name: "input", Type: &ast.TypeRef{Name: "CreateInput"}}},
+			ReturnType: &ast.TypeRef{Name: "Payload"},
+		}},
+	}}}
+
+	data, err := generator.BuildSchemaJSON(result, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded schema.Schema
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Types["CreateInput"].Usage != schema.TypeUsageInput {
+		t.Fatalf("CreateInput usage = %q", decoded.Types["CreateInput"].Usage)
+	}
+	if decoded.Types["Payload"].Usage != schema.TypeUsageOutput {
+		t.Fatalf("Payload usage = %q", decoded.Types["Payload"].Usage)
+	}
 }
 
 // --- Federation tests ---
 
 func TestBuildSchemaModels_ExtendFieldModule(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
-
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"User": {"id": 1, "name": 2, "posts": 10},
 		"Post": {"id": 1, "title": 2},
-	})
+	}}})
 
 	result := &semantic.Result{
 		Files: []*ast.File{
@@ -1044,7 +992,7 @@ func TestBuildSchemaModels_ExtendFieldModule(t *testing.T) {
 	}
 
 	s := schema.New()
-	buildSchemaModels(s, result, nil)
+	generator.buildSchemaModels(s, result, nil)
 
 	user := s.Models["User"]
 	if user == nil {
@@ -1083,12 +1031,9 @@ func TestBuildSchemaModels_ExtendFieldModule(t *testing.T) {
 }
 
 func TestWriteModelRegistration_ExtendRelation(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
-
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"User": {"id": 1, "name": 2, "posts": 10},
-	})
+	}}})
 
 	m := &ast.ModelDecl{
 		Name: "User",
@@ -1104,7 +1049,7 @@ func TestWriteModelRegistration_ExtendRelation(t *testing.T) {
 	}
 
 	var b strings.Builder
-	writeModelRegistration(&b, m, "base", nil, extendModules)
+	generator.writeModelRegistration(&b, m, "base", nil, extendModules)
 	code := b.String()
 
 	// Should include relation field with Module and ForeignKey
@@ -1123,13 +1068,10 @@ func TestWriteModelRegistration_ExtendRelation(t *testing.T) {
 }
 
 func TestBuildSchemaModels_SameModuleRelationNoModule(t *testing.T) {
-	old := modelFieldIDs
-	defer func() { modelFieldIDs = old }()
-
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"User": {"id": 1, "name": 2, "posts": 10},
 		"Post": {"id": 1, "title": 2},
-	})
+	}}})
 
 	// User and Post in same file — relation is NOT cross-module
 	result := &semantic.Result{
@@ -1155,7 +1097,7 @@ func TestBuildSchemaModels_SameModuleRelationNoModule(t *testing.T) {
 	}
 
 	s := schema.New()
-	buildSchemaModels(s, result, nil)
+	generator.buildSchemaModels(s, result, nil)
 
 	user := s.Models["User"]
 	for i := range user.Fields {
@@ -1225,19 +1167,14 @@ func TestInferForeignKey_BelongsTo(t *testing.T) {
 }
 
 func TestGenerateSchemaFile_WithExtendResolve(t *testing.T) {
-	old := modelFieldIDs
-	oldAPIs := apiIDs
-	defer func() { modelFieldIDs = old; apiIDs = oldAPIs }()
-
-	SetModelFieldIDs(map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"User": {"id": 1, "name": 2, "posts": 10},
 		"Post": {"id": 1, "title": 2},
-	})
-	SetAPIIDs(map[string]int{
+	}, APIs: map[string]int{
 		"getUser":                 1,
 		"svc:batchLoad:Post":      50,
 		"svc:resolve:Post:userId": 51,
-	})
+	}}})
 
 	result := &semantic.Result{
 		Files: []*ast.File{
@@ -1272,7 +1209,7 @@ func TestGenerateSchemaFile_WithExtendResolve(t *testing.T) {
 		},
 	}
 
-	src := generateSchemaFile(result, "app", nil)
+	src := generator.generateSchemaFile(result, "app", nil)
 	code := string(src)
 
 	// Should register svc:batchLoad and svc:resolve APIs
@@ -1285,15 +1222,7 @@ func TestGenerateSchemaFile_WithExtendResolve(t *testing.T) {
 }
 
 func TestGenerateSchemaFileUsesExtendedModelPrimaryKey(t *testing.T) {
-	oldContext := globalEventCtx
-	oldFields := modelFieldIDs
-	oldAPIs := apiIDs
-	defer func() {
-		globalEventCtx = oldContext
-		modelFieldIDs = oldFields
-		apiIDs = oldAPIs
-	}()
-	globalEventCtx = &EventContext{
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		ModelModule:  map[string]string{"Product": "product", "Review": "review"},
 		ModelIDField: map[string]string{"Product": "sku", "Review": "id"},
 		ModelIDType:  map[string]string{"Product": "String", "Review": "Int"},
@@ -1301,12 +1230,10 @@ func TestGenerateSchemaFileUsesExtendedModelPrimaryKey(t *testing.T) {
 			"Product": {"sku": true, "name": true},
 			"Review":  {"id": true, "productSku": true},
 		},
-	}
-	modelFieldIDs = map[string]map[string]int{
+	}, IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"Product": {"sku": 1, "reviews": 10},
 		"Review":  {"id": 1, "productSku": 2},
-	}
-	apiIDs = map[string]int{"svc:resolve:Review:productSku": 51}
+	}, APIs: map[string]int{"svc:resolve:Review:productSku": 51}}})
 	result := &semantic.Result{Files: []*ast.File{{
 		Name: "origin/review.luxo",
 		Models: []*ast.ModelDecl{{
@@ -1322,7 +1249,7 @@ func TestGenerateSchemaFileUsesExtendedModelPrimaryKey(t *testing.T) {
 		}},
 	}}}
 
-	code := string(generateSchemaFile(result, "app", nil))
+	code := string(generator.generateSchemaFile(result, "app", nil))
 	for _, want := range []string{
 		`ForeignKey: "productSku"`,
 		`Name: "svc:resolve:Review:productSku"`,
@@ -1335,23 +1262,16 @@ func TestGenerateSchemaFileUsesExtendedModelPrimaryKey(t *testing.T) {
 }
 
 func TestGenerateSchemaFileWithRemoteNamedLoad(t *testing.T) {
-	oldContext := globalEventCtx
-	oldAPIs := apiIDs
-	oldParams := apiParamIDs
-	defer func() {
-		globalEventCtx = oldContext
-		apiIDs = oldAPIs
-		apiParamIDs = oldParams
-	}()
-	globalEventCtx = &EventContext{remoteLoadCalls: map[string][]loadCallInfo{
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{remoteLoadCalls: map[string][]loadCallInfo{
 		"user": {{
 			modelName:    "User",
 			argNames:     []string{"email"},
 			argTypeNames: []string{"String"},
 		}},
-	}}
-	apiIDs = map[string]int{"svc:load:User:email": 73}
-	apiParamIDs = map[string]map[string]int{"svc:load:User:email": {"email": 6}}
+	}}, IDs: StableIDs{
+		APIs:      map[string]int{"svc:load:User:email": 73},
+		APIParams: map[string]map[string]int{"svc:load:User:email": {"email": 6}},
+	}})
 	result := &semantic.Result{Files: []*ast.File{{
 		Name: "origin/user.luxo",
 		Models: []*ast.ModelDecl{{
@@ -1363,7 +1283,7 @@ func TestGenerateSchemaFileWithRemoteNamedLoad(t *testing.T) {
 		}},
 	}}}
 
-	code := string(generateSchemaFile(result, "luxo", nil))
+	code := string(generator.generateSchemaFile(result, "luxo", nil))
 	for _, check := range []string{
 		`ID: 73, Name: "svc:load:User:email", Module: "user"`,
 		`ID: 6, Name: "email", Type: schema.FieldString, TypeName: "String", IsList: true`,

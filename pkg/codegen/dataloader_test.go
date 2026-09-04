@@ -304,12 +304,10 @@ func TestAnalyzeRelationsSkipsComputed(t *testing.T) {
 }
 
 func TestAnalyzeRelationsUsesTargetPrimaryKeyName(t *testing.T) {
-	oldContext := globalEventCtx
-	defer func() { globalEventCtx = oldContext }()
-	globalEventCtx = &EventContext{
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		ModelIDType:  map[string]string{"Product": "String"},
 		ModelIDField: map[string]string{"Product": "sku"},
-	}
+	}})
 
 	review := &ast.ModelDecl{
 		Name: "Review",
@@ -318,7 +316,7 @@ func TestAnalyzeRelationsUsesTargetPrimaryKeyName(t *testing.T) {
 			{Name: "product", Type: &ast.TypeRef{Name: "Product"}},
 		},
 	}
-	relations := analyzeRelations(review, nil)
+	relations := generator.analyzeRelations(review, nil)
 	if len(relations) != 1 {
 		t.Fatalf("got %d relations, want 1", len(relations))
 	}
@@ -746,17 +744,13 @@ func TestGenerateDataLoaderDefaultLoadersDedupSeenMap(t *testing.T) {
 // --- Extend DataLoader load-by-PK ---
 
 func TestGenerateDataLoaderExtendByPK(t *testing.T) {
-	oldContext := globalEventCtx
-	oldAPIs := apiIDs
-	oldFields := modelFieldIDs
-	defer func() {
-		globalEventCtx = oldContext
-		apiIDs = oldAPIs
-		modelFieldIDs = oldFields
-	}()
-	globalEventCtx = &EventContext{ModelModule: map[string]string{"User": "user"}}
-	apiIDs = map[string]int{"svc:batchLoad:User": 42}
-	modelFieldIDs = map[string]map[string]int{"User": {"id": 1, "phone": 2}}
+	generator := mustNewGenerator(t, GeneratorConfig{
+		Events: &EventContext{ModelModule: map[string]string{"User": "user"}},
+		IDs: StableIDs{
+			APIs:        map[string]int{"svc:batchLoad:User": 42},
+			ModelFields: map[string]map[string]int{"User": {"id": 1, "phone": 2}},
+		},
+	})
 
 	result := &semantic.Result{
 		Files: []*ast.File{
@@ -791,7 +785,7 @@ func TestGenerateDataLoaderExtendByPK(t *testing.T) {
 		},
 	}
 
-	src := generateDataLoaderFile(result, "post_luxo", map[string]bool{}, nil, DriverPG)
+	src := generator.generateDataLoaderFile(result, "post_luxo", map[string]bool{}, nil)
 	if src == nil {
 		t.Fatal("expected dataloader file")
 	}
@@ -839,20 +833,13 @@ func TestGenerateDataLoaderExtendByPK(t *testing.T) {
 }
 
 func TestGenerateDataLoaderExtendByUUID(t *testing.T) {
-	oldContext := globalEventCtx
-	oldAPIs := apiIDs
-	oldFields := modelFieldIDs
-	defer func() {
-		globalEventCtx = oldContext
-		apiIDs = oldAPIs
-		modelFieldIDs = oldFields
-	}()
-	globalEventCtx = &EventContext{
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		ModelModule: map[string]string{"Account": "identity"},
 		ModelIDType: map[string]string{"Account": "UUID"},
-	}
-	apiIDs = map[string]int{"svc:batchLoad:Account": 44}
-	modelFieldIDs = map[string]map[string]int{"Account": {"id": 1, "name": 2}}
+	}, IDs: StableIDs{
+		APIs:        map[string]int{"svc:batchLoad:Account": 44},
+		ModelFields: map[string]map[string]int{"Account": {"id": 1, "name": 2}},
+	}})
 
 	result := &semantic.Result{Files: []*ast.File{{
 		Name: "origin/order.luxo",
@@ -864,7 +851,7 @@ func TestGenerateDataLoaderExtendByUUID(t *testing.T) {
 			}},
 		}},
 	}}}
-	code := string(generateDataLoaderFile(result, "order_luxo", nil, nil, DriverPG))
+	code := string(generator.generateDataLoaderFile(result, "order_luxo", nil, nil))
 
 	checks := []string{
 		`"github.com/google/uuid"`,
@@ -951,20 +938,14 @@ func TestGenerateDataLoaderFKLoad(t *testing.T) {
 }
 
 func TestGenerateDataLoaderRemoteNamedLoad(t *testing.T) {
-	oldContext := globalEventCtx
-	oldAPIs := apiIDs
-	oldParams := apiParamIDs
-	oldFields := modelFieldIDs
-	defer func() {
-		globalEventCtx = oldContext
-		apiIDs = oldAPIs
-		apiParamIDs = oldParams
-		modelFieldIDs = oldFields
-	}()
-	globalEventCtx = &EventContext{ModelModule: map[string]string{"User": "user"}}
-	apiIDs = map[string]int{"svc:load:User:email": 71}
-	apiParamIDs = map[string]map[string]int{"svc:load:User:email": {"email": 1}}
-	modelFieldIDs = map[string]map[string]int{"User": {"id": 1, "email": 2, "name": 3}}
+	generator := mustNewGenerator(t, GeneratorConfig{
+		Events: &EventContext{ModelModule: map[string]string{"User": "user"}},
+		IDs: StableIDs{
+			APIs:        map[string]int{"svc:load:User:email": 71},
+			APIParams:   map[string]map[string]int{"svc:load:User:email": {"email": 1}},
+			ModelFields: map[string]map[string]int{"User": {"id": 1, "email": 2, "name": 3}},
+		},
+	})
 
 	result := &semantic.Result{Files: []*ast.File{{
 		Name: "origin/post.luxo",
@@ -984,7 +965,7 @@ func TestGenerateDataLoaderRemoteNamedLoad(t *testing.T) {
 		}},
 	}}}
 
-	code := string(generateDataLoaderFile(result, "post_luxo", nil, nil, DriverPG))
+	code := string(generator.generateDataLoaderFile(result, "post_luxo", nil, nil))
 	if _, err := format.Source([]byte(code)); err != nil {
 		t.Fatalf("remote named loader generated invalid Go: %v\n%s", err, code)
 	}
@@ -1008,22 +989,14 @@ func TestGenerateDataLoaderRemoteNamedLoad(t *testing.T) {
 }
 
 func TestGenerateRemoteCompositeNamedLoad(t *testing.T) {
-	oldContext := globalEventCtx
-	oldAPIs := apiIDs
-	oldParams := apiParamIDs
-	oldFields := modelFieldIDs
-	defer func() {
-		globalEventCtx = oldContext
-		apiIDs = oldAPIs
-		apiParamIDs = oldParams
-		modelFieldIDs = oldFields
-	}()
-	globalEventCtx = &EventContext{ModelModule: map[string]string{"Post": "post", "User": "user"}}
-	apiIDs = map[string]int{"svc:load:Post:tenantId:slug": 72}
-	apiParamIDs = map[string]map[string]int{
-		"svc:load:Post:tenantId:slug": {"tenantId": 1, "slug": 2},
-	}
-	modelFieldIDs = map[string]map[string]int{"Post": {"id": 1, "title": 2, "secret": 3}}
+	generator := mustNewGenerator(t, GeneratorConfig{
+		Events: &EventContext{ModelModule: map[string]string{"Post": "post", "User": "user"}},
+		IDs: StableIDs{
+			APIs:        map[string]int{"svc:load:Post:tenantId:slug": 72},
+			APIParams:   map[string]map[string]int{"svc:load:Post:tenantId:slug": {"tenantId": 1, "slug": 2}},
+			ModelFields: map[string]map[string]int{"Post": {"id": 1, "title": 2, "secret": 3}},
+		},
+	})
 	call := loadCallInfo{
 		modelName:    "Post",
 		sourceModule: "feed",
@@ -1032,7 +1005,7 @@ func TestGenerateRemoteCompositeNamedLoad(t *testing.T) {
 		argTypeNames: []string{"Int", "String"},
 	}
 	var b strings.Builder
-	generateRemoteNamedLoadBatchFunc(&b, call, []string{"id", "title"})
+	generator.generateRemoteNamedLoadBatchFunc(&b, call, []string{"id", "title"})
 	out := b.String()
 	for _, want := range []string{
 		"keys []PostByTenantIdAndSlugKey",
@@ -1067,9 +1040,7 @@ func TestGenerateRemoteArrayEncodingUUID(t *testing.T) {
 }
 
 func TestGenerateRemoteLoadersKeepsLocalNamedLoadsLocal(t *testing.T) {
-	oldContext := globalEventCtx
-	defer func() { globalEventCtx = oldContext }()
-	globalEventCtx = &EventContext{ModelModule: map[string]string{"Post": "post"}}
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{ModelModule: map[string]string{"Post": "post"}}})
 	call := loadCallInfo{
 		modelName:    "Post",
 		sourceModule: "post",
@@ -1079,7 +1050,7 @@ func TestGenerateRemoteLoadersKeepsLocalNamedLoadsLocal(t *testing.T) {
 	}
 	var b strings.Builder
 	result := &semantic.Result{Files: []*ast.File{{Extends: []*ast.ExtendDecl{{Name: "User"}}}}}
-	generateRemoteLoaders(&b, result, nil, nil, []string{"User"}, []loadCallInfo{call})
+	generator.generateRemoteLoaders(&b, result, nil, nil, []string{"User"}, []loadCallInfo{call})
 	if out := b.String(); !strings.Contains(out, `lux.NewStringField("slug").In(keys...)`) {
 		t.Fatalf("local named load did not use the database batch function:\n%s", out)
 	}
@@ -1090,7 +1061,7 @@ func TestExternalModelFieldNamesSkipsOtherExtensions(t *testing.T) {
 		{Name: "Account", Fields: []*ast.FieldDecl{{Name: "name", Type: &ast.TypeRef{Name: "String"}}}},
 		{Name: "User", Fields: []*ast.FieldDecl{{Name: "email", Type: &ast.TypeRef{Name: "String"}}}},
 	}}}}
-	if got := externalModelFieldNames(result, "User"); !slices.Equal(got, []string{"id", "email"}) {
+	if got := defaultGenerator().externalModelFieldNames(result, "User"); !slices.Equal(got, []string{"id", "email"}) {
 		t.Fatalf("external fields = %v", got)
 	}
 }

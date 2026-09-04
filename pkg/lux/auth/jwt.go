@@ -52,14 +52,17 @@ func ResetConfig() {
 
 func loadConfigFromEnv() (*Config, error) {
 	secret, ok := env.Get("JWT_SECRET")
-	if !ok {
+	if !ok || strings.TrimSpace(secret) == "" {
 		return nil, fmt.Errorf("JWT_SECRET is not set")
 	}
 
 	expires := 7 * 24 * time.Hour // default 7d
 	if v, ok := env.Get("JWT_EXPIRES"); ok {
 		d, err := parseDuration(v)
-		if err != nil {
+		if err != nil || d <= 0 {
+			if err == nil {
+				err = fmt.Errorf("duration must be positive")
+			}
 			return nil, fmt.Errorf("invalid JWT_EXPIRES: %w", err)
 		}
 		expires = d
@@ -67,13 +70,22 @@ func loadConfigFromEnv() (*Config, error) {
 
 	refreshEnabled := false
 	if v, ok := env.Get("JWT_REFRESH"); ok {
-		refreshEnabled = v == "true"
+		switch v {
+		case "true":
+			refreshEnabled = true
+		case "false":
+		default:
+			return nil, fmt.Errorf("invalid JWT_REFRESH %q: expected true or false", v)
+		}
 	}
 
 	refreshExpires := 30 * 24 * time.Hour // default 30d
 	if v, ok := env.Get("JWT_REFRESH_EXPIRES"); ok {
 		d, err := parseDuration(v)
-		if err != nil {
+		if err != nil || d <= 0 {
+			if err == nil {
+				err = fmt.Errorf("duration must be positive")
+			}
 			return nil, fmt.Errorf("invalid JWT_REFRESH_EXPIRES: %w", err)
 		}
 		refreshExpires = d

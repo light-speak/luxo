@@ -5,8 +5,8 @@
 <h3 align="center">Build APIs at the speed of light.</h3>
 
 <p align="center">
-  A general-purpose language with a built-in API framework.<br/>
-  One language, one protocol, one toolchain — replaces REST, GraphQL, and gRPC.
+  A schema-first compiled backend language and platform.<br/>
+  One language, one protocol, one toolchain for API and data services.
 </p>
 
 <p align="center">
@@ -46,9 +46,9 @@ Follow that question to its logical end, and you arrive at Luxo.
 
 ## What is Luxo?
 
-Luxo is a **programming language** that compiles to Go — with a built-in API framework, its own protocol, and a complete toolchain from schema to deployment.
+Luxo is a **schema-first compiled backend language and platform**. It compiles `.luxo` into Go services, database access, migrations, typed SDK metadata, and deployment entry points. Luvia exposes the same schema over JSON and Luxo Binary through HTTP, WebSocket, and native RPC.
 
-Write `.luxo` files. Get: API server, database layer, client SDKs, migrations, monitoring dashboard. No glue code.
+Luxo is designed to unify workloads commonly split across REST, GraphQL, gRPC, an ORM, and handwritten client glue. PostgreSQL is the implemented database backend today; MySQL, SQLite, and MongoDB remain roadmap targets.
 
 ```luxo
 model User @crud {
@@ -61,25 +61,25 @@ model User @crud {
 }
 ```
 
-This generates everything. One file, zero boilerplate.
+One source definition drives the generated server, database layer, migrations, schema, and SDK contracts.
 
 ## Why Not...
 
 | | GraphQL | gRPC | REST | **Luxo** |
 |---|---|---|---|---|
 | **Field Selection** | ✅ Supported but too loose — clients can craft arbitrarily deep queries, needs extra depth/complexity limits to prevent abuse | ❌ None — response fixed to proto definition (`FieldMask` exists but requires manual handling) | ❌ None — each endpoint returns fixed fields, `?fields=` requires manual implementation | ✅ Schema-level field visibility, compile-time validation, propagated down to SQL — only selected columns are queried |
-| **Binary Transport** | ❌ Spec is encoding-agnostic, but virtually all deployments use JSON — significant serialization overhead at scale | ✅ Protobuf binary encoding — compact and efficient | ❌ Any format via content negotiation in theory, but JSON dominates in practice with no standard binary option | ✅ JSON in dev for easy debugging, auto-switches to Binary in prod for throughput — zero configuration |
+| **Binary Transport** | ❌ Spec is encoding-agnostic, but virtually all deployments use JSON — significant serialization overhead at scale | ✅ Protobuf binary encoding — compact and efficient | ❌ Any format via content negotiation in theory, but JSON dominates in practice with no standard binary option | ✅ One schema for JSON and Luxo Binary; the SDK mode or `X-Luxo-Mode` explicitly selects the wire format |
 | **One Schema** | ❌ SDL defines the API, but ORM/DB mapping maintained separately — two sources of truth that drift apart (code-first tools can help) | ❌ `.proto` for wire format + ORM for database — two definitions to keep in sync | ❌ No schema-driven workflow — routes, models, and docs all written by hand | ✅ One `.luxo` file generates API, DB migrations, client SDK, and docs — single source of truth |
 | **N+1 Prevention** | ❌ Resolver-per-field pattern naturally causes N+1 — requires manual DataLoader integration (standard practice; frameworks like Hasura auto-solve) | N/A — no nested field resolution model | ❌ Nested resources require manual query optimization or eager loading | ✅ Compiler auto-analyzes relations and generates DataLoader batching — no manual intervention needed |
 | **Null Safety** | ⚠️ SDL `!` marks non-null with server-side runtime enforcement; client codegen can provide compile-time type safety | ✅ Protobuf fields have default zero values with compile-time type safety (but proto3 can't distinguish "zero" from "unset" without `optional`) | ❌ No null safety — null errors only surface at runtime | ✅ Language-level compile-time null safety: `?` nullable declaration, `?.` safe access, `?:` Elvis fallback — null errors caught before running |
-| **Error Handling** | ❌ Loosely-typed `errors` array with message string + optional extensions — hard for clients to handle structurally | ✅ gRPC Status with 16 standard codes + rich error details — well-typed | ❌ HTTP status codes + custom JSON body — no unified error structure standard | ✅ `Result<T>` typed errors + `?` operator for auto-propagation — safe and concise |
+| **Error Handling** | ❌ Loosely-typed `errors` array with message string + optional extensions — hard for clients to handle structurally | ✅ gRPC Status with 16 standard codes + rich error details — well-typed | ❌ HTTP status codes + custom JSON body — no unified error structure standard | ✅ One structured transport error envelope; native `Result<T>` lowers to Go `(T, error)` and `?` propagates failures |
 | **Concurrency** | ⚠️ Most implementations auto-parallelize independent resolvers (gqlgen / Apollo / graphql-java), but no language-level concurrency primitives — complex orchestration still depends on the host language | ❌ Supports bidirectional streaming, but concurrency orchestration is entirely manual | ❌ No built-in concurrency — fully depends on framework or manual thread/goroutine management | ✅ Built-in `async` / `await` + `Channel` — compiles directly to Go goroutines and channels, zero-cost concurrency |
 | **Multi-service** | ⚠️ Apollo Federation is mature but operationally complex — requires extra gateway layer and cross-service coordination | ⚠️ Native point-to-point RPC, but multi-service orchestration still needs service mesh/discovery (Istio, Consul, etc.) | ❌ Inter-service calls require hand-written HTTP clients or additional frameworks | ✅ `extend` for cross-service type composition + built-in gateway routing + native RPC — multi-service out of the box |
-| **Scaling** | ❌ Monolith-to-federation migration requires rewriting resolvers, adding `@key`/`@external` annotations, deploying Apollo Router | ❌ Service split requires redefining `.proto` files, regenerating stubs, rewriting client calls | ❌ Every split means new routes, new HTTP clients, new deployment configs | ✅ Single service → multi-service by changing config only — zero code changes, Luvia gateway handles everything |
+| **Scaling** | ❌ Monolith-to-federation migration requires rewriting resolvers, adding `@key`/`@external` annotations, deploying Apollo Router | ❌ Service split requires redefining `.proto` files, regenerating stubs, rewriting client calls | ❌ Every split means new routes, new HTTP clients, new deployment configs | ✅ The compiler generates embedded and clustered entry points, RPC routing, and federation loaders from the same schema contract |
 
 ## The Language
 
-Luxo is a real programming language — not just a schema DSL. **32 keywords**, 9 core types (`Int`, `Float`, `String`, `Boolean`, `DateTime`, `Duration`, `UUID`, `Decimal`, `Bytes`), clean syntax, compiles to Go.
+Luxo is a backend programming language, not only a schema DSL. Its scalar types are `Int`, `Float`, `String`, `Boolean`, `DateTime`, `Duration`, `UUID`, `Decimal`, `Bytes`, and `JSON`; generic runtime types include `Result<T>`, `Channel<T>`, `Page<T>`, and `Cursor<T>`. Luxo compiles to Go.
 
 ### Null Safety
 
@@ -112,9 +112,14 @@ when(result) {
 Errors propagate with `?` — no try/catch, no async/await infection.
 
 ```luxo
-val user = findUser(1)?              // Ok → unwrap, Err → auto throw
-val data = http.get(url)?            // errors propagate automatically
+fn loadUser(id: Int): Result<User> @native
+
+api getUser(id: Int): User {
+  loadUser(id)?                      // value → unwrap, error → propagate
+}
 ```
+
+`Result<T>` is the ABI for Go-backed native functions. Public APIs declare their payload type (`User` above); transport errors use the shared structured error envelope.
 
 ### Concurrency — No async/await Infection
 
@@ -232,6 +237,11 @@ getUser(1) {
 
 Client selects fields → API serializes only those → SQL queries only those. End to end.
 
+Generated SDK output models preserve field presence exactly: unselected, selected
+`null`, or selected value. Decoders never fabricate zero values for omitted fields.
+Input DTOs remain strict; if one schema type is used in both directions, codegen
+emits `Foo` for selected output and `FooInput` for input.
+
 ### Real-time Streams
 
 ```luxo
@@ -260,8 +270,8 @@ go install github.com/light-speak/luxo/cmd/luxo@latest
 luxo init my-app
 cd my-app
 luxo add user
-luxo gen
 cp .env.example .env
+luxo gen
 luxo run
 ```
 
@@ -269,7 +279,15 @@ luxo run
 
 > [View full architecture diagram](assets/architecture.svg)
 
-**Luvia is always on** — single service runs embedded (in-process, zero overhead), multi-service runs as a standalone gateway. Same code, same behavior, just change `DEPLOY_MODE` in `.env`. Scale from prototype to production without touching a single line of code.
+**Luvia is always on.** Embedded mode runs every module and the gateway in one process. Cluster mode uses generated per-module service binaries plus a generated gateway; RPC routing and federation loaders come from the same analyzed schema, without handwritten transport clients.
+
+JSON and Luxo Binary are both production transports. HTTP clients select them through the SDK transport mode or `X-Luxo-Mode: json|binary`; WebSocket and native RPC use their canonical binary framing. `APP_ENV` never silently changes the wire contract.
+
+### Wire Compatibility
+
+`luxo.lock` v2 pins model/type/event field IDs, API IDs, parameter IDs, and their wire types. `luxo gen` rejects breaking changes before rewriting the lock. Use `--allow-breaking` only when every deployed producer and consumer will be regenerated together.
+
+Compatibility here means a new server continues accepting old clients, so compatible releases should deploy servers before regenerated clients. Adding a model/type field or an optional API parameter is compatible in that direction. Removing or changing a field/parameter, adding a required parameter, changing an API return type, removing an API, or changing an event payload is breaking. Removed IDs stay reserved and are never reused.
 
 
 ## AI-Native by Design
@@ -299,8 +317,8 @@ Same task in TypeScript? 150+ lines, 4 packages, no compile-time safety.
 ## Roadmap
 
 ### Phase 1 — Compiler ✅
-- [x] Lexer · Parser (32 keywords, Pratt parser)
-- [x] Semantic Analyzer (type checking, null safety, field injection, 59 directives)
+- [x] Lexer · Parser (Pratt parser)
+- [x] Semantic Analyzer (layered declaration/type/body/post-analysis passes, type checking, null safety, field injection, directive validation)
 - [x] LSP Server (diagnostics, completion, hover, go-to-definition, references)
 - [x] VS Code Extension (syntax highlighting, LSP integration)
 

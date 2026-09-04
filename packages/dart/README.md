@@ -170,6 +170,10 @@ final user = await transport.call('getUser', {
 // + DataLoader: SELECT title FROM posts WHERE user_id IN (1)
 ```
 
+Generated output fields use `Selected<T>`. Check `isSelected` before reading
+`value`; a selected nullable field may still contain `null`. Input DTOs remain
+strict, and a shared input/output type generates `Foo` plus `FooInput`.
+
 ### Binary Codec
 
 Low-level varint/svarint/fixed64 encoding for custom protocols:
