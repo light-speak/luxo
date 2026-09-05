@@ -111,6 +111,134 @@ jobs:
       - name: Verify compiler state isolation
         run: go test -race ./pkg/codegen ./pkg/semantic ./pkg/lockfile -count=1 -timeout=180s
 
+  runtime-race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: luxo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d luxo_test"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=5
+
+    env:
+      DATABASE_HOST: localhost
+      DATABASE_PORT: 5432
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_PREFIX: luxo_test
+      DATABASE_SSL: disable
+      LUXO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Verify runtime concurrency safety
+        run: go test -race ./pkg/lux/... -count=1 -timeout=240s
+
+  performance:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out benchmark baseline
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: .tmp/base
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Test performance gate
+        run: GOWORK=off go test ./scripts/benchgate -count=1
+
+      - name: Install pinned benchstat
+        env:
+          GOBIN: ${{ github.workspace }}/.tmp/bin
+        run: |
+          mkdir -p "${GOBIN}"
+          go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70
+
+      - name: Compile benchmark binaries
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/bin/base .tmp/bin/head .tmp/test-tmp
+          rg -l '^func Benchmark' pkg --glob '*_test.go' | xargs -n1 dirname | sort -u > .tmp/head-benchmark-packages.txt
+          cd .tmp/base
+          rg -l '^func Benchmark' pkg --glob '*_test.go' | xargs -n1 dirname | sort -u > ../base-benchmark-packages.txt
+          cd "${GITHUB_WORKSPACE}"
+          comm -12 .tmp/base-benchmark-packages.txt .tmp/head-benchmark-packages.txt > .tmp/benchmark-packages.txt
+          while IFS= read -r package; do
+            binary="${package//\//-}.test"
+            GOWORK=off go test -c "./${package}" -o ".tmp/bin/head/${binary}"
+            cd .tmp/base
+            GOWORK=off go test -c "./${package}" -o "${GITHUB_WORKSPACE}/.tmp/bin/base/${binary}"
+            cd "${GITHUB_WORKSPACE}"
+          done < .tmp/benchmark-packages.txt
+
+      - name: Run interleaved benchmark samples
+        env:
+          TMPDIR: ${{ github.workspace }}/.tmp/test-tmp
+        run: |
+          set -euo pipefail
+          base_output="${GITHUB_WORKSPACE}/.tmp/benchmark-base.txt"
+          head_output="${GITHUB_WORKSPACE}/.tmp/benchmark-head.txt"
+          : > "${base_output}"
+          : > "${head_output}"
+          run_suite() {
+            local source_root="$1"
+            local binary_root="$2"
+            local output="$3"
+            while IFS= read -r package; do
+              local binary="${package//\//-}.test"
+              (
+                cd "${source_root}/${package}"
+                "${binary_root}/${binary}" \
+                  -test.run='^$' \
+                  -test.bench=. \
+                  -test.benchmem \
+                  -test.benchtime=200ms \
+                  -test.count=1 \
+                  -test.cpu=2
+              ) >> "${output}"
+            done < "${GITHUB_WORKSPACE}/.tmp/benchmark-packages.txt"
+          }
+          for sample in {1..10}; do
+            if (( sample % 2 == 1 )); then
+              run_suite "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}"
+              run_suite "${GITHUB_WORKSPACE}" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}"
+            else
+              run_suite "${GITHUB_WORKSPACE}" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}"
+              run_suite "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}"
+            fi
+          done
+
+      - name: Enforce performance baseline
+        run: |
+          .tmp/bin/benchstat -alpha 0.01 base=.tmp/benchmark-base.txt head=.tmp/benchmark-head.txt
+          .tmp/bin/benchstat -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv base=.tmp/benchmark-base.txt head=.tmp/benchmark-head.txt > .tmp/benchstat.csv 2> .tmp/benchstat-warnings.txt
+          GOWORK=off go run ./scripts/benchgate .tmp/benchstat.csv
+
   external-go-consumer:
     runs-on: ubuntu-latest
     steps:
@@ -243,3 +371,24 @@ jobs:
           fi
           ../../packages/kotlin/gradlew luxoAnalyze --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
           ../../packages/kotlin/gradlew luxoAnalyze --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
+
+  sdk-swift-conformance:
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out Swift SDK
+        uses: actions/checkout@v7
+        with:
+          repository: light-speak/luxo-swift
+          ref: main
+          path: .tmp/luxo-swift
+          persist-credentials: false
+
+      - name: Verify Swift wire protocol compatibility
+        env:
+          LUXO_PROTOCOL_FIXTURE: ${{ github.workspace }}/pkg/lux/codec/testdata/protocol-v1.json
+        run: swift test --package-path .tmp/luxo-swift --filter ProtocolConformanceTests
