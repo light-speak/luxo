@@ -71,6 +71,7 @@ export interface LuxoAPI {
   returnType?: string
   returnList?: boolean
   paginated?: boolean
+  defaultPageSize?: number
   stream?: boolean
   params?: LuxoParam[]
 }

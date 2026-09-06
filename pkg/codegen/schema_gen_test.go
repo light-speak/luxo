@@ -112,6 +112,32 @@ func TestGenerateSchemaFile_Basic(t *testing.T) {
 	}
 }
 
+func TestGenerateSchemaFileMarksCRUDPaginationParamsOptional(t *testing.T) {
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+		ModelFields: map[string]map[string]int{"User": {"id": 1}},
+		APIs:        map[string]int{"listUsers": 11},
+		APIParams:   map[string]map[string]int{"listUsers": {"page": 1, "pageSize": 2}},
+	}})
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/user.luxo",
+		Models: []*ast.ModelDecl{{
+			Name:       "User",
+			Directives: []*ast.Directive{{Name: "crud", Args: []*ast.NamedArg{{Name: "only", Value: &ast.ListExpr{Items: []ast.Expr{&ast.Ident{Name: "list"}}}}}}},
+			Fields:     []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}},
+		}},
+	}}}
+
+	src := string(generator.generateSchemaFile(result, "luxo", nil))
+	for _, want := range []string{
+		`Name: "page", Type: schema.FieldInt, TypeName: "Int", HasDefault: true`,
+		`Name: "pageSize", Type: schema.FieldInt, TypeName: "Int", HasDefault: true`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("generated CRUD list schema missing %q:\n%s", want, src)
+		}
+	}
+}
+
 func TestGenerateSchemaFileRegistersEnumsWithModule(t *testing.T) {
 	result := &semantic.Result{Files: []*ast.File{{
 		Name:  "origin/auth/member.luxo",
@@ -262,7 +288,7 @@ func TestWriteAPIRegistrationSchema(t *testing.T) {
 	}
 	retType := &ast.TypeRef{Name: "User"}
 
-	generator.writeAPIRegistrationSchema(&b, "createUser", "user", params, retType, false, false, nil, nil)
+	generator.writeAPIRegistrationSchema(&b, "createUser", "user", params, retType, false, 0, false, nil, nil)
 	src := b.String()
 
 	checks := []string{
@@ -291,7 +317,7 @@ func TestWriteAPIRegistrationSchemaListParam(t *testing.T) {
 
 	var b strings.Builder
 	params := []*ast.ParamDecl{{Name: "tags", Type: &ast.TypeRef{Name: "String", IsList: true}}}
-	generator.writeAPIRegistrationSchema(&b, "search", "search", params, nil, false, false, nil, nil)
+	generator.writeAPIRegistrationSchema(&b, "search", "search", params, nil, false, 0, false, nil, nil)
 	if src := b.String(); !strings.Contains(src, `Name: "tags", Type: schema.FieldString, TypeName: "String", IsList: true`) {
 		t.Fatalf("list parameter metadata missing:\n%s", src)
 	}
@@ -419,8 +445,12 @@ func TestBuildSchemaJSONIncludesCompleteCRUDParams(t *testing.T) {
 		t.Fatal(err)
 	}
 	create := got.APIs["createProject"]
+	list := got.APIs["listProjects"]
 	update := got.APIs["updateProject"]
 	deleteMany := got.APIs["deleteProjects"]
+	if len(list.Params) != 2 || !list.Params[0].HasDefault || !list.Params[1].HasDefault {
+		t.Fatalf("pagination params should carry protocol defaults: %+v", list.Params)
+	}
 	if len(create.Params) != 2 || create.Params[1].Name != "description" || !create.Params[1].Nullable || !create.Params[1].HasDefault {
 		t.Fatalf("create params = %+v", create.Params)
 	}
@@ -555,7 +585,10 @@ func TestBuildSchemaJSON_WithExtendStubs(t *testing.T) {
 }
 
 func TestBuildSchemaJSON_WithAPIPaginated(t *testing.T) {
-	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIs: map[string]int{"search": 1}}})
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+		APIs:      map[string]int{"search": 1},
+		APIParams: map[string]map[string]int{"search": {"page": 1, "pageSize": 2}},
+	}})
 
 	result := &semantic.Result{
 		Files: []*ast.File{{
@@ -563,15 +596,56 @@ func TestBuildSchemaJSON_WithAPIPaginated(t *testing.T) {
 			APIs: []*ast.ApiDecl{{
 				Name:       "search",
 				ReturnType: &ast.TypeRef{Name: "User", IsList: true},
-				Directives: []*ast.Directive{{Name: "paginate"}},
+				Directives: []*ast.Directive{{Name: "paginate", Args: []*ast.NamedArg{{
+					Name: "defaultPageSize", Value: &ast.Literal{Kind: token.Int, Value: "50"},
+				}}}},
 			}},
 		}},
 	}
 
-	data, _ := generator.BuildSchemaJSON(result, nil)
-	s := string(data)
-	if !strings.Contains(s, `"paginated":true`) {
-		t.Errorf("should mark API as paginated: %s", s)
+	data, err := generator.BuildSchemaJSON(result, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got schema.Schema
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	api := got.APIs["search"]
+	if !api.Paginated || api.DefaultPageSize != 50 {
+		t.Fatalf("paginated API metadata = %+v", api)
+	}
+	if len(api.Params) != 2 || api.Params[0].Name != "page" || !api.Params[0].HasDefault || api.Params[1].Name != "pageSize" || !api.Params[1].HasDefault {
+		t.Fatalf("paginated API params = %+v", api.Params)
+	}
+}
+
+func TestGenerateSchemaFileInjectsPaginatedAPIParams(t *testing.T) {
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+		APIs:      map[string]int{"browseUsers": 1},
+		APIParams: map[string]map[string]int{"browseUsers": {"status": 1, "page": 2, "pageSize": 3}},
+	}})
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/user.luxo",
+		APIs: []*ast.ApiDecl{{
+			Name:       "browseUsers",
+			Params:     []*ast.ParamDecl{{Name: "status", Type: &ast.TypeRef{Name: "String", Nullable: true}}},
+			ReturnType: &ast.TypeRef{Name: "User", IsList: true},
+			Directives: []*ast.Directive{{Name: "paginate", Args: []*ast.NamedArg{{
+				Name: "defaultPageSize", Value: &ast.Literal{Kind: token.Int, Value: "50"},
+			}}}},
+		}},
+	}}}
+
+	src := string(generator.generateSchemaFile(result, "luxo", nil))
+	for _, want := range []string{
+		"DefaultPageSize: 50",
+		`Name: "page", Type: schema.FieldInt, TypeName: "Int", HasDefault: true`,
+		`Name: "pageSize", Type: schema.FieldInt, TypeName: "Int", HasDefault: true`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("generated @paginate schema missing %q:\n%s", want, src)
+		}
 	}
 }
 
@@ -644,7 +718,7 @@ func TestWriteAPIRegistrationSchema_Paginated(t *testing.T) {
 	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIs: map[string]int{"listUser": 30}}})
 
 	var b strings.Builder
-	generator.writeAPIRegistrationSchema(&b, "listUser", "user", nil, &ast.TypeRef{Name: "User", IsList: true}, true, false, nil, nil)
+	generator.writeAPIRegistrationSchema(&b, "listUser", "user", nil, &ast.TypeRef{Name: "User", IsList: true}, true, 20, false, nil, nil)
 	src := b.String()
 
 	if !strings.Contains(src, "Paginated: true") {

@@ -926,6 +926,101 @@ func TestParseBinaryRequestAppliesPaginationParams(t *testing.T) {
 	}
 }
 
+func TestAPIRegistryAppliesSchemaPaginationDefaults(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("browseUsers", 1)
+	meta := []ParamMeta{{Name: "page", Type: "Int", FieldID: 1}, {Name: "pageSize", Type: "Int", FieldID: 2}}
+	reg.RegisterParams("browseUsers", meta)
+	s := schema.New()
+	s.RegisterAPI(&schema.API{
+		ID: 1, Name: "browseUsers", Paginated: true, DefaultPageSize: 50,
+		Params: []schema.Param{
+			{ID: 1, Name: "page", Type: schema.FieldInt, HasDefault: true},
+			{ID: 2, Name: "pageSize", Type: schema.FieldInt, HasDefault: true},
+		},
+	})
+	reg.SetSchema(s)
+
+	binaryReq, err := reg.ParseBinaryRequest(mustEncodeBinaryRequest(t, 1, nil, nil, meta))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binaryReq.Page != 1 || binaryReq.PageSize != 50 {
+		t.Fatalf("binary defaults = %d/%d, want 1/50", binaryReq.Page, binaryReq.PageSize)
+	}
+
+	jsonReq, err := ParseRequest(httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(`{"$api":"browseUsers"}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.prepareJSONRequest(jsonReq); err != nil {
+		t.Fatal(err)
+	}
+	if jsonReq.Page != 1 || jsonReq.PageSize != 50 {
+		t.Fatalf("JSON defaults = %d/%d, want 1/50", jsonReq.Page, jsonReq.PageSize)
+	}
+	canonical, err := reg.ParseBinaryRequest(jsonReq.BinaryRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical.Page != 1 || canonical.PageSize != 50 {
+		t.Fatalf("canonical JSON request defaults = %d/%d, want 1/50", canonical.Page, canonical.PageSize)
+	}
+}
+
+func TestAPIRegistryPreservesExplicitPagination(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("browseUsers", 1)
+	meta := []ParamMeta{{Name: "page", Type: "Int", FieldID: 1}, {Name: "pageSize", Type: "Int", FieldID: 2}}
+	reg.RegisterParams("browseUsers", meta)
+	s := schema.New()
+	s.RegisterAPI(&schema.API{ID: 1, Name: "browseUsers", Paginated: true, DefaultPageSize: 50})
+	reg.SetSchema(s)
+
+	binaryReq, err := reg.ParseBinaryRequest(mustEncodeBinaryRequest(t, 1, nil, map[string]any{"page": 3, "pageSize": 7}, meta))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binaryReq.Page != 3 || binaryReq.PageSize != 7 {
+		t.Fatalf("binary pagination = %d/%d, want 3/7", binaryReq.Page, binaryReq.PageSize)
+	}
+
+	jsonReq, err := ParseRequest(httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(`{"$api":"browseUsers","page":3,"pageSize":7}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.prepareJSONRequest(jsonReq); err != nil {
+		t.Fatal(err)
+	}
+	if jsonReq.Page != 3 || jsonReq.PageSize != 7 {
+		t.Fatalf("JSON pagination = %d/%d, want 3/7", jsonReq.Page, jsonReq.PageSize)
+	}
+	canonical, err := reg.ParseBinaryRequest(jsonReq.BinaryRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical.Page != 3 || canonical.PageSize != 7 {
+		t.Fatalf("canonical JSON pagination = %d/%d, want 3/7", canonical.Page, canonical.PageSize)
+	}
+}
+
+func TestAPIRegistryRejectsInvalidSchemaPaginationDefaults(t *testing.T) {
+	for _, invalid := range []int{0, 101} {
+		reg := NewAPIRegistry()
+		reg.Register("browseUsers", 1)
+		s := schema.New()
+		s.RegisterAPI(&schema.API{ID: 1, Name: "browseUsers", Paginated: true, DefaultPageSize: invalid})
+		reg.SetSchema(s)
+		req, err := reg.ParseBinaryRequest([]byte{1, 0, 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if req.PageSize != defaultPageSize {
+			t.Fatalf("default %d produced page size %d, want %d", invalid, req.PageSize, defaultPageSize)
+		}
+	}
+}
+
 func TestBinaryRequestRoundTripsFiltersAndSorters(t *testing.T) {
 	reg := NewAPIRegistry()
 	reg.Register("listUsers", 1)

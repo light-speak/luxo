@@ -93,6 +93,7 @@ data class LuxoAPI(
     val returnType: String? = null,
     val returnList: Boolean = false,
     val paginated: Boolean = false,
+    val defaultPageSize: Int? = null,
     val stream: Boolean = false,
     val params: List<LuxoParam> = emptyList(),
 )

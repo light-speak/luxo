@@ -1026,6 +1026,31 @@ func TestUpdateAPIsWithCrud(t *testing.T) {
 	}
 }
 
+func TestUpdateAPIsInjectsPaginateParamIDs(t *testing.T) {
+	lf := New()
+	files := []*ast.File{{APIs: []*ast.ApiDecl{{
+		Name:   "browsePosts",
+		Params: []*ast.ParamDecl{{Name: "status", Type: &ast.TypeRef{Name: "String"}}},
+		Directives: []*ast.Directive{{Name: "paginate", Args: []*ast.NamedArg{{
+			Name:  "defaultPageSize",
+			Value: &ast.Literal{Kind: token.Int, Value: "50"},
+		}}}},
+	}}}}
+
+	lf.Update(files)
+	params := lf.APIs["browsePosts"].Params
+	if params["status"] != 1 || params["page"] != 2 || params["pageSize"] != 3 {
+		t.Fatalf("paginated API params = %v", params)
+	}
+	paramTypes := lf.APIs["browsePosts"].ParamTypes
+	if paramTypes["page"] != "Int" || paramTypes["pageSize"] != "Int" {
+		t.Fatalf("paginated API param types = %v", paramTypes)
+	}
+	if changes := lf.BreakingChanges(files); len(changes) != 0 {
+		t.Fatalf("injected pagination params reported as breaking: %+v", changes)
+	}
+}
+
 func TestUpdateAPIsWithCrudUsesOnlyHandlerParams(t *testing.T) {
 	lf := New()
 	relation := field("author", "User")

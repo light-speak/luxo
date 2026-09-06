@@ -94,6 +94,19 @@ func TestBuildParamTypesFromASTPreservesLists(t *testing.T) {
 	}
 }
 
+func TestBuildParamTypesFromASTInjectsPaginationTypes(t *testing.T) {
+	files := []*ast.File{{APIs: []*ast.ApiDecl{{
+		Name:       "browsePosts",
+		Params:     []*ast.ParamDecl{{Name: "status", Type: &ast.TypeRef{Name: "String", Nullable: true}}},
+		Directives: []*ast.Directive{{Name: "paginate"}},
+	}}}}
+
+	types := buildParamTypesFromAST(files)["browsePosts"]
+	if types["status"] != "String?" || types["page"] != "Int" || types["pageSize"] != "Int" {
+		t.Fatalf("paginated API types = %v", types)
+	}
+}
+
 func TestBuildParamTypesFromASTNormalizesWireTypes(t *testing.T) {
 	files := []*ast.File{{
 		Enums: []*ast.EnumDecl{{Name: "Role"}},

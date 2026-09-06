@@ -201,7 +201,7 @@ func TestSchemaToJSON(t *testing.T) {
 			{ID: 2, Name: "title", Type: FieldString},
 		},
 	})
-	s.RegisterAPI(&API{ID: 10, Name: "listPosts", Module: "post", ReturnType: "Post", ReturnList: true, Paginated: true})
+	s.RegisterAPI(&API{ID: 10, Name: "listPosts", Module: "post", ReturnType: "Post", ReturnList: true, Paginated: true, DefaultPageSize: 50})
 
 	data, err := s.ToJSON()
 	if err != nil {
@@ -226,6 +226,9 @@ func TestSchemaToJSON(t *testing.T) {
 	listPosts := apis["listPosts"].(map[string]any)
 	if listPosts["paginated"] != true {
 		t.Errorf("paginated = %v", listPosts["paginated"])
+	}
+	if listPosts["defaultPageSize"] != float64(50) {
+		t.Errorf("defaultPageSize = %v", listPosts["defaultPageSize"])
 	}
 	if listPosts["returnList"] != true {
 		t.Errorf("returnList = %v", listPosts["returnList"])

@@ -123,7 +123,7 @@ func (r *APIRegistry) ParseBinaryRequest(body []byte) (*Request, error) {
 		API:        apiName,
 		Select:     fields,
 		Page:       1,
-		PageSize:   20,
+		PageSize:   defaultPageSize,
 		BinaryMode: true,
 		FieldMask:  fieldMask,
 		paramNames: r.paramNames[apiName],
@@ -137,7 +137,9 @@ func (r *APIRegistry) ParseBinaryRequest(body []byte) (*Request, error) {
 		return nil, err
 	}
 	req.applyBinaryListParams()
-	if err := r.validateRequiredParams(req); err != nil {
+	definition := r.apiDefinition(apiName)
+	applyPaginationDefaults(req, definition)
+	if err := validateRequiredParams(req, definition); err != nil {
 		return nil, err
 	}
 	req.binaryRequest = body
@@ -151,7 +153,9 @@ func (r *APIRegistry) prepareJSONRequest(req *Request) error {
 	if !registered {
 		return nil
 	}
-	params, err := r.encodeJSONRequestParams(req)
+	definition := r.apiDefinition(req.API)
+	applyPaginationDefaults(req, definition)
+	params, err := r.encodeJSONRequestParams(req, definition)
 	if err != nil {
 		return err
 	}
@@ -166,7 +170,25 @@ func (r *APIRegistry) prepareJSONRequest(req *Request) error {
 	return nil
 }
 
-func (r *APIRegistry) encodeJSONRequestParams(req *Request) ([]byte, error) {
+func (r *APIRegistry) apiDefinition(name string) *schema.API {
+	if r.schema == nil {
+		return nil
+	}
+	return r.schema.APIs[name]
+}
+
+func applyPaginationDefaults(req *Request, definition *schema.API) {
+	if definition == nil || !definition.Paginated || req.pageSizeSet {
+		return
+	}
+	pageSize := definition.DefaultPageSize
+	if pageSize <= 0 || pageSize > maxPageSize {
+		pageSize = defaultPageSize
+	}
+	req.PageSize = pageSize
+}
+
+func (r *APIRegistry) encodeJSONRequestParams(req *Request, definition *schema.API) ([]byte, error) {
 	meta := r.paramOrder[req.API]
 	if err := validateKnownJSONParams(req, meta); err != nil {
 		return nil, err
@@ -195,7 +217,7 @@ func (r *APIRegistry) encodeJSONRequestParams(req *Request) ([]byte, error) {
 		}
 	}
 	enc.WriteEnd()
-	if err := r.validateRequiredParams(req); err != nil {
+	if err := validateRequiredParams(req, definition); err != nil {
 		return nil, err
 	}
 	return enc.Bytes(), nil
@@ -286,11 +308,7 @@ func decodeJSONBytesParam(raw json.RawMessage, meta ParamMeta) (any, bool, error
 	return values, true, nil
 }
 
-func (r *APIRegistry) validateRequiredParams(req *Request) error {
-	if r.schema == nil {
-		return nil
-	}
-	definition := r.schema.APIs[req.API]
+func validateRequiredParams(req *Request, definition *schema.API) error {
 	if definition == nil {
 		return nil
 	}

@@ -88,6 +88,80 @@ func TestStmtNodeInterface(t *testing.T) {
 	}
 }
 
+func TestEffectiveAPIParamsInjectsPaginationDefaults(t *testing.T) {
+	api := &ApiDecl{
+		Params: []*ParamDecl{{Name: "status", Type: &TypeRef{Name: "String", Nullable: true}}},
+		Directives: []*Directive{{Name: "paginate", Args: []*NamedArg{{
+			Name:  "defaultPageSize",
+			Value: &Literal{Kind: token.Int, Value: "50"},
+		}}}},
+	}
+
+	params := api.EffectiveParams()
+	if len(params) != 3 || params[0].Name != "status" || params[1].Name != "page" || params[2].Name != "pageSize" {
+		t.Fatalf("effective params = %+v", params)
+	}
+	if len(api.Params) != 1 {
+		t.Fatalf("EffectiveParams mutated source params: %+v", api.Params)
+	}
+	if got := params[1].Default.(*Literal).Value; got != "1" {
+		t.Fatalf("page default = %s, want 1", got)
+	}
+	if got := params[2].Default.(*Literal).Value; got != "50" {
+		t.Fatalf("pageSize default = %s, want 50", got)
+	}
+	if got := api.DefaultPageSize(); got != 50 {
+		t.Fatalf("DefaultPageSize() = %d, want 50", got)
+	}
+}
+
+func TestEffectiveAPIParamsDoesNotInjectWithoutPaginate(t *testing.T) {
+	api := &ApiDecl{Params: []*ParamDecl{{Name: "page", Type: &TypeRef{Name: "String"}}}}
+	params := api.EffectiveParams()
+	if len(params) != 1 || params[0] != api.Params[0] {
+		t.Fatalf("effective params = %+v", params)
+	}
+	if got := api.DefaultPageSize(); got != 20 {
+		t.Fatalf("DefaultPageSize() = %d, want 20", got)
+	}
+}
+
+func TestPaginationHelpersHandleDefensiveInputs(t *testing.T) {
+	var missing *ApiDecl
+	if missing.EffectiveParams() != nil || missing.DefaultPageSize() != DefaultPaginationPageSize {
+		t.Fatal("nil API should use empty params and the protocol default")
+	}
+
+	tests := []struct {
+		name string
+		arg  Expr
+	}{
+		{"non-literal", &Ident{Name: "size"}},
+		{"wrong literal type", &Literal{Kind: token.String, Value: "50"}},
+		{"non-positive", &Literal{Kind: token.Int, Value: "0"}},
+		{"overflow", &Literal{Kind: token.Int, Value: "999999999999999999999999999999"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			api := &ApiDecl{Directives: []*Directive{{Name: "paginate", Args: []*NamedArg{{Value: tt.arg}}}}}
+			if got := api.DefaultPageSize(); got != DefaultPaginationPageSize {
+				t.Fatalf("DefaultPageSize() = %d, want %d", got, DefaultPaginationPageSize)
+			}
+		})
+	}
+
+	page := paginationParam("page", "3")
+	pageSize := paginationParam("pageSize", "9")
+	api := &ApiDecl{
+		Params:     []*ParamDecl{page, pageSize},
+		Directives: []*Directive{{Name: "paginate"}},
+	}
+	params := api.EffectiveParams()
+	if len(params) != 2 || params[0] != page || params[1] != pageSize {
+		t.Fatalf("explicit pagination params were replaced: %+v", params)
+	}
+}
+
 func TestWalkExprsTraversesAllNestedExpressionBlocks(t *testing.T) {
 	blockWith := func(name string) *Block {
 		return &Block{Stmts: []Stmt{&ExprStmt{Expr: &Ident{Name: name}}}}

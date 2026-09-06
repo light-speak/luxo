@@ -173,8 +173,9 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/migrate\"\n")
 	b.WriteString("\tpg \"github.com/light-speak/luxo/pkg/lux/pg\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/queue\"\n")
-	// rpc needed for fn @service or cluster mode DataLoaders
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/rpc\"\n")
+	if entryNeedsRPC(modules, anyServiceFns) {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/rpc\"\n")
+	}
 	b.WriteString(")\n\n")
 
 	// Version variable
@@ -261,6 +262,18 @@ func entryCapabilities(modules []moduleInfo) (hasEvents, hasServiceFunctions boo
 		hasServiceFunctions = hasServiceFunctions || module.hasServiceFns
 	}
 	return hasEvents, hasServiceFunctions
+}
+
+func entryNeedsRPC(modules []moduleInfo, hasServiceFunctions bool) bool {
+	if hasServiceFunctions {
+		return true
+	}
+	for _, module := range modules {
+		if module.hasExtend || module.hasBatchRPC || module.hasRemoteLoad {
+			return true
+		}
+	}
+	return false
 }
 
 func writeEmbeddedGatewayWiring(b *strings.Builder, modules []moduleInfo, hasServiceFunctions bool) {

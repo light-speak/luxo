@@ -424,9 +424,33 @@ func (a *Analyzer) resolveApiTypes(file *ast.File) {
 			a.resolveTypeRef(p.Type, api.Pos)
 		}
 		a.checkDirectives(api.Directives, OnApi)
+		a.validatePaginateAPI(api)
 		a.validateStreamAPI(api)
 		a.validateNativeReturnType(api)
 		a.validateScopeDirective(api)
+	}
+}
+
+func (a *Analyzer) validatePaginateAPI(api *ast.ApiDecl) {
+	paginate, count := findAPIDirective(api.Directives, "paginate")
+	if paginate == nil {
+		return
+	}
+	if count > 1 {
+		a.addError(paginate.Pos, "@paginate may only be declared once / @paginate 只能声明一次")
+	}
+	if api.ReturnType == nil || !api.ReturnType.IsList || api.ReturnType.Nullable {
+		a.addError(api.Pos, "@paginate API must return a non-nullable list / @paginate API 必须返回非空列表")
+	} else if typ := a.types[api.ReturnType.Name]; typ == nil || typ.Kind != TypeModel {
+		a.addError(api.ReturnType.Pos, "@paginate API must return a model list / @paginate API 必须返回模型列表")
+	}
+	if native, _ := findAPIDirective(api.Directives, "native"); native != nil {
+		a.addError(native.Pos, "@paginate cannot be combined with @native / @paginate 不能与 @native 组合使用")
+	}
+	for _, param := range api.Params {
+		if param.Name == "page" || param.Name == "pageSize" {
+			a.addError(param.Pos, "@paginate automatically injects '%s'; remove the declared parameter / @paginate 会自动注入 '%s'，请删除显式参数", param.Name, param.Name)
+		}
 	}
 }
 

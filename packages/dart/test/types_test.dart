@@ -110,6 +110,7 @@ void main() {
         'returnType': 'User',
         'returnList': true,
         'paginated': true,
+        'defaultPageSize': 50,
         'params': [
           {'id': 1, 'name': 'userId', 'type': 'Int'},
         ],
@@ -121,6 +122,7 @@ void main() {
       expect(api.returnType, equals('User'));
       expect(api.returnList, isTrue);
       expect(api.paginated, isTrue);
+      expect(api.defaultPageSize, equals(50));
       expect(api.params.length, equals(1));
       expect(api.params[0].name, equals('userId'));
     });
@@ -135,6 +137,7 @@ void main() {
       expect(api.returnType, isNull);
       expect(api.returnList, isFalse);
       expect(api.paginated, isFalse);
+      expect(api.defaultPageSize, isNull);
       expect(api.params, isEmpty);
     });
   });

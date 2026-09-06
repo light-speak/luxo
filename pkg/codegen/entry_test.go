@@ -192,6 +192,9 @@ func TestGenerateEntryFileNonCrudAPIRegistersHandlers(t *testing.T) {
 	if !strings.Contains(code, "schema_luxo.RegisterHandlers(gw.Router, schemaApp)") {
 		t.Errorf("non-CRUD API module must still RegisterHandlers:\n%s", code)
 	}
+	if strings.Contains(code, `"github.com/light-speak/luxo/pkg/lux/rpc"`) {
+		t.Errorf("entry without RPC capabilities must not import rpc:\n%s", code)
+	}
 }
 
 func TestGenerateEntryFileWithLoaders(t *testing.T) {

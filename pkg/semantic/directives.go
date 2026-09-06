@@ -440,6 +440,9 @@ func (a *Analyzer) validateDirective(d *ast.Directive, ctx DirectiveContext, fie
 	if d.Name == "rateLimit" {
 		a.checkRateLimit(d)
 	}
+	if d.Name == "paginate" {
+		a.checkPaginateDefault(d)
+	}
 }
 
 func (a *Analyzer) checkRateLimit(d *ast.Directive) {
@@ -453,6 +456,22 @@ func (a *Analyzer) checkRateLimit(d *ast.Directive) {
 	windowLiteral, ok := directiveLiteral(windowArg)
 	if !ok || windowLiteral.Kind != token.Duration || !isPositiveDuration(windowLiteral.Value) {
 		a.addError(d.Pos, "@rateLimit window must be a positive duration / @rateLimit 的 window 必须是正时长")
+	}
+}
+
+func (a *Analyzer) checkPaginateDefault(d *ast.Directive) {
+	arg := findDirectiveArg(d.Args, "defaultPageSize", 0)
+	if arg == nil {
+		return
+	}
+	literal, ok := directiveLiteral(arg)
+	if !ok || literal.Kind != token.Int || !isPositiveInteger(literal.Value) {
+		a.addError(d.Pos, "@paginate defaultPageSize must be a positive integer / @paginate 的 defaultPageSize 必须是正整数")
+		return
+	}
+	value, _ := strconv.Atoi(literal.Value)
+	if value > 100 {
+		a.addError(d.Pos, "@paginate defaultPageSize must be at most 100 / @paginate 的 defaultPageSize 最大为 100")
 	}
 }
 

@@ -104,15 +104,16 @@ func (g *GeneratorContext) compileAPIBody(b *strings.Builder, api *ast.ApiDecl, 
 
 	// Compile body statements
 	c := &compiler{
-		generator:       g,
-		b:               b,
-		indent:          "\t\t",
-		models:          models,
-		enums:           enums,
-		api:             api,
-		vars:            make(map[string]valType),
-		nativeFunctions: nativeFunctions,
-		paginate:        hasDirective(api.Directives, "paginate"),
+		generator:        g,
+		b:                b,
+		indent:           "\t\t",
+		models:           models,
+		enums:            enums,
+		api:              api,
+		vars:             make(map[string]valType),
+		paginationTotals: make(map[string]string),
+		nativeFunctions:  nativeFunctions,
+		paginate:         hasDirective(api.Directives, "paginate"),
 	}
 	// Register API params in vars with Luxo type name for type-aware compilation
 	for _, p := range api.Params {
@@ -233,23 +234,24 @@ func isNilableGoType(goType string) bool {
 
 // compiler holds state during body compilation.
 type compiler struct {
-	generator       *GeneratorContext
-	b               *strings.Builder
-	indent          string
-	models          map[string]*ast.ModelDecl
-	types           map[string]bool // type declaration names (AuthPayload, etc.)
-	enums           map[string]bool // enum type names
-	api             *ast.ApiDecl
-	vars            map[string]valType // variable name → resolved type
-	inAsync         bool               // true inside async { } — no return err
-	inForExpr       bool               // true inside for-as-expression with yield — yield compiles to return
-	yieldAddr       bool               // true when a yielded value must be wrapped in a pointer
-	yieldTmp        int                // unique temporary counter for nullable primitive yields
-	paginate        bool               // true when API has @paginate
-	hasTotalVar     bool               // true after _total is assigned (paginated query)
-	ptrTmpCount     int                // counter for hoisted pointer temp vars (nullable create args)
-	resultTmp       int                // counter for Result<T> values lowered from Go's (T, error)
-	nativeFunctions map[string]bool    // @native fn names available through app.Resolver
+	generator        *GeneratorContext
+	b                *strings.Builder
+	indent           string
+	models           map[string]*ast.ModelDecl
+	types            map[string]bool // type declaration names (AuthPayload, etc.)
+	enums            map[string]bool // enum type names
+	api              *ast.ApiDecl
+	vars             map[string]valType // variable name → resolved type
+	inAsync          bool               // true inside async { } — no return err
+	inForExpr        bool               // true inside for-as-expression with yield — yield compiles to return
+	yieldAddr        bool               // true when a yielded value must be wrapped in a pointer
+	yieldTmp         int                // unique temporary counter for nullable primitive yields
+	paginate         bool               // true when API has @paginate
+	paginationTotals map[string]string  // result variable → exact query total variable
+	paginationTmp    int                // unique pagination temporary counter
+	ptrTmpCount      int                // counter for hoisted pointer temp vars (nullable create args)
+	resultTmp        int                // counter for Result<T> values lowered from Go's (T, error)
+	nativeFunctions  map[string]bool    // @native fn names available through app.Resolver
 }
 
 func (c *compiler) write(format string, args ...any) {
@@ -295,9 +297,10 @@ func (c *compiler) compileVal(s *ast.ValStmt) {
 	if c.isModelQuery(s.Value) {
 		qt := c.resolveQueryType(s.Value)
 		// @paginate + all → AllWithCount returns (results, total, error)
-		if c.paginate && qt.isList {
-			c.write("%s, _total, err := %s", s.Name, expr)
-			c.hasTotalVar = true
+		if c.paginate && qt.isList && isCountedPaginationQuery(s.Value) {
+			totalName := "_luxoTotal" + str.Capitalize(s.Name)
+			c.write("%s, %s, err := %s", s.Name, totalName, expr)
+			c.paginationTotals[s.Name] = totalName
 		} else {
 			c.write("%s, err := %s", s.Name, expr)
 		}
@@ -306,7 +309,8 @@ func (c *compiler) compileVal(s *ast.ValStmt) {
 	} else {
 		if list, ok := s.Value.(*ast.ListExpr); ok && c.api != nil && c.api.ReturnType != nil && c.api.ReturnType.IsList {
 			expr = c.compileTypedList(list, c.api.ReturnType)
-			c.vars[s.Name] = valType{name: c.api.ReturnType.Name, isList: true}
+			_, isModel := c.models[c.api.ReturnType.Name]
+			c.vars[s.Name] = valType{name: c.api.ReturnType.Name, isList: true, isModel: isModel}
 		}
 		// Wrap bare integer literals in int64() to match Luxo's Int = int64
 		if lit, ok := s.Value.(*ast.Literal); ok && lit.Kind == token.Int {
@@ -323,6 +327,14 @@ func (c *compiler) compileVal(s *ast.ValStmt) {
 		// Track when-expression type based on API return type
 		if _, ok := s.Value.(*ast.WhenExpr); ok && c.api != nil && c.api.ReturnType != nil {
 			c.vars[s.Name] = valType{name: c.api.ReturnType.Name}
+		}
+		if source, ok := s.Value.(*ast.Ident); ok {
+			if sourceType, exists := c.vars[source.Name]; exists {
+				c.vars[s.Name] = sourceType
+			}
+			if totalName := c.paginationTotals[source.Name]; totalName != "" {
+				c.paginationTotals[s.Name] = totalName
+			}
 		}
 	}
 }
@@ -369,13 +381,19 @@ func (c *compiler) compileReturn(s *ast.ReturnStmt) {
 	// 1. Direct model query chain — extract to temp var, then WriteLuxo
 	if c.isModelQuery(s.Value) {
 		qt := c.resolveQueryType(s.Value)
-		// Extract query result to temp variable (query returns (result, error))
-		c.write("_result, err := %s", expr)
-		c.write("if err != nil {\n%s\treturn err\n%s}", c.indent, c.indent)
-		c.writeComputedResolve(qt.name, "_result", qt.isList)
-		if qt.isList {
-			c.write("WriteColumnar%s(req.Buf, _result, req.FieldMask)", qt.name)
+		// Extract query result to temp variable (query returns (result, error)).
+		totalName := ""
+		if c.paginate && qt.isList && isCountedPaginationQuery(s.Value) {
+			totalName = c.nextPaginationName("Total")
+			c.write("_result, %s, err := %s", totalName, expr)
 		} else {
+			c.write("_result, err := %s", expr)
+		}
+		c.write("if err != nil {\n%s\treturn err\n%s}", c.indent, c.indent)
+		if qt.isList {
+			c.writeModelListReturn("_result", qt.name, totalName)
+		} else {
+			c.writeComputedResolve(qt.name, "_result", false)
 			c.write("_result.WriteLuxo(req.Buf, req.FieldMask)")
 		}
 		c.write("return nil")
@@ -400,17 +418,10 @@ func (c *compiler) compileReturn(s *ast.ReturnStmt) {
 // Always writes Luxo binary — Luvia converts to JSON if needed.
 func (c *compiler) writeReturnByType(expr string, vt valType) {
 	if vt.isModel {
-		c.writeComputedResolve(vt.name, expr, vt.isList)
 		if vt.isList {
-			if c.paginate && c.hasTotalVar {
-				c.write("WriteColumnar%s(req.Buf, %s, req.FieldMask)", vt.name, expr)
-				c.write("req.Buf.B = codec.AppendSvarint(req.Buf.B, _total)")
-				c.write("req.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.Page))")
-				c.write("req.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.PageSize))")
-			} else {
-				c.write("WriteColumnar%s(req.Buf, %s, req.FieldMask)", vt.name, expr)
-			}
+			c.writeModelListReturn(expr, vt.name, c.paginationTotals[expr])
 		} else {
+			c.writeComputedResolve(vt.name, expr, false)
 			c.write("%s.WriteLuxo(req.Buf, req.FieldMask)", expr)
 		}
 		return
@@ -439,8 +450,14 @@ func (c *compiler) writeScalarReturn(expr string) {
 		typeName := c.api.ReturnType.Name
 		if model := c.models[typeName]; model != nil {
 			if c.api.ReturnType.IsList {
-				c.writeComputedResolve(typeName, expr, true)
-				c.write("WriteColumnar%s(req.Buf, %s, req.FieldMask)", typeName, expr)
+				if c.paginate {
+					resultName := c.nextPaginationName("Result")
+					c.write("%s := %s", resultName, expr)
+					c.writeModelListReturn(resultName, typeName, "")
+				} else {
+					c.writeComputedResolve(typeName, expr, true)
+					c.write("WriteColumnar%s(req.Buf, %s, req.FieldMask)", typeName, expr)
+				}
 			} else {
 				c.write("_result := %s", expr)
 				c.writeComputedResolve(typeName, "&_result", false)
@@ -468,6 +485,44 @@ func (c *compiler) writeScalarReturn(expr string) {
 		}
 	}
 	c.write("_ = %s // unsupported return type for binary encoding", expr)
+}
+
+func (c *compiler) writeModelListReturn(expr, modelName, totalName string) {
+	if c.paginate && totalName == "" {
+		totalName = c.writeInMemoryPagination(expr)
+	}
+	c.writeComputedResolve(modelName, expr, true)
+	c.write("WriteColumnar%s(req.Buf, %s, req.FieldMask)", modelName, expr)
+	if c.paginate {
+		c.write("req.Buf.B = codec.AppendSvarint(req.Buf.B, %s)", totalName)
+		c.write("req.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.Page))")
+		c.write("req.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.PageSize))")
+	}
+}
+
+func (c *compiler) writeInMemoryPagination(expr string) string {
+	totalName := c.nextPaginationName("Total")
+	suffix := strings.TrimPrefix(totalName, "_luxoTotal")
+	startName := "_luxoStart" + suffix
+	endName := "_luxoEnd" + suffix
+	pageName := "_luxoPage" + suffix
+	c.write("%s := int64(len(%s))", totalName, expr)
+	c.write("if req.PageSize > 0 {")
+	c.indent += "\t"
+	c.write("%s := req.Page - 1", pageName)
+	c.write("%s := len(%s)", startName, expr)
+	c.write("if %s <= len(%s)/req.PageSize { %s = %s * req.PageSize }", pageName, expr, startName, pageName)
+	c.write("%s := len(%s)", endName, expr)
+	c.write("if req.PageSize < %s-%s { %s = %s + req.PageSize }", endName, startName, endName, startName)
+	c.write("%s = %s[%s:%s]", expr, expr, startName, endName)
+	c.indent = strings.TrimSuffix(c.indent, "\t")
+	c.write("}")
+	return totalName
+}
+
+func (c *compiler) nextPaginationName(kind string) string {
+	c.paginationTmp++
+	return fmt.Sprintf("_luxo%s%d", kind, c.paginationTmp)
 }
 
 func (c *compiler) writeComputedResolve(modelName, expr string, list bool) {
@@ -1741,6 +1796,11 @@ func (c *compiler) isModelQuery(expr ast.Expr) bool {
 	return false
 }
 
+func isCountedPaginationQuery(expr ast.Expr) bool {
+	chain := flattenChain(expr)
+	return len(chain) >= 2 && chain[len(chain)-1].method == "all"
+}
+
 // compileUpdateChain compiles .update(field: val, ...) → .Update(ctx, SetField{...}, ...)
 // Checks @hash fields and auto-hashes values before update.
 func (c *compiler) compileUpdateChain(b *strings.Builder, modelName string, args []*ast.NamedArg) {
@@ -2147,7 +2207,11 @@ func (c *compiler) compileTypedList(e *ast.ListExpr, listType *ast.TypeRef) stri
 	for _, item := range e.Items {
 		items = append(items, c.compileExpr(item))
 	}
-	return resolveGoType(listType) + "{" + strings.Join(items, ", ") + "}"
+	goType := resolveGoType(listType)
+	if _, isModel := c.models[listType.Name]; isModel {
+		goType = "[]*" + listType.Name
+	}
+	return goType + "{" + strings.Join(items, ", ") + "}"
 }
 
 // compileTemplate: "hello ${name}: ${count} items"

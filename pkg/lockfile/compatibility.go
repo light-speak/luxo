@@ -81,7 +81,7 @@ func collectContracts(files []*ast.File) wireContracts {
 			contracts.events[event.Name] = params
 		}
 		for _, api := range file.APIs {
-			contracts.apis[api.Name] = newAPIContract(api.Params, api.ReturnType)
+			contracts.apis[api.Name] = newAPIContract(api.EffectiveParams(), api.ReturnType)
 		}
 		for _, fn := range file.Functions {
 			if hasServiceDirective(fn) {

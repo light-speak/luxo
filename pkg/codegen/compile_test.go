@@ -17,11 +17,12 @@ func newCompiler(models map[string]*ast.ModelDecl) *compiler {
 	}
 	var b strings.Builder
 	return &compiler{
-		b:      &b,
-		indent: "\t\t",
-		models: models,
-		api:    &ast.ApiDecl{Name: "test"},
-		vars:   make(map[string]valType),
+		b:                &b,
+		indent:           "\t\t",
+		models:           models,
+		api:              &ast.ApiDecl{Name: "test"},
+		vars:             make(map[string]valType),
+		paginationTotals: make(map[string]string),
 	}
 }
 
@@ -6217,12 +6218,12 @@ func TestWriteReturnByTypeModelList(t *testing.T) {
 func TestWriteReturnByTypePaginatedList(t *testing.T) {
 	c := newCompiler(nil)
 	c.paginate = true
-	c.hasTotalVar = true
+	c.paginationTotals["posts"] = "_luxoTotalPosts"
 	c.writeReturnByType("posts", valType{isModel: true, isList: true, name: "Post"})
 	out := compilerOut(c)
 	// Binary mode paginated response
-	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, _total)") {
-		t.Fatalf("missing _total in binary paginated response, got:\n%s", out)
+	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, _luxoTotalPosts)") {
+		t.Fatalf("missing query total in binary paginated response, got:\n%s", out)
 	}
 	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, int64(req.Page))") {
 		t.Fatalf("missing page in binary paginated response, got:\n%s", out)
@@ -6704,11 +6705,33 @@ func TestCompileValPaginateAllWithCount(t *testing.T) {
 		},
 	})
 	out := compilerOut(c)
-	if !strings.Contains(out, "_total") {
-		t.Fatalf("paginate + all should generate _total, got:\n%s", out)
+	if !strings.Contains(out, "_luxoTotalPosts") {
+		t.Fatalf("paginate + all should generate a variable-specific total, got:\n%s", out)
 	}
 	if !strings.Contains(out, "AllWithCount") {
 		t.Fatalf("paginate + all should call AllWithCount, got:\n%s", out)
+	}
+}
+
+func TestCompilePaginatedLoadUsesInMemoryTotal(t *testing.T) {
+	c := newCompiler(makeModels("Post"))
+	c.paginate = true
+	load := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "load"},
+		Args: []*ast.NamedArg{{Name: "userId", Value: &ast.Ident{Name: "userId"}}},
+	}
+	c.compileStmt(&ast.ValStmt{Name: "posts", Value: load})
+	c.compileReturn(&ast.ReturnStmt{Value: &ast.Ident{Name: "posts"}})
+
+	out := compilerOut(c)
+	if !strings.Contains(out, "posts, err := app.loaders.PostByUserId.Load") {
+		t.Fatalf("paginated load must use its two-value result, got:\n%s", out)
+	}
+	if !strings.Contains(out, "_luxoTotal1 := int64(len(posts))") {
+		t.Fatalf("paginated load must use in-memory total, got:\n%s", out)
+	}
+	if strings.Contains(out, "posts, _luxoTotalPosts, err :=") {
+		t.Fatalf("paginated load was treated as AllWithCount, got:\n%s", out)
 	}
 }
 
@@ -6796,18 +6819,96 @@ func TestCompileAwaitWithNonValStmts(t *testing.T) {
 // ─── compileLoad ───────────────────────────────────────────────────────────
 
 func TestWriteReturnByTypePaginatedList_NoTotal(t *testing.T) {
-	// @paginate set but _total not assigned — should fall through to non-paginated
 	c := newCompiler(nil)
 	c.paginate = true
-	c.hasTotalVar = false
 	c.writeReturnByType("posts", valType{isModel: true, isList: true, name: "Post"})
 	out := compilerOut(c)
-	// Should write columnar but NOT append _total
 	if !strings.Contains(out, "WriteColumnarPost(req.Buf, posts, req.FieldMask)") {
 		t.Fatalf("missing WriteColumnar, got:\n%s", out)
 	}
-	if strings.Contains(out, "_total") {
-		t.Fatalf("should not reference _total when hasTotalVar is false, got:\n%s", out)
+	for _, want := range []string{
+		"_luxoTotal1 := int64(len(posts))",
+		"posts = posts[_luxoStart1:_luxoEnd1]",
+		"codec.AppendSvarint(req.Buf.B, _luxoTotal1)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("in-memory pagination missing %q, got:\n%s", want, out)
+		}
+	}
+}
+
+func TestCompilePaginatedModelListLiteral(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	c.paginate = true
+	c.api.ReturnType = &ast.TypeRef{Name: "User", IsList: true}
+	c.compileStmt(&ast.ValStmt{Name: "users", Value: &ast.ListExpr{}})
+	c.compileReturn(&ast.ReturnStmt{Value: &ast.Ident{Name: "users"}})
+
+	out := compilerOut(c)
+	for _, want := range []string{
+		"users := []*User{}",
+		"_luxoTotal1 := int64(len(users))",
+		"WriteColumnarUser(req.Buf, users, req.FieldMask)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("paginated model list literal missing %q, got:\n%s", want, out)
+		}
+	}
+}
+
+func TestCompileReturnPaginatedQueryUsesExactTotal(t *testing.T) {
+	c := newCompiler(makeModels("Post"))
+	c.paginate = true
+	c.api.ReturnType = &ast.TypeRef{Name: "Post", IsList: true}
+	c.compileReturn(&ast.ReturnStmt{Value: &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "all"},
+	}})
+
+	out := compilerOut(c)
+	for _, want := range []string{
+		"_result, _luxoTotal1, err := app.Post.Limit(req.PageSize).Offset((req.Page - 1) * req.PageSize).AllWithCount(ctx)",
+		"codec.AppendSvarint(req.Buf.B, _luxoTotal1)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("direct paginated query missing %q, got:\n%s", want, out)
+		}
+	}
+}
+
+func TestPaginatedQueryTotalsDoNotContaminateVariables(t *testing.T) {
+	c := newCompiler(makeModels("Post", "User"))
+	c.paginate = true
+	for _, query := range []struct{ variable, model string }{{"posts", "Post"}, {"users", "User"}} {
+		c.compileStmt(&ast.ValStmt{Name: query.variable, Value: &ast.CallExpr{
+			Func: &ast.MemberExpr{Object: &ast.Ident{Name: query.model}, Field: "all"},
+		}})
+	}
+	c.writeReturnByType("posts", valType{isModel: true, isList: true, name: "Post"})
+
+	out := compilerOut(c)
+	if !strings.Contains(out, "posts, _luxoTotalPosts, err :=") || !strings.Contains(out, "users, _luxoTotalUsers, err :=") {
+		t.Fatalf("query totals must use distinct variables, got:\n%s", out)
+	}
+	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, _luxoTotalPosts)") {
+		t.Fatalf("returned list used another query's total, got:\n%s", out)
+	}
+}
+
+func TestPaginatedQueryTotalFollowsListAlias(t *testing.T) {
+	c := newCompiler(makeModels("Post"))
+	c.paginate = true
+	c.compileStmt(&ast.ValStmt{Name: "posts", Value: &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "all"},
+	}})
+	c.compileStmt(&ast.ValStmt{Name: "result", Value: &ast.Ident{Name: "posts"}})
+	c.compileReturn(&ast.ReturnStmt{Value: &ast.Ident{Name: "result"}})
+
+	out := compilerOut(c)
+	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, _luxoTotalPosts)") {
+		t.Fatalf("aliased query result lost its exact total, got:\n%s", out)
+	}
+	if strings.Contains(out, "int64(len(result))") {
+		t.Fatalf("aliased query result was paginated twice, got:\n%s", out)
 	}
 }
 

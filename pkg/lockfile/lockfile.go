@@ -400,8 +400,8 @@ func (lf *LockFile) updateAPIs(files []*ast.File) {
 	// Declared APIs — params from AST
 	for _, file := range files {
 		for _, api := range file.APIs {
-			var params []string
-			for _, p := range api.Params {
+			params := make([]string, 0, len(api.Params)+2)
+			for _, p := range api.EffectiveParams() {
 				params = append(params, p.Name)
 			}
 			ensure(api.Name, params)

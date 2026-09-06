@@ -307,11 +307,12 @@ func buildParamTypesFromAST(files []*ast.File) map[string]map[string]string {
 	}
 	for _, file := range files {
 		for _, a := range file.APIs {
-			if len(a.Params) == 0 {
+			params := a.EffectiveParams()
+			if len(params) == 0 {
 				continue
 			}
-			m := make(map[string]string, len(a.Params))
-			for _, p := range a.Params {
+			m := make(map[string]string, len(params))
+			for _, p := range params {
 				if p.Type != nil {
 					m[p.Name] = binaryParamType(p.Type, enums)
 				}

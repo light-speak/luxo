@@ -120,6 +120,7 @@ type API struct {
 	ReturnType       string  `json:"returnType,omitempty"`
 	ReturnList       bool    `json:"returnList,omitempty"`
 	Paginated        bool    `json:"paginated,omitempty"`
+	DefaultPageSize  int     `json:"defaultPageSize,omitempty"`
 	Stream           bool    `json:"stream,omitempty"`
 	Params           []Param `json:"params,omitempty"`
 	Deprecated       bool    `json:"deprecated,omitempty"`

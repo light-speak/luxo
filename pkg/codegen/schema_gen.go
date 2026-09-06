@@ -14,14 +14,15 @@ import (
 // that registers model and API metadata with the Luvia schema registry.
 // This enables schema-driven Binary↔JSON conversion at the Luvia layer.
 type schemaAPIInfo struct {
-	name           string
-	moduleName     string
-	params         []*ast.ParamDecl
-	optionalParams map[string]bool
-	returnType     *ast.TypeRef
-	paginated      bool
-	stream         bool
-	directives     []*ast.Directive
+	name            string
+	moduleName      string
+	params          []*ast.ParamDecl
+	optionalParams  map[string]bool
+	returnType      *ast.TypeRef
+	paginated       bool
+	defaultPageSize int
+	stream          bool
+	directives      []*ast.Directive
 }
 
 func generateSchemaFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
@@ -110,7 +111,7 @@ func (g *GeneratorContext) generateSchemaFile(result *semantic.Result, packageNa
 
 	// Register APIs
 	for _, api := range apis {
-		g.writeAPIRegistrationSchema(&b, api.name, api.moduleName, api.params, api.returnType, api.paginated, api.stream, enums, api.optionalParams, api.directives)
+		g.writeAPIRegistrationSchema(&b, api.name, api.moduleName, api.params, api.returnType, api.paginated, api.defaultPageSize, api.stream, enums, api.optionalParams, api.directives)
 	}
 
 	// Register type declarations (non-DB types like AuthPayload)
@@ -151,9 +152,12 @@ func (g *GeneratorContext) collectSchemaAPIs(result *semantic.Result, enums map[
 			}
 		}
 		for _, api := range file.APIs {
+			paginated := hasDirective(api.Directives, "paginate")
 			apis = append(apis, schemaAPIInfo{
 				name: api.Name, moduleName: modName,
-				params: api.Params, returnType: api.ReturnType, stream: hasDirective(api.Directives, "stream"), directives: api.Directives,
+				params: api.EffectiveParams(), returnType: api.ReturnType,
+				paginated: paginated, defaultPageSize: paginationDefaultPageSize(api, paginated),
+				stream: hasDirective(api.Directives, "stream"), directives: api.Directives,
 			})
 		}
 		for _, fn := range file.Functions {
@@ -213,10 +217,12 @@ func buildCrudAPIInfo(model *ast.ModelDecl, op, modName string, enums map[string
 	case "list":
 		ai.returnType = &ast.TypeRef{Name: modelName, IsList: true}
 		ai.paginated = true
+		ai.defaultPageSize = ast.DefaultPaginationPageSize
 		ai.params = []*ast.ParamDecl{
 			{Name: "page", Type: &ast.TypeRef{Name: "Int"}},
 			{Name: "pageSize", Type: &ast.TypeRef{Name: "Int"}},
 		}
+		ai.optionalParams = map[string]bool{"page": true, "pageSize": true}
 	case "create":
 		ai.returnType = &ast.TypeRef{Name: modelName}
 		ai.params = crudParamDecls(model, enums, false)
@@ -349,7 +355,7 @@ func writeEnumRegistration(b *strings.Builder, enumDecl *ast.EnumDecl, moduleNam
 }
 
 // writeAPIRegistrationSchema generates schema.RegisterAPI for one API.
-func (g *GeneratorContext) writeAPIRegistrationSchema(b *strings.Builder, name, moduleName string, params []*ast.ParamDecl, returnType *ast.TypeRef, paginated, stream bool, enums map[string]bool, optionalParams map[string]bool, directives ...[]*ast.Directive) {
+func (g *GeneratorContext) writeAPIRegistrationSchema(b *strings.Builder, name, moduleName string, params []*ast.ParamDecl, returnType *ast.TypeRef, paginated bool, defaultPageSize int, stream bool, enums map[string]bool, optionalParams map[string]bool, directives ...[]*ast.Directive) {
 	apiID := g.apiID(name)
 	fmt.Fprintf(b, "\ts.RegisterAPI(&schema.API{\n")
 	fmt.Fprintf(b, "\t\tID: %d, Name: %q, Module: %q,\n", apiID, name, moduleName)
@@ -358,6 +364,7 @@ func (g *GeneratorContext) writeAPIRegistrationSchema(b *strings.Builder, name, 
 	}
 	if paginated {
 		fmt.Fprintf(b, "\t\tPaginated: true,\n")
+		fmt.Fprintf(b, "\t\tDefaultPageSize: %d,\n", defaultPageSize)
 	}
 	if stream {
 		fmt.Fprintf(b, "\t\tStream: true,\n")
@@ -591,9 +598,10 @@ func (g *GeneratorContext) buildSchemaAPIs(s *schema.Schema, result *semantic.Re
 					a.ReturnType = m.Name
 					a.ReturnList = true
 					a.Paginated = true
+					a.DefaultPageSize = ast.DefaultPaginationPageSize
 					a.Params = []schema.Param{
-						{ID: g.apiParamID(apiName, "page"), Name: "page", Type: schema.FieldInt},
-						{ID: g.apiParamID(apiName, "pageSize"), Name: "pageSize", Type: schema.FieldInt},
+						{ID: g.apiParamID(apiName, "page"), Name: "page", Type: schema.FieldInt, HasDefault: true},
+						{ID: g.apiParamID(apiName, "pageSize"), Name: "pageSize", Type: schema.FieldInt, HasDefault: true},
 					}
 				case "create":
 					a.ReturnType = m.Name
@@ -618,8 +626,9 @@ func (g *GeneratorContext) buildSchemaAPIs(s *schema.Schema, result *semantic.Re
 				a.ReturnList = api.ReturnType.IsList
 			}
 			a.Paginated = hasDirective(api.Directives, "paginate")
+			a.DefaultPageSize = paginationDefaultPageSize(api, a.Paginated)
 			a.Stream = hasDirective(api.Directives, "stream")
-			for _, p := range api.Params {
+			for _, p := range api.EffectiveParams() {
 				a.Params = append(a.Params, schema.Param{
 					ID: g.apiParamID(api.Name, p.Name), Name: p.Name,
 					Type:       luxoParamToSchemaFieldType(p.Type.Name, enums),
@@ -632,6 +641,13 @@ func (g *GeneratorContext) buildSchemaAPIs(s *schema.Schema, result *semantic.Re
 			s.RegisterAPI(a)
 		}
 	}
+}
+
+func paginationDefaultPageSize(api *ast.ApiDecl, paginated bool) int {
+	if !paginated {
+		return 0
+	}
+	return api.DefaultPageSize()
 }
 
 func (g *GeneratorContext) schemaParamForModelID(apiName string, model *ast.ModelDecl, enums map[string]bool, list bool) schema.Param {

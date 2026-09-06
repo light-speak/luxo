@@ -562,6 +562,39 @@ func TestDirectiveRateLimitRejectsInvalidConfiguration(t *testing.T) {
 	}
 }
 
+func TestPaginateDirectiveAcceptsBoundedDefaultPageSize(t *testing.T) {
+	result := analyze(t, `
+model User { id: Int }
+api browseUsers(status: String?): [User] @paginate(defaultPageSize: 50)
+`)
+	expectNoErrors(t, result)
+}
+
+func TestPaginateDirectiveRejectsInvalidConfiguration(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"non-integer default", `api browse(): [Int] @paginate(defaultPageSize: "50")`, "positive integer"},
+		{"zero default", `api browse(): [Int] @paginate(defaultPageSize: 0)`, "positive integer"},
+		{"oversized default", `api browse(): [Int] @paginate(defaultPageSize: 101)`, "at most 100"},
+		{"scalar return", `api browse(): Int @paginate`, "must return a non-nullable list"},
+		{"nullable list return", `api browse(): [Int]? @paginate`, "must return a non-nullable list"},
+		{"primitive list return", `api browse(): [Int] @paginate`, "must return a model list"},
+		{"native API", `model User { id: Int } api browse(): [User] @paginate @native`, "cannot be combined with @native"},
+		{"duplicate directive", `api browse(): [Int] @paginate @paginate`, "may only be declared once"},
+		{"reserved page", `api browse(page: Int): [Int] @paginate`, "automatically injects 'page'"},
+		{"reserved page size", `api browse(pageSize: Int): [Int] @paginate`, "automatically injects 'pageSize'"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := analyze(t, tt.input)
+			expectError(t, result, tt.want)
+		})
+	}
+}
+
 func TestDirectiveIndexFields(t *testing.T) {
 	result := analyze(t, `model User @index(fields: ["name", "email"]) { name: String }`)
 	expectNoErrors(t, result)
