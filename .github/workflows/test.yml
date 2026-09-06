@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -36,6 +39,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@v7
         with:
@@ -70,6 +75,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@v7
         with:
@@ -103,6 +110,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@v7
         with:
@@ -141,6 +150,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@v7
         with:
@@ -157,6 +168,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Check out benchmark baseline
         uses: actions/checkout@v7
@@ -189,19 +202,27 @@ jobs:
               done |
               sort -u
           }
-          mkdir -p .tmp/bin/base .tmp/bin/head .tmp/test-tmp
-          benchmark_packages > .tmp/head-benchmark-packages.txt
+          mkdir -p .tmp/bin/base .tmp/bin/head .tmp/head .tmp/test-tmp
+          git archive HEAD | tar -x -C .tmp/head
           (
             cd .tmp/base
             benchmark_packages
           ) > .tmp/base-benchmark-packages.txt
+          (
+            cd .tmp/head
+            benchmark_packages
+          ) > .tmp/head-benchmark-packages.txt
           comm -12 .tmp/base-benchmark-packages.txt .tmp/head-benchmark-packages.txt > .tmp/benchmark-packages.txt
           while IFS= read -r package; do
             binary="${package//\//-}.test"
-            GOWORK=off go test -c "./${package}" -o ".tmp/bin/head/${binary}"
-            cd .tmp/base
-            GOWORK=off go test -c "./${package}" -o "${GITHUB_WORKSPACE}/.tmp/bin/base/${binary}"
-            cd "${GITHUB_WORKSPACE}"
+            (
+              cd .tmp/base
+              GOWORK=off go test -trimpath -c "./${package}" -o "${GITHUB_WORKSPACE}/.tmp/bin/base/${binary}"
+            )
+            (
+              cd .tmp/head
+              GOWORK=off go test -trimpath -c "./${package}" -o "${GITHUB_WORKSPACE}/.tmp/bin/head/${binary}"
+            )
           done < .tmp/benchmark-packages.txt
 
       - name: Run interleaved benchmark samples
@@ -213,32 +234,33 @@ jobs:
           head_output="${GITHUB_WORKSPACE}/.tmp/benchmark-head.txt"
           : > "${base_output}"
           : > "${head_output}"
-          run_suite() {
+          run_package() {
             local source_root="$1"
             local binary_root="$2"
             local output="$3"
-            while IFS= read -r package; do
-              local binary="${package//\//-}.test"
-              (
-                cd "${source_root}/${package}"
-                "${binary_root}/${binary}" \
-                  -test.run='^$' \
-                  -test.bench=. \
-                  -test.benchmem \
-                  -test.benchtime=200ms \
-                  -test.count=1 \
-                  -test.cpu=2
-              ) >> "${output}"
-            done < "${GITHUB_WORKSPACE}/.tmp/benchmark-packages.txt"
+            local package="$4"
+            local binary="${package//\//-}.test"
+            (
+              cd "${source_root}/${package}"
+              "${binary_root}/${binary}" \
+                -test.run='^$' \
+                -test.bench=. \
+                -test.benchmem \
+                -test.benchtime=200ms \
+                -test.count=1 \
+                -test.cpu=2
+            ) >> "${output}"
           }
           for sample in {1..10}; do
-            if (( sample % 2 == 1 )); then
-              run_suite "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}"
-              run_suite "${GITHUB_WORKSPACE}" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}"
-            else
-              run_suite "${GITHUB_WORKSPACE}" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}"
-              run_suite "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}"
-            fi
+            while IFS= read -r package; do
+              if (( sample % 2 == 1 )); then
+                run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}"
+                run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}"
+              else
+                run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}"
+                run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}"
+              fi
+            done < "${GITHUB_WORKSPACE}/.tmp/benchmark-packages.txt"
           done
 
       - name: Enforce performance baseline
@@ -251,6 +273,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@v7
         with:
@@ -273,6 +297,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@v7
         with:
@@ -295,6 +321,8 @@ jobs:
         package: [client, react, vite-plugin]
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: pnpm/action-setup@v6
         with:
@@ -323,6 +351,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: dart-lang/setup-dart@v1
 
@@ -344,6 +374,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-java@v6
         with:
@@ -387,6 +419,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Check out Swift SDK
         uses: actions/checkout@v7
