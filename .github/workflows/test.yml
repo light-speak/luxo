@@ -182,11 +182,19 @@ jobs:
       - name: Compile benchmark binaries
         run: |
           set -euo pipefail
+          benchmark_packages() {
+            find pkg -type f -name '*_test.go' -exec grep -l '^func Benchmark' {} + |
+              while IFS= read -r file; do
+                dirname "${file}"
+              done |
+              sort -u
+          }
           mkdir -p .tmp/bin/base .tmp/bin/head .tmp/test-tmp
-          rg -l '^func Benchmark' pkg --glob '*_test.go' | xargs -n1 dirname | sort -u > .tmp/head-benchmark-packages.txt
-          cd .tmp/base
-          rg -l '^func Benchmark' pkg --glob '*_test.go' | xargs -n1 dirname | sort -u > ../base-benchmark-packages.txt
-          cd "${GITHUB_WORKSPACE}"
+          benchmark_packages > .tmp/head-benchmark-packages.txt
+          (
+            cd .tmp/base
+            benchmark_packages
+          ) > .tmp/base-benchmark-packages.txt
           comm -12 .tmp/base-benchmark-packages.txt .tmp/head-benchmark-packages.txt > .tmp/benchmark-packages.txt
           while IFS= read -r package; do
             binary="${package//\//-}.test"
