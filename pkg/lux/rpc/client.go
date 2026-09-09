@@ -7,13 +7,25 @@ import (
 	"sync"
 	"time"
 
+	"github.com/light-speak/luxo/pkg/lux/api"
 	"github.com/light-speak/luxo/pkg/lux/codec"
+	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
 )
 
 // Client sends RPC requests to a remote Luxo service.
 // Uses connection pooling for high throughput.
 type Client struct {
+	name string
 	pool *Pool
+}
+
+// TraceTarget describes the logical operation and selected field behind an RPC call.
+type TraceTarget struct {
+	Operation  string
+	Field      string
+	FieldPath  string
+	Selection  string
+	Dependency api.TraceDependency
 }
 
 // Subscription is a dedicated server-streaming RPC connection.
@@ -47,6 +59,11 @@ func NewClient(addr string) *Client {
 	return &Client{pool: NewPool(addr, 32)}
 }
 
+// NewNamedClient creates a client whose debug traces identify the target service.
+func NewNamedClient(name, addr string) *Client {
+	return &Client{name: name, pool: NewPool(addr, 32)}
+}
+
 // Call sends a binary-encoded request and returns the response body.
 // apiID: from luxo.lock. params: pre-encoded binary (fieldID+value pairs + 0x00).
 // Returns the response body (without status byte) and any error.
@@ -64,9 +81,33 @@ func (c *Client) CallWithMask(apiID int, fieldMask []byte, params []byte) ([]byt
 // CallWithMaskContext sends an authenticated request and propagates cancellation
 // and deadlines to the network operation.
 func (c *Client) CallWithMaskContext(ctx context.Context, bearerToken string, apiID int, fieldMask []byte, params []byte) ([]byte, error) {
+	return c.CallWithMaskTargetContext(ctx, bearerToken, apiID, fieldMask, params, TraceTarget{})
+}
+
+// CallWithMaskTargetContext adds service and field attribution when detailed
+// tracing is explicitly enabled on ctx. The normal path keeps the v1 envelope.
+func (c *Client) CallWithMaskTargetContext(ctx context.Context, bearerToken string, apiID int, fieldMask []byte, params []byte, target TraceTarget) ([]byte, error) {
 	request := encodeCallRequest(apiID, fieldMask, params)
-	payload := encodeRequestEnvelope(requestKindCall, bearerToken, request)
-	return c.callPayload(ctx, payload)
+	trace := api.DebugTrace(ctx)
+	if trace == nil {
+		payload := encodeRequestEnvelope(requestKindCall, bearerToken, request)
+		return c.callPayload(ctx, payload)
+	}
+	fieldPath := target.FieldPath
+	if fieldPath == "" {
+		fieldPath = api.JoinTraceFieldPath(api.TraceFieldPath(ctx), target.Field)
+	}
+	target.FieldPath = fieldPath
+	_, callSpan := trace.StartSpan(ctx, api.DebugSpanMeta{
+		Name: "service.call", Category: "service", Service: c.traceName(), Operation: target.Operation,
+		Field: target.Field, FieldPath: fieldPath, Selection: target.Selection, Dependency: target.Dependency,
+	})
+	payload := encodeTracedRequestEnvelope(requestKindCall, bearerToken, api.TraceID(ctx), fieldPath, trace.DatabaseDetails(), request)
+	body, remote, err := c.callTracedPayload(ctx, payload)
+	applyTraceDefaults(&remote, c.traceName(), target)
+	trace.MergeSpan(callSpan, remote)
+	trace.FinishSpan(callSpan)
+	return body, err
 }
 
 // SubscribeContext opens a dedicated binary RPC stream. The connection is not
@@ -187,6 +228,28 @@ func encodeCallRequest(apiID int, fieldMask []byte, params []byte) []byte {
 }
 
 func (c *Client) callPayload(ctx context.Context, payload []byte) ([]byte, error) {
+	resp, err := c.exchange(ctx, payload)
+	if err != nil {
+		return nil, err
+	}
+	if len(resp) == 0 {
+		return nil, fmt.Errorf("rpc: empty response")
+	}
+
+	status := resp[0]
+	body := resp[1:]
+
+	if status == statusError {
+		return nil, decodeError(body)
+	}
+	if status != statusOK {
+		return nil, fmt.Errorf("rpc: invalid unary response status %d", status)
+	}
+
+	return body, nil
+}
+
+func (c *Client) exchange(ctx context.Context, payload []byte) ([]byte, error) {
 	// Get pooled connection
 	conn, err := c.pool.GetContext(ctx)
 	if err != nil {
@@ -241,21 +304,71 @@ func (c *Client) callPayload(ctx context.Context, payload []byte) ([]byte, error
 		conn.Close()
 	}
 
+	return resp, nil
+}
+
+func (c *Client) callTracedPayload(ctx context.Context, payload []byte) ([]byte, api.DebugTraceSnapshot, error) {
+	resp, err := c.exchange(ctx, payload)
+	if err != nil {
+		return nil, api.DebugTraceSnapshot{}, err
+	}
+	return decodeTracedResponse(resp)
+}
+
+func decodeTracedResponse(resp []byte) ([]byte, api.DebugTraceSnapshot, error) {
 	if len(resp) == 0 {
-		return nil, fmt.Errorf("rpc: empty response")
+		return nil, api.DebugTraceSnapshot{}, fmt.Errorf("rpc: empty traced response")
 	}
-
 	status := resp[0]
-	body := resp[1:]
-
-	if status == statusError {
-		return nil, decodeError(body)
+	if status != statusTraceOK && status != statusTraceError {
+		if status == statusError {
+			return nil, api.DebugTraceSnapshot{}, decodeError(resp[1:])
+		}
+		return nil, api.DebugTraceSnapshot{}, fmt.Errorf("rpc: invalid traced response status %d", status)
 	}
-	if status != statusOK {
-		return nil, fmt.Errorf("rpc: invalid unary response status %d", status)
+	traceLength, consumed := codec.ReadVarint(resp, 1)
+	if consumed <= 0 {
+		return nil, api.DebugTraceSnapshot{}, fmt.Errorf("rpc: invalid traced response length")
 	}
+	start := 1 + consumed
+	if traceLength > uint64(len(resp)-start) {
+		return nil, api.DebugTraceSnapshot{}, fmt.Errorf("rpc: traced response length exceeds frame")
+	}
+	end := start + int(traceLength)
+	trace, err := api.DecodeDebugTrace(resp[start:end])
+	if err != nil {
+		return nil, api.DebugTraceSnapshot{}, fmt.Errorf("rpc: decode traced response: %w", err)
+	}
+	body := resp[end:]
+	if status == statusTraceError {
+		return nil, trace, decodeError(body)
+	}
+	return body, trace, nil
+}
 
-	return body, nil
+func (c *Client) traceName() string {
+	if c.name != "" {
+		return c.name
+	}
+	return c.pool.addr
+}
+
+func applyTraceDefaults(snapshot *api.DebugTraceSnapshot, service string, target TraceTarget) {
+	for i := range snapshot.Spans {
+		span := &snapshot.Spans[i]
+		if span.Service == "" {
+			span.Service = service
+		}
+		if span.Operation == "" {
+			span.Operation = target.Operation
+		}
+		if span.Field == "" {
+			span.Field = target.Field
+		}
+		if span.FieldPath == "" {
+			span.FieldPath = target.FieldPath
+		}
+	}
 }
 
 // Close closes the connection pool.
@@ -296,7 +409,13 @@ func decodeError(data []byte) error {
 	if seen != 0b111 {
 		return fmt.Errorf("rpc: error envelope missing required fields")
 	}
-	return fmt.Errorf("rpc error %d %s: %s", code, name, message)
+	appErr := &luxerrors.AppError{Name: name, Code: int(code), Message: message}
+	if code >= 500 {
+		appErr.Message = "error.internal"
+		appErr.Internal = true
+		appErr.Cause = fmt.Errorf("rpc error %d %s: %s", code, name, message)
+	}
+	return appErr
 }
 
 // EncodeParams builds binary params from typed values.

@@ -122,58 +122,9 @@ func generateExtendStub(b *strings.Builder, ext *ast.ExtendDecl) {
 	defaultGenerator().generateExtendStub(b, ext)
 }
 
-func (g *GeneratorContext) generateExtendStub(b *strings.Builder, ext *ast.ExtendDecl) {
-	var fields []fieldInfo
-	maxName := 0
-	maxType := 0
-	for _, f := range ext.Fields {
-		fi := fieldInfo{
-			goName:  str.Capitalize(f.Name),
-			goType:  resolveGoType(f.Type),
-			dbTag:   str.ToSnakeCase(f.Name),
-			jsonTag: f.Name,
-		}
-		if f.Computed != nil {
-			fi.dbTag = "-"
-		}
-		if len(fi.goName) > maxName {
-			maxName = len(fi.goName)
-		}
-		if len(fi.goType) > maxType {
-			maxType = len(fi.goType)
-		}
-		fields = append(fields, fi)
-	}
-
+func (g *GeneratorContext) generateExtendStub(b *strings.Builder, ext *ast.ExtendDecl, enumSets ...map[string]bool) {
 	fmt.Fprintf(b, "// %s is a stub for the external %s model (from extend).\n", ext.Name, ext.Name)
-	fmt.Fprintf(b, "type %s struct {\n", ext.Name)
-	// Always include the owner's primary key for foreign-key references and DataLoader.
-	idFieldName := g.externalModelIDFieldName(ext.Name)
-	idGoName := str.Capitalize(idFieldName)
-	hasId := false
-	for _, fi := range fields {
-		if fi.goName == idGoName {
-			hasId = true
-		}
-	}
-	if !hasId {
-		idName := idGoName
-		idType := mapBaseType(g.externalModelIDTypeName(ext.Name))
-		if len(idName) > maxName {
-			maxName = len(idName)
-		}
-		if len(idType) > maxType {
-			maxType = len(idType)
-		}
-		fmt.Fprintf(b, "\t%-*s %-*s `db:%q json:%q`\n", maxName, idName, maxType, idType, str.ToSnakeCase(idFieldName), idFieldName)
-	}
-	for _, fi := range fields {
-		fmt.Fprintf(b, "\t%-*s %-*s `db:%q json:%q`\n",
-			maxName, fi.goName,
-			maxType, fi.goType,
-			fi.dbTag, fi.jsonTag)
-	}
-	b.WriteString("}\n")
+	generateModel(b, g.extendStubModel(ext), firstBoolSet(enumSets))
 }
 
 // collectFieldInfos collects field info from declarations and measures column widths.

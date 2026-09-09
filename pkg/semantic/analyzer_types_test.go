@@ -1463,6 +1463,57 @@ api test(): ObjResult {
 	expectNoErrors(t, result)
 }
 
+func TestWhenExpressionInfersCommonBranchType(t *testing.T) {
+	result := analyze(t, `
+enum Decision { READY BLOCKED }
+api readiness(total: Int): Decision {
+  val decision = when {
+    total > 0 -> Decision.READY
+    else -> Decision.BLOCKED
+  }
+  decision
+}
+`)
+	expectNoErrors(t, result)
+	stmt := result.Files[0].APIs[0].Body.Stmts[0].(*ast.ValStmt)
+	if stmt.Value.GetTypeTag() != "Decision" {
+		t.Fatalf("when type = %q, want Decision", stmt.Value.GetTypeTag())
+	}
+}
+
+func TestWhenExpressionRejectsIncompatibleBranchTypes(t *testing.T) {
+	result := analyze(t, `
+api readiness(total: Int): String {
+  val decision = when {
+    total > 0 -> "ready"
+    else -> 0
+  }
+  decision
+}
+`)
+	expectError(t, result, "when branches must return compatible types")
+}
+
+func TestWhenExpressionMergesNullBranchesAsNullable(t *testing.T) {
+	for _, source := range []string{
+		`api choose(flag: Boolean): String? {
+  val result = when { flag -> null else -> "ready" }
+  result
+}`,
+		`api choose(flag: Boolean): String? {
+  val result = when { flag -> "ready" else -> null }
+  result
+}`,
+	} {
+		result := analyze(t, source)
+		expectNoErrors(t, result)
+		stmt := result.Files[0].APIs[0].Body.Stmts[0].(*ast.ValStmt)
+		if stmt.Value.GetTypeTag() != "String" || !stmt.Value.IsNullable() {
+			t.Fatalf("when type = %q nullable=%v, want String?", stmt.Value.GetTypeTag(), stmt.Value.IsNullable())
+		}
+	}
+}
+
 func TestObjectExprUnknownType(t *testing.T) {
 	result := analyze(t, `
 api test(): String {

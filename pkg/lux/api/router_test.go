@@ -90,6 +90,28 @@ func TestRouterWithSelect(t *testing.T) {
 	}
 }
 
+func TestPrepareRequestRequiresPublicStructuredSelection(t *testing.T) {
+	rt := NewRouter()
+	rt.Schema.RegisterModel(&schema.Model{Name: "User", Fields: []schema.Field{{ID: 1, Name: "id", Type: schema.FieldInt}}})
+	rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "getUser", ReturnType: "User"})
+	rt.Schema.RegisterAPI(&schema.API{ID: 2, Name: "countUsers", ReturnType: "Int"})
+
+	for _, req := range []*Request{
+		{API: "getUser"},
+		{API: "getUser", BinaryMode: true},
+	} {
+		if err := rt.prepareRequest(req, req.BinaryMode); err == nil || !strings.Contains(err.Error(), "$select is required") {
+			t.Fatalf("prepareRequest(%+v) error = %v, want required selection", req, err)
+		}
+	}
+	if err := rt.prepareRequest(&Request{API: "getUser", Internal: true}, false); err != nil {
+		t.Fatalf("internal request must preserve select-all semantics: %v", err)
+	}
+	if err := rt.prepareRequest(&Request{API: "countUsers"}, false); err != nil {
+		t.Fatalf("scalar response must not require a selection: %v", err)
+	}
+}
+
 func TestRouterUnknownAPI(t *testing.T) {
 	rt := NewRouter()
 	body := `{"$api":"notExist"}`
@@ -621,7 +643,7 @@ func TestRouterSchemaConversion(t *testing.T) {
 	})
 
 	// JSON request → handler writes binary → Router converts to JSON via schema
-	body := `{"$api":"getUser","id":1}`
+	body := `{"$api":"getUser","$select":"id,name","id":1}`
 	r := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(body))
 	w := httptest.NewRecorder()
 	rt.ServeHTTP(w, r)
@@ -753,11 +775,16 @@ type mockMetrics struct {
 
 type mockTraceMetrics struct {
 	mockMetrics
-	traces []TraceRecord
+	traces      []TraceRecord
+	sampleTrace bool
 }
 
 func (m *mockTraceMetrics) RecordTrace(record TraceRecord) {
 	m.traces = append(m.traces, record)
+}
+
+func (m *mockTraceMetrics) ShouldTrace(string) bool {
+	return m.sampleTrace
 }
 
 func (m *mockMetrics) Record(api string, duration time.Duration, isError bool) {
@@ -791,6 +818,20 @@ func TestSetMetricsCollector(t *testing.T) {
 	}
 	if mc.calls[0].isError {
 		t.Error("should not be error")
+	}
+}
+
+func TestSetMetricsCollectorCanBeCleared(t *testing.T) {
+	rt := NewRouter()
+	mc := &mockMetrics{}
+	rt.SetMetricsCollector(mc)
+	if got := rt.RequestMetricsRecorder(); got != mc {
+		t.Fatalf("metrics recorder = %T, want configured recorder", got)
+	}
+
+	rt.SetMetricsCollector(nil)
+	if got := rt.RequestMetricsRecorder(); got != nil {
+		t.Fatalf("metrics recorder = %T, want nil", got)
 	}
 }
 
@@ -837,6 +878,32 @@ func TestTraceRecorderReceivesRequestMetadata(t *testing.T) {
 	}
 	if got.ClientName != "typescript" || got.ClientVersion != "1.2.3" {
 		t.Fatalf("client metadata = %q/%q", got.ClientName, got.ClientVersion)
+	}
+}
+
+func TestRouterHeadSamplesDetailedTraceWithoutExposingDebugHeaders(t *testing.T) {
+	rt := NewRouter()
+	mc := &mockTraceMetrics{sampleTrace: true}
+	rt.SetMetricsCollector(mc)
+	rt.Handle("getUser", func(ctx context.Context, req *Request) error {
+		if DebugTrace(ctx) == nil {
+			t.Fatal("sampled handler has no detailed trace")
+		}
+		req.Buf.AppendInt(1)
+		return nil
+	})
+	rt.Schema.RegisterAPI(&schema.API{Name: "getUser", ReturnType: "Int"})
+
+	r := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(`{"$api":"getUser","$select":"id"}`))
+	r.Header.Set("X-Request-Id", "sample-me")
+	w := httptest.NewRecorder()
+	TraceMiddleware(rt).ServeHTTP(w, r)
+
+	if w.Header().Get(DebugTraceResponseHeader) != "" || w.Header().Get("Server-Timing") != "" {
+		t.Fatalf("sampled production trace leaked debug headers: %v", w.Header())
+	}
+	if len(mc.traces) != 1 || !mc.traces[0].HeadSampled || mc.traces[0].Spans == "" {
+		t.Fatalf("sampled trace record = %+v", mc.traces)
 	}
 }
 

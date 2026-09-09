@@ -189,6 +189,7 @@ func GenerateEntryFile(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t}\n\n")
 
 	writeAutoMigration(&b)
+	writeEmbeddedGatewaySchema(&b, modules)
 
 	writeModuleApps(&b, modules)
 	writeDataLoaderWiring(&b, modules)
@@ -277,13 +278,6 @@ func entryNeedsRPC(modules []moduleInfo, hasServiceFunctions bool) bool {
 }
 
 func writeEmbeddedGatewayWiring(b *strings.Builder, modules []moduleInfo, hasServiceFunctions bool) {
-	b.WriteString("\tgw := luvia.New()\n\n")
-	for _, module := range modules {
-		if module.hasSchema {
-			fmt.Fprintf(b, "\t%s_luxo.RegisterSchema(gw.Router.Schema)\n", module.name)
-		}
-	}
-	b.WriteString("\n")
 	for _, module := range modules {
 		fmt.Fprintf(b, "\tgw.AddModule(%q)\n", module.name)
 		if module.hasCrud || module.hasAPI {
@@ -298,6 +292,16 @@ func writeEmbeddedGatewayWiring(b *strings.Builder, modules []moduleInfo, hasSer
 		}
 	}
 	writeEmbeddedRPCWiring(b, modules, hasServiceFunctions)
+}
+
+func writeEmbeddedGatewaySchema(b *strings.Builder, modules []moduleInfo) {
+	b.WriteString("\tgw := luvia.New()\n")
+	for _, module := range modules {
+		if module.hasSchema {
+			fmt.Fprintf(b, "\t%s_luxo.RegisterSchema(gw.Router.Schema)\n", module.name)
+		}
+	}
+	b.WriteString("\n")
 }
 
 func writeEmbeddedRPCWiring(b *strings.Builder, modules []moduleInfo, hasServiceFunctions bool) {
@@ -348,6 +352,7 @@ func writeModuleApps(b *strings.Builder, modules []moduleInfo) {
 	b.WriteString("\t\tos.Exit(1)\n")
 	b.WriteString("\t}\n")
 	b.WriteString("\tdefer db.Close()\n\n")
+	b.WriteString("\tgw.SetRuntimeDependencyStatsProvider(db)\n\n")
 
 	for _, m := range modules {
 		fmt.Fprintf(b, "\t%sApp := %s_luxo.NewFromDB(db)\n", m.name, m.name)
@@ -387,8 +392,8 @@ func writeDataLoaderWiring(b *strings.Builder, modules []moduleInfo) {
 		for _, m := range modules {
 			envKey := strings.ToUpper(m.name) + "_SERVICE_ADDR"
 			defaultAddr := m.name + ":9000"
-			fmt.Fprintf(b, "\t\trpcClients[%q] = rpc.NewClient(env.GetOrDefault(%q, %q))\n",
-				m.name, envKey, defaultAddr)
+			fmt.Fprintf(b, "\t\trpcClients[%q] = rpc.NewNamedClient(%q, env.GetOrDefault(%q, %q))\n",
+				m.name, m.name, envKey, defaultAddr)
 		}
 		for _, m := range modules {
 			if !m.hasLoaders {
@@ -396,7 +401,7 @@ func writeDataLoaderWiring(b *strings.Builder, modules []moduleInfo) {
 			}
 			if m.hasExtend {
 				// Module with cross-module extends: use RPC-backed loaders
-				fmt.Fprintf(b, "\t\t%sApp.SetLoaders(%s_luxo.NewRemoteLoaders(%sApp, rpcClients, dlCfg))\n", m.name, m.name, m.name)
+				fmt.Fprintf(b, "\t\t%sApp.SetLoaders(%s_luxo.NewRemoteLoaders(%sApp, rpcClients, gw.Router.Schema, dlCfg))\n", m.name, m.name, m.name)
 			} else {
 				// Module with only same-module relations: use local DB
 				fmt.Fprintf(b, "\t\t%sApp.SetLoaders(%s_luxo.NewDefaultLoaders(%sApp, dlCfg))\n", m.name, m.name, m.name)
@@ -532,6 +537,12 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 	fmt.Fprintf(&b, "\t}\n\n")
 
 	writeAutoMigration(&b)
+	b.WriteString("\tgw := luvia.New()\n")
+	fmt.Fprintf(&b, "\tgw.AddModule(%q)\n", target.name)
+	if target.hasSchema {
+		fmt.Fprintf(&b, "\t%s_luxo.RegisterSchema(gw.Router.Schema)\n", target.name)
+	}
+	b.WriteString("\n")
 
 	// Create app
 	fmt.Fprintf(&b, "\tapp, err := %s_luxo.New(ctx)\n", target.name)
@@ -540,6 +551,7 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 	b.WriteString("\t\tos.Exit(1)\n")
 	b.WriteString("\t}\n")
 	b.WriteString("\tdefer app.Close()\n\n")
+	b.WriteString("\tgw.SetRuntimeDependencyStatsProvider(app.DB)\n\n")
 	fmt.Fprintf(&b, "\t%s_resolver.Setup(app)\n\n", target.name)
 
 	// DataLoader
@@ -554,10 +566,10 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 				}
 				envKey := strings.ToUpper(other.name) + "_SERVICE_ADDR"
 				defaultAddr := other.name + ":9000"
-				fmt.Fprintf(&b, "\trpcClients[%q] = rpc.NewClient(env.GetOrDefault(%q, %q))\n",
-					other.name, envKey, defaultAddr)
+				fmt.Fprintf(&b, "\trpcClients[%q] = rpc.NewNamedClient(%q, env.GetOrDefault(%q, %q))\n",
+					other.name, other.name, envKey, defaultAddr)
 			}
-			fmt.Fprintf(&b, "\tapp.SetLoaders(%s_luxo.NewRemoteLoaders(app, rpcClients, dlCfg))\n\n", target.name)
+			fmt.Fprintf(&b, "\tapp.SetLoaders(%s_luxo.NewRemoteLoaders(app, rpcClients, gw.Router.Schema, dlCfg))\n\n", target.name)
 		} else {
 			// Module with only same-module relations: use local DB
 			fmt.Fprintf(&b, "\tapp.SetLoaders(%s_luxo.NewDefaultLoaders(app, dlCfg))\n\n", target.name)
@@ -583,11 +595,6 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 	b.WriteString("\tapp.Queue = taskQueue\n\n")
 
 	// Gateway + handlers
-	b.WriteString("\tgw := luvia.New()\n")
-	fmt.Fprintf(&b, "\tgw.AddModule(%q)\n", target.name)
-	if target.hasSchema {
-		fmt.Fprintf(&b, "\t%s_luxo.RegisterSchema(gw.Router.Schema)\n", target.name)
-	}
 	// Same rationale as in the embedded entry: RegisterHandlers must follow
 	// handler.gen.go's own trigger (@crud OR non-CRUD APIs), not hasCrud alone.
 	if target.hasCrud || target.hasAPI {
@@ -685,8 +692,8 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	for _, m := range allModules {
 		envKey := strings.ToUpper(m.name) + "_SERVICE_ADDR"
 		defaultAddr := m.name + ":9000"
-		fmt.Fprintf(&b, "\trpcClients[%q] = rpc.NewClient(env.GetOrDefault(%q, %q))\n",
-			m.name, envKey, defaultAddr)
+		fmt.Fprintf(&b, "\trpcClients[%q] = rpc.NewNamedClient(%q, env.GetOrDefault(%q, %q))\n",
+			m.name, m.name, envKey, defaultAddr)
 	}
 	b.WriteString("\n")
 
@@ -709,6 +716,7 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 			fmt.Fprintf(&b, "\t%s_luxo.RegisterSchema(gw.Router.Schema)\n", m.name)
 		}
 	}
+	b.WriteString("\tgw.Router.Registry.RegisterSchemaAPIs(gw.Router.Schema)\n")
 	b.WriteString("\n")
 	writeGatewayNativeStreamWiring(&b, allModules)
 
@@ -771,13 +779,16 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 
 	// Federation: query planning
 	b.WriteString("\t\t// Federation: check if request needs cross-module field resolution\n")
+	b.WriteString("\t\ttrace := api.DebugTrace(ctx)\n")
+	b.WriteString("\t\t_, planSpan := trace.StartSpan(ctx, api.DebugSpanMeta{Name: \"query.plan\", Category: \"gateway\", Service: \"gateway\", Operation: apiName})\n")
 	b.WriteString("\t\tvar apiModule string\n")
 	b.WriteString("\t\tif apiMeta != nil { apiModule = apiMeta.Module }\n")
 	b.WriteString("\t\tplan, err := luvia.Plan(model, req.FieldMask, apiModule)\n")
+	b.WriteString("\t\ttrace.FinishSpan(planSpan)\n")
 	b.WriteString("\t\tif err != nil { return err }\n")
 	b.WriteString("\t\tif plan == nil {\n")
 	b.WriteString("\t\t\t// No extend fields — direct forward with field mask\n")
-	b.WriteString("\t\t\tresp, err := client.CallWithMaskContext(ctx, bearerToken, apiID, req.FieldMask, params)\n")
+	b.WriteString("\t\t\tresp, err := client.CallWithMaskTargetContext(ctx, bearerToken, apiID, req.FieldMask, params, rpc.TraceTarget{Operation: apiName, Dependency: api.TraceDependencySequential})\n")
 	b.WriteString("\t\t\tif err != nil {\n")
 	b.WriteString("\t\t\t\treturn err\n")
 	b.WriteString("\t\t\t}\n")
@@ -787,7 +798,7 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 
 	// Federation: parallel RPC
 	b.WriteString("\t\t// Primary request with federation mask (local fields + id)\n")
-	b.WriteString("\t\tresp, err := client.CallWithMaskContext(ctx, bearerToken, apiID, plan.Primary.Mask, params)\n")
+	b.WriteString("\t\tresp, err := client.CallWithMaskTargetContext(ctx, bearerToken, apiID, plan.Primary.Mask, params, rpc.TraceTarget{Operation: apiName, Dependency: api.TraceDependencySequential})\n")
 	b.WriteString("\t\tif err != nil {\n")
 	b.WriteString("\t\t\treturn err\n")
 	b.WriteString("\t\t}\n\n")
@@ -800,11 +811,13 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t\t\t\treturn nil\n")
 	b.WriteString("\t\t\t}\n")
 	b.WriteString("\t\t\tresolveParams := keys.EncodeParam(1)\n")
+	b.WriteString("\t\t\tdependency := api.TraceDependencySequential\n")
+	b.WriteString("\t\t\tif len(plan.Extends) > 1 { dependency = api.TraceDependencyParallel }\n")
 	b.WriteString("\t\t\tresolveCol := func(ext luvia.ExtendStep, cl *rpc.Client) luvia.ExtendColumnResult {\n")
 	b.WriteString("\t\t\t\tsvcName := \"svc:resolve:\" + ext.ModelName + \":\" + ext.ForeignKey\n")
 	b.WriteString("\t\t\t\tresolveAPI := s.APIs[svcName]\n")
 	b.WriteString("\t\t\t\tif resolveAPI == nil { return luvia.ExtendColumnResult{} }\n")
-	b.WriteString("\t\t\t\textResp, err := cl.CallWithMaskContext(ctx, bearerToken, resolveAPI.ID, ext.Mask, resolveParams)\n")
+	b.WriteString("\t\t\t\textResp, err := cl.CallWithMaskTargetContext(ctx, bearerToken, resolveAPI.ID, ext.Mask, resolveParams, rpc.TraceTarget{Operation: svcName, Field: ext.FieldName, Dependency: dependency})\n")
 	b.WriteString("\t\t\t\tif err != nil { return luvia.ExtendColumnResult{} }\n")
 	b.WriteString("\t\t\t\tblobs := luvia.ParseGroupedResponse(extResp, ext.IsList)\n")
 	b.WriteString("\t\t\t\treturn luvia.ExtendColumnResult{FieldID: ext.FieldID, Blobs: blobs}\n")
@@ -828,7 +841,9 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t\t\t\t}\n")
 	b.WriteString("\t\t\t\twg.Wait()\n")
 	b.WriteString("\t\t\t}\n")
+	b.WriteString("\t\t\t_, mergeSpan := trace.StartSpan(ctx, api.DebugSpanMeta{Name: \"response.merge\", Category: \"gateway\", Service: \"gateway\", Operation: apiName})\n")
 	b.WriteString("\t\t\tmerged := luvia.MergeColumnar(resp, extCols)\n")
+	b.WriteString("\t\t\ttrace.FinishSpan(mergeSpan)\n")
 	b.WriteString("\t\t\treq.Buf.B = append(req.Buf.B, merged...)\n")
 	b.WriteString("\t\t\treturn nil\n")
 	b.WriteString("\t\t}\n\n")
@@ -855,7 +870,7 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t\t\t\tif cl := rpcClients[ext.Module]; cl != nil {\n")
 	b.WriteString("\t\t\t\t\tresolveAPI := s.APIs[svcName]\n")
 	b.WriteString("\t\t\t\t\tif resolveAPI != nil {\n")
-	b.WriteString("\t\t\t\t\t\tr, e := cl.CallWithMaskContext(ctx, bearerToken, resolveAPI.ID, ext.Mask, resolveParams)\n")
+	b.WriteString("\t\t\t\t\t\tr, e := cl.CallWithMaskTargetContext(ctx, bearerToken, resolveAPI.ID, ext.Mask, resolveParams, rpc.TraceTarget{Operation: svcName, Field: ext.FieldName, Dependency: api.TraceDependencySequential})\n")
 	b.WriteString("\t\t\t\t\t\tif e == nil { svcResp[svcName] = r }\n")
 	b.WriteString("\t\t\t\t\t}\n")
 	b.WriteString("\t\t\t\t}\n")
@@ -871,11 +886,11 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t\t\t\tresolveAPI := s.APIs[svcName]\n")
 	b.WriteString("\t\t\t\tif resolveAPI == nil { continue }\n")
 	b.WriteString("\t\t\t\twg.Add(1)\n")
-	b.WriteString("\t\t\t\tgo func(name string, cl *rpc.Client, apiID int, mask []byte) {\n")
+	b.WriteString("\t\t\t\tgo func(name, field string, cl *rpc.Client, apiID int, mask []byte) {\n")
 	b.WriteString("\t\t\t\t\tdefer wg.Done()\n")
-	b.WriteString("\t\t\t\t\tr, e := cl.CallWithMaskContext(ctx, bearerToken, apiID, mask, resolveParams)\n")
+	b.WriteString("\t\t\t\t\tr, e := cl.CallWithMaskTargetContext(ctx, bearerToken, apiID, mask, resolveParams, rpc.TraceTarget{Operation: name, Field: field, Dependency: api.TraceDependencyParallel})\n")
 	b.WriteString("\t\t\t\t\tif e == nil { mu.Lock(); svcResp[name] = r; mu.Unlock() }\n")
-	b.WriteString("\t\t\t\t}(svcName, cl, resolveAPI.ID, ext.Mask)\n")
+	b.WriteString("\t\t\t\t}(svcName, ext.FieldName, cl, resolveAPI.ID, ext.Mask)\n")
 	b.WriteString("\t\t\t}\n")
 	b.WriteString("\t\t\twg.Wait()\n")
 	b.WriteString("\t\t}\n")
@@ -889,7 +904,9 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	b.WriteString("\t\t\t\t}\n")
 	b.WriteString("\t\t\t}\n")
 	b.WriteString("\t\t}\n")
+	b.WriteString("\t\t_, mergeSpan := trace.StartSpan(ctx, api.DebugSpanMeta{Name: \"response.merge\", Category: \"gateway\", Service: \"gateway\", Operation: apiName})\n")
 	b.WriteString("\t\tmerged := luvia.Merge(resp, extResults)\n")
+	b.WriteString("\t\ttrace.FinishSpan(mergeSpan)\n")
 	b.WriteString("\t\treq.Buf.B = append(req.Buf.B, merged...)\n")
 	b.WriteString("\t\treturn nil\n")
 	b.WriteString("\t}\n")

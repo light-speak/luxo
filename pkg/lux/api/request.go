@@ -23,6 +23,27 @@ var bodyPool = sync.Pool{
 	},
 }
 
+// binaryRequestPool reuses the fixed-size request envelope on binary transport
+// paths. Request data is valid only for the duration of the synchronous handler,
+// matching the existing pooled response-buffer lifetime.
+var binaryRequestPool = sync.Pool{
+	New: func() any {
+		return new(Request)
+	},
+}
+
+// GetRequest gets a zeroed Request from the binary transport pool.
+// Callers must return it with PutRequest after synchronous processing finishes.
+func GetRequest() *Request {
+	return binaryRequestPool.Get().(*Request)
+}
+
+// PutRequest clears and returns a Request to the binary transport pool.
+func PutRequest(req *Request) {
+	*req = Request{}
+	binaryRequestPool.Put(req)
+}
+
 // putBody returns a body buffer to the pool, discarding oversized buffers
 // to prevent a single large request from permanently inflating pool memory.
 func putBody(bp *[]byte) {
@@ -502,6 +523,62 @@ func (r *Request) ParamUUIDArray(name string) ([]uuid.UUID, error) {
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be an array of UUIDs"})
 	}
 	return value, nil
+}
+
+// ParamMessage returns a structured Luxo parameter without JSON conversion.
+// present distinguishes an omitted optional parameter from an explicit null.
+func (r *Request) ParamMessage(name string, optional, nullable bool) ([]byte, bool, error) {
+	value, present, err := r.binaryStructuredParam(name, optional, nullable)
+	if err != nil || !present || value == nil {
+		return nil, present, err
+	}
+	message, ok := value.(BinaryMessage)
+	if !ok {
+		return nil, true, invalidBinaryStructuredParam(name)
+	}
+	return message, true, nil
+}
+
+// ParamMessageArray returns structured Luxo list parameters without JSON conversion.
+func (r *Request) ParamMessageArray(name string, optional, nullable bool) (BinaryMessages, bool, error) {
+	value, present, err := r.binaryStructuredParam(name, optional, nullable)
+	if err != nil || !present || value == nil {
+		return nil, present, err
+	}
+	messages, ok := value.(BinaryMessages)
+	if !ok {
+		return nil, true, invalidBinaryStructuredParam(name)
+	}
+	return messages, true, nil
+}
+
+func (r *Request) binaryStructuredParam(name string, optional, nullable bool) (any, bool, error) {
+	value, present := r.findParam(name)
+	if !present {
+		if optional {
+			return nil, false, nil
+		}
+		return nil, false, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
+	}
+	if value == nil && !nullable {
+		return nil, true, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must not be null"})
+	}
+	return value, true, nil
+}
+
+func invalidBinaryStructuredParam(name string) error {
+	return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "invalid binary message"})
+}
+
+// InvalidParam converts a generated codec failure into a client-safe parameter error.
+func InvalidParam(name string, cause error) error {
+	detail := "invalid binary message"
+	if cause != nil {
+		detail = cause.Error()
+	}
+	return errors.BadRequest.
+		WithData(errors.ParamError{Param: name, Error: detail}).
+		WithCause(cause)
 }
 
 // ParamJSON extracts a required parameter into the target.

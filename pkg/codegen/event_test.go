@@ -17,12 +17,13 @@ func TestGenerateEventFileNoEvents(t *testing.T) {
 	}
 }
 
-func TestEventJSONFallbackTypes(t *testing.T) {
+func TestEventJSONFieldRequirement(t *testing.T) {
 	events := []*ast.EventDecl{{Params: []*ast.ParamDecl{
 		{Name: "unknown", Type: &ast.TypeRef{Name: "LegacyPayload"}},
+		{Name: "metadata", Type: &ast.TypeRef{Name: "JSON"}},
 		{Name: "items", Type: &ast.TypeRef{Name: "String", IsList: true}},
 	}}}
-	if !eventsNeedJSON(events, nil, nil) {
+	if !eventsNeedJSON(events) {
 		t.Fatal("eventsNeedJSON() = false, want true")
 	}
 	if !isEventBuiltin("JSON") || isEventBuiltin("LegacyPayload") {
@@ -43,8 +44,8 @@ func TestEventObjectCollectionAndJSONRequirements(t *testing.T) {
 	if !eventsUseObjects(events, objects) {
 		t.Fatal("type declarations must be treated as event objects")
 	}
-	if !eventsNeedJSON([]*ast.EventDecl{{Params: []*ast.ParamDecl{{Name: "unknown"}}}}, nil, nil) {
-		t.Fatal("an unresolved event parameter must retain the JSON fallback")
+	if eventsNeedJSON([]*ast.EventDecl{{Params: []*ast.ParamDecl{{Name: "unknown"}}}}) {
+		t.Fatal("an unresolved event parameter must not enable a JSON fallback")
 	}
 }
 
@@ -110,7 +111,7 @@ func TestEventScalarReadExpressions(t *testing.T) {
 	}
 }
 
-func TestEventCodecFallbackWriters(t *testing.T) {
+func TestEventCodecDoesNotGenerateJSONFallbacks(t *testing.T) {
 	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{EventFields: map[string]map[string]int{"Changed": {"payload": 1}}}})
 	param := &ast.ParamDecl{Name: "payload", Type: &ast.TypeRef{Name: "External"}}
 	var b strings.Builder
@@ -118,9 +119,9 @@ func TestEventCodecFallbackWriters(t *testing.T) {
 	generator.writeEventUnmarshalField(&b, "Changed", param, false, false)
 	writeEventListMarshal(&b, 2, "e.Payloads", "External", false, false)
 	writeEventListUnmarshal(&b, 2, "e.Payloads", "External", false, false)
-	for _, want := range []string{"json.Marshal(e.Payload)", "json.Unmarshal(dec.ReadBytes(), &e.Payload)", "json.Marshal(e.Payloads[i])", "json.Unmarshal(dec.ReadBytes(), &e.Payloads[i])"} {
-		if !strings.Contains(b.String(), want) {
-			t.Fatalf("fallback codec missing %q:\n%s", want, b.String())
+	for _, forbidden := range []string{"json.Marshal", "json.Unmarshal"} {
+		if strings.Contains(b.String(), forbidden) {
+			t.Fatalf("invalid event types must not generate reflection fallback %q:\n%s", forbidden, b.String())
 		}
 	}
 }

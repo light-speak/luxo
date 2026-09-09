@@ -6,10 +6,12 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/light-speak/luxo/pkg/lux/selection"
 )
 
 func BenchmarkLoadSequential(b *testing.B) {
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		result := make(map[int]string, len(keys))
 		for _, k := range keys {
 			result[k] = fmt.Sprintf("v%d", k)
@@ -25,7 +27,7 @@ func BenchmarkLoadSequential(b *testing.B) {
 }
 
 func BenchmarkLoadConcurrent(b *testing.B) {
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		result := make(map[int]string, len(keys))
 		for _, k := range keys {
 			result[k] = fmt.Sprintf("v%d", k)
@@ -45,7 +47,7 @@ func BenchmarkLoadConcurrent(b *testing.B) {
 }
 
 func BenchmarkLoadWithFields(b *testing.B) {
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		result := make(map[int]string, len(keys))
 		for _, k := range keys {
 			result[k] = "ok"
@@ -54,7 +56,7 @@ func BenchmarkLoadWithFields(b *testing.B) {
 	}, Config{Wait: 1 * time.Millisecond, MaxBatch: 1000})
 
 	ctx := context.Background()
-	fields := []string{"name", "email", "avatar"}
+	fields := []*selection.Field{{Name: "name"}, {Name: "email"}, {Name: "avatar"}}
 	b.ResetTimer()
 
 	var wg sync.WaitGroup

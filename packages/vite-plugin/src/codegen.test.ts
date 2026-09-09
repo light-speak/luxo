@@ -62,7 +62,7 @@ const schema: LuxoSchema = {
         { id: 1, name: 'projectId', type: 'Int' },
         { id: 2, name: 'apiName', type: 'String', nullable: true },
         { id: 3, name: 'tags', type: 'String', isList: true, hasDefault: true },
-				{ id: 4, name: 'input', type: 'JSON', typeName: 'CreateNodeInput' },
+				{ id: 4, name: 'input', type: 'Model', typeName: 'CreateNodeInput' },
       ],
     },
     searchNodes: {
@@ -85,6 +85,44 @@ const schema: LuxoSchema = {
 beforeEach(() => outputs.clear())
 
 describe('generateTypes', () => {
+	it('keeps default scalar fields strict and explicit selections tri-state', async () => {
+		await generateTypes(schema, 'generated')
+
+		const types = outputs.get('generated/types.ts') ?? ''
+		const client = outputs.get('generated/client.ts') ?? ''
+		expect(types).toContain('export interface Node<Selection extends boolean = false>')
+		expect(types).toContain('id: true extends Selection ? Selected<number> : number')
+		expect(client).toContain('async createSnapshot<Select extends string | undefined = undefined>')
+		expect(client).toContain('params?: { $select?: Select }')
+		expect(client).toContain('Promise<Node<Select extends string ? true : false>>')
+		expect(client).toContain('Promise<Page<Node<Select extends string ? true : false>>>')
+	})
+
+	it('keeps unloaded model relations optional in the default projection', async () => {
+		await generateTypes({
+			models: {
+				Parent: {
+					name: 'Parent',
+					usage: 'output',
+					fields: [
+						{ id: 1, name: 'id', type: 'Int' },
+						{ id: 2, name: 'children', type: 'Model', typeName: 'Child', isList: true, relation: true },
+					],
+				},
+				Child: {
+					name: 'Child',
+					usage: 'output',
+					fields: [{ id: 1, name: 'name', type: 'String' }],
+				},
+			},
+			apis: {},
+		}, 'generated')
+
+		const types = outputs.get('generated/types.ts') ?? ''
+		expect(types).toContain('id: true extends Selection ? Selected<number> : number')
+		expect(types).toContain('children: Selected<Child<Selection>[]>')
+	})
+
   it('generates optional parameters and binary array metadata', async () => {
     await generateTypes(schema, 'generated')
 
@@ -96,16 +134,18 @@ describe('generateTypes', () => {
 		expect(client).toMatch(/import type \{[^\n]*CreateNodeInput[^\n]*\} from '\.\/types'/)
     expect(client).toContain('TransportOptions, CallOptions, Page, Filter, Sorter')
     expect(client).toContain('$filters?: Filter[]; $sorters?: Sorter[]')
-    expect(client).toContain('}, options?: CallOptions): Promise<MetricTimeSeries[]>')
-    expect(client).toContain('params?: { page?: number; pageSize?: number; $select?: string; $filters?: Filter[]; $sorters?: Sorter[] }, options?: CallOptions')
-    expect(client).toContain('async searchNodes(params?: { page?: number; pageSize?: number; $select?: string; $filters?: Filter[]; $sorters?: Sorter[] }')
-    expect(client).toContain('async createSnapshot(params?: { $select?: string }, options?: CallOptions)')
+    expect(client).toContain('}, options?: CallOptions): Promise<MetricTimeSeries<Select extends string ? true : false>[]>')
+    expect(client).toContain('params?: { page?: number; pageSize?: number; $select?: Select; $filters?: Filter[]; $sorters?: Sorter[] }, options?: CallOptions')
+    expect(client).toContain('async searchNodes<Select extends string | undefined = undefined>(params?: { page?: number; pageSize?: number; $select?: Select; $filters?: Filter[]; $sorters?: Sorter[] }')
+    expect(client).toContain('async createSnapshot<Select extends string | undefined = undefined>(params?: { $select?: Select }, options?: CallOptions)')
     expect(client).not.toContain('async createSnapshot(input:')
-    expect(client).toContain('projectId: number; apiName: string | null; tags?: string[]; input: CreateNodeInput; $select?: string')
+    expect(client).toContain('projectId: number; apiName: string | null; tags?: string[]; input: CreateNodeInput; $select?: Select')
     expect(client).toContain("this.transport.call('getMetricTimeSeries', params, options)")
     expect(apiSchema).toContain("name: 'tags', type: 'String', isList: true")
 		expect(apiSchema).toContain("name: 'apiName', type: 'String', nullable: true")
-		expect(apiSchema).toContain("'MetricTimeSeries': { 'apiName': { fieldID: 1 }, 'points': { fieldID: 2, typeName: 'MetricPoint' } }")
+		expect(apiSchema).toContain("name: 'input', type: 'Model', typeName: 'CreateNodeInput'")
+		expect(apiSchema).toContain("'MetricTimeSeries': { 'apiName': { fieldID: 1, type: 'String' }, 'points': { fieldID: 2, type: 'Model', typeName: 'MetricPoint', isList: true } }")
+		expect(apiSchema).toContain("'CreateNodeInput': { 'name': { fieldID: 1, type: 'String' } }")
 		expect(apiSchema).toContain("fields: LUXO_SELECTION_TYPES['MetricTimeSeries'], types: LUXO_SELECTION_TYPES")
 	})
 
@@ -138,6 +178,25 @@ describe('generateTypes', () => {
     expect(types).toContain('points: _points ? decodeColumnarMetricPoint(_points[i]) : undefined')
   })
 
+  it('decodes UUID columns from their fixed-width binary representation', async () => {
+    await generateTypes({
+      models: {
+        Project: {
+          name: 'Project',
+          fields: [
+            { id: 1, name: 'publicId', type: 'UUID' },
+            { id: 2, name: 'parentId', type: 'UUID', nullable: true },
+          ],
+        },
+      },
+      apis: {},
+    }, 'generated')
+
+    const types = outputs.get('generated/types.ts') ?? ''
+    expect(types).toContain("case 1: _publicId = r.readColumnUUID(); break")
+    expect(types).toContain("case 2: _parentId = r.readColumnUUIDPtr(); break")
+  })
+
   it('decodes scalar list fields in row mode', async () => {
     await generateTypes(schema, 'generated')
 
@@ -160,7 +219,7 @@ describe('generateTypes', () => {
     }, 'generated')
 
     const types = outputs.get('generated/types.ts') ?? ''
-    expect(types).toContain('role: Selected<Role>')
+    expect(types).toContain('role: true extends Selection ? Selected<Role> : Role')
     expect(types).toContain("Object.prototype.hasOwnProperty.call(data, 'role')")
     expect(types).not.toContain("'' as Role")
   })
@@ -227,8 +286,8 @@ describe('generateTypes', () => {
 
     const types = outputs.get('generated/types.ts') ?? ''
     const client = outputs.get('generated/client.ts') ?? ''
-    expect(types).toContain('blob: Selected<Uint8Array>')
-    expect(types).toContain('metadata: Selected<unknown>')
+    expect(types).toContain('blob: true extends Selection ? Selected<Uint8Array> : Uint8Array')
+    expect(types).toContain('metadata: true extends Selection ? Selected<unknown> : unknown')
     expect(types).toContain("Object.prototype.hasOwnProperty.call(data, 'blob')")
     expect(types).not.toContain('new Uint8Array(0)')
     expect(types).toContain('decodeJSONValue(_metadata![i]!)')
@@ -261,14 +320,14 @@ describe('generateTypes', () => {
 
     const types = outputs.get('generated/types.ts') ?? ''
     const client = outputs.get('generated/client.ts') ?? ''
-    expect(types).toContain('export interface Profile {')
-    expect(types).toContain('name: Selected<string>')
-    expect(types).toContain('bio: Selected<string | null>')
+    expect(types).toContain('export interface Profile<Selection extends boolean = false> {')
+    expect(types).toContain('name: true extends Selection ? Selected<string> : string')
+    expect(types).toContain('bio: true extends Selection ? Selected<string | null> : string | null')
     expect(types).toContain('export interface ProfileInput {')
     expect(types).toContain('name: string')
     expect(types).toContain('bio: string | null')
     expect(client).toContain('profile: ProfileInput')
-    expect(client).toContain('Promise<Profile>')
+    expect(client).toContain('Promise<Profile<Select extends string ? true : false>>')
   })
 })
 
@@ -287,11 +346,19 @@ describe('stream client generation', () => {
           stream: true,
           params: [{ id: 1, name: 'projectId', type: 'Int' }],
         },
+        systemReady: {
+          id: 10,
+          name: 'systemReady',
+          module: 'alert',
+          returnType: 'Alert',
+          stream: true,
+        },
       },
     }, 'generated')
 
     const client = outputs.get('generated/client.ts') ?? ''
-    expect(client).toContain('subscribeLiveAlerts(params: { projectId: number; $select?: string }, onData: (data: Alert) => void): Promise<() => void>')
+    expect(client).toContain('subscribeLiveAlerts<Select extends string | undefined = undefined>(params: { projectId: number; $select?: Select }, onData: (data: Alert<Select extends string ? true : false>) => void): Promise<() => void>')
+    expect(client).toContain('subscribeSystemReady<Select extends string | undefined = undefined>(params: { $select?: Select }, onData: (data: Alert<Select extends string ? true : false>) => void): Promise<() => void>')
     expect(client).toContain("this.transport.subscribe('liveAlerts', params ?? {}")
     expect(client).not.toContain('async liveAlerts(')
   })

@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/light-speak/luxo/pkg/lux"
 	"github.com/light-speak/luxo/pkg/lux/api"
 	"github.com/light-speak/luxo/pkg/lux/auth"
 	"github.com/light-speak/luxo/pkg/lux/env"
@@ -24,11 +25,12 @@ import (
 
 // Gateway is the Luvia API gateway.
 type Gateway struct {
-	Router    *api.Router
-	modules   []string
-	server    *http.Server
-	metrics   *MetricsCollector
-	registrar *GatewayRegistrar
+	Router          *api.Router
+	modules         []string
+	server          *http.Server
+	metrics         *MetricsCollector
+	registrar       *GatewayRegistrar
+	dependencyStats lux.RuntimeDependencyStatsProvider
 }
 
 // New creates a new Luvia gateway.
@@ -61,6 +63,11 @@ func (g *Gateway) AddModule(name string) {
 	g.modules = append(g.modules, name)
 }
 
+// SetRuntimeDependencyStatsProvider enables out-of-band dependency health snapshots.
+func (g *Gateway) SetRuntimeDependencyStatsProvider(provider lux.RuntimeDependencyStatsProvider) {
+	g.dependencyStats = provider
+}
+
 // Serve starts the HTTP/2 server with graceful shutdown support.
 // Default: h2c (HTTP/2 cleartext, no TLS, zero config).
 // If APP_TLS_CERT and APP_TLS_KEY are set, uses HTTP/2 with TLS.
@@ -87,7 +94,7 @@ func (g *Gateway) Serve(version string) error {
 	if g.metrics != nil {
 		g.Router.SetMetricsCollector(g.metrics)
 	}
-	g.registrar = newGatewayRegistrar(port, version)
+	g.registrar = newGatewayRegistrarWithDependencyStats(port, version, g.dependencyStats)
 	defer g.closeIntegrations()
 
 	certFile := envOr("APP_TLS_CERT", "")
@@ -264,6 +271,7 @@ func (g *Gateway) buildMux(version string) (*http.ServeMux, string) {
 	if envOr("APP_ENV", "") == "development" {
 		g.Router.SetDevMode(true)
 	}
+	g.Router.SetDebugTraceKey(envOr("LUXO_API_KEY", ""))
 	configureWebSocketOrigins(g.Router, envOr("CORS_ORIGIN", "*"))
 
 	// Schema introspection key

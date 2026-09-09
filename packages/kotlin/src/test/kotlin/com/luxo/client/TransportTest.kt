@@ -11,6 +11,16 @@ import kotlin.test.assertTrue
 import kotlin.test.assertFailsWith
 
 class TransportProtocolTest {
+	private data class TestInput(val value: String) : LuxoBinaryEncodable {
+		override fun writeLuxo(encoder: LuxoEncoder) {
+			encoder.writeVarint(value.toByteArray().size.toLong())
+			encoder.writeVarint(1L)
+			encoder.writeString(value)
+			encoder.writeEnd()
+		}
+
+		override fun toLuxoJson() = buildJsonObject { put("value", value) }
+	}
 
     @Test
     fun `binary request includes field mask and typed params`() {
@@ -45,6 +55,14 @@ class TransportProtocolTest {
         )
         val body = LuxoBinaryProtocol.encodeRequest(meta, mapOf("\$select" to "id,posts{title}"))
         assertTrue(byteArrayOf(1, 6, 1, 5, 3, 2, 1, 2, 0).contentEquals(body))
+    }
+
+    @Test
+    fun `binary request requires selection for structured responses only`() {
+        val structured = APISchemaEntry(id = 1, fields = mapOf("id" to SelectionFieldSchema(1)))
+        assertFailsWith<LuxoError> { LuxoBinaryProtocol.encodeRequest(structured, emptyMap()) }
+        assertFailsWith<LuxoError> { LuxoBinaryProtocol.encodeRequest(structured, mapOf("\$select" to "   ")) }
+        assertTrue(byteArrayOf(2, 0, 0).contentEquals(LuxoBinaryProtocol.encodeRequest(APISchemaEntry(2), emptyMap())))
     }
 
     @Test
@@ -156,10 +174,30 @@ class TransportProtocolTest {
     }
 
     @Test
+	fun `structured params use native length-delimited Luxo messages`() {
+		val meta = APISchemaEntry(
+			3,
+			listOf(ParamSchema(2, "input", "Model", typeName = "Input")),
+		)
+		val body = LuxoBinaryProtocol.encodeRequest(meta, mapOf("input" to TestInput("x")))
+		assertTrue(byteArrayOf(3, 0, 2, 5, 1, 1, 1, 120, 0, 0).contentEquals(body))
+
+		val listMeta = APISchemaEntry(
+			3,
+			listOf(ParamSchema(2, "inputs", "Model", isList = true, typeName = "Input")),
+		)
+		val listBody = LuxoBinaryProtocol.encodeRequest(
+			listMeta,
+			mapOf("inputs" to listOf(TestInput("x"), TestInput("y"))),
+		)
+		assertTrue(byteArrayOf(3, 0, 2, 2, 5, 1, 1, 1, 120, 0, 5, 1, 1, 1, 121, 0, 0).contentEquals(listBody))
+	}
+
+	@Test
     fun `unknown param types and non-string DateTime are rejected`() {
         assertFailsWith<LuxoError> {
             LuxoBinaryProtocol.encodeRequest(
-                APISchemaEntry(1, listOf(ParamSchema(1, "input", "Model"))),
+				APISchemaEntry(1, listOf(ParamSchema(1, "input", "Unsupported"))),
                 mapOf("input" to emptyMap<String, Any?>()),
             )
         }

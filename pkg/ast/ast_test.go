@@ -217,6 +217,48 @@ func TestStructFieldAccessDecls(t *testing.T) {
 	}
 }
 
+func TestModelCRUDOperations(t *testing.T) {
+	list := func(names ...string) *ListExpr {
+		items := make([]Expr, 0, len(names))
+		for _, name := range names {
+			items = append(items, &Ident{Name: name})
+		}
+		return &ListExpr{Items: items}
+	}
+	crud := func(args ...*NamedArg) *ModelDecl {
+		return &ModelDecl{Directives: []*Directive{{Name: "crud", Args: args}}}
+	}
+	mixedList := &ListExpr{Items: []Expr{&Literal{}, &Ident{Name: "get"}}}
+	tests := []struct {
+		name       string
+		model      *ModelDecl
+		operations []string
+	}{
+		{name: "nil model"},
+		{name: "without crud", model: &ModelDecl{}},
+		{name: "all", model: crud(), operations: []string{"get", "list", "create", "update", "delete", "deleteMany"}},
+		{name: "only", model: crud(&NamedArg{Name: "only", Value: list("get", "list")}), operations: []string{"get", "list"}},
+		{name: "except", model: crud(&NamedArg{Name: "except", Value: list("update", "delete")}), operations: []string{"get", "list", "create", "deleteMany"}},
+		{name: "invalid only value", model: crud(&NamedArg{Name: "only", Value: &Ident{Name: "get"}})},
+		{name: "unknown argument", model: crud(&NamedArg{Name: "other"}), operations: []string{"get", "list", "create", "update", "delete", "deleteMany"}},
+		{name: "skip non-ident", model: crud(&NamedArg{Name: "only", Value: mixedList}), operations: []string{"get"}},
+		{name: "skip other directive", model: &ModelDecl{Directives: []*Directive{{Name: "auth"}, {Name: "crud"}}}, operations: []string{"get", "list", "create", "update", "delete", "deleteMany"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.model.CRUDOperations()
+			if len(got) != len(tt.operations) {
+				t.Fatalf("CRUDOperations() = %v, want %v", got, tt.operations)
+			}
+			for i := range got {
+				if got[i] != tt.operations[i] {
+					t.Fatalf("CRUDOperations() = %v, want %v", got, tt.operations)
+				}
+			}
+		})
+	}
+}
+
 func TestStructFieldAccessNodes(t *testing.T) {
 	wb := &WhenBranch{IsType: "User", Body: &Ident{Name: "x"}}
 	if wb.IsType != "User" {

@@ -51,6 +51,21 @@ func TestWriteJSONCompatibilityFunctions(t *testing.T) {
 	}
 }
 
+func TestReadLuxoAllocatesNonNullableNestedModel(t *testing.T) {
+	model := &ast.ModelDecl{Name: "Project", Fields: []*ast.FieldDecl{{
+		Name: "owner", Type: &ast.TypeRef{Name: "User"},
+	}}}
+	generator := generatorWithModelFieldIDs(map[string]map[string]int{
+		"Project": {"owner": 10},
+	})
+	var builder strings.Builder
+	generator.generateReadLuxo(&builder, model, nil)
+	code := builder.String()
+	if !strings.Contains(code, "p.Owner = &User{}") || !strings.Contains(code, "p.Owner.ReadLuxo(dec)") {
+		t.Fatalf("non-nullable nested decoder must allocate its pointer before decoding:\n%s", code)
+	}
+}
+
 // --- WriteLuxo generation tests ---
 
 func TestGenerateWriteLuxoWithFieldIDs(t *testing.T) {
@@ -279,8 +294,12 @@ func TestGenerateWriteLuxoRelationEncoded(t *testing.T) {
 	generator.generateWriteLuxo(&b, m, enums)
 	code := b.String()
 
-	if !strings.Contains(code, "p.User.WriteLuxo(buf, nil)") {
-		t.Errorf("relation field should use nested row encoding:\n%s", code)
+	if strings.Contains(code, "p.User.WriteLuxo(buf, nil)") {
+		t.Errorf("default projection must not encode an unloaded relation:\n%s", code)
+	}
+	if !strings.Contains(code, "if len(selectionMask) > 0 && codec.FieldMaskHas(mask, 3)") ||
+		!strings.Contains(code, "p.User.WriteLuxo(buf, _childMask3)") {
+		t.Errorf("explicitly selected relation should use nested row encoding:\n%s", code)
 	}
 	// Non-relation fields should appear
 	if !strings.Contains(code, "p.Id") {
@@ -1009,12 +1028,18 @@ func TestGenerateModelBinaryWritersIncludeRelations(t *testing.T) {
 		!strings.Contains(rowCode, "p.Children[i].WriteLuxo(buf, _childMask3)") {
 		t.Fatalf("model row writer must encode selected relations:\n%s", rowCode)
 	}
+	if strings.Contains(rowCode, "p.Children[i].WriteLuxo(buf, nil)") {
+		t.Fatalf("model row writer must omit unloaded relations from its default projection:\n%s", rowCode)
+	}
 
 	var columnar strings.Builder
 	generator.generateWriteColumnar(&columnar, model, nil)
 	columnarCode := columnar.String()
 	if !strings.Contains(columnarCode, "WriteColumnarChildValues(&nb, items[i].Children, _childMask3)") {
 		t.Fatalf("model list relation must use canonical nested columnar encoding:\n%s", columnarCode)
+	}
+	if !strings.Contains(columnarCode, "if len(selectionMask) > 0 && codec.FieldMaskHas(mask, 3)") {
+		t.Fatalf("model columnar writer must omit unloaded relations from its default projection:\n%s", columnarCode)
 	}
 	if !strings.Contains(columnarCode, "mask = codec.SelectionMaskFields(mask)") {
 		t.Fatalf("columnar writer must decode the recursive selection node:\n%s", columnarCode)
@@ -1121,8 +1146,11 @@ func TestGenerateWriteLuxoUUIDDecimalBytesJSON(t *testing.T) {
 	if !strings.Contains(code, "uuid.UUID(dec.ReadUUID())") {
 		t.Errorf("UUID ReadLuxo should use ReadUUID (16-byte fixed):\n%s", code)
 	}
-	if !strings.Contains(code, "decimal.RequireFromString") {
-		t.Errorf("Decimal ReadLuxo should use decimal.RequireFromString:\n%s", code)
+	if strings.Contains(code, "decimal.RequireFromString") {
+		t.Errorf("Decimal ReadLuxo must not panic on invalid wire input:\n%s", code)
+	}
+	if !strings.Contains(code, "decimal.NewFromString") || !strings.Contains(code, "dec.Fail(err)") {
+		t.Errorf("Decimal ReadLuxo should report parse failures through Decoder:\n%s", code)
 	}
 	if !strings.Contains(code, "ReadBytes()") {
 		t.Errorf("Bytes ReadLuxo should use ReadBytes:\n%s", code)

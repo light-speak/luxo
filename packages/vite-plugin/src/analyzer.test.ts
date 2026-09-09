@@ -35,28 +35,68 @@ const schema: LuxoSchema = {
       ],
     },
   },
+  types: {
+    AuthPayload: {
+      name: 'AuthPayload',
+      fields: [
+        { id: 1, name: 'member', type: 'Model', typeName: 'User' },
+        { id: 2, name: 'token', type: 'String' },
+      ],
+    },
+    RecursiveNode: {
+      name: 'RecursiveNode',
+      fields: [
+        { id: 1, name: 'value', type: 'String' },
+        { id: 2, name: 'child', type: 'Model', typeName: 'RecursiveNode', nullable: true },
+      ],
+    },
+  },
   apis: {
-    getUser: { id: 1, name: 'getUser', module: 'user', returnType: 'User' },
+    getUser: {
+      id: 1,
+      name: 'getUser',
+      module: 'user',
+      returnType: 'User',
+      params: [{ id: 1, name: 'id', type: 'Int' }],
+    },
     listUsers: { id: 2, name: 'listUsers', module: 'user', returnType: 'User', returnList: true, paginated: true },
-    getPost: { id: 3, name: 'getPost', module: 'post', returnType: 'Post' },
+    allUsers: { id: 4, name: 'allUsers', module: 'user', returnType: 'User', returnList: true },
+    me: { id: 5, name: 'me', module: 'user', returnType: 'User' },
+    login: { id: 6, name: 'login', module: 'user', returnType: 'AuthPayload' },
+    getRecursiveNode: { id: 7, name: 'getRecursiveNode', module: 'user', returnType: 'RecursiveNode' },
+    liveAlerts: {
+      id: 8,
+      name: 'liveAlerts',
+      module: 'user',
+      returnType: 'User',
+      stream: true,
+      params: [{ id: 1, name: 'projectId', type: 'Int' }],
+    },
+    getPost: {
+      id: 3,
+      name: 'getPost',
+      module: 'post',
+      returnType: 'Post',
+      params: [{ id: 1, name: 'id', type: 'Int' }],
+    },
   },
 }
 
 describe('analyzeAndTransform', () => {
   it('should inject $select for simple field access', () => {
     const code = `
-const user = await client.getUser(1)
+const user = await client.getUser({ id: 1 })
 console.log(user.name)
 console.log(user.email)
 `
     const result = analyzeAndTransform(code, 'test.ts', schema)
     expect(result).not.toBeNull()
-    expect(result).toContain("$select: 'name,email'")
+    expect(result).toContain("getUser({ $select: 'name,email', id: 1 })")
   })
 
   it('should inject $select for optional chain access', () => {
     const code = `
-const user = await client.getUser(1)
+const user = await client.getUser({ id: 1 })
 const name = user?.name
 `
     const result = analyzeAndTransform(code, 'test.ts', schema)
@@ -67,7 +107,7 @@ const name = user?.name
 
   it('should handle destructuring', () => {
     const code = `
-const { name, email } = await client.getUser(1)
+const { name, email } = await client.getUser({ id: 1 })
 `
     const result = analyzeAndTransform(code, 'test.ts', schema)
     expect(result).not.toBeNull()
@@ -76,7 +116,7 @@ const { name, email } = await client.getUser(1)
 
   it('should handle destructure with rename', () => {
     const code = `
-const { name: userName, email } = await client.getUser(1)
+const { name: userName, email } = await client.getUser({ id: 1 })
 `
     const result = analyzeAndTransform(code, 'test.ts', schema)
     expect(result).not.toBeNull()
@@ -84,50 +124,50 @@ const { name: userName, email } = await client.getUser(1)
     expect(result).toContain('email')
   })
 
-  it('should not inject when all fields are used', () => {
+  it('should keep an explicit selection when all fields are used', () => {
     const code = `
-const user = await client.getUser(1)
+const user = await client.getUser({ id: 1 })
 console.log(user.id, user.name, user.email, user.phone, user.score)
 `
     const result = analyzeAndTransform(code, 'test.ts', schema)
-    // All 5 fields used → no optimization needed
-    expect(result).toBeNull()
+    expect(result).not.toBeNull()
+    expect(result).toContain("$select: 'id,name,email,phone,score'")
   })
 
   it('should not inject when $select already present', () => {
     const code = `
-const user = await client.getUser(1, { $select: 'name' })
+const user = await client.getUser({ id: 1, $select: 'name' })
 console.log(user.name)
 `
     const result = analyzeAndTransform(code, 'test.ts', schema)
     expect(result).toBeNull()
   })
 
-  it('should not modify code without field access', () => {
+  it('should use a safe projection when usage is opaque', () => {
     const code = `
-const user = await client.getUser(1)
+const user = await client.getUser({ id: 1 })
 doSomething(user)
 `
     const result = analyzeAndTransform(code, 'test.ts', schema)
-    expect(result).toBeNull()
+    expect(result).toContain("getUser({ $select: 'id,name,email,phone,score', id: 1 })")
   })
 
   it('should handle multiple API calls independently', () => {
     const code = `
-const user = await client.getUser(1)
-const post = await client.getPost(2)
+const user = await client.getUser({ id: 1 })
+const post = await client.getPost({ id: 2 })
 console.log(user.name)
 console.log(post.title)
 `
     const result = analyzeAndTransform(code, 'test.ts', schema)
     expect(result).not.toBeNull()
-    expect(result).toContain("getUser(1, { $select: 'name' })")
-    expect(result).toContain("getPost(2, { $select: 'title' })")
+    expect(result).toContain("getUser({ $select: 'name', id: 1 })")
+    expect(result).toContain("getPost({ $select: 'title', id: 2 })")
   })
 
   it('should handle template literal field access', () => {
     const code = `
-const user = await client.getUser(1)
+const user = await client.getUser({ id: 1 })
 const msg = \`Hello \${user.name}\`
 `
     const result = analyzeAndTransform(code, 'test.ts', schema)
@@ -137,7 +177,7 @@ const msg = \`Hello \${user.name}\`
 
   it('should track nested relation fields', () => {
     const code = `
-const post = await client.getPost(1)
+const post = await client.getPost({ id: 1 })
 console.log(post.title)
 console.log(post.user.name)
 `
@@ -149,7 +189,7 @@ console.log(post.user.name)
 
   it('should track forEach lambda params', () => {
     const code = `
-const post = await client.getPost(1)
+const post = await client.getPost({ id: 1 })
 console.log(post.title)
 post.comments.forEach(c => {
   console.log(c.content)
@@ -164,7 +204,7 @@ post.comments.forEach(c => {
 
   it('should track variable alias', () => {
     const code = `
-const post = await client.getPost(1)
+const post = await client.getPost({ id: 1 })
 const author = post.user
 console.log(post.title)
 console.log(author.name)
@@ -178,7 +218,7 @@ console.log(author.email)
 
   it('should track index access on nested relations', () => {
     const code = `
-const post = await client.getPost(1)
+const post = await client.getPost({ id: 1 })
 console.log(post.comments[0].content)
 `
     const result = analyzeAndTransform(code, 'test.ts', schema)
@@ -188,7 +228,7 @@ console.log(post.comments[0].content)
 
   it('should skip non-model field access', () => {
     const code = `
-const user = await client.getUser(1)
+const user = await client.getUser({ id: 1 })
 console.log(user.name)
 console.log(user.toString())
 `
@@ -198,5 +238,157 @@ console.log(user.toString())
     expect(result).toContain("$select: 'name'")
     // $select should only contain 'name', not 'toString'
     expect(result).not.toContain("$select: 'name,toString'")
+  })
+
+  it('preserves CallOptions while merging selection into params', () => {
+    const code = `
+const user = await client.getUser({ id: 1 }, { signal })
+console.log(user.name)
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).toContain("getUser({ $select: 'name', id: 1 }, { signal })")
+  })
+
+  it('tracks repeated calls to the same API independently', () => {
+    const code = `
+const first = await client.getUser({ id: 1 })
+const second = await client.getUser({ id: 2 })
+console.log(first.name)
+console.log(second.email)
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).toContain("getUser({ $select: 'name', id: 1 })")
+    expect(result).toContain("getUser({ $select: 'email', id: 2 })")
+  })
+
+  it('tracks paginated item fields through array callbacks', () => {
+    const code = `
+const page = await client.listUsers({ page: 1, pageSize: 20 })
+const names = page.items.map(user => user.name)
+console.log(names, page.total)
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).toContain("listUsers({ $select: 'name', page: 1, pageSize: 20 })")
+  })
+
+  it('injects an explicit safe projection when a response escapes static analysis', () => {
+    const code = `
+const user = await client.getUser({ id: 1 })
+console.log(user.name)
+consume(user)
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).toContain("getUser({ $select: 'name,id,email,phone,score', id: 1 })")
+  })
+
+  it('lets dynamic or spread params override an inferred selection', () => {
+    const code = `
+const params = getParams()
+const user = await client.getUser(params, { signal })
+console.log(user.name)
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).toContain("getUser({ $select: 'name', ...(params) }, { signal })")
+  })
+
+  it('injects params for a structured API called without arguments', () => {
+    const code = `
+const user = await client.me()
+console.log(user.name)
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).toContain("client.me({ $select: 'name' })")
+  })
+
+  it('tracks non-paginated list items in for-of loops', () => {
+    const code = `
+const users = await client.allUsers()
+for (const user of users) console.log(user.email)
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).toContain("client.allUsers({ $select: 'email' })")
+  })
+
+  it('keeps destructured scalar values safe after extraction', () => {
+    const code = `
+const { name } = await client.getUser({ id: 1 })
+consume(name)
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).toContain("getUser({ $select: 'name', id: 1 })")
+  })
+
+  it('uses an explicit safe projection for dynamic property access', () => {
+    const code = `
+const user = await client.getUser({ id: 1 })
+console.log(user.name)
+console.log(user[fieldName])
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).toContain("getUser({ $select: 'name,id,email,phone,score', id: 1 })")
+  })
+
+  it('injects a safe projection for promise callback consumption', () => {
+    const code = `
+client.me().then(member => setUser(member))
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).toContain("client.me({ $select: 'id,name,email,phone,score' })")
+  })
+
+  it('completes a selected structured leaf with its safe scalar projection', () => {
+    const code = `
+const result = await client.login({ username, password })
+saveToken(result.token)
+setUser(result.member)
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).toContain("login({ $select: 'token,member{id,name,email,phone,score}', username, password })")
+  })
+
+  it('bounds a recursive structured leaf at its scalar projection', () => {
+    const code = `
+const node = await client.getRecursiveNode()
+consume(node.child)
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).toContain("getRecursiveNode({ $select: 'child{value}' })")
+  })
+
+  it('injects a minimal projection when a structured result is unused', () => {
+    const code = `
+const ignored = await client.getUser({ id: 1 })
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).toContain("getUser({ $select: 'id', id: 1 })")
+  })
+
+  it('tracks structured fields consumed by a generated stream callback', () => {
+    const code = `
+client.subscribeLiveAlerts({ projectId }, user => console.log(user.name, user.email))
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).toContain("subscribeLiveAlerts({ $select: 'name,email', projectId }, user =>")
+  })
+
+  it('uses a safe explicit projection for an external stream callback', () => {
+    const code = `
+client.subscribeLiveAlerts({ projectId }, handleAlert)
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).toContain("subscribeLiveAlerts({ $select: 'id,name,email,phone,score', projectId }, handleAlert)")
+  })
+
+  it('uses lexical bindings when result names are shadowed', () => {
+    const code = `
+const user = await client.getUser({ id: 1 })
+function inspect() {
+  const user = { email: 'local' }
+  consume(user)
+}
+console.log(user.name)
+`
+    const result = analyzeAndTransform(code, 'test.ts', schema)
+    expect(result).toContain("getUser({ $select: 'name', id: 1 })")
   })
 })

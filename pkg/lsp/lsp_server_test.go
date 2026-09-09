@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,17 +19,46 @@ import (
 
 // ========== Server Integration Tests ==========
 
-func newTestServer() (*Server, *bytes.Buffer) {
-	var output bytes.Buffer
+type synchronizedBuffer struct {
+	mu  sync.RWMutex
+	buf bytes.Buffer
+}
+
+func (b *synchronizedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *synchronizedBuffer) String() string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.buf.String()
+}
+
+func (b *synchronizedBuffer) Reset() {
+	b.mu.Lock()
+	b.buf.Reset()
+	b.mu.Unlock()
+}
+
+func (b *synchronizedBuffer) Len() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.buf.Len()
+}
+
+func newTestServer() (*Server, *synchronizedBuffer) {
+	output := &synchronizedBuffer{}
 	logger := log.New(io.Discard, "", 0)
-	server := NewServer(strings.NewReader(""), &output, logger)
-	return server, &output
+	server := NewServer(strings.NewReader(""), output, logger)
+	return server, output
 }
 
 // ========== Additional Coverage Tests ==========
 
 // helper to open a doc and reset output buffer
-func openDoc(server *Server, output *bytes.Buffer, uri, text string) {
+func openDoc(server *Server, output interface{ Reset() }, uri, text string) {
 	params, _ := json.Marshal(DidOpenParams{
 		TextDocument: TextDocumentItem{
 			URI:  uri,
@@ -39,7 +69,7 @@ func openDoc(server *Server, output *bytes.Buffer, uri, text string) {
 	output.Reset()
 }
 
-func requestCompletion(server *Server, output *bytes.Buffer, uri string, pos Position) string {
+func requestCompletion(server *Server, output interface{ String() string }, uri string, pos Position) string {
 	id := json.RawMessage(`100`)
 	params, _ := json.Marshal(CompletionParams{
 		TextDocument: TextDocumentID{URI: uri},
@@ -54,7 +84,7 @@ func requestCompletion(server *Server, output *bytes.Buffer, uri string, pos Pos
 	return output.String()
 }
 
-func requestHover(server *Server, output *bytes.Buffer, uri string, pos Position) string {
+func requestHover(server *Server, output interface{ String() string }, uri string, pos Position) string {
 	id := json.RawMessage(`101`)
 	params, _ := json.Marshal(HoverParams{
 		TextDocument: TextDocumentID{URI: uri},
@@ -69,7 +99,7 @@ func requestHover(server *Server, output *bytes.Buffer, uri string, pos Position
 	return output.String()
 }
 
-func requestDefinition(server *Server, output *bytes.Buffer, uri string, pos Position) string {
+func requestDefinition(server *Server, output interface{ String() string }, uri string, pos Position) string {
 	id := json.RawMessage(`102`)
 	params, _ := json.Marshal(DefinitionParams{
 		TextDocument: TextDocumentID{URI: uri},
@@ -84,7 +114,7 @@ func requestDefinition(server *Server, output *bytes.Buffer, uri string, pos Pos
 	return output.String()
 }
 
-func requestReferences(server *Server, output *bytes.Buffer, uri string, pos Position) string {
+func requestReferences(server *Server, output interface{ String() string }, uri string, pos Position) string {
 	id := json.RawMessage(`103`)
 	params, _ := json.Marshal(ReferenceParams{
 		TextDocument: TextDocumentID{URI: uri},

@@ -972,6 +972,29 @@ func TestSearchField_FilterOp(t *testing.T) {
 	}
 }
 
+func TestSearchFieldSupportsStringFiltering(t *testing.T) {
+	f := NewSearchField("title")
+	tests := []struct {
+		name string
+		cond Condition
+		want string
+	}{
+		{name: "eq", cond: f.Eq("Luxo"), want: "title = $1"},
+		{name: "neq", cond: f.Neq("Legacy"), want: "title != $1"},
+		{name: "in", cond: f.In("A", "B"), want: "title IN ($1, $2)"},
+		{name: "filter-eq", cond: f.FilterOp("eq", "Luxo"), want: "title = $1"},
+		{name: "filter-match", cond: f.FilterOp("match", "fast api"), want: "to_tsvector"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sql, _ := tt.cond.ToSQL(1)
+			if !strings.Contains(sql, tt.want) {
+				t.Fatalf("SQL = %q, want substring %q", sql, tt.want)
+			}
+		})
+	}
+}
+
 func TestSearchField_CustomBuilder(t *testing.T) {
 	old := DefaultSearchBuilder
 	defer func() { DefaultSearchBuilder = old }()

@@ -60,7 +60,12 @@ func collectContracts(files []*ast.File) wireContracts {
 	}
 	for _, file := range files {
 		for _, model := range file.Models {
-			contracts.models[model.Name] = fieldTypes(model.Fields)
+			fields := contracts.models[model.Name]
+			if fields == nil {
+				fields = make(map[string]string)
+				contracts.models[model.Name] = fields
+			}
+			mergeFieldTypes(fields, model.Fields)
 		}
 		for _, extend := range file.Extends {
 			fields := contracts.models[extend.Name]

@@ -179,6 +179,37 @@ export class Encoder {
     this.writeRawBytes(v)
   }
 
+  /** Write a length-delimited value directly into this encoder's buffer. */
+  writeDelimited(writeValue: (encoder: Encoder) => void): void {
+    const prefixPosition = this.pos
+    this.grow(1)
+    this.pos++
+    const valuePosition = this.pos
+    try {
+      writeValue(this)
+    } catch (error) {
+      this.pos = prefixPosition
+      throw error
+    }
+    const valueLength = this.pos - valuePosition
+    const prefixLength = varintLength(valueLength)
+    const shift = prefixLength - 1
+    if (shift > 0) {
+      this.grow(shift)
+      this.buf.copyWithin(valuePosition + shift, valuePosition, this.pos)
+      this.pos += shift
+    }
+    this.writeVarintAt(prefixPosition, valueLength)
+  }
+
+  private writeVarintAt(position: number, value: number): void {
+    while (value >= 0x80) {
+      this.buf[position++] = (value & 0x7f) | 0x80
+      value = Math.floor(value / 128)
+    }
+    this.buf[position] = value
+  }
+
   /** Write a fixed 16-byte UUID (no length prefix). Accepts a canonical string or raw bytes. */
   writeUUID(v: string | Uint8Array): void {
     const bytes = typeof v === 'string' ? parseUUID(v) : v
@@ -274,6 +305,15 @@ export class Encoder {
   reset(): void {
     this.pos = 0
   }
+}
+
+function varintLength(value: number): number {
+  let length = 1
+  while (value >= 0x80) {
+    value = Math.floor(value / 128)
+    length++
+  }
+  return length
 }
 
 // --- Decoder ---

@@ -543,12 +543,15 @@ var DefaultSearchBuilder SearchBuilder = func(col string, argOffset int) string 
 	return "to_tsvector('simple', " + col + ") @@ plainto_tsquery('simple', $" + strconv.Itoa(argOffset) + ")"
 }
 
-// SearchField provides full-text search conditions for @search columns.
+// SearchField provides both ordinary string filters and full-text search for
+// columns carrying @filterable and @search together.
 // Pluggable: set DefaultSearchBuilder to change backend (PG/MySQL/ES).
-type SearchField struct{ col string }
+type SearchField struct{ StringField }
 
 // NewSearchField creates a SearchField for the given column.
-func NewSearchField(col string) SearchField { return SearchField{col: col} }
+func NewSearchField(col string) SearchField {
+	return SearchField{StringField: NewStringField(col)}
+}
 
 // Match generates a full-text search condition using the configured backend.
 func (f SearchField) Match(query string) Condition {
@@ -557,7 +560,10 @@ func (f SearchField) Match(query string) Condition {
 
 // FilterOp applies a search filter (used by @filterable @search).
 func (f SearchField) FilterOp(op, val string) Condition {
-	return f.Match(val)
+	if strings.EqualFold(op, "match") || strings.EqualFold(op, "search") {
+		return f.Match(val)
+	}
+	return f.StringField.FilterOp(op, val)
 }
 
 type searchCond struct {

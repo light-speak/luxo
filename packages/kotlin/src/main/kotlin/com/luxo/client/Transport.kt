@@ -47,6 +47,9 @@ data class APISchemaEntry(
 data class SelectionFieldSchema(
     val fieldID: Int,
     val typeName: String? = null,
+	val type: String? = null,
+	val isList: Boolean = false,
+	val nullable: Boolean = false,
 )
 
 data class ParamSchema(
@@ -56,6 +59,7 @@ data class ParamSchema(
     /** True when the param is an array ([T]) — encoded as [count][items...]. */
     val isList: Boolean = false,
     val nullable: Boolean = false,
+	val typeName: String? = null,
 )
 
 private data class SelectedField(val name: String, val children: List<SelectedField>? = null)
@@ -135,6 +139,7 @@ internal fun luxoJsonValue(value: Any?): JsonElement = when (value) {
     }
     is Iterable<*> -> buildJsonArray { value.forEach { add(luxoJsonValue(it)) } }
     is Array<*> -> buildJsonArray { value.forEach { add(luxoJsonValue(it)) } }
+	is LuxoBinaryEncodable -> value.toLuxoJson()
     else -> throw LuxoError("ConfigError", 0, "unsupported JSON value: ${value::class.qualifiedName}")
 }
 
@@ -233,10 +238,13 @@ internal object LuxoBinaryProtocol {
     }
 
     private fun writeFieldMask(enc: LuxoEncoder, meta: APISchemaEntry, selection: String?) {
-        if (selection.isNullOrBlank() || meta.fields.isEmpty()) {
+		if (meta.fields.isEmpty()) {
             enc.writeVarint(0)
             return
         }
+		if (selection.isNullOrBlank()) {
+			throw LuxoError("ConfigError", 0, "\$select is required for structured responses")
+		}
         val mask = encodeSelectionNode(SelectionParser(selection).parse(), meta.fields, meta.types)
         enc.writeVarint(mask.size.toLong())
         enc.writeRawBytes(mask)
@@ -349,6 +357,7 @@ internal object LuxoBinaryProtocol {
             "Boolean" -> enc.writeBool(value as Boolean)
             "Bytes" -> enc.writeBytes(value as ByteArray)
             "JSON" -> enc.writeBytes(luxoJsonValue(value).toString().toByteArray(Charsets.UTF_8))
+			"Model" -> writeStructuredParam(enc, param, value)
             else -> throw LuxoError("ConfigError", 0, "unsupported binary param type: ${param.type}")
         }
     }
@@ -371,9 +380,20 @@ internal object LuxoBinaryProtocol {
             "JSON" -> items.forEach {
                 enc.writeBytes(luxoJsonValue(it).toString().toByteArray(Charsets.UTF_8))
             }
+			"Model" -> items.forEach { writeStructuredParam(enc, param, it) }
             else -> throw LuxoError("ConfigError", 0, "unsupported binary list param type: ${param.type}")
         }
     }
+
+	private fun writeStructuredParam(enc: LuxoEncoder, param: ParamSchema, value: Any?) {
+		val structured = value as? LuxoBinaryEncodable
+			?: throw LuxoError(
+				"ConfigError",
+				0,
+				"${param.typeName ?: "structured parameter"} must implement LuxoBinaryEncodable",
+			)
+		enc.writeDelimited(structured::writeLuxo)
+	}
 
     private fun unixSeconds(value: Any): Long = when (value) {
         is String -> java.time.Instant.parse(value).epochSecond

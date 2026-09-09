@@ -6,6 +6,7 @@ import (
 
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lux"
+	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
 )
 
@@ -126,6 +127,31 @@ func TestCompileQuestionCallsNativeResolverInNestedExpression(t *testing.T) {
 	if !strings.Contains(out, "_result1, err := app.Resolver.LoadCount(ctx)") ||
 		!strings.Contains(out, "if err != nil") {
 		t.Fatalf("native Result call must be lowered with error propagation:\n%s", out)
+	}
+}
+
+func TestServiceFunctionCallsNativeResultThroughResolver(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Functions: []*ast.FnDecl{
+			{
+				Name:       "loadCount",
+				ReturnType: &ast.TypeRef{Name: "Result", TypeArgs: []*ast.TypeRef{{Name: "Int"}}},
+				Directives: []*ast.Directive{{Name: "native"}},
+			},
+			{
+				Name:       "heartbeat",
+				ReturnType: &ast.TypeRef{Name: "Int"},
+				Directives: []*ast.Directive{{Name: "service"}},
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.UnaryExpr{
+					Op: "?", Value: &ast.CallExpr{Func: &ast.Ident{Name: "loadCount"}},
+				}}}},
+			},
+		},
+	}}}
+	var body strings.Builder
+	defaultGenerator().generateServiceFnHandlers(&body, result, nil)
+	if !strings.Contains(body.String(), "app.Resolver.LoadCount(ctx)") {
+		t.Fatalf("service function did not route native Result call through resolver:\n%s", body.String())
 	}
 }
 
@@ -1651,7 +1677,40 @@ func TestCompileAPIBodyWithCustomTypeParam(t *testing.T) {
 		t.Fatalf("expected 'var input PostInput', got %q", out)
 	}
 	if !strings.Contains(out, `req.ParamJSON("input", &input)`) {
-		t.Fatalf("expected ParamJSON call, got %q", out)
+		t.Fatalf("expected JSON fallback, got %q", out)
+	}
+	for _, want := range []string{
+		"if req.BinaryMode",
+		`req.ParamMessage("input", false, false)`,
+		"input.ReadLuxo(_inputDecoder)",
+		`api.InvalidParam("input", _inputDecoder.Err())`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected native structured decode %q, got %q", want, out)
+		}
+	}
+}
+
+func TestCompileAPIBodyWithCustomTypeListParam(t *testing.T) {
+	api := &ast.ApiDecl{
+		Name: "createPosts",
+		Params: []*ast.ParamDecl{
+			{Name: "inputs", Type: &ast.TypeRef{Name: "PostInput", IsList: true}},
+		},
+		Body: &ast.Block{},
+	}
+	var b strings.Builder
+	compileAPIBody(&b, api, nil, nil)
+	out := b.String()
+	for _, want := range []string{
+		`req.ParamMessageArray("inputs", false, false)`,
+		"inputs = make([]PostInput, len(_inputsMessages))",
+		"inputs[i].ReadLuxo(_inputsDecoder)",
+		`req.ParamJSON("inputs", &inputs)`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected native structured list decode %q, got %q", want, out)
+		}
 	}
 }
 
@@ -3227,6 +3286,415 @@ func TestCompileAwaitParallelQueries(t *testing.T) {
 	if vt, ok := c.vars["posts"]; !ok || !vt.isList {
 		t.Error("posts var not tracked as list")
 	}
+}
+
+func TestCompileAwaitDestructuringBindsParallelResults(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"User": {Name: "User"},
+		"Post": {Name: "Post"},
+	}
+	c := newCompiler(models)
+	user := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "find"},
+		Args: []*ast.NamedArg{{Name: "id", Value: &ast.Ident{Name: "id"}}},
+	}
+	posts := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "where"},
+			},
+			Field: "all",
+		},
+	}
+	c.compileStmt(&ast.ValStmt{
+		Names: []string{"user", "posts"},
+		Value: &ast.AwaitExpr{Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: user},
+			&ast.ExprStmt{Expr: posts},
+		}}},
+	})
+	out := compilerOut(c)
+	for _, want := range []string{
+		"var user *User",
+		"var posts []*Post",
+		"user, err = app.User.Where(UserWhere.Id.Eq(id)).First(gctx)",
+		"posts, err = app.Post.Where().All(gctx)",
+		"if err := g.Wait(); err != nil",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("destructured await missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, " := \n") {
+		t.Fatalf("destructured await emitted an empty declaration:\n%s", out)
+	}
+}
+
+func TestCompileAwaitSingleExpressionBinding(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	c.compileStmt(&ast.ValStmt{
+		Name: "user",
+		Value: &ast.AwaitExpr{Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "find"},
+				Args: []*ast.NamedArg{{Name: "id", Value: &ast.Ident{Name: "id"}}},
+			}},
+		}}},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "var user *User") || !strings.Contains(out, "user, err = app.User.Where(UserWhere.Id.Eq(id)).First(gctx)") {
+		t.Fatalf("single-expression await binding was not compiled:\n%s", out)
+	}
+}
+
+func TestCompileAwaitValueBinding(t *testing.T) {
+	c := newCompiler(nil)
+	value := &ast.Literal{Kind: token.Int, Value: "7"}
+	value.SetTypeTag("Int")
+	c.compileStmt(&ast.ValStmt{
+		Name: "answer",
+		Value: &ast.AwaitExpr{Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: value},
+		}}},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "var answer int64") || !strings.Contains(out, "answer = 7") {
+		t.Fatalf("await value binding was not strongly typed:\n%s", out)
+	}
+}
+
+func TestCompileAwaitBindingsIgnoreInvalidRecoveryNodes(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileAwaitBindings(&ast.AwaitExpr{Body: &ast.Block{Stmts: []ast.Stmt{
+		nil,
+		&ast.ExprStmt{},
+	}}}, []string{"value"})
+	if out := compilerOut(c); !strings.Contains(out, "errgroup.WithContext(ctx)") {
+		t.Fatalf("recovered await block was not emitted:\n%s", out)
+	}
+}
+
+func TestCompileAwaitBindingsRejectExtraExpressions(t *testing.T) {
+	c := newCompiler(nil)
+	c.compileAwaitBindings(&ast.AwaitExpr{Body: &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.Literal{Kind: token.Int, Value: "1"}},
+		&ast.ExprStmt{Expr: &ast.Literal{Kind: token.Int, Value: "2"}},
+	}}}, []string{"value"})
+	if out := compilerOut(c); out != "" {
+		t.Fatalf("invalid await mismatch emitted partial code:\n%s", out)
+	}
+}
+
+func TestGoTypeForAwaitValue(t *testing.T) {
+	tests := []struct {
+		name  string
+		value valType
+		want  string
+	}{
+		{name: "model", value: valType{name: "User", isModel: true}, want: "*User"},
+		{name: "model list", value: valType{name: "User", isModel: true, isList: true}, want: "[]*User"},
+		{name: "primitive", value: valType{name: "Int"}, want: "int64"},
+		{name: "primitive list", value: valType{name: "String", isList: true}, want: "[]string"},
+		{name: "nullable primitive", value: valType{name: "Int", nullable: true}, want: "*int64"},
+		{name: "nullable list", value: valType{name: "String", isList: true, nullable: true}, want: "[]string"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := goTypeForValType(test.value); got != test.want {
+				t.Fatalf("go type = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestCompileAwaitAggregateUsesGroupContext(t *testing.T) {
+	c := newCompiler(makeModels("Task"))
+	where := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Task"}, Field: "where"},
+	}
+	lambda := &ast.LambdaExpr{Body: &ast.Block{Stmts: []ast.Stmt{
+		&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "storyPoints"}},
+	}}}
+	sum := &ast.CallExpr{
+		Func: &ast.MemberExpr{Object: where, Field: "sum"},
+		Args: []*ast.NamedArg{{Value: lambda}},
+	}
+	c.compileStmt(&ast.ValStmt{
+		Name: "points",
+		Value: &ast.AwaitExpr{Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: sum},
+		}}},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, `.Sum(gctx, "story_points")`) {
+		t.Fatalf("await aggregate did not use group context:\n%s", out)
+	}
+}
+
+func TestCompileAwaitFusesCompatibleAggregates(t *testing.T) {
+	models := makeModels("Task")
+	c := newCompiler(models)
+	c.enums = map[string]bool{"TaskStatus": true}
+
+	projectFilter := func() ast.Expr {
+		return &ast.BinaryExpr{
+			Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "projectId"},
+			Op:    "==",
+			Right: &ast.Ident{Name: "projectId"},
+		}
+	}
+	statusFilter := func(status string) ast.Expr {
+		return &ast.BinaryExpr{
+			Left: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "status"}, Op: "==",
+			Right: &ast.MemberExpr{Object: &ast.Ident{Name: "TaskStatus"}, Field: status},
+		}
+	}
+
+	c.compileStmt(&ast.ValStmt{
+		Names: []string{"total", "completed", "review"},
+		Value: &ast.AwaitExpr{Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: modelAggregateCall("Task", "count", "", projectFilter())},
+			&ast.ExprStmt{Expr: modelAggregateCall("Task", "count", "", projectFilter(), statusFilter("DONE"))},
+			&ast.ExprStmt{Expr: modelAggregateCall("Task", "count", "", projectFilter(), statusFilter("IN_REVIEW"))},
+		}}},
+	})
+
+	out := compilerOut(c)
+	if strings.Count(out, ".AggregateBatch(gctx,") != 1 || strings.Contains(out, ".Count(gctx)") {
+		t.Fatalf("compatible aggregates were not fused:\n%s", out)
+	}
+	if strings.Count(out, "TaskWhere.ProjectId.Eq(projectId)") != 1 {
+		t.Fatalf("common predicate was not hoisted exactly once:\n%s", out)
+	}
+	for _, want := range []string{
+		"lux.AggregateSpec{Function: lux.AggregateCount}",
+		"Conditions: []lux.Condition{TaskWhere.Status.Eq(string(TaskStatusDONE))}",
+		"Conditions: []lux.Condition{TaskWhere.Status.Eq(string(TaskStatusIN_REVIEW))}",
+		"total = _luxoAggregates1[0]",
+		"completed = _luxoAggregates1[1]",
+		"review = _luxoAggregates1[2]",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("fused aggregate output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Count(out, "g.Go(func() error {") != 1 {
+		t.Fatalf("one fused aggregate group should use one goroutine:\n%s", out)
+	}
+}
+
+func TestCompileAwaitFusesScalarAggregateFunctions(t *testing.T) {
+	c := newCompiler(makeModels("Task"))
+	c.compileStmt(&ast.ValStmt{
+		Names: []string{"count", "sum", "average", "minimum", "maximum"},
+		Value: &ast.AwaitExpr{Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: modelAggregateCall("Task", "count", "")},
+			&ast.ExprStmt{Expr: modelAggregateCall("Task", "sum", "storyPoints")},
+			&ast.ExprStmt{Expr: modelAggregateCall("Task", "avg", "storyPoints")},
+			&ast.ExprStmt{Expr: modelAggregateCall("Task", "min", "storyPoints")},
+			&ast.ExprStmt{Expr: modelAggregateCall("Task", "max", "storyPoints")},
+		}}},
+	})
+
+	out := compilerOut(c)
+	for _, want := range []string{
+		"Function: lux.AggregateCount",
+		"Function: lux.AggregateSum, Column: \"story_points\"",
+		"Function: lux.AggregateAvg, Column: \"story_points\"",
+		"Function: lux.AggregateMin, Column: \"story_points\"",
+		"Function: lux.AggregateMax, Column: \"story_points\"",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("fused scalar aggregates missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestCompileAwaitAggregateFusionFallsBackSafely(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*compiler)
+		exprs []ast.Expr
+	}{
+		{
+			name: "different models",
+			exprs: []ast.Expr{
+				modelAggregateCall("Task", "count", ""),
+				modelAggregateCall("Project", "count", ""),
+			},
+		},
+		{
+			name: "volatile predicate",
+			exprs: []ast.Expr{
+				modelAggregateCall("Task", "count", "", &ast.BinaryExpr{Left: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "createdAt"}, Op: ">", Right: &ast.CallExpr{Func: &ast.Ident{Name: "now"}}}),
+				modelAggregateCall("Task", "count", ""),
+			},
+		},
+		{
+			name: "scoped API",
+			setup: func(c *compiler) {
+				c.api.Directives = []*ast.Directive{{Name: "scope"}}
+			},
+			exprs: []ast.Expr{
+				modelAggregateCall("Task", "count", ""),
+				modelAggregateCall("Task", "count", ""),
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c := newCompiler(makeModels("Task", "Project"))
+			if test.setup != nil {
+				test.setup(c)
+			}
+			stmts := make([]ast.Stmt, len(test.exprs))
+			for index, expr := range test.exprs {
+				stmts[index] = &ast.ExprStmt{Expr: expr}
+			}
+			c.compileStmt(&ast.ValStmt{Names: []string{"left", "right"}, Value: &ast.AwaitExpr{Body: &ast.Block{Stmts: stmts}}})
+			out := compilerOut(c)
+			if strings.Contains(out, ".AggregateBatch(") || strings.Count(out, ".Count(gctx)") != 2 {
+				t.Fatalf("unsafe aggregates must retain independent execution:\n%s", out)
+			}
+		})
+	}
+}
+
+func TestAwaitAggregateRejectsRemoteModel(t *testing.T) {
+	c := newCompiler(makeModels("Task"))
+	c.generator = mustNewGenerator(t, GeneratorConfig{Events: &EventContext{ModelModule: map[string]string{"Task": "task"}}})
+	c.api.Pos.File = "origin/project.luxo"
+	task := c.newAwaitTask("total", modelAggregateCall("Task", "count", ""))
+	if _, ok := c.awaitAggregate(0, task); ok {
+		t.Fatal("remote model aggregate was accepted for local SQL fusion")
+	}
+}
+
+func TestAggregateTerminalRejectsInvalidShapes(t *testing.T) {
+	invalid := []chainLink{
+		{method: "count", args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "1"}}}},
+		{method: "sum"},
+		{method: "sum", args: []*ast.NamedArg{{Value: &ast.Ident{Name: "notALambda"}}}},
+		{method: "all"},
+	}
+	for _, link := range invalid {
+		if _, ok := aggregateTerminal(link); ok {
+			t.Fatalf("invalid aggregate terminal was accepted: %+v", link)
+		}
+	}
+}
+
+func TestAwaitAggregateConditionSafety(t *testing.T) {
+	c := newCompiler(makeModels("Task"))
+	named := &ast.NamedArg{Name: "projectId", Value: &ast.Ident{Name: "projectId"}}
+	condition, ok := c.awaitAggregateCondition("Task", named)
+	if !ok || condition != "TaskWhere.ProjectId.Eq(projectId)" {
+		t.Fatalf("named aggregate condition = %q, %v", condition, ok)
+	}
+	for _, arg := range []*ast.NamedArg{
+		nil,
+		{Value: &ast.Ident{Name: "notAComparison"}},
+	} {
+		if _, ok := c.awaitAggregateCondition("Task", arg); ok {
+			t.Fatalf("unsafe aggregate condition was accepted: %+v", arg)
+		}
+	}
+	if _, ok := c.awaitAggregateConditions("Task", []chainLink{{method: "orderBy"}}); ok {
+		t.Fatal("non-where query modifier was accepted for aggregate fusion")
+	}
+}
+
+func TestStableAggregateConditionShapes(t *testing.T) {
+	field := &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "priority"}
+	valid := &ast.NamedArg{Value: &ast.BinaryExpr{Left: field, Op: ">=", Right: &ast.UnaryExpr{Op: "-", Value: &ast.Literal{Kind: token.Int, Value: "1"}}}}
+	if !stableAggregateCondition(valid) {
+		t.Fatal("stable comparison was rejected")
+	}
+	for _, arg := range []*ast.NamedArg{
+		{Name: "value", Value: &ast.CallExpr{Func: &ast.Ident{Name: "now"}}},
+		{Value: &ast.BinaryExpr{Left: field, Op: "+", Right: &ast.Literal{Kind: token.Int, Value: "1"}}},
+		{Value: &ast.BinaryExpr{Left: &ast.Literal{Kind: token.Int, Value: "1"}, Op: "==", Right: &ast.Literal{Kind: token.Int, Value: "1"}}},
+	} {
+		if stableAggregateCondition(arg) {
+			t.Fatalf("unstable condition was accepted: %+v", arg)
+		}
+	}
+	for _, expr := range []ast.Expr{
+		&ast.Ident{},
+		&ast.Literal{Kind: token.Int, Value: "1"},
+		&ast.MemberExpr{Object: &ast.Ident{Name: "model"}},
+		&ast.MemberExpr{Object: &ast.Ident{Name: "it"}},
+	} {
+		if aggregateFieldReference(expr) {
+			t.Fatalf("invalid aggregate field reference was accepted: %+v", expr)
+		}
+	}
+	if !aggregateFieldReference(&ast.Ident{Name: "priority"}) {
+		t.Fatal("identifier field reference was rejected")
+	}
+	if stableAggregateValue(&ast.UnaryExpr{Op: "!", Value: &ast.Ident{Name: "flag"}}) || stableAggregateValue(&ast.CallExpr{Func: &ast.Ident{Name: "now"}}) {
+		t.Fatal("volatile aggregate value was accepted")
+	}
+	if !stableAggregateValue(&ast.MemberExpr{Object: &ast.Ident{Name: "request"}, Field: "limit"}) {
+		t.Fatal("stable member value was rejected")
+	}
+}
+
+func TestCommonAggregateConditionsPreservesMultiplicity(t *testing.T) {
+	tasks := []awaitAggregate{
+		{conditions: []string{"project", "project", "status"}},
+		{conditions: []string{"project", "priority"}},
+	}
+	common := commonAggregateConditions(tasks)
+	if len(common) != 1 || common[0] != "project" {
+		t.Fatalf("common conditions = %v", common)
+	}
+}
+
+func BenchmarkCompileAwaitAggregateFusion(b *testing.B) {
+	models := makeModels("Task")
+	statement := &ast.ValStmt{
+		Names: []string{"total", "completed", "cancelled", "review", "critical"},
+		Value: &ast.AwaitExpr{Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: modelAggregateCall("Task", "count", "")},
+			&ast.ExprStmt{Expr: modelAggregateCall("Task", "count", "", aggregateFieldEquals("status", "DONE"))},
+			&ast.ExprStmt{Expr: modelAggregateCall("Task", "count", "", aggregateFieldEquals("status", "CANCELLED"))},
+			&ast.ExprStmt{Expr: modelAggregateCall("Task", "count", "", aggregateFieldEquals("status", "IN_REVIEW"))},
+			&ast.ExprStmt{Expr: modelAggregateCall("Task", "count", "", aggregateFieldEquals("priority", "CRITICAL"))},
+		}}},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		c := newCompiler(models)
+		c.compileStmt(statement)
+	}
+}
+
+func aggregateFieldEquals(field, value string) ast.Expr {
+	return &ast.BinaryExpr{
+		Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: field},
+		Op:    "==",
+		Right: &ast.Literal{Kind: token.String, Value: value},
+	}
+}
+
+func modelAggregateCall(model, function, column string, conditions ...ast.Expr) ast.Expr {
+	var receiver ast.Expr = &ast.Ident{Name: model}
+	for _, condition := range conditions {
+		receiver = &ast.CallExpr{
+			Func: &ast.MemberExpr{Object: receiver, Field: "where"},
+			Args: []*ast.NamedArg{{Value: condition}},
+		}
+	}
+	args := []*ast.NamedArg(nil)
+	if column != "" {
+		args = []*ast.NamedArg{{Value: &ast.LambdaExpr{Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: column}},
+		}}}}}
+	}
+	return &ast.CallExpr{Func: &ast.MemberExpr{Object: receiver, Field: function}, Args: args}
 }
 
 // TestCompileAwaitNoVals — await with no val statements → sequential
@@ -5964,6 +6432,56 @@ func TestInferWhenReturnType(t *testing.T) {
 	}
 }
 
+func TestInferWhenReturnTypeUsesSemanticType(t *testing.T) {
+	c := newCompiler(nil)
+	c.enums = make(map[string]bool)
+	c.enums["DeliveryRisk"] = true
+
+	integer := &ast.WhenExpr{}
+	integer.SetTypeTag("Int")
+	if got := c.inferWhenReturnType(integer); got != "int64" {
+		t.Fatalf("integer when type = %q, want int64", got)
+	}
+
+	risk := &ast.WhenExpr{}
+	risk.SetTypeTag("DeliveryRisk")
+	if got := c.inferWhenReturnType(risk); got != "DeliveryRisk" {
+		t.Fatalf("enum when type = %q, want DeliveryRisk", got)
+	}
+}
+
+func TestCompileElvisGuardUsesSemanticBooleanType(t *testing.T) {
+	c := newCompiler(nil)
+	condition := &ast.Ident{Name: "valid"}
+	condition.SetTypeTag("Boolean")
+	c.compileElvisGuard(&ast.ElvisExpr{
+		Left:  condition,
+		Right: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "ValidationFailed"},
+	})
+	out := compilerOut(c)
+	if !strings.Contains(out, "if !valid {") || strings.Contains(out, "valid == nil") {
+		t.Fatalf("boolean elvis guard was not compiled as a boolean check:\n%s", out)
+	}
+}
+
+func TestCompileWhereNullComparisons(t *testing.T) {
+	c := newCompiler(nil)
+	field := &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "storyPoints"}
+	nullValue := &ast.Literal{Kind: token.Null, Value: "null"}
+	for _, test := range []struct {
+		op   string
+		want string
+	}{
+		{op: "==", want: "TaskWhere.StoryPoints.IsNull()"},
+		{op: "!=", want: "TaskWhere.StoryPoints.IsNotNull()"},
+	} {
+		got := c.compileWhereArg("Task", &ast.BinaryExpr{Left: field, Op: test.op, Right: nullValue})
+		if got != test.want {
+			t.Fatalf("null comparison %s = %q, want %q", test.op, got, test.want)
+		}
+	}
+}
+
 // --- zeroValueForType ---
 
 func TestZeroValueForType(t *testing.T) {
@@ -6689,6 +7207,9 @@ func TestCompileWhenWithElse(t *testing.T) {
 	if !strings.Contains(got, "default:") {
 		t.Fatalf("when with else should have default, got:\n%s", got)
 	}
+	if strings.Count(got, "return ") != 2 {
+		t.Fatalf("exhaustive when must not emit an unreachable fallback return:\n%s", got)
+	}
 }
 
 // ─── compileVal — paginate + all → _total ───────────────────────────────────
@@ -6921,6 +7442,56 @@ func TestCompileLoad_PK(t *testing.T) {
 	got := b.String()
 	if !strings.Contains(got, "app.loaders.ExtendUser.Load(ctx, userId, nil)") {
 		t.Errorf("PK load: got %q", got)
+	}
+}
+
+func TestCompileRemoteLoadUsesOnlyReferencedFields(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"Project": testModel("Project", nil, []*ast.FieldDecl{
+			testField("id", "Int"),
+			testField("name", "String"),
+			testField("description", "String"),
+			testField("owner", "User"),
+		}),
+		"User": testModel("User", nil, []*ast.FieldDecl{
+			testField("id", "Int"),
+			testField("name", "String"),
+			testField("email", "String"),
+		}),
+	}
+	apiDecl := &ast.ApiDecl{
+		Name: "releaseReadiness",
+		Pos:  token.Position{File: "origin/task/stats.luxo"},
+		Body: &ast.Block{Stmts: []ast.Stmt{
+			&ast.ValStmt{Name: "project", Value: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Project"}, Field: "load"},
+				Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "projectId"}}},
+			}},
+			&ast.ReturnStmt{Value: &ast.ObjectExpr{Fields: []*ast.NamedArg{
+				{Name: "projectName", Value: &ast.MemberExpr{Object: &ast.Ident{Name: "project"}, Field: "name"}},
+				{Name: "ownerName", Value: &ast.MemberExpr{Object: &ast.MemberExpr{Object: &ast.Ident{Name: "project"}, Field: "owner"}, Field: "name"}},
+			}}},
+		}},
+	}
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{ModelModule: map[string]string{
+		"Project": "project",
+		"User":    "user",
+	}}})
+	c := newCompiler(models)
+	c.generator = generator
+	c.api = apiDecl
+	c.loadSelections = analyzeLoadSelections(apiDecl.Body, models)
+	c.compileHandlerBody(apiDecl.Body.Stmts)
+
+	got := compilerOut(c)
+	want := `app.loaders.ExtendProject.Load(ctx, projectId, []*selection.Field{{Name: "name"}, {Name: "owner", Children: []*selection.Field{{Name: "name"}}}})`
+	if !strings.Contains(got, want) {
+		t.Fatalf("remote load must use the statically referenced fields:\n%s", got)
+	}
+	for _, unwanted := range []string{`Name: "description"`, `Name: "email"`} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("remote load selected an unused field %s:\n%s", unwanted, got)
+		}
 	}
 }
 
@@ -8061,6 +8632,95 @@ func TestCompileDeleteManyTerminal(t *testing.T) {
 	})
 	if !strings.Contains(got, ".Delete(ctx)") {
 		t.Errorf("deleteMany should compile to .Delete(ctx): got %q", got)
+	}
+}
+
+func TestCompileStaticDeleteManyPreservesWhere(t *testing.T) {
+	models := map[string]*ast.ModelDecl{
+		"Notification": {
+			Name:       "Notification",
+			Directives: []*ast.Directive{{Name: "soft"}},
+		},
+	}
+	c := newCompiler(models)
+	got := c.compileModelChain("Notification", []chainLink{{
+		method: "deleteMany",
+		args: []*ast.NamedArg{{Name: "where", Value: &ast.BinaryExpr{
+			Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "userId"},
+			Op:    "==",
+			Right: &ast.Ident{Name: "userId"},
+		}}},
+	}})
+	if want := "app.Notification.Where(NotificationWhere.UserId.Eq(userId)).SoftDelete(ctx)"; got != want {
+		t.Fatalf("deleteMany = %q, want %q", got, want)
+	}
+}
+
+func TestCompileStaticUpdateManyPreservesWhereAndSets(t *testing.T) {
+	c := newCompiler(makeModels("Task"))
+	got := c.compileModelChain("Task", []chainLink{{
+		method: "updateMany",
+		args: []*ast.NamedArg{
+			{Name: "where", Value: &ast.BinaryExpr{
+				Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "projectId"},
+				Op:    "==",
+				Right: &ast.Ident{Name: "projectId"},
+			}},
+			{Name: "status", Value: &ast.Ident{Name: "newStatus"}},
+		},
+	}})
+	want := `app.Task.Where(TaskWhere.ProjectId.Eq(projectId)).Update(ctx, lux.SetField{Col: "status", Val: newStatus})`
+	if got != want {
+		t.Fatalf("updateMany = %q, want %q", got, want)
+	}
+}
+
+func TestCompileChainedUpdateManyKeepsExistingWhere(t *testing.T) {
+	c := newCompiler(makeModels("Task"))
+	got := c.compileModelChain("Task", []chainLink{
+		{method: "where", args: []*ast.NamedArg{{Value: &ast.BinaryExpr{
+			Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "projectId"},
+			Op:    "==",
+			Right: &ast.Ident{Name: "projectId"},
+		}}}},
+		{method: "updateMany", args: []*ast.NamedArg{
+			{Name: "status", Value: &ast.Ident{Name: "newStatus"}},
+		}},
+	})
+	want := `app.Task.Where(TaskWhere.ProjectId.Eq(projectId)).Update(ctx, lux.SetField{Col: "status", Val: newStatus})`
+	if got != want {
+		t.Fatalf("chained updateMany = %q, want %q", got, want)
+	}
+}
+
+func TestCompileStaticDeleteManyWithoutWhereUsesQuery(t *testing.T) {
+	c := newCompiler(makeModels("Trace"))
+	if got, want := c.compileModelChain("Trace", []chainLink{{method: "deleteMany"}}), "app.Trace.Where().Delete(ctx)"; got != want {
+		t.Fatalf("deleteMany = %q, want %q", got, want)
+	}
+}
+
+func TestCompileReturnDirectBulkMutationUsesScalarCodec(t *testing.T) {
+	c := newCompiler(makeModels("Task"))
+	c.api.ReturnType = &ast.TypeRef{Name: "Int"}
+	call := &ast.CallExpr{Func: &ast.MemberExpr{
+		Object: &ast.Ident{Name: "Task"},
+		Field:  "updateMany",
+	}, Args: []*ast.NamedArg{
+		{Name: "where", Value: &ast.BinaryExpr{
+			Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "projectId"},
+			Op:    "==",
+			Right: &ast.Ident{Name: "projectId"},
+		}},
+		{Name: "status", Value: &ast.Ident{Name: "newStatus"}},
+	}}
+	c.compileStmt(&ast.ReturnStmt{Value: call})
+	out := compilerOut(c)
+	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, _result)") {
+		t.Fatalf("bulk mutation Int result must use scalar codec:\n%s", out)
+	}
+	if strings.Contains(out, "_result.WriteLuxo") {
+		t.Fatalf("bulk mutation Int result must not use model encoding:\n%s", out)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	stderrors "errors"
 	"github.com/light-speak/luxo/pkg/lux/api"
@@ -175,20 +176,33 @@ func (s *Server) processRequest(conn io.Writer, payload []byte) error {
 }
 
 func (s *Server) processCall(conn io.Writer, envelope requestEnvelope) error {
-	ctx, err := s.requestContext(envelope.token)
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var ctx context.Context = requestCtx
+	var trace *api.DebugTraceSession
+	if envelope.traceID != "" {
+		ctx, trace = api.WithRemoteTrace(ctx, envelope.traceID, envelope.fieldPath, envelope.databaseDetails)
+	}
+	authStarted := trace.Start()
+	ctx, err := s.requestContext(ctx, envelope.token)
+	trace.Finish(authStarted, api.DebugSpanMeta{Name: "service.authenticate", Category: "service"})
 	if err != nil {
-		return WriteFrame(conn, encodeError(401, "Unauthorized", err.Error()))
+		return writeCallError(conn, 401, "Unauthorized", err.Error(), trace)
 	}
-	req, parseErr := s.registry.ParseBinaryRequest(envelope.body)
-	if parseErr != nil {
-		return WriteFrame(conn, encodeError(400, "BadRequest", parseErr.Error()))
+	req := api.GetRequest()
+	defer api.PutRequest(req)
+	decodeStarted := trace.Start()
+	if parseErr := s.registry.ParseBinaryRequestInto(envelope.body, req); parseErr != nil {
+		trace.Finish(decodeStarted, api.DebugSpanMeta{Name: "service.decode", Category: "service"})
+		return writeCallError(conn, 400, "BadRequest", parseErr.Error(), trace)
 	}
+	trace.Finish(decodeStarted, api.DebugSpanMeta{Name: "service.decode", Category: "service", Operation: req.API})
 	req.Internal = true
 
 	// Dispatch to handler
 	fn, ok := s.handlers[req.API]
 	if !ok {
-		return WriteFrame(conn, encodeError(404, "NotFound", "handler not found: "+req.API))
+		return writeCallError(conn, 404, "NotFound", "handler not found: "+req.API, trace)
 	}
 
 	buf := api.GetBuf()
@@ -196,30 +210,45 @@ func (s *Server) processCall(conn io.Writer, envelope requestEnvelope) error {
 	buf.B = append(buf.B, statusOK)
 	req.Buf = buf
 
-	herr := s.callHandler(ctx, fn, req)
+	metrics := s.router.RequestMetricsRecorder()
+	var handlerStarted time.Time
+	if metrics != nil {
+		handlerStarted = time.Now()
+	}
+	handlerCtx, handlerSpan := trace.StartSpan(ctx, api.DebugSpanMeta{Name: "service.handler", Category: "service", Operation: req.API})
+	herr := s.callHandler(handlerCtx, fn, req)
+	trace.FinishSpan(handlerSpan)
+	if metrics != nil {
+		metrics.Record(req.API, time.Since(handlerStarted), herr != nil)
+	}
 	if herr != nil {
 		api.PutBuf(buf)
 		var appErr *luxerrors.AppError
 		if stderrors.As(herr, &appErr) {
-			return WriteFrame(conn, encodeError(appErr.Code, appErr.Name, appErr.Message))
+			return writeCallError(conn, appErr.Code, appErr.Name, appErr.Message, trace)
 		}
-		return WriteFrame(conn, encodeError(500, "Internal", herr.Error()))
+		return writeCallError(conn, 500, "Internal", herr.Error(), trace)
 	}
 
 	// Zero-copy: write [frame header][statusOK + handler payload] directly from pooled buf
-	err = WriteFrame(conn, buf.B)
+	if trace == nil {
+		err = WriteFrame(conn, buf.B)
+	} else {
+		err = writeTracedFrame(conn, statusTraceOK, buf.B[1:], trace)
+	}
 	api.PutBuf(buf)
 	return err
 }
 
 func (s *Server) processStream(conn net.Conn, envelope requestEnvelope) {
-	ctx, err := s.requestContext(envelope.token)
+	ctx, err := s.requestContext(context.Background(), envelope.token)
 	if err != nil {
 		WriteFrame(conn, encodeError(401, "Unauthorized", err.Error()))
 		return
 	}
-	req, err := s.registry.ParseBinaryRequest(envelope.body)
-	if err != nil {
+	req := api.GetRequest()
+	defer api.PutRequest(req)
+	if err := s.registry.ParseBinaryRequestInto(envelope.body, req); err != nil {
 		WriteFrame(conn, encodeError(400, "BadRequest", err.Error()))
 		return
 	}
@@ -256,8 +285,7 @@ func (s *Server) processStream(conn net.Conn, envelope requestEnvelope) {
 	}
 }
 
-func (s *Server) requestContext(token string) (context.Context, error) {
-	ctx := context.Background()
+func (s *Server) requestContext(ctx context.Context, token string) (context.Context, error) {
 	if token == "" {
 		return ctx, nil
 	}
@@ -289,4 +317,22 @@ func encodeError(code int, name, message string) []byte {
 	resp = append(resp, statusError)
 	resp = append(resp, enc.Bytes()...)
 	return resp
+}
+
+func writeCallError(w io.Writer, code int, name, message string, trace *api.DebugTraceSession) error {
+	encoded := encodeError(code, name, message)
+	if trace == nil {
+		return WriteFrame(w, encoded)
+	}
+	return writeTracedFrame(w, statusTraceError, encoded[1:], trace)
+}
+
+func writeTracedFrame(w io.Writer, status byte, body []byte, trace *api.DebugTraceSession) error {
+	encodedTrace := api.EncodeDebugTrace(trace.Snapshot())
+	payload := make([]byte, 0, 1+10+len(encodedTrace)+len(body))
+	payload = append(payload, status)
+	payload = codec.AppendVarint(payload, uint64(len(encodedTrace)))
+	payload = append(payload, encodedTrace...)
+	payload = append(payload, body...)
+	return WriteFrame(w, payload)
 }

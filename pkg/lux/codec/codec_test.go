@@ -2,6 +2,7 @@ package codec
 
 import (
 	"bytes"
+	"errors"
 	"math"
 	"testing"
 	"unsafe"
@@ -298,6 +299,19 @@ func TestDecoderInvalidData(t *testing.T) {
 	}
 	if dec.Err() == nil {
 		t.Fatal("message without end marker should be rejected")
+	}
+}
+
+func TestDecoderFailPreservesFirstError(t *testing.T) {
+	dec := NewDecoder(nil)
+	first := errors.New("invalid decimal")
+	dec.Fail(first)
+	dec.Fail(errors.New("later error"))
+	if !errors.Is(dec.Err(), first) {
+		t.Fatalf("Err() = %v, want first error", dec.Err())
+	}
+	if dec.NextField() {
+		t.Fatal("NextField should stop after Fail")
 	}
 }
 
@@ -3206,6 +3220,18 @@ func TestColumnarArenaNoStrings(t *testing.T) {
 	r := NewColumnarReader(data)
 	if r.ArenaSize() != 0 {
 		t.Fatalf("ArenaSize should be 0, got %d", r.ArenaSize())
+	}
+}
+
+func TestColumnarWriterEmptyOmitsFieldColumns(t *testing.T) {
+	w := &ColumnarWriter{}
+	w.SetCount(0)
+	w.WriteColumnInt(1, nil)
+	w.WriteColumnString(2, nil)
+
+	want := []byte{0, 0, 0}
+	if got := w.Bytes(); !bytes.Equal(got, want) {
+		t.Fatalf("empty columnar payload = %v, want %v", got, want)
 	}
 }
 

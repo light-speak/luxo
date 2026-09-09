@@ -125,11 +125,11 @@ func TestBuildParamTypesFromASTNormalizesWireTypes(t *testing.T) {
 	if got := types["create"]["role"]; got != "Enum" {
 		t.Fatalf("role wire type = %q, want Enum", got)
 	}
-	if got := types["create"]["input"]; got != "JSON" {
-		t.Fatalf("input wire type = %q, want JSON", got)
+	if got := types["create"]["input"]; got != "CreateInput" {
+		t.Fatalf("input wire type = %q, want CreateInput", got)
 	}
-	if got := types["create"]["inputs"]; got != "[JSON]" {
-		t.Fatalf("inputs wire type = %q, want [JSON]", got)
+	if got := types["create"]["inputs"]; got != "[CreateInput]" {
+		t.Fatalf("inputs wire type = %q, want [CreateInput]", got)
 	}
 }
 

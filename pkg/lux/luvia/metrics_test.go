@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -41,6 +40,20 @@ func TestMetricsCollectorRecordTraceSampling(t *testing.T) {
 	if len(mc.traces) != 2 {
 		t.Fatalf("full sampling trace count = %d, want 2", len(mc.traces))
 	}
+	mc.traceSampleRate = 0
+	mc.RecordTrace(api.TraceRecord{TraceID: "head-sampled", StatusCode: http.StatusOK, HeadSampled: true})
+	if len(mc.traces) != 3 {
+		t.Fatalf("head-sampled trace count = %d, want 3", len(mc.traces))
+	}
+}
+
+func TestMetricsCollectorShouldTraceUsesConfiguredRate(t *testing.T) {
+	if (&MetricsCollector{traceSampleRate: 0}).ShouldTrace("trace") {
+		t.Fatal("zero sampling rate sampled a trace")
+	}
+	if !(&MetricsCollector{traceSampleRate: 1}).ShouldTrace("trace") {
+		t.Fatal("full sampling rate skipped a trace")
+	}
 }
 
 func TestMetricsCollectorFlushTraces(t *testing.T) {
@@ -64,7 +77,7 @@ func TestMetricsCollectorFlushTraces(t *testing.T) {
 	mc.RecordTrace(api.TraceRecord{
 		TraceID: "trace-1", APIName: "getUser", Duration: 2500 * time.Microsecond,
 		StatusCode: http.StatusOK, ClientName: "typescript", ClientVersion: "1.2.3",
-		Timestamp: time.Unix(100, 0).UTC(),
+		Timestamp: time.Unix(100, 0).UTC(), Spans: `[{"name":"service.call"}]`, Selection: "id,project{id,name}",
 	})
 	mc.flushTraces()
 
@@ -79,6 +92,12 @@ func TestMetricsCollectorFlushTraces(t *testing.T) {
 	if trace["duration"] != 2.5 || trace["status"] != "OK" || trace["clientName"] != "typescript" {
 		t.Fatalf("trace payload = %+v", trace)
 	}
+	if trace["spans"] != `[{"name":"service.call"}]` {
+		t.Fatalf("trace spans = %#v", trace["spans"])
+	}
+	if trace["selection"] != "id,project{id,name}" {
+		t.Fatalf("trace selection = %#v", trace["selection"])
+	}
 }
 
 func TestGatewayInstanceIDUsesEnvironment(t *testing.T) {
@@ -90,7 +109,7 @@ func TestGatewayInstanceIDUsesEnvironment(t *testing.T) {
 
 func TestMetricsCollectorRecord(t *testing.T) {
 	mc := &MetricsCollector{
-		buckets: make(map[string]*metricBucket),
+		buckets: make(map[metricBucketKey]*metricBucket),
 		done:    make(chan struct{}),
 	}
 
@@ -124,7 +143,7 @@ func TestMetricsCollectorRecord(t *testing.T) {
 
 func TestMetricsCollectorRecordMultipleAPIs(t *testing.T) {
 	mc := &MetricsCollector{
-		buckets: make(map[string]*metricBucket),
+		buckets: make(map[metricBucketKey]*metricBucket),
 		done:    make(chan struct{}),
 	}
 
@@ -137,6 +156,28 @@ func TestMetricsCollectorRecordMultipleAPIs(t *testing.T) {
 	if len(mc.buckets) != 2 {
 		t.Fatalf("expected 2 buckets, got %d", len(mc.buckets))
 	}
+}
+
+func BenchmarkMetricsCollectorRecord(b *testing.B) {
+	mc := &MetricsCollector{buckets: make(map[metricBucketKey]*metricBucket)}
+	mc.Record("getUser", time.Millisecond, false)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		mc.Record("getUser", time.Millisecond, false)
+	}
+}
+
+func BenchmarkMetricsCollectorRecordParallel(b *testing.B) {
+	mc := &MetricsCollector{buckets: make(map[metricBucketKey]*metricBucket)}
+	mc.Record("getUser", time.Millisecond, false)
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			mc.Record("getUser", time.Millisecond, false)
+		}
+	})
 }
 
 func TestPercentile(t *testing.T) {
@@ -176,9 +217,16 @@ func TestPercentileSorted(t *testing.T) {
 	}
 }
 
+func TestPercentileUsesNearestRankForSmallSamples(t *testing.T) {
+	data := []float64{1, 2, 3, 4, 100}
+	if got := percentile(data, 0.95); got != 100 {
+		t.Fatalf("p95 = %f, want 100 for a five-sample bucket", got)
+	}
+}
+
 func TestMetricsLatenciesCapped(t *testing.T) {
 	mc := &MetricsCollector{
-		buckets: make(map[string]*metricBucket),
+		buckets: make(map[metricBucketKey]*metricBucket),
 		done:    make(chan struct{}),
 	}
 	// Record more than maxLatencySamples
@@ -199,7 +247,7 @@ func TestMetricsLatenciesCapped(t *testing.T) {
 
 func TestMetricsDoubleClose(t *testing.T) {
 	mc := &MetricsCollector{
-		buckets: make(map[string]*metricBucket),
+		buckets: make(map[metricBucketKey]*metricBucket),
 		done:    make(chan struct{}),
 	}
 	mc.Close()
@@ -272,7 +320,7 @@ func TestMetricsCollectorCloseFlush(t *testing.T) {
 	mc := &MetricsCollector{
 		studioURL: srv.URL,
 		apiKey:    "test",
-		buckets:   make(map[string]*metricBucket),
+		buckets:   make(map[metricBucketKey]*metricBucket),
 		done:      make(chan struct{}),
 		client:    &http.Client{Timeout: 5 * time.Second},
 	}
@@ -305,7 +353,7 @@ func TestMetricsFlushNonSuccessReenqueues(t *testing.T) {
 	mc := &MetricsCollector{
 		studioURL: srv.URL,
 		apiKey:    "invalid",
-		buckets:   make(map[string]*metricBucket),
+		buckets:   make(map[metricBucketKey]*metricBucket),
 		done:      make(chan struct{}),
 		client:    &http.Client{Timeout: time.Second},
 	}
@@ -320,15 +368,15 @@ func TestMetricsFlushNonSuccessReenqueues(t *testing.T) {
 }
 
 func TestMetricsReenqueueMergesConcurrentBucket(t *testing.T) {
-	mc := &MetricsCollector{buckets: make(map[string]*metricBucket)}
+	mc := &MetricsCollector{buckets: make(map[metricBucketKey]*metricBucket)}
 	timestamp := time.Now().Truncate(5 * time.Minute)
-	key := "getUser:" + strconv.FormatInt(timestamp.Unix(), 10)
+	key := metricBucketKey{apiName: "getUser", bucketUnix: timestamp.Unix()}
 	mc.buckets[key] = &metricBucket{
 		apiName: "getUser", timestamp: timestamp, totalCount: 2, errCount: 1,
 		totalMs: 20, latencies: []float64{5, 15},
 	}
 
-	mc.reenqueue(map[string]*metricBucket{key: {
+	mc.reenqueue(map[metricBucketKey]*metricBucket{key: {
 		apiName: "getUser", timestamp: timestamp, totalCount: 3, errCount: 2,
 		totalMs: 60, latencies: []float64{10, 20, 30},
 	}})
@@ -341,7 +389,7 @@ func TestMetricsReenqueueMergesConcurrentBucket(t *testing.T) {
 
 func TestMetricsFlushEmptyBuckets(t *testing.T) {
 	mc := &MetricsCollector{
-		buckets: make(map[string]*metricBucket),
+		buckets: make(map[metricBucketKey]*metricBucket),
 		done:    make(chan struct{}),
 	}
 	// flush with empty buckets should not panic
@@ -352,7 +400,7 @@ func TestMetricsFlushHTTPError(t *testing.T) {
 	mc := &MetricsCollector{
 		studioURL: "http://127.0.0.1:1", // unreachable
 		apiKey:    "test",
-		buckets:   make(map[string]*metricBucket),
+		buckets:   make(map[metricBucketKey]*metricBucket),
 		done:      make(chan struct{}),
 		client:    &http.Client{Timeout: 1 * time.Second},
 	}
@@ -366,7 +414,7 @@ func TestMetricsFlushHTTPErrorReenqueue(t *testing.T) {
 	mc := &MetricsCollector{
 		studioURL: "http://127.0.0.1:1", // unreachable
 		apiKey:    "test",
-		buckets:   make(map[string]*metricBucket),
+		buckets:   make(map[metricBucketKey]*metricBucket),
 		done:      make(chan struct{}),
 		client:    &http.Client{Timeout: 100 * time.Millisecond},
 	}
@@ -386,7 +434,7 @@ func TestMetricsFlushInvalidURL(t *testing.T) {
 	mc := &MetricsCollector{
 		studioURL: "://invalid", // invalid URL scheme
 		apiKey:    "test",
-		buckets:   make(map[string]*metricBucket),
+		buckets:   make(map[metricBucketKey]*metricBucket),
 		done:      make(chan struct{}),
 		client:    &http.Client{Timeout: 1 * time.Second},
 	}
@@ -412,7 +460,7 @@ func TestMetricsFlushLoopTickerBranch(t *testing.T) {
 	mc := &MetricsCollector{
 		studioURL: srv.URL,
 		apiKey:    "test",
-		buckets:   make(map[string]*metricBucket),
+		buckets:   make(map[metricBucketKey]*metricBucket),
 		done:      make(chan struct{}),
 		client:    &http.Client{Timeout: 5 * time.Second},
 	}
@@ -515,11 +563,11 @@ func TestMetricsCollectorReenqueueTraceLimits(t *testing.T) {
 
 func TestMetricsCollectorReenqueueFullLatencyBucket(t *testing.T) {
 	timestamp := time.Now().Truncate(5 * time.Minute)
-	key := "getUser:" + strconv.FormatInt(timestamp.Unix(), 10)
-	mc := &MetricsCollector{buckets: map[string]*metricBucket{
+	key := metricBucketKey{apiName: "getUser", bucketUnix: timestamp.Unix()}
+	mc := &MetricsCollector{buckets: map[metricBucketKey]*metricBucket{
 		key: {latencies: make([]float64, maxLatencySamples)},
 	}}
-	mc.reenqueue(map[string]*metricBucket{
+	mc.reenqueue(map[metricBucketKey]*metricBucket{
 		key: {totalCount: 1, latencies: []float64{10}},
 	})
 	if len(mc.buckets[key].latencies) != maxLatencySamples || mc.buckets[key].totalCount != 1 {

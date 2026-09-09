@@ -1,6 +1,7 @@
 package luvia
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -8,7 +9,15 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/light-speak/luxo/pkg/lux"
 )
+
+type dependencyStatsProviderFunc func(context.Context) []lux.RuntimeDependencyStats
+
+func (provider dependencyStatsProviderFunc) RuntimeDependencies(ctx context.Context) []lux.RuntimeDependencyStats {
+	return provider(ctx)
+}
 
 func TestNewGatewayRegistrarNilWhenNoEnv(t *testing.T) {
 	os.Unsetenv("LUXO_STUDIO_URL")
@@ -57,6 +66,7 @@ func TestGatewayRegistrarRegisterBody(t *testing.T) {
 	os.Setenv("LUXO_STUDIO_URL", srv.URL)
 	os.Setenv("LUXO_API_KEY", "test-key-123")
 	os.Setenv("LUXO_PROJECT_ID", "7")
+	os.Unsetenv("INTROSPECTION_KEY")
 	defer os.Unsetenv("LUXO_STUDIO_URL")
 	defer os.Unsetenv("LUXO_API_KEY")
 	defer os.Unsetenv("LUXO_PROJECT_ID")
@@ -84,6 +94,9 @@ func TestGatewayRegistrarRegisterBody(t *testing.T) {
 	regBody := received[0]
 	if regBody["$api"] != "svc:registerGateway" {
 		t.Errorf("$api = %v, want svc:registerGateway", regBody["$api"])
+	}
+	if regBody["$select"] != "id" {
+		t.Errorf("$select = %v, want id", regBody["$select"])
 	}
 	if regBody["instanceId"] == nil {
 		t.Error("instanceId should be set")
@@ -144,6 +157,9 @@ func TestGatewayRegistrarHeartbeatBody(t *testing.T) {
 	if hb["instanceId"] != "test-instance" {
 		t.Errorf("instanceId = %v, want test-instance", hb["instanceId"])
 	}
+	if hb["projectId"] != float64(1) {
+		t.Errorf("projectId = %v, want 1", hb["projectId"])
+	}
 	if _, ok := hb["memoryMB"]; !ok {
 		t.Error("memoryMB should be present")
 	}
@@ -161,6 +177,70 @@ func TestGatewayRegistrarHeartbeatBody(t *testing.T) {
 	}
 	if authHeader != "Bearer test-key" {
 		t.Errorf("Authorization header = %q, want Bearer test-key", authHeader)
+	}
+}
+
+func TestGatewayRegistrarHeartbeatReregistersExpiredLease(t *testing.T) {
+	var mu sync.Mutex
+	var apiNames []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		apiName, _ := body["$api"].(string)
+		mu.Lock()
+		apiNames = append(apiNames, apiName)
+		mu.Unlock()
+		if apiName == "svc:heartbeat" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	gr := &GatewayRegistrar{
+		studioURL: srv.URL, apiKey: "test", projectID: 7, instanceID: "gateway-1",
+		endpoint: "http://gateway-1:8080", done: make(chan struct{}), client: srv.Client(),
+	}
+	gr.heartbeat()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(apiNames) != 2 || apiNames[0] != "svc:heartbeat" || apiNames[1] != "svc:registerGateway" {
+		t.Fatalf("API sequence = %v, want heartbeat then registration", apiNames)
+	}
+}
+
+func TestGatewayRegistrarDeregisterPayloads(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		nodeType string
+		apiName  string
+	}{
+		{name: "gateway", apiName: "svc:deregisterGateway"},
+		{name: "service", nodeType: "service", apiName: "svc:deregisterServiceNode"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var received map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+					t.Fatal(err)
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+
+			gr := &GatewayRegistrar{
+				studioURL: srv.URL, apiKey: "key", projectID: 9, instanceID: "node-1",
+				nodeType: test.nodeType, done: make(chan struct{}), client: srv.Client(),
+			}
+			gr.deregister()
+			if received["$api"] != test.apiName || received["projectId"] != float64(9) || received["instanceId"] != "node-1" {
+				t.Fatalf("deregister payload = %+v", received)
+			}
+		})
 	}
 }
 
@@ -323,6 +403,36 @@ func TestGatewayRegistrarHeartbeatLoopDone(t *testing.T) {
 	gr.heartbeatLoop()
 }
 
+func TestGatewayRegistrarHeartbeatLoopTicks(t *testing.T) {
+	requestReceived := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requestReceived <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	gr := &GatewayRegistrar{
+		studioURL: srv.URL, apiKey: "test", instanceID: "gateway-1",
+		done: make(chan struct{}), client: srv.Client(), startedAt: time.Now(),
+	}
+	loopDone := make(chan struct{})
+	go func() {
+		gr.heartbeatLoopEvery(time.Millisecond)
+		close(loopDone)
+	}()
+	select {
+	case <-requestReceived:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat loop did not tick")
+	}
+	close(gr.done)
+	select {
+	case <-loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat loop did not stop")
+	}
+}
+
 func TestGatewayRegistrarRegisterIntroKey(t *testing.T) {
 	var mu sync.Mutex
 	var received []map[string]any
@@ -365,6 +475,14 @@ func TestGatewayRegistrarRegisterIntroKey(t *testing.T) {
 	}
 }
 
+func TestGatewayRegistrarDeregisterInvalidURL(t *testing.T) {
+	gr := &GatewayRegistrar{
+		studioURL: "://invalid", apiKey: "test", instanceID: "gateway-1",
+		client: &http.Client{},
+	}
+	gr.deregister()
+}
+
 func TestGatewayRegistrarRegisterNoIntroKey(t *testing.T) {
 	var mu sync.Mutex
 	var received []map[string]any
@@ -401,10 +519,10 @@ func TestGatewayRegistrarRegisterNoIntroKey(t *testing.T) {
 	if len(received) == 0 {
 		t.Fatal("register should be called on startup")
 	}
-	// introKey must be omitted entirely (not sent as ""), so the Studio side
-	// keeps its stored key instead of clearing it.
-	if _, ok := received[0]["introKey"]; ok {
-		t.Errorf("introKey should be omitted when INTROSPECTION_KEY is unset, got %v", received[0]["introKey"])
+	// Nullable and omitted are distinct in Luxo. Explicit null tells Studio to
+	// preserve the stored key while satisfying the required nullable parameter.
+	if introKey, present := received[0]["introKey"]; !present || introKey != nil {
+		t.Errorf("introKey = %v, present=%v, want explicit null", introKey, present)
 	}
 }
 
@@ -452,6 +570,7 @@ func TestServiceNodeRegistrarPayloads(t *testing.T) {
 	t.Setenv("LUXO_SERVICE_NAME", "billing")
 	t.Setenv("LUXO_INSTANCE_ID", "billing-1")
 	t.Setenv("LUXO_GATEWAY_ENDPOINT", "http://billing-1:4000")
+	t.Setenv("INTROSPECTION_KEY", "gateway-only-key")
 
 	registrar := newGatewayRegistrar("4000", "v2")
 	if registrar == nil {
@@ -469,7 +588,58 @@ func TestServiceNodeRegistrarPayloads(t *testing.T) {
 	if received[0]["$api"] != "svc:registerServiceNode" || received[0]["name"] != "billing" || received[0]["addr"] == nil {
 		t.Fatalf("registration payload = %+v", received[0])
 	}
+	if received[0]["$select"] != "id" {
+		t.Fatalf("registration $select = %v, want id", received[0]["$select"])
+	}
+	if _, ok := received[0]["introKey"]; ok {
+		t.Fatalf("service registration must not send gateway-only introKey: %+v", received[0])
+	}
 	if received[len(received)-1]["$api"] != "svc:heartbeatServiceNode" {
 		t.Fatalf("heartbeat payload = %+v", received[len(received)-1])
+	}
+}
+
+func TestGatewayRegistrarHeartbeatIncludesRuntimeDependencies(t *testing.T) {
+	var mu sync.Mutex
+	var received []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		mu.Lock()
+		received = append(received, body)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	t.Setenv("LUXO_STUDIO_URL", server.URL)
+	t.Setenv("LUXO_API_KEY", "key")
+
+	provider := dependencyStatsProviderFunc(func(context.Context) []lux.RuntimeDependencyStats {
+		latency := 1.25
+		return []lux.RuntimeDependencyStats{{
+			Key: "database:postgresql", Kind: lux.DependencyDatabase, Provider: "postgresql",
+			Target: "db.internal:5432", Name: "taskflow", Status: lux.DependencyOnline,
+			LatencyMs: &latency, PoolMax: 20, PoolTotal: 4, PoolInUse: 1, PoolIdle: 3,
+		}}
+	})
+	registrar := newGatewayRegistrarWithDependencyStats("8080", "v1", provider)
+	if registrar == nil {
+		t.Fatal("registrar is nil")
+	}
+	defer registrar.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	last := received[len(received)-1]
+	dependencies, ok := last["dependencies"].([]any)
+	if !ok || len(dependencies) != 1 {
+		t.Fatalf("dependencies = %#v", last["dependencies"])
+	}
+	database, ok := dependencies[0].(map[string]any)
+	if !ok || database["target"] != "db.internal:5432" || database["poolInUse"] != float64(1) {
+		t.Fatalf("database dependency = %#v", dependencies[0])
 	}
 }

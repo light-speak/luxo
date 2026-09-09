@@ -288,7 +288,7 @@ func TestWriteAPIRegistrationSchema(t *testing.T) {
 	}
 	retType := &ast.TypeRef{Name: "User"}
 
-	generator.writeAPIRegistrationSchema(&b, "createUser", "user", params, retType, false, 0, false, nil, nil)
+	generator.writeAPIRegistrationSchema(&b, "createUser", "user", params, retType, false, 0, false, nil, nil, "")
 	src := b.String()
 
 	checks := []string{
@@ -317,7 +317,7 @@ func TestWriteAPIRegistrationSchemaListParam(t *testing.T) {
 
 	var b strings.Builder
 	params := []*ast.ParamDecl{{Name: "tags", Type: &ast.TypeRef{Name: "String", IsList: true}}}
-	generator.writeAPIRegistrationSchema(&b, "search", "search", params, nil, false, 0, false, nil, nil)
+	generator.writeAPIRegistrationSchema(&b, "search", "search", params, nil, false, 0, false, nil, nil, "")
 	if src := b.String(); !strings.Contains(src, `Name: "tags", Type: schema.FieldString, TypeName: "String", IsList: true`) {
 		t.Fatalf("list parameter metadata missing:\n%s", src)
 	}
@@ -356,7 +356,7 @@ func TestBuildSchemaJSON_PreservesOptionalParams(t *testing.T) {
 	}
 }
 
-func TestBuildSchemaJSONUsesJSONWireTypeForStructuredParams(t *testing.T) {
+func TestBuildSchemaJSONUsesModelWireTypeForStructuredParams(t *testing.T) {
 	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
 		APIs:      map[string]int{"createProject": 10},
 		APIParams: map[string]map[string]int{"createProject": {"input": 1}},
@@ -377,13 +377,13 @@ func TestBuildSchemaJSONUsesJSONWireTypeForStructuredParams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), `"name":"input","type":"JSON","typeName":"CreateProjectInput"`) {
+	if !strings.Contains(string(data), `"name":"input","type":"Model","typeName":"CreateProjectInput"`) {
 		t.Fatalf("structured param metadata = %s", data)
 	}
 }
 
-func TestLuxoParamToSchemaTypeUsesJSONForStructuredValues(t *testing.T) {
-	if got := luxoParamToSchemaType("Payload", nil); got != "FieldJSON" {
+func TestLuxoParamToSchemaTypeUsesModelForStructuredValues(t *testing.T) {
+	if got := luxoParamToSchemaType("Payload", nil); got != "FieldModel" {
 		t.Fatalf("structured parameter type = %q", got)
 	}
 	if got := luxoParamToSchemaType("Int", nil); got != "FieldInt" {
@@ -428,11 +428,12 @@ func TestBuildSchemaJSONIncludesCompleteCRUDParams(t *testing.T) {
 		Name: "origin/project.luxo",
 		Models: []*ast.ModelDecl{{
 			Name:       "Project",
+			Doc:        "A managed project.",
 			Directives: []*ast.Directive{{Name: "crud"}},
 			Fields: []*ast.FieldDecl{
-				{Name: "id", Type: &ast.TypeRef{Name: "UUID"}, Directives: []*ast.Directive{{Name: "auto"}}},
-				{Name: "name", Type: &ast.TypeRef{Name: "String"}},
-				{Name: "description", Type: &ast.TypeRef{Name: "String", Nullable: true}},
+				{Name: "id", Doc: "Project identifier.", Type: &ast.TypeRef{Name: "UUID"}, Directives: []*ast.Directive{{Name: "auto"}}},
+				{Name: "name", Doc: "Project name.", Type: &ast.TypeRef{Name: "String"}},
+				{Name: "description", Doc: "Project description.", Type: &ast.TypeRef{Name: "String", Nullable: true}},
 			},
 		}},
 	}}}
@@ -462,6 +463,16 @@ func TestBuildSchemaJSONIncludesCompleteCRUDParams(t *testing.T) {
 	}
 	if len(deleteMany.Params) != 1 || !deleteMany.Params[0].IsList || deleteMany.ReturnType != "Int" {
 		t.Fatalf("deleteMany = %+v", deleteMany)
+	}
+	for name, api := range got.APIs {
+		if api.Description == "" {
+			t.Errorf("generated API %s has no description", name)
+		}
+		for _, param := range api.Params {
+			if param.Description == "" {
+				t.Errorf("generated API parameter %s.%s has no description", name, param.Name)
+			}
+		}
 	}
 }
 
@@ -672,6 +683,73 @@ func TestBuildSchemaJSONMarksDeclaredPrimaryKey(t *testing.T) {
 	}
 }
 
+func TestBuildSchemaJSONPreservesDocumentationAndRelationMetadata(t *testing.T) {
+	generator := mustNewGenerator(t, GeneratorConfig{
+		IDs: StableIDs{
+			ModelFields: map[string]map[string]int{
+				"Task":    {"id": 1, "projectId": 2, "project": 3},
+				"Project": {"id": 1, "name": 2},
+			},
+			APIs:      map[string]int{"getTask": 10},
+			APIParams: map[string]map[string]int{"getTask": {"id": 1}},
+		},
+		Events: &EventContext{ModelModule: map[string]string{"Task": "task", "Project": "project"}},
+	})
+	result := &semantic.Result{Files: []*ast.File{
+		{
+			Name: "origin/task/model.luxo",
+			Models: []*ast.ModelDecl{{
+				Name: "Task", Doc: "A unit of work.",
+				Fields: []*ast.FieldDecl{
+					{Name: "id", Doc: "Task identifier.", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}}},
+					{Name: "projectId", Doc: "Owning project key.", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "project", Doc: "Owning project.", Type: &ast.TypeRef{Name: "Project"}},
+				},
+			}},
+			APIs: []*ast.ApiDecl{{
+				Name: "getTask", Doc: "Fetch one task.",
+				Params:     []*ast.ParamDecl{{Name: "id", Doc: "Task identifier.", Type: &ast.TypeRef{Name: "Int"}}},
+				ReturnType: &ast.TypeRef{Name: "Task"}, Directives: []*ast.Directive{{Name: "auth"}},
+			}},
+		},
+		{
+			Name: "origin/project/model.luxo",
+			Models: []*ast.ModelDecl{{Name: "Project", Fields: []*ast.FieldDecl{
+				{Name: "id", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}}},
+				{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+			}}},
+		},
+	}}
+
+	data, err := generator.BuildSchemaJSON(result, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got schema.Schema
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	task := got.Models["Task"]
+	if task.Description != "A unit of work." {
+		t.Fatalf("model description = %q", task.Description)
+	}
+	fields := make(map[string]*schema.Field, len(task.Fields))
+	for index := range task.Fields {
+		fields[task.Fields[index].Name] = &task.Fields[index]
+	}
+	if id := fields["id"]; id.Description != "Task identifier." || !id.PrimaryKey || len(id.Directives) != 1 || id.Directives[0] != "id" {
+		t.Fatalf("id metadata = %#v", id)
+	}
+	relation := fields["project"]
+	if relation.Description != "Owning project." || relation.RelationKind != schema.RelationBelongsTo || relation.LocalKey != "projectId" || relation.RemoteKey != "id" || relation.TargetModule != "project" {
+		t.Fatalf("relation metadata = %#v", relation)
+	}
+	api := got.APIs["getTask"]
+	if api.Description != "Fetch one task." || len(api.Directives) != 1 || api.Directives[0] != "auth" || api.Params[0].Description != "Task identifier." {
+		t.Fatalf("API metadata = %#v", api)
+	}
+}
+
 func TestBuildSchemaJSONMergesExtensionAndKeepsProjectionLocal(t *testing.T) {
 	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
 		"User": {"id": 1, "name": 2, "posts": 10},
@@ -680,7 +758,7 @@ func TestBuildSchemaJSONMergesExtensionAndKeepsProjectionLocal(t *testing.T) {
 
 	user := &ast.ModelDecl{Name: "User", Fields: []*ast.FieldDecl{
 		{Name: "id", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}}},
-		{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+		{Name: "name", Doc: "Public user name.", Type: &ast.TypeRef{Name: "String"}},
 	}}
 	post := &ast.ModelDecl{Name: "Post", Fields: []*ast.FieldDecl{
 		{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
@@ -712,13 +790,16 @@ func TestBuildSchemaJSONMergesExtensionAndKeepsProjectionLocal(t *testing.T) {
 	if len(fields) != 3 || fields["name"].Module != "" || fields["posts"].Module != "post" {
 		t.Fatalf("merged User fields = %#v", fields)
 	}
+	if fields["name"].Description != "Public user name." {
+		t.Fatalf("extension replaced authoritative field metadata: %#v", fields["name"])
+	}
 }
 
 func TestWriteAPIRegistrationSchema_Paginated(t *testing.T) {
 	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIs: map[string]int{"listUser": 30}}})
 
 	var b strings.Builder
-	generator.writeAPIRegistrationSchema(&b, "listUser", "user", nil, &ast.TypeRef{Name: "User", IsList: true}, true, 20, false, nil, nil)
+	generator.writeAPIRegistrationSchema(&b, "listUser", "user", nil, &ast.TypeRef{Name: "User", IsList: true}, true, 20, false, nil, nil, "")
 	src := b.String()
 
 	if !strings.Contains(src, "Paginated: true") {
@@ -881,7 +962,7 @@ func TestWriteTypeRegistration(t *testing.T) {
 	}}})
 
 	td := &ast.TypeDecl{
-		Name: "AuthPayload",
+		Name: "AuthPayload", Doc: "Authentication result.",
 		Fields: []*ast.FieldDecl{
 			{Name: "token", Type: &ast.TypeRef{Name: "String"}},
 			{Name: "user", Type: &ast.TypeRef{Name: "User", IsList: false}},
@@ -896,6 +977,7 @@ func TestWriteTypeRegistration(t *testing.T) {
 	checks := []string{
 		"RegisterType",
 		`Name: "AuthPayload"`,
+		`Description: "Authentication result."`,
 		`Name: "token"`,
 		"schema.FieldString",
 		`Name: "user"`,
@@ -1138,6 +1220,44 @@ func TestWriteModelRegistration_ExtendRelation(t *testing.T) {
 	}
 	if !strings.Contains(code, `IsList: true`) {
 		t.Errorf("missing IsList: true:\n%s", code)
+	}
+}
+
+func TestWriteModelRegistrationPreservesScalarTypeNameAndListShape(t *testing.T) {
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
+		"Task": {"status": 1, "tags": 2},
+	}}})
+	model := &ast.ModelDecl{Name: "Task", Fields: []*ast.FieldDecl{
+		{Name: "status", Type: &ast.TypeRef{Name: "TaskStatus"}},
+		{Name: "tags", Type: &ast.TypeRef{Name: "String", IsList: true}},
+	}}
+
+	var output strings.Builder
+	generator.writeModelRegistration(&output, model, "task", map[string]bool{"TaskStatus": true}, nil)
+	code := output.String()
+	for _, expected := range []string{
+		`Name: "status", Type: schema.FieldEnum, TypeName: "TaskStatus"`,
+		`Name: "tags", Type: schema.FieldString, TypeName: "String", Nullable: false, IsList: true`,
+	} {
+		if !strings.Contains(code, expected) {
+			t.Errorf("generated runtime schema missing %q:\n%s", expected, code)
+		}
+	}
+}
+
+func TestWriteModelRegistrationPreservesNullableRelation(t *testing.T) {
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
+		"Task": {"assignee": 1},
+	}}})
+	model := &ast.ModelDecl{Name: "Task", Fields: []*ast.FieldDecl{
+		{Name: "assignee", Type: &ast.TypeRef{Name: "User", Nullable: true}},
+	}}
+
+	var output strings.Builder
+	generator.writeModelRegistration(&output, model, "task", nil, nil)
+	code := output.String()
+	if !strings.Contains(code, `Name: "assignee", Type: schema.FieldModel, TypeName: "User", Nullable: true`) {
+		t.Fatalf("generated runtime schema lost nullable relation metadata:\n%s", code)
 	}
 }
 

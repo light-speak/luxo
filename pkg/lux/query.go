@@ -6,6 +6,26 @@ import (
 	"strings"
 )
 
+// AggregateFunction is a database-independent scalar aggregate operation.
+// Backend packages translate it into their native query language.
+type AggregateFunction string
+
+const (
+	AggregateCount AggregateFunction = "COUNT"
+	AggregateSum   AggregateFunction = "SUM"
+	AggregateAvg   AggregateFunction = "AVG"
+	AggregateMin   AggregateFunction = "MIN"
+	AggregateMax   AggregateFunction = "MAX"
+)
+
+// AggregateSpec describes one scalar result in a fused aggregate query.
+// Conditions are additional to the common conditions already held by Query.
+type AggregateSpec struct {
+	Function   AggregateFunction
+	Column     string
+	Conditions []Condition
+}
+
 // --- SQL builder functions (shared by PG, MySQL, SQLite) ---
 
 // BuildSelectSQL builds a SELECT query string with args.

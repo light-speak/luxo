@@ -207,7 +207,7 @@ func TestWSJSON_Success(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	// Send JSON request
-	req := `{"$id":1,"$api":"getUser","id":42}`
+	req := `{"$id":1,"$api":"getUser","$select":"id,name","id":42}`
 	if err := conn.Write(ctx, websocket.MessageText, []byte(req)); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -387,7 +387,9 @@ func TestWSBinary_Success(t *testing.T) {
 	reqBuf := []byte{BinaryFrameCallRequest}
 	reqBuf = codec.AppendVarint(reqBuf, 1)  // seq
 	reqBuf = codec.AppendVarint(reqBuf, 10) // API ID
-	reqBuf = codec.AppendVarint(reqBuf, 0)  // mask len
+	mask := codec.AppendSelectionMask(nil, []byte{0x06}, nil)
+	reqBuf = codec.AppendVarint(reqBuf, uint64(len(mask)))
+	reqBuf = append(reqBuf, mask...)
 	// Param: field 1 = int 42
 	var enc codec.Encoder
 	enc.WriteFieldInt(1, 42)
@@ -430,6 +432,35 @@ func TestWSBinary_Success(t *testing.T) {
 	}
 }
 
+func TestWSBinaryRejectsStructuredCallWithoutFieldMask(t *testing.T) {
+	rt := testWSRouter()
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	request := []byte{BinaryFrameCallRequest}
+	request = codec.AppendVarint(request, 2)
+	request = codec.AppendVarint(request, 10)
+	request = codec.AppendVarint(request, 0)
+	request = append(request, 0)
+	if err := conn.Write(ctx, websocket.MessageBinary, request); err != nil {
+		t.Fatal(err)
+	}
+	_, response, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response) == 0 || response[0] != BinaryFrameCallError {
+		t.Fatalf("response = %v", response)
+	}
+}
+
 func TestWSBinary_SequenceBoundaryDoesNotCollideWithFrameTypes(t *testing.T) {
 	rt := testWSRouter()
 	srv := httptest.NewServer(rt)
@@ -447,7 +478,9 @@ func TestWSBinary_SequenceBoundaryDoesNotCollideWithFrameTypes(t *testing.T) {
 		req := []byte{BinaryFrameCallRequest}
 		req = codec.AppendVarint(req, seq)
 		req = codec.AppendVarint(req, 10)
-		req = codec.AppendVarint(req, 0)
+		mask := codec.AppendSelectionMask(nil, []byte{0x06}, nil)
+		req = codec.AppendVarint(req, uint64(len(mask)))
+		req = append(req, mask...)
 		req = codec.AppendVarint(req, 1)
 		req = codec.AppendSvarint(req, int64(seq))
 		req = append(req, 0)
@@ -878,7 +911,7 @@ func TestWSUpgradeViaHTTP(t *testing.T) {
 	rt := testWSRouter()
 
 	// Regular HTTP POST should still work (not upgrade)
-	r := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(`{"$api":"getUser","id":1}`))
+	r := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(`{"$api":"getUser","$select":"id,name","id":1}`))
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	rt.ServeHTTP(w, r)
@@ -1185,6 +1218,41 @@ func TestWSBinary_SubscribeWithFieldMask(t *testing.T) {
 
 	if rt.Streams.SubCount("watchMask") != 1 {
 		t.Errorf("sub count = %d, want 1", rt.Streams.SubCount("watchMask"))
+	}
+}
+
+func TestWSBinaryRejectsStructuredSubscriptionWithoutFieldMask(t *testing.T) {
+	rt := testWSRouter()
+	rt.Schema.RegisterAPI(&schema.API{ID: 67, Name: "watchUser", ReturnType: "User", Stream: true})
+	rt.Registry.Register("watchUser", 67)
+	rt.Registry.RegisterParams("watchUser", nil)
+
+	srv := httptest.NewServer(rt)
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	request := []byte{BinaryFrameSubscribe}
+	request = codec.AppendVarint(request, 67)
+	request = codec.AppendVarint(request, 0)
+	request = append(request, 0)
+	if err := conn.Write(ctx, websocket.MessageBinary, request); err != nil {
+		t.Fatal(err)
+	}
+	messageType, response, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if messageType != websocket.MessageBinary || len(response) == 0 || response[0] != BinaryFrameSubscribeError {
+		t.Fatalf("response = %v, type = %v", response, messageType)
+	}
+	if rt.Streams.SubCount("watchUser") != 0 {
+		t.Fatal("structured stream without a field mask must not be subscribed")
 	}
 }
 

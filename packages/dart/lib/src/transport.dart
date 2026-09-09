@@ -39,8 +39,11 @@ class LuxoFilter {
   final String field;
   final String op;
   final Object value;
-  const LuxoFilter(
-      {required this.field, required this.op, required this.value});
+  const LuxoFilter({
+    required this.field,
+    required this.op,
+    required this.value,
+  });
   Map<String, Object> toJson() => {'field': field, 'op': op, 'value': value};
 }
 
@@ -68,7 +71,16 @@ class APISchemaEntry {
 class SelectionFieldSchema {
   final int fieldID;
   final String? typeName;
-  const SelectionFieldSchema(this.fieldID, [this.typeName]);
+  final String? type;
+  final bool isList;
+  final bool nullable;
+  const SelectionFieldSchema(
+    this.fieldID, [
+    this.typeName,
+    this.type,
+    this.isList = false,
+    this.nullable = false,
+  ]);
 }
 
 class ParamSchema {
@@ -77,13 +89,20 @@ class ParamSchema {
   final String type;
   final bool isList;
   final bool nullable;
+  final String? typeName;
   const ParamSchema(
     this.fieldID,
     this.name,
     this.type, [
     this.isList = false,
     this.nullable = false,
+    this.typeName,
   ]);
+}
+
+/// Generated input values implement direct Luxo binary encoding.
+abstract interface class LuxoBinaryEncodable {
+  void writeLuxo(LuxoEncoder encoder);
 }
 
 /// Transport options.
@@ -145,6 +164,10 @@ void encodeParam(LuxoEncoder enc, ParamSchema pm, dynamic v) {
         for (final value in list) {
           enc.writeBytes(Uint8List.fromList(utf8.encode(jsonEncode(value))));
         }
+      case 'Model':
+        for (final value in list) {
+          _writeStructuredParam(enc, pm, value);
+        }
       default:
         throw LuxoError(
           'ConfigError',
@@ -171,6 +194,8 @@ void encodeParam(LuxoEncoder enc, ParamSchema pm, dynamic v) {
       enc.writeBytes(v as Uint8List);
     case 'JSON':
       enc.writeBytes(Uint8List.fromList(utf8.encode(jsonEncode(v))));
+    case 'Model':
+      _writeStructuredParam(enc, pm, v);
     default:
       throw LuxoError(
         'ConfigError',
@@ -178,6 +203,17 @@ void encodeParam(LuxoEncoder enc, ParamSchema pm, dynamic v) {
         'unsupported binary param type: ${pm.type}',
       );
   }
+}
+
+void _writeStructuredParam(LuxoEncoder enc, ParamSchema param, dynamic value) {
+  if (value is! LuxoBinaryEncodable) {
+    throw LuxoError(
+      'ConfigError',
+      0,
+      '${param.typeName ?? 'structured parameter'} must implement LuxoBinaryEncodable',
+    );
+  }
+  enc.writeDelimited(value.writeLuxo);
 }
 
 class _SelectedField {
@@ -244,11 +280,8 @@ class _SelectionParser {
     while (offset < input.length && input.codeUnitAt(offset) <= 32) offset++;
   }
 
-  Never _fail(String message) => throw LuxoError(
-        'ConfigError',
-        0,
-        '$message at position $offset',
-      );
+  Never _fail(String message) =>
+      throw LuxoError('ConfigError', 0, '$message at position $offset');
 }
 
 bool _identifierStart(int code) =>
@@ -268,7 +301,10 @@ Uint8List _encodeSelectionNode(
     final meta = fields[field.name];
     if (meta == null) {
       throw LuxoError(
-          'ConfigError', 0, 'unknown selected field: ${field.name}');
+        'ConfigError',
+        0,
+        'unknown selected field: ${field.name}',
+      );
     }
     mask = fieldMaskSet(mask, meta.fieldID);
     if (field.children == null) continue;
@@ -303,9 +339,16 @@ void _writeFieldMask(
   Map<String, dynamic>? params,
 ) {
   final select = params?[r'$select'];
-  if (select is! String || select.trim().isEmpty || meta.fields.isEmpty) {
+  if (meta.fields.isEmpty) {
     enc.writeVarint(0);
     return;
+  }
+  if (select is! String || select.trim().isEmpty) {
+    throw LuxoError(
+      'ConfigError',
+      0,
+      r'$select is required for structured responses',
+    );
   }
   final mask = _encodeSelectionNode(
     _SelectionParser(select).parse(),
@@ -325,7 +368,10 @@ void _writeListControls(LuxoEncoder enc, Map<String, dynamic>? params) {
 void _writeFilters(LuxoEncoder enc, dynamic value) {
   if (value is! List || value.length > 1000) {
     throw LuxoError(
-        'ConfigError', 0, r'$filters must contain at most 1000 entries');
+      'ConfigError',
+      0,
+      r'$filters must contain at most 1000 entries',
+    );
   }
   enc.writeVarint(_binaryFiltersFieldID);
   enc.writeVarint(value.length);
@@ -349,7 +395,10 @@ void _writeFilters(LuxoEncoder enc, dynamic value) {
 void _writeSorters(LuxoEncoder enc, dynamic value) {
   if (value is! List || value.length > 100) {
     throw LuxoError(
-        'ConfigError', 0, r'$sorters must contain at most 100 entries');
+      'ConfigError',
+      0,
+      r'$sorters must contain at most 100 entries',
+    );
   }
   enc.writeVarint(_binarySortersFieldID);
   enc.writeVarint(value.length);
@@ -431,10 +480,10 @@ LuxoError decodeBinaryError(Uint8List data, int statusCode) {
 }
 
 LuxoError _binaryParseError(int statusCode, String message) => LuxoError(
-      'ParseError',
-      statusCode,
-      'invalid binary error response: $message',
-    );
+  'ParseError',
+  statusCode,
+  'invalid binary error response: $message',
+);
 
 /// Transport interface — implemented by HTTP and WebSocket.
 abstract class Transport {
@@ -473,9 +522,9 @@ class HttpTransport implements Transport {
     http.Client? client,
     this.timeout = const Duration(seconds: 30),
     this.onTokenExpired,
-  })  : _client = client ?? http.Client(),
-        _mode = options?.mode ?? TransportMode.json,
-        _schema = {} {
+  }) : _client = client ?? http.Client(),
+       _mode = options?.mode ?? TransportMode.json,
+       _schema = {} {
     if (options?.headers != null) _headers.addAll(options!.headers!);
     if (options?.token != null)
       _headers['Authorization'] = 'Bearer ${options!.token}';
@@ -664,9 +713,9 @@ class WsTransport implements Transport {
     TransportOptions? options,
     bool autoReconnect = true,
     this.timeout = const Duration(seconds: 30),
-  })  : _mode = options?.mode ?? TransportMode.json,
-        _token = options?.token,
-        _autoReconnect = autoReconnect;
+  }) : _mode = options?.mode ?? TransportMode.json,
+       _token = options?.token,
+       _autoReconnect = autoReconnect;
 
   @override
   void setSchema(Map<String, APISchemaEntry> schema) => _schema = schema;
@@ -683,9 +732,11 @@ class WsTransport implements Transport {
     final uri = Uri.parse(endpoint);
     final url = _token == null
         ? endpoint
-        : uri.replace(
-            queryParameters: {...uri.queryParameters, 'token': _token!},
-          ).toString();
+        : uri
+              .replace(
+                queryParameters: {...uri.queryParameters, 'token': _token!},
+              )
+              .toString();
 
     try {
       final ws = await connectSocket(url);
@@ -892,7 +943,8 @@ class WsTransport implements Transport {
       return;
     }
     if (frameType != BinaryFrameType.callSuccess &&
-        frameType != BinaryFrameType.callError) return;
+        frameType != BinaryFrameType.callError)
+      return;
     final c = _pending.remove(id);
     if (c == null) return;
     if (frameType == BinaryFrameType.callError) {

@@ -581,7 +581,14 @@ func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
 		if isCRUD && isQueryModifierArg(arg.Name) {
 			continue
 		}
-		argTypes[i] = a.checkExpr(arg.Value, callScope)
+		argScope := callScope
+		if isCRUD && arg.Name != "" && arg.Name != "where" {
+			// Named CRUD values come from the caller. Resolving them in the
+			// injected model scope makes a same-named nullable field overwrite
+			// the actual parameter type (create(detail: detail)).
+			argScope = scope
+		}
+		argTypes[i] = a.checkExpr(arg.Value, argScope)
 		// Named args in CRUD create: also mark variable usage in outer scope
 		// (callScope may shadow variables with model fields)
 		if isCRUD && arg.Name != "" {
@@ -1294,6 +1301,7 @@ func (a *Analyzer) checkElvisExpr(e *ast.ElvisExpr, scope *Scope) *ResolvedType 
 
 func (a *Analyzer) checkWhenExpr(e *ast.WhenExpr, scope *Scope) *ResolvedType {
 	var subjectType *ResolvedType
+	var resultType *ResolvedType
 	if e.Subject != nil {
 		subjectType = a.checkExpr(e.Subject, scope)
 	}
@@ -1315,15 +1323,47 @@ func (a *Analyzer) checkWhenExpr(e *ast.WhenExpr, scope *Scope) *ResolvedType {
 			if b.IsType != "" && subjectType != nil && subjectType.Kind == TypeSealed {
 				branchScope = a.injectSealedVariantFields(scope, subjectType, b.IsType, e.Subject)
 			}
-			a.checkExpr(b.Body, branchScope)
+			bodyType := a.checkExpr(b.Body, branchScope)
+			resultType = a.mergeWhenBranchType(resultType, bodyType, b.Body.GetPos())
 		}
 	}
 	if e.Else != nil {
-		a.checkExpr(e.Else, scope)
+		elseType := a.checkExpr(e.Else, scope)
+		resultType = a.mergeWhenBranchType(resultType, elseType, e.Else.GetPos())
 	}
 	// sealed exhaustiveness check
 	a.checkWhenExhaustive(e, subjectType)
-	return nil
+	return resultType
+}
+
+func (a *Analyzer) mergeWhenBranchType(current, next *ResolvedType, pos token.Position) *ResolvedType {
+	if next == nil {
+		return current
+	}
+	if current == nil {
+		return cloneResolvedType(next)
+	}
+	if isNullType(current) {
+		return next.AsNullable()
+	}
+	if isNullType(next) {
+		return current.AsNullable()
+	}
+	left := cloneResolvedType(current)
+	right := cloneResolvedType(next)
+	left.Nullable = false
+	right.Nullable = false
+	if !sameResolvedType(left, right) {
+		a.addError(pos, "when branches must return compatible types, got '%s' and '%s' / when 分支必须返回兼容类型，得到 '%s' 和 '%s'",
+			formatResolvedType(current), formatResolvedType(next), formatResolvedType(current), formatResolvedType(next))
+		return current
+	}
+	left.Nullable = current.Nullable || next.Nullable
+	return left
+}
+
+func isNullType(typ *ResolvedType) bool {
+	return typ != nil && typ.Kind == TypeUnknown && typ.Name == "null"
 }
 
 // checkWhenExhaustive verifies when exhaustiveness for sealed/enum types and else requirement.

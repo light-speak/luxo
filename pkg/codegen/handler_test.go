@@ -123,16 +123,59 @@ func TestGenerateSQLColumnSelectorUsesDeclaredDatabaseFields(t *testing.T) {
 		`cols = ensureSelectedColumn(cols, "sku")`,
 		`case "displayName":`,
 		`cols = ensureSelectedColumn(cols, "display_name")`,
+		`case "reviews":`,
 		`if !hasPrimaryKey { cols = append(cols, "sku") }`,
 	} {
 		if !strings.Contains(code, want) {
 			t.Fatalf("model SQL selector missing %q:\n%s", want, code)
 		}
 	}
-	for _, excluded := range []string{`case "secret":`, `case "reviewCount":`, `case "reviews":`, `"id"`} {
+	for _, excluded := range []string{`case "secret":`, `case "reviewCount":`, `"id"`} {
 		if strings.Contains(code, excluded) {
 			t.Fatalf("model SQL selector contains non-database field %q:\n%s", excluded, code)
 		}
+	}
+}
+
+func TestGenerateSQLColumnSelectorIncludesSelectedRelationLocalKey(t *testing.T) {
+	model := &ast.ModelDecl{
+		Name: "TimeEntry",
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}}},
+			{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "user", Type: &ast.TypeRef{Name: "User"}},
+		},
+	}
+
+	var b strings.Builder
+	generateSQLColumnSelector(&b, model, nil)
+	code := b.String()
+	for _, want := range []string{
+		`case "user":`,
+		`cols = ensureSelectedColumn(cols, "user_id")`,
+	} {
+		if !strings.Contains(code, want) {
+			t.Fatalf("selected relation dependency missing %q:\n%s", want, code)
+		}
+	}
+}
+
+func TestGenerateCRUDHandlersDoNotSelectUnrequestedRelationKeys(t *testing.T) {
+	model := &ast.ModelDecl{
+		Name:       "TimeEntry",
+		Directives: []*ast.Directive{{Name: "crud"}},
+		Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}}},
+			{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "user", Type: &ast.TypeRef{Name: "User"}},
+		},
+	}
+
+	var b strings.Builder
+	generateCRUDHandlers(&b, []*ast.ModelDecl{model}, nil, nil)
+	code := b.String()
+	if strings.Contains(code, `cols = ensureField(cols, "user_id")`) {
+		t.Fatalf("CRUD handlers must select relation keys only when their relations are requested:\n%s", code)
 	}
 }
 
@@ -181,11 +224,11 @@ func TestGenerateBatchLoadHandlersUsesCanonicalListAndSelection(t *testing.T) {
 	if !strings.Contains(code, `Name: "keys", Type: "Int", IsList: true`) {
 		t.Errorf("batch handler metadata must describe a list param:\n%s", code)
 	}
-	if !strings.Contains(code, `codec.FieldMaskHas(fieldMask, 2)`) || !strings.Contains(code, `fields = append(fields, "name")`) {
-		t.Errorf("batch handler must push the wire selection into SQL:\n%s", code)
+	if !strings.Contains(code, `fields := selectUserSQLColumns(req.Select)`) {
+		t.Errorf("batch handler must map the decoded recursive selection to SQL columns:\n%s", code)
 	}
-	if strings.Contains(code, `fields = append(fields, "posts")`) {
-		t.Errorf("batch handler must not select relation names as SQL columns:\n%s", code)
+	if strings.Contains(code, `fieldMask := codec.SelectionMaskFields(req.FieldMask)`) {
+		t.Errorf("batch handler must not flatten the recursive selection before resolving relation keys:\n%s", code)
 	}
 }
 
@@ -245,6 +288,7 @@ func TestGenerateRemoteNamedLoadHandlers(t *testing.T) {
 		"handleLoadUserByTenantIdAndEmail",
 		`ParamIntArray("tenantId")`,
 		`ParamStringArray("email")`,
+		`fields := selectUserSQLColumns(req.Select)`,
 		`fields = append(fields, "tenant_id")`,
 		`fields = append(fields, "email")`,
 		"groups[i] = lux.AllOf(",
@@ -340,8 +384,8 @@ func TestGenerateFederationResolversUsesCanonicalListAndSelection(t *testing.T) 
 	if !strings.Contains(code, `Name: "keys", Type: "Int", IsList: true`) {
 		t.Errorf("resolver metadata must describe one canonical list param:\n%s", code)
 	}
-	if !strings.Contains(code, `codec.FieldMaskHas(fieldMask, 3)`) || !strings.Contains(code, `fields = append(fields, "title")`) {
-		t.Errorf("resolver must push the field selection into SQL:\n%s", code)
+	if !strings.Contains(code, `fields := selectPostSQLColumns(req.Select)`) {
+		t.Errorf("resolver must map the decoded recursive selection to SQL columns:\n%s", code)
 	}
 	if !strings.Contains(code, `fields = append(fields, "user_id")`) {
 		t.Errorf("resolver must select its grouping key:\n%s", code)
@@ -679,9 +723,12 @@ func TestCrudOperationsNoCrud(t *testing.T) {
 }
 
 func TestExtractListArgNonList(t *testing.T) {
-	result := extractListArg(&ast.Ident{Name: "get"})
+	result := crudOperations(testModel("User", []*ast.Directive{crudDirective(&ast.NamedArg{
+		Name:  "only",
+		Value: &ast.Ident{Name: "get"},
+	})}, nil))
 	if result != nil {
-		t.Error("should return nil for non-list arg")
+		t.Error("should return nil for a non-list only argument")
 	}
 }
 
@@ -1049,7 +1096,7 @@ func TestGenerateHandlerNonNullableRelation(t *testing.T) {
 		t.Errorf("non-nullable FK should NOT dereference:\n%s", code)
 	}
 	// Should directly pass post.UserId
-	if !strings.Contains(code, "post.UserId, childCols") {
+	if !strings.Contains(code, "post.UserId, f.Children") {
 		t.Errorf("should directly pass FK value:\n%s", code)
 	}
 }
@@ -1175,7 +1222,8 @@ func TestNativeHandlersDecodeOptionalNullableJSON(t *testing.T) {
 		Params:     []*ast.ParamDecl{param},
 		Directives: []*ast.Directive{{Name: "native"}},
 	}, nil, nil)
-	if out := apiBuilder.String(); !strings.Contains(out, `req.ParamJSONOptionalNullable("payload", &payload)`) {
+	if out := apiBuilder.String(); !strings.Contains(out, `req.ParamJSONOptionalNullable("payload", &payload)`) ||
+		!strings.Contains(out, `req.ParamMessage("payload", true, true)`) {
 		t.Fatalf("native API nullable parameter decoding missing:\n%s", out)
 	}
 
@@ -1185,7 +1233,8 @@ func TestNativeHandlersDecodeOptionalNullableJSON(t *testing.T) {
 		Params:     []*ast.ParamDecl{param},
 		Directives: []*ast.Directive{{Name: "native"}, {Name: "service"}},
 	}, nil, nil)
-	if out := serviceBuilder.String(); !strings.Contains(out, `req.ParamJSONOptionalNullable("payload", &payload)`) {
+	if out := serviceBuilder.String(); !strings.Contains(out, `req.ParamJSONOptionalNullable("payload", &payload)`) ||
+		!strings.Contains(out, `req.ParamMessage("payload", true, true)`) {
 		t.Fatalf("native service nullable parameter decoding missing:\n%s", out)
 	}
 }
@@ -1267,8 +1316,17 @@ func TestGenerateFilterParserSkipsRelation(t *testing.T) {
 	src := generateHandlerFile(result, "app", nil)
 	code := string(src)
 
-	// "user" relation should not appear as a filter case
-	if strings.Contains(code, `case "user"`) {
+	start := strings.Index(code, "func parsePostFilters")
+	if start < 0 {
+		t.Fatalf("missing generated filter parser:\n%s", code)
+	}
+	end := strings.Index(code[start:], "func parsePostSorters")
+	if end < 0 {
+		t.Fatalf("missing generated filter parser:\n%s", code)
+	}
+	filterCode := code[start : start+end]
+	// "user" relation should not appear as a filter case.
+	if strings.Contains(filterCode, `case "user"`) {
 		t.Errorf("relation field should be skipped in filter parser:\n%s", code)
 	}
 }
@@ -1535,8 +1593,8 @@ func TestGenerateCRUDHandlerWithModelAuth(t *testing.T) {
 		t.Fatal("should generate handler file")
 	}
 	code := string(src)
-	if got := strings.Count(code, "luvia.Identity(ctx)"); got != len(crudOps) {
-		t.Errorf("@auth model should protect all %d CRUD handlers, got %d guards", len(crudOps), got)
+	if got := strings.Count(code, "luvia.Identity(ctx)"); got != 6 {
+		t.Errorf("@auth model should protect all 6 CRUD handlers, got %d guards", got)
 	}
 	if !strings.Contains(code, `"github.com/light-speak/luxo/pkg/lux/luvia"`) {
 		t.Error("should import luvia when a CRUD model uses @auth")
@@ -2060,6 +2118,14 @@ func TestWriteAPIRegistration(t *testing.T) {
 		t.Errorf("missing list metadata:\n%s", code)
 	}
 
+	generator.ids.APIParams["getUser"] = map[string]int{"input": 3}
+	generator.ids.APIParamTypes["getUser"] = map[string]string{"input": "CreateUserInput"}
+	b.Reset()
+	generator.writeAPIRegistration(&b, "getUser")
+	if code := b.String(); !strings.Contains(code, `Type: "Model", TypeName: "CreateUserInput", FieldID: 3`) {
+		t.Errorf("missing structured type metadata:\n%s", code)
+	}
+
 	generator.ids.APIParams["getUser"] = map[string]int{"id": 1, "removed": 9}
 	generator.ids.APIParamTypes["getUser"] = map[string]string{"id": "Int"}
 	b.Reset()
@@ -2351,25 +2417,6 @@ func TestDetectHandlerFeaturesWithAuth(t *testing.T) {
 	f := detectHandlerFeatures(&semantic.Result{}, models, nil, nil)
 	if !f.hasAuth {
 		t.Fatal("should detect withAuth")
-	}
-}
-
-// ─── writeFKEnsure: dedup and snake_case ────────────────────────────────────
-
-func TestWriteFKEnsureDedupe(t *testing.T) {
-	var b strings.Builder
-	rels := []Relation{
-		{LocalKey: "userId"},
-		{LocalKey: "userId"}, // duplicate
-		{LocalKey: "postId"},
-	}
-	writeFKEnsure(&b, rels)
-	out := b.String()
-	if strings.Count(out, "user_id") != 1 {
-		t.Fatalf("should dedupe user_id, got:\n%s", out)
-	}
-	if !strings.Contains(out, "post_id") {
-		t.Fatalf("should include post_id, got:\n%s", out)
 	}
 }
 
@@ -2777,6 +2824,31 @@ func TestGenerateHandlerDeleteMany_StringID(t *testing.T) {
 
 // ─── Validation directive tests ──────────────────────────────────────────────
 
+func TestGenerateHandlerDeleteMany_UUIDID(t *testing.T) {
+	result := &semantic.Result{
+		Files: []*ast.File{{
+			Models: []*ast.ModelDecl{
+				testModel("Account", []*ast.Directive{crudDirective(
+					&ast.NamedArg{Name: "only", Value: &ast.ListExpr{Items: []ast.Expr{
+						&ast.Ident{Name: "deleteMany"},
+					}}},
+				)}, []*ast.FieldDecl{
+					testField("id", "UUID", directive("id")),
+					testField("name", "String"),
+				}),
+			},
+		}},
+	}
+	code := string(generateHandlerFile(result, "luxo", nil))
+
+	if !strings.Contains(code, `req.ParamUUIDArray("ids")`) {
+		t.Error("deleteMany with UUID ID should use ParamUUIDArray")
+	}
+	if strings.Contains(code, "json.Unmarshal") {
+		t.Error("deleteMany with UUID ID should not use json.Unmarshal")
+	}
+}
+
 func TestGenerateStringValidation_NotBlank(t *testing.T) {
 	var b strings.Builder
 	f := &ast.FieldDecl{
@@ -3070,12 +3142,59 @@ func TestNestedRelationResolvesComputedFieldsInOneBatch(t *testing.T) {
 		"func resolvePostComputedFields(",
 		"case \"commentCount\": needComments = true",
 		"computedItems := make([]*Post, 0)",
-		"computedItems = append(computedItems, item.Posts...)",
+		"computedItems = append(computedItems, &item.Posts[i])",
 		"resolvePostComputedFields(ctx, app, computedItems, f.Children)",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("nested computed resolution missing %q:\n%s", want, out)
 		}
+	}
+}
+
+func TestNestedListRelationUsesValueSliceBatchResolver(t *testing.T) {
+	project := &ast.ModelDecl{Name: "Project", Directives: []*ast.Directive{{Name: "crud"}}, Fields: []*ast.FieldDecl{
+		{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+		{Name: "tasks", Type: &ast.TypeRef{Name: "Task", IsList: true}},
+	}}
+	task := &ast.ModelDecl{Name: "Task", Directives: []*ast.Directive{{Name: "crud"}}, Fields: []*ast.FieldDecl{
+		{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+		{Name: "projectId", Type: &ast.TypeRef{Name: "Int"}},
+		{Name: "comments", Type: &ast.TypeRef{Name: "Comment", IsList: true}},
+	}}
+	comment := &ast.ModelDecl{Name: "Comment", Fields: []*ast.FieldDecl{
+		{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+		{Name: "taskId", Type: &ast.TypeRef{Name: "Int"}},
+	}}
+	result := &semantic.Result{Files: []*ast.File{{Models: []*ast.ModelDecl{project, task, comment}}}}
+	code := string(generateHandlerFile(result, "example", nil))
+	for _, want := range []string{
+		"func resolveTaskValueListRelations(ctx context.Context, app *App, items []Task",
+		"traceCtx := api.WithTraceFieldPath(ctx, f.Name)",
+		"resolveTaskValueListRelations(traceCtx, app, project.Tasks, f.Children, d-1)",
+	} {
+		if !strings.Contains(code, want) {
+			t.Fatalf("nested list relation resolver missing %q:\n%s", want, code)
+		}
+	}
+}
+
+func TestHandlerImportsFollowGeneratedBodyForDurationNamedFields(t *testing.T) {
+	task := &ast.ModelDecl{Name: "Task", Fields: []*ast.FieldDecl{
+		{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+		{Name: "minutes", Type: &ast.TypeRef{Name: "Int"}},
+	}}
+	apiDecl := &ast.ApiDecl{
+		Name:       "totalMinutes",
+		ReturnType: &ast.TypeRef{Name: "Int"},
+		Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.MemberExpr{
+			Object: &ast.Ident{Name: "task"},
+			Field:  "minutes",
+		}}}},
+	}
+	result := &semantic.Result{Files: []*ast.File{{Models: []*ast.ModelDecl{task}, APIs: []*ast.ApiDecl{apiDecl}}}}
+	code := string(generateHandlerFile(result, "example", nil))
+	if strings.Contains(code, `"time"`) {
+		t.Fatalf("ordinary field named minutes must not force a time import:\n%s", code)
 	}
 }
 

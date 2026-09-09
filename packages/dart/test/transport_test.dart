@@ -9,6 +9,19 @@ import 'package:luxo_client/src/transport.dart';
 import 'package:luxo_client/src/codec.dart';
 import 'package:luxo_client/src/error.dart';
 
+class _TestInput implements LuxoBinaryEncodable {
+  final String value;
+  const _TestInput(this.value);
+
+  @override
+  void writeLuxo(LuxoEncoder encoder) {
+    encoder.writeVarint(utf8.encode(value).length);
+    encoder.writeVarint(1);
+    encoder.writeString(value);
+    encoder.writeEnd();
+  }
+}
+
 void main() {
   group('HttpTransport', () {
     group('timeout', () {
@@ -321,6 +334,30 @@ void main() {
         transport.close();
       });
 
+      test('requires selection for structured responses only', () async {
+        final mockClient = http_testing.MockClient((request) async {
+          return http.Response.bytes([], 200);
+        });
+        final transport = HttpTransport(
+          'http://localhost:8080',
+          client: mockClient,
+          options: const TransportOptions(mode: TransportMode.binary),
+        );
+        transport.setSchema({
+          'user.get': APISchemaEntry(1, const [], const {
+            'id': SelectionFieldSchema(1),
+          }),
+          'health': const APISchemaEntry(2),
+        });
+
+        await expectLater(
+          transport.call<dynamic>('user.get'),
+          throwsA(isA<LuxoError>().having((error) => error.message, 'message', contains(r'$select is required'))),
+        );
+        await transport.call<dynamic>('health');
+        transport.close();
+      });
+
       test('encodes nested selections recursively', () async {
         late Uint8List captured;
         final mockClient = http_testing.MockClient((request) async {
@@ -333,19 +370,26 @@ void main() {
           options: const TransportOptions(mode: TransportMode.binary),
         );
         transport.setSchema({
-          'user.get': APISchemaEntry(1, const [], const {
-            'id': SelectionFieldSchema(1),
-            'posts': SelectionFieldSchema(3, 'Post'),
-          }, const {
-            'Post': {
+          'user.get': APISchemaEntry(
+            1,
+            const [],
+            const {
               'id': SelectionFieldSchema(1),
-              'title': SelectionFieldSchema(2),
+              'posts': SelectionFieldSchema(3, 'Post'),
             },
-          }),
+            const {
+              'Post': {
+                'id': SelectionFieldSchema(1),
+                'title': SelectionFieldSchema(2),
+              },
+            },
+          ),
         });
 
-        await transport
-            .call('user.get', params: {r'$select': 'id,posts{title}'});
+        await transport.call(
+          'user.get',
+          params: {r'$select': 'id,posts{title}'},
+        );
         expect(captured, equals([1, 6, 1, 5, 3, 2, 1, 2, 0]));
         transport.close();
       });
@@ -363,48 +407,52 @@ void main() {
         );
         transport.setSchema({'user.list': const APISchemaEntry(5)});
 
-        await transport.call('user.list', params: const {
-          r'$filters': [LuxoFilter(field: 'age', op: 'gte', value: 18)],
-          r'$sorters': [LuxoSorter(field: 'createdAt', order: 'desc')],
-        });
+        await transport.call(
+          'user.list',
+          params: const {
+            r'$filters': [LuxoFilter(field: 'age', op: 'gte', value: 18)],
+            r'$sorters': [LuxoSorter(field: 'createdAt', order: 'desc')],
+          },
+        );
         expect(
-            captured,
-            equals([
-              5,
-              0,
-              0xfe,
-              0xff,
-              0xff,
-              0xff,
-              0x07,
-              1,
-              3,
-              97,
-              103,
-              101,
-              4,
-              2,
-              49,
-              56,
-              0xff,
-              0xff,
-              0xff,
-              0xff,
-              0x07,
-              1,
-              9,
-              99,
-              114,
-              101,
-              97,
-              116,
-              101,
-              100,
-              65,
-              116,
-              1,
-              0,
-            ]));
+          captured,
+          equals([
+            5,
+            0,
+            0xfe,
+            0xff,
+            0xff,
+            0xff,
+            0x07,
+            1,
+            3,
+            97,
+            103,
+            101,
+            4,
+            2,
+            49,
+            56,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0x07,
+            1,
+            9,
+            99,
+            114,
+            101,
+            97,
+            116,
+            101,
+            100,
+            65,
+            116,
+            1,
+            0,
+          ]),
+        );
         transport.close();
       });
 
@@ -589,11 +637,34 @@ void main() {
         expect(dec.readUuidArray(), equals([a]));
       });
 
+      test('structured params use native length-delimited Luxo messages', () {
+        final enc = LuxoEncoder();
+        encodeParam(
+          enc,
+          const ParamSchema(2, 'input', 'Model', false, false, 'Input'),
+          const _TestInput('x'),
+        );
+        enc.writeEnd();
+        expect(enc.bytes(), equals([2, 5, 1, 1, 1, 120, 0, 0]));
+
+        final list = LuxoEncoder();
+        encodeParam(
+          list,
+          const ParamSchema(2, 'inputs', 'Model', true, false, 'Input'),
+          const [_TestInput('x'), _TestInput('y')],
+        );
+        list.writeEnd();
+        expect(
+          list.bytes(),
+          equals([2, 2, 5, 1, 1, 1, 120, 0, 5, 1, 1, 1, 121, 0, 0]),
+        );
+      });
+
       test('unknown param types and non-string DateTime are rejected', () {
         expect(
           () => encodeParam(
             LuxoEncoder(),
-            const ParamSchema(1, 'input', 'Model'),
+            const ParamSchema(1, 'input', 'Unsupported'),
             {},
           ),
           throwsA(isA<LuxoError>()),
@@ -632,10 +703,11 @@ void main() {
       );
       try {
         final unsubscribe = await transport.subscribe(
-          'watchPayload',
-          {'projectId': 7},
-          (_) {},
-        );
+            'watchPayload',
+            {
+              'projectId': 7,
+            },
+            (_) {});
         unsubscribe();
         await unsubscribeReceived.future.timeout(const Duration(seconds: 1));
       } finally {
@@ -708,19 +780,23 @@ void main() {
       try {
         await expectLater(
           callTransport.call('health'),
-          throwsA(isA<LuxoError>().having(
-            (error) => error.error,
-            'error',
-            'TimeoutError',
-          )),
+          throwsA(
+            isA<LuxoError>().having(
+              (error) => error.error,
+              'error',
+              'TimeoutError',
+            ),
+          ),
         );
         await expectLater(
           subscriptionTransport.subscribe('watchPayload', const {}, (_) {}),
-          throwsA(isA<LuxoError>().having(
-            (error) => error.error,
-            'error',
-            'TimeoutError',
-          )),
+          throwsA(
+            isA<LuxoError>().having(
+              (error) => error.error,
+              'error',
+              'TimeoutError',
+            ),
+          ),
         );
       } finally {
         callTransport.close();
@@ -743,11 +819,7 @@ void main() {
           const ParamSchema(1, 'nickname', 'String', false, true),
           null,
         );
-        encodeParam(
-          enc,
-          const ParamSchema(2, 'age', 'Int', false, true),
-          42,
-        );
+        encodeParam(enc, const ParamSchema(2, 'age', 'Int', false, true), 42);
         enc.writeEnd();
         expect(enc.bytes(), [1, 0, 2, 1, 84, 0]);
       });

@@ -17,9 +17,7 @@ class LuxoEncoder {
   int _pos;
 
   /// Creates an encoder with optional initial capacity (default 1024).
-  LuxoEncoder([int capacity = 1024])
-      : _buf = Uint8List(capacity),
-        _pos = 0;
+  LuxoEncoder([int capacity = 1024]) : _buf = Uint8List(capacity), _pos = 0;
 
   void _ensureCapacity(int needed) {
     final required = _pos + needed;
@@ -82,6 +80,37 @@ class LuxoEncoder {
     _ensureCapacity(v.length);
     _buf.setRange(_pos, _pos + v.length, v);
     _pos += v.length;
+  }
+
+  /// Writes a length-delimited value directly into the current buffer.
+  void writeDelimited(void Function(LuxoEncoder encoder) writeValue) {
+    final prefixPosition = _pos;
+    _ensureCapacity(1);
+    _pos++;
+    final valuePosition = _pos;
+    try {
+      writeValue(this);
+    } catch (_) {
+      _pos = prefixPosition;
+      rethrow;
+    }
+    final valueLength = _pos - valuePosition;
+    final prefixLength = _varintLength(valueLength);
+    final shift = prefixLength - 1;
+    if (shift > 0) {
+      _ensureCapacity(shift);
+      _buf.setRange(valuePosition + shift, _pos + shift, _buf, valuePosition);
+      _pos += shift;
+    }
+    _writeVarintAt(prefixPosition, valueLength);
+  }
+
+  void _writeVarintAt(int position, int value) {
+    while (value >= 0x80) {
+      _buf[position++] = (value & 0x7f) | 0x80;
+      value ~/= 128;
+    }
+    _buf[position] = value;
   }
 
   /// Writes raw bytes without a length prefix.
@@ -223,6 +252,39 @@ class LuxoEncoder {
   }
 }
 
+int _varintLength(int value) {
+  var length = 1;
+  while (value >= 0x80) {
+    value ~/= 128;
+    length++;
+  }
+  return length;
+}
+
+/// Returns the UTF-8 byte length without allocating an encoded copy.
+int luxoUtf8Length(String value) {
+  var length = 0;
+  for (var i = 0; i < value.length; i++) {
+    final code = value.codeUnitAt(i);
+    if (code < 0x80) {
+      length++;
+    } else if (code < 0x800) {
+      length += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < value.length) {
+      final next = value.codeUnitAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        length += 4;
+        i++;
+      } else {
+        length += 3;
+      }
+    } else {
+      length += 3;
+    }
+  }
+  return length;
+}
+
 /// Luxo binary wire format decoder.
 ///
 /// Usage (generated code):
@@ -248,9 +310,9 @@ class LuxoDecoder {
 
   /// Creates a decoder from raw bytes. No copy is made.
   LuxoDecoder(Uint8List data)
-      : _data = ByteData.sublistView(data),
-        _bytes = data,
-        _off = 0;
+    : _data = ByteData.sublistView(data),
+      _bytes = data,
+      _off = 0;
 
   /// Skips the arena header (totalStringLen varint) that prefixes each model's binary data.
   void skipArenaHeader() {
@@ -565,11 +627,11 @@ class ColumnarDecoder {
 
   /// Creates a columnar decoder from raw bytes. Reads the row count varint.
   ColumnarDecoder(Uint8List data)
-      : _data = ByteData.sublistView(data),
-        _bytes = data,
-        _off = 0,
-        count = 0,
-        arenaSize = 0 {
+    : _data = ByteData.sublistView(data),
+      _bytes = data,
+      _off = 0,
+      count = 0,
+      arenaSize = 0 {
     final raw = _readVarint();
     count = raw < 0 ? 0 : raw;
     final arena = _readVarint();

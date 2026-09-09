@@ -394,8 +394,6 @@ func binaryParamType(ref *ast.TypeRef, enums map[string]bool) string {
 	typeName := ref.Name
 	if enums[typeName] {
 		typeName = "Enum"
-	} else if !isBinaryScalarParamType(typeName) {
-		typeName = "JSON"
 	}
 	if ref.IsList {
 		typeName = "[" + typeName + "]"

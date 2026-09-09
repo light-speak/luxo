@@ -2,6 +2,8 @@ package pg
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux"
@@ -83,6 +85,96 @@ func (q *Query[T]) First(ctx context.Context) (*T, error) {
 func (q *Query[T]) Count(ctx context.Context) (int64, error) {
 	query, args := lux.BuildCountSQL(q.table, q.conds)
 	return QueryScalar[int64](ctx, q.db, query, args...)
+}
+
+// AggregateBatch executes compatible scalar aggregates in one database
+// statement. Query conditions are shared; each spec may add its own filter.
+func (q *Query[T]) AggregateBatch(ctx context.Context, specs ...lux.AggregateSpec) ([]int64, error) {
+	query, args, err := buildAggregateBatchSQL(q.table, q.conds, specs)
+	if err != nil {
+		return nil, err
+	}
+	values := make([]int64, len(specs))
+	destinations := make([]any, len(values))
+	for index := range values {
+		destinations[index] = &values[index]
+	}
+	if err := q.db.conn.QueryRow(ctx, query, args...).Scan(destinations...); err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+
+func buildAggregateBatchSQL(table string, common []lux.Condition, specs []lux.AggregateSpec) (string, []any, error) {
+	if len(specs) == 0 {
+		return "", nil, fmt.Errorf("pg: aggregate batch requires at least one result")
+	}
+	commonSQL, args := aggregateConditionsSQL(common, 1)
+	var query strings.Builder
+	query.WriteString("SELECT ")
+	for index, spec := range specs {
+		if index > 0 {
+			query.WriteString(", ")
+		}
+		filterSQL, filterArgs := aggregateConditionsSQL(spec.Conditions, len(args)+1)
+		expression, err := postgresAggregateExpression(spec, filterSQL)
+		if err != nil {
+			return "", nil, err
+		}
+		query.WriteString(expression)
+		args = append(args, filterArgs...)
+	}
+	query.WriteString(" FROM ")
+	query.WriteString(table)
+	if commonSQL != "" {
+		query.WriteString(" WHERE ")
+		query.WriteString(commonSQL)
+	}
+	return query.String(), args, nil
+}
+
+func postgresAggregateExpression(spec lux.AggregateSpec, filter string) (string, error) {
+	var expression string
+	switch spec.Function {
+	case lux.AggregateCount:
+		if spec.Column != "" {
+			return "", fmt.Errorf("pg: COUNT aggregate must not specify a column")
+		}
+		expression = "COUNT(*)"
+	case lux.AggregateSum, lux.AggregateAvg, lux.AggregateMin, lux.AggregateMax:
+		if spec.Column == "" {
+			return "", fmt.Errorf("pg: %s aggregate requires a column", spec.Function)
+		}
+		expression = string(spec.Function) + "(" + spec.Column + ")"
+	default:
+		return "", fmt.Errorf("pg: unsupported aggregate function %q", spec.Function)
+	}
+	if filter != "" {
+		expression += " FILTER (WHERE " + filter + ")"
+	}
+	if spec.Function != lux.AggregateCount {
+		expression = "COALESCE(" + expression + ", 0)"
+	}
+	return expression, nil
+}
+
+func aggregateConditionsSQL(conditions []lux.Condition, argOffset int) (string, []any) {
+	var query strings.Builder
+	var args []any
+	written := 0
+	for _, condition := range conditions {
+		if condition == nil {
+			continue
+		}
+		fragment, values := condition.ToSQL(argOffset + len(args))
+		if written > 0 {
+			query.WriteString(" AND ")
+		}
+		query.WriteString(fragment)
+		args = append(args, values...)
+		written++
+	}
+	return query.String(), args
 }
 
 // Sum returns the SUM of the given column for matching records.

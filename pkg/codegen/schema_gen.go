@@ -23,6 +23,7 @@ type schemaAPIInfo struct {
 	defaultPageSize int
 	stream          bool
 	directives      []*ast.Directive
+	description     string
 }
 
 func generateSchemaFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
@@ -111,7 +112,7 @@ func (g *GeneratorContext) generateSchemaFile(result *semantic.Result, packageNa
 
 	// Register APIs
 	for _, api := range apis {
-		g.writeAPIRegistrationSchema(&b, api.name, api.moduleName, api.params, api.returnType, api.paginated, api.defaultPageSize, api.stream, enums, api.optionalParams, api.directives)
+		g.writeAPIRegistrationSchema(&b, api.name, api.moduleName, api.params, api.returnType, api.paginated, api.defaultPageSize, api.stream, enums, api.optionalParams, api.description, api.directives)
 	}
 
 	// Register type declarations (non-DB types like AuthPayload)
@@ -146,8 +147,12 @@ func (g *GeneratorContext) collectSchemaAPIs(result *semantic.Result, enums map[
 			if hasCrud(m) || g.events != nil && g.events.remotePKModels[m.Name] {
 				apis = append(apis, schemaAPIInfo{
 					name: "svc:batchLoad:" + m.Name, moduleName: modName,
-					params:     []*ast.ParamDecl{{Name: "keys", Type: &ast.TypeRef{Name: modelIDTypeName(m), IsList: true}}},
-					returnType: &ast.TypeRef{Name: m.Name, IsList: true},
+					params: []*ast.ParamDecl{{
+						Name: "keys", Type: &ast.TypeRef{Name: modelIDTypeName(m), IsList: true},
+						Doc: "Primary keys to resolve in one batch.",
+					}},
+					returnType:  &ast.TypeRef{Name: m.Name, IsList: true},
+					description: fmt.Sprintf("Batch-load %s records for cross-service field resolution.", m.Name),
 				})
 			}
 		}
@@ -157,14 +162,14 @@ func (g *GeneratorContext) collectSchemaAPIs(result *semantic.Result, enums map[
 				name: api.Name, moduleName: modName,
 				params: api.EffectiveParams(), returnType: api.ReturnType,
 				paginated: paginated, defaultPageSize: paginationDefaultPageSize(api, paginated),
-				stream: hasDirective(api.Directives, "stream"), directives: api.Directives,
+				stream: hasDirective(api.Directives, "stream"), directives: api.Directives, description: api.Doc,
 			})
 		}
 		for _, fn := range file.Functions {
 			if hasDirective(fn.Directives, "service") {
 				apis = append(apis, schemaAPIInfo{
 					name: "svc:" + fn.Name, moduleName: modName,
-					params: fn.Params, returnType: fn.ReturnType,
+					params: fn.Params, returnType: fn.ReturnType, description: fn.Doc,
 				})
 			}
 		}
@@ -179,8 +184,12 @@ func (g *GeneratorContext) collectSchemaAPIs(result *semantic.Result, enums map[
 				fk := g.inferFederationForeignKey(&ast.ModelDecl{Name: ext.Name}, f)
 				apis = append(apis, schemaAPIInfo{
 					name: "svc:resolve:" + f.Type.Name + ":" + fk, moduleName: modName,
-					params:     []*ast.ParamDecl{{Name: "keys", Type: &ast.TypeRef{Name: g.externalModelIDTypeName(ext.Name), IsList: true}}},
-					returnType: &ast.TypeRef{Name: f.Type.Name, IsList: true},
+					params: []*ast.ParamDecl{{
+						Name: "keys", Type: &ast.TypeRef{Name: g.externalModelIDTypeName(ext.Name), IsList: true},
+						Doc: "Foreign keys to resolve in one batch.",
+					}},
+					returnType:  &ast.TypeRef{Name: f.Type.Name, IsList: true},
+					description: fmt.Sprintf("Resolve %s.%s across services.", ext.Name, f.Name),
 				})
 			}
 		}
@@ -190,11 +199,12 @@ func (g *GeneratorContext) collectSchemaAPIs(result *semantic.Result, enums map[
 		for _, call := range g.events.remoteLoadCalls[moduleName] {
 			params := make([]*ast.ParamDecl, len(call.argNames))
 			for i, argName := range call.argNames {
-				params[i] = &ast.ParamDecl{Name: argName, Type: &ast.TypeRef{Name: call.argTypeNames[i], IsList: true}}
+				params[i] = &ast.ParamDecl{Name: argName, Type: &ast.TypeRef{Name: call.argTypeNames[i], IsList: true}, Doc: "Join keys to resolve in one batch."}
 			}
 			apis = append(apis, schemaAPIInfo{
 				name: loadServiceName(call), moduleName: moduleName,
 				params: params, returnType: &ast.TypeRef{Name: call.modelName, IsList: true},
+				description: fmt.Sprintf("Load %s records from the owning service.", call.modelName),
 			})
 		}
 	}
@@ -204,12 +214,12 @@ func (g *GeneratorContext) collectSchemaAPIs(result *semantic.Result, enums map[
 func buildCrudAPIInfo(model *ast.ModelDecl, op, modName string, enums map[string]bool) schemaAPIInfo {
 	modelName := model.Name
 	apiName := crudAPIName(modelName, op)
-	ai := schemaAPIInfo{name: apiName, moduleName: modName}
+	ai := schemaAPIInfo{name: apiName, moduleName: modName, description: crudAPIDescription(modelName, op)}
 	idType := &ast.TypeRef{Name: "Int"}
 	if field := primaryKeyField(model); field != nil {
 		idType = &ast.TypeRef{Name: field.Type.Name}
 	}
-	idParam := []*ast.ParamDecl{{Name: "id", Type: idType}}
+	idParam := []*ast.ParamDecl{{Name: "id", Type: idType, Doc: fmt.Sprintf("Primary key of the %s record.", modelName)}}
 	switch op {
 	case "get":
 		ai.returnType = &ast.TypeRef{Name: modelName}
@@ -219,8 +229,8 @@ func buildCrudAPIInfo(model *ast.ModelDecl, op, modName string, enums map[string
 		ai.paginated = true
 		ai.defaultPageSize = ast.DefaultPaginationPageSize
 		ai.params = []*ast.ParamDecl{
-			{Name: "page", Type: &ast.TypeRef{Name: "Int"}},
-			{Name: "pageSize", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "page", Type: &ast.TypeRef{Name: "Int"}, Doc: "One-based page number."},
+			{Name: "pageSize", Type: &ast.TypeRef{Name: "Int"}, Doc: "Maximum records returned per page."},
 		}
 		ai.optionalParams = map[string]bool{"page": true, "pageSize": true}
 	case "create":
@@ -236,9 +246,26 @@ func buildCrudAPIInfo(model *ast.ModelDecl, op, modName string, enums map[string
 		ai.params = idParam
 	case "deleteMany":
 		ai.returnType = &ast.TypeRef{Name: "Int"}
-		ai.params = []*ast.ParamDecl{{Name: "ids", Type: &ast.TypeRef{Name: idType.Name, IsList: true}}}
+		ai.params = []*ast.ParamDecl{{Name: "ids", Type: &ast.TypeRef{Name: idType.Name, IsList: true}, Doc: fmt.Sprintf("Primary keys of the %s records to delete.", modelName)}}
 	}
 	return ai
+}
+
+func crudAPIDescription(modelName, operation string) string {
+	switch operation {
+	case "get":
+		return fmt.Sprintf("Fetch one %s record by primary key.", modelName)
+	case "list":
+		return fmt.Sprintf("List %s records with pagination.", modelName)
+	case "create":
+		return fmt.Sprintf("Create one %s record.", modelName)
+	case "update":
+		return fmt.Sprintf("Update one %s record by primary key.", modelName)
+	case "delete":
+		return fmt.Sprintf("Delete one %s record by primary key.", modelName)
+	default:
+		return fmt.Sprintf("Delete multiple %s records by primary key.", modelName)
+	}
 }
 
 func crudOptionalParams(params []*ast.ParamDecl, update bool) map[string]bool {
@@ -258,7 +285,7 @@ func crudParamDecls(model *ast.ModelDecl, enums map[string]bool, update bool) []
 			(update && (field.Name == primaryKeyFieldName(model) || hasDirective(field.Directives, "immutable"))) {
 			continue
 		}
-		params = append(params, &ast.ParamDecl{Name: field.Name, Type: field.Type, Default: field.Default})
+		params = append(params, &ast.ParamDecl{Name: field.Name, Type: field.Type, Default: field.Default, Doc: field.Doc})
 	}
 	return params
 }
@@ -272,7 +299,10 @@ func (g *GeneratorContext) writeModelRegistration(b *strings.Builder, m *ast.Mod
 	if moduleName != "" {
 		fmt.Fprintf(b, "\t\tModule: %q,\n", moduleName)
 	}
+	writeSchemaDescription(b, "\t\t", m.Doc)
+	writeSchemaDirectives(b, "\t\t", m.Directives)
 	fmt.Fprintf(b, "\t\tFields: []schema.Field{\n")
+	relations := relationMap(g.analyzeRelations(m, enums))
 
 	for _, f := range m.Fields {
 		if f.Type == nil {
@@ -287,13 +317,15 @@ func (g *GeneratorContext) writeModelRegistration(b *strings.Builder, m *ast.Mod
 			continue
 		}
 
-		relation := isRelationField(f, enums)
+		relation, isRelation := relations[f.Name]
 
 		// Scalar fields: write type info for Binary↔JSON
-		if !relation {
+		if !isRelation {
 			fieldType := luxoTypeToSchemaType(f.Type.Name, enums)
-			fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, Nullable: %v, Computed: %v, PrimaryKey: %v},\n",
-				fieldID, f.Name, fieldType, f.Type.Nullable, f.Computed != nil, f.Name == primaryKeyFieldName(m))
+			fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, TypeName: %q, Nullable: %v, IsList: %v, Computed: %v, PrimaryKey: %v",
+				fieldID, f.Name, fieldType, f.Type.Name, f.Type.Nullable, f.Type.IsList, f.Computed != nil, f.Name == primaryKeyFieldName(m))
+			writeInlineFieldMetadata(b, f)
+			b.WriteString("},\n")
 			continue
 		}
 
@@ -304,8 +336,10 @@ func (g *GeneratorContext) writeModelRegistration(b *strings.Builder, m *ast.Mod
 		if module != "" {
 			fk = g.inferForeignKey(m, f, enums)
 		}
-		fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, TypeName: %q, IsList: %v, Relation: true, Module: %q, ForeignKey: %q},\n",
-			fieldID, f.Name, fieldType, f.Type.Name, f.Type.IsList, module, fk)
+		fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, TypeName: %q, Nullable: %v, IsList: %v, Relation: true, Module: %q, ForeignKey: %q, RelationKind: schema.%s, LocalKey: %q, RemoteKey: %q, TargetModule: %q",
+			fieldID, f.Name, fieldType, f.Type.Name, f.Type.Nullable, f.Type.IsList, module, fk, schemaRelationKindName(relation.Type), relation.LocalKey, relation.RemoteKey, g.remoteModelModule(relation.TargetName))
+		writeInlineFieldMetadata(b, f)
+		b.WriteString("},\n")
 	}
 
 	fmt.Fprintf(b, "\t\t},\n")
@@ -317,6 +351,7 @@ func (g *GeneratorContext) writeTypeRegistration(b *strings.Builder, t *ast.Type
 	fmt.Fprintf(b, "\ts.RegisterType(&schema.TypeDecl{\n")
 	fmt.Fprintf(b, "\t\tName: %q,\n", t.Name)
 	fmt.Fprintf(b, "\t\tModule: %q,\n", moduleName)
+	writeSchemaDescription(b, "\t\t", t.Doc)
 	fmt.Fprintf(b, "\t\tFields: []schema.Field{\n")
 
 	for _, f := range t.Fields {
@@ -335,8 +370,10 @@ func (g *GeneratorContext) writeTypeRegistration(b *strings.Builder, t *ast.Type
 			// blob as a scalar string array.
 			fieldType = "FieldModel"
 		}
-		fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, TypeName: %q, Nullable: %v, IsList: %v, Relation: %v},\n",
+		fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, TypeName: %q, Nullable: %v, IsList: %v, Relation: %v",
 			fieldID, f.Name, fieldType, f.Type.Name, f.Type.Nullable, f.Type.IsList, relation)
+		writeInlineFieldMetadata(b, f)
+		b.WriteString("},\n")
 	}
 
 	fmt.Fprintf(b, "\t\t},\n")
@@ -344,7 +381,7 @@ func (g *GeneratorContext) writeTypeRegistration(b *strings.Builder, t *ast.Type
 }
 
 func writeEnumRegistration(b *strings.Builder, enumDecl *ast.EnumDecl, moduleName string) {
-	fmt.Fprintf(b, "\ts.RegisterEnum(&schema.Enum{Name: %q, Module: %q, Values: []string{", enumDecl.Name, moduleName)
+	fmt.Fprintf(b, "\ts.RegisterEnum(&schema.Enum{Name: %q, Module: %q, Description: %q, Values: []string{", enumDecl.Name, moduleName, enumDecl.Doc)
 	for index, value := range enumDecl.Values {
 		if index > 0 {
 			b.WriteString(", ")
@@ -354,11 +391,93 @@ func writeEnumRegistration(b *strings.Builder, enumDecl *ast.EnumDecl, moduleNam
 	b.WriteString("}})\n")
 }
 
+func relationMap(relations []Relation) map[string]Relation {
+	result := make(map[string]Relation, len(relations))
+	for _, relation := range relations {
+		result[relation.FieldName] = relation
+	}
+	return result
+}
+
+func schemaRelationKindName(kind RelationType) string {
+	switch kind {
+	case BelongsTo:
+		return "RelationBelongsTo"
+	case HasMany:
+		return "RelationHasMany"
+	default:
+		return "RelationHasOne"
+	}
+}
+
+func schemaRelationKind(kind RelationType) schema.RelationKind {
+	switch kind {
+	case BelongsTo:
+		return schema.RelationBelongsTo
+	case HasMany:
+		return schema.RelationHasMany
+	default:
+		return schema.RelationHasOne
+	}
+}
+
+func schemaDirectiveNames(directives []*ast.Directive) []string {
+	if len(directives) == 0 {
+		return nil
+	}
+	names := make([]string, len(directives))
+	for index, directive := range directives {
+		names[index] = directive.Name
+	}
+	return names
+}
+
+func writeSchemaDescription(b *strings.Builder, indent, description string) {
+	if description != "" {
+		fmt.Fprintf(b, "%sDescription: %q,\n", indent, description)
+	}
+}
+
+func writeSchemaDirectives(b *strings.Builder, indent string, directives []*ast.Directive) {
+	if len(directives) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "%sDirectives: []string{", indent)
+	for index, directive := range directives {
+		if index > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(b, "%q", directive.Name)
+	}
+	b.WriteString("},\n")
+}
+
+func writeInlineFieldMetadata(b *strings.Builder, field *ast.FieldDecl) {
+	if field.Doc != "" {
+		fmt.Fprintf(b, ", Description: %q", field.Doc)
+	}
+	if len(field.Directives) == 0 {
+		return
+	}
+	b.WriteString(", Directives: []string{")
+	for index, directive := range field.Directives {
+		if index > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(b, "%q", directive.Name)
+	}
+	b.WriteString("}")
+}
+
 // writeAPIRegistrationSchema generates schema.RegisterAPI for one API.
-func (g *GeneratorContext) writeAPIRegistrationSchema(b *strings.Builder, name, moduleName string, params []*ast.ParamDecl, returnType *ast.TypeRef, paginated bool, defaultPageSize int, stream bool, enums map[string]bool, optionalParams map[string]bool, directives ...[]*ast.Directive) {
+func (g *GeneratorContext) writeAPIRegistrationSchema(b *strings.Builder, name, moduleName string, params []*ast.ParamDecl, returnType *ast.TypeRef, paginated bool, defaultPageSize int, stream bool, enums map[string]bool, optionalParams map[string]bool, description string, directives ...[]*ast.Directive) {
 	apiID := g.apiID(name)
 	fmt.Fprintf(b, "\ts.RegisterAPI(&schema.API{\n")
 	fmt.Fprintf(b, "\t\tID: %d, Name: %q, Module: %q,\n", apiID, name, moduleName)
+	writeSchemaDescription(b, "\t\t", description)
+	if len(directives) > 0 {
+		writeSchemaDirectives(b, "\t\t", directives[0])
+	}
 	if returnType != nil {
 		fmt.Fprintf(b, "\t\tReturnType: %q, ReturnList: %v,\n", returnType.Name, returnType.IsList)
 	}
@@ -406,6 +525,9 @@ func (g *GeneratorContext) writeAPIRegistrationSchema(b *strings.Builder, name, 
 			if p.Default != nil || optionalParams[p.Name] {
 				b.WriteString(", HasDefault: true")
 			}
+			if description := schemaParamDescription(p); description != "" {
+				fmt.Fprintf(b, ", Description: %q", description)
+			}
 			b.WriteString("},\n")
 		}
 		fmt.Fprintf(b, "\t\t},\n")
@@ -413,12 +535,22 @@ func (g *GeneratorContext) writeAPIRegistrationSchema(b *strings.Builder, name, 
 	fmt.Fprintf(b, "\t})\n")
 }
 
-func luxoParamToSchemaType(typeName string, enums map[string]bool) string {
-	typeID := luxoTypeToSchemaType(typeName, enums)
-	if typeID == "FieldModel" {
-		return "FieldJSON"
+func schemaParamDescription(param *ast.ParamDecl) string {
+	if param.Doc != "" {
+		return param.Doc
 	}
-	return typeID
+	switch param.Name {
+	case "page":
+		return "One-based page number."
+	case "pageSize":
+		return "Maximum records returned per page."
+	default:
+		return ""
+	}
+}
+
+func luxoParamToSchemaType(typeName string, enums map[string]bool) string {
+	return luxoTypeToSchemaType(typeName, enums)
 }
 
 // luxoTypeToSchemaType maps Luxo type name to schema.FieldType constant name.
@@ -485,16 +617,20 @@ func (g *GeneratorContext) buildSchemaModels(s *schema.Schema, result *semantic.
 		for _, ext := range file.Extends {
 			stub := &schema.Model{Name: ext.Name, Module: modelModule[ext.Name]}
 			owner := modelDecls[ext.Name]
+			extendModel := &ast.ModelDecl{Name: ext.Name, Fields: ext.Fields}
+			relations := relationMap(g.analyzeRelations(extendModel, enums))
 			for _, f := range ext.Fields {
-				field, ok := g.schemaFieldFromDecl(ext.Name, f, "", enums)
+				if owner != nil && modelDeclHasField(owner, f.Name) {
+					continue
+				}
+				relation, relationFound := relations[f.Name]
+				field, ok := g.schemaFieldFromDecl(ext.Name, f, "", enums, relation, relationFound)
 				if !ok {
 					continue
 				}
-				if owner == nil || !modelDeclHasField(owner, f.Name) {
-					field.Module = modName
-					if field.Relation {
-						field.ForeignKey = g.inferFederationForeignKey(&ast.ModelDecl{Name: ext.Name}, f)
-					}
+				field.Module = modName
+				if field.Relation {
+					field.ForeignKey = g.inferFederationForeignKey(&ast.ModelDecl{Name: ext.Name}, f)
 				}
 				stub.Fields = append(stub.Fields, field)
 			}
@@ -504,10 +640,12 @@ func (g *GeneratorContext) buildSchemaModels(s *schema.Schema, result *semantic.
 }
 
 func (g *GeneratorContext) schemaModelFromDecl(model *ast.ModelDecl, module string, enums map[string]bool) *schema.Model {
-	result := &schema.Model{Name: model.Name, Module: module}
+	result := &schema.Model{Name: model.Name, Module: module, Description: model.Doc, Directives: schemaDirectiveNames(model.Directives)}
 	primaryKey := primaryKeyFieldName(model)
+	relations := relationMap(g.analyzeRelations(model, enums))
 	for _, field := range model.Fields {
-		converted, ok := g.schemaFieldFromDecl(model.Name, field, primaryKey, enums)
+		relation, relationFound := relations[field.Name]
+		converted, ok := g.schemaFieldFromDecl(model.Name, field, primaryKey, enums, relation, relationFound)
 		if ok {
 			result.Fields = append(result.Fields, converted)
 		}
@@ -515,21 +653,30 @@ func (g *GeneratorContext) schemaModelFromDecl(model *ast.ModelDecl, module stri
 	return result
 }
 
-func (g *GeneratorContext) schemaFieldFromDecl(modelName string, field *ast.FieldDecl, primaryKey string, enums map[string]bool) (schema.Field, bool) {
+func (g *GeneratorContext) schemaFieldFromDecl(modelName string, field *ast.FieldDecl, primaryKey string, enums map[string]bool, relation Relation, relationFound bool) (schema.Field, bool) {
 	if field.Type == nil || hasDirective(field.Directives, "hidden") || hasDirective(field.Directives, "internal") {
 		return schema.Field{}, false
 	}
-	return schema.Field{
-		ID:         g.modelFieldID(modelName, field.Name),
-		Name:       field.Name,
-		Type:       luxoTypeToSchemaFieldType(field.Type.Name, enums),
-		TypeName:   field.Type.Name,
-		Nullable:   field.Type.Nullable,
-		IsList:     field.Type.IsList,
-		Relation:   isRelationField(field, enums),
-		Computed:   field.Computed != nil,
-		PrimaryKey: field.Name == primaryKey,
-	}, true
+	result := schema.Field{
+		ID:          g.modelFieldID(modelName, field.Name),
+		Name:        field.Name,
+		Type:        luxoTypeToSchemaFieldType(field.Type.Name, enums),
+		TypeName:    field.Type.Name,
+		Nullable:    field.Type.Nullable,
+		IsList:      field.Type.IsList,
+		Relation:    relationFound,
+		Computed:    field.Computed != nil,
+		PrimaryKey:  field.Name == primaryKey,
+		Description: field.Doc,
+		Directives:  schemaDirectiveNames(field.Directives),
+	}
+	if relationFound {
+		result.RelationKind = schemaRelationKind(relation.Type)
+		result.LocalKey = relation.LocalKey
+		result.RemoteKey = relation.RemoteKey
+		result.TargetModule = g.remoteModelModule(relation.TargetName)
+	}
+	return result, true
 }
 
 func modelDeclHasField(model *ast.ModelDecl, name string) bool {
@@ -588,7 +735,7 @@ func (g *GeneratorContext) buildSchemaAPIs(s *schema.Schema, result *semantic.Re
 			}
 			for _, op := range crudOperations(m) {
 				apiName := crudAPIName(m.Name, op)
-				a := &schema.API{ID: g.apiID(apiName), Name: apiName, Module: modName}
+				a := &schema.API{ID: g.apiID(apiName), Name: apiName, Module: modName, Description: crudAPIDescription(m.Name, op)}
 				idParam := g.schemaParamForModelID(apiName, m, enums, false)
 				switch op {
 				case "get":
@@ -600,8 +747,8 @@ func (g *GeneratorContext) buildSchemaAPIs(s *schema.Schema, result *semantic.Re
 					a.Paginated = true
 					a.DefaultPageSize = ast.DefaultPaginationPageSize
 					a.Params = []schema.Param{
-						{ID: g.apiParamID(apiName, "page"), Name: "page", Type: schema.FieldInt, HasDefault: true},
-						{ID: g.apiParamID(apiName, "pageSize"), Name: "pageSize", Type: schema.FieldInt, HasDefault: true},
+						{ID: g.apiParamID(apiName, "page"), Name: "page", Type: schema.FieldInt, HasDefault: true, Description: "One-based page number."},
+						{ID: g.apiParamID(apiName, "pageSize"), Name: "pageSize", Type: schema.FieldInt, HasDefault: true, Description: "Maximum records returned per page."},
 					}
 				case "create":
 					a.ReturnType = m.Name
@@ -620,7 +767,10 @@ func (g *GeneratorContext) buildSchemaAPIs(s *schema.Schema, result *semantic.Re
 			}
 		}
 		for _, api := range file.APIs {
-			a := &schema.API{ID: g.apiID(api.Name), Name: api.Name, Module: modName}
+			a := &schema.API{
+				ID: g.apiID(api.Name), Name: api.Name, Module: modName,
+				Description: api.Doc, Directives: schemaDirectiveNames(api.Directives),
+			}
 			if api.ReturnType != nil {
 				a.ReturnType = api.ReturnType.Name
 				a.ReturnList = api.ReturnType.IsList
@@ -631,11 +781,12 @@ func (g *GeneratorContext) buildSchemaAPIs(s *schema.Schema, result *semantic.Re
 			for _, p := range api.EffectiveParams() {
 				a.Params = append(a.Params, schema.Param{
 					ID: g.apiParamID(api.Name, p.Name), Name: p.Name,
-					Type:       luxoParamToSchemaFieldType(p.Type.Name, enums),
-					TypeName:   p.Type.Name,
-					IsList:     p.Type.IsList,
-					Nullable:   p.Type.Nullable,
-					HasDefault: p.Default != nil,
+					Type:        luxoParamToSchemaFieldType(p.Type.Name, enums),
+					TypeName:    p.Type.Name,
+					IsList:      p.Type.IsList,
+					Nullable:    p.Type.Nullable,
+					HasDefault:  p.Default != nil,
+					Description: schemaParamDescription(p),
 				})
 			}
 			s.RegisterAPI(a)
@@ -656,12 +807,14 @@ func (g *GeneratorContext) schemaParamForModelID(apiName string, model *ast.Mode
 		typeName = field.Type.Name
 	}
 	name := "id"
+	description := fmt.Sprintf("Primary key of the %s record.", model.Name)
 	if list {
 		name = "ids"
+		description = fmt.Sprintf("Primary keys of the %s records.", model.Name)
 	}
 	return schema.Param{
 		ID: g.apiParamID(apiName, name), Name: name,
-		Type: luxoParamToSchemaFieldType(typeName, enums), TypeName: typeName, IsList: list,
+		Type: luxoParamToSchemaFieldType(typeName, enums), TypeName: typeName, IsList: list, Description: description,
 	}
 }
 
@@ -676,6 +829,7 @@ func (g *GeneratorContext) schemaCRUDFieldParams(apiName string, model *ast.Mode
 			ID: g.apiParamID(apiName, field.Name), Name: field.Name,
 			Type: luxoParamToSchemaFieldType(field.Type.Name, enums), TypeName: field.Type.Name,
 			IsList: field.Type.IsList, Nullable: field.Type.Nullable, HasDefault: update || field.Type.Nullable || field.Default != nil,
+			Description: field.Doc,
 		})
 	}
 	return params
@@ -684,7 +838,7 @@ func (g *GeneratorContext) schemaCRUDFieldParams(apiName string, model *ast.Mode
 func buildSchemaEnums(s *schema.Schema, result *semantic.Result) {
 	for _, file := range result.Files {
 		for _, e := range file.Enums {
-			s.RegisterEnum(&schema.Enum{Name: e.Name, Module: moduleNameFromFile(file.Name), Values: e.Values})
+			s.RegisterEnum(&schema.Enum{Name: e.Name, Module: moduleNameFromFile(file.Name), Values: e.Values, Description: e.Doc})
 		}
 	}
 }
@@ -692,7 +846,7 @@ func buildSchemaEnums(s *schema.Schema, result *semantic.Result) {
 func (g *GeneratorContext) buildSchemaTypes(s *schema.Schema, result *semantic.Result, enums map[string]bool) {
 	for _, file := range result.Files {
 		for _, t := range file.Types {
-			st := &schema.TypeDecl{Name: t.Name, Module: moduleNameFromFile(file.Name)}
+			st := &schema.TypeDecl{Name: t.Name, Module: moduleNameFromFile(file.Name), Description: t.Doc}
 			for _, f := range t.Fields {
 				if f.Type == nil {
 					continue
@@ -701,6 +855,7 @@ func (g *GeneratorContext) buildSchemaTypes(s *schema.Schema, result *semantic.R
 					ID: g.modelFieldID(t.Name, f.Name), Name: f.Name,
 					Type: luxoTypeToSchemaFieldType(f.Type.Name, enums), TypeName: f.Type.Name,
 					Nullable: f.Type.Nullable, IsList: f.Type.IsList,
+					Description: f.Doc, Directives: schemaDirectiveNames(f.Directives),
 				})
 			}
 			s.RegisterType(st)
@@ -738,12 +893,6 @@ func luxoTypeToSchemaFieldType(typeName string, enums map[string]bool) schema.Fi
 	}
 }
 
-// luxoParamToSchemaFieldType maps structured params to their canonical JSON
-// wire representation while TypeName retains the generated SDK type.
 func luxoParamToSchemaFieldType(typeName string, enums map[string]bool) schema.FieldType {
-	typeID := luxoTypeToSchemaFieldType(typeName, enums)
-	if typeID == schema.FieldModel {
-		return schema.FieldJSON
-	}
-	return typeID
+	return luxoTypeToSchemaFieldType(typeName, enums)
 }

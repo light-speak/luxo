@@ -236,9 +236,12 @@ getUser(1) {
 
 客户端选字段 → API 只序列化这些 → SQL 只查这些。端到端。
 
-生成的 SDK 输出模型精确保留三种字段状态：未选择、已选择且为 `null`、已选择且有值；
-解码器不会为缺失字段伪造零值。输入 DTO 保持严格；同一个 Schema 类型同时用于输入和输出时，
-codegen 会生成用于选择输出的 `Foo` 和用于输入的 `FooInput`。
+所有返回结构化数据的公开 API 都必须携带非空 `$select`；缺少字段选择是协议错误，不会
+隐式退化为全字段查询。Vite 分析器会为生成客户端的普通请求和流式订阅回调在编译期
+自动注入选择；动态或逃逸用法会生成显式的安全投影，直接使用底层 transport 时则必须
+自行传入 `$select`。显式选择返回
+`Foo<true>`，精确保留未选择、已选择且为 `null`、已选择且有值三种状态。输入 DTO 保持
+严格；同一个 Schema 类型同时用于输入和输出时，codegen 分别生成 `Foo` 和 `FooInput`。
 
 ### 实时流
 
@@ -280,6 +283,20 @@ luxo run
 **Luvia 始终在线。** embedded 模式把所有模块和网关放在同一进程；cluster 模式使用生成的模块服务二进制和独立网关。RPC 路由与 Federation loader 都来自同一份已分析的 Schema，不需要手写传输客户端。
 
 JSON 与 Luxo Binary 都是生产传输。HTTP 客户端通过 SDK transport mode 或 `X-Luxo-Mode: json|binary` 选择；WebSocket 与原生 RPC 使用各自的 canonical binary framing。`APP_ENV` 不会静默改变 wire 契约。
+
+### 请求追踪与 SQL
+
+Luxo 的追踪是请求级、跨网关、服务、DataLoader 与数据库的执行 DAG。Studio Playground
+主动调试会携带项目调试密钥并显式请求详细追踪；PostgreSQL 在服务端记录连接池等待、SQL
+操作、资源、耗时、参数数量、影响行数和错误码。SQL 正文会先删除普通及嵌套注释，脱敏
+字符串、转义字符串、dollar-quoted 与数字字面量，并限制为 4 KiB；参数值和数据库凭据
+永不进入 trace。
+
+生产环境的普通请求没有 tracer session，数据库热路径仅做常数次 context 查询，不读取时钟、
+不构造元数据且保持零分配。`LUXO_TRACE_SAMPLE_RATE` 命中的线上样本只保留归一化 SQL
+结构指纹和结构元数据，注释、字面量与参数序号不会影响聚合键，也不会构造或保存 SQL 正文。
+详细 trace 使用流式、版本化 Luxo Binary response envelope，避免 HTTP header 大小限制，
+同时不让网关缓存或复制整份业务响应；最多保留 128 个 span，超出时明确标记截断。
 
 ### Wire 兼容性
 

@@ -64,6 +64,39 @@ class LuxoEncoder(initialCapacity: Int = 1024) {
         writeRawBytes(v)
     }
 
+	/** Write a length-delimited value directly into this encoder's buffer. */
+	fun writeDelimited(writeValue: (LuxoEncoder) -> Unit) {
+		val prefixPosition = pos
+		ensure(1)
+		pos++
+		val valuePosition = pos
+		try {
+			writeValue(this)
+		} catch (error: Throwable) {
+			pos = prefixPosition
+			throw error
+		}
+		val valueLength = pos - valuePosition
+		val prefixLength = varintLength(valueLength)
+		val shift = prefixLength - 1
+		if (shift > 0) {
+			ensure(shift)
+			System.arraycopy(buf, valuePosition, buf, valuePosition + shift, valueLength)
+			pos += shift
+		}
+		writeVarintAt(prefixPosition, valueLength)
+	}
+
+	private fun writeVarintAt(start: Int, input: Int) {
+		var position = start
+		var value = input
+		while (value >= 0x80) {
+			buf[position++] = ((value and 0x7f) or 0x80).toByte()
+			value /= 128
+		}
+		buf[position] = value.toByte()
+	}
+
     /** Write raw bytes without a length prefix. */
     fun writeRawBytes(v: ByteArray) {
         ensure(v.size)
@@ -143,6 +176,36 @@ class LuxoEncoder(initialCapacity: Int = 1024) {
         while (newCap < pos + n) newCap = newCap shl 1
         buf = buf.copyOf(newCap)
     }
+}
+
+private fun varintLength(input: Int): Int {
+	var value = input
+	var length = 1
+	while (value >= 0x80) {
+		value /= 128
+		length++
+	}
+	return length
+}
+
+/** Return the UTF-8 byte length without allocating an encoded copy. */
+fun luxoUtf8Length(value: String): Int {
+	var length = 0
+	var index = 0
+	while (index < value.length) {
+		val code = value[index].code
+		when {
+			code < 0x80 -> length++
+			code < 0x800 -> length += 2
+			code in 0xd800..0xdbff && index + 1 < value.length && value[index + 1].code in 0xdc00..0xdfff -> {
+				length += 4
+				index++
+			}
+			else -> length += 3
+		}
+		index++
+	}
+	return length
 }
 
 class LuxoDecoder(private val buf: ByteArray) {

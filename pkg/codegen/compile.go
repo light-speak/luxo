@@ -2,6 +2,7 @@ package codegen
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/ast"
@@ -26,6 +27,8 @@ func compileDefaultValue(expr ast.Expr, goType string, enums map[string]bool) st
 			return "true"
 		case token.False:
 			return "false"
+		case token.Null:
+			return "nil"
 		}
 	case *ast.Ident:
 		if e.Name == "true" {
@@ -73,6 +76,10 @@ func (g *GeneratorContext) compileAPIBody(b *strings.Builder, api *ast.ApiDecl, 
 
 	// Parse params (with default value support)
 	for _, p := range api.Params {
+		if isStructuredParam(p, enums) {
+			writeStructuredParamExtraction(b, p, enums, "\t\t")
+			continue
+		}
 		goType := resolveGoType(p.Type)
 		method := paramMethod(goType)
 		if p.Type != nil && p.Type.Nullable {
@@ -114,6 +121,7 @@ func (g *GeneratorContext) compileAPIBody(b *strings.Builder, api *ast.ApiDecl, 
 		paginationTotals: make(map[string]string),
 		nativeFunctions:  nativeFunctions,
 		paginate:         hasDirective(api.Directives, "paginate"),
+		loadSelections:   analyzeLoadSelections(api.Body, models),
 	}
 	// Register API params in vars with Luxo type name for type-aware compilation
 	for _, p := range api.Params {
@@ -130,6 +138,72 @@ func (g *GeneratorContext) compileAPIBody(b *strings.Builder, api *ast.ApiDecl, 
 	c.compileHandlerBody(api.Body.Stmts)
 
 	fmt.Fprintf(b, "\t}\n}\n\n")
+}
+
+func isStructuredParam(param *ast.ParamDecl, enums map[string]bool) bool {
+	if param == nil || param.Type == nil || enums[param.Type.Name] {
+		return false
+	}
+	switch param.Type.Name {
+	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes", "JSON":
+		return false
+	default:
+		return true
+	}
+}
+
+func writeStructuredParamExtraction(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, indent string) {
+	writeStructuredParamDeclaration(b, param, enums, indent)
+	fmt.Fprintf(b, "%sif req.BinaryMode {\n", indent)
+	if param.Type.IsList {
+		writeStructuredListParamDecode(b, param, indent+"\t")
+	} else {
+		writeStructuredScalarParamDecode(b, param, indent+"\t")
+	}
+	fmt.Fprintf(b, "%s} else {\n", indent)
+	fmt.Fprintf(b, "%s\tif err := req.%s(%q, &%s); err != nil {\n", indent, paramJSONMethod(param), param.Name, param.Name)
+	fmt.Fprintf(b, "%s\t\treturn err\n%s\t}\n%s}\n", indent, indent, indent)
+}
+
+func writeStructuredParamDeclaration(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, indent string) {
+	goType := resolveGoType(param.Type)
+	if param.Default == nil {
+		fmt.Fprintf(b, "%svar %s %s\n", indent, param.Name, goType)
+		return
+	}
+	defaultValue := compileDefaultValue(param.Default, goType, enums)
+	fmt.Fprintf(b, "%svar %s %s = %s\n", indent, param.Name, goType, defaultValue)
+}
+
+func writeStructuredScalarParamDecode(b *strings.Builder, param *ast.ParamDecl, indent string) {
+	optional := param.Default != nil
+	nullable := param.Type.Nullable
+	name := param.Name
+	fmt.Fprintf(b, "%s_%sMessage, _%sPresent, err := req.ParamMessage(%q, %t, %t)\n", indent, name, name, name, optional, nullable)
+	fmt.Fprintf(b, "%sif err != nil { return err }\n", indent)
+	fmt.Fprintf(b, "%sif _%sPresent && _%sMessage != nil {\n", indent, name, name)
+	fmt.Fprintf(b, "%s\t_%sDecoder := codec.NewDecoder(_%sMessage)\n", indent, name, name)
+	if nullable {
+		fmt.Fprintf(b, "%s\t%s = &%s{}\n", indent, name, param.Type.Name)
+	}
+	fmt.Fprintf(b, "%s\t%s.ReadLuxo(_%sDecoder)\n", indent, name, name)
+	fmt.Fprintf(b, "%s\tif _%sDecoder.Err() != nil { return api.InvalidParam(%q, _%sDecoder.Err()) }\n", indent, name, name, name)
+	fmt.Fprintf(b, "%s}\n", indent)
+}
+
+func writeStructuredListParamDecode(b *strings.Builder, param *ast.ParamDecl, indent string) {
+	optional := param.Default != nil
+	nullable := param.Type.Nullable
+	name := param.Name
+	fmt.Fprintf(b, "%s_%sMessages, _%sPresent, err := req.ParamMessageArray(%q, %t, %t)\n", indent, name, name, name, optional, nullable)
+	fmt.Fprintf(b, "%sif err != nil { return err }\n", indent)
+	fmt.Fprintf(b, "%sif _%sPresent && _%sMessages != nil {\n", indent, name, name)
+	fmt.Fprintf(b, "%s\t%s = make([]%s, len(_%sMessages))\n", indent, name, param.Type.Name, name)
+	fmt.Fprintf(b, "%s\tfor i := range _%sMessages {\n", indent, name)
+	fmt.Fprintf(b, "%s\t\t_%sDecoder := codec.NewDecoder(_%sMessages[i])\n", indent, name, name)
+	fmt.Fprintf(b, "%s\t\t%s[i].ReadLuxo(_%sDecoder)\n", indent, name, name)
+	fmt.Fprintf(b, "%s\t\tif _%sDecoder.Err() != nil { return api.InvalidParam(%q, _%sDecoder.Err()) }\n", indent, name, name, name)
+	fmt.Fprintf(b, "%s\t}\n%s}\n", indent, indent)
 }
 
 func (c *compiler) compileHandlerBody(statements []ast.Stmt) {
@@ -163,6 +237,10 @@ func compileFnBody(b *strings.Builder, fn *ast.FnDecl, models map[string]*ast.Mo
 }
 
 func (g *GeneratorContext) compileFnBody(b *strings.Builder, fn *ast.FnDecl, models map[string]*ast.ModelDecl, enums map[string]bool) {
+	g.compileFnBodyWithNativeFunctions(b, fn, models, enums, nil)
+}
+
+func (g *GeneratorContext) compileFnBodyWithNativeFunctions(b *strings.Builder, fn *ast.FnDecl, models map[string]*ast.ModelDecl, enums map[string]bool, nativeFunctions map[string]bool) {
 	// Convert FnDecl to ApiDecl for code reuse — they share the same structure
 	api := &ast.ApiDecl{
 		Pos:        fn.Pos,
@@ -172,7 +250,7 @@ func (g *GeneratorContext) compileFnBody(b *strings.Builder, fn *ast.FnDecl, mod
 		Directives: fn.Directives,
 		Body:       fn.Body,
 	}
-	g.compileAPIBody(b, api, models, enums, nil)
+	g.compileAPIBody(b, api, models, enums, nativeFunctions)
 }
 
 // valType tracks the resolved type of a val variable.
@@ -251,7 +329,11 @@ type compiler struct {
 	paginationTmp    int                // unique pagination temporary counter
 	ptrTmpCount      int                // counter for hoisted pointer temp vars (nullable create args)
 	resultTmp        int                // counter for Result<T> values lowered from Go's (T, error)
+	aggregateTmp     int                // counter for fused await aggregate result slices
 	nativeFunctions  map[string]bool    // @native fn names available through app.Resolver
+	loadSelections   map[string]string  // load variable → exact compiled selection literal
+	loadSelection    string             // selection for the load expression currently being compiled
+	hasLoadSelection bool               // distinguishes an exact empty projection from select-all nil
 }
 
 func (c *compiler) write(format string, args ...any) {
@@ -293,7 +375,20 @@ func (c *compiler) compileStmt(stmt ast.Stmt) {
 
 // compileVal: val x = expr
 func (c *compiler) compileVal(s *ast.ValStmt) {
+	if await, ok := s.Value.(*ast.AwaitExpr); ok {
+		names := s.Names
+		if len(names) == 0 {
+			names = []string{s.Name}
+		}
+		c.compileAwaitBindings(await, names)
+		return
+	}
+	previousSelection, previousHasSelection := c.loadSelection, c.hasLoadSelection
+	if modelName, ok := directLoadModel(s.Value); ok && c.isRemoteModel(modelName) {
+		c.loadSelection, c.hasLoadSelection = c.loadSelections[s.Name]
+	}
 	expr := c.compileExpr(s.Value)
+	c.loadSelection, c.hasLoadSelection = previousSelection, previousHasSelection
 	if c.isModelQuery(s.Value) {
 		qt := c.resolveQueryType(s.Value)
 		// @paginate + all → AllWithCount returns (results, total, error)
@@ -390,11 +485,10 @@ func (c *compiler) compileReturn(s *ast.ReturnStmt) {
 			c.write("_result, err := %s", expr)
 		}
 		c.write("if err != nil {\n%s\treturn err\n%s}", c.indent, c.indent)
-		if qt.isList {
+		if qt.isModel && qt.isList {
 			c.writeModelListReturn("_result", qt.name, totalName)
 		} else {
-			c.writeComputedResolve(qt.name, "_result", false)
-			c.write("_result.WriteLuxo(req.Buf, req.FieldMask)")
+			c.writeReturnByType("_result", qt)
 		}
 		c.write("return nil")
 		return
@@ -739,6 +833,9 @@ func isErrorReturningBool(expr ast.Expr) bool {
 // isBoolExpr checks if an expression returns a plain bool (not nullable, not error).
 // Detects: member.verifyPassword(), it.contains(), etc.
 func isBoolExpr(expr ast.Expr) bool {
+	if expr != nil && expr.GetTypeTag() == "Boolean" && !expr.IsListType() && !expr.IsNullable() {
+		return true
+	}
 	call, ok := expr.(*ast.CallExpr)
 	if !ok {
 		return false
@@ -1487,6 +1584,14 @@ func (c *compiler) compileWhereArg(modelName string, expr ast.Expr) string {
 			field = ident.Name
 		}
 	}
+	if literal, ok := bin.Right.(*ast.Literal); ok && literal.Kind == token.Null {
+		switch bin.Op {
+		case "==":
+			return fmt.Sprintf("%sWhere.%s.IsNull()", modelName, str.Capitalize(field))
+		case "!=":
+			return fmt.Sprintf("%sWhere.%s.IsNotNull()", modelName, str.Capitalize(field))
+		}
+	}
 
 	op := ""
 	switch bin.Op {
@@ -1743,7 +1848,7 @@ func (c *compiler) resolveQueryType(expr ast.Expr) valType {
 				return valType{name: "Int"}
 			case "update":
 				return valType{name: "Int"} // rows affected
-			case "delete", "deleteMany":
+			case "delete", "deleteMany", "updateMany":
 				return valType{name: "Int"} // rows affected
 			case "sum", "avg", "min", "max":
 				return valType{name: "Int"}
@@ -1783,7 +1888,7 @@ func (c *compiler) isModelQuery(expr ast.Expr) bool {
 			// Check terminal method
 			last := chain[len(chain)-1]
 			switch last.method {
-			case "first", "all", "create", "exec", "find", "load", "exists", "update", "delete", "deleteMany", "count",
+			case "first", "all", "create", "exec", "find", "load", "exists", "update", "updateMany", "delete", "deleteMany", "count",
 				"sum", "avg", "min", "max":
 				return true
 			}
@@ -1844,6 +1949,33 @@ func (c *compiler) compileUpdateChain(b *strings.Builder, modelName string, args
 	fmt.Fprintf(b, ".Update(ctx, %s)", strings.Join(sets, ", "))
 }
 
+func splitBulkMutationArgs(args []*ast.NamedArg) (ast.Expr, []*ast.NamedArg) {
+	var where ast.Expr
+	sets := make([]*ast.NamedArg, 0, len(args))
+	for _, arg := range args {
+		if arg.Name == "where" {
+			where = arg.Value
+			continue
+		}
+		sets = append(sets, arg)
+	}
+	return where, sets
+}
+
+func (c *compiler) compileBulkMutationBase(b *strings.Builder, modelName string, where ast.Expr) {
+	if b.Len() > 0 && where == nil {
+		return
+	}
+	if b.Len() == 0 {
+		fmt.Fprintf(b, "app.%s", modelName)
+	}
+	b.WriteString(".Where(")
+	if where != nil {
+		b.WriteString(c.compileWhereArg(modelName, where))
+	}
+	b.WriteByte(')')
+}
+
 // isHashField checks if a model field has @hash directive.
 func isHashField(model *ast.ModelDecl, fieldName string) bool {
 	for _, f := range model.Fields {
@@ -1879,9 +2011,9 @@ func (c *compiler) compileLoad(b *strings.Builder, modelName string, args []*ast
 	}
 
 	if !hasNamedArgs {
-		// PK load: User.load(id) → app.loaders.ExtendUser.Load(ctx, id, nil)
+		// PK load: User.load(id) → app.loaders.ExtendUser.Load(ctx, id, fields)
 		val := c.compileExpr(args[0].Value)
-		fmt.Fprintf(b, "app.loaders.Extend%s.Load(ctx, %s, nil)", modelName, val)
+		fmt.Fprintf(b, "app.loaders.Extend%s.Load(ctx, %s, %s)", modelName, val, c.compiledLoadSelection())
 		return
 	}
 
@@ -1903,8 +2035,8 @@ func (c *compiler) compileLoad(b *strings.Builder, modelName string, args []*ast
 	}
 
 	if len(names) == 1 {
-		// Single FK: Post.load(userId: x) → app.loaders.PostByUserId.Load(ctx, x, nil)
-		fmt.Fprintf(b, "app.loaders.%s.Load(ctx, %s, nil)", loaderName, vals[0])
+		// Single FK: Post.load(userId: x) → app.loaders.PostByUserId.Load(ctx, x, fields)
+		fmt.Fprintf(b, "app.loaders.%s.Load(ctx, %s, %s)", loaderName, vals[0], c.compiledLoadSelection())
 	} else {
 		// Composite key: Post.load(userId: x, type: y)
 		// → app.loaders.PostByUserIdAndType.Load(ctx, PostByUserIdAndTypeKey{UserId: x, Type: y}, nil)
@@ -1916,8 +2048,199 @@ func (c *compiler) compileLoad(b *strings.Builder, modelName string, args []*ast
 			}
 			fmt.Fprintf(b, "%s: %s", str.Capitalize(name), vals[i])
 		}
-		b.WriteString("}, nil)")
+		fmt.Fprintf(b, "}, %s)", c.compiledLoadSelection())
 	}
+}
+
+func (c *compiler) compiledLoadSelection() string {
+	if !c.hasLoadSelection {
+		return "nil"
+	}
+	return c.loadSelection
+}
+
+func (c *compiler) isRemoteModel(modelName string) bool {
+	if c.generator == nil || c.generator.events == nil || c.api == nil {
+		return false
+	}
+	owner := c.generator.events.ModelModule[modelName]
+	source := moduleNameFromFile(c.api.Pos.File)
+	return owner != "" && source != "" && owner != source
+}
+
+func directLoadModel(expr ast.Expr) (string, bool) {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return "", false
+	}
+	member, ok := call.Func.(*ast.MemberExpr)
+	if !ok || member.Field != "load" {
+		return "", false
+	}
+	model, ok := member.Object.(*ast.Ident)
+	if !ok {
+		return "", false
+	}
+	return model.Name, true
+}
+
+func analyzeLoadSelections(body *ast.Block, models map[string]*ast.ModelDecl) map[string]string {
+	bindings := make(map[string]string)
+	collectLoadBindings(body, bindings)
+	paths := make(map[string][][]string, len(bindings))
+	ast.WalkExprs(body, func(expr ast.Expr) {
+		member, ok := expr.(*ast.MemberExpr)
+		if !ok {
+			return
+		}
+		root, path := memberSelectionPath(member)
+		modelName, exists := bindings[root]
+		if exists && validModelSelectionPath(modelName, path, models) {
+			paths[root] = append(paths[root], path)
+		}
+	})
+	result := make(map[string]string, len(bindings))
+	for variable := range bindings {
+		result[variable] = compileSelectionLiteral(pruneSelectionPrefixes(paths[variable]))
+	}
+	return result
+}
+
+func collectLoadBindings(block *ast.Block, bindings map[string]string) {
+	if block == nil {
+		return
+	}
+	for _, stmt := range block.Stmts {
+		switch value := stmt.(type) {
+		case *ast.ValStmt:
+			if modelName, ok := directLoadModel(value.Value); ok {
+				bindings[value.Name] = modelName
+			}
+		case *ast.IfStmt:
+			collectLoadBindings(value.Then, bindings)
+		case *ast.ForStmt:
+			collectLoadBindings(value.Body, bindings)
+		}
+	}
+}
+
+func memberSelectionPath(member *ast.MemberExpr) (string, []string) {
+	path := []string{member.Field}
+	object := member.Object
+	for {
+		switch value := object.(type) {
+		case *ast.Ident:
+			return value.Name, path
+		case *ast.MemberExpr:
+			path = append([]string{value.Field}, path...)
+			object = value.Object
+		default:
+			return "", nil
+		}
+	}
+}
+
+func validModelSelectionPath(modelName string, path []string, models map[string]*ast.ModelDecl) bool {
+	for index, name := range path {
+		model := models[modelName]
+		field := modelField(model, name)
+		if field == nil {
+			return false
+		}
+		if index+1 < len(path) {
+			modelName = field.Type.Name
+		}
+	}
+	return len(path) > 0
+}
+
+func modelField(model *ast.ModelDecl, name string) *ast.FieldDecl {
+	if model == nil {
+		return nil
+	}
+	for _, field := range model.Fields {
+		if field.Name == name {
+			return field
+		}
+	}
+	return nil
+}
+
+func pruneSelectionPrefixes(paths [][]string) [][]string {
+	sort.Slice(paths, func(i, j int) bool {
+		if len(paths[i]) != len(paths[j]) {
+			return len(paths[i]) > len(paths[j])
+		}
+		return strings.Join(paths[i], "\x00") < strings.Join(paths[j], "\x00")
+	})
+	result := make([][]string, 0, len(paths))
+	for _, path := range paths {
+		if !selectionPathCovered(path, result) {
+			result = append(result, path)
+		}
+	}
+	return result
+}
+
+func selectionPathCovered(path []string, selected [][]string) bool {
+	for _, candidate := range selected {
+		if len(candidate) < len(path) {
+			continue
+		}
+		match := true
+		for index := range path {
+			if candidate[index] != path[index] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+type compiledSelectionNode struct {
+	name     string
+	children map[string]*compiledSelectionNode
+}
+
+func compileSelectionLiteral(paths [][]string) string {
+	roots := make(map[string]*compiledSelectionNode)
+	for _, path := range paths {
+		insertCompiledSelection(roots, path)
+	}
+	return "[]*selection.Field{" + renderCompiledSelection(roots) + "}"
+}
+
+func insertCompiledSelection(nodes map[string]*compiledSelectionNode, path []string) {
+	for _, name := range path {
+		node := nodes[name]
+		if node == nil {
+			node = &compiledSelectionNode{name: name, children: make(map[string]*compiledSelectionNode)}
+			nodes[name] = node
+		}
+		nodes = node.children
+	}
+}
+
+func renderCompiledSelection(nodes map[string]*compiledSelectionNode) string {
+	names := make([]string, 0, len(nodes))
+	for name := range nodes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		node := nodes[name]
+		part := fmt.Sprintf("{Name: %q", node.name)
+		if len(node.children) > 0 {
+			part += ", Children: []*selection.Field{" + renderCompiledSelection(node.children) + "}"
+		}
+		parts = append(parts, part+"}")
+	}
+	return strings.Join(parts, ", ")
 }
 
 func (c *compiler) compileTerminalMethod(b *strings.Builder, modelName string, link chainLink) bool {
@@ -1935,11 +2258,27 @@ func (c *compiler) compileTerminalMethod(b *strings.Builder, modelName string, l
 	// Check if this is a terminal method first
 	isTerminal := false
 	switch link.method {
-	case "delete", "deleteMany", "all", "first", "exists", "exec", "count", "update", "upsert", "save", "sum", "avg", "min", "max":
+	case "delete", "deleteMany", "all", "first", "exists", "exec", "count", "update", "updateMany", "upsert", "save", "sum", "avg", "min", "max":
 		isTerminal = true
 	}
 	if !isTerminal {
 		return false
+	}
+	if link.method == "deleteMany" {
+		where, _ := splitBulkMutationArgs(link.args)
+		c.compileBulkMutationBase(b, modelName, where)
+		if m, ok := c.models[modelName]; ok && isSoftDelete(m) {
+			b.WriteString(".SoftDelete(ctx)")
+		} else {
+			b.WriteString(".Delete(ctx)")
+		}
+		return true
+	}
+	if link.method == "updateMany" {
+		where, sets := splitBulkMutationArgs(link.args)
+		c.compileBulkMutationBase(b, modelName, where)
+		c.compileUpdateChain(b, modelName, sets)
+		return true
 	}
 	// Seed builder if empty (terminal-only chain without prior modifier)
 	if b.Len() == 0 {
@@ -1947,13 +2286,6 @@ func (c *compiler) compileTerminalMethod(b *strings.Builder, modelName string, l
 	}
 	switch link.method {
 	case "delete":
-		if m, ok := c.models[modelName]; ok && isSoftDelete(m) {
-			fmt.Fprintf(b, ".SoftDelete(ctx)")
-		} else {
-			fmt.Fprintf(b, ".Delete(ctx)")
-		}
-		return true
-	case "deleteMany":
 		if m, ok := c.models[modelName]; ok && isSoftDelete(m) {
 			fmt.Fprintf(b, ".SoftDelete(ctx)")
 		} else {
@@ -2423,14 +2755,20 @@ func (c *compiler) compileWhen(e *ast.WhenExpr) string {
 		elseExpr := c.compileExpr(e.Else)
 		fmt.Fprintf(&b, "%s\tdefault:\n%s\t\treturn %s\n", c.indent, c.indent, elseExpr)
 	}
-	zeroVal := zeroValueForType(retType)
-	fmt.Fprintf(&b, "%s\t}\n%s\treturn %s\n%s}()", c.indent, c.indent, zeroVal, c.indent)
+	fmt.Fprintf(&b, "%s\t}\n", c.indent)
+	if e.Else == nil {
+		fmt.Fprintf(&b, "%s\treturn %s\n", c.indent, zeroValueForType(retType))
+	}
+	fmt.Fprintf(&b, "%s}()", c.indent)
 	return b.String()
 }
 
 // inferWhenReturnType infers the Go return type for a when expression.
 // Uses the API return type if available, otherwise falls back to "any".
 func (c *compiler) inferWhenReturnType(e *ast.WhenExpr) string {
+	if goType := c.goTypeForExpr(e); goType != "" {
+		return goType
+	}
 	if c.api != nil && c.api.ReturnType != nil {
 		switch c.api.ReturnType.Name {
 		case "String":
@@ -2571,14 +2909,17 @@ func (c *compiler) subCompiler() *compiler {
 		childVars[k] = v
 	}
 	return &compiler{
-		generator: c.generator,
-		b:         &b,
-		indent:    c.indent,
-		models:    c.models,
-		types:     c.types,
-		enums:     c.enums,
-		api:       c.api,
-		vars:      childVars,
+		generator:        c.generator,
+		b:                &b,
+		indent:           c.indent,
+		models:           c.models,
+		types:            c.types,
+		enums:            c.enums,
+		api:              c.api,
+		vars:             childVars,
+		loadSelections:   c.loadSelections,
+		loadSelection:    c.loadSelection,
+		hasLoadSelection: c.hasLoadSelection,
 	}
 }
 
@@ -2593,17 +2934,70 @@ func (c *compiler) compileAsync(e *ast.AsyncExpr) string {
 	return fmt.Sprintf("go func() {\n%s%s}()", sub.b.String(), c.indent)
 }
 
-// compileAwaitStmt compiles await { val x = ...; val y = ... } into parallel errgroup execution.
-// Each val statement becomes an independent goroutine task.
-// Variables are declared in the outer scope, goroutines assign to them.
-func (c *compiler) compileAwaitStmt(e *ast.AwaitExpr) {
-	// Phase 1: collect val statements → parallel tasks; others → sequential after
-	type awaitTask struct {
-		varName string
-		goType  string // Go type for var declaration
-		expr    string // compiled expression
-		isQuery bool   // true if model query (has error return)
+type awaitTask struct {
+	varName   string
+	goType    string
+	expr      string
+	source    ast.Expr
+	isQuery   bool
+	valueType valType
+}
+
+// compileAwaitBindings compiles the documented destructuring form:
+// val (a, b) = await { queryA(); queryB() }.
+func (c *compiler) compileAwaitBindings(e *ast.AwaitExpr, names []string) {
+	tasks := make([]awaitTask, 0, len(names))
+	for _, stmt := range e.Body.Stmts {
+		exprStmt, ok := stmt.(*ast.ExprStmt)
+		if !ok || exprStmt.Expr == nil {
+			continue
+		}
+		if len(tasks) >= len(names) {
+			return
+		}
+		tasks = append(tasks, c.newAwaitTask(names[len(tasks)], exprStmt.Expr))
 	}
+	c.emitAwaitTasks(tasks)
+}
+
+func (c *compiler) newAwaitTask(name string, value ast.Expr) awaitTask {
+	task := awaitTask{varName: name, expr: c.compileExpr(value), source: value, isQuery: c.isModelQuery(value)}
+	if task.isQuery {
+		task.valueType = c.resolveQueryType(value)
+		task.goType = goTypeForValType(task.valueType)
+	} else {
+		valueType, ok := c.valTypeFromExpr(value)
+		if ok {
+			task.valueType = valueType
+			task.goType = goTypeForValType(valueType)
+		}
+	}
+	if task.goType == "" {
+		task.goType = "any"
+	}
+	return task
+}
+
+func goTypeForValType(value valType) string {
+	if value.isModel {
+		if value.isList {
+			return "[]*" + value.name
+		}
+		return "*" + value.name
+	}
+	base := mapBaseType(value.name)
+	if value.isList {
+		return "[]" + base
+	}
+	if value.nullable && !isNilableGoType(base) {
+		return "*" + base
+	}
+	return base
+}
+
+// compileAwaitStmt retains the legacy standalone form used by older schemas:
+// await { val a = queryA(); val b = queryB() }.
+func (c *compiler) compileAwaitStmt(e *ast.AwaitExpr) {
 
 	var tasks []awaitTask
 	var afterStmts []ast.Stmt
@@ -2614,33 +3008,7 @@ func (c *compiler) compileAwaitStmt(e *ast.AwaitExpr) {
 			afterStmts = append(afterStmts, stmt)
 			continue
 		}
-		expr := c.compileExpr(vs.Value)
-		goType := "any"
-		isQuery := c.isModelQuery(vs.Value)
-		if isQuery {
-			qt := c.resolveQueryType(vs.Value)
-			if qt.isModel {
-				if qt.isList {
-					goType = "[]*" + qt.name
-				} else {
-					goType = "*" + qt.name
-				}
-			} else if qt.name == "Boolean" {
-				goType = "bool"
-			} else if qt.name == "Int" {
-				goType = "int64"
-			}
-		}
-		tasks = append(tasks, awaitTask{
-			varName: vs.Name,
-			goType:  goType,
-			expr:    expr,
-			isQuery: isQuery,
-		})
-		// Register var type for downstream compileReturn
-		if isQuery {
-			c.vars[vs.Name] = c.resolveQueryType(vs.Value)
-		}
+		tasks = append(tasks, c.newAwaitTask(vs.Name, vs.Value))
 	}
 
 	if len(tasks) == 0 {
@@ -2651,42 +3019,295 @@ func (c *compiler) compileAwaitStmt(e *ast.AwaitExpr) {
 		return
 	}
 
-	// Phase 2: generate code — write directly to c.b
+	c.emitAwaitTasks(tasks)
 
-	// Declare variables in outer scope
+	for _, stmt := range afterStmts {
+		c.compileStmt(stmt)
+	}
+}
+
+func (c *compiler) emitAwaitTasks(tasks []awaitTask) {
 	for _, t := range tasks {
 		c.write("var %s %s", t.varName, t.goType)
+		c.vars[t.varName] = t.valueType
 	}
 
-	// errgroup
+	groups := c.awaitAggregateGroups(tasks)
 	c.write("g, gctx := errgroup.WithContext(ctx)")
-
-	for _, t := range tasks {
-		c.write("g.Go(func() error {")
-		if t.isQuery {
-			c.write("\tvar err error")
-			c.write("\t%s, err = %s", t.varName, strings.Replace(t.expr, "(ctx)", "(gctx)", 1))
-			c.write("\treturn err")
-		} else {
-			c.write("\t%s = %s", t.varName, t.expr)
-			c.write("\treturn nil")
+	for index := range tasks {
+		group, first := awaitAggregateGroupAt(groups, index)
+		if group != nil {
+			if first {
+				c.emitAwaitAggregateGroup(*group)
+			}
+			continue
 		}
-		c.write("})")
+		c.emitAwaitTask(tasks[index])
 	}
 
 	c.write("if err := g.Wait(); err != nil {")
 	c.write("\treturn err")
 	c.write("}")
-
-	// Suppress unused variable warnings for await vars not referenced later
 	for _, t := range tasks {
 		c.write("_ = %s", t.varName)
 	}
+}
 
-	// Compile sequential statements after await
-	for _, stmt := range afterStmts {
-		c.compileStmt(stmt)
+type awaitAggregate struct {
+	taskIndex  int
+	varName    string
+	model      string
+	function   string
+	column     string
+	conditions []string
+}
+
+type awaitAggregateGroup struct {
+	model  string
+	common []string
+	tasks  []awaitAggregate
+}
+
+func (c *compiler) awaitAggregateGroups(tasks []awaitTask) []awaitAggregateGroup {
+	if c.api != nil && hasDirective(c.api.Directives, "scope") {
+		return nil
 	}
+	byModel := make(map[string]int)
+	groups := make([]awaitAggregateGroup, 0, len(tasks)/2)
+	for index, task := range tasks {
+		aggregate, ok := c.awaitAggregate(index, task)
+		if !ok {
+			continue
+		}
+		groupIndex, exists := byModel[aggregate.model]
+		if !exists {
+			groupIndex = len(groups)
+			byModel[aggregate.model] = groupIndex
+			groups = append(groups, awaitAggregateGroup{model: aggregate.model})
+		}
+		groups[groupIndex].tasks = append(groups[groupIndex].tasks, aggregate)
+	}
+	return finalizeAwaitAggregateGroups(groups)
+}
+
+func finalizeAwaitAggregateGroups(groups []awaitAggregateGroup) []awaitAggregateGroup {
+	result := groups[:0]
+	for _, group := range groups {
+		if len(group.tasks) < 2 {
+			continue
+		}
+		group.common = commonAggregateConditions(group.tasks)
+		for index := range group.tasks {
+			group.tasks[index].conditions = subtractAggregateConditions(group.tasks[index].conditions, group.common)
+		}
+		result = append(result, group)
+	}
+	return result
+}
+
+func (c *compiler) awaitAggregate(taskIndex int, task awaitTask) (awaitAggregate, bool) {
+	chain := flattenChain(task.source)
+	if !task.isQuery || len(chain) < 2 {
+		return awaitAggregate{}, false
+	}
+	root, ok := chain[0].expr.(*ast.Ident)
+	if !ok || c.models[root.Name] == nil || c.isRemoteModel(root.Name) {
+		return awaitAggregate{}, false
+	}
+	terminal := chain[len(chain)-1]
+	column, ok := aggregateTerminal(terminal)
+	if !ok {
+		return awaitAggregate{}, false
+	}
+	conditions, ok := c.awaitAggregateConditions(root.Name, chain[1:len(chain)-1])
+	if !ok {
+		return awaitAggregate{}, false
+	}
+	return awaitAggregate{taskIndex: taskIndex, varName: task.varName, model: root.Name, function: terminal.method, column: column, conditions: conditions}, true
+}
+
+func aggregateTerminal(link chainLink) (string, bool) {
+	switch link.method {
+	case "count":
+		return "", len(link.args) == 0
+	case "sum", "avg", "min", "max":
+		if len(link.args) != 1 {
+			return "", false
+		}
+		column := extractLambdaField(link.args[0].Value)
+		return column, column != ""
+	default:
+		return "", false
+	}
+}
+
+func (c *compiler) awaitAggregateConditions(model string, links []chainLink) ([]string, bool) {
+	var conditions []string
+	for _, link := range links {
+		if link.method != "where" {
+			return nil, false
+		}
+		for _, arg := range link.args {
+			condition, ok := c.awaitAggregateCondition(model, arg)
+			if !ok {
+				return nil, false
+			}
+			conditions = append(conditions, condition)
+		}
+	}
+	return conditions, true
+}
+
+func (c *compiler) awaitAggregateCondition(model string, arg *ast.NamedArg) (string, bool) {
+	if arg == nil || !stableAggregateCondition(arg) {
+		return "", false
+	}
+	if arg.Name != "" {
+		return fmt.Sprintf("%sWhere.%s.Eq(%s)", model, str.Capitalize(arg.Name), c.compileExpr(arg.Value)), true
+	}
+	return c.compileWhereArg(model, arg.Value), true
+}
+
+func stableAggregateCondition(arg *ast.NamedArg) bool {
+	if arg.Name != "" {
+		return stableAggregateValue(arg.Value)
+	}
+	binary, ok := arg.Value.(*ast.BinaryExpr)
+	if !ok || !aggregateComparison(binary.Op) || !aggregateFieldReference(binary.Left) {
+		return false
+	}
+	return stableAggregateValue(binary.Right)
+}
+
+func aggregateComparison(operator string) bool {
+	switch operator {
+	case "==", "!=", ">", ">=", "<", "<=":
+		return true
+	default:
+		return false
+	}
+}
+
+func aggregateFieldReference(expr ast.Expr) bool {
+	if identifier, ok := expr.(*ast.Ident); ok {
+		return identifier.Name != ""
+	}
+	member, ok := expr.(*ast.MemberExpr)
+	if !ok {
+		return false
+	}
+	identifier, ok := member.Object.(*ast.Ident)
+	return ok && identifier.Name == "it" && member.Field != ""
+}
+
+func stableAggregateValue(expr ast.Expr) bool {
+	switch value := expr.(type) {
+	case *ast.Literal, *ast.Ident:
+		return true
+	case *ast.MemberExpr:
+		return stableAggregateValue(value.Object)
+	case *ast.UnaryExpr:
+		return (value.Op == "+" || value.Op == "-") && stableAggregateValue(value.Value)
+	default:
+		return false
+	}
+}
+
+func commonAggregateConditions(tasks []awaitAggregate) []string {
+	minimums := conditionCounts(tasks[0].conditions)
+	for _, task := range tasks[1:] {
+		counts := conditionCounts(task.conditions)
+		for condition, minimum := range minimums {
+			if counts[condition] < minimum {
+				minimums[condition] = counts[condition]
+			}
+		}
+	}
+	common := make([]string, 0, len(tasks[0].conditions))
+	used := make(map[string]int, len(minimums))
+	for _, condition := range tasks[0].conditions {
+		if used[condition] < minimums[condition] {
+			common = append(common, condition)
+			used[condition]++
+		}
+	}
+	return common
+}
+
+func conditionCounts(conditions []string) map[string]int {
+	counts := make(map[string]int, len(conditions))
+	for _, condition := range conditions {
+		counts[condition]++
+	}
+	return counts
+}
+
+func subtractAggregateConditions(conditions, common []string) []string {
+	remaining := conditionCounts(common)
+	result := make([]string, 0, len(conditions)-len(common))
+	for _, condition := range conditions {
+		if remaining[condition] > 0 {
+			remaining[condition]--
+			continue
+		}
+		result = append(result, condition)
+	}
+	return result
+}
+
+func awaitAggregateGroupAt(groups []awaitAggregateGroup, taskIndex int) (*awaitAggregateGroup, bool) {
+	for index := range groups {
+		for taskOffset, task := range groups[index].tasks {
+			if task.taskIndex == taskIndex {
+				return &groups[index], taskOffset == 0
+			}
+		}
+	}
+	return nil, false
+}
+
+func (c *compiler) emitAwaitAggregateGroup(group awaitAggregateGroup) {
+	c.aggregateTmp++
+	result := fmt.Sprintf("_luxoAggregates%d", c.aggregateTmp)
+	base := fmt.Sprintf("app.%s.Where(%s)", group.model, strings.Join(group.common, ", "))
+	specs := make([]string, len(group.tasks))
+	for index, task := range group.tasks {
+		specs[index] = compileAggregateSpec(task)
+	}
+	c.write("g.Go(func() error {")
+	c.write("\t%s, err := %s.AggregateBatch(gctx, %s)", result, base, strings.Join(specs, ", "))
+	c.write("\tif err != nil { return err }")
+	for index, task := range group.tasks {
+		c.write("\t%s = %s[%d]", task.varName, result, index)
+	}
+	c.write("\treturn nil")
+	c.write("})")
+}
+
+func compileAggregateSpec(task awaitAggregate) string {
+	fields := []string{"Function: lux.Aggregate" + str.Capitalize(task.function)}
+	if task.column != "" {
+		fields = append(fields, fmt.Sprintf("Column: %q", str.ToSnakeCase(task.column)))
+	}
+	if len(task.conditions) > 0 {
+		fields = append(fields, "Conditions: []lux.Condition{"+strings.Join(task.conditions, ", ")+"}")
+	}
+	return "lux.AggregateSpec{" + strings.Join(fields, ", ") + "}"
+}
+
+func (c *compiler) emitAwaitTask(task awaitTask) {
+	c.write("g.Go(func() error {")
+	if task.isQuery {
+		c.write("\tvar err error")
+		expr := strings.Replace(task.expr, "(ctx,", "(gctx,", 1)
+		expr = strings.Replace(expr, "(ctx)", "(gctx)", 1)
+		c.write("\t%s, err = %s", task.varName, expr)
+		c.write("\treturn err")
+	} else {
+		c.write("\t%s = %s", task.varName, task.expr)
+		c.write("\treturn nil")
+	}
+	c.write("})")
 }
 
 // compileStringMethod compiles Luxo string methods to Go standard library calls.

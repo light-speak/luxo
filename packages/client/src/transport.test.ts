@@ -26,8 +26,46 @@ describe('binary param validation', () => {
 		}
 	})
 	it('rejects unknown wire types', () => {
-		expect(() => encodeParam(new Encoder(), { fieldID: 1, type: 'Model' }, {})).toThrow('unsupported binary param type')
-		expect(() => encodeParam(new Encoder(), { fieldID: 1, type: 'Model', isList: true }, [])).toThrow('unsupported binary list param type')
+		expect(() => encodeParam(new Encoder(), { fieldID: 1, type: 'Unsupported' }, {})).toThrow('unsupported binary param type')
+		expect(() => encodeParam(new Encoder(), { fieldID: 1, type: 'Unsupported', isList: true }, [])).toThrow('unsupported binary list param type')
+	})
+
+	it('encodes structured params as native length-delimited Luxo messages', () => {
+		const meta = {
+			id: 9,
+			params: [{ fieldID: 7, name: 'input', type: 'Model', typeName: 'CreateInput' }],
+			types: {
+				CreateInput: {
+					name: { fieldID: 1, type: 'String' },
+					count: { fieldID: 2, type: 'Int' },
+					child: { fieldID: 3, type: 'Model', typeName: 'Child', nullable: true },
+					tags: { fieldID: 4, type: 'String', isList: true },
+				},
+				Child: { enabled: { fieldID: 1, type: 'Boolean' } },
+			},
+		}
+		const body = encodeBinaryBody(meta, {
+			input: { name: 'é', count: -2, child: { enabled: true }, tags: ['a', 'bc'] },
+		})
+		expect(Array.from(body)).toEqual([
+			9, 0, 7, 21,
+			2, 1, 2, 0xc3, 0xa9, 2, 3, 3, 1,
+			0, 1, 1, 0, 4, 2, 1, 97, 2, 98, 99, 0,
+			0,
+		])
+	})
+
+	it('encodes structured param lists and rejects incomplete model metadata', () => {
+		const meta = {
+			id: 3,
+			params: [{ fieldID: 2, name: 'items', type: 'Model', typeName: 'Item', isList: true }],
+			types: { Item: { value: { fieldID: 1, type: 'Int' } } },
+		}
+		expect(Array.from(encodeBinaryBody(meta, { items: [{ value: 1 }, { value: 2 }] }))).toEqual([
+			3, 0, 2, 2, 4, 0, 1, 2, 0, 4, 0, 1, 4, 0, 0,
+		])
+		expect(() => encodeParam(new Encoder(), { fieldID: 1, type: 'Model', typeName: 'Missing' }, {}, {}))
+			.toThrow('missing schema for structured type Missing')
 	})
 
 	it('accepts only RFC3339 strings for DateTime', () => {
@@ -166,6 +204,13 @@ describe('FetchTransport binary field selection', () => {
     expect(() => encodeBinaryBody(meta, { $select: 'missing' })).toThrow('unknown selected field')
     expect(() => encodeBinaryBody(meta, { $select: 'id{name}' })).toThrow('does not support nested selection')
     expect(() => encodeBinaryBody(meta, { $select: 'id,id' })).toThrow('duplicate field')
+  })
+
+  it('requires $select for structured responses only', () => {
+    const structured = { id: 1, fields: { id: { fieldID: 1 } } }
+    expect(() => encodeBinaryBody(structured)).toThrow('$select is required')
+    expect(() => encodeBinaryBody(structured, { $select: '   ' })).toThrow('$select is required')
+    expect(Array.from(encodeBinaryBody({ id: 2 }))).toEqual([2, 0, 0])
   })
 
   it('refreshes an expired token once in binary mode', async () => {

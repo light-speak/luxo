@@ -13,11 +13,13 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/light-speak/luxo/pkg/lux/i18n"
 	"github.com/light-speak/luxo/pkg/lux/schema"
+	"github.com/light-speak/luxo/pkg/lux/selection"
 )
 
 // Pre-allocated response framing bytes — avoids per-request []byte conversion.
@@ -39,6 +41,10 @@ type MetricsRecorder interface {
 	Record(apiName string, duration time.Duration, isError bool)
 }
 
+type metricsRecorderState struct {
+	recorder MetricsRecorder
+}
+
 // TraceRecord contains the request data needed by an optional trace exporter.
 type TraceRecord struct {
 	TraceID       string
@@ -48,11 +54,19 @@ type TraceRecord struct {
 	ClientName    string
 	ClientVersion string
 	Timestamp     time.Time
+	Spans         string
+	Selection     string
+	HeadSampled   bool
 }
 
 // TraceRecorder is implemented by metrics collectors that also export traces.
 type TraceRecorder interface {
 	RecordTrace(record TraceRecord)
+}
+
+// TraceSampler decides whether a request should collect detailed production spans.
+type TraceSampler interface {
+	ShouldTrace(traceID string) bool
 }
 
 // Router maps API names to handlers and serves the /luvia endpoint.
@@ -72,7 +86,8 @@ type Router struct {
 	WSAllowAllOrigins      bool                                                   // explicitly allow every WebSocket origin
 	IdentityExtractor      func(context.Context) any                              // extracts authenticated stream identity from request context
 	InternalRequestContext func(context.Context, string) (context.Context, error) // verifies RPC bearer metadata and enriches context
-	metrics                MetricsRecorder                                        // optional metrics collector
+	metrics                atomic.Pointer[metricsRecorderState]                   // optional metrics collector
+	debugTraceSecret       string
 	requestLogging         bool
 	debugParamShape        bool
 	logWriter              io.Writer
@@ -87,7 +102,22 @@ type RouterOptions struct {
 
 // SetMetricsCollector configures request metrics collection.
 func (rt *Router) SetMetricsCollector(mc MetricsRecorder) {
-	rt.metrics = mc
+	if mc == nil {
+		rt.metrics.Store(nil)
+		return
+	}
+	rt.metrics.Store(&metricsRecorderState{recorder: mc})
+}
+
+// RequestMetricsRecorder returns the current request metrics sink.
+// Callers retain the returned recorder for one request so configuration changes
+// cannot split a measurement across different collectors.
+func (rt *Router) RequestMetricsRecorder() MetricsRecorder {
+	state := rt.metrics.Load()
+	if state == nil {
+		return nil
+	}
+	return state.recorder
 }
 
 // NewRouter creates an empty router.
@@ -183,6 +213,11 @@ func (rt *Router) SetDevMode(dev bool) {
 	rt.devMode = dev
 }
 
+// SetDebugTraceKey configures the secret required for detailed production tracing.
+func (rt *Router) SetDebugTraceKey(key string) {
+	rt.debugTraceSecret = key
+}
+
 // ExportHandlers returns the handler map for sharing with RPC server.
 func (rt *Router) ExportHandlers() map[string]HandlerFunc {
 	return rt.handlers
@@ -202,6 +237,12 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rt.handleIntrospection(w, r)
 		return
 	}
+	r = rt.enableTrace(r)
+	if trace := DebugTrace(r.Context()); trace != nil && trace.responseEnvelope {
+		capture := newDebugResponseWriter(w)
+		defer capture.flush(trace)
+		w = capture
+	}
 
 	binaryMode := r.Header.Get("X-Luxo-Mode") == "binary"
 
@@ -210,20 +251,27 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	debugTrace := DebugTrace(r.Context())
+	decodeStarted := debugTrace.Start()
 	var req *Request
 	var err error
 	if binaryMode {
+		req = GetRequest()
+		defer PutRequest(req)
 		body, bp, readErr := readBody(r.Body)
 		if readErr != nil {
 			putBody(bp)
+			debugTrace.Finish(decodeStarted, DebugSpanMeta{Name: "request.decode", Category: "gateway"})
+			writeDebugTraceHeaders(w.Header(), debugTrace)
 			rt.writeAppError(w, r, true, errors.New("BadRequest", http.StatusBadRequest, readErr.Error()))
 			return
 		}
 		defer putBody(bp)
-		req, err = rt.Registry.ParseBinaryRequest(body)
+		err = rt.Registry.ParseBinaryRequestInto(body, req)
 	} else {
 		req, err = ParseRequest(r)
 	}
+	debugTrace.Finish(decodeStarted, DebugSpanMeta{Name: "request.decode", Category: "gateway"})
 	if err != nil {
 		if rt.requestLogging {
 			mode := "json"
@@ -235,6 +283,7 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				colorRed, colorReset, mode,
 				colorRed, err.Error(), colorReset)
 		}
+		writeDebugTraceHeaders(w.Header(), debugTrace)
 		rt.writeAppError(w, r, binaryMode, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
 		return
 	}
@@ -242,38 +291,44 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	fn, ok := rt.handlers[req.API]
 	if !ok {
+		writeDebugTraceHeaders(w.Header(), debugTrace)
 		rt.writeAppError(w, r, binaryMode, errors.NotFound.WithData(errors.ResourceError{Resource: req.API}))
 		return
 	}
 
-	// Force handler to always write Luxo binary.
-	// Luvia converts to JSON if client wants JSON.
-	req.BinaryMode = true
-
+	prepareStarted := debugTrace.Start()
 	if err = rt.prepareRequest(req, binaryMode); err != nil {
+		debugTrace.Finish(prepareStarted, DebugSpanMeta{Name: "request.prepare", Category: "gateway", Operation: req.API})
+		writeDebugTraceHeaders(w.Header(), debugTrace)
 		rt.writeAppError(w, r, binaryMode, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
 		return
 	}
+	debugTrace.Finish(prepareStarted, DebugSpanMeta{Name: "request.prepare", Category: "gateway", Operation: req.API})
 
 	// Get pooled buffer, set on request, handler writes directly
 	buf := GetBuf()
 	req.Buf = buf
 
-	observed := rt.metrics != nil || rt.requestLogging
+	metrics := rt.RequestMetricsRecorder()
+	observed := metrics != nil || rt.requestLogging || debugTrace != nil
 	var start time.Time
 	if observed {
 		start = time.Now()
 	}
-	herr := rt.callHandler(fn, r.Context(), req)
+	handlerCtx, handlerSpan := debugTrace.StartSpan(r.Context(), DebugSpanMeta{
+		Name: "handler.execute", Category: "gateway", Operation: req.API,
+	})
+	herr := rt.callHandler(fn, handlerCtx, req)
 	var duration time.Duration
 	if observed {
 		duration = time.Since(start)
 	}
+	debugTrace.FinishSpan(handlerSpan)
 
-	if rt.metrics != nil {
-		rt.metrics.Record(req.API, duration, herr != nil)
-		if recorder, ok := rt.metrics.(TraceRecorder); ok {
-			recorder.RecordTrace(newTraceRecord(r, req.API, start, duration, herr))
+	if metrics != nil {
+		metrics.Record(req.API, duration, herr != nil)
+		if recorder, ok := metrics.(TraceRecorder); ok {
+			recorder.RecordTrace(newTraceRecord(r, req.API, req.Select, start, duration, herr))
 		}
 	}
 
@@ -284,10 +339,19 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			rt.logParamStructure(req)
 		}
 		PutBuf(buf)
+		writeDebugTraceHeaders(w.Header(), debugTrace)
 		rt.writeAppError(w, r, binaryMode, herr)
 		return
 	}
 	rt.logRequest(req.API, duration, nil)
+
+	encodeStarted := debugTrace.Start()
+	var jsonBody []byte
+	if !binaryMode {
+		jsonBody = rt.convertBinaryToJSON(req.API, buf.B)
+	}
+	debugTrace.Finish(encodeStarted, DebugSpanMeta{Name: "response.encode", Category: "gateway", Operation: req.API})
+	writeDebugTraceHeaders(w.Header(), debugTrace)
 
 	if binaryMode {
 		// Client wants binary: handler wrote Luxo binary, pass through
@@ -300,11 +364,40 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write(jsonDataPrefix)
-		w.Write(rt.convertBinaryToJSON(req.API, buf.B))
+		w.Write(jsonBody)
 		w.Write(jsonDataSuffix)
 	}
 
 	PutBuf(buf)
+}
+
+func (rt *Router) enableDebugTrace(r *http.Request) *http.Request {
+	if !debugTraceRequested(r.Header.Get(DebugTraceRequestHeader)) {
+		return r
+	}
+	authorized := rt.devMode
+	if !authorized && rt.debugTraceSecret != "" {
+		authorized = subtle.ConstantTimeCompare([]byte(r.Header.Get(DebugTraceKeyHeader)), []byte(rt.debugTraceSecret)) == 1
+	}
+	if !authorized {
+		return r
+	}
+	ctx, trace := WithDebugTrace(r.Context(), TraceID(r.Context()))
+	trace.responseEnvelope = debugTraceRequested(r.Header.Get(DebugTraceEnvelopeHeader))
+	return r.WithContext(ctx)
+}
+
+func (rt *Router) enableTrace(r *http.Request) *http.Request {
+	r = rt.enableDebugTrace(r)
+	if DebugTrace(r.Context()) != nil {
+		return r
+	}
+	sampler, ok := rt.RequestMetricsRecorder().(TraceSampler)
+	if !ok || !sampler.ShouldTrace(TraceID(r.Context())) {
+		return r
+	}
+	ctx, _ := WithSampledTrace(r.Context(), TraceID(r.Context()))
+	return r.WithContext(ctx)
 }
 
 func directClientKey(remoteAddr string) string {
@@ -316,6 +409,9 @@ func directClientKey(remoteAddr string) string {
 }
 
 func (rt *Router) prepareRequest(req *Request, binaryMode bool) error {
+	if err := rt.validatePublicSelection(req, binaryMode); err != nil {
+		return err
+	}
 	if err := rt.applyJSONSelection(req, binaryMode); err != nil {
 		return err
 	}
@@ -323,6 +419,26 @@ func (rt *Router) prepareRequest(req *Request, binaryMode bool) error {
 		return nil
 	}
 	return rt.Registry.prepareJSONRequest(req)
+}
+
+func (rt *Router) validatePublicSelection(req *Request, binaryMode bool) error {
+	if req.Internal || rt.Schema == nil {
+		return nil
+	}
+	apiMeta := rt.Schema.APIs[req.API]
+	if apiMeta == nil || schemaObject(rt.Schema, apiMeta.ReturnType) == nil {
+		return nil
+	}
+	if binaryMode {
+		if len(req.FieldMask) == 0 {
+			return fmt.Errorf("$select is required for structured response %s", apiMeta.ReturnType)
+		}
+		return nil
+	}
+	if len(req.Select) == 0 {
+		return fmt.Errorf("$select is required for structured response %s", apiMeta.ReturnType)
+	}
+	return nil
 }
 
 func (rt *Router) applyJSONSelection(req *Request, binaryMode bool) error {
@@ -344,7 +460,7 @@ func (rt *Router) applyJSONSelection(req *Request, binaryMode bool) error {
 	return err
 }
 
-func newTraceRecord(r *http.Request, apiName string, startedAt time.Time, duration time.Duration, err error) TraceRecord {
+func newTraceRecord(r *http.Request, apiName string, selected []*selection.Field, startedAt time.Time, duration time.Duration, err error) TraceRecord {
 	statusCode := http.StatusOK
 	if err != nil {
 		statusCode = http.StatusInternalServerError
@@ -353,7 +469,7 @@ func newTraceRecord(r *http.Request, apiName string, startedAt time.Time, durati
 			statusCode = appErr.Code
 		}
 	}
-	return TraceRecord{
+	record := TraceRecord{
 		TraceID:       TraceID(r.Context()),
 		APIName:       apiName,
 		Duration:      duration,
@@ -362,6 +478,12 @@ func newTraceRecord(r *http.Request, apiName string, startedAt time.Time, durati
 		ClientVersion: r.Header.Get("X-Luxo-Client-Version"),
 		Timestamp:     startedAt.UTC(),
 	}
+	if trace := DebugTrace(r.Context()); trace != nil {
+		record.Spans = DebugTraceJSON(trace.Snapshot())
+		record.Selection = selection.Format(selected)
+		record.HeadSampled = trace.Sampled()
+	}
+	return record
 }
 
 // handleIntrospection serves the schema as JSON for SDK generation.

@@ -50,8 +50,9 @@ function toUnixSeconds(value: unknown): number {
 /** Encode a single API param (scalar or list) to binary using the schema metadata. */
 export function encodeParam(
   enc: Encoder,
-	pm: { fieldID: number; type: string; isList?: boolean; nullable?: boolean },
+	pm: ParamEncodingSchema,
   v: unknown,
+	types: Record<string, Record<string, SelectionFieldSchema>> = {},
 ): void {
 	enc.writeVarint(pm.fieldID)
 	if (pm.nullable) {
@@ -65,6 +66,7 @@ export function encodeParam(
 	}
   if (pm.isList) {
     const arr = v as unknown[]
+		if (!Array.isArray(v)) throw new LuxoError('ConfigError', 0, `parameter field ${pm.fieldID} must be an array`)
 		enc.writeVarint(arr.length)
     switch (pm.type) {
       case 'Int': case 'Duration':
@@ -83,6 +85,8 @@ export function encodeParam(
 		for (const value of arr) enc.writeBytes(toUint8Array(value)); break
 	  case 'JSON':
 		for (const value of arr) enc.writeBytes(encodeJSONParam(value)); break
+	  case 'Model':
+		for (const value of arr) writeStructuredParam(enc, pm, value, types); break
 	  default:
 		throw new LuxoError('ConfigError', 0, `unsupported binary list param type: ${pm.type}`)
     }
@@ -106,9 +110,133 @@ export function encodeParam(
 	  enc.writeBytes(toUint8Array(v)); break
 	case 'JSON':
 	  enc.writeBytes(encodeJSONParam(v)); break
+	case 'Model':
+	  writeStructuredParam(enc, pm, v, types); break
 	default:
 	  throw new LuxoError('ConfigError', 0, `unsupported binary param type: ${pm.type}`)
   }
+}
+
+type ParamEncodingSchema = Omit<ParamSchema, 'name'> & { name?: string }
+
+function writeStructuredParam(
+	enc: Encoder,
+	meta: Pick<ParamSchema, 'typeName'>,
+	value: unknown,
+	types: Record<string, Record<string, SelectionFieldSchema>>,
+): void {
+	const typeName = meta.typeName
+	const fields = typeName ? types[typeName] : undefined
+	if (!typeName || !fields) {
+		throw new LuxoError('ConfigError', 0, `missing schema for structured type ${typeName ?? '<unknown>'}`)
+	}
+	enc.writeDelimited(message => encodeStructuredMessage(message, value, fields, types, typeName))
+}
+
+function encodeStructuredMessage(
+	enc: Encoder,
+	value: unknown,
+	fields: Record<string, SelectionFieldSchema>,
+	types: Record<string, Record<string, SelectionFieldSchema>>,
+	typeName: string,
+): void {
+	if (!isRecord(value)) throw new LuxoError('ConfigError', 0, `${typeName} must be an object`)
+	enc.writeVarint(structuredArenaLength(value, fields))
+	for (const [name, field] of Object.entries(fields)) {
+		const fieldValue = value[name]
+		if (fieldValue === undefined) continue
+		writeStructuredField(enc, name, field, fieldValue, types)
+	}
+	enc.writeEnd()
+}
+
+function structuredArenaLength(value: Record<string, unknown>, fields: Record<string, SelectionFieldSchema>): number {
+	let length = 0
+	for (const [name, field] of Object.entries(fields)) {
+		const fieldValue = value[name]
+		if (fieldValue == null || field.isList || (field.type !== 'String' && field.type !== 'Enum')) continue
+		if (typeof fieldValue !== 'string') {
+			throw new LuxoError('ConfigError', 0, `${name} must be a string`)
+		}
+		length += utf8Length(fieldValue)
+	}
+	return length
+}
+
+function utf8Length(value: string): number {
+	let length = 0
+	for (let i = 0; i < value.length; i++) {
+		const code = value.charCodeAt(i)
+		if (code < 0x80) length++
+		else if (code < 0x800) length += 2
+		else if (code >= 0xd800 && code <= 0xdbff && i + 1 < value.length &&
+			value.charCodeAt(i + 1) >= 0xdc00 && value.charCodeAt(i + 1) <= 0xdfff) {
+			length += 4
+			i++
+		} else length += 3
+	}
+	return length
+}
+
+function writeStructuredField(
+	enc: Encoder,
+	name: string,
+	field: SelectionFieldSchema,
+	value: unknown,
+	types: Record<string, Record<string, SelectionFieldSchema>>,
+): void {
+	if (!field.type) throw new LuxoError('ConfigError', 0, `missing wire type for field ${name}`)
+	enc.writeVarint(field.fieldID)
+	if (field.nullable) {
+		if (value === null) {
+			enc.writeBool(false)
+			return
+		}
+		enc.writeBool(true)
+	} else if (value === null) {
+		throw new LuxoError('ConfigError', 0, `${name} is not nullable`)
+	}
+	if (field.isList) {
+		if (!Array.isArray(value)) throw new LuxoError('ConfigError', 0, `${name} must be an array`)
+		enc.writeVarint(value.length)
+		for (const item of value) writeStructuredValue(enc, field, item, types)
+		return
+	}
+	writeStructuredValue(enc, field, value, types)
+}
+
+function writeStructuredValue(
+	enc: Encoder,
+	field: SelectionFieldSchema,
+	value: unknown,
+	types: Record<string, Record<string, SelectionFieldSchema>>,
+): void {
+	switch (field.type) {
+		case 'Int': case 'Duration': enc.writeSvarint(value as number); return
+		case 'Float': enc.writeFixed64(value as number); return
+		case 'String': case 'Enum': case 'Decimal': enc.writeString(value as string); return
+		case 'Boolean': enc.writeBool(value as boolean); return
+		case 'UUID': enc.writeUUID(value as string); return
+		case 'DateTime': enc.writeSvarint(toUnixSeconds(value)); return
+		case 'Bytes': enc.writeBytes(toUint8Array(value)); return
+		case 'JSON': enc.writeBytes(encodeJSONParam(value)); return
+		case 'Model': writeNestedStructuredValue(enc, field, value, types); return
+		default: throw new LuxoError('ConfigError', 0, `unsupported structured field type: ${field.type}`)
+	}
+}
+
+function writeNestedStructuredValue(
+	enc: Encoder,
+	field: SelectionFieldSchema,
+	value: unknown,
+	types: Record<string, Record<string, SelectionFieldSchema>>,
+): void {
+	const typeName = field.typeName
+	const nestedFields = typeName ? types[typeName] : undefined
+	if (!typeName || !nestedFields) {
+		throw new LuxoError('ConfigError', 0, `missing schema for structured type ${typeName ?? '<unknown>'}`)
+	}
+	encodeStructuredMessage(enc, value, nestedFields, types, typeName)
 }
 
 function encodeJSONParam(value: unknown): Uint8Array {
@@ -128,14 +256,26 @@ function toUint8Array(value: unknown): Uint8Array {
 /** API schema metadata for binary encoding */
 export interface APISchema {
   id: number
-	params?: Array<{ fieldID: number; name: string; type: string; isList?: boolean; nullable?: boolean }>
+	params?: ParamSchema[]
   fields?: Record<string, SelectionFieldSchema>
   types?: Record<string, Record<string, SelectionFieldSchema>>
 }
 
+export interface ParamSchema {
+	fieldID: number
+	name: string
+	type: string
+	typeName?: string
+	isList?: boolean
+	nullable?: boolean
+}
+
 export interface SelectionFieldSchema {
   fieldID: number
+	type?: string
   typeName?: string
+	isList?: boolean
+	nullable?: boolean
 }
 
 interface SelectedField {
@@ -282,10 +422,13 @@ function isFilterValue(value: unknown): value is string | number | boolean {
 
 export function writeFieldMask(enc: Encoder, meta: APISchema, params?: Record<string, unknown>): void {
   const select = params?.$select
-  if (typeof select !== 'string' || select.trim() === '' || !meta.fields) {
+	if (!meta.fields || Object.keys(meta.fields).length === 0) {
     enc.writeVarint(0)
     return
   }
+	if (typeof select !== 'string' || select.trim() === '') {
+		throw new LuxoError('ConfigError', 0, '$select is required for structured responses')
+	}
   const selected = new SelectionParser(select).parse()
   const mask = encodeSelectionNode(selected, meta.fields, meta.types ?? {})
   enc.writeVarint(mask.length)
@@ -300,7 +443,7 @@ export function encodeBinaryBody(meta: APISchema, params?: Record<string, unknow
     for (const param of meta.params) {
       const value = params[param.name]
 		if (value === undefined) continue
-      encodeParam(enc, param, value)
+      encodeParam(enc, param, value, meta.types)
     }
   }
   if (params && '$filters' in params) encodeFilters(enc, params.$filters)

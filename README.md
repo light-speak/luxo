@@ -237,10 +237,15 @@ getUser(1) {
 
 Client selects fields → API serializes only those → SQL queries only those. End to end.
 
-Generated SDK output models preserve field presence exactly: unselected, selected
-`null`, or selected value. Decoders never fabricate zero values for omitted fields.
-Input DTOs remain strict; if one schema type is used in both directions, codegen
-emits `Foo` for selected output and `FooInput` for input.
+Every public API returning a structured value requires a non-empty `$select`;
+an omitted selection is a protocol error rather than an implicit full-table
+projection. The Vite analyzer normally injects the selection at compile time
+for generated one-shot calls and stream subscription callbacks. For escaped
+or dynamic usage it emits an explicit safe projection, while raw
+transport callers must provide `$select` themselves. Explicit selections return
+`Foo<true>` and preserve field presence exactly: unselected, selected `null`, or
+selected value. Input DTOs remain strict; shared input/output types generate
+`Foo` and `FooInput` separately.
 
 ### Real-time Streams
 
@@ -282,6 +287,26 @@ luxo run
 **Luvia is always on.** Embedded mode runs every module and the gateway in one process. Cluster mode uses generated per-module service binaries plus a generated gateway; RPC routing and federation loaders come from the same analyzed schema, without handwritten transport clients.
 
 JSON and Luxo Binary are both production transports. HTTP clients select them through the SDK transport mode or `X-Luxo-Mode: json|binary`; WebSocket and native RPC use their canonical binary framing. `APP_ENV` never silently changes the wire contract.
+
+### Request and SQL Tracing
+
+Luxo traces a request as an execution DAG across the gateway, services,
+DataLoaders, and databases. An active Studio Playground debug request carries
+the project debug key and explicitly opts into details. PostgreSQL then records
+pool wait, operation, resource, timing, argument count, affected rows, and error
+code. SQL text is stripped of regular and nested comments, has string,
+dollar-quoted, and numeric literals redacted, and is capped at 4 KiB. Argument
+values and database credentials never enter a trace.
+
+Ordinary production requests have no trace session: the database hot path only
+performs only constant-time context lookups, reads no clock, constructs no metadata, and allocates
+nothing. Samples selected by `LUXO_TRACE_SAMPLE_RATE` retain only a normalized
+SQL-shape fingerprint and structural metadata; comments, literal values, and
+parameter ordinals do not affect that aggregation key. Samples never construct
+or persist SQL text. Detailed traces use a streaming, versioned Luxo Binary
+response envelope instead of HTTP headers, so the gateway does not buffer or
+copy the business body. Traces are capped at 128 spans with explicit truncation
+metadata.
 
 ### Wire Compatibility
 

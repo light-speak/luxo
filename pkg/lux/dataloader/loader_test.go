@@ -3,16 +3,17 @@ package dataloader
 import (
 	"context"
 	"fmt"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/light-speak/luxo/pkg/lux/selection"
 )
 
 func TestLoadSingle(t *testing.T) {
 	var calls int32
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		atomic.AddInt32(&calls, 1)
 		result := make(map[int]string)
 		for _, k := range keys {
@@ -30,11 +31,70 @@ func TestLoadSingle(t *testing.T) {
 	}
 }
 
+func TestLoadPreservesCallerContext(t *testing.T) {
+	type contextKey string
+	const key contextKey = "request"
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
+		return map[int]string{keys[0]: ctx.Value(key).(string)}, nil
+	}, DefaultConfig())
+
+	value, err := loader.Load(context.WithValue(context.Background(), key, "trace-1"), 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value != "trace-1" {
+		t.Fatalf("batch context value = %q", value)
+	}
+}
+
+func TestLoadSeparatesConcurrentRequestScopes(t *testing.T) {
+	type contextKey string
+	const key contextKey = "request"
+	var calls atomic.Int32
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
+		calls.Add(1)
+		result := make(map[int]string, len(keys))
+		for _, item := range keys {
+			result[item] = ctx.Value(key).(string)
+		}
+		return result, nil
+	}, Config{Wait: 10 * time.Millisecond, MaxBatch: 100})
+
+	firstBase, cancelFirst := context.WithCancel(context.Background())
+	defer cancelFirst()
+	secondBase, cancelSecond := context.WithCancel(context.Background())
+	defer cancelSecond()
+	contexts := []context.Context{
+		context.WithValue(firstBase, key, "first"),
+		context.WithValue(secondBase, key, "second"),
+	}
+	want := []string{"first", "second"}
+	got := make([]string, len(contexts))
+	var wg sync.WaitGroup
+	for i := range contexts {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			got[index], _ = loader.Load(contexts[index], index+1, nil)
+		}(i)
+	}
+	wg.Wait()
+
+	if calls.Load() != 2 {
+		t.Fatalf("batch calls = %d, want 2 isolated request scopes", calls.Load())
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("result %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 func TestLoadBatching(t *testing.T) {
 	var calls int32
 	var batchSize int32
 
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		atomic.AddInt32(&calls, 1)
 		atomic.StoreInt32(&batchSize, int32(len(keys)))
 		result := make(map[int]string)
@@ -69,10 +129,9 @@ func TestLoadBatching(t *testing.T) {
 }
 
 func TestLoadFieldsMerge(t *testing.T) {
-	var gotFields []string
+	var gotFields []*selection.Field
 
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
-		sort.Strings(fields)
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		gotFields = fields
 		result := make(map[int]string)
 		for _, k := range keys {
@@ -86,28 +145,27 @@ func TestLoadFieldsMerge(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		loader.Load(context.Background(), 1, []string{"title"})
+		loader.Load(context.Background(), 1, []*selection.Field{{Name: "project", Children: []*selection.Field{{Name: "id"}}}})
 	}()
 	go func() {
 		defer wg.Done()
-		loader.Load(context.Background(), 2, []string{"title", "content"})
+		loader.Load(context.Background(), 2, []*selection.Field{{Name: "project", Children: []*selection.Field{{Name: "name"}}}, {Name: "title"}})
 	}()
 	wg.Wait()
 
-	// Fields should be union: [content, title]
+	// Nested selections must be merged rather than flattened or overwritten.
 	if len(gotFields) != 2 {
 		t.Fatalf("expected 2 merged fields, got %d: %v", len(gotFields), gotFields)
 	}
-	sort.Strings(gotFields)
-	if gotFields[0] != "content" || gotFields[1] != "title" {
-		t.Errorf("merged fields = %v, want [content, title]", gotFields)
+	if got := selection.Format(gotFields); got != "project{id,name},title" && got != "project{name,id},title" {
+		t.Errorf("merged fields = %q", got)
 	}
 }
 
 func TestLoadNoFields(t *testing.T) {
-	var gotFields []string
+	var gotFields []*selection.Field
 
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		gotFields = fields
 		return map[int]string{1: "ok"}, nil
 	}, DefaultConfig())
@@ -119,10 +177,33 @@ func TestLoadNoFields(t *testing.T) {
 	}
 }
 
+func TestLoadSelectAllDominatesPartialSelection(t *testing.T) {
+	var gotFields []*selection.Field
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
+		gotFields = fields
+		return map[int]string{1: "one", 2: "two"}, nil
+	}, Config{Wait: 10 * time.Millisecond, MaxBatch: 100})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = loader.Load(context.Background(), 1, nil)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = loader.Load(context.Background(), 2, []*selection.Field{{Name: "name"}})
+	}()
+	wg.Wait()
+	if gotFields != nil {
+		t.Fatalf("select-all must dominate partial selection: %s", selection.Format(gotFields))
+	}
+}
+
 func TestLoadMaxBatch(t *testing.T) {
 	var calls int32
 
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		atomic.AddInt32(&calls, 1)
 		result := make(map[int]string)
 		for _, k := range keys {
@@ -149,7 +230,7 @@ func TestLoadMaxBatch(t *testing.T) {
 }
 
 func TestLoadError(t *testing.T) {
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		return nil, fmt.Errorf("db error")
 	}, DefaultConfig())
 
@@ -163,7 +244,7 @@ func TestLoadError(t *testing.T) {
 }
 
 func TestLoadMissingKey(t *testing.T) {
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		return map[int]string{}, nil // return empty — key not found
 	}, DefaultConfig())
 
@@ -177,7 +258,7 @@ func TestLoadMissingKey(t *testing.T) {
 }
 
 func TestLoadAll(t *testing.T) {
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		result := make(map[int]string)
 		for _, k := range keys {
 			result[k] = fmt.Sprintf("v%d", k)
@@ -185,7 +266,7 @@ func TestLoadAll(t *testing.T) {
 		return result, nil
 	}, DefaultConfig())
 
-	results, err := loader.LoadAll(context.Background(), []int{1, 2, 3}, []string{"name"})
+	results, err := loader.LoadAll(context.Background(), []int{1, 2, 3}, []*selection.Field{{Name: "name"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +279,7 @@ func TestLoadAll(t *testing.T) {
 }
 
 func TestLoadAllEmpty(t *testing.T) {
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		t.Fatal("should not be called for empty keys")
 		return nil, nil
 	}, DefaultConfig())
@@ -213,7 +294,7 @@ func TestLoadAllEmpty(t *testing.T) {
 }
 
 func TestLoadAllError(t *testing.T) {
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		return nil, fmt.Errorf("batch error")
 	}, DefaultConfig())
 
@@ -226,7 +307,7 @@ func TestLoadAllError(t *testing.T) {
 func TestLoadDedupKeys(t *testing.T) {
 	var gotKeys []int
 
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		gotKeys = keys
 		result := make(map[int]string)
 		for _, k := range keys {
@@ -253,7 +334,7 @@ func TestLoadDedupKeys(t *testing.T) {
 }
 
 func TestLoadContextCancel(t *testing.T) {
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		time.Sleep(50 * time.Millisecond) // slow query
 		return map[int]string{1: "ok"}, nil
 	}, Config{Wait: 5 * time.Millisecond, MaxBatch: 100})
@@ -273,7 +354,7 @@ func TestLoadContextCancel(t *testing.T) {
 func TestLoadContextCancelDoesNotKillOthers(t *testing.T) {
 	var calls int32
 
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		atomic.AddInt32(&calls, 1)
 		result := make(map[int]string)
 		for _, k := range keys {
@@ -331,7 +412,7 @@ func TestDefaultConfig(t *testing.T) {
 
 func TestNewZeroWaitUsesDefault(t *testing.T) {
 	// cfg.Wait <= 0 should fall back to default 2ms
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		return map[int]string{1: "ok"}, nil
 	}, Config{Wait: 0, MaxBatch: 10})
 
@@ -341,7 +422,7 @@ func TestNewZeroWaitUsesDefault(t *testing.T) {
 }
 
 func TestNewNegativeWaitUsesDefault(t *testing.T) {
-	loader := New(func(ctx context.Context, keys []int, fields []string) (map[int]string, error) {
+	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		return map[int]string{1: "ok"}, nil
 	}, Config{Wait: -5 * time.Millisecond, MaxBatch: 10})
 

@@ -1,4 +1,5 @@
 import type { Plugin } from 'vite'
+import { resolve } from 'node:path'
 import { analyzeAndTransform } from './analyzer'
 import { generateTypes } from './codegen'
 import type { LuxoSchema } from '@luxojs/client'
@@ -18,9 +19,14 @@ export interface LuxoPluginOptions {
 export function luxo(options: LuxoPluginOptions = {}): Plugin {
   let schema: LuxoSchema | null = null
   const outDir = options.outDir || 'src/luxo'
+  let generatedDir = resolve(outDir)
 
   return {
     name: 'luxo',
+
+    configResolved(config) {
+      generatedDir = resolve(config.root, outDir)
+    },
 
     async buildStart() {
       // Load schema from endpoint or local file
@@ -33,10 +39,10 @@ export function luxo(options: LuxoPluginOptions = {}): Plugin {
     },
 
     transform(code: string, id: string) {
-      // Only process .ts and .tsx files
-      if (!id.endsWith('.ts') && !id.endsWith('.tsx')) return null
-      if (id.includes('node_modules')) return null
-      if (id.includes('/luxo/')) return null // skip generated files
+      const sourceID = id.split('?', 1)[0]!.replaceAll('\\', '/')
+      if (!sourceID.endsWith('.ts') && !sourceID.endsWith('.tsx')) return null
+      if (sourceID.includes('/node_modules/')) return null
+      if (isInsideDirectory(sourceID, generatedDir)) return null
 
       if (!schema) return null
 
@@ -47,6 +53,11 @@ export function luxo(options: LuxoPluginOptions = {}): Plugin {
       return { code: result, map: null }
     },
   }
+}
+
+function isInsideDirectory(file: string, directory: string): boolean {
+  const normalizedDirectory = directory.replaceAll('\\', '/').replace(/\/$/, '')
+  return file === normalizedDirectory || file.startsWith(`${normalizedDirectory}/`)
 }
 
 async function loadSchema(options: LuxoPluginOptions): Promise<LuxoSchema | null> {

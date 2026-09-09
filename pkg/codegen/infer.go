@@ -402,13 +402,8 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, n)\n")
 
 	case "list":
-		if hasRels {
-			fmt.Fprintf(b, "\t\tcols := select%sSQLColumns(req.Select)\n", modelName)
-			writeInferredFKEnsure(b, rels)
-			fmt.Fprintf(b, "\t\tq := app.%s.Where(conds...).Select(cols...)\n", modelName)
-		} else {
-			fmt.Fprintf(b, "\t\tq := app.%s.Where(conds...).Select(select%sSQLColumns(req.Select)...)\n", modelName, modelName)
-		}
+		fmt.Fprintf(b, "\t\tcols := select%sSQLColumns(req.Select)\n", modelName)
+		fmt.Fprintf(b, "\t\tq := app.%s.Where(conds...).Select(cols...)\n", modelName)
 		if inf.OrderBy != "" {
 			order := str.ToSnakeCase(inf.OrderBy)
 			if inf.OrderDesc {
@@ -442,13 +437,8 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 		}
 
 	default: // get
-		if hasRels {
-			fmt.Fprintf(b, "\t\tcols := select%sSQLColumns(req.Select)\n", modelName)
-			writeInferredFKEnsure(b, rels)
-			fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(conds...).Select(cols...).First(ctx)\n", modelName)
-		} else {
-			fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(conds...).Select(select%sSQLColumns(req.Select)...).First(ctx)\n", modelName, modelName)
-		}
+		fmt.Fprintf(b, "\t\tcols := select%sSQLColumns(req.Select)\n", modelName)
+		fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(conds...).Select(cols...).First(ctx)\n", modelName)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		fmt.Fprintf(b, "\t\tif result == nil {\n\t\t\treturn errors.NotFound.WithData(errors.ResourceError{Resource: %q})\n\t\t}\n", modelName)
 		if hasRels {
@@ -461,19 +451,6 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 
 	fmt.Fprintf(b, "\t\treturn nil\n")
 	fmt.Fprintf(b, "\t}\n}\n\n")
-}
-
-// writeInferredFKEnsure writes ensureField calls for relation FK columns in inferred handlers.
-func writeInferredFKEnsure(b *strings.Builder, rels []Relation) {
-	seen := make(map[string]bool)
-	for _, rel := range rels {
-		col := str.ToSnakeCase(rel.LocalKey)
-		if seen[col] {
-			continue
-		}
-		seen[col] = true
-		fmt.Fprintf(b, "\t\tcols = ensureField(cols, %q)\n", col)
-	}
 }
 
 // writeZeroParamClause writes a zero-parameter clause (true/false/isNull/isNotNull).

@@ -316,6 +316,37 @@ func TestAPIContractMetadataSurvivesJSONRoundTrip(t *testing.T) {
 	}
 }
 
+func TestExtensionBeforeModelPreservesWireContract(t *testing.T) {
+	modelFile := &ast.File{
+		Name:   "origin/project/model.luxo",
+		Models: []*ast.ModelDecl{model("Project", field("id", "Int"))},
+	}
+	extensionFile := &ast.File{
+		Name: "origin/alert/rule.luxo",
+		Extends: []*ast.ExtendDecl{{
+			Name:   "Project",
+			Fields: []*ast.FieldDecl{field("alertRules", "AlertRule")},
+		}},
+	}
+	lf := New()
+	lf.Update([]*ast.File{modelFile, extensionFile})
+	extensionID := lf.Models["Project"].Fields["alertRules"]
+
+	reordered := []*ast.File{extensionFile, modelFile}
+	if changes := lf.BreakingChanges(reordered); hasBreakingPath(changes, "model Project.alertRules") {
+		t.Fatalf("file order produced a false breaking change: %v", changes)
+	}
+	lf.Update(reordered)
+	if got := lf.Models["Project"].Fields["alertRules"]; got != extensionID {
+		t.Fatalf("extension field ID changed from %d to %d", extensionID, got)
+	}
+	for _, reserved := range lf.Models["Project"].Reserved {
+		if reserved == extensionID {
+			t.Fatalf("live extension field ID %d was reserved", extensionID)
+		}
+	}
+}
+
 func TestBreakingChangeString(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -1023,6 +1054,71 @@ func TestUpdateAPIsWithCrud(t *testing.T) {
 	// updatePost should have "id" + field names
 	if lf.APIs["updatePost"].Params["id"] == 0 {
 		t.Errorf("updatePost should have id param")
+	}
+}
+
+func TestUpdateAPIsHonorsCrudOperationsAndExplicitOverrides(t *testing.T) {
+	m := model("AlertRule", field("name", "String"))
+	m.Directives = []*ast.Directive{{
+		Name: "crud",
+		Args: []*ast.NamedArg{{
+			Name:  "only",
+			Value: &ast.ListExpr{Items: []ast.Expr{&ast.Ident{Name: "get"}, &ast.Ident{Name: "list"}}},
+		}},
+	}}
+	file := &ast.File{
+		Name:   "alert.luxo",
+		Models: []*ast.ModelDecl{m},
+		APIs: []*ast.ApiDecl{
+			{Name: "updateAlertRule", Params: []*ast.ParamDecl{{Name: "ruleId", Type: &ast.TypeRef{Name: "Int"}}, {Name: "name", Type: &ast.TypeRef{Name: "String"}}}},
+			{Name: "deleteAlertRule", Params: []*ast.ParamDecl{{Name: "ruleId", Type: &ast.TypeRef{Name: "Int"}}}},
+		},
+	}
+	lf := New()
+	lf.Update([]*ast.File{file})
+	updateRuleID := lf.APIParamID("updateAlertRule", "ruleId")
+	deleteRuleID := lf.APIParamID("deleteAlertRule", "ruleId")
+
+	lf.Update([]*ast.File{file})
+	if got := lf.APIParamID("updateAlertRule", "ruleId"); got != updateRuleID {
+		t.Fatalf("update override param ID changed from %d to %d", updateRuleID, got)
+	}
+	if got := lf.APIParamID("deleteAlertRule", "ruleId"); got != deleteRuleID {
+		t.Fatalf("delete override param ID changed from %d to %d", deleteRuleID, got)
+	}
+	for _, name := range []string{"createAlertRule", "deleteAlertRules"} {
+		if lf.APIs[name] != nil {
+			t.Errorf("disabled CRUD API %s was registered", name)
+		}
+	}
+	if len(lf.APIs["updateAlertRule"].Reserved) != 0 || len(lf.APIs["deleteAlertRule"].Reserved) != 0 {
+		t.Fatalf("explicit overrides accumulated reserved params: update=%v delete=%v", lf.APIs["updateAlertRule"].Reserved, lf.APIs["deleteAlertRule"].Reserved)
+	}
+}
+
+func TestUpdateAPIsNeverReusesReservedParamIDs(t *testing.T) {
+	lf := New()
+	withParams := func(names ...string) []*ast.File {
+		params := make([]*ast.ParamDecl, 0, len(names))
+		for _, name := range names {
+			params = append(params, &ast.ParamDecl{Name: name, Type: &ast.TypeRef{Name: "String"}})
+		}
+		return files(nil, []*ast.ApiDecl{{Name: "search", Params: params}})
+	}
+	lf.Update(withParams("query", "cursor"))
+	removedID := lf.APIParamID("search", "cursor")
+	lf.Update(withParams("query"))
+	data, err := json.Marshal(lf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded := New()
+	if err := json.Unmarshal(data, reloaded); err != nil {
+		t.Fatal(err)
+	}
+	reloaded.Update(withParams("query", "limit"))
+	if got := reloaded.APIParamID("search", "limit"); got <= removedID {
+		t.Fatalf("new param ID %d reused or preceded reserved ID %d", got, removedID)
 	}
 }
 

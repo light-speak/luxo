@@ -188,6 +188,42 @@ func TestParseTypeGeneric(t *testing.T) {
 	}
 }
 
+func TestParseTypeFieldDocComments(t *testing.T) {
+	input := `/// Forecast response.
+type Forecast {
+  /// Median delivery time.
+  p50Weeks: Float
+  /// Risk classification.
+  risk: String
+}`
+	file := parse(t, input)
+	if len(file.Types) != 1 {
+		t.Fatalf("expected 1 type, got %d", len(file.Types))
+	}
+	typ := file.Types[0]
+	if typ.Doc != "Forecast response." {
+		t.Fatalf("type doc = %q", typ.Doc)
+	}
+	if len(typ.Fields) != 2 {
+		t.Fatalf("field count = %d, want 2", len(typ.Fields))
+	}
+	if typ.Fields[0].Doc != "Median delivery time." || typ.Fields[1].Doc != "Risk classification." {
+		t.Fatalf("field docs = %q, %q", typ.Fields[0].Doc, typ.Fields[1].Doc)
+	}
+}
+
+func TestParseTypeAllowsTrailingDocComment(t *testing.T) {
+	file := parse(t, `
+type Result {
+  value: String
+  /// Reserved for a future field.
+}
+`)
+	if len(file.Types) != 1 || len(file.Types[0].Fields) != 1 {
+		t.Fatalf("types = %+v, want one type with one field", file.Types)
+	}
+}
+
 func TestParseFn(t *testing.T) {
 	input := `fn encrypt(value: String): String @native`
 	file := parse(t, input)

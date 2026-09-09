@@ -2,14 +2,104 @@ package selection
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/light-speak/luxo/pkg/lux/str"
 )
+
+// Format returns the canonical compact representation of a selection tree.
+func Format(fields []*Field) string {
+	if len(fields) == 0 {
+		return ""
+	}
+	var builder strings.Builder
+	writeSelection(&builder, fields)
+	return builder.String()
+}
+
+func writeSelection(builder *strings.Builder, fields []*Field) {
+	for index, field := range fields {
+		if index > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(field.Name)
+		if len(field.Children) == 0 {
+			continue
+		}
+		builder.WriteByte('{')
+		writeSelection(builder, field.Children)
+		builder.WriteByte('}')
+	}
+}
 
 // Field represents a selected field, optionally with nested sub-selections.
 type Field struct {
 	Name     string
 	Children []*Field // nil = leaf field
+}
+
+// EnsureField returns fields with name selected. It preserves nil because nil
+// means all fields, and never mutates the caller-owned selection slice.
+func EnsureField(fields []*Field, name string) []*Field {
+	if fields == nil {
+		return nil
+	}
+	for _, field := range fields {
+		if field.Name == name {
+			return fields
+		}
+	}
+	result := make([]*Field, len(fields), len(fields)+1)
+	copy(result, fields)
+	return append(result, &Field{Name: name})
+}
+
+// Merge combines two partial selection trees without mutating either input.
+// A nil tree means all fields and therefore dominates a partial selection.
+func Merge(left, right []*Field) []*Field {
+	if left == nil || right == nil {
+		return nil
+	}
+	result := cloneFields(left)
+	positions := make(map[string]int, len(result))
+	for index, field := range result {
+		positions[field.Name] = index
+	}
+	for _, field := range right {
+		index, exists := positions[field.Name]
+		if !exists {
+			positions[field.Name] = len(result)
+			result = append(result, cloneField(field))
+			continue
+		}
+		result[index].Children = mergeChildren(result[index].Children, field.Children)
+	}
+	return result
+}
+
+func mergeChildren(left, right []*Field) []*Field {
+	if left == nil || right == nil {
+		return nil
+	}
+	return Merge(left, right)
+}
+
+func cloneFields(fields []*Field) []*Field {
+	if fields == nil {
+		return nil
+	}
+	result := make([]*Field, len(fields))
+	for index, field := range fields {
+		result[index] = cloneField(field)
+	}
+	return result
+}
+
+func cloneField(field *Field) *Field {
+	if field == nil {
+		return nil
+	}
+	return &Field{Name: field.Name, Children: cloneFields(field.Children)}
 }
 
 // SQLColumns extracts leaf field names as snake_case SQL column names.

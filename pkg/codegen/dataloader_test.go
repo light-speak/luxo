@@ -735,7 +735,7 @@ func TestGenerateDataLoaderDefaultLoadersDedupSeenMap(t *testing.T) {
 	code := string(src)
 
 	// PostUser loader should appear exactly once as a batch function inline
-	count := strings.Count(code, "func(ctx context.Context, keys []int64, fields []string) (map[int64]*User, error)")
+	count := strings.Count(code, "func(ctx context.Context, keys []int64, selected []*selection.Field) (map[int64]*User, error)")
 	if count != 1 {
 		t.Errorf("deduplicated default loader should appear once, got %d", count)
 	}
@@ -821,14 +821,54 @@ func TestGenerateDataLoaderExtendByPK(t *testing.T) {
 	if !strings.Contains(code, "enc.WriteFieldIntArray(1, keys)") {
 		t.Errorf("remote loader must encode keys as one canonical list param:\n%s", code)
 	}
-	if !strings.Contains(code, `fields = ensureField(fields, "id")`) {
+	if !strings.Contains(code, `fields = selection.EnsureField(fields, "id")`) {
 		t.Errorf("extend loader must always select its map key:\n%s", code)
 	}
-	if !strings.Contains(code, `case "phone": fieldMask = codec.FieldMaskSet(fieldMask, 2)`) {
-		t.Errorf("remote loader must translate requested fields to the wire mask:\n%s", code)
+	if !strings.Contains(code, `selectionMask, err := schema.SelectToFieldMask(fields, model, registry)`) {
+		t.Errorf("remote loader must preserve the recursive field selection:\n%s", code)
 	}
-	if !strings.Contains(code, "client.CallWithMask(42, selectionMask, enc.Bytes())") {
+	if !strings.Contains(code, `client.CallWithMaskTargetContext(ctx, luvia.BearerToken(ctx), 42, selectionMask, enc.Bytes(), rpc.TraceTarget{Operation: "svc:batchLoad:User", Field: "", Selection: selection.Format(fields), Dependency: api.TraceDependencySequential})`) {
 		t.Errorf("remote loader must forward its field selection:\n%s", code)
+	}
+}
+
+func TestGenerateRemoteLoadersUsesRPCForExternalBelongsToRelations(t *testing.T) {
+	generator := mustNewGenerator(t, GeneratorConfig{
+		Events: &EventContext{ModelModule: map[string]string{"Post": "post", "User": "user"}},
+		IDs: StableIDs{
+			APIs:        map[string]int{"svc:batchLoad:User": 42},
+			ModelFields: map[string]map[string]int{"User": {"id": 1, "username": 2}},
+		},
+	})
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/post/model.luxo",
+		Models: []*ast.ModelDecl{{
+			Name: "Post",
+			Fields: []*ast.FieldDecl{
+				{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+				{Name: "authorId", Type: &ast.TypeRef{Name: "Int"}},
+				{Name: "author", Type: &ast.TypeRef{Name: "User"}, Directives: []*ast.Directive{{Name: "by", Args: []*ast.NamedArg{
+					{Value: &ast.Ident{Name: "id"}},
+					{Value: &ast.Ident{Name: "authorId"}},
+				}}}},
+			},
+		}},
+		Extends: []*ast.ExtendDecl{{Name: "User", Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "username", Type: &ast.TypeRef{Name: "String"}},
+		}}},
+	}}}
+
+	code := string(generator.generateDataLoaderFile(result, "post_luxo", nil, nil))
+	_, remote, ok := strings.Cut(code, "func NewRemoteLoaders")
+	if !ok {
+		t.Fatalf("missing NewRemoteLoaders:\n%s", code)
+	}
+	if got := strings.Count(remote, `client := rpcClients["user"]`); got != 2 {
+		t.Fatalf("external relation and extend loaders must both use user RPC, got %d:\n%s", got, remote)
+	}
+	if strings.Contains(remote, `lux.BuildSelectSQL("users"`) {
+		t.Fatalf("external relation must not query a table in the local service database:\n%s", remote)
 	}
 }
 
@@ -972,9 +1012,9 @@ func TestGenerateDataLoaderRemoteNamedLoad(t *testing.T) {
 	checks := []string{
 		`client := rpcClients["user"]`,
 		"enc.WriteFieldStringArray(1, keys)",
-		"client.CallWithMask(71, selectionMask, enc.Bytes())",
-		`case "email": fieldMask = codec.FieldMaskSet(fieldMask, 2)`,
-		`case "name": fieldMask = codec.FieldMaskSet(fieldMask, 3)`,
+		`client.CallWithMaskTargetContext(ctx, luvia.BearerToken(ctx), 71, selectionMask, enc.Bytes(), rpc.TraceTarget{Operation: "svc:load:User:email", Selection: selection.Format(fields), Dependency: api.TraceDependencySequential})`,
+		`model := registry.Models["User"]`,
+		`selectionMask, err := schema.SelectToFieldMask(fields, model, registry)`,
 		"groupCount != uint64(len(keys))",
 		"codec.ReadBytes(resp, off)",
 	}
@@ -982,9 +1022,6 @@ func TestGenerateDataLoaderRemoteNamedLoad(t *testing.T) {
 		if !strings.Contains(code, check) {
 			t.Errorf("remote named loader missing %q:\n%s", check, code)
 		}
-	}
-	if strings.Contains(code, `case "password":`) {
-		t.Errorf("remote mask exposed a field absent from extend:\n%s", code)
 	}
 }
 

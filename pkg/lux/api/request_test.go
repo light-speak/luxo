@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/shopspring/decimal"
 )
 
@@ -540,6 +541,22 @@ func TestParamJSONWrongType(t *testing.T) {
 	err := req.ParamJSON("input", &target)
 	if err == nil {
 		t.Fatal("expected error for string as struct")
+	}
+}
+
+func TestInvalidParamPreservesStructuredDecodeCause(t *testing.T) {
+	cause := fmt.Errorf("codec: truncated varint at offset 3")
+	err := InvalidParam("input", cause)
+	appErr, ok := err.(*luxerrors.AppError)
+	if !ok {
+		t.Fatalf("error type = %T, want *errors.AppError", err)
+	}
+	paramErr, ok := appErr.Data.(luxerrors.ParamError)
+	if !ok {
+		t.Fatalf("error data type = %T, want errors.ParamError", appErr.Data)
+	}
+	if appErr.Code != http.StatusBadRequest || appErr.Cause != cause || paramErr.Param != "input" || paramErr.Error != cause.Error() {
+		t.Fatalf("invalid parameter error = %#v, data = %#v", appErr, paramErr)
 	}
 }
 

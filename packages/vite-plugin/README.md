@@ -27,12 +27,12 @@ export default defineConfig({
 
 ```ts
 // Source / 源代码
-const post = await client.getPost(1)
+const post = await client.getPost({ id: 1 })
 console.log(post.title)
 console.log(post.user.name)
 
 // Compiled / 编译后（自动注入）
-const post = await client.getPost(1, { $select: 'title,user{name}' })
+const post = await client.getPost({ id: 1, $select: 'title,user{name}' })
 ```
 
 ### Nested field tracking / 嵌套字段追踪
@@ -50,7 +50,10 @@ post.comments.forEach(c => {
 - Nested relations: `post.user.name`
 - Lambda params: `arr.forEach(item => item.field)`
 - Variable alias: `const author = post.user; author.name`
-- Destructuring: `const { name, email } = await client.getUser(1)`
+- Paginated and list results: `page.items.map(user => user.name)`
+- Stream callback payloads: `subscribeLiveUsers(params, user => user.name)`
+- Destructuring: `const { name, email } = await client.getUser({ id: 1 })`
+- Conservative escape fallback: dynamic or externally consumed results receive an explicit safe projection
 - Depth warning: nesting > 5 levels triggers compile-time warning
 
 ### Code generation / 代码生成
@@ -59,3 +62,11 @@ Generates typed client from schema introspection:
 - `types.ts` — Interfaces for all models, enums (union types), type declarations
 - `schema.ts` — API schema for binary transport
 - `client.ts` — Typed methods with async/await
+
+Calls without a manual `$select` expose the model's default projection:
+persistent fields are required and unloaded relations remain optional. A manual
+selection changes the return type to `Foo<true>`, preserving unselected,
+selected-null, and selected-value as distinct states. Automatic selection is
+also injected for generated stream subscriptions. If a result escapes static
+analysis, the plugin emits a bounded explicit projection instead of relying on
+implicit full-field behavior.
