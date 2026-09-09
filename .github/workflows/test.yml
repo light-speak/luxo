@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -230,10 +234,14 @@ jobs:
           TMPDIR: ${{ github.workspace }}/.tmp/test-tmp
         run: |
           set -euo pipefail
-          base_output="${GITHUB_WORKSPACE}/.tmp/benchmark-base.txt"
-          head_output="${GITHUB_WORKSPACE}/.tmp/benchmark-head.txt"
-          : > "${base_output}"
-          : > "${head_output}"
+          primary_base_output="${GITHUB_WORKSPACE}/.tmp/benchmark-primary-base.txt"
+          primary_head_output="${GITHUB_WORKSPACE}/.tmp/benchmark-primary-head.txt"
+          confirmation_base_output="${GITHUB_WORKSPACE}/.tmp/benchmark-confirmation-base.txt"
+          confirmation_head_output="${GITHUB_WORKSPACE}/.tmp/benchmark-confirmation-head.txt"
+          : > "${primary_base_output}"
+          : > "${primary_head_output}"
+          : > "${confirmation_base_output}"
+          : > "${confirmation_head_output}"
           run_package() {
             local source_root="$1"
             local binary_root="$2"
@@ -251,7 +259,14 @@ jobs:
                 -test.cpu=2
             ) >> "${output}"
           }
-          for sample in {1..10}; do
+          for sample in {1..20}; do
+            if (( (sample - 1) % 4 < 2 )); then
+              base_output="${primary_base_output}"
+              head_output="${primary_head_output}"
+            else
+              base_output="${confirmation_base_output}"
+              head_output="${confirmation_head_output}"
+            fi
             while IFS= read -r package; do
               if (( sample % 2 == 1 )); then
                 run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}"
@@ -265,9 +280,11 @@ jobs:
 
       - name: Enforce performance baseline
         run: |
-          .tmp/bin/benchstat -alpha 0.01 base=.tmp/benchmark-base.txt head=.tmp/benchmark-head.txt
-          .tmp/bin/benchstat -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv base=.tmp/benchmark-base.txt head=.tmp/benchmark-head.txt > .tmp/benchstat.csv 2> .tmp/benchstat-warnings.txt
-          GOWORK=off go run ./scripts/benchgate .tmp/benchstat.csv
+          .tmp/bin/benchstat -alpha 0.01 base=.tmp/benchmark-primary-base.txt head=.tmp/benchmark-primary-head.txt
+          .tmp/bin/benchstat -alpha 0.01 base=.tmp/benchmark-confirmation-base.txt head=.tmp/benchmark-confirmation-head.txt
+          .tmp/bin/benchstat -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv base=.tmp/benchmark-primary-base.txt head=.tmp/benchmark-primary-head.txt > .tmp/benchstat-primary.csv 2> .tmp/benchstat-primary-warnings.txt
+          .tmp/bin/benchstat -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv base=.tmp/benchmark-confirmation-base.txt head=.tmp/benchmark-confirmation-head.txt > .tmp/benchstat-confirmation.csv 2> .tmp/benchstat-confirmation-warnings.txt
+          GOWORK=off go run ./scripts/benchgate .tmp/benchstat-primary.csv .tmp/benchstat-confirmation.csv
 
   external-go-consumer:
     runs-on: ubuntu-latest

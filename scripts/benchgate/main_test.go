@@ -27,7 +27,7 @@ func TestEvaluateRejectsSignificantTimeRegression(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Regressions) != 1 || !strings.Contains(result.Regressions[0], "sec/op +5.01%") {
+	if len(result.Regressions) != 1 || !strings.Contains(result.Regressions[0].Description, "sec/op +5.01%") {
 		t.Fatalf("regressions = %v", result.Regressions)
 	}
 }
@@ -40,11 +40,72 @@ func TestEvaluateRejectsSignificantAllocationRegression(t *testing.T) {
 	if len(result.Regressions) != 2 {
 		t.Fatalf("regressions = %v", result.Regressions)
 	}
-	if !strings.Contains(result.Regressions[0], "B/op +0.01%") {
-		t.Fatalf("byte regression = %q", result.Regressions[0])
+	if !strings.Contains(result.Regressions[0].Description, "B/op +0.01%") {
+		t.Fatalf("byte regression = %q", result.Regressions[0].Description)
 	}
-	if !strings.Contains(result.Regressions[1], "allocs/op +0.01%") {
-		t.Fatalf("allocation regression = %q", result.Regressions[1])
+	if !strings.Contains(result.Regressions[1].Description, "allocs/op +0.01%") {
+		t.Fatalf("allocation regression = %q", result.Regressions[1].Description)
+	}
+}
+
+func TestConfirmEvaluationsAcceptsUnconfirmedRunnerNoise(t *testing.T) {
+	primary := mustEvaluate(t, benchstatCSV("+5.37%", "~", "n=10"))
+	confirmation := mustEvaluate(t, benchstatCSV("+1.42%", "~", "n=10"))
+
+	result, err := confirmEvaluations(primary, confirmation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Regressions) != 0 {
+		t.Fatalf("regressions = %v", result.Regressions)
+	}
+	if len(result.Unconfirmed) != 1 || !strings.Contains(result.Unconfirmed[0].Description, "+5.37%") {
+		t.Fatalf("unconfirmed = %v", result.Unconfirmed)
+	}
+}
+
+func TestConfirmEvaluationsAcceptsConfirmationOnlyNoise(t *testing.T) {
+	primary := mustEvaluate(t, benchstatCSV("+1.42%", "~", "n=10"))
+	confirmation := mustEvaluate(t, benchstatCSV("+5.37%", "~", "n=10"))
+
+	result, err := confirmEvaluations(primary, confirmation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Regressions) != 0 || len(result.Unconfirmed) != 1 {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestConfirmEvaluationsRejectsRepeatedRegression(t *testing.T) {
+	primary := mustEvaluate(t, benchstatCSV("+5.37%", "+0.01%", "n=10"))
+	confirmation := mustEvaluate(t, benchstatCSV("+5.12%", "+0.02%", "n=10"))
+
+	result, err := confirmEvaluations(primary, confirmation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Regressions) != 3 {
+		t.Fatalf("regressions = %v", result.Regressions)
+	}
+}
+
+func TestConfirmEvaluationsRequiresMatchingComparisons(t *testing.T) {
+	primary := mustEvaluate(t, benchstatCSV("~", "~", "n=10"))
+	confirmation := mustEvaluate(t, strings.Replace(benchstatCSV("~", "~", "n=10"), "EncodeEvent-2", "DecodeEvent-2", 1))
+
+	if _, err := confirmEvaluations(primary, confirmation); err == nil || !strings.Contains(err.Error(), "comparison sets differ") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestConfirmEvaluationsRejectsDifferentComparisonCounts(t *testing.T) {
+	primary := mustEvaluate(t, benchstatCSV("~", "~", "n=10"))
+	confirmation := mustEvaluate(t, benchstatCSV("~", "~", "n=10"))
+	delete(confirmation.Comparisons, comparisonKey{Package: "example", Benchmark: "EncodeEvent-2", Unit: "sec/op"})
+
+	if _, err := confirmEvaluations(primary, confirmation); err == nil || !strings.Contains(err.Error(), "comparison sets differ") {
+		t.Fatalf("error = %v", err)
 	}
 }
 
@@ -85,18 +146,21 @@ func TestEvaluateRejectsInvalidInput(t *testing.T) {
 func TestRunReportsSuccessAndRegression(t *testing.T) {
 	tests := []struct {
 		name      string
-		timeDelta string
+		primary   string
+		confirm   string
 		wantError bool
 		want      string
 	}{
-		{name: "success", timeDelta: "+5.00%", want: "performance gate passed"},
-		{name: "regression", timeDelta: "+5.01%", wantError: true, want: "performance regression"},
+		{name: "success", primary: "+5.00%", confirm: "+5.00%", want: "performance gate passed"},
+		{name: "runner noise", primary: "+5.37%", confirm: "+1.42%", want: "unconfirmed performance variation"},
+		{name: "regression", primary: "+5.01%", confirm: "+5.02%", wantError: true, want: "confirmed performance regression"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			path := writeRunInput(t, benchstatCSV(test.timeDelta, "~", "n=10"))
+			primaryPath := writeRunInput(t, benchstatCSV(test.primary, "~", "n=10"))
+			confirmationPath := writeRunInput(t, benchstatCSV(test.confirm, "~", "n=10"))
 			var output strings.Builder
-			err := run([]string{path}, &output)
+			err := run([]string{primaryPath, confirmationPath}, &output)
 			if (err != nil) != test.wantError {
 				t.Fatalf("error = %v", err)
 			}
@@ -111,18 +175,26 @@ func TestRunRejectsInvalidArgumentsAndPaths(t *testing.T) {
 	if err := run(nil, io.Discard); err == nil || !strings.Contains(err.Error(), "usage") {
 		t.Fatalf("usage error = %v", err)
 	}
-	if err := run([]string{"missing"}, io.Discard); err == nil {
+	if err := run([]string{"missing", "also-missing"}, io.Discard); err == nil {
 		t.Fatal("missing input error = nil")
 	}
 	path := writeRunInput(t, "")
-	if err := run([]string{path}, io.Discard); err == nil || !strings.Contains(err.Error(), "no time comparisons") {
+	validPath := writeRunInput(t, benchstatCSV("~", "~", "n=10"))
+	if err := run([]string{path, validPath}, io.Discard); err == nil || !strings.Contains(err.Error(), "no time comparisons") {
 		t.Fatalf("invalid content error = %v", err)
+	}
+	if err := run([]string{validPath, "missing"}, io.Discard); err == nil {
+		t.Fatal("missing confirmation error = nil")
+	}
+	differentPath := writeRunInput(t, strings.Replace(benchstatCSV("~", "~", "n=10"), "EncodeEvent-2", "DecodeEvent-2", 1))
+	if err := run([]string{validPath, differentPath}, io.Discard); err == nil || !strings.Contains(err.Error(), "comparison sets differ") {
+		t.Fatalf("comparison mismatch error = %v", err)
 	}
 }
 
 func TestCommandReturnsProcessStatus(t *testing.T) {
 	path := writeRunInput(t, benchstatCSV("~", "~", "n=10"))
-	if code := command([]string{path}, io.Discard, io.Discard); code != 0 {
+	if code := command([]string{path, path}, io.Discard, io.Discard); code != 0 {
 		t.Fatalf("success status = %d", code)
 	}
 	var errorOutput strings.Builder
@@ -132,6 +204,15 @@ func TestCommandReturnsProcessStatus(t *testing.T) {
 	if !strings.Contains(errorOutput.String(), "usage") {
 		t.Fatalf("error output = %q", errorOutput.String())
 	}
+}
+
+func mustEvaluate(t *testing.T, content string) evaluation {
+	t.Helper()
+	result, err := evaluate(strings.NewReader(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
 }
 
 type errorReader struct{}
