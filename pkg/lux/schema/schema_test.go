@@ -117,6 +117,29 @@ func TestRegisterModelMergesFederationStub(t *testing.T) {
 	}
 }
 
+func TestRegisterModelMergesIncomingMetadata(t *testing.T) {
+	s := New()
+	s.RegisterModel(&Model{
+		Name:        "User",
+		Module:      "user",
+		Description: "Original description",
+		Directives:  []string{"cache"},
+	})
+	s.RegisterModel(&Model{
+		Name:        "User",
+		Description: "Merged description",
+		Directives:  []string{"auth"},
+	})
+
+	model := s.Models["User"]
+	if model.Module != "user" || model.Description != "Merged description" {
+		t.Fatalf("merged metadata = %#v", model)
+	}
+	if len(model.Directives) != 1 || model.Directives[0] != "auth" {
+		t.Fatalf("merged directives = %#v", model.Directives)
+	}
+}
+
 func TestRegisterAPI(t *testing.T) {
 	s := New()
 	a := &API{ID: 1, Name: "getUser", Module: "user", ReturnType: "User"}

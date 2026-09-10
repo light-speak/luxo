@@ -53,6 +53,9 @@ func collectStreams(result *semantic.Result) []streamInfo {
 }
 
 func (g *GeneratorContext) collectStreams(result *semantic.Result) []streamInfo {
+	if !hasStreamAPI(result) {
+		return nil
+	}
 	declarations := g.collectStreamTypes(result)
 	var streams []streamInfo
 	for _, file := range result.Files {
@@ -68,6 +71,17 @@ func (g *GeneratorContext) collectStreams(result *semantic.Result) []streamInfo 
 		}
 	}
 	return streams
+}
+
+func hasStreamAPI(result *semantic.Result) bool {
+	for _, file := range result.Files {
+		for _, api := range file.APIs {
+			if hasDirective(api.Directives, "stream") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (g *GeneratorContext) collectStreamTypes(result *semantic.Result) streamTypes {

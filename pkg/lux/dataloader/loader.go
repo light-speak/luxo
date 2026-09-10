@@ -10,7 +10,8 @@ import (
 
 // BatchFn is the function that fetches data in batch.
 // keys: all collected keys in this batch.
-// fields: merged recursive selection requested by this batch.
+// fields: merged recursive selection requested by this batch. The selection is
+// immutable request metadata and must not be modified by the batch function.
 // Returns a map from key to result.
 type BatchFn[K comparable, V any] func(ctx context.Context, keys []K, fields []*selection.Field) (map[K]V, error)
 
@@ -161,17 +162,35 @@ func (b *batch[K, V]) add(key K, fields []*selection.Field) *request[K, V] {
 		b.hasRequest = true
 		b.selectsAll = fields == nil
 		if fields != nil {
-			b.fields = selection.Merge([]*selection.Field{}, fields)
+			b.fields = fields
 		}
 	} else if !b.selectsAll {
 		if fields == nil {
 			b.selectsAll = true
 			b.fields = nil
-		} else {
+		} else if !sameSelection(b.fields, fields) {
 			b.fields = selection.Merge(b.fields, fields)
 		}
 	}
 	return req
+}
+
+func sameSelection(left, right []*selection.Field) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] == nil || right[i] == nil {
+			if left[i] != right[i] {
+				return false
+			}
+			continue
+		}
+		if left[i].Name != right[i].Name || !sameSelection(left[i].Children, right[i].Children) {
+			return false
+		}
+	}
+	return true
 }
 
 func (b *batch[K, V]) size() int {

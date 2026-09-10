@@ -151,7 +151,11 @@ func sameResolvedType(left, right *ResolvedType) bool {
 	if left == nil || right == nil {
 		return true
 	}
-	return left.Name == right.Name && left.Kind == right.Kind && left.IsList == right.IsList && left.Nullable == right.Nullable &&
+	return left.Nullable == right.Nullable && sameResolvedTypeIgnoringNullability(left, right)
+}
+
+func sameResolvedTypeIgnoringNullability(left, right *ResolvedType) bool {
+	return left.Name == right.Name && left.Kind == right.Kind && left.IsList == right.IsList &&
 		typeArgsAssignable(left.TypeArgs, right.TypeArgs) && typeArgsAssignable(right.TypeArgs, left.TypeArgs)
 }
 
@@ -189,7 +193,7 @@ func (a *Analyzer) inferForExprType(body *ast.Block) *ResolvedType {
 	}
 
 	value := blockResultExpr(body)
-	result := a.resolvedExprType(value)
+	result := cloneResolvedType(a.resolvedExprType(value))
 	if result == nil {
 		return nil
 	}
@@ -220,9 +224,14 @@ func (a *Analyzer) resolvedExprType(expr ast.Expr) *ResolvedType {
 	if base == nil {
 		base = &ResolvedType{Kind: TypeUnknown, Name: expr.GetTypeTag()}
 	}
+	nullable := expr.IsNullable()
+	isList := expr.IsListType()
+	if base.Nullable == nullable && base.IsList == isList {
+		return base
+	}
 	result := cloneResolvedType(base)
-	result.Nullable = expr.IsNullable()
-	result.IsList = expr.IsListType()
+	result.Nullable = nullable
+	result.IsList = isList
 	return result
 }
 
@@ -1341,7 +1350,7 @@ func (a *Analyzer) mergeWhenBranchType(current, next *ResolvedType, pos token.Po
 		return current
 	}
 	if current == nil {
-		return cloneResolvedType(next)
+		return next
 	}
 	if isNullType(current) {
 		return next.AsNullable()
@@ -1349,17 +1358,15 @@ func (a *Analyzer) mergeWhenBranchType(current, next *ResolvedType, pos token.Po
 	if isNullType(next) {
 		return current.AsNullable()
 	}
-	left := cloneResolvedType(current)
-	right := cloneResolvedType(next)
-	left.Nullable = false
-	right.Nullable = false
-	if !sameResolvedType(left, right) {
+	if !sameResolvedTypeIgnoringNullability(current, next) {
 		a.addError(pos, "when branches must return compatible types, got '%s' and '%s' / when 分支必须返回兼容类型，得到 '%s' 和 '%s'",
 			formatResolvedType(current), formatResolvedType(next), formatResolvedType(current), formatResolvedType(next))
 		return current
 	}
-	left.Nullable = current.Nullable || next.Nullable
-	return left
+	if next.Nullable {
+		return current.AsNullable()
+	}
+	return current
 }
 
 func isNullType(typ *ResolvedType) bool {

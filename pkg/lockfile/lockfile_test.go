@@ -1710,6 +1710,9 @@ func TestInternalAPIHelperBoundaries(t *testing.T) {
 	if upperFirst("") != "" || upperFirst("über") != "Über" || lowerFirst("Üser") != "üser" {
 		t.Fatal("identifier case conversion failed")
 	}
+	if name, params := crudAPIContract("User", "Users", "unknown", &ast.ModelDecl{}, nil); name != "" || params != nil {
+		t.Fatalf("unknown CRUD contract = %q, %#v", name, params)
+	}
 }
 
 func TestNamedLoadDiscoveryRejectsInvalidCallsAndDeduplicates(t *testing.T) {

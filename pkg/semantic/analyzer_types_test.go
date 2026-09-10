@@ -1514,6 +1514,20 @@ func TestWhenExpressionMergesNullBranchesAsNullable(t *testing.T) {
 	}
 }
 
+func TestWhenExpressionPreservesNullableCompatibleBranch(t *testing.T) {
+	result := analyze(t, `
+api choose(flag: Boolean, fallback: String?): String? {
+  val result = when { flag -> "ready" else -> fallback }
+  result
+}
+`)
+	expectNoErrors(t, result)
+	stmt := result.Files[0].APIs[0].Body.Stmts[0].(*ast.ValStmt)
+	if stmt.Value.GetTypeTag() != "String" || !stmt.Value.IsNullable() {
+		t.Fatalf("when type = %q nullable=%v, want String?", stmt.Value.GetTypeTag(), stmt.Value.IsNullable())
+	}
+}
+
 func TestObjectExprUnknownType(t *testing.T) {
 	result := analyze(t, `
 api test(): String {

@@ -323,6 +323,8 @@ func TestGenerateRemoteNamedLoadHandlerSingleSoftKey(t *testing.T) {
 		Directives: []*ast.Directive{{Name: "soft"}},
 		Fields: []*ast.FieldDecl{
 			{Name: "email", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "orgId", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "org", Type: &ast.TypeRef{Name: "Org"}},
 			computedAggregateField("postCount", "Int", "count", &ast.Ident{Name: "posts"}),
 		},
 	}
@@ -339,6 +341,7 @@ func TestGenerateRemoteNamedLoadHandlerSingleSoftKey(t *testing.T) {
 		`lux.NewStringField("email").In(emailKeys...)`,
 		`lux.NewTimeField("deleted_at").IsNull()`,
 		"resolveUserComputed(ctx, app, rows, req.FieldMask)",
+		"resolveUserListRelations(ctx, app, rows, req.Select)",
 		"key := row.Email",
 		"key := emailKeys[i]",
 	} {
@@ -360,6 +363,8 @@ func TestGenerateFederationResolversUsesCanonicalListAndSelection(t *testing.T) 
 			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
 			{Name: "userId", Type: &ast.TypeRef{Name: "Int"}},
 			{Name: "title", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "projectId", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "project", Type: &ast.TypeRef{Name: "Project"}},
 		},
 	}
 	result := &semantic.Result{Files: []*ast.File{{
@@ -389,6 +394,9 @@ func TestGenerateFederationResolversUsesCanonicalListAndSelection(t *testing.T) 
 	}
 	if !strings.Contains(code, `fields = append(fields, "user_id")`) {
 		t.Errorf("resolver must select its grouping key:\n%s", code)
+	}
+	if !strings.Contains(code, "resolvePostListRelations(ctx, app, rows, req.Select)") {
+		t.Errorf("resolver must populate selected nested relations:\n%s", code)
 	}
 }
 
@@ -1051,6 +1059,14 @@ func TestGenerateHandlerNullableRelation(t *testing.T) {
 						{Name: "user", Type: &ast.TypeRef{Name: "User", Nullable: true}},
 					},
 				),
+				testModel("User",
+					[]*ast.Directive{crudDirective()},
+					[]*ast.FieldDecl{
+						testField("id", "Int", directive("id"), directive("auto")),
+						testField("roleId", "Int"),
+						{Name: "role", Type: &ast.TypeRef{Name: "Role"}},
+					},
+				),
 			},
 		}},
 	}
@@ -1064,6 +1080,9 @@ func TestGenerateHandlerNullableRelation(t *testing.T) {
 	// Should dereference the pointer: *post.UserId
 	if !strings.Contains(code, "*post.UserId") {
 		t.Errorf("nullable FK should dereference pointer in Load call:\n%s", code)
+	}
+	if !strings.Contains(code, "resolveUserRelations(traceCtx, app, result, f.Children, d-1)") {
+		t.Errorf("nullable relation should recursively resolve selected child relations:\n%s", code)
 	}
 }
 
@@ -3825,5 +3844,13 @@ func TestHandlerImportsNoModels(t *testing.T) {
 	// Should NOT have standalone lux import when no models
 	if strings.Contains(code, `"github.com/light-speak/luxo/pkg/lux"`) && !strings.Contains(code, `"github.com/light-speak/luxo/pkg/lux/`) {
 		t.Error("should not import lux when no models")
+	}
+}
+
+func TestWriteHandlerImportsIncludesGeneratedTimeUsage(t *testing.T) {
+	var b strings.Builder
+	writeHandlerImports(&b, &semantic.Result{}, nil, handlerFeatures{}, false, "time.Now()")
+	if !strings.Contains(b.String(), `"time"`) {
+		t.Fatalf("generated time usage did not add the time import:\n%s", b.String())
 	}
 }

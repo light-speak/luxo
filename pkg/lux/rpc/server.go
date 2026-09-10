@@ -176,11 +176,12 @@ func (s *Server) processRequest(conn io.Writer, payload []byte) error {
 }
 
 func (s *Server) processCall(conn io.Writer, envelope requestEnvelope) error {
-	requestCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	var ctx context.Context = requestCtx
+	var ctx context.Context = context.Background()
 	var trace *api.DebugTraceSession
 	if envelope.traceID != "" {
+		requestCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		ctx = requestCtx
 		ctx, trace = api.WithRemoteTrace(ctx, envelope.traceID, envelope.fieldPath, envelope.databaseDetails)
 	}
 	authStarted := trace.Start()

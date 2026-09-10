@@ -630,6 +630,39 @@ func TestParseBinaryRequestIntoRejectsNilDestination(t *testing.T) {
 	}
 }
 
+func TestParseBinaryRequestRejectsMissingRequiredSchemaParam(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("create", 1)
+	reg.RegisterParams("create", []ParamMeta{{Name: "input", Type: "Model", TypeName: "CreateInput", FieldID: 1}})
+	s := schema.New()
+	s.RegisterAPI(&schema.API{ID: 1, Name: "create", Params: []schema.Param{{ID: 1, Name: "input", Type: schema.FieldModel, TypeName: "CreateInput"}}})
+	reg.SetSchema(s)
+
+	if _, err := reg.ParseBinaryRequest([]byte{1, 0, 0}); err == nil {
+		t.Fatal("missing required structured parameter was accepted")
+	}
+}
+
+func TestJSONStructuredParamRejectsInvalidShapes(t *testing.T) {
+	meta := ParamMeta{Name: "input", Type: "Model", TypeName: "MissingInput"}
+	if _, _, err := new(APIRegistry).jsonStructuredParam(json.RawMessage(`{}`), meta); err == nil {
+		t.Fatal("structured parameter without schema was accepted")
+	}
+
+	reg := NewAPIRegistry()
+	reg.SetSchema(schema.New())
+	if _, _, err := reg.jsonStructuredParam(json.RawMessage(`{}`), meta); err == nil {
+		t.Fatal("unknown structured parameter type was accepted")
+	}
+	meta.IsList = true
+	if _, _, err := reg.jsonStructuredParam(json.RawMessage(`{}`), meta); err == nil {
+		t.Fatal("structured list object was accepted")
+	}
+	if _, _, err := reg.jsonStructuredParam(json.RawMessage(`[{}]`), meta); err == nil {
+		t.Fatal("invalid structured list element was accepted")
+	}
+}
+
 func TestParseBinaryRequestFieldMaskOverflow(t *testing.T) {
 	reg := NewAPIRegistry()
 	reg.Register("test", 1)
@@ -1450,6 +1483,20 @@ func TestStructuredBinaryParamsPreserveNativeMessages(t *testing.T) {
 	gotList, present, err := req.ParamMessageArray("inputs", false, false)
 	if err != nil || !present || !reflect.DeepEqual(gotList, messages) {
 		t.Fatalf("messages = %v, %v, %v", gotList, present, err)
+	}
+}
+
+func TestStructuredBinaryParamsRejectInvalidMessageContainers(t *testing.T) {
+	listMeta := []ParamMeta{{Name: "inputs", Type: "Model", TypeName: "CreateInput", FieldID: 1, IsList: true}}
+	if _, err := EncodeBinaryRequest(9, nil, map[string]any{"inputs": []any{BinaryMessage{0}}}, listMeta); err == nil {
+		t.Fatal("non-canonical structured message list was encoded")
+	}
+	if _, _, err := readBinaryParam(nil, 0, ParamMeta{Name: "input", Type: "Model", TypeName: "CreateInput"}); err == nil {
+		t.Fatal("truncated structured message was decoded")
+	}
+	body := codec.AppendArrayHeader(nil, 1)
+	if _, _, err := readBinaryParam(body, 0, ParamMeta{Name: "inputs", Type: "Model", TypeName: "CreateInput", IsList: true}); err == nil {
+		t.Fatal("truncated structured message list was decoded")
 	}
 }
 

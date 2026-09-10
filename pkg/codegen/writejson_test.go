@@ -1177,7 +1177,7 @@ func TestGenerateWriteLuxoUUIDDecimalBytesJSON(t *testing.T) {
 func TestGenerateScalarArrayFields(t *testing.T) {
 
 	generator := generatorWithModelFieldIDs(map[string]map[string]int{
-		"Tagged": {"id": 1, "tags": 2, "scores": 3, "ids": 4, "roles": 5},
+		"Tagged": {"id": 1, "tags": 2, "scores": 3, "ids": 4, "roles": 5, "prices": 6},
 	})
 
 	result := &semantic.Result{
@@ -1191,6 +1191,7 @@ func TestGenerateScalarArrayFields(t *testing.T) {
 					{Name: "scores", Type: &ast.TypeRef{Name: "Int", IsList: true}},
 					{Name: "ids", Type: &ast.TypeRef{Name: "UUID", IsList: true}},
 					{Name: "roles", Type: &ast.TypeRef{Name: "Role", IsList: true}},
+					{Name: "prices", Type: &ast.TypeRef{Name: "Decimal", IsList: true}},
 				},
 			}},
 		}},
@@ -1209,6 +1210,7 @@ func TestGenerateScalarArrayFields(t *testing.T) {
 		"dec.ReadUUIDArray()",
 		"uuid.UUID(v)",
 		"make([]Role, len(_a))",
+		"make([]decimal.Decimal, len(_a))",
 		// Columnar: array field encoded as a Bytes column of inline-array cells
 		"w.WriteColumnBytes",
 		"cells := make([][]byte, len(items))",

@@ -162,6 +162,25 @@ func TestLoadFieldsMerge(t *testing.T) {
 	}
 }
 
+func TestSameSelection(t *testing.T) {
+	left := []*selection.Field{{Name: "project", Children: []*selection.Field{{Name: "id"}, {Name: "name"}}}}
+	right := []*selection.Field{{Name: "project", Children: []*selection.Field{{Name: "id"}, {Name: "name"}}}}
+	if !sameSelection(left, right) {
+		t.Fatal("identical nested selections must compare equal")
+	}
+	right[0].Children[1].Name = "owner"
+	if sameSelection(left, right) {
+		t.Fatal("different nested selections must not compare equal")
+	}
+	if sameSelection(left, nil) || !sameSelection(nil, nil) {
+		t.Fatal("selection nil handling is incorrect")
+	}
+	withNil := []*selection.Field{nil}
+	if !sameSelection(withNil, []*selection.Field{nil}) || sameSelection(withNil, []*selection.Field{{Name: "id"}}) {
+		t.Fatal("nil selection node handling is incorrect")
+	}
+}
+
 func TestLoadNoFields(t *testing.T) {
 	var gotFields []*selection.Field
 

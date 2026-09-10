@@ -215,6 +215,9 @@ func TestPercentileSorted(t *testing.T) {
 	if got := percentile(data, 1.0); got != 10 {
 		t.Errorf("p100 = %f, want 10", got)
 	}
+	if got := percentile(data, 2.0); got != 10 {
+		t.Errorf("out-of-range percentile = %f, want 10", got)
+	}
 }
 
 func TestPercentileUsesNearestRankForSmallSamples(t *testing.T) {

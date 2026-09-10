@@ -62,7 +62,7 @@ func collectContracts(files []*ast.File) wireContracts {
 		for _, model := range file.Models {
 			fields := contracts.models[model.Name]
 			if fields == nil {
-				fields = make(map[string]string)
+				fields = make(map[string]string, len(model.Fields))
 				contracts.models[model.Name] = fields
 			}
 			mergeFieldTypes(fields, model.Fields)
@@ -70,7 +70,7 @@ func collectContracts(files []*ast.File) wireContracts {
 		for _, extend := range file.Extends {
 			fields := contracts.models[extend.Name]
 			if fields == nil {
-				fields = make(map[string]string)
+				fields = make(map[string]string, len(extend.Fields))
 				contracts.models[extend.Name] = fields
 			}
 			mergeFieldTypes(fields, extend.Fields)

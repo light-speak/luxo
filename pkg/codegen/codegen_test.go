@@ -19,6 +19,20 @@ func buildResult(files ...*ast.File) *semantic.Result {
 	}
 }
 
+func TestGeneratorAllEnumsMergesLocalAndCrossModuleEnums(t *testing.T) {
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
+		EnumModule: map[string]string{"Role": "auth"},
+	}})
+	local := map[string]bool{"Status": true}
+	all := generator.allEnums(local)
+	if !all["Status"] || !all["Role"] || len(all) != 2 {
+		t.Fatalf("all enums = %#v", all)
+	}
+	if local["Role"] {
+		t.Fatal("allEnums mutated the local enum set")
+	}
+}
+
 // collapseSpaces normalizes runs of spaces/tabs to single spaces so assertions
 // are insensitive to gofmt struct-field alignment.
 func collapseSpaces(s string) string {

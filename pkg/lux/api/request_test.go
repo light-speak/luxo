@@ -560,6 +560,35 @@ func TestInvalidParamPreservesStructuredDecodeCause(t *testing.T) {
 	}
 }
 
+func TestBinaryStructuredParamPresenceAndTypeValidation(t *testing.T) {
+	absent := &Request{paramNames: []string{"input"}, paramCount: 1}
+	if _, present, err := absent.ParamMessage("input", true, false); err != nil || present {
+		t.Fatalf("optional absent message = present %v, err %v", present, err)
+	}
+	if _, present, err := absent.ParamMessage("input", false, false); err == nil || present {
+		t.Fatalf("required absent message = present %v, err %v", present, err)
+	}
+
+	nullValue := &Request{paramNames: []string{"input"}, paramCount: 1, paramSet: 1, paramNull: 1}
+	if value, present, err := nullValue.ParamMessage("input", false, true); err != nil || !present || value != nil {
+		t.Fatalf("nullable message = %v, present %v, err %v", value, present, err)
+	}
+	if _, present, err := nullValue.ParamMessage("input", false, false); err == nil || !present {
+		t.Fatalf("non-nullable message = present %v, err %v", present, err)
+	}
+
+	wrong := &Request{paramNames: []string{"input"}, paramCount: 1, paramSlots: [16]any{"wrong"}, paramSet: 1}
+	if _, present, err := wrong.ParamMessage("input", false, false); err == nil || !present {
+		t.Fatalf("wrong message type = present %v, err %v", present, err)
+	}
+	if _, present, err := wrong.ParamMessageArray("input", false, false); err == nil || !present {
+		t.Fatalf("wrong message list type = present %v, err %v", present, err)
+	}
+	if _, present, err := absent.ParamMessageArray("input", true, false); err != nil || present {
+		t.Fatalf("optional absent message list = present %v, err %v", present, err)
+	}
+}
+
 func TestParseRequestWithFilters(t *testing.T) {
 	body := `{"$api":"listUsers","$filters":[{"field":"role","op":"eq","value":"ADMIN"}]}`
 	req, err := ParseRequest(makeReq(body))

@@ -145,6 +145,9 @@ func buildModelFieldIndex(result *semantic.Result) map[string][]*ast.FieldDecl {
 // collectLoadCalls scans all API/fn bodies for Model.load(...) calls
 // and returns unique (model, args) combinations for DataLoader generation.
 func collectLoadCalls(result *semantic.Result) []loadCallInfo {
+	if !hasLoadCallBodies(result) {
+		return nil
+	}
 	var calls []loadCallInfo
 	fieldIndex := buildModelFieldIndex(result)
 	seenByModule := make(map[string]map[string]bool)
@@ -180,6 +183,22 @@ func collectLoadCalls(result *semantic.Result) []loadCallInfo {
 		}
 	}
 	return calls
+}
+
+func hasLoadCallBodies(result *semantic.Result) bool {
+	for _, file := range result.Files {
+		for _, api := range file.APIs {
+			if api.Body != nil {
+				return true
+			}
+		}
+		for _, fn := range file.Functions {
+			if fn.Body != nil {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // scanLoadCalls recursively scans an AST statement for Model.load(...) calls.
@@ -253,6 +272,9 @@ func recordLoadCallExpr(expr ast.Expr, seen map[string]bool, calls *[]loadCallIn
 // For each `extend User { ... }` where User is from another module, we need a
 // DataLoader that loads User by primary key.
 func collectExtendModels(result *semantic.Result) []string {
+	if !hasExtensions(result) {
+		return nil
+	}
 	// Collect which models are defined in each module
 	moduleModels := make(map[string]map[string]bool)
 	for _, file := range result.Files {
@@ -280,6 +302,15 @@ func collectExtendModels(result *semantic.Result) []string {
 		}
 	}
 	return models
+}
+
+func hasExtensions(result *semantic.Result) bool {
+	for _, file := range result.Files {
+		if len(file.Extends) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 type modelRelations struct {
@@ -345,7 +376,7 @@ func (g *GeneratorContext) generateDataLoaderFile(result *semantic.Result, packa
 }
 
 func (g *GeneratorContext) collectDataLoaderInputs(result *semantic.Result, enums map[string]bool, externalSoftModels map[string]bool) dataLoaderInputs {
-	inputs := dataLoaderInputs{softModels: make(map[string]bool)}
+	var inputs dataLoaderInputs
 
 	for _, file := range result.Files {
 		for _, m := range file.Models {
@@ -362,12 +393,20 @@ func (g *GeneratorContext) collectDataLoaderInputs(result *semantic.Result, enum
 			inputs.loadCalls = append(inputs.loadCalls, lc)
 		}
 	}
-	for k, v := range externalSoftModels {
-		inputs.softModels[k] = v
+	if len(externalSoftModels) > 0 {
+		inputs.softModels = make(map[string]bool, len(externalSoftModels))
+		for k, v := range externalSoftModels {
+			if v {
+				inputs.softModels[k] = true
+			}
+		}
 	}
 	for _, file := range result.Files {
 		for _, m := range file.Models {
 			if isSoftDelete(m) {
+				if inputs.softModels == nil {
+					inputs.softModels = make(map[string]bool)
+				}
 				inputs.softModels[m.Name] = true
 			}
 		}

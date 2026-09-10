@@ -219,6 +219,145 @@ func TestTracedRequestEnvelopeRoundTrip(t *testing.T) {
 	if envelope.token != "token" || envelope.traceID != "trace-123" || envelope.fieldPath != "task.project.owner" || !envelope.databaseDetails || !bytes.Equal(envelope.body, body) {
 		t.Fatalf("decoded traced envelope = %+v", envelope)
 	}
+
+	payload = encodeTracedRequestEnvelope(requestKindCall, "", "trace-456", "", false, body)
+	envelope, err = decodeRequestEnvelope(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envelope.databaseDetails {
+		t.Fatal("database details must remain disabled")
+	}
+}
+
+func TestTracedRequestEnvelopeRejectsMalformedTraceMetadata(t *testing.T) {
+	for name, payload := range map[string][]byte{
+		"unsupported version": {requestEnvelopeMarker, 0xff, requestKindCall, 0, 0},
+		"invalid detail flag": {requestEnvelopeMarker, tracedRequestEnvelopeVersion, requestKindCall, 0, 1, 't', 0, 2, 0},
+		"missing body":        {requestEnvelopeMarker, tracedRequestEnvelopeVersion, requestKindCall, 0, 1, 't', 0, 0},
+		"invalid field path":  {requestEnvelopeMarker, tracedRequestEnvelopeVersion, requestKindCall, 0, 1, 't', 0x80},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := decodeRequestEnvelope(payload); err == nil {
+				t.Fatal("malformed traced request envelope was accepted")
+			}
+		})
+	}
+
+	oversizedPath := codec.AppendVarint(nil, maxTraceFieldPathSize+1)
+	for name, payload := range map[string][]byte{
+		"invalid path length": {0x80},
+		"oversized path":      oversizedPath,
+		"truncated path":      {2, 'a'},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := decodeTraceFieldPath(payload, 0); err == nil {
+				t.Fatal("invalid trace field path was accepted")
+			}
+		})
+	}
+
+	oversizedID := codec.AppendVarint(nil, maxTraceIDSize+1)
+	for name, payload := range map[string][]byte{
+		"invalid ID length": {0x80},
+		"empty ID":          {0},
+		"oversized ID":      oversizedID,
+		"truncated ID":      {2, 'a'},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := decodeTraceID(payload, 0); err == nil {
+				t.Fatal("invalid trace ID was accepted")
+			}
+		})
+	}
+}
+
+func TestDecodeTracedResponseValidation(t *testing.T) {
+	traceData := api.EncodeDebugTrace(api.DebugTraceSnapshot{TraceID: "trace-response"})
+	okResponse := append([]byte{statusTraceOK}, codec.AppendVarint(nil, uint64(len(traceData)))...)
+	okResponse = append(okResponse, traceData...)
+	okResponse = append(okResponse, "body"...)
+	body, trace, err := decodeTracedResponse(okResponse)
+	if err != nil || string(body) != "body" || trace.TraceID != "trace-response" {
+		t.Fatalf("decoded traced response = %q, %+v, %v", body, trace, err)
+	}
+
+	errorResponse := append([]byte{statusTraceError}, codec.AppendVarint(nil, uint64(len(traceData)))...)
+	errorResponse = append(errorResponse, traceData...)
+	errorResponse = append(errorResponse, encodeError(400, "BadRequest", "invalid")[1:]...)
+	if _, gotTrace, err := decodeTracedResponse(errorResponse); err == nil || gotTrace.TraceID != "trace-response" {
+		t.Fatalf("traced error response = %+v, %v", gotTrace, err)
+	}
+
+	for name, response := range map[string][]byte{
+		"empty":           nil,
+		"canonical error": encodeError(400, "BadRequest", "invalid"),
+		"invalid status":  {0xff},
+		"invalid length":  {statusTraceOK, 0x80},
+		"truncated trace": {statusTraceOK, 2, 0},
+		"invalid trace":   {statusTraceOK, 1, 0xff},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := decodeTracedResponse(response); err == nil {
+				t.Fatal("invalid traced response was accepted")
+			}
+		})
+	}
+}
+
+func TestTracedClientErrorsAndTraceNames(t *testing.T) {
+	client := NewClient("127.0.0.1:1")
+	defer client.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := client.callTracedPayload(ctx, []byte{0}); err == nil {
+		t.Fatal("cancelled traced RPC call succeeded")
+	}
+	if got := client.traceName(); got != "127.0.0.1:1" {
+		t.Fatalf("unnamed client trace name = %q", got)
+	}
+	named := NewNamedClient("project", "127.0.0.1:1")
+	defer named.Close()
+	if got := named.traceName(); got != "project" {
+		t.Fatalf("named client trace name = %q", got)
+	}
+}
+
+func TestServerTracedAuthenticationAndStreamDecodeErrors(t *testing.T) {
+	router := api.NewRouter()
+	server := NewServer(router)
+	server.internalRequestContext = func(context.Context, string) (context.Context, error) {
+		return nil, fmt.Errorf("invalid token")
+	}
+	var response bytes.Buffer
+	if err := server.processCall(&response, requestEnvelope{token: "token", traceID: "trace-auth", body: []byte{0}}); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := ReadFrame(&response, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, trace, err := decodeTracedResponse(frame); err == nil || trace.TraceID != "trace-auth" {
+		t.Fatalf("traced auth error = %+v, %v", trace, err)
+	}
+
+	server = NewServer(router)
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	done := make(chan struct{})
+	go func() {
+		server.processStream(serverConn, requestEnvelope{body: []byte{0xff}})
+		close(done)
+	}()
+	frame, err = ReadFrame(clientConn, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frame) == 0 || frame[0] != statusError {
+		t.Fatalf("stream decode response = %v", frame)
+	}
+	<-done
 }
 
 func TestTracedRPCCallMergesServicePhases(t *testing.T) {

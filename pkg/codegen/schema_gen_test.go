@@ -38,6 +38,18 @@ func TestLuxoTypeToSchemaType(t *testing.T) {
 	}
 }
 
+func TestSchemaMetadataHelperBoundaries(t *testing.T) {
+	if got := schemaRelationKind(HasOne); got != schema.RelationHasOne {
+		t.Fatalf("has-one relation kind = %v", got)
+	}
+	field := &ast.FieldDecl{Doc: "Public display name.", Directives: []*ast.Directive{{Name: "index"}}}
+	var b strings.Builder
+	writeInlineFieldMetadata(&b, field)
+	if got := b.String(); !strings.Contains(got, `Description: "Public display name."`) || !strings.Contains(got, `Directives: []string{"index"}`) {
+		t.Fatalf("inline field metadata = %q", got)
+	}
+}
+
 func TestLuxoTypeToSchemaFieldType(t *testing.T) {
 	tests := []struct {
 		typeName string

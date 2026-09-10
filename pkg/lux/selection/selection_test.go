@@ -159,6 +159,22 @@ func TestMergeAllSelectionDominatesAndEnsureFieldCopies(t *testing.T) {
 	if EnsureField(nil, "id") != nil {
 		t.Fatal("EnsureField(nil) must preserve select-all")
 	}
+	existing := EnsureField(partial, "name")
+	if len(existing) != 1 || existing[0] != partial[0] {
+		t.Fatalf("EnsureField(existing) = %#v", existing)
+	}
+}
+
+func TestMergeLeafSelectionDominatesNestedSelection(t *testing.T) {
+	left := []*Field{{Name: "project"}}
+	right := []*Field{{Name: "project", Children: []*Field{{Name: "name"}}}}
+	merged := Merge(left, right)
+	if got := Format(merged); got != "project" {
+		t.Fatalf("Merge() = %q, want leaf selection", got)
+	}
+	if cloneField(nil) != nil {
+		t.Fatal("cloneField(nil) must return nil")
+	}
 }
 
 func TestParseNestedWithSpaces(t *testing.T) {

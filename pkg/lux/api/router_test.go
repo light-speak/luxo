@@ -1109,6 +1109,35 @@ func TestRouterBinaryModeParseError(t *testing.T) {
 	}
 }
 
+func TestRouterBinaryReadAndPreparationErrors(t *testing.T) {
+	t.Run("body read", func(t *testing.T) {
+		rt := NewRouter()
+		r := httptest.NewRequest(http.MethodPost, "/luvia", errReader{})
+		r.Header.Set("X-Luxo-Mode", "binary")
+		w := httptest.NewRecorder()
+		rt.ServeHTTP(w, r)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+		}
+	})
+
+	t.Run("missing structured selection", func(t *testing.T) {
+		rt := NewRouter()
+		rt.Schema.RegisterModel(&schema.Model{Name: "User", Fields: []schema.Field{{ID: 1, Name: "id", Type: schema.FieldInt}}})
+		rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "getUser", ReturnType: "User"})
+		rt.Registry.Register("getUser", 1)
+		rt.Handle("getUser", func(context.Context, *Request) error { return nil })
+
+		r := httptest.NewRequest(http.MethodPost, "/luvia", bytes.NewReader([]byte{1, 0, 0}))
+		r.Header.Set("X-Luxo-Mode", "binary")
+		w := httptest.NewRecorder()
+		rt.ServeHTTP(w, r)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+		}
+	})
+}
+
 // --- ServeHTTP: JSON request with schema conversion + FieldMask ---
 
 func TestRouterJSONWithFieldMaskConversion(t *testing.T) {

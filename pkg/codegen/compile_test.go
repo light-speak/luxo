@@ -27,6 +27,50 @@ func newCompiler(models map[string]*ast.ModelDecl) *compiler {
 	}
 }
 
+func TestCompilerWritesPaginatedInMemoryModelReturn(t *testing.T) {
+	c := newCompiler(map[string]*ast.ModelDecl{"User": {Name: "User"}})
+	c.api.ReturnType = &ast.TypeRef{Name: "User", IsList: true}
+	c.paginate = true
+	c.writeScalarReturn("users")
+	out := compilerOut(c)
+	for _, want := range []string{"_luxoResult1 := users", "int64(len(_luxoResult1))", "WriteColumnarUser", "req.PageSize"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("paginated model return missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestStructuredParamAndLoadSelectionBoundaries(t *testing.T) {
+	if isStructuredParam(nil, nil) || isStructuredParam(&ast.ParamDecl{}, nil) {
+		t.Fatal("incomplete parameters were classified as structured")
+	}
+	if isStructuredParam(&ast.ParamDecl{Type: &ast.TypeRef{Name: "Role"}}, map[string]bool{"Role": true}) {
+		t.Fatal("enum parameter was classified as structured")
+	}
+	if _, ok := directLoadModel(&ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Literal{}, Field: "load"}}); ok {
+		t.Fatal("load call with a non-model receiver was accepted")
+	}
+
+	bindings := map[string]string{"existing": "User"}
+	collectLoadBindings(nil, bindings)
+	if len(bindings) != 1 {
+		t.Fatalf("nil block changed bindings: %#v", bindings)
+	}
+	root, path := memberSelectionPath(&ast.MemberExpr{Object: &ast.Literal{}, Field: "name"})
+	if root != "" || path != nil {
+		t.Fatalf("invalid member path = %q, %#v", root, path)
+	}
+	if validModelSelectionPath("Missing", []string{"id"}, nil) {
+		t.Fatal("unknown model selection path was accepted")
+	}
+	if modelField(&ast.ModelDecl{}, "missing") != nil || modelField(nil, "id") != nil {
+		t.Fatal("missing model field was resolved")
+	}
+	if selectionPathCovered([]string{"project", "name"}, [][]string{{"project"}}) {
+		t.Fatal("shorter selection covered a nested path")
+	}
+}
+
 func compilerOut(c *compiler) string {
 	return c.b.String()
 }

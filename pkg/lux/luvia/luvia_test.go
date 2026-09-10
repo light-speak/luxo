@@ -1,6 +1,7 @@
 package luvia
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -18,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/light-speak/luxo/pkg/lux"
 	"github.com/light-speak/luxo/pkg/lux/auth"
 )
 
@@ -65,6 +67,12 @@ func TestNewGateway(t *testing.T) {
 	gw.AddModule("post")
 	if len(gw.modules) != 2 {
 		t.Errorf("modules = %d, want 2", len(gw.modules))
+	}
+	gw.SetRuntimeDependencyStatsProvider(dependencyStatsProviderFunc(func(context.Context) []lux.RuntimeDependencyStats {
+		return nil
+	}))
+	if gw.dependencyStats == nil {
+		t.Fatal("runtime dependency stats provider was not configured")
 	}
 }
 
