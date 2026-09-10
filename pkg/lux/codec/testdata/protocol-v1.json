@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "primitives": {
+    "varint300": "ac02",
+    "svarintNegative42": "53",
+    "fixed64OnePoint25": "000000000000f43f",
+    "booleans": "0100",
+    "utf8String": "0a4c75786fe4b896e7958c",
+    "bytes": "0300ff10",
+    "uuid": "0123456789abcdef0123456789abcdef",
+    "intArray": "03050012",
+    "nullableNull": "00",
+    "nullableString": "01044c75786f"
+  },
+  "requests": {
+    "allTypes": "ac02000105021203000000000000f43f040a4c75786fe4b896e7958c05044f50454e060531322e353007010878090123456789abcdef0123456789abcdef0a0200ff0b0b7b226f6b223a747275657d0c02016106e4b896e7958c00",
+    "nullable": "0900010002015400",
+    "selected": "070601050302010200"
+  },
+  "errorEnvelope": "01a006020a42616452657175657374030362616404017405027b7d06016300",
+  "frames": {
+    "callRequest": "01fd01070000",
+    "subscribeSuccess": "07fd01"
+  },
+  "columnar": "03070105001202016106e4b896e7958c0003010100010000"
+}

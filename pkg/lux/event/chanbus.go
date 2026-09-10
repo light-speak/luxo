@@ -99,10 +99,7 @@ func (b *ChanBus) dispatch(name string, ch chan message) {
 	defer b.wg.Done()
 	for {
 		select {
-		case msg, ok := <-ch:
-			if !ok {
-				return
-			}
+		case msg := <-ch:
 			b.mu.RLock()
 			handlers := b.subs[name]
 			b.mu.RUnlock()
@@ -129,15 +126,12 @@ func safeCall(h Handler, ctx context.Context, payload any) (err error) {
 	return h(ctx, payload)
 }
 
-// Close shuts down all dispatchers and channels.
-// Waits for all in-flight dispatchers to drain before returning.
+// Close shuts down all dispatchers and waits for in-flight handlers to stop.
+// Event channels remain open so an Emit already in progress cannot panic.
 func (b *ChanBus) Close() {
 	b.once.Do(func() {
-		close(b.done)
 		b.mu.Lock()
-		for _, ch := range b.channels {
-			close(ch)
-		}
+		close(b.done)
 		b.mu.Unlock()
 		b.wg.Wait()
 	})
