@@ -410,6 +410,34 @@ func TestStreamHub_UnsubscribeNonExistent(t *testing.T) {
 	hub.Unsubscribe("nonexistent", sub)
 }
 
+func TestWritePumpsStopOnContextDone(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(context.Context, *StreamSub)
+	}{
+		{
+			name: "JSON",
+			run: func(ctx context.Context, sub *StreamSub) {
+				WritePumpJSON(ctx, nil, "watchTest", sub)
+			},
+		},
+		{
+			name: "Binary",
+			run: func(ctx context.Context, sub *StreamSub) {
+				WritePumpBinary(ctx, nil, 11, sub)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			test.run(ctx, &StreamSub{Ch: make(chan []byte)})
+		})
+	}
+}
+
 // --- WebSocket stream integration tests ---
 
 func TestWSJSON_Subscribe(t *testing.T) {
