@@ -127,7 +127,7 @@ func safeCall(h Handler, ctx context.Context, payload any) (err error) {
 }
 
 // Close shuts down all dispatchers and channels.
-// Waits for all in-flight dispatchers to drain before returning.
+// Waits for all accepted events and in-flight handlers before returning.
 func (b *ChanBus) Close() {
 	b.once.Do(func() {
 		close(b.done)

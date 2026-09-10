@@ -165,6 +165,39 @@ func TestChanBusClose(t *testing.T) {
 	bus.Emit(context.Background(), "test", "after close")
 }
 
+func TestChanBusCloseWaitsForInFlightEmit(t *testing.T) {
+	bus := NewChanBus(1)
+	handled := make(chan struct{}, 1)
+	if err := bus.On("test", func(context.Context, any) error {
+		handled <- struct{}{}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	bus.mu.RLock()
+	ch := bus.channels["test"]
+	closed := make(chan struct{})
+	go func() {
+		bus.Close()
+		close(closed)
+	}()
+	<-bus.done
+	ch <- "accepted"
+	bus.mu.RUnlock()
+
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not wait for the accepted event")
+	}
+	select {
+	case <-handled:
+	default:
+		t.Fatal("accepted event was not handled before Close returned")
+	}
+}
+
 func TestChanBusTypedPayload(t *testing.T) {
 	bus := NewChanBus(10)
 	defer bus.Close()
