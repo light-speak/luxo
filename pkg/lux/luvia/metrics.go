@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -19,7 +20,13 @@ import (
 const (
 	maxLatencySamples = 30000
 	maxPendingTraces  = 10000
+	metricBucketSecs  = int64((5 * time.Minute) / time.Second)
 )
+
+type metricBucketKey struct {
+	apiName    string
+	bucketUnix int64
+}
 
 // MetricsCollector aggregates request metrics in memory and periodically
 // flushes them to a Luxo Studio instance via the ingestMetrics API.
@@ -31,7 +38,7 @@ type MetricsCollector struct {
 	nodeType   string
 
 	mu      sync.Mutex
-	buckets map[string]*metricBucket // key: "apiName:minute"
+	buckets map[metricBucketKey]*metricBucket
 	traces  []api.TraceRecord
 	done    chan struct{}
 	closed  bool
@@ -68,7 +75,7 @@ func NewMetricsCollector() *MetricsCollector {
 		projectID:       projectID,
 		instanceID:      gatewayInstanceID(),
 		nodeType:        gatewayNodeType(),
-		buckets:         make(map[string]*metricBucket),
+		buckets:         make(map[metricBucketKey]*metricBucket),
 		traces:          make([]api.TraceRecord, 0, 128),
 		traceSampleRate: traceSampleRateFromEnv(),
 		done:            make(chan struct{}),
@@ -96,13 +103,12 @@ func (mc *MetricsCollector) Record(apiName string, duration time.Duration, isErr
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 
-	// 5-minute bucket
-	now := time.Now().Truncate(5 * time.Minute)
-	key := fmt.Sprintf("%s:%d", apiName, now.Unix())
+	now := time.Now().Unix()
+	key := metricBucketKey{apiName: apiName, bucketUnix: now - now%metricBucketSecs}
 
 	b, ok := mc.buckets[key]
 	if !ok {
-		b = &metricBucket{apiName: apiName, timestamp: now}
+		b = &metricBucket{apiName: apiName, timestamp: time.Unix(key.bucketUnix, 0).UTC()}
 		mc.buckets[key] = b
 	}
 	ms := float64(duration.Microseconds()) / 1000.0
@@ -120,7 +126,7 @@ func (mc *MetricsCollector) Record(apiName string, duration time.Duration, isErr
 // RecordTrace queues a sampled request trace for the Studio exporter.
 // Errors are always retained; successful requests obey LUXO_TRACE_SAMPLE_RATE.
 func (mc *MetricsCollector) RecordTrace(record api.TraceRecord) {
-	if record.StatusCode < http.StatusBadRequest && !shouldSampleTrace(record.TraceID, mc.traceSampleRate) {
+	if record.StatusCode < http.StatusBadRequest && !record.HeadSampled && !shouldSampleTrace(record.TraceID, mc.traceSampleRate) {
 		return
 	}
 	mc.mu.Lock()
@@ -129,6 +135,11 @@ func (mc *MetricsCollector) RecordTrace(record api.TraceRecord) {
 		return
 	}
 	mc.traces = append(mc.traces, record)
+}
+
+// ShouldTrace performs deterministic head sampling before request execution.
+func (mc *MetricsCollector) ShouldTrace(traceID string) bool {
+	return shouldSampleTrace(traceID, mc.traceSampleRate)
 }
 
 func shouldSampleTrace(traceID string, rate float64) bool {
@@ -185,7 +196,7 @@ func (mc *MetricsCollector) flushMetrics() {
 		return
 	}
 	old := mc.buckets
-	mc.buckets = make(map[string]*metricBucket)
+	mc.buckets = make(map[metricBucketKey]*metricBucket)
 	mc.mu.Unlock()
 
 	var bucketList []map[string]any
@@ -266,6 +277,12 @@ func (mc *MetricsCollector) flushTraces() {
 		if record.ClientVersion != "" {
 			trace["clientVersion"] = record.ClientVersion
 		}
+		if record.Spans != "" {
+			trace["spans"] = record.Spans
+		}
+		if record.Selection != "" {
+			trace["selection"] = record.Selection
+		}
 		traces = append(traces, trace)
 	}
 
@@ -310,7 +327,7 @@ func (mc *MetricsCollector) reenqueueTraces(records []api.TraceRecord) {
 	mc.traces = append(records, mc.traces...)
 }
 
-func (mc *MetricsCollector) reenqueue(buckets map[string]*metricBucket) {
+func (mc *MetricsCollector) reenqueue(buckets map[metricBucketKey]*metricBucket) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 	for key, previous := range buckets {
@@ -342,6 +359,15 @@ func percentile(data []float64, p float64) float64 {
 	copy(sorted, data)
 	sort.Float64s(sorted)
 
-	idx := int(float64(len(sorted)-1) * p)
+	// Nearest-rank keeps high percentiles meaningful for small buckets. The
+	// previous floor((n-1)*p) formula made p95 ignore the slowest request until
+	// a bucket contained at least 20 samples, allowing p95 to fall below avg.
+	idx := int(math.Ceil(float64(len(sorted))*p)) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
 	return sorted[idx]
 }

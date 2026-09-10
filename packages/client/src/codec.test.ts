@@ -100,6 +100,22 @@ describe('Encoder', () => {
     expect(bytes.length).toBe(1)
   })
 
+  it('writes length-delimited values in place without an intermediate buffer', () => {
+    const enc = new Encoder(4)
+    enc.writeDelimited(value => {
+      value.writeVarint(7)
+      value.writeString('go')
+    })
+    expect(Array.from(enc.bytes())).toEqual([4, 7, 2, 103, 111])
+
+    const large = new Encoder(4)
+    large.writeDelimited(value => value.writeRawBytes(new Uint8Array(130).fill(9)))
+    const bytes = large.bytes()
+    expect(Array.from(bytes.slice(0, 2))).toEqual([130, 1])
+    expect(bytes.length).toBe(132)
+    expect(bytes.slice(2).every(byte => byte === 9)).toBe(true)
+  })
+
   it('reset allows encoder reuse', () => {
     const enc = new Encoder()
     enc.writeVarint(42)

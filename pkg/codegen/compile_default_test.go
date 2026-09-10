@@ -127,12 +127,21 @@ func TestCompileAPIBody_ParamWithDefaultCustomType(t *testing.T) {
 	compileAPIBody(&b, api, nil, nil)
 	out := b.String()
 
-	// Custom type with default uses the optional JSON extractor.
+	// Custom types use native messages in binary mode and JSON only as fallback.
 	if !strings.Contains(out, "var input CreateInput") {
 		t.Fatalf("expected var declaration, got:\n%s", out)
 	}
 	if !strings.Contains(out, `req.ParamJSONOptional("input", &input)`) {
 		t.Fatalf("expected ParamJSONOptional, got:\n%s", out)
+	}
+	if !strings.Contains(out, `req.ParamMessage("input", true, false)`) {
+		t.Fatalf("expected optional native message extraction, got:\n%s", out)
+	}
+}
+
+func TestCompileDefaultValueNullUsesNil(t *testing.T) {
+	if got := compileDefaultValue(&ast.Literal{Kind: token.Null}, "*Payload", nil); got != "nil" {
+		t.Fatalf("null default = %q, want nil", got)
 	}
 }
 

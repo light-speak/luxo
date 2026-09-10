@@ -139,8 +139,14 @@ const user = await transport.call('getUser', {
 // + DataLoader: SELECT title FROM posts WHERE user_id IN (1)
 ```
 
-Generated output fields use `Selected<T>` (`T | undefined`): `undefined` means
-unselected, while `null` remains an explicitly selected nullable value. Input
+Public APIs returning structured values require a non-empty `$select`; omitting
+it is a protocol error, not an implicit full projection. The Vite plugin injects
+the selection for statically analyzable generated-client calls, including
+stream callback payloads, and emits an explicit safe projection for dynamic
+usage. Raw transport callers must provide
+`$select` themselves. Explicit selections return `Foo<true>` and use
+`Selected<T>` (`T | undefined`) for selectable fields, so `undefined` means
+unselected while `null` remains an explicitly selected nullable value. Input
 DTOs stay strict; shared input/output types generate separate `Foo` and
 `FooInput` interfaces.
 

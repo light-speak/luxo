@@ -5,10 +5,8 @@ package pg
 import (
 	"context"
 	"fmt"
-	"log"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -52,51 +50,12 @@ func NewDBWithConfig(ctx context.Context, connString string, cfg lux.DBConfig) (
 	if cfg.Timeout > 0 {
 		poolCfg.ConnConfig.ConnectTimeout = cfg.Timeout
 	}
-	if cfg.DebugSQL {
-		poolCfg.ConnConfig.Tracer = &pgxTracer{}
-	}
+	poolCfg.ConnConfig.Tracer = &pgxTracer{database: poolCfg.ConnConfig.Database, debugSQL: cfg.DebugSQL}
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("pg: connect to database: %w", err)
 	}
 	return &DB{pool: pool, conn: pool}, nil
-}
-
-// --- pgx SQL Tracer (implements pgx.QueryTracer + lux.QueryTracer) ---
-
-type pgxTracer struct{}
-
-type traceStartKey struct{}
-
-type traceStartData struct {
-	startTime time.Time
-	sql       string
-	args      []any
-}
-
-func (t *pgxTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
-	return context.WithValue(ctx, traceStartKey{}, traceStartData{
-		startTime: time.Now(),
-		sql:       data.SQL,
-		args:      data.Args,
-	})
-}
-
-func (t *pgxTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryEndData) {
-	sd, ok := ctx.Value(traceStartKey{}).(traceStartData)
-	if !ok {
-		return
-	}
-	dur := time.Since(sd.startTime)
-	sql := strings.ReplaceAll(strings.ReplaceAll(sd.sql, "\n", " "), "\t", " ")
-	if len(sql) > 200 {
-		sql = sql[:200] + "..."
-	}
-	if data.Err != nil {
-		log.Printf("[SQL] %s | ERROR: %v | %s | args=%v", dur, data.Err, sql, sd.args)
-	} else {
-		log.Printf("[SQL] %s | %s | %s | args=%v", dur, data.CommandTag.String(), sql, sd.args)
-	}
 }
 
 // NewDBFromPool creates a DB from an existing pgxpool.Pool.

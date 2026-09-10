@@ -54,6 +54,7 @@ func TestGenerateEntryFile(t *testing.T) {
 		"lux.DBConfigFromEnv()",
 		"pg.NewDBWithConfig(ctx",
 		"defer db.Close()",
+		"gw.SetRuntimeDependencyStatsProvider(db)",
 		"user_luxo.NewFromDB(db)",
 		"post_luxo.NewFromDB(db)",
 		"luvia.New()",
@@ -192,6 +193,9 @@ func TestGenerateEntryFileNonCrudAPIRegistersHandlers(t *testing.T) {
 	if !strings.Contains(code, "schema_luxo.RegisterHandlers(gw.Router, schemaApp)") {
 		t.Errorf("non-CRUD API module must still RegisterHandlers:\n%s", code)
 	}
+	if strings.Contains(code, `"github.com/light-speak/luxo/pkg/lux/rpc"`) {
+		t.Errorf("entry without RPC capabilities must not import rpc:\n%s", code)
+	}
 }
 
 func TestGenerateEntryFileWithLoaders(t *testing.T) {
@@ -306,7 +310,7 @@ func TestGenerateEntryFileWithExtends(t *testing.T) {
 	if !strings.Contains(code, "NewDefaultLoaders") {
 		t.Errorf("should have NewDefaultLoaders for embedded mode:\n%s", code)
 	}
-	if !strings.Contains(code, "rpc.NewClient") {
+	if !strings.Contains(code, "rpc.NewNamedClient") {
 		t.Errorf("should have RPC client setup:\n%s", code)
 	}
 }
@@ -483,6 +487,7 @@ func TestGenerateModuleEntryFiles(t *testing.T) {
 		"rpc.NewServer",
 		"DATABASE_PREFIX",
 		"AUTO_MIGRATE",
+		"gw.SetRuntimeDependencyStatsProvider(app.DB)",
 		"gw.Serve(Version)",
 	}
 	for _, check := range userChecks {
@@ -630,12 +635,13 @@ func TestGenerateGatewayEntry(t *testing.T) {
 		"gateway/main.gen.go",
 		`user_luxo "myapp/service/user/luxo"`,
 		`post_luxo "myapp/service/post/luxo"`,
-		"rpc.NewClient",
+		"rpc.NewNamedClient",
 		"USER_SERVICE_ADDR",
 		"POST_SERVICE_ADDR",
 		"user:9000",
 		"post:9000",
 		"RegisterSchema",
+		"gw.Router.Registry.RegisterSchemaAPIs(gw.Router.Schema)",
 		"proxyHandler",
 		"routing",
 		"gw.Serve(Version)",
@@ -643,7 +649,13 @@ func TestGenerateGatewayEntry(t *testing.T) {
 		`gw.AddModule("post")`,
 		"params := req.BinaryParams()",
 		"luvia.BearerToken(ctx)",
-		"CallWithMaskContext(ctx, bearerToken",
+		"CallWithMaskTargetContext(ctx, bearerToken",
+		"rpc.TraceTarget{Operation: apiName, Dependency: api.TraceDependencySequential}",
+		"rpc.TraceTarget{Operation: svcName, Field: ext.FieldName, Dependency: dependency}",
+		"api.TraceDependencyParallel",
+		"trace.StartSpan(ctx",
+		`Name: "query.plan"`,
+		`Name: "response.merge"`,
 		"luvia.ExtractPrimaryKeyColumn",
 		"luvia.ExtractPrimaryKeys",
 		"keys.EncodeParam(1)",
@@ -977,7 +989,7 @@ func TestGenerateSingleModuleEntryWithExtends(t *testing.T) {
 	src := string(code)
 
 	// Should have RPC-backed loader wiring with project service
-	if !strings.Contains(src, "rpc.NewClient") {
+	if !strings.Contains(src, "rpc.NewNamedClient") {
 		t.Errorf("extends module should use RPC client:\n%s", src)
 	}
 	if !strings.Contains(src, "NewRemoteLoaders") {

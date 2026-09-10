@@ -5,8 +5,7 @@ import 'package:luxo_client/src/codegen.dart';
 import 'package:test/test.dart';
 
 void main() {
-  test('generated client preserves binary list, Bytes, JSON, and field IDs',
-      () async {
+  test('generated client preserves binary list, Bytes, JSON, and field IDs', () async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     final output = Directory('.tmp/codegen_test');
     if (output.existsSync()) output.deleteSync(recursive: true);
@@ -40,8 +39,14 @@ void main() {
       expect(types, contains('class ChildInput'));
       expect(types, contains('final ChildInput child;'));
       expect(types, contains('Child.fromJson'));
-      expect(types, contains("if (data.isSelected) 'data': base64Encode(data.value)"));
-      expect(types, contains("if (child.isSelected) 'child': child.value.toJson()"));
+      expect(
+        types,
+        contains("if (data.isSelected) 'data': base64Encode(data.value)"),
+      );
+      expect(
+        types,
+        contains("if (child.isSelected) 'child': child.value.toJson()"),
+      );
       expect(types, isNot(contains('Uint8List(0)')));
       expect(types, contains('dec.readBytes()'));
       expect(types, contains('jsonDecode(utf8.decode(dec.readBytes()))'));
@@ -51,13 +56,35 @@ void main() {
       );
       expect(
         schema,
-        contains("'child': SelectionFieldSchema(4, 'Child')"),
+        contains(
+          "'child': SelectionFieldSchema(4, 'Child', 'Model', false, false)",
+        ),
       );
-      expect(schema,
-          contains("luxoSelectionTypes['Payload']!, luxoSelectionTypes"));
+      expect(
+        schema,
+        contains(
+          "ParamSchema(3, 'input', 'Model', false, false, 'CreateInput')",
+        ),
+      );
+      expect(
+        schema,
+        contains(
+          "'name': SelectionFieldSchema(1, null, 'String', false, false)",
+        ),
+      );
+      expect(
+        schema,
+        contains("luxoSelectionTypes['Payload']!, luxoSelectionTypes"),
+      );
       expect(client, contains('required List<Uint8List> chunks'));
       expect(client, contains('required Object metadata'));
       expect(client, contains('required CreateInput input'));
+      expect(
+        types,
+        contains('class CreateInput implements LuxoBinaryEncodable'),
+      );
+      expect(types, contains('void writeLuxo(LuxoEncoder encoder)'));
+      expect(types, contains('child.writeLuxo(encoder)'));
       expect(client, contains('required String? note'));
       expect(
         client,
@@ -66,12 +93,18 @@ void main() {
         ),
       );
       expect(
-          client, contains("if (caption.isPresent) 'caption': caption.value"));
+        client,
+        contains("if (caption.isPresent) 'caption': caption.value"),
+      );
       expect(client, isNot(contains('..nextField()')));
-      expect(types,
-          contains('List<Payload> decodeColumnarPayload(Uint8List data)'));
-      expect(types,
-          contains('Page<Payload> decodePaginatedPayload(Uint8List data)'));
+      expect(
+        types,
+        contains('List<Payload> decodeColumnarPayload(Uint8List data)'),
+      );
+      expect(
+        types,
+        contains('Page<Payload> decodePaginatedPayload(Uint8List data)'),
+      );
       expect(client, contains('decodeColumnarPayload(d)'));
       expect(client, contains('decodePaginatedPayload(d)'));
       expect(client, contains('List<LuxoFilter>? filters'));
@@ -86,8 +119,10 @@ void main() {
         client,
         contains('Future<Payload> createSnapshot({String? select})'),
       );
-      expect(client,
-          isNot(contains('createSnapshot(Map<String, dynamic> input)')));
+      expect(
+        client,
+        isNot(contains('createSnapshot(Map<String, dynamic> input)')),
+      );
       expect(client, contains('Future<Payload> upload({'));
       expect(client, contains('String? select'));
       expect(
@@ -104,10 +139,10 @@ void main() {
         ),
       );
 
-      final analysis = await Process.run(
-        Platform.resolvedExecutable,
-        ['analyze', output.path],
-      );
+      final analysis = await Process.run(Platform.resolvedExecutable, [
+        'analyze',
+        output.path,
+      ]);
       expect(
         analysis.exitCode,
         0,
@@ -162,7 +197,7 @@ const _schema = <String, Object>{
       'params': [
         {'id': 1, 'name': 'chunks', 'type': 'Bytes', 'isList': true},
         {'id': 2, 'name': 'metadata', 'type': 'JSON'},
-        {'id': 3, 'name': 'input', 'type': 'JSON', 'typeName': 'CreateInput'},
+        {'id': 3, 'name': 'input', 'type': 'Model', 'typeName': 'CreateInput'},
         {'id': 4, 'name': 'note', 'type': 'String', 'nullable': true},
         {
           'id': 5,

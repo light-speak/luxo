@@ -117,6 +117,29 @@ func TestRegisterModelMergesFederationStub(t *testing.T) {
 	}
 }
 
+func TestRegisterModelMergesIncomingMetadata(t *testing.T) {
+	s := New()
+	s.RegisterModel(&Model{
+		Name:        "User",
+		Module:      "user",
+		Description: "Original description",
+		Directives:  []string{"cache"},
+	})
+	s.RegisterModel(&Model{
+		Name:        "User",
+		Description: "Merged description",
+		Directives:  []string{"auth"},
+	})
+
+	model := s.Models["User"]
+	if model.Module != "user" || model.Description != "Merged description" {
+		t.Fatalf("merged metadata = %#v", model)
+	}
+	if len(model.Directives) != 1 || model.Directives[0] != "auth" {
+		t.Fatalf("merged directives = %#v", model.Directives)
+	}
+}
+
 func TestRegisterAPI(t *testing.T) {
 	s := New()
 	a := &API{ID: 1, Name: "getUser", Module: "user", ReturnType: "User"}
@@ -201,7 +224,7 @@ func TestSchemaToJSON(t *testing.T) {
 			{ID: 2, Name: "title", Type: FieldString},
 		},
 	})
-	s.RegisterAPI(&API{ID: 10, Name: "listPosts", Module: "post", ReturnType: "Post", ReturnList: true, Paginated: true})
+	s.RegisterAPI(&API{ID: 10, Name: "listPosts", Module: "post", ReturnType: "Post", ReturnList: true, Paginated: true, DefaultPageSize: 50})
 
 	data, err := s.ToJSON()
 	if err != nil {
@@ -226,6 +249,9 @@ func TestSchemaToJSON(t *testing.T) {
 	listPosts := apis["listPosts"].(map[string]any)
 	if listPosts["paginated"] != true {
 		t.Errorf("paginated = %v", listPosts["paginated"])
+	}
+	if listPosts["defaultPageSize"] != float64(50) {
+		t.Errorf("defaultPageSize = %v", listPosts["defaultPageSize"])
 	}
 	if listPosts["returnList"] != true {
 		t.Errorf("returnList = %v", listPosts["returnList"])

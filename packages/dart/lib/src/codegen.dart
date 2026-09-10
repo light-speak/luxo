@@ -79,22 +79,19 @@ String _luxoTypeToDart(String type) {
 }
 
 bool _isScalar(String type) => const {
-      'Int',
-      'Float',
-      'String',
-      'Boolean',
-      'DateTime',
-      'Duration',
-      'UUID',
-      'Bytes',
-      'Decimal',
-      'JSON',
-    }.contains(type);
+  'Int',
+  'Float',
+  'String',
+  'Boolean',
+  'DateTime',
+  'Duration',
+  'UUID',
+  'Bytes',
+  'Decimal',
+  'JSON',
+}.contains(type);
 
-String _dartParamType(
-  LuxoParam param,
-  Map<String, TypeUsage> usages,
-) {
+String _dartParamType(LuxoParam param, Map<String, TypeUsage> usages) {
   final schemaType =
       param.typeName ?? (usages.containsKey(param.type) ? param.type : null);
   final type = schemaType == null
@@ -113,13 +110,13 @@ String _dartFieldType(
   bool input = false,
 }) {
   final typeName = f.typeName ?? f.type;
-  final structured = schema.models.containsKey(typeName) ||
-      schema.types.containsKey(typeName);
+  final structured =
+      schema.models.containsKey(typeName) || schema.types.containsKey(typeName);
   final base = structured && input
       ? _inputTypeName(typeName, usages)
       : f.type == 'Model' || structured
-          ? typeName
-          : _luxoTypeToDart(f.type);
+      ? typeName
+      : _luxoTypeToDart(f.type);
   if (f.isList) return 'List<$base>';
   return base;
 }
@@ -235,7 +232,7 @@ void _writeDartDeclaration(
   Map<String, TypeUsage> usages, {
   required bool output,
 }) {
-  b.writeln('class $name {');
+  b.writeln('class $name${output ? '' : ' implements LuxoBinaryEncodable'} {');
   for (final f in fields) {
     final base = _dartFieldType(f, schema, usages: usages, input: !output);
     final value = f.nullable ? '$base?' : base;
@@ -248,9 +245,7 @@ void _writeDartDeclaration(
     if (output) {
       final base = _dartFieldType(f, schema, usages: usages);
       final value = f.nullable ? '$base?' : base;
-      b.writeln(
-        '    this.${f.name} = const Selected<$value>.unselected(),',
-      );
+      b.writeln('    this.${f.name} = const Selected<$value>.unselected(),');
     } else {
       b.writeln(
         f.nullable ? '    this.${f.name},' : '    required this.${f.name},',
@@ -267,9 +262,7 @@ void _writeDartDeclaration(
         "    ${f.name}: json.containsKey('${f.name}') ? Selected<$value>.value(${_jsonCast(f, schema, usages, input: false)}) : const Selected<$value>.unselected(),",
       );
     } else {
-      b.writeln(
-        '    ${f.name}: ${_jsonCast(f, schema, usages, input: true)},',
-      );
+      b.writeln('    ${f.name}: ${_jsonCast(f, schema, usages, input: true)},');
     }
   }
   b.writeln('  );');
@@ -282,7 +275,102 @@ void _writeDartDeclaration(
     );
   }
   b.writeln('  };');
+  if (!output) {
+    _writeDartBinaryEncoder(b, fields, schema);
+  }
   b.writeln('}\n');
+}
+
+void _writeDartBinaryEncoder(
+  StringBuffer b,
+  List<LuxoField> fields,
+  LuxoSchema schema,
+) {
+  final arenaFields = fields.where(
+    (field) =>
+        !field.isList && (field.type == 'String' || field.type == 'Enum'),
+  );
+  final arenaTerms = arenaFields.map(
+    (field) => field.nullable
+        ? "(${field.name} == null ? 0 : luxoUtf8Length(${field.name}!))"
+        : 'luxoUtf8Length(${field.name})',
+  );
+  b.writeln('\n  @override');
+  b.writeln('  void writeLuxo(LuxoEncoder encoder) {');
+  b.writeln(
+    '    encoder.writeVarint(${arenaTerms.isEmpty ? '0' : arenaTerms.join(' + ')});',
+  );
+  for (final field in fields) {
+    _writeDartBinaryField(b, field, schema);
+  }
+  b.writeln('    encoder.writeEnd();');
+  b.writeln('  }');
+}
+
+void _writeDartBinaryField(StringBuffer b, LuxoField field, LuxoSchema schema) {
+  b.writeln('    encoder.writeVarint(${field.id});');
+  if (!field.nullable) {
+    _writeDartBinaryValue(b, field, field.name, schema, '    ');
+    return;
+  }
+  b.writeln('    if (${field.name} == null) {');
+  b.writeln('      encoder.writeNull();');
+  b.writeln('    } else {');
+  b.writeln('      encoder.writePresent();');
+  _writeDartBinaryValue(b, field, '${field.name}!', schema, '      ');
+  b.writeln('    }');
+}
+
+void _writeDartBinaryValue(
+  StringBuffer b,
+  LuxoField field,
+  String value,
+  LuxoSchema schema,
+  String indent,
+) {
+  if (field.isList) {
+    b.writeln('${indent}encoder.writeVarint($value.length);');
+    b.writeln('${indent}for (final item in $value) {');
+    _writeDartBinaryScalar(b, field, 'item', schema, '$indent  ');
+    b.writeln('$indent}');
+    return;
+  }
+  _writeDartBinaryScalar(b, field, value, schema, indent);
+}
+
+void _writeDartBinaryScalar(
+  StringBuffer b,
+  LuxoField field,
+  String value,
+  LuxoSchema schema,
+  String indent,
+) {
+  if (_isNested(field, schema)) {
+    b.writeln('${indent}$value.writeLuxo(encoder);');
+    return;
+  }
+  switch (field.type) {
+    case 'Int' || 'Duration':
+      b.writeln('${indent}encoder.writeSvarint($value);');
+    case 'Float':
+      b.writeln('${indent}encoder.writeFixed64($value);');
+    case 'String' || 'Enum' || 'Decimal':
+      b.writeln('${indent}encoder.writeString($value);');
+    case 'Boolean':
+      b.writeln('${indent}encoder.writeBool($value);');
+    case 'DateTime':
+      b.writeln(
+        '${indent}encoder.writeSvarint(DateTime.parse($value).toUtc().millisecondsSinceEpoch ~/ 1000);',
+      );
+    case 'UUID':
+      b.writeln('${indent}encoder.writeUuid($value);');
+    case 'Bytes':
+      b.writeln('${indent}encoder.writeBytes($value);');
+    case 'JSON':
+      b.writeln(
+        '${indent}encoder.writeBytes(Uint8List.fromList(utf8.encode(jsonEncode($value))));',
+      );
+  }
 }
 
 void _writeDartDecoders(
@@ -361,7 +449,8 @@ void _writeColumnarDecoder(
   b.writeln('    switch (dec.fieldID) {');
   for (final f in fields) {
     b.writeln(
-        '      case ${f.id}: _${f.name} = ${_columnRead(f, schema)}; break;');
+      '      case ${f.id}: _${f.name} = ${_columnRead(f, schema)}; break;',
+    );
   }
   b.writeln(
     "      default: throw FormatException('unknown $name column ID \${dec.fieldID}');",
@@ -376,7 +465,8 @@ void _writeColumnarDecoder(
   b.writeln('  ));');
   if (paginated) {
     b.writeln(
-        '  return Page(items: items, total: dec.readSvarint(), page: dec.readSvarint(), pageSize: dec.readSvarint());');
+      '  return Page(items: items, total: dec.readSvarint(), page: dec.readSvarint(), pageSize: dec.readSvarint());',
+    );
   } else {
     b.writeln('  return items;');
   }
@@ -416,8 +506,7 @@ String _columnRead(LuxoField f, LuxoSchema schema) {
   }
   return switch (f.type) {
     'Int' ||
-    'Duration' =>
-      f.nullable ? 'dec.readColumnIntPtr()' : 'dec.readColumnInt()',
+    'Duration' => f.nullable ? 'dec.readColumnIntPtr()' : 'dec.readColumnInt()',
     'Float' =>
       f.nullable ? 'dec.readColumnFloatPtr()' : 'dec.readColumnFloat()',
     'Boolean' =>
@@ -461,16 +550,16 @@ String _columnValue(
 }
 
 String _binaryArrayRead(String type, String dec) => switch (type) {
-      'Int' || 'Duration' => '$dec.readIntArray()',
-      'Float' => '$dec.readFloatArray()',
-      'Boolean' => '$dec.readBoolArray()',
-      'DateTime' => '$dec.readDateTimeArray()',
-      'UUID' => '$dec.readUuidArray()',
-      'Bytes' => '$dec.readBytesArray()',
-      'JSON' =>
-        '$dec.readBytesArray().map((v) => jsonDecode(utf8.decode(v)) as Object).toList()',
-      _ => '$dec.readStringArray()',
-    };
+  'Int' || 'Duration' => '$dec.readIntArray()',
+  'Float' => '$dec.readFloatArray()',
+  'Boolean' => '$dec.readBoolArray()',
+  'DateTime' => '$dec.readDateTimeArray()',
+  'UUID' => '$dec.readUuidArray()',
+  'Bytes' => '$dec.readBytesArray()',
+  'JSON' =>
+    '$dec.readBytesArray().map((v) => jsonDecode(utf8.decode(v)) as Object).toList()',
+  _ => '$dec.readStringArray()',
+};
 
 String _jsonCast(
   LuxoField f,
@@ -518,7 +607,8 @@ String _jsonCast(
     default:
       // Relation / nested-model field.
       final rawTypeName = f.typeName ?? f.type;
-      final typeName = input &&
+      final typeName =
+          input &&
               (schema.models.containsKey(rawTypeName) ||
                   schema.types.containsKey(rawTypeName))
           ? _inputTypeName(rawTypeName, usages)
@@ -601,41 +691,54 @@ String _genSchemaMap(LuxoSchema schema) {
     ...schema.models,
   };
   b.writeln(
-      'final luxoSelectionTypes = <String, Map<String, SelectionFieldSchema>>{');
+    'final luxoSelectionTypes = <String, Map<String, SelectionFieldSchema>>{',
+  );
   for (final type in selectionTypes.values) {
     b.write("  '${type.name}': {");
     for (var i = 0; i < type.fields.length; i++) {
       final field = type.fields[i];
       if (i > 0) b.write(', ');
       final typeName = field.typeName ?? field.type;
-      final nested = _isNested(field, schema) ? ", '$typeName'" : '';
-      b.write("'${field.name}': SelectionFieldSchema(${field.id}$nested)");
+      final declaredType = field.typeName == null ? 'null' : "'$typeName'";
+      b.write(
+        "'${field.name}': SelectionFieldSchema(${field.id}, "
+        "$declaredType, '${field.type}', ${field.isList}, ${field.nullable})",
+      );
     }
     b.writeln('},');
   }
   b.writeln('};\n');
   b.writeln(
-      '/// API schema map — used by binary transport for encoding requests.');
+    '/// API schema map — used by binary transport for encoding requests.',
+  );
   b.writeln('final luxoSchema = <String, APISchemaEntry>{');
   for (final api in schema.apis.values) {
     if (api.name.startsWith('svc:')) continue;
     final returnFields = api.returnType == null
         ? const <LuxoField>[]
         : (schema.models[api.returnType]?.fields ??
-            schema.types[api.returnType]?.fields ??
-            const <LuxoField>[]);
+              schema.types[api.returnType]?.fields ??
+              const <LuxoField>[]);
+    final needsTypes =
+        returnFields.isNotEmpty ||
+        api.params.any((param) => param.type == 'Model');
     b.write("  '${api.name}': APISchemaEntry(${api.id}");
     if (api.params.isNotEmpty || returnFields.isNotEmpty) {
       b.write(', [\n');
       for (final p in api.params) {
         b.writeln(
-          "    ParamSchema(${p.id}, '${p.name}', '${p.type}', ${p.isList}, ${p.nullable}),",
+          "    ParamSchema(${p.id}, '${p.name}', '${p.type}', ${p.isList}, ${p.nullable}${p.typeName == null ? '' : ", '${p.typeName}'"}),",
         );
       }
       b.write('  ]');
     }
     if (returnFields.isNotEmpty) {
-      b.write(", luxoSelectionTypes['${api.returnType}']!, luxoSelectionTypes");
+      b.write(", luxoSelectionTypes['${api.returnType}']!");
+    } else if (needsTypes) {
+      b.write(', const {}');
+    }
+    if (needsTypes) {
+      b.write(', luxoSelectionTypes');
     }
     b.writeln('),');
   }
@@ -660,9 +763,11 @@ String _genClient(LuxoSchema schema) {
   b.writeln('  }\n');
   b.writeln('  /// Create client from URL — auto-detects HTTP vs WebSocket.');
   b.writeln(
-      "  factory LuxoClient.create(String endpoint, {TransportOptions? options}) {");
+    "  factory LuxoClient.create(String endpoint, {TransportOptions? options}) {",
+  );
   b.writeln(
-      "    final transport = endpoint.startsWith('ws') ? WsTransport(endpoint, options: options) : HttpTransport(endpoint, options: options);");
+    "    final transport = endpoint.startsWith('ws') ? WsTransport(endpoint, options: options) : HttpTransport(endpoint, options: options);",
+  );
   b.writeln('    return LuxoClient(transport);');
   b.writeln('  }\n');
   b.writeln('  void setMode(TransportMode mode) => transport.setMode(mode);');
@@ -679,11 +784,7 @@ String _genClient(LuxoSchema schema) {
   return b.toString();
 }
 
-void _genMethod(
-  StringBuffer b,
-  LuxoAPI api,
-  Map<String, TypeUsage> usages,
-) {
+void _genMethod(StringBuffer b, LuxoAPI api, Map<String, TypeUsage> usages) {
   final ret = _returnType(api);
   final dec = _decoder(api);
   final structuredReturn =
@@ -700,11 +801,7 @@ void _genMethod(
     final isPaginated = api.paginated;
     final paramParts = api.params.map((p) {
       final forcedOptional = isPaginated && paginationNames.contains(p.name);
-      return _dartParamDeclaration(
-        p,
-        usages,
-        forcedOptional: forcedOptional,
-      );
+      return _dartParamDeclaration(p, usages, forcedOptional: forcedOptional);
     }).toList();
 
     if (api.paginated) {
@@ -715,7 +812,8 @@ void _genMethod(
       paramParts.add('List<LuxoFilter>? filters');
       paramParts.add('List<LuxoSorter>? sorters');
       b.writeln(
-          "  Future<$ret> ${api.name}({${paramParts.join(', ')}}) async {");
+        "  Future<$ret> ${api.name}({${paramParts.join(', ')}}) async {",
+      );
       b.writeln("    final sel = select ?? _hint('${api.name}');");
       b.writeln("    return transport.call('${api.name}', params: {");
       for (final p in api.params) {
@@ -742,7 +840,8 @@ void _genMethod(
     if (structuredReturn) {
       paramParts.add('String? select');
       b.writeln(
-          "  Future<$ret> ${api.name}({${paramParts.join(', ')}}) async {");
+        "  Future<$ret> ${api.name}({${paramParts.join(', ')}}) async {",
+      );
       b.writeln("    final sel = select ?? _hint('${api.name}');");
       b.writeln("    return transport.call('${api.name}', params: {");
       for (final p in api.params) {
@@ -767,7 +866,8 @@ void _genMethod(
 
   if (api.paginated) {
     b.writeln(
-        "  Future<$ret> ${api.name}({int? page, int? pageSize, String? select, List<LuxoFilter>? filters, List<LuxoSorter>? sorters}) async {");
+      "  Future<$ret> ${api.name}({int? page, int? pageSize, String? select, List<LuxoFilter>? filters, List<LuxoSorter>? sorters}) async {",
+    );
     b.writeln("    final sel = select ?? _hint('${api.name}');");
     b.writeln("    return transport.call('${api.name}', params: {");
     b.writeln("      if (page != null) 'page': page,");
@@ -804,8 +904,9 @@ void _genStreamMethod(
       'subscribe${api.name[0].toUpperCase()}${api.name.substring(1)}';
   final structuredReturn =
       api.returnType != null && !_isScalar(api.returnType!);
-  final declarations =
-      api.params.map((param) => _dartParamDeclaration(param, usages)).toList();
+  final declarations = api.params
+      .map((param) => _dartParamDeclaration(param, usages))
+      .toList();
   if (structuredReturn) declarations.add('String? select');
   declarations.add('required void Function($returnType) onData');
   b.writeln(
@@ -906,15 +1007,15 @@ String _decodeExpression(LuxoAPI api, String value) {
       final jsonRead = t == 'Float'
           ? '($value as List).map((e) => (e as num).toDouble()).toList()'
           : t == 'Bytes'
-              ? '($value as List).map((e) => base64Decode(e as String)).toList()'
-              : '($value as List).cast<$dartType>()';
+          ? '($value as List).map((e) => base64Decode(e as String)).toList()'
+          : '($value as List).cast<$dartType>()';
       return '$value is Uint8List ? $binaryListRead : $jsonRead';
     }
     final jsonRead = t == 'Float'
         ? '($value as num).toDouble()'
         : t == 'Bytes'
-            ? 'base64Decode($value as String)'
-            : '$value as $dartType';
+        ? 'base64Decode($value as String)'
+        : '$value as $dartType';
     return '$value is Uint8List ? $binaryScalarRead : $jsonRead';
   }
   if (api.paginated) {

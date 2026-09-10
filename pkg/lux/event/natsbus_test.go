@@ -2,13 +2,12 @@ package event
 
 import (
 	"context"
+	"errors"
 	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"encoding/json"
 )
 
 func natsURL(t *testing.T) string {
@@ -46,7 +45,7 @@ func TestNATSBusEmitOn(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	bus.Emit(context.Background(), "test.nats.emit", map[string]any{"id": 42})
+	bus.Emit(context.Background(), "test.nats.emit", []byte{0x2a})
 
 	select {
 	case <-done:
@@ -54,12 +53,8 @@ func TestNATSBusEmitOn(t *testing.T) {
 		t.Fatal("timeout waiting for event")
 	}
 
-	got := received.Load().(string)
-	// json.Marshal produces JSON
-	var obj map[string]any
-	json.Unmarshal([]byte(got), &obj)
-	if obj["id"].(float64) != 42 {
-		t.Errorf("got %v", got)
+	if got := received.Load().(string); got != "*" {
+		t.Errorf("got %q, want raw byte payload", got)
 	}
 }
 
@@ -87,7 +82,7 @@ func TestNATSBusMultipleHandlers(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	bus.Emit(context.Background(), "test.nats.multi", "test")
+	bus.Emit(context.Background(), "test.nats.multi", []byte("test"))
 
 	wg.Wait()
 	if count.Load() != 2 {
@@ -95,30 +90,25 @@ func TestNATSBusMultipleHandlers(t *testing.T) {
 	}
 }
 
-func TestNATSBusTypedPayload(t *testing.T) {
+func TestNATSBusRawPayload(t *testing.T) {
 	bus, err := NewNATSBus(natsURL(t))
 	if err != nil {
 		t.Skipf("NATS not available: %v", err)
 	}
 	defer bus.Close()
 
-	type OrderEvent struct {
-		OrderID int     `json:"orderId"`
-		Total   float64 `json:"total"`
-	}
-
 	done := make(chan struct{})
-	var got OrderEvent
+	var got string
 
 	bus.On("test.nats.typed", func(ctx context.Context, payload any) error {
-		json.Unmarshal(payload.([]byte), &got)
+		got = string(payload.([]byte))
 		close(done)
 		return nil
 	})
 
 	time.Sleep(50 * time.Millisecond)
 
-	bus.Emit(context.Background(), "test.nats.typed", OrderEvent{OrderID: 1, Total: 99.99})
+	bus.Emit(context.Background(), "test.nats.typed", []byte("order:1:99.99"))
 
 	select {
 	case <-done:
@@ -126,8 +116,8 @@ func TestNATSBusTypedPayload(t *testing.T) {
 		t.Fatal("timeout")
 	}
 
-	if got.OrderID != 1 || got.Total != 99.99 {
-		t.Errorf("got %+v", got)
+	if got != "order:1:99.99" {
+		t.Errorf("got %q", got)
 	}
 }
 
@@ -150,9 +140,9 @@ func TestNATSBusHandlerPanicRecovery(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	bus.Emit(context.Background(), "test.nats.panic", "test")
+	bus.Emit(context.Background(), "test.nats.panic", []byte("test"))
 	time.Sleep(50 * time.Millisecond)
-	bus.Emit(context.Background(), "test.nats.after.panic", "test")
+	bus.Emit(context.Background(), "test.nats.after.panic", []byte("test"))
 
 	select {
 	case <-done:
@@ -224,7 +214,7 @@ func TestNATSBusOnQueue(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	bus.Emit(context.Background(), "test.nats.queue.basic", map[string]any{"ok": true})
+	bus.Emit(context.Background(), "test.nats.queue.basic", []byte{1})
 
 	select {
 	case <-done:
@@ -264,7 +254,7 @@ func TestNATSBusOnQueueCompeting(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	for range n {
-		bus.Emit(context.Background(), "test.nats.queue.compete", "test")
+		bus.Emit(context.Background(), "test.nats.queue.compete", []byte("test"))
 	}
 
 	wg.Wait()
@@ -300,7 +290,7 @@ func TestNATSBusOnQueueCrossGroup(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	for range n {
-		bus.Emit(context.Background(), "test.nats.queue.cross", "test")
+		bus.Emit(context.Background(), "test.nats.queue.cross", []byte("test"))
 	}
 
 	wg.Wait()
@@ -345,9 +335,9 @@ func TestNATSBusOnQueuePanicRecovery(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	bus.Emit(context.Background(), "test.nats.queue.panic", "test")
+	bus.Emit(context.Background(), "test.nats.queue.panic", []byte("test"))
 	time.Sleep(50 * time.Millisecond)
-	bus.Emit(context.Background(), "test.nats.queue.panic.after", "test")
+	bus.Emit(context.Background(), "test.nats.queue.panic.after", []byte("test"))
 
 	select {
 	case <-done:
@@ -378,7 +368,7 @@ func TestNATSBusConcurrent(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	for range n {
-		go bus.Emit(context.Background(), "test.nats.concurrent", "test")
+		go bus.Emit(context.Background(), "test.nats.concurrent", []byte("test"))
 	}
 
 	wg.Wait()
@@ -394,10 +384,26 @@ func TestNATSBusEmitMarshalError(t *testing.T) {
 	}
 	defer bus.Close()
 
-	// channels are not JSON-serializable
-	err = bus.Emit(context.Background(), "test.nats.marshal.err", make(chan int))
-	if err == nil {
-		t.Fatal("expected marshal error")
+	err = bus.Emit(context.Background(), "test.nats.marshal.err", "implicit JSON is forbidden")
+	if !errors.Is(err, ErrBinaryPayloadRequired) {
+		t.Fatalf("error = %v, want ErrBinaryPayloadRequired", err)
+	}
+}
+
+func TestNATSPayloadBytes(t *testing.T) {
+	raw := []byte{0x01, 0x02}
+	got, err := natsPayloadBytes(raw)
+	if err != nil || len(got) != 2 || &got[0] != &raw[0] {
+		t.Fatalf("raw payload = %v, %v", got, err)
+	}
+
+	got, err = natsPayloadBytes(&luxoPayload{data: []byte{0xde, 0xad}})
+	if err != nil || len(got) != 2 || got[0] != 0xde || got[1] != 0xad {
+		t.Fatalf("Luxo payload = %v, %v", got, err)
+	}
+
+	if _, err = natsPayloadBytes(struct{}{}); !errors.Is(err, ErrBinaryPayloadRequired) {
+		t.Fatalf("unsupported payload error = %v", err)
 	}
 }
 

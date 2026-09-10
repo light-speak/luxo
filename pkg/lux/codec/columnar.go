@@ -196,10 +196,14 @@ func (w *ColumnarWriter) Bytes() []byte {
 	w.buf = AppendVarint(w.buf, uint64(w.count))
 	// Arena size: total string bytes for arena allocation on decode
 	w.buf = AppendVarint(w.buf, uint64(w.totalStringLen))
-	// Columns: [fieldID varint] [column data]
-	for _, col := range w.columns {
-		w.buf = AppendVarint(w.buf, uint64(col.fieldID))
-		w.buf = append(w.buf, col.data...)
+	// An empty result has no column values, so field IDs would be ambiguous with
+	// metadata appended after the end marker. Emit the canonical empty payload.
+	if w.count > 0 {
+		// Columns: [fieldID varint] [column data]
+		for _, col := range w.columns {
+			w.buf = AppendVarint(w.buf, uint64(col.fieldID))
+			w.buf = append(w.buf, col.data...)
+		}
 	}
 	// End marker
 	w.buf = append(w.buf, 0x00)

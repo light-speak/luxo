@@ -60,12 +60,17 @@ func collectContracts(files []*ast.File) wireContracts {
 	}
 	for _, file := range files {
 		for _, model := range file.Models {
-			contracts.models[model.Name] = fieldTypes(model.Fields)
+			fields := contracts.models[model.Name]
+			if fields == nil {
+				fields = make(map[string]string, len(model.Fields))
+				contracts.models[model.Name] = fields
+			}
+			mergeFieldTypes(fields, model.Fields)
 		}
 		for _, extend := range file.Extends {
 			fields := contracts.models[extend.Name]
 			if fields == nil {
-				fields = make(map[string]string)
+				fields = make(map[string]string, len(extend.Fields))
 				contracts.models[extend.Name] = fields
 			}
 			mergeFieldTypes(fields, extend.Fields)
@@ -81,7 +86,7 @@ func collectContracts(files []*ast.File) wireContracts {
 			contracts.events[event.Name] = params
 		}
 		for _, api := range file.APIs {
-			contracts.apis[api.Name] = newAPIContract(api.Params, api.ReturnType)
+			contracts.apis[api.Name] = newAPIContract(api.EffectiveParams(), api.ReturnType)
 		}
 		for _, fn := range file.Functions {
 			if hasServiceDirective(fn) {

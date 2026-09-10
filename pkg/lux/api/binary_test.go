@@ -130,6 +130,53 @@ func TestPrepareJSONRequestParamsProducesCanonicalBinary(t *testing.T) {
 	}
 }
 
+func TestPrepareJSONStructuredParamsProducesNativeMessages(t *testing.T) {
+	rt := NewRouter()
+	rt.Registry.Register("create", 43)
+	meta := []ParamMeta{
+		{Name: "input", Type: "Model", TypeName: "CreateInput", FieldID: 1},
+		{Name: "inputs", Type: "Model", TypeName: "CreateInput", FieldID: 2, IsList: true},
+	}
+	rt.Registry.RegisterParams("create", meta)
+	rt.Schema.RegisterType(&schema.TypeDecl{Name: "Child", Fields: []schema.Field{
+		{ID: 1, Name: "enabled", Type: schema.FieldBool},
+	}})
+	rt.Schema.RegisterType(&schema.TypeDecl{Name: "CreateInput", Fields: []schema.Field{
+		{ID: 1, Name: "name", Type: schema.FieldString},
+		{ID: 2, Name: "scores", Type: schema.FieldInt, IsList: true},
+		{ID: 3, Name: "child", Type: schema.FieldModel, TypeName: "Child", Nullable: true},
+	}})
+	rt.Schema.RegisterAPI(&schema.API{ID: 43, Name: "create", Params: []schema.Param{
+		{ID: 1, Name: "input", Type: schema.FieldModel, TypeName: "CreateInput"},
+		{ID: 2, Name: "inputs", Type: schema.FieldModel, TypeName: "CreateInput", IsList: true},
+	}})
+	value := `{"name":"é","scores":[1,-2],"child":{"enabled":true}}`
+	req, err := parseRawRequest(map[string]json.RawMessage{
+		"$api":   json.RawMessage(`"create"`),
+		"input":  json.RawMessage(value),
+		"inputs": json.RawMessage(`[` + value + `]`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.prepareRequest(req, false); err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := rt.Registry.ParseBinaryRequest(req.BinaryRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := BinaryMessage{2, 1, 2, 0xc3, 0xa9, 2, 2, 2, 3, 3, 1, 0, 1, 1, 0, 0}
+	message, present, err := canonical.ParamMessage("input", false, false)
+	if err != nil || !present || !bytes.Equal(message, want) {
+		t.Fatalf("input = %v, %v, %v; want %v", message, present, err, want)
+	}
+	messages, present, err := canonical.ParamMessageArray("inputs", false, false)
+	if err != nil || !present || len(messages) != 1 || !bytes.Equal(messages[0], want) {
+		t.Fatalf("inputs = %v, %v, %v; want [%v]", messages, present, err, want)
+	}
+}
+
 func TestPrepareJSONRequestParamsRejectsInvalidInput(t *testing.T) {
 	rt := NewRouter()
 	rt.Registry.Register("watch", 42)
@@ -170,7 +217,7 @@ func TestJSONParamValueCanonicalDurationAndBytes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := &Request{Params: map[string]json.RawMessage{tt.meta.Name: tt.raw}}
-			got, present, err := jsonParamValue(req, tt.meta)
+			got, present, err := (&APIRegistry{}).jsonParamValue(req, tt.meta)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -196,7 +243,7 @@ func TestJSONParamValueRejectsInvalidDurationAndBytes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := &Request{Params: map[string]json.RawMessage{tt.meta.Name: tt.raw}}
-			if _, _, err := jsonParamValue(req, tt.meta); err == nil {
+			if _, _, err := (&APIRegistry{}).jsonParamValue(req, tt.meta); err == nil {
 				t.Fatal("expected invalid parameter to fail")
 			}
 		})
@@ -294,6 +341,28 @@ func TestBinaryModeHTTP(t *testing.T) {
 	respBody, _ := io.ReadAll(resp.Body)
 	if string(respBody) != `"pong"` {
 		t.Fatalf("body = %q", string(respBody))
+	}
+}
+
+func TestJSONRequestModeIsNotReportedAsBinary(t *testing.T) {
+	rt := NewRouter()
+	var binaryMode bool
+	rt.Handle("ping", func(_ context.Context, req *Request) error {
+		binaryMode = req.BinaryMode
+		req.Buf.AppendString(`"pong"`)
+		return nil
+	})
+	rt.Registry.Register("ping", 100)
+	rt.Registry.RegisterParams("ping", nil)
+
+	r := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(`{"$api":"ping"}`))
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if binaryMode {
+		t.Fatal("JSON request must not be exposed to handlers as binary input")
 	}
 }
 
@@ -469,6 +538,40 @@ func TestRegistryParamNames(t *testing.T) {
 	}
 }
 
+func TestRegistryRegisterSchemaAPIs(t *testing.T) {
+	s := schema.New()
+	s.RegisterAPI(&schema.API{
+		ID:   17,
+		Name: "createUsers",
+		Params: []schema.Param{
+			{ID: 1, Name: "teamId", Type: schema.FieldInt, TypeName: "Int"},
+			{ID: 2, Name: "inputs", Type: schema.FieldModel, TypeName: "CreateUserInput", IsList: true},
+			{ID: 3, Name: "role", Type: schema.FieldEnum, TypeName: "UserRole", Nullable: true},
+		},
+	})
+
+	reg := NewAPIRegistry()
+	reg.RegisterSchemaAPIs(s)
+
+	if id, ok := reg.IDByName("createUsers"); !ok || id != 17 {
+		t.Fatalf("IDByName(createUsers) = %d, %v", id, ok)
+	}
+	if reg.schema != s {
+		t.Fatal("schema was not attached to registry")
+	}
+	want := []ParamMeta{
+		{Name: "teamId", Type: "Int", TypeName: "Int", FieldID: 1},
+		{Name: "inputs", Type: "Model", TypeName: "CreateUserInput", FieldID: 2, IsList: true},
+		{Name: "role", Type: "Enum", TypeName: "UserRole", FieldID: 3, Nullable: true},
+	}
+	if got := reg.ParamOrder("createUsers"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("ParamOrder(createUsers) = %#v, want %#v", got, want)
+	}
+	if got := reg.ParamNames("createUsers"); !reflect.DeepEqual(got, []string{"teamId", "inputs", "role"}) {
+		t.Fatalf("ParamNames(createUsers) = %v", got)
+	}
+}
+
 // --- ParseBinaryRequest edge cases ---
 
 func TestParseBinaryRequestInvalidVarint(t *testing.T) {
@@ -477,6 +580,86 @@ func TestParseBinaryRequestInvalidVarint(t *testing.T) {
 	_, err := reg.ParseBinaryRequest([]byte{0x80})
 	if err == nil {
 		t.Fatal("should error on invalid varint")
+	}
+}
+
+func TestParseBinaryRequestIntoResetsReusedRequest(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("ping", 1)
+
+	req := &Request{
+		API:         "stale",
+		Params:      map[string]json.RawMessage{"stale": json.RawMessage(`true`)},
+		Filters:     []Filter{{Field: "stale"}},
+		Sorters:     []Sorter{{Field: "stale"}},
+		Page:        9,
+		PageSize:    99,
+		ClientKey:   "stale",
+		Internal:    true,
+		pageSizeSet: true,
+		paramSlots:  [16]any{"stale"},
+		paramCount:  1,
+		paramSet:    1,
+		paramNull:   1,
+	}
+	if err := reg.ParseBinaryRequestInto([]byte{1, 0, 0}, req); err != nil {
+		t.Fatalf("parse binary request: %v", err)
+	}
+
+	if req.API != "ping" || !req.BinaryMode {
+		t.Fatalf("request identity = (%q, %v), want (ping, true)", req.API, req.BinaryMode)
+	}
+	if req.Page != 1 || req.PageSize != defaultPageSize {
+		t.Fatalf("pagination = (%d, %d), want (1, %d)", req.Page, req.PageSize, defaultPageSize)
+	}
+	if req.Params != nil || req.Filters != nil || req.Sorters != nil {
+		t.Fatalf("stale collections survived reuse: params=%v filters=%v sorters=%v", req.Params, req.Filters, req.Sorters)
+	}
+	if req.ClientKey != "" || req.Internal || req.pageSizeSet {
+		t.Fatalf("stale transport state survived reuse: client=%q internal=%v pageSizeSet=%v", req.ClientKey, req.Internal, req.pageSizeSet)
+	}
+	if req.paramCount != 0 || req.paramSet != 0 || req.paramNull != 0 || req.paramSlots[0] != nil {
+		t.Fatalf("stale binary params survived reuse: count=%d set=%d null=%d slot=%v", req.paramCount, req.paramSet, req.paramNull, req.paramSlots[0])
+	}
+}
+
+func TestParseBinaryRequestIntoRejectsNilDestination(t *testing.T) {
+	reg := NewAPIRegistry()
+	if err := reg.ParseBinaryRequestInto([]byte{1, 0, 0}, nil); err == nil {
+		t.Fatal("expected nil destination error")
+	}
+}
+
+func TestParseBinaryRequestRejectsMissingRequiredSchemaParam(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("create", 1)
+	reg.RegisterParams("create", []ParamMeta{{Name: "input", Type: "Model", TypeName: "CreateInput", FieldID: 1}})
+	s := schema.New()
+	s.RegisterAPI(&schema.API{ID: 1, Name: "create", Params: []schema.Param{{ID: 1, Name: "input", Type: schema.FieldModel, TypeName: "CreateInput"}}})
+	reg.SetSchema(s)
+
+	if _, err := reg.ParseBinaryRequest([]byte{1, 0, 0}); err == nil {
+		t.Fatal("missing required structured parameter was accepted")
+	}
+}
+
+func TestJSONStructuredParamRejectsInvalidShapes(t *testing.T) {
+	meta := ParamMeta{Name: "input", Type: "Model", TypeName: "MissingInput"}
+	if _, _, err := new(APIRegistry).jsonStructuredParam(json.RawMessage(`{}`), meta); err == nil {
+		t.Fatal("structured parameter without schema was accepted")
+	}
+
+	reg := NewAPIRegistry()
+	reg.SetSchema(schema.New())
+	if _, _, err := reg.jsonStructuredParam(json.RawMessage(`{}`), meta); err == nil {
+		t.Fatal("unknown structured parameter type was accepted")
+	}
+	meta.IsList = true
+	if _, _, err := reg.jsonStructuredParam(json.RawMessage(`{}`), meta); err == nil {
+		t.Fatal("structured list object was accepted")
+	}
+	if _, _, err := reg.jsonStructuredParam(json.RawMessage(`[{}]`), meta); err == nil {
+		t.Fatal("invalid structured list element was accepted")
 	}
 }
 
@@ -926,6 +1109,101 @@ func TestParseBinaryRequestAppliesPaginationParams(t *testing.T) {
 	}
 }
 
+func TestAPIRegistryAppliesSchemaPaginationDefaults(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("browseUsers", 1)
+	meta := []ParamMeta{{Name: "page", Type: "Int", FieldID: 1}, {Name: "pageSize", Type: "Int", FieldID: 2}}
+	reg.RegisterParams("browseUsers", meta)
+	s := schema.New()
+	s.RegisterAPI(&schema.API{
+		ID: 1, Name: "browseUsers", Paginated: true, DefaultPageSize: 50,
+		Params: []schema.Param{
+			{ID: 1, Name: "page", Type: schema.FieldInt, HasDefault: true},
+			{ID: 2, Name: "pageSize", Type: schema.FieldInt, HasDefault: true},
+		},
+	})
+	reg.SetSchema(s)
+
+	binaryReq, err := reg.ParseBinaryRequest(mustEncodeBinaryRequest(t, 1, nil, nil, meta))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binaryReq.Page != 1 || binaryReq.PageSize != 50 {
+		t.Fatalf("binary defaults = %d/%d, want 1/50", binaryReq.Page, binaryReq.PageSize)
+	}
+
+	jsonReq, err := ParseRequest(httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(`{"$api":"browseUsers"}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.prepareJSONRequest(jsonReq); err != nil {
+		t.Fatal(err)
+	}
+	if jsonReq.Page != 1 || jsonReq.PageSize != 50 {
+		t.Fatalf("JSON defaults = %d/%d, want 1/50", jsonReq.Page, jsonReq.PageSize)
+	}
+	canonical, err := reg.ParseBinaryRequest(jsonReq.BinaryRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical.Page != 1 || canonical.PageSize != 50 {
+		t.Fatalf("canonical JSON request defaults = %d/%d, want 1/50", canonical.Page, canonical.PageSize)
+	}
+}
+
+func TestAPIRegistryPreservesExplicitPagination(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("browseUsers", 1)
+	meta := []ParamMeta{{Name: "page", Type: "Int", FieldID: 1}, {Name: "pageSize", Type: "Int", FieldID: 2}}
+	reg.RegisterParams("browseUsers", meta)
+	s := schema.New()
+	s.RegisterAPI(&schema.API{ID: 1, Name: "browseUsers", Paginated: true, DefaultPageSize: 50})
+	reg.SetSchema(s)
+
+	binaryReq, err := reg.ParseBinaryRequest(mustEncodeBinaryRequest(t, 1, nil, map[string]any{"page": 3, "pageSize": 7}, meta))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binaryReq.Page != 3 || binaryReq.PageSize != 7 {
+		t.Fatalf("binary pagination = %d/%d, want 3/7", binaryReq.Page, binaryReq.PageSize)
+	}
+
+	jsonReq, err := ParseRequest(httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(`{"$api":"browseUsers","page":3,"pageSize":7}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.prepareJSONRequest(jsonReq); err != nil {
+		t.Fatal(err)
+	}
+	if jsonReq.Page != 3 || jsonReq.PageSize != 7 {
+		t.Fatalf("JSON pagination = %d/%d, want 3/7", jsonReq.Page, jsonReq.PageSize)
+	}
+	canonical, err := reg.ParseBinaryRequest(jsonReq.BinaryRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical.Page != 3 || canonical.PageSize != 7 {
+		t.Fatalf("canonical JSON pagination = %d/%d, want 3/7", canonical.Page, canonical.PageSize)
+	}
+}
+
+func TestAPIRegistryRejectsInvalidSchemaPaginationDefaults(t *testing.T) {
+	for _, invalid := range []int{0, 101} {
+		reg := NewAPIRegistry()
+		reg.Register("browseUsers", 1)
+		s := schema.New()
+		s.RegisterAPI(&schema.API{ID: 1, Name: "browseUsers", Paginated: true, DefaultPageSize: invalid})
+		reg.SetSchema(s)
+		req, err := reg.ParseBinaryRequest([]byte{1, 0, 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if req.PageSize != defaultPageSize {
+			t.Fatalf("default %d produced page size %d, want %d", invalid, req.PageSize, defaultPageSize)
+		}
+	}
+}
+
 func TestBinaryRequestRoundTripsFiltersAndSorters(t *testing.T) {
 	reg := NewAPIRegistry()
 	reg.Register("listUsers", 1)
@@ -1177,6 +1455,48 @@ func TestReadBinaryParamJSONPreservesRawJSON(t *testing.T) {
 	}
 	if got, ok := val.(json.RawMessage); !ok || string(got) != `{"name":"luxo"}` {
 		t.Fatalf("JSON param = %#v", val)
+	}
+}
+
+func TestStructuredBinaryParamsPreserveNativeMessages(t *testing.T) {
+	message := BinaryMessage{0, 1, 4, 'l', 'u', 'x', 'o', 0}
+	messages := BinaryMessages{message, BinaryMessage{0, 1, 2, 'g', 'o', 0}}
+	meta := []ParamMeta{
+		{Name: "input", Type: "Model", TypeName: "CreateInput", FieldID: 1},
+		{Name: "inputs", Type: "Model", TypeName: "CreateInput", FieldID: 2, IsList: true},
+	}
+	body := mustEncodeBinaryRequest(t, 9, nil, map[string]any{
+		"input":  message,
+		"inputs": messages,
+	}, meta)
+	registry := NewAPIRegistry()
+	registry.Register("create", 9)
+	registry.RegisterParams("create", meta)
+	req, err := registry.ParseBinaryRequest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, present, err := req.ParamMessage("input", false, false)
+	if err != nil || !present || !bytes.Equal(got, message) {
+		t.Fatalf("message = %v, %v, %v", got, present, err)
+	}
+	gotList, present, err := req.ParamMessageArray("inputs", false, false)
+	if err != nil || !present || !reflect.DeepEqual(gotList, messages) {
+		t.Fatalf("messages = %v, %v, %v", gotList, present, err)
+	}
+}
+
+func TestStructuredBinaryParamsRejectInvalidMessageContainers(t *testing.T) {
+	listMeta := []ParamMeta{{Name: "inputs", Type: "Model", TypeName: "CreateInput", FieldID: 1, IsList: true}}
+	if _, err := EncodeBinaryRequest(9, nil, map[string]any{"inputs": []any{BinaryMessage{0}}}, listMeta); err == nil {
+		t.Fatal("non-canonical structured message list was encoded")
+	}
+	if _, _, err := readBinaryParam(nil, 0, ParamMeta{Name: "input", Type: "Model", TypeName: "CreateInput"}); err == nil {
+		t.Fatal("truncated structured message was decoded")
+	}
+	body := codec.AppendArrayHeader(nil, 1)
+	if _, _, err := readBinaryParam(body, 0, ParamMeta{Name: "inputs", Type: "Model", TypeName: "CreateInput", IsList: true}); err == nil {
+		t.Fatal("truncated structured message list was decoded")
 	}
 }
 

@@ -8,6 +8,23 @@ import kotlin.test.assertFailsWith
 
 class LuxoEncoderDecoderTest {
 
+	@Test
+	fun `length-delimited values are written in place`() {
+		val enc = LuxoEncoder(4)
+		enc.writeDelimited { value ->
+			value.writeVarint(7L)
+			value.writeString("go")
+		}
+		assertTrue(byteArrayOf(4, 7, 2, 103, 111).contentEquals(enc.bytes()))
+
+		val large = LuxoEncoder(4)
+		large.writeDelimited { it.writeRawBytes(ByteArray(130) { 9 }) }
+		val bytes = large.bytes()
+		assertEquals(132, bytes.size)
+		assertTrue(byteArrayOf(0x82.toByte(), 1).contentEquals(bytes.copyOfRange(0, 2)))
+		assertTrue(bytes.copyOfRange(2, bytes.size).all { it == 9.toByte() })
+	}
+
     @Test
     fun `bytes round-trip preserves arbitrary binary data`() {
         val expected = byteArrayOf(0, 1, 127, 0x80.toByte(), 0xff.toByte())

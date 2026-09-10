@@ -17,6 +17,19 @@ func TestParseEmpty(t *testing.T) {
 	}
 }
 
+func TestFormatCanonicalSelection(t *testing.T) {
+	fields, err := Parse(" id , project { id , owner { name } } ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := Format(fields); got != "id,project{id,owner{name}}" {
+		t.Fatalf("Format() = %q", got)
+	}
+	if got := Format(nil); got != "" {
+		t.Fatalf("Format(nil) = %q", got)
+	}
+}
+
 func TestParseOnlySpaces(t *testing.T) {
 	fields, err := Parse("   ")
 	if err != nil {
@@ -112,6 +125,55 @@ func TestParseNestedOneLevel(t *testing.T) {
 	}
 	if posts.Children[0].Name != "title" || posts.Children[1].Name != "content" {
 		t.Error("posts children should be title, content")
+	}
+}
+
+func TestMergePreservesNestedSelections(t *testing.T) {
+	left := []*Field{{Name: "id"}, {Name: "project", Children: []*Field{{Name: "id"}, {Name: "owner", Children: []*Field{{Name: "id"}}}}}}
+	right := []*Field{{Name: "title"}, {Name: "project", Children: []*Field{{Name: "name"}, {Name: "owner", Children: []*Field{{Name: "username"}}}}}}
+
+	merged := Merge(left, right)
+	if got := Format(merged); got != "id,project{id,owner{id,username},name},title" {
+		t.Fatalf("Merge() = %q", got)
+	}
+	if got := Format(left); got != "id,project{id,owner{id}}" {
+		t.Fatalf("Merge() mutated left input: %q", got)
+	}
+	if merged[0].Children != nil {
+		t.Fatalf("Merge() changed scalar leaf into an object selection: %#v", merged[0])
+	}
+}
+
+func TestMergeAllSelectionDominatesAndEnsureFieldCopies(t *testing.T) {
+	partial := []*Field{{Name: "name"}}
+	if merged := Merge(nil, partial); merged != nil {
+		t.Fatalf("Merge(nil, partial) = %#v", merged)
+	}
+	ensured := EnsureField(partial, "id")
+	if got := Format(ensured); got != "name,id" {
+		t.Fatalf("EnsureField() = %q", got)
+	}
+	if got := Format(partial); got != "name" {
+		t.Fatalf("EnsureField() mutated input: %q", got)
+	}
+	if EnsureField(nil, "id") != nil {
+		t.Fatal("EnsureField(nil) must preserve select-all")
+	}
+	existing := EnsureField(partial, "name")
+	if len(existing) != 1 || existing[0] != partial[0] {
+		t.Fatalf("EnsureField(existing) = %#v", existing)
+	}
+}
+
+func TestMergeLeafSelectionDominatesNestedSelection(t *testing.T) {
+	left := []*Field{{Name: "project"}}
+	right := []*Field{{Name: "project", Children: []*Field{{Name: "name"}}}}
+	merged := Merge(left, right)
+	if got := Format(merged); got != "project" {
+		t.Fatalf("Merge() = %q, want leaf selection", got)
+	}
+	if cloneField(nil) != nil {
+		t.Fatal("cloneField(nil) must return nil")
 	}
 }
 

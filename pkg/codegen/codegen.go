@@ -172,7 +172,7 @@ func (g *GeneratorContext) Generate(result *semantic.Result, packageName string,
 	gr := &GenerateResult{
 		Files: make(map[string][]byte),
 	}
-	enums := collectEnums(result)
+	enums := g.allEnums(collectEnums(result))
 
 	gr.Files["model.gen.go"] = g.generateModelFile(result, packageName, enums)
 
@@ -223,6 +223,20 @@ func (g *GeneratorContext) Generate(result *semantic.Result, packageName string,
 		gr.Files[name] = formatted
 	}
 	return gr, nil
+}
+
+func (g *GeneratorContext) allEnums(local map[string]bool) map[string]bool {
+	if g.events == nil || len(g.events.EnumModule) == 0 {
+		return local
+	}
+	result := make(map[string]bool, len(local)+len(g.events.EnumModule))
+	for name := range local {
+		result[name] = true
+	}
+	for name := range g.events.EnumModule {
+		result[name] = true
+	}
+	return result
 }
 
 // formatGenerated runs gofmt (go/format) on generated Go source so emitted
@@ -280,7 +294,7 @@ func (g *GeneratorContext) generateModelFile(result *semantic.Result, packageNam
 				continue
 			}
 			extendDone[ext.Name] = true
-			g.generateExtendStub(&b, ext)
+			g.generateExtendStub(&b, ext, enums)
 			b.WriteByte('\n')
 		}
 	}

@@ -167,6 +167,10 @@ func (p *Parser) parseType() *ast.TypeDecl {
 	// fields
 	p.expect(token.LBrace)
 	for !p.check(token.RBrace) && !p.isEOF() {
+		p.consumeDoc()
+		if p.check(token.RBrace) || p.isEOF() {
+			break
+		}
 		td.Fields = append(td.Fields, p.parseField())
 	}
 	p.expect(token.RBrace)

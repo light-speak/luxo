@@ -21,9 +21,10 @@ type Schema struct {
 
 // Enum describes an enum type with its values.
 type Enum struct {
-	Name   string   `json:"name"`
-	Module string   `json:"module,omitempty"`
-	Values []string `json:"values"`
+	Name        string   `json:"name"`
+	Module      string   `json:"module,omitempty"`
+	Values      []string `json:"values"`
+	Description string   `json:"description,omitempty"`
 }
 
 // TypeUsage describes whether a structured type is used for API input,
@@ -39,10 +40,12 @@ const (
 
 // TypeDecl describes a plain data type (non-DB, like AuthPayload).
 type TypeDecl struct {
-	Name   string    `json:"name"`
-	Module string    `json:"module,omitempty"`
-	Usage  TypeUsage `json:"usage,omitempty"`
-	Fields []Field   `json:"fields"`
+	Name        string    `json:"name"`
+	Module      string    `json:"module,omitempty"`
+	Usage       TypeUsage `json:"usage,omitempty"`
+	Fields      []Field   `json:"fields"`
+	Description string    `json:"description,omitempty"`
+	Directives  []string  `json:"directives,omitempty"`
 }
 
 // AsModel converts TypeDecl to a Model for Binary↔JSON conversion.
@@ -51,7 +54,7 @@ func (td *TypeDecl) AsModel() *Model {
 	// Copy the fields slice so we don't mutate td.Fields (JSONPrefix append).
 	fields := make([]Field, len(td.Fields))
 	copy(fields, td.Fields)
-	m := &Model{Name: td.Name, Module: td.Module, Fields: fields}
+	m := &Model{Name: td.Name, Module: td.Module, Fields: fields, Description: td.Description, Directives: td.Directives}
 	m.byID = make(map[int]*Field, len(m.Fields))
 	m.byName = make(map[string]*Field, len(m.Fields))
 	for i := range m.Fields {
@@ -67,25 +70,42 @@ func (td *TypeDecl) AsModel() *Model {
 
 // Model describes a model's fields for binary ↔ JSON conversion.
 type Model struct {
-	Name   string    `json:"name"`
-	Module string    `json:"module,omitempty"`
-	Usage  TypeUsage `json:"usage,omitempty"`
-	Fields []Field   `json:"fields"`
-	byID   map[int]*Field
-	byName map[string]*Field
+	Name        string    `json:"name"`
+	Module      string    `json:"module,omitempty"`
+	Usage       TypeUsage `json:"usage,omitempty"`
+	Fields      []Field   `json:"fields"`
+	Description string    `json:"description,omitempty"`
+	Directives  []string  `json:"directives,omitempty"`
+	byID        map[int]*Field
+	byName      map[string]*Field
 }
+
+// RelationKind describes where the join key is stored.
+type RelationKind string
+
+const (
+	RelationBelongsTo RelationKind = "belongsTo"
+	RelationHasMany   RelationKind = "hasMany"
+	RelationHasOne    RelationKind = "hasOne"
+)
 
 // Field describes a single model field.
 type Field struct {
-	ID         int       `json:"id"`
-	Name       string    `json:"name"`
-	Type       FieldType `json:"type"`
-	TypeName   string    `json:"typeName,omitempty"` // original Luxo type name (User, MemberRole, etc.)
-	Nullable   bool      `json:"nullable,omitempty"`
-	IsList     bool      `json:"isList,omitempty"`
-	Relation   bool      `json:"relation,omitempty"` // true if this is a relation field (not a DB column)
-	Computed   bool      `json:"computed,omitempty"` // true if this is a selectable non-persistent field
-	PrimaryKey bool      `json:"primaryKey,omitempty"`
+	ID           int          `json:"id"`
+	Name         string       `json:"name"`
+	Type         FieldType    `json:"type"`
+	TypeName     string       `json:"typeName,omitempty"` // original Luxo type name (User, MemberRole, etc.)
+	Nullable     bool         `json:"nullable,omitempty"`
+	IsList       bool         `json:"isList,omitempty"`
+	Relation     bool         `json:"relation,omitempty"` // true if this is a relation field (not a DB column)
+	Computed     bool         `json:"computed,omitempty"` // true if this is a selectable non-persistent field
+	PrimaryKey   bool         `json:"primaryKey,omitempty"`
+	Description  string       `json:"description,omitempty"`
+	Directives   []string     `json:"directives,omitempty"`
+	RelationKind RelationKind `json:"relationKind,omitempty"`
+	LocalKey     string       `json:"localKey,omitempty"`
+	RemoteKey    string       `json:"remoteKey,omitempty"`
+	TargetModule string       `json:"targetModule,omitempty"`
 	// Federation: which module defined this field (empty = same module as the model)
 	Module string `json:"module,omitempty"`
 	// Federation: FK field name for resolving cross-module relations (e.g. "userId")
@@ -114,27 +134,31 @@ const (
 
 // API describes an API's params and return type.
 type API struct {
-	ID               int     `json:"id"`
-	Name             string  `json:"name"`
-	Module           string  `json:"module"`
-	ReturnType       string  `json:"returnType,omitempty"`
-	ReturnList       bool    `json:"returnList,omitempty"`
-	Paginated        bool    `json:"paginated,omitempty"`
-	Stream           bool    `json:"stream,omitempty"`
-	Params           []Param `json:"params,omitempty"`
-	Deprecated       bool    `json:"deprecated,omitempty"`
-	DeprecatedReason string  `json:"deprecatedReason,omitempty"`
+	ID               int      `json:"id"`
+	Name             string   `json:"name"`
+	Module           string   `json:"module"`
+	ReturnType       string   `json:"returnType,omitempty"`
+	ReturnList       bool     `json:"returnList,omitempty"`
+	Paginated        bool     `json:"paginated,omitempty"`
+	DefaultPageSize  int      `json:"defaultPageSize,omitempty"`
+	Stream           bool     `json:"stream,omitempty"`
+	Params           []Param  `json:"params,omitempty"`
+	Deprecated       bool     `json:"deprecated,omitempty"`
+	DeprecatedReason string   `json:"deprecatedReason,omitempty"`
+	Description      string   `json:"description,omitempty"`
+	Directives       []string `json:"directives,omitempty"`
 }
 
 // Param describes an API parameter.
 type Param struct {
-	ID         int       `json:"id"`
-	Name       string    `json:"name"`
-	Type       FieldType `json:"type"`
-	TypeName   string    `json:"typeName,omitempty"`
-	IsList     bool      `json:"isList,omitempty"`     // true for array params (in/notIn → [T])
-	Nullable   bool      `json:"nullable,omitempty"`   // true when the DSL type has a ? suffix
-	HasDefault bool      `json:"hasDefault,omitempty"` // true when the DSL parameter declares a default
+	ID          int       `json:"id"`
+	Name        string    `json:"name"`
+	Type        FieldType `json:"type"`
+	TypeName    string    `json:"typeName,omitempty"`
+	IsList      bool      `json:"isList,omitempty"`     // true for array params (in/notIn → [T])
+	Nullable    bool      `json:"nullable,omitempty"`   // true when the DSL type has a ? suffix
+	HasDefault  bool      `json:"hasDefault,omitempty"` // true when the DSL parameter declares a default
+	Description string    `json:"description,omitempty"`
 }
 
 // fieldTypeNames maps FieldType to its string representation for JSON.
@@ -219,9 +243,15 @@ func (s *Schema) RegisterModel(m *Model) {
 }
 
 func mergeModels(existing, incoming *Model) *Model {
-	merged := &Model{Name: existing.Name, Module: existing.Module}
+	merged := &Model{Name: existing.Name, Module: existing.Module, Description: existing.Description, Directives: existing.Directives}
 	if incoming.Module != "" {
 		merged.Module = incoming.Module
+	}
+	if incoming.Description != "" {
+		merged.Description = incoming.Description
+	}
+	if len(incoming.Directives) > 0 {
+		merged.Directives = incoming.Directives
 	}
 	merged.Fields = append(merged.Fields, existing.Fields...)
 	byID := make(map[int]int, len(merged.Fields))

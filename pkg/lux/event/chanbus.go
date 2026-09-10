@@ -2,9 +2,17 @@ package event
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
+)
+
+var (
+	// ErrBusClosed is returned when publishing or subscribing after shutdown.
+	ErrBusClosed = errors.New("event: bus is closed")
+	// ErrBufferFull is returned when a non-blocking in-process publish cannot be accepted.
+	ErrBufferFull = errors.New("event: buffer is full")
 )
 
 // ChanBus implements Bus using Go channels.
@@ -14,15 +22,10 @@ type ChanBus struct {
 	mu       sync.RWMutex
 	subs     map[string][]Handler
 	bufSize  int
-	channels map[string]chan message
+	channels map[string]chan any
 	done     chan struct{}
 	once     sync.Once
 	wg       sync.WaitGroup
-}
-
-type message struct {
-	ctx     context.Context
-	payload any
 }
 
 // NewChanBus creates a channel-based event bus.
@@ -34,35 +37,37 @@ func NewChanBus(bufSize int) *ChanBus {
 	return &ChanBus{
 		subs:     make(map[string][]Handler),
 		bufSize:  bufSize,
-		channels: make(map[string]chan message),
+		channels: make(map[string]chan any),
 		done:     make(chan struct{}),
 	}
 }
 
 var _ Bus = (*ChanBus)(nil)
 
-// Emit publishes an event. Non-blocking — drops if buffer is full or bus is closed.
+// Emit publishes an event without blocking. Accepted events are drained during Close.
 func (b *ChanBus) Emit(ctx context.Context, name string, payload any) error {
+	b.mu.RLock()
 	select {
 	case <-b.done:
-		return fmt.Errorf("event: bus is closed")
+		b.mu.RUnlock()
+		return ErrBusClosed
 	default:
 	}
 
-	b.mu.RLock()
 	ch, ok := b.channels[name]
-	b.mu.RUnlock()
-
 	if !ok {
+		b.mu.RUnlock()
 		return nil // no subscribers
 	}
 
 	select {
-	case ch <- message{ctx: ctx, payload: payload}:
+	case ch <- payload:
+		b.mu.RUnlock()
+		return nil
 	default:
-		// buffer full, drop
+		b.mu.RUnlock()
+		return ErrBufferFull
 	}
-	return nil
 }
 
 // On registers a handler. Starts a goroutine to consume events.
@@ -72,13 +77,13 @@ func (b *ChanBus) On(name string, handler Handler) error {
 	select {
 	case <-b.done:
 		b.mu.Unlock()
-		return fmt.Errorf("event: bus is closed")
+		return ErrBusClosed
 	default:
 	}
 	b.subs[name] = append(b.subs[name], handler)
 
 	if _, ok := b.channels[name]; !ok {
-		ch := make(chan message, b.bufSize)
+		ch := make(chan any, b.bufSize)
 		b.channels[name] = ch
 		// Start dispatcher for this event
 		b.wg.Add(1)
@@ -95,22 +100,17 @@ func (b *ChanBus) OnQueue(name string, group string, handler Handler) error {
 }
 
 // dispatch reads from the channel and calls all handlers for the event.
-func (b *ChanBus) dispatch(name string, ch chan message) {
+func (b *ChanBus) dispatch(name string, ch <-chan any) {
 	defer b.wg.Done()
-	for {
-		select {
-		case msg := <-ch:
-			b.mu.RLock()
-			handlers := b.subs[name]
-			b.mu.RUnlock()
+	for payload := range ch {
+		b.mu.RLock()
+		handlers := b.subs[name]
+		b.mu.RUnlock()
 
-			for _, h := range handlers {
-				if err := safeCall(h, msg.ctx, msg.payload); err != nil {
-					fmt.Fprintf(os.Stderr, "event %s handler error: %v\n", name, err)
-				}
+		for _, h := range handlers {
+			if err := safeCall(h, bgCtx, payload); err != nil {
+				fmt.Fprintf(os.Stderr, "event %s handler error: %v\n", name, err)
 			}
-		case <-b.done:
-			return
 		}
 	}
 }
@@ -126,12 +126,15 @@ func safeCall(h Handler, ctx context.Context, payload any) (err error) {
 	return h(ctx, payload)
 }
 
-// Close shuts down all dispatchers and waits for in-flight handlers to stop.
-// Event channels remain open so an Emit already in progress cannot panic.
+// Close shuts down all dispatchers and channels.
+// Waits for all accepted events and in-flight handlers before returning.
 func (b *ChanBus) Close() {
 	b.once.Do(func() {
-		b.mu.Lock()
 		close(b.done)
+		b.mu.Lock()
+		for _, ch := range b.channels {
+			close(ch)
+		}
 		b.mu.Unlock()
 		b.wg.Wait()
 	})

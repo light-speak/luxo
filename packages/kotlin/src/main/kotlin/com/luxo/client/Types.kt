@@ -2,6 +2,13 @@ package com.luxo.client
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonElement
+
+/** Generated input values encode directly in binary mode and lazily in JSON mode. */
+interface LuxoBinaryEncodable {
+	fun writeLuxo(encoder: LuxoEncoder)
+	fun toLuxoJson(): JsonElement
+}
 
 /** Three-state argument for patch APIs: absent, explicit null, or a value. */
 sealed interface LuxoOptional<out T> {
@@ -93,6 +100,7 @@ data class LuxoAPI(
     val returnType: String? = null,
     val returnList: Boolean = false,
     val paginated: Boolean = false,
+    val defaultPageSize: Int? = null,
     val stream: Boolean = false,
     val params: List<LuxoParam> = emptyList(),
 )

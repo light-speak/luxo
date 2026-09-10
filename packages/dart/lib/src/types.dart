@@ -196,6 +196,7 @@ class LuxoAPI {
   final String? returnType;
   final bool returnList;
   final bool paginated;
+  final int? defaultPageSize;
   final bool stream;
   final List<LuxoParam> params;
 
@@ -206,6 +207,7 @@ class LuxoAPI {
     this.returnType,
     this.returnList = false,
     this.paginated = false,
+    this.defaultPageSize,
     this.stream = false,
     this.params = const [],
   });
@@ -217,6 +219,7 @@ class LuxoAPI {
         returnType: json['returnType'] as String?,
         returnList: json['returnList'] as bool? ?? false,
         paginated: json['paginated'] as bool? ?? false,
+        defaultPageSize: json['defaultPageSize'] as int?,
         stream: json['stream'] as bool? ?? false,
         params: (json['params'] as List?)
                 ?.map((e) => LuxoParam.fromJson(e as Map<String, dynamic>))

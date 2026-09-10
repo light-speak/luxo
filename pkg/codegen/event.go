@@ -62,7 +62,7 @@ func (g *GeneratorContext) generateEventFile(result *semantic.Result, packageNam
 	if len(events) > 0 {
 		b.WriteString("\t\"fmt\"\n")
 	}
-	if eventsNeedJSON(events, enums, objects) {
+	if eventsNeedJSON(events) {
 		b.WriteString("\t\"encoding/json\"\n")
 	}
 	if needsTime {
@@ -166,16 +166,10 @@ func eventsUseObjects(events []*ast.EventDecl, objects map[string]bool) bool {
 	return false
 }
 
-func eventsNeedJSON(events []*ast.EventDecl, enums, objects map[string]bool) bool {
+func eventsNeedJSON(events []*ast.EventDecl) bool {
 	for _, eventDecl := range events {
 		for _, param := range eventDecl.Params {
-			if param.Type == nil {
-				return true
-			}
-			if param.Type.Name == "JSON" {
-				return true
-			}
-			if !isEventBuiltin(param.Type.Name) && !enums[param.Type.Name] && !objects[param.Type.Name] {
+			if param.Type != nil && param.Type.Name == "JSON" {
 				return true
 			}
 		}
@@ -264,9 +258,7 @@ func (g *GeneratorContext) writeEventMarshalField(b *strings.Builder, eventName 
 	}
 	if isEventBuiltin(param.Type.Name) || isEnum {
 		writeEventScalarMarshal(b, fieldID, value, param.Type, isEnum)
-		return
 	}
-	fmt.Fprintf(b, "\tif data, err := json.Marshal(%s); err == nil { enc.WriteFieldBytes(%d, data) }\n", value, fieldID)
 }
 
 func writeEventScalarMarshal(b *strings.Builder, fieldID int, value string, ref *ast.TypeRef, isEnum bool) {
@@ -321,9 +313,6 @@ func writeEventListMarshal(b *strings.Builder, fieldID int, value, typeName stri
 		writeEventObjectValue(b, item, "\t\t")
 	} else if isEventBuiltin(typeName) || isEnum {
 		fmt.Fprintf(b, "\t\t%s\n", eventScalarWriteStatement(typeName, item, isEnum))
-	} else {
-		fmt.Fprintf(b, "\t\tdata, _ := json.Marshal(%s)\n", item)
-		b.WriteString("\t\tenc.WriteBytes(data)\n")
 	}
 	b.WriteString("\t}\n")
 }
@@ -365,10 +354,7 @@ func (g *GeneratorContext) writeEventUnmarshalField(b *strings.Builder, eventNam
 	}
 	if isEventBuiltin(param.Type.Name) || isEnum {
 		writeEventScalarUnmarshal(b, fieldID, value, param.Type, isEnum)
-		return
 	}
-	fmt.Fprintf(b, "\t\tcase %d:\n", fieldID)
-	fmt.Fprintf(b, "\t\t\tif err := json.Unmarshal(dec.ReadBytes(), &%s); err != nil { return err }\n", value)
 }
 
 func writeEventScalarUnmarshal(b *strings.Builder, fieldID int, value string, ref *ast.TypeRef, isEnum bool) {
@@ -464,8 +450,6 @@ func writeEventListUnmarshal(b *strings.Builder, fieldID int, value, typeName st
 		fmt.Fprintf(b, "\t\t\t\t%s = parsed\n", item)
 	} else if isEventBuiltin(typeName) || isEnum {
 		fmt.Fprintf(b, "\t\t\t\t%s = %s\n", item, eventScalarReadExpression(typeName, isEnum, false))
-	} else {
-		fmt.Fprintf(b, "\t\t\t\tif err := json.Unmarshal(dec.ReadBytes(), &%s); err != nil { return err }\n", item)
 	}
 	b.WriteString("\t\t\t}\n")
 }

@@ -44,6 +44,22 @@ void main() {
         expect(bytes[1], equals(0x01)); // 128 >> 7
       });
 
+      test('length-delimited values are written in place', () {
+        final enc = LuxoEncoder(4);
+        enc.writeDelimited((value) {
+          value.writeVarint(7);
+          value.writeString('go');
+        });
+        expect(enc.bytes(), equals([4, 7, 2, 103, 111]));
+
+        final large = LuxoEncoder(4);
+        large.writeDelimited(
+          (value) => value.writeRawBytes(Uint8List(130)..fillRange(0, 130, 9)),
+        );
+        expect(large.bytes().sublist(0, 2), equals([130, 1]));
+        expect(large.bytes().sublist(2), everyElement(9));
+      });
+
       test('300 (two-byte varint)', () {
         final enc = LuxoEncoder();
         enc.writeVarint(300);
@@ -83,8 +99,10 @@ void main() {
       test('negative -42', () => testRoundTrip(-42));
       test('large positive', () => testRoundTrip(2147483647));
       test('large negative', () => testRoundTrip(-2147483648));
-      test('very large positive',
-          () => testRoundTrip(9007199254740991)); // JS max safe int
+      test(
+        'very large positive',
+        () => testRoundTrip(9007199254740991),
+      ); // JS max safe int
       test('very large negative', () => testRoundTrip(-9007199254740991));
     });
 
@@ -358,8 +376,10 @@ void main() {
 
       test('invalid hex digit throws', () {
         final enc = LuxoEncoder();
-        expect(() => enc.writeUuid('zz0e8400-e29b-41d4-a716-446655440000'),
-            throwsFormatException);
+        expect(
+          () => enc.writeUuid('zz0e8400-e29b-41d4-a716-446655440000'),
+          throwsFormatException,
+        );
       });
 
       test('truncated wire data sets error', () {
@@ -609,39 +629,40 @@ void main() {
     });
 
     test(
-        'scalar array column — each cell is a length-prefixed [count][items] blob',
-        () {
-      // Column where each cell is a string-array blob: [count][string...]
-      final cell0 = BytesBuilder();
-      _writeVarint(cell0, 2); // 2 items
-      _writeString(cell0, 'x');
-      _writeString(cell0, 'y');
-      final cell1 = BytesBuilder();
-      _writeVarint(cell1, 0); // empty array
+      'scalar array column — each cell is a length-prefixed [count][items] blob',
+      () {
+        // Column where each cell is a string-array blob: [count][string...]
+        final cell0 = BytesBuilder();
+        _writeVarint(cell0, 2); // 2 items
+        _writeString(cell0, 'x');
+        _writeString(cell0, 'y');
+        final cell1 = BytesBuilder();
+        _writeVarint(cell1, 0); // empty array
 
-      final bb = BytesBuilder();
-      _writeVarint(bb, 2); // count=2 rows
-      _writeVarint(bb, 0); // arena size
-      _writeVarint(bb, 1); // fieldID=1
-      // cell 0 as length-prefixed blob
-      final c0 = cell0.toBytes();
-      _writeVarint(bb, c0.length);
-      bb.add(c0);
-      // cell 1 as length-prefixed blob
-      final c1 = cell1.toBytes();
-      _writeVarint(bb, c1.length);
-      bb.add(c1);
-      bb.addByte(0x00); // end
+        final bb = BytesBuilder();
+        _writeVarint(bb, 2); // count=2 rows
+        _writeVarint(bb, 0); // arena size
+        _writeVarint(bb, 1); // fieldID=1
+        // cell 0 as length-prefixed blob
+        final c0 = cell0.toBytes();
+        _writeVarint(bb, c0.length);
+        bb.add(c0);
+        // cell 1 as length-prefixed blob
+        final c1 = cell1.toBytes();
+        _writeVarint(bb, c1.length);
+        bb.add(c1);
+        bb.addByte(0x00); // end
 
-      final dec = ColumnarDecoder(Uint8List.fromList(bb.toBytes()));
-      expect(dec.nextColumn(), isTrue);
-      final blobs = dec.readColumnBytes();
-      expect(blobs.length, equals(2));
-      // Decode each cell blob with a row decoder.
-      expect(LuxoDecoder(blobs[0]).readStringArray(), equals(['x', 'y']));
-      expect(LuxoDecoder(blobs[1]).readStringArray(), isEmpty);
-      expect(dec.nextColumn(), isFalse);
-    });
+        final dec = ColumnarDecoder(Uint8List.fromList(bb.toBytes()));
+        expect(dec.nextColumn(), isTrue);
+        final blobs = dec.readColumnBytes();
+        expect(blobs.length, equals(2));
+        // Decode each cell blob with a row decoder.
+        expect(LuxoDecoder(blobs[0]).readStringArray(), equals(['x', 'y']));
+        expect(LuxoDecoder(blobs[1]).readStringArray(), isEmpty);
+        expect(dec.nextColumn(), isFalse);
+      },
+    );
 
     test('readSvarint public method', () {
       final bb = BytesBuilder();
@@ -665,7 +686,9 @@ void main() {
     test('dateTimeStringFromUnixSeconds matches JSON ISO 8601 UTC', () {
       expect(dateTimeStringFromUnixSeconds(seconds), equals(iso));
       expect(
-          dateTimeStringFromUnixSeconds(0), equals('1970-01-01T00:00:00.000Z'));
+        dateTimeStringFromUnixSeconds(0),
+        equals('1970-01-01T00:00:00.000Z'),
+      );
     });
 
     test('readDateTime decodes svarint seconds to ISO string', () {
@@ -711,14 +734,17 @@ void main() {
       final dec = LuxoDecoder(enc.bytes());
       expect(dec.nextField(), isTrue);
       expect(
-          dec.readDateTimeArray(), equals([iso, '1970-01-01T00:00:00.000Z']));
+        dec.readDateTimeArray(),
+        equals([iso, '1970-01-01T00:00:00.000Z']),
+      );
     });
 
     test('binary and JSON DateTime representations are identical', () {
       // JSON mode surfaces DateTime as the RFC3339 string the server sends.
-      final jsonValue =
-          DateTime.fromMillisecondsSinceEpoch(seconds * 1000, isUtc: true)
-              .toIso8601String();
+      final jsonValue = DateTime.fromMillisecondsSinceEpoch(
+        seconds * 1000,
+        isUtc: true,
+      ).toIso8601String();
 
       final enc = LuxoEncoder();
       enc.writeFieldInt(1, seconds);
@@ -743,7 +769,9 @@ void main() {
       final dec = ColumnarDecoder(Uint8List.fromList(bb.toBytes()));
       expect(dec.nextColumn(), isTrue);
       expect(
-          dec.readColumnDateTime(), equals([iso, '1970-01-01T00:00:00.000Z']));
+        dec.readColumnDateTime(),
+        equals([iso, '1970-01-01T00:00:00.000Z']),
+      );
       expect(dec.nextColumn(), isFalse);
     });
 

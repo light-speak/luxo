@@ -12,9 +12,6 @@ import (
 	"github.com/light-speak/luxo/pkg/token"
 )
 
-// crudOps defines the 6 CRUD operations.
-var crudOps = []string{"get", "list", "create", "update", "delete", "deleteMany"}
-
 // handlerFeatures holds feature detection flags for handler imports.
 type handlerFeatures struct {
 	hasOrGroups       bool
@@ -260,6 +257,7 @@ func (g *GeneratorContext) generateCRUDHandlers(b *strings.Builder, models []*as
 		if len(rels) > 0 {
 			generateRelationResolver(b, m, rels, modelRels, computedModels)
 			generateListRelationResolver(b, m, rels, modelRels, computedModels)
+			generateValueListRelationResolver(b, m, rels, modelRels, computedModels)
 		}
 	}
 }
@@ -319,6 +317,7 @@ func generateServiceFnHandlers(b *strings.Builder, result *semantic.Result, mode
 
 func (g *GeneratorContext) generateServiceFnHandlers(b *strings.Builder, result *semantic.Result, modelMap map[string]*ast.ModelDecl) []string {
 	enumSet := CollectEnumsFromResult(result)
+	nativeFunctions := collectNativeFunctionNames(result)
 	var names []string
 	for _, file := range result.Files {
 		for _, fn := range file.Functions {
@@ -330,7 +329,7 @@ func (g *GeneratorContext) generateServiceFnHandlers(b *strings.Builder, result 
 				generateNativeServiceHandler(b, fn, modelMap, enumSet)
 			} else if fn.Body != nil {
 				// Compiled fn @service
-				g.compileFnBody(b, fn, modelMap, enumSet)
+				g.compileFnBodyWithNativeFunctions(b, fn, modelMap, enumSet, nativeFunctions)
 			}
 			names = append(names, fn.Name)
 		}
@@ -383,6 +382,11 @@ func generateNativeAPIHandler(b *strings.Builder, api *ast.ApiDecl, models map[s
 	// Parse params
 	var paramNames []string
 	for _, p := range api.Params {
+		if isStructuredParam(p, enums) {
+			writeStructuredParamExtraction(b, p, enums, "\t\t")
+			paramNames = append(paramNames, p.Name)
+			continue
+		}
 		goType := resolveGoType(p.Type)
 		method := paramMethod(goType)
 		if p.Type != nil && p.Type.Nullable {
@@ -477,6 +481,11 @@ func generateNativeServiceHandler(b *strings.Builder, fn *ast.FnDecl, models map
 	// Parse params
 	var paramNames []string
 	for _, p := range fn.Params {
+		if isStructuredParam(p, enums) {
+			writeStructuredParamExtraction(b, p, enums, "\t\t")
+			paramNames = append(paramNames, p.Name)
+			continue
+		}
 		goType := resolveGoType(p.Type)
 		method := paramMethod(goType)
 		if p.Type != nil && p.Type.Nullable {
@@ -534,20 +543,6 @@ func (g *GeneratorContext) generateRegisterServiceFns(b *strings.Builder, servic
 	}
 
 	b.WriteString("}\n\n")
-}
-
-// writeFKEnsure generates ensureField calls for relation key columns.
-// BelongsTo needs the FK column (e.g., user_id); HasOne/HasMany need the local key (e.g., id).
-func writeFKEnsure(b *strings.Builder, rels []Relation) {
-	seen := make(map[string]bool)
-	for _, rel := range rels {
-		col := str.ToSnakeCase(rel.LocalKey)
-		if seen[col] {
-			continue
-		}
-		seen[col] = true
-		fmt.Fprintf(b, "\t\tcols = ensureField(cols, %q)\n", col)
-	}
 }
 
 // writeHandlerImports writes handler.gen.go imports.
@@ -642,7 +637,7 @@ func (g *GeneratorContext) writeHandlerImports(b *strings.Builder, result *seman
 	if hasPattern {
 		b.WriteString("\t\"regexp\"\n")
 	}
-	if hasTime || feat.hasTimeFunc {
+	if hasTime {
 		b.WriteString("\t\"time\"\n")
 	}
 	// crypto.randomHex uses luxocrypto import (covered by hasHash || hasCrypto check)
@@ -727,57 +722,7 @@ func hasCrud(m *ast.ModelDecl) bool {
 
 // crudOperations returns the list of CRUD ops enabled for a model.
 func crudOperations(m *ast.ModelDecl) []string {
-	for _, d := range m.Directives {
-		if d.Name != "crud" {
-			continue
-		}
-		// @crud without args → all 5 ops
-		if len(d.Args) == 0 {
-			return crudOps
-		}
-		// @crud(only: [...]) or @crud(except: [...])
-		for _, arg := range d.Args {
-			if arg.Name == "only" {
-				return extractListArg(arg.Value)
-			}
-			if arg.Name == "except" {
-				except := extractListArg(arg.Value)
-				return filterOps(crudOps, except)
-			}
-		}
-		return crudOps
-	}
-	return nil
-}
-
-// extractListArg extracts string values from a list expression [get, list, ...].
-func extractListArg(expr ast.Expr) []string {
-	list, ok := expr.(*ast.ListExpr)
-	if !ok {
-		return nil
-	}
-	var result []string
-	for _, elem := range list.Items {
-		if ident, ok := elem.(*ast.Ident); ok {
-			result = append(result, ident.Name)
-		}
-	}
-	return result
-}
-
-// filterOps returns ops minus excluded ones.
-func filterOps(all, except []string) []string {
-	set := make(map[string]bool, len(except))
-	for _, e := range except {
-		set[e] = true
-	}
-	var result []string
-	for _, op := range all {
-		if !set[op] {
-			result = append(result, op)
-		}
-	}
-	return result
+	return m.CRUDOperations()
 }
 
 // generateHandler generates a single CRUD handler function.
@@ -806,7 +751,6 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		if hidden {
 			fmt.Fprintf(b, "\t\tif cols == nil { cols = default%sCols }\n", name)
 		}
-		writeFKEnsure(b, rels)
 		fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(%sWhere.%s.Eq(id)).Select(cols...).First(ctx)\n", name, name, idGoName)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		fmt.Fprintf(b, "\t\tif result == nil {\n\t\t\treturn errors.NotFound.WithData(errors.ResourceError{Resource: %q, ID: id})\n\t\t}\n", name)
@@ -829,7 +773,6 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		if hidden {
 			fmt.Fprintf(b, "\t\tif cols == nil { cols = default%sCols }\n", name)
 		}
-		writeFKEnsure(b, rels)
 		fmt.Fprintf(b, "\t\tconds := parse%sFilters(req.Filters)\n", name)
 		// Note: @soft deleted_at filter is already in Client.Where(), not added here
 		fmt.Fprintf(b, "\t\tq := app.%s.Where(conds...).Select(cols...)\n", name)
@@ -891,6 +834,9 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 			fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		case "string":
 			fmt.Fprintf(b, "\t\tids, err := req.ParamStringArray(\"ids\")\n")
+			fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+		case "uuid.UUID":
+			fmt.Fprintf(b, "\t\tids, err := req.ParamUUIDArray(\"ids\")\n")
 			fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		default:
 			fmt.Fprintf(b, "\t\tvar ids []%s\n", idType)
@@ -1117,6 +1063,10 @@ func generateDefaultCols(b *strings.Builder, m *ast.ModelDecl, enums map[string]
 
 func generateSQLColumnSelector(b *strings.Builder, model *ast.ModelDecl, enums map[string]bool) {
 	primaryKey := primaryKeyFieldName(model)
+	relationLocalKeys := make(map[string]string)
+	for _, relation := range analyzeRelations(model, enums) {
+		relationLocalKeys[relation.FieldName] = relation.LocalKey
+	}
 	fmt.Fprintf(b, "// select%sSQLColumns maps API fields to database columns.\n", model.Name)
 	fmt.Fprintf(b, "func select%sSQLColumns(fields []*selection.Field) []string {\n", model.Name)
 	b.WriteString("\tif len(fields) == 0 { return nil }\n")
@@ -1125,6 +1075,14 @@ func generateSQLColumnSelector(b *strings.Builder, model *ast.ModelDecl, enums m
 	b.WriteString("\tfor _, field := range fields {\n")
 	b.WriteString("\t\tswitch field.Name {\n")
 	for _, field := range model.Fields {
+		if localKey, ok := relationLocalKeys[field.Name]; ok {
+			fmt.Fprintf(b, "\t\tcase %q:\n", field.Name)
+			fmt.Fprintf(b, "\t\t\tcols = ensureSelectedColumn(cols, %q)\n", str.ToSnakeCase(localKey))
+			if localKey == primaryKey {
+				b.WriteString("\t\t\thasPrimaryKey = true\n")
+			}
+			continue
+		}
 		if localKey, ok := computedFieldLocalKey(model, field, enums); ok {
 			fmt.Fprintf(b, "\t\tcase %q:\n", field.Name)
 			fmt.Fprintf(b, "\t\t\tcols = ensureSelectedColumn(cols, %q)\n", str.ToSnakeCase(localKey))
@@ -1192,12 +1150,15 @@ func writeNestedComputedResolve(b *strings.Builder, relation Relation, resultExp
 	if !computedModels[relation.TargetName] {
 		return
 	}
-	items := resultExpr
 	if !relation.IsList {
-		items = "[]*" + relation.TargetName + "{" + resultExpr + "}"
+		fmt.Fprintf(b, "%sif err := resolve%sComputedFields(ctx, app, []*%s{%s}, f.Children); err != nil { return err }\n",
+			indent, relation.TargetName, relation.TargetName, resultExpr)
+		return
 	}
-	fmt.Fprintf(b, "%sif err := resolve%sComputedFields(ctx, app, %s, f.Children); err != nil { return err }\n",
-		indent, relation.TargetName, items)
+	fmt.Fprintf(b, "%scomputedItems := make([]*%s, len(%s))\n", indent, relation.TargetName, resultExpr)
+	fmt.Fprintf(b, "%sfor i := range %s { computedItems[i] = &%s[i] }\n", indent, resultExpr, resultExpr)
+	fmt.Fprintf(b, "%sif err := resolve%sComputedFields(ctx, app, computedItems, f.Children); err != nil { return err }\n",
+		indent, relation.TargetName)
 }
 
 func writeNestedListComputedResolve(b *strings.Builder, relation Relation, computedModels map[string]bool) {
@@ -1208,7 +1169,7 @@ func writeNestedListComputedResolve(b *strings.Builder, relation Relation, compu
 	fmt.Fprintf(b, "\t\t\tcomputedItems := make([]*%s, 0)\n", relation.TargetName)
 	b.WriteString("\t\t\tfor _, item := range items {\n")
 	if relation.IsList {
-		fmt.Fprintf(b, "\t\t\t\tcomputedItems = append(computedItems, item.%s...)\n", goField)
+		fmt.Fprintf(b, "\t\t\t\tfor i := range item.%s { computedItems = append(computedItems, &item.%s[i]) }\n", goField, goField)
 	} else {
 		fmt.Fprintf(b, "\t\t\t\tif item.%s != nil { computedItems = append(computedItems, item.%s) }\n", goField, goField)
 	}
@@ -1240,32 +1201,33 @@ func generateRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relat
 
 		fmt.Fprintf(b, "\tfor _, f := range fields {\n")
 		fmt.Fprintf(b, "\t\tif f.Name == %q && f.Children != nil {\n", fieldName)
-		fmt.Fprintf(b, "\t\t\tchildCols := select%sSQLColumns(f.Children)\n", rel.TargetName)
 		if rel.FKNullable {
 			fmt.Fprintf(b, "\t\t\tif %s.%s != nil {\n", lower, goLocalKey)
-			fmt.Fprintf(b, "\t\t\t\tresult, err := app.loaders.%s.Load(ctx, *%s.%s, childCols)\n",
+			fmt.Fprintf(b, "\t\t\t\tresult, err := app.loaders.%s.Load(ctx, *%s.%s, f.Children)\n",
 				loaderField, lower, goLocalKey)
 			fmt.Fprintf(b, "\t\t\t\tif err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n")
 			fmt.Fprintf(b, "\t\t\t\t%s.%s = result\n", lower, goFieldName)
 			writeNestedComputedResolve(b, rel, "result", "\t\t\t\t", computedModels)
 			// Recursive resolve for child's relations
 			if modelRels[rel.TargetName] {
-				fmt.Fprintf(b, "\t\t\t\tif err := resolve%sRelations(ctx, app, result, f.Children, d-1); err != nil {\n", rel.TargetName)
+				fmt.Fprintf(b, "\t\t\t\ttraceCtx := api.WithTraceFieldPath(ctx, f.Name)\n")
+				fmt.Fprintf(b, "\t\t\t\tif err := resolve%sRelations(traceCtx, app, result, f.Children, d-1); err != nil {\n", rel.TargetName)
 				fmt.Fprintf(b, "\t\t\t\t\treturn err\n\t\t\t\t}\n")
 			}
 			fmt.Fprintf(b, "\t\t\t}\n")
 		} else {
-			fmt.Fprintf(b, "\t\t\tresult, err := app.loaders.%s.Load(ctx, %s.%s, childCols)\n",
+			fmt.Fprintf(b, "\t\t\tresult, err := app.loaders.%s.Load(ctx, %s.%s, f.Children)\n",
 				loaderField, lower, goLocalKey)
 			fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
 			fmt.Fprintf(b, "\t\t\t%s.%s = result\n", lower, goFieldName)
 			writeNestedComputedResolve(b, rel, "result", "\t\t\t", computedModels)
 			// Recursive resolve for child's relations
 			if modelRels[rel.TargetName] {
+				fmt.Fprintf(b, "\t\t\ttraceCtx := api.WithTraceFieldPath(ctx, f.Name)\n")
 				if rel.IsList {
-					fmt.Fprintf(b, "\t\t\tif err := resolve%sListRelations(ctx, app, %s.%s, f.Children, d-1); err != nil {\n", rel.TargetName, lower, goFieldName)
+					fmt.Fprintf(b, "\t\t\tif err := resolve%sValueListRelations(traceCtx, app, %s.%s, f.Children, d-1); err != nil {\n", rel.TargetName, lower, goFieldName)
 				} else {
-					fmt.Fprintf(b, "\t\t\tif err := resolve%sRelations(ctx, app, result, f.Children, d-1); err != nil {\n", rel.TargetName)
+					fmt.Fprintf(b, "\t\t\tif err := resolve%sRelations(traceCtx, app, result, f.Children, d-1); err != nil {\n", rel.TargetName)
 				}
 				fmt.Fprintf(b, "\t\t\t\treturn err\n\t\t\t}\n")
 			}
@@ -1283,12 +1245,26 @@ func generateRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relat
 // generateListRelationResolver generates a batch resolve function for LIST handlers.
 // Uses LoadAll (direct dispatch, zero wait) instead of per-item Load.
 func generateListRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relation, modelRels map[string]bool, computedSets ...map[string]bool) {
+	generateListRelationResolverMode(b, m, rels, modelRels, false, computedSets...)
+}
+
+func generateValueListRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relation, modelRels map[string]bool, computedSets ...map[string]bool) {
+	generateListRelationResolverMode(b, m, rels, modelRels, true, computedSets...)
+}
+
+func generateListRelationResolverMode(b *strings.Builder, m *ast.ModelDecl, rels []Relation, modelRels map[string]bool, valueSlice bool, computedSets ...map[string]bool) {
 	name := m.Name
 	computedModels := firstBoolSet(computedSets)
+	functionName := "resolve" + name + "ListRelations"
+	itemsType := "[]*" + name
+	if valueSlice {
+		functionName = "resolve" + name + "ValueListRelations"
+		itemsType = "[]" + name
+	}
 
-	fmt.Fprintf(b, "// resolve%sListRelations batch-loads all relation fields for a list of %s.\n", name, name)
+	fmt.Fprintf(b, "// %s batch-loads all relation fields for a list of %s.\n", functionName, name)
 	fmt.Fprintf(b, "// Uses LoadAll — direct dispatch, zero wait.\n")
-	fmt.Fprintf(b, "func resolve%sListRelations(ctx context.Context, app *App, items []*%s, fields []*selection.Field, depth ...int) error {\n", name, name)
+	fmt.Fprintf(b, "func %s(ctx context.Context, app *App, items %s, fields []*selection.Field, depth ...int) error {\n", functionName, itemsType)
 	fmt.Fprintf(b, "\td := MaxRelationDepth\n")
 	fmt.Fprintf(b, "\tif len(depth) > 0 {\n\t\td = depth[0]\n\t}\n")
 	fmt.Fprintf(b, "\tif d <= 0 {\n\t\treturn nil\n\t}\n")
@@ -1302,35 +1278,33 @@ func generateListRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []R
 
 		fmt.Fprintf(b, "\tfor _, f := range fields {\n")
 		fmt.Fprintf(b, "\t\tif f.Name == %q && f.Children != nil {\n", fieldName)
-		fmt.Fprintf(b, "\t\t\tchildCols := select%sSQLColumns(f.Children)\n", rel.TargetName)
-
 		// Collect all keys
 		fmt.Fprintf(b, "\t\t\tkeys := make([]%s, 0, len(items))\n", rel.KeyGoType)
 		if rel.FKNullable {
-			fmt.Fprintf(b, "\t\t\tfor _, item := range items {\n")
+			writeRelationItemLoopStart(b, valueSlice)
 			fmt.Fprintf(b, "\t\t\t\tif item.%s != nil {\n", goLocalKey)
 			fmt.Fprintf(b, "\t\t\t\t\tkeys = append(keys, *item.%s)\n", goLocalKey)
 			fmt.Fprintf(b, "\t\t\t\t}\n")
 			fmt.Fprintf(b, "\t\t\t}\n")
 		} else {
-			fmt.Fprintf(b, "\t\t\tfor _, item := range items {\n")
+			writeRelationItemLoopStart(b, valueSlice)
 			fmt.Fprintf(b, "\t\t\t\tkeys = append(keys, item.%s)\n", goLocalKey)
 			fmt.Fprintf(b, "\t\t\t}\n")
 		}
 
 		// LoadAll — direct dispatch, zero wait
-		fmt.Fprintf(b, "\t\t\tresultMap, err := app.loaders.%s.LoadAll(ctx, keys, childCols)\n", loaderField)
+		fmt.Fprintf(b, "\t\t\tresultMap, err := app.loaders.%s.LoadAll(ctx, keys, f.Children)\n", loaderField)
 		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
 
 		// Map results back
 		if rel.FKNullable {
-			fmt.Fprintf(b, "\t\t\tfor _, item := range items {\n")
+			writeRelationItemLoopStart(b, valueSlice)
 			fmt.Fprintf(b, "\t\t\t\tif item.%s != nil {\n", goLocalKey)
 			fmt.Fprintf(b, "\t\t\t\t\titem.%s = resultMap[*item.%s]\n", goFieldName, goLocalKey)
 			fmt.Fprintf(b, "\t\t\t\t}\n")
 			fmt.Fprintf(b, "\t\t\t}\n")
 		} else {
-			fmt.Fprintf(b, "\t\t\tfor _, item := range items {\n")
+			writeRelationItemLoopStart(b, valueSlice)
 			fmt.Fprintf(b, "\t\t\t\titem.%s = resultMap[item.%s]\n", goFieldName, goLocalKey)
 			fmt.Fprintf(b, "\t\t\t}\n")
 		}
@@ -1338,14 +1312,15 @@ func generateListRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []R
 
 		// Recursive resolve for child's relations
 		if modelRels[rel.TargetName] {
+			fmt.Fprintf(b, "\t\t\ttraceCtx := api.WithTraceFieldPath(ctx, f.Name)\n")
 			if rel.IsList {
-				fmt.Fprintf(b, "\t\t\tfor _, item := range items {\n")
-				fmt.Fprintf(b, "\t\t\t\tif err := resolve%sListRelations(ctx, app, item.%s, f.Children, d-1); err != nil {\n", rel.TargetName, goFieldName)
+				writeRelationItemLoopStart(b, valueSlice)
+				fmt.Fprintf(b, "\t\t\t\tif err := resolve%sValueListRelations(traceCtx, app, item.%s, f.Children, d-1); err != nil {\n", rel.TargetName, goFieldName)
 				fmt.Fprintf(b, "\t\t\t\t\treturn err\n\t\t\t\t}\n")
 				fmt.Fprintf(b, "\t\t\t}\n")
 			} else {
-				fmt.Fprintf(b, "\t\t\tfor _, item := range items {\n")
-				fmt.Fprintf(b, "\t\t\t\tif err := resolve%sRelations(ctx, app, item.%s, f.Children, d-1); err != nil {\n", rel.TargetName, goFieldName)
+				writeRelationItemLoopStart(b, valueSlice)
+				fmt.Fprintf(b, "\t\t\t\tif err := resolve%sRelations(traceCtx, app, item.%s, f.Children, d-1); err != nil {\n", rel.TargetName, goFieldName)
 				fmt.Fprintf(b, "\t\t\t\t\treturn err\n\t\t\t\t}\n")
 				fmt.Fprintf(b, "\t\t\t}\n")
 			}
@@ -1358,6 +1333,14 @@ func generateListRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []R
 
 	fmt.Fprintf(b, "\treturn nil\n")
 	fmt.Fprintf(b, "}\n\n")
+}
+
+func writeRelationItemLoopStart(b *strings.Builder, valueSlice bool) {
+	if valueSlice {
+		b.WriteString("\t\t\tfor i := range items {\n\t\t\t\titem := &items[i]\n")
+		return
+	}
+	b.WriteString("\t\t\tfor _, item := range items {\n")
 }
 
 // crudAPIName returns the API endpoint name for a CRUD operation.
@@ -1518,12 +1501,15 @@ func (g *GeneratorContext) generateBatchLoadHandlers(b *strings.Builder, models 
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 		fmt.Fprintf(b, "\t\tkeys, err := req.Param%s(\"keys\")\n", paramMethod)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		g.generateSelectedSQLFields(b, m, firstBoolSet(enumSets))
+		fmt.Fprintf(b, "\t\tfields := select%sSQLColumns(req.Select)\n", name)
 		fmt.Fprintf(b, "\t\tconds := []lux.Condition{lux.New%s(%q).In(keys...)}\n", goTypeToCondField(idGoType), idColumn)
 		fmt.Fprintf(b, "\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", tableName)
 		fmt.Fprintf(b, "\t\trows, err := %s.QueryRows(ctx, app.DB, %s, query, args...)\n", g.dbPkg, scanFn)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		writeComputedResolve(b, m, "rows", "\t\t")
+		if len(g.analyzeRelations(m, firstBoolSet(enumSets))) > 0 {
+			fmt.Fprintf(b, "\t\tif err := resolve%sListRelations(ctx, app, rows, req.Select); err != nil { return err }\n", name)
+		}
 		// Write response: binary array of models
 		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(rows)))\n")
 		fmt.Fprintf(b, "\t\tfor _, row := range rows {\n")
@@ -1661,7 +1647,7 @@ func (g *GeneratorContext) generateRemoteNamedLoadHandler(b *strings.Builder, mo
 			b.WriteString("\t\t}\n")
 		}
 	}
-	g.generateSelectedSQLFields(b, model, firstBoolSet(enumSets))
+	fmt.Fprintf(b, "\t\tfields := select%sSQLColumns(req.Select)\n", model.Name)
 	for _, argName := range call.argNames {
 		generateRequiredSQLField(b, str.ToSnakeCase(argName))
 	}
@@ -1678,6 +1664,9 @@ func (g *GeneratorContext) generateRemoteNamedLoadHandler(b *strings.Builder, mo
 	fmt.Fprintf(b, "\t\trows, err := %s.QueryRows(ctx, app.DB, scan%s, query, args...)\n", g.dbPkg, model.Name)
 	b.WriteString("\t\tif err != nil { return err }\n")
 	writeComputedResolve(b, model, "rows", "\t\t")
+	if len(g.analyzeRelations(model, firstBoolSet(enumSets))) > 0 {
+		fmt.Fprintf(b, "\t\tif err := resolve%sListRelations(ctx, app, rows, req.Select); err != nil { return err }\n", model.Name)
+	}
 	fmt.Fprintf(b, "\t\tgrouped := make(map[%s][]*%s, len(%sKeys))\n", keyType, model.Name, call.argNames[0])
 	b.WriteString("\t\tfor _, row := range rows {\n")
 	fmt.Fprintf(b, "\t\t\tkey := %s\n", loadKeyExpr(call, "row."))
@@ -1812,7 +1801,12 @@ func (g *GeneratorContext) writeAPIRegistration(b *strings.Builder, name string)
 	fmt.Fprintf(b, "\trouter.Registry.RegisterParams(%q, []api.ParamMeta{\n", name)
 	for _, param := range registered {
 		ptype, isList, nullable := g.resolveParamMetaFromAST(name, param.name)
-		fmt.Fprintf(b, "\t\t{Name: %q, Type: %q, FieldID: %d", param.name, ptype, param.id)
+		wireType, typeName := registeredParamType(ptype)
+		fmt.Fprintf(b, "\t\t{Name: %q, Type: %q", param.name, wireType)
+		if typeName != "" {
+			fmt.Fprintf(b, ", TypeName: %q", typeName)
+		}
+		fmt.Fprintf(b, ", FieldID: %d", param.id)
 		if isList {
 			b.WriteString(", IsList: true")
 		}
@@ -1822,6 +1816,15 @@ func (g *GeneratorContext) writeAPIRegistration(b *strings.Builder, name string)
 		b.WriteString("},\n")
 	}
 	b.WriteString("\t})\n")
+}
+
+func registeredParamType(typeName string) (string, string) {
+	switch typeName {
+	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "Bytes", "UUID", "Decimal", "JSON", "Enum", "Model":
+		return typeName, ""
+	default:
+		return "Model", typeName
+	}
 }
 
 // resolveParamTypeFromAST looks up the actual Luxo type for a param from AST data.
@@ -2965,7 +2968,7 @@ func (g *GeneratorContext) generateFederationResolvers(b *strings.Builder, resul
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 		fmt.Fprintf(b, "\t\tkeys, err := req.Param%sArray(\"keys\")\n", ep.keyType)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		g.generateSelectedSQLFields(b, ep.model, enums)
+		fmt.Fprintf(b, "\t\tfields := select%sSQLColumns(req.Select)\n", ep.modelName)
 		generateRequiredSQLField(b, ep.fkColumn)
 		// Query: WHERE fk_column IN (keys)
 		fmt.Fprintf(b, "\t\tconds := []lux.Condition{lux.New%sField(%q).In(keys...)}\n", ep.keyType, ep.fkColumn)
@@ -2973,6 +2976,9 @@ func (g *GeneratorContext) generateFederationResolvers(b *strings.Builder, resul
 		fmt.Fprintf(b, "\t\trows, err := %s.QueryRows(ctx, app.DB, %s, query, args...)\n", g.dbPkg, ep.scanFn)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\n")
 		writeComputedResolve(b, ep.model, "rows", "\t\t")
+		if len(g.analyzeRelations(ep.model, enums)) > 0 {
+			fmt.Fprintf(b, "\t\tif err := resolve%sListRelations(ctx, app, rows, req.Select); err != nil { return err }\n", ep.modelName)
+		}
 
 		// Group by FK field
 		fmt.Fprintf(b, "\t\t// Group results by FK value, preserving request key order\n")

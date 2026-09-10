@@ -308,8 +308,13 @@ func (rt *Router) handleWSStreamBinary(ctx context.Context, ws *wsConn, data []b
 	}
 
 	// Subscribe body is identical to the canonical HTTP binary request body.
-	req, err := rt.Registry.ParseBinaryRequest(data[1:])
-	if err != nil {
+	req := GetRequest()
+	defer PutRequest(req)
+	if err := rt.Registry.ParseBinaryRequestInto(data[1:], req); err != nil {
+		rt.writeWSBinarySubscriptionError(ctx, ws, apiID, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
+		return
+	}
+	if err := rt.validatePublicSelection(req, true); err != nil {
 		rt.writeWSBinarySubscriptionError(ctx, ws, apiID, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
 		return
 	}
@@ -381,8 +386,6 @@ func (rt *Router) handleWSJSON(ctx context.Context, ws *wsConn, data []byte) {
 		rt.writeWSJSONError(ctx, ws, seqID, "BadRequest", 400, err.Error())
 		return
 	}
-	req.BinaryMode = true // handler always writes binary
-
 	// Find handler
 	fn, ok := rt.handlers[req.API]
 	if !ok {
@@ -437,8 +440,9 @@ func (rt *Router) handleWSBinary(ctx context.Context, ws *wsConn, data []byte) {
 	}
 
 	reqBody := data[1+n:]
-	req, err := rt.Registry.ParseBinaryRequest(reqBody)
-	if err != nil {
+	req := GetRequest()
+	defer PutRequest(req)
+	if err := rt.Registry.ParseBinaryRequestInto(reqBody, req); err != nil {
 		rt.writeWSBinaryError(ctx, ws, seq, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
 		return
 	}
@@ -447,6 +451,10 @@ func (rt *Router) handleWSBinary(ctx context.Context, ws *wsConn, data []byte) {
 	fn, ok := rt.handlers[req.API]
 	if !ok {
 		rt.writeWSBinaryError(ctx, ws, seq, errors.NotFound.WithData(errors.ResourceError{Resource: req.API}))
+		return
+	}
+	if err := rt.validatePublicSelection(req, true); err != nil {
+		rt.writeWSBinaryError(ctx, ws, seq, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
 		return
 	}
 

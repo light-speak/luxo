@@ -35,6 +35,30 @@ api deactivateAll(): Int @auth {
 	expectNoErrors(t, result)
 }
 
+func TestCRUDWriteValueUsesOuterScopeType(t *testing.T) {
+	result := analyze(t, `
+model Note {
+  id: Int @id @auto
+  detail: String?
+}
+api createNote(detail: String): Note {
+  return Note.create(detail: detail)
+}`)
+	expectNoErrors(t, result)
+
+	ret, ok := result.Files[0].APIs[0].Body.Stmts[0].(*ast.ReturnStmt)
+	if !ok {
+		t.Fatalf("statement = %T, want *ast.ReturnStmt", result.Files[0].APIs[0].Body.Stmts[0])
+	}
+	call, ok := ret.Value.(*ast.CallExpr)
+	if !ok || len(call.Args) != 1 {
+		t.Fatalf("return value = %#v, want one-argument call", ret.Value)
+	}
+	if call.Args[0].Value.IsNullable() {
+		t.Fatal("create value must keep the non-null API parameter type instead of the nullable model-field type")
+	}
+}
+
 func TestCreateMany(t *testing.T) {
 	result := analyze(t, `
 model Tag {

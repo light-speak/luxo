@@ -4,18 +4,22 @@ package event
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 
 	"github.com/light-speak/luxo/pkg/lux/env"
 )
 
+var ErrBinaryPayloadRequired = errors.New("event: NATS payload must use Luxo binary or []byte")
+
 // Bus is the interface for publishing and subscribing to events.
 // ChanBus (channel) and NATSBus implement this interface.
 type Bus interface {
-	// Emit publishes an event with the given name and payload.
+	// Emit publishes an event with the given name and payload. Consumer handlers
+	// run with a bus-owned context because delivery can outlive the caller.
 	// payload can be any type — ChanBus passes it directly (zero serialization),
-	// NATSBus uses Luxo binary for generated events and JSON for custom payloads.
+	// while NATSBus accepts LuxoMarshaler values or pre-encoded []byte only.
 	Emit(ctx context.Context, name string, payload any) error
 
 	// On registers a broadcast handler — every instance receives the event.

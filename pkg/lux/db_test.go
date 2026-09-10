@@ -1,6 +1,8 @@
 package lux
 
 import (
+	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -231,5 +233,64 @@ func TestDBConfigFromEnvDebugSQLTrue(t *testing.T) {
 	cfg := DBConfigFromEnv()
 	if !cfg.DebugSQL {
 		t.Error("DebugSQL should be true when DEBUG_SQL=true")
+	}
+}
+
+type recordingDatabaseTraceSink struct {
+	queryMeta    DatabaseTraceMeta
+	queryResult  DatabaseTraceResult
+	poolMeta     DatabasePoolTraceMeta
+	poolError    error
+	queryStarted bool
+	poolStarted  bool
+}
+
+func (*recordingDatabaseTraceSink) DatabaseTraceDetails() bool { return true }
+
+func (r *recordingDatabaseTraceSink) StartDatabaseQuery(ctx context.Context, meta DatabaseTraceMeta) context.Context {
+	r.queryStarted = true
+	r.queryMeta = meta
+	return ctx
+}
+
+func (r *recordingDatabaseTraceSink) FinishDatabaseQuery(_ context.Context, result DatabaseTraceResult) {
+	r.queryResult = result
+}
+
+func (r *recordingDatabaseTraceSink) StartDatabaseAcquire(ctx context.Context, meta DatabasePoolTraceMeta) context.Context {
+	r.poolStarted = true
+	r.poolMeta = meta
+	return ctx
+}
+
+func (r *recordingDatabaseTraceSink) FinishDatabaseAcquire(_ context.Context, err error) {
+	r.poolError = err
+}
+
+func TestDatabaseTraceSinkContext(t *testing.T) {
+	if DatabaseTraceSinkFromContext(context.Background()) != nil {
+		t.Fatal("background context must not contain a database trace sink")
+	}
+	sink := &recordingDatabaseTraceSink{}
+	ctx := WithDatabaseTraceSink(context.Background(), sink)
+	if DatabaseTraceSinkFromContext(ctx) != sink {
+		t.Fatal("database trace sink was not preserved in context")
+	}
+
+	queryMeta := DatabaseTraceMeta{Backend: "postgresql", Database: "taskflow", Operation: "SELECT", Resource: "tasks", Statement: "SELECT id FROM tasks", Fingerprint: "abc", ArgumentCount: 1}
+	queryResult := DatabaseTraceResult{Command: "SELECT", RowsAffected: 2, RowsKnown: true}
+	poolMeta := DatabasePoolTraceMeta{Backend: "postgresql", Database: "taskflow"}
+	poolErr := errors.New("pool unavailable")
+	tracer := DatabaseTraceSinkFromContext(ctx)
+	ctx = tracer.StartDatabaseQuery(ctx, queryMeta)
+	tracer.FinishDatabaseQuery(ctx, queryResult)
+	ctx = tracer.StartDatabaseAcquire(ctx, poolMeta)
+	tracer.FinishDatabaseAcquire(ctx, poolErr)
+
+	if !sink.queryStarted || sink.queryMeta != queryMeta || sink.queryResult != queryResult {
+		t.Fatalf("query trace = %+v", sink)
+	}
+	if !sink.poolStarted || sink.poolMeta != poolMeta || !errors.Is(sink.poolError, poolErr) {
+		t.Fatalf("pool trace = %+v", sink)
 	}
 }

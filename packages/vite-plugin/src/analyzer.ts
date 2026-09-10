@@ -1,282 +1,496 @@
 import { parse } from '@babel/parser'
-import _traverse from '@babel/traverse'
+import _traverse, { type NodePath } from '@babel/traverse'
 import * as t from '@babel/types'
-import type { LuxoSchema, LuxoModel } from '@luxojs/client'
+import type { LuxoAPI, LuxoField, LuxoModel, LuxoSchema, LuxoTypeDecl } from '@luxojs/client'
 
-// babel/traverse CJS/ESM interop
 const traverse = (_traverse as unknown as { default: typeof _traverse }).default ?? _traverse
-
-/** Max nesting depth before warning */
 const MAX_NESTING_DEPTH = 5
+const ARRAY_CALLBACKS = new Set(['every', 'filter', 'find', 'flatMap', 'forEach', 'map', 'some'])
+const PAGE_FIELDS = new Set(['page', 'pageSize', 'total'])
+
+type SchemaDeclaration = LuxoModel | LuxoTypeDecl
+type ValueShape = 'object' | 'list' | 'page' | 'scalar'
+
+interface CallUsage {
+  api: LuxoAPI
+  call: t.CallExpression
+  tree: FieldNode
+  escaped: boolean
+}
+
+interface ValueBinding {
+  usage: CallUsage
+  typeName: string
+  fields: string[]
+  shape: ValueShape
+}
+
+interface TextEdit {
+  start: number
+  end: number
+  replacement: string
+}
+
+interface AnalysisState {
+  schema: LuxoSchema
+  apis: Map<string, LuxoAPI>
+  streamAPIs: Map<string, LuxoAPI>
+  bindings: Map<t.Identifier, ValueBinding>
+  usages: CallUsage[]
+  usagesByCall: Map<t.CallExpression, CallUsage>
+}
 
 /**
- * Compile-time nested field tracking for Luxo API calls.
- * Uses Babel AST for accurate analysis including:
- * - Direct access: user.name
- * - Optional chain: user?.name
- * - Nested relations: post.user.name → "user{name}"
- * - Lambda params: post.comments.forEach(c => c.user.name)
- * - Destructuring: const { name, email } = await client.getUser(1)
- * - Variable aliasing: const user = post.user; user.name
+ * Tracks statically visible result usage and injects a safe compile-time
+ * selection into generated client's params object.
  */
-export function analyzeAndTransform(
-  code: string,
-  _id: string,
-  schema: LuxoSchema,
-): string | null {
-  let ast: t.File
+export function analyzeAndTransform(code: string, _id: string, schema: LuxoSchema): string | null {
+  const ast = parseSource(code)
+  if (!ast) return null
+
+  const state = createAnalysisState(schema)
+  collectBindings(ast, state)
+  collectStandaloneCalls(ast, state)
+  collectFieldAccesses(ast, state)
+  collectEscapes(ast, state)
+
+  const edits = state.usages.flatMap(usage => createSelectionEdit(code, usage, state.schema))
+  if (edits.length === 0) return null
+  return applyTextEdits(code, edits)
+}
+
+function parseSource(code: string): t.File | null {
   try {
-    ast = parse(code, {
+    return parse(code, {
       sourceType: 'module',
       plugins: ['typescript', 'jsx'],
     })
   } catch {
-    return null // unparseable file — skip
+    return null
   }
-
-  // Phase 1: collect variable → API mapping + variable → parent chain
-  const varToAPI = new Map<string, string>()
-  const varToType = new Map<string, string>()
-  const varToParent = new Map<string, { var: string; field: string }>()
-  const apiTrees = new Map<string, FieldNode>()
-
-  traverse(ast, {
-    VariableDeclarator(path) {
-      const id = path.node.id
-      const init = path.node.init
-      if (!init) return
-
-      // Pattern: const { name, email } = await client.getUser(args)
-      if (t.isObjectPattern(id)) {
-        const expr = t.isAwaitExpression(init) ? init.argument : init
-        if (t.isCallExpression(expr) && t.isMemberExpression(expr.callee)) {
-          const method = expr.callee.property
-          if (t.isIdentifier(method)) {
-            const apiMeta = Object.values(schema.apis).find(a => a.name === method.name)
-            if (apiMeta?.returnType) {
-              const model = schema.models[apiMeta.returnType]
-              if (model) {
-                const root = new FieldNode('root')
-                for (const prop of id.properties) {
-                  if (t.isObjectProperty(prop) && t.isIdentifier(prop.key)) {
-                    const fieldName = prop.key.name
-                    if (model.fields.some(f => f.name === fieldName)) {
-                      root.addChild(fieldName)
-                    }
-                  }
-                }
-                if (root.children.size > 0 && root.children.size < model.fields.length) {
-                  apiTrees.set(method.name, root)
-                  varToAPI.set('__destruct__' + method.name, method.name)
-                }
-              }
-            }
-          }
-        }
-        return
-      }
-
-      if (!t.isIdentifier(id)) return
-
-      // Unwrap await
-      const expr = t.isAwaitExpression(init) ? init.argument : init
-
-      // Pattern: const user = await client.getUser(args)
-      if (t.isCallExpression(expr) && t.isMemberExpression(expr.callee)) {
-        const method = expr.callee.property
-        if (t.isIdentifier(method)) {
-          const apiMeta = Object.values(schema.apis).find(a => a.name === method.name)
-          if (apiMeta?.returnType) {
-            varToAPI.set(id.name, method.name)
-            varToType.set(id.name, apiMeta.returnType)
-          }
-        }
-      }
-
-      // Pattern: const user = post.user (variable alias)
-      if (t.isMemberExpression(expr) && t.isIdentifier(expr.object) && t.isIdentifier(expr.property)) {
-        const parentVar = expr.object.name
-        if (varToAPI.has(parentVar) || varToParent.has(parentVar)) {
-          varToParent.set(id.name, { var: parentVar, field: expr.property.name })
-          // Resolve type
-          const parentType = varToType.get(parentVar)
-          if (parentType) {
-            const model = schema.models[parentType]
-            const field = model?.fields.find(f => f.name === expr.property.name)
-            if (field?.type && schema.models[field.type]) {
-              varToType.set(id.name, field.type)
-            }
-          }
-        }
-      }
-    },
-
-    // Track forEach/map lambda params: arr.forEach(item => ...)
-    CallExpression(path) {
-      const callee = path.node.callee
-      if (!t.isMemberExpression(callee)) return
-      const method = callee.property
-      if (!t.isIdentifier(method)) return
-      if (!['forEach', 'map', 'filter', 'find', 'some', 'every', 'flatMap'].includes(method.name)) return
-
-      // Get the array source
-      const obj = callee.object
-      let sourceVar: string | undefined
-      let sourceField: string | undefined
-
-      if (t.isMemberExpression(obj) && t.isIdentifier(obj.object) && t.isIdentifier(obj.property)) {
-        sourceVar = obj.object.name
-        sourceField = obj.property.name
-      } else if (t.isIdentifier(obj)) {
-        // Direct variable: comments.forEach(...)
-        sourceVar = obj.name
-      }
-
-      if (!sourceVar) return
-      if (!varToAPI.has(sourceVar) && !varToParent.has(sourceVar)) return
-
-      // Get lambda param name
-      const arg = path.node.arguments[0]
-      if (!arg) return
-      let paramName: string | undefined
-      if (t.isArrowFunctionExpression(arg) || t.isFunctionExpression(arg)) {
-        const firstParam = arg.params[0]
-        if (t.isIdentifier(firstParam)) {
-          paramName = firstParam.name
-        }
-      }
-
-      if (!paramName) return
-
-      // Link lambda param to source
-      if (sourceField) {
-        varToParent.set(paramName, { var: sourceVar, field: sourceField })
-        // Resolve type
-        const parentType = varToType.get(sourceVar)
-        if (parentType) {
-          const model = schema.models[parentType]
-          const field = model?.fields.find(f => f.name === sourceField)
-          if (field?.type && schema.models[field.type]) {
-            varToType.set(paramName, field.type)
-          }
-        }
-      } else {
-        // Direct variable alias (comments = post.comments, then comments.forEach(c => ...))
-        const parent = varToParent.get(sourceVar)
-        if (parent) {
-          varToParent.set(paramName, parent)
-          const parentType = varToType.get(sourceVar)
-          if (parentType) varToType.set(paramName, parentType)
-        }
-      }
-    },
-  })
-
-  if (varToAPI.size === 0) return null
-
-  // Phase 2: initialize trees for non-destructured APIs
-  for (const apiName of varToAPI.values()) {
-    if (!apiTrees.has(apiName)) {
-      apiTrees.set(apiName, new FieldNode('root'))
-    }
-  }
-
-  const processChain = (chain: string[]) => {
-    const rootVar = chain[0]
-    let apiName: string | undefined
-    let fieldChain: string[]
-
-    if (varToAPI.has(rootVar)) {
-      apiName = varToAPI.get(rootVar)
-      fieldChain = chain.slice(1)
-    } else {
-      const resolved = resolveParentChain(rootVar, varToParent)
-      if (!resolved) return
-      apiName = varToAPI.get(resolved.rootVar)
-      fieldChain = [...resolved.fields, ...chain.slice(1)]
-    }
-
-    if (!apiName) return
-    const tree = apiTrees.get(apiName)
-    if (!tree) return
-
-    const apiMeta = Object.values(schema.apis).find(a => a.name === apiName)
-    if (!apiMeta?.returnType) return
-
-    addFieldChain(tree, fieldChain, schema.models[apiMeta.returnType], schema)
-  }
-
-  traverse(ast, {
-    MemberExpression(path) {
-      const chain = extractChain(path.node)
-      if (chain && chain.length >= 2) processChain(chain)
-    },
-    OptionalMemberExpression(path) {
-      const chain = extractChain(path.node)
-      if (chain && chain.length >= 2) processChain(chain)
-    },
-  })
-
-  // Phase 3: generate $select and inject
-  let modified = false
-  let result = code
-
-  for (const [apiName, tree] of apiTrees) {
-    const selectStr = tree.toSelectString()
-    if (!selectStr) continue
-
-    // Check depth and warn
-    const depth = tree.maxDepth()
-    if (depth > MAX_NESTING_DEPTH) {
-      console.warn(
-        `[luxo] Warning: ${apiName} has ${depth}-level nested field selection (max recommended: ${MAX_NESTING_DEPTH}). ` +
-        `Deep nesting may cause performance issues. Consider using @native or restructuring your query.`
-      )
-    }
-
-    // Skip if all top-level fields are used
-    const apiMeta = Object.values(schema.apis).find(a => a.name === apiName)
-    if (apiMeta?.returnType) {
-      const model = schema.models[apiMeta.returnType]
-      if (model && tree.children.size >= model.fields.length) continue
-    }
-
-    // Find and replace the API call — use balanced paren matching
-    const callStart = new RegExp(`await\\s+\\w+\\.${escapeRegex(apiName)}\\(`)
-    const startMatch = callStart.exec(result)
-    if (!startMatch) continue
-    const startIdx = startMatch.index
-    const argsStart = startIdx + startMatch[0].length
-    // Find matching closing paren (balanced)
-    let parenDepth = 1
-    let i = argsStart
-    while (i < result.length && parenDepth > 0) {
-      if (result[i] === '(') parenDepth++
-      else if (result[i] === ')') parenDepth--
-      if (parenDepth > 0) i++
-    }
-    if (parenDepth !== 0) continue
-    const argsStr = result.substring(argsStart, i)
-    if (argsStr.includes('$select')) continue
-
-    const trimmed = argsStr.trim()
-    const before = result.substring(0, argsStart)
-    const after = result.substring(i) // starts with ')'
-    const injection = trimmed === ''
-      ? `{ $select: '${selectStr}' }`
-      : `${argsStr}, { $select: '${selectStr}' }`
-
-    result = before + injection + after
-    modified = true
-  }
-
-  return modified ? result : null
 }
 
-// ─── FieldNode tree ─────────────────────────────────────────────────────────
+function createAnalysisState(schema: LuxoSchema): AnalysisState {
+  return {
+    schema,
+    apis: new Map(Object.values(schema.apis).filter(api => !api.stream).map(api => [api.name, api])),
+    streamAPIs: new Map(Object.values(schema.apis).filter(api => api.stream).map(api => [streamMethodName(api.name), api])),
+    bindings: new Map(),
+    usages: [],
+    usagesByCall: new Map(),
+  }
+}
+
+function collectBindings(ast: t.File, state: AnalysisState): void {
+  traverse(ast, {
+    VariableDeclarator(path) {
+      bindVariableDeclarator(path, state)
+    },
+    CallExpression(path) {
+      bindArrayCallback(path, state)
+      bindStreamCallback(path, state)
+    },
+    ForOfStatement(path) {
+      bindForOfItem(path, state)
+    },
+  })
+}
+
+function collectStandaloneCalls(ast: t.File, state: AnalysisState): void {
+  traverse(ast, {
+    CallExpression(path) {
+      const apiCall = findAPICall(path, state)
+      if (!apiCall || state.usagesByCall.has(apiCall.path.node)) return
+      const usage = callUsage(apiCall.api, apiCall.path.node, state)
+      usage.escaped = !apiCall.path.parentPath?.isExpressionStatement()
+    },
+  })
+}
+
+function bindVariableDeclarator(path: NodePath<t.VariableDeclarator>, state: AnalysisState): void {
+  const init = asNodePath(path.get('init'))
+  if (!init?.node) return
+
+  const apiCall = findAPICall(init, state)
+  if (apiCall) {
+    if (apiCall.stream) return
+    const usage = callUsage(apiCall.api, apiCall.path.node, state)
+    bindPattern(asNodePath(path.get('id')), rootValue(usage), state)
+    return
+  }
+
+  const value = resolveValue(init, state)
+  if (value) bindPattern(asNodePath(path.get('id')), value, state)
+}
+
+function createCallUsage(api: LuxoAPI, call: t.CallExpression): CallUsage {
+  return { api, call, tree: new FieldNode('root'), escaped: false }
+}
+
+function callUsage(api: LuxoAPI, call: t.CallExpression, state: AnalysisState): CallUsage {
+  const existing = state.usagesByCall.get(call)
+  if (existing) return existing
+  const usage = createCallUsage(api, call)
+  state.usages.push(usage)
+  state.usagesByCall.set(call, usage)
+  return usage
+}
+
+function rootValue(usage: CallUsage): ValueBinding {
+  let shape: ValueShape = 'object'
+  if (usage.api.paginated) shape = 'page'
+  else if (usage.api.returnList) shape = 'list'
+  return { usage, typeName: usage.api.returnType ?? '', fields: [], shape }
+}
+
+function findAPICall(
+  path: NodePath<t.Node>,
+  state: AnalysisState,
+): { api: LuxoAPI; path: NodePath<t.CallExpression>; stream: boolean } | null {
+  const expression = unwrapExpression(path)
+  if (!expression.isCallExpression()) return null
+  const callee = asNodePath(expression.get('callee'))
+  if (!callee || (!callee.isMemberExpression() && !callee.isOptionalMemberExpression())) return null
+  const name = memberPropertyName(callee.node)
+  const api = name ? state.apis.get(name) ?? state.streamAPIs.get(name) : undefined
+  if (!api?.returnType || !declaration(state.schema, api.returnType)) return null
+  return { api, path: expression as NodePath<t.CallExpression>, stream: Boolean(name && state.streamAPIs.has(name)) }
+}
+
+function bindPattern(path: NodePath<t.Node> | null, value: ValueBinding, state: AnalysisState): void {
+  if (!path) return
+  if (path.isIdentifier()) {
+    bindIdentifier(path, value, state)
+    return
+  }
+  if (path.isObjectPattern()) {
+    bindObjectPattern(path, value, state)
+    return
+  }
+  if (path.isArrayPattern()) bindArrayPattern(path, value, state)
+}
+
+function bindIdentifier(path: NodePath<t.Identifier>, value: ValueBinding, state: AnalysisState): void {
+  if (value.shape === 'scalar') return
+  const binding = path.scope.getBinding(path.node.name)
+  if (binding) state.bindings.set(binding.identifier, value)
+}
+
+function bindObjectPattern(path: NodePath<t.ObjectPattern>, value: ValueBinding, state: AnalysisState): void {
+  for (const propertyPath of path.get('properties')) {
+    if (propertyPath.isRestElement()) {
+      value.usage.escaped = true
+      continue
+    }
+    if (!propertyPath.isObjectProperty()) continue
+    const name = objectPropertyName(propertyPath.node)
+    if (!name) {
+      value.usage.escaped = true
+      continue
+    }
+    const child = resolveProperty(value, name, state.schema)
+    if (!child) continue
+    addSelectedFields(child)
+    bindPattern(asNodePath(propertyPath.get('value')), child, state)
+  }
+}
+
+function bindArrayPattern(path: NodePath<t.ArrayPattern>, value: ValueBinding, state: AnalysisState): void {
+  if (value.shape !== 'list') {
+    value.usage.escaped = true
+    return
+  }
+  const item = { ...value, shape: 'object' as const }
+  for (const element of path.get('elements')) bindPattern(asNodePath(element), item, state)
+}
+
+function bindArrayCallback(path: NodePath<t.CallExpression>, state: AnalysisState): void {
+  const callee = asNodePath(path.get('callee'))
+  if (!callee?.isMemberExpression() && !callee?.isOptionalMemberExpression()) return
+  const method = memberPropertyName(callee.node)
+  if (!method || !ARRAY_CALLBACKS.has(method)) return
+
+  const source = resolveValue(asNodePath(callee.get('object')), state)
+  if (source?.shape !== 'list') return
+  const callback = asNodePath(path.get('arguments')[0])
+  if (!callback?.isArrowFunctionExpression() && !callback?.isFunctionExpression()) return
+  bindPattern(asNodePath(callback.get('params')[0]), { ...source, shape: 'object' }, state)
+}
+
+function bindStreamCallback(path: NodePath<t.CallExpression>, state: AnalysisState): void {
+  const apiCall = findAPICall(path, state)
+  if (!apiCall?.stream) return
+
+  const usage = callUsage(apiCall.api, apiCall.path.node, state)
+  const args = apiCall.path.get('arguments')
+  const callback = asNodePath(args[args.length - 1])
+  if (!callback?.isArrowFunctionExpression() && !callback?.isFunctionExpression()) {
+    usage.escaped = true
+    return
+  }
+  bindPattern(asNodePath(callback.get('params')[0]), rootValue(usage), state)
+}
+
+function bindForOfItem(path: NodePath<t.ForOfStatement>, state: AnalysisState): void {
+  const source = resolveValue(asNodePath(path.get('right')), state)
+  if (source?.shape !== 'list') return
+  const left = asNodePath(path.get('left'))
+  const target = left?.isVariableDeclaration() ? asNodePath(left.get('declarations')[0]?.get('id')) : left
+  bindPattern(target, { ...source, shape: 'object' }, state)
+}
+
+function collectFieldAccesses(ast: t.File, state: AnalysisState): void {
+  const visit = (path: NodePath<t.MemberExpression | t.OptionalMemberExpression>) => {
+    const value = resolveValue(path, state)
+    if (value && value.fields.length > 0) addSelectedFields(value)
+  }
+  traverse(ast, {
+    MemberExpression: visit,
+    OptionalMemberExpression: visit,
+  })
+}
+
+function addSelectedFields(value: ValueBinding): void {
+  addFieldChain(value.usage.tree, value.fields)
+}
+
+function collectEscapes(ast: t.File, state: AnalysisState): void {
+  traverse(ast, {
+    Identifier(path) {
+      if (!path.isReferencedIdentifier()) return
+      const value = lookupIdentifier(path, state)
+      if (value && !isSafeReference(path)) value.usage.escaped = true
+    },
+  })
+}
+
+function isSafeReference(path: NodePath<t.Identifier>): boolean {
+  let current: NodePath<t.Node> = path
+  while (isTransparentExpression(current.parentPath)) current = current.parentPath!
+  const parent = current.parentPath
+  if (!parent) return false
+  if (parent.isVariableDeclarator() && parent.node.init === current.node) return true
+  if (parent.isForOfStatement() && parent.node.right === current.node) return true
+  if (!parent.isMemberExpression() && !parent.isOptionalMemberExpression()) return false
+  if (parent.node.object !== current.node) return false
+  return !parent.node.computed || isStaticMemberProperty(parent.node.property)
+}
+
+function isTransparentExpression(path: NodePath<t.Node> | null): boolean {
+  return Boolean(path?.isTSAsExpression() || path?.isTSNonNullExpression() || path?.isTypeCastExpression())
+}
+
+function resolveValue(path: NodePath<t.Node> | null, state: AnalysisState): ValueBinding | null {
+  if (!path?.node) return null
+  const expression = unwrapExpression(path)
+  if (expression.isIdentifier()) return lookupIdentifier(expression, state)
+  if (!expression.isMemberExpression() && !expression.isOptionalMemberExpression()) return null
+
+  const base = resolveValue(asNodePath(expression.get('object')), state)
+  if (!base) return null
+  if (expression.node.computed && !isStaticMemberProperty(expression.node.property)) return null
+  const name = memberPropertyName(expression.node)
+  return name === null ? resolveIndexedValue(base, expression.node.property) : resolveProperty(base, name, state.schema)
+}
+
+function resolveIndexedValue(base: ValueBinding, property: t.Expression | t.PrivateName): ValueBinding | null {
+  if (!t.isNumericLiteral(property) && !(t.isStringLiteral(property) && /^\d+$/.test(property.value))) return null
+  if (base.shape !== 'list') return null
+  return { ...base, shape: 'object' }
+}
+
+function resolveProperty(base: ValueBinding, name: string, schema: LuxoSchema): ValueBinding | null {
+  if (base.shape === 'page') {
+    if (name === 'items') return { ...base, shape: 'list' }
+    return PAGE_FIELDS.has(name) ? { ...base, shape: 'scalar' } : null
+  }
+  if (base.shape === 'list') return name === 'length' ? { ...base, shape: 'scalar' } : null
+  if (base.shape !== 'object') return null
+
+  const field = declaration(schema, base.typeName)?.fields.find(candidate => candidate.name === name)
+  if (!field) return null
+  return fieldValue(base, field, schema)
+}
+
+function fieldValue(base: ValueBinding, field: LuxoField, schema: LuxoSchema): ValueBinding {
+  const typeName = field.typeName || field.type
+  const nested = Boolean(declaration(schema, typeName))
+  let shape: ValueShape = nested ? 'object' : 'scalar'
+  if (field.isList || field.list) shape = 'list'
+  return { ...base, typeName, fields: [...base.fields, field.name], shape }
+}
+
+function lookupIdentifier(path: NodePath<t.Identifier>, state: AnalysisState): ValueBinding | null {
+  const binding = path.scope.getBinding(path.node.name)
+  return binding ? state.bindings.get(binding.identifier) ?? null : null
+}
+
+function declaration(schema: LuxoSchema, name: string): SchemaDeclaration | undefined {
+  return schema.models[name] ?? schema.types?.[name]
+}
+
+function unwrapExpression(path: NodePath<t.Node>): NodePath<t.Node> {
+  let current = path
+  while (true) {
+    if (current.isAwaitExpression()) {
+      current = asNodePath(current.get('argument')) ?? current
+      continue
+    }
+    if (current.isTSAsExpression() || current.isTSNonNullExpression() || current.isTypeCastExpression()) {
+      current = asNodePath(current.get('expression')) ?? current
+      continue
+    }
+    return current
+  }
+}
+
+function createSelectionEdit(code: string, usage: CallUsage, schema: LuxoSchema): TextEdit[] {
+  if (hasManualSelection(usage.call)) return []
+  if (usage.escaped) addSafeProjection(usage.tree, usage.api.returnType ?? '', schema)
+  completeStructuredLeaves(usage.tree, usage.api.returnType ?? '', schema)
+  if (usage.tree.children.size === 0) addMinimalProjection(usage.tree, usage.api.returnType ?? '', schema)
+  const selection = usage.tree.toSelectString()
+  if (!selection) return []
+  warnDeepSelection(usage.api.name, usage.tree)
+
+  const first = usage.call.arguments[0]
+  if (!first) return insertEmptyParams(usage.call, selection)
+  if (t.isObjectExpression(first)) return mergeObjectParams(first, selection)
+  return wrapDynamicParams(code, first, selection)
+}
+
+function addSafeProjection(
+  root: FieldNode,
+  typeName: string,
+  schema: LuxoSchema,
+  ancestors: ReadonlySet<string> = new Set(),
+): void {
+  const type = declaration(schema, typeName)
+  if (!type) return
+  const recursive = ancestors.has(typeName)
+  const nextAncestors = new Set(ancestors).add(typeName)
+  const model = schema.models[typeName]
+
+  for (const field of type.fields) {
+    const nestedType = field.typeName || field.type
+    const nested = declaration(schema, nestedType)
+    if (!nested) {
+      root.addChild(field.name)
+      continue
+    }
+    if (recursive) continue
+    if (model && field.relation) continue
+    const child = root.addChild(field.name)
+    addSafeProjection(child, nestedType, schema, nextAncestors)
+    if (child.children.size === 0) root.children.delete(field.name)
+  }
+}
+
+function completeStructuredLeaves(
+  root: FieldNode,
+  typeName: string,
+  schema: LuxoSchema,
+  ancestors: ReadonlySet<string> = new Set(),
+): void {
+  const type = declaration(schema, typeName)
+  if (!type || ancestors.has(typeName)) return
+  const nextAncestors = new Set(ancestors).add(typeName)
+
+  for (const child of root.children.values()) {
+    const field = type.fields.find(candidate => candidate.name === child.name)
+    if (!field) continue
+    const nestedType = field.typeName || field.type
+    if (!declaration(schema, nestedType)) continue
+    if (child.children.size === 0) addSafeProjection(child, nestedType, schema, nextAncestors)
+    else completeStructuredLeaves(child, nestedType, schema, nextAncestors)
+  }
+}
+
+function addMinimalProjection(
+  root: FieldNode,
+  typeName: string,
+  schema: LuxoSchema,
+  ancestors: ReadonlySet<string> = new Set(),
+): boolean {
+  const type = declaration(schema, typeName)
+  if (!type) return false
+  const model = schema.models[typeName]
+  const scalar = type.fields.find(field => !declaration(schema, field.typeName || field.type))
+  if (scalar) {
+    root.addChild(scalar.name)
+    return true
+  }
+  if (ancestors.has(typeName)) return false
+
+  const nextAncestors = new Set(ancestors).add(typeName)
+  for (const field of type.fields) {
+    if (model && field.relation) continue
+    const nestedType = field.typeName || field.type
+    if (!declaration(schema, nestedType)) continue
+    const child = root.addChild(field.name)
+    if (addMinimalProjection(child, nestedType, schema, nextAncestors)) return true
+    root.children.delete(field.name)
+  }
+  return false
+}
+
+function hasManualSelection(call: t.CallExpression): boolean {
+  const first = call.arguments[0]
+  if (!t.isObjectExpression(first)) return false
+  return first.properties.some(property => {
+    if (!t.isObjectProperty(property) && !t.isObjectMethod(property)) return false
+    return staticPropertyName(property.key, property.computed) === '$select'
+  })
+}
+
+function insertEmptyParams(call: t.CallExpression, selection: string): TextEdit[] {
+  if (call.end === null || call.end === undefined) return []
+  const point = call.end - 1
+  return [{ start: point, end: point, replacement: `{ $select: '${selection}' }` }]
+}
+
+function mergeObjectParams(params: t.ObjectExpression, selection: string): TextEdit[] {
+  if (params.start === null || params.start === undefined || params.end === null || params.end === undefined) return []
+  if (params.properties.length === 0) {
+    return [{ start: params.start, end: params.end, replacement: `{ $select: '${selection}' }` }]
+  }
+  return [{ start: params.start + 1, end: params.start + 1, replacement: ` $select: '${selection}',` }]
+}
+
+function wrapDynamicParams(
+  code: string,
+  params: t.Expression | t.SpreadElement | t.JSXNamespacedName | t.ArgumentPlaceholder,
+  selection: string,
+): TextEdit[] {
+  if (params.start === null || params.start === undefined || params.end === null || params.end === undefined) return []
+  const source = code.slice(params.start, params.end)
+  return [{
+    start: params.start,
+    end: params.end,
+    replacement: `{ $select: '${selection}', ...(${source}) }`,
+  }]
+}
+
+function warnDeepSelection(apiName: string, tree: FieldNode): void {
+  const depth = tree.maxDepth()
+  if (depth <= MAX_NESTING_DEPTH) return
+  console.warn(
+    `[luxo] Warning: ${apiName} has ${depth}-level nested field selection (max recommended: ${MAX_NESTING_DEPTH}). ` +
+    'Deep nesting may cause performance issues. Consider using @native or restructuring your query.'
+  )
+}
+
+function applyTextEdits(code: string, edits: TextEdit[]): string {
+  let result = code
+  for (const edit of [...edits].sort((a, b) => b.start - a.start)) {
+    result = result.slice(0, edit.start) + edit.replacement + result.slice(edit.end)
+  }
+  return result
+}
 
 class FieldNode {
   children = new Map<string, FieldNode>()
+
   constructor(public name: string) {}
 
   addChild(name: string): FieldNode {
@@ -289,7 +503,6 @@ class FieldNode {
   }
 
   toSelectString(): string {
-    if (this.children.size === 0) return ''
     const parts: string[] = []
     for (const child of this.children.values()) {
       const nested = child.toSelectString()
@@ -299,84 +512,41 @@ class FieldNode {
   }
 
   maxDepth(): number {
-    if (this.children.size === 0) return 0
     let max = 0
-    for (const child of this.children.values()) {
-      max = Math.max(max, child.maxDepth())
-    }
-    return max + 1
+    for (const child of this.children.values()) max = Math.max(max, child.maxDepth())
+    return this.children.size === 0 ? 0 : max + 1
   }
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-/** Extract property chain from MemberExpression/OptionalMemberExpression */
-function extractChain(node: t.Expression): string[] | null {
-  const chain: string[] = []
-
-  let current: t.Expression = node
-  while (t.isMemberExpression(current) || t.isOptionalMemberExpression(current)) {
-    const prop = current.property
-    if (t.isIdentifier(prop)) {
-      chain.unshift(prop.name)
-    } else {
-      break
-    }
-    current = current.object
-
-    // Skip index expressions: arr[0].field
-    if ((t.isMemberExpression(current) || t.isOptionalMemberExpression(current)) && current.computed) {
-      current = current.object
-    }
-  }
-
-  if (t.isIdentifier(current)) {
-    chain.unshift(current.name)
-  }
-
-  return chain.length >= 2 ? chain : null
+function addFieldChain(root: FieldNode, fields: string[]): void {
+  let current = root
+  for (const field of fields) current = current.addChild(field)
 }
 
-/** Resolve variable through parent chain: c → post.comments */
-function resolveParentChain(
-  varName: string,
-  parents: Map<string, { var: string; field: string }>,
-): { rootVar: string; fields: string[] } | null {
-  const fields: string[] = []
-  let current = varName
-  const seen = new Set<string>()
-
-  while (parents.has(current)) {
-    if (seen.has(current)) break // prevent cycles
-    seen.add(current)
-    const parent = parents.get(current)!
-    fields.unshift(parent.field)
-    current = parent.var
-  }
-
-  if (fields.length === 0) return null
-  return { rootVar: current, fields }
+function memberPropertyName(node: t.MemberExpression | t.OptionalMemberExpression): string | null {
+  if (!node.computed && t.isIdentifier(node.property)) return node.property.name
+  return staticPropertyName(node.property, node.computed)
 }
 
-/** Add a field chain to the tree, validating against schema */
-function addFieldChain(
-  root: FieldNode,
-  chain: string[],
-  model: LuxoModel | undefined,
-  schema: LuxoSchema,
-): void {
-  let currentModel = model
-  let currentNode = root
-
-  for (const seg of chain) {
-    const field = currentModel?.fields.find(f => f.name === seg)
-    if (!field) break
-
-    currentNode = currentNode.addChild(seg)
-    currentModel = field.type ? schema.models[field.type] : undefined
-  }
+function streamMethodName(apiName: string): string {
+  return `subscribe${apiName.charAt(0).toUpperCase()}${apiName.slice(1)}`
 }
 
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+function objectPropertyName(node: t.ObjectProperty): string | null {
+  return staticPropertyName(node.key, node.computed)
+}
+
+function staticPropertyName(property: t.Expression | t.PrivateName, computed: boolean): string | null {
+  if (!computed && t.isIdentifier(property)) return property.name
+  if (t.isStringLiteral(property)) return property.value
+  return null
+}
+
+function isStaticMemberProperty(property: t.Expression | t.PrivateName): boolean {
+  return t.isNumericLiteral(property) || t.isStringLiteral(property)
+}
+
+function asNodePath(value: NodePath<t.Node> | NodePath<t.Node>[] | null | undefined): NodePath<t.Node> | null {
+  if (!value || Array.isArray(value)) return null
+  return value
 }

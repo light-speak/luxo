@@ -350,6 +350,8 @@ func TestBinaryPaginatedListToJSON_EmptyList(t *testing.T) {
 
 	w := &codec.ColumnarWriter{}
 	w.SetCount(0)
+	w.WriteColumnInt(1, nil)
+	w.WriteColumnString(2, nil)
 	data := w.Bytes()
 
 	// Append actual pagination metadata: total=100, page=3, pageSize=25

@@ -279,11 +279,14 @@ func (lf *LockFile) updateModels(files []*ast.File) {
 	currentModels := make(map[string]map[string]bool)
 	for _, file := range files {
 		for _, m := range file.Models {
-			fields := make(map[string]bool, len(m.Fields))
+			fields := currentModels[m.Name]
+			if fields == nil {
+				fields = make(map[string]bool, len(m.Fields))
+				currentModels[m.Name] = fields
+			}
 			for _, f := range m.Fields {
 				fields[f.Name] = true
 			}
-			currentModels[m.Name] = fields
 		}
 		// Include extend field names so they are not reserved as "removed".
 		for _, ext := range file.Extends {
@@ -367,6 +370,12 @@ func (lf *LockFile) reserveRemovedFields(ml *ModelLock, current map[string]bool)
 // updateAPIs assigns stable IDs to all API declarations, including CRUD APIs.
 func (lf *LockFile) updateAPIs(files []*ast.File) {
 	active := make(map[string]bool)
+	declared := make(map[string]bool)
+	for _, file := range files {
+		for _, api := range file.APIs {
+			declared[api.Name] = true
+		}
+	}
 	ensure := func(name string, params []string) {
 		active[name] = true
 		lf.ensureAPIID(name, params)
@@ -385,13 +394,12 @@ func (lf *LockFile) updateAPIs(files []*ast.File) {
 			}
 			name := m.Name
 			plural := name + "s"
-			// CRUD param names are well-known
-			ensure("get"+name, []string{"id"})
-			ensure("list"+plural, []string{"page", "pageSize"})
-			ensure("create"+name, collectCRUDFieldNames(m, enums, false))
-			ensure("update"+name, append([]string{"id"}, collectCRUDFieldNames(m, enums, true)...))
-			ensure("delete"+name, []string{"id"})
-			ensure("delete"+plural, []string{"ids"})
+			for _, operation := range m.CRUDOperations() {
+				apiName, params := crudAPIContract(name, plural, operation, m, enums)
+				if apiName != "" && !declared[apiName] {
+					ensure(apiName, params)
+				}
+			}
 			ensure("svc:batchLoad:"+name, []string{"keys"})
 		}
 	}
@@ -400,8 +408,8 @@ func (lf *LockFile) updateAPIs(files []*ast.File) {
 	// Declared APIs — params from AST
 	for _, file := range files {
 		for _, api := range file.APIs {
-			var params []string
-			for _, p := range api.Params {
+			params := make([]string, 0, len(api.Params)+2)
+			for _, p := range api.EffectiveParams() {
 				params = append(params, p.Name)
 			}
 			ensure(api.Name, params)
@@ -421,6 +429,25 @@ func (lf *LockFile) updateAPIs(files []*ast.File) {
 		}
 	}
 	lf.reserveRemovedAPIs(active)
+}
+
+func crudAPIContract(name, plural, operation string, model *ast.ModelDecl, enums map[string]bool) (string, []string) {
+	switch operation {
+	case "get":
+		return "get" + name, []string{"id"}
+	case "list":
+		return "list" + plural, []string{"page", "pageSize"}
+	case "create":
+		return "create" + name, collectCRUDFieldNames(model, enums, false)
+	case "update":
+		return "update" + name, append([]string{"id"}, collectCRUDFieldNames(model, enums, true)...)
+	case "delete":
+		return "delete" + name, []string{"id"}
+	case "deleteMany":
+		return "delete" + plural, []string{"ids"}
+	default:
+		return "", nil
+	}
 }
 
 func (lf *LockFile) updateFederationAPIs(files []*ast.File, enums map[string]bool, ensure func(string, []string)) {
@@ -614,6 +641,11 @@ func (lf *LockFile) ensureAPIID(name string, params []string) {
 	}
 	// Compute nextP from existing params
 	for _, id := range al.Params {
+		if id > al.nextP {
+			al.nextP = id
+		}
+	}
+	for _, id := range al.Reserved {
 		if id > al.nextP {
 			al.nextP = id
 		}

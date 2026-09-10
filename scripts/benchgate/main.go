@@ -12,6 +12,7 @@ import (
 )
 
 const (
+	confirmationFlag  = "--requires-confirmation"
 	maxTimeRegression = 5.0
 	minimumSamples    = 10
 )
@@ -55,14 +56,56 @@ func command(args []string, output, errorOutput io.Writer) int {
 }
 
 func run(args []string, output io.Writer) error {
-	if len(args) != 2 {
-		return errors.New("usage: benchgate <primary.csv> <confirmation.csv>")
+	if len(args) > 0 && args[0] == confirmationFlag {
+		if len(args) != 2 {
+			return usageError()
+		}
+		return reportConfirmationRequirement(args[1], output)
 	}
-	primary, err := evaluateFile(args[0])
+	switch len(args) {
+	case 1:
+		return evaluatePrimary(args[0], output)
+	case 2:
+		return evaluateConfirmation(args[0], args[1], output)
+	default:
+		return usageError()
+	}
+}
+
+func usageError() error {
+	return errors.New("usage: benchgate [--requires-confirmation] <primary.csv> [confirmation.csv]")
+}
+
+func reportConfirmationRequirement(path string, output io.Writer) error {
+	result, err := evaluateFile(path)
 	if err != nil {
 		return err
 	}
-	confirmation, err := evaluateFile(args[1])
+	_, err = fmt.Fprintln(output, len(result.Regressions) > 0)
+	return err
+}
+
+func evaluatePrimary(path string, output io.Writer) error {
+	result, err := evaluateFile(path)
+	if err != nil {
+		return err
+	}
+	for _, regression := range result.Regressions {
+		fmt.Fprintf(output, "candidate performance regression: %s\n", regression.Description)
+	}
+	if len(result.Regressions) > 0 {
+		return fmt.Errorf("performance gate requires confirmation for %d regression candidate(s)", len(result.Regressions))
+	}
+	fmt.Fprintf(output, "performance gate passed: %d time and %d allocation comparisons; primary sample group clean without confirmation\n", result.TimeComparisons, result.AllocationComparisons)
+	return nil
+}
+
+func evaluateConfirmation(primaryPath, confirmationPath string, output io.Writer) error {
+	primary, err := evaluateFile(primaryPath)
+	if err != nil {
+		return err
+	}
+	confirmation, err := evaluateFile(confirmationPath)
 	if err != nil {
 		return err
 	}

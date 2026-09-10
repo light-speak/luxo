@@ -4,13 +4,16 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"github.com/light-speak/luxo/pkg/lux/selection"
 )
 
 // BatchFn is the function that fetches data in batch.
 // keys: all collected keys in this batch.
-// fields: union of all requested fields in this batch.
+// fields: merged recursive selection requested by this batch. The selection is
+// immutable request metadata and must not be modified by the batch function.
 // Returns a map from key to result.
-type BatchFn[K comparable, V any] func(ctx context.Context, keys []K, fields []string) (map[K]V, error)
+type BatchFn[K comparable, V any] func(ctx context.Context, keys []K, fields []*selection.Field) (map[K]V, error)
 
 // Loader batches and caches Load calls within a configurable time window.
 // Thread-safe — multiple goroutines can call Load concurrently.
@@ -19,8 +22,8 @@ type Loader[K comparable, V any] struct {
 	wait     time.Duration
 	maxBatch int
 
-	mu    sync.Mutex
-	batch *batch[K, V]
+	mu      sync.Mutex
+	batches map[<-chan struct{}]*batch[K, V]
 }
 
 // Config configures a Loader.
@@ -46,24 +49,26 @@ func New[K comparable, V any](fn BatchFn[K, V], cfg Config) *Loader[K, V] {
 		batchFn:  fn,
 		wait:     cfg.Wait,
 		maxBatch: cfg.MaxBatch,
+		batches:  make(map[<-chan struct{}]*batch[K, V]),
 	}
 }
 
 // Load adds a key + fields to the current batch and waits for the result.
 // Respects ctx cancellation — returns immediately if context is done.
-func (l *Loader[K, V]) Load(ctx context.Context, key K, fields []string) (V, error) {
+func (l *Loader[K, V]) Load(ctx context.Context, key K, fields []*selection.Field) (V, error) {
 	l.mu.Lock()
 
-	if l.batch == nil {
-		l.batch = newBatch[K, V]()
-		b := l.batch
-		time.AfterFunc(l.wait, func() { l.flushBatch(b) })
+	scope := ctx.Done()
+	b := l.batches[scope]
+	if b == nil {
+		b = newBatch[K, V](ctx)
+		l.batches[scope] = b
+		time.AfterFunc(l.wait, func() { l.flushBatch(scope, b) })
 	}
-	b := l.batch
 	req := b.add(key, fields)
 
 	if l.maxBatch > 0 && b.size() >= l.maxBatch {
-		l.batch = nil
+		delete(l.batches, scope)
 		l.mu.Unlock()
 		l.dispatchBatch(b)
 	} else {
@@ -83,7 +88,7 @@ func (l *Loader[K, V]) Load(ctx context.Context, key K, fields []string) (V, err
 // LoadAll loads multiple keys immediately — bypasses batch window.
 // Used by LIST handlers where all keys are known upfront.
 // Zero wait, direct dispatch.
-func (l *Loader[K, V]) LoadAll(ctx context.Context, keys []K, fields []string) (map[K]V, error) {
+func (l *Loader[K, V]) LoadAll(ctx context.Context, keys []K, fields []*selection.Field) (map[K]V, error) {
 	if len(keys) == 0 {
 		return nil, nil
 	}
@@ -92,10 +97,10 @@ func (l *Loader[K, V]) LoadAll(ctx context.Context, keys []K, fields []string) (
 
 // flushBatch dispatches a batch after the wait window expires.
 // Called by time.AfterFunc — no goroutine blocked during wait.
-func (l *Loader[K, V]) flushBatch(b *batch[K, V]) {
+func (l *Loader[K, V]) flushBatch(scope <-chan struct{}, b *batch[K, V]) {
 	l.mu.Lock()
-	if l.batch == b {
-		l.batch = nil
+	if l.batches[scope] == b {
+		delete(l.batches, scope)
 	}
 	l.mu.Unlock()
 
@@ -106,8 +111,8 @@ func (l *Loader[K, V]) flushBatch(b *batch[K, V]) {
 func (l *Loader[K, V]) dispatchBatch(b *batch[K, V]) {
 	b.once.Do(func() {
 		keys := b.keys()
-		fields := b.mergedFields()
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		fields := b.mergedSelection()
+		ctx, cancel := context.WithTimeout(b.ctx, 30*time.Second)
 		defer cancel()
 		results, err := l.batchFn(ctx, keys, fields)
 
@@ -124,36 +129,68 @@ func (l *Loader[K, V]) dispatchBatch(b *batch[K, V]) {
 
 // batch collects load requests within a window.
 type batch[K comparable, V any] struct {
-	requests []*request[K, V]
-	fieldSet map[string]bool
-	once     sync.Once
+	ctx        context.Context
+	requests   []*request[K, V]
+	fields     []*selection.Field
+	hasRequest bool
+	selectsAll bool
+	once       sync.Once
 }
 
 type request[K comparable, V any] struct {
 	key    K
-	fields []string
+	fields []*selection.Field
 	value  V
 	err    error
 	done   chan struct{}
 }
 
-func newBatch[K comparable, V any]() *batch[K, V] {
+func newBatch[K comparable, V any](ctx context.Context) *batch[K, V] {
 	return &batch[K, V]{
-		fieldSet: make(map[string]bool),
+		ctx: ctx,
 	}
 }
 
-func (b *batch[K, V]) add(key K, fields []string) *request[K, V] {
+func (b *batch[K, V]) add(key K, fields []*selection.Field) *request[K, V] {
 	req := &request[K, V]{
 		key:    key,
 		fields: fields,
 		done:   make(chan struct{}),
 	}
 	b.requests = append(b.requests, req)
-	for _, f := range fields {
-		b.fieldSet[f] = true
+	if !b.hasRequest {
+		b.hasRequest = true
+		b.selectsAll = fields == nil
+		if fields != nil {
+			b.fields = fields
+		}
+	} else if !b.selectsAll {
+		if fields == nil {
+			b.selectsAll = true
+			b.fields = nil
+		} else if !sameSelection(b.fields, fields) {
+			b.fields = selection.Merge(b.fields, fields)
+		}
 	}
 	return req
+}
+
+func sameSelection(left, right []*selection.Field) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] == nil || right[i] == nil {
+			if left[i] != right[i] {
+				return false
+			}
+			continue
+		}
+		if left[i].Name != right[i].Name || !sameSelection(left[i].Children, right[i].Children) {
+			return false
+		}
+	}
+	return true
 }
 
 func (b *batch[K, V]) size() int {
@@ -172,13 +209,9 @@ func (b *batch[K, V]) keys() []K {
 	return keys
 }
 
-func (b *batch[K, V]) mergedFields() []string {
-	if len(b.fieldSet) == 0 {
+func (b *batch[K, V]) mergedSelection() []*selection.Field {
+	if b.selectsAll || !b.hasRequest {
 		return nil
 	}
-	fields := make([]string, 0, len(b.fieldSet))
-	for f := range b.fieldSet {
-		fields = append(fields, f)
-	}
-	return fields
+	return b.fields
 }

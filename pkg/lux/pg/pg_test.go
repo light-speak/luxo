@@ -760,22 +760,22 @@ func TestTraceQueryEndMissingContextKey(t *testing.T) {
 }
 
 func TestTraceQueryStartStoresData(t *testing.T) {
-	tr := &pgxTracer{}
+	tr := &pgxTracer{debugSQL: true}
 	ctx := context.Background()
 	startData := pgx.TraceQueryStartData{
 		SQL:  "SELECT 1",
 		Args: []any{42},
 	}
 	ctx2 := tr.TraceQueryStart(ctx, nil, startData)
-	sd, ok := ctx2.Value(traceStartKey{}).(traceStartData)
+	sd, ok := ctx2.Value(debugSQLTraceKey{}).(debugSQLTrace)
 	if !ok {
-		t.Fatal("expected traceStartData to be stored in context")
+		t.Fatal("expected debugSQLTrace to be stored in context")
 	}
-	if sd.sql != "SELECT 1" {
-		t.Errorf("sql = %q, want SELECT 1", sd.sql)
+	if sd.statement != "SELECT ?" {
+		t.Errorf("sql = %q, want sanitized SELECT ?", sd.statement)
 	}
-	if len(sd.args) != 1 || sd.args[0] != 42 {
-		t.Errorf("args = %v", sd.args)
+	if sd.argumentCount != 1 {
+		t.Errorf("argument count = %d", sd.argumentCount)
 	}
 }
 
@@ -862,6 +862,141 @@ func TestQuerySumAvgMinMax(t *testing.T) {
 	}
 	if min != 10 {
 		t.Errorf("Min = %d, want 10", min)
+	}
+}
+
+func TestBuildAggregateBatchSQL(t *testing.T) {
+	query, args, err := buildAggregateBatchSQL("tasks",
+		[]lux.Condition{lux.NewIntField("project_id").Eq(42)},
+		[]lux.AggregateSpec{
+			{Function: lux.AggregateCount},
+			{Function: lux.AggregateCount, Conditions: []lux.Condition{lux.NewStringField("status").Eq("DONE")}},
+			{Function: lux.AggregateSum, Column: "story_points", Conditions: []lux.Condition{lux.NewStringField("status").Neq("CANCELLED")}},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "SELECT COUNT(*), COUNT(*) FILTER (WHERE status = $2), COALESCE(SUM(story_points) FILTER (WHERE status != $3), 0) FROM tasks WHERE project_id = $1"
+	if query != want {
+		t.Fatalf("aggregate batch SQL = %q, want %q", query, want)
+	}
+	if fmt.Sprint(args) != "[42 DONE CANCELLED]" {
+		t.Fatalf("aggregate batch args = %v", args)
+	}
+}
+
+func TestBuildAggregateBatchSQLValidatesPlan(t *testing.T) {
+	tests := []struct {
+		name string
+		spec []lux.AggregateSpec
+	}{
+		{name: "empty"},
+		{name: "invalid function", spec: []lux.AggregateSpec{{Function: lux.AggregateFunction("DROP TABLE")}}},
+		{name: "count column", spec: []lux.AggregateSpec{{Function: lux.AggregateCount, Column: "id"}}},
+		{name: "missing column", spec: []lux.AggregateSpec{{Function: lux.AggregateSum}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, _, err := buildAggregateBatchSQL("tasks", nil, test.spec); err == nil {
+				t.Fatal("invalid aggregate plan was accepted")
+			}
+		})
+	}
+}
+
+func TestBuildAggregateBatchSQLSkipsNilConditions(t *testing.T) {
+	query, args, err := buildAggregateBatchSQL("tasks",
+		[]lux.Condition{nil, lux.NewIntField("project_id").Eq(42)},
+		[]lux.AggregateSpec{{
+			Function:   lux.AggregateCount,
+			Conditions: []lux.Condition{nil, lux.NewStringField("status").Eq("DONE"), lux.NewIntField("priority").Gte(4)},
+		}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "SELECT COUNT(*) FILTER (WHERE status = $2 AND priority >= $3) FROM tasks WHERE project_id = $1"
+	if query != want || fmt.Sprint(args) != "[42 DONE 4]" {
+		t.Fatalf("aggregate SQL with nil conditions = %q, %v", query, args)
+	}
+}
+
+func TestQueryAggregateBatch(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	for _, age := range []int64{10, 20, 30} {
+		_, err := InsertReturning(ctx, db, scanUser, "users",
+			[]string{"id", "name", "email", "age"},
+			[]any{uuid.Must(uuid.NewV7()), "batch", fmt.Sprintf("batch%d@t.com", age), age},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	values, err := NewQuery[testUser](db, "users", scanUser, []lux.Condition{lux.NewStringField("name").Eq("batch")}).AggregateBatch(ctx,
+		lux.AggregateSpec{Function: lux.AggregateCount},
+		lux.AggregateSpec{Function: lux.AggregateCount, Conditions: []lux.Condition{lux.NewIntField("age").Gte(20)}},
+		lux.AggregateSpec{Function: lux.AggregateSum, Column: "age"},
+		lux.AggregateSpec{Function: lux.AggregateAvg, Column: "age"},
+		lux.AggregateSpec{Function: lux.AggregateMin, Column: "age"},
+		lux.AggregateSpec{Function: lux.AggregateMax, Column: "age"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(values) != "[3 2 60 20 10 30]" {
+		t.Fatalf("aggregate batch values = %v", values)
+	}
+}
+
+func TestQueryAggregateBatchErrors(t *testing.T) {
+	ctx := context.Background()
+	query := NewQuery[testUser](nil, "users", scanUser, nil)
+	if _, err := query.AggregateBatch(ctx); err == nil {
+		t.Fatal("empty aggregate batch was accepted")
+	}
+
+	db := testDB(t)
+	query = NewQuery[testUser](db, "missing_aggregate_table", scanUser, nil)
+	if _, err := query.AggregateBatch(ctx, lux.AggregateSpec{Function: lux.AggregateCount}); err == nil {
+		t.Fatal("database aggregate error was not returned")
+	}
+}
+
+func BenchmarkBuildAggregateBatchSQL(b *testing.B) {
+	common := []lux.Condition{lux.NewIntField("project_id").Eq(42)}
+	specs := []lux.AggregateSpec{
+		{Function: lux.AggregateCount},
+		{Function: lux.AggregateCount, Conditions: []lux.Condition{lux.NewStringField("status").Eq("DONE")}},
+		{Function: lux.AggregateCount, Conditions: []lux.Condition{lux.NewStringField("status").Eq("CANCELLED")}},
+		{Function: lux.AggregateCount, Conditions: []lux.Condition{lux.NewStringField("status").Eq("IN_REVIEW")}},
+		{Function: lux.AggregateCount, Conditions: []lux.Condition{lux.NewStringField("priority").Eq("CRITICAL"), lux.NewStringField("status").Neq("DONE")}},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, _, err := buildAggregateBatchSQL("tasks", common, specs); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkBuildSeparateAggregateSQL(b *testing.B) {
+	queries := [][]lux.Condition{
+		{lux.NewIntField("project_id").Eq(42)},
+		{lux.NewIntField("project_id").Eq(42), lux.NewStringField("status").Eq("DONE")},
+		{lux.NewIntField("project_id").Eq(42), lux.NewStringField("status").Eq("CANCELLED")},
+		{lux.NewIntField("project_id").Eq(42), lux.NewStringField("status").Eq("IN_REVIEW")},
+		{lux.NewIntField("project_id").Eq(42), lux.NewStringField("priority").Eq("CRITICAL"), lux.NewStringField("status").Neq("DONE")},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		for _, conditions := range queries {
+			lux.BuildCountSQL("tasks", conditions)
+		}
 	}
 }
 

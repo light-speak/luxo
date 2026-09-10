@@ -1,23 +1,51 @@
 package lux
 
-import "fmt"
+import (
+	"strconv"
+	"strings"
+)
 
-// PlaceholderFn generates a parameter placeholder for the given index.
-// Default: PostgreSQL ($1, $2...). Override for MySQL (?).
-var PlaceholderFn = func(index int) string {
-	return fmt.Sprintf("$%d", index)
+// PlaceholderFunc renders a backend-specific parameter placeholder.
+// It is passed explicitly so different backends can safely run concurrently.
+type PlaceholderFunc func(index int) string
+
+// PostgreSQLPlaceholder renders PostgreSQL's numbered placeholder syntax.
+func PostgreSQLPlaceholder(index int) string {
+	return "$" + strconv.Itoa(index)
 }
 
 // AggregateSQL generates a SQL aggregate query for computed fields.
-// Uses PlaceholderFn for database-agnostic parameter binding.
+// PostgreSQL placeholders remain the compatibility default.
 func AggregateSQL(fn, table, fkCol, targetCol string) string {
-	ph := PlaceholderFn(1)
+	return AggregateSQLWithPlaceholder(fn, table, fkCol, targetCol, PostgreSQLPlaceholder)
+}
+
+// AggregateSQLWithPlaceholder generates an aggregate query using an explicit
+// placeholder renderer. SQL backends own the renderer; no process-global
+// dialect state is mutated.
+func AggregateSQLWithPlaceholder(fn, table, fkCol, targetCol string, placeholder PlaceholderFunc) string {
+	if placeholder == nil {
+		placeholder = PostgreSQLPlaceholder
+	}
 	col := "*"
 	if targetCol != "" {
 		col = targetCol
 	}
+	var query strings.Builder
+	query.Grow(len(fn) + len(table) + len(fkCol) + len(col) + 48)
 	if fn == "COUNT" {
-		return fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s = %s", table, fkCol, ph)
+		query.WriteString("SELECT COUNT(*) FROM ")
+	} else {
+		query.WriteString("SELECT COALESCE(")
+		query.WriteString(fn)
+		query.WriteByte('(')
+		query.WriteString(col)
+		query.WriteString("), 0) FROM ")
 	}
-	return fmt.Sprintf("SELECT COALESCE(%s(%s), 0) FROM %s WHERE %s = %s", fn, col, table, fkCol, ph)
+	query.WriteString(table)
+	query.WriteString(" WHERE ")
+	query.WriteString(fkCol)
+	query.WriteString(" = ")
+	query.WriteString(placeholder(1))
+	return query.String()
 }

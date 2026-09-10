@@ -2,6 +2,8 @@ package event
 
 import (
 	"context"
+	"errors"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,6 +35,38 @@ func TestChanBusEmitOn(t *testing.T) {
 	got := received.Load().(map[string]any)
 	if got["id"] != 1 {
 		t.Errorf("got %v", got)
+	}
+}
+
+func TestChanBusHandlerContextOutlivesEmitter(t *testing.T) {
+	bus := NewChanBus(1)
+	defer bus.Close()
+
+	type contextKey struct{}
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), contextKey{}, "request-value"))
+	cancel()
+	result := make(chan struct {
+		err   error
+		value any
+	}, 1)
+	if err := bus.On("audit", func(ctx context.Context, _ any) error {
+		result <- struct {
+			err   error
+			value any
+		}{err: ctx.Err(), value: ctx.Value(contextKey{})}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bus.Emit(ctx, "audit", nil); err != nil {
+		t.Fatal(err)
+	}
+	got := <-result
+	if got.err != nil {
+		t.Fatalf("handler inherited emitter cancellation: %v", got.err)
+	}
+	if got.value != nil {
+		t.Fatalf("handler inherited request-scoped value: %v", got.value)
 	}
 }
 
@@ -78,18 +112,47 @@ func TestChanBusBufferFull(t *testing.T) {
 	defer bus.Close()
 
 	block := make(chan struct{})
+	started := make(chan struct{})
 	bus.On("slow", func(ctx context.Context, payload any) error {
+		if payload == "1" {
+			close(started)
+		}
 		<-block
 		return nil
 	})
 
-	bus.Emit(context.Background(), "slow", "1")
-	time.Sleep(10 * time.Millisecond)
-
-	bus.Emit(context.Background(), "slow", "2")
-	bus.Emit(context.Background(), "slow", "3")
+	if err := bus.Emit(context.Background(), "slow", "1"); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := bus.Emit(context.Background(), "slow", "2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bus.Emit(context.Background(), "slow", "3"); !errors.Is(err, ErrBufferFull) {
+		t.Fatalf("full buffer error = %v, want %v", err, ErrBufferFull)
+	}
 
 	close(block)
+}
+
+func TestChanBusCloseDrainsAcceptedEvents(t *testing.T) {
+	bus := NewChanBus(16)
+	var handled atomic.Int32
+	if err := bus.On("audit", func(context.Context, any) error {
+		handled.Add(1)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 16 {
+		if err := bus.Emit(context.Background(), "audit", i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bus.Close()
+	if got := handled.Load(); got != 16 {
+		t.Fatalf("Close handled %d events, want 16", got)
+	}
 }
 
 func TestChanBusClose(t *testing.T) {
@@ -102,17 +165,36 @@ func TestChanBusClose(t *testing.T) {
 	bus.Emit(context.Background(), "test", "after close")
 }
 
-func TestChanBusCloseKeepsEventChannelsOpen(t *testing.T) {
+func TestChanBusCloseWaitsForInFlightEmit(t *testing.T) {
 	bus := NewChanBus(1)
-	if err := bus.On("test", func(context.Context, any) error { return nil }); err != nil {
+	handled := make(chan struct{}, 1)
+	if err := bus.On("test", func(context.Context, any) error {
+		handled <- struct{}{}
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
-	bus.Close()
+
+	bus.mu.RLock()
+	ch := bus.channels["test"]
+	closed := make(chan struct{})
+	go func() {
+		bus.Close()
+		close(closed)
+	}()
+	<-bus.done
+	ch <- "accepted"
+	bus.mu.RUnlock()
 
 	select {
-	case bus.channels["test"] <- message{}:
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not wait for the accepted event")
+	}
+	select {
+	case <-handled:
 	default:
-		t.Fatal("event channel should remain open after shutdown")
+		t.Fatal("accepted event was not handled before Close returned")
 	}
 }
 
@@ -296,5 +378,27 @@ func TestChanBusOnAfterClose(t *testing.T) {
 	err := bus.On("test", func(ctx context.Context, payload any) error { return nil })
 	if err == nil {
 		t.Fatal("On after Close should return error")
+	}
+}
+
+func BenchmarkChanBusEmit(b *testing.B) {
+	bus := NewChanBus(1024)
+	if err := bus.On("benchmark", func(context.Context, any) error { return nil }); err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(bus.Close)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		for {
+			err := bus.Emit(context.Background(), "benchmark", "payload")
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, ErrBufferFull) {
+				b.Fatal(err)
+			}
+			runtime.Gosched()
+		}
 	}
 }

@@ -598,6 +598,9 @@ func TestGenerateInferredHandlerSelectsRelationColumns(t *testing.T) {
 				!strings.Contains(out, "resolveUser") {
 				t.Fatalf("%s relation selection was not generated:\n%s", action, out)
 			}
+			if strings.Contains(out, `cols = ensureField(cols, "id")`) {
+				t.Fatalf("%s selected unrequested relation keys:\n%s", action, out)
+			}
 		})
 	}
 }

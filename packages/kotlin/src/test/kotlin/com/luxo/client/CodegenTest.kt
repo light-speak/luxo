@@ -32,7 +32,7 @@ class CodegenTest {
                 module = "file",
                 returnType = "Payload",
                 params = listOf(
-                    LuxoParam(1, "input", "JSON", typeName = "CreateInput"),
+					LuxoParam(1, "input", "Model", typeName = "CreateInput"),
                     LuxoParam(2, "note", "String", nullable = true),
                     LuxoParam(3, "caption", "String", nullable = true, hasDefault = true),
                 ),
@@ -91,6 +91,7 @@ class CodegenTest {
     fun `generates canonical columnar and paginated decoders`() {
         val types = LuxoCodegen.genTypes(schema, "com.example")
         val client = LuxoCodegen.genClient(schema, "com.example")
+		val wireSchema = LuxoCodegen.genSchemaMap(schema, "com.example")
         val hints = LuxoCodegen.genSelectHints("com.example", emptyMap())
 
         assertContains(types, "fun decodeColumnarPayload(data: ByteArray): List<Payload>")
@@ -108,7 +109,13 @@ class CodegenTest {
         assertContains(client, "decodeColumnarPayload(data)")
         assertContains(client, "decodePaginatedPayload(data)")
         assertContains(client, "input: CreateInput")
-        assertContains(client, "Json.encodeToJsonElement(input)")
+		assertFalse(client.contains("Json.encodeToJsonElement(input)"))
+		assertContains(types, "data class CreateInput(")
+		assertContains(types, ") : LuxoBinaryEncodable")
+		assertContains(types, "override fun writeLuxo(encoder: LuxoEncoder)")
+		assertContains(types, "encoder.writeString(name)")
+		assertContains(wireSchema, "ParamSchema(1, \"input\", \"Model\", isList = false, nullable = false, typeName = \"CreateInput\")")
+		assertContains(wireSchema, "SelectionFieldSchema(1, type = \"String\"")
         assertContains(client, "note: String?")
         assertContains(client, "caption: LuxoOptional<String> = LuxoOptional.Absent")
         assertContains(client, "is LuxoOptional.Present -> callParams[\"caption\"] = caption.value")

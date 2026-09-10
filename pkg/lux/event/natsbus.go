@@ -5,15 +5,13 @@ import (
 	"fmt"
 	"sync"
 
-	"encoding/json"
-
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/nats-io/nats.go"
 )
 
 // NATSBus implements Bus using NATS messaging.
 // Used in multi-service mode for cross-process event delivery.
-// Generated events use Luxo binary; custom payloads fall back to JSON.
+// Generated events use Luxo binary; custom payloads must be pre-encoded.
 type NATSBus struct {
 	conn *nats.Conn
 	subs []*nats.Subscription
@@ -35,20 +33,24 @@ func NewNATSBus(url string) (*NATSBus, error) {
 	return &NATSBus{conn: conn}, nil
 }
 
-// Emit serializes payload and publishes to NATS.
-// Uses Luxo binary format if the payload implements LuxoMarshaler, falls back to JSON.
+// Emit publishes a Luxo binary or pre-encoded payload to NATS.
 func (b *NATSBus) Emit(ctx context.Context, name string, payload any) error {
-	var data []byte
-	if m, ok := payload.(codec.LuxoMarshaler); ok {
-		data = m.MarshalLuxo()
-	} else {
-		var err error
-		data, err = json.Marshal(payload)
-		if err != nil {
-			return fmt.Errorf("nats marshal: %w", err)
-		}
+	data, err := natsPayloadBytes(payload)
+	if err != nil {
+		return err
 	}
 	return b.conn.Publish(name, data)
+}
+
+func natsPayloadBytes(payload any) ([]byte, error) {
+	switch value := payload.(type) {
+	case []byte:
+		return value, nil
+	case codec.LuxoMarshaler:
+		return value.MarshalLuxo(), nil
+	default:
+		return nil, fmt.Errorf("%w: %T", ErrBinaryPayloadRequired, payload)
+	}
 }
 
 // On subscribes to a NATS subject. Handler receives the raw wire bytes.

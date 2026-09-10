@@ -157,6 +157,7 @@ class LuxoAPITest {
         assertNull(api.returnType)
         assertFalse(api.returnList)
         assertFalse(api.paginated)
+        assertNull(api.defaultPageSize)
         assertEquals(emptyList(), api.params)
     }
 
@@ -169,6 +170,7 @@ class LuxoAPITest {
             returnType = "User",
             returnList = true,
             paginated = true,
+            defaultPageSize = 50,
             params = listOf(
                 LuxoParam(id = 1, name = "page", type = "Int"),
                 LuxoParam(id = 2, name = "pageSize", type = "Int"),
@@ -180,6 +182,7 @@ class LuxoAPITest {
         assertEquals("User", api.returnType)
         assertTrue(api.returnList)
         assertTrue(api.paginated)
+        assertEquals(50, api.defaultPageSize)
         assertEquals(2, api.params.size)
         assertEquals("page", api.params[0].name)
     }

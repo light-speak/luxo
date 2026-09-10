@@ -305,7 +305,7 @@ func (g *GeneratorContext) writeArenaLenCalc(b *strings.Builder, m *ast.ModelDec
 
 // generateWriteLuxo generates a WriteLuxo method for Luxo binary serialization.
 // Field IDs come from luxo.lock via getModelFieldID().
-// Writes all non-hidden fields, including selected nested relations.
+// Writes persistent/default fields and explicitly selected nested relations.
 // Prefixes field data with totalStringLen varint for arena allocation on decode.
 func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
 	defaultGenerator().generateWriteLuxo(b, m, enums)
@@ -348,7 +348,11 @@ func (g *GeneratorContext) generateWriteLuxo(b *strings.Builder, m *ast.ModelDec
 			continue
 		}
 
-		fmt.Fprintf(b, "\tif codec.FieldMaskHas(mask, %d) {\n", fieldID)
+		if isRelationField(f, enums) {
+			fmt.Fprintf(b, "\tif len(selectionMask) > 0 && codec.FieldMaskHas(mask, %d) {\n", fieldID)
+		} else {
+			fmt.Fprintf(b, "\tif codec.FieldMaskHas(mask, %d) {\n", fieldID)
+		}
 
 		// @visible: conditional field visibility based on identity
 		hasVisible := writeVisibleDirective(b, f)
@@ -499,7 +503,8 @@ func writeScalarEncoding(b *strings.Builder, typeName string, nullable bool, fid
 	}
 }
 
-// generateWriteLuxoAllFields generates the nil-mask fast path — all fields, no checks.
+// generateWriteLuxoAllFields generates the nil-mask fast path for the default
+// model projection. Relations are loaded only through an explicit selection.
 func generateWriteLuxoAllFields(b *strings.Builder, m *ast.ModelDecl, recv string, enums map[string]bool) {
 	defaultGenerator().generateWriteLuxoAllFields(b, m, recv, enums)
 }
@@ -512,6 +517,9 @@ func (g *GeneratorContext) generateWriteLuxoAllFields(b *strings.Builder, m *ast
 		if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
 			continue
 		}
+		if isRelationField(f, enums) {
+			continue
+		}
 		fieldID := g.modelFieldID(m.Name, f.Name)
 		if fieldID == 0 {
 			continue
@@ -519,11 +527,7 @@ func (g *GeneratorContext) generateWriteLuxoAllFields(b *strings.Builder, m *ast
 		goField := recv + "." + str.Capitalize(f.Name)
 		fid := fmt.Sprintf("%d", fieldID)
 
-		if isRelationField(f, enums) {
-			writeNestedRowField(b, f, fid, goField, "", "\t\t")
-		} else {
-			writeModelFieldEncoding(b, f, fid, goField, enums, "\t\t")
-		}
+		writeModelFieldEncoding(b, f, fid, goField, enums, "\t\t")
 	}
 }
 
@@ -709,6 +713,7 @@ func writeReadLuxoNestedField(b *strings.Builder, f *ast.FieldDecl, fieldID int,
 		fmt.Fprintf(b, "\t\t\tif dec.ReadBool() { %s = &%s{}; %s.ReadLuxo(dec) }\n", goField, f.Type.Name, goField)
 	default:
 		fmt.Fprintf(b, "\t\tcase %d:\n", fieldID)
+		fmt.Fprintf(b, "\t\t\t%s = &%s{}\n", goField, f.Type.Name)
 		fmt.Fprintf(b, "\t\t\t%s.ReadLuxo(dec)\n", goField)
 	}
 }
@@ -793,9 +798,9 @@ func writeReadLuxoTypedField(b *strings.Builder, f *ast.FieldDecl, fieldID int, 
 		}
 	case "Decimal":
 		if f.Type.Nullable {
-			fmt.Fprintf(b, "\t\tcase %d:\n\t\t\tif v := dec.ReadStringPtr(); v != nil { d := decimal.RequireFromString(*v); %s = &d }\n", fieldID, goField)
+			fmt.Fprintf(b, "\t\tcase %d:\n\t\t\tif raw := dec.ReadStringPtr(); raw != nil { value, err := decimal.NewFromString(*raw); if err != nil { dec.Fail(err) } else { %s = &value } }\n", fieldID, goField)
 		} else {
-			fmt.Fprintf(b, "\t\tcase %d: %s = decimal.RequireFromString(dec.ReadString())\n", fieldID, goField)
+			fmt.Fprintf(b, "\t\tcase %d:\n\t\t\t{ raw := dec.ReadString(); if dec.Err() == nil { value, err := decimal.NewFromString(raw); if err != nil { dec.Fail(err) } else { %s = value } } }\n", fieldID, goField)
 		}
 	case "Bytes", "JSON":
 		if f.Type.Nullable {
@@ -838,7 +843,7 @@ func writeReadLuxoListField(b *strings.Builder, f *ast.FieldDecl, fieldID int, g
 	case "UUID":
 		fmt.Fprintf(b, "\t\tcase %d:\n\t\t\t{ _a := dec.ReadUUIDArray(); %s = make([]uuid.UUID, len(_a)); for i, v := range _a { %s[i] = uuid.UUID(v) } }\n", fieldID, goField, goField)
 	case "Decimal":
-		fmt.Fprintf(b, "\t\tcase %d:\n\t\t\t{ _a := dec.ReadStringArray(); %s = make([]decimal.Decimal, len(_a)); for i, v := range _a { %s[i] = decimal.RequireFromString(v) } }\n", fieldID, goField, goField)
+		fmt.Fprintf(b, "\t\tcase %d:\n\t\t\t{ _a := dec.ReadStringArray(); %s = make([]decimal.Decimal, len(_a)); for i, raw := range _a { value, err := decimal.NewFromString(raw); if err != nil { dec.Fail(err); break }; %s[i] = value } }\n", fieldID, goField, goField)
 	}
 }
 
@@ -920,7 +925,11 @@ func (g *GeneratorContext) generateModelWriteColumnar(b *strings.Builder, m *ast
 	fmt.Fprintf(b, "\tw.SetCount(len(items))\n")
 
 	for _, f := range fields {
-		fmt.Fprintf(b, "\tif len(mask) == 0 || codec.FieldMaskHas(mask, %d) {\n", f.fieldID)
+		if f.relation {
+			fmt.Fprintf(b, "\tif len(selectionMask) > 0 && codec.FieldMaskHas(mask, %d) {\n", f.fieldID)
+		} else {
+			fmt.Fprintf(b, "\tif len(mask) == 0 || codec.FieldMaskHas(mask, %d) {\n", f.fieldID)
+		}
 		visibleExpr := compileVisibleDirectiveExpr(f.decl)
 		if visibleExpr != "" {
 			fmt.Fprintf(b, "\t\tif %s {\n", visibleExpr)

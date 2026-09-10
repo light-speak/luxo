@@ -62,6 +62,14 @@ func (d *Decoder) Err() error {
 	return d.err
 }
 
+// Fail records a semantic decoding error and stops further reads.
+// The first error is preserved so callers see the original failure.
+func (d *Decoder) Fail(err error) {
+	if d.err == nil {
+		d.err = err
+	}
+}
+
 // Offset returns the current read position.
 func (d *Decoder) Offset() int {
 	return d.off
