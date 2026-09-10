@@ -102,6 +102,20 @@ func TestChanBusClose(t *testing.T) {
 	bus.Emit(context.Background(), "test", "after close")
 }
 
+func TestChanBusCloseKeepsEventChannelsOpen(t *testing.T) {
+	bus := NewChanBus(1)
+	if err := bus.On("test", func(context.Context, any) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	bus.Close()
+
+	select {
+	case bus.channels["test"] <- message{}:
+	default:
+		t.Fatal("event channel should remain open after shutdown")
+	}
+}
+
 func TestChanBusTypedPayload(t *testing.T) {
 	bus := NewChanBus(10)
 	defer bus.Close()

@@ -314,6 +314,17 @@ func TestMemoryPublishAfterClose(t *testing.T) {
 	}
 }
 
+func TestMemoryPublishObservesShutdownAfterQueueLookup(t *testing.T) {
+	q := NewMemoryQueue(testConfig())
+	q.queues["test"] = &memQueue{ch: make(chan []byte)}
+	close(q.done)
+
+	err := q.Publish(context.Background(), "test", []byte("late"))
+	if err == nil || err.Error() != "queue: closed" {
+		t.Fatalf("Publish error = %v, want queue closed", err)
+	}
+}
+
 func TestMemorySubscribeAfterClose(t *testing.T) {
 	q := NewMemoryQueue(testConfig())
 	q.Close()
