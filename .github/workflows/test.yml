@@ -173,6 +173,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Check out benchmark baseline
@@ -187,16 +188,12 @@ jobs:
           go-version-file: go.mod
 
       - name: Test performance gate
-        run: GOWORK=off go test ./scripts/benchgate -count=1
+        run: GOWORK=off go test ./scripts/benchgate ./scripts/benchscope -count=1
 
-      - name: Install pinned benchstat
+      - name: Select affected benchmark packages
+        id: benchmark_scope
         env:
-          GOBIN: ${{ github.workspace }}/.tmp/bin
-        run: |
-          mkdir -p "${GOBIN}"
-          go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70
-
-      - name: Compile benchmark binaries
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
           benchmark_packages() {
@@ -206,7 +203,7 @@ jobs:
               done |
               sort -u
           }
-          mkdir -p .tmp/bin/base .tmp/bin/head .tmp/head .tmp/test-tmp
+          mkdir -p .tmp/head
           git archive HEAD | tar -x -C .tmp/head
           (
             cd .tmp/base
@@ -216,7 +213,35 @@ jobs:
             cd .tmp/head
             benchmark_packages
           ) > .tmp/head-benchmark-packages.txt
-          comm -12 .tmp/base-benchmark-packages.txt .tmp/head-benchmark-packages.txt > .tmp/benchmark-packages.txt
+          comm -12 .tmp/base-benchmark-packages.txt .tmp/head-benchmark-packages.txt > .tmp/common-benchmark-packages.txt
+          git -c core.quotePath=false diff --no-renames --name-only "${BASE_SHA}" HEAD > .tmp/changed-files.txt
+          GOWORK=off go run ./scripts/benchscope \
+            .tmp/base \
+            .tmp/head \
+            .tmp/changed-files.txt \
+            .tmp/common-benchmark-packages.txt > .tmp/benchmark-packages.txt
+          if [[ -s .tmp/benchmark-packages.txt ]]; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+            echo "Affected benchmark packages:"
+            cat .tmp/benchmark-packages.txt
+          else
+            echo "run=false" >> "${GITHUB_OUTPUT}"
+            echo "No benchmarked package has production changes in its dependency graph."
+          fi
+
+      - name: Install pinned benchstat
+        if: steps.benchmark_scope.outputs.run == 'true'
+        env:
+          GOBIN: ${{ github.workspace }}/.tmp/bin
+        run: |
+          mkdir -p "${GOBIN}"
+          go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70
+
+      - name: Compile benchmark binaries
+        if: steps.benchmark_scope.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/bin/base .tmp/bin/head .tmp/test-tmp
           while IFS= read -r package; do
             binary="${package//\//-}.test"
             (
@@ -230,6 +255,7 @@ jobs:
           done < .tmp/benchmark-packages.txt
 
       - name: Run interleaved benchmark samples
+        if: steps.benchmark_scope.outputs.run == 'true'
         env:
           TMPDIR: ${{ github.workspace }}/.tmp/test-tmp
         run: |
@@ -279,6 +305,7 @@ jobs:
           done
 
       - name: Enforce performance baseline
+        if: steps.benchmark_scope.outputs.run == 'true'
         run: |
           .tmp/bin/benchstat -alpha 0.01 base=.tmp/benchmark-primary-base.txt head=.tmp/benchmark-primary-head.txt
           .tmp/bin/benchstat -alpha 0.01 base=.tmp/benchmark-confirmation-base.txt head=.tmp/benchmark-confirmation-head.txt
