@@ -35,6 +35,11 @@ jobs:
           --health-timeout=3s
           --health-retries=5
 
+      nats:
+        image: nats:2-alpine
+        ports:
+          - 4222:4222
+
     env:
       DATABASE_HOST: localhost
       DATABASE_PORT: 5432
@@ -55,7 +60,7 @@ jobs:
 
       - name: Run tests with coverage
         run: |
-          go test ./pkg/... -v -coverprofile=coverage.out -timeout 180s -count=1
+          go test ./pkg/... ./scripts/... -v -coverprofile=coverage.out -timeout 180s -count=1
           go test ./cmd/... -v -timeout 60s -count=1
 
       - name: Coverage summary
@@ -90,11 +95,11 @@ jobs:
           go-version-file: go.mod
 
       - name: Vet
-        run: go vet ./pkg/... ./cmd/...
+        run: go vet ./pkg/... ./cmd/... ./scripts/...
 
       - name: Gofmt check
         run: |
-          UNFORMATTED=$(gofmt -l pkg/ cmd/)
+          UNFORMATTED=$(gofmt -l pkg/ cmd/ scripts/)
           if [ -n "$UNFORMATTED" ]; then
             echo "::error::Files not formatted: $UNFORMATTED"
             exit 1
@@ -102,8 +107,8 @@ jobs:
 
       - name: Gocyclo check
         run: |
-          go install github.com/fzipp/gocyclo/cmd/gocyclo@latest
-          VIOLATIONS=$(gocyclo -over 25 pkg/)
+          go install github.com/fzipp/gocyclo/cmd/gocyclo@v0.6.0
+          VIOLATIONS=$(gocyclo -over 25 pkg/ cmd/ scripts/)
           if [ -n "$VIOLATIONS" ]; then
             echo "::error::Cyclomatic complexity > 25:"
             echo "$VIOLATIONS"
@@ -111,7 +116,7 @@ jobs:
           fi
 
       - name: Build
-        run: go build ./pkg/... ./cmd/...
+        run: go build ./pkg/... ./cmd/... ./scripts/...
 
   race:
     runs-on: ubuntu-latest
@@ -145,6 +150,11 @@ jobs:
           --health-interval=5s
           --health-timeout=3s
           --health-retries=5
+
+      nats:
+        image: nats:2-alpine
+        ports:
+          - 4222:4222
 
     env:
       DATABASE_HOST: localhost
@@ -257,20 +267,12 @@ jobs:
             )
           done < .tmp/benchmark-packages.txt
 
-      - name: Run interleaved benchmark samples
+      - name: Run adaptive interleaved benchmark samples
         if: steps.benchmark_scope.outputs.run == 'true'
         env:
           TMPDIR: ${{ github.workspace }}/.tmp/test-tmp
         run: |
           set -euo pipefail
-          primary_base_output="${GITHUB_WORKSPACE}/.tmp/benchmark-primary-base.txt"
-          primary_head_output="${GITHUB_WORKSPACE}/.tmp/benchmark-primary-head.txt"
-          confirmation_base_output="${GITHUB_WORKSPACE}/.tmp/benchmark-confirmation-base.txt"
-          confirmation_head_output="${GITHUB_WORKSPACE}/.tmp/benchmark-confirmation-head.txt"
-          : > "${primary_base_output}"
-          : > "${primary_head_output}"
-          : > "${confirmation_base_output}"
-          : > "${confirmation_head_output}"
           run_package() {
             local source_root="$1"
             local binary_root="$2"
@@ -288,33 +290,45 @@ jobs:
                 -test.cpu=2
             ) >> "${output}"
           }
-          for sample in {1..20}; do
-            if (( (sample - 1) % 4 < 2 )); then
-              base_output="${primary_base_output}"
-              head_output="${primary_head_output}"
-            else
-              base_output="${confirmation_base_output}"
-              head_output="${confirmation_head_output}"
-            fi
-            while IFS= read -r package; do
-              if (( sample % 2 == 1 )); then
-                run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}"
-                run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}"
-              else
-                run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}"
-                run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}"
-              fi
-            done < "${GITHUB_WORKSPACE}/.tmp/benchmark-packages.txt"
-          done
+          run_group() {
+            local group="$1"
+            local base_output="${GITHUB_WORKSPACE}/.tmp/benchmark-${group}-base.txt"
+            local head_output="${GITHUB_WORKSPACE}/.tmp/benchmark-${group}-head.txt"
+            : > "${base_output}"
+            : > "${head_output}"
+            for sample in {1..10}; do
+              while IFS= read -r package; do
+                if (( sample % 2 == 1 )); then
+                  run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}"
+                  run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}"
+                else
+                  run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}"
+                  run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}"
+                fi
+              done < "${GITHUB_WORKSPACE}/.tmp/benchmark-packages.txt"
+            done
+          }
+          run_group primary
+          .tmp/bin/benchstat -alpha 0.01 base=.tmp/benchmark-primary-base.txt head=.tmp/benchmark-primary-head.txt
+          .tmp/bin/benchstat -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv base=.tmp/benchmark-primary-base.txt head=.tmp/benchmark-primary-head.txt > .tmp/benchstat-primary.csv 2> .tmp/benchstat-primary-warnings.txt
+          confirmation_required=$(GOWORK=off go run ./scripts/benchgate --requires-confirmation .tmp/benchstat-primary.csv)
+          if [[ "${confirmation_required}" == "true" ]]; then
+            echo "Primary samples found a regression candidate; running confirmation samples."
+            run_group confirmation
+            .tmp/bin/benchstat -alpha 0.01 base=.tmp/benchmark-confirmation-base.txt head=.tmp/benchmark-confirmation-head.txt
+            .tmp/bin/benchstat -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv base=.tmp/benchmark-confirmation-base.txt head=.tmp/benchmark-confirmation-head.txt > .tmp/benchstat-confirmation.csv 2> .tmp/benchstat-confirmation-warnings.txt
+          else
+            echo "Primary samples are clean; confirmation samples are unnecessary."
+          fi
 
       - name: Enforce performance baseline
         if: steps.benchmark_scope.outputs.run == 'true'
         run: |
-          .tmp/bin/benchstat -alpha 0.01 base=.tmp/benchmark-primary-base.txt head=.tmp/benchmark-primary-head.txt
-          .tmp/bin/benchstat -alpha 0.01 base=.tmp/benchmark-confirmation-base.txt head=.tmp/benchmark-confirmation-head.txt
-          .tmp/bin/benchstat -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv base=.tmp/benchmark-primary-base.txt head=.tmp/benchmark-primary-head.txt > .tmp/benchstat-primary.csv 2> .tmp/benchstat-primary-warnings.txt
-          .tmp/bin/benchstat -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv base=.tmp/benchmark-confirmation-base.txt head=.tmp/benchmark-confirmation-head.txt > .tmp/benchstat-confirmation.csv 2> .tmp/benchstat-confirmation-warnings.txt
-          GOWORK=off go run ./scripts/benchgate .tmp/benchstat-primary.csv .tmp/benchstat-confirmation.csv
+          if [[ -s .tmp/benchstat-confirmation.csv ]]; then
+            GOWORK=off go run ./scripts/benchgate .tmp/benchstat-primary.csv .tmp/benchstat-confirmation.csv
+          else
+            GOWORK=off go run ./scripts/benchgate .tmp/benchstat-primary.csv
+          fi
 
   external-go-consumer:
     runs-on: ubuntu-latest

@@ -171,9 +171,62 @@ func TestRunReportsSuccessAndRegression(t *testing.T) {
 	}
 }
 
+func TestRunAcceptsCleanPrimaryWithoutConfirmation(t *testing.T) {
+	path := writeRunInput(t, benchstatCSV("~", "~", "n=10"))
+	var output strings.Builder
+	if err := run([]string{path}, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "without confirmation") {
+		t.Fatalf("output = %q", output.String())
+	}
+}
+
+func TestRunRequiresConfirmationForPrimaryRegression(t *testing.T) {
+	path := writeRunInput(t, benchstatCSV("+5.01%", "~", "n=10"))
+	var output strings.Builder
+	err := run([]string{path}, &output)
+	if err == nil || !strings.Contains(err.Error(), "requires confirmation") {
+		t.Fatalf("error = %v", err)
+	}
+	if !strings.Contains(output.String(), "candidate performance regression") {
+		t.Fatalf("output = %q", output.String())
+	}
+}
+
+func TestRunReportsWhetherConfirmationIsRequired(t *testing.T) {
+	cleanPath := writeRunInput(t, benchstatCSV("~", "~", "n=10"))
+	regressionPath := writeRunInput(t, benchstatCSV("~", "+0.01%", "n=10"))
+
+	var output strings.Builder
+	if err := run([]string{"--requires-confirmation", cleanPath}, &output); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "false\n" {
+		t.Fatalf("clean output = %q", output.String())
+	}
+
+	output.Reset()
+	if err := run([]string{"--requires-confirmation", regressionPath}, &output); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "true\n" {
+		t.Fatalf("regression output = %q", output.String())
+	}
+}
+
 func TestRunRejectsInvalidArgumentsAndPaths(t *testing.T) {
 	if err := run(nil, io.Discard); err == nil || !strings.Contains(err.Error(), "usage") {
 		t.Fatalf("usage error = %v", err)
+	}
+	if err := run([]string{confirmationFlag}, io.Discard); err == nil || !strings.Contains(err.Error(), "usage") {
+		t.Fatalf("confirmation usage error = %v", err)
+	}
+	if err := run([]string{"missing"}, io.Discard); err == nil {
+		t.Fatal("missing primary error = nil")
+	}
+	if err := run([]string{confirmationFlag, "missing"}, io.Discard); err == nil {
+		t.Fatal("missing confirmation probe error = nil")
 	}
 	if err := run([]string{"missing", "also-missing"}, io.Discard); err == nil {
 		t.Fatal("missing input error = nil")
@@ -189,6 +242,9 @@ func TestRunRejectsInvalidArgumentsAndPaths(t *testing.T) {
 	differentPath := writeRunInput(t, strings.Replace(benchstatCSV("~", "~", "n=10"), "EncodeEvent-2", "DecodeEvent-2", 1))
 	if err := run([]string{validPath, differentPath}, io.Discard); err == nil || !strings.Contains(err.Error(), "comparison sets differ") {
 		t.Fatalf("comparison mismatch error = %v", err)
+	}
+	if err := run([]string{confirmationFlag, validPath}, errorWriter{}); err == nil || !strings.Contains(err.Error(), "write failure") {
+		t.Fatalf("confirmation output error = %v", err)
 	}
 }
 
@@ -219,6 +275,12 @@ type errorReader struct{}
 
 func (errorReader) Read([]byte) (int, error) {
 	return 0, errors.New("read failure")
+}
+
+type errorWriter struct{}
+
+func (errorWriter) Write([]byte) (int, error) {
+	return 0, errors.New("write failure")
 }
 
 func benchstatCSV(timeDelta, allocationDelta, samples string) string {
