@@ -661,6 +661,7 @@ func TestServeWithMetricsAndRegistrar(t *testing.T) {
 
 	t.Setenv("LUXO_STUDIO_URL", srv.URL)
 	t.Setenv("LUXO_API_KEY", "test-key")
+	t.Setenv("LUXO_PROJECT_ID", testStudioProjectID)
 	t.Setenv("APP_PORT", "0")
 
 	gw := New()

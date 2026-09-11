@@ -34,6 +34,26 @@ func TestGenerateNativeFileNoNative(t *testing.T) {
 	}
 }
 
+func TestNativeSignatureImports(t *testing.T) {
+	for _, test := range []struct{ name, path string }{
+		{"UUID", "github.com/google/uuid"}, {"Decimal", "github.com/shopspring/decimal"},
+		{"JSON", "encoding/json"}, {"Duration", "time"}, {"DateTime", "time"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ref := &luxoast.TypeRef{Name: test.name, Nullable: true, IsList: true}
+			for _, api := range []*luxoast.ApiDecl{
+				mkNativeAPI("input", []*luxoast.ParamDecl{{Name: "value", Type: ref}}, nil),
+				mkNativeAPI("output", nil, &luxoast.TypeRef{Name: "Result", TypeArgs: []*luxoast.TypeRef{ref}}),
+			} {
+				code := string(GenerateNativeFile(&semantic.Result{Files: []*luxoast.File{{APIs: []*luxoast.ApiDecl{api}}}}, "luxo"))
+				if strings.Count(code, `"`+test.path+`"`) != 1 {
+					t.Fatalf("missing or duplicate import %s:\n%s", test.path, code)
+				}
+			}
+		})
+	}
+}
+
 func TestGenerateNativeFile(t *testing.T) {
 	result := &semantic.Result{
 		Files: []*luxoast.File{{

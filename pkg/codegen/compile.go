@@ -29,6 +29,20 @@ func compileDefaultValue(expr ast.Expr, goType string, enums map[string]bool) st
 			return "false"
 		case token.Null:
 			return "nil"
+		case token.Duration:
+			if value, ok := compileDurationLiteral(e.Value); ok {
+				return value
+			}
+		}
+	case *ast.UnaryExpr:
+		if e.Op == "+" || e.Op == "-" {
+			if literal, ok := e.Value.(*ast.Literal); ok {
+				value := compileDefaultValue(literal, goType, enums)
+				if literal.Kind == token.Duration {
+					return e.Op + "(" + value + ")"
+				}
+				return e.Op + value
+			}
 		}
 	case *ast.Ident:
 		if e.Name == "true" {
@@ -60,11 +74,35 @@ func compileDefaultValue(expr ast.Expr, goType string, enums map[string]bool) st
 	}
 }
 
-func compileAPIBody(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast.ModelDecl, enums map[string]bool) {
-	defaultGenerator().compileAPIBody(b, api, models, enums, nil)
+func compileDurationLiteral(value string) (string, bool) {
+	units := []struct {
+		suffix string
+		goUnit string
+	}{
+		{suffix: "ms", goUnit: "time.Millisecond"},
+		{suffix: "d", goUnit: "24 * time.Hour"},
+		{suffix: "h", goUnit: "time.Hour"},
+		{suffix: "m", goUnit: "time.Minute"},
+		{suffix: "s", goUnit: "time.Second"},
+	}
+	for _, unit := range units {
+		if !strings.HasSuffix(value, unit.suffix) {
+			continue
+		}
+		amount := strings.TrimSuffix(value, unit.suffix)
+		if amount == "1" {
+			return unit.goUnit, true
+		}
+		return amount + " * " + unit.goUnit, true
+	}
+	return "", false
 }
 
-func (g *GeneratorContext) compileAPIBody(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast.ModelDecl, enums map[string]bool, nativeFunctions map[string]bool) {
+func compileAPIBody(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast.ModelDecl, enums map[string]bool) {
+	defaultGenerator().compileAPIBody(b, api, models, enums, nil, nil, nil)
+}
+
+func (g *GeneratorContext) compileAPIBody(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast.ModelDecl, enums map[string]bool, nativeFunctions map[string]bool, functions map[string]*ast.FnDecl, selectionFunctions map[string]bool) {
 	name := api.Name
 	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(name))
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
@@ -76,52 +114,25 @@ func (g *GeneratorContext) compileAPIBody(b *strings.Builder, api *ast.ApiDecl, 
 
 	// Parse params (with default value support)
 	for _, p := range api.Params {
-		if isStructuredParam(p, enums) {
-			writeStructuredParamExtraction(b, p, enums, "\t\t")
-			continue
-		}
-		goType := resolveGoType(p.Type)
-		method := paramMethod(goType)
-		if p.Type != nil && p.Type.Nullable {
-			method = ""
-		}
-
-		if p.Default != nil {
-			// Parameter with default value — optional
-			defaultVal := compileDefaultValue(p.Default, goType, enums)
-			if method == "" {
-				// Custom type with default
-				fmt.Fprintf(b, "\t\tvar %s %s = %s\n", p.Name, goType, defaultVal)
-				fmt.Fprintf(b, "\t\t_ = req.%s(%q, &%s)\n", paramJSONMethod(p), p.Name, p.Name)
-			} else {
-				fmt.Fprintf(b, "\t\t%s, _err_%s := req.Param%s(%q)\n", p.Name, p.Name, method, p.Name)
-				fmt.Fprintf(b, "\t\tif _err_%s != nil { %s = %s }\n", p.Name, p.Name, defaultVal)
-			}
-		} else if method == "" {
-			// Custom type — use ParamJSON with struct target
-			fmt.Fprintf(b, "\t\tvar %s %s\n", p.Name, goType)
-			methodName := paramJSONMethod(p)
-			fmt.Fprintf(b, "\t\tif err := req.%s(%q, &%s); err != nil {\n", methodName, p.Name, p.Name)
-			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
-		} else {
-			fmt.Fprintf(b, "\t\t%s, err := req.Param%s(%q)\n", p.Name, method, p.Name)
-			fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		}
+		writeCallableParamExtraction(b, p, enums, "\t\t")
 	}
 
 	// Compile body statements
 	c := &compiler{
-		generator:        g,
-		b:                b,
-		indent:           "\t\t",
-		models:           models,
-		enums:            enums,
-		api:              api,
-		vars:             make(map[string]valType),
-		paginationTotals: make(map[string]string),
-		nativeFunctions:  nativeFunctions,
-		paginate:         hasDirective(api.Directives, "paginate"),
-		loadSelections:   analyzeLoadSelections(api.Body, models),
+		generator:          g,
+		b:                  b,
+		indent:             "\t\t",
+		models:             models,
+		enums:              enums,
+		api:                api,
+		vars:               make(map[string]valType),
+		paginationTotals:   make(map[string]string),
+		nativeFunctions:    nativeFunctions,
+		functions:          functions,
+		selectionFunctions: selectionFunctions,
+		clientSelection:    "req.Select",
+		paginate:           hasDirective(api.Directives, "paginate"),
+		loadSelections:     analyzeLoadSelections(api.Body, models),
 	}
 	// Register API params in vars with Luxo type name for type-aware compilation
 	for _, p := range api.Params {
@@ -152,6 +163,44 @@ func isStructuredParam(param *ast.ParamDecl, enums map[string]bool) bool {
 	}
 }
 
+func writeCallableParamExtraction(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, indent string) {
+	if isStructuredParam(param, enums) {
+		writeStructuredParamExtraction(b, param, enums, indent)
+		return
+	}
+	goType := resolveGoType(param.Type)
+	method := paramMethod(goType)
+	if param.Type != nil && param.Type.Nullable {
+		method = ""
+	}
+	if param.Default != nil {
+		writeOptionalParamExtraction(b, param, enums, method, indent)
+		return
+	}
+	if method == "" {
+		fmt.Fprintf(b, "%svar %s %s\n", indent, param.Name, goType)
+		fmt.Fprintf(b, "%sif err := req.%s(%q, &%s); err != nil {\n", indent, paramJSONMethod(param), param.Name, param.Name)
+		fmt.Fprintf(b, "%s\treturn err\n%s}\n", indent, indent)
+		return
+	}
+	fmt.Fprintf(b, "%s%s, err := req.Param%s(%q)\n", indent, param.Name, method, param.Name)
+	fmt.Fprintf(b, "%sif err != nil {\n%s\treturn err\n%s}\n", indent, indent, indent)
+}
+
+func writeOptionalParamExtraction(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, method, indent string) {
+	writeDefaultParamDeclaration(b, param, enums, indent)
+	if method == "" {
+		fmt.Fprintf(b, "%sif err := req.%s(%q, &%s); err != nil {\n", indent, paramJSONMethod(param), param.Name, param.Name)
+		fmt.Fprintf(b, "%s\treturn err\n%s}\n", indent, indent)
+		return
+	}
+	fmt.Fprintf(b, "%sif req.HasParam(%q) {\n", indent, param.Name)
+	fmt.Fprintf(b, "%s\t_value%s, err := req.Param%s(%q)\n", indent, str.Capitalize(param.Name), method, param.Name)
+	fmt.Fprintf(b, "%s\tif err != nil { return err }\n", indent)
+	fmt.Fprintf(b, "%s\t%s = _value%s\n", indent, param.Name, str.Capitalize(param.Name))
+	fmt.Fprintf(b, "%s}\n", indent)
+}
+
 func writeStructuredParamExtraction(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, indent string) {
 	writeStructuredParamDeclaration(b, param, enums, indent)
 	fmt.Fprintf(b, "%sif req.BinaryMode {\n", indent)
@@ -171,8 +220,30 @@ func writeStructuredParamDeclaration(b *strings.Builder, param *ast.ParamDecl, e
 		fmt.Fprintf(b, "%svar %s %s\n", indent, param.Name, goType)
 		return
 	}
-	defaultValue := compileDefaultValue(param.Default, goType, enums)
+	writeDefaultParamDeclaration(b, param, enums, indent)
+}
+
+func writeDefaultParamDeclaration(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, indent string) {
+	goType := resolveGoType(param.Type)
+	valueType := param.Type
+	if valueType != nil && valueType.Nullable {
+		copy := *valueType
+		copy.Nullable = false
+		valueType = &copy
+	}
+	defaultValue := compileDefaultValue(param.Default, resolveGoType(valueType), enums)
+	if valueType != param.Type && !isNullLiteral(param.Default) {
+		defaultName := "_default" + str.Capitalize(param.Name)
+		fmt.Fprintf(b, "%s%s := %s\n", indent, defaultName, defaultValue)
+		fmt.Fprintf(b, "%svar %s %s = &%s\n", indent, param.Name, goType, defaultName)
+		return
+	}
 	fmt.Fprintf(b, "%svar %s %s = %s\n", indent, param.Name, goType, defaultValue)
+}
+
+func isNullLiteral(expr ast.Expr) bool {
+	literal, ok := expr.(*ast.Literal)
+	return ok && literal.Kind == token.Null
 }
 
 func writeStructuredScalarParamDecode(b *strings.Builder, param *ast.ParamDecl, indent string) {
@@ -221,6 +292,21 @@ func (c *compiler) compileHandlerBody(statements []ast.Stmt) {
 	}
 }
 
+func (c *compiler) compileCallableBody(statements []ast.Stmt) {
+	for index, statement := range statements {
+		if index == len(statements)-1 && c.functionResult != nil {
+			if expression, ok := statement.(*ast.ExprStmt); ok {
+				c.compileReturn(&ast.ReturnStmt{Pos: expression.Pos, Value: expression.Expr})
+				return
+			}
+		}
+		c.compileStmt(statement)
+	}
+	if len(statements) == 0 || !isHandlerTerminating(statements[len(statements)-1]) {
+		c.write("return nil")
+	}
+}
+
 func isHandlerTerminating(statement ast.Stmt) bool {
 	switch statement.(type) {
 	case *ast.ReturnStmt, *ast.ThrowStmt:
@@ -237,10 +323,10 @@ func compileFnBody(b *strings.Builder, fn *ast.FnDecl, models map[string]*ast.Mo
 }
 
 func (g *GeneratorContext) compileFnBody(b *strings.Builder, fn *ast.FnDecl, models map[string]*ast.ModelDecl, enums map[string]bool) {
-	g.compileFnBodyWithNativeFunctions(b, fn, models, enums, nil)
+	g.compileFnBodyWithFunctions(b, fn, models, enums, nil, nil, nil)
 }
 
-func (g *GeneratorContext) compileFnBodyWithNativeFunctions(b *strings.Builder, fn *ast.FnDecl, models map[string]*ast.ModelDecl, enums map[string]bool, nativeFunctions map[string]bool) {
+func (g *GeneratorContext) compileFnBodyWithFunctions(b *strings.Builder, fn *ast.FnDecl, models map[string]*ast.ModelDecl, enums map[string]bool, nativeFunctions map[string]bool, functions map[string]*ast.FnDecl, selectionFunctions map[string]bool) {
 	// Convert FnDecl to ApiDecl for code reuse — they share the same structure
 	api := &ast.ApiDecl{
 		Pos:        fn.Pos,
@@ -250,7 +336,77 @@ func (g *GeneratorContext) compileFnBodyWithNativeFunctions(b *strings.Builder, 
 		Directives: fn.Directives,
 		Body:       fn.Body,
 	}
-	g.compileAPIBody(b, api, models, enums, nativeFunctions)
+	g.compileAPIBody(b, api, models, enums, nativeFunctions, functions, selectionFunctions)
+}
+
+func (g *GeneratorContext) compileLocalFunction(b *strings.Builder, fn *ast.FnDecl, models map[string]*ast.ModelDecl, enums map[string]bool, nativeFunctions map[string]bool, functions map[string]*ast.FnDecl, selectionFunctions map[string]bool) {
+	writeCompiledFunctionSignature(b, fn, models, selectionFunctions[fn.Name])
+	api := &ast.ApiDecl{Pos: fn.Pos, Name: fn.Name, Params: fn.Params, ReturnType: fn.ReturnType, Body: fn.Body}
+	c := &compiler{
+		generator:          g,
+		b:                  b,
+		indent:             "\t",
+		models:             models,
+		enums:              enums,
+		api:                api,
+		vars:               make(map[string]valType),
+		paginationTotals:   make(map[string]string),
+		nativeFunctions:    nativeFunctions,
+		functions:          functions,
+		selectionFunctions: selectionFunctions,
+		functionResult:     fn.ReturnType,
+		inFunction:         true,
+		loadSelections:     analyzeLoadSelections(fn.Body, models),
+	}
+	if selectionFunctions[fn.Name] {
+		c.clientSelection = "_select"
+	}
+	registerCompiledFunctionParams(c, fn.Params)
+	c.compileCallableBody(fn.Body.Stmts)
+	b.WriteString("}\n\n")
+}
+
+func writeCompiledFunctionSignature(b *strings.Builder, fn *ast.FnDecl, models map[string]*ast.ModelDecl, usesSelection bool) {
+	fmt.Fprintf(b, "func (app *App) %s(ctx context.Context", fn.Name)
+	if usesSelection {
+		b.WriteString(", _select []*selection.Field")
+	}
+	for _, param := range fn.Params {
+		goType := compiledFunctionGoType(param.Type, models)
+		if param.Spread {
+			fmt.Fprintf(b, ", %s ...%s", param.Name, goType)
+			continue
+		}
+		fmt.Fprintf(b, ", %s %s", param.Name, goType)
+	}
+	if fn.ReturnType == nil {
+		b.WriteString(") error {\n")
+		return
+	}
+	fmt.Fprintf(b, ") (_value %s, err error) {\n", compiledFunctionGoType(fn.ReturnType, models))
+}
+
+func compiledFunctionGoType(ref *ast.TypeRef, models map[string]*ast.ModelDecl) string {
+	if ref == nil || models[ref.Name] == nil {
+		return resolveGoType(ref)
+	}
+	if ref.IsList {
+		return "[]*" + ref.Name
+	}
+	return "*" + ref.Name
+}
+
+func registerCompiledFunctionParams(c *compiler, params []*ast.ParamDecl) {
+	for _, param := range params {
+		valueType := valType{name: "string"}
+		if param.Type != nil {
+			valueType.name = param.Type.Name
+			valueType.isList = param.Type.IsList
+			valueType.nullable = param.Type.Nullable
+			_, valueType.isModel = c.models[param.Type.Name]
+		}
+		c.vars[param.Name] = valueType
+	}
 }
 
 // valType tracks the resolved type of a val variable.
@@ -312,28 +468,35 @@ func isNilableGoType(goType string) bool {
 
 // compiler holds state during body compilation.
 type compiler struct {
-	generator        *GeneratorContext
-	b                *strings.Builder
-	indent           string
-	models           map[string]*ast.ModelDecl
-	types            map[string]bool // type declaration names (AuthPayload, etc.)
-	enums            map[string]bool // enum type names
-	api              *ast.ApiDecl
-	vars             map[string]valType // variable name → resolved type
-	inAsync          bool               // true inside async { } — no return err
-	inForExpr        bool               // true inside for-as-expression with yield — yield compiles to return
-	yieldAddr        bool               // true when a yielded value must be wrapped in a pointer
-	yieldTmp         int                // unique temporary counter for nullable primitive yields
-	paginate         bool               // true when API has @paginate
-	paginationTotals map[string]string  // result variable → exact query total variable
-	paginationTmp    int                // unique pagination temporary counter
-	ptrTmpCount      int                // counter for hoisted pointer temp vars (nullable create args)
-	resultTmp        int                // counter for Result<T> values lowered from Go's (T, error)
-	aggregateTmp     int                // counter for fused await aggregate result slices
-	nativeFunctions  map[string]bool    // @native fn names available through app.Resolver
-	loadSelections   map[string]string  // load variable → exact compiled selection literal
-	loadSelection    string             // selection for the load expression currently being compiled
-	hasLoadSelection bool               // distinguishes an exact empty projection from select-all nil
+	generator          *GeneratorContext
+	b                  *strings.Builder
+	indent             string
+	models             map[string]*ast.ModelDecl
+	types              map[string]bool // type declaration names (AuthPayload, etc.)
+	enums              map[string]bool // enum type names
+	api                *ast.ApiDecl
+	vars               map[string]valType     // variable name → resolved type
+	inAsync            bool                   // true inside async { } — no return err
+	inForExpr          bool                   // true inside for-as-expression with yield — yield compiles to return
+	yieldAddr          bool                   // true when a yielded value must be wrapped in a pointer
+	yieldTmp           int                    // unique temporary counter for nullable primitive yields
+	paginate           bool                   // true when API has @paginate
+	paginationTotals   map[string]string      // result variable → exact query total variable
+	paginationTmp      int                    // unique pagination temporary counter
+	ptrTmpCount        int                    // counter for hoisted pointer temp vars (nullable create args)
+	resultTmp          int                    // counter for Result<T> values lowered from Go's (T, error)
+	aggregateTmp       int                    // counter for fused await aggregate result slices
+	nativeFunctions    map[string]bool        // @native fn names available through app.Resolver
+	functions          map[string]*ast.FnDecl // function declarations available for static call lowering
+	selectionFunctions map[string]bool        // local functions that consume client field selection
+	clientSelection    string                 // generated expression for the current request selection
+	functionResult     *ast.TypeRef           // non-nil while compiling a local fn body
+	inFunction         bool                   // true while compiling a local fn rather than a transport handler
+	valueClosure       bool                   // Go value boundary; never writes a transport response
+	closureError       string                 // local failure slot for an immediately invoked value closure
+	loadSelections     map[string]string      // load variable → exact compiled selection literal
+	loadSelection      string                 // selection for the load expression currently being compiled
+	hasLoadSelection   bool                   // distinguishes an exact empty projection from select-all nil
 }
 
 func (c *compiler) write(format string, args ...any) {
@@ -399,7 +562,7 @@ func (c *compiler) compileVal(s *ast.ValStmt) {
 		} else {
 			c.write("%s, err := %s", s.Name, expr)
 		}
-		c.write("if err != nil {\n%s\treturn err\n%s}", c.indent, c.indent)
+		c.writeErrorGuard()
 		c.vars[s.Name] = qt
 	} else {
 		if list, ok := s.Value.(*ast.ListExpr); ok && c.api != nil && c.api.ReturnType != nil && c.api.ReturnType.IsList {
@@ -464,6 +627,30 @@ func unwrapQuestion(expr ast.Expr) (ast.Expr, bool) {
 
 // compileReturn: return expr
 func (c *compiler) compileReturn(s *ast.ReturnStmt) {
+	if c.valueClosure {
+		if s.Value == nil {
+			c.write("return nil")
+		} else {
+			expression := c.compileExpr(s.Value)
+			if c.isModelQuery(s.Value) {
+				c.resultTmp++
+				name := fmt.Sprintf("_result%d", c.resultTmp)
+				c.write("%s, err := %s", name, expression)
+				c.writeErrorGuard()
+				expression = name
+			}
+			c.write("return %s", expression)
+		}
+		return
+	}
+	if c.inAsync {
+		c.write("return")
+		return
+	}
+	if c.inFunction {
+		c.compileFunctionReturn(s)
+		return
+	}
 	if s.Value == nil {
 		c.write("return nil")
 		return
@@ -506,6 +693,27 @@ func (c *compiler) compileReturn(s *ast.ReturnStmt) {
 	// 3. Fallback: use API return type declaration
 	c.writeScalarReturn(expr)
 	c.write("return nil")
+}
+
+func (c *compiler) compileFunctionReturn(statement *ast.ReturnStmt) {
+	if statement.Value == nil {
+		c.write("return nil")
+		return
+	}
+	expression := c.compileExpr(statement.Value)
+	if list, ok := statement.Value.(*ast.ListExpr); ok && c.functionResult != nil && c.functionResult.IsList {
+		expression = c.compileTypedList(list, c.functionResult)
+	}
+	if c.isModelQuery(statement.Value) {
+		c.write("return %s", expression)
+		return
+	}
+	if c.functionResult != nil && c.models[c.functionResult.Name] != nil && !c.functionResult.IsList {
+		if _, ok := statement.Value.(*ast.ObjectExpr); ok {
+			expression = "&" + expression
+		}
+	}
+	c.write("return %s, nil", expression)
 }
 
 // writeReturnByType emits binary output code based on tracked variable type.
@@ -696,7 +904,7 @@ func (c *compiler) isTypeDecl(name string) bool {
 // compileThrow: throw ErrorName(args)
 func (c *compiler) compileThrow(s *ast.ThrowStmt) {
 	expr := c.compileThrowExpr(s.Error)
-	c.write("return %s", expr)
+	c.writeErrorReturn("", expr)
 }
 
 // compileExprStmt: standalone expression (including elvis guard and ? propagation)
@@ -719,7 +927,7 @@ func (c *compiler) compileExprStmt(s *ast.ExprStmt) {
 	if c.isModelQuery(s.Expr) {
 		expr := c.compileExpr(s.Expr)
 		c.write("if _, err := %s; err != nil {", expr)
-		c.write("\treturn err")
+		c.writeErrorReturn("\t", "err")
 		c.write("}")
 		return
 	}
@@ -729,13 +937,42 @@ func (c *compiler) compileExprStmt(s *ast.ExprStmt) {
 		if ident, ok := call.Func.(*ast.Ident); ok && ident.Name == "transaction" {
 			expr := c.compileExpr(s.Expr)
 			c.write("if err := %s; err != nil {", expr)
-			c.write("\treturn err")
+			c.writeErrorReturn("\t", "err")
 			c.write("}")
 			return
 		}
 	}
+	if c.compileDiscardedFunctionCall(s.Expr) {
+		return
+	}
 	expr := c.compileExpr(s.Expr)
 	c.write("%s", expr)
+}
+
+func (c *compiler) compileDiscardedFunctionCall(expression ast.Expr) bool {
+	call, ok := expression.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	ident, ok := call.Func.(*ast.Ident)
+	if !ok {
+		return false
+	}
+	fn := c.functions[ident.Name]
+	if isCompiledLocalFunction(fn) {
+		if result := c.compileExpr(call); result != "" {
+			c.write("_ = %s", result)
+		}
+		return true
+	}
+	if fn == nil || fn.ReturnType != nil || !hasDirective(fn.Directives, "native") {
+		return false
+	}
+	result := c.compileExpr(call)
+	c.write("if err := %s; err != nil {", result)
+	c.writeErrorReturn("\t", "err")
+	c.write("}")
+	return true
 }
 
 // compileIf: if condition { stmts }
@@ -760,7 +997,7 @@ func (c *compiler) compileElvisGuard(e *ast.ElvisExpr) {
 	if unary, ok := e.Left.(*ast.UnaryExpr); ok && unary.Op == "!" {
 		inner := c.compileExpr(unary.Value)
 		c.write("if %s {", inner)
-		c.write("\treturn %s", right)
+		c.writeErrorReturn("\t", right)
 		c.write("}")
 		return
 	}
@@ -770,10 +1007,10 @@ func (c *compiler) compileElvisGuard(e *ast.ElvisExpr) {
 		left := c.compileExpr(e.Left)
 		c.write("_ok, _err := %s", left)
 		c.write("if _err != nil {")
-		c.write("\treturn _err")
+		c.writeErrorReturn("\t", "_err")
 		c.write("}")
 		c.write("if !_ok {")
-		c.write("\treturn %s", right)
+		c.writeErrorReturn("\t", right)
 		c.write("}")
 		return
 	}
@@ -786,7 +1023,7 @@ func (c *compiler) compileElvisGuard(e *ast.ElvisExpr) {
 	} else {
 		c.write("if %s == nil {", left)
 	}
-	c.write("\treturn %s", right)
+	c.writeErrorReturn("\t", right)
 	c.write("}")
 }
 
@@ -800,17 +1037,17 @@ func (c *compiler) compileBangElvisGuard(e *ast.BangElvisExpr) {
 		left := c.compileExpr(e.Left)
 		c.write("_ok, _err := %s", left)
 		c.write("if _err != nil {")
-		c.write("\treturn _err")
+		c.writeErrorReturn("\t", "_err")
 		c.write("}")
 		c.write("if _ok {")
-		c.write("\treturn %s", right)
+		c.writeErrorReturn("\t", right)
 		c.write("}")
 		return
 	}
 
 	left := c.compileExpr(e.Left)
 	c.write("if %s {", left)
-	c.write("\treturn %s", right)
+	c.writeErrorReturn("\t", right)
 	c.write("}")
 }
 
@@ -872,7 +1109,7 @@ func (c *compiler) compileEmit(s *ast.EmitStmt) {
 	} else {
 		c.write("if err := %sEmit%s(ctx, app.EventBus, %s%sEvent{%s}); err != nil {",
 			prefix, s.EventName, prefix, s.EventName, strings.Join(args, ", "))
-		c.write("\treturn err")
+		c.writeErrorReturn("\t", "err")
 		c.write("}")
 	}
 }
@@ -961,6 +1198,11 @@ func (c *compiler) compileLiteral(e *ast.Literal) string {
 		return "false"
 	case token.Null:
 		return "nil"
+	case token.Duration:
+		if value, ok := compileDurationLiteral(e.Value); ok {
+			return value
+		}
+		return e.Value
 	default:
 		return e.Value
 	}
@@ -1050,7 +1292,7 @@ func (c *compiler) compileInstanceMethod(e *ast.CallExpr) string {
 				if model, ok := c.models[modelName]; ok && isHashField(model, arg.Name) {
 					hashedVar := "hashed" + str.Capitalize(arg.Name)
 					c.write("%s, err := luxocrypto.HashPassword(%s)", hashedVar, val)
-					c.write("if err != nil {\n%s\treturn err\n%s}", c.indent, c.indent)
+					c.writeErrorGuard()
 					val = hashedVar
 				}
 				sets = append(sets, fmt.Sprintf("lux.SetField{Col: %q, Val: %s}", str.ToSnakeCase(arg.Name), val))
@@ -1118,7 +1360,7 @@ func (c *compiler) compileTransactionCall(e *ast.CallExpr) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	sub := c.subCompiler()
+	sub := c.errorCompiler()
 	sub.indent = c.indent + "\t"
 	for _, stmt := range lambda.Body.Stmts {
 		sub.compileStmt(stmt)
@@ -1159,9 +1401,15 @@ func (c *compiler) compileModelCallChain(e *ast.CallExpr) (string, bool) {
 }
 
 func (c *compiler) compileGenericCall(e *ast.CallExpr) string {
-	// Generic call — Go does not support named args, use positional only.
 	funcExpr := c.compileExpr(e.Func)
 	ident, isIdent := e.Func.(*ast.Ident)
+	var declaration *ast.FnDecl
+	if isIdent {
+		declaration = c.functions[ident.Name]
+		if isCompiledLocalFunction(declaration) {
+			return c.compileLocalFunctionCall(e, declaration)
+		}
+	}
 	isNative := isIdent && c.nativeFunctions[ident.Name]
 	if isNative {
 		funcExpr = "app.Resolver." + str.Capitalize(ident.Name)
@@ -1170,10 +1418,125 @@ func (c *compiler) compileGenericCall(e *ast.CallExpr) string {
 	if isNative {
 		args = append(args, "ctx")
 	}
+	if isNative && declaration != nil {
+		args = append(args, c.compileDeclaredFunctionArguments(e, declaration)...)
+		return fmt.Sprintf("%s(%s)", funcExpr, strings.Join(args, ", "))
+	}
 	for _, a := range e.Args {
 		args = append(args, c.compileExpr(a.Value))
 	}
 	return fmt.Sprintf("%s(%s)", funcExpr, strings.Join(args, ", "))
+}
+
+func isCompiledLocalFunction(fn *ast.FnDecl) bool {
+	return fn != nil && fn.Body != nil && !hasDirective(fn.Directives, "native") && !hasDirective(fn.Directives, "service")
+}
+
+func (c *compiler) compileLocalFunctionCall(call *ast.CallExpr, fn *ast.FnDecl) string {
+	args := []string{"ctx"}
+	if c.selectionFunctions[fn.Name] {
+		args = append(args, c.clientSelection)
+	}
+	args = append(args, c.compileDeclaredFunctionArguments(call, fn)...)
+	expression := fmt.Sprintf("app.%s(%s)", fn.Name, strings.Join(args, ", "))
+	if fn.ReturnType == nil {
+		c.write("if err := %s; err != nil {", expression)
+		c.writeErrorReturn("\t", "err")
+		c.write("}")
+		return ""
+	}
+	c.resultTmp++
+	result := fmt.Sprintf("_result%d", c.resultTmp)
+	c.write("%s, err := %s", result, expression)
+	c.write("if err != nil {")
+	c.writeErrorReturn("\t", "err")
+	c.write("}")
+	return result
+}
+
+func (c *compiler) compileDeclaredFunctionArguments(call *ast.CallExpr, fn *ast.FnDecl) []string {
+	values, variadicValues := declaredFunctionArgumentValues(call, fn)
+	args := make([]string, 0, len(call.Args))
+	for index, param := range fn.Params {
+		if param.Spread {
+			for _, value := range variadicValues {
+				args = append(args, c.compileExpr(value))
+			}
+			continue
+		}
+		if values[index] != nil {
+			args = append(args, c.compileExpr(values[index]))
+			continue
+		}
+		args = append(args, c.compileFunctionDefault(param))
+	}
+	return args
+}
+
+func (c *compiler) compileFunctionDefault(param *ast.ParamDecl) string {
+	valueType := param.Type
+	if valueType == nil || !valueType.Nullable || isNullLiteral(param.Default) {
+		return compileDefaultValue(param.Default, compiledFunctionGoType(valueType, c.models), c.enums)
+	}
+	copy := *valueType
+	copy.Nullable = false
+	value := compileDefaultValue(param.Default, compiledFunctionGoType(&copy, c.models), c.enums)
+	c.ptrTmpCount++
+	name := fmt.Sprintf("_default%d", c.ptrTmpCount)
+	c.write("%s := %s", name, value)
+	return "&" + name
+}
+
+func declaredFunctionArgumentValues(call *ast.CallExpr, fn *ast.FnDecl) ([]ast.Expr, []ast.Expr) {
+	values := make([]ast.Expr, len(fn.Params))
+	variadicValues := make([]ast.Expr, 0, len(call.Args))
+	positions := make(map[string]int, len(fn.Params))
+	for index, param := range fn.Params {
+		positions[param.Name] = index
+	}
+	nextPosition := 0
+	for _, argument := range call.Args {
+		position := nextPosition
+		if argument.Name != "" {
+			position = positions[argument.Name]
+		} else if position < len(fn.Params) && !fn.Params[position].Spread {
+			nextPosition++
+		}
+		if fn.Params[position].Spread {
+			variadicValues = append(variadicValues, argument.Value)
+			continue
+		}
+		values[position] = argument.Value
+	}
+	return values, variadicValues
+}
+
+// Write directly to the output buffer without allocating an intermediate statement.
+func (c *compiler) writeErrorReturn(indent, expression string) {
+	if c.valueClosure {
+		c.writeClosureError(indent, expression)
+		return
+	}
+	if c.inAsync {
+		c.write("%sluxolog.Error((%s).Error())", indent, expression)
+		c.write("%sreturn", indent)
+		return
+	}
+	c.b.WriteString(c.indent)
+	c.b.WriteString(indent)
+	if c.inFunction && c.functionResult != nil {
+		c.b.WriteString("return _value, ")
+	} else {
+		c.b.WriteString("return ")
+	}
+	c.b.WriteString(expression)
+	c.b.WriteByte('\n')
+}
+
+func (c *compiler) writeErrorGuard() {
+	c.write("if err != nil {")
+	c.writeErrorReturn("\t", "err")
+	c.write("}")
 }
 
 func (c *compiler) dbPackage() string {
@@ -1298,7 +1661,11 @@ func (c *compiler) compileModifierMethod(b *strings.Builder, modelName string, l
 	case "create":
 		c.compileCreateLink(b, modelName, link, i == totalLinks-1)
 	case "select":
-		fmt.Fprintf(b, ".Select(select%sSQLColumns(req.Select)...)", modelName)
+		selection := c.clientSelection
+		if selection == "" {
+			selection = "req.Select"
+		}
+		fmt.Fprintf(b, ".Select(select%sSQLColumns(%s)...)", modelName, selection)
 	case "orderBy":
 		c.compileOrderByChain(b, link.args)
 	case "limit", "offset":
@@ -1462,7 +1829,7 @@ func (c *compiler) compileCreateLink(b *strings.Builder, modelName string, link 
 					val := c.compileExpr(arg.Value)
 					hashed := "hashed" + str.Capitalize(arg.Name)
 					c.write("%s, err := luxocrypto.HashPassword(%s)", hashed, val)
-					c.write("if err != nil {\n%s\treturn err\n%s}", c.indent, c.indent)
+					c.writeErrorGuard()
 				}
 			}
 		}
@@ -1732,7 +2099,9 @@ func (c *compiler) compileBuiltinCall(e *ast.CallExpr) string {
 		// RandomHex returns (string, error) — assign to temp var with error check
 		varName := "_hex"
 		c.write("%s, _hexErr := luxocrypto.RandomHex(%s)", varName, n)
-		c.write("if _hexErr != nil {\n%s\treturn _hexErr\n%s}", c.indent, c.indent)
+		c.write("if _hexErr != nil {")
+		c.writeErrorReturn("\t", "_hexErr")
+		c.write("}")
 		return varName
 	case "randomBytes":
 		return fmt.Sprintf("luxocrypto.RandomBytes(%s)", n)
@@ -1759,7 +2128,7 @@ func (c *compiler) compileUnary(e *ast.UnaryExpr) string {
 		c.resultTmp++
 		name := fmt.Sprintf("_result%d", c.resultTmp)
 		c.write("%s, err := %s", name, operand)
-		c.write("if err != nil {\n%s\treturn err\n%s}", c.indent, c.indent)
+		c.writeErrorGuard()
 		return name
 	}
 	operand := c.compileExpr(e.Value)
@@ -1920,7 +2289,7 @@ func (c *compiler) compileUpdateChain(b *strings.Builder, modelName string, args
 			val := c.compileExpr(arg.Value)
 			hashedVar := "hashed" + str.Capitalize(arg.Name)
 			c.write("%s, err := luxocrypto.HashPassword(%s)", hashedVar, val)
-			c.write("if err != nil {\n%s\treturn err\n%s}", c.indent, c.indent)
+			c.writeErrorGuard()
 		}
 	}
 	var sets []string
@@ -2439,67 +2808,12 @@ func (c *compiler) compileForExpr(s *ast.ForStmt) string {
 
 // compileForExprYield generates a closure returning the first yielded value (or nil).
 func (c *compiler) compileForExprYield(s *ast.ForStmt) string {
-	sub := c.subCompiler()
-	sub.indent = c.indent + "\t\t"
-	sub.inForExpr = true
-	returnType := c.goTypeForExpr(s)
-	if returnType == "" {
-		returnType = "any"
-	}
-	sub.yieldAddr = c.yieldNeedsAddress(s)
-
-	// Compile entire body — YieldExpr will emit "return <value>"
-	for _, stmt := range s.Body.Stmts {
-		sub.compileStmt(stmt)
-	}
-
-	if rangeExpr, ok := s.Collection.(*ast.RangeExpr); ok {
-		start := c.compileExpr(rangeExpr.Start)
-		end := c.compileExpr(rangeExpr.End)
-		return fmt.Sprintf("func() %s {\n%s\tfor %s := int64(%s); %s <= %s; %s++ {\n%s%s\t}\n%s\treturn nil\n%s}()",
-			returnType, c.indent, s.VarName, start, s.VarName, end, s.VarName,
-			sub.b.String(), c.indent, c.indent, c.indent)
-	}
-
-	coll := c.compileExpr(s.Collection)
-	return fmt.Sprintf("func() %s {\n%s\tfor _, %s := range %s {\n%s%s\t}\n%s\treturn nil\n%s}()",
-		returnType, c.indent, s.VarName, coll,
-		sub.b.String(), c.indent, c.indent, c.indent)
+	return c.compileForValue(s, true)
 }
 
 // compileForExprCollect generates a closure collecting all values into a typed slice.
 func (c *compiler) compileForExprCollect(s *ast.ForStmt) string {
-	sub := c.subCompiler()
-	sub.indent = c.indent + "\t\t"
-	resultType := c.goTypeForExpr(s)
-	if resultType == "" {
-		resultType = "[]any"
-	}
-
-	// Compile all but last statement normally
-	for i := 0; i < len(s.Body.Stmts)-1; i++ {
-		sub.compileStmt(s.Body.Stmts[i])
-	}
-	// Last statement is the collected value
-	lastExpr := ""
-	if es, ok := s.Body.Stmts[len(s.Body.Stmts)-1].(*ast.ExprStmt); ok {
-		lastExpr = sub.compileExpr(es.Expr)
-	} else if rs, ok := s.Body.Stmts[len(s.Body.Stmts)-1].(*ast.ReturnStmt); ok && rs.Value != nil {
-		lastExpr = sub.compileExpr(rs.Value)
-	}
-
-	if rangeExpr, ok := s.Collection.(*ast.RangeExpr); ok {
-		start := c.compileExpr(rangeExpr.Start)
-		end := c.compileExpr(rangeExpr.End)
-		return fmt.Sprintf("func() %s {\n%s\tvar _result %s\n%s\tfor %s := int64(%s); %s <= %s; %s++ {\n%s%s\t\t_result = append(_result, %s)\n%s\t}\n%s\treturn _result\n%s}()",
-			resultType, c.indent, resultType, c.indent, s.VarName, start, s.VarName, end, s.VarName,
-			sub.b.String(), c.indent, lastExpr, c.indent, c.indent, c.indent)
-	}
-
-	coll := c.compileExpr(s.Collection)
-	return fmt.Sprintf("func() %s {\n%s\tvar _result %s\n%s\tfor _, %s := range %s {\n%s%s\t\t_result = append(_result, %s)\n%s\t}\n%s\treturn _result\n%s}()",
-		resultType, c.indent, resultType, c.indent, s.VarName, coll,
-		sub.b.String(), c.indent, lastExpr, c.indent, c.indent, c.indent)
+	return c.compileForValue(s, false)
 }
 
 // compileBlock compiles a block body with indentation.
@@ -2704,63 +3018,61 @@ func (c *compiler) compileObject(e *ast.ObjectExpr) string {
 
 // compileWhen: when { cond -> expr, else -> expr }
 func (c *compiler) compileWhen(e *ast.WhenExpr) string {
-	// Detect channel select: when { <-ch -> ... } → Go select
 	if e.Subject == nil && c.hasChannelBranch(e) {
 		return c.compileSelect(e)
 	}
-
-	// when is compiled inline as a helper variable + switch
-	retType := c.inferWhenReturnType(e)
-	var b strings.Builder
-	fmt.Fprintf(&b, "func() %s {\n", retType)
-	// Check if any branch uses is-type → type switch
-	hasIsType := false
-	for _, br := range e.Branches {
-		if br.IsType != "" {
-			hasIsType = true
-			break
-		}
+	sub := c.valueCompiler()
+	sub.indent += "\t"
+	subject := ""
+	if e.Subject != nil {
+		subject = sub.compileExpr(e.Subject)
 	}
-
+	hasIsType := false
+	for _, branch := range e.Branches {
+		hasIsType = hasIsType || branch.IsType != ""
+	}
 	if hasIsType && e.Subject != nil {
-		// Type switch: when(x) { is String -> ..., is Int -> ... }
-		subj := c.compileExpr(e.Subject)
-		fmt.Fprintf(&b, "%s\tswitch %s.(type) {\n", c.indent, subj)
-		for _, br := range e.Branches {
-			body := c.compileExpr(br.Body)
-			if br.IsType != "" {
-				fmt.Fprintf(&b, "%s\tcase %s:\n%s\t\treturn %s\n", c.indent, br.IsType, c.indent, body)
-			} else if br.Condition != nil {
-				cond := c.compileExpr(br.Condition)
-				fmt.Fprintf(&b, "%s\tcase %s:\n%s\t\treturn %s\n", c.indent, cond, c.indent, body)
-			}
+		subject += ".(type)"
+	}
+	if !hasIsType && whenConditionsCall(e) {
+		if e.Subject != nil {
+			sub.write("_subject := %s", subject)
+			subject = "_subject"
 		}
-	} else if e.Subject != nil {
-		subj := c.compileExpr(e.Subject)
-		fmt.Fprintf(&b, "%s\tswitch %s {\n", c.indent, subj)
-		for _, br := range e.Branches {
-			cond := c.compileExpr(br.Condition)
-			body := c.compileExpr(br.Body)
-			fmt.Fprintf(&b, "%s\tcase %s:\n%s\t\treturn %s\n", c.indent, cond, c.indent, body)
+		sub.compileWhenConditions(e, subject)
+		retType := c.inferWhenReturnType(e)
+		if e.Else == nil {
+			sub.write("return %s", zeroValueForType(retType))
 		}
+		return c.finishValueClosure(sub, retType, sub.b.String())
+	}
+	if subject == "" {
+		sub.write("switch {")
 	} else {
-		fmt.Fprintf(&b, "%s\tswitch {\n", c.indent)
-		for _, br := range e.Branches {
-			cond := c.compileExpr(br.Condition)
-			body := c.compileExpr(br.Body)
-			fmt.Fprintf(&b, "%s\tcase %s:\n%s\t\treturn %s\n", c.indent, cond, c.indent, body)
+		sub.write("switch %s {", subject)
+	}
+	for _, branch := range e.Branches {
+		condition := branch.IsType
+		if condition == "" {
+			condition = sub.compileExpr(branch.Condition)
 		}
+		sub.write("case %s:", condition)
+		sub.indent += "\t"
+		sub.compileValueBranch(branch.Body)
+		sub.indent = strings.TrimSuffix(sub.indent, "\t")
 	}
 	if e.Else != nil {
-		elseExpr := c.compileExpr(e.Else)
-		fmt.Fprintf(&b, "%s\tdefault:\n%s\t\treturn %s\n", c.indent, c.indent, elseExpr)
+		sub.write("default:")
+		sub.indent += "\t"
+		sub.compileValueBranch(e.Else)
+		sub.indent = strings.TrimSuffix(sub.indent, "\t")
 	}
-	fmt.Fprintf(&b, "%s\t}\n", c.indent)
+	sub.write("}")
+	retType := c.inferWhenReturnType(e)
 	if e.Else == nil {
-		fmt.Fprintf(&b, "%s\treturn %s\n", c.indent, zeroValueForType(retType))
+		sub.write("return %s", zeroValueForType(retType))
 	}
-	fmt.Fprintf(&b, "%s}()", c.indent)
-	return b.String()
+	return c.finishValueClosure(sub, retType, sub.b.String())
 }
 
 // inferWhenReturnType infers the Go return type for a when expression.
@@ -2810,46 +3122,30 @@ func (c *compiler) hasChannelBranch(e *ast.WhenExpr) bool {
 
 // compileSelect: when { <-ch1 -> { ... }, <-ch2 -> { ... } } → Go select
 func (c *compiler) compileSelect(e *ast.WhenExpr) string {
-	retType := c.inferWhenReturnType(e)
-	var b strings.Builder
-	fmt.Fprintf(&b, "func() %s {\n%s\tselect {\n", retType, c.indent)
-
-	for _, br := range e.Branches {
-		if u, ok := br.Condition.(*ast.UnaryExpr); ok && u.Op == "<-" {
-			ch := c.compileExpr(u.Value)
-			// Check if body is a lambda with a named param: { msg -> ... }
-			if lambda, ok := br.Body.(*ast.LambdaExpr); ok && len(lambda.Params) > 0 {
-				param := lambda.Params[0]
-				fmt.Fprintf(&b, "%s\tcase %s := <-%s:\n", c.indent, param, ch)
-				sub := c.subCompiler()
-				sub.indent = c.indent + "\t\t"
-				for _, stmt := range lambda.Body.Stmts {
-					sub.compileStmt(stmt)
-				}
-				b.WriteString(sub.b.String())
-			} else {
-				fmt.Fprintf(&b, "%s\tcase %s:\n", c.indent, c.compileExpr(br.Condition))
-				body := c.compileExpr(br.Body)
-				fmt.Fprintf(&b, "%s\t\t%s\n", c.indent, body)
-			}
+	sub := c.valueCompiler()
+	sub.indent += "\t"
+	sub.write("select {")
+	for _, branch := range e.Branches {
+		condition := sub.compileExpr(branch.Condition)
+		if lambda, ok := branch.Body.(*ast.LambdaExpr); ok && len(lambda.Params) > 0 {
+			sub.write("case %s := %s:", lambda.Params[0], condition)
 		} else {
-			// Non-channel branch (e.g., timeout) — compile as regular case
-			cond := c.compileExpr(br.Condition)
-			fmt.Fprintf(&b, "%s\tcase %s:\n", c.indent, cond)
-			body := c.compileExpr(br.Body)
-			fmt.Fprintf(&b, "%s\t\t%s\n", c.indent, body)
+			sub.write("case %s:", condition)
 		}
+		sub.indent += "\t"
+		sub.compileValueBranch(branch.Body)
+		sub.indent = strings.TrimSuffix(sub.indent, "\t")
 	}
-
 	if e.Else != nil {
-		fmt.Fprintf(&b, "%s\tdefault:\n", c.indent)
-		elseExpr := c.compileExpr(e.Else)
-		fmt.Fprintf(&b, "%s\t\t%s\n", c.indent, elseExpr)
+		sub.write("default:")
+		sub.indent += "\t"
+		sub.compileValueBranch(e.Else)
+		sub.indent = strings.TrimSuffix(sub.indent, "\t")
 	}
-
-	zeroVal := zeroValueForType(retType)
-	fmt.Fprintf(&b, "%s\t}\n%s\treturn %s\n%s}()", c.indent, c.indent, zeroVal, c.indent)
-	return b.String()
+	sub.write("}")
+	retType := c.inferWhenReturnType(e)
+	sub.write("return %s", zeroValueForType(retType))
+	return c.finishValueClosure(sub, retType, sub.b.String())
 }
 
 // extractLambdaField extracts the field name from a simple lambda like { it.minutes }.
@@ -2891,7 +3187,7 @@ func (c *compiler) compileLambda(e *ast.LambdaExpr) string {
 
 // compileTransaction: tx { ... } → app.DB.Tx(ctx, func(ctx) error { ... })
 func (c *compiler) compileTransaction(e *ast.TransactionExpr) string {
-	sub := c.subCompiler()
+	sub := c.errorCompiler()
 	sub.indent = c.indent + "\t"
 	for _, stmt := range e.Body.Stmts {
 		sub.compileStmt(stmt)
@@ -2909,23 +3205,30 @@ func (c *compiler) subCompiler() *compiler {
 		childVars[k] = v
 	}
 	return &compiler{
-		generator:        c.generator,
-		b:                &b,
-		indent:           c.indent,
-		models:           c.models,
-		types:            c.types,
-		enums:            c.enums,
-		api:              c.api,
-		vars:             childVars,
-		loadSelections:   c.loadSelections,
-		loadSelection:    c.loadSelection,
-		hasLoadSelection: c.hasLoadSelection,
+		generator:          c.generator,
+		b:                  &b,
+		indent:             c.indent,
+		models:             c.models,
+		types:              c.types,
+		enums:              c.enums,
+		api:                c.api,
+		vars:               childVars,
+		nativeFunctions:    c.nativeFunctions,
+		functions:          c.functions,
+		selectionFunctions: c.selectionFunctions,
+		clientSelection:    c.clientSelection,
+		loadSelections:     c.loadSelections,
+		loadSelection:      c.loadSelection,
+		hasLoadSelection:   c.hasLoadSelection,
+		resultTmp:          c.resultTmp,
 	}
 }
 
 // compileAsync: async { body } → go func() { body }()
 func (c *compiler) compileAsync(e *ast.AsyncExpr) string {
 	sub := c.subCompiler()
+	sub.inFunction = false
+	sub.functionResult = nil
 	sub.indent = c.indent + "\t"
 	sub.inAsync = true
 	for _, stmt := range e.Body.Stmts {
@@ -2937,7 +3240,6 @@ func (c *compiler) compileAsync(e *ast.AsyncExpr) string {
 type awaitTask struct {
 	varName   string
 	goType    string
-	expr      string
 	source    ast.Expr
 	isQuery   bool
 	valueType valType
@@ -2961,7 +3263,7 @@ func (c *compiler) compileAwaitBindings(e *ast.AwaitExpr, names []string) {
 }
 
 func (c *compiler) newAwaitTask(name string, value ast.Expr) awaitTask {
-	task := awaitTask{varName: name, expr: c.compileExpr(value), source: value, isQuery: c.isModelQuery(value)}
+	task := awaitTask{varName: name, source: value, isQuery: c.isModelQuery(value)}
 	if task.isQuery {
 		task.valueType = c.resolveQueryType(value)
 		task.goType = goTypeForValType(task.valueType)
@@ -3033,7 +3335,10 @@ func (c *compiler) emitAwaitTasks(tasks []awaitTask) {
 	}
 
 	groups := c.awaitAggregateGroups(tasks)
+	c.write("{")
+	c.indent += "\t"
 	c.write("g, gctx := errgroup.WithContext(ctx)")
+	c.write("_ = gctx")
 	for index := range tasks {
 		group, first := awaitAggregateGroupAt(groups, index)
 		if group != nil {
@@ -3046,7 +3351,9 @@ func (c *compiler) emitAwaitTasks(tasks []awaitTask) {
 	}
 
 	c.write("if err := g.Wait(); err != nil {")
-	c.write("\treturn err")
+	c.writeErrorReturn("\t", "err")
+	c.write("}")
+	c.indent = strings.TrimSuffix(c.indent, "\t")
 	c.write("}")
 	for _, t := range tasks {
 		c.write("_ = %s", t.varName)
@@ -3296,15 +3603,21 @@ func compileAggregateSpec(task awaitAggregate) string {
 }
 
 func (c *compiler) emitAwaitTask(task awaitTask) {
+	// Fused aggregates never reach this path: compile each remaining expression
+	// exactly once, inside its own error-return and cancellation boundary.
+	sub := c.errorCompiler()
+	sub.indent = c.indent + "\t"
+	expression := sub.compileExpr(task.source)
 	c.write("g.Go(func() error {")
+	c.write("\tctx := gctx")
+	c.write("\t_ = ctx")
+	c.b.WriteString(sub.b.String())
 	if task.isQuery {
-		c.write("\tvar err error")
-		expr := strings.Replace(task.expr, "(ctx,", "(gctx,", 1)
-		expr = strings.Replace(expr, "(ctx)", "(gctx)", 1)
-		c.write("\t%s, err = %s", task.varName, expr)
+		c.write("\t_awaitValue, err := %s", expression)
+		c.write("\t%s = _awaitValue", task.varName)
 		c.write("\treturn err")
 	} else {
-		c.write("\t%s = %s", task.varName, task.expr)
+		c.write("\t%s = %s", task.varName, expression)
 		c.write("\treturn nil")
 	}
 	c.write("})")

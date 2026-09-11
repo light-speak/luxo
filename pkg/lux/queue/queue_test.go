@@ -35,8 +35,12 @@ func TestConfigValidateKeepsExplicit(t *testing.T) {
 }
 
 func TestNewFromEnvMemory(t *testing.T) {
+	t.Setenv("NATS_URL", "")
 	os.Unsetenv("NATS_URL")
-	q := NewFromEnv(DefaultConfig())
+	q, err := NewFromEnv(DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer q.Close()
 
 	if _, ok := q.(*MemoryQueue); !ok {
@@ -44,14 +48,29 @@ func TestNewFromEnvMemory(t *testing.T) {
 	}
 }
 
-func TestNewFromEnvNATSFallback(t *testing.T) {
-	// Bad NATS URL should fall back to MemoryQueue.
-	t.Setenv("NATS_URL", "nats://192.0.2.1:1")
-	q := NewFromEnv(DefaultConfig())
+func TestNewFromEnvNATS(t *testing.T) {
+	if os.Getenv("NATS_URL") == "" {
+		t.Skip("set NATS_URL to run the NATS factory integration test")
+	}
+	q, err := NewFromEnv(DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer q.Close()
+	if _, ok := q.(*NATSQueue); !ok {
+		t.Fatalf("expected *NATSQueue, got %T", q)
+	}
+}
 
-	if _, ok := q.(*MemoryQueue); !ok {
-		t.Errorf("expected *MemoryQueue fallback, got %T", q)
+func TestNewFromEnvNATSFailure(t *testing.T) {
+	for _, address := range []string{"nats://127.0.0.1:1", "", "   "} {
+		t.Run(address, func(t *testing.T) {
+			t.Setenv("NATS_URL", address)
+			q, err := NewFromEnv(DefaultConfig())
+			if err == nil || q != nil {
+				t.Fatalf("configured NATS failure must propagate: queue=%T err=%v", q, err)
+			}
+		})
 	}
 }
 

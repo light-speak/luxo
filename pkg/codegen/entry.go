@@ -8,7 +8,7 @@ import (
 	"github.com/light-speak/luxo/pkg/semantic"
 )
 
-// GenerateEntryFile produces luxis/app/main.gen.go — the embedded entry point
+// GenerateEntryFile produces lucis/app/main.gen.go — the embedded entry point
 // that imports all modules, registers handlers, and starts the Luvia gateway.
 type moduleInfo struct {
 	name          string
@@ -436,23 +436,21 @@ func modulesNeedLoaders(modules []moduleInfo) bool {
 }
 
 func writeEventBusWiring(b *strings.Builder, modules []moduleInfo) {
-	b.WriteString("\teventBus := event.NewFromEnv()\n")
-	b.WriteString("\tdefer eventBus.Close()\n\n")
+	writeBackendInitialization(b, "eventBus", "event.NewFromEnv()")
 
 	for _, m := range modules {
 		if m.hasEvents || m.emitsEvents {
 			fmt.Fprintf(b, "\t%sApp.EventBus = eventBus\n", m.name)
 		}
 		if m.hasEvents {
-			fmt.Fprintf(b, "\t%s_luxo.RegisterEvents(eventBus, %sApp)\n", m.name, m.name)
+			writeEventRegistration(b, m.name, m.name+"App")
 		}
 	}
 	b.WriteString("\n")
 }
 
 func writeQueueWiring(b *strings.Builder, modules []moduleInfo) {
-	b.WriteString("\ttaskQueue := queue.NewFromEnv(queue.DefaultConfig())\n")
-	b.WriteString("\tdefer taskQueue.Close()\n\n")
+	writeBackendInitialization(b, "taskQueue", "queue.NewFromEnv(queue.DefaultConfig())")
 
 	for _, m := range modules {
 		fmt.Fprintf(b, "\t%sApp.Queue = taskQueue\n", m.name)
@@ -460,8 +458,20 @@ func writeQueueWiring(b *strings.Builder, modules []moduleInfo) {
 	b.WriteString("\n")
 }
 
+// Backend initialization failures must terminate startup, never change backends.
+func writeBackendInitialization(b *strings.Builder, variable, constructor string) {
+	fmt.Fprintf(b, "\t%s, err := %s\n", variable, constructor)
+	b.WriteString("\tif err != nil {\n\t\tfmt.Fprintf(os.Stderr, \"fatal: initialize messaging: %v\\n\", err)\n\t\tos.Exit(1)\n\t}\n")
+	fmt.Fprintf(b, "\tdefer %s.Close()\n\n", variable)
+}
+
+func writeEventRegistration(b *strings.Builder, module, app string) {
+	fmt.Fprintf(b, "\tif err := %s_luxo.RegisterEvents(eventBus, %s); err != nil {\n", module, app)
+	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"fatal: register events: %v\\n\", err)\n\t\tos.Exit(1)\n\t}\n")
+}
+
 // GenerateModuleEntryFiles produces per-module entry points for cluster mode.
-// Each module gets its own main.gen.go under luxis/<module>/.
+// Each module gets its own main.gen.go under lucis/<module>/.
 // Returns map[moduleName][]byte.
 func GenerateModuleEntryFiles(result *semantic.Result, modulePath string) map[string][]byte {
 	allModules := collectModules(result)
@@ -578,20 +588,18 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 
 	// Events
 	if target.hasEvents || target.emitsEvents || target.hasStreams {
-		b.WriteString("\teventBus := event.NewFromEnv()\n")
-		b.WriteString("\tdefer eventBus.Close()\n")
+		writeBackendInitialization(&b, "eventBus", "event.NewFromEnv()")
 		if target.hasEvents || target.emitsEvents {
 			b.WriteString("\tapp.EventBus = eventBus\n")
 		}
 		if target.hasEvents {
-			fmt.Fprintf(&b, "\t%s_luxo.RegisterEvents(eventBus, app)\n", target.name)
+			writeEventRegistration(&b, target.name, "app")
 		}
 		b.WriteString("\n")
 	}
 
 	// Queue
-	b.WriteString("\ttaskQueue := queue.NewFromEnv(queue.DefaultConfig())\n")
-	b.WriteString("\tdefer taskQueue.Close()\n")
+	writeBackendInitialization(&b, "taskQueue", "queue.NewFromEnv(queue.DefaultConfig())")
 	b.WriteString("\tapp.Queue = taskQueue\n\n")
 
 	// Gateway + handlers
@@ -638,7 +646,7 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 	return formatGenerated([]byte(b.String()))
 }
 
-// GenerateGatewayEntry produces luxis/gateway/main.gen.go — a pure routing gateway.
+// GenerateGatewayEntry produces lucis/gateway/main.gen.go — a pure routing gateway.
 // Routes API requests to the correct backend service via Luxo RPC.
 // Owns the full schema for Binary↔JSON conversion. No handler code.
 func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
@@ -700,8 +708,7 @@ func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {
 	// Gateway
 	b.WriteString("\tgw := luvia.New()\n\n")
 	if anyStreams {
-		b.WriteString("\teventBus := event.NewFromEnv()\n")
-		b.WriteString("\tdefer eventBus.Close()\n")
+		writeBackendInitialization(&b, "eventBus", "event.NewFromEnv()")
 		for _, module := range allModules {
 			if module.hasStreams {
 				fmt.Fprintf(&b, "\t%s_luxo.RegisterStreams(gw.Router, eventBus, nil)\n", module.name)

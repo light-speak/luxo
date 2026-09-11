@@ -43,6 +43,7 @@ type Result struct {
 type Analyzer struct {
 	scope          *Scope
 	types          map[string]*ResolvedType
+	functions      map[string]*ast.FnDecl
 	errors         []Error
 	warnings       []Warning
 	inLambda       bool // true when checking inside a lambda body

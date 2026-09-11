@@ -46,9 +46,9 @@ func TestGenerateDeployFiles_Basic(t *testing.T) {
 		"FROM alpine:3.20 AS user-run",
 		"FROM alpine:3.20 AS post-run",
 		"CGO_ENABLED=0 go build",
-		"./luxis/user/",
-		"./luxis/post/",
-		"./luxis/gateway/",
+		"./lucis/user/",
+		"./lucis/post/",
+		"./lucis/gateway/",
 		"ENTRYPOINT",
 		"migrations",
 	}

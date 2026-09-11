@@ -17,6 +17,40 @@ func TestGenerateEventFileNoEvents(t *testing.T) {
 	}
 }
 
+func TestEventRegistrationPropagatesSubscriptionErrors(t *testing.T) {
+	var b strings.Builder
+	g := &GeneratorContext{}
+	g.generateRegisterEvents(&b, []*ast.OnDecl{{EventName: "Completed"}}, "activity", "activity", nil, nil)
+	for _, expected := range []string{"func RegisterEvents(bus event.Bus, app *App) error", "if err := event.OnQueueDecode", "}); err != nil {", "return err"} {
+		if !strings.Contains(b.String(), expected) {
+			t.Errorf("missing %q in generated registration", expected)
+		}
+	}
+}
+
+func TestEventListenerIncludesExtendedModelContext(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Name:    "origin/post/event.luxo",
+		Extends: []*ast.ExtendDecl{{Name: "User", Fields: []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}}}},
+		Events:  []*ast.EventDecl{{Name: "Published", Params: []*ast.ParamDecl{{Name: "authorId", Type: &ast.TypeRef{Name: "Int"}}}}},
+		Listeners: []*ast.OnDecl{{
+			Pos: token.Position{File: "origin/post/event.luxo"}, EventName: "Published", Params: []string{"e"},
+			Body: &ast.Block{Stmts: []ast.Stmt{&ast.ValStmt{Name: "_", Value: &ast.CallExpr{
+				Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "load"},
+				Args: []*ast.NamedArg{{Value: &ast.MemberExpr{Object: &ast.Ident{Name: "e"}, Field: "authorId"}}},
+			}}}},
+		}},
+	}}}
+	g := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{ModelModule: map[string]string{"User": "user"}}})
+	code := string(g.generateEventFile(result, "luxo"))
+	if !strings.Contains(code, "app.loaders.ExtendUser.Load(ctx, e.AuthorId,") || strings.Contains(code, " := User.Load(") {
+		t.Fatalf("listeners must compile extend loads through typed loaders:\n%s", code)
+	}
+	if !strings.Contains(code, `"github.com/light-speak/luxo/pkg/lux/selection"`) || strings.Contains(code, "e.AuthorId, nil)") {
+		t.Fatalf("discarded remote loads must use an explicit key-only selection:\n%s", code)
+	}
+}
+
 func TestEventJSONFieldRequirement(t *testing.T) {
 	events := []*ast.EventDecl{{Params: []*ast.ParamDecl{
 		{Name: "unknown", Type: &ast.TypeRef{Name: "LegacyPayload"}},

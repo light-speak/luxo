@@ -121,6 +121,32 @@ api getUser(id: Int): User {
 
 `Result<T>` is the ABI for Go-backed native functions. Public APIs declare their payload type (`User` above); transport errors use the shared structured error envelope.
 
+### Compiled Functions and Native Boundaries
+
+Ordinary functions are compiled into direct module-local Go methods. They can call other compiled functions or cross into a Go implementation through `@native`; neither path uses reflection or runtime name lookup.
+
+```luxo
+fn normalizeScore(score: Int, ceiling: Int = 100): Int {
+  when(score) {
+    in 0..ceiling -> score
+    else -> ceiling
+  }
+}
+
+fn verifyRelease(projectId: Int): Result<Boolean> @native
+fn recordRelease(projectId: Int) @native
+
+api releaseReady(projectId: Int, score: Int): Boolean {
+  val normalized = normalizeScore(ceiling: 100, score: score)
+  recordRelease(projectId)             // Go error is propagated automatically
+  verifyRelease(projectId)? && normalized >= 80
+}
+```
+
+Named arguments are matched to declarations at compile time. Defaults must be type-safe compile-time constants, and invalid names, duplicates, missing required values, or type mismatches stop generation during semantic analysis.
+Value-returning native functions use `Result<T>` and explicit `?`; native functions without a value lower to Go `error` and propagate failures automatically.
+Function variadics use `...values: T`, must be last, cannot have defaults, and preserve the same direct Go variadic ABI for compiled and `@native` functions. Public APIs use `[T]` instead because their named parameter IDs must remain stable on the wire.
+
 ### Concurrency — No async/await Infection
 
 ```luxo
@@ -314,6 +340,45 @@ metadata.
 
 Compatibility here means a new server continues accepting old clients, so compatible releases should deploy servers before regenerated clients. Adding a model/type field or an optional API parameter is compatible in that direction. Removing or changing a field/parameter, adding a required parameter, changing an API return type, removing an API, or changing an event payload is breaking. Removed IDs stay reserved and are never reused.
 
+
+### Studio Registration Transport Security
+
+Configure `LUXO_STUDIO_URL`, `LUXO_API_KEY`, and the public project UUID `LUXO_PROJECT_ID` to enable registration and periodic heartbeats. Remote URLs require HTTPS by default; `localhost` and loopback IPs may use HTTP for local development. Only explicitly trusted private networks should enable remote HTTP through `LUXO_STUDIO_ALLOW_INSECURE_HTTP=true`; this does not encrypt the connection. URLs must not contain embedded credentials, query parameters, or fragments.
+
+Registration, heartbeats, deregistration, metrics, and trace exports never follow HTTP redirects, preventing replay of credential-bearing request bodies. Gateway shutdown cancels in-flight registration, heartbeats, and dependency probes, joins the registration worker, then attempts deregistration with a separate two-second timeout. These operations stay outside application request hot paths.
+
+### Release and Stability Policy
+
+Until SDK versions are stabilized, the cross-repository Swift development CI temporarily follows `main`. This checks current integration but is not reproducible release compatibility evidence; pin the SDK commit and record the compatibility matrix after stabilization.
+
+The next release target is **`v1.0.0-beta.1`**, not an already published stable release. Luxo follows [Semantic Versioning](https://semver.org/): Git tags use the `v` prefix; package versions use the format required by their ecosystem.
+
+| Stage | Version sequence | Scope |
+| --- | --- | --- |
+| Beta | `v1.0.0-beta.1`, `v1.0.0-beta.2`, … | Establish the compatibility baseline and fix correctness, security, and performance defects. |
+| Release candidate | `v1.0.0-rc.1`, `v1.0.0-rc.2`, … | Feature freeze; release-blocking fixes only. |
+| Stable | `v1.0.0` | Publish the verified public contract. |
+| Maintenance | `v1.0.1` / `v1.1.0` / `v2.0.0` | Compatible fixes / compatible additions / incompatible public-contract changes. |
+
+Beta releases are prereleases, not a promise of production stability. From beta.1 onward, preserve compatibility by default. Any unavoidable beta contract break requires explicit review, migration instructions, updated SDKs, and compatibility tests; a new beta number alone does not make a breaking change safe. Published tags and artifacts must never be overwritten.
+
+The public contract covers DSL semantics, supported CLI/configuration, generated/native Go interfaces, SDK behavior, explicit field selection, schema/lock IDs and wire types, JSON/Binary and RPC/stream framing, errors, and Studio registration/telemetry. Internal implementation and trace timing measurements are not stable APIs. Product versions, wire-envelope versions, and `luxo.lock` versions are separate: a product release must not renumber unchanged encodings or reuse removed IDs.
+
+Each release must identify the exact core commit and tested TypeScript, Dart, Kotlin, and Swift SDK versions/commits. Release gates include compiler/runtime tests, race checks, lint and reachable-path coverage review, benchmark comparison against the previous baseline, cross-SDK protocol fixtures, and a clean external consumer build. Preserve baseline fixtures and generated consumers; running only regenerated clients against a new server is not a backward-compatibility test. Before the first stable release, verify Studio against the candidate without a developer Go workspace or unpinned sibling checkout.
+
+Studio releases must pin the tested core Go module, CLI, frontend SDKs, and CI checkout to the recorded release/commit, never floating `main` or `latest`. Local source overrides are development-only. Studio and independently released SDKs keep their own version numbers; the release compatibility matrix, not identical numbers, establishes support. PostgreSQL is the currently implemented database backend; future database backends and new Studio features are outside this release freeze.
+
+#### Performance Blocking and Approved Feature Costs
+
+Performance review distinguishes request-path regressions from necessary compilation costs. Initialization on first use in each compilation is neither per-request allocation nor once-per-process initialization. Required features still need tests and benchmarks; necessity alone grants no exception.
+
+Default CI rules remain unchanged: at least 10 samples per revision; significant time growth above 5% or significant allocation growth triggers a second sample group, and repeated regressions block. The 5% threshold is an automated detection threshold, not an expendable performance budget. Reflection, generic request-path serialization, and confirmed hot-path defects still require rejection during review.
+
+Explicitly reviewed compilation allocation costs live in [approved-costs.json](scripts/benchgate/approved-costs.json). Each record specifies a reason, exact baseline SHA, package, benchmark, and absolute B/op and allocs/op increase limits. Only semantic/codegen are eligible; wildcards and time exceptions are forbidden. Approvals apply only after matching comparison sets from two sample groups, with both byte and allocation increases within budget in both groups. CI prints every applied approval. Over-budget changes, other benchmarks, runtime packages, and time regressions retain the default gates. A changed baseline SHA automatically expires an approval, preventing cumulative reuse across later versions.
+
+The approved cost in this batch is the declaration index for strict fn/native argument checks in `AnalyzeDemoFile-2`: at most 272 B and 2 allocations per compilation over the recorded baseline. The 272 B ceiling includes the original 256 B cost and 16 B of explicitly approved measurement headroom; two local sample groups measured increases of 258 B and 253.5 B. The index is built on demand and reused, never on the generated service's request path. New approvals or expanded budgets require explicit maintainer confirmation; tools must not approve them automatically.
+
+CI retains raw benchmark samples and benchstat comparisons for 14 days, including failed runs. Gate diagnostics report exact baseline, candidate, and absolute differences rather than rounded percentages alone. Queue integration tests require a healthy JetStream-enabled NATS server, not just an open NATS port. Each lexer/parser/semantic fuzz target runs two million executions with four workers and a 180-second hard timeout; any failure or timeout still fails CI. Fuzz logs, toolchain information, and saved failing inputs are retained for 14 days.
 
 ## AI-Native by Design
 

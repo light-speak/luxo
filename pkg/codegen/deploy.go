@@ -48,12 +48,12 @@ func generateDockerfile(modules []moduleInfo) []byte {
 	// Per-module build stages
 	for _, m := range modules {
 		fmt.Fprintf(&b, "FROM builder AS %s\n", m.name)
-		fmt.Fprintf(&b, "RUN CGO_ENABLED=0 go build -o /service ./luxis/%s/\n\n", m.name)
+		fmt.Fprintf(&b, "RUN CGO_ENABLED=0 go build -o /service ./lucis/%s/\n\n", m.name)
 	}
 
 	// Gateway build
 	b.WriteString("FROM builder AS gateway\n")
-	b.WriteString("RUN CGO_ENABLED=0 go build -o /service ./luxis/gateway/\n\n")
+	b.WriteString("RUN CGO_ENABLED=0 go build -o /service ./lucis/gateway/\n\n")
 
 	// Runtime images — include migrations for auto-migrate on startup
 	for _, m := range modules {

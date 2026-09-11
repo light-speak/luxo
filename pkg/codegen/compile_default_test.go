@@ -8,6 +8,36 @@ import (
 	"github.com/light-speak/luxo/pkg/token"
 )
 
+func TestWriteErrorReturnAvoidsIntermediateAllocations(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		inFunction bool
+		result     *ast.TypeRef
+		indent     string
+		want       string
+	}{
+		{name: "handler", want: "\treturn failure\n"},
+		{name: "void function", inFunction: true, indent: "\t", want: "\t\treturn failure\n"},
+		{name: "value function", inFunction: true, result: &ast.TypeRef{Name: "Int"}, want: "\treturn _value, failure\n"},
+		{name: "handler with result", result: &ast.TypeRef{Name: "Int"}, want: "\treturn failure\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var output strings.Builder
+			output.Grow(1001 * len(test.want))
+			c := compiler{b: &output, indent: "\t", inFunction: test.inFunction, functionResult: test.result}
+			allocations := testing.AllocsPerRun(1000, func() {
+				c.writeErrorReturn(test.indent, "failure")
+			})
+			if allocations != 0 {
+				t.Fatalf("error return allocated %v times, want 0", allocations)
+			}
+			if output.String() != strings.Repeat(test.want, 1001) {
+				t.Fatal("error return changed generated code")
+			}
+		})
+	}
+}
+
 func TestCompileAPIBody_ParamWithDefaultInt(t *testing.T) {
 	api := &ast.ApiDecl{
 		Name: "listUsers",
@@ -145,6 +175,47 @@ func TestCompileDefaultValueNullUsesNil(t *testing.T) {
 	}
 }
 
+func TestCompileDefaultValueDuration(t *testing.T) {
+	tests := []struct {
+		value string
+		want  string
+	}{
+		{value: "5ms", want: "5 * time.Millisecond"},
+		{value: "1h", want: "time.Hour"},
+		{value: "2d", want: "2 * 24 * time.Hour"},
+	}
+	for _, tt := range tests {
+		if got := compileDefaultValue(&ast.Literal{Kind: token.Duration, Value: tt.value}, "time.Duration", nil); got != tt.want {
+			t.Errorf("duration default %s = %q, want %q", tt.value, got, tt.want)
+		}
+	}
+}
+
+func TestCompileDefaultValueSignedNumber(t *testing.T) {
+	value := &ast.UnaryExpr{Op: "-", Value: &ast.Literal{Kind: token.Int, Value: "1"}}
+	if got := compileDefaultValue(value, "int64", nil); got != "-1" {
+		t.Fatalf("signed default = %q, want -1", got)
+	}
+	duration := &ast.UnaryExpr{Op: "-", Value: &ast.Literal{Kind: token.Duration, Value: "5s"}}
+	if got := compileDefaultValue(duration, "time.Duration", nil); got != "-(5 * time.Second)" {
+		t.Fatalf("signed duration default = %q, want %q", got, "-(5 * time.Second)")
+	}
+}
+
+func TestCompileDefaultValueFalseLiteral(t *testing.T) {
+	if got := compileDefaultValue(&ast.Literal{Kind: token.False}, "bool", nil); got != "false" {
+		t.Fatalf("false default = %q, want false", got)
+	}
+}
+
+func TestCompileDurationLiteralExpression(t *testing.T) {
+	c := newCompiler(nil)
+	value := &ast.Literal{Kind: token.Duration, Value: "5s"}
+	if got := c.compileExpr(value); got != "5 * time.Second" {
+		t.Fatalf("duration expression = %q, want %q", got, "5 * time.Second")
+	}
+}
+
 func TestCompileAPIBody_NullableParamIsRequired(t *testing.T) {
 	api := &ast.ApiDecl{
 		Name: "update",
@@ -159,6 +230,27 @@ func TestCompileAPIBody_NullableParamIsRequired(t *testing.T) {
 	compileAPIBody(&b, api, nil, nil)
 	if out := b.String(); !strings.Contains(out, `req.ParamJSONNullable("note", &note)`) {
 		t.Fatalf("nullable parameter must remain required:\n%s", out)
+	}
+}
+
+func TestCompileAPIBodyNullableParamWithNonNullDefault(t *testing.T) {
+	api := &ast.ApiDecl{
+		Name: "lookup",
+		Params: []*ast.ParamDecl{{
+			Name:    "label",
+			Type:    &ast.TypeRef{Name: "String", Nullable: true},
+			Default: &ast.Literal{Kind: token.String, Value: "ready"},
+		}},
+		Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{}}},
+	}
+
+	var b strings.Builder
+	compileAPIBody(&b, api, nil, nil)
+	out := b.String()
+	if !strings.Contains(out, `_defaultLabel := "ready"`) ||
+		!strings.Contains(out, `var label *string = &_defaultLabel`) ||
+		!strings.Contains(out, `if err := req.ParamJSONOptionalNullable("label", &label); err != nil`) {
+		t.Fatalf("nullable non-null default must use a stable pointer:\n%s", out)
 	}
 }
 

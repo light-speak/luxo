@@ -120,6 +120,32 @@ api getUser(id: Int): User {
 
 `Result<T>` 是 Go-backed native 函数的 ABI。公开 API 声明的是响应 payload 类型（上例为 `User`）；传输错误使用统一的结构化错误 envelope。
 
+### 编译函数与 Native 边界
+
+普通函数会编译成模块内可直接调用的 Go 方法。它既能调用其他编译函数，也能通过 `@native` 进入 Go 实现；两条路径都不使用反射或运行时名称查找。
+
+```luxo
+fn normalizeScore(score: Int, ceiling: Int = 100): Int {
+  when(score) {
+    in 0..ceiling -> score
+    else -> ceiling
+  }
+}
+
+fn verifyRelease(projectId: Int): Result<Boolean> @native
+fn recordRelease(projectId: Int) @native
+
+api releaseReady(projectId: Int, score: Int): Boolean {
+  val normalized = normalizeScore(ceiling: 100, score: score)
+  recordRelease(projectId)             // Go error 自动传播
+  verifyRelease(projectId)? && normalized >= 80
+}
+```
+
+命名参数在编译期按声明匹配，默认值必须是类型匹配的编译期常量；未知参数、重复参数、缺少必填参数和类型不匹配都会在语义分析阶段阻止生成。
+有返回值的 native 函数使用 `Result<T>` 和显式 `?`；无返回值的 native 函数降级为 Go `error`，失败会自动传播。
+函数不定参数使用 `...values: T`，必须位于最后且不能声明默认值；普通编译函数与 `@native` 函数生成一致的 Go 可变参数 ABI。公开 API 必须使用 `[T]`，以保持 wire 上命名参数 ID 的唯一与稳定。
+
 ### 并发 — 没有 async/await 传染
 
 ```luxo
@@ -303,6 +329,45 @@ Luxo 的追踪是请求级、跨网关、服务、DataLoader 与数据库的执�
 `luxo.lock` v2 固定 model/type/event 字段 ID、API ID、参数 ID 及其 wire 类型。`luxo gen` 会在改写 lock 前拒绝破坏性变更；只有确定所有已部署生产者与消费者会同步重新生成时，才使用 `--allow-breaking`。
 
 这里的“兼容”指新服务端仍能接受旧客户端，因此兼容发布应先部署服务端，再发布重新生成的客户端。在这个方向上，新增 model/type 字段或可选 API 参数属于兼容变更。删除或修改字段/参数、增加必填参数、修改 API 返回类型、删除 API、修改事件 payload 都属于破坏性变更。已删除 ID 永久保留，不会复用。
+
+### Studio 注册传输安全
+
+配置 `LUXO_STUDIO_URL`、`LUXO_API_KEY` 和公开项目 UUID `LUXO_PROJECT_ID` 后，运行时向 Studio 注册并定期上报心跳。远端 URL 默认要求 HTTPS；`localhost` 和回环 IP 允许 HTTP，供本地开发使用。仅在明确可信的内网链路上，才设置 `LUXO_STUDIO_ALLOW_INSECURE_HTTP=true` 显式允许远端 HTTP；这不会为链路提供加密。URL 不允许内嵌凭据、查询参数或 fragment。
+
+注册、心跳、注销及指标/追踪上报都不跟随 HTTP 重定向，避免重放包含凭据的请求体。网关关闭时取消进行中的注册、心跳及依赖探测，等待注册任务退出后，再以独立的 2 秒超时尽力注销；这些操作不进入业务请求热路径。
+
+### 发布与稳定性规范
+
+SDK 版本固化前，Swift 跨仓库开发 CI 暂时跟随 `main`。这只能作为当前联调检查，不能作为可复现的发布兼容性证据；版本固化后再固定 SDK 提交并记录兼容矩阵。
+
+下一发布目标为 **`v1.0.0-beta.1`**，不是已经发布的稳定版。Luxo 遵循 [语义化版本规范](https://semver.org/lang/zh-CN/)：Git tag 使用 `v` 前缀，包版本采用各生态要求的格式。
+
+| 阶段 | 版本序列 | 范围 |
+| --- | --- | --- |
+| Beta | `v1.0.0-beta.1`、`v1.0.0-beta.2`…… | 建立兼容基线，修复正确性、安全和性能缺陷。 |
+| 发布候选 | `v1.0.0-rc.1`、`v1.0.0-rc.2`…… | 功能冻结，只修复阻碍发布的问题。 |
+| 正式版 | `v1.0.0` | 发布验证完成的公开契约。 |
+| 后续维护 | `v1.0.1` / `v1.1.0` / `v2.0.0` | 兼容修复 / 兼容新增 / 不兼容的公开契约变更。 |
+
+Beta 是预发布版，不代表生产稳定性承诺。从 beta.1 起默认保持兼容；确实无法避免的 beta 契约破坏必须经过明确评审，提供迁移说明，同步 SDK 和兼容测试，不能仅凭递增 beta 序号视为安全升级。已经发布的 tag 和产物不可覆盖。
+
+公开契约覆盖 DSL 语义、支持的 CLI/配置、生成代码与 native Go 接口、SDK 行为、显式字段选择、Schema/lock ID 和 wire 类型、JSON/Binary 与 RPC/stream 帧、错误、Studio 注册和遥测。内部实现及追踪耗时数值不属于稳定 API。产品版本、wire envelope 版本和 `luxo.lock` 版本相互独立；产品升级不应修改未变化的编码版本，也不允许复用已删除 ID。
+
+每次发布必须记录核心提交和验证过的 TypeScript、Dart、Kotlin、Swift SDK 版本/提交。门禁包括编译器与运行时测试、race 检查、lint 和可达路径覆盖率审查、相对上一基线的 benchmark 对比、跨 SDK 协议 fixtures、干净外部消费项目构建。保留基线 fixtures 和已生成的消费者；只把客户端重新生成后连接新服务端，不算向后兼容验证。首个正式版发布前，还必须让 Studio 脱离开发者 Go workspace 和未固定的同级源码，独立验证候选版。
+
+Studio 发布时必须将核心 Go module、CLI、前端 SDK 和 CI checkout 固定到记录的版本/提交，不跟随浮动 `main` 或 `latest`；本地源码替换仅用于开发。Studio 和独立发布的 SDK 保留各自版本号，以发布兼容矩阵建立支持关系，不要求版本数字相同。当前已实现数据库后端为 PostgreSQL，未来数据库后端和 Studio 新功能不纳入本次冻结。
+
+#### 性能阻断与已批准的功能成本
+
+性能审查区分请求热路径回退与必要的编译期功能成本。“每次编译首次使用时初始化”不等于“每次请求分配”，也不是整个进程只初始化一次。新增功能仍需测试和 benchmark，不因功能必要就自动获得豁免。
+
+默认 CI 规则不变：每个版本至少 10 次采样，显著耗时增长超过 5% 或显著分配增长进入二次采样，两组确认后阻断。5% 是自动检测阈值，不是允许人为消耗的性能预算；反射、请求热路径通用序列化和已确认的热路径缺陷仍须人工阻止。
+
+经明确评审的编译期分配成本记录在 [approved-costs.json](scripts/benchgate/approved-costs.json)。记录必须指定原因、精确基线 SHA、包、benchmark 和绝对 B/op、allocs/op 增量上限；仅 semantic/codegen 可配置，不允许通配符或耗时豁免。审批只能在两组采样一致、且两组的字节数与分配次数均未超预算时使用，CI 明确打印命中记录。超预算、其他 benchmark、运行时包和耗时回退仍按默认规则处理。基线 SHA 更新后记录自动失效，不能把同一个增量滚动累加到后续版本。
+
+本批批准的是 `AnalyzeDemoFile-2` 中 fn/native 严格参数校验的声明索引：相对记录的基线，每次编译最多增加 272 B 和 2 次分配。272 B 包含原 256 B 成本及维护者确认的 16 B 测量余量；两组本地实测增量分别为 258 B 和 253.5 B。索引按需创建并复用，不进入生成服务的请求热路径。新增审批或扩大预算必须重新获得维护者确认，不能由工具自动批准。
+
+CI 保留原始 benchmark 样本和 benchstat 对比结果 14 天，失败运行也保留。门禁日志输出精确的基线值、候选值和绝对增量，不再只显示舍入后的百分比。队列集成测试要求 JetStream 已启用并健康，而不只是 NATS 端口可连接。Lexer、Parser、Semantic 各执行 200 万次 Fuzz，使用 4 个 worker 和 180 秒硬超时；失败或超时仍然阻断 CI。Fuzz 日志、工具链信息及已保存的失败输入保留 14 天。
 
 
 ## AI 原生设计

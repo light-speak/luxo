@@ -609,6 +609,7 @@ func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
 		}
 	}
 	a.checkLoadArguments(e, argTypes)
+	a.checkDeclaredFunctionCall(e, argTypes)
 
 	// 1.3: check create required fields (function-style and chain-style)
 	if ident, ok := e.Func.(*ast.Ident); ok && ident.Name == "create" {
@@ -619,6 +620,149 @@ func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
 	}
 
 	return a.inferCallReturnType(e)
+}
+
+func (a *Analyzer) checkDeclaredFunctionCall(call *ast.CallExpr, argTypes []*ResolvedType) {
+	ident, ok := call.Func.(*ast.Ident)
+	if !ok {
+		return
+	}
+	if a.functions == nil {
+		symbol := a.scope.LookupLocal(ident.Name)
+		if symbol == nil || symbol.Kind != SymFn {
+			return
+		}
+		a.indexFunctionDeclarations()
+	}
+	fn := a.functions[ident.Name]
+	if fn == nil {
+		return
+	}
+	if hasNamedDirective(fn.Directives, "service") {
+		a.addError(call.Pos, "@service fn '%s' cannot be called as a local function / @service fn '%s' 不能作为本地函数调用", fn.Name, fn.Name)
+		return
+	}
+	positions := functionParameterPositions(fn.Params)
+	var localAssigned [16]bool
+	assigned := localAssigned[:]
+	if len(fn.Params) > len(localAssigned) {
+		assigned = make([]bool, len(fn.Params))
+	}
+	assigned = assigned[:len(fn.Params)]
+	variadic := functionVariadicParameter(fn.Params)
+	nextPosition, namedSeen := 0, false
+	for index, argument := range call.Args {
+		position, repeated, valid := a.resolveFunctionArgumentPosition(fn.Name, len(call.Args), argument, positions, assigned, variadic, &nextPosition, &namedSeen)
+		if !valid {
+			continue
+		}
+		if !repeated {
+			assigned[position] = true
+		}
+		a.checkFunctionArgumentType(argument, argTypes[index], fn.Params[position])
+	}
+	a.checkMissingFunctionArguments(call, fn, assigned)
+}
+
+func functionParameterPositions(params []*ast.ParamDecl) map[string]int {
+	positions := make(map[string]int, len(params))
+	for index, param := range params {
+		positions[param.Name] = index
+	}
+	return positions
+}
+
+// Build the secondary index only when a declared function is actually called.
+func (a *Analyzer) indexFunctionDeclarations() {
+	for _, file := range a.files {
+		for _, fn := range file.Functions {
+			symbol := a.scope.LookupLocal(fn.Name)
+			if symbol == nil || symbol.Kind != SymFn {
+				continue
+			}
+			if a.functions == nil {
+				a.functions = make(map[string]*ast.FnDecl, len(file.Functions))
+			}
+			if _, exists := a.functions[fn.Name]; !exists {
+				a.functions[fn.Name] = fn
+			}
+		}
+	}
+}
+
+func functionVariadicParameter(params []*ast.ParamDecl) int {
+	for index, param := range params {
+		if param.Spread {
+			return index
+		}
+	}
+	return -1
+}
+
+func (a *Analyzer) resolveFunctionArgumentPosition(functionName string, argumentCount int, argument *ast.NamedArg, positions map[string]int, assigned []bool, variadic int, nextPosition *int, namedSeen *bool) (int, bool, bool) {
+	if argument.Name != "" {
+		*namedSeen = true
+		position, exists := positions[argument.Name]
+		if !exists {
+			a.addError(argument.Value.GetPos(), "unknown argument '%s' in call to '%s' / 调用 '%s' 时存在未知参数 '%s'", argument.Name, functionName, functionName, argument.Name)
+			return 0, false, false
+		}
+		position, valid := a.rejectDuplicateFunctionArgument(argument, position, assigned)
+		return position, false, valid
+	}
+	if *namedSeen {
+		a.addError(argument.Value.GetPos(), "positional argument cannot follow named arguments in call to '%s' / 调用 '%s' 时位置参数不能出现在命名参数之后", functionName, functionName)
+		return 0, false, false
+	}
+	if *nextPosition >= len(assigned) {
+		a.addError(argument.Value.GetPos(), "%s expects at most %d argument(s), got %d / %s 最多接受 %d 个参数，实际得到 %d 个", functionName, len(assigned), argumentCount, functionName, len(assigned), argumentCount)
+		return 0, false, false
+	}
+	position := *nextPosition
+	if position == variadic {
+		return position, true, true
+	}
+	*nextPosition++
+	position, valid := a.rejectDuplicateFunctionArgument(argument, position, assigned)
+	return position, false, valid
+}
+
+func (a *Analyzer) rejectDuplicateFunctionArgument(argument *ast.NamedArg, position int, assigned []bool) (int, bool) {
+	if assigned[position] {
+		a.addError(argument.Value.GetPos(), "duplicate argument '%s' / 参数 '%s' 重复", argument.Name, argument.Name)
+		return 0, false
+	}
+	return position, true
+}
+
+func (a *Analyzer) checkFunctionArgumentType(argument *ast.NamedArg, actual *ResolvedType, param *ast.ParamDecl) {
+	if ref := param.Type; ref != nil && len(ref.Tuple) == 0 && len(ref.TypeArgs) == 0 {
+		if base := a.types[ref.Name]; base != nil {
+			// Assignment checks only read the type; keep qualifiers on the stack.
+			expected := *base
+			expected.Nullable, expected.IsList = ref.Nullable, ref.IsList
+			a.checkResolvedFunctionArgumentType(argument, actual, &expected, param.Name)
+			return
+		}
+	}
+	expected := a.resolveTypeRef(param.Type, param.Pos)
+	a.checkResolvedFunctionArgumentType(argument, actual, expected, param.Name)
+}
+
+func (a *Analyzer) checkResolvedFunctionArgumentType(argument *ast.NamedArg, actual, expected *ResolvedType, name string) {
+	if actual == nil || expected == nil || isTypeAssignable(expected, actual) {
+		return
+	}
+	a.addError(argument.Value.GetPos(), "argument '%s' expects '%s', got '%s' / 参数 '%s' 需要 '%s'，实际得到 '%s'", name, formatResolvedType(expected), formatResolvedType(actual), name, formatResolvedType(expected), formatResolvedType(actual))
+}
+
+func (a *Analyzer) checkMissingFunctionArguments(call *ast.CallExpr, fn *ast.FnDecl, assigned []bool) {
+	for index, param := range fn.Params {
+		if assigned[index] || param.Default != nil || param.Spread {
+			continue
+		}
+		a.addError(call.Pos, "missing required argument '%s' in call to '%s' / 调用 '%s' 时缺少必填参数 '%s'", param.Name, fn.Name, fn.Name, param.Name)
+	}
 }
 
 // checkTransactionCall handles transaction { ... } which is parsed as

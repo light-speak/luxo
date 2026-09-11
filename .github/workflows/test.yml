@@ -35,11 +35,6 @@ jobs:
           --health-timeout=3s
           --health-retries=5
 
-      nats:
-        image: nats:2-alpine
-        ports:
-          - 4222:4222
-
     env:
       DATABASE_HOST: localhost
       DATABASE_PORT: 5432
@@ -48,6 +43,7 @@ jobs:
       DATABASE_PREFIX: luxo_test
       DATABASE_SSL: disable
       LUXO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
+      NATS_URL: nats://127.0.0.1:4222
 
     steps:
       - uses: actions/checkout@v7
@@ -57,6 +53,20 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+
+      - name: Start NATS with JetStream and verify readiness
+        run: |
+          set -euo pipefail
+          docker run --detach --name luxo-ci-nats \
+            --publish 127.0.0.1:4222:4222 \
+            --publish 127.0.0.1:8222:8222 \
+            nats:2-alpine -js -m 8222
+          curl --fail --silent --show-error --retry 20 --retry-all-errors \
+            --retry-delay 1 --connect-timeout 2 --max-time 5 \
+            http://127.0.0.1:8222/healthz
+          curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+            http://127.0.0.1:8222/jsz | jq --exit-status \
+            '.disabled != true and .config.max_memory > 0 and .config.max_storage > 0'
 
       - name: Run tests with coverage
         run: |
@@ -82,6 +92,12 @@ jobs:
           files: coverage.out
           use_oidc: true
           fail_ci_if_error: true
+
+      - name: Stop NATS test container
+        if: always()
+        run: |
+          docker logs luxo-ci-nats || true
+          docker rm --force luxo-ci-nats || true
 
   lint:
     runs-on: ubuntu-latest
@@ -323,12 +339,29 @@ jobs:
 
       - name: Enforce performance baseline
         if: steps.benchmark_scope.outputs.run == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
+          set -euo pipefail
           if [[ -s .tmp/benchstat-confirmation.csv ]]; then
-            GOWORK=off go run ./scripts/benchgate .tmp/benchstat-primary.csv .tmp/benchstat-confirmation.csv
+            GOWORK=off go run ./scripts/benchgate --approved-costs scripts/benchgate/approved-costs.json --base-sha "${BASE_SHA}" .tmp/benchstat-primary.csv .tmp/benchstat-confirmation.csv
           else
-            GOWORK=off go run ./scripts/benchgate .tmp/benchstat-primary.csv
+            GOWORK=off go run ./scripts/benchgate --approved-costs scripts/benchgate/approved-costs.json --base-sha "${BASE_SHA}" .tmp/benchstat-primary.csv
           fi
+
+      - name: Preserve performance evidence
+        if: always() && steps.benchmark_scope.outputs.run == 'true'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: performance-evidence-${{ github.run_attempt }}
+          retention-days: 14
+          include-hidden-files: true
+          path: |
+            .tmp/benchmark-*.txt
+            .tmp/benchstat-*.csv
+            .tmp/benchstat-*-warnings.txt
+            .tmp/*benchmark-packages.txt
+            .tmp/changed-files.txt
 
   external-go-consumer:
     runs-on: ubuntu-latest
@@ -356,6 +389,7 @@ jobs:
 
   fuzz:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
@@ -365,14 +399,39 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Prepare fuzz diagnostics
+        run: |
+          mkdir -p .tmp/fuzz
+          go version | tee .tmp/fuzz/toolchain.txt
+          go env GOOS GOARCH >> .tmp/fuzz/toolchain.txt
+
       - name: Fuzz Lexer
-        run: go test ./pkg/lexer/ -fuzz=FuzzLexer -fuzztime=30s -timeout=120s
+        run: |
+          set -euo pipefail
+          go test ./pkg/lexer/ -run='^$' -fuzz='^FuzzLexer$' -fuzztime=2000000x -parallel=4 -timeout=180s 2>&1 | tee .tmp/fuzz/lexer.log
 
       - name: Fuzz Parser
-        run: go test ./pkg/parser/ -fuzz=FuzzParser -fuzztime=30s -timeout=120s
+        run: |
+          set -euo pipefail
+          go test ./pkg/parser/ -run='^$' -fuzz='^FuzzParser$' -fuzztime=2000000x -parallel=4 -timeout=180s 2>&1 | tee .tmp/fuzz/parser.log
 
       - name: Fuzz Semantic
-        run: go test ./pkg/semantic/ -fuzz=FuzzAnalyzer -fuzztime=30s -timeout=120s
+        run: |
+          set -euo pipefail
+          go test ./pkg/semantic/ -run='^$' -fuzz='^FuzzAnalyzer$' -fuzztime=2000000x -parallel=4 -timeout=180s 2>&1 | tee .tmp/fuzz/semantic.log
+
+      - name: Preserve fuzz diagnostics and failing inputs
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: fuzz-evidence-${{ github.run_attempt }}
+          retention-days: 14
+          include-hidden-files: true
+          path: |
+            .tmp/fuzz/
+            pkg/lexer/testdata/fuzz/
+            pkg/parser/testdata/fuzz/
+            pkg/semantic/testdata/fuzz/
 
   sdk-ts:
     runs-on: ubuntu-latest

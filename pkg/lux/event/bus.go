@@ -1,12 +1,12 @@
 // Package event provides a typed event system for the Luxo runtime.
-// Embedded mode uses Go channels, multi-service mode uses NATS.
+// An unset NATS_URL uses Go channels; configured NATS enables cross-process delivery.
 package event
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
+	"strings"
 
 	"github.com/light-speak/luxo/pkg/lux/env"
 )
@@ -38,20 +38,22 @@ type Bus interface {
 // Handler processes an event payload and returns an error if processing fails.
 // For ChanBus, payload is the original struct (zero-copy).
 // For NATSBus, payload is []byte containing the published wire representation.
-// Returning an error signals a delivery failure — the bus may retry or dead-letter.
+// Current backends log handler failures without retry or dead-letter delivery.
 type Handler func(ctx context.Context, payload any) error
 
 // NewFromEnv creates a Bus based on environment configuration.
-// If NATS_URL is set, connects to NATS (falls back to ChanBus on failure).
-// Otherwise uses ChanBus with default buffer size 256.
-func NewFromEnv() Bus {
+// An explicitly configured NATS backend must initialize successfully.
+// Only an unset NATS_URL selects the in-process ChanBus.
+func NewFromEnv() (Bus, error) {
 	if natsURL, ok := env.Get("NATS_URL"); ok {
+		if strings.TrimSpace(natsURL) == "" {
+			return nil, errors.New("event: NATS_URL is set but empty")
+		}
 		bus, err := NewNATSBus(natsURL)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: NATS connect failed, using channel bus: %v\n", err)
-			return NewChanBus(256)
+			return nil, fmt.Errorf("event: initialize NATS: %w", err)
 		}
-		return bus
+		return bus, nil
 	}
-	return NewChanBus(256)
+	return NewChanBus(256), nil
 }

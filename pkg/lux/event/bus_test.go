@@ -7,8 +7,12 @@ import (
 
 func TestNewFromEnvChanBus(t *testing.T) {
 	// No NATS_URL → ChanBus
+	t.Setenv("NATS_URL", "")
 	os.Unsetenv("NATS_URL")
-	bus := NewFromEnv()
+	bus, err := NewFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer bus.Close()
 
 	if _, ok := bus.(*ChanBus); !ok {
@@ -17,32 +21,31 @@ func TestNewFromEnvChanBus(t *testing.T) {
 }
 
 func TestNewFromEnvNATSBus(t *testing.T) {
-	// With NATS_URL → NATSBus (if NATS is running)
+	// Explicit integration configuration must connect successfully.
 	natsURL := os.Getenv("NATS_URL")
 	if natsURL == "" {
-		natsURL = "nats://localhost:4222"
+		t.Skip("set NATS_URL to run the NATS factory integration test")
 	}
 	t.Setenv("NATS_URL", natsURL)
 
-	bus := NewFromEnv()
+	bus, err := NewFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer bus.Close()
-
 	if _, ok := bus.(*NATSBus); !ok {
-		// NATS not available, should fallback to ChanBus
-		if _, ok := bus.(*ChanBus); !ok {
-			t.Errorf("expected NATSBus or ChanBus fallback, got %T", bus)
-		}
+		t.Errorf("expected NATSBus, got %T", bus)
 	}
 }
 
-func TestNewFromEnvNATSFallback(t *testing.T) {
-	// Bad NATS_URL → should fallback to ChanBus
-	t.Setenv("NATS_URL", "nats://192.0.2.1:1")
-
-	bus := NewFromEnv()
-	defer bus.Close()
-
-	if _, ok := bus.(*ChanBus); !ok {
-		t.Errorf("expected ChanBus fallback on bad NATS, got %T", bus)
+func TestNewFromEnvNATSFailure(t *testing.T) {
+	for _, address := range []string{"nats://127.0.0.1:1", "", "   "} {
+		t.Run(address, func(t *testing.T) {
+			t.Setenv("NATS_URL", address)
+			bus, err := NewFromEnv()
+			if err == nil || bus != nil {
+				t.Fatalf("configured NATS failure must propagate: bus=%T err=%v", bus, err)
+			}
+		})
 	}
 }

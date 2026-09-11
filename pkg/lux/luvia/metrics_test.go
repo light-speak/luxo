@@ -69,7 +69,7 @@ func TestMetricsCollectorFlushTraces(t *testing.T) {
 	mc := &MetricsCollector{
 		studioURL:       srv.URL,
 		apiKey:          "secret",
-		projectID:       7,
+		projectID:       testStudioProjectID,
 		instanceID:      "gateway-1",
 		traceSampleRate: 1,
 		client:          srv.Client(),
@@ -290,7 +290,8 @@ func TestNewMetricsCollectorCreated(t *testing.T) {
 
 	os.Setenv("LUXO_STUDIO_URL", srv.URL)
 	os.Setenv("LUXO_API_KEY", "test-key")
-	os.Setenv("LUXO_PROJECT_ID", "42")
+	t.Setenv("LUXO_PROJECT_ID", testStudioProjectID)
+	t.Setenv("LUXO_PROJECT_ID", testStudioProjectID)
 	defer os.Unsetenv("LUXO_STUDIO_URL")
 	defer os.Unsetenv("LUXO_API_KEY")
 	defer os.Unsetenv("LUXO_PROJECT_ID")
@@ -301,8 +302,8 @@ func TestNewMetricsCollectorCreated(t *testing.T) {
 	}
 	defer mc.Close()
 
-	if mc.projectID != 42 {
-		t.Errorf("projectID = %d, want 42", mc.projectID)
+	if mc.projectID != testStudioProjectID {
+		t.Errorf("projectID = %s, want UUID", mc.projectID)
 	}
 }
 

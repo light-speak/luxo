@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "approvals": [
+    {
+      "id": "beta-fn-declaration-index",
+      "baseSHA": "dbd269d586a71739b69dd6acb1a26b85f50483d0",
+      "package": "github.com/light-speak/luxo/pkg/semantic",
+      "benchmark": "AnalyzeDemoFile-2",
+      "maxBytes": 272,
+      "maxAllocs": 2,
+      "reason": "用户确认接受严格 fn/native 参数校验的编译期声明索引成本；在原 256 B 成本上增加 16 B 测量余量，总上限 272 B，仍最多增加 2 次分配。两组本地实测增量为 258 B 和 253.5 B；每次编译首次调用时建立，不进入请求热路径。 User-approved declaration-index cost for strict fn/native argument checks: a 272 B ceiling includes 16 B measurement headroom above the original 256 B cost, retaining the +2 allocation limit. Two local groups measured +258 B and +253.5 B; initialization occurs on first use per compilation, never on the request hot path."
+    }
+  ]
+}

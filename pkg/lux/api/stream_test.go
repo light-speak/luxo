@@ -433,7 +433,21 @@ func TestWritePumpsStopOnContextDone(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
-			test.run(ctx, &StreamSub{Ch: make(chan []byte)})
+			sub := &StreamSub{Ch: make(chan []byte)}
+			// Release a regressed pump too, so a failed assertion cannot leak it.
+			defer close(sub.Ch)
+			done := make(chan struct{})
+			go func() {
+				test.run(ctx, sub)
+				close(done)
+			}()
+			timer := time.NewTimer(time.Second)
+			defer timer.Stop()
+			select {
+			case <-done:
+			case <-timer.C:
+				t.Fatal("write pump did not stop after context cancellation")
+			}
 		})
 	}
 }

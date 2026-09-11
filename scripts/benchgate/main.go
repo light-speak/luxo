@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -21,6 +22,7 @@ type evaluation struct {
 	TimeComparisons       int
 	AllocationComparisons int
 	Comparisons           map[comparisonKey]struct{}
+	Measurements          map[comparisonKey]measurement
 	Regressions           []regression
 	Unconfirmed           []regression
 }
@@ -33,8 +35,12 @@ type comparisonKey struct {
 
 type regression struct {
 	Key         comparisonKey
-	Delta       string
 	Description string
+}
+
+type measurement struct {
+	Base float64
+	Head float64
 }
 
 type comparisonEvaluator struct {
@@ -56,24 +62,28 @@ func command(args []string, output, errorOutput io.Writer) int {
 }
 
 func run(args []string, output io.Writer) error {
-	if len(args) > 0 && args[0] == confirmationFlag {
-		if len(args) != 2 {
+	options, paths, err := parseGateOptions(args)
+	if err != nil {
+		return err
+	}
+	if options.confirmation {
+		if len(paths) != 1 {
 			return usageError()
 		}
-		return reportConfirmationRequirement(args[1], output)
+		return reportConfirmationRequirement(paths[0], output)
 	}
-	switch len(args) {
+	switch len(paths) {
 	case 1:
-		return evaluatePrimary(args[0], output)
+		return evaluatePrimary(paths[0], output)
 	case 2:
-		return evaluateConfirmation(args[0], args[1], output)
+		return evaluateConfirmation(paths[0], paths[1], output, options.costs)
 	default:
 		return usageError()
 	}
 }
 
 func usageError() error {
-	return errors.New("usage: benchgate [--requires-confirmation] <primary.csv> [confirmation.csv]")
+	return errors.New("usage: benchgate [--requires-confirmation] [--approved-costs policy.json --base-sha SHA] <primary.csv> [confirmation.csv]")
 }
 
 func reportConfirmationRequirement(path string, output io.Writer) error {
@@ -100,7 +110,7 @@ func evaluatePrimary(path string, output io.Writer) error {
 	return nil
 }
 
-func evaluateConfirmation(primaryPath, confirmationPath string, output io.Writer) error {
+func evaluateConfirmation(primaryPath, confirmationPath string, output io.Writer, costs map[costKey]approvedCost) error {
 	primary, err := evaluateFile(primaryPath)
 	if err != nil {
 		return err
@@ -111,6 +121,9 @@ func evaluateConfirmation(primaryPath, confirmationPath string, output io.Writer
 	}
 	result, err := confirmEvaluations(primary, confirmation)
 	if err != nil {
+		return err
+	}
+	if err := applyApprovedCosts(&result, primary, confirmation, costs, output); err != nil {
 		return err
 	}
 	for _, unconfirmed := range result.Unconfirmed {
@@ -138,7 +151,10 @@ func evaluateFile(path string) (evaluation, error) {
 func evaluate(input io.Reader) (evaluation, error) {
 	reader := csv.NewReader(input)
 	reader.FieldsPerRecord = -1
-	evaluator := comparisonEvaluator{result: evaluation{Comparisons: make(map[comparisonKey]struct{})}}
+	evaluator := comparisonEvaluator{result: evaluation{
+		Comparisons:  make(map[comparisonKey]struct{}),
+		Measurements: make(map[comparisonKey]measurement),
+	}}
 	for {
 		row, err := reader.Read()
 		if errors.Is(err, io.EOF) {
@@ -187,14 +203,21 @@ func (evaluator *comparisonEvaluator) consume(row []string) error {
 	}
 	evaluator.countComparison()
 	key := comparisonKey{Package: evaluator.packageName, Benchmark: row[0], Unit: evaluator.unit}
+	if _, exists := evaluator.result.Comparisons[key]; exists {
+		return fmt.Errorf("duplicate benchmark comparison: %v", key)
+	}
+	values, err := parseMeasurement(row[1], row[3])
+	if err != nil {
+		return fmt.Errorf("%s/%s: %w", evaluator.packageName, row[0], err)
+	}
 	evaluator.result.Comparisons[key] = struct{}{}
+	evaluator.result.Measurements[key] = values
 	if significant && change > threshold {
 		evaluator.result.Regressions = append(
 			evaluator.result.Regressions,
 			regression{
 				Key:         key,
-				Delta:       row[5],
-				Description: fmt.Sprintf("%s/%s %s %s", evaluator.packageName, row[0], evaluator.unit, row[5]),
+				Description: fmt.Sprintf("%s/%s %s %s (base=%g head=%g delta=%+g)", evaluator.packageName, row[0], evaluator.unit, row[5], values.Base, values.Head, values.Head-values.Base),
 			},
 		)
 	}
@@ -215,7 +238,7 @@ func confirmEvaluations(primary, confirmation evaluation) (evaluation, error) {
 	for key, first := range primaryByKey {
 		second, confirmed := confirmationByKey[key]
 		if confirmed {
-			first.Description += "; confirmation " + second.Delta
+			first.Description += "; confirmation " + second.Description
 			result.Regressions = append(result.Regressions, first)
 			continue
 		}
@@ -310,8 +333,24 @@ func parseDelta(value string) (float64, bool, error) {
 		return 0, false, fmt.Errorf("invalid delta %q", value)
 	}
 	change, err := strconv.ParseFloat(strings.TrimSuffix(value, "%"), 64)
-	if err != nil {
+	if err != nil || math.IsNaN(change) || math.IsInf(change, 0) {
 		return 0, false, fmt.Errorf("invalid delta %q", value)
 	}
 	return change, true, nil
+}
+
+func parseMeasurement(base, head string) (measurement, error) {
+	var result measurement
+	for index, value := range []string{base, head} {
+		parsed, err := strconv.ParseFloat(value, 64)
+		if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed < 0 {
+			return measurement{}, fmt.Errorf("invalid benchmark measurement %q", value)
+		}
+		if index == 0 {
+			result.Base = parsed
+		} else {
+			result.Head = parsed
+		}
+	}
+	return result, nil
 }

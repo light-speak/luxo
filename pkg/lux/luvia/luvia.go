@@ -86,6 +86,14 @@ func (g *Gateway) Serve(version string) error {
 	if err := validateJWTConfig(); err != nil {
 		return err
 	}
+	if os.Getenv("LUXO_STUDIO_URL") != "" && os.Getenv("LUXO_API_KEY") != "" {
+		if _, err := studioURLFromEnv(); err != nil {
+			return err
+		}
+		if _, err := studioProjectIDFromEnv(); err != nil {
+			return err
+		}
+	}
 	mux, port := g.buildMux(version)
 	addr := ":" + port
 
