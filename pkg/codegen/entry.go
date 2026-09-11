@@ -8,7 +8,7 @@ import (
 	"github.com/light-speak/luxo/pkg/semantic"
 )
 
-// GenerateEntryFile produces luxis/app/main.gen.go — the embedded entry point
+// GenerateEntryFile produces lucis/app/main.gen.go — the embedded entry point
 // that imports all modules, registers handlers, and starts the Luvia gateway.
 type moduleInfo struct {
 	name          string
@@ -461,7 +461,7 @@ func writeQueueWiring(b *strings.Builder, modules []moduleInfo) {
 }
 
 // GenerateModuleEntryFiles produces per-module entry points for cluster mode.
-// Each module gets its own main.gen.go under luxis/<module>/.
+// Each module gets its own main.gen.go under lucis/<module>/.
 // Returns map[moduleName][]byte.
 func GenerateModuleEntryFiles(result *semantic.Result, modulePath string) map[string][]byte {
 	allModules := collectModules(result)
@@ -638,7 +638,7 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 	return formatGenerated([]byte(b.String()))
 }
 
-// GenerateGatewayEntry produces luxis/gateway/main.gen.go — a pure routing gateway.
+// GenerateGatewayEntry produces lucis/gateway/main.gen.go — a pure routing gateway.
 // Routes API requests to the correct backend service via Luxo RPC.
 // Owns the full schema for Binary↔JSON conversion. No handler code.
 func GenerateGatewayEntry(result *semantic.Result, modulePath string) []byte {

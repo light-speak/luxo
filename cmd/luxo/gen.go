@@ -79,19 +79,19 @@ func runGen(cmd *cobra.Command, args []string) error {
 	// Generate entry points
 	modulePath, _ := readModulePath()
 	if modulePath != "" {
-		// Embedded entry: luxis/app/main.gen.go (all modules, single process)
+		// Embedded entry: lucis/app/main.gen.go (all modules, single process)
 		if err := generateEntry(result, modulePath); err != nil {
 			return err
 		}
 		totalFiles++
 
-		// Per-module entries: luxis/<module>/main.gen.go (cluster mode, one binary per module)
+		// Per-module entries: lucis/<module>/main.gen.go (cluster mode, one binary per module)
 		moduleEntries, err := codegen.GenerateModuleEntryFilesChecked(result, modulePath)
 		if err != nil {
 			return err
 		}
 		for modName, src := range moduleEntries {
-			outDir := filepath.Join("luxis", modName)
+			outDir := filepath.Join("lucis", modName)
 			if err := os.MkdirAll(outDir, 0755); err != nil {
 				return fmt.Errorf("create %s: %w", outDir, err)
 			}
@@ -105,13 +105,13 @@ func runGen(cmd *cobra.Command, args []string) error {
 			totalFiles++
 		}
 
-		// Gateway entry: luxis/gateway/main.gen.go (pure router, no handler code)
+		// Gateway entry: lucis/gateway/main.gen.go (pure router, no handler code)
 		gwSrc, err := codegen.GenerateGatewayEntryChecked(result, modulePath)
 		if err != nil {
 			return err
 		}
 		if gwSrc != nil {
-			outDir := filepath.Join("luxis", "gateway")
+			outDir := filepath.Join("lucis", "gateway")
 			if err := os.MkdirAll(outDir, 0755); err != nil {
 				return fmt.Errorf("create %s: %w", outDir, err)
 			}
@@ -529,7 +529,7 @@ func generateEntry(result *semantic.Result, modulePath string) error {
 	if src == nil {
 		return nil
 	}
-	outDir := filepath.Join("luxis", "app")
+	outDir := filepath.Join("lucis", "app")
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		return fmt.Errorf("create %s: %w", outDir, err)
 	}
