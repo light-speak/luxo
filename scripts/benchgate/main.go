@@ -35,7 +35,6 @@ type comparisonKey struct {
 
 type regression struct {
 	Key         comparisonKey
-	Delta       string
 	Description string
 }
 
@@ -218,8 +217,7 @@ func (evaluator *comparisonEvaluator) consume(row []string) error {
 			evaluator.result.Regressions,
 			regression{
 				Key:         key,
-				Delta:       row[5],
-				Description: fmt.Sprintf("%s/%s %s %s", evaluator.packageName, row[0], evaluator.unit, row[5]),
+				Description: fmt.Sprintf("%s/%s %s %s (base=%g head=%g delta=%+g)", evaluator.packageName, row[0], evaluator.unit, row[5], values.Base, values.Head, values.Head-values.Base),
 			},
 		)
 	}
@@ -240,7 +238,7 @@ func confirmEvaluations(primary, confirmation evaluation) (evaluation, error) {
 	for key, first := range primaryByKey {
 		second, confirmed := confirmationByKey[key]
 		if confirmed {
-			first.Description += "; confirmation " + second.Delta
+			first.Description += "; confirmation " + second.Description
 			result.Regressions = append(result.Regressions, first)
 			continue
 		}

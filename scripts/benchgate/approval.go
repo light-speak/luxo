@@ -140,6 +140,7 @@ func applyApprovedCosts(result *evaluation, primary, confirmation evaluation, co
 			return err
 		}
 		if !accepted {
+			item.Description += fmt.Sprintf("; approved limits: +%d B/op, +%d allocs/op (%s)", cost.MaxBytes, cost.MaxAllocs, cost.ID)
 			remaining = append(remaining, item)
 			continue
 		}

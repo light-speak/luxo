@@ -82,6 +82,64 @@ func TestMeasurementsRejectInvalidValuesAndDuplicates(t *testing.T) {
 
 const approvedBase = "dbd269d586a71739b69dd6acb1a26b85f50483d0"
 
+func TestRepositoryApprovedCostBudget(t *testing.T) {
+	costs, err := loadApprovedCosts("approved-costs.json", approvedBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cost := costs[costKey{"github.com/light-speak/luxo/pkg/semantic", "AnalyzeDemoFile-2"}]
+	if len(costs) != 1 || cost.MaxBytes != 272 || cost.MaxAllocs != 2 {
+		t.Fatalf("unexpected reviewed repository budget: %+v", costs)
+	}
+	for _, test := range []struct {
+		name         string
+		primaryBytes float64
+		confirmBytes float64
+		allocations  float64
+		timeDelta    string
+		base         string
+		pass         bool
+	}{
+		{"measured groups", 258, 253.5, 2, "~", approvedBase, true},
+		{"exact ceiling", 272, 272, 2, "~", approvedBase, true},
+		{"fraction over ceiling", 272.5, 272.5, 2, "~", approvedBase, false},
+		{"primary over ceiling", 273, 258, 2, "~", approvedBase, false},
+		{"confirmation over ceiling", 258, 273, 2, "~", approvedBase, false},
+		{"extra allocation", 258, 258, 3, "~", approvedBase, false},
+		{"time regression", 258, 258, 2, "+6%", approvedBase, false},
+		{"expired baseline", 258, 258, 2, "~", strings.Repeat("a", 40), false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			primary := writeRunInput(t, compilerCostCSV(test.timeDelta, test.primaryBytes, test.allocations))
+			confirmation := writeRunInput(t, compilerCostCSV(test.timeDelta, test.confirmBytes, test.allocations))
+			err := run([]string{"--approved-costs", "approved-costs.json", "--base-sha", test.base, primary, confirmation}, io.Discard)
+			if (err == nil) != test.pass {
+				t.Fatalf("gate error = %v, want pass=%t", err, test.pass)
+			}
+		})
+	}
+}
+
+func TestRejectedCostReportsExactMeasurements(t *testing.T) {
+	policy := writeRunInput(t, approvedPolicy)
+	primary := writeRunInput(t, compilerCostCSV("~", 257.5, 2))
+	confirmation := writeRunInput(t, compilerCostCSV("~", 258, 2))
+	var output strings.Builder
+	err := run([]string{"--approved-costs", policy, "--base-sha", approvedBase, primary, confirmation}, &output)
+	if err == nil {
+		t.Fatal("over-budget measurements must not be rounded into approval")
+	}
+	for _, want := range []string{
+		"base=446000 head=446257.5 delta=+257.5",
+		"base=446000 head=446258 delta=+258",
+		"approved limits: +256 B/op, +2 allocs/op",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Errorf("missing %q in diagnostics: %s", want, output.String())
+		}
+	}
+}
+
 const approvedPolicy = `{"version":1,"approvals":[{
 	"id":"fn-declaration-index",
 	"baseSHA":"` + approvedBase + `",
