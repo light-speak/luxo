@@ -71,3 +71,16 @@ func BenchmarkGenerateModelFile(b *testing.B) {
 		generateModelFile(result, "gen", nil)
 	}
 }
+
+// Exercise actual handler imports; the model-only fixture emits no handlers.
+func BenchmarkGenerateHandlerFile(b *testing.B) {
+	result := buildBenchResult()
+	for _, model := range result.Files[0].Models {
+		model.Directives = []*ast.Directive{{Name: "crud"}}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		generateHandlerFile(result, "gen", nil)
+	}
+}

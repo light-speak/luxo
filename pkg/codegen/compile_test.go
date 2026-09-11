@@ -3361,8 +3361,11 @@ func TestCompileAwaitDestructuringBindsParallelResults(t *testing.T) {
 	for _, want := range []string{
 		"var user *User",
 		"var posts []*Post",
-		"user, err = app.User.Where(UserWhere.Id.Eq(id)).First(gctx)",
-		"posts, err = app.Post.Where().All(gctx)",
+		"ctx := gctx",
+		"_awaitValue, err := app.User.Where(UserWhere.Id.Eq(id)).First(ctx)",
+		"user = _awaitValue",
+		"_awaitValue, err := app.Post.Where().All(ctx)",
+		"posts = _awaitValue",
 		"if err := g.Wait(); err != nil",
 	} {
 		if !strings.Contains(out, want) {
@@ -3386,7 +3389,7 @@ func TestCompileAwaitSingleExpressionBinding(t *testing.T) {
 		}}},
 	})
 	out := compilerOut(c)
-	if !strings.Contains(out, "var user *User") || !strings.Contains(out, "user, err = app.User.Where(UserWhere.Id.Eq(id)).First(gctx)") {
+	if !strings.Contains(out, "var user *User") || !strings.Contains(out, "ctx := gctx") || !strings.Contains(out, "_awaitValue, err := app.User.Where(UserWhere.Id.Eq(id)).First(ctx)") || !strings.Contains(out, "user = _awaitValue") {
 		t.Fatalf("single-expression await binding was not compiled:\n%s", out)
 	}
 }
@@ -3470,7 +3473,7 @@ func TestCompileAwaitAggregateUsesGroupContext(t *testing.T) {
 		}}},
 	})
 	out := compilerOut(c)
-	if !strings.Contains(out, `.Sum(gctx, "story_points")`) {
+	if !strings.Contains(out, "ctx := gctx") || !strings.Contains(out, `.Sum(ctx, "story_points")`) {
 		t.Fatalf("await aggregate did not use group context:\n%s", out)
 	}
 }
@@ -3598,7 +3601,7 @@ func TestCompileAwaitAggregateFusionFallsBackSafely(t *testing.T) {
 			}
 			c.compileStmt(&ast.ValStmt{Names: []string{"left", "right"}, Value: &ast.AwaitExpr{Body: &ast.Block{Stmts: stmts}}})
 			out := compilerOut(c)
-			if strings.Contains(out, ".AggregateBatch(") || strings.Count(out, ".Count(gctx)") != 2 {
+			if strings.Contains(out, ".AggregateBatch(") || strings.Count(out, "ctx := gctx") != 2 || strings.Count(out, ".Count(ctx)") != 2 {
 				t.Fatalf("unsafe aggregates must retain independent execution:\n%s", out)
 			}
 		})
@@ -4956,6 +4959,7 @@ func TestCompileWhenWithModelQuery(t *testing.T) {
 		},
 		Else: &ast.Literal{Kind: token.Int, Value: "0"},
 	})
+	got = compilerOut(c) + got
 	if !strings.Contains(got, "switch role") {
 		t.Fatalf("missing switch, got:\n%s", got)
 	}

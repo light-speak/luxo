@@ -492,6 +492,8 @@ type compiler struct {
 	clientSelection    string                 // generated expression for the current request selection
 	functionResult     *ast.TypeRef           // non-nil while compiling a local fn body
 	inFunction         bool                   // true while compiling a local fn rather than a transport handler
+	valueClosure       bool                   // Go value boundary; never writes a transport response
+	closureError       string                 // local failure slot for an immediately invoked value closure
 	loadSelections     map[string]string      // load variable → exact compiled selection literal
 	loadSelection      string                 // selection for the load expression currently being compiled
 	hasLoadSelection   bool                   // distinguishes an exact empty projection from select-all nil
@@ -625,6 +627,26 @@ func unwrapQuestion(expr ast.Expr) (ast.Expr, bool) {
 
 // compileReturn: return expr
 func (c *compiler) compileReturn(s *ast.ReturnStmt) {
+	if c.valueClosure {
+		if s.Value == nil {
+			c.write("return nil")
+		} else {
+			expression := c.compileExpr(s.Value)
+			if c.isModelQuery(s.Value) {
+				c.resultTmp++
+				name := fmt.Sprintf("_result%d", c.resultTmp)
+				c.write("%s, err := %s", name, expression)
+				c.writeErrorGuard()
+				expression = name
+			}
+			c.write("return %s", expression)
+		}
+		return
+	}
+	if c.inAsync {
+		c.write("return")
+		return
+	}
 	if c.inFunction {
 		c.compileFunctionReturn(s)
 		return
@@ -1338,7 +1360,7 @@ func (c *compiler) compileTransactionCall(e *ast.CallExpr) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	sub := c.subCompiler()
+	sub := c.errorCompiler()
 	sub.indent = c.indent + "\t"
 	for _, stmt := range lambda.Body.Stmts {
 		sub.compileStmt(stmt)
@@ -1491,6 +1513,15 @@ func declaredFunctionArgumentValues(call *ast.CallExpr, fn *ast.FnDecl) ([]ast.E
 
 // Write directly to the output buffer without allocating an intermediate statement.
 func (c *compiler) writeErrorReturn(indent, expression string) {
+	if c.valueClosure {
+		c.writeClosureError(indent, expression)
+		return
+	}
+	if c.inAsync {
+		c.write("%sluxolog.Error((%s).Error())", indent, expression)
+		c.write("%sreturn", indent)
+		return
+	}
 	c.b.WriteString(c.indent)
 	c.b.WriteString(indent)
 	if c.inFunction && c.functionResult != nil {
@@ -2068,7 +2099,9 @@ func (c *compiler) compileBuiltinCall(e *ast.CallExpr) string {
 		// RandomHex returns (string, error) — assign to temp var with error check
 		varName := "_hex"
 		c.write("%s, _hexErr := luxocrypto.RandomHex(%s)", varName, n)
-		c.write("if _hexErr != nil {\n%s\treturn _hexErr\n%s}", c.indent, c.indent)
+		c.write("if _hexErr != nil {")
+		c.writeErrorReturn("\t", "_hexErr")
+		c.write("}")
 		return varName
 	case "randomBytes":
 		return fmt.Sprintf("luxocrypto.RandomBytes(%s)", n)
@@ -2775,67 +2808,12 @@ func (c *compiler) compileForExpr(s *ast.ForStmt) string {
 
 // compileForExprYield generates a closure returning the first yielded value (or nil).
 func (c *compiler) compileForExprYield(s *ast.ForStmt) string {
-	sub := c.subCompiler()
-	sub.indent = c.indent + "\t\t"
-	sub.inForExpr = true
-	returnType := c.goTypeForExpr(s)
-	if returnType == "" {
-		returnType = "any"
-	}
-	sub.yieldAddr = c.yieldNeedsAddress(s)
-
-	// Compile entire body — YieldExpr will emit "return <value>"
-	for _, stmt := range s.Body.Stmts {
-		sub.compileStmt(stmt)
-	}
-
-	if rangeExpr, ok := s.Collection.(*ast.RangeExpr); ok {
-		start := c.compileExpr(rangeExpr.Start)
-		end := c.compileExpr(rangeExpr.End)
-		return fmt.Sprintf("func() %s {\n%s\tfor %s := int64(%s); %s <= %s; %s++ {\n%s%s\t}\n%s\treturn nil\n%s}()",
-			returnType, c.indent, s.VarName, start, s.VarName, end, s.VarName,
-			sub.b.String(), c.indent, c.indent, c.indent)
-	}
-
-	coll := c.compileExpr(s.Collection)
-	return fmt.Sprintf("func() %s {\n%s\tfor _, %s := range %s {\n%s%s\t}\n%s\treturn nil\n%s}()",
-		returnType, c.indent, s.VarName, coll,
-		sub.b.String(), c.indent, c.indent, c.indent)
+	return c.compileForValue(s, true)
 }
 
 // compileForExprCollect generates a closure collecting all values into a typed slice.
 func (c *compiler) compileForExprCollect(s *ast.ForStmt) string {
-	sub := c.subCompiler()
-	sub.indent = c.indent + "\t\t"
-	resultType := c.goTypeForExpr(s)
-	if resultType == "" {
-		resultType = "[]any"
-	}
-
-	// Compile all but last statement normally
-	for i := 0; i < len(s.Body.Stmts)-1; i++ {
-		sub.compileStmt(s.Body.Stmts[i])
-	}
-	// Last statement is the collected value
-	lastExpr := ""
-	if es, ok := s.Body.Stmts[len(s.Body.Stmts)-1].(*ast.ExprStmt); ok {
-		lastExpr = sub.compileExpr(es.Expr)
-	} else if rs, ok := s.Body.Stmts[len(s.Body.Stmts)-1].(*ast.ReturnStmt); ok && rs.Value != nil {
-		lastExpr = sub.compileExpr(rs.Value)
-	}
-
-	if rangeExpr, ok := s.Collection.(*ast.RangeExpr); ok {
-		start := c.compileExpr(rangeExpr.Start)
-		end := c.compileExpr(rangeExpr.End)
-		return fmt.Sprintf("func() %s {\n%s\tvar _result %s\n%s\tfor %s := int64(%s); %s <= %s; %s++ {\n%s%s\t\t_result = append(_result, %s)\n%s\t}\n%s\treturn _result\n%s}()",
-			resultType, c.indent, resultType, c.indent, s.VarName, start, s.VarName, end, s.VarName,
-			sub.b.String(), c.indent, lastExpr, c.indent, c.indent, c.indent)
-	}
-
-	coll := c.compileExpr(s.Collection)
-	return fmt.Sprintf("func() %s {\n%s\tvar _result %s\n%s\tfor _, %s := range %s {\n%s%s\t\t_result = append(_result, %s)\n%s\t}\n%s\treturn _result\n%s}()",
-		resultType, c.indent, resultType, c.indent, s.VarName, coll,
-		sub.b.String(), c.indent, lastExpr, c.indent, c.indent, c.indent)
+	return c.compileForValue(s, false)
 }
 
 // compileBlock compiles a block body with indentation.
@@ -3040,63 +3018,61 @@ func (c *compiler) compileObject(e *ast.ObjectExpr) string {
 
 // compileWhen: when { cond -> expr, else -> expr }
 func (c *compiler) compileWhen(e *ast.WhenExpr) string {
-	// Detect channel select: when { <-ch -> ... } → Go select
 	if e.Subject == nil && c.hasChannelBranch(e) {
 		return c.compileSelect(e)
 	}
-
-	// when is compiled inline as a helper variable + switch
-	retType := c.inferWhenReturnType(e)
-	var b strings.Builder
-	fmt.Fprintf(&b, "func() %s {\n", retType)
-	// Check if any branch uses is-type → type switch
-	hasIsType := false
-	for _, br := range e.Branches {
-		if br.IsType != "" {
-			hasIsType = true
-			break
-		}
+	sub := c.valueCompiler()
+	sub.indent += "\t"
+	subject := ""
+	if e.Subject != nil {
+		subject = sub.compileExpr(e.Subject)
 	}
-
+	hasIsType := false
+	for _, branch := range e.Branches {
+		hasIsType = hasIsType || branch.IsType != ""
+	}
 	if hasIsType && e.Subject != nil {
-		// Type switch: when(x) { is String -> ..., is Int -> ... }
-		subj := c.compileExpr(e.Subject)
-		fmt.Fprintf(&b, "%s\tswitch %s.(type) {\n", c.indent, subj)
-		for _, br := range e.Branches {
-			body := c.compileExpr(br.Body)
-			if br.IsType != "" {
-				fmt.Fprintf(&b, "%s\tcase %s:\n%s\t\treturn %s\n", c.indent, br.IsType, c.indent, body)
-			} else if br.Condition != nil {
-				cond := c.compileExpr(br.Condition)
-				fmt.Fprintf(&b, "%s\tcase %s:\n%s\t\treturn %s\n", c.indent, cond, c.indent, body)
-			}
+		subject += ".(type)"
+	}
+	if !hasIsType && whenConditionsCall(e) {
+		if e.Subject != nil {
+			sub.write("_subject := %s", subject)
+			subject = "_subject"
 		}
-	} else if e.Subject != nil {
-		subj := c.compileExpr(e.Subject)
-		fmt.Fprintf(&b, "%s\tswitch %s {\n", c.indent, subj)
-		for _, br := range e.Branches {
-			cond := c.compileExpr(br.Condition)
-			body := c.compileExpr(br.Body)
-			fmt.Fprintf(&b, "%s\tcase %s:\n%s\t\treturn %s\n", c.indent, cond, c.indent, body)
+		sub.compileWhenConditions(e, subject)
+		retType := c.inferWhenReturnType(e)
+		if e.Else == nil {
+			sub.write("return %s", zeroValueForType(retType))
 		}
+		return c.finishValueClosure(sub, retType, sub.b.String())
+	}
+	if subject == "" {
+		sub.write("switch {")
 	} else {
-		fmt.Fprintf(&b, "%s\tswitch {\n", c.indent)
-		for _, br := range e.Branches {
-			cond := c.compileExpr(br.Condition)
-			body := c.compileExpr(br.Body)
-			fmt.Fprintf(&b, "%s\tcase %s:\n%s\t\treturn %s\n", c.indent, cond, c.indent, body)
+		sub.write("switch %s {", subject)
+	}
+	for _, branch := range e.Branches {
+		condition := branch.IsType
+		if condition == "" {
+			condition = sub.compileExpr(branch.Condition)
 		}
+		sub.write("case %s:", condition)
+		sub.indent += "\t"
+		sub.compileValueBranch(branch.Body)
+		sub.indent = strings.TrimSuffix(sub.indent, "\t")
 	}
 	if e.Else != nil {
-		elseExpr := c.compileExpr(e.Else)
-		fmt.Fprintf(&b, "%s\tdefault:\n%s\t\treturn %s\n", c.indent, c.indent, elseExpr)
+		sub.write("default:")
+		sub.indent += "\t"
+		sub.compileValueBranch(e.Else)
+		sub.indent = strings.TrimSuffix(sub.indent, "\t")
 	}
-	fmt.Fprintf(&b, "%s\t}\n", c.indent)
+	sub.write("}")
+	retType := c.inferWhenReturnType(e)
 	if e.Else == nil {
-		fmt.Fprintf(&b, "%s\treturn %s\n", c.indent, zeroValueForType(retType))
+		sub.write("return %s", zeroValueForType(retType))
 	}
-	fmt.Fprintf(&b, "%s}()", c.indent)
-	return b.String()
+	return c.finishValueClosure(sub, retType, sub.b.String())
 }
 
 // inferWhenReturnType infers the Go return type for a when expression.
@@ -3146,46 +3122,30 @@ func (c *compiler) hasChannelBranch(e *ast.WhenExpr) bool {
 
 // compileSelect: when { <-ch1 -> { ... }, <-ch2 -> { ... } } → Go select
 func (c *compiler) compileSelect(e *ast.WhenExpr) string {
-	retType := c.inferWhenReturnType(e)
-	var b strings.Builder
-	fmt.Fprintf(&b, "func() %s {\n%s\tselect {\n", retType, c.indent)
-
-	for _, br := range e.Branches {
-		if u, ok := br.Condition.(*ast.UnaryExpr); ok && u.Op == "<-" {
-			ch := c.compileExpr(u.Value)
-			// Check if body is a lambda with a named param: { msg -> ... }
-			if lambda, ok := br.Body.(*ast.LambdaExpr); ok && len(lambda.Params) > 0 {
-				param := lambda.Params[0]
-				fmt.Fprintf(&b, "%s\tcase %s := <-%s:\n", c.indent, param, ch)
-				sub := c.subCompiler()
-				sub.indent = c.indent + "\t\t"
-				for _, stmt := range lambda.Body.Stmts {
-					sub.compileStmt(stmt)
-				}
-				b.WriteString(sub.b.String())
-			} else {
-				fmt.Fprintf(&b, "%s\tcase %s:\n", c.indent, c.compileExpr(br.Condition))
-				body := c.compileExpr(br.Body)
-				fmt.Fprintf(&b, "%s\t\t%s\n", c.indent, body)
-			}
+	sub := c.valueCompiler()
+	sub.indent += "\t"
+	sub.write("select {")
+	for _, branch := range e.Branches {
+		condition := sub.compileExpr(branch.Condition)
+		if lambda, ok := branch.Body.(*ast.LambdaExpr); ok && len(lambda.Params) > 0 {
+			sub.write("case %s := %s:", lambda.Params[0], condition)
 		} else {
-			// Non-channel branch (e.g., timeout) — compile as regular case
-			cond := c.compileExpr(br.Condition)
-			fmt.Fprintf(&b, "%s\tcase %s:\n", c.indent, cond)
-			body := c.compileExpr(br.Body)
-			fmt.Fprintf(&b, "%s\t\t%s\n", c.indent, body)
+			sub.write("case %s:", condition)
 		}
+		sub.indent += "\t"
+		sub.compileValueBranch(branch.Body)
+		sub.indent = strings.TrimSuffix(sub.indent, "\t")
 	}
-
 	if e.Else != nil {
-		fmt.Fprintf(&b, "%s\tdefault:\n", c.indent)
-		elseExpr := c.compileExpr(e.Else)
-		fmt.Fprintf(&b, "%s\t\t%s\n", c.indent, elseExpr)
+		sub.write("default:")
+		sub.indent += "\t"
+		sub.compileValueBranch(e.Else)
+		sub.indent = strings.TrimSuffix(sub.indent, "\t")
 	}
-
-	zeroVal := zeroValueForType(retType)
-	fmt.Fprintf(&b, "%s\t}\n%s\treturn %s\n%s}()", c.indent, c.indent, zeroVal, c.indent)
-	return b.String()
+	sub.write("}")
+	retType := c.inferWhenReturnType(e)
+	sub.write("return %s", zeroValueForType(retType))
+	return c.finishValueClosure(sub, retType, sub.b.String())
 }
 
 // extractLambdaField extracts the field name from a simple lambda like { it.minutes }.
@@ -3227,7 +3187,7 @@ func (c *compiler) compileLambda(e *ast.LambdaExpr) string {
 
 // compileTransaction: tx { ... } → app.DB.Tx(ctx, func(ctx) error { ... })
 func (c *compiler) compileTransaction(e *ast.TransactionExpr) string {
-	sub := c.subCompiler()
+	sub := c.errorCompiler()
 	sub.indent = c.indent + "\t"
 	for _, stmt := range e.Body.Stmts {
 		sub.compileStmt(stmt)
@@ -3260,12 +3220,15 @@ func (c *compiler) subCompiler() *compiler {
 		loadSelections:     c.loadSelections,
 		loadSelection:      c.loadSelection,
 		hasLoadSelection:   c.hasLoadSelection,
+		resultTmp:          c.resultTmp,
 	}
 }
 
 // compileAsync: async { body } → go func() { body }()
 func (c *compiler) compileAsync(e *ast.AsyncExpr) string {
 	sub := c.subCompiler()
+	sub.inFunction = false
+	sub.functionResult = nil
 	sub.indent = c.indent + "\t"
 	sub.inAsync = true
 	for _, stmt := range e.Body.Stmts {
@@ -3277,7 +3240,6 @@ func (c *compiler) compileAsync(e *ast.AsyncExpr) string {
 type awaitTask struct {
 	varName   string
 	goType    string
-	expr      string
 	source    ast.Expr
 	isQuery   bool
 	valueType valType
@@ -3301,7 +3263,7 @@ func (c *compiler) compileAwaitBindings(e *ast.AwaitExpr, names []string) {
 }
 
 func (c *compiler) newAwaitTask(name string, value ast.Expr) awaitTask {
-	task := awaitTask{varName: name, expr: c.compileExpr(value), source: value, isQuery: c.isModelQuery(value)}
+	task := awaitTask{varName: name, source: value, isQuery: c.isModelQuery(value)}
 	if task.isQuery {
 		task.valueType = c.resolveQueryType(value)
 		task.goType = goTypeForValType(task.valueType)
@@ -3373,7 +3335,10 @@ func (c *compiler) emitAwaitTasks(tasks []awaitTask) {
 	}
 
 	groups := c.awaitAggregateGroups(tasks)
+	c.write("{")
+	c.indent += "\t"
 	c.write("g, gctx := errgroup.WithContext(ctx)")
+	c.write("_ = gctx")
 	for index := range tasks {
 		group, first := awaitAggregateGroupAt(groups, index)
 		if group != nil {
@@ -3387,6 +3352,8 @@ func (c *compiler) emitAwaitTasks(tasks []awaitTask) {
 
 	c.write("if err := g.Wait(); err != nil {")
 	c.writeErrorReturn("\t", "err")
+	c.write("}")
+	c.indent = strings.TrimSuffix(c.indent, "\t")
 	c.write("}")
 	for _, t := range tasks {
 		c.write("_ = %s", t.varName)
@@ -3636,15 +3603,21 @@ func compileAggregateSpec(task awaitAggregate) string {
 }
 
 func (c *compiler) emitAwaitTask(task awaitTask) {
+	// Fused aggregates never reach this path: compile each remaining expression
+	// exactly once, inside its own error-return and cancellation boundary.
+	sub := c.errorCompiler()
+	sub.indent = c.indent + "\t"
+	expression := sub.compileExpr(task.source)
 	c.write("g.Go(func() error {")
+	c.write("\tctx := gctx")
+	c.write("\t_ = ctx")
+	c.b.WriteString(sub.b.String())
 	if task.isQuery {
-		c.write("\tvar err error")
-		expr := strings.Replace(task.expr, "(ctx,", "(gctx,", 1)
-		expr = strings.Replace(expr, "(ctx)", "(gctx)", 1)
-		c.write("\t%s, err = %s", task.varName, expr)
+		c.write("\t_awaitValue, err := %s", expression)
+		c.write("\t%s = _awaitValue", task.varName)
 		c.write("\treturn err")
 	} else {
-		c.write("\t%s = %s", task.varName, task.expr)
+		c.write("\t%s = %s", task.varName, expression)
 		c.write("\treturn nil")
 	}
 	c.write("})")

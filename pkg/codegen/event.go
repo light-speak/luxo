@@ -125,7 +125,7 @@ func (g *GeneratorContext) generateEventFile(result *semantic.Result, packageNam
 	body := b.String()
 	var out strings.Builder
 	out.WriteString(importPrefix)
-	if strings.Contains(body, "selection.") {
+	if generatedPackages(body).has("selection") {
 		out.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
 	}
 	out.WriteString(")\n\n")

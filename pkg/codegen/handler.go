@@ -678,24 +678,28 @@ func (g *GeneratorContext) writeHandlerImports(b *strings.Builder, result *seman
 	needsUUID := false
 	needsDecimal := false
 	if len(generatedBody) > 0 {
-		body := generatedBody[0]
-		hasOrGroups = strings.Contains(body, "strconv.")
-		hasSortable = strings.Contains(body, "strings.")
+		packages := generatedPackages(generatedBody[0])
+		hasOrGroups = packages.has("strconv")
+		hasSortable = packages.has("strings")
 		hasTemplateStr = false
-		hasAuth = strings.Contains(body, "luvia.")
+		hasAuth = packages.has("luvia")
 		hasHash = false
-		feat.hasCrypto = strings.Contains(body, "luxocrypto.")
-		hasTime = strings.Contains(body, "time.")
-		needsJSON = strings.Contains(body, "json.")
-		needsFmt = strings.Contains(body, "fmt.")
+		feat.hasCrypto = packages.has("luxocrypto")
+		hasTime = packages.has("time")
+		needsJSON = packages.has("json")
+		needsFmt = packages.has("fmt")
 		hasValidation = false
-		hasPattern = strings.Contains(body, "regexp.")
-		needsLux = strings.Contains(body, "lux.")
-		needsErrors = strings.Contains(body, "errors.")
-		needsSelection = strings.Contains(body, "selection.")
-		needsPG = strings.Contains(body, "pg.")
-		needsUUID = strings.Contains(body, "uuid.")
-		needsDecimal = strings.Contains(body, "decimal.")
+		hasPattern = packages.has("regexp")
+		needsLux = packages.has("lux")
+		needsErrors = packages.has("errors")
+		needsSelection = packages.has("selection")
+		needsPG = packages.has("pg")
+		needsUUID = packages.has("uuid")
+		needsDecimal = packages.has("decimal")
+		needsCodec = packages.has("codec")
+		hasAwait = packages.has("errgroup")
+		hasTransaction = false
+		feat.hasLog = packages.has("luxolog")
 	}
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
@@ -2088,17 +2092,13 @@ func generateSorterParser(b *strings.Builder, m *ast.ModelDecl) {
 
 // bodyContainsAwait checks if an API body block contains any AwaitExpr.
 func bodyContainsAwait(block *ast.Block) bool {
-	if block == nil {
-		return false
-	}
-	for _, stmt := range block.Stmts {
-		if es, ok := stmt.(*ast.ExprStmt); ok {
-			if _, ok := es.Expr.(*ast.AwaitExpr); ok {
-				return true
-			}
+	found := false
+	ast.WalkExprs(block, func(expr ast.Expr) {
+		if _, ok := expr.(*ast.AwaitExpr); ok {
+			found = true
 		}
-	}
-	return false
+	})
+	return found
 }
 
 // bodyContainsTransaction checks if an API body block contains a transaction call.
