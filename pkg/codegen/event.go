@@ -90,7 +90,8 @@ func (g *GeneratorContext) generateEventFile(result *semantic.Result, packageNam
 	for _, modName := range modNames {
 		fmt.Fprintf(&b, "\t%s \"%s/%s/luxo\"\n", crossModuleImports[modName], g.events.ModulePath, modName)
 	}
-	b.WriteString(")\n\n")
+	importPrefix := b.String()
+	b.Reset()
 
 	// Event structs + MarshalLuxo/UnmarshalLuxo
 	for _, e := range events {
@@ -103,15 +104,8 @@ func (g *GeneratorContext) generateEventFile(result *semantic.Result, packageNam
 		generateEmitFunc(&b, e)
 	}
 
-	// Collect models for compiling on-handler bodies
-	var models []*ast.ModelDecl
-	for _, file := range result.Files {
-		models = append(models, file.Models...)
-	}
-	modelMap := make(map[string]*ast.ModelDecl, len(models))
-	for _, m := range models {
-		modelMap[m.Name] = m
-	}
+	// Reuse the API model registry so listeners also recognize extend projections.
+	modelMap, _ := collectInferredAPIs(result)
 
 	// RegisterEvents function — wires all on-listeners
 	g.generateRegisterEvents(&b, listeners, currentModule, currentModule, modelMap, enums)
@@ -128,7 +122,15 @@ func (g *GeneratorContext) generateEventFile(result *semantic.Result, packageNam
 		b.WriteString("}\n\n")
 	}
 
-	return []byte(b.String())
+	body := b.String()
+	var out strings.Builder
+	out.WriteString(importPrefix)
+	if strings.Contains(body, "selection.") {
+		out.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
+	}
+	out.WriteString(")\n\n")
+	out.WriteString(body)
+	return []byte(out.String())
 }
 
 func collectEventObjectTypes(result *semantic.Result) map[string]bool {
@@ -490,11 +492,11 @@ func generateEmitFunc(b *strings.Builder, e *ast.EventDecl) {
 func (g *GeneratorContext) generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleName string, currentModule string, models map[string]*ast.ModelDecl, enums map[string]bool) {
 	if len(listeners) == 0 {
 		b.WriteString("// RegisterEvents — no listeners in this module.\n")
-		b.WriteString("func RegisterEvents(bus event.Bus, app *App) {}\n\n")
+		b.WriteString("func RegisterEvents(bus event.Bus, app *App) error { return nil }\n\n")
 		return
 	}
 	b.WriteString("// RegisterEvents registers all event listeners with the bus.\n")
-	b.WriteString("func RegisterEvents(bus event.Bus, app *App) {\n")
+	b.WriteString("func RegisterEvents(bus event.Bus, app *App) error {\n")
 
 	for _, l := range listeners {
 		paramName := "payload"
@@ -514,19 +516,21 @@ func (g *GeneratorContext) generateRegisterEvents(b *strings.Builder, listeners 
 		}
 		eventType := eventTypePrefix + l.EventName + "Event"
 		if l.Broadcast {
-			fmt.Fprintf(b, "\tevent.OnDecode(bus, %q, %s, func(ctx context.Context, %s %s) error {\n", l.EventName, unmarshalFunc, paramName, eventType)
+			fmt.Fprintf(b, "\tif err := event.OnDecode(bus, %q, %s, func(ctx context.Context, %s %s) error {\n", l.EventName, unmarshalFunc, paramName, eventType)
 		} else {
-			fmt.Fprintf(b, "\tevent.OnQueueDecode(bus, %q, %q, %s, func(ctx context.Context, %s %s) error {\n", l.EventName, moduleName, unmarshalFunc, paramName, eventType)
+			fmt.Fprintf(b, "\tif err := event.OnQueueDecode(bus, %q, %q, %s, func(ctx context.Context, %s %s) error {\n", l.EventName, moduleName, unmarshalFunc, paramName, eventType)
 		}
 		// Compile on-handler body if present
 		if l.Body != nil && len(l.Body.Stmts) > 0 {
 			c := &compiler{
-				generator: g,
-				b:         b,
-				indent:    "\t\t",
-				models:    models,
-				enums:     enums,
-				vars:      make(map[string]valType),
+				generator:      g,
+				b:              b,
+				indent:         "\t\t",
+				models:         models,
+				enums:          enums,
+				vars:           make(map[string]valType),
+				api:            &ast.ApiDecl{Pos: l.Pos},
+				loadSelections: analyzeLoadSelections(l.Body, models),
 			}
 			// Register event param as a known variable so event.field compiles correctly
 			c.vars[paramName] = valType{name: l.EventName + "Event"}
@@ -538,10 +542,10 @@ func (g *GeneratorContext) generateRegisterEvents(b *strings.Builder, listeners 
 			fmt.Fprintf(b, "\t\t_ = %s\n", paramName)
 			fmt.Fprintf(b, "\t\treturn nil\n")
 		}
-		b.WriteString("\t})\n")
+		b.WriteString("\t}); err != nil {\n\t\treturn err\n\t}\n")
 	}
 
-	b.WriteString("}\n\n")
+	b.WriteString("\treturn nil\n}\n\n")
 
 	// Note: Unmarshal functions are generated in generateEventFile, not here
 }

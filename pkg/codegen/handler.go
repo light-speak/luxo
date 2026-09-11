@@ -33,64 +33,79 @@ func detectHandlerFeatures(result *semantic.Result, models []*ast.ModelDecl, inf
 }
 
 func (g *GeneratorContext) detectHandlerFeatures(result *semantic.Result, models []*ast.ModelDecl, inferredAPIs []*ast.ApiDecl, modelMap map[string]*ast.ModelDecl) handlerFeatures {
-	var f handlerFeatures
+	f := handlerFeatures{
+		hasOrGroups: inferredAPIsHaveOrGroups(inferredAPIs, modelMap),
+		hasSortable: modelsHaveSortableFields(models),
+	}
+	detectCompiledBodyFeatures(result, &f)
+	f.hasAuth = detectAuthNeeded(result, models)
+	g.scanHandlerBodyBuiltins(result, &f)
+	return f
+}
 
-	// Check if any inferred API has OR groups (need strconv import)
-	for _, api := range inferredAPIs {
-		inf := InferAPI(api.Name, modelMap)
-		if inf != nil && len(inf.Groups) > 1 {
-			f.hasOrGroups = true
-			break
+func inferredAPIsHaveOrGroups(apis []*ast.ApiDecl, modelMap map[string]*ast.ModelDecl) bool {
+	for _, api := range apis {
+		if inferred := InferAPI(api.Name, modelMap); inferred != nil && len(inferred.Groups) > 1 {
+			return true
 		}
 	}
+	return false
+}
 
-	// Check if any CRUD model has sortable fields (need "strings" import)
-	for _, m := range models {
-		for _, fd := range m.Fields {
-			if hasDirective(fd.Directives, "sortable") && fd.Type != nil && fd.Computed == nil {
-				f.hasSortable = true
-				break
+func modelsHaveSortableFields(models []*ast.ModelDecl) bool {
+	for _, model := range models {
+		for _, field := range model.Fields {
+			if hasDirective(field.Directives, "sortable") && field.Type != nil && field.Computed == nil {
+				return true
 			}
 		}
-		if f.hasSortable {
-			break
-		}
 	}
+	return false
+}
 
-	// Check compiled APIs for await, transaction, and template strings
+func detectCompiledBodyFeatures(result *semantic.Result, features *handlerFeatures) {
 	for _, file := range result.Files {
 		for _, api := range file.APIs {
-			if api.Body != nil && !hasDirective(api.Directives, "native") {
-				if bodyContainsAwait(api.Body) {
-					f.hasAwait = true
-				}
-				if bodyContainsTransaction(api.Body) {
-					f.hasTransaction = true
-				}
+			if api.Body == nil {
+				continue
 			}
-			if api.Body != nil && bodyContainsTemplateString(api.Body) {
-				f.hasTemplateStr = true
+			features.hasTemplateStr = features.hasTemplateStr || bodyContainsTemplateString(api.Body)
+			if !hasDirective(api.Directives, "native") {
+				mergeCompiledBodyFeatures(features, api.Body)
+			}
+		}
+		for _, fn := range file.Functions {
+			if fn.Body != nil && !hasDirective(fn.Directives, "native") {
+				mergeCompiledBodyFeatures(features, fn.Body)
 			}
 		}
 	}
+}
 
-	f.hasAuth = detectAuthNeeded(result, models)
+func mergeCompiledBodyFeatures(features *handlerFeatures, body *ast.Block) {
+	features.hasAwait = features.hasAwait || bodyContainsAwait(body)
+	features.hasTransaction = features.hasTransaction || bodyContainsTransaction(body)
+	features.hasTemplateStr = features.hasTemplateStr || bodyContainsTemplateString(body)
+}
 
-	// Scan compiled API bodies for crypto, time, and cross-module emit usage
-	curModule := ""
+func (g *GeneratorContext) scanHandlerBodyBuiltins(result *semantic.Result, features *handlerFeatures) {
+	currentModule := ""
 	if len(result.Files) > 0 {
-		curModule = moduleNameFromFile(result.Files[0].Name)
+		currentModule = moduleNameFromFile(result.Files[0].Name)
 	}
 	for _, file := range result.Files {
 		for _, api := range file.APIs {
 			if api.Body == nil {
 				continue
 			}
-			g.scanBodyForBuiltins(api.Body, &f, curModule)
+			g.scanBodyForBuiltins(api.Body, features, currentModule)
+		}
+		for _, fn := range file.Functions {
+			if fn.Body != nil && !hasDirective(fn.Directives, "native") {
+				g.scanBodyForBuiltins(fn.Body, features, currentModule)
+			}
 		}
 	}
-
-	return f
 }
 
 // generateHandlerFile produces handler.gen.go containing CRUD handlers,
@@ -103,6 +118,14 @@ func (g *GeneratorContext) generateHandlerFile(result *semantic.Result, packageN
 	models, allModels := collectHandlerModels(result)
 	modelMap, inferredAPIs := collectInferredAPIs(result)
 	hasCompiledAPIs, hasNativeAPIs, hasServiceFns := handlerDeclarationKinds(result)
+	compiledFunctions := collectCompiledFunctions(result)
+	functionDeclarations := collectFunctionDeclarations(result)
+	selectionFunctions := collectSelectionAwareFunctions(compiledFunctions)
+	var callableEnums map[string]bool
+	if hasCompiledAPIs || hasServiceFns {
+		// Only callable bodies need a retained enum index; share it across handlers.
+		callableEnums = CollectEnumsFromResult(result)
+	}
 	remoteLoads := g.remoteLoadCallsForResult(result)
 	if len(models) == 0 && len(inferredAPIs) == 0 && !hasCompiledAPIs && !hasNativeAPIs && !hasServiceFns && len(remoteLoads) == 0 {
 		return nil
@@ -127,7 +150,8 @@ func (g *GeneratorContext) generateHandlerFile(result *semantic.Result, packageN
 		}
 	}
 
-	compiledNames := g.generateCompiledHandlers(&b, result, modelMap)
+	g.generateCompiledFunctions(&b, result, compiledFunctions, functionDeclarations, selectionFunctions, modelMap, callableEnums)
+	compiledNames := g.generateCompiledHandlers(&b, result, modelMap, callableEnums, functionDeclarations, selectionFunctions)
 	nativeNames := generateNativeAPIHandlers(&b, result)
 	inferredNames := generateInferredHandlers(&b, inferredAPIs, modelMap, enums)
 
@@ -153,7 +177,7 @@ func (g *GeneratorContext) generateHandlerFile(result *semantic.Result, packageN
 	g.generateRegisterFuncWithInferred(&b, models, allInferred, apiDirectives)
 
 	// fn @service handlers
-	serviceNames := g.generateServiceFnHandlers(&b, result, modelMap)
+	serviceNames := g.generateServiceFnHandlers(&b, result, modelMap, callableEnums, functionDeclarations, selectionFunctions)
 	g.generateRegisterServiceFns(&b, serviceNames)
 
 	// DataLoader RPC endpoints — batch load for each model (cluster mode)
@@ -189,6 +213,9 @@ func handlerDeclarationKinds(result *semantic.Result) (hasCompiled, hasNative, h
 		for _, api := range file.APIs {
 			hasNative = hasNative || hasDirective(api.Directives, "native")
 			hasCompiled = hasCompiled || api.Body != nil && !hasDirective(api.Directives, "native")
+		}
+		for _, fn := range file.Functions {
+			hasCompiled = hasCompiled || fn.Body != nil && !hasDirective(fn.Directives, "native")
 		}
 		hasService = hasService || functionsHaveDirective(file.Functions, "service")
 	}
@@ -278,17 +305,17 @@ func generateInferredHandlers(b *strings.Builder, apis []*ast.ApiDecl, modelMap 
 }
 
 func generateCompiledHandlers(b *strings.Builder, result *semantic.Result, modelMap map[string]*ast.ModelDecl) []string {
-	return defaultGenerator().generateCompiledHandlers(b, result, modelMap)
+	functions := collectFunctionDeclarations(result)
+	return defaultGenerator().generateCompiledHandlers(b, result, modelMap, CollectEnumsFromResult(result), functions, collectSelectionAwareFunctions(collectCompiledFunctions(result)))
 }
 
-func (g *GeneratorContext) generateCompiledHandlers(b *strings.Builder, result *semantic.Result, modelMap map[string]*ast.ModelDecl) []string {
-	enumSet := CollectEnumsFromResult(result)
+func (g *GeneratorContext) generateCompiledHandlers(b *strings.Builder, result *semantic.Result, modelMap map[string]*ast.ModelDecl, enumSet map[string]bool, functions map[string]*ast.FnDecl, selectionFunctions map[string]bool) []string {
 	nativeFunctions := collectNativeFunctionNames(result)
 	var names []string
 	for _, file := range result.Files {
 		for _, api := range file.APIs {
 			if api.Body != nil && !hasDirective(api.Directives, "native") && !hasDirective(api.Directives, "stream") {
-				g.compileAPIBody(b, api, modelMap, enumSet, nativeFunctions)
+				g.compileAPIBody(b, api, modelMap, enumSet, nativeFunctions, functions, selectionFunctions)
 				names = append(names, api.Name)
 			}
 		}
@@ -296,11 +323,94 @@ func (g *GeneratorContext) generateCompiledHandlers(b *strings.Builder, result *
 	return names
 }
 
+func collectCompiledFunctions(result *semantic.Result) map[string]*ast.FnDecl {
+	var functions map[string]*ast.FnDecl
+	for _, file := range result.Files {
+		for _, fn := range file.Functions {
+			if fn.Body != nil && !hasDirective(fn.Directives, "native") && !hasDirective(fn.Directives, "service") {
+				if functions == nil {
+					functions = make(map[string]*ast.FnDecl)
+				}
+				functions[fn.Name] = fn
+			}
+		}
+	}
+	return functions
+}
+
+func collectFunctionDeclarations(result *semantic.Result) map[string]*ast.FnDecl {
+	var functions map[string]*ast.FnDecl
+	for _, file := range result.Files {
+		for _, fn := range file.Functions {
+			if functions == nil {
+				functions = make(map[string]*ast.FnDecl)
+			}
+			functions[fn.Name] = fn
+		}
+	}
+	return functions
+}
+
+func (g *GeneratorContext) generateCompiledFunctions(b *strings.Builder, result *semantic.Result, compiledFunctions, functionDeclarations map[string]*ast.FnDecl, selectionFunctions map[string]bool, models map[string]*ast.ModelDecl, enums map[string]bool) {
+	if len(compiledFunctions) == 0 {
+		return
+	}
+	names := make([]string, 0, len(compiledFunctions))
+	for name := range compiledFunctions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	nativeFunctions := collectNativeFunctionNames(result)
+	for _, name := range names {
+		g.compileLocalFunction(b, compiledFunctions[name], models, enums, nativeFunctions, functionDeclarations, selectionFunctions)
+	}
+}
+
+func collectSelectionAwareFunctions(functions map[string]*ast.FnDecl) map[string]bool {
+	if len(functions) == 0 {
+		return nil
+	}
+	selectionFunctions := make(map[string]bool)
+	callers := make(map[string][]string, len(functions))
+	for name, function := range functions {
+		ast.WalkExprs(function.Body, func(expr ast.Expr) {
+			call, ok := expr.(*ast.CallExpr)
+			if !ok {
+				return
+			}
+			if member, ok := call.Func.(*ast.MemberExpr); ok && member.Field == "select" && len(call.Args) == 0 {
+				selectionFunctions[name] = true
+			}
+			if ident, ok := call.Func.(*ast.Ident); ok && functions[ident.Name] != nil {
+				callers[ident.Name] = append(callers[ident.Name], name)
+			}
+		})
+	}
+	propagateSelectionFunctions(selectionFunctions, callers)
+	return selectionFunctions
+}
+
+func propagateSelectionFunctions(selectionFunctions map[string]bool, callers map[string][]string) {
+	queue := make([]string, 0, len(selectionFunctions))
+	for function := range selectionFunctions {
+		queue = append(queue, function)
+	}
+	for index := 0; index < len(queue); index++ {
+		for _, caller := range callers[queue[index]] {
+			if selectionFunctions[caller] {
+				continue
+			}
+			selectionFunctions[caller] = true
+			queue = append(queue, caller)
+		}
+	}
+}
+
 func collectNativeFunctionNames(result *semantic.Result) map[string]bool {
 	names := make(map[string]bool)
 	for _, file := range result.Files {
 		for _, fn := range file.Functions {
-			if hasDirective(fn.Directives, "native") && fn.ReturnType != nil && fn.ReturnType.Name == "Result" {
+			if hasDirective(fn.Directives, "native") {
 				names[fn.Name] = true
 			}
 		}
@@ -312,11 +422,11 @@ func collectNativeFunctionNames(result *semantic.Result) map[string]bool {
 // Handles both compiled fn (with body) and @native fn (delegating to NativeResolver).
 // Returns service fn names for RegisterServiceFns generation.
 func generateServiceFnHandlers(b *strings.Builder, result *semantic.Result, modelMap map[string]*ast.ModelDecl) []string {
-	return defaultGenerator().generateServiceFnHandlers(b, result, modelMap)
+	functions := collectFunctionDeclarations(result)
+	return defaultGenerator().generateServiceFnHandlers(b, result, modelMap, CollectEnumsFromResult(result), functions, collectSelectionAwareFunctions(collectCompiledFunctions(result)))
 }
 
-func (g *GeneratorContext) generateServiceFnHandlers(b *strings.Builder, result *semantic.Result, modelMap map[string]*ast.ModelDecl) []string {
-	enumSet := CollectEnumsFromResult(result)
+func (g *GeneratorContext) generateServiceFnHandlers(b *strings.Builder, result *semantic.Result, modelMap map[string]*ast.ModelDecl, enumSet map[string]bool, functions map[string]*ast.FnDecl, selectionFunctions map[string]bool) []string {
 	nativeFunctions := collectNativeFunctionNames(result)
 	var names []string
 	for _, file := range result.Files {
@@ -329,7 +439,7 @@ func (g *GeneratorContext) generateServiceFnHandlers(b *strings.Builder, result 
 				generateNativeServiceHandler(b, fn, modelMap, enumSet)
 			} else if fn.Body != nil {
 				// Compiled fn @service
-				g.compileFnBodyWithNativeFunctions(b, fn, modelMap, enumSet, nativeFunctions)
+				g.compileFnBodyWithFunctions(b, fn, modelMap, enumSet, nativeFunctions, functions, selectionFunctions)
 			}
 			names = append(names, fn.Name)
 		}
@@ -382,25 +492,7 @@ func generateNativeAPIHandler(b *strings.Builder, api *ast.ApiDecl, models map[s
 	// Parse params
 	var paramNames []string
 	for _, p := range api.Params {
-		if isStructuredParam(p, enums) {
-			writeStructuredParamExtraction(b, p, enums, "\t\t")
-			paramNames = append(paramNames, p.Name)
-			continue
-		}
-		goType := resolveGoType(p.Type)
-		method := paramMethod(goType)
-		if p.Type != nil && p.Type.Nullable {
-			method = ""
-		}
-		if method == "" {
-			fmt.Fprintf(b, "\t\tvar %s %s\n", p.Name, goType)
-			methodName := paramJSONMethod(p)
-			fmt.Fprintf(b, "\t\tif err := req.%s(%q, &%s); err != nil {\n", methodName, p.Name, p.Name)
-			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
-		} else {
-			fmt.Fprintf(b, "\t\t%s, err := req.Param%s(%q)\n", p.Name, method, p.Name)
-			fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		}
+		writeCallableParamExtraction(b, p, enums, "\t\t")
 		paramNames = append(paramNames, p.Name)
 	}
 
@@ -481,25 +573,7 @@ func generateNativeServiceHandler(b *strings.Builder, fn *ast.FnDecl, models map
 	// Parse params
 	var paramNames []string
 	for _, p := range fn.Params {
-		if isStructuredParam(p, enums) {
-			writeStructuredParamExtraction(b, p, enums, "\t\t")
-			paramNames = append(paramNames, p.Name)
-			continue
-		}
-		goType := resolveGoType(p.Type)
-		method := paramMethod(goType)
-		if p.Type != nil && p.Type.Nullable {
-			method = ""
-		}
-		if method == "" {
-			fmt.Fprintf(b, "\t\tvar %s %s\n", p.Name, goType)
-			methodName := paramJSONMethod(p)
-			fmt.Fprintf(b, "\t\tif err := req.%s(%q, &%s); err != nil {\n", methodName, p.Name, p.Name)
-			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
-		} else {
-			fmt.Fprintf(b, "\t\t%s, err := req.Param%s(%q)\n", p.Name, method, p.Name)
-			fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		}
+		writeCallableParamExtraction(b, p, enums, "\t\t")
 		paramNames = append(paramNames, p.Name)
 	}
 
@@ -1440,26 +1514,7 @@ func directiveDuration(d *ast.Directive, name string, position int) (string, boo
 	if literal.Kind != token.Duration {
 		return "", false
 	}
-	units := []struct {
-		suffix string
-		goUnit string
-	}{
-		{"ms", "time.Millisecond"},
-		{"d", "24 * time.Hour"},
-		{"h", "time.Hour"},
-		{"m", "time.Minute"},
-		{"s", "time.Second"},
-	}
-	for _, unit := range units {
-		if strings.HasSuffix(literal.Value, unit.suffix) {
-			value := strings.TrimSuffix(literal.Value, unit.suffix)
-			if value == "1" {
-				return unit.goUnit, true
-			}
-			return value + " * " + unit.goUnit, true
-		}
-	}
-	return "", false
+	return compileDurationLiteral(literal.Value)
 }
 
 // collectAPIDirectives collects directives for each API by name.
@@ -2261,6 +2316,11 @@ func detectAuthNeeded(result *semantic.Result, models []*ast.ModelDecl) bool {
 	for _, file := range result.Files {
 		for _, api := range file.APIs {
 			if hasDirective(api.Directives, "auth") {
+				return true
+			}
+		}
+		for _, fn := range file.Functions {
+			if hasDirective(fn.Directives, "auth") {
 				return true
 			}
 		}

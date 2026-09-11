@@ -45,6 +45,106 @@ func TestConcurrentAnalysesAreIsolated(t *testing.T) {
 	}
 }
 
+func TestFunctionIndexIsBuiltOnlyForDeclaredCalls(t *testing.T) {
+	fn := &ast.FnDecl{Name: "helper"}
+	file := &ast.File{Functions: []*ast.FnDecl{fn}}
+	a := New()
+	a.files = []*ast.File{file}
+	a.collectDeclarations(file)
+	if a.functions != nil {
+		t.Fatal("unused function declarations must not allocate a second index")
+	}
+	a.checkDeclaredFunctionCall(&ast.CallExpr{Func: &ast.Ident{Name: "unknown"}}, nil)
+	if a.functions != nil {
+		t.Fatal("unknown calls must not initialize the function index")
+	}
+	call := &ast.CallExpr{Func: &ast.Ident{Name: "helper"}}
+	a.checkDeclaredFunctionCall(call, nil)
+	if a.functions["helper"] != fn {
+		t.Fatal("declared calls must resolve their function declaration")
+	}
+	allocations := testing.AllocsPerRun(100, func() {
+		a.checkDeclaredFunctionCall(call, nil)
+	})
+	if allocations != 0 {
+		t.Fatalf("repeated zero-argument checks allocated %v times", allocations)
+	}
+}
+
+func TestFunctionArgumentTypeCheckDoesNotAllocate(t *testing.T) {
+	a := New()
+	argument := &ast.NamedArg{Value: &ast.Ident{Name: "value"}}
+	for _, ref := range []*ast.TypeRef{{Name: "Int"}, {Name: "Int", Nullable: true}, {Name: "Int", IsList: true}} {
+		param := &ast.ParamDecl{Name: "value", Type: ref}
+		actual := a.resolveTypeRef(ref, token.Position{})
+		allocations := testing.AllocsPerRun(100, func() {
+			a.checkFunctionArgumentType(argument, actual, param)
+		})
+		if allocations != 0 {
+			t.Errorf("argument type %v allocated %v times", ref, allocations)
+		}
+	}
+	if len(a.errors) != 0 {
+		t.Fatalf("valid arguments rejected: %v", a.errors)
+	}
+}
+
+func TestLazyFunctionIndexPreservesAcceptedDeclarations(t *testing.T) {
+	first := &ast.FnDecl{Name: "helper"}
+	duplicate := &ast.FnDecl{Name: "helper", Params: []*ast.ParamDecl{{Name: "required", Type: &ast.TypeRef{Name: "Int"}}}}
+	shadowed := &ast.FnDecl{Name: "endpoint", Params: duplicate.Params}
+	a := New()
+	file := &ast.File{APIs: []*ast.ApiDecl{{Name: "endpoint"}}, Functions: []*ast.FnDecl{first, duplicate, shadowed}}
+	a.files = []*ast.File{file}
+	a.collectDeclarations(file)
+	a.checkDeclaredFunctionCall(&ast.CallExpr{Func: &ast.Ident{Name: "helper"}}, nil)
+	a.checkDeclaredFunctionCall(&ast.CallExpr{Func: &ast.Ident{Name: "endpoint"}}, nil)
+	if a.functions["helper"] != first || a.functions["endpoint"] != nil || len(a.errors) != 0 {
+		t.Fatalf("index must only retain accepted function declarations: %v", a.errors)
+	}
+}
+
+func TestFunctionCallWithLargeParameterList(t *testing.T) {
+	fn := &ast.FnDecl{Name: "many"}
+	call := &ast.CallExpr{Func: &ast.Ident{Name: fn.Name}}
+	a := New()
+	var types []*ResolvedType
+	for index := range 17 {
+		name := fmt.Sprintf("p%d", index)
+		fn.Params = append(fn.Params, &ast.ParamDecl{Name: name, Type: &ast.TypeRef{Name: "Int"}})
+		call.Args = append(call.Args, &ast.NamedArg{Name: name, Value: &ast.Literal{Kind: token.Int, Value: "1"}})
+		types = append(types, a.types["Int"])
+	}
+	file := &ast.File{Functions: []*ast.FnDecl{fn}}
+	a.files = []*ast.File{file}
+	a.collectDeclarations(file)
+	a.checkDeclaredFunctionCall(call, types)
+	if len(a.errors) != 0 {
+		t.Fatalf("large argument list rejected: %v", a.errors)
+	}
+}
+
+func TestFunctionArgumentComplexTypeResolution(t *testing.T) {
+	for _, ref := range []*ast.TypeRef{
+		nil,
+		{Name: "Result", TypeArgs: []*ast.TypeRef{{Name: "Int"}}},
+		{Tuple: []*ast.TypeRef{{Name: "Int"}, {Name: "String"}}},
+	} {
+		a := New()
+		argument := &ast.NamedArg{Value: &ast.Ident{Name: "value"}}
+		actual := a.resolveTypeRef(ref, token.Position{})
+		a.checkFunctionArgumentType(argument, actual, &ast.ParamDecl{Name: "value", Type: ref})
+		if len(a.errors) != 0 {
+			t.Errorf("matching complex type rejected: %v", a.errors)
+		}
+	}
+	a := New()
+	a.checkFunctionArgumentType(&ast.NamedArg{Value: &ast.Ident{Name: "value"}}, nil, &ast.ParamDecl{Type: &ast.TypeRef{Name: "Missing"}})
+	if len(a.errors) != 1 || !strings.Contains(a.errors[0].Message, "unknown type") {
+		t.Fatalf("unknown parameter type was not diagnosed: %v", a.errors)
+	}
+}
+
 func analyze(t *testing.T, input string) *Result {
 	t.Helper()
 	l := lexer.New(input, "test.luxo")
@@ -453,7 +553,7 @@ func TestDestructuringNonTuple(t *testing.T) {
 	// destructuring from a non-tuple — all variables get the same type
 	result := analyze(t, `
 model User { name: String }
-fn getPair(): User @native @service
+fn getPair(): User { User { name: "pair" } }
 api test(): User {
   val (a, b) = getPair()
   a

@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/light-speak/luxo/pkg/lux"
 )
 
@@ -63,7 +64,7 @@ func runtimeBusySeconds() float64 {
 type GatewayRegistrar struct {
 	studioURL       string
 	apiKey          string
-	projectID       int
+	projectID       string
 	instanceID      string
 	nodeType        string
 	nodeName        string
@@ -76,6 +77,7 @@ type GatewayRegistrar struct {
 	closed          bool
 	mu              sync.Mutex
 	worker          sync.WaitGroup
+	registered      bool // Owned by the registration worker.
 	client          *http.Client
 	dependencyStats lux.RuntimeDependencyStatsProvider
 }
@@ -96,9 +98,10 @@ func newGatewayRegistrarWithDependencyStats(port, version string, dependencyStat
 	if studioURL == "" || apiKey == "" {
 		return nil
 	}
-	projectID := 0
-	if v := os.Getenv("LUXO_PROJECT_ID"); v != "" {
-		fmt.Sscanf(v, "%d", &projectID)
+	projectID, err := studioProjectIDFromEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[studio] %v\n", err)
+		return nil
 	}
 	// instanceID identifies this gateway in the Gateway table (must be unique
 	// across instances of the same project). Honor LUXO_INSTANCE_ID first so
@@ -143,13 +146,20 @@ func newGatewayRegistrarWithDependencyStats(port, version string, dependencyStat
 	gr.worker.Add(1)
 	go func() {
 		defer gr.worker.Done()
-		if gr.register() {
-			gr.heartbeat()
-		}
+		gr.refreshRegistration()
 		gr.heartbeatLoop()
 	}()
 
 	return gr
+}
+
+func studioProjectIDFromEnv() (string, error) {
+	value := os.Getenv("LUXO_PROJECT_ID")
+	id, err := uuid.Parse(value)
+	if err != nil || id == uuid.Nil || len(value) != 36 || id.String() != strings.ToLower(value) {
+		return "", fmt.Errorf("LUXO_PROJECT_ID must be a non-zero project UUID from Studio, not a numeric database ID")
+	}
+	return id.String(), nil
 }
 
 func gatewayInstanceID() string {
@@ -236,13 +246,26 @@ func (gr *GatewayRegistrar) heartbeatLoop() {
 	gr.heartbeatLoopEvery(30 * time.Second)
 }
 
+// refreshRegistration retries the handshake before renewing the lease.
+// Studio being unavailable at startup must not turn an unregistered node into
+// a heartbeat-only client. This runs outside the application request path.
+func (gr *GatewayRegistrar) refreshRegistration() {
+	if !gr.registered {
+		gr.registered = gr.register()
+		if !gr.registered {
+			return
+		}
+	}
+	gr.heartbeat()
+}
+
 func (gr *GatewayRegistrar) heartbeatLoopEvery(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			gr.heartbeat()
+			gr.refreshRegistration()
 		case <-gr.done:
 			return
 		}
@@ -289,7 +312,7 @@ func (gr *GatewayRegistrar) heartbeat() {
 	}
 	resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
-		gr.register()
+		gr.registered = gr.register()
 	}
 }
 

@@ -353,6 +353,11 @@ func TestGenerateEntryFileWithEvents(t *testing.T) {
 	if !strings.Contains(code, "RegisterEvents") {
 		t.Errorf("should call RegisterEvents:\n%s", code)
 	}
+	for _, required := range []string{"eventBus, err := event.NewFromEnv()", "taskQueue, err := queue.NewFromEnv(", "if err := user_luxo.RegisterEvents(", "fatal: initialize messaging:", "fatal: register events:"} {
+		if !strings.Contains(code, required) {
+			t.Errorf("embedded entry must propagate messaging failures: missing %q", required)
+		}
+	}
 	if !strings.Contains(code, "eventBus.Close()") {
 		t.Errorf("should defer eventBus.Close():\n%s", code)
 	}
@@ -574,6 +579,11 @@ func TestGenerateModuleEntryFiles_WithEvents(t *testing.T) {
 	}
 	if !strings.Contains(src, "RegisterEvents") {
 		t.Errorf("should register events:\n%s", src)
+	}
+	for _, required := range []string{"eventBus, err := event.NewFromEnv()", "taskQueue, err := queue.NewFromEnv(", "if err := order_luxo.RegisterEvents(", "fatal: initialize messaging:", "fatal: register events:"} {
+		if !strings.Contains(src, required) {
+			t.Errorf("module entry must propagate messaging failures: missing %q", required)
+		}
 	}
 }
 
@@ -1105,7 +1115,7 @@ func TestGeneratedEntriesBridgeNativeStreamsThroughRPC(t *testing.T) {
 	if !strings.Contains(module, "score_luxo.RegisterStreams(gw.Router, eventBus, app.Resolver)") {
 		t.Fatalf("service native stream resolver was not injected:\n%s", module)
 	}
-	if !strings.Contains(module, "eventBus := event.NewFromEnv()") {
+	if !strings.Contains(module, "eventBus, err := event.NewFromEnv()") {
 		t.Fatalf("native stream service did not initialize its event bus:\n%s", module)
 	}
 	if !strings.Contains(module, "score_luxo.RegisterSchema(gw.Router.Schema)") {

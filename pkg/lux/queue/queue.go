@@ -6,7 +6,7 @@ package queue
 import (
 	"context"
 	"fmt"
-	"os"
+	"strings"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/env"
@@ -61,17 +61,19 @@ func (c *Config) validate() {
 }
 
 // NewFromEnv creates a Queue based on environment configuration.
-// If NATS_URL is set, connects to NATS JetStream (falls back to MemoryQueue on failure).
-// Otherwise uses MemoryQueue.
-func NewFromEnv(cfg Config) Queue {
+// An explicitly configured NATS backend must initialize successfully.
+// Only an unset NATS_URL selects MemoryQueue.
+func NewFromEnv(cfg Config) (Queue, error) {
 	cfg.validate()
 	if natsURL, ok := env.Get("NATS_URL"); ok {
+		if strings.TrimSpace(natsURL) == "" {
+			return nil, fmt.Errorf("queue: NATS_URL is set but empty")
+		}
 		q, err := NewNATSQueue(natsURL, cfg)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: NATS JetStream connect failed, using memory queue: %v\n", err)
-			return NewMemoryQueue(cfg)
+			return nil, fmt.Errorf("queue: initialize NATS JetStream: %w", err)
 		}
-		return q
+		return q, nil
 	}
-	return NewMemoryQueue(cfg)
+	return NewMemoryQueue(cfg), nil
 }

@@ -48,6 +48,7 @@ jobs:
       DATABASE_PREFIX: luxo_test
       DATABASE_SSL: disable
       LUXO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
+      NATS_URL: nats://127.0.0.1:4222
 
     steps:
       - uses: actions/checkout@v7
@@ -323,11 +324,14 @@ jobs:
 
       - name: Enforce performance baseline
         if: steps.benchmark_scope.outputs.run == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
+          set -euo pipefail
           if [[ -s .tmp/benchstat-confirmation.csv ]]; then
-            GOWORK=off go run ./scripts/benchgate .tmp/benchstat-primary.csv .tmp/benchstat-confirmation.csv
+            GOWORK=off go run ./scripts/benchgate --approved-costs scripts/benchgate/approved-costs.json --base-sha "${BASE_SHA}" .tmp/benchstat-primary.csv .tmp/benchstat-confirmation.csv
           else
-            GOWORK=off go run ./scripts/benchgate .tmp/benchstat-primary.csv
+            GOWORK=off go run ./scripts/benchgate --approved-costs scripts/benchgate/approved-costs.json --base-sha "${BASE_SHA}" .tmp/benchstat-primary.csv
           fi
 
   external-go-consumer:

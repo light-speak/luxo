@@ -26,25 +26,6 @@ func GenerateNativeFile(result *semantic.Result, packageName string) []byte {
 	}
 
 	var b strings.Builder
-	writeHeader(&b, packageName, "native.gen.go")
-	// Scan for time import need (DateTime params/return)
-	needsTime := false
-	for _, api := range apis {
-		for _, p := range api.Params {
-			if p.Type != nil && p.Type.Name == "DateTime" {
-				needsTime = true
-			}
-		}
-		if api.ReturnType != nil && api.ReturnType.Name == "DateTime" {
-			needsTime = true
-		}
-	}
-	if needsTime {
-		b.WriteString("import (\n\t\"context\"\n\t\"time\"\n)\n\n")
-	} else if len(apis) > 0 {
-		b.WriteString("import \"context\"\n\n")
-	}
-
 	b.WriteString("// NativeResolver is the interface for @native API implementations.\n")
 	b.WriteString("// Implement this interface in your resolver package.\n")
 	b.WriteString("type NativeResolver interface {\n")
@@ -55,6 +36,10 @@ func GenerateNativeFile(result *semantic.Result, packageName string) []byte {
 		fmt.Fprintf(&b, "\t%s(ctx context.Context", str.Capitalize(api.Name))
 		for _, p := range api.Params {
 			goType := resolveGoType(p.Type)
+			if p.Spread {
+				fmt.Fprintf(&b, ", %s ...%s", p.Name, goType)
+				continue
+			}
 			fmt.Fprintf(&b, ", %s %s", p.Name, goType)
 		}
 		returnType := unwrapResultType(api.ReturnType)
@@ -66,7 +51,29 @@ func GenerateNativeFile(result *semantic.Result, packageName string) []byte {
 	}
 	b.WriteString("}\n")
 
-	return []byte(b.String())
+	body := b.String()
+	var out strings.Builder
+	writeHeader(&out, packageName, "native.gen.go")
+	writeNativeImports(&out, body)
+	out.WriteString(body)
+	return []byte(out.String())
+}
+
+// Derive imports from emitted signatures, including nullable/list/Result wrappers.
+func writeNativeImports(b *strings.Builder, body string) {
+	if !strings.Contains(body, "context.Context") {
+		return
+	}
+	b.WriteString("import (\n\t\"context\"\n")
+	for _, imp := range []struct{ qualifier, path string }{
+		{"json.", "encoding/json"}, {"time.", "time"},
+		{"uuid.", "github.com/google/uuid"}, {"decimal.", "github.com/shopspring/decimal"},
+	} {
+		if strings.Contains(body, imp.qualifier) {
+			fmt.Fprintf(b, "\t%q\n", imp.path)
+		}
+	}
+	b.WriteString(")\n\n")
 }
 
 func unwrapResultType(ref *luxoast.TypeRef) *luxoast.TypeRef {

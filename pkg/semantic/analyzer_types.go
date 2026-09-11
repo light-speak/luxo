@@ -420,15 +420,78 @@ func (a *Analyzer) resolveApiTypes(file *ast.File) {
 			a.addError(api.ReturnType.Pos, "API return types must be response values, not Result<T> / API 返回类型必须是响应值，不能是 Result<T>")
 		}
 
-		for _, p := range api.Params {
-			a.resolveTypeRef(p.Type, api.Pos)
-		}
+		a.validateAPIParameters(api)
 		a.checkDirectives(api.Directives, OnApi)
 		a.validatePaginateAPI(api)
 		a.validateStreamAPI(api)
 		a.validateNativeReturnType(api)
 		a.validateScopeDirective(api)
 	}
+}
+
+func (a *Analyzer) validateAPIParameters(api *ast.ApiDecl) {
+	a.validateCallableParameters("API", api.Name, api.Params)
+	for _, param := range api.Params {
+		if param.Spread {
+			a.addError(param.Pos, "API parameter '%s' cannot be variadic; use [%s] / API 参数 '%s' 不能是不定参数，请使用 [%s]", param.Name, param.Type.Name, param.Name, param.Type.Name)
+		}
+	}
+}
+
+func (a *Analyzer) validateCallableParameters(kind, name string, params []*ast.ParamDecl) {
+	seen := make(map[string]bool, len(params))
+	for _, param := range params {
+		expected := a.resolveTypeRef(param.Type, param.Pos)
+		if seen[param.Name] {
+			a.addError(param.Pos, "duplicate parameter '%s' in %s '%s' / %s '%s' 中参数 '%s' 重复", param.Name, kind, name, kind, name, param.Name)
+		} else {
+			seen[param.Name] = true
+		}
+		a.validateParameterDefault(param, expected)
+	}
+}
+
+func (a *Analyzer) validateParameterDefault(param *ast.ParamDecl, expected *ResolvedType) {
+	if param.Default == nil {
+		return
+	}
+	actual, constant := a.parameterDefaultType(param.Default)
+	if !constant {
+		a.addError(param.Default.GetPos(), "default value for parameter '%s' must be a compile-time constant / 参数 '%s' 的默认值必须是编译期常量", param.Name, param.Name)
+		return
+	}
+	if actual != nil && !isTypeAssignable(expected, actual) {
+		a.addError(param.Default.GetPos(), "default value for parameter '%s' expects '%s', got '%s' / 参数 '%s' 的默认值需要 '%s'，实际得到 '%s'", param.Name, formatResolvedType(expected), formatDefaultValueType(actual), param.Name, formatResolvedType(expected), formatDefaultValueType(actual))
+	}
+}
+
+func (a *Analyzer) parameterDefaultType(expr ast.Expr) (*ResolvedType, bool) {
+	switch value := expr.(type) {
+	case *ast.Literal:
+		return a.literalType(value), true
+	case *ast.UnaryExpr:
+		literal, ok := value.Value.(*ast.Literal)
+		if ok && (value.Op == "+" || value.Op == "-") && (literal.Kind == token.Int || literal.Kind == token.Float || literal.Kind == token.Duration) {
+			return a.literalType(literal), true
+		}
+	case *ast.MemberExpr:
+		owner, ok := value.Object.(*ast.Ident)
+		if !ok {
+			return nil, false
+		}
+		typ := a.types[owner.Name]
+		if typ != nil && typ.Kind == TypeEnum && stringInSlice(value.Field, typ.EnumValues) {
+			return typ, true
+		}
+	}
+	return nil, false
+}
+
+func formatDefaultValueType(typ *ResolvedType) string {
+	if typ.Kind == TypeUnknown && typ.Name == "null" {
+		return "null"
+	}
+	return formatResolvedType(typ)
 }
 
 func (a *Analyzer) validatePaginateAPI(api *ast.ApiDecl) {
@@ -870,10 +933,16 @@ func isPascalBoundary(s string, idx, sepLen int) bool {
 // validateNativeReturnType checks that @native APIs declare a return type.
 func (a *Analyzer) validateNativeReturnType(api *ast.ApiDecl) {
 	for _, d := range api.Directives {
-		if d.Name == "native" && api.ReturnType == nil {
-			a.addError(api.Pos, "@native API must declare a return type")
-			return
+		if d.Name != "native" {
+			continue
 		}
+		if api.ReturnType == nil {
+			a.addError(api.Pos, "@native API must declare a return type")
+		}
+		if api.Body != nil && !hasNamedDirective(api.Directives, "stream") {
+			a.addError(api.Body.Pos, "@native API cannot declare a Luxo body / @native API 不能声明 Luxo 函数体")
+		}
+		return
 	}
 }
 
@@ -951,11 +1020,44 @@ func (a *Analyzer) resolveFnTypes(file *ast.File) {
 		if fn.ReturnType != nil {
 			sym.Type = a.resolveTypeRef(fn.ReturnType, fn.Pos)
 		}
-		for _, p := range fn.Params {
-			a.resolveTypeRef(p.Type, fn.Pos)
-		}
+		a.validateFunctionParameters(fn)
 		a.checkDirectives(fn.Directives, OnFn)
+		a.validateFunctionBoundary(fn)
 		a.validateFunctionResult(fn)
+	}
+}
+
+func (a *Analyzer) validateFunctionParameters(fn *ast.FnDecl) {
+	a.validateCallableParameters("fn", fn.Name, fn.Params)
+	variadicSeen := false
+	for index, param := range fn.Params {
+		if !param.Spread {
+			continue
+		}
+		if variadicSeen {
+			a.addError(param.Pos, "only one variadic parameter is allowed / 只允许一个不定参数")
+		}
+		variadicSeen = true
+		if index != len(fn.Params)-1 {
+			a.addError(param.Pos, "variadic parameter '%s' must be last / 不定参数 '%s' 必须位于最后", param.Name, param.Name)
+		}
+		if param.Default != nil {
+			a.addError(param.Pos, "variadic parameter '%s' cannot have a default value / 不定参数 '%s' 不能有默认值", param.Name, param.Name)
+		}
+	}
+}
+
+func (a *Analyzer) validateFunctionBoundary(fn *ast.FnDecl) {
+	isNative := hasNamedDirective(fn.Directives, "native")
+	isService := hasNamedDirective(fn.Directives, "service")
+	if isNative && fn.Body != nil {
+		a.addError(fn.Body.Pos, "@native fn '%s' cannot declare a Luxo body / @native fn '%s' 不能声明 Luxo 函数体", fn.Name, fn.Name)
+	}
+	if !isNative && fn.Body == nil {
+		a.addError(fn.Pos, "fn '%s' must declare a Luxo body or use @native / fn '%s' 必须声明 Luxo 函数体或使用 @native", fn.Name, fn.Name)
+	}
+	if hasNamedDirective(fn.Directives, "auth") && !isService {
+		a.addError(fn.Pos, "@auth on fn '%s' requires @service / fn '%s' 上的 @auth 必须与 @service 一起使用", fn.Name, fn.Name)
 	}
 }
 

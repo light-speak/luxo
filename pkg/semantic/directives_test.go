@@ -150,10 +150,9 @@ func TestDirectiveCorrectContextMiddleware(t *testing.T) {
 	expectNoErrors(t, result)
 }
 
-func TestDirectiveFnAuth(t *testing.T) {
-	// @auth on fn (correct — allowed on fn)
+func TestDirectivePrivateFnAuthRequiresServiceBoundary(t *testing.T) {
 	result := analyze(t, `fn secureOp(): Result<Int> @auth @native`)
-	expectNoErrors(t, result)
+	expectError(t, result, "@auth on fn 'secureOp' requires @service")
 }
 
 // ========== Directive Type Constraint ==========

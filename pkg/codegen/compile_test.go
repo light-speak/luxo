@@ -193,7 +193,7 @@ func TestServiceFunctionCallsNativeResultThroughResolver(t *testing.T) {
 		},
 	}}}
 	var body strings.Builder
-	defaultGenerator().generateServiceFnHandlers(&body, result, nil)
+	defaultGenerator().generateServiceFnHandlers(&body, result, nil, nil, collectFunctionDeclarations(result), nil)
 	if !strings.Contains(body.String(), "app.Resolver.LoadCount(ctx)") {
 		t.Fatalf("service function did not route native Result call through resolver:\n%s", body.String())
 	}

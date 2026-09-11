@@ -651,6 +651,178 @@ api count(): Int {
 	expectError(t, result, "must be applied directly")
 }
 
+func TestFunctionCallAcceptsNamedArgumentsAndDefaults(t *testing.T) {
+	result := analyze(t, `
+fn format(label: String, count: Int = 2): String { label }
+api display(): String { format(count: 3, label: "ready") }
+`)
+	expectNoErrors(t, result)
+}
+
+func TestCompiledFunctionCanCallNativeFunction(t *testing.T) {
+	result := analyze(t, `
+fn loadBaseScore(projectId: Int, adjustment: Int = 4): Result<Int> @native
+fn evaluateScore(projectId: Int): Int {
+  loadBaseScore(adjustment: 3, projectId: projectId)? + 1
+}
+api releaseScore(projectId: Int): Int { evaluateScore(projectId) }
+`)
+	expectNoErrors(t, result)
+}
+
+func TestCompiledFunctionCanCallVoidNativeFunction(t *testing.T) {
+	result := analyze(t, `
+fn recordAudit(action: String) @native
+fn recordRelease() { recordAudit("release") }
+api release(): Boolean {
+  recordRelease()
+  return true
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestFunctionCallAcceptsVariadicArguments(t *testing.T) {
+	result := analyze(t, `
+fn join(prefix: String, ...values: String): String { prefix }
+api display(): String { join("release", "ready", "now") }
+`)
+	expectNoErrors(t, result)
+}
+
+func TestFunctionDeclarationRejectsInvalidVariadicParameters(t *testing.T) {
+	tests := []struct {
+		name    string
+		params  string
+		message string
+	}{
+		{name: "not last", params: "...values: String, suffix: String", message: "variadic parameter 'values' must be last"},
+		{name: "default", params: `...values: String = "ready"`, message: "variadic parameter 'values' cannot have a default value"},
+		{name: "multiple", params: "...first: String, ...second: String", message: "only one variadic parameter is allowed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := analyze(t, "fn join("+tt.params+"): String { \"ready\" }")
+			expectError(t, result, tt.message)
+		})
+	}
+}
+
+func TestFunctionDeclarationRequiresOneExecutableBoundary(t *testing.T) {
+	tests := []struct {
+		name    string
+		source  string
+		message string
+	}{
+		{name: "missing body", source: "fn helper(): Int", message: "fn 'helper' must declare a Luxo body or use @native"},
+		{name: "service missing body", source: "fn helper(): Int @service", message: "fn 'helper' must declare a Luxo body or use @native"},
+		{name: "native with body", source: "fn helper(): Result<Int> @native { 1 }", message: "@native fn 'helper' cannot declare a Luxo body"},
+		{name: "private auth", source: "fn helper(): Int @auth { 1 }", message: "@auth on fn 'helper' requires @service"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := analyze(t, tt.source)
+			expectError(t, result, tt.message)
+		})
+	}
+}
+
+func TestNativeAPICannotDeclareLuxoBody(t *testing.T) {
+	result := analyze(t, "api helper(): Int @native { 1 }")
+	expectError(t, result, "@native API cannot declare a Luxo body")
+}
+
+func TestAPICannotDeclareVariadicParameter(t *testing.T) {
+	result := analyze(t, "api sum(...values: Int): Int @native")
+	expectError(t, result, "API parameter 'values' cannot be variadic; use [Int]")
+}
+
+func TestFunctionCallCannotBypassServiceBoundary(t *testing.T) {
+	result := analyze(t, `
+fn remoteScore(projectId: Int): Int @service { projectId }
+api score(projectId: Int): Int { remoteScore(projectId) }
+`)
+	expectError(t, result, "@service fn 'remoteScore' cannot be called as a local function")
+}
+
+func TestCallableParametersRejectDuplicateNames(t *testing.T) {
+	tests := []struct {
+		name    string
+		source  string
+		message string
+	}{
+		{name: "API", source: "api lookup(id: Int, id: Int): Int @native", message: "duplicate parameter 'id' in API 'lookup'"},
+		{name: "function", source: "fn add(value: Int, value: Int): Int { value }", message: "duplicate parameter 'value' in fn 'add'"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := analyze(t, tt.source)
+			expectError(t, result, tt.message)
+		})
+	}
+}
+
+func TestCallableParameterDefaultsMustBeStaticAndTyped(t *testing.T) {
+	tests := []struct {
+		name    string
+		source  string
+		message string
+	}{
+		{name: "API type mismatch", source: `api lookup(limit: Int = "all"): Int @native`, message: "default value for parameter 'limit' expects 'Int', got 'String'"},
+		{name: "function type mismatch", source: `fn label(value: String = 1): String { value }`, message: "default value for parameter 'value' expects 'String', got 'Int'"},
+		{name: "runtime expression", source: `fn add(value: Int = now()): Int { value }`, message: "default value for parameter 'value' must be a compile-time constant"},
+		{name: "member runtime expression", source: `fn add(value: Int = now().second): Int { value }`, message: "default value for parameter 'value' must be a compile-time constant"},
+		{name: "null non-nullable", source: `fn label(value: String = null): String { value }`, message: "default value for parameter 'value' expects 'String', got 'null'"},
+		{name: "wrong enum", source: `enum Mode { FAST } enum State { READY } fn mode(value: Mode = State.READY): Mode { value }`, message: "default value for parameter 'value' expects 'Mode', got 'State'"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := analyze(t, tt.source)
+			expectError(t, result, tt.message)
+		})
+	}
+}
+
+func TestCallableParameterDefaultsAcceptSupportedConstants(t *testing.T) {
+	result := analyze(t, `
+enum Mode { FAST }
+fn configure(
+  retries: Int = -1,
+  ratio: Float = 0.5,
+  label: String = "ready",
+  enabled: Boolean = true,
+  timeout: Duration = 5s,
+  mode: Mode = Mode.FAST,
+  note: String? = null
+): Int { retries }
+`)
+	expectNoErrors(t, result)
+}
+
+func TestFunctionCallRejectsInvalidArguments(t *testing.T) {
+	tests := []struct {
+		name    string
+		call    string
+		message string
+	}{
+		{name: "missing required", call: "format(count: 3)", message: "missing required argument 'label'"},
+		{name: "unknown named", call: `format(label: "ready", other: 3)`, message: "unknown argument 'other'"},
+		{name: "duplicate named", call: `format(label: "ready", label: "again")`, message: "duplicate argument 'label'"},
+		{name: "wrong type", call: "format(label: 1)", message: "argument 'label' expects 'String', got 'Int'"},
+		{name: "too many positional", call: `format("ready", 2, 3)`, message: "expects at most 2 argument(s), got 3"},
+		{name: "positional after named", call: `format(count: 3, "ready")`, message: "positional argument cannot follow named arguments"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := analyze(t, `
+fn format(label: String, count: Int = 2): String { label }
+api display(): String { `+tt.call+` }
+`)
+			expectError(t, result, tt.message)
+		})
+	}
+}
+
 func TestBinaryIn(t *testing.T) {
 	result := analyze(t, `
 api test(): Boolean {
