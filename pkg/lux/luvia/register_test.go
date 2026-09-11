@@ -469,7 +469,11 @@ func TestGatewayRegistrarHeartbeatLoopDone(t *testing.T) {
 func TestGatewayRegistrarHeartbeatLoopTicks(t *testing.T) {
 	requestReceived := make(chan struct{}, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		requestReceived <- struct{}{}
+		// Coalesce ticks: the assertion consumes only the first notification.
+		select {
+		case requestReceived <- struct{}{}:
+		default:
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()

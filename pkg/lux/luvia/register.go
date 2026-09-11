@@ -74,6 +74,8 @@ type GatewayRegistrar struct {
 	startedAt       time.Time
 	cpu             cpuSampler
 	done            chan struct{}
+	ctx             context.Context
+	cancel          context.CancelFunc
 	closed          bool
 	mu              sync.Mutex
 	worker          sync.WaitGroup
@@ -96,6 +98,11 @@ func newGatewayRegistrarWithDependencyStats(port, version string, dependencyStat
 	studioURL := os.Getenv("LUXO_STUDIO_URL")
 	apiKey := os.Getenv("LUXO_API_KEY")
 	if studioURL == "" || apiKey == "" {
+		return nil
+	}
+	studioURL, err := studioURLFromEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[studio] %v\n", err)
 		return nil
 	}
 	projectID, err := studioProjectIDFromEnv()
@@ -122,6 +129,7 @@ func newGatewayRegistrarWithDependencyStats(port, version string, dependencyStat
 		endpoint = fmt.Sprintf("http://%s:%s", instanceID, port)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	gr := &GatewayRegistrar{
 		studioURL:  studioURL,
 		apiKey:     apiKey,
@@ -137,7 +145,9 @@ func newGatewayRegistrarWithDependencyStats(port, version string, dependencyStat
 		version:         version,
 		startedAt:       time.Now(),
 		done:            make(chan struct{}),
-		client:          &http.Client{Timeout: 10 * time.Second},
+		ctx:             ctx,
+		cancel:          cancel,
+		client:          newStudioHTTPClient(),
 		dependencyStats: dependencyStats,
 	}
 	gr.cpu.percent()
@@ -186,6 +196,9 @@ func (gr *GatewayRegistrar) Close() {
 	}
 	gr.closed = true
 	close(gr.done)
+	if gr.cancel != nil {
+		gr.cancel()
+	}
 	gr.mu.Unlock()
 
 	// Waiting prevents a delayed startup registration from recreating the node
@@ -221,7 +234,7 @@ func (gr *GatewayRegistrar) register() bool {
 	}
 	body, _ := json.Marshal(payload)
 
-	req, err := http.NewRequest("POST", gr.studioURL+"/luvia", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(gr.requestContext(), http.MethodPost, gr.studioURL+"/luvia", bytes.NewReader(body))
 	if err != nil {
 		return false
 	}
@@ -244,6 +257,14 @@ func (gr *GatewayRegistrar) register() bool {
 
 func (gr *GatewayRegistrar) heartbeatLoop() {
 	gr.heartbeatLoopEvery(30 * time.Second)
+}
+
+func (gr *GatewayRegistrar) requestContext() context.Context {
+	// Package-internal standalone registrars may have no background worker.
+	if gr.ctx == nil {
+		return context.Background()
+	}
+	return gr.ctx
 }
 
 // refreshRegistration retries the handshake before renewing the lease.
@@ -283,7 +304,7 @@ func (gr *GatewayRegistrar) heartbeat() {
 	}
 	dependencies := make([]lux.RuntimeDependencyStats, 0)
 	if gr.dependencyStats != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(gr.requestContext(), 2*time.Second)
 		dependencies = gr.dependencyStats.RuntimeDependencies(ctx)
 		cancel()
 	}
@@ -299,7 +320,7 @@ func (gr *GatewayRegistrar) heartbeat() {
 		"dependencies": dependencies,
 	})
 
-	req, err := http.NewRequest("POST", gr.studioURL+"/luvia", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(gr.requestContext(), http.MethodPost, gr.studioURL+"/luvia", bytes.NewReader(body))
 	if err != nil {
 		return
 	}

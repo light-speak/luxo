@@ -87,6 +87,9 @@ func (g *Gateway) Serve(version string) error {
 		return err
 	}
 	if os.Getenv("LUXO_STUDIO_URL") != "" && os.Getenv("LUXO_API_KEY") != "" {
+		if _, err := studioURLFromEnv(); err != nil {
+			return err
+		}
 		if _, err := studioProjectIDFromEnv(); err != nil {
 			return err
 		}

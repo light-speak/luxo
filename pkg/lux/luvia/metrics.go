@@ -65,6 +65,11 @@ func NewMetricsCollector() *MetricsCollector {
 	if studioURL == "" || apiKey == "" {
 		return nil
 	}
+	studioURL, err := studioURLFromEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[studio] %v\n", err)
+		return nil
+	}
 	projectID, err := studioProjectIDFromEnv()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[studio] %v\n", err)
@@ -80,7 +85,7 @@ func NewMetricsCollector() *MetricsCollector {
 		traces:          make([]api.TraceRecord, 0, 128),
 		traceSampleRate: traceSampleRateFromEnv(),
 		done:            make(chan struct{}),
-		client:          &http.Client{Timeout: 10 * time.Second},
+		client:          newStudioHTTPClient(),
 	}
 	go mc.flushLoop()
 	return mc

@@ -341,7 +341,15 @@ metadata.
 Compatibility here means a new server continues accepting old clients, so compatible releases should deploy servers before regenerated clients. Adding a model/type field or an optional API parameter is compatible in that direction. Removing or changing a field/parameter, adding a required parameter, changing an API return type, removing an API, or changing an event payload is breaking. Removed IDs stay reserved and are never reused.
 
 
+### Studio Registration Transport Security
+
+Configure `LUXO_STUDIO_URL`, `LUXO_API_KEY`, and the public project UUID `LUXO_PROJECT_ID` to enable registration and periodic heartbeats. Remote URLs require HTTPS by default; `localhost` and loopback IPs may use HTTP for local development. Only explicitly trusted private networks should enable remote HTTP through `LUXO_STUDIO_ALLOW_INSECURE_HTTP=true`; this does not encrypt the connection. URLs must not contain embedded credentials, query parameters, or fragments.
+
+Registration, heartbeats, deregistration, metrics, and trace exports never follow HTTP redirects, preventing replay of credential-bearing request bodies. Gateway shutdown cancels in-flight registration, heartbeats, and dependency probes, joins the registration worker, then attempts deregistration with a separate two-second timeout. These operations stay outside application request hot paths.
+
 ### Release and Stability Policy
+
+Until SDK versions are stabilized, the cross-repository Swift development CI temporarily follows `main`. This checks current integration but is not reproducible release compatibility evidence; pin the SDK commit and record the compatibility matrix after stabilization.
 
 The next release target is **`v1.0.0-beta.1`**, not an already published stable release. Luxo follows [Semantic Versioning](https://semver.org/): Git tags use the `v` prefix; package versions use the format required by their ecosystem.
 
