@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -9,11 +10,30 @@ type generatedImports uint32
 
 func (imports generatedImports) has(name string) bool { return imports&generatedPackageBit(name) != 0 }
 
+// writeScalarTypeImports shares value-type imports across emitted signatures.
+func writeScalarTypeImports(b *strings.Builder, body string) {
+	wanted := generatedPackageBit("json") | generatedPackageBit("time") |
+		generatedPackageBit("uuid") | generatedPackageBit("decimal")
+	packages := scanGeneratedPackages(body, wanted)
+	for _, imp := range []struct{ name, path string }{
+		{"json", "encoding/json"}, {"time", "time"},
+		{"uuid", "github.com/google/uuid"}, {"decimal", "github.com/shopspring/decimal"},
+	} {
+		if packages.has(imp.name) {
+			fmt.Fprintf(b, "\t%q\n", imp.path)
+		}
+	}
+}
+
 // generatedPackages recognizes package-root selectors without allocating tokens
 // or reparsing a Go AST. Go literal boundaries come from the standard library;
 // comments/whitespace preserve the preceding identifier, other tokens clear it.
 // This scan is generation-only and retains no state between output files.
 func generatedPackages(body string) generatedImports {
+	return scanGeneratedPackages(body, 0)
+}
+
+func scanGeneratedPackages(body string, stopAfter generatedImports) generatedImports {
 	var imports generatedImports
 	identifier := ""
 	afterDot := false
@@ -50,6 +70,9 @@ func generatedPackages(body string) generatedImports {
 		}
 		if ch == '.' {
 			imports |= generatedPackageBit(identifier)
+			if stopAfter != 0 && imports&stopAfter == stopAfter {
+				return imports
+			}
 		}
 		identifier, afterDot = "", ch == '.'
 		index++

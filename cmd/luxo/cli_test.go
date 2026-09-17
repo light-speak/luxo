@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,6 +36,49 @@ func TestCallFieldMaskUsesStableSchemaIDs(t *testing.T) {
 	}
 }
 
+func TestLoadCallSchemaPreparesNestedTypes(t *testing.T) {
+	tempRoot := filepath.Join("..", "..", ".tmp")
+	if err := os.MkdirAll(tempRoot, 0755); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.CreateTemp(tempRoot, "call-schema-*.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := file.Name()
+	t.Cleanup(func() { file.Close(); os.Remove(path) })
+	data := `{"models":{},"apis":{"read":{"name":"read","returnType":"Parent"}},"types":{
+		"Parent":{"name":"Parent","fields":[{"id":1,"name":"child","type":"Model","typeName":"Child","relation":true}]},
+		"Child":{"name":"Child","fields":[{"id":3,"name":"value","type":"Int"}]}}}`
+	if _, err := file.WriteString(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := loadCallSchema(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mask, err := callFieldMask("child { value }", s.APIs["read"], s)
+	if err != nil || len(mask) == 0 {
+		t.Fatalf("decoded nested selection: %x / %v", mask, err)
+	}
+	child := s.LookupModel("Child")
+	if child == nil || child != s.LookupModel("Child") || string(child.FieldByID(3).JSONPrefix) != `"value":` {
+		t.Fatal("CLI did not prepare type metadata")
+	}
+	if _, err := loadCallSchema(path + ".missing"); err == nil {
+		t.Fatal("missing file accepted")
+	}
+	if err := os.WriteFile(path, []byte(`{`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadCallSchema(path); err == nil {
+		t.Fatal("malformed schema accepted")
+	}
+}
+
 func TestParseBinaryCLIValueUsesSchemaType(t *testing.T) {
 	value, err := parseBinaryCLIValue(`["AQI=",""]`, schema.Param{Type: schema.FieldBytes, IsList: true})
 	if err != nil {
@@ -48,7 +92,7 @@ func TestParseBinaryCLIValueUsesSchemaType(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if jsonValue.(map[string]any)["ok"] != true {
+	if string(jsonValue.(json.RawMessage)) != `{"ok":true}` {
 		t.Fatalf("JSON = %#v", jsonValue)
 	}
 }
@@ -230,7 +274,7 @@ func TestReadModulePath(t *testing.T) {
 	defer os.Chdir(origDir)
 	os.Chdir(dir)
 
-	os.WriteFile("go.mod", []byte("module github.com/test/myapp\n\ngo 1.26\n"), 0644)
+	os.WriteFile("go.mod", []byte("module github.com/test/myapp\n\ngo 1.27.1\n"), 0644)
 
 	path, err := readModulePath()
 	if err != nil {
@@ -260,7 +304,7 @@ func TestReadModulePathNoDirective(t *testing.T) {
 	defer os.Chdir(origDir)
 	os.Chdir(dir)
 
-	os.WriteFile("go.mod", []byte("go 1.26\n"), 0644)
+	os.WriteFile("go.mod", []byte("go 1.27.1\n"), 0644)
 
 	_, err := readModulePath()
 	if err == nil {

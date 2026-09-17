@@ -7,9 +7,23 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.test.assertFailsWith
 import kotlinx.serialization.builtins.serializer
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.encodeToJsonElement
 
 class PageTest {
+
+    @Test
+    fun `page metadata preserves int64 precision in JSON`() {
+        for (value in listOf(2147483648L, 4294967296L, 9007199254740993L, Long.MAX_VALUE)) {
+            val json = """{"items":["x"],"total":$value,"page":$value,"pageSize":$value}"""
+            val page = Json.decodeFromString<Page<String>>(json)
+            assertEquals(value, page.total)
+            assertEquals(value, page.page)
+            assertEquals(value, page.pageSize)
+            assertEquals(json, Json.encodeToString(Page.serializer(String.serializer()), page))
+        }
+    }
 
     @Test
     fun `page data class properties`() {
@@ -21,9 +35,9 @@ class PageTest {
         )
 
         assertEquals(listOf("a", "b", "c"), page.items)
-        assertEquals(10, page.total)
-        assertEquals(1, page.page)
-        assertEquals(3, page.pageSize)
+        assertEquals(10L, page.total)
+        assertEquals(1L, page.page)
+        assertEquals(3L, page.pageSize)
     }
 
     @Test
@@ -31,9 +45,9 @@ class PageTest {
         val json = """{"items":["x","y"],"total":5,"page":2,"pageSize":2}"""
         val page = Json.decodeFromString<Page<String>>(json)
         assertEquals(listOf("x", "y"), page.items)
-        assertEquals(5, page.total)
-        assertEquals(2, page.page)
-        assertEquals(2, page.pageSize)
+        assertEquals(5L, page.total)
+        assertEquals(2L, page.page)
+        assertEquals(2L, page.pageSize)
 
         val encoded = Json.encodeToString(Page.serializer(String.serializer()), page)
         assertEquals(json, encoded)
@@ -41,6 +55,29 @@ class PageTest {
 }
 
 class LuxoSchemaTest {
+
+    @Test
+    fun `Go introspection metadata is preserved without ignoring unknown fields`() {
+        val source = """
+        {
+          "models":{"Project":{"name":"Project","module":"project","usage":"output","description":"项目","directives":["crud"],
+            "fields":[{"id":1,"name":"owner","type":"Model","typeName":"User","relation":true,"computed":true,
+              "primaryKey":true,"description":"负责人","directives":["by"],"relationKind":"belongsTo",
+              "localKey":"ownerId","remoteKey":"id","targetModule":"user","module":"project","foreignKey":"ownerId"}]}},
+          "enums":{"Role":{"name":"Role","module":"user","values":["ADMIN"],"description":"权限"}},
+          "types":{"Precision":{"name":"Precision","module":"precision","usage":"inputOutput","description":"精度",
+            "directives":["example"],"fields":[{"id":1,"name":"value","type":"Int","description":"完整整数"}]}},
+          "apis":{"echo":{"id":1,"name":"echo","module":"precision","returnType":"Precision",
+            "description":"返回输入","directives":["native"],"deprecated":true,"deprecatedReason":"替代示例",
+            "params":[{"id":1,"name":"input","type":"Model","typeName":"Precision","description":"输入对象"}]}}
+        }
+        """.trimIndent()
+        val schema = Json.decodeFromString<LuxoSchema>(source)
+        assertEquals(Json.parseToJsonElement(source), Json.encodeToJsonElement(schema))
+        assertFailsWith<SerializationException> {
+            Json.decodeFromString<LuxoSchema>("""{"futureWireEncoding":"unknown"}""")
+        }
+    }
 
     @Test
     fun `schema defaults to empty maps`() {

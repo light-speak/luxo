@@ -26,5 +26,14 @@ class LuxoGradlePluginTest {
             compileKotlin.get().taskDependencies.getDependencies(compileKotlin.get())
                 .any { it.name == "luxoAnalyze" },
         )
+
+        val catalog = File("../gradle/libs.versions.toml").readText()
+        val compilerVersion = checkNotNull(Regex("""kotlin = "([^"]+)"""").find(catalog)).groupValues[1]
+        val analyzer = project.configurations.getByName("luxoAnalyzerRuntimeClasspath").dependencies
+        val compiler = analyzer.single { it.name == "kotlin-compiler-embeddable" }
+        assertEquals(compilerVersion, compiler.version)
+        val codegen = project.configurations.getByName("luxoCodegenRuntimeClasspath").dependencies
+        assertTrue(codegen.none { it.group == "org.jetbrains.kotlin" })
+        assertEquals(codegen.single().version, analyzer.single { it.name == "luxo-client" }.version)
     }
 }

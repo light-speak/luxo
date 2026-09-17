@@ -20,6 +20,17 @@ import (
 	"github.com/light-speak/luxo/pkg/lux/selection"
 )
 
+func checkedJSON(t testing.TB) func([]byte, error) []byte {
+	t.Helper()
+	return func(data []byte, err error) []byte {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+}
+
 func TestRouterBasic(t *testing.T) {
 	rt := NewRouter()
 	rt.Handle("getUser", func(ctx context.Context, req *Request) error {
@@ -176,7 +187,7 @@ func TestRouterEmptyBody(t *testing.T) {
 func TestRouterAppError(t *testing.T) {
 	rt := NewRouter()
 	rt.Handle("fail", func(ctx context.Context, req *Request) error {
-		return errors.NotFound.WithData(errors.MapData{"resource": "User"})
+		return errors.NotFound.WithData(errors.ResourceError{Resource: "User"})
 	})
 
 	body := `{"$api":"fail"}`
@@ -215,7 +226,7 @@ error:
 	rt := NewRouter()
 	rt.SetTranslator(tr)
 	rt.Handle("fail", func(ctx context.Context, req *Request) error {
-		return errors.NotFound.WithData(errors.MapData{"resource": "User"})
+		return errors.NotFound.WithData(errors.ResourceError{Resource: "User"})
 	})
 
 	body := `{"$api":"fail"}`
@@ -694,11 +705,11 @@ func TestIntrospectionViaHeader(t *testing.T) {
 func TestConvertBinaryToJSON_EmptyData(t *testing.T) {
 	rt := NewRouter()
 	// Empty data should return null regardless of schema
-	result := rt.convertBinaryToJSON("getUser", nil)
+	result := checkedJSON(t)(rt.convertBinaryToJSON("getUser", nil))
 	if string(result) != "null" {
 		t.Errorf("expected null for empty data, got %q", result)
 	}
-	result = rt.convertBinaryToJSON("getUser", []byte{})
+	result = checkedJSON(t)(rt.convertBinaryToJSON("getUser", []byte{}))
 	if string(result) != "null" {
 		t.Errorf("expected null for zero-length data, got %q", result)
 	}
@@ -709,7 +720,7 @@ func TestStreamPayloadJSONUsesSchemaConversion(t *testing.T) {
 	rt.Schema = schema.New()
 	rt.Schema.APIs["count"] = &schema.API{Name: "count", ReturnType: "Int"}
 	data := codec.AppendSvarint(nil, 42)
-	if got := string(rt.StreamPayloadJSON("count", data)); got != "42" {
+	if got := string(checkedJSON(t)(rt.StreamPayloadJSON("count", data))); got != "42" {
 		t.Fatalf("StreamPayloadJSON = %s", got)
 	}
 }
@@ -720,8 +731,8 @@ func TestConvertBinaryToJSONScalarListAndEnum(t *testing.T) {
 	rt.Schema.RegisterEnum(&schema.Enum{Name: "Role", Values: []string{"ADMIN"}})
 	rt.Schema.APIs["roles"] = &schema.API{Name: "roles", ReturnType: "Role", ReturnList: true}
 	data := codec.AppendArrayHeader(nil, 1)
-	data = codec.AppendString(data, "ADMIN")
-	if got := string(rt.convertBinaryToJSON("roles", data)); got != `["ADMIN"]` {
+	data = codec.AppendBytes(data, []byte("ADMIN"))
+	if got := string(checkedJSON(t)(rt.convertBinaryToJSON("roles", data))); got != `["ADMIN"]` {
 		t.Fatalf("enum list = %s", got)
 	}
 }
@@ -731,7 +742,7 @@ func TestConvertBinaryToJSON_NoSchema(t *testing.T) {
 	rt.Schema = nil
 	// Without schema, should pass data through (handler wrote JSON directly)
 	input := []byte(`{"id":1,"name":"test"}`)
-	result := rt.convertBinaryToJSON("getUser", input)
+	result := checkedJSON(t)(rt.convertBinaryToJSON("getUser", input))
 	if string(result) != string(input) {
 		t.Errorf("expected passthrough, got %q", result)
 	}
@@ -741,7 +752,7 @@ func TestConvertBinaryToJSON_UnknownAPI(t *testing.T) {
 	rt := NewRouter()
 	// Schema exists but API not registered — pass through
 	input := []byte(`{"id":1}`)
-	result := rt.convertBinaryToJSON("nonExistent", input)
+	result := checkedJSON(t)(rt.convertBinaryToJSON("nonExistent", input))
 	if string(result) != string(input) {
 		t.Errorf("unknown API should passthrough, got %q", result)
 	}
@@ -925,7 +936,7 @@ func TestIsStreamAPIUsesSchemaAndNativeRegistration(t *testing.T) {
 	rt := NewRouter()
 	rt.Schema.RegisterAPI(&schema.API{Name: "watchSchema", Stream: true})
 	rt.Schema.RegisterAPI(&schema.API{Name: "regularAPI"})
-	rt.HandleStreamNative("watchNative", func(context.Context, *StreamParams, any, *Stream) {})
+	rt.HandleStreamNative("watchNative", func(context.Context, *StreamParams, any, *Stream) error { return nil })
 
 	if !rt.isStreamAPI("watchSchema") {
 		t.Error("schema stream should be accepted")
@@ -950,7 +961,7 @@ func TestRouterValidateRequiresGeneratedStreamImplementations(t *testing.T) {
 	}
 
 	rt.RequireStream("watchNative")
-	rt.HandleStreamNative("watchNative", func(context.Context, *StreamParams, any, *Stream) {})
+	rt.HandleStreamNative("watchNative", func(context.Context, *StreamParams, any, *Stream) error { return nil })
 	if err := rt.Validate(); err != nil {
 		t.Fatalf("registered native stream failed validation: %v", err)
 	}
@@ -969,7 +980,7 @@ func TestConvertBinaryToJSON_ScalarNoReturnType(t *testing.T) {
 	var data []byte
 	data = codec.AppendSvarint(data, 42)
 
-	result := rt.convertBinaryToJSON("deleteUser", data)
+	result := checkedJSON(t)(rt.convertBinaryToJSON("deleteUser", data))
 	if string(result) != "42" {
 		t.Errorf("scalar should be 42, got %q", result)
 	}
@@ -998,7 +1009,7 @@ func TestConvertBinaryToJSON_TypeDeclaration(t *testing.T) {
 	enc.WriteEnd()
 	data = append(data, enc.Bytes()...)
 
-	result := rt.convertBinaryToJSON("login", data)
+	result := checkedJSON(t)(rt.convertBinaryToJSON("login", data))
 	got := string(result)
 	if !strings.Contains(got, `"token":"abc123"`) {
 		t.Errorf("should contain token: %s", got)
@@ -1016,9 +1027,9 @@ func TestConvertBinaryToJSON_ScalarReturnType(t *testing.T) {
 	})
 
 	var data []byte
-	data = codec.AppendString(data, "hello")
+	data = codec.AppendBytes(data, []byte("hello"))
 
-	result := rt.convertBinaryToJSON("count", data)
+	result := checkedJSON(t)(rt.convertBinaryToJSON("count", data))
 	if string(result) != `"hello"` {
 		t.Errorf("scalar string should be quoted, got %q", result)
 	}
@@ -1039,10 +1050,9 @@ func TestConvertBinaryToJSON_ListPath(t *testing.T) {
 
 	// Empty list — just test that the list path is reached
 	var data []byte
-	data = codec.AppendVarint(data, 0) // arena header (totalStringLen)
-	data = codec.AppendVarint(data, 0) // count=0
+	data = append(data, 0, 0, 0) // count, arena header, end marker
 
-	result := rt.convertBinaryToJSON("listItems", data)
+	result := checkedJSON(t)(rt.convertBinaryToJSON("listItems", data))
 	got := string(result)
 	if got != "[]" {
 		t.Errorf("empty list should be [], got %q", got)
@@ -1064,13 +1074,12 @@ func TestConvertBinaryToJSON_PaginatedListPath(t *testing.T) {
 
 	// Empty paginated list
 	var data []byte
-	data = codec.AppendVarint(data, 0)  // arena header
-	data = codec.AppendVarint(data, 0)  // total=0
-	data = codec.AppendVarint(data, 1)  // page=1
-	data = codec.AppendVarint(data, 20) // pageSize=20
-	data = codec.AppendVarint(data, 0)  // count=0
+	data = append(data, 0, 0, 0) // count, arena header, end marker
+	data = codec.AppendSvarint(data, 0)
+	data = codec.AppendSvarint(data, 1)
+	data = codec.AppendSvarint(data, 20)
 
-	result := rt.convertBinaryToJSON("listItems", data)
+	result := checkedJSON(t)(rt.convertBinaryToJSON("listItems", data))
 	got := string(result)
 	if !strings.Contains(got, "total") {
 		t.Errorf("paginated should have total: %s", got)
@@ -1176,6 +1185,73 @@ func TestRouterJSONWithFieldMaskConversion(t *testing.T) {
 	}
 }
 
+func TestRouterRejectsInvalidRawJSONResponse(t *testing.T) {
+	for _, raw := range [][]byte{nil, []byte(`{"secret":`), {'"', 0xff, '"'}} {
+		for _, traced := range []bool{false, true} {
+			rt := NewRouter()
+			rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "opaque", ReturnType: "JSON"})
+			rt.Handle("opaque", func(_ context.Context, req *Request) error {
+				req.Buf.B = codec.AppendBytes(req.Buf.B, raw)
+				return nil
+			})
+			assertMalformedJSONResponse(t, rt, `{"$api":"opaque"}`, traced)
+		}
+	}
+}
+
+func assertMalformedJSONResponse(t *testing.T, rt *Router, body string, traced bool) {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(body))
+	if traced {
+		rt.SetDevMode(true)
+		r.Header.Set(DebugTraceRequestHeader, "true")
+	}
+	w := httptest.NewRecorder()
+	rt.ServeHTTP(w, r)
+	if traced && w.Header().Get(DebugTraceResponseHeader) == "" {
+		t.Fatal("debug response did not contain a trace")
+	}
+	var result struct {
+		Code  int             `json:"code"`
+		Error string          `json:"error"`
+		Data  json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("invalid error envelope: %s / %v", w.Body.String(), err)
+	}
+	if w.Code != http.StatusInternalServerError || result.Code != 500 || result.Error == "" || result.Data != nil {
+		t.Fatalf("malformed JSON became a successful response: %d / %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "secret") {
+		t.Fatal("malformed payload leaked into the error")
+	}
+}
+
+func TestRouterRejectsBrokenNestedJSONResponse(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		for _, traced := range []bool{false, true} {
+			rt := NewRouter()
+			parent := &schema.Model{Name: "Parent", Fields: []schema.Field{
+				{ID: 1, Name: "id", Type: schema.FieldInt},
+				{ID: 2, Name: "child", Type: schema.FieldModel, TypeName: "Child", Relation: true},
+			}}
+			rt.Schema.RegisterModel(parent)
+			rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "opaque", ReturnType: "Parent"})
+			fields := "id"
+			if !missing {
+				rt.Schema.RegisterModel(&schema.Model{Name: "Child", Fields: []schema.Field{{ID: 1, Name: "value", Type: schema.FieldInt}}})
+				fields = "id, child { value }"
+			}
+			rt.Handle("opaque", func(_ context.Context, req *Request) error {
+				// Fault injection: a handler publishes a present but empty child frame.
+				req.Buf.B = append(req.Buf.B, 0, 1, 84, 2, 0, 0)
+				return nil
+			})
+			assertMalformedJSONResponse(t, rt, `{"$api":"opaque","$select":"`+fields+`"}`, traced)
+		}
+	}
+}
+
 func TestRouterJSONSelectionSupportsTypeReturn(t *testing.T) {
 	rt := NewRouter()
 	rt.Schema.RegisterType(&schema.TypeDecl{
@@ -1207,6 +1283,49 @@ func TestRouterJSONSelectionSupportsTypeReturn(t *testing.T) {
 	}
 	if !maskApplied {
 		t.Fatal("type return selection was not converted to a field mask")
+	}
+}
+
+func TestPreparedTypesKeepJSONAndBinarySelectionInSync(t *testing.T) {
+	rt := NewRouter()
+	rt.Schema.RegisterType(&schema.TypeDecl{Name: "Parent", Fields: []schema.Field{
+		{ID: 1, Name: "child", Type: schema.FieldModel, TypeName: "Child", Relation: true},
+	}})
+	rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "read", ReturnType: "Parent"})
+	for _, name := range []string{"previous", "current"} {
+		rt.Schema.RegisterType(&schema.TypeDecl{Name: "Child", Fields: []schema.Field{{ID: 3, Name: name, Type: schema.FieldInt}}})
+		selected, err := selection.Parse("child { " + name + " }")
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := &Request{API: "read", Select: selected}
+		if err := rt.applyJSONSelection(req, false); err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := rt.Registry.decodeFieldMask("read", req.FieldMask)
+		if err != nil || len(decoded) != 1 || len(decoded[0].Children) != 1 || decoded[0].Children[0].Name != name {
+			t.Fatalf("binary selection differs from JSON: %v / %v", decoded, err)
+		}
+		var child codec.Encoder
+		child.WriteVarint(0)
+		child.WriteFieldInt(3, 42)
+		child.WriteEnd()
+		var parent codec.Encoder
+		parent.WriteVarint(0)
+		parent.WriteFieldHeader(1)
+		parent.WriteBytes(child.Bytes())
+		parent.WriteEnd()
+		got, err := rt.StreamPayloadJSON("read", parent.Bytes())
+		if err != nil || string(got) != `{"child":{"`+name+`":42}}` {
+			t.Fatalf("nested response uses stale metadata: %q / %v", got, err)
+		}
+	}
+	previous, err := selection.Parse("child { previous }")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.applyJSONSelection(&Request{API: "read", Select: previous}, false); err == nil {
+		t.Fatal("removed field is still selectable")
 	}
 }
 

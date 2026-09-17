@@ -1,0 +1,267 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/light-speak/luxo/pkg/lux/api"
+	"github.com/light-speak/luxo/pkg/lux/codec"
+	"github.com/light-speak/luxo/pkg/lux/luvia"
+	"github.com/light-speak/luxo/pkg/lux/rpc"
+	"github.com/light-speak/luxo/pkg/lux/schema"
+)
+
+func TestGatewayNestedGeneratedProtocol(t *testing.T) {
+	for _, list := range []bool{false, true} {
+		for _, test := range gatewayNestedCases() {
+			t.Run(fmt.Sprintf("list=%v/%s/count=%d", list, test.field, test.count), func(t *testing.T) {
+				verifyGatewayNestedProtocol(t, list, test.field, test.count)
+			})
+		}
+	}
+}
+
+type gatewayNestedCase struct {
+	field string
+	count int
+}
+
+func gatewayNestedCases() []gatewayNestedCase {
+	return []gatewayNestedCase{
+		{"primary", 1}, {"optional", 1}, {"optional", 0},
+		{"rows", 2}, {"rows", 0}, {"optionalRows", 2}, {"optionalRows", 0},
+	}
+}
+
+func TestGatewayPrimaryKeysNested(t *testing.T) {
+	for _, list := range []bool{false, true} {
+		for _, test := range gatewayNestedCases() {
+			t.Run(fmt.Sprintf("list=%v/%s/count=%d", list, test.field, test.count), func(t *testing.T) {
+				s, mask := gatewayNestedSchema(list, test.field)
+				var encoded api.ResponseBuf
+				if err := writeGatewayNested(&encoded, gatewayNestedValue(test.field, test.count), mask, list); err != nil {
+					t.Fatal(err)
+				}
+				verifyGatewayNestedRead(t, encoded.B, list)
+				verifyGatewayPrimaryKeys(t, encoded.B, list, s.Models["NestedGroup"], s)
+			})
+		}
+	}
+}
+
+func TestGatewayPrimaryKeysNullableArrays(t *testing.T) {
+	for _, list := range []bool{false, true} {
+		for state := range 3 {
+			t.Run(fmt.Sprintf("list=%v/state=%d", list, state), func(t *testing.T) {
+				s := schema.New()
+				RegisterSchema(s)
+				model := s.Types["NullableArrays"].AsModel()
+				model.FieldByName("tail").PrimaryKey = true
+				s.RegisterModel(model)
+				value := NullableArrays{Tail: 9223372036854775807}
+				if state > 0 {
+					value.Values, value.Durations, value.Flags = []int64{}, []time.Duration{}, []bool{}
+				}
+				if state == 2 {
+					value.Values, value.Durations, value.Flags = []int64{-9223372036854775808}, []time.Duration{-1}, []bool{true}
+				}
+				var encoded api.ResponseBuf
+				var err error
+				if list {
+					err = WriteColumnarNullableArrays(&encoded, []NullableArrays{value}, nil)
+				} else {
+					err = value.WriteLuxo(&encoded, nil)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				verifyGatewayPrimaryKeys(t, encoded.B, list, model, s)
+			})
+		}
+	}
+}
+
+func verifyGatewayPrimaryKeys(t *testing.T, data []byte, list bool, model *schema.Model, s *schema.Schema) {
+	t.Helper()
+	var keys luvia.BinaryKeys
+	var ok bool
+	if list {
+		keys, ok = luvia.ExtractPrimaryKeyColumn(data, model.PrimaryKeyField(), model)
+	} else {
+		keys, ok = luvia.ExtractPrimaryKeys(data, model.PrimaryKeyField(), model, s)
+	}
+	if !ok || keys.Len() != 1 {
+		t.Fatal("failed to extract the generated primary key after nested fields")
+	}
+	expected := codec.AppendSvarint([]byte{1, 1}, 9223372036854775807)
+	expected = append(expected, 0)
+	if !bytes.Equal(keys.EncodeParam(1), expected) {
+		t.Fatal("forwarded key does not preserve Int64.max bytes")
+	}
+}
+
+func verifyGatewayNestedProtocol(t *testing.T, list bool, fieldName string, count int) {
+	t.Helper()
+	s, mask := gatewayNestedSchema(list, fieldName)
+	value := gatewayNestedValue(fieldName, count)
+	primary := func(_ context.Context, request *api.Request) error {
+		return writeGatewayNested(request.Buf, value, request.FieldMask, list)
+	}
+	client := proxyTestRPC(t, s, map[string]api.HandlerFunc{"extensionFixture": primary, "svc:resolve:Precision:value": gatewayNestedResolver(count)})
+	request := &api.Request{FieldMask: mask, Buf: &api.ResponseBuf{}}
+	if err := proxyHandler(client, s, "extensionFixture", map[string]*rpc.Client{"child": client})(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	var expected api.ResponseBuf
+	if err := writeGatewayNested(&expected, value, mask, list); err != nil {
+		t.Fatal(err)
+	}
+	verifyGatewayNestedRead(t, expected.B, list)
+	verifyGatewayNestedRead(t, request.Buf.B, list)
+	// Root fields may be reordered by the merger; compare their decoded values,
+	// not the byte order of the complete parent message.
+	actualFields := gatewayNestedJSONFields(t, request.Buf.B, list, s)
+	expectedFields := gatewayNestedJSONFields(t, expected.B, list, s)
+	for _, name := range []string{fieldName, "tail"} {
+		actual, actualPresent := actualFields[name]
+		want, wantPresent := expectedFields[name]
+		if actualPresent != wantPresent || !bytes.Equal(actual, want) {
+			t.Errorf("field %s disagrees with generated writer: actual=%q (present=%v) expected=%q (present=%v)", name, actual, actualPresent, want, wantPresent)
+		}
+	}
+}
+
+func gatewayNestedResolver(count int) api.HandlerFunc {
+	return func(_ context.Context, request *api.Request) error {
+		keys, err := request.ParamIntArray("keys")
+		if err != nil || len(keys) != 1 || keys[0] != 9223372036854775807 {
+			return fmt.Errorf("key precision lost: %v, %v", keys, err)
+		}
+		shape, err := request.ParamInt("shape")
+		if err != nil { return err }
+		if shape < 0 || shape > 3 { return fmt.Errorf("invalid resolve shape") }
+		request.Buf.B = codec.AppendVarint(request.Buf.B, uint64(len(keys)))
+		if shape&1 == 0 && count == 0 {
+			if shape&2 == 0 { return fmt.Errorf("required relation missing") }
+			request.Buf.B = append(request.Buf.B, 0)
+			return nil
+		}
+		var body api.ResponseBuf
+		if shape&1 != 0 {
+			rows := make([]Precision, count)
+			for i := range rows { rows[i] = gatewayNestedChild(i) }
+			if err := WriteColumnarPrecision(&body, rows, request.FieldMask); err != nil { return err }
+		} else {
+			if count != 1 { return fmt.Errorf("multiple rows for single relation") }
+			row := gatewayNestedChild(0)
+			if err := row.WriteLuxo(&body, request.FieldMask); err != nil { return err }
+		}
+		if shape&2 != 0 { request.Buf.B = append(request.Buf.B, 1) }
+		request.Buf.B = codec.AppendBytes(request.Buf.B, body.B)
+		return nil
+	}
+}
+
+func gatewayNestedJSONFields(t *testing.T, data []byte, list bool, s *schema.Schema) map[string]json.RawMessage {
+	t.Helper()
+	model := s.Models["NestedGroup"]
+	if list {
+		var rows []map[string]json.RawMessage
+		encoded, err := schema.BinaryListToJSON(nil, data, model, s)
+		if err != nil {
+			t.Fatalf("invalid binary list response: %v", err)
+		}
+		if err := json.Unmarshal(encoded, &rows); err != nil {
+			t.Fatalf("invalid JSON response: %s: %v", encoded, err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("unexpected row count: %d", len(rows))
+		}
+		return rows[0]
+	}
+	var fields map[string]json.RawMessage
+	encoded, err := schema.BinaryToJSON(nil, data, model, s)
+	if err != nil {
+		t.Fatalf("invalid binary response: %v", err)
+	}
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatalf("invalid JSON response: %s: %v", encoded, err)
+	}
+	return fields
+}
+
+func gatewayNestedSchema(list bool, fieldName string) (*schema.Schema, []byte) {
+	s := schema.New()
+	RegisterSchema(s)
+	parent := s.Types["NestedGroup"].AsModel()
+	key := parent.FieldByName("tail")
+	key.PrimaryKey = true
+	field := parent.FieldByName(fieldName)
+	field.Module, field.ForeignKey = "child", "value"
+	s.RegisterModel(parent)
+	s.RegisterAPI(&schema.API{ID: 1000, Name: "extensionFixture", Module: "parent", ReturnType: parent.Name, ReturnList: list})
+	s.RegisterAPI(&schema.API{ID: 1001, Name: "svc:resolve:Precision:value", Params: []schema.Param{{ID: 1, Name: "keys", Type: schema.FieldInt, IsList: true}, {ID: 2, Name: "shape", Type: schema.FieldInt}}})
+	child := s.Types["Precision"].AsModel()
+	var childMask []byte
+	for _, name := range []string{"value", "duration", "label"} {
+		childMask = codec.FieldMaskSet(childMask, child.FieldByName(name).ID)
+	}
+	fields := codec.FieldMaskSet(codec.FieldMaskSet(nil, key.ID), field.ID)
+	mask := codec.AppendSelectionMask(nil, fields, []codec.SelectionMaskChild{{FieldID: field.ID, Mask: codec.AppendSelectionMask(nil, childMask, nil)}})
+	return s, mask
+}
+
+func gatewayNestedChild(index int) Precision {
+	return Precision{Value: 9223372036854775807 - int64(index), Duration: time.Duration(-9223372036854775807), Label: "精度 café"}
+}
+
+func gatewayNestedValue(field string, count int) NestedGroup {
+	value := NestedGroup{Tail: 9223372036854775807}
+	child := gatewayNestedChild(0)
+	switch field {
+	case "primary":
+		value.Primary = &child
+	case "optional":
+		if count != 0 {
+			value.Optional = &child
+		}
+	case "rows", "optionalRows":
+		rows := make([]Precision, count)
+		for i := range rows {
+			rows[i] = gatewayNestedChild(i)
+		}
+		if field == "rows" {
+			value.Rows = rows
+		} else {
+			value.OptionalRows = rows
+		}
+	}
+	return value
+}
+
+func writeGatewayNested(buffer *api.ResponseBuf, value NestedGroup, mask []byte, list bool) error {
+	if list {
+		return WriteColumnarNestedGroup(buffer, []NestedGroup{value}, mask)
+	}
+	return value.WriteLuxo(buffer, mask)
+}
+
+func verifyGatewayNestedRead(t *testing.T, data []byte, list bool) {
+	t.Helper()
+	if list {
+		if _, err := ReadColumnarNestedGroup(data); err != nil {
+			t.Errorf("generated columnar reader rejected merged payload: %v", err)
+		}
+		return
+	}
+	var decoded NestedGroup
+	decoder := codec.NewDecoder(data)
+	decoded.ReadLuxo(decoder)
+	if err := decoder.Finish(); err != nil {
+		t.Errorf("generated row reader rejected merged payload: %v", err)
+	}
+}

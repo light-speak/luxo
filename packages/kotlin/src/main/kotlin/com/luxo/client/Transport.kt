@@ -1,19 +1,14 @@
 package com.luxo.client
 
-import kotlinx.coroutines.*
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.json.*
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
-import okio.ByteString
 import java.io.IOException
 import java.util.Base64
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
-import kotlin.math.min
 
 /** Transport mode: JSON for debugging, BINARY for production. */
 enum class TransportMode { JSON, BINARY }
@@ -36,13 +31,16 @@ private val filterOperatorIDs = mapOf(
 data class LuxoFilter(val field: String, val op: String, val value: Any)
 data class LuxoSorter(val field: String, val order: String)
 
-/** API schema metadata for binary encoding. */
+/** API schema metadata for binary encoding and typed JSON parameters. */
 data class APISchemaEntry(
     val id: Int,
     val params: List<ParamSchema> = emptyList(),
     val fields: Map<String, SelectionFieldSchema> = emptyMap(),
     val types: Map<String, Map<String, SelectionFieldSchema>> = emptyMap(),
-)
+) {
+    // Built once with the schema, not on the request path.
+    internal val paramsByName = params.associateBy { it.name }
+}
 
 data class SelectionFieldSchema(
     val fieldID: Int,
@@ -148,11 +146,13 @@ internal object LuxoBinaryProtocol {
     const val CALL_REQUEST = 0x01
     const val CALL_SUCCESS = 0x02
     const val CALL_ERROR = 0x03
-    const val SUBSCRIBE = 0x04
-    const val UNSUBSCRIBE = 0x05
-    const val STREAM = 0x06
-    const val SUBSCRIBE_SUCCESS = 0x07
-    const val SUBSCRIBE_ERROR = 0x08
+    const val SUBSCRIBE = 0x10
+    const val UNSUBSCRIBE = 0x11
+    const val STREAM = 0x12
+    const val SUBSCRIBE_SUCCESS = 0x13
+    const val SUBSCRIBE_ERROR = 0x14
+    const val STREAM_COMPLETE = 0x15
+    const val STREAM_ERROR = 0x16
 
     fun encodeRequest(meta: APISchemaEntry, params: Map<String, Any?>): ByteArray {
         val enc = LuxoEncoder()
@@ -182,14 +182,14 @@ internal object LuxoBinaryProtocol {
 
     fun callFrame(sequence: Long, body: ByteArray): ByteArray = frame(CALL_REQUEST, sequence, body)
 
-    fun subscribeFrame(body: ByteArray): ByteArray = frame(SUBSCRIBE, null, body)
+    fun subscribeFrame(sequence: Long, body: ByteArray): ByteArray = frame(SUBSCRIBE, sequence, body)
 
-    fun unsubscribeFrame(apiID: Int): ByteArray = frame(UNSUBSCRIBE, apiID.toLong(), ByteArray(0))
+    fun unsubscribeFrame(sequence: Long): ByteArray = frame(UNSUBSCRIBE, sequence, ByteArray(0))
 
-    private fun frame(type: Int, id: Long?, payload: ByteArray): ByteArray {
+    private fun frame(type: Int, id: Long, payload: ByteArray): ByteArray {
         val enc = LuxoEncoder()
         enc.writeVarint(type.toLong())
-        if (id != null) enc.writeVarint(id)
+        enc.writeVarint(id)
         enc.writeRawBytes(payload)
         return enc.bytes()
     }
@@ -206,31 +206,31 @@ internal object LuxoBinaryProtocol {
             var seen = 0
             var ended = false
             while (dec.remaining() > 0) {
-                if (!dec.nextField()) {
+                val field = dec.readVarint()
+                if (field == 0L) {
                     ended = true
                     break
                 }
-                when (dec.fieldID) {
-                    1 -> { code = dec.readInt().toInt(); seen = seen or 1 }
-                    2 -> { name = dec.readString(); seen = seen or 2 }
-                    3 -> { message = dec.readString(); seen = seen or 4 }
+                require(field in 1L..6L) { "unknown binary error field $field" }
+                val bit = 1 shl (field.toInt() - 1)
+                require(seen and bit == 0) { "duplicate binary error field $field" }
+                seen = seen or bit
+                when (field.toInt()) {
+                    1 -> {
+                        val value = dec.readInt()
+                        require(value in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong()) { "error code exceeds signed 32-bit range" }
+                        code = value.toInt()
+                    }
+                    2 -> name = dec.readString()
+                    3 -> message = dec.readString()
                     4 -> traceId = dec.readString()
-                    5 -> data = Json.parseToJsonElement(dec.readBytes().toString(Charsets.UTF_8))
+                    5 -> data = decodeLuxoJSON(dec.readString())
                     6 -> cause = dec.readString()
-                    else -> return LuxoError(
-                        "ParseError",
-                        statusCode,
-                        "unknown binary error field ${dec.fieldID}",
-                    )
                 }
             }
-            if (!ended) return LuxoError("ParseError", statusCode, "invalid binary error response: missing end marker")
-            if (dec.remaining() != 0) {
-                return LuxoError("ParseError", statusCode, "invalid binary error response: trailing bytes")
-            }
-            if (seen != 7) {
-                return LuxoError("ParseError", statusCode, "invalid binary error response: missing required fields")
-            }
+            require(ended) { "missing end marker" }
+            require(dec.remaining() == 0) { "trailing bytes" }
+            require(seen and 7 == 7) { "missing required fields" }
             LuxoError(name, code, message, traceId, data, cause)
         } catch (error: Exception) {
             LuxoError("ParseError", statusCode, "invalid binary error response: ${error.message}")
@@ -349,14 +349,14 @@ internal object LuxoBinaryProtocol {
 
     private fun encodeScalarParam(enc: LuxoEncoder, param: ParamSchema, value: Any) {
         when (param.type) {
-            "Int", "Duration" -> enc.writeSvarint((value as Number).toLong())
+            "Int", "Duration" -> enc.writeSvarint(requireLuxoInt64(value))
             "Float" -> enc.writeFixed64((value as Number).toDouble())
             "UUID" -> enc.writeUuid(value as String)
-            "DateTime" -> enc.writeSvarint(unixSeconds(value))
+            "DateTime" -> writeDateTimeParam(enc, value)
             "String", "Enum", "Decimal" -> enc.writeString(value as String)
             "Boolean" -> enc.writeBool(value as Boolean)
             "Bytes" -> enc.writeBytes(value as ByteArray)
-            "JSON" -> enc.writeBytes(luxoJsonValue(value).toString().toByteArray(Charsets.UTF_8))
+            "JSON" -> enc.writeBytes(encodeLuxoJSON(luxoJsonValue(value)).toByteArray(Charsets.UTF_8))
 			"Model" -> writeStructuredParam(enc, param, value)
             else -> throw LuxoError("ConfigError", 0, "unsupported binary param type: ${param.type}")
         }
@@ -367,18 +367,18 @@ internal object LuxoBinaryProtocol {
             ?: throw LuxoError("ConfigError", 0, "parameter ${param.name} must be a list")
         enc.writeVarint(items.size.toLong())
         when (param.type) {
-            "Int", "Duration" -> items.forEach { enc.writeSvarint((it as Number).toLong()) }
+            "Int", "Duration" -> items.forEach { enc.writeSvarint(requireLuxoInt64(it)) }
             "Float" -> items.forEach { enc.writeFixed64((it as Number).toDouble()) }
             "UUID" -> items.forEach { enc.writeUuid(it as String) }
             "DateTime" -> items.forEach {
                 val item = it ?: throw LuxoError("ConfigError", 0, "parameter ${param.name} contains null")
-                enc.writeSvarint(unixSeconds(item))
+                writeDateTimeParam(enc, item)
             }
             "String", "Enum", "Decimal" -> items.forEach { enc.writeString(it as String) }
             "Boolean" -> items.forEach { enc.writeBool(it as Boolean) }
             "Bytes" -> items.forEach { enc.writeBytes(it as ByteArray) }
             "JSON" -> items.forEach {
-                enc.writeBytes(luxoJsonValue(it).toString().toByteArray(Charsets.UTF_8))
+                enc.writeBytes(encodeLuxoJSON(luxoJsonValue(it)).toByteArray(Charsets.UTF_8))
             }
 			"Model" -> items.forEach { writeStructuredParam(enc, param, it) }
             else -> throw LuxoError("ConfigError", 0, "unsupported binary list param type: ${param.type}")
@@ -395,25 +395,59 @@ internal object LuxoBinaryProtocol {
 		enc.writeDelimited(structured::writeLuxo)
 	}
 
-    private fun unixSeconds(value: Any): Long = when (value) {
-        is String -> java.time.Instant.parse(value).epochSecond
+    private fun writeDateTimeParam(enc: LuxoEncoder, value: Any): Unit = when (value) {
+        is String -> enc.writeDateTime(value)
         else -> throw LuxoError("ConfigError", 0, "invalid DateTime parameter: ${value::class.qualifiedName}")
     }
 }
 
+/** Optional terminal notifications. Explicit cancellation does not invoke either callback. */
+class StreamObserver(
+    val onComplete: (() -> Unit)? = null,
+    val onError: ((LuxoError) -> Unit)? = null,
+)
+
 /**
- * Transport interface — single call() method, mode handled internally.
+ * Transport interface for calls and subscriptions, mode handled internally.
  *
  * JSON mode: returns parsed JsonElement (for kotlinx.serialization decode).
  * Binary mode: returns raw ByteArray (for generated decode{Model} functions).
  */
 interface Transport {
     suspend fun call(api: String, params: Map<String, Any?> = emptyMap()): Any
-    suspend fun subscribe(api: String, params: Map<String, Any?> = emptyMap(), handler: (Any) -> Unit): () -> Unit =
+    /** Decode separately so an invalid payload cannot be confused with an application callback error. */
+    suspend fun <T> subscribe(
+        api: String,
+        decoder: (Any) -> T,
+        params: Map<String, Any?> = emptyMap(),
+        observer: StreamObserver? = null,
+        handler: (T) -> Unit,
+    ): () -> Unit =
         throw LuxoError("ConfigError", 0, "subscriptions require a WebSocket endpoint")
     fun setSchema(schema: Map<String, APISchemaEntry>)
     fun setMode(mode: TransportMode)
     fun setToken(token: String)
+}
+
+/** Immutable mode-specific headers; configuration and token changes stay off the request path. */
+internal class HttpProtocolHeaders private constructor(base: Headers) {
+    val json: Headers = base.newBuilder().set("Content-Type", JSON_MEDIA_TYPE.toString())
+        .set("X-Luxo-Mode", "json").build()
+    val binary: Headers = base.newBuilder().set("Content-Type", BINARY_MEDIA_TYPE.toString())
+        .set("X-Luxo-Mode", "binary").build()
+
+    constructor(headers: Map<String, String>, token: String?) : this(Headers.Builder().apply {
+        for ((name, value) in headers) set(name, value)
+        if (token != null) set("Authorization", "Bearer $token")
+    }.build())
+
+    fun withToken(token: String): HttpProtocolHeaders =
+        HttpProtocolHeaders(json.newBuilder().set("Authorization", "Bearer $token").build())
+
+    companion object {
+        val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        val BINARY_MEDIA_TYPE = "application/x-luxo".toMediaType()
+    }
 }
 
 /** OkHttp-based transport for Android / JVM. */
@@ -426,7 +460,7 @@ class OkHttpTransport(
     private val schema: Map<String, APISchemaEntry> = emptyMap(),
     /** Request timeout in seconds (default 30) */
     timeoutSeconds: Long = 30,
-    /** Called on 401 — return new token to auto-retry, null to fail */
+    /** Called only for valid HTTP/code 401 errors; a new token retries once in the original mode. */
     private val onTokenExpired: (suspend () -> String?)? = null,
 ) : Transport {
 
@@ -435,16 +469,9 @@ class OkHttpTransport(
         .readTimeout(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)
         .writeTimeout(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)
         .build())
-    private val extraHeaders = ConcurrentHashMap<String, String>()
+    @Volatile private var currentHeaders = HttpProtocolHeaders(headers, token)
     @Volatile private var currentMode: TransportMode = mode
-    private var currentSchema: Map<String, APISchemaEntry> = schema
-
-    init {
-        extraHeaders.putAll(headers)
-        if (token != null) {
-            extraHeaders["Authorization"] = "Bearer $token"
-        }
-    }
+    @Volatile private var currentSchema: Map<String, APISchemaEntry> = schema
 
     /**
      * Call a Luxo API. Returns JsonElement (JSON mode) or ByteArray (binary mode).
@@ -452,7 +479,7 @@ class OkHttpTransport(
      */
     override fun setSchema(schema: Map<String, APISchemaEntry>) { currentSchema = schema }
     override fun setMode(mode: TransportMode) { currentMode = mode }
-    override fun setToken(token: String) { extraHeaders["Authorization"] = "Bearer $token" }
+    override fun setToken(token: String) { currentHeaders = currentHeaders.withToken(token) }
 
     override suspend fun call(api: String, params: Map<String, Any?>): Any {
         return if (currentMode == TransportMode.BINARY) callBinary(api, params) else callJSON(api, params)
@@ -461,52 +488,32 @@ class OkHttpTransport(
     private suspend fun callJSON(api: String, params: Map<String, Any?>, isRetry: Boolean = false): JsonElement {
         val body = buildJsonObject {
             put("\$api", JsonPrimitive(api))
-            for ((k, v) in params) {
-                put(k, luxoJsonValue(v))
-            }
+            putLuxoParams(params, currentSchema[api])
         }
 
         val request = Request.Builder()
             .url(endpoint)
-            .post(body.toString().toRequestBody(JSON_MEDIA_TYPE))
-            .apply {
-                header("Content-Type", "application/json")
-                for ((k, v) in extraHeaders) header(k, v)
-            }
+            .post(encodeLuxoJSON(body).toRequestBody(HttpProtocolHeaders.JSON_MEDIA_TYPE))
+            .headers(currentHeaders.json)
             .build()
 
-        val response = client.awaitFullResponse(request)
-
-        // 401 auto-refresh: invoke callback, retry once with new token
-        if (response.code == 401 && !isRetry && onTokenExpired != null) {
-            val newToken = onTokenExpired.invoke()
-            if (newToken != null) {
-                setToken(newToken)
-                return callJSON(api, params, isRetry = true)
-            }
+        val response = client.awaitFullResponse(request) {
+            HTTPResponseBytes(it.code, it.body?.bytes() ?: throw IOException("missing response body"))
         }
-
-        val responseBody = response.body
-
         val json = try {
-            Json.parseToJsonElement(responseBody).jsonObject
+            decodeHTTPJSON(response.body)
         } catch (e: Exception) {
-            throw LuxoError("ParseError", 0, "invalid JSON response: ${e.message}")
+            throw LuxoError("ParseError", response.code, "invalid JSON response: ${e.message}")
         }
-
-        val error = json["error"]
-        if (error != null && error is JsonPrimitive) {
-            throw LuxoError(
-                error = error.content,
-                code = json["code"]?.jsonPrimitive?.int ?: 0,
-                message = json["message"]?.jsonPrimitive?.content ?: "",
-                traceId = json["traceId"]?.jsonPrimitive?.contentOrNull,
-                data = json["data"],
-                developmentCause = json["cause"]?.jsonPrimitive?.contentOrNull,
-            )
+        val decoded = decodeLuxoJsonError(json, response.code)
+        if (response.code == 200 && decoded == null) return json["data"] ?: JsonNull
+        val error = decoded ?: LuxoError("ParseError", response.code, "missing JSON error envelope")
+        val newToken = refreshFor(response.code, error, isRetry)?.invoke()
+        if (newToken != null) {
+            setToken(newToken)
+            return callJSON(api, params, isRetry = true)
         }
-
-        return json["data"] ?: JsonNull
+        throw error
     }
 
     private suspend fun callBinary(api: String, params: Map<String, Any?>, isRetry: Boolean = false): ByteArray {
@@ -517,419 +524,31 @@ class OkHttpTransport(
 
         val request = Request.Builder()
             .url(endpoint)
-            .post(body.toRequestBody(BINARY_MEDIA_TYPE))
-            .apply {
-                header("Content-Type", "application/x-luxo")
-                header("X-Luxo-Mode", "binary")
-                for ((k, v) in extraHeaders) header(k, v)
-            }
+            .post(body.toRequestBody(HttpProtocolHeaders.BINARY_MEDIA_TYPE))
+            .headers(currentHeaders.binary)
             .build()
 
-        val response = client.awaitFullBinaryResponse(request)
-
-        // 401 auto-refresh: invoke callback, retry once with new token
-        if (response.code == 401 && !isRetry && onTokenExpired != null) {
-            val newToken = onTokenExpired.invoke()
-            if (newToken != null) {
-                setToken(newToken)
-                return callBinary(api, params, isRetry = true)
-            }
+        val response = client.awaitFullResponse(request) {
+            HTTPResponseBytes(it.code, it.body?.bytes() ?: throw IOException("missing response body"))
         }
-
-        if (response.code !in 200..299) {
-            throw LuxoBinaryProtocol.decodeError(response.body, response.code)
+        if (response.code == 200) return response.body
+        val error = LuxoBinaryProtocol.decodeError(response.body, response.code)
+        val newToken = refreshFor(response.code, error, isRetry)?.invoke()
+        if (newToken != null) {
+            setToken(newToken)
+            return callBinary(api, params, isRetry = true)
         }
-        return response.body
+        throw error
     }
 
-
-    companion object {
-        private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
-        private val BINARY_MEDIA_TYPE = "application/x-luxo".toMediaType()
-    }
-}
-
-// MARK: - WebSocket Transport
-
-/**
- * OkHttp WebSocket transport that implements Transport interface for RPC calls,
- * plus subscription support for streaming.
- *
- * Features:
- * - Implements Transport.call() via request/response over WebSocket
- * - Auto-reconnect with exponential backoff (1s, 2s, 4s... up to 30s)
- * - Subscription API for streaming data
- *
- * Usage:
- *   val ws = LuxoWebSocket("ws://localhost:4000/luvia/ws")
- *   ws.connect()
- *   val result = ws.call("getUser", mapOf("id" to 1))  // RPC over WS
- *   ws.subscribe("liveTraces", mapOf("projectId" to 1)) { data -> ... }
- *   ws.close()
- */
-class LuxoWebSocket(
-    private val url: String,
-    private val client: OkHttpClient = OkHttpClient(),
-    token: String? = null,
-    private val autoReconnect: Boolean = true,
-    /** Max reconnect delay in milliseconds */
-    private val maxReconnectDelayMs: Long = 30_000L,
-    private val timeoutMillis: Long = 30_000L,
-) : Transport {
-
-    @Volatile private var ws: WebSocket? = null
-    private data class Subscription(
-        val params: Map<String, Any?>,
-        val handler: (Any) -> Unit,
-        var acknowledgement: CompletableDeferred<() -> Unit>?,
-    )
-
-    private val subscriptions = ConcurrentHashMap<String, Subscription>()
-    private val pendingCalls = ConcurrentHashMap<Long, CompletableDeferred<Any>>()
-    private val requestIdCounter = AtomicLong(0)
-    @Volatile private var currentToken: String? = token
-    @Volatile private var currentMode: TransportMode = TransportMode.JSON
-    @Volatile private var currentSchema: Map<String, APISchemaEntry> = emptyMap()
-    @Volatile private var connected: Boolean = false
-    @Volatile private var closed: Boolean = false
-    private var reconnectAttempt: Int = 0
-    private var reconnectJob: Job? = null
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private val connectionLock = Any()
-    private var connecting = false
-    private var connectionReady = CompletableDeferred<Unit>()
-
-    override fun setSchema(schema: Map<String, APISchemaEntry>) { currentSchema = schema }
-    override fun setMode(mode: TransportMode) { currentMode = mode }
-    override fun setToken(token: String) { currentToken = token }
-
-    override suspend fun call(api: String, params: Map<String, Any?>): Any {
-        awaitConnection()
-
-        val requestID = requestIdCounter.incrementAndGet()
-        val message: Any = if (currentMode == TransportMode.BINARY) {
-            val meta = currentSchema[api]
-                ?: throw LuxoError("ConfigError", 0, "no schema for API \"$api\" — binary mode requires schema")
-            LuxoBinaryProtocol.callFrame(requestID, LuxoBinaryProtocol.encodeRequest(meta, params))
-        } else {
-            buildJsonObject {
-                put("\$id", requestID)
-                put("\$api", api)
-                for ((key, value) in params) put(key, luxoJsonValue(value))
-            }.toString()
-        }
-        val deferred = CompletableDeferred<Any>()
-        pendingCalls[requestID] = deferred
-
-        val sent = when (message) {
-            is ByteArray -> ws?.send(ByteString.of(*message))
-            is String -> ws?.send(message)
-            else -> false
-        } ?: false
-        if (!sent) {
-            pendingCalls.remove(requestID)
-            throw LuxoError("ConnectionError", 0, "failed to send WebSocket message")
-        }
-
-        return try {
-            withTimeout(timeoutMillis) { deferred.await() }
-        } catch (_: TimeoutCancellationException) {
-            throw LuxoError("TimeoutError", 0, "request timed out after ${timeoutMillis}ms")
-        } finally {
-            pendingCalls.remove(requestID)
-        }
-    }
-
-    fun connect() {
-        if (closed) return
-        startConnection()
-    }
-
-    private suspend fun awaitConnection() {
-        if (closed) throw LuxoError("ConnectionError", 0, "WebSocket closed by client")
-        connect()
-        val ready = synchronized(connectionLock) { connectionReady }
-        try {
-            withTimeout(timeoutMillis) { ready.await() }
-        } catch (_: TimeoutCancellationException) {
-            throw LuxoError("TimeoutError", 0, "connection timed out after ${timeoutMillis}ms")
-        }
-    }
-
-    private fun startConnection() {
-        synchronized(connectionLock) {
-            if (connected || connecting || closed) return
-            if (connectionReady.isCompleted) connectionReady = CompletableDeferred()
-            connecting = true
-        }
-        try {
-            doConnect()
-        } catch (error: Throwable) {
-            handleDisconnect(LuxoError("ConnectionError", 0, "WebSocket connection failed: ${error.message}"))
-        }
-    }
-
-    private fun doConnect() {
-        val request = Request.Builder()
-            .url(url)
-            .apply { currentToken?.let { header("Authorization", "Bearer $it") } }
-            .build()
-
-        ws = client.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                val ready = synchronized(connectionLock) {
-                    if (ws !== webSocket || closed) return@synchronized null
-                    connected = true
-                    connecting = false
-                    connectionReady
-                }
-                if (ready == null) {
-                    webSocket.close(1000, "stale connection")
-                    return
-                }
-                ready.complete(Unit)
-                reconnectAttempt = 0
-                for ((api, subscription) in subscriptions) {
-                    sendSubscription(api, subscription.params)
-                }
-            }
-
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                handleJsonMessage(text)
-            }
-
-            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                handleBinaryMessage(bytes.toByteArray())
-            }
-
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                if (ws !== webSocket) return
-                ws = null
-                val error = LuxoError("ConnectionError", 0, "WebSocket connection lost: ${t.message}")
-                handleDisconnect(error)
-
-                // Auto-reconnect with exponential backoff
-                if (autoReconnect && !closed) {
-                    scheduleReconnect()
-                }
-            }
-
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                if (ws !== webSocket) return
-                ws = null
-                handleDisconnect(LuxoError("ConnectionError", 0, "WebSocket closed: $reason"))
-                if (autoReconnect && !closed) {
-                    scheduleReconnect()
-                }
-            }
-        })
-    }
-
-    private fun scheduleReconnect() {
-        reconnectJob?.cancel()
-        reconnectJob = scope.launch {
-            val delayMs = min(1000L * (1L shl min(reconnectAttempt, 14)), maxReconnectDelayMs)
-            reconnectAttempt++
-            delay(delayMs)
-            if (!closed) {
-                startConnection()
-            }
-        }
-    }
-
-    private fun handleDisconnect(error: LuxoError) {
-        val ready = synchronized(connectionLock) {
-            connected = false
-            connecting = false
-            connectionReady
-        }
-        if (!ready.isCompleted) ready.completeExceptionally(error)
-        for (deferred in pendingCalls.values) deferred.completeExceptionally(error)
-        pendingCalls.clear()
-        for ((api, subscription) in subscriptions) {
-            val acknowledgement = subscription.acknowledgement ?: continue
-            acknowledgement.completeExceptionally(error)
-            subscriptions.remove(api, subscription)
-        }
-    }
-
-    private fun handleJsonMessage(text: String) {
-        try {
-            val json = Json.parseToJsonElement(text).jsonObject
-            val subscription = json["\$sub"]?.jsonPrimitive?.contentOrNull
-            if (subscription != null) {
-                val errorName = json["error"]?.jsonPrimitive?.contentOrNull
-                acknowledgeSubscription(
-                    subscription,
-                    errorName?.let {
-                        LuxoError(
-                            error = it,
-                            code = json["code"]?.jsonPrimitive?.int ?: 0,
-                            message = json["message"]?.jsonPrimitive?.content ?: "",
-                            traceId = json["traceId"]?.jsonPrimitive?.contentOrNull,
-                            data = json["data"],
-                            developmentCause = json["cause"]?.jsonPrimitive?.contentOrNull,
-                        )
-                    },
-                )
-                return
-            }
-            val stream = json["\$stream"]?.jsonPrimitive?.contentOrNull
-            if (stream != null) {
-                subscriptions[stream]?.handler?.invoke(json["data"] ?: JsonNull)
-                return
-            }
-            val requestID = json["\$id"]?.jsonPrimitive?.longOrNull ?: return
-            val deferred = pendingCalls.remove(requestID) ?: return
-            val error = json["error"]?.jsonPrimitive?.contentOrNull
-            if (error != null) {
-                deferred.completeExceptionally(
-                    LuxoError(
-                        error = error,
-                        code = json["code"]?.jsonPrimitive?.int ?: 0,
-                        message = json["message"]?.jsonPrimitive?.content ?: "",
-                        traceId = json["traceId"]?.jsonPrimitive?.contentOrNull,
-                        data = json["data"],
-                        developmentCause = json["cause"]?.jsonPrimitive?.contentOrNull,
-                    ),
-                )
-            } else {
-                deferred.complete(json["data"] ?: JsonNull)
-            }
-        } catch (_: Exception) {
-            // Ignore malformed or unrelated frames. They cannot be correlated safely.
-        }
-    }
-
-    private fun handleBinaryMessage(bytes: ByteArray) {
-        try {
-            val dec = LuxoDecoder(bytes)
-            val frameType = dec.readVarint().toInt()
-            val id = dec.readVarint()
-            val payload = dec.readRemainingBytes()
-            when (frameType) {
-                LuxoBinaryProtocol.SUBSCRIBE_SUCCESS,
-                LuxoBinaryProtocol.SUBSCRIBE_ERROR -> {
-                    val api = currentSchema.entries.firstOrNull { it.value.id.toLong() == id }?.key
-                    if (api != null) {
-                        acknowledgeSubscription(
-                            api,
-                            if (frameType == LuxoBinaryProtocol.SUBSCRIBE_ERROR) {
-                                LuxoBinaryProtocol.decodeError(payload, 0)
-                            } else {
-                                null
-                            },
-                        )
-                    }
-                }
-                LuxoBinaryProtocol.CALL_SUCCESS -> pendingCalls.remove(id)?.complete(payload)
-                LuxoBinaryProtocol.CALL_ERROR -> pendingCalls.remove(id)?.completeExceptionally(
-                    LuxoBinaryProtocol.decodeError(payload, 0),
-                )
-                LuxoBinaryProtocol.STREAM -> {
-                    val api = currentSchema.entries.firstOrNull { it.value.id.toLong() == id }?.key
-                    if (api != null) subscriptions[api]?.handler?.invoke(payload)
-                }
-            }
-        } catch (_: Exception) {
-            // Ignore malformed or unrelated frames. They cannot be correlated safely.
-        }
-    }
-
-    override suspend fun subscribe(api: String, params: Map<String, Any?>, handler: (Any) -> Unit): () -> Unit {
-        awaitConnection()
-        val acknowledgement = CompletableDeferred<() -> Unit>()
-        val subscription = Subscription(params, handler, acknowledgement)
-        if (subscriptions.putIfAbsent(api, subscription) != null) {
-            throw LuxoError("ConfigError", 0, "already subscribed to \"$api\"")
-        }
-        if (currentMode == TransportMode.BINARY && currentSchema[api] == null) {
-            subscriptions.remove(api)
-            throw LuxoError("ConfigError", 0, "no schema for API \"$api\" — binary mode requires schema")
-        }
-        try {
-            if (!sendSubscription(api, params)) {
-                throw LuxoError("ConnectionError", 0, "failed to send subscription")
-            }
-        } catch (error: Throwable) {
-            subscriptions.remove(api, subscription)
-            throw error
-        }
-        return try {
-            withTimeout(timeoutMillis) { acknowledgement.await() }
-        } catch (_: TimeoutCancellationException) {
-            subscriptions.remove(api, subscription)
-            throw LuxoError("TimeoutError", 0, "subscription timed out after ${timeoutMillis}ms")
-        }
-    }
-
-    private fun acknowledgeSubscription(api: String, error: LuxoError?) {
-        val subscription = subscriptions[api] ?: return
-        val acknowledgement = subscription.acknowledgement
-        if (error != null) {
-            subscriptions.remove(api, subscription)
-            acknowledgement?.completeExceptionally(error)
-            return
-        }
-        if (acknowledgement == null) return
-        subscription.acknowledgement = null
-        acknowledgement.complete { unsubscribe(api) }
-    }
-
-    private fun sendSubscription(api: String, params: Map<String, Any?>): Boolean {
-        if (currentMode == TransportMode.BINARY) {
-            val meta = currentSchema[api]
-                ?: throw LuxoError("ConfigError", 0, "no schema for API \"$api\"")
-            val frame = LuxoBinaryProtocol.subscribeFrame(LuxoBinaryProtocol.encodeRequest(meta, params))
-            return ws?.send(ByteString.of(*frame)) == true
-        }
-        val message = buildJsonObject {
-            put("\$sub", api)
-            for ((key, value) in params) put(key, luxoJsonValue(value))
-        }
-        return ws?.send(message.toString()) == true
-    }
-
-    fun unsubscribe(api: String) {
-        if (subscriptions.remove(api) == null || !connected) return
-        if (currentMode == TransportMode.BINARY) {
-            val meta = currentSchema[api] ?: return
-            ws?.send(ByteString.of(*LuxoBinaryProtocol.unsubscribeFrame(meta.id)))
-        } else {
-            ws?.send(buildJsonObject { put("\$unsub", api) }.toString())
-        }
-    }
-
-    fun close() {
-        closed = true
-        reconnectJob?.cancel()
-        val socket = ws
-        ws = null
-        socket?.close(1000, "client close")
-        connected = false
-        // Fail any pending calls
-        val error = LuxoError("ConnectionError", 0, "WebSocket closed by client")
-        synchronized(connectionLock) {
-            connecting = false
-            if (!connectionReady.isCompleted) connectionReady.completeExceptionally(error)
-        }
-        for (subscription in subscriptions.values) {
-            subscription.acknowledgement?.completeExceptionally(error)
-        }
-        subscriptions.clear()
-        for (deferred in pendingCalls.values) {
-            deferred.completeExceptionally(error)
-        }
-        pendingCalls.clear()
-        scope.cancel()
-    }
+    private fun refreshFor(status: Int, error: LuxoError, isRetry: Boolean): (suspend () -> String?)? =
+        if (!isRetry && status == 401 && error.code == 401 && error.error != "ParseError") onTokenExpired else null
 }
 
 /** Internal response wrapper carrying HTTP status code. */
-private data class StringResponse(val code: Int, val body: String)
-private data class BinaryResponse(val code: Int, val body: ByteArray)
+private data class HTTPResponseBytes(val code: Int, val body: ByteArray)
 
-private suspend fun OkHttpClient.awaitFullResponse(request: Request): StringResponse =
+private suspend inline fun <T> OkHttpClient.awaitFullResponse(request: Request, crossinline read: (Response) -> T): T =
     suspendCancellableCoroutine { cont ->
         val call = newCall(request)
         cont.invokeOnCancellation { call.cancel() }
@@ -938,25 +557,13 @@ private suspend fun OkHttpClient.awaitFullResponse(request: Request): StringResp
                 cont.resumeWithException(LuxoError("NetworkError", 0, e.message ?: "network error"))
             }
             override fun onResponse(call: Call, response: Response) {
-                response.use { resp ->
-                    cont.resume(StringResponse(resp.code, resp.body?.string() ?: "{}"))
+                val result = try {
+                    response.use { read(it) }
+                } catch (error: Exception) {
+                    cont.resumeWithException(LuxoError("NetworkError", 0, error.message ?: "response body failed"))
+                    return
                 }
-            }
-        })
-    }
-
-private suspend fun OkHttpClient.awaitFullBinaryResponse(request: Request): BinaryResponse =
-    suspendCancellableCoroutine { cont ->
-        val call = newCall(request)
-        cont.invokeOnCancellation { call.cancel() }
-        call.enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                cont.resumeWithException(LuxoError("NetworkError", 0, e.message ?: "network error"))
-            }
-            override fun onResponse(call: Call, response: Response) {
-                response.use { resp ->
-                    cont.resume(BinaryResponse(resp.code, resp.body?.bytes() ?: ByteArray(0)))
-                }
+                cont.resume(result)
             }
         })
     }

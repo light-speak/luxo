@@ -4,19 +4,21 @@
   "description": "Luxo Vite plugin — compile-time field tracking, auto $select injection, and typed client generation",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
-  "types": "src/public.d.ts",
+  "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./src/public.d.ts",
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.mjs",
       "require": "./dist/index.js"
     }
   },
   "files": [
-    "dist",
-    "src"
+    "dist"
   ],
   "license": "Apache-2.0",
+  "engines": {
+    "node": "^22.18.0 || >=24.11.0"
+  },
   "keywords": ["luxo", "vite", "plugin", "codegen", "field-tracking", "select", "babel", "ast"],
   "repository": {
     "type": "git",
@@ -25,24 +27,27 @@
   },
   "homepage": "https://github.com/light-speak/luxo",
   "scripts": {
-    "build": "tsup",
+    "build": "tsdown && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "prepublishOnly": "pnpm build"
   },
   "peerDependencies": {
     "@luxojs/client": ">=0.1.0-dev.3",
-    "typescript": ">=5.0",
+    "typescript": ">=7.0 <8",
     "vite": ">=5.0"
   },
   "dependencies": {
-    "@babel/parser": "^7.29.3",
-    "@babel/traverse": "^7.29.0",
-    "@babel/types": "^7.29.0"
+    "@babel/parser": "^8.0.5",
+    "@babel/traverse": "^8.0.5",
+    "@babel/types": "^8.0.5"
   },
   "devDependencies": {
     "@luxojs/client": "link:../client",
-    "tsup": "^8.5.1",
-    "vitest": "^3.0.0"
+    "@types/node": "^26.5.1",
+    "tsdown": "^0.23.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
   }
 }

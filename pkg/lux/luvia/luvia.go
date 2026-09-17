@@ -73,6 +73,14 @@ func (g *Gateway) SetRuntimeDependencyStatsProvider(provider lux.RuntimeDependen
 // If APP_TLS_CERT and APP_TLS_KEY are set, uses HTTP/2 with TLS.
 // Handles SIGTERM/SIGINT for graceful shutdown — drains active connections.
 func (g *Gateway) Serve(version string) error {
+	// Register before startup so signals received while initializing are retained.
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(quit)
+	return g.serve(version, quit)
+}
+
+func (g *Gateway) serve(version string, quit <-chan os.Signal) error {
 	if err := g.Router.Validate(); err != nil {
 		return err
 	}
@@ -119,7 +127,7 @@ func (g *Gateway) Serve(version string) error {
 	}
 
 	g.server = server
-	return g.waitForShutdown(serveErr, shutdownTimeout)
+	return g.waitForShutdown(quit, serveErr, shutdownTimeout)
 }
 
 func validateDeploymentMode() error {
@@ -219,10 +227,7 @@ func positiveDurationEnv(name string, fallback time.Duration) (time.Duration, er
 }
 
 // waitForShutdown blocks until SIGTERM, SIGINT, or a server failure, then gracefully shuts down.
-func (g *Gateway) waitForShutdown(serveErr <-chan error, timeout time.Duration) error {
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
-	defer signal.Stop(quit)
+func (g *Gateway) waitForShutdown(quit <-chan os.Signal, serveErr <-chan error, timeout time.Duration) error {
 	var sig os.Signal
 	select {
 	case err := <-serveErr:

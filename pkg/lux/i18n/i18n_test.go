@@ -3,6 +3,9 @@ package i18n
 import (
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -28,7 +31,7 @@ error:
   out_of_stock: "Out of stock, ${available} remaining"
 `))
 
-	got := tr.Translate("en", "error.out_of_stock", map[string]any{"available": 3})
+	got := tr.Translate("en", "error.out_of_stock", Values{"available": "3"})
 	if got != "Out of stock, 3 remaining" {
 		t.Errorf("got %q", got)
 	}
@@ -87,24 +90,110 @@ error:
 func TestSubstitute(t *testing.T) {
 	tests := []struct {
 		tmpl string
-		data map[string]any
+		data Values
 		want string
 	}{
 		{"hello", nil, "hello"},
-		{"hello ${name}", map[string]any{"name": "world"}, "hello world"},
-		{"${a} and ${b}", map[string]any{"a": 1, "b": 2}, "1 and 2"},
-		{"${missing}", map[string]any{}, "${missing}"},
-		{"${missing}", map[string]any{"other": 1}, "${missing}"},
-		{"no vars", map[string]any{"a": 1}, "no vars"},
-		{"${x", map[string]any{"x": 1}, "${x"},                 // unclosed
-		{"$", map[string]any{}, "$"},                           // lone dollar
-		{"a$b", map[string]any{}, "a$b"},                       // dollar not followed by {
-		{"${a}${b}", map[string]any{"a": "x", "b": "y"}, "xy"}, // consecutive
+		{"hello ${name}", Values{"name": "world"}, "hello world"},
+		{"${a} and ${b}", Values{"a": "1", "b": "2"}, "1 and 2"},
+		{"${missing}", Values{}, "${missing}"},
+		{"${missing}", Values{"other": "1"}, "${missing}"},
+		{"no vars", Values{"a": "1"}, "no vars"},
+		{"${x", Values{"x": "1"}, "${x"},               // unclosed
+		{"$", Values{}, "$"},                           // lone dollar
+		{"a$b", Values{}, "a$b"},                       // dollar not followed by {
+		{"${a}${b}", Values{"a": "x", "b": "y"}, "xy"}, // consecutive
 	}
 	for _, tt := range tests {
 		got := substitute(tt.tmpl, tt.data)
 		if got != tt.want {
 			t.Errorf("substitute(%q, %v) = %q, want %q", tt.tmpl, tt.data, got, tt.want)
+		}
+	}
+}
+
+func TestSubstituteOwnedOutput(t *testing.T) {
+	var data Data = Values{"name": "first", "empty": ""}
+	output := substitute("${name}/${empty}/${unknown}/${name}", data)
+	for _, size := range []int{1, 64, 4096, 8192} {
+		value := strings.Repeat("数", size)
+		if got := substitute("pre:${name}:post", Values{"name": value}); got != "pre:"+value+":post" {
+			t.Fatalf("output changed for size %d", size)
+		}
+		if output != "first//${unknown}/first" {
+			t.Fatalf("previous output was overwritten: %q", output)
+		}
+	}
+}
+
+type missingTextData struct{ text string }
+
+func (d missingTextData) AppendText(dst []byte, _ string) ([]byte, bool) {
+	return append(dst, d.text...), false
+}
+
+func TestSubstituteMissingRollback(t *testing.T) {
+	const template = "before:${unknown}:after"
+	data := missingTextData{text: strings.Repeat("discard me", 64)}
+	if got := substitute(template, data); got != template {
+		t.Fatalf("output = %q, want %q", got, template)
+	}
+	buf, changed := appendSubstitution(nil, template, data)
+	if changed || string(buf) != template {
+		t.Fatalf("missing field changed output: %q, %v", buf, changed)
+	}
+	for _, value := range buf[len(buf):cap(buf)] {
+		if value != 0 {
+			t.Fatal("discarded text remains after rollback")
+		}
+	}
+}
+
+type recordingTextData struct {
+	fields []string
+	values Values
+}
+
+func (d *recordingTextData) AppendText(dst []byte, field string) ([]byte, bool) {
+	d.fields = append(d.fields, field)
+	return d.values.AppendText(dst, field)
+}
+
+func TestSubstituteVisitsFieldsOnce(t *testing.T) {
+	data := &recordingTextData{values: Values{"name": "数", "": "empty"}}
+	const template = "$${name}|${missing}|${name}|${}|$|${oops"
+	if got := substitute(template, data); got != "$数|${missing}|数|empty|$|${oops" {
+		t.Fatalf("output = %q", got)
+	}
+	if want := []string{"name", "missing", "name", ""}; !slices.Equal(data.fields, want) {
+		t.Fatalf("fields = %q, want %q", data.fields, want)
+	}
+}
+
+func TestInterpolationBufferReset(t *testing.T) {
+	for _, size := range []int{0, 16, maxInterpolationCapacity, maxInterpolationCapacity + 1} {
+		storage := make([]byte, size)
+		for i := range storage {
+			storage[i] = 'x'
+		}
+		buf := interpolationBuffer{bytes: storage}
+		buf.reset()
+		if len(buf.bytes) != 0 {
+			t.Fatalf("size %d: buffer was not reset", size)
+		}
+		if size > maxInterpolationCapacity {
+			if buf.bytes != nil {
+				t.Fatal("oversized backing array was retained")
+			}
+			continue
+		}
+		if cap(buf.bytes) != size {
+			t.Fatalf("size %d: reusable capacity was lost", size)
+		}
+		for _, value := range storage {
+			if value != 0 {
+				t.Fatal("backing array still contains error data")
+			}
 		}
 	}
 }
@@ -206,12 +295,19 @@ error:
 	var wg sync.WaitGroup
 	n := 100
 	wg.Add(n)
-	for range n {
+	for i := range n {
 		go func() {
 			defer wg.Done()
-			got := tr.Translate("en", "error.test", map[string]any{"name": "world"})
-			if got != "hello world" {
-				t.Errorf("got %q", got)
+			value := "world-" + strconv.Itoa(i)
+			data := Values{"name": value}
+			first := tr.Translate("en", "error.test", data)
+			for range 100 {
+				if got := tr.Translate("en", "error.test", data); got != "hello "+value {
+					t.Errorf("got %q, want %q", got, "hello "+value)
+				}
+			}
+			if first != "hello "+value {
+				t.Errorf("previous result changed: %q", first)
 			}
 		}()
 	}
@@ -248,17 +344,17 @@ func TestLoadDirUnreadableFile(t *testing.T) {
 
 func TestSubstituteUnclosedAtEnd(t *testing.T) {
 	// $ at end of string — must pass non-nil data to avoid early return
-	got := substitute("end$", map[string]any{"x": 1})
+	got := substitute("end$", Values{"x": "1"})
 	if got != "end$" {
 		t.Errorf("got %q", got)
 	}
 	// ${ without closing }
-	got = substitute("${unclosed", map[string]any{"x": 1})
+	got = substitute("${unclosed", Values{"x": "1"})
 	if got != "${unclosed" {
 		t.Errorf("got %q", got)
 	}
 	// Template has ${} to pass early check, but also has trailing $
-	got = substitute("${x}$", map[string]any{"x": "a"})
+	got = substitute("${x}$", Values{"x": "a"})
 	if got != "a$" {
 		t.Errorf("got %q", got)
 	}

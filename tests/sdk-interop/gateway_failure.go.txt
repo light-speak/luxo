@@ -1,0 +1,514 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	stderrors "errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/light-speak/luxo/pkg/lux/api"
+	"github.com/light-speak/luxo/pkg/lux/codec"
+	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
+	"github.com/light-speak/luxo/pkg/lux/rpc"
+	"github.com/light-speak/luxo/pkg/lux/schema"
+)
+
+func TestProxyExtensionFailures(t *testing.T) {
+	for _, list := range []bool{false, true} {
+		for _, branches := range []int{1, 2} {
+			for _, failure := range []string{"client", "schema", "rpc", "not-found", "truncated", "count", "child-boundary", "child-field", "primary-key"} {
+				t.Run(fmt.Sprintf("list=%v/branches=%d/%s", list, branches, failure), func(t *testing.T) {
+					verifyProxyFailure(t, list, branches, failure)
+				})
+			}
+		}
+	}
+}
+
+type proxyErrorData struct{}
+
+func (proxyErrorData) AppendJSON(dst []byte) ([]byte, error) {
+	return append(dst, `{"number":123456789012345678901234567890.123456789}`...), nil
+}
+
+func (proxyErrorData) AppendText(dst []byte, name string) ([]byte, bool) {
+	if name != "number" { return dst, false }
+	return append(dst, "123456789012345678901234567890.123456789"...), true
+}
+
+func TestProxyExtensionPreservesErrorData(t *testing.T) {
+	for _, list := range []bool{false, true} {
+		for _, branches := range []int{1, 2} {
+			s := proxyTestSchema(list, branches)
+			client := proxyTestRPC(t, s, map[string]api.HandlerFunc{
+				"parent": proxyTestResponse(proxyTestPrimary(list, true)),
+				"svc:resolve:Child:parentId": func(context.Context, *api.Request) error {
+					return luxerrors.New("PrecisionRejected", 422, "error.precision").WithData(proxyErrorData{})
+				},
+				"svc:resolve:Other:parentId": proxyTestResponse(proxyEmptyResolvedList()),
+			})
+			buffer := &api.ResponseBuf{B: []byte{0x77}}
+			request := &api.Request{FieldMask: proxyTestMask(branches), Buf: buffer}
+			ctx, _ := api.WithDebugTrace(t.Context(), "extension-error-data")
+			err := proxyHandler(client, s, "parent", map[string]*rpc.Client{"child":client, "other":client})(ctx, request)
+			value, ok := stderrors.AsType[*luxerrors.AppError](err)
+			if !ok || value.Code != 422 || value.Data == nil { t.Fatalf("extension data lost: %v", err) }
+			got, encodeErr := value.Data.AppendJSON(nil)
+			want, _ := (proxyErrorData{}).AppendJSON(nil)
+			if encodeErr != nil || !bytes.Equal(got, want) { t.Fatalf("extension data changed: %s, %v", got, encodeErr) }
+			if !bytes.Equal(buffer.B, []byte{0x77}) { t.Fatal("partial response published") }
+		}
+	}
+}
+
+func verifyProxyFailure(t *testing.T, list bool, branches int, failure string) {
+	t.Helper()
+	s := proxyTestSchema(list, branches)
+	primary := proxyTestPrimary(list, failure != "primary-key")
+	client := proxyTestRPC(t, s, map[string]api.HandlerFunc{
+		"parent": proxyTestResponse(primary),
+		"svc:resolve:Child:parentId": func(_ context.Context, request *api.Request) error {
+			if failure == "not-found" {
+				return luxerrors.New("NotFound", 404, "extension absent")
+			}
+			if failure == "rpc" {
+				return fmt.Errorf("extension refused")
+			}
+			response := proxyEmptyResolvedList()
+			if failure == "truncated" {
+				response = []byte{1}
+			}
+			if failure == "child-boundary" {
+				response = codec.AppendBytes([]byte{1}, []byte{1, 0, 1, 0x80})
+			}
+			if failure == "child-field" {
+				response = codec.AppendBytes([]byte{1}, []byte{1, 0, 99, 2, 0})
+			}
+			if failure == "count" {
+				response = []byte{0}
+			}
+			request.Buf.B = append(request.Buf.B, response...)
+			return nil
+		},
+		"svc:resolve:Other:parentId": proxyTestResponse(proxyEmptyResolvedList()),
+	})
+	clients := map[string]*rpc.Client{"child": client, "other": client}
+	if failure == "client" {
+		delete(clients, "child")
+	}
+	if failure == "schema" {
+		delete(s.APIs, "svc:resolve:Child:parentId")
+	}
+	buffer := &api.ResponseBuf{B: []byte{0x77}}
+	request := &api.Request{FieldMask: proxyTestMask(branches), Buf: buffer}
+	err := proxyHandler(client, s, "parent", clients)(t.Context(), request)
+	if err == nil {
+		t.Fatal("extension failure was returned as success")
+	}
+	if !bytes.Equal(buffer.B, []byte{0x77}) {
+		t.Fatalf("published partial response: %x", buffer.B)
+	}
+	if failure != "primary-key" && !strings.Contains(err.Error(), "children") {
+		t.Fatalf("error lost field attribution: %v", err)
+	}
+}
+
+func TestProxyProtocolFailureStatus(t *testing.T) {
+	for _, list := range []bool{false, true} {
+		for _, binary := range []bool{false, true} {
+			t.Run(fmt.Sprintf("list=%v/binary=%v", list, binary), func(t *testing.T) {
+				s := proxyTestSchema(list, 1)
+				client := proxyTestRPC(t, s, map[string]api.HandlerFunc{
+					"parent":                     proxyTestResponse(proxyTestPrimary(list, true)),
+					"svc:resolve:Child:parentId": proxyTestResponse([]byte{1}),
+				})
+				router := api.NewRouter()
+				router.Schema = s
+				router.Registry.RegisterSchemaAPIs(s)
+				router.Handle("parent", proxyHandler(client, s, "parent", map[string]*rpc.Client{"child": client}))
+				body := []byte(`{"$api":"parent","$select":"id,children { id }"}`)
+				if binary {
+					var err error
+					body, err = api.EncodeBinaryRequest(1, proxyTestMask(1), nil, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				request := httptest.NewRequest(http.MethodPost, "/luvia", bytes.NewReader(body))
+				if binary {
+					request.Header.Set("X-Luxo-Mode", "binary")
+				}
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, request)
+				if response.Code != http.StatusInternalServerError {
+					t.Fatalf("expected handler error, received %d: %s", response.Code, response.Body.Bytes())
+				}
+			})
+		}
+	}
+}
+
+func TestProxySelectionReuse(t *testing.T) {
+	for _, list := range []bool{false, true} {
+		for _, sameMask := range []bool{false, true} {
+			t.Run(fmt.Sprintf("list=%v/same-mask=%v", list, sameMask), func(t *testing.T) {
+				verifyProxySelectionReuse(t, list, sameMask)
+			})
+		}
+	}
+}
+
+func verifyProxySelectionReuse(t *testing.T, list, sameMask bool) {
+	t.Helper()
+	s := proxyTestSchema(list, 1)
+	alias := s.Models["Parent"].Fields[1]
+	alias.ID, alias.Name = 3, "alias"
+	s.Models["Parent"].Fields = append(s.Models["Parent"].Fields, alias)
+	var calls atomic.Int32
+	var selected atomic.Uint32
+	client := proxyTestRPC(t, s, map[string]api.HandlerFunc{
+		"parent": proxyTestResponse(proxyTestPrimary(list, true)),
+		"svc:resolve:Child:parentId": func(_ context.Context, request *api.Request) error {
+			keys, err := request.ParamIntArray("keys")
+			if err != nil || len(keys) != 1 || keys[0] != 9223372036854775807 {
+				return fmt.Errorf("primary key precision lost: %v, %v", keys, err)
+			}
+			calls.Add(1)
+			fields := codec.SelectionMaskFields(request.FieldMask)
+			for field := 1; field <= 2; field++ {
+				if codec.FieldMaskHas(fields, field) {
+					selected.Or(1 << (field - 1))
+				}
+			}
+			request.Buf.B = append(request.Buf.B, proxyEmptyResolvedList()...)
+			return nil
+		},
+	})
+	request := &api.Request{FieldMask: proxyTestAliasMask(sameMask), Buf: &api.ResponseBuf{}}
+	if err := proxyHandler(client, s, "parent", map[string]*rpc.Client{"child": client})(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	wantCalls, wantFields := int32(2), uint32(3)
+	if sameMask {
+		wantCalls, wantFields = 1, 1
+	}
+	if calls.Load() != wantCalls || selected.Load() != wantFields {
+		t.Fatalf("calls=%d fields=%b, want calls=%d fields=%b", calls.Load(), selected.Load(), wantCalls, wantFields)
+	}
+}
+
+func proxyTestAliasMask(same bool) []byte {
+	mask := proxyTestMask(2)
+	if same {
+		return mask
+	}
+	return codec.AppendSelectionMask(nil, codec.SelectionMaskFields(mask), []codec.SelectionMaskChild{
+		{FieldID: 2, Mask: codec.AppendSelectionMask(nil, codec.FieldMaskSet(nil, 1), nil)},
+		{FieldID: 3, Mask: codec.AppendSelectionMask(nil, codec.FieldMaskSet(nil, 2), nil)},
+	})
+}
+
+func TestProxyEmptyPrimaryList(t *testing.T) {
+	s := proxyTestSchema(true, 1)
+	var extensionCalls atomic.Int32
+	client := proxyTestRPC(t, s, map[string]api.HandlerFunc{
+		"parent": proxyTestResponse([]byte{0, 0, 0}),
+		"svc:resolve:Child:parentId": func(context.Context, *api.Request) error {
+			extensionCalls.Add(1)
+			return fmt.Errorf("must not resolve an empty primary list")
+		},
+	})
+	request := &api.Request{FieldMask: proxyTestMask(1), Buf: &api.ResponseBuf{}}
+	if err := proxyHandler(client, s, "parent", map[string]*rpc.Client{"child": client})(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	if extensionCalls.Load() != 0 || !bytes.Equal(request.Buf.B, []byte{0, 0, 0}) {
+		t.Fatalf("empty result changed: calls=%d, body=%x", extensionCalls.Load(), request.Buf.B)
+	}
+}
+
+func TestProxyMixedSharedTargets(t *testing.T) {
+	s := proxyTestSchema(false, 2)
+	alias := s.Models["Parent"].Fields[1]
+	alias.ID, alias.Name = 4, "alias"
+	s.Models["Parent"].Fields = append(s.Models["Parent"].Fields, alias)
+	var childCalls, otherCalls atomic.Int32
+	client := proxyTestRPC(t, s, map[string]api.HandlerFunc{
+		"parent": proxyTestResponse(proxyTestPrimary(false, true)),
+		"svc:resolve:Child:parentId": func(_ context.Context, request *api.Request) error {
+			childCalls.Add(1)
+			request.Buf.B = append(request.Buf.B, proxyEmptyResolvedList()...)
+			return nil
+		},
+		"svc:resolve:Other:parentId": func(_ context.Context, request *api.Request) error {
+			otherCalls.Add(1)
+			request.Buf.B = append(request.Buf.B, proxyEmptyResolvedList()...)
+			return nil
+		},
+	})
+	request := &api.Request{FieldMask: proxyTestMask(3), Buf: &api.ResponseBuf{}}
+	if err := proxyHandler(client, s, "parent", map[string]*rpc.Client{"child": client, "other": client})(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	if childCalls.Load() != 1 || otherCalls.Load() != 1 {
+		t.Fatalf("duplicate RPC: %d/%d", childCalls.Load(), otherCalls.Load())
+	}
+	if !bytes.HasSuffix(request.Buf.B, []byte{2, 3, 0, 0, 0, 3, 3, 0, 0, 0, 4, 3, 0, 0, 0, 0}) {
+		t.Fatalf("lost shared fields: %x", request.Buf.B)
+	}
+}
+
+func TestProxyMissingPrimaryConfiguration(t *testing.T) {
+	s := proxyTestSchema(false, 1)
+	for _, name := range []string{"parent", "unknown"} {
+		request := &api.Request{FieldMask: proxyTestMask(1), Buf: &api.ResponseBuf{}}
+		if err := proxyHandler(nil, s, name, nil)(t.Context(), request); err == nil {
+			t.Fatalf("accepted missing primary: %s", name)
+		}
+	}
+}
+
+func TestProxyInvalidEmptyPrimary(t *testing.T) {
+	for _, primary := range [][]byte{nil, {0}, {0, 0}, {0, 0, 0, 0}, {0, 0, 1}} {
+		s := proxyTestSchema(true, 1)
+		client := proxyTestRPC(t, s, map[string]api.HandlerFunc{"parent": proxyTestResponse(primary)})
+		request := &api.Request{FieldMask: proxyTestMask(1), Buf: &api.ResponseBuf{}}
+		if err := proxyHandler(client, s, "parent", map[string]*rpc.Client{"child": client})(t.Context(), request); err == nil {
+			t.Fatalf("accepted incomplete empty response: %x", primary)
+		}
+	}
+}
+
+func TestProxyPrimaryAndPlanningFailures(t *testing.T) {
+	for _, failure := range []string{"rpc", "plan", "offline"} {
+		t.Run(failure, func(t *testing.T) {
+			s := proxyTestSchema(false, 1)
+			client := proxyTestRPC(t, s, map[string]api.HandlerFunc{"parent": func(context.Context, *api.Request) error { return fmt.Errorf("primary refused") }})
+			if failure == "plan" {
+				s.Models["Parent"].Fields[1].Relation = false
+			}
+			if failure == "offline" {
+				client.Close()
+			}
+			request := &api.Request{FieldMask: proxyTestMask(1), Buf: &api.ResponseBuf{}}
+			if err := proxyHandler(client, s, "parent", map[string]*rpc.Client{"child": client})(t.Context(), request); err == nil {
+				t.Fatal("accepted primary/planning failure")
+			}
+			if len(request.Buf.B) != 0 {
+				t.Fatal("published partial primary")
+			}
+		})
+	}
+}
+
+func TestProxySuccessfulMergeKeepsBytes(t *testing.T) {
+	for _, list := range []bool{false, true} {
+		for _, branches := range []int{1, 2} {
+			t.Run(fmt.Sprintf("list=%v/branches=%d", list, branches), func(t *testing.T) {
+				s := proxyTestSchema(list, branches)
+				primary := proxyTestPrimary(list, true)
+				child := proxyTestPrimary(true, true)
+				grouped := codec.AppendBytes([]byte{1}, child)
+				client := proxyTestRPC(t, s, map[string]api.HandlerFunc{
+					"parent":                     proxyTestResponse(primary),
+					"svc:resolve:Child:parentId": proxyTestResponse(grouped),
+					"svc:resolve:Other:parentId": proxyTestResponse(grouped),
+				})
+				request := &api.Request{FieldMask: proxyTestMask(branches), Buf: &api.ResponseBuf{}}
+				if err := proxyHandler(client, s, "parent", map[string]*rpc.Client{"child": client, "other": client})(t.Context(), request); err != nil {
+					t.Fatal(err)
+				}
+				expected := bytes.Clone(primary[:len(primary)-1])
+				for field := 2; field <= branches+1; field++ {
+					expected = codec.AppendVarint(expected, uint64(field))
+					expected = codec.AppendBytes(expected, child)
+				}
+				expected = append(expected, 0)
+				if !bytes.Equal(request.Buf.B, expected) {
+					t.Fatalf("merge changed Int64 payload: got %x, want %x", request.Buf.B, expected)
+				}
+			})
+		}
+	}
+}
+
+func TestProxyParallelFailureCancelsPendingRPC(t *testing.T) {
+	for _, list := range []bool{false, true} {
+		t.Run(fmt.Sprint(list), func(t *testing.T) {
+			s := proxyTestSchema(list, 2)
+			pending := make(chan struct{})
+			release := make(chan struct{})
+			client := proxyTestRPC(t, s, map[string]api.HandlerFunc{
+				"parent": proxyTestResponse(proxyTestPrimary(list, true)),
+				"svc:resolve:Child:parentId": func(context.Context, *api.Request) error {
+					<-pending
+					return fmt.Errorf("extension refused")
+				},
+				"svc:resolve:Other:parentId": func(context.Context, *api.Request) error {
+					close(pending)
+					<-release
+					return nil
+				},
+			})
+			defer close(release)
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			request := &api.Request{FieldMask: proxyTestMask(2), Buf: &api.ResponseBuf{}}
+			err := proxyHandler(client, s, "parent", map[string]*rpc.Client{"child": client, "other": client})(ctx, request)
+			if ctx.Err() != nil {
+				t.Fatal("gateway waited for the request deadline instead of cancelling the pending RPC")
+			}
+			if err == nil || !strings.Contains(err.Error(), "children") {
+				t.Fatalf("first failure lost: %v", err)
+			}
+			if len(request.Buf.B) != 0 {
+				t.Fatal("published a partial success")
+			}
+		})
+	}
+}
+
+func proxyTestSchema(list bool, branches int) *schema.Schema {
+	s := schema.New()
+	fields := []schema.Field{
+		{ID: 1, Name: "id", Type: schema.FieldInt, PrimaryKey: true},
+		{ID: 2, Name: "children", Type: schema.FieldModel, TypeName: "Child", IsList: true, Relation: true, Module: "child", ForeignKey: "parentId"},
+	}
+	if branches == 2 {
+		fields = append(fields, schema.Field{ID: 3, Name: "others", Type: schema.FieldModel, TypeName: "Other", IsList: true, Relation: true, Module: "other", ForeignKey: "parentId"})
+	}
+	s.RegisterModel(&schema.Model{Name: "Parent", Fields: fields})
+	s.RegisterModel(&schema.Model{Name: "Child", Fields: []schema.Field{{ID: 1, Name: "id", Type: schema.FieldInt}, {ID: 2, Name: "other", Type: schema.FieldInt}}})
+	s.RegisterModel(&schema.Model{Name: "Other", Fields: []schema.Field{{ID: 1, Name: "id", Type: schema.FieldInt}}})
+	s.RegisterAPI(&schema.API{ID: 1, Name: "parent", ReturnType: "Parent", ReturnList: list, Module: "parent"})
+	s.RegisterAPI(&schema.API{ID: 2, Name: "svc:resolve:Child:parentId", Params: []schema.Param{{ID: 1, Name: "keys", Type: schema.FieldInt, IsList: true}, {ID: 2, Name: "shape", Type: schema.FieldInt}}})
+	s.RegisterAPI(&schema.API{ID: 3, Name: "svc:resolve:Other:parentId", Params: []schema.Param{{ID: 1, Name: "keys", Type: schema.FieldInt, IsList: true}, {ID: 2, Name: "shape", Type: schema.FieldInt}}})
+	return s
+}
+
+func proxyTestMask(branches int) []byte {
+	var mask []byte
+	var children []codec.SelectionMaskChild
+	for field := 1; field <= branches+1; field++ {
+		mask = codec.FieldMaskSet(mask, field)
+		if field > 1 {
+			children = append(children, codec.SelectionMaskChild{FieldID: field, Mask: codec.AppendSelectionMask(nil, codec.FieldMaskSet(nil, 1), nil)})
+		}
+	}
+	return codec.AppendSelectionMask(nil, mask, children)
+}
+
+func proxyTestPrimary(list, key bool) []byte {
+	var response []byte
+	if list {
+		response = append(response, 1)
+	}
+	response = append(response, 0)
+	if key {
+		response = codec.AppendVarint(response, 1)
+		response = codec.AppendSvarint(response, 9223372036854775807)
+	}
+	return append(response, 0)
+}
+
+func proxyTestResponse(body []byte) api.HandlerFunc {
+	return func(_ context.Context, request *api.Request) error {
+		request.Buf.B = append(request.Buf.B, body...)
+		return nil
+	}
+}
+
+func proxyTestRPC(t testing.TB, s *schema.Schema, handlers map[string]api.HandlerFunc) *rpc.Client {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := api.NewRouter()
+	router.Schema = s
+	router.Registry.RegisterSchemaAPIs(s)
+	for name, handler := range handlers {
+		router.Handle(name, handler)
+	}
+	server := rpc.NewServer(router)
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(listener) }()
+	client := rpc.NewNamedClient("fixture", listener.Addr().String())
+	t.Cleanup(func() {
+		client.Close()
+		server.Close()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	})
+	return client
+}
+
+func proxyEmptyResolvedList() []byte { return []byte{1, 3, 0, 0, 0} }
+
+func TestProxyAliasShapesStayIndependent(t *testing.T) {
+	for _, list := range []bool{false, true} {
+		t.Run(fmt.Sprint(list), func(t *testing.T) {
+			s := proxyTestSchema(list, 1)
+			base := s.Models["Parent"].Fields[1]
+			s.Models["Parent"].Fields = s.Models["Parent"].Fields[:1]
+			var fields []byte
+			var children []codec.SelectionMaskChild
+			fields = codec.FieldMaskSet(fields, 1)
+			for shape := 0; shape < 4; shape++ {
+				field := base
+				field.ID, field.Name = shape+2, fmt.Sprintf("shape%d", shape)
+				field.IsList, field.Nullable = shape&1 != 0, shape&2 != 0
+				s.Models["Parent"].Fields = append(s.Models["Parent"].Fields, field)
+				fields = codec.FieldMaskSet(fields, field.ID)
+				children = append(children, codec.SelectionMaskChild{FieldID: field.ID, Mask: codec.AppendSelectionMask(nil, codec.FieldMaskSet(nil, 1), nil)})
+			}
+			var seen atomic.Uint32
+			var calls atomic.Int32
+			client := proxyTestRPC(t, s, map[string]api.HandlerFunc{
+				"parent": proxyTestResponse(proxyTestPrimary(list, true)),
+				"svc:resolve:Child:parentId": func(_ context.Context, req *api.Request) error {
+					shape, err := req.ParamInt("shape")
+					if err != nil || shape < 0 || shape > 3 {
+						return fmt.Errorf("invalid shape: %d %v", shape, err)
+					}
+					calls.Add(1)
+					seen.Or(1 << uint(shape))
+					req.Buf.B = append(req.Buf.B, 1)
+					if shape&2 != 0 {
+						req.Buf.B = append(req.Buf.B, 1)
+					}
+					req.Buf.B = codec.AppendBytes(req.Buf.B, proxyTestPrimary(shape&1 != 0, true))
+					return nil
+				},
+			})
+			req := &api.Request{FieldMask: codec.AppendSelectionMask(nil, fields, children), Buf: &api.ResponseBuf{}}
+			if err := proxyHandler(client, s, "parent", map[string]*rpc.Client{"child": client})(t.Context(), req); err != nil {
+				t.Fatal(err)
+			}
+			if calls.Load() != 4 || seen.Load() != 15 {
+				t.Fatalf("merged incompatible aliases: %d calls, shapes %b", calls.Load(), seen.Load())
+			}
+			primary := proxyTestPrimary(list, true)
+			expected := bytes.Clone(primary[:len(primary)-1])
+			for shape := 0; shape < 4; shape++ {
+				expected = append(expected, byte(shape+2))
+				if shape&2 != 0 {
+					expected = append(expected, 1)
+				}
+				expected = codec.AppendBytes(expected, proxyTestPrimary(shape&1 != 0, true))
+			}
+			expected = append(expected, 0)
+			if !bytes.Equal(req.Buf.B, expected) {
+				t.Fatalf("shape/framing changed: got %x, want %x", req.Buf.B, expected)
+			}
+		})
+	}
+}

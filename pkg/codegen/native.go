@@ -65,14 +65,7 @@ func writeNativeImports(b *strings.Builder, body string) {
 		return
 	}
 	b.WriteString("import (\n\t\"context\"\n")
-	for _, imp := range []struct{ qualifier, path string }{
-		{"json.", "encoding/json"}, {"time.", "time"},
-		{"uuid.", "github.com/google/uuid"}, {"decimal.", "github.com/shopspring/decimal"},
-	} {
-		if strings.Contains(body, imp.qualifier) {
-			fmt.Fprintf(b, "\t%q\n", imp.path)
-		}
-	}
+	writeScalarTypeImports(b, body)
 	b.WriteString(")\n\n")
 }
 

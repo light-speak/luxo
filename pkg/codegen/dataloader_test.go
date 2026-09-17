@@ -165,6 +165,17 @@ func TestGenerateDataLoaderFile(t *testing.T) {
 	}
 }
 
+func TestDataLoaderGenericQueryDoesNotImportDriver(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{Extends: []*ast.ExtendDecl{{Name: "User"}}}}}
+	source := string(generateDataLoaderFile(result, "generated", nil, nil, DriverPG))
+	if !strings.Contains(source, "app.DB.QueryRows(") {
+		t.Fatal("expected the generic database method")
+	}
+	if strings.Contains(source, DriverPG.DriverImport()) {
+		t.Fatal("method-based loaders must not import an unused database package")
+	}
+}
+
 func TestGenerateDataLoaderFileNoRelations(t *testing.T) {
 	result := &semantic.Result{
 		Files: []*ast.File{{

@@ -85,6 +85,52 @@ func TestGenerateEntryFileNoModels(t *testing.T) {
 	}
 }
 
+func TestGeneratedSchemaRegistrationPrecedesServing(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{}}
+	for _, name := range []string{"user", "post"} {
+		result.Files = append(result.Files, &ast.File{
+			Name:      "origin/" + name + "/api.luxo",
+			Models:    []*ast.ModelDecl{{Name: name + "Record", Directives: []*ast.Directive{{Name: "crud"}}}},
+			Types:     []*ast.TypeDecl{{Name: name + "Payload", Fields: []*ast.FieldDecl{{Name: "value", Type: &ast.TypeRef{Name: "Int"}}}}},
+			Functions: []*ast.FnDecl{{Name: name + "Score", Directives: []*ast.Directive{{Name: "service"}}, Body: &ast.Block{}}},
+		})
+	}
+	modules := GenerateModuleEntryFiles(result, "myapp")
+	for _, entry := range []struct {
+		name    string
+		source  []byte
+		modules []string
+	}{
+		{"embedded", GenerateEntryFile(result, "myapp"), []string{"user", "post"}},
+		{"gateway", GenerateGatewayEntry(result, "myapp"), []string{"user", "post"}},
+		{"user", modules["user"], []string{"user"}},
+		{"post", modules["post"], []string{"post"}},
+	} {
+		t.Run(entry.name, func(t *testing.T) { assertSchemaBeforeServing(t, string(entry.source), entry.modules) })
+	}
+}
+
+func assertSchemaBeforeServing(t *testing.T, source string, modules []string) {
+	t.Helper()
+	firstServe := strings.Index(source, "gw.Serve(")
+	if firstServe < 0 {
+		t.Fatal("entry has no HTTP serving boundary")
+	}
+	if rpc := strings.Index(source, "rpc.NewServer("); rpc >= 0 && rpc < firstServe {
+		firstServe = rpc
+	}
+	for _, module := range modules {
+		registration := module + "_luxo.RegisterSchema(gw.Router.Schema)"
+		at := strings.Index(source, registration)
+		if at < 0 || at > firstServe {
+			t.Fatalf("%s must complete before publishing a server", registration)
+		}
+		if strings.Count(source, registration) != 1 {
+			t.Fatalf("%s registered more than once", registration)
+		}
+	}
+}
+
 func TestGeneratedEntriesTreatDotEnvAsOptionalButRejectMalformedFiles(t *testing.T) {
 	result := &semantic.Result{Files: []*ast.File{{
 		Name: "origin/user.luxo",
@@ -668,7 +714,7 @@ func TestGenerateGatewayEntry(t *testing.T) {
 		`Name: "response.merge"`,
 		"luvia.ExtractPrimaryKeyColumn",
 		"luvia.ExtractPrimaryKeys",
-		"keys.EncodeParam(1)",
+		"keys.EncodeResolveParams(shape)",
 	}
 	for _, check := range checks {
 		if !strings.Contains(src, check) {
@@ -1127,12 +1173,31 @@ func TestGeneratedEntriesBridgeNativeStreamsThroughRPC(t *testing.T) {
 		`gw.Router.HandleStreamNative("watchLiveScore", rpcStreamProxy(rpcClients["score"]`,
 		"client.SubscribeContext(ctx, luvia.BearerToken(ctx)",
 		"params.Binary()",
-		"router.StreamPayloadJSON(apiName, data)",
+		"data, err = router.StreamPayloadJSON(apiName, data)",
+		"return subscription.Err()",
 	} {
 		if !strings.Contains(gateway, want) {
 			t.Fatalf("gateway native stream bridge missing %q:\n%s", want, gateway)
 		}
 	}
+	if strings.Contains(gateway, "case <-subscription.Errors():") {
+		t.Fatal("terminal errors must not skip buffered stream messages")
+	}
+}
+
+func TestGeneratedGatewayStreamErrorInterfaceCompiles(t *testing.T) {
+	var source strings.Builder
+	source.WriteString(`package generated
+import (
+    "context"
+    "fmt"
+    "github.com/light-speak/luxo/pkg/lux/api"
+    "github.com/light-speak/luxo/pkg/lux/rpc"
+    "github.com/light-speak/luxo/pkg/lux/luvia"
+)
+`)
+	writeGatewayRPCStreamProxy(&source, []moduleInfo{{nativeStreams: []string{"watch"}}})
+	runGeneratedProtocolPackage(t, source.String(), "package generated\n")
 }
 
 func TestGenerateGatewayEntryNoCrudModel(t *testing.T) {

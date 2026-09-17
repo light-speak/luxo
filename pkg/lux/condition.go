@@ -5,6 +5,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/light-speak/luxo/pkg/lux/datetime"
+
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 )
@@ -170,7 +172,7 @@ func (f TimeField) Between(from, to time.Time) Condition {
 // FilterOp creates a condition from string operator and value (RFC3339).
 // Returns FALSE condition if the value cannot be parsed.
 func (f TimeField) FilterOp(op, val string) Condition {
-	t, err := time.Parse(time.RFC3339, val)
+	t, err := datetime.ParseRFC3339(val)
 	if err != nil {
 		return falseCond{}
 	}

@@ -1,0 +1,96 @@
+const _iterations = 5000;
+
+void main() {
+  for (final mode in TransportMode.values) {
+    for (final count in [1, 32, 128]) {
+      for (final id in <Object>[1, BigInt.parse('18446744073709551615')]) {
+        _compareDispatch(mode, count, id);
+      }
+    }
+  }
+  print('Stream dispatch only; excludes sockets, setup, decoding callback and allocation measurements.');
+}
+
+void _compareDispatch(TransportMode mode, int count, Object id) {
+  final current = WsTransport('ws://unused', autoReconnect: false);
+  var beforeCount = 0;
+  var afterCount = 0;
+  final schema = {for (var i = 0; i < count; i++) 'api$i': APISchemaEntry(i + 1)};
+  final api = 'api${count - 1}';
+  final previous = _PreviousDispatch(schema, {api: (_) => beforeCount++});
+  current._subscriptions[id] = _Subscription(mode, (value) => value, (_) => afterCount++, null);
+  final oldJSON = '{"\$stream":"$api","data":42}';
+  final newJSON = '{"\$stream":$id,"data":42}';
+  final oldEncoder = LuxoEncoder()..writeVarint(6)..writeVarint(count)..writeVarint(42);
+  final newEncoder = LuxoEncoder()..writeVarint(0x12);
+  _writeSequence(newEncoder, id);
+  newEncoder.writeVarint(42);
+  final oldBinary = oldEncoder.bytes();
+  final newBinary = newEncoder.bytes();
+  void before() => mode == TransportMode.json
+      ? previous.json(oldJSON) : previous.binary(oldBinary);
+  void after() => mode == TransportMode.json
+      ? current._handleJsonResponse(newJSON) : current._handleBinaryResponse(newBinary);
+  before(); after();
+  if (beforeCount != 1 || afterCount != 1) throw StateError('Probe failed to dispatch');
+  benchmark.compareBenchmarks('$mode schema=$count id=${id is int ? 'small' : 'maximum'}',
+    () { for (var i = 0; i < _iterations; i++) before(); return beforeCount; },
+    () { for (var i = 0; i < _iterations; i++) after(); return afterCount; },
+    iterations: _iterations, includeRange: true);
+  if (beforeCount != afterCount) throw StateError('Probe silently dropped messages');
+  current.close();
+}
+
+// Frozen previous stream-dispatch path, not an equivalently identity-safe protocol.
+// Non-stream branches return without work; all measured frames are stream data.
+class _PreviousDispatch {
+  final Map<String, APISchemaEntry> schema;
+  final Map<String, void Function(dynamic)> subscriptions;
+  _PreviousDispatch(this.schema, this.subscriptions);
+
+  void json(String data) {
+    try {
+      final json = decodeLuxoJSON(data, preserveNumberSyntax: true) as Map<String, dynamic>;
+      final subscription = json[r'$sub'];
+      if (subscription is String) return;
+      final stream = json[r'$stream'];
+      if (stream is String) subscriptions[stream]?.call(json['data']);
+    } catch (_) {}
+  }
+
+  void binary(Uint8List data) {
+    if (data.length < 2) return;
+    final frameType = data[0];
+    if (frameType < 2 || frameType > 8) return;
+    var low = 0;
+    var high = 0;
+    for (var i = 0; i < 10 && i + 1 < data.length; i++) {
+      final byte = data[i + 1];
+      if (i == 9 && byte > 1) return;
+      final payload = byte & 127;
+      if (i < 4) {
+        low |= payload << (i * 7);
+      } else if (i == 4) {
+        low = (low | (payload << 28)) & 0xffffffff;
+        high = payload >>> 4;
+      } else {
+        high |= payload << (i * 7 - 32);
+      }
+      if (byte < 128) {
+        _dispatch(data, frameType, uint64FromWords(low, high), i + 2);
+        return;
+      }
+    }
+  }
+
+  void _dispatch(Uint8List data, int frameType, Object id, int offset) {
+    if (frameType == 7 || frameType == 8) return;
+    if (frameType == 6) {
+      String? api;
+      for (final entry in schema.entries) {
+        if (entry.value.id == id) { api = entry.key; break; }
+      }
+      if (api != null) subscriptions[api]?.call(data.sublist(offset));
+    }
+  }
+}

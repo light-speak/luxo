@@ -465,7 +465,7 @@ func (lf *LockFile) updateFederationAPIs(files []*ast.File, enums map[string]boo
 					continue
 				}
 				foreignKey := federationForeignKey(ext.Name, primaryKeys[ext.Name], field)
-				ensure("svc:resolve:"+field.Type.Name+":"+foreignKey, []string{"keys"})
+				ensure("svc:resolve:"+field.Type.Name+":"+foreignKey, []string{"keys", "shape"})
 			}
 		}
 	}

@@ -7,6 +7,9 @@ import (
 	"github.com/light-speak/luxo/pkg/lux/str"
 )
 
+// Keep scaffold and build-image requirements in sync with the core module.
+const generatedGoVersion = "1.27.1"
+
 // ScaffoldResult holds scaffold files to be written to disk.
 // Keys are relative paths from the project root.
 type ScaffoldResult struct {
@@ -80,7 +83,7 @@ tmp/
 func generateGoMod(modulePath string) []byte {
 	var b strings.Builder
 	fmt.Fprintf(&b, "module %s\n\n", modulePath)
-	b.WriteString("go 1.26.0\n")
+	b.WriteString("go " + generatedGoVersion + "\n")
 	return []byte(b.String())
 }
 

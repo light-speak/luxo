@@ -139,12 +139,12 @@ func TestGenerateStreamFileNoEventSource(t *testing.T) {
 	if !strings.Contains(code, "type StreamResolver interface") {
 		t.Error("should generate StreamResolver interface")
 	}
-	if !strings.Contains(code, "HandleWatchLiveScore(ctx context.Context, params *api.StreamParams, identity any, stream *api.TypedStream[ScoreEvent])") {
+	if !strings.Contains(code, "HandleWatchLiveScore(ctx context.Context, params *api.StreamParams, identity any, stream *api.TypedStream[ScoreEvent]) error") {
 		t.Error("should generate HandleWatchLiveScore method in StreamResolver")
 	}
 
 	// Should generate handler wrapper delegating to resolver
-	if !strings.Contains(code, "resolver.HandleWatchLiveScore(ctx, params, identity, typedStream)") {
+	if !strings.Contains(code, "return resolver.HandleWatchLiveScore(ctx, params, identity, typedStream)") {
 		t.Error("should delegate to resolver.HandleWatchLiveScore")
 	}
 }
@@ -654,7 +654,7 @@ func TestStreamImportsCollectRemoteTypesAndEnums(t *testing.T) {
 		payloadModule: "common", sourceModule: "feed", body: body,
 	}}
 	var b strings.Builder
-	generator.writeStreamImports(&b, streams)
+	generator.writeStreamImports(&b, streams, "")
 	for _, module := range []string{"auth", "common", "events"} {
 		if !strings.Contains(b.String(), module+`_luxo "github.com/example/service/`+module+`/luxo"`) {
 			t.Fatalf("missing %s import:\n%s", module, b.String())

@@ -1,0 +1,58 @@
+package api
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func invalidUnicodeRequests() []string {
+	return []string{
+		`{"$api":"text","value":"\uD800"}`,
+		`{"$api":"text","\uDC00":1}`,
+		`{"$api":"text","raw":{"items":["\uDBFF"]}}`,
+		`{"$api":"text","value":"\uD800","value":"valid"}`,
+		`{"$api":"text","$select":"\uD800"}`,
+		`{"$api":"text","$filters":[{"field":"id","op":"eq","value":"\uDC00"}]}`,
+	}
+}
+
+func TestHTTPJSONRejectsSurrogatesBeforeDispatch(t *testing.T) {
+	for _, body := range invalidUnicodeRequests() {
+		t.Run(body, func(t *testing.T) {
+			for _, traced := range []bool{false, true} {
+				rt := NewRouter()
+				rt.SetDevMode(traced)
+				called := false
+				rt.Handle("text", func(context.Context, *Request) error { called = true; return nil })
+				req := makeReq(body)
+				if traced {
+					req.Header.Set(DebugTraceRequestHeader, "true")
+				}
+				response := httptest.NewRecorder()
+				rt.ServeHTTP(response, req)
+				if response.Code != http.StatusBadRequest || called {
+					t.Fatalf("malformed Unicode dispatched: status=%d called=%t", response.Code, called)
+				}
+			}
+		})
+	}
+}
+
+func TestJSONRequestOwnsEscapedKeysAndRawValues(t *testing.T) {
+	const body = `{"\u0024api":"text","n\u0061me":"\uD800\uDC00","raw":{"n":123456789012345678901234567890}}`
+	got, err := ParseRequest(makeReq(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 100 {
+		if _, err := ParseRequest(makeReq(`{"$api":"xxxx","other":"replacement","raw":{"n":0}}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got.API != "text" || string(got.Params["name"]) != `"\uD800\uDC00"` ||
+		string(got.Params["raw"]) != `{"n":123456789012345678901234567890}` {
+		t.Fatal("pooled request parsing changed an owned result")
+	}
+}

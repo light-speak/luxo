@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -21,12 +22,16 @@ type StreamHub struct {
 
 // StreamSub represents one client's subscription to a @stream API.
 type StreamSub struct {
-	Ch        chan []byte        // encoded data ready to write to WS
-	Params    *StreamParams      // subscription parameters (roomId, etc.)
-	Identity  any                // authenticated user (nil if no @auth)
-	FieldMask []byte             // which fields the client wants
-	Binary    bool               // negotiated Luxo binary mode
-	cancel    context.CancelFunc // cancel this sub's write pump
+	Ch           chan []byte        // encoded data ready to write to WS
+	Params       *StreamParams      // subscription parameters (roomId, etc.)
+	Identity     any                // authenticated user (nil if no @auth)
+	FieldMask    []byte             // which fields the client wants
+	Binary       bool               // negotiated Luxo binary mode
+	cancel       context.CancelFunc // cancel this sub's producer
+	cancelWriter context.CancelFunc // optional WS writer; independent of completion
+	sendMu       sync.RWMutex       // native Send vs. hub-owned channel close
+	closed       bool               // protected by sendMu
+	result       error              // terminal result, protected by sendMu
 }
 
 // StreamParams holds subscription parameters from the client.
@@ -185,17 +190,21 @@ type Stream struct {
 // subscriber's field selection and negotiated transport mode.
 type TypedStream[T any] struct {
 	stream *Stream
-	encode func(value T, fieldMask []byte, binary bool) []byte
+	encode func(value T, fieldMask []byte, binary bool) ([]byte, error)
 }
 
 // NewTypedStream binds a generated typed encoder to a raw stream transport.
-func NewTypedStream[T any](stream *Stream, encode func(value T, fieldMask []byte, binary bool) []byte) *TypedStream[T] {
+func NewTypedStream[T any](stream *Stream, encode func(value T, fieldMask []byte, binary bool) ([]byte, error)) *TypedStream[T] {
 	return &TypedStream[T]{stream: stream, encode: encode}
 }
 
 // Send encodes and pushes one typed stream value.
 func (s *TypedStream[T]) Send(value T) error {
-	return s.stream.Send(s.encode(value, s.stream.sub.FieldMask, s.stream.sub.Binary))
+	data, err := s.encode(value, s.stream.sub.FieldMask, s.stream.sub.Binary)
+	if err != nil {
+		return err
+	}
+	return s.stream.Send(data)
 }
 
 // Context returns the subscription context.
@@ -216,6 +225,14 @@ func (s *InternalStream) Messages() <-chan []byte {
 	return s.sub.Ch
 }
 
+// Err returns the terminal result. Read Messages until closed before interpreting
+// nil as successful completion; an active subscription also returns nil.
+func (s *InternalStream) Err() error {
+	s.sub.sendMu.RLock()
+	defer s.sub.sendMu.RUnlock()
+	return s.sub.result
+}
+
 // Close removes the subscription and cancels its handler context.
 func (s *InternalStream) Close() {
 	s.once.Do(func() {
@@ -229,13 +246,33 @@ var ErrStreamFull = fmt.Errorf("stream: subscriber channel full, client too slow
 // Send pushes encoded data to the client.
 // Returns ErrStreamFull immediately if channel is full — caller should stop pushing.
 func (s *Stream) Send(data []byte) error {
+	s.sub.sendMu.RLock()
+	defer s.sub.sendMu.RUnlock()
+	if s.sub.closed {
+		return context.Canceled
+	}
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
 	select {
 	case s.sub.Ch <- data:
 		return nil
-	case <-s.ctx.Done():
-		return s.ctx.Err()
 	default:
 		return ErrStreamFull
+	}
+}
+
+// close is called once under the hub's write lock. Event dispatch already holds
+// the hub read lock; only native Send needs the per-subscription lock as well.
+// Lock order is hub.mu -> sendMu; Send never acquires hub.mu.
+func (s *StreamSub) close(err error) {
+	s.sendMu.Lock()
+	s.closed = true
+	s.result = err
+	close(s.Ch)
+	s.sendMu.Unlock()
+	if s.cancel != nil {
+		s.cancel()
 	}
 }
 
@@ -306,13 +343,18 @@ func (h *StreamHub) Subscribe(apiName string, params map[string]any, identity an
 
 // SubscribeMode adds a subscriber and records its negotiated wire mode.
 func (h *StreamHub) SubscribeMode(apiName string, params map[string]any, identity any, fieldMask []byte, binary bool, cancel context.CancelFunc) *StreamSub {
+	return h.subscribeMode(apiName, params, identity, fieldMask, binary, cancel, nil)
+}
+
+func (h *StreamHub) subscribeMode(apiName string, params map[string]any, identity any, fieldMask []byte, binary bool, cancel, cancelWriter context.CancelFunc) *StreamSub {
 	sub := &StreamSub{
-		Ch:        make(chan []byte, 64), // buffered to absorb bursts
-		Params:    &StreamParams{values: params},
-		Identity:  identity,
-		FieldMask: fieldMask,
-		Binary:    binary,
-		cancel:    cancel,
+		Ch:           make(chan []byte, 64), // buffered to absorb bursts
+		Params:       &StreamParams{values: params},
+		Identity:     identity,
+		FieldMask:    fieldMask,
+		Binary:       binary,
+		cancel:       cancel,
+		cancelWriter: cancelWriter,
 	}
 
 	h.mu.Lock()
@@ -328,105 +370,107 @@ func (h *StreamHub) SubscribeMode(apiName string, params map[string]any, identit
 
 // Unsubscribe removes a subscriber.
 func (h *StreamHub) Unsubscribe(apiName string, sub *StreamSub) {
+	// Stop the writer before closing Ch. Otherwise it can observe the closed
+	// queue while its context is live and emit cancellation as an Internal end.
+	// A completed producer is already absent from the hub, but its writer may
+	// still be draining. Explicit cancellation must stop that writer as well.
+	if sub != nil {
+		sub.stopWriting()
+	}
+	h.finish(apiName, sub, context.Canceled)
+}
+
+func (s *StreamSub) stopWriting() {
+	if s.cancelWriter != nil {
+		s.cancelWriter()
+	}
+}
+
+// finish publishes one result before closing the queue. Removal owns completion;
+// a later handler return or cancellation cannot overwrite the first result.
+func (h *StreamHub) finish(apiName string, sub *StreamSub, err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	subs := h.subs[apiName]
 	for i, s := range subs {
 		if s == sub {
-			h.subs[apiName] = append(subs[:i], subs[i+1:]...)
-			close(sub.Ch)
-			if sub.cancel != nil {
-				sub.cancel()
+			kept := append(subs[:i], subs[i+1:]...)
+			subs[len(subs)-1] = nil
+			if len(kept) == 0 {
+				delete(h.subs, apiName)
+			} else {
+				h.subs[apiName] = kept
 			}
+			sub.close(err)
 			return
 		}
 	}
 }
 
-// Dispatch sends data to all matching subscribers of an API.
-// matcher can be nil (broadcast to all).
-// encodeFn encodes the raw event data per subscriber's fieldMask.
-// Holds RLock during send — safe because sends are non-blocking (select/default).
-func (h *StreamHub) Dispatch(apiName string, rawData any, matcher StreamMatcher, encodeFn func(data any, fieldMask []byte) []byte) {
-	h.mu.RLock()
-
-	subs := h.subs[apiName]
-	if len(subs) == 0 {
-		h.mu.RUnlock()
-		return
-	}
-
+// Dispatch sends data to matching subscribers and propagates encoding failures.
+// A matcher uses one default encoding; subscriber projections reuse the same dispatcher.
+func (h *StreamHub) Dispatch(apiName string, rawData any, matcher StreamMatcher, encodeFn func(data any, fieldMask []byte) ([]byte, error)) error {
+	var match StreamSubscriberMatcher
 	var defaultEncoded []byte
-	var slow []*StreamSub
-
-	for _, sub := range subs {
-		if matcher != nil {
-			if defaultEncoded == nil {
-				defaultEncoded = encodeFn(rawData, nil)
-			}
-			if !matcher(defaultEncoded, sub.Params, sub.Identity) {
-				continue
-			}
+	if matcher != nil {
+		if h.SubCount(apiName) == 0 {
+			return nil
 		}
-
-		var encoded []byte
-		if len(sub.FieldMask) == 0 {
-			if defaultEncoded == nil {
-				defaultEncoded = encodeFn(rawData, nil)
-			}
-			encoded = defaultEncoded
-		} else {
-			encoded = encodeFn(rawData, sub.FieldMask)
+		var err error
+		defaultEncoded, err = encodeFn(rawData, nil)
+		if err != nil {
+			return err
 		}
-
-		if !enqueueStreamData(sub, encoded) {
-			slow = append(slow, sub)
+		match = func(params *StreamParams, identity any) bool {
+			return matcher(defaultEncoded, params, identity)
 		}
 	}
-	h.mu.RUnlock()
-	h.removeSlowSubscribers(apiName, slow)
+	return h.DispatchPreparedEvent(apiName, match, func(mask []byte, _ bool) ([]byte, error) {
+		if matcher != nil && len(mask) == 0 {
+			return defaultEncoded, nil
+		}
+		return encodeFn(rawData, mask)
+	})
 }
 
-// DispatchEvent sends an event-derived API result using each subscriber's
-// negotiated JSON or binary mode. matchData is the binary event payload used
-// by generated matchers; encodeFn encodes the stream API's return value.
-func (h *StreamHub) DispatchEvent(apiName string, matchData []byte, matcher StreamMatcher, encodeFn func(fieldMask []byte, binary bool) []byte) {
-	h.mu.RLock()
-
-	var encodings []streamEncoding
-	var slow []*StreamSub
-	for _, sub := range h.subs[apiName] {
-		if matcher != nil && !matcher(matchData, sub.Params, sub.Identity) {
-			continue
-		}
-		encoded := cachedStreamEncoding(&encodings, sub.FieldMask, sub.Binary, encodeFn)
-		if !enqueueStreamData(sub, encoded) {
-			slow = append(slow, sub)
+// DispatchEvent encodes the stream result for each negotiated transport mode.
+// matchData is the already-encoded binary event used by legacy matchers.
+func (h *StreamHub) DispatchEvent(apiName string, matchData []byte, matcher StreamMatcher, encodeFn func(fieldMask []byte, binary bool) ([]byte, error)) error {
+	var match StreamSubscriberMatcher
+	if matcher != nil {
+		match = func(params *StreamParams, identity any) bool {
+			return matcher(matchData, params, identity)
 		}
 	}
-	h.mu.RUnlock()
-	h.removeSlowSubscribers(apiName, slow)
+	return h.DispatchPreparedEvent(apiName, match, encodeFn)
 }
 
 // DispatchPreparedEvent sends an event whose generated matcher captures typed
 // event fields. The event is decoded once by OnDecode, independent of subscriber count.
-func (h *StreamHub) DispatchPreparedEvent(apiName string, matcher StreamSubscriberMatcher, encodeFn func(fieldMask []byte, binary bool) []byte) {
+// An encoding failure stops this dispatch. Previously sent valid messages cannot be retracted.
+func (h *StreamHub) DispatchPreparedEvent(apiName string, matcher StreamSubscriberMatcher, encodeFn func(fieldMask []byte, binary bool) ([]byte, error)) error {
 	h.mu.RLock()
 
-	var encodings []streamEncoding
+	var encodings streamEncodings
 	var slow []*StreamSub
 	for _, sub := range h.subs[apiName] {
 		if matcher != nil && !matcher(sub.Params, sub.Identity) {
 			continue
 		}
-		encoded := cachedStreamEncoding(&encodings, sub.FieldMask, sub.Binary, encodeFn)
+		encoded, err := cachedStreamEncoding(&encodings, sub.FieldMask, sub.Binary, encodeFn)
+		if err != nil {
+			h.mu.RUnlock()
+			h.removeSlowSubscribers(apiName, slow)
+			return err
+		}
 		if !enqueueStreamData(sub, encoded) {
 			slow = append(slow, sub)
 		}
 	}
 	h.mu.RUnlock()
 	h.removeSlowSubscribers(apiName, slow)
+	return nil
 }
 
 type streamEncoding struct {
@@ -435,16 +479,35 @@ type streamEncoding struct {
 	data   []byte
 }
 
-func cachedStreamEncoding(encodings *[]streamEncoding, mask []byte, binary bool, encodeFn func([]byte, bool) []byte) []byte {
-	for i := range *encodings {
-		cached := &(*encodings)[i]
+// Keep the common single-projection cache on the stack. Additional masks or
+// transport modes allocate only when the dispatch actually needs them.
+type streamEncodings struct {
+	first    streamEncoding
+	hasFirst bool
+	rest     []streamEncoding
+}
+
+func cachedStreamEncoding(encodings *streamEncodings, mask []byte, binary bool, encodeFn func([]byte, bool) ([]byte, error)) ([]byte, error) {
+	if encodings.hasFirst && encodings.first.binary == binary && bytes.Equal(encodings.first.mask, mask) {
+		return encodings.first.data, nil
+	}
+	for i := range encodings.rest {
+		cached := &encodings.rest[i]
 		if cached.binary == binary && bytes.Equal(cached.mask, mask) {
-			return cached.data
+			return cached.data, nil
 		}
 	}
-	data := encodeFn(mask, binary)
-	*encodings = append(*encodings, streamEncoding{mask: mask, binary: binary, data: data})
-	return data
+	data, err := encodeFn(mask, binary)
+	if err != nil {
+		return nil, err
+	}
+	entry := streamEncoding{mask: mask, binary: binary, data: data}
+	if !encodings.hasFirst {
+		encodings.first, encodings.hasFirst = entry, true
+	} else {
+		encodings.rest = append(encodings.rest, entry)
+	}
+	return data, nil
 }
 
 // DispatchEncoded sends pre-encoded data to all matching subscribers.
@@ -490,10 +553,8 @@ func (h *StreamHub) removeSlowSubscribers(apiName string, slow []*StreamSub) {
 	kept := subs[:0]
 	for _, sub := range subs {
 		if _, remove := slowSet[sub]; remove {
-			close(sub.Ch)
-			if sub.cancel != nil {
-				sub.cancel()
-			}
+			sub.stopWriting()
+			sub.close(ErrStreamFull)
 			continue
 		}
 		kept = append(kept, sub)
@@ -542,8 +603,11 @@ func (rt *Router) startNativeStreamHandler(ctx context.Context, apiName string, 
 	}
 	stream := &Stream{sub: sub, ctx: ctx}
 	go func() {
-		defer rt.Streams.Unsubscribe(apiName, sub)
-		handler(ctx, sub.Params, identity, stream)
+		err := handler(ctx, sub.Params, identity, stream)
+		if err == nil {
+			err = ctx.Err()
+		}
+		rt.Streams.finish(apiName, sub, err)
 	}()
 }
 
@@ -573,8 +637,9 @@ func binaryStreamParams(req *Request) map[string]any {
 }
 
 // WritePumpJSON runs the write pump for a JSON WS subscription.
-// Reads from sub.Ch, wraps in {"$stream":"apiName","data":...}, writes to WS.
-func WritePumpJSON(ctx context.Context, ws *wsConn, apiName string, sub *StreamSub) {
+// Reads from sub.Ch, wraps in {"$stream":subscriptionID,"data":...}, writes to WS.
+// Nil means the closed producer queue was observed; callers must still check ctx.
+func WritePumpJSON(ctx context.Context, ws *wsConn, id uint64, sub *StreamSub) error {
 	buf := GetBuf()
 	defer PutBuf(buf)
 
@@ -582,43 +647,44 @@ func WritePumpJSON(ctx context.Context, ws *wsConn, apiName string, sub *StreamS
 		select {
 		case data, ok := <-sub.Ch:
 			if !ok {
-				return
+				return nil
 			}
 			buf.B = buf.B[:0]
 			buf.AppendString(`{"$stream":`)
-			buf.AppendJSONString(apiName)
+			buf.B = strconv.AppendUint(buf.B, id, 10)
 			buf.AppendString(`,"data":`)
 			buf.B = append(buf.B, data...)
 			buf.AppendByte('}')
 			if err := ws.writeText(ctx, buf.B); err != nil {
-				return
+				return err
 			}
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		}
 	}
 }
 
 // WritePumpBinary runs the write pump for a binary WS subscription.
-// Reads from sub.Ch, wraps in [0x06][API ID varint][payload], writes to WS.
-func WritePumpBinary(ctx context.Context, ws *wsConn, apiID int, sub *StreamSub) {
+// Reads from sub.Ch, wraps in [0x12][subscription UInt64][payload], writes to WS.
+// Nil means the closed producer queue was observed; callers must still check ctx.
+func WritePumpBinary(ctx context.Context, ws *wsConn, id uint64, sub *StreamSub) error {
 	for {
 		select {
 		case data, ok := <-sub.Ch:
 			if !ok {
-				return
+				return nil
 			}
 			buf := GetBuf()
 			buf.B = append(buf.B, BinaryFrameStream)
-			buf.B = codec.AppendVarint(buf.B, uint64(apiID))
+			buf.B = codec.AppendVarint(buf.B, id)
 			buf.B = append(buf.B, data...)
 			err := ws.writeBinary(ctx, buf.B)
 			PutBuf(buf)
 			if err != nil {
-				return
+				return err
 			}
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		}
 	}
 }

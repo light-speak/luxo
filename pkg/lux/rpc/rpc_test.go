@@ -6,7 +6,10 @@ import (
 	"encoding/binary"
 	stderrors "errors"
 	"fmt"
+	"io"
+	"math"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -87,7 +90,11 @@ func TestRPCRoundTrip(t *testing.T) {
 	rt := api.NewRouter()
 	rt.Handle("ping", func(ctx context.Context, req *api.Request) error {
 		req.Buf.B = codec.AppendVarint(req.Buf.B, 1)
-		req.Buf.B = codec.AppendString(req.Buf.B, "pong")
+		if encoded, err := codec.AppendString(req.Buf.B, "pong"); err != nil {
+			return err
+		} else {
+			req.Buf.B = encoded
+		}
 		req.Buf.B = append(req.Buf.B, 0x00)
 		return nil
 	})
@@ -95,11 +102,10 @@ func TestRPCRoundTrip(t *testing.T) {
 	rt.Registry.RegisterParams("ping", nil)
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19876")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 	defer srv.Close()
 
-	client := NewClient("127.0.0.1:19876")
+	client := NewClient(addr)
 	defer client.Close()
 
 	resp, err := client.Call(1, nil)
@@ -117,7 +123,11 @@ func TestRPCWithParams(t *testing.T) {
 	rt.Handle("greet", func(ctx context.Context, req *api.Request) error {
 		name, _ := req.ParamString("name")
 		req.Buf.B = codec.AppendVarint(req.Buf.B, 1)
-		req.Buf.B = codec.AppendString(req.Buf.B, "hello "+name)
+		if encoded, err := codec.AppendString(req.Buf.B, "hello "+name); err != nil {
+			return err
+		} else {
+			req.Buf.B = encoded
+		}
 		req.Buf.B = append(req.Buf.B, 0x00)
 		return nil
 	})
@@ -127,14 +137,13 @@ func TestRPCWithParams(t *testing.T) {
 	})
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19877")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 	defer srv.Close()
 
-	client := NewClient("127.0.0.1:19877")
+	client := NewClient(addr)
 	defer client.Close()
 
-	params := EncodeParams(ParamField{FieldID: 1, Value: "world"})
+	params := mustEncodeParams(t, ParamField{FieldID: 1, Value: "world"})
 	resp, err := client.Call(2, params)
 	if err != nil {
 		t.Fatal(err)
@@ -173,22 +182,21 @@ func TestRPCContextEnvelopeForwardsVerifiedIdentity(t *testing.T) {
 	rt.Registry.RegisterParams("private", nil)
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19880")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 	defer srv.Close()
 
-	client := NewClient("127.0.0.1:19880")
+	client := NewClient(addr)
 	defer client.Close()
 	if _, err := client.CallWithMaskContext(context.Background(), "verified-token", 7, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestCanonicalRequestEnvelopeRejectsLegacyAndUnknownVersions(t *testing.T) {
+func TestCanonicalRequestEnvelopeRejectsUnknownFlags(t *testing.T) {
 	body := encodeCallRequest(7, nil, nil)
 	payload := encodeRequestEnvelope(requestKindCall, "token", body)
-	if !bytes.Equal(payload[:3], []byte{requestEnvelopeMarker, requestEnvelopeVersion, requestKindCall}) {
-		t.Fatalf("canonical envelope prefix = %v", payload[:3])
+	if !bytes.Equal(payload[:2], []byte{requestKindCall, 0}) {
+		t.Fatalf("canonical envelope prefix = %v", payload[:2])
 	}
 	envelope, err := decodeRequestEnvelope(payload)
 	if err != nil {
@@ -200,17 +208,17 @@ func TestCanonicalRequestEnvelopeRejectsLegacyAndUnknownVersions(t *testing.T) {
 	if _, err := decodeRequestEnvelope(body); err == nil {
 		t.Fatal("legacy bare requests must be rejected")
 	}
-	payload[1]++
+	payload[1] = 0x80
 	if _, err := decodeRequestEnvelope(payload); err == nil {
-		t.Fatal("unknown envelope versions must be rejected")
+		t.Fatal("unknown envelope flags must be rejected")
 	}
 }
 
 func TestTracedRequestEnvelopeRoundTrip(t *testing.T) {
 	body := encodeCallRequest(7, nil, nil)
 	payload := encodeTracedRequestEnvelope(requestKindCall, "token", "trace-123", "task.project.owner", true, body)
-	if !bytes.Equal(payload[:3], []byte{requestEnvelopeMarker, tracedRequestEnvelopeVersion, requestKindCall}) {
-		t.Fatalf("traced envelope prefix = %v", payload[:3])
+	if !bytes.Equal(payload[:2], []byte{requestKindCall, 1}) {
+		t.Fatalf("traced envelope prefix = %v", payload[:2])
 	}
 	envelope, err := decodeRequestEnvelope(payload)
 	if err != nil {
@@ -232,10 +240,11 @@ func TestTracedRequestEnvelopeRoundTrip(t *testing.T) {
 
 func TestTracedRequestEnvelopeRejectsMalformedTraceMetadata(t *testing.T) {
 	for name, payload := range map[string][]byte{
-		"unsupported version": {requestEnvelopeMarker, 0xff, requestKindCall, 0, 0},
-		"invalid detail flag": {requestEnvelopeMarker, tracedRequestEnvelopeVersion, requestKindCall, 0, 1, 't', 0, 2, 0},
-		"missing body":        {requestEnvelopeMarker, tracedRequestEnvelopeVersion, requestKindCall, 0, 1, 't', 0, 0},
-		"invalid field path":  {requestEnvelopeMarker, tracedRequestEnvelopeVersion, requestKindCall, 0, 1, 't', 0x80},
+		"unsupported flags":   {requestKindCall, 0xff, 0, 0},
+		"invalid detail flag": {requestKindCall, 1, 0, 1, 't', 0, 2, 0},
+		"missing body":        {requestKindCall, 1, 0, 1, 't', 0, 0},
+		"invalid field path":  {requestKindCall, 1, 0, 1, 't', 0x80},
+		"invalid trace ID":    {requestKindCall, 1, 0, 0, 0},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := decodeRequestEnvelope(payload); err == nil {
@@ -273,7 +282,10 @@ func TestTracedRequestEnvelopeRejectsMalformedTraceMetadata(t *testing.T) {
 }
 
 func TestDecodeTracedResponseValidation(t *testing.T) {
-	traceData := api.EncodeDebugTrace(api.DebugTraceSnapshot{TraceID: "trace-response"})
+	traceData, encodeErr := api.EncodeDebugTrace(api.DebugTraceSnapshot{TraceID: "trace-response"})
+	if encodeErr != nil {
+		t.Fatal(encodeErr)
+	}
 	okResponse := append([]byte{statusTraceOK}, codec.AppendVarint(nil, uint64(len(traceData)))...)
 	okResponse = append(okResponse, traceData...)
 	okResponse = append(okResponse, "body"...)
@@ -375,11 +387,10 @@ func TestTracedRPCCallMergesServicePhases(t *testing.T) {
 	})
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19898")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 	defer srv.Close()
 
-	client := NewNamedClient("task", "127.0.0.1:19898")
+	client := NewNamedClient("task", addr)
 	defer client.Close()
 	ctx, trace := api.WithDebugTrace(context.Background(), "trace-rpc")
 	ctx = api.WithTraceFieldPath(ctx, "task")
@@ -437,9 +448,7 @@ func TestRPCErrorEnvelopeRequiresCanonicalFieldsAndTermination(t *testing.T) {
 		"trailing":  append(encodeError(400, "BadRequest", "bad")[1:], 1),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := decodeError(data); err == nil {
-				t.Fatal("invalid error envelope must be rejected")
-			}
+			requireRPCEnvelopeFailure(t, data)
 		})
 	}
 }
@@ -451,11 +460,10 @@ func TestRPCStreamRoundTripAndCancellation(t *testing.T) {
 	rt.Registry.RegisterParams("watchRPC", nil)
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19882")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 	defer srv.Close()
 
-	client := NewClient("127.0.0.1:19882")
+	client := NewClient(addr)
 	defer client.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	subscription, err := client.SubscribeContext(ctx, "", 8, nil, nil)
@@ -498,10 +506,9 @@ func TestServerCloseTerminatesActiveRPCStream(t *testing.T) {
 	rt.Registry.Register("watchShutdown", 9)
 	rt.Registry.RegisterParams("watchShutdown", nil)
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19883")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 
-	client := NewClient("127.0.0.1:19883")
+	client := NewClient(addr)
 	defer client.Close()
 	subscription, err := client.SubscribeContext(context.Background(), "", 9, nil, nil)
 	if err != nil {
@@ -529,14 +536,15 @@ func TestServerCloseTerminatesActiveRPCStream(t *testing.T) {
 func TestServerCloseTerminatesIdleRPCConnection(t *testing.T) {
 	rt := api.NewRouter()
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19884")
-	time.Sleep(100 * time.Millisecond)
-	conn, err := net.Dial("tcp", "127.0.0.1:19884")
-	if err != nil {
+	addr := startTestRPCServer(t, srv)
+	conn := verifiedTestRPCConn(t, addr)
+	// Complete a rejected request to establish that the connection is registered and idle.
+	if err := WriteFrame(conn, encodeRequestEnvelope(requestKindCall, "", nil)); err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
-	time.Sleep(20 * time.Millisecond)
+	if _, err := ReadFrame(conn, nil); err != nil {
+		t.Fatal(err)
+	}
 
 	closed := make(chan struct{})
 	go func() {
@@ -557,11 +565,10 @@ func TestRPCError(t *testing.T) {
 	// No handler registered for "missing"
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19878")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 	defer srv.Close()
 
-	client := NewClient("127.0.0.1:19878")
+	client := NewClient(addr)
 	defer client.Close()
 
 	_, err := client.Call(99, nil)
@@ -581,11 +588,10 @@ func BenchmarkRPC_Ping(b *testing.B) {
 	rt.Registry.RegisterParams("ping", nil)
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19879")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(b, srv)
 	defer srv.Close()
 
-	client := NewClient("127.0.0.1:19879")
+	client := NewClient(addr)
 	defer client.Close()
 
 	b.ReportAllocs()
@@ -687,18 +693,19 @@ func TestWriteFramePayloadError(t *testing.T) {
 }
 
 func TestRequestEnvelopeRejectsMalformedShapes(t *testing.T) {
-	overLimit := []byte{requestEnvelopeMarker, requestEnvelopeVersion, requestKindCall}
+	overLimit := []byte{requestKindCall, 0}
 	overLimit = codec.AppendVarint(overLimit, maxBearerTokenSize+1)
-	declaredTokenTooLong := []byte{requestEnvelopeMarker, requestEnvelopeVersion, requestKindCall}
+	declaredTokenTooLong := []byte{requestKindCall, 0}
 	declaredTokenTooLong = codec.AppendVarint(declaredTokenTooLong, 2)
 	declaredTokenTooLong = append(declaredTokenTooLong, 'a')
 	tests := map[string][]byte{
-		"truncated":               {requestEnvelopeMarker},
-		"unknown request kind":    {requestEnvelopeMarker, requestEnvelopeVersion, 9, 0, 1},
-		"invalid token length":    {requestEnvelopeMarker, requestEnvelopeVersion, requestKindCall, 0x80},
+		"truncated":               {requestKindCall},
+		"unknown request kind":    {9, 0, 0, 1},
+		"invalid token length":    {requestKindCall, 0, 0x80, 0x80},
 		"token over limit":        overLimit,
 		"token exceeds request":   declaredTokenTooLong,
-		"request body is missing": {requestEnvelopeMarker, requestEnvelopeVersion, requestKindCall, 0},
+		"request body is missing": {requestKindCall, 0, 0},
+		"token without body":      {requestKindCall, 0, 1, 'a'},
 	}
 	for name, payload := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -865,6 +872,9 @@ func startSingleFrameRPCServer(t *testing.T, response []byte, respond bool) stri
 		}
 		defer conn.Close()
 		conn.SetDeadline(time.Now().Add(time.Second))
+		if !acceptTestHandshake(t, conn) {
+			return
+		}
 		if _, readErr := ReadFrame(conn, nil); readErr != nil || !respond {
 			return
 		}
@@ -888,6 +898,7 @@ func TestPoolGetPut(t *testing.T) {
 			if err != nil {
 				return
 			}
+			acceptTestHandshake(t, conn)
 			conn.Close()
 		}
 	}()
@@ -914,7 +925,8 @@ func TestPoolFullDropsConnection(t *testing.T) {
 			if err != nil {
 				return
 			}
-			_ = conn
+			acceptTestHandshake(t, conn)
+			conn.Close()
 		}
 	}()
 
@@ -961,7 +973,11 @@ func TestClientCallWithMask(t *testing.T) {
 	rt := api.NewRouter()
 	rt.Handle("ping", func(ctx context.Context, req *api.Request) error {
 		req.Buf.B = codec.AppendVarint(req.Buf.B, 1)
-		req.Buf.B = codec.AppendString(req.Buf.B, "pong")
+		if encoded, err := codec.AppendString(req.Buf.B, "pong"); err != nil {
+			return err
+		} else {
+			req.Buf.B = encoded
+		}
 		req.Buf.B = append(req.Buf.B, 0x00)
 		return nil
 	})
@@ -969,11 +985,10 @@ func TestClientCallWithMask(t *testing.T) {
 	rt.Registry.RegisterParams("ping", nil)
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19881")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 	defer srv.Close()
 
-	client := NewClient("127.0.0.1:19881")
+	client := NewClient(addr)
 	defer client.Close()
 
 	mask := codec.FieldMaskSet(nil, 1)
@@ -1059,13 +1074,37 @@ func TestServerHandlerNotFound(t *testing.T) {
 
 // --- EncodeParams type coverage ---
 
+func mustEncodeParams(t testing.TB, fields ...ParamField) []byte {
+	t.Helper()
+	data, err := EncodeParams(fields...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func TestEncodeParamsRejectsNonFiniteFloats(t *testing.T) {
+	for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		data, err := EncodeParams(ParamField{FieldID: 1, Value: int64(42)}, ParamField{FieldID: 2, Value: value})
+		if !stderrors.Is(err, codec.ErrNonFiniteFloat) || data != nil {
+			t.Fatalf("invalid Float published data: %x, %v", data, err)
+		}
+	}
+}
+
+func TestEncodeParamsRejectsUnsupportedValues(t *testing.T) {
+	data, err := EncodeParams(ParamField{FieldID: 1, Value: []byte("unsupported")})
+	if err == nil || data != nil {
+		t.Fatalf("unsupported value was silently dropped: %x, %v", data, err)
+	}
+}
+
 func TestEncodeParamsAllTypes(t *testing.T) {
-	params := EncodeParams(
+	params := mustEncodeParams(t,
 		ParamField{FieldID: 1, Value: int64(42)},
 		ParamField{FieldID: 2, Value: 3.14},
 		ParamField{FieldID: 3, Value: "hello"},
 		ParamField{FieldID: 4, Value: true},
-		ParamField{FieldID: 5, Value: []byte("unknown")}, // unsupported type, should be skipped
 	)
 	if len(params) == 0 {
 		t.Fatal("should encode something")
@@ -1079,7 +1118,11 @@ func TestRPCWithFloatParam(t *testing.T) {
 	rt.Handle("calc", func(ctx context.Context, req *api.Request) error {
 		v, _ := req.ParamFloat("value")
 		req.Buf.B = codec.AppendVarint(req.Buf.B, 1)
-		req.Buf.B = codec.AppendFixed64(req.Buf.B, v*2)
+		encoded, err := codec.AppendFixed64(req.Buf.B, v*2)
+		if err != nil {
+			return err
+		}
+		req.Buf.B = encoded
 		req.Buf.B = append(req.Buf.B, 0x00)
 		return nil
 	})
@@ -1089,14 +1132,13 @@ func TestRPCWithFloatParam(t *testing.T) {
 	})
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19882")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 	defer srv.Close()
 
-	client := NewClient("127.0.0.1:19882")
+	client := NewClient(addr)
 	defer client.Close()
 
-	params := EncodeParams(ParamField{FieldID: 1, Value: 3.14})
+	params := mustEncodeParams(t, ParamField{FieldID: 1, Value: 3.14})
 	resp, err := client.Call(10, params)
 	if err != nil {
 		t.Fatal(err)
@@ -1121,14 +1163,13 @@ func TestRPCWithBoolParam(t *testing.T) {
 	})
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19883")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 	defer srv.Close()
 
-	client := NewClient("127.0.0.1:19883")
+	client := NewClient(addr)
 	defer client.Close()
 
-	params := EncodeParams(ParamField{FieldID: 1, Value: true})
+	params := mustEncodeParams(t, ParamField{FieldID: 1, Value: true})
 	resp, err := client.Call(11, params)
 	if err != nil {
 		t.Fatal(err)
@@ -1153,14 +1194,13 @@ func TestRPCWithIntParam(t *testing.T) {
 	})
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19884")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 	defer srv.Close()
 
-	client := NewClient("127.0.0.1:19884")
+	client := NewClient(addr)
 	defer client.Close()
 
-	params := EncodeParams(ParamField{FieldID: 1, Value: int64(42)})
+	params := mustEncodeParams(t, ParamField{FieldID: 1, Value: int64(42)})
 	resp, err := client.Call(12, params)
 	if err != nil {
 		t.Fatal(err)
@@ -1183,11 +1223,10 @@ func TestRPCHandlerReturnsAppError(t *testing.T) {
 	rt.Registry.RegisterParams("fail", nil)
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19885")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 	defer srv.Close()
 
-	client := NewClient("127.0.0.1:19885")
+	client := NewClient(addr)
 	defer client.Close()
 
 	_, err := client.Call(13, nil)
@@ -1215,11 +1254,10 @@ func TestRPCHandlerReturnsGenericError(t *testing.T) {
 	rt.Registry.RegisterParams("crash", nil)
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19886")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 	defer srv.Close()
 
-	client := NewClient("127.0.0.1:19886")
+	client := NewClient(addr)
 	defer client.Close()
 
 	_, err := client.Call(14, nil)
@@ -1244,7 +1282,8 @@ func TestPoolGetFromIdle(t *testing.T) {
 			if err != nil {
 				return
 			}
-			_ = conn // keep open
+			acceptTestHandshake(t, conn)
+			conn.Close()
 		}
 	}()
 
@@ -1291,7 +1330,11 @@ func BenchmarkRPC_Echo(b *testing.B) {
 	rt.Handle("echo", func(ctx context.Context, req *api.Request) error {
 		name, _ := req.ParamString("name")
 		req.Buf.B = codec.AppendVarint(req.Buf.B, 1)
-		req.Buf.B = codec.AppendString(req.Buf.B, "hello "+name)
+		if encoded, err := codec.AppendString(req.Buf.B, "hello "+name); err != nil {
+			return err
+		} else {
+			req.Buf.B = encoded
+		}
 		req.Buf.B = append(req.Buf.B, 0x00)
 		return nil
 	})
@@ -1301,14 +1344,13 @@ func BenchmarkRPC_Echo(b *testing.B) {
 	})
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19880")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(b, srv)
 	defer srv.Close()
 
-	client := NewClient("127.0.0.1:19880")
+	client := NewClient(addr)
 	defer client.Close()
 
-	params := EncodeParams(ParamField{FieldID: 1, Value: "world"})
+	params := mustEncodeParams(b, ParamField{FieldID: 1, Value: "world"})
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -1331,11 +1373,10 @@ func TestRPCHandlerPanicRecovery(t *testing.T) {
 	rt.Registry.RegisterParams("crash", nil)
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19890")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 	defer srv.Close()
 
-	client := NewClient("127.0.0.1:19890")
+	client := NewClient(addr)
 	defer client.Close()
 
 	// Should get error, not crash
@@ -1365,11 +1406,10 @@ func TestRPCTruncatedParams(t *testing.T) {
 	})
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19891")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 	defer srv.Close()
 
-	client := NewClient("127.0.0.1:19891")
+	client := NewClient(addr)
 	defer client.Close()
 
 	// Send truncated param: fieldID varint but no value bytes
@@ -1444,7 +1484,8 @@ func TestPoolPutAfterClose(t *testing.T) {
 			if e != nil {
 				return
 			}
-			_ = c
+			acceptTestHandshake(t, c)
+			c.Close()
 		}
 	}()
 
@@ -1554,35 +1595,20 @@ func TestServerInvalidFrameDisconnect(t *testing.T) {
 	rt.Registry.RegisterParams("ping", nil)
 
 	srv := NewServer(rt)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
+	addr := startTestRPCServer(t, srv)
+	defer srv.Close()
+
+	// Send garbage data then half-close; the server must close its side of the socket.
+	conn := verifiedTestRPCConn(t, addr)
+	if _, err := conn.Write([]byte{0xFF, 0xFF}); err != nil { // invalid frame header
 		t.Fatal(err)
 	}
-	srv.listener = ln
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			srv.wg.Add(1)
-			go srv.handleConn(conn)
-		}
-	}()
-	defer func() {
-		srv.Close()
-		ln.Close()
-	}()
-
-	// Send garbage data then close
-	conn, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
+	if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
 		t.Fatal(err)
 	}
-	conn.Write([]byte{0xFF, 0xFF}) // invalid frame header
-	conn.Close()
-
-	time.Sleep(50 * time.Millisecond) // let server process
+	if _, err := conn.Read(make([]byte, 1)); !stderrors.Is(err, io.EOF) {
+		t.Fatalf("invalid frame disconnect = %v, want EOF", err)
+	}
 }
 
 // --- Client: CallWithMask — server returns error status ---
@@ -1596,11 +1622,10 @@ func TestClientCallWithMaskServerError(t *testing.T) {
 	rt.Registry.RegisterParams("err", nil)
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19892")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 	defer srv.Close()
 
-	client := NewClient("127.0.0.1:19892")
+	client := NewClient(addr)
 	defer client.Close()
 
 	_, err := client.CallWithMask(1, nil, nil)
@@ -1702,7 +1727,8 @@ func TestClientCallWriteError(t *testing.T) {
 			if e != nil {
 				return
 			}
-			c.Close() // close immediately so client write fails
+			acceptTestHandshake(t, c)
+			c.Close() // close after handshake so client write fails
 		}
 	}()
 
@@ -1742,6 +1768,10 @@ func TestClientCallReadError(t *testing.T) {
 				return
 			}
 			// Read the request frame then close without responding
+			if !acceptTestHandshake(t, c) {
+				c.Close()
+				return
+			}
 			ReadFrame(c, nil)
 			c.Close()
 		}
@@ -1773,6 +1803,10 @@ func TestClientCallEmptyResponse(t *testing.T) {
 				return
 			}
 			// Read the request
+			if !acceptTestHandshake(t, c) {
+				c.Close()
+				return
+			}
 			ReadFrame(c, nil)
 			// Write an empty response frame (0-length payload)
 			WriteFrame(c, []byte{})
@@ -1802,6 +1836,9 @@ func TestClientRejectsNonUnaryResponseStatus(t *testing.T) {
 			return
 		}
 		defer conn.Close()
+		if !acceptTestHandshake(t, conn) {
+			return
+		}
 		ReadFrame(conn, nil)
 		WriteFrame(conn, []byte{statusStream, 1})
 	}()
@@ -1813,9 +1850,9 @@ func TestClientRejectsNonUnaryResponseStatus(t *testing.T) {
 	}
 }
 
-// --- Pool: GetContext receives nil from closed channel ---
+// --- Pool: GetContext rejects a closed and drained pool ---
 
-func TestPoolGetContextNilFromChannel(t *testing.T) {
+func TestPoolGetContextAfterDrain(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -1827,7 +1864,8 @@ func TestPoolGetContextNilFromChannel(t *testing.T) {
 			if e != nil {
 				return
 			}
-			_ = c
+			acceptTestHandshake(t, c)
+			c.Close()
 		}
 	}()
 
@@ -1840,13 +1878,10 @@ func TestPoolGetContextNilFromChannel(t *testing.T) {
 	}
 	pool.Put(conn)
 
-	// Close the pool — this closes the channel
+	// Close the pool and drain idle connections without closing the queue.
 	pool.Close()
 
-	// The channel is closed and drained. Now a Get should fail via closed.Load() check.
-	// To hit the nil-from-channel path, we need the atomic check to pass but the channel read to give nil.
-	// This is a race-condition path; the closed.Load() guard makes it unreachable in practice.
-	// The pool.Close() already covers the drain. Test the closed-pool path explicitly.
+	// The closed flag rejects the borrow before it can receive or dial.
 	_, err = pool.GetContext(context.Background())
 	if err == nil {
 		t.Fatal("GetContext on closed pool should error")
@@ -1865,13 +1900,16 @@ func TestServerListenAndServeError(t *testing.T) {
 	}
 }
 
-// --- Server: connection rejected at capacity (via ListenAndServe) ---
+// --- Server: connection rejected at capacity (via Serve) ---
 
 func TestServerAtCapacity(t *testing.T) {
 	rt := api.NewRouter()
 	// Use a blocking handler to hold the semaphore slot
 	blocked := make(chan struct{})
+	started := make(chan struct{})
+	release := sync.OnceFunc(func() { close(blocked) })
 	rt.Handle("block", func(ctx context.Context, req *api.Request) error {
+		close(started)
 		<-blocked // block until released
 		req.Buf.B = append(req.Buf.B, 0x00)
 		return nil
@@ -1883,43 +1921,39 @@ func TestServerAtCapacity(t *testing.T) {
 	// Set sem to 1 so only 1 concurrent connection allowed
 	srv.sem = make(chan struct{}, 1)
 
-	go srv.ListenAndServe("127.0.0.1:19895")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 	defer srv.Close()
-
-	addr := "127.0.0.1:19895"
+	defer release()
 
 	// First connection: send a request that blocks the handler
-	c1, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c1.Close()
+	c1 := verifiedTestRPCConn(t, addr)
 
 	var payload []byte
 	payload = codec.AppendVarint(payload, 1) // API ID
 	payload = codec.AppendVarint(payload, 0) // mask len
 	payload = append(payload, 0x00)          // params end
-	WriteFrame(c1, encodeRequestEnvelope(requestKindCall, "", payload))
-
-	// Wait for handler to be running (sem slot taken)
-	time.Sleep(50 * time.Millisecond)
-
-	// Second connection: should be rejected at capacity (sem full, handler blocked)
-	c2, err := net.Dial("tcp", addr)
-	if err != nil {
+	if err := WriteFrame(c1, encodeRequestEnvelope(requestKindCall, "", payload)); err != nil {
 		t.Fatal(err)
 	}
-	defer c2.Close()
 
-	// Give server time to reject the second connection
-	time.Sleep(50 * time.Millisecond)
+	// Wait for handler to be running (sem slot taken)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first handler did not start")
+	}
+
+	// Second connection: should be rejected at capacity (sem full, handler blocked)
+	// Observe rejection before releasing the occupied slot, rather than sleeping.
+	assertRPCConnectionRejected(t, addr)
 
 	// Release the blocked handler
-	close(blocked)
+	release()
 
 	// Read c1's response
-	ReadFrame(c1, nil)
+	if _, err := ReadFrame(c1, nil); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // --- Server: processRequest WriteFrame error -> handleConn exits ---
@@ -1938,6 +1972,9 @@ func TestServerHandleConnProcessRequestWriteError(t *testing.T) {
 	pr, pw := net.Pipe()
 	srv.wg.Add(1)
 	go srv.handleConn(pw)
+	if err := initiateHandshake(t.Context(), pr, time.Second); err != nil {
+		t.Fatal(err)
+	}
 
 	// Send a valid request and read the response first to confirm it works
 	var payload []byte
@@ -1965,14 +2002,12 @@ func TestServerHandleConnProcessRequestWriteError(t *testing.T) {
 }
 
 // --- Server: accept error (non-done, continue path) ---
-// server.go:56,58 — Accept error when server is NOT shutting down.
-// This requires a transient Accept error (e.g., EMFILE). This is practically
-// impossible to trigger in tests without OS-level manipulation.
-// Marking as a defensive unreachable path in practice.
+// Serve accepts an injected listener, so transient/permanent errors and retry
+// cancellation are now reachable without OS resource exhaustion; see server_listener_test.go.
 
 // --- Server: ListenAndServe graceful shutdown (done channel) ---
 
-func TestServerListenAndServeGracefulShutdown(t *testing.T) {
+func TestServerServeGracefulShutdown(t *testing.T) {
 	rt := api.NewRouter()
 	rt.Handle("ping", func(ctx context.Context, req *api.Request) error {
 		req.Buf.B = append(req.Buf.B, 0x00)
@@ -1982,18 +2017,14 @@ func TestServerListenAndServeGracefulShutdown(t *testing.T) {
 	rt.Registry.RegisterParams("ping", nil)
 
 	srv := NewServer(rt)
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- srv.ListenAndServe("127.0.0.1:19896")
-	}()
-	time.Sleep(100 * time.Millisecond)
+	startTestRPCServer(t, srv)
 
 	// Close the server -> done channel closed -> ln.Accept() returns error -> select <-s.done hits -> returns nil
 	srv.Close()
 
-	err := <-errCh
-	if err != nil {
-		t.Fatalf("ListenAndServe should return nil on graceful shutdown, got: %v", err)
+	// A closed server also releases a newly allocated socket through the address wrapper.
+	if err := srv.ListenAndServe("127.0.0.1:0"); err != nil {
+		t.Fatalf("ListenAndServe after Close = %v", err)
 	}
 }
 
@@ -2009,15 +2040,18 @@ func TestServerAcceptErrorContinues(t *testing.T) {
 	rt.Registry.RegisterParams("ping", nil)
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19897")
-	time.Sleep(100 * time.Millisecond)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := startTestRPCListener(t, srv, &transientTestListener{Listener: listener})
 	defer srv.Close()
 
 	// Make a successful connection to verify the server is still running
-	client := NewClient("127.0.0.1:19897")
+	client := NewClient(addr)
 	defer client.Close()
 
-	_, err := client.Call(1, nil)
+	_, err = client.Call(1, nil)
 	if err != nil {
 		t.Fatalf("server should still be running: %v", err)
 	}

@@ -64,6 +64,7 @@ func (g *GeneratorContext) generateSchemaFile(result *semantic.Result, packageNa
 		modelNames[m.Name] = true
 	}
 	var stubs []*ast.ModelDecl
+	stubByName := make(map[string]*ast.ModelDecl)
 	for _, file := range result.Files {
 		modName := moduleNameFromFile(file.Name)
 		for _, ext := range file.Extends {
@@ -79,10 +80,7 @@ func (g *GeneratorContext) generateSchemaFile(result *semantic.Result, packageNa
 					}
 				}
 			}
-			if !modelNames[ext.Name] {
-				stubs = append(stubs, &ast.ModelDecl{Name: ext.Name, Fields: ext.Fields})
-				modelNames[ext.Name] = true
-			}
+			stubs = appendSchemaStub(stubs, stubByName, modelNames, ext)
 		}
 	}
 
@@ -132,10 +130,26 @@ func (g *GeneratorContext) generateSchemaFile(result *semantic.Result, packageNa
 	return []byte(b.String())
 }
 
+func appendSchemaStub(stubs []*ast.ModelDecl, byName map[string]*ast.ModelDecl, names map[string]bool, ext *ast.ExtendDecl) []*ast.ModelDecl {
+	if !names[ext.Name] {
+		stub := &ast.ModelDecl{Name: ext.Name, Fields: append([]*ast.FieldDecl(nil), ext.Fields...)}
+		stubs = append(stubs, stub)
+		byName[ext.Name], names[ext.Name] = stub, true
+	} else if stub := byName[ext.Name]; stub != nil {
+		for _, field := range ext.Fields {
+			if modelFieldByName(stub, field.Name) == nil {
+				stub.Fields = append(stub.Fields, field)
+			}
+		}
+	}
+	return stubs
+}
+
 // buildCrudAPIInfo constructs schemaAPIInfo for a single CRUD operation.
 // collectSchemaAPIs collects all API metadata (CRUD + compiled + service + batchLoad + resolve).
 func (g *GeneratorContext) collectSchemaAPIs(result *semantic.Result, enums map[string]bool, modelOwner map[string]string, modelFields map[string]map[string]bool) []schemaAPIInfo {
 	var apis []schemaAPIInfo
+	seenResolvers := make(map[[2]string]bool)
 	for _, file := range result.Files {
 		modName := moduleNameFromFile(file.Name)
 		for _, m := range file.Models {
@@ -182,12 +196,18 @@ func (g *GeneratorContext) collectSchemaAPIs(result *semantic.Result, enums map[
 					continue
 				}
 				fk := g.inferFederationForeignKey(&ast.ModelDecl{Name: ext.Name}, f)
+				name := "svc:resolve:" + f.Type.Name + ":" + fk
+				key := [2]string{modName, name}
+				if seenResolvers[key] {
+					continue
+				}
+				seenResolvers[key] = true
 				apis = append(apis, schemaAPIInfo{
-					name: "svc:resolve:" + f.Type.Name + ":" + fk, moduleName: modName,
+					name: name, moduleName: modName,
 					params: []*ast.ParamDecl{{
 						Name: "keys", Type: &ast.TypeRef{Name: g.externalModelIDTypeName(ext.Name), IsList: true},
 						Doc: "Foreign keys to resolve in one batch.",
-					}},
+					}, {Name: "shape", Type: &ast.TypeRef{Name: "Int"}, Doc: "Canonical result shape: bit 0 is list, bit 1 nullable."}},
 					returnType:  &ast.TypeRef{Name: f.Type.Name, IsList: true},
 					description: fmt.Sprintf("Resolve %s.%s across services.", ext.Name, f.Name),
 				})
@@ -334,7 +354,7 @@ func (g *GeneratorContext) writeModelRegistration(b *strings.Builder, m *ast.Mod
 		module := extendModules[f.Name]
 		fk := ""
 		if module != "" {
-			fk = g.inferForeignKey(m, f, enums)
+			fk = g.inferFederationForeignKey(m, f)
 		}
 		fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, TypeName: %q, Nullable: %v, IsList: %v, Relation: true, Module: %q, ForeignKey: %q, RelationKind: schema.%s, LocalKey: %q, RemoteKey: %q, TargetModule: %q",
 			fieldID, f.Name, fieldType, f.Type.Name, f.Type.Nullable, f.Type.IsList, module, fk, schemaRelationKindName(relation.Type), relation.LocalKey, relation.RemoteKey, g.remoteModelModule(relation.TargetName))

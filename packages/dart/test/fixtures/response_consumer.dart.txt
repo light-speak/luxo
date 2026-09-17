@@ -1,0 +1,271 @@
+part of 'int64_consumer_test.dart';
+
+void verifyScalarResponses() {
+  test(
+    'named enum returns use scalar wire decoding without field selection',
+    () async {
+      final transport = _ResponseTransport();
+      final client = LuxoClient(transport);
+      for (final text in ['OPEN', 'DONE']) {
+        transport.response = text;
+        expect(await client.namedEnum(), text);
+        transport.response = (sdk.LuxoEncoder()..writeString(text)).bytes();
+        expect(await client.namedEnum(), text);
+        expect(transport.params, isNull);
+        transport.response = [text];
+        expect(await client.namedEnums(), [text]);
+        transport.response =
+            (sdk.LuxoEncoder()
+                  ..writeVarint(1)
+                  ..writeString(text))
+                .bytes();
+        expect(await client.namedEnums(), [text]);
+        expect(transport.params, isNull);
+      }
+      for (final bytes in <List<int>>[
+        [],
+        [1],
+        [1, 255],
+        [0, 99],
+      ]) {
+        transport.response = Uint8List.fromList(bytes);
+        await expectLater(client.namedEnum(), throwsFormatException);
+        await expectLater(client.namedEnums(), throwsFormatException);
+      }
+    },
+  );
+
+  test('implicit Int returns retain scalar and list shape', () async {
+    final transport = _ResponseTransport();
+    final client = LuxoClient(transport);
+    for (final value in [sdk.LuxoInt64.minValue, sdk.LuxoInt64.maxValue]) {
+      transport.response = value.toBigInt();
+      expect(await client.implicitInteger(), value);
+      transport.response = (sdk.LuxoEncoder()..writeSvarint(value)).bytes();
+      expect(await client.implicitInteger(), value);
+      transport.response = [value.toBigInt()];
+      expect(await client.implicitIntegers(), [value]);
+      transport.response =
+          (sdk.LuxoEncoder()
+                ..writeVarint(1)
+                ..writeSvarint(value))
+              .bytes();
+      expect(await client.implicitIntegers(), [value]);
+    }
+  });
+
+  test('generated scalar and scalar-list streams reject bad payloads before callback delivery', () async {
+    final transport = _ResponseTransport();
+    final client = LuxoClient(transport);
+    final unary = _streamSubscribers(client, array: false);
+    final arrays = _streamSubscribers(client, array: true);
+    final cells = _scalarArrayCells();
+    for (var index = 0; index < unary.length; index++) {
+      final position = index == 11 ? 9 : index;
+      final values = _streamValues[position];
+      final cell = cells[position];
+      final element = Uint8List.sublistView(
+        cell,
+        1,
+        _firstElementEnd(position),
+      );
+      final malformed = _malformedScalarPayloads(position);
+      await _verifySubscription(
+        transport,
+        unary[index],
+        element,
+        values.first,
+        _jsonValue(values.first),
+        malformed,
+      );
+      await _verifySubscription(
+        transport,
+        arrays[index],
+        cell,
+        values,
+        values.map(_jsonValue).toList(),
+        [
+          for (final bytes in malformed) ...[
+            [1, ...bytes],
+            [2, ...element, ...bytes],
+          ],
+        ],
+      );
+    }
+  });
+}
+
+typedef _Subscribe = Future<void Function()> Function(void Function(Object));
+
+List<_Subscribe> _streamSubscribers(LuxoClient c, {required bool array}) =>
+    array
+    ? [
+        (receive) => c.subscribeWatchIntArray(onData: receive),
+        (receive) => c.subscribeWatchDurationArray(onData: receive),
+        (receive) => c.subscribeWatchFloatArray(onData: receive),
+        (receive) => c.subscribeWatchStringArray(onData: receive),
+        (receive) => c.subscribeWatchBooleanArray(onData: receive),
+        (receive) => c.subscribeWatchDateTimeArray(onData: receive),
+        (receive) => c.subscribeWatchUUIDArray(onData: receive),
+        (receive) => c.subscribeWatchBytesArray(onData: receive),
+        (receive) => c.subscribeWatchDecimalArray(onData: receive),
+        (receive) => c.subscribeWatchEnumArray(onData: receive),
+        (receive) => c.subscribeWatchJSONArray(onData: receive),
+        (receive) => c.subscribeWatchTaskStatusArray(onData: receive),
+      ]
+    : [
+        (receive) => c.subscribeWatchInt(onData: receive),
+        (receive) => c.subscribeWatchDuration(onData: receive),
+        (receive) => c.subscribeWatchFloat(onData: receive),
+        (receive) => c.subscribeWatchString(onData: receive),
+        (receive) => c.subscribeWatchBoolean(onData: receive),
+        (receive) => c.subscribeWatchDateTime(onData: receive),
+        (receive) => c.subscribeWatchUUID(onData: receive),
+        (receive) => c.subscribeWatchBytes(onData: receive),
+        (receive) => c.subscribeWatchDecimal(onData: receive),
+        (receive) => c.subscribeWatchEnum(onData: receive),
+        (receive) => c.subscribeWatchJSON(onData: receive),
+        (receive) => c.subscribeWatchTaskStatus(onData: receive),
+      ];
+
+// Offsets in the independently written two-element wire fixtures, including count.
+int _firstElementEnd(int kind) => switch (kind) {
+  0 || 1 => 11,
+  2 => 9,
+  3 || 4 || 7 => 2,
+  5 => 3,
+  6 => 17,
+  8 => 3,
+  9 => 6,
+  10 => 7,
+  _ => throw StateError('unknown fixture kind'),
+};
+
+List<List<Object>> get _streamValues => [
+  [sdk.LuxoInt64.minValue, sdk.LuxoInt64.maxValue],
+  [sdk.LuxoInt64.minValue, sdk.LuxoInt64.maxValue],
+  [1.5, 2.0],
+  ['', '\uFEFF\uFEFF发布\uFFFD'],
+  [false, true],
+  ['1970-01-01T00:00:00Z', '1970-01-01T00:00:01Z'],
+  [_uuid, _uuid],
+  [
+    Uint8List(0),
+    Uint8List.fromList([1, 255]),
+  ],
+  ['0', '1.25'],
+  ['OPEN', 'DONE'],
+  [
+    false,
+    {'large': BigInt.parse('18446744073709551616')},
+  ],
+];
+
+Object _jsonValue(Object value) => switch (value) {
+  sdk.LuxoInt64() => value.toBigInt(),
+  Uint8List() => base64Encode(value),
+  _ => value,
+};
+
+List<List<int>> _malformedScalarPayloads(int kind) {
+  final overflow = [...List<int>.filled(9, 255), 2];
+  return switch (kind) {
+    0 || 1 || 5 => [overflow],
+    3 || 8 || 9 => [
+      [1, 255],
+      overflow,
+    ],
+    4 => [
+      [2],
+    ],
+    7 => [overflow],
+    10 => [
+      [1, 123],
+      [1, 255],
+      overflow,
+    ],
+    _ => [],
+  };
+}
+
+Future<void> _verifySubscription(
+  _ResponseTransport transport,
+  _Subscribe subscribe,
+  Uint8List bytes,
+  Object expected,
+  Object json,
+  List<List<int>> malformed,
+) async {
+  final delivered = <Object>[];
+  final stop = await subscribe(delivered.add);
+  expect(transport.params, isEmpty);
+  transport.emit(bytes);
+  expect(delivered, [expected]);
+  for (var end = 0; end < bytes.length; end++) {
+    expect(
+      () => transport.emit(Uint8List.sublistView(bytes, 0, end)),
+      throwsFormatException,
+    );
+    expect(delivered, [expected]);
+  }
+  expect(
+    () => transport.emit(Uint8List.fromList([...bytes, 99])),
+    throwsFormatException,
+  );
+  expect(delivered, [expected]);
+  for (final value in malformed) {
+    expect(
+      () => transport.emit(Uint8List.fromList(value)),
+      throwsFormatException,
+    );
+    expect(delivered, [expected]);
+  }
+  delivered.clear();
+  transport.emit(json);
+  expect(delivered, [expected]);
+  stop();
+  expect(transport.receiver, isNull);
+}
+
+// Controlled response injection tests generated callbacks, not real WebSocket frames.
+class _ResponseTransport extends sdk.Transport {
+  Object? response;
+  Map<String, dynamic>? params;
+  void Function(dynamic)? receiver;
+
+  @override
+  Future<T> call<T>(
+    String api, {
+    Map<String, dynamic>? params,
+    T Function(dynamic)? decoder,
+  }) async {
+    this.params = params;
+    return decoder!(response);
+  }
+
+  @override
+  Future<void Function()> subscribe<T>(
+    String api,
+    Map<String, dynamic> params,
+    void Function(T) onData, {
+    required T Function(Object?) decoder,
+    void Function(sdk.LuxoError)? onError,
+    void Function()? onDone,
+  }) async {
+    this.params = params;
+    receiver = (value) => onData(decoder(value));
+    return () => receiver = null;
+  }
+
+  void emit(Object value) => receiver!(value);
+  @override
+  void setSchema(Map<String, sdk.APISchemaEntry> schema) {}
+  @override
+  void setMode(sdk.TransportMode mode) {}
+  @override
+  void setToken(String token) {}
+  @override
+  void close() {
+    receiver = null;
+  }
+}

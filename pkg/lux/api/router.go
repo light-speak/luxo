@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"crypto/subtle"
-	"encoding/json"
 	stderrors "errors"
 	"fmt"
 	"io"
@@ -16,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/light-speak/luxo/pkg/lux/i18n"
 	"github.com/light-speak/luxo/pkg/lux/schema"
@@ -33,8 +33,9 @@ var (
 type HandlerFunc func(ctx context.Context, req *Request) error
 
 // StreamHandlerFunc is called when a client subscribes to a @stream @native API without event source.
-// The handler receives a Stream and pushes data via stream.Send(). Return when done or context cancelled.
-type StreamHandlerFunc func(ctx context.Context, params *StreamParams, identity any, stream *Stream)
+// The handler pushes data via stream.Send(). Return nil for completion or an
+// error for terminal failure; accepted messages precede the terminal result.
+type StreamHandlerFunc func(ctx context.Context, params *StreamParams, identity any, stream *Stream) error
 
 // MetricsRecorder is called for each completed request to collect metrics.
 type MetricsRecorder interface {
@@ -327,13 +328,18 @@ func (rt *Router) executeHTTPHandler(w http.ResponseWriter, r *http.Request, req
 	buf := GetBuf()
 	req.Buf = buf
 	startedAt, duration, handlerErr := rt.callObservedHandler(r.Context(), req, fn, metrics != nil || rt.requestLogging, trace)
-	rt.recordRequestMetrics(r, req, metrics, startedAt, duration, handlerErr)
 	if handlerErr != nil {
+		rt.recordRequestMetrics(r, req, metrics, startedAt, duration, handlerErr)
 		rt.writeHandlerError(w, r, req, buf, binaryMode, trace, duration, handlerErr)
 		return
 	}
+	jsonBody, encodeErr := rt.encodeHTTPResponse(req, buf, binaryMode, trace)
+	rt.recordRequestMetrics(r, req, metrics, startedAt, duration, encodeErr)
+	if encodeErr != nil {
+		rt.writeHandlerError(w, r, req, buf, binaryMode, trace, duration, encodeErr)
+		return
+	}
 	rt.logRequest(req.API, duration, nil)
-	jsonBody := rt.encodeHTTPResponse(req, buf, binaryMode, trace)
 	writeDebugTraceHeaders(w.Header(), trace)
 	rt.writeHTTPResponse(w, buf.B, jsonBody, binaryMode)
 	PutBuf(buf)
@@ -382,20 +388,21 @@ func (rt *Router) writeHandlerError(w http.ResponseWriter, r *http.Request, req 
 	rt.writeAppError(w, r, binaryMode, err)
 }
 
-func (rt *Router) encodeHTTPResponse(req *Request, buf *ResponseBuf, binaryMode bool, trace *DebugTraceSession) []byte {
+func (rt *Router) encodeHTTPResponse(req *Request, buf *ResponseBuf, binaryMode bool, trace *DebugTraceSession) ([]byte, error) {
 	var jsonBody []byte
+	var err error
 	if trace == nil {
 		if !binaryMode {
-			jsonBody = rt.convertBinaryToJSON(req.API, buf.B)
+			jsonBody, err = rt.convertBinaryToJSON(req.API, buf.B)
 		}
-		return jsonBody
+		return jsonBody, err
 	}
 	encodeStarted := trace.Start()
 	if !binaryMode {
-		jsonBody = rt.convertBinaryToJSON(req.API, buf.B)
+		jsonBody, err = rt.convertBinaryToJSON(req.API, buf.B)
 	}
 	trace.Finish(encodeStarted, DebugSpanMeta{Name: "response.encode", Category: "gateway", Operation: req.API})
-	return jsonBody
+	return jsonBody, err
 }
 
 func (rt *Router) writeHTTPResponse(w http.ResponseWriter, binaryBody, jsonBody []byte, binaryMode bool) {
@@ -473,7 +480,7 @@ func (rt *Router) validatePublicSelection(req *Request, binaryMode bool) error {
 		return nil
 	}
 	apiMeta := rt.Schema.APIs[req.API]
-	if apiMeta == nil || schemaObject(rt.Schema, apiMeta.ReturnType) == nil {
+	if apiMeta == nil || rt.Schema.LookupModel(apiMeta.ReturnType) == nil {
 		return nil
 	}
 	if binaryMode {
@@ -496,7 +503,7 @@ func (rt *Router) applyJSONSelection(req *Request, binaryMode bool) error {
 	if apiMeta == nil || apiMeta.ReturnType == "" {
 		return nil
 	}
-	model := schemaObject(rt.Schema, apiMeta.ReturnType)
+	model := rt.Schema.LookupModel(apiMeta.ReturnType)
 	if model == nil {
 		return nil
 	}
@@ -526,7 +533,11 @@ func newTraceRecord(r *http.Request, apiName string, selected []*selection.Field
 		Timestamp:     startedAt.UTC(),
 	}
 	if trace := DebugTrace(r.Context()); trace != nil {
-		record.Spans = DebugTraceJSON(trace.Snapshot())
+		var encodeErr error
+		record.Spans, encodeErr = DebugTraceJSON(trace.Snapshot())
+		if encodeErr != nil {
+			record.Spans = failedDebugTraceJSON
+		}
 		record.Selection = selection.Format(selected)
 		record.HeadSampled = trace.Sampled()
 	}
@@ -565,16 +576,16 @@ func (rt *Router) handleIntrospection(w http.ResponseWriter, r *http.Request) {
 
 // convertBinaryToJSON converts handler's Luxo binary response to JSON using schema.
 // Handles model, list, paginated list, and scalar return types.
-func (rt *Router) convertBinaryToJSON(apiName string, data []byte) []byte {
-	if len(data) == 0 {
-		return []byte("null")
+func (rt *Router) convertBinaryToJSON(apiName string, data []byte) ([]byte, error) {
+	if len(data) == 0 && (rt.Schema == nil || rt.Schema.APIs[apiName] == nil || rt.Schema.APIs[apiName].ReturnType == "") {
+		return []byte("null"), nil
 	}
 	if rt.Schema == nil {
-		return data // no schema — assume handler wrote JSON directly
+		return data, nil // no schema — assume handler wrote JSON directly
 	}
 	apiMeta := rt.Schema.APIs[apiName]
 	if apiMeta == nil {
-		return data // unknown API — pass through as-is
+		return data, nil // unknown API — pass through as-is
 	}
 
 	// No return type → scalar (delete returns count as Int)
@@ -583,7 +594,7 @@ func (rt *Router) convertBinaryToJSON(apiName string, data []byte) []byte {
 	}
 
 	// Check if return type is a model, type declaration, or scalar
-	model := schemaObject(rt.Schema, apiMeta.ReturnType)
+	model := rt.Schema.LookupModel(apiMeta.ReturnType)
 	if model == nil {
 		wireType := apiMeta.ReturnType
 		if rt.Schema.Enums[wireType] != nil {
@@ -606,18 +617,8 @@ func (rt *Router) convertBinaryToJSON(apiName string, data []byte) []byte {
 
 // StreamPayloadJSON converts a generated binary stream payload through the
 // same schema-driven path as an ordinary API response.
-func (rt *Router) StreamPayloadJSON(apiName string, data []byte) []byte {
+func (rt *Router) StreamPayloadJSON(apiName string, data []byte) ([]byte, error) {
 	return rt.convertBinaryToJSON(apiName, data)
-}
-
-func schemaObject(s *schema.Schema, typeName string) *schema.Model {
-	if model := s.Models[typeName]; model != nil {
-		return model
-	}
-	if declaration := s.Types[typeName]; declaration != nil {
-		return declaration.AsModel()
-	}
-	return nil
 }
 
 // callHandler executes a handler with panic recovery.
@@ -638,11 +639,13 @@ func (rt *Router) writeAppError(w http.ResponseWriter, r *http.Request, binaryMo
 	buf := GetBuf()
 
 	if binaryMode {
-		buf.B = appendBinaryError(buf.B, werr)
+		werr = appendWireErrorFields(buf, werr, true)
 		w.Header().Set("Content-Type", "application/x-luxo")
 		w.Header().Set("X-Luxo-Mode", "binary")
 	} else {
-		appendJSONError(buf, werr)
+		buf.AppendByte('{')
+		werr = appendWireErrorFields(buf, werr, false)
+		buf.AppendByte('}')
 	}
 
 	w.WriteHeader(werr.Code)
@@ -651,19 +654,26 @@ func (rt *Router) writeAppError(w http.ResponseWriter, r *http.Request, binaryMo
 }
 
 func (rt *Router) buildWireError(ctx context.Context, acceptLanguage string, err error) wireError {
-	var appErr *errors.AppError
-	if !stderrors.As(err, &appErr) {
+	appErr, ok := stderrors.AsType[*errors.AppError](err)
+	if !ok {
 		appErr = errors.Wrap(err)
 	}
 
+	var data []byte
+	if appErr.Data != nil && !appErr.Internal {
+		var encodeErr error
+		data, encodeErr = appErr.Data.AppendJSON(nil)
+		if encodeErr != nil {
+			appErr, data = errors.Wrap(encodeErr), nil
+		}
+	}
 	message := appErr.Message
+	if appErr.Internal {
+		message = "error.internal"
+	}
 	if rt.translator != nil && !appErr.Internal {
 		locale := i18n.ParseAcceptLanguage(acceptLanguage)
-		if appErr.Data != nil {
-			message = rt.translator.Translate(locale, appErr.Message, appErr.Data.I18nData())
-		} else {
-			message = rt.translator.Translate(locale, appErr.Message, nil)
-		}
+		message = rt.translator.Translate(locale, appErr.Message, appErr.Data)
 	}
 
 	werr := wireError{
@@ -671,9 +681,7 @@ func (rt *Router) buildWireError(ctx context.Context, acceptLanguage string, err
 		Name:    appErr.Name,
 		Message: message,
 		TraceID: TraceID(ctx),
-	}
-	if appErr.Data != nil && !appErr.Internal {
-		werr.Data, _ = json.Marshal(appErr.Data)
+		Data:    data,
 	}
 	if rt.devMode && appErr.Cause != nil {
 		werr.Cause = appErr.Cause.Error()
@@ -681,22 +689,22 @@ func (rt *Router) buildWireError(ctx context.Context, acceptLanguage string, err
 	return werr
 }
 
-func appendJSONError(buf *ResponseBuf, e wireError) {
-	buf.AppendByte('{')
-	appendJSONErrorFields(buf, e)
-	buf.AppendByte('}')
-}
-
-func appendJSONErrorFields(buf *ResponseBuf, e wireError) {
+func appendJSONErrorFields(buf *ResponseBuf, e wireError) error {
 	buf.AppendString(`"error":`)
-	buf.AppendJSONString(e.Name)
+	if err := buf.AppendJSONString(e.Name); err != nil {
+		return err
+	}
 	buf.AppendString(`,"code":`)
 	buf.AppendInt(int64(e.Code))
 	buf.AppendString(`,"message":`)
-	buf.AppendJSONString(e.Message)
+	if err := buf.AppendJSONString(e.Message); err != nil {
+		return err
+	}
 	if e.TraceID != "" {
 		buf.AppendString(`,"traceId":`)
-		buf.AppendJSONString(e.TraceID)
+		if err := buf.AppendJSONString(e.TraceID); err != nil {
+			return err
+		}
 	}
 	if len(e.Data) > 0 {
 		buf.AppendString(`,"data":`)
@@ -704,8 +712,37 @@ func appendJSONErrorFields(buf *ResponseBuf, e wireError) {
 	}
 	if e.Cause != "" {
 		buf.AppendString(`,"cause":`)
-		buf.AppendJSONString(e.Cause)
+		if err := buf.AppendJSONString(e.Cause); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+// appendWireErrorFields discards the entire invalid error, not just its text.
+// The fallback consists only of fixed valid strings and cannot recurse.
+func appendWireErrorFields(buf *ResponseBuf, value wireError, binaryMode bool) wireError {
+	prefix := len(buf.B)
+	var err error
+	if binaryMode {
+		buf.B, err = appendBinaryError(buf.B, value)
+	} else {
+		err = appendJSONErrorFields(buf, value)
+	}
+	if err == nil {
+		return value
+	}
+	buf.B = buf.B[:prefix]
+	value = wireError{Code: 500, Name: "Internal", Message: "error.internal"}
+	if binaryMode {
+		buf.B = codec.AppendSvarint(append(buf.B, binaryErrorCodeField), 500)
+		buf.B = codec.AppendBytes(append(buf.B, binaryErrorNameField), []byte("Internal"))
+		buf.B = codec.AppendBytes(append(buf.B, binaryErrorMessageField), []byte("error.internal"))
+		buf.AppendByte(0)
+	} else {
+		buf.AppendString(`"error":"Internal","code":500,"message":"error.internal"`)
+	}
+	return value
 }
 
 // ANSI color codes for module tags

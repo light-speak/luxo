@@ -119,7 +119,7 @@ func encodeProtocolFixtureSelection(t *testing.T) []byte {
 
 func TestProtocolConformanceErrorAndFrames(t *testing.T) {
 	fixture := loadAPIProtocolFixture(t)
-	errorWire := appendBinaryError(nil, wireError{
+	errorWire := mustBinaryError(t, nil, wireError{
 		Code: 400, Name: "BadRequest", Message: "bad", TraceID: "t", Data: []byte(`{}`), Cause: "c",
 	})
 	if got := hex.EncodeToString(errorWire); got != fixture.ErrorEnvelope {

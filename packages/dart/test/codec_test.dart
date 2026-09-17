@@ -1,9 +1,26 @@
 import 'dart:convert';
 import 'dart:typed_data';
+
 import 'package:test/test.dart';
 import 'package:luxo_client/src/codec.dart';
+import 'package:luxo_client/src/int64.dart';
 
 void main() {
+  test('row and column decoders require the end marker', () {
+    final row = LuxoDecoder(Uint8List.fromList([0, 1, 84]));
+    row.skipArenaHeader();
+    expect(row.nextField(), isTrue);
+    expect(row.readInt(), LuxoInt64.fromInt(42));
+    expect(row.nextField(), isFalse);
+    expect(row.error, contains('end marker'));
+
+    final column = ColumnarDecoder(Uint8List.fromList([1, 0, 1, 128, 1]));
+    expect(column.nextColumn(), isTrue);
+    expect(column.readColumnInt(), [LuxoInt64.fromInt(64)]);
+    expect(column.nextColumn(), isFalse);
+    expect(column.error, contains('end marker'));
+  });
+
   group('LuxoEncoder/LuxoDecoder', () {
     group('writeVarint/readVarint round-trip', () {
       // readInt uses zigzag, so for unsigned varint round-trip we use
@@ -82,13 +99,13 @@ void main() {
       void testRoundTrip(int value) {
         final enc = LuxoEncoder();
         // Use field pattern: fieldID + svarint
-        enc.writeFieldInt(1, value);
+        enc.writeFieldInt(1, LuxoInt64.parse('$value'));
         enc.writeEnd();
 
         final dec = LuxoDecoder(enc.bytes());
         expect(dec.nextField(), isTrue);
         expect(dec.fieldID, equals(1));
-        expect(dec.readInt(), equals(value));
+        expect(dec.readInt(), equals(LuxoInt64.fromInt(value)));
         expect(dec.nextField(), isFalse); // end marker
       }
 
@@ -201,7 +218,7 @@ void main() {
     group('multiple fields', () {
       test('mixed types in sequence', () {
         final enc = LuxoEncoder();
-        enc.writeFieldInt(1, 42);
+        enc.writeFieldInt(1, LuxoInt64.fromInt(42));
         enc.writeFieldString(2, 'hello');
         enc.writeFieldBool(3, true);
         enc.writeFieldFloat(4, 3.14);
@@ -211,7 +228,7 @@ void main() {
 
         expect(dec.nextField(), isTrue);
         expect(dec.fieldID, equals(1));
-        expect(dec.readInt(), equals(42));
+        expect(dec.readInt(), equals(LuxoInt64.fromInt(42)));
 
         expect(dec.nextField(), isTrue);
         expect(dec.fieldID, equals(2));
@@ -245,12 +262,12 @@ void main() {
         final enc = LuxoEncoder();
         enc.writeVarint(1); // fieldID
         enc.writePresent();
-        enc.writeSvarint(99);
+        enc.writeSvarint(LuxoInt64.fromInt(99));
         enc.writeEnd();
 
         final dec = LuxoDecoder(enc.bytes());
         expect(dec.nextField(), isTrue);
-        expect(dec.readIntPtr(), equals(99));
+        expect(dec.readIntPtr(), equals(LuxoInt64.fromInt(99)));
       });
 
       test('null string', () {
@@ -392,11 +409,17 @@ void main() {
     group('scalar array fields (row format)', () {
       test('int array round-trip', () {
         final enc = LuxoEncoder();
-        enc.writeFieldIntArray(1, [1, -2, 300, 0]);
+        enc.writeFieldIntArray(
+          1,
+          [1, -2, 300, 0].map(LuxoInt64.fromInt).toList(),
+        );
         enc.writeEnd();
         final dec = LuxoDecoder(enc.bytes());
         expect(dec.nextField(), isTrue);
-        expect(dec.readIntArray(), equals([1, -2, 300, 0]));
+        expect(
+          dec.readIntArray(),
+          equals([1, -2, 300, 0].map(LuxoInt64.fromInt)),
+        );
         expect(dec.nextField(), isFalse);
       });
 
@@ -495,7 +518,7 @@ void main() {
       expect(dec.nextColumn(), isTrue);
       expect(dec.fieldID, equals(1));
       final ints = dec.readColumnInt();
-      expect(ints, equals([42, -7]));
+      expect(ints, equals([42, -7].map(LuxoInt64.fromInt)));
 
       expect(dec.nextColumn(), isTrue);
       expect(dec.fieldID, equals(2));
@@ -549,7 +572,7 @@ void main() {
       expect(dec.nextColumn(), isTrue);
       expect(dec.fieldID, equals(1));
       final nullableInts = dec.readColumnIntPtr();
-      expect(nullableInts, equals([null, 99, null]));
+      expect(nullableInts, equals([null, LuxoInt64.fromInt(99), null]));
 
       expect(dec.nextColumn(), isTrue);
       expect(dec.fieldID, equals(2));
@@ -628,41 +651,38 @@ void main() {
       expect(dec.nextColumn(), isFalse);
     });
 
-    test(
-      'scalar array column — each cell is a length-prefixed [count][items] blob',
-      () {
-        // Column where each cell is a string-array blob: [count][string...]
-        final cell0 = BytesBuilder();
-        _writeVarint(cell0, 2); // 2 items
-        _writeString(cell0, 'x');
-        _writeString(cell0, 'y');
-        final cell1 = BytesBuilder();
-        _writeVarint(cell1, 0); // empty array
+    test('scalar array column — each cell is a length-prefixed [count][items] blob', () {
+      // Column where each cell is a string-array blob: [count][string...]
+      final cell0 = BytesBuilder();
+      _writeVarint(cell0, 2); // 2 items
+      _writeString(cell0, 'x');
+      _writeString(cell0, 'y');
+      final cell1 = BytesBuilder();
+      _writeVarint(cell1, 0); // empty array
 
-        final bb = BytesBuilder();
-        _writeVarint(bb, 2); // count=2 rows
-        _writeVarint(bb, 0); // arena size
-        _writeVarint(bb, 1); // fieldID=1
-        // cell 0 as length-prefixed blob
-        final c0 = cell0.toBytes();
-        _writeVarint(bb, c0.length);
-        bb.add(c0);
-        // cell 1 as length-prefixed blob
-        final c1 = cell1.toBytes();
-        _writeVarint(bb, c1.length);
-        bb.add(c1);
-        bb.addByte(0x00); // end
+      final bb = BytesBuilder();
+      _writeVarint(bb, 2); // count=2 rows
+      _writeVarint(bb, 0); // arena size
+      _writeVarint(bb, 1); // fieldID=1
+      // cell 0 as length-prefixed blob
+      final c0 = cell0.toBytes();
+      _writeVarint(bb, c0.length);
+      bb.add(c0);
+      // cell 1 as length-prefixed blob
+      final c1 = cell1.toBytes();
+      _writeVarint(bb, c1.length);
+      bb.add(c1);
+      bb.addByte(0x00); // end
 
-        final dec = ColumnarDecoder(Uint8List.fromList(bb.toBytes()));
-        expect(dec.nextColumn(), isTrue);
-        final blobs = dec.readColumnBytes();
-        expect(blobs.length, equals(2));
-        // Decode each cell blob with a row decoder.
-        expect(LuxoDecoder(blobs[0]).readStringArray(), equals(['x', 'y']));
-        expect(LuxoDecoder(blobs[1]).readStringArray(), isEmpty);
-        expect(dec.nextColumn(), isFalse);
-      },
-    );
+      final dec = ColumnarDecoder(Uint8List.fromList(bb.toBytes()));
+      expect(dec.nextColumn(), isTrue);
+      final blobs = dec.readColumnBytes();
+      expect(blobs.length, equals(2));
+      // Decode each cell blob with a row decoder.
+      expect(LuxoDecoder(blobs[0]).readStringArray(), equals(['x', 'y']));
+      expect(LuxoDecoder(blobs[1]).readStringArray(), isEmpty);
+      expect(dec.nextColumn(), isFalse);
+    });
 
     test('readSvarint public method', () {
       final bb = BytesBuilder();
@@ -674,26 +694,25 @@ void main() {
 
       final dec = ColumnarDecoder(Uint8List.fromList(bb.toBytes()));
       expect(dec.nextColumn(), isFalse);
-      expect(dec.readSvarint(), equals(-42));
+      expect(dec.readSvarint(), equals(LuxoInt64.fromInt(-42)));
     });
   });
 
   group('DateTime svarint decoding', () {
     // 2021-01-01T00:00:00Z == 1609459200 unix seconds.
     const seconds = 1609459200;
-    const iso = '2021-01-01T00:00:00.000Z';
+    const iso = '2021-01-01T00:00:00Z';
 
     test('dateTimeStringFromUnixSeconds matches JSON ISO 8601 UTC', () {
       expect(dateTimeStringFromUnixSeconds(seconds), equals(iso));
-      expect(
-        dateTimeStringFromUnixSeconds(0),
-        equals('1970-01-01T00:00:00.000Z'),
-      );
+      expect(dateTimeStringFromUnixSeconds(0), equals('1970-01-01T00:00:00Z'));
+      expect(dateTimeStringFromUnixSeconds(-1), '1969-12-31T23:59:59Z');
     });
 
     test('readDateTime decodes svarint seconds to ISO string', () {
       final enc = LuxoEncoder();
-      enc.writeFieldInt(1, seconds); // svarint(unix seconds)
+      enc.writeVarint(1);
+      enc.writeDateTime(iso); // svarint(unix seconds)
       enc.writeEnd();
 
       final dec = LuxoDecoder(enc.bytes());
@@ -718,7 +737,7 @@ void main() {
       final enc = LuxoEncoder();
       enc.writeVarint(1); // fieldID
       enc.writePresent();
-      enc.writeSvarint(seconds);
+      enc.writeDateTime(iso);
       enc.writeEnd();
 
       final dec = LuxoDecoder(enc.bytes());
@@ -728,26 +747,24 @@ void main() {
 
     test('readDateTimeArray decodes svarint seconds list to ISO strings', () {
       final enc = LuxoEncoder();
-      enc.writeFieldIntArray(1, [seconds, 0]);
+      enc.writeVarint(1);
+      enc.writeVarint(2);
+      enc.writeDateTime(iso);
+      enc.writeDateTime('1970-01-01T00:00:00Z');
       enc.writeEnd();
 
       final dec = LuxoDecoder(enc.bytes());
       expect(dec.nextField(), isTrue);
-      expect(
-        dec.readDateTimeArray(),
-        equals([iso, '1970-01-01T00:00:00.000Z']),
-      );
+      expect(dec.readDateTimeArray(), equals([iso, '1970-01-01T00:00:00Z']));
     });
 
     test('binary and JSON DateTime representations are identical', () {
-      // JSON mode surfaces DateTime as the RFC3339 string the server sends.
-      final jsonValue = DateTime.fromMillisecondsSinceEpoch(
-        seconds * 1000,
-        isUtc: true,
-      ).toIso8601String();
+      // Go emits whole-second RFC3339 without Dart's fractional .000 suffix.
+      const jsonValue = '2021-01-01T00:00:00Z';
 
       final enc = LuxoEncoder();
-      enc.writeFieldInt(1, seconds);
+      enc.writeVarint(1);
+      enc.writeDateTime(iso);
       enc.writeEnd();
       final dec = LuxoDecoder(enc.bytes());
       dec.nextField();
@@ -763,15 +780,14 @@ void main() {
       _writeVarint(bb, 0); // arena size
       _writeVarint(bb, 1); // fieldID
       _writeSvarint(bb, seconds);
+      _writeVarint(bb, 0);
       _writeSvarint(bb, 0);
+      _writeVarint(bb, 0);
       bb.addByte(0x00); // end
 
       final dec = ColumnarDecoder(Uint8List.fromList(bb.toBytes()));
       expect(dec.nextColumn(), isTrue);
-      expect(
-        dec.readColumnDateTime(),
-        equals([iso, '1970-01-01T00:00:00.000Z']),
-      );
+      expect(dec.readColumnDateTime(), equals([iso, '1970-01-01T00:00:00Z']));
       expect(dec.nextColumn(), isFalse);
     });
 
@@ -782,7 +798,8 @@ void main() {
       _writeVarint(bb, 1); // fieldID
       bb.addByte(0x00); // null
       bb.addByte(0x01);
-      _writeSvarint(bb, seconds); // present
+      _writeSvarint(bb, seconds);
+      _writeVarint(bb, 0); // present
       bb.addByte(0x00); // null
       bb.addByte(0x00); // end
 
@@ -844,16 +861,21 @@ void main() {
 // --- Test helpers for building columnar binary data ---
 
 void _writeVarint(BytesBuilder bb, int v) {
-  var uv = v;
-  while (uv & ~0x7F != 0) {
-    bb.addByte((uv & 0x7F) | 0x80);
-    uv = uv >>> 7;
-  }
-  bb.addByte(uv & 0x7F);
+  _writeUnsigned(bb, BigInt.from(v));
 }
 
 void _writeSvarint(BytesBuilder bb, int v) {
-  _writeVarint(bb, (v << 1) ^ (v >> 63));
+  final value = BigInt.from(v);
+  _writeUnsigned(bb, (value << 1) ^ (value >> 63));
+}
+
+// Independent fixture encoding must not rely on JavaScript's 32-bit bitwise operators.
+void _writeUnsigned(BytesBuilder bb, BigInt value) {
+  do {
+    final part = (value & BigInt.from(127)).toInt();
+    value >>= 7;
+    bb.addByte(part | (value == BigInt.zero ? 0 : 128));
+  } while (value != BigInt.zero);
 }
 
 void _writeFixed64(BytesBuilder bb, double v) {

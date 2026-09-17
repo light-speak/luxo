@@ -14,8 +14,38 @@ package codec
 
 import (
 	"encoding/binary"
+	"errors"
 	"math"
+	"unicode/utf8"
 )
+
+// ErrNonFiniteFloat rejects values outside the protocol's finite Float domain.
+var ErrNonFiniteFloat = errors.New("luxo: Float must be finite")
+
+// ErrInvalidUTF8 rejects String values outside the protocol's text domain.
+var ErrInvalidUTF8 = errors.New("luxo: String must be valid UTF-8")
+
+// ErrInsufficientElementBytes rejects collections before allocating their
+// results when even their minimum encoded size cannot fit the remaining bytes.
+var ErrInsufficientElementBytes = errors.New("codec: insufficient element bytes")
+
+// ErrInsufficientArenaBytes rejects an allocation larger than the available payload.
+var ErrInsufficientArenaBytes = errors.New("codec: insufficient arena bytes")
+
+// ErrEmptyColumnarProjection rejects nonempty lists with no returned column.
+var ErrEmptyColumnarProjection = errors.New("codec: nonempty list requires at least one column")
+
+// ErrInvalidColumnarCount rejects counts outside the supported wire domain.
+var ErrInvalidColumnarCount = errors.New("codec: invalid columnar record count")
+
+// ErrColumnarRowCount rejects columns whose values do not match the record count.
+var ErrColumnarRowCount = errors.New("codec: column values must match the record count")
+
+// ErrInvalidColumnarField rejects IDs that collide with the end marker or overflow.
+var ErrInvalidColumnarField = errors.New("codec: column field ID must be positive")
+
+// ErrInvalidColumnarArena rejects metadata outside the decoder's allocation domain.
+var ErrInvalidColumnarArena = errors.New("codec: invalid columnar arena size")
 
 // Safety limits to prevent OOM from malicious/corrupted wire data.
 const (
@@ -37,7 +67,7 @@ func AppendVarint(dst []byte, v uint64) []byte {
 }
 
 // ReadVarint reads a varint from buf at offset. Returns value and bytes consumed.
-// Returns (0, 0) if buf is too short or varint overflows 64 bits.
+// Returns (0, 0) on truncation and (0, -1) on overflow.
 // Use ReadVarintErr for error details.
 func ReadVarint(buf []byte, off int) (uint64, int) {
 	var v uint64
@@ -49,7 +79,9 @@ func ReadVarint(buf []byte, off int) (uint64, int) {
 			return v, i - off + 1
 		}
 		shift += 7
-		if shift >= 64 {
+		// Only the tenth byte can overflow uint64. Validate it on the
+		// continuation path so short values need no extra terminal check.
+		if shift == 63 && i+1 < len(buf) && buf[i+1] > 1 {
 			return 0, -1 // overflow (distinguishable from truncation)
 		}
 	}
@@ -74,19 +106,38 @@ func ReadSvarint(buf []byte, off int) (int64, int) {
 
 // --- Fixed64 (float64, little-endian) ---
 
-// AppendFixed64 appends a float64 as 8 bytes little-endian.
-func AppendFixed64(dst []byte, v float64) []byte {
+// AppendFixed64 appends a finite Float as 8 bytes little-endian.
+// On failure it returns the unchanged destination and ErrNonFiniteFloat.
+func AppendFixed64(dst []byte, v float64) ([]byte, error) {
+	if !IsFiniteFloat(v) {
+		return dst, ErrNonFiniteFloat
+	}
+	return appendFixed64(dst, v), nil
+}
+
+// appendFixed64 is used only after the caller has checked the finite domain.
+func appendFixed64(dst []byte, v float64) []byte {
 	var buf [8]byte
 	binary.LittleEndian.PutUint64(buf[:], math.Float64bits(v))
 	return append(dst, buf[:]...)
 }
 
-// ReadFixed64 reads a float64 from 8 bytes at offset.
+// IsFiniteFloat reports whether a value belongs to the protocol Float domain.
+// Both signs of zero and all finite subnormal values are preserved.
+func IsFiniteFloat(value float64) bool {
+	return math.Float64bits(value)&0x7ff0000000000000 != 0x7ff0000000000000
+}
+
+// ReadFixed64 reads a finite float64 from 8 bytes at offset.
+// A non-finite or truncated value consumes no bytes.
 func ReadFixed64(buf []byte, off int) (float64, int) {
 	if off+8 > len(buf) {
 		return 0, 0
 	}
 	bits := binary.LittleEndian.Uint64(buf[off:])
+	if bits&0x7ff0000000000000 == 0x7ff0000000000000 {
+		return 0, 0
+	}
 	return math.Float64frombits(bits), 8
 }
 
@@ -98,8 +149,16 @@ func AppendBytes(dst []byte, v []byte) []byte {
 	return append(dst, v...)
 }
 
-// AppendString appends a length-prefixed string to dst.
-func AppendString(dst []byte, v string) []byte {
+// AppendString appends a UTF-8 string, leaving dst unchanged on failure.
+func AppendString(dst []byte, v string) ([]byte, error) {
+	if !utf8.ValidString(v) {
+		return dst, ErrInvalidUTF8
+	}
+	return appendString(dst, v), nil
+}
+
+// appendString is used only after the caller has validated the complete value.
+func appendString(dst []byte, v string) []byte {
 	dst = AppendVarint(dst, uint64(len(v)))
 	return append(dst, v...)
 }
@@ -122,13 +181,22 @@ func ReadBytes(buf []byte, off int) ([]byte, int) {
 	return buf[start:end], n + int(length)
 }
 
-// ReadString reads a length-prefixed string from buf at offset.
+// ReadString reads strict UTF-8, preserving a leading U+FEFF as field data.
+// Malformed text consumes no bytes; opaque binary values use ReadBytes.
 func ReadString(buf []byte, off int) (string, int) {
-	b, n := ReadBytes(buf, off)
+	b, n := readStringBytes(buf, off)
 	if n == 0 {
 		return "", 0
 	}
 	return string(b), n
+}
+
+func readStringBytes(buf []byte, off int) ([]byte, int) {
+	b, n := ReadBytes(buf, off)
+	if n == 0 || !utf8.Valid(b) {
+		return nil, 0
+	}
+	return b, n
 }
 
 // --- Boolean ---
@@ -163,13 +231,21 @@ func AppendArrayHeader(dst []byte, count int) []byte {
 	return AppendVarint(dst, uint64(count))
 }
 
-// ReadArrayHeader reads the array count from buf at offset.
+// ReadArrayHeader reads a count within MaxArrayElements before narrowing to int.
+// Invalid or oversized headers consume no bytes.
 func ReadArrayHeader(buf []byte, off int) (count int, n int) {
 	v, n := ReadVarint(buf, off)
-	if n <= 0 {
+	if n <= 0 || v > MaxArrayElements {
 		return 0, 0
 	}
 	return int(v), n
+}
+
+// HasElementBytes checks a collection's minimum payload before allocation.
+// Division avoids overflowing count*minSize. Variable-width values still need
+// their ordinary per-element validation after this lower-bound check.
+func HasElementBytes(buf []byte, off, count, minSize int) bool {
+	return uint(off) <= uint(len(buf)) && count >= 0 && minSize > 0 && count <= (len(buf)-off)/minSize
 }
 
 // --- Nullable flag ---

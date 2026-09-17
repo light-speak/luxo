@@ -232,8 +232,6 @@ func (g *GeneratorContext) generateStreamFile(result *semantic.Result, packageNa
 	}
 
 	var b strings.Builder
-	writeHeader(&b, packageName, "stream.gen.go")
-	g.writeStreamImports(&b, streams)
 	writeRegisterStreams(&b, streams)
 	writeStreamResolverInterface(&b, streams)
 
@@ -249,10 +247,15 @@ func (g *GeneratorContext) generateStreamFile(result *semantic.Result, packageNa
 		}
 	}
 
-	return []byte(b.String())
+	body := b.String()
+	var out strings.Builder
+	writeHeader(&out, packageName, "stream.gen.go")
+	g.writeStreamImports(&out, streams, body)
+	out.WriteString(body)
+	return []byte(out.String())
 }
 
-func (g *GeneratorContext) writeStreamImports(b *strings.Builder, streams []streamInfo) {
+func (g *GeneratorContext) writeStreamImports(b *strings.Builder, streams []streamInfo, body string) {
 	needsContext := false
 	needsCodec := false
 	remoteModules := make(map[string]bool)
@@ -283,7 +286,11 @@ func (g *GeneratorContext) writeStreamImports(b *strings.Builder, streams []stre
 	if needsContext {
 		b.WriteString("\t\"context\"\n")
 	}
+	writeScalarTypeImports(b, body)
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
+	if generatedPackages(body).has("errors") {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/errors\"\n")
+	}
 	if needsCodec {
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
 	}
@@ -337,7 +344,7 @@ func writeRegisterStreams(b *strings.Builder, streams []streamInfo) {
 			writeTypedStreamRegistration(b, si, matcherName)
 		} else {
 			handlerName := "handleStream" + str.Capitalize(si.apiName)
-			fmt.Fprintf(b, "\trouter.HandleStreamNative(%q, func(ctx context.Context, params *api.StreamParams, identity any, stream *api.Stream) { %s(ctx, params, identity, stream, router, resolver) })\n", si.apiName, handlerName)
+			fmt.Fprintf(b, "\trouter.HandleStreamNative(%q, func(ctx context.Context, params *api.StreamParams, identity any, stream *api.Stream) error { return %s(ctx, params, identity, stream, router, resolver) })\n", si.apiName, handlerName)
 		}
 	}
 
@@ -352,13 +359,12 @@ func writeTypedStreamRegistration(b *strings.Builder, si streamInfo, matcherName
 	fmt.Fprintf(b, "\trouter.HandleStream(%q, nil)\n", si.apiName)
 	fmt.Fprintf(b, "\tevent.OnDecode[%s](bus, %q, %s, func(ctx context.Context, payload %s) error {\n", eventType, si.eventName, unmarshal, eventType)
 	if si.isNative {
-		fmt.Fprintf(b, "\t\trouter.Streams.DispatchPreparedEvent(%q, func(params *api.StreamParams, identity any) bool { return %s(payload, params, identity, resolver) }, func(mask []byte, binary bool) []byte {\n", si.apiName, matcherName)
+		fmt.Fprintf(b, "\t\treturn router.Streams.DispatchPreparedEvent(%q, func(params *api.StreamParams, identity any) bool { return %s(payload, params, identity, resolver) }, func(mask []byte, binary bool) ([]byte, error) {\n", si.apiName, matcherName)
 	} else {
-		fmt.Fprintf(b, "\t\trouter.Streams.DispatchPreparedEvent(%q, %s, func(mask []byte, binary bool) []byte {\n", si.apiName, preparedStreamMatcher(si, matcherName))
+		fmt.Fprintf(b, "\t\treturn router.Streams.DispatchPreparedEvent(%q, %s, func(mask []byte, binary bool) ([]byte, error) {\n", si.apiName, preparedStreamMatcher(si, matcherName))
 	}
 	writeStreamEncoderBody(b, si, payloadField, "\t\t\t")
 	b.WriteString("\t\t})\n")
-	b.WriteString("\t\treturn nil\n")
 	b.WriteString("\t})\n")
 }
 
@@ -370,7 +376,7 @@ func writeStreamEncoderBody(b *strings.Builder, si streamInfo, value, indent str
 	fmt.Fprintf(b, "%sif !binary {\n", indent)
 	fmt.Fprintf(b, "%s\treturn router.StreamPayloadJSON(%q, data)\n", indent, si.apiName)
 	fmt.Fprintf(b, "%s}\n", indent)
-	fmt.Fprintf(b, "%sreturn data\n", indent)
+	fmt.Fprintf(b, "%sreturn data, nil\n", indent)
 }
 
 func preparedStreamMatcher(si streamInfo, matcherName string) string {
@@ -424,22 +430,22 @@ func writeStreamPayloadEncoding(b *strings.Builder, si streamInfo, value, indent
 		if appendExpr, ok := binaryScalarAppend(ref.Name, "buf.B", "item", si.payloadEnum); ok {
 			fmt.Fprintf(b, "%sbuf.B = codec.AppendArrayHeader(buf.B, len(%s))\n", indent, value)
 			fmt.Fprintf(b, "%sfor _, item := range %s {\n", indent, value)
-			fmt.Fprintf(b, "%s\tbuf.B = %s\n", indent, appendExpr)
+			writeBinaryAppend(b, indent+"\t", "buf.B", appendExpr, "api.PutBuf(buf); return nil, err")
 			fmt.Fprintf(b, "%s}\n", indent)
 			return
 		}
 		if si.payloadKind == streamPayloadModel {
-			fmt.Fprintf(b, "%s%sWriteColumnar%sValues(buf, %s, mask)\n", indent, streamModulePrefix(si.payloadModule, si.sourceModule), ref.Name, value)
+			writeBinaryCall(b, indent, fmt.Sprintf("%sWriteColumnar%sValues(buf, %s, mask)", streamModulePrefix(si.payloadModule, si.sourceModule), ref.Name, value), "api.PutBuf(buf); return nil, err")
 			return
 		}
-		fmt.Fprintf(b, "%s%sWriteColumnar%s(buf, %s, mask)\n", indent, streamModulePrefix(si.payloadModule, si.sourceModule), ref.Name, value)
+		writeBinaryCall(b, indent, fmt.Sprintf("%sWriteColumnar%s(buf, %s, mask)", streamModulePrefix(si.payloadModule, si.sourceModule), ref.Name, value), "api.PutBuf(buf); return nil, err")
 		return
 	}
 	if appendExpr, ok := binaryScalarAppend(ref.Name, "buf.B", value, si.payloadEnum); ok {
-		fmt.Fprintf(b, "%sbuf.B = %s\n", indent, appendExpr)
+		writeBinaryAppend(b, indent, "buf.B", appendExpr, "api.PutBuf(buf); return nil, err")
 		return
 	}
-	fmt.Fprintf(b, "%s%s.WriteLuxo(buf, mask)\n", indent, value)
+	writeBinaryCall(b, indent, fmt.Sprintf("%s.WriteLuxo(buf, mask)", value), "api.PutBuf(buf); return nil, err")
 }
 
 func writeStreamResolverInterface(b *strings.Builder, streams []streamInfo) {
@@ -454,7 +460,7 @@ func writeStreamResolverInterface(b *strings.Builder, streams []streamInfo) {
 			fmt.Fprintf(b, "\tMatch%s(event %s, params *api.StreamParams, identity any) bool\n", str.Capitalize(si.apiName), eventType)
 			continue
 		}
-		fmt.Fprintf(b, "\tHandle%s(ctx context.Context, params *api.StreamParams, identity any, stream *api.TypedStream[%s])\n", str.Capitalize(si.apiName), streamReturnGoType(si))
+		fmt.Fprintf(b, "\tHandle%s(ctx context.Context, params *api.StreamParams, identity any, stream *api.TypedStream[%s]) error\n", str.Capitalize(si.apiName), streamReturnGoType(si))
 	}
 	b.WriteString("}\n\n")
 
@@ -487,12 +493,12 @@ func generateNativeStreamHandler(b *strings.Builder, si streamInfo) {
 	returnType := streamReturnGoType(si)
 
 	fmt.Fprintf(b, "// %s invokes resolver.%s on each subscription.\n", name, resolverMethod)
-	fmt.Fprintf(b, "func %s(ctx context.Context, params *api.StreamParams, identity any, stream *api.Stream, router *api.Router, resolver StreamResolver) {\n", name)
-	writeStreamAuthGuard(b, si, "\t", "return")
-	fmt.Fprintf(b, "\ttypedStream := api.NewTypedStream(stream, func(payload %s, mask []byte, binary bool) []byte {\n", returnType)
+	fmt.Fprintf(b, "func %s(ctx context.Context, params *api.StreamParams, identity any, stream *api.Stream, router *api.Router, resolver StreamResolver) error {\n", name)
+	writeStreamAuthGuard(b, si, "\t", "return errors.Unauthorized")
+	fmt.Fprintf(b, "\ttypedStream := api.NewTypedStream(stream, func(payload %s, mask []byte, binary bool) ([]byte, error) {\n", returnType)
 	writeStreamEncoderBody(b, si, "payload", "\t\t")
 	b.WriteString("\t})\n")
-	fmt.Fprintf(b, "\tresolver.%s(ctx, params, identity, typedStream)\n", resolverMethod)
+	fmt.Fprintf(b, "\treturn resolver.%s(ctx, params, identity, typedStream)\n", resolverMethod)
 	fmt.Fprintf(b, "}\n\n")
 }
 

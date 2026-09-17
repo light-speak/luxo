@@ -43,13 +43,13 @@ enum class TypeUsage {
     @SerialName("unused") UNUSED,
 }
 
-/** Paginated list response. */
+/** Paginated list response with full-width Luxo Int metadata. */
 @Serializable
 data class Page<T>(
     val items: List<T>,
-    val total: Int,
-    val page: Int,
-    val pageSize: Int,
+    val total: Long,
+    val page: Long,
+    val pageSize: Long,
 )
 
 /** Luxo schema definition (from introspection). */
@@ -65,6 +65,8 @@ data class LuxoSchema(
 data class LuxoEnum(
     val name: String,
     val values: List<String> = emptyList(),
+    val module: String = "",
+    val description: String = "",
 )
 
 @Serializable
@@ -72,6 +74,9 @@ data class LuxoTypeDecl(
     val name: String,
     val usage: TypeUsage? = null,
     val fields: List<LuxoField> = emptyList(),
+    val module: String = "",
+    val description: String = "",
+    val directives: List<String> = emptyList(),
 )
 
 @Serializable
@@ -79,7 +84,17 @@ data class LuxoModel(
     val name: String,
     val usage: TypeUsage? = null,
     val fields: List<LuxoField> = emptyList(),
+    val module: String = "",
+    val description: String = "",
+    val directives: List<String> = emptyList(),
 )
+
+@Serializable
+enum class RelationKind {
+    @SerialName("belongsTo") BELONGS_TO,
+    @SerialName("hasMany") HAS_MANY,
+    @SerialName("hasOne") HAS_ONE,
+}
 
 @Serializable
 data class LuxoField(
@@ -90,6 +105,16 @@ data class LuxoField(
     val nullable: Boolean = false,
     val isList: Boolean = false,
     val relation: Boolean = false,
+    val computed: Boolean = false,
+    val primaryKey: Boolean = false,
+    val description: String = "",
+    val directives: List<String> = emptyList(),
+    val relationKind: RelationKind? = null,
+    val localKey: String = "",
+    val remoteKey: String = "",
+    val targetModule: String = "",
+    val module: String = "",
+    val foreignKey: String = "",
 )
 
 @Serializable
@@ -103,6 +128,10 @@ data class LuxoAPI(
     val defaultPageSize: Int? = null,
     val stream: Boolean = false,
     val params: List<LuxoParam> = emptyList(),
+    val deprecated: Boolean = false,
+    val deprecatedReason: String = "",
+    val description: String = "",
+    val directives: List<String> = emptyList(),
 )
 
 @Serializable
@@ -115,4 +144,5 @@ data class LuxoParam(
     val isList: Boolean = false,
     val nullable: Boolean = false,
     val hasDefault: Boolean = false,
+    val description: String = "",
 )

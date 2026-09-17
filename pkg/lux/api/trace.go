@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/light-speak/luxo/pkg/lux"
@@ -102,6 +103,8 @@ type DebugTraceSnapshot struct {
 	Duration  time.Duration
 	Spans     []DebugSpan
 	Truncated bool
+	// EncodingFailed reports missing diagnostic data, not a business failure.
+	EncodingFailed bool
 }
 
 // DebugTraceSession collects opt-in request timings. Normal requests do not
@@ -112,6 +115,7 @@ type DebugTraceSession struct {
 	mu               sync.Mutex
 	spans            []DebugSpan
 	truncated        bool
+	encodingFailed   bool
 	nextSpanID       uint32
 	headSampled      bool
 	exposeHeaders    bool
@@ -371,11 +375,12 @@ func (s *DebugTraceSession) record(span DebugSpan) {
 
 // MergeSpan adds downstream spans beneath the local RPC call that produced them.
 func (s *DebugTraceSession) MergeSpan(call DebugSpanHandle, remote DebugTraceSnapshot) {
-	if s == nil || call.span.ID == 0 || len(remote.Spans) == 0 {
+	if s == nil || call.span.ID == 0 {
 		return
 	}
 	base := call.span.Start
 	s.mu.Lock()
+	s.encodingFailed = s.encodingFailed || remote.EncodingFailed
 	remapped := make(map[uint32]uint32, len(remote.Spans))
 	for _, span := range remote.Spans {
 		if len(s.spans) >= maxDebugTraceSpans {
@@ -410,6 +415,7 @@ func (s *DebugTraceSession) Snapshot() DebugTraceSnapshot {
 	s.mu.Lock()
 	spans := append([]DebugSpan(nil), s.spans...)
 	truncated := s.truncated
+	encodingFailed := s.encodingFailed
 	s.mu.Unlock()
 	sort.SliceStable(spans, func(i, j int) bool {
 		if spans[i].Start == spans[j].Start {
@@ -417,91 +423,12 @@ func (s *DebugTraceSession) Snapshot() DebugTraceSnapshot {
 		}
 		return spans[i].Start < spans[j].Start
 	})
-	return DebugTraceSnapshot{TraceID: s.traceID, Duration: time.Since(s.started), Spans: spans, Truncated: truncated}
-}
-
-// EncodeDebugTrace encodes a trace without reflection or JSON serialization.
-func EncodeDebugTrace(snapshot DebugTraceSnapshot) []byte {
-	spans := make([][]byte, len(snapshot.Spans))
-	for i := range snapshot.Spans {
-		spans[i] = encodeDebugSpan(snapshot.Spans[i])
-	}
-	var enc codec.Encoder
-	enc.WriteFieldString(1, snapshot.TraceID)
-	enc.WriteFieldInt(2, int64(snapshot.Duration))
-	enc.WriteFieldBytesArray(3, spans)
-	if snapshot.Truncated {
-		enc.WriteFieldBool(4, true)
-	}
-	enc.WriteEnd()
-	return append([]byte{3}, enc.Bytes()...)
-}
-
-func encodeDebugSpan(span DebugSpan) []byte {
-	var enc codec.Encoder
-	enc.WriteFieldString(1, span.Name)
-	enc.WriteFieldString(2, span.Category)
-	if span.Service != "" {
-		enc.WriteFieldString(3, span.Service)
-	}
-	if span.Operation != "" {
-		enc.WriteFieldString(4, span.Operation)
-	}
-	if span.Field != "" {
-		enc.WriteFieldString(5, span.Field)
-	}
-	enc.WriteFieldInt(6, int64(span.Start))
-	enc.WriteFieldInt(7, int64(span.Duration))
-	enc.WriteFieldInt(8, int64(span.ID))
-	if span.ParentID != 0 {
-		enc.WriteFieldInt(9, int64(span.ParentID))
-	}
-	if span.FieldPath != "" {
-		enc.WriteFieldString(10, span.FieldPath)
-	}
-	if span.Dependency != "" {
-		enc.WriteFieldString(11, string(span.Dependency))
-	}
-	if span.Selection != "" {
-		enc.WriteFieldString(12, span.Selection)
-	}
-	if span.DatabaseBackend != "" {
-		enc.WriteFieldString(13, span.DatabaseBackend)
-	}
-	if span.DatabaseName != "" {
-		enc.WriteFieldString(14, span.DatabaseName)
-	}
-	if span.DatabaseOperation != "" {
-		enc.WriteFieldString(15, span.DatabaseOperation)
-	}
-	if span.DatabaseResource != "" {
-		enc.WriteFieldString(16, span.DatabaseResource)
-	}
-	if span.Statement != "" {
-		enc.WriteFieldString(17, span.Statement)
-	}
-	if span.Fingerprint != "" {
-		enc.WriteFieldString(18, span.Fingerprint)
-	}
-	if span.ArgumentCount != 0 {
-		enc.WriteFieldInt(19, int64(span.ArgumentCount))
-	}
-	if span.RowsKnown {
-		enc.WriteFieldInt(20, span.RowsAffected)
-	}
-	if span.ErrorCode != "" {
-		enc.WriteFieldString(21, span.ErrorCode)
-	}
-	if span.StatementTruncated {
-		enc.WriteFieldBool(22, true)
-	}
-	enc.WriteEnd()
-	return append([]byte(nil), enc.Bytes()...)
+	return DebugTraceSnapshot{TraceID: s.traceID, Duration: time.Since(s.started), Spans: spans, Truncated: truncated, EncodingFailed: encodingFailed}
 }
 
 // DecodeDebugTrace decodes the versioned Luxo trace envelope.
 func DecodeDebugTrace(data []byte) (DebugTraceSnapshot, error) {
-	if len(data) < 2 || (data[0] != 1 && data[0] != 2 && data[0] != 3) {
+	if len(data) < 2 || data[0] < 1 || data[0] > debugTraceVersion {
 		return DebugTraceSnapshot{}, fmt.Errorf("invalid debug trace envelope")
 	}
 	version := data[0]
@@ -518,6 +445,11 @@ func DecodeDebugTrace(data []byte) (DebugTraceSnapshot, error) {
 			spanData = dec.ReadBytesArray()
 		case 4:
 			snapshot.Truncated = dec.ReadBool()
+		case 5:
+			if version < debugTraceVersion {
+				return DebugTraceSnapshot{}, fmt.Errorf("debug trace failure marker requires version %d", debugTraceVersion)
+			}
+			snapshot.EncodingFailed = dec.ReadBool()
 		default:
 			return DebugTraceSnapshot{}, fmt.Errorf("unknown debug trace field %d", dec.FieldID())
 		}
@@ -525,7 +457,7 @@ func DecodeDebugTrace(data []byte) (DebugTraceSnapshot, error) {
 	if err := finishDebugDecode(dec, len(data)-1); err != nil {
 		return DebugTraceSnapshot{}, err
 	}
-	if snapshot.TraceID == "" || snapshot.Duration < 0 {
+	if (snapshot.TraceID == "" && !snapshot.EncodingFailed) || snapshot.Duration < 0 {
 		return DebugTraceSnapshot{}, fmt.Errorf("invalid debug trace metadata")
 	}
 	snapshot.Spans = make([]DebugSpan, len(spanData))
@@ -581,7 +513,7 @@ func decodeDebugSpan(data []byte) (DebugSpan, error) {
 	if err := finishDebugDecode(dec, len(data)); err != nil {
 		return DebugSpan{}, err
 	}
-	if span.Name == "" || span.Category == "" || span.Start < 0 || span.Duration < 0 {
+	if !validDebugSpan(&span) {
 		return DebugSpan{}, fmt.Errorf("invalid debug span metadata")
 	}
 	if span.FieldPath == "" {
@@ -627,8 +559,12 @@ func finishDebugDecode(dec *codec.Decoder, size int) error {
 }
 
 // EncodeDebugTraceHeader returns a base64url value safe for HTTP headers.
-func EncodeDebugTraceHeader(snapshot DebugTraceSnapshot) string {
-	return base64.RawURLEncoding.EncodeToString(EncodeDebugTrace(snapshot))
+func EncodeDebugTraceHeader(snapshot DebugTraceSnapshot) (string, error) {
+	data, err := EncodeDebugTrace(snapshot)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(data), nil
 }
 
 // DecodeDebugTraceHeader decodes a trace response header.
@@ -644,13 +580,16 @@ func DecodeDebugTraceHeader(value string) (DebugTraceSnapshot, error) {
 // binary trace in the response body for Studio's explicitly traced requests.
 // Version 2 puts a fixed-size footer after the trace so servers can stream the
 // business body without buffering or copying it first.
-func EncodeDebugResponseEnvelope(body []byte, snapshot DebugTraceSnapshot) []byte {
-	trace := EncodeDebugTrace(snapshot)
+func EncodeDebugResponseEnvelope(body []byte, snapshot DebugTraceSnapshot) ([]byte, error) {
+	trace, err := EncodeDebugTrace(snapshot)
+	if err != nil {
+		return nil, err
+	}
 	result := make([]byte, 1, 1+len(body)+len(trace)+debugResponseEnvelopeFooterSize)
 	result[0] = debugResponseEnvelopeVersion
 	result = append(result, body...)
 	result = append(result, trace...)
-	return appendDebugResponseFooter(result, len(trace))
+	return appendDebugResponseFooter(result, len(trace)), nil
 }
 
 // DecodeDebugResponseEnvelope restores a response body and detailed trace.
@@ -719,9 +658,11 @@ func writeDebugTraceHeaders(header http.Header, trace *DebugTraceSession) {
 	}
 	snapshot := trace.Snapshot()
 	if !trace.responseEnvelope {
-		header.Set(DebugTraceResponseHeader, EncodeDebugTraceHeader(snapshot))
+		header.Set(DebugTraceResponseHeader, base64.RawURLEncoding.EncodeToString(EncodeDebugTraceResult(snapshot)))
 	}
-	header.Set("Server-Timing", serverTimingValue(snapshot.Spans))
+	if timing := serverTimingValue(snapshot.Spans); validServerTiming(timing) {
+		header.Set("Server-Timing", timing)
+	}
 }
 
 type debugResponseWriter struct {
@@ -765,7 +706,7 @@ func (w *debugResponseWriter) flush(trace *DebugTraceSession) {
 	if w.writeErr != nil {
 		return
 	}
-	encodedTrace := EncodeDebugTrace(trace.Snapshot())
+	encodedTrace := EncodeDebugTraceResult(trace.Snapshot())
 	if _, err := w.target.Write(encodedTrace); err != nil {
 		return
 	}
@@ -778,6 +719,18 @@ func (w *debugResponseWriter) prepareHeader() {
 	header.Del(DebugTraceResponseHeader)
 	header.Set(DebugTraceEnvelopeHeader, "true")
 	header.Set("Content-Type", "application/x-luxo-debug")
+}
+
+func validServerTiming(value string) bool {
+	if !utf8.ValidString(value) {
+		return false
+	}
+	for i := range value {
+		if (value[i] < ' ' && value[i] != '\t') || value[i] == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func serverTimingValue(spans []DebugSpan) string {
@@ -795,77 +748,4 @@ func serverTimingValue(spans []DebugSpan) string {
 		b.WriteByte('"')
 	}
 	return b.String()
-}
-
-// DebugTraceJSON formats spans for Studio persistence without reflection.
-func DebugTraceJSON(snapshot DebugTraceSnapshot) string {
-	buf := make([]byte, 0, len(snapshot.Spans)*128)
-	buf = append(buf, '[')
-	for i := range snapshot.Spans {
-		if i > 0 {
-			buf = append(buf, ',')
-		}
-		span := &snapshot.Spans[i]
-		buf = append(buf, '{')
-		buf = append(buf, `"id":`...)
-		buf = strconv.AppendUint(buf, uint64(span.ID), 10)
-		buf = append(buf, `,"parentId":`...)
-		buf = strconv.AppendUint(buf, uint64(span.ParentID), 10)
-		buf = appendDebugJSONString(buf, "name", span.Name, true)
-		buf = appendDebugJSONString(buf, "category", span.Category, true)
-		buf = appendDebugJSONString(buf, "service", span.Service, true)
-		buf = appendDebugJSONString(buf, "operation", span.Operation, true)
-		buf = appendDebugJSONString(buf, "field", span.Field, true)
-		buf = appendDebugJSONString(buf, "fieldPath", span.FieldPath, true)
-		buf = appendDebugJSONString(buf, "selection", span.Selection, true)
-		buf = appendDebugJSONString(buf, "dependency", string(span.Dependency), true)
-		if span.DatabaseBackend != "" {
-			buf = appendDebugJSONString(buf, "databaseBackend", span.DatabaseBackend, true)
-		}
-		if span.DatabaseName != "" {
-			buf = appendDebugJSONString(buf, "databaseName", span.DatabaseName, true)
-		}
-		if span.DatabaseOperation != "" {
-			buf = appendDebugJSONString(buf, "databaseOperation", span.DatabaseOperation, true)
-		}
-		if span.DatabaseResource != "" {
-			buf = appendDebugJSONString(buf, "databaseResource", span.DatabaseResource, true)
-		}
-		if span.Statement != "" {
-			buf = appendDebugJSONString(buf, "statement", span.Statement, true)
-		}
-		if span.Fingerprint != "" {
-			buf = appendDebugJSONString(buf, "fingerprint", span.Fingerprint, true)
-		}
-		if span.ArgumentCount != 0 {
-			buf = append(buf, `,"argumentCount":`...)
-			buf = strconv.AppendInt(buf, int64(span.ArgumentCount), 10)
-		}
-		if span.RowsKnown {
-			buf = append(buf, `,"rowsAffected":`...)
-			buf = strconv.AppendInt(buf, span.RowsAffected, 10)
-		}
-		if span.ErrorCode != "" {
-			buf = appendDebugJSONString(buf, "errorCode", span.ErrorCode, true)
-		}
-		if span.StatementTruncated {
-			buf = append(buf, `,"statementTruncated":true`...)
-		}
-		buf = append(buf, `,"start":`...)
-		buf = strconv.AppendFloat(buf, float64(span.Start)/float64(time.Millisecond), 'f', -1, 64)
-		buf = append(buf, `,"duration":`...)
-		buf = strconv.AppendFloat(buf, float64(span.Duration)/float64(time.Millisecond), 'f', -1, 64)
-		buf = append(buf, '}')
-	}
-	buf = append(buf, ']')
-	return string(buf)
-}
-
-func appendDebugJSONString(buf []byte, name, value string, comma bool) []byte {
-	if comma {
-		buf = append(buf, ',')
-	}
-	buf = strconv.AppendQuote(buf, name)
-	buf = append(buf, ':')
-	return strconv.AppendQuote(buf, value)
 }

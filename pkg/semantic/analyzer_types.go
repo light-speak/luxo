@@ -35,9 +35,16 @@ func (a *Analyzer) resolveFields(file *ast.File) {
 	a.resolveInterfaceFields(file)
 	a.resolveTypeFields(file)
 	a.resolveEventTypes(file)
+	a.resolveErrorTypes(file)
 	a.resolveApiTypes(file)
 	a.resolveFnTypes(file)
 	a.resolveExtendFields(file)
+}
+
+func (a *Analyzer) resolveErrorTypes(file *ast.File) {
+	for _, declaration := range file.Errors {
+		a.validateCallableParameters("error", declaration.Name, declaration.Fields)
+	}
 }
 
 func (a *Analyzer) resolveEventTypes(file *ast.File) {

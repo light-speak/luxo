@@ -1,10 +1,11 @@
 package com.luxo.client
 
 import java.io.File
+import java.io.IOException
 import kotlinx.serialization.json.Json
-import org.jetbrains.kotlin.cli.common.messages.MessageCollector
+import org.jetbrains.kotlin.cli.create
 import org.jetbrains.kotlin.cli.jvm.compiler.EnvironmentConfigFiles
-import org.jetbrains.kotlin.cli.jvm.compiler.KotlinCoreEnvironment
+import org.jetbrains.kotlin.cli.pipeline.jvm.JvmFrontendPipelinePhase
 import org.jetbrains.kotlin.com.intellij.openapi.util.Disposer
 import org.jetbrains.kotlin.com.intellij.psi.PsiElement
 import org.jetbrains.kotlin.com.intellij.psi.PsiErrorElement
@@ -37,7 +38,7 @@ object SelectAnalyzer {
         val sources = root.walkTopDown()
             .filter { it.isFile && it.extension == "kt" }
             .filterNot { it.hasExcludedPathSegment(root) }
-            .map { it.readText() }
+            .map { it.readAnalysisText() }
         writeHints(outFile, packageName, analyzeSources(sources, schema))
     }
 
@@ -212,25 +213,25 @@ object SelectAnalyzer {
     }
 }
 
-@OptIn(org.jetbrains.kotlin.K1Deprecation::class, CompilerConfiguration.Internals::class)
 private class KotlinSyntaxParser : AutoCloseable {
     private val disposable = Disposer.newDisposable("luxo-select-analyzer")
-    private val environment: KotlinCoreEnvironment
-
-    init {
-        val configuration = CompilerConfiguration().apply {
+    private val environment = try {
+        val configuration = CompilerConfiguration.create().apply {
             put(CommonConfigurationKeys.MODULE_NAME, "luxo-select-analyzer")
-            put(CommonConfigurationKeys.MESSAGE_COLLECTOR_KEY, MessageCollector.NONE)
         }
-        environment = KotlinCoreEnvironment.createForProduction(
-            disposable,
+        JvmFrontendPipelinePhase.createProjectEnvironment(
             configuration,
+            disposable,
             EnvironmentConfigFiles.JVM_CONFIG_FILES,
         )
+    } catch (error: Throwable) {
+        Disposer.dispose(disposable)
+        throw error
     }
+    private val factory = KtPsiFactory(environment.project, false)
 
     fun parse(fileName: String, source: String): KtFile =
-        KtPsiFactory(environment.project, false).createFile(fileName, source)
+        factory.createFile(fileName, source)
 
     override fun close() {
         Disposer.dispose(disposable)
@@ -262,6 +263,14 @@ private fun KtLambdaExpression.bindsParameter(name: String): Boolean =
 private fun File.hasExcludedPathSegment(root: File): Boolean {
     val relative = relativeToOrNull(root)?.invariantSeparatorsPath ?: return true
     return relative.split('/').any { it == "generated" || it == "test" }
+}
+
+/** Source text keeps every code point; only JSON documents allow a leading BOM. */
+private fun File.readAnalysisText(jsonDocument: Boolean = false): String = try {
+    val bytes = readBytes()
+    if (jsonDocument) decodeJSONDocumentText(bytes) else bytes.decodeToString(throwOnInvalidSequence = true)
+} catch (error: IOException) {
+    throw IllegalArgumentException("cannot read UTF-8 input $path: ${error.message}", error)
 }
 
 private fun qualifiedCallValue(call: KtCallExpression): KtExpression {
@@ -298,7 +307,7 @@ object SelectAnalyzerCli {
         require(schemaFile.isFile) {
             "schema file not found: ${schemaFile.path}; run luxoGenerate first or set -Pluxo.schemaFile"
         }
-        val schema = Json.decodeFromString<LuxoSchema>(schemaFile.readText())
+        val schema = Json.decodeFromString<LuxoSchema>(requireJSONUnicode(schemaFile.readAnalysisText(jsonDocument = true)))
         SelectAnalyzer.analyze(args[0], args[1], args[2], schema)
     }
 }

@@ -1,11 +1,11 @@
 plugins {
-    kotlin("jvm") version "2.4.10"
+    alias(libs.plugins.kotlin.jvm)
     `java-gradle-plugin`
     `maven-publish`
 }
 
-group = "com.luxo"
-version = "0.1.0"
+group = rootProject.group
+version = rootProject.version
 
 repositories {
     mavenCentral()
@@ -19,6 +19,14 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+}
+
+val toolingVersions = mapOf("kotlinVersion" to libs.versions.kotlin.get(), "luxoVersion" to version.toString())
+tasks.processResources {
+    inputs.properties(toolingVersions)
+    filesMatching("com/luxo/gradle/tooling.properties") {
+        expand(toolingVersions)
+    }
 }
 
 gradlePlugin {

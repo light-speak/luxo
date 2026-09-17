@@ -1,0 +1,161 @@
+import 'dart:typed_data';
+
+import 'package:luxo_client/luxo_client.dart';
+
+import '../../benchmark/uint64_benchmark.dart' show compareBenchmarks;
+import 'types.dart' as current;
+import 'types_before.dart' as previous;
+import 'client.dart' as current;
+import 'client_before.dart' as previous;
+
+const _iterations = 1000;
+Object? _sink;
+
+Future<void> main() async {
+  final cases = <String, String>{
+    'first': '{"id":42}',
+    'last': '{"createdAt":"2026-09-17T00:00:00Z"}',
+    'null': '{"optional":null}',
+    'mixed': '{"id":9223372036854775807,"duration":42,"values":[1,2],"optional":null}',
+  };
+  for (final entry in cases.entries) {
+    final row = decodeLuxoJSON(entry.value) as Map<String, dynamic>;
+    _compare(
+      'single ${entry.key}',
+      () => previous.Numbers.fromJson(row),
+      () => current.Numbers.fromJson(row),
+    );
+    for (final count in [1, 128]) {
+      final rows = List<Object?>.filled(count, row);
+      _compare(
+        'list $count ${entry.key}',
+        () => rows
+            .map((e) => previous.Numbers.fromJson(e as Map<String, dynamic>))
+            .toList(),
+        () => rows
+            .map(
+              (e) => current.Numbers.$fromJsonItem(e as Map<String, dynamic>),
+            )
+            .toList(),
+      );
+    }
+  }
+  for (final count in [1, 128]) {
+    final row = decodeLuxoJSON(
+      encodeLuxoJSON({
+        'children': List.filled(count, {'label': null}),
+      }),
+    ) as Map<String, dynamic>;
+    _compare(
+      'nested $count',
+      () => previous.Projection.fromJson(row),
+      () => current.Projection.fromJson(row),
+    );
+    final rows = decodeLuxoJSON(
+      encodeLuxoJSON(List.filled(count, {'metadata': false})),
+    ) as List;
+    _compare(
+      'stream $count',
+      await _dispatch(false, rows),
+      await _dispatch(true, rows),
+    );
+    final page = <String, dynamic>{
+      'items': rows,
+      'total': count,
+      'page': 1,
+      'pageSize': count,
+    };
+    _compare(
+      'page $count',
+      () => Page.fromJson(page, previous.Payload.fromJson).items,
+      () => Page.fromJson(page, current.Payload.$fromJsonItem).items,
+    );
+  }
+  final enc = LuxoEncoder()
+    ..writeVarint(0)
+    ..writeFieldInt(1, LuxoInt64.fromInt(42))
+    ..writeEnd();
+  final row = Uint8List.fromList(enc.bytes());
+  _compare(
+    'binary row control',
+    () => previous.decodeNumbers(LuxoDecoder(row)),
+    () => current.decodeNumbers(LuxoDecoder(row)),
+  );
+  print(
+    'sink present: ${_sink != null}; decode only; allocations not measured',
+  );
+}
+
+void _compare(
+  String name,
+  Object? Function() before,
+  Object? Function() after,
+) {
+  if (encodeLuxoJSON(before()) != encodeLuxoJSON(after()))
+    throw StateError('$name changed values');
+  compareBenchmarks(
+    name,
+    () => _batch(before),
+    () => _batch(after),
+    iterations: _iterations,
+    includeRange: true,
+  );
+}
+
+int _batch(Object? Function() operation) {
+  for (var index = 0; index < _iterations; index++) {
+    _sink = operation();
+  }
+  return _sink == null ? 0 : 1;
+}
+
+Future<Object? Function()> _dispatch(bool after, List rows) async {
+  final transport = _Transport();
+  Object? result;
+  void receive(Object? value) {
+    result = value;
+  }
+
+  if (after) {
+    await current.LuxoClient(transport)
+        .subscribeWatchPayloadList(onData: receive);
+  } else {
+    await previous.LuxoClient(transport)
+        .subscribeWatchPayloadList(onData: receive);
+  }
+  return () {
+    transport.emit!(rows);
+    return result;
+  };
+}
+
+class _Transport extends Transport {
+  void Function(Object?)? emit;
+  @override
+  Future<T> call<T>(
+    String api, {
+    Map<String, dynamic>? params,
+    T Function(dynamic)? decoder,
+  }) async => throw StateError('Unexpected call');
+  @override
+  Future<void Function()> subscribe<T>(
+    String api,
+    Map<String, dynamic> params,
+    void Function(T) onData, {
+    required T Function(Object?) decoder,
+    void Function(LuxoError)? onError,
+    void Function()? onDone,
+  }) async {
+    emit = (value) => onData(decoder(value));
+    return () {};
+  }
+
+  @override
+  void setSchema(Map<String, APISchemaEntry> schema) {}
+  @override
+  void setMode(TransportMode mode) {}
+  @override
+  void setToken(String token) {}
+  @override
+  void close() {}
+}

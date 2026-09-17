@@ -351,7 +351,6 @@ func (g *GeneratorContext) generateDataLoaderFile(result *semantic.Result, packa
 	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/dataloader\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
-	fmt.Fprintf(&b, "\tpg %q\n", g.driver.DriverImport())
 	if needsUUID {
 		b.WriteString("\t\"github.com/google/uuid\"\n")
 	}
@@ -648,7 +647,7 @@ func (g *GeneratorContext) generateFKLoadBatchFunc(b *strings.Builder, lc loadCa
 			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewTimeField(\"deleted_at\").IsNull())\n")
 		}
 		fmt.Fprintf(b, "\t\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", tableName)
-		fmt.Fprintf(b, "\t\t\trows, err := %s.QueryRows(ctx, app.DB, %s, query, args...)\n", g.dbPkg, scanFn)
+		fmt.Fprintf(b, "\t\t\trows, err := app.DB.QueryRows(ctx, %s, query, args...)\n", scanFn)
 		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
 		fmt.Fprintf(b, "\t\t\tresult := make(map[%s][]*%s, len(keys))\n", keyType, lc.modelName)
 		fmt.Fprintf(b, "\t\t\tfor _, row := range rows {\n")
@@ -672,7 +671,7 @@ func (g *GeneratorContext) generateFKLoadBatchFunc(b *strings.Builder, lc loadCa
 		}
 
 		fmt.Fprintf(b, "\t\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", tableName)
-		fmt.Fprintf(b, "\t\t\trows, err := %s.QueryRows(ctx, app.DB, %s, query, args...)\n", g.dbPkg, scanFn)
+		fmt.Fprintf(b, "\t\t\trows, err := app.DB.QueryRows(ctx, %s, query, args...)\n", scanFn)
 		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
 
 		// Group by composite key
@@ -896,7 +895,7 @@ func (g *GeneratorContext) generateExtendByPKBatchFunc(b *strings.Builder, model
 	fmt.Fprintf(b, "\t\t\tfields = ensureField(fields, %q)\n", idColumn)
 	fmt.Fprintf(b, "\t\t\tconds := []lux.Condition{lux.New%s(%q).In(keys...)}\n", goTypeToCondField(keyType), idColumn)
 	fmt.Fprintf(b, "\t\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", tableName)
-	fmt.Fprintf(b, "\t\t\trows, err := %s.QueryRows(ctx, app.DB, %s, query, args...)\n", g.dbPkg, scanFn)
+	fmt.Fprintf(b, "\t\t\trows, err := app.DB.QueryRows(ctx, %s, query, args...)\n", scanFn)
 	fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
 	fmt.Fprintf(b, "\t\t\tresult := make(map[%s]*%s, len(keys))\n", keyType, modelName)
 	fmt.Fprintf(b, "\t\t\tfor _, row := range rows {\n")
@@ -909,7 +908,7 @@ func (g *GeneratorContext) generateExtendByPKBatchFunc(b *strings.Builder, model
 func generateRemoteKeyEncoding(b *strings.Builder, typeName string) {
 	switch typeName {
 	case "String":
-		b.WriteString("\t\t\tenc.WriteFieldStringArray(1, keys)\n")
+		writeBinaryCall(b, "\t\t\t", "enc.WriteFieldStringArray(1, keys)", "return nil, err")
 	case "UUID":
 		b.WriteString("\t\t\trawKeys := make([][16]byte, len(keys))\n")
 		b.WriteString("\t\t\tfor i, key := range keys { rawKeys[i] = [16]byte(key) }\n")
@@ -922,7 +921,7 @@ func generateRemoteKeyEncoding(b *strings.Builder, typeName string) {
 func generateRemoteArrayEncoding(b *strings.Builder, fieldID int, typeName, keysName string) {
 	switch typeName {
 	case "String":
-		fmt.Fprintf(b, "\t\t\tenc.WriteFieldStringArray(%d, %s)\n", fieldID, keysName)
+		writeBinaryCall(b, "\t\t\t", fmt.Sprintf("enc.WriteFieldStringArray(%d, %s)", fieldID, keysName), "return nil, err")
 	case "UUID":
 		rawName := keysName + "Raw"
 		fmt.Fprintf(b, "\t\t\t%s := make([][16]byte, len(%s))\n", rawName, keysName)
@@ -1011,7 +1010,7 @@ func (g *GeneratorContext) remoteModelModule(modelName string) string {
 }
 
 // generateBatchFunc generates an inline batch function for a relation.
-// Uses raw pg.QueryRows with the module's scan function — no cross-module Client dependency.
+// Uses DB.QueryRows with the module's scan function — no cross-module Client dependency.
 func (g *GeneratorContext) generateBatchFunc(b *strings.Builder, modelName string, rel Relation, softTarget bool) {
 	targetTable := str.ToSnakeCase(rel.TargetName) + "s"
 	remoteCol := str.ToSnakeCase(rel.RemoteKey)
@@ -1029,7 +1028,7 @@ func (g *GeneratorContext) generateBatchFunc(b *strings.Builder, modelName strin
 			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewTimeField(\"deleted_at\").IsNull())\n")
 		}
 		fmt.Fprintf(b, "\t\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", targetTable)
-		fmt.Fprintf(b, "\t\t\trows, err := pg.QueryRows(ctx, app.DB, %s, query, args...)\n", scanFn)
+		fmt.Fprintf(b, "\t\t\trows, err := app.DB.QueryRows(ctx, %s, query, args...)\n", scanFn)
 		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
 		fmt.Fprintf(b, "\t\t\tresult := make(map[%s][]%s, len(keys))\n", keyType, rel.TargetName)
 		fmt.Fprintf(b, "\t\t\tfor _, row := range rows {\n")
@@ -1047,7 +1046,7 @@ func (g *GeneratorContext) generateBatchFunc(b *strings.Builder, modelName strin
 			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewTimeField(\"deleted_at\").IsNull())\n")
 		}
 		fmt.Fprintf(b, "\t\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", targetTable)
-		fmt.Fprintf(b, "\t\t\trows, err := pg.QueryRows(ctx, app.DB, %s, query, args...)\n", scanFn)
+		fmt.Fprintf(b, "\t\t\trows, err := app.DB.QueryRows(ctx, %s, query, args...)\n", scanFn)
 		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
 		fmt.Fprintf(b, "\t\t\tresult := make(map[%s]*%s, len(keys))\n", keyType, rel.TargetName)
 		fmt.Fprintf(b, "\t\t\tfor _, row := range rows {\n")

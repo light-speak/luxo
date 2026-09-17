@@ -1,9 +1,14 @@
 package luvia
 
 import (
+	"bytes"
+	"encoding/binary"
+	"math"
 	"reflect"
 	"testing"
+	"time"
 
+	"github.com/light-speak/luxo/internal/testutil"
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/schema"
 )
@@ -133,7 +138,7 @@ func TestExtractID(t *testing.T) {
 	buf = codec.AppendVarint(buf, 1) // field 1
 	buf = codec.AppendSvarint(buf, 42)
 	buf = codec.AppendVarint(buf, 2) // field 2
-	buf = codec.AppendString(buf, "Alice")
+	buf = codec.AppendBytes(buf, []byte("Alice"))
 	buf = append(buf, 0x00)
 
 	fieldTypes := map[int]codec.FieldSkipType{
@@ -180,6 +185,44 @@ func TestExtractPrimaryKeysPreservesStringWireEncoding(t *testing.T) {
 	}
 }
 
+func TestExtractPrimaryKeysValidatesDateTimePairs(t *testing.T) {
+	for _, nullable := range []bool{false, true} {
+		registry := schema.New()
+		model := &schema.Model{Name: "Scheduled", Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt, PrimaryKey: true},
+			{ID: 2, Name: "at", Type: schema.FieldDateTime, Nullable: nullable},
+		}}
+		registry.RegisterModel(model)
+		for _, keyFirst := range []bool{false, true} {
+			valid := testutil.Bytes(t)(codec.AppendDateTime(nil, time.Unix(-1, 999999999).UTC()))
+			for index, date := range [][]byte{valid, {0, 128}, codec.AppendVarint([]byte{0}, 1_000_000_000)} {
+				field := []byte{2}
+				if nullable {
+					field = append(field, 1)
+				}
+				field = append(field, date...)
+				row := []byte{0}
+				if keyFirst {
+					row = append(row, 1, 84)
+				}
+				row = append(row, field...)
+				if !keyFirst {
+					row = append(row, 1, 84)
+				}
+				row = append(row, 0)
+				keys, ok := ExtractPrimaryKeys(row, model.PrimaryKeyField(), model, registry)
+				if ok != (index == 0) || (ok && keys.Len() != 1) {
+					t.Fatalf("row nullable=%v keyFirst=%v date=%x: valid=%v", nullable, keyFirst, date, ok)
+				}
+				keys, ok = ExtractPrimaryKeyColumn(append([]byte{1}, row...), model.PrimaryKeyField(), model)
+				if ok != (index == 0) || (ok && keys.Len() != 1) {
+					t.Fatalf("column nullable=%v keyFirst=%v date=%x: valid=%v", nullable, keyFirst, date, ok)
+				}
+			}
+		}
+	}
+}
+
 func TestExtractPrimaryKeysSkipsListsAndNestedModels(t *testing.T) {
 	child := &schema.Model{Name: "Child", Fields: []schema.Field{{ID: 1, Name: "name", Type: schema.FieldString}}}
 	parent := &schema.Model{Name: "Parent", Fields: []schema.Field{
@@ -194,15 +237,13 @@ func TestExtractPrimaryKeysSkipsListsAndNestedModels(t *testing.T) {
 	primary = codec.AppendVarint(primary, 0)
 	primary = codec.AppendVarint(primary, 2)
 	primary = codec.AppendVarint(primary, 2)
-	primary = codec.AppendString(primary, "a")
-	primary = codec.AppendString(primary, "b")
+	primary = codec.AppendBytes(primary, []byte("a"))
+	primary = codec.AppendBytes(primary, []byte("b"))
 	primary = codec.AppendVarint(primary, 3)
-	primary = codec.AppendVarint(primary, 1)
-	primary = codec.AppendVarint(primary, 1)
-	primary = codec.AppendString(primary, "x")
-	primary = append(primary, 0)
+	childRow := codec.AppendBytes([]byte{1, 1}, []byte("x"))
+	primary = codec.AppendBytes(primary, append(childRow, 0))
 	primary = codec.AppendVarint(primary, 7)
-	primary = codec.AppendString(primary, "parent-key")
+	primary = codec.AppendBytes(primary, []byte("parent-key"))
 	primary = append(primary, 0)
 
 	keys, ok := ExtractPrimaryKeys(primary, parent.PrimaryKeyField(), parent, s)
@@ -229,7 +270,7 @@ func TestExtractPrimaryKeyColumnPreservesUUIDWireEncoding(t *testing.T) {
 	s := schema.New()
 	s.RegisterModel(model)
 
-	keys, ok := ExtractPrimaryKeyColumn(writer.Bytes(), model.FieldByID(7), model)
+	keys, ok := ExtractPrimaryKeyColumn(testutil.Bytes(t)(writer.Bytes()), model.FieldByID(7), model)
 	if !ok || keys.Len() != 2 {
 		t.Fatalf("ExtractPrimaryKeyColumn() = %#v, %v", keys, ok)
 	}
@@ -247,8 +288,8 @@ func TestExtractPrimaryKeyColumnPreservesUUIDWireEncoding(t *testing.T) {
 func TestExtractPrimaryKeyColumnSkipsScalarListColumn(t *testing.T) {
 	var listCell []byte
 	listCell = codec.AppendVarint(listCell, 2)
-	listCell = codec.AppendString(listCell, "a")
-	listCell = codec.AppendString(listCell, "b")
+	listCell = codec.AppendBytes(listCell, []byte("a"))
+	listCell = codec.AppendBytes(listCell, []byte("b"))
 	var writer codec.ColumnarWriter
 	writer.SetCount(1)
 	writer.WriteColumnBytes(2, [][]byte{listCell})
@@ -260,7 +301,7 @@ func TestExtractPrimaryKeyColumnSkipsScalarListColumn(t *testing.T) {
 	s := schema.New()
 	s.RegisterModel(model)
 
-	keys, ok := ExtractPrimaryKeyColumn(writer.Bytes(), model.PrimaryKeyField(), model)
+	keys, ok := ExtractPrimaryKeyColumn(testutil.Bytes(t)(writer.Bytes()), model.PrimaryKeyField(), model)
 	if !ok || keys.Len() != 1 {
 		t.Fatalf("keys = %#v, ok %v", keys, ok)
 	}
@@ -274,7 +315,7 @@ func TestExtractIDColumn(t *testing.T) {
 	w.SetCount(3)
 	w.WriteColumnInt(1, []int64{10, 20, 30})
 	w.WriteColumnString(2, []string{"a", "b", "c"})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	s := schema.New()
 	s.RegisterModel(&schema.Model{
@@ -300,7 +341,7 @@ func TestExtractIDColumn_NotFirstColumn(t *testing.T) {
 	w.SetCount(2)
 	w.WriteColumnString(2, []string{"x", "y"}) // name first
 	w.WriteColumnInt(1, []int64{100, 200})     // id second
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	s := schema.New()
 	s.RegisterModel(&schema.Model{
@@ -325,12 +366,12 @@ func TestMergeColumnar(t *testing.T) {
 	w.SetCount(2)
 	w.WriteColumnInt(1, []int64{1, 2})
 	w.WriteColumnString(2, []string{"a", "b"})
-	primary := w.Bytes()
+	primary := testutil.Bytes(t)(w.Bytes())
 
 	extends := []ExtendColumnResult{
 		{
 			FieldID: 10,
-			Blobs:   [][]byte{{0xAA, 0xBB}, {0xCC}},
+			Blobs:   [][]byte{codec.AppendBytes(nil, []byte{0xAA, 0xBB}), codec.AppendBytes(nil, []byte{0xCC})},
 		},
 	}
 
@@ -379,7 +420,7 @@ func TestExtractID_NonFirstField(t *testing.T) {
 	var buf []byte
 	buf = codec.AppendVarint(buf, 0) // arena
 	buf = codec.AppendVarint(buf, 2) // field 2 (string)
-	buf = codec.AppendString(buf, "Alice")
+	buf = codec.AppendBytes(buf, []byte("Alice"))
 	buf = codec.AppendVarint(buf, 1) // field 1 (id)
 	buf = codec.AppendSvarint(buf, 99)
 	buf = append(buf, 0x00)
@@ -422,61 +463,35 @@ func TestExtractID_NullableField(t *testing.T) {
 // --- ParseGroupedResponse tests ---
 
 func TestParseGroupedResponse_List(t *testing.T) {
-	// Build grouped response: 2 keys, key0 has 2 items, key1 has 1 item
-	var resp []byte
-	resp = codec.AppendVarint(resp, 2) // key_count
+	resp := append([]byte{2}, resolvedValueFixture(t, 2, false)...)
+	resp = append(resp, resolvedValueFixture(t, 1, false)...)
+	assertResolvedListCounts(t, ParseGroupedResponse(resp, false), []int{2, 1})
+}
 
-	// Key 0: 2 items
-	resp = codec.AppendVarint(resp, 2) // item_count
-	item1 := []byte{0xAA, 0xBB}
-	resp = codec.AppendBytes(resp, item1) // len-prefixed item 1
-	item2 := []byte{0xCC}
-	resp = codec.AppendBytes(resp, item2) // len-prefixed item 2
-
-	// Key 1: 1 item
-	resp = codec.AppendVarint(resp, 1)
-	item3 := []byte{0xDD, 0xEE, 0xFF}
-	resp = codec.AppendBytes(resp, item3)
-
-	blobs := ParseGroupedResponse(resp, true)
-	if len(blobs) != 2 {
-		t.Fatalf("expected 2 blobs, got %d", len(blobs))
+func assertResolvedListCounts(t *testing.T, values [][]byte, counts []int) {
+	t.Helper()
+	if len(values) != len(counts) {
+		t.Fatalf("groups = %d, want %d", len(values), len(counts))
 	}
-
-	// Blob 0: [count varint=2][item1 raw][item2 raw]
-	dec := codec.NewDecoder(blobs[0])
-	count := dec.ReadArrayLength()
-	if count != 2 {
-		t.Fatalf("blob0 count = %d, want 2", count)
-	}
-	// Blob 1: [count varint=1][item3 raw]
-	dec = codec.NewDecoder(blobs[1])
-	count = dec.ReadArrayLength()
-	if count != 1 {
-		t.Fatalf("blob1 count = %d, want 1", count)
+	for i, value := range values {
+		body, n := codec.ReadBytes(value, 0)
+		if n != len(value) {
+			t.Fatalf("invalid field value %x", value)
+		}
+		reader := codec.NewColumnarReader(body)
+		if reader.Err() != nil || reader.Count() != counts[i] {
+			t.Fatalf("group %d: count %d, error %v", i, reader.Count(), reader.Err())
+		}
 	}
 }
 
 func TestParseGroupedResponse_Single(t *testing.T) {
-	var resp []byte
-	resp = codec.AppendVarint(resp, 2) // 2 keys
-
-	// Key 0: 1 item
-	resp = codec.AppendVarint(resp, 1)
-	resp = codec.AppendBytes(resp, []byte{0x01, 0x02})
-
-	// Key 1: 0 items
-	resp = codec.AppendVarint(resp, 0)
-
-	blobs := ParseGroupedResponse(resp, false)
-	if len(blobs) != 2 {
-		t.Fatalf("expected 2 blobs, got %d", len(blobs))
-	}
-	if len(blobs[0]) != 2 || blobs[0][0] != 0x01 {
-		t.Fatalf("blob0 = %x, want [01 02]", blobs[0])
-	}
-	if blobs[1] != nil {
-		t.Fatalf("blob1 should be nil, got %x", blobs[1])
+	value := codec.AppendBytes([]byte{1}, []byte{0, 1, 2, 0})
+	resp := append([]byte{2}, value...)
+	resp = append(resp, 0)
+	blobs := ParseGroupedResponse(resp, true)
+	if len(blobs) != 2 || !bytes.Equal(blobs[0], value) || !bytes.Equal(blobs[1], []byte{0}) {
+		t.Fatalf("nullable groups = %x", blobs)
 	}
 }
 
@@ -501,11 +516,11 @@ func TestExtractID_SkipAllTypes(t *testing.T) {
 	buf = codec.AppendVarint(buf, 0) // arena
 	// field 2: float
 	buf = codec.AppendVarint(buf, 2)
-	buf = codec.AppendFixed64(buf, 3.14)
+	buf = binary.LittleEndian.AppendUint64(buf, math.Float64bits(3.14))
 	// field 3: nullable string (present)
 	buf = codec.AppendVarint(buf, 3)
 	buf = codec.AppendPresent(buf)
-	buf = codec.AppendString(buf, "hello")
+	buf = codec.AppendBytes(buf, []byte("hello"))
 	// field 4: nullable varint (null)
 	buf = codec.AppendVarint(buf, 4)
 	buf = codec.AppendNull(buf)
@@ -539,8 +554,8 @@ func TestExtractIDColumn_AllColumnTypes(t *testing.T) {
 	buf = codec.AppendVarint(buf, 0) // totalStringLen = 0 (no arena)
 	// col 2: float
 	buf = codec.AppendVarint(buf, 2)
-	buf = codec.AppendFixed64(buf, 1.0)
-	buf = codec.AppendFixed64(buf, 2.0)
+	buf = binary.LittleEndian.AppendUint64(buf, math.Float64bits(1.0))
+	buf = binary.LittleEndian.AppendUint64(buf, math.Float64bits(2.0))
 	// col 3: bool
 	buf = codec.AppendVarint(buf, 3)
 	buf = codec.AppendBool(buf, true)
@@ -548,7 +563,7 @@ func TestExtractIDColumn_AllColumnTypes(t *testing.T) {
 	// col 4: nullable string
 	buf = codec.AppendVarint(buf, 4)
 	buf = codec.AppendPresent(buf)
-	buf = codec.AppendString(buf, "a")
+	buf = codec.AppendBytes(buf, []byte("a"))
 	buf = codec.AppendNull(buf)
 	// col 1: id
 	buf = codec.AppendVarint(buf, 1)
@@ -652,7 +667,7 @@ func TestExtractIDColumn_UnknownColumn(t *testing.T) {
 	w := &codec.ColumnarWriter{}
 	w.SetCount(1)
 	w.WriteColumnInt(99, []int64{1}) // unknown field
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	s := schema.New()
 	s.RegisterModel(&schema.Model{
@@ -672,10 +687,10 @@ func TestSkipColumnarColumn_AllTypes(t *testing.T) {
 	buf = codec.AppendVarint(buf, 0) // totalStringLen = 0 (no arena)
 	// col 2: string
 	buf = codec.AppendVarint(buf, 2)
-	buf = codec.AppendString(buf, "test")
+	buf = codec.AppendBytes(buf, []byte("test"))
 	// col 3: float
 	buf = codec.AppendVarint(buf, 3)
-	buf = codec.AppendFixed64(buf, 1.5)
+	buf = binary.LittleEndian.AppendUint64(buf, math.Float64bits(1.5))
 	// col 4: bool
 	buf = codec.AppendVarint(buf, 4)
 	buf = codec.AppendBool(buf, true)
@@ -685,7 +700,7 @@ func TestSkipColumnarColumn_AllTypes(t *testing.T) {
 	// col 6: nullable float (present)
 	buf = codec.AppendVarint(buf, 6)
 	buf = codec.AppendPresent(buf)
-	buf = codec.AppendFixed64(buf, 2.5)
+	buf = binary.LittleEndian.AppendUint64(buf, math.Float64bits(2.5))
 	// col 7: nullable bool (null)
 	buf = codec.AppendVarint(buf, 7)
 	buf = codec.AppendNull(buf)
@@ -724,18 +739,20 @@ func TestSchemaFieldToSkipType_AllTypes(t *testing.T) {
 		want  codec.FieldSkipType
 	}{
 		{schema.Field{Type: schema.FieldInt}, codec.SkipVarint},
-		{schema.Field{Type: schema.FieldDateTime}, codec.SkipVarint},
+		{schema.Field{Type: schema.FieldDateTime}, codec.SkipDateTime},
 		{schema.Field{Type: schema.FieldDuration}, codec.SkipVarint},
 		{schema.Field{Type: schema.FieldBool}, codec.SkipVarint},
 		{schema.Field{Type: schema.FieldFloat}, codec.SkipFixed64},
-		{schema.Field{Type: schema.FieldString}, codec.SkipBytes},
-		{schema.Field{Type: schema.FieldEnum}, codec.SkipBytes},
+		{schema.Field{Type: schema.FieldString}, codec.SkipString},
+		{schema.Field{Type: schema.FieldEnum}, codec.SkipString},
+		{schema.Field{Type: schema.FieldDecimal}, codec.SkipString},
 		{schema.Field{Type: schema.FieldBytes}, codec.SkipBytes},
 		{schema.Field{Type: schema.FieldModel}, codec.SkipBytes},
 		// Nullable
 		{schema.Field{Type: schema.FieldInt, Nullable: true}, codec.SkipNullVarint},
 		{schema.Field{Type: schema.FieldFloat, Nullable: true}, codec.SkipNullFixed64},
-		{schema.Field{Type: schema.FieldString, Nullable: true}, codec.SkipNullBytes},
+		{schema.Field{Type: schema.FieldString, Nullable: true}, codec.SkipNullString},
+		{schema.Field{Type: schema.FieldDecimal, Nullable: true}, codec.SkipNullString},
 		{schema.Field{Type: schema.FieldBool, Nullable: true}, codec.SkipNullVarint},
 	}
 	for _, tt := range tests {
@@ -807,7 +824,7 @@ func TestExtractIDColumn_NullableEnum(t *testing.T) {
 	buf = codec.AppendVarint(buf, 0) // totalStringLen = 0 (no arena)
 	buf = codec.AppendVarint(buf, 3) // fieldID=3 (nullable enum)
 	buf = codec.AppendPresent(buf)
-	buf = codec.AppendString(buf, "ADMIN")
+	buf = codec.AppendBytes(buf, []byte("ADMIN"))
 	buf = codec.AppendVarint(buf, 1) // fieldID=1 (id)
 	buf = codec.AppendSvarint(buf, 55)
 	buf = append(buf, 0x00)
@@ -830,33 +847,23 @@ func TestParseGroupedResponse_Truncated(t *testing.T) {
 	// key_count=1 but no data after
 	resp := codec.AppendVarint(nil, 1)
 	blobs := ParseGroupedResponse(resp, true)
-	// Should return partial result without panic
-	if len(blobs) != 1 {
-		t.Fatalf("expected 1 blob, got %d", len(blobs))
+	// Truncation must not return the previously accepted partial result.
+	if blobs != nil {
+		t.Fatalf("accepted truncated response: %x", blobs)
 	}
 }
 
 func TestParseGroupedResponse_ListTruncatedItem(t *testing.T) {
-	// key_count=1, item_count=2, but only 1 item provided
-	var resp []byte
-	resp = codec.AppendVarint(resp, 1) // 1 key
-	resp = codec.AppendVarint(resp, 2) // 2 items
-	resp = codec.AppendBytes(resp, []byte{0xAA})
-	// missing second item
-	blobs := ParseGroupedResponse(resp, true)
-	if len(blobs) != 1 {
-		t.Fatalf("expected 1 blob, got %d", len(blobs))
+	resp := resolvedResponseFixture(t, 1, 2, false)
+	if blobs := ParseGroupedResponse(resp[:len(resp)-1], false); blobs != nil {
+		t.Fatalf("accepted truncated columnar body: %x", blobs)
 	}
 }
 
 func TestParseGroupedResponse_SingleTruncatedItem(t *testing.T) {
-	var resp []byte
-	resp = codec.AppendVarint(resp, 1) // 1 key
-	resp = codec.AppendVarint(resp, 1) // 1 item
-	// missing item data
-	blobs := ParseGroupedResponse(resp, false)
-	if len(blobs) != 1 {
-		t.Fatalf("expected 1 blob, got %d", len(blobs))
+	// One present nullable value, but its length and body are missing.
+	if blobs := ParseGroupedResponse([]byte{1, 1}, true); blobs != nil {
+		t.Fatalf("accepted truncated nullable object: %x", blobs)
 	}
 }
 
@@ -917,37 +924,20 @@ func TestMerge_MultipleExtendsSomeEmpty(t *testing.T) {
 	}
 }
 
-func TestParseGroupedResponse_SingleWithMultipleItems(t *testing.T) {
-	// Single mode with >1 items per key — tests the skip-remaining-items path
-	var resp []byte
-	resp = codec.AppendVarint(resp, 1) // 1 key
-	resp = codec.AppendVarint(resp, 3) // 3 items (only first should be used)
-	resp = codec.AppendBytes(resp, []byte{0x01, 0x02})
-	resp = codec.AppendBytes(resp, []byte{0x03, 0x04}) // should be skipped
-	resp = codec.AppendBytes(resp, []byte{0x05})       // should be skipped
-
-	blobs := ParseGroupedResponse(resp, false)
-	if len(blobs) != 1 {
-		t.Fatalf("expected 1 blob, got %d", len(blobs))
-	}
-	if len(blobs[0]) != 2 || blobs[0][0] != 0x01 || blobs[0][1] != 0x02 {
-		t.Fatalf("blob[0] = %x, want [01 02]", blobs[0])
+func TestParseGroupedResponse_TrailingGroupValues(t *testing.T) {
+	// The declared key count must consume exactly one canonical field value.
+	resp := codec.AppendBytes([]byte{1}, []byte{0, 0})
+	resp = codec.AppendBytes(resp, []byte{0, 0})
+	if blobs := ParseGroupedResponse(resp, false); blobs != nil {
+		t.Fatalf("accepted trailing group: %x", blobs)
 	}
 }
 
-func TestParseGroupedResponse_SingleSkipRemainingTruncated(t *testing.T) {
-	// Single mode: 1 key, 3 items, first item present, second truncated
-	var resp []byte
-	resp = codec.AppendVarint(resp, 1) // 1 key
-	resp = codec.AppendVarint(resp, 3) // 3 items
-	resp = codec.AppendBytes(resp, []byte{0xAA})
-	// remaining items truncated — no more data
-	blobs := ParseGroupedResponse(resp, false)
-	if len(blobs) != 1 {
-		t.Fatalf("expected 1 blob, got %d", len(blobs))
-	}
-	if blobs[0][0] != 0xAA {
-		t.Fatalf("blob[0] = %x, want [AA]", blobs[0])
+func TestParseGroupedResponse_LaterGroupTruncated(t *testing.T) {
+	resp := codec.AppendBytes([]byte{2}, []byte{0, 0})
+	resp = append(resp, 2, 0) // The second group declares two bytes, but has one.
+	if blobs := ParseGroupedResponse(resp, false); blobs != nil {
+		t.Fatalf("accepted partial grouped response: %x", blobs)
 	}
 }
 
@@ -1029,7 +1019,7 @@ func TestExtractIDColumn_IDNotFound(t *testing.T) {
 	w := &codec.ColumnarWriter{}
 	w.SetCount(1)
 	w.WriteColumnString(2, []string{"hello"})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	s := schema.New()
 	s.RegisterModel(&schema.Model{
@@ -1099,7 +1089,7 @@ func TestSkipColumnarColumn_EnumNonNullable(t *testing.T) {
 	buf = codec.AppendVarint(buf, 1) // count=1
 	buf = codec.AppendVarint(buf, 0) // totalStringLen = 0
 	buf = codec.AppendVarint(buf, 2) // fieldID=2 (enum)
-	buf = codec.AppendString(buf, "ADMIN")
+	buf = codec.AppendBytes(buf, []byte("ADMIN"))
 	buf = codec.AppendVarint(buf, 1) // fieldID=1 (id)
 	buf = codec.AppendSvarint(buf, 77)
 	buf = append(buf, 0x00)
@@ -1119,54 +1109,31 @@ func TestSkipColumnarColumn_EnumNonNullable(t *testing.T) {
 }
 
 func TestParseGroupedResponse_MultipleKeys(t *testing.T) {
-	// 3 keys: key0=2 items, key1=0 items, key2=1 item
-	var resp []byte
-	resp = codec.AppendVarint(resp, 3) // 3 keys
-	resp = codec.AppendVarint(resp, 2) // key0: 2 items
-	resp = codec.AppendBytes(resp, []byte{0x01})
-	resp = codec.AppendBytes(resp, []byte{0x02})
-	resp = codec.AppendVarint(resp, 0) // key1: 0 items
-	resp = codec.AppendVarint(resp, 1) // key2: 1 item
-	resp = codec.AppendBytes(resp, []byte{0x03})
-
-	blobs := ParseGroupedResponse(resp, true)
-	if len(blobs) != 3 {
-		t.Fatalf("expected 3 blobs, got %d", len(blobs))
+	resp := []byte{3}
+	for _, count := range []int{2, 0, 1} {
+		resp = append(resp, resolvedValueFixture(t, count, false)...)
 	}
-	// key0: list with 2 items
-	if len(blobs[0]) == 0 {
-		t.Fatal("key0 blob should not be empty")
-	}
-	// key1: empty list
-	dec := codec.NewDecoder(blobs[1])
-	count := dec.ReadArrayLength()
-	if count != 0 {
-		t.Fatalf("key1 count should be 0, got %d", count)
-	}
-	// key2: list with 1 item
-	if len(blobs[2]) == 0 {
-		t.Fatal("key2 blob should not be empty")
-	}
+	assertResolvedListCounts(t, ParseGroupedResponse(resp, false), []int{2, 0, 1})
 }
 
 func TestSkipNestedRowFieldHandlesSchemaAndWireFailures(t *testing.T) {
 	registry := schema.New()
 	missing := &schema.Field{Type: schema.FieldModel, TypeName: "Missing", Relation: true}
-	if skipNestedRowField(codec.NewDecoder(nil), missing, registry) {
+	if skipNestedRowField(codec.NewDecoder(nil), missing, registry, 1) {
 		t.Fatal("missing nested schema was accepted")
 	}
 
 	registry.RegisterType(&schema.TypeDecl{Name: "Child", Fields: []schema.Field{{ID: 1, Name: "value", Type: schema.FieldInt}}})
 	nullable := &schema.Field{Type: schema.FieldModel, TypeName: "Child", Relation: true, Nullable: true}
-	if !skipNestedRowField(codec.NewDecoder(codec.AppendNull(nil)), nullable, registry) {
+	if !skipNestedRowField(codec.NewDecoder(codec.AppendNull(nil)), nullable, registry, 1) {
 		t.Fatal("nullable nested type declaration was not skipped")
 	}
-	if skipNestedRowField(codec.NewDecoder(nil), nullable, registry) {
+	if skipNestedRowField(codec.NewDecoder(nil), nullable, registry, 1) {
 		t.Fatal("truncated nullable marker was accepted")
 	}
 
 	list := &schema.Field{Type: schema.FieldModel, TypeName: "Child", Relation: true, IsList: true}
-	if skipNestedRowField(codec.NewDecoder(nil), list, registry) {
+	if skipNestedRowField(codec.NewDecoder(nil), list, registry, 1) {
 		t.Fatal("truncated nested list header was accepted")
 	}
 	row := codec.AppendArrayHeader(nil, 1)
@@ -1174,7 +1141,7 @@ func TestSkipNestedRowFieldHandlesSchemaAndWireFailures(t *testing.T) {
 	row = codec.AppendVarint(row, 1)
 	row = codec.AppendSvarint(row, 42)
 	row = append(row, 0)
-	if !skipNestedRowField(codec.NewDecoder(row), list, registry) {
+	if !skipNestedRowField(codec.NewDecoder(codec.AppendBytes(nil, row)), list, registry, 1) {
 		t.Fatal("valid nested list was not skipped")
 	}
 	unknownField := codec.AppendArrayHeader(nil, 1)
@@ -1182,7 +1149,7 @@ func TestSkipNestedRowFieldHandlesSchemaAndWireFailures(t *testing.T) {
 	unknownField = codec.AppendVarint(unknownField, 2)
 	unknownField = codec.AppendSvarint(unknownField, 42)
 	unknownField = append(unknownField, 0)
-	if skipNestedRowField(codec.NewDecoder(unknownField), list, registry) {
+	if skipNestedRowField(codec.NewDecoder(codec.AppendBytes(nil, unknownField)), list, registry, 1) {
 		t.Fatal("unknown nested row field was accepted")
 	}
 }
@@ -1215,7 +1182,7 @@ func TestExtractPrimaryKeysRejectsInvalidInputs(t *testing.T) {
 
 	unknownField := codec.AppendVarint(nil, 0)
 	unknownField = codec.AppendVarint(unknownField, 2)
-	unknownField = codec.AppendString(unknownField, "value")
+	unknownField = codec.AppendBytes(unknownField, []byte("value"))
 	unknownField = append(unknownField, 0)
 	if _, ok := ExtractPrimaryKeys(unknownField, key, model, registry); ok {
 		t.Fatal("unknown row field was accepted")
@@ -1252,13 +1219,13 @@ func TestExtractPrimaryKeyColumnRejectsInvalidInputs(t *testing.T) {
 	var unknown codec.ColumnarWriter
 	unknown.SetCount(1)
 	unknown.WriteColumnInt(3, []int64{1})
-	if _, ok := ExtractPrimaryKeyColumn(unknown.Bytes(), keyField, model); ok {
+	if _, ok := ExtractPrimaryKeyColumn(testutil.Bytes(t)(unknown.Bytes()), keyField, model); ok {
 		t.Fatal("unknown column was accepted")
 	}
 	var missing codec.ColumnarWriter
 	missing.SetCount(1)
 	missing.WriteColumnInt(2, []int64{1})
-	if _, ok := ExtractPrimaryKeyColumn(missing.Bytes(), keyField, model); ok {
+	if _, ok := ExtractPrimaryKeyColumn(testutil.Bytes(t)(missing.Bytes()), keyField, model); ok {
 		t.Fatal("response without key column was accepted")
 	}
 	truncated := []byte{1, 0, 2}

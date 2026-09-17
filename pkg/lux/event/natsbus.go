@@ -47,7 +47,11 @@ func natsPayloadBytes(payload any) ([]byte, error) {
 	case []byte:
 		return value, nil
 	case codec.LuxoMarshaler:
-		return value.MarshalLuxo(), nil
+		data, err := value.MarshalLuxo()
+		if err != nil {
+			return nil, err
+		}
+		return data, nil
 	default:
 		return nil, fmt.Errorf("%w: %T", ErrBinaryPayloadRequired, payload)
 	}

@@ -22,7 +22,7 @@ func TestInitProjectGoMod(t *testing.T) {
 
 	checks := []string{
 		"module github.com/example/myapp",
-		"go 1.26.0",
+		"go 1.27.1",
 	}
 	for _, check := range checks {
 		if !strings.Contains(src, check) {

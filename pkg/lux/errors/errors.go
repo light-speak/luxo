@@ -4,10 +4,12 @@
 package errors
 
 // ErrorData is the interface for typed error data attached to AppError.
-// Implementations: ParamError, ResourceError, MapData.
+// Implementations append typed fields directly; no map or reflection fallback.
 type ErrorData interface {
-	// I18nData returns key-value pairs for i18n template substitution.
-	I18nData() map[string]any
+	AppendJSON(dst []byte) ([]byte, error)
+	// AppendText leaves dst unchanged and returns false for an unknown field.
+	// It must preserve the prefix and must not retain dst after returning.
+	AppendText(dst []byte, field string) ([]byte, bool)
 }
 
 // AppError is the structured error type for all Luxo application errors.
@@ -15,7 +17,7 @@ type AppError struct {
 	Name     string    // PascalCase identifier: "NotFound", "OutOfStock"
 	Code     int       // HTTP status code: 404, 409, 500
 	Message  string    // i18n key: "error.not_found"
-	Data     ErrorData // typed data: ParamError, ResourceError, MapData, or nil
+	Data     ErrorData // typed data, or nil
 	Internal bool      // if true, message/data not exposed to client
 	Cause    error     // wrapped underlying error
 }
@@ -26,30 +28,10 @@ type ParamError struct {
 	Error string `json:"error"`
 }
 
-func (p ParamError) I18nData() map[string]any {
-	return map[string]any{"param": p.Param, "error": p.Error}
-}
-
 // ResourceError is error data for missing resources.
 type ResourceError struct {
 	Resource string `json:"resource"`
-	ID       any    `json:"id,omitempty"`
-}
-
-func (r ResourceError) I18nData() map[string]any {
-	m := map[string]any{"resource": r.Resource}
-	if r.ID != nil {
-		m["id"] = r.ID
-	}
-	return m
-}
-
-// MapData is typed error data from a key-value map.
-// Used by generated error constructors for custom error fields.
-type MapData map[string]any
-
-func (d MapData) I18nData() map[string]any {
-	return map[string]any(d)
+	ID       ResourceID
 }
 
 func (e *AppError) Error() string {
@@ -102,7 +84,7 @@ var (
 	Forbidden        = New("Forbidden", 403, "error.forbidden")
 	BadRequest       = New("BadRequest", 400, "error.bad_request")
 	Conflict         = New("Conflict", 409, "error.conflict")
-	InternalError    = New("Internal", 500, "error.internal")
+	InternalError    = Wrap(nil)
 	ValidationFailed = New("ValidationFailed", 422, "error.validation_failed")
 	RateLimited      = New("RateLimited", 429, "error.rate_limited")
 	ServiceTimeout   = New("ServiceTimeout", 502, "error.service_timeout")

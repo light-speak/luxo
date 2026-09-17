@@ -114,22 +114,13 @@ jobs:
         run: go vet ./pkg/... ./cmd/... ./scripts/...
 
       - name: Gofmt check
-        run: |
-          UNFORMATTED=$(gofmt -l pkg/ cmd/ scripts/)
-          if [ -n "$UNFORMATTED" ]; then
-            echo "::error::Files not formatted: $UNFORMATTED"
-            exit 1
-          fi
+        run: sh scripts/check-go.sh format pkg/ cmd/ scripts/
 
       - name: Gocyclo check
         run: |
           go install github.com/fzipp/gocyclo/cmd/gocyclo@v0.6.0
-          VIOLATIONS=$(gocyclo -over 25 pkg/ cmd/ scripts/)
-          if [ -n "$VIOLATIONS" ]; then
-            echo "::error::Cyclomatic complexity > 25:"
-            echo "$VIOLATIONS"
-            exit 1
-          fi
+          go version -m "$(command -v gocyclo)"
+          sh scripts/check-go.sh complexity pkg/ cmd/ scripts/
 
       - name: Build
         run: go build ./pkg/... ./cmd/... ./scripts/...
@@ -446,15 +437,37 @@ jobs:
 
       - uses: pnpm/action-setup@v6
         with:
-          version: 10
+          version: 11.9.0
 
       - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version-file: .node-version
+
+      - name: Verify Node toolchain
+        run: sh scripts/check-node.sh
+
+      - uses: actions/setup-go@v7
+        if: matrix.package == 'vite-plugin'
+        with:
+          go-version-file: go.mod
 
       - name: Install dependencies
         working-directory: packages/${{ matrix.package }}
         run: pnpm install --frozen-lockfile
+
+      - name: Report JavaScript toolchain
+        working-directory: packages/${{ matrix.package }}
+        run: |
+          node --version
+          pnpm --version
+          pnpm exec tsc --version
+
+      - name: Build client dependency for SDK consumers
+        if: matrix.package != 'client'
+        working-directory: packages/client
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
 
       - name: Test and build package
         working-directory: packages/${{ matrix.package }}
@@ -462,19 +475,51 @@ jobs:
           pnpm test
           pnpm build
 
-      - name: Type-check React package
-        if: matrix.package == 'react'
-        working-directory: packages/react
+      - name: Type-check SDK package
+        working-directory: packages/${{ matrix.package }}
         run: pnpm typecheck
 
   sdk-dart:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dart: ['3.13.0', '3.13.4']
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ matrix.dart }}
+
+      - name: Verify Dart toolchain
+        env:
+          DART_EXPECTED: ${{ matrix.dart }}
+        run: |
+          set -euo pipefail
+          : "${DART_EXPECTED:?missing expected Dart version}"
+          dart_version_output="$(dart --version 2>&1)"
+          printf '%s\n' "${dart_version_output}"
+          case "${dart_version_output}" in
+            "Dart SDK version: ${DART_EXPECTED} (stable) "*) ;;
+            *) printf '::error::Expected Dart %s stable\n' "${DART_EXPECTED}"; exit 1 ;;
+          esac
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+
+      - name: Verify Node toolchain
+        run: sh scripts/check-node.sh
+
+      - name: Check generated Go interoperability fixture
+        run: go test ./tests/sdk-interop
 
       - name: Install dependencies
         working-directory: packages/dart
@@ -488,8 +533,18 @@ jobs:
         working-directory: packages/dart
         run: dart test
 
+      - name: Test JavaScript and Wasm precision and WebSocket adapter
+        working-directory: packages/dart
+        run: >-
+          dart test -p node -c dart2js -c dart2wasm -j 1
+          test/int64_test.dart test/int64_codec_test.dart test/int64_json_test.dart
+          test/socket_web_test.dart test/uint64_test.dart test/error_response_test.dart test/json_parameters_test.dart
+          test/http_protocol_test.dart test/codec_metadata_test.dart test/codec_test.dart test/codec_text_test.dart
+          test/unicode_test.dart
+
   sdk-kotlin:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -500,8 +555,13 @@ jobs:
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: 21
+          java-version: '26'
+          check-latest: true
           cache: gradle
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
 
       - name: Verify Gradle Wrapper
         working-directory: packages/kotlin
@@ -512,6 +572,14 @@ jobs:
       - name: Test Kotlin SDK and Gradle plugin
         working-directory: packages/kotlin
         run: ./gradlew build :gradle-plugin:validatePlugins --no-daemon --warning-mode fail
+
+      - name: Test generated Kotlin client against Go
+        run: |
+          go test ./tests/sdk-interop
+          go run ./tests/sdk-interop -run -- ./packages/kotlin/gradlew -p tests/sdk-interop/kotlin build --project-cache-dir .tmp/gradle-cache --no-daemon --warning-mode fail
+
+      - name: Test Kotlin gateway responses, errors and stream terminals
+        run: go run ./tests/sdk-interop -run -gateway -- ./packages/kotlin/gradlew -p tests/sdk-interop/kotlin build --project-cache-dir .tmp/gradle-cache --no-daemon --warning-mode fail
 
       - name: Test external Kotlin consumer
         working-directory: tests/kotlin-consumer
@@ -533,7 +601,9 @@ jobs:
           ../../packages/kotlin/gradlew luxoAnalyze --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
 
   sdk-swift-conformance:
-    runs-on: macos-15
+    runs-on: macos-26
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
     timeout-minutes: 20
     permissions:
       contents: read
@@ -554,3 +624,17 @@ jobs:
         env:
           LUXO_PROTOCOL_FIXTURE: ${{ github.workspace }}/pkg/lux/codec/testdata/protocol-v1.json
         run: swift test --package-path .tmp/luxo-swift --filter ProtocolConformanceTests
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Verify generated Swift client against Go
+        env:
+          LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
+        run: go run ./tests/sdk-interop -run -- bash tests/sdk-interop/swift/run.sh
+
+      - name: Verify Swift gateway responses, error data and stream terminals
+        env:
+          LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
+        run: go run ./tests/sdk-interop -run -gateway -- bash tests/sdk-interop/swift/run.sh

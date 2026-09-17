@@ -1,9 +1,23 @@
 package api
 
 import (
+	"bytes"
+	"errors"
+	"math"
 	"testing"
 	"time"
+
+	"github.com/light-speak/luxo/pkg/lux/codec"
 )
+
+func TestResponseBufRejectsNonFiniteFloat(t *testing.T) {
+	for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		buf := ResponseBuf{B: []byte("prefix")}
+		if err := buf.AppendFloat(value); !errors.Is(err, codec.ErrNonFiniteFloat) || !bytes.Equal(buf.B, []byte("prefix")) {
+			t.Fatalf("invalid JSON Float published: %q, %v", buf.B, err)
+		}
+	}
+}
 
 func TestResponseBufAppendInt(t *testing.T) {
 	buf := GetBuf()
@@ -29,7 +43,9 @@ func TestResponseBufAppendFloat(t *testing.T) {
 	buf := GetBuf()
 	defer PutBuf(buf)
 
-	buf.AppendFloat(3.14)
+	if err := buf.AppendFloat(3.14); err != nil {
+		t.Fatal(err)
+	}
 	if string(buf.B) != "3.14" {
 		t.Errorf("got %q", string(buf.B))
 	}

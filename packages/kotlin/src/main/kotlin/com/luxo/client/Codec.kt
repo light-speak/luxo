@@ -1,5 +1,12 @@
 package com.luxo.client
 
+private fun finiteFloatFromBits(bits: Long): Double {
+    if (bits and 0x7ff0000000000000L == 0x7ff0000000000000L) {
+        throw LuxoCodecException("Float must be finite")
+    }
+    return Double.fromBits(bits)
+}
+
 /**
  * Luxo binary wire-format codec.
  *
@@ -38,8 +45,16 @@ class LuxoEncoder(initialCapacity: Int = 1024) {
         writeVarint((v shl 1) xor (v shr 63))
     }
 
+    /** Write exact seconds and nanoseconds without a millisecond conversion. */
+    fun writeDateTime(value: String) {
+        val instant = DateTimeCodec.parse(value)
+        writeSvarint(instant.epochSecond)
+        writeVarint(instant.nano.toLong())
+    }
+
     /** Write IEEE 754 float64 in little-endian byte order. */
     fun writeFixed64(v: Double) {
+        if (!v.isFinite()) throw LuxoCodecException("Float must be finite")
         ensure(8)
         val bits = java.lang.Double.doubleToRawLongBits(v)
         buf[pos++] = (bits).toByte()
@@ -54,7 +69,7 @@ class LuxoEncoder(initialCapacity: Int = 1024) {
 
     /** Write length-prefixed UTF-8 string. */
     fun writeString(v: String) {
-        val bytes = v.toByteArray(Charsets.UTF_8)
+        val bytes = requireLuxoUnicode(v).toByteArray(Charsets.UTF_8)
         writeBytes(bytes)
     }
 
@@ -130,8 +145,9 @@ class LuxoEncoder(initialCapacity: Int = 1024) {
     }
 
     fun writeFieldString(fieldID: Int, v: String) {
+        val bytes = requireLuxoUnicode(v).toByteArray(Charsets.UTF_8)
         writeVarint(fieldID.toLong())
-        writeString(v)
+        writeBytes(bytes)
     }
 
     fun writeFieldBool(fieldID: Int, v: Boolean) {
@@ -153,10 +169,25 @@ class LuxoEncoder(initialCapacity: Int = 1024) {
      * Write a scalar-array field: [fieldID][count][item0][item1]...
      * [encode] writes one element per item using the element type's encoding.
      */
-    fun <T> writeFieldArray(fieldID: Int, items: List<T>, encode: (T) -> Unit) {
-        writeVarint(fieldID.toLong())
-        writeVarint(items.size.toLong())
-        for (item in items) encode(item)
+    inline fun <T> writeFieldArray(fieldID: Int, items: List<T>, crossinline encode: (T) -> Unit) {
+        val start = arrayWritePosition()
+        try {
+            writeVarint(fieldID.toLong())
+            writeVarint(items.size.toLong())
+            for (item in items) encode(item)
+        } catch (error: Throwable) {
+            restoreArrayWritePosition(start)
+            throw error
+        }
+    }
+
+    // Part of the inline ABI: rebuild consumers if changed. Not a general checkpoint API.
+    @PublishedApi
+    internal fun arrayWritePosition(): Int = pos
+
+    @PublishedApi
+    internal fun restoreArrayWritePosition(position: Int) {
+        pos = position
     }
 
     /** Write end-of-struct marker (fieldID 0). */
@@ -197,7 +228,8 @@ fun luxoUtf8Length(value: String): Int {
 		when {
 			code < 0x80 -> length++
 			code < 0x800 -> length += 2
-			code in 0xd800..0xdbff && index + 1 < value.length && value[index + 1].code in 0xdc00..0xdfff -> {
+			Character.isSurrogate(value[index]) -> {
+				requireLuxoSurrogatePair(value, index)
 				length += 4
 				index++
 			}
@@ -207,6 +239,37 @@ fun luxoUtf8Length(value: String): Int {
 	}
 	return length
 }
+
+/** Decode a UTF-8 field without copying its byte range or stripping a leading U+FEFF. */
+fun decodeLuxoUtf8(bytes: ByteArray, startIndex: Int = 0, endIndex: Int = bytes.size): String {
+    val text = String(bytes, startIndex, endIndex - startIndex, Charsets.UTF_8)
+    // The platform replaces malformed sequences with U+FFFD. Only ambiguous text
+    // needs the strict decoder; a literal U+FFFD is valid and must remain intact.
+    if ('\uFFFD' !in text) return text
+    return try {
+        bytes.decodeToString(startIndex, endIndex, throwOnInvalidSequence = true)
+    } catch (_: java.nio.charset.CharacterCodingException) {
+        throw LuxoCodecException("invalid UTF-8 string at offset $startIndex")
+    }
+}
+
+// Match the Go decoder's allocation limits; these do not narrow business Int64 values.
+private const val MAX_ARRAY_ELEMENTS = 1_000_000
+private const val MAX_COLUMNAR_RECORDS = 10_000_000
+private const val MAX_ARENA_SIZE = 64 * 1024 * 1024
+
+private fun checkedMetadata(value: Long, limit: Int, kind: String): Int {
+    // Flip the sign bit for unsigned ordering without a platform-specific Long API.
+    // Kotlin 2.4 also lowers ULong comparison to Long.compareUnsigned on JVM 1.8.
+    if ((value xor Long.MIN_VALUE) > (limit.toLong() xor Long.MIN_VALUE)) {
+        throw metadataError(value, limit, kind)
+    }
+    return value.toInt()
+}
+
+// Keep error formatting out of the small, inlineable successful check.
+private fun metadataError(value: Long, limit: Int, kind: String): LuxoCodecException =
+    LuxoCodecException("invalid $kind ${value.toULong()}, limit $limit")
 
 class LuxoDecoder(private val buf: ByteArray) {
 
@@ -220,20 +283,17 @@ class LuxoDecoder(private val buf: ByteArray) {
 
     /** Skip the arena header (totalStringLen varint) that prefixes each model's binary data. */
     fun skipArenaHeader() {
-        readVarintRaw()
+        checkedMetadata(readVarintRaw(), MAX_ARENA_SIZE, "arena size")
     }
 
     /**
-     * Read the next field ID.  Returns false when end marker (0x00) is
-     * reached or the buffer is exhausted.
+     * Read the next field ID. Returns false at the end marker (0x00).
+     * Exhaustion without an end marker is malformed input.
      */
     fun nextField(): Boolean {
-        if (off >= buf.size) {
-            fieldID = 0
-            return false
-        }
+        if (off >= buf.size) throw LuxoCodecException("missing row end marker")
         val id = readVarintRaw()
-        fieldID = id.toInt()
+        fieldID = checkedMetadata(id, Int.MAX_VALUE, "field ID")
         return fieldID != 0
     }
 
@@ -257,18 +317,22 @@ class LuxoDecoder(private val buf: ByteArray) {
         bits = bits or ((buf[off++].toLong() and 0xFF) shl 40)
         bits = bits or ((buf[off++].toLong() and 0xFF) shl 48)
         bits = bits or ((buf[off++].toLong() and 0xFF) shl 56)
-        return java.lang.Double.longBitsToDouble(bits)
+        return finiteFloatFromBits(bits)
     }
 
     /** Read a length-prefixed UTF-8 string. */
     fun readString(): String {
-        return readBytes().toString(Charsets.UTF_8)
+        val length = readVarintRaw()
+        val len = checkedMetadata(length, buf.size - off, "string length")
+        val result = decodeLuxoUtf8(buf, off, off + len)
+        off += len
+        return result
     }
 
     /** Read length-prefixed arbitrary bytes. */
     fun readBytes(): ByteArray {
-        val len = readVarintRaw().toInt()
-        checkRemaining(len)
+        val length = readVarintRaw()
+        val len = checkedMetadata(length, buf.size - off, "byte length")
         val result = buf.copyOfRange(off, off + len)
         off += len
         return result
@@ -282,6 +346,11 @@ class LuxoDecoder(private val buf: ByteArray) {
 
     /** Number of unread bytes. */
     fun remaining(): Int = buf.size - off
+
+    /** Validate a complete response or length-delimited child, never an input field. */
+    fun checkComplete() {
+        if (off != buf.size) throw LuxoCodecException("trailing binary data")
+    }
 
     /** Return all unread bytes. */
     fun readRemainingBytes(): ByteArray {
@@ -302,10 +371,16 @@ class LuxoDecoder(private val buf: ByteArray) {
     }
 
     /**
-     * Read a DateTime: svarint(unix seconds) on the wire, returned as an
+     * Read a DateTime seconds/nanoseconds pair, returned as an
      * ISO-8601 string to match the JSON-mode representation (Kotlin `String`).
      */
-    fun readDateTime(): String = DateTimeCodec.toIso(readInt())
+    fun readDateTime(): String = DateTimeCodec.toIso(readInt(), readVarintRaw())
+
+    fun readDateTimeArray(): List<String> {
+        val count = checkedMetadata(readVarintRaw(), MAX_ARRAY_ELEMENTS, "array count")
+        checkRemaining(count * 2)
+        return List(count) { readDateTime() }
+    }
 
     // -- nullable readers -------------------------------------------------
 
@@ -334,7 +409,7 @@ class LuxoDecoder(private val buf: ByteArray) {
         return readUuid()
     }
 
-    /** Read a nullable DateTime (0x00=null, else svarint seconds -> ISO string). */
+    /** Read a nullable DateTime (0x00=null, else seconds/nanoseconds -> RFC3339). */
     fun readDateTimePtr(): String? {
         if (!readNullFlag()) return null
         return readDateTime()
@@ -348,7 +423,9 @@ class LuxoDecoder(private val buf: ByteArray) {
 
     /** Read an array of items using a decoder lambda. */
     fun <T> readArray(decode: () -> T): List<T> {
-        val count = readVarintRaw().toInt()
+        val count = checkedMetadata(readVarintRaw(), MAX_ARRAY_ELEMENTS, "array count")
+        // Every wire element has at least one byte, including null and empty values.
+        checkRemaining(count)
         return List(count) { decode() }
     }
 
@@ -362,7 +439,10 @@ class LuxoDecoder(private val buf: ByteArray) {
             checkRemaining(1)
             val b = buf[off++].toLong() and 0xFF
             result = result or ((b and 0x7F) shl shift)
-            if (b and 0x80 == 0L) break
+            if (b and 0x80 == 0L) {
+                if (shift == 63 && b > 1) throw LuxoCodecException("varint overflow")
+                break
+            }
             shift += 7
             if (shift >= 64) throw LuxoCodecException("varint overflow")
         }
@@ -383,7 +463,7 @@ class LuxoDecoder(private val buf: ByteArray) {
     }
 
     private fun checkRemaining(n: Int) {
-        if (off + n > buf.size) {
+        if (n > buf.size - off) {
             throw LuxoCodecException("unexpected end of buffer at offset $off, need $n bytes")
         }
     }
@@ -441,20 +521,32 @@ class ColumnarDecoder(private val buf: ByteArray) {
         private set
 
     init {
-        count = readVarintRaw().toInt()
-        arenaSize = readVarintRaw().toInt()
+        count = checkedMetadata(readVarintRaw(), MAX_COLUMNAR_RECORDS, "column count")
+        arenaSize = checkedMetadata(readVarintRaw(), MAX_ARENA_SIZE, "arena size")
+        if (count > 0) {
+            if (count > buf.size - off - 2) throw LuxoCodecException("insufficient columnar element bytes")
+            val start = off
+            var id = buf[start].toLong() and 0xffL
+            if (id >= 0x80) {
+                id = readVarintRaw()
+                if (count > buf.size - off - 1) throw LuxoCodecException("insufficient columnar element bytes")
+                off = start
+            }
+            if (id == 0L) throw LuxoCodecException("nonempty list requires at least one column")
+        }
     }
 
-    /** Advance to next column. Returns false at end marker (0x00) or EOF. */
+    /** Advance to the next column; exhaustion before its end marker is malformed. */
     fun nextColumn(): Boolean {
-        if (off >= buf.size) return false
-        val id = readVarintRaw().toInt()
+        if (off >= buf.size) throw LuxoCodecException("missing column end marker")
+        val id = checkedMetadata(readVarintRaw(), Int.MAX_VALUE, "field ID")
         fieldID = id
         return id != 0
     }
 
     /** Read [count] zigzag-encoded signed int64 values. */
     fun readColumnInt(): List<Long> {
+        checkRemaining(count)
         val result = LongArray(count)
         for (i in 0 until count) {
             val uv = readVarintRaw()
@@ -464,36 +556,40 @@ class ColumnarDecoder(private val buf: ByteArray) {
     }
 
     /**
-     * Read [count] DateTime values from an Int column (svarint unix seconds),
+     * Read [count] DateTime pairs,
      * converting each to its ISO-8601 string representation.
      */
     fun readColumnDateTime(): List<String> {
+        checkRemaining(count * 2)
         val result = Array(count) { "" }
         for (i in 0 until count) {
-            val uv = readVarintRaw()
-            val sec = (uv ushr 1) xor -(uv and 1L)
-            result[i] = DateTimeCodec.toIso(sec)
+            result[i] = readDateTime()
         }
         return result.asList()
     }
 
-    /** Read [count] nullable DateTime values (0x00=null, else svarint seconds). */
+    /** Read [count] nullable DateTime pairs (0x00=null). */
     fun readColumnDateTimePtr(): List<String?> {
+        checkRemaining(count)
         val result = arrayOfNulls<String>(count)
         for (i in 0 until count) {
             if (!readCanonicalMarker("nullable")) continue
-            val uv = readVarintRaw()
-            val sec = (uv ushr 1) xor -(uv and 1L)
-            result[i] = DateTimeCodec.toIso(sec)
+            result[i] = readDateTime()
         }
         return result.asList()
+    }
+
+    private fun readDateTime(): String {
+        val unsigned = readVarintRaw()
+        val seconds = (unsigned ushr 1) xor -(unsigned and 1L)
+        return DateTimeCodec.toIso(seconds, readVarintRaw())
     }
 
     /** Read [count] fixed64 (8-byte LE) float values. */
     fun readColumnFloat(): List<Double> {
+        checkRemaining(count * 8)
         val result = DoubleArray(count)
         for (i in 0 until count) {
-            checkRemaining(8)
             var bits: Long = 0
             bits = bits or ((buf[off++].toLong() and 0xFF))
             bits = bits or ((buf[off++].toLong() and 0xFF) shl 8)
@@ -503,19 +599,19 @@ class ColumnarDecoder(private val buf: ByteArray) {
             bits = bits or ((buf[off++].toLong() and 0xFF) shl 40)
             bits = bits or ((buf[off++].toLong() and 0xFF) shl 48)
             bits = bits or ((buf[off++].toLong() and 0xFF) shl 56)
-            result[i] = java.lang.Double.longBitsToDouble(bits)
+            result[i] = finiteFloatFromBits(bits)
         }
         return result.asList()
     }
 
     /** Read [count] length-prefixed UTF-8 string values. */
     fun readColumnString(): List<String> {
+        checkRemaining(count)
         val result = Array(count) { "" }
         for (i in 0 until count) {
-            val len = readVarintRaw().toInt()
+            val len = readByteLength()
             if (len == 0) { result[i] = ""; continue }
-            checkRemaining(len)
-            result[i] = String(buf, off, len, Charsets.UTF_8)
+            result[i] = decodeLuxoUtf8(buf, off, off + len)
             off += len
         }
         return result.asList()
@@ -523,6 +619,7 @@ class ColumnarDecoder(private val buf: ByteArray) {
 
     /** Read [count] boolean values (varint 0/1). */
     fun readColumnBool(): List<Boolean> {
+        checkRemaining(count)
         val result = BooleanArray(count)
         for (i in 0 until count) {
             result[i] = readCanonicalMarker("bool")
@@ -532,6 +629,7 @@ class ColumnarDecoder(private val buf: ByteArray) {
 
     /** Read [count] nullable int values (0x00=null, 0x01+svarint). */
     fun readColumnIntPtr(): List<Long?> {
+        checkRemaining(count)
         val result = arrayOfNulls<Long>(count)
         for (i in 0 until count) {
             if (!readCanonicalMarker("nullable")) continue
@@ -543,6 +641,7 @@ class ColumnarDecoder(private val buf: ByteArray) {
 
     /** Read [count] nullable float values (0x00=null, 0x01+fixed64). */
     fun readColumnFloatPtr(): List<Double?> {
+        checkRemaining(count)
         val result = arrayOfNulls<Double>(count)
         for (i in 0 until count) {
             if (!readCanonicalMarker("nullable")) continue
@@ -556,20 +655,20 @@ class ColumnarDecoder(private val buf: ByteArray) {
             bits = bits or ((buf[off++].toLong() and 0xFF) shl 40)
             bits = bits or ((buf[off++].toLong() and 0xFF) shl 48)
             bits = bits or ((buf[off++].toLong() and 0xFF) shl 56)
-            result[i] = java.lang.Double.longBitsToDouble(bits)
+            result[i] = finiteFloatFromBits(bits)
         }
         return result.asList()
     }
 
     /** Read [count] nullable string values (0x00=null, 0x01+string). */
     fun readColumnStringPtr(): List<String?> {
+        checkRemaining(count)
         val result = arrayOfNulls<String>(count)
         for (i in 0 until count) {
             if (!readCanonicalMarker("nullable")) continue
-            val len = readVarintRaw().toInt()
+            val len = readByteLength()
             if (len == 0) { result[i] = ""; continue }
-            checkRemaining(len)
-            result[i] = String(buf, off, len, Charsets.UTF_8)
+            result[i] = decodeLuxoUtf8(buf, off, off + len)
             off += len
         }
         return result.asList()
@@ -577,6 +676,7 @@ class ColumnarDecoder(private val buf: ByteArray) {
 
     /** Read [count] nullable boolean values (0x00=null, 0x01+varint). */
     fun readColumnBoolPtr(): List<Boolean?> {
+        checkRemaining(count)
         val result = arrayOfNulls<Boolean>(count)
         for (i in 0 until count) {
             if (!readCanonicalMarker("nullable")) continue
@@ -587,9 +687,9 @@ class ColumnarDecoder(private val buf: ByteArray) {
 
     /** Read [count] fixed 16-byte UUID values as canonical lowercase strings. */
     fun readColumnUuid(): List<String> {
+        checkRemaining(count * 16)
         val result = Array(count) { "" }
         for (i in 0 until count) {
-            checkRemaining(16)
             result[i] = UuidCodec.format(buf, off)
             off += 16
         }
@@ -598,6 +698,7 @@ class ColumnarDecoder(private val buf: ByteArray) {
 
     /** Read [count] nullable UUID values (0x00=null, 0x01+16 bytes). */
     fun readColumnUuidPtr(): List<String?> {
+        checkRemaining(count)
         val result = arrayOfNulls<String>(count)
         for (i in 0 until count) {
             if (!readCanonicalMarker("nullable")) continue
@@ -614,10 +715,10 @@ class ColumnarDecoder(private val buf: ByteArray) {
      * for list columns (scalar arrays and relation lists) in columnar form.
      */
     fun readColumnBytes(): List<ByteArray> {
+        checkRemaining(count)
         val result = Array(count) { ByteArray(0) }
         for (i in 0 until count) {
-            val len = readVarintRaw().toInt()
-            checkRemaining(len)
+            val len = readByteLength()
             result[i] = buf.copyOfRange(off, off + len)
             off += len
         }
@@ -626,11 +727,11 @@ class ColumnarDecoder(private val buf: ByteArray) {
 
     /** Read [count] nullable byte blobs (0x00=null, 0x01+length+bytes). */
     fun readColumnBytesPtr(): List<ByteArray?> {
+        checkRemaining(count)
         val result = arrayOfNulls<ByteArray>(count)
         for (i in 0 until count) {
             if (!readCanonicalMarker("nullable")) continue
-            val len = readVarintRaw().toInt()
-            checkRemaining(len)
+            val len = readByteLength()
             result[i] = buf.copyOfRange(off, off + len)
             off += len
         }
@@ -640,6 +741,11 @@ class ColumnarDecoder(private val buf: ByteArray) {
     /** Current read position (for reading pagination metadata after 0x00). */
     fun offset(): Int = off
 
+    /** Validate the batch boundary after any pagination metadata has been read. */
+    fun checkComplete() {
+        if (off != buf.size) throw LuxoCodecException("trailing columnar data")
+    }
+
     /** Read one signed zigzag-encoded varint at current position. */
     fun readSvarint(): Long {
         val uv = readVarintRaw()
@@ -648,6 +754,11 @@ class ColumnarDecoder(private val buf: ByteArray) {
 
     // -- internal ---------------------------------------------------------
 
+    private fun readByteLength(): Int {
+        val length = readVarintRaw()
+        return checkedMetadata(length, buf.size - off, "byte length")
+    }
+
     private fun readVarintRaw(): Long {
         var result: Long = 0
         var shift = 0
@@ -655,7 +766,10 @@ class ColumnarDecoder(private val buf: ByteArray) {
             checkRemaining(1)
             val b = buf[off++].toLong() and 0xFF
             result = result or ((b and 0x7F) shl shift)
-            if (b and 0x80 == 0L) break
+            if (b and 0x80 == 0L) {
+                if (shift == 63 && b > 1) throw LuxoCodecException("varint overflow")
+                break
+            }
             shift += 7
             if (shift >= 64) throw LuxoCodecException("varint overflow")
         }
@@ -673,7 +787,7 @@ class ColumnarDecoder(private val buf: ByteArray) {
     }
 
     private fun checkRemaining(n: Int) {
-        if (off + n > buf.size) {
+        if (n > buf.size - off) {
             throw LuxoCodecException("unexpected end of buffer at offset $off, need $n bytes")
         }
     }
@@ -711,19 +825,18 @@ object UuidCodec {
      */
     fun parse(s: String): ByteArray {
         if (s.length != 36) throw LuxoCodecException("invalid UUID length: ${s.length}")
+        if (s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-') {
+            throw LuxoCodecException("invalid UUID separators: $s")
+        }
         val out = ByteArray(16)
-        var j = 0
         var i = 0
-        while (i < s.length) {
-            val c = s[i]
-            if (c == '-') { i++; continue }
-            if (i + 1 >= s.length || j >= 16) throw LuxoCodecException("invalid UUID: $s")
+        for (j in 0 until 16) {
+            if (j == 4 || j == 6 || j == 8 || j == 10) i++
             val hi = nibble(s[i])
             val lo = nibble(s[i + 1])
-            out[j++] = ((hi shl 4) or lo).toByte()
+            out[j] = ((hi shl 4) or lo).toByte()
             i += 2
         }
-        if (j != 16) throw LuxoCodecException("invalid UUID: $s")
         return out
     }
 
@@ -738,14 +851,47 @@ object UuidCodec {
 /**
  * DateTime wire-format helpers.
  *
- * On the Luxo binary wire a DateTime is svarint(unix seconds). JSON / API
+ * On the Luxo binary wire a DateTime is signed seconds plus unsigned nanos. JSON / API
  * surfaces use an ISO-8601 string. Both SDK modes expose DateTime as a Kotlin
  * `String`, so binary decoding converts seconds to the canonical ISO form.
  */
 object DateTimeCodec {
+    private val timestampPattern = Regex("""[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?([Zz]|[+-]([0-9]{2}):([0-9]{2}))""")
 
-    /** Convert Unix seconds to an ISO-8601 (UTC) string, e.g. "2026-05-28T10:00:00Z". */
-    fun toIso(seconds: Long): String = java.time.Instant.ofEpochSecond(seconds).toString()
+    fun parse(value: String): java.time.Instant {
+        val match = timestampPattern.matchEntire(value) ?: throw LuxoCodecException("DateTime requires RFC3339 with at most 9 fractional digits")
+        val zone = match.groups[1]!!
+        val hours = match.groups[2]?.value?.toInt() ?: 0
+        val minutes = match.groups[3]?.value?.toInt() ?: 0
+        if (hours > 23 || minutes > 59) throw LuxoCodecException("invalid DateTime offset")
+        val offset = (hours * 3600 + minutes * 60) * (if (zone.value[0] == '-') -1 else 1)
+        val local = try {
+            java.time.LocalDateTime.parse(value.substring(0, zone.range.first))
+        } catch (_: java.time.DateTimeException) {
+            throw LuxoCodecException("invalid DateTime calendar")
+        }
+        val seconds = local.toEpochSecond(java.time.ZoneOffset.UTC) - offset
+        requireRange(seconds)
+        return java.time.Instant.ofEpochSecond(seconds, local.nano.toLong())
+    }
+
+    fun validate(value: String): String {
+        parse(value)
+        return value
+    }
+
+    private fun requireRange(seconds: Long) {
+        if (seconds < -62167219200L || seconds > 253402300799L) throw LuxoCodecException("DateTime out of range")
+    }
+
+    /** Format the fraction separately to match Go's trimmed RFC3339Nano output. */
+    fun toIso(seconds: Long, nanoseconds: Long = 0): String {
+        requireRange(seconds)
+        if (nanoseconds !in 0..999999999) throw LuxoCodecException("invalid DateTime nanoseconds")
+        val whole = java.time.Instant.ofEpochSecond(seconds).toString()
+        if (nanoseconds == 0L) return whole
+        return whole.dropLast(1) + "." + nanoseconds.toString().padStart(9, '0').trimEnd('0') + "Z"
+    }
 }
 
 class LuxoCodecException(message: String) : RuntimeException(message)

@@ -201,7 +201,7 @@ func (g *GeneratorContext) Generate(result *semantic.Result, packageName string,
 	}
 
 	// error.gen.go — typed error constructors
-	if errorSrc := generateErrorFile(result, packageName); errorSrc != nil {
+	if errorSrc := g.generateErrorFile(result, packageName); errorSrc != nil {
 		gr.Files["error.gen.go"] = errorSrc
 	}
 

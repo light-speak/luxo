@@ -1,0 +1,142 @@
+const _iterations = 5000;
+
+void main() {
+  for (final mode in TransportMode.values) {
+    for (final id in <Object>[1, BigInt.parse('18446744073709551615')]) {
+      _compareDispatch(mode, id, false);
+      _compareDispatch(mode, id, true);
+      _measureTermination(mode, id);
+    }
+  }
+  print('Baseline keeps pre-terminal dispatch with current shared decoding/storage; not the original release.');
+  print('Terminal columns are complete/error absolute costs, not a regression comparison.');
+  print('Local dispatch only; excludes sockets, setup, callback decoding and allocation measurements.');
+}
+
+Uint8List _frame(int tag, Object id, List<int> payload) {
+  final encoder = LuxoEncoder()..writeVarint(tag);
+  _writeSequence(encoder, id);
+  return Uint8List.fromList([...encoder.bytes(), ...payload]);
+}
+
+void _compareDispatch(TransportMode mode, Object id, bool unary) {
+  final before = _BeforeTerminal();
+  final after = WsTransport('ws://unused', autoReconnect: false);
+  var oldCount = 0;
+  var newCount = 0;
+  before._subscriptions[id] = _Subscription(mode, (value) => value, (_) => oldCount++, null);
+  after._subscriptions[id] = _Subscription(mode, (value) => value, (_) => newCount++, null);
+  final json = '{"${unary ? r'$id' : r'$stream'}":$id,"data":42}';
+  final binary = _frame(unary ? 2 : 0x12, id, [42]);
+  int run(WsTransport transport) {
+    for (var i = 0; i < _iterations; i++) {
+      if (unary) transport._pending[id] = Completer<dynamic>.sync();
+      if (mode == TransportMode.json) transport._handleJsonResponse(json);
+      else transport._handleBinaryResponse(binary);
+    }
+    return unary ? transport._pending.length : (identical(transport, before) ? oldCount : newCount);
+  }
+  benchmark.compareBenchmarks('$mode ${unary ? 'unary' : 'data'} id=${id is int ? 'small' : 'maximum'}',
+    () => run(before), () => run(after), iterations: _iterations, includeRange: true);
+  if (oldCount != newCount || before._pending.isNotEmpty || after._pending.isNotEmpty) {
+    throw StateError('Dispatch failed');
+  }
+  before.close(); after.close();
+}
+
+void _measureTermination(TransportMode mode, Object id) {
+  final transport = WsTransport('ws://unused', autoReconnect: false);
+  var count = 0;
+  final subscription = _Subscription(mode, (value) => value, (_) => throw StateError('Unexpected data'), null,
+    onDone: () => count++, onError: (error) { if (error.error != 'Rejected') throw error; count++; });
+  final payload = (LuxoEncoder()..writeFieldInt(1, LuxoInt64.fromInt(422))
+    ..writeFieldString(2, 'Rejected')..writeFieldString(3, 'rejected')..writeEnd()).bytes();
+  final json = ['{"\$end":$id,"ok":true}', '{"\$end":$id,"error":"Rejected","code":422,"message":"rejected"}'];
+  final binary = [_frame(0x15, id, []), _frame(0x16, id, payload)];
+  int run(int failure) {
+    for (var i = 0; i < _iterations; i++) {
+      transport._subscriptions[id] = subscription;
+      if (mode == TransportMode.json) transport._handleJsonResponse(json[failure]);
+      else transport._handleBinaryResponse(binary[failure]);
+    }
+    return count;
+  }
+  for (var i = 0; i < 2; i++) {
+    final previous = count;
+    run(i);
+    if (count != previous + _iterations || transport._subscriptions.isNotEmpty) throw StateError('Terminal probe failed');
+  }
+  benchmark.compareBenchmarks('$mode terminal complete/error (absolute) id=${id is int ? 'small' : 'maximum'}',
+    () => run(0), () => run(1), iterations: _iterations, includeRange: true);
+  transport.close();
+}
+
+// Frozen pre-terminal methods use current shared helpers and typed subscription
+// storage. This does not measure the original release or extra callback slots.
+class _BeforeTerminal extends WsTransport {
+  _BeforeTerminal() : super('ws://unused', autoReconnect: false);
+
+  @override
+  void _handleJsonResponse(String data) {
+    try {
+      final json = decodeLuxoJSON(data, preserveNumberSyntax: true) as Map<String, dynamic>;
+      if (json.containsKey(r'$sub')) {
+        final subscription = uint64FromJSON(json[r'$sub']);
+        if (subscription == null) return;
+        if (!json.containsKey('error') && json['ok'] != true) return;
+        _acknowledgeSubscription(subscription, TransportMode.json,
+          json.containsKey('error') ? decodeJSONError(json, 0) : null);
+        return;
+      }
+      if (json.containsKey(r'$stream')) {
+        final stream = uint64FromJSON(json[r'$stream']);
+        if (stream != null) _deliverSubscription(stream, TransportMode.json, json['data']);
+        return;
+      }
+      final id = uint64FromJSON(json[r'$id']);
+      if (id == null) return;
+      final c = _pending.remove(id);
+      if (c == null) return;
+      if (json.containsKey('error')) c.completeError(decodeJSONError(json, 0));
+      else c.complete(json['data']);
+    } catch (_) {}
+  }
+
+  @override
+  void _handleBinaryResponse(Uint8List data) {
+    if (data.length < 2) return;
+    final frameType = data[0];
+    if (frameType != BinaryFrameType.callSuccess && frameType != BinaryFrameType.callError &&
+        frameType != BinaryFrameType.stream && frameType != BinaryFrameType.subscribeSuccess &&
+        frameType != BinaryFrameType.subscribeError) return;
+    var low = 0;
+    var high = 0;
+    for (var i = 0; i < 10 && i + 1 < data.length; i++) {
+      final byte = data[i + 1];
+      if (i == 9 && byte > 1) return;
+      final payload = byte & 127;
+      if (i < 4) low |= payload << (i * 7);
+      else if (i == 4) { low = (low | (payload << 28)) & 0xffffffff; high = payload >>> 4; }
+      else high |= payload << (i * 7 - 32);
+      if (byte < 128) { _dispatchBinaryResponse(data, frameType, uint64FromWords(low, high), i + 2); return; }
+    }
+  }
+
+  @override
+  void _dispatchBinaryResponse(Uint8List data, int frameType, Object id, int off) {
+    if (frameType == BinaryFrameType.subscribeSuccess || frameType == BinaryFrameType.subscribeError) {
+      if (frameType == BinaryFrameType.subscribeSuccess && off != data.length) return;
+      _acknowledgeSubscription(id, TransportMode.binary,
+        frameType == BinaryFrameType.subscribeError ? decodeBinaryError(Uint8List.sublistView(data, off), 0) : null);
+      return;
+    }
+    if (frameType == BinaryFrameType.stream) {
+      _deliverSubscription(id, TransportMode.binary, Uint8List.sublistView(data, off));
+      return;
+    }
+    final c = _pending.remove(id);
+    if (c == null) return;
+    if (frameType == BinaryFrameType.callError) c.completeError(decodeBinaryError(Uint8List.sublistView(data, off), 0));
+    else c.complete(Uint8List.sublistView(data, off));
+  }
+}

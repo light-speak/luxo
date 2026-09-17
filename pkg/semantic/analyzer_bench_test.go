@@ -11,6 +11,32 @@ import (
 	"github.com/light-speak/luxo/pkg/parser"
 )
 
+// Isolate the added compile-time validation; no request handler calls this pass.
+func BenchmarkErrorDeclarationValidation(b *testing.B) {
+	for _, count := range []int{0, 1, 16} {
+		b.Run(fmt.Sprintf("fields_%d", count), func(b *testing.B) {
+			analyzer := New()
+			file := &ast.File{}
+			if count > 0 {
+				declaration := &ast.ErrorDecl{Name: "Rejected"}
+				for index := range count {
+					declaration.Fields = append(declaration.Fields, &ast.ParamDecl{
+						Name: fmt.Sprintf("value%d", index), Type: &ast.TypeRef{Name: "JSON"},
+					})
+				}
+				file.Errors = []*ast.ErrorDecl{declaration}
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				analyzer.resolveErrorTypes(file)
+			}
+			if len(analyzer.errors) != 0 {
+				b.Fatal(analyzer.errors)
+			}
+		})
+	}
+}
+
 // Representative .luxo source for semantic analysis benchmarks.
 const benchSemanticInput = `
 enum Role {

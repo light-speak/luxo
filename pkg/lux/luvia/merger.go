@@ -11,8 +11,8 @@ import (
 //
 //	[arenaHeader varint][fieldID][value]...[0x00 end]
 //
-// Each extend response is also a WriteLuxo output from batchLoad, wrapped
-// with its parent field ID so the client can decode it correctly.
+// Each extend response is a canonical field value (presence marker when
+// nullable, then a length-prefixed object or columnar sub-message).
 //
 // Strategy: strip the primary's end marker, append extend fields (each
 // prefixed with its field ID), then write a new end marker.
@@ -57,7 +57,7 @@ func Merge(primary []byte, extends []ExtendResult) []byte {
 // ExtendResult holds the resolved data for one extend field.
 type ExtendResult struct {
 	FieldID int    // field ID in the parent model
-	Data    []byte // encoded value (list: [count][items...], single: [arenaHeader][fields][0x00])
+	Data    []byte // canonical field value: optional presence marker + length-prefixed sub-message
 }
 
 // BinaryKeys stores primary-key values exactly as encoded on the wire. The
@@ -82,86 +82,44 @@ func (k BinaryKeys) EncodeParam(fieldID int) []byte {
 	return append(result, 0)
 }
 
+// EncodeResolveParams adds the requested value shape without re-encoding keys.
+func (k BinaryKeys) EncodeResolveParams(shape int) []byte {
+	result := k.EncodeParam(1)
+	result = append(result[:len(result)-1], 2)
+	result = codec.AppendSvarint(result, int64(shape))
+	return append(result, 0)
+}
+
 // ExtractPrimaryKeys extracts one primary key while preserving its wire
 // representation. This is the single-record federation path.
 func ExtractPrimaryKeys(primary []byte, keyField *schema.Field, model *schema.Model, registry *schema.Schema) (BinaryKeys, bool) {
-	if len(primary) == 0 || keyField == nil || model == nil || registry == nil || !isFederationKeyType(keyField.Type) {
+	if len(primary) == 0 || keyField == nil || model == nil || registry == nil || !isFederationKeyType(keyField.Type) || keyField.Nullable || keyField.IsList {
 		return BinaryKeys{}, false
 	}
 	dec := codec.NewDecoder(primary)
-	dec.SkipArenaHeader()
+	dec.ReadArenaSize()
+	var keys BinaryKeys
 	for dec.NextField() {
 		fieldID := dec.FieldID()
 		field := model.FieldByID(fieldID)
 		if field == nil {
 			return BinaryKeys{}, false
 		}
-		if fieldID == keyField.ID {
-			start := dec.Offset()
-			if !skipSchemaRowField(dec, field, registry) {
-				return BinaryKeys{}, false
-			}
-			return BinaryKeys{count: 1, values: primary[start:dec.Offset()]}, true
-		}
-		if !skipSchemaRowField(dec, field, registry) {
+		start := dec.Offset()
+		if !skipResponseField(dec, field, registry, false, 0) {
 			return BinaryKeys{}, false
 		}
-	}
-	return BinaryKeys{}, false
-}
-
-func skipSchemaRowField(dec *codec.Decoder, field *schema.Field, registry *schema.Schema) bool {
-	if field.Relation {
-		return skipNestedRowField(dec, field, registry)
-	}
-	if field.IsList {
-		element := *field
-		element.Nullable = false
-		element.IsList = false
-		dec.SkipArray(schemaFieldToSkipType(&element))
-	} else {
-		dec.SkipValue(schemaFieldToSkipType(field))
-	}
-	return dec.Err() == nil
-}
-
-func skipNestedRowField(dec *codec.Decoder, field *schema.Field, registry *schema.Schema) bool {
-	nested := registry.Models[field.TypeName]
-	if nested == nil {
-		if declaration := registry.Types[field.TypeName]; declaration != nil {
-			nested = declaration.AsModel()
-		}
-	}
-	if nested == nil {
-		return false
-	}
-	if field.IsList {
-		count := dec.ReadArrayLength()
-		if dec.Err() != nil {
-			return false
-		}
-		for range count {
-			if !skipModelRow(dec, nested, registry) {
-				return false
+		if fieldID == keyField.ID {
+			if keys.count != 0 {
+				return BinaryKeys{}, false
 			}
-		}
-		return true
-	}
-	if field.Nullable && !dec.ReadBool() {
-		return dec.Err() == nil
-	}
-	return skipModelRow(dec, nested, registry)
-}
-
-func skipModelRow(dec *codec.Decoder, model *schema.Model, registry *schema.Schema) bool {
-	dec.SkipArenaHeader()
-	for dec.NextField() {
-		field := model.FieldByID(dec.FieldID())
-		if field == nil || !skipSchemaRowField(dec, field, registry) {
-			return false
+			keys = BinaryKeys{count: 1, values: primary[start:dec.Offset()]}
 		}
 	}
-	return dec.Err() == nil
+	if dec.Finish() != nil || keys.count == 0 {
+		return BinaryKeys{}, false
+	}
+	return keys, true
 }
 
 // ExtractID reads the id field from a primary binary response using schema type info.
@@ -227,14 +185,23 @@ func ExtractIDColumn(data []byte, idFieldID int, model *schema.Model) []int64 {
 // ExtractPrimaryKeyColumn extracts a complete primary-key column while
 // preserving its wire representation. The returned bytes reference data.
 func ExtractPrimaryKeyColumn(data []byte, keyField *schema.Field, model *schema.Model) (BinaryKeys, bool) {
-	if len(data) == 0 || keyField == nil || model == nil || !isFederationKeyType(keyField.Type) {
+	if len(data) == 0 || keyField == nil || model == nil || !isFederationKeyType(keyField.Type) || keyField.Nullable || keyField.IsList {
 		return BinaryKeys{}, false
 	}
 	r := codec.NewColumnarReader(data)
 	if r.Err() != nil || r.Count() == 0 {
 		return BinaryKeys{}, false
 	}
-	for r.NextColumn() {
+	var keys BinaryKeys
+	for {
+		columnStart := r.Offset()
+		if !r.NextColumn() {
+			end, size := codec.ReadVarint(data, columnStart)
+			if r.Err() != nil || size <= 0 || end != 0 || columnStart+size != len(data) || keys.count == 0 {
+				return BinaryKeys{}, false
+			}
+			return keys, true
+		}
 		field := model.FieldByID(r.FieldID())
 		if field == nil {
 			return BinaryKeys{}, false
@@ -245,10 +212,12 @@ func ExtractPrimaryKeyColumn(data []byte, keyField *schema.Field, model *schema.
 			return BinaryKeys{}, false
 		}
 		if field.ID == keyField.ID {
-			return BinaryKeys{count: r.Count(), values: data[start:r.Offset()]}, true
+			if keys.count != 0 {
+				return BinaryKeys{}, false
+			}
+			keys = BinaryKeys{count: r.Count(), values: data[start:r.Offset()]}
 		}
 	}
-	return BinaryKeys{}, false
 }
 
 // skipColumnarColumn advances past all values in a column without allocating.
@@ -262,7 +231,13 @@ func skipColumnarColumn(r *codec.ColumnarReader, f *schema.Field) {
 		return
 	}
 	switch f.Type {
-	case schema.FieldInt, schema.FieldDateTime, schema.FieldDuration:
+	case schema.FieldDateTime:
+		if f.Nullable {
+			r.SkipColumnDateTimePtr()
+		} else {
+			r.SkipColumnDateTime()
+		}
+	case schema.FieldInt, schema.FieldDuration:
 		if f.Nullable {
 			r.SkipColumnIntPtr()
 		} else {
@@ -274,7 +249,7 @@ func skipColumnarColumn(r *codec.ColumnarReader, f *schema.Field) {
 		} else {
 			r.SkipColumnFloat()
 		}
-	case schema.FieldString, schema.FieldEnum:
+	case schema.FieldString, schema.FieldEnum, schema.FieldDecimal:
 		if f.Nullable {
 			r.SkipColumnStringPtr()
 		} else {
@@ -292,10 +267,12 @@ func skipColumnarColumn(r *codec.ColumnarReader, f *schema.Field) {
 		} else {
 			r.SkipColumnUUID()
 		}
-	case schema.FieldModel:
-		r.SkipColumnBytes()
 	default:
-		r.SkipColumnBytes()
+		if f.Nullable {
+			r.SkipColumnBytesPtr()
+		} else {
+			r.SkipColumnBytes()
+		}
 	}
 }
 
@@ -303,9 +280,8 @@ func skipColumnarColumn(r *codec.ColumnarReader, f *schema.Field) {
 // Each ExtendColumnResult represents one extend field with per-record blob data.
 //
 // Format of extend column: [fieldID varint][blob0][blob1]...[blobN]
-// Each blob is length-prefixed: [varint len][binary data]
-// The binary data is the WriteLuxo output for that extend field value
-// (for lists: [count varint][model1][model2]..., for single: full WriteLuxo).
+// Each blob already includes its optional presence marker and length prefix.
+// The body is WriteColumnar output for a list or WriteLuxo for an object.
 //
 // Strategy: strip the end marker (0x00), append extend columns, new end marker.
 func MergeColumnar(primary []byte, extends []ExtendColumnResult) []byte {
@@ -337,7 +313,7 @@ func MergeColumnar(primary []byte, extends []ExtendColumnResult) []byte {
 		}
 		result = codec.AppendVarint(result, uint64(ext.FieldID))
 		for _, blob := range ext.Blobs {
-			result = codec.AppendBytes(result, blob)
+			result = append(result, blob...)
 		}
 	}
 
@@ -349,74 +325,68 @@ func MergeColumnar(primary []byte, extends []ExtendColumnResult) []byte {
 // ExtendColumnResult holds per-record blob data for one extend field.
 type ExtendColumnResult struct {
 	FieldID int      // field ID in the parent model
-	Blobs   [][]byte // one blob per record (index = record index)
+	Blobs   [][]byte // canonical field values, one per record (index = record index)
 }
 
-// ParseGroupedResponse parses a svc:resolve grouped response into per-record blobs.
-//
-// Response format (from svc:resolve handler):
-//
-//	[key_count varint]
-//	For each key (in request order):
-//	  [item_count varint]
-//	  [item1_len varint][item1 bytes]   ← length-prefixed
-//	  [item2_len varint][item2 bytes]
-//	  ...
-//
-// For list extend fields: returns per-key blob = [count varint][item1 bytes][item2 bytes]...
-// For single extend fields: returns per-key blob = the single item bytes (or nil).
-func ParseGroupedResponse(resp []byte, isList bool) [][]byte {
-	if len(resp) == 0 {
-		return nil
-	}
+// ParseGroupedResponse indexes canonical relation values in request key order.
+// Each value is [present?][length][sub-message], exactly as embedded in a row
+// or column. A null is a one-byte value, never an omitted field. The returned
+// slices borrow resp; callers must keep it alive until merging completes.
+func ParseGroupedResponse(resp []byte, nullable bool) [][]byte {
 	keyCount, n := codec.ReadVarint(resp, 0)
-	if n <= 0 {
+	if n <= 0 || keyCount > codec.MaxArrayElements || keyCount > uint64(len(resp)-n) {
 		return nil
 	}
 	off := n
-
-	blobs := make([][]byte, keyCount)
-	for i := 0; i < int(keyCount); i++ {
-		itemCount, cn := codec.ReadVarint(resp, off)
-		if cn <= 0 {
-			return blobs
-		}
-		off += cn
-
-		if isList {
-			// Collect all items for this key into a list blob:
-			// [count varint][item1 raw bytes][item2 raw bytes]...
-			var listBuf []byte
-			listBuf = codec.AppendArrayHeader(listBuf, int(itemCount))
-			for j := 0; j < int(itemCount); j++ {
-				item, rn := codec.ReadBytes(resp, off)
-				if rn == 0 {
-					return blobs
-				}
-				off += rn
-				listBuf = append(listBuf, item...)
+	blobs := make([][]byte, int(keyCount))
+	for i := range blobs {
+		start := off
+		if nullable {
+			if off >= len(resp) || resp[off] > 1 {
+				return nil
 			}
-			blobs[i] = listBuf
-		} else {
-			if itemCount == 0 {
-				blobs[i] = nil
-			} else {
-				item, rn := codec.ReadBytes(resp, off)
-				if rn == 0 {
-					return blobs
-				}
-				off += rn
-				blobs[i] = item
-				// Skip remaining items (shouldn't exist for single field)
-				for j := 1; j < int(itemCount); j++ {
-					_, rn := codec.ReadBytes(resp, off)
-					if rn == 0 {
-						return blobs
-					}
-					off += rn
-				}
+			off++
+			if resp[start] == 0 {
+				blobs[i] = resp[start:off]
+				continue
 			}
 		}
+		body, consumed := codec.ReadBytes(resp, off)
+		if consumed <= 0 || len(body) == 0 {
+			return nil
+		}
+		off += consumed
+		blobs[i] = resp[start:off]
+	}
+	if off != len(resp) {
+		return nil
 	}
 	return blobs
+}
+
+// ValidateResolvedFields checks child boundaries without decoding models or
+// converting row/column formats. Missing required values and malformed children
+// fail the entire group before the gateway publishes any bytes.
+func ValidateResolvedFields(blobs [][]byte, step ExtendStep, registry *schema.Schema) bool {
+	if registry == nil {
+		return false
+	}
+	fields, ok := nestedResponseFields(registry, step.ModelName)
+	if !ok {
+		return false
+	}
+	for _, blob := range blobs {
+		dec := codec.NewDecoder(blob)
+		if step.Nullable && !dec.ReadBool() {
+			if dec.Finish() != nil {
+				return false
+			}
+			continue
+		}
+		body := dec.ReadBytes()
+		if dec.Finish() != nil || !skipModelResponse(body, fields, registry, step.IsList, 0) {
+			return false
+		}
+	}
+	return true
 }

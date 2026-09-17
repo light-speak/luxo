@@ -1,3 +1,6 @@
+import 'int64.dart';
+import 'json.dart';
+
 /// Three-state optional argument used by patch APIs.
 ///
 /// `absent` leaves the field unchanged, while `present(null)` explicitly
@@ -6,9 +9,7 @@ class LuxoOptional<T> {
   final bool isPresent;
   final T? value;
 
-  const LuxoOptional.absent()
-      : isPresent = false,
-        value = null;
+  const LuxoOptional.absent() : isPresent = false, value = null;
 
   const LuxoOptional.present(this.value) : isPresent = true;
 }
@@ -21,13 +22,9 @@ class Selected<T> {
   final bool isSelected;
   final T? _value;
 
-  const Selected.unselected()
-      : isSelected = false,
-        _value = null;
+  const Selected.unselected() : isSelected = false, _value = null;
 
-  const Selected.value(T value)
-      : isSelected = true,
-        _value = value;
+  const Selected.value(T value) : isSelected = true, _value = value;
 
   T get value {
     if (!isSelected) {
@@ -40,19 +37,19 @@ class Selected<T> {
 enum TypeUsage { input, output, inputOutput, unused }
 
 TypeUsage? _typeUsageFromJson(Object? value) => switch (value) {
-      'input' => TypeUsage.input,
-      'output' => TypeUsage.output,
-      'inputOutput' => TypeUsage.inputOutput,
-      'unused' => TypeUsage.unused,
-      _ => null,
-    };
+  'input' => TypeUsage.input,
+  'output' => TypeUsage.output,
+  'inputOutput' => TypeUsage.inputOutput,
+  'unused' => TypeUsage.unused,
+  _ => null,
+};
 
 /// Paginated list response.
 class Page<T> {
   final List<T> items;
-  final int total;
-  final int page;
-  final int pageSize;
+  final LuxoInt64 total;
+  final LuxoInt64 page;
+  final LuxoInt64 pageSize;
 
   const Page({
     required this.items,
@@ -70,9 +67,9 @@ class Page<T> {
       items: (json['items'] as List)
           .map((e) => fromJson(e as Map<String, dynamic>))
           .toList(),
-      total: json['total'] as int,
-      page: json['page'] as int,
-      pageSize: json['pageSize'] as int,
+      total: luxoInt64FromJSON(json['total']),
+      page: luxoInt64FromJSON(json['page']),
+      pageSize: luxoInt64FromJSON(json['pageSize']),
     );
   }
 }
@@ -84,11 +81,12 @@ class LuxoSchema {
   final Map<String, LuxoEnum> enums;
   final Map<String, LuxoTypeDecl> types;
 
-  const LuxoSchema(
-      {required this.models,
-      required this.apis,
-      this.enums = const {},
-      this.types = const {}});
+  const LuxoSchema({
+    required this.models,
+    required this.apis,
+    this.enums = const {},
+    this.types = const {},
+  });
 
   factory LuxoSchema.fromJson(Map<String, dynamic> json) {
     final models = <String, LuxoModel>{};
@@ -124,9 +122,9 @@ class LuxoEnum {
   final List<String> values;
   const LuxoEnum({required this.name, required this.values});
   factory LuxoEnum.fromJson(Map<String, dynamic> json) => LuxoEnum(
-        name: json['name'] as String,
-        values: (json['values'] as List).cast<String>(),
-      );
+    name: json['name'] as String,
+    values: (json['values'] as List).cast<String>(),
+  );
 }
 
 class LuxoTypeDecl {
@@ -135,12 +133,12 @@ class LuxoTypeDecl {
   final List<LuxoField> fields;
   const LuxoTypeDecl({required this.name, this.usage, required this.fields});
   factory LuxoTypeDecl.fromJson(Map<String, dynamic> json) => LuxoTypeDecl(
-        name: json['name'] as String,
-        usage: _typeUsageFromJson(json['usage']),
-        fields: (json['fields'] as List)
-            .map((e) => LuxoField.fromJson(e as Map<String, dynamic>))
-            .toList(),
-      );
+    name: json['name'] as String,
+    usage: _typeUsageFromJson(json['usage']),
+    fields: (json['fields'] as List)
+        .map((e) => LuxoField.fromJson(e as Map<String, dynamic>))
+        .toList(),
+  );
 }
 
 class LuxoModel {
@@ -151,12 +149,12 @@ class LuxoModel {
   const LuxoModel({required this.name, this.usage, required this.fields});
 
   factory LuxoModel.fromJson(Map<String, dynamic> json) => LuxoModel(
-        name: json['name'] as String,
-        usage: _typeUsageFromJson(json['usage']),
-        fields: (json['fields'] as List)
-            .map((e) => LuxoField.fromJson(e as Map<String, dynamic>))
-            .toList(),
-      );
+    name: json['name'] as String,
+    usage: _typeUsageFromJson(json['usage']),
+    fields: (json['fields'] as List)
+        .map((e) => LuxoField.fromJson(e as Map<String, dynamic>))
+        .toList(),
+  );
 }
 
 class LuxoField {
@@ -179,14 +177,14 @@ class LuxoField {
   });
 
   factory LuxoField.fromJson(Map<String, dynamic> json) => LuxoField(
-        id: json['id'] as int,
-        name: json['name'] as String,
-        type: json['type'] as String,
-        typeName: json['typeName'] as String?,
-        nullable: json['nullable'] as bool? ?? false,
-        isList: json['isList'] as bool? ?? false,
-        relation: json['relation'] as bool? ?? false,
-      );
+    id: json['id'] as int,
+    name: json['name'] as String,
+    type: json['type'] as String,
+    typeName: json['typeName'] as String?,
+    nullable: json['nullable'] as bool? ?? false,
+    isList: json['isList'] as bool? ?? false,
+    relation: json['relation'] as bool? ?? false,
+  );
 }
 
 class LuxoAPI {
@@ -213,19 +211,20 @@ class LuxoAPI {
   });
 
   factory LuxoAPI.fromJson(Map<String, dynamic> json) => LuxoAPI(
-        id: json['id'] as int,
-        name: json['name'] as String,
-        module: json['module'] as String,
-        returnType: json['returnType'] as String?,
-        returnList: json['returnList'] as bool? ?? false,
-        paginated: json['paginated'] as bool? ?? false,
-        defaultPageSize: json['defaultPageSize'] as int?,
-        stream: json['stream'] as bool? ?? false,
-        params: (json['params'] as List?)
-                ?.map((e) => LuxoParam.fromJson(e as Map<String, dynamic>))
-                .toList() ??
-            [],
-      );
+    id: json['id'] as int,
+    name: json['name'] as String,
+    module: json['module'] as String,
+    returnType: json['returnType'] as String?,
+    returnList: json['returnList'] as bool? ?? false,
+    paginated: json['paginated'] as bool? ?? false,
+    defaultPageSize: json['defaultPageSize'] as int?,
+    stream: json['stream'] as bool? ?? false,
+    params:
+        (json['params'] as List?)
+            ?.map((e) => LuxoParam.fromJson(e as Map<String, dynamic>))
+            .toList() ??
+        [],
+  );
 }
 
 class LuxoParam {
@@ -248,12 +247,12 @@ class LuxoParam {
   });
 
   factory LuxoParam.fromJson(Map<String, dynamic> json) => LuxoParam(
-        id: json['id'] as int,
-        name: json['name'] as String,
-        type: json['type'] as String,
-        typeName: json['typeName'] as String?,
-        isList: json['isList'] as bool? ?? false,
-        nullable: json['nullable'] as bool? ?? false,
-        hasDefault: json['hasDefault'] as bool? ?? false,
-      );
+    id: json['id'] as int,
+    name: json['name'] as String,
+    type: json['type'] as String,
+    typeName: json['typeName'] as String?,
+    isList: json['isList'] as bool? ?? false,
+    nullable: json['nullable'] as bool? ?? false,
+    hasDefault: json['hasDefault'] as bool? ?? false,
+  );
 }

@@ -2,12 +2,14 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart' as http_testing;
 import 'package:test/test.dart';
 import 'package:luxo_client/src/transport.dart';
 import 'package:luxo_client/src/codec.dart';
 import 'package:luxo_client/src/error.dart';
+import 'package:luxo_client/src/int64.dart';
 
 class _TestInput implements LuxoBinaryEncodable {
   final String value;
@@ -217,14 +219,12 @@ void main() {
         final mockClient = http_testing.MockClient((request) async {
           callCount++;
           if (callCount == 1) {
-            return http.Response(
-              jsonEncode({
-                'error': 'Unauthorized',
-                'code': 401,
-                'message': 'expired',
-              }),
-              401,
-            );
+            final error = LuxoEncoder()
+              ..writeFieldInt(1, LuxoInt64.fromInt(401))
+              ..writeFieldString(2, 'Unauthorized')
+              ..writeFieldString(3, 'expired')
+              ..writeEnd();
+            return http.Response.bytes(error.bytes(), 401);
           }
           // Return valid binary response on retry
           return http.Response.bytes([0x00], 200);
@@ -352,7 +352,13 @@ void main() {
 
         await expectLater(
           transport.call<dynamic>('user.get'),
-          throwsA(isA<LuxoError>().having((error) => error.message, 'message', contains(r'$select is required'))),
+          throwsA(
+            isA<LuxoError>().having(
+              (error) => error.message,
+              'message',
+              contains(r'$select is required'),
+            ),
+          ),
         );
         await transport.call<dynamic>('health');
         transport.close();
@@ -507,8 +513,8 @@ void main() {
                 .having((e) => e.error, 'error', 'BadRequest')
                 .having((e) => e.code, 'code', 400)
                 .having((e) => e.traceId, 'traceId', 't')
-                .having((e) => e.data, 'data', {}).having(
-                    (e) => e.cause, 'cause', 'c'),
+                .having((e) => e.data, 'data', {})
+                .having((e) => e.cause, 'cause', 'c'),
           ),
         );
         transport.close();
@@ -678,6 +684,29 @@ void main() {
           throwsFormatException,
         );
       });
+
+      test(
+        'DateTime parameters preserve nanoseconds at fractional boundaries',
+        () {
+          final corpus = jsonDecode(
+            File('../../pkg/lux/codec/testdata/protocol-v1.json')
+                .readAsStringSync(),
+          ) as Map<String, Object?>;
+          final cases = (corpus['dateTimeCases']! as List<Object?>)
+              .cast<Map<String, Object?>>();
+          for (final item in cases) {
+            final value = item['input']! as String;
+            final enc = LuxoEncoder();
+            encodeParam(enc, const ParamSchema(1, 'at', 'DateTime'), value);
+            enc.writeEnd();
+            final dec = LuxoDecoder(enc.bytes());
+            expect(dec.nextField(), isTrue);
+            expect(dec.readDateTime(), item['canonical'], reason: value);
+            expect(dec.nextField(), isFalse);
+            expect(dec.error, isNull);
+          }
+        },
+      );
     });
   });
 
@@ -690,8 +719,8 @@ void main() {
         socket.listen((message) {
           final json = jsonDecode(message as String) as Map<String, dynamic>;
           if (json[r'$sub'] == 'watchPayload') {
-            socket.add(jsonEncode({r'$sub': 'watchPayload', 'ok': true}));
-          } else if (json[r'$unsub'] == 'watchPayload') {
+            socket.add(jsonEncode({r'$sub': json[r'$id'], 'ok': true}));
+          } else if (json[r'$unsub'] == 1) {
             unsubscribeReceived.complete();
           }
         });
@@ -703,11 +732,11 @@ void main() {
       );
       try {
         final unsubscribe = await transport.subscribe(
-            'watchPayload',
-            {
-              'projectId': 7,
-            },
-            (_) {});
+          'watchPayload',
+          {'projectId': 7},
+          (_) {},
+          decoder: (value) => value,
+        );
         unsubscribe();
         await unsubscribeReceived.future.timeout(const Duration(seconds: 1));
       } finally {
@@ -723,7 +752,7 @@ void main() {
         socket.listen((_) {
           socket.add(<int>[
             BinaryFrameType.subscribeError,
-            12,
+            1,
             1,
             0xa0,
             0x06,
@@ -746,7 +775,12 @@ void main() {
       transport.setSchema({'watchPayload': const APISchemaEntry(12)});
       try {
         await expectLater(
-          transport.subscribe('watchPayload', const {}, (_) {}),
+          transport.subscribe(
+            'watchPayload',
+            const {},
+            (_) {},
+            decoder: (value) => value,
+          ),
           throwsA(
             isA<LuxoError>()
                 .having((error) => error.error, 'error', 'BadRequest')
@@ -789,7 +823,12 @@ void main() {
           ),
         );
         await expectLater(
-          subscriptionTransport.subscribe('watchPayload', const {}, (_) {}),
+          subscriptionTransport.subscribe(
+            'watchPayload',
+            const {},
+            (_) {},
+            decoder: (value) => value,
+          ),
           throwsA(
             isA<LuxoError>().having(
               (error) => error.error,

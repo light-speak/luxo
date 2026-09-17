@@ -12,11 +12,14 @@ import (
 // Schema holds runtime metadata for Luxo binary ↔ JSON conversion.
 // Used by Luvia to convert responses without requiring model structs.
 // Loaded from luxo.lock + codegen-emitted schema registration.
+// Complete registration and usage inference before serving requests. All maps,
+// fields and returned metadata are read-only while requests are in flight.
 type Schema struct {
-	Models map[string]*Model    `json:"models"`
-	APIs   map[string]*API      `json:"apis"`
-	Enums  map[string]*Enum     `json:"enums,omitempty"`
-	Types  map[string]*TypeDecl `json:"types,omitempty"`
+	Models     map[string]*Model    `json:"models"`
+	APIs       map[string]*API      `json:"apis"`
+	Enums      map[string]*Enum     `json:"enums,omitempty"`
+	Types      map[string]*TypeDecl `json:"types,omitempty"`
+	typeModels map[string]*Model
 }
 
 // Enum describes an enum type with its values.
@@ -46,26 +49,6 @@ type TypeDecl struct {
 	Fields      []Field   `json:"fields"`
 	Description string    `json:"description,omitempty"`
 	Directives  []string  `json:"directives,omitempty"`
-}
-
-// AsModel converts TypeDecl to a Model for Binary↔JSON conversion.
-// Types use the same field-based binary encoding as models.
-func (td *TypeDecl) AsModel() *Model {
-	// Copy the fields slice so we don't mutate td.Fields (JSONPrefix append).
-	fields := make([]Field, len(td.Fields))
-	copy(fields, td.Fields)
-	m := &Model{Name: td.Name, Module: td.Module, Fields: fields, Description: td.Description, Directives: td.Directives}
-	m.byID = make(map[int]*Field, len(m.Fields))
-	m.byName = make(map[string]*Field, len(m.Fields))
-	for i := range m.Fields {
-		f := &m.Fields[i]
-		f.JSONPrefix = append(f.JSONPrefix[:0:0], '"')
-		f.JSONPrefix = append(f.JSONPrefix, f.Name...)
-		f.JSONPrefix = append(f.JSONPrefix, '"', ':')
-		m.byID[f.ID] = f
-		m.byName[f.Name] = f
-	}
-	return m
 }
 
 // Model describes a model's fields for binary ↔ JSON conversion.
@@ -122,7 +105,7 @@ const (
 	FieldFloat
 	FieldString
 	FieldBool
-	FieldDateTime // int64 unix timestamp
+	FieldDateTime // floor Unix seconds followed by unsigned nanoseconds
 	FieldDuration // int64 nanoseconds
 	FieldBytes
 	FieldEnum    // string on wire
@@ -228,9 +211,17 @@ func (s *Schema) RegisterEnum(e *Enum) {
 	s.Enums[e.Name] = e
 }
 
-// RegisterType adds a type declaration to the schema.
+// RegisterType owns a copy of the declaration and prepares its runtime indexes.
+// It may replace a declaration during startup, never while serving requests.
 func (s *Schema) RegisterType(t *TypeDecl) {
-	s.Types[t.Name] = t
+	m := t.AsModel()
+	owned := *t
+	owned.Fields, owned.Directives = m.Fields, m.Directives
+	s.Types[t.Name] = &owned
+	if s.typeModels == nil {
+		s.typeModels = make(map[string]*Model)
+	}
+	s.typeModels[t.Name] = m
 }
 
 // RegisterModel adds a model definition to the schema.
@@ -317,6 +308,11 @@ func (s *Schema) InferTypeUsage() {
 		s.markTypeUsage(api.ReturnType, TypeUsageOutput, visited)
 		for _, param := range api.Params {
 			s.markTypeUsage(param.TypeName, TypeUsageInput, visited)
+		}
+	}
+	for name, decl := range s.Types {
+		if model := s.typeModels[name]; model != nil {
+			model.Usage = decl.Usage
 		}
 	}
 }
@@ -429,12 +425,7 @@ func selectToFieldMask(fields []*selection.Field, model *Model, schema *Schema, 
 		if !mf.Relation || schema == nil {
 			return nil, fmt.Errorf("field %s.%s does not support nested selection", model.Name, f.Name)
 		}
-		nested := schema.Models[mf.TypeName]
-		if nested == nil {
-			if decl := schema.Types[mf.TypeName]; decl != nil {
-				nested = decl.AsModel()
-			}
-		}
+		nested := schema.LookupModel(mf.TypeName)
 		if nested == nil {
 			return nil, fmt.Errorf("nested type %q for %s.%s is not registered", mf.TypeName, model.Name, f.Name)
 		}

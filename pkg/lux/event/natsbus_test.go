@@ -407,13 +407,33 @@ func TestNATSPayloadBytes(t *testing.T) {
 	}
 }
 
+type failingLuxoPayload struct{ err error }
+
+func (p failingLuxoPayload) MarshalLuxo() ([]byte, error) {
+	return []byte{1, 2}, p.err
+}
+
+func TestNATSBusStopsBeforePublishOnEncodingError(t *testing.T) {
+	failure := errors.New("payload encoding failed")
+	payload := failingLuxoPayload{err: failure}
+	data, err := natsPayloadBytes(payload)
+	if !errors.Is(err, failure) || data != nil {
+		t.Fatalf("partial payload escaped: %x, %v", data, err)
+	}
+	// A nil connection is intentional: encoding must fail before Publish.
+	bus := &NATSBus{}
+	if err := bus.Emit(context.Background(), "invalid", payload); !errors.Is(err, failure) {
+		t.Fatalf("encoding error was lost: %v", err)
+	}
+}
+
 // luxoPayload implements codec.LuxoMarshaler for testing the binary path.
 type luxoPayload struct {
 	data []byte
 }
 
-func (p *luxoPayload) MarshalLuxo() []byte {
-	return p.data
+func (p *luxoPayload) MarshalLuxo() ([]byte, error) {
+	return p.data, nil
 }
 
 func TestNATSBusEmitLuxoMarshaler(t *testing.T) {

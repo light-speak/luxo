@@ -54,26 +54,50 @@ func (s *Server) ListenAndServe(addr string) error {
 	if err != nil {
 		return err
 	}
+	fmt.Printf("  Luxo RPC on %s\n", ln.Addr())
+	return s.Serve(ln)
+}
+
+// Serve accepts RPC connections from an already allocated listener.
+// It owns and closes the listener, including when the server is closed or busy.
+// Only one listener may serve at a time. Close makes this server permanently closed.
+// A permanent Accept error is returned; Close causes Serve to return nil.
+func (s *Server) Serve(ln net.Listener) error {
+	if ln == nil {
+		return fmt.Errorf("rpc: nil listener")
+	}
+	defer ln.Close()
 	s.connMu.Lock()
 	if s.closing {
 		s.connMu.Unlock()
-		ln.Close()
 		return nil
+	}
+	if s.listener != nil {
+		s.connMu.Unlock()
+		return fmt.Errorf("rpc: server is already serving")
 	}
 	s.listener = ln
 	s.connMu.Unlock()
-	fmt.Printf("  Luxo RPC on %s\n", addr)
+	defer func() {
+		s.connMu.Lock()
+		s.listener = nil
+		s.connMu.Unlock()
+	}()
+	return s.acceptConnections(ln)
+}
 
+func (s *Server) acceptConnections(ln net.Listener) error {
+	var retryDelay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			select {
-			case <-s.done:
-				return nil
-			default:
+			retry, serveErr := s.retryAccept(err, &retryDelay)
+			if !retry {
+				return serveErr
 			}
 			continue
 		}
+		retryDelay = 0
 		if tc, ok := conn.(*net.TCPConn); ok {
 			tc.SetNoDelay(true)
 		}
@@ -92,6 +116,32 @@ func (s *Server) ListenAndServe(addr string) error {
 			defer func() { <-s.sem }()
 			s.handleConn(conn)
 		}()
+	}
+}
+
+// Back off only transient listener failures; shutdown must interrupt the wait.
+func (s *Server) retryAccept(err error, delay *time.Duration) (bool, error) {
+	select {
+	case <-s.done:
+		return false, nil
+	default:
+	}
+	temporary, ok := err.(interface{ Temporary() bool })
+	if !ok || !temporary.Temporary() {
+		return false, err
+	}
+	if *delay == 0 {
+		*delay = 5 * time.Millisecond
+	} else {
+		*delay = min(*delay*2, time.Second)
+	}
+	timer := time.NewTimer(*delay)
+	defer timer.Stop()
+	select {
+	case <-s.done:
+		return false, nil
+	case <-timer.C:
+		return true, nil
 	}
 }
 
@@ -116,6 +166,9 @@ func (s *Server) handleConn(conn net.Conn) {
 	defer s.wg.Done()
 	defer s.unregisterConnection(conn)
 	defer conn.Close()
+	if err := acceptHandshake(conn); err != nil {
+		return
+	}
 
 	var readBuf []byte
 	for {
@@ -224,9 +277,8 @@ func (s *Server) processCall(conn io.Writer, envelope requestEnvelope) error {
 	}
 	if herr != nil {
 		api.PutBuf(buf)
-		var appErr *luxerrors.AppError
-		if stderrors.As(herr, &appErr) {
-			return writeCallError(conn, appErr.Code, appErr.Name, appErr.Message, trace)
+		if appErr, ok := stderrors.AsType[*luxerrors.AppError](herr); ok {
+			return writeApplicationError(conn, appErr, trace)
 		}
 		return writeCallError(conn, 500, "Internal", herr.Error(), trace)
 	}
@@ -265,7 +317,10 @@ func (s *Server) processStream(conn net.Conn, envelope requestEnvelope) {
 	if err := writeStatusFrame(conn, statusOK, nil); err != nil {
 		return
 	}
+	s.pumpInternalStream(conn, stream)
+}
 
+func (s *Server) pumpInternalStream(conn net.Conn, stream *api.InternalStream) {
 	disconnected := make(chan struct{})
 	go func() {
 		var probe [1]byte
@@ -275,7 +330,11 @@ func (s *Server) processStream(conn net.Conn, envelope requestEnvelope) {
 	for {
 		select {
 		case data, ok := <-stream.Messages():
-			if !ok || writeStatusFrame(conn, statusStream, data) != nil {
+			if !ok {
+				writeStreamResult(conn, stream.Err())
+				return
+			}
+			if writeStatusFrame(conn, statusStream, data) != nil {
 				return
 			}
 		case <-disconnected:
@@ -284,6 +343,19 @@ func (s *Server) processStream(conn net.Conn, envelope requestEnvelope) {
 			return
 		}
 	}
+}
+
+func writeStreamResult(w io.Writer, err error) error {
+	if err == nil {
+		return writeStatusFrame(w, statusStreamComplete, nil)
+	}
+	if appErr, ok := stderrors.AsType[*luxerrors.AppError](err); ok {
+		return writeApplicationError(w, appErr, nil)
+	}
+	if stderrors.Is(err, api.ErrStreamFull) {
+		return writeCallError(w, 429, "SlowConsumer", "stream subscriber is too slow", nil)
+	}
+	return writeApplicationError(w, luxerrors.InternalError, nil)
 }
 
 func (s *Server) requestContext(ctx context.Context, token string) (context.Context, error) {
@@ -307,21 +379,12 @@ func (s *Server) callHandler(ctx context.Context, fn api.HandlerFunc, req *api.R
 	return fn(ctx, req)
 }
 
-func encodeError(code int, name, message string) []byte {
-	var enc codec.Encoder
-	enc.WriteFieldInt(1, int64(code))
-	enc.WriteFieldString(2, name)
-	enc.WriteFieldString(3, message)
-	enc.WriteEnd()
-
-	resp := make([]byte, 0, 1+len(enc.Bytes()))
-	resp = append(resp, statusError)
-	resp = append(resp, enc.Bytes()...)
-	return resp
-}
-
 func writeCallError(w io.Writer, code int, name, message string, trace *api.DebugTraceSession) error {
 	encoded := encodeError(code, name, message)
+	return writeEncodedError(w, encoded, trace)
+}
+
+func writeEncodedError(w io.Writer, encoded []byte, trace *api.DebugTraceSession) error {
 	if trace == nil {
 		return WriteFrame(w, encoded)
 	}
@@ -329,7 +392,7 @@ func writeCallError(w io.Writer, code int, name, message string, trace *api.Debu
 }
 
 func writeTracedFrame(w io.Writer, status byte, body []byte, trace *api.DebugTraceSession) error {
-	encodedTrace := api.EncodeDebugTrace(trace.Snapshot())
+	encodedTrace := api.EncodeDebugTraceResult(trace.Snapshot())
 	payload := make([]byte, 0, 1+10+len(encodedTrace)+len(body))
 	payload = append(payload, status)
 	payload = codec.AppendVarint(payload, uint64(len(encodedTrace)))

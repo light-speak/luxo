@@ -39,7 +39,20 @@ type ExtendStep struct {
 	ModelName  string // target model name (e.g. "Post")
 	ForeignKey string // FK field name on the target model (e.g. "userId")
 	IsList     bool   // true if the field is a list ([Post] vs Post)
+	Nullable   bool   // preserve an explicitly selected null rather than omitting it
 	Mask       []byte // nested field mask for the extend model's fields (nil = all)
+}
+
+// Shape identifies the canonical relation value: bit 0 is list, bit 1 nullable.
+func (s ExtendStep) Shape() int {
+	shape := 0
+	if s.IsList {
+		shape |= 1
+	}
+	if s.Nullable {
+		shape |= 2
+	}
+	return shape
 }
 
 // Plan analyzes a field mask against a model's schema and produces a QueryPlan.
@@ -90,6 +103,7 @@ func Plan(model *schema.Model, mask []byte, apiModule string) (*QueryPlan, error
 				ModelName:  f.TypeName,
 				ForeignKey: f.ForeignKey,
 				IsList:     f.IsList,
+				Nullable:   f.Nullable,
 				Mask:       selectionChild(mask, f.ID),
 			})
 		} else {
@@ -134,7 +148,12 @@ func selectionChild(mask []byte, fieldID int) []byte {
 // schemaFieldToSkipType maps a schema field type to a codec skip type.
 func schemaFieldToSkipType(f *schema.Field) codec.FieldSkipType {
 	switch f.Type {
-	case schema.FieldInt, schema.FieldDateTime, schema.FieldDuration, schema.FieldBool:
+	case schema.FieldDateTime:
+		if f.Nullable {
+			return codec.SkipNullDateTime
+		}
+		return codec.SkipDateTime
+	case schema.FieldInt, schema.FieldDuration, schema.FieldBool:
 		if f.Nullable {
 			return codec.SkipNullVarint
 		}
@@ -149,7 +168,12 @@ func schemaFieldToSkipType(f *schema.Field) codec.FieldSkipType {
 			return codec.SkipNullFixed16
 		}
 		return codec.SkipFixed16
-	case schema.FieldString, schema.FieldEnum, schema.FieldBytes, schema.FieldModel:
+	case schema.FieldString, schema.FieldEnum, schema.FieldDecimal:
+		if f.Nullable {
+			return codec.SkipNullString
+		}
+		return codec.SkipString
+	case schema.FieldBytes, schema.FieldModel:
 		if f.Nullable {
 			return codec.SkipNullBytes
 		}

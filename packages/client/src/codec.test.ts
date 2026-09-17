@@ -1,8 +1,56 @@
 import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
 import {
   Encoder, Decoder, ColumnarDecoder, fieldMaskSet, fieldMaskHas,
   formatUUID, parseUUID, decodeScalarArray, unixSecondsToISO,
 } from './codec'
+
+describe('canonical UUID text', () => {
+  const fixture = JSON.parse(readFileSync(new URL('../../../pkg/lux/codec/testdata/protocol-v1.json', import.meta.url), 'utf8')) as {
+    uuidCanonicalCases: { input: string; canonical: string | null }[]
+  }
+  it('rejects every corrupted position and non-canonical length', () => {
+    const valid = '00112233-4455-6677-8899-aabbccddeeff'
+    for (let index = 0; index < valid.length; index++) {
+      for (const replacement of valid[index] === '-' ? ['0', '_', '−'] : ['g', '-', '\u0000', 'é']) {
+        expect(parseUUID(valid.slice(0, index) + replacement + valid.slice(index + 1))).toBeNull()
+      }
+    }
+    for (const input of ['', valid.slice(1), valid + '0', valid.replaceAll('-', '')]) {
+      expect(parseUUID(input)).toBeNull()
+    }
+  })
+  it.each(fixture.uuidCanonicalCases)('checks all separators and hex digits: $input', ({ input, canonical }) => {
+    const bytes = parseUUID(input)
+    const encoder = new Encoder()
+    if (canonical === null) {
+      expect(bytes).toBeNull()
+      expect(() => encoder.writeUUID(input)).toThrow()
+      expect(encoder.bytes()).toHaveLength(0)
+    } else {
+      expect(bytes).not.toBeNull()
+      encoder.writeUUID(input)
+      expect(new Decoder(encoder.bytes()).readUUID()).toBe(canonical)
+    }
+  })
+})
+
+describe('structured response boundaries', () => {
+  it('requires row and column end markers even when values finish exactly at EOF', () => {
+    const row = new Decoder(new Uint8Array([0, 1, 84]))
+    row.skipArenaHeader()
+    expect(row.nextField()).toBe(true)
+    expect(row.readInt()).toBe(42n)
+    expect(row.nextField()).toBe(false)
+    expect(row.error).toMatch(/end marker/)
+
+    const column = new ColumnarDecoder(new Uint8Array([1, 0, 1, 128, 1]))
+    expect(column.nextColumn()).toBe(true)
+    expect(column.readColumnInt()).toEqual([64n])
+    expect(column.nextColumn()).toBe(false)
+    expect(column.error).toMatch(/end marker/)
+  })
+})
 
 describe('Encoder', () => {
   it('writeVarint encodes small values in 1 byte', () => {
@@ -37,9 +85,9 @@ describe('Encoder', () => {
 
   it('writeSvarint encodes positive values with zigzag', () => {
     const enc = new Encoder()
-    enc.writeSvarint(0)
-    enc.writeSvarint(1)
-    enc.writeSvarint(2)
+    enc.writeSvarint(BigInt(0))
+    enc.writeSvarint(BigInt(1))
+    enc.writeSvarint(BigInt(2))
     const bytes = enc.bytes()
     // zigzag: 0→0, 1→2, 2→4
     expect(bytes[0]).toBe(0)
@@ -49,8 +97,8 @@ describe('Encoder', () => {
 
   it('writeSvarint encodes negative values with zigzag', () => {
     const enc = new Encoder()
-    enc.writeSvarint(-1)
-    enc.writeSvarint(-2)
+    enc.writeSvarint(BigInt(-1))
+    enc.writeSvarint(BigInt(-2))
     const bytes = enc.bytes()
     // zigzag: -1→1, -2→3
     expect(bytes[0]).toBe(1)
@@ -138,25 +186,25 @@ describe('Decoder', () => {
   it('reads varint via readInt (zigzag decoded)', () => {
     const enc = new Encoder()
     // Write field with ID=1 + signed int
-    enc.writeFieldInt(1, 42)
+    enc.writeFieldInt(1, 42n)
     enc.writeEnd()
 
     const dec = new Decoder(enc.bytes())
     expect(dec.nextField()).toBe(true)
     expect(dec.fieldID).toBe(1)
-    expect(dec.readInt()).toBe(42)
+    expect(dec.readInt()).toBe(42n)
     expect(dec.nextField()).toBe(false)
   })
 
   it('reads negative int', () => {
     const enc = new Encoder()
-    enc.writeFieldInt(2, -100)
+    enc.writeFieldInt(2, -100n)
     enc.writeEnd()
 
     const dec = new Decoder(enc.bytes())
     expect(dec.nextField()).toBe(true)
     expect(dec.fieldID).toBe(2)
-    expect(dec.readInt()).toBe(-100)
+    expect(dec.readInt()).toBe(-100n)
   })
 
   it('reads float64', () => {
@@ -209,7 +257,7 @@ describe('Decoder', () => {
 
   it('round-trip multiple fields', () => {
     const enc = new Encoder()
-    enc.writeFieldInt(1, 999)
+    enc.writeFieldInt(1, 999n)
     enc.writeFieldFloat(2, -0.5)
     enc.writeFieldString(3, 'hello world')
     enc.writeFieldBool(4, true)
@@ -219,7 +267,7 @@ describe('Decoder', () => {
 
     expect(dec.nextField()).toBe(true)
     expect(dec.fieldID).toBe(1)
-    expect(dec.readInt()).toBe(999)
+    expect(dec.readInt()).toBe(999n)
 
     expect(dec.nextField()).toBe(true)
     expect(dec.fieldID).toBe(2)
@@ -238,7 +286,7 @@ describe('Decoder', () => {
 
   it('remaining returns bytes left', () => {
     const enc = new Encoder()
-    enc.writeFieldInt(1, 5)
+    enc.writeFieldInt(1, 5n)
     enc.writeEnd()
     const bytes = enc.bytes()
 
@@ -262,7 +310,7 @@ describe('Decoder', () => {
 
 describe('fieldMask', () => {
   it('fieldMaskSet sets bits correctly', () => {
-    let mask = new Uint8Array(1)
+    let mask: Uint8Array = new Uint8Array(1)
     mask = fieldMaskSet(mask, 1)
     expect(mask[0] & 1).toBe(1)
 
@@ -271,21 +319,21 @@ describe('fieldMask', () => {
   })
 
   it('fieldMaskSet grows mask when needed', () => {
-    let mask = new Uint8Array(1)
+    let mask: Uint8Array = new Uint8Array(1)
     mask = fieldMaskSet(mask, 9) // needs byte index 1
     expect(mask.length).toBe(2)
     expect(mask[1] & 1).toBe(1)
   })
 
   it('fieldMaskSet grows for large field IDs', () => {
-    let mask = new Uint8Array(0)
+    let mask: Uint8Array = new Uint8Array(0)
     mask = fieldMaskSet(mask, 17)
     expect(mask.length).toBe(3)
     expect(fieldMaskHas(mask, 17)).toBe(true)
   })
 
   it('fieldMaskHas returns true for set bits', () => {
-    let mask = new Uint8Array(2)
+    let mask: Uint8Array = new Uint8Array(2)
     mask = fieldMaskSet(mask, 3)
     mask = fieldMaskSet(mask, 10)
     expect(fieldMaskHas(mask, 3)).toBe(true)
@@ -300,7 +348,7 @@ describe('fieldMask', () => {
   })
 })
 
-describe('DateTime (svarint unix seconds → RFC3339 string)', () => {
+describe('DateTime (seconds/nanoseconds → RFC3339 string)', () => {
   // 2026-05-28T12:00:00Z = 1779710400 unix seconds (whole seconds, no fractional part).
   const SECONDS = Math.floor(Date.UTC(2026, 4, 28, 12, 0, 0) / 1000)
   const ISO = '2026-05-28T12:00:00Z'
@@ -310,17 +358,17 @@ describe('DateTime (svarint unix seconds → RFC3339 string)', () => {
     expect(unixSecondsToISO(0)).toBe('1970-01-01T00:00:00Z')
   })
 
-  it('readDateTime decodes svarint(seconds) to ISO string', () => {
+  it('readDateTime decodes seconds/nanoseconds to ISO string', () => {
     const enc = new Encoder()
-    enc.writeSvarint(SECONDS)
+    enc.writeDateTime(ISO)
     const dec = new Decoder(enc.bytes())
     expect(dec.readDateTime()).toBe(ISO)
   })
 
   it('readDateTime handles epoch and pre-epoch (negative) values', () => {
     const enc = new Encoder()
-    enc.writeSvarint(0)
-    enc.writeSvarint(-1)
+    enc.writeDateTime('1970-01-01T00:00:00Z')
+    enc.writeDateTime('1969-12-31T23:59:59Z')
     const dec = new Decoder(enc.bytes())
     expect(dec.readDateTime()).toBe('1970-01-01T00:00:00Z')
     expect(dec.readDateTime()).toBe('1969-12-31T23:59:59Z')
@@ -331,10 +379,10 @@ describe('DateTime (svarint unix seconds → RFC3339 string)', () => {
     expect(new Decoder(data).readDateTimePtr()).toBe(null)
   })
 
-  it('readDateTimePtr decodes present value (0x01 + svarint)', () => {
+  it('readDateTimePtr decodes present value (0x01 + seconds/nanoseconds)', () => {
     const enc = new Encoder()
     enc.writeBool(true) // 0x01 present flag
-    enc.writeSvarint(SECONDS)
+    enc.writeDateTime(ISO)
     const dec = new Decoder(enc.bytes())
     expect(dec.readDateTimePtr()).toBe(ISO)
   })
@@ -348,8 +396,8 @@ describe('DateTime (svarint unix seconds → RFC3339 string)', () => {
     enc.writeVarint(2) // count
     enc.writeVarint(0) // arena size
     enc.writeVarint(5) // fieldID
-    enc.writeSvarint(SECONDS)
-    enc.writeSvarint(0)
+    enc.writeDateTime(ISO)
+    enc.writeDateTime('1970-01-01T00:00:00Z')
     enc.writeEnd()
     const r = new ColumnarDecoder(enc.bytes())
     expect(r.arenaSize).toBe(0)
@@ -365,7 +413,7 @@ describe('DateTime (svarint unix seconds → RFC3339 string)', () => {
     enc.writeVarint(5) // fieldID
     enc.writeBool(false) // null flag for first
     enc.writeBool(true) // present flag for second
-    enc.writeSvarint(SECONDS)
+    enc.writeDateTime(ISO)
     enc.writeEnd()
     const r = new ColumnarDecoder(enc.bytes())
     expect(r.nextColumn()).toBe(true)
@@ -375,17 +423,17 @@ describe('DateTime (svarint unix seconds → RFC3339 string)', () => {
   it('decodeScalarArray returns ISO strings for DateTime', () => {
     const enc = new Encoder()
     enc.writeVarint(2) // array count
-    enc.writeSvarint(SECONDS)
-    enc.writeSvarint(0)
+    enc.writeDateTime(ISO)
+    enc.writeDateTime('1970-01-01T00:00:00Z')
     expect(decodeScalarArray(enc.bytes(), 'DateTime')).toEqual([ISO, '1970-01-01T00:00:00Z'])
   })
 
   it('decodeScalarArray keeps Duration as raw nanosecond numbers', () => {
     const enc = new Encoder()
     enc.writeVarint(2)
-    enc.writeSvarint(1000000000)
-    enc.writeSvarint(500)
-    expect(decodeScalarArray(enc.bytes(), 'Duration')).toEqual([1000000000, 500])
+    enc.writeSvarint(BigInt(1000000000))
+    enc.writeSvarint(BigInt(500))
+    expect(decodeScalarArray(enc.bytes(), 'Duration')).toEqual([1000000000n, 500n])
   })
 
   it('rejects non-canonical boolean and nullable markers', () => {

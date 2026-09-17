@@ -25,17 +25,19 @@
   },
   "homepage": "https://github.com/light-speak/luxo",
   "scripts": {
-    "build": "tsup",
+    "build": "tsdown && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "prepublishOnly": "pnpm build"
   },
   "peerDependencies": {
-    "typescript": ">=5.0"
+    "typescript": ">=7.0 <8"
   },
   "devDependencies": {
-    "tsup": "^8.5.1",
-    "typescript": "^6.0.3",
-    "vitest": "^3.2.4"
+    "@types/node": "^26.5.1",
+    "tsdown": "^0.23.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
   }
 }

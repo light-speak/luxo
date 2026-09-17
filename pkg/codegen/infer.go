@@ -421,7 +421,7 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 				fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 			}
 			writeComputedResolve(b, model, "results", "\t\t")
-			fmt.Fprintf(b, "\t\tWriteColumnar%s(req.Buf, results, req.FieldMask)\n", modelName)
+			fmt.Fprintf(b, "\t\tif err := WriteColumnar%s(req.Buf, results, req.FieldMask); err != nil { return err }\n", modelName)
 		} else {
 			fmt.Fprintf(b, "\t\tresults, total, err := q.Limit(req.PageSize).Offset((req.Page - 1) * req.PageSize).AllWithCount(ctx)\n")
 			fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
@@ -430,7 +430,7 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 				fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 			}
 			writeComputedResolve(b, model, "results", "\t\t")
-			fmt.Fprintf(b, "\t\tWriteColumnar%s(req.Buf, results, req.FieldMask)\n", modelName)
+			fmt.Fprintf(b, "\t\tif err := WriteColumnar%s(req.Buf, results, req.FieldMask); err != nil { return err }\n", modelName)
 			fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, total)\n")
 			fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.Page))\n")
 			fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.PageSize))\n")
@@ -446,7 +446,7 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
 		}
 		writeComputedResolve(b, model, "[]*"+modelName+"{result}", "\t\t")
-		fmt.Fprintf(b, "\t\tresult.WriteLuxo(req.Buf, req.FieldMask)\n")
+		fmt.Fprintf(b, "\t\tif err := result.WriteLuxo(req.Buf, req.FieldMask); err != nil { return err }\n")
 	}
 
 	fmt.Fprintf(b, "\t\treturn nil\n")

@@ -1,0 +1,101 @@
+import 'dart:async';
+import 'dart:js_interop';
+import 'dart:typed_data';
+import 'package:luxo_client/luxo_client.dart';
+import '__WEBSOCKET_ID_CASES__';
+
+@JS('process.argv')
+external JSArray<JSString> get arguments;
+
+Future<void> main() async {
+  final endpoint = arguments.toDart.last.toDart;
+  await verifyWebSocketIDs(endpoint);
+  await verifySocketAdapterFault(endpoint);
+  for (final mode in TransportMode.values) {
+    for (final parse in [false, true]) await verifySocketFailure(endpoint, mode, parse);
+  }
+  print('web socket protocol verified');
+}
+
+Future<void> verifySocketFailure(String endpoint, TransportMode mode, bool parse) async {
+    final expected = parse ? 'ParseError' : 'NetworkError';
+    final transport = WsTransport(endpoint,
+      options: TransportOptions(mode: mode), autoReconnect: false,
+      timeout: const Duration(seconds: 3));
+    transport.setSchema({
+      'echo': const APISchemaEntry(7, [ParamSchema(1, 'value', 'Int')]),
+      'disconnect': const APISchemaEntry(8),
+      'malformed': const APISchemaEntry(9),
+    });
+    LuxoInt64 decode(Object? data) => data is Uint8List
+        ? LuxoDecoder(data).readIntChecked() : luxoInt64FromJSON(data);
+    final value = LuxoInt64.maxValue;
+    try {
+      final result = await transport.call('echo', params: {'value': value}, decoder: decode);
+      if (result != value) throw StateError('$mode call lost integer precision');
+      final received = [Completer<LuxoInt64>(), Completer<LuxoInt64>()];
+      final ended = [Completer<LuxoError>(), Completer<LuxoError>()];
+      var deliveries = 0;
+      var errors = 0;
+      final stops = await Future.wait([
+        for (var i = 0; i < 2; i++)
+          transport.subscribe('echo', {'value': value}, (data) {
+            deliveries++;
+            received[i].complete(decode(data));
+          }, onError: (error) {
+            errors++;
+            ended[i].complete(error);
+          }, onDone: () => throw StateError('disconnect completed normally'), decoder: (value) => value),
+      ]);
+      if ((await Future.wait(received.map((entry) => entry.future)))
+          .any((result) => result != value)) {
+        throw StateError('$mode stream lost integer precision');
+      }
+      try {
+        await transport.call(parse ? 'malformed' : 'disconnect', decoder: decode);
+        throw StateError('disconnected call unexpectedly succeeded');
+      } on LuxoError catch (error) {
+        if (error.error != expected) throw StateError('$expected became ${error.error}');
+      }
+      final failures = await Future.wait(ended.map((entry) => entry.future))
+          .timeout(const Duration(seconds: 3));
+      if (failures.any((error) => error.error != expected)) {
+        throw StateError('disconnected subscription did not report $expected');
+      }
+      if (await transport.call('echo', params: {'value': value}, decoder: decode) != value) {
+        throw StateError('reconnected call failed');
+      }
+      final next = Completer<LuxoInt64>();
+      final stop = await transport.subscribe('echo', {'value': value},
+        (data) => next.complete(decode(data)),
+        onError: (_) => throw StateError('new subscription failed'), decoder: (value) => value);
+      for (final oldStop in stops) oldStop();
+      if (await next.future != value || deliveries != 2 || errors != 2) {
+        throw StateError('old subscription was replayed or affected the new one');
+      }
+      stop();
+    } finally {
+      transport.close();
+    }
+}
+
+Future<void> verifySocketAdapterFault(String endpoint) async {
+  final transport = WsTransport('$endpoint/adapter-fault', autoReconnect: false,
+    timeout: const Duration(seconds: 3));
+  try {
+    for (final subscription in [false, true]) {
+      try {
+        if (subscription) {
+          await transport.subscribe('echo', {}, (_) => throw StateError('unexpected data'), decoder: (value) => value);
+        } else {
+          await transport.call<Object>('echo');
+        }
+        throw StateError('invalid socket event was accepted');
+      } on LuxoError catch (error) {
+        if (error.error != 'NetworkError') rethrow;
+      }
+    }
+  } finally {
+    transport.close();
+  }
+}

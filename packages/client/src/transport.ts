@@ -1,18 +1,28 @@
+import { decodeJSONEnvelope, encodeLuxoJSON } from './json'
+import { jsonUint64, readWireUint64, UINT64_MAX } from './uint64'
+import type { UInt64 } from './uint64'
+import { decodeBinaryError, jsonResponseError } from './error-codec'
+import { JSONParamValidator } from './json-params'
 import { LuxoError } from './error'
-import { Decoder, Encoder, fieldMaskSet } from './codec'
+import { Encoder, fieldMaskSet } from './codec'
+import { HTTPHeaders } from './http-headers'
 
 const textEncoder = new TextEncoder()
-const textDecoder = new TextDecoder()
+// Preserve Response.text()'s document BOM handling, but reject invalid UTF-8.
+const httpTextDecoder = new TextDecoder('utf-8', { fatal: true })
+export { decodeBinaryError, jsonResponseError } from './error-codec'
 
 const BinaryFrame = {
   callRequest: 0x01,
   callSuccess: 0x02,
   callError: 0x03,
-  subscribe: 0x04,
-  unsubscribe: 0x05,
-  stream: 0x06,
-  subscribeSuccess: 0x07,
-  subscribeError: 0x08,
+  subscribe: 0x10,
+  unsubscribe: 0x11,
+  stream: 0x12,
+  subscribeSuccess: 0x13,
+  subscribeError: 0x14,
+  streamComplete: 0x15,
+  streamError: 0x16,
 } as const
 
 const binaryFiltersFieldID = 0x7ffffffe
@@ -36,15 +46,11 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return new Uint8Array(bytes).buffer
 }
 
-function toUnixSeconds(value: unknown): number {
+function writeDateTimeParam(enc: Encoder, value: unknown): void {
 	if (typeof value !== 'string') {
 		throw new LuxoError('ConfigError', 0, 'DateTime parameters require an RFC3339 string')
 	}
-	const milliseconds = Date.parse(value)
-	if (!Number.isFinite(milliseconds)) {
-		throw new LuxoError('ConfigError', 0, 'DateTime parameters require an RFC3339 string')
-	}
-	return Math.floor(milliseconds / 1000)
+	enc.writeDateTime(value)
 }
 
 /** Encode a single API param (scalar or list) to binary using the schema metadata. */
@@ -70,9 +76,9 @@ export function encodeParam(
 		enc.writeVarint(arr.length)
     switch (pm.type) {
       case 'Int': case 'Duration':
-		for (const value of arr as number[]) enc.writeSvarint(value); break
+		for (const value of arr as bigint[]) enc.writeSvarint(value); break
       case 'DateTime':
-		for (const value of arr) enc.writeSvarint(toUnixSeconds(value)); break
+		for (const value of arr) writeDateTimeParam(enc, value); break
       case 'Float':
 		for (const value of arr as number[]) enc.writeFixed64(value); break
       case 'String': case 'Enum': case 'Decimal':
@@ -94,7 +100,7 @@ export function encodeParam(
   }
   switch (pm.type) {
     case 'Int': case 'Duration':
-	  enc.writeSvarint(v as number); break
+	  enc.writeSvarint(v as bigint); break
     case 'Float':
 	  enc.writeFixed64(v as number); break
     case 'String': case 'Enum': case 'Decimal':
@@ -104,7 +110,7 @@ export function encodeParam(
     case 'UUID':
 	  enc.writeUUID(v as string); break
     case 'DateTime': {
-	  enc.writeSvarint(toUnixSeconds(v)); break
+	  writeDateTimeParam(enc, v); break
 	}
 	case 'Bytes':
 	  enc.writeBytes(toUint8Array(v)); break
@@ -212,12 +218,12 @@ function writeStructuredValue(
 	types: Record<string, Record<string, SelectionFieldSchema>>,
 ): void {
 	switch (field.type) {
-		case 'Int': case 'Duration': enc.writeSvarint(value as number); return
+		case 'Int': case 'Duration': enc.writeSvarint(value as bigint); return
 		case 'Float': enc.writeFixed64(value as number); return
 		case 'String': case 'Enum': case 'Decimal': enc.writeString(value as string); return
 		case 'Boolean': enc.writeBool(value as boolean); return
 		case 'UUID': enc.writeUUID(value as string); return
-		case 'DateTime': enc.writeSvarint(toUnixSeconds(value)); return
+		case 'DateTime': writeDateTimeParam(enc, value); return
 		case 'Bytes': enc.writeBytes(toUint8Array(value)); return
 		case 'JSON': enc.writeBytes(encodeJSONParam(value)); return
 		case 'Model': writeNestedStructuredValue(enc, field, value, types); return
@@ -240,7 +246,7 @@ function writeNestedStructuredValue(
 }
 
 function encodeJSONParam(value: unknown): Uint8Array {
-	const encoded = JSON.stringify(value)
+	const encoded = encodeLuxoJSON(value)
 	if (encoded === undefined) {
 		throw new LuxoError('ConfigError', 0, 'JSON parameter is not serializable')
 	}
@@ -415,8 +421,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }
 
-function isFilterValue(value: unknown): value is string | number | boolean {
-  return typeof value === 'string' || typeof value === 'boolean' ||
+function isFilterValue(value: unknown): value is string | number | bigint | boolean {
+  return typeof value === 'string' || typeof value === 'boolean' || typeof value === 'bigint' ||
     (typeof value === 'number' && Number.isFinite(value))
 }
 
@@ -452,52 +458,10 @@ export function encodeBinaryBody(meta: APISchema, params?: Record<string, unknow
   return enc.bytes()
 }
 
-export function decodeBinaryError(data: Uint8Array, statusCode: number): LuxoError {
-  const dec = new Decoder(data)
-  let code = statusCode
-  let name = 'Error'
-  let message = `HTTP ${statusCode}`
-  let traceId: string | undefined
-  let errorData: unknown
-  let cause: string | undefined
-  let seen = 0
-  let ended = false
-  while (dec.remaining > 0) {
-    if (!dec.nextField()) {
-      ended = dec.error === null
-      break
-    }
-    switch (dec.fieldID) {
-      case 1: code = dec.readInt(); seen |= 1; break
-      case 2: name = dec.readString(); seen |= 2; break
-      case 3: message = dec.readString(); seen |= 4; break
-      case 4: traceId = dec.readString(); break
-      case 5: {
-        const raw = textDecoder.decode(dec.readBytes())
-        try { errorData = JSON.parse(raw) } catch {
-          return binaryParseError(statusCode, 'invalid JSON data')
-        }
-        break
-      }
-      case 6: cause = dec.readString(); break
-      default: return binaryParseError(statusCode, `unknown binary error field ${dec.fieldID}`)
-    }
-  }
-  if (dec.error !== null) return binaryParseError(statusCode, dec.error)
-  if (!ended) return binaryParseError(statusCode, 'missing end marker')
-  if (dec.remaining !== 0) return binaryParseError(statusCode, 'trailing bytes')
-  if (seen !== 7) return binaryParseError(statusCode, 'missing required fields')
-  return new LuxoError(name, code, message, traceId, errorData, cause)
-}
-
-function binaryParseError(statusCode: number, message: string): LuxoError {
-  return new LuxoError('ParseError', statusCode, `invalid binary error response: ${message}`)
-}
-
 /** Transport interface — implemented by HTTP, WebSocket, etc. */
 export interface Transport {
   call(api: string, params?: Record<string, unknown>, options?: CallOptions): Promise<unknown>
-  subscribe(api: string, params: Record<string, unknown>, onData: (data: unknown) => void): Promise<() => void>
+  subscribe<T>(api: string, params: Record<string, unknown>, decode: (data: unknown) => T, onData: (data: T) => void, observer?: StreamObserver): Promise<() => void>
   setSchema(schema: Record<string, APISchema>): void
   setMode(mode: TransportMode): void
   setToken(token: string | null): void
@@ -508,6 +472,12 @@ export interface CallOptions {
   signal?: AbortSignal
 }
 
+/** Terminal notifications after acknowledgement; setup failures reject subscribe(). */
+export interface StreamObserver {
+  onError?: (error: LuxoError) => void
+  onComplete?: () => void
+}
+
 /** Shared transport options */
 export interface TransportOptions {
   token?: string
@@ -515,7 +485,7 @@ export interface TransportOptions {
   mode?: TransportMode
   /** Request timeout in milliseconds (default: 30000) */
   timeout?: number
-  /** Called when token expires (401). Return new token to auto-retry. */
+  /** Called only for valid HTTP/code 401 errors; a new token retries once in the original mode. */
   onTokenExpired?: () => Promise<string | null>
   /** Optional safe request observer. Parameter values and wire payloads are never exposed. */
   observer?: TransportObserver
@@ -553,7 +523,8 @@ function notifyObserver(observer: TransportObserver, event: TransportEvent): voi
 /** Fetch-based transport for Web / Node.js 18+.
  *  Uses HTTP/2 when available — single connection, multiplexed requests. */
 export class FetchTransport implements Transport {
-  private headers: Record<string, string> = {}
+  private readonly jsonParams = new JSONParamValidator()
+  private readonly headers: HTTPHeaders
   private mode: TransportMode = 'json'
   private schema: Record<string, APISchema> = {}
   private timeout: number
@@ -565,18 +536,16 @@ export class FetchTransport implements Transport {
     this.timeout = options?.timeout ?? 30000
     this.onTokenExpired = options?.onTokenExpired
     this.observer = options?.observer
-    if (options?.headers) this.headers = { ...options.headers }
-    if (options?.token) this.headers['Authorization'] = `Bearer ${options.token}`
+    this.headers = new HTTPHeaders(options?.headers, options?.token)
   }
 
-  setSchema(schema: Record<string, APISchema>): void { this.schema = schema }
+  setSchema(schema: Record<string, APISchema>): void {
+    this.jsonParams.setSchema(schema)
+    this.schema = schema
+  }
   setMode(mode: TransportMode): void { this.mode = mode }
   setToken(token: string | null): void {
-    if (token) {
-      this.headers['Authorization'] = `Bearer ${token}`
-      return
-    }
-    delete this.headers['Authorization']
+    this.headers.setToken(token)
   }
 
   call(api: string, params?: Record<string, unknown>, options?: CallOptions): Promise<unknown> {
@@ -621,7 +590,7 @@ export class FetchTransport implements Transport {
     }
   }
 
-  async subscribe(_api: string, _params: Record<string, unknown>, _onData: (data: unknown) => void): Promise<() => void> {
+  async subscribe<T>(_api: string, _params: Record<string, unknown>, _decode: (data: unknown) => T, _onData: (data: T) => void): Promise<() => void> {
     throw new LuxoError('ConfigError', 0, 'subscriptions require a WebSocket endpoint')
   }
 
@@ -665,45 +634,35 @@ export class FetchTransport implements Transport {
     options?: CallOptions,
     allowRefresh = true,
   ): Promise<unknown> {
-    const body: Record<string, unknown> = { $api: api }
-    if (params) Object.assign(body, params)
+    const prepared = this.jsonParams.prepare(api, params)
+    const body = { ...prepared, $api: api }
 
     const scope = await this.openRequest({
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...this.headers },
-      body: JSON.stringify(body),
+      headers: this.headers.json,
+      body: encodeLuxoJSON(body),
     }, options?.signal)
     const resp = scope.response
 
     try {
-      // 401 auto-refresh: call onTokenExpired, get new token, retry once
-      if (resp.status === 401 && allowRefresh && this.onTokenExpired) {
-        scope.close()
-        const newToken = await this.onTokenExpired()
-        if (newToken) {
-          this.setToken(newToken)
-          return this.jsonCall(api, params, options, false)
-        }
-      }
-
       let json: Record<string, unknown>
-      try { json = await resp.json() } catch (error) {
+      try { json = decodeJSONEnvelope(httpTextDecoder.decode(await resp.arrayBuffer())) } catch (error) {
         const aborted = scope.abortError(error)
         if (aborted) throw aborted
         throw new LuxoError('ParseError', resp.status, `invalid JSON (HTTP ${resp.status})`)
       }
 
-      if (json.error) {
-		throw new LuxoError(
-		  json.error as string,
-		  (json.code as number) ?? resp.status,
-		  (json.message as string) ?? '',
-		  json.traceId as string | undefined,
-		  json.data,
-		  typeof json.cause === 'string' ? json.cause : undefined,
-		)
+      if (resp.status === 200 && !('error' in json)) return json.data
+      const error = jsonResponseError(json, resp.status)
+      const refresh = this.refreshAfterUnauthorized(error, scope, allowRefresh)
+      if (refresh) {
+        const token = await refresh
+        if (token) {
+          this.setToken(token)
+          return this.jsonCall(api, params, options, false)
+        }
       }
-      return json.data
+      throw error
     } finally {
       scope.close()
     }
@@ -717,25 +676,35 @@ export class FetchTransport implements Transport {
   ): Promise<unknown> {
     const scope = await this.openRequest({
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-luxo', 'X-Luxo-Mode': 'binary', ...this.headers },
+      headers: this.headers.binary,
       body: this.encodeBinaryRequest(api, params),
     }, options?.signal)
-    const resp = scope.response
-
     try {
-      if (resp.status === 401 && allowRefresh && this.onTokenExpired) {
-        scope.close()
-        const newToken = await this.onTokenExpired()
-        if (newToken) {
-          this.setToken(newToken)
+      const data = await this.readBinaryResponse(scope)
+      if (scope.response.status === 200) return data
+      const error = decodeBinaryError(data, scope.response.status)
+      const refresh = this.refreshAfterUnauthorized(error, scope, allowRefresh)
+      if (refresh) {
+        const token = await refresh
+        if (token) {
+          this.setToken(token)
           return this.binaryCall(api, params, options, false)
         }
       }
-
-      return await this.readBinaryResponse(scope)
+      throw error
     } finally {
       scope.close()
     }
+  }
+
+  private refreshAfterUnauthorized(
+    error: LuxoError, scope: ResponseScope, allowRefresh: boolean,
+  ): Promise<string | null> | undefined {
+    // Only a validated 401 envelope may refresh; body failures never reach here.
+    if (!allowRefresh || scope.response.status !== 401 ||
+      error.code !== 401 || error.error === 'ParseError' || !this.onTokenExpired) return undefined
+    scope.close()
+    return this.onTokenExpired()
   }
 
   private encodeBinaryRequest(api: string, params?: Record<string, unknown>): ArrayBuffer {
@@ -747,51 +716,55 @@ export class FetchTransport implements Transport {
   private async readBinaryResponse(scope: ResponseScope): Promise<Uint8Array> {
     const response = scope.response
     try {
-	  const data = new Uint8Array(await response.arrayBuffer())
-	  if (response.ok) return data
-	  throw decodeBinaryError(data, response.status)
+      return new Uint8Array(await response.arrayBuffer())
     } catch (error) {
-      if (error instanceof LuxoError) throw error
       const aborted = scope.abortError(error)
       if (aborted) throw aborted
-      if (!response.ok) throw new LuxoError('Error', response.status, `HTTP ${response.status}`)
-      throw error
+      throw new LuxoError('ParseError', response.status, 'invalid binary response body')
     }
   }
 }
 
 // --- WebSocket Transport ---
 
+interface SubscriptionAcknowledgement {
+  resolve: (unsubscribe: () => void) => void
+  reject: (error: Error) => void
+  cleanup: () => void
+}
+
+interface WSSubscription {
+  mode: TransportMode
+  onData: (data: unknown) => void
+  observer?: StreamObserver
+  acknowledgement?: SubscriptionAcknowledgement
+}
+
 /** WebSocket transport — persistent connection, multiplexed requests.
  *  Ideal for real-time apps: subscriptions, events, high-frequency calls.
  *  Supports both JSON and binary modes. */
 export class WsTransport implements Transport {
+  private readonly jsonParams = new JSONParamValidator()
   private ws: WebSocket | null = null
   private mode: TransportMode = 'json'
   private schema: Record<string, APISchema> = {}
-  private pending = new Map<number, {
+  private pending = new Map<UInt64, {
     resolve: (v: unknown) => void
     reject: (e: Error) => void
     cleanup: () => void
   }>()
-  private seq = 0
+  private seq: UInt64 = 0
   private connectPromise: Promise<void> | null = null
+  private rejectConnection: ((error: Error) => void) | null = null
   private token: string | undefined
   private closed = false
   private reconnectAttempts = 0
   private maxReconnectAttempts = 10
   private reconnectDelay = 1000 // ms, doubles each attempt (exponential backoff)
+  private reconnectTimer: ReturnType<typeof setTimeout> | undefined
   private readonly observer?: TransportObserver
   private readonly timeout: number
-  private subscriptions = new Map<string, {
-    params: Record<string, unknown>
-    onData: (data: unknown) => void
-    acknowledgement?: {
-      resolve: (unsubscribe: () => void) => void
-      reject: (error: Error) => void
-      cleanup: () => void
-    }
-  }>()
+  private subscriptions = new Map<UInt64, WSSubscription>()
 
   constructor(private endpoint: string, options?: TransportOptions) {
     this.mode = options?.mode ?? 'json'
@@ -800,67 +773,122 @@ export class WsTransport implements Transport {
     this.timeout = options?.timeout ?? 30000
   }
 
-  setSchema(schema: Record<string, APISchema>): void { this.schema = schema }
+  setSchema(schema: Record<string, APISchema>): void {
+    this.jsonParams.setSchema(schema)
+    this.schema = schema
+  }
   setMode(mode: TransportMode): void { this.mode = mode }
   setToken(token: string | null): void { this.token = token ?? undefined }
 
   private connect(): Promise<void> {
+    if (this.closed) return Promise.reject(new LuxoError('NetworkError', 0, 'WebSocket closed'))
     if (this.ws?.readyState === WebSocket.OPEN) return Promise.resolve()
     if (this.connectPromise) return this.connectPromise
+    if (this.ws) return this.replaceClosingSocket(this.ws)
 
-    this.connectPromise = new Promise((resolve, reject) => {
+    let ws: WebSocket
+    try {
       const separator = this.endpoint.includes('?') ? '&' : '?'
       const url = this.token ? `${this.endpoint}${separator}token=${encodeURIComponent(this.token)}` : this.endpoint
-      const ws = new WebSocket(url)
-      ws.binaryType = 'arraybuffer'
-
+      ws = new WebSocket(url)
+    } catch (error) {
+      return Promise.reject(error)
+    }
+    this.cancelReconnect()
+    ws.binaryType = 'arraybuffer'
+    this.ws = ws
+    this.connectPromise = new Promise((resolve, reject) => {
+      this.rejectConnection = reject
       ws.onopen = () => {
-        this.ws = ws
+        if (this.ws !== ws) { ws.close(); return }
         this.connectPromise = null
+        this.rejectConnection = null
         this.reconnectAttempts = 0
-        for (const [api, subscription] of this.subscriptions) {
-          this.sendSubscription(api, subscription.params)
-        }
         resolve()
       }
-
       ws.onerror = () => {
-        this.connectPromise = null
-        reject(new LuxoError('NetworkError', 0, 'WebSocket connection failed'))
+        if (this.ws !== ws) return
+        try { this.disconnect(ws, new LuxoError('NetworkError', 0, 'WebSocket connection failed'), true) }
+        finally { ws.close() }
       }
-
       ws.onmessage = (event) => {
-        if (this.mode === 'binary' && event.data instanceof ArrayBuffer) {
+        if (this.ws !== ws) return
+        if (event.data instanceof ArrayBuffer) {
           this.handleBinaryResponse(new Uint8Array(event.data))
         } else {
-          this.handleJSONResponse(typeof event.data === 'string' ? event.data : '')
+          this.handleJSONResponse(typeof event.data === 'string' ? event.data : '', ws)
         }
       }
 
-      ws.onclose = () => {
-        this.ws = null
-        this.connectPromise = null
-        // Reject all pending requests
-        for (const [, p] of this.pending) {
-          p.cleanup()
-          p.reject(new LuxoError('NetworkError', 0, 'WebSocket closed'))
-        }
-        this.pending.clear()
-        for (const [api, subscription] of this.subscriptions) {
-          if (!subscription.acknowledgement) continue
-          subscription.acknowledgement.cleanup()
-          subscription.acknowledgement.reject(new LuxoError('NetworkError', 0, 'WebSocket closed'))
-          this.subscriptions.delete(api)
-        }
-        // Auto-reconnect with exponential backoff
-        if (!this.closed && this.reconnectAttempts < this.maxReconnectAttempts) {
-          const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts)
-          this.reconnectAttempts++
-          setTimeout(() => { this.connect().catch(() => {}) }, Math.min(delay, 30000))
-        }
-      }
+      ws.onclose = () => this.disconnect(ws, new LuxoError('NetworkError', 0, 'WebSocket closed'), true)
     })
     return this.connectPromise
+  }
+
+  private replaceClosingSocket(ws: WebSocket): Promise<void> {
+    try { this.disconnect(ws, new LuxoError('NetworkError', 0, 'WebSocket closed'), true) }
+    finally { ws.close() }
+    return this.connect()
+  }
+
+  private disconnect(ws: WebSocket, error: LuxoError, notify: boolean): void {
+    if (this.ws !== ws) return
+    this.ws = null
+    this.connectPromise = null
+    this.rejectConnection?.(error)
+    this.rejectConnection = null
+    for (const request of this.pending.values()) {
+      request.cleanup()
+      request.reject(error)
+    }
+    this.pending.clear()
+    // Detach before invoking observers: callbacks may close or start a new connection.
+    const retired = this.subscriptions
+    this.subscriptions = new Map()
+    for (const subscription of retired.values()) {
+      subscription.acknowledgement?.cleanup()
+      subscription.acknowledgement?.reject(error)
+    }
+    this.scheduleReconnect()
+    try { if (notify) this.notifyDisconnected(retired, error) }
+    finally { retired.clear() }
+  }
+
+  private notifyDisconnected(retired: Map<UInt64, WSSubscription>, error: LuxoError): void {
+    let failures: unknown[] | undefined
+    for (const subscription of retired.values()) {
+      if (subscription.acknowledgement) continue
+      try { subscription.observer?.onError?.(error) }
+      catch (failure) { (failures ??= []).push(failure) }
+    }
+    if (failures?.length === 1) throw failures[0]
+    if (failures) throw new AggregateError(failures, 'WebSocket disconnect observers failed')
+  }
+
+  private scheduleReconnect(): void {
+    this.cancelReconnect()
+    if (this.closed || this.reconnectAttempts >= this.maxReconnectAttempts) return
+    const delay = Math.min(this.reconnectDelay * 2 ** this.reconnectAttempts++, 30000)
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = undefined
+      try { await this.connect() }
+      catch {
+        // A constructor failure has no socket event; never duplicate an event-scheduled retry.
+        if (!this.ws && this.reconnectTimer === undefined) this.scheduleReconnect()
+      }
+    }, delay)
+  }
+
+  private cancelReconnect(): void {
+    if (this.reconnectTimer === undefined) return
+    clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = undefined
+  }
+
+  private requireSocket(): WebSocket {
+    const ws = this.ws
+    if (!ws || ws.readyState !== WebSocket.OPEN) throw new LuxoError('NetworkError', 0, 'WebSocket is not connected')
+    return ws
   }
 
   call(api: string, params?: Record<string, unknown>, options?: CallOptions): Promise<unknown> {
@@ -900,12 +928,19 @@ export class WsTransport implements Transport {
     if (options?.signal?.aborted) throw new LuxoError('CancelledError', 0, 'request cancelled')
     await this.connect()
     if (options?.signal?.aborted) throw new LuxoError('CancelledError', 0, 'request cancelled')
-    const id = ++this.seq
+    const id = this.nextRequestID()
     return this.createPendingCall(id, api, params, options?.signal)
   }
 
+  private nextRequestID(): UInt64 {
+    if (typeof this.seq === 'number' && this.seq < Number.MAX_SAFE_INTEGER) return ++this.seq
+    const previous = BigInt(this.seq)
+    if (previous >= UINT64_MAX) throw new LuxoError('RequestIDExhausted', 0, 'WebSocket request IDs exhausted')
+    return this.seq = previous + 1n
+  }
+
   private createPendingCall(
-    id: number,
+    id: UInt64,
     api: string,
     params: Record<string, unknown> | undefined,
     signal: AbortSignal | undefined,
@@ -938,128 +973,162 @@ export class WsTransport implements Transport {
     })
   }
 
-  private sendCall(id: number, api: string, params?: Record<string, unknown>): void {
+  private sendCall(id: UInt64, api: string, params?: Record<string, unknown>): void {
+    const ws = this.requireSocket()
     if (this.mode !== 'binary') {
-      this.ws!.send(JSON.stringify({ $id: id, $api: api, ...params }))
+      const prepared = this.jsonParams.prepare(api, params)
+      ws.send(encodeLuxoJSON({ ...prepared, $id: id, $api: api }))
       return
     }
     const meta = this.schema[api]
     if (!meta) throw new LuxoError('ConfigError', 0, `no schema for "${api}"`)
     const enc = new Encoder()
 	enc.writeRawBytes(new Uint8Array([BinaryFrame.callRequest]))
-    enc.writeVarint(id)
+    enc.writeUint64(id)
 	enc.writeRawBytes(encodeBinaryBody(meta, params))
-    this.ws!.send(toArrayBuffer(enc.bytes()))
+    ws.send(toArrayBuffer(enc.bytes()))
   }
 
-  async subscribe(api: string, params: Record<string, unknown>, onData: (data: unknown) => void): Promise<() => void> {
-    if (this.subscriptions.has(api)) {
-      throw new LuxoError('ConfigError', 0, `already subscribed to "${api}" on this transport`)
-    }
+  async subscribe<T>(api: string, params: Record<string, unknown>, decode: (data: unknown) => T, onData: (data: T) => void, observer?: StreamObserver): Promise<() => void> {
     await this.connect()
+    const id = this.nextRequestID()
+    const subscription: WSSubscription = {
+      observer, mode: this.mode,
+      onData: data => {
+        let value: T
+        try { value = decode(data) }
+        catch (error) { this.failSubscriptionDecoding(id, subscription, error); return }
+        // Application exceptions must not become protocol failures.
+        onData(value)
+      },
+    }
     return new Promise<() => void>((resolve, reject) => {
-      let acknowledgement: {
-        resolve: (unsubscribe: () => void) => void
-        reject: (error: Error) => void
-        cleanup: () => void
-      }
       const timeout = setTimeout(() => {
-        const subscription = this.subscriptions.get(api)
-        if (subscription?.acknowledgement !== acknowledgement) return
-        this.subscriptions.delete(api)
-        acknowledgement.cleanup()
+        if (!subscription.acknowledgement || this.subscriptions.get(id) !== subscription) return
+        this.unsubscribe(id)
+        subscription.acknowledgement = undefined
         reject(new LuxoError('TimeoutError', 0, `subscription timed out after ${this.timeout}ms`))
       }, this.timeout)
-      acknowledgement = { resolve, reject, cleanup: () => clearTimeout(timeout) }
-      this.subscriptions.set(api, {
-        params,
-        onData,
-        acknowledgement,
-      })
+      subscription.acknowledgement = { resolve, reject, cleanup: () => clearTimeout(timeout) }
+      this.subscriptions.set(id, subscription)
       try {
-        this.sendSubscription(api, params)
+        this.sendSubscription(id, api, params, subscription.mode)
       } catch (error) {
-        this.subscriptions.delete(api)
-        acknowledgement.cleanup()
+        this.subscriptions.delete(id)
+        subscription.acknowledgement.cleanup()
         reject(error instanceof Error ? error : new Error(String(error)))
       }
     })
   }
 
-  private unsubscribe(api: string): void {
-    if (!this.subscriptions.delete(api)) return
+  private unsubscribe(id: UInt64): void {
+    const subscription = this.subscriptions.get(id)
+    if (!subscription) return
+    this.subscriptions.delete(id)
+    subscription.acknowledgement?.cleanup()
     if (this.ws?.readyState !== WebSocket.OPEN) return
-    if (this.mode === 'binary') {
-      const meta = this.schema[api]
-      if (!meta) return
+    if (subscription.mode === 'binary') {
       const enc = new Encoder()
       enc.writeRawBytes(new Uint8Array([BinaryFrame.unsubscribe]))
-      enc.writeVarint(meta.id)
+      enc.writeUint64(id)
       this.ws.send(toArrayBuffer(enc.bytes()))
       return
     }
-    this.ws.send(JSON.stringify({ $unsub: api }))
+    this.ws.send(encodeLuxoJSON({ $unsub: id }))
   }
 
-  private sendSubscription(api: string, params: Record<string, unknown>): void {
-    if (this.mode === 'binary') {
+  private sendSubscription(id: UInt64, api: string, params: Record<string, unknown>, mode: TransportMode): void {
+    const ws = this.requireSocket()
+    if (mode === 'binary') {
       const meta = this.schema[api]
       if (!meta) throw new LuxoError('ConfigError', 0, `no schema for "${api}"`)
       const enc = new Encoder()
 	  enc.writeRawBytes(new Uint8Array([BinaryFrame.subscribe]))
+	  enc.writeUint64(id)
 	  enc.writeRawBytes(encodeBinaryBody(meta, params))
-      this.ws!.send(toArrayBuffer(enc.bytes()))
+      ws.send(toArrayBuffer(enc.bytes()))
       return
     }
-    this.ws!.send(JSON.stringify({ $sub: api, ...params }))
+    const prepared = this.jsonParams.prepare(api, params)
+    ws.send(encodeLuxoJSON({ ...prepared, $id: id, $sub: api }))
   }
 
-  private handleJSONResponse(data: string) {
-    try {
-      const json = JSON.parse(data)
-      if (typeof json.$sub === 'string') {
-        this.handleSubscriptionAcknowledgement(json.$sub, json.error
-          ? new LuxoError(json.error, json.code ?? 0, json.message ?? '', json.traceId, json.data, json.cause)
-          : undefined)
-        return
-      }
-      if (typeof json.$stream === 'string') {
-        this.subscriptions.get(json.$stream)?.onData(json.data)
-        return
-      }
-      const id = json.$id as number
-      const p = this.pending.get(id)
-      if (!p) return
-      this.pending.delete(id)
-      p.cleanup()
+  private handleJSONResponse(data: string, ws: WebSocket) {
+    let json: Record<string, unknown>
+    try { json = decodeJSONEnvelope(data) }
+    catch {
+      try { this.disconnect(ws, new LuxoError('ParseError', 0, 'invalid WebSocket JSON message'), true) }
+      finally { ws.close() }
+      return
+    }
+    if ('$end' in json) {
+      if ('$sub' in json || '$stream' in json || '$id' in json) return
+      this.handleJSONStreamEnd(json)
+      return
+    }
+    if ('$sub' in json) {
+      const id = jsonUint64(json.$sub)
+      if (id === undefined || this.subscriptions.get(id)?.mode !== 'json') return
+      if (!('error' in json) && json.ok !== true) return
+      this.handleSubscriptionAcknowledgement(id, 'error' in json
+        ? jsonResponseError(json)
+        : undefined)
+      return
+    }
+    if ('$stream' in json) {
+      const id = jsonUint64(json.$stream)
+      if (id === undefined) return
+      this.deliverSubscription(id, 'json', json.data)
+      return
+    }
+    const id = jsonUint64(json.$id)
+    if (id === undefined) return
+    const p = this.pending.get(id)
+    if (!p) return
+    this.pending.delete(id)
+    p.cleanup()
+    if ('error' in json) p.reject(jsonResponseError(json))
+    else p.resolve(json.data)
+  }
 
-      if (json.error) {
-		p.reject(new LuxoError(json.error, json.code ?? 0, json.message ?? '', json.traceId, json.data, json.cause))
-      } else {
-        p.resolve(json.data)
-      }
-    } catch { /* malformed message, ignore */ }
+  private handleJSONStreamEnd(json: Record<string, unknown>): void {
+    const id = jsonUint64(json.$end)
+    if (id === undefined) return
+    const failure = 'error' in json
+    const error = failure && !('ok' in json) ? jsonResponseError(json)
+      : !failure && json.ok === true && !('data' in json) ? undefined
+      : new LuxoError('ParseError', 0, 'invalid stream completion')
+    this.finishSubscription(id, 'json', error)
   }
 
   private handleBinaryResponse(data: Uint8Array) {
+	const header = readWireUint64(data, 1)
+	if (!header) return
 	if (data[0] === BinaryFrame.subscribeSuccess || data[0] === BinaryFrame.subscribeError) {
-	  const { value: apiID, offset } = readVarint(data, 1)
-      const api = Object.entries(this.schema).find(([, meta]) => meta.id === apiID)?.[0]
-      if (!api) return
+	  const { value: id, offset } = header
+      if (data[0] === BinaryFrame.subscribeSuccess && offset !== data.length) return
+      if (this.subscriptions.get(id)?.mode !== 'binary') return
       this.handleSubscriptionAcknowledgement(
-        api,
+        id,
         data[0] === BinaryFrame.subscribeError ? decodeBinaryError(data.subarray(offset), 0) : undefined,
       )
       return
     }
 	if (data[0] === BinaryFrame.stream) {
-	  const { value: apiID, offset } = readVarint(data, 1)
-      const api = Object.entries(this.schema).find(([, meta]) => meta.id === apiID)?.[0]
-      if (api) this.subscriptions.get(api)?.onData(data.subarray(offset))
+	  const { value: id, offset } = header
+      this.deliverSubscription(id, 'binary', data.subarray(offset))
+      return
+    }
+    if (data[0] === BinaryFrame.streamComplete || data[0] === BinaryFrame.streamError) {
+      const { value: id, offset } = header
+      const error = data[0] === BinaryFrame.streamError ? decodeBinaryError(data.subarray(offset), 0)
+        : offset === data.length ? undefined
+        : new LuxoError('ParseError', 0, 'trailing stream completion bytes')
+      this.finishSubscription(id, 'binary', error)
       return
     }
 	if (data[0] !== BinaryFrame.callSuccess && data[0] !== BinaryFrame.callError) return
-	const { value: id, offset: off } = readVarint(data, 1)
+	const { value: id, offset: off } = header
 
     const p = this.pending.get(id)
     if (!p) return
@@ -1072,43 +1141,56 @@ export class WsTransport implements Transport {
 	p.resolve(data.subarray(off))
   }
 
-  private handleSubscriptionAcknowledgement(api: string, error?: LuxoError): void {
-    const subscription = this.subscriptions.get(api)
+  private deliverSubscription(id: UInt64, mode: TransportMode, data: unknown): void {
+    const subscription = this.subscriptions.get(id)
+    if (subscription?.mode === mode && !subscription.acknowledgement) subscription.onData(data)
+  }
+
+  private failSubscriptionDecoding(id: UInt64, subscription: WSSubscription, cause: unknown): void {
+    if (this.subscriptions.get(id) !== subscription) return
+    const error = new LuxoError('DecodeError', 0, cause instanceof Error ? cause.message : 'invalid subscription response')
+    // Local retirement is authoritative even if the advisory cancellation cannot be sent.
+    try { this.unsubscribe(id) } catch { /* Connection events own transport failure notification. */ }
+    subscription.observer?.onError?.(error)
+  }
+
+  private finishSubscription(id: UInt64, mode: TransportMode, error?: LuxoError): void {
+    const subscription = this.subscriptions.get(id)
+    if (!subscription || subscription.mode !== mode) return
+    this.subscriptions.delete(id)
+    const acknowledgement = subscription.acknowledgement
+    if (acknowledgement) {
+      acknowledgement.cleanup()
+      acknowledgement.reject(new LuxoError('ParseError', 0, 'stream ended before acknowledgement'))
+      return
+    }
+    if (error) subscription.observer?.onError?.(error)
+    else subscription.observer?.onComplete?.()
+  }
+
+  private handleSubscriptionAcknowledgement(id: UInt64, error?: LuxoError): void {
+    const subscription = this.subscriptions.get(id)
     const acknowledgement = subscription?.acknowledgement
     if (!subscription) return
     if (error) {
-      this.subscriptions.delete(api)
+      this.subscriptions.delete(id)
       acknowledgement?.cleanup()
       acknowledgement?.reject(error)
+      if (!acknowledgement) subscription.observer?.onError?.(error)
       return
     }
     if (!acknowledgement) return
     subscription.acknowledgement = undefined
     acknowledgement.cleanup()
-    acknowledgement.resolve(() => this.unsubscribe(api))
+    acknowledgement.resolve(() => this.unsubscribe(id))
   }
 
   close(): void {
     this.closed = true
-    for (const [, subscription] of this.subscriptions) {
-      subscription.acknowledgement?.cleanup()
-      subscription.acknowledgement?.reject(new LuxoError('NetworkError', 0, 'WebSocket closed'))
-    }
-    this.subscriptions.clear()
-    this.ws?.close()
-    this.ws = null
+    this.cancelReconnect()
+    const ws = this.ws
+    if (!ws) return
+    this.disconnect(ws, new LuxoError('NetworkError', 0, 'WebSocket closed'), false)
+    ws.close()
   }
-}
-
-function readVarint(data: Uint8Array, start: number): { value: number; offset: number } {
-  let value = 0
-  let shift = 0
-  let offset = start
-  while (offset < data.length) {
-    const byte = data[offset++]
-    value += (byte & 0x7F) * (2 ** shift)
-    if (byte < 0x80) break
-    shift += 7
-  }
-  return { value, offset }
 }

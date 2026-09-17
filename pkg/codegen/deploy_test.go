@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -8,6 +9,32 @@ import (
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
 )
+
+func TestGeneratedToolchainMatchesCoreModule(t *testing.T) {
+	data, err := os.ReadFile("../../go.mod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var version string
+	for line := range strings.SplitSeq(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == "go" {
+			version = fields[1]
+			break
+		}
+	}
+	if version == "" {
+		t.Fatal("core module must declare its Go version")
+	}
+	project := InitProject("example.com/toolchain")
+	if !strings.Contains(string(project.Files["go.mod"]), "\ngo "+version+"\n") {
+		t.Fatalf("new projects must use the core Go version %s", version)
+	}
+	want := "FROM golang:" + version + "-alpine AS builder\n"
+	if !strings.Contains(string(generateDockerfile([]moduleInfo{{name: "user"}})), want) {
+		t.Fatalf("generated Dockerfile must use the core Go version %s", version)
+	}
+}
 
 func TestGenerateDeployFiles_Basic(t *testing.T) {
 	result := &semantic.Result{
@@ -39,7 +66,7 @@ func TestGenerateDeployFiles_Basic(t *testing.T) {
 	// Dockerfile checks
 	df := string(files.Dockerfile)
 	checks := []string{
-		"FROM golang:1.26-alpine AS builder",
+		"FROM golang:1.27.1-alpine AS builder",
 		"FROM builder AS user",
 		"FROM builder AS post",
 		"FROM builder AS gateway",

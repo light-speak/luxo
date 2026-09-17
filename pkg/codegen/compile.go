@@ -141,8 +141,9 @@ func (g *GeneratorContext) compileAPIBody(b *strings.Builder, api *ast.ApiDecl, 
 			typeName = p.Type.Name
 		}
 		vt := valType{name: typeName}
-		if p.Type != nil && p.Type.Nullable {
-			vt.nullable = true
+		if p.Type != nil {
+			vt.nullable = p.Type.Nullable
+			vt.isList = p.Type.IsList
 		}
 		c.vars[p.Name] = vt
 	}
@@ -257,8 +258,8 @@ func writeStructuredScalarParamDecode(b *strings.Builder, param *ast.ParamDecl, 
 	if nullable {
 		fmt.Fprintf(b, "%s\t%s = &%s{}\n", indent, name, param.Type.Name)
 	}
-	fmt.Fprintf(b, "%s\t%s.ReadLuxo(_%sDecoder)\n", indent, name, name)
-	fmt.Fprintf(b, "%s\tif _%sDecoder.Err() != nil { return api.InvalidParam(%q, _%sDecoder.Err()) }\n", indent, name, name, name)
+	fmt.Fprintf(b, "%s\t%s.ReadLuxoInput(_%sDecoder)\n", indent, name, name)
+	fmt.Fprintf(b, "%s\tif err := _%sDecoder.Finish(); err != nil { return api.InvalidParam(%q, err) }\n", indent, name, name)
 	fmt.Fprintf(b, "%s}\n", indent)
 }
 
@@ -272,8 +273,8 @@ func writeStructuredListParamDecode(b *strings.Builder, param *ast.ParamDecl, in
 	fmt.Fprintf(b, "%s\t%s = make([]%s, len(_%sMessages))\n", indent, name, param.Type.Name, name)
 	fmt.Fprintf(b, "%s\tfor i := range _%sMessages {\n", indent, name)
 	fmt.Fprintf(b, "%s\t\t_%sDecoder := codec.NewDecoder(_%sMessages[i])\n", indent, name, name)
-	fmt.Fprintf(b, "%s\t\t%s[i].ReadLuxo(_%sDecoder)\n", indent, name, name)
-	fmt.Fprintf(b, "%s\t\tif _%sDecoder.Err() != nil { return api.InvalidParam(%q, _%sDecoder.Err()) }\n", indent, name, name, name)
+	fmt.Fprintf(b, "%s\t\t%s[i].ReadLuxoInput(_%sDecoder)\n", indent, name, name)
+	fmt.Fprintf(b, "%s\t\tif err := _%sDecoder.Finish(); err != nil { return api.InvalidParam(%q, err) }\n", indent, name, name)
 	fmt.Fprintf(b, "%s\t}\n%s}\n", indent, indent)
 }
 
@@ -411,7 +412,8 @@ func registerCompiledFunctionParams(c *compiler, params []*ast.ParamDecl) {
 
 // valType tracks the resolved type of a val variable.
 type valType struct {
-	isModel  bool   // true if this is a *Model or []*Model
+	isModel  bool   // true for model values, pointers and lists
+	isValue  bool   // true for an addressable model value rather than a model pointer
 	isList   bool   // true if this is a list (e.g., []*Model)
 	isChan   bool   // true if this is a channel (Channel<T>)
 	nullable bool   // true if this is a pointer type (nullable param/field)
@@ -419,12 +421,19 @@ type valType struct {
 }
 
 func (c *compiler) valTypeFromExpr(expr ast.Expr) (valType, bool) {
+	if ident, ok := expr.(*ast.Ident); ok {
+		if value, exists := c.vars[ident.Name]; exists {
+			return value, true
+		}
+	}
 	if expr == nil || expr.GetTypeTag() == "" {
 		return valType{}, false
 	}
 	_, isModel := c.models[expr.GetTypeTag()]
+	_, isObject := expr.(*ast.ObjectExpr)
 	return valType{
 		isModel:  isModel,
+		isValue:  isModel && isObject,
 		isList:   expr.IsListType(),
 		nullable: expr.IsNullable(),
 		name:     expr.GetTypeTag(),
@@ -432,21 +441,11 @@ func (c *compiler) valTypeFromExpr(expr ast.Expr) (valType, bool) {
 }
 
 func (c *compiler) goTypeForExpr(expr ast.Expr) string {
-	if expr == nil || expr.GetTypeTag() == "" {
+	value, ok := c.valTypeFromExpr(expr)
+	if !ok {
 		return ""
 	}
-	name := expr.GetTypeTag()
-	base := mapBaseType(name)
-	if _, isModel := c.models[name]; isModel {
-		base = "*" + name
-	}
-	if expr.IsListType() {
-		return "[]" + base
-	}
-	if expr.IsNullable() && !isNilableGoType(base) {
-		return "*" + base
-	}
-	return base
+	return goTypeForValType(value)
 }
 
 func (c *compiler) yieldNeedsAddress(expr ast.Expr) bool {
@@ -550,7 +549,11 @@ func (c *compiler) compileVal(s *ast.ValStmt) {
 	if modelName, ok := directLoadModel(s.Value); ok && c.isRemoteModel(modelName) {
 		c.loadSelection, c.hasLoadSelection = c.loadSelections[s.Name]
 	}
-	expr := c.compileExpr(s.Value)
+	var expected *ast.TypeRef
+	if s.Value.GetTypeTag() == "" && c.api != nil {
+		expected = c.api.ReturnType
+	}
+	expr := c.compileExpectedExpr(s.Value, expected)
 	c.loadSelection, c.hasLoadSelection = previousSelection, previousHasSelection
 	if c.isModelQuery(s.Value) {
 		qt := c.resolveQueryType(s.Value)
@@ -565,10 +568,9 @@ func (c *compiler) compileVal(s *ast.ValStmt) {
 		c.writeErrorGuard()
 		c.vars[s.Name] = qt
 	} else {
-		if list, ok := s.Value.(*ast.ListExpr); ok && c.api != nil && c.api.ReturnType != nil && c.api.ReturnType.IsList {
-			expr = c.compileTypedList(list, c.api.ReturnType)
-			_, isModel := c.models[c.api.ReturnType.Name]
-			c.vars[s.Name] = valType{name: c.api.ReturnType.Name, isList: true, isModel: isModel}
+		if _, ok := s.Value.(*ast.ListExpr); ok && expected != nil && expected.IsList {
+			_, isModel := c.models[expected.Name]
+			c.vars[s.Name] = valType{name: expected.Name, isList: true, isModel: isModel}
 		}
 		// Wrap bare integer literals in int64() to match Luxo's Int = int64
 		if lit, ok := s.Value.(*ast.Literal); ok && lit.Kind == token.Int {
@@ -587,9 +589,6 @@ func (c *compiler) compileVal(s *ast.ValStmt) {
 			c.vars[s.Name] = valType{name: c.api.ReturnType.Name}
 		}
 		if source, ok := s.Value.(*ast.Ident); ok {
-			if sourceType, exists := c.vars[source.Name]; exists {
-				c.vars[s.Name] = sourceType
-			}
 			if totalName := c.paginationTotals[source.Name]; totalName != "" {
 				c.paginationTotals[s.Name] = totalName
 			}
@@ -655,10 +654,11 @@ func (c *compiler) compileReturn(s *ast.ReturnStmt) {
 		c.write("return nil")
 		return
 	}
-	expr := c.compileExpr(s.Value)
-	if list, ok := s.Value.(*ast.ListExpr); ok && c.api != nil && c.api.ReturnType != nil && c.api.ReturnType.IsList {
-		expr = c.compileTypedList(list, c.api.ReturnType)
+	var expected *ast.TypeRef
+	if c.api != nil {
+		expected = c.api.ReturnType
 	}
+	expr := c.compileExpectedExpr(s.Value, expected)
 
 	// 1. Direct model query chain — extract to temp var, then WriteLuxo
 	if c.isModelQuery(s.Value) {
@@ -700,18 +700,10 @@ func (c *compiler) compileFunctionReturn(statement *ast.ReturnStmt) {
 		c.write("return nil")
 		return
 	}
-	expression := c.compileExpr(statement.Value)
-	if list, ok := statement.Value.(*ast.ListExpr); ok && c.functionResult != nil && c.functionResult.IsList {
-		expression = c.compileTypedList(list, c.functionResult)
-	}
+	expression := c.compileFunctionArgument(statement.Value, c.functionResult)
 	if c.isModelQuery(statement.Value) {
 		c.write("return %s", expression)
 		return
-	}
-	if c.functionResult != nil && c.models[c.functionResult.Name] != nil && !c.functionResult.IsList {
-		if _, ok := statement.Value.(*ast.ObjectExpr); ok {
-			expression = "&" + expression
-		}
 	}
 	c.write("return %s, nil", expression)
 }
@@ -724,7 +716,7 @@ func (c *compiler) writeReturnByType(expr string, vt valType) {
 			c.writeModelListReturn(expr, vt.name, c.paginationTotals[expr])
 		} else {
 			c.writeComputedResolve(vt.name, expr, false)
-			c.write("%s.WriteLuxo(req.Buf, req.FieldMask)", expr)
+			c.writeBinaryCall("%s.WriteLuxo(req.Buf, req.FieldMask)", expr)
 		}
 		return
 	}
@@ -733,14 +725,14 @@ func (c *compiler) writeReturnByType(expr string, vt valType) {
 			return
 		}
 		if c.isTypeDecl(vt.name) {
-			c.write("WriteColumnar%s(req.Buf, %s, req.FieldMask)", vt.name, expr)
+			c.writeBinaryCall("WriteColumnar%s(req.Buf, %s, req.FieldMask)", vt.name, expr)
 			return
 		}
 	}
 	if appendExpr, ok := binaryScalarAppend(vt.name, "req.Buf.B", expr, c.enums[vt.name]); ok {
-		c.write("req.Buf.B = %s", appendExpr)
+		c.writeBinaryAppend(appendExpr)
 	} else if c.isTypeDecl(vt.name) {
-		c.write("%s.WriteLuxo(req.Buf, req.FieldMask)", expr)
+		c.writeBinaryCall("%s.WriteLuxo(req.Buf, req.FieldMask)", expr)
 	} else {
 		c.write("_ = %s // unsupported return type for binary encoding", expr)
 	}
@@ -758,12 +750,12 @@ func (c *compiler) writeScalarReturn(expr string) {
 					c.writeModelListReturn(resultName, typeName, "")
 				} else {
 					c.writeComputedResolve(typeName, expr, true)
-					c.write("WriteColumnar%s(req.Buf, %s, req.FieldMask)", typeName, expr)
+					c.writeBinaryCall("WriteColumnar%s(req.Buf, %s, req.FieldMask)", typeName, expr)
 				}
 			} else {
 				c.write("_result := %s", expr)
 				c.writeComputedResolve(typeName, "&_result", false)
-				c.write("_result.WriteLuxo(req.Buf, req.FieldMask)")
+				c.writeBinaryCall("_result.WriteLuxo(req.Buf, req.FieldMask)")
 			}
 			return
 		}
@@ -772,17 +764,17 @@ func (c *compiler) writeScalarReturn(expr string) {
 				return
 			}
 			if c.isTypeDecl(typeName) {
-				c.write("WriteColumnar%s(req.Buf, %s, req.FieldMask)", typeName, expr)
+				c.writeBinaryCall("WriteColumnar%s(req.Buf, %s, req.FieldMask)", typeName, expr)
 				return
 			}
 		}
 		if appendExpr, ok := binaryScalarAppend(typeName, "req.Buf.B", expr, c.enums[typeName]); ok {
-			c.write("req.Buf.B = %s", appendExpr)
+			c.writeBinaryAppend(appendExpr)
 			return
 		}
 		// Try as type with WriteLuxo — value receiver
 		if c.isTypeDecl(typeName) {
-			c.write("%s.WriteLuxo(req.Buf, req.FieldMask)", expr)
+			c.writeBinaryCall("%s.WriteLuxo(req.Buf, req.FieldMask)", expr)
 			return
 		}
 	}
@@ -794,7 +786,7 @@ func (c *compiler) writeModelListReturn(expr, modelName, totalName string) {
 		totalName = c.writeInMemoryPagination(expr)
 	}
 	c.writeComputedResolve(modelName, expr, true)
-	c.write("WriteColumnar%s(req.Buf, %s, req.FieldMask)", modelName, expr)
+	c.writeBinaryCall("WriteColumnar%s(req.Buf, %s, req.FieldMask)", modelName, expr)
 	if c.paginate {
 		c.write("req.Buf.B = codec.AppendSvarint(req.Buf.B, %s)", totalName)
 		c.write("req.Buf.B = codec.AppendSvarint(req.Buf.B, int64(req.Page))")
@@ -847,7 +839,7 @@ func (c *compiler) writePrimitiveList(expr, typeName string) bool {
 	c.write("for _, v := range %s {", expr)
 	oldIndent := c.indent
 	c.indent += "\t"
-	c.write("req.Buf.B = %s", appendExpr)
+	c.writeBinaryAppend(appendExpr)
 	c.indent = oldIndent
 	c.write("}")
 	return true
@@ -867,15 +859,17 @@ func binaryScalarAppend(typeName, dst, value string, isEnum bool) (string, bool)
 	case "Boolean":
 		return fmt.Sprintf("codec.AppendBool(%s, %s)", dst, value), true
 	case "DateTime":
-		return fmt.Sprintf("codec.AppendSvarint(%s, %s.Unix())", dst, value), true
+		return fmt.Sprintf("codec.AppendDateTime(%s, %s)", dst, value), true
 	case "Duration":
 		return fmt.Sprintf("codec.AppendSvarint(%s, int64(%s))", dst, value), true
 	case "UUID":
 		return fmt.Sprintf("codec.AppendUUID(%s, %s)", dst, value), true
 	case "Decimal":
 		return fmt.Sprintf("codec.AppendString(%s, %s.String())", dst, value), true
-	case "Bytes", "JSON":
+	case "Bytes":
 		return fmt.Sprintf("codec.AppendBytes(%s, %s)", dst, value), true
+	case "JSON":
+		return fmt.Sprintf("codec.AppendJSON(%s, %s)", dst, value), true
 	default:
 		return "", false
 	}
@@ -1460,12 +1454,12 @@ func (c *compiler) compileDeclaredFunctionArguments(call *ast.CallExpr, fn *ast.
 	for index, param := range fn.Params {
 		if param.Spread {
 			for _, value := range variadicValues {
-				args = append(args, c.compileExpr(value))
+				args = append(args, c.compileFunctionArgument(value, param.Type))
 			}
 			continue
 		}
 		if values[index] != nil {
-			args = append(args, c.compileExpr(values[index]))
+			args = append(args, c.compileFunctionArgument(values[index], param.Type))
 			continue
 		}
 		args = append(args, c.compileFunctionDefault(param))
@@ -2835,31 +2829,6 @@ func (c *compiler) compileAssign(s *ast.AssignStmt) {
 
 // --- Phase 2 expression compilers ---
 
-// compileList emits a concrete slice when semantic analysis resolved the element type.
-func (c *compiler) compileList(e *ast.ListExpr) string {
-	var items []string
-	for _, item := range e.Items {
-		items = append(items, c.compileExpr(item))
-	}
-	goType := c.goTypeForExpr(e)
-	if goType == "" {
-		goType = "[]any"
-	}
-	return goType + "{" + strings.Join(items, ", ") + "}"
-}
-
-func (c *compiler) compileTypedList(e *ast.ListExpr, listType *ast.TypeRef) string {
-	items := make([]string, 0, len(e.Items))
-	for _, item := range e.Items {
-		items = append(items, c.compileExpr(item))
-	}
-	goType := resolveGoType(listType)
-	if _, isModel := c.models[listType.Name]; isModel {
-		goType = "[]*" + listType.Name
-	}
-	return goType + "{" + strings.Join(items, ", ") + "}"
-}
-
 // compileTemplate: "hello ${name}: ${count} items"
 // Generates strings.Builder for zero-alloc string concatenation.
 // String expressions are written directly; int64 uses strconv.AppendInt.
@@ -3284,6 +3253,9 @@ func goTypeForValType(value valType) string {
 	if value.isModel {
 		if value.isList {
 			return "[]*" + value.name
+		}
+		if value.isValue {
+			return value.name
 		}
 		return "*" + value.name
 	}

@@ -3,14 +3,18 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"encoding/json/jsontext"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/light-speak/luxo/pkg/lux/errors"
+	"github.com/light-speak/luxo/pkg/lux/jsonutil"
 	"github.com/light-speak/luxo/pkg/lux/selection"
 	"github.com/shopspring/decimal"
 )
@@ -78,55 +82,6 @@ var reservedKeys = map[string]bool{
 	"page": true, "pageSize": true,
 }
 
-// Filter represents a single filter condition from $filters.
-type Filter struct {
-	Field    string `json:"field"`
-	Operator string `json:"op"`
-	Value    string `json:"value"`
-}
-
-// UnmarshalJSON accepts JSON scalar filter values while keeping the internal
-// string representation consumed by typed FilterOp implementations.
-func (f *Filter) UnmarshalJSON(data []byte) error {
-	var raw struct {
-		Field    string          `json:"field"`
-		Operator string          `json:"op"`
-		Value    json.RawMessage `json:"value"`
-	}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
-	}
-	value, err := parseFilterValue(raw.Value)
-	if err != nil {
-		return err
-	}
-	f.Value = value
-	f.Field = raw.Field
-	f.Operator = raw.Operator
-	return nil
-}
-
-func parseFilterValue(raw json.RawMessage) (string, error) {
-	value := bytes.TrimSpace(raw)
-	if len(value) == 0 || bytes.Equal(value, []byte("null")) || value[0] == '{' || value[0] == '[' {
-		return "", fmt.Errorf("filter value must be a string, number, or boolean")
-	}
-	if value[0] == '"' {
-		var decoded string
-		if err := json.Unmarshal(value, &decoded); err != nil {
-			return "", err
-		}
-		return decoded, nil
-	}
-	return string(value), nil
-}
-
-// Sorter represents a sort directive from $sorters.
-type Sorter struct {
-	Field string `json:"field"`
-	Order string `json:"order"` // "asc" or "desc"
-}
-
 // Request represents a parsed Luvia API request.
 type Request struct {
 	API         string                     // $api field
@@ -181,6 +136,8 @@ func (r *Request) applyBinaryListParams() {
 // MaxJSONBodySize limits JSON request body to 10MB (smaller than binary).
 const MaxJSONBodySize = 10 * 1024 * 1024
 
+var errInvalidJSONUTF8 = stderrors.New("invalid JSON: invalid UTF-8")
+
 func ParseRequest(r *http.Request) (*Request, error) {
 	defer r.Body.Close()
 	body, bp, err := readBody(r.Body)
@@ -198,9 +155,13 @@ func ParseRequest(r *http.Request) (*Request, error) {
 	if len(body) > MaxJSONBodySize {
 		return nil, fmt.Errorf("JSON body exceeds %d bytes limit", MaxJSONBodySize)
 	}
-
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(body, &raw); err != nil {
+	// Parse names and opaque values together; reject invalid Unicode before it
+	// can be replaced. The returned values own their bytes, not the pooled body.
+	raw, err := jsonutil.ParseObject(body)
+	if err != nil {
+		if !utf8.Valid(body) {
+			return nil, errInvalidJSONUTF8
+		}
 		return nil, fmt.Errorf("invalid JSON: %w", err)
 	}
 	return parseRawRequest(raw)
@@ -216,7 +177,8 @@ func parseRawRequest(raw map[string]json.RawMessage) (*Request, error) {
 	if !ok {
 		return nil, fmt.Errorf("missing $api field")
 	}
-	if err := json.Unmarshal(apiRaw, &req.API); err != nil {
+	var err error
+	if req.API, err = jsonutil.ParseString(apiRaw); err != nil {
 		return nil, fmt.Errorf("$api must be a string")
 	}
 	if req.API == "" {
@@ -225,8 +187,8 @@ func parseRawRequest(raw map[string]json.RawMessage) (*Request, error) {
 
 	// Extract $select (optional)
 	if selRaw, ok := raw["$select"]; ok {
-		var selStr string
-		if err := json.Unmarshal(selRaw, &selStr); err != nil {
+		selStr, err := jsonutil.ParseString(selRaw)
+		if err != nil {
 			return nil, fmt.Errorf("$select must be a string")
 		}
 		fields, err := selection.Parse(selStr)
@@ -255,12 +217,11 @@ func parseRawRequest(raw map[string]json.RawMessage) (*Request, error) {
 // parseListParams extracts $filters, $sorters, page, pageSize from raw request.
 func (req *Request) parseListParams(raw map[string]json.RawMessage) error {
 	if filtersRaw, ok := raw["$filters"]; ok {
-		if err := json.Unmarshal(filtersRaw, &req.Filters); err != nil {
+		filters, err := parseListObjects(filtersRaw, 1000, "op", filterMetadata)
+		if err != nil {
 			return fmt.Errorf("$filters: %w", err)
 		}
-		if len(req.Filters) > 1000 {
-			return fmt.Errorf("$filters exceeds limit: %d > 1000", len(req.Filters))
-		}
+		req.Filters = filters
 		for i := range req.Filters {
 			if req.Filters[i].Field == "" || filterOperatorID(req.Filters[i].Operator) == 0 {
 				return fmt.Errorf("$filters[%d]: invalid field or operator", i)
@@ -268,12 +229,11 @@ func (req *Request) parseListParams(raw map[string]json.RawMessage) error {
 		}
 	}
 	if sortersRaw, ok := raw["$sorters"]; ok {
-		if err := json.Unmarshal(sortersRaw, &req.Sorters); err != nil {
+		sorters, err := parseListObjects(sortersRaw, 100, "order", sorterMetadata)
+		if err != nil {
 			return fmt.Errorf("$sorters: %w", err)
 		}
-		if len(req.Sorters) > 100 {
-			return fmt.Errorf("$sorters exceeds limit: %d > 100", len(req.Sorters))
-		}
+		req.Sorters = sorters
 		for i := range req.Sorters {
 			if req.Sorters[i].Field == "" || (req.Sorters[i].Order != "asc" && req.Sorters[i].Order != "desc") {
 				return fmt.Errorf("$sorters[%d]: invalid field or order", i)
@@ -282,14 +242,15 @@ func (req *Request) parseListParams(raw map[string]json.RawMessage) error {
 	}
 	req.Page = 1
 	req.PageSize = defaultPageSize
+	var err error
 	if pageRaw, ok := raw["page"]; ok {
-		if err := json.Unmarshal(pageRaw, &req.Page); err != nil {
+		if req.Page, err = parseJSONPageInteger(pageRaw); err != nil {
 			return fmt.Errorf("page must be an integer")
 		}
 	}
 	if psRaw, ok := raw["pageSize"]; ok {
 		req.pageSizeSet = true
-		if err := json.Unmarshal(psRaw, &req.PageSize); err != nil {
+		if req.PageSize, err = parseJSONPageInteger(psRaw); err != nil {
 			return fmt.Errorf("pageSize must be an integer")
 		}
 	}
@@ -301,6 +262,15 @@ func (req *Request) parseListParams(raw map[string]json.RawMessage) error {
 	}
 	// pageSize == 0 → return all (no pagination)
 	return nil
+}
+
+// Pagination still uses Go int internally; never truncate on a 32-bit host.
+func parseJSONPageInteger(raw []byte) (int, error) {
+	value, err := jsonutil.ParseInt64(raw)
+	if err != nil || int64(int(value)) != value {
+		return 0, fmt.Errorf("expected an integer within platform range")
+	}
+	return int(value), nil
 }
 
 // findParam looks up a binary param by name from the inline slot array.
@@ -344,7 +314,7 @@ func (r *Request) ParamIsNull(name string) bool {
 }
 
 // ParamInt extracts an integer parameter. Returns 400 BadRequest on error.
-// Binary mode: inline array lookup (zero alloc). JSON mode: json.Unmarshal.
+// Binary mode uses typed slots; JSON mode reads a strict integer token.
 func (r *Request) ParamInt(name string) (int64, error) {
 	if r.paramNames != nil {
 		if v, ok := r.findParam(name); ok {
@@ -358,8 +328,8 @@ func (r *Request) ParamInt(name string) (int64, error) {
 	if !ok {
 		return 0, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
-	var v int64
-	if err := json.Unmarshal(raw, &v); err != nil {
+	v, err := jsonutil.ParseInt64(raw)
+	if err != nil {
 		return 0, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be an integer"})
 	}
 	return v, nil
@@ -379,8 +349,8 @@ func (r *Request) ParamString(name string) (string, error) {
 	if !ok {
 		return "", errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
-	var v string
-	if err := json.Unmarshal(raw, &v); err != nil {
+	v, err := jsonutil.ParseString(raw)
+	if err != nil {
 		return "", errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be a string"})
 	}
 	return v, nil
@@ -400,11 +370,7 @@ func (r *Request) ParamDateTime(name string) (time.Time, error) {
 	if !ok {
 		return time.Time{}, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return time.Time{}, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be a string"})
-	}
-	t, err := time.Parse(time.RFC3339, s)
+	t, err := jsonutil.ParseDateTime(raw)
 	if err != nil {
 		return time.Time{}, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be RFC3339 format"})
 	}
@@ -425,8 +391,8 @@ func (r *Request) ParamFloat(name string) (float64, error) {
 	if !ok {
 		return 0, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
-	var v float64
-	if err := json.Unmarshal(raw, &v); err != nil {
+	v, err := jsonutil.ParseFloat64(raw)
+	if err != nil {
 		return 0, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be a number"})
 	}
 	return v, nil
@@ -446,8 +412,8 @@ func (r *Request) ParamBool(name string) (bool, error) {
 	if !ok {
 		return false, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
-	var v bool
-	if err := json.Unmarshal(raw, &v); err != nil {
+	v, err := jsonutil.ParseBool(raw)
+	if err != nil {
 		return false, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be a boolean"})
 	}
 	return v, nil
@@ -470,8 +436,8 @@ func (r *Request) ParamIntArray(name string) ([]int64, error) {
 	if !ok {
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
-	var v []int64
-	if err := json.Unmarshal(raw, &v); err != nil {
+	v, err := jsonutil.ParseInt64Array(raw)
+	if err != nil {
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be an array of integers"})
 	}
 	return v, nil
@@ -494,8 +460,8 @@ func (r *Request) ParamStringArray(name string) ([]string, error) {
 	if !ok {
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
-	var v []string
-	if err := json.Unmarshal(raw, &v); err != nil {
+	v, err := jsonutil.ParseStringArray(raw)
+	if err != nil {
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be an array of strings"})
 	}
 	return v, nil
@@ -518,11 +484,27 @@ func (r *Request) ParamUUIDArray(name string) ([]uuid.UUID, error) {
 	if !ok {
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
-	var value []uuid.UUID
-	if err := json.Unmarshal(raw, &value); err != nil {
+	var reader jsonUUIDArrayReader
+	value, err := jsonutil.ParseArray(raw, reader.parse)
+	if err != nil {
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be an array of UUIDs"})
 	}
 	return value, nil
+}
+
+// ParseArray has already validated this entire JSON value, including Unicode.
+type jsonUUIDArrayReader struct{ scratch []byte }
+
+func (r *jsonUUIDArrayReader) parse(raw []byte) (uuid.UUID, error) {
+	if len(raw) >= 2 && raw[0] == '"' && bytes.IndexByte(raw, '\\') < 0 {
+		return uuid.ParseBytes(raw[1 : len(raw)-1])
+	}
+	value, err := jsontext.AppendUnquote(r.scratch[:0], raw)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	r.scratch = value
+	return uuid.ParseBytes(value)
 }
 
 // ParamMessage returns a structured Luxo parameter without JSON conversion.

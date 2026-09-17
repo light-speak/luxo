@@ -13,6 +13,7 @@ import (
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
+	"github.com/light-speak/luxo/pkg/lux/jsonutil"
 	"github.com/light-speak/luxo/pkg/lux/schema"
 	"nhooyr.io/websocket"
 )
@@ -67,6 +68,35 @@ func registerTestStream(rt *Router, name string) {
 	definition.Stream = true
 }
 
+// newInMemoryWebSocket keeps network waits inside the caller's synctest bubble.
+func newInMemoryWebSocket(t *testing.T, rt http.Handler) (context.Context, *websocket.Conn) {
+	t.Helper()
+	srv := httptest.NewTestServer(t, rt)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+	conn, _, err := websocket.Dial(ctx, "ws://example.com", &websocket.DialOptions{HTTPClient: srv.Client()})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { conn.CloseNow() })
+	return ctx, conn
+}
+
+func writeWSFrame(t *testing.T, ctx context.Context, conn *websocket.Conn, kind websocket.MessageType, frame []byte) {
+	t.Helper()
+	if err := conn.Write(ctx, kind, frame); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
+func requireWSFrame(t *testing.T, ctx context.Context, conn *websocket.Conn, kind websocket.MessageType, want []byte) {
+	t.Helper()
+	gotKind, frame, err := conn.Read(ctx)
+	if err != nil || gotKind != kind || !bytes.Equal(frame, want) {
+		t.Fatalf("frame = (%v, %q, %v), want (%v, %q, nil)", gotKind, frame, err, kind, want)
+	}
+}
+
 func TestWSRejectsSubscriptionsToNonStreamAPIs(t *testing.T) {
 	rt := testWSRouter()
 	srv := httptest.NewServer(rt)
@@ -80,10 +110,10 @@ func TestWSRejectsSubscriptionsToNonStreamAPIs(t *testing.T) {
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
-	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"$sub":"getUser","id":42}`)); err != nil {
+	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"$id":1,"$sub":"getUser","id":42}`)); err != nil {
 		t.Fatal(err)
 	}
-	binary := []byte{BinaryFrameSubscribe}
+	binary := []byte{BinaryFrameSubscribe, 2}
 	binary = codec.AppendVarint(binary, 10)
 	binary = codec.AppendVarint(binary, 0)
 	var enc codec.Encoder
@@ -116,18 +146,18 @@ func TestWSJSONSubscriptionAcknowledgesSuccessAndErrors(t *testing.T) {
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
-	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"$sub":"watchAck"}`)); err != nil {
+	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"$id":1,"$sub":"watchAck"}`)); err != nil {
 		t.Fatal(err)
 	}
 	messageType, data, err := conn.Read(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if messageType != websocket.MessageText || string(data) != `{"$sub":"watchAck","ok":true}` {
+	if messageType != websocket.MessageText || string(data) != `{"$sub":1,"ok":true}` {
 		t.Fatalf("unexpected subscribe acknowledgement: type=%v data=%s", messageType, data)
 	}
 
-	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"$sub":"getUser","id":42}`)); err != nil {
+	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"$id":2,"$sub":"getUser","id":42}`)); err != nil {
 		t.Fatal(err)
 	}
 	_, data, err = conn.Read(ctx)
@@ -138,7 +168,7 @@ func TestWSJSONSubscriptionAcknowledgesSuccessAndErrors(t *testing.T) {
 	if err := json.Unmarshal(data, &response); err != nil {
 		t.Fatal(err)
 	}
-	if string(response["$sub"]) != `"getUser"` || string(response["error"]) != `"BadRequest"` {
+	if string(response["$sub"]) != `2` || string(response["error"]) != `"BadRequest"` {
 		t.Fatalf("unexpected subscription error: %s", data)
 	}
 }
@@ -159,7 +189,7 @@ func TestWSBinarySubscriptionAcknowledgesSuccessAndErrors(t *testing.T) {
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
-	request := []byte{BinaryFrameSubscribe, 71, 0, 0}
+	request := []byte{BinaryFrameSubscribe, 1, 71, 0, 0}
 	if err := conn.Write(ctx, websocket.MessageBinary, request); err != nil {
 		t.Fatal(err)
 	}
@@ -167,11 +197,11 @@ func TestWSBinarySubscriptionAcknowledgesSuccessAndErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if messageType != websocket.MessageBinary || !bytes.Equal(data, []byte{BinaryFrameSubscribeSuccess, 71}) {
+	if messageType != websocket.MessageBinary || !bytes.Equal(data, []byte{BinaryFrameSubscribeSuccess, 1}) {
 		t.Fatalf("unexpected subscribe acknowledgement: type=%v data=%v", messageType, data)
 	}
 
-	request = []byte{BinaryFrameSubscribe, 10, 0, 0}
+	request = []byte{BinaryFrameSubscribe, 2, 10, 0, 0}
 	if err := conn.Write(ctx, websocket.MessageBinary, request); err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +209,7 @@ func TestWSBinarySubscriptionAcknowledgesSuccessAndErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(data) < 3 || data[0] != BinaryFrameSubscribeError || data[1] != 10 {
+	if len(data) < 3 || data[0] != BinaryFrameSubscribeError || data[1] != 2 {
 		t.Fatalf("unexpected subscription error frame: %v", data)
 	}
 	wireErr, err := DecodeBinaryError(data[2:], 0)
@@ -330,6 +360,68 @@ func TestWSJSON_HandlerError(t *testing.T) {
 	got := string(data)
 	if !strings.Contains(got, "NotFound") {
 		t.Errorf("should contain NotFound error: %s", got)
+	}
+}
+
+func TestWSJSONStructuredErrorFields(t *testing.T) {
+	for _, dev := range []bool{false, true} {
+		t.Run(fmt.Sprint(dev), func(t *testing.T) {
+			rt := testWSRouter()
+			rt.SetDevMode(dev)
+			rt.Handle("failAPI", func(context.Context, *Request) error {
+				return errors.New("PrecisionRejected", 422, "error.precision_rejected").
+					WithData(precisionErrorData{Value: 9223372036854775807, Label: "精度 café"}).
+					WithCause(fmt.Errorf("private diagnostic"))
+			})
+			srv := httptest.NewServer(TraceMiddleware(rt))
+			defer srv.Close()
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), &websocket.DialOptions{
+				HTTPHeader: http.Header{"X-Request-Id": {"error-parity"}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close(websocket.StatusNormalClosure, "")
+			request := []byte(`{"$id":18446744073709551615,"$api":"failAPI"}`)
+			if err := conn.Write(ctx, websocket.MessageText, request); err != nil {
+				t.Fatal(err)
+			}
+			_, body, err := conn.Read(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			verifyWSStructuredError(t, body, dev)
+		})
+	}
+}
+
+func verifyWSStructuredError(t *testing.T, body []byte, dev bool) {
+	t.Helper()
+	var response struct {
+		ID                             uint64 `json:"$id"`
+		Error, Message, TraceID, Cause string
+		Code                           int
+		Data                           struct {
+			Value int64
+			Label string
+		}
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.ID != ^uint64(0) || response.Code != 422 || response.Error != "PrecisionRejected" ||
+		response.Message != "error.precision_rejected" || response.TraceID != "error-parity" ||
+		response.Data.Value != 9223372036854775807 || response.Data.Label != "精度 café" {
+		t.Fatalf("incomplete error response: %s", body)
+	}
+	wantCause := ""
+	if dev {
+		wantCause = "private diagnostic"
+	}
+	if response.Cause != wantCause {
+		t.Fatalf("development cause = %q, want %q", response.Cause, wantCause)
 	}
 }
 
@@ -921,7 +1013,7 @@ func TestWSUpgradeViaHTTP(t *testing.T) {
 	}
 }
 
-func TestIsStreamMsg(t *testing.T) {
+func TestIsStreamRequest(t *testing.T) {
 	tests := []struct {
 		name string
 		data string
@@ -949,12 +1041,20 @@ func TestIsStreamMsg(t *testing.T) {
 		// Minimal/boundary inputs
 		{"too short to match", `{"$s"}`, false},
 		{"exact minimum $sub", `{"$sub":"x"}`, true},
+		{"escaped $sub", `{"\u0024sub":"x"}`, true},
+		{"escaped $unsub", `{"$un\u0073ub":1}`, true},
+		{"top-level array", `[{"$sub":"x"}]`, false},
+		{"value with escaped quote", `{"key":"val\"ue","$sub":"x"}`, true},
+		{"missing colon", `{"$sub"}`, false},
+		{"invalid Unicode", `{"$sub":"\uD800"}`, false},
+		{"trailing value", `{"$sub":"x"} {}`, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := isStreamMsg([]byte(tt.data))
+			raw, err := jsonutil.ParseObject([]byte(tt.data))
+			got := err == nil && isStreamRequest(raw)
 			if got != tt.want {
-				t.Errorf("isStreamMsg(%q) = %v, want %v", tt.data, got, tt.want)
+				t.Errorf("isStreamRequest(%q) = %v, want %v", tt.data, got, tt.want)
 			}
 		})
 	}
@@ -1011,7 +1111,7 @@ func TestWSBinary_SubscribeWithFloatParam(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	var reqBuf []byte
-	reqBuf = append(reqBuf, BinaryFrameSubscribe)
+	reqBuf = append(reqBuf, BinaryFrameSubscribe, 1)
 	reqBuf = codec.AppendVarint(reqBuf, 61) // API ID
 	reqBuf = codec.AppendVarint(reqBuf, 0)  // no mask
 	var enc codec.Encoder
@@ -1049,7 +1149,7 @@ func TestWSBinary_SubscribeWithStringParam(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	var reqBuf []byte
-	reqBuf = append(reqBuf, BinaryFrameSubscribe)
+	reqBuf = append(reqBuf, BinaryFrameSubscribe, 1)
 	reqBuf = codec.AppendVarint(reqBuf, 62) // API ID
 	reqBuf = codec.AppendVarint(reqBuf, 0)  // no mask
 	var enc codec.Encoder
@@ -1087,7 +1187,7 @@ func TestWSBinary_SubscribeWithBoolParam(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	var reqBuf []byte
-	reqBuf = append(reqBuf, BinaryFrameSubscribe)
+	reqBuf = append(reqBuf, BinaryFrameSubscribe, 1)
 	reqBuf = codec.AppendVarint(reqBuf, 63) // API ID
 	reqBuf = codec.AppendVarint(reqBuf, 0)  // no mask
 	var enc codec.Encoder
@@ -1127,7 +1227,7 @@ func TestWSBinary_SubscribeWithUnsupportedParamType(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	var reqBuf []byte
-	reqBuf = append(reqBuf, BinaryFrameSubscribe)
+	reqBuf = append(reqBuf, BinaryFrameSubscribe, 1)
 	reqBuf = codec.AppendVarint(reqBuf, 64)
 	reqBuf = codec.AppendVarint(reqBuf, 0)
 	var enc codec.Encoder
@@ -1151,8 +1251,9 @@ func TestWSBinary_SubscribeNativeHandler(t *testing.T) {
 	rt.Registry.RegisterParams("watchNativeBin", nil)
 
 	handlerCalled := make(chan struct{}, 1)
-	rt.HandleStreamNative("watchNativeBin", func(ctx context.Context, params *StreamParams, identity any, stream *Stream) {
+	rt.HandleStreamNative("watchNativeBin", func(ctx context.Context, params *StreamParams, identity any, stream *Stream) error {
 		handlerCalled <- struct{}{}
+		return nil
 	})
 
 	srv := httptest.NewServer(rt)
@@ -1169,7 +1270,7 @@ func TestWSBinary_SubscribeNativeHandler(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	var reqBuf []byte
-	reqBuf = append(reqBuf, BinaryFrameSubscribe)
+	reqBuf = append(reqBuf, BinaryFrameSubscribe, 1)
 	reqBuf = codec.AppendVarint(reqBuf, 65) // API ID
 	reqBuf = codec.AppendVarint(reqBuf, 0)  // no mask
 	reqBuf = append(reqBuf, 0x00)           // end params
@@ -1206,7 +1307,7 @@ func TestWSBinary_SubscribeWithFieldMask(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	var reqBuf []byte
-	reqBuf = append(reqBuf, BinaryFrameSubscribe)
+	reqBuf = append(reqBuf, BinaryFrameSubscribe, 1)
 	reqBuf = codec.AppendVarint(reqBuf, 66) // API ID
 	mask := codec.AppendSelectionMask(nil, []byte{0xFF, 0x01}, nil)
 	reqBuf = codec.AppendVarint(reqBuf, uint64(len(mask)))
@@ -1237,7 +1338,7 @@ func TestWSBinaryRejectsStructuredSubscriptionWithoutFieldMask(t *testing.T) {
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
-	request := []byte{BinaryFrameSubscribe}
+	request := []byte{BinaryFrameSubscribe, 1}
 	request = codec.AppendVarint(request, 67)
 	request = codec.AppendVarint(request, 0)
 	request = append(request, 0)
@@ -1303,7 +1404,7 @@ func TestWSBinary_StreamUnknownAPIID(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	var reqBuf []byte
-	reqBuf = append(reqBuf, BinaryFrameSubscribe)
+	reqBuf = append(reqBuf, BinaryFrameSubscribe, 1)
 	reqBuf = codec.AppendVarint(reqBuf, 999) // unknown API ID
 	reqBuf = codec.AppendVarint(reqBuf, 0)
 	reqBuf = append(reqBuf, 0x00)
@@ -1378,16 +1479,6 @@ func TestWSBinary_UnsubscribeNonExistent(t *testing.T) {
 	_, _, err = conn.Read(ctx)
 	if err != nil {
 		t.Fatalf("connection should survive: %v", err)
-	}
-}
-
-// --- isStreamMsg with escape in string ---
-
-func TestIsStreamMsg_EscapeInString(t *testing.T) {
-	// String value with escaped quote shouldn't break parsing
-	got := isStreamMsg([]byte(`{"key":"val\"ue","$sub":"x"}`))
-	if !got {
-		t.Error("should find $sub after escaped quote in string value")
 	}
 }
 
@@ -1486,35 +1577,4 @@ func TestWSAllowAllOrigins(t *testing.T) {
 		t.Fatalf("wildcard origin policy rejected connection: %v", err)
 	}
 	conn.Close(websocket.StatusNormalClosure, "")
-}
-
-func TestHasColonAfter(t *testing.T) {
-	tests := []struct {
-		name string
-		data string
-		pos  int
-		want bool
-	}{
-		// Normal JSON key-value separator
-		{"immediate colon", `"key":val`, 5, true},
-		{"colon after spaces", `"key" : val`, 5, true},
-		{"colon after tab", "\"key\"\t:", 5, true},
-
-		// No colon — means the match was inside a value, not a key
-		{"no more data after pos", `"key"`, 5, false},
-		{"next char is comma (value context)", `"key",`, 5, false},
-		{"next char is closing brace", `"key"}`, 5, false},
-
-		// Pos at end of buffer
-		{"pos equals len", `abc`, 3, false},
-		{"pos beyond len", `ab`, 5, false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := hasColonAfter([]byte(tt.data), tt.pos)
-			if got != tt.want {
-				t.Errorf("hasColonAfter(%q, %d) = %v, want %v", tt.data, tt.pos, got, tt.want)
-			}
-		})
-	}
 }

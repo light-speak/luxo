@@ -634,8 +634,94 @@ func TestFilterRejectsMalformedJSON(t *testing.T) {
 	if err := filter.UnmarshalJSON([]byte(`{"field":`)); err == nil {
 		t.Fatal("malformed filter JSON succeeded")
 	}
-	if _, err := parseFilterValue([]byte{'"', '\\', 'x', '"'}); err == nil {
+	if err := filter.UnmarshalJSON([]byte(`{"value":"\x"}`)); err == nil {
 		t.Fatal("malformed JSON string succeeded")
+	}
+}
+
+func TestFilterRejectsInvalidUnicodeWithoutChangingReceiver(t *testing.T) {
+	for _, raw := range []string{`{"field":"\uD800","op":"eq","value":1}`, `{"field":"id","op":"eq","value":"\uDC00"}`,
+		`{"field":"id","op":"eq","value":"\uD800","value":"valid"}`, `{"field":"id","op":"eq","value":1,"ignored":"\uD800"}`} {
+		filter := Filter{Field: "keep", Operator: "eq", Value: "previous"}
+		if err := filter.UnmarshalJSON([]byte(raw)); err == nil || filter != (Filter{Field: "keep", Operator: "eq", Value: "previous"}) {
+			t.Errorf("invalid Unicode accepted or receiver modified: %q / %+v / %v", raw, filter, err)
+		}
+	}
+}
+
+func TestJSONListMetadataPreservesAliasesAndNumericTokens(t *testing.T) {
+	for _, token := range []string{"9223372036854775807", "123456789012345678901234567890", "0.123456789012345678901", "1e9999", "-0", "true"} {
+		body := `{"$api":"list","$filters":[{"FIELD":"old","field":"id","Op":"eq","VALUE":` + token + `,"ignored":{}}],` +
+			`"$sorters":[{"field":"old","Field":"id","ORDER":"desc","ignored":[]}]}`
+		req, err := ParseRequest(makeReq(body))
+		if err != nil || len(req.Filters) != 1 || req.Filters[0] != (Filter{"id", "eq", token}) || len(req.Sorters) != 1 || req.Sorters[0] != (Sorter{"id", "desc"}) {
+			t.Fatalf("metadata changed: %v / %v", req, err)
+		}
+	}
+	for _, raw := range []string{"null", "[]"} {
+		req, err := ParseRequest(makeReq(`{"$api":"list","$filters":` + raw + `,"$sorters":` + raw + `}`))
+		if err != nil || len(req.Filters) != 0 || len(req.Sorters) != 0 {
+			t.Fatalf("empty metadata changed: %v / %v", req, err)
+		}
+	}
+}
+
+func TestJSONListMetadataPreservesDuplicateMembers(t *testing.T) {
+	body := `{"$api":"list","$filters":[{"field":"id","Field":null,"op":"eq","OP":null,"value":{},"VALUE":""}],` +
+		`"$sorters":[{"FIELD":"id","field":null,"ORDER":"desc","order":null}]}`
+	req, err := ParseRequest(makeReq(body))
+	if err != nil || req.Filters[0] != (Filter{"id", "eq", ""}) || req.Sorters[0] != (Sorter{"id", "desc"}) {
+		t.Fatalf("duplicate member behavior changed: %v / %v", req, err)
+	}
+}
+
+func TestJSONListMetadataOwnsFields(t *testing.T) {
+	text := strings.Repeat("東京", 12000)
+	input := []byte(`{"field":"name","op":"eq","value":"` + text + `","unknown":"` + text + `"}`)
+	var filter Filter
+	if err := filter.UnmarshalJSON(input); err != nil {
+		t.Fatal(err)
+	}
+	clear(input)
+	for range 3 {
+		var next Filter
+		if err := next.UnmarshalJSON([]byte(`{"FIELD":"other","OP":"ne","VALUE":1}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if filter != (Filter{"name", "eq", text}) {
+		t.Fatal("metadata retained mutable input or reader storage")
+	}
+}
+
+func TestJSONListMetadataRejectsMalformedObjects(t *testing.T) {
+	for _, raw := range []string{"", "null", "[]", "{", "{1:1}", `{"field":}`, `{"field":1,"value":1}`, `{}true`, `{"value":1}true`,
+		`{"op":false,"value":1}`, `{"field":"id","op":"eq","value":"\uD800"}`} {
+		var value Filter
+		if err := value.UnmarshalJSON([]byte(raw)); err == nil {
+			t.Errorf("malformed metadata accepted: %q", raw)
+		}
+	}
+}
+
+func TestJSONListMetadataRejectsMalformedItems(t *testing.T) {
+	for _, key := range []string{"$filters", "$sorters"} {
+		for _, raw := range []string{"[false]", "[null]", `[{"field":1}]`} {
+			if req, err := ParseRequest(makeReq(`{"$api":"list","` + key + `":` + raw + `}`)); err == nil || req != nil {
+				t.Errorf("invalid metadata item accepted: %s: %s", key, raw)
+			}
+		}
+	}
+}
+
+func TestJSONListMetadataRejectsIncompleteDirectArrays(t *testing.T) {
+	for _, key := range []string{"$filters", "$sorters"} {
+		for _, raw := range []string{"", "[", "null true", "[]true", "[false]", `[{"field":"id","op":"eq","value":}]`, `[{"field":"id"},]`} {
+			req := &Request{}
+			if err := req.parseListParams(map[string]json.RawMessage{key: []byte(raw)}); err == nil {
+				t.Errorf("invalid direct metadata accepted: %s: %q", key, raw)
+			}
+		}
 	}
 }
 

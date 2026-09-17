@@ -1,0 +1,69 @@
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"testing"
+
+	"github.com/light-speak/luxo/pkg/lux/api"
+	"github.com/light-speak/luxo/pkg/lux/rpc"
+)
+
+func BenchmarkProxy(b *testing.B) {
+	for _, list := range []bool{false, true} {
+		for _, branches := range []int{0, 1, 2} {
+			b.Run(fmt.Sprintf("list=%v/branches=%d", list, branches), func(b *testing.B) {
+				benchmarkProxyCase(b, list, branches, false)
+			})
+		}
+		b.Run(fmt.Sprintf("list=%v/shared", list), func(b *testing.B) { benchmarkProxyCase(b, list, 2, true) })
+	}
+}
+
+func benchmarkProxyCase(b *testing.B, list bool, branches int, shared bool) {
+	s := proxyTestSchema(list, branches)
+	if shared {
+		alias := s.Models["Parent"].Fields[1]
+		alias.ID, alias.Name = 3, "alias"
+		s.Models["Parent"].Fields[2] = alias
+	}
+	client := proxyTestRPC(b, s, map[string]api.HandlerFunc{
+		"parent":                     proxyTestResponse(proxyTestPrimary(list, true)),
+		"svc:resolve:Child:parentId": proxyTestResponse(proxyEmptyResolvedList()),
+		"svc:resolve:Other:parentId": proxyTestResponse(proxyEmptyResolvedList()),
+	})
+	clients := map[string]*rpc.Client{"child": client, "other": client}
+	implementations := []struct {
+		name   string
+		handle api.HandlerFunc
+	}{
+		{"canonical-without-child-validation", proxyHandlerBenchmark(client, s, "parent", clients)},
+		{"canonical-checked", proxyHandler(client, s, "parent", clients)},
+	}
+	if os.Getenv("LUXO_PROXY_BENCH_REVERSE") == "1" {
+		implementations[0], implementations[1] = implementations[1], implementations[0]
+	}
+	var expected []byte
+	for _, implementation := range implementations {
+		request := &api.Request{FieldMask: proxyTestMask(branches), Buf: &api.ResponseBuf{}}
+		if err := implementation.handle(b.Context(), request); err != nil {
+			b.Fatal(err)
+		}
+		if expected == nil {
+			expected = bytes.Clone(request.Buf.B)
+		}
+		if !bytes.Equal(expected, request.Buf.B) {
+			b.Fatal("implementations disagree on valid response")
+		}
+		b.Run(implementation.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				request.Buf.B = request.Buf.B[:0]
+				if err := implementation.handle(b.Context(), request); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

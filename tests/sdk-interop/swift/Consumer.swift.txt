@@ -1,0 +1,783 @@
+import Foundation
+@testable import LuxoClient
+
+@main
+struct GoConsumer {
+  static let selection = "value, duration, optional, values, label"
+
+  static func main() async {
+    do {
+      try await run()
+    } catch {
+      FileHandle.standardError.write(Data("Go consumer failed: \(error)\n".utf8))
+      exit(1)
+    }
+  }
+
+  static func run() async throws {
+    try verifyNestedBoundaries()
+    let environment = ProcessInfo.processInfo.environment
+    guard let endpoint = environment["LUXO_INTEROP_ENDPOINT"],
+      let corpus = environment["LUXO_INTEROP_CORPUS"]
+    else {
+      throw failure("missing live Go fixture environment")
+    }
+    let gateway: Bool
+    switch environment["LUXO_INTEROP_TOPOLOGY"] {
+    case "direct": gateway = false
+    case "gateway": gateway = true
+    default: throw failure("missing or invalid topology; use the Go -run owner")
+    }
+    let scope =
+      gateway
+      ? "gateway success/streams/errors" : "direct success/streams/errors"
+    let cases = try JSONDecoder().decode(
+      Corpus.self, from: Data(contentsOf: URL(fileURLWithPath: corpus)))
+    let values = try cases.int64Cases.map { item in
+      guard let value = Int(item.value) else {
+        throw failure("integer outside platform range: \(item.value)")
+      }
+      return value
+    }
+    for websocket in [false, true] {
+      for binary in [false, true] {
+        try await verifyChannel(
+          endpoint: endpoint, websocket: websocket, binary: binary, values: values,
+          numberTokens: cases.jsonNumberTokens, dates: cases.dateTimeCases)
+        print("\(scope): \(websocket ? "WebSocket" : "HTTP") \(binary ? "Binary" : "JSON") passed")
+      }
+    }
+    for binary in [false, true] {
+      for start in [UInt64(0), 9_007_199_254_740_990, UInt64(Int64.max) - 1, UInt64.max - 2] {
+        try await verifySubscriptionIDs(endpoint: endpoint, binary: binary, start: start)
+        print("\(scope): concurrent \(binary ? "Binary" : "JSON") UInt64 subscriptions from \(start) passed")
+      }
+      for fail in [false, true] {
+        let socket = try WebSocketTransport(
+          url: endpoint.replacingOccurrences(of: "http:", with: "ws:"), timeout: 5,
+          session: URLSession(configuration: .ephemeral), initialSequence: .max - 1)
+        defer { socket.close() }
+        let client = LuxoGeneratedClient(transport: socket)
+        if binary { client.enableBinary() }
+        socket.connect()
+        try await verifyFiniteStream(client, fail: fail, reuse: false)
+        print("\(scope): \(binary ? "Binary" : "JSON") UInt64.max terminal failure=\(fail) passed")
+      }
+    }
+  }
+
+  static func verifySubscriptionIDs(endpoint: String, binary: Bool, start: UInt64) async throws {
+    let socket = try WebSocketTransport(
+      url: endpoint.replacingOccurrences(of: "http:", with: "ws:"), timeout: 5,
+      session: URLSession(configuration: .ephemeral), initialSequence: start)
+    defer { socket.close() }
+    let client = LuxoGeneratedClient(transport: socket)
+    if binary { client.enableBinary() }
+    socket.connect()
+    let (first, firstContinuation) = AsyncStream<Precision>.makeStream()
+    let (second, secondContinuation) = AsyncStream<Precision>.makeStream()
+    defer { firstContinuation.finish(); secondContinuation.finish() }
+    async let firstSetup = client.subscribeWatchPrecision(value: Int.min, select: selection) {
+      firstContinuation.yield($0)
+    }
+    async let secondSetup = client.subscribeWatchPrecision(value: Int.max, select: selection) {
+      secondContinuation.yield($0)
+    }
+    let cancellations = try await (firstSetup, secondSetup)
+    defer { cancellations.0(); cancellations.1() }
+    try ensure(try await firstValue(first).value.requireValue() == Int.min, "first subscription identity changed")
+    try ensure(try await firstValue(second).value.requireValue() == Int.max, "second subscription identity changed")
+    if start == UInt64.max - 2 {
+      do {
+        _ = try await client.subscribeWatchPrecision(value: 1, select: selection) { _ in }
+        throw failure("UInt64 subscription counter wrapped")
+      } catch let error as LuxoError {
+        try ensure(error.name == "RequestIDExhausted", "wrong exhaustion error")
+      }
+    }
+  }
+
+  static func verifyChannel(
+    endpoint: String, websocket: Bool, binary: Bool, values: [Int], numberTokens: [String],
+    dates: [DateTimeCase]
+  ) async throws {
+    let socket =
+      try websocket
+      ? WebSocketTransport(url: endpoint.replacingOccurrences(of: "http:", with: "ws:"), timeout: 5)
+      : nil
+    let transport: any Transport
+    if let socket {
+      transport = socket
+    } else {
+      transport = try URLSessionTransport(endpoint: endpoint, timeout: 5)
+    }
+    defer { socket?.close() }
+    let observed = RecordingTransport(base: transport)
+    let client = LuxoGeneratedClient(transport: observed)
+    try ensure(observed.registrationCount == 1, "schema was not registered at initialization")
+    if binary { client.enableBinary() }
+    try ensure(observed.registrationCount == 1, "mode change repeated schema registration")
+    socket?.connect()
+    try await verifyUnary(client, values: values)
+    try await verifyTimestamps(client, cases: dates)
+    try await verifyBusinessFloats(client)
+    try await verifyJSONNumbers(client, tokens: numberTokens, websocket: websocket)
+    try await verifyNamedEnums(client, websocket: websocket)
+    try ensure(
+      try await client.checkListEffects() == [1, 2, 3, 3], "list evaluation count mismatch")
+    try await verifyErrors(client, values: values)
+    try await verifyJSONErrors(client, tokens: numberTokens)
+    try await verifyPagination(client)
+    try await verifyNullableArrays(client, websocket: websocket)
+    try await verifyNestedResponses(client, websocket: websocket)
+    try await verifyScalarArrays(client, websocket: websocket)
+    if websocket {
+      try await verifyStreams(client, values: values)
+      for fail in [false, true] { try await verifyFiniteStream(client, fail: fail) }
+    }
+  }
+
+  static let scalarSelection =
+    "ints, floats, strings, bools, dates, durations, uuids, bytes, decimals, jsons, enums, tail"
+
+  static func verifyTimestamps(_ client: LuxoGeneratedClient, cases: [DateTimeCase]) async throws {
+    for item in cases {
+      try ensure(try await client.echoTimestamp(value: item.input) == item.canonical, "DateTime mismatch: \(item.input)")
+    }
+    let inputs = cases.map(\.input)
+    let expected = cases.map(\.canonical)
+    try ensure(try await client.echoTimestamps(values: inputs) == expected, "DateTime list mismatch")
+    let input = ScalarArraysInput(dates: inputs, tail: 42)
+    let row = try await client.echoScalarArrays(input: input, select: "dates, tail")
+    try ensure(try row.dates.requireValue() == expected, "DateTime input mismatch")
+    for row in try await client.listScalarArrays(input: input, select: "dates, tail") {
+      try ensure(try row.dates.requireValue() == expected, "DateTime column mismatch")
+      try ensure(try row.tail.requireValue() == 42, "DateTime column cursor mismatch")
+    }
+  }
+
+  static func verifyBusinessFloats(_ client: LuxoGeneratedClient) async throws {
+    let values: [Double] = [0, -0.0, .leastNonzeroMagnitude, -.leastNonzeroMagnitude, .greatestFiniteMagnitude, -.greatestFiniteMagnitude]
+    for value in values {
+      let result = try await client.scaleFloat(value: value, factor: 1)
+      try ensure(result.bitPattern == value.bitPattern, "business Float bits changed")
+      let rows = try await client.scaleFloatList(value: value, factor: 1)
+      try ensure(rows.count == 2 && rows.allSatisfy { $0.bitPattern == value.bitPattern }, "Float list bits changed")
+    }
+    for value in [Double.greatestFiniteMagnitude, -Double.greatestFiniteMagnitude] {
+      for list in [false, true] {
+        do {
+          if list { _ = try await client.scaleFloatList(value: value, factor: 2) }
+          else { _ = try await client.scaleFloat(value: value, factor: 2) }
+          throw failure("business Float overflow was accepted")
+        } catch let error as LuxoError {
+          try ensure(error.code == 500 && error.name == "Internal" && error.message == "error.internal", "overflow error identity changed")
+          try ensure(error.data == nil && error.cause == nil, "overflow exposed internal data")
+        }
+        try ensure(try await client.scaleFloat(value: 1.25, factor: 2) == 2.5, "success after overflow failed")
+      }
+    }
+  }
+
+  static func jsonFixtureDocuments(_ token: String) -> [Data] {
+    [Data(token.utf8), Data("{\"nested\":[\(token),null,{\"n\":\(token)}]}".utf8)]
+  }
+
+  static func verifyJSONNumbers(
+    _ client: LuxoGeneratedClient, tokens: [String], websocket: Bool
+  ) async throws {
+    for token in tokens {
+      for data in jsonFixtureDocuments(token) {
+        let value = try JSONValue.parse(data)
+        let result = try await client.echoJSON(value: value)
+        try ensure(try result.jsonData() == data, "generic JSON number changed: \(token)")
+        let list = try await client.echoJSONs(values: [value, .null])
+        try ensure(list == [value, .null], "generic JSON list changed: \(token)")
+        if websocket { try await verifyJSONStreams(client, value: value) }
+      }
+    }
+  }
+
+  static func verifyJSONErrors(_ client: LuxoGeneratedClient, tokens: [String]) async throws {
+    for token in tokens {
+      for data in jsonFixtureDocuments(token) {
+        let value = try JSONValue.parse(data)
+        try await verifyJSONError(client, value: value, token: token)
+      }
+    }
+  }
+
+  static func verifyJSONError(
+    _ client: LuxoGeneratedClient, value: JSONValue, token: String
+  ) async throws {
+    do {
+      _ = try await client.rejectJSON(value: value)
+      throw failure("expected JSONRejected")
+    } catch let error as LuxoError {
+      try ensure(error.name == "JSONRejected" && error.code == 422, "JSON error identity mismatch")
+      try ensure(error.message == "error.json_rejected", "JSON error message mismatch")
+      try ensure(
+        error.traceId?.isEmpty == false && error.cause == nil, "JSON error metadata mismatch")
+      guard let data = error.data as? [String: Any] else { throw failure("missing JSON error data") }
+      if case .object = value {
+        guard let opaque = data["value"] as? [String: Any],
+          let items = opaque["nested"] as? [Any], items.count == 3,
+          let nested = items[2] as? [String: Any]
+        else { throw failure("missing nested JSON error data") }
+        try ensure(items[1] is NSNull, "JSON error null changed")
+        try ensure(rawNumberToken(items[0]) == token, "JSON error number changed: \(token)")
+        try ensure(rawNumberToken(nested["n"]) == token, "nested JSON error number changed: \(token)")
+      } else {
+        try ensure(rawNumberToken(data["value"]) == token, "scalar JSON error number changed: \(token)")
+      }
+    }
+    try ensure(try await client.echoJSON(value: value) == value, "success after JSON error changed")
+  }
+
+  static func rawNumberToken(_ value: Any?) -> String? {
+    if let number = value as? JSONNumber { return number.literal }
+    if let integer = value as? Int64 { return String(integer) }
+    return nil
+  }
+
+  static func verifyJSONStreams(_ client: LuxoGeneratedClient, value: JSONValue) async throws {
+    let (stream, continuation) = AsyncStream<JSONValue>.makeStream()
+    let cancel = try await client.subscribeWatchJSON(value: value) { continuation.yield($0) }
+    defer {
+      cancel()
+      continuation.finish()
+    }
+    try ensure(try await firstValue(stream) == value, "generic JSON stream number changed")
+    let (rows, listContinuation) = AsyncStream<[JSONValue]>.makeStream()
+    let cancelList = try await client.subscribeWatchJSONs(values: [value, .null]) {
+      listContinuation.yield($0)
+    }
+    defer {
+      cancelList()
+      listContinuation.finish()
+    }
+    try ensure(try await firstValue(rows) == [value, .null], "generic JSON list stream changed")
+  }
+
+  static func verifyNamedEnums(_ client: LuxoGeneratedClient, websocket: Bool) async throws {
+    for value in FixtureState.allCases {
+      try ensure(try await client.echoFixtureState(value: value) == value, "enum value mismatch")
+    }
+    for values: [FixtureState] in [[], [.open], [.closed, .open]] {
+      try ensure(try await client.echoFixtureStates(values: values) == values, "enum list mismatch")
+    }
+    guard websocket else { return }
+    let (stream, continuation) = AsyncStream<FixtureState>.makeStream()
+    let cancel = try await client.subscribeWatchFixtureState { continuation.yield($0) }
+    defer {
+      cancel()
+      continuation.finish()
+    }
+    try ensure(try await firstValue(stream) == .open, "enum stream mismatch")
+    let (listStream, listContinuation) = AsyncStream<[FixtureState]>.makeStream()
+    let cancelList = try await client.subscribeWatchFixtureStates { listContinuation.yield($0) }
+    defer {
+      cancelList()
+      listContinuation.finish()
+    }
+    try ensure(try await firstValue(listStream) == [.open, .closed], "enum list stream mismatch")
+  }
+
+  static func verifyErrors(_ client: LuxoGeneratedClient, values: [Int]) async throws {
+    for value in values {
+      do {
+        _ = try await client.rejectPrecision(value: value)
+        throw failure("expected PrecisionRejected")
+      } catch let error as LuxoError {
+        try ensure(
+          error.name == "PrecisionRejected" && error.code == 422, "error identity mismatch")
+        try ensure(error.message == "error.precision_rejected", "error message mismatch")
+        try ensure(error.traceId?.isEmpty == false, "missing error trace ID")
+        guard let data = error.data as? [String: Any], let integer = data["value"] as? NSNumber
+        else {
+          throw failure("missing numeric error data")
+        }
+        try ensure(integer.stringValue == String(value), "error integer lost precision")
+        try ensure(data["label"] as? String == "精度 café", "error label mismatch")
+        try ensure(error.cause == nil, "unexpected error cause")
+      }
+      try ensure(
+        try await client.echoInteger(value: value) == value, "success after error mismatch")
+    }
+  }
+
+  static func verifyPagination(_ client: LuxoGeneratedClient) async throws {
+    let cases: [(Int?, Int?, Int, Int, [Int])] = [
+      (nil, nil, 1, 2, [1, 2]), (2, 2, 2, 2, [3]), (3, 2, 3, 2, []),
+      (9_007_199_254_740_993, 2, 9_007_199_254_740_993, 2, []), (Int.max, 2, Int.max, 2, []),
+      (0, 2, 1, 2, [1, 2]), (-1, 2, 1, 2, [1, 2]), (1, 0, 1, 0, [1, 2, 3]),
+      (1, 100, 1, 100, [1, 2, 3]), (1, -1, 1, 20, [1, 2, 3]), (1, 101, 1, 20, [1, 2, 3]),
+    ]
+    for value in [Int.min, Int.max] {
+      for (page, size, expectedPage, expectedSize, ids) in cases {
+        let result = try await client.browsePrecision(
+          value: value, page: page, pageSize: size, select: "id, value")
+        try ensure(
+          result.total == 3 && result.page == expectedPage && result.pageSize == expectedSize,
+          "pagination metadata mismatch")
+        try ensure(result.items.count == ids.count, "pagination item count mismatch")
+        for (index, row) in result.items.enumerated() {
+          try ensure(try row.id.requireValue() == ids[index], "pagination ID mismatch")
+          try ensure(try row.value.requireValue() == value, "pagination value mismatch")
+          try ensure(unselected(row.label), "pagination selected an extra field")
+        }
+      }
+    }
+  }
+
+  static func scalarState<Value>(_ state: Int, _ values: [Value]) -> [Value]? {
+    state == 0 ? nil : state == 1 ? [] : values
+  }
+
+  static func scalarInput(_ state: Int) throws -> ScalarArraysInput {
+    guard let zero = UUID(uuidString: "00000000-0000-0000-0000-000000000000"),
+      let one = UUID(uuidString: "00000000-0000-0000-0000-000000000001")
+    else { throw failure("invalid fixture UUID") }
+    return ScalarArraysInput(
+      ints: scalarState(state, [Int.min, Int.max]),
+      floats: scalarState(
+        state,
+        state == 3
+          ? [
+            -1.5, 1.25, -0.0, Double.leastNonzeroMagnitude,
+            -Double.leastNonzeroMagnitude, Double.greatestFiniteMagnitude,
+          ]
+          : [-1.5, 1.25]),
+      strings: scalarState(state, ["", "精度 café 東京"]), bools: scalarState(state, [true, false]),
+      dates: scalarState(state, ["1969-12-31T23:59:59Z", "2021-01-01T00:00:00Z"]),
+      durations: scalarState(state, [Int64.min, Int64.max]),
+      uuids: scalarState(state, [zero, one]),
+      bytes: scalarState(state, [Data(), Data([0, 127, 128, 255])]),
+      decimals: scalarState(state, ["1234567890.123456789", "-0.000000001"]),
+      jsons: scalarState(
+        state, [.object(["value": .integer(Int64.max), "text": .string("東京")]), .bool(false)]),
+      enums: scalarState(state, [.open, .closed]), tail: 42)
+  }
+
+  static func verifyScalarArrays(_ client: LuxoGeneratedClient, websocket: Bool) async throws {
+    for state in 0...3 {
+      let input = try scalarInput(state)
+      try verifyScalarValues(
+        try await client.echoScalarArrays(input: input, select: scalarSelection), input: input)
+      let rows = try await client.listScalarArrays(input: input, select: scalarSelection)
+      try ensure(rows.count == 2, "expected scalar array pair")
+      for row in rows { try verifyScalarValues(row, input: input) }
+      var partials = try await client.listScalarArrays(input: input, select: "tail")
+      partials.append(try await client.echoScalarArrays(input: input, select: "tail"))
+      for row in partials {
+        try ensure(try row.tail.requireValue() == 42, "scalar partial tail mismatch")
+        let absent = [
+          unselected(row.ints), unselected(row.floats), unselected(row.strings),
+          unselected(row.bools),
+          unselected(row.dates), unselected(row.durations), unselected(row.uuids),
+          unselected(row.bytes),
+          unselected(row.decimals), unselected(row.jsons), unselected(row.enums),
+        ]
+        try ensure(absent.allSatisfy { $0 }, "scalar array unexpectedly selected")
+      }
+      if websocket {
+        let (stream, continuation) = AsyncStream<ScalarArrays>.makeStream()
+        let cancel = try await client.subscribeWatchScalarArrays(
+          state: state, select: scalarSelection
+        ) { row in
+          continuation.yield(row)
+        }
+        defer {
+          cancel()
+          continuation.finish()
+        }
+        try verifyScalarValues(try await firstValue(stream), input: input)
+      }
+    }
+  }
+
+  static func verifyScalarValues(_ row: ScalarArrays, input: ScalarArraysInput) throws {
+    try ensure(try row.ints.requireValue() == input.ints, "scalar ints mismatch")
+    try ensure(
+      try row.floats.requireValue()?.map(\.bitPattern) == input.floats?.map(\.bitPattern),
+      "scalar float bits mismatch")
+    try ensure(try row.strings.requireValue() == input.strings, "scalar strings mismatch")
+    try ensure(try row.bools.requireValue() == input.bools, "scalar bools mismatch")
+    try ensure(try row.dates.requireValue() == input.dates, "scalar dates mismatch")
+    try ensure(try row.durations.requireValue() == input.durations, "scalar durations mismatch")
+    try ensure(try row.uuids.requireValue() == input.uuids, "scalar uuids mismatch")
+    try ensure(try row.bytes.requireValue() == input.bytes, "scalar bytes mismatch")
+    try ensure(try row.decimals.requireValue() == input.decimals, "scalar decimals mismatch")
+    try ensure(try row.jsons.requireValue() == input.jsons, "scalar jsons mismatch")
+    try ensure(try row.enums.requireValue() == input.enums, "scalar enums mismatch")
+    try ensure(try row.tail.requireValue() == input.tail, "scalar tail mismatch")
+  }
+
+  static func verifyUnary(_ client: LuxoGeneratedClient, values: [Int]) async throws {
+    for value in values {
+      let integer = try await client.echoInteger(value: value)
+      let duration = try await client.echoDuration(value: Int64(value))
+      try ensure(integer == value && duration == Int64(value), "scalar precision mismatch")
+      for optional in [nil, value] {
+        let input = makeInput(value: value, optional: optional, values: values)
+        try verify(try await client.echoPrecision(input: input, select: selection), input: input)
+        let rows = try await client.listPrecision(input: input, select: selection)
+        try ensure(rows.count == 2, "expected columnar pair")
+        for row in rows { try verify(row, input: input) }
+      }
+    }
+    let echoed = try await client.echoIntegers(values: values)
+    let empty = try await client.echoIntegers(values: [])
+    try ensure(echoed == values && empty.isEmpty, "array precision mismatch")
+    let row = try await client.echoPrecision(
+      input: makeInput(value: Int.max, optional: nil, values: []), select: "value")
+    try ensure(try row.value.requireValue() == Int.max, "partial value mismatch")
+    try ensure(
+      unselected(row.duration) && unselected(row.optional) && unselected(row.values),
+      "unexpected selected fields"
+    )
+    try ensure(unselected(row.label) && unselected(row.ignored), "unexpected selected fields")
+  }
+
+  static func verifyStreams(_ client: LuxoGeneratedClient, values: [Int]) async throws {
+    for value in values {
+      let (stream, continuation) = AsyncStream<Precision>.makeStream()
+      let cancel = try await client.subscribeWatchPrecision(value: value, select: selection) {
+        row in
+        continuation.yield(row)
+      }
+      defer {
+        cancel()
+        continuation.finish()
+      }
+      let row = try await firstValue(stream)
+      try verify(row, input: makeInput(value: value, optional: value, values: [value]))
+    }
+  }
+
+  static func firstValue<Value: Sendable>(_ stream: AsyncStream<Value>) async throws -> Value {
+    try await withThrowingTaskGroup(of: Value.self) { group in
+      group.addTask {
+        for await row in stream { return row }
+        throw failure("stream ended without data")
+      }
+      group.addTask {
+        try await Task.sleep(for: .seconds(5))
+        throw failure("stream timed out")
+      }
+      defer { group.cancelAll() }
+      guard let row = try await group.next() else { throw failure("missing stream result") }
+      return row
+    }
+  }
+
+  enum FiniteEvent: Sendable {
+    case row([JSONValue])
+    case terminal(LuxoError?)
+  }
+
+  static func verifyFiniteStream(_ client: LuxoGeneratedClient, fail: Bool, reuse: Bool = true) async throws {
+    let text = #"{"n":123456789012345678901234567890,"fraction":1.2345678901234567890123456789,"zero":-0}"#
+    let value = try JSONValue.parse(Data(text.utf8))
+    let (events, continuation) = AsyncStream<FiniteEvent>.makeStream(bufferingPolicy: .bufferingOldest(65))
+    let count = TerminalCounter()
+    let observer = StreamObserver(onComplete: {
+      count.increment(); continuation.yield(.terminal(nil)); continuation.finish()
+    }, onError: { error in
+      count.increment(); continuation.yield(.terminal(error)); continuation.finish()
+    })
+    let cancel = try await client.subscribeWatchFiniteJSON(value: value, fail: fail, observer: observer) {
+      continuation.yield(.row($0))
+    }
+    defer { cancel(); cancel(); continuation.finish() }
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      group.addTask {
+        var rows = 0
+        for await event in events {
+          switch event {
+          case .row(let row):
+            try ensure(row.count == 2 && row[0] == .integer(Int64(rows)) && row[1] == value, "finite row changed")
+            rows += 1
+          case .terminal(let error):
+            try ensure(rows == 64, "terminal overtook accepted data: \(rows)")
+            if fail {
+              try ensure(error?.name == "JSONRejected" && error?.code == 422, "finite error identity changed")
+              guard let data = error?.data as? [String: Any], let opaque = data["value"] as? [String: Any]
+              else { throw failure("missing finite error data") }
+              try ensure(rawNumberToken(opaque["n"]) == "123456789012345678901234567890", "finite integer changed")
+              try ensure(rawNumberToken(opaque["fraction"]) == "1.2345678901234567890123456789", "finite fraction changed")
+              try ensure(rawNumberToken(opaque["zero"]) == "-0", "finite negative zero changed")
+            } else { try ensure(error == nil, "normal stream failed") }
+            return
+          }
+        }
+        throw failure("finite stream closed without terminal")
+      }
+      group.addTask { try await Task.sleep(for: .seconds(5)); throw failure("finite stream timed out") }
+      defer { group.cancelAll() }
+      _ = try await group.next()
+    }
+    if reuse { try ensure(try await client.echoJSON(value: value) == value, "connection failed after terminal") }
+    try ensure(count.value == 1, "terminal notified more than once")
+  }
+
+  static func verify(_ row: Precision, input: PrecisionInput) throws {
+    try ensure(try row.value.requireValue() == input.value, "integer mismatch")
+    try ensure(try row.duration.requireValue() == input.duration, "duration mismatch")
+    try ensure(try row.optional.requireValue() == input.optional, "nullable mismatch")
+    try ensure(try row.values.requireValue() == input.values, "array mismatch")
+    try ensure(try row.label.requireValue() == input.label, "Unicode mismatch")
+    try ensure(unselected(row.ignored), "unselected field returned")
+  }
+
+  static let nullableSelection = "values, durations, flags, tail"
+  static let nullableCases = [
+    NullableArraysInput(values: nil, durations: nil, flags: nil, tail: 42),
+    NullableArraysInput(values: [], durations: [], flags: [], tail: 42),
+    NullableArraysInput(
+      values: [Int.min, Int.max], durations: [Int64.min, Int64.max], flags: [true, false], tail: 42),
+  ]
+
+  static func verifyNullableArrays(_ client: LuxoGeneratedClient, websocket: Bool) async throws {
+    for (state, input) in nullableCases.enumerated() {
+      try verifyNullable(
+        try await client.echoNullableArrays(input: input, select: nullableSelection), input: input)
+      let rows = try await client.listNullableArrays(input: input, select: nullableSelection)
+      try ensure(rows.count == 2, "expected nullable array pair")
+      for row in rows { try verifyNullable(row, input: input) }
+      var partials = try await client.listNullableArrays(input: input, select: "tail")
+      partials.append(try await client.echoNullableArrays(input: input, select: "tail"))
+      for partial in partials {
+        try ensure(try partial.tail.requireValue() == input.tail, "nullable partial tail mismatch")
+        try ensure(
+          unselected(partial.values) && unselected(partial.durations) && unselected(partial.flags),
+          "nullable array unexpectedly selected")
+      }
+      if websocket {
+        let (stream, continuation) = AsyncStream<NullableArrays>.makeStream()
+        let cancel = try await client.subscribeWatchNullableArrays(
+          state: state, select: nullableSelection
+        ) {
+          row in
+          continuation.yield(row)
+        }
+        defer {
+          cancel()
+          continuation.finish()
+        }
+        try verifyNullable(try await firstValue(stream), input: input)
+      }
+    }
+  }
+
+  static func verifyNullable(_ row: NullableArrays, input: NullableArraysInput) throws {
+    try ensure(try row.values.requireValue() == input.values, "nullable integer array mismatch")
+    try ensure(
+      try row.durations.requireValue() == input.durations, "nullable duration array mismatch")
+    try ensure(try row.flags.requireValue() == input.flags, "nullable boolean array mismatch")
+    try ensure(try row.tail.requireValue() == input.tail, "nullable array tail mismatch")
+  }
+
+  static let nestedGroupSelection =
+    "label, primary { \(selection) }, optional { \(selection) }, rows { \(selection) }, optionalRows { \(selection) }, tail"
+  static let nestedSelection =
+    "group { \(nestedGroupSelection) }, groups { \(nestedGroupSelection) }, tail"
+
+  static func nestedInput(_ state: Int) -> NestedPrecisionInput {
+    let row = PrecisionInput(
+      value: Int.max, duration: Int64.min, optional: Int.max,
+      values: [Int.min, Int.max], label: "精度 café", ignored: 42)
+    let group = NestedGroupInput(
+      label: "nested 東京", primary: row, optional: state == 0 ? nil : row,
+      rows: state == 2 ? [row] : [], optionalRows: state == 0 ? nil : state == 1 ? [] : [row],
+      tail: 42)
+    return NestedPrecisionInput(group: group, groups: [group], tail: -42)
+  }
+
+  static func verifyNestedResponses(_ client: LuxoGeneratedClient, websocket: Bool) async throws {
+    for state in 0...2 {
+      let input = nestedInput(state)
+      try verifyNested(
+        try await client.echoNestedPrecision(input: input, select: nestedSelection), input: input)
+      let rows = try await client.listNestedPrecision(input: input, select: nestedSelection)
+      try ensure(rows.count == 2, "expected nested pair")
+      for row in rows { try verifyNested(row, input: input) }
+      var partials = try await client.listNestedPrecision(input: input, select: "tail")
+      partials.append(try await client.echoNestedPrecision(input: input, select: "tail"))
+      for row in partials {
+        try ensure(try row.tail.requireValue() == input.tail, "nested partial tail mismatch")
+        try ensure(
+          unselected(row.group) && unselected(row.groups), "nested field unexpectedly selected")
+      }
+      if websocket {
+        let (stream, continuation) = AsyncStream<NestedPrecision>.makeStream()
+        let cancel = try await client.subscribeWatchNestedPrecision(
+          state: state, select: nestedSelection
+        ) {
+          row in
+          continuation.yield(row)
+        }
+        defer {
+          cancel()
+          continuation.finish()
+        }
+        try verifyNested(try await firstValue(stream), input: input)
+      }
+    }
+  }
+
+  static func verifyNested(_ row: NestedPrecision, input: NestedPrecisionInput) throws {
+    try verifyGroup(try row.group.requireValue(), input: input.group)
+    let groups = try row.groups.requireValue()
+    try ensure(groups.count == input.groups.count, "nested groups count mismatch")
+    for (actual, expected) in zip(groups, input.groups) { try verifyGroup(actual, input: expected) }
+    try ensure(try row.tail.requireValue() == input.tail, "nested tail mismatch")
+  }
+
+  static func verifyGroup(_ row: NestedGroup, input: NestedGroupInput) throws {
+    try ensure(try row.label.requireValue() == input.label, "nested label mismatch")
+    try verify(try row.primary.requireValue(), input: input.primary)
+    if let expected = input.optional {
+      guard let actual = try row.optional.requireValue() else {
+        throw failure("missing nested optional")
+      }
+      try verify(actual, input: expected)
+    } else {
+      try ensure(try row.optional.requireValue() == nil, "nested optional is not null")
+    }
+    try verifyNestedRows(try row.rows.requireValue(), inputs: input.rows)
+    try verifyNestedRows(try row.optionalRows.requireValue(), inputs: input.optionalRows)
+    try ensure(try row.tail.requireValue() == input.tail, "nested group tail mismatch")
+  }
+
+  static func verifyNestedRows(_ rows: [Precision]?, inputs: [PrecisionInput]?) throws {
+    guard let inputs else {
+      try ensure(rows == nil, "nested list is not null")
+      return
+    }
+    guard let rows else { throw failure("missing nested list") }
+    try ensure(rows.count == inputs.count, "nested list count mismatch")
+    for (actual, expected) in zip(rows, inputs) { try verify(actual, input: expected) }
+  }
+
+  // Malformed payload probes use the same response boundary as generated API methods.
+  static func verifyNestedBoundaries() throws {
+    for columnar in [false, true] {
+      func read(_ bytes: [UInt8]) throws -> NestedGroup {
+        if columnar { return try decodeColumnarNestedGroup(Data(bytes))[0] }
+        return try decodeLuxoResponse(Data(bytes)) { try decodeNestedGroup(&$0) }
+      }
+      for field: UInt8 in 2...5 {
+        let child: [UInt8] = field < 4 ? [0, 1, 84, 0] : [1, 0, 1, 84, 0]
+        func wrap(_ payload: [UInt8]) -> [UInt8] {
+          var bytes: [UInt8] = columnar ? [1, 0] : [0]
+          bytes.append(field)
+          if field == 3 || field == 5 { bytes.append(1) }
+          bytes.append(UInt8(payload.count))
+          return bytes + payload + [6, 84, 0]
+        }
+        let valid = wrap(child)
+        let row = try read(valid)
+        try ensure(try row.tail.requireValue() == 42, "boundary tail mismatch")
+        let value: Precision?
+        switch field {
+        case 2: value = try row.primary.requireValue()
+        case 3: value = try row.optional.requireValue()
+        case 4: value = try row.rows.requireValue().first
+        default: value = try row.optionalRows.requireValue()?.first
+        }
+        try ensure(try value?.value.requireValue() == 42, "boundary child mismatch")
+        var invalid = [wrap(child + [99]), valid + [99]]
+        for end in child.indices { invalid.append(wrap(Array(child.prefix(end)))) }
+        for end in valid.indices { invalid.append(Array(valid.prefix(end))) }
+        if field == 3 || field == 5 {
+          var marker = valid
+          marker[columnar ? 3 : 2] = 2
+          invalid.append(marker)
+        }
+        for bytes in invalid {
+          var rejected = false
+          do { _ = try read(bytes) } catch is LuxoError { rejected = true }
+          try ensure(rejected, "accepted malformed nested field \(field), columnar=\(columnar)")
+        }
+      }
+    }
+  }
+
+  static func makeInput(value: Int, optional: Int?, values: [Int]) -> PrecisionInput {
+    PrecisionInput(
+      value: value, duration: Int64(value), optional: optional, values: values, label: "精度 café",
+      ignored: 42)
+  }
+
+  static func unselected<Value>(_ field: Selected<Value>) -> Bool {
+    if case .unselected = field { return true }
+    return false
+  }
+
+  static func ensure(_ condition: Bool, _ message: String) throws {
+    if !condition { throw failure(message) }
+  }
+
+  static func failure(_ message: String) -> LuxoError {
+    LuxoError(code: 0, message: message, name: "InteropFailure")
+  }
+
+  struct Corpus: Decodable {
+    var int64Cases: [IntegerCase]
+    var jsonNumberTokens: [String]
+    var dateTimeCases: [DateTimeCase]
+  }
+
+  struct DateTimeCase: Decodable {
+    var input: String
+    var canonical: String
+  }
+
+  struct IntegerCase: Decodable {
+    var value: String
+  }
+}
+
+private final class TerminalCounter: @unchecked Sendable {
+  private let lock = NSLock()
+  private var count = 0
+  var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+  func increment() { lock.lock(); defer { lock.unlock() }; count += 1 }
+}
+
+// Only the registration counter is mutable; its accesses use the lock.
+final class RecordingTransport: Transport, @unchecked Sendable {
+  private let base: any Transport
+  private let lock = NSLock()
+  private var registrations = 0
+
+  init(base: any Transport) { self.base = base }
+
+  var registrationCount: Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return registrations
+  }
+
+  func setSchema(_ schema: [String: APISchema]) {
+    base.setSchema(schema)
+    lock.lock()
+    registrations += 1
+    lock.unlock()
+  }
+
+  func setMode(_ mode: TransportMode) { base.setMode(mode) }
+  func setToken(_ token: String) { base.setToken(token) }
+
+  func call(_ api: String, params: [String: LuxoValue]?) async throws -> TransportPayload {
+    try await base.call(api, params: params)
+  }
+
+  func subscribe<Value: Sendable>(
+    _ api: String, decoder: @escaping @Sendable (TransportPayload) throws -> Value,
+    params: [String: LuxoValue]?, observer: StreamObserver?, handler: @escaping @Sendable (Value) -> Void
+  ) async throws -> (@Sendable () -> Void) {
+    try await base.subscribe(api, decoder: decoder, params: params, observer: observer, handler: handler)
+  }
+}

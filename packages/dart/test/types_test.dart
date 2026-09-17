@@ -22,12 +22,7 @@ void main() {
     });
 
     test('fromJson with empty items', () {
-      final json = {
-        'items': [],
-        'total': 0,
-        'page': 1,
-        'pageSize': 10,
-      };
+      final json = {'items': [], 'total': 0, 'page': 1, 'pageSize': 10};
       final page = Page.fromJson(json, (e) => e);
       expect(page.items, isEmpty);
       expect(page.total, equals(0));
@@ -56,11 +51,7 @@ void main() {
     });
 
     test('fromJson with defaults', () {
-      final json = {
-        'id': 2,
-        'name': 'email',
-        'type': 'String',
-      };
+      final json = {'id': 2, 'name': 'email', 'type': 'String'};
       final field = LuxoField.fromJson(json);
       expect(field.nullable, isFalse);
       expect(field.isList, isFalse);
@@ -128,11 +119,7 @@ void main() {
     });
 
     test('fromJson with defaults', () {
-      final json = {
-        'id': 2,
-        'name': 'listPosts',
-        'module': 'post',
-      };
+      final json = {'id': 2, 'name': 'listPosts', 'module': 'post'};
       final api = LuxoAPI.fromJson(json);
       expect(api.returnType, isNull);
       expect(api.returnList, isFalse);
@@ -166,11 +153,7 @@ void main() {
           },
         },
         'apis': {
-          'getUser': {
-            'id': 1,
-            'name': 'getUser',
-            'module': 'user',
-          },
+          'getUser': {'id': 1, 'name': 'getUser', 'module': 'user'},
         },
         'enums': {
           'Status': {

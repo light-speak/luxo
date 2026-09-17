@@ -1,0 +1,135 @@
+import { LuxoClient } from './client.js'
+import type { Transport } from '@luxojs/client'
+import { decodeLuxoJSON } from '@luxojs/client'
+
+type Receive = (value: unknown) => void
+type Subscribe = (receive: Receive) => Promise<() => void>
+type Invoke = () => Promise<unknown>
+type Case = { bytes: number[]; value: unknown; invalid?: number[][] }
+
+const cases: Record<string, Case[]> = {
+  String: [
+    { bytes: [0], value: '' },
+    { bytes: [4, 239, 187, 191, 97], value: '\ufeffa', invalid: [[1, 255], [2, 192, 128]] },
+  ],
+  Float: [{ bytes: [0, 0, 0, 0, 0, 0, 248, 63], value: 1.5 }],
+  Boolean: [{ bytes: [0], value: false, invalid: [[2], [128, 0]] }, { bytes: [1], value: true }],
+  Int: [
+    { bytes: [0], value: 0n, invalid: [[128], [...Array<number>(9).fill(255), 2]] },
+    { bytes: [254, ...Array<number>(8).fill(255), 1], value: 9223372036854775807n },
+    { bytes: [...Array<number>(9).fill(255), 1], value: -9223372036854775808n },
+  ],
+  Duration: [{ bytes: [1], value: -1n, invalid: [[128]] }],
+  DateTime: [{ bytes: [0, 0], value: '1970-01-01T00:00:00Z', invalid: [[0], [128], [0, 128], [0, 128, 148, 235, 220, 3]] }],
+  UUID: [{ bytes: Array<number>(16).fill(0), value: '00000000-0000-0000-0000-000000000000' }],
+  Bytes: [{ bytes: [2, 255, 128], value: Uint8Array.of(255, 128) }, { bytes: [0], value: new Uint8Array() }],
+  Decimal: [{ bytes: [3, 49, 46, 53], value: '1.5', invalid: [[1, 255]] }],
+  JSON: [
+    { bytes: [1, 49], value: 1, invalid: [[0], [1, 123], [3, 34, 255, 34]] },
+    { bytes: [4, 110, 117, 108, 108], value: null },
+  ],
+  Enum: [{ bytes: [2, 111, 107], value: 'ok', invalid: [[1, 255]] }],
+}
+
+let response: unknown
+let delivered = 0
+const failures: string[] = []
+const transport: Transport = {
+  async call() { return response },
+  async subscribe(_api, _params, decode, onData) { onData(decode(response)); return () => {} },
+  setMode() {}, setToken() {}, setSchema() {},
+}
+const client = new LuxoClient(transport)
+const format = (value: unknown) => JSON.stringify(value, (_key, item: unknown) =>
+  typeof item === 'bigint' ? item.toString() + 'n' : item)
+
+async function verify(type: string, scalar: Invoke, list: Invoke, singleStream: Subscribe, listStream: Subscribe): Promise<void> {
+  for (const test of cases[type]) {
+    await verifyValid(type, test.bytes, test.value, scalar, singleStream)
+    await verifyValid(type + ' list', [2, ...test.bytes, ...test.bytes], [test.value, test.value], list, listStream)
+    for (let length = 0; length < test.bytes.length; length++) {
+      await verifyInvalid(type, test.bytes.slice(0, length), scalar, singleStream)
+    }
+    const array = [2, ...test.bytes, ...test.bytes]
+    for (let length = 0; length < array.length; length++) {
+      await verifyInvalid(type + ' list', array.slice(0, length), list, listStream)
+    }
+    for (const invalid of test.invalid ?? []) {
+      await verifyInvalid(type, invalid, scalar, singleStream)
+      await verifyInvalid(type + ' list', [2, ...test.bytes, ...invalid], list, listStream)
+    }
+    await verifyInvalid(type, [...test.bytes, 0], scalar, singleStream)
+    await verifyInvalid(type + ' list', [...array, 0], list, listStream)
+  }
+  await verifyValid(type + ' empty list', [0], [], list, listStream)
+  await verifyInvalid(type + ' list count', [128], list, listStream)
+  await verifyJSONKinds(type, scalar, list, singleStream, listStream)
+}
+
+async function verifyJSONKinds(type: string, scalar: Invoke, list: Invoke, singleStream: Subscribe, listStream: Subscribe): Promise<void> {
+  const textTypes = ['String', 'DateTime', 'UUID', 'Decimal', 'Enum', 'Bytes']
+  if (type !== 'Boolean' && !textTypes.includes(type)) return
+  const tokens = ['0', '1', '9007199254740993', '1.0', 'null', '[]', '{}']
+  tokens.push(...(type === 'Boolean' ? ['"true"', '"false"', '""'] : ['true', 'false']))
+  if (type === 'DateTime') tokens.push(...[
+    '"2000-01-01T00:00:00.1234567890Z"', '"2001-02-29T00:00:00Z"',
+    '"0000-01-01T00:00:00+00:01"', '"9999-12-31T23:59:59-00:01"',
+    '"2000-01-01T00:00:00"',
+  ])
+  for (const token of tokens) {
+    response = decodeLuxoJSON(token)
+    await verifyInvalidValue(type + ' JSON ' + token, scalar, singleStream)
+    response = [decodeLuxoJSON(token)]
+    await verifyInvalidValue(type + ' JSON list ' + token, list, listStream)
+  }
+}
+
+async function verifyValid(name: string, bytes: number[], value: unknown, invoke: Invoke, subscribe: Subscribe): Promise<void> {
+  // Exercise a view with a non-zero byteOffset, not just a whole backing buffer.
+  response = Uint8Array.from([255, ...bytes, 255]).subarray(1, bytes.length + 1)
+  const check = (actual: unknown) => {
+    if (format(actual) !== format(value)) throw new Error(name + ': wrong value')
+  }
+  check(await invoke())
+  let received = 0
+  const cancel = await subscribe(actual => { received++; check(actual) })
+  cancel()
+  if (received !== 1) throw new Error(name + ': missing stream value')
+  response = value
+  // Binary Bytes fixtures also include empty values; encode those explicitly for JSON.
+  if (name.startsWith('Bytes')) response = Array.isArray(value)
+    ? value.map(item => (item as Uint8Array).length ? '/4A=' : '')
+    : (value as Uint8Array).length ? '/4A=' : ''
+  check(await invoke())
+  ;(await subscribe(check))()
+}
+
+async function verifyInvalid(name: string, bytes: number[], invoke: Invoke, subscribe: Subscribe): Promise<void> {
+  response = Uint8Array.from(bytes)
+  await verifyInvalidValue(name, invoke, subscribe)
+}
+
+async function verifyInvalidValue(name: string, invoke: Invoke, subscribe: Subscribe): Promise<void> {
+  await expectFailure(name, invoke)
+  const before = delivered
+  await expectFailure(name + ' stream', () => subscribe(() => { delivered++ }))
+  if (delivered !== before) failures.push(name + ': malformed value reached onData')
+}
+
+async function expectFailure(name: string, invoke: Invoke): Promise<void> {
+  try { await invoke() } catch (error) {
+    if (error instanceof Error) return
+    throw error
+  }
+  failures.push(name + ': accepted ' + format(response))
+}
+
+async function main(): Promise<void> {
+  // GENERATED_CHECKS
+  response = Uint8Array.of(2)
+  if (await client.implicitCount() !== 1n) throw new Error('implicit Int return mismatch')
+  response = Uint8Array.of(2, 0)
+  await expectFailure('implicit Int trailing byte', () => client.implicitCount())
+  if (failures.length) throw new Error(failures.length + ' boundary failures\n' + failures.slice(0, 25).join('\n'))
+}
+void main().catch(error => { throw error })

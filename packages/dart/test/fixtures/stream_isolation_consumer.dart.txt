@@ -1,0 +1,110 @@
+part of 'int64_consumer_test.dart';
+
+typedef _StartStream = Future<void Function()> Function(
+  LuxoClient,
+  void Function(Object?),
+  void Function(sdk.LuxoError),
+  void Function(),
+);
+
+void verifyStreamIsolation() {
+  final cases = <String, _StartStream>{
+    'Payload[]': (c, data, error, done) => c.subscribeWatchPayloadList(
+      select: 'metadata',
+      onData: data,
+      onError: error,
+      onDone: done,
+    ),
+    'Int': (c, data, error, done) =>
+        c.subscribeWatchInt(onData: data, onError: error, onDone: done),
+    'String': (c, data, error, done) =>
+        c.subscribeWatchString(onData: data, onError: error, onDone: done),
+    'String[]': (c, data, error, done) =>
+        c.subscribeWatchStringArray(onData: data, onError: error, onDone: done),
+    'Payload': (c, data, error, done) => c.subscribeWatchPayload(
+      projectId: sdk.LuxoInt64.fromInt(1),
+      select: 'data',
+      onData: data,
+      onError: error,
+      onDone: done,
+    ),
+  };
+  for (final mode in sdk.TransportMode.values) {
+    for (final entry in cases.entries) {
+      test('$mode generated ${entry.key} isolates malformed stream data', () async {
+        final transport = sdk.WsTransport(
+          '__STREAM_ENDPOINT__/${entry.key == 'Payload[]' ? 'projection' : 'decoder'}',
+          options: sdk.TransportOptions(mode: mode),
+          autoReconnect: false,
+        );
+        final client = LuxoClient(transport);
+        final failed = Completer<sdk.LuxoError>(),
+            peer = Completer<sdk.LuxoInt64>();
+        var errors = 0, deliveries = 0, done = 0;
+        try {
+          final stop = await entry.value(client, (_) => deliveries++, (error) {
+            errors++;
+            if (!failed.isCompleted) failed.complete(error);
+          }, () => done++);
+          expect(
+            (await failed.future.timeout(const Duration(seconds: 3))).error,
+            'DecodeError',
+          );
+          stop();
+          stop();
+          final stopPeer = await client.subscribeWatchInt(
+            onData: peer.complete,
+          );
+          expect(
+            await peer.future.timeout(const Duration(seconds: 3)),
+            sdk.LuxoInt64.fromInt(7),
+          );
+          expect(await client.scalarInt(), sdk.LuxoInt64.fromInt(7));
+          expect(errors, 1);
+          expect(deliveries, 0);
+          expect(done, 0);
+          stopPeer();
+        } finally {
+          client.close();
+        }
+      });
+    }
+    test(
+      '$mode generated callback exceptions stay in the application Zone',
+      () async {
+        final failure = StateError('business callback'), uncaught = <Object>[];
+        final result = Completer<void>(), finished = Completer<void>();
+        var calls = 0;
+        runZonedGuarded(() async {
+          final client = LuxoClient(
+            sdk.WsTransport(
+              '__STREAM_ENDPOINT__/business',
+              options: sdk.TransportOptions(mode: mode),
+              autoReconnect: false,
+            ),
+          );
+          try {
+            final stop = await client.subscribeWatchInt(
+              onData: (_) {
+                calls++;
+                throw failure;
+              },
+              onError: (_) => fail('business error became protocol error'),
+              onDone: finished.complete,
+            );
+            await finished.future.timeout(const Duration(seconds: 3));
+            expect(calls, 2);
+            expect(uncaught, [failure, failure]);
+            stop();
+            result.complete();
+          } catch (error, stack) {
+            result.completeError(error, stack);
+          } finally {
+            client.close();
+          }
+        }, (error, _) => uncaught.add(error));
+        await result.future;
+      },
+    );
+  }
+}

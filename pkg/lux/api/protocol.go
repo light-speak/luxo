@@ -5,20 +5,25 @@ import (
 	"fmt"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
+	"github.com/light-speak/luxo/pkg/lux/jsonutil"
 )
 
 // Binary WebSocket frame types. Every binary frame starts with exactly one
 // frame type byte so request sequence varints can never collide with control
 // or stream frames.
 const (
-	BinaryFrameCallRequest      byte = 0x01
-	BinaryFrameCallSuccess      byte = 0x02
-	BinaryFrameCallError        byte = 0x03
-	BinaryFrameSubscribe        byte = 0x04
-	BinaryFrameUnsubscribe      byte = 0x05
-	BinaryFrameStream           byte = 0x06
-	BinaryFrameSubscribeSuccess byte = 0x07
-	BinaryFrameSubscribeError   byte = 0x08
+	BinaryFrameCallRequest byte = 0x01
+	BinaryFrameCallSuccess byte = 0x02
+	BinaryFrameCallError   byte = 0x03
+	// The 0x10 range identifies streams by subscription UInt64, not API ID.
+	// Retired 0x04..0x08 frames are rejected, never parsed as the new layout.
+	BinaryFrameSubscribe        byte = 0x10
+	BinaryFrameUnsubscribe      byte = 0x11
+	BinaryFrameStream           byte = 0x12
+	BinaryFrameSubscribeSuccess byte = 0x13
+	BinaryFrameSubscribeError   byte = 0x14
+	BinaryFrameStreamComplete   byte = 0x15
+	BinaryFrameStreamError      byte = 0x16
 )
 
 const (
@@ -51,32 +56,77 @@ func (e *BinaryError) Error() string {
 
 type wireError = BinaryError
 
-func appendBinaryError(dst []byte, e wireError) []byte {
-	var enc codec.Encoder
-	enc.WriteFieldInt(binaryErrorCodeField, int64(e.Code))
-	enc.WriteFieldString(binaryErrorNameField, e.Name)
-	enc.WriteFieldString(binaryErrorMessageField, e.Message)
-	if e.TraceID != "" {
-		enc.WriteFieldString(binaryErrorTraceIDField, e.TraceID)
+func appendBinaryError(dst []byte, e wireError) ([]byte, error) {
+	prefix := dst
+	dst = codec.AppendSvarint(append(dst, binaryErrorCodeField), int64(e.Code))
+	for _, field := range []struct {
+		id    byte
+		value string
+	}{
+		{binaryErrorNameField, e.Name}, {binaryErrorMessageField, e.Message},
+		{binaryErrorTraceIDField, e.TraceID},
+	} {
+		if field.id == binaryErrorTraceIDField && field.value == "" {
+			continue
+		}
+		var err error
+		dst, err = codec.AppendString(append(dst, field.id), field.value)
+		if err != nil {
+			return prefix, err
+		}
 	}
 	if len(e.Data) > 0 {
-		enc.WriteFieldBytes(binaryErrorDataField, e.Data)
+		dst = codec.AppendBytes(append(dst, binaryErrorDataField), e.Data)
 	}
 	if e.Cause != "" {
-		enc.WriteFieldString(binaryErrorCauseField, e.Cause)
+		var err error
+		dst, err = codec.AppendString(append(dst, binaryErrorCauseField), e.Cause)
+		if err != nil {
+			return prefix, err
+		}
 	}
-	enc.WriteEnd()
-	return append(dst, enc.Bytes()...)
+	return append(dst, 0), nil
 }
 
 // DecodeBinaryError decodes the canonical binary error envelope.
-func DecodeBinaryError(data []byte, statusCode int) (*BinaryError, error) {
+// The legacy statusCode argument cannot supply missing required wire fields.
+func DecodeBinaryError(data []byte, _ int) (*BinaryError, error) {
 	dec := codec.NewDecoder(data)
-	result := &BinaryError{Code: statusCode, Name: "Error", Message: fmt.Sprintf("HTTP %d", statusCode)}
+	result := &BinaryError{}
+	seen, err := readBinaryErrorFields(dec, result)
+	if err != nil {
+		return nil, err
+	}
+	if err := dec.Finish(); err != nil {
+		return nil, fmt.Errorf("decode binary error: %w", err)
+	}
+	if err := validateBinaryError(result, seen); err != nil {
+		return nil, err
+	}
+	result.Data = append(json.RawMessage(nil), result.Data...)
+	return result, nil
+}
+
+func readBinaryErrorFields(dec *codec.Decoder, result *BinaryError) (uint8, error) {
+	var seen uint8
 	for dec.NextField() {
-		switch dec.FieldID() {
+		field := dec.FieldID()
+		if field < binaryErrorCodeField || field > binaryErrorCauseField {
+			return 0, fmt.Errorf("unknown binary error field %d", field)
+		}
+		bit := uint8(1 << field)
+		if seen&bit != 0 {
+			return 0, fmt.Errorf("duplicate binary error field %d", field)
+		}
+		seen |= bit
+		switch field {
 		case binaryErrorCodeField:
-			result.Code = int(dec.ReadInt())
+			value := dec.ReadInt()
+			result.Code = int(value)
+			// Only 32-bit targets can narrow the signed wire value to a host int.
+			if int64(result.Code) != value {
+				return 0, fmt.Errorf("binary error code exceeds host int range")
+			}
 		case binaryErrorNameField:
 			result.Name = dec.ReadString()
 		case binaryErrorMessageField:
@@ -84,24 +134,22 @@ func DecodeBinaryError(data []byte, statusCode int) (*BinaryError, error) {
 		case binaryErrorTraceIDField:
 			result.TraceID = dec.ReadString()
 		case binaryErrorDataField:
-			result.Data = append(result.Data[:0], dec.ReadBytes()...)
+			result.Data = dec.ReadBytes()
 		case binaryErrorCauseField:
 			result.Cause = dec.ReadString()
-		default:
-			return nil, fmt.Errorf("unknown binary error field %d", dec.FieldID())
 		}
 	}
-	if err := dec.Err(); err != nil {
-		return nil, fmt.Errorf("decode binary error: %w", err)
+	return seen, nil
+}
+
+func validateBinaryError(result *BinaryError, seen uint8) error {
+	const required = 1<<binaryErrorCodeField | 1<<binaryErrorNameField | 1<<binaryErrorMessageField
+	if seen&required != required {
+		return fmt.Errorf("decode binary error: missing required fields")
 	}
-	if dec.FieldID() != 0 {
-		return nil, fmt.Errorf("decode binary error: missing end marker")
+	// String fields have already passed Decoder's UTF-8 validation and Finish.
+	if seen&(1<<binaryErrorDataField) != 0 && !jsonutil.ValidUTF8JSON(result.Data) {
+		return fmt.Errorf("decode binary error: invalid JSON data")
 	}
-	if dec.Offset() != len(data) {
-		return nil, fmt.Errorf("decode binary error: trailing bytes")
-	}
-	if len(result.Data) > 0 && !json.Valid(result.Data) {
-		return nil, fmt.Errorf("decode binary error: invalid JSON data")
-	}
-	return result, nil
+	return nil
 }

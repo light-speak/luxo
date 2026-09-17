@@ -1,0 +1,60 @@
+import { LuxoClient } from './client.js'
+import { decodeJSONTextValues } from './types.js'
+import { decodeLuxoJSON, encodeLuxoJSON } from '@luxojs/client'
+import type { Transport } from '@luxojs/client'
+
+let response: unknown
+const transport: Transport = {
+  async call() { return response },
+  async subscribe() { throw new Error('Unexpected subscription') },
+  setSchema() {}, setMode() {}, setToken() {},
+}
+const client = new LuxoClient(transport)
+const failures: string[] = []
+
+async function verifyValid(): Promise<void> {
+  for (const row of [{}, { state: null, child: null }, {
+    label: 'false', enabled: false, labels: ['', '9007199254740993'], flags: [true, false],
+    state: 'ok', states: ['ok'], child: { label: 'child' }, children: [{ enabled: true }],
+  }]) {
+    response = row
+    const actual = await client.getTextValues({ $select: 'label, enabled, labels, flags, state, states, child { label }, children { enabled }' })
+    if (encodeLuxoJSON(actual) !== encodeLuxoJSON(row)) throw new Error('Valid JSON response changed')
+    if (encodeLuxoJSON(decodeJSONTextValues(row)) !== encodeLuxoJSON(row)) throw new Error('Valid model changed')
+  }
+}
+
+async function verifyInvalid(row: Record<string, unknown>): Promise<void> {
+  try { decodeJSONTextValues(row); failures.push('decoder accepted an invalid row') }
+  catch (error) { if (!(error instanceof TypeError)) throw error }
+  response = row
+  try {
+    await client.getTextValues({ $select: 'label, enabled, labels, flags, state, states, child { label }, children { enabled }' })
+    failures.push('client accepted an invalid row')
+  } catch (error) { if (!(error instanceof TypeError)) throw error }
+}
+
+async function main(): Promise<void> {
+  await verifyValid()
+  for (const text of ['\ud800', '\udfff', '\ud800x', '\udc00\ud800']) {
+    for (const row of [{ label: text }, { labels: ['valid', text] }]) {
+      for (const nested of [row, { child: row }, { children: [{ label: 'valid' }, row] }]) {
+        await verifyInvalid(nested)
+      }
+    }
+  }
+  const fields = ['label', 'enabled', 'labels', 'flags', 'state', 'states']
+  for (const field of fields) {
+    const isList = ['labels', 'flags', 'states'].includes(field)
+    const tokens = ['0', '1', '9007199254740993', '1.0', '[]', '{}']
+    tokens.push(...(['enabled', 'flags'].includes(field) ? ['"true"', '"false"'] : ['true', 'false']))
+    if (field !== 'state') tokens.push('null')
+    for (const token of tokens) {
+      const value = decodeLuxoJSON(token)
+      const row = { [field]: isList ? [value] : value }
+      for (const nested of [row, { child: row }, { children: [{ label: 'valid' }, row] }]) await verifyInvalid(nested)
+    }
+  }
+  if (failures.length) throw new Error(failures.length + ' JSON kind failures\n' + failures.slice(0, 20).join('\n'))
+}
+void main().catch(error => { throw error })

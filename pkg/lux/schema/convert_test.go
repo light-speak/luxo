@@ -1,12 +1,26 @@
 package schema
 
 import (
+	"encoding/binary"
+	"math"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/light-speak/luxo/internal/testutil"
 	"github.com/light-speak/luxo/pkg/lux/codec"
 )
+
+func checkedJSON(t testing.TB) func([]byte, error) []byte {
+	t.Helper()
+	return func(data []byte, err error) []byte {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+}
 
 func userModel() *Model {
 	s := New()
@@ -23,6 +37,37 @@ func userModel() *Model {
 	}
 	s.RegisterModel(m)
 	return m
+}
+
+func TestNullableArrayJSONStates(t *testing.T) {
+	s := New()
+	model := &Model{Name: "Array", Fields: []Field{
+		{ID: 1, Name: "values", Type: FieldInt, IsList: true, Nullable: true},
+		{ID: 2, Name: "tail", Type: FieldInt},
+	}}
+	s.RegisterModel(model)
+	for _, test := range []struct {
+		name, want  string
+		row, column []byte
+	}{
+		{"null", `{"values":null,"tail":42}`, []byte{0, 1, 0, 2, 84, 0}, []byte{1, 0, 1, 0, 2, 84, 0}},
+		{"empty", `{"values":[],"tail":42}`, []byte{0, 1, 1, 0, 2, 84, 0}, []byte{1, 0, 1, 1, 1, 0, 2, 84, 0}},
+		{"values", `{"values":[-1,1],"tail":42}`, []byte{0, 1, 1, 2, 1, 2, 2, 84, 0}, []byte{1, 0, 1, 1, 3, 2, 1, 2, 2, 84, 0}},
+		{"unselected", `{"tail":42}`, []byte{0, 2, 84, 0}, []byte{1, 0, 2, 84, 0}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := string(checkedJSON(t)(BinaryToJSON(nil, test.row, model, s))); got != test.want {
+				t.Errorf("row=%s want=%s", got, test.want)
+			}
+			if got := string(checkedJSON(t)(BinaryListToJSON(nil, test.column, model, s))); got != "["+test.want+"]" {
+				t.Errorf("column=%s want=[%s]", got, test.want)
+			}
+			got, err := s.JSONToBinary("Array", []byte(test.want))
+			if err != nil || string(got) != string(test.row) {
+				t.Errorf("JSON input=%x err=%v want=%x", got, err, test.row)
+			}
+		})
+	}
 }
 
 // withArenaHeader prepends a totalStringLen varint (value 0) to binary data.
@@ -52,7 +97,7 @@ func TestBinaryToJSON_Basic(t *testing.T) {
 	phone := "13800138000"
 	data := encodeUser(1, "Alice", "alice@test.com", 99.5, &phone, true)
 
-	result := BinaryToJSON(nil, data, m)
+	result := checkedJSON(t)(BinaryToJSON(nil, data, m))
 	expected := `{"id":1,"name":"Alice","email":"alice@test.com","score":99.5,"phone":"13800138000","isActive":true}`
 
 	if string(result) != expected {
@@ -64,7 +109,7 @@ func TestBinaryToJSON_NullField(t *testing.T) {
 	m := userModel()
 	data := encodeUser(2, "Bob", "bob@test.com", 0, nil, false)
 
-	result := BinaryToJSON(nil, data, m)
+	result := checkedJSON(t)(BinaryToJSON(nil, data, m))
 	expected := `{"id":2,"name":"Bob","email":"bob@test.com","score":0,"phone":null,"isActive":false}`
 
 	if string(result) != expected {
@@ -77,7 +122,7 @@ func TestBinaryToJSON_StringEscape(t *testing.T) {
 	phone := "123"
 	data := encodeUser(1, `Al"ice`, "a@b.com", 0, &phone, true)
 
-	result := BinaryToJSON(nil, data, m)
+	result := checkedJSON(t)(BinaryToJSON(nil, data, m))
 	if string(result) == "" {
 		t.Error("empty result")
 	}
@@ -101,7 +146,7 @@ func TestBinaryListToJSON(t *testing.T) {
 	w.WriteColumnStringPtr(5, []*string{&phone1, nil}) // phone (nullable)
 	w.WriteColumnBool(6, []bool{true, false})          // isActive
 
-	result := BinaryListToJSON(nil, w.Bytes(), m)
+	result := checkedJSON(t)(BinaryListToJSON(nil, testutil.Bytes(t)(w.Bytes()), m))
 	got := string(result)
 
 	if got[0] != '[' || got[len(got)-1] != ']' {
@@ -127,7 +172,7 @@ func TestBinaryListToJSON(t *testing.T) {
 func TestBinaryScalarToJSON_Int(t *testing.T) {
 	var buf []byte
 	buf = codec.AppendSvarint(buf, 42)
-	result := BinaryScalarToJSON(nil, buf, "Int")
+	result := checkedJSON(t)(BinaryScalarToJSON(nil, buf, "Int"))
 	if string(result) != "42" {
 		t.Errorf("got %q, want 42", result)
 	}
@@ -136,7 +181,7 @@ func TestBinaryScalarToJSON_Int(t *testing.T) {
 func TestBinaryScalarToJSON_NegativeInt(t *testing.T) {
 	var buf []byte
 	buf = codec.AppendSvarint(buf, -100)
-	result := BinaryScalarToJSON(nil, buf, "Int")
+	result := checkedJSON(t)(BinaryScalarToJSON(nil, buf, "Int"))
 	if string(result) != "-100" {
 		t.Errorf("got %q, want -100", result)
 	}
@@ -144,8 +189,8 @@ func TestBinaryScalarToJSON_NegativeInt(t *testing.T) {
 
 func TestBinaryScalarToJSON_Float(t *testing.T) {
 	var buf []byte
-	buf = codec.AppendFixed64(buf, 3.14)
-	result := BinaryScalarToJSON(nil, buf, "Float")
+	buf = binary.LittleEndian.AppendUint64(buf, math.Float64bits(3.14))
+	result := checkedJSON(t)(BinaryScalarToJSON(nil, buf, "Float"))
 	if string(result) != "3.14" {
 		t.Errorf("got %q, want 3.14", result)
 	}
@@ -155,7 +200,7 @@ func TestBinaryScalarToJSON_Boolean(t *testing.T) {
 	// true
 	var buf []byte
 	buf = codec.AppendBool(buf, true)
-	result := BinaryScalarToJSON(nil, buf, "Boolean")
+	result := checkedJSON(t)(BinaryScalarToJSON(nil, buf, "Boolean"))
 	if string(result) != "true" {
 		t.Errorf("got %q, want true", result)
 	}
@@ -163,7 +208,7 @@ func TestBinaryScalarToJSON_Boolean(t *testing.T) {
 	// false — this is the tricky case: 0x00 could be confused with int 0
 	buf = buf[:0]
 	buf = codec.AppendBool(buf, false)
-	result = BinaryScalarToJSON(nil, buf, "Boolean")
+	result = checkedJSON(t)(BinaryScalarToJSON(nil, buf, "Boolean"))
 	if string(result) != "false" {
 		t.Errorf("got %q, want false", result)
 	}
@@ -171,8 +216,8 @@ func TestBinaryScalarToJSON_Boolean(t *testing.T) {
 
 func TestBinaryScalarToJSON_String(t *testing.T) {
 	var buf []byte
-	buf = codec.AppendString(buf, "hello")
-	result := BinaryScalarToJSON(nil, buf, "String")
+	buf = codec.AppendBytes(buf, []byte("hello"))
+	result := checkedJSON(t)(BinaryScalarToJSON(nil, buf, "String"))
 	if string(result) != `"hello"` {
 		t.Errorf("got %q, want %q", result, `"hello"`)
 	}
@@ -180,8 +225,8 @@ func TestBinaryScalarToJSON_String(t *testing.T) {
 
 func TestBinaryScalarToJSON_StringWithEscape(t *testing.T) {
 	var buf []byte
-	buf = codec.AppendString(buf, "say \"hi\"\nnewline")
-	result := BinaryScalarToJSON(nil, buf, "String")
+	buf = codec.AppendBytes(buf, []byte("say \"hi\"\nnewline"))
+	result := checkedJSON(t)(BinaryScalarToJSON(nil, buf, "String"))
 	want := `"say \"hi\"\nnewline"`
 	if string(result) != want {
 		t.Errorf("got %s, want %s", result, want)
@@ -190,8 +235,8 @@ func TestBinaryScalarToJSON_StringWithEscape(t *testing.T) {
 
 func TestBinaryScalarToJSON_DateTime(t *testing.T) {
 	var buf []byte
-	buf = codec.AppendSvarint(buf, 1776074400)
-	result := BinaryScalarToJSON(nil, buf, "DateTime")
+	buf = testutil.Bytes(t)(codec.AppendDateTime(buf, time.Unix(1776074400, 0)))
+	result := checkedJSON(t)(BinaryScalarToJSON(nil, buf, "DateTime"))
 	if string(result) != `"2026-04-13T10:00:00Z"` {
 		t.Errorf("got %s", result)
 	}
@@ -200,7 +245,7 @@ func TestBinaryScalarToJSON_DateTime(t *testing.T) {
 func TestBinaryScalarToJSON_Duration(t *testing.T) {
 	var buf []byte
 	buf = codec.AppendSvarint(buf, 5000000000) // 5s in nanoseconds
-	result := BinaryScalarToJSON(nil, buf, "Duration")
+	result := checkedJSON(t)(BinaryScalarToJSON(nil, buf, "Duration"))
 	if string(result) != "5000000000" {
 		t.Errorf("got %q", result)
 	}
@@ -208,14 +253,14 @@ func TestBinaryScalarToJSON_Duration(t *testing.T) {
 
 func TestBinaryScalarListToJSON(t *testing.T) {
 	data := codec.AppendArrayHeader(nil, 3)
-	data = codec.AppendString(data, "A")
-	data = codec.AppendString(data, "B")
-	data = codec.AppendString(data, "C")
-	if got := string(BinaryScalarListToJSON(nil, data, "String")); got != `["A","B","C"]` {
+	data = codec.AppendBytes(data, []byte("A"))
+	data = codec.AppendBytes(data, []byte("B"))
+	data = codec.AppendBytes(data, []byte("C"))
+	if got := string(checkedJSON(t)(BinaryScalarListToJSON(nil, data, "String"))); got != `["A","B","C"]` {
 		t.Fatalf("string list = %s", got)
 	}
-	if got := string(BinaryScalarListToJSON(nil, []byte{0x80}, "String")); got != "null" {
-		t.Fatalf("malformed list = %s", got)
+	if got, err := BinaryScalarListToJSON(nil, []byte{0x80}, "String"); err == nil || len(got) != 0 {
+		t.Fatalf("malformed list accepted: %s, %v", got, err)
 	}
 }
 
@@ -229,20 +274,20 @@ func TestBinaryScalarListToJSONAllWireTypes(t *testing.T) {
 	}{
 		{name: "Int", typeName: "Int", append: func(dst []byte) []byte { return codec.AppendSvarint(dst, -2) }, want: `[-2]`},
 		{name: "Duration", typeName: "Duration", append: func(dst []byte) []byte { return codec.AppendSvarint(dst, 3) }, want: `[3]`},
-		{name: "Float", typeName: "Float", append: func(dst []byte) []byte { return codec.AppendFixed64(dst, 1.5) }, want: `[1.5]`},
+		{name: "Float", typeName: "Float", append: func(dst []byte) []byte { return binary.LittleEndian.AppendUint64(dst, math.Float64bits(1.5)) }, want: `[1.5]`},
 		{name: "Boolean true", typeName: "Boolean", append: func(dst []byte) []byte { return codec.AppendBool(dst, true) }, want: `[true]`},
 		{name: "Boolean false", typeName: "Boolean", append: func(dst []byte) []byte { return codec.AppendBool(dst, false) }, want: `[false]`},
-		{name: "DateTime", typeName: "DateTime", append: func(dst []byte) []byte { return codec.AppendSvarint(dst, 0) }, want: `["1970-01-01T00:00:00Z"]`},
+		{name: "DateTime", typeName: "DateTime", append: func(dst []byte) []byte { return testutil.Bytes(t)(codec.AppendDateTime(dst, time.Unix(0, 0))) }, want: `["1970-01-01T00:00:00Z"]`},
 		{name: "UUID", typeName: "UUID", append: func(dst []byte) []byte { return codec.AppendUUID(dst, uuidValue) }, want: `["550e8400-e29b-41d4-a716-446655440000"]`},
 		{name: "Bytes", typeName: "Bytes", append: func(dst []byte) []byte { return codec.AppendBytes(dst, []byte{0xff}) }, want: `["/w=="]`},
 		{name: "JSON", typeName: "JSON", append: func(dst []byte) []byte { return codec.AppendBytes(dst, []byte(`{"ok":true}`)) }, want: `[{"ok":true}]`},
-		{name: "Decimal", typeName: "Decimal", append: func(dst []byte) []byte { return codec.AppendString(dst, "1.25") }, want: `["1.25"]`},
+		{name: "Decimal", typeName: "Decimal", append: func(dst []byte) []byte { return codec.AppendBytes(dst, []byte("1.25")) }, want: `["1.25"]`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			data := codec.AppendArrayHeader(nil, 1)
 			data = test.append(data)
-			if got := string(BinaryScalarListToJSON(nil, data, test.typeName)); got != test.want {
+			if got := string(checkedJSON(t)(BinaryScalarListToJSON(nil, data, test.typeName))); got != test.want {
 				t.Fatalf("%s list = %s, want %s", test.typeName, got, test.want)
 			}
 		})
@@ -250,45 +295,44 @@ func TestBinaryScalarListToJSONAllWireTypes(t *testing.T) {
 
 	data := codec.AppendArrayHeader(nil, 1)
 	data = codec.AppendSvarint(data, 1)
-	if got := string(BinaryScalarListToJSON(nil, data, "Unknown")); got != "null" {
-		t.Fatalf("unknown scalar list = %s", got)
+	if got, err := BinaryScalarListToJSON(nil, data, "Unknown"); err == nil || len(got) != 0 {
+		t.Fatalf("unknown scalar list accepted: %s, %v", got, err)
 	}
 }
 
 func TestBinaryScalarToJSONBlobTypesAndMalformedValues(t *testing.T) {
 	bytesData := codec.AppendBytes(nil, []byte{0xff})
-	if got := string(BinaryScalarToJSON(nil, bytesData, "Bytes")); got != `"/w=="` {
+	if got := string(checkedJSON(t)(BinaryScalarToJSON(nil, bytesData, "Bytes"))); got != `"/w=="` {
 		t.Fatalf("bytes scalar = %s", got)
 	}
 	jsonData := codec.AppendBytes(nil, []byte(`{"ok":true}`))
-	if got := string(BinaryScalarToJSON(nil, jsonData, "JSON")); got != `{"ok":true}` {
+	if got := string(checkedJSON(t)(BinaryScalarToJSON(nil, jsonData, "JSON"))); got != `{"ok":true}` {
 		t.Fatalf("JSON scalar = %s", got)
 	}
 	for _, typeName := range []string{"Int", "Float", "Boolean", "UUID", "Bytes", "JSON", "DateTime", "String", "Unknown"} {
-		if got := string(BinaryScalarToJSON(nil, []byte{0x80}, typeName)); got != "null" {
-			t.Errorf("malformed %s scalar = %s", typeName, got)
+		if got, err := BinaryScalarToJSON(nil, []byte{0x80}, typeName); err == nil || len(got) != 0 {
+			t.Errorf("malformed %s scalar accepted: %s, %v", typeName, got, err)
 		}
 	}
 }
 
 func TestBinaryScalarToJSON_Empty(t *testing.T) {
-	result := BinaryScalarToJSON(nil, nil, "Int")
-	if string(result) != "null" {
-		t.Errorf("empty data should be null, got %q", result)
+	for _, typeName := range []string{"Int", "String", "Float"} {
+		if result, err := BinaryScalarToJSON(nil, nil, typeName); err == nil || len(result) != 0 {
+			t.Errorf("empty %s response accepted: %q, %v", typeName, result, err)
+		}
 	}
-	result = BinaryScalarToJSON(nil, []byte{}, "String")
-	if string(result) != "null" {
-		t.Errorf("empty data should be null, got %q", result)
+	if got := string(checkedJSON(t)(BinaryScalarToJSON(nil, nil, ""))); got != "null" {
+		t.Fatal(got)
 	}
 }
 
-func TestBinaryScalarToJSON_FallbackSvarint(t *testing.T) {
-	// Unknown type name should fall back to svarint
+func TestBinaryScalarToJSON_RejectUnknownType(t *testing.T) {
+	// Unknown metadata must not guess an integer from arbitrary bytes.
 	var buf []byte
 	buf = codec.AppendSvarint(buf, 77)
-	result := BinaryScalarToJSON(nil, buf, "SomeUnknownType")
-	if string(result) != "77" {
-		t.Errorf("fallback got %q, want 77", result)
+	if result, err := BinaryScalarToJSON(nil, buf, "SomeUnknownType"); err == nil || len(result) != 0 {
+		t.Errorf("unknown type accepted: %q, %v", result, err)
 	}
 }
 
@@ -296,7 +340,7 @@ func TestBinaryScalarToJSON_EmptyTypeName(t *testing.T) {
 	// Empty type name should use svarint path
 	var buf []byte
 	buf = codec.AppendSvarint(buf, -1)
-	result := BinaryScalarToJSON(nil, buf, "")
+	result := checkedJSON(t)(BinaryScalarToJSON(nil, buf, ""))
 	if string(result) != "-1" {
 		t.Errorf("got %q, want -1", result)
 	}
@@ -317,14 +361,14 @@ func TestBinaryPaginatedListToJSON_Basic(t *testing.T) {
 	phone := "111"
 	w.WriteColumnStringPtr(5, []*string{&phone, nil})
 	w.WriteColumnBool(6, []bool{true, false})
-	columnar := w.Bytes()
+	columnar := testutil.Bytes(t)(w.Bytes())
 
 	// Append pagination metadata: total=50, page=2, pageSize=20
 	columnar = codec.AppendSvarint(columnar, 50)
 	columnar = codec.AppendSvarint(columnar, 2)
 	columnar = codec.AppendSvarint(columnar, 20)
 
-	result := BinaryPaginatedListToJSON(nil, columnar, m)
+	result := checkedJSON(t)(BinaryPaginatedListToJSON(nil, columnar, m))
 	got := string(result)
 
 	// Check structure
@@ -352,14 +396,14 @@ func TestBinaryPaginatedListToJSON_EmptyList(t *testing.T) {
 	w.SetCount(0)
 	w.WriteColumnInt(1, nil)
 	w.WriteColumnString(2, nil)
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	// Append actual pagination metadata: total=100, page=3, pageSize=25
 	data = codec.AppendSvarint(data, 100)
 	data = codec.AppendSvarint(data, 3)
 	data = codec.AppendSvarint(data, 25)
 
-	result := BinaryPaginatedListToJSON(nil, data, m)
+	result := checkedJSON(t)(BinaryPaginatedListToJSON(nil, data, m))
 	got := string(result)
 
 	if !strings.Contains(got, `"items":[]`) {
@@ -381,20 +425,10 @@ func TestBinaryPaginatedListToJSON_EmptyListNoMetadata(t *testing.T) {
 
 	w := &codec.ColumnarWriter{}
 	w.SetCount(0)
-	data := w.Bytes() // no pagination metadata after end marker
+	data := testutil.Bytes(t)(w.Bytes()) // no pagination metadata after end marker
 
-	result := BinaryPaginatedListToJSON(nil, data, m)
-	got := string(result)
-
-	// Fallback defaults
-	if !strings.Contains(got, `"total":0`) {
-		t.Errorf("missing default total: %s", got)
-	}
-	if !strings.Contains(got, `"page":1`) {
-		t.Errorf("missing default page: %s", got)
-	}
-	if !strings.Contains(got, `"pageSize":20`) {
-		t.Errorf("missing default pageSize: %s", got)
+	if result, err := BinaryPaginatedListToJSON(nil, data, m); err == nil || len(result) != 0 {
+		t.Errorf("missing metadata accepted: %s, %v", result, err)
 	}
 }
 
@@ -407,24 +441,22 @@ func TestBinaryToJSON_EmptyModel(t *testing.T) {
 	data := withArenaHeader(enc.Bytes())
 
 	m := userModel()
-	result := BinaryToJSON(nil, data, m)
+	result := checkedJSON(t)(BinaryToJSON(nil, data, m))
 	if string(result) != "{}" {
 		t.Errorf("empty model should be {}, got %s", result)
 	}
 }
 
 func TestBinaryToJSON_UnknownFieldID(t *testing.T) {
-	// Encode a field ID not in the model — should break cleanly
+	// Unknown fields cannot be skipped without wire type metadata.
 	var enc codec.Encoder
 	enc.WriteFieldInt(99, 42) // field 99 not in userModel
 	enc.WriteEnd()
 	data := withArenaHeader(enc.Bytes())
 
 	m := userModel()
-	result := BinaryToJSON(nil, data, m)
-	// Should produce valid JSON (possibly just {})
-	if result[0] != '{' || result[len(result)-1] != '}' {
-		t.Errorf("should produce valid JSON object, got %s", result)
+	if result, err := BinaryToJSON(nil, data, m); err == nil || len(result) != 0 {
+		t.Errorf("unknown field accepted: %s, %v", result, err)
 	}
 }
 
@@ -453,13 +485,13 @@ func TestBinaryToJSON_AllFieldTypes(t *testing.T) {
 	enc.WriteFieldFloat(2, 2.718)
 	enc.WriteFieldString(3, "test")
 	enc.WriteFieldBool(4, false)
-	enc.WriteFieldInt(5, ts) // DateTime as unix timestamp
+	enc.WriteFieldDateTime(5, time.Unix(ts, 0)) // DateTime as seconds and nanoseconds
 	enc.WriteFieldInt(6, 5000000000)
 	enc.WriteFieldString(7, "ACTIVE")
 	enc.WriteFieldBytes(8, []byte{0xDE, 0xAD})
 	enc.WriteEnd()
 
-	result := BinaryToJSON(nil, withArenaHeader(enc.Bytes()), m)
+	result := checkedJSON(t)(BinaryToJSON(nil, withArenaHeader(enc.Bytes()), m))
 	got := string(result)
 
 	if !strings.Contains(got, `"intVal":-42`) {
@@ -502,7 +534,7 @@ func TestBinaryToJSON_DecimalAndJSON(t *testing.T) {
 	enc.WriteFieldBytes(2, []byte(`{"ok":true,"count":2}`))
 	enc.WriteEnd()
 
-	got := string(BinaryToJSON(nil, withArenaHeader(enc.Bytes()), m))
+	got := string(checkedJSON(t)(BinaryToJSON(nil, withArenaHeader(enc.Bytes()), m)))
 	if got != `{"amount":"123.4500","metadata":{"ok":true,"count":2}}` {
 		t.Fatalf("BinaryToJSON() = %s", got)
 	}
@@ -523,7 +555,7 @@ func TestBinaryListToJSON_BytesDecimalAndJSONColumns(t *testing.T) {
 	w.WriteColumnString(2, []string{"9.99"})
 	w.WriteColumnBytes(3, [][]byte{[]byte(`[1,true]`)})
 
-	got := string(BinaryListToJSON(nil, w.Bytes(), m))
+	got := string(checkedJSON(t)(BinaryListToJSON(nil, testutil.Bytes(t)(w.Bytes()), m)))
 	if got != `[{"blob":"3q0=","amount":"9.99","metadata":[1,true]}]` {
 		t.Fatalf("BinaryListToJSON() = %s", got)
 	}
@@ -552,7 +584,7 @@ func TestBinaryToJSON_NullableFields(t *testing.T) {
 	enc.WriteFieldIntPtr(5, nil)
 	enc.WriteEnd()
 
-	result := BinaryToJSON(nil, withArenaHeader(enc.Bytes()), m)
+	result := checkedJSON(t)(BinaryToJSON(nil, withArenaHeader(enc.Bytes()), m))
 	got := string(result)
 
 	// All values should be null
@@ -568,15 +600,15 @@ func TestBinaryToJSON_NullableFields(t *testing.T) {
 	fv := 3.14
 	sv := "hello"
 	bv := true
-	dv := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC).Unix()
+	dv := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
 	enc.WriteFieldIntPtr(1, &iv)
 	enc.WriteFieldFloatPtr(2, &fv)
 	enc.WriteFieldStringPtr(3, &sv)
 	enc.WriteFieldBoolPtr(4, &bv)
-	enc.WriteFieldIntPtr(5, &dv)
+	enc.WriteFieldDateTimePtr(5, &dv)
 	enc.WriteEnd()
 
-	result = BinaryToJSON(nil, withArenaHeader(enc.Bytes()), m)
+	result = checkedJSON(t)(BinaryToJSON(nil, withArenaHeader(enc.Bytes()), m))
 	got = string(result)
 
 	if !strings.Contains(got, `"intVal":10`) {
@@ -602,7 +634,7 @@ func TestBinaryListToJSON_Empty(t *testing.T) {
 	m := userModel()
 	w := &codec.ColumnarWriter{}
 	w.SetCount(0)
-	result := BinaryListToJSON(nil, w.Bytes(), m)
+	result := checkedJSON(t)(BinaryListToJSON(nil, testutil.Bytes(t)(w.Bytes()), m))
 	if string(result) != "[]" {
 		t.Errorf("empty list should be [], got %s", result)
 	}
@@ -625,7 +657,7 @@ func TestBinaryListToJSON_NullableIntColumn(t *testing.T) {
 	v := int64(100)
 	w.WriteColumnIntPtr(2, []*int64{&v, nil, &v})
 
-	result := BinaryListToJSON(nil, w.Bytes(), m)
+	result := checkedJSON(t)(BinaryListToJSON(nil, testutil.Bytes(t)(w.Bytes()), m))
 	got := string(result)
 
 	if !strings.Contains(got, "null") {
@@ -650,7 +682,7 @@ func TestBinaryListToJSON_BoolColumn(t *testing.T) {
 	w.SetCount(2)
 	w.WriteColumnBool(1, []bool{true, false})
 
-	result := BinaryListToJSON(nil, w.Bytes(), m)
+	result := checkedJSON(t)(BinaryListToJSON(nil, testutil.Bytes(t)(w.Bytes()), m))
 	got := string(result)
 	if !strings.Contains(got, "true") || !strings.Contains(got, "false") {
 		t.Errorf("missing bool values: %s", got)
@@ -671,7 +703,7 @@ func TestBinaryListToJSON_FloatColumn(t *testing.T) {
 	w.SetCount(2)
 	w.WriteColumnFloat(1, []float64{3.14, -0.001})
 
-	result := BinaryListToJSON(nil, w.Bytes(), m)
+	result := checkedJSON(t)(BinaryListToJSON(nil, testutil.Bytes(t)(w.Bytes()), m))
 	got := string(result)
 	if !strings.Contains(got, "3.14") || !strings.Contains(got, "-0.001") {
 		t.Errorf("missing float values: %s", got)
@@ -688,13 +720,13 @@ func TestBinaryListToJSON_DateTimeColumn(t *testing.T) {
 	}
 	s.RegisterModel(m)
 
-	ts := time.Date(2026, 4, 13, 10, 30, 0, 0, time.UTC).Unix()
+	ts := time.Date(2026, 4, 13, 10, 30, 0, 0, time.UTC)
 
 	w := &codec.ColumnarWriter{}
 	w.SetCount(1)
-	w.WriteColumnInt(1, []int64{ts})
+	w.WriteColumnDateTime(1, []time.Time{ts})
 
-	result := BinaryListToJSON(nil, w.Bytes(), m)
+	result := checkedJSON(t)(BinaryListToJSON(nil, testutil.Bytes(t)(w.Bytes()), m))
 	if !strings.Contains(string(result), "2026-04-13T10:30:00Z") {
 		t.Errorf("missing datetime: %s", result)
 	}
@@ -747,76 +779,6 @@ func TestAppendJSONString_ControlChars(t *testing.T) {
 	}
 }
 
-// --- appendAnyJSON edge cases ---
-
-func TestAppendAnyJSON_NilPtrString(t *testing.T) {
-	var sp *string
-	f := &Field{Type: FieldString}
-	got := appendAnyJSON(nil, sp, f)
-	if string(got) != "null" {
-		t.Errorf("nil *string should be null, got %s", got)
-	}
-}
-
-func TestAppendAnyJSON_NilPtrInt(t *testing.T) {
-	var ip *int64
-	f := &Field{Type: FieldInt}
-	got := appendAnyJSON(nil, ip, f)
-	if string(got) != "null" {
-		t.Errorf("nil *int64 should be null, got %s", got)
-	}
-}
-
-func TestAppendAnyJSON_UnknownType(t *testing.T) {
-	f := &Field{Type: FieldInt}
-	got := appendAnyJSON(nil, struct{}{}, f)
-	if string(got) != "null" {
-		t.Errorf("unknown type should be null, got %s", got)
-	}
-}
-
-func TestAppendAnyJSON_BoolTrue(t *testing.T) {
-	f := &Field{Type: FieldBool}
-	got := appendAnyJSON(nil, true, f)
-	if string(got) != "true" {
-		t.Errorf("got %s", got)
-	}
-}
-
-func TestAppendAnyJSON_BoolFalse(t *testing.T) {
-	f := &Field{Type: FieldBool}
-	got := appendAnyJSON(nil, false, f)
-	if string(got) != "false" {
-		t.Errorf("got %s", got)
-	}
-}
-
-func TestAppendAnyJSON_Nil(t *testing.T) {
-	f := &Field{Type: FieldString}
-	got := appendAnyJSON(nil, nil, f)
-	if string(got) != "null" {
-		t.Errorf("nil should be null, got %s", got)
-	}
-}
-
-func TestAppendAnyJSON_PresentPtrString(t *testing.T) {
-	s := "hello"
-	f := &Field{Type: FieldString}
-	got := appendAnyJSON(nil, &s, f)
-	if string(got) != `"hello"` {
-		t.Errorf("got %s, want %q", got, `"hello"`)
-	}
-}
-
-func TestAppendAnyJSON_PresentPtrInt(t *testing.T) {
-	v := int64(77)
-	f := &Field{Type: FieldInt}
-	got := appendAnyJSON(nil, &v, f)
-	if string(got) != "77" {
-		t.Errorf("got %s", got)
-	}
-}
-
 func TestBinaryToJSON_NullableDefaultBranch(t *testing.T) {
 	// FieldBytes nullable — hits default branch in appendNullableFieldJSON
 	s := New()
@@ -832,7 +794,7 @@ func TestBinaryToJSON_NullableDefaultBranch(t *testing.T) {
 	enc.WriteFieldBytes(1, nil) // nullable bytes
 	enc.WriteEnd()
 
-	result := BinaryToJSON(nil, withArenaHeader(enc.Bytes()), m)
+	result := checkedJSON(t)(BinaryToJSON(nil, withArenaHeader(enc.Bytes()), m))
 	// Should produce valid JSON
 	if result[0] != '{' {
 		t.Errorf("expected JSON object, got %s", result)
@@ -854,15 +816,13 @@ func TestBinaryToJSON_FieldTypeDefault(t *testing.T) {
 	enc.WriteFieldString(1, "ignored") // wire type doesn't matter
 	enc.WriteEnd()
 
-	result := BinaryToJSON(nil, withArenaHeader(enc.Bytes()), m)
-	// Should produce valid JSON without crashing
-	if result[0] != '{' {
-		t.Errorf("expected JSON object, got %s", result)
+	if result, err := BinaryToJSON(nil, withArenaHeader(enc.Bytes()), m); err == nil || len(result) != 0 {
+		t.Errorf("unsupported field accepted: %s, %v", result, err)
 	}
 }
 
 func TestBinaryListToJSON_UnknownFieldColumn(t *testing.T) {
-	// Columnar data with a field ID not in the model — should break column loop
+	// Unknown columns must not turn a partial response into a success.
 	s := New()
 	m := &Model{
 		Name: "M",
@@ -877,17 +837,15 @@ func TestBinaryListToJSON_UnknownFieldColumn(t *testing.T) {
 	w.WriteColumnInt(1, []int64{42})
 	w.WriteColumnInt(99, []int64{0}) // unknown field
 
-	result := BinaryListToJSON(nil, w.Bytes(), m)
-	got := string(result)
-	if !strings.Contains(got, "42") {
-		t.Errorf("should still contain known field data: %s", got)
+	if result, err := BinaryListToJSON(nil, testutil.Bytes(t)(w.Bytes()), m); err == nil || len(result) != 0 {
+		t.Errorf("unknown column accepted: %s, %v", result, err)
 	}
 }
 
 func TestBinaryScalarToJSON_UUID(t *testing.T) {
 	// UUID is a 16-byte fixed value on the wire (per protocol), not a string.
 	data := []byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
-	result := BinaryScalarToJSON(nil, data, "UUID")
+	result := checkedJSON(t)(BinaryScalarToJSON(nil, data, "UUID"))
 	if string(result) != `"550e8400-e29b-41d4-a716-446655440000"` {
 		t.Errorf("UUID 16-byte decode: got %s", result)
 	}
@@ -921,11 +879,11 @@ func TestColumnarScalarArrayToJSON(t *testing.T) {
 	w.SetCount(2)
 	// record 0: ["x","y"], record 1: []
 	cell0 := codec.AppendArrayHeader(nil, 2)
-	cell0 = codec.AppendString(cell0, "x")
-	cell0 = codec.AppendString(cell0, "y")
+	cell0 = codec.AppendBytes(cell0, []byte("x"))
+	cell0 = codec.AppendBytes(cell0, []byte("y"))
 	cell1 := codec.AppendArrayHeader(nil, 0)
 	w.WriteColumnBytes(1, [][]byte{cell0, cell1})
-	out := columnarToJSON(nil, w.Bytes(), m)
+	out := checkedJSON(t)(columnarToJSON(nil, testutil.Bytes(t)(w.Bytes()), m))
 	want := `[{"tags":["x","y"]},{"tags":[]}]`
 	if string(out) != want {
 		t.Errorf("columnar scalar array:\n got %s\nwant %s", out, want)
@@ -934,8 +892,8 @@ func TestColumnarScalarArrayToJSON(t *testing.T) {
 
 func TestBinaryScalarToJSON_Decimal(t *testing.T) {
 	var buf []byte
-	buf = codec.AppendString(buf, "123.456")
-	result := BinaryScalarToJSON(nil, buf, "Decimal")
+	buf = codec.AppendBytes(buf, []byte("123.456"))
+	result := checkedJSON(t)(BinaryScalarToJSON(nil, buf, "Decimal"))
 	if string(result) != `"123.456"` {
 		t.Errorf("got %s", result)
 	}
@@ -956,7 +914,7 @@ func TestBinaryListToJSON_NullableStringColumn(t *testing.T) {
 	s1 := "hello"
 	w.WriteColumnStringPtr(1, []*string{&s1, nil, &s1})
 
-	result := BinaryListToJSON(nil, w.Bytes(), m)
+	result := checkedJSON(t)(BinaryListToJSON(nil, testutil.Bytes(t)(w.Bytes()), m))
 	got := string(result)
 	// First and third should be "hello", second should be null
 	if !strings.Contains(got, `"hello"`) {
@@ -970,7 +928,7 @@ func TestBinaryListToJSON_NullableStringColumn(t *testing.T) {
 func TestAppendColumnValueJSON_Default(t *testing.T) {
 	// typedColumn with no typed slices set — should output "null"
 	col := &typedColumn{field: &Field{ID: 1, Name: "unknown", Type: FieldInt}}
-	dst := appendColumnValueJSON(nil, col, 0)
+	dst := checkedJSON(t)(appendColumnValueJSON(nil, col, 0))
 	if string(dst) != "null" {
 		t.Errorf("default branch should output null, got %q", dst)
 	}
@@ -986,12 +944,12 @@ func TestBinaryListToJSON_NullableDateTimeColumn(t *testing.T) {
 	}
 	s.RegisterModel(m)
 
-	ts := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC).Unix()
+	ts := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
 	w := &codec.ColumnarWriter{}
 	w.SetCount(2)
-	w.WriteColumnIntPtr(1, []*int64{&ts, nil})
+	w.WriteColumnDateTimePtr(1, []*time.Time{&ts, nil})
 
-	result := BinaryListToJSON(nil, w.Bytes(), m)
+	result := checkedJSON(t)(BinaryListToJSON(nil, testutil.Bytes(t)(w.Bytes()), m))
 	got := string(result)
 	if !strings.Contains(got, "2026") {
 		t.Errorf("missing datetime: %s", got)
@@ -1015,9 +973,9 @@ func TestBinaryListToJSON_NullableFloatColumn(t *testing.T) {
 	var w codec.ColumnarWriter
 	w.SetCount(2)
 	w.WriteColumnFloatPtr(1, []*float64{&v1, nil})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
-	result := BinaryListToJSON(nil, data, m)
+	result := checkedJSON(t)(BinaryListToJSON(nil, data, m))
 	got := string(result)
 	if !strings.Contains(got, "1.5") {
 		t.Errorf("missing float value: %s", got)
@@ -1041,9 +999,9 @@ func TestBinaryListToJSON_NullableBoolColumn(t *testing.T) {
 	var w codec.ColumnarWriter
 	w.SetCount(2)
 	w.WriteColumnBoolPtr(1, []*bool{&tr, nil})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
-	result := BinaryListToJSON(nil, data, m)
+	result := checkedJSON(t)(BinaryListToJSON(nil, data, m))
 	got := string(result)
 	if !strings.Contains(got, "true") {
 		t.Errorf("missing bool value: %s", got)
@@ -1069,7 +1027,7 @@ func TestBinaryToJSON_NullableDuration(t *testing.T) {
 	buf = codec.AppendSvarint(buf, 5000)
 	buf = append(buf, 0x00) // end
 
-	result := BinaryToJSON(nil, withArenaHeader(buf), m)
+	result := checkedJSON(t)(BinaryToJSON(nil, withArenaHeader(buf), m))
 	got := string(result)
 	if !strings.Contains(got, "5000") {
 		t.Errorf("expected 5000, got: %s", got)
@@ -1092,7 +1050,7 @@ func TestBinaryToJSON_NullableBytes(t *testing.T) {
 	buf = codec.AppendBytes(buf, []byte{0xCA, 0xFE})
 	buf = append(buf, 0x00) // end
 
-	result := BinaryToJSON(nil, withArenaHeader(buf), m)
+	result := checkedJSON(t)(BinaryToJSON(nil, withArenaHeader(buf), m))
 	got := string(result)
 	if !strings.Contains(got, `"yv4="`) {
 		t.Errorf("expected base64 encoded bytes, got: %s", got)
@@ -1121,13 +1079,13 @@ func TestAppendArrayFieldJSON_AllTypes(t *testing.T) {
 		}, `[1000000]`},
 		{"DateTime", FieldDateTime, func() []byte {
 			c := codec.AppendArrayHeader(nil, 1)
-			c = codec.AppendSvarint(c, 1776427200) // 2026-04-17T12:00:00Z
+			c = testutil.Bytes(t)(codec.AppendDateTime(c, time.Unix(1776427200, 0))) // 2026-04-17T12:00:00Z
 			return c
 		}, `["2026-04-17T12:00:00Z"]`},
 		{"Float", FieldFloat, func() []byte {
 			c := codec.AppendArrayHeader(nil, 2)
-			c = codec.AppendFixed64(c, 1.5)
-			c = codec.AppendFixed64(c, -2.25)
+			c = binary.LittleEndian.AppendUint64(c, math.Float64bits(1.5))
+			c = binary.LittleEndian.AppendUint64(c, math.Float64bits(-2.25))
 			return c
 		}, `[1.5,-2.25]`},
 		{"Bool", FieldBool, func() []byte {
@@ -1149,14 +1107,14 @@ func TestAppendArrayFieldJSON_AllTypes(t *testing.T) {
 		}, `["/wA="]`},
 		{"Enum", FieldEnum, func() []byte {
 			c := codec.AppendArrayHeader(nil, 2)
-			c = codec.AppendString(c, "ADMIN")
-			c = codec.AppendString(c, "USER")
+			c = codec.AppendBytes(c, []byte("ADMIN"))
+			c = codec.AppendBytes(c, []byte("USER"))
 			return c
 		}, `["ADMIN","USER"]`},
 		{"JSON", FieldJSON, func() []byte {
 			c := codec.AppendArrayHeader(nil, 2)
 			c = codec.AppendBytes(c, []byte(`{"ok":true}`))
-			c = codec.AppendBytes(c, []byte("invalid"))
+			c = codec.AppendBytes(c, []byte("null"))
 			return c
 		}, `[{"ok":true},null]`},
 		{"Unknown_emptyArray", FieldModel, func() []byte {
@@ -1166,7 +1124,11 @@ func TestAppendArrayFieldJSON_AllTypes(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &Field{Type: tc.ft, IsList: true}
-			out := appendArrayFieldJSON(nil, codec.NewDecoder(tc.cell()), f)
+			dec := codec.NewDecoder(tc.cell())
+			out := appendArrayFieldJSON(nil, dec, f)
+			if err := dec.Err(); err != nil {
+				t.Fatal(err)
+			}
 			if string(out) != tc.want {
 				t.Errorf("got %s want %s", out, tc.want)
 			}
@@ -1183,11 +1145,11 @@ func TestAppendNullableFieldJSONAllWireTypes(t *testing.T) {
 		want   string
 	}{
 		{name: "Int", field: FieldInt, append: func(dst []byte) []byte { return codec.AppendSvarint(dst, -2) }, want: `-2`},
-		{name: "Float", field: FieldFloat, append: func(dst []byte) []byte { return codec.AppendFixed64(dst, 1.5) }, want: `1.5`},
-		{name: "String", field: FieldString, append: func(dst []byte) []byte { return codec.AppendString(dst, "luxo") }, want: `"luxo"`},
+		{name: "Float", field: FieldFloat, append: func(dst []byte) []byte { return binary.LittleEndian.AppendUint64(dst, math.Float64bits(1.5)) }, want: `1.5`},
+		{name: "String", field: FieldString, append: func(dst []byte) []byte { return codec.AppendBytes(dst, []byte("luxo")) }, want: `"luxo"`},
 		{name: "Boolean true", field: FieldBool, append: func(dst []byte) []byte { return codec.AppendBool(dst, true) }, want: `true`},
 		{name: "Boolean false", field: FieldBool, append: func(dst []byte) []byte { return codec.AppendBool(dst, false) }, want: `false`},
-		{name: "DateTime", field: FieldDateTime, append: func(dst []byte) []byte { return codec.AppendSvarint(dst, 0) }, want: `"1970-01-01T00:00:00Z"`},
+		{name: "DateTime", field: FieldDateTime, append: func(dst []byte) []byte { return testutil.Bytes(t)(codec.AppendDateTime(dst, time.Unix(0, 0))) }, want: `"1970-01-01T00:00:00Z"`},
 		{name: "Duration", field: FieldDuration, append: func(dst []byte) []byte { return codec.AppendSvarint(dst, 3) }, want: `3`},
 		{name: "UUID", field: FieldUUID, append: func(dst []byte) []byte { return codec.AppendUUID(dst, uuidValue) }, want: `"550e8400-e29b-41d4-a716-446655440000"`},
 		{name: "Bytes", field: FieldBytes, append: func(dst []byte) []byte { return codec.AppendBytes(dst, []byte{0xff}) }, want: `"/w=="`},
@@ -1229,7 +1191,7 @@ func TestColumnarModelBlobToJSON(t *testing.T) {
 	var w codec.ColumnarWriter
 	w.SetCount(1)
 	w.WriteColumnBytes(1, [][]byte{inner})
-	out := columnarToJSON(nil, w.Bytes(), outer, s)
+	out := checkedJSON(t)(columnarToJSON(nil, testutil.Bytes(t)(w.Bytes()), outer, s))
 	want := `[{"sub":{"n":7}}]`
 	if string(out) != want {
 		t.Errorf("got %s want %s", out, want)

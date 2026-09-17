@@ -205,13 +205,13 @@ func (g *GeneratorContext) generateEventCodec(b *strings.Builder, e *ast.EventDe
 
 	// MarshalLuxo
 	fmt.Fprintf(b, "// MarshalLuxo encodes %s to Luxo binary format.\n", typeName)
-	fmt.Fprintf(b, "func (e %s) MarshalLuxo() []byte {\n", typeName)
+	fmt.Fprintf(b, "func (e %s) MarshalLuxo() ([]byte, error) {\n", typeName)
 	b.WriteString("\tvar enc codec.Encoder\n")
 	for _, p := range e.Params {
 		g.writeEventMarshalField(b, e.Name, p, enums[p.Type.Name], objects[p.Type.Name])
 	}
 	b.WriteString("\tenc.WriteEnd()\n")
-	b.WriteString("\treturn enc.Bytes()\n")
+	b.WriteString("\treturn enc.Bytes(), nil\n")
 	b.WriteString("}\n\n")
 
 	// UnmarshalLuxo
@@ -281,27 +281,29 @@ func writeEventScalarMarshal(b *strings.Builder, fieldID int, value string, ref 
 
 func eventScalarWriteStatement(typeName, value string, isEnum bool) string {
 	if isEnum {
-		return fmt.Sprintf("enc.WriteString(string(%s))", value)
+		return binaryCallStatement(fmt.Sprintf("enc.WriteString(string(%s))", value), "return nil, err")
 	}
 	switch typeName {
 	case "Int":
 		return "enc.WriteInt(" + value + ")"
 	case "Float":
-		return "enc.WriteFloat(" + value + ")"
+		return binaryCallStatement("enc.WriteFloat("+value+")", "return nil, err")
 	case "String":
-		return "enc.WriteString(" + value + ")"
+		return binaryCallStatement("enc.WriteString("+value+")", "return nil, err")
 	case "Boolean":
 		return "enc.WriteBool(" + value + ")"
 	case "DateTime":
-		return "enc.WriteInt(" + value + ".Unix())"
+		return binaryCallStatement("enc.WriteDateTime("+value+")", "return nil, err")
 	case "Duration":
 		return "enc.WriteInt(int64(" + value + "))"
 	case "UUID":
 		return "enc.WriteUUID([16]byte(" + value + "))"
 	case "Decimal":
-		return "enc.WriteString(" + value + ".String())"
-	case "Bytes", "JSON":
+		return binaryCallStatement("enc.WriteString("+value+".String())", "return nil, err")
+	case "Bytes":
 		return "enc.WriteBytes(" + value + ")"
+	case "JSON":
+		return binaryCallStatement("enc.WriteJSON("+value+")", "return nil, err")
 	}
 	return ""
 }
@@ -335,7 +337,7 @@ func writeEventObjectMarshal(b *strings.Builder, fieldID int, value string, null
 
 func writeEventObjectValue(b *strings.Builder, value, indent string) {
 	fmt.Fprintf(b, "%sbuf := api.GetBuf()\n", indent)
-	fmt.Fprintf(b, "%s%s.WriteLuxo(buf, nil)\n", indent, value)
+	writeBinaryCall(b, indent, fmt.Sprintf("%s.WriteLuxo(buf, nil)", value), "api.PutBuf(buf); return nil, err")
 	fmt.Fprintf(b, "%senc.WriteBytes(buf.B)\n", indent)
 	fmt.Fprintf(b, "%sapi.PutBuf(buf)\n", indent)
 }
@@ -389,7 +391,7 @@ func eventScalarReadExpression(typeName string, isEnum, nullable bool) string {
 			return "dec.ReadBoolPtr()"
 		case "Bytes", "JSON":
 			if typeName == "JSON" {
-				return "func() *json.RawMessage { raw := dec.ReadBytesValuePtr(); if raw == nil { return nil }; value := json.RawMessage(*raw); return &value }()"
+				return "func() *json.RawMessage { raw := dec.ReadJSONPtr(); if raw == nil { return nil }; value := json.RawMessage(*raw); return &value }()"
 			}
 			return "dec.ReadBytesValuePtr()"
 		default:
@@ -409,7 +411,7 @@ func eventScalarReadExpression(typeName string, isEnum, nullable bool) string {
 	case "Boolean":
 		return "dec.ReadBool()"
 	case "DateTime":
-		return "time.Unix(dec.ReadInt(), 0).UTC()"
+		return "dec.ReadDateTime()"
 	case "Duration":
 		return "time.Duration(dec.ReadInt())"
 	case "UUID":
@@ -417,7 +419,7 @@ func eventScalarReadExpression(typeName string, isEnum, nullable bool) string {
 	case "Bytes":
 		return "dec.ReadBytes()"
 	case "JSON":
-		return "json.RawMessage(dec.ReadBytes())"
+		return "json.RawMessage(dec.ReadJSON())"
 	}
 	return ""
 }
@@ -431,7 +433,7 @@ func eventNullableReadClosure(typeName string, isEnum bool) string {
 		read = "dec.ReadStringPtr()"
 		conversion = typeName + "(*raw)"
 	case typeName == "DateTime":
-		conversion = "time.Unix(*raw, 0).UTC()"
+		return "dec.ReadDateTimePtr()"
 	case typeName == "UUID":
 		read = "dec.ReadUUIDPtr()"
 		conversion = "uuid.UUID(*raw)"
@@ -441,6 +443,10 @@ func eventNullableReadClosure(typeName string, isEnum bool) string {
 
 func writeEventListUnmarshal(b *strings.Builder, fieldID int, value, typeName string, isEnum, isObject bool) {
 	fmt.Fprintf(b, "\t\tcase %d:\n", fieldID)
+	if typeName == "DateTime" {
+		fmt.Fprintf(b, "\t\t\t%s = dec.ReadDateTimeArray()\n", value)
+		return
+	}
 	b.WriteString("\t\t\tcount := dec.ReadArrayLength()\n")
 	fmt.Fprintf(b, "\t\t\t%s = make([]%s, count)\n", value, mapBaseType(typeName))
 	fmt.Fprintf(b, "\t\t\tfor i := range %s {\n", value)

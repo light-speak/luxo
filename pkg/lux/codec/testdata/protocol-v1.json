@@ -1,5 +1,314 @@
 {
+  "dateTimeBoundaryCases": [
+    {
+      "name": "min",
+      "input": "0000-01-01T00:00:00.000000001Z",
+      "canonical": "0000-01-01T00:00:00.000000001Z"
+    },
+    {
+      "name": "max",
+      "input": "9999-12-31T23:59:59.999999999Z",
+      "canonical": "9999-12-31T23:59:59.999999999Z"
+    },
+    {
+      "name": "lowercase",
+      "input": "2026-09-17t12:00:00.123456789z",
+      "canonical": "2026-09-17T12:00:00.123456789Z"
+    },
+    {
+      "name": "zero_offset",
+      "input": "1970-01-01T00:00:00-00:00",
+      "canonical": "1970-01-01T00:00:00Z"
+    },
+    {
+      "name": "large_offset",
+      "input": "1970-01-01T23:59:00+23:59",
+      "canonical": "1970-01-01T00:00:00Z"
+    },
+    {
+      "name": "year_zero_leap",
+      "input": "0000-02-29T00:00:00Z",
+      "canonical": "0000-02-29T00:00:00Z"
+    },
+    {
+      "name": "century_leap",
+      "input": "2000-02-29T00:00:00Z",
+      "canonical": "2000-02-29T00:00:00Z"
+    },
+    {
+      "name": "reform",
+      "input": "1582-10-10T00:00:00Z",
+      "canonical": "1582-10-10T00:00:00Z"
+    },
+    {
+      "name": "extra_digit",
+      "input": "2026-09-17T12:00:00.1234567890Z",
+      "canonical": null
+    },
+    {
+      "name": "extra_zero",
+      "input": "2026-09-17T12:00:00.0000000000Z",
+      "canonical": null
+    },
+    {
+      "name": "empty_fraction",
+      "input": "2026-09-17T12:00:00.Z",
+      "canonical": null
+    },
+    {
+      "name": "comma",
+      "input": "2026-09-17T12:00:00,1Z",
+      "canonical": null
+    },
+    {
+      "name": "missing_zone",
+      "input": "2026-09-17T12:00:00",
+      "canonical": null
+    },
+    {
+      "name": "missing_second",
+      "input": "2026-09-17T12:00Z",
+      "canonical": null
+    },
+    {
+      "name": "space",
+      "input": "2026-09-17 12:00:00Z",
+      "canonical": null
+    },
+    {
+      "name": "trailing",
+      "input": "2026-09-17T12:00:00Zx",
+      "canonical": null
+    },
+    {
+      "name": "leading_space",
+      "input": " 2026-09-17T12:00:00Z",
+      "canonical": null
+    },
+    {
+      "name": "trailing_space",
+      "input": "2026-09-17T12:00:00Z ",
+      "canonical": null
+    },
+    {
+      "name": "short_hour",
+      "input": "2026-09-17T1:00:00Z",
+      "canonical": null
+    },
+    {
+      "name": "hour_24",
+      "input": "2026-09-17T24:00:00Z",
+      "canonical": null
+    },
+    {
+      "name": "minute_60",
+      "input": "2026-09-17T12:60:00Z",
+      "canonical": null
+    },
+    {
+      "name": "leap_second",
+      "input": "2016-12-31T23:59:60Z",
+      "canonical": null
+    },
+    {
+      "name": "non_leap",
+      "input": "1900-02-29T00:00:00Z",
+      "canonical": null
+    },
+    {
+      "name": "day_rollover",
+      "input": "2026-02-30T00:00:00Z",
+      "canonical": null
+    },
+    {
+      "name": "month_zero",
+      "input": "2026-00-17T12:00:00Z",
+      "canonical": null
+    },
+    {
+      "name": "day_zero",
+      "input": "2026-09-00T12:00:00Z",
+      "canonical": null
+    },
+    {
+      "name": "offset_hour",
+      "input": "2026-09-17T12:00:00+24:00",
+      "canonical": null
+    },
+    {
+      "name": "offset_minute",
+      "input": "2026-09-17T12:00:00+01:60",
+      "canonical": null
+    },
+    {
+      "name": "offset_compact",
+      "input": "2026-09-17T12:00:00+0100",
+      "canonical": null
+    },
+    {
+      "name": "offset_seconds",
+      "input": "2026-09-17T12:00:00+01:00:00",
+      "canonical": null
+    },
+    {
+      "name": "before_min",
+      "input": "0000-01-01T00:00:00+00:01",
+      "canonical": null
+    },
+    {
+      "name": "after_max",
+      "input": "9999-12-31T23:59:59-00:01",
+      "canonical": null
+    },
+    {
+      "name": "negative_year",
+      "input": "-0001-01-01T00:00:00Z",
+      "canonical": null
+    },
+    {
+      "name": "expanded_year",
+      "input": "+010000-01-01T00:00:00Z",
+      "canonical": null
+    }
+  ],
   "version": 1,
+  "uuidCanonicalCases": [
+    {"input":"00112233-4455-6677-8899-aabbccddeeff","canonical":"00112233-4455-6677-8899-aabbccddeeff"},
+    {"input":"AABBCCDD-EEFF-0011-2233-445566778899","canonical":"aabbccdd-eeff-0011-2233-445566778899"},
+    {"input":"00000000-0000-0000-0000-000000000000","canonical":"00000000-0000-0000-0000-000000000000"},
+    {"input":"ffffffff-ffff-ffff-ffff-ffffffffffff","canonical":"ffffffff-ffff-ffff-ffff-ffffffffffff"},
+    {"input":"----00112233445566778899aabbccddeeff","canonical":null},
+    {"input":"00112233445566778899aabbccddeeff----","canonical":null},
+    {"input":"0011223344-55-66-77-8899aabbccddeeff","canonical":null},
+    {"input":"g0112233-4455-6677-8899-aabbccddeeff","canonical":null},
+    {"input":" 0112233-4455-6677-8899-aabbccddeeff","canonical":null},
+    {"input":"\u00000112233-4455-6677-8899-aabbccddeeff","canonical":null},
+    {"input":"00112233-4455-6677-8899-aabbccddee-f","canonical":null}
+  ],
+  "jsonUnicodeCases": [
+    {"name":"high surrogate","raw":"\"\\uD800\"","valid":false},
+    {"name":"last high surrogate","raw":"\"\\uDBFF\"","valid":false},
+    {"name":"low surrogate","raw":"\"\\uDC00\"","valid":false},
+    {"name":"last low surrogate","raw":"\"\\udfff\"","valid":false},
+    {"name":"reversed pair","raw":"\"\\uDC00\\uD800\"","valid":false},
+    {"name":"two high surrogates","raw":"\"\\uD800\\uDBFF\"","valid":false},
+    {"name":"high then scalar","raw":"\"\\uD800\\u0061\"","valid":false},
+    {"name":"separated pair","raw":"\"\\uD800x\\uDC00\"","valid":false},
+    {"name":"escaped second slash","raw":"\"\\uD800\\\\uDC00\"","valid":false},
+    {"name":"bad object key","raw":"{\"\\uD800\":1}","valid":false},
+    {"name":"bad nested value","raw":"{\"items\":[0,{\"name\":\"\\uDC00\"}]}","valid":false},
+    {"name":"bad overwritten value","raw":"{\"name\":\"\\uD800\",\"name\":\"valid\"}","valid":false},
+    {"name":"bad trailing value","raw":"[\"\\uD800\\uDC00\",\"\\uDBFF\"]","valid":false},
+    {"name":"first pair","raw":"\"\\uD800\\uDC00\"","valid":true},
+    {"name":"last pair","raw":"\"\\uDBFF\\uDFFF\"","valid":true},
+    {"name":"mixed case pair","raw":"\"\\ud83D\\uDe00\"","valid":true},
+    {"name":"paired key","raw":"{\"\\uD800\\uDC00\":\"\\uDBFF\\uDFFF\"}","valid":true},
+    {"name":"literal escape text","raw":"\"\\\\uD800\"","valid":true},
+    {"name":"non surrogate boundaries","raw":"\"\\uD7FF\\uE000\\uFFFF\"","valid":true},
+    {"name":"replacement characters","raw":"\"\\uFFFD�\"","valid":true},
+    {"name":"control and BOM characters","raw":"\"\\u0000\\n\\uFEFF\"","valid":true},
+    {"name":"unmodified text","raw":"\"東京 é café\"","valid":true},
+    {"name":"duplicate keys and raw numbers","raw":"{\"n\":1,\"n\":123456789012345678901234567890,\"tiny\":1e-9999,\"text\":\"\\uD800\\uDC00\"}","valid":true}
+  ],
+  "dateTimeCases": [
+    {"input":"1582-10-04T23:59:59Z","seconds":"-12220156801","nanoseconds":0,"canonical":"1582-10-04T23:59:59Z"},
+    {"input":"1582-10-14T23:59:59Z","seconds":"-12219292801","nanoseconds":0,"canonical":"1582-10-14T23:59:59Z"},
+    {"input":"1582-10-15T00:00:00Z","seconds":"-12219292800","nanoseconds":0,"canonical":"1582-10-15T00:00:00Z"},
+    {"input":"1970-01-01T00:00:00Z","seconds":"0","nanoseconds":0,"canonical":"1970-01-01T00:00:00Z"},
+    {"input":"1969-12-31T23:59:59Z","seconds":"-1","nanoseconds":0,"canonical":"1969-12-31T23:59:59Z"},
+    {"input":"1969-12-31T23:59:59.001Z","seconds":"-1","nanoseconds":1000000,"canonical":"1969-12-31T23:59:59.001Z"},
+    {"input":"1969-12-31T23:59:59.999999999Z","seconds":"-1","nanoseconds":999999999,"canonical":"1969-12-31T23:59:59.999999999Z"},
+    {"input":"1970-01-01T00:00:00.999999999Z","seconds":"0","nanoseconds":999999999,"canonical":"1970-01-01T00:00:00.999999999Z"},
+    {"input":"1970-01-01T08:59:59.999999999+09:00","seconds":"-1","nanoseconds":999999999,"canonical":"1969-12-31T23:59:59.999999999Z"},
+    {"input":"1969-12-31T15:59:59.999999999-08:00","seconds":"-1","nanoseconds":999999999,"canonical":"1969-12-31T23:59:59.999999999Z"},
+    {"input":"2038-01-19T03:14:07.999999999Z","seconds":"2147483647","nanoseconds":999999999,"canonical":"2038-01-19T03:14:07.999999999Z"},
+    {"input":"9999-12-31T23:59:59.999999999Z","seconds":"253402300799","nanoseconds":999999999,"canonical":"9999-12-31T23:59:59.999999999Z"},
+    {"input":"0001-01-01T00:00:00.999999999Z","seconds":"-62135596800","nanoseconds":999999999,"canonical":"0001-01-01T00:00:00.999999999Z"},
+    {"input":"0000-01-01T00:00:00.999999999Z","seconds":"-62167219200","nanoseconds":999999999,"canonical":"0000-01-01T00:00:00.999999999Z"}
+  ],
+  "jsonNumberConversions": [
+    {"token":"0","int64":"0","float64Bits":"0000000000000000"},
+    {"token":"-0","int64":"0","float64Bits":"8000000000000000"},
+    {"token":"1","int64":"1","float64Bits":"3ff0000000000000"},
+    {"token":"-1","int64":"-1","float64Bits":"bff0000000000000"},
+    {"token":"9007199254740993","int64":"9007199254740993","float64Bits":"4340000000000000"},
+    {"token":"-9007199254740993","int64":"-9007199254740993","float64Bits":"c340000000000000"},
+    {"token":"9223372036854775807","int64":"9223372036854775807","float64Bits":"43e0000000000000"},
+    {"token":"-9223372036854775808","int64":"-9223372036854775808","float64Bits":"c3e0000000000000"},
+    {"token":"9223372036854775808","int64":null,"float64Bits":"43e0000000000000"},
+    {"token":"-9223372036854775809","int64":null,"float64Bits":"c3e0000000000000"},
+    {"token":"18446744073709551615","int64":null,"float64Bits":"43f0000000000000"},
+    {"token":"1.0","int64":null,"float64Bits":"3ff0000000000000"},
+    {"token":"1E+03","int64":null,"float64Bits":"408f400000000000"},
+    {"token":"1.25","int64":null,"float64Bits":"3ff4000000000000"},
+    {"token":"1.00000000000000011102230246251565404236316680908203125","int64":null,"float64Bits":"3ff0000000000000"},
+    {"token":"1.00000000000000011102230246251565404236316680908203126","int64":null,"float64Bits":"3ff0000000000001"},
+    {"token":"1.00000000000000033306690738754696212708950042724609375","int64":null,"float64Bits":"3ff0000000000002"},
+    {"token":"0.000","int64":null,"float64Bits":"0000000000000000"},
+    {"token":"-0.000","int64":null,"float64Bits":"8000000000000000"},
+    {"token":"0e99999999999999999999999999999999","int64":null,"float64Bits":"0000000000000000"},
+    {"token":"-0e99999999999999999999999999999999","int64":null,"float64Bits":"8000000000000000"},
+    {"token":"0e-99999999999999999999999999999999","int64":null,"float64Bits":"0000000000000000"},
+    {"token":"-0e-99999999999999999999999999999999","int64":null,"float64Bits":"8000000000000000"},
+    {"token":"5e-324","int64":null,"float64Bits":"0000000000000001"},
+    {"token":"-5e-324","int64":null,"float64Bits":"8000000000000001"},
+    {"token":"2.4703282292062327e-324","int64":null,"float64Bits":null},
+    {"token":"-2.4703282292062327e-324","int64":null,"float64Bits":null},
+    {"token":"2.4703282292062328e-324","int64":null,"float64Bits":"0000000000000001"},
+    {"token":"-2.4703282292062328e-324","int64":null,"float64Bits":"8000000000000001"},
+    {"token":"2.2250738585072014e-308","int64":null,"float64Bits":"0010000000000000"},
+    {"token":"2.225073858507201e-308","int64":null,"float64Bits":"000fffffffffffff"},
+    {"token":"1.7976931348623157e308","int64":null,"float64Bits":"7fefffffffffffff"},
+    {"token":"-1.7976931348623157e308","int64":null,"float64Bits":"ffefffffffffffff"},
+    {"token":"1.7976931348623158e308","int64":null,"float64Bits":"7fefffffffffffff"},
+    {"token":"1.7976931348623159e308","int64":null,"float64Bits":null},
+    {"token":"-1.7976931348623159e308","int64":null,"float64Bits":null},
+    {"token":"1e400","int64":null,"float64Bits":null},
+    {"token":"-1e400","int64":null,"float64Bits":null},
+    {"token":"1e-400","int64":null,"float64Bits":null},
+    {"token":"-1e-400","int64":null,"float64Bits":null}
+  ],
+  "jsonNumberTokens": [
+    "0",
+    "-0",
+    "1.0",
+    "1E+03",
+    "9007199254740993",
+    "18446744073709551615",
+    "123456789012345678901234567890",
+    "0.12345678901234567890123456789",
+    "1e400",
+    "1e-400",
+    "1e2147483648",
+    "1e-2147483649",
+    "1e9999999999999999999999999999999999999999",
+    "-1e-9999999999999999999999999999999999999999",
+    "0e9999999999999999999999999999999999999999",
+    "-0e-9999999999999999999999999999999999999999",
+    "-0.000E+000000",
+    "1.230000E-000003",
+    "1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456",
+    "0.1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456"
+  ],
+  "int64Cases": [
+    {"value": "0", "wire": "00"},
+    {"value": "1", "wire": "02"},
+    {"value": "-1", "wire": "01"},
+    {"value": "2147483647", "wire": "feffffff0f"},
+    {"value": "-2147483648", "wire": "ffffffff0f"},
+    {"value": "4294967296", "wire": "8080808020"},
+    {"value": "4503599627370495", "wire": "feffffffffffff0f"},
+    {"value": "4503599627370496", "wire": "8080808080808010"},
+    {"value": "-4503599627370496", "wire": "ffffffffffffff0f"},
+    {"value": "-4503599627370497", "wire": "8180808080808010"},
+    {"value": "9007199254740991", "wire": "feffffffffffff1f"},
+    {"value": "9007199254740992", "wire": "8080808080808020"},
+    {"value": "9007199254740993", "wire": "8280808080808020"},
+    {"value": "-9007199254740993", "wire": "8180808080808020"},
+    {"value": "9223372036854775807", "wire": "feffffffffffffffff01"},
+    {"value": "-9223372036854775808", "wire": "ffffffffffffffffff01"}
+  ],
+  "invalidInt64": ["", "80", "80808080808080808002", "ffffffffffffffffff02", "8080808080808080808000"],
   "primitives": {
     "varint300": "ac02",
     "svarintNegative42": "53",
@@ -13,14 +322,14 @@
     "nullableString": "01044c75786f"
   },
   "requests": {
-    "allTypes": "ac02000105021203000000000000f43f040a4c75786fe4b896e7958c05044f50454e060531322e353007010878090123456789abcdef0123456789abcdef0a0200ff0b0b7b226f6b223a747275657d0c02016106e4b896e7958c00",
+    "allTypes": "ac02000105021203000000000000f43f040a4c75786fe4b896e7958c05044f50454e060531322e35300701087800090123456789abcdef0123456789abcdef0a0200ff0b0b7b226f6b223a747275657d0c02016106e4b896e7958c00",
     "nullable": "0900010002015400",
     "selected": "070601050302010200"
   },
   "errorEnvelope": "01a006020a42616452657175657374030362616404017405027b7d06016300",
   "frames": {
     "callRequest": "01fd01070000",
-    "subscribeSuccess": "07fd01"
+    "subscribeSuccess": "13fd01"
   },
   "columnar": "03070105001202016106e4b896e7958c0003010100010000"
 }

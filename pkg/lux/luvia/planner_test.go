@@ -227,8 +227,8 @@ func TestPlan_NoPrimaryKeyField(t *testing.T) {
 func TestSchemaFieldToSkipType_NullableEnum(t *testing.T) {
 	f := &schema.Field{Type: schema.FieldEnum, Nullable: true}
 	got := schemaFieldToSkipType(f)
-	if got != codec.SkipNullBytes {
-		t.Errorf("nullable enum skip type = %d, want SkipNullBytes", got)
+	if got != codec.SkipNullString {
+		t.Errorf("nullable enum skip type = %d, want SkipNullString", got)
 	}
 }
 
@@ -251,8 +251,8 @@ func TestSchemaFieldToSkipType_NullableModel(t *testing.T) {
 func TestSchemaFieldToSkipType_NullableDateTime(t *testing.T) {
 	f := &schema.Field{Type: schema.FieldDateTime, Nullable: true}
 	got := schemaFieldToSkipType(f)
-	if got != codec.SkipNullVarint {
-		t.Errorf("nullable datetime skip type = %d, want SkipNullVarint", got)
+	if got != codec.SkipNullDateTime {
+		t.Errorf("nullable datetime skip type = %d, want SkipNullDateTime", got)
 	}
 }
 

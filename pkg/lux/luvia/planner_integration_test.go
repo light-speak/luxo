@@ -3,6 +3,7 @@ package luvia
 import (
 	"testing"
 
+	"github.com/light-speak/luxo/internal/testutil"
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/schema"
 )
@@ -41,25 +42,23 @@ func encodeUser(id int64, name, email string) []byte {
 	buf = codec.AppendVarint(buf, 1) // field 1 = id
 	buf = codec.AppendSvarint(buf, id)
 	buf = codec.AppendVarint(buf, 2) // field 2 = name
-	buf = codec.AppendString(buf, name)
+	buf = codec.AppendBytes(buf, []byte(name))
 	buf = codec.AppendVarint(buf, 3) // field 3 = email
-	buf = codec.AppendString(buf, email)
+	buf = codec.AppendBytes(buf, []byte(email))
 	buf = append(buf, 0x00) // end
 	return buf
 }
 
-// encodePost builds a binary-encoded Post.
-func encodePost(id, userID int64, title string) []byte {
-	var buf []byte
-	buf = codec.AppendVarint(buf, 0) // arena header
-	buf = codec.AppendVarint(buf, 1) // field 1 = id
-	buf = codec.AppendSvarint(buf, id)
-	buf = codec.AppendVarint(buf, 2) // field 2 = title
-	buf = codec.AppendString(buf, title)
-	buf = codec.AppendVarint(buf, 3) // field 3 = userId
-	buf = codec.AppendSvarint(buf, userID)
-	buf = append(buf, 0x00) // end
-	return buf
+// encodePostList builds the canonical columnar body shared by row and list parents.
+func encodePostList(t testing.TB, ids, userIDs []int64, titles []string) []byte {
+	w := &codec.ColumnarWriter{}
+	w.SetCount(len(ids))
+	if len(ids) != 0 {
+		w.WriteColumnInt(1, ids)
+		w.WriteColumnString(2, titles)
+		w.WriteColumnInt(3, userIDs)
+	}
+	return testutil.Bytes(t)(w.Bytes())
 }
 
 func decodeIntKeys(t *testing.T, keys BinaryKeys) []int64 {
@@ -132,14 +131,8 @@ func TestIntegration_PlanSplitMerge(t *testing.T) {
 		t.Fatalf("extracted ids = %v, want [42]", ids)
 	}
 
-	// Step 4: Simulate extend RPC response (post service returns 2 posts for user 42)
-	// Encode as a list: [count varint][post1 raw][post2 raw]
-	post1 := encodePost(101, 42, "Hello World")
-	post2 := encodePost(102, 42, "Second Post")
-	var postsData []byte
-	postsData = codec.AppendArrayHeader(postsData, 2) // count = 2
-	postsData = append(postsData, post1...)
-	postsData = append(postsData, post2...)
+	// Step 4: A resolver returns a length-prefixed columnar value.
+	postsData := codec.AppendBytes(nil, encodePostList(t, []int64{101, 102}, []int64{42, 42}, []string{"Hello World", "Second Post"}))
 
 	// Step 5: Merge primary + extend
 	merged := Merge(primary, []ExtendResult{
@@ -167,7 +160,7 @@ func TestIntegration_PlanSplitMerge(t *testing.T) {
 		case 3:
 			_ = dec.ReadString() // email (may be empty)
 		case 10:
-			postsCount = dec.ReadArrayLength()
+			postsCount = verifyPostList(t, dec.ReadBytes())
 		default:
 			t.Fatalf("unexpected field ID %d in merged response", fid)
 		}
@@ -193,25 +186,20 @@ func TestIntegration_PlanSplitMerge(t *testing.T) {
 // --- Test 2: Columnar Federation Integration (list response) ---
 
 // buildColumnarPrimary builds a columnar response with 3 users.
-func buildColumnarPrimary() []byte {
+func buildColumnarPrimary(t testing.TB) []byte {
 	cw := &codec.ColumnarWriter{}
 	cw.SetCount(3)
 	cw.WriteColumnInt(1, []int64{10, 20, 30})
 	cw.WriteColumnString(2, []string{"Alice", "Bob", "Carol"})
 	cw.WriteColumnString(3, []string{"a@x", "b@x", "c@x"})
-	return cw.Bytes()
+	return testutil.Bytes(t)(cw.Bytes())
 }
 
 // buildGroupedPostResponse simulates RPC response: user 10→2 posts, 20→0, 30→1.
-func buildGroupedPostResponse() []byte {
-	var resp []byte
-	resp = codec.AppendVarint(resp, 3)
-	resp = codec.AppendVarint(resp, 2)
-	resp = codec.AppendBytes(resp, encodePost(101, 10, "Post A"))
-	resp = codec.AppendBytes(resp, encodePost(102, 10, "Post B"))
-	resp = codec.AppendVarint(resp, 0)
-	resp = codec.AppendVarint(resp, 1)
-	resp = codec.AppendBytes(resp, encodePost(103, 30, "Post C"))
+func buildGroupedPostResponse(t testing.TB) []byte {
+	resp := codec.AppendBytes([]byte{3}, encodePostList(t, []int64{101, 102}, []int64{10, 10}, []string{"Post A", "Post B"}))
+	resp = codec.AppendBytes(resp, encodePostList(t, nil, nil, nil))
+	resp = codec.AppendBytes(resp, encodePostList(t, []int64{103}, []int64{30}, []string{"Post C"}))
 	return resp
 }
 
@@ -219,8 +207,7 @@ func buildGroupedPostResponse() []byte {
 func verifyBlobCounts(t *testing.T, blobs [][]byte, expected []int) {
 	t.Helper()
 	for i, want := range expected {
-		dec := codec.NewDecoder(blobs[i])
-		got := dec.ReadArrayLength()
+		got := verifyPostList(t, blobs[i])
 		if got != want {
 			t.Errorf("blob[%d] count = %d, want %d", i, got, want)
 		}
@@ -237,7 +224,7 @@ func TestIntegration_ColumnarFederation(t *testing.T) {
 		t.Fatal("expected non-nil plan")
 	}
 
-	primaryColumnar := buildColumnarPrimary()
+	primaryColumnar := buildColumnarPrimary(t)
 
 	keys, ok := ExtractPrimaryKeyColumn(primaryColumnar, plan.PrimaryKeyField, userModel)
 	if !ok {
@@ -248,12 +235,12 @@ func TestIntegration_ColumnarFederation(t *testing.T) {
 		t.Fatalf("ids = %v, want [10 20 30]", ids)
 	}
 
-	groupedResp := buildGroupedPostResponse()
-	blobs := ParseGroupedResponse(groupedResp, true)
+	groupedResp := buildGroupedPostResponse(t)
+	blobs := ParseGroupedResponse(groupedResp, false)
 	if len(blobs) != 3 {
 		t.Fatalf("expected 3 blobs, got %d", len(blobs))
 	}
-	verifyBlobCounts(t, blobs, []int{2, 0, 1})
+	assertResolvedListCounts(t, blobs, []int{2, 0, 1})
 
 	// Step 5: MergeColumnar — add extend column to primary columnar data
 	extStep := plan.Extends[0]
@@ -349,17 +336,9 @@ func TestIntegration_MultiModuleFederation(t *testing.T) {
 	// Simulate primary response
 	primary := encodeUser(1, "Alice", "a@x.com")
 
-	// Simulate extend responses
-	// Posts: 1 post
-	var postsData []byte
-	postsData = codec.AppendArrayHeader(postsData, 1)
-	postsData = append(postsData, encodePost(100, 1, "Hello")...)
-
-	// Comments: 2 comments (encoded like posts for simplicity)
-	var commentsData []byte
-	commentsData = codec.AppendArrayHeader(commentsData, 2)
-	commentsData = append(commentsData, encodePost(200, 1, "Comment1")...) // reusing encodePost format
-	commentsData = append(commentsData, encodePost(201, 1, "Comment2")...)
+	// Both nested values use the same columnar body regardless of the parent shape.
+	postsData := codec.AppendBytes(nil, encodePostList(t, []int64{100}, []int64{1}, []string{"Hello"}))
+	commentsData := codec.AppendBytes(nil, encodePostList(t, []int64{200, 201}, []int64{1, 1}, []string{"Comment1", "Comment2"}))
 
 	// Merge
 	merged := Merge(primary, []ExtendResult{
@@ -367,12 +346,7 @@ func TestIntegration_MultiModuleFederation(t *testing.T) {
 		{FieldID: modules["comment"].FieldID, Data: commentsData},
 	})
 
-	// Verify merged response contains the right structure.
-	// We check that the merged binary starts with the primary fields and ends
-	// with extend fields appended. Since the extend data is raw list binary
-	// (count + items), full decoding would require knowing the nested model schema.
-	// Instead, verify field presence by checking the binary contains the expected
-	// field IDs as varints at the right positions.
+	// Verify each nested columnar value and the complete parent boundary.
 	dec := codec.NewDecoder(merged)
 	dec.SkipArenaHeader()
 
@@ -396,36 +370,16 @@ func TestIntegration_MultiModuleFederation(t *testing.T) {
 	}
 	_ = dec.ReadString()
 
-	// Field 10 (posts) — read the list count header
-	if !dec.NextField() || dec.FieldID() != 10 {
-		t.Fatal("expected field 10 (posts)")
-	}
-	postsCount := dec.ReadArrayLength()
-	if postsCount != 1 {
-		t.Errorf("posts count = %d, want 1", postsCount)
-	}
-	// Skip past the post items (each is a full binary message with arena header)
-	for i := 0; i < postsCount; i++ {
-		dec.SkipArenaHeader()
-		for dec.NextField() {
-			switch dec.FieldID() {
-			case 1:
-				_ = dec.ReadInt()
-			case 2:
-				_ = dec.ReadString()
-			case 3:
-				_ = dec.ReadInt()
-			}
+	for _, field := range []struct{ id, count int }{{10, 1}, {11, 2}} {
+		if !dec.NextField() || dec.FieldID() != field.id {
+			t.Fatalf("missing field %d", field.id)
+		}
+		if got := verifyPostList(t, dec.ReadBytes()); got != field.count {
+			t.Fatalf("field %d count = %d", field.id, got)
 		}
 	}
-
-	// Field 11 (comments) — read the list count header
-	if !dec.NextField() || dec.FieldID() != 11 {
-		t.Fatalf("expected field 11 (comments), got EOF or fieldID %d", dec.FieldID())
-	}
-	commentsCount := dec.ReadArrayLength()
-	if commentsCount != 2 {
-		t.Errorf("comments count = %d, want 2", commentsCount)
+	if dec.NextField() || dec.Finish() != nil {
+		t.Fatal("invalid merged parent boundary")
 	}
 }
 
@@ -442,9 +396,9 @@ func TestIntegration_BinaryRoundtrip(t *testing.T) {
 	primary = codec.AppendVarint(primary, 1) // id
 	primary = codec.AppendSvarint(primary, 7)
 	primary = codec.AppendVarint(primary, 2) // name
-	primary = codec.AppendString(primary, "Bob")
+	primary = codec.AppendBytes(primary, []byte("Bob"))
 	primary = codec.AppendVarint(primary, 3) // email
-	primary = codec.AppendString(primary, "bob@test.com")
+	primary = codec.AppendBytes(primary, []byte("bob@test.com"))
 	primary = append(primary, 0x00) // end
 
 	plan := planForTest(t, userModel, nil, "user")
@@ -462,12 +416,8 @@ func TestIntegration_BinaryRoundtrip(t *testing.T) {
 		t.Fatalf("extracted ids = %v", ids)
 	}
 
-	// Simulate extend response: 3 posts for user 7
-	var postsData []byte
-	postsData = codec.AppendArrayHeader(postsData, 3)
-	for i := int64(1); i <= 3; i++ {
-		postsData = append(postsData, encodePost(i, 7, "Post")...)
-	}
+	// Simulate three posts for user 7.
+	postsData := codec.AppendBytes(nil, encodePostList(t, []int64{1, 2, 3}, []int64{7, 7, 7}, []string{"Post", "Post", "Post"}))
 
 	merged := Merge(primary, []ExtendResult{
 		{FieldID: 10, Data: postsData},
@@ -490,24 +440,7 @@ func TestIntegration_BinaryRoundtrip(t *testing.T) {
 		case 3:
 			gotEmail = dec.ReadString()
 		case 10:
-			gotPostCount = dec.ReadArrayLength()
-			// Skip past the post items (each is a full message)
-			for i := 0; i < gotPostCount; i++ {
-				// Skip arena header
-				dec.SkipArenaHeader()
-				// Read each post's fields until end marker
-				for dec.NextField() {
-					fid := dec.FieldID()
-					switch fid {
-					case 1:
-						_ = dec.ReadInt() // post id
-					case 2:
-						_ = dec.ReadString() // title
-					case 3:
-						_ = dec.ReadInt() // userId
-					}
-				}
-			}
+			gotPostCount = verifyPostList(t, dec.ReadBytes())
 		}
 	}
 	if dec.Err() != nil {
@@ -525,4 +458,28 @@ func TestIntegration_BinaryRoundtrip(t *testing.T) {
 	if gotPostCount != 3 {
 		t.Errorf("post count = %d, want 3", gotPostCount)
 	}
+}
+
+func verifyPostList(t *testing.T, body []byte) int {
+	t.Helper()
+	r := codec.NewColumnarReader(body)
+	count := r.Count()
+	for r.NextColumn() {
+		switch r.FieldID() {
+		case 1, 3:
+			if got := r.ReadColumnInt(); len(got) != count {
+				t.Fatal("invalid post integer column")
+			}
+		case 2:
+			if got := r.ReadColumnString(); len(got) != count {
+				t.Fatal("invalid post title column")
+			}
+		default:
+			t.Fatalf("unknown post column %d", r.FieldID())
+		}
+	}
+	if r.Err() != nil || r.Offset() != len(body) {
+		t.Fatalf("invalid post columnar boundary: %v", r.Err())
+	}
+	return count
 }

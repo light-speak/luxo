@@ -4,13 +4,15 @@ version: 0.1.2
 homepage: https://github.com/light-speak/luxo
 
 environment:
-  sdk: ">=3.0.0 <4.0.0"
+  sdk: ">=3.13.0 <4.0.0"
 
 dependencies:
+  fixnum: ^1.1.1
   http: ^1.2.0
-  analyzer: ^7.0.0
-  build: ^2.4.0
+  analyzer: ^14.4.0
+  build: ^4.0.11
   glob: ^2.1.0
+  web: ^1.1.1
 
 dev_dependencies:
   test: ^1.24.0

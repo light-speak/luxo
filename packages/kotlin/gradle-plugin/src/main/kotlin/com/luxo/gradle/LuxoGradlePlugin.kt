@@ -1,5 +1,6 @@
 package com.luxo.gradle
 
+import java.util.Properties
 import org.gradle.api.Plugin
 import org.gradle.api.Project
 import org.gradle.api.artifacts.Configuration
@@ -34,12 +35,20 @@ private fun Project.toolingClasspath(name: String, includeCompiler: Boolean = fa
         it.isCanBeResolved = true
         it.description = "Isolated runtime for Luxo build tooling"
     }
-    dependencies.add(name, "com.luxo:luxo-client:$LUXO_VERSION")
+    dependencies.add(name, "com.luxo:luxo-client:${ToolingVersions.luxo}")
     if (includeCompiler) {
-        dependencies.add(name, "org.jetbrains.kotlin:kotlin-compiler-embeddable:$KOTLIN_COMPILER_VERSION")
+        dependencies.add(name, "org.jetbrains.kotlin:kotlin-compiler-embeddable:${ToolingVersions.kotlin}")
     }
     return classpath
 }
 
-private const val LUXO_VERSION = "0.1.0"
-private const val KOTLIN_COMPILER_VERSION = "2.4.10"
+/** Build-time versions come from the SDK build, never the host Gradle Kotlin runtime. */
+private object ToolingVersions {
+    private val properties = Properties().apply {
+        checkNotNull(LuxoGradlePlugin::class.java.getResourceAsStream("tooling.properties")) {
+            "Luxo plugin tooling versions are missing"
+        }.use { load(it) }
+    }
+    val luxo: String = checkNotNull(properties.getProperty("luxoVersion"))
+    val kotlin: String = checkNotNull(properties.getProperty("kotlinVersion"))
+}

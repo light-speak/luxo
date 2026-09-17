@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/api"
 	"github.com/light-speak/luxo/pkg/lux/codec"
-	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
 )
 
 // Client sends RPC requests to a remote Luxo service.
@@ -36,6 +36,8 @@ type Subscription struct {
 	cancel   context.CancelFunc
 	stop     func() bool
 	once     sync.Once
+	finished atomic.Bool
+	result   error // published by finished; immutable afterward
 }
 
 // Messages returns canonical Luxo binary stream payloads.
@@ -43,9 +45,19 @@ func (s *Subscription) Messages() <-chan []byte {
 	return s.messages
 }
 
-// Errors reports the terminal stream result and then closes.
+// Errors reports terminal failure and then closes. Drain Messages first when
+// ordering matters; selecting Errors alongside Messages can skip buffered data.
 func (s *Subscription) Errors() <-chan error {
 	return s.errors
+}
+
+// Err returns the terminal result without consuming it. Drain Messages before
+// interpreting nil as successful completion; an active stream also returns nil.
+func (s *Subscription) Err() error {
+	if s.finished.Load() {
+		return s.result
+	}
+	return nil
 }
 
 // Close cancels the subscription and closes its dedicated connection.
@@ -85,7 +97,7 @@ func (c *Client) CallWithMaskContext(ctx context.Context, bearerToken string, ap
 }
 
 // CallWithMaskTargetContext adds service and field attribution when detailed
-// tracing is explicitly enabled on ctx. The normal path keeps the v1 envelope.
+// tracing is explicitly enabled on ctx. Normal requests carry no trace metadata.
 func (c *Client) CallWithMaskTargetContext(ctx context.Context, bearerToken string, apiID int, fieldMask []byte, params []byte, target TraceTarget) ([]byte, error) {
 	request := encodeCallRequest(apiID, fieldMask, params)
 	trace := api.DebugTrace(ctx)
@@ -189,6 +201,13 @@ func (s *Subscription) readLoop(ctx context.Context) {
 		case statusError:
 			s.finish(decodeError(frame[1:]))
 			return
+		case statusStreamComplete:
+			var err error
+			if len(frame) != 1 {
+				err = fmt.Errorf("rpc: trailing stream completion data")
+			}
+			s.finish(err)
+			return
 		default:
 			s.finish(fmt.Errorf("rpc: invalid stream frame status %d", frame[0]))
 			return
@@ -198,6 +217,8 @@ func (s *Subscription) readLoop(ctx context.Context) {
 
 func (s *Subscription) finish(err error) {
 	s.once.Do(func() {
+		s.result = err
+		s.finished.Store(true)
 		if s.stop != nil {
 			s.stop()
 		}
@@ -376,66 +397,30 @@ func (c *Client) Close() {
 	c.pool.Close()
 }
 
-// decodeError decodes a binary error response.
-func decodeError(data []byte) error {
-	dec := codec.NewDecoder(data)
-	var code int64
-	var name, message string
-	var seen uint8
-	for dec.NextField() {
-		switch dec.FieldID() {
-		case 1:
-			code = dec.ReadInt()
-			seen |= 1 << 0
-		case 2:
-			name = dec.ReadString()
-			seen |= 1 << 1
-		case 3:
-			message = dec.ReadString()
-			seen |= 1 << 2
-		default:
-			return fmt.Errorf("rpc: unknown error field %d", dec.FieldID())
-		}
-	}
-	if err := dec.Err(); err != nil {
-		return fmt.Errorf("rpc: decode error envelope: %w", err)
-	}
-	if dec.FieldID() != 0 {
-		return fmt.Errorf("rpc: error envelope missing end marker")
-	}
-	if dec.Offset() != len(data) {
-		return fmt.Errorf("rpc: error envelope has trailing bytes")
-	}
-	if seen != 0b111 {
-		return fmt.Errorf("rpc: error envelope missing required fields")
-	}
-	appErr := &luxerrors.AppError{Name: name, Code: int(code), Message: message}
-	if code >= 500 {
-		appErr.Message = "error.internal"
-		appErr.Internal = true
-		appErr.Cause = fmt.Errorf("rpc error %d %s: %s", code, name, message)
-	}
-	return appErr
-}
-
 // EncodeParams builds binary params from typed values.
 // Helper for constructing RPC call params.
-func EncodeParams(fields ...ParamField) []byte {
+func EncodeParams(fields ...ParamField) ([]byte, error) {
 	var enc codec.Encoder
 	for _, f := range fields {
 		switch v := f.Value.(type) {
 		case int64:
 			enc.WriteFieldInt(f.FieldID, v)
 		case float64:
-			enc.WriteFieldFloat(f.FieldID, v)
+			if err := enc.WriteFieldFloat(f.FieldID, v); err != nil {
+				return nil, fmt.Errorf("RPC parameter %d: %w", f.FieldID, err)
+			}
 		case string:
-			enc.WriteFieldString(f.FieldID, v)
+			if err := enc.WriteFieldString(f.FieldID, v); err != nil {
+				return nil, fmt.Errorf("RPC parameter %d: %w", f.FieldID, err)
+			}
 		case bool:
 			enc.WriteFieldBool(f.FieldID, v)
+		default:
+			return nil, fmt.Errorf("RPC parameter %d: unsupported value type %T", f.FieldID, f.Value)
 		}
 	}
 	enc.WriteEnd()
-	return enc.Bytes()
+	return enc.Bytes(), nil
 }
 
 // ParamField represents a single parameter for EncodeParams.

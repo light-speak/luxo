@@ -1,9 +1,9 @@
 /** Paginated list response */
 export interface Page<T> {
   items: T[]
-  total: number
-  page: number
-  pageSize: number
+  total: bigint
+  page: bigint
+  pageSize: bigint
 }
 
 export type FilterOperator = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' | 'contains' | 'startswith' | 'endswith' | 'match'
@@ -11,7 +11,7 @@ export type FilterOperator = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' | 'contai
 export interface Filter {
   field: string
   op: FilterOperator
-  value: string | number | boolean
+  value: string | number | bigint | boolean
 }
 
 export interface Sorter {

@@ -1,6 +1,17 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'int64.dart';
+import 'int64_native.dart'
+    if (dart.library.js_interop) 'int64_web.dart'
+    as int64wire;
+import 'int64_validation.dart';
+import 'wire_reader.dart';
+import 'unicode.dart';
+import 'uint64.dart' show writeWireUint64;
+
+Uint8List _encodeString(String value) => utf8.encode(requireUnicode(value));
+
 /// Luxo binary wire format encoder.
 ///
 /// Wire format matches the Go implementation exactly:
@@ -8,7 +19,7 @@ import 'dart:typed_data';
 /// - Svarint: zigzag encoding then varint
 /// - Fixed64: 8 bytes little-endian IEEE 754 float64
 /// - String: varint length + UTF-8 bytes
-/// - Bool: varint 0 or 1
+/// - Bool: one canonical byte, 0 or 1
 /// - Nullable: 1 byte flag (0x00=null, 0x01=present) + value if present
 /// - Field: varint fieldID + value
 /// - End marker: 0x00 (fieldID 0)
@@ -22,7 +33,7 @@ class LuxoEncoder {
   void _ensureCapacity(int needed) {
     final required = _pos + needed;
     if (required <= _buf.length) return;
-    var newLen = _buf.length;
+    var newLen = _buf.isEmpty ? 64 : _buf.length;
     while (newLen < required) {
       newLen <<= 1;
     }
@@ -33,25 +44,39 @@ class LuxoEncoder {
 
   /// Writes an unsigned varint (LEB128).
   void writeVarint(int v) {
-    // Max 10 bytes for 64-bit varint.
-    _ensureCapacity(10);
-    var uv = v; // Dart int is 64-bit signed, treat bit pattern as unsigned.
-    while (uv & ~0x7F != 0) {
-      _buf[_pos++] = (uv & 0x7F) | 0x80;
-      // Logical right shift: Dart's >> is arithmetic for negative ints,
-      // so we use >>> (triple shift) which is unsigned.
-      uv = uv >>> 7;
+    if (v < 0 || v > maxSafeInteger) {
+      throw RangeError.range(v, 0, maxSafeInteger, 'v');
     }
-    _buf[_pos++] = uv & 0x7F;
+    _ensureCapacity(8);
+    while (v >= 128) {
+      _buf[_pos++] = (v & 127) | 128;
+      v = v <= 0xffffffff ? v >>> 7 : v ~/ 128;
+    }
+    _buf[_pos++] = v;
+  }
+
+  /// Writes a complete unsigned 64-bit value; ordinary metadata uses writeVarint.
+  void writeUint64(BigInt v) {
+    _ensureCapacity(10);
+    _pos = writeWireUint64(_buf, _pos, v);
   }
 
   /// Writes a signed varint using zigzag encoding.
-  void writeSvarint(int v) {
-    writeVarint((v << 1) ^ (v >> 63));
+  void writeSvarint(LuxoInt64 v) {
+    _ensureCapacity(10);
+    _pos = int64wire.writeWireInt64(_buf, _pos, v);
+  }
+
+  /// Writes floor Unix seconds and the exact nanosecond fraction.
+  void writeDateTime(String value) {
+    final parts = dateTimePartsFromString(value);
+    writeSvarint(LuxoInt64.fromInt(parts.seconds));
+    writeVarint(parts.nanoseconds);
   }
 
   /// Writes a float64 as 8 bytes little-endian.
   void writeFixed64(double v) {
+    if (!v.isFinite) throw const FormatException('Float must be finite');
     _ensureCapacity(8);
     final bd = ByteData(8);
     bd.setFloat64(0, v, Endian.little);
@@ -61,11 +86,7 @@ class LuxoEncoder {
 
   /// Writes a length-prefixed UTF-8 string.
   void writeString(String v) {
-    final encoded = utf8.encode(v);
-    writeVarint(encoded.length);
-    _ensureCapacity(encoded.length);
-    _buf.setRange(_pos, _pos + encoded.length, encoded);
-    _pos += encoded.length;
+    writeBytes(_encodeString(v));
   }
 
   /// Writes a boolean as varint (0 or 1).
@@ -143,7 +164,7 @@ class LuxoEncoder {
   // --- Field writers ---
 
   /// Writes field header (fieldID) + signed int value.
-  void writeFieldInt(int fieldID, int v) {
+  void writeFieldInt(int fieldID, LuxoInt64 v) {
     writeVarint(fieldID);
     writeSvarint(v);
   }
@@ -156,8 +177,9 @@ class LuxoEncoder {
 
   /// Writes field header + string value.
   void writeFieldString(int fieldID, String v) {
+    final encoded = _encodeString(v);
     writeVarint(fieldID);
-    writeString(v);
+    writeBytes(encoded);
   }
 
   /// Writes field header + bool value.
@@ -182,7 +204,7 @@ class LuxoEncoder {
   // Array layout: [varint count][item0][item1]... (count uses plain varint).
 
   /// Writes field header + count-prefixed int64 array (zigzag items).
-  void writeFieldIntArray(int fieldID, List<int> v) {
+  void writeFieldIntArray(int fieldID, List<LuxoInt64> v) {
     writeVarint(fieldID);
     writeVarint(v.length);
     for (final e in v) {
@@ -201,10 +223,16 @@ class LuxoEncoder {
 
   /// Writes field header + count-prefixed string array (length-prefixed items).
   void writeFieldStringArray(int fieldID, List<String> v) {
-    writeVarint(fieldID);
-    writeVarint(v.length);
-    for (final e in v) {
-      writeString(e);
+    final start = _pos;
+    try {
+      writeVarint(fieldID);
+      writeVarint(v.length);
+      for (final e in v) {
+        writeString(e);
+      }
+    } catch (_) {
+      _pos = start;
+      rethrow;
     }
   }
 
@@ -297,119 +325,116 @@ int luxoUtf8Length(String value) {
 ///   }
 /// }
 /// ```
-class LuxoDecoder {
+class LuxoDecoder extends WireReader {
   final ByteData _data;
-  final Uint8List _bytes;
-  int _off;
 
   /// The current field ID after calling [nextField].
   int fieldID = 0;
 
-  /// Any decoding error encountered.
-  String? error;
-
   /// Creates a decoder from raw bytes. No copy is made.
-  LuxoDecoder(Uint8List data)
-    : _data = ByteData.sublistView(data),
-      _bytes = data,
-      _off = 0;
+  LuxoDecoder(Uint8List data) : _data = ByteData.sublistView(data), super(data);
 
   /// Skips the arena header (totalStringLen varint) that prefixes each model's binary data.
   void skipArenaHeader() {
-    _readVarint();
+    readBoundedUnsigned(maxArenaSize, 'arena size');
   }
 
   /// Advances to the next field. Returns false at end or on error.
   bool nextField() {
-    if (error != null || _off >= _data.lengthInBytes) return false;
-    final result = _readVarint();
-    if (result < 0) {
-      error = 'truncated varint at offset $_off';
+    if (error != null) return false;
+    if (wireOffset >= _data.lengthInBytes) {
+      error = 'missing row end marker';
       return false;
     }
+    final result = _readVarint();
+    if (result < 0) return false;
     fieldID = result;
     return fieldID != 0; // 0 = end marker
   }
 
   /// Reads a signed int64 (zigzag decoded).
-  int readInt() {
-    final uv = _readVarint();
-    // Zigzag decode: (uv >>> 1) ^ -(uv & 1)
-    return (uv >>> 1) ^ -(uv & 1);
+  LuxoInt64 readInt() => int64wire.readWireInt64(this);
+
+  /// Decodes a complete scalar response, rejecting invalid or trailing bytes.
+  LuxoInt64 readIntChecked() => _checkedValue(readInt());
+  double readFloatChecked() => _checkedValue(readFloat());
+  String readStringChecked() => _checkedValue(readString());
+  bool readBoolChecked() => _checkedValue(readBool());
+  String readDateTimeChecked() => _checkedValue(readDateTime());
+  String readUuidChecked() => _checkedValue(readUuid());
+  Uint8List readBytesChecked() => _checkedValue(readBytes());
+
+  /// Decodes a complete scalar-array response with the same strict boundary.
+  List<LuxoInt64> readIntArrayChecked() => _checkedValue(readIntArray());
+  List<double> readFloatArrayChecked() => _checkedValue(readFloatArray());
+  List<String> readStringArrayChecked() => _checkedValue(readStringArray());
+  List<bool> readBoolArrayChecked() => _checkedValue(readBoolArray());
+  List<String> readDateTimeArrayChecked() => _checkedValue(readDateTimeArray());
+  List<String> readUuidArrayChecked() => _checkedValue(readUuidArray());
+  List<Uint8List> readBytesArrayChecked() => _checkedValue(readBytesArray());
+
+  T _checkedValue<T>(T value) {
+    checkComplete();
+    return value;
   }
 
-  /// Reads a DateTime field encoded as svarint(unix seconds) and converts it
+  /// Verifies a complete response or length-delimited child, never an input field.
+  void checkComplete() {
+    if (error != null || wireOffset != wireBytes.length) {
+      throw FormatException(error ?? 'trailing binary data');
+    }
+  }
+
+  /// Reads a DateTime seconds/nanoseconds pair and converts it
   /// to an ISO 8601 UTC string — matching the JSON wire representation
   /// (RFC3339). Keeps binary and JSON decoding type-consistent (both String).
-  String readDateTime() => dateTimeStringFromUnixSeconds(readInt());
+  String readDateTime() => _readDateTime(this);
 
   /// Reads a nullable DateTime field. Returns null when the null marker is set,
   /// otherwise svarint(unix seconds) converted to an ISO 8601 UTC string.
   String? readDateTimePtr() {
     if (!_readNullableFlag()) return null;
-    return readDateTime();
+    final value = readDateTime();
+    return error == null ? value : null;
   }
 
   /// Reads a float64 (8 bytes little-endian).
   double readFloat() {
-    if (_off + 8 > _data.lengthInBytes) {
-      error = 'invalid fixed64 at offset $_off';
-      return 0.0;
-    }
-    final v = _data.getFloat64(_off, Endian.little);
-    _off += 8;
+    if (!requireBytes(8, 'fixed64')) return 0.0;
+    final v = _data.getFloat64(wireOffset, Endian.little);
+    if (!acceptFloat(v)) return 0.0;
+    wireOffset += 8;
     return v;
   }
 
-  /// Reads a length-prefixed UTF-8 string.
-  String readString() {
-    final length = _readVarint();
-    if (length < 0 || _off + length > _data.lengthInBytes) {
-      error = 'invalid string at offset $_off';
-      return '';
-    }
-    final s = utf8.decode(Uint8List.sublistView(_bytes, _off, _off + length));
-    _off += length;
-    return s;
-  }
-
-  /// Reads a boolean (varint 0 or 1).
-  bool readBool() {
-    final v = _readVarint();
-    if (v == 0) return false;
-    if (v == 1) return true;
-    if (error == null) error = 'invalid bool marker at offset ${_off - 1}';
-    return false;
-  }
+  /// Reads a boolean (one canonical byte, 0 or 1).
+  bool readBool() => readCanonicalMarker('bool');
 
   /// Reads length-prefixed raw bytes. Returns a view into the input buffer.
   Uint8List readBytes() {
-    final length = _readVarint();
-    if (length < 0 || _off + length > _data.lengthInBytes) {
-      error = 'invalid bytes at offset $_off';
-      return Uint8List(0);
-    }
-    final v = Uint8List.sublistView(_bytes, _off, _off + length);
-    _off += length;
+    final length = readLength('bytes');
+    if (length < 0) return _emptyBytes;
+    final v = Uint8List.sublistView(wireBytes, wireOffset, wireOffset + length);
+    wireOffset += length;
     return v;
   }
 
   /// Reads a fixed 16-byte UUID and formats it as a canonical
   /// "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" string.
   String readUuid() {
-    if (_off + 16 > _data.lengthInBytes) {
-      error = 'truncated uuid at offset $_off';
+    if (wireOffset + 16 > _data.lengthInBytes) {
+      error ??= 'truncated uuid at offset $wireOffset';
       return '';
     }
-    final s = formatUuid(_bytes, _off);
-    _off += 16;
+    final s = formatUuid(wireBytes, wireOffset);
+    wireOffset += 16;
     return s;
   }
 
   // --- Nullable readers ---
 
   /// Reads a nullable int. Returns null if the null marker is present.
-  int? readIntPtr() {
+  LuxoInt64? readIntPtr() {
     if (!_readNullableFlag()) return null;
     return readInt();
   }
@@ -441,13 +466,9 @@ class LuxoDecoder {
   // --- Array readers ---
 
   /// Reads a count-prefixed int64 array.
-  List<int> readIntArray() {
-    final count = _readVarint();
-    if (count < 0) {
-      error = 'invalid array header at offset $_off';
-      return const [];
-    }
-    final result = <int>[];
+  List<LuxoInt64> readIntArray() {
+    final count = readArrayCount();
+    final result = <LuxoInt64>[];
     for (var i = 0; i < count; i++) {
       result.add(readInt());
       if (error != null) return const [];
@@ -455,30 +476,22 @@ class LuxoDecoder {
     return result;
   }
 
-  /// Reads a count-prefixed DateTime array (svarint unix-seconds items),
+  /// Reads a count-prefixed DateTime array (seconds/nanoseconds pairs),
   /// converting each element to an ISO 8601 UTC string to match JSON mode.
   List<String> readDateTimeArray() {
-    final count = _readVarint();
-    if (count < 0) {
-      error = 'invalid array header at offset $_off';
-      return const [];
-    }
+    final count = readArrayCount(2);
     final result = <String>[];
     for (var i = 0; i < count; i++) {
-      final seconds = readInt();
+      final value = readDateTime();
       if (error != null) return const [];
-      result.add(dateTimeStringFromUnixSeconds(seconds));
+      result.add(value);
     }
     return result;
   }
 
   /// Reads a count-prefixed string array.
   List<String> readStringArray() {
-    final count = _readVarint();
-    if (count < 0) {
-      error = 'invalid array header at offset $_off';
-      return const [];
-    }
+    final count = readArrayCount();
     final result = <String>[];
     for (var i = 0; i < count; i++) {
       result.add(readString());
@@ -489,11 +502,7 @@ class LuxoDecoder {
 
   /// Reads a count-prefixed float64 array.
   List<double> readFloatArray() {
-    final count = _readVarint();
-    if (count < 0) {
-      error = 'invalid array header at offset $_off';
-      return const [];
-    }
+    final count = readArrayCount(8);
     final result = <double>[];
     for (var i = 0; i < count; i++) {
       result.add(readFloat());
@@ -504,26 +513,25 @@ class LuxoDecoder {
 
   /// Reads a count-prefixed bool array.
   List<bool> readBoolArray() {
-    final count = _readVarint();
-    if (count < 0) {
-      error = 'invalid array header at offset $_off';
-      return const [];
-    }
+    final count = readArrayCount();
     final result = <bool>[];
+    // Preflight guarantees one byte per item; validate every marker without
+    // repeating the scalar reader's cursor/error checks inside the array loop.
     for (var i = 0; i < count; i++) {
-      result.add(readBool());
-      if (error != null) return const [];
+      final offset = wireOffset++;
+      final marker = wireBytes[offset];
+      if (marker > 1) {
+        error = 'invalid bool marker at offset $offset';
+        return const [];
+      }
+      result.add(marker == 1);
     }
     return result;
   }
 
   /// Reads a count-prefixed UUID array (16-byte items → canonical strings).
   List<String> readUuidArray() {
-    final count = _readVarint();
-    if (count < 0) {
-      error = 'invalid array header at offset $_off';
-      return const [];
-    }
+    final count = readArrayCount(16);
     final result = <String>[];
     for (var i = 0; i < count; i++) {
       result.add(readUuid());
@@ -534,11 +542,7 @@ class LuxoDecoder {
 
   /// Reads a count-prefixed bytes array (length-prefixed items).
   List<Uint8List> readBytesArray() {
-    final count = _readVarint();
-    if (count < 0) {
-      error = 'invalid array header at offset $_off';
-      return const [];
-    }
+    final count = readArrayCount();
     final result = <Uint8List>[];
     for (var i = 0; i < count; i++) {
       result.add(readBytes());
@@ -548,40 +552,15 @@ class LuxoDecoder {
   }
 
   /// Current read offset.
-  int get offset => _off;
+  int get offset => wireOffset;
 
   // --- Internal ---
 
-  /// Reads unsigned varint (LEB128). Returns -1 on error.
-  int _readVarint() {
-    var v = 0;
-    var shift = 0;
-    while (_off < _data.lengthInBytes) {
-      final b = _bytes[_off++];
-      v |= (b & 0x7F) << shift;
-      if (b < 0x80) return v;
-      shift += 7;
-      if (shift >= 64) {
-        error = 'varint overflow at offset $_off';
-        return -1;
-      }
-    }
-    error = 'truncated varint at offset $_off';
-    return -1;
-  }
+  int _readVarint() => readUnsigned();
 
   /// Reads nullable flag byte. Returns true if value is present.
   bool _readNullableFlag() {
-    if (_off >= _data.lengthInBytes) {
-      error = 'invalid nullable at offset $_off';
-      return false;
-    }
-    final markerOffset = _off;
-    final marker = _bytes[_off++];
-    if (marker == 0x00) return false;
-    if (marker == 0x01) return true;
-    error = 'invalid nullable marker at offset $markerOffset';
-    return false;
+    return readCanonicalMarker('nullable');
   }
 
   /// Read a nullable nested model using a decoder function.
@@ -592,8 +571,13 @@ class LuxoDecoder {
 
   /// Read an array of items using a decoder function.
   List<T> readArray<T>(T Function() decode) {
-    final count = _readVarint();
-    return List.generate(count, (_) => decode());
+    final count = readArrayCount();
+    final result = <T>[];
+    for (var i = 0; i < count; i++) {
+      result.add(decode());
+      if (error != null) return const [];
+    }
+    return result;
   }
 }
 
@@ -608,10 +592,8 @@ class LuxoDecoder {
 /// ...
 /// [0x00]  // end marker
 /// ```
-class ColumnarDecoder {
+class ColumnarDecoder extends WireReader {
   final ByteData _data;
-  final Uint8List _bytes;
-  int _off;
 
   /// Number of rows in this columnar batch.
   int count;
@@ -622,26 +604,41 @@ class ColumnarDecoder {
   /// The current column's field ID after calling [nextColumn].
   int fieldID = 0;
 
-  /// Any decoding error encountered.
-  String? error;
-
   /// Creates a columnar decoder from raw bytes. Reads the row count varint.
   ColumnarDecoder(Uint8List data)
     : _data = ByteData.sublistView(data),
-      _bytes = data,
-      _off = 0,
       count = 0,
-      arenaSize = 0 {
-    final raw = _readVarint();
-    count = raw < 0 ? 0 : raw;
-    final arena = _readVarint();
-    arenaSize = arena < 0 ? 0 : arena;
+      arenaSize = 0,
+      super(data) {
+    count = readBoundedUnsigned(maxColumnarRecords, 'column count');
+    arenaSize = readBoundedUnsigned(maxArenaSize, 'arena size');
+    if (error == null && count > 0) {
+      if (count > data.length - wireOffset - 2) {
+        error = 'insufficient columnar element bytes';
+      } else {
+        final start = wireOffset;
+        var id = data[start];
+        if (id >= 0x80) {
+          id = _readVarint();
+          if (count > data.length - wireOffset - 1) {
+            error ??= 'insufficient columnar element bytes';
+          }
+          wireOffset = start;
+        }
+        if (id == 0 && error == null) {
+          error = 'nonempty list requires at least one column';
+        }
+      }
+    }
   }
 
-  /// Advances to the next column. Returns false at end marker (0x00) or EOF.
+  /// Advances to the next column. EOF without an end marker is an error.
   bool nextColumn() {
     if (error != null) return false;
-    if (_off >= _data.lengthInBytes) return false;
+    if (wireOffset >= _data.lengthInBytes) {
+      error = 'missing column end marker';
+      return false;
+    }
     final id = _readVarint();
     if (id < 0) return false;
     fieldID = id;
@@ -649,78 +646,80 @@ class ColumnarDecoder {
   }
 
   /// Reads [count] svarint values (zigzag-encoded int column).
-  List<int> readColumnInt() {
-    final result = List<int>.filled(count, 0);
+  List<LuxoInt64> readColumnInt() {
+    if (!requireBytes(count, 'int64 column')) return const [];
+    final result = List<LuxoInt64>.filled(count, LuxoInt64.zero);
     for (var i = 0; i < count; i++) {
-      if (_off >= _data.lengthInBytes) break;
       result[i] = _readSvarint();
+      if (error != null) break;
     }
     return result;
   }
 
-  /// Reads [count] DateTime values from an Int (svarint unix-seconds) column,
+  /// Reads [count] DateTime pairs,
   /// converting each to an ISO 8601 UTC string to match the JSON wire format.
   List<String> readColumnDateTime() {
+    if (!requireBytes(count * 2, 'datetime column')) return const [];
     final result = List<String>.filled(count, '');
     for (var i = 0; i < count; i++) {
-      if (_off >= _data.lengthInBytes) break;
-      result[i] = dateTimeStringFromUnixSeconds(_readSvarint());
+      result[i] = _readDateTime(this);
+      if (error != null) return const [];
     }
     return result;
   }
 
-  /// Reads [count] nullable DateTime values (0x00=null, 0x01+svarint seconds),
+  /// Reads [count] nullable DateTime pairs (0x00=null, 0x01+seconds+nanos),
   /// each non-null value converted to an ISO 8601 UTC string.
   List<String?> readColumnDateTimePtr() {
+    if (!requireBytes(count, 'nullable datetime column')) return const [];
     final result = List<String?>.filled(count, null);
     for (var i = 0; i < count; i++) {
-      if (!_readCanonicalMarker('nullable')) continue;
-      result[i] = dateTimeStringFromUnixSeconds(_readSvarint());
+      if (!readCanonicalMarker('nullable')) continue;
+      result[i] = _readDateTime(this);
+      if (error != null) return const [];
     }
     return result;
   }
 
   /// Reads [count] fixed64 float values.
   List<double> readColumnFloat() {
+    if (!requireBytes(count * 8, 'float column')) return const [];
     final result = List<double>.filled(count, 0.0);
     for (var i = 0; i < count; i++) {
-      if (_off + 8 > _data.lengthInBytes) break;
-      result[i] = _data.getFloat64(_off, Endian.little);
-      _off += 8;
+      result[i] = _data.getFloat64(wireOffset, Endian.little);
+      if (!acceptFloat(result[i])) return const [];
+      wireOffset += 8;
     }
     return result;
   }
 
   /// Reads [count] length-prefixed string values.
   List<String> readColumnString() {
+    if (!requireBytes(count, 'string column')) return const [];
     final result = List<String>.filled(count, '');
     for (var i = 0; i < count; i++) {
-      final len = _readVarint();
-      if (len <= 0) {
-        result[i] = '';
-        continue;
-      }
-      if (_off + len > _data.lengthInBytes) break;
-      result[i] = utf8.decode(Uint8List.sublistView(_bytes, _off, _off + len));
-      _off += len;
+      result[i] = readString();
+      if (error != null) return const [];
     }
     return result;
   }
 
-  /// Reads [count] boolean values (varint 0/1).
+  /// Reads [count] boolean values (canonical single-byte 0/1).
   List<bool> readColumnBool() {
+    if (!requireBytes(count, 'bool column')) return const [];
     final result = List<bool>.filled(count, false);
     for (var i = 0; i < count; i++) {
-      result[i] = _readCanonicalMarker('bool');
+      result[i] = readCanonicalMarker('bool');
     }
     return result;
   }
 
   /// Reads [count] nullable int values (0x00=null, 0x01+svarint).
-  List<int?> readColumnIntPtr() {
-    final result = List<int?>.filled(count, null);
+  List<LuxoInt64?> readColumnIntPtr() {
+    if (!requireBytes(count, 'nullable int64 column')) return const [];
+    final result = List<LuxoInt64?>.filled(count, null);
     for (var i = 0; i < count; i++) {
-      if (!_readCanonicalMarker('nullable')) continue;
+      if (!readCanonicalMarker('nullable')) continue;
       result[i] = _readSvarint();
     }
     return result;
@@ -728,62 +727,60 @@ class ColumnarDecoder {
 
   /// Reads [count] nullable float values (0x00=null, 0x01+fixed64).
   List<double?> readColumnFloatPtr() {
+    if (!requireBytes(count, 'nullable float column')) return const [];
     final result = List<double?>.filled(count, null);
     for (var i = 0; i < count; i++) {
-      if (!_readCanonicalMarker('nullable')) continue;
-      if (_off + 8 > _data.lengthInBytes) break;
-      result[i] = _data.getFloat64(_off, Endian.little);
-      _off += 8;
+      if (!readCanonicalMarker('nullable')) continue;
+      if (!requireBytes(8, 'float')) return const [];
+      result[i] = _data.getFloat64(wireOffset, Endian.little);
+      if (!acceptFloat(result[i]!)) return const [];
+      wireOffset += 8;
     }
     return result;
   }
 
   /// Reads [count] nullable string values (0x00=null, 0x01+string).
   List<String?> readColumnStringPtr() {
+    if (!requireBytes(count, 'nullable string column')) return const [];
     final result = List<String?>.filled(count, null);
     for (var i = 0; i < count; i++) {
-      if (!_readCanonicalMarker('nullable')) continue;
-      final len = _readVarint();
-      if (len <= 0) {
-        result[i] = '';
-        continue;
-      }
-      if (_off + len > _data.lengthInBytes) break;
-      result[i] = utf8.decode(Uint8List.sublistView(_bytes, _off, _off + len));
-      _off += len;
+      if (readCanonicalMarker('nullable')) result[i] = readString();
+      if (error != null) return const [];
     }
     return result;
   }
 
-  /// Reads [count] nullable boolean values (0x00=null, 0x01+varint).
+  /// Reads [count] nullable booleans (0x00=null, 0x01+single-byte bool).
   List<bool?> readColumnBoolPtr() {
+    if (!requireBytes(count, 'nullable bool column')) return const [];
     final result = List<bool?>.filled(count, null);
     for (var i = 0; i < count; i++) {
-      if (!_readCanonicalMarker('nullable')) continue;
-      result[i] = _readCanonicalMarker('bool');
+      if (!readCanonicalMarker('nullable')) continue;
+      result[i] = readCanonicalMarker('bool');
     }
     return result;
   }
 
   /// Reads [count] fixed 16-byte UUID values as canonical strings.
   List<String> readColumnUuid() {
+    if (!requireBytes(count * 16, 'uuid column')) return const [];
     final result = List<String>.filled(count, '');
     for (var i = 0; i < count; i++) {
-      if (_off + 16 > _data.lengthInBytes) break;
-      result[i] = formatUuid(_bytes, _off);
-      _off += 16;
+      result[i] = formatUuid(wireBytes, wireOffset);
+      wireOffset += 16;
     }
     return result;
   }
 
   /// Reads [count] nullable UUID values (0x00=null, 0x01+16 bytes).
   List<String?> readColumnUuidPtr() {
+    if (!requireBytes(count, 'nullable uuid column')) return const [];
     final result = List<String?>.filled(count, null);
     for (var i = 0; i < count; i++) {
-      if (!_readCanonicalMarker('nullable')) continue;
-      if (_off + 16 > _data.lengthInBytes) break;
-      result[i] = formatUuid(_bytes, _off);
-      _off += 16;
+      if (!readCanonicalMarker('nullable')) continue;
+      if (!requireBytes(16, 'uuid')) return const [];
+      result[i] = formatUuid(wireBytes, wireOffset);
+      wireOffset += 16;
     }
     return result;
   }
@@ -794,81 +791,135 @@ class ColumnarDecoder {
   /// a length-prefixed blob. For scalar arrays the blob holds an inline
   /// [count][items...] array, decoded with a fresh [LuxoDecoder].
   List<Uint8List> readColumnBytes() {
+    if (!requireBytes(count, 'bytes column')) return const [];
     final result = List<Uint8List>.filled(count, _emptyBytes, growable: false);
     for (var i = 0; i < count; i++) {
-      final len = _readVarint();
-      if (len < 0 || _off + len > _data.lengthInBytes) break;
-      result[i] = Uint8List.sublistView(_bytes, _off, _off + len);
-      _off += len;
+      final len = readLength('bytes');
+      if (len < 0) return const [];
+      result[i] = Uint8List.sublistView(
+        wireBytes,
+        wireOffset,
+        wireOffset + len,
+      );
+      wireOffset += len;
     }
     return result;
   }
 
   /// Reads [count] nullable byte blobs (0x00=null, 0x01+length+bytes).
   List<Uint8List?> readColumnBytesPtr() {
+    if (!requireBytes(count, 'nullable bytes column')) return const [];
     final result = List<Uint8List?>.filled(count, null, growable: false);
     for (var i = 0; i < count; i++) {
-      if (!_readCanonicalMarker('nullable')) continue;
-      final len = _readVarint();
-      if (len < 0 || _off + len > _data.lengthInBytes) break;
-      result[i] = Uint8List.sublistView(_bytes, _off, _off + len);
-      _off += len;
+      if (!readCanonicalMarker('nullable')) continue;
+      final len = readLength('bytes');
+      if (len < 0) return const [];
+      result[i] = Uint8List.sublistView(
+        wireBytes,
+        wireOffset,
+        wireOffset + len,
+      );
+      wireOffset += len;
     }
     return result;
   }
 
   /// Current read position (for reading pagination metadata after 0x00).
-  int get offset => _off;
+  int get offset => wireOffset;
 
   /// Reads one signed zigzag-encoded varint at current position.
-  int readSvarint() => _readSvarint();
+  LuxoInt64 readSvarint() => _readSvarint();
 
   // --- Internal ---
 
-  int _readSvarint() {
-    final uv = _readVarint();
-    return (uv >>> 1) ^ -(uv & 1);
-  }
+  LuxoInt64 _readSvarint() => int64wire.readWireInt64(this);
 
-  /// Reads unsigned varint (LEB128). Returns -1 on error.
-  int _readVarint() {
-    var v = 0;
-    var shift = 0;
-    while (_off < _data.lengthInBytes) {
-      final b = _bytes[_off++];
-      v |= (b & 0x7F) << shift;
-      if (b < 0x80) return v;
-      shift += 7;
-      if (shift >= 64) return -1;
-    }
-    return -1;
-  }
-
-  bool _readCanonicalMarker(String kind) {
-    if (_off >= _data.lengthInBytes) {
-      error ??= 'truncated $kind marker at offset $_off';
-      return false;
-    }
-    final markerOffset = _off;
-    final marker = _bytes[_off++];
-    if (marker == 0x00) return false;
-    if (marker == 0x01) return true;
-    error ??= 'invalid $kind marker at offset $markerOffset';
-    return false;
-  }
+  int _readVarint() => readUnsigned();
 }
 
 // --- DateTime helpers ---
 
-/// Converts a unix-seconds timestamp (as carried by the Luxo binary wire as
-/// svarint) to an ISO 8601 UTC string, matching the RFC3339 representation the
-/// JSON wire format uses. This keeps DateTime fields the same Dart type
-/// (String) regardless of transport mode.
-String dateTimeStringFromUnixSeconds(int seconds) =>
-    DateTime.fromMillisecondsSinceEpoch(
-      seconds * 1000,
-      isUtc: true,
-    ).toIso8601String();
+final _timestampPattern = RegExp(
+  r'^([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt]([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,9}))?([Zz]|[+-]([0-9]{2}):([0-9]{2}))$',
+);
+
+String _readDateTime(WireReader reader) {
+  if (reader.error != null) return '';
+  final seconds = int64wire.readWireInt64(reader);
+  final nanos = reader.readBoundedUnsigned(999999999, 'DateTime nanoseconds');
+  if (reader.error != null) return '';
+  return dateTimeStringFromParts(seconds.toInt(), nanos);
+}
+
+/// Keeps the fraction out of DateTime, whose Web representation is millisecond-based.
+({int seconds, int nanoseconds}) dateTimePartsFromString(String value) {
+  final parts = _timestampPattern.firstMatch(value);
+  if (parts == null || parts.end != value.length) {
+    throw const FormatException(
+      'DateTime requires RFC3339 with at most 9 fractional digits',
+    );
+  }
+  final year = int.parse(parts[1]!);
+  final month = int.parse(parts[2]!);
+  final day = int.parse(parts[3]!);
+  final leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+  final days = month == 2
+      ? (leap ? 29 : 28)
+      : (const [4, 6, 9, 11].contains(month) ? 30 : 31);
+  if (month < 1 ||
+      month > 12 ||
+      day < 1 ||
+      day > days ||
+      int.parse(parts[4]!) > 23 ||
+      int.parse(parts[5]!) > 59 ||
+      int.parse(parts[6]!) > 59 ||
+      int.parse(parts[9] ?? '0') > 23 ||
+      int.parse(parts[10] ?? '0') > 59) {
+    throw const FormatException('invalid DateTime calendar or offset');
+  }
+  final whole =
+      '${value.substring(0, 19).replaceFirst('t', 'T')}${parts[8]!.replaceFirst('z', 'Z')}';
+  final seconds = DateTime.parse(whole).millisecondsSinceEpoch ~/ 1000;
+  if (seconds < -62167219200 || seconds > 253402300799)
+    throw const FormatException('DateTime out of range');
+  final fraction = parts[7];
+  final nanos = fraction == null ? 0 : int.parse(fraction.padRight(9, '0'));
+  return (seconds: seconds, nanoseconds: nanos);
+}
+
+String dateTimeStringFromParts(int seconds, int nanoseconds) {
+  if (nanoseconds < 0 || nanoseconds >= 1000000000) {
+    throw const FormatException('invalid DateTime nanoseconds');
+  }
+  final whole = dateTimeStringFromUnixSeconds(seconds);
+  if (nanoseconds == 0) return whole;
+  var fraction = nanoseconds.toString().padLeft(9, '0');
+  var end = fraction.length;
+  while (fraction.codeUnitAt(end - 1) == 48) {
+    end--;
+  }
+  fraction = fraction.substring(0, end);
+  return '${whole.substring(0, whole.length - 1)}.${fraction}Z';
+}
+
+/// Extracts floor Unix seconds after validating the complete exact timestamp.
+/// This utility does not encode a complete DateTime wire value by itself.
+int dateTimeUnixSecondsFromString(String value) {
+  return dateTimePartsFromString(value).seconds;
+}
+
+/// Formats a whole-second timestamp. The wire reader uses
+/// [dateTimeStringFromParts] to preserve its separate nanosecond component.
+String dateTimeStringFromUnixSeconds(int seconds) {
+  if (seconds < -62167219200 || seconds > 253402300799)
+    throw RangeError.range(seconds, -62167219200, 253402300799, 'seconds');
+  final iso = DateTime.fromMillisecondsSinceEpoch(
+    seconds * 1000,
+    isUtc: true,
+  ).toIso8601String();
+  // This helper has no fraction; Go's RFC3339 JSON omits the .000 suffix.
+  return '${iso.substring(0, iso.length - 5)}Z';
+}
 
 // --- UUID helpers ---
 

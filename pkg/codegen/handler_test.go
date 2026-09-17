@@ -10,6 +10,29 @@ import (
 	"github.com/light-speak/luxo/pkg/token"
 )
 
+func TestNativeStreamNeverRegistersUnaryHandler(t *testing.T) {
+	stream := &ast.ApiDecl{
+		Name: "watch", ReturnType: &ast.TypeRef{Name: "Int"},
+		Directives: []*ast.Directive{{Name: "native"}, {Name: "stream"}},
+	}
+	result := buildResult(&ast.File{APIs: []*ast.ApiDecl{stream}})
+	var out strings.Builder
+	if names := generateNativeAPIHandlers(&out, result); len(names) != 0 || out.Len() != 0 {
+		t.Fatalf("native stream generated unary handler: %v\n%s", names, out.String())
+	}
+	if source := generateHandlerFile(result, "main", nil); source != nil {
+		t.Fatalf("stream-only service must not emit unary handlers:\n%s", source)
+	}
+	result.Files[0].APIs = append(result.Files[0].APIs, &ast.ApiDecl{
+		Name: "echo", ReturnType: &ast.TypeRef{Name: "Int"},
+		Directives: []*ast.Directive{{Name: "native"}},
+	})
+	source := string(generateHandlerFile(result, "main", nil))
+	if !strings.Contains(source, "handleEcho") || strings.Contains(source, "handleWatch") {
+		t.Fatalf("mixed native service must only register unary echo:\n%s", source)
+	}
+}
+
 func TestGenerateCRUDHandlersUseDeclaredPrimaryKey(t *testing.T) {
 	model := &ast.ModelDecl{
 		Name: "Product",
@@ -226,6 +249,9 @@ func TestGenerateBatchLoadHandlersUsesCanonicalListAndSelection(t *testing.T) {
 	}
 	if !strings.Contains(code, `fields := selectUserSQLColumns(req.Select)`) {
 		t.Errorf("batch handler must map the decoded recursive selection to SQL columns:\n%s", code)
+	}
+	if !strings.Contains(code, `app.DB.QueryRows(ctx, scanUser, query, args...)`) {
+		t.Errorf("batch handler must use the Go 1.27 generic database method and concrete scanner:\n%s", code)
 	}
 	if strings.Contains(code, `fieldMask := codec.SelectionMaskFields(req.FieldMask)`) {
 		t.Errorf("batch handler must not flatten the recursive selection before resolving relation keys:\n%s", code)
@@ -2199,6 +2225,48 @@ func TestWriteAPIRegistrationNoParams(t *testing.T) {
 	}
 }
 
+func TestWriteAPIRegistrationNamedEnums(t *testing.T) {
+	for _, name := range []string{"echoState", "svc:echoState"} {
+		generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+			APIs:          map[string]int{name: 5},
+			APIParams:     map[string]map[string]int{name: {"value": 1, "values": 2, "input": 3}},
+			APIParamTypes: map[string]map[string]string{"echoState": {"value": "State", "values": "[State]?", "input": "Input"}},
+		}})
+		var b strings.Builder
+		if strings.HasPrefix(name, "svc:") {
+			generator.generateRegisterServiceFns(&b, []string{"echoState"}, map[string]bool{"State": true})
+		} else {
+			generator.writeAPIRegistration(&b, name, map[string]bool{"State": true})
+		}
+		for _, want := range []string{
+			`Name: "value", Type: "Enum", TypeName: "State", FieldID: 1`,
+			`Name: "values", Type: "Enum", TypeName: "State", FieldID: 2, IsList: true, Nullable: true`,
+			`Name: "input", Type: "Model", TypeName: "Input", FieldID: 3`,
+		} {
+			if !strings.Contains(b.String(), want) {
+				t.Errorf("%s missing %s:\n%s", name, want, b.String())
+			}
+		}
+	}
+}
+
+func TestCompiledCRUDOverrideRegistersEnumMetadataOnce(t *testing.T) {
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+		APIs:          map[string]int{"getTask": 1},
+		APIParams:     map[string]map[string]int{"getTask": {"state": 1}},
+		APIParamTypes: map[string]map[string]string{"getTask": {"state": "State"}},
+	}})
+	model := &ast.ModelDecl{Name: "Task", Directives: []*ast.Directive{{Name: "crud"}}}
+	var output strings.Builder
+	generator.generateRegisterFuncWithInferred(&output, []*ast.ModelDecl{model}, []string{"getTask"}, nil, map[string]bool{"State": true})
+	if strings.Count(output.String(), `router.Handle("getTask",`) != 1 {
+		t.Fatalf("compiled CRUD override registered multiple times:\n%s", output.String())
+	}
+	if !strings.Contains(output.String(), `Name: "state", Type: "Enum", TypeName: "State", FieldID: 1`) {
+		t.Fatalf("compiled CRUD override lost enum metadata:\n%s", output.String())
+	}
+}
+
 // --- paramMethod ---
 
 func TestParamMethod(t *testing.T) {
@@ -2745,12 +2813,12 @@ func TestNativeAPIHandlerAdvancedScalarReturns(t *testing.T) {
 		name string
 		want string
 	}{
-		{"DateTime", "codec.AppendSvarint(req.Buf.B, result.Unix())"},
+		{"DateTime", "codec.AppendDateTime(req.Buf.B, result)"},
 		{"Duration", "codec.AppendSvarint(req.Buf.B, int64(result))"},
 		{"UUID", "codec.AppendUUID(req.Buf.B, result)"},
 		{"Decimal", "codec.AppendString(req.Buf.B, result.String())"},
 		{"Bytes", "codec.AppendBytes(req.Buf.B, result)"},
-		{"JSON", "codec.AppendBytes(req.Buf.B, result)"},
+		{"JSON", "codec.AppendJSON(req.Buf.B, result)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -2,25 +2,34 @@ package schema
 
 import (
 	"encoding/base64"
-	"encoding/json"
+	"errors"
+	"fmt"
 	"strconv"
 	"time"
 	"unicode/utf8"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
+	"github.com/light-speak/luxo/pkg/lux/jsonutil"
 )
+
+var errInvalidJSONPayload = errors.New("schema: invalid UTF-8 JSON payload")
 
 // BinaryToJSON converts a Luxo binary-encoded model to JSON using schema metadata.
 // No model struct needed — pure schema-driven conversion.
 // Returns the JSON bytes appended to dst.
-// schema is optional — needed for nested model/type resolution.
-func BinaryToJSON(dst []byte, data []byte, model *Model, schemas ...*Schema) []byte {
+// Schema is optional for flat values, but required for present nested values.
+func BinaryToJSON(dst []byte, data []byte, model *Model, schemas ...*Schema) ([]byte, error) {
 	dec := codec.NewDecoder(data)
-	return binaryToJSONFromDecoder(dst, dec, model, schemas...)
+	start := len(dst)
+	dst = binaryToJSONFromDecoder(dst, dec, model, schemas...)
+	if err := dec.Finish(); err != nil {
+		return dst[:start], err
+	}
+	return dst, nil
 }
 
 // binaryToJSONFromDecoder reads fields from a decoder and produces JSON.
-// Used by both top-level and nested model decoding (sharing the same decoder stream).
+// Used by top-level and independently framed nested model decoding.
 // Skips the arena header (totalStringLen varint) that WriteLuxo prepends.
 func binaryToJSONFromDecoder(dst []byte, dec *codec.Decoder, model *Model, schemas ...*Schema) []byte {
 	// Skip arena header — Binary→JSON doesn't use arena allocation
@@ -30,6 +39,7 @@ func binaryToJSONFromDecoder(dst []byte, dec *codec.Decoder, model *Model, schem
 	for dec.NextField() {
 		f := model.FieldByID(dec.FieldID())
 		if f == nil {
+			dec.Fail(fmt.Errorf("schema: unknown field %d in %s", dec.FieldID(), model.Name))
 			break
 		}
 		if !first {
@@ -38,9 +48,17 @@ func binaryToJSONFromDecoder(dst []byte, dec *codec.Decoder, model *Model, schem
 		first = false
 		dst = append(dst, f.JSONPrefix...)
 
-		// Nested model/type — recurse using same decoder
-		if f.Relation && len(schemas) > 0 && schemas[0] != nil {
-			dst = appendNestedModelJSON(dst, dec, f, schemas[0])
+		// Read one child frame; missing metadata must not fabricate null or [].
+		if f.Relation {
+			var nestedSchema *Schema
+			if len(schemas) > 0 {
+				nestedSchema = schemas[0]
+			}
+			var err error
+			dst, err = appendNestedModelJSON(dst, dec, f, nestedSchema)
+			if err != nil {
+				dec.Fail(err)
+			}
 		} else {
 			dst = appendFieldValueJSON(dst, dec, f)
 		}
@@ -49,54 +67,20 @@ func binaryToJSONFromDecoder(dst []byte, dec *codec.Decoder, model *Model, schem
 	return dst
 }
 
-// appendNestedModelJSON decodes an inline nested model/type from the same
-// decoder stream. Wire formats (matching WriteLuxo):
-//   - single:          [nested object]
-//   - nullable single: [present/null flag][nested object]
-//   - list:            [varint count][item1][item2]...
-func appendNestedModelJSON(dst []byte, dec *codec.Decoder, f *Field, s *Schema) []byte {
-	nested := s.Models[f.TypeName]
-	if nested == nil {
-		if td := s.Types[f.TypeName]; td != nil {
-			nested = td.AsModel()
-		}
+// appendNestedModelJSON reads one length-delimited child response. Nested
+// objects contain row bytes; nested lists contain columnar bytes. Nullable
+// children use one outer presence flag, including nullable relation lists.
+func appendNestedModelJSON(dst []byte, dec *codec.Decoder, f *Field, s *Schema) ([]byte, error) {
+	if f.Nullable && !dec.ReadBool() {
+		return append(dst, "null"...), dec.Err()
 	}
-	if nested == nil {
-		// Schema incomplete: we cannot skip nested fields without type info.
-		// This should never happen in practice since codegen ensures schema completeness.
-		// Drain the nested sub-message (terminated by 0x00) by consuming field IDs
-		// without reading values — this will exhaust the decoder.
-		for dec.NextField() {
-			// Cannot read field values without type info; decoder is now misaligned.
-			break
-		}
-		return append(dst, "null"...)
-	}
-	if f.IsList {
-		count := dec.ReadArrayLength()
-		dst = append(dst, '[')
-		for i := 0; i < count; i++ {
-			if i > 0 {
-				dst = append(dst, ',')
-			}
-			dst = binaryToJSONFromDecoder(dst, dec, nested, s)
-		}
-		return append(dst, ']')
-	}
-	if f.Nullable {
-		if !dec.ReadBool() { // present/null flag byte
-			return append(dst, "null"...)
-		}
-	}
-	// The nested model's fields are inline in the same byte stream,
-	// terminated by 0x00 (which NextField handles).
-	return binaryToJSONFromDecoder(dst, dec, nested, s)
+	return appendNestedColumnBlobJSON(dst, dec.ReadBytes(), f, s)
 }
 
 // BinaryListToJSON converts a columnar-encoded list of models to JSON.
 // Columnar format: [count][fieldID][val0..valN][fieldID][val0..valN]...[0x00]
 // Optional schema enables federation blob column expansion.
-func BinaryListToJSON(dst []byte, data []byte, model *Model, schemas ...*Schema) []byte {
+func BinaryListToJSON(dst []byte, data []byte, model *Model, schemas ...*Schema) ([]byte, error) {
 	return columnarToJSON(dst, data, model, schemas...)
 }
 
@@ -105,6 +89,8 @@ type typedColumn struct {
 	field     *Field
 	ints      []int64
 	intPtrs   []*int64
+	times     []time.Time
+	timePtrs  []*time.Time
 	floats    []float64
 	floatPtrs []*float64
 	strings   []string
@@ -119,45 +105,73 @@ type typedColumn struct {
 
 // columnarToJSON decodes columnar binary to JSON array.
 // Uses typed column slices instead of map[string]any per record — zero map allocation.
-func columnarToJSON(dst []byte, data []byte, model *Model, schemas ...*Schema) []byte {
-	r := codec.NewColumnarReader(data)
-	count := r.Count()
-	if count == 0 {
-		return append(dst, '[', ']')
+func columnarToJSON(dst []byte, data []byte, model *Model, schemas ...*Schema) ([]byte, error) {
+	r, columns, err := readJSONColumns(data, model)
+	if err != nil {
+		return dst, err
 	}
-	columns := make([]typedColumn, 0, len(model.Fields))
+	if r.Offset() != len(data) {
+		return dst, fmt.Errorf("schema: trailing columnar data")
+	}
+	return appendJSONRows(dst, r.Count(), columns, schemas...)
+}
 
-	for r.NextColumn() {
+// readJSONColumns is shared by ordinary lists and paginated lists. It validates
+// the decoder before any typed column is indexed by the JSON writer.
+func readJSONColumns(data []byte, model *Model) (*codec.ColumnarReader, []typedColumn, error) {
+	r := codec.NewColumnarReader(data)
+	if err := r.Err(); err != nil {
+		return r, nil, err
+	}
+	var columns []typedColumn
+	if r.Count() > 0 {
+		columns = make([]typedColumn, 0, len(model.Fields))
+	}
+	for {
+		before := r.Offset()
+		if !r.NextColumn() {
+			if r.Offset() <= before || data[r.Offset()-1] != 0 {
+				return r, nil, fmt.Errorf("schema: missing columnar end marker")
+			}
+			break
+		}
 		f := model.FieldByID(r.FieldID())
 		if f == nil {
-			break
+			return r, nil, fmt.Errorf("schema: unknown column %d in %s", r.FieldID(), model.Name)
 		}
 		col := typedColumn{field: f}
 		readColumn(r, f, &col)
+		if err := r.Err(); err != nil {
+			return r, nil, err
+		}
 		columns = append(columns, col)
 	}
+	return r, columns, nil
+}
 
-	// Write JSON array — iterate records, for each record iterate columns
+func appendJSONRows(dst []byte, count int, columns []typedColumn, schemas ...*Schema) ([]byte, error) {
+	start := len(dst)
 	dst = append(dst, '[')
 	for i := 0; i < count; i++ {
 		if i > 0 {
 			dst = append(dst, ',')
 		}
 		dst = append(dst, '{')
-		first := true
 		for ci := range columns {
-			col := &columns[ci]
-			if !first {
+			if ci > 0 {
 				dst = append(dst, ',')
 			}
-			first = false
+			col := &columns[ci]
 			dst = append(dst, col.field.JSONPrefix...)
-			dst = appendColumnValueJSON(dst, col, i, schemas...)
+			var err error
+			dst, err = appendColumnValueJSON(dst, col, i, schemas...)
+			if err != nil {
+				return dst[:start], err
+			}
 		}
 		dst = append(dst, '}')
 	}
-	dst = append(dst, ']')
-	return dst
+	return append(dst, ']'), nil
 }
 
 // readColumn reads a column's values into a typedColumn using the field's type info.
@@ -165,11 +179,21 @@ func readColumn(r *codec.ColumnarReader, f *Field, col *typedColumn) {
 	// List columns (scalar arrays and relation lists) are Bytes columns: each
 	// cell holds an inline [count][items...] array or a nested-model blob.
 	if f.IsList {
-		col.blobs = r.ReadColumnBytes()
+		if f.Nullable {
+			col.blobPtrs = r.ReadColumnBytesPtr()
+		} else {
+			col.blobs = r.ReadColumnBytes()
+		}
 		return
 	}
 	switch f.Type {
-	case FieldInt, FieldDateTime, FieldDuration:
+	case FieldDateTime:
+		if f.Nullable {
+			col.timePtrs = r.ReadColumnDateTimePtr()
+		} else {
+			col.times = r.ReadColumnDateTime()
+		}
+	case FieldInt, FieldDuration:
 		if f.Nullable {
 			col.intPtrs = r.ReadColumnIntPtr()
 		} else {
@@ -215,269 +239,152 @@ func readColumn(r *codec.ColumnarReader, f *Field, col *typedColumn) {
 }
 
 // appendColumnValueJSON appends the JSON value for record i from a typed column.
-func appendColumnValueJSON(dst []byte, col *typedColumn, i int, schemas ...*Schema) []byte {
+func appendColumnValueJSON(dst []byte, col *typedColumn, i int, schemas ...*Schema) ([]byte, error) {
 	f := col.field
 	switch {
 	case col.ints != nil:
-		if f.Type == FieldDateTime {
-			dst = append(dst, '"')
-			dst = time.Unix(col.ints[i], 0).UTC().AppendFormat(dst, time.RFC3339Nano)
-			dst = append(dst, '"')
-			return dst
-		}
-		return strconv.AppendInt(dst, col.ints[i], 10)
+		return strconv.AppendInt(dst, col.ints[i], 10), nil
 	case col.intPtrs != nil:
 		if col.intPtrs[i] == nil {
-			return append(dst, "null"...)
+			return append(dst, "null"...), nil
 		}
-		if f.Type == FieldDateTime {
-			dst = append(dst, '"')
-			dst = time.Unix(*col.intPtrs[i], 0).UTC().AppendFormat(dst, time.RFC3339Nano)
-			dst = append(dst, '"')
-			return dst
+		return strconv.AppendInt(dst, *col.intPtrs[i], 10), nil
+	case col.times != nil:
+		return appendDateTimeJSON(dst, col.times[i]), nil
+	case col.timePtrs != nil:
+		if col.timePtrs[i] == nil {
+			return append(dst, "null"...), nil
 		}
-		return strconv.AppendInt(dst, *col.intPtrs[i], 10)
+		return appendDateTimeJSON(dst, *col.timePtrs[i]), nil
 	case col.floats != nil:
-		return strconv.AppendFloat(dst, col.floats[i], 'f', -1, 64)
+		return strconv.AppendFloat(dst, col.floats[i], 'f', -1, 64), nil
 	case col.floatPtrs != nil:
 		if col.floatPtrs[i] == nil {
-			return append(dst, "null"...)
+			return append(dst, "null"...), nil
 		}
-		return strconv.AppendFloat(dst, *col.floatPtrs[i], 'f', -1, 64)
+		return strconv.AppendFloat(dst, *col.floatPtrs[i], 'f', -1, 64), nil
 	case col.strings != nil:
-		return appendJSONString(dst, col.strings[i])
+		return appendJSONString(dst, col.strings[i]), nil
 	case col.strPtrs != nil:
 		if col.strPtrs[i] == nil {
-			return append(dst, "null"...)
+			return append(dst, "null"...), nil
 		}
-		return appendJSONString(dst, *col.strPtrs[i])
+		return appendJSONString(dst, *col.strPtrs[i]), nil
 	case col.bools != nil:
 		if col.bools[i] {
-			return append(dst, "true"...)
+			return append(dst, "true"...), nil
 		}
-		return append(dst, "false"...)
+		return append(dst, "false"...), nil
 	case col.boolPtrs != nil:
 		if col.boolPtrs[i] == nil {
-			return append(dst, "null"...)
+			return append(dst, "null"...), nil
 		}
 		if *col.boolPtrs[i] {
-			return append(dst, "true"...)
+			return append(dst, "true"...), nil
 		}
-		return append(dst, "false"...)
+		return append(dst, "false"...), nil
 	case col.uuids != nil:
-		return appendUUIDString(dst, col.uuids[i])
+		return appendUUIDString(dst, col.uuids[i]), nil
 	case col.uuidPtrs != nil:
 		if col.uuidPtrs[i] == nil {
-			return append(dst, "null"...)
+			return append(dst, "null"...), nil
 		}
-		return appendUUIDString(dst, *col.uuidPtrs[i])
+		return appendUUIDString(dst, *col.uuidPtrs[i]), nil
 	case col.blobs != nil:
-		return appendColumnBlobJSON(dst, col, i, schemas...)
+		return appendColumnBlobValueJSON(dst, col.blobs[i], f, schemas...)
 	case col.blobPtrs != nil:
 		if col.blobPtrs[i] == nil {
-			return append(dst, "null"...)
+			return append(dst, "null"...), nil
 		}
-		if f.Type == FieldModel {
-			return appendNestedColumnBlobJSON(dst, *col.blobPtrs[i], f, schemas...)
-		}
-		return appendBinaryBlobJSON(dst, *col.blobPtrs[i], f)
+		return appendColumnBlobValueJSON(dst, *col.blobPtrs[i], f, schemas...)
 	default:
-		return append(dst, "null"...)
+		return append(dst, "null"...), nil
 	}
 }
 
-// appendColumnBlobJSON decodes a Bytes-column cell: either a scalar array field
+// appendColumnBlobValueJSON decodes a Bytes-column cell: either a scalar array field
 // ([count][items...]) or a federation extend blob (nested model / list binary).
-func appendColumnBlobJSON(dst []byte, col *typedColumn, i int, schemas ...*Schema) []byte {
-	f := col.field
-	blob := col.blobs[i]
+func appendColumnBlobValueJSON(dst, blob []byte, f *Field, schemas ...*Schema) ([]byte, error) {
 	// Scalar array field: each cell is an inline [count][items...] array.
 	if f.IsList && f.Type != FieldModel {
-		return appendArrayFieldJSON(dst, codec.NewDecoder(blob), f)
+		dec := codec.NewDecoder(blob)
+		start := len(dst)
+		dst = appendArrayFieldJSON(dst, dec, f)
+		if err := dec.Finish(); err != nil {
+			return dst[:start], err
+		}
+		return dst, nil
 	}
 	if f.Type != FieldModel {
-		return appendBinaryBlobJSON(dst, blob, f)
+		if f.Type == FieldJSON {
+			return appendRawJSON(dst, blob)
+		}
+		return appendBase64JSON(dst, blob), nil
 	}
 	return appendNestedColumnBlobJSON(dst, blob, f, schemas...)
 }
 
-func appendNestedColumnBlobJSON(dst, blob []byte, f *Field, schemas ...*Schema) []byte {
-	if len(blob) == 0 {
-		if f.IsList {
-			return append(dst, "[]"...)
-		}
-		return append(dst, "null"...)
+func appendNestedColumnBlobJSON(dst, blob []byte, f *Field, schemas ...*Schema) ([]byte, error) {
+	if len(schemas) == 0 || schemas[0] == nil {
+		return dst, fmt.Errorf("schema: nested type %q for field %q requires schema", f.TypeName, f.Name)
 	}
-	if len(schemas) > 0 && schemas[0] != nil {
-		nested := schemas[0].Models[f.TypeName]
-		if nested == nil {
-			// Type declarations (non-DB types like MetricPoint) live in Types
-			if td := schemas[0].Types[f.TypeName]; td != nil {
-				nested = td.AsModel()
-			}
-		}
-		if nested != nil {
-			if f.IsList {
-				return BinaryListToJSON(dst, blob, nested, schemas[0])
-			}
-			return BinaryToJSON(dst, blob, nested, schemas[0])
-		}
+	nested := schemas[0].LookupModel(f.TypeName)
+	if nested == nil {
+		return dst, fmt.Errorf("schema: nested type %q for field %q is not registered", f.TypeName, f.Name)
 	}
 	if f.IsList {
-		return append(dst, "[]"...)
+		return BinaryListToJSON(dst, blob, nested, schemas[0])
 	}
-	return append(dst, "null"...)
+	return BinaryToJSON(dst, blob, nested, schemas[0])
 }
 
-func appendBinaryBlobJSON(dst, blob []byte, f *Field) []byte {
-	if f.Type == FieldJSON {
-		if json.Valid(blob) {
-			return append(dst, blob...)
-		}
-		return append(dst, "null"...)
+func appendRawJSON(dst, raw []byte) ([]byte, error) {
+	if !jsonutil.ValidUTF8JSON(raw) {
+		return dst, errInvalidJSONPayload
 	}
+	return append(dst, raw...), nil
+}
+
+func appendDecodedJSON(dst, raw []byte, dec *codec.Decoder) []byte {
+	dst, err := appendRawJSON(dst, raw)
+	if err != nil {
+		dec.Fail(err)
+	}
+	return dst
+}
+
+func appendBase64JSON(dst, blob []byte) []byte {
 	dst = append(dst, '"')
 	dst = append(dst, base64.StdEncoding.EncodeToString(blob)...)
 	return append(dst, '"')
 }
 
-func appendAnyJSON(dst []byte, v any, f *Field) []byte {
-	if v == nil {
-		return append(dst, "null"...)
-	}
-	switch val := v.(type) {
-	case int64:
-		if f.Type == FieldDateTime {
-			dst = append(dst, '"')
-			dst = time.Unix(val, 0).UTC().AppendFormat(dst, time.RFC3339Nano)
-			dst = append(dst, '"')
-			return dst
-		}
-		return strconv.AppendInt(dst, val, 10)
-	case *int64:
-		if val == nil {
-			return append(dst, "null"...)
-		}
-		return strconv.AppendInt(dst, *val, 10)
-	case float64:
-		return strconv.AppendFloat(dst, val, 'f', -1, 64)
-	case string:
-		return appendJSONString(dst, val)
-	case *string:
-		if val == nil {
-			return append(dst, "null"...)
-		}
-		return appendJSONString(dst, *val)
-	case bool:
-		if val {
-			return append(dst, "true"...)
-		}
-		return append(dst, "false"...)
-	default:
-		return append(dst, "null"...)
-	}
-}
-
 // BinaryPaginatedListToJSON converts a paginated columnar list response to JSON.
 // Binary format: [columnar data: count+columns+0x00][total svarint][page svarint][pageSize svarint]
 // JSON format: {"items":[...],"total":N,"page":N,"pageSize":N}
-func BinaryPaginatedListToJSON(dst []byte, data []byte, model *Model, schemas ...*Schema) []byte {
-	r := codec.NewColumnarReader(data)
-	count := r.Count()
-	if count == 0 {
-		// Still read pagination metadata from after the end marker.
-		// When count=0, NextColumn is never called, so skip the 0x00 end marker manually.
-		off := r.Offset()
-		if off < len(data) && data[off] == 0x00 {
-			off++
-		}
-		dst = append(dst, `{"items":[]`...)
-		remaining := data[off:]
-		roff := 0
-		if total, tn := codec.ReadSvarint(remaining, roff); tn > 0 {
-			roff += tn
-			dst = append(dst, `,"total":`...)
-			dst = strconv.AppendInt(dst, total, 10)
-		} else {
-			dst = append(dst, `,"total":0`...)
-		}
-		if page, pn := codec.ReadSvarint(remaining, roff); pn > 0 {
-			roff += pn
-			dst = append(dst, `,"page":`...)
-			dst = strconv.AppendInt(dst, page, 10)
-		} else {
-			dst = append(dst, `,"page":1`...)
-		}
-		if pageSize, psn := codec.ReadSvarint(remaining, roff); psn > 0 {
-			dst = append(dst, `,"pageSize":`...)
-			dst = strconv.AppendInt(dst, pageSize, 10)
-		} else {
-			dst = append(dst, `,"pageSize":20`...)
-		}
-		return append(dst, '}')
+func BinaryPaginatedListToJSON(dst []byte, data []byte, model *Model, schemas ...*Schema) ([]byte, error) {
+	r, columns, err := readJSONColumns(data, model)
+	if err != nil {
+		return dst, err
 	}
-
-	// Read columns into typed slices (zero map allocation)
-	columns := make([]typedColumn, 0, len(model.Fields))
-	for r.NextColumn() {
-		f := model.FieldByID(r.FieldID())
-		if f == nil {
-			break
-		}
-		col := typedColumn{field: f}
-		readColumn(r, f, &col)
-		columns = append(columns, col)
+	metadata := codec.NewDecoder(data[r.Offset():])
+	total, page, pageSize := metadata.ReadInt(), metadata.ReadInt(), metadata.ReadInt()
+	if err := metadata.Finish(); err != nil {
+		return dst, err
 	}
-
-	// Write JSON items
-	dst = append(dst, `{"items":[`...)
-	for i := 0; i < count; i++ {
-		if i > 0 {
-			dst = append(dst, ',')
-		}
-		dst = append(dst, '{')
-		first := true
-		for ci := range columns {
-			col := &columns[ci]
-			if !first {
-				dst = append(dst, ',')
-			}
-			first = false
-			dst = append(dst, col.field.JSONPrefix...)
-			dst = appendColumnValueJSON(dst, col, i, schemas...)
-		}
-		dst = append(dst, '}')
+	start := len(dst)
+	dst = append(dst, `{"items":`...)
+	dst, err = appendJSONRows(dst, r.Count(), columns, schemas...)
+	if err != nil {
+		return dst[:start], err
 	}
-	dst = append(dst, ']')
-
-	// Read pagination metadata after columnar data
-	// ColumnarReader.Offset() points past the 0x00 end marker
-	remaining := data[r.Offset():]
-	roff := 0
-
-	total, tn := codec.ReadSvarint(remaining, roff)
-	if tn > 0 {
-		roff += tn
-		dst = append(dst, `,"total":`...)
-		dst = strconv.AppendInt(dst, total, 10)
-	}
-
-	page, pn := codec.ReadSvarint(remaining, roff)
-	if pn > 0 {
-		roff += pn
-		dst = append(dst, `,"page":`...)
-		dst = strconv.AppendInt(dst, page, 10)
-	}
-
-	pageSize, psn := codec.ReadSvarint(remaining, roff)
-	if psn > 0 {
-		dst = append(dst, `,"pageSize":`...)
-		dst = strconv.AppendInt(dst, pageSize, 10)
-	}
-	_ = psn
-
-	dst = append(dst, '}')
-	return dst
+	dst = append(dst, `,"total":`...)
+	dst = strconv.AppendInt(dst, total, 10)
+	dst = append(dst, `,"page":`...)
+	dst = strconv.AppendInt(dst, page, 10)
+	dst = append(dst, `,"pageSize":`...)
+	dst = strconv.AppendInt(dst, pageSize, 10)
+	return append(dst, '}'), nil
 }
 
 // appendArrayFieldJSON decodes a scalar array field ([count][items...]) and
@@ -486,9 +393,9 @@ func BinaryPaginatedListToJSON(dst []byte, data []byte, model *Model, schemas ..
 func appendArrayFieldJSON(dst []byte, dec *codec.Decoder, f *Field) []byte {
 	switch f.Type {
 	case FieldInt, FieldDuration:
-		return appendIntArrayJSON(dst, dec.ReadIntArray(), false)
+		return appendIntArrayJSON(dst, dec.ReadIntArray())
 	case FieldDateTime:
-		return appendIntArrayJSON(dst, dec.ReadIntArray(), true)
+		return appendDateTimeArrayJSON(dst, dec.ReadDateTimeArray())
 	case FieldFloat:
 		return appendFloatArrayJSON(dst, dec.ReadFloatArray())
 	case FieldString, FieldEnum, FieldDecimal:
@@ -506,26 +413,42 @@ func appendArrayFieldJSON(dst []byte, dec *codec.Decoder, f *Field) []byte {
 			if i > 0 {
 				dst = append(dst, ',')
 			}
-			dst = appendBinaryBlobJSON(dst, raw, f)
+			var err error
+			dst, err = appendRawJSON(dst, raw)
+			if err != nil {
+				dec.Fail(err)
+				return dst
+			}
 		}
 		return append(dst, ']')
 	}
 	return append(dst, '[', ']')
 }
 
-func appendIntArrayJSON(dst []byte, vs []int64, asTime bool) []byte {
+func appendIntArrayJSON(dst []byte, vs []int64) []byte {
 	dst = append(dst, '[')
 	for i, v := range vs {
 		if i > 0 {
 			dst = append(dst, ',')
 		}
-		if asTime {
-			dst = append(dst, '"')
-			dst = time.Unix(v, 0).UTC().AppendFormat(dst, time.RFC3339Nano)
-			dst = append(dst, '"')
-		} else {
-			dst = strconv.AppendInt(dst, v, 10)
+		dst = strconv.AppendInt(dst, v, 10)
+	}
+	return append(dst, ']')
+}
+
+func appendDateTimeJSON(dst []byte, value time.Time) []byte {
+	dst = append(dst, '"')
+	dst = value.UTC().AppendFormat(dst, time.RFC3339Nano)
+	return append(dst, '"')
+}
+
+func appendDateTimeArrayJSON(dst []byte, values []time.Time) []byte {
+	dst = append(dst, '[')
+	for i, value := range values {
+		if i > 0 {
+			dst = append(dst, ',')
 		}
+		dst = appendDateTimeJSON(dst, value)
 	}
 	return append(dst, ']')
 }
@@ -594,6 +517,9 @@ func appendBytesArrayJSON(dst []byte, vs [][]byte) []byte {
 // appendFieldValueJSON reads the next value from decoder and appends as JSON.
 func appendFieldValueJSON(dst []byte, dec *codec.Decoder, f *Field) []byte {
 	if f.IsList {
+		if f.Nullable && !dec.ReadBool() {
+			return append(dst, "null"...)
+		}
 		return appendArrayFieldJSON(dst, dec, f)
 	}
 	if f.Nullable {
@@ -616,12 +542,7 @@ func appendFieldValueJSON(dst []byte, dec *codec.Decoder, f *Field) []byte {
 		}
 		return append(dst, "false"...)
 	case FieldDateTime:
-		v := dec.ReadInt()
-		t := time.Unix(v, 0).UTC()
-		dst = append(dst, '"')
-		dst = t.AppendFormat(dst, time.RFC3339Nano)
-		dst = append(dst, '"')
-		return dst
+		return appendDateTimeJSON(dst, dec.ReadDateTime())
 	case FieldDuration:
 		v := dec.ReadInt()
 		return strconv.AppendInt(dst, v, 10)
@@ -637,7 +558,7 @@ func appendFieldValueJSON(dst []byte, dec *codec.Decoder, f *Field) []byte {
 		dst = append(dst, '"')
 		return dst
 	case FieldJSON:
-		return appendBinaryBlobJSON(dst, dec.ReadBytes(), f)
+		return appendDecodedJSON(dst, dec.ReadBytes(), dec)
 	default:
 		return append(dst, "null"...)
 	}
@@ -674,15 +595,11 @@ func appendNullableFieldJSON(dst []byte, dec *codec.Decoder, f *Field) []byte {
 		}
 		return append(dst, "false"...)
 	case FieldDateTime:
-		v := dec.ReadIntPtr()
+		v := dec.ReadDateTimePtr()
 		if v == nil {
 			return append(dst, "null"...)
 		}
-		t := time.Unix(*v, 0).UTC()
-		dst = append(dst, '"')
-		dst = t.AppendFormat(dst, time.RFC3339Nano)
-		dst = append(dst, '"')
-		return dst
+		return appendDateTimeJSON(dst, *v)
 	case FieldDuration:
 		v := dec.ReadIntPtr()
 		if v == nil {
@@ -709,7 +626,7 @@ func appendNullableFieldJSON(dst []byte, dec *codec.Decoder, f *Field) []byte {
 		if raw == nil {
 			return append(dst, "null"...)
 		}
-		return appendBinaryBlobJSON(dst, raw, f)
+		return appendDecodedJSON(dst, raw, dec)
 	default:
 		return append(dst, "null"...)
 	}
@@ -717,70 +634,22 @@ func appendNullableFieldJSON(dst []byte, dec *codec.Decoder, f *Field) []byte {
 
 // BinaryScalarToJSON converts a single scalar binary value to JSON.
 // Uses the declared return type for precise decoding — no guessing.
-func BinaryScalarToJSON(dst []byte, data []byte, typeName string) []byte {
-	if len(data) == 0 {
-		return append(dst, "null"...)
+func BinaryScalarToJSON(dst []byte, data []byte, typeName string) ([]byte, error) {
+	if len(data) == 0 && typeName == "" {
+		return append(dst, "null"...), nil
 	}
-	switch typeName {
-	case "Int", "Duration", "":
-		v, n := codec.ReadSvarint(data, 0)
-		if n > 0 {
-			return strconv.AppendInt(dst, v, 10)
-		}
-	case "Float":
-		v, n := codec.ReadFixed64(data, 0)
-		if n > 0 {
-			return strconv.AppendFloat(dst, v, 'f', -1, 64)
-		}
-	case "Boolean":
-		v, n := codec.ReadBool(data, 0)
-		if n > 0 {
-			if v {
-				return append(dst, "true"...)
-			}
-			return append(dst, "false"...)
-		}
-	case "UUID":
-		if len(data) >= 16 {
-			var u [16]byte
-			copy(u[:], data[:16])
-			return appendUUIDString(dst, u)
-		}
-	case "Bytes":
-		raw, n := codec.ReadBytes(data, 0)
-		if n > 0 {
-			return appendBinaryBlobJSON(dst, raw, &Field{Type: FieldBytes})
-		}
-	case "JSON":
-		raw, n := codec.ReadBytes(data, 0)
-		if n > 0 {
-			return appendBinaryBlobJSON(dst, raw, &Field{Type: FieldJSON})
-		}
-	case "DateTime":
-		v, n := codec.ReadSvarint(data, 0)
-		if n > 0 {
-			t := time.Unix(v, 0).UTC()
-			dst = append(dst, '"')
-			dst = t.AppendFormat(dst, time.RFC3339Nano)
-			return append(dst, '"')
-		}
-	case "String", "Decimal":
-		v, n := codec.ReadString(data, 0)
-		if n > 0 {
-			return appendJSONString(dst, v)
-		}
+	start := len(dst)
+	dec := codec.NewDecoder(data)
+	dst = appendScalarValueJSON(dst, dec, typeName)
+	if err := dec.Finish(); err != nil {
+		return dst[:start], err
 	}
-	// Fallback: try svarint
-	v, n := codec.ReadSvarint(data, 0)
-	if n > 0 {
-		return strconv.AppendInt(dst, v, 10)
-	}
-	return append(dst, "null"...)
+	return dst, nil
 }
 
 // BinaryScalarListToJSON converts a canonical count-prefixed list of scalar
 // values. Enum callers pass String because enums share the string wire type.
-func BinaryScalarListToJSON(dst []byte, data []byte, typeName string) []byte {
+func BinaryScalarListToJSON(dst []byte, data []byte, typeName string) ([]byte, error) {
 	start := len(dst)
 	dec := codec.NewDecoder(data)
 	count := dec.ReadArrayLength()
@@ -791,10 +660,10 @@ func BinaryScalarListToJSON(dst []byte, data []byte, typeName string) []byte {
 		}
 		dst = appendScalarValueJSON(dst, dec, typeName)
 	}
-	if dec.Err() != nil {
-		return append(dst[:start], "null"...)
+	if err := dec.Finish(); err != nil {
+		return dst[:start], err
 	}
-	return append(dst, ']')
+	return append(dst, ']'), nil
 }
 
 func appendScalarValueJSON(dst []byte, dec *codec.Decoder, typeName string) []byte {
@@ -809,20 +678,17 @@ func appendScalarValueJSON(dst []byte, dec *codec.Decoder, typeName string) []by
 		}
 		return append(dst, "false"...)
 	case "DateTime":
-		t := time.Unix(dec.ReadInt(), 0).UTC()
-		dst = append(dst, '"')
-		dst = t.AppendFormat(dst, time.RFC3339Nano)
-		return append(dst, '"')
+		return appendDateTimeJSON(dst, dec.ReadDateTime())
 	case "UUID":
 		return appendUUIDString(dst, dec.ReadUUID())
 	case "Bytes":
-		return appendBinaryBlobJSON(dst, dec.ReadBytes(), &Field{Type: FieldBytes})
+		return appendBase64JSON(dst, dec.ReadBytes())
 	case "JSON":
-		return appendBinaryBlobJSON(dst, dec.ReadBytes(), &Field{Type: FieldJSON})
+		return appendDecodedJSON(dst, dec.ReadBytes(), dec)
 	case "String", "Decimal":
 		return appendJSONString(dst, dec.ReadString())
 	default:
-		dec.SkipField()
+		dec.Fail(fmt.Errorf("schema: unsupported scalar type %q", typeName))
 		return dst
 	}
 }

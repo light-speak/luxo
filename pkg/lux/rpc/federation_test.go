@@ -1,173 +1,86 @@
 package rpc
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"slices"
 	"testing"
-	"time"
 
+	"github.com/light-speak/luxo/internal/testutil"
 	"github.com/light-speak/luxo/pkg/lux/api"
 	"github.com/light-speak/luxo/pkg/lux/codec"
 )
 
-// encodePost builds a binary-encoded Post model for testing.
-func encodePost(id, userID int64, title string) []byte {
-	var buf []byte
-	buf = codec.AppendVarint(buf, 0) // arena header
-	buf = codec.AppendVarint(buf, 1) // field 1 = id
-	buf = codec.AppendSvarint(buf, id)
-	buf = codec.AppendVarint(buf, 2) // field 2 = title
-	buf = codec.AppendString(buf, title)
-	buf = codec.AppendVarint(buf, 3) // field 3 = userId
-	buf = codec.AppendSvarint(buf, userID)
-	buf = append(buf, 0x00) // end
-	return buf
-}
-
-// --- Test: End-to-End RPC BatchLoad ---
-
-// TestFederation_RPCBatchLoad tests the full RPC batch load flow:
-// 1. Start an in-process RPC server with a batch load handler
-// 2. Create an RPC client
-// 3. Call the batch load endpoint with a set of keys
-// 4. Verify the response contains correct models
-// 5. Verify binary encoding/decoding roundtrips
+// TestFederation_RPCBatchLoad sends explicit keys/shape and canonical columnar
+// groups through real TCP RPC. This tests transport, not database execution.
 func TestFederation_RPCBatchLoad(t *testing.T) {
 	rt := api.NewRouter()
-
-	// Register a "svc:resolve:Post:userId" handler that simulates batch loading.
-	// It receives user IDs as a param and returns a grouped response:
-	// [key_count varint] per-key: [item_count varint] [len-prefixed items...]
-	rt.Handle("svc:resolve:Post:userId", func(ctx context.Context, req *api.Request) error {
-		// In a real system, params would contain the FK keys.
-		// For this test, we simulate returning posts for 3 users: IDs 10, 20, 30.
-		// User 10: 2 posts, User 20: 0 posts, User 30: 1 post
-		buf := req.Buf
-
-		// key_count = 3
-		buf.B = codec.AppendVarint(buf.B, 3)
-
-		// Key 0 (user 10): 2 posts
-		buf.B = codec.AppendVarint(buf.B, 2)
-		buf.B = codec.AppendBytes(buf.B, encodePost(101, 10, "Post A"))
-		buf.B = codec.AppendBytes(buf.B, encodePost(102, 10, "Post B"))
-
-		// Key 1 (user 20): 0 posts
-		buf.B = codec.AppendVarint(buf.B, 0)
-
-		// Key 2 (user 30): 1 post
-		buf.B = codec.AppendVarint(buf.B, 1)
-		buf.B = codec.AppendBytes(buf.B, encodePost(103, 30, "Post C"))
-
+	groups := [][]byte{
+		postColumns(t, []int64{101, 102}, []int64{10, 10}, []string{"Post A", "Post B"}),
+		postColumns(t, nil, nil, nil),
+		postColumns(t, []int64{103}, []int64{30}, []string{"Post C"}),
+	}
+	rt.Handle("svc:resolve:Post:userId", func(_ context.Context, req *api.Request) error {
+		keys, err := req.ParamIntArray("keys")
+		if err != nil {
+			return err
+		}
+		shape, err := req.ParamInt("shape")
+		if err != nil {
+			return err
+		}
+		if !slices.Equal(keys, []int64{10, 20, 30}) || shape != 1 {
+			return fmt.Errorf("invalid resolver parameters")
+		}
+		req.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(groups)))
+		for _, group := range groups {
+			req.Buf.B = codec.AppendBytes(req.Buf.B, group)
+		}
 		return nil
 	})
 	rt.Registry.Register("svc:resolve:Post:userId", 100)
-	rt.Registry.RegisterParams("svc:resolve:Post:userId", nil)
-
+	rt.Registry.RegisterParams("svc:resolve:Post:userId", []api.ParamMeta{{FieldID: 1, Name: "keys", Type: "Int", IsList: true}, {FieldID: 2, Name: "shape", Type: "Int"}})
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19900")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 	defer srv.Close()
-
-	client := NewClient("127.0.0.1:19900")
+	client := NewClient(addr)
 	defer client.Close()
-
-	// Call the batch load endpoint
-	resp, err := client.Call(100, nil)
+	params := []byte{1, 3}
+	for _, key := range []int64{10, 20, 30} {
+		params = codec.AppendSvarint(params, key)
+	}
+	params = codec.AppendSvarint(append(params, 2), 1)
+	params = append(params, 0)
+	resp, err := client.Call(100, params)
 	if err != nil {
-		t.Fatalf("RPC call failed: %v", err)
+		t.Fatal(err)
 	}
-	if len(resp) == 0 {
-		t.Fatal("empty response")
+	count, n := codec.ReadVarint(resp, 0)
+	if n <= 0 || count != uint64(len(groups)) {
+		t.Fatalf("invalid group count: %x", resp)
 	}
-
-	// Parse grouped response
-	off := 0
-	keyCount, n := codec.ReadVarint(resp, off)
-	if n <= 0 {
-		t.Fatal("failed to read key_count")
-	}
-	off += n
-
-	if keyCount != 3 {
-		t.Fatalf("key_count = %d, want 3", keyCount)
-	}
-
-	type keyResult struct {
-		itemCount int
-		posts     []struct {
-			id     int64
-			title  string
-			userID int64
+	for i, want := range groups {
+		body, size := codec.ReadBytes(resp, n)
+		if size <= 0 || !bytes.Equal(body, want) {
+			t.Fatalf("group %d changed: %x", i, body)
 		}
+		n += size
 	}
+	if n != len(resp) {
+		t.Fatal("trailing resolver bytes")
+	}
+}
 
-	results := make([]keyResult, keyCount)
-	for k := 0; k < int(keyCount); k++ {
-		itemCount, n := codec.ReadVarint(resp, off)
-		if n <= 0 {
-			t.Fatalf("key %d: failed to read item_count", k)
-		}
-		off += n
-		results[k].itemCount = int(itemCount)
-
-		for i := 0; i < int(itemCount); i++ {
-			item, rn := codec.ReadBytes(resp, off)
-			if rn == 0 {
-				t.Fatalf("key %d, item %d: failed to read item", k, i)
-			}
-			off += rn
-
-			// Decode the post binary
-			dec := codec.NewDecoder(item)
-			dec.SkipArenaHeader()
-			var post struct {
-				id     int64
-				title  string
-				userID int64
-			}
-			for dec.NextField() {
-				switch dec.FieldID() {
-				case 1:
-					post.id = dec.ReadInt()
-				case 2:
-					post.title = dec.ReadString()
-				case 3:
-					post.userID = dec.ReadInt()
-				}
-			}
-			if dec.Err() != nil {
-				t.Fatalf("post decode error: %v", dec.Err())
-			}
-			results[k].posts = append(results[k].posts, post)
-		}
+func postColumns(t testing.TB, ids, userIDs []int64, titles []string) []byte {
+	w := &codec.ColumnarWriter{}
+	w.SetCount(len(ids))
+	if len(ids) > 0 {
+		w.WriteColumnInt(1, ids)
+		w.WriteColumnString(2, titles)
+		w.WriteColumnInt(3, userIDs)
 	}
-
-	// Verify key 0: 2 posts for user 10
-	if results[0].itemCount != 2 {
-		t.Errorf("key0 itemCount = %d, want 2", results[0].itemCount)
-	}
-	if len(results[0].posts) != 2 {
-		t.Fatalf("key0 posts = %d, want 2", len(results[0].posts))
-	}
-	if results[0].posts[0].id != 101 || results[0].posts[0].title != "Post A" {
-		t.Errorf("key0.post0 = %+v", results[0].posts[0])
-	}
-	if results[0].posts[1].id != 102 || results[0].posts[1].userID != 10 {
-		t.Errorf("key0.post1 = %+v", results[0].posts[1])
-	}
-
-	// Verify key 1: 0 posts for user 20
-	if results[1].itemCount != 0 {
-		t.Errorf("key1 itemCount = %d, want 0", results[1].itemCount)
-	}
-
-	// Verify key 2: 1 post for user 30
-	if results[2].itemCount != 1 {
-		t.Errorf("key2 itemCount = %d, want 1", results[2].itemCount)
-	}
-	if len(results[2].posts) != 1 || results[2].posts[0].id != 103 {
-		t.Errorf("key2.post0 = %+v", results[2].posts)
-	}
+	return testutil.Bytes(t)(w.Bytes())
 }
 
 // --- Test: RPC BatchLoad with field mask ---
@@ -189,11 +102,10 @@ func TestFederation_RPCBatchLoadWithMask(t *testing.T) {
 	rt.Registry.RegisterParams("svc:resolve:Post:userId", nil)
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19901")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 	defer srv.Close()
 
-	client := NewClient("127.0.0.1:19901")
+	client := NewClient(addr)
 	defer client.Close()
 
 	// Send request with a field mask
@@ -235,11 +147,10 @@ func TestFederation_RPCMultipleCalls(t *testing.T) {
 	rt.Registry.RegisterParams("svc:batchLoad", nil)
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19902")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 	defer srv.Close()
 
-	client := NewClient("127.0.0.1:19902")
+	client := NewClient(addr)
 	defer client.Close()
 
 	// Make 5 sequential calls (simulates federation resolving multiple extends)
@@ -273,9 +184,17 @@ func TestFederation_RPCBinaryRoundtrip(t *testing.T) {
 		buf.B = codec.AppendVarint(buf.B, 1) // field 1 = id
 		buf.B = codec.AppendSvarint(buf.B, 42)
 		buf.B = codec.AppendVarint(buf.B, 2) // field 2 = name
-		buf.B = codec.AppendString(buf.B, "Alice")
+		if encoded, err := codec.AppendString(buf.B, "Alice"); err != nil {
+			return err
+		} else {
+			buf.B = encoded
+		}
 		buf.B = codec.AppendVarint(buf.B, 3) // field 3 = score
-		buf.B = codec.AppendFixed64(buf.B, 99.5)
+		encoded, err := codec.AppendFixed64(buf.B, 99.5)
+		if err != nil {
+			return err
+		}
+		buf.B = encoded
 		buf.B = codec.AppendVarint(buf.B, 4) // field 4 = active
 		buf.B = codec.AppendBool(buf.B, true)
 		buf.B = append(buf.B, 0x00)
@@ -285,11 +204,10 @@ func TestFederation_RPCBinaryRoundtrip(t *testing.T) {
 	rt.Registry.RegisterParams("svc:resolve:Profile", nil)
 
 	srv := NewServer(rt)
-	go srv.ListenAndServe("127.0.0.1:19903")
-	time.Sleep(100 * time.Millisecond)
+	addr := startTestRPCServer(t, srv)
 	defer srv.Close()
 
-	client := NewClient("127.0.0.1:19903")
+	client := NewClient(addr)
 	defer client.Close()
 
 	resp, err := client.Call(103, nil)

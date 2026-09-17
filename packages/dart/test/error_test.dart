@@ -17,15 +17,9 @@ void main() {
     });
 
     test('carries structured data and development cause', () {
-      final err = LuxoError(
-          'BadRequest',
-          400,
-          'bad',
-          'trace',
-          {
-            'param': 'email',
-          },
-          'validation failed');
+      final err = LuxoError('BadRequest', 400, 'bad', 'trace', {
+        'param': 'email',
+      }, 'validation failed');
       expect(err.data, equals({'param': 'email'}));
       expect(err.cause, equals('validation failed'));
     });

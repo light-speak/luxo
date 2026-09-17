@@ -26,19 +26,21 @@ object LuxoCodegen {
         schemaFile: String? = null,
     ) {
         val connection = introspectionConnection(endpoint, key)
-        val body = try {
+        val bytes = try {
             val status = connection.responseCode
             if (status != HttpURLConnection.HTTP_OK) {
                 throw RuntimeException("HTTP $status")
             }
-            connection.inputStream.bufferedReader().use { it.readText() }
+            connection.inputStream.use { it.readBytes() }
         } catch (e: Exception) {
             throw RuntimeException("luxo introspection failed: ${e.message}", e)
         } finally {
             connection.disconnect()
         }
+        val body: String
         val schema = try {
-            Json.decodeFromString<LuxoSchema>(body)
+            body = decodeJSONDocumentText(bytes)
+            Json.decodeFromString<LuxoSchema>(requireJSONUnicode(body))
         } catch (e: Exception) {
             throw RuntimeException("luxo introspection returned invalid JSON: ${e.message}", e)
         }
@@ -164,7 +166,7 @@ object LuxoCodegen {
     private fun isScalar(type: String): Boolean =
         type in setOf(
             "Int", "Float", "String", "Boolean", "DateTime", "Duration",
-            "UUID", "Bytes", "Decimal", "JSON",
+            "UUID", "Bytes", "Decimal", "JSON", "Enum",
         )
 
     /** Element reader expression for a scalar type (used inside readArray). */
@@ -173,17 +175,22 @@ object LuxoCodegen {
         "Float" -> "$decoder.readFloat()"
         "Boolean" -> "$decoder.readBool()"
         "UUID" -> "$decoder.readUuid()"
-        "DateTime" -> "$decoder.readDateTime()" // svarint(unix seconds) -> ISO string
+        "DateTime" -> "$decoder.readDateTime()" // seconds/nanoseconds -> RFC3339 string
         "Bytes" -> "$decoder.readBytes()"
-        "JSON" -> "Json.parseToJsonElement($decoder.readBytes().toString(Charsets.UTF_8))"
+        "JSON" -> "decodeLuxoJSON($decoder.readString())"
         else -> "$decoder.readString()" // String, Decimal, Enum
     }
 
+    private fun scalarArrayRead(type: String, decoder: String = "dec"): String =
+        if (type == "DateTime") "$decoder.readDateTimeArray()"
+        else "$decoder.readArray { ${scalarElementRead(type, decoder)} }"
+
     private fun binaryRead(f: LuxoField): String {
         val n = f.nullable
+        if (f.isList && n) return "if (dec.readBool()) ${binaryRead(f.copy(nullable = false))} else null"
         // Scalar arrays: [count][items...] — decode element-by-element.
         if (f.isList && isScalar(f.type)) {
-            return "dec.readArray { ${scalarElementRead(f.type)} }"
+            return scalarArrayRead(f.type)
         }
         return when (f.type) {
             "Int", "Duration" -> if (n) "dec.readIntPtr()" else "dec.readInt()"
@@ -192,18 +199,18 @@ object LuxoCodegen {
             "UUID" -> if (n) "dec.readUuidPtr()" else "dec.readUuid()"
             "Bytes" -> if (n) "dec.readNullable { dec.readBytes() }" else "dec.readBytes()"
             "JSON" -> {
-                val read = "Json.parseToJsonElement(dec.readBytes().toString(Charsets.UTF_8))"
+                val read = scalarElementRead("JSON")
                 if (n) "dec.readNullable { $read }" else read
             }
-            // DateTime: svarint(unix seconds) on the wire -> ISO string (matches JSON mode).
+            // DateTime: exact seconds/nanoseconds on the wire -> RFC3339 string.
             "DateTime" -> if (n) "dec.readDateTimePtr()" else "dec.readDateTime()"
             "String", "Decimal", "Enum" -> if (n) "dec.readStringPtr()" else "dec.readString()"
             else -> {
-                // Nested model — decode recursively
+                // Responses carry independent, length-delimited row or columnar messages.
                 val tn = f.typeName ?: f.type
-                if (f.isList) "dec.readArray { decode$tn(dec) }"
-                else if (n) "dec.readNullable { decode$tn(dec) }"
-                else "decode$tn(dec)"
+                val decoded = if (f.isList) "decodeColumnar$tn(dec.readBytes())"
+                    else "decode$tn(LuxoDecoder(dec.readBytes()))"
+                if (n) "dec.readNullable { $decoded }" else decoded
             }
         }
     }
@@ -215,10 +222,21 @@ object LuxoCodegen {
         appendLine("import com.luxo.client.ColumnarDecoder")
 		appendLine("import com.luxo.client.LuxoBinaryEncodable")
         appendLine("import com.luxo.client.LuxoDecoder")
+        appendLine("import com.luxo.client.LuxoError")
 		appendLine("import com.luxo.client.LuxoEncoder")
         appendLine("import com.luxo.client.Page")
         appendLine("import com.luxo.client.Selected")
 		appendLine("import com.luxo.client.luxoUtf8Length")
+        appendLine("import com.luxo.client.decodeLuxoUtf8")
+        appendLine("import com.luxo.client.luxoJsonFloat")
+        appendLine("import com.luxo.client.decodeLuxoJsonInt")
+        appendLine("import com.luxo.client.decodeLuxoJsonFloat")
+        appendLine("import com.luxo.client.decodeLuxoJsonString")
+        appendLine("import com.luxo.client.DateTimeCodec")
+        appendLine("import com.luxo.client.decodeLuxoJsonBoolean")
+        appendLine("import com.luxo.client.decodeLuxoJSON")
+        appendLine("import com.luxo.client.encodeLuxoJSON")
+        appendLine("import com.luxo.client.decodeLuxoJsonValue")
         appendLine("import kotlinx.serialization.Serializable")
         appendLine("import kotlinx.serialization.json.*\n")
 
@@ -257,6 +275,7 @@ object LuxoCodegen {
                 append(generateKotlinDeclaration(inputTypeName(m.name, usages), m.fields, schema, usages, output = false))
             }
         }
+        append(generateKotlinJSONArrays(schema, usages))
     }
 
     private fun generateKotlinDeclaration(
@@ -280,6 +299,7 @@ object LuxoCodegen {
 		} else {
 			appendLine(") : LuxoBinaryEncodable {")
 			append(generateKotlinBinaryEncoder(fields, schema))
+            append(generateKotlinJSONEncoder(name, fields, schema))
 			appendLine("}\n")
 		}
     }
@@ -294,9 +314,35 @@ object LuxoCodegen {
 		for (field in fields) writeKotlinBinaryField(this, field, schema)
 		appendLine("        encoder.writeEnd()")
 		appendLine("    }")
-		appendLine()
-		appendLine("    override fun toLuxoJson(): JsonElement = Json.encodeToJsonElement(this)")
 	}
+
+    private fun generateKotlinJSONEncoder(name: String, fields: List<LuxoField>, schema: LuxoSchema): String = buildString {
+        appendLine()
+        appendLine("    override fun toLuxoJson(): JsonElement = buildJsonObject {")
+        for (field in fields) {
+            val value = "this@$name.${field.name}"
+            val expression = if (field.nullable) {
+                "$value?.let { value -> ${kotlinJSONValue(field, "value", schema)} } ?: JsonNull"
+            } else kotlinJSONValue(field, value, schema)
+            appendLine("        put(\"${field.name}\", $expression)")
+        }
+        appendLine("    }")
+    }
+
+    private fun kotlinJSONValue(field: LuxoField, value: String, schema: LuxoSchema): String =
+        if (field.isList) "JsonArray($value.map { item -> ${kotlinJSONScalar(field, "item", schema)} })"
+        else kotlinJSONScalar(field, value, schema)
+
+    private fun kotlinJSONScalar(field: LuxoField, value: String, schema: LuxoSchema): String {
+        if (isNested(field, schema)) return "$value.toLuxoJson()"
+        return when (field.type) {
+            "JSON" -> value
+            "Bytes" -> "JsonPrimitive(java.util.Base64.getEncoder().encodeToString($value))"
+            "Float" -> "luxoJsonFloat($value)"
+            "Int", "Duration", "String", "Enum", "Boolean", "DateTime", "UUID", "Decimal" -> "JsonPrimitive($value)"
+            else -> error("unsupported structured field type ${field.type}")
+        }
+    }
 
 	private fun writeKotlinBinaryField(out: StringBuilder, field: LuxoField, schema: LuxoSchema) {
 		out.appendLine("        encoder.writeVarint(${field.id}L)")
@@ -347,10 +393,10 @@ object LuxoCodegen {
 			"Float" -> "encoder.writeFixed64($value)"
 			"String", "Enum", "Decimal" -> "encoder.writeString($value)"
 			"Boolean" -> "encoder.writeBool($value)"
-			"DateTime" -> "encoder.writeSvarint(java.time.Instant.parse($value).epochSecond)"
+			"DateTime" -> "encoder.writeDateTime($value)"
 			"UUID" -> "encoder.writeUuid($value)"
 			"Bytes" -> "encoder.writeBytes($value)"
-			"JSON" -> "encoder.writeBytes($value.toString().toByteArray(Charsets.UTF_8))"
+			"JSON" -> "encoder.writeBytes(encodeLuxoJSON($value).toByteArray(Charsets.UTF_8))"
 			else -> error("unsupported structured field type ${field.type}")
 		}
 		out.appendLine("$indent$statement")
@@ -375,52 +421,80 @@ object LuxoCodegen {
         appendLine("            else -> error(\"unknown $name field ID \${dec.fieldID}\")")
         appendLine("        }")
         appendLine("    }")
+        appendLine("    dec.checkComplete()")
         appendLine("    return $name(")
         for (f in fields) {
             appendLine("        ${f.name} = _${f.name},")
         }
         appendLine("    )")
         appendLine("}\n")
-        append(generateKotlinJSONDecoder(name, fields, schema))
+        append(generateKotlinJSONDecoder(name, fields, schema, usages))
         append(generateKotlinColumnarDecoder(name, fields, schema, usages, false))
         append(generateKotlinColumnarDecoder(name, fields, schema, usages, true))
     }
 
-    private fun generateKotlinJSONDecoder(name: String, fields: List<LuxoField>, schema: LuxoSchema): String = buildString {
-        appendLine("fun decodeJSON$name(data: JsonObject): $name = $name(")
+    private fun generateKotlinJSONDecoder(
+        name: String,
+        fields: List<LuxoField>,
+        schema: LuxoSchema,
+        usages: Map<String, TypeUsage>,
+    ): String = buildString {
+        appendLine("fun decodeJSON$name(data: JsonObject): $name {")
         for (field in fields) {
-            val raw = "data.getValue(\"${field.name}\")"
+            val base = resolveFieldType(field, schema, usages)
+            val type = if (field.nullable) "$base?" else base
+            val raw = "`${field.name}\$json`"
             val decoded = kotlinJSONValue(field, schema, "value")
             val selectedValue = if (field.nullable) {
                 "$raw.takeUnless { it is JsonNull }?.let { value -> $decoded }"
             } else {
                 "$raw.let { value -> $decoded }"
             }
-            appendLine("    ${field.name} = if (\"${field.name}\" in data) Selected.value($selectedValue) else Selected.unselected(),")
+            // JSON null is JsonNull, so Kotlin null unambiguously denotes an absent key.
+            appendLine("    val $raw = data[\"${field.name}\"]")
+            appendLine("    val _${field.name}: Selected<$type> = if ($raw != null) {")
+            appendLine("        Selected.value($selectedValue)")
+            appendLine("    } else Selected.unselected()")
         }
-        appendLine(")\n")
+        appendLine("    return $name(")
+        for (field in fields) appendLine("        ${field.name} = _${field.name},")
+        appendLine("    )")
+        appendLine("}\n")
+        // Check statically known Selected states, never look up the JSON fields a second time.
+        // '$' cannot occur in DSL identifiers; keep the public unary function reference unambiguous.
+        appendLine("internal fun `decodeJSON$name\$item`(data: JsonObject): $name {")
+        appendLine("    val value = decodeJSON$name(data)")
+        val missing = fields.joinToString(" && ") { "!value.${it.name}.isSelected" }.ifEmpty { "true" }
+        appendLine("    if ($missing) throw LuxoError(\"ParseError\", 0, \"$name list item must contain a selected schema field\")")
+        appendLine("    return value")
+        appendLine("}\n")
     }
 
     private fun kotlinJSONValue(field: LuxoField, schema: LuxoSchema, value: String): String {
+        if (field.isList) return "${kotlinJSONArrayName(field)}($value.jsonArray)"
         val typeName = field.typeName ?: field.type
-        val element = when {
-            isNested(field, schema) -> "decodeJSON$typeName(item.jsonObject)"
-            field.type in setOf("Int", "Duration") -> "item.jsonPrimitive.long"
-            field.type == "Float" -> "item.jsonPrimitive.double"
-            field.type == "Boolean" -> "item.jsonPrimitive.boolean"
-            field.type == "Bytes" -> "java.util.Base64.getDecoder().decode(item.jsonPrimitive.content)"
-            field.type == "JSON" -> "item"
-            else -> "item.jsonPrimitive.content"
-        }
-        if (field.isList) return "$value.jsonArray.map { item -> $element }"
-        return when {
-            isNested(field, schema) -> "decodeJSON$typeName($value.jsonObject)"
-            field.type in setOf("Int", "Duration") -> "$value.jsonPrimitive.long"
-            field.type == "Float" -> "$value.jsonPrimitive.double"
-            field.type == "Boolean" -> "$value.jsonPrimitive.boolean"
-            field.type == "Bytes" -> "java.util.Base64.getDecoder().decode($value.jsonPrimitive.content)"
-            field.type == "JSON" -> value
-            else -> "$value.jsonPrimitive.content"
+        return if (isNested(field, schema)) "decodeJSON$typeName($value.jsonObject)"
+            else scalarJSONRead(field.type, value)
+    }
+
+    private fun kotlinJSONArrayName(field: LuxoField): String =
+        "`decodeJSONArray\$${field.typeName ?: field.type}`"
+
+    /** Keep array loops small and shared across all output fields with the same element type. */
+    private fun generateKotlinJSONArrays(schema: LuxoSchema, usages: Map<String, TypeUsage>): String = buildString {
+        val declarations = schema.models.values.map { it.name to it.fields } + schema.types.values.map { it.name to it.fields }
+        val outputFields = declarations.filter { hasOutputUsage(usages[it.first] ?: TypeUsage.UNUSED) }
+            .flatMap { it.second }.filter { it.isList }
+        val returns = schema.apis.values.filter { isStructuredReturn(it, schema) && (it.returnList || it.paginated) }
+            .map { LuxoField(0, "", "Model", typeName = it.returnType, isList = true) }
+        val fields = (outputFields + returns).distinctBy(::kotlinJSONArrayName)
+        for (field in fields) {
+            val typeName = field.typeName ?: field.type
+            val read = if (isNested(field, schema)) "`decodeJSON$typeName\$item`(item.jsonObject)"
+                else scalarJSONRead(field.type, "item")
+            val type = resolveFieldType(field, schema, usages)
+            appendLine("internal fun ${kotlinJSONArrayName(field)}(data: JsonArray): $type =")
+            appendLine("    data.map { item -> $read }\n")
         }
     }
 
@@ -442,11 +516,17 @@ object LuxoCodegen {
         appendLine("            else -> error(\"unknown $name column ID \${dec.fieldID}\")")
         appendLine("        }")
         appendLine("    }")
+        if (paginated) {
+            for (metadata in listOf("total", "page", "pageSize")) {
+                appendLine("    val $metadata = dec.readSvarint()")
+            }
+        }
+        appendLine("    dec.checkComplete()")
         appendLine("    val items = List(dec.count) { i -> $name(")
         for (f in fields) appendLine("        ${f.name} = ${kotlinColumnValue(f, schema, usages)},")
         appendLine("    ) }")
         if (paginated) {
-            appendLine("    return Page(items, dec.readSvarint().toInt(), dec.readSvarint().toInt(), dec.readSvarint().toInt())")
+            appendLine("    return Page(items, total, page, pageSize)")
         } else {
             appendLine("    return items")
         }
@@ -460,7 +540,7 @@ object LuxoCodegen {
 
     private fun kotlinColumnType(f: LuxoField, schema: LuxoSchema, usages: Map<String, TypeUsage>): String {
         if (isNested(f, schema) || f.isList || f.type == "Bytes" || f.type == "JSON") {
-            return if (f.nullable && !f.isList) "List<ByteArray?>" else "List<ByteArray>"
+            return if (f.nullable) "List<ByteArray?>" else "List<ByteArray>"
         }
         val base = resolveFieldType(f, schema, usages)
         return if (f.nullable) "List<$base?>" else "List<$base>"
@@ -468,7 +548,7 @@ object LuxoCodegen {
 
     private fun kotlinColumnRead(f: LuxoField, schema: LuxoSchema): String {
         if (isNested(f, schema) || f.isList || f.type == "Bytes" || f.type == "JSON") {
-            return if (f.nullable && !f.isList) "dec.readColumnBytesPtr()" else "dec.readColumnBytes()"
+            return if (f.nullable) "dec.readColumnBytesPtr()" else "dec.readColumnBytes()"
         }
         return when (f.type) {
             "Int", "Duration" -> if (f.nullable) "dec.readColumnIntPtr()" else "dec.readColumnInt()"
@@ -489,20 +569,22 @@ object LuxoCodegen {
         val value: String
         if (isNested(f, schema)) {
             value = if (f.isList) {
-                "decodeColumnar$typeName($column[i])"
+                if (f.nullable) "$column[i]?.let { decodeColumnar$typeName(it) }"
+                else "decodeColumnar$typeName($column[i])"
             } else if (f.nullable) {
                 "$column[i]?.let { decode$typeName(LuxoDecoder(it)) }"
             } else {
                 "decode$typeName(LuxoDecoder($column[i]))"
             }
         } else if (f.isList) {
-            val element = scalarElementRead(f.type, "cell")
-            value = "LuxoDecoder($column[i]).let { cell -> cell.readArray { $element } }"
+            val data = if (f.nullable) "data" else "$column[i]"
+            val decoded = completeScalarRead(data, scalarArrayRead(f.type, "cell"), "cell")
+            value = if (f.nullable) "$column[i]?.let { data -> $decoded }" else decoded
         } else if (f.type == "JSON") {
             value = if (f.nullable) {
-                "$column[i]?.let { Json.parseToJsonElement(it.toString(Charsets.UTF_8)) }"
+                "$column[i]?.let { decodeLuxoJSON(decodeLuxoUtf8(it)) }"
             } else {
-                "Json.parseToJsonElement($column[i].toString(Charsets.UTF_8))"
+                "decodeLuxoJSON(decodeLuxoUtf8($column[i]))"
             }
         } else {
             value = "$column[i]"
@@ -602,10 +684,10 @@ object LuxoCodegen {
         usages: Map<String, TypeUsage>,
     ) {
         val ret = returnType(api)
-        val structuredReturn = api.returnType?.let { !isScalar(it) } == true
+        val structuredReturn = isStructuredReturn(api, schema)
         if (api.stream) {
             genStreamMethod(b, api, schema, usages, ret)
-            genDecodeHelper(b, api)
+            genDecodeHelper(b, api, schema)
             return
         }
 
@@ -725,7 +807,7 @@ object LuxoCodegen {
         }
 
         // Private decode helper — dispatches JSON vs binary
-        genDecodeHelper(b, api)
+        genDecodeHelper(b, api, schema)
     }
 
     private fun genStreamMethod(
@@ -744,11 +826,11 @@ object LuxoCodegen {
                 else -> "${param.name}: $type"
             }
         }.toMutableList()
-        val structuredReturn = api.returnType?.let { !isScalar(it) } == true
+        val structuredReturn = isStructuredReturn(api, schema)
         if (structuredReturn) params += "select: String? = null"
         val separator = if (params.isEmpty()) "" else "${params.joinToString(", ")}, "
         val methodName = "subscribe" + api.name.replaceFirstChar { it.uppercase() }
-        b.appendLine("    suspend fun $methodName(${separator}onData: ($returnType) -> Unit): () -> Unit {")
+        b.appendLine("    suspend fun $methodName(${separator}observer: StreamObserver? = null, onData: ($returnType) -> Unit): () -> Unit {")
         b.appendLine("        val callParams = mutableMapOf<String, Any?>()")
         for (param in api.params) {
 			val value = paramTransportValue(param)
@@ -765,75 +847,63 @@ object LuxoCodegen {
             }
         }
         if (structuredReturn) b.appendLine("        if (select != null) callParams[\"\\\$select\"] = select")
-        b.appendLine("        return transport.subscribe(\"${api.name}\", callParams) { data ->")
-        b.appendLine("            onData(decode_${api.name}(data))")
-        b.appendLine("        }")
+        b.appendLine("        return transport.subscribe(\"${api.name}\", { data -> decode_${api.name}(data) }, callParams, observer, onData)")
         b.appendLine("    }\n")
     }
 
-    private fun genDecodeHelper(b: StringBuilder, api: LuxoAPI) {
+    private fun isStructuredReturn(api: LuxoAPI, schema: LuxoSchema): Boolean =
+        api.returnType?.let { !isScalar(it) && it !in schema.enums } == true
+
+    private fun genDecodeHelper(b: StringBuilder, api: LuxoAPI, schema: LuxoSchema) {
         val ret = returnType(api)
-        val t = api.returnType
         b.appendLine("    private fun decode_${api.name}(data: Any): $ret = when (data) {")
-
-        if (t == null || isScalar(t)) {
-            // Scalar decode
-            val jsonScalarDecode = when (t) {
-                    null, "Int", "Duration" -> "(data as JsonElement).jsonPrimitive.long"
-                "Float" -> "(data as JsonElement).jsonPrimitive.double"
-                "Boolean" -> "(data as JsonElement).jsonPrimitive.boolean"
-                "Bytes" -> "java.util.Base64.getDecoder().decode((data as JsonElement).jsonPrimitive.content)"
-                "JSON" -> "data as JsonElement"
-                else -> "(data as JsonElement).jsonPrimitive.content"
-            }
-            val binaryScalarDecode = when (t) {
-                    null, "Int", "Duration" -> "LuxoDecoder(data).readInt()"
-                "Float" -> "LuxoDecoder(data).readFloat()"
-                "Boolean" -> "LuxoDecoder(data).readBool()"
-                "DateTime" -> "LuxoDecoder(data).readDateTime()"
-                "UUID" -> "LuxoDecoder(data).readUuid()"
-                "Bytes" -> "LuxoDecoder(data).readBytes()"
-                "JSON" -> "Json.parseToJsonElement(LuxoDecoder(data).readBytes().toString(Charsets.UTF_8))"
-                else -> "LuxoDecoder(data).readString()"
-            }
-            val jsonDecode = if (api.returnList) {
-                when (t) {
-                        null, "Int", "Duration" -> "(data as JsonArray).map { it.jsonPrimitive.long }"
-                    "Float" -> "(data as JsonArray).map { it.jsonPrimitive.double }"
-                    "Boolean" -> "(data as JsonArray).map { it.jsonPrimitive.boolean }"
-                    "Bytes" -> "(data as JsonArray).map { java.util.Base64.getDecoder().decode(it.jsonPrimitive.content) }"
-                    "JSON" -> "(data as JsonArray).toList()"
-                    else -> "(data as JsonArray).map { it.jsonPrimitive.content }"
-                }
-            } else jsonScalarDecode
-            val binaryDecode = if (api.returnList) {
-                val element = scalarElementRead(t ?: "Int", "d")
-                "LuxoDecoder(data).let { d -> d.readArray { $element } }"
-            } else binaryScalarDecode
-            b.appendLine("        is ByteArray -> $binaryDecode")
-            b.appendLine("        else -> $jsonDecode")
-        } else {
-            // Model decode
-            val jsonDecode = when {
-                api.paginated -> "(data as JsonElement).jsonObject.let { obj -> Page(obj.getValue(\"items\").jsonArray.map { decodeJSON$t(it.jsonObject) }, obj.getValue(\"total\").jsonPrimitive.int, obj.getValue(\"page\").jsonPrimitive.int, obj.getValue(\"pageSize\").jsonPrimitive.int) }"
-                api.returnList -> "(data as JsonArray).map { decodeJSON$t(it.jsonObject) }"
-                else -> "decodeJSON$t((data as JsonElement).jsonObject)"
-            }
-            val binaryDecode = when {
-                api.paginated -> "decodePaginated$t(data)"
-                api.returnList -> "decodeColumnar$t(data)"
-                else -> "decode$t(LuxoDecoder(data))"
-            }
-            b.appendLine("        is ByteArray -> $binaryDecode")
-            b.appendLine("        else -> $jsonDecode")
-        }
-
+        if (isStructuredReturn(api, schema)) genModelResponse(b, api) else genScalarResponse(b, api)
         b.appendLine("    }\n")
+    }
+
+    private fun genScalarResponse(b: StringBuilder, api: LuxoAPI) {
+        val type = api.returnType ?: "Int"
+        val element = scalarElementRead(type)
+        val binaryRead = if (api.returnList) scalarArrayRead(type) else element
+        val jsonRead = if (api.returnList) {
+            "(data as JsonArray).map { ${scalarJSONRead(type, "it")} }"
+        } else scalarJSONRead(type, "(data as JsonElement)")
+        b.appendLine("        is ByteArray -> ${completeScalarRead("data", binaryRead)}")
+        b.appendLine("        else -> $jsonRead")
+    }
+
+    private fun scalarJSONRead(type: String, value: String): String = when (type) {
+        "Int", "Duration" -> "decodeLuxoJsonInt($value)"
+        "Float" -> "decodeLuxoJsonFloat($value)"
+        "Boolean" -> "decodeLuxoJsonBoolean($value)"
+        "Bytes" -> "java.util.Base64.getDecoder().decode(decodeLuxoJsonString($value))"
+        "JSON" -> "decodeLuxoJsonValue($value)"
+        "DateTime" -> "DateTimeCodec.validate(decodeLuxoJsonString($value))"
+        else -> "decodeLuxoJsonString($value)"
+    }
+
+    // Kotlin's let is inline: no decoder callback object or extra runtime dispatch.
+    private fun completeScalarRead(bytes: String, read: String, decoder: String = "dec"): String =
+        "LuxoDecoder($bytes).let { $decoder -> val value = $read; $decoder.checkComplete(); value }"
+
+    private fun genModelResponse(b: StringBuilder, api: LuxoAPI) {
+        val t = api.returnType
+        val jsonDecode = when {
+            api.paginated -> "(data as JsonElement).jsonObject.let { obj -> Page(`decodeJSONArray\$$t`(obj.getValue(\"items\").jsonArray), decodeLuxoJsonInt(obj.getValue(\"total\")), decodeLuxoJsonInt(obj.getValue(\"page\")), decodeLuxoJsonInt(obj.getValue(\"pageSize\"))) }"
+            api.returnList -> "`decodeJSONArray\$$t`(data as JsonArray)"
+            else -> "decodeJSON$t((data as JsonElement).jsonObject)"
+        }
+        val binaryDecode = when {
+            api.paginated -> "decodePaginated$t(data)"
+            api.returnList -> "decodeColumnar$t(data)"
+            else -> "decode$t(LuxoDecoder(data))"
+        }
+        b.appendLine("        is ByteArray -> $binaryDecode")
+        b.appendLine("        else -> $jsonDecode")
     }
 
     private fun returnType(api: LuxoAPI): String {
-        val returnType = api.returnType ?: return "Long"
-        val t = luxoTypeToKt(returnType)
+        val t = luxoTypeToKt(api.returnType ?: "Int")
         return when {
             api.paginated -> "Page<$t>"
             api.returnList -> "List<$t>"

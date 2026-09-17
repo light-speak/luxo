@@ -1,0 +1,248 @@
+/// Exact integer values sent through generated Go and SDK codecs.
+type Precision {
+  value: Int
+  duration: Duration
+  optional: Int?
+  values: [Int]
+  label: String
+  ignored: Int
+}
+
+/// Echo through a compiled Luxo body, not a handwritten wire response.
+api echoPrecision(input: Precision): Precision {
+  return input
+}
+
+/// Exercise the generated columnar response writer.
+api listPrecision(input: Precision): [Precision] {
+  return [input, input]
+}
+
+api echoInteger(value: Int): Int {
+  return value
+}
+
+api echoDuration(value: Duration): Duration {
+  return value
+}
+
+/// DateTime responses preserve seconds and nanoseconds, including before the epoch.
+api echoTimestamp(value: DateTime): DateTime {
+  return value
+}
+
+api echoTimestamps(values: [DateTime]): [DateTime] {
+  return values
+}
+
+api echoIntegers(values: [Int]): [Int] {
+  return values
+}
+
+/// Required scalar and array parameters reject null without JSON coercion.
+api echoString(value: String): String {
+  return value
+}
+
+api echoStrings(values: [String]): [String] {
+  return values
+}
+
+api echoBoolean(value: Boolean): Boolean {
+  return value
+}
+
+api echoUUIDs(values: [UUID]): [UUID] {
+  return values
+}
+
+/// Bytes use Base64 strings in JSON, never numeric arrays or null elements.
+api echoBytes(value: Bytes): Bytes {
+  return value
+}
+
+api echoByteLists(values: [Bytes]): [Bytes] {
+  return values
+}
+
+/// Finite inputs can overflow during real compiled business arithmetic.
+api scaleFloat(value: Float, factor: Float): Float {
+  return value * factor
+}
+
+/// A later invalid result must not expose the already-written first item.
+api scaleFloatList(value: Float, factor: Float): [Float] {
+  return [value, value * factor]
+}
+
+/// Opaque JSON numbers are not constrained to the business Int64 type.
+api echoJSON(value: JSON): JSON {
+  return value
+}
+
+api echoJSONs(values: [JSON]): [JSON] {
+  return values
+}
+
+error PrecisionRejected(value: Int, label: String) {
+  code: 422
+  message: "error.precision_rejected"
+}
+
+/// Error data must retain the same Int64 value as a successful response.
+api rejectPrecision(value: Int): Int {
+  throw PrecisionRejected(value: value, label: "精度 café")
+}
+
+error JSONRejected(value: JSON) {
+  code: 422
+  message: "error.json_rejected"
+}
+
+/// Error data must preserve opaque numbers without an Int64/Float conversion.
+api rejectJSON(value: JSON): JSON {
+  throw JSONRejected(value: value)
+}
+
+/// Subscription parameters and generated stream writers retain raw JSON tokens.
+api watchJSON(value: JSON): JSON @stream @native
+
+api watchJSONs(values: [JSON]): [JSON] @stream @native
+
+/// Drain 64 ordered messages, then complete or return an exact structured error.
+api watchFiniteJSON(value: JSON, fail: Boolean): [JSON] @stream @native
+
+/// This model is constructed in memory; pagination never queries a database.
+model PageRecord {
+  id: Int @id
+  value: Int
+  label: String
+}
+
+api browsePrecision(value: Int): [PageRecord] @paginate(defaultPageSize: 2) {
+  val first = PageRecord { id: 1, value: value, label: "first" }
+  val second = PageRecord { id: 2, value: value, label: "second" }
+  val forwarded = echoPageRecord(second)
+  return [
+    first,
+    forwarded,
+    PageRecord { id: 3, value: value, label: "third" }
+  ]
+}
+
+fn echoPageRecord(record: PageRecord): PageRecord {
+  return record
+}
+
+fn bumpPageRecord(record: PageRecord): Int {
+  record.value += 1
+  return record.value
+}
+
+fn pageRecordEffects(record: PageRecord): [Int] {
+  return [bumpPageRecord(record)]
+}
+
+/// Variable, function-return and API-return lists must evaluate each call once.
+api checkListEffects(): [Int] {
+  val record = PageRecord { id: 1, value: 0, label: "effects" }
+  val alias = record
+  val values = [bumpPageRecord(alias)]
+  val forwarded = pageRecordEffects(alias)
+  var first = 0
+  var second = 0
+  for value in values { first = value }
+  for value in forwarded { second = value }
+  return [first, second, bumpPageRecord(alias), alias.value]
+}
+
+/// Native code only supplies stream values; generated code encodes them.
+api watchPrecision(value: Int): Precision @stream @native
+
+/// Nullable arrays must preserve null, empty and unselected states.
+type NullableArrays {
+  values: [Int]?
+  durations: [Duration]?
+  flags: [Boolean]?
+  tail: Int
+}
+
+api echoNullableArrays(input: NullableArrays): NullableArrays {
+  return input
+}
+
+api listNullableArrays(input: NullableArrays): [NullableArrays] {
+  return [input, input]
+}
+
+api watchNullableArrays(state: Int): NullableArrays @stream @native
+
+/// Nested response boundaries must match across row, column and stream encoders.
+type NestedGroup {
+  label: String
+  primary: Precision
+  optional: Precision?
+  rows: [Precision]
+  optionalRows: [Precision]?
+  tail: Int
+}
+
+/// Three levels of selected fields, including nullable nested objects and lists.
+type NestedPrecision {
+  group: NestedGroup
+  groups: [NestedGroup]
+  tail: Int
+}
+
+api echoNestedPrecision(input: NestedPrecision): NestedPrecision {
+  return input
+}
+
+api listNestedPrecision(input: NestedPrecision): [NestedPrecision] {
+  return [input, input]
+}
+
+api watchNestedPrecision(state: Int): NestedPrecision @stream @native
+
+enum FixtureState {
+  OPEN
+  CLOSED
+}
+
+api echoFixtureState(value: FixtureState): FixtureState {
+  return value
+}
+
+api echoFixtureStates(values: [FixtureState]): [FixtureState] {
+  return values
+}
+
+api watchFixtureState(): FixtureState @stream @native
+
+api watchFixtureStates(): [FixtureState] @stream @native
+
+/// Every scalar family in the same nullable-array response and input.
+type ScalarArrays {
+  ints: [Int]?
+  floats: [Float]?
+  strings: [String]?
+  bools: [Boolean]?
+  dates: [DateTime]?
+  durations: [Duration]?
+  uuids: [UUID]?
+  bytes: [Bytes]?
+  decimals: [Decimal]?
+  jsons: [JSON]?
+  enums: [FixtureState]?
+  tail: Int
+}
+
+api echoScalarArrays(input: ScalarArrays): ScalarArrays {
+  return input
+}
+
+api listScalarArrays(input: ScalarArrays): [ScalarArrays] {
+  return [input, input]
+}
+
+api watchScalarArrays(state: Int): ScalarArrays @stream @native

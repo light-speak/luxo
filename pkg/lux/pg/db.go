@@ -119,6 +119,11 @@ func QueryRows[T any](ctx context.Context, db *DB, scan ScanFunc[T], query strin
 	return results, rows.Err()
 }
 
+// QueryRows executes a SELECT on this pool or transaction using a concrete scanner.
+func (db *DB) QueryRows[T any](ctx context.Context, scan ScanFunc[T], query string, args ...any) ([]*T, error) {
+	return QueryRows(ctx, db, scan, query, args...)
+}
+
 // QueryRow executes a SELECT and scans the first row, or returns nil.
 func QueryRow[T any](ctx context.Context, db *DB, scan ScanFunc[T], query string, args ...any) (*T, error) {
 	rows, err := db.conn.Query(ctx, query, args...)
@@ -136,11 +141,21 @@ func QueryRow[T any](ctx context.Context, db *DB, scan ScanFunc[T], query string
 	return scan(rows)
 }
 
+// QueryRow scans the first row on this pool or transaction, or returns nil.
+func (db *DB) QueryRow[T any](ctx context.Context, scan ScanFunc[T], query string, args ...any) (*T, error) {
+	return QueryRow(ctx, db, scan, query, args...)
+}
+
 // QueryScalar executes a SELECT and scans a single scalar value.
 func QueryScalar[T any](ctx context.Context, db *DB, query string, args ...any) (T, error) {
 	var result T
 	err := db.conn.QueryRow(ctx, query, args...).Scan(&result)
 	return result, err
+}
+
+// QueryScalar scans a scalar value on this pool or transaction.
+func (db *DB) QueryScalar[T any](ctx context.Context, query string, args ...any) (T, error) {
+	return QueryScalar[T](ctx, db, query, args...)
 }
 
 // QueryRaw executes a row query through the active pool or transaction.
@@ -175,7 +190,7 @@ func InsertReturning[T any](ctx context.Context, db *DB, scan ScanFunc[T], table
 		b.Write(strconv.AppendInt(tmp[:0], int64(i+1), 10))
 	}
 	b.WriteString(") RETURNING *")
-	return QueryRow(ctx, db, scan, b.String(), vals...)
+	return db.QueryRow(ctx, scan, b.String(), vals...)
 }
 
 // InsertManyReturning inserts multiple rows and scans all RETURNING * results.
@@ -212,7 +227,7 @@ func InsertManyReturning[T any](ctx context.Context, db *DB, scan ScanFunc[T], t
 	}
 	b.WriteString(" RETURNING *")
 
-	return QueryRows(ctx, db, scan, b.String(), args...)
+	return db.QueryRows(ctx, scan, b.String(), args...)
 }
 
 // UpdateReturning updates a single record by ID and scans the RETURNING * result.
@@ -258,5 +273,5 @@ func UpdateReturningBy[T any, ID comparable](ctx context.Context, db *DB, scan S
 	b.WriteString(" RETURNING *")
 	args = append(args, id)
 
-	return QueryRow(ctx, db, scan, b.String(), args...)
+	return db.QueryRow(ctx, scan, b.String(), args...)
 }

@@ -1,14 +1,13 @@
 package api
 
 import (
+	"encoding/json/jsontext"
 	"strconv"
 	"sync"
 	"time"
-	"unicode/utf8"
-)
 
-// hex lookup for JSON \u00XX escape without fmt.Sprintf.
-const hexDigits = "0123456789abcdef"
+	"github.com/light-speak/luxo/pkg/lux/codec"
+)
 
 // ResponseBuf is a pooled, zero-allocation response buffer.
 // Uses []byte with direct append — no bytes.Buffer overhead.
@@ -51,58 +50,27 @@ func PutBuf(buf *ResponseBuf) {
 func (r *ResponseBuf) AppendByte(c byte)     { r.B = append(r.B, c) }
 func (r *ResponseBuf) AppendString(s string) { r.B = append(r.B, s...) }
 func (r *ResponseBuf) AppendInt(v int64)     { r.B = strconv.AppendInt(r.B, v, 10) }
-func (r *ResponseBuf) AppendFloat(v float64) { r.B = strconv.AppendFloat(r.B, v, 'f', -1, 64) }
 func (r *ResponseBuf) AppendBool(v bool)     { r.B = strconv.AppendBool(r.B, v) }
 func (r *ResponseBuf) AppendBytes(b []byte)  { r.B = append(r.B, b...) }
 
-// AppendJSONString writes a JSON-escaped string directly into the buffer.
-// Uses a byte-level fast path for ASCII — bulk-appends runs of safe bytes.
-// Falls through to rune handling only for bytes >= 0x80 or special chars.
-func (r *ResponseBuf) AppendJSONString(s string) {
-	r.B = append(r.B, '"')
-	i := 0
-	for i < len(s) {
-		// Fast path: scan for longest run of safe ASCII bytes.
-		start := i
-		for i < len(s) {
-			c := s[i]
-			if c < 0x20 || c == '"' || c == '\\' || c >= 0x80 {
-				break
-			}
-			i++
-		}
-		if start < i {
-			r.B = append(r.B, s[start:i]...)
-		}
-		if i >= len(s) {
-			break
-		}
-		c := s[i]
-		if c >= 0x80 {
-			// Multi-byte UTF-8: decode rune and append.
-			ru, size := utf8.DecodeRuneInString(s[i:])
-			r.B = utf8.AppendRune(r.B, ru)
-			i += size
-			continue
-		}
-		// Special ASCII byte requiring escape.
-		switch c {
-		case '"':
-			r.B = append(r.B, '\\', '"')
-		case '\\':
-			r.B = append(r.B, '\\', '\\')
-		case '\n':
-			r.B = append(r.B, '\\', 'n')
-		case '\r':
-			r.B = append(r.B, '\\', 'r')
-		case '\t':
-			r.B = append(r.B, '\\', 't')
-		default:
-			r.B = append(r.B, '\\', 'u', '0', '0', hexDigits[c>>4], hexDigits[c&0x0f])
-		}
-		i++
+// AppendFloat writes a finite business Float without changing the buffer on error.
+func (r *ResponseBuf) AppendFloat(v float64) error {
+	if !codec.IsFiniteFloat(v) {
+		return codec.ErrNonFiniteFloat
 	}
-	r.B = append(r.B, '"')
+	r.B = strconv.AppendFloat(r.B, v, 'f', -1, 64)
+	return nil
+}
+
+// AppendJSONString writes a UTF-8 JSON string without publishing partial output
+// or replacement characters on failure. The input must not alias the buffer.
+func (r *ResponseBuf) AppendJSONString(s string) error {
+	dst, err := jsontext.AppendQuote(r.B, s)
+	if err != nil {
+		return err
+	}
+	r.B = dst
+	return nil
 }
 
 // AppendTime writes a time value as a JSON string using the given layout.

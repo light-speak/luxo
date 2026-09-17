@@ -3,14 +3,17 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"encoding/json/jsontext"
+	stderrors "errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"sync"
-
-	stderrors "errors"
+	"unicode/utf8"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
+	"github.com/light-speak/luxo/pkg/lux/jsonutil"
 	"nhooyr.io/websocket"
 )
 
@@ -19,20 +22,30 @@ import (
 // Reads are single-goroutine (the read loop), no lock needed.
 type wsConn struct {
 	conn           *websocket.Conn
+	ctx            context.Context // connection lifetime, never a subscription's context
 	acceptLanguage string
 	mu             sync.Mutex // serialize writes
 }
 
 func (c *wsConn) writeText(ctx context.Context, data []byte) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.conn.Write(ctx, websocket.MessageText, data)
+	return c.write(ctx, websocket.MessageText, data)
 }
 
 func (c *wsConn) writeBinary(ctx context.Context, data []byte) error {
+	return c.write(ctx, websocket.MessageBinary, data)
+}
+
+func (c *wsConn) write(ctx context.Context, kind websocket.MessageType, data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.conn.Write(ctx, websocket.MessageBinary, data)
+	// A queued message can be discarded. Once writing starts, the entire frame
+	// must finish: cancelling websocket.Write closes the shared connection.
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return c.conn.Write(c.ctx, kind, data)
+	}
 }
 
 // handleWebSocket upgrades the HTTP connection to WebSocket and runs the message loop.
@@ -48,11 +61,11 @@ func (c *wsConn) writeBinary(ctx context.Context, data []byte) error {
 //	  Call:      [0x01][seq varint][API ID varint][FieldMask len][mask][Params...][0x00]
 //	  Success:   [0x02][seq varint][payload]
 //	  Error:     [0x03][seq varint][Binary Error Envelope]
-//	  Subscribe: [0x04][API ID varint][FieldMask len][mask][Params...][0x00]
-//	  Unsub:     [0x05][API ID varint]
-//	  Stream:    [0x06][API ID varint][payload]
-//	  Sub OK:    [0x07][API ID varint]
-//	  Sub Error: [0x08][API ID varint][Binary Error Envelope]
+//	  Subscribe: [0x10][subscription UInt64][API ID][FieldMask len][mask][Params...][0x00]
+//	  Unsub:     [0x11][subscription UInt64]
+//	  Stream:    [0x12][subscription UInt64][payload]
+//	  Sub OK:    [0x13][subscription UInt64]
+//	  Sub Error: [0x14][subscription UInt64][Binary Error Envelope]
 func (rt *Router) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	opts := &websocket.AcceptOptions{}
 	if rt.WSAllowAllOrigins {
@@ -69,17 +82,13 @@ func (rt *Router) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(1 << 20) // 1MB max incoming message
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
-	ws := &wsConn{conn: conn, acceptLanguage: r.Header.Get("Accept-Language")}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	ws := &wsConn{conn: conn, ctx: ctx, acceptLanguage: r.Header.Get("Accept-Language")}
 
 	// Track this connection's stream subscriptions for cleanup on disconnect
-	var connSubs []connStreamSub
-	defer func() {
-		for _, cs := range connSubs {
-			rt.Streams.Unsubscribe(cs.apiName, cs.sub)
-		}
-	}()
+	var connSubs connectionSubscriptions
+	defer connSubs.close(rt.Streams)
 
 	for {
 		msgType, data, err := conn.Read(ctx)
@@ -88,14 +97,14 @@ func (rt *Router) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if msgType == websocket.MessageText {
-			// Check for $sub/$unsub before dispatching as request
-			if isStreamMsg(data) {
-				rt.handleWSStreamJSON(ctx, ws, data, &connSubs)
-			} else {
-				go rt.handleWSJSON(ctx, ws, data)
+			if !rt.handleWSText(ctx, ws, data, &connSubs) {
+				return
 			}
 		} else if len(data) > 0 {
 			switch data[0] {
+			case 0x04, 0x05, 0x06, 0x07, 0x08:
+				conn.Close(websocket.StatusProtocolError, "retired stream protocol")
+				return
 			case BinaryFrameSubscribe, BinaryFrameUnsubscribe:
 				rt.handleWSStreamBinary(ctx, ws, data, &connSubs)
 			case BinaryFrameCallRequest:
@@ -105,138 +114,84 @@ func (rt *Router) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// connStreamSub tracks a subscription belonging to this WS connection.
-type connStreamSub struct {
-	apiName string
-	sub     *StreamSub
+// Validate the complete message, not individual fragments. RFC 6455 §8.1.
+// Classify only decoded top-level names, including escaped control keys.
+func (rt *Router) handleWSText(ctx context.Context, ws *wsConn, data []byte, connSubs *connectionSubscriptions) bool {
+	raw, err := jsonutil.ParseObject(data)
+	if err != nil {
+		if invalidJSONUnicode(data, err) {
+			ws.conn.Close(websocket.StatusInvalidFramePayloadData, "invalid JSON Unicode")
+			return false
+		}
+		return true // Preserve the existing malformed-JSON drop policy.
+	}
+	if isStreamRequest(raw) {
+		rt.handleWSStreamJSON(ctx, ws, raw, connSubs)
+	} else {
+		go rt.handleWSJSON(ctx, ws, raw)
+	}
+	return true
 }
 
-// isStreamMsg checks if a JSON message has "$sub" or "$unsub" as a top-level key.
-// Tracks brace depth to ensure the key is at the root object level (depth == 1).
-func isStreamMsg(data []byte) bool {
-	depth := 0
-	inString := false
-	escape := false
-	for i := 0; i < len(data); i++ {
-		if escape {
-			escape = false
-			continue
-		}
-		ch := data[i]
-		if inString {
-			if ch == '\\' {
-				escape = true
-			} else if ch == '"' {
-				inString = false
-			}
-			continue
-		}
-		switch ch {
-		case '{':
-			depth++
-		case '}':
-			depth--
-		case '"':
-			if depth == 1 && matchStreamKey(data, i) {
-				return true
-			}
-			inString = true
-		}
-	}
-	return false
+func isStreamRequest(raw map[string]json.RawMessage) bool {
+	_, sub := raw["$sub"]
+	_, unsub := raw["$unsub"]
+	return sub || unsub
 }
 
-// matchStreamKey checks if data[i:] starts with "$sub": or "$unsub":.
-func matchStreamKey(data []byte, i int) bool {
-	if i+1 >= len(data) || data[i+1] != '$' {
-		return false
+func invalidJSONUnicode(data []byte, err error) bool {
+	if !utf8.Valid(data) {
+		return true
 	}
-	if i+6 <= len(data) && data[i+2] == 's' && data[i+3] == 'u' && data[i+4] == 'b' && data[i+5] == '"' {
-		return hasColonAfter(data, i+6)
-	}
-	if i+8 <= len(data) && data[i+2] == 'u' && data[i+3] == 'n' && data[i+4] == 's' && data[i+5] == 'u' && data[i+6] == 'b' && data[i+7] == '"' {
-		return hasColonAfter(data, i+8)
-	}
-	return false
-}
-
-// hasColonAfter checks if the next non-whitespace byte at or after pos is ':'.
-func hasColonAfter(data []byte, pos int) bool {
-	for pos < len(data) {
-		if data[pos] == ' ' || data[pos] == '\t' || data[pos] == '\n' || data[pos] == '\r' {
-			pos++
-			continue
-		}
-		return data[pos] == ':'
-	}
-	return false
+	// Only the failure path distinguishes invalid escapes from ordinary syntax
+	// errors. No second scan is added to successful messages. The strict parser
+	// already allows duplicates, so a v1-valid syntactic failure is Unicode.
+	_, syntax := stderrors.AsType[*jsontext.SyntacticError](err)
+	return syntax && json.Valid(data)
 }
 
 // handleWSStreamJSON handles JSON $sub/$unsub messages.
-func (rt *Router) handleWSStreamJSON(ctx context.Context, ws *wsConn, data []byte, connSubs *[]connStreamSub) {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return
-	}
-
-	// Subscribe: {"$sub": "watchDanmaku", "roomId": 123}
-	if subRaw, ok := raw["$sub"]; ok {
-		var apiName string
-		if err := json.Unmarshal(subRaw, &apiName); err != nil || apiName == "" {
-			rt.writeWSJSONSubscriptionError(ctx, ws, apiName, errors.New("BadRequest", http.StatusBadRequest, "invalid $sub API name"))
+func (rt *Router) handleWSStreamJSON(ctx context.Context, ws *wsConn, raw map[string]json.RawMessage, connSubs *connectionSubscriptions) {
+	// Subscribe: {"$id": 1, "$sub": "watchDanmaku", "roomId": 123}
+	if _, ok := raw["$sub"]; ok {
+		id, valid := parseWSJSONSequence(raw["$id"])
+		if !valid {
+			return // No trustworthy subscription ID; do not dispatch or reply.
+		}
+		if !connSubs.reserve(id) {
+			rt.writeWSJSONSubscriptionError(ctx, ws, id, errors.New("Conflict", http.StatusConflict, "subscription IDs must increase and cannot be reused"))
 			return
 		}
-		req, params, err := rt.parseJSONSubscription(raw)
+		if _, ambiguous := raw["$unsub"]; ambiguous {
+			rt.writeWSJSONSubscriptionError(ctx, ws, id, errors.New("BadRequest", http.StatusBadRequest, "subscription cannot also unsubscribe"))
+			return
+		}
+		req, params, err := rt.prepareWSJSONSubscription(raw)
 		if err != nil {
-			rt.writeWSJSONSubscriptionError(ctx, ws, apiName, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
+			rt.writeWSJSONSubscriptionError(ctx, ws, id, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
 			return
 		}
-		if !rt.isStreamAPI(apiName) {
-			rt.writeWSJSONSubscriptionError(ctx, ws, apiName, errors.New("BadRequest", http.StatusBadRequest, apiName+" is not a stream API"))
-			return
-		}
-		if hasConnectionSubscription(*connSubs, apiName) {
-			rt.writeWSJSONSubscriptionError(ctx, ws, apiName, errors.New("Conflict", http.StatusConflict, apiName+" is already subscribed"))
-			return
-		}
-
-		// Extract identity from context
-		identity := rt.identityFromCtx(ctx)
-
-		// Per-subscription context — cancelled on slow consumer or connection close.
-		subCtx, subCancel := context.WithCancel(ctx)
-
-		sub := rt.Streams.SubscribeMode(apiName, params, identity, req.FieldMask, false, subCancel)
-		if sub == nil {
-			subCancel()
-			rt.writeWSJSONSubscriptionError(ctx, ws, apiName, errors.New("Unavailable", http.StatusServiceUnavailable, apiName+" subscriber limit reached"))
-			return
-		}
-		sub.Params.binary = append([]byte(nil), req.BinaryParams()...)
-		*connSubs = append(*connSubs, connStreamSub{apiName: apiName, sub: sub})
-		if err := rt.writeWSJSONSubscriptionSuccess(ctx, ws, apiName); err != nil {
-			return
-		}
-
-		// Start write pump
-		go WritePumpJSON(subCtx, ws, apiName, sub)
-
-		rt.startNativeStreamHandler(subCtx, apiName, params, identity, sub)
+		rt.startWSSubscription(ctx, ws, connSubs, id, req, params, false)
 		return
 	}
 
-	// Unsubscribe: {"$unsub": "watchDanmaku"}
-	if unsubRaw, ok := raw["$unsub"]; ok {
-		var apiName string
-		json.Unmarshal(unsubRaw, &apiName)
-		for i, cs := range *connSubs {
-			if cs.apiName == apiName {
-				rt.Streams.Unsubscribe(apiName, cs.sub)
-				*connSubs = append((*connSubs)[:i], (*connSubs)[i+1:]...)
-				return
-			}
+	// Unsubscribe: {"$unsub": 1}; API names never identify an existing instance.
+	if unsubRaw, ok := raw["$unsub"]; ok && len(raw) == 1 {
+		if id, valid := parseWSJSONSequence(unsubRaw); valid {
+			rt.unsubscribeWS(connSubs, id)
 		}
 	}
+}
+
+func (rt *Router) prepareWSJSONSubscription(raw map[string]json.RawMessage) (*Request, map[string]any, error) {
+	req, params, err := rt.parseJSONSubscription(raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !rt.isStreamAPI(req.API) {
+		return nil, nil, fmt.Errorf("%s is not a stream API", req.API)
+	}
+	return req, params, nil
 }
 
 func (rt *Router) parseJSONSubscription(raw map[string]json.RawMessage) (*Request, map[string]any, error) {
@@ -262,7 +217,7 @@ func (rt *Router) parseJSONSubscription(raw map[string]json.RawMessage) (*Reques
 }
 
 // handleWSStreamBinary handles binary stream subscribe/unsubscribe.
-func (rt *Router) handleWSStreamBinary(ctx context.Context, ws *wsConn, data []byte, connSubs *[]connStreamSub) {
+func (rt *Router) handleWSStreamBinary(ctx context.Context, ws *wsConn, data []byte, connSubs *connectionSubscriptions) {
 	if len(data) < 2 {
 		return
 	}
@@ -270,83 +225,116 @@ func (rt *Router) handleWSStreamBinary(ctx context.Context, ws *wsConn, data []b
 	frameType := data[0]
 	off := 1
 
-	apiID, n := codec.ReadVarint(data, off)
+	id, n := codec.ReadVarint(data, off)
 	if n <= 0 {
 		return
 	}
 	off += n
 
-	apiName, ok := rt.Registry.NameByID(int(apiID))
-	if !ok {
-		if frameType == BinaryFrameSubscribe {
-			rt.writeWSBinarySubscriptionError(ctx, ws, apiID, errors.NotFound.WithData(errors.ResourceError{Resource: fmt.Sprintf("API %d", apiID)}))
-		}
-		return
-	}
-
 	if frameType == BinaryFrameUnsubscribe {
 		if off != len(data) {
 			return
 		}
-		// Unsubscribe
-		for i, cs := range *connSubs {
-			if cs.apiName == apiName {
-				rt.Streams.Unsubscribe(apiName, cs.sub)
-				*connSubs = append((*connSubs)[:i], (*connSubs)[i+1:]...)
-				return
-			}
-		}
+		rt.unsubscribeWS(connSubs, id)
+		return
+	}
+	if !connSubs.reserve(id) {
+		rt.writeWSBinarySubscriptionError(ctx, ws, id, errors.New("Conflict", http.StatusConflict, "subscription IDs must increase and cannot be reused"))
+		return
+	}
+	apiID, size := codec.ReadVarint(data, off)
+	if size <= 0 {
+		rt.writeWSBinarySubscriptionError(ctx, ws, id, errors.New("BadRequest", http.StatusBadRequest, "invalid API ID"))
+		return
+	}
+	apiName, ok := rt.Registry.NameByID(int(apiID))
+	if !ok || uint64(int(apiID)) != apiID || int(apiID) < 0 {
+		rt.writeWSBinarySubscriptionError(ctx, ws, id, errors.NotFound.WithData(errors.ResourceError{Resource: fmt.Sprintf("API %d", apiID)}))
 		return
 	}
 	if !rt.isStreamAPI(apiName) {
-		rt.writeWSBinarySubscriptionError(ctx, ws, apiID, errors.New("BadRequest", http.StatusBadRequest, apiName+" is not a stream API"))
-		return
-	}
-	if hasConnectionSubscription(*connSubs, apiName) {
-		rt.writeWSBinarySubscriptionError(ctx, ws, apiID, errors.New("Conflict", http.StatusConflict, apiName+" is already subscribed"))
+		rt.writeWSBinarySubscriptionError(ctx, ws, id, errors.New("BadRequest", http.StatusBadRequest, apiName+" is not a stream API"))
 		return
 	}
 
 	// Subscribe body is identical to the canonical HTTP binary request body.
 	req := GetRequest()
 	defer PutRequest(req)
-	if err := rt.Registry.ParseBinaryRequestInto(data[1:], req); err != nil {
-		rt.writeWSBinarySubscriptionError(ctx, ws, apiID, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
+	if err := rt.Registry.ParseBinaryRequestInto(data[off:], req); err != nil {
+		rt.writeWSBinarySubscriptionError(ctx, ws, id, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
 		return
 	}
 	if err := rt.validatePublicSelection(req, true); err != nil {
-		rt.writeWSBinarySubscriptionError(ctx, ws, apiID, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
+		rt.writeWSBinarySubscriptionError(ctx, ws, id, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
 		return
 	}
-	params := binaryStreamParams(req)
+	rt.startWSSubscription(ctx, ws, connSubs, id, req, binaryStreamParams(req), true)
+}
 
+func (rt *Router) startWSSubscription(ctx context.Context, ws *wsConn, connSubs *connectionSubscriptions, id uint64, req *Request, params map[string]any, binary bool) {
+	apiName := req.API
 	identity := rt.identityFromCtx(ctx)
-	subCtx, subCancel := context.WithCancel(ctx)
-
-	sub := rt.Streams.SubscribeMode(apiName, params, identity, req.FieldMask, true, subCancel)
+	sub, subCtx, writerCtx := rt.Streams.subscribeWS(ctx, apiName, params, identity, req.FieldMask, binary)
 	if sub == nil {
-		subCancel()
-		rt.writeWSBinarySubscriptionError(ctx, ws, apiID, errors.New("Unavailable", http.StatusServiceUnavailable, apiName+" subscriber limit reached"))
+		err := errors.New("Unavailable", http.StatusServiceUnavailable, apiName+" subscriber limit reached")
+		if binary {
+			rt.writeWSBinarySubscriptionError(ctx, ws, id, err)
+		} else {
+			rt.writeWSJSONSubscriptionError(ctx, ws, id, err)
+		}
 		return
 	}
 	sub.Params.binary = append([]byte(nil), req.BinaryParams()...)
-	*connSubs = append(*connSubs, connStreamSub{apiName: apiName, sub: sub})
-	if err := rt.writeWSBinarySubscriptionSuccess(ctx, ws, apiID); err != nil {
+	connSubs.add(id, apiName, sub)
+	var err error
+	if binary {
+		err = rt.writeWSBinarySubscriptionSuccess(ctx, ws, id)
+	} else {
+		err = rt.writeWSJSONSubscriptionSuccess(ctx, ws, id)
+	}
+	if err != nil {
+		rt.Streams.Unsubscribe(apiName, sub)
+		connSubs.remove(id, sub)
 		return
 	}
-
-	go WritePumpBinary(subCtx, ws, int(apiID), sub)
-
+	go rt.writeSubscription(writerCtx, ws, apiName, id, sub, connSubs)
 	rt.startNativeStreamHandler(subCtx, apiName, params, identity, sub)
 }
 
-func hasConnectionSubscription(subscriptions []connStreamSub, apiName string) bool {
-	for _, subscription := range subscriptions {
-		if subscription.apiName == apiName {
-			return true
-		}
+func (rt *Router) unsubscribeWS(connSubs *connectionSubscriptions, id uint64) {
+	if item, ok := connSubs.take(id); ok {
+		rt.Streams.Unsubscribe(item.apiName, item.sub)
 	}
-	return false
+}
+
+func (rt *Router) writeSubscription(ctx context.Context, ws *wsConn, apiName string, id uint64, sub *StreamSub, connSubs *connectionSubscriptions) {
+	defer connSubs.remove(id, sub)
+	defer rt.Streams.Unsubscribe(apiName, sub)
+	var err error
+	if sub.Binary {
+		err = WritePumpBinary(ctx, ws, id, sub)
+	} else {
+		err = WritePumpJSON(ctx, ws, id, sub)
+	}
+	if err == nil && ctx.Err() == nil {
+		// Receiving the closed channel publishes the immutable terminal result.
+		// Only this writer sends it, after all accepted data, at most once.
+		rt.writeWSStreamEnd(ctx, ws, id, sub.Binary, sub.result)
+	}
+}
+
+// subscribeWS gives the producer and writer sibling lifetimes. Finishing the
+// producer cancels its work immediately without interrupting accepted writes.
+// Explicit unsubscribe, slow-consumer removal and disconnect still abort both.
+func (h *StreamHub) subscribeWS(ctx context.Context, apiName string, params map[string]any, identity any, mask []byte, binary bool) (*StreamSub, context.Context, context.Context) {
+	producer, cancelProducer := context.WithCancel(ctx)
+	writer, cancelWriter := context.WithCancel(ctx)
+	sub := h.subscribeMode(apiName, params, identity, mask, binary, cancelProducer, cancelWriter)
+	if sub == nil {
+		cancelProducer()
+		cancelWriter()
+	}
+	return sub, producer, writer
 }
 
 // IdentityExtractor extracts identity from context.
@@ -368,33 +356,26 @@ func (rt *Router) identityFromCtx(ctx context.Context) any {
 }
 
 // handleWSJSON processes a JSON WebSocket message.
-func (rt *Router) handleWSJSON(ctx context.Context, ws *wsConn, data []byte) {
-	// Parse: {"$id": N, "$api": "name", ...params}
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return // malformed, drop
-	}
-
-	// Extract $id
-	var seqID int64
-	if idRaw, ok := raw["$id"]; ok {
-		json.Unmarshal(idRaw, &seqID)
+func (rt *Router) handleWSJSON(ctx context.Context, ws *wsConn, raw map[string]json.RawMessage) {
+	seqID, valid := parseWSJSONSequence(raw["$id"])
+	if !valid {
+		return // No trustworthy correlation ID; drop just like an invalid binary sequence.
 	}
 
 	req, err := parseRawRequest(raw)
 	if err != nil {
-		rt.writeWSJSONError(ctx, ws, seqID, "BadRequest", 400, err.Error())
+		rt.writeWSJSONError(ctx, ws, seqID, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
 		return
 	}
 	// Find handler
 	fn, ok := rt.handlers[req.API]
 	if !ok {
-		rt.writeWSJSONError(ctx, ws, seqID, "NotFound", 404, req.API+" not found")
+		rt.writeWSJSONError(ctx, ws, seqID, errors.New("NotFound", http.StatusNotFound, req.API+" not found"))
 		return
 	}
 
 	if err := rt.prepareRequest(req, false); err != nil {
-		rt.writeWSJSONError(ctx, ws, seqID, "BadRequest", 400, err.Error())
+		rt.writeWSJSONError(ctx, ws, seqID, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
 		return
 	}
 
@@ -405,25 +386,37 @@ func (rt *Router) handleWSJSON(ctx context.Context, ws *wsConn, data []byte) {
 	herr := rt.callHandler(fn, ctx, req)
 	if herr != nil {
 		PutBuf(buf)
-		var appErr *errors.AppError
-		if !stderrors.As(herr, &appErr) {
-			appErr = errors.Wrap(herr)
-		}
-		rt.writeWSJSONError(ctx, ws, seqID, appErr.Name, appErr.Code, appErr.Message)
+		rt.writeWSJSONError(ctx, ws, seqID, herr)
 		return
 	}
 
 	// Write JSON response: {"$id": N, "data": ...}
+	jsonBody, err := rt.convertBinaryToJSON(req.API, buf.B)
+	if err != nil {
+		PutBuf(buf)
+		rt.writeWSJSONError(ctx, ws, seqID, err)
+		return
+	}
 	resp := GetBuf()
 	resp.AppendString(`{"$id":`)
-	resp.AppendInt(seqID)
+	resp.B = strconv.AppendUint(resp.B, seqID, 10)
 	resp.AppendString(`,"data":`)
-	resp.B = append(resp.B, rt.convertBinaryToJSON(req.API, buf.B)...)
+	resp.B = append(resp.B, jsonBody...)
 	resp.AppendByte('}')
 
 	ws.writeText(ctx, resp.B)
 	PutBuf(resp)
 	PutBuf(buf)
+}
+
+// parseWSJSONSequence preserves the binary uint64 domain without a float or signed intermediate.
+// Parse the integer token directly; this adds no reflection or JSON serialization pass.
+func parseWSJSONSequence(raw []byte) (uint64, bool) {
+	if len(raw) == 0 || raw[0] < '0' || raw[0] > '9' || (len(raw) > 1 && raw[0] == '0') {
+		return 0, false
+	}
+	id, err := strconv.ParseUint(string(raw), 10, 64)
+	return id, err == nil
 }
 
 // handleWSBinary processes a binary WebSocket message.
@@ -481,19 +474,19 @@ func (rt *Router) handleWSBinary(ctx context.Context, ws *wsConn, data []byte) {
 }
 
 // writeWSJSONError sends a JSON error frame.
-func (rt *Router) writeWSJSONError(ctx context.Context, ws *wsConn, seqID int64, name string, code int, msg string) {
+func (rt *Router) writeWSJSONError(ctx context.Context, ws *wsConn, seqID uint64, err error) {
 	buf := GetBuf()
-	buf.AppendString(`{"$id":`)
-	buf.AppendInt(seqID)
-	buf.AppendString(`,"error":`)
-	buf.AppendJSONString(name)
-	buf.AppendString(`,"code":`)
-	buf.AppendInt(int64(code))
-	buf.AppendString(`,"message":`)
-	buf.AppendJSONString(msg)
-	buf.AppendByte('}')
+	appendWSJSONError(buf, seqID, rt.buildWireError(ctx, ws.acceptLanguage, err))
 	ws.writeText(ctx, buf.B)
 	PutBuf(buf)
+}
+
+func appendWSJSONError(buf *ResponseBuf, seqID uint64, err wireError) {
+	buf.AppendString(`{"$id":`)
+	buf.B = strconv.AppendUint(buf.B, seqID, 10)
+	buf.AppendByte(',')
+	appendWireErrorFields(buf, err, false)
+	buf.AppendByte('}')
 }
 
 // writeWSBinaryError sends [0x03][seq varint][canonical binary error envelope].
@@ -501,44 +494,64 @@ func (rt *Router) writeWSBinaryError(ctx context.Context, ws *wsConn, seq uint64
 	buf := GetBuf()
 	buf.B = append(buf.B, BinaryFrameCallError)
 	buf.B = codec.AppendVarint(buf.B, seq)
-	buf.B = appendBinaryError(buf.B, rt.buildWireError(ctx, ws.acceptLanguage, err))
+	appendWireErrorFields(buf, rt.buildWireError(ctx, ws.acceptLanguage, err), true)
 	ws.writeBinary(ctx, buf.B)
 	PutBuf(buf)
 }
 
-func (rt *Router) writeWSJSONSubscriptionSuccess(ctx context.Context, ws *wsConn, apiName string) error {
-	buf := GetBuf()
-	defer PutBuf(buf)
-	buf.AppendString(`{"$sub":`)
-	buf.AppendJSONString(apiName)
-	buf.AppendString(`,"ok":true}`)
-	return ws.writeText(ctx, buf.B)
+func (rt *Router) writeWSJSONSubscriptionSuccess(ctx context.Context, ws *wsConn, id uint64) error {
+	return rt.writeWSJSONStreamResult(ctx, ws, id, false, nil)
 }
 
-func (rt *Router) writeWSJSONSubscriptionError(ctx context.Context, ws *wsConn, apiName string, err error) error {
+func (rt *Router) writeWSJSONSubscriptionError(ctx context.Context, ws *wsConn, id uint64, err error) error {
+	return rt.writeWSJSONStreamResult(ctx, ws, id, false, err)
+}
+
+func (rt *Router) writeWSJSONStreamResult(ctx context.Context, ws *wsConn, id uint64, terminal bool, err error) error {
 	buf := GetBuf()
 	defer PutBuf(buf)
-	buf.AppendString(`{"$sub":`)
-	buf.AppendJSONString(apiName)
+	if terminal {
+		buf.AppendString(`{"$end":`)
+	} else {
+		buf.AppendString(`{"$sub":`)
+	}
+	buf.B = strconv.AppendUint(buf.B, id, 10)
 	buf.AppendByte(',')
-	appendJSONErrorFields(buf, rt.buildWireError(ctx, ws.acceptLanguage, err))
+	if err == nil {
+		buf.AppendString(`"ok":true`)
+	} else {
+		appendWireErrorFields(buf, rt.buildWireError(ctx, ws.acceptLanguage, err), false)
+	}
 	buf.AppendByte('}')
 	return ws.writeText(ctx, buf.B)
 }
 
-func (rt *Router) writeWSBinarySubscriptionSuccess(ctx context.Context, ws *wsConn, apiID uint64) error {
+func (rt *Router) writeWSBinarySubscriptionSuccess(ctx context.Context, ws *wsConn, id uint64) error {
+	return rt.writeWSBinaryStreamResult(ctx, ws, id, BinaryFrameSubscribeSuccess, nil)
+}
+
+func (rt *Router) writeWSBinarySubscriptionError(ctx context.Context, ws *wsConn, id uint64, err error) error {
+	return rt.writeWSBinaryStreamResult(ctx, ws, id, BinaryFrameSubscribeError, err)
+}
+
+func (rt *Router) writeWSBinaryStreamResult(ctx context.Context, ws *wsConn, id uint64, frame byte, err error) error {
 	buf := GetBuf()
 	defer PutBuf(buf)
-	buf.B = append(buf.B, BinaryFrameSubscribeSuccess)
-	buf.B = codec.AppendVarint(buf.B, apiID)
+	buf.B = append(buf.B, frame)
+	buf.B = codec.AppendVarint(buf.B, id)
+	if err != nil {
+		appendWireErrorFields(buf, rt.buildWireError(ctx, ws.acceptLanguage, err), true)
+	}
 	return ws.writeBinary(ctx, buf.B)
 }
 
-func (rt *Router) writeWSBinarySubscriptionError(ctx context.Context, ws *wsConn, apiID uint64, err error) error {
-	buf := GetBuf()
-	defer PutBuf(buf)
-	buf.B = append(buf.B, BinaryFrameSubscribeError)
-	buf.B = codec.AppendVarint(buf.B, apiID)
-	buf.B = appendBinaryError(buf.B, rt.buildWireError(ctx, ws.acceptLanguage, err))
-	return ws.writeBinary(ctx, buf.B)
+func (rt *Router) writeWSStreamEnd(ctx context.Context, ws *wsConn, id uint64, binary bool, err error) error {
+	if !binary {
+		return rt.writeWSJSONStreamResult(ctx, ws, id, true, err)
+	}
+	frame := BinaryFrameStreamComplete
+	if err != nil {
+		frame = BinaryFrameStreamError
+	}
+	return rt.writeWSBinaryStreamResult(ctx, ws, id, frame, err)
 }

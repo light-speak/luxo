@@ -13,7 +13,7 @@
   <a href="https://github.com/light-speak/luxo/actions/workflows/test.yml"><img src="https://github.com/light-speak/luxo/actions/workflows/test.yml/badge.svg" alt="Tests" /></a>
   <a href="https://codecov.io/gh/light-speak/luxo"><img src="https://codecov.io/gh/light-speak/luxo/branch/main/graph/badge.svg" alt="codecov" /></a>
   <a href="https://goreportcard.com/report/github.com/light-speak/luxo"><img src="https://goreportcard.com/badge/github.com/light-speak/luxo?v=2" alt="Go Report Card" /></a>
-  <a href="https://go.dev"><img src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go" alt="Go Version" /></a>
+  <a href="https://go.dev"><img src="https://img.shields.io/badge/Go-1.27.1+-00ADD8?style=flat&logo=go" alt="Go Version" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License" /></a>
 </p>
 
@@ -80,6 +80,8 @@ One source definition drives the generated server, database layer, migrations, s
 ## The Language
 
 Luxo is a backend programming language, not only a schema DSL. Its scalar types are `Int`, `Float`, `String`, `Boolean`, `DateTime`, `Duration`, `UUID`, `Decimal`, `Bytes`, and `JSON`; generic runtime types include `Result<T>`, `Channel<T>`, `Page<T>`, and `Cursor<T>`. Luxo compiles to Go.
+
+DateTime preserves nanoseconds in both JSON and Binary. JSON requires timezone-bearing RFC3339 with at most nine fractional digits and UTC years 0000–9999; Binary carries floor Unix seconds plus unsigned nanoseconds. Excess precision and out-of-range values are rejected. This pre-release change requires matching regenerated services and SDKs (internal RPC version 3), with no legacy time fallback. Database storage precision and performance are separate acceptance gates.
 
 ### Null Safety
 
@@ -312,7 +314,9 @@ luxo run
 
 **Luvia is always on.** Embedded mode runs every module and the gateway in one process. Cluster mode uses generated per-module service binaries plus a generated gateway; RPC routing and federation loaders come from the same analyzed schema, without handwritten transport clients.
 
-JSON and Luxo Binary are both production transports. HTTP clients select them through the SDK transport mode or `X-Luxo-Mode: json|binary`; WebSocket and native RPC use their canonical binary framing. `APP_ENV` never silently changes the wire contract.
+JSON and Luxo Binary are both production transports. HTTP clients select them through the SDK transport mode or `X-Luxo-Mode: json|binary`; WebSocket supports JSON text and canonical binary frames, while native RPC uses its binary framing. `APP_ENV` never silently changes the wire contract.
+
+Both encodings preserve the same value semantics. Business `Int`/`Duration` are signed int64; WebSocket call IDs (`$id` in JSON, `sequence` in Binary) are unsigned uint64. JSON IDs must be unquoted decimal integer tokens in `0…18446744073709551615`, not booleans, strings, fractions or exponents. Invalid/missing/overflowing IDs are dropped before handler dispatch, never coerced to zero. Successful and failed calls echo the exact valid ID. SDK counters must fail on exhaustion instead of rounding, narrowing or overwriting pending calls; complete cross-SDK boundary acceptance remains a beta release gate.
 
 ### Request and SQL Tracing
 
@@ -366,7 +370,65 @@ The public contract covers DSL semantics, supported CLI/configuration, generated
 
 Each release must identify the exact core commit and tested TypeScript, Dart, Kotlin, and Swift SDK versions/commits. Release gates include compiler/runtime tests, race checks, lint and reachable-path coverage review, benchmark comparison against the previous baseline, cross-SDK protocol fixtures, and a clean external consumer build. Preserve baseline fixtures and generated consumers; running only regenerated clients against a new server is not a backward-compatibility test. Before the first stable release, verify Studio against the candidate without a developer Go workspace or unpinned sibling checkout.
 
+SDK convenience features may follow the core release, but protocol correctness cannot: `Int` and `Duration` must preserve the entire signed 64-bit range, reject overflow/truncated binary values, and agree across JSON/Binary, nullable values, arrays, columns, and streams. Use shared exact-wire fixtures, not just same-SDK round trips. Validate Dart VM and JavaScript targets independently; passing native tests does not certify web precision. SDK version pinning is not a reason to defer these release blockers.
+
 Studio releases must pin the tested core Go module, CLI, frontend SDKs, and CI checkout to the recorded release/commit, never floating `main` or `latest`. Local source overrides are development-only. Studio and independently released SDKs keep their own version numbers; the release compatibility matrix, not identical numbers, establishes support. PostgreSQL is the currently implemented database backend; future database backends and new Studio features are outside this release freeze.
+
+#### Pre-Beta Internal RPC Upgrade (Under Validation)
+
+The unreleased internal protocol does not retain old-gateway compatibility or automatic fallback. Regenerate, rebuild, and deploy gateways and services together from the same verified core commit. This does not change the public SDK HTTP/WebSocket JSON/Binary formats.
+
+Each new TCP connection exchanges a fixed preface and requires an exact `rpc.ProtocolVersion` match before business requests. Pooled connections do not repeat the handshake. New connections, reconnects, and newly opened stream connections incur one extra network RTT, subject to separate performance acceptance. Requests use one kind/flags/token/optional-trace/body format; historical trace-request decoders are removed. Version checks do not replace authentication or schema/lock ID consistency checks.
+
+Internal relation resolvers now require `keys` (field 1) and `shape` (field 2: bit 0 list, bit 1 nullable). Each response group is the canonical field value, including presence and length, with an object or columnar-list body generated by the target service. The gateway validates and copies those bytes without model decoding/re-encoding. Required missing objects and multiple rows for a single relation fail; empty lists and selected null values remain distinct. Regenerate both gateways and services together.
+
+Nested response regressions pass for the new format. Unary RPC errors now preserve raw JSON data, differing interpolation text and the internal-error flag without converting numbers to floating point. Generated TS, Dart, Kotlin and Swift consumers exercise error data through gateways over HTTP/WebSocket and JSON/Binary. Native stream termination errors, full SDK/device acceptance and performance gates remain open; this does not freeze Beta.
+
+#### Pre-Beta Error Data Interface Migration
+
+The development Go API uses static `errors.ErrorData` methods `AppendJSON(dst []byte) ([]byte, error)` and `AppendText(dst []byte, field string) ([]byte, bool)` instead of `I18nData()/MapData` and reflective formatting. Luxo error declarations and constructor arguments are unchanged: rerun `luxo gen`. Handwritten native error data implementations must implement the new methods. Use `errors.IntID(value)`, `errors.StringID(value)`, or `errors.UUIDID(value)` for `ResourceError.ID` rather than a dynamically typed ID.
+
+AppendJSON must append valid JSON on success and preserve the original dst prefix on failure; `errors.DataWriter` provides static writers. AppendText supplies only the requested field and returns the original dst with false for a missing or unrepresentable value. Direct i18n callers may use string-only `i18n.Values`. Int/Duration retain the full signed 64-bit range; generic JSON keeps original numeric tokens without floating-point conversion. Internal errors never encode or interpolate data, expose only `error.internal` as their message, and disclose cause only in development mode.
+
+This is a pre-freeze Go source-interface change, not a change to the public JSON/Binary numeric contracts or binary layouts. Unary RPC data propagation is covered by the integration tests above, not a certification of every SDK path or performance gate. Float writer error propagation has been separately approved and implemented; performance acceptance remains independent.
+
+#### Finite Float Writer Migration (Under Validation)
+
+`codec.LuxoMarshaler.MarshalLuxo` now returns `([]byte, error)`; rerun `luxo gen` for events and update handwritten implementations. Encoder Float value/field/array writers and ColumnarWriter Float column writers return `error`, rejecting NaN/infinities without committing a partial field or column. `rpc.EncodeParams` also returns `([]byte, error)` and rejects unsupported values instead of dropping parameters. NATS does not publish when marshaling fails; the existing `Emit` error return is unchanged.
+
+Generated model/type `WriteLuxo` and all `WriteColumnar` variants now return `error`; `codec.AppendFixed64` returns `([]byte,error)`, and `ResponseBuf.AppendFloat` returns `error`. Nested events, compiled/native handlers and internal RPC propagate failures. Direct ResponseBuf callers must discard the current output after a write error.
+
+`codec.ColumnarWriter.Bytes()` now returns `([]byte, error)`. It rejects nonempty zero-column output, invalid record/arena counts, nonpositive field IDs and inconsistent column lengths before touching the output buffer; failures return nil bytes. Callers must check the error. Empty lists retain `00 00 00`, and a selected all-null column remains valid. Call `Reset()` after inconsistent columns or invalid field IDs; generated direct writers already return errors and do not use this buffered helper. This API change does not imply performance acceptance for unmeasured workloads.
+
+Stream encoder callbacks and `StreamPayloadJSON` return `([]byte,error)`; `TypedStream.Send` and `Dispatch*` report failures without sending the failed payload. All five schema Binary-to-JSON converters also return `([]byte,error)`, propagated through HTTP, WebSocket and CLI instead of disguising invalid responses as integers, null or default pagination. Rerun `luxo gen` and update handwritten encoder callbacks; ordinary DSL and native business return types are unchanged.
+
+The gateway native-stream proxy stops forwarding when conversion fails. Its existing void handler contract does not yet deliver complete terminal error data to SDK subscribers; stopping invalid messages is not certification of that separate protocol path.
+
+Valid wire bytes, negative zero and finite subnormals are preserved. Checks apply only to fields actually written, without reflection or additional serialization round trips. Cross-SDK revalidation, end-to-end performance acceptance and protocol freeze remain pending. An asynchronous subscriber failure cannot retroactively fail a completed publish, retract previously delivered valid messages, or roll back database writes.
+
+#### Modern Stable Toolchains
+
+The development mainline actively adopts the latest stable toolchains and useful stable language features. It does not maintain old compiler support merely for its own sake. Experimental flags, nightly compilers, and preview APIs are not requirements of released SDKs. Toolchain upgrades do not change wire versions, field IDs, integer precision, or selection semantics.
+
+The current migration targets are Go 1.27.1+, TypeScript 7, Dart 3.13+, and Kotlin 2.4.20; Swift tracks its latest stable compiler line in separately verified SDK changes. Compiler versions and device/runtime deployment targets are separate decisions: a newer Kotlin or Swift compiler does not by itself justify dropping older Android or iOS devices.
+
+The exact Node version for JavaScript development and SDK interoperability is defined in [`.node-version`](.node-version), shared by TS and Dart Web CI instead of a floating major. Before installing dependencies, `sh scripts/check-node.sh` verifies the actual runtime; Studio's linked build uses the same core script. Old or preview versions, invalid pins, and failed tool invocations stop validation without downloading or installing tools. TS CI also pins pnpm and reports the actual Node, pnpm and TypeScript compiler versions. Node declarations in all three TS packages are build/test-only, with resolved versions pinned by lockfiles; they do not enter browser runtime code. Client/React retain ES2022 output, and the Vite plugin declares its minimum Node requirement separately. Updating development tools does not certify browser or minimum plugin-runtime compatibility.
+
+Dart CI pins both the supported minimum, 3.13.0, and the selected stable version, 3.13.4, in the [workflow](.github/workflows/test.yml). Both use the same analysis, VM, JavaScript/Wasm, and generated-consumer checks. Startup verification rejects a different compiler version, a preview channel, or a failed tool invocation instead of treating floating `stable` as a reproducible baseline. Updating this exact version neither raises the SDK minimum nor approves performance costs caused by compiler changes.
+
+The Go generator and generated projects move together: database entry points use generic methods `DB.QueryRows[T]`, `DB.QueryRow[T]` and `DB.QueryScalar[T]`, retaining package-level call compatibility over one implementation. Existing `Query[T]`, create/update bases and DataLoader already share generic algorithms; model scanners, field selection and codecs remain schema-specialized. `NativeResolver` keeps concrete signatures because interface methods cannot declare independent type parameters.
+
+Go-based analysis tools must also be built with a compiler that understands the project's syntax. From this repository root, rebuild the pinned checker with `go install github.com/fzipp/gocyclo/cmd/gocyclo@v0.6.0` and inspect it with `go version -m "$(command -v gocyclo)"` after upgrading Go. The tracked pre-commit hook, `bash scripts/lint.sh`, and CI share [check-go.sh](scripts/check-go.sh), checking `pkg/`, `cmd/`, and `scripts/`. Missing tools, parse failures, unexpected diagnostics, unformatted files, and complexity above 25 all fail the gate with diagnostics preserved. Nothing is automatically installed or skipped locally; reinstall the tracked hook if using an older copied version.
+
+For a CI-like local database test run, set `LUXO_TEST_DATABASE_URL` to a dedicated PostgreSQL test database: each test creates and cleans its own schema. Without it, tests start individual containers, whose cumulative startup/cleanup can exceed the local lint script's 60-second package timeout. Do not point this setting at application data or skip database tests to obtain a passing result.
+
+Dart hints use resolved types at build time for primary-constructor fields, local aliases, nested relations, list/page access and inline callbacks. Cross-file and `part` merging isolates symbols and client libraries. SDK wrappers such as `Selected.value` are not wire fields, and explicit `select` takes precedence. See the [Dart SDK](packages/dart/README.md#compile-time-field-tracking) for the default output directory and static-analysis boundaries; source analysis never runs on the request path.
+
+Adoption includes generators, generated consumers, build/declaration tools, language-aware field-selection analysis, CI, and documentation, not just manifest edits. Unsupported source syntax must produce a diagnostic, never silently expand field selection. Stable features are adopted where they improve correctness, performance, or maintainability; new syntax alone is not evidence of faster runtime code. Reflection and generic hot-path serialization remain prohibited.
+
+Lock exact resolved tools for reproducible builds and record them in release evidence. CI verifies the supported minimum and current stable toolchain where different; previews belong in separate scheduled compatibility checks. Compare baseline and candidate on the same toolchain, and separately measure compiler upgrades on unchanged code. Do not reset performance baselines to hide regressions. Published artifacts keep their recorded requirements; increasing a released package's minimum compiler requires an explicit compatibility review, version decision, and migration notes, never a silent maintenance update.
+
+References: [Go 1.27](https://go.dev/doc/go1.27), [Dart 3.13](https://dart.dev/blog/announcing-dart-3-13), [TypeScript 7](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/).
 
 #### Performance Blocking and Approved Feature Costs
 

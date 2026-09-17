@@ -85,13 +85,24 @@ const schema: LuxoSchema = {
 beforeEach(() => outputs.clear())
 
 describe('generateTypes', () => {
+	it('keeps nullable array markers outside columnar array cells', async () => {
+		await generateTypes({ models: { ArrayRecord: {
+			name: 'ArrayRecord', usage: 'output',
+			fields: [{ id: 1, name: 'values', type: 'Int', isList: true, nullable: true }],
+		} }, apis: {} }, 'generated')
+		const types = outputs.get('generated/types.ts') ?? ''
+		expect(types).toContain("dec.readBool() ? dec.readIntArray() : null")
+		expect(types).toContain('let _values: (Uint8Array | null)[] | undefined')
+		expect(types).toContain('_values = r.readColumnBytesPtr()')
+		expect(types).toContain("_values[i] === null ? null : decodeScalarArray(_values[i]!, 'Int') as bigint[]")
+	})
 	it('keeps default scalar fields strict and explicit selections tri-state', async () => {
 		await generateTypes(schema, 'generated')
 
 		const types = outputs.get('generated/types.ts') ?? ''
 		const client = outputs.get('generated/client.ts') ?? ''
 		expect(types).toContain('export interface Node<Selection extends boolean = false>')
-		expect(types).toContain('id: true extends Selection ? Selected<number> : number')
+		expect(types).toContain('id: true extends Selection ? Selected<bigint> : bigint')
 		expect(client).toContain('async createSnapshot<Select extends string | undefined = undefined>')
 		expect(client).toContain('params?: { $select?: Select }')
 		expect(client).toContain('Promise<Node<Select extends string ? true : false>>')
@@ -119,7 +130,7 @@ describe('generateTypes', () => {
 		}, 'generated')
 
 		const types = outputs.get('generated/types.ts') ?? ''
-		expect(types).toContain('id: true extends Selection ? Selected<number> : number')
+		expect(types).toContain('id: true extends Selection ? Selected<bigint> : bigint')
 		expect(types).toContain('children: Selected<Child<Selection>[]>')
 	})
 
@@ -131,15 +142,15 @@ describe('generateTypes', () => {
 		expect(client).toContain('apiName: string | null')
     expect(client).toContain('tags?: string[]')
 		expect(client).toContain('input: CreateNodeInput')
-		expect(client).toMatch(/import type \{[^\n]*CreateNodeInput[^\n]*\} from '\.\/types'/)
+		expect(client).toMatch(/import type \{[^\n]*CreateNodeInput[^\n]*\} from '\.\/types\.js'/)
     expect(client).toContain('TransportOptions, CallOptions, Page, Filter, Sorter')
     expect(client).toContain('$filters?: Filter[]; $sorters?: Sorter[]')
     expect(client).toContain('}, options?: CallOptions): Promise<MetricTimeSeries<Select extends string ? true : false>[]>')
-    expect(client).toContain('params?: { page?: number; pageSize?: number; $select?: Select; $filters?: Filter[]; $sorters?: Sorter[] }, options?: CallOptions')
-    expect(client).toContain('async searchNodes<Select extends string | undefined = undefined>(params?: { page?: number; pageSize?: number; $select?: Select; $filters?: Filter[]; $sorters?: Sorter[] }')
+    expect(client).toContain('params?: { page?: bigint; pageSize?: bigint; $select?: Select; $filters?: Filter[]; $sorters?: Sorter[] }, options?: CallOptions')
+    expect(client).toContain('async searchNodes<Select extends string | undefined = undefined>(params?: { page?: bigint; pageSize?: bigint; $select?: Select; $filters?: Filter[]; $sorters?: Sorter[] }')
     expect(client).toContain('async createSnapshot<Select extends string | undefined = undefined>(params?: { $select?: Select }, options?: CallOptions)')
     expect(client).not.toContain('async createSnapshot(input:')
-    expect(client).toContain('projectId: number; apiName: string | null; tags?: string[]; input: CreateNodeInput; $select?: Select')
+    expect(client).toContain('projectId: bigint; apiName: string | null; tags?: string[]; input: CreateNodeInput; $select?: Select')
     expect(client).toContain("this.transport.call('getMetricTimeSeries', params, options)")
     expect(apiSchema).toContain("name: 'tags', type: 'String', isList: true")
 		expect(apiSchema).toContain("name: 'apiName', type: 'String', nullable: true")
@@ -232,6 +243,18 @@ describe('generateTypes', () => {
     expect(client).not.toMatch(/import \{[^\n]*decodeMetricTimeSeries[, }]/)
   })
 
+  it('keeps generated list helpers disjoint from model names', async () => {
+    await generateTypes({
+      models: Object.fromEntries(['Metric', 'MetricItem', 'ItemMetric'].map(name => [name, {
+        name, fields: [{ id: 1, name: 'id', type: 'Int' }],
+      }])),
+      apis: { rows: { id: 1, name: 'rows', module: 'test', returnType: 'Metric', returnList: true } },
+    }, 'generated')
+    const source = outputs.get('generated/types.ts') ?? ''
+    const names = [...source.matchAll(/(?:export )?function ([\w$]+)\(/g)].map(match => match[1])
+    expect(new Set(names).size).toBe(names.length)
+  })
+
   it('only imports runtime decode helpers used by the generated schema', async () => {
     await generateTypes({
       models: {
@@ -250,7 +273,7 @@ describe('generateTypes', () => {
 
     const types = outputs.get('generated/types.ts') ?? ''
     const client = outputs.get('generated/client.ts') ?? ''
-    expect(types).toContain("import { Decoder, ColumnarDecoder } from '@luxojs/client'")
+    expect(types).toContain("import { Decoder, ColumnarDecoder, int64FromJSON } from '@luxojs/client'")
     expect(types).not.toContain('decodeBase64')
     expect(types).not.toContain('decodeJSONValue')
     expect(types).not.toContain('decodeScalarArray')
@@ -357,8 +380,10 @@ describe('stream client generation', () => {
     }, 'generated')
 
     const client = outputs.get('generated/client.ts') ?? ''
-    expect(client).toContain('subscribeLiveAlerts<Select extends string | undefined = undefined>(params: { projectId: number; $select?: Select }, onData: (data: Alert<Select extends string ? true : false>) => void): Promise<() => void>')
-    expect(client).toContain('subscribeSystemReady<Select extends string | undefined = undefined>(params: { $select?: Select }, onData: (data: Alert<Select extends string ? true : false>) => void): Promise<() => void>')
+    expect(client).toContain('subscribeLiveAlerts<Select extends string | undefined = undefined>(params: { projectId: bigint; $select?: Select }, onData: (data: Alert<Select extends string ? true : false>) => void, observer?: StreamObserver): Promise<() => void>')
+    expect(client).toContain('subscribeSystemReady<Select extends string | undefined = undefined>(params: { $select?: Select }, onData: (data: Alert<Select extends string ? true : false>) => void, observer?: StreamObserver): Promise<() => void>')
+    expect(client).toContain('}, onData, observer)')
+    expect(client).not.toContain('return onData(')
     expect(client).toContain("this.transport.subscribe('liveAlerts', params ?? {}")
     expect(client).not.toContain('async liveAlerts(')
   })

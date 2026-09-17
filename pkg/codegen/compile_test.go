@@ -1726,8 +1726,9 @@ func TestCompileAPIBodyWithCustomTypeParam(t *testing.T) {
 	for _, want := range []string{
 		"if req.BinaryMode",
 		`req.ParamMessage("input", false, false)`,
-		"input.ReadLuxo(_inputDecoder)",
-		`api.InvalidParam("input", _inputDecoder.Err())`,
+		"input.ReadLuxoInput(_inputDecoder)",
+		"_inputDecoder.Finish()",
+		`api.InvalidParam("input", err)`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("expected native structured decode %q, got %q", want, out)
@@ -1749,7 +1750,7 @@ func TestCompileAPIBodyWithCustomTypeListParam(t *testing.T) {
 	for _, want := range []string{
 		`req.ParamMessageArray("inputs", false, false)`,
 		"inputs = make([]PostInput, len(_inputsMessages))",
-		"inputs[i].ReadLuxo(_inputsDecoder)",
+		"inputs[i].ReadLuxoInput(_inputsDecoder)",
 		`req.ParamJSON("inputs", &inputs)`,
 	} {
 		if !strings.Contains(out, want) {
@@ -2087,12 +2088,12 @@ func TestWriteScalarReturnCoversEveryWireScalar(t *testing.T) {
 		{"Float", "codec.AppendFixed64(req.Buf.B, value)"},
 		{"Boolean", "codec.AppendBool(req.Buf.B, value)"},
 		{"String", "codec.AppendString(req.Buf.B, value)"},
-		{"DateTime", "codec.AppendSvarint(req.Buf.B, value.Unix())"},
+		{"DateTime", "codec.AppendDateTime(req.Buf.B, value)"},
 		{"Duration", "codec.AppendSvarint(req.Buf.B, int64(value))"},
 		{"UUID", "codec.AppendUUID(req.Buf.B, value)"},
 		{"Decimal", "codec.AppendString(req.Buf.B, value.String())"},
 		{"Bytes", "codec.AppendBytes(req.Buf.B, value)"},
-		{"JSON", "codec.AppendBytes(req.Buf.B, value)"},
+		{"JSON", "codec.AppendJSON(req.Buf.B, value)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2117,6 +2118,25 @@ func TestWriteScalarListReturnUsesUnsignedCountAndElementCodec(t *testing.T) {
 	if !strings.Contains(out, "for _, v := range values") ||
 		!strings.Contains(out, "codec.AppendBytes(req.Buf.B, v)") {
 		t.Fatalf("Bytes list must encode every element:\n%s", out)
+	}
+}
+
+func TestCompiledAPIListParameterReturnPreservesListShape(t *testing.T) {
+	for _, name := range []string{"Int", "Float", "Boolean", "String", "DateTime", "Duration", "UUID", "Decimal", "Bytes", "JSON", "Role"} {
+		t.Run(name, func(t *testing.T) {
+			ref := &ast.TypeRef{Name: name, IsList: true}
+			declaration := &ast.ApiDecl{
+				Name: "echo", Params: []*ast.ParamDecl{{Name: "values", Type: ref}}, ReturnType: ref,
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.Ident{Name: "values"}}}},
+			}
+			var out strings.Builder
+			compileAPIBody(&out, declaration, nil, map[string]bool{"Role": true})
+			for _, want := range []string{"codec.AppendVarint(req.Buf.B, uint64(len(values)))", "for _, v := range values"} {
+				if !strings.Contains(out.String(), want) {
+					t.Fatalf("list return missing %q:\n%s", want, out.String())
+				}
+			}
+		})
 	}
 }
 
@@ -2325,6 +2345,96 @@ func TestCompileListEmpty(t *testing.T) {
 	got := c.compileExpr(&ast.ListExpr{Items: nil})
 	if got != "[]any{}" {
 		t.Fatalf("expected []any{}, got %q", got)
+	}
+}
+
+func TestCompileModelListElements(t *testing.T) {
+	for _, typed := range []bool{false, true} {
+		c := newCompiler(map[string]*ast.ModelDecl{"User": {Name: "User"}})
+		c.vars["value"] = valType{name: "User", isModel: true, isValue: true}
+		c.vars["pointer"] = valType{name: "User", isModel: true}
+		list := &ast.ListExpr{Items: []ast.Expr{
+			&ast.ObjectExpr{TypeName: "User"}, &ast.Ident{Name: "value"}, &ast.Ident{Name: "pointer"},
+		}}
+		list.SetTypeTag("User")
+		list.SetListType(true)
+		got := c.compileList(list)
+		if typed {
+			got = c.compileTypedList(list, &ast.TypeRef{Name: "User", IsList: true})
+		}
+		if got != "[]*User{&User{}, &value, pointer}" {
+			t.Fatalf("typed=%v: model list = %s", typed, got)
+		}
+	}
+}
+
+func TestCompileListCallsExecuteOnce(t *testing.T) {
+	for _, target := range []string{"variable", "return", "function"} {
+		t.Run(target, func(t *testing.T) {
+			c := newCompiler(nil)
+			c.functions = map[string]*ast.FnDecl{"next": {Name: "next", Body: &ast.Block{}, ReturnType: &ast.TypeRef{Name: "Int"}}}
+			c.api.ReturnType = &ast.TypeRef{Name: "Int", IsList: true}
+			list := &ast.ListExpr{Items: []ast.Expr{&ast.CallExpr{Func: &ast.Ident{Name: "next"}}}}
+			switch target {
+			case "variable":
+				c.compileVal(&ast.ValStmt{Name: "values", Value: list})
+			case "return":
+				c.compileReturn(&ast.ReturnStmt{Value: list})
+			case "function":
+				c.functionResult = c.api.ReturnType
+				c.compileFunctionReturn(&ast.ReturnStmt{Value: list})
+			}
+			if got := strings.Count(compilerOut(c), "app.next(ctx)"); got != 1 {
+				t.Fatalf("%s compiled one function call %d times:\n%s", target, got, compilerOut(c))
+			}
+		})
+	}
+}
+
+func TestCompileLocalListUsesItsOwnType(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	c.api.ReturnType = &ast.TypeRef{Name: "User", IsList: true}
+	list := &ast.ListExpr{Items: []ast.Expr{&ast.Literal{Kind: token.Int, Value: "7"}}}
+	list.SetTypeTag("Int")
+	list.SetListType(true)
+	c.compileVal(&ast.ValStmt{Name: "values", Value: list})
+	if !strings.Contains(compilerOut(c), "values := []int64{7}") || c.vars["values"].isModel {
+		t.Fatalf("API return type leaked into local list: %s / %+v", compilerOut(c), c.vars["values"])
+	}
+}
+
+func TestCompileValTracksUntypedWhenResult(t *testing.T) {
+	c := newCompiler(nil)
+	c.api.ReturnType = &ast.TypeRef{Name: "Int"}
+	c.compileVal(&ast.ValStmt{Name: "result", Value: &ast.WhenExpr{
+		Else: &ast.Literal{Kind: token.Int, Value: "7"},
+	}})
+	if got := c.vars["result"]; got.name != "Int" {
+		t.Fatalf("untyped when did not inherit the return type: %+v", got)
+	}
+}
+
+func TestCompileModelFunctionABI(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	model := &ast.ObjectExpr{TypeName: "User"}
+	model.SetTypeTag("User")
+	c.compileVal(&ast.ValStmt{Name: "value", Value: model})
+	c.compileVal(&ast.ValStmt{Name: "alias", Value: &ast.Ident{Name: "value"}})
+	c.vars["pointer"] = valType{name: "User", isModel: true}
+	for _, name := range []string{"value", "alias", "pointer"} {
+		c.functionResult = &ast.TypeRef{Name: "User"}
+		c.compileFunctionReturn(&ast.ReturnStmt{Value: &ast.Ident{Name: name}})
+	}
+	c.compileFunctionReturn(&ast.ReturnStmt{Value: model})
+	for _, want := range []string{"return &value, nil", "return &alias, nil", "return pointer, nil", "return &User{}, nil"} {
+		if !strings.Contains(compilerOut(c), want) {
+			t.Fatalf("missing %q: %s", want, compilerOut(c))
+		}
+	}
+	fn := &ast.FnDecl{Params: []*ast.ParamDecl{{Name: "users", Type: &ast.TypeRef{Name: "User"}, Spread: true}}}
+	call := &ast.CallExpr{Args: []*ast.NamedArg{{Value: model}, {Value: &ast.Ident{Name: "alias"}}, {Value: &ast.Ident{Name: "pointer"}}}}
+	if got := strings.Join(c.compileDeclaredFunctionArguments(call, fn), ", "); got != "&User{}, &alias, pointer" {
+		t.Fatalf("variadic model arguments = %s", got)
 	}
 }
 
@@ -3439,6 +3549,7 @@ func TestGoTypeForAwaitValue(t *testing.T) {
 		want  string
 	}{
 		{name: "model", value: valType{name: "User", isModel: true}, want: "*User"},
+		{name: "model value", value: valType{name: "User", isModel: true, isValue: true}, want: "User"},
 		{name: "model list", value: valType{name: "User", isModel: true, isList: true}, want: "[]*User"},
 		{name: "primitive", value: valType{name: "Int"}, want: "int64"},
 		{name: "primitive list", value: valType{name: "String", isList: true}, want: "[]string"},

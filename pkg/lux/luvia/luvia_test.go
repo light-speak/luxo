@@ -487,42 +487,14 @@ func TestServe_H2C(t *testing.T) {
 
 	// Use a random high port
 	t.Setenv("APP_PORT", "0")
-
-	// Start Serve in goroutine and stop with signal
-	done := make(chan error, 1)
-	go func() {
-		done <- gw.Serve("test-v1")
-	}()
-
-	// Give server time to start then send interrupt
-	time.Sleep(50 * time.Millisecond)
-	proc, _ := os.FindProcess(os.Getpid())
-	proc.Signal(syscall.SIGINT)
-
-	err := <-done
-	if err != nil {
-		t.Errorf("Serve should shut down cleanly, got: %v", err)
-	}
+	serveWithPendingShutdown(t, gw, "test-v1")
 }
 
 func TestServe_CustomShutdownTimeout(t *testing.T) {
 	t.Setenv("GRACEFUL_TIMEOUT", "1s")
 	t.Setenv("APP_PORT", "0")
 
-	gw := New()
-	done := make(chan error, 1)
-	go func() {
-		done <- gw.Serve("test-v1")
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	proc, _ := os.FindProcess(os.Getpid())
-	proc.Signal(syscall.SIGINT)
-
-	err := <-done
-	if err != nil {
-		t.Errorf("got: %v", err)
-	}
+	serveWithPendingShutdown(t, New(), "test-v1")
 }
 
 func TestServe_TLS(t *testing.T) {
@@ -532,25 +504,26 @@ func TestServe_TLS(t *testing.T) {
 	t.Setenv("APP_TLS_KEY", keyFile)
 	t.Setenv("APP_PORT", "0")
 
-	gw := New()
-	done := make(chan error, 1)
-	go func() {
-		done <- gw.Serve("test-tls")
-	}()
+	serveWithPendingShutdown(t, New(), "test-tls")
+}
 
-	time.Sleep(100 * time.Millisecond)
-	proc, _ := os.FindProcess(os.Getpid())
-	proc.Signal(syscall.SIGINT)
-
-	err := <-done
-	if err != nil {
-		t.Errorf("TLS Serve should shut down cleanly, got: %v", err)
+func serveWithPendingShutdown(t *testing.T, gw *Gateway, version string) {
+	t.Helper()
+	// Queue shutdown before startup, without signalling the entire test process.
+	quit := make(chan os.Signal, 1)
+	quit <- syscall.SIGINT
+	if err := gw.serve(version, quit); err != nil {
+		t.Fatalf("Serve should shut down cleanly: %v", err)
+	}
+	if gw.server == nil {
+		t.Fatal("Serve did not start the HTTP server")
 	}
 }
 
 func TestServeReturnsTLSLoadError(t *testing.T) {
-	t.Setenv("APP_TLS_CERT", filepath.Join(t.TempDir(), "missing-cert.pem"))
-	t.Setenv("APP_TLS_KEY", filepath.Join(t.TempDir(), "missing-key.pem"))
+	dir := gatewayTestDir(t)
+	t.Setenv("APP_TLS_CERT", filepath.Join(dir, "missing-cert.pem"))
+	t.Setenv("APP_TLS_KEY", filepath.Join(dir, "missing-key.pem"))
 	t.Setenv("APP_PORT", "0")
 
 	err := New().Serve("test-invalid-tls")
@@ -561,7 +534,7 @@ func TestServeReturnsTLSLoadError(t *testing.T) {
 
 func generateTestCert(t *testing.T) (certFile, keyFile string) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := gatewayTestDir(t)
 	certPath := filepath.Join(dir, "cert.pem")
 	keyPath := filepath.Join(dir, "key.pem")
 
@@ -587,8 +560,12 @@ func generateTestCert(t *testing.T) (certFile, keyFile string) {
 	}
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 
-	os.WriteFile(certPath, certPEM, 0600)
-	os.WriteFile(keyPath, keyPEM, 0600)
+	if err := os.WriteFile(certPath, certPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
 	return certPath, keyPath
 }
 
@@ -665,18 +642,9 @@ func TestServeWithMetricsAndRegistrar(t *testing.T) {
 	t.Setenv("APP_PORT", "0")
 
 	gw := New()
-	done := make(chan error, 1)
-	go func() {
-		done <- gw.Serve("test-v1")
-	}()
-
-	time.Sleep(100 * time.Millisecond)
-	proc, _ := os.FindProcess(os.Getpid())
-	proc.Signal(syscall.SIGINT)
-
-	err := <-done
-	if err != nil {
-		t.Errorf("Serve should shut down cleanly, got: %v", err)
+	serveWithPendingShutdown(t, gw, "test-v1")
+	if gw.metrics == nil || gw.registrar == nil {
+		t.Fatal("Studio integrations were not initialized")
 	}
 }
 
@@ -684,20 +652,13 @@ func TestWaitForShutdown_NilMetricsAndRegistrar(t *testing.T) {
 	// Test waitForShutdown with nil metrics and registrar (already covered
 	// by the basic Serve tests, but explicitly verify the nil guard paths)
 	t.Setenv("APP_PORT", "0")
+	t.Setenv("LUXO_STUDIO_URL", "")
+	t.Setenv("LUXO_API_KEY", "")
 
 	gw := New()
-	done := make(chan error, 1)
-	go func() {
-		done <- gw.Serve("test-v1")
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	proc, _ := os.FindProcess(os.Getpid())
-	proc.Signal(syscall.SIGINT)
-
-	err := <-done
-	if err != nil {
-		t.Errorf("got: %v", err)
+	serveWithPendingShutdown(t, gw, "test-v1")
+	if gw.metrics != nil || gw.registrar != nil {
+		t.Fatal("Studio integrations must stay disabled without configuration")
 	}
 }
 

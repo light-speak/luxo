@@ -1,5 +1,11 @@
 package com.luxo.client
 
+import java.io.File
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.long
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -7,6 +13,94 @@ import kotlin.test.assertTrue
 import kotlin.test.assertFailsWith
 
 class LuxoEncoderDecoderTest {
+
+    @Test
+    fun `row decoder requires an end marker`() {
+        val row = LuxoDecoder(byteArrayOf(0, 1, 84))
+        row.skipArenaHeader()
+        assertTrue(row.nextField())
+        assertEquals(42L, row.readInt())
+        assertFailsWith<LuxoCodecException> { row.nextField() }
+    }
+
+    @Test
+    fun `column decoder requires an end marker`() {
+        val column = ColumnarDecoder(byteArrayOf(1, 0, 1, 0x80.toByte(), 1))
+        assertTrue(column.nextColumn())
+        assertEquals(listOf(64L), column.readColumnInt())
+        assertFailsWith<LuxoCodecException> { column.nextColumn() }
+    }
+
+    @Test
+    fun `response completion rejects trailing data and respects pagination`() {
+        for (extra in listOf(byteArrayOf(), byteArrayOf(99))) {
+            val row = LuxoDecoder(byteArrayOf(0, 0) + extra)
+            row.skipArenaHeader()
+            assertFalse(row.nextField())
+            val column = ColumnarDecoder(byteArrayOf(0, 0, 0) + extra)
+            assertFalse(column.nextColumn())
+            if (extra.isEmpty()) {
+                row.checkComplete()
+                column.checkComplete()
+            } else {
+                assertFailsWith<LuxoCodecException> { row.checkComplete() }
+                assertFailsWith<LuxoCodecException> { column.checkComplete() }
+            }
+        }
+        val page = ColumnarDecoder(byteArrayOf(0, 0, 0, 0, 2, 40))
+        assertFalse(page.nextColumn())
+        assertFailsWith<LuxoCodecException> { page.checkComplete() }
+        assertEquals(0L, page.readSvarint())
+        assertEquals(1L, page.readSvarint())
+        assertEquals(20L, page.readSvarint())
+        page.checkComplete()
+    }
+
+    @Test
+    fun `int64 matches canonical wire and JSON values`() {
+        val fixture = Json.parseToJsonElement(
+            File("../../pkg/lux/codec/testdata/protocol-v1.json").readText()
+        ).jsonObject
+        for (entry in fixture.getValue("int64Cases").jsonArray) {
+            val item = entry.jsonObject
+            val value = item.getValue("value").jsonPrimitive.content.toLong()
+            val wire = fixtureBytes(item.getValue("wire").jsonPrimitive.content)
+            val encoder = LuxoEncoder()
+            encoder.writeSvarint(value)
+            assertTrue(wire.contentEquals(encoder.bytes()), "wire for $value")
+            assertEquals(value, LuxoDecoder(wire).readInt())
+            val containerWire = byteArrayOf(1) + wire
+            assertEquals(value, LuxoDecoder(containerWire).readIntPtr())
+            val array = LuxoDecoder(containerWire)
+            assertEquals(listOf(value), array.readArray { array.readInt() })
+            val column = ColumnarDecoder(byteArrayOf(1, 0, 1) + wire + byteArrayOf(0))
+            assertTrue(column.nextColumn())
+            assertEquals(listOf(value), column.readColumnInt())
+            val nullableColumn = ColumnarDecoder(byteArrayOf(1, 0, 1) + containerWire + byteArrayOf(0))
+            assertTrue(nullableColumn.nextColumn())
+            assertEquals(listOf(value), nullableColumn.readColumnIntPtr())
+            assertEquals(value, Json.parseToJsonElement(value.toString()).jsonPrimitive.long)
+        }
+    }
+
+    @Test
+    fun `reject invalid int64 in row and column encodings`() {
+        val fixture = Json.parseToJsonElement(
+            File("../../pkg/lux/codec/testdata/protocol-v1.json").readText()
+        ).jsonObject
+        for (entry in fixture.getValue("invalidInt64").jsonArray) {
+            val wire = fixtureBytes(entry.jsonPrimitive.content)
+            assertFailsWith<LuxoCodecException>(entry.toString()) { LuxoDecoder(wire).readInt() }
+            assertFailsWith<LuxoCodecException>(entry.toString()) {
+                val column = ColumnarDecoder(byteArrayOf(1, 0, 1) + wire)
+                assertTrue(column.nextColumn())
+                column.readColumnInt()
+            }
+        }
+    }
+
+    private fun fixtureBytes(hex: String): ByteArray =
+        hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 
 	@Test
 	fun `length-delimited values are written in place`() {
@@ -37,6 +131,17 @@ class LuxoEncoderDecoderTest {
         assertEquals(1, dec.fieldID)
         assertTrue(expected.contentEquals(dec.readBytes()))
         assertFalse(dec.nextField())
+    }
+
+    @Test
+    fun `byte lengths cannot wrap to a smaller Int`() {
+        for (length in listOf(2L, 2147483648L, 4294967296L, 4294967297L, Long.MAX_VALUE, Long.MIN_VALUE, -1L)) {
+            val encoder = LuxoEncoder()
+            encoder.writeVarint(length)
+            encoder.writeRawBytes(byteArrayOf(65))
+            assertFailsWith<LuxoCodecException>("length=$length") { LuxoDecoder(encoder.bytes()).readBytes() }
+            assertFailsWith<LuxoCodecException>("string length=$length") { LuxoDecoder(encoder.bytes()).readString() }
+        }
     }
 
     // -- Varint round-trip --
@@ -135,7 +240,7 @@ class LuxoEncoderDecoderTest {
 
     @Test
     fun `fixed64 common values`() {
-        val values = listOf(0.0, 1.0, -1.0, 3.14159, Double.MAX_VALUE, Double.MIN_VALUE, Double.NaN)
+        val values = listOf(0.0, -0.0, 1.0, -1.0, 3.14159, Double.MAX_VALUE, Double.MIN_VALUE)
         val enc = LuxoEncoder()
         for ((i, v) in values.withIndex()) {
             enc.writeFieldFloat(i + 1, v)
@@ -147,28 +252,16 @@ class LuxoEncoderDecoderTest {
             assertTrue(dec.nextField())
             assertEquals(i + 1, dec.fieldID)
             val actual = dec.readFloat()
-            if (expected.isNaN()) {
-                assertTrue(actual.isNaN())
-            } else {
-                assertEquals(expected, actual)
-            }
+            assertEquals(expected.toRawBits(), actual.toRawBits())
         }
         assertFalse(dec.nextField())
     }
 
     @Test
-    fun `fixed64 infinity`() {
-        val enc = LuxoEncoder()
-        enc.writeFieldFloat(1, Double.POSITIVE_INFINITY)
-        enc.writeFieldFloat(2, Double.NEGATIVE_INFINITY)
-        enc.writeEnd()
-
-        val dec = LuxoDecoder(enc.bytes())
-        assertTrue(dec.nextField())
-        assertEquals(Double.POSITIVE_INFINITY, dec.readFloat())
-        assertTrue(dec.nextField())
-        assertEquals(Double.NEGATIVE_INFINITY, dec.readFloat())
-        assertFalse(dec.nextField())
+    fun `fixed64 rejects non-finite values`() {
+        for (value in listOf(Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY)) {
+            assertFailsWith<LuxoCodecException> { LuxoEncoder().writeFieldFloat(1, value) }
+        }
     }
 
     // -- String round-trip --
@@ -248,9 +341,9 @@ class LuxoEncoderDecoderTest {
     // -- Edge cases --
 
     @Test
-    fun `empty buffer returns false on nextField`() {
+    fun `empty buffer cannot stand in for an end marker`() {
         val dec = LuxoDecoder(ByteArray(0))
-        assertFalse(dec.nextField())
+        assertFailsWith<LuxoCodecException> { dec.nextField() }
         assertEquals(0, dec.fieldID)
     }
 
@@ -301,6 +394,42 @@ class LuxoEncoderDecoderTest {
     }
 
     // -- UUID round-trip (16-byte fixed) --
+
+    @Test
+    fun `uuid rejects every corrupted position and non-canonical length`() {
+        val valid = "00112233-4455-6677-8899-aabbccddeeff"
+        for (index in valid.indices) {
+            val replacements = if (valid[index] == '-') listOf('0', '_', '−') else listOf('g', '-', '\u0000', 'é')
+            for (replacement in replacements) {
+                val malformed = valid.replaceRange(index, index + 1, replacement.toString())
+                assertFailsWith<LuxoCodecException>(malformed) { UuidCodec.parse(malformed) }
+            }
+        }
+        for (input in listOf("", valid.drop(1), valid + "0", valid.replace("-", ""))) {
+            assertFailsWith<LuxoCodecException>(input) { UuidCodec.parse(input) }
+        }
+    }
+
+    @Test
+    fun `uuid canonical shared cases reject misplaced separators`() {
+        val fixture = Json.parseToJsonElement(File("../../pkg/lux/codec/testdata/protocol-v1.json").readText()).jsonObject
+        val cases = fixture.getValue("uuidCanonicalCases").jsonArray
+        assertEquals(11, cases.size)
+        for (entry in cases) {
+            val item = entry.jsonObject
+            val input = item.getValue("input").jsonPrimitive.content
+            val canonical = item.getValue("canonical")
+            val encoder = LuxoEncoder()
+            if (canonical == kotlinx.serialization.json.JsonNull) {
+                assertFailsWith<LuxoCodecException>(input) { UuidCodec.parse(input) }
+                assertFailsWith<LuxoCodecException>(input) { encoder.writeUuid(input) }
+                assertEquals(0, encoder.bytes().size, input)
+            } else {
+                encoder.writeUuid(input)
+                assertEquals(canonical.jsonPrimitive.content, LuxoDecoder(encoder.bytes()).readUuid(), input)
+            }
+        }
+    }
 
     @Test
     fun `uuid round-trip canonical string`() {
@@ -416,13 +545,14 @@ class LuxoEncoderDecoderTest {
         assertEquals(emptyList(), dec.readArray { dec.readString() })
     }
 
-    // -- DateTime (svarint unix seconds -> ISO string) --
+    // -- DateTime (floor Unix seconds + nanoseconds -> ISO string) --
 
     @Test
     fun `datetime decodes svarint seconds to ISO string`() {
-        // Go wire: DateTime = svarint(unix seconds). 1748424000 == 2025-05-28T09:20:00Z.
+        // Go wire: svarint(seconds) + varint(nanos). 1748424000 == 2025-05-28T09:20:00Z.
         val enc = LuxoEncoder()
-        enc.writeFieldInt(1, 1748424000L)
+        enc.writeVarint(1)
+        enc.writeDateTime("2025-05-28T09:20:00Z")
         enc.writeEnd()
 
         val dec = LuxoDecoder(enc.bytes())
@@ -435,7 +565,8 @@ class LuxoEncoderDecoderTest {
     @Test
     fun `datetime epoch zero`() {
         val enc = LuxoEncoder()
-        enc.writeFieldInt(1, 0L)
+        enc.writeVarint(1)
+        enc.writeDateTime("1970-01-01T00:00:00Z")
         enc.writeEnd()
 
         val dec = LuxoDecoder(enc.bytes())
@@ -446,7 +577,8 @@ class LuxoEncoderDecoderTest {
     @Test
     fun `datetime negative seconds (pre-epoch)`() {
         val enc = LuxoEncoder()
-        enc.writeFieldInt(1, -1L)
+        enc.writeVarint(1)
+        enc.writeDateTime("1969-12-31T23:59:59Z")
         enc.writeEnd()
 
         val dec = LuxoDecoder(enc.bytes())
@@ -459,7 +591,7 @@ class LuxoEncoderDecoderTest {
         val enc = LuxoEncoder()
         enc.writeVarint(1) // fieldID
         enc.writeBool(true) // null flag = present
-        enc.writeSvarint(1748424000L)
+        enc.writeDateTime("2025-05-28T09:20:00Z")
         enc.writeEnd()
 
         val dec = LuxoDecoder(enc.bytes())
@@ -483,14 +615,14 @@ class LuxoEncoderDecoderTest {
     fun `datetime scalar array round-trip`() {
         val secs = listOf(0L, 1748424000L, -1L)
         val enc = LuxoEncoder()
-        enc.writeFieldArray(1, secs) { enc.writeSvarint(it) }
+        enc.writeFieldArray(1, secs) { enc.writeSvarint(it); enc.writeVarint(0) }
         enc.writeEnd()
 
         val dec = LuxoDecoder(enc.bytes())
         assertTrue(dec.nextField())
         assertEquals(
             listOf("1970-01-01T00:00:00Z", "2025-05-28T09:20:00Z", "1969-12-31T23:59:59Z"),
-            dec.readArray { dec.readDateTime() },
+            dec.readDateTimeArray(),
         )
     }
 
@@ -636,9 +768,9 @@ class ColumnarDecoderTest {
         buf.writeVarint(3) // count=3
         buf.writeVarint(0) // arena size
         buf.writeVarint(1) // fieldID=1
-        buf.writeSvarint(0)
-        buf.writeSvarint(1748424000)
-        buf.writeSvarint(-1)
+        buf.writeSvarint(0); buf.writeVarint(0)
+        buf.writeSvarint(1748424000); buf.writeVarint(0)
+        buf.writeSvarint(-1); buf.writeVarint(0)
         buf.add(0x00)
 
         val dec = ColumnarDecoder(buf.toByteArray())
@@ -659,7 +791,7 @@ class ColumnarDecoderTest {
         buf.writeVarint(0) // arena size
         buf.writeVarint(1) // fieldID=1
         buf.add(0x00) // null
-        buf.add(0x01); buf.writeSvarint(1748424000) // present
+        buf.add(0x01); buf.writeSvarint(1748424000); buf.writeVarint(0) // present
         buf.add(0x00) // null
         buf.add(0x00) // end marker
 

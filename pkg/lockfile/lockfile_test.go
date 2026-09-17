@@ -1617,6 +1617,9 @@ func TestUpdateAPIsIncludesInternalClusterEndpoints(t *testing.T) {
 			t.Errorf("%s keys field ID = %d, want 1", name, entry.Params["keys"])
 		}
 	}
+	if got := lf.APIs["svc:resolve:Post:userId"].Params["shape"]; got != 2 {
+		t.Fatalf("resolver shape field ID = %d, want 2", got)
+	}
 }
 
 func TestUpdateAPIsIncludesNamedLoadEndpoint(t *testing.T) {

@@ -1,10 +1,55 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
+
 import 'package:http/http.dart' as http;
+
 import 'error.dart';
+import 'error_codec.dart';
 import 'codec.dart';
+import 'int64.dart';
+import 'int64_native.dart'
+    if (dart.library.js_interop) 'int64_web.dart'
+    as platform;
+import 'json.dart';
+import 'schema.dart';
 import 'socket.dart';
+import 'uint64.dart';
+
+export 'error_codec.dart' show decodeBinaryError;
+export 'schema.dart';
+
+// Keep compiled JSON metadata and Binary metadata on the same registration snapshot.
+Map<String, APISchemaEntry> _snapshotSchema(
+  Map<String, APISchemaEntry> schema,
+) {
+  final types =
+      Map<
+        Map<String, Map<String, SelectionFieldSchema>>,
+        Map<String, Map<String, SelectionFieldSchema>>
+      >.identity();
+  return schema.map(
+    (name, entry) => MapEntry(
+      name,
+      APISchemaEntry(
+        entry.id,
+        List.unmodifiable(entry.params),
+        Map.unmodifiable(entry.fields),
+        types.putIfAbsent(
+          entry.types,
+          () => Map.unmodifiable(
+            entry.types.map(
+              (name, fields) => MapEntry(
+                name,
+                Map<String, SelectionFieldSchema>.unmodifiable(fields),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
 
 /// Transport mode: json for debugging, binary for production.
 enum TransportMode { json, binary }
@@ -13,11 +58,13 @@ abstract final class BinaryFrameType {
   static const callRequest = 0x01;
   static const callSuccess = 0x02;
   static const callError = 0x03;
-  static const subscribe = 0x04;
-  static const unsubscribe = 0x05;
-  static const stream = 0x06;
-  static const subscribeSuccess = 0x07;
-  static const subscribeError = 0x08;
+  static const subscribe = 0x10;
+  static const unsubscribe = 0x11;
+  static const stream = 0x12;
+  static const subscribeSuccess = 0x13;
+  static const subscribeError = 0x14;
+  static const streamComplete = 0x15;
+  static const streamError = 0x16;
 }
 
 const _binaryFiltersFieldID = 0x7ffffffe;
@@ -35,7 +82,7 @@ const _filterOperatorIDs = <String, int>{
   'match': 10,
 };
 
-class LuxoFilter {
+class LuxoFilter implements LuxoJSONEncodable {
   final String field;
   final String op;
   final Object value;
@@ -47,57 +94,11 @@ class LuxoFilter {
   Map<String, Object> toJson() => {'field': field, 'op': op, 'value': value};
 }
 
-class LuxoSorter {
+class LuxoSorter implements LuxoJSONEncodable {
   final String field;
   final String order;
   const LuxoSorter({required this.field, required this.order});
   Map<String, Object> toJson() => {'field': field, 'order': order};
-}
-
-/// API schema metadata for binary encoding.
-class APISchemaEntry {
-  final int id;
-  final List<ParamSchema> params;
-  final Map<String, SelectionFieldSchema> fields;
-  final Map<String, Map<String, SelectionFieldSchema>> types;
-  const APISchemaEntry(
-    this.id, [
-    this.params = const [],
-    this.fields = const {},
-    this.types = const {},
-  ]);
-}
-
-class SelectionFieldSchema {
-  final int fieldID;
-  final String? typeName;
-  final String? type;
-  final bool isList;
-  final bool nullable;
-  const SelectionFieldSchema(
-    this.fieldID, [
-    this.typeName,
-    this.type,
-    this.isList = false,
-    this.nullable = false,
-  ]);
-}
-
-class ParamSchema {
-  final int fieldID;
-  final String name;
-  final String type;
-  final bool isList;
-  final bool nullable;
-  final String? typeName;
-  const ParamSchema(
-    this.fieldID,
-    this.name,
-    this.type, [
-    this.isList = false,
-    this.nullable = false,
-    this.typeName,
-  ]);
 }
 
 /// Generated input values implement direct Luxo binary encoding.
@@ -119,10 +120,10 @@ class TransportOptions {
 
 /// Encodes a single API param onto [enc] using its schema metadata.
 /// Handles scalar and list ([T]) params. UUID is encoded as fixed 16 bytes.
-int _toUnixSeconds(dynamic value) {
+void _writeDateTimeParam(LuxoEncoder encoder, dynamic value) {
   if (value is String) {
-    final dt = DateTime.parse(value).toUtc();
-    return dt.millisecondsSinceEpoch ~/ 1000;
+    encoder.writeDateTime(value);
+    return;
   }
   throw FormatException('invalid DateTime param: ${value.runtimeType}');
 }
@@ -147,9 +148,9 @@ void encodeParam(LuxoEncoder enc, ParamSchema pm, dynamic v) {
     enc.writeVarint(list.length);
     switch (pm.type) {
       case 'Int' || 'Duration':
-        for (final value in list.cast<int>()) enc.writeSvarint(value);
+        for (final value in list.cast<LuxoInt64>()) enc.writeSvarint(value);
       case 'DateTime':
-        for (final value in list) enc.writeSvarint(_toUnixSeconds(value));
+        for (final value in list) _writeDateTimeParam(enc, value);
       case 'Float':
         for (final value in list) enc.writeFixed64((value as num).toDouble());
       case 'String' || 'Enum' || 'Decimal':
@@ -162,7 +163,9 @@ void encodeParam(LuxoEncoder enc, ParamSchema pm, dynamic v) {
         for (final value in list.cast<Uint8List>()) enc.writeBytes(value);
       case 'JSON':
         for (final value in list) {
-          enc.writeBytes(Uint8List.fromList(utf8.encode(jsonEncode(value))));
+          enc.writeBytes(
+            Uint8List.fromList(utf8.encode(encodeLuxoJSON(value))),
+          );
         }
       case 'Model':
         for (final value in list) {
@@ -179,9 +182,9 @@ void encodeParam(LuxoEncoder enc, ParamSchema pm, dynamic v) {
   }
   switch (pm.type) {
     case 'Int' || 'Duration':
-      enc.writeSvarint(v as int);
+      enc.writeSvarint(v as LuxoInt64);
     case 'DateTime':
-      enc.writeSvarint(_toUnixSeconds(v));
+      _writeDateTimeParam(enc, v);
     case 'Float':
       enc.writeFixed64((v as num).toDouble());
     case 'String' || 'Enum' || 'Decimal':
@@ -193,7 +196,7 @@ void encodeParam(LuxoEncoder enc, ParamSchema pm, dynamic v) {
     case 'Bytes':
       enc.writeBytes(v as Uint8List);
     case 'JSON':
-      enc.writeBytes(Uint8List.fromList(utf8.encode(jsonEncode(v))));
+      enc.writeBytes(Uint8List.fromList(utf8.encode(encodeLuxoJSON(v))));
     case 'Model':
       _writeStructuredParam(enc, pm, v);
     default:
@@ -418,72 +421,15 @@ void _writeSorters(LuxoEncoder enc, dynamic value) {
 }
 
 bool _validFilterValue(dynamic value) =>
-    value is String || value is bool || (value is num && value.isFinite);
+    value is String ||
+    value is bool ||
+    platform.isWireInt64(value) ||
+    (value is num && value.isFinite);
 
 String _filterValueText(dynamic value) {
   if (value is bool) return value ? 'true' : 'false';
   return value.toString();
 }
-
-LuxoError decodeBinaryError(Uint8List data, int statusCode) {
-  final dec = LuxoDecoder(data);
-  var code = statusCode;
-  var name = 'Error';
-  var message = 'HTTP $statusCode';
-  String? traceId;
-  dynamic errorData;
-  String? cause;
-  var seen = 0;
-  var ended = false;
-  while (dec.offset < data.length) {
-    if (!dec.nextField()) {
-      ended = dec.error == null;
-      break;
-    }
-    switch (dec.fieldID) {
-      case 1:
-        code = dec.readInt();
-        seen |= 1;
-      case 2:
-        name = dec.readString();
-        seen |= 2;
-      case 3:
-        message = dec.readString();
-        seen |= 4;
-      case 4:
-        traceId = dec.readString();
-      case 5:
-        final raw = utf8.decode(dec.readBytes());
-        try {
-          errorData = jsonDecode(raw);
-        } catch (_) {
-          return _binaryParseError(statusCode, 'invalid JSON data');
-        }
-      case 6:
-        cause = dec.readString();
-      default:
-        return _binaryParseError(
-          statusCode,
-          'unknown binary error field ${dec.fieldID}',
-        );
-    }
-  }
-  if (dec.error != null) return _binaryParseError(statusCode, dec.error!);
-  if (!ended) return _binaryParseError(statusCode, 'missing end marker');
-  if (dec.offset != data.length) {
-    return _binaryParseError(statusCode, 'trailing bytes');
-  }
-  if (seen != 7) {
-    return _binaryParseError(statusCode, 'missing required fields');
-  }
-  return LuxoError(name, code, message, traceId, errorData, cause);
-}
-
-LuxoError _binaryParseError(int statusCode, String message) => LuxoError(
-  'ParseError',
-  statusCode,
-  'invalid binary error response: $message',
-);
 
 /// Transport interface — implemented by HTTP and WebSocket.
 abstract class Transport {
@@ -492,15 +438,39 @@ abstract class Transport {
     Map<String, dynamic>? params,
     T Function(dynamic)? decoder,
   });
-  Future<void Function()> subscribe(
+
+  /// Decode before delivery; decoding failure terminates only this subscription.
+  /// Application callback errors must not be reported as protocol failures.
+  Future<void Function()> subscribe<T>(
     String api,
     Map<String, dynamic> params,
-    void Function(dynamic) onData,
-  );
+    void Function(T) onData, {
+    required T Function(Object?) decoder,
+    void Function(LuxoError)? onError,
+    void Function()? onDone,
+  });
   void setSchema(Map<String, APISchemaEntry> schema);
   void setMode(TransportMode mode);
   void setToken(String token);
   void close();
+}
+
+void _writeRequest(
+  LuxoEncoder encoder,
+  APISchemaEntry schema,
+  Map<String, dynamic>? params,
+) {
+  encoder.writeVarint(schema.id);
+  _writeFieldMask(encoder, schema, params);
+  if (params != null) {
+    for (final param in schema.params) {
+      if (params.containsKey(param.name)) {
+        encodeParam(encoder, param, params[param.name]);
+      }
+    }
+  }
+  _writeListControls(encoder, params);
+  encoder.writeEnd();
 }
 
 // --- HTTP Transport ---
@@ -509,12 +479,20 @@ abstract class Transport {
 /// Uses HTTP/2 when available (dart:io HttpClient supports h2).
 class HttpTransport implements Transport {
   final String endpoint;
-  final Map<String, String> _headers = {'Content-Type': 'application/json'};
+  final Map<String, String> _headers = {
+    'content-type': 'application/json',
+    'x-luxo-mode': 'json',
+  };
+  final Map<String, String> _binaryHeaders = {
+    'content-type': 'application/x-luxo',
+    'x-luxo-mode': 'binary',
+  };
   final http.Client _client;
   final Duration timeout;
   final Future<String?> Function()? onTokenExpired;
   TransportMode _mode;
   Map<String, APISchemaEntry> _schema;
+  final _jsonRequests = JSONRequestEncoder();
 
   HttpTransport(
     this.endpoint, {
@@ -525,17 +503,33 @@ class HttpTransport implements Transport {
   }) : _client = client ?? http.Client(),
        _mode = options?.mode ?? TransportMode.json,
        _schema = {} {
-    if (options?.headers != null) _headers.addAll(options!.headers!);
-    if (options?.token != null)
-      _headers['Authorization'] = 'Bearer ${options!.token}';
+    final headers = options?.headers;
+    if (headers != null) {
+      for (final entry in headers.entries) {
+        final name = entry.key.toLowerCase();
+        if (name == 'content-type' || name == 'x-luxo-mode') continue;
+        _setHeader(name, entry.value);
+      }
+    }
+    final token = options?.token;
+    if (token != null) setToken(token);
+  }
+
+  void _setHeader(String name, String value) {
+    _headers[name] = value;
+    _binaryHeaders[name] = value;
   }
 
   @override
-  void setSchema(Map<String, APISchemaEntry> schema) => _schema = schema;
+  void setSchema(Map<String, APISchemaEntry> schema) {
+    _schema = _snapshotSchema(schema);
+    _jsonRequests.setSchema(_schema);
+  }
+
   @override
   void setMode(TransportMode mode) => _mode = mode;
   @override
-  void setToken(String token) => _headers['Authorization'] = 'Bearer $token';
+  void setToken(String token) => _setHeader('authorization', 'Bearer $token');
   @override
   void close() => _client.close();
 
@@ -548,15 +542,20 @@ class HttpTransport implements Transport {
     final result = _mode == TransportMode.binary
         ? await _binaryCall(api, params)
         : await _jsonCall(api, params);
-    return decoder == null ? result as T : decoder(result);
+    return decoder == null
+        ? (result is Uint8List ? result : normalizeLuxoJSON(result)) as T
+        : decoder(result);
   }
 
   @override
-  Future<void Function()> subscribe(
+  Future<void Function()> subscribe<T>(
     String api,
     Map<String, dynamic> params,
-    void Function(dynamic) onData,
-  ) {
+    void Function(T) onData, {
+    required T Function(Object?) decoder,
+    void Function(LuxoError)? onError,
+    void Function()? onDone,
+  }) {
     throw LuxoError(
       'ConfigError',
       0,
@@ -569,13 +568,12 @@ class HttpTransport implements Transport {
     Map<String, dynamic>? params, {
     bool isRetry = false,
   }) async {
-    final body = <String, dynamic>{r'$api': api};
-    if (params != null) body.addAll(params);
+    final body = _jsonRequests.encode(api, params);
 
     final http.Response resp;
     try {
       resp = await _client
-          .post(Uri.parse(endpoint), headers: _headers, body: jsonEncode(body))
+          .post(Uri.parse(endpoint), headers: _headers, body: body)
           .timeout(timeout);
     } on TimeoutException {
       throw LuxoError('TimeoutError', 0, 'request timed out after $timeout');
@@ -583,33 +581,45 @@ class HttpTransport implements Transport {
       throw LuxoError('NetworkError', 0, e.toString());
     }
 
-    // 401 auto-refresh: call onTokenExpired, retry once with new token.
-    if (resp.statusCode == 401 && !isRetry && onTokenExpired != null) {
-      final newToken = await onTokenExpired!();
+    final json = _jsonEnvelope(resp);
+    if (resp.statusCode == 200 && !json.containsKey('error'))
+      return json['data'];
+    final error = decodeJSONError(json, resp.statusCode);
+    final refresh = _refreshAfterUnauthorized(error, resp.statusCode, isRetry);
+    if (refresh != null) {
+      final newToken = await refresh;
       if (newToken != null) {
         setToken(newToken);
         return _jsonCall(api, params, isRetry: true);
       }
     }
 
-    final Map<String, dynamic> json;
+    throw error;
+  }
+
+  Map<String, dynamic> _jsonEnvelope(http.Response resp) {
     try {
-      json = jsonDecode(resp.body) as Map<String, dynamic>;
+      return decodeLuxoJSON(
+        utf8.decode(resp.bodyBytes),
+        preserveNumberSyntax: true,
+      ) as Map<String, dynamic>;
     } catch (e) {
       throw LuxoError('ParseError', resp.statusCode, 'invalid JSON: $e');
     }
+  }
 
-    if (json.containsKey('error')) {
-      throw LuxoError(
-        (json['error'] ?? 'Unknown') as String,
-        (json['code'] ?? 0) as int,
-        (json['message'] ?? '') as String,
-        json['traceId'] as String?,
-        json['data'],
-        json['cause'] as String?,
-      );
+  Future<String?>? _refreshAfterUnauthorized(
+    LuxoError error,
+    int status,
+    bool isRetry,
+  ) {
+    if (isRetry ||
+        status != 401 ||
+        error.code != 401 ||
+        error.error == 'ParseError') {
+      return null;
     }
-    return json['data'];
+    return onTokenExpired?.call();
   }
 
   Future<dynamic> _binaryCall(
@@ -626,30 +636,12 @@ class HttpTransport implements Transport {
       );
 
     final enc = LuxoEncoder();
-    enc.writeVarint(meta.id);
-    _writeFieldMask(enc, meta, params);
-    if (params != null) {
-      for (final pm in meta.params) {
-        if (!params.containsKey(pm.name)) continue;
-        final v = params[pm.name];
-        encodeParam(enc, pm, v);
-      }
-    }
-    _writeListControls(enc, params);
-    enc.writeEnd();
+    _writeRequest(enc, meta, params);
 
     final http.Response resp;
     try {
       resp = await _client
-          .post(
-            Uri.parse(endpoint),
-            headers: {
-              'Content-Type': 'application/x-luxo',
-              'X-Luxo-Mode': 'binary',
-              ..._headers,
-            },
-            body: enc.bytes(),
-          )
+          .post(Uri.parse(endpoint), headers: _binaryHeaders, body: enc.bytes())
           .timeout(timeout);
     } on TimeoutException {
       throw LuxoError('TimeoutError', 0, 'request timed out after $timeout');
@@ -657,52 +649,97 @@ class HttpTransport implements Transport {
       throw LuxoError('NetworkError', 0, e.toString());
     }
 
-    // 401 auto-refresh: call onTokenExpired, retry once with new token.
-    if (resp.statusCode == 401 && !isRetry && onTokenExpired != null) {
-      final newToken = await onTokenExpired!();
+    if (resp.statusCode == 200) return Uint8List.fromList(resp.bodyBytes);
+    final error = decodeBinaryError(
+      Uint8List.fromList(resp.bodyBytes),
+      resp.statusCode,
+    );
+    final refresh = _refreshAfterUnauthorized(error, resp.statusCode, isRetry);
+    if (refresh != null) {
+      final newToken = await refresh;
       if (newToken != null) {
         setToken(newToken);
         return _binaryCall(api, params, isRetry: true);
       }
     }
 
-    if (resp.statusCode != 200) {
-      throw decodeBinaryError(
-        Uint8List.fromList(resp.bodyBytes),
-        resp.statusCode,
-      );
-    }
-    return Uint8List.fromList(resp.bodyBytes);
+    throw error;
   }
 }
 
 // --- WebSocket Transport ---
 
-class _Subscription {
-  final Map<String, dynamic> params;
-  final void Function(dynamic) onData;
+/// Internal boundary-test factory, excluded from the package entry point.
+WsTransport wsTransportWithSequence(
+  String endpoint,
+  Object initialSequence, {
+  TransportOptions? options,
+  Duration timeout = const Duration(seconds: 3),
+}) {
+  return WsTransport(
+    endpoint,
+    options: options,
+    autoReconnect: false,
+    timeout: timeout,
+  ).._requestIDs = RequestIDs(initialSequence);
+}
+
+class _Subscription<T> {
+  final TransportMode mode;
+  final T Function(Object?) decoder;
+  final void Function(T) onData;
+  final void Function(LuxoError)? onError;
+  final void Function()? onDone;
   Completer<void Function()>? acknowledgement;
 
-  _Subscription(this.params, this.onData, this.acknowledgement);
+  _Subscription(
+    this.mode,
+    this.decoder,
+    this.onData,
+    this.acknowledgement, {
+    this.onError,
+    this.onDone,
+  });
+
+  void deliver(WsTransport transport, Object id, Object? data) {
+    final T value;
+    try {
+      value = decoder(data);
+    } catch (error) {
+      transport._failSubscriptionDecoding(id, this, error);
+      return;
+    }
+    // Application exceptions belong to the caller's Zone, not the protocol.
+    onData(value);
+  }
+}
+
+void _writeSequence(LuxoEncoder encoder, Object id) {
+  if (id is int) {
+    encoder.writeVarint(id);
+  } else {
+    encoder.writeUint64(id as BigInt);
+  }
 }
 
 /// WebSocket transport — persistent connection, multiplexed requests.
-/// Supports automatic reconnection with exponential backoff.
+/// Connections can reconnect; interrupted subscriptions must be created again.
 class WsTransport implements Transport {
   final String endpoint;
   final Duration timeout;
   TransportMode _mode;
   Map<String, APISchemaEntry> _schema = {};
+  final _jsonRequests = JSONRequestEncoder();
   String? _token;
 
   LuxoSocket? _ws;
-  int _seq = 0;
-  final _pending = <int, Completer<dynamic>>{};
-  final _subscriptions = <String, _Subscription>{};
-  Completer<void>? _connectCompleter;
+  var _requestIDs = RequestIDs();
+  final _pending = <Object, Completer<dynamic>>{};
+  var _subscriptions = <Object, _Subscription<Object?>>{};
+  Completer<void>? _connecting;
 
   // Reconnection state
-  bool _autoReconnect;
+  final bool _autoReconnect;
   bool _closed = false;
   int _reconnectAttempts = 0;
   static const int _maxBackoffSeconds = 30;
@@ -718,86 +755,123 @@ class WsTransport implements Transport {
        _autoReconnect = autoReconnect;
 
   @override
-  void setSchema(Map<String, APISchemaEntry> schema) => _schema = schema;
+  void setSchema(Map<String, APISchemaEntry> schema) {
+    _schema = _snapshotSchema(schema);
+    _jsonRequests.setSchema(_schema);
+  }
+
   @override
   void setMode(TransportMode mode) => _mode = mode;
   @override
   void setToken(String token) => _token = token;
 
-  Future<void> _connect() async {
-    if (_ws != null) return;
-    if (_connectCompleter != null) return _connectCompleter!.future;
+  Future<void> _connect() {
+    if (_closed)
+      return Future.error(LuxoError('NetworkError', 0, 'WebSocket closed'));
+    if (_ws != null) return Future.value();
+    final pending = _connecting;
+    if (pending != null) return pending.future;
+    final ready = Completer<void>();
+    _connecting = ready;
+    unawaited(_open(ready));
+    return ready.future;
+  }
 
-    _connectCompleter = Completer<void>();
-    final uri = Uri.parse(endpoint);
-    final url = _token == null
-        ? endpoint
-        : uri
-              .replace(
-                queryParameters: {...uri.queryParameters, 'token': _token!},
-              )
-              .toString();
-
+  Future<void> _open(Completer<void> ready) async {
+    LuxoSocket? connected;
     try {
+      final uri = Uri.parse(endpoint);
+      final url = _token == null
+          ? endpoint
+          : uri
+                .replace(
+                  queryParameters: {...uri.queryParameters, 'token': _token!},
+                )
+                .toString();
       final ws = await connectSocket(url);
+      connected = ws;
+      if (_closed) {
+        throw LuxoError('NetworkError', 0, 'WebSocket closed');
+      }
       _ws = ws;
+      // A failed manual retry must not cancel the scheduled recovery attempt.
+      _reconnectTimer?.cancel();
+      _reconnectTimer = null;
       _reconnectAttempts = 0; // Reset backoff on successful connect
       _listenWs(ws);
-      for (final entry in _subscriptions.entries) {
-        _sendSubscription(entry.key, entry.value.params);
-      }
-      _connectCompleter!.complete();
+      ready.complete();
     } catch (e) {
-      final error = LuxoError('NetworkError', 0, 'WebSocket failed: $e');
-      _connectCompleter!.completeError(error);
-      _connectCompleter = null;
-      throw error;
+      if (connected != null) {
+        if (identical(_ws, connected)) _ws = null;
+        unawaited(connected.close());
+      }
+      if (!ready.isCompleted) {
+        ready.completeError(
+          LuxoError('NetworkError', 0, 'WebSocket failed: $e'),
+        );
+      }
+    } finally {
+      if (identical(_connecting, ready)) _connecting = null;
     }
-    _connectCompleter = null;
   }
 
   void _listenWs(LuxoSocket ws) {
     // Listen for messages and dispatch to pending requests
     ws.messages.listen(
       (data) {
-        if (_mode == TransportMode.binary && data is List<int>) {
+        if (!identical(_ws, ws)) return;
+        if (data is List<int>) {
           _handleBinaryResponse(Uint8List.fromList(data));
         } else if (data is String) {
-          _handleJsonResponse(data);
+          _handleJsonResponse(data, ws);
         }
       },
-      onDone: () {
-        _ws = null;
-        for (final c in _pending.values) {
-          c.completeError(LuxoError('NetworkError', 0, 'WebSocket closed'));
-        }
-        _pending.clear();
-        for (final entry in _subscriptions.entries.toList()) {
-          final acknowledgement = entry.value.acknowledgement;
-          if (acknowledgement == null) continue;
-          acknowledgement.completeError(
-            LuxoError('NetworkError', 0, 'WebSocket closed'),
-          );
-          _subscriptions.remove(entry.key);
-        }
-        _scheduleReconnect();
-      },
+      onDone: () => _disconnected(ws),
+      onError: (Object _) => _disconnected(ws),
     );
+  }
+
+  void _disconnected(LuxoSocket ws, [LuxoError? failure]) {
+    if (!identical(_ws, ws)) return;
+    _ws = null;
+    unawaited(ws.close());
+    final error = failure ?? LuxoError('NetworkError', 0, 'WebSocket closed');
+    final retired = _retirePending(error);
+    _scheduleReconnect();
+    for (final subscription in retired.values) {
+      final notify = subscription.onError;
+      if (subscription.acknowledgement == null && notify != null) {
+        // Report user exceptions to the listener's zone without losing peers.
+        Zone.current.runUnaryGuarded(notify, error);
+      }
+    }
+  }
+
+  Map<Object, _Subscription<Object?>> _retirePending(LuxoError error) {
+    for (final pending in _pending.values) pending.completeError(error);
+    _pending.clear();
+    final retired = _subscriptions;
+    _subscriptions = {};
+    for (final subscription in retired.values) {
+      subscription.acknowledgement?.completeError(error);
+    }
+    return retired;
   }
 
   /// Schedule a reconnection attempt with exponential backoff.
   void _scheduleReconnect() {
-    if (_closed || !_autoReconnect) return;
+    if (_closed || !_autoReconnect || _ws != null || _reconnectTimer != null)
+      return;
 
     final delaySeconds = (1 << _reconnectAttempts).clamp(1, _maxBackoffSeconds);
-    _reconnectAttempts++;
+    if (_reconnectAttempts < 5) _reconnectAttempts++;
 
     _reconnectTimer = Timer(Duration(seconds: delaySeconds), () async {
+      _reconnectTimer = null;
       if (_closed) return;
       try {
         await _connect();
       } catch (_) {
-        // _connect failed, onDone will fire again or we schedule manually
         _scheduleReconnect();
       }
     });
@@ -810,7 +884,8 @@ class WsTransport implements Transport {
     T Function(dynamic)? decoder,
   }) async {
     await _connect();
-    final id = ++_seq;
+    final ws = _requireSocket();
+    final id = _requestIDs.next();
     final completer = Completer<dynamic>();
     _pending[id] = completer;
 
@@ -823,22 +898,12 @@ class WsTransport implements Transport {
 
         final enc = LuxoEncoder();
         enc.writeVarint(BinaryFrameType.callRequest);
-        enc.writeVarint(id);
-        enc.writeVarint(meta.id);
-        _writeFieldMask(enc, meta, params);
-        if (params != null) {
-          for (final pm in meta.params) {
-            if (!params.containsKey(pm.name)) continue;
-            final v = params[pm.name];
-            encodeParam(enc, pm, v);
-          }
-        }
-        _writeListControls(enc, params);
-        enc.writeEnd();
-        _ws!.add(enc.bytes());
+        _writeSequence(enc, id);
+        _writeRequest(enc, meta, params);
+        ws.add(enc.bytes());
       } else {
-        final body = jsonEncode({r'$id': id, r'$api': api, ...?params});
-        _ws!.add(body);
+        final body = _jsonRequests.encode(api, params, sequence: id);
+        ws.add(body);
       }
     } catch (_) {
       _pending.remove(id);
@@ -847,7 +912,9 @@ class WsTransport implements Transport {
 
     try {
       final result = await completer.future.timeout(timeout);
-      return decoder == null ? result as T : decoder(result);
+      return decoder == null
+          ? (result is Uint8List ? result : normalizeLuxoJSON(result)) as T
+          : decoder(result);
     } on TimeoutException {
       throw LuxoError('TimeoutError', 0, 'request timed out after $timeout');
     } finally {
@@ -855,96 +922,137 @@ class WsTransport implements Transport {
     }
   }
 
-  void _handleJsonResponse(String data) {
+  void _handleJsonResponse(String data, LuxoSocket ws) {
+    final Map<String, dynamic> json;
     try {
-      final json = jsonDecode(data) as Map<String, dynamic>;
-      final subscription = json[r'$sub'];
-      if (subscription is String) {
-        _acknowledgeSubscription(
-          subscription,
-          json.containsKey('error')
-              ? LuxoError(
-                  json['error'] as String,
-                  (json['code'] ?? 0) as int,
-                  (json['message'] ?? '') as String,
-                  json['traceId'] as String?,
-                  json['data'],
-                  json['cause'] as String?,
-                )
-              : null,
-        );
+      json = decodeLuxoJSON(
+        data,
+        preserveNumberSyntax: true,
+      ) as Map<String, dynamic>;
+    } catch (_) {
+      _disconnected(
+        ws,
+        LuxoError('ParseError', 0, 'invalid WebSocket JSON message'),
+      );
+      return;
+    }
+    if (json.containsKey(r'$end')) {
+      if (json.containsKey(r'$sub') ||
+          json.containsKey(r'$stream') ||
+          json.containsKey(r'$id'))
         return;
-      }
-      final stream = json[r'$stream'];
-      if (stream is String) {
-        _subscriptions[stream]?.onData(json['data']);
-        return;
-      }
-      final id = json[r'$id'] as int;
-      final c = _pending.remove(id);
-      if (c == null) return;
-      if (json.containsKey('error')) {
-        c.completeError(
-          LuxoError(
-            json['error'] as String,
-            (json['code'] ?? 0) as int,
-            (json['message'] ?? '') as String,
-            json['traceId'] as String?,
-            json['data'],
-            json['cause'] as String?,
-          ),
-        );
-      } else {
-        c.complete(json['data']);
-      }
-    } catch (_) {}
+      _handleJsonStreamEnd(json);
+      return;
+    }
+    if (json.containsKey(r'$sub')) {
+      final subscription = uint64FromJSON(json[r'$sub']);
+      if (subscription == null) return;
+      if (!json.containsKey('error') && json['ok'] != true) return;
+      _acknowledgeSubscription(
+        subscription,
+        TransportMode.json,
+        json.containsKey('error') ? decodeJSONError(json, 0) : null,
+      );
+      return;
+    }
+    if (json.containsKey(r'$stream')) {
+      final stream = uint64FromJSON(json[r'$stream']);
+      if (stream != null)
+        _deliverSubscription(stream, TransportMode.json, json['data']);
+      return;
+    }
+    final id = uint64FromJSON(json[r'$id']);
+    if (id == null) return;
+    final c = _pending.remove(id);
+    if (c == null) return;
+    if (json.containsKey('error')) {
+      c.completeError(decodeJSONError(json, 0));
+    } else {
+      c.complete(json['data']);
+    }
+  }
+
+  void _handleJsonStreamEnd(Map<String, dynamic> json) {
+    final id = uint64FromJSON(json[r'$end']);
+    if (id == null) return;
+    final failure = json.containsKey('error');
+    final error = failure && !json.containsKey('ok')
+        ? decodeJSONError(json, 0)
+        : !failure && json['ok'] == true && !json.containsKey('data')
+        ? null
+        : LuxoError('ParseError', 0, 'invalid stream completion');
+    _finishSubscription(id, TransportMode.json, error);
   }
 
   void _handleBinaryResponse(Uint8List data) {
-    if (data.isEmpty) return;
+    if (data.length < 2) return;
     final frameType = data[0];
-    int id = 0;
-    int shift = 0;
-    int off = 1;
-    while (off < data.length) {
-      final b = data[off++];
-      id += (b & 0x7F) * (1 << shift);
-      if (b < 0x80) break;
-      shift += 7;
+    if (frameType != BinaryFrameType.callSuccess &&
+        frameType != BinaryFrameType.callError &&
+        frameType != BinaryFrameType.stream &&
+        frameType != BinaryFrameType.subscribeSuccess &&
+        frameType != BinaryFrameType.subscribeError &&
+        frameType != BinaryFrameType.streamComplete &&
+        frameType != BinaryFrameType.streamError)
+      return;
+    var low = 0;
+    var high = 0;
+    for (var i = 0; i < 10 && i + 1 < data.length; i++) {
+      final byte = data[i + 1];
+      if (i == 9 && byte > 1) return;
+      final payload = byte & 127;
+      if (i < 4) {
+        low |= payload << (i * 7);
+      } else if (i == 4) {
+        low = (low | (payload << 28)) & 0xffffffff;
+        high = payload >>> 4;
+      } else {
+        high |= payload << (i * 7 - 32);
+      }
+      if (byte < 128) {
+        _dispatchBinaryResponse(
+          data,
+          frameType,
+          uint64FromWords(low, high),
+          i + 2,
+        );
+        return;
+      }
     }
+  }
+
+  void _dispatchBinaryResponse(
+    Uint8List data,
+    int frameType,
+    Object id,
+    int off,
+  ) {
     if (frameType == BinaryFrameType.subscribeSuccess ||
         frameType == BinaryFrameType.subscribeError) {
-      String? api;
-      for (final entry in _schema.entries) {
-        if (entry.value.id == id) {
-          api = entry.key;
-          break;
-        }
-      }
-      if (api != null) {
-        _acknowledgeSubscription(
-          api,
-          frameType == BinaryFrameType.subscribeError
-              ? decodeBinaryError(Uint8List.sublistView(data, off), 0)
-              : null,
-        );
-      }
+      if (frameType == BinaryFrameType.subscribeSuccess && off != data.length)
+        return;
+      _acknowledgeSubscription(
+        id,
+        TransportMode.binary,
+        frameType == BinaryFrameType.subscribeError
+            ? decodeBinaryError(Uint8List.sublistView(data, off), 0)
+            : null,
+      );
       return;
     }
     if (frameType == BinaryFrameType.stream) {
-      String? api;
-      for (final entry in _schema.entries) {
-        if (entry.value.id == id) {
-          api = entry.key;
-          break;
-        }
-      }
-      if (api != null) _subscriptions[api]?.onData(data.sublist(off));
+      _deliverSubscription(
+        id,
+        TransportMode.binary,
+        Uint8List.sublistView(data, off),
+      );
       return;
     }
-    if (frameType != BinaryFrameType.callSuccess &&
-        frameType != BinaryFrameType.callError)
+    // The frame whitelist has already rejected unknown tags before ID decoding.
+    if (frameType >= BinaryFrameType.streamComplete) {
+      _finishBinarySubscription(data, frameType, id, off);
       return;
+    }
     final c = _pending.remove(id);
     if (c == null) return;
     if (frameType == BinaryFrameType.callError) {
@@ -954,35 +1062,52 @@ class WsTransport implements Transport {
     }
   }
 
+  void _finishBinarySubscription(
+    Uint8List data,
+    int frameType,
+    Object id,
+    int off,
+  ) {
+    final error = frameType == BinaryFrameType.streamError
+        ? decodeBinaryError(Uint8List.sublistView(data, off), 0)
+        : off == data.length
+        ? null
+        : LuxoError('ParseError', 0, 'trailing stream completion bytes');
+    _finishSubscription(id, TransportMode.binary, error);
+  }
+
   @override
-  Future<void Function()> subscribe(
+  Future<void Function()> subscribe<T>(
     String api,
     Map<String, dynamic> params,
-    void Function(dynamic) onData,
-  ) async {
-    if (_subscriptions.containsKey(api)) {
-      throw LuxoError(
-        'ConfigError',
-        0,
-        'already subscribed to "$api" on this transport',
-      );
-    }
+    void Function(T) onData, {
+    required T Function(Object?) decoder,
+    void Function(LuxoError)? onError,
+    void Function()? onDone,
+  }) async {
     await _connect();
+    final ws = _requireSocket();
+    final id = _requestIDs.next();
     final acknowledgement = Completer<void Function()>();
-    final subscription = _Subscription(params, onData, acknowledgement);
-    _subscriptions[api] = subscription;
+    final subscription = _Subscription<T>(
+      _mode,
+      decoder,
+      onData,
+      acknowledgement,
+      onError: onError,
+      onDone: onDone,
+    );
+    _subscriptions[id] = subscription;
     try {
-      _sendSubscription(api, params);
+      _sendSubscription(ws, id, api, params, subscription.mode);
     } catch (error, stackTrace) {
-      _subscriptions.remove(api);
+      _subscriptions.remove(id);
       acknowledgement.completeError(error, stackTrace);
     }
     try {
       return await acknowledgement.future.timeout(timeout);
     } on TimeoutException {
-      if (_subscriptions[api] == subscription) {
-        _subscriptions.remove(api);
-      }
+      _unsubscribe(id);
       throw LuxoError(
         'TimeoutError',
         0,
@@ -991,68 +1116,121 @@ class WsTransport implements Transport {
     }
   }
 
-  void _acknowledgeSubscription(String api, LuxoError? error) {
-    final subscription = _subscriptions[api];
-    if (subscription == null) return;
+  void _failSubscriptionDecoding(
+    Object id,
+    _Subscription<Object?> subscription,
+    Object cause,
+  ) {
+    if (!identical(_subscriptions[id], subscription)) return;
+    final error = LuxoError(
+      'DecodeError',
+      0,
+      cause is LuxoError ? cause.message : cause.toString(),
+    );
+    // Local termination does not depend on the advisory cancellation being sent.
+    try {
+      _unsubscribe(id);
+    } catch (_) {
+      /* Socket events handle connection failures. */
+    }
+    subscription.onError?.call(error);
+  }
+
+  void _deliverSubscription(Object id, TransportMode mode, Object? data) {
+    final subscription = _subscriptions[id];
+    if (subscription == null ||
+        subscription.mode != mode ||
+        subscription.acknowledgement != null)
+      return;
+    subscription.deliver(this, id, data);
+  }
+
+  void _acknowledgeSubscription(
+    Object id,
+    TransportMode mode,
+    LuxoError? error,
+  ) {
+    final subscription = _subscriptions[id];
+    if (subscription == null || subscription.mode != mode) return;
     final acknowledgement = subscription.acknowledgement;
     if (error != null) {
-      _subscriptions.remove(api);
+      _subscriptions.remove(id);
       acknowledgement?.completeError(error);
+      if (acknowledgement == null) subscription.onError?.call(error);
       return;
     }
     if (acknowledgement == null) return;
     subscription.acknowledgement = null;
-    acknowledgement.complete(() => _unsubscribe(api));
+    acknowledgement.complete(() => _unsubscribe(id));
   }
 
-  void _unsubscribe(String api) {
-    if (_subscriptions.remove(api) == null || _ws == null) return;
-    if (_mode == TransportMode.binary) {
-      final meta = _schema[api];
-      if (meta == null) return;
-      final enc = LuxoEncoder();
-      enc.writeVarint(BinaryFrameType.unsubscribe);
-      enc.writeVarint(meta.id);
-      _ws!.add(enc.bytes());
+  void _finishSubscription(Object id, TransportMode mode, LuxoError? error) {
+    final subscription = _subscriptions[id];
+    if (subscription == null || subscription.mode != mode) return;
+    _subscriptions.remove(id);
+    final acknowledgement = subscription.acknowledgement;
+    if (acknowledgement != null) {
+      acknowledgement.completeError(
+        LuxoError('ParseError', 0, 'stream ended before acknowledgement'),
+      );
+    } else if (error != null) {
+      subscription.onError?.call(error);
     } else {
-      _ws!.add(jsonEncode({r'$unsub': api}));
+      subscription.onDone?.call();
     }
   }
 
-  void _sendSubscription(String api, Map<String, dynamic> params) {
-    if (_mode == TransportMode.json) {
-      _ws!.add(jsonEncode({r'$sub': api, ...params}));
+  void _unsubscribe(Object id) {
+    final subscription = _subscriptions.remove(id);
+    if (subscription == null || _ws == null) return;
+    if (subscription.mode == TransportMode.binary) {
+      final enc = LuxoEncoder();
+      enc.writeVarint(BinaryFrameType.unsubscribe);
+      _writeSequence(enc, id);
+      _ws!.add(enc.bytes());
+    } else {
+      _ws!.add(encodeLuxoJSON({r'$unsub': id}));
+    }
+  }
+
+  LuxoSocket _requireSocket() =>
+      _ws ?? (throw LuxoError('NetworkError', 0, 'WebSocket closed'));
+
+  void _sendSubscription(
+    LuxoSocket ws,
+    Object id,
+    String api,
+    Map<String, dynamic> params,
+    TransportMode mode,
+  ) {
+    if (mode == TransportMode.json) {
+      ws.add(
+        _jsonRequests.encode(api, params, sequence: id, subscription: true),
+      );
       return;
     }
     final meta = _schema[api];
     if (meta == null) throw LuxoError('ConfigError', 0, 'no schema for "$api"');
     final enc = LuxoEncoder();
     enc.writeVarint(BinaryFrameType.subscribe);
-    enc.writeVarint(meta.id);
-    _writeFieldMask(enc, meta, params);
-    for (final pm in meta.params) {
-      if (!params.containsKey(pm.name)) continue;
-      final value = params[pm.name];
-      encodeParam(enc, pm, value);
-    }
-    _writeListControls(enc, params);
-    enc.writeEnd();
-    _ws!.add(enc.bytes());
+    _writeSequence(enc, id);
+    _writeRequest(enc, meta, params);
+    ws.add(enc.bytes());
   }
 
   @override
   void close() {
     _closed = true;
-    _autoReconnect = false;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
-    for (final subscription in _subscriptions.values) {
-      subscription.acknowledgement?.completeError(
-        LuxoError('NetworkError', 0, 'WebSocket closed'),
-      );
-    }
-    _subscriptions.clear();
-    _ws?.close();
+    final error = LuxoError('NetworkError', 0, 'WebSocket closed');
+    final connecting = _connecting;
+    _connecting = null;
+    if (connecting != null && !connecting.isCompleted)
+      connecting.completeError(error);
+    _retirePending(error);
+    final ws = _ws;
     _ws = null;
+    if (ws != null) unawaited(ws.close());
   }
 }
