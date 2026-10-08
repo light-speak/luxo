@@ -80,9 +80,12 @@ function activate(context) {
     const outputChannel = vscode.window.createOutputChannel('Luxo Language Server');
     outputChannel.appendLine('LSP binary: ' + lspPath);
 
+    const policyWatcher = vscode.workspace.createFileSystemWatcher('**/luxo.cache.json');
+    context.subscriptions.push(policyWatcher);
     const clientOptions = {
         documentSelector: [{ scheme: 'file', language: 'luxo' }],
         outputChannel: outputChannel,
+        synchronize: { fileEvents: policyWatcher },
     };
 
     client = new LanguageClient('luxo', 'Luxo Language Server', serverOptions, clientOptions);

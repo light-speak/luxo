@@ -65,7 +65,7 @@ func TestRegisteredTypeOwnershipAndUsageAreSchemaLocal(t *testing.T) {
 	first.RegisterType(decl)
 	second.RegisterType(decl)
 	decl.Fields[0].Name, decl.Directives[0], decl.Fields[0].Directives[0] = "changed", "changed", "changed"
-	first.RegisterAPI(&API{Name: "read", ReturnType: "Payload"})
+	first.RegisterAPI(&API{ID: 1, Name: "read", ReturnType: "Payload"})
 	first.InferTypeUsage()
 	second.InferTypeUsage()
 	for _, s := range []*Schema{first, second} {
@@ -94,7 +94,7 @@ func TestPrepareDecodedSchemaRebuildsWithoutChangingIntrospection(t *testing.T) 
 	s := New()
 	s.RegisterModel(&Model{Name: "Item", Fields: []Field{{ID: 1, Name: "id"}}})
 	s.RegisterType(&TypeDecl{Name: "Payload", Fields: []Field{{ID: 2, Name: "value"}}})
-	s.RegisterAPI(&API{Name: "read", ReturnType: "Payload"})
+	s.RegisterAPI(&API{ID: 1, Name: "read", ReturnType: "Payload"})
 	s.InferTypeUsage()
 	before, err := s.ToJSON()
 	if err != nil {
@@ -146,7 +146,7 @@ func TestPreparedSchemaConcurrentConversions(t *testing.T) {
 	s := New()
 	s.RegisterType(&TypeDecl{Name: "Child", Fields: []Field{{ID: 1, Name: "value", Type: FieldInt}}})
 	s.RegisterType(&TypeDecl{Name: "Parent", Fields: []Field{{ID: 2, Name: "child", Type: FieldModel, TypeName: "Child", Relation: true}}})
-	s.RegisterAPI(&API{Name: "read", ReturnType: "Parent"})
+	s.RegisterAPI(&API{ID: 1, Name: "read", ReturnType: "Parent"})
 	s.InferTypeUsage()
 	fields, err := selection.Parse("child { value }")
 	if err != nil {

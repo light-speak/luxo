@@ -26,7 +26,7 @@ func TestGenerateAuthenticatedStreamRejectsAnonymousIdentity(t *testing.T) {
 		}},
 	}}}
 	code := string(generateStreamFile(result, "luxo"))
-	if !strings.Contains(code, "if api.IdentityID(identity) == 0") {
+	if !strings.Contains(code, "if !ok || identity.ID() == 0") {
 		t.Fatalf("authenticated stream has no identity guard:\n%s", code)
 	}
 }
@@ -87,7 +87,7 @@ func TestGenerateStreamFileWithEventSource(t *testing.T) {
 	}
 
 	// Native event matchers receive the already-decoded typed event once.
-	if !strings.Contains(code, "MatchWatchDanmaku(event DanmakuSentEvent, params *api.StreamParams, identity any) bool") {
+	if !strings.Contains(code, "MatchWatchDanmaku(event DanmakuSentEvent, params *WatchDanmakuStreamParams, identity any) bool") {
 		t.Error("should generate a typed native event matcher contract")
 	}
 	if !strings.Contains(code, "matchWatchDanmaku(payload, params, identity, resolver)") || !strings.Contains(code, "resolver.MatchWatchDanmaku(event, params, identity)") {
@@ -131,15 +131,15 @@ func TestGenerateStreamFileNoEventSource(t *testing.T) {
 	}
 
 	// Should register native stream handler
-	if !strings.Contains(code, `router.HandleStreamNative("watchLiveScore"`) {
-		t.Error("should register HandleStreamNative")
+	if !strings.Contains(code, `router.HandleStreamPrepared("watchLiveScore"`) {
+		t.Error("should register HandleStreamPrepared")
 	}
 
 	// Should generate StreamResolver interface
 	if !strings.Contains(code, "type StreamResolver interface") {
 		t.Error("should generate StreamResolver interface")
 	}
-	if !strings.Contains(code, "HandleWatchLiveScore(ctx context.Context, params *api.StreamParams, identity any, stream *api.TypedStream[ScoreEvent]) error") {
+	if !strings.Contains(code, "HandleWatchLiveScore(ctx context.Context, params *WatchLiveScoreStreamParams, identity any, stream *api.TypedStream[ScoreEvent]) error") {
 		t.Error("should generate HandleWatchLiveScore method in StreamResolver")
 	}
 
@@ -211,12 +211,12 @@ func TestGenerateStreamFileLuxoMatcher(t *testing.T) {
 	if strings.Contains(code, "codec.NewDecoder(data)") {
 		t.Error("typed event fields must not be decoded again per subscriber")
 	}
-	if !strings.Contains(code, "DispatchPreparedEvent") || !strings.Contains(code, "matchWatchDanmaku(payload.RoomId, params, identity)") {
+	if !strings.Contains(code, "streamWatchDanmaku.Dispatch") || !strings.Contains(code, "matchWatchDanmaku(payload.RoomId, params, identity)") {
 		t.Error("typed event field should be captured by the prepared matcher")
 	}
 
 	// Should validate and decode the subscription parameter once.
-	if !strings.Contains(code, `param_roomId, ok_roomId := params.LookupInt("roomId")`) {
+	if !strings.Contains(code, `param_roomId := params.RoomId`) {
 		t.Error("should validate the subscription parameter")
 	}
 
@@ -249,10 +249,10 @@ func TestGenerateTypedStreamRegistersMatcher(t *testing.T) {
 	}}}
 
 	code := string(generateStreamFile(result, "luxo"))
-	if !strings.Contains(code, `router.Streams.DispatchPreparedEvent("liveAlerts"`) {
+	if !strings.Contains(code, `streamLiveAlerts.Dispatch(`) {
 		t.Fatalf("typed stream registration missing:\n%s", code)
 	}
-	if !strings.Contains(code, `DispatchPreparedEvent("liveAlerts", matchLiveAlerts`) {
+	if !strings.Contains(code, `streamLiveAlerts.Dispatch(matchLiveAlerts`) {
 		t.Fatalf("authenticated stream matcher registration missing:\n%s", code)
 	}
 	if !strings.Contains(code, `return router.StreamPayloadJSON("liveAlerts", data)`) {
@@ -338,6 +338,7 @@ func TestClassifyStreamPayloadKinds(t *testing.T) {
 	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		ModelModule: map[string]string{"User": "accounts"},
 		TypeModule:  map[string]string{"Payload": "common"},
+		EnumModule:  map[string]string{"Role": "auth"},
 	}})
 	models := map[string]bool{"User": true}
 	types := map[string]bool{"Payload": true}
@@ -354,8 +355,32 @@ func TestClassifyStreamPayloadKinds(t *testing.T) {
 	if payload.payloadKind != streamPayloadType || payload.payloadModule != "common" {
 		t.Fatalf("type payload = %+v", payload)
 	}
-	if !enum.payloadEnum || enum.payloadKind != streamPayloadScalar {
+	if !enum.payloadEnum || enum.payloadKind != streamPayloadScalar || enum.payloadModule != "auth" {
 		t.Fatalf("enum payload = %+v", enum)
+	}
+}
+
+func TestCrossModuleEnumStreamEncoding(t *testing.T) {
+	g := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{ModulePath: "example/service", EnumModule: map[string]string{"Role": "auth"}}})
+	for _, list := range []bool{false, true} {
+		si := streamInfo{apiName: "watchRole", sourceModule: "feed", isNative: true, returnType: &ast.TypeRef{Name: "Role", IsList: list}}
+		g.classifyStreamPayload(&si, si.returnType, nil, nil, map[string]bool{"Role": true})
+		var body, imports strings.Builder
+		writeStreamResolverInterface(&body, []streamInfo{si})
+		g.writeStreamImports(&imports, []streamInfo{si}, body.String())
+		if !strings.Contains(imports.String(), `auth_luxo "example/service/auth/luxo"`) || !strings.Contains(body.String(), "auth_luxo.Role(") || !strings.Contains(body.String(), ".AppendLuxo(buf.B)") {
+			t.Fatalf("remote enum writer missing: %s\n%s", imports.String(), body.String())
+		}
+		want := "auth_luxo.Role"
+		if list {
+			want = "[]" + want
+		}
+		if got := streamReturnGoType(si); got != want {
+			t.Fatalf("native type = %s, want %s", got, want)
+		}
+		if strings.Contains(imports.String(), `"github.com/light-speak/luxo/pkg/lux/codec"`) != list {
+			t.Fatal("codec import does not match generated body")
+		}
 	}
 }
 
@@ -590,19 +615,6 @@ func TestStreamFieldTypes(t *testing.T) {
 		t.Errorf("enum stream type = %q", got)
 	}
 
-	// streamParamMethod — all branches
-	paramCases := []struct{ in, want string }{
-		{"Int", "Int"}, {"Float", "Float"}, {"String", "String"},
-		{"Boolean", "Boolean"}, {"Duration", "Duration"}, {"UUID", "UUID"}, {"Unknown", ""},
-	}
-	for _, c := range paramCases {
-		if got := streamParamMethod(c.in, false); got != c.want {
-			t.Errorf("streamParamMethod(%q) = %q, want %q", c.in, got, c.want)
-		}
-	}
-	if got := streamParamMethod("Role", true); got != "String" {
-		t.Errorf("enum stream param method = %q", got)
-	}
 	if got := streamFieldGoType(&ast.TypeRef{Name: "Unknown"}, false); got != "" {
 		t.Errorf("unknown stream field type = %q", got)
 	}
@@ -635,6 +647,30 @@ func TestStreamGenerationTypeHelpers(t *testing.T) {
 	remote := streamInfo{returnType: &ast.TypeRef{Name: "User", IsList: true}, payloadKind: streamPayloadModel, payloadModule: "accounts", sourceModule: "feed"}
 	if got := streamReturnGoType(remote); got != "[]accounts_luxo.User" {
 		t.Fatalf("remote list return type = %q", got)
+	}
+}
+
+func TestSharedEnumStreamUsesLocalAliases(t *testing.T) {
+	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
+		EnumModule:        map[string]string{"Role": "auth"},
+		Enums:             map[string]*ast.EnumDecl{"Role": {Name: "Role", Values: []string{"Admin"}}},
+		SharedEnumPackage: "example.com/app/internal/luxotypes",
+		ModulePath:        "example.com/app/service",
+	}})
+	expression := &ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "Admin"}
+	got, ok := generator.compileStreamExpr(expression, nil, map[string]bool{"Role": true}, "feed")
+	if !ok || got != "string(RoleAdmin)" {
+		t.Fatalf("enum expression = %q, %v", got, ok)
+	}
+	stream := streamInfo{sourceModule: "feed", body: &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: expression}}}}
+	generator.classifyStreamPayload(&stream, &ast.TypeRef{Name: "Role"}, nil, nil, map[string]bool{"Role": true})
+	if stream.payloadModule != "" {
+		t.Fatal("shared enum payload still imports its business service")
+	}
+	var imports strings.Builder
+	generator.writeStreamImports(&imports, []streamInfo{stream}, "")
+	if strings.Contains(imports.String(), "/service/auth/") {
+		t.Fatal("enum matcher imported a business service")
 	}
 }
 

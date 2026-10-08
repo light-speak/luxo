@@ -3,10 +3,13 @@ package rpc
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/api"
@@ -16,6 +19,128 @@ type poolLifecycleConn struct {
 	net.Conn
 	closes  atomic.Int32
 	onClose func()
+}
+
+func TestClientExchangeDeadlineFailuresDoNotRecycleConnections(t *testing.T) {
+	for _, sample := range []struct {
+		name      string
+		deadline  bool
+		fail      int
+		wantError bool
+	}{
+		{"setting deadline", true, 1, true},
+		{"resetting deadline", true, 2, false},
+		{"resetting without caller deadline", false, 1, false},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			var frame bytes.Buffer
+			if err := WriteFrame(&frame, []byte{statusOK, 42}); err != nil {
+				t.Fatal(err)
+			}
+			closed := &poolLifecycleConn{}
+			conn := &prefaceTestConn{Conn: closed, reader: &frame, writer: io.Discard, failDeadline: sample.fail}
+			client := NewClient("unused")
+			defer client.Close()
+			client.pool.Put(conn)
+			ctx := context.Background()
+			if sample.deadline {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, time.Minute)
+				defer cancel()
+			}
+			response, err := client.exchange(ctx, []byte{1})
+			if sample.wantError {
+				if !errors.Is(err, net.ErrClosed) || response != nil {
+					t.Fatalf("deadline error = %v, response=%x", err, response)
+				}
+			} else if err != nil || !bytes.Equal(response, []byte{statusOK, 42}) {
+				t.Fatalf("completed response lost during deadline cleanup: %x, %v", response, err)
+			}
+			if closed.closes.Load() != 1 || len(client.pool.conns) != 0 {
+				t.Fatal("connection with failed deadline handling was retained")
+			}
+		})
+	}
+}
+
+func TestClientExchangeCancellationInterruptsBlockedIO(t *testing.T) {
+	for _, reading := range []bool{false, true} {
+		synctest.Test(t, func(t *testing.T) {
+			conn, peer := net.Pipe()
+			defer peer.Close()
+			defer conn.Close()
+			client := NewClient("unused")
+			defer client.Close()
+			client.pool.Put(conn)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan struct{})
+			var response []byte
+			var callErr error
+			go func() {
+				defer close(done)
+				response, callErr = client.exchange(ctx, []byte{42})
+			}()
+			if reading {
+				if request, err := ReadFrame(peer, nil); err != nil || !bytes.Equal(request, []byte{42}) {
+					t.Fatalf("request = %x, err=%v", request, err)
+				}
+			}
+			synctest.Wait()
+			cancel()
+			<-done
+			if !errors.Is(callErr, context.Canceled) || response != nil || len(client.pool.conns) != 0 {
+				t.Fatalf("canceled exchange (reading=%v) = %x, err=%v, idle=%d", reading, response, callErr, len(client.pool.conns))
+			}
+		})
+	}
+}
+
+type cancelOnResponseConn struct {
+	net.Conn
+	remaining int
+	cancel    context.CancelFunc
+}
+
+func (c *cancelOnResponseConn) Read(data []byte) (int, error) {
+	n, err := c.Conn.Read(data)
+	c.remaining -= n
+	if c.remaining == 0 {
+		c.cancel()
+		synctest.Wait()
+	}
+	return n, err
+}
+
+func TestClientExchangeCompletedResponseRacingCancellation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		conn, peer := net.Pipe()
+		defer peer.Close()
+		defer conn.Close()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		client := NewClient("unused")
+		defer client.Close()
+		client.pool.Put(&cancelOnResponseConn{Conn: conn, remaining: 6, cancel: cancel})
+		done := make(chan error, 1)
+		go func() {
+			if _, err := ReadFrame(peer, nil); err != nil {
+				done <- err
+				return
+			}
+			done <- WriteFrame(peer, []byte{statusOK, 42})
+		}()
+		response, err := client.exchange(ctx, []byte{1})
+		if err != nil || !bytes.Equal(response, []byte{statusOK, 42}) || len(client.pool.conns) != 0 {
+			t.Fatalf("completed response or pool ownership changed: %x, %v, idle=%d", response, err, len(client.pool.conns))
+		}
+		if err := <-done; err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatal(err)
+		}
+		if _, err := peer.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+			t.Fatalf("canceled connection remained open: %v", err)
+		}
+	})
 }
 
 func TestPoolIdleBorrowReturnAllocations(t *testing.T) {

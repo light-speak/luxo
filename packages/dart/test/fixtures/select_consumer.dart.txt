@@ -9,7 +9,7 @@ Future<void> main() async {
   var calls = 0;
   final transport = HttpTransport('https://example.test/luvia', client: MockClient((request) async {
     final body = decodeLuxoJSON(request.body) as Map<String, dynamic>;
-    final expected = calls++ < 2 ? 'id,name' : 'name';
+    final expected = calls++ == 1 ? 'id' : 'name';
     if (body[r'$select'] != expected) throw StateError('selection: $body');
     return http.Response(expected == 'name'
         ? '{"data":{"name":"Ada"}}'

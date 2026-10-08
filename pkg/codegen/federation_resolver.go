@@ -73,7 +73,7 @@ func (g *GeneratorContext) resolveEndpoint(parent string, field *ast.FieldDecl, 
 	keyType := g.externalModelIDTypeName(parent)
 	fkField := modelFieldByName(model, fk)
 	return resolveEndpoint{
-		model: model, modelName: model.Name, tableName: str.ToSnakeCase(model.Name) + "s",
+		model: model, modelName: model.Name, tableName: modelTableName(model.Name),
 		fkField: fk, fkColumn: str.ToSnakeCase(fk), svcName: "svc:resolve:" + model.Name + ":" + fk,
 		scanFn: "scan" + model.Name, keyType: keyType, keyGoType: mapBaseType(keyType),
 		fkNullable: fkField != nil && fkField.Type != nil && fkField.Type.Nullable,
@@ -131,13 +131,13 @@ func generateResolveGroupWriter(b *strings.Builder, ep resolveEndpoint) {
 func (g *GeneratorContext) registerResolveEndpoints(b *strings.Builder, endpoints []resolveEndpoint) {
 	// The entry point always calls this, even for modules without resolvers.
 	b.WriteString("// RegisterFederationResolvers registers cross-service resolve endpoints.\n")
-	b.WriteString("func RegisterFederationResolvers(router *api.Router, app *App) {\n")
+	b.WriteString("func RegisterFederationResolvers(router *api.Router, app *App) error {\n")
 	for _, ep := range endpoints {
-		fmt.Fprintf(b, "\trouter.Handle(%q, handleResolve%sBy%s(app))\n", ep.svcName, ep.modelName, str.Capitalize(ep.fkField))
+		fmt.Fprintf(b, "\trouter.HandleInternal(%q, handleResolve%sBy%s(app))\n", ep.svcName, ep.modelName, str.Capitalize(ep.fkField))
 		if id := g.apiID(ep.svcName); id > 0 {
-			fmt.Fprintf(b, "\trouter.Registry.Register(%q, %d)\n", ep.svcName, id)
-			fmt.Fprintf(b, "\trouter.Registry.RegisterParams(%q, []api.ParamMeta{{FieldID: 1, Name: \"keys\", Type: %q, IsList: true}, {FieldID: 2, Name: \"shape\", Type: \"Int\"}})\n", ep.svcName, ep.keyType)
+			writeRegistryRoute(b, ep.svcName, id)
+			fmt.Fprintf(b, "\tif err := router.Registry.RegisterParams(%q, []api.ParamMeta{{FieldID: 1, Name: \"keys\", Type: %q, IsList: true}, {FieldID: 2, Name: \"shape\", Type: \"Int\"}}); err != nil { return err }\n", ep.svcName, ep.keyType)
 		}
 	}
-	b.WriteString("}\n\n")
+	b.WriteString("\treturn nil\n}\n\n")
 }

@@ -71,6 +71,8 @@ func writeColumnBaseline(buf *api.ResponseBuf, items []Sample, mask []byte) {
 
 const floatWriterBenchmark = `package generated
 import (
+"github.com/light-speak/luxo/internal/testutil"
+
     "bytes"
     "fmt"
     "math"
@@ -80,7 +82,7 @@ import (
 )
 func TestFloatBaselineParityAndAllocations(t *testing.T) {
     values := []Sample{{1,math.MaxFloat64},{2,math.SmallestNonzeroFloat64},{3,math.Copysign(0,-1)}}
-    masks := [][]byte{nil,codec.AppendSelectionMask(nil, []byte{3}, nil),codec.AppendSelectionMask(nil, []byte{1}, nil)}
+    masks := [][]byte{nil,testutil.Bytes(t)(codec.AppendSelectionMask(nil, []byte{3}, nil)),testutil.Bytes(t)(codec.AppendSelectionMask(nil, []byte{1}, nil))}
     for _, mask := range masks {
         for _, columns := range []bool{false,true} {
             baseline := api.ResponseBuf{B:make([]byte,0,4096)}
@@ -107,7 +109,7 @@ func BenchmarkGeneratedFloat(b *testing.B) {
                 b.Run(fmt.Sprintf("rows=%d/column=%t/checked=%t",count,columns,checked),func(b *testing.B){
                     values := make([]Sample,count)
                     for i := range values { values[i] = Sample{Id:int64(i),Value:float64(i)+0.25} }
-                    mask := codec.AppendSelectionMask(nil,[]byte{3},nil)
+                    mask := testutil.Bytes(b)(codec.AppendSelectionMask(nil,[]byte{3},nil))
                     buf := api.ResponseBuf{B:make([]byte,0,count*32)}
                     b.ReportAllocs()
                     for b.Loop() {

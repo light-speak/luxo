@@ -1,6 +1,6 @@
 name: luxo_client
 description: "Luxo SDK for Dart/Flutter — Schema-driven API framework. One .luxo file generates API + DB + SDK. Features: HTTP/2 & WebSocket transport, binary codec (3x faster than JSON), compile-time field selection ($select), typed client codegen, and auto-reconnect."
-version: 0.1.2
+version: 1.0.0-beta.1
 homepage: https://github.com/light-speak/luxo
 
 environment:

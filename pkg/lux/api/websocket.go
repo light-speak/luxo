@@ -206,8 +206,17 @@ func (rt *Router) parseJSONSubscription(raw map[string]json.RawMessage) (*Reques
 	if err != nil {
 		return nil, nil, err
 	}
+	if rt.streamHandlers[req.API].preparesInputs() {
+		if err := rt.prepareCallRequest(req, false, true); err != nil {
+			return nil, nil, err
+		}
+		return req, nil, nil
+	}
 	if err := rt.prepareRequest(req, false); err != nil {
 		return nil, nil, err
+	}
+	if rt.streamHandlers[req.API].forwardPrepare != nil {
+		return req, nil, nil
 	}
 	canonical, err := rt.Registry.ParseBinaryRequest(req.BinaryRequest())
 	if err != nil {
@@ -268,14 +277,26 @@ func (rt *Router) handleWSStreamBinary(ctx context.Context, ws *wsConn, data []b
 		rt.writeWSBinarySubscriptionError(ctx, ws, id, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
 		return
 	}
-	rt.startWSSubscription(ctx, ws, connSubs, id, req, binaryStreamParams(req), true)
+	rt.startWSSubscription(ctx, ws, connSubs, id, req, rt.streamInputValues(req), true)
 }
 
 func (rt *Router) startWSSubscription(ctx context.Context, ws *wsConn, connSubs *connectionSubscriptions, id uint64, req *Request, params map[string]any, binary bool) {
 	apiName := req.API
 	identity := rt.identityFromCtx(ctx)
-	sub, subCtx, writerCtx := rt.Streams.subscribeWS(ctx, apiName, params, identity, req.FieldMask, binary)
+	prepared, err := rt.prepareStreamHandler(ctx, req, identity)
+	if err != nil {
+		if binary {
+			rt.writeWSBinarySubscriptionError(ctx, ws, id, err)
+		} else {
+			rt.writeWSJSONSubscriptionError(ctx, ws, id, err)
+		}
+		return
+	}
+	sub, subCtx, writerCtx := rt.Streams.subscribePreparedWS(ctx, apiName, params, identity, preparedStreamFieldMask(req, prepared), binary, prepared)
 	if sub == nil {
+		if prepared.release != nil {
+			prepared.release()
+		}
 		err := errors.New("Unavailable", http.StatusServiceUnavailable, apiName+" subscriber limit reached")
 		if binary {
 			rt.writeWSBinarySubscriptionError(ctx, ws, id, err)
@@ -284,9 +305,10 @@ func (rt *Router) startWSSubscription(ctx context.Context, ws *wsConn, connSubs 
 		}
 		return
 	}
-	sub.Params.binary = append([]byte(nil), req.BinaryParams()...)
+	if !prepared.valid() {
+		sub.Params.binary = append([]byte(nil), req.BinaryParams()...)
+	}
 	connSubs.add(id, apiName, sub)
-	var err error
 	if binary {
 		err = rt.writeWSBinarySubscriptionSuccess(ctx, ws, id)
 	} else {
@@ -298,7 +320,7 @@ func (rt *Router) startWSSubscription(ctx context.Context, ws *wsConn, connSubs 
 		return
 	}
 	go rt.writeSubscription(writerCtx, ws, apiName, id, sub, connSubs)
-	rt.startNativeStreamHandler(subCtx, apiName, params, identity, sub)
+	rt.startNativeStreamHandler(subCtx, apiName, identity, sub, prepared.run)
 }
 
 func (rt *Router) unsubscribeWS(connSubs *connectionSubscriptions, id uint64) {
@@ -327,9 +349,13 @@ func (rt *Router) writeSubscription(ctx context.Context, ws *wsConn, apiName str
 // producer cancels its work immediately without interrupting accepted writes.
 // Explicit unsubscribe, slow-consumer removal and disconnect still abort both.
 func (h *StreamHub) subscribeWS(ctx context.Context, apiName string, params map[string]any, identity any, mask []byte, binary bool) (*StreamSub, context.Context, context.Context) {
+	return h.subscribePreparedWS(ctx, apiName, params, identity, mask, binary, preparedStream{})
+}
+
+func (h *StreamHub) subscribePreparedWS(ctx context.Context, apiName string, params map[string]any, identity any, mask []byte, binary bool, prepared preparedStream) (*StreamSub, context.Context, context.Context) {
 	producer, cancelProducer := context.WithCancel(ctx)
 	writer, cancelWriter := context.WithCancel(ctx)
-	sub := h.subscribeMode(apiName, params, identity, mask, binary, cancelProducer, cancelWriter)
+	sub := h.subscribePreparedMode(apiName, params, identity, mask, binary, cancelProducer, cancelWriter, prepared)
 	if sub == nil {
 		cancelProducer()
 		cancelWriter()
@@ -374,7 +400,7 @@ func (rt *Router) handleWSJSON(ctx context.Context, ws *wsConn, raw map[string]j
 		return
 	}
 
-	if err := rt.prepareRequest(req, false); err != nil {
+	if err := rt.prepareCallRequest(req, false, fn.localJSON); err != nil {
 		rt.writeWSJSONError(ctx, ws, seqID, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
 		return
 	}
@@ -383,7 +409,7 @@ func (rt *Router) handleWSJSON(ctx context.Context, ws *wsConn, raw map[string]j
 	buf := GetBuf()
 	req.Buf = buf
 
-	herr := rt.callHandler(fn, ctx, req)
+	herr := rt.callHandler(fn.call, ctx, req)
 	if herr != nil {
 		PutBuf(buf)
 		rt.writeWSJSONError(ctx, ws, seqID, herr)
@@ -455,7 +481,7 @@ func (rt *Router) handleWSBinary(ctx context.Context, ws *wsConn, data []byte) {
 	buf := GetBuf()
 	req.Buf = buf
 
-	herr := rt.callHandler(fn, ctx, req)
+	herr := rt.callHandler(fn.call, ctx, req)
 	if herr != nil {
 		PutBuf(buf)
 		rt.writeWSBinaryError(ctx, ws, seq, herr)

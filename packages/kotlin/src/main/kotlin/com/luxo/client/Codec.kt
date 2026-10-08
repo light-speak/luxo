@@ -45,6 +45,20 @@ class LuxoEncoder(initialCapacity: Int = 1024) {
         writeVarint((v shl 1) xor (v shr 63))
     }
 
+    /** Write a typed Int/Duration list without a callback or temporary container. */
+    fun writeIntList(values: List<Long>) {
+        writeVarint(values.size.toLong())
+        if (values is RandomAccess) {
+            var index = 0
+            while (index < values.size) {
+                writeSvarint(values[index])
+                index++
+            }
+        } else {
+            for (value in values) writeSvarint(value)
+        }
+    }
+
     /** Write exact seconds and nanoseconds without a millisecond conversion. */
     fun writeDateTime(value: String) {
         val instant = DateTimeCodec.parse(value)
@@ -84,13 +98,31 @@ class LuxoEncoder(initialCapacity: Int = 1024) {
 		val prefixPosition = pos
 		ensure(1)
 		pos++
-		val valuePosition = pos
 		try {
 			writeValue(this)
 		} catch (error: Throwable) {
 			pos = prefixPosition
 			throw error
 		}
+		finishDelimited(prefixPosition)
+	}
+
+	/** Pass the model separately so generated writers do not capture it. */
+	fun <T> writeDelimitedValue(value: T, writeValue: (LuxoEncoder, T) -> Unit) {
+		val prefixPosition = pos
+		ensure(1)
+		pos++
+		try {
+			writeValue(this, value)
+		} catch (error: Throwable) {
+			pos = prefixPosition
+			throw error
+		}
+		finishDelimited(prefixPosition)
+	}
+
+	private fun finishDelimited(prefixPosition: Int) {
+		val valuePosition = prefixPosition + 1
 		val valueLength = pos - valuePosition
 		val prefixLength = varintLength(valueLength)
 		val shift = prefixLength - 1
@@ -271,9 +303,29 @@ private fun checkedMetadata(value: Long, limit: Int, kind: String): Int {
 private fun metadataError(value: Long, limit: Int, kind: String): LuxoCodecException =
     LuxoCodecException("invalid $kind ${value.toULong()}, limit $limit")
 
-class LuxoDecoder(private val buf: ByteArray) {
+private fun checkedDecoderOffset(bytes: ByteArray, offset: Int): Int {
+    if (offset < 0 || offset > bytes.size) throw LuxoCodecException("invalid decoder offset")
+    return offset
+}
 
-    private var off: Int = 0
+/** Validate only the nullable root envelope; the selected decoder must validate its entire value. */
+fun isNullRoot(bytes: ByteArray): Boolean {
+    if (bytes.isEmpty()) throw LuxoCodecException("missing nullable root marker")
+    val marker = bytes[0].toInt()
+    if (marker !in 0..1 || (if (marker == 0) bytes.size != 1 else bytes.size == 1)) {
+        throw LuxoCodecException("invalid nullable root envelope")
+    }
+    return marker == 0
+}
+
+class LuxoDecoder private constructor(private val buf: ByteArray, private var off: Int) {
+    constructor(buf: ByteArray) : this(buf, 0)
+
+    companion object {
+        /** Read from the original buffer without copying its body. Completion still checks its end. */
+        fun atOffset(bytes: ByteArray, offset: Int): LuxoDecoder =
+            LuxoDecoder(bytes, checkedDecoderOffset(bytes, offset))
+    }
 
     /** The field ID read by the most recent [nextField] call. */
     var fieldID: Int = 0
@@ -475,9 +527,10 @@ object FieldMask {
     /**
      * Set the bit for [fieldID] in [mask], growing the array if needed.
      * Returns the (possibly new) mask array.
+     * Rejects IDs outside the selection domain before mutation or allocation.
      */
     fun set(mask: ByteArray, fieldID: Int): ByteArray {
-        if (fieldID <= 0) return mask
+        require(fieldID in 1..WireIDLimits.SELECTION_FIELD) { "selection field ID must be from 1 to 65535" }
         val bit = fieldID - 1
         val byteIdx = bit ushr 3
         val m = if (byteIdx >= mask.size) mask.copyOf(byteIdx + 1) else mask
@@ -487,7 +540,7 @@ object FieldMask {
 
     /** Check whether [fieldID] is present in [mask]. */
     fun has(mask: ByteArray, fieldID: Int): Boolean {
-        if (fieldID <= 0) return false
+        require(fieldID in 1..WireIDLimits.SELECTION_FIELD) { "selection field ID must be from 1 to 65535" }
         val bit = fieldID - 1
         val byteIdx = bit ushr 3
         if (byteIdx >= mask.size) return false
@@ -506,9 +559,14 @@ object FieldMask {
  *   ...
  *   [0x00]  // end marker
  */
-class ColumnarDecoder(private val buf: ByteArray) {
+class ColumnarDecoder private constructor(private val buf: ByteArray, private var off: Int) {
+    constructor(buf: ByteArray) : this(buf, 0)
 
-    private var off: Int = 0
+    companion object {
+        /** Parse the columnar header at an explicit offset, sharing the original buffer. */
+        fun atOffset(bytes: ByteArray, offset: Int): ColumnarDecoder =
+            ColumnarDecoder(bytes, checkedDecoderOffset(bytes, offset))
+    }
 
     /** Number of rows in this columnar batch. */
     val count: Int

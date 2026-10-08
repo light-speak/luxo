@@ -1,6 +1,8 @@
 package main
 
 import (
+	"github.com/light-speak/luxo/internal/testutil"
+
 	"bytes"
 	"context"
 	"encoding/json"
@@ -41,7 +43,7 @@ func TestGatewayPrimaryKeysNested(t *testing.T) {
 	for _, list := range []bool{false, true} {
 		for _, test := range gatewayNestedCases() {
 			t.Run(fmt.Sprintf("list=%v/%s/count=%d", list, test.field, test.count), func(t *testing.T) {
-				s, mask := gatewayNestedSchema(list, test.field)
+				s, mask := gatewayNestedSchema(t, list, test.field)
 				var encoded api.ResponseBuf
 				if err := writeGatewayNested(&encoded, gatewayNestedValue(test.field, test.count), mask, list); err != nil {
 					t.Fatal(err)
@@ -58,10 +60,10 @@ func TestGatewayPrimaryKeysNullableArrays(t *testing.T) {
 		for state := range 3 {
 			t.Run(fmt.Sprintf("list=%v/state=%d", list, state), func(t *testing.T) {
 				s := schema.New()
-				RegisterSchema(s)
+				proxyTestRequire(t, RegisterSchema(s))
 				model := s.Types["NullableArrays"].AsModel()
 				model.FieldByName("tail").PrimaryKey = true
-				s.RegisterModel(model)
+				proxyTestRequire(t, s.RegisterModel(model))
 				value := NullableArrays{Tail: 9223372036854775807}
 				if state > 0 {
 					value.Values, value.Durations, value.Flags = []int64{}, []time.Duration{}, []bool{}
@@ -106,7 +108,7 @@ func verifyGatewayPrimaryKeys(t *testing.T, data []byte, list bool, model *schem
 
 func verifyGatewayNestedProtocol(t *testing.T, list bool, fieldName string, count int) {
 	t.Helper()
-	s, mask := gatewayNestedSchema(list, fieldName)
+	s, mask := gatewayNestedSchema(t, list, fieldName)
 	value := gatewayNestedValue(fieldName, count)
 	primary := func(_ context.Context, request *api.Request) error {
 		return writeGatewayNested(request.Buf, value, request.FieldMask, list)
@@ -142,25 +144,41 @@ func gatewayNestedResolver(count int) api.HandlerFunc {
 			return fmt.Errorf("key precision lost: %v, %v", keys, err)
 		}
 		shape, err := request.ParamInt("shape")
-		if err != nil { return err }
-		if shape < 0 || shape > 3 { return fmt.Errorf("invalid resolve shape") }
+		if err != nil {
+			return err
+		}
+		if shape < 0 || shape > 3 {
+			return fmt.Errorf("invalid resolve shape")
+		}
 		request.Buf.B = codec.AppendVarint(request.Buf.B, uint64(len(keys)))
 		if shape&1 == 0 && count == 0 {
-			if shape&2 == 0 { return fmt.Errorf("required relation missing") }
+			if shape&2 == 0 {
+				return fmt.Errorf("required relation missing")
+			}
 			request.Buf.B = append(request.Buf.B, 0)
 			return nil
 		}
 		var body api.ResponseBuf
 		if shape&1 != 0 {
 			rows := make([]Precision, count)
-			for i := range rows { rows[i] = gatewayNestedChild(i) }
-			if err := WriteColumnarPrecision(&body, rows, request.FieldMask); err != nil { return err }
+			for i := range rows {
+				rows[i] = gatewayNestedChild(i)
+			}
+			if err := WriteColumnarPrecision(&body, rows, request.FieldMask); err != nil {
+				return err
+			}
 		} else {
-			if count != 1 { return fmt.Errorf("multiple rows for single relation") }
+			if count != 1 {
+				return fmt.Errorf("multiple rows for single relation")
+			}
 			row := gatewayNestedChild(0)
-			if err := row.WriteLuxo(&body, request.FieldMask); err != nil { return err }
+			if err := row.WriteLuxo(&body, request.FieldMask); err != nil {
+				return err
+			}
 		}
-		if shape&2 != 0 { request.Buf.B = append(request.Buf.B, 1) }
+		if shape&2 != 0 {
+			request.Buf.B = append(request.Buf.B, 1)
+		}
 		request.Buf.B = codec.AppendBytes(request.Buf.B, body.B)
 		return nil
 	}
@@ -194,24 +212,24 @@ func gatewayNestedJSONFields(t *testing.T, data []byte, list bool, s *schema.Sch
 	return fields
 }
 
-func gatewayNestedSchema(list bool, fieldName string) (*schema.Schema, []byte) {
+func gatewayNestedSchema(t testing.TB, list bool, fieldName string) (*schema.Schema, []byte) {
 	s := schema.New()
-	RegisterSchema(s)
+	proxyTestRequire(t, RegisterSchema(s))
 	parent := s.Types["NestedGroup"].AsModel()
 	key := parent.FieldByName("tail")
 	key.PrimaryKey = true
 	field := parent.FieldByName(fieldName)
 	field.Module, field.ForeignKey = "child", "value"
-	s.RegisterModel(parent)
-	s.RegisterAPI(&schema.API{ID: 1000, Name: "extensionFixture", Module: "parent", ReturnType: parent.Name, ReturnList: list})
-	s.RegisterAPI(&schema.API{ID: 1001, Name: "svc:resolve:Precision:value", Params: []schema.Param{{ID: 1, Name: "keys", Type: schema.FieldInt, IsList: true}, {ID: 2, Name: "shape", Type: schema.FieldInt}}})
+	proxyTestRequire(t, s.RegisterModel(parent))
+	proxyTestRequire(t, s.RegisterAPI(&schema.API{ID: 1000, Name: "extensionFixture", Module: "parent", ReturnType: parent.Name, ReturnList: list}))
+	proxyTestRequire(t, s.RegisterAPI(&schema.API{ID: 1001, Name: "svc:resolve:Precision:value", Params: []schema.Param{{ID: 1, Name: "keys", Type: schema.FieldInt, IsList: true}, {ID: 2, Name: "shape", Type: schema.FieldInt}}}))
 	child := s.Types["Precision"].AsModel()
 	var childMask []byte
 	for _, name := range []string{"value", "duration", "label"} {
-		childMask = codec.FieldMaskSet(childMask, child.FieldByName(name).ID)
+		childMask = testutil.Bytes(t)(codec.FieldMaskSet(childMask, child.FieldByName(name).ID))
 	}
-	fields := codec.FieldMaskSet(codec.FieldMaskSet(nil, key.ID), field.ID)
-	mask := codec.AppendSelectionMask(nil, fields, []codec.SelectionMaskChild{{FieldID: field.ID, Mask: codec.AppendSelectionMask(nil, childMask, nil)}})
+	fields := testutil.Bytes(t)(codec.FieldMaskSet(testutil.Bytes(t)(codec.FieldMaskSet(nil, key.ID)), field.ID))
+	mask := testutil.Bytes(t)(codec.AppendSelectionMask(nil, fields, []codec.SelectionMaskChild{{FieldID: field.ID, Mask: testutil.Bytes(t)(codec.AppendSelectionMask(nil, childMask, nil))}}))
 	return s, mask
 }
 

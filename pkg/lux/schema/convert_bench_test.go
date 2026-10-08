@@ -4,11 +4,94 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
 )
+
+func BenchmarkColumnarJSONCapacity(b *testing.B) {
+	for _, fields := range []int{1, 16, 128} {
+		for _, rows := range []int{0, 1, 128} {
+			for _, large := range []bool{false, true} {
+				model, data, want := columnarJSONCapacityFixture(b, fields, rows, large)
+				for _, reuse := range []bool{false, true} {
+					b.Run(fmt.Sprintf("fields=%d/rows=%d/large=%t/reuse=%t", fields, rows, large, reuse), func(b *testing.B) {
+						var dst []byte
+						if reuse {
+							dst = make([]byte, 0, len(want))
+						}
+						b.ReportAllocs()
+						for b.Loop() {
+							got, err := BinaryListToJSON(dst[:0], data, model)
+							if err != nil || !bytes.Equal(got, want) {
+								b.Fatalf("invalid output: %v, bytes=%d", err, len(got))
+							}
+							if reuse {
+								dst = got
+							}
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func columnarJSONCapacityFixture(t testing.TB, fields, rows int, large bool) (*Model, []byte, []byte) {
+	t.Helper()
+	model := &Model{Name: "Capacity"}
+	var writer codec.ColumnarWriter
+	writer.SetCount(rows)
+	for index := range fields {
+		model.Fields = append(model.Fields, Field{ID: index + 1, Name: "field" + strconv.Itoa(index), Type: FieldInt})
+		if rows > 0 {
+			values := make([]int64, rows)
+			for row := range values {
+				values[row] = capacityInteger(index, row, large)
+			}
+			writer.WriteColumnInt(index+1, values)
+		}
+	}
+	if err := New().RegisterModel(model); err != nil {
+		t.Fatal(err)
+	}
+	data, err := writer.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return model, data, capacityJSONExpected(fields, rows, large)
+}
+
+func capacityInteger(field, row int, large bool) int64 {
+	value := int64(field + row)
+	if large {
+		return math.MaxInt64 - value
+	}
+	return value
+}
+
+func capacityJSONExpected(fields, rows int, large bool) []byte {
+	dst := []byte{'['}
+	for row := range rows {
+		if row > 0 {
+			dst = append(dst, ',')
+		}
+		dst = append(dst, '{')
+		for field := range fields {
+			if field > 0 {
+				dst = append(dst, ',')
+			}
+			dst = strconv.AppendQuote(dst, "field"+strconv.Itoa(field))
+			dst = append(dst, ':')
+			dst = strconv.AppendInt(dst, capacityInteger(field, row, large), 10)
+		}
+		dst = append(dst, '}')
+	}
+	return append(dst, ']')
+}
 
 func BenchmarkStructuredJSONInput(b *testing.B) {
 	for _, item := range []struct {

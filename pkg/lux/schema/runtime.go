@@ -16,14 +16,23 @@ func (s *Schema) LookupModel(name string) *Model {
 // directly during startup. RegisterModel/RegisterType already prepare their own
 // metadata. Prepare is not safe concurrently with requests or registration.
 // Call InferTypeUsage afterwards when API roots or field graphs have changed.
-func (s *Schema) Prepare() {
+func (s *Schema) Prepare() error {
+	if err := s.validateDeclarations(); err != nil {
+		return err
+	}
+	ids, err := s.validatedAPIIndex()
+	if err != nil {
+		return err
+	}
 	s.typeModels = make(map[string]*Model, len(s.Types))
 	for _, model := range s.Models {
 		initializeModel(model)
 	}
 	for _, decl := range s.Types {
-		s.RegisterType(decl)
+		s.registerType(decl)
 	}
+	s.apiNames = ids
+	return nil
 }
 
 // AsModel returns an independent, mutable copy of a type's field metadata.

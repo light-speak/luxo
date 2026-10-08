@@ -213,7 +213,9 @@ func loadCallSchema(path string) (*schema.Schema, error) {
 	if err := json.Unmarshal(data, &result); err != nil {
 		return nil, fmt.Errorf("decode %s: %w", path, err)
 	}
-	result.Prepare()
+	if err := result.Prepare(); err != nil {
+		return nil, fmt.Errorf("prepare %s: %w", path, err)
+	}
 	return &result, nil
 }
 

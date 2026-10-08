@@ -8,7 +8,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.luxo:luxo-client:0.1.0")
+    implementation("com.luxo:luxo-client:1.0.0-beta.1")
 }
 
 layout.buildDirectory = layout.projectDirectory.dir(".tmp/build")
@@ -34,6 +34,44 @@ val verifyProtocol = tasks.register<JavaExec>("verifyProtocol") {
 
 tasks.check {
     dependsOn(verifyProtocol)
+}
+
+fun writeBenchmarkHarness(directory: File, harness: File) {
+    val shared = harness.readText().substringAfter("internal object PairedJvmBenchmark {", "")
+    check(shared.isNotEmpty()) { "Paired JVM harness not found" }
+    directory.resolve("PairedJvmBenchmark.kt").writeText("""
+        package app
+        import com.sun.management.ThreadMXBean
+        import java.lang.management.ManagementFactory
+        import java.util.Locale
+        import java.util.function.LongSupplier
+        internal object PairedJvmBenchmark {
+    """.trimIndent() + shared)
+}
+
+providers.gradleProperty("luxo.enumBenchmark").orNull?.let {
+    check(!providers.gradleProperty("luxo.projectionBaseline").isPresent) { "Run enum and projection benchmarks separately" }
+    val generated = layout.projectDirectory.dir(".tmp/enum-benchmark")
+    val template = file("benchmark/EnumBenchmark.kt.txt")
+    val harness = file("../../packages/kotlin/src/test/kotlin/com/luxo/client/WebSocketIDBenchmark.kt")
+    val prepare = tasks.register("prepareEnumBenchmark") {
+        inputs.files(template, harness)
+        outputs.dir(generated)
+        doLast {
+            val directory = generated.asFile.apply { mkdirs() }
+            writeBenchmarkHarness(directory, harness)
+            directory.resolve("EnumBenchmark.kt").writeText(template.readText())
+        }
+    }
+    kotlin.sourceSets["main"].kotlin.srcDir(generated)
+    tasks.named("compileKotlin") { dependsOn(prepare) }
+    tasks.register<JavaExec>("benchmarkEnums") {
+        group = "verification"
+        description = "Compare generated known/unknown enum boundaries with strict string readers"
+        classpath = sourceSets["main"].runtimeClasspath
+        mainClass.set("app.EnumBenchmark")
+        jvmArgs("-Xms512m", "-Xmx512m")
+    }
 }
 
 // Capture the actual pre-change generated sources once; never silently replace them.
@@ -68,16 +106,7 @@ providers.gradleProperty("luxo.projectionBaseline").orNull?.let { snapshot ->
                 directory.resolve(name).writeText(original.replaceFirst("package com.luxo.generated",
                     "package com.luxo.projectionbefore"))
             }
-            val shared = harness.readText().substringAfter("internal object PairedJvmBenchmark {", "")
-            check(shared.isNotEmpty()) { "Paired JVM harness not found" }
-            directory.resolve("PairedJvmBenchmark.kt").writeText("""
-                package app
-                import com.sun.management.ThreadMXBean
-                import java.lang.management.ManagementFactory
-                import java.util.Locale
-                import java.util.function.LongSupplier
-                internal object PairedJvmBenchmark {
-            """.trimIndent() + shared)
+            writeBenchmarkHarness(directory, harness)
             directory.resolve("JsonProjectionBenchmark.kt").writeText(template.readText())
         }
     }

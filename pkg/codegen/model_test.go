@@ -9,6 +9,29 @@ import (
 	"github.com/light-speak/luxo/pkg/token"
 )
 
+func TestCollectFieldInfosUsesExactCapacity(t *testing.T) {
+	fields := []*ast.FieldDecl{
+		{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+		{Name: "name", Type: &ast.TypeRef{Name: "String"}},
+		{Name: "score", Type: &ast.TypeRef{Name: "Float"}},
+	}
+	for _, count := range []int{0, 1, 3} {
+		infos, nameWidth, typeWidth := collectFieldInfos(fields[:count], nil)
+		if len(infos) != count || cap(infos) != count {
+			t.Fatalf("field metadata capacity=%d length=%d want=%d", cap(infos), len(infos), count)
+		}
+		if count == 0 && (nameWidth != 0 || typeWidth != 0) {
+			t.Fatal("empty field metadata has nonzero alignment")
+		}
+		if count == 3 {
+			want := fieldInfo{goName: "Score", goType: "float64", dbTag: "score", jsonTag: "score"}
+			if infos[2] != want || nameWidth != 5 || typeWidth != 7 {
+				t.Fatalf("field metadata changed: %+v %d %d", infos, nameWidth, typeWidth)
+			}
+		}
+	}
+}
+
 func TestGenerateModel(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -534,23 +557,23 @@ func TestGenerateModelWithAuth(t *testing.T) {
 	}
 	generateModel(&b, m, nil)
 	out := b.String()
-	if !strings.Contains(out, "func (m *Member) CreateToken() string") {
+	if !strings.Contains(out, "func (m *Member) CreateToken() (string, error)") {
 		t.Errorf("missing CreateToken: %s", out)
 	}
-	if !strings.Contains(out, "func (m *Member) RefreshToken(oldToken string) string") {
+	if !strings.Contains(out, "func (m *Member) RefreshToken(oldToken string) (string, error)") {
 		t.Errorf("missing RefreshToken: %s", out)
 	}
-	if !strings.Contains(out, `"id": m.Id`) {
-		t.Errorf("missing id in data map: %s", out)
+	if !strings.Contains(out, `w.Int(m.Id)`) {
+		t.Errorf("missing static id writer: %s", out)
 	}
-	if !strings.Contains(out, `"role": m.Role`) {
-		t.Errorf("missing role in data map: %s", out)
+	if !strings.Contains(out, `w.String(m.Role)`) {
+		t.Errorf("missing static role writer: %s", out)
 	}
-	if !strings.Contains(out, "auth.Sign(cfg, data)") {
+	if !strings.Contains(out, "auth.Sign(cfg, m.AppendClaimsJSON)") || strings.Contains(out, "map[string]any") {
 		t.Errorf("missing auth.Sign call: %s", out)
 	}
-	if !strings.Contains(out, "auth.Verify(cfg, oldToken)") {
-		t.Errorf("missing auth.Verify call: %s", out)
+	if !strings.Contains(out, "auth.VerifyRefresh(cfg, oldToken)") {
+		t.Errorf("missing auth.VerifyRefresh call: %s", out)
 	}
 }
 

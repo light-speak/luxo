@@ -12,6 +12,8 @@ repositories {
 }
 
 dependencies {
+    compileOnly("org.jetbrains.kotlin:kotlin-gradle-plugin-api:${libs.versions.kotlin.get()}")
+    testImplementation("org.jetbrains.kotlin:kotlin-gradle-plugin-api:${libs.versions.kotlin.get()}")
     testImplementation(gradleTestKit())
     testImplementation(kotlin("test"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
@@ -19,6 +21,13 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    dependsOn(rootProject.tasks.named("jar"))
+    dependsOn(tasks.jar)
+    doFirst {
+        systemProperty("luxo.testPluginJar", rootProject.tasks.named<Jar>("jar").get().archiveFile.get().asFile.absolutePath)
+        systemProperty("luxo.testGradleUserHome", gradle.gradleUserHomeDir.absolutePath)
+        systemProperty("luxo.testGradlePluginJar", tasks.jar.get().archiveFile.get().asFile.absolutePath)
+    }
 }
 
 val toolingVersions = mapOf("kotlinVersion" to libs.versions.kotlin.get(), "luxoVersion" to version.toString())

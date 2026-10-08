@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -98,7 +99,33 @@ func BenchmarkPayloadJSONList(b *testing.B) {
 }
 `
 
-func runGeneratedProtocolPackage(t *testing.T, source, assertions string) {
+func runGeneratedProtocolPackage(t *testing.T, source, assertions string, legacyReference ...bool) {
+	t.Helper()
+	dir := writeProtocolFixture(t, source, assertions)
+	args, benchmark := protocolTestArgs()
+	natsAdapter := strings.Contains(assertions, "github.com/light-speak/luxo/pkg/lux/nats/event")
+	if natsAdapter {
+		writeAdapterFixtureModule(t, dir, "pkg/lux/nats")
+		args = append(args[:1], append([]string{"-mod=mod"}, args[1:]...)...)
+	}
+	if len(legacyReference) > 0 && legacyReference[0] {
+		args = append([]string{"test", "-overlay=" + legacyRequestBenchmarkOverlay(t, dir)}, args[1:]...)
+	}
+	command := exec.Command("go", args...)
+	command.Dir = dir
+	if natsAdapter {
+		command.Env = append(os.Environ(), "GOWORK=off")
+	}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("generated protocol execution: %v\n%s", err, output)
+	}
+	if benchmark {
+		t.Logf("%s", output)
+	}
+}
+
+func writeProtocolFixture(t *testing.T, source, assertions string) string {
 	t.Helper()
 	root, err := filepath.Abs("../../.tmp")
 	if err != nil {
@@ -121,27 +148,64 @@ func runGeneratedProtocolPackage(t *testing.T, source, assertions string) {
 			t.Fatal(err)
 		}
 	}
-	command := exec.Command("go", "test", "-count=1", "-timeout=30s", ".")
-	if os.Getenv("LUXO_ARRAY_BENCHMARK") == "1" {
-		command = exec.Command("go", "test", "-run=^$", "-bench=BenchmarkArray", "-benchtime=200ms", "-benchmem", "-count=3", ".")
+	return dir
+}
+
+func protocolTestArgs() ([]string, bool) {
+	args := []string{"test", "-count=1", "-timeout=30s", "."}
+	benchmark := false
+	for _, option := range []struct{ env, name, duration, count string }{
+		{"LUXO_ARRAY_BENCHMARK", "BenchmarkArray", "200ms", "3"},
+		{"LUXO_SCANNER_BENCHMARK", "BenchmarkScannerDiscard", "200ms", "1"},
+		{"LUXO_NESTED_BENCHMARK", "BenchmarkNested", "200ms", "3"},
+		{"LUXO_FLOAT_BENCHMARK", "BenchmarkGeneratedFloat", "500ms", "1"},
+		{"LUXO_PAYLOAD_BENCHMARK", "BenchmarkPayload", "300ms", "1"},
+		{"LUXO_STRUCTURED_PARAM_BENCHMARK", "BenchmarkStructuredTransport", "200ms", "1"},
+		{"LUXO_ENUM_BENCHMARK", "BenchmarkEnum", "200ms", "1"},
+		{"LUXO_CACHE_BENCHMARK", "BenchmarkCacheBoundary", "500ms", "1"},
+		{"LUXO_LOADER_BINDING_BENCHMARK", "BenchmarkLoaderBinding", "300ms", "1"},
+		{"LUXO_EVENT_BENCHMARK", "BenchmarkEventNullable", "300ms", "1"},
+		{"LUXO_EVENT_SNAPSHOT_BENCHMARK", "BenchmarkEventSnapshot", "300ms", "1"},
+		{"LUXO_JSON_INPUT_BENCHMARK", "BenchmarkJSONInput", "200ms", "1"},
+		{"LUXO_JSON_LOCAL_BENCHMARK", "BenchmarkLocalJSONTransport", "200ms", "1"},
+		{"LUXO_CRUD_INPUT_BENCHMARK", "BenchmarkMutationInput", "200ms", "1"},
+		{"LUXO_STREAM_PREPARE_BENCHMARK", "BenchmarkStreamPreparationLifecycle", "300ms", "1"},
+	} {
+		if os.Getenv(option.env) == "1" {
+			args = []string{"test", "-run=^$", "-bench=" + option.name, "-benchtime=" + option.duration, "-benchmem", "-count=" + option.count, "."}
+			benchmark = true
+		}
 	}
-	if os.Getenv("LUXO_NESTED_BENCHMARK") == "1" {
-		command = exec.Command("go", "test", "-run=^$", "-bench=BenchmarkNested", "-benchtime=200ms", "-benchmem", "-count=3", ".")
+	return args, benchmark
+}
+
+func legacyRequestBenchmarkOverlay(t *testing.T, dir string) string {
+	t.Helper()
+	if strings.Contains(os.Getenv("GOFLAGS"), "-overlay") {
+		t.Fatal("historical request benchmark overlay cannot replace another GOFLAGS overlay")
 	}
-	if os.Getenv("LUXO_FLOAT_BENCHMARK") == "1" {
-		command = exec.Command("go", "test", "-run=^$", "-bench=BenchmarkGeneratedFloat", "-benchtime=500ms", "-benchmem", "-count=1", ".")
-	}
-	if os.Getenv("LUXO_PAYLOAD_BENCHMARK") == "1" {
-		command = exec.Command("go", "test", "-run=^$", "-bench=BenchmarkPayload", "-benchtime=300ms", "-benchmem", "-count=1", ".")
-	}
-	command.Dir = dir
-	output, err := command.CombinedOutput()
+	apiDir, err := filepath.Abs("../lux/api")
 	if err != nil {
-		t.Fatalf("generated protocol execution: %v\n%s", err, output)
+		t.Fatal(err)
 	}
-	if os.Getenv("LUXO_ARRAY_BENCHMARK") == "1" || os.Getenv("LUXO_NESTED_BENCHMARK") == "1" || os.Getenv("LUXO_FLOAT_BENCHMARK") == "1" || os.Getenv("LUXO_PAYLOAD_BENCHMARK") == "1" {
-		t.Logf("%s", output)
+	target := filepath.Join(apiDir, "request_legacy_benchmark.go")
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("benchmark overlay target must not exist: %s (%v)", target, err)
 	}
+	snapshot := filepath.Join(apiDir, "request_legacy_reference_test.go")
+	data, err := json.Marshal(struct{ Replace map[string]string }{map[string]string{target: snapshot}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "legacy-overlay.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func structuredParamBenchmarkEnabled() bool {
+	return os.Getenv("LUXO_STRUCTURED_PARAM_BENCHMARK") == "1"
 }
 
 const protocolJSONAssertions = `package generated
@@ -206,8 +270,8 @@ func nullableScalarSources(declaration string) (string, string) {
 	g := generatorWithModelFieldIDs(ids)
 	var source, assertions strings.Builder
 	source.WriteString("package generated\n")
-	writeWriteJSONImports(&source, models)
-	source.WriteString("type ArrayState string\n")
+	writeWriteJSONImports(&source, models, 0)
+	generateEnum(&source, &ast.EnumDecl{Name: "ArrayState", Values: []string{"open", "closed"}})
 	assertions.WriteString(nullableScalarTestImports)
 	for i, model := range models {
 		writeArrayFixtureDeclaration(&source, g, model, enums, declaration)

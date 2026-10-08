@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"testing"
 )
@@ -88,7 +89,7 @@ func TestRepositoryApprovedCostBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	cost := costs[costKey{"github.com/light-speak/luxo/pkg/semantic", "AnalyzeDemoFile-2"}]
-	if len(costs) != 1 || cost.MaxBytes != 272 || cost.MaxAllocs != 2 {
+	if len(costs) != 17 || cost.ID != "beta-compiler-demo-v1-validation" || cost.MaxBytes != 11280 || cost.MaxAllocs != 116 {
 		t.Fatalf("unexpected reviewed repository budget: %+v", costs)
 	}
 	for _, test := range []struct {
@@ -100,14 +101,15 @@ func TestRepositoryApprovedCostBudget(t *testing.T) {
 		base         string
 		pass         bool
 	}{
-		{"measured groups", 258, 253.5, 2, "~", approvedBase, true},
-		{"exact ceiling", 272, 272, 2, "~", approvedBase, true},
-		{"fraction over ceiling", 272.5, 272.5, 2, "~", approvedBase, false},
-		{"primary over ceiling", 273, 258, 2, "~", approvedBase, false},
-		{"confirmation over ceiling", 258, 273, 2, "~", approvedBase, false},
-		{"extra allocation", 258, 258, 3, "~", approvedBase, false},
-		{"time regression", 258, 258, 2, "+6%", approvedBase, false},
-		{"expired baseline", 258, 258, 2, "~", strings.Repeat("a", 40), false},
+		{"previous smaller cost", 258, 253.5, 2, "~", approvedBase, true},
+		{"measured groups", 11262.5, 11261.5, 116, "~", approvedBase, true},
+		{"exact ceiling", 11280, 11280, 116, "~", approvedBase, true},
+		{"fraction over ceiling", 11280.5, 11280.5, 116, "~", approvedBase, false},
+		{"primary over ceiling", 11281, 11261.5, 116, "~", approvedBase, false},
+		{"confirmation over ceiling", 11262.5, 11281, 116, "~", approvedBase, false},
+		{"extra allocation", 11262.5, 11261.5, 117, "~", approvedBase, false},
+		{"time regression", 11262.5, 11261.5, 116, "+6%", approvedBase, false},
+		{"expired baseline", 11262.5, 11261.5, 116, "~", strings.Repeat("a", 40), false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			primary := writeRunInput(t, compilerCostCSV(test.timeDelta, test.primaryBytes, test.allocations))
@@ -117,6 +119,263 @@ func TestRepositoryApprovedCostBudget(t *testing.T) {
 				t.Fatalf("gate error = %v, want pass=%t", err, test.pass)
 			}
 		})
+	}
+}
+
+func TestColdCompilationBudgets(t *testing.T) {
+	for _, sample := range []struct {
+		pkg, name                       string
+		nanoseconds, bytes, allocations int64
+	}{
+		{"codegen", "Generate-2", 4850000, 1053545, 22002},
+		{"codegen", "GenerateModelFile-2", 2237, 3649, 5},
+		{"lockfile", "Update-2", 12936, 9744, 44},
+		{"lockfile", "SaveLoad-2", 0, 19355, 66},
+		{"semantic", "Analyze-2", 5791, 4184, 17},
+		{"semantic", "AnalyzeLargeFile-2", 0, 64, 0},
+	} {
+		t.Run(sample.pkg+"/"+sample.name, func(t *testing.T) {
+			costs, err := loadApprovedCosts("approved-costs.json", approvedBase)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cost, ok := costs[costKey{"github.com/light-speak/luxo/pkg/" + sample.pkg, sample.name}]
+			if !ok || cost.MaxNanoseconds != float64(sample.nanoseconds) || cost.MaxBytes != sample.bytes || cost.MaxAllocs != sample.allocations {
+				t.Fatalf("incorrect cold compilation budget: %+v", cost)
+			}
+			testColdCompilationBudget(t, cost)
+		})
+	}
+}
+
+func TestRuntimeCombinationBudgets(t *testing.T) {
+	costs, err := loadApprovedCosts("approved-costs.json", approvedBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sample := range []struct {
+		pkg, name string
+		ns        float64
+	}{
+		{"api", "ParseBinaryRequestPaginatedDefaults-2", 11.435},
+		{"codec", "ReadStringVsArena/Arena-2", 35.285},
+		{"codec", "ReadStringVsArena/NoArena-2", 37.320},
+		{"codec", "ColumnarStringArena-2", 659.400},
+		{"codec", "ColumnarStringNoArena-2", 721.250},
+		{"codec", "RowWrite10-2", 53.700},
+		{"codec", "EncodeEvent-2", 1.005},
+		{"codec", "DecodeEvent-2", 6.355},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			cost, ok := costs[costKey{"github.com/light-speak/luxo/pkg/lux/" + sample.pkg, sample.name}]
+			if !ok || float64(cost.MaxNanoseconds) != sample.ns || cost.MaxBytes != 0 || cost.MaxAllocs != 0 {
+				t.Fatalf("incorrect runtime budget: %+v", cost)
+			}
+			testColdCompilationBudget(t, cost)
+		})
+	}
+}
+
+func TestEventSnapshotBudget(t *testing.T) {
+	costs, err := loadApprovedCosts("approved-costs.json", approvedBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cost, ok := costs[costKey{"github.com/light-speak/luxo/pkg/lux/event", "ChanBusEmit-2"}]
+	if !ok || cost.MaxNanoseconds != 82.105 || cost.MaxBytes != 72 || cost.MaxAllocs != 4 {
+		t.Fatalf("incorrect event snapshot budget: %+v", cost)
+	}
+	testColdCompilationBudget(t, cost)
+}
+
+func TestRuntimeTimeBudgetsFailClosed(t *testing.T) {
+	cost := approvedCost{ID: "runtime", BaseSHA: approvedBase, Package: "github.com/light-speak/luxo/pkg/lux/codec", Benchmark: "EncodeEvent-2", MaxNanoseconds: 1.005, Reason: "test"}
+	for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), -0.001} {
+		invalid := cost
+		invalid.MaxNanoseconds = value
+		if invalid.validate() == nil {
+			t.Fatalf("accepted invalid limit: %v", value)
+		}
+	}
+	for _, key := range []costKey{
+		{"github.com/light-speak/luxo/pkg/lux/codec", "ColumnarWrite10-2"},
+		{"github.com/light-speak/luxo/pkg/lux/api", "RouterObservabilityDisabled-2"},
+		{"github.com/light-speak/luxo/pkg/lux/event", "ChanBusEmitUnreviewed-2"},
+	} {
+		invalid := cost
+		invalid.Package, invalid.Benchmark = key.Package, key.Benchmark
+		if invalid.validate() == nil {
+			t.Fatalf("accepted unreviewed sample: %+v", key)
+		}
+	}
+}
+
+func TestTimeBudgetOnlyAllowsOneRepresentationStep(t *testing.T) {
+	cost := approvedCost{Package: "sample", Benchmark: "sample", MaxNanoseconds: 35.285}
+	group := coldCostMeasurements(cost)
+	key := comparisonKey{cost.Package, cost.Benchmark, "sec/op"}
+	value := group.Measurements[key]
+	value.Base = 3.8915e-8
+	ceiling := value.Base + cost.MaxNanoseconds/1e9
+	for _, test := range []struct {
+		head float64
+		want bool
+	}{
+		{ceiling, true},
+		{math.Nextafter(ceiling, math.Inf(1)), true},
+		{math.Nextafter(math.Nextafter(ceiling, math.Inf(1)), math.Inf(1)), false},
+		{ceiling + 1e-12, false},
+	} {
+		value.Head = test.head
+		group.Measurements[key] = value
+		accepted, err := cost.accepts(group, group)
+		if err != nil || accepted != test.want {
+			t.Fatalf("head %.20g: accepted=%t, err=%v", test.head, accepted, err)
+		}
+	}
+}
+
+func testColdCompilationBudget(t *testing.T, cost approvedCost) {
+	t.Helper()
+	for _, test := range []struct {
+		name, unit   string
+		increase     float64
+		confirmation bool
+	}{
+		{"ceiling", "", 0, false},
+		{"primary time", "sec/op", 1e-9, false},
+		{"confirmation time", "sec/op", 1e-9, true},
+		{"primary bytes", "B/op", 0.5, false},
+		{"confirmation bytes", "B/op", 0.5, true},
+		{"allocations", "allocs/op", 1, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			primary, confirmation := coldCostMeasurements(cost), coldCostMeasurements(cost)
+			group := primary
+			if test.confirmation {
+				group = confirmation
+			}
+			if test.unit != "" {
+				key := comparisonKey{cost.Package, cost.Benchmark, test.unit}
+				value := group.Measurements[key]
+				value.Head += test.increase
+				group.Measurements[key] = value
+			}
+			result := evaluation{Regressions: []regression{{Key: comparisonKey{cost.Package, cost.Benchmark, "B/op"}}}}
+			if test.unit == "sec/op" || cost.MaxNanoseconds > 0 {
+				result.Regressions = append(result.Regressions, regression{Key: comparisonKey{cost.Package, cost.Benchmark, "sec/op"}})
+			}
+			err := applyApprovedCosts(&result, primary, confirmation, map[costKey]approvedCost{{cost.Package, cost.Benchmark}: cost}, io.Discard)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (len(result.Regressions) == 0) != (test.unit == "") {
+				t.Fatalf("unexpected remaining regressions: %+v", result.Regressions)
+			}
+		})
+	}
+}
+
+func coldCostMeasurements(cost approvedCost) evaluation {
+	return evaluation{Measurements: map[comparisonKey]measurement{
+		{cost.Package, cost.Benchmark, "sec/op"}:    {Base: 1e-6, Head: 1e-6 + float64(cost.MaxNanoseconds)/1e9},
+		{cost.Package, cost.Benchmark, "B/op"}:      {Base: 100, Head: 100 + float64(cost.MaxBytes)},
+		{cost.Package, cost.Benchmark, "allocs/op"}: {Base: 10, Head: 10 + float64(cost.MaxAllocs)},
+	}}
+}
+
+func TestTimeApprovalEligibilityIsExact(t *testing.T) {
+	for _, key := range []costKey{
+		{"github.com/light-speak/luxo/pkg/lux/auth", "VerifyUncached-2"},
+		{"github.com/light-speak/luxo/pkg/codegen", "Generate-4"},
+		{"github.com/light-speak/luxo/pkg/codegen", "LogicalExpression/fallibleAnd-2"},
+		{"github.com/light-speak/luxo/pkg/semantic", "AnalyzeDemoFile-2"},
+		{"github.com/light-speak/luxo/pkg/semantic", "AnalyzeLargeFile-2"},
+		{"github.com/light-speak/luxo/pkg/lockfile", "SaveLoad-2"},
+		{"github.com/light-speak/luxo/pkg/lockfile", "Load-2"},
+	} {
+		cost := approvedCost{ID: "unreviewed-time", BaseSHA: approvedBase, Package: key.Package, Benchmark: key.Benchmark, MaxBytes: 1, MaxNanoseconds: 1, Reason: "test"}
+		if err := cost.validate(); err == nil {
+			t.Errorf("unreviewed time sample accepted: %+v", key)
+		}
+	}
+	cost := approvedCost{ID: "negative-time", BaseSHA: approvedBase, Package: "github.com/light-speak/luxo/pkg/codegen", Benchmark: "Generate-2", MaxBytes: 1, MaxNanoseconds: -1, Reason: "test"}
+	if err := cost.validate(); err == nil {
+		t.Fatal("negative time limit accepted")
+	}
+}
+
+func TestTimeApprovalRequiresBothTimeMeasurements(t *testing.T) {
+	cost := approvedCost{ID: "time", BaseSHA: approvedBase, Package: "github.com/light-speak/luxo/pkg/codegen", Benchmark: "Generate-2", MaxBytes: 1, MaxNanoseconds: 1, Reason: "test"}
+	for _, missingGroup := range []int{0, 1} {
+		groups := []evaluation{coldCostMeasurements(cost), coldCostMeasurements(cost)}
+		delete(groups[missingGroup].Measurements, comparisonKey{cost.Package, cost.Benchmark, "sec/op"})
+		if _, err := cost.accepts(groups...); err == nil || !strings.Contains(err.Error(), "requires sec/op") {
+			t.Fatalf("missing time measurement in group %d: %v", missingGroup, err)
+		}
+	}
+}
+
+func TestRepositoryApprovalDoesNotCoverOtherBenchmarksOrPackages(t *testing.T) {
+	for _, replacement := range [][2]string{
+		{"AnalyzeDemoFile-2", "Analyze-2"},
+		{"/pkg/semantic", "/pkg/codegen"},
+		{"/pkg/semantic", "/pkg/lux/api"},
+	} {
+		input := strings.ReplaceAll(compilerCostCSV("~", 11262.5, 116), replacement[0], replacement[1])
+		path := writeRunInput(t, input)
+		if err := run([]string{"--approved-costs", "approved-costs.json", "--base-sha", approvedBase, path, path}, io.Discard); err == nil {
+			t.Fatalf("repository approval widened to %s", replacement[1])
+		}
+	}
+}
+
+func TestRepositoryVerificationCostBudget(t *testing.T) {
+	costs, err := loadApprovedCosts("approved-costs.json", approvedBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cost := costs[costKey{"github.com/light-speak/luxo/pkg/lux/auth", "VerifyUncached-2"}]
+	if cost.ID != "beta-jwt-verification-precision" || cost.MaxBytes != 736 || cost.MaxAllocs != 10 {
+		t.Fatalf("unexpected reviewed verification budget: %+v", cost)
+	}
+	for _, test := range []struct {
+		name, timeDelta, base, benchmark        string
+		primaryBytes, confirmBytes, allocations float64
+		pass                                    bool
+	}{
+		{"exact measured ceiling", "~", approvedBase, "VerifyUncached-2", 736, 736, 10, true},
+		{"primary over limit", "~", approvedBase, "VerifyUncached-2", 736.5, 736, 10, false},
+		{"confirmation over limit", "~", approvedBase, "VerifyUncached-2", 736, 736.5, 10, false},
+		{"extra allocation", "~", approvedBase, "VerifyUncached-2", 736, 736, 11, false},
+		{"time regression", "+6%", approvedBase, "VerifyUncached-2", 736, 736, 10, false},
+		{"expired baseline", "~", strings.Repeat("a", 40), "VerifyUncached-2", 736, 736, 10, false},
+		{"cached verification", "~", approvedBase, "VerifyCached-2", 736, 736, 10, false},
+		{"different sample", "~", approvedBase, "VerifyUncached-4", 736, 736, 10, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			csv := func(increase float64) string {
+				return allocationCostCSV("github.com/light-speak/luxo/pkg/lux/auth", test.benchmark, test.timeDelta, 1456, increase, 22, test.allocations)
+			}
+			primary, confirmation := writeRunInput(t, csv(test.primaryBytes)), writeRunInput(t, csv(test.confirmBytes))
+			err := run([]string{"--approved-costs", "approved-costs.json", "--base-sha", test.base, primary, confirmation}, io.Discard)
+			if (err == nil) != test.pass {
+				t.Fatalf("gate error = %v, want pass=%t", err, test.pass)
+			}
+		})
+	}
+}
+
+func TestRuntimeApprovalEligibilityIsExact(t *testing.T) {
+	cost := approvedCost{ID: "verification", BaseSHA: approvedBase, Package: "github.com/light-speak/luxo/pkg/lux/auth", Benchmark: "VerifyUncached-2", MaxBytes: 736, MaxAllocs: 10, Reason: "Reviewed verification memory only"}
+	if err := cost.validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"VerifyCached-2", "VerifyUncached-4", "VerifyUncached-2/other", "*", ""} {
+		cost.Benchmark = name
+		if err := cost.validate(); err == nil {
+			t.Errorf("unreviewed runtime benchmark accepted: %q", name)
+		}
 	}
 }
 
@@ -150,8 +409,12 @@ const approvedPolicy = `{"version":1,"approvals":[{
 }]}`
 
 func compilerCostCSV(timeDelta string, byteIncrease, allocationIncrease float64) string {
+	return allocationCostCSV("github.com/light-speak/luxo/pkg/semantic", "AnalyzeDemoFile-2", timeDelta, 446000, byteIncrease, 3585, allocationIncrease)
+}
+
+func allocationCostCSV(packageName, benchmark, timeDelta string, baseBytes, byteIncrease, baseAllocs, allocationIncrease float64) string {
 	var output strings.Builder
-	output.WriteString("pkg: github.com/light-speak/luxo/pkg/semantic\n")
+	fmt.Fprintf(&output, "pkg: %s\n", packageName)
 	for _, metric := range []struct {
 		unit     string
 		base     float64
@@ -159,11 +422,11 @@ func compilerCostCSV(timeDelta string, byteIncrease, allocationIncrease float64)
 		delta    string
 	}{
 		{"sec/op", 10, 0, timeDelta},
-		{"B/op", 446000, byteIncrease, "+0.06%"},
-		{"allocs/op", 3585, allocationIncrease, "+0.06%"},
+		{"B/op", baseBytes, byteIncrease, "+0.06%"},
+		{"allocs/op", baseAllocs, allocationIncrease, "+0.06%"},
 	} {
 		table := benchstatTable(metric.unit, metric.delta, "n=10")
-		table = strings.ReplaceAll(table, "EncodeEvent-2", "AnalyzeDemoFile-2")
+		table = strings.ReplaceAll(table, "EncodeEvent-2", benchmark)
 		table = strings.Replace(table, ",10,0%,11,0%,", fmt.Sprintf(",%g,0%%,%g,0%%,", metric.base, metric.base+metric.increase), 1)
 		output.WriteString(table)
 		output.WriteByte('\n')
@@ -186,7 +449,7 @@ func TestApprovedCompilationCostRequiresConfirmation(t *testing.T) {
 	}
 	output.Reset()
 	err = run([]string{"--approved-costs", policy, "--base-sha", approvedBase, primary, primary}, &output)
-	if err != nil || !strings.Contains(output.String(), "approved compilation cost: fn-declaration-index") {
+	if err != nil || !strings.Contains(output.String(), "approved allocation cost: fn-declaration-index") {
 		t.Fatalf("approved output = %q, error %v", output.String(), err)
 	}
 }

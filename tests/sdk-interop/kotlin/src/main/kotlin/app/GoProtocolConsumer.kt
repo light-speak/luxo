@@ -4,6 +4,8 @@ import com.luxo.client.LuxoWebSocket
 import com.luxo.client.LuxoDecoder
 import com.luxo.client.LuxoCodecException
 import com.luxo.client.LuxoError
+import com.luxo.client.LuxoFilter
+import com.luxo.client.LuxoSorter
 import com.luxo.client.decodeLuxoJSON
 import com.luxo.interop.decodeNestedGroup
 import com.luxo.interop.decodeColumnarNestedGroup
@@ -12,6 +14,8 @@ import com.luxo.client.OkHttpTransport
 import com.luxo.client.TransportMode
 import com.luxo.client.StreamObserver
 import com.luxo.interop.LuxoClient
+import com.luxo.interop.LuxoQuery_listQueryProbes
+import com.luxo.interop.FixtureState
 import com.luxo.interop.Precision
 import com.luxo.interop.PrecisionInput
 import com.luxo.interop.NullableArrays
@@ -45,6 +49,7 @@ private const val selection = "value, duration, optional, values, label"
 
 suspend fun main(args: Array<String>) {
     verifyNestedBoundaries()
+    verifyNullableRootDecoding()
     check(System.getProperty("java.class.path").split(File.pathSeparator).none {
         File(it).name.startsWith("kotlin-compiler-embeddable-")
     }) { "the compiler must not enter the consumer runtime" }
@@ -75,6 +80,45 @@ suspend fun main(args: Array<String>) {
     }
     verifySubscriptionIDs(args[0])
     verifyTerminalMaximumIDs(args[0])
+    for (mode in TransportMode.entries) {
+        verifyTokenRefresh(args[0], mode)
+        println("$scope: HTTP $mode access/refresh lifecycle passed")
+    }
+}
+
+private suspend fun verifyTokenRefresh(endpoint: String, mode: TransportMode) {
+    val http = OkHttpClient()
+    try {
+        val bootstrap = LuxoClient(OkHttpTransport(endpoint, client = http, mode = mode))
+        val refresh = bootstrap.issueFixtureRefresh()
+        val access = bootstrap.issueFixtureAccess()
+        check(runCatching { bootstrap.exchangeFixtureRefresh(token = access) }.exceptionOrNull() is LuxoError)
+        var attempts = 0
+        var policy = "renew"
+        val transport = OkHttpTransport(endpoint, client = http, mode = mode, timeoutSeconds = 5,
+            onTokenExpired = {
+                attempts++
+                when (policy) {
+                    "decline" -> null
+                    "invalid" -> refresh
+                    else -> bootstrap.exchangeFixtureRefresh(token = refresh)
+                }
+            })
+        val client = LuxoClient(transport)
+        transport.setToken(refresh)
+        repeat(2) { check(client.fixtureIdentity() == 9007199254740993L) }
+        check(attempts == 1)
+        for (next in listOf("decline", "invalid")) {
+            policy = next
+            transport.setToken(refresh)
+            val failure = runCatching { client.fixtureIdentity() }.exceptionOrNull()
+            check(failure is LuxoError && failure.code == 401)
+            check(attempts == if (next == "decline") 2 else 3)
+        }
+    } finally {
+        http.dispatcher.executorService.shutdownNow()
+        http.connectionPool.evictAll()
+    }
 }
 
 private fun verifyJSONDateTimeBoundaries(cases: List<JsonElement>) {
@@ -100,8 +144,12 @@ private suspend fun verifyUUIDs(client: LuxoClient, cases: List<JsonElement>) {
             check(client.echoUUIDs(listOf(input)) == listOf(canonical.jsonPrimitive.content))
         } else {
             val error = runCatching { client.echoUUIDs(listOf(input)) }.exceptionOrNull()
-            check(error is LuxoCodecException ||
-                error is LuxoError && error.message.orEmpty().contains("uuid", ignoreCase = true)) { "$input: $error" }
+            if (error is LuxoError) {
+                check(error.code == 400 && error.error == "BadRequest") { "$input: $error" }
+                val parameter = error.data?.jsonObject?.get("param")?.jsonPrimitive?.content
+                if (parameter != null) check(parameter == "values")
+                else check(error.message.orEmpty().contains("uuid", ignoreCase = true) && error.message.orEmpty().contains("values"))
+            } else check(error is LuxoCodecException) { "$input: $error" }
         }
     }
     val valid = listOf("00112233-4455-6677-8899-aabbccddeeff")
@@ -149,11 +197,11 @@ private suspend fun verifySubscriptionIDs(endpoint: String) {
     }
 }
 
-private fun startSubscription(block: suspend () -> (() -> Unit)): CompletableFuture<() -> Unit> {
-    val future = CompletableFuture<() -> Unit>()
-    block.startCoroutine(object : Continuation<() -> Unit> {
+private fun <T> startSubscription(block: suspend () -> T): CompletableFuture<T> {
+    val future = CompletableFuture<T>()
+    block.startCoroutine(object : Continuation<T> {
         override val context = EmptyCoroutineContext
-        override fun resumeWith(result: Result<() -> Unit>) {
+        override fun resumeWith(result: Result<T>) {
             result.fold({ future.complete(it) }, { future.completeExceptionally(it) })
         }
     })
@@ -171,8 +219,13 @@ private suspend fun verifyChannel(
     val client = LuxoClient(transport)
     try {
         socket?.connect()
+        if (System.getenv("LUXO_INTEROP_ENUM_UPGRADE") == "true") {
+            verifyEnumUpgrade(client, websocket)
+            return
+        }
         verifyUUIDs(client, uuidCases)
         verifyUnary(client, values)
+        verifyNullableRootCalls(client)
         verifyTimestamps(client, dates)
         verifyBusinessFloats(client)
         verifyNamedEnums(client, websocket)
@@ -182,11 +235,14 @@ private suspend fun verifyChannel(
         verifyUnicode(client)
         verifyJSONNumbers(client, tokens, websocket)
         verifyErrors(client, values)
+        verifyStrictQueries(client)
         verifyJSONErrors(client, tokens)
         verifyNullableArrays(client, websocket)
         verifyNestedResponses(client, websocket)
         verifyScalarArrays(client, websocket)
         if (websocket) {
+            verifyNullableRootStreams(client)
+            verifyTimestampStreams(client, dates)
             verifyStreams(client, values)
             for (fail in listOf(false, true)) verifyFiniteStream(client, fail)
         }
@@ -195,6 +251,72 @@ private suspend fun verifyChannel(
         http.dispatcher.executorService.shutdownNow()
         http.connectionPool.evictAll()
     }
+}
+
+private fun verifyFutureState(value: FixtureState) {
+    check(value is FixtureState.Unknown && value.rawValue == "FUTURE")
+}
+
+private suspend fun verifyEnumUpgrade(client: LuxoClient, websocket: Boolean) {
+    verifyPagination(client)
+    val future = FixtureState.fromValue("FUTURE")
+    verifyFutureState(future)
+    val received = client.echoFixtureState(future)
+    verifyFutureState(received)
+    verifyFutureState(client.echoFixtureState(received))
+    val expected = listOf(FixtureState.Known.OPEN, future, FixtureState.Known.CLOSED)
+    val values = client.echoFixtureStates(expected)
+    check(values == expected)
+    verifyFutureState(values[1])
+    check(client.echoFixtureStates(emptyList()).isEmpty())
+    if (websocket) verifyFutureStreams(client, expected)
+    val error = runCatching { client.echoFixtureState(FixtureState.fromValue("UNDECLARED")) }.exceptionOrNull()
+    check(error is LuxoError && error.code == 400 && error.error == "BadRequest")
+    check(client.echoInteger(42) == 42L)
+}
+
+private suspend fun verifyFutureStreams(client: LuxoClient, expected: List<FixtureState>) {
+    val value = CompletableFuture<FixtureState>()
+    val cancel = client.subscribeWatchFixtureState { value.complete(it) }
+    try { verifyFutureState(awaitValue(value)) } finally { cancel() }
+    val values = CompletableFuture<List<FixtureState>>()
+    val cancelList = client.subscribeWatchFixtureStates { values.complete(it) }
+    try {
+        val rows = awaitValue(values)
+        check(rows == expected)
+        verifyFutureState(rows[1])
+    } finally { cancelList() }
+}
+
+private suspend fun verifyStrictQueries(client: LuxoClient) {
+    check(LuxoQuery_listQueryProbes.count_eq(9007199254740993L).value == 9007199254740993L)
+    check(LuxoQuery_listQueryProbes.count_desc().order == "desc")
+    verifyQueryError(client, "createdAt") {
+        client.listQueryProbes(select = "id", filters = listOf(LuxoQuery_listQueryProbes.createdAt_eq("2026-02-30T00:00:00Z")))
+    }
+    val filters = listOf(
+        LuxoFilter("missing", "eq", "1"), LuxoFilter("id", "eq", "1"),
+        LuxoFilter("state", "eq", "FUTURE"), LuxoFilter("state", "gt", "OPEN"),
+        LuxoFilter("active", "eq", "truue"), LuxoFilter("score", "eq", "NaN"),
+        LuxoFilter("count", "eq", "bad"), LuxoFilter("createdAt", "eq", "2026-02-30T00:00:00Z"),
+    )
+    for (filter in filters) {
+        verifyQueryError(client, filter.field) { client.listQueryProbes(select = "id", filters = listOf(filter)) }
+    }
+    for (field in listOf("missing", "id")) {
+        verifyQueryError(client, field) { client.listQueryProbes(select = "id", sorters = listOf(LuxoSorter(field, "asc"))) }
+    }
+}
+
+private suspend fun verifyQueryError(client: LuxoClient, field: String, request: suspend () -> Unit) {
+    try {
+        request()
+        error("invalid query succeeded: $field")
+    } catch (error: LuxoError) {
+        check(error.code == 400 && error.error == "BadRequest")
+        check(error.data?.jsonObject?.get("param")?.jsonPrimitive?.content == field)
+    }
+    check(client.echoInteger(42L) == 42L)
 }
 
 private fun jsonFixtureTexts(tokens: List<String>) = tokens.flatMap { token ->
@@ -212,6 +334,20 @@ private suspend fun verifyTimestamps(client: LuxoClient, cases: List<Pair<String
         check(row.dates.value() == expected)
         check(row.tail.value() == 42L)
     }
+}
+
+private suspend fun verifyTimestampStreams(client: LuxoClient, cases: List<Pair<String, String>>) {
+    for ((input, expected) in cases) {
+        val received = CompletableFuture<String>()
+        val cancel = client.subscribeWatchTimestamp(input) { received.complete(it) }
+        try { check(awaitValue(received) == expected) } finally { cancel() }
+    }
+    for (values in listOf(emptyList(), cases.take(1), cases)) {
+        val received = CompletableFuture<List<String>>()
+        val cancel = client.subscribeWatchTimestamps(values.map { it.first }) { received.complete(it) }
+        try { check(awaitValue(received) == values.map { it.second }) } finally { cancel() }
+    }
+    check(client.echoInteger(42L) == 42L)
 }
 
 private suspend fun verifyBusinessFloats(client: LuxoClient) {
@@ -250,22 +386,30 @@ private suspend fun verifyJSONErrors(client: LuxoClient, tokens: List<String>) {
 }
 
 private suspend fun verifyNamedEnums(client: LuxoClient, websocket: Boolean) {
-    for (value in listOf("OPEN", "CLOSED")) check(client.echoFixtureState(value) == value)
-    for (values in listOf(emptyList(), listOf("OPEN"), listOf("CLOSED", "OPEN"))) {
+    for (value in listOf(FixtureState.Known.OPEN, FixtureState.Known.CLOSED)) check(client.echoFixtureState(value) == value)
+    for (values in listOf(emptyList(), listOf(FixtureState.Known.OPEN), listOf(FixtureState.Known.CLOSED, FixtureState.Known.OPEN))) {
         check(client.echoFixtureStates(values) == values)
     }
+    for (text in listOf("FUTURE", "", "open")) {
+        val unknown = FixtureState.fromValue(text)
+        check(unknown is FixtureState.Unknown)
+        for (result in listOf(runCatching { client.echoFixtureState(unknown) },
+            runCatching { client.echoFixtureStates(listOf(FixtureState.Known.OPEN, unknown)) })) {
+            check((result.exceptionOrNull() as? LuxoError)?.code == 400) { "Server accepted undeclared enum $text: $result" }
+        }
+    }
     if (!websocket) return
-    val value = CompletableFuture<String>()
+    val value = CompletableFuture<FixtureState>()
     val cancel = client.subscribeWatchFixtureState { value.complete(it) }
     try {
-        check(awaitValue(value) == "OPEN")
+        check(awaitValue(value) == FixtureState.Known.OPEN)
     } finally {
         cancel()
     }
-    val values = CompletableFuture<List<String>>()
+    val values = CompletableFuture<List<FixtureState>>()
     val cancelList = client.subscribeWatchFixtureStates { values.complete(it) }
     try {
-        check(awaitValue(values) == listOf("OPEN", "CLOSED"))
+        check(awaitValue(values) == listOf(FixtureState.Known.OPEN, FixtureState.Known.CLOSED))
     } finally {
         cancelList()
     }
@@ -410,6 +554,7 @@ private suspend fun verifyPagination(client: LuxoClient) {
 }
 
 private suspend fun verifyUnary(client: LuxoClient, values: List<Long>) {
+    verifyConcurrentSelections(client)
     for (value in values) {
         check(client.echoInteger(value) == value)
         check(client.echoDuration(value) == value)
@@ -430,7 +575,35 @@ private suspend fun verifyUnary(client: LuxoClient, values: List<Long>) {
     check(!row.label.isSelected && !row.ignored.isSelected)
 }
 
+private suspend fun verifyConcurrentSelections(client: LuxoClient) {
+    val inputs = List(16) { index ->
+        PrecisionInput(Long.MAX_VALUE - index, index.toLong(), null, emptyList(), "call-$index", 0)
+    }
+    val pending = inputs.map { input -> startSubscription {
+        val value = startSubscription { client.echoPrecision(input, select = "value") }
+        val label = startSubscription { client.echoPrecision(input, select = "label") }
+        val combined = startSubscription { client.echoPrecision(input, select = "value, label") }
+        val rows = listOf(awaitValue(value), awaitValue(label), awaitValue(combined))
+        check(rows[0].value.value() == input.value && !rows[0].label.isSelected)
+        check(rows[1].label.value() == input.label && !rows[1].value.isSelected)
+        check(rows[2].value.value() == input.value && rows[2].label.value() == input.label)
+        for (row in rows) {
+            check(!row.duration.isSelected && !row.optional.isSelected && !row.values.isSelected && !row.ignored.isSelected)
+        }
+    } }
+    awaitValue(CompletableFuture.allOf(*pending.toTypedArray()))
+    val repeated = client.echoPrecision(inputs[0], select = "value")
+    check(repeated.value.value() == inputs[0].value && !repeated.label.isSelected)
+}
+
 private suspend fun verifyStreams(client: LuxoClient, values: List<Long>) {
+    val defaultValue = CompletableFuture<Precision>()
+    val cancelDefault = client.subscribeWatchPrecision(select = selection) { defaultValue.complete(it) }
+    try {
+        verify(awaitValue(defaultValue), PrecisionInput(42, 42, 42, listOf(42), "精度 café", 42))
+    } finally {
+        cancelDefault()
+    }
     for (value in values) {
         val received = CompletableFuture<Precision>()
         val cancel = client.subscribeWatchPrecision(value, select = selection) { received.complete(it) }
@@ -442,7 +615,7 @@ private suspend fun verifyStreams(client: LuxoClient, values: List<Long>) {
     }
 }
 
-private suspend fun <T> awaitValue(received: CompletableFuture<T>): T = suspendCoroutine { continuation ->
+internal suspend fun <T> awaitValue(received: CompletableFuture<T>): T = suspendCoroutine { continuation ->
     received.orTimeout(5, TimeUnit.SECONDS).whenComplete { value, error ->
         if (error == null) continuation.resume(value) else continuation.resumeWithException(error)
     }
@@ -597,7 +770,7 @@ private fun scalarArraysInput(state: Int) = ScalarArraysInput(
     jsons = scalarArrayState(state, listOf(buildJsonObject {
         put("value", JsonPrimitive(Long.MAX_VALUE)); put("text", JsonPrimitive("東京"))
     }, JsonPrimitive(false))),
-    enums = scalarArrayState(state, listOf("OPEN", "CLOSED")), tail = 42L,
+    enums = scalarArrayState(state, listOf(FixtureState.Known.OPEN, FixtureState.Known.CLOSED)), tail = 42L,
 )
 
 private fun verifyScalarArrayValues(row: ScalarArrays, input: ScalarArraysInput) {

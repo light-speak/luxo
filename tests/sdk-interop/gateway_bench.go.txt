@@ -22,7 +22,7 @@ func BenchmarkProxy(b *testing.B) {
 }
 
 func benchmarkProxyCase(b *testing.B, list bool, branches int, shared bool) {
-	s := proxyTestSchema(list, branches)
+	s := proxyTestSchema(b, list, branches)
 	if shared {
 		alias := s.Models["Parent"].Fields[1]
 		alias.ID, alias.Name = 3, "alias"
@@ -46,7 +46,7 @@ func benchmarkProxyCase(b *testing.B, list bool, branches int, shared bool) {
 	}
 	var expected []byte
 	for _, implementation := range implementations {
-		request := &api.Request{FieldMask: proxyTestMask(branches), Buf: &api.ResponseBuf{}}
+		request := &api.Request{FieldMask: proxyTestMask(b, branches), Buf: &api.ResponseBuf{}}
 		if err := implementation.handle(b.Context(), request); err != nil {
 			b.Fatal(err)
 		}

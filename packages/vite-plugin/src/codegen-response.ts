@@ -24,6 +24,19 @@ export function genCompleteCheck(decoder: string, trailing: string, context: str
 
 /** Emit one decoder shared by unary responses and subscription decoding. */
 export function genResponseBody(api: LuxoAPI, schema: LuxoSchema, returnType: string, indent: string): string {
+  const prefix = api.returnNullable ? genNullableRoot(indent) : ''
+  return prefix + genPresentResponseBody(api, schema, returnType, indent)
+}
+
+function genNullableRoot(indent: string): string {
+  return `${indent}if (d instanceof Uint8Array) {\n` +
+    `${indent}  if (d.length === 0 || d[0] > 1 || (d[0] === 0 ? d.length !== 1 : d.length === 1)) throw new Error('invalid nullable root envelope')\n` +
+    `${indent}  if (d[0] === 0) return null\n` +
+    `${indent}  d = d.subarray(1)\n` +
+    `${indent}} else if (d === null) return null\n`
+}
+
+function genPresentResponseBody(api: LuxoAPI, schema: LuxoSchema, returnType: string, indent: string): string {
   const emit = (value: string, prefix = indent) => `${prefix}return ${value}\n`
   if (hasStructuredReturn(api, schema)) return emit(`(${modelDecode(api)}) as unknown as ${returnType}`)
   const enumReturn = Boolean(api.returnType && schema.enums?.[api.returnType])
@@ -34,9 +47,11 @@ export function genResponseBody(api: LuxoAPI, schema: LuxoSchema, returnType: st
   let out = `${indent}if (d instanceof Uint8Array) {\n${inner}const dec = new Decoder(d)\n`
   out += `${inner}const value = ${scalarRead(type, list)}\n`
   out += genCompleteCheck('dec', 'dec.remaining !== 0', `${type}${list ? '[]' : ''} response`, inner)
-  out += emit(enumReturn ? `value as ${returnType}` : 'value', inner) + `${indent}}\n`
-  const json = list ? `(d as unknown[]).map(item => ${genScalarJSONRead(type, 'item')})` : genScalarJSONRead(type, 'd')
-  return out + emit(enumReturn ? `(${json}) as ${returnType}` : json)
+  const decoder = `decodeEnum$${api.returnType}`
+  out += emit(enumReturn ? (list ? `value.map(${decoder})` : `${decoder}(value)`) : 'value', inner) + `${indent}}\n`
+  const jsonItem = (value: string) => enumReturn ? `${decoder}(${genScalarJSONRead(type, value)})` : genScalarJSONRead(type, value)
+  const json = list ? `(d as unknown[]).map(item => ${jsonItem('item')})` : jsonItem('d')
+  return out + emit(json)
 }
 
 function scalarRead(type: string, list: boolean): string {

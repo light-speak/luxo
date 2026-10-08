@@ -22,8 +22,53 @@ import okio.buffer
 import kotlin.test.*
 
 class HttpProtocolTest {
+    @Test
+    fun `success requires data while explicit null remains valid`() = runBlocking {
+        var body = "{}"
+        var refreshed = 0
+        withClient({ request, _ -> response(request, 200, body.toByteArray()) }) { client, sent ->
+            val transport = transport(client, TransportMode.JSON) { refreshed++; "unused" }
+            for (missing in listOf("{}", """{"ok":true}""", """{"value":42}""")) {
+                body = missing
+                val error = assertFailsWith<LuxoError> { transport.call("echo") }
+                assertEquals("ParseError", error.error)
+                assertEquals(200, error.code)
+            }
+            for (value in listOf("null", "false", "0", "\"\"", "[]", "{}")) {
+                body = """{"data":$value}"""
+                assertEquals(decodeLuxoJSON(value), transport.call("echo"))
+            }
+            assertEquals(0, refreshed)
+            assertEquals(9, sent.size)
+        }
+    }
+
     private val endpoint = "http://localhost/luvia"
     private val schema = mapOf("echo" to APISchemaEntry(1))
+
+    @Test
+    fun `cache overload preserves identity without automatic retry or token refresh`() = runBlocking {
+        for (mode in TransportMode.entries) {
+            var refreshed = 0
+            val success = if (mode == TransportMode.JSON) """{"data":42}""".toByteArray() else byteArrayOf(84)
+            withClient({ request, attempt ->
+                if (attempt == 1) response(request, 503, errorBody(mode, 503, "CacheOriginBusy", "Cache origin capacity exhausted"))
+                else response(request, 200, success)
+            }) { client, sent ->
+                val transport = transport(client, mode) { refreshed++; "must-not-refresh" }
+                val error = assertFailsWith<LuxoError> { transport.call("echo") }
+                assertEquals("CacheOriginBusy", error.error)
+                assertEquals(503, error.code)
+                assertEquals("Cache origin capacity exhausted", error.message)
+                assertEquals(1, sent.size)
+                assertEquals(0, refreshed)
+                val next = transport.call("echo")
+                if (mode == TransportMode.JSON) assertEquals(JsonPrimitive(42), next)
+                else assertContentEquals(byteArrayOf(84), next as ByteArray)
+                assertEquals(2, sent.size)
+            }
+        }
+    }
 
     @Test
     fun `JSON responses are UTF-8 regardless of the HTTP charset`() = runBlocking {
@@ -330,12 +375,12 @@ class HttpProtocolTest {
     private fun transport(client: OkHttpClient, mode: TransportMode, refresh: (suspend () -> String?)? = null) =
         OkHttpTransport(endpoint, client = client, mode = mode, schema = schema, onTokenExpired = refresh)
 
-    private fun errorBody(mode: TransportMode, code: Int): ByteArray {
-        if (mode == TransportMode.JSON) return """{"error":"Unauthorized","code":$code,"message":"expired"}""".toByteArray()
+    private fun errorBody(mode: TransportMode, code: Int, name: String = "Unauthorized", message: String = "expired"): ByteArray {
+        if (mode == TransportMode.JSON) return """{"error":"$name","code":$code,"message":"$message"}""".toByteArray()
         return LuxoEncoder().apply {
             writeFieldInt(1, code.toLong())
-            writeFieldString(2, "Unauthorized")
-            writeFieldString(3, "expired")
+            writeFieldString(2, name)
+            writeFieldString(3, message)
             writeEnd()
         }.bytes()
     }

@@ -1,6 +1,9 @@
 export const INT64_MIN = -(1n << 63n)
 export const INT64_MAX = (1n << 63n) - 1n
 
+// Private to this JavaScript realm; no shared memory or asynchronous access.
+const int64Words = new DataView(new ArrayBuffer(8))
+
 /** Validate the schema Int/Duration representation without coercion or wrapping. */
 export function assertInt64(value: bigint): void {
   if (typeof value !== 'bigint') throw new TypeError('Luxo Int/Duration requires bigint')
@@ -17,8 +20,10 @@ export function int64ToSafeNumber(value: bigint): number {
 /** Zigzag uses two words; the per-byte loop contains no BigInt arithmetic. */
 export function writeWireInt64(bytes: Uint8Array, offset: number, value: bigint): number {
   assertInt64(value)
-  const low = Number(BigInt.asUintN(32, value))
-  const high = Number(BigInt.asIntN(32, value >> 32n))
+  int64Words.setBigInt64(0, value, true)
+  // Read both words before writing the caller's destination, which may reenter.
+  const low = int64Words.getUint32(0, true)
+  const high = int64Words.getInt32(4, true)
   const sign = high >> 31
   return writeWireWords(bytes, offset, ((low << 1) ^ sign) >>> 0, (((high << 1) | (low >>> 31)) ^ sign) >>> 0)
 }

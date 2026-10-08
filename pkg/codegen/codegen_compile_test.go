@@ -66,13 +66,13 @@ func TestGeneratedCodeCompiles(t *testing.T) {
 		Events: []*ast.EventDecl{{
 			Name: "DocChanged",
 			Params: []*ast.ParamDecl{
-				{Name: "doc", Type: &ast.TypeRef{Name: "Doc"}},
+				{Name: "doc", Type: &ast.TypeRef{Name: "DocSnapshot"}},
 				{Name: "at", Type: &ast.TypeRef{Name: "DateTime"}},
 				{Name: "ttl", Type: &ast.TypeRef{Name: "Duration"}},
 				{Name: "uid", Type: &ast.TypeRef{Name: "UUID"}},
 				{Name: "price", Type: &ast.TypeRef{Name: "Decimal"}},
 				{Name: "metadata", Type: &ast.TypeRef{Name: "JSON"}},
-				{Name: "docs", Type: &ast.TypeRef{Name: "Doc", IsList: true}},
+				{Name: "docs", Type: &ast.TypeRef{Name: "DocSnapshot", IsList: true}},
 				{Name: "labels", Type: &ast.TypeRef{Name: "String", IsList: true}},
 			},
 		}},
@@ -80,7 +80,7 @@ func TestGeneratedCodeCompiles(t *testing.T) {
 			{
 				Name:       "watchDoc",
 				Params:     []*ast.ParamDecl{{Name: "uid", Type: &ast.TypeRef{Name: "UUID"}}},
-				ReturnType: &ast.TypeRef{Name: "Doc"},
+				ReturnType: &ast.TypeRef{Name: "DocSnapshot"},
 				Directives: []*ast.Directive{{Name: "stream", Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "DocChanged"}}}}},
 				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: &ast.BinaryExpr{
 					Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "uid"},
@@ -96,7 +96,22 @@ func TestGeneratedCodeCompiles(t *testing.T) {
 		},
 	}
 
-	generator, err := NewGenerator(GeneratorConfig{IDs: StableIDs{ModelFields: modelIDs, EventFields: eventIDs}})
+	// Events declare independent snapshots rather than database model payloads.
+	for _, model := range file.Models {
+		snapshot := &ast.TypeDecl{Name: model.Name + "Snapshot"}
+		for _, field := range model.Fields {
+			copyField, copyType := *field, *field.Type
+			if copyType.Name == "Child" {
+				copyType.Name = "ChildSnapshot"
+			}
+			copyField.Type = &copyType
+			snapshot.Fields = append(snapshot.Fields, &copyField)
+		}
+		file.Types = append(file.Types, snapshot)
+		modelIDs[snapshot.Name] = modelIDs[model.Name]
+	}
+
+	generator, err := NewGenerator(GeneratorConfig{IDs: completeFixtureAPIIDs(result(file), StableIDs{ModelFields: modelIDs, EventFields: eventIDs})})
 	if err != nil {
 		t.Fatal(err)
 	}

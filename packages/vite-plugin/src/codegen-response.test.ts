@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest'
+import { stripTypeScriptTypes } from 'node:module'
+import { Decoder, int64FromJSON } from '@luxojs/client'
 import type { LuxoSchema } from '@luxojs/client'
 import { genResponseBody, hasStructuredReturn, isScalar, luxoTypeToTS } from './codegen-response'
 
@@ -9,6 +11,24 @@ const schema: LuxoSchema = {
 }
 
 describe('response generation', () => {
+  it.each([false, true])('decodes explicit nullable roots (list=%s) and rejects malformed envelopes', list => {
+    const api = { id: 1, name: 'optional', module: 'test', returnType: 'Int', returnList: list, returnNullable: true }
+    const body = genResponseBody(api, schema, `${list ? 'bigint[]' : 'bigint'} | null`, '  ')
+    const source = stripTypeScriptTypes(`function decode(d: unknown) {\n${body}}`)
+    // Execute generated source only in the test; production code remains static.
+    const factory = new Function('Decoder', 'int64FromJSON', `${source}\nreturn decode`) as
+      (decoder: typeof Decoder, integer: typeof int64FromJSON) => (data: unknown) => unknown
+    const decode = factory(Decoder, int64FromJSON)
+    expect(decode(null)).toBeNull()
+    expect(decode(new Uint8Array([0]))).toBeNull()
+    expect(decode(list ? [] : 0)).toEqual(list ? [] : 0n)
+    expect(decode(new Uint8Array([1, 0]))).toEqual(list ? [] : 0n)
+    expect(decode(new Uint8Array(list ? [1, 1, 84] : [1, 84]))).toEqual(list ? [42n] : 42n)
+    for (const invalid of [[], [1], [2], [0, 0], list ? [1, 0, 0] : [1, 84, 0]]) {
+      expect(() => decode(new Uint8Array(invalid))).toThrow()
+    }
+  })
+
   it.each(['Int', 'Duration', 'Float', 'Boolean', 'String', 'Bytes', 'JSON', 'DateTime', 'UUID', 'Decimal', 'Enum'])
   ('emits exactly one completion check for %s values and lists before delivery', type => {
     for (const list of [false, true]) {
@@ -24,13 +44,14 @@ describe('response generation', () => {
     }
   })
 
-  it('treats named enum returns as scalars without changing their declared type', () => {
+  it('uses an explicit unknown-member decoder for named enum responses', () => {
     const api = { id: 1, name: 'state', module: 'test', returnType: 'State' }
     expect(hasStructuredReturn(api, schema)).toBe(false)
     for (const list of [false, true]) {
       const type = list ? 'State[]' : 'State'
       const body = genResponseBody({ ...api, returnList: list }, schema, type, '    ')
-      expect(body).toContain(`return value as ${type}`)
+      expect(body).toContain(list ? 'value.map(decodeEnum$State)' : 'decodeEnum$State(value)')
+      expect(body).not.toContain(`as ${type}`)
       expect(body).not.toContain('decodeState')
       expect(body).not.toContain('State<')
     }

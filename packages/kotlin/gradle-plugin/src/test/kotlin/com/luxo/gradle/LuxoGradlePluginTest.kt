@@ -5,6 +5,8 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
+import kotlin.test.assertFalse
+import org.jetbrains.kotlin.gradle.plugin.KotlinCompilerPluginSupportPlugin
 import org.gradle.testfixtures.ProjectBuilder
 
 class LuxoGradlePluginTest {
@@ -22,10 +24,12 @@ class LuxoGradlePluginTest {
         assertEquals("com.luxo.generated", extension.packageName.get())
         assertIs<LuxoGenerateTask>(project.tasks.getByName("luxoGenerate"))
         assertIs<LuxoAnalyzeTask>(project.tasks.getByName("luxoAnalyze"))
-        assertTrue(
+        assertIs<KotlinCompilerPluginSupportPlugin>(project.plugins.getPlugin(LuxoGradlePlugin::class.java))
+        assertFalse(
             compileKotlin.get().taskDependencies.getDependencies(compileKotlin.get())
                 .any { it.name == "luxoAnalyze" },
         )
+        assertEquals("com.luxo.select", project.plugins.getPlugin(LuxoGradlePlugin::class.java).getCompilerPluginId())
 
         val catalog = File("../gradle/libs.versions.toml").readText()
         val compilerVersion = checkNotNull(Regex("""kotlin = "([^"]+)"""").find(catalog)).groupValues[1]

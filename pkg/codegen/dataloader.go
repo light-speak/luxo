@@ -326,6 +326,10 @@ type dataLoaderInputs struct {
 	hasRemote    bool
 }
 
+func (inputs dataLoaderInputs) needed() bool {
+	return len(inputs.relations) > 0 || len(inputs.extendModels) > 0 || len(inputs.loadCalls) > 0
+}
+
 // generateDataLoaderFile produces dataloader.gen.go with loader types and batch function signatures.
 func generateDataLoaderFile(result *semantic.Result, packageName string, enums map[string]bool, externalSoftModels map[string]bool, driver DBDriver) []byte {
 	generator := defaultGenerator()
@@ -336,7 +340,7 @@ func generateDataLoaderFile(result *semantic.Result, packageName string, enums m
 
 func (g *GeneratorContext) generateDataLoaderFile(result *semantic.Result, packageName string, enums map[string]bool, externalSoftModels map[string]bool) []byte {
 	inputs := g.collectDataLoaderInputs(result, enums, externalSoftModels)
-	if len(inputs.relations) == 0 && len(inputs.extendModels) == 0 && len(inputs.loadCalls) == 0 {
+	if !inputs.needed() {
 		return nil
 	}
 	needsUUID := g.dataLoaderNeedsUUID(inputs.relations, inputs.extendModels, inputs.loadCalls)
@@ -517,32 +521,9 @@ func deduplicateLoaders(allRelations []modelRelations) []loaderEntry {
 // generateLoadersStruct generates the Loaders struct with actual Loader instances.
 func (g *GeneratorContext) generateLoadersStruct(b *strings.Builder, allRelations []modelRelations, seenTypes map[string]bool, extendModels []string, fkLoadCalls []loadCallInfo) {
 	entries := deduplicateLoaders(allRelations)
-
-	// Struct
-	b.WriteString("// Loaders holds DataLoader instances for all relations.\n")
-	b.WriteString("type Loaders struct {\n")
-	for _, e := range entries {
-		if e.rel.IsList {
-			fmt.Fprintf(b, "\t%s *dataloader.Loader[%s, []%s]\n", e.fieldName, e.rel.KeyGoType, e.rel.TargetName)
-		} else {
-			fmt.Fprintf(b, "\t%s *dataloader.Loader[%s, *%s]\n", e.fieldName, e.rel.KeyGoType, e.rel.TargetName)
-		}
-	}
-	// Extend model load-by-PK loaders
-	for _, name := range extendModels {
-		fmt.Fprintf(b, "\tExtend%s *dataloader.Loader[%s, *%s]\n", name, g.externalModelIDGoType(name), name)
-	}
-	// FK/multi-condition loaders from load() calls
-	for _, lc := range fkLoadCalls {
-		loaderName := loaderNameFromLoadCall(lc)
-		if len(lc.argNames) == 1 {
-			fmt.Fprintf(b, "\t%s *dataloader.Loader[%s, []*%s]\n", loaderName, lc.argTypes[0], lc.modelName)
-		} else {
-			keyType := loaderName + "Key"
-			fmt.Fprintf(b, "\t%s *dataloader.Loader[%s, []*%s]\n", loaderName, keyType, lc.modelName)
-		}
-	}
-	b.WriteString("}\n\n")
+	slots := g.loaderBindingSlots(entries, extendModels, fkLoadCalls)
+	writeLoaderDeclarations(b, slots)
+	writeCustomLoaderTransactionFactory(b)
 
 	// Constructor
 	b.WriteString("// NewLoaders creates Loaders from batch functions.\n")
@@ -592,12 +573,69 @@ func (g *GeneratorContext) generateLoadersStruct(b *strings.Builder, allRelation
 
 }
 
+type loaderBindingSlot struct {
+	name      string
+	valueType string
+}
+
+func (g *GeneratorContext) loaderBindingSlots(entries []loaderEntry, extends []string, calls []loadCallInfo) []loaderBindingSlot {
+	slots := make([]loaderBindingSlot, 0, len(entries)+len(extends)+len(calls))
+	for _, entry := range entries {
+		value := "*" + entry.rel.TargetName
+		if entry.rel.IsList {
+			value = "[]" + entry.rel.TargetName
+		}
+		slots = append(slots, loaderBindingSlot{entry.fieldName, fmt.Sprintf("*dataloader.Loader[%s, %s]", entry.rel.KeyGoType, value)})
+	}
+	for _, name := range extends {
+		slots = append(slots, loaderBindingSlot{"Extend" + name, fmt.Sprintf("*dataloader.Loader[%s, *%s]", g.externalModelIDGoType(name), name)})
+	}
+	for _, call := range calls {
+		name := loaderNameFromLoadCall(call)
+		key := name + "Key"
+		if len(call.argNames) == 1 {
+			key = call.argTypes[0]
+		}
+		slots = append(slots, loaderBindingSlot{name, fmt.Sprintf("*dataloader.Loader[%s, []*%s]", key, call.modelName)})
+	}
+	return slots
+}
+
+func writeLoaderDeclarations(b *strings.Builder, slots []loaderBindingSlot) {
+	var fields strings.Builder
+	for _, slot := range slots {
+		fmt.Fprintf(&fields, "\t%s %s\n", slot.name, slot.valueType)
+	}
+	b.WriteString("// Loaders holds DataLoader instances for all relations.\n")
+	b.WriteString("type Loaders struct {\n\trebind func(*App) Loaders\n\tbound loaderBinding\n")
+	b.WriteString(fields.String())
+	b.WriteString("}\n\n// loaderBinding is the exact loader set covered by a transaction factory.\n")
+	b.WriteString("type loaderBinding struct {\n")
+	b.WriteString(fields.String())
+	b.WriteString("}\n\nfunc (l *Loaders) binding() loaderBinding {\n\treturn loaderBinding{\n")
+	for _, slot := range slots {
+		fmt.Fprintf(b, "\t\t%s: l.%s,\n", slot.name, slot.name)
+	}
+	b.WriteString("\t}\n}\n\n")
+}
+
+func writeCustomLoaderTransactionFactory(b *strings.Builder) {
+	b.WriteString("// WithTransactionFactory binds custom loaders to each transaction's App.\n")
+	b.WriteString("// The factory must create fresh loaders using tx, never captured outer clients.\n")
+	b.WriteString("// Transaction loaders must finish dispatch before Tx returns (for example, MaxBatch=1).\n")
+	b.WriteString("func (l Loaders) WithTransactionFactory(factory func(tx *App) Loaders) Loaders {\n")
+	b.WriteString("\tl.rebind = factory\n\tl.bound = l.binding()\n\treturn l\n}\n\n")
+	b.WriteString("func (l *Loaders) transactionFactoryRequired() bool {\n")
+	b.WriteString("\tif l.rebind != nil { return l.bound != l.binding() }\n")
+	b.WriteString("\treturn l.binding() != (loaderBinding{})\n}\n\n")
+}
+
 // generateDefaultLoaders generates NewDefaultLoaders that uses the module's own Clients.
 func (g *GeneratorContext) generateDefaultLoaders(b *strings.Builder, allRelations []modelRelations, softModels map[string]bool, extendModels []string, fkLoadCalls []loadCallInfo) {
 	b.WriteString("// NewDefaultLoaders creates Loaders with default batch functions using the module's Clients.\n")
 	b.WriteString("// Used in embedded mode — all models share the same database.\n")
 	b.WriteString("func NewDefaultLoaders(app *App, cfg dataloader.Config) Loaders {\n")
-	b.WriteString("\treturn NewLoaders(cfg,\n")
+	b.WriteString("\tloaders := NewLoaders(cfg,\n")
 
 	seen := make(map[string]bool)
 	for _, mr := range allRelations {
@@ -622,12 +660,22 @@ func (g *GeneratorContext) generateDefaultLoaders(b *strings.Builder, allRelatio
 	}
 
 	b.WriteString("\t)\n")
+	writeLoaderTransactionFactory(b, "NewDefaultLoaders(tx, cfg)")
 	b.WriteString("}\n")
+}
+
+func writeLoaderTransactionFactory(b *strings.Builder, constructor string) {
+	b.WriteString("\treturn loaders.WithTransactionFactory(func(tx *App) Loaders {\n")
+	b.WriteString("\t\t// Dispatch on the caller before transaction completion, without a batch window.\n")
+	b.WriteString("\t\tcfg := cfg\n")
+	b.WriteString("\t\tcfg.MaxBatch = 1\n")
+	fmt.Fprintf(b, "\t\treturn %s\n", constructor)
+	b.WriteString("\t})\n")
 }
 
 // generateFKLoadBatchFunc generates a batch function for FK/multi-condition load().
 func (g *GeneratorContext) generateFKLoadBatchFunc(b *strings.Builder, lc loadCallInfo, softTarget bool) {
-	tableName := str.ToSnakeCase(lc.modelName) + "s"
+	tableName := modelTableName(lc.modelName)
 	scanFn := "scan" + lc.modelName
 	loaderName := loaderNameFromLoadCall(lc)
 
@@ -733,7 +781,7 @@ func (g *GeneratorContext) generateRemoteLoaders(b *strings.Builder, result *sem
 	b.WriteString("// Same-module relations use local DB. Cross-module (extend) loaders call remote service.\n")
 	b.WriteString("// Used in cluster mode (DEPLOY_MODE=cluster).\n")
 	b.WriteString("func NewRemoteLoaders(app *App, rpcClients map[string]*rpc.Client, registry *schema.Schema, cfg dataloader.Config) Loaders {\n")
-	b.WriteString("\treturn NewLoaders(cfg,\n")
+	b.WriteString("\tloaders := NewLoaders(cfg,\n")
 
 	// Same-module relations use the local DB. A belongs-to relation whose target
 	// model is owned by another module must use that module's batch-load RPC.
@@ -768,6 +816,7 @@ func (g *GeneratorContext) generateRemoteLoaders(b *strings.Builder, result *sem
 	}
 
 	b.WriteString("\t)\n")
+	writeLoaderTransactionFactory(b, "NewRemoteLoaders(tx, rpcClients, registry, cfg)")
 	b.WriteString("}\n\n")
 }
 
@@ -882,7 +931,7 @@ func (g *GeneratorContext) generateRemoteNamedLoadBatchFunc(b *strings.Builder, 
 // generateExtendByPKBatchFunc generates a load-by-primary-key batch function for a cross-module model.
 // User.load(id) → this batch function queries users WHERE id IN (keys).
 func (g *GeneratorContext) generateExtendByPKBatchFunc(b *strings.Builder, modelName string) {
-	tableName := str.ToSnakeCase(modelName) + "s"
+	tableName := modelTableName(modelName)
 	scanFn := "scan" + modelName
 	keyType := g.externalModelIDGoType(modelName)
 	idField := g.externalModelIDFieldName(modelName)
@@ -1012,7 +1061,7 @@ func (g *GeneratorContext) remoteModelModule(modelName string) string {
 // generateBatchFunc generates an inline batch function for a relation.
 // Uses DB.QueryRows with the module's scan function — no cross-module Client dependency.
 func (g *GeneratorContext) generateBatchFunc(b *strings.Builder, modelName string, rel Relation, softTarget bool) {
-	targetTable := str.ToSnakeCase(rel.TargetName) + "s"
+	targetTable := modelTableName(rel.TargetName)
 	remoteCol := str.ToSnakeCase(rel.RemoteKey)
 	scanFn := "scan" + rel.TargetName
 	goRemoteField := str.Capitalize(rel.RemoteKey) // camelCase → PascalCase (e.g., userId → UserId)
@@ -1060,7 +1109,7 @@ func (g *GeneratorContext) generateBatchFunc(b *strings.Builder, modelName strin
 // loaderTypeName returns the type name for a loader function.
 func loaderTypeName(modelName string, rel Relation) string {
 	if rel.IsList {
-		return pluralize(rel.TargetName) + "By" + str.Capitalize(rel.RemoteKey) + "Loader"
+		return ast.PluralModelName(rel.TargetName) + "By" + str.Capitalize(rel.RemoteKey) + "Loader"
 	}
 	return rel.TargetName + "By" + str.Capitalize(rel.RemoteKey) + "Loader"
 }

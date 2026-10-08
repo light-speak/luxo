@@ -1,26 +1,192 @@
 part of 'int64_consumer_test.dart';
 
 void verifyScalarResponses() {
+  test('enum parameter lists remain independent and growable', () async {
+    final transport = _ResponseTransport()..response = 'OPEN';
+    final client = LuxoClient(transport);
+    final states = [TaskStatusKnown.OPEN, TaskStatus.fromValue('FUTURE')];
+    await client.enumOptions(nullable: null, nullableList: states);
+    final raw = transport.params!['nullableList'] as List<String>;
+    states[0] = TaskStatusKnown.DONE;
+    expect(raw, ['OPEN', 'FUTURE']);
+    raw.add('OTHER');
+    expect(states.map((value) => value.rawValue), ['DONE', 'FUTURE']);
+    await client.enumOptions(nullable: null, nullableList: []);
+    final empty = transport.params!['nullableList'] as List<String>;
+    empty.add('OPEN');
+    expect(empty, ['OPEN']);
+  });
+  test(
+    'enum parameters preserve omitted values, null and raw unknown text',
+    () async {
+      final transport = _ResponseTransport()..response = 'FUTURE';
+      final client = LuxoClient(transport);
+      await client.enumOptions(nullable: null, nullableList: null);
+      expect(transport.params, {'nullable': null, 'nullableList': null});
+      final unknown = TaskStatus.fromValue('FUTURE');
+      await client.enumOptions(
+        nullable: unknown,
+        nullableList: [unknown],
+        defaulted: unknown,
+        nullableDefault: sdk.LuxoOptional.present(unknown),
+      );
+      expect(transport.params, {
+        'nullable': 'FUTURE',
+        'nullableList': ['FUTURE'],
+        'defaulted': 'FUTURE',
+        'nullableDefault': 'FUTURE',
+      });
+      await client.enumOptions(
+        nullable: null,
+        nullableList: [],
+        nullableDefault: const sdk.LuxoOptional<TaskStatus>.present(null),
+      );
+      expect(transport.params, {
+        'nullable': null,
+        'nullableList': [],
+        'nullableDefault': null,
+      });
+      for (final invalid in [null, 1, true, <Object?>{}]) {
+        expect(
+          () => EnumPayload.fromJson({'status': invalid}),
+          throwsA(isA<TypeError>()),
+        );
+        expect(
+          () => EnumPayload.fromJson({
+            'statuses': ['OPEN', invalid],
+          }),
+          throwsA(isA<TypeError>()),
+        );
+      }
+    },
+  );
+
+  test(
+    'enum models preserve unknown values, null and selection in both encodings',
+    () {
+      for (final nullable in [false, true]) {
+        final json = <String, Object?>{
+          'status': '未来状态',
+          'optional': nullable ? null : 'FUTURE',
+          'statuses': ['OPEN', 'FUTURE'],
+          'optionalList': nullable ? null : ['DONE', 'FUTURE'],
+        };
+        final input = EnumPayloadInput.fromJson(json);
+        expect(input.status, isA<TaskStatusUnknown>());
+        expect(input.toJson(), json);
+        expect(input.toLuxoParameters(), json);
+        final row = sdk.LuxoEncoder();
+        input.writeLuxo(row);
+        expect(
+          row.bytes().first,
+          utf8.encode('未来状态').length + (nullable ? 0 : 6),
+        );
+        expect(decodeEnumPayload(sdk.LuxoDecoder(row.bytes())).toJson(), json);
+        final model = EnumPayload.fromJson(json);
+        expect(model.status.value.rawValue, '未来状态');
+        expect(model.toJson(), json);
+        expect(EnumPayload.fromJson({}).status.isSelected, isFalse);
+        expect(EnumPayload.fromJson({'optional': null}).optional.value, isNull);
+        final column = sdk.LuxoEncoder()
+          ..writeVarint(1)
+          ..writeVarint(0);
+        column
+          ..writeVarint(1)
+          ..writeString('未来状态')
+          ..writeVarint(2);
+        if (nullable) {
+          column.writeNull();
+        } else {
+          column
+            ..writePresent()
+            ..writeString('FUTURE');
+        }
+        final list =
+            (sdk.LuxoEncoder()
+                  ..writeVarint(2)
+                  ..writeString('OPEN')
+                  ..writeString('FUTURE'))
+                .bytes();
+        column
+          ..writeVarint(3)
+          ..writeBytes(list)
+          ..writeVarint(4);
+        if (nullable) {
+          column.writeNull();
+        } else {
+          column
+            ..writePresent()
+            ..writeBytes(
+              (sdk.LuxoEncoder()
+                    ..writeVarint(2)
+                    ..writeString('DONE')
+                    ..writeString('FUTURE'))
+                  .bytes(),
+            );
+        }
+        column.writeEnd();
+        expect(decodeColumnarEnumPayload(column.bytes()).single.toJson(), json);
+        column
+          ..writeSvarint(sdk.LuxoInt64.fromInt(1))
+          ..writeSvarint(sdk.LuxoInt64.fromInt(1))
+          ..writeSvarint(sdk.LuxoInt64.fromInt(1));
+        expect(
+          decodePaginatedEnumPayload(column.bytes()).items.single.toJson(),
+          json,
+        );
+      }
+      expect(
+        TaskStatus.fromValue('future'),
+        isNot(OtherStatus.fromValue('future')),
+      );
+      expect({
+        TaskStatus.fromValue('future'),
+        TaskStatus.fromValue('future'),
+      }, hasLength(1));
+      expect(OtherStatusKnown.class$.rawValue, 'class');
+      expect(OtherStatusKnown.values$.rawValue, 'values');
+      expect(OtherStatusKnown.rawValue$.rawValue, 'rawValue');
+      expect(OtherStatusKnown.value$_hidden.rawValue, '_hidden');
+      expect(OtherStatusKnown.OtherStatusKnown$.rawValue, 'OtherStatusKnown');
+      expect(
+        () => sdk.encodeLuxoJSON(TaskStatus.fromValue('future')),
+        throwsFormatException,
+      );
+    },
+  );
+
   test(
     'named enum returns use scalar wire decoding without field selection',
     () async {
       final transport = _ResponseTransport();
       final client = LuxoClient(transport);
-      for (final text in ['OPEN', 'DONE']) {
+      for (final text in ['OPEN', 'DONE', 'FUTURE', '', '未来状态']) {
+        final expected = TaskStatus.fromValue(text);
         transport.response = text;
-        expect(await client.namedEnum(), text);
+        expect(await client.namedEnum(), expected);
         transport.response = (sdk.LuxoEncoder()..writeString(text)).bytes();
-        expect(await client.namedEnum(), text);
-        expect(transport.params, isNull);
+        expect(await client.namedEnum(), expected);
+        expect(transport.params, isEmpty);
         transport.response = [text];
-        expect(await client.namedEnums(), [text]);
+        expect(await client.namedEnums(), [expected]);
         transport.response =
             (sdk.LuxoEncoder()
                   ..writeVarint(1)
                   ..writeString(text))
                 .bytes();
-        expect(await client.namedEnums(), [text]);
-        expect(transport.params, isNull);
+        expect(await client.namedEnums(), [expected]);
+        expect(transport.params, isEmpty);
+        expect(expected.rawValue, text);
+        if (text == 'OPEN' || text == 'DONE') {
+          expect(expected, isA<TaskStatusKnown>());
+          expect(identical(TaskStatus.fromValue(text), expected), isTrue);
+        } else {
+          expect(expected, isA<TaskStatusUnknown>());
+          expect(_describeStatus(expected), text);
+        }
+        transport.response = text;
+        await client.echoEnum(value: expected);
+        expect(transport.params?['value'], text);
       }
       for (final bytes in <List<int>>[
         [],
@@ -63,6 +229,11 @@ void verifyScalarResponses() {
     for (var index = 0; index < unary.length; index++) {
       final position = index == 11 ? 9 : index;
       final values = _streamValues[position];
+      final expected = position == 9
+          ? values
+                .map((value) => TaskStatus.fromValue(value as String))
+                .toList()
+          : values;
       final cell = cells[position];
       final element = Uint8List.sublistView(
         cell,
@@ -74,7 +245,7 @@ void verifyScalarResponses() {
         transport,
         unary[index],
         element,
-        values.first,
+        expected.first,
         _jsonValue(values.first),
         malformed,
       );
@@ -82,7 +253,7 @@ void verifyScalarResponses() {
         transport,
         arrays[index],
         cell,
-        values,
+        expected,
         values.map(_jsonValue).toList(),
         [
           for (final bytes in malformed) ...[
@@ -94,6 +265,12 @@ void verifyScalarResponses() {
     }
   });
 }
+
+String _describeStatus(TaskStatus status) => switch (status) {
+  TaskStatusKnown.OPEN => 'open',
+  TaskStatusKnown.DONE => 'done',
+  TaskStatusUnknown(:final rawValue) => rawValue,
+};
 
 typedef _Subscribe = Future<void Function()> Function(void Function(Object));
 
@@ -237,9 +414,10 @@ class _ResponseTransport extends sdk.Transport {
   Future<T> call<T>(
     String api, {
     Map<String, dynamic>? params,
+    sdk.GeneratedRequest? request,
     T Function(dynamic)? decoder,
   }) async {
-    this.params = params;
+    this.params = request?.toJSONParameters() ?? params;
     return decoder!(response);
   }
 
@@ -249,15 +427,16 @@ class _ResponseTransport extends sdk.Transport {
     Map<String, dynamic> params,
     void Function(T) onData, {
     required T Function(Object?) decoder,
+    sdk.GeneratedRequest? request,
     void Function(sdk.LuxoError)? onError,
     void Function()? onDone,
   }) async {
-    this.params = params;
+    this.params = request?.toJSONParameters() ?? params;
     receiver = (value) => onData(decoder(value));
     return () => receiver = null;
   }
 
-  void emit(Object value) => receiver!(value);
+  void emit(Object? value) => receiver!(value);
   @override
   void setSchema(Map<String, sdk.APISchemaEntry> schema) {}
   @override

@@ -63,9 +63,9 @@ func (a *Analyzer) resolveEventTypes(file *ast.File) {
 			if param.Type.IsList && param.Type.Nullable {
 				a.addError(param.Pos, "event parameter '%s.%s' cannot be a nullable list / 事件参数 '%s.%s' 不能是可空列表", event.Name, param.Name, event.Name, param.Name)
 			}
-			switch resolved.Kind {
-			case TypeInt, TypeFloat, TypeString, TypeBool, TypeDateTime, TypeDuration, TypeUUID, TypeDecimal, TypeBytes, TypeJSON, TypeModel, TypeCustom, TypeEnum:
-			default:
+			// Model references receive a path-aware snapshot diagnostic after all
+			// declarations have resolved, including references nested in types.
+			if resolved.Kind != TypeModel && !isEventWireKind(resolved.Kind) {
 				a.addError(param.Pos, "event parameter '%s.%s' has unsupported wire type '%s' / 事件参数 '%s.%s' 使用了不支持的传输类型 '%s'",
 					event.Name, param.Name, formatTypeRef(param.Type), event.Name, param.Name, formatTypeRef(param.Type))
 			}
@@ -98,7 +98,7 @@ func (a *Analyzer) resolveModelFields(file *ast.File) {
 		}
 		a.validatePrimaryKeyFields(m)
 		a.checkDirectives(m.Directives, OnModel)
-		// @withAuth: inject .createToken(), .verify(), .refreshToken() methods
+		// @withAuth: inject access/refresh token and password verification methods.
 		if hasModelDirective(m.Directives, "withAuth") {
 			a.injectWithAuthMethods(typ, m.Directives)
 		}
@@ -241,7 +241,7 @@ func (a *Analyzer) validateComputedField(model *ast.ModelDecl, field *ast.FieldD
 		return
 	}
 	want := targetField.Type.Name
-	if aggregate.Name == "avg" {
+	if aggregate.Name == "avg" && want != "Decimal" {
 		want = "Float"
 	}
 	a.validateComputedAggregateResult(model, field, aggregate.Name, want, targetField.Type.Name)
@@ -534,8 +534,6 @@ func (a *Analyzer) validateStreamAPI(api *ast.ApiDecl) {
 	}
 	if api.ReturnType == nil {
 		a.addError(api.Pos, "@stream API must declare a return type / @stream API 必须声明返回类型")
-	} else if api.ReturnType.Nullable {
-		a.addError(api.ReturnType.Pos, "@stream return type must be non-nullable / @stream 返回类型必须非空")
 	}
 	for _, incompatible := range []string{"cache", "paginate", "scope"} {
 		if directive, _ := findAPIDirective(api.Directives, incompatible); directive != nil {
@@ -790,7 +788,7 @@ func (a *Analyzer) findModelInName(rest string) (string, *ResolvedType) {
 		if mt.Kind != TypeModel {
 			continue
 		}
-		plural := mn + "s"
+		plural := ast.PluralModelName(mn)
 		if strings.HasPrefix(rest, plural) && len(plural) > len(bestName) {
 			bestName = plural
 			bestType = mt
@@ -1302,6 +1300,9 @@ func (a *Analyzer) resolveTypeRef(ref *ast.TypeRef, pos token.Position) *Resolve
 	}
 
 	// Generic args
+	if name == "Channel" && len(ref.TypeArgs) != 1 {
+		a.addError(pos, "Channel requires exactly one element type / Channel 必须有且仅有一个元素类型")
+	}
 	for _, arg := range ref.TypeArgs {
 		result.TypeArgs = append(result.TypeArgs, a.resolveTypeRef(arg, pos))
 	}

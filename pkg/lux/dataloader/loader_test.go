@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/selection"
@@ -179,6 +180,66 @@ func TestSameSelection(t *testing.T) {
 	if !sameSelection(withNil, []*selection.Field{nil}) || sameSelection(withNil, []*selection.Field{{Name: "id"}}) {
 		t.Fatal("nil selection node handling is incorrect")
 	}
+}
+
+func TestBatchSelectionBecomesAllAfterPartial(t *testing.T) {
+	partial := []*selection.Field{{Name: "id"}}
+	batch := newBatch[int, string](t.Context())
+	batch.add(1, partial)
+	batch.add(2, nil)
+	batch.add(3, partial)
+	if batch.mergedSelection() != nil || !batch.selectsAll || batch.size() != 3 {
+		t.Fatal("internal full selection did not dominate earlier and later projections")
+	}
+	if len(partial) != 1 || partial[0].Name != "id" {
+		t.Fatal("merging mutated caller selection metadata")
+	}
+}
+
+func TestExpiredBatchTimerCannotFlushReplacement(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var calls atomic.Int32
+		loader := New(func(_ context.Context, keys []int, _ []*selection.Field) (map[int]int, error) {
+			calls.Add(1)
+			values := make(map[int]int, len(keys))
+			for _, key := range keys {
+				values[key] = key
+			}
+			return values, nil
+		}, Config{Wait: time.Second, MaxBatch: 2})
+		results := make(chan int, 3)
+		load := func(key int) {
+			value, err := loader.Load(t.Context(), key, nil)
+			if err != nil {
+				t.Errorf("load %d: %v", key, err)
+			}
+			results <- value
+		}
+		go load(1)
+		synctest.Wait()
+		go load(2)
+		synctest.Wait()
+		first, second := <-results, <-results
+		if first+second != 3 || first == second || calls.Load() != 1 {
+			t.Fatal("full batch was not dispatched exactly once")
+		}
+		time.Sleep(500 * time.Millisecond)
+		go load(3)
+		synctest.Wait()
+		time.Sleep(500 * time.Millisecond)
+		synctest.Wait()
+		loader.mu.Lock()
+		pending := len(loader.batches)
+		loader.mu.Unlock()
+		if calls.Load() != 1 || len(results) != 0 || pending != 1 {
+			t.Fatal("old timer dispatched or removed the replacement batch")
+		}
+		time.Sleep(500 * time.Millisecond)
+		synctest.Wait()
+		if <-results != 3 || calls.Load() != 2 || len(loader.batches) != 0 {
+			t.Fatal("replacement batch lost its own timer or remained registered")
+		}
+	})
 }
 
 func TestLoadNoFields(t *testing.T) {
@@ -447,5 +508,82 @@ func TestNewNegativeWaitUsesDefault(t *testing.T) {
 
 	if loader.wait != 1*time.Millisecond {
 		t.Errorf("negative wait should default to 2ms, got %v", loader.wait)
+	}
+}
+
+func TestBatchStateIsAllocatedOnlyForLoad(t *testing.T) {
+	loader := New(func(_ context.Context, keys []int, _ []*selection.Field) (map[int]string, error) {
+		return map[int]string{keys[0]: "ok"}, nil
+	}, Config{Wait: time.Microsecond, MaxBatch: 2})
+	if loader.batches != nil {
+		t.Fatal("unused loader allocated batch state")
+	}
+	values, err := loader.LoadAll(t.Context(), []int{1}, nil)
+	if err != nil || values[1] != "ok" || loader.batches != nil {
+		t.Fatalf("direct load initialized batching: values=%v err=%v", values, err)
+	}
+	for range 2 {
+		value, err := loader.Load(t.Context(), 1, nil)
+		if err != nil || value != "ok" {
+			t.Fatalf("first/reused batch: value=%s err=%v", value, err)
+		}
+	}
+	loader.mu.Lock()
+	defer loader.mu.Unlock()
+	if loader.batches == nil || len(loader.batches) != 0 {
+		t.Fatal("batch state was not initialized or retained a completed batch")
+	}
+}
+
+func TestImmediateLoadDoesNotCreateBatch(t *testing.T) {
+	fields := []*selection.Field{{Name: "user", Children: []*selection.Field{{Name: "id"}}}}
+	loader := New(func(ctx context.Context, keys []int, selected []*selection.Field) (map[int]string, error) {
+		if len(keys) != 1 || keys[0] != 7 || &selected[0] != &fields[0] {
+			t.Fatal("immediate dispatch changed keys or field selection")
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > 30*time.Second {
+			t.Fatal("immediate dispatch lost its timeout")
+		}
+		return map[int]string{7: "value"}, nil
+	}, Config{Wait: time.Hour, MaxBatch: 1})
+	value, err := loader.Load(t.Context(), 7, fields)
+	if err != nil || value != "value" || loader.batches != nil {
+		t.Fatalf("immediate load used batch state: value=%s err=%v", value, err)
+	}
+}
+
+func TestImmediateLoadErrors(t *testing.T) {
+	failure := fmt.Errorf("batch failed")
+	for _, scenario := range []string{"missing", "error", "cancel", "deadline"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if scenario == "deadline" {
+				var release context.CancelFunc
+				ctx, release = context.WithDeadline(ctx, time.Now().Add(-time.Second))
+				defer release()
+			}
+			loader := New(func(context.Context, []int, []*selection.Field) (map[int]string, error) {
+				switch scenario {
+				case "error":
+					return map[int]string{7: "not a success"}, failure
+				case "cancel":
+					cancel()
+				}
+				return nil, nil
+			}, Config{MaxBatch: 1})
+			want := ctx.Err()
+			if scenario == "error" {
+				want = failure
+			}
+			if scenario == "cancel" {
+				want = context.Canceled
+			}
+			value, err := loader.Load(ctx, 7, nil)
+			if err != want || value != "" {
+				t.Fatalf("got %q/%v, want zero/%v", value, err, want)
+			}
+		})
 	}
 }

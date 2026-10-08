@@ -4,6 +4,10 @@ import 'dart:io';
 import 'types.dart';
 import 'json.dart';
 
+part 'codegen_enum.dart';
+part 'codegen_request.dart';
+part 'codegen_query.dart';
+
 /// Generate typed client from Luxo schema introspection.
 ///
 /// Usage:
@@ -35,21 +39,17 @@ Future<void> generate({
     }
 
     final schema = LuxoSchema.fromJson(json);
+    schema.validateIDs();
+    _validateEnums(schema);
+    final queries = generateQueryBuilders(schema);
 
     final dir = Directory(outDir);
     if (!dir.existsSync()) dir.createSync(recursive: true);
 
     File('$outDir/types.dart').writeAsStringSync(_genTypes(schema));
     File('$outDir/schema.dart').writeAsStringSync(_genSchemaMap(schema));
-    // Placeholder for _select_hints.g.dart — build_runner overwrites with real hints
-    final hintsFile = File('$outDir/_select_hints.g.dart');
-    if (!hintsFile.existsSync()) {
-      hintsFile.writeAsStringSync(
-        '// GENERATED placeholder. Run `dart run build_runner build` for real hints.\n'
-        'const selectHints = <String, String>{};\n',
-      );
-    }
     File('$outDir/client.dart').writeAsStringSync(_genClient(schema));
+    File('$outDir/queries.dart').writeAsStringSync(queries);
     print('[luxo] Generated types -> $outDir/');
   } finally {
     client.close();
@@ -98,6 +98,8 @@ String _dartParamType(LuxoParam param, Map<String, TypeUsage> usages) {
   final schemaType = param.typeName ?? param.type;
   final type = usages.containsKey(schemaType)
       ? _inputTypeName(schemaType, usages)
+      : param.type == 'Enum' && param.typeName != null
+      ? param.typeName!
       : _luxoTypeToDart(param.type);
   return param.isList ? _dartListType(param.type, type) : type;
 }
@@ -120,6 +122,8 @@ String _dartFieldType(
       schema.models.containsKey(typeName) || schema.types.containsKey(typeName);
   final base = structured && input
       ? _inputTypeName(typeName, usages)
+      : f.type == 'Enum' && f.typeName != null
+      ? f.typeName!
       : f.type == 'Model' || structured
       ? typeName
       : _luxoTypeToDart(f.type);
@@ -205,10 +209,13 @@ String _genTypes(LuxoSchema schema) {
   if (convert || usages.values.any(_hasOutputUsage)) {
     b.writeln("import 'dart:typed_data';");
   }
-  if (usages.values.any((usage) => usage != TypeUsage.unused)) {
+  if (schema.enums.isNotEmpty ||
+      usages.values.any((usage) => usage != TypeUsage.unused)) {
     b.writeln("import 'package:luxo_client/luxo_client.dart';\n");
   }
   b.writeln("export 'package:luxo_client/src/types.dart' show Page;\n");
+
+  _writeEnums(b, schema);
 
   for (final t in schema.types.values) {
     _writeDartDeclarations(b, t.name, t.fields, schema, usages);
@@ -380,8 +387,8 @@ void _writeDartBinaryEncoder(
   );
   final arenaTerms = arenaFields.map(
     (field) => field.nullable
-        ? "(${field.name} == null ? 0 : luxoUtf8Length(${field.name}!))"
-        : 'luxoUtf8Length(${field.name})',
+        ? "(${field.name} == null ? 0 : luxoUtf8Length(${_enumWireValue(field.type, field.typeName, '${field.name}!')}))"
+        : 'luxoUtf8Length(${_enumWireValue(field.type, field.typeName, field.name)})',
   );
   b.writeln('\n  @override');
   b.writeln('  void writeLuxo(LuxoEncoder encoder) {');
@@ -443,7 +450,9 @@ void _writeDartBinaryScalar(
     case 'Float':
       b.writeln('${indent}encoder.writeFixed64($value);');
     case 'String' || 'Enum' || 'Decimal':
-      b.writeln('${indent}encoder.writeString($value);');
+      b.writeln(
+        '${indent}encoder.writeString(${_enumWireValue(field.type, field.typeName, value)});',
+      );
     case 'Boolean':
       b.writeln('${indent}encoder.writeBool($value);');
     case 'DateTime':
@@ -525,6 +534,10 @@ String _jsonWrite(
     encoded = field.isList
         ? '$value.map((item) => item.toBigInt()).toList()'
         : '$value.toBigInt()';
+  } else if (field.type == 'Enum' && field.typeName != null) {
+    encoded = field.isList
+        ? '${field.typeName}.\$rawList($value)'
+        : '$value.rawValue';
   } else {
     encoded = value;
   }
@@ -601,6 +614,9 @@ String _columnStorageType(
     return f.nullable ? 'List<Uint8List?>' : 'List<Uint8List>';
   }
   final base = _dartFieldType(f, schema, usages: usages);
+  if (f.type == 'Enum' && f.typeName != null) {
+    return f.nullable ? 'List<String?>' : 'List<String>';
+  }
   return f.nullable ? 'List<$base?>' : 'List<$base>';
 }
 
@@ -646,12 +662,17 @@ String _columnValue(
       value = f.nullable ? '$column[i] == null ? null : $decoded' : decoded;
     }
   } else if (f.isList) {
-    final decoded = _binaryScalarRead(
-      f.type,
-      'LuxoDecoder($element)',
-      array: true,
-      checked: true,
-    );
+    final decoded = f.type == 'Enum' && f.typeName != null
+        ? '${f.typeName}.\$readArray(LuxoDecoder($element), complete: true)'
+        : _binaryScalarRead(
+            f.type,
+            'LuxoDecoder($element)',
+            array: true,
+            checked: true,
+          );
+    value = f.nullable ? '$column[i] == null ? null : $decoded' : decoded;
+  } else if (f.type == 'Enum' && f.typeName != null) {
+    final decoded = '${f.typeName}.fromValue($element)';
     value = f.nullable ? '$column[i] == null ? null : $decoded' : decoded;
   } else if (f.type == 'JSON') {
     final decoded = 'decodeLuxoJSON(utf8.decode($element)) as Object';
@@ -693,6 +714,12 @@ String _jsonCast(
 }) {
   final n = f.name;
   final q = f.nullable;
+  if (f.type == 'Enum' && f.typeName != null) {
+    final read = f.isList
+        ? '${f.typeName}.\$fromJSONList(json[\'$n\'])'
+        : '${f.typeName}.fromValue(luxoStringFromJSON(json[\'$n\']))';
+    return q ? "json['$n'] == null ? null : $read" : read;
+  }
   // Scalar array field ([T]) — JSON value is a List.
   if (f.isList && _isScalar(f.type)) {
     final cast = switch (f.type) {
@@ -761,6 +788,15 @@ String _jsonCast(
 
 String _binaryRead(LuxoField f) {
   final n = f.nullable;
+  if (f.type == 'Enum' && f.typeName != null) {
+    if (f.isList) {
+      final read = '${f.typeName}.\$readArray(dec)';
+      return n ? 'dec.readBool() ? $read : null' : read;
+    }
+    return n
+        ? '${f.typeName}.\$readNullable(dec)'
+        : '${f.typeName}.fromValue(dec.readString())';
+  }
   // Scalar array field ([T]) — inline [count][items...] in the row stream.
   if (f.isList && _isScalar(f.type)) {
     // DateTime arrays carry seconds/nanoseconds pairs but surface as
@@ -833,7 +869,7 @@ String _genSchemaMap(LuxoSchema schema) {
   );
   b.writeln('final luxoSchema = <String, APISchemaEntry>{');
   for (final api in schema.apis.values) {
-    if (api.name.startsWith('svc:')) continue;
+    if (api.internal) continue;
     final returnFields = api.returnType == null
         ? const <LuxoField>[]
         : (schema.models[api.returnType]?.fields ??
@@ -868,16 +904,9 @@ String _genSchemaMap(LuxoSchema schema) {
 
 String _genClient(LuxoSchema schema) {
   final usages = _inferTypeUsages(schema);
-  final apis = schema.apis.values
-      .where((api) => !api.name.startsWith('svc:'))
-      .toList();
-  final hints = apis.any(
-    (api) =>
-        !api.stream &&
-        (api.paginated || !_isScalar(_responseType(api, schema))),
-  );
+  final apis = schema.apis.values.where((api) => !api.internal).toList();
   final b = StringBuffer();
-  _writeClientImports(b, schema, apis, usages, hints: hints);
+  _writeClientImports(b, schema, apis, usages);
   b.writeln('class LuxoClient {');
   b.writeln('  final Transport transport;');
   b.writeln('  static final schema = luxoSchema;\n');
@@ -896,14 +925,13 @@ String _genClient(LuxoSchema schema) {
   b.writeln('  void setMode(TransportMode mode) => transport.setMode(mode);');
   b.writeln('  void setToken(String token) => transport.setToken(token);');
   b.writeln('  void close() => transport.close();\n');
-  if (hints)
-    b.writeln('  String? _hint(String api) => hints.selectHints[api];\n');
 
   for (final api in apis) {
     _genMethod(b, api, schema, usages);
   }
 
   b.writeln('}');
+  for (final api in apis) _genRequest(b, api, schema, usages);
   return b.toString();
 }
 
@@ -911,28 +939,31 @@ void _writeClientImports(
   StringBuffer b,
   LuxoSchema schema,
   List<LuxoAPI> apis,
-  Map<String, TypeUsage> usages, {
-  required bool hints,
-}) {
+  Map<String, TypeUsage> usages,
+) {
   final types = apis.any(
     (api) =>
+        schema.enums.containsKey(api.returnType) ||
         !_isScalar(_responseType(api, schema)) ||
         api.params.any(
-          (param) => usages.containsKey(param.typeName ?? param.type),
+          (param) =>
+              schema.enums.containsKey(param.typeName) ||
+              usages.containsKey(param.typeName ?? param.type),
         ),
   );
   b.writeln('// Auto-generated by luxo_client. DO NOT EDIT.\n');
   if (apis.isNotEmpty) b.writeln("import 'dart:typed_data';");
   if (apis.any(
-    (api) => api.returnType == 'Bytes' || api.returnType == 'JSON',
+    (api) =>
+        api.returnType == 'Bytes' ||
+        api.returnType == 'JSON' ||
+        api.params.any((param) => param.type == 'JSON'),
   )) {
     b.writeln("import 'dart:convert';");
   }
   b.writeln("import 'package:luxo_client/luxo_client.dart';");
   if (types) b.writeln("import 'types.dart';");
   b.writeln("import 'schema.dart';");
-  if (hints)
-    b.writeln("import '_select_hints.g.dart' as hints show selectHints;\n");
 }
 
 String _responseType(LuxoAPI api, LuxoSchema schema) {
@@ -959,15 +990,11 @@ void _genMethod(
   final args = declarations.isEmpty ? '' : '{${declarations.join(', ')}}';
   b.writeln("  Future<$ret> ${api.name}($args) async {");
   if (selection) {
-    b.writeln("    final sel = select ?? _hint('${api.name}');");
+    b.writeln('    final sel = select;');
   }
-  if (declarations.isEmpty) {
-    b.writeln("    return transport.call('${api.name}', decoder: $dec);");
-  } else {
-    b.writeln("    return transport.call('${api.name}', params: {");
-    _writeUnaryParams(b, api, selection: selection);
-    b.writeln('    }, decoder: $dec);');
-  }
+  b.writeln(
+    "    return transport.call('${api.name}', request: ${_requestCall(api, selection: selection)}, decoder: $dec);",
+  );
   b.writeln('  }\n');
 }
 
@@ -1046,15 +1073,11 @@ void _genStreamMethod(
   b.writeln(
     '  Future<void Function()> $methodName({${declarations.join(', ')}}) {',
   );
-  b.writeln("    return transport.subscribe('${api.name}', {");
-  for (final param in api.params) {
-    _writeDartParamEntry(b, param);
-  }
-  if (structuredReturn) {
-    b.writeln("      if (select != null) r'\$select': select,");
-  }
   b.writeln(
-    '    }, onData, decoder: ${_decoder(api, type)}, onError: onError, onDone: onDone);',
+    "    return transport.subscribe('${api.name}', const {}, onData, request: ${_requestCall(api, selection: structuredReturn, stream: true)},",
+  );
+  b.writeln(
+    '      decoder: ${_decoder(api, type)}, onError: onError, onDone: onDone);',
   );
   b.writeln('  }\n');
 }
@@ -1082,34 +1105,73 @@ void _writeDartParamEntry(
   LuxoParam param, {
   bool forcedOptional = false,
 }) {
+  String value(String expression, bool nullable) {
+    if (param.type != 'Enum' || param.typeName == null) return expression;
+    if (param.isList) {
+      final method = nullable ? '\$nullableRawList' : '\$rawList';
+      return '${param.typeName}.$method($expression)';
+    }
+    final checked = nullable ? '$expression?' : expression;
+    return '$checked.rawValue';
+  }
+
   if (param.nullable && param.hasDefault) {
     b.writeln(
-      "      if (${param.name}.isPresent) '${param.name}': ${param.name}.value,",
+      "      if (${param.name}.isPresent) '${param.name}': ${value('${param.name}.value', true)},",
     );
     return;
   }
   if (forcedOptional || param.hasDefault) {
     b.writeln(
-      "      if (${param.name} != null) '${param.name}': ${param.name},",
+      "      if (${param.name} != null) '${param.name}': ${value(param.name, false)},",
     );
     return;
   }
-  b.writeln("      '${param.name}': ${param.name},");
+  b.writeln("      '${param.name}': ${value(param.name, param.nullable)},");
 }
 
 String _returnType(LuxoAPI api, String type) {
-  final t = _luxoTypeToDart(type);
-  if (api.paginated) return 'Page<$t>';
-  if (api.returnList) return _dartListType(type, t);
-  return t;
+  final t = type == 'Enum' && api.returnType != 'Enum'
+      ? api.returnType!
+      : _luxoTypeToDart(type);
+  final result = api.paginated
+      ? 'Page<$t>'
+      : api.returnList
+      ? _dartListType(type, t)
+      : t;
+  return api.returnNullable ? '$result?' : result;
 }
 
 /// Generates a decoder lambda that handles both JSON (Map/int/etc) and binary (Uint8List).
 String _decoder(LuxoAPI api, String type) {
+  if (api.returnNullable) {
+    return '''(d) {
+      if (d is Uint8List) {
+        if (d.isEmpty || d[0] > 1 || (d[0] == 0 ? d.length != 1 : d.length == 1)) {
+          throw const FormatException('invalid nullable root envelope');
+        }
+        if (d[0] == 0) return null;
+        d = Uint8List.sublistView(d, 1);
+      } else if (d == null) {
+        return null;
+      }
+      return ${_decodeExpression(api, type, 'd')};
+    }''';
+  }
   return '(d) => ${_decodeExpression(api, type, 'd')}';
 }
 
 String _decodeExpression(LuxoAPI api, String t, String value) {
+  if (t == 'Enum' && api.returnType != 'Enum') {
+    final name = api.returnType!;
+    final binary = api.returnList
+        ? '$name.\$readArray(LuxoDecoder($value), complete: true)'
+        : '$name.fromValue(LuxoDecoder($value).readStringChecked())';
+    final json = api.returnList
+        ? '$name.\$fromJSONList($value)'
+        : '$name.fromValue(luxoStringFromJSON($value))';
+    return '$value is Uint8List ? $binary : $json';
+  }
   if (_isScalar(t)) {
     final binaryRead = _binaryScalarRead(
       t,

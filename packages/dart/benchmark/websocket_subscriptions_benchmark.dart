@@ -7,6 +7,10 @@ Future<void> main(List<String> args) async {
     throw ArgumentError('Expected exe, js or wasm');
   }
   final platform = args.first;
+  if (args.length == 3 && args[1] == 'presence') {
+    await _measurePresence(platform, args[2]);
+    return;
+  }
   final snapshot =
       args.length == 3 && ['disconnect', 'decode'].contains(args[1]);
   if (!snapshot &&
@@ -45,22 +49,84 @@ Future<void> main(List<String> args) async {
       await _run(executable, arguments);
     }
   } finally {
-    if (FileSystemEntity.isLinkSync(directory.path) ||
-        directory.parent.resolveSymbolicLinksSync() !=
-            root.resolveSymbolicLinksSync()) {
-      throw StateError('Refusing cleanup outside owned scratch');
-    }
-    directory.deleteSync(recursive: true);
+    _cleanOwned(directory, root);
   }
 }
 
-File _writeProbe(Directory directory, String kind, String? before) {
-  final source = File('lib/src/transport.dart')
-      .readAsStringSync()
-      .replaceAllMapped(
-        RegExp("'([a-z0-9_]+\\.dart)'"),
-        (match) => "'package:luxo_client/src/${match[1]}'",
+void _cleanOwned(Directory directory, Directory root) {
+  if (FileSystemEntity.isLinkSync(directory.path) ||
+      directory.parent.resolveSymbolicLinksSync() !=
+          root.resolveSymbolicLinksSync()) {
+    throw StateError('Refusing cleanup outside owned scratch');
+  }
+  directory.deleteSync(recursive: true);
+}
+
+Future<void> _measurePresence(String platform, String snapshot) async {
+  final root = Directory('.tmp')..createSync(recursive: true);
+  final directory = root.createTempSync('response-presence-benchmark-');
+  try {
+    for (final variant in ['before', 'after']) {
+      final entry = _writePresenceProbe(
+        directory,
+        variant,
+        File(variant == 'before' ? snapshot : 'lib/src/transport.dart')
+            .readAsStringSync(),
       );
+      await _run(Platform.resolvedExecutable, [
+        'compile',
+        platform,
+        '--packages=${File('.dart_tool/package_config.json').absolute.path}',
+        entry.absolute.path,
+        '-o',
+        '${directory.absolute.path}/$variant.$platform',
+      ]);
+    }
+    for (var process = 1; process <= 3; process++) {
+      final variants = process.isEven
+          ? ['after', 'before']
+          : ['before', 'after'];
+      for (final variant in variants) {
+        stdout.writeln('$platform $variant process $process');
+        await _run(
+          platform == 'exe'
+              ? '${directory.absolute.path}/$variant.exe'
+              : 'node',
+          platform == 'exe' ? [] : [_webRunner(directory, platform, variant)],
+        );
+      }
+    }
+  } finally {
+    _cleanOwned(directory, root);
+  }
+}
+
+File _writePresenceProbe(Directory directory, String variant, String source) {
+  final support = File('benchmark/websocket_lifecycle_support.dart.txt')
+      .readAsStringSync();
+  final compare = support.indexOf('Future<void> _compareAsync(');
+  final socket = support.indexOf('class _ProbeSocket ');
+  if (compare < 0 || socket < compare)
+    throw StateError('Unexpected shared probe layout');
+  final clockNative = File('benchmark/clock_native.dart').absolute.uri;
+  final clockWeb = File('benchmark/clock_web.dart').absolute.uri;
+  final probe = File('benchmark/response_presence_probe.dart.txt')
+      .readAsStringSync();
+  return File('${directory.path}/$variant.dart')..writeAsStringSync(
+    "import '$clockNative' if (dart.library.js_interop) '$clockWeb' as clock;\n"
+    '${_rewriteImports(source)}\n${support.substring(0, compare)}\n${support.substring(socket)}\n$probe',
+  );
+}
+
+String _rewriteImports(String source) => source.replaceAllMapped(
+  RegExp("'([a-z0-9_]+\\.dart)'"),
+  (match) => "'package:luxo_client/src/${match[1]}'",
+);
+
+File _writeProbe(Directory directory, String kind, String? before) {
+  final source = _rewriteImports(
+    File('lib/src/transport.dart').readAsStringSync(),
+  );
   final benchmark = File('benchmark/uint64_benchmark.dart').absolute.uri;
   final clockNative = File('benchmark/clock_native.dart').absolute.uri;
   final clockWeb = File('benchmark/clock_web.dart').absolute.uri;
@@ -100,16 +166,20 @@ String _snapshotBaseline(String path) {
   return '$contract\n$implementation';
 }
 
-String _webRunner(Directory directory, String platform) {
+String _webRunner(
+  Directory directory,
+  String platform, [
+  String name = 'probe',
+]) {
   final runner = File(
     '${directory.path}/run.${platform == 'js' ? 'cjs' : 'mjs'}',
   );
   runner.writeAsStringSync(
     platform == 'js'
-        ? "globalThis.self = globalThis; require('./probe.js');\n"
+        ? "globalThis.self = globalThis; require('./$name.js');\n"
         : "import { readFile } from 'node:fs/promises';\n"
-              "import { compile } from './probe.mjs';\n"
-              "const compiled = await compile(await readFile(new URL('./probe.wasm', import.meta.url)));\n"
+              "import { compile } from './$name.mjs';\n"
+              "const compiled = await compile(await readFile(new URL('./$name.wasm', import.meta.url)));\n"
               'const instance = await compiled.instantiate({}); instance.invokeMain();\n',
   );
   return runner.absolute.path;

@@ -5,11 +5,7 @@ package queue
 
 import (
 	"context"
-	"fmt"
-	"strings"
 	"time"
-
-	"github.com/light-speak/luxo/pkg/lux/env"
 )
 
 // Queue is the interface for publishing and consuming tasks.
@@ -31,10 +27,13 @@ type Queue interface {
 // Handler processes a task payload.
 type Handler func(ctx context.Context, payload []byte) error
 
+// DeadLetterSuffix names the portable dead-letter destination of a task queue.
+const DeadLetterSuffix = ".dlq"
+
 // Config controls queue behavior.
 type Config struct {
 	MaxRetries  int           // maximum delivery attempts (default 3)
-	RetryDelay  time.Duration // base delay before retry, doubled each attempt (default 5s)
+	RetryDelay  time.Duration // base retry delay, doubled each attempt (default 5s; NATS caps at 1m)
 	Concurrency int           // concurrent workers per queue (default 4)
 }
 
@@ -47,8 +46,8 @@ func DefaultConfig() Config {
 	}
 }
 
-// validate fills zero-value fields with defaults.
-func (c *Config) validate() {
+// SetDefaults fills zero-value fields with defaults.
+func (c *Config) SetDefaults() {
 	if c.MaxRetries <= 0 {
 		c.MaxRetries = 3
 	}
@@ -58,22 +57,4 @@ func (c *Config) validate() {
 	if c.Concurrency <= 0 {
 		c.Concurrency = 4
 	}
-}
-
-// NewFromEnv creates a Queue based on environment configuration.
-// An explicitly configured NATS backend must initialize successfully.
-// Only an unset NATS_URL selects MemoryQueue.
-func NewFromEnv(cfg Config) (Queue, error) {
-	cfg.validate()
-	if natsURL, ok := env.Get("NATS_URL"); ok {
-		if strings.TrimSpace(natsURL) == "" {
-			return nil, fmt.Errorf("queue: NATS_URL is set but empty")
-		}
-		q, err := NewNATSQueue(natsURL, cfg)
-		if err != nil {
-			return nil, fmt.Errorf("queue: initialize NATS JetStream: %w", err)
-		}
-		return q, nil
-	}
-	return NewMemoryQueue(cfg), nil
 }

@@ -42,6 +42,9 @@ func TestRouterDebugLogsParamStructureWithoutValues(t *testing.T) {
 	req.Header.Set("X-Luxo-Mode", "binary")
 	rt.ServeHTTP(httptest.NewRecorder(), req)
 
+	if err := rt.CloseRequestLogs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	output := logs.String()
 	if strings.Contains(output, secret) {
 		t.Fatalf("debug log leaked parameter value: %s", output)
@@ -71,6 +74,9 @@ func TestRouterDebugLogsJSONParamStructureWithoutValues(t *testing.T) {
 	))
 	rt.ServeHTTP(httptest.NewRecorder(), req)
 
+	if err := rt.CloseRequestLogs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	output := logs.String()
 	if strings.Contains(output, secret) {
 		t.Fatalf("debug log leaked JSON parameter value: %s", output)
@@ -81,23 +87,39 @@ func TestRouterDebugLogsJSONParamStructureWithoutValues(t *testing.T) {
 }
 
 func TestRouterLoggingDisabledWritesNothing(t *testing.T) {
-	var logs bytes.Buffer
-	rt := NewRouterWithOptions(RouterOptions{LogWriter: &logs})
-	rt.Handle("health", func(_ context.Context, req *Request) error {
-		req.Buf.AppendString("true")
-		return nil
-	})
-	req := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(`{"$api":"health"}`))
-	rt.ServeHTTP(httptest.NewRecorder(), req)
-	if logs.Len() != 0 {
-		t.Fatalf("disabled logger wrote %q", logs.String())
+	for _, test := range []struct {
+		name, body string
+		status     int
+	}{
+		{"success", `{"$api":"health"}`, http.StatusOK},
+		{"parse_error", `{`, http.StatusBadRequest},
+		{"handler_error", `{"$api":"failing"}`, http.StatusInternalServerError},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			rt := NewRouterWithOptions(RouterOptions{LogWriter: &logs, DebugParamStructure: true})
+			rt.Handle("health", func(_ context.Context, req *Request) error {
+				req.Buf.AppendString("true")
+				return nil
+			})
+			rt.Handle("failing", func(context.Context, *Request) error { return luxerrors.New("Internal", 500, "failed") })
+			req := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(test.body))
+			response := httptest.NewRecorder()
+			rt.ServeHTTP(response, req)
+			if response.Code != test.status {
+				t.Fatalf("status=%d, want %d: %s", response.Code, test.status, response.Body.String())
+			}
+			if logs.Len() != 0 {
+				t.Fatalf("disabled logger wrote %q", logs.String())
+			}
+		})
 	}
 }
 
 func TestRouterLogsStableErrorNameWithoutCause(t *testing.T) {
 	const secret = "DO_NOT_LOG_THIS_ERROR_CAUSE"
 	var logs bytes.Buffer
-	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, LogWriter: &logs})
+	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, SynchronousRequestLogs: true, LogWriter: &logs})
 	rt.Handle("failing", func(context.Context, *Request) error {
 		return luxerrors.Wrap(fmt.Errorf("database rejected %s", secret))
 	})
@@ -117,7 +139,15 @@ func BenchmarkRouterObservabilityDisabled(b *testing.B) {
 }
 
 func BenchmarkRouterObservabilityEnabled(b *testing.B) {
+	benchmarkRouterObservability(b, RouterOptions{RequestLogging: true, SynchronousRequestLogs: true, LogWriter: io.Discard})
+}
+
+func BenchmarkRouterObservabilityAsync(b *testing.B) {
 	benchmarkRouterObservability(b, RouterOptions{RequestLogging: true, LogWriter: io.Discard})
+}
+
+func BenchmarkRouterObservabilitySampled(b *testing.B) {
+	benchmarkRouterObservability(b, RouterOptions{RequestLogging: true, RequestLogSampleEvery: 100, LogWriter: io.Discard})
 }
 
 func benchmarkRouterObservability(b *testing.B, options RouterOptions) {
@@ -134,4 +164,10 @@ func benchmarkRouterObservability(b *testing.B, options RouterOptions) {
 		req := httptest.NewRequest(http.MethodPost, "/luvia", bytes.NewReader(body))
 		rt.ServeHTTP(httptest.NewRecorder(), req)
 	}
+	b.StopTimer()
+	if err := rt.CloseRequestLogs(context.Background()); err != nil {
+		b.Fatal(err)
+	}
+	drops, _ := rt.RequestLogStats()
+	b.ReportMetric(float64(drops)/float64(b.N), "drops/request")
 }

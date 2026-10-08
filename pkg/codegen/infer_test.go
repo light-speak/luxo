@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/light-speak/luxo/internal/inferred"
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/token"
 )
@@ -541,7 +542,7 @@ func TestGenerateInferredHandlerEnumParam(t *testing.T) {
 	}
 }
 
-func TestGenerateInferredHandlerParamJSON(t *testing.T) {
+func TestGenerateInferredHandlerParamUUID(t *testing.T) {
 	mWithUUID := testModel("User", nil, []*ast.FieldDecl{
 		testField("id", "UUID"),
 		testField("email", "String"),
@@ -559,12 +560,12 @@ func TestGenerateInferredHandlerParamJSON(t *testing.T) {
 	var b strings.Builder
 	generateInferredHandler(&b, api, inf, map[string]bool{}, mWithUUID)
 	out := b.String()
-	if !strings.Contains(out, "req.ParamJSON") {
-		t.Errorf("UUID param: expected ParamJSON for UUID type, got:\n%s", out)
+	if !strings.Contains(out, "req.ParamUUID") {
+		t.Errorf("UUID param: expected ParamUUID, got:\n%s", out)
 	}
 }
 
-func TestGenerateInferredHandlerNullableParamJSON(t *testing.T) {
+func TestGenerateInferredHandlerNullableParamUUID(t *testing.T) {
 	model := testModel("User", nil, []*ast.FieldDecl{testField("id", "UUID")})
 	api := testApiDecl("getUserById", []*ast.ParamDecl{{
 		Name: "id",
@@ -577,8 +578,8 @@ func TestGenerateInferredHandlerNullableParamJSON(t *testing.T) {
 	}
 	var b strings.Builder
 	generateInferredHandler(&b, api, inf, nil, model)
-	if out := b.String(); !strings.Contains(out, "req.ParamJSONNullable") {
-		t.Fatalf("nullable UUID parameter did not use nullable JSON decoding:\n%s", out)
+	if out := b.String(); !strings.Contains(out, `req.ParamIsNull("id")`) || !strings.Contains(out, `req.ParamUUID("id")`) {
+		t.Fatalf("nullable UUID parameter did not use static nullable decoding:\n%s", out)
 	}
 }
 
@@ -604,6 +605,100 @@ func TestGenerateInferredHandlerSelectsRelationColumns(t *testing.T) {
 		})
 	}
 }
+
+func TestGenerateInferredTopListPropagatesRelationError(t *testing.T) {
+	model := testModel("User", nil, []*ast.FieldDecl{
+		testField("id", "Int"),
+		{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+	})
+	var output strings.Builder
+	generateInferredHandler(&output, testApiDecl("listTop5Users", nil),
+		&InferredAPI{Action: "list", ModelName: "User", TopN: 5}, nil, model)
+	code := output.String()
+	for _, expected := range []string{
+		"q.Limit(5).All(ctx)",
+		"if err := resolveUserListRelations(ctx, app, results, req.Select); err != nil {\n\t\t\treturn err",
+		"WriteColumnarUser(req.Buf, results, req.FieldMask)",
+	} {
+		if !strings.Contains(code, expected) {
+			t.Fatalf("missing %q:\n%s", expected, code)
+		}
+	}
+	if strings.Contains(code, "AllWithCount") {
+		t.Fatal("fixed top list unexpectedly enabled pagination")
+	}
+}
+
+func TestGeneratedTopListRelationFailure(t *testing.T) {
+	runGeneratedFixture(t, `
+model User @noTime { id: Int @id
+ name: String
+ posts: [Post]
+}
+model Post @noTime { id: Int @id
+ userId: Int
+ user: User
+}
+api listTop5Users
+api listTop5UsersByName
+api listUsersByName
+`, topListRelationAssertions, StableIDs{ModelFields: map[string]map[string]int{
+		"User": {"id": 1, "name": 2, "posts": 3}, "Post": {"id": 1, "userId": 2, "user": 3},
+	}})
+}
+
+const topListRelationAssertions = `package generated
+import("bytes";"encoding/json";"net/http/httptest";"testing"
+"github.com/light-speak/luxo/pkg/lux/api"
+"github.com/light-speak/luxo/pkg/lux/codec"
+"github.com/light-speak/luxo/pkg/lux/pg"
+"github.com/light-speak/luxo/pkg/lux/schema"
+"github.com/testcontainers/testcontainers-go"
+"github.com/testcontainers/testcontainers-go/modules/postgres")
+func TestTopListRelationFailure(t *testing.T){
+ container,err:=postgres.Run(t.Context(),"postgres:17-alpine",postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
+ testcontainers.CleanupContainer(t,container);if err!=nil{t.Fatal(err)}
+ connection,err:=container.ConnectionString(t.Context(),"sslmode=disable");if err!=nil{t.Fatal(err)}
+ db,err:=pg.NewDB(t.Context(),connection);if err!=nil{t.Fatal(err)};t.Cleanup(db.Close)
+ if _,err:=pg.Exec(t.Context(),db,"CREATE TABLE users(id bigint PRIMARY KEY,name text); INSERT INTO users VALUES(1,'first'),(2,'second')");err!=nil{t.Fatal(err)}
+ for _,apiName:=range []string{"listTop5Users","listTop5UsersByName","listUsersByName"}{for _,binary:=range []bool{false,true}{for _,relation:=range []bool{false,true}{
+  router:=api.NewRouter();if err:=RegisterSchema(router.Schema);err!=nil{t.Fatal(err)}
+  app:=NewFromDB(db)
+  if err:=RegisterHandlers(router,app);err!=nil{t.Fatal(err)}
+  selection:="id";if relation{selection="id,posts { id }"}
+  payload:=map[string]any{"$api":apiName,"$select":selection}
+  var params map[string]any
+  wantRows:=2
+  if apiName!="listTop5Users"{params=map[string]any{"name":"first"};payload["name"]="first";wantRows=1}
+  body,err:=json.Marshal(payload);if err!=nil{t.Fatal(err)}
+  if binary{
+   fields:=[]byte{1};var children []codec.SelectionMaskChild
+   if relation{fields=[]byte{5};child,err:=codec.AppendSelectionMask(nil,[]byte{1},nil);if err!=nil{t.Fatal(err)};children=[]codec.SelectionMaskChild{{FieldID:3,Mask:child}}}
+   mask,err:=codec.AppendSelectionMask(nil,fields,children);if err!=nil{t.Fatal(err)}
+   body,err=api.EncodeBinaryRequest(router.Schema.APIs[apiName].ID,mask,params,router.Registry.ParamOrder(apiName));if err!=nil{t.Fatal(err)}
+  }
+  request:=httptest.NewRequest("POST","/",bytes.NewReader(body));if binary{request.Header.Set("X-Luxo-Mode","binary")}else{request.Header.Set("Content-Type","application/json")}
+  response:=httptest.NewRecorder();router.ServeHTTP(response,request)
+  want:=200;if relation{want=500}
+  if response.Code!=want{t.Fatalf("binary=%v relation=%v status=%d want=%d body=%s",binary,relation,response.Code,want,response.Body.String())}
+  if !relation{
+   var rows []User
+   if apiName=="listUsersByName"{rows=readInferredPage(t,router,response.Body.Bytes(),binary)}else if binary{rows,err=ReadColumnarUser(response.Body.Bytes())}else{var envelope struct{Data []User};err=json.Unmarshal(response.Body.Bytes(),&envelope);rows=envelope.Data}
+   if err!=nil||len(rows)!=wantRows{t.Fatal(apiName,binary,rows,err)}
+   if wantRows==1&&rows[0].Id!=1{t.Fatal("filter was not applied",rows)}
+  }
+ }}}
+}
+func readInferredPage(t *testing.T,router *api.Router,body []byte,binary bool)[]User{
+ t.Helper()
+ var err error
+ if binary{body,err=schema.BinaryPaginatedListToJSON(nil,body,router.Schema.Models["User"],router.Schema);if err!=nil{t.Fatal(err)}}else{var envelope struct{Data json.RawMessage};if err=json.Unmarshal(body,&envelope);err!=nil{t.Fatal(err)};body=envelope.Data}
+ var page struct{Items []User;Total int;Page int;PageSize int}
+ if err=json.Unmarshal(body,&page);err!=nil{t.Fatal(err)}
+ if page.Total!=1||page.Page!=1||page.PageSize<=0{t.Fatalf("incorrect pagination: %+v",page)}
+ return page.Items
+}
+`
 
 func TestWriteAndClause(t *testing.T) {
 	m := testModel("Post", nil, []*ast.FieldDecl{
@@ -880,7 +975,7 @@ func TestSingularize(t *testing.T) {
 		{"User", "User"},
 	}
 	for _, tc := range cases {
-		got := singularize(tc.input)
+		got := inferred.Singularize(tc.input)
 		if got != tc.want {
 			t.Errorf("singularize(%q) = %q, want %q", tc.input, got, tc.want)
 		}
@@ -899,7 +994,7 @@ func TestParseOrderByAsc(t *testing.T) {
 		{"UpdatedAt", "updatedAt", false}, // no suffix
 	}
 	for _, tc := range cases {
-		field, desc := parseOrderBy(tc.input)
+		field, desc := inferred.ParseOrderBy(tc.input)
 		if field != tc.wantField {
 			t.Errorf("parseOrderBy(%q) field = %q, want %q", tc.input, field, tc.wantField)
 		}
@@ -1234,7 +1329,7 @@ func TestBuildInferredParamsStringPatternOps(t *testing.T) {
 func TestSplitBySeparatorLowercaseAfterSep(t *testing.T) {
 	// "EmailOrphone" split by "Or": idx=5, char after "Or" is 'p' (lowercase)
 	// → else-break, no split occurs, whole string returned as one part.
-	parts := splitBySeparator("EmailOrphone", "Or")
+	parts := inferred.SplitBySeparator("EmailOrphone", "Or")
 	if len(parts) != 1 {
 		t.Errorf("expected 1 part for lowercase-after-sep, got %d: %v", len(parts), parts)
 	}

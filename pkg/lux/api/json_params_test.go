@@ -2,15 +2,18 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
+	"github.com/light-speak/luxo/pkg/lux/schema"
 )
 
 func TestUUIDCanonicalSharedCases(t *testing.T) {
@@ -50,6 +53,138 @@ func TestUUIDCanonicalSharedCases(t *testing.T) {
 			if err := registry.prepareJSONRequest(req); err == nil {
 				t.Errorf("accepted malformed UUID %q list=%t", item.Input, list)
 			}
+		}
+	}
+}
+
+type requestJSONMarshalerProbe struct{ calls *int }
+
+func (probe requestJSONMarshalerProbe) MarshalJSON() ([]byte, error) {
+	*probe.calls++
+	return []byte(`{"ok":true}`), nil
+}
+
+func TestBinaryJSONRequestRejectsImplicitSerialization(t *testing.T) {
+	for _, list := range []bool{false, true} {
+		meta := []ParamMeta{{Name: "document", Type: "JSON", FieldID: 1, IsList: list}}
+		calls := 0
+		for _, value := range []any{map[string]any{"ok": true}, struct{ OK bool }{true},
+			requestJSONMarshalerProbe{&calls}, "text", int64(42), true, []byte(`{"ok":true}`), nil,
+		} {
+			input := value
+			if list {
+				input = []any{value}
+			}
+			body, err := EncodeBinaryRequest(1, nil, map[string]any{"document": input}, meta)
+			if err == nil || body != nil {
+				t.Errorf("arbitrary Go value encoded as JSON: list=%v, type=%T", list, value)
+			}
+		}
+		if calls != 0 {
+			t.Errorf("request encoding invoked MarshalJSON %d times", calls)
+		}
+	}
+}
+
+func TestBinaryJSONRequestPreservesDocumentTokens(t *testing.T) {
+	for _, list := range []bool{false, true} {
+		meta := []ParamMeta{{Name: "document", Type: "JSON", FieldID: 1, IsList: list}}
+		registry := NewAPIRegistry()
+		registry.Register("read", 1)
+		registry.RegisterParams("read", meta)
+		for _, raw := range []string{`123456789012345678901234567890`, `1.234567890123456789`, `"東京"`, `{"a":1,"a":2}`, `[]`, `true`} {
+			var input any = json.RawMessage(raw)
+			if list {
+				input = []any{input}
+			}
+			body := mustEncodeBinaryRequest(t, 1, nil, map[string]any{"document": input}, meta)
+			req, err := registry.ParseBinaryRequest(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if list {
+				values, err := req.ParamRawJSONArray("document")
+				if err != nil || len(values) != 1 || string(values[0]) != raw {
+					t.Fatalf("JSON list changed: %q, %v", values, err)
+				}
+			} else if value, err := req.ParamRawJSON("document"); err != nil || string(value) != raw {
+				t.Fatalf("JSON document changed: %q, %v", value, err)
+			}
+		}
+	}
+}
+
+func TestRequiredJSONRejectsNullInBothRequestModes(t *testing.T) {
+	meta := []ParamMeta{{Name: "document", Type: "JSON", FieldID: 1}}
+	registry := NewAPIRegistry()
+	registry.Register("read", 1)
+	registry.RegisterParams("read", meta)
+	for _, raw := range []string{"null", " \t\r\nnull \t\r\n"} {
+		if body, err := EncodeBinaryRequest(1, nil, map[string]any{"document": json.RawMessage(raw)}, meta); err == nil || body != nil {
+			t.Errorf("encoded non-null JSON parameter as null: %q", raw)
+		}
+		// Build an untrusted wire request independently of the checked encoder.
+		body := codec.AppendBytes([]byte{1, 0, 1}, []byte(raw))
+		body = append(body, 0)
+		if _, err := registry.ParseBinaryRequest(body); err == nil {
+			t.Errorf("Binary accepted non-null JSON parameter as null: %q", raw)
+		}
+		req := &Request{API: "read", Params: map[string]json.RawMessage{"document": []byte(raw)}}
+		if err := registry.prepareJSONRequest(req); err == nil {
+			t.Errorf("JSON accepted non-null JSON parameter as null: %q", raw)
+		}
+	}
+}
+
+func TestJSONParameterNullScope(t *testing.T) {
+	for _, list := range []bool{false, true} {
+		meta := []ParamMeta{{Name: "document", Type: "JSON", FieldID: 1, Nullable: true, IsList: list}}
+		registry := NewAPIRegistry()
+		registry.Register("read", 1)
+		registry.RegisterParams("read", meta)
+		body := mustEncodeBinaryRequest(t, 1, nil, map[string]any{"document": nil}, meta)
+		req, err := registry.ParseBinaryRequest(body)
+		if err != nil || !req.ParamIsNull("document") {
+			t.Fatalf("nullable JSON rejected null: %v", err)
+		}
+	}
+	meta := []ParamMeta{{Name: "document", Type: "JSON", FieldID: 1, IsList: true}}
+	registry := NewAPIRegistry()
+	registry.Register("read", 1)
+	registry.RegisterParams("read", meta)
+	body := mustEncodeBinaryRequest(t, 1, nil, map[string]any{"document": []json.RawMessage{[]byte("null"), []byte(`{"nested":null}`)}}, meta)
+	req, err := registry.ParseBinaryRequest(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values, err := req.ParamRawJSONArray("document")
+	if err != nil || len(values) != 2 || string(values[0]) != "null" || string(values[1]) != `{"nested":null}` {
+		t.Fatalf("JSON list null changed: %q, %v", values, err)
+	}
+}
+
+func TestRequiredJSONNullNeverReachesHTTPHandler(t *testing.T) {
+	router := NewRouterWithOptions(RouterOptions{})
+	router.Schema.RegisterAPI(&schema.API{Name: "read", ID: 1, ReturnType: "Int", Params: []schema.Param{
+		{Name: "document", ID: 1, Type: schema.FieldJSON},
+	}})
+	router.Registry.RegisterSchemaAPIs(router.Schema)
+	called := false
+	router.Handle("read", func(_ context.Context, _ *Request) error { called = true; return nil })
+	for _, binaryMode := range []bool{false, true} {
+		body := []byte(`{"$api":"read","document":null}`)
+		if binaryMode {
+			body = append(codec.AppendBytes([]byte{1, 0, 1}, []byte(" \tnull\r\n")), 0)
+		}
+		request := httptest.NewRequest("POST", "/luvia", bytes.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		if binaryMode {
+			request.Header.Set("X-Luxo-Mode", "binary")
+		}
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != 400 || called {
+			t.Fatalf("null reached handler: binary=%t, status=%d, called=%t", binaryMode, response.Code, called)
 		}
 	}
 }

@@ -1,5 +1,5 @@
 import { LuxoClient } from './client.js'
-import type { Transport } from '@luxojs/client'
+import { responseTransport } from './response-transport.js'
 import { decodeLuxoJSON } from '@luxojs/client'
 
 type Receive = (value: unknown) => void
@@ -34,11 +34,7 @@ const cases: Record<string, Case[]> = {
 let response: unknown
 let delivered = 0
 const failures: string[] = []
-const transport: Transport = {
-  async call() { return response },
-  async subscribe(_api, _params, decode, onData) { onData(decode(response)); return () => {} },
-  setMode() {}, setToken() {}, setSchema() {},
-}
+const transport = responseTransport(() => response)
 const client = new LuxoClient(transport)
 const format = (value: unknown) => JSON.stringify(value, (_key, item: unknown) =>
   typeof item === 'bigint' ? item.toString() + 'n' : item)

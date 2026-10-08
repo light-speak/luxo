@@ -69,6 +69,19 @@ One file. Zero boilerplate. This generates everything — including the Dart cli
                      Binary (prod)
 ```
 
+## Typed query controls
+
+For a generated API `listUsers` exposing an Int `count` filter and sorter, the generated query helpers preserve the full Int64 range:
+
+```dart
+import 'package:luxo_client/luxo_client.dart';
+import 'generated/queries.dart';
+final filters = [LuxoQuery_listUsers.count_eq(LuxoInt64.parse('9007199254740993'))];
+final sorters = [LuxoQuery_listUsers.count_desc()];
+```
+
+Pass these values to the generated API's `filters` / `sorters` arguments. Helpers come from the API's advertised capabilities, not all fields on its return model. Only advertised operators are generated. Dynamic controls remain available; the server still validates every query. These helpers do not perform runtime Schema lookup.
+
 ## Install
 
 The development mainline requires Dart 3.13 or newer. Published versions keep
@@ -76,9 +89,12 @@ their own SDK constraints; the toolchain migration does not itself publish a new
 JavaScript and Wasm targets also require a host with native
 `String.prototype.isWellFormed`; unsupported hosts are not silently downgraded.
 
+The following coordinate is prepared for the unreleased `1.0.0-beta.1` candidate.
+Use it after publication; pin the exact version during the first protocol freeze.
+
 ```yaml
 dependencies:
-  luxo_client: ^0.1.0
+  luxo_client: 1.0.0-beta.1
 ```
 
 ```bash
@@ -342,21 +358,24 @@ try {
 
 ## Compile-time Field Tracking
 
-Using `build_runner`, Luxo resolves the types in your Dart source code at build
-time and generates `$select` hints for the client in `lib/src/luxo/client.dart`:
-
-```yaml
-# build.yaml
-targets:
-  $default:
-    builders:
-      luxo_client|select_hints:
-        enabled: true
-```
+Luxo resolves Dart types and injects selections into individual call sites in an
+isolated project snapshot. Your original source files are not modified. The
+default generated client location is `lib/src/luxo/client.dart`.
 
 ```bash
-dart run build_runner build
+dart run luxo_client:build --entry bin/main.dart
 ```
+
+Export a native AOT executable from the same call-site-transformed snapshot:
+
+```bash
+dart run luxo_client:build --entry bin/main.dart --compile exe --output .tmp/release/app
+```
+
+The output is project-relative, must not already exist, and is published only
+after compilation succeeds. The temporary source snapshot is removed; the
+executable remains runnable and the original business source is unchanged.
+This is Dart native AOT, not Flutter packaging or cross-compilation.
 
 Your code, for an API with an `Int` parameter named `id`:
 
@@ -365,21 +384,40 @@ final user = await client.getUser(id: LuxoInt64.fromInt(1));
 print(user.name.value);
 ```
 
-Generated hint: `getUser → "name"`. The SDK sends an explicit selection; the
+This invocation receives `select: 'name'`. Another invocation of `getUser` that
+reads only `id` receives `select: 'id'`, not their union. The
 server combines it with fields required by business logic and associations.
 
 The analyzer follows local aliases, nested relations, null-aware access, list
 indexing/iteration, pagination items and inline collection/Future callbacks.
 `Selected.value`, collection helpers and pagination metadata are not schema
-fields. Fields read across files and `part` declarations are merged per API;
-same-named variables and other client libraries cannot contaminate the hints.
+fields. Selections belong to resolved invocations, not API-wide hint tables;
+same-named variables and other client libraries cannot contaminate them.
 Dart 3.13 primary-constructor fields are supported through resolved types.
 
 An explicit `select:` always takes precedence. This is static analysis, not
-whole-program tracing: opaque helper calls, dynamic dispatch and custom SDK
-output locations require explicit selections. Missing hints do not mean “all
-fields”; structured responses still require a valid selection. The build emits
-a constant map, with no runtime source analysis or tracing.
+whole-program tracing: opaque helper calls and dynamic result usage require an
+explicit selection. Custom SDK output locations use `--client lib/path/client.dart`.
+Unsafe or empty inference fails instead of selecting all fields. The old
+build_runner hint output is no longer consumed by generated clients.
+
+For Flutter tooling, the machine-protocol entry runs against the same isolated
+snapshot and refreshes selections before forwarding each `app.restart` command:
+
+```bash
+dart run luxo_client:flutter --flutter /path/to/flutter -- -d macos
+```
+
+This entry uses Flutter's JSON machine protocol, not interactive `r`/`R` keys.
+Invalid source rejects the restart without replacing the last valid snapshot;
+the running application can reload again after the source is corrected.
+Dart VM execution, macOS hot reload and macOS Release execution have been exercised
+with a generated client. Release verification includes per-call JSON/Binary selections
+and exact Int64 values against a real Go service and gateway. Use `app.stop` to end
+the machine-protocol application; input EOF is forwarded and owned snapshots are cleaned.
+IDE breakpoint mapping, artifact export/signing and other Flutter devices remain
+separate acceptance work, not completed production-readiness claims. Resolve
+dependencies in the original project first; the staged runner uses `--no-pub`.
 
 ## JSON parameter precision
 
@@ -434,7 +472,10 @@ null integer elements. Invalid parameters fail before sending with a
 `ConfigError` and a path such as `input.children[1].id`. Non-finite opaque JSON
 numbers still throw `FormatException`, not a misleading HTTP `NetworkError`.
 
-Registration snapshots mutable schema collections for both modes and compiles
+Registration validates API/parameter/field IDs and owns immutable metadata for
+both modes before replacing the schema. Invalid or duplicate IDs throw
+`FormatException`; failed registration preserves the previous schema and JSON
+plan. Shared field/type directories stay shared within each snapshot. It compiles
 only reachable input metadata. Changes take effect through `setSchema`, not by
 mutating a previously registered map. Recursive schemas use a work queue; input
 depth is bounded. Generated input objects are projected once, without reflection
@@ -451,7 +492,9 @@ WebSocket 调用和订阅在写入 JSON 时校验整数、可空列表和嵌套�
 发送前返回，包含 `input.children[1].id` 这样的路径。普通 JSON 中的非有限数仍报
 `FormatException`，不再误报 HTTP `NetworkError`。
 
-注册时保存两种传输共用的 Schema 快照并编译可达输入元数据；修改后须重新调用
+登记时检查API/参数/字段编号并保存两种传输共用的不可变元数据快照；非法或重复
+编号抛出`FormatException`，登记失败保留旧Schema与JSON参数计划。共享字段/type
+目录在快照内继续共享，只编译可达输入元数据。修改后须重新调用
 `setSchema`，不要依赖原 Map 的后续修改。递归 Schema 通过工作队列编译，输入
 深度有界；生成对象仅转换一次，无反射和额外 JSON 编解码往返。旧客户端缺少嵌套
 字段类型时需重新生成，传入这些字段会明确报错。未传参数及无 Schema 的手工
@@ -529,19 +572,37 @@ VM、JS、Wasm 统一检查数组 100 万元素、列式 1000 万行和 arena 64
 数据当作 0、false 或空数组成功返回。行内字段共用父游标，不逐字段要求整行结束。
 Enum 数组在 JSON/Binary 中均使用字符串元素；需重新生成客户端以获得这些修复。
 
-Named enum API results (for example, `TaskStatus`) also use `String` or
-`List<String>` for both calls and subscriptions, not model decoders or `$select`.
+Named enum declarations now generate a sealed type (for example, `TaskStatus`),
+`TaskStatusKnown` constants and `TaskStatusUnknown` values carrying `rawValue`.
+Use `TaskStatus.fromValue(text)` when reading application text; known members
+resolve to constants, while unknown text is preserved without becoming a known
+member. Calls, subscriptions, parameters and model fields use this type or its
+list form; scalar enum results still do not require `$select` or model decoders.
+Regenerate clients and replace raw string arguments with the generated values.
+Typed writers send `rawValue` with the unchanged string wire encoding; the server
+still rejects members absent from its own Schema. Generic JSON does not implicitly
+convert enum objects: explicitly pass `rawValue` when that is the intended data.
+Enum fields and parameters require `typeName` referencing a declared enum; API
+results require the concrete enum name, not bare `Enum`. Invalid or missing
+enum metadata fails generation before existing client files are overwritten.
 Minimal scalar-only, input-only, empty and internal-only schemas pass strict
 analysis without unused imports or selection helpers. Generated subscriptions
 validate complete scalar/list payloads before invoking `onData`; tests include
 truncation, trailing bytes, invalid Boolean/UTF-8/JSON and overflowing integers.
-Enum membership policy and generic JSON number representation are unchanged.
+Generic JSON number representation is unchanged.
 
-命名枚举 API 返回值（如 `TaskStatus`）在调用和订阅中也生成 `String` 或
-`List<String>`，不会误走模型解码或要求 `$select`。仅标量、仅输入类型、空 Schema
+命名枚举现生成 sealed 类型（如 `TaskStatus`）、已知常量 `TaskStatusKnown` 和
+携带 `rawValue` 的 `TaskStatusUnknown`。`TaskStatus.fromValue(text)` 将已知成员
+映射到常量，未知原文明确保留，不冒充已知值。调用、订阅、参数和模型字段使用该
+类型或其列表；需重新生成客户端并替换原来的字符串参数。线上仍编码为字符串，
+服务端仍拒绝自身 Schema 未声明的成员；通用 JSON 不会隐式转换枚举对象，如需
+原文应显式传入 `rawValue`。标量枚举不会误走模型解码或要求 `$select`。
+Enum字段和参数必须带有指向枚举声明的`typeName`，API返回值必须写具体枚举名，
+不能使用裸`Enum`。缺失或无效元数据在生成文件前报错，不覆盖已有客户端。
+仅标量、仅输入类型、空 Schema
 及仅内部 API 的最小项目均通过严格分析，不生成未使用的导入或字段选择辅助函数。
 生成的订阅在触发 `onData` 前完成标量/列表负载校验；回归包含截断、尾随字节、非法
-Boolean/UTF-8/JSON 和整数溢出。不改变枚举成员校验策略或通用 JSON 数值表示。
+Boolean/UTF-8/JSON 和整数溢出。通用 JSON 数值表示不变。
 
 Binary string fields preserve leading U+FEFF and literal U+FFFD in row,
 columnar, nullable, array and error-message paths. Malformed UTF-8 sets the

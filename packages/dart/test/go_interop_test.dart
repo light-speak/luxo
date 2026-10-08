@@ -21,6 +21,11 @@ void main() {
       () => _verifyConsumer(gateway),
       timeout: const Timeout(Duration(minutes: 5)),
     );
+    test(
+      'old Dart SDK preserves future enum members; gateway=$gateway',
+      () => _verifyEnumUpgradeConsumer(gateway),
+      timeout: const Timeout(Duration(minutes: 5)),
+    );
   }
   test(
     'gateway is closed when the Dart consumer fails',
@@ -100,8 +105,9 @@ Future<void> _verifyConsumer(bool gateway) async {
 }
 
 Future<void> _withBuiltFixture(
-  Future<void> Function(Directory, String) use,
-) async {
+  Future<void> Function(Directory, String) use, {
+  bool futureEnum = false,
+}) async {
   final core = Directory('../..').absolute;
   final root = Directory('${core.path}/.tmp')..createSync(recursive: true);
   final output = root.createTempSync('sdk-interop-');
@@ -111,6 +117,7 @@ Future<void> _withBuiltFixture(
       './tests/sdk-interop',
       '-out',
       output.path,
+      if (futureEnum) '-future-enum',
     ], cwd: core.path);
     final binary = '${output.path}/server';
     await _checked('go', ['build', '-o', binary, output.path], cwd: core.path);
@@ -118,6 +125,33 @@ Future<void> _withBuiltFixture(
   } finally {
     _removeOwnedDirectory(output, root);
   }
+}
+
+Future<void> _verifyEnumUpgradeConsumer(bool gateway) async {
+  await _withBuiltFixture((core, binary) async {
+    final root = Directory('.tmp')..createSync(recursive: true);
+    final generated = root.createTempSync('go-enum-upgrade-');
+    try {
+      await _withDeployment(binary, gateway, (endpoint) async {
+        await generate(
+          endpoint: endpoint,
+          key: 'sdk-interop',
+          outDir: generated.path,
+        );
+      });
+      final types = File('${generated.path}/types.dart');
+      final oldTypes = types.readAsStringSync();
+      await _withBuiltFixture((_, nextBinary) async {
+        await _withDeployment(nextBinary, gateway, (endpoint) async {
+          _writeConsumer(core, generated, endpoint, enumUpgrade: true);
+          await _verifyPlatforms(generated);
+        });
+      }, futureEnum: true);
+      expect(types.readAsStringSync(), oldTypes);
+    } finally {
+      _removeOwnedDirectory(generated, root);
+    }
+  });
 }
 
 void _removeOwnedDirectory(Directory directory, Directory root) {
@@ -175,7 +209,12 @@ Future<void> _withDeployment(
   );
 }
 
-void _writeConsumer(Directory core, Directory output, String endpoint) {
+void _writeConsumer(
+  Directory core,
+  Directory output,
+  String endpoint, {
+  bool enumUpgrade = false,
+}) {
   final fixture = jsonDecode(
     File('${core.path}/pkg/lux/codec/testdata/protocol-v1.json')
         .readAsStringSync(),
@@ -197,8 +236,7 @@ void _writeConsumer(Directory core, Directory output, String endpoint) {
   File('${output.path}/consumer_test.dart').writeAsStringSync(
     "import 'interop_cases.dart' as cases;\n"
     'void main() {\n'
-    '  cases.registerSuccessAndStreamTests();\n'
-    '  cases.registerErrorTests();\n'
+    '${enumUpgrade ? '  cases.registerEnumUpgradeTests();' : '  cases.registerSuccessAndStreamTests();\n  cases.registerErrorTests();'}\n'
     '}\n',
   );
 }

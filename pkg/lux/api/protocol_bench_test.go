@@ -12,7 +12,66 @@ import (
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
+	"github.com/light-speak/luxo/pkg/lux/schema"
 )
+
+// Compare actual schema conversion with and without a nullable envelope. This
+// measures the new feature's local cost, not HTTP/RPC or the previous release.
+func BenchmarkNullableRootJSON(b *testing.B) {
+	list := codec.AppendVarint(nil, 128)
+	for range 128 {
+		list = codec.AppendSvarint(list, 42)
+	}
+	for _, fixture := range []struct {
+		name, kind, want string
+		list             bool
+		data             []byte
+	}{
+		{"int", "Int", "42", false, []byte{84}},
+		{"zero", "Int", "0", false, []byte{0}},
+		{"false", "Boolean", "false", false, []byte{0}},
+		{"empty-text", "String", `""`, false, []byte{0}},
+		{"empty-list", "Int", "[]", true, []byte{0}},
+		{"list128", "Int", "[" + strings.TrimSuffix(strings.Repeat("42,", 128), ",") + "]", true, list},
+		{"object", "RootItem", `{"id":42}`, false, []byte{0, 1, 84, 0}},
+	} {
+		for _, mode := range []string{"plain", "present", "null"} {
+			b.Run(fixture.name+"/"+mode, func(b *testing.B) {
+				router := NewRouter()
+				if err := router.Schema.RegisterType(&schema.TypeDecl{Name: "RootItem", Fields: []schema.Field{
+					{ID: 1, Name: "id", Type: schema.FieldInt},
+				}}); err != nil {
+					b.Fatal(err)
+				}
+				if err := router.Schema.RegisterAPI(&schema.API{ID: 1, Name: "read", ReturnType: fixture.kind,
+					ReturnList: fixture.list, ReturnNullable: mode != "plain"}); err != nil {
+					b.Fatal(err)
+				}
+				data, want := fixture.data, fixture.want
+				if mode == "present" {
+					data = append([]byte{1}, data...)
+				} else if mode == "null" {
+					data, want = []byte{0}, "null"
+				}
+				benchmarkNullableRootJSON(b, router, data, want)
+			})
+		}
+	}
+}
+
+func benchmarkNullableRootJSON(b *testing.B, router *Router, data []byte, want string) {
+	got, err := router.convertBinaryToJSON("read", data)
+	if err != nil || string(got) != want {
+		b.Fatalf("invalid fixture: %s, %v; want %s", got, err, want)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		got, err = router.convertBinaryToJSON("read", data)
+	}
+	if err != nil || string(got) != want {
+		b.Fatalf("conversion changed result: %s, %v; want %s", got, err, want)
+	}
+}
 
 // Compare identical basic errors; detailed errors deliberately expose previously lost fields.
 // This excludes WebSocket I/O and never measures successful requests.

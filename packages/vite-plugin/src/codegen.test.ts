@@ -11,6 +11,52 @@ vi.mock('fs', () => ({
 
 import { generateTypes } from './codegen'
 
+it('uses static encoders by default for unary and stream transport entries', async () => {
+  const params = [{ id: 3, name: 'id', type: 'Int' }]
+  await generateTypes({ models: {}, apis: {
+    getUser: { id: 7, name: 'getUser', module: 'test', returnType: 'Int', params },
+    watchUser: { id: 8, name: 'watchUser', module: 'test', returnType: 'Int', stream: true, params },
+    ping: { id: 9, name: 'ping', module: 'test', returnType: 'Int' },
+  } }, 'static-candidate')
+  const client = outputs.get('static-candidate/client.ts') ?? ''
+  expect(client).toContain('GeneratedTransport as Transport')
+  expect(client).toContain("this.transport.callGenerated('getUser', $getUserRequest, params, options)")
+  expect(client).toContain("this.transport.callGenerated('ping', $pingRequest, undefined, options)")
+  expect(client).toContain("this.transport.subscribeGenerated('watchUser', $watchUserRequest, params,")
+  expect(client).not.toContain('new $')
+  expect(outputs.get('static-candidate/requests.ts')).not.toContain('constructor(')
+})
+
+it('generates dedicated requests for unary and streams instead of passing parameter records', async () => {
+  const params = [{ id: 3, name: 'id', type: 'Int' }]
+  await generateTypes({ models: {}, apis: {
+    getUser: { id: 7, name: 'getUser', module: 'test', returnType: 'Int', params },
+    watchUser: { id: 8, name: 'watchUser', module: 'test', returnType: 'Int', stream: true, params },
+  } }, 'static-requests', { staticRequests: false })
+  const client = outputs.get('static-requests/client.ts') ?? ''
+  const requests = outputs.get('static-requests/requests.ts') ?? ''
+  expect(client).toContain("this.transport.call('getUser', new $getUserRequest(params), options)")
+  expect(client).toContain("this.transport.subscribe('watchUser', new $watchUserRequest(params)")
+  expect(requests).toContain('extends GeneratedRequest')
+  expect(requests).toContain('enc.writeVarint(3)')
+  expect(requests).toContain('enc.writeSvarint(value)')
+  expect(requests).not.toContain('encodeParam(')
+  expect(requests).not.toContain('Object.entries(')
+})
+
+it('excludes explicit internal routes independently of their names', async () => {
+  const apis = {
+    ping: { id: 1, name: 'ping', module: 'test', returnType: 'Int', internal: false },
+    privateOperation: { id: 2, name: 'privateOperation', module: 'test', returnType: 'Int', internal: true },
+  }
+  await generateTypes({ models: {}, apis }, 'internal-routes')
+  for (const name of ['client.ts', 'schema.ts']) {
+    const source = outputs.get(`internal-routes/${name}`) ?? ''
+    expect(source).toContain('ping')
+    expect(source).not.toContain('privateOperation')
+  }
+})
+
 const schema: LuxoSchema = {
   models: {
     Node: {
@@ -84,6 +130,68 @@ const schema: LuxoSchema = {
 
 beforeEach(() => outputs.clear())
 
+describe('stable Schema numbering', () => {
+  for (const target of ['model', 'type', 'api', 'param'] as const) {
+    const limit = target === 'api' ? 2147483647 : target === 'param' ? 2147483645 : 65535
+    for (const id of [0, -1, 1.5, NaN, Infinity, limit + 1, Number.MAX_SAFE_INTEGER]) {
+      it(`rejects ${target} ID ${id} before writing files`, async () => {
+        const fixture = structuredClone(schema)
+        const entry = target === 'model' ? fixture.models.Node.fields[0]
+          : target === 'type' ? fixture.types!.MetricPoint.fields[0]
+          : target === 'api' ? fixture.apis.getMetricTimeSeries
+          : fixture.apis.getMetricTimeSeries.params![0]
+        entry.id = id
+        outputs.set('invalid/types.ts', 'existing client')
+        await expect(generateTypes(fixture, 'invalid')).rejects.toThrow(/ID/)
+        expect([...outputs]).toEqual([['invalid/types.ts', 'existing client']])
+      })
+    }
+    it(`rejects missing ${target} ID`, async () => {
+      const fixture = structuredClone(schema)
+      const entry = target === 'model' ? fixture.models.Node.fields[0]
+        : target === 'type' ? fixture.types!.MetricPoint.fields[0]
+        : target === 'api' ? fixture.apis.getMetricTimeSeries
+        : fixture.apis.getMetricTimeSeries.params![0]
+      delete (entry as { id?: number }).id
+      await expect(generateTypes(fixture, 'invalid')).rejects.toThrow(/ID/)
+      expect(outputs.size).toBe(0)
+    })
+  }
+
+  it('rejects duplicate numbers in each namespace', async () => {
+    for (const target of ['model', 'type', 'api', 'param'] as const) {
+      const fixture = structuredClone(schema)
+      if (target === 'model') fixture.models.Node.fields.push({ id: 1, name: 'other', type: 'Int' })
+      if (target === 'type') fixture.types!.MetricPoint.fields[1].id = 1
+      if (target === 'api') fixture.apis.listNodes.id = fixture.apis.getMetricTimeSeries.id
+      if (target === 'param') fixture.apis.getMetricTimeSeries.params![1].id = 1
+      await expect(generateTypes(fixture, 'invalid')).rejects.toThrow(/duplicate.*ID/)
+      expect(outputs.size).toBe(0)
+    }
+  })
+
+  it('preserves legal sparse maxima and independent parameter namespaces', async () => {
+    const fixture = structuredClone(schema)
+    fixture.models.Node.fields[0].id = 65535
+    fixture.types!.MetricPoint.fields[0].id = 65535
+    fixture.apis.getMetricTimeSeries.id = 2147483647
+    fixture.apis.getMetricTimeSeries.params![0].id = 2147483645
+    fixture.apis.listNodes.params = [{ id: 2147483645, name: 'cursor', type: 'Int' }]
+    await generateTypes(fixture, 'valid')
+    expect(outputs.get('valid/schema.ts')).toContain('2147483647')
+    expect(outputs.get('valid/schema.ts')).toContain('2147483645')
+    expect(outputs.get('valid/schema.ts')).toContain('65535')
+  })
+
+  it('validates internal routes before excluding them from public code', async () => {
+    const fixture = structuredClone(schema)
+    fixture.apis.getMetricTimeSeries.internal = true
+    fixture.apis.getMetricTimeSeries.id = 0
+    await expect(generateTypes(fixture, 'invalid')).rejects.toThrow(/ID/)
+    expect(outputs.size).toBe(0)
+  })
+})
+
 describe('generateTypes', () => {
 	it('keeps nullable array markers outside columnar array cells', async () => {
 		await generateTypes({ models: { ArrayRecord: {
@@ -151,7 +259,7 @@ describe('generateTypes', () => {
     expect(client).toContain('async createSnapshot<Select extends string | undefined = undefined>(params?: { $select?: Select }, options?: CallOptions)')
     expect(client).not.toContain('async createSnapshot(input:')
     expect(client).toContain('projectId: bigint; apiName: string | null; tags?: string[]; input: CreateNodeInput; $select?: Select')
-    expect(client).toContain("this.transport.call('getMetricTimeSeries', params, options)")
+    expect(client).toContain("this.transport.callGenerated('getMetricTimeSeries', $getMetricTimeSeriesRequest, params, options)")
     expect(apiSchema).toContain("name: 'tags', type: 'String', isList: true")
 		expect(apiSchema).toContain("name: 'apiName', type: 'String', nullable: true")
 		expect(apiSchema).toContain("name: 'input', type: 'Model', typeName: 'CreateNodeInput'")
@@ -233,6 +341,11 @@ describe('generateTypes', () => {
     expect(types).toContain('role: true extends Selection ? Selected<Role> : Role')
     expect(types).toContain("Object.prototype.hasOwnProperty.call(data, 'role')")
     expect(types).not.toContain("'' as Role")
+    expect(types).toContain("UnknownEnumValue<'Role'>")
+    expect(types).toContain('export function decodeEnum$Role')
+    expect(types).toContain('decodeEnum$Role(stringFromJSON(')
+    expect(types).toContain('decodeEnum$Role(dec.readString())')
+    expect(types).toContain('decodeEnum$Role(_role[i]')
   })
 
   it('does not import an unused row decoder for list returns', async () => {
@@ -384,7 +497,7 @@ describe('stream client generation', () => {
     expect(client).toContain('subscribeSystemReady<Select extends string | undefined = undefined>(params: { $select?: Select }, onData: (data: Alert<Select extends string ? true : false>) => void, observer?: StreamObserver): Promise<() => void>')
     expect(client).toContain('}, onData, observer)')
     expect(client).not.toContain('return onData(')
-    expect(client).toContain("this.transport.subscribe('liveAlerts', params ?? {}")
+    expect(client).toContain("this.transport.subscribeGenerated('liveAlerts', $liveAlertsRequest, params,")
     expect(client).not.toContain('async liveAlerts(')
   })
 })

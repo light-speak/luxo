@@ -121,6 +121,21 @@ func releaseRawJSONArrayDecoder(reader *rawJSONArrayDecoder) {
 	rawJSONArrayDecoders.Put(reader)
 }
 
+// Already-separated documents need no interface slice or JSON round trip.
+func encodeJSONDocuments(enc *codec.Encoder, meta ParamMeta, documents []json.RawMessage) error {
+	if len(documents) > codec.MaxArrayElements {
+		return fmt.Errorf("param %s: array size exceeds limit %d", meta.Name, codec.MaxArrayElements)
+	}
+	enc.WriteArrayHeader(len(documents))
+	for index, document := range documents {
+		if !jsonutil.ValidUTF8JSON(document) {
+			return fmt.Errorf("param %s[%d]: invalid JSON", meta.Name, index)
+		}
+		enc.WriteBytes(document)
+	}
+	return nil
+}
+
 // Preserve opaque JSON tokens while requiring valid Unicode in keys and values.
 // No numeric conversion, reflection, or per-element JSON marshaling is needed.
 func encodeRawJSONArray(enc *codec.Encoder, meta ParamMeta, raw []byte) error {

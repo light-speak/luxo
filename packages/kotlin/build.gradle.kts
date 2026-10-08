@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "com.luxo"
-version = "0.1.0"
+version = file("../../VERSION").readText().trim()
 
 base {
     archivesName.set("luxo-client")
@@ -41,6 +41,12 @@ publishing {
 
 val luxoAnalyzerRuntime = configurations.create("luxoAnalyzerRuntime")
 
+tasks.processResources {
+    val version = libs.versions.kotlin.get()
+    inputs.property("kotlinVersion", version)
+    filesMatching("com/luxo/client/compiler/tooling.properties") { expand("kotlinVersion" to version) }
+}
+
 dependencies {
     api("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
@@ -58,6 +64,37 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    dependsOn(tasks.jar)
+    doFirst {
+        systemProperty("luxo.testRuntimeClasspath", sourceSets["test"].runtimeClasspath.asPath)
+        systemProperty("luxo.testPluginJar", tasks.jar.get().archiveFile.get().asFile.absolutePath)
+    }
+}
+
+tasks.register<JavaExec>("benchmarkNullableRoots") {
+    group = "verification"
+    description = "Compile real generated nullable readers and measure isolated JVMs"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.luxo.client.NullableRootBenchmark")
+    args(providers.gradleProperty("luxo.nullableMode").orElse("measure").get())
+    providers.gradleProperty("luxo.nullableBaseline").orNull?.let { args(file(it).absolutePath) }
+}
+
+tasks.register<JavaExec>("benchmarkResponsePresence") {
+    group = "verification"
+    description = "Measure HTTP/WS response presence using one transport implementation per JVM"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.luxo.client.ResponsePresenceBenchmark")
+    jvmArgs("-Xms512m", "-Xmx512m")
+}
+
+tasks.register<JavaExec>("benchmarkSchemaRegistration") {
+    group = "verification"
+    description = "Compare validated schema snapshots with borrowed metadata registration"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.luxo.client.SchemaRegistrationBenchmark")
+    jvmArgs("-Xms512m", "-Xmx512m")
+    args(providers.gradleProperty("luxo.schemaParams").orElse("1").get())
 }
 
 tasks.register<JavaExec>("benchmarkWebSocketIDs") {
@@ -151,6 +188,8 @@ tasks.register<JavaExec>("benchmarkCodecMetadata") {
     description = "Compare bounded metadata decoding with frozen pre-bounds readers"
     classpath = sourceSets["test"].runtimeClasspath
     mainClass.set("com.luxo.client.CodecMetadataBenchmark")
+    jvmArgs("-Xms512m", "-Xmx512m")
+    providers.gradleProperty("luxo.codecBenchmark").orNull?.let { args(it) }
 }
 
 tasks.register<JavaExec>("benchmarkUUID") {

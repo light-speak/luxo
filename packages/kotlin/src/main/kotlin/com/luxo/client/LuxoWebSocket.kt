@@ -76,19 +76,25 @@ class LuxoWebSocket(
         requestIdCounter.set(initialSequence.toLong())
     }
 
-    override fun setSchema(schema: Map<String, APISchemaEntry>) { currentSchema = schema }
+    override fun setSchema(schema: Map<String, APISchemaEntry>) { currentSchema = snapshotAPISchema(schema) }
     override fun setMode(mode: TransportMode) { currentMode = mode }
     override fun setToken(token: String) { currentToken = token }
 
-    override suspend fun call(api: String, params: Map<String, Any?>): Any {
+    override suspend fun call(api: String, params: Map<String, Any?>): Any = callRequest(api, params, null)
+
+    override suspend fun call(api: String, request: GeneratedRequest): Any = callRequest(api, emptyMap(), request)
+
+    private suspend fun callRequest(api: String, params: Map<String, Any?>, generated: GeneratedRequest?): Any {
         awaitConnection()
         val id = nextWebSocketRequestID(requestIdCounter)
         val message: Any = if (currentMode == TransportMode.BINARY) {
             val meta = requireSchema(api)
-            LuxoBinaryProtocol.callFrame(id, LuxoBinaryProtocol.encodeRequest(meta, params))
+            val body = if (generated == null) LuxoBinaryProtocol.encodeRequest(meta, params)
+                else LuxoBinaryProtocol.encodeRequest(meta, generated)
+            LuxoBinaryProtocol.callFrame(id, body)
         } else {
             encodeLuxoJSON(buildJsonObject {
-                putLuxoParams(params, currentSchema[api])
+                putLuxoParams(generated?.toJSONParameters() ?: params, currentSchema[api])
                 put("\$id", webSocketJSONID(id))
                 put("\$api", api)
             })
@@ -248,14 +254,29 @@ class LuxoWebSocket(
         val stream = json["\$stream"]
         if (stream != null) {
             val id = webSocketJSONRequestID(stream) ?: return
-            deliver(id, TransportMode.JSON, json["data"] ?: JsonNull)
+            val data = json["data"]
+            if (data != null) deliver(id, TransportMode.JSON, data)
+            else {
+                val subscription = subscriptions[id]
+                if (subscription?.mode == TransportMode.JSON && subscription.acknowledgement == null) {
+                    failSubscriptionPayload(id, subscription, LuxoError("ParseError", 0, "missing JSON response data"))
+                }
+            }
             return
         }
+        handleJsonCall(json)
+    }
+
+    private fun handleJsonCall(json: JsonObject) {
         val id = webSocketJSONRequestID(json["\$id"]) ?: return
         val deferred = pendingCalls.remove(id) ?: return
         val error = decodeLuxoJsonError(json, 0)
-        if (error == null) deferred.complete(json["data"] ?: JsonNull)
-        else deferred.completeExceptionally(error)
+        if (error != null) deferred.completeExceptionally(error)
+        else {
+            val data = json["data"]
+            if (data != null) deferred.complete(data)
+            else deferred.completeExceptionally(LuxoError("ParseError", 0, "missing JSON response data"))
+        }
     }
 
     private fun handleBinaryMessage(bytes: ByteArray) {
@@ -304,12 +325,16 @@ class LuxoWebSocket(
     }
 
     private fun failDecoding(id: Long, subscription: Subscription<*>, cause: Exception) {
+        failSubscriptionPayload(id, subscription, LuxoError("DecodeError", 0, cause.message ?: "invalid subscription payload"))
+    }
+
+    private fun failSubscriptionPayload(id: Long, subscription: Subscription<*>, error: LuxoError) {
         synchronized(connectionLock) {
             if (!subscriptions.remove(id, subscription)) return
             // Remote cancellation is advisory; a failed write must not restore local state.
             try { sendCancellation(id, subscription.mode) } catch (_: Exception) { }
         }
-        subscription.observer?.onError?.invoke(LuxoError("DecodeError", 0, cause.message ?: "invalid subscription payload"))
+        subscription.observer?.onError?.invoke(error)
     }
 
     override suspend fun <T> subscribe(
@@ -318,6 +343,16 @@ class LuxoWebSocket(
         params: Map<String, Any?>,
         observer: StreamObserver?,
         handler: (T) -> Unit,
+    ): () -> Unit = subscribeRequest(api, decoder, params, observer, handler, null)
+
+    override suspend fun <T> subscribe(
+        api: String, decoder: (Any) -> T, request: GeneratedRequest,
+        observer: StreamObserver?, handler: (T) -> Unit,
+    ): () -> Unit = subscribeRequest(api, decoder, emptyMap(), observer, handler, request)
+
+    private suspend fun <T> subscribeRequest(
+        api: String, decoder: (Any) -> T, params: Map<String, Any?>,
+        observer: StreamObserver?, handler: (T) -> Unit, generated: GeneratedRequest?,
     ): () -> Unit {
         awaitConnection()
         val acknowledgement = CompletableDeferred<() -> Unit>()
@@ -325,7 +360,7 @@ class LuxoWebSocket(
             if (closed || !connected) throw LuxoError("ConnectionError", 0, "WebSocket is not connected")
             val id = nextWebSocketRequestID(requestIdCounter)
             val mode = currentMode
-            val message = subscriptionMessage(id, api, params, mode)
+            val message = subscriptionMessage(id, api, params, mode, generated)
             val subscription = Subscription(mode, decoder, handler, observer, acknowledgement)
             subscriptions[id] = subscription
             try {
@@ -379,12 +414,15 @@ class LuxoWebSocket(
         else subscription.observer?.onComplete?.invoke()
     }
 
-    private fun subscriptionMessage(id: Long, api: String, params: Map<String, Any?>, mode: TransportMode): Any {
+    private fun subscriptionMessage(id: Long, api: String, params: Map<String, Any?>, mode: TransportMode, generated: GeneratedRequest?): Any {
         if (mode == TransportMode.BINARY) {
-            return LuxoBinaryProtocol.subscribeFrame(id, LuxoBinaryProtocol.encodeRequest(requireSchema(api), params)).toByteString()
+            val meta = requireSchema(api)
+            val body = if (generated == null) LuxoBinaryProtocol.encodeRequest(meta, params)
+                else LuxoBinaryProtocol.encodeRequest(meta, generated)
+            return LuxoBinaryProtocol.subscribeFrame(id, body).toByteString()
         }
         return encodeLuxoJSON(buildJsonObject {
-            putLuxoParams(params, currentSchema[api])
+            putLuxoParams(generated?.toJSONParameters() ?: params, currentSchema[api])
             put("\$id", webSocketJSONID(id))
             put("\$sub", api)
         })

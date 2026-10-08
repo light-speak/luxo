@@ -21,6 +21,90 @@ func TestMerge_NoExtends(t *testing.T) {
 	}
 }
 
+func TestAppendMergedDestination(t *testing.T) {
+	for _, columnar := range []bool{false, true} {
+		for _, primary := range [][]byte{nil, {0, 1, 84}, {0, 1, 84, 0}} {
+			for _, body := range [][]byte{nil, {4, 0, 1, 2, 0}} {
+				checkAppendMergedDestination(t, columnar, primary, body)
+			}
+		}
+	}
+}
+
+func checkAppendMergedDestination(t *testing.T, columnar bool, primary, body []byte) {
+	t.Helper()
+	beforePrimary, beforeBody := bytes.Clone(primary), bytes.Clone(body)
+	row := []ExtendResult{{FieldID: 300, Data: body}}
+	columns := []ExtendColumnResult{{FieldID: 300, Blobs: [][]byte{body}}}
+	want := Merge(primary, row)
+	if columnar {
+		want = MergeColumnar(primary, columns)
+	}
+	dst := make([]byte, 2, len(want)+2)
+	dst[0], dst[1] = 0xaa, 0xbb
+	start := &dst[0]
+	var got []byte
+	if columnar {
+		got = AppendMergedColumnar(dst, primary, columns)
+	} else {
+		got = AppendMerged(dst, primary, row)
+	}
+	if len(got) < 2 || got[0] != 0xaa || got[1] != 0xbb || !bytes.Equal(got[2:], want) {
+		t.Fatalf("columnar=%v: append changed prefix or wire: %x, want %x", columnar, got, want)
+	}
+	if &got[0] != start {
+		t.Fatal("sufficient destination capacity was not reused")
+	}
+	if !bytes.Equal(primary, beforePrimary) || !bytes.Equal(body, beforeBody) {
+		t.Fatal("merge modified borrowed source buffers")
+	}
+}
+
+func TestAppendMergedNoExtends(t *testing.T) {
+	for _, primary := range [][]byte{nil, {0, 1, 84, 0}} {
+		for _, columnar := range []bool{false, true} {
+			dst := []byte{0xaa}
+			want := append(bytes.Clone(dst), primary...)
+			var got []byte
+			if columnar {
+				got = AppendMergedColumnar(dst, primary, nil)
+			} else {
+				got = AppendMerged(dst, primary, nil)
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("columnar=%v: got %x, want %x", columnar, got, want)
+			}
+		}
+	}
+}
+
+func TestAppendMergedOwnedBufferAllocations(t *testing.T) {
+	primary := []byte{0, 1, 84, 0}
+	child := []byte{4, 0, 1, 2, 0}
+	row := []ExtendResult{{FieldID: 300, Data: child}}
+	columns := []ExtendColumnResult{{FieldID: 300, Blobs: [][]byte{child}}}
+	storage := make([]byte, 0, 64)
+	for _, columnar := range []bool{false, true} {
+		var result []byte
+		allocations := testing.AllocsPerRun(100, func() {
+			if columnar {
+				result = AppendMergedColumnar(storage[:0], primary, columns)
+			} else {
+				result = AppendMerged(storage[:0], primary, row)
+			}
+		})
+		if allocations != 0 || len(result) == 0 {
+			t.Fatalf("columnar=%v: %g allocations with reusable output", columnar, allocations)
+		}
+		owned := bytes.Clone(result)
+		primary[2]++
+		child[3]++
+		if !bytes.Equal(result, owned) {
+			t.Fatal("output retained borrowed message storage")
+		}
+	}
+}
+
 func TestMerge_WithExtend(t *testing.T) {
 	// Primary: [arenaHeader=0] [field1=42] [0x00 end]
 	var primary []byte
@@ -743,6 +827,7 @@ func TestSchemaFieldToSkipType_AllTypes(t *testing.T) {
 		{schema.Field{Type: schema.FieldDuration}, codec.SkipVarint},
 		{schema.Field{Type: schema.FieldBool}, codec.SkipVarint},
 		{schema.Field{Type: schema.FieldFloat}, codec.SkipFixed64},
+		{schema.Field{Type: schema.FieldUUID}, codec.SkipFixed16},
 		{schema.Field{Type: schema.FieldString}, codec.SkipString},
 		{schema.Field{Type: schema.FieldEnum}, codec.SkipString},
 		{schema.Field{Type: schema.FieldDecimal}, codec.SkipString},
@@ -751,6 +836,7 @@ func TestSchemaFieldToSkipType_AllTypes(t *testing.T) {
 		// Nullable
 		{schema.Field{Type: schema.FieldInt, Nullable: true}, codec.SkipNullVarint},
 		{schema.Field{Type: schema.FieldFloat, Nullable: true}, codec.SkipNullFixed64},
+		{schema.Field{Type: schema.FieldUUID, Nullable: true}, codec.SkipNullFixed16},
 		{schema.Field{Type: schema.FieldString, Nullable: true}, codec.SkipNullString},
 		{schema.Field{Type: schema.FieldDecimal, Nullable: true}, codec.SkipNullString},
 		{schema.Field{Type: schema.FieldBool, Nullable: true}, codec.SkipNullVarint},

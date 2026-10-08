@@ -1,14 +1,10 @@
 import { LuxoClient } from './client.js'
 import { decodeJSONMetric, decodeJSONTextValues } from './types.js'
 import { encodeLuxoJSON } from '@luxojs/client'
-import type { Transport } from '@luxojs/client'
+import { responseTransport } from './response-transport.js'
 
 let response: unknown
-const transport: Transport = {
-  async call() { return response },
-  async subscribe(_api, _params, decode, onData) { onData(decode(response)); return () => {} },
-  setSchema() {}, setMode() {}, setToken() {},
-}
+const transport = responseTransport(() => response)
 const client = new LuxoClient(transport)
 const failures: string[] = []
 

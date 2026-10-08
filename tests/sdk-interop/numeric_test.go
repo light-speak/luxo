@@ -116,13 +116,14 @@ func verifyNumericFixtureResponse(t *testing.T, status int, body []byte, shape n
 	var response struct {
 		Data           json.RawMessage
 		Error, TraceID string
+		Cause          json.RawMessage
 		Code           int
 	}
 	if err := json.Unmarshal(body, &response); err != nil {
 		t.Fatal(err)
 	}
 	if want == nil {
-		if status != http.StatusBadRequest || response.Error != "BadRequest" || response.Code != 400 || response.TraceID == "" || len(response.Data) != 0 {
+		if status != http.StatusBadRequest || response.Error != "BadRequest" || response.Code != 400 || response.TraceID == "" || len(response.Cause) != 0 || !numericFixtureErrorDataValid(response.Data, shape.name) {
 			t.Fatalf("invalid numeric input did not produce a clean BadRequest: %d %s", status, body)
 		}
 		return
@@ -145,6 +146,55 @@ func verifyNumericFixtureResponse(t *testing.T, status int, body []byte, shape n
 		if err != nil || fmt.Sprintf("%016x", math.Float64bits(value)) != *want {
 			t.Fatalf("Float = %s (bits %016x), want bits %s: %v", raw, math.Float64bits(value), *want, err)
 		}
+	}
+}
+
+// Error diagnostics are not a partial successful result. Gateway validation may
+// omit data; local generated handlers identify the rejected parameter explicitly.
+func numericFixtureErrorDataValid(data json.RawMessage, shape string) bool {
+	if len(data) == 0 {
+		return true
+	}
+	var fields map[string]string
+	if err := json.Unmarshal(data, &fields); err != nil || len(fields) != 2 || fields["error"] == "" {
+		return false
+	}
+	parameter := "value"
+	switch shape {
+	case "IntList":
+		parameter = "values"
+	case "IntObject", "IntObjects", "FloatObject", "FloatObjects":
+		parameter = "input"
+	}
+	return fields["param"] == parameter
+}
+
+func TestNumericFixtureErrorDataContract(t *testing.T) {
+	for _, tc := range []struct {
+		shape, data string
+		valid       bool
+	}{
+		{"Int", "", true},
+		{"Int", `{"param":"value","error":"must be an integer"}`, true},
+		{"IntList", `{"param":"values","error":"invalid integer"}`, true},
+		{"FloatList", `{"param":"value","error":"invalid number"}`, true},
+		{"IntObjects", `{"param":"input","error":"invalid integer"}`, true},
+		{"FloatObject", `{"param":"input","error":"invalid number"}`, true},
+		{"Int", `42`, false},
+		{"IntList", `[1]`, false},
+		{"Int", `null`, false},
+		{"Int", `{}`, false},
+		{"Int", `{"param":"other","error":"invalid"}`, false},
+		{"Int", `{"param":"value","error":""}`, false},
+		{"Int", `{"param":"value","error":"invalid","value":"42"}`, false},
+		{"Int", `{"param":"value","error":42}`, false},
+		{"Int", `{"param":"value","error":"invalid"} true`, false},
+	} {
+		t.Run(tc.shape+"/"+tc.data, func(t *testing.T) {
+			if got := numericFixtureErrorDataValid(json.RawMessage(tc.data), tc.shape); got != tc.valid {
+				t.Fatalf("valid = %t, want %t", got, tc.valid)
+			}
+		})
 	}
 }
 

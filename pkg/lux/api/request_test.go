@@ -119,7 +119,7 @@ func TestParamIsNullJSONMode(t *testing.T) {
 	}
 }
 
-func TestAssignBinaryNativeParams(t *testing.T) {
+func TestLegacyAssignBinaryNativeParams(t *testing.T) {
 	instant := time.Date(2026, 9, 4, 1, 2, 3, 0, time.UTC)
 	id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440000")
 	duration := 3 * time.Second
@@ -152,7 +152,7 @@ func TestAssignBinaryNativeParams(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if !assignBinaryNativeParam(test.value, test.target) {
+			if !legacyAssignBinaryNativeParam(test.value, test.target) {
 				t.Fatalf("%s was not assigned", test.name)
 			}
 		})
@@ -169,12 +169,12 @@ func TestAssignBinaryNativeParams(t *testing.T) {
 	if !gotDecimal.Equal(amount) || gotDecimalPtr == nil || !gotDecimalPtr.Equal(amount) {
 		t.Fatal("decimal assignment failed")
 	}
-	if assignBinaryNativeParam("wrong", &gotTime) {
+	if legacyAssignBinaryNativeParam("wrong", &gotTime) {
 		t.Fatal("mismatched native value was assigned")
 	}
 }
 
-func TestAssignBinarySliceParams(t *testing.T) {
+func TestLegacyAssignBinarySliceParams(t *testing.T) {
 	instant := time.Date(2026, 9, 4, 1, 2, 3, 0, time.UTC)
 	id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440000")
 	amount := decimal.RequireFromString("12.50")
@@ -197,7 +197,7 @@ func TestAssignBinarySliceParams(t *testing.T) {
 	}
 	for _, test := range values {
 		t.Run(test.name, func(t *testing.T) {
-			if !assignBinarySliceParam(test.value, test.target) {
+			if !legacyAssignBinarySliceParam(test.value, test.target) {
 				t.Fatalf("%s was not assigned", test.name)
 			}
 			if !reflect.DeepEqual(reflect.ValueOf(test.target).Elem().Interface(), test.value) {
@@ -206,7 +206,7 @@ func TestAssignBinarySliceParams(t *testing.T) {
 		})
 	}
 	var integers []int64
-	if assignBinarySliceParam([]string{"wrong"}, &integers) || assignBinarySliceParam(1, new(struct{})) {
+	if legacyAssignBinarySliceParam([]string{"wrong"}, &integers) || legacyAssignBinarySliceParam(1, new(struct{})) {
 		t.Fatal("mismatched slice value was assigned")
 	}
 }
@@ -314,8 +314,7 @@ func TestParamMissing(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing param")
 	}
-	var target struct{ X int }
-	err = req.ParamJSON("obj", &target)
+	_, _, err = req.ParamMessage("obj", false, false)
 	if err == nil {
 		t.Fatal("expected error for missing param")
 	}
@@ -405,13 +404,13 @@ func TestParamDateTimeWrongType(t *testing.T) {
 	}
 }
 
-func TestParamJSON(t *testing.T) {
+func TestLegacyParamJSON(t *testing.T) {
 	req, _ := ParseRequest(makeReq(`{"$api":"test","input":{"name":"lin","age":30}}`))
 	var target struct {
 		Name string `json:"name"`
 		Age  int    `json:"age"`
 	}
-	if err := req.ParamJSON("input", &target); err != nil {
+	if err := req.LegacyParamJSON("input", &target); err != nil {
 		t.Fatal(err)
 	}
 	if target.Name != "lin" || target.Age != 30 {
@@ -419,7 +418,7 @@ func TestParamJSON(t *testing.T) {
 	}
 }
 
-func TestParamJSONDecodesStructuredBinaryJSON(t *testing.T) {
+func TestLegacyParamJSONDecodesStructuredBinaryJSON(t *testing.T) {
 	type input struct {
 		Name string `json:"name"`
 	}
@@ -429,7 +428,7 @@ func TestParamJSONDecodesStructuredBinaryJSON(t *testing.T) {
 		paramSlots: [16]any{json.RawMessage(`{"name":"luxo"}`)},
 	}
 	var got input
-	if err := req.ParamJSON("input", &got); err != nil {
+	if err := req.LegacyParamJSON("input", &got); err != nil {
 		t.Fatal(err)
 	}
 	if got.Name != "luxo" {
@@ -437,7 +436,7 @@ func TestParamJSONDecodesStructuredBinaryJSON(t *testing.T) {
 	}
 }
 
-func TestParamJSONAssignsNativeBinaryTypes(t *testing.T) {
+func TestLegacyParamJSONAssignsNativeBinaryTypes(t *testing.T) {
 	wantTime := time.Unix(1_700_000_000, 0).UTC()
 	wantUUID := uuid.MustParse("550e8400-e29b-41d4-a716-446655440000")
 	req := &Request{
@@ -447,10 +446,10 @@ func TestParamJSONAssignsNativeBinaryTypes(t *testing.T) {
 	}
 	var gotTime time.Time
 	var gotUUID uuid.UUID
-	if err := req.ParamJSON("at", &gotTime); err != nil {
+	if err := req.LegacyParamJSON("at", &gotTime); err != nil {
 		t.Fatal(err)
 	}
-	if err := req.ParamJSON("id", &gotUUID); err != nil {
+	if err := req.LegacyParamJSON("id", &gotUUID); err != nil {
 		t.Fatal(err)
 	}
 	if !gotTime.Equal(wantTime) || gotUUID != wantUUID {
@@ -458,11 +457,11 @@ func TestParamJSONAssignsNativeBinaryTypes(t *testing.T) {
 	}
 }
 
-func TestParamJSONOptionalMissing(t *testing.T) {
+func TestLegacyParamJSONOptionalMissing(t *testing.T) {
 	req, _ := ParseRequest(makeReq(`{"$api":"test"}`))
 
 	var s *string
-	if err := req.ParamJSONOptional("name", &s); err != nil {
+	if err := req.LegacyParamJSONOptional("name", &s); err != nil {
 		t.Fatalf("missing nullable string param should not error: %v", err)
 	}
 	if s != nil {
@@ -470,31 +469,31 @@ func TestParamJSONOptionalMissing(t *testing.T) {
 	}
 
 	var i *int64
-	if err := req.ParamJSONOptional("count", &i); err != nil {
+	if err := req.LegacyParamJSONOptional("count", &i); err != nil {
 		t.Fatalf("missing nullable int param should not error: %v", err)
 	}
 	var f *float64
-	if err := req.ParamJSONOptional("ratio", &f); err != nil {
+	if err := req.LegacyParamJSONOptional("ratio", &f); err != nil {
 		t.Fatalf("missing nullable float param should not error: %v", err)
 	}
 	var b *bool
-	if err := req.ParamJSONOptional("flag", &b); err != nil {
+	if err := req.LegacyParamJSONOptional("flag", &b); err != nil {
 		t.Fatalf("missing nullable bool param should not error: %v", err)
 	}
 	var tm *time.Time
-	if err := req.ParamJSONOptional("at", &tm); err != nil {
+	if err := req.LegacyParamJSONOptional("at", &tm); err != nil {
 		t.Fatalf("missing nullable datetime param should not error: %v", err)
 	}
 	var d *time.Duration
-	if err := req.ParamJSONOptional("ttl", &d); err != nil {
+	if err := req.LegacyParamJSONOptional("ttl", &d); err != nil {
 		t.Fatalf("missing nullable duration param should not error: %v", err)
 	}
 }
 
-func TestParamJSONNullableNull(t *testing.T) {
+func TestLegacyParamJSONNullableNull(t *testing.T) {
 	req, _ := ParseRequest(makeReq(`{"$api":"test","name":null}`))
 	var s *string
-	if err := req.ParamJSONNullable("name", &s); err != nil {
+	if err := req.LegacyParamJSONNullable("name", &s); err != nil {
 		t.Fatalf("null nullable param should not error: %v", err)
 	}
 	if s != nil {
@@ -502,43 +501,43 @@ func TestParamJSONNullableNull(t *testing.T) {
 	}
 }
 
-func TestParamJSONNullableRequiresPresence(t *testing.T) {
+func TestLegacyParamJSONNullableRequiresPresence(t *testing.T) {
 	req, _ := ParseRequest(makeReq(`{"$api":"test"}`))
 	var value *string
-	if err := req.ParamJSONNullable("name", &value); err == nil {
+	if err := req.LegacyParamJSONNullable("name", &value); err == nil {
 		t.Fatal("required nullable param should reject absence")
 	}
 }
 
-func TestParamJSONRejectsNullForNonNullableTarget(t *testing.T) {
+func TestLegacyParamJSONRejectsNullForNonNullableTarget(t *testing.T) {
 	req, _ := ParseRequest(makeReq(`{"$api":"test","name":null}`))
 	var value string
-	if err := req.ParamJSON("name", &value); err == nil {
+	if err := req.LegacyParamJSON("name", &value); err == nil {
 		t.Fatal("required non-null param should reject null")
 	}
-	if err := req.ParamJSONOptional("name", &value); err == nil {
+	if err := req.LegacyParamJSONOptional("name", &value); err == nil {
 		t.Fatal("optional non-null param should reject explicit null")
 	}
 }
 
-func TestParamJSONRequiredStillMissing(t *testing.T) {
+func TestLegacyParamJSONRequiredStillMissing(t *testing.T) {
 	// Required custom-type params (single-pointer struct targets) must still
 	// report missing.
 	req, _ := ParseRequest(makeReq(`{"$api":"test"}`))
 	var target struct {
 		Name string `json:"name"`
 	}
-	if err := req.ParamJSON("input", &target); err == nil {
+	if err := req.LegacyParamJSON("input", &target); err == nil {
 		t.Fatal("missing required param should error")
 	}
 }
 
-func TestParamJSONWrongType(t *testing.T) {
+func TestLegacyParamJSONWrongType(t *testing.T) {
 	req, _ := ParseRequest(makeReq(`{"$api":"test","input":"not_object"}`))
 	var target struct {
 		Name string `json:"name"`
 	}
-	err := req.ParamJSON("input", &target)
+	err := req.LegacyParamJSON("input", &target)
 	if err == nil {
 		t.Fatal("expected error for string as struct")
 	}
@@ -1039,7 +1038,7 @@ func TestReadBodySizeLimit(t *testing.T) {
 
 // --- ParamJSON binary nil value ---
 
-func TestParamJSONBinaryNilValue(t *testing.T) {
+func TestLegacyParamJSONBinaryNilValue(t *testing.T) {
 	req := &Request{
 		paramNames: []string{"data"},
 		paramCount: 1,
@@ -1047,7 +1046,7 @@ func TestParamJSONBinaryNilValue(t *testing.T) {
 		paramNull:  1,
 	}
 	var v any
-	err := req.ParamJSONOptionalNullable("data", &v)
+	err := req.LegacyParamJSONOptionalNullable("data", &v)
 	if err != nil {
 		t.Fatal("nil param should not error (nullable)")
 	}
@@ -1055,21 +1054,21 @@ func TestParamJSONBinaryNilValue(t *testing.T) {
 
 type requestTestEnum string
 
-func TestParamJSONBinaryConvertsNamedAndByteTypes(t *testing.T) {
+func TestLegacyParamJSONBinaryConvertsNamedAndByteTypes(t *testing.T) {
 	req := &Request{
 		paramNames: []string{"roles", "payload"},
 		paramCount: 2,
 		paramSlots: [16]any{[]string{"ADMIN", "MEMBER"}, []byte{1, 2, 3}},
 	}
 	var roles []requestTestEnum
-	if err := req.ParamJSON("roles", &roles); err != nil {
+	if err := req.LegacyParamJSON("roles", &roles); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(roles, []requestTestEnum{"ADMIN", "MEMBER"}) {
 		t.Fatalf("roles = %#v", roles)
 	}
 	var payload []byte
-	if err := req.ParamJSON("payload", &payload); err != nil {
+	if err := req.LegacyParamJSON("payload", &payload); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(payload, []byte{1, 2, 3}) {

@@ -5,6 +5,53 @@ import {
   formatUUID, parseUUID, decodeScalarArray, unixSecondsToISO,
 } from './codec'
 
+describe('encoder buffer ownership transfer', () => {
+  it('writes typed delimited values without a capturing callback and rolls back failures', () => {
+    const encoder = new Encoder(1)
+    const input = new Uint8Array(130).fill(9)
+    encoder.writeVarint(7)
+    encoder.writeDelimitedValue(input, (target, value) => {
+      expect(value).toBe(input)
+      target.writeRawBytes(value)
+    })
+    const expected = new Encoder()
+    expected.writeVarint(7)
+    expected.writeBytes(input)
+    expect(encoder.bytes()).toEqual(expected.bytes())
+    const snapshot = encoder.bytes()
+    expect(() => encoder.writeDelimitedValue(42n, (target, value) => {
+      target.writeSvarint(value)
+      throw Error('writer failure')
+    })).toThrow('writer failure')
+    expect(encoder.bytes()).toEqual(snapshot)
+  })
+  it('does not retain a large unused backing buffer for a short response', () => {
+    const encoder = new Encoder(65536)
+    encoder.writeSvarint(1n)
+    const result = encoder.takeBytes()
+    expect([...result]).toEqual([2])
+    expect(result.buffer.byteLength).toBe(1)
+  })
+  it('returns only encoded bytes and isolates later writes and resets', () => {
+    const encoder = new Encoder(16)
+    encoder.writeSvarint(42n)
+    const first = encoder.takeBytes()
+    expect([...first]).toEqual([84])
+    expect(first.buffer.byteLength).toBe(16)
+    encoder.reset()
+    encoder.writeSvarint(99n)
+    const second = encoder.takeBytes()
+    expect([...first]).toEqual([84])
+    expect([...second]).toEqual([198, 1])
+    expect(first.buffer).not.toBe(second.buffer)
+    first[0] = 0
+    expect([...second]).toEqual([198, 1])
+    expect(encoder.takeBytes()).toHaveLength(0)
+    encoder.writeFixed64(1.25)
+    expect(new Decoder(encoder.takeBytes()).readFloat()).toBe(1.25)
+  })
+})
+
 describe('canonical UUID text', () => {
   const fixture = JSON.parse(readFileSync(new URL('../../../pkg/lux/codec/testdata/protocol-v1.json', import.meta.url), 'utf8')) as {
     uuidCanonicalCases: { input: string; canonical: string | null }[]
@@ -53,6 +100,21 @@ describe('structured response boundaries', () => {
 })
 
 describe('Encoder', () => {
+  it('preserves Float boundaries after small-buffer and large-buffer growth', () => {
+    const enc = new Encoder(1)
+    enc.writeVarint(42)
+    enc.writeRawBytes(new Uint8Array(4096))
+    enc.writeFixed64(-0)
+    enc.writeFixed64(Number.MIN_VALUE)
+    enc.writeRawBytes(new Uint8Array(16384))
+    enc.writeFixed64(Number.MAX_VALUE)
+    const bytes = enc.bytes()
+    const data = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    expect(Object.is(data.getFloat64(4097, true), -0)).toBe(true)
+    expect(data.getFloat64(4105, true)).toBe(Number.MIN_VALUE)
+    expect(data.getFloat64(20497, true)).toBe(Number.MAX_VALUE)
+  })
+
   it('writeVarint encodes small values in 1 byte', () => {
     const enc = new Encoder()
     enc.writeVarint(0)
@@ -309,6 +371,23 @@ describe('Decoder', () => {
 })
 
 describe('fieldMask', () => {
+  it('rejects IDs outside the selection domain without aliasing or modifying the mask', () => {
+    for (const fieldID of [0, -1, 1.5, NaN, Infinity, 65536, 2147483647, 4294967297, Number.MAX_SAFE_INTEGER]) {
+      const mask = Uint8Array.of(1)
+      expect(() => fieldMaskHas(mask, fieldID)).toThrow(RangeError)
+      expect(() => fieldMaskSet(mask, fieldID)).toThrow(RangeError)
+      expect(mask).toEqual(Uint8Array.of(1))
+    }
+  })
+
+  it('keeps the maximum selection field in an 8 KiB mask', () => {
+    const mask = fieldMaskSet(new Uint8Array(0), 65535)
+    expect(mask.length).toBe(8192)
+    expect(mask[8191]).toBe(0x40)
+    expect(fieldMaskHas(mask, 65535)).toBe(true)
+    expect(fieldMaskHas(mask, 1)).toBe(false)
+  })
+
   it('fieldMaskSet sets bits correctly', () => {
     let mask: Uint8Array = new Uint8Array(1)
     mask = fieldMaskSet(mask, 1)
@@ -341,9 +420,9 @@ describe('fieldMask', () => {
     expect(fieldMaskHas(mask, 4)).toBe(false)
   })
 
-  it('fieldMaskHas returns false for out-of-range field IDs', () => {
+  it('fieldMaskHas rejects zero and returns false for unselected valid IDs', () => {
     const mask = new Uint8Array(1)
-    expect(fieldMaskHas(mask, 0)).toBe(false)
+    expect(() => fieldMaskHas(mask, 0)).toThrow(RangeError)
     expect(fieldMaskHas(mask, 100)).toBe(false)
   })
 })

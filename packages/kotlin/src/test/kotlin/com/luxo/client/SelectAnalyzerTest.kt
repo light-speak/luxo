@@ -12,6 +12,26 @@ import kotlin.test.assertFalse
 import kotlin.test.assertIs
 
 class SelectAnalyzerTest {
+    @Test
+    fun `enum raw values do not become model subfields`() {
+        val fixture = LuxoSchema(
+            enums = mapOf("State" to LuxoEnum("State", listOf("OPEN"))),
+            models = mapOf("Record" to LuxoModel("Record", fields = listOf(
+                LuxoField(1, "state", "Enum", typeName = "State"),
+                LuxoField(2, "states", "Enum", typeName = "State", isList = true),
+            ))),
+            apis = mapOf("getRecord" to LuxoAPI(1, "getRecord", "test", returnType = "Record")),
+        )
+        val hints = SelectAnalyzer.analyzeSources(sequenceOf("""
+            fun render() {
+                val record = client.getRecord()
+                println(record.state.value().rawValue)
+                println(record.states.value().map { it.rawValue })
+            }
+        """.trimIndent()), fixture)
+        assertEquals("state, states", hints["getRecord"])
+    }
+
     private val schema = LuxoSchema(
         models = mapOf(
             "Node" to LuxoModel(

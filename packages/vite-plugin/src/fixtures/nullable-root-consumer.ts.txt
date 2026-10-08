@@ -1,0 +1,51 @@
+import { LuxoClient } from './client.js'
+import { encodeLuxoJSON } from '@luxojs/client'
+import { responseTransport } from './response-transport.js'
+
+let response: unknown
+const transport = responseTransport(() => response)
+const client = new LuxoClient(transport)
+const selection = { $select: 'id' }
+
+function equal(actual: unknown, expected: unknown): void {
+  if (encodeLuxoJSON(actual) !== encodeLuxoJSON(expected)) throw new Error('nullable root changed')
+}
+
+async function reject(action: () => Promise<unknown>): Promise<void> {
+  let failed = false
+  try { await action() } catch { failed = true }
+  if (!failed) throw new Error('invalid nullable root accepted')
+}
+
+async function main(): Promise<void> {
+  const cases = [
+    { call: () => client.optionalInt(), stream: (receive: (value: unknown) => void) => client.subscribeOptionalValueStream(receive),
+      json: 42n, binary: [1, 84], empty: 0n, emptyBinary: [1, 0] },
+    { call: () => client.optionalMetric(selection), stream: (receive: (value: unknown) => void) => client.subscribeOptionalModelStream(selection, receive),
+      json: { id: 42n }, binary: [1, 0, 1, 84, 0], empty: {}, emptyBinary: [1, 0, 0] },
+    { call: () => client.optionalRows(selection), stream: (receive: (value: unknown) => void) => client.subscribeOptionalRowsStream(selection, receive),
+      json: [{ id: 42n }], binary: [1, 1, 0, 1, 84, 0], empty: [], emptyBinary: [1, 0, 0, 0] },
+  ]
+  for (const test of cases) {
+    for (const [data, expected] of [
+      [null, null], [new Uint8Array([0]), null],
+      [test.json, test.json], [new Uint8Array(test.binary), test.json],
+      [test.empty, test.empty], [new Uint8Array(test.emptyBinary), test.empty],
+    ]) {
+      response = data
+      equal(await test.call(), expected)
+      let count = 0
+      const cancel = await test.stream(value => { count++; equal(value, expected) })
+      cancel()
+      equal(count, 1)
+    }
+    for (const invalid of [[], [1], [2], [0, 0], [...test.binary, 0]]) {
+      response = new Uint8Array(invalid)
+      await reject(test.call)
+      let delivered = false
+      await reject(() => test.stream(() => { delivered = true }))
+      equal(delivered, false)
+    }
+  }
+}
+void main().catch(error => { throw error })

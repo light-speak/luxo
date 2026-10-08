@@ -65,6 +65,10 @@ type EventContext struct {
 	// TypeModule and EnumModule track non-model wire type ownership.
 	TypeModule map[string]string
 	EnumModule map[string]string
+	// Enums supplies canonical definitions independently of business packages.
+	Enums map[string]*ast.EnumDecl
+	// SharedEnumPackage is the explicit project-level canonical package path.
+	SharedEnumPackage string
 	// ModelIDType maps model name → Luxo type name of its id field.
 	ModelIDType map[string]string
 	// ModelIDField maps model name → schema-declared primary-key field name.
@@ -89,6 +93,7 @@ func BuildEventContext(allFiles []*ast.File, modulePath string) *EventContext {
 		ModelModule:     make(map[string]string),
 		TypeModule:      make(map[string]string),
 		EnumModule:      make(map[string]string),
+		Enums:           make(map[string]*ast.EnumDecl),
 		ModelIDType:     make(map[string]string),
 		ModelIDField:    make(map[string]string),
 		ModelFields:     make(map[string]map[string]bool),
@@ -117,6 +122,7 @@ func BuildEventContext(allFiles []*ast.File, modulePath string) *EventContext {
 		}
 		for _, enum := range file.Enums {
 			ctx.EnumModule[enum.Name] = modName
+			ctx.Enums[enum.Name] = enum
 		}
 	}
 	for _, file := range allFiles {
@@ -153,11 +159,10 @@ func modelIDTypeName(model *ast.ModelDecl) string {
 	return "Int"
 }
 
-// Generate creates a generator for one compilation and returns every generated
-// source file. Callers that need stable wire IDs or cross-module metadata should
-// construct a GeneratorContext with NewGenerator and call its Generate method.
-func Generate(result *semantic.Result, packageName string, driver DBDriver, softModels ...map[string]bool) (*GenerateResult, error) {
-	generator, err := NewGenerator(GeneratorConfig{Driver: driver})
+// Generate emits a complete compilation using caller-supplied stable wire IDs.
+// Missing identifiers are errors; this entry point never invents temporary IDs.
+func Generate(result *semantic.Result, packageName string, config GeneratorConfig, softModels ...map[string]bool) (*GenerateResult, error) {
+	generator, err := NewGenerator(config)
 	if err != nil {
 		return nil, err
 	}
@@ -168,12 +173,32 @@ func Generate(result *semantic.Result, packageName string, driver DBDriver, soft
 	return generator.Generate(result, packageName, soft)
 }
 
-func (g *GeneratorContext) Generate(result *semantic.Result, packageName string, softModels map[string]bool) (*GenerateResult, error) {
-	gr := &GenerateResult{
-		Files: make(map[string][]byte),
+func (g *GeneratorContext) Generate(result *semantic.Result, packageName string, softModels map[string]bool) (generated *GenerateResult, err error) {
+	defer recoverCompilerFailure(&generated, &err)
+	if result == nil {
+		return nil, fmt.Errorf("code generation requires a semantic result")
+	}
+	if len(result.Errors) > 0 {
+		return nil, fmt.Errorf("code generation requires successful semantic analysis: %s", result.Errors[0].Message)
+	}
+	result = g.withEnumDependencies(result)
+	if err := validateRequestContracts(result); err != nil {
+		return nil, err
 	}
 	enums := g.allEnums(collectEnums(result))
+	if err := g.validateRegisteredParameters(result, enums); err != nil {
+		return nil, err
+	}
+	if err := g.validateFieldIdentifiers(result); err != nil {
+		return nil, err
+	}
+	return g.generateSources(result, packageName, enums, softModels)
+}
 
+// generateSources is internal emission after contract validation. Source-fragment
+// tests may call it without a wire catalog; public entry points never do so.
+func (g *GeneratorContext) generateSources(result *semantic.Result, packageName string, enums map[string]bool, softModels map[string]bool) (*GenerateResult, error) {
+	gr := &GenerateResult{Files: make(map[string][]byte)}
 	gr.Files["model.gen.go"] = g.generateModelFile(result, packageName, enums)
 
 	if dbSrc := g.generateDBFile(result, packageName, enums); dbSrc != nil {
@@ -239,19 +264,7 @@ func (g *GeneratorContext) allEnums(local map[string]bool) map[string]bool {
 	return result
 }
 
-// formatGenerated runs gofmt (go/format) on generated Go source so emitted
-// files pass the repo-wide gofmt gate without a separate formatting step.
-// On a format error — which would mean the generator produced invalid Go —
-// the raw source is returned so the compiler surfaces the real error with
-// meaningful line numbers instead of a swallowed formatting failure.
-func formatGenerated(src []byte) []byte {
-	formatted, err := formatGeneratedChecked(src)
-	if err != nil {
-		return src
-	}
-	return formatted
-}
-
+// formatGeneratedChecked formats at the public boundary and rejects invalid Go.
 func formatGeneratedChecked(src []byte) ([]byte, error) {
 	formatted, err := format.Source(src)
 	if err != nil {
@@ -274,7 +287,11 @@ func (g *GeneratorContext) generateModelFile(result *semantic.Result, packageNam
 	// enums first (structs may reference them)
 	for _, file := range result.Files {
 		for _, e := range file.Enums {
-			generateEnum(&b, e)
+			if g.usesSharedEnums() {
+				generateEnumAlias(&b, e)
+			} else {
+				generateEnum(&b, e)
+			}
 			b.WriteByte('\n')
 		}
 	}
@@ -300,11 +317,19 @@ func (g *GeneratorContext) generateModelFile(result *semantic.Result, packageNam
 	}
 
 	// model structs
+	var authWriter *errorDataGenerator
 	for _, file := range result.Files {
 		for _, m := range file.Models {
-			generateModel(&b, m, enums)
+			if authWriter == nil && hasDirective(m.Directives, "withAuth") {
+				authWriter = newErrorDataGenerator(result, g)
+				authWriter.objectPrefix = "Auth"
+			}
+			generateModel(&b, m, enums, authWriter)
 			b.WriteByte('\n')
 		}
+	}
+	if authWriter != nil {
+		authWriter.writeObjects(&b)
 	}
 
 	// type structs (non-DB plain data types like AuthPayload, ProjectOverview)
@@ -326,6 +351,7 @@ func writeHeader(b *strings.Builder, packageName, sourceFile string) {
 
 // modelImportNeeds tracks which imports model.gen.go requires.
 type modelImportNeeds struct {
+	codec   bool
 	time    bool
 	json    bool
 	uuid    bool
@@ -357,8 +383,21 @@ func writeImports(b *strings.Builder, files []*ast.File) {
 }
 
 func (g *GeneratorContext) writeImports(b *strings.Builder, files []*ast.File) {
+	writeModelImports(b, g.modelImports(files))
+	if g.usesSharedEnums() {
+		for _, file := range files {
+			if len(file.Enums) > 0 {
+				fmt.Fprintf(b, "import luxotypes %q\n\n", g.events.SharedEnumPackage)
+				break
+			}
+		}
+	}
+}
+
+func (g *GeneratorContext) modelImports(files []*ast.File) modelImportNeeds {
 	var needs modelImportNeeds
 	for _, file := range files {
+		needs.codec = needs.codec || len(file.Enums) > 0 && !g.usesSharedEnums()
 		for _, m := range file.Models {
 			if isSoftDelete(m) && !hasDeletedAtField(m.Fields) {
 				needs.time = true
@@ -371,6 +410,7 @@ func (g *GeneratorContext) writeImports(b *strings.Builder, files []*ast.File) {
 			}
 			if hasDirective(m.Directives, "withAuth") {
 				needs.auth = true
+				needs.time = true
 			}
 		}
 		// type declarations may also need imports (DateTime, UUID, Decimal)
@@ -386,17 +426,16 @@ func (g *GeneratorContext) writeImports(b *strings.Builder, files []*ast.File) {
 			}
 		}
 	}
+	return needs
+}
 
-	if !needs.time && !needs.json && !needs.uuid && !needs.decimal && !needs.hash && !needs.auth {
+func writeModelImports(b *strings.Builder, needs modelImportNeeds) {
+	if !needs.time && !needs.json && !needs.uuid && !needs.decimal && !needs.hash && !needs.auth && !needs.codec {
 		return
 	}
 
 	b.WriteString("import (\n")
 	// stdlib group
-	if needs.auth {
-		b.WriteString("\t\"fmt\"\n")
-		b.WriteString("\t\"os\"\n")
-	}
 	if needs.time {
 		b.WriteString("\t\"time\"\n")
 	}
@@ -404,6 +443,9 @@ func (g *GeneratorContext) writeImports(b *strings.Builder, files []*ast.File) {
 		b.WriteString("\t\"encoding/json\"\n")
 	}
 	// third-party group
+	if needs.codec {
+		b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
+	}
 	if needs.uuid {
 		b.WriteString("\n\t\"github.com/google/uuid\"\n")
 	}
@@ -415,6 +457,7 @@ func (g *GeneratorContext) writeImports(b *strings.Builder, files []*ast.File) {
 	}
 	if needs.auth {
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/auth\"\n")
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/errors\"\n")
 	}
 	b.WriteString(")\n\n")
 }
@@ -446,7 +489,7 @@ func (g *GeneratorContext) generateDBFile(result *semantic.Result, packageName s
 		}
 	}
 
-	g.generateExtendScanners(&b, result.Files, modelNames)
+	g.generateExtendScanners(&b, result.Files, modelNames, enums)
 
 	for _, file := range result.Files {
 		for _, m := range file.Models {
@@ -581,18 +624,8 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 		return nil
 	}
 
-	hasRelations := false
-	for _, file := range result.Files {
-		for _, m := range file.Models {
-			if len(analyzeRelations(m, enums)) > 0 {
-				hasRelations = true
-				break
-			}
-		}
-		if len(file.Extends) > 0 {
-			hasRelations = true
-		}
-	}
+	loaders := defaultGenerator().collectDataLoaderInputs(result, enums, nil)
+	hasLoaders := loaders.needed()
 
 	hasEvents := appNeedsEvents(result)
 	hasNativeAPIs := len(collectNativeAPIs(result)) > 0 || resultHasNativeStreams(result)
@@ -626,7 +659,7 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 		fmt.Fprintf(&b, "\t%s *%sClient\n", name, name)
 	}
 	// Extend models are accessed via DataLoader only — no Client field.
-	if hasRelations {
+	if hasLoaders {
 		b.WriteString("\tloaders Loaders\n")
 	}
 	b.WriteString("}\n\n")
@@ -660,16 +693,36 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 	b.WriteString("\ta.DB.Close()\n")
 	b.WriteString("}\n\n")
 
-	// Tx function
-	b.WriteString("// Tx runs fn inside a transaction. The App passed to fn uses the transaction\n")
-	b.WriteString("// for all queries. If fn returns nil, the transaction commits; otherwise it rolls back.\n")
-	b.WriteString("func (a *App) Tx(ctx context.Context, fn func(tx *App) error) error {\n")
-	b.WriteString("\treturn a.DB.Tx(ctx, func(txDB *pg.DB) error {\n")
-	b.WriteString("\t\treturn fn(NewFromDB(txDB))\n")
-	b.WriteString("\t})\n")
-	b.WriteString("}\n")
+	writeAppTransaction(&b, models, hasLoaders)
 
 	return []byte(b.String())
+}
+
+func writeAppTransaction(b *strings.Builder, models []string, hasLoaders bool) {
+	b.WriteString("// Tx binds generated model clients to a transaction and preserves injected dependencies.\n")
+	b.WriteString("// If fn returns nil, the transaction commits; otherwise it rolls back.\n")
+	b.WriteString("// External dependencies do not automatically participate in the database transaction.\n")
+	b.WriteString("func (a *App) Tx(ctx context.Context, fn func(tx *App) error) error {\n")
+	if hasLoaders {
+		b.WriteString("\tif a.loaders.transactionFactoryRequired() {\n")
+		b.WriteString("\t\treturn fmt.Errorf(\"luxo: custom DataLoader requires an explicit transaction factory\")\n\t}\n")
+	}
+	b.WriteString("\treturn a.DB.Tx(ctx, func(txDB *pg.DB) error {\n")
+	b.WriteString("\t\ttxApp := *a\n")
+	b.WriteString("\t\ttxApp.DB = txDB\n")
+	for _, name := range models {
+		fmt.Fprintf(b, "\t\ttxApp.%s = &%sClient{db: txDB}\n", name, name)
+	}
+	if hasLoaders {
+		b.WriteString("\t\tif a.loaders.rebind != nil {\n")
+		b.WriteString("\t\t\ttxApp.loaders = a.loaders.rebind(&txApp)\n")
+		b.WriteString("\t\t\tif txApp.loaders.rebind == nil { txApp.loaders = txApp.loaders.WithTransactionFactory(a.loaders.rebind) }\n")
+		b.WriteString("\t\t\tif txApp.loaders.transactionFactoryRequired() { return fmt.Errorf(\"luxo: transaction factory returned modified DataLoader bindings\") }\n")
+		b.WriteString("\t\t}\n")
+	}
+	b.WriteString("\t\treturn fn(&txApp)\n")
+	b.WriteString("\t})\n")
+	b.WriteString("}\n")
 }
 
 // writeDBImports writes import block for db.gen.go.
@@ -709,7 +762,7 @@ func (g *GeneratorContext) writeDBImports(b *strings.Builder, files []*ast.File)
 
 // generateExtendScanners generates scanners for extend models (Id + data fields only).
 // Used by embedded mode DataLoader to scan DB rows for cross-module models.
-func (g *GeneratorContext) generateExtendScanners(b *strings.Builder, files []*ast.File, modelNames map[string]bool) {
+func (g *GeneratorContext) generateExtendScanners(b *strings.Builder, files []*ast.File, modelNames, enums map[string]bool) {
 	seen := make(map[string]bool)
 	for _, file := range files {
 		for _, ext := range file.Extends {
@@ -720,10 +773,10 @@ func (g *GeneratorContext) generateExtendScanners(b *strings.Builder, files []*a
 			idFieldName := g.externalModelIDFieldName(ext.Name)
 			fields := []*ast.FieldDecl{{Name: idFieldName, Type: &ast.TypeRef{Name: g.externalModelIDTypeName(ext.Name)}, Directives: []*ast.Directive{{Name: "id"}}}}
 			for _, f := range ext.Fields {
-				if f.Name == idFieldName || f.Computed != nil || f.Type == nil || f.Type.IsList {
+				if f.Name == idFieldName || f.Computed != nil || f.Type == nil {
 					continue
 				}
-				if isRelationType(f.Type.Name) {
+				if isRelationType(f.Type.Name) && !enums[f.Type.Name] {
 					continue
 				}
 				fields = append(fields, f)

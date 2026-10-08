@@ -1,9 +1,21 @@
 # Generated Go / SDK interoperability
 
-This fixture compiles `schema.luxo` with the real lexer, parser, semantic analyzer,
+For a sequential local functional acceptance run (existing toolchains/dependencies,
+macOS with Xcode for the Swift iOS compilation check):
+
+```sh
+bash tests/sdk-interop/acceptance.sh all
+```
+
+Use `ts`, `dart`, `kotlin` or `swift` to select one SDK. The runner stops at the first
+failure and retains per-stage logs plus `results.tsv` under `.tmp/sdk-acceptance.*`.
+This is not a performance benchmark, release approval, or application build wrapper.
+
+The generated-consumer fixture compiles `schema.luxo` with the real lexer, parser, semantic analyzer,
 lock-ID allocator and Go generator. The generated handlers, schema, row/column
 writers and stream encoders run behind the real Luxo router. Unary APIs contain
-compiled Luxo bodies; `@native` only supplies stream values. No database, mock
+compiled Luxo bodies; `@native` supplies stream values and a preauthenticated test
+identity for token lifecycle assertions. No database, mock
 HTTP responses, handwritten payload codec or new dependency is required.
 
 The Dart, TypeScript, Kotlin and Swift suites fetch live introspection and generate/type-check
@@ -12,15 +24,94 @@ and Wasm; TypeScript 7 compiles and executes CJS/ESM consumers on Node. Kotlin
 compiles an independent JVM consumer without the serialization compiler plugin.
 Swift compiles an independent SwiftPM consumer with Swift 6 strict concurrency
 and warnings as errors, using only the SDK's public runtime product.
+Both Swift build stages require the checked-in `swift/Package.resolved`; the
+generated consumer receives an unchanged copy. An incompatible or missing lock
+fails the build instead of updating dependencies. The local SDK source revision
+still needs separate release pinning; a dependency lock does not pin that source.
 Values come from the shared Go protocol fixture, including both Int64 extremes
 and values beyond JavaScript's exact-number range. It tests scalar Int/Duration,
 integer arrays, structured inputs, nullable values, columnar results, partial
 selection and native streams. Structured errors and in-memory model pagination
 also use real compiled handlers. All four SDKs additionally exercise a generated
-gateway with a separate TCP RPC backend as described below. Extension-response
-merging, multiple backend modules and device consumers remain outside this suite.
+gateway with a separate TCP RPC backend as described below. That four-SDK fixture
+does not exercise extension-response merging, multiple backend modules or device
+consumers; the separate Go gateway fixture below covers the first two.
+
+## HTTP access / refresh lifecycle
+
+All four generated SDK consumers exercise JSON and Binary token refresh against
+both the direct service and generated gateway. The fixture uses the production
+`luvia.New()` identity/RPC verification setup and HTTP auth middleware. Test-owned
+server processes explicitly set their own JWT configuration; developer secrets
+and refresh settings must not affect these tests.
+
+`issueFixtureAccess` and `issueFixtureRefresh` operate on a fixed preauthenticated
+identity, `9007199254740993`, supplied by a native fixture. They are **not login
+APIs** and must never be copied into a production login implementation. The
+generated methods perform actual signing, refresh-purpose verification and access
+issuance; no token or HTTP response is fabricated by the SDK consumer.
+
+The assertions reject an access token at the refresh endpoint and a refresh token
+as ordinary API access. An HTTP401 triggers a callback using a separate generated
+client to exchange the refresh token; the original call succeeds with the exact
+Int64 identity, and the next call does not refresh again. A callback returning
+no token preserves Unauthorized; returning another refresh token fails after one
+retry rather than looping. The unauthorized trigger deliberately uses the wrong
+token purpose, not a wall-clock sleep; this does not replace expiry-boundary tests.
+
+These are correctness tests, not refresh performance measurements, concurrent
+single-flight guarantees, rotation/revocation coverage or mobile-device tests.
 
 ## Generated gateway / TCP RPC
+
+### HTTP gateway performance fixture
+
+`go test ./tests/sdk-interop -run '^TestGeneratedGatewayHTTP$' -count=1`
+validates the complete HTTP gateway entry and actual TCP RPC with the generated
+proxy. The fixture checks status, content type and exact response bytes on every
+call, including Int64.max, one record / 128 records, no extensions / two distinct
+backend services, JSON / Binary, and 1 / 16 / 128 selected scalar fields. The primary
+backend verifies its exact field mask before returning a response. Negative
+controls reject wrong status, mode, values, unselected extra fields and an
+incorrect backend projection. List extensions are non-empty and checked against
+independently assembled expected payloads.
+
+Set `LUXO_PROXY_HTTP_BENCHMARK=1` for the opt-in serial benchmark. Connections
+are warmed with 32 checked requests per case; `BenchmarkProxyHTTP` covers the
+single-scalar-field control and `BenchmarkProxyHTTPWide` covers 16 / 128 fields.
+Request construction, HTTP client,
+router parsing, selection, RPC, merging and response read/verification are timed.
+All test-owned listeners and connections are closed. Allocation counts include
+both ends in the same Go process, not just the gateway. Deterministic handwritten
+backend payload handlers isolate transport work; this benchmark does not include
+the generated business model handlers, a database, four external SDKs, HTTP/2,
+concurrent throughput or latency percentiles. It is not a gRPC comparison or a
+complete protocol-freeze performance gate.
+
+The same fixture also checks HTTP/2 h2c using the gateway's existing `h2c`
+handler and an explicit HTTP/2 client. Every response must have `ProtoMajor == 2`;
+a negative control rejects an HTTP/1.1 response even when its status, media type
+and payload are correct. The default race test includes all 24 h2c shapes.
+Set `LUXO_PROXY_HTTP2_BENCHMARK=1` for `BenchmarkProxyHTTP2`, with the same
+32-call warmup, 300ms per case and exact payload checks. Run HTTP/1 and HTTP/2
+benchmark switches separately. These are serial loopback HTTP/2-to-TCP-RPC
+measurements, not TLS, multiplexed concurrent load, external SDKs, database work,
+latency percentiles or an equivalent-work gRPC comparison.
+
+Warm benchmarks now count successful `Accept` calls for the HTTP listener and
+each RPC target. They require exactly one connection per listener both after
+warmup and after timing, so reconnection cannot silently enter a reuse result.
+The listener returns the original TCP connection unchanged; counting only occurs
+when accepting a connection, not for each request. Regressions cover unused
+counters, forced HTTP reconnection and both protocols with two RPC extensions.
+
+For an opt-in diagnostic of the 128-row, 128-field JSON response with two
+extensions, run `LUXO_PROXY_HTTP_PROFILE=1 go test ./tests/sdk-interop -run
+'^TestGeneratedGatewayHTTPProfile$' -count=1 -v`. It profiles HTTP/1.1 and h2c
+sequentially, prints CPU and sampled allocation summaries, then removes its
+test executable and raw profiles with the owned scratch directory. Profiles
+include setup and warmup; their sampled byte totals are not per-request
+allocation counts and profiled timings are not performance acceptance results.
 
 TS 7 CJS/ESM, Dart VM/JavaScript/Wasm, Kotlin JVM and Swift all run direct and
 gateway deployments. The gateway tests
@@ -33,6 +124,23 @@ separate processes, with independent ephemeral listeners. The gateway registers
 schema and proxies, never local business handlers. Go regressions also stop the
 backend, require gateway requests to fail and verify owned processes/listeners
 are closed on success, consumer failure and failed readiness.
+
+`QueryProbe` also exports its actual CRUD query capabilities. All four consumers
+compile generated `LuxoQuery_listQueryProbes` helpers, preserve an Int64 value
+above JavaScript's safe integer range, and send a typed DateTime filter containing
+an invalid date. The latter must still receive the server's BadRequest response;
+typed construction does not bypass semantic validation. Local sorter assertions
+do not prove database sorting or successful query execution.
+
+`QueryProbe` is a generated CRUD model with no database configured. All four
+consumers send invalid filters (unknown/unexposed field, undeclared enum,
+enum ordering, malformed Boolean/Float/Int/DateTime) and invalid sort fields.
+Each request must return `BadRequest`/400 with the offending `data.param`, then
+an interleaved `echoInteger` must succeed on the same client. These assertions
+run over HTTP/WebSocket × JSON/Binary in both deployments; they verify rejection
+before database access, not successful SQL execution or database behavior.
+Internal `svc:` RPCs are excluded from public SDK methods and transport tables;
+the Swift generator has a separate regression for this compilation boundary.
 
 This revealed a handler-metadata bug: named enum parameters were emitted as
 `Model` even though gateway introspection described them as `Enum`. Service
@@ -76,6 +184,15 @@ also emitted by generated native streams. `NestedPrecision` adds three levels of
 objects and object lists, nullable children/lists, Unicode, Int64 extremes and
 partial selection. The same cases pass through row, columnar and native stream
 responses. Inputs keep their separate inline nested layout.
+
+`watchPrecision(value: Int = 42)` additionally verifies omitted native-stream
+parameters through the generated clients. Each SDK subscribes without `value`
+and checks the selected response fields against 42; the existing explicit-value
+cases still include zero, negative values and both Int64 extremes. Introspection
+exports only `hasDefault`, not the literal, so SDKs must leave the parameter absent
+and let the service prepare its typed snapshot. The cases run in both WebSocket
+modes through direct and gateway/TCP deployments. They do not certify every
+default expression, nullable omission semantics, authorization or ACK ordering.
 
 `ScalarArrays` covers all eleven scalar families (Int, Float, String, Boolean,
 DateTime, Duration, UUID, Bytes, Decimal, JSON and enum) as nullable arrays in
@@ -142,9 +259,18 @@ Unix seconds followed by unsigned nanoseconds (0..999999999). Internal RPC is
 version 3; no whole-second fallback exists. JSON uses timezone-bearing RFC3339,
 at most nine fractional digits and UTC years 0000..9999. All four runtimes also
 consume 34 shared text-boundary cases; Go tests send these through direct and
-gateway HTTP paths. Fractions beyond nine digits, invalid dates, missing zones
+gateway HTTP and WebSocket paths. Each invalid input is followed by a valid
+nanosecond request on the same WebSocket connection. Fractions beyond nine digits, invalid dates, missing zones
 and UTC range overflow are errors, not silently normalized values. These checks
 do not certify database storage precision, device SDKs or performance.
+
+`watchTimestamp` / `watchTimestamps` also pass the 14 timestamps through native
+stream input and generated stream output. All four SDK consumers check scalar
+subscriptions, empty/single/full lists and a subsequent unary request after
+cancellation, in JSON/Binary through both direct and gateway deployments.
+TS CJS/ESM, Dart VM/JS/Wasm, Kotlin JVM and Swift provide 476 additional DateTime
+subscription scenarios. These tests do not certify stream parameter defaults,
+unknown enum rejection or bounded recursive event snapshots.
 
 The shared `jsonNumberConversions` cases define explicit signed-Int64 results
 and fixed 16-digit hexadecimal Float bit patterns. Null expectations mean that
@@ -175,6 +301,42 @@ from compiled Luxo bodies. The corresponding native streams use the same Go
 generated encoders. All four SDK consumers check both declared enum values,
 empty/populated lists and WebSocket streams without `$select`. This verifies
 named-enum schema resolution, not the policy for unknown future enum values.
+
+Dart and Kotlin consumers now use explicit Known/Unknown enum types. Their
+scalar/list calls also send undeclared `FUTURE`, empty and wrong-case values and
+require the current Go server to return 400 in both transports and topologies.
+Unknown response preservation is separately exercised by generated local
+consumers. TS and Dart additionally build two real Go service revisions: the
+old schema declares OPEN/CLOSED, while `-out <directory> -future-enum` compiles
+a new server declaring FUTURE and emitting it in scalar/list streams. Generate
+the client from the old service, stop it, then use that unchanged client against
+the new direct/gateway deployment over HTTP/WebSocket and JSON/Binary. The
+consumer requires explicit Unknown values retaining `FUTURE`, mixed known/unknown
+lists, round-trip resubmission and rejection of `UNDECLARED`. TS CJS/ESM and Dart
+VM/JS/Wasm run this upgrade matrix. Kotlin and Swift run it using
+`go run ./tests/sdk-interop -run -enum-upgrade [-gateway] -- <consumer>`:
+the owner captures actual old introspection bytes and closes the old deployment,
+then exposes that immutable snapshot at `LUXO_INTEROP_SCHEMA_ENDPOINT` solely for
+generation. Requests use the separately compiled newer service at
+`LUXO_INTEROP_ENDPOINT`; failures close both endpoints. The owner always sets
+`LUXO_INTEROP_ENUM_UPGRADE` explicitly, preventing stale shell settings from
+silently replacing ordinary tests. CI includes both upgrade topologies for all
+four SDKs. This checks schema evolution, not compatibility with old wire versions
+or older released SDK runtimes.
+
+The same upgrade fixture also adds an API before existing declarations, inserts
+a nullable `future` field at the start of `PageRecord`, and adds a defaulted
+`delta: Int = 0` parameter to `echoInteger`. It first allocates IDs from the old
+analyzed schema, then updates that same lock with the newer schema. Go compares
+the two live introspection snapshots: existing API/parameter/model/type field IDs
+must remain unchanged, and the new API/parameter must receive fresh IDs. An
+explicit `delta` call verifies that the parameter actually affects execution.
+All four unchanged old clients rerun pagination with Int64 extremes and partial
+selection against the added model field. Existing scalar calls omit `delta`;
+their values must remain unchanged over both modes and transports. The fixture
+refuses missing replacement anchors instead of silently exercising identical
+revisions. This is additive-schema compatibility with current SDK runtimes, not
+a historical released-client or old-wire certification.
 
 Each generated consumer also tests deliberately malformed local payloads:
 truncation at every byte of a child and its enclosing message, missing end
@@ -222,7 +384,17 @@ can pass; local sibling-checkout results do not certify the remote `main` revisi
 
 The runner starts one generated service, or a gateway and separate RPC service,
 passes the endpoint, corpus, topology and owned scratch directory to the consumer,
-and closes all owned processes on success or failure.
+and closes its service/gateway processes on success or failure. On Linux/macOS,
+build and consumer commands run in dedicated sessions with an anchor kept until
+descendant cleanup finishes, preventing session-ID reuse during cleanup. The
+consumer has a ten-minute deadline; success, failure and cancellation all clean
+descendants even when tools create additional process groups. Inspection or
+cleanup failure preserves the owned scratch directory and returns an error.
+This requires process-inspection permissions and cooperative tools that do not
+daemonize into separate sessions; it is not a sandbox for arbitrary detached
+process trees. Other host systems explicitly reject this process runner. A real
+Swift Foundation subprocess and separate-process-group regressions cover the
+previously observed SwiftPM timeout cleanup failure.
 Kotlin's stream test suspends while awaiting data, never blocking the socket
 reader after a subscription acknowledgement. The corpus covers all four
 HTTP/WebSocket × JSON/Binary channels. The Dart/TS suites are included in their
@@ -328,7 +500,26 @@ WebSocket复用原连接并核验每次编号，同时检查所选字段、结�
 `echoFixtureState` / `echoFixtureStates` 通过编译的 Luxo 逻辑返回命名枚举单值或
 列表；对应 native 订阅共用 Go 生成编码器。四个 SDK 均验证两个已声明枚举值、空/
 非空列表和 WebSocket 订阅，不传 `$select`。这证明命名枚举的 Schema 分流正确，
-不代表已经确定未来新增枚举成员的兼容策略。
+单靠这些已知成员样本不能证明未来新增成员的兼容行为。
+
+Dart和Kotlin消费者现使用明确的Known/Unknown类型，另外通过单值/列表参数发送
+未声明的`FUTURE`、空文本及错误大小写，要求两种传输、两种部署的当前Go服务端
+均返回400。TS与Dart另构建两个真实Go服务版本：旧Schema仅含OPEN/CLOSED，新版
+声明FUTURE并通过单值/列表流发送。客户端只从旧版生成，关闭旧服务后连接新版，
+覆盖直连/网关、HTTP/WS和JSON/Binary；验证明确的Unknown、原值再次提交、混合
+列表及服务端拒绝UNDECLARED。TS覆盖CJS/ESM，Dart覆盖VM/JS/Wasm；Kotlin/Swift
+通过`-run -enum-upgrade`（网关另加`-gateway`）运行同类升级测试。测试所有者保存
+旧服务真实Schema后关闭旧部署，以只读快照端点供生成器使用，业务请求仅发往实际
+重新编译的新版；失败也清理两个端点。CI包含四SDK两种升级部署，但本地通过不代表
+线上CI已执行通过。这不代表旧wire或历史已发布SDK运行库的兼容性。
+同一升级夹具还在已有声明之前增加API、在PageRecord开头插入nullable字段，并给
+echoInteger增加实际参与计算的`delta: Int = 0`。先由旧AST建立编号锁，再在同一锁
+上更新新AST；Go比较真实新旧introspection中的API、参数、模型/type字段编号，
+新增项不能挤占旧编号。四SDK旧客户端复用带Int64极值和部分选择的分页检查，
+旧整数调用不提供delta；两种部署、两种模式及两种传输都必须保持原结果。
+新增参数另有显式传值控制，源代码替换锚点失配时报错，不能悄悄测试同一版本。
+其他形状的Unknown响应保留仍由独立生成消费者注入验证；契约已确定，但全部SDK
+真实升级矩阵与性能验收未全部完成。
 
 四个生成消费者另外用本地故意损坏的消息，验证子消息和父消息每个字节位置的截断、
 缺少结束标记、内外尾随字节和非法 nullable 标记。负向探针只是补充，不能替代真实 Go

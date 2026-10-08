@@ -7,6 +7,7 @@ import 'dart:isolate';
 
 import 'package:build/build.dart';
 import 'package:luxo_client/src/builder/select_builder.dart';
+import 'package:luxo_client/src/builder/selection_build.dart';
 import 'package:luxo_client/src/codegen.dart';
 import 'package:test/test.dart';
 
@@ -93,6 +94,7 @@ Map<String, Object?> _minimalSchema(String scalar, {required bool input}) => {
           'name':
               '${scalar == 'internal' ? 'svc:' : ''}${stream ? 'watchValue' : 'readValue'}',
           'module': 'fixture',
+          'internal': scalar == 'internal',
           'returnType': input
               ? 'Int'
               : scalar == 'internal'
@@ -148,13 +150,15 @@ Future<void> _verifyReadme() async {
   final testLibrary = await Isolate.resolvePackageUri(
     Uri.parse('package:test/test.dart'),
   );
+  final build = await SelectionBuild.prepare(fixture.root);
+  addTearDown(build.close);
   await fixture.runDart([
     '--packages=.dart_tool/package_config.json',
     testLibrary!.resolve('../bin/test.dart').toFilePath(),
     '-r',
     'expanded',
     'bin/verify_test.dart',
-  ]);
+  ], workingDirectory: build.directory.path);
 }
 
 Future<void> _verifyConversionImport(String scalar) async {

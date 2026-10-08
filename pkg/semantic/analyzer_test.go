@@ -313,7 +313,7 @@ func TestFnDeclaration(t *testing.T) {
 // ========== Complex Schema Test ==========
 
 func TestComplexSchema(t *testing.T) {
-	result := analyze(t, `
+	result := analyzeCached(t, `
 model Base {
   id: Int
   createdAt: DateTime
@@ -342,7 +342,7 @@ type AuthResult {
   user: User
 }
 
-api getUser(id: Int): User @cache(ttl: 60)
+api getUser(id: Int): User @cache(policy: "preview")
 
 api register(input: AuthResult): AuthResult {
   val user = User.create(name: "test")
@@ -968,6 +968,101 @@ api test(): Int {
 }
 
 // ========== Circular Event Dependency Tests ==========
+
+func TestNestedCircularEventDependency(t *testing.T) {
+	for _, body := range []string{
+		`if true { emit Second(id: 1) }`,
+		`transaction { emit Second(id: 1) }`,
+		`async { emit Second(id: 1) }`,
+		`for id in [1, 2] { emit Second(id: id) }`,
+		`transaction { if true { async { emit Second(id: 1) } } }`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			source := `event First(id: Int)
+event Second(id: Int)
+on First { ` + body + ` }
+on Second { emit First(id: 1) }`
+			// Prove the nested source is otherwise valid and acyclic chains work.
+			expectNoErrors(t, analyze(t, strings.Replace(source, "emit First(id: 1)", "", 1)))
+			expectError(t, analyze(t, source), "circular event dependency")
+		})
+	}
+}
+
+func TestCollectEmitsNestedExpressions(t *testing.T) {
+	block := &ast.Block{Stmts: []ast.Stmt{
+		&ast.EmitStmt{EventName: "Outer", Args: []*ast.NamedArg{{Value: &ast.AwaitExpr{
+			Body: &ast.Block{Stmts: []ast.Stmt{&ast.EmitStmt{EventName: "Nested"}}},
+		}}}},
+	}}
+	if got, _ := collectReachableEmits(block, "", nil, nil); strings.Join(got, ",") != "Outer,Nested" {
+		t.Fatalf("emitted events = %v, want Outer,Nested", got)
+	}
+}
+
+func TestEventHelpersIgnoreModelMethodsAndNativeBodies(t *testing.T) {
+	expectNoErrors(t, analyze(t, `model User { id: Int @id }
+event Changed(id: Int)
+fn count(): Int { emit Changed(id: 1)
+return 0 }
+fn inspect(): Result<Int> @native
+on Changed { User.count()
+val result = inspect()? }`))
+}
+
+func TestEventCollectorEmptyDoesNotAllocate(t *testing.T) {
+	block := &ast.Block{}
+	for _, bodies := range []map[callableKey]*ast.Block{nil, {{name: "unused"}: block}} {
+		allocations := testing.AllocsPerRun(100, func() {
+			if events, _ := collectReachableEmits(block, "", bodies, nil); len(events) != 0 {
+				t.Fatal(events)
+			}
+		})
+		if allocations != 0 {
+			t.Fatalf("empty listener used %.0f allocations", allocations)
+		}
+	}
+}
+
+func TestEventCycleThroughHelpers(t *testing.T) {
+	for _, declarations := range []string{
+		`fn relay() { emit Second(id: 1) }`,
+		`fn relay() { nested() }
+fn nested() { transaction { emit Second(id: 1) } }`,
+		`fn relay() { nested() }
+fn nested() { relay()
+emit Second(id: 1) }`,
+	} {
+		source := `event First(id: Int)
+event Second(id: Int)
+` + declarations + `
+on First { relay() }
+on Second { emit First(id: 1) }`
+		expectNoErrors(t, analyze(t, strings.Replace(source, "emit First(id: 1)", "", 1)))
+		expectError(t, analyze(t, source), "circular event dependency")
+	}
+}
+
+func TestEventHelpersRemainModuleLocal(t *testing.T) {
+	for _, reverse := range []bool{false, true} {
+		common := parseFileWithName(t, `event First(id: Int)
+event Second(id: Int)
+event Terminal(id: Int)
+fn publish() { emit Second(id: 1) }`, "origin/common/events.luxo")
+		first := parseFileWithName(t, `fn relay() { emit Terminal(id: 1) }
+on First { relay() }`, "origin/first/events.luxo")
+		second := parseFileWithName(t, `fn relay() { emit First(id: 1) }
+on Second { relay() }`, "origin/second/events.luxo")
+		files := []*ast.File{common, first, second}
+		if reverse {
+			files[1], files[2] = files[2], files[1]
+		}
+		expectNoErrors(t, analyzeModules(t, files))
+		// First -> common.publish -> Second -> local.relay -> First.
+		first = parseFileWithName(t, `on First { publish() }`, "origin/first/events.luxo")
+		expectError(t, analyzeModules(t, []*ast.File{common, first, second}), "circular event dependency")
+	}
+}
 
 func TestCircularEventDependency(t *testing.T) {
 	file := &ast.File{
@@ -1756,7 +1851,7 @@ api test(): Int {
   0
 }
 `)
-	expectNoErrors(t, result)
+	expectError(t, result, "explicit type projection")
 }
 
 func TestPaginateOperation(t *testing.T) {
@@ -1802,6 +1897,9 @@ model User @withAuth(stores: [id, role]) {
 		t.Error("createToken field not injected")
 	} else if f.Doc == "" {
 		t.Error("createToken field missing Doc string")
+	}
+	if f, ok := userType.Fields["createRefreshToken"]; !ok || !f.IsMethod || f.Doc == "" {
+		t.Error("createRefreshToken method or description missing")
 	}
 	if f, ok := userType.Fields["verify"]; !ok {
 		t.Error("verify field not injected")
@@ -2032,6 +2130,64 @@ api test(): String {
 }
 `)
 	expectNoErrors(t, result)
+}
+
+func TestAuthMethodArguments(t *testing.T) {
+	for _, sample := range []struct{ call, errorText string }{
+		{"user.createToken()", ""},
+		{"user.createToken(5m)", ""},
+		{"user.createToken(expires: 5m)", ""},
+		{"user.createRefreshToken()", ""},
+		{"user.createRefreshToken(5m)", "expects at most 0"},
+		{"user.createRefreshToken(expires: 5m)", "unknown argument 'expires'"},
+		{`user.refreshToken("signed")`, ""},
+		{`user.refreshToken(token: "signed")`, ""},
+		{`user.createToken("5m")`, "expects 'Duration'"},
+		{"user.createToken(null)", "expects 'Duration'"},
+		{"user.createToken(1)", "expects 'Duration'"},
+		{"user.createToken(ttl: 5m)", "unknown argument 'ttl'"},
+		{"user.createToken(5m, 10m)", "expects at most 1"},
+		{"user.createToken(expires: 5m, expires: 10m)", "duplicate argument 'expires'"},
+		{"user.refreshToken()", "missing required argument 'token'"},
+		{"user.refreshToken(1)", "expects 'String'"},
+		{`user.refreshToken(plain: "signed")`, "unknown argument 'plain'"},
+	} {
+		t.Run(sample.call, func(t *testing.T) {
+			result := analyze(t, `model User @withAuth(stores: [name]) { name: String }
+fn token(user: User): String { `+sample.call+` }`)
+			if sample.errorText == "" {
+				expectNoErrors(t, result)
+			} else {
+				expectError(t, result, sample.errorText)
+			}
+		})
+	}
+}
+
+func TestAuthArgumentChecksIgnoreOtherReceivers(t *testing.T) {
+	a := New()
+	a.types["Plain"] = &ResolvedType{Kind: TypeModel, Name: "Plain", Fields: map[string]*FieldInfo{
+		"createToken": {Name: "createToken", Type: a.types["String"]},
+	}}
+	for _, sample := range []struct {
+		typeName, method string
+		list             bool
+	}{
+		{"", "createToken", false},
+		{"Unknown", "createToken", false},
+		{"String", "createToken", false},
+		{"Plain", "createToken", true},
+		{"Plain", "createToken", false},
+		{"Plain", "refreshToken", false},
+	} {
+		object := &ast.Ident{Name: "value"}
+		object.SetTypeTag(sample.typeName)
+		object.SetListType(sample.list)
+		a.checkAuthMethodArguments(&ast.CallExpr{Func: &ast.MemberExpr{Object: object, Field: sample.method}}, nil)
+	}
+	if len(a.errors) != 0 {
+		t.Fatalf("auth checks interpreted unrelated values: %v", a.errors)
+	}
 }
 
 func TestMethodVerifyWithoutCallError(t *testing.T) {
@@ -2832,6 +2988,28 @@ func TestChainCRUDAggregateReturnType(t *testing.T) {
 	}
 }
 
+func TestChainCRUDFallbackReturnTypes(t *testing.T) {
+	a := New()
+	a.declareType("User", TypeModel, token.Position{}, "")
+	for _, test := range []struct {
+		method, name   string
+		list, nullable bool
+	}{
+		{"create", "User", false, false},
+		{"all", "User", true, false},
+		{"first", "User", false, true},
+		{"count", "Int", false, false},
+	} {
+		t.Run(test.method, func(t *testing.T) {
+			call := &ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: test.method}}
+			result := a.inferCheckedCallReturnType(call, nil)
+			if result == nil || result.Name != test.name || result.IsList != test.list || result.Nullable != test.nullable {
+				t.Fatalf("unexpected fallback type: %+v", result)
+			}
+		})
+	}
+}
+
 // ========== isAutoManagedField Edge Cases ==========
 
 func TestCreateMissingFieldWithIdDirective(t *testing.T) {
@@ -3200,9 +3378,19 @@ func TestHasSearchDirectiveEmptyDirectives(t *testing.T) {
 	a.scope.Define(&Symbol{Name: "post", Kind: SymVariable, Type: postType})
 
 	expr := &ast.MemberExpr{Object: &ast.Ident{Name: "post"}, Field: "title"}
+	a.types["Post"] = postType
+	expr.Object.SetTypeTag("Post")
 	got := a.hasSearchDirective(expr)
 	if got {
 		t.Error("expected false for field with no directives")
+	}
+}
+
+func TestHasSearchDirectiveUnresolvedReceiver(t *testing.T) {
+	a := New()
+	expr := &ast.MemberExpr{Object: &ast.Ident{Name: "missing"}, Field: "title"}
+	if a.hasSearchDirective(expr) {
+		t.Fatal("unresolved receiver cannot establish a search directive")
 	}
 }
 
@@ -3220,6 +3408,8 @@ func TestHasSearchDirectiveDirectLoopNoSearch(t *testing.T) {
 
 	// hasSearchDirective(post.title) — should return false because no "search" directive
 	expr := &ast.MemberExpr{Object: &ast.Ident{Name: "post"}, Field: "title"}
+	a.types["Post"] = postType
+	expr.Object.SetTypeTag("Post")
 	got := a.hasSearchDirective(expr)
 	if got {
 		t.Error("expected false for field without @search")
@@ -3239,6 +3429,8 @@ func TestHasSearchDirectiveDirectLoopWithSearch(t *testing.T) {
 	a.scope.Define(&Symbol{Name: "post", Kind: SymVariable, Type: postType})
 
 	expr := &ast.MemberExpr{Object: &ast.Ident{Name: "post"}, Field: "title"}
+	a.types["Post"] = postType
+	expr.Object.SetTypeTag("Post")
 	got := a.hasSearchDirective(expr)
 	if !got {
 		t.Error("expected true for field with @search")
@@ -3411,7 +3603,7 @@ api test(): [Post] {
 }
 
 func TestQueryModifierMethodGroupBy(t *testing.T) {
-	// Model.groupBy(field) — exercises isQueryModifierMethod returning true
+	// A grouping operation is not an executable result without a typed projection.
 	result := analyze(t, `
 model Post {
   title: String
@@ -3422,7 +3614,7 @@ api test(): Int {
   0
 }
 `)
-	expectNoErrors(t, result)
+	expectError(t, result, "explicit type projection")
 }
 
 // ========== isAutoManagedField — IsMethod field ==========
@@ -3622,6 +3814,10 @@ func TestHasSearchDirectiveFieldNilDirect(t *testing.T) {
 
 	// MemberExpr "obj.ghost" — obj resolves, "ghost" does not exist → field == nil
 	expr := &ast.MemberExpr{Object: &ast.Ident{Name: "obj"}, Field: "ghost"}
+	a.types["Obj"] = objType
+	if resolved := a.checkExpr(expr.Object, a.scope); resolved != objType {
+		t.Fatalf("receiver did not resolve: %+v", resolved)
+	}
 	if a.hasSearchDirective(expr) {
 		t.Error("expected false for non-existent field")
 	}
@@ -3714,6 +3910,24 @@ api watch(): Int @stream {
 	expectError(t, result, "@stream without an event source requires @native")
 }
 
+func TestNullableStreamMessages(t *testing.T) {
+	for _, typ := range []string{"Int", "[Int]", "Snapshot", "[Snapshot]"} {
+		for _, source := range []string{"@stream @native", "@stream(Changed) { true }", "@stream(Changed) @native"} {
+			if strings.HasPrefix(typ, "[") && source != "@stream @native" {
+				continue // Event snapshots still prohibit nullable lists.
+			}
+			t.Run(typ+source, func(t *testing.T) {
+				declaration := "type Snapshot { value: Int }\n"
+				if source != "@stream @native" {
+					declaration += "event Changed(value: " + typ + "?)\n"
+				}
+				result := analyze(t, declaration+"api watch(): "+typ+"? "+source)
+				expectNoErrors(t, result)
+			})
+		}
+	}
+}
+
 func TestStreamContractValidation(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -3751,9 +3965,9 @@ func TestStreamContractValidation(t *testing.T) {
 			want:  "must contain exactly one payload parameter of type 'Int'",
 		},
 		{
-			name:  "nullable return",
-			input: `event Changed(value: Int?)\napi watch: Int? @stream(Changed)`,
-			want:  "@stream return type must be non-nullable",
+			name:  "non-nullable payload mismatch",
+			input: `event Changed(value: Int)\napi watch: Int? @stream(Changed)`,
+			want:  "must contain exactly one payload parameter of type 'Int?'",
 		},
 		{
 			name:  "native body",

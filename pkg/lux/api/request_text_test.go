@@ -110,7 +110,7 @@ func TestWSTextRejectsInvalidUnicodeBeforeDispatch(t *testing.T) {
 		t.Run(frame, func(t *testing.T) {
 			rt := NewRouter()
 			var calls atomic.Int64
-			rt.Schema.RegisterAPI(&schema.API{Name: "text", ReturnType: "String"})
+			rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "text", ReturnType: "String"})
 			rt.Handle("text", func(_ context.Context, req *Request) error {
 				calls.Add(1)
 				var err error
@@ -261,7 +261,7 @@ func newTextBoundarySocket(t *testing.T, rt *Router) (context.Context, *websocke
 
 func TestWSTextPreservesValidUTF8(t *testing.T) {
 	rt := NewRouter()
-	rt.Schema.RegisterAPI(&schema.API{Name: "text", ReturnType: "String"})
+	rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "text", ReturnType: "String"})
 	rt.Handle("text", func(_ context.Context, req *Request) error {
 		value, err := req.ParamString("value")
 		if err != nil {

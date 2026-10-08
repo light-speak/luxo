@@ -99,7 +99,7 @@ var builtinDirectives = []DirectiveDef{
 		Params:      []ParamDef{{Name: "stores", Required: true}, {Name: "default"}},
 		MaxArgs:     2,
 		HasBody:     false,
-		Description: "mark model as auth subject, auto-generates .createToken()/.verify()/.refreshToken(). stores: fields to store in JWT token. default: true means @auth without args defaults to this model. JWT secret/expires/refresh configured via .env",
+		Description: "mark model as auth subject, auto-generates .createToken()/.createRefreshToken()/.verify()/.refreshToken(). stores: fields to store in JWT token. default: true means @auth without args defaults to this model. JWT secret/expires/refresh configured via .env",
 	},
 
 	// ===== Field-level directives — identity & indexing =====
@@ -365,9 +365,15 @@ var builtinDirectives = []DirectiveDef{
 	},
 	{
 		Name: "cache", Contexts: OnApi,
-		Params:      []ParamDef{{Name: "ttl"}},
+		Params:      []ParamDef{{Name: "policy", Required: true}},
 		MaxArgs:     1,
-		Description: "cache response with TTL",
+		Description: "cache response using a statically resolved policy",
+	},
+	{
+		Name: "cacheable", Contexts: OnFn | OnApi,
+		Params:      []ParamDef{{Name: "dependsOn", Required: true}},
+		MaxArgs:     1,
+		Description: "declare a native implementation read-only with explicit cache dependencies",
 	},
 	{
 		Name: "rateLimit", Contexts: OnApi,
@@ -442,6 +448,9 @@ func (a *Analyzer) validateDirective(d *ast.Directive, ctx DirectiveContext, fie
 	}
 	if d.Name == "paginate" {
 		a.checkPaginateDefault(d)
+	}
+	if d.Name == "cache" {
+		a.checkCacheDirective(d)
 	}
 }
 

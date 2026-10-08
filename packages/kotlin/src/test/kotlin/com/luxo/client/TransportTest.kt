@@ -11,6 +11,16 @@ import kotlin.test.assertTrue
 import kotlin.test.assertFailsWith
 
 class TransportProtocolTest {
+    @Test
+    fun `binary request rejects out-of-range selected metadata`() {
+        for (id in listOf(0, -1, 65536, Int.MAX_VALUE)) {
+            val meta = APISchemaEntry(id = 1, fields = mapOf("value" to SelectionFieldSchema(id)))
+            assertFailsWith<IllegalArgumentException> {
+                LuxoBinaryProtocol.encodeRequest(meta, mapOf("\$select" to "value"))
+            }
+        }
+    }
+
 	private data class TestInput(val value: String) : LuxoBinaryEncodable {
 		override fun writeLuxo(encoder: LuxoEncoder) {
 			encoder.writeVarint(value.toByteArray().size.toLong())

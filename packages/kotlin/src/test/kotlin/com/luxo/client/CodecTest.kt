@@ -13,6 +13,46 @@ import kotlin.test.assertTrue
 import kotlin.test.assertFailsWith
 
 class LuxoEncoderDecoderTest {
+    @Test
+    fun `nullable root marker requires exactly one canonical presence byte`() {
+        assertTrue(isNullRoot(byteArrayOf(0)))
+        assertFalse(isNullRoot(byteArrayOf(1, 0)))
+        for (bad in listOf(byteArrayOf(), byteArrayOf(1), byteArrayOf(2, 0),
+            byteArrayOf(-1, 0), byteArrayOf(0, 0))) {
+            assertFailsWith<LuxoCodecException> { isNullRoot(bad) }
+        }
+    }
+
+    @Test
+    fun `offset readers share their input without weakening complete-message checks`() {
+        val scalarBytes = byteArrayOf(1, 84)
+        val scalar = LuxoDecoder.atOffset(scalarBytes, 1)
+        scalarBytes[1] = 86
+        assertEquals(43L, scalar.readInt())
+        scalar.checkComplete()
+        val columnBytes = byteArrayOf(1, 1, 0, 1, 84, 0)
+        val column = ColumnarDecoder.atOffset(columnBytes, 1)
+        columnBytes[4] = 86
+        assertTrue(column.nextColumn())
+        assertEquals(listOf(43L), column.readColumnInt())
+        assertFalse(column.nextColumn())
+        column.checkComplete()
+        for (offset in listOf(-1, 3, Int.MIN_VALUE, Int.MAX_VALUE)) {
+            assertFailsWith<LuxoCodecException> { LuxoDecoder.atOffset(scalarBytes, offset) }
+            assertFailsWith<LuxoCodecException> { ColumnarDecoder.atOffset(scalarBytes, offset) }
+        }
+        LuxoDecoder.atOffset(scalarBytes, scalarBytes.size).checkComplete()
+        assertFailsWith<LuxoCodecException> { ColumnarDecoder.atOffset(scalarBytes, scalarBytes.size) }
+        assertEquals(1L, LuxoDecoder.atOffset(byteArrayOf(2), 0).readInt())
+        assertEquals(0, ColumnarDecoder.atOffset(byteArrayOf(0, 0, 0), 0).count)
+        val trailing = LuxoDecoder.atOffset(byteArrayOf(1, 84, 99), 1)
+        assertEquals(42L, trailing.readInt())
+        assertFailsWith<LuxoCodecException> { trailing.checkComplete() }
+        val trailingColumn = ColumnarDecoder.atOffset(byteArrayOf(1, 0, 0, 0, 99), 1)
+        assertFalse(trailingColumn.nextColumn())
+        assertFailsWith<LuxoCodecException> { trailingColumn.checkComplete() }
+    }
+
 
     @Test
     fun `row decoder requires an end marker`() {
@@ -930,6 +970,25 @@ class ColumnarDecoderTest {
 class FieldMaskTest {
 
     @Test
+    fun `invalid selection IDs fail without mutation`() {
+        for (id in listOf(0, -1, Int.MIN_VALUE, 65536, Int.MAX_VALUE)) {
+            val mask = byteArrayOf(1)
+            assertFailsWith<IllegalArgumentException> { FieldMask.has(mask, id) }
+            assertFailsWith<IllegalArgumentException> { FieldMask.set(mask, id) }
+            assertTrue(mask.contentEquals(byteArrayOf(1)))
+        }
+    }
+
+    @Test
+    fun `maximum selection ID fits in eight KiB without the spare bit`() {
+        val mask = FieldMask.set(byteArrayOf(), 65535)
+        assertEquals(8192, mask.size)
+        assertEquals(0x40, mask.last().toInt())
+        assertTrue(FieldMask.has(mask, 65535))
+        assertFalse(FieldMask.has(mask, 1))
+    }
+
+    @Test
     fun `set and has basic`() {
         var mask = ByteArray(0)
         mask = FieldMask.set(mask, 1)
@@ -941,7 +1000,7 @@ class FieldMaskTest {
         assertTrue(FieldMask.has(mask, 8))
         assertTrue(FieldMask.has(mask, 9))
         assertTrue(FieldMask.has(mask, 16))
-        assertFalse(FieldMask.has(mask, 0))
+        assertFailsWith<IllegalArgumentException> { FieldMask.has(mask, 0) }
         assertFalse(FieldMask.has(mask, 2))
         assertFalse(FieldMask.has(mask, 10))
         assertFalse(FieldMask.has(mask, 17))

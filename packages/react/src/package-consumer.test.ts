@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { afterAll, beforeAll, expect, it } from 'vitest'
 import { execFile } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
@@ -41,6 +41,14 @@ it('publishes compiler-emitted declarations without a handwritten source fallbac
   expect(manifest.exports['.'].types).toBe('./dist/index.d.ts')
   expect(existsSync(join(installed, 'src'))).toBe(false)
   expect(readFileSync(join(installed, 'dist/index.d.ts'), 'utf8')).toContain('QueryClient')
+})
+
+it('publishes client runtime sources without tests or benchmark baselines', () => {
+  const installed = join(directory, 'node_modules/@luxojs/client')
+  const sources = readdirSync(join(installed, 'src'), { recursive: true, encoding: 'utf8' })
+  expect(sources).toContain('index.ts')
+  expect(sources).toContain('codec.ts')
+  expect(sources.filter(name => /\.(test|bench)\.ts$/.test(name))).toEqual([])
 })
 
 it.each(['cts', 'mts'])('type-checks and executes a packed .%s consumer with TS 7', async extension => {

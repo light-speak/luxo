@@ -27,31 +27,14 @@ type APIRegistry struct {
 	schema     *schema.Schema
 }
 
-// SetSchema configures return-model metadata used to decode binary field masks.
-func (r *APIRegistry) SetSchema(s *schema.Schema) {
-	r.schema = s
-}
-
-// RegisterSchemaAPIs builds protocol routing metadata from a complete runtime
-// schema. Pure gateways use this because they own no generated handlers that
-// could register API IDs and parameter layouts individually.
-func (r *APIRegistry) RegisterSchemaAPIs(s *schema.Schema) {
-	r.SetSchema(s)
-	for name, definition := range s.APIs {
-		r.Register(name, definition.ID)
-		params := make([]ParamMeta, len(definition.Params))
-		for i, param := range definition.Params {
-			params[i] = ParamMeta{
-				Name:     param.Name,
-				Type:     param.Type.String(),
-				TypeName: param.TypeName,
-				FieldID:  param.ID,
-				IsList:   param.IsList,
-				Nullable: param.Nullable,
-			}
-		}
-		r.RegisterParams(name, params)
+// SetSchema validates return metadata during startup before replacing it.
+// Finish all registration before serving requests; online mutation is unsupported.
+func (r *APIRegistry) SetSchema(s *schema.Schema) error {
+	if err := s.Prepare(); err != nil {
+		return err
 	}
+	r.schema = s
+	return nil
 }
 
 // ParamMeta describes an API parameter for binary decoding.
@@ -70,13 +53,13 @@ type BinaryMessage []byte
 // BinaryMessages is a list of length-delimited structured Luxo values.
 type BinaryMessages [][]byte
 
-const maxFieldMaskSize = 10 * 1024 // 10KB = 80,000 fields max
+const maxFieldMaskSize = 10 * 1024 // Entire encoded selection tree, not the per-level field ID limit.
 
 const (
 	// BinaryFiltersFieldID and BinarySortersFieldID are reserved request TLV
 	// field IDs for list controls. User parameter IDs must remain below them.
-	BinaryFiltersFieldID = (1 << 31) - 2
-	BinarySortersFieldID = (1 << 31) - 1
+	BinaryFiltersFieldID = codec.FiltersFieldID
+	BinarySortersFieldID = codec.SortersFieldID
 )
 
 var filterOperators = [...]string{
@@ -93,23 +76,6 @@ func NewAPIRegistry() *APIRegistry {
 	}
 }
 
-// Register adds an API to the registry.
-func (r *APIRegistry) Register(name string, id int) {
-	r.idToName[id] = name
-	r.nameToID[name] = id
-}
-
-// RegisterParams sets the ordered parameter metadata for an API.
-// Builds a static name list for zero-alloc param lookup at request time.
-func (r *APIRegistry) RegisterParams(name string, params []ParamMeta) {
-	r.paramOrder[name] = params
-	names := make([]string, len(params))
-	for i, p := range params {
-		names[i] = p.Name
-	}
-	r.paramNames[name] = names
-}
-
 // NameByID returns the API name for a given ID.
 func (r *APIRegistry) NameByID(id int) (string, bool) {
 	name, ok := r.idToName[id]
@@ -123,11 +89,13 @@ func (r *APIRegistry) IDByName(name string) (int, bool) {
 }
 
 // ParamOrder returns param metadata for an API (used by RPC server).
+// The returned slice is read-only and remains owned by the registry.
 func (r *APIRegistry) ParamOrder(name string) []ParamMeta {
 	return r.paramOrder[name]
 }
 
 // ParamNames returns the static param name list for an API (used by RPC server).
+// The returned slice is read-only and remains owned by the registry.
 func (r *APIRegistry) ParamNames(name string) []string {
 	return r.paramNames[name]
 }
@@ -138,7 +106,7 @@ func (r *APIRegistry) ParamNames(name string) []string {
 //	[API ID varint] [Field Mask length varint] [Field Mask bytes] [Params...]
 //	Params: [fieldID varint] [value] ... [0x00 terminator]
 //
-// Params are decoded to json.RawMessage so existing handlers work unchanged.
+// Params are decoded into typed slots; structured values retain their message bytes.
 func (r *APIRegistry) ParseBinaryRequest(body []byte) (*Request, error) {
 	req := new(Request)
 	if err := r.ParseBinaryRequestInto(body, req); err != nil {
@@ -192,6 +160,7 @@ func (r *APIRegistry) ParseBinaryRequestInto(body []byte, req *Request) error {
 }
 
 func (r *APIRegistry) prepareJSONRequest(req *Request) error {
+	req.clearPreparedJSON()
 	apiID, registered := r.nameToID[req.API]
 	if !registered {
 		return nil
@@ -200,6 +169,7 @@ func (r *APIRegistry) prepareJSONRequest(req *Request) error {
 	applyPaginationDefaults(req, definition)
 	params, err := r.encodeJSONRequestParams(req, definition)
 	if err != nil {
+		req.clearPreparedJSON()
 		return err
 	}
 	request := make([]byte, 0, 20+len(req.FieldMask)+len(params))
@@ -233,6 +203,9 @@ func applyPaginationDefaults(req *Request, definition *schema.API) {
 
 func (r *APIRegistry) encodeJSONRequestParams(req *Request, definition *schema.API) ([]byte, error) {
 	meta := r.paramOrder[req.API]
+	if len(meta) > len(req.paramSlots) {
+		return nil, fmt.Errorf("too many params (max %d) for API %s", len(req.paramSlots), req.API)
+	}
 	if err := validateKnownJSONParams(req, meta); err != nil {
 		return nil, err
 	}
@@ -247,6 +220,14 @@ func (r *APIRegistry) encodeJSONRequestParams(req *Request, definition *schema.A
 		}
 		if err := encodeBinaryParam(&enc, meta[i], value); err != nil {
 			return nil, err
+		}
+		if meta[i].Type == "Model" {
+			if req.paramNames == nil {
+				req.paramNames = r.paramNames[req.API]
+				req.paramCount = len(meta)
+			}
+			req.paramSlots[i] = value
+			req.markParamPresent(i)
 		}
 	}
 	if len(req.Filters) > 0 {
@@ -392,6 +373,9 @@ func (r *APIRegistry) parseBinaryHeader(body []byte) (string, []*selection.Field
 	if n <= 0 {
 		return "", nil, nil, 0, fmt.Errorf("invalid API ID varint")
 	}
+	if apiID == 0 || apiID > codec.MaxAPIID {
+		return "", nil, nil, 0, fmt.Errorf("API ID %d is outside 1..%d", apiID, codec.MaxAPIID)
+	}
 	apiName, ok := r.idToName[int(apiID)]
 	if !ok {
 		return "", nil, nil, 0, fmt.Errorf("unknown API ID: %d", apiID)
@@ -457,6 +441,9 @@ func (d *binaryParamDecoder) readFieldID() (uint64, error) {
 	}
 	if n == 0 {
 		return 0, fmt.Errorf("truncated param field ID")
+	}
+	if fieldID > codec.SortersFieldID {
+		return 0, fmt.Errorf("param field ID %d exceeds protocol limit", fieldID)
 	}
 	d.off += n
 	return fieldID, nil
@@ -563,22 +550,14 @@ func decodeFieldMask(mask []byte, model *schema.Model, schemas *schema.Schema, d
 	if !ok {
 		return nil, fmt.Errorf("invalid field mask for %s", model.Name)
 	}
-	fields := make([]*selection.Field, 0, len(model.Fields))
-	selectedByID := make(map[int]*selection.Field)
-	for i := range model.Fields {
-		field := &model.Fields[i]
-		if !codec.FieldMaskHas(fieldMask, field.ID) {
-			continue
-		}
-		selected := &selection.Field{Name: field.Name}
-		if field.Relation {
-			selected.Children = []*selection.Field{}
-		}
-		fields = append(fields, selected)
-		selectedByID[field.ID] = selected
+	// Only nested selections need an ID index; scalar-only masks never use it.
+	var selectedByID map[int]*selection.Field
+	if len(children) > 0 {
+		selectedByID = make(map[int]*selection.Field)
 	}
-	if countFieldMaskBits(fieldMask) != len(fields) {
-		return nil, fmt.Errorf("field mask for %s contains an unknown field ID", model.Name)
+	fields, err := allocateSelectedFields(fieldMask, model, selectedByID)
+	if err != nil {
+		return nil, err
 	}
 	for off := 0; off < len(children); {
 		fieldID, n := codec.ReadVarint(children, off)
@@ -605,6 +584,39 @@ func decodeFieldMask(mask []byte, model *schema.Model, schemas *schema.Schema, d
 	return fields, nil
 }
 
+func allocateSelectedFields(mask []byte, model *schema.Model, relations map[int]*selection.Field) ([]*selection.Field, error) {
+	count := countFieldMaskBits(mask)
+	if count > len(model.Fields) {
+		return nil, fmt.Errorf("field mask for %s contains an unknown field ID", model.Name)
+	}
+	// Each request owns one contiguous node block and its pointer view. Neither
+	// the registered schema nor another decoded tree shares mutable nodes.
+	nodes := make([]selection.Field, count)
+	fields := make([]*selection.Field, 0, count)
+	for i := range model.Fields {
+		field := &model.Fields[i]
+		if !codec.FieldMaskHas(mask, field.ID) {
+			continue
+		}
+		if len(fields) == count {
+			return nil, fmt.Errorf("field mask for %s matches duplicate schema field IDs", model.Name)
+		}
+		selected := &nodes[len(fields)]
+		selected.Name = field.Name
+		if field.Relation {
+			selected.Children = []*selection.Field{}
+			if relations != nil {
+				relations[field.ID] = selected
+			}
+		}
+		fields = append(fields, selected)
+	}
+	if len(fields) != count {
+		return nil, fmt.Errorf("field mask for %s contains an unknown field ID", model.Name)
+	}
+	return fields, nil
+}
+
 func countFieldMaskBits(mask []byte) int {
 	count := 0
 	for _, value := range mask {
@@ -613,9 +625,10 @@ func countFieldMaskBits(mask []byte) int {
 	return count
 }
 
-// EncodeBinaryRequest creates a canonical Luxo binary request.
+// EncodeBinaryRequest creates a canonical Luxo binary request. JSON values must
+// be json.RawMessage documents (or document lists), not arbitrary Go objects.
 func EncodeBinaryRequest(apiID int, fieldMask []byte, params map[string]any, paramMeta []ParamMeta) ([]byte, error) {
-	if apiID <= 0 {
+	if apiID <= 0 || apiID > codec.MaxAPIID {
 		return nil, fmt.Errorf("invalid API ID %d", apiID)
 	}
 	if len(fieldMask) > maxFieldMaskSize {
@@ -634,6 +647,9 @@ func EncodeBinaryRequest(apiID int, fieldMask []byte, params map[string]any, par
 	var enc codec.Encoder
 	known := make(map[string]struct{}, len(paramMeta))
 	for _, meta := range paramMeta {
+		if meta.FieldID <= 0 {
+			return nil, fmt.Errorf("param %s: invalid field ID %d", meta.Name, meta.FieldID)
+		}
 		if meta.FieldID >= BinaryFiltersFieldID {
 			return nil, fmt.Errorf("param %s: field ID %d is reserved", meta.Name, meta.FieldID)
 		}
@@ -843,6 +859,9 @@ func encodeBinaryScalarValue(enc *codec.Encoder, meta ParamMeta, value any) bool
 		}
 	case "JSON":
 		if raw, ok := binaryJSON(value); ok {
+			if !meta.Nullable && isJSONNull(raw) {
+				return false
+			}
 			enc.WriteBytes(raw)
 			return true
 		}
@@ -906,14 +925,20 @@ func binaryDecimal(value any) (string, bool) {
 }
 
 func binaryJSON(value any) ([]byte, bool) {
-	if raw, ok := value.(json.RawMessage); ok {
-		return raw, jsonutil.ValidUTF8JSON(raw)
-	}
-	raw, err := json.Marshal(value)
-	return raw, err == nil
+	raw, ok := value.(json.RawMessage)
+	return raw, ok && jsonutil.ValidUTF8JSON(raw)
+}
+
+func isJSONNull(raw []byte) bool {
+	return bytes.Equal(bytes.Trim(raw, " \t\r\n"), []byte("null"))
 }
 
 func encodeBinaryListValue(enc *codec.Encoder, meta ParamMeta, value any) error {
+	if meta.Type == "JSON" {
+		if documents, ok := value.([]json.RawMessage); ok {
+			return encodeJSONDocuments(enc, meta, documents)
+		}
+	}
 	if meta.Type == "Model" {
 		messages, ok := value.(BinaryMessages)
 		if !ok {
@@ -1268,6 +1293,9 @@ func readBinaryJSONParam(buf []byte, off int, meta ParamMeta) (any, int, error) 
 	}
 	if !jsonutil.ValidUTF8JSON(value) {
 		return nil, 0, fmt.Errorf("param %s: invalid JSON", meta.Name)
+	}
+	if !meta.Nullable && isJSONNull(value) {
+		return nil, 0, fmt.Errorf("param %s: expected a non-null JSON value", meta.Name)
 	}
 	return json.RawMessage(value), consumed, nil
 }

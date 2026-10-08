@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 )
@@ -17,13 +18,14 @@ type costKey struct {
 }
 
 type approvedCost struct {
-	ID        string `json:"id"`
-	BaseSHA   string `json:"baseSHA"`
-	Package   string `json:"package"`
-	Benchmark string `json:"benchmark"`
-	MaxBytes  int64  `json:"maxBytes"`
-	MaxAllocs int64  `json:"maxAllocs"`
-	Reason    string `json:"reason"`
+	ID             string  `json:"id"`
+	BaseSHA        string  `json:"baseSHA"`
+	Package        string  `json:"package"`
+	Benchmark      string  `json:"benchmark"`
+	MaxBytes       int64   `json:"maxBytes"`
+	MaxAllocs      int64   `json:"maxAllocs"`
+	MaxNanoseconds float64 `json:"maxNanoseconds,omitempty"`
+	Reason         string  `json:"reason"`
 }
 
 type costPolicy struct {
@@ -42,7 +44,7 @@ func parseGateOptions(args []string) (gateOptions, []string, error) {
 	flags := flag.NewFlagSet("benchgate", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	flags.BoolVar(&options.confirmation, strings.TrimPrefix(confirmationFlag, "--"), false, "require a second sample group")
-	flags.StringVar(&path, "approved-costs", "", "reviewed compilation cost policy")
+	flags.StringVar(&path, "approved-costs", "", "reviewed sample cost policy")
 	flags.StringVar(&base, "base-sha", "", "exact benchmark baseline commit")
 	if err := flags.Parse(args); err != nil {
 		return options, nil, fmt.Errorf("%w: %v", usageError(), err)
@@ -114,16 +116,63 @@ func (cost approvedCost) validate() error {
 	}
 	switch cost.Package {
 	case "github.com/light-speak/luxo/pkg/semantic", "github.com/light-speak/luxo/pkg/codegen":
+	case "github.com/light-speak/luxo/pkg/lockfile":
+		if cost.Benchmark != "Update-2" && cost.Benchmark != "SaveLoad-2" {
+			return fmt.Errorf("lockfile approval requires a reviewed sample, got %q", cost.Benchmark)
+		}
+	case "github.com/light-speak/luxo/pkg/lux/auth":
+		if cost.Benchmark != "VerifyUncached-2" {
+			return fmt.Errorf("runtime approval is limited to the reviewed VerifyUncached-2 sample, got %q", cost.Benchmark)
+		}
+	case "github.com/light-speak/luxo/pkg/lux/api", "github.com/light-speak/luxo/pkg/lux/codec", "github.com/light-speak/luxo/pkg/lux/event":
+		if !cost.permitsRuntimeTimeBudget() {
+			return fmt.Errorf("runtime approval requires an exact reviewed sample, got %q", cost.Benchmark)
+		}
 	default:
-		return fmt.Errorf("approved costs cannot exempt package %q; only compiler work is eligible", cost.Package)
+		return fmt.Errorf("approved costs cannot exempt unreviewed package %q", cost.Package)
 	}
 	if cost.Benchmark == "" || strings.ContainsAny(cost.Benchmark, "*?[] \t\r\n") {
 		return errors.New("approved cost requires an exact benchmark name, without wildcards")
 	}
-	if cost.MaxBytes < 0 || cost.MaxAllocs < 0 || cost.MaxBytes == 0 && cost.MaxAllocs == 0 {
+	if cost.MaxBytes < 0 || cost.MaxAllocs < 0 || cost.MaxBytes == 0 && cost.MaxAllocs == 0 && cost.MaxNanoseconds == 0 {
 		return errors.New("approved cost requires nonnegative allocation limits and at least one positive limit")
 	}
+	if math.IsNaN(cost.MaxNanoseconds) || math.IsInf(cost.MaxNanoseconds, 0) || cost.MaxNanoseconds < 0 || cost.MaxNanoseconds > 0 && !cost.permitsTimeBudget() {
+		return errors.New("time approval requires a finite nonnegative limit and an exact reviewed sample")
+	}
 	return nil
+}
+
+func (cost approvedCost) permitsTimeBudget() bool {
+	switch cost.Package {
+	case "github.com/light-speak/luxo/pkg/codegen":
+		return cost.Benchmark == "Generate-2" || cost.Benchmark == "GenerateModelFile-2"
+	case "github.com/light-speak/luxo/pkg/semantic":
+		return cost.Benchmark == "Analyze-2"
+	case "github.com/light-speak/luxo/pkg/lockfile":
+		return cost.Benchmark == "Update-2"
+	default:
+		return cost.permitsRuntimeTimeBudget()
+	}
+}
+
+func (cost approvedCost) permitsRuntimeTimeBudget() bool {
+	if cost.Package == "github.com/light-speak/luxo/pkg/lux/event" {
+		return cost.Benchmark == "ChanBusEmit-2"
+	}
+	if cost.Package == "github.com/light-speak/luxo/pkg/lux/api" {
+		return cost.Benchmark == "ParseBinaryRequestPaginatedDefaults-2"
+	}
+	if cost.Package != "github.com/light-speak/luxo/pkg/lux/codec" {
+		return false
+	}
+	switch cost.Benchmark {
+	case "ReadStringVsArena/Arena-2", "ReadStringVsArena/NoArena-2",
+		"ColumnarStringArena-2", "ColumnarStringNoArena-2", "RowWrite10-2", "EncodeEvent-2", "DecodeEvent-2":
+		return true
+	default:
+		return false
+	}
 }
 
 // An approval applies only after both complete sample groups have been compared.
@@ -131,7 +180,7 @@ func applyApprovedCosts(result *evaluation, primary, confirmation evaluation, co
 	remaining := result.Regressions[:0]
 	for _, item := range result.Regressions {
 		cost, exists := costs[costKey{item.Key.Package, item.Key.Benchmark}]
-		if !exists || item.Key.Unit == "sec/op" {
+		if !exists || item.Key.Unit == "sec/op" && cost.MaxNanoseconds == 0 {
 			remaining = append(remaining, item)
 			continue
 		}
@@ -140,11 +189,15 @@ func applyApprovedCosts(result *evaluation, primary, confirmation evaluation, co
 			return err
 		}
 		if !accepted {
-			item.Description += fmt.Sprintf("; approved limits: +%d B/op, +%d allocs/op (%s)", cost.MaxBytes, cost.MaxAllocs, cost.ID)
+			item.Description += fmt.Sprintf("; approved limits: %s (%s)", cost.limits(), cost.ID)
 			remaining = append(remaining, item)
 			continue
 		}
-		if _, err := fmt.Fprintf(output, "approved compilation cost: %s; %s; limits +%d B/op, +%d allocs/op; baseline %s; %s\n", cost.ID, item.Description, cost.MaxBytes, cost.MaxAllocs, cost.BaseSHA, cost.Reason); err != nil {
+		label := "allocation"
+		if item.Key.Unit == "sec/op" {
+			label = "time"
+		}
+		if _, err := fmt.Fprintf(output, "approved %s cost: %s; %s; limits %s; baseline %s; %s\n", label, cost.ID, item.Description, cost.limits(), cost.BaseSHA, cost.Reason); err != nil {
 			return err
 		}
 	}
@@ -152,8 +205,28 @@ func applyApprovedCosts(result *evaluation, primary, confirmation evaluation, co
 	return nil
 }
 
+func (cost approvedCost) limits() string {
+	text := fmt.Sprintf("+%d B/op, +%d allocs/op", cost.MaxBytes, cost.MaxAllocs)
+	if cost.MaxNanoseconds > 0 {
+		text += fmt.Sprintf(", +%g ns/op", cost.MaxNanoseconds)
+	}
+	return text
+}
+
 func (cost approvedCost) accepts(groups ...evaluation) (bool, error) {
 	for _, group := range groups {
+		if cost.MaxNanoseconds > 0 {
+			values, exists := group.Measurements[comparisonKey{cost.Package, cost.Benchmark, "sec/op"}]
+			if !exists {
+				return false, fmt.Errorf("approved cost %q requires sec/op measurements", cost.ID)
+			}
+			// Unit conversion and addition can differ by one floating-point representation step.
+			// This is not a percentage tolerance or an extra nanosecond budget.
+			ceiling := math.Nextafter(values.Base+cost.MaxNanoseconds/1e9, math.Inf(1))
+			if values.Head > ceiling {
+				return false, nil
+			}
+		}
 		for _, limit := range []struct {
 			unit    string
 			maximum int64

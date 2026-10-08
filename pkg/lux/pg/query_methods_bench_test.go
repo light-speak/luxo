@@ -46,6 +46,31 @@ func scanMethodValue(rows Rows) (*int64, error) {
 	return &value, err
 }
 
+func BenchmarkQueryFirstContract(b *testing.B) {
+	for _, required := range []bool{false, true} {
+		name := "optional"
+		if required {
+			name = "required"
+		}
+		b.Run(name, func(b *testing.B) {
+			db := &DB{conn: &queryMethodConn{rows: queryMethodRows{value: 42}}}
+			query := NewQuery(db, "values", scanMethodValue, nil)
+			read := query.First
+			if required {
+				read = query.FirstRequired
+			}
+			ctx := context.Background()
+			b.ReportAllocs()
+			for b.Loop() {
+				value, err := read(ctx)
+				if err != nil || value == nil || *value != 42 {
+					b.Fatal(value, err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkDBQueryDispatch(b *testing.B) {
 	db := &DB{conn: &queryMethodConn{rows: queryMethodRows{value: 42}}}
 	ctx := context.Background()

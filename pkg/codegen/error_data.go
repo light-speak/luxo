@@ -10,17 +10,19 @@ import (
 )
 
 type errorDataGenerator struct {
-	objects map[string][]*ast.FieldDecl
-	enums   map[string]bool
-	queued  map[string]bool
-	queue   []string
+	objectPrefix string
+	objects      map[string][]*ast.FieldDecl
+	enums        map[string]bool
+	queued       map[string]bool
+	queue        []string
 }
 
 func newErrorDataGenerator(result *semantic.Result, generator *GeneratorContext) *errorDataGenerator {
 	g := &errorDataGenerator{
-		objects: make(map[string][]*ast.FieldDecl),
-		enums:   generator.allEnums(collectEnums(result)),
-		queued:  make(map[string]bool),
+		objectPrefix: "Error",
+		objects:      make(map[string][]*ast.FieldDecl),
+		enums:        generator.allEnums(collectEnums(result)),
+		queued:       make(map[string]bool),
 	}
 	for _, file := range result.Files {
 		for _, model := range file.Models {
@@ -103,6 +105,7 @@ func (g *errorDataGenerator) writeValue(b *strings.Builder, ref *ast.TypeRef, va
 
 func (g *errorDataGenerator) writeScalar(b *strings.Builder, ref *ast.TypeRef, value string, text bool, indent string) {
 	if g.enums[ref.Name] {
+		fmt.Fprintf(b, "%sif !%s.IsValid() { w.Reject(%q); return }\n", indent, value, "error data: undeclared enum value for "+ref.Name)
 		value = "string(" + value + ")"
 		g.writeString(b, value, text, indent)
 		return
@@ -113,7 +116,7 @@ func (g *errorDataGenerator) writeScalar(b *strings.Builder, ref *ast.TypeRef, v
 			g.queue = append(g.queue, ref.Name)
 		}
 		value = "&" + value
-		fmt.Fprintf(b, "%sappendError%sJSON(w, %s)\n", indent, ref.Name, value)
+		fmt.Fprintf(b, "%sappend%s%sJSON(w, %s)\n", indent, g.objectPrefix, ref.Name, value)
 		return
 	}
 	method := map[string]string{"Int": "Int", "Duration": "Int", "Float": "Float", "Boolean": "Bool", "DateTime": "Time", "Bytes": "Bytes", "JSON": "JSON"}[ref.Name]
@@ -145,7 +148,7 @@ func (g *errorDataGenerator) writeString(b *strings.Builder, value string, text 
 func (g *errorDataGenerator) writeObjects(b *strings.Builder) {
 	for next := 0; next < len(g.queue); next++ {
 		name := g.queue[next]
-		fmt.Fprintf(b, "func appendError%sJSON(w *errors.DataWriter, value *%s) {\n", name, name)
+		fmt.Fprintf(b, "func append%s%sJSON(w *errors.DataWriter, value *%s) {\n", g.objectPrefix, name, name)
 		b.WriteString("\tif value == nil { w.Token(\"null\"); return }\n\tif !w.Enter() { return }\n\tw.Token(\"{\")\n")
 		index := 0
 		for _, field := range g.objects[name] {
@@ -153,7 +156,7 @@ func (g *errorDataGenerator) writeObjects(b *strings.Builder) {
 				continue
 			}
 			writeErrorFieldName(b, field.Name, index, "\t")
-			fmt.Fprintf(b, "\tappendError%sField%d(w, value)\n", name, index)
+			fmt.Fprintf(b, "\tappend%s%sField%d(w, value)\n", g.objectPrefix, name, index)
 			index++
 		}
 		b.WriteString("\tw.Token(\"}\")\n\tw.Leave()\n}\n\n")
@@ -162,7 +165,7 @@ func (g *errorDataGenerator) writeObjects(b *strings.Builder) {
 			if hasDirective(field.Directives, "hidden") || hasDirective(field.Directives, "internal") {
 				continue
 			}
-			fmt.Fprintf(b, "func appendError%sField%d(w *errors.DataWriter, value *%s) {\n", name, index, name)
+			fmt.Fprintf(b, "func append%s%sField%d(w *errors.DataWriter, value *%s) {\n", g.objectPrefix, name, index, name)
 			b.WriteString("\tif w.Err() != nil { return }\n")
 			g.writeValue(b, field.Type, "value."+str.Capitalize(field.Name), isRelationField(field, g.enums), false, "\t")
 			b.WriteString("}\n\n")

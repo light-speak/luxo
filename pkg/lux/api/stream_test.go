@@ -1,6 +1,8 @@
 package api
 
 import (
+	"github.com/light-speak/luxo/internal/testutil"
+
 	"bytes"
 	"context"
 	"errors"
@@ -115,6 +117,132 @@ func TestStreamSingleProjectionDoesNotAllocateCache(t *testing.T) {
 	})
 	if allocs != 0 {
 		t.Fatalf("single projection allocated cache: %g", allocs)
+	}
+}
+
+func TestStreamDispatchMatcherReusesDefaultEncoding(t *testing.T) {
+	hub := NewStreamHub()
+	encoded, matched := 0, 0
+	matcher := func(data []byte, _ *StreamParams, _ any) bool {
+		matched++
+		if string(data) != "default" {
+			t.Errorf("matcher received projected data: %q", data)
+		}
+		return true
+	}
+	encode := func(_ any, mask []byte) ([]byte, error) {
+		encoded++
+		if len(mask) == 0 {
+			return []byte("default"), nil
+		}
+		return []byte("projected"), nil
+	}
+	if err := hub.Dispatch("watch", nil, matcher, encode); err != nil || encoded != 0 || matched != 0 {
+		t.Fatalf("empty topic performed work: encoded=%d matched=%d err=%v", encoded, matched, err)
+	}
+	for _, mask := range [][]byte{nil, nil, {1, 1}} {
+		sub := hub.Subscribe("watch", nil, nil, mask, nil)
+		defer hub.Unsubscribe("watch", sub)
+	}
+	if err := hub.Dispatch("watch", nil, matcher, encode); err != nil {
+		t.Fatal(err)
+	}
+	if encoded != 2 || matched != 3 {
+		t.Fatalf("default encoding was not shared: encoded=%d matched=%d", encoded, matched)
+	}
+	for index, sub := range hub.subs["watch"] {
+		want := "default"
+		if index == 2 {
+			want = "projected"
+		}
+		select {
+		case data := <-sub.Ch:
+			if string(data) != want {
+				t.Errorf("subscriber %d received %q, want %q", index, data, want)
+			}
+		default:
+			t.Errorf("subscriber %d did not receive the event", index)
+		}
+	}
+}
+
+func TestStreamDispatchSeparatesProjectionAndMode(t *testing.T) {
+	hub := NewStreamHub()
+	for _, choice := range []struct {
+		mask byte
+		mode bool
+	}{{1, true}, {2, true}, {2, false}, {3, true}, {2, true}, {2, false}} {
+		sub := hub.SubscribeMode("watch", nil, nil, []byte{1, choice.mask}, choice.mode, nil)
+		defer hub.Unsubscribe("watch", sub)
+	}
+	calls := make(map[string]int)
+	for round := range 2 {
+		err := hub.DispatchPreparedEvent("watch", nil, func(mask []byte, binary bool) ([]byte, error) {
+			key := fmt.Sprintf("%t/%x", binary, mask)
+			calls[key]++
+			return []byte(fmt.Sprintf("%d/%s", round, key)), nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, sub := range hub.subs["watch"] {
+			want := fmt.Sprintf("%d/%t/%x", round, sub.Binary, sub.FieldMask)
+			select {
+			case data := <-sub.Ch:
+				if string(data) != want {
+					t.Errorf("projection, mode or event crossed: got %q, want %q", data, want)
+				}
+			default:
+				t.Errorf("missing event %q", want)
+			}
+		}
+	}
+	if len(calls) != 4 {
+		t.Fatalf("encoded %d combinations, want 4", len(calls))
+	}
+	for key, count := range calls {
+		if count != 2 {
+			t.Errorf("%s encoded %d times, want once per event", key, count)
+		}
+	}
+}
+
+func TestSlowStreamReleasesOutsideHubLockOnce(t *testing.T) {
+	hub := NewStreamHub()
+	writerCtx, stopWriter := context.WithCancel(t.Context())
+	defer stopWriter()
+	released := 0
+	prepared := preparedStream{release: func() {
+		released++
+		if writerCtx.Err() != context.Canceled {
+			t.Error("release ran before stopping the writer")
+		}
+		if !hub.mu.TryLock() {
+			t.Error("release ran while holding the hub lock")
+			return
+		}
+		defer hub.mu.Unlock()
+		if len(hub.subs["watch"]) != 1 {
+			t.Error("release ran before removing the slow subscriber")
+		}
+	}}
+	slow := hub.subscribePreparedMode("watch", nil, nil, nil, true, nil, stopWriter, prepared)
+	for range cap(slow.Ch) {
+		slow.Ch <- []byte("queued")
+	}
+	fast := hub.Subscribe("watch", nil, nil, nil, nil)
+	defer hub.Unsubscribe("watch", fast)
+	hub.DispatchEncoded("watch", []byte("next"), nil)
+	if released != 1 || !slow.closed || !errors.Is(slow.result, ErrStreamFull) || hub.SubCount("watch") != 1 {
+		t.Fatalf("slow subscriber was not released: released=%d closed=%t result=%v", released, slow.closed, slow.result)
+	}
+	if len(fast.Ch) != 1 || string(<-fast.Ch) != "next" {
+		t.Fatal("slow subscriber cleanup interrupted the healthy subscriber")
+	}
+	hub.removeSlowSubscribers("watch", []*StreamSub{slow})
+	hub.Unsubscribe("watch", slow)
+	if released != 1 || hub.SubCount("watch") != 1 {
+		t.Fatal("repeated cleanup released twice or removed the healthy subscriber")
 	}
 }
 
@@ -401,10 +529,10 @@ func TestStreamHub_NoSubscribers(t *testing.T) {
 
 func TestRouterOpenInternalStreamUsesCanonicalSubscriptionLifecycle(t *testing.T) {
 	rt := NewRouter()
-	rt.Schema.RegisterAPI(&schema.API{Name: "watchInternal", Stream: true})
+	rt.Schema.RegisterAPI(&schema.API{ID: 71, Name: "watchInternal", Stream: true})
 	rt.Registry.Register("watchInternal", 71)
 	rt.Registry.RegisterParams("watchInternal", []ParamMeta{{Name: "id", Type: "Int", FieldID: 1}})
-	mask := codec.AppendSelectionMask(nil, []byte{1}, nil)
+	mask := testutil.Bytes(t)(codec.AppendSelectionMask(nil, []byte{1}, nil))
 	requestData, err := EncodeBinaryRequest(71, mask, map[string]any{"id": int64(42)}, rt.Registry.ParamOrder("watchInternal"))
 	if err != nil {
 		t.Fatal(err)

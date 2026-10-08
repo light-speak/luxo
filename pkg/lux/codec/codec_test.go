@@ -13,6 +13,37 @@ import (
 
 // --- Wire-level tests ---
 
+func TestNullableRootEnvelope(t *testing.T) {
+	for _, test := range []struct {
+		data        []byte
+		null, valid bool
+	}{
+		{nil, false, false}, {[]byte{0}, true, true}, {[]byte{1}, false, false},
+		{[]byte{2}, false, false}, {[]byte{0, 0}, false, false},
+		{[]byte{1, 0}, false, true}, {[]byte{1, 84}, false, true},
+	} {
+		value, null, err := UnwrapNullableRoot(test.data)
+		if (err == nil) != test.valid || null != test.null {
+			t.Fatalf("%x: %x %v %v", test.data, value, null, err)
+		}
+		if err != nil && !errors.Is(err, ErrInvalidNullableRoot) {
+			t.Fatal(err)
+		}
+		if test.valid && !bytes.Equal(value, test.data[1:]) {
+			t.Fatal("changed payload")
+		}
+		if test.valid && !null && &value[0] != &test.data[1] {
+			t.Fatal("copied payload")
+		}
+	}
+	if allocations := testing.AllocsPerRun(100, func() {
+		_, _, _ = UnwrapNullableRoot([]byte{0})
+		_, _, _ = UnwrapNullableRoot([]byte{1, 84})
+	}); allocations != 0 {
+		t.Fatalf("root envelope allocated: %v", allocations)
+	}
+}
+
 func TestColumnarReaderHeaderDoesNotAllocate(t *testing.T) {
 	data := []byte{1, 0, 1, 0, 0}
 	allocs := testing.AllocsPerRun(100, func() {
@@ -160,6 +191,27 @@ func TestEncoderDecoderRoundTrip(t *testing.T) {
 	}
 	if assigneeId != 7 {
 		t.Fatalf("assigneeId: got %d", assigneeId)
+	}
+}
+
+func TestEncoderReusesSuppliedBuffer(t *testing.T) {
+	buffer := make([]byte, 1, 64)
+	buffer[0] = 99
+	enc := NewEncoder(buffer)
+	enc.WriteFieldInt(1, 42)
+	enc.WriteEnd()
+	encoded := enc.Bytes()
+	if encoded[0] != 99 || &encoded[0] != &buffer[0] {
+		t.Fatal("encoder lost prefix or copied supplied storage")
+	}
+	dec := NewDecoder(encoded[1:])
+	if !dec.NextField() || dec.FieldID() != 1 || dec.ReadInt() != 42 || dec.NextField() || dec.Finish() != nil {
+		t.Fatal("invalid appended message")
+	}
+	enc.Reset()
+	enc.WriteEnd()
+	if len(enc.Bytes()) != 1 || &enc.Bytes()[0] != &buffer[0] {
+		t.Fatal("reset did not reuse storage")
 	}
 }
 
@@ -460,9 +512,9 @@ func BenchmarkDecodeEvent(b *testing.B) {
 // --- Field Mask ---
 
 func TestFieldMaskHas(t *testing.T) {
-	mask := FieldMaskSet(nil, 1)
-	mask = FieldMaskSet(mask, 3)
-	mask = FieldMaskSet(mask, 9)
+	mask := testutil.Bytes(t)(FieldMaskSet(nil, 1))
+	mask = testutil.Bytes(t)(FieldMaskSet(mask, 3))
+	mask = testutil.Bytes(t)(FieldMaskSet(mask, 9))
 
 	if !FieldMaskHas(mask, 1) {
 		t.Error("should have field 1")
@@ -485,7 +537,7 @@ func TestFieldMaskNilIsAll(t *testing.T) {
 }
 
 func TestFieldMaskAll(t *testing.T) {
-	mask := FieldMaskAll(12)
+	mask := testutil.Bytes(t)(FieldMaskAll(12))
 	for i := 1; i <= 12; i++ {
 		if !FieldMaskHas(mask, i) {
 			t.Errorf("FieldMaskAll(12) should have field %d", i)
@@ -1797,18 +1849,18 @@ func TestColumnarSkipUUIDPtrErrors(t *testing.T) {
 // --- FieldMask edge cases ---
 
 func TestFieldMaskSetInvalid(t *testing.T) {
-	mask := FieldMaskSet(nil, 0)
-	if mask != nil {
+	mask, err := FieldMaskSet(nil, 0)
+	if err == nil || mask != nil {
 		t.Error("fieldID 0 should not set anything")
 	}
-	mask = FieldMaskSet(nil, -1)
-	if mask != nil {
+	mask, err = FieldMaskSet(nil, -1)
+	if err == nil || mask != nil {
 		t.Error("negative fieldID should not set anything")
 	}
 }
 
 func TestFieldMaskHasInvalid(t *testing.T) {
-	mask := FieldMaskSet(nil, 1)
+	mask := testutil.Bytes(t)(FieldMaskSet(nil, 1))
 	if FieldMaskHas(mask, 0) {
 		t.Error("fieldID 0 should not match")
 	}
@@ -1818,19 +1870,19 @@ func TestFieldMaskHasInvalid(t *testing.T) {
 }
 
 func TestFieldMaskHasBeyondLen(t *testing.T) {
-	mask := FieldMaskSet(nil, 1) // 1 byte
+	mask := testutil.Bytes(t)(FieldMaskSet(nil, 1)) // 1 byte
 	if FieldMaskHas(mask, 100) {
 		t.Error("field beyond mask length should not match")
 	}
 }
 
 func TestFieldMaskAllZero(t *testing.T) {
-	mask := FieldMaskAll(0)
-	if mask != nil {
+	mask, err := FieldMaskAll(0)
+	if err == nil || mask != nil {
 		t.Error("FieldMaskAll(0) should return nil")
 	}
-	mask = FieldMaskAll(-1)
-	if mask != nil {
+	mask, err = FieldMaskAll(-1)
+	if err == nil || mask != nil {
 		t.Error("FieldMaskAll(-1) should return nil")
 	}
 }
@@ -2037,6 +2089,46 @@ func TestDecoderReadBytesPtrNullable(t *testing.T) {
 	got2 := dec2.ReadBytesPtr()
 	if got2 != nil {
 		t.Fatalf("expected nil, got %v", got2)
+	}
+}
+
+func TestDecoderNullableBytesRejectMalformedInput(t *testing.T) {
+	for _, data := range [][]byte{nil, {2}, {255}, {1}, {1, 2, 42}} {
+		dec := NewDecoder(data)
+		if value := dec.ReadBytesPtr(); value != nil || dec.Err() == nil {
+			t.Fatalf("ReadBytesPtr(%x) = %x, err=%v", data, value, dec.Err())
+		}
+		if dec.Finish() == nil || dec.NextField() {
+			t.Fatalf("malformed nullable bytes continued decoding: %x", data)
+		}
+		dec = NewDecoder(data)
+		if value := dec.ReadBytesValuePtr(); value != nil || dec.Err() == nil {
+			t.Fatalf("ReadBytesValuePtr(%x) = %v, err=%v", data, value, dec.Err())
+		}
+	}
+}
+
+func TestDecoderSkipFixed16Boundaries(t *testing.T) {
+	for length := 0; length <= 16; length++ {
+		data := append([]byte{0}, make([]byte, length)...)
+		dec := NewDecoder(data)
+		dec.ReadInt()
+		dec.SkipFixed16()
+		if length < 16 {
+			if dec.Err() == nil || dec.Offset() != 1 || dec.Finish() == nil || dec.NextField() {
+				t.Fatalf("truncated fixed16 advanced or succeeded: length=%d offset=%d err=%v", length, dec.Offset(), dec.Err())
+			}
+		} else if dec.Offset() != 17 || dec.Finish() != nil {
+			t.Fatalf("complete fixed16 failed: offset=%d err=%v", dec.Offset(), dec.Err())
+		}
+	}
+	for _, offset := range []int{-1, 17, math.MaxInt} {
+		dec := NewDecoder(make([]byte, 16))
+		dec.off = offset
+		dec.SkipFixed16()
+		if dec.Err() == nil || dec.Offset() != offset {
+			t.Fatalf("invalid offset %d accepted or changed", offset)
+		}
 	}
 }
 

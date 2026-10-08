@@ -8,12 +8,26 @@ import (
 
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lux"
-	"github.com/light-speak/luxo/pkg/lux/pg"
+	"github.com/light-speak/luxo/pkg/lux/dialect/pg"
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
 )
 
 func pgDialect() lux.Dialect { return pg.Dialect{} }
+
+func TestQualifiedEnumDefaultColumnState(t *testing.T) {
+	for _, value := range []ast.Expr{
+		&ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "ADMIN"},
+		&ast.Ident{Name: "ADMIN"},
+	} {
+		column := buildColumnState(&ast.FieldDecl{
+			Name: "role", Type: &ast.TypeRef{Name: "Role"}, Default: value,
+		}, pgDialect())
+		if column == nil || column.Default != "'ADMIN'" {
+			t.Fatalf("enum default for %T = %#v", value, column)
+		}
+	}
+}
 
 func mkPos() token.Position {
 	return token.Position{File: "test.luxo", Line: 1, Col: 1}
@@ -54,16 +68,27 @@ func TestSaveAndLoadState(t *testing.T) {
 	if loaded.Models["User"].Columns["id"].Type != "SERIAL" {
 		t.Error("column type mismatch")
 	}
+	for _, invalid := range []*SchemaState{nil, {Models: map[string]*ModelState{"User": nil}}, {Models: map[string]*ModelState{"User": {Columns: map[string]*ColumnState{"id": nil}}}}} {
+		if err := SaveState(path, invalid); err == nil {
+			t.Error("saving a malformed state must fail before overwriting the file")
+		}
+		preserved, err := LoadState(path)
+		if err != nil || preserved == nil || preserved.Models["User"] == nil || preserved.Models["User"].Table != "users" {
+			t.Fatalf("rejected save changed the previous state: %v, %v", preserved, err)
+		}
+	}
 }
 
 func TestLoadStateInvalidJSON(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".state.json")
-	os.WriteFile(path, []byte("bad"), 0644)
-
-	_, err := LoadState(path)
-	if err == nil {
-		t.Fatal("should error on invalid JSON")
+	for _, input := range []string{"bad", "null", `{"models":{"User":null}}`, `{"models":{"User":{"table":"users","columns":{"id":null}}}}`} {
+		if err := os.WriteFile(path, []byte(input), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if state, err := LoadState(path); err == nil || state != nil {
+			t.Errorf("invalid state %s returned %v, %v", input, state, err)
+		}
 	}
 }
 
@@ -422,6 +447,17 @@ func TestBuildColumnStateNilType(t *testing.T) {
 	cs := buildColumnState(f, d)
 	if cs != nil {
 		t.Error("nil type should return nil")
+	}
+}
+
+func TestBuildColumnStateQualifiedEnumDefault(t *testing.T) {
+	field := &ast.FieldDecl{
+		Name: "role", Type: &ast.TypeRef{Name: "Role"},
+		Default: &ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "USER"},
+	}
+	column := buildColumnState(field, pgDialect())
+	if column == nil || column.Default != "'USER'" {
+		t.Fatalf("qualified enum default: %+v", column)
 	}
 }
 

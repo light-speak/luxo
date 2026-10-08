@@ -11,7 +11,7 @@ import (
 
 func TestSkipResponseNestedFrames(t *testing.T) {
 	registry := schema.New()
-	registry.RegisterType(&schema.TypeDecl{Name: "Child", Fields: []schema.Field{{ID: 1, Type: schema.FieldInt}}})
+	registry.RegisterType(&schema.TypeDecl{Name: "Child", Fields: []schema.Field{{ID: 1, Name: "value", Type: schema.FieldInt}}})
 	for _, list := range []bool{false, true} {
 		field := &schema.Field{Type: schema.FieldModel, TypeName: "Child", Relation: true, Nullable: true, IsList: list}
 		body := codec.AppendSvarint([]byte{0, 1}, 9223372036854775807)
@@ -48,7 +48,7 @@ func TestSkipResponseNestedFrames(t *testing.T) {
 
 func TestSkipResponseDepthBound(t *testing.T) {
 	registry := schema.New()
-	field := schema.Field{ID: 1, Type: schema.FieldModel, TypeName: "Node", Relation: true}
+	field := schema.Field{ID: 1, Name: "next", Type: schema.FieldModel, TypeName: "Node", Relation: true}
 	registry.RegisterModel(&schema.Model{Name: "Node", Fields: []schema.Field{field}})
 	body := []byte{0, 0}
 	for depth := 1; depth <= maxKeyResponseDepth; depth++ {
@@ -125,7 +125,7 @@ func TestSkipResponseColumnarCountUsesColumnLimit(t *testing.T) {
 }
 
 func TestSkipResponseColumnarBodyValidation(t *testing.T) {
-	fields := []schema.Field{{ID: 1, Type: schema.FieldInt}, {ID: 2, Type: schema.FieldModel, TypeName: "Child", Relation: true}}
+	fields := []schema.Field{{ID: 1, Name: "value", Type: schema.FieldInt}, {ID: 2, Name: "child", Type: schema.FieldModel, TypeName: "Child", Relation: true}}
 	registry := schema.New()
 	registry.RegisterModel(&schema.Model{Name: "Child", Fields: fields[:1]})
 	valid := codec.AppendBytes([]byte{1, 0, 1, 2, 2}, []byte{0, 1, 2, 0})

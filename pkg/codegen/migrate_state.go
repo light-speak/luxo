@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -48,6 +49,12 @@ func LoadState(path string) (*SchemaState, error) {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, err
 	}
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return nil, fmt.Errorf("migration state must be an object")
+	}
+	if err := validateSchemaState(&s); err != nil {
+		return nil, err
+	}
 	if s.Models == nil {
 		s.Models = make(map[string]*ModelState)
 	}
@@ -56,11 +63,32 @@ func LoadState(path string) (*SchemaState, error) {
 
 // SaveState writes the schema state to a file.
 func SaveState(path string, s *SchemaState) error {
+	if err := validateSchemaState(s); err != nil {
+		return err
+	}
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
+		// Unreachable for the validated, non-recursive state types; retain encoder error propagation.
 		return err
 	}
 	return os.WriteFile(path, append(data, '\n'), 0644)
+}
+
+func validateSchemaState(s *SchemaState) error {
+	if s == nil {
+		return fmt.Errorf("migration state must be an object")
+	}
+	for name, model := range s.Models {
+		if model == nil {
+			return fmt.Errorf("migration state model %q must be an object", name)
+		}
+		for field, column := range model.Columns {
+			if column == nil {
+				return fmt.Errorf("migration state column %q.%q must be an object", name, field)
+			}
+		}
+	}
+	return nil
 }
 
 // ComputeState builds the desired schema state from the current AST.
@@ -70,7 +98,7 @@ func ComputeState(result *semantic.Result, enums map[string]bool, dialect lux.Di
 	for _, file := range result.Files {
 		for _, m := range file.Models {
 			ms := &ModelState{
-				Table:   str.ToSnakeCase(m.Name) + "s",
+				Table:   modelTableName(m.Name),
 				Columns: make(map[string]*ColumnState),
 			}
 

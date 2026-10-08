@@ -2,6 +2,37 @@ import 'package:test/test.dart';
 import 'package:luxo_client/src/types.dart';
 
 void main() {
+  test(
+    'Schema numbering preserves sparse maxima and independent namespaces',
+    () {
+      final schema = LuxoSchema(
+        models: {
+          'Item': LuxoModel(
+            name: 'Item',
+            fields: [LuxoField(id: 65535, name: 'id', type: 'Int')],
+          ),
+        },
+        types: {
+          'Input': LuxoTypeDecl(
+            name: 'Input',
+            fields: [LuxoField(id: 65535, name: 'id', type: 'Int')],
+          ),
+        },
+        apis: {
+          for (final id in [1, 2147483647])
+            'read$id': LuxoAPI(
+              id: id,
+              name: 'read$id',
+              module: 'test',
+              params: [LuxoParam(id: 2147483645, name: 'value', type: 'Int')],
+            ),
+        },
+      );
+      schema.validateIDs();
+      expect(schema.models['Item']!.fields.single.id, 65535);
+      expect(schema.apis['read2147483647']!.id, 2147483647);
+    },
+  );
   group('Page', () {
     test('fromJson parses correctly', () {
       final json = {
@@ -61,6 +92,26 @@ void main() {
   });
 
   group('LuxoModel', () {
+    test('preserves computed source metadata without changing fields', () {
+      final model = LuxoModel.fromJson({
+        'name': 'User',
+        'fields': [
+          {'id': 1, 'name': 'postCount', 'type': 'Int'},
+        ],
+        'computedSources': {
+          'postCount': {'model': 'Post', 'module': 'blog'},
+          'localCount': {'model': 'Local'},
+        },
+      });
+      expect(model.computedSources['postCount']!.model, 'Post');
+      expect(model.computedSources['postCount']!.module, 'blog');
+      expect(model.computedSources['localCount']!.module, '');
+      expect(model.fields.single.type, 'Int');
+      expect(
+        LuxoModel.fromJson({'name': 'Plain', 'fields': []}).computedSources,
+        isEmpty,
+      );
+    });
     test('fromJson', () {
       final json = {
         'name': 'User',
@@ -93,6 +144,22 @@ void main() {
   });
 
   group('LuxoAPI', () {
+    test('preserves explicit root nullability independently of list shape', () {
+      for (final list in [false, true]) {
+        for (final nullable in [false, true]) {
+          final api = LuxoAPI.fromJson({
+            'id': 1,
+            'name': 'optional',
+            'module': 'test',
+            'returnType': 'Int',
+            'returnList': list,
+            'returnNullable': nullable,
+          });
+          expect(api.returnNullable, nullable);
+          expect(api.returnList, list);
+        }
+      }
+    });
     test('fromJson with all fields', () {
       final json = {
         'id': 1,
@@ -123,6 +190,7 @@ void main() {
       final api = LuxoAPI.fromJson(json);
       expect(api.returnType, isNull);
       expect(api.returnList, isFalse);
+      expect(api.returnNullable, isFalse);
       expect(api.paginated, isFalse);
       expect(api.defaultPageSize, isNull);
       expect(api.params, isEmpty);

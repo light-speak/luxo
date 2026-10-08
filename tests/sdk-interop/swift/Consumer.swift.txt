@@ -16,6 +16,7 @@ struct GoConsumer {
 
   static func run() async throws {
     try verifyNestedBoundaries()
+    try await verifyNullableRootBoundaries()
     let environment = ProcessInfo.processInfo.environment
     guard let endpoint = environment["LUXO_INTEROP_ENDPOINT"],
       let corpus = environment["LUXO_INTEROP_CORPUS"]
@@ -48,6 +49,8 @@ struct GoConsumer {
       }
     }
     for binary in [false, true] {
+      try await verifyTokenRefresh(endpoint: endpoint, binary: binary)
+      print("\(scope): HTTP \(binary ? "Binary" : "JSON") access/refresh lifecycle passed")
       for start in [UInt64(0), 9_007_199_254_740_990, UInt64(Int64.max) - 1, UInt64.max - 2] {
         try await verifySubscriptionIDs(endpoint: endpoint, binary: binary, start: start)
         print("\(scope): concurrent \(binary ? "Binary" : "JSON") UInt64 subscriptions from \(start) passed")
@@ -57,7 +60,7 @@ struct GoConsumer {
           url: endpoint.replacingOccurrences(of: "http:", with: "ws:"), timeout: 5,
           session: URLSession(configuration: .ephemeral), initialSequence: .max - 1)
         defer { socket.close() }
-        let client = LuxoGeneratedClient(transport: socket)
+        let client = try LuxoGeneratedClient(transport: socket)
         if binary { client.enableBinary() }
         socket.connect()
         try await verifyFiniteStream(client, fail: fail, reuse: false)
@@ -66,12 +69,56 @@ struct GoConsumer {
     }
   }
 
+  static func verifyTokenRefresh(endpoint: String, binary: Bool) async throws {
+    let session = URLSession(configuration: .ephemeral)
+    defer { session.invalidateAndCancel() }
+    let bootstrapTransport = try URLSessionTransport(endpoint: endpoint, timeout: 5, session: session)
+    let transport = try URLSessionTransport(endpoint: endpoint, timeout: 5, session: session)
+    let bootstrap = try LuxoGeneratedClient(transport: bootstrapTransport)
+    let client = try LuxoGeneratedClient(transport: transport)
+    if binary { bootstrap.enableBinary(); client.enableBinary() }
+    let refresh = try await bootstrap.issueFixtureRefresh()
+    let access = try await bootstrap.issueFixtureAccess()
+    var rejectedAccess = false
+    do {
+      _ = try await bootstrap.exchangeFixtureRefresh(token: access)
+    } catch is LuxoError { rejectedAccess = true }
+    try ensure(rejectedAccess, "access token accepted by refresh endpoint")
+    transport.setToken(refresh)
+    try await expectUnauthorized(client)
+    let attempts = TerminalCounter()
+    transport.onTokenExpired = {
+      attempts.increment()
+      return try? await bootstrap.exchangeFixtureRefresh(token: refresh)
+    }
+    for _ in 0..<2 {
+      try ensure(try await client.fixtureIdentity() == 9_007_199_254_740_993, "refreshed identity lost precision")
+    }
+    try ensure(attempts.value == 1, "successful refresh was repeated")
+    transport.setToken(refresh)
+    transport.onTokenExpired = { attempts.increment(); return nil }
+    try await expectUnauthorized(client)
+    try ensure(attempts.value == 2, "declined refresh looped or was skipped")
+    transport.onTokenExpired = { attempts.increment(); return refresh }
+    try await expectUnauthorized(client)
+    try ensure(attempts.value == 3, "invalid renewed token retried indefinitely")
+  }
+
+  static func expectUnauthorized(_ client: LuxoGeneratedClient) async throws {
+    do {
+      _ = try await client.fixtureIdentity()
+      throw failure("refresh token accepted as API access")
+    } catch let error as LuxoError {
+      try ensure(error.code == 401, "unauthorized error changed: \(error)")
+    }
+  }
+
   static func verifySubscriptionIDs(endpoint: String, binary: Bool, start: UInt64) async throws {
     let socket = try WebSocketTransport(
       url: endpoint.replacingOccurrences(of: "http:", with: "ws:"), timeout: 5,
       session: URLSession(configuration: .ephemeral), initialSequence: start)
     defer { socket.close() }
-    let client = LuxoGeneratedClient(transport: socket)
+    let client = try LuxoGeneratedClient(transport: socket)
     if binary { client.enableBinary() }
     socket.connect()
     let (first, firstContinuation) = AsyncStream<Precision>.makeStream()
@@ -113,12 +160,17 @@ struct GoConsumer {
     }
     defer { socket?.close() }
     let observed = RecordingTransport(base: transport)
-    let client = LuxoGeneratedClient(transport: observed)
+    let client = try LuxoGeneratedClient(transport: observed)
     try ensure(observed.registrationCount == 1, "schema was not registered at initialization")
     if binary { client.enableBinary() }
     try ensure(observed.registrationCount == 1, "mode change repeated schema registration")
     socket?.connect()
+    if ProcessInfo.processInfo.environment["LUXO_INTEROP_ENUM_UPGRADE"] == "true" {
+      try await verifyEnumUpgrade(client, websocket: websocket)
+      return
+    }
     try await verifyUnary(client, values: values)
+    try await verifyNullableRoots(client, values: values)
     try await verifyTimestamps(client, cases: dates)
     try await verifyBusinessFloats(client)
     try await verifyJSONNumbers(client, tokens: numberTokens, websocket: websocket)
@@ -126,12 +178,15 @@ struct GoConsumer {
     try ensure(
       try await client.checkListEffects() == [1, 2, 3, 3], "list evaluation count mismatch")
     try await verifyErrors(client, values: values)
+    try await verifyStrictQueries(client)
     try await verifyJSONErrors(client, tokens: numberTokens)
     try await verifyPagination(client)
     try await verifyNullableArrays(client, websocket: websocket)
     try await verifyNestedResponses(client, websocket: websocket)
     try await verifyScalarArrays(client, websocket: websocket)
     if websocket {
+      try await verifyNullableRootStreams(client)
+      try await verifyTimestampStreams(client, cases: dates)
       try await verifyStreams(client, values: values)
       for fail in [false, true] { try await verifyFiniteStream(client, fail: fail) }
     }
@@ -139,6 +194,123 @@ struct GoConsumer {
 
   static let scalarSelection =
     "ints, floats, strings, bools, dates, durations, uuids, bytes, decimals, jsons, enums, tail"
+
+  static func verifyNullableRoots(_ client: LuxoGeneratedClient, values: [Int]) async throws {
+    for value: Int? in [nil, 0] + values.map(Optional.some) {
+      try ensure(try await client.echoOptionalInteger(value: value) == value, "nullable integer mismatch")
+    }
+    for values: [Int]? in [nil, [], values] {
+      try ensure(try await client.echoOptionalIntegers(values: values) == values, "nullable list mismatch")
+    }
+    let input = makeInput(value: 42, optional: nil, values: [])
+    let missing = try await client.echoOptionalPrecision(input: nil, select: "value")
+    try ensure(missing == nil, "nullable model became a value")
+    let row = try await client.echoOptionalPrecision(input: input, select: "value")
+    try ensure(try row?.value.requireValue() == 42, "nullable model field mismatch")
+    guard case .unselected? = row?.label else { throw failure("unselected field was returned") }
+    let absent = try await client.echoOptionalPrecisions(inputs: nil, select: "value")
+    try ensure(absent == nil, "nullable model list became a value")
+    for inputs in [[], [input]] {
+      let rows = try await client.echoOptionalPrecisions(inputs: inputs, select: "value")
+      try ensure(rows?.count == inputs.count, "nullable model list size mismatch")
+      for row in rows ?? [] { try ensure(try row.value.requireValue() == 42, "nullable list field mismatch") }
+    }
+  }
+
+  static func verifyNullableRootStreams(_ client: LuxoGeneratedClient) async throws {
+    let integers: [Int?] = try await nullableStream { observer, receive in
+      try await client.subscribeWatchOptionalInteger(observer: observer, handler: receive)
+    }
+    try ensure(integers == [nil, 0], "null ended integer stream")
+    let lists: [[Int]?] = try await nullableStream { observer, receive in
+      try await client.subscribeWatchOptionalIntegers(observer: observer, handler: receive)
+    }
+    try ensure(lists == [nil, []], "null ended list stream")
+    let records: [Precision?] = try await nullableStream { observer, receive in
+      try await client.subscribeWatchOptionalPrecision(select: "value", observer: observer, handler: receive)
+    }
+    try ensure(records.count == 2 && records[0] == nil, "null ended model stream")
+    try ensure(try records[1]?.value.requireValue() == 42, "nullable stream field mismatch")
+    guard case .unselected? = records[1]?.label else { throw failure("nullable stream selection ignored") }
+    try ensure(try await client.echoInteger(value: 42) == 42, "completion closed peer connection")
+  }
+
+  static func nullableStream<Value: Sendable>(
+    _ subscribe: (StreamObserver, @escaping @Sendable (Value?) -> Void) async throws -> (@Sendable () -> Void)
+  ) async throws -> [Value?] {
+    let (events, continuation) = AsyncThrowingStream<Value?, Error>.makeStream()
+    let terminals = TerminalCounter()
+    let observer = StreamObserver(onComplete: { terminals.increment(); continuation.finish() }, onError: {
+      terminals.increment(); continuation.finish(throwing: $0)
+    })
+    let cancel = try await subscribe(observer) { continuation.yield($0) }
+    defer { cancel(); continuation.finish() }
+    let rows = try await withThrowingTaskGroup(of: [Value?].self) { group in
+      group.addTask {
+        var values: [Value?] = []
+        for try await value in events { values.append(value) }
+        return values
+      }
+      group.addTask { try await Task.sleep(nanoseconds: 5_000_000_000); throw failure("nullable stream timeout") }
+      defer { group.cancelAll() }
+      guard let values = try await group.next() else { throw failure("missing nullable stream") }
+      return values
+    }
+    try ensure(terminals.value == 1, "nullable stream terminal count mismatch")
+    return rows
+  }
+
+  static func verifyNullableRootBoundaries() async throws {
+    try await verifyNullableStructuredBoundaries()
+    for data in [Data(), Data([1]), Data([2]), Data([0, 0])] {
+      let client = try LuxoGeneratedClient(transport: NullablePayloadTransport(data: data, mode: .binary))
+      for kind in 0..<4 {
+        do {
+          switch kind {
+          case 0: _ = try await client.echoOptionalInteger(value: nil)
+          case 1: _ = try await client.echoOptionalIntegers(values: nil)
+          case 2: _ = try await client.echoOptionalPrecision(input: nil, select: "value")
+          default: _ = try await client.echoOptionalPrecisions(inputs: nil, select: "value")
+          }
+          throw failure("invalid nullable envelope accepted")
+        } catch let error as LuxoError { try ensure(error.name == "DecodeError", "wrong nullable failure") }
+      }
+    }
+    for data in [Data([1, 84, 0]), Data([1, 0x80])] {
+      let client = try LuxoGeneratedClient(transport: NullablePayloadTransport(data: data, mode: .binary))
+      do { _ = try await client.echoOptionalInteger(value: nil); throw failure("invalid nullable value accepted") }
+      catch let error as LuxoError { try ensure(error.name == "DecodeError", "wrong nullable payload failure") }
+    }
+  }
+
+  static func verifyNullableStructuredBoundaries() async throws {
+    guard let field = LUXO_SCHEMA["echoOptionalPrecision"]?.fields["value"]?.fieldID else {
+      throw failure("missing nullable response field metadata")
+    }
+    var body = Encoder()
+    body.writeVarint(UInt64(field)); body.writeSvarint(42); body.writeVarint(0)
+    for list in [false, true] {
+      let valid = Data(list ? [1, 1, 0] : [1, 0]) + body.data
+      let client = try LuxoGeneratedClient(transport: NullablePayloadTransport(data: valid, mode: .binary))
+      let value = try await nullableStructuredValue(client, list: list)
+      try ensure(value == 42, "nullable structured root mismatch")
+      for data in [Data(valid.dropLast()), valid + Data([99])] {
+        let invalid = try LuxoGeneratedClient(transport: NullablePayloadTransport(data: data, mode: .binary))
+        do { _ = try await nullableStructuredValue(invalid, list: list); throw failure("bad nullable structure accepted") }
+        catch let error as LuxoError { try ensure(error.name == "DecodeError", "wrong nullable structure error") }
+      }
+      for mode in [TransportMode.json, .binary] {
+        let data = mode == .json ? Data("null".utf8) : Data([0])
+        let absent = try LuxoGeneratedClient(transport: NullablePayloadTransport(data: data, mode: mode))
+        try ensure(try await nullableStructuredValue(absent, list: list) == nil, "null structure became a value")
+      }
+    }
+  }
+
+  static func nullableStructuredValue(_ client: LuxoGeneratedClient, list: Bool) async throws -> Int? {
+    if list { return try await client.echoOptionalPrecisions(inputs: nil, select: "value")?.first?.value.requireValue() }
+    return try await client.echoOptionalPrecision(input: nil, select: "value")?.value.requireValue()
+  }
 
   static func verifyTimestamps(_ client: LuxoGeneratedClient, cases: [DateTimeCase]) async throws {
     for item in cases {
@@ -154,6 +326,22 @@ struct GoConsumer {
       try ensure(try row.dates.requireValue() == expected, "DateTime column mismatch")
       try ensure(try row.tail.requireValue() == 42, "DateTime column cursor mismatch")
     }
+  }
+
+  static func verifyTimestampStreams(_ client: LuxoGeneratedClient, cases: [DateTimeCase]) async throws {
+    for item in cases {
+      let (stream, continuation) = AsyncStream<String>.makeStream()
+      let cancel = try await client.subscribeWatchTimestamp(value: item.input) { continuation.yield($0) }
+      defer { cancel(); continuation.finish() }
+      try ensure(try await firstValue(stream) == item.canonical, "DateTime scalar stream changed nanoseconds")
+    }
+    for items in [[], Array(cases.prefix(1)), cases] {
+      let (stream, continuation) = AsyncStream<[String]>.makeStream()
+      let cancel = try await client.subscribeWatchTimestamps(values: items.map(\.input)) { continuation.yield($0) }
+      defer { cancel(); continuation.finish() }
+      try ensure(try await firstValue(stream) == items.map(\.canonical), "DateTime list stream changed nanoseconds")
+    }
+    try ensure(try await client.echoInteger(value: 42) == 42, "DateTime stream cancellation closed the connection")
   }
 
   static func verifyBusinessFloats(_ client: LuxoGeneratedClient) async throws {
@@ -260,11 +448,27 @@ struct GoConsumer {
   }
 
   static func verifyNamedEnums(_ client: LuxoGeneratedClient, websocket: Bool) async throws {
-    for value in FixtureState.allCases {
+    for value in FixtureState.knownCases {
       try ensure(try await client.echoFixtureState(value: value) == value, "enum value mismatch")
     }
     for values: [FixtureState] in [[], [.open], [.closed, .open]] {
       try ensure(try await client.echoFixtureStates(values: values) == values, "enum list mismatch")
+    }
+    for raw in ["FUTURE", "", "open"] {
+      let value = FixtureState(rawValue: raw)
+      for list in [false, true] {
+        do {
+          if list {
+            _ = try await client.echoFixtureStates(values: [.open, value])
+          } else {
+            _ = try await client.echoFixtureState(value: value)
+          }
+          throw failure("server accepted an undeclared enum member")
+        } catch let error as LuxoError {
+          try ensure(error.code == 400, "undeclared enum member did not return 400")
+        }
+      }
+      try ensure(try await client.echoFixtureState(value: .open) == .open, "success after enum rejection")
     }
     guard websocket else { return }
     let (stream, continuation) = AsyncStream<FixtureState>.makeStream()
@@ -281,6 +485,47 @@ struct GoConsumer {
       listContinuation.finish()
     }
     try ensure(try await firstValue(listStream) == [.open, .closed], "enum list stream mismatch")
+  }
+
+  static func verifyFutureState(_ value: FixtureState) throws {
+    guard case .unknown(let raw) = value, raw == "FUTURE" else {
+      throw failure("future enum was not explicitly Unknown")
+    }
+  }
+
+  static func verifyEnumUpgrade(_ client: LuxoGeneratedClient, websocket: Bool) async throws {
+    try await verifyPagination(client)
+    let future = FixtureState(rawValue: "FUTURE")
+    try verifyFutureState(future)
+    let received = try await client.echoFixtureState(value: future)
+    try verifyFutureState(received)
+    try verifyFutureState(try await client.echoFixtureState(value: received))
+    let expected: [FixtureState] = [.open, future, .closed]
+    let values = try await client.echoFixtureStates(values: expected)
+    try ensure(values == expected, "future enum mixed list changed")
+    try verifyFutureState(values[1])
+    try ensure(try await client.echoFixtureStates(values: []).isEmpty, "empty enum list changed")
+    if websocket { try await verifyFutureStreams(client, expected: expected) }
+    do {
+      _ = try await client.echoFixtureState(value: FixtureState(rawValue: "UNDECLARED"))
+      throw failure("server accepted an undeclared enum")
+    } catch let error as LuxoError {
+      try ensure(error.code == 400 && error.name == "BadRequest", "wrong enum error")
+    }
+    try ensure(try await client.echoInteger(value: 42) == 42, "request after enum failure changed")
+  }
+
+  static func verifyFutureStreams(_ client: LuxoGeneratedClient, expected: [FixtureState]) async throws {
+    let (stream, continuation) = AsyncStream<FixtureState>.makeStream()
+    let cancel = try await client.subscribeWatchFixtureState { continuation.yield($0) }
+    defer { cancel(); continuation.finish() }
+    try verifyFutureState(try await firstValue(stream))
+    let (list, listContinuation) = AsyncStream<[FixtureState]>.makeStream()
+    let cancelList = try await client.subscribeWatchFixtureStates { listContinuation.yield($0) }
+    defer { cancelList(); listContinuation.finish() }
+    let rows = try await firstValue(list)
+    try ensure(rows == expected, "future enum stream list changed")
+    try verifyFutureState(rows[1])
   }
 
   static func verifyErrors(_ client: LuxoGeneratedClient, values: [Int]) async throws {
@@ -304,6 +549,46 @@ struct GoConsumer {
       try ensure(
         try await client.echoInteger(value: value) == value, "success after error mismatch")
     }
+  }
+
+  static func verifyStrictQueries(_ client: LuxoGeneratedClient) async throws {
+    guard case .int64(9007199254740993) = LuxoQuery_listQueryProbes.count_eq(9007199254740993).value else {
+      throw failure("query Int64 lost precision")
+    }
+    try ensure(LuxoQuery_listQueryProbes.count_desc().order == "desc", "query sorter changed")
+    try await verifyQueryError(client, field: "createdAt") {
+      _ = try await client.listQueryProbes(select: "id", filters: [LuxoQuery_listQueryProbes.createdAt_eq("2026-02-30T00:00:00Z")])
+    }
+    let cases = [
+      ("missing", "eq", "1"), ("id", "eq", "1"),
+      ("state", "eq", "FUTURE"), ("state", "gt", "OPEN"),
+      ("active", "eq", "truue"), ("score", "eq", "NaN"),
+      ("count", "eq", "bad"), ("createdAt", "eq", "2026-02-30T00:00:00Z"),
+    ]
+    for (field, op, value) in cases {
+      try await verifyQueryError(client, field: field) {
+        _ = try await client.listQueryProbes(select: "id", filters: [LuxoFilter(field: field, op: op, value: .string(value))])
+      }
+    }
+    for field in ["missing", "id"] {
+      try await verifyQueryError(client, field: field) {
+        _ = try await client.listQueryProbes(select: "id", sorters: [LuxoSorter(field: field, order: "asc")])
+      }
+    }
+  }
+
+  static func verifyQueryError(
+    _ client: LuxoGeneratedClient, field: String, request: () async throws -> Void
+  ) async throws {
+    do {
+      try await request()
+      throw failure("invalid query succeeded: \(field)")
+    } catch let error as LuxoError {
+      try ensure(error.code == 400 && error.name == "BadRequest", "wrong query error identity")
+      let data = error.data as? [String: Any]
+      try ensure(data?["param"] as? String == field, "missing query error field")
+    }
+    try ensure(try await client.echoInteger(value: 42) == 42, "success after query error failed")
   }
 
   static func verifyPagination(_ client: LuxoGeneratedClient) async throws {
@@ -414,6 +699,7 @@ struct GoConsumer {
   }
 
   static func verifyUnary(_ client: LuxoGeneratedClient, values: [Int]) async throws {
+    try await verifyConcurrentSelections(client)
     for value in values {
       let integer = try await client.echoInteger(value: value)
       let duration = try await client.echoDuration(value: Int64(value))
@@ -439,7 +725,50 @@ struct GoConsumer {
     try ensure(unselected(row.label) && unselected(row.ignored), "unexpected selected fields")
   }
 
+  static func verifyConcurrentSelections(_ client: LuxoGeneratedClient) async throws {
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      for index in 0..<16 {
+        group.addTask {
+          let input = PrecisionInput(
+            value: Int.max - index, duration: Int64(index), optional: nil, values: [],
+            label: "call-\(index)", ignored: 0)
+          async let value = client.echoPrecision(input: input, select: "value")
+          async let label = client.echoPrecision(input: input, select: "label")
+          async let combined = client.echoPrecision(input: input, select: "value, label")
+          let rows = try await [value, label, combined]
+          try ensure(try rows[0].value.requireValue() == input.value, "concurrent value mismatch")
+          try ensure(unselected(rows[0].label), "concurrent value gained label")
+          try ensure(try rows[1].label.requireValue() == input.label, "concurrent label mismatch")
+          try ensure(unselected(rows[1].value), "concurrent label gained value")
+          try ensure(
+            try rows[2].value.requireValue() == input.value, "concurrent combined value mismatch")
+          try ensure(
+            try rows[2].label.requireValue() == input.label, "concurrent combined label mismatch")
+          for row in rows {
+            try ensure(
+              unselected(row.duration) && unselected(row.optional) && unselected(row.values)
+                && unselected(row.ignored),
+              "concurrent request gained fields")
+          }
+        }
+      }
+      try await group.waitForAll()
+    }
+    let repeated = try await client.echoPrecision(
+      input: makeInput(value: Int.max, optional: nil, values: []), select: "value")
+    try ensure(try repeated.value.requireValue() == Int.max, "repeated concurrent value mismatch")
+    try ensure(unselected(repeated.label), "repeated request gained label")
+  }
+
   static func verifyStreams(_ client: LuxoGeneratedClient, values: [Int]) async throws {
+    let (defaultStream, defaultContinuation) = AsyncStream<Precision>.makeStream()
+    let cancelDefault = try await client.subscribeWatchPrecision(select: selection) {
+      defaultContinuation.yield($0)
+    }
+    do {
+      defer { cancelDefault(); defaultContinuation.finish() }
+      try verify(try await firstValue(defaultStream), input: makeInput(value: 42, optional: 42, values: [42]))
+    }
     for value in values {
       let (stream, continuation) = AsyncStream<Precision>.makeStream()
       let cancel = try await client.subscribeWatchPrecision(value: value, select: selection) {
@@ -462,7 +791,7 @@ struct GoConsumer {
         throw failure("stream ended without data")
       }
       group.addTask {
-        try await Task.sleep(for: .seconds(5))
+        try await Task.sleep(nanoseconds: 5_000_000_000)
         throw failure("stream timed out")
       }
       defer { group.cancelAll() }
@@ -513,7 +842,7 @@ struct GoConsumer {
         }
         throw failure("finite stream closed without terminal")
       }
-      group.addTask { try await Task.sleep(for: .seconds(5)); throw failure("finite stream timed out") }
+      group.addTask { try await Task.sleep(nanoseconds: 5_000_000_000); throw failure("finite stream timed out") }
       defer { group.cancelAll() }
       _ = try await group.next()
     }
@@ -747,6 +1076,20 @@ private final class TerminalCounter: @unchecked Sendable {
 }
 
 // Only the registration counter is mutable; its accesses use the lock.
+private struct NullablePayloadTransport: Transport {
+  let data: Data
+  let mode: TransportMode
+  func setSchema(_ schema: [String: APISchema]) throws {}
+  func setMode(_ mode: TransportMode) {}
+  func setToken(_ token: String) {}
+  func call(_ api: String, params: [String: LuxoValue]?) async throws -> TransportPayload {
+    TransportPayload(data: data, mode: mode)
+  }
+  func call(_ api: String, request: any GeneratedRequest) async throws -> TransportPayload {
+    TransportPayload(data: data, mode: mode)
+  }
+}
+
 final class RecordingTransport: Transport, @unchecked Sendable {
   private let base: any Transport
   private let lock = NSLock()
@@ -760,8 +1103,8 @@ final class RecordingTransport: Transport, @unchecked Sendable {
     return registrations
   }
 
-  func setSchema(_ schema: [String: APISchema]) {
-    base.setSchema(schema)
+  func setSchema(_ schema: [String: APISchema]) throws {
+    try base.setSchema(schema)
     lock.lock()
     registrations += 1
     lock.unlock()
@@ -772,6 +1115,17 @@ final class RecordingTransport: Transport, @unchecked Sendable {
 
   func call(_ api: String, params: [String: LuxoValue]?) async throws -> TransportPayload {
     try await base.call(api, params: params)
+  }
+
+  func call(_ api: String, request: any GeneratedRequest) async throws -> TransportPayload {
+    try await base.call(api, request: request)
+  }
+
+  func subscribe<Value: Sendable>(
+    _ api: String, decoder: @escaping @Sendable (TransportPayload) throws -> Value,
+    request: any GeneratedRequest, observer: StreamObserver?, handler: @escaping @Sendable (Value) -> Void
+  ) async throws -> (@Sendable () -> Void) {
+    try await base.subscribe(api, decoder: decoder, request: request, observer: observer, handler: handler)
   }
 
   func subscribe<Value: Sendable>(

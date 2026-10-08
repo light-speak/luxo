@@ -1,6 +1,8 @@
 package api
 
 import (
+	"github.com/light-speak/luxo/internal/testutil"
+
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
@@ -9,7 +11,48 @@ import (
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/jsonutil"
+	"github.com/light-speak/luxo/pkg/lux/schema"
+	"github.com/light-speak/luxo/pkg/lux/selection"
 )
+
+func FuzzDecodeFieldMask(f *testing.F) {
+	s := schema.New()
+	model := &schema.Model{Name: "Record", Fields: []schema.Field{
+		{ID: 9, Name: "name"},
+		{ID: 1, Name: "id"},
+		{ID: 17, Name: "child", Relation: true, TypeName: "Record"},
+	}}
+	s.RegisterModel(model)
+	scalar := testSelectionMask(testutil.Bytes(f)(codec.FieldMaskSet(nil, 9)))
+	nested := testSelectionMask(testutil.Bytes(f)(codec.FieldMaskSet(nil, 17)), codec.SelectionMaskChild{FieldID: 17, Mask: scalar})
+	for _, mask := range [][]byte{nil, scalar, nested, {1, 0}, {1, 0xff}, {1, 1, 3}} {
+		f.Add(mask)
+	}
+	f.Fuzz(func(t *testing.T, mask []byte) {
+		if len(mask) > maxFieldMaskSize {
+			t.Skip()
+		}
+		original := bytes.Clone(mask)
+		fields, err := decodeFieldMask(mask, model, s, 0)
+		if !bytes.Equal(mask, original) {
+			t.Fatal("selection decoding mutated request bytes")
+		}
+		if err != nil {
+			if fields != nil {
+				t.Fatal("selection decoding published a partial tree")
+			}
+			return
+		}
+		roundTrip, err := schema.SelectToFieldMask(fields, model, s)
+		if err != nil {
+			t.Fatalf("decoded selection cannot be encoded: %v", err)
+		}
+		decoded, err := decodeFieldMask(roundTrip, model, s, 0)
+		if err != nil || selection.Format(fields) != selection.Format(decoded) {
+			t.Fatalf("selection changed after round trip: %x => %x, %v", mask, roundTrip, err)
+		}
+	})
+}
 
 func FuzzJSONBase64Parameter(f *testing.F) {
 	for _, raw := range []string{`""`, `"AQI="`, `"\u0041QI="`, `"AQ\r\nI="`, `"AQI=%%"`,

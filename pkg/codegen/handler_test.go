@@ -33,6 +33,39 @@ func TestNativeStreamNeverRegistersUnaryHandler(t *testing.T) {
 	}
 }
 
+func TestModelOnlyModuleRetainsInternalSelectors(t *testing.T) {
+	model := &ast.ModelDecl{Name: "Post", Fields: []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}}}}}
+	result := buildResult(&ast.File{Models: []*ast.ModelDecl{model}, Extends: []*ast.ExtendDecl{{Name: "User", Fields: []*ast.FieldDecl{{Name: "name", Type: &ast.TypeRef{Name: "String"}}}}}})
+	source := string(generateHandlerFile(result, "luxo", nil))
+	for _, want := range []string{"func selectPostSQLColumns(", "func selectUserSQLColumns("} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("model-only module omitted %s", want)
+		}
+	}
+	if strings.Contains(source, "handleCreate") {
+		t.Fatal("model-only module exposed implicit CRUD")
+	}
+}
+
+func TestInternalModelHandlerOwnership(t *testing.T) {
+	models := []*ast.ModelDecl{{Name: "User"}}
+	result := buildResult(&ast.File{Models: models})
+	for _, sample := range []struct {
+		events *EventContext
+		want   bool
+	}{
+		{nil, false},
+		{&EventContext{}, false},
+		{&EventContext{remotePKModels: map[string]bool{"Other": true}}, false},
+		{&EventContext{remotePKModels: map[string]bool{"User": true}}, true},
+	} {
+		generator := &GeneratorContext{events: sample.events}
+		if got := generator.needsInternalModelHandlers(result, models); got != sample.want {
+			t.Fatalf("internal handler ownership = %v, want %v", got, sample.want)
+		}
+	}
+}
+
 func TestGenerateCRUDHandlersUseDeclaredPrimaryKey(t *testing.T) {
 	model := &ast.ModelDecl{
 		Name: "Product",
@@ -58,6 +91,23 @@ func TestGenerateCRUDHandlersUseDeclaredPrimaryKey(t *testing.T) {
 	}
 	if strings.Contains(code, "selection.SQLColumns(req.Select)") {
 		t.Fatalf("generic selection hardcodes id and must not be used for CRUD:\n%s", code)
+	}
+}
+
+func TestGeneratedCRUDDoesNotImplicitlyInvalidateTTLCache(t *testing.T) {
+	model := testModel("User", []*ast.Directive{{Name: "crud"}}, []*ast.FieldDecl{
+		testField("id", "Int", &ast.Directive{Name: "id"}), testField("name", "String"),
+	})
+	var source strings.Builder
+	generateCRUDHandlers(&source, []*ast.ModelDecl{model}, nil, nil)
+	code := source.String()
+	for _, name := range []string{"CreateUser", "UpdateUser", "DeleteUser", "DeleteUsers"} {
+		if !strings.Contains(code, "func handle"+name+"(") {
+			t.Fatalf("missing generated mutation %s", name)
+		}
+	}
+	if strings.Contains(code, "InvalidateCache") {
+		t.Fatal("TTL CRUD generated implicit invalidation")
 	}
 }
 
@@ -90,9 +140,6 @@ func TestHandlerCompatibilityFunctions(t *testing.T) {
 	}
 	generateSelectedSQLFields(&b, model)
 	writeAPIRegistration(&b, "getUser")
-	if typ, nullable, list := resolveParamMetaFromAST("getUser", "id"); typ == "" || nullable || list {
-		t.Fatalf("resolved param = %q, %v, %v", typ, nullable, list)
-	}
 	if groups := collectComputedAggregateGroups(model, models, nil); len(groups) != 0 {
 		t.Fatalf("computed aggregate groups = %#v", groups)
 	}
@@ -122,6 +169,41 @@ func TestDirectiveDurationRejectsMalformedValues(t *testing.T) {
 		Value: &ast.Literal{Kind: token.Duration, Value: "5ms"},
 	}}}, "value", 0); !ok || got != "5 * time.Millisecond" {
 		t.Fatalf("duration = %q, %v", got, ok)
+	}
+	if got, ok := directiveDuration(&ast.Directive{Args: []*ast.NamedArg{{
+		Value: &ast.Literal{Kind: token.Int, Value: "5"},
+	}}}, "value", 0); !ok || got != "5 * time.Second" {
+		t.Fatalf("integer duration = %q, %v", got, ok)
+	}
+}
+
+func TestBeforeSaveIgnoresIncompleteExpressions(t *testing.T) {
+	var output strings.Builder
+	field := &ast.FieldDecl{Directives: []*ast.Directive{{Name: "beforeSave", Body: &ast.Block{
+		Stmts: []ast.Stmt{&ast.AssignStmt{}, &ast.ExprStmt{}},
+	}}}}
+	generateBeforeSave(&output, field, "value", "\t")
+	if output.Len() != 0 {
+		t.Fatalf("incomplete expression emitted source: %q", output.String())
+	}
+	call := &ast.CallExpr{Func: &ast.Ident{Name: "normalize"}, Args: []*ast.NamedArg{
+		{Value: &ast.BinaryExpr{Left: &ast.Ident{Name: "it"}, Op: "+", Right: &ast.Literal{Kind: token.Int, Value: "1"}}},
+	}}
+	if got := compileFieldExpr(call, "value"); got != "" {
+		t.Fatalf("unsupported argument emitted partial call: %q", got)
+	}
+}
+
+func TestSelectedSQLFieldsSkipUnnumberedFields(t *testing.T) {
+	var output strings.Builder
+	defaultGenerator().generateSelectedSQLFields(&output, &ast.ModelDecl{
+		Name: "User", Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "unregistered", Type: &ast.TypeRef{Name: "String"}},
+		},
+	})
+	if strings.Contains(output.String(), "unregistered") || strings.Contains(output.String(), "FieldMaskHas(fieldMask, 0)") {
+		t.Fatalf("unnumbered field emitted selection: %q", output.String())
 	}
 }
 
@@ -319,7 +401,7 @@ func TestGenerateRemoteNamedLoadHandlers(t *testing.T) {
 		`fields = append(fields, "email")`,
 		"groups[i] = lux.AllOf(",
 		"lux.AnyOf(groups...)",
-		`router.Handle("svc:load:User:tenantId:email"`,
+		`router.HandleInternal("svc:load:User:tenantId:email"`,
 		`FieldID: 4, Name: "tenantId", Type: "Int", IsList: true`,
 		`FieldID: 7, Name: "email", Type: "String", IsList: true`,
 	}
@@ -733,9 +815,9 @@ func TestPluralize(t *testing.T) {
 		{"Category", "Categories"},
 	}
 	for _, tt := range tests {
-		got := pluralize(tt.input)
+		got := ast.PluralModelName(tt.input)
 		if got != tt.want {
-			t.Errorf("pluralize(%q) = %q, want %q", tt.input, got, tt.want)
+			t.Errorf("ast.PluralModelName(%q) = %q, want %q", tt.input, got, tt.want)
 		}
 	}
 }
@@ -927,9 +1009,9 @@ func TestParamMethodDateTime(t *testing.T) {
 }
 
 func TestParamMethodCustomType(t *testing.T) {
-	// Custom types return empty for ParamJSON dispatch
-	if got := paramMethod("uuid.UUID"); got != "" {
-		t.Errorf("paramMethod(uuid.UUID) = %q, want empty", got)
+	// Native scalar types use concrete request readers.
+	if got := paramMethod("uuid.UUID"); got != "UUID" {
+		t.Errorf("paramMethod(uuid.UUID) = %q, want UUID", got)
 	}
 }
 
@@ -1250,12 +1332,12 @@ func TestGenerateHandlerNullableParam(t *testing.T) {
 	src := generateHandlerFile(result, "app", nil)
 	code := string(src)
 
-	if !strings.Contains(code, "&subtitleVal") {
-		t.Errorf("nullable param should use & prefix:\n%s", code)
+	if !strings.Contains(code, "_value := subtitleVal") || !strings.Contains(code, "builder.SetSubtitle(&_value)") {
+		t.Errorf("nullable param should pass a branch-local pointer:\n%s", code)
 	}
 }
 
-func TestNativeHandlersDecodeOptionalNullableJSON(t *testing.T) {
+func TestNativeHandlersDecodeOptionalNullableStructure(t *testing.T) {
 	param := &ast.ParamDecl{
 		Name:    "payload",
 		Type:    &ast.TypeRef{Name: "Payload", Nullable: true},
@@ -1267,7 +1349,7 @@ func TestNativeHandlersDecodeOptionalNullableJSON(t *testing.T) {
 		Params:     []*ast.ParamDecl{param},
 		Directives: []*ast.Directive{{Name: "native"}},
 	}, nil, nil)
-	if out := apiBuilder.String(); !strings.Contains(out, `req.ParamJSONOptionalNullable("payload", &payload)`) ||
+	if out := apiBuilder.String(); strings.Contains(out, `req.ParamJSON`) || !strings.Contains(out, "payload = nil") ||
 		!strings.Contains(out, `req.ParamMessage("payload", true, true)`) {
 		t.Fatalf("native API nullable parameter decoding missing:\n%s", out)
 	}
@@ -1278,7 +1360,7 @@ func TestNativeHandlersDecodeOptionalNullableJSON(t *testing.T) {
 		Params:     []*ast.ParamDecl{param},
 		Directives: []*ast.Directive{{Name: "native"}, {Name: "service"}},
 	}, nil, nil)
-	if out := serviceBuilder.String(); !strings.Contains(out, `req.ParamJSONOptionalNullable("payload", &payload)`) ||
+	if out := serviceBuilder.String(); strings.Contains(out, `req.ParamJSON`) || !strings.Contains(out, "payload = nil") ||
 		!strings.Contains(out, `req.ParamMessage("payload", true, true)`) {
 		t.Fatalf("native service nullable parameter decoding missing:\n%s", out)
 	}
@@ -1336,7 +1418,7 @@ func TestGenerateHandlerEnumParam(t *testing.T) {
 	src := generateHandlerFile(result, "app", enums)
 	code := string(src)
 
-	if !strings.Contains(code, "Role(roleVal)") {
+	if !strings.Contains(code, "Role(_roleValText)") || !strings.Contains(code, "_roleValEnum.IsValid()") {
 		t.Errorf("enum param should cast to enum type:\n%s", code)
 	}
 }
@@ -2090,67 +2172,6 @@ func TestBodyContainsTemplateString(t *testing.T) {
 	}
 }
 
-// --- inferParamType ---
-
-func TestInferParamType(t *testing.T) {
-	tests := []struct {
-		name string
-		want string
-	}{
-		{"id", "Int"},
-		{"userId", "Int"},
-		{"page", "Int"},
-		{"pageSize", "Int"},
-		{"limit", "Int"},
-		{"offset", "Int"},
-		{"priority", "Int"},
-		{"minutes", "Int"},
-		{"quantity", "Int"},
-		{"count", "Int"},
-		{"isActive", "Boolean"},
-		{"active", "Boolean"},
-		{"published", "Boolean"},
-		{"amount", "Float"},
-		{"price", "Float"},
-		{"balance", "Float"},
-		{"score", "Float"},
-		{"total", "Float"},
-		{"budget", "Float"},
-		{"name", "String"},
-		{"email", "String"},
-		{"unknown", "String"},
-	}
-	for _, tt := range tests {
-		if got := inferParamType(tt.name); got != tt.want {
-			t.Errorf("inferParamType(%q) = %q, want %q", tt.name, got, tt.want)
-		}
-	}
-}
-
-// --- resolveParamTypeFromAST ---
-
-func TestResolveParamTypeFromAST(t *testing.T) {
-	// No AST data — falls back to heuristic
-	if got := resolveParamTypeFromAST("getUser", "id"); got != "Int" {
-		t.Fatalf("fallback should use inferParamType, got %q", got)
-	}
-
-	// With AST data
-	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIParamTypes: map[string]map[string]string{
-		"getUser": {"id": "UUID"},
-	}}})
-	if got, _, _ := generator.resolveParamMetaFromAST("getUser", "id"); got != "UUID" {
-		t.Fatalf("should use AST type, got %q", got)
-	}
-	if got, _, _ := generator.resolveParamMetaFromAST("svc:getUser", "id"); got != "UUID" {
-		t.Fatalf("service API should use the unprefixed AST type, got %q", got)
-	}
-	// Missing param in AST — fallback
-	if got, _, _ := generator.resolveParamMetaFromAST("getUser", "name"); got != "String" {
-		t.Fatalf("missing param should fallback, got %q", got)
-	}
-}
-
 // --- writeAPIRegistration ---
 
 func TestWriteAPIRegistration(t *testing.T) {
@@ -2167,9 +2188,9 @@ func TestWriteAPIRegistration(t *testing.T) {
 	generator.ids.APIParams = map[string]map[string]int{
 		"getUser": {"id": 2, "name": 1},
 	}
-	generator.ids.APIParamTypes = map[string]map[string]string{
+	generator.requestParams = requestParamDeclarations(map[string]map[string]string{
 		"getUser": {"id": "Int", "name": "String"},
-	}
+	})
 	b.Reset()
 	generator.writeAPIRegistration(&b, "getUser")
 	code := b.String()
@@ -2187,7 +2208,7 @@ func TestWriteAPIRegistration(t *testing.T) {
 	}
 
 	generator.ids.APIParams["getUser"] = map[string]int{"ids": 2}
-	generator.ids.APIParamTypes["getUser"] = map[string]string{"ids": "[UUID]?"}
+	generator.requestParams = requestParamDeclarations(map[string]map[string]string{"getUser": {"ids": "[UUID]?"}})
 	b.Reset()
 	generator.writeAPIRegistration(&b, "getUser")
 	if code := b.String(); !strings.Contains(code, `Type: "UUID", FieldID: 2, IsList: true, Nullable: true`) {
@@ -2195,7 +2216,7 @@ func TestWriteAPIRegistration(t *testing.T) {
 	}
 
 	generator.ids.APIParams["getUser"] = map[string]int{"input": 3}
-	generator.ids.APIParamTypes["getUser"] = map[string]string{"input": "CreateUserInput"}
+	generator.requestParams = requestParamDeclarations(map[string]map[string]string{"getUser": {"input": "CreateUserInput"}})
 	b.Reset()
 	generator.writeAPIRegistration(&b, "getUser")
 	if code := b.String(); !strings.Contains(code, `Type: "Model", TypeName: "CreateUserInput", FieldID: 3`) {
@@ -2203,7 +2224,7 @@ func TestWriteAPIRegistration(t *testing.T) {
 	}
 
 	generator.ids.APIParams["getUser"] = map[string]int{"id": 1, "removed": 9}
-	generator.ids.APIParamTypes["getUser"] = map[string]string{"id": "Int"}
+	generator.requestParams = requestParamDeclarations(map[string]map[string]string{"getUser": {"id": "Int"}})
 	b.Reset()
 	generator.writeAPIRegistration(&b, "getUser")
 	if code := b.String(); strings.Contains(code, `Name: "removed"`) {
@@ -2228,10 +2249,10 @@ func TestWriteAPIRegistrationNoParams(t *testing.T) {
 func TestWriteAPIRegistrationNamedEnums(t *testing.T) {
 	for _, name := range []string{"echoState", "svc:echoState"} {
 		generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
-			APIs:          map[string]int{name: 5},
-			APIParams:     map[string]map[string]int{name: {"value": 1, "values": 2, "input": 3}},
-			APIParamTypes: map[string]map[string]string{"echoState": {"value": "State", "values": "[State]?", "input": "Input"}},
+			APIs:      map[string]int{name: 5},
+			APIParams: map[string]map[string]int{name: {"value": 1, "values": 2, "input": 3}},
 		}})
+		generator.requestParams = requestParamDeclarations(map[string]map[string]string{name: {"value": "State", "values": "[State]?", "input": "Input"}})
 		var b strings.Builder
 		if strings.HasPrefix(name, "svc:") {
 			generator.generateRegisterServiceFns(&b, []string{"echoState"}, map[string]bool{"State": true})
@@ -2252,10 +2273,10 @@ func TestWriteAPIRegistrationNamedEnums(t *testing.T) {
 
 func TestCompiledCRUDOverrideRegistersEnumMetadataOnce(t *testing.T) {
 	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
-		APIs:          map[string]int{"getTask": 1},
-		APIParams:     map[string]map[string]int{"getTask": {"state": 1}},
-		APIParamTypes: map[string]map[string]string{"getTask": {"state": "State"}},
+		APIs:      map[string]int{"getTask": 1},
+		APIParams: map[string]map[string]int{"getTask": {"state": 1}},
 	}})
+	generator.requestParams = requestParamDeclarations(map[string]map[string]string{"getTask": {"state": "State"}})
 	model := &ast.ModelDecl{Name: "Task", Directives: []*ast.Directive{{Name: "crud"}}}
 	var output strings.Builder
 	generator.generateRegisterFuncWithInferred(&output, []*ast.ModelDecl{model}, []string{"getTask"}, nil, map[string]bool{"State": true})
@@ -2339,8 +2360,8 @@ func TestGenerateParamSetNullableEnum(t *testing.T) {
 	if !strings.Contains(out, "roleValEnum") {
 		t.Fatalf("nullable enum should create enum tmp var, got:\n%s", out)
 	}
-	if !strings.Contains(out, "&roleValEnum") {
-		t.Fatalf("nullable enum should take pointer, got:\n%s", out)
+	if !strings.Contains(out, "_value := roleVal") || !strings.Contains(out, "builder.SetRole(&_value)") {
+		t.Fatalf("nullable enum should allocate its setter pointer only in the non-null branch, got:\n%s", out)
 	}
 }
 
@@ -2354,12 +2375,28 @@ func TestGenerateParamSetCustomType(t *testing.T) {
 	}
 	generateParamSet(&b, f, "SetMetadata", "\t\t", nil)
 	out := b.String()
-	if !strings.Contains(out, "ParamJSON") {
-		t.Fatalf("custom type should use ParamJSON, got:\n%s", out)
+	if !strings.Contains(out, "ParamRawJSON") {
+		t.Fatalf("JSON should use its raw document reader, got:\n%s", out)
 	}
 }
 
 // ─── writeHandlerImports: all features enabled ──────────────────────────────
+
+func TestWriteHandlerImportsPatternAndStandaloneTransaction(t *testing.T) {
+	var output strings.Builder
+	model := &ast.ModelDecl{Name: "User", Directives: []*ast.Directive{{Name: "crud"}}, Fields: []*ast.FieldDecl{
+		{Name: "name", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "pattern"}}},
+	}}
+	writeHandlerImports(&output, &semantic.Result{}, []*ast.ModelDecl{model}, handlerFeatures{}, false)
+	if !strings.Contains(output.String(), `"regexp"`) {
+		t.Fatalf("pattern validator omitted regexp: %s", output.String())
+	}
+	output.Reset()
+	writeHandlerImports(&output, &semantic.Result{}, nil, handlerFeatures{hasTransaction: true}, false)
+	if !strings.Contains(output.String(), `"`+DriverPG.DriverImport()+`"`) {
+		t.Fatalf("standalone transaction omitted driver: %s", output.String())
+	}
+}
 
 func TestWriteHandlerImportsAllFeatures(t *testing.T) {
 	var b strings.Builder
@@ -2704,10 +2741,10 @@ func TestNativeAPIHandler(t *testing.T) {
 	}
 
 	// Registration in RegisterHandlers
-	if !strings.Contains(code, `router.Handle("getDashboardOverview"`) {
+	if !strings.Contains(code, `router.HandleLocal("getDashboardOverview"`) {
 		t.Error("native API should be registered in RegisterHandlers")
 	}
-	if !strings.Contains(code, `router.Handle("getErrorBreakdown"`) {
+	if !strings.Contains(code, `router.HandleLocal("getErrorBreakdown"`) {
 		t.Error("native API should be registered in RegisterHandlers")
 	}
 }
@@ -3502,8 +3539,8 @@ func TestWriteHandlerRegistration_Cache(t *testing.T) {
 	}
 	writeHandlerRegistration(&b, "getUser", dirs)
 	out := b.String()
-	if !strings.Contains(out, "api.WithCache") {
-		t.Errorf("@cache should wrap with WithCache: %s", out)
+	if strings.Contains(out, "WithCache") || !strings.Contains(out, `router.RequireCache("getUser")`) || !strings.Contains(out, `router.Handle("getUser", handleGetUser(app))`) {
+		t.Errorf("@cache must not bypass handler preflight: %s", out)
 	}
 }
 
@@ -3800,10 +3837,10 @@ func TestCollectBatchLoadModelsIncludesRemotePrimaryKeyModel(t *testing.T) {
 
 func TestWriteAPIRegistrationSkipsOnlyStaleParams(t *testing.T) {
 	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
-		APIs:          map[string]int{"svc:lookup": 9},
-		APIParams:     map[string]map[string]int{"svc:lookup": {"stale": 1}},
-		APIParamTypes: map[string]map[string]string{"lookup": {"active": "String"}},
+		APIs:      map[string]int{"svc:lookup": 9},
+		APIParams: map[string]map[string]int{"svc:lookup": {"stale": 1}},
 	}})
+	generator.requestParams = requestParamDeclarations(map[string]map[string]string{"svc:lookup": {"active": "String"}})
 	var b strings.Builder
 	generator.writeAPIRegistration(&b, "svc:lookup")
 	out := b.String()
@@ -4095,7 +4132,7 @@ func TestCRUDHandlerSkipDebug(t *testing.T) {
 	ops := crudOperations(models[0])
 	t.Logf("ops: %v", ops)
 	for _, op := range ops {
-		t.Logf("crudAPIName(Project, %s) = %s", op, crudAPIName("Project", op))
+		t.Logf("ast.CRUDAPIName(Project, %s) = %s", op, ast.CRUDAPIName("Project", op))
 	}
 }
 

@@ -94,4 +94,46 @@ internal object PairedJvmBenchmark {
             median(previous) { it.nanos }, median(current) { it.nanos },
             median(previous) { it.bytes }, median(current) { it.bytes }))
     }
+
+    /** One implementation per JVM; callers compile both versions with identical class names. */
+    fun isolated(name: String, operation: LongSupplier, iterations: Int, warmupIterations: Int = iterations): Int {
+        require(iterations > 0 && warmupIterations > 0)
+        val warmup = List(12) { measure(operation, warmupIterations) }
+        val samples = List(20) { measure(operation, iterations) }
+        reportIsolated(name, warmup, samples)
+        return warmupIterations * 12 + iterations * 20
+    }
+
+    /** The caller owns one coroutine scope; immediate test callbacks must stay on its thread. */
+    suspend fun isolatedSuspending(
+        name: String, iterations: Int, warmupIterations: Int, operation: suspend () -> Long,
+    ): Int {
+        require(iterations > 0 && warmupIterations > 0)
+        val warmup = List(12) { measureSuspending(operation, warmupIterations) }
+        val samples = List(20) { measureSuspending(operation, iterations) }
+        reportIsolated(name, warmup, samples)
+        return warmupIterations * 12 + iterations * 20
+    }
+
+    private suspend fun measureSuspending(operation: suspend () -> Long, iterations: Int): Sample {
+        val thread = Thread.currentThread().threadId()
+        val bytes = allocations.getThreadAllocatedBytes(thread)
+        val start = System.nanoTime()
+        var result = 0L
+        repeat(iterations) { result = result xor operation() }
+        val elapsed = System.nanoTime() - start
+        val allocated = allocations.getThreadAllocatedBytes(thread) - bytes
+        check(Thread.currentThread().threadId() == thread) { "allocation measurement crossed threads" }
+        sink = result
+        return Sample(elapsed.toDouble() / iterations, allocated.toDouble() / iterations)
+    }
+
+    private fun reportIsolated(name: String, warmup: List<Sample>, samples: List<Sample>) {
+        fun median(value: (Sample) -> Double): Double =
+            samples.map(value).sorted().let { (it[9] + it[10]) / 2 }
+        println(String.format(Locale.ROOT, "%s: %.3f ns/op; %.3f B/op; sink=%d", name,
+            median { it.nanos }, median { it.bytes }, sink))
+        warmup.forEach { println("warmup $name ${it.nanos} ${it.bytes}") }
+        samples.forEach { println("sample $name ${it.nanos} ${it.bytes}") }
+    }
 }

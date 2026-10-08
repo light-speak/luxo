@@ -17,7 +17,11 @@ Object? _metadataSink;
 
 enum _Kind { array, cell, boolean, integer, floating, string }
 
-void main() {
+void main(List<String> args) {
+  if (args.contains('selection')) {
+    _benchmarkSelection();
+    return;
+  }
   final row = LuxoEncoder()..writeVarint(0);
   for (final id in [1, 128, 16384, 2097152]) {
     row.writeFieldInt(id, LuxoInt64.minValue);
@@ -43,6 +47,67 @@ void main() {
   print(
     'Decoder construction, arrays and cells only; not network, allocations or release gates.',
   );
+}
+
+void _benchmarkSelection() {
+  for (final id in [1, 128, 65535]) {
+    final mask = fieldMaskSet(Uint8List(0), id);
+    int repeat(bool Function(Uint8List, int) has) {
+      var result = 0;
+      for (var i = 0; i < 10000; i++) {
+        if (has(mask, id)) result++;
+      }
+      return result;
+    }
+
+    compareBenchmarks(
+      'mask has id=$id',
+      () => repeat(_legacyMaskHas),
+      () => repeat(fieldMaskHas),
+      iterations: 10000,
+      includeRange: true,
+    );
+    for (final fresh in [false, true]) {
+      final iterations = fresh ? 1000 : 10000;
+      int repeatSet(Uint8List Function(Uint8List, int) set) {
+        var result = 0;
+        for (var i = 0; i < iterations; i++) {
+          result += set(fresh ? Uint8List(0) : mask, id).last;
+        }
+        return result;
+      }
+
+      compareBenchmarks(
+        'mask set id=$id fresh=$fresh',
+        () => repeatSet(_legacyMaskSet),
+        () => repeatSet(fieldMaskSet),
+        iterations: iterations,
+        includeRange: true,
+      );
+    }
+  }
+}
+
+// Frozen pre-limit helpers for valid-input performance comparison only.
+bool _legacyMaskHas(Uint8List mask, int fieldID) {
+  if (fieldID <= 0) return false;
+  final bit = fieldID - 1;
+  final byteIndex = bit >> 3;
+  if (byteIndex >= mask.length) return false;
+  return (mask[byteIndex] & (1 << (bit & 7))) != 0;
+}
+
+Uint8List _legacyMaskSet(Uint8List mask, int fieldID) {
+  if (fieldID <= 0) return mask;
+  final bit = fieldID - 1;
+  final byteIndex = bit >> 3;
+  if (byteIndex >= mask.length) {
+    final newMask = Uint8List(byteIndex + 1);
+    newMask.setRange(0, mask.length, mask);
+    mask = newMask;
+  }
+  mask[byteIndex] |= 1 << (bit & 7);
+  return mask;
 }
 
 typedef _ScalarReader = Object Function(LuxoDecoder);

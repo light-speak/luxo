@@ -1,6 +1,8 @@
 package api
 
 import (
+	"github.com/light-speak/luxo/internal/testutil"
+
 	"bytes"
 	"context"
 	"encoding/json"
@@ -54,7 +56,7 @@ func testWSRouter() *Router {
 	rt.Registry.RegisterParams("getUser", []ParamMeta{
 		{Name: "id", Type: "Int", FieldID: 1},
 	})
-	rt.Schema.RegisterAPI(&schema.API{Name: "watchTest", Stream: true})
+	rt.Schema.RegisterAPI(&schema.API{ID: 11, Name: "watchTest", Stream: true})
 
 	return rt
 }
@@ -62,7 +64,16 @@ func testWSRouter() *Router {
 func registerTestStream(rt *Router, name string) {
 	definition := rt.Schema.APIs[name]
 	if definition == nil {
-		definition = &schema.API{Name: name}
+		id, registered := rt.Registry.IDByName(name)
+		if !registered {
+			id = 1
+			for _, existing := range rt.Schema.APIs {
+				if existing.ID >= id {
+					id = existing.ID + 1
+				}
+			}
+		}
+		definition = &schema.API{ID: id, Name: name}
 		rt.Schema.RegisterAPI(definition)
 	}
 	definition.Stream = true
@@ -479,7 +490,7 @@ func TestWSBinary_Success(t *testing.T) {
 	reqBuf := []byte{BinaryFrameCallRequest}
 	reqBuf = codec.AppendVarint(reqBuf, 1)  // seq
 	reqBuf = codec.AppendVarint(reqBuf, 10) // API ID
-	mask := codec.AppendSelectionMask(nil, []byte{0x06}, nil)
+	mask := testutil.Bytes(t)(codec.AppendSelectionMask(nil, []byte{0x06}, nil))
 	reqBuf = codec.AppendVarint(reqBuf, uint64(len(mask)))
 	reqBuf = append(reqBuf, mask...)
 	// Param: field 1 = int 42
@@ -570,7 +581,7 @@ func TestWSBinary_SequenceBoundaryDoesNotCollideWithFrameTypes(t *testing.T) {
 		req := []byte{BinaryFrameCallRequest}
 		req = codec.AppendVarint(req, seq)
 		req = codec.AppendVarint(req, 10)
-		mask := codec.AppendSelectionMask(nil, []byte{0x06}, nil)
+		mask := testutil.Bytes(t)(codec.AppendSelectionMask(nil, []byte{0x06}, nil))
 		req = codec.AppendVarint(req, uint64(len(mask)))
 		req = append(req, mask...)
 		req = codec.AppendVarint(req, 1)
@@ -730,7 +741,9 @@ func TestWSJSONSelectionSupportsTypeReturn(t *testing.T) {
 			{ID: 2, Name: "expiresAt", Type: schema.FieldDateTime},
 		},
 	})
-	rt.Schema.RegisterAPI(&schema.API{ID: 11, Name: "login", Module: "auth", ReturnType: "AuthPayload"})
+	if err := rt.Schema.RegisterAPI(&schema.API{ID: 12, Name: "login", Module: "auth", ReturnType: "AuthPayload"}); err != nil {
+		t.Fatal(err)
+	}
 	maskApplied := make(chan bool, 1)
 	rt.Handle("login", func(ctx context.Context, req *Request) error {
 		maskApplied <- bytes.Equal(req.FieldMask, []byte{1, 1})
@@ -1309,7 +1322,7 @@ func TestWSBinary_SubscribeWithFieldMask(t *testing.T) {
 	var reqBuf []byte
 	reqBuf = append(reqBuf, BinaryFrameSubscribe, 1)
 	reqBuf = codec.AppendVarint(reqBuf, 66) // API ID
-	mask := codec.AppendSelectionMask(nil, []byte{0xFF, 0x01}, nil)
+	mask := testutil.Bytes(t)(codec.AppendSelectionMask(nil, []byte{0xFF, 0x01}, nil))
 	reqBuf = codec.AppendVarint(reqBuf, uint64(len(mask)))
 	reqBuf = append(reqBuf, mask...)
 	reqBuf = append(reqBuf, 0x00) // end params

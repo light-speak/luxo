@@ -1,6 +1,9 @@
 package luvia
 
 import (
+	"math/bits"
+	"slices"
+
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/schema"
 )
@@ -24,14 +27,28 @@ func Merge(primary []byte, extends []ExtendResult) []byte {
 	if len(extends) == 0 {
 		return primary
 	}
+	return AppendMerged(nil, primary, extends)
+}
+
+// AppendMerged appends already validated messages to caller-owned storage.
+// Source buffers must not overlap dst's backing array and remain unchanged.
+// With sufficient capacity, no intermediate merged message is allocated.
+func AppendMerged(dst, primary []byte, extends []ExtendResult) []byte {
+	if len(extends) == 0 {
+		return append(dst, primary...)
+	}
 
 	// Calculate total size for pre-allocation
 	totalSize := len(primary) // includes arena header + fields + 0x00
 	for _, ext := range extends {
-		totalSize += len(ext.Data) // fieldID varint + value bytes
+		if len(ext.Data) > 0 {
+			totalSize += max(1, (bits.Len64(uint64(ext.FieldID))+6)/7) + len(ext.Data) // fieldID varint + value bytes
+		}
 	}
-
-	result := make([]byte, 0, totalSize)
+	if len(primary) == 0 || primary[len(primary)-1] != 0 {
+		totalSize++
+	}
+	result := slices.Grow(dst, totalSize)
 
 	// Copy primary response WITHOUT the trailing end marker (0x00)
 	if len(primary) > 0 && primary[len(primary)-1] == 0x00 {
@@ -288,16 +305,31 @@ func MergeColumnar(primary []byte, extends []ExtendColumnResult) []byte {
 	if len(extends) == 0 {
 		return primary
 	}
+	return AppendMergedColumnar(nil, primary, extends)
+}
+
+// AppendMergedColumnar appends validated columns directly to owned output.
+// A row uses the same field layout with exactly one blob per extend field.
+// Source buffers must not overlap dst's backing array and remain unchanged.
+func AppendMergedColumnar(dst, primary []byte, extends []ExtendColumnResult) []byte {
+	if len(extends) == 0 {
+		return append(dst, primary...)
+	}
 
 	totalSize := len(primary)
 	for _, ext := range extends {
-		totalSize += 10 // fieldID varint overhead
+		if len(ext.Blobs) == 0 {
+			continue
+		}
+		totalSize += max(1, (bits.Len64(uint64(ext.FieldID))+6)/7) // fieldID varint overhead
 		for _, blob := range ext.Blobs {
-			totalSize += 10 + len(blob) // varint len + blob data
+			totalSize += len(blob) // Each blob already contains its varint length.
 		}
 	}
-
-	result := make([]byte, 0, totalSize)
+	if len(primary) == 0 || primary[len(primary)-1] != 0 {
+		totalSize++
+	}
+	result := slices.Grow(dst, totalSize)
 
 	// Copy primary WITHOUT end marker
 	if len(primary) > 0 && primary[len(primary)-1] == 0x00 {

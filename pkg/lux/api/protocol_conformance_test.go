@@ -1,6 +1,8 @@
 package api
 
 import (
+	"github.com/light-speak/luxo/internal/testutil"
+
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
@@ -106,10 +108,10 @@ func encodeProtocolFixtureNullable(t *testing.T) []byte {
 
 func encodeProtocolFixtureSelection(t *testing.T) []byte {
 	t.Helper()
-	child := codec.AppendSelectionMask(nil, codec.FieldMaskSet(nil, 2), nil)
-	fields := codec.FieldMaskSet(nil, 1)
-	fields = codec.FieldMaskSet(fields, 3)
-	mask := codec.AppendSelectionMask(nil, fields, []codec.SelectionMaskChild{{FieldID: 3, Mask: child}})
+	child := testutil.Bytes(t)(codec.AppendSelectionMask(nil, testutil.Bytes(t)(codec.FieldMaskSet(nil, 2)), nil))
+	fields := testutil.Bytes(t)(codec.FieldMaskSet(nil, 1))
+	fields = testutil.Bytes(t)(codec.FieldMaskSet(fields, 3))
+	mask := testutil.Bytes(t)(codec.AppendSelectionMask(nil, fields, []codec.SelectionMaskChild{{FieldID: 3, Mask: child}}))
 	data, err := EncodeBinaryRequest(7, mask, nil, nil)
 	if err != nil {
 		t.Fatal(err)

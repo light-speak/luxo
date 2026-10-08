@@ -157,6 +157,31 @@ func TestDirectivePrivateFnAuthRequiresServiceBoundary(t *testing.T) {
 
 // ========== Directive Type Constraint ==========
 
+func TestFilterableRejectsUnsupportedTypes(t *testing.T) {
+	for _, typeName := range []string{"JSON", "Bytes", "Duration", "[Int]", "[String]", "[State]", "[JSON]?", "[Bytes]?", "[Duration]", "JSON?", "Bytes?", "Duration?", "Child", "Input", "Missing"} {
+		t.Run(typeName, func(t *testing.T) {
+			result := analyze(t, "enum State { OPEN CLOSED }\nmodel Child { id: Int @id }\ntype Input { value: Int }\nmodel Probe { value: "+typeName+" @filterable }")
+			expectError(t, result, "@filterable requires a supported scalar or enum")
+			for _, diagnostic := range result.Errors {
+				if strings.Contains(diagnostic.Message, "@filterable") && diagnostic.Pos.Line != 4 {
+					t.Fatalf("wrong annotation position: %v", diagnostic.Pos)
+				}
+			}
+		})
+	}
+}
+
+func TestFilterableSupportedScalarTypes(t *testing.T) {
+	for _, typeName := range []string{"Int", "Float", "String", "Boolean", "DateTime", "UUID", "Decimal", "State"} {
+		for _, nullable := range []string{"", "?"} {
+			t.Run(typeName+nullable, func(t *testing.T) {
+				result := analyze(t, "enum State { OPEN CLOSED }\nmodel Probe { value: "+typeName+nullable+" @filterable }")
+				expectNoErrors(t, result)
+			})
+		}
+	}
+}
+
 func TestDirectiveTypeConstraintHash(t *testing.T) {
 	// @hash on Int (should be on String)
 	result := analyze(t, `model User { age: Int @hash }`)
@@ -445,7 +470,7 @@ func TestMultipleDirectivesOnModel(t *testing.T) {
 }
 
 func TestMultipleDirectivesOnApi(t *testing.T) {
-	result := analyze(t, `api getUser(): Int @auth @cache(ttl: 60)`)
+	result := analyzeCached(t, `api getUser(): Int @auth @cache(policy: "preview")`)
 	expectNoErrors(t, result)
 }
 
@@ -484,6 +509,18 @@ func TestTransformDirectiveResultTypeMustMatchField(t *testing.T) {
   name: String @transform { it.length }
 }`)
 	expectError(t, result, "@transform result type 'Int' does not match field type 'String'")
+}
+
+func TestTransformDirectiveReportsUnknownExpressionWithoutTypeCascade(t *testing.T) {
+	result := analyze(t, `model User {
+  name: String @transform { missingTransformValue }
+}`)
+	expectError(t, result, "undefined: 'missingTransformValue'")
+	for _, diagnostic := range result.Errors {
+		if strings.Contains(diagnostic.Message, "@transform result type") {
+			t.Fatalf("unknown expression produced a secondary type mismatch: %s", diagnostic.Message)
+		}
+	}
 }
 
 func TestTransformDirectiveSupportsNullableValue(t *testing.T) {
@@ -535,8 +572,8 @@ func TestDirectiveAuthRole(t *testing.T) {
 	expectNoErrors(t, result)
 }
 
-func TestDirectiveCacheTtl(t *testing.T) {
-	result := analyze(t, `api cached(): Int @cache(ttl: 5m)`)
+func TestDirectiveCachePolicy(t *testing.T) {
+	result := analyzeCached(t, `api cached(): Int @cache(policy: "preview")`)
 	expectNoErrors(t, result)
 }
 

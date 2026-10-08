@@ -3,8 +3,65 @@ package codec
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"testing"
 )
+
+func BenchmarkColumnFloatCapacity(b *testing.B) {
+	for _, rows := range []int{0, 1, 10, 128} {
+		b.Run(fmt.Sprint(rows), func(b *testing.B) {
+			values := floatCapacityValues(rows)
+			var writer ColumnarWriter
+			b.ReportAllocs()
+			for b.Loop() {
+				writer.Reset()
+				writer.SetCount(rows)
+				if err := writer.WriteColumnFloat(1, values); err != nil {
+					b.Fatal(err)
+				}
+				if _, err := writer.Bytes(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkColumnFloatReject(b *testing.B) {
+	for _, index := range []int{0, 63, 127} {
+		b.Run(fmt.Sprint(index), func(b *testing.B) {
+			values := floatCapacityValues(128)
+			values[index] = math.Inf(1)
+			var writer ColumnarWriter
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := writer.WriteColumnFloat(1, values); err != ErrNonFiniteFloat {
+					b.Fatal("invalid Float accepted", err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkColumnCapacity(b *testing.B) {
+	for _, rows := range []int{0, 1, 10, 128} {
+		for _, fixture := range columnCapacityFixtures(rows) {
+			b.Run(fmt.Sprintf("%s/rows=%d", fixture.name, rows), func(b *testing.B) {
+				var writer ColumnarWriter
+				b.ReportAllocs()
+				b.ResetTimer()
+				for b.Loop() {
+					writer.Reset()
+					writer.SetCount(rows)
+					fixture.write(&writer)
+					if _, err := writer.Bytes(); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
 
 // Frozen finalizer before the error-return migration. Valid inputs only.
 func (w *ColumnarWriter) bytesBeforeValidation() []byte {

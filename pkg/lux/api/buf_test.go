@@ -19,6 +19,28 @@ func TestResponseBufRejectsNonFiniteFloat(t *testing.T) {
 	}
 }
 
+func TestResponseBufReset(t *testing.T) {
+	storage := make([]byte, 0, 64)
+	buf := ResponseBuf{B: storage}
+	for range 2 {
+		buf.AppendString("previous response")
+		buf.Identity = struct{ ID int64 }{ID: 42}
+		buf.Reset()
+		if len(buf.B) != 0 || cap(buf.B) != cap(storage) || buf.Identity != nil {
+			t.Fatalf("reset retained state or lost capacity: %+v", buf)
+		}
+		buf.AppendByte('x')
+		if &buf.B[0] != &storage[:cap(storage)][0] || string(buf.B) != "x" {
+			t.Fatal("reset did not reuse the original storage")
+		}
+	}
+	var empty ResponseBuf
+	empty.Reset()
+	if empty.B != nil || empty.Identity != nil {
+		t.Fatalf("reset changed zero buffer: %+v", empty)
+	}
+}
+
 func TestResponseBufAppendInt(t *testing.T) {
 	buf := GetBuf()
 	defer PutBuf(buf)

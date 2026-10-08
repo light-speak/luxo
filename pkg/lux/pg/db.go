@@ -23,6 +23,7 @@ type ScanFunc[T any] func(rows Rows) (*T, error)
 // conn is the internal interface satisfied by both *pgxpool.Pool and pgx.Tx.
 // Not exported — generated code never sees this.
 type conn interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
@@ -76,8 +77,10 @@ func (db *DB) Pool() *pgxpool.Pool {
 // Tx runs fn inside a database transaction. The *DB passed to fn uses the
 // transaction for all queries. If fn returns nil, the transaction commits;
 // otherwise it rolls back. Panics inside fn are recovered and cause a rollback.
+// A nested call uses a savepoint on the current connection, not a new pool
+// transaction, so releasing it never commits independently of its parent.
 func (db *DB) Tx(ctx context.Context, fn func(tx *DB) error) (err error) {
-	pgxTx, err := db.pool.Begin(ctx)
+	pgxTx, err := db.conn.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("pg: begin tx: %w", err)
 	}
@@ -102,13 +105,19 @@ func (db *DB) Tx(ctx context.Context, fn func(tx *DB) error) (err error) {
 
 // QueryRows executes a SELECT and scans all rows using the provided scan function.
 func QueryRows[T any](ctx context.Context, db *DB, scan ScanFunc[T], query string, args ...any) ([]*T, error) {
+	return queryValues(ctx, db, scan, query, args...)
+}
+
+// queryValues supports both model pointers and plain projection values without
+// a dynamic row map or an intermediate result conversion.
+func queryValues[T any](ctx context.Context, db *DB, scan func(Rows) (T, error), query string, args ...any) ([]T, error) {
 	rows, err := db.conn.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var results []*T
+	var results []T
 	for rows.Next() {
 		item, err := scan(rows)
 		if err != nil {
@@ -144,6 +153,25 @@ func QueryRow[T any](ctx context.Context, db *DB, scan ScanFunc[T], query string
 // QueryRow scans the first row on this pool or transaction, or returns nil.
 func (db *DB) QueryRow[T any](ctx context.Context, scan ScanFunc[T], query string, args ...any) (*T, error) {
 	return QueryRow(ctx, db, scan, query, args...)
+}
+
+// writeRow drains the command completion before returning a mutation result.
+// A successful row scanner alone does not prove that the statement committed.
+func writeRow[T any](ctx context.Context, db *DB, scan ScanFunc[T], query string, args ...any) (*T, error) {
+	rows, err := db.conn.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, rows.Err()
+	}
+	row, err := scan(rows)
+	rows.Close()
+	if err == nil {
+		err = rows.Err()
+	}
+	return row, err
 }
 
 // QueryScalar executes a SELECT and scans a single scalar value.
@@ -190,7 +218,7 @@ func InsertReturning[T any](ctx context.Context, db *DB, scan ScanFunc[T], table
 		b.Write(strconv.AppendInt(tmp[:0], int64(i+1), 10))
 	}
 	b.WriteString(") RETURNING *")
-	return db.QueryRow(ctx, scan, b.String(), vals...)
+	return writeRow(ctx, db, scan, b.String(), vals...)
 }
 
 // InsertManyReturning inserts multiple rows and scans all RETURNING * results.
@@ -227,7 +255,7 @@ func InsertManyReturning[T any](ctx context.Context, db *DB, scan ScanFunc[T], t
 	}
 	b.WriteString(" RETURNING *")
 
-	return db.QueryRows(ctx, scan, b.String(), args...)
+	return QueryRows(ctx, db, scan, b.String(), args...)
 }
 
 // UpdateReturning updates a single record by ID and scans the RETURNING * result.
@@ -273,5 +301,5 @@ func UpdateReturningBy[T any, ID comparable](ctx context.Context, db *DB, scan S
 	b.WriteString(" RETURNING *")
 	args = append(args, id)
 
-	return db.QueryRow(ctx, scan, b.String(), args...)
+	return writeRow(ctx, db, scan, b.String(), args...)
 }

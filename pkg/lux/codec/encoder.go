@@ -26,6 +26,11 @@ type Encoder struct {
 	buf []byte
 }
 
+// NewEncoder appends to buffer without copying it. The caller transfers
+// exclusive use of its backing storage until encoding finishes. Bytes returns
+// the updated slice, including any existing prefix and any grown capacity.
+func NewEncoder(buffer []byte) Encoder { return Encoder{buf: buffer} }
+
 // Reset clears the buffer for reuse.
 func (e *Encoder) Reset() {
 	e.buf = e.buf[:0]

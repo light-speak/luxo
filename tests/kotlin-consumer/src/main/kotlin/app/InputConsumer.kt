@@ -5,6 +5,7 @@ import com.luxo.client.decodeLuxoJSON
 import com.luxo.client.encodeLuxoJSON
 import com.luxo.generated.EncodingChild
 import com.luxo.generated.EncodingInput
+import com.luxo.generated.Role
 import kotlinx.serialization.json.*
 
 /** No serialization compiler plugin is applied in this independent consumer. */
@@ -60,7 +61,7 @@ private fun verifyUnicodeInputs(input: EncodingInput) {
         val payload = buildJsonObject { put(text, text) }
         val invalid = listOf(
             input.copy(text = text), input.copy(texts = listOf("valid", text)),
-            input.copy(role = text), input.copy(roles = listOf(text)),
+            input.copy(role = Role.fromValue(text)), input.copy(roles = listOf(Role.fromValue(text))),
             input.copy(decimal = text), input.copy(decimals = listOf(text)),
             input.copy(payload = payload), input.copy(payloads = listOf(payload)),
         )
@@ -85,9 +86,9 @@ private fun encodingInput(): EncodingInput {
     val child = EncodingChild(Long.MIN_VALUE)
     return EncodingInput(
         number = Long.MAX_VALUE, duration = Long.MIN_VALUE, ratio = 1.25, text = "精度 café", flag = true,
-        date = date, uuid = uuid, decimal = decimal, blob = blob, payload = payload, role = "MEMBER", child = child,
+        date = date, uuid = uuid, decimal = decimal, blob = blob, payload = payload, role = Role.Known.MEMBER, child = child,
         integers = listOf(Long.MAX_VALUE), durations = listOf(Long.MIN_VALUE), ratios = listOf(1.25), texts = listOf("精度 café"),
         flags = listOf(true), dates = listOf(date), uuids = listOf(uuid), decimals = listOf(decimal), blobs = listOf(blob),
-        payloads = listOf(payload), roles = listOf("MEMBER"), children = listOf(child),
+        payloads = listOf(payload), roles = listOf(Role.Known.MEMBER), children = listOf(child),
     )
 }

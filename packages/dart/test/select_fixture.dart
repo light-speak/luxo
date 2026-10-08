@@ -127,11 +127,14 @@ class SelectFixture implements Resolver {
     await root.delete(recursive: true);
   }
 
-  Future<void> runDart(List<String> arguments) async {
+  Future<void> runDart(
+    List<String> arguments, {
+    String? workingDirectory,
+  }) async {
     final process = await Process.start(
       Platform.resolvedExecutable,
       arguments,
-      workingDirectory: root.path,
+      workingDirectory: workingDirectory ?? root.path,
     );
     final stdout = process.stdout.transform(utf8.decoder).join();
     final stderr = process.stderr.transform(utf8.decoder).join();

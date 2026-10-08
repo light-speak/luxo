@@ -1,10 +1,27 @@
 package codec
 
 import (
+	"bytes"
 	"encoding/binary"
 	"math"
 	"testing"
 )
+
+func FuzzNullableRootEnvelope(f *testing.F) {
+	for _, data := range [][]byte{nil, {0}, {1}, {2}, {0, 0}, {1, 0}, {1, 84}} {
+		f.Add(data)
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		valid := len(data) == 1 && data[0] == 0 || len(data) > 1 && data[0] == 1
+		value, null, err := UnwrapNullableRoot(data)
+		if (err == nil) != valid {
+			t.Fatalf("wrong envelope validity: %x, %v", data, err)
+		}
+		if valid && (null != (data[0] == 0) || !bytes.Equal(value, data[1:])) {
+			t.Fatalf("changed root: %x -> %x / %v", data, value, null)
+		}
+	})
+}
 
 func FuzzArrayMetadataBounds(f *testing.F) {
 	for _, count := range []uint64{0, 1, 128, MaxArrayElements, MaxArrayElements + 1, 1 << 32, 1 << 63, math.MaxUint64} {

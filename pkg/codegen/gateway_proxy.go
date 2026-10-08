@@ -38,11 +38,21 @@ func proxyHandler(client *rpc.Client, s *schema.Schema, apiName string, rpcClien
 		}
 		resp, err := client.CallWithMaskTargetContext(ctx, bearerToken, apiMeta.ID, mask, params, rpc.TraceTarget{Operation: apiName, Dependency: api.TraceDependencySequential})
 		if err != nil { return err }
-		if plan != nil {
-			resp, err = proxyMerge(ctx, s, model, apiMeta, plan, resp, rpcClients)
+		dst := req.Buf.B
+		if apiMeta.ReturnNullable {
+			value, null, err := codec.UnwrapNullableRoot(resp)
 			if err != nil { return err }
+			if null { req.Buf.B = codec.AppendNull(dst); return nil }
+			resp = value
+			dst = codec.AppendPresent(dst)
 		}
-		req.Buf.B = append(req.Buf.B, resp...)
+		if plan != nil {
+			merged, err := proxyMerge(ctx, s, model, apiMeta, plan, dst, resp, rpcClients)
+			if err != nil { return err }
+			req.Buf.B = merged
+			return nil
+		}
+		req.Buf.B = append(dst, resp...)
 		return nil
 	}
 }
@@ -59,21 +69,17 @@ func proxyPreflight(s *schema.Schema, plan *luvia.QueryPlan, clients map[string]
 `
 
 const gatewayProxyMerge = `
-func proxyMerge(ctx context.Context, s *schema.Schema, model *schema.Model, apiMeta *schema.API, plan *luvia.QueryPlan, primary []byte, clients map[string]*rpc.Client) ([]byte, error) {
+func proxyMerge(ctx context.Context, s *schema.Schema, model *schema.Model, apiMeta *schema.API, plan *luvia.QueryPlan, dst, primary []byte, clients map[string]*rpc.Client) ([]byte, error) {
 	keys, err := proxyPrimaryKeys(primary, apiMeta.ReturnList, plan, model, s)
 	if err != nil { return nil, err }
-	if keys.Len() == 0 { return primary, nil }
+	if keys.Len() == 0 { return append(dst, primary...), nil }
 	columns, err := proxyResolve(ctx, s, plan.Extends, keys, clients)
 	if err != nil { return nil, err }
 	trace := api.DebugTrace(ctx)
 	_, mergeSpan := trace.StartSpan(ctx, api.DebugSpanMeta{Name: "response.merge", Category: "gateway", Service: "gateway", Operation: apiMeta.Name})
 	defer trace.FinishSpan(mergeSpan)
-	if apiMeta.ReturnList { return luvia.MergeColumnar(primary, columns), nil }
-	results := make([]luvia.ExtendResult, len(columns))
-	for i, column := range columns {
-		results[i] = luvia.ExtendResult{FieldID: column.FieldID, Data: column.Blobs[0]}
-	}
-	return luvia.Merge(primary, results), nil
+	// A single row has one blob per field; the canonical field bytes are identical.
+	return luvia.AppendMergedColumnar(dst, primary, columns), nil
 }
 `
 

@@ -2,14 +2,84 @@ package semantic
 
 import (
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 
+	"github.com/light-speak/luxo/internal/testutil"
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lexer"
 	"github.com/light-speak/luxo/pkg/parser"
 )
+
+func BenchmarkEditDistance(b *testing.B) {
+	for _, size := range []int{8, 63, 64, 128} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			left := strings.Repeat("a", size)
+			right := strings.Repeat("a", size-1) + "b"
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				if editDistance(left, right) != 1 {
+					b.Fatal("incorrect edit distance")
+				}
+			}
+		})
+	}
+}
+
+// Compare compile-time event collection, not event delivery or request handling.
+func BenchmarkCollectEventEmits(b *testing.B) {
+	for _, count := range []int{0, 1, 128} {
+		block := &ast.Block{}
+		for range count {
+			block.Stmts = append(block.Stmts, &ast.EmitStmt{EventName: "Changed"})
+		}
+		for _, recursive := range []bool{false, true} {
+			b.Run(fmt.Sprintf("direct_%d/recursive=%t", count, recursive), func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					var events []string
+					if recursive {
+						events, _ = collectReachableEmits(block, "", nil, nil)
+					} else {
+						for _, stmt := range block.Stmts {
+							if emit, ok := stmt.(*ast.EmitStmt); ok {
+								events = append(events, emit.EventName)
+							}
+						}
+					}
+					if len(events) != count {
+						b.Fatal(events)
+					}
+				}
+			})
+		}
+	}
+}
+
+// Synthetic, prebuilt callable graphs isolate reachable-event collection.
+func BenchmarkReachableEventEmits(b *testing.B) {
+	for _, count := range []int{1, 32, 128} {
+		bodies := make(map[callableKey]*ast.Block, count)
+		for index := range count {
+			var statement ast.Stmt = &ast.EmitStmt{EventName: "Changed"}
+			if index+1 < count {
+				statement = &ast.ExprStmt{Expr: &ast.CallExpr{Func: &ast.Ident{Name: fmt.Sprintf("helper%d", index+1)}}}
+			}
+			bodies[callableKey{name: fmt.Sprintf("helper%d", index)}] = &ast.Block{Stmts: []ast.Stmt{statement}}
+		}
+		root := &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: &ast.CallExpr{Func: &ast.Ident{Name: "helper0"}}}}}
+		b.Run(fmt.Sprintf("helpers_%d", count), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				events, _ := collectReachableEmits(root, "", bodies, nil)
+				if len(events) != 1 || events[0] != "Changed" {
+					b.Fatal(events)
+				}
+			}
+		})
+	}
+}
 
 // Isolate the added compile-time validation; no request handler calls this pass.
 func BenchmarkErrorDeclarationValidation(b *testing.B) {
@@ -98,7 +168,12 @@ error Unauthorized {
   message: "error.unauthorized"
 }
 
-event PostCreated(post: Post, userId: Int)
+type PostSnapshot {
+  id: Int
+  title: String
+}
+
+event PostCreated(post: PostSnapshot, userId: Int)
 
 api createPost(title: String, content: String): Post @auth {
   val post = Post.create(
@@ -106,7 +181,7 @@ api createPost(title: String, content: String): Post @auth {
     content: content,
     userId: my.id
   )
-  emit PostCreated(post: post, userId: my.id)
+  emit PostCreated(post: PostSnapshot { id: post.id, title: post.title }, userId: my.id)
   post
 }
 
@@ -148,6 +223,46 @@ func parseFile(b *testing.B, input string) *ast.File {
 	return file
 }
 
+// BenchmarkAnalyzeWhereMembership separates query validation from ordinary comparisons.
+func BenchmarkAnalyzeWhereMembership(b *testing.B) {
+	for _, predicate := range []struct{ name, source string }{
+		{"comparison", "it.points > 0"}, {"range", "it.points in 1..10"}, {"list", "it.points in values"},
+	} {
+		b.Run(predicate.name, func(b *testing.B) {
+			file := parseFile(b, "model Probe { id: Int @id points: Int }\napi selected(values: [Int]): [Probe] { return Probe.where { "+predicate.source+" }.all() }")
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				if result := Analyze([]*ast.File{file}); len(result.Errors) != 0 {
+					b.Fatal(result.Errors)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkAnalyzeQueryValueScopes covers string and CRUD predicate bindings.
+func BenchmarkAnalyzeQueryValueScopes(b *testing.B) {
+	for _, sample := range []struct{ name, expression string }{
+		{"string", `Probe.where { it.title.startsWith(value) }.all()`},
+		{"string-expression", `Probe.where { it.title.startsWith(value.trim()) }.all()`},
+		{"crud-comparison", `Probe.find(where: it.title == value)`},
+		{"crud-membership", `Probe.find(where: it.points in values)`},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			file := parseFile(b, `model Probe { id: Int @id points: Int title: String }
+api selected(value: String, values: [Int]): [Probe] { return `+sample.expression+` }`)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				if result := Analyze([]*ast.File{file}); len(result.Errors) != 0 {
+					b.Fatal(result.Errors)
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkAnalyze measures full semantic analysis of a medium-sized .luxo source.
 func BenchmarkAnalyze(b *testing.B) {
 	file := parseFile(b, benchSemanticInput)
@@ -180,18 +295,26 @@ func BenchmarkAnalyzeLargeFile(b *testing.B) {
 	}
 }
 
-// BenchmarkAnalyzeDemoFile measures semantic analysis of the full demo.luxo file.
+// BenchmarkAnalyzeDemoFile retains the immutable V1 analysis/diagnostics workload.
+// The historical corpus is not a valid current application; errors are intentional here.
 func BenchmarkAnalyzeDemoFile(b *testing.B) {
-	data, err := os.ReadFile("../../editors/vscode/examples/demo.luxo")
-	if err != nil {
-		b.Skipf("demo.luxo not found: %v", err)
-	}
-	src := string(data)
+	src := testutil.CompilerDemoV1()
 	file := parseFile(b, src)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
 		a := New()
 		a.Analyze([]*ast.File{file})
+	}
+}
+
+func TestHistoricalCompilerCorpusIncludesDiagnostics(t *testing.T) {
+	tokens, lexErrors := lexer.New(testutil.CompilerDemoV1(), "bench.luxo").Tokenize()
+	file, parseErrors := parser.New(tokens).Parse("bench.luxo")
+	if len(lexErrors) != 0 || len(parseErrors) != 0 {
+		t.Fatalf("historical input must be syntactically complete: %v %v", lexErrors, parseErrors)
+	}
+	if result := New().Analyze([]*ast.File{file}); len(result.Errors) == 0 {
+		t.Fatal("reassess benchmark classification: the historical diagnostics workload no longer reports errors")
 	}
 }

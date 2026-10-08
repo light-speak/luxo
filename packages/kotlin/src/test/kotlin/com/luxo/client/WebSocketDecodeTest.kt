@@ -7,6 +7,36 @@ import kotlin.test.*
 
 class WebSocketDecodeTest {
     @Test
+    fun missingJSONDataRetiresOnlyItsOperation() = runBlocking {
+        withSocket(TransportMode.JSON) { transport, socket ->
+            val errors = mutableListOf<LuxoError>()
+            val values = mutableListOf<Any>()
+            val peers = mutableListOf<Any>()
+            var done = 0
+            val stop = transport.subscribe("watch", { it }, observer = StreamObserver({ done++ }, { errors += it })) { values += it }
+            val stopPeer = transport.subscribe("watch", { it }) { peers += it }
+            socket.receive("""{"${'$'}stream":1,"data":null}""")
+            repeat(2) { socket.receive("""{"${'$'}stream":1}""") }
+            finish(socket, TransportMode.JSON, 1)
+            socket.receive("""{"${'$'}stream":2,"data":null}""")
+            assertEquals(listOf<Any>(JsonNull), values)
+            assertEquals(listOf<Any>(JsonNull), peers)
+            assertEquals("ParseError", errors.single().error)
+            assertEquals(0, done)
+            val normal = socket.onText
+            socket.onText = { text ->
+                val id = Json.parseToJsonElement(text).jsonObject["\$id"]
+                if (id != null) socket.receive("""{"${'$'}id":$id}""")
+            }
+            assertEquals("ParseError", assertFailsWith<LuxoError> { transport.call("watch") }.error)
+            socket.onText = normal
+            assertEquals(7L, integer(transport.call("watch")))
+            assertEquals(0, socket.closes)
+            stop(); stopPeer()
+        }
+    }
+
+    @Test
     fun malformedPayloadRetiresOnlyItsSubscription() = runBlocking {
         for (mode in TransportMode.entries) withSocket(mode) { transport, socket ->
             val errors = mutableListOf<LuxoError>()

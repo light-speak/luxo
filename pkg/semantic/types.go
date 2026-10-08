@@ -115,26 +115,26 @@ func BuiltinTypes() map[string]*ResolvedType {
 		"isEmpty": {Name: "isEmpty", Type: boolType},
 		"size":    {Name: "size", Type: intType},
 		// transform — return String (self-ref resolved below)
-		"lowercase": {Name: "lowercase", Type: nil},
-		"uppercase": {Name: "uppercase", Type: nil},
-		"trim":      {Name: "trim", Type: nil},
-		"trimStart": {Name: "trimStart", Type: nil},
-		"trimEnd":   {Name: "trimEnd", Type: nil},
-		"reversed":  {Name: "reversed", Type: nil},
+		"lowercase": {Name: "lowercase", Type: nil, IsMethod: true},
+		"uppercase": {Name: "uppercase", Type: nil, IsMethod: true},
+		"trim":      {Name: "trim", Type: nil, IsMethod: true},
+		"trimStart": {Name: "trimStart", Type: nil, IsMethod: true},
+		"trimEnd":   {Name: "trimEnd", Type: nil, IsMethod: true},
+		"reversed":  {Name: "reversed", Type: nil, IsMethod: true},
 		// methods that take args — return type varies but LSP won't error
-		"contains":   {Name: "contains", Type: boolType},
-		"startsWith": {Name: "startsWith", Type: boolType},
-		"endsWith":   {Name: "endsWith", Type: boolType},
-		"matches":    {Name: "matches", Type: boolType},
-		"replace":    {Name: "replace", Type: nil},
-		"replaceAll": {Name: "replaceAll", Type: nil},
-		"split":      {Name: "split", Type: nil},
-		"substring":  {Name: "substring", Type: nil},
-		"repeat":     {Name: "repeat", Type: nil},
-		"padStart":   {Name: "padStart", Type: nil},
-		"padEnd":     {Name: "padEnd", Type: nil},
-		"toInt":      {Name: "toInt", Type: intType},
-		"toFloat":    {Name: "toFloat", Type: floatType},
+		"contains":   {Name: "contains", Type: boolType, IsMethod: true},
+		"startsWith": {Name: "startsWith", Type: boolType, IsMethod: true},
+		"endsWith":   {Name: "endsWith", Type: boolType, IsMethod: true},
+		"matches":    {Name: "matches", Type: boolType, IsMethod: true},
+		"replace":    {Name: "replace", Type: nil, IsMethod: true},
+		"replaceAll": {Name: "replaceAll", Type: nil, IsMethod: true},
+		"split":      {Name: "split", Type: nil, IsMethod: true},
+		"substring":  {Name: "substring", Type: nil, IsMethod: true},
+		"repeat":     {Name: "repeat", Type: nil, IsMethod: true},
+		"padStart":   {Name: "padStart", Type: nil, IsMethod: true},
+		"padEnd":     {Name: "padEnd", Type: nil, IsMethod: true},
+		"toInt":      {Name: "toInt", Type: intType, IsMethod: true},
+		"toFloat":    {Name: "toFloat", Type: floatType, IsMethod: true},
 	}}
 	// self-reference for string methods that return String
 	stringReturnMethods := []string{
@@ -181,6 +181,11 @@ func BuiltinTypes() map[string]*ResolvedType {
 		}},
 		"Identity": identityType,
 	}
+}
+
+// IsNonNullBoolean excludes nullable values and Boolean collections.
+func (t *ResolvedType) IsNonNullBoolean() bool {
+	return t != nil && t.Kind == TypeBool && !t.IsList && !t.Nullable
 }
 
 // IsNumeric returns true if the type is numeric.

@@ -24,7 +24,7 @@ func TestChanBusEmitOn(t *testing.T) {
 		return nil
 	})
 
-	bus.Emit(context.Background(), "user.created", map[string]any{"id": 1})
+	bus.Emit(context.Background(), "user.created", testEvent{UserID: 1})
 
 	select {
 	case <-done:
@@ -32,8 +32,8 @@ func TestChanBusEmitOn(t *testing.T) {
 		t.Fatal("timeout waiting for event")
 	}
 
-	got := received.Load().(map[string]any)
-	if got["id"] != 1 {
+	got := received.Load().(testEvent)
+	if got.UserID != 1 {
 		t.Errorf("got %v", got)
 	}
 }
@@ -58,7 +58,7 @@ func TestChanBusHandlerContextOutlivesEmitter(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := bus.Emit(ctx, "audit", nil); err != nil {
+	if err := bus.Emit(ctx, "audit", immutablePayload(0)); err != nil {
 		t.Fatal(err)
 	}
 	got := <-result
@@ -89,7 +89,7 @@ func TestChanBusMultipleHandlers(t *testing.T) {
 		return nil
 	})
 
-	bus.Emit(context.Background(), "order.placed", "test")
+	bus.Emit(context.Background(), "order.placed", immutablePayload("test"))
 
 	wg.Wait()
 	if count.Load() != 2 {
@@ -101,7 +101,7 @@ func TestChanBusNoSubscribers(t *testing.T) {
 	bus := NewChanBus(10)
 	defer bus.Close()
 
-	err := bus.Emit(context.Background(), "nobody.listens", "test")
+	err := bus.Emit(context.Background(), "nobody.listens", immutablePayload("test"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,14 +121,14 @@ func TestChanBusBufferFull(t *testing.T) {
 		return nil
 	})
 
-	if err := bus.Emit(context.Background(), "slow", "1"); err != nil {
+	if err := bus.Emit(context.Background(), "slow", immutablePayload("1")); err != nil {
 		t.Fatal(err)
 	}
 	<-started
-	if err := bus.Emit(context.Background(), "slow", "2"); err != nil {
+	if err := bus.Emit(context.Background(), "slow", immutablePayload("2")); err != nil {
 		t.Fatal(err)
 	}
-	if err := bus.Emit(context.Background(), "slow", "3"); !errors.Is(err, ErrBufferFull) {
+	if err := bus.Emit(context.Background(), "slow", immutablePayload("3")); !errors.Is(err, ErrBufferFull) {
 		t.Fatalf("full buffer error = %v, want %v", err, ErrBufferFull)
 	}
 
@@ -145,7 +145,7 @@ func TestChanBusCloseDrainsAcceptedEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := range 16 {
-		if err := bus.Emit(context.Background(), "audit", i); err != nil {
+		if err := bus.Emit(context.Background(), "audit", immutablePayload(i)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -162,7 +162,7 @@ func TestChanBusClose(t *testing.T) {
 	bus.Close()
 	bus.Close() // double close should not panic
 
-	bus.Emit(context.Background(), "test", "after close")
+	bus.Emit(context.Background(), "test", immutablePayload("after close"))
 }
 
 func TestChanBusCloseWaitsForInFlightEmit(t *testing.T) {
@@ -183,7 +183,11 @@ func TestChanBusCloseWaitsForInFlightEmit(t *testing.T) {
 		close(closed)
 	}()
 	<-bus.done
-	ch <- "accepted"
+	owned, err := immutablePayload("accepted").SnapshotEvent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch <- owned
 	bus.mu.RUnlock()
 
 	select {
@@ -217,7 +221,7 @@ func TestChanBusTypedPayload(t *testing.T) {
 		return nil
 	})
 
-	bus.Emit(context.Background(), "order.created", OrderEvent{OrderID: 1, UserID: 42, Total: 99.99})
+	bus.Emit(context.Background(), "order.created", immutablePayload(OrderEvent{OrderID: 1, UserID: 42, Total: 99.99}))
 
 	<-done
 	if got.OrderID != 1 || got.UserID != 42 {
@@ -241,7 +245,7 @@ func TestChanBusConcurrent(t *testing.T) {
 	n := 100
 	wg.Add(n)
 	for range n {
-		go bus.Emit(context.Background(), "concurrent", "test")
+		go bus.Emit(context.Background(), "concurrent", immutablePayload("test"))
 	}
 
 	wg.Wait()
@@ -267,7 +271,7 @@ func TestChanBusHandlerPanicRecovery(t *testing.T) {
 		return nil
 	})
 
-	bus.Emit(context.Background(), "crash", "test")
+	bus.Emit(context.Background(), "crash", immutablePayload("test"))
 
 	select {
 	case <-done:
@@ -281,11 +285,11 @@ func TestChanBusHandlerPanicRecovery(t *testing.T) {
 }
 
 func TestSafeCall(t *testing.T) {
-	err := safeCall(func(ctx context.Context, payload any) error {
+	err := InvokeHandler(func(ctx context.Context, payload any) error {
 		panic("should not crash")
 	}, context.Background(), nil)
 	if err == nil {
-		t.Error("safeCall should return panic-converted error")
+		t.Error("InvokeHandler should return panic-converted error")
 	}
 	if !strings.Contains(err.Error(), "panic") {
 		t.Errorf("error should mention panic: %v", err)
@@ -319,7 +323,7 @@ func TestChanBusOnQueue(t *testing.T) {
 		return nil
 	})
 
-	bus.Emit(context.Background(), "user.created", map[string]any{"id": 1})
+	bus.Emit(context.Background(), "user.created", testEvent{UserID: 1})
 
 	select {
 	case <-done:
@@ -327,8 +331,8 @@ func TestChanBusOnQueue(t *testing.T) {
 		t.Fatal("timeout")
 	}
 
-	got := received.Load().(map[string]any)
-	if got["id"] != 1 {
+	got := received.Load().(testEvent)
+	if got.UserID != 1 {
 		t.Errorf("got %v", got)
 	}
 }
@@ -352,7 +356,7 @@ func TestChanBusOnQueueMultipleGroups(t *testing.T) {
 		return nil
 	})
 
-	bus.Emit(context.Background(), "order.created", "test")
+	bus.Emit(context.Background(), "order.created", immutablePayload("test"))
 
 	wg.Wait()
 	if count.Load() != 2 {
@@ -365,7 +369,7 @@ func TestChanBusEmitAfterClose(t *testing.T) {
 	bus.On("test", func(ctx context.Context, payload any) error { return nil })
 	bus.Close()
 
-	err := bus.Emit(context.Background(), "test", "data")
+	err := bus.Emit(context.Background(), "test", immutablePayload("data"))
 	if err == nil {
 		t.Fatal("Emit after Close should return error")
 	}
@@ -391,7 +395,7 @@ func BenchmarkChanBusEmit(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		for {
-			err := bus.Emit(context.Background(), "benchmark", "payload")
+			err := bus.Emit(context.Background(), "benchmark", immutablePayload("payload"))
 			if err == nil {
 				break
 			}
@@ -401,4 +405,23 @@ func BenchmarkChanBusEmit(b *testing.B) {
 			runtime.Gosched()
 		}
 	}
+}
+func TestChanBusDispatchChannelClose(t *testing.T) {
+	bus := NewChanBus(1)
+
+	block := make(chan struct{})
+	bus.On("dispatch.close", func(ctx context.Context, payload any) error {
+		<-block
+		return nil
+	})
+
+	bus.Emit(context.Background(), "dispatch.close", immutablePayload("1"))
+	time.Sleep(10 * time.Millisecond)
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		bus.Close()
+	}()
+	close(block)
+	time.Sleep(50 * time.Millisecond)
 }

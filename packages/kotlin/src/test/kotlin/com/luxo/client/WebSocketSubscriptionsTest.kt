@@ -7,6 +7,26 @@ import kotlin.test.*
 
 class WebSocketSubscriptionsTest {
     @Test
+    fun registrationOwnsMetadataAndInvalidReplacementKeepsSubscriptionsUsable() = runBlocking {
+        for (mode in TransportMode.entries) withSocket { transport, socket ->
+            transport.setMode(mode)
+            val params = mutableListOf(ParamSchema(1, "value", "Int"))
+            val source = mutableMapOf("watch" to APISchemaEntry(77, params))
+            transport.setSchema(source)
+            params[0] = ParamSchema(2, "value", "String")
+            source.clear()
+            assertFailsWith<IllegalArgumentException> {
+                transport.setSchema(mapOf("watch" to APISchemaEntry(0)))
+            }
+            val ids = recordSubscriptions(socket, mode)
+            val cancel = transport.subscribe("watch", { it }, mapOf("value" to 7L)) {}
+            assertEquals(listOf(1uL), ids)
+            assertEquals(0, socket.closes)
+            cancel()
+        }
+    }
+
+    @Test
     fun `queued binary subscribe and cancel retain original bytes`() = runBlocking {
         withSocket { transport, socket ->
             transport.setMode(TransportMode.BINARY)

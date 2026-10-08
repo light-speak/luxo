@@ -8,6 +8,7 @@ import (
 	"encoding/json/jsontext"
 	"fmt"
 	"strconv"
+	"strings"
 )
 
 // ValidUTF8JSON checks one complete JSON value, including UTF-8 and paired
@@ -32,6 +33,70 @@ func ParseFloat64(raw []byte) (float64, error) {
 		return 0, fmt.Errorf("JSON number underflows float64")
 	}
 	return value, nil
+}
+
+// ParseFloat64Text preserves existing string ownership during numeric parsing.
+// The byte entry remains separate so byte callers do not copy before validation.
+func ParseFloat64Text(raw string) (float64, error) {
+	raw = strings.Trim(raw, " \t\r\n")
+	if !validNumberText(raw) {
+		return 0, fmt.Errorf("expected a JSON number")
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, err
+	}
+	if value == 0 && nonzeroMantissa([]byte(raw)) {
+		return 0, fmt.Errorf("JSON number underflows float64")
+	}
+	return value, nil
+}
+
+// Validate just the numeric token without borrowing a general JSON decoder or
+// copying the string into a decoder-owned byte buffer. Rounding stays in strconv.
+func validNumberText(raw string) bool {
+	i := 0
+	if len(raw) > 0 && raw[0] == '-' {
+		i++
+	}
+	if i == len(raw) {
+		return false
+	}
+	if raw[i] == '0' {
+		i++
+	} else {
+		if raw[i] < '1' || raw[i] > '9' {
+			return false
+		}
+		i = numberTextDigits(raw, i)
+	}
+	if i < len(raw) && raw[i] == '.' {
+		i++
+		start := i
+		i = numberTextDigits(raw, i)
+		if i == start {
+			return false
+		}
+	}
+	if i < len(raw) && (raw[i] == 'e' || raw[i] == 'E') {
+		i++
+		if i < len(raw) && (raw[i] == '+' || raw[i] == '-') {
+			i++
+		}
+		start := i
+		i = numberTextDigits(raw, i)
+		if i == start {
+			return false
+		}
+	}
+	return i == len(raw)
+}
+
+func numberTextDigits(raw string, i int) int {
+	for i < len(raw) && raw[i] >= '0' && raw[i] <= '9' {
+		i++
+	}
+	return i
 }
 
 func nonzeroMantissa(raw []byte) bool {

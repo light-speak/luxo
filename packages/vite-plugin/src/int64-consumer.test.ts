@@ -21,6 +21,7 @@ const schema: LuxoSchema = {
     { id: 6, name: 'states', type: 'Enum', typeName: 'State', isList: true },
     { id: 7, name: 'child', type: 'Model', typeName: 'TextValues', nullable: true },
     { id: 8, name: 'children', type: 'Model', typeName: 'TextValues', isList: true },
+    { id: 9, name: 'optionalStates', type: 'Enum', typeName: 'State', isList: true, nullable: true },
   ] } },
   models: { Metric: { name: 'Metric', fields: [
     { id: 1, name: 'id', type: 'Int' },
@@ -50,7 +51,12 @@ for (const type of scalarTypes) {
   }
 }
 schema.apis.implicitCount = { id: 100, name: 'implicitCount', module: 'test' }
-const responseConsumers = ['json-kind-consumer', 'json-projection-consumer', 'stream-isolation-consumer'] as const
+for (const [index, name] of ['optionalInt', 'optionalMetric', 'optionalRows', 'optionalValueStream', 'optionalModelStream', 'optionalRowsStream'].entries()) {
+  schema.apis[name] = { id: 200 + index, name, module: 'test', returnNullable: true,
+    returnType: name === 'optionalInt' || name === 'optionalValueStream' ? 'Int' : 'Metric',
+    returnList: name.includes('Rows'), stream: name.endsWith('Stream') }
+}
+const responseConsumers = ['json-kind-consumer', 'json-projection-consumer', 'stream-isolation-consumer', 'enum-consumer', 'nullable-root-consumer'] as const
 
 it.each(['commonjs', 'module'])('compiles a generated %s consumer with TS 7 and executes real HTTP JSON/binary contracts', async moduleType => {
   const root = resolve(import.meta.dirname, '../../..')
@@ -83,6 +89,8 @@ it.each(['commonjs', 'module'])('compiles a generated %s consumer with TS 7 and 
 }, 90000)
 
 function prepareResponseConsumers(directory: string): void {
+  writeFileSync(join(directory, 'response-transport.ts'), readFileSync(
+    join(import.meta.dirname, 'fixtures/response-transport.ts.txt'), 'utf8'))
   writeFileSync(join(directory, 'scalar-consumer.ts'), scalarConsumer())
   for (const script of responseConsumers) {
     writeFileSync(join(directory, `${script}.ts`), readFileSync(
@@ -247,7 +255,8 @@ const consumer = `
 import { LuxoClient } from './client.js'
 import { decodeJSONMetric, decodeMetric, decodeColumnarMetric, decodePaginatedMetric } from './types.js'
 import { Encoder, Decoder, decodeLuxoJSON, int64FromJSON } from '@luxojs/client'
-import type { Transport, LuxoTypeDecl } from '@luxojs/client'
+import type { LuxoTypeDecl } from '@luxojs/client'
+import { responseTransport } from './response-transport.js'
 
 const declaration: LuxoTypeDecl = { name: 'MetricInput', fields: [{ id: 1, name: 'value', type: 'Int' }] }
 
@@ -318,10 +327,7 @@ async function main(): Promise<void> {
   }
   rejects(() => int64FromJSON(decodeLuxoJSON('1e0', true)))
   let response: unknown = value
-  const transport: Transport = {
-    async call() { return response }, setMode() {}, setToken() {}, setSchema() {},
-    async subscribe(_api, _params, decode, onData) { onData(decode({ id: value })); return () => {} },
-  }
+  const transport = responseTransport(() => response, () => ({ id: value }))
   const client = new LuxoClient(transport)
   equal(await client.count(), value)
   response = { items: [{ id: value }], total: value, page: 1, pageSize: 20 }

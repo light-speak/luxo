@@ -1,11 +1,14 @@
 package codegen
 
 import (
+	"cmp"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 
+	"github.com/light-speak/luxo/internal/inferred"
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lux/str"
 	"github.com/light-speak/luxo/pkg/semantic"
@@ -127,9 +130,10 @@ func (g *GeneratorContext) generateHandlerFile(result *semantic.Result, packageN
 		callableEnums = CollectEnumsFromResult(result)
 	}
 	remoteLoads := g.remoteLoadCallsForResult(result)
-	if len(models) == 0 && len(inferredAPIs) == 0 && !hasCompiledAPIs && !hasNativeAPIs && !hasServiceFns && len(remoteLoads) == 0 {
+	if len(models) == 0 && len(inferredAPIs) == 0 && !hasCompiledAPIs && !hasNativeAPIs && !hasServiceFns && len(remoteLoads) == 0 && !g.needsInternalModelHandlers(result, allModels) {
 		return nil
 	}
+	g = g.withRequestDeclarations(result, enums)
 
 	features := g.detectHandlerFeatures(result, models, inferredAPIs, modelMap)
 
@@ -174,7 +178,7 @@ func (g *GeneratorContext) generateHandlerFile(result *semantic.Result, packageN
 	// RegisterHandlers function (CRUD + inferred + compiled + native)
 	allInferred := append(inferredNames, compiledNames...)
 	allInferred = append(allInferred, nativeNames...)
-	g.generateRegisterFuncWithInferred(&b, models, allInferred, apiDirectives, enums)
+	g.generateRegisterHandlers(&b, models, allInferred, apiDirectives, enums, allInferred)
 
 	// fn @service handlers
 	serviceNames := g.generateServiceFnHandlers(&b, result, modelMap, callableEnums, functionDeclarations, selectionFunctions)
@@ -194,6 +198,22 @@ func (g *GeneratorContext) generateHandlerFile(result *semantic.Result, packageN
 	g.writeHandlerImports(&out, result, allModels, features, strings.Contains(body, "codec."), body)
 	out.WriteString(body)
 	return []byte(out.String())
+}
+
+func (g *GeneratorContext) needsInternalModelHandlers(result *semantic.Result, models []*ast.ModelDecl) bool {
+	for _, file := range result.Files {
+		if len(file.Extends) > 0 {
+			return true
+		}
+	}
+	if g.events != nil {
+		for _, model := range models {
+			if g.events.remotePKModels[model.Name] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func collectHandlerModels(result *semantic.Result) (crudModels, allModels []*ast.ModelDecl) {
@@ -251,19 +271,19 @@ func generateCRUDHandlers(b *strings.Builder, models []*ast.ModelDecl, enums map
 }
 
 func (g *GeneratorContext) generateCRUDHandlers(b *strings.Builder, models []*ast.ModelDecl, enums map[string]bool, skipNames map[string]bool, universes ...[]*ast.ModelDecl) {
+	computedUniverse := models
+	if len(universes) > 0 {
+		computedUniverse = universes[0]
+	}
 	// Collect all model relations for recursive resolve support
 	modelRels := make(map[string]bool)
-	for _, m := range models {
+	for _, m := range computedUniverse {
 		rels := g.analyzeRelations(m, enums)
 		if len(rels) > 0 {
 			modelRels[m.Name] = true
 		}
 	}
 	computedModels := make(map[string]bool)
-	computedUniverse := models
-	if len(universes) > 0 {
-		computedUniverse = universes[0]
-	}
 	for _, model := range computedUniverse {
 		computedModels[model.Name] = modelHasComputedAggregates(model)
 	}
@@ -277,13 +297,17 @@ func (g *GeneratorContext) generateCRUDHandlers(b *strings.Builder, models []*as
 		ops := crudOperations(m)
 		for _, op := range ops {
 			// Skip if a compiled/inferred API with the same name exists
-			if skipNames[crudAPIName(m.Name, op)] {
+			if skipNames[ast.CRUDAPIName(m.Name, op)] {
 				continue
 			}
 			generateHandler(b, m, op, enums, rels)
 		}
 		generateFilterParser(b, m, enums)
-		generateSorterParser(b, m)
+		generateSorterParser(b, m, enums)
+	}
+	// Relation resolution is also needed by explicit and inferred APIs without @crud.
+	for _, m := range computedUniverse {
+		rels := g.analyzeRelations(m, enums)
 		if len(rels) > 0 {
 			generateRelationResolver(b, m, rels, modelRels, computedModels)
 			generateListRelationResolver(b, m, rels, modelRels, computedModels)
@@ -498,6 +522,7 @@ func generateNativeAPIHandler(b *strings.Builder, api *ast.ApiDecl, models map[s
 		writeCallableParamExtraction(b, p, enums, "\t\t")
 		paramNames = append(paramNames, p.Name)
 	}
+	cached := writeCachedBodyStart(b, api.Directives)
 
 	// Call NativeResolver
 	if api.ReturnType != nil {
@@ -516,11 +541,26 @@ func generateNativeAPIHandler(b *strings.Builder, api *ast.ApiDecl, models map[s
 		writeNativeReturnEncoding(b, api.ReturnType, models, enums)
 	}
 	fmt.Fprintf(b, "\t\treturn nil\n")
+	writeCachedBodyEnd(b, cached)
 	fmt.Fprintf(b, "\t}\n}\n\n")
 }
 
 // writeNativeReturnEncoding writes the binary encoding for a native API return value.
 func writeNativeReturnEncoding(b *strings.Builder, rt *ast.TypeRef, models map[string]*ast.ModelDecl, enums map[string]bool) {
+	if rt.Nullable {
+		b.WriteString("\t\tif result == nil { req.Buf.B = codec.AppendNull(req.Buf.B); return nil }\n")
+		b.WriteString("\t\treq.Buf.B = codec.AppendPresent(req.Buf.B)\n")
+		if !rt.IsList {
+			b.WriteString("\t\t{\n\t\tresult := *result\n")
+			writeNativePresentEncoding(b, rt, models, enums)
+			b.WriteString("\t\t}\n")
+			return
+		}
+	}
+	writeNativePresentEncoding(b, rt, models, enums)
+}
+
+func writeNativePresentEncoding(b *strings.Builder, rt *ast.TypeRef, models map[string]*ast.ModelDecl, enums map[string]bool) {
 	if rt.IsList {
 		writeNativeListEncoding(b, rt, models, enums)
 		return
@@ -610,16 +650,16 @@ func (g *GeneratorContext) generateRegisterServiceFns(b *strings.Builder, servic
 		return
 	}
 	b.WriteString("// RegisterServiceFns registers fn @service handlers with the router.\n")
-	b.WriteString("// Service fns use svc: prefix to distinguish from API handlers.\n")
-	b.WriteString("func RegisterServiceFns(router *api.Router, app *App) {\n")
+	b.WriteString("// Service fns are RPC-only; svc: is a naming convention, not access control.\n")
+	b.WriteString("func RegisterServiceFns(router *api.Router, app *App) error {\n")
 
 	for _, name := range serviceNames {
 		svcName := "svc:" + name
-		fmt.Fprintf(b, "\trouter.Handle(%q, handle%s(app))\n", svcName, str.Capitalize(name))
+		fmt.Fprintf(b, "\trouter.HandleInternal(%q, handle%s(app))\n", svcName, str.Capitalize(name))
 		g.writeAPIRegistration(b, svcName, firstBoolSet(enumSets))
 	}
 
-	b.WriteString("}\n\n")
+	b.WriteString("\treturn nil\n}\n\n")
 }
 
 // writeHandlerImports writes handler.gen.go imports.
@@ -680,8 +720,11 @@ func (g *GeneratorContext) writeHandlerImports(b *strings.Builder, result *seman
 	needsPG := len(models) > 0
 	needsUUID := false
 	needsDecimal := false
+	needsContext := true
+	var packages generatedImports
 	if len(generatedBody) > 0 {
-		packages := generatedPackages(generatedBody[0])
+		packages = generatedPackages(generatedBody[0])
+		needsContext = packages.has("context")
 		hasOrGroups = packages.has("strconv")
 		hasSortable = packages.has("strings")
 		hasTemplateStr = false
@@ -705,7 +748,9 @@ func (g *GeneratorContext) writeHandlerImports(b *strings.Builder, result *seman
 		feat.hasLog = packages.has("luxolog")
 	}
 	b.WriteString("import (\n")
-	b.WriteString("\t\"context\"\n")
+	if needsContext {
+		b.WriteString("\t\"context\"\n")
+	}
 	if needsFmt {
 		b.WriteString("\t\"fmt\"\n")
 	}
@@ -755,6 +800,7 @@ func (g *GeneratorContext) writeHandlerImports(b *strings.Builder, result *seman
 	if needsDecimal {
 		b.WriteString("\t\"github.com/shopspring/decimal\"\n")
 	}
+	writeStringUtilityImports(b, packages)
 	g.writeSortedCrossModuleImports(b, feat.crossEventImports)
 	if hasAwait {
 		b.WriteString("\t\"golang.org/x/sync/errgroup\"\n")
@@ -770,21 +816,7 @@ func (g *GeneratorContext) writeHandlerImports(b *strings.Builder, result *seman
 
 // collectInferredAPIs builds a model map and collects zero-body APIs.
 func collectInferredAPIs(result *semantic.Result) (map[string]*ast.ModelDecl, []*ast.ApiDecl) {
-	modelMap := make(map[string]*ast.ModelDecl)
-	for _, file := range result.Files {
-		for _, m := range file.Models {
-			modelMap[m.Name] = m
-		}
-		// Include extend stubs so compiled APIs can reference cross-module models
-		for _, ext := range file.Extends {
-			if _, exists := modelMap[ext.Name]; !exists {
-				modelMap[ext.Name] = &ast.ModelDecl{
-					Name:   ext.Name,
-					Fields: ext.Fields,
-				}
-			}
-		}
-	}
+	modelMap := inferred.Models(result.Files)
 	var apis []*ast.ApiDecl
 	for _, file := range result.Files {
 		for _, api := range file.APIs {
@@ -812,7 +844,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 	idType := idGoType(m)
 	idGoName := primaryKeyGoName(m)
 
-	apiName := crudAPIName(name, op)
+	apiName := ast.CRUDAPIName(name, op)
 	hasRels := len(rels) > 0
 	hidden := hasHiddenFields(m)
 
@@ -854,10 +886,13 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		if hidden {
 			fmt.Fprintf(b, "\t\tif cols == nil { cols = default%sCols }\n", name)
 		}
-		fmt.Fprintf(b, "\t\tconds := parse%sFilters(req.Filters)\n", name)
+		fmt.Fprintf(b, "\t\tconds, err := parse%sFilters(req.Filters)\n", name)
+		b.WriteString("\t\tif err != nil { return err }\n")
+		fmt.Fprintf(b, "\t\tsorts, err := parse%sSorters(req.Sorters)\n", name)
+		b.WriteString("\t\tif err != nil { return err }\n")
 		// Note: @soft deleted_at filter is already in Client.Where(), not added here
 		fmt.Fprintf(b, "\t\tq := app.%s.Where(conds...).Select(cols...)\n", name)
-		fmt.Fprintf(b, "\t\tif sorts := parse%sSorters(req.Sorters); len(sorts) > 0 {\n", name)
+		b.WriteString("\t\tif len(sorts) > 0 {\n")
 		fmt.Fprintf(b, "\t\t\tq = q.OrderBy(sorts...)\n")
 		fmt.Fprintf(b, "\t\t}\n")
 		fmt.Fprintf(b, "\t\tresults, total, err := q.Limit(req.PageSize).Offset((req.Page - 1) * req.PageSize).AllWithCount(ctx)\n")
@@ -897,7 +932,6 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		}
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		fmt.Fprintf(b, "\t\tif n == 0 {\n\t\t\treturn errors.NotFound.WithData(errors.ResourceError{Resource: %q, ID: errors.%s(id)})\n\t\t}\n", name, resourceIDConstructor(idType))
-		fmt.Fprintf(b, "\t\tapi.InvalidateCache(%q)\n", name)
 		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, n)\n")
 		fmt.Fprintf(b, "\t\treturn nil\n")
 		fmt.Fprintf(b, "\t}\n}\n\n")
@@ -909,31 +943,13 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		if needAuth {
 			writeCRUDAuthCheck(b, "\t\t", modelAuth)
 		}
-		switch idType {
-		case "int64":
-			fmt.Fprintf(b, "\t\tids, err := req.ParamIntArray(\"ids\")\n")
-			fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		case "string":
-			fmt.Fprintf(b, "\t\tids, err := req.ParamStringArray(\"ids\")\n")
-			fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		case "uuid.UUID":
-			fmt.Fprintf(b, "\t\tids, err := req.ParamUUIDArray(\"ids\")\n")
-			fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		default:
-			fmt.Fprintf(b, "\t\tvar ids []%s\n", idType)
-			fmt.Fprintf(b, "\t\tif err := json.Unmarshal(req.Params[\"ids\"], &ids); err != nil {\n")
-			fmt.Fprintf(b, "\t\t\treturn fmt.Errorf(\"param ids: %%w\", err)\n")
-			fmt.Fprintf(b, "\t\t}\n")
-		}
+		writeParamIDs(b, idType, "\t\t")
 		if soft {
 			fmt.Fprintf(b, "\t\tn, err := app.%s.SoftDelete(ctx, %sWhere.%s.In(ids...))\n", name, name, idGoName)
 		} else {
 			fmt.Fprintf(b, "\t\tn, err := app.%s.Where(%sWhere.%s.In(ids...)).Delete(ctx)\n", name, name, idGoName)
 		}
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-		fmt.Fprintf(b, "\t\tif n > 0 {\n")
-		fmt.Fprintf(b, "\t\t\tapi.InvalidateCache(%q)\n", name)
-		fmt.Fprintf(b, "\t\t}\n")
 		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendSvarint(req.Buf.B, n)\n")
 		fmt.Fprintf(b, "\t\treturn nil\n")
 		fmt.Fprintf(b, "\t}\n}\n\n")
@@ -948,28 +964,17 @@ func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string,
 	if needAuth {
 		writeCRUDAuthCheck(b, "\t\t", modelAuth)
 	}
-	fmt.Fprintf(b, "\t\tbuilder := app.%s.Create()\n", name)
-
-	for _, f := range m.Fields {
-		if skipHandlerField(f, enums) {
-			continue
-		}
-		setter := "Set" + str.Capitalize(f.Name)
-		optional := (f.Type != nil && f.Type.Nullable) || f.Default != nil
-		if optional {
-			fmt.Fprintf(b, "\t\tif req.HasParam(%q) {\n", f.Name)
-			generateParamSet(b, f, setter, "\t\t\t", enums)
-			fmt.Fprintf(b, "\t\t}\n")
-		} else {
-			generateParamSet(b, f, setter, "\t\t", enums)
-		}
+	fields := mutationInputFields(m, enums, false)
+	for _, field := range fields {
+		generateMutationInputRead(b, field, "\t\t", enums)
 	}
-
-	// @beforeSave hooks are compiled per-field inside generateParamSet
+	fmt.Fprintf(b, "\t\tbuilder := app.%s.Create()\n", name)
+	for _, field := range fields {
+		generateMutationInputApply(b, field, "Set"+str.Capitalize(field.field.Name), "\t\t")
+	}
 
 	fmt.Fprintf(b, "\t\tresult, err := builder.Exec(ctx)\n")
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-	fmt.Fprintf(b, "\t\tapi.InvalidateCache(%q)\n", m.Name)
 	writeComputedResolve(b, m, "[]*"+name+"{result}", "\t\t")
 	fmt.Fprintf(b, "\t\tif err := result.WriteLuxo(req.Buf, req.FieldMask); err != nil { return err }\n")
 	fmt.Fprintf(b, "\t\treturn nil\n")
@@ -986,24 +991,21 @@ func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType
 		writeCRUDAuthCheck(b, "\t\t", modelAuth)
 	}
 	writeParamID(b, idType, "\t\t")
+	fields := mutationInputFields(m, enums, true)
+	for _, field := range fields {
+		generateMutationInputRead(b, field, "\t\t", enums)
+	}
 	fmt.Fprintf(b, "\t\texisting, err := app.%s.Find(ctx, id)\n", name)
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 	fmt.Fprintf(b, "\t\tif existing == nil {\n\t\t\treturn errors.NotFound.WithData(errors.ResourceError{Resource: %q, ID: errors.%s(id)})\n\t\t}\n", name, resourceIDConstructor(idType))
-	tableName := str.ToSnakeCase(name) + "s"
+	tableName := modelTableName(name)
 	fmt.Fprintf(b, "\t\tbuilder := new%sUpdateBuilder(app.%s.db, %q, id)\n", name, name, tableName)
 
-	for _, f := range m.Fields {
-		if skipHandlerField(f, enums) || f.Name == primaryKeyFieldName(m) || hasDirective(f.Directives, "immutable") {
-			continue
-		}
-		setter := "Set" + str.Capitalize(f.Name)
-		fmt.Fprintf(b, "\t\tif req.HasParam(%q) {\n", f.Name)
-		generateParamSet(b, f, setter, "\t\t\t", enums)
-		fmt.Fprintf(b, "\t\t}\n")
+	for _, field := range fields {
+		generateMutationInputApply(b, field, "Set"+str.Capitalize(field.field.Name), "\t\t")
 	}
 	fmt.Fprintf(b, "\t\tresult, err := builder.Exec(ctx)\n")
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
-	fmt.Fprintf(b, "\t\tapi.InvalidateCache(%q)\n", m.Name)
 	writeComputedResolve(b, m, "[]*"+name+"{result}", "\t\t")
 	fmt.Fprintf(b, "\t\tif err := result.WriteLuxo(req.Buf, req.FieldMask); err != nil { return err }\n")
 	fmt.Fprintf(b, "\t\treturn nil\n")
@@ -1012,11 +1014,8 @@ func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType
 }
 
 // skipHandlerField returns true if a field should be excluded from create/update handlers.
-func skipHandlerField(f *ast.FieldDecl, enums map[string]bool) bool {
-	if isAutoManaged(f) || hasDirective(f.Directives, "internal") || f.Computed != nil {
-		return true
-	}
-	if f.Name == "id" && hasDirective(f.Directives, "auto") {
+func skipHandlerField(f *ast.FieldDecl, enums map[string]bool, modelDirectives ...[]*ast.Directive) bool {
+	if isAutoManaged(f, modelDirectives...) || hasDirective(f.Directives, "internal") || f.Computed != nil {
 		return true
 	}
 	if isRelationField(f, enums) {
@@ -1042,75 +1041,6 @@ func isRelationField(f *ast.FieldDecl, enums map[string]bool) bool {
 	}
 	// Non-builtin, non-enum: it's a relation (Post, [Post], User, etc.)
 	return true
-}
-
-// generateParamSet writes a param extraction + setter call.
-func generateParamSet(b *strings.Builder, f *ast.FieldDecl, setter, indent string, enums map[string]bool) {
-	originalIndent := indent
-	if f.Type != nil && f.Type.Nullable {
-		fmt.Fprintf(b, "%sif req.ParamIsNull(%q) {\n", indent, f.Name)
-		fmt.Fprintf(b, "%s\tbuilder.%s(nil)\n", indent, setter)
-		fmt.Fprintf(b, "%s} else {\n", indent)
-		indent += "\t"
-	}
-	varName := f.Name + "Val"
-
-	// For nullable fields, use the base type for param extraction, then take pointer
-	baseType := f.Type
-	if f.Type != nil && f.Type.Nullable {
-		baseType = &ast.TypeRef{Name: f.Type.Name} // strip nullable
-	}
-	goType := resolveGoType(baseType)
-
-	// Enum fields are strings in JSON
-	isEnum := f.Type != nil && enums[f.Type.Name]
-	method := paramMethod(goType)
-	if method == "" && isEnum {
-		method = "String"
-	}
-
-	if method == "" {
-		// Custom type — use ParamJSON
-		fmt.Fprintf(b, "%svar %s %s\n", indent, varName, goType)
-		fmt.Fprintf(b, "%sif err := req.ParamJSON(%q, &%s); err != nil {\n", indent, f.Name, varName)
-		fmt.Fprintf(b, "%s\treturn fmt.Errorf(\"param %s: %%w\", err)\n", indent, f.Name)
-		fmt.Fprintf(b, "%s}\n", indent)
-	} else {
-		fmt.Fprintf(b, "%s%s, err := req.Param%s(%q)\n", indent, varName, method, f.Name)
-		fmt.Fprintf(b, "%sif err != nil {\n", indent)
-		fmt.Fprintf(b, "%s\treturn fmt.Errorf(\"param %s: %%w\", err)\n", indent, f.Name)
-		fmt.Fprintf(b, "%s}\n", indent)
-	}
-
-	// Field validation directives
-	generateFieldValidation(b, f, varName, indent)
-
-	// @beforeSave: transform field value before persistence
-	generateBeforeSave(b, f, varName, indent)
-
-	// @hash: auto-hash password before save
-	if hasDirective(f.Directives, "hash") {
-		fmt.Fprintf(b, "%s%s, err = luxocrypto.HashPassword(%s)\n", indent, varName, varName)
-		fmt.Fprintf(b, "%sif err != nil {\n", indent)
-		fmt.Fprintf(b, "%s\treturn fmt.Errorf(\"hash %s: %%w\", err)\n", indent, f.Name)
-		fmt.Fprintf(b, "%s}\n", indent)
-	}
-
-	argExpr := varName
-	if f.Type != nil && f.Type.Nullable && isEnum {
-		// Nullable enum: cast to enum type, then take pointer
-		tmpVar := varName + "Enum"
-		fmt.Fprintf(b, "%s%s := %s(%s)\n", indent, tmpVar, f.Type.Name, varName)
-		argExpr = "&" + tmpVar
-	} else if f.Type != nil && f.Type.Nullable {
-		argExpr = "&" + varName
-	} else if isEnum {
-		argExpr = f.Type.Name + "(" + varName + ")"
-	}
-	fmt.Fprintf(b, "%sbuilder.%s(%s)\n", indent, setter, argExpr)
-	if f.Type != nil && f.Type.Nullable {
-		fmt.Fprintf(b, "%s}\n", originalIndent)
-	}
 }
 
 // hasHiddenFields checks if a model has any @hidden fields.
@@ -1202,22 +1132,8 @@ func computedFieldLocalKey(model *ast.ModelDecl, field *ast.FieldDecl, enums map
 	if field.Computed == nil {
 		return "", false
 	}
-	relations := analyzeRelations(model, enums)
-	for _, directive := range field.Computed.Directives {
-		if len(directive.Args) != 1 {
-			continue
-		}
-		relationName, _, ok := computedAggregateTarget(directive.Name, directive.Args[0].Value)
-		if !ok {
-			continue
-		}
-		for _, relation := range relations {
-			if relation.FieldName == relationName && relation.IsList {
-				return relation.LocalKey, true
-			}
-		}
-	}
-	return "", false
+	relation, ok := computedFieldRelation(field, analyzeRelations(model, enums))
+	return relation.LocalKey, ok
 }
 
 func firstBoolSet(sets []map[string]bool) map[string]bool {
@@ -1424,28 +1340,20 @@ func writeRelationItemLoopStart(b *strings.Builder, valueSlice bool) {
 	b.WriteString("\t\t\tfor _, item := range items {\n")
 }
 
-// crudAPIName returns the API endpoint name for a CRUD operation.
-func crudAPIName(modelName, op string) string {
-	switch op {
-	case "list":
-		return "list" + pluralize(modelName)
-	case "deleteMany":
-		return "delete" + pluralize(modelName)
-	default:
-		return op + modelName
-	}
-}
-
 // generateRegisterFuncWithInferred generates RegisterHandlers with CRUD + inferred handlers.
 // Also registers API IDs and param metadata for binary protocol routing.
-// Wraps handlers with @cache/@rateLimit middleware when present.
+// Applies @rateLimit middleware; @cache is emitted after handler preflight.
 func generateRegisterFuncWithInferred(b *strings.Builder, models []*ast.ModelDecl, inferredNames []string, apiDirs map[string][]*ast.Directive) {
 	defaultGenerator().generateRegisterFuncWithInferred(b, models, inferredNames, apiDirs)
 }
 
 func (g *GeneratorContext) generateRegisterFuncWithInferred(b *strings.Builder, models []*ast.ModelDecl, inferredNames []string, apiDirs map[string][]*ast.Directive, enumSets ...map[string]bool) {
+	g.generateRegisterHandlers(b, models, inferredNames, apiDirs, firstBoolSet(enumSets), nil)
+}
+
+func (g *GeneratorContext) generateRegisterHandlers(b *strings.Builder, models []*ast.ModelDecl, inferredNames []string, apiDirs map[string][]*ast.Directive, enums map[string]bool, localNames []string) {
 	b.WriteString("// RegisterHandlers registers all API handlers with the router.\n")
-	b.WriteString("func RegisterHandlers(router *api.Router, app *App) {\n")
+	b.WriteString("func RegisterHandlers(router *api.Router, app *App) error {\n")
 
 	// Build set of compiled/inferred names to skip duplicate CRUD handlers
 	compiledSet := make(map[string]bool, len(inferredNames))
@@ -1455,35 +1363,39 @@ func (g *GeneratorContext) generateRegisterFuncWithInferred(b *strings.Builder, 
 
 	for _, m := range models {
 		for _, op := range crudOperations(m) {
-			name := crudAPIName(m.Name, op)
+			name := ast.CRUDAPIName(m.Name, op)
 			// Skip CRUD handler if a compiled API with the same name exists
 			if compiledSet[name] {
 				continue
 			}
-			writeHandlerRegistration(b, name, apiDirs[name])
-			g.writeAPIRegistration(b, name, firstBoolSet(enumSets))
+			writeHandlerRegistrationMode(b, name, apiDirs[name], true)
+			g.writeAPIRegistration(b, name, enums)
 		}
 	}
 
 	for _, name := range inferredNames {
-		writeHandlerRegistration(b, name, apiDirs[name])
-		g.writeAPIRegistration(b, name, firstBoolSet(enumSets))
+		writeHandlerRegistrationMode(b, name, apiDirs[name], slices.Contains(localNames, name))
+		g.writeAPIRegistration(b, name, enums)
 	}
 
-	b.WriteString("}\n")
+	b.WriteString("\treturn nil\n}\n")
 }
 
-// writeHandlerRegistration writes router.Handle with optional @cache/@rateLimit wrapping.
+// writeHandlerRegistration applies rate limiting before every handler invocation.
+// Cache lookups stay inside the handler, after authorization and parameter reads.
 func writeHandlerRegistration(b *strings.Builder, name string, directives []*ast.Directive) {
+	writeHandlerRegistrationMode(b, name, directives, false)
+}
+
+func writeHandlerRegistrationMode(b *strings.Builder, name string, directives []*ast.Directive, localJSON bool) {
 	handler := fmt.Sprintf("handle%s(app)", str.Capitalize(name))
+	if hasDirective(directives, "cache") {
+		fmt.Fprintf(b, "\trouter.RequireCache(%q)\n", name)
+	}
 
 	// Apply directives in declaration order so the generated middleware stack is deterministic.
 	for _, d := range directives {
 		switch d.Name {
-		case "cache":
-			if ttl, ok := directiveDuration(d, "ttl", 0); ok {
-				handler = fmt.Sprintf("api.WithCache(%s, %s)", ttl, handler)
-			}
 		case "rateLimit":
 			maxArg := findCodegenDirectiveArg(d.Args, "max", 0)
 			maxLiteral, maxOK := maxArg.Value.(*ast.Literal)
@@ -1494,7 +1406,11 @@ func writeHandlerRegistration(b *strings.Builder, name string, directives []*ast
 		}
 	}
 
-	fmt.Fprintf(b, "\trouter.Handle(%q, %s)\n", name, handler)
+	method := "Handle"
+	if localJSON {
+		method = "HandleLocal"
+	}
+	fmt.Fprintf(b, "\trouter.%s(%q, %s)\n", method, name, handler)
 }
 
 func findCodegenDirectiveArg(args []*ast.NamedArg, name string, position int) *ast.NamedArg {
@@ -1551,7 +1467,7 @@ func (g *GeneratorContext) generateBatchLoadHandlers(b *strings.Builder, models 
 
 	for _, m := range models {
 		name := m.Name
-		tableName := str.ToSnakeCase(name) + "s"
+		tableName := modelTableName(name)
 		scanFn := "scan" + name
 		idType := modelIDTypeName(m)
 		idGoType := idGoType(m)
@@ -1584,17 +1500,17 @@ func (g *GeneratorContext) generateBatchLoadHandlers(b *strings.Builder, models 
 	// RegisterBatchLoaders registers batch load endpoints
 	b.WriteString("// RegisterBatchLoaders registers batch load RPC endpoints for all models.\n")
 	b.WriteString("// Remote services call these endpoints to batch-load model data (cluster mode).\n")
-	b.WriteString("func RegisterBatchLoaders(router *api.Router, app *App) {\n")
+	b.WriteString("func RegisterBatchLoaders(router *api.Router, app *App) error {\n")
 	for _, m := range models {
 		svcName := "svc:batchLoad:" + m.Name
-		fmt.Fprintf(b, "\trouter.Handle(%q, handleBatchLoad%s(app))\n", svcName, m.Name)
+		fmt.Fprintf(b, "\trouter.HandleInternal(%q, handleBatchLoad%s(app))\n", svcName, m.Name)
 		apiID := g.apiID(svcName)
 		if apiID > 0 {
-			fmt.Fprintf(b, "\trouter.Registry.Register(%q, %d)\n", svcName, apiID)
-			fmt.Fprintf(b, "\trouter.Registry.RegisterParams(%q, []api.ParamMeta{{FieldID: 1, Name: \"keys\", Type: %q, IsList: true}})\n", svcName, modelIDTypeName(m))
+			writeRegistryRoute(b, svcName, apiID)
+			fmt.Fprintf(b, "\tif err := router.Registry.RegisterParams(%q, []api.ParamMeta{{FieldID: 1, Name: \"keys\", Type: %q, IsList: true}}); err != nil { return err }\n", svcName, modelIDTypeName(m))
 		}
 	}
-	b.WriteString("}\n\n")
+	b.WriteString("\treturn nil\n}\n\n")
 }
 
 func collectBatchLoadModels(crudModels, allModels []*ast.ModelDecl) []*ast.ModelDecl {
@@ -1659,22 +1575,22 @@ func (g *GeneratorContext) generateRemoteNamedLoadHandlers(b *strings.Builder, r
 		return
 	}
 	b.WriteString("// RegisterRemoteLoaders registers named cross-module load endpoints.\n")
-	b.WriteString("func RegisterRemoteLoaders(router *api.Router, app *App) {\n")
+	b.WriteString("func RegisterRemoteLoaders(router *api.Router, app *App) error {\n")
 	for _, call := range generated {
 		serviceName := loadServiceName(call)
 		handlerName := "handleLoad" + loaderNameFromLoadCall(call)
-		fmt.Fprintf(b, "\trouter.Handle(%q, %s(app))\n", serviceName, handlerName)
+		fmt.Fprintf(b, "\trouter.HandleInternal(%q, %s(app))\n", serviceName, handlerName)
 		if apiID := g.apiID(serviceName); apiID > 0 {
-			fmt.Fprintf(b, "\trouter.Registry.Register(%q, %d)\n", serviceName, apiID)
-			fmt.Fprintf(b, "\trouter.Registry.RegisterParams(%q, []api.ParamMeta{\n", serviceName)
+			writeRegistryRoute(b, serviceName, apiID)
+			fmt.Fprintf(b, "\tif err := router.Registry.RegisterParams(%q, []api.ParamMeta{\n", serviceName)
 			for i, argName := range call.argNames {
 				fmt.Fprintf(b, "\t\t{FieldID: %d, Name: %q, Type: %q, IsList: true},\n",
 					g.apiParamID(serviceName, argName), argName, call.argTypeNames[i])
 			}
-			b.WriteString("\t})\n")
+			b.WriteString("\t}); err != nil { return err }\n")
 		}
 	}
-	b.WriteString("}\n\n")
+	b.WriteString("\treturn nil\n}\n\n")
 	_ = result
 }
 
@@ -1722,7 +1638,7 @@ func (g *GeneratorContext) generateRemoteNamedLoadHandler(b *strings.Builder, mo
 	if isSoftDelete(model) {
 		b.WriteString("\t\tconds = append(conds, lux.NewTimeField(\"deleted_at\").IsNull())\n")
 	}
-	fmt.Fprintf(b, "\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", str.ToSnakeCase(model.Name)+"s")
+	fmt.Fprintf(b, "\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", modelTableName(model.Name))
 	fmt.Fprintf(b, "\t\trows, err := app.DB.QueryRows(ctx, scan%s, query, args...)\n", model.Name)
 	b.WriteString("\t\tif err != nil { return err }\n")
 	writeComputedResolve(b, model, "rows", "\t\t")
@@ -1837,48 +1753,47 @@ func (g *GeneratorContext) writeAPIRegistration(b *strings.Builder, name string,
 	if id == 0 {
 		return
 	}
-	fmt.Fprintf(b, "\trouter.Registry.Register(%q, %d)\n", name, id)
+	writeRegistryRoute(b, name, id)
 	params := g.apiParamIDs(name)
 	if len(params) == 0 {
 		return
 	}
 	type registeredParam struct {
-		name string
-		id   int
+		declaration *ast.ParamDecl
+		id          int
 	}
 	registered := make([]registeredParam, 0, len(params))
-	activeTypes, hasActiveTypes := g.ids.APIParamTypes[strings.TrimPrefix(name, "svc:")]
-	for paramName, paramID := range params {
-		if hasActiveTypes {
-			if _, ok := activeTypes[paramName]; !ok {
-				continue
-			}
+	for _, param := range g.requestParams[name] {
+		if id := params[param.Name]; id > 0 {
+			registered = append(registered, registeredParam{declaration: param, id: id})
 		}
-		registered = append(registered, registeredParam{name: paramName, id: paramID})
 	}
 	if len(registered) == 0 {
 		return
 	}
-	sort.Slice(registered, func(i, j int) bool { return registered[i].id < registered[j].id })
-	fmt.Fprintf(b, "\trouter.Registry.RegisterParams(%q, []api.ParamMeta{\n", name)
+	slices.SortFunc(registered, func(a, b registeredParam) int { return cmp.Compare(a.id, b.id) })
+	fmt.Fprintf(b, "\tif err := router.Registry.RegisterParams(%q, []api.ParamMeta{\n", name)
 	for _, param := range registered {
-		g.writeRegisteredParam(b, name, param.name, param.id, firstBoolSet(enumSets))
+		writeRegisteredParam(b, param.declaration, param.id, firstBoolSet(enumSets))
 	}
-	b.WriteString("\t})\n")
+	b.WriteString("\t}); err != nil { return err }\n")
 }
 
-func (g *GeneratorContext) writeRegisteredParam(b *strings.Builder, apiName, paramName string, id int, enums map[string]bool) {
-	ptype, isList, nullable := g.resolveParamMetaFromAST(apiName, paramName)
-	wireType, typeName := registeredParamType(ptype, enums)
-	fmt.Fprintf(b, "\t\t{Name: %q, Type: %q", paramName, wireType)
+func writeRegistryRoute(b *strings.Builder, name string, id int) {
+	fmt.Fprintf(b, "\tif err := router.Registry.Register(%q, %d); err != nil { return err }\n", name, id)
+}
+
+func writeRegisteredParam(b *strings.Builder, param *ast.ParamDecl, id int, enums map[string]bool) {
+	wireType, typeName := registeredParamType(param.Type.Name, enums)
+	fmt.Fprintf(b, "\t\t{Name: %q, Type: %q", param.Name, wireType)
 	if typeName != "" {
 		fmt.Fprintf(b, ", TypeName: %q", typeName)
 	}
 	fmt.Fprintf(b, ", FieldID: %d", id)
-	if isList {
+	if param.Type.IsList {
 		b.WriteString(", IsList: true")
 	}
-	if nullable {
+	if param.Type.Nullable {
 		b.WriteString(", Nullable: true")
 	}
 	b.WriteString("},\n")
@@ -1896,54 +1811,6 @@ func registeredParamType(typeName string, enums map[string]bool) (string, string
 	}
 }
 
-// resolveParamTypeFromAST looks up the actual Luxo type for a param from AST data.
-// Falls back to inferParamType heuristic if no AST info available.
-func resolveParamTypeFromAST(apiName, paramName string) string {
-	typeName, _, _ := defaultGenerator().resolveParamMetaFromAST(apiName, paramName)
-	return typeName
-}
-
-func resolveParamMetaFromAST(apiName, paramName string) (string, bool, bool) {
-	return defaultGenerator().resolveParamMetaFromAST(apiName, paramName)
-}
-
-func (g *GeneratorContext) resolveParamMetaFromAST(apiName, paramName string) (string, bool, bool) {
-	if g.ids.APIParamTypes != nil {
-		lookupName := strings.TrimPrefix(apiName, "svc:")
-		if params, ok := g.ids.APIParamTypes[lookupName]; ok {
-			if t, ok := params[paramName]; ok {
-				nullable := strings.HasSuffix(t, "?")
-				t = strings.TrimSuffix(t, "?")
-				if strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]") {
-					return strings.TrimSuffix(strings.TrimPrefix(t, "["), "]"), true, nullable
-				}
-				return t, false, nullable
-			}
-		}
-	}
-	return inferParamType(paramName), false, false
-}
-
-// inferParamType infers Luxo type from param name for binary param metadata.
-// Falls back to "String" for unknown patterns. For compiled APIs with AST type info,
-// this is overridden by resolveParamType when available.
-func inferParamType(name string) string {
-	switch {
-	case name == "id" || strings.HasSuffix(name, "Id"):
-		return "Int"
-	case name == "page" || name == "pageSize" || name == "limit" || name == "offset" ||
-		name == "priority" || name == "minutes" || name == "quantity" || name == "count":
-		return "Int"
-	case strings.HasPrefix(name, "is") || name == "active" || name == "published":
-		return "Boolean"
-	case name == "amount" || name == "price" || name == "balance" || name == "score" ||
-		name == "total" || name == "budget":
-		return "Float"
-	default:
-		return "String"
-	}
-}
-
 // idGoType returns the Go type of the id field.
 func idGoType(m *ast.ModelDecl) string {
 	if field := primaryKeyField(m); field != nil {
@@ -1954,19 +1821,15 @@ func idGoType(m *ast.ModelDecl) string {
 
 // writeParamID generates id parameter extraction code for CRUD handlers.
 func writeParamID(b *strings.Builder, idType, indent string) {
-	method := paramMethod(idType)
-	if method != "" {
-		fmt.Fprintf(b, "%sid, err := req.Param%s(\"id\")\n", indent, method)
-		fmt.Fprintf(b, "%sif err != nil {\n%s\treturn err\n%s}\n", indent, indent, indent)
-	} else {
-		fmt.Fprintf(b, "%svar id %s\n", indent, idType)
-		fmt.Fprintf(b, "%sif err := req.ParamJSON(\"id\", &id); err != nil {\n", indent)
-		fmt.Fprintf(b, "%s\treturn err\n%s}\n", indent, indent)
-	}
+	writeRequiredParam(b, "id", "id", paramMethod(idType), indent)
+}
+
+func writeParamIDs(b *strings.Builder, idType, indent string) {
+	writeRequiredParam(b, "ids", "ids", paramMethod("[]"+idType), indent)
 }
 
 // paramMethod returns the Request method name for a Go type.
-// Returns "" for types that require ParamJSON (custom structs, nested arrays, etc.).
+// Returns "" for named types that need generated extraction.
 func paramMethod(goType string) string {
 	switch goType {
 	case "int64":
@@ -1983,121 +1846,35 @@ func paramMethod(goType string) string {
 		return "IntArray"
 	case "[]string":
 		return "StringArray"
+	case "time.Duration":
+		return "Duration"
+	case "uuid.UUID":
+		return "UUID"
+	case "decimal.Decimal":
+		return "Decimal"
+	case "[]byte":
+		return "Bytes"
+	case "json.RawMessage":
+		return "RawJSON"
+	case "[]float64":
+		return "FloatArray"
+	case "[]bool":
+		return "BoolArray"
+	case "[]time.Time":
+		return "DateTimeArray"
+	case "[]time.Duration":
+		return "DurationArray"
+	case "[]uuid.UUID":
+		return "UUIDArray"
+	case "[]decimal.Decimal":
+		return "DecimalArray"
+	case "[][]byte":
+		return "BytesArray"
+	case "[]json.RawMessage":
+		return "RawJSONArray"
 	default:
-		return "" // custom type — use ParamJSON
+		return "" // named types use generated structured or enum readers
 	}
-}
-
-func paramJSONMethod(param *ast.ParamDecl) string {
-	if param.Type != nil && param.Type.Nullable {
-		if param.Default != nil {
-			return "ParamJSONOptionalNullable"
-		}
-		return "ParamJSONNullable"
-	}
-	if param.Default != nil {
-		return "ParamJSONOptional"
-	}
-	return "ParamJSON"
-}
-
-// generateFilterParser generates a parse{Model}Filters function that converts
-// api.Filter to lux.Condition, only allowing @filterable fields.
-func generateFilterParser(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
-	name := m.Name
-	fmt.Fprintf(b, "// parse%sFilters converts request filters to SQL conditions.\n", name)
-	fmt.Fprintf(b, "// Only @filterable fields are allowed.\n")
-	fmt.Fprintf(b, "func parse%sFilters(filters []api.Filter) []lux.Condition {\n", name)
-	fmt.Fprintf(b, "\tvar conds []lux.Condition\n")
-	fmt.Fprintf(b, "\tfor _, f := range filters {\n")
-	fmt.Fprintf(b, "\t\tswitch f.Field {\n")
-
-	for _, f := range m.Fields {
-		if !hasDirective(f.Directives, "filterable") || f.Type == nil || f.Computed != nil {
-			continue
-		}
-		if isRelationField(f, enums) {
-			continue
-		}
-		col := str.ToSnakeCase(f.Name)
-		fmt.Fprintf(b, "\t\tcase %q:\n", f.Name)
-
-		switch f.Type.Name {
-		case "Int":
-			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewIntField(%q).FilterOp(f.Operator, f.Value))\n", col)
-		case "Float":
-			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewFloatField(%q).FilterOp(f.Operator, f.Value))\n", col)
-		case "String":
-			if hasDirective(f.Directives, "search") {
-				fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewSearchField(%q).FilterOp(f.Operator, f.Value))\n", col)
-			} else {
-				fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewStringField(%q).FilterOp(f.Operator, f.Value))\n", col)
-			}
-		case "Boolean":
-			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewBoolField(%q).FilterOp(f.Operator, f.Value))\n", col)
-		case "DateTime":
-			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewTimeField(%q).FilterOp(f.Operator, f.Value))\n", col)
-		default:
-			// Enum or other types — treat as string
-			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewStringField(%q).FilterOp(f.Operator, f.Value))\n", col)
-		}
-	}
-
-	fmt.Fprintf(b, "\t\t}\n") // end switch
-	fmt.Fprintf(b, "\t}\n")   // end for
-	fmt.Fprintf(b, "\treturn conds\n")
-	fmt.Fprintf(b, "}\n\n")
-}
-
-// generateSorterParser generates a parse{Model}Sorters function that converts
-// api.Sorter to ORDER BY clauses, only allowing @sortable fields.
-func generateSorterParser(b *strings.Builder, m *ast.ModelDecl) {
-	name := m.Name
-
-	// Check if any @sortable fields exist
-	hasSortable := false
-	for _, f := range m.Fields {
-		if hasDirective(f.Directives, "sortable") && f.Type != nil && f.Computed == nil {
-			hasSortable = true
-			break
-		}
-	}
-
-	fmt.Fprintf(b, "// parse%sSorters converts request sorters to ORDER BY clauses.\n", name)
-	fmt.Fprintf(b, "// Only @sortable fields are allowed.\n")
-	fmt.Fprintf(b, "func parse%sSorters(sorters []api.Sorter) []string {\n", name)
-
-	if !hasSortable {
-		fmt.Fprintf(b, "\treturn nil\n")
-		fmt.Fprintf(b, "}\n\n")
-		return
-	}
-
-	fmt.Fprintf(b, "\tvar clauses []string\n")
-	fmt.Fprintf(b, "\tfor _, s := range sorters {\n")
-	fmt.Fprintf(b, "\t\tvar col string\n")
-	fmt.Fprintf(b, "\t\tswitch s.Field {\n")
-
-	for _, f := range m.Fields {
-		if !hasDirective(f.Directives, "sortable") || f.Type == nil || f.Computed != nil {
-			continue
-		}
-		col := str.ToSnakeCase(f.Name)
-		fmt.Fprintf(b, "\t\tcase %q:\n", f.Name)
-		fmt.Fprintf(b, "\t\t\tcol = %q\n", col)
-	}
-
-	fmt.Fprintf(b, "\t\tdefault:\n")
-	fmt.Fprintf(b, "\t\t\tcontinue\n")
-	fmt.Fprintf(b, "\t\t}\n") // end switch
-	fmt.Fprintf(b, "\t\tif strings.EqualFold(s.Order, \"desc\") {\n")
-	fmt.Fprintf(b, "\t\t\tclauses = append(clauses, col+\" DESC\")\n")
-	fmt.Fprintf(b, "\t\t} else {\n")
-	fmt.Fprintf(b, "\t\t\tclauses = append(clauses, col+\" ASC\")\n")
-	fmt.Fprintf(b, "\t\t}\n")
-	fmt.Fprintf(b, "\t}\n") // end for
-	fmt.Fprintf(b, "\treturn clauses\n")
-	fmt.Fprintf(b, "}\n\n")
 }
 
 // bodyContainsAwait checks if an API body block contains any AwaitExpr.
@@ -2186,7 +1963,10 @@ func writeAuthCheck(b *strings.Builder, indent string, directives ...*ast.Direct
 	if len(directives) == 0 || directives[0] == nil {
 		return
 	}
-	d := directives[0]
+	writeAuthorizationCheck(b, indent, directives[0])
+}
+
+func writeAuthorizationCheck(b *strings.Builder, indent string, d *ast.Directive) {
 
 	// Collect roles (positional args) and named args
 	var roles []string
@@ -2297,23 +2077,6 @@ func compilePermissionExpr(expr ast.Expr) string {
 	}
 
 	return fmt.Sprintf("%s %s %s", left, bin.Op, right)
-}
-
-// pluralize adds "s" to a name (simple English pluralization).
-func pluralize(name string) string {
-	if strings.HasSuffix(name, "s") || strings.HasSuffix(name, "x") || strings.HasSuffix(name, "z") {
-		return name + "es"
-	}
-	if strings.HasSuffix(name, "y") && len(name) >= 2 {
-		// Only consonant+y → ies (e.g. History→Histories)
-		// Vowel+y → just add s (e.g. Gateway→Gateways, Key→Keys)
-		prev := name[len(name)-2]
-		if prev != 'a' && prev != 'e' && prev != 'i' && prev != 'o' && prev != 'u' &&
-			prev != 'A' && prev != 'E' && prev != 'I' && prev != 'O' && prev != 'U' {
-			return name[:len(name)-1] + "ies"
-		}
-	}
-	return name + "s"
 }
 
 // detectAuthNeeded checks if luvia import is needed in handler.gen.go.
@@ -2538,12 +2301,13 @@ func compileFieldExpr(expr ast.Expr, itVar string) string {
 	switch e := expr.(type) {
 	case *ast.CallExpr:
 		if member, ok := e.Func.(*ast.MemberExpr); ok {
-			obj := compileFieldExpr(member.Object, itVar)
+			obj := func() string { return compileFieldExpr(member.Object, itVar) }
 			nargs := len(e.Args)
 			arg := func(i int) string {
 				if i < nargs {
 					return compileFieldExpr(e.Args[i].Value, itVar)
 				}
+				// Defensive: string helpers check nargs before requesting a fixed argument index.
 				return ""
 			}
 			if result := compileStringTransform(member.Field, obj, arg, nargs); result != "" {
@@ -2806,7 +2570,7 @@ func computedGroupSQL(group computedAggregateGroup) string {
 		b.WriteString(", ")
 		b.WriteString(computedAggregateSQLExpr(aggregate))
 	}
-	fmt.Fprintf(&b, ` FROM "%s" WHERE "%s" = ANY($1)`, str.ToSnakeCase(group.target.Name)+"s", str.ToSnakeCase(group.relation.RemoteKey))
+	fmt.Fprintf(&b, ` FROM "%s" WHERE "%s" = ANY($1)`, modelTableName(group.target.Name), str.ToSnakeCase(group.relation.RemoteKey))
 	if isSoftDelete(group.target) {
 		b.WriteString(` AND "deleted_at" IS NULL`)
 	}

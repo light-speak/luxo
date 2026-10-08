@@ -9,6 +9,204 @@ import 'support/stream_decode_server.dart';
 
 void main() {
   test(
+    'generated nullable benchmark fixtures preserve the wire contract',
+    () async {
+      final result = await _runDart([
+        '--packages=.dart_tool/package_config.json',
+        'benchmark/nullable_root_benchmark.dart',
+        'verify',
+      ]);
+      expect(result.exitCode, 0, reason: '${result.stdout}\n${result.stderr}');
+      expect(
+        result.stdout,
+        contains('verified 11 generated nullable root fixtures'),
+      );
+    },
+    timeout: const Timeout(Duration(seconds: 65)),
+  );
+  for (final target in ['models', 'types', 'apis', 'params']) {
+    final limit = target == 'apis'
+        ? 2147483647
+        : target == 'params'
+        ? 2147483645
+        : 65535;
+    for (final id in [0, -1, limit + 1, 9007199254740991]) {
+      test('reject stable $target ID $id before writing', () async {
+        await _rejectSchema(_numberedSchema(target, id), 'ID', existing: true);
+      });
+    }
+    test('reject stable duplicate $target IDs', () async {
+      await _rejectSchema(
+        _numberedSchema(target, 1, duplicate: true),
+        'duplicate ID',
+      );
+    });
+  }
+  test('internal routes use explicit metadata instead of names', () async {
+    final root = Directory('.tmp')..createSync(recursive: true);
+    final output = root.createTempSync('internal-routes-');
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    server.listen((request) async {
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        jsonEncode({
+          'models': <String, Object>{},
+          'apis': {
+            for (final entry in {
+              'ping': false,
+              'privateOperation': true,
+            }.entries)
+              entry.key: {
+                'id': entry.value ? 2 : 1,
+                'name': entry.key,
+                'module': 'test',
+                'returnType': 'Int',
+                'internal': entry.value,
+              },
+          },
+        }),
+      );
+      await request.response.close();
+    });
+    try {
+      await generate(
+        endpoint: 'http://${server.address.host}:${server.port}',
+        key: 'test',
+        outDir: output.path,
+      );
+      for (final file in ['client.dart', 'schema.dart']) {
+        final source = File('${output.path}/$file').readAsStringSync();
+        expect(source, contains('ping'));
+        expect(source, isNot(contains('privateOperation')));
+      }
+    } finally {
+      await server.close(force: true);
+      output.deleteSync(recursive: true);
+    }
+  });
+  test('process budget reports an explicit timeout', () async {
+    final root = Directory('.tmp')..createSync(recursive: true);
+    final output = root.createTempSync('process-budget-');
+    final script = File('${output.path}/hold.dart')
+      ..writeAsStringSync(
+        'Future<void> main() => Future<void>.delayed(const Duration(minutes: 1));\n',
+      );
+    try {
+      await expectLater(
+        _runProcess(Platform.resolvedExecutable, [
+          script.path,
+        ], timeout: Duration.zero),
+        throwsA(
+          isA<TimeoutException>().having(
+            (error) => error.duration,
+            'budget',
+            Duration.zero,
+          ),
+        ),
+      );
+    } finally {
+      output.deleteSync(recursive: true);
+    }
+  });
+  test('process budget preserves successful output', () async {
+    final result = await _runProcess(Platform.resolvedExecutable, [
+      '--version',
+    ]);
+    expect(result.exitCode, 0);
+    expect('${result.stdout}${result.stderr}', contains('Dart SDK version'));
+  });
+  for (final target in ['models', 'types', 'params']) {
+    for (final name in [null, '', 'Missing']) {
+      for (final list in [false, true]) {
+        test(
+          'reject missing enum declaration $target/$name/list=$list',
+          () async {
+            await _rejectSchema(
+              _enumReferenceSchema(target, name, list),
+              'requires a declared enum type',
+            );
+          },
+        );
+      }
+    }
+  }
+  for (final list in [false, true]) {
+    test('reject undeclared API return list=$list', () async {
+      await _rejectSchema({
+        'apis': {
+          'read': {
+            'id': 1,
+            'name': 'read',
+            'module': 'test',
+            'returnType': 'Missing',
+            'returnList': list,
+          },
+        },
+      }, 'has an undeclared return type');
+    });
+    test('reject bare Enum API return list=$list', () async {
+      await _rejectSchema({
+        'apis': {
+          'read': {
+            'id': 1,
+            'name': 'read',
+            'module': 'test',
+            'returnType': 'Enum',
+            'returnList': list,
+          },
+        },
+      }, 'requires a named enum return type');
+    });
+  }
+  test('reject enum declaration with a different lookup name', () async {
+    await _rejectSchema({
+      'enums': {
+        'State': {
+          'name': 'Other',
+          'values': ['OPEN'],
+        },
+      },
+    }, 'does not match its name');
+  });
+  test(
+    'reject invalid enum Schema without replacing an existing client',
+    () async {
+      await _rejectSchema(
+        _enumReferenceSchema('params', null, false),
+        'requires a declared enum type',
+        existing: true,
+      );
+    },
+  );
+  for (final values in <List<String>>[
+    [],
+    ['OPEN', 'OPEN'],
+  ]) {
+    test('reject invalid enum members $values before writing types', () async {
+      await _rejectSchema({
+        'enums': {
+          'State': {'name': 'State', 'values': values},
+        },
+      }, 'requires distinct members');
+    });
+  }
+  for (final suffix in ['Known', 'Unknown']) {
+    test('reject generated enum $suffix name collisions', () async {
+      await _rejectSchema({
+        'enums': {
+          'State': {
+            'name': 'State',
+            'values': ['OPEN'],
+          },
+          'State$suffix': {
+            'name': 'State$suffix',
+            'values': ['READY'],
+          },
+        },
+      }, 'conflicts with Schema');
+    });
+  }
+  test(
     'generated client preserves binary list, Bytes, JSON, and field IDs',
     () async {
       final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
@@ -54,7 +252,18 @@ void main() {
 
         expect(client, contains('echoInt({required LuxoInt64 value})'));
         expect(client, contains('echoDuration({required LuxoInt64 value})'));
-        expect(client, contains('echoEnum({required String value})'));
+        expect(client, contains('echoEnum({required TaskStatus value})'));
+        expect(types, contains('sealed class TaskStatus'));
+        expect(
+          types,
+          contains('static List<String> \$rawList(List<TaskStatus> values)'),
+        );
+        expect(client, contains('TaskStatus.\$nullableRawList(nullableList)'));
+        expect(types, contains('enum TaskStatusKnown implements TaskStatus'));
+        expect(
+          types,
+          contains('final class TaskStatusUnknown extends TaskStatus'),
+        );
 
         expect(types, contains("import 'dart:typed_data';"));
         expect(types, contains('final Selected<Uint8List> data;'));
@@ -168,7 +377,15 @@ void main() {
           ),
         );
         expect(client, contains("transport.subscribe('watchPayload'"));
-        expect(client, contains('}, onData, decoder:'));
+        expect(
+          client,
+          contains("const {}, onData, request: _watchPayloadRequest("),
+        );
+        expect(
+          client,
+          contains('class _uploadRequest extends GeneratedRequest'),
+        );
+        expect(client, contains('encoder.writeDelimited(value.writeLuxo)'));
         expect(client, isNot(contains('(d) => onData(')));
         expect(client, contains('onError: onError, onDone: onDone'));
         expect(
@@ -183,6 +400,10 @@ void main() {
         );
         File('${output.path}/response_consumer.dart').writeAsStringSync(
           File('test/fixtures/response_consumer.dart.txt').readAsStringSync(),
+        );
+        File('${output.path}/nullable_root_consumer.dart').writeAsStringSync(
+          File('test/fixtures/nullable_root_consumer.dart.txt')
+              .readAsStringSync(),
         );
         File('${output.path}/json_kind_consumer.dart').writeAsStringSync(
           File('test/fixtures/json_kind_consumer.dart.txt').readAsStringSync(),
@@ -233,6 +454,9 @@ void main() {
         if (Platform.environment['LUXO_BENCH_JSON_PROJECTION'] == '1') {
           await _runProjectionBenchmarks(output);
         }
+        if (Platform.environment['LUXO_BENCH_ENUMS'] == '1') {
+          await _runEnumBenchmarks(output);
+        }
       } finally {
         for (final socket in sockets) await socket.close();
         await server.close(force: true);
@@ -241,12 +465,127 @@ void main() {
     },
     timeout: Timeout(
       Duration(
-        minutes: Platform.environment['LUXO_BENCH_JSON_PROJECTION'] == '1'
+        minutes:
+            Platform.environment['LUXO_BENCH_JSON_PROJECTION'] == '1' ||
+                Platform.environment['LUXO_BENCH_ENUMS'] == '1'
             ? 10
             : 2,
       ),
     ),
   );
+}
+
+Map<String, Object?> _numberedSchema(
+  String target,
+  int id, {
+  bool duplicate = false,
+}) {
+  final fields = [
+    {'id': id, 'name': 'value', 'type': 'Int'},
+    if (duplicate) {'id': id, 'name': 'other', 'type': 'Int'},
+  ];
+  if (target == 'apis' || target == 'params') {
+    return {
+      'apis': {
+        'read': {
+          'id': target == 'apis' ? id : 1,
+          'name': 'read',
+          'module': 'test',
+          'returnType': 'Int',
+          if (target == 'params') 'params': fields,
+        },
+        if (target == 'apis' && duplicate)
+          'other': {
+            'id': id,
+            'name': 'other',
+            'module': 'test',
+            'returnType': 'Int',
+          },
+      },
+    };
+  }
+  return {
+    target: {
+      'Payload': {'name': 'Payload', 'fields': fields},
+    },
+  };
+}
+
+Map<String, Object?> _enumReferenceSchema(
+  String target,
+  String? name,
+  bool list,
+) {
+  final field = {
+    'id': 1,
+    'name': 'state',
+    'type': 'Enum',
+    if (name != null) 'typeName': name,
+    'isList': list,
+    'nullable': list,
+  };
+  return target == 'params'
+      ? {
+          'apis': {
+            'read': {
+              'id': 1,
+              'name': 'read',
+              'module': 'test',
+              'returnType': 'Int',
+              'params': [field],
+            },
+          },
+        }
+      : {
+          target: {
+            'Payload': {
+              'name': 'Payload',
+              'fields': [field],
+            },
+          },
+        };
+}
+
+Future<void> _rejectSchema(
+  Map<String, Object?> schema,
+  String message, {
+  bool existing = false,
+}) async {
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  final root = Directory('.tmp')..createSync(recursive: true);
+  final output = root.createTempSync('enum-schema-');
+  final types = File('${output.path}/types.dart');
+  if (existing) types.writeAsStringSync('// Existing generated client.\n');
+  server.listen((request) async {
+    request.response.headers.contentType = ContentType.json;
+    request.response.write(jsonEncode(schema));
+    await request.response.close();
+  });
+  try {
+    await expectLater(
+      generate(
+        endpoint: 'http://${server.address.host}:${server.port}/luxo',
+        key: 'test',
+        outDir: output.path,
+      ),
+      throwsA(
+        isA<FormatException>().having(
+          (error) => error.message,
+          'message',
+          contains(message),
+        ),
+      ),
+    );
+    if (existing) {
+      expect(types.readAsStringSync(), '// Existing generated client.\n');
+      expect(output.listSync(), hasLength(1));
+    } else {
+      expect(output.listSync(), isEmpty);
+    }
+  } finally {
+    await server.close(force: true);
+    output.deleteSync(recursive: true);
+  }
 }
 
 (String, String) _prepareProjectionBenchmark(Directory output) {
@@ -272,6 +611,27 @@ void main() {
 
 Future<void> _runProjectionBenchmarks(Directory output) async {
   final (script, test) = _prepareProjectionBenchmark(output);
+  await _runGeneratedBenchmarks(output, 'projection', script, test);
+}
+
+Future<void> _runEnumBenchmarks(Directory output) async {
+  final script = '${output.path}/enum_benchmark.dart';
+  File(script).writeAsStringSync(
+    File('benchmark/enum_benchmark.dart.txt').readAsStringSync(),
+  );
+  final test = '${output.path}/enum_benchmark_test.dart';
+  File(test).writeAsStringSync(
+    "import 'package:test/test.dart';\nimport 'enum_benchmark.dart' as bench;\nvoid main() { test('enum benchmark', bench.main); }\n",
+  );
+  await _runGeneratedBenchmarks(output, 'enum', script, test);
+}
+
+Future<void> _runGeneratedBenchmarks(
+  Directory output,
+  String name,
+  String script,
+  String test,
+) async {
   final analysis = await _runDart(['analyze', '--fatal-infos', output.path]);
   expect(
     analysis.exitCode,
@@ -283,14 +643,18 @@ Future<void> _runProjectionBenchmarks(Directory output) async {
     'exe',
     script,
     '-o',
-    '${output.path}/projection-bench',
+    '${output.path}/$name-bench',
   ]);
   expect(compile.exitCode, 0, reason: '${compile.stdout}\n${compile.stderr}');
   for (final platform in ['aot', 'dart2js', 'dart2wasm']) {
     for (var round = 1; round <= 3; round++) {
       final result = platform == 'aot'
-          ? await _runProcess('${output.path}/projection-bench', [])
-          : await _runDart([
+          ? await _runProcess(
+              '${output.path}/$name-bench',
+              [],
+              timeout: const Duration(minutes: 3),
+            )
+          : await _runProcess(Platform.resolvedExecutable, [
               'test',
               '-p',
               'node',
@@ -299,9 +663,9 @@ Future<void> _runProjectionBenchmarks(Directory output) async {
               test,
               '--reporter',
               'expanded',
-            ]);
+            ], timeout: const Duration(minutes: 3));
       expect(result.exitCode, 0, reason: '${result.stdout}\n${result.stderr}');
-      print('projection benchmark $platform round $round\n${result.stdout}');
+      print('$name benchmark $platform round $round\n${result.stdout}');
     }
   }
 }
@@ -327,24 +691,39 @@ Future<ProcessResult> _runDart(List<String> arguments) async {
 
 Future<ProcessResult> _runProcess(
   String executable,
-  List<String> arguments,
-) async {
+  List<String> arguments, {
+  Duration timeout = const Duration(seconds: 60),
+}) async {
   final process = await Process.start(executable, arguments);
   final stdout = process.stdout.transform(utf8.decoder).join();
   final stderr = process.stderr.transform(utf8.decoder).join();
-  final timer = Timer(
-    const Duration(seconds: 60),
-    () => process.kill(ProcessSignal.sigkill),
-  );
+  var expired = false;
+  Timer? force;
+  final timer = Timer(timeout, () {
+    expired = true;
+    process.kill(ProcessSignal.sigterm);
+    force = Timer(
+      const Duration(seconds: 2),
+      () => process.kill(ProcessSignal.sigkill),
+    );
+  });
   try {
-    return ProcessResult(
+    final result = ProcessResult(
       process.pid,
       await process.exitCode,
       await stdout,
       await stderr,
     );
+    if (expired) {
+      throw TimeoutException(
+        'Process $executable exceeded its budget.\n${result.stdout}\n${result.stderr}',
+        timeout,
+      );
+    }
+    return result;
   } finally {
     timer.cancel();
+    force?.cancel();
   }
 }
 
@@ -398,8 +777,41 @@ final _schema = <String, Object>{
       'name': 'TaskStatus',
       'values': ['OPEN', 'DONE'],
     },
+    'OtherStatus': {
+      'name': 'OtherStatus',
+      'values': ['class', 'values', 'rawValue', '_hidden', 'OtherStatusKnown'],
+    },
   },
   'models': {
+    'EnumPayload': {
+      'name': 'EnumPayload',
+      'usage': 'inputOutput',
+      'fields': [
+        {'id': 1, 'name': 'status', 'type': 'Enum', 'typeName': 'TaskStatus'},
+        {
+          'id': 2,
+          'name': 'optional',
+          'type': 'Enum',
+          'typeName': 'TaskStatus',
+          'nullable': true,
+        },
+        {
+          'id': 3,
+          'name': 'statuses',
+          'type': 'Enum',
+          'typeName': 'TaskStatus',
+          'isList': true,
+        },
+        {
+          'id': 4,
+          'name': 'optionalList',
+          'type': 'Enum',
+          'typeName': 'TaskStatus',
+          'isList': true,
+          'nullable': true,
+        },
+      ],
+    },
     'OptionalArrays': {
       'name': 'OptionalArrays',
       'usage': 'output',
@@ -447,7 +859,13 @@ final _schema = <String, Object>{
         {'id': 7, 'name': 'uuids', 'type': 'UUID', 'isList': true},
         {'id': 8, 'name': 'blobs', 'type': 'Bytes', 'isList': true},
         {'id': 9, 'name': 'decimals', 'type': 'Decimal', 'isList': true},
-        {'id': 10, 'name': 'enums', 'type': 'Enum', 'isList': true},
+        {
+          'id': 10,
+          'name': 'enums',
+          'type': 'Enum',
+          'typeName': 'TaskStatus',
+          'isList': true,
+        },
         {'id': 11, 'name': 'jsons', 'type': 'JSON', 'isList': true},
       ],
     },
@@ -496,6 +914,23 @@ final _schema = <String, Object>{
     },
   },
   'apis': {
+    for (final (index, type) in [
+      ..._scalarTypes,
+      'Payload',
+      'Projection',
+    ].indexed)
+      for (final array in [false, true])
+        for (final stream in [false, true])
+          'optional$type${array ? 'Array' : ''}${stream ? 'Stream' : ''}': {
+            'id': 1000 + index * 4 + (array ? 2 : 0) + (stream ? 1 : 0),
+            'name':
+                'optional$type${array ? 'Array' : ''}${stream ? 'Stream' : ''}',
+            'module': 'nullable',
+            'returnType': type == 'Enum' ? 'TaskStatus' : type,
+            'returnList': array,
+            'returnNullable': true,
+            'stream': stream,
+          },
     'projection': {
       'id': 17,
       'name': 'projection',
@@ -515,6 +950,44 @@ final _schema = <String, Object>{
       'name': 'namedEnum',
       'module': 'scalar',
       'returnType': 'TaskStatus',
+    },
+    'enumOptions': {
+      'id': 304,
+      'name': 'enumOptions',
+      'module': 'scalar',
+      'returnType': 'TaskStatus',
+      'params': [
+        {
+          'id': 1,
+          'name': 'nullable',
+          'type': 'Enum',
+          'typeName': 'TaskStatus',
+          'nullable': true,
+        },
+        {
+          'id': 2,
+          'name': 'nullableList',
+          'type': 'Enum',
+          'typeName': 'TaskStatus',
+          'isList': true,
+          'nullable': true,
+        },
+        {
+          'id': 3,
+          'name': 'defaulted',
+          'type': 'Enum',
+          'typeName': 'TaskStatus',
+          'hasDefault': true,
+        },
+        {
+          'id': 4,
+          'name': 'nullableDefault',
+          'type': 'Enum',
+          'typeName': 'TaskStatus',
+          'nullable': true,
+          'hasDefault': true,
+        },
+      ],
     },
     'namedEnums': {
       'id': 301,
@@ -540,7 +1013,7 @@ final _schema = <String, Object>{
           'id': 400 + index * 2 + (array ? 1 : 0),
           'name': 'watch$type${array ? 'Array' : ''}',
           'module': 'scalar',
-          'returnType': type,
+          'returnType': type == 'Enum' ? 'TaskStatus' : type,
           'returnList': array,
           'stream': true,
         },
@@ -549,7 +1022,9 @@ final _schema = <String, Object>{
         'id': 200 + index,
         'name': 'echo${_scalarTypes[index]}',
         'module': 'scalar',
-        'returnType': _scalarTypes[index],
+        'returnType': _scalarTypes[index] == 'Enum'
+            ? 'TaskStatus'
+            : _scalarTypes[index],
         'params': [
           {
             'id': 1,
@@ -566,14 +1041,14 @@ final _schema = <String, Object>{
         'id': 100 + index * 2,
         'name': 'scalar$type',
         'module': 'scalar',
-        'returnType': type,
+        'returnType': type == 'Enum' ? 'TaskStatus' : type,
       },
     for (final (index, type) in _scalarTypes.indexed)
       'array$type': {
         'id': 101 + index * 2,
         'name': 'array$type',
         'module': 'scalar',
-        'returnType': type,
+        'returnType': type == 'Enum' ? 'TaskStatus' : type,
         'returnList': true,
       },
     'echoInteger': {

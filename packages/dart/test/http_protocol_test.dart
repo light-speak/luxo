@@ -7,6 +7,38 @@ import 'package:luxo_client/luxo_client.dart';
 import 'package:test/test.dart';
 
 void main() {
+  test('success requires data while explicit null remains valid', () async {
+    var body = '{}', refreshes = 0, calls = 0;
+    final transport = HttpTransport(
+      'http://localhost/luvia',
+      client: MockClient((_) async {
+        calls++;
+        return http.Response(body, 200);
+      }),
+      onTokenExpired: () async {
+        refreshes++;
+        return 'unused';
+      },
+    );
+    try {
+      for (final missing in ['{}', '{"ok":true}', '{"value":42}']) {
+        body = missing;
+        await expectLater(
+          transport.call<Object?>('echo'),
+          _error('ParseError', 200),
+        );
+      }
+      for (final data in [null, false, 0, '', [], <String, Object?>{}]) {
+        body = jsonEncode({'data': data});
+        expect(await transport.call<Object?>('echo'), data);
+      }
+      expect(refreshes, 0);
+      expect(calls, 9);
+    } finally {
+      transport.close();
+    }
+  });
+
   test('malformed Unicode success and error bodies fail without token refresh', () async {
     for (final status in [200, 401, 500]) {
       for (final value in [
@@ -53,6 +85,58 @@ void main() {
     }
   });
   for (final mode in TransportMode.values) {
+    test(
+      '$mode cache overload preserves identity without retry or refresh',
+      () async {
+        var calls = 0, refreshes = 0;
+        final transport = HttpTransport(
+          'http://localhost/luvia',
+          options: TransportOptions(mode: mode),
+          client: MockClient((_) async {
+            calls++;
+            return calls == 1
+                ? _errorResponse(
+                    mode,
+                    status: 503,
+                    code: 503,
+                    name: 'CacheOriginBusy',
+                    message: 'Cache origin capacity exhausted',
+                  )
+                : _success(mode);
+          }),
+          onTokenExpired: () async {
+            refreshes++;
+            return 'must-not-refresh';
+          },
+        );
+        try {
+          transport.setSchema({'echo': const APISchemaEntry(7)});
+          await expectLater(
+            transport.call<Object?>('echo'),
+            throwsA(
+              isA<LuxoError>()
+                  .having((error) => error.error, 'name', 'CacheOriginBusy')
+                  .having((error) => error.code, 'code', 503)
+                  .having(
+                    (error) => error.message,
+                    'message',
+                    'Cache origin capacity exhausted',
+                  ),
+            ),
+          );
+          expect(calls, 1);
+          expect(refreshes, 0);
+          final result = await transport.call<Object?>('echo');
+          expect(
+            result,
+            mode == TransportMode.json ? 42 : Uint8List.fromList([84]),
+          );
+          expect(calls, 2);
+        } finally {
+          transport.close();
+        }
+      },
+    );
     test('$mode rejects malformed input before HTTP send', () async {
       var calls = 0;
       final transport = HttpTransport(
@@ -491,17 +575,19 @@ http.Response _errorResponse(
   TransportMode mode, {
   int status = 401,
   int code = 401,
+  String name = 'Unauthorized',
+  String message = 'expired',
 }) {
   if (mode == TransportMode.json) {
     return http.Response(
-      '{"error":"Unauthorized","code":$code,"message":"expired"}',
+      '{"error":"$name","code":$code,"message":"$message"}',
       status,
     );
   }
   final encoder = LuxoEncoder()
     ..writeFieldInt(1, LuxoInt64.fromInt(code))
-    ..writeFieldString(2, 'Unauthorized')
-    ..writeFieldString(3, 'expired')
+    ..writeFieldString(2, name)
+    ..writeFieldString(3, message)
     ..writeEnd();
   return http.Response.bytes(encoder.bytes(), status);
 }

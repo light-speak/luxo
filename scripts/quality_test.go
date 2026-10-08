@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -20,14 +21,96 @@ type qualityEntry struct {
 
 type qualityWorkflow struct {
 	Jobs map[string]struct {
-		Strategy struct {
-			Matrix struct{ Dart []string }
+		If             string
+		Needs          yaml.Node
+		TimeoutMinutes int `yaml:"timeout-minutes"`
+		Env            map[string]string
+		Strategy       struct {
+			FailFast *bool `yaml:"fail-fast"`
+			Matrix   struct{ Dart []string }
 		}
 		Steps []struct {
-			Name, Run, Uses string
-			With, Env       map[string]string
-			ContinueOnError bool `yaml:"continue-on-error"`
+			Name, Run, Uses, If string
+			With, Env           map[string]string
+			ContinueOnError     bool `yaml:"continue-on-error"`
 		}
+	}
+}
+
+func TestStorageCIRequiresRealS3(t *testing.T) {
+	job := readQualityWorkflow(t).Jobs["test"]
+	for key, value := range map[string]string{
+		"STORAGE_ENDPOINT": "127.0.0.1:9000", "STORAGE_REGION": "us-east-1",
+		"STORAGE_ACCESS_KEY": "luxo-ci-storage", "STORAGE_SECRET_KEY": "luxo-ci-storage-secret",
+		"STORAGE_BUCKET": "luxo-ci-storage", "STORAGE_USE_SSL": "false",
+	} {
+		if job.Env[key] != value {
+			t.Errorf("S3 CI environment %s = %q, want %q", key, job.Env[key], value)
+		}
+	}
+	start, tests, stop := -1, -1, -1
+	for i, step := range job.Steps {
+		switch step.Name {
+		case "Start MinIO and verify readiness":
+			start = i
+			for _, required := range []string{
+				"quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
+				"127.0.0.1:9000:9000", "--tmpfs /data:", "MINIO_ROOT_USER=$STORAGE_ACCESS_KEY",
+				"MINIO_ROOT_PASSWORD=$STORAGE_SECRET_KEY", "http://$STORAGE_ENDPOINT/minio/health/ready",
+				"--fail", "--max-time 5",
+			} {
+				if !strings.Contains(step.Run, required) {
+					t.Errorf("S3 CI startup lost %q", required)
+				}
+			}
+			if step.ContinueOnError {
+				t.Error("S3 startup failure must block tests")
+			}
+		case "Run tests with coverage":
+			tests = i
+		case "Stop MinIO test container":
+			stop = i
+			if step.If != "always()" || !strings.Contains(step.Run, "docker rm --force luxo-ci-minio") {
+				t.Error("S3 cleanup must run even after test failure")
+			}
+		}
+	}
+	if start < 0 || tests <= start || stop <= tests {
+		t.Fatalf("S3 lifecycle order invalid: start=%d tests=%d stop=%d", start, tests, stop)
+	}
+}
+
+func TestStorageCIStartupPropagatesFailures(t *testing.T) {
+	var startup string
+	for _, step := range readQualityWorkflow(t).Jobs["test"].Steps {
+		if step.Name == "Start MinIO and verify readiness" {
+			startup = step.Run
+		}
+	}
+	if startup == "" {
+		t.Fatal("missing S3 startup command")
+	}
+	for _, failure := range []string{"none", "docker", "curl"} {
+		t.Run(failure, func(t *testing.T) {
+			fixture := newQualityFixture(t)
+			for _, tool := range []string{"docker", "curl"} {
+				body := ""
+				if tool == failure {
+					body = "exit 42"
+				}
+				fixture.tool(t, tool, body, false)
+			}
+			output, log, err := fixture.run(t, "export STORAGE_ACCESS_KEY=key STORAGE_SECRET_KEY=secret STORAGE_ENDPOINT=127.0.0.1:9000\n"+startup)
+			if (err != nil) != (failure != "none") {
+				t.Fatalf("failure=%s err=%v output=%s log=%s", failure, err, output, log)
+			}
+			if failure == "docker" && strings.Contains(log, "curl ") {
+				t.Fatal("startup continued after container failure")
+			}
+			if failure != "docker" && !strings.Contains(log, "curl ") {
+				t.Fatal("startup did not probe S3 readiness")
+			}
+		})
 	}
 }
 
@@ -38,6 +121,34 @@ func readQualityWorkflow(t *testing.T) qualityWorkflow {
 		t.Fatal(err)
 	}
 	return workflow
+}
+
+func TestCompilerRaceCIIncludesGeneratedChildren(t *testing.T) {
+	job := readQualityWorkflow(t).Jobs["race"]
+	if job.TimeoutMinutes != 15 {
+		t.Errorf("compiler race job needs a bounded 15 minute lifecycle, got %d", job.TimeoutMinutes)
+	}
+	found := 0
+	for _, step := range job.Steps {
+		if step.Name != "Verify compiler state isolation" {
+			continue
+		}
+		found++
+		if !slices.Contains(strings.Fields(step.Env["GOFLAGS"]), "-race") {
+			t.Error("generated Go test children must inherit race instrumentation through GOFLAGS")
+		}
+		for _, required := range []string{"./pkg/codegen", "./pkg/semantic", "./pkg/lockfile", "-count=1", "-timeout=10m"} {
+			if !strings.Contains(step.Run, required) {
+				t.Errorf("compiler race command lost %q", required)
+			}
+		}
+		if step.ContinueOnError {
+			t.Error("compiler race failures must block the workflow")
+		}
+	}
+	if found != 1 {
+		t.Fatalf("expected exactly one compiler race step, got %d", found)
+	}
 }
 
 func qualityEntries(t *testing.T) []qualityEntry {
@@ -65,7 +176,7 @@ func TestSDKInteropCIIncludesBothTopologies(t *testing.T) {
 		"sdk-kotlin":            "./packages/kotlin/gradlew -p tests/sdk-interop/kotlin build",
 		"sdk-swift-conformance": "bash tests/sdk-interop/swift/run.sh",
 	} {
-		for _, mode := range []string{"-run --", "-run -gateway --"} {
+		for _, mode := range []string{"-run --", "-run -gateway --", "-run -enum-upgrade --", "-run -enum-upgrade -gateway --"} {
 			command := "go run ./tests/sdk-interop " + mode + " " + consumer
 			found := 0
 			for _, step := range workflow.Jobs[job].Steps {
@@ -80,6 +191,37 @@ func TestSDKInteropCIIncludesBothTopologies(t *testing.T) {
 				t.Errorf("%s needs exactly one %s consumer step; got %d", job, mode, found)
 			}
 		}
+	}
+}
+
+func TestSwiftInteropRequiresLockedDependencies(t *testing.T) {
+	script := readQualityFile(t, "../tests/sdk-interop/swift/run.sh")
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprint(fail), func(t *testing.T) {
+			fixture := newQualityFixture(t)
+			body := `locked=false
+for arg in "$@"; do
+  if [ "$arg" = --disable-automatic-resolution ]; then locked=true; fi
+done
+if [ "$locked" != true ]; then echo 'missing locked resolution'; exit 24; fi`
+			if fail {
+				body += "\necho locked-build-failed; exit 42"
+			}
+			fixture.tool(t, "swift", body, false)
+			command := "export LUXO_INTEROP_SCRATCH=" + shellQualityQuote(string(fixture)) +
+				" LUXO_SWIFT_PATH=" + shellQualityQuote(string(fixture)) + "\n" + script
+			output, log, err := fixture.run(t, command)
+			if (err != nil) != fail || !strings.Contains(log, "--disable-automatic-resolution") {
+				t.Fatalf("Swift must require the lock and propagate failure: %v\n%s\n%s", err, output, log)
+			}
+			if fail && !strings.Contains(output, "locked-build-failed") {
+				t.Fatalf("lost Swift build failure: %s", output)
+			}
+		})
+	}
+	ignored := readQualityFile(t, "../tests/sdk-interop/swift/.gitignore")
+	if strings.Contains(ignored, "Package.resolved") {
+		t.Fatal("Swift interop must not ignore its release dependency lock")
 	}
 }
 
@@ -263,16 +405,69 @@ func TestQualityGatesCheckEveryGoDirectory(t *testing.T) {
 			if err != nil {
 				t.Fatalf("clean tools rejected: %v\n%s", err, output)
 			}
-			for _, want := range []string{"gofmt -s -l pkg/ cmd/ scripts/\n", "gocyclo -over 25 pkg/ cmd/ scripts/\n"} {
+			for _, want := range []string{"gofmt -s -l pkg/ cmd/ scripts/ internal/\n", "gocyclo -over 25 pkg/ cmd/ scripts/ internal/\n"} {
 				if strings.Count(log, want) != 1 {
 					t.Errorf("expected exactly one %q, got:\n%s", want, log)
 				}
 			}
-			if entry.name != "CI" && !strings.Contains(log, "go vet ./pkg/... ./cmd/... ./scripts/...\n") {
+			if entry.name != "CI" && !strings.Contains(log, "go vet ./pkg/... ./cmd/... ./cmd/luxo/... ./scripts/... ./internal/... ./pkg/lux/pg/... ./pkg/lux/nats/... ./pkg/lux/cache/redis/... ./pkg/lux/storage/s3/...\n") {
 				t.Errorf("vet must cover the same directories:\n%s", log)
 			}
-			if entry.name == "lint" && !strings.Contains(log, "go test ./pkg/... ./scripts/...") {
+			if entry.name == "lint" && !strings.Contains(log, "go test ./pkg/... ./cmd/... ./scripts/... ./internal/...") {
 				t.Errorf("lint must run gate regression tests:\n%s", log)
+			}
+			if entry.name == "lint" {
+				for _, module := range []string{"cmd/luxo", "pkg/lux/pg", "pkg/lux/nats", "pkg/lux/cache/redis", "pkg/lux/storage/s3"} {
+					if !strings.Contains(log, "go test ./"+module+"/...") {
+						t.Errorf("lint skipped nested module %s:\n%s", module, log)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestCIEnforces32BitErrorCodeBoundaries(t *testing.T) {
+	for _, step := range readQualityWorkflow(t).Jobs["test"].Steps {
+		if step.Name != "Verify 32-bit error code boundaries" {
+			continue
+		}
+		for _, required := range []string{
+			"GOARCH=386", "CGO_ENABLED=0", "go test ./pkg/lux/api ./pkg/lux/rpc",
+			"TestDecodeBinaryErrorCodeRepresentability", "TestRPCErrorCodeDoesNotNarrow", "-count=1",
+		} {
+			if !strings.Contains(step.Run, required) {
+				t.Errorf("32-bit boundary check missing %q", required)
+			}
+		}
+		if step.ContinueOnError || step.If != "" {
+			t.Fatal("32-bit boundary failures must block CI")
+		}
+		return
+	}
+	t.Fatal("missing 32-bit boundary check")
+}
+
+func TestCIGoCommandsIncludeInternalPackages(t *testing.T) {
+	workflow := readQualityWorkflow(t)
+	for _, test := range []struct{ job, step, command string }{
+		{"test", "Run tests with coverage", "go test ./pkg/... ./cmd/... ./scripts/... ./internal/..."},
+		{"lint", "Vet", "go vet ./pkg/... ./cmd/... ./cmd/luxo/... ./scripts/... ./internal/... ./pkg/lux/pg/... ./pkg/lux/nats/... ./pkg/lux/cache/redis/... ./pkg/lux/storage/s3/..."},
+		{"lint", "Build", "go build ./pkg/... ./cmd/... ./cmd/luxo/... ./scripts/... ./internal/... ./pkg/lux/pg/... ./pkg/lux/nats/... ./pkg/lux/cache/redis/... ./pkg/lux/storage/s3/..."},
+	} {
+		t.Run(test.step, func(t *testing.T) {
+			found := 0
+			for _, step := range workflow.Jobs[test.job].Steps {
+				if step.Name != test.step {
+					continue
+				}
+				found++
+				if !strings.Contains(step.Run, test.command) || step.ContinueOnError {
+					t.Errorf("CI must enforce internal package checks: %s", step.Run)
+				}
+			}
+			if found != 1 {
+				t.Fatalf("expected one %q step, got %d", test.step, found)
 			}
 		})
 	}

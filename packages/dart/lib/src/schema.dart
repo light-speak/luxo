@@ -1,3 +1,7 @@
+const maxSelectionFieldID = 65535;
+const maxAPIID = 2147483647;
+const maxParamID = maxAPIID - 2;
+
 /// API schema metadata for binary encoding and exact JSON parameter validation.
 class APISchemaEntry {
   final int id;

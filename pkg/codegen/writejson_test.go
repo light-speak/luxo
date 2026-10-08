@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -8,6 +9,74 @@ import (
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
 )
+
+func TestWriteObjectArrayItemsPropagatesEncodingError(t *testing.T) {
+	var output strings.Builder
+	writeScalarArrayItems(&output, "Snapshot", false, "items", "\t")
+	for _, want := range []string{
+		"codec.AppendArrayHeader(buf.B, len(items))",
+		"for i := range items",
+		"items[i].WriteLuxo(buf, nil)",
+		"return err",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("object array encoding missing %q: %s", want, output.String())
+		}
+	}
+}
+
+func TestWriteScalarEncodingPreservesOutput(t *testing.T) {
+	for _, scalar := range []struct{ name, call, value, pointer string }{
+		{"Int", "AppendSvarint", "item.Value", "*item.Value"},
+		{"Float", "AppendFixed64", "item.Value", "*item.Value"},
+		{"String", "AppendString", "item.Value", "*item.Value"},
+		{"Boolean", "AppendBool", "item.Value", "*item.Value"},
+		{"DateTime", "AppendDateTime", "item.Value", "*item.Value"},
+		{"Duration", "AppendSvarint", "int64(item.Value)", "int64(*item.Value)"},
+		{"UUID", "AppendUUID", "[16]byte(item.Value)", "[16]byte(*item.Value)"},
+		{"Decimal", "AppendString", "item.Value.String()", "item.Value.String()"},
+		{"Bytes", "AppendBytes", "item.Value", "*item.Value"},
+		{"JSON", "AppendJSON", "item.Value", "*item.Value"},
+	} {
+		for _, nullable := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/nullable=%t", scalar.name, nullable), func(t *testing.T) {
+				value, indent := scalar.value, "\t"
+				want := "prefix\n\tbuf.B = codec.AppendVarint(buf.B, 7)\n"
+				if nullable {
+					value, indent = scalar.pointer, "\t\t"
+					want += "\tif item.Value != nil {\n\t\tbuf.B = codec.AppendPresent(buf.B)\n"
+				}
+				call := fmt.Sprintf("codec.%s(buf.B, %s)", scalar.call, value)
+				switch scalar.name {
+				case "Float", "String", "DateTime", "Decimal", "JSON":
+					want += indent + "if encoded, err := " + call + "; err != nil { return err } else { buf.B = encoded }\n"
+				default:
+					want += indent + "buf.B = " + call + "\n"
+				}
+				if nullable {
+					want += "\t} else {\n\t\tbuf.B = codec.AppendNull(buf.B)\n\t}\n"
+				}
+				var output strings.Builder
+				output.WriteString("prefix\n")
+				writeScalarEncoding(&output, scalar.name, nullable, "7", "item.Value", "\t")
+				if output.String() != want {
+					t.Fatalf("encoding changed:\ngot %q\nwant %q", output.String(), want)
+				}
+			})
+		}
+	}
+}
+
+func TestWriteScalarEncodingLeavesUnsupportedTypeUnchanged(t *testing.T) {
+	for _, nullable := range []bool{false, true} {
+		var output strings.Builder
+		output.WriteString("prefix")
+		writeScalarEncoding(&output, "NestedModel", nullable, "7", "item.Value", "\t")
+		if output.String() != "prefix" {
+			t.Fatal("non-scalar dispatch emitted a partial scalar")
+		}
+	}
+}
 
 func TestGenerateWriteJSONFileNoModels(t *testing.T) {
 	generator := defaultGenerator()
@@ -1195,12 +1264,12 @@ func TestGenerateScalarArrayFields(t *testing.T) {
 		// WriteLuxo: array header + per-type item append
 		"codec.AppendArrayHeader(buf.B, len(t.Tags))",
 		"codec.AppendUUID(buf.B, [16]byte(v))", // [UUID]
-		"codec.AppendString(buf.B, string(v))", // [Role] enum
+		"Role(v).AppendLuxo(buf.B)",            // [Role] enum
 		// ReadLuxo: array readers + conversions
 		"dec.ReadStringArray()",
 		"dec.ReadIntArray()",
 		"dec.ReadUUIDArray()",
-		"uuid.UUID(v)",
+		"uuid.UUID(_item)",
 		"make([]Role, len(_a))",
 		"make([]decimal.Decimal, len(_a))",
 		// Columnar: array field encoded as a Bytes column of inline-array cells

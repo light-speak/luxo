@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/light-speak/luxo/internal/inferred"
 	"github.com/light-speak/luxo/pkg/ast"
 )
 
@@ -52,6 +53,7 @@ type apiContract struct {
 }
 
 func collectContracts(files []*ast.File) wireContracts {
+	models := inferred.ModelsForAPIs(files)
 	contracts := wireContracts{
 		models: make(map[string]map[string]string),
 		types:  make(map[string]map[string]string),
@@ -86,6 +88,7 @@ func collectContracts(files []*ast.File) wireContracts {
 			contracts.events[event.Name] = params
 		}
 		for _, api := range file.APIs {
+			api = inferred.Contract(api, models)
 			contracts.apis[api.Name] = newAPIContract(api.EffectiveParams(), api.ReturnType)
 		}
 		for _, fn := range file.Functions {

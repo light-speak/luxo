@@ -14,6 +14,70 @@ import (
 
 var canonicalIntegerSink any
 
+func BenchmarkBinaryJSONRawRequest(b *testing.B) {
+	for _, sample := range []struct{ name, raw string }{
+		{"small", `{"ok":true}`},
+		{"precision", `{"integer":123456789012345678901234567890,"fraction":1.234567890123456789}`},
+		{"unicode1KiB", `"` + strings.Repeat("中文", 171) + `"`},
+		{"unicode72KiB", `"` + strings.Repeat("中文", 12288) + `"`},
+		{"escaped128", `"` + strings.Repeat(`\uD800\uDC00`, 128) + `"`},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			document := json.RawMessage(sample.raw)
+			meta := []ParamMeta{{Name: "document", Type: "JSON", FieldID: 1}}
+			params := map[string]any{"document": document}
+			// Independent request golden: API 1, empty mask, field 1, document, end.
+			expected := codec.AppendBytes([]byte{1, 0, 1}, document)
+			expected = append(expected, 0)
+			b.ReportAllocs()
+			for b.Loop() {
+				body, err := EncodeBinaryRequest(1, nil, params, meta)
+				if err != nil || !bytes.Equal(body, expected) {
+					b.Fatal("raw JSON request changed", err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkBinaryJSONDocuments(b *testing.B) {
+	meta := []ParamMeta{{Name: "values", Type: "JSON", FieldID: 1, IsList: true}}
+	for _, count := range []int{0, 1, 128} {
+		documents := make([]json.RawMessage, count)
+		boxed := make([]any, count)
+		for index := range documents {
+			documents[index] = []byte(`{"n":123456789012345678901234567890,"d":1.234567890123456789,"text":"東京"}`)
+			boxed[index] = documents[index]
+		}
+		var expected []byte
+		for _, item := range []struct {
+			name  string
+			value any
+		}{{"boxed", boxed}, {"typed", documents}} {
+			params := map[string]any{"values": item.value}
+			b.Run(fmt.Sprintf("%d/%s", count, item.name), func(b *testing.B) {
+				body, err := EncodeBinaryRequest(9, nil, params, meta)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if expected == nil {
+					expected = body
+				}
+				if !bytes.Equal(body, expected) {
+					b.Fatal("typed and boxed documents produced different wire")
+				}
+				b.ReportAllocs()
+				for b.Loop() {
+					body, err := EncodeBinaryRequest(9, nil, params, meta)
+					if err != nil || !bytes.Equal(body, expected) {
+						b.Fatal("JSON document request changed", err)
+					}
+				}
+			})
+		}
+	}
+}
+
 func BenchmarkCanonicalJSONStructured(b *testing.B) {
 	for _, count := range []int{-1, 0, 1, 128} {
 		s := schema.New()
@@ -30,7 +94,9 @@ func BenchmarkCanonicalJSONStructured(b *testing.B) {
 		meta := ParamMeta{Name: "value", Type: "Model", TypeName: "Sample", FieldID: 1, IsList: count >= 0}
 		req := &Request{API: "echo", Params: map[string]json.RawMessage{"value": []byte(raw)}}
 		registry := NewAPIRegistry()
-		registry.SetSchema(s)
+		if err := registry.SetSchema(s); err != nil {
+			b.Fatal(err)
+		}
 		registry.Register("echo", 1)
 		registry.RegisterParams("echo", []ParamMeta{meta})
 		b.Run(fmt.Sprintf("%d", count), func(b *testing.B) {
@@ -200,7 +266,8 @@ func benchmarkCanonicalJSONValue(b *testing.B, tc opaqueJSONBenchmarkCase) {
 	for _, version := range []struct {
 		name   string
 		decode func(*Request, ParamMeta) (any, bool, error)
-	}{{"before", beforeOpaqueJSONValue}, {"after", NewAPIRegistry().jsonParamValue}} {
+		encode func(*codec.Encoder, ParamMeta, any) error
+	}{{"before", beforeOpaqueJSONValue, encodeOpaqueJSONReference}, {"after", NewAPIRegistry().jsonParamValue, encodeBinaryParam}} {
 		b.Run(version.name, func(b *testing.B) {
 			var enc codec.Encoder
 			write := func() {
@@ -209,7 +276,7 @@ func benchmarkCanonicalJSONValue(b *testing.B, tc opaqueJSONBenchmarkCase) {
 					b.Fatalf("decode: present %v, error %v", present, err)
 				}
 				enc.Reset()
-				if err := encodeBinaryParam(&enc, meta, value); err != nil {
+				if err := version.encode(&enc, meta, value); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -225,6 +292,32 @@ func benchmarkCanonicalJSONValue(b *testing.B, tc opaqueJSONBenchmarkCase) {
 			}
 		})
 	}
+}
+
+// Preserve the former reflective encoder only for the non-null JSON benchmark.
+// The production request encoder intentionally no longer accepts these values.
+func encodeOpaqueJSONReference(enc *codec.Encoder, meta ParamMeta, value any) error {
+	if meta.Type != "JSON" || meta.Nullable || meta.FieldID <= 0 {
+		return fmt.Errorf("unsupported historical benchmark metadata")
+	}
+	enc.WriteFieldHeader(meta.FieldID)
+	values := []any{value}
+	if meta.IsList {
+		var ok bool
+		values, ok = value.([]any)
+		if !ok {
+			return fmt.Errorf("expected historical JSON list")
+		}
+		enc.WriteArrayHeader(len(values))
+	}
+	for _, item := range values {
+		raw, err := json.Marshal(item)
+		if err != nil {
+			return err
+		}
+		enc.WriteBytes(raw)
+	}
+	return nil
 }
 
 // Frozen JSON-specific normalization; compare only exactly representable values.
@@ -330,7 +423,9 @@ func BenchmarkParseBinaryRequestPaginatedDefaults(b *testing.B) {
 			{ID: 2, Name: "pageSize", Type: schema.FieldInt, HasDefault: true},
 		},
 	})
-	registry.SetSchema(s)
+	if err := registry.SetSchema(s); err != nil {
+		b.Fatal(err)
+	}
 	body := []byte{1, 0, 0}
 
 	b.ReportAllocs()
@@ -360,7 +455,9 @@ func BenchmarkParseBinaryRequestIntoPaginatedDefaults(b *testing.B) {
 			{ID: 2, Name: "pageSize", Type: schema.FieldInt, HasDefault: true},
 		},
 	})
-	registry.SetSchema(s)
+	if err := registry.SetSchema(s); err != nil {
+		b.Fatal(err)
+	}
 	body := []byte{1, 0, 0}
 	request := new(Request)
 

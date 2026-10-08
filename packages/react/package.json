@@ -1,6 +1,6 @@
 {
   "name": "@luxojs/react",
-  "version": "0.1.0-dev.3",
+  "version": "1.0.0-beta.1",
   "description": "Luxo React hooks — useLuxoQuery / useLuxoMutation with compile-time field tracking",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -39,7 +39,7 @@
     "prepublishOnly": "pnpm build"
   },
   "peerDependencies": {
-    "@luxojs/client": ">=0.1.0-dev.1",
+    "@luxojs/client": "1.0.0-beta.1",
     "react": ">=18.0"
   },
   "devDependencies": {

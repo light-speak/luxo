@@ -1,6 +1,9 @@
 package codegen
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -25,6 +28,96 @@ func TestGenerateQueryBuilderUsesDeclaredPrimaryKey(t *testing.T) {
 		}
 	}
 }
+
+func TestNoTimePreservesExplicitTimestampInputs(t *testing.T) {
+	model := noTimeInputModel()
+	var output strings.Builder
+	generateQueryBuilder(&output, model, nil)
+	code := output.String()
+	for _, fragment := range []string{"SetCreatedAt(v time.Time)", "SetUpdatedAt(v time.Time)", "CreatedAt time.Time", "UpdatedAt time.Time", "r.CreatedAt", "r.UpdatedAt"} {
+		if !strings.Contains(code, fragment) {
+			t.Errorf("@noTime lost explicit timestamp input %q", fragment)
+		}
+	}
+	if strings.Contains(code, "time.Now()") {
+		t.Error("@noTime generated automatic timestamp values")
+	}
+	for _, update := range []bool{false, true} {
+		fields := mutationInputFields(model, nil, update)
+		if len(fields) != 2 || fields[0].field.Name != "createdAt" || fields[1].field.Name != "updatedAt" {
+			t.Errorf("@noTime CRUD inputs missing: update=%v, fields=%v", update, fields)
+		}
+	}
+}
+
+func noTimeInputModel() *ast.ModelDecl {
+	return &ast.ModelDecl{Name: "Audit", Directives: []*ast.Directive{{Name: "crud"}, {Name: "noTime"}}, Fields: []*ast.FieldDecl{
+		{Name: "id", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}, {Name: "auto"}}},
+		{Name: "createdAt", Type: &ast.TypeRef{Name: "DateTime"}},
+		{Name: "updatedAt", Type: &ast.TypeRef{Name: "DateTime"}},
+	}}
+}
+
+func TestNoTimeKeepsAutomaticIdentifiers(t *testing.T) {
+	model := noTimeInputModel()
+	model.Fields[0].Type.Name = "UUID"
+	fills := collectAutoFills(model.Fields, model.Directives)
+	columns := collectAutoCols(model.Fields, model.Directives)
+	if len(fills) != 1 || !strings.Contains(fills[0], "uuid.NewV7()") {
+		t.Fatalf("@noTime changed automatic UUID generation: %v", fills)
+	}
+	if len(columns) != 1 || columns[0].col != "id" || columns[0].expr != "uuid.Must(uuid.NewV7())" {
+		t.Fatalf("@noTime changed batch UUID generation: %v", columns)
+	}
+	if fields := collectUserFields(model.Fields, model.Directives); len(fields) != 2 {
+		t.Fatalf("automatic UUID leaked into batch input: %v", fields)
+	}
+}
+
+func TestGeneratedNoTimeTimestampContract(t *testing.T) {
+	input := result(&ast.File{Models: []*ast.ModelDecl{noTimeInputModel()}})
+	config := GeneratorConfig{Driver: DriverPG, IDs: completeFixtureAPIIDs(input, StableIDs{
+		ModelFields: map[string]map[string]int{"Audit": {"id": 1, "createdAt": 2, "updatedAt": 3}},
+	})}
+	generated, err := Generate(input, "generated", config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := writeProtocolFixture(t, "package generated\n", noTimeTimestampAssertions)
+	for name, data := range generated.Files {
+		if filepath.Base(name) != name {
+			t.Fatalf("unexpected generated path %q", name)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	command := exec.Command("go", "test", "-count=1", "-timeout=60s", ".")
+	command.Dir = dir
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("generated @noTime contract: %v\n%s", err, output)
+	}
+}
+
+const noTimeTimestampAssertions = `package generated
+import ("testing";"time";"github.com/light-speak/luxo/pkg/lux/schema")
+func TestNoTimeTimestampContract(t *testing.T) {
+  first:=time.Unix(-1,123456789).UTC(); second:=time.Unix(1776427200,987654321).UTC()
+  create:=(&AuditClient{}).Create().SetCreatedAt(first).SetUpdatedAt(second)
+  if len(create.Cols)!=2 || create.Cols[0]!="created_at" || create.Cols[1]!="updated_at" || create.Vals[0]!=first || create.Vals[1]!=second {t.Fatalf("create replaced times: %+v",create)}
+  update:=newAuditUpdateBuilder(nil,"audits",1).SetCreatedAt(first).SetUpdatedAt(second)
+  if len(update.Sets)!=2 || update.Sets[0].Val!=first || update.Sets[1].Val!=second {t.Fatalf("update replaced times: %+v",update)}
+  many:=(&AuditClient{}).CreateMany().Add(AuditCreateInput{CreatedAt:first,UpdatedAt:second})
+  if len(many.rows)!=1 || many.rows[0].CreatedAt!=first || many.rows[0].UpdatedAt!=second {t.Fatal("batch changed times")}
+  catalog:=schema.New(); if err:=RegisterSchema(catalog);err!=nil {t.Fatal(err)}
+  for _,name:=range []string{"createAudit","updateAudit"} {
+    declaration:=catalog.APIs[name];if declaration==nil {t.Fatalf("missing %s",name)}
+    found:=0
+    for _,param:=range declaration.Params {if param.Name=="createdAt" || param.Name=="updatedAt" {found++;if param.Type!=schema.FieldDateTime {t.Fatal("timestamp input changed type")}}}
+    if found!=2 {t.Fatalf("SDK schema lost timestamp inputs for %s: %+v",name,declaration.Params)}
+  }
+}
+`
 
 func TestGenerateClient(t *testing.T) {
 	fields := []*ast.FieldDecl{

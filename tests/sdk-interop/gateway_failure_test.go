@@ -25,6 +25,36 @@ var fixtureGatewayBenchmarks []byte
 //go:embed gateway_nested.go.txt
 var fixtureGatewayNestedTests []byte
 
+//go:embed gateway_http.go.txt
+var fixtureGatewayHTTPTests []byte
+
+func TestGeneratedGatewayHTTP(t *testing.T) {
+	t.Chdir("../..")
+	err := withBuiltFixture(func(_ string, scratch string) error {
+		if err := writeGatewayTestSources(scratch, map[string][]byte{
+			"gateway_failure_test.go": fixtureGatewayFailureTests,
+			"gateway_http_test.go":    fixtureGatewayHTTPTests,
+		}); err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+		defer cancel()
+		args := []string{"test", "-race", "-run", "^TestProxyHTTP", "-count=1", scratch}
+		if os.Getenv("LUXO_PROXY_HTTP_BENCHMARK") == "1" {
+			args = []string{"test", "-run", "^TestProxyHTTP", "-bench", "^BenchmarkProxyHTTP(Wide)?$", "-benchmem", "-benchtime=300ms", "-count=1", scratch}
+		}
+		if os.Getenv("LUXO_PROXY_HTTP2_BENCHMARK") == "1" {
+			args = []string{"test", "-run", "^TestProxyHTTP", "-bench", "^BenchmarkProxyHTTP2$", "-benchmem", "-benchtime=300ms", "-count=1", scratch}
+		}
+		command := exec.Command("go", args...)
+		command.Stdout, command.Stderr = os.Stdout, os.Stderr
+		return runOwnedFixtureCommand(ctx, command)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestGeneratedGatewayExtensionFailures(t *testing.T) {
 	t.Chdir("../..")
 	err := withBuiltFixture(func(_ string, scratch string) error {
@@ -33,12 +63,12 @@ func TestGeneratedGatewayExtensionFailures(t *testing.T) {
 		}
 		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 		defer cancel()
-		command := exec.CommandContext(ctx, "go", "test", "-race", "-count=1", "-run", "^TestProxy", scratch)
+		command := exec.Command("go", "test", "-race", "-count=1", "-run", "^TestProxy", scratch)
 		if os.Getenv("LUXO_PROXY_REPORT") == "1" {
 			command.Args = append(command.Args[:len(command.Args)-1], "-coverprofile="+filepath.Join(scratch, "coverage.out"), "-shuffle=on", "-count=20", scratch)
 		}
 		command.Stdout, command.Stderr = os.Stdout, os.Stderr
-		if err := command.Run(); err != nil {
+		if err := runOwnedFixtureCommand(ctx, command); err != nil {
 			return err
 		}
 		if os.Getenv("LUXO_PROXY_REPORT") == "1" {
@@ -51,19 +81,73 @@ func TestGeneratedGatewayExtensionFailures(t *testing.T) {
 	}
 }
 
+func TestGeneratedGatewayHTTPProfile(t *testing.T) {
+	if os.Getenv("LUXO_PROXY_HTTP_PROFILE") != "1" {
+		t.Skip("opt-in isolated HTTP gateway CPU/allocation profile")
+	}
+	t.Chdir("../..")
+	err := withBuiltFixture(func(_ string, scratch string) error {
+		if err := writeGatewayTestSources(scratch, map[string][]byte{
+			"gateway_failure_test.go": fixtureGatewayFailureTests,
+			"gateway_http_test.go":    fixtureGatewayHTTPTests,
+		}); err != nil {
+			return err
+		}
+		for _, name := range []string{"BenchmarkProxyHTTPWide", "BenchmarkProxyHTTP2"} {
+			if err := profileGatewayHTTP(t.Context(), scratch, name); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func profileGatewayHTTP(parent context.Context, scratch, name string) error {
+	ctx, cancel := context.WithTimeout(parent, 3*time.Minute)
+	defer cancel()
+	executable := filepath.Join(scratch, "profile.test")
+	cpu, memory := filepath.Join(scratch, "cpu.pprof"), filepath.Join(scratch, "memory.pprof")
+	pattern := "^" + name + "$/fields=128$/rows=128$/branches=2$/binary=false$"
+	command := exec.Command("go", "test", "-run=^$", "-bench="+pattern, "-benchmem", "-benchtime=3s",
+		"-cpuprofile="+cpu, "-memprofile="+memory, "-o", executable, scratch)
+	command.Stdout, command.Stderr = os.Stdout, os.Stderr
+	if err := runOwnedFixtureCommand(ctx, command); err != nil {
+		return err
+	}
+	for _, report := range []struct{ mode, path string }{{"-cpu", cpu}, {"-alloc_space", memory}} {
+		fmt.Printf("%s %s profile\n", name, report.mode)
+		args := []string{"tool", "pprof", "-top", "-nodecount=15"}
+		if report.mode != "-cpu" {
+			args = append(args, report.mode)
+		}
+		command := exec.Command("go", append(args, executable, report.path)...)
+		command.Stdout, command.Stderr = os.Stdout, os.Stderr
+		if err := runOwnedFixtureCommand(ctx, command); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func reportGatewayProxy(ctx context.Context, scratch string) error {
-	output, err := exec.CommandContext(ctx, "go", "tool", "cover", "-func="+filepath.Join(scratch, "coverage.out")).Output()
+	var report bytes.Buffer
+	command := exec.Command("go", "tool", "cover", "-func="+filepath.Join(scratch, "coverage.out"))
+	command.Stdout, command.Stderr = &report, os.Stderr
+	err := runOwnedFixtureCommand(ctx, command)
 	if err != nil {
 		return err
 	}
-	for _, line := range bytes.Split(output, []byte{'\n'}) {
+	for _, line := range bytes.Split(report.Bytes(), []byte{'\n'}) {
 		if bytes.Contains(line, []byte("/gateway_proxy.gen.go:")) {
 			fmt.Println(string(line))
 		}
 	}
-	command := exec.CommandContext(ctx, "gocyclo", "-over", "25", filepath.Join(scratch, "gateway_proxy.gen.go"))
+	command = exec.Command("gocyclo", "-over", "25", filepath.Join(scratch, "gateway_proxy.gen.go"))
 	command.Stdout, command.Stderr = os.Stdout, os.Stderr
-	return command.Run()
+	return runOwnedFixtureCommand(ctx, command)
 }
 
 func TestGeneratedGatewayBenchmark(t *testing.T) {
@@ -85,9 +169,9 @@ func TestGeneratedGatewayBenchmark(t *testing.T) {
 		}
 		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
 		defer cancel()
-		command := exec.CommandContext(ctx, "go", "test", "-run", "^$", "-bench", "^BenchmarkProxy$", "-benchtime=200ms", "-count=3", scratch)
+		command := exec.Command("go", "test", "-run", "^$", "-bench", "^BenchmarkProxy$", "-benchtime=200ms", "-count=3", scratch)
 		command.Stdout, command.Stderr = os.Stdout, os.Stderr
-		return command.Run()
+		return runOwnedFixtureCommand(ctx, command)
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -156,9 +240,9 @@ func runGeneratedGatewayNestedTests(t *testing.T, pattern string) {
 		}
 		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 		defer cancel()
-		command := exec.CommandContext(ctx, "go", "test", "-race", "-run", pattern, "-count=1", scratch)
+		command := exec.Command("go", "test", "-race", "-run", pattern, "-count=1", scratch)
 		command.Stdout, command.Stderr = os.Stdout, os.Stderr
-		return command.Run()
+		return runOwnedFixtureCommand(ctx, command)
 	})
 	if err != nil {
 		t.Fatal(err)

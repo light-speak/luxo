@@ -3,6 +3,8 @@ package event
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,6 +13,113 @@ import (
 type testEvent struct {
 	UserID int    `json:"userId"`
 	Name   string `json:"name"`
+}
+
+func (p testEvent) SnapshotEvent() (Snapshot, error) {
+	return immutablePayload(p).SnapshotEvent()
+}
+
+type capturedTypedBus struct {
+	Bus
+	handler Handler
+}
+
+func (b *capturedTypedBus) On(_ string, handler Handler) error {
+	b.handler = handler
+	return nil
+}
+
+func (b *capturedTypedBus) OnQueue(_ string, _ string, handler Handler) error {
+	b.handler = handler
+	return nil
+}
+
+func TestTypedHandlersRejectUnexpectedPayload(t *testing.T) {
+	for _, queue := range []bool{false, true} {
+		bus := &capturedTypedBus{}
+		decoded, handled := 0, 0
+		decode := func([]byte, any) error { decoded++; return nil }
+		handle := func(context.Context, testEvent) error { handled++; return nil }
+		var err error
+		if queue {
+			err = OnQueueDecode(bus, "probe", "group", decode, handle)
+		} else {
+			err = OnDecode(bus, "probe", decode, handle)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, payload := range []any{nil, 42, "wrong", (*testEvent)(nil)} {
+			if err := bus.handler(t.Context(), payload); !errors.Is(err, ErrUnexpectedPayload) {
+				t.Fatalf("queue=%t: incompatible payload returned %v", queue, err)
+			}
+		}
+		if decoded != 0 || handled != 0 {
+			t.Fatalf("invalid payload reached decoder/handler: %d/%d", decoded, handled)
+		}
+		if err := bus.handler(t.Context(), testEvent{}); err != nil {
+			t.Fatal(err)
+		}
+		if decoded != 0 || handled != 1 {
+			t.Fatal("rejection affected the next valid event")
+		}
+	}
+}
+
+// The historical adapter only differs in its silent mismatched-type result.
+// Both sides reuse preboxed payloads and exclude queues, wire decoding and I/O.
+func BenchmarkTypedPayloadDispatch(b *testing.B) {
+	for _, sample := range []struct {
+		name     string
+		payload  any
+		rejected bool
+	}{
+		{"direct", testEvent{UserID: 42}, false},
+		{"bytes", []byte{42}, false},
+		{"mismatch", 42, true},
+	} {
+		for _, previous := range []bool{true, false} {
+			b.Run(fmt.Sprintf("%s/previous=%t", sample.name, previous), func(b *testing.B) {
+				count := 0
+				decode := func(data []byte, target any) error { target.(*testEvent).UserID = int(data[0]); return nil }
+				handle := func(_ context.Context, value testEvent) error { count += value.UserID; return nil }
+				bus := &capturedTypedBus{}
+				if err := OnDecode(bus, "probe", decode, handle); err != nil {
+					b.Fatal(err)
+				}
+				if previous {
+					bus.handler = typedHandlerBeforeRejection(decode, handle)
+				}
+				ctx := b.Context()
+				b.ReportAllocs()
+				for b.Loop() {
+					err := bus.handler(ctx, sample.payload)
+					if (err != nil) != (sample.rejected && !previous) {
+						b.Fatal(err)
+					}
+				}
+				if !sample.rejected && count != b.N*42 {
+					b.Fatal("valid dispatch was skipped")
+				}
+			})
+		}
+	}
+}
+
+func typedHandlerBeforeRejection[T any](unmarshal func([]byte, any) error, handler func(context.Context, T) error) Handler {
+	return func(ctx context.Context, raw any) error {
+		switch value := raw.(type) {
+		case T:
+			return handler(ctx, value)
+		case []byte:
+			var target T
+			if err := unmarshal(value, &target); err != nil {
+				return err
+			}
+			return handler(ctx, target)
+		}
+		return nil
+	}
 }
 
 func TestOnDecodeDirectPayload(t *testing.T) {
@@ -93,7 +202,7 @@ func TestOnQueueDecodeDirectPayload(t *testing.T) {
 	}
 }
 
-func TestOnDecodeIgnoresUnknownType(t *testing.T) {
+func TestOnDecodeDoesNotDeliverUnknownType(t *testing.T) {
 	bus := NewChanBus(10)
 	defer bus.Close()
 
@@ -140,7 +249,7 @@ func TestOnQueueDecodeFromBytes(t *testing.T) {
 	}
 }
 
-func TestOnQueueDecodeIgnoresUnknownType(t *testing.T) {
+func TestOnQueueDecodeDoesNotDeliverUnknownType(t *testing.T) {
 	bus := NewChanBus(10)
 	defer bus.Close()
 

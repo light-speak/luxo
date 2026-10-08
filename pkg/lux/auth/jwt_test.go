@@ -17,7 +17,7 @@ func testConfig() *Config {
 
 func TestSignAndVerify(t *testing.T) {
 	cfg := testConfig()
-	data := map[string]any{"id": float64(1), "role": "admin"}
+	data := testClaims(1, "admin")
 
 	token, err := Sign(cfg, data)
 	if err != nil {
@@ -33,17 +33,17 @@ func TestSignAndVerify(t *testing.T) {
 		t.Fatalf("Verify failed: %v", err)
 	}
 
-	if result["id"] != float64(1) {
-		t.Errorf("id = %v, want 1", result["id"])
+	if result.ID() != 1 {
+		t.Errorf("id = %v, want 1", result.ID())
 	}
-	if result["role"] != "admin" {
-		t.Errorf("role = %v, want admin", result["role"])
+	if result.String("role") != "admin" {
+		t.Errorf("role = %v, want admin", result.String("role"))
 	}
 }
 
 func TestVerifyExpired(t *testing.T) {
 	cfg := testConfig()
-	data := map[string]any{"id": float64(1)}
+	data := testClaims(1, "")
 
 	token, _ := SignWithExpiry(cfg, data, -time.Hour)
 
@@ -55,7 +55,7 @@ func TestVerifyExpired(t *testing.T) {
 
 func TestVerifyBadSignature(t *testing.T) {
 	cfg := testConfig()
-	data := map[string]any{"id": float64(1)}
+	data := testClaims(1, "")
 
 	token, _ := Sign(cfg, data)
 
@@ -96,18 +96,18 @@ func TestVerifyBadPayload(t *testing.T) {
 
 func TestSignRefresh(t *testing.T) {
 	cfg := testConfig()
-	data := map[string]any{"id": float64(1)}
+	data := testClaims(1, "")
 
 	token, err := SignRefresh(cfg, data)
 	if err != nil {
 		t.Fatalf("SignRefresh failed: %v", err)
 	}
 
-	result, err := Verify(cfg, token)
+	result, err := VerifyRefresh(cfg, token)
 	if err != nil {
 		t.Fatalf("Verify refresh token failed: %v", err)
 	}
-	if result["id"] != float64(1) {
+	if result.ID() != 1 {
 		t.Error("refresh token should contain same data")
 	}
 }
@@ -116,7 +116,7 @@ func TestSignRefreshDisabled(t *testing.T) {
 	cfg := testConfig()
 	cfg.RefreshEnabled = false
 
-	_, err := SignRefresh(cfg, map[string]any{})
+	_, err := SignRefresh(cfg, testClaims(0, ""))
 	if err == nil {
 		t.Fatal("should error when refresh disabled")
 	}

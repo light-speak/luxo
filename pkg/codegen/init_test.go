@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -23,10 +24,28 @@ func TestInitProjectGoMod(t *testing.T) {
 	checks := []string{
 		"module github.com/example/myapp",
 		"go 1.27.1",
+		"github.com/light-speak/luxo v1.0.0-beta.1",
+		"github.com/light-speak/luxo/pkg/lux/pg v1.0.0-beta.1",
 	}
 	for _, check := range checks {
 		if !strings.Contains(src, check) {
 			t.Errorf("missing %q in go.mod:\n%s", check, src)
+		}
+	}
+}
+
+func TestScaffoldPinsOnlySelectedDefaultAdapter(t *testing.T) {
+	version, err := os.ReadFile("../../VERSION")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := string(InitProject("example.com/app").Files["go.mod"])
+	if !strings.Contains(manifest, "github.com/light-speak/luxo v"+strings.TrimSpace(string(version))+"\n") {
+		t.Fatal("scaffold version drift")
+	}
+	for _, unwanted := range []string{"/nats", "/cache/redis", "/storage/s3", "replace "} {
+		if strings.Contains(manifest, unwanted) {
+			t.Fatalf("unselected dependency %q", unwanted)
 		}
 	}
 }
@@ -53,6 +72,9 @@ func TestInitProjectEnvExample(t *testing.T) {
 		"DATABASE_PASSWORD=postgres",
 		"JWT_SECRET=change-me",
 		"DEPLOY_MODE=embedded",
+		"LUXO_EVENT_BACKEND=none",
+		"LUXO_QUEUE_BACKEND=none",
+		"LUXO_CACHE_BACKEND=none",
 		"CORS_ORIGIN=*",
 		"LOG_LEVEL=info",
 		"GRACEFUL_TIMEOUT=30s",

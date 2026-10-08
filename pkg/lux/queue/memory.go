@@ -27,7 +27,7 @@ type memQueue struct {
 }
 
 // dlqSuffix is appended to the queue name for the dead-letter queue.
-const dlqSuffix = ".dlq"
+const dlqSuffix = DeadLetterSuffix
 
 // shutdownTimeout is the maximum time Close waits for in-flight tasks.
 const shutdownTimeout = 10 * time.Second
@@ -36,7 +36,7 @@ var _ Queue = (*MemoryQueue)(nil)
 
 // NewMemoryQueue creates an in-memory queue with the given config.
 func NewMemoryQueue(cfg Config) *MemoryQueue {
-	cfg.validate()
+	cfg.SetDefaults()
 	return &MemoryQueue{
 		cfg:    cfg,
 		queues: make(map[string]*memQueue),
@@ -45,8 +45,11 @@ func NewMemoryQueue(cfg Config) *MemoryQueue {
 }
 
 // Publish sends a task payload to the named queue.
-// Returns an error if the queue is closed or the buffer is full.
-func (m *MemoryQueue) Publish(_ context.Context, queue string, payload []byte) error {
+// Waits for buffer capacity until the context is canceled or the queue closes.
+func (m *MemoryQueue) Publish(ctx context.Context, queue string, payload []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -63,11 +66,20 @@ func (m *MemoryQueue) Publish(_ context.Context, queue string, payload []byte) e
 	cp := make([]byte, len(payload))
 	copy(cp, payload)
 
+	// Avoid registering cancellation waiters when capacity is already available.
+	select {
+	case mq.ch <- cp:
+		return nil
+	default:
+	}
+
 	select {
 	case mq.ch <- cp:
 		return nil
 	case <-m.done:
 		return fmt.Errorf("queue: closed")
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -125,7 +137,7 @@ func (m *MemoryQueue) worker(name string, mq *memQueue) {
 func (m *MemoryQueue) executeWithRetry(name string, handler Handler, payload []byte) {
 	delay := m.cfg.RetryDelay
 	for attempt := 1; attempt <= m.cfg.MaxRetries; attempt++ {
-		err := safeCall(handler, context.Background(), payload)
+		err := InvokeHandler(handler, context.Background(), payload)
 		if err == nil {
 			return
 		}
@@ -198,8 +210,8 @@ func (m *MemoryQueue) Close() error {
 	return nil
 }
 
-// safeCall invokes the handler with panic recovery.
-func safeCall(h Handler, ctx context.Context, payload []byte) (err error) {
+// InvokeHandler invokes the handler with panic recovery.
+func InvokeHandler(h Handler, ctx context.Context, payload []byte) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("queue handler panic: %v", r)

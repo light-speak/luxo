@@ -51,6 +51,18 @@ We started with one question: **from storage to screen, what is the minimum numb
                      Binary (prod, 3x smaller)
 ```
 
+## Typed query controls
+
+For a generated API `listUsers` exposing an Int `count` filter and sorter, the generated query helpers preserve the full Int64 range:
+
+```ts
+import { LuxoQuery_listUsers } from './generated/queries.js'
+const filters = [LuxoQuery_listUsers.count_eq(9007199254740993n)]
+const sorters = [LuxoQuery_listUsers.count_desc()]
+```
+
+Pass these values to the generated API's `$filters` / `$sorters` arguments. Helpers come from the API's advertised capabilities, not all fields on its return model. Only advertised operators are generated. Dynamic controls remain available; the server still validates every query. These helpers do not perform runtime Schema lookup.
+
 ## Install
 
 ```bash
@@ -120,6 +132,13 @@ transport.setSchema(LUXO_SCHEMA)
 const user = await transport.call('getUser', { id: 1n, $select: 'id, name' })
 ```
 
+Schema registration validates API, parameter and selection-field IDs, including nested
+type directories. Invalid or duplicate IDs throw `RangeError` before replacing the
+previous registration. HTTP, WebSocket and WeChat transports keep an owned metadata
+snapshot: later edits to the caller's schema do not change request encoding. Call
+`setSchema` explicitly to apply an updated schema. Validation and copying happen at
+registration, not on every request or stream message; the wire format is unchanged.
+
 ### Exact Integers in JSON and Binary
 
 Schema `Int` and `Duration` use `bigint`, including input/output arrays, nullable
@@ -170,6 +189,16 @@ null, and unselected fields stay absent. DateTime additionally checks RFC3339
 syntax, at most nine fractional digits and UTC years 0000–9999; UUID syntax and
 enum membership remain separate checks. `stringFromJSON` and `booleanFromJSON` expose
 the same checks to handwritten decoders without coercing values.
+
+Generated enums preserve known members as string literals and represent unknown
+response members as `UnknownEnumValue<'EnumName'>`. Narrow with
+`value instanceof UnknownEnumValue`, then read `value.rawValue` for an explicit
+fallback; `enumName` and `kind: 'unknown'` identify the immutable value. Generated
+JSON/Binary readers apply this to nested fields, lists, pagination and streams.
+Schema-directed request encoders unwrap enum values without changing their wire
+string; a different enum's unknown value is rejected. `StateValues` still lists
+only the members declared in that client's schema. Regenerate the client with the
+matching plugin; the server continues to validate against its own declared members.
 
 DateTime remains a string: do not pass it through JS `Date` when exact subsecond
 precision matters. Binary carries signed floor seconds plus unsigned nanoseconds;

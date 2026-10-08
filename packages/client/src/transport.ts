@@ -3,9 +3,15 @@ import { jsonUint64, readWireUint64, UINT64_MAX } from './uint64'
 import type { UInt64 } from './uint64'
 import { decodeBinaryError, jsonResponseError } from './error-codec'
 import { JSONParamValidator } from './json-params'
+import { snapshotAPISchema } from './schema-runtime'
 import { LuxoError } from './error'
 import { Encoder, fieldMaskSet } from './codec'
 import { HTTPHeaders } from './http-headers'
+import { enumRawValue } from './enum'
+import { GeneratedRequest, requestJSON } from './request'
+import type { RequestEncoder, RequestValues } from './request'
+import type { RequestParameters } from './request'
+import { writeFilters, writeSorters, writeDynamicFilters, writeDynamicSorters } from './query-controls'
 
 const textEncoder = new TextEncoder()
 // Preserve Response.text()'s document BOM handling, but reject invalid UTF-8.
@@ -25,26 +31,7 @@ const BinaryFrame = {
   streamError: 0x16,
 } as const
 
-const binaryFiltersFieldID = 0x7ffffffe
-const binarySortersFieldID = 0x7fffffff
-const filterOperatorIDs: Record<string, number> = {
-  eq: 1,
-  ne: 2,
-  gt: 3,
-  gte: 4,
-  lt: 5,
-  lte: 6,
-  contains: 7,
-  startswith: 8,
-  endswith: 9,
-  match: 10,
-}
-
 export type TransportMode = 'json' | 'binary'
-
-function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-  return new Uint8Array(bytes).buffer
-}
 
 function writeDateTimeParam(enc: Encoder, value: unknown): void {
 	if (typeof value !== 'string') {
@@ -81,7 +68,9 @@ export function encodeParam(
 		for (const value of arr) writeDateTimeParam(enc, value); break
       case 'Float':
 		for (const value of arr as number[]) enc.writeFixed64(value); break
-      case 'String': case 'Enum': case 'Decimal':
+      case 'Enum':
+		for (const value of arr) enc.writeString(enumRawValue(value, pm.typeName)); break
+      case 'String': case 'Decimal':
 		for (const value of arr as string[]) enc.writeString(value); break
       case 'Boolean':
 		for (const value of arr as boolean[]) enc.writeBool(value); break
@@ -103,7 +92,9 @@ export function encodeParam(
 	  enc.writeSvarint(v as bigint); break
     case 'Float':
 	  enc.writeFixed64(v as number); break
-    case 'String': case 'Enum': case 'Decimal':
+    case 'Enum':
+	  enc.writeString(enumRawValue(v, pm.typeName)); break
+    case 'String': case 'Decimal':
 	  enc.writeString(v as string); break
     case 'Boolean':
 	  enc.writeBool(v as boolean); break
@@ -159,8 +150,9 @@ function encodeStructuredMessage(
 function structuredArenaLength(value: Record<string, unknown>, fields: Record<string, SelectionFieldSchema>): number {
 	let length = 0
 	for (const [name, field] of Object.entries(fields)) {
-		const fieldValue = value[name]
+		let fieldValue = value[name]
 		if (fieldValue == null || field.isList || (field.type !== 'String' && field.type !== 'Enum')) continue
+		if (field.type === 'Enum') fieldValue = enumRawValue(fieldValue, field.typeName)
 		if (typeof fieldValue !== 'string') {
 			throw new LuxoError('ConfigError', 0, `${name} must be a string`)
 		}
@@ -169,7 +161,7 @@ function structuredArenaLength(value: Record<string, unknown>, fields: Record<st
 	return length
 }
 
-function utf8Length(value: string): number {
+export function utf8Length(value: string): number {
 	let length = 0
 	for (let i = 0; i < value.length; i++) {
 		const code = value.charCodeAt(i)
@@ -220,7 +212,8 @@ function writeStructuredValue(
 	switch (field.type) {
 		case 'Int': case 'Duration': enc.writeSvarint(value as bigint); return
 		case 'Float': enc.writeFixed64(value as number); return
-		case 'String': case 'Enum': case 'Decimal': enc.writeString(value as string); return
+		case 'Enum': enc.writeString(enumRawValue(value, field.typeName)); return
+		case 'String': case 'Decimal': enc.writeString(value as string); return
 		case 'Boolean': enc.writeBool(value as boolean); return
 		case 'UUID': enc.writeUUID(value as string); return
 		case 'DateTime': writeDateTimeParam(enc, value); return
@@ -245,7 +238,7 @@ function writeNestedStructuredValue(
 	encodeStructuredMessage(enc, value, nestedFields, types, typeName)
 }
 
-function encodeJSONParam(value: unknown): Uint8Array {
+export function encodeJSONParam(value: unknown): Uint8Array {
 	const encoded = encodeLuxoJSON(value)
 	if (encoded === undefined) {
 		throw new LuxoError('ConfigError', 0, 'JSON parameter is not serializable')
@@ -384,50 +377,15 @@ function encodeSelectionNode(
   return node.bytes()
 }
 
-function encodeFilters(enc: Encoder, value: unknown): void {
-  if (!Array.isArray(value) || value.length > 1000) {
-    throw new LuxoError('ConfigError', 0, '$filters must be an array with at most 1000 entries')
-  }
-  enc.writeVarint(binaryFiltersFieldID)
-  enc.writeVarint(value.length)
-  for (const [index, item] of value.entries()) {
-    if (!isRecord(item) || typeof item.field !== 'string' || item.field === '' ||
-        typeof item.op !== 'string' || !filterOperatorIDs[item.op] || !isFilterValue(item.value)) {
-      throw new LuxoError('ConfigError', 0, `invalid $filters entry at index ${index}`)
-    }
-    enc.writeString(item.field)
-    enc.writeVarint(filterOperatorIDs[item.op])
-    enc.writeString(String(item.value))
-  }
-}
-
-function encodeSorters(enc: Encoder, value: unknown): void {
-  if (!Array.isArray(value) || value.length > 100) {
-    throw new LuxoError('ConfigError', 0, '$sorters must be an array with at most 100 entries')
-  }
-  enc.writeVarint(binarySortersFieldID)
-  enc.writeVarint(value.length)
-  for (const [index, item] of value.entries()) {
-    if (!isRecord(item) || typeof item.field !== 'string' || item.field === '' ||
-        (item.order !== 'asc' && item.order !== 'desc')) {
-      throw new LuxoError('ConfigError', 0, `invalid $sorters entry at index ${index}`)
-    }
-    enc.writeString(item.field)
-    enc.writeBool(item.order === 'desc')
-  }
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }
 
-function isFilterValue(value: unknown): value is string | number | bigint | boolean {
-  return typeof value === 'string' || typeof value === 'boolean' || typeof value === 'bigint' ||
-    (typeof value === 'number' && Number.isFinite(value))
+export function writeFieldMask(enc: Encoder, meta: APISchema, params?: Record<string, unknown>): void {
+  writeSelectionMask(enc, meta, params?.$select)
 }
 
-export function writeFieldMask(enc: Encoder, meta: APISchema, params?: Record<string, unknown>): void {
-  const select = params?.$select
+function writeSelectionMask(enc: Encoder, meta: APISchema, select: unknown): void {
 	if (!meta.fields || Object.keys(meta.fields).length === 0) {
     enc.writeVarint(0)
     return
@@ -441,7 +399,45 @@ export function writeFieldMask(enc: Encoder, meta: APISchema, params?: Record<st
   enc.writeRawBytes(mask)
 }
 
-export function encodeBinaryBody(meta: APISchema, params?: Record<string, unknown>): Uint8Array {
+export function encodeStaticRequestBody<P extends RequestValues>(
+  meta: APISchema, codec: RequestEncoder<P>, params?: P,
+): Uint8Array<ArrayBuffer> {
+  if (codec.apiID !== meta.id) throw new LuxoError('ConfigError', 0, 'generated request API ID differs from registered schema')
+  const enc = new Encoder(Math.min(65536, codec.initialCapacity(params)))
+  enc.writeVarint(codec.apiID)
+  writeSelectionMask(enc, meta, params?.$select)
+  codec.writeParameters(enc, params)
+  if (params?.$filters !== undefined) writeFilters(enc, params.$filters)
+  if (params?.$sorters !== undefined) writeSorters(enc, params.$sorters)
+  enc.writeEnd()
+  return enc.takeBytes()
+}
+
+function prepareStaticBody<P extends RequestValues>(
+  meta: APISchema | undefined, mode: TransportMode, codec: RequestEncoder<P>, params?: P,
+): Uint8Array<ArrayBuffer> | undefined {
+  if (!meta) throw new LuxoError('ConfigError', 0, 'generated request API has no registered schema')
+  if (mode === 'binary') return encodeStaticRequestBody(meta, codec, params)
+  if (meta.id !== codec.apiID) throw new LuxoError('ConfigError', 0, 'generated request API ID differs from registered schema')
+  return undefined
+}
+
+function encodeGeneratedBody(meta: APISchema, params: GeneratedRequest): Uint8Array<ArrayBuffer> {
+  if (params.apiID !== meta.id) throw new LuxoError('ConfigError', 0, 'generated request API ID differs from registered schema')
+  const enc = new Encoder(Math.min(65536, params.initialCapacity))
+  enc.writeVarint(params.apiID)
+  writeSelectionMask(enc, meta, params.selection)
+  params.writeParameters(enc)
+  const filters = params.filters
+  const sorters = params.sorters
+  if (filters !== undefined) writeFilters(enc, filters)
+  if (sorters !== undefined) writeSorters(enc, sorters)
+  enc.writeEnd()
+  return enc.bytes()
+}
+
+export function encodeBinaryBody(meta: APISchema, params?: RequestParameters): Uint8Array<ArrayBuffer> {
+  if (params instanceof GeneratedRequest) return encodeGeneratedBody(meta, params)
   const enc = new Encoder()
   enc.writeVarint(meta.id)
   writeFieldMask(enc, meta, params)
@@ -452,20 +448,26 @@ export function encodeBinaryBody(meta: APISchema, params?: Record<string, unknow
       encodeParam(enc, param, value, meta.types)
     }
   }
-  if (params && '$filters' in params) encodeFilters(enc, params.$filters)
-  if (params && '$sorters' in params) encodeSorters(enc, params.$sorters)
+  if (params && '$filters' in params) writeDynamicFilters(enc, params.$filters)
+  if (params && '$sorters' in params) writeDynamicSorters(enc, params.$sorters)
   enc.writeEnd()
   return enc.bytes()
 }
 
 /** Transport interface — implemented by HTTP, WebSocket, etc. */
 export interface Transport {
-  call(api: string, params?: Record<string, unknown>, options?: CallOptions): Promise<unknown>
-  subscribe<T>(api: string, params: Record<string, unknown>, decode: (data: unknown) => T, onData: (data: T) => void, observer?: StreamObserver): Promise<() => void>
+  call(api: string, params?: RequestParameters, options?: CallOptions): Promise<unknown>
+  subscribe<T>(api: string, params: RequestParameters, decode: (data: unknown) => T, onData: (data: T) => void, observer?: StreamObserver): Promise<() => void>
   setSchema(schema: Record<string, APISchema>): void
   setMode(mode: TransportMode): void
   setToken(token: string | null): void
   close?(): void
+}
+
+/** Candidate static request entry; dynamic callers retain the explicit Transport API. */
+export interface GeneratedTransport extends Transport {
+  callGenerated<P extends RequestValues>(api: string, codec: RequestEncoder<P>, params?: P, options?: CallOptions): Promise<unknown>
+  subscribeGenerated<P extends RequestValues, T>(api: string, codec: RequestEncoder<P>, params: P | undefined, decode: (data: unknown) => T, onData: (data: T) => void, observer?: StreamObserver): Promise<() => void>
 }
 
 export interface CallOptions {
@@ -540,20 +542,38 @@ export class FetchTransport implements Transport {
   }
 
   setSchema(schema: Record<string, APISchema>): void {
-    this.jsonParams.setSchema(schema)
-    this.schema = schema
+    const snapshot = snapshotAPISchema(schema)
+    this.jsonParams.setSchema(snapshot)
+    this.schema = snapshot
   }
   setMode(mode: TransportMode): void { this.mode = mode }
   setToken(token: string | null): void {
     this.headers.setToken(token)
   }
 
-  call(api: string, params?: Record<string, unknown>, options?: CallOptions): Promise<unknown> {
+  call(api: string, params?: RequestParameters, options?: CallOptions): Promise<unknown> {
     if (!this.observer) return this.dispatch(api, params, options)
-    return this.callObserved(api, params, options)
+    return this.callObserved(api, this.mode, performance.now(), this.dispatch(api, params, options))
   }
 
-  private dispatch(api: string, params?: Record<string, unknown>, options?: CallOptions): Promise<unknown> {
+  callGenerated<P extends RequestValues>(api: string, codec: RequestEncoder<P>, params?: P, options?: CallOptions): Promise<unknown> {
+    if (!this.observer) return this.dispatchGenerated(api, codec, params, options)
+    return this.callObserved(api, this.mode, performance.now(), this.dispatchGenerated(api, codec, params, options))
+  }
+
+  private dispatchGenerated<P extends RequestValues>(api: string, codec: RequestEncoder<P>, params?: P, options?: CallOptions): Promise<unknown> {
+    try {
+      if (options?.signal?.aborted) throw new LuxoError('CancelledError', 0, 'request cancelled')
+      const body = prepareStaticBody(this.schema[api], this.mode, codec, params)
+      return body !== undefined
+        ? this.binaryCall(api, undefined, options, true, body)
+        : this.jsonCall(api, params, options)
+    } catch (error) {
+      return Promise.reject(error)
+    }
+  }
+
+  private dispatch(api: string, params?: RequestParameters, options?: CallOptions): Promise<unknown> {
     if (options?.signal?.aborted) {
       return Promise.reject(new LuxoError('CancelledError', 0, 'request cancelled'))
     }
@@ -562,11 +582,9 @@ export class FetchTransport implements Transport {
       : this.jsonCall(api, params, options)
   }
 
-  private async callObserved(api: string, params?: Record<string, unknown>, options?: CallOptions): Promise<unknown> {
-    const start = performance.now()
-    const mode = this.mode
+  private async callObserved(api: string, mode: TransportMode, start: number, pending: Promise<unknown>): Promise<unknown> {
     try {
-      const result = await this.dispatch(api, params, options)
+      const result = await pending
       notifyObserver(this.observer!, {
         api,
         mode,
@@ -590,7 +608,11 @@ export class FetchTransport implements Transport {
     }
   }
 
-  async subscribe<T>(_api: string, _params: Record<string, unknown>, _decode: (data: unknown) => T, _onData: (data: T) => void): Promise<() => void> {
+  async subscribe<T>(_api: string, _params: RequestParameters, _decode: (data: unknown) => T, _onData: (data: T) => void): Promise<() => void> {
+    throw new LuxoError('ConfigError', 0, 'subscriptions require a WebSocket endpoint')
+  }
+
+  async subscribeGenerated<P extends RequestValues, T>(_api: string, _codec: RequestEncoder<P>, _params: P | undefined, _decode: (data: unknown) => T, _onData: (data: T) => void): Promise<() => void> {
     throw new LuxoError('ConfigError', 0, 'subscriptions require a WebSocket endpoint')
   }
 
@@ -630,11 +652,11 @@ export class FetchTransport implements Transport {
 
   private async jsonCall(
     api: string,
-    params?: Record<string, unknown>,
+    params?: RequestParameters,
     options?: CallOptions,
     allowRefresh = true,
   ): Promise<unknown> {
-    const prepared = this.jsonParams.prepare(api, params)
+    const prepared = this.jsonParams.prepare(api, requestJSON(params))
     const body = { ...prepared, $api: api }
 
     const scope = await this.openRequest({
@@ -652,7 +674,10 @@ export class FetchTransport implements Transport {
         throw new LuxoError('ParseError', resp.status, `invalid JSON (HTTP ${resp.status})`)
       }
 
-      if (resp.status === 200 && !('error' in json)) return json.data
+      if (resp.status === 200 && !('error' in json)) {
+        if (!Object.hasOwn(json, 'data')) throw new LuxoError('ParseError', resp.status, 'missing JSON response data')
+        return json.data
+      }
       const error = jsonResponseError(json, resp.status)
       const refresh = this.refreshAfterUnauthorized(error, scope, allowRefresh)
       if (refresh) {
@@ -670,14 +695,15 @@ export class FetchTransport implements Transport {
 
   private async binaryCall(
     api: string,
-    params?: Record<string, unknown>,
+    params?: RequestParameters,
     options?: CallOptions,
     allowRefresh = true,
+    preparedBody?: ArrayBuffer | Uint8Array<ArrayBuffer>,
   ): Promise<unknown> {
     const scope = await this.openRequest({
       method: 'POST',
       headers: this.headers.binary,
-      body: this.encodeBinaryRequest(api, params),
+      body: preparedBody ?? this.encodeBinaryRequest(api, params),
     }, options?.signal)
     try {
       const data = await this.readBinaryResponse(scope)
@@ -688,7 +714,7 @@ export class FetchTransport implements Transport {
         const token = await refresh
         if (token) {
           this.setToken(token)
-          return this.binaryCall(api, params, options, false)
+          return this.binaryCall(api, params, options, false, preparedBody)
         }
       }
       throw error
@@ -707,10 +733,10 @@ export class FetchTransport implements Transport {
     return this.onTokenExpired()
   }
 
-  private encodeBinaryRequest(api: string, params?: Record<string, unknown>): ArrayBuffer {
+  private encodeBinaryRequest(api: string, params?: RequestParameters): ArrayBuffer {
     const meta = this.schema[api]
     if (!meta) throw new LuxoError('ConfigError', 0, `no schema for "${api}" — call setSchema() or use LuxoClient.create()`)
-	return toArrayBuffer(encodeBinaryBody(meta, params))
+    return encodeBinaryBody(meta, params).buffer
   }
 
   private async readBinaryResponse(scope: ResponseScope): Promise<Uint8Array> {
@@ -774,8 +800,9 @@ export class WsTransport implements Transport {
   }
 
   setSchema(schema: Record<string, APISchema>): void {
-    this.jsonParams.setSchema(schema)
-    this.schema = schema
+    const snapshot = snapshotAPISchema(schema)
+    this.jsonParams.setSchema(snapshot)
+    this.schema = snapshot
   }
   setMode(mode: TransportMode): void { this.mode = mode }
   setToken(token: string | null): void { this.token = token ?? undefined }
@@ -891,16 +918,19 @@ export class WsTransport implements Transport {
     return ws
   }
 
-  call(api: string, params?: Record<string, unknown>, options?: CallOptions): Promise<unknown> {
+  call(api: string, params?: RequestParameters, options?: CallOptions): Promise<unknown> {
     if (!this.observer) return this.dispatchCall(api, params, options)
-    return this.callObserved(api, params, options)
+    return this.callObserved(api, this.mode, performance.now(), this.dispatchCall(api, params, options))
   }
 
-  private async callObserved(api: string, params?: Record<string, unknown>, options?: CallOptions): Promise<unknown> {
-    const start = performance.now()
-    const mode = this.mode
+  callGenerated<P extends RequestValues>(api: string, codec: RequestEncoder<P>, params?: P, options?: CallOptions): Promise<unknown> {
+    if (!this.observer) return this.dispatchGeneratedCall(api, codec, params, options)
+    return this.callObserved(api, this.mode, performance.now(), this.dispatchGeneratedCall(api, codec, params, options))
+  }
+
+  private async callObserved(api: string, mode: TransportMode, start: number, pending: Promise<unknown>): Promise<unknown> {
     try {
-      const result = await this.dispatchCall(api, params, options)
+      const result = await pending
       notifyObserver(this.observer!, {
         api,
         mode,
@@ -924,12 +954,20 @@ export class WsTransport implements Transport {
     }
   }
 
-  private async dispatchCall(api: string, params?: Record<string, unknown>, options?: CallOptions): Promise<unknown> {
+  private async dispatchCall(api: string, params?: RequestParameters, options?: CallOptions): Promise<unknown> {
     if (options?.signal?.aborted) throw new LuxoError('CancelledError', 0, 'request cancelled')
     await this.connect()
     if (options?.signal?.aborted) throw new LuxoError('CancelledError', 0, 'request cancelled')
     const id = this.nextRequestID()
     return this.createPendingCall(id, api, params, options?.signal)
+  }
+
+  private async dispatchGeneratedCall<P extends RequestValues>(api: string, codec: RequestEncoder<P>, params?: P, options?: CallOptions): Promise<unknown> {
+    if (options?.signal?.aborted) throw new LuxoError('CancelledError', 0, 'request cancelled')
+    await this.connect()
+    if (options?.signal?.aborted) throw new LuxoError('CancelledError', 0, 'request cancelled')
+    const body = prepareStaticBody(this.schema[api], this.mode, codec, params)
+    return this.createPendingCall(this.nextRequestID(), api, params, options?.signal, body)
   }
 
   private nextRequestID(): UInt64 {
@@ -942,8 +980,9 @@ export class WsTransport implements Transport {
   private createPendingCall(
     id: UInt64,
     api: string,
-    params: Record<string, unknown> | undefined,
+    params: RequestParameters | undefined,
     signal: AbortSignal | undefined,
+    preparedBody?: Uint8Array<ArrayBuffer>,
   ): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -964,7 +1003,7 @@ export class WsTransport implements Transport {
       this.pending.set(id, { resolve, reject, cleanup })
       if (signal?.aborted) { cancel(); return }
       try {
-        this.sendCall(id, api, params)
+        this.sendCall(id, api, params, preparedBody)
       } catch (error) {
         this.pending.delete(id)
         cleanup()
@@ -973,10 +1012,10 @@ export class WsTransport implements Transport {
     })
   }
 
-  private sendCall(id: UInt64, api: string, params?: Record<string, unknown>): void {
+  private sendCall(id: UInt64, api: string, params?: RequestParameters, preparedBody?: Uint8Array<ArrayBuffer>): void {
     const ws = this.requireSocket()
     if (this.mode !== 'binary') {
-      const prepared = this.jsonParams.prepare(api, params)
+      const prepared = this.jsonParams.prepare(api, requestJSON(params))
       ws.send(encodeLuxoJSON({ ...prepared, $id: id, $api: api }))
       return
     }
@@ -985,12 +1024,22 @@ export class WsTransport implements Transport {
     const enc = new Encoder()
 	enc.writeRawBytes(new Uint8Array([BinaryFrame.callRequest]))
     enc.writeUint64(id)
-	enc.writeRawBytes(encodeBinaryBody(meta, params))
-    ws.send(toArrayBuffer(enc.bytes()))
+	enc.writeRawBytes(preparedBody ?? encodeBinaryBody(meta, params))
+    ws.send(enc.bytes().buffer)
   }
 
-  async subscribe<T>(api: string, params: Record<string, unknown>, decode: (data: unknown) => T, onData: (data: T) => void, observer?: StreamObserver): Promise<() => void> {
+  async subscribe<T>(api: string, params: RequestParameters, decode: (data: unknown) => T, onData: (data: T) => void, observer?: StreamObserver): Promise<() => void> {
     await this.connect()
+    return this.startSubscription(api, params, decode, onData, observer)
+  }
+
+  async subscribeGenerated<P extends RequestValues, T>(api: string, codec: RequestEncoder<P>, params: P | undefined, decode: (data: unknown) => T, onData: (data: T) => void, observer?: StreamObserver): Promise<() => void> {
+    await this.connect()
+    const body = prepareStaticBody(this.schema[api], this.mode, codec, params)
+    return this.startSubscription(api, params, decode, onData, observer, body)
+  }
+
+  private startSubscription<T>(api: string, params: RequestParameters | undefined, decode: (data: unknown) => T, onData: (data: T) => void, observer?: StreamObserver, preparedBody?: Uint8Array<ArrayBuffer>): Promise<() => void> {
     const id = this.nextRequestID()
     const subscription: WSSubscription = {
       observer, mode: this.mode,
@@ -1012,7 +1061,7 @@ export class WsTransport implements Transport {
       subscription.acknowledgement = { resolve, reject, cleanup: () => clearTimeout(timeout) }
       this.subscriptions.set(id, subscription)
       try {
-        this.sendSubscription(id, api, params, subscription.mode)
+        this.sendSubscription(id, api, params, subscription.mode, preparedBody)
       } catch (error) {
         this.subscriptions.delete(id)
         subscription.acknowledgement.cleanup()
@@ -1031,13 +1080,13 @@ export class WsTransport implements Transport {
       const enc = new Encoder()
       enc.writeRawBytes(new Uint8Array([BinaryFrame.unsubscribe]))
       enc.writeUint64(id)
-      this.ws.send(toArrayBuffer(enc.bytes()))
+      this.ws.send(enc.bytes().buffer)
       return
     }
     this.ws.send(encodeLuxoJSON({ $unsub: id }))
   }
 
-  private sendSubscription(id: UInt64, api: string, params: Record<string, unknown>, mode: TransportMode): void {
+  private sendSubscription(id: UInt64, api: string, params: RequestParameters | undefined, mode: TransportMode, preparedBody?: Uint8Array<ArrayBuffer>): void {
     const ws = this.requireSocket()
     if (mode === 'binary') {
       const meta = this.schema[api]
@@ -1045,11 +1094,11 @@ export class WsTransport implements Transport {
       const enc = new Encoder()
 	  enc.writeRawBytes(new Uint8Array([BinaryFrame.subscribe]))
 	  enc.writeUint64(id)
-	  enc.writeRawBytes(encodeBinaryBody(meta, params))
-      ws.send(toArrayBuffer(enc.bytes()))
+	  enc.writeRawBytes(preparedBody ?? encodeBinaryBody(meta, params))
+      ws.send(enc.bytes().buffer)
       return
     }
-    const prepared = this.jsonParams.prepare(api, params)
+    const prepared = this.jsonParams.prepare(api, requestJSON(params))
     ws.send(encodeLuxoJSON({ ...prepared, $id: id, $sub: api }))
   }
 
@@ -1078,6 +1127,13 @@ export class WsTransport implements Transport {
     if ('$stream' in json) {
       const id = jsonUint64(json.$stream)
       if (id === undefined) return
+      if (!Object.hasOwn(json, 'data')) {
+        const subscription = this.subscriptions.get(id)
+        if (subscription?.mode === 'json' && !subscription.acknowledgement) {
+          this.failSubscription(id, subscription, new LuxoError('ParseError', 0, 'missing JSON response data'))
+        }
+        return
+      }
       this.deliverSubscription(id, 'json', json.data)
       return
     }
@@ -1088,7 +1144,8 @@ export class WsTransport implements Transport {
     this.pending.delete(id)
     p.cleanup()
     if ('error' in json) p.reject(jsonResponseError(json))
-    else p.resolve(json.data)
+    else if (Object.hasOwn(json, 'data')) p.resolve(json.data)
+    else p.reject(new LuxoError('ParseError', 0, 'missing JSON response data'))
   }
 
   private handleJSONStreamEnd(json: Record<string, unknown>): void {
@@ -1147,8 +1204,12 @@ export class WsTransport implements Transport {
   }
 
   private failSubscriptionDecoding(id: UInt64, subscription: WSSubscription, cause: unknown): void {
-    if (this.subscriptions.get(id) !== subscription) return
     const error = new LuxoError('DecodeError', 0, cause instanceof Error ? cause.message : 'invalid subscription response')
+    this.failSubscription(id, subscription, error)
+  }
+
+  private failSubscription(id: UInt64, subscription: WSSubscription, error: LuxoError): void {
+    if (this.subscriptions.get(id) !== subscription) return
     // Local retirement is authoritative even if the advisory cancellation cannot be sent.
     try { this.unsubscribe(id) } catch { /* Connection events own transport failure notification. */ }
     subscription.observer?.onError?.(error)

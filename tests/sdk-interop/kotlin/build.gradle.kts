@@ -12,14 +12,15 @@ repositories {
 
 val codegenRuntime = configurations.create("codegenRuntime")
 dependencies {
-    implementation("com.luxo:luxo-client:0.1.0")
-    codegenRuntime("com.luxo:luxo-client:0.1.0")
+    implementation("com.luxo:luxo-client:1.0.0-beta.1")
+    codegenRuntime("com.luxo:luxo-client:1.0.0-beta.1")
 }
 
 val scratch = providers.environmentVariable("LUXO_INTEROP_SCRATCH").map { file(it) }
 layout.buildDirectory.set(layout.dir(scratch).map { it.dir("kotlin-build") })
 val generated = layout.buildDirectory.dir("generated")
 val endpoint = providers.environmentVariable("LUXO_INTEROP_ENDPOINT")
+val schemaEndpoint = providers.environmentVariable("LUXO_INTEROP_SCHEMA_ENDPOINT").orElse(endpoint)
 
 java {
     sourceCompatibility = JavaVersion.VERSION_1_8
@@ -36,8 +37,8 @@ kotlin {
 val generateClient = tasks.register<JavaExec>("generateClient") {
     classpath = codegenRuntime
     mainClass.set("com.luxo.client.LuxoCodegenCli")
-    args(endpoint.get(), generated.get().asFile.absolutePath, "com.luxo.interop")
-    inputs.property("endpoint", endpoint)
+    args(schemaEndpoint.get(), generated.get().asFile.absolutePath, "com.luxo.interop")
+    inputs.property("endpoint", schemaEndpoint)
     outputs.dir(generated)
 }
 

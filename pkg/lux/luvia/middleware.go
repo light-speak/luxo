@@ -13,69 +13,9 @@ type bearerTokenCtxKey struct{}
 
 var identityKey identityCtxKey
 
-// Claims wraps JWT claims data with type-safe accessors.
+// Claims exposes the same immutable, exact identity used by JWT verification.
 // This is the `my` keyword in Luxo — access the current user's data.
-type Claims struct {
-	data map[string]any
-}
-
-// ID returns the "id" claim as int64. Returns 0 if missing or wrong type.
-func (c *Claims) ID() int64 {
-	return c.Int("id")
-}
-
-// String returns a string claim by key. Returns "" if missing or wrong type.
-func (c *Claims) String(key string) string {
-	if v, ok := c.data[key].(string); ok {
-		return v
-	}
-	return ""
-}
-
-// Int returns an integer claim by key. Returns 0 if missing or wrong type.
-// Handles both int64 and float64 (JSON numbers decode as float64).
-func (c *Claims) Int(key string) int64 {
-	switch v := c.data[key].(type) {
-	case float64:
-		return int64(v)
-	case int64:
-		return v
-	}
-	return 0
-}
-
-// Float returns a float64 claim by key. Returns 0 if missing or wrong type.
-func (c *Claims) Float(key string) float64 {
-	switch v := c.data[key].(type) {
-	case float64:
-		return v
-	case int64:
-		return float64(v)
-	}
-	return 0
-}
-
-// Bool returns a boolean claim by key. Returns false if missing or wrong type.
-func (c *Claims) Bool(key string) bool {
-	v, _ := c.data[key].(bool)
-	return v
-}
-
-// Has reports whether a claim key exists.
-func (c *Claims) Has(key string) bool {
-	_, ok := c.data[key]
-	return ok
-}
-
-// Get returns a claim value by key. Returns nil if missing.
-func (c *Claims) Get(key string) any {
-	return c.data[key]
-}
-
-// Raw returns the underlying map for cases requiring direct access.
-func (c *Claims) Raw() map[string]any {
-	return c.data
-}
+type Claims = auth.Claims
 
 // Identity returns the authenticated user's claims from context.
 // Returns nil if no valid JWT was present on the request.
@@ -106,7 +46,7 @@ func AuthMiddleware(cfg *auth.Config, next http.Handler) http.Handler {
 			// requests; the cache removes HMAC + JSON decode from the hot path.
 			data, err := auth.VerifyCached(cfg, token)
 			if err == nil {
-				ctx := context.WithValue(r.Context(), identityKey, &Claims{data: data})
+				ctx := context.WithValue(r.Context(), identityKey, &data)
 				ctx = context.WithValue(ctx, bearerTokenCtxKey{}, token)
 				r = r.WithContext(ctx)
 			}

@@ -1,14 +1,10 @@
 import { LuxoClient } from './client.js'
 import { decodeJSONTextValues } from './types.js'
 import { decodeLuxoJSON, encodeLuxoJSON } from '@luxojs/client'
-import type { Transport } from '@luxojs/client'
+import { responseTransport } from './response-transport.js'
 
 let response: unknown
-const transport: Transport = {
-  async call() { return response },
-  async subscribe() { throw new Error('Unexpected subscription') },
-  setSchema() {}, setMode() {}, setToken() {},
-}
+const transport = responseTransport(() => response, () => { throw new Error('Unexpected subscription') })
 const client = new LuxoClient(transport)
 const failures: string[] = []
 

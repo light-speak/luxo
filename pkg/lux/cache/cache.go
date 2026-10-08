@@ -1,5 +1,5 @@
 // Package cache provides a pluggable caching layer for @cache directive.
-// Default implementation is in-memory with TTL. Redis backend available.
+// Memory and Redis backends must be selected explicitly by the application.
 package cache
 
 import (
@@ -10,7 +10,8 @@ import (
 
 // Cache is the pluggable cache interface used by @cache directive.
 // Implementations must be safe for concurrent use.
-// All methods are best-effort: cache failures should not break the application.
+// Backends return failures instead of disguising them as misses. The caller
+// owns timeout, observability and failure policy; storage does not log secrets.
 type Cache interface {
 	// Get returns cached data for the key. Returns nil, nil on cache miss.
 	Get(ctx context.Context, key string) ([]byte, error)
@@ -18,7 +19,8 @@ type Cache interface {
 	Set(ctx context.Context, key string, value []byte, ttl time.Duration) error
 	// Del removes specific keys.
 	Del(ctx context.Context, keys ...string) error
-	// Invalidate removes all keys matching a prefix (e.g., "luxo:api:getUser:").
+	// Invalidate removes keys under a literal prefix (e.g., "luxo:api:getUser:").
+	// It is a maintenance operation, not a barrier against concurrent fills.
 	Invalidate(ctx context.Context, prefix string) error
 	// Close releases resources.
 	Close() error
@@ -100,6 +102,8 @@ func (c *MemoryCache) Invalidate(_ context.Context, prefix string) error {
 
 // Close stops the background cleanup goroutine.
 func (c *MemoryCache) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	select {
 	case <-c.closeCh:
 		// Already closed.

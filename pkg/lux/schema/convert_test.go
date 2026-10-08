@@ -860,6 +860,9 @@ func TestUUIDRoundTrip(t *testing.T) {
 	if out := appendUUIDString(nil, u); string(out) != `"`+s+`"` {
 		t.Errorf("round trip mismatch: %s", out)
 	}
+	if upper, valid := parseUUID(strings.ToUpper(s)); !valid || upper != u {
+		t.Fatal("uppercase UUID did not preserve its value")
+	}
 	if _, ok := parseUUID("too-short"); ok {
 		t.Error("should reject wrong length")
 	}
@@ -995,19 +998,59 @@ func TestBinaryListToJSON_NullableBoolColumn(t *testing.T) {
 	}
 	s.RegisterModel(m)
 
-	tr := true
+	tr, fl := true, false
 	var w codec.ColumnarWriter
-	w.SetCount(2)
-	w.WriteColumnBoolPtr(1, []*bool{&tr, nil})
+	w.SetCount(3)
+	w.WriteColumnBoolPtr(1, []*bool{&tr, nil, &fl})
 	data := testutil.Bytes(t)(w.Bytes())
 
 	result := checkedJSON(t)(BinaryListToJSON(nil, data, m))
 	got := string(result)
-	if !strings.Contains(got, "true") {
-		t.Errorf("missing bool value: %s", got)
+	if got != `[{"active":true},{"active":null},{"active":false}]` {
+		t.Errorf("nullable bool states changed: %s", got)
 	}
-	if !strings.Contains(got, "null") {
-		t.Errorf("missing null: %s", got)
+}
+
+func TestBinaryToJSON_UUIDFieldAndTruncatedBytes(t *testing.T) {
+	s := New()
+	m := &Model{Name: "File", Fields: []Field{
+		{ID: 1, Name: "id", Type: FieldUUID},
+		{ID: 2, Name: "data", Type: FieldBytes},
+	}}
+	if err := s.RegisterModel(m); err != nil {
+		t.Fatal(err)
+	}
+	var enc codec.Encoder
+	enc.WriteFieldUUID(1, [16]byte{})
+	enc.WriteEnd()
+	got := string(checkedJSON(t)(BinaryToJSON(nil, withArenaHeader(enc.Bytes()), m)))
+	if got != `{"id":"00000000-0000-0000-0000-000000000000"}` {
+		t.Fatalf("UUID field = %s", got)
+	}
+	if _, err := BinaryToJSON(nil, withArenaHeader([]byte{2, 3, 'x'}), m); err == nil {
+		t.Fatal("truncated bytes field produced a successful JSON response")
+	}
+}
+
+func TestBinaryListToJSON_UUIDColumns(t *testing.T) {
+	s := New()
+	m := &Model{Name: "Identifiers", Fields: []Field{
+		{ID: 1, Name: "id", Type: FieldUUID},
+		{ID: 2, Name: "parent", Type: FieldUUID, Nullable: true},
+	}}
+	if err := s.RegisterModel(m); err != nil {
+		t.Fatal(err)
+	}
+	value := [16]byte{0x53, 0x1f, 0x2d, 0, 0x20, 0xe5, 0x47, 0xf2, 0xb8, 0x74, 0x22, 0xb6, 0xfc, 0x76, 0x32, 0x8b}
+	var writer codec.ColumnarWriter
+	writer.SetCount(2)
+	writer.WriteColumnUUID(1, [][16]byte{value, {}})
+	writer.WriteColumnUUIDPtr(2, []*[16]byte{&value, nil})
+	data := testutil.Bytes(t)(writer.Bytes())
+	got := string(checkedJSON(t)(BinaryListToJSON(nil, data, m)))
+	want := `[{"id":"531f2d00-20e5-47f2-b874-22b6fc76328b","parent":"531f2d00-20e5-47f2-b874-22b6fc76328b"},{"id":"00000000-0000-0000-0000-000000000000","parent":null}]`
+	if got != want {
+		t.Fatalf("UUID columns = %s, want %s", got, want)
 	}
 }
 
@@ -1078,10 +1121,11 @@ func TestAppendArrayFieldJSON_AllTypes(t *testing.T) {
 			return c
 		}, `[1000000]`},
 		{"DateTime", FieldDateTime, func() []byte {
-			c := codec.AppendArrayHeader(nil, 1)
+			c := codec.AppendArrayHeader(nil, 2)
 			c = testutil.Bytes(t)(codec.AppendDateTime(c, time.Unix(1776427200, 0))) // 2026-04-17T12:00:00Z
+			c = testutil.Bytes(t)(codec.AppendDateTime(c, time.Unix(-1, 123456789)))
 			return c
-		}, `["2026-04-17T12:00:00Z"]`},
+		}, `["2026-04-17T12:00:00Z","1969-12-31T23:59:59.123456789Z"]`},
 		{"Float", FieldFloat, func() []byte {
 			c := codec.AppendArrayHeader(nil, 2)
 			c = binary.LittleEndian.AppendUint64(c, math.Float64bits(1.5))
@@ -1096,15 +1140,17 @@ func TestAppendArrayFieldJSON_AllTypes(t *testing.T) {
 			return c
 		}, `[true,false,true]`},
 		{"UUID", FieldUUID, func() []byte {
-			c := codec.AppendArrayHeader(nil, 1)
+			c := codec.AppendArrayHeader(nil, 2)
 			c = codec.AppendUUID(c, [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00})
+			c = codec.AppendUUID(c, [16]byte{})
 			return c
-		}, `["550e8400-e29b-41d4-a716-446655440000"]`},
+		}, `["550e8400-e29b-41d4-a716-446655440000","00000000-0000-0000-0000-000000000000"]`},
 		{"Bytes", FieldBytes, func() []byte {
-			c := codec.AppendArrayHeader(nil, 1)
+			c := codec.AppendArrayHeader(nil, 2)
 			c = codec.AppendBytes(c, []byte{0xff, 0x00})
+			c = codec.AppendBytes(c, nil)
 			return c
-		}, `["/wA="]`},
+		}, `["/wA=",""]`},
 		{"Enum", FieldEnum, func() []byte {
 			c := codec.AppendArrayHeader(nil, 2)
 			c = codec.AppendBytes(c, []byte("ADMIN"))
@@ -1159,9 +1205,15 @@ func TestAppendNullableFieldJSONAllWireTypes(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			data := codec.AppendVarint(nil, 1)
 			data = test.append(data)
-			got := appendNullableFieldJSON(nil, codec.NewDecoder(data), &Field{Type: test.field, Nullable: true})
-			if string(got) != test.want {
-				t.Fatalf("nullable %s = %s, want %s", test.name, got, test.want)
+			dec := codec.NewDecoder(data)
+			got := appendNullableFieldJSON(nil, dec, &Field{Type: test.field, Nullable: true})
+			if string(got) != test.want || dec.Finish() != nil {
+				t.Fatalf("nullable %s = %s, want %s, err=%v", test.name, got, test.want, dec.Err())
+			}
+			dec = codec.NewDecoder([]byte{0})
+			got = appendNullableFieldJSON(nil, dec, &Field{Type: test.field, Nullable: true})
+			if string(got) != "null" || dec.Finish() != nil {
+				t.Fatalf("null %s = %s, err=%v", test.name, got, dec.Err())
 			}
 		})
 	}

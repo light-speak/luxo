@@ -2,6 +2,7 @@ package app
 
 import com.luxo.client.*
 import com.luxo.generated.LuxoClient
+import com.luxo.generated.Role
 import com.luxo.generated.decodeColumnarTextRecord
 import com.luxo.generated.decodeTextRecord
 import com.luxo.generated.decodeJSONTextRecord
@@ -13,7 +14,15 @@ internal class ResponseTransport : Transport {
     var response: Any = JsonNull
     var callback: (Any) -> Unit = {}
     var observer: StreamObserver? = null
-    override suspend fun call(api: String, params: Map<String, Any?>): Any = response
+    var params: Map<String, Any?> = emptyMap()
+    override suspend fun call(api: String, params: Map<String, Any?>): Any {
+        this.params = params
+        return response
+    }
+    override suspend fun call(api: String, request: GeneratedRequest): Any = call(api, request.toJSONParameters())
+    override suspend fun <T> subscribe(api: String, decoder: (Any) -> T, request: GeneratedRequest,
+        observer: StreamObserver?, handler: (T) -> Unit): () -> Unit =
+        subscribe(api, decoder, request.toJSONParameters(), observer, handler)
     override suspend fun <T> subscribe(api: String, decoder: (Any) -> T, params: Map<String, Any?>, observer: StreamObserver?, handler: (T) -> Unit): () -> Unit {
         callback = { data -> handler(decoder(data)) }
         this.observer = observer
@@ -59,6 +68,7 @@ private fun scalarResponses(): List<ScalarResponse> = listOf(
 )
 
 suspend fun verifyScalarResponses() {
+    verifyEnums()
     verifyStreamObserver()
     verifyJSONKinds()
     verifyUnicodeResponses()
@@ -248,6 +258,7 @@ private fun normalized(value: Any?): JsonElement = when (value) {
     is JsonElement -> value
     is ByteArray -> JsonPrimitive(Base64.getEncoder().encodeToString(value))
     is String -> JsonPrimitive(value)
+    is Role -> JsonPrimitive(value.rawValue)
     is Boolean -> JsonPrimitive(value)
     is Number -> JsonPrimitive(value)
     is List<*> -> JsonArray(value.map { normalized(it) })

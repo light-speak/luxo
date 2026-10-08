@@ -68,7 +68,11 @@ func (w *ColumnarWriter) appendColumn(fieldID, rows int, data []byte) {
 
 // WriteColumnInt writes a full int64 column for all records.
 func (w *ColumnarWriter) WriteColumnInt(fieldID int, values []int64) {
+	// One byte per value is the lower bound; avoid tiny growth for wide varints.
 	var data []byte
+	if len(values) > 0 {
+		data = make([]byte, 0, (len(values)+7)&^7)
+	}
 	for _, v := range values {
 		data = AppendSvarint(data, v)
 	}
@@ -77,11 +81,18 @@ func (w *ColumnarWriter) WriteColumnInt(fieldID int, values []int64) {
 
 // WriteColumnFloat writes a full float64 column.
 func (w *ColumnarWriter) WriteColumnFloat(fieldID int, values []float64) error {
-	var data []byte
+	if len(values) == 0 {
+		w.appendColumn(fieldID, 0, nil)
+		return nil
+	}
 	for _, v := range values {
 		if !IsFiniteFloat(v) {
 			return ErrNonFiniteFloat
 		}
+	}
+	// Validate before reserving the payload, including invalid values near the end.
+	data := make([]byte, 0, len(values)*8)
+	for _, v := range values {
 		data = appendFixed64(data, v)
 	}
 	w.appendColumn(fieldID, len(values), data)
@@ -107,6 +118,9 @@ func (w *ColumnarWriter) WriteColumnString(fieldID int, values []string) error {
 // WriteColumnBool writes a full boolean column.
 func (w *ColumnarWriter) WriteColumnBool(fieldID int, values []bool) {
 	var data []byte
+	if len(values) > 0 {
+		data = make([]byte, 0, len(values))
+	}
 	for _, v := range values {
 		data = AppendBool(data, v)
 	}
@@ -226,6 +240,9 @@ func (w *ColumnarWriter) WriteColumnBytesNullable(fieldID int, values [][]byte) 
 // WriteColumnUUID writes a full UUID column (fixed 16-byte values).
 func (w *ColumnarWriter) WriteColumnUUID(fieldID int, values [][16]byte) {
 	var data []byte
+	if len(values) > 0 {
+		data = make([]byte, 0, len(values)*16)
+	}
 	for _, v := range values {
 		data = AppendUUID(data, v)
 	}

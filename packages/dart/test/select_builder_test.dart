@@ -123,7 +123,7 @@ Future<void> page(primary.LuxoClient first, secondary.LuxoClient second) async {
     },
   );
 
-  test('generated client consumes inferred selections and preserves explicit overrides', () async {
+  test('generated client ignores API-wide hints and uses injected call-site selections', () async {
     final fixture = await SelectFixture.create({
       'lib/label.dart': '''
 import 'src/luxo/client.dart';
@@ -150,7 +150,17 @@ Future<String> identifier(LuxoClient client) async {
       await File('${fixture.root.path}/${entry.key.path}')
           .writeAsString(entry.value);
     }
-    await fixture.runDart(['bin/verify.dart']);
+    final generated = await File(
+      '${fixture.root.path}/lib/src/luxo/client.dart',
+    ).readAsString();
+    expect(generated, isNot(contains('selectHints')));
+    await fixture.runDart([
+      File('bin/build.dart').absolute.path,
+      '--project',
+      fixture.root.path,
+      '--entry',
+      'bin/verify.dart',
+    ]);
   });
 }
 

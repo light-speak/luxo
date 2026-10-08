@@ -26,7 +26,7 @@ func TestResolverAliasesShareOneEndpoint(t *testing.T) {
 	if !strings.Contains(source.String(), `req.ParamInt("shape")`) {
 		t.Fatal("missing explicit result shape")
 	}
-	apis := g.collectSchemaAPIs(result, nil, map[string]string{"User": "user", "Post": "post"}, nil)
+	apis := g.collectSchemaAPIs(result, nil)
 	count := 0
 	for _, api := range apis {
 		if api.name != "svc:resolve:Post:userId" {
@@ -99,10 +99,12 @@ func TestGeneratedResolverNullableForeignKey(t *testing.T) {
 	g.generateReadColumnar(&source, post, nil)
 	generateResolveGroupWriter(&source, resolveEndpoint{modelName: "Post", fkField: "userId", keyGoType: "int64", fkNullable: true})
 	runGeneratedProtocolPackage(t, source.String(), `package generated
-import ("testing"; "github.com/light-speak/luxo/pkg/lux/api"; "github.com/light-speak/luxo/pkg/lux/codec"; "github.com/light-speak/luxo/pkg/lux/luvia")
+import (
+"github.com/light-speak/luxo/internal/testutil"
+"testing"; "github.com/light-speak/luxo/pkg/lux/api"; "github.com/light-speak/luxo/pkg/lux/codec"; "github.com/light-speak/luxo/pkg/lux/luvia")
 func TestNullableForeignKey(t *testing.T) {
 	key:=int64(9)
-	req:=&api.Request{Buf:&api.ResponseBuf{},FieldMask:codec.AppendSelectionMask(nil,codec.FieldMaskSet(nil,1),nil)}
+	req:=&api.Request{Buf:&api.ResponseBuf{},FieldMask:testutil.Bytes(t)(codec.AppendSelectionMask(nil,testutil.Bytes(t)(codec.FieldMaskSet(nil,1)),nil))}
 	rows:=[]*Post{{Id:1},{Id:2,UserId:&key}}
 	if err:=writeResolvePostByUserIdGroups(req,[]int64{9,0},rows,1); err!=nil { t.Fatal(err) }
 	groups:=luvia.ParseGroupedResponse(req.Buf.B,false)
@@ -120,6 +122,8 @@ func TestNullableForeignKey(t *testing.T) {
 
 const resolverGroupAssertions = `package generated
 import (
+"github.com/light-speak/luxo/internal/testutil"
+
     "bytes"
     "math"
     "testing"
@@ -132,7 +136,7 @@ func TestCanonicalGroups(t *testing.T) {
         for _, count := range []int{0,1,2} {
             rows := make([]*Post,count)
             for i := range rows { rows[i] = &Post{Id: math.MaxInt64-int64(i), UserId: math.MinInt64, Amount: -0.5} }
-            req := &api.Request{Buf: &api.ResponseBuf{B: []byte{0x77}}, FieldMask: codec.AppendSelectionMask(nil, codec.FieldMaskSet(nil, 1), nil)}
+            req := &api.Request{Buf: &api.ResponseBuf{B: []byte{0x77}}, FieldMask: testutil.Bytes(t)(codec.AppendSelectionMask(nil, testutil.Bytes(t)(codec.FieldMaskSet(nil, 1)), nil))}
             err := writeResolvePostByUserIdGroups(req, []int64{math.MinInt64,math.MinInt64}, rows, shape)
             invalid := shape&1 == 0 && (count > 1 || count == 0 && shape&2 == 0)
             if invalid {

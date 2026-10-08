@@ -1,9 +1,9 @@
 package parser
 
 import (
-	"os"
 	"testing"
 
+	"github.com/light-speak/luxo/internal/testutil"
 	"github.com/light-speak/luxo/pkg/lexer"
 	"github.com/light-speak/luxo/pkg/token"
 )
@@ -111,13 +111,9 @@ func BenchmarkParseExpr(b *testing.B) {
 	}
 }
 
-// BenchmarkParseDemoFile measures parsing of the full demo.luxo file.
+// BenchmarkParseDemoFile measures parsing of the immutable V1 corpus.
 func BenchmarkParseDemoFile(b *testing.B) {
-	data, err := os.ReadFile("../../editors/vscode/examples/demo.luxo")
-	if err != nil {
-		b.Skipf("demo.luxo not found: %v", err)
-	}
-	src := string(data)
+	src := testutil.CompilerDemoV1()
 	tokens := tokenize(b, src)
 	b.ReportAllocs()
 	b.ResetTimer()

@@ -19,7 +19,11 @@ func finiteFloatWriterSource(declaration string) string {
 	return scalarWriterSource(declaration, "Float", "float64")
 }
 
-func scalarWriterSource(declaration, scalar, goType string) string {
+func scalarWriterSource(declaration, scalar, goType string, enumSets ...map[string]bool) string {
+	var enums map[string]bool
+	if len(enumSets) > 0 {
+		enums = enumSets[0]
+	}
 	child := &ast.ModelDecl{Name: "Child", Fields: []*ast.FieldDecl{
 		{Name: "value", Type: &ast.TypeRef{Name: scalar}},
 	}}
@@ -37,16 +41,23 @@ func scalarWriterSource(declaration, scalar, goType string) string {
 	})
 	var source strings.Builder
 	source.WriteString("package generated\nimport (\"github.com/light-speak/luxo/pkg/lux/api\"; \"github.com/light-speak/luxo/pkg/lux/codec\")\n")
-	writeArrayFixtureDeclaration(&source, g, child, nil, declaration)
-	if declaration == "model" {
-		g.generateModelWriteColumnar(&source, child, nil, "WriteColumnarChildValues", "[]Child")
+	if enums[scalar] {
+		generateEnum(&source, &ast.EnumDecl{Name: scalar, Values: []string{"OPEN", "CLOSED"}})
 	}
-	writeArrayFixtureDeclaration(&source, g, parent, nil, declaration)
-	writeScalarHandlers(&source, parent, declaration, scalar, goType)
+	writeArrayFixtureDeclaration(&source, g, child, enums, declaration)
+	if declaration == "model" {
+		g.generateModelWriteColumnar(&source, child, enums, "WriteColumnarChildValues", "[]Child")
+	}
+	writeArrayFixtureDeclaration(&source, g, parent, enums, declaration)
+	writeScalarHandlers(&source, parent, declaration, scalar, goType, enums)
 	return source.String()
 }
 
-func writeScalarHandlers(source *strings.Builder, model *ast.ModelDecl, declaration, scalar, scalarGoType string) {
+func writeScalarHandlers(source *strings.Builder, model *ast.ModelDecl, declaration, scalar, scalarGoType string, enumSets ...map[string]bool) {
+	var enums map[string]bool
+	if len(enumSets) > 0 {
+		enums = enumSets[0]
+	}
 	for _, kind := range []string{"Native", "Compiled"} {
 		for _, list := range []bool{false, true} {
 			name, goType := kind, scalarGoType
@@ -56,9 +67,10 @@ func writeScalarHandlers(source *strings.Builder, model *ast.ModelDecl, declarat
 			source.WriteString("func encode" + name + "(req *api.Request, result " + goType + ") error {\n")
 			ref := &ast.TypeRef{Name: scalar, IsList: list}
 			if kind == "Native" {
-				writeNativeReturnEncoding(source, ref, nil, nil)
+				writeNativeReturnEncoding(source, ref, nil, enums)
 			} else {
 				c := newCompiler(nil)
+				c.enums = enums
 				c.b, c.api.ReturnType = source, ref
 				c.writeScalarReturn("result")
 			}
@@ -77,6 +89,8 @@ func writeScalarHandlers(source *strings.Builder, model *ast.ModelDecl, declarat
 
 const finiteFloatWriterAssertions = `package generated
 import (
+"github.com/light-speak/luxo/internal/testutil"
+
     "errors"
     "math"
     "testing"
@@ -84,10 +98,10 @@ import (
     "github.com/light-speak/luxo/pkg/lux/codec"
 )
 
-func floatMask(ids ...int) []byte {
+func floatMask(t testing.TB, ids ...int) []byte {
     var fields []byte
-    for _, id := range ids { fields = codec.FieldMaskSet(fields, id) }
-    return codec.AppendSelectionMask(nil, fields, nil)
+    for _, id := range ids { fields = testutil.Bytes(t)(codec.FieldMaskSet(fields, id)) }
+    return testutil.Bytes(t)(codec.AppendSelectionMask(nil, fields, nil))
 }
 
 func TestRejectSelectedNonFinite(t *testing.T) {
@@ -98,7 +112,7 @@ func TestRejectSelectedNonFinite(t *testing.T) {
             {Children: []Child{{Value: 1}, {Value: value}}},
         }
         for i, payload := range payloads {
-            mask := floatMask(i+1)
+            mask := floatMask(t, i+1)
             for _, write := range []func(*api.ResponseBuf) error{
                 func(buf *api.ResponseBuf) error { return payload.WriteLuxo(buf, mask) },
                 func(buf *api.ResponseBuf) error { return WriteColumnarPayload(buf, []Payload{{Child: &Child{}}, payload}, mask) },
@@ -109,8 +123,8 @@ func TestRejectSelectedNonFinite(t *testing.T) {
                 }
             }
             // Selecting a different field must not inspect the invalid value.
-            skip := floatMask(1)
-            if i == 0 { skip = floatMask(2) }
+            skip := floatMask(t, 1)
+            if i == 0 { skip = floatMask(t, 2) }
             if err := payload.WriteLuxo(&api.ResponseBuf{}, skip); err != nil { t.Fatal(err) }
             if err := WriteColumnarPayload(&api.ResponseBuf{}, []Payload{payload}, skip); err != nil { t.Fatal(err) }
         }
@@ -122,7 +136,7 @@ func TestFiniteBitsAndEmptyColumns(t *testing.T) {
         value := math.Float64frombits(bits)
         payload := Payload{Value: value, Optional: &value, Values: []float64{value}, OptionalValues: []float64{value}}
         buf := &api.ResponseBuf{}
-        if err := payload.WriteLuxo(buf, floatMask(1,2,3,4)); err != nil { t.Fatal(err) }
+        if err := payload.WriteLuxo(buf, floatMask(t, 1,2,3,4)); err != nil { t.Fatal(err) }
         var out Payload
         dec := codec.NewDecoder(buf.B)
         out.ReadLuxo(dec)
@@ -140,7 +154,7 @@ func TestFiniteBitsAndEmptyColumns(t *testing.T) {
 func TestGeneratedHandlerFloatErrors(t *testing.T) {
     for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
         for _, encode := range []func(*api.Request, float64) error{encodeNative, encodeCompiled, encodeLiteral} {
-            req := &api.Request{Buf: &api.ResponseBuf{}, FieldMask: floatMask(1)}
+            req := &api.Request{Buf: &api.ResponseBuf{}, FieldMask: floatMask(t, 1)}
             if err := encode(req, value); !errors.Is(err, codec.ErrNonFiniteFloat) { t.Fatal(err) }
         }
         for _, encode := range []func(*api.Request, []float64) error{encodeNativeList, encodeCompiledList} {

@@ -115,7 +115,10 @@ func (g *GeneratorContext) compileAPIBody(b *strings.Builder, api *ast.ApiDecl, 
 	// Parse params (with default value support)
 	for _, p := range api.Params {
 		writeCallableParamExtraction(b, p, enums, "\t\t")
+		// Validation is required even when the body does not reference a parameter.
+		fmt.Fprintf(b, "\t\t_ = %s\n", p.Name)
 	}
+	cached := writeCachedBodyStart(b, api.Directives)
 
 	// Compile body statements
 	c := &compiler{
@@ -148,71 +151,49 @@ func (g *GeneratorContext) compileAPIBody(b *strings.Builder, api *ast.ApiDecl, 
 		c.vars[p.Name] = vt
 	}
 	c.compileHandlerBody(api.Body.Stmts)
+	writeCachedBodyEnd(b, cached)
 
 	fmt.Fprintf(b, "\t}\n}\n\n")
 }
 
-func isStructuredParam(param *ast.ParamDecl, enums map[string]bool) bool {
-	if param == nil || param.Type == nil || enums[param.Type.Name] {
+// writeCachedBodyStart must follow authorization and all typed parameter reads.
+func writeCachedBodyStart(b *strings.Builder, directives []*ast.Directive) bool {
+	directive := findDirective(directives, "cache")
+	if directive == nil {
 		return false
 	}
-	switch param.Type.Name {
-	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes", "JSON":
-		return false
-	default:
+	if len(directive.Args) == 1 && directive.Args[0].Name == "policy" {
+		b.WriteString("\t\treturn api.CacheResponsePolicy(ctx, req, luvia.BearerToken(ctx), func() error {\n")
 		return true
+	}
+	return false
+}
+
+func writeCachedBodyEnd(b *strings.Builder, cached bool) {
+	if cached {
+		b.WriteString("\t\t})\n")
 	}
 }
 
 func writeCallableParamExtraction(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, indent string) {
-	if isStructuredParam(param, enums) {
-		writeStructuredParamExtraction(b, param, enums, indent)
+	if writeBuiltinParamExtraction(b, param, enums, indent) {
 		return
 	}
-	goType := resolveGoType(param.Type)
-	method := paramMethod(goType)
-	if param.Type != nil && param.Type.Nullable {
-		method = ""
-	}
-	if param.Default != nil {
-		writeOptionalParamExtraction(b, param, enums, method, indent)
+	if param.Type != nil && enums[param.Type.Name] {
+		writeEnumParamExtraction(b, param, enums, indent)
 		return
 	}
-	if method == "" {
-		fmt.Fprintf(b, "%svar %s %s\n", indent, param.Name, goType)
-		fmt.Fprintf(b, "%sif err := req.%s(%q, &%s); err != nil {\n", indent, paramJSONMethod(param), param.Name, param.Name)
-		fmt.Fprintf(b, "%s\treturn err\n%s}\n", indent, indent)
-		return
-	}
-	fmt.Fprintf(b, "%s%s, err := req.Param%s(%q)\n", indent, param.Name, method, param.Name)
-	fmt.Fprintf(b, "%sif err != nil {\n%s\treturn err\n%s}\n", indent, indent, indent)
+	// Parser and generation entry validation require an explicit type.
+	writeStructuredParamExtraction(b, param, enums, indent)
 }
 
 func writeOptionalParamExtraction(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, method, indent string) {
 	writeDefaultParamDeclaration(b, param, enums, indent)
-	if method == "" {
-		fmt.Fprintf(b, "%sif err := req.%s(%q, &%s); err != nil {\n", indent, paramJSONMethod(param), param.Name, param.Name)
-		fmt.Fprintf(b, "%s\treturn err\n%s}\n", indent, indent)
-		return
-	}
 	fmt.Fprintf(b, "%sif req.HasParam(%q) {\n", indent, param.Name)
 	fmt.Fprintf(b, "%s\t_value%s, err := req.Param%s(%q)\n", indent, str.Capitalize(param.Name), method, param.Name)
 	fmt.Fprintf(b, "%s\tif err != nil { return err }\n", indent)
 	fmt.Fprintf(b, "%s\t%s = _value%s\n", indent, param.Name, str.Capitalize(param.Name))
 	fmt.Fprintf(b, "%s}\n", indent)
-}
-
-func writeStructuredParamExtraction(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, indent string) {
-	writeStructuredParamDeclaration(b, param, enums, indent)
-	fmt.Fprintf(b, "%sif req.BinaryMode {\n", indent)
-	if param.Type.IsList {
-		writeStructuredListParamDecode(b, param, indent+"\t")
-	} else {
-		writeStructuredScalarParamDecode(b, param, indent+"\t")
-	}
-	fmt.Fprintf(b, "%s} else {\n", indent)
-	fmt.Fprintf(b, "%s\tif err := req.%s(%q, &%s); err != nil {\n", indent, paramJSONMethod(param), param.Name, param.Name)
-	fmt.Fprintf(b, "%s\t\treturn err\n%s\t}\n%s}\n", indent, indent, indent)
 }
 
 func writeStructuredParamDeclaration(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, indent string) {
@@ -233,9 +214,9 @@ func writeDefaultParamDeclaration(b *strings.Builder, param *ast.ParamDecl, enum
 		valueType = &copy
 	}
 	defaultValue := compileDefaultValue(param.Default, resolveGoType(valueType), enums)
-	if valueType != param.Type && !isNullLiteral(param.Default) {
+	if valueType != param.Type && !param.Type.IsList && !isNullLiteral(param.Default) {
 		defaultName := "_default" + str.Capitalize(param.Name)
-		fmt.Fprintf(b, "%s%s := %s\n", indent, defaultName, defaultValue)
+		fmt.Fprintf(b, "%svar %s %s = %s\n", indent, defaultName, resolveGoType(valueType), defaultValue)
 		fmt.Fprintf(b, "%svar %s %s = &%s\n", indent, param.Name, goType, defaultName)
 		return
 	}
@@ -245,37 +226,6 @@ func writeDefaultParamDeclaration(b *strings.Builder, param *ast.ParamDecl, enum
 func isNullLiteral(expr ast.Expr) bool {
 	literal, ok := expr.(*ast.Literal)
 	return ok && literal.Kind == token.Null
-}
-
-func writeStructuredScalarParamDecode(b *strings.Builder, param *ast.ParamDecl, indent string) {
-	optional := param.Default != nil
-	nullable := param.Type.Nullable
-	name := param.Name
-	fmt.Fprintf(b, "%s_%sMessage, _%sPresent, err := req.ParamMessage(%q, %t, %t)\n", indent, name, name, name, optional, nullable)
-	fmt.Fprintf(b, "%sif err != nil { return err }\n", indent)
-	fmt.Fprintf(b, "%sif _%sPresent && _%sMessage != nil {\n", indent, name, name)
-	fmt.Fprintf(b, "%s\t_%sDecoder := codec.NewDecoder(_%sMessage)\n", indent, name, name)
-	if nullable {
-		fmt.Fprintf(b, "%s\t%s = &%s{}\n", indent, name, param.Type.Name)
-	}
-	fmt.Fprintf(b, "%s\t%s.ReadLuxoInput(_%sDecoder)\n", indent, name, name)
-	fmt.Fprintf(b, "%s\tif err := _%sDecoder.Finish(); err != nil { return api.InvalidParam(%q, err) }\n", indent, name, name)
-	fmt.Fprintf(b, "%s}\n", indent)
-}
-
-func writeStructuredListParamDecode(b *strings.Builder, param *ast.ParamDecl, indent string) {
-	optional := param.Default != nil
-	nullable := param.Type.Nullable
-	name := param.Name
-	fmt.Fprintf(b, "%s_%sMessages, _%sPresent, err := req.ParamMessageArray(%q, %t, %t)\n", indent, name, name, name, optional, nullable)
-	fmt.Fprintf(b, "%sif err != nil { return err }\n", indent)
-	fmt.Fprintf(b, "%sif _%sPresent && _%sMessages != nil {\n", indent, name, name)
-	fmt.Fprintf(b, "%s\t%s = make([]%s, len(_%sMessages))\n", indent, name, param.Type.Name, name)
-	fmt.Fprintf(b, "%s\tfor i := range _%sMessages {\n", indent, name)
-	fmt.Fprintf(b, "%s\t\t_%sDecoder := codec.NewDecoder(_%sMessages[i])\n", indent, name, name)
-	fmt.Fprintf(b, "%s\t\t%s[i].ReadLuxoInput(_%sDecoder)\n", indent, name, name)
-	fmt.Fprintf(b, "%s\t\tif err := _%sDecoder.Finish(); err != nil { return api.InvalidParam(%q, err) }\n", indent, name, name)
-	fmt.Fprintf(b, "%s\t}\n%s}\n", indent, indent)
 }
 
 func (c *compiler) compileHandlerBody(statements []ast.Stmt) {
@@ -388,6 +338,9 @@ func writeCompiledFunctionSignature(b *strings.Builder, fn *ast.FnDecl, models m
 }
 
 func compiledFunctionGoType(ref *ast.TypeRef, models map[string]*ast.ModelDecl) string {
+	if ref != nil && ref.Name == "Channel" && len(ref.TypeArgs) == 1 {
+		return "chan " + compiledFunctionGoType(ref.TypeArgs[0], models)
+	}
 	if ref == nil || models[ref.Name] == nil {
 		return resolveGoType(ref)
 	}
@@ -402,6 +355,8 @@ func registerCompiledFunctionParams(c *compiler, params []*ast.ParamDecl) {
 		valueType := valType{name: "string"}
 		if param.Type != nil {
 			valueType.name = param.Type.Name
+			valueType.typeRef = param.Type
+			valueType.isChan = param.Type.Name == "Channel" && !param.Type.IsList && !param.Type.Nullable
 			valueType.isList = param.Type.IsList
 			valueType.nullable = param.Type.Nullable
 			_, valueType.isModel = c.models[param.Type.Name]
@@ -412,17 +367,21 @@ func registerCompiledFunctionParams(c *compiler, params []*ast.ParamDecl) {
 
 // valType tracks the resolved type of a val variable.
 type valType struct {
-	isModel  bool   // true for model values, pointers and lists
-	isValue  bool   // true for an addressable model value rather than a model pointer
-	isList   bool   // true if this is a list (e.g., []*Model)
-	isChan   bool   // true if this is a channel (Channel<T>)
-	nullable bool   // true if this is a pointer type (nullable param/field)
-	name     string // model name or luxo type name (Int/String/Boolean/Float)
+	typeRef  *ast.TypeRef // Explicit generic arguments, including Channel element representation.
+	isModel  bool         // true for model values, pointers and lists
+	isValue  bool         // true for an addressable model value rather than a model pointer
+	isList   bool         // true if this is a list (e.g., []*Model)
+	isChan   bool         // true if this is a channel (Channel<T>)
+	nullable bool         // true if this is a pointer type (nullable param/field)
+	name     string       // model name or luxo type name (Int/String/Boolean/Float)
 }
 
 func (c *compiler) valTypeFromExpr(expr ast.Expr) (valType, bool) {
 	if ident, ok := expr.(*ast.Ident); ok {
 		if value, exists := c.vars[ident.Name]; exists {
+			if ident.NarrowedTag && c.isNarrowedScalar(ident, value) {
+				value.nullable = false
+			}
 			return value, true
 		}
 	}
@@ -432,6 +391,7 @@ func (c *compiler) valTypeFromExpr(expr ast.Expr) (valType, bool) {
 	_, isModel := c.models[expr.GetTypeTag()]
 	_, isObject := expr.(*ast.ObjectExpr)
 	return valType{
+		isChan:   expr.GetTypeTag() == "Channel" && !expr.IsNullable() && !expr.IsListType(),
 		isModel:  isModel,
 		isValue:  isModel && isObject,
 		isList:   expr.IsListType(),
@@ -492,6 +452,7 @@ type compiler struct {
 	functionResult     *ast.TypeRef           // non-nil while compiling a local fn body
 	inFunction         bool                   // true while compiling a local fn rather than a transport handler
 	valueClosure       bool                   // Go value boundary; never writes a transport response
+	valueModel         bool                   // value closure returns a model pointer, not a local model value
 	closureError       string                 // local failure slot for an immediately invoked value closure
 	loadSelections     map[string]string      // load variable → exact compiled selection literal
 	loadSelection      string                 // selection for the load expression currently being compiled
@@ -531,12 +492,15 @@ func (c *compiler) compileStmt(stmt ast.Stmt) {
 		// Unreachable: every ast.Stmt implementation has a case above. A new
 		// statement type added to the AST without a case here is a compiler bug —
 		// fail loud at gen time rather than silently emitting broken Go.
-		panic(fmt.Sprintf("codegen: unhandled statement type %T", stmt))
+		panic(&InternalCompilerError{Detail: fmt.Sprintf("codegen: unhandled statement type %T", stmt)})
 	}
 }
 
 // compileVal: val x = expr
 func (c *compiler) compileVal(s *ast.ValStmt) {
+	if c.compileChannelValue(s) {
+		return
+	}
 	if await, ok := s.Value.(*ast.AwaitExpr); ok {
 		names := s.Names
 		if len(names) == 0 {
@@ -578,17 +542,18 @@ func (c *compiler) compileVal(s *ast.ValStmt) {
 		}
 		c.write("%s := %s", s.Name, expr)
 		if vt, ok := c.valTypeFromExpr(s.Value); ok {
+			if vt.isChan {
+				vt.typeRef = c.channelTypeRef(s.Value)
+			}
 			c.vars[s.Name] = vt
-		}
-		// Track channel variables for close() and for-range codegen
-		if c.isChannelConstructor(s.Value) {
-			c.vars[s.Name] = valType{isChan: true}
-		}
-		// Track when-expression type based on API return type
-		if _, ok := s.Value.(*ast.WhenExpr); ok && c.api != nil && c.api.ReturnType != nil {
+		} else if _, ok := s.Value.(*ast.WhenExpr); ok && c.api != nil && c.api.ReturnType != nil {
+			// Only untyped source fragments may inherit the enclosing API result.
 			c.vars[s.Name] = valType{name: c.api.ReturnType.Name}
 		}
 		if source, ok := s.Value.(*ast.Ident); ok {
+			if c.vars[source.Name].isChan {
+				c.vars[s.Name] = c.vars[source.Name]
+			}
 			if totalName := c.paginationTotals[source.Name]; totalName != "" {
 				c.paginationTotals[s.Name] = totalName
 			}
@@ -638,6 +603,9 @@ func (c *compiler) compileReturn(s *ast.ReturnStmt) {
 				c.writeErrorGuard()
 				expression = name
 			}
+			if c.valueModel {
+				expression = c.modelReference(s.Value, expression)
+			}
 			c.write("return %s", expression)
 		}
 		return
@@ -657,6 +625,10 @@ func (c *compiler) compileReturn(s *ast.ReturnStmt) {
 	var expected *ast.TypeRef
 	if c.api != nil {
 		expected = c.api.ReturnType
+	}
+	if expected != nil && expected.Nullable {
+		c.compileNullableReturn(s.Value, expected)
+		return
 	}
 	expr := c.compileExpectedExpr(s.Value, expected)
 
@@ -847,7 +819,7 @@ func (c *compiler) writePrimitiveList(expr, typeName string) bool {
 
 func binaryScalarAppend(typeName, dst, value string, isEnum bool) (string, bool) {
 	if isEnum {
-		return fmt.Sprintf("codec.AppendString(%s, string(%s))", dst, value), true
+		return enumAppendExpression(typeName, dst, value), true
 	}
 	switch typeName {
 	case "Int":
@@ -888,7 +860,7 @@ func (c *compiler) isTypeDecl(name string) bool {
 		return false
 	}
 	switch name {
-	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes", "JSON", "", "GroupResult":
+	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Bytes", "JSON", "":
 		return false
 	}
 	// PascalCase and not recognized — likely a type declaration
@@ -903,8 +875,17 @@ func (c *compiler) compileThrow(s *ast.ThrowStmt) {
 
 // compileExprStmt: standalone expression (including elvis guard and ? propagation)
 func (c *compiler) compileExprStmt(s *ast.ExprStmt) {
+	if branch, ok := s.Expr.(*ast.WhenExpr); ok && c.inForExpr && containsYieldExpr(branch) {
+		c.compileYieldWhenStatement(branch)
+		return
+	}
 	if elvis, ok := s.Expr.(*ast.ElvisExpr); ok {
-		c.compileElvisGuard(elvis)
+		if thrown, ok := elvis.Right.(*ast.UnaryExpr); ok && thrown.Op == "throw" {
+			c.compileElvisGuard(elvis)
+		} else {
+			value := c.compileDefaultExpr(elvis)
+			c.write("_ = %s", value)
+		}
 		return
 	}
 	if bang, ok := s.Expr.(*ast.BangElvisExpr); ok {
@@ -925,16 +906,8 @@ func (c *compiler) compileExprStmt(s *ast.ExprStmt) {
 		c.write("}")
 		return
 	}
-	// Transaction as standalone statement — check error
-	// transaction { ... } is parsed as CallExpr(Ident("transaction"), lambda)
-	if call, ok := s.Expr.(*ast.CallExpr); ok {
-		if ident, ok := call.Func.(*ast.Ident); ok && ident.Name == "transaction" {
-			expr := c.compileExpr(s.Expr)
-			c.write("if err := %s; err != nil {", expr)
-			c.writeErrorReturn("\t", "err")
-			c.write("}")
-			return
-		}
+	if c.compileTransactionStatement(s.Expr) {
+		return
 	}
 	if c.compileDiscardedFunctionCall(s.Expr) {
 		return
@@ -943,10 +916,35 @@ func (c *compiler) compileExprStmt(s *ast.ExprStmt) {
 	c.write("%s", expr)
 }
 
+func (c *compiler) compileTransactionStatement(expression ast.Expr) bool {
+	var compiled string
+	switch expression := expression.(type) {
+	case *ast.TransactionExpr:
+		compiled = c.compileTransaction(expression)
+	case *ast.CallExpr:
+		var ok bool
+		compiled, ok = c.compileTransactionCall(expression)
+		if !ok {
+			return false
+		}
+	default:
+		return false
+	}
+	c.write("if err := %s; err != nil {", compiled)
+	c.writeErrorReturn("\t", "err")
+	c.write("}")
+	return true
+}
+
 func (c *compiler) compileDiscardedFunctionCall(expression ast.Expr) bool {
 	call, ok := expression.(*ast.CallExpr)
 	if !ok {
 		return false
+	}
+	if c.authMethod(call) != nil {
+		result := c.compileExpr(call)
+		c.write("_ = %s", result)
+		return true
 	}
 	ident, ok := call.Func.(*ast.Ident)
 	if !ok {
@@ -985,14 +983,10 @@ func (c *compiler) compileIf(s *ast.IfStmt) {
 // - bool: !x → throw
 // - (bool, error): val, err := x; if err → return err; if !val → throw
 func (c *compiler) compileElvisGuard(e *ast.ElvisExpr) {
-	right := c.compileExpr(e.Right)
-
 	// !expr ?: throw → if expr { return ... }
 	if unary, ok := e.Left.(*ast.UnaryExpr); ok && unary.Op == "!" {
 		inner := c.compileExpr(unary.Value)
-		c.write("if %s {", inner)
-		c.writeErrorReturn("\t", right)
-		c.write("}")
+		c.writeConditionalThrow(inner, e.Right)
 		return
 	}
 
@@ -1003,9 +997,7 @@ func (c *compiler) compileElvisGuard(e *ast.ElvisExpr) {
 		c.write("if _err != nil {")
 		c.writeErrorReturn("\t", "_err")
 		c.write("}")
-		c.write("if !_ok {")
-		c.writeErrorReturn("\t", right)
-		c.write("}")
+		c.writeConditionalThrow("!_ok", e.Right)
 		return
 	}
 
@@ -1013,36 +1005,31 @@ func (c *compiler) compileElvisGuard(e *ast.ElvisExpr) {
 	left := c.compileExpr(e.Left)
 	// Bool (non-error): if !val { throw }
 	if isBoolExpr(e.Left) {
-		c.write("if !%s {", left)
+		if _, binary := e.Left.(*ast.BinaryExpr); binary {
+			left = "(" + left + ")"
+		}
+		c.writeConditionalThrow("!"+left, e.Right)
 	} else {
-		c.write("if %s == nil {", left)
+		c.writeConditionalThrow(left+" == nil", e.Right)
 	}
-	c.writeErrorReturn("\t", right)
-	c.write("}")
 }
 
 // compileBangElvisGuard: x !: throw Error
 // - bool: if x → throw
 // - (bool, error): val, err := x; if err → return err; if val → throw
 func (c *compiler) compileBangElvisGuard(e *ast.BangElvisExpr) {
-	right := c.compileThrowExpr(e.Right)
-
 	if isErrorReturningBool(e.Left) {
 		left := c.compileExpr(e.Left)
 		c.write("_ok, _err := %s", left)
 		c.write("if _err != nil {")
 		c.writeErrorReturn("\t", "_err")
 		c.write("}")
-		c.write("if _ok {")
-		c.writeErrorReturn("\t", right)
-		c.write("}")
+		c.writeConditionalThrow("_ok", e.Right)
 		return
 	}
 
 	left := c.compileExpr(e.Left)
-	c.write("if %s {", left)
-	c.writeErrorReturn("\t", right)
-	c.write("}")
+	c.writeConditionalThrow(left, e.Right)
 }
 
 // isErrorReturningBool checks if an expression is a method call that returns (bool, error).
@@ -1112,6 +1099,12 @@ func (c *compiler) compileEmit(s *ast.EmitStmt) {
 func (c *compiler) compileExpr(expr ast.Expr) string {
 	switch e := expr.(type) {
 	case *ast.Ident:
+		if !e.NarrowedTag {
+			return e.Name
+		}
+		if c.isNarrowedScalar(e, c.vars[e.Name]) {
+			return "(*" + e.Name + ")"
+		}
 		return e.Name
 	case *ast.Literal:
 		return c.compileLiteral(e)
@@ -1122,8 +1115,7 @@ func (c *compiler) compileExpr(expr ast.Expr) string {
 	case *ast.BinaryExpr:
 		return c.compileBinary(e)
 	case *ast.ElvisExpr:
-		// Standalone elvis (not as guard) — not common in Phase 1
-		return fmt.Sprintf("/* elvis */ %s", c.compileExpr(e.Left))
+		return c.compileDefaultExpr(e)
 	case *ast.BangElvisExpr:
 		return fmt.Sprintf("/* !: */ %s", c.compileExpr(e.Left))
 	case *ast.UnaryExpr:
@@ -1178,7 +1170,7 @@ func (c *compiler) compileBlockExpr(expr ast.Expr) string {
 		// Unreachable: compileExpr + compileBlockExpr cover every ast.Expr
 		// implementation. A new expression type without a case here is a
 		// compiler bug — fail loud at gen time rather than emit broken Go.
-		panic(fmt.Sprintf("codegen: unhandled expression type %T", expr))
+		panic(&InternalCompilerError{Detail: fmt.Sprintf("codegen: unhandled expression type %T", expr)})
 	}
 }
 
@@ -1204,6 +1196,12 @@ func (c *compiler) compileLiteral(e *ast.Literal) string {
 
 // compileMember: obj.field
 func (c *compiler) compileMember(e *ast.MemberExpr) string {
+	if e.Object.GetTypeTag() == "String" && !e.Object.IsListType() {
+		switch e.Field {
+		case "length", "size", "isEmpty":
+			return compileStringQuery(e.Field, func() string { return c.compileExpr(e.Object) }, nil, 0)
+		}
+	}
 	if ident, ok := e.Object.(*ast.Ident); ok {
 		// error.NotFound → errors.NotFound
 		if ident.Name == "error" {
@@ -1300,6 +1298,15 @@ func (c *compiler) compileInstanceMethod(e *ast.CallExpr) string {
 
 // compileCall: handles Model.where(...).first(), Model.create(...), etc.
 func (c *compiler) compileCall(e *ast.CallExpr) string {
+	if e.Group != nil {
+		return c.compileTypedGroup(e.Group)
+	}
+	if result, ok := c.compileCollectionCall(e); ok {
+		return result
+	}
+	if result, ok := c.compileAuthMethod(e); ok {
+		return result
+	}
 	// Built-in functions: now(), crypto.randomHex(), etc.
 	if result := c.compileBuiltinCall(e); result != "" {
 		return result
@@ -1315,9 +1322,7 @@ func (c *compiler) compileCall(e *ast.CallExpr) string {
 		return result
 	}
 
-	if result, ok := c.compileChannelConstructor(e); ok {
-		return result
-	}
+	c.rejectUntypedChannelConstructor(e)
 
 	if result, ok := c.compileTransactionCall(e); ok {
 		return result
@@ -1333,16 +1338,12 @@ func (c *compiler) compileCall(e *ast.CallExpr) string {
 	return c.compileGenericCall(e)
 }
 
-func (c *compiler) compileChannelConstructor(e *ast.CallExpr) (string, bool) {
+func (c *compiler) rejectUntypedChannelConstructor(e *ast.CallExpr) {
 	ident, ok := e.Func.(*ast.Ident)
 	if !ok || ident.Name != "Channel" {
-		return "", false
+		return
 	}
-	size := "0"
-	if len(e.Args) > 0 {
-		size = c.compileExpr(e.Args[0].Value)
-	}
-	return fmt.Sprintf("make(chan any, %s)", size), true
+	panic(&InternalCompilerError{Detail: "Channel constructor requires a typed variable declaration"})
 }
 
 func (c *compiler) compileTransactionCall(e *ast.CallExpr) (string, bool) {
@@ -1354,19 +1355,16 @@ func (c *compiler) compileTransactionCall(e *ast.CallExpr) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	sub := c.errorCompiler()
-	sub.indent = c.indent + "\t"
-	for _, stmt := range lambda.Body.Stmts {
-		sub.compileStmt(stmt)
-	}
-	return fmt.Sprintf("app.DB.Tx(ctx, func(tx *%s.DB) error {\n%s%s\treturn nil\n%s})",
-		c.dbPackage(), sub.b.String(), c.indent, c.indent), true
+	return c.compileTransactionBlock(lambda.Body), true
 }
 
 func (c *compiler) compileChannelClose(e *ast.CallExpr) (string, bool) {
 	member, ok := e.Func.(*ast.MemberExpr)
 	if !ok || len(e.Args) != 0 || member.Field != "close" {
 		return "", false
+	}
+	if ref := c.channelTypeRef(member.Object); ref != nil && ref.Name == "Channel" {
+		return "close(" + c.compileExpr(member.Object) + ")", true
 	}
 	ident, ok := member.Object.(*ast.Ident)
 	if !ok {
@@ -1387,6 +1385,9 @@ func (c *compiler) compileModelCallChain(e *ast.CallExpr) (string, bool) {
 	ident, ok := chain[0].expr.(*ast.Ident)
 	if !ok {
 		return "", false
+	}
+	if model := c.queryAliasModel(ident.Name); model != "" {
+		return c.compileQueryAlias(ident.Name, model, chain[1:]), true
 	}
 	if _, isModel := c.models[ident.Name]; !isModel {
 		return "", false
@@ -1584,6 +1585,9 @@ func flattenChain(expr ast.Expr) []chainLink {
 				expr = member.Object
 				continue
 			}
+			if model, method := functionFindModel(e); model != nil {
+				return append([]chainLink{{expr: model}, {method: method, args: e.Args[1:]}}, chain...)
+			}
 			// Direct call like ErrorName(args)
 			chain = append([]chainLink{{expr: e.Func, args: e.Args}}, chain...)
 			return chain
@@ -1630,12 +1634,6 @@ func (c *compiler) compileModelChain(modelName string, links []chainLink) string
 		}
 	}
 
-	// Detect groupBy chain: Model.where(...).groupBy { it.field }.select { ... }
-	if idx := findGroupByLink(links); idx >= 0 {
-		c.compileGroupByChain(&b, modelName, links, idx, scopeInjected)
-		return b.String()
-	}
-
 	for i, link := range links {
 		// Terminal methods — return immediately
 		if done := c.compileTerminalMethod(&b, modelName, link); done {
@@ -1671,11 +1669,6 @@ func (c *compiler) compileModifierMethod(b *strings.Builder, modelName string, l
 			}
 			fmt.Fprintf(b, ".%s(%s)", str.Capitalize(link.method), val)
 		}
-	case "groupBy":
-		if len(link.args) > 0 {
-			val := c.compileExpr(link.args[0].Value)
-			fmt.Fprintf(b, ".GroupBy(%q)", str.ToSnakeCase(val))
-		}
 	default:
 		// Unknown method — ensure model client is seeded
 		if i == 0 {
@@ -1689,127 +1682,6 @@ func (c *compiler) compileModifierMethod(b *strings.Builder, modelName string, l
 		b.WriteString(strings.Join(args, ", "))
 		b.WriteString(")")
 	}
-}
-
-// findGroupByLink returns the index of a groupBy link, or -1.
-func findGroupByLink(links []chainLink) int {
-	for i, l := range links {
-		if l.method == "groupBy" {
-			return i
-		}
-	}
-	return -1
-}
-
-// compileGroupByChain compiles Model.where(...).groupBy { it.field }.select { aggs... }
-// into a Query.GroupBy(ctx, cols, aggs) call returning []map[string]any.
-func (c *compiler) compileGroupByChain(b *strings.Builder, modelName string, links []chainLink, groupByIdx int, scopeInjected bool) {
-	// Compile preceding where/filter links
-	for i := 0; i < groupByIdx; i++ {
-		c.compileModifierMethod(b, modelName, links[i], i, len(links), scopeInjected)
-	}
-	if b.Len() == 0 {
-		fmt.Fprintf(b, "app.%s", modelName)
-	}
-
-	// Extract group column(s) from groupBy lambda
-	groupLink := links[groupByIdx]
-	groupCols := c.extractGroupByCols(groupLink)
-
-	// Extract aggregations from .select lambda (if present)
-	var aggs []string
-	for i := groupByIdx + 1; i < len(links); i++ {
-		if links[i].method == "select" && len(links[i].args) > 0 {
-			aggs = c.extractSelectAggs(links[i])
-			break
-		}
-	}
-
-	// Generate: .GroupBy(ctx, []string{"col"}, []lux.GroupAgg{...})
-	fmt.Fprintf(b, ".GroupBy(ctx, []string{%s}, []lux.GroupAgg{%s})",
-		strings.Join(groupCols, ", "),
-		strings.Join(aggs, ", "))
-}
-
-// extractGroupByCols extracts column names from groupBy { it.field } or groupBy { [it.f1, it.f2] }.
-func (c *compiler) extractGroupByCols(link chainLink) []string {
-	if len(link.args) == 0 {
-		return nil
-	}
-	arg := link.args[0].Value
-	// Lambda wrapper: unwrap body
-	if lambda, ok := arg.(*ast.LambdaExpr); ok && lambda.Body != nil && len(lambda.Body.Stmts) > 0 {
-		if es, ok := lambda.Body.Stmts[0].(*ast.ExprStmt); ok {
-			arg = es.Expr
-		}
-	}
-	switch e := arg.(type) {
-	case *ast.MemberExpr:
-		return []string{fmt.Sprintf("%q", str.ToSnakeCase(e.Field))}
-	case *ast.ListExpr:
-		var cols []string
-		for _, item := range e.Items {
-			if m, ok := item.(*ast.MemberExpr); ok {
-				cols = append(cols, fmt.Sprintf("%q", str.ToSnakeCase(m.Field)))
-			}
-		}
-		return cols
-	default:
-		val := c.compileExpr(arg)
-		return []string{fmt.Sprintf("%q", str.ToSnakeCase(val))}
-	}
-}
-
-// extractSelectAggs extracts aggregation definitions from .select { key: it.key, count: it.count(), sum: it.sum { it.col } }.
-func (c *compiler) extractSelectAggs(link chainLink) []string {
-	if len(link.args) == 0 {
-		return nil
-	}
-	arg := link.args[0].Value
-	// Unwrap lambda body
-	if lambda, ok := arg.(*ast.LambdaExpr); ok && lambda.Body != nil && len(lambda.Body.Stmts) > 0 {
-		if es, ok := lambda.Body.Stmts[0].(*ast.ExprStmt); ok {
-			arg = es.Expr
-		}
-	}
-	obj, ok := arg.(*ast.ObjectExpr)
-	if !ok {
-		return nil
-	}
-	var aggs []string
-	for _, field := range obj.Fields {
-		// Skip key fields (it.key, it.key[0], etc) — those come from GROUP BY columns
-		if isGroupKeyRef(field.Value) {
-			continue
-		}
-		// Parse aggregation calls: it.count(), it.sum { it.col }, it.avg { it.col }, etc.
-		if call, ok := field.Value.(*ast.CallExpr); ok {
-			if member, ok := call.Func.(*ast.MemberExpr); ok {
-				fn := strings.ToUpper(member.Field)
-				col := ""
-				// Lambda arg: it.sum { it.total } → col = "total"
-				if len(call.Args) > 0 {
-					col = extractLambdaField(call.Args[0].Value)
-				}
-				alias := str.ToSnakeCase(field.Name)
-				if col == "" {
-					aggs = append(aggs, fmt.Sprintf(`{Fn: %q, Alias: %q}`, fn, alias))
-				} else {
-					aggs = append(aggs, fmt.Sprintf(`{Fn: %q, Col: %q, Alias: %q}`, fn, str.ToSnakeCase(col), alias))
-				}
-			}
-		}
-	}
-	return aggs
-}
-
-// isGroupKeyRef checks if an expression references the group key (it.key or it.key[N]).
-func isGroupKeyRef(e ast.Expr) bool {
-	if m, ok := e.(*ast.MemberExpr); ok {
-		return m.Field == "key"
-	}
-	// it.key[0] — IndexExpr on MemberExpr
-	return false
 }
 
 // compileCreateLink compiles a create() link with @hash and nullable field handling.
@@ -1899,8 +1771,7 @@ func (c *compiler) compileWhereChain(b *strings.Builder, modelName string, args 
 		}
 		if arg.Name != "" {
 			// Named arg: where(id: userId) → ModelWhere.Id.Eq(userId)
-			val := c.compileExpr(arg.Value)
-			b.WriteString(fmt.Sprintf("%sWhere.%s.Eq(%s)", modelName, str.Capitalize(arg.Name), val))
+			b.WriteString(c.compileWhereComparison(modelName, arg.Name, "Eq", arg.Value))
 		} else {
 			b.WriteString(c.compileWhereArg(modelName, arg.Value))
 		}
@@ -1914,36 +1785,44 @@ func (c *compiler) compileWhereChain(b *strings.Builder, modelName string, args 
 // it.title.contains("x") → ModelWhere.Title.Match("x")  (@search field)
 // it.title.contains("x") → ModelWhere.Title.Like("%" + lux.EscapeLike("x") + "%")  (non-search)
 func (c *compiler) compileWhereArg(modelName string, expr ast.Expr) string {
+	receiver := "it"
+	if lambda, ok := expr.(*ast.LambdaExpr); ok {
+		if body, parameter := lambda.SingleExpression(); body != nil {
+			expr, receiver = body, parameter
+		}
+	}
+	return c.compileWherePredicate(modelName, expr, receiver)
+}
+
+func (c *compiler) compileWherePredicate(modelName string, expr ast.Expr, receiver string) string {
+	if unary, ok := expr.(*ast.UnaryExpr); ok && unary.Op == "!" {
+		if field := c.whereBooleanField(modelName, unary.Value, receiver); field != "" {
+			return field + ".IsFalse()"
+		}
+		return "lux.Not(" + c.compileWherePredicate(modelName, unary.Value, receiver) + ")"
+	}
 	// Handle method call conditions: it.field.contains/startsWith/endsWith(arg)
-	if result := c.compileWhereMethodCall(modelName, expr); result != "" {
+	if result := c.compileWhereMethodCall(modelName, expr, receiver); result != "" {
 		return result
 	}
 
 	bin, ok := expr.(*ast.BinaryExpr)
 	if !ok {
-		return c.compileExpr(expr)
+		return c.compileWhereBoolean(modelName, expr, receiver)
+	}
+	if bin.Op == "&&" || bin.Op == "||" {
+		combine := "AllOf"
+		if bin.Op == "||" {
+			combine = "AnyOf"
+		}
+		return fmt.Sprintf("lux.%s(%s, %s)", combine,
+			c.compileWherePredicate(modelName, bin.Left, receiver),
+			c.compileWherePredicate(modelName, bin.Right, receiver))
 	}
 
-	field := ""
-	val := c.compileExpr(bin.Right)
-	// Enum values need string() cast for Where conditions (StringField.Eq expects string)
-	if member, ok := bin.Right.(*ast.MemberExpr); ok {
-		if ident, ok := member.Object.(*ast.Ident); ok && c.enums[ident.Name] {
-			val = "string(" + val + ")"
-		}
-	}
-
-	// it.field == value → field from member expr
-	if member, ok := bin.Left.(*ast.MemberExpr); ok {
-		if ident, ok := member.Object.(*ast.Ident); ok && ident.Name == "it" {
-			field = member.Field
-		}
-	}
-	// field == value → field from ident (legacy/shorthand)
-	if field == "" {
-		if ident, ok := bin.Left.(*ast.Ident); ok {
-			field = ident.Name
-		}
+	field := wherePredicateField(bin.Left, receiver)
+	if bin.Op == "in" {
+		return c.compileWhereMembership(modelName, field, bin)
 	}
 	if literal, ok := bin.Right.(*ast.Literal); ok && literal.Kind == token.Null {
 		switch bin.Op {
@@ -1972,7 +1851,28 @@ func (c *compiler) compileWhereArg(modelName string, expr ast.Expr) string {
 		return c.compileExpr(expr)
 	}
 
-	return fmt.Sprintf("%sWhere.%s.%s(%s)", modelName, str.Capitalize(field), op, val)
+	return c.compileWhereComparison(modelName, field, op, bin.Right)
+}
+
+// Enum parameters and computed values use the same SQL representation as literals.
+func (c *compiler) compileWhereComparison(model, field, operator string, expr ast.Expr) string {
+	value := c.compileExpr(expr)
+	prefix, suffix := "", ""
+	if c.isWhereEnum(expr) {
+		prefix, suffix = "string(", ")"
+	}
+	return model + "Where." + str.Capitalize(field) + "." + operator + "(" + prefix + value + suffix + ")"
+}
+
+func (c *compiler) isWhereEnum(expr ast.Expr) bool {
+	if c.enums[expr.GetTypeTag()] || c.isEnumExpr(expr) {
+		return true
+	}
+	if member, ok := expr.(*ast.MemberExpr); ok {
+		ident, ok := member.Object.(*ast.Ident)
+		return ok && c.enums[ident.Name]
+	}
+	return false
 }
 
 // compileWhereMethodCall handles string method calls in where context:
@@ -1983,7 +1883,7 @@ func (c *compiler) compileWhereArg(modelName string, expr ast.Expr) string {
 //	it.name.endsWith("x")   → ModelWhere.Name.Like("%" + lux.EscapeLike(x))
 //
 // Returns "" if expr is not a recognized method call pattern.
-func (c *compiler) compileWhereMethodCall(modelName string, expr ast.Expr) string {
+func (c *compiler) compileWhereMethodCall(modelName string, expr ast.Expr, receiver string) string {
 	call, ok := expr.(*ast.CallExpr)
 	if !ok || len(call.Args) == 0 {
 		return ""
@@ -1998,15 +1898,10 @@ func (c *compiler) compileWhereMethodCall(modelName string, expr ast.Expr) strin
 		return ""
 	}
 
-	// Extract field name from it.field.method(arg) pattern
-	innerMember, ok := member.Object.(*ast.MemberExpr)
-	if !ok {
+	fieldName := wherePredicateField(member.Object, receiver)
+	if fieldName == "" {
 		return ""
 	}
-	if ident, ok := innerMember.Object.(*ast.Ident); !ok || ident.Name != "it" {
-		return ""
-	}
-	fieldName := innerMember.Field
 	argVal := c.compileExpr(call.Args[0].Value)
 
 	// Check if the field has @search directive
@@ -2023,6 +1918,7 @@ func (c *compiler) compileWhereMethodCall(modelName string, expr ast.Expr) strin
 	case "endsWith":
 		return fmt.Sprintf(`%sWhere.%s.Like("%%" + lux.EscapeLike(%s))`, modelName, str.Capitalize(fieldName), argVal)
 	}
+	// Unreachable: the method guard above admits only the three switch cases.
 	return ""
 }
 
@@ -2043,6 +1939,12 @@ func (c *compiler) fieldHasSearch(modelName, fieldName string) bool {
 // compileBinary: a + b, a == b, etc.
 func (c *compiler) compileBinary(e *ast.BinaryExpr) string {
 	left := c.compileExpr(e.Left)
+	if e.Op == "<-" {
+		return left + " <- " + c.compileChannelSendValue(e.Left, e.Right)
+	}
+	if e.Op == "&&" || e.Op == "||" {
+		return c.compileLogicalBinary(e, left)
+	}
 	right := c.compileExpr(e.Right)
 	// DateTime +/- Duration → time.Add(duration) / time.Add(-duration)
 	// Only rewrite when left is DateTime (via TypeTag) and right is Duration
@@ -2126,6 +2028,9 @@ func (c *compiler) compileUnary(e *ast.UnaryExpr) string {
 		return name
 	}
 	operand := c.compileExpr(e.Value)
+	if _, binary := e.Value.(*ast.BinaryExpr); binary {
+		operand = "(" + operand + ")"
+	}
 	return fmt.Sprintf("%s%s", e.Op, operand)
 }
 
@@ -2163,6 +2068,9 @@ func (c *compiler) compileThrowExpr(expr ast.Expr) string {
 
 // resolveQueryType determines the return type of a model query chain.
 func (c *compiler) resolveQueryType(expr ast.Expr) valType {
+	if call, ok := expr.(*ast.CallExpr); ok && call.Group != nil {
+		return valType{name: call.Group.Result, isList: true}
+	}
 	// Instance method: variable.update() → Int (rows affected), variable.delete() → Int
 	if call, ok := expr.(*ast.CallExpr); ok {
 		if member, ok := call.Func.(*ast.MemberExpr); ok {
@@ -2183,11 +2091,11 @@ func (c *compiler) resolveQueryType(expr ast.Expr) valType {
 	}
 	root := chain[0]
 	if ident, ok := root.expr.(*ast.Ident); ok {
-		if _, isModel := c.models[ident.Name]; isModel {
+		if modelName := c.queryRootModel(ident.Name); modelName != "" {
 			last := chain[len(chain)-1]
 			switch last.method {
-			case "first", "find":
-				return valType{isModel: true, name: ident.Name}
+			case "first", "find", "findMany", "findFirst":
+				return valType{isModel: true, isList: findReturnsList(last), name: modelName}
 			case "load":
 				// PK load (no named args) → single model; FK load (named args) → list
 				hasNamed := false
@@ -2198,13 +2106,13 @@ func (c *compiler) resolveQueryType(expr ast.Expr) valType {
 					}
 				}
 				if hasNamed {
-					return valType{isModel: true, isList: true, name: ident.Name}
+					return valType{isModel: true, isList: true, name: modelName}
 				}
-				return valType{isModel: true, name: ident.Name}
+				return valType{isModel: true, name: modelName}
 			case "all":
-				return valType{isModel: true, isList: true, name: ident.Name}
+				return valType{isModel: true, isList: true, name: modelName}
 			case "create", "exec":
-				return valType{isModel: true, name: ident.Name}
+				return valType{isModel: true, name: modelName}
 			case "exists":
 				return valType{name: "Boolean"}
 			case "count":
@@ -2214,11 +2122,7 @@ func (c *compiler) resolveQueryType(expr ast.Expr) valType {
 			case "delete", "deleteMany", "updateMany":
 				return valType{name: "Int"} // rows affected
 			case "sum", "avg", "min", "max":
-				return valType{name: "Int"}
-			}
-			// groupBy chain → returns ([]map[string]any, error)
-			if findGroupByLink(chain) >= 0 {
-				return valType{isList: true, name: "GroupResult"}
+				return c.aggregateValueType(expr, modelName, last)
 			}
 		}
 	}
@@ -2227,6 +2131,9 @@ func (c *compiler) resolveQueryType(expr ast.Expr) valType {
 
 // isModelQuery checks if an expression is a Model query chain (returns (*T, error)).
 func (c *compiler) isModelQuery(expr ast.Expr) bool {
+	if call, ok := expr.(*ast.CallExpr); ok && call.Group != nil {
+		return true
+	}
 	// Instance method: variable.delete(), variable.update(...)
 	if call, ok := expr.(*ast.CallExpr); ok {
 		if member, ok := call.Func.(*ast.MemberExpr); ok {
@@ -2247,16 +2154,12 @@ func (c *compiler) isModelQuery(expr ast.Expr) bool {
 	}
 	root := chain[0]
 	if ident, ok := root.expr.(*ast.Ident); ok {
-		if _, isModel := c.models[ident.Name]; isModel {
+		if c.queryRootModel(ident.Name) != "" {
 			// Check terminal method
 			last := chain[len(chain)-1]
 			switch last.method {
-			case "first", "all", "create", "exec", "find", "load", "exists", "update", "updateMany", "delete", "deleteMany", "count",
+			case "first", "all", "create", "exec", "find", "findMany", "findFirst", "load", "exists", "update", "updateMany", "delete", "deleteMany", "count",
 				"sum", "avg", "min", "max":
-				return true
-			}
-			// groupBy chain: check if any link is groupBy (not necessarily last)
-			if findGroupByLink(chain) >= 0 {
 				return true
 			}
 		}
@@ -2266,7 +2169,7 @@ func (c *compiler) isModelQuery(expr ast.Expr) bool {
 
 func isCountedPaginationQuery(expr ast.Expr) bool {
 	chain := flattenChain(expr)
-	return len(chain) >= 2 && chain[len(chain)-1].method == "all"
+	return len(chain) >= 2 && (chain[len(chain)-1].method == "all" || findReturnsList(chain[len(chain)-1]))
 }
 
 // compileUpdateChain compiles .update(field: val, ...) → .Update(ctx, SetField{...}, ...)
@@ -2608,11 +2511,8 @@ func renderCompiledSelection(nodes map[string]*compiledSelectionNode) string {
 
 func (c *compiler) compileTerminalMethod(b *strings.Builder, modelName string, link chainLink) bool {
 	switch link.method {
-	case "find":
-		if len(link.args) > 0 {
-			val := c.compileExpr(link.args[0].Value)
-			fmt.Fprintf(b, "app.%s.Where(%sWhere.%s.Eq(%s)).First(ctx)", modelName, modelName, primaryKeyGoName(c.models[modelName]), val)
-		}
+	case "find", "findMany", "findFirst":
+		c.compileFindChain(b, modelName, link)
 		return true
 	case "load":
 		c.compileLoad(b, modelName, link.args)
@@ -2662,7 +2562,10 @@ func (c *compiler) compileTerminalMethod(b *strings.Builder, modelName string, l
 			b.WriteString(".All(ctx)")
 		}
 		return true
-	case "first", "exists", "exec", "count":
+	case "first":
+		b.WriteString(".First(ctx)")
+		return true
+	case "exists", "exec", "count":
 		fmt.Fprintf(b, ".%s(ctx)", str.Capitalize(link.method))
 		return true
 	case "update", "upsert":
@@ -2677,12 +2580,13 @@ func (c *compiler) compileTerminalMethod(b *strings.Builder, modelName string, l
 			if col == "" {
 				col = c.compileExpr(link.args[0].Value)
 			}
-			fmt.Fprintf(b, ".%s(ctx, %q)", str.Capitalize(link.method), str.ToSnakeCase(col))
+			fmt.Fprintf(b, ".%s(ctx, %q)", str.Capitalize(c.aggregateMethod(modelName, link, col)), str.ToSnakeCase(col))
 		} else {
 			fmt.Fprintf(b, ".%s(ctx)", str.Capitalize(link.method))
 		}
 		return true
 	}
+	// Unreachable: the terminal guard and the two bulk cases exhaust this switch.
 	return false
 }
 
@@ -2721,6 +2625,10 @@ func (c *compiler) compileFor(s *ast.ForStmt) {
 		return
 	}
 	coll := c.compileExpr(s.Collection)
+	binding := c.saveBinding(s.VarName)
+	item, _ := c.valTypeFromExpr(s.Collection)
+	item.isList, item.nullable = false, false
+	c.vars[s.VarName] = item
 	// Channel range uses single variable: for v := range ch
 	if c.isChannelVar(s.Collection) {
 		c.write("for %s := range %s {", s.VarName, coll)
@@ -2729,6 +2637,7 @@ func (c *compiler) compileFor(s *ast.ForStmt) {
 	}
 	c.compileBlock(s.Body)
 	c.write("}")
+	c.restoreBinding(binding)
 }
 
 // compileForRange: for i in start..end { ... } → for i := int64(start); i <= end; i++ { ... }
@@ -2736,52 +2645,30 @@ func (c *compiler) compileFor(s *ast.ForStmt) {
 func (c *compiler) compileForRange(varName string, r *ast.RangeExpr, body *ast.Block) {
 	start := c.compileExpr(r.Start)
 	end := c.compileExpr(r.End)
+	binding := c.saveBinding(varName)
+	c.vars[varName] = valType{name: "Int"}
 	c.write("for %s := int64(%s); %s <= %s; %s++ {", varName, start, varName, end, varName)
 	c.compileBlock(body)
 	c.write("}")
+	c.restoreBinding(binding)
 }
 
-// containsYield walks an AST block and returns true if any YieldExpr is found.
+// containsYield checks yields owned by the enclosing for expression.
 func containsYield(block *ast.Block) bool {
-	if block == nil {
-		return false
-	}
-	for _, stmt := range block.Stmts {
-		if containsYieldStmt(stmt) {
-			return true
-		}
-	}
-	return false
-}
-
-// containsYieldStmt checks a single statement for yield expressions.
-func containsYieldStmt(stmt ast.Stmt) bool {
-	switch s := stmt.(type) {
-	case *ast.ExprStmt:
-		return containsYieldExpr(s.Expr)
-	case *ast.ValStmt:
-		return containsYieldExpr(s.Value)
-	case *ast.IfStmt:
-		if containsYield(s.Then) {
-			return true
-		}
-	case *ast.ForStmt:
-		if containsYield(s.Body) {
-			return true
-		}
-	}
-	return false
+	found := false
+	ast.WalkYields(block, func(*ast.YieldExpr) {
+		found = true
+	})
+	return found
 }
 
 // containsYieldExpr checks if an expression is or contains a yield.
 func containsYieldExpr(expr ast.Expr) bool {
-	if expr == nil {
-		return false
-	}
-	if _, ok := expr.(*ast.YieldExpr); ok {
-		return true
-	}
-	return false
+	found := false
+	ast.WalkExpressionYields(expr, func(*ast.YieldExpr) {
+		found = true
+	})
+	return found
 }
 
 // compileForExpr compiles a for-as-expression.
@@ -2814,8 +2701,14 @@ func (c *compiler) compileForExprCollect(s *ast.ForStmt) string {
 func (c *compiler) compileBlock(block *ast.Block) {
 	old := c.indent
 	c.indent += "\t"
+	var local [8]lexicalBinding
+	bindings := local[:0]
 	for _, stmt := range block.Stmts {
+		bindings = c.saveStatementBindings(bindings, stmt)
 		c.compileStmt(stmt)
+	}
+	for index := len(bindings) - 1; index >= 0; index-- {
+		c.restoreBinding(bindings[index])
 	}
 	c.indent = old
 }
@@ -2830,8 +2723,7 @@ func (c *compiler) compileAssign(s *ast.AssignStmt) {
 // --- Phase 2 expression compilers ---
 
 // compileTemplate: "hello ${name}: ${count} items"
-// Generates strings.Builder for zero-alloc string concatenation.
-// String expressions are written directly; int64 uses strconv.AppendInt.
+// Typed writes avoid dynamic formatting and temporary numeric strings.
 func (c *compiler) compileTemplate(e *ast.TemplateString) string {
 	if len(e.Parts) == 0 {
 		return `""`
@@ -2842,60 +2734,25 @@ func (c *compiler) compileTemplate(e *ast.TemplateString) string {
 			return fmt.Sprintf("%q", lit.Value)
 		}
 	}
-	var b strings.Builder
-	b.WriteString("func() string {\n")
-	fmt.Fprintf(&b, "%s\tvar _sb strings.Builder\n", c.indent)
-	for _, part := range e.Parts {
-		if lit, ok := part.(*ast.Literal); ok && lit.Kind == token.String {
-			fmt.Fprintf(&b, "%s\t_sb.WriteString(%q)\n", c.indent, lit.Value)
-		} else {
-			compiled := c.compileExpr(part)
-			if c.isEnumExpr(part) {
-				fmt.Fprintf(&b, "%s\t_sb.WriteString(string(%s))\n", c.indent, compiled)
-			} else if c.isStringExpr(part) {
-				fmt.Fprintf(&b, "%s\t_sb.WriteString(%s)\n", c.indent, compiled)
-			} else if c.isIntExpr(part) {
-				fmt.Fprintf(&b, "%s\t_sb.WriteString(strconv.FormatInt(int64(%s), 10))\n", c.indent, compiled)
-			} else {
-				fmt.Fprintf(&b, "%s\tfmt.Fprintf(&_sb, \"%%v\", %s)\n", c.indent, compiled)
-			}
-		}
+	sub := c.valueCompiler()
+	sub.indent = c.indent + "\t"
+	parts := make([]compiledTemplatePart, len(e.Parts))
+	sizes := make([]string, len(e.Parts))
+	for index, part := range e.Parts {
+		parts[index] = sub.prepareTemplatePart(part, index)
+		sizes[index] = "len(" + parts[index].value + ")"
 	}
-	fmt.Fprintf(&b, "%s\treturn _sb.String()\n%s}()", c.indent, c.indent)
-	return b.String()
-}
-
-// isStringExpr checks if an expression is likely a string type.
-// Uses heuristics: MemberExpr on known string fields, string literals, etc.
-func (c *compiler) isStringExpr(expr ast.Expr) bool {
-	switch e := expr.(type) {
-	case *ast.MemberExpr:
-		if ident, ok := e.Object.(*ast.Ident); ok {
-			if vt, ok := c.vars[ident.Name]; ok && vt.isModel {
-				if m, ok := c.models[vt.name]; ok {
-					for _, f := range m.Fields {
-						if f.Name == e.Field && f.Type != nil && f.Type.Name == "String" {
-							return true
-						}
-					}
-				}
-			}
+	sub.write("var _sb strings.Builder")
+	sub.write("_sb.Grow(%s)", strings.Join(sizes, " + "))
+	for _, part := range parts {
+		method := "WriteString"
+		if part.numeric {
+			method = "Write"
 		}
-	case *ast.Ident:
-		if vt, ok := c.vars[e.Name]; ok {
-			if vt.name == "String" || vt.name == "string" {
-				return true
-			}
-		}
-	case *ast.Literal:
-		return e.Kind == token.String
-	case *ast.CallExpr:
-		// String method calls (e.g. .trim(), .lowercase())
-		if member, ok := e.Func.(*ast.MemberExpr); ok {
-			return c.isStringExpr(member.Object)
-		}
+		sub.write("_sb.%s(%s)", method, part.value)
 	}
-	return false
+	sub.write("return _sb.String()")
+	return c.finishValueClosure(sub, "string", sub.b.String())
 }
 
 // isLogTarget checks if an expression is a valid target for .i/.d/.w/.e log methods.
@@ -2987,10 +2844,14 @@ func (c *compiler) compileObject(e *ast.ObjectExpr) string {
 
 // compileWhen: when { cond -> expr, else -> expr }
 func (c *compiler) compileWhen(e *ast.WhenExpr) string {
+	if c.inForExpr && containsYieldExpr(e) {
+		return c.compileYieldWhenValue(e)
+	}
 	if e.Subject == nil && c.hasChannelBranch(e) {
 		return c.compileSelect(e)
 	}
 	sub := c.valueCompiler()
+	sub.valueModel = c.models[e.GetTypeTag()] != nil
 	sub.indent += "\t"
 	subject := ""
 	if e.Subject != nil {
@@ -3134,7 +2995,11 @@ func extractLambdaField(expr ast.Expr) string {
 		return ""
 	}
 	// Check that the object is "it" (implicit param)
-	if ident, ok := member.Object.(*ast.Ident); ok && ident.Name == "it" {
+	parameter := "it"
+	if len(lambda.Params) == 1 {
+		parameter = lambda.Params[0]
+	}
+	if ident, ok := member.Object.(*ast.Ident); ok && ident.Name == parameter {
 		return member.Field
 	}
 	return ""
@@ -3154,14 +3019,18 @@ func (c *compiler) compileLambda(e *ast.LambdaExpr) string {
 	return fmt.Sprintf("func(%s any) any {\n%s%s}", params, sub.b.String(), c.indent)
 }
 
-// compileTransaction: tx { ... } → app.DB.Tx(ctx, func(ctx) error { ... })
+// compileTransaction binds model operations to the transaction's App.
 func (c *compiler) compileTransaction(e *ast.TransactionExpr) string {
+	return c.compileTransactionBlock(e.Body)
+}
+
+func (c *compiler) compileTransactionBlock(body *ast.Block) string {
 	sub := c.errorCompiler()
 	sub.indent = c.indent + "\t"
-	for _, stmt := range e.Body.Stmts {
+	for _, stmt := range body.Stmts {
 		sub.compileStmt(stmt)
 	}
-	return fmt.Sprintf("app.DB.Tx(ctx, func(ctx context.Context) error {\n%s%s\treturn nil\n%s})",
+	return fmt.Sprintf("app.Tx(ctx, func(app *App) error {\n%s%s\treturn nil\n%s})",
 		sub.b.String(), c.indent, c.indent)
 }
 
@@ -3553,6 +3422,9 @@ func (c *compiler) emitAwaitAggregateGroup(group awaitAggregateGroup) {
 	for index, task := range group.tasks {
 		specs[index] = compileAggregateSpec(task)
 	}
+	if c.emitMixedAggregateGroup(group, base, specs) {
+		return
+	}
 	c.write("g.Go(func() error {")
 	c.write("\t%s, err := %s.AggregateBatch(gctx, %s)", result, base, strings.Join(specs, ", "))
 	c.write("\tif err != nil { return err }")
@@ -3602,11 +3474,12 @@ func (c *compiler) compileStringMethod(e *ast.CallExpr) string {
 	if !ok {
 		return ""
 	}
-	obj := c.compileExpr(member.Object)
+	obj := func() string { return c.compileExpr(member.Object) }
 	arg := func(i int) string {
 		if i < len(e.Args) {
 			return c.compileExpr(e.Args[i].Value)
 		}
+		// Defensive: string helpers check nargs before requesting a fixed argument index.
 		return ""
 	}
 	nargs := len(e.Args)
@@ -3621,91 +3494,92 @@ func (c *compiler) compileStringMethod(e *ast.CallExpr) string {
 }
 
 // compileStringTransform handles string transform methods (returns string).
-func compileStringTransform(method, obj string, arg func(int) string, nargs int) string {
+func compileStringTransform(method string, obj func() string, arg func(int) string, nargs int) string {
 	switch method {
 	case "lowercase":
-		return fmt.Sprintf("strings.ToLower(%s)", obj)
+		return fmt.Sprintf("strings.ToLower(%s)", obj())
 	case "uppercase":
-		return fmt.Sprintf("strings.ToUpper(%s)", obj)
+		return fmt.Sprintf("strings.ToUpper(%s)", obj())
 	case "trim":
-		return fmt.Sprintf("strings.TrimSpace(%s)", obj)
+		return fmt.Sprintf("strings.TrimSpace(%s)", obj())
 	case "trimStart":
 		if nargs > 0 {
-			return fmt.Sprintf("strings.TrimLeft(%s, %s)", obj, arg(0))
+			return fmt.Sprintf("strings.TrimLeft(%s, %s)", obj(), arg(0))
 		}
-		return fmt.Sprintf("strings.TrimLeft(%s, \" \")", obj)
+		return fmt.Sprintf("strings.TrimLeft(%s, \" \")", obj())
 	case "trimEnd":
 		if nargs > 0 {
-			return fmt.Sprintf("strings.TrimRight(%s, %s)", obj, arg(0))
+			return fmt.Sprintf("strings.TrimRight(%s, %s)", obj(), arg(0))
 		}
-		return fmt.Sprintf("strings.TrimRight(%s, \" \")", obj)
+		return fmt.Sprintf("strings.TrimRight(%s, \" \")", obj())
 	case "reversed":
-		return fmt.Sprintf("str.Reverse(%s)", obj)
+		return fmt.Sprintf("str.Reverse(%s)", obj())
 	case "replace", "replaceAll":
 		if nargs >= 2 {
-			return fmt.Sprintf("strings.ReplaceAll(%s, %s, %s)", obj, arg(0), arg(1))
+			return fmt.Sprintf("strings.ReplaceAll(%s, %s, %s)", obj(), arg(0), arg(1))
 		}
 	case "substring":
 		if nargs >= 2 {
-			return fmt.Sprintf("%s[%s:%s]", obj, arg(0), arg(1))
+			return fmt.Sprintf("%s[%s:%s]", obj(), arg(0), arg(1))
 		}
 		if nargs == 1 {
-			return fmt.Sprintf("%s[%s:]", obj, arg(0))
+			return fmt.Sprintf("%s[%s:]", obj(), arg(0))
 		}
 	case "repeat":
 		if nargs > 0 {
-			return fmt.Sprintf("strings.Repeat(%s, int(%s))", obj, arg(0))
+			return fmt.Sprintf("strings.Repeat(%s, int(%s))", obj(), arg(0))
 		}
 	case "padStart":
 		if nargs >= 2 {
-			return fmt.Sprintf("str.PadLeft(%s, int(%s), %s)", obj, arg(0), arg(1))
+			return fmt.Sprintf("str.PadLeft(%s, int(%s), %s)", obj(), arg(0), arg(1))
 		}
 	case "padEnd":
 		if nargs >= 2 {
-			return fmt.Sprintf("str.PadRight(%s, int(%s), %s)", obj, arg(0), arg(1))
+			return fmt.Sprintf("str.PadRight(%s, int(%s), %s)", obj(), arg(0), arg(1))
 		}
 	case "split":
 		if nargs > 0 {
-			return fmt.Sprintf("strings.Split(%s, %s)", obj, arg(0))
+			return fmt.Sprintf("strings.Split(%s, %s)", obj(), arg(0))
 		}
 	}
 	return ""
 }
 
 // compileStringQuery handles string query methods (returns bool/int).
-func compileStringQuery(method, obj string, arg func(int) string, nargs int) string {
+func compileStringQuery(method string, obj func() string, arg func(int) string, nargs int) string {
 	switch method {
 	case "contains":
 		if nargs > 0 {
-			return fmt.Sprintf("strings.Contains(%s, %s)", obj, arg(0))
+			return fmt.Sprintf("strings.Contains(%s, %s)", obj(), arg(0))
 		}
 	case "startsWith":
 		if nargs > 0 {
-			return fmt.Sprintf("strings.HasPrefix(%s, %s)", obj, arg(0))
+			return fmt.Sprintf("strings.HasPrefix(%s, %s)", obj(), arg(0))
 		}
 	case "endsWith":
 		if nargs > 0 {
-			return fmt.Sprintf("strings.HasSuffix(%s, %s)", obj, arg(0))
+			return fmt.Sprintf("strings.HasSuffix(%s, %s)", obj(), arg(0))
 		}
 	case "isEmpty":
-		return fmt.Sprintf("(len(%s) == 0)", obj)
+		return fmt.Sprintf("(len(%s) == 0)", obj())
 	case "matches":
 		if nargs > 0 {
-			return fmt.Sprintf("str.Matches(%s, %s)", arg(0), obj)
+			value := obj()
+			return fmt.Sprintf("str.Matches(%s, %s)", arg(0), value)
 		}
 	case "length", "size":
-		return fmt.Sprintf("int64(len(%s))", obj)
+		return fmt.Sprintf("int64(len(%s))", obj())
 	}
 	return ""
 }
 
 // compileStringConvert handles string type conversion methods.
-func compileStringConvert(method, obj string) string {
+func compileStringConvert(method string, obj func() string) string {
 	switch method {
 	case "toInt":
-		return fmt.Sprintf("convert.StringToInt(%s)", obj)
+		return fmt.Sprintf("convert.StringToInt(%s)", obj())
 	case "toFloat":
-		return fmt.Sprintf("convert.StringToFloat(%s)", obj)
+		return fmt.Sprintf("convert.StringToFloat(%s)", obj())
 	}
 	return ""
 }

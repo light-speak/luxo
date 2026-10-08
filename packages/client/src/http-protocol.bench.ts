@@ -6,6 +6,24 @@ type TransportConstructor = typeof FetchTransport
 const endpoint = 'http://localhost/luvia'
 const utf8 = new TextEncoder()
 
+// Snapshot comparison for response presence only. Binary uses a valid Int payload.
+export async function measureHTTPResponsePresence(before: TransportConstructor, after: TransportConstructor): Promise<void> {
+  const originalFetch = globalThis.fetch
+  try {
+    for (const name of ['small', 'null', 'nested16', 'unicode4K', 'binary'] as const) {
+      const mode = name === 'binary' ? 'binary' : 'json'
+      const body = name === 'binary' ? new Uint8Array([14])
+        : utf8.encode(name === 'null' ? '{"data":null}' : fixture(name))
+      globalThis.fetch = async () => new Response(body)
+      const previous = new before(endpoint, { mode }), current = new after(endpoint, { mode })
+      previous.setSchema({ echo: { id: 1 } })
+      current.setSchema({ echo: { id: 1 } })
+      deepStrictEqual(await previous.call('echo'), await current.call('echo'))
+      await measureAsync(`response presence HTTP ${name}`, () => previous.call('echo'), () => current.call('echo'))
+    }
+  } finally { globalThis.fetch = originalFetch }
+}
+
 // Compile both snapshots with the same toolchain; do not time a Vite loader.
 export async function measureHTTP(before: TransportConstructor, after: TransportConstructor): Promise<void> {
   const configurations: Record<string, TransportOptions | undefined> = {

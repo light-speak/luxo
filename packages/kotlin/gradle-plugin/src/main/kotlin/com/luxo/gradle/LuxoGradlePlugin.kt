@@ -1,12 +1,22 @@
 package com.luxo.gradle
 
 import java.util.Properties
-import org.gradle.api.Plugin
 import org.gradle.api.Project
 import org.gradle.api.artifacts.Configuration
+import org.gradle.api.provider.Provider
+import org.jetbrains.kotlin.gradle.plugin.KotlinCompilation
+import org.jetbrains.kotlin.gradle.plugin.KotlinCompilerPluginSupportPlugin
+import org.jetbrains.kotlin.gradle.plugin.SubpluginArtifact
+import org.jetbrains.kotlin.gradle.plugin.SubpluginOption
 
 /** Registers Luxo code generation and compiler-AST field analysis. */
-class LuxoGradlePlugin : Plugin<Project> {
+class LuxoGradlePlugin : KotlinCompilerPluginSupportPlugin {
+    override fun getCompilerPluginId() = "com.luxo.select"
+    override fun getPluginArtifact() = SubpluginArtifact("com.luxo", "luxo-client", ToolingVersions.luxo)
+    override fun isApplicable(kotlinCompilation: KotlinCompilation<*>) = true
+    override fun applyToCompilation(kotlinCompilation: KotlinCompilation<*>): Provider<List<SubpluginOption>> =
+        kotlinCompilation.target.project.provider { emptyList() }
+
     override fun apply(target: Project) {
         val extension = target.extensions.create("luxo", LuxoExtension::class.java)
         extension.applyConventions(target)
@@ -16,16 +26,11 @@ class LuxoGradlePlugin : Plugin<Project> {
         val generate = target.tasks.register("luxoGenerate", LuxoGenerateTask::class.java) {
             it.configureFrom(extension, codegenClasspath)
         }
-        val analyze = target.tasks.register("luxoAnalyze", LuxoAnalyzeTask::class.java) {
+        target.tasks.register("luxoAnalyze", LuxoAnalyzeTask::class.java) {
             it.configureFrom(extension, analyzerClasspath)
             it.mustRunAfter(generate)
         }
 
-        target.tasks.configureEach {
-            if (it.name.startsWith("compile") && it.name.endsWith("Kotlin")) {
-                it.dependsOn(analyze)
-            }
-        }
     }
 }
 

@@ -11,6 +11,109 @@ import 'package:luxo_client/src/transport.dart' show wsTransportWithSequence;
 import 'package:test/test.dart';
 
 void main() {
+  test('missing JSON data retires only its operation', () async {
+    final failed = Completer<LuxoError>(), peer = Completer<Object?>();
+    final values = <Object?>[];
+    var calls = 0, errors = 0, completed = 0;
+    await _withSocket(
+      TransportMode.json,
+      (socket, message) {
+        final body = jsonDecode(message as String) as Map<String, dynamic>;
+        if (body.containsKey(r'$api')) {
+          socket.add(
+            jsonEncode({r'$id': body[r'$id'], if (++calls > 1) 'data': null}),
+          );
+          return;
+        }
+        final (id, cancel) = _control(message);
+        if (cancel) return;
+        _ack(socket, TransportMode.json, id);
+        socket.add(jsonEncode({r'$stream': id.toInt(), 'data': null}));
+        if (id == BigInt.one) {
+          socket.add(r'{"$stream":1}');
+          socket.add(r'{"$stream":1}');
+          socket.add(r'{"$end":1,"ok":true}');
+        }
+      },
+      (transport) async {
+        final stop = await transport.subscribe<Object?>(
+          'echo',
+          {},
+          values.add,
+          decoder: (value) => value,
+          onError: (error) {
+            errors++;
+            failed.complete(error);
+          },
+          onDone: () {
+            completed++;
+          },
+        );
+        final stopPeer = await transport.subscribe<Object?>(
+          'echo',
+          {},
+          peer.complete,
+          decoder: (value) => value,
+        );
+        expect((await failed.future).error, 'ParseError');
+        expect(await peer.future, null);
+        await expectLater(
+          transport.call<Object?>('echo'),
+          throwsA(
+            isA<LuxoError>().having(
+              (error) => error.error,
+              'error',
+              'ParseError',
+            ),
+          ),
+        );
+        expect(await transport.call<Object?>('echo'), null);
+        expect(values, [null]);
+        expect(errors, 1);
+        expect(completed, 0);
+        stop();
+        stopPeer();
+      },
+    );
+  });
+
+  for (final mode in TransportMode.values) {
+    test(
+      '$mode invalid schema update preserves a working subscription',
+      () async {
+        await _withSocket(
+          mode,
+          (socket, message) {
+            final (id, cancel) = _control(message);
+            if (cancel) return;
+            if (message is List<int>) {
+              final decoder = LuxoDecoder(Uint8List.fromList(message));
+              expect(decoder.readUnsigned(), 0x10);
+              decoder.readUnsigned();
+              expect(decoder.readUnsigned(), 7);
+            }
+            _ack(socket, mode, id);
+            _data(socket, mode, id, 7);
+          },
+          (transport) async {
+            expect(
+              () => transport.setSchema({'echo': const APISchemaEntry(0)}),
+              throwsA(isA<FormatException>()),
+            );
+            final value = Completer<int>();
+            final stop = await transport.subscribe(
+              'echo',
+              {},
+              value.complete,
+              decoder: _value,
+            );
+            expect(await value.future, 7);
+            stop();
+          },
+        );
+      },
+    );
+  }
   for (final mode in TransportMode.values) {
     for (final body in [
       '',

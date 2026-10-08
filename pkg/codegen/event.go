@@ -44,29 +44,10 @@ func (g *GeneratorContext) generateEventFile(result *semantic.Result, packageNam
 	enums := CollectEnumsFromResult(result)
 	objects := collectEventObjectTypes(result)
 
-	// Check if listener bodies need time import
-	needsTime := eventsUseType(events, "DateTime") || eventsUseType(events, "Duration")
-	for _, l := range listeners {
-		if l.Body != nil {
-			var feat handlerFeatures
-			scanBodyForBuiltins(l.Body, &feat)
-			if feat.hasTimeFunc {
-				needsTime = true
-				break
-			}
-		}
-	}
-
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
 	if len(events) > 0 {
 		b.WriteString("\t\"fmt\"\n")
-	}
-	if eventsNeedJSON(events) {
-		b.WriteString("\t\"encoding/json\"\n")
-	}
-	if needsTime {
-		b.WriteString("\t\"time\"\n")
 	}
 	if len(events) > 0 {
 		if eventsUseObjects(events, objects) {
@@ -75,12 +56,6 @@ func (g *GeneratorContext) generateEventFile(result *semantic.Result, packageNam
 		b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/event\"\n")
-	if eventsUseType(events, "UUID") {
-		b.WriteString("\n\t\"github.com/google/uuid\"\n")
-	}
-	if eventsUseType(events, "Decimal") {
-		b.WriteString("\t\"github.com/shopspring/decimal\"\n")
-	}
 	// Sort cross-module imports for deterministic output
 	modNames := make([]string, 0, len(crossModuleImports))
 	for modName := range crossModuleImports {
@@ -98,8 +73,9 @@ func (g *GeneratorContext) generateEventFile(result *semantic.Result, packageNam
 		generateEventStruct(&b, e)
 		g.generateEventCodec(&b, e, enums, objects)
 	}
+	g.generateEventSnapshots(&b, result, events, enums)
 
-	// Emit functions — pass struct directly, zero serialization
+	// Emit functions use owned static snapshots in memory, encoding only for NATS.
 	for _, e := range events {
 		generateEmitFunc(&b, e)
 	}
@@ -125,6 +101,11 @@ func (g *GeneratorContext) generateEventFile(result *semantic.Result, packageNam
 	body := b.String()
 	var out strings.Builder
 	out.WriteString(importPrefix)
+	// Include types used only inside nested snapshot copies, not just root fields.
+	writeScalarTypeImports(&out, body)
+	if generatedPackages(body).has("bytes") {
+		out.WriteString("\t\"bytes\"\n")
+	}
 	if generatedPackages(body).has("selection") {
 		out.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
 	}
@@ -146,32 +127,10 @@ func collectEventObjectTypes(result *semantic.Result) map[string]bool {
 	return objects
 }
 
-func eventsUseType(events []*ast.EventDecl, name string) bool {
-	for _, eventDecl := range events {
-		for _, param := range eventDecl.Params {
-			if param.Type != nil && param.Type.Name == name {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func eventsUseObjects(events []*ast.EventDecl, objects map[string]bool) bool {
 	for _, eventDecl := range events {
 		for _, param := range eventDecl.Params {
 			if param.Type != nil && objects[param.Type.Name] {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func eventsNeedJSON(events []*ast.EventDecl) bool {
-	for _, eventDecl := range events {
-		for _, param := range eventDecl.Params {
-			if param.Type != nil && param.Type.Name == "JSON" {
 				return true
 			}
 		}
@@ -201,57 +160,21 @@ func generateEventStruct(b *strings.Builder, e *ast.EventDecl) {
 // generateEventCodec generates MarshalLuxo/UnmarshalLuxo for binary encoding.
 // Field IDs come from luxo.lock (stable across schema evolution).
 func (g *GeneratorContext) generateEventCodec(b *strings.Builder, e *ast.EventDecl, enums, objects map[string]bool) {
-	typeName := e.Name + "Event"
-
-	// MarshalLuxo
-	fmt.Fprintf(b, "// MarshalLuxo encodes %s to Luxo binary format.\n", typeName)
-	fmt.Fprintf(b, "func (e %s) MarshalLuxo() ([]byte, error) {\n", typeName)
-	b.WriteString("\tvar enc codec.Encoder\n")
-	for _, p := range e.Params {
-		g.writeEventMarshalField(b, e.Name, p, enums[p.Type.Name], objects[p.Type.Name])
-	}
-	b.WriteString("\tenc.WriteEnd()\n")
-	b.WriteString("\treturn enc.Bytes(), nil\n")
-	b.WriteString("}\n\n")
-
-	// UnmarshalLuxo
-	fmt.Fprintf(b, "// UnmarshalLuxo decodes %s from Luxo binary format.\n", typeName)
-	fmt.Fprintf(b, "func (e *%s) UnmarshalLuxo(data []byte) error {\n", typeName)
-	for _, p := range e.Params {
-		if p.Type != nil && !p.Type.Nullable && g.eventFieldID(e.Name, p.Name) != 0 {
-			fmt.Fprintf(b, "\tvar seen%s bool\n", str.Capitalize(p.Name))
-		}
-	}
-	b.WriteString("\tdec := codec.NewDecoder(data)\n")
-	b.WriteString("\tfor dec.NextField() {\n")
-	b.WriteString("\t\tswitch dec.FieldID() {\n")
-	for _, p := range e.Params {
-		g.writeEventUnmarshalField(b, e.Name, p, enums[p.Type.Name], objects[p.Type.Name])
-		if p.Type != nil && !p.Type.Nullable && g.eventFieldID(e.Name, p.Name) != 0 {
-			fmt.Fprintf(b, "\t\t\tseen%s = true\n", str.Capitalize(p.Name))
-		}
-	}
-	b.WriteString("\t\tdefault: dec.SkipField()\n")
-	b.WriteString("\t\t}\n")
-	b.WriteString("\t}\n")
-	b.WriteString("\tif err := dec.Err(); err != nil { return err }\n")
-	for _, p := range e.Params {
-		if p.Type != nil && !p.Type.Nullable && g.eventFieldID(e.Name, p.Name) != 0 {
-			fmt.Fprintf(b, "\tif !seen%s { return fmt.Errorf(%q) }\n", str.Capitalize(p.Name), "event "+e.Name+": missing required field "+p.Name)
-		}
-	}
-	b.WriteString("\treturn nil\n")
-	b.WriteString("}\n\n")
+	c := eventWireCodec{name: e.Name + "Event", marshalName: "MarshalLuxo", unmarshalName: "UnmarshalLuxo", fields: e.Params, ids: g.ids.EventFields[e.Name]}
+	c.write(b, enums, objects)
 }
 
 func (g *GeneratorContext) writeEventMarshalField(b *strings.Builder, eventName string, param *ast.ParamDecl, isEnum, isObject bool) {
-	fieldID := g.eventFieldID(eventName, param.Name)
+	writeEventMarshalField(b, g.eventFieldID(eventName, param.Name), param, isEnum, isObject)
+}
+
+func writeEventMarshalField(b *strings.Builder, fieldID int, param *ast.ParamDecl, isEnum, isObject bool) {
 	if fieldID == 0 || param.Type == nil {
 		return
 	}
 	value := "e." + str.Capitalize(param.Name)
 	if param.Type.IsList {
-		writeEventListMarshal(b, fieldID, value, param.Type.Name, isEnum, isObject)
+		writeEventListMarshal(b, fieldID, value, param.Type, isEnum, isObject)
 		return
 	}
 	if isObject {
@@ -281,7 +204,7 @@ func writeEventScalarMarshal(b *strings.Builder, fieldID int, value string, ref 
 
 func eventScalarWriteStatement(typeName, value string, isEnum bool) string {
 	if isEnum {
-		return binaryCallStatement(fmt.Sprintf("enc.WriteString(string(%s))", value), "return nil, err")
+		return fmt.Sprintf("if !%s.IsValid() { return nil, codec.ErrInvalidEnum }; ", value) + binaryCallStatement(fmt.Sprintf("enc.WriteString(string(%s))", value), "return nil, err")
 	}
 	switch typeName {
 	case "Int":
@@ -308,17 +231,23 @@ func eventScalarWriteStatement(typeName, value string, isEnum bool) string {
 	return ""
 }
 
-func writeEventListMarshal(b *strings.Builder, fieldID int, value, typeName string, isEnum, isObject bool) {
+func writeEventListMarshal(b *strings.Builder, fieldID int, value string, ref *ast.TypeRef, isEnum, isObject bool) {
 	fmt.Fprintf(b, "\tenc.WriteFieldHeader(%d)\n", fieldID)
+	if ref.Nullable {
+		fmt.Fprintf(b, "\tif %s == nil { enc.WriteNull() } else {\n\tenc.WritePresent()\n", value)
+	}
 	fmt.Fprintf(b, "\tenc.WriteArrayHeader(len(%s))\n", value)
 	fmt.Fprintf(b, "\tfor i := range %s {\n", value)
 	item := value + "[i]"
 	if isObject {
 		writeEventObjectValue(b, item, "\t\t")
-	} else if isEventBuiltin(typeName) || isEnum {
-		fmt.Fprintf(b, "\t\t%s\n", eventScalarWriteStatement(typeName, item, isEnum))
+	} else if isEventBuiltin(ref.Name) || isEnum {
+		fmt.Fprintf(b, "\t\t%s\n", eventScalarWriteStatement(ref.Name, item, isEnum))
 	}
 	b.WriteString("\t}\n")
+	if ref.Nullable {
+		b.WriteString("\t}\n")
+	}
 }
 
 func writeEventObjectMarshal(b *strings.Builder, fieldID int, value string, nullable bool) {
@@ -337,23 +266,26 @@ func writeEventObjectMarshal(b *strings.Builder, fieldID int, value string, null
 
 func writeEventObjectValue(b *strings.Builder, value, indent string) {
 	fmt.Fprintf(b, "%sbuf := api.GetBuf()\n", indent)
-	writeBinaryCall(b, indent, fmt.Sprintf("%s.WriteLuxo(buf, nil)", value), "api.PutBuf(buf); return nil, err")
-	fmt.Fprintf(b, "%senc.WriteBytes(buf.B)\n", indent)
-	fmt.Fprintf(b, "%sapi.PutBuf(buf)\n", indent)
+	fmt.Fprintf(b, "%sraw, err := %s.marshalEventSnapshot(buf.B, depth + 1)\n", indent, value)
+	fmt.Fprintf(b, "%sif err != nil { api.PutBuf(buf); return nil, err }\n", indent)
+	fmt.Fprintf(b, "%sbuf.B = raw\n%senc.WriteBytes(raw)\n%sapi.PutBuf(buf)\n", indent, indent, indent)
 }
 
 func (g *GeneratorContext) writeEventUnmarshalField(b *strings.Builder, eventName string, param *ast.ParamDecl, isEnum, isObject bool) {
-	fieldID := g.eventFieldID(eventName, param.Name)
+	writeEventUnmarshalField(b, g.eventFieldID(eventName, param.Name), param, isEnum, isObject, false)
+}
+
+func writeEventUnmarshalField(b *strings.Builder, fieldID int, param *ast.ParamDecl, isEnum, isObject, objectPointer bool) {
 	if fieldID == 0 || param.Type == nil {
 		return
 	}
 	value := "e." + str.Capitalize(param.Name)
 	if param.Type.IsList {
-		writeEventListUnmarshal(b, fieldID, value, param.Type.Name, isEnum, isObject)
+		writeEventListUnmarshal(b, fieldID, value, param.Type, isEnum, isObject)
 		return
 	}
 	if isObject {
-		writeEventObjectUnmarshal(b, fieldID, value, param.Type)
+		writeEventObjectUnmarshal(b, fieldID, value, param.Type, objectPointer)
 		return
 	}
 	if isEventBuiltin(param.Type.Name) || isEnum {
@@ -368,11 +300,14 @@ func writeEventScalarUnmarshal(b *strings.Builder, fieldID int, value string, re
 		return
 	}
 	fmt.Fprintf(b, "\t\t\t%s = %s\n", value, eventScalarReadExpression(ref.Name, isEnum, ref.Nullable))
+	if isEnum {
+		writeEnumReadCheck(b, value, ref.Nullable, "\t\t\t")
+	}
 }
 
 func writeEventDecimalUnmarshal(b *strings.Builder, value string, nullable bool) {
 	if nullable {
-		fmt.Fprintf(b, "\t\t\tif raw := dec.ReadStringPtr(); raw != nil { parsed, err := decimal.NewFromString(*raw); if err != nil { return err }; %s = &parsed }\n", value)
+		fmt.Fprintf(b, "\t\t\tif raw := dec.ReadStringPtr(); raw != nil { parsed, err := decimal.NewFromString(*raw); if err != nil { return err }; %s = &parsed } else { %s = nil }\n", value, value)
 		return
 	}
 	fmt.Fprintf(b, "\t\t\tparsed, err := decimal.NewFromString(dec.ReadString()); if err != nil { return err }; %s = parsed\n", value)
@@ -441,13 +376,18 @@ func eventNullableReadClosure(typeName string, isEnum bool) string {
 	return "func() *" + goType + " { raw := " + read + "; if raw == nil { return nil }; value := " + conversion + "; return &value }()"
 }
 
-func writeEventListUnmarshal(b *strings.Builder, fieldID int, value, typeName string, isEnum, isObject bool) {
+func writeEventListUnmarshal(b *strings.Builder, fieldID int, value string, ref *ast.TypeRef, isEnum, isObject bool) {
 	fmt.Fprintf(b, "\t\tcase %d:\n", fieldID)
+	if ref.Nullable {
+		fmt.Fprintf(b, "\t\t\tif !dec.ReadBool() { %s = nil; break }\n", value)
+	}
+	typeName := ref.Name
 	if typeName == "DateTime" {
 		fmt.Fprintf(b, "\t\t\t%s = dec.ReadDateTimeArray()\n", value)
 		return
 	}
 	b.WriteString("\t\t\tcount := dec.ReadArrayLength()\n")
+	b.WriteString("\t\t\tif !dec.CheckElementBytes(count, 1) { break }\n")
 	fmt.Fprintf(b, "\t\t\t%s = make([]%s, count)\n", value, mapBaseType(typeName))
 	fmt.Fprintf(b, "\t\t\tfor i := range %s {\n", value)
 	item := value + "[i]"
@@ -458,36 +398,42 @@ func writeEventListUnmarshal(b *strings.Builder, fieldID int, value, typeName st
 		fmt.Fprintf(b, "\t\t\t\t%s = parsed\n", item)
 	} else if isEventBuiltin(typeName) || isEnum {
 		fmt.Fprintf(b, "\t\t\t\t%s = %s\n", item, eventScalarReadExpression(typeName, isEnum, false))
+		if isEnum {
+			writeEnumReadCheck(b, item, false, "\t\t\t\t")
+		}
 	}
+	b.WriteString("\t\t\t\tif dec.Err() != nil { break }\n")
 	b.WriteString("\t\t\t}\n")
 }
 
-func writeEventObjectUnmarshal(b *strings.Builder, fieldID int, value string, ref *ast.TypeRef) {
+func writeEventObjectUnmarshal(b *strings.Builder, fieldID int, value string, ref *ast.TypeRef, objectPointer ...bool) {
 	fmt.Fprintf(b, "\t\tcase %d:\n", fieldID)
 	if ref.Nullable {
 		b.WriteString("\t\t\tif dec.ReadBool() {\n")
 		fmt.Fprintf(b, "\t\t\t\t%s = &%s{}\n", value, ref.Name)
 		writeEventObjectReadValue(b, value, "\t\t\t\t")
-		b.WriteString("\t\t\t}\n")
+		fmt.Fprintf(b, "\t\t\t} else { %s = nil }\n", value)
 		return
+	}
+	if len(objectPointer) > 0 && objectPointer[0] {
+		fmt.Fprintf(b, "\t\t\t%s = &%s{}\n", value, ref.Name)
 	}
 	writeEventObjectReadValue(b, value, "\t\t\t")
 }
 
 func writeEventObjectReadValue(b *strings.Builder, value, indent string) {
 	fmt.Fprintf(b, "%sraw := dec.ReadBytes()\n", indent)
-	fmt.Fprintf(b, "%snested := codec.NewDecoder(raw)\n", indent)
-	fmt.Fprintf(b, "%s%s.ReadLuxo(nested)\n", indent, value)
-	fmt.Fprintf(b, "%sif err := nested.Err(); err != nil { return err }\n", indent)
+	fmt.Fprintf(b, "%sif err := dec.Err(); err != nil { return err }\n", indent)
+	fmt.Fprintf(b, "%sif err := %s.unmarshalEventSnapshot(raw, depth + 1); err != nil { return err }\n", indent, value)
 }
 
 // generateEmitFunc generates a typed emit function.
-// Passes the struct directly — ChanBus delivers zero-copy,
-// NATSBus serializes at the wire boundary.
+// ChanBus captures a validated independent snapshot; NATSBus serializes only
+// at the wire boundary. Neither path uses an encode/decode copying round trip.
 func generateEmitFunc(b *strings.Builder, e *ast.EventDecl) {
 	fmt.Fprintf(b, "// Emit%s publishes a %s event.\n", e.Name, e.Name)
 	fmt.Fprintf(b, "func Emit%s(ctx context.Context, bus event.Bus, e %sEvent) error {\n", e.Name, e.Name)
-	fmt.Fprintf(b, "\treturn bus.Emit(ctx, %q, e)\n", e.Name)
+	fmt.Fprintf(b, "\treturn bus.Emit(ctx, %q, &e)\n", e.Name)
 	fmt.Fprintf(b, "}\n\n")
 }
 

@@ -17,6 +17,7 @@ import { writeWireUint64 } from './uint64'
 import { MAX_ARENA_SIZE, MAX_COLUMNAR_RECORDS, WireReader, decodeUTF8 } from './wire-reader'
 import { decodeLuxoJSON } from './json'
 import { assertUnicode } from './unicode'
+import { MAX_SELECTION_FIELD_ID } from './schema'
 
 const textEncoder = new TextEncoder()
 
@@ -99,8 +100,12 @@ export function parseUUID(s: string): Uint8Array | null {
 
 // --- Encoder ---
 
+const emptyEncoderBuffer = new Uint8Array(0)
+const emptyEncoderView = new DataView(emptyEncoderBuffer.buffer)
+const maxTransferredSlack = 64
+
 export class Encoder {
-  private buf: Uint8Array
+  private buf: Uint8Array<ArrayBuffer>
   private view: DataView
   private pos: number
 
@@ -196,12 +201,17 @@ export class Encoder {
 
   /** Write a length-delimited value directly into this encoder's buffer. */
   writeDelimited(writeValue: (encoder: Encoder) => void): void {
+    this.writeDelimitedValue(undefined, writeValue)
+  }
+
+  /** Write a typed delimited value without allocating a capturing callback. */
+  writeDelimitedValue<T>(value: T, writeValue: (encoder: Encoder, value: T) => void): void {
     const prefixPosition = this.pos
     this.grow(1)
     this.pos++
     const valuePosition = this.pos
     try {
-      writeValue(this)
+      writeValue(this, value)
     } catch (error) {
       this.pos = prefixPosition
       throw error
@@ -319,8 +329,19 @@ export class Encoder {
   }
 
   /** Return a trimmed copy of the encoded data (safe for fetch body) */
-  bytes(): Uint8Array {
+  bytes(): Uint8Array<ArrayBuffer> {
     return this.buf.slice(0, this.pos)
+  }
+
+  /** Transfer ownership, compacting buffers with significant unused capacity.
+   * Subsequent writes use a new buffer. Consumers must honor byteOffset/byteLength. */
+  takeBytes(): Uint8Array<ArrayBuffer> {
+    const result = this.buf.length - this.pos > maxTransferredSlack
+      ? this.buf.slice(0, this.pos) : this.buf.subarray(0, this.pos)
+    this.buf = emptyEncoderBuffer
+    this.view = emptyEncoderView
+    this.pos = 0
+    return result
   }
 
   /** Reset encoder for reuse without reallocating */
@@ -819,9 +840,15 @@ export class ColumnarDecoder extends WireReader {
 
 // --- FieldMask helpers ---
 
-/** Set a field bit in the mask, growing the mask if necessary. Returns the (possibly new) mask. */
+function checkSelectionFieldID(fieldID: number): void {
+  if (!Number.isInteger(fieldID) || fieldID <= 0 || fieldID > MAX_SELECTION_FIELD_ID) {
+    throw new RangeError('selection field ID must be an integer from 1 to 65535')
+  }
+}
+
+/** Set a field bit, growing if necessary. IDs outside 1..65535 throw RangeError. */
 export function fieldMaskSet(mask: Uint8Array, fieldID: number): Uint8Array {
-  if (!Number.isInteger(fieldID) || fieldID <= 0) return mask
+  checkSelectionFieldID(fieldID)
   const bit = fieldID - 1
   const byteIdx = bit >>> 3
   const bitIdx = bit & 7
@@ -835,9 +862,9 @@ export function fieldMaskSet(mask: Uint8Array, fieldID: number): Uint8Array {
   return mask
 }
 
-/** Check if a field bit is set in the mask. */
+/** Check a field bit. Invalid IDs throw RangeError rather than aliasing another bit. */
 export function fieldMaskHas(mask: Uint8Array, fieldID: number): boolean {
-  if (!Number.isInteger(fieldID) || fieldID <= 0) return false
+  checkSelectionFieldID(fieldID)
   const bit = fieldID - 1
   const byteIdx = bit >>> 3
   if (byteIdx >= mask.length) return false

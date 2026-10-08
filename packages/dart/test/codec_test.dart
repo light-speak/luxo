@@ -811,6 +811,36 @@ void main() {
   });
 
   group('fieldMask utilities', () {
+    test(
+      'rejects IDs outside the selection domain without modifying the mask',
+      () {
+        for (final fieldID in [
+          0,
+          -1,
+          65536,
+          2147483647,
+          4294967297,
+          9007199254740991,
+        ]) {
+          final mask = Uint8List.fromList([1]);
+          expect(() => fieldMaskHas(mask, fieldID), throwsRangeError);
+          expect(() => fieldMaskSet(mask, fieldID), throwsRangeError);
+          expect(mask, [1]);
+        }
+      },
+    );
+
+    test(
+      'maximum selection field fits in 8 KiB without setting the spare bit',
+      () {
+        final mask = fieldMaskSet(Uint8List(0), 65535);
+        expect(mask.length, 8192);
+        expect(mask.last, 0x40);
+        expect(fieldMaskHas(mask, 65535), isTrue);
+        expect(fieldMaskHas(mask, 1), isFalse);
+      },
+    );
+
     test('set and check single field', () {
       var mask = Uint8List(0);
       mask = fieldMaskSet(mask, 1);
@@ -826,11 +856,11 @@ void main() {
       expect(fieldMaskHas(mask, 3), isTrue);
       expect(fieldMaskHas(mask, 8), isTrue);
       expect(fieldMaskHas(mask, 16), isTrue);
-      expect(fieldMaskHas(mask, 0), isFalse);
+      expect(() => fieldMaskHas(mask, 0), throwsRangeError);
       expect(fieldMaskHas(mask, 9), isFalse);
     });
 
-    test('fieldMaskHas returns false for out-of-range', () {
+    test('fieldMaskHas returns false for unselected valid IDs', () {
       final mask = Uint8List(1);
       expect(fieldMaskHas(mask, 100), isFalse);
     });

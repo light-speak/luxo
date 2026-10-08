@@ -2,19 +2,67 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/schema"
 )
 
+type delayedLogResponseWriter struct{ *httptest.ResponseRecorder }
+
+func (w delayedLogResponseWriter) Write(p []byte) (int, error) {
+	time.Sleep(10 * time.Millisecond)
+	return w.ResponseRecorder.Write(p)
+}
+
+func TestHTTPLogIncludesResponseWriteDuration(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var out bytes.Buffer
+		r := NewRouterWithOptions(RouterOptions{RequestLogging: true, SynchronousRequestLogs: true, LogWriter: &out})
+		r.Handle("health", func(_ context.Context, req *Request) error { req.Buf.AppendString("true"); return nil })
+		r.ServeHTTP(delayedLogResponseWriter{httptest.NewRecorder()}, httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(`{"$api":"health"}`)))
+		if !strings.Contains(out.String(), "server=30.0ms") {
+			t.Fatalf("write time missing: %q", out.String())
+		}
+	})
+}
+
+func TestHTTPAsyncLogDoesNotWaitForWriter(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		out := &blockedLogWriter{entered: make(chan struct{}), release: make(chan struct{})}
+		r := NewRouterWithOptions(RouterOptions{RequestLogging: true, LogWriter: out})
+		r.Handle("health", func(_ context.Context, req *Request) error {
+			req.Buf.AppendString("true")
+			return nil
+		})
+		response := httptest.NewRecorder()
+		r.ServeHTTP(delayedLogResponseWriter{response}, httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(`{"$api":"health"}`)))
+		<-out.entered
+		// The response completed although output is blocked. Output delay must
+		// not rewrite the already captured server-side duration.
+		time.Sleep(time.Second)
+		close(out.release)
+		if err := r.CloseRequestLogs(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if response.Code != http.StatusOK || !strings.Contains(out.buf.String(), "server=30.0ms") {
+			t.Fatalf("response=%d logs=%q", response.Code, out.buf.String())
+		}
+		if drops, failures := r.RequestLogStats(); drops != 0 || failures != 0 {
+			t.Fatalf("drops=%d failures=%d", drops, failures)
+		}
+	})
+}
+
 func TestLogRequest_WithError(t *testing.T) {
 	var logs bytes.Buffer
-	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, LogWriter: &logs})
+	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, SynchronousRequestLogs: true, LogWriter: &logs})
 	rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "getUser", Module: "user"})
 
 	rt.logRequest("getUser", 50*time.Millisecond, fmt.Errorf("InvalidCredentials"))
@@ -32,7 +80,7 @@ func TestLogRequest_WithError(t *testing.T) {
 
 func TestLogRequest_SlowDuration(t *testing.T) {
 	var logs bytes.Buffer
-	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, LogWriter: &logs})
+	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, SynchronousRequestLogs: true, LogWriter: &logs})
 	rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "slowAPI", Module: "slow"})
 
 	// >500ms should be red
@@ -46,7 +94,7 @@ func TestLogRequest_SlowDuration(t *testing.T) {
 
 func TestLogRequest_MediumDuration(t *testing.T) {
 	var logs bytes.Buffer
-	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, LogWriter: &logs})
+	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, SynchronousRequestLogs: true, LogWriter: &logs})
 	rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "medAPI", Module: "med"})
 
 	// >100ms <500ms should be yellow
@@ -77,7 +125,7 @@ func TestServeHTTPLogsParseErrors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var logs bytes.Buffer
-			rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, LogWriter: &logs})
+			rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, SynchronousRequestLogs: true, LogWriter: &logs})
 			r := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(tt.body))
 			if tt.binary {
 				r.Header.Set("X-Luxo-Mode", "binary")
@@ -96,7 +144,7 @@ func TestServeHTTPLogsParseErrors(t *testing.T) {
 
 func TestLogRequest_NoModule(t *testing.T) {
 	var logs bytes.Buffer
-	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, LogWriter: &logs})
+	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, SynchronousRequestLogs: true, LogWriter: &logs})
 	// API not in schema — should fall back to "api" module
 
 	rt.logRequest("unknownAPI", 5*time.Millisecond, nil)

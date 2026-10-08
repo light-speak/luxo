@@ -8,11 +8,11 @@ import type { IncomingHttpHeaders } from 'node:http'
 const utf8 = new TextEncoder()
 afterEach(() => vi.unstubAllGlobals())
 
-function binaryError(): Uint8Array<ArrayBuffer> {
+function binaryError(code = 401n, name = 'Unauthorized', message = 'expired'): Uint8Array<ArrayBuffer> {
   const encoder = new Encoder()
-  encoder.writeFieldInt(1, 401n)
-  encoder.writeFieldString(2, 'Unauthorized')
-  encoder.writeFieldString(3, 'expired')
+  encoder.writeFieldInt(1, code)
+  encoder.writeFieldString(2, name)
+  encoder.writeFieldString(3, message)
   encoder.writeEnd()
   return new Uint8Array(encoder.bytes())
 }
@@ -24,6 +24,25 @@ function response(mode: TransportMode, status = 200): Response {
 }
 
 describe.each(['json', 'binary'] as const)('%s HTTP request metadata', mode => {
+  it('preserves cache overload without automatic retry or token refresh', async () => {
+    const refresh = vi.fn(async () => 'must-not-refresh')
+    const fetch = vi.fn(async () => new Response(mode === 'json'
+      ? '{"error":"CacheOriginBusy","code":503,"message":"Cache origin capacity exhausted"}'
+      : binaryError(503n, 'CacheOriginBusy', 'Cache origin capacity exhausted'), { status: 503 }))
+    vi.stubGlobal('fetch', fetch)
+    const transport = new FetchTransport('http://localhost/api', { mode, onTokenExpired: refresh })
+    transport.setSchema({ echo: { id: 1 } })
+    await expect(transport.call('echo')).rejects.toMatchObject({
+      error: 'CacheOriginBusy', code: 503, message: 'Cache origin capacity exhausted',
+    })
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(refresh).not.toHaveBeenCalled()
+    fetch.mockImplementation(async () => response(mode))
+    const next = await transport.call('echo')
+    expect(next).toEqual(mode === 'json' ? true : Uint8Array.of(1))
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
+
   it('reserves case-insensitive protocol headers and snapshots caller-owned options', async () => {
     const requests: RequestInit[] = []
     vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {

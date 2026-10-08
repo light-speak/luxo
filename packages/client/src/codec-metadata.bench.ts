@@ -6,6 +6,68 @@ import { measure } from './measure.bench'
 type Codecs = typeof Codec
 type Operation = () => unknown
 
+type Int64Writer = (bytes: Uint8Array, offset: number, value: bigint) => number
+
+/** Compare separately compiled integer writers with prebuilt inputs and reused destinations. */
+export function measureInt64Writes(before: Int64Writer, after: Int64Writer): void {
+  const maximum = (1n << 63n) - 1n
+  const samples: [string, bigint[]][] = [
+    ['zero', [0n]], ['small', [42n]], ['negative', [-42n]],
+    ['int32-max', [2147483647n]], ['int32-min', [-2147483648n]],
+    ['uint32', [4294967295n]], ['safe-limit', [9007199254740991n]],
+    ['above-safe-limit', [9007199254740993n]], ['int64-max', [maximum]], ['int64-min', [-(1n << 63n)]],
+    ['128-small', Array.from({ length: 128 }, (_, i) => BigInt(i - 64))],
+    ['128-mixed', Array.from({ length: 128 }, (_, i) => i % 2 ? BigInt(i) : maximum - BigInt(i))],
+  ]
+  for (const [name, values] of samples) {
+    const operation = (writer: Int64Writer, bytes: Uint8Array): (() => number) => () => {
+      let offset = 0
+      for (const value of values) offset = writer(bytes, offset, value)
+      return offset
+    }
+    const oldBytes = new Uint8Array(values.length * 10), newBytes = oldBytes.slice()
+    const previous = operation(before, oldBytes), current = operation(after, newBytes)
+    if (previous() !== current() || oldBytes.some((byte, i) => byte !== newBytes[i])) {
+      throw new Error(`${name}: integer writer wire differs`)
+    }
+    measure(`Int64 ${name}`, previous, current)
+  }
+}
+
+/** Compare selection helpers on valid IDs only; the legacy path aliases large IDs. */
+export function measureFieldMasks(codec: Pick<Codecs, 'fieldMaskHas' | 'fieldMaskSet'>): void {
+  for (const id of [1, 128, 65535]) {
+    const mask = codec.fieldMaskSet(new Uint8Array(0), id)
+    measure(`mask has id=${id}`, () => legacyMaskHas(mask, id), () => codec.fieldMaskHas(mask, id))
+    measure(`mask set reused id=${id}`, () => legacyMaskSet(mask, id), () => codec.fieldMaskSet(mask, id))
+    measure(`mask set fresh id=${id}`, () => legacyMaskSet(new Uint8Array(0), id), () => codec.fieldMaskSet(new Uint8Array(0), id))
+  }
+}
+
+// Frozen helpers from before the classified ID boundary, for benchmarks only.
+function legacyMaskHas(mask: Uint8Array, fieldID: number): boolean {
+  if (!Number.isInteger(fieldID) || fieldID <= 0) return false
+  const bit = fieldID - 1
+  const byteIdx = bit >>> 3
+  if (byteIdx >= mask.length) return false
+  return (mask[byteIdx] & (1 << (bit & 7))) !== 0
+}
+
+function legacyMaskSet(mask: Uint8Array, fieldID: number): Uint8Array {
+  if (!Number.isInteger(fieldID) || fieldID <= 0) return mask
+  const bit = fieldID - 1
+  const byteIdx = bit >>> 3
+  const bitIdx = bit & 7
+  if (byteIdx >= mask.length) {
+    const next = new Uint8Array(byteIdx + 1)
+    next.set(mask, 0)
+    next[byteIdx] = 1 << bitIdx
+    return next
+  }
+  mask[byteIdx] |= 1 << bitIdx
+  return mask
+}
+
 /** Compare separately built UUID parsers without charging malformed-input fixes to valid wire. */
 export function measureUUID(before: Pick<Codecs, 'parseUUID' | 'Encoder'>, after: Pick<Codecs, 'parseUUID' | 'Encoder'>): void {
   const samples = [

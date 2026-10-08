@@ -35,9 +35,21 @@ type Gateway struct {
 
 // New creates a new Luvia gateway.
 func New() *Gateway {
-	router := api.NewRouter()
+	return newGateway(api.NewRouter())
+}
+
+// NewWithOptions creates a gateway with explicitly owned runtime dependencies.
+func NewWithOptions(options api.RouterOptions) *Gateway {
+	return newGateway(api.NewRouterWithOptions(options))
+}
+
+func newGateway(router *api.Router) *Gateway {
 	router.IdentityExtractor = func(ctx context.Context) any {
-		return Identity(ctx)
+		// An anonymous identity must not become a non-nil interface holding a nil pointer.
+		if identity := Identity(ctx); identity != nil {
+			return identity
+		}
+		return nil
 	}
 	router.InternalRequestContext = internalRequestContext
 	return &Gateway{
@@ -54,7 +66,7 @@ func internalRequestContext(ctx context.Context, bearerToken string) (context.Co
 	if err != nil {
 		return nil, err
 	}
-	ctx = context.WithValue(ctx, identityKey, &Claims{data: data})
+	ctx = context.WithValue(ctx, identityKey, &data)
 	return context.WithValue(ctx, bearerTokenCtxKey{}, bearerToken), nil
 }
 
@@ -80,8 +92,17 @@ func (g *Gateway) Serve(version string) error {
 	return g.serve(version, quit)
 }
 
-func (g *Gateway) serve(version string, quit <-chan os.Signal) error {
-	if err := g.Router.Validate(); err != nil {
+func (g *Gateway) serve(version string, quit <-chan os.Signal) (serveResult error) {
+	// Logs are best-effort diagnostics, but drain failures remain visible to the
+	// process owner. This also releases the worker when startup fails.
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := g.Router.CloseRequestLogs(ctx); err != nil {
+			serveResult = errors.Join(serveResult, fmt.Errorf("request log shutdown: %w", err))
+		}
+	}()
+	if err := g.Router.Prepare(); err != nil {
 		return err
 	}
 	shutdownTimeout, err := positiveDurationEnv("GRACEFUL_TIMEOUT", 30*time.Second)

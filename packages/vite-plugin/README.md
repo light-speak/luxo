@@ -59,6 +59,15 @@ during generation, not on the application's request path.
 
 ## Features / 功能
 
+Generated APIs use a static encoder per API with the original typed parameters;
+they do not allocate a per-call request wrapper. Custom transports must implement
+`GeneratedTransport.callGenerated` and `subscribeGenerated`. Dynamic Schema-based
+calls remain a separate, explicit client capability; they are not a fallback for generated APIs.
+
+生成API默认将每API静态编码器与原强类型参数交给Transport，不再逐请求创建请求包装对象。
+手写Transport需要实现`GeneratedTransport.callGenerated`和`subscribeGenerated`。
+动态Schema调用仍是独立、显式入口，不作为生成API的降级路径。
+
 ### Standalone SDK generation
 
 For scripts that do not start Vite, use the same Schema loader and generator:

@@ -11,7 +11,7 @@ import (
 
 // ProtocolVersion identifies the complete internal RPC contract, independently
 // of the product version and public SDK wire format. Peers must match exactly.
-const ProtocolVersion uint32 = 3
+const ProtocolVersion uint32 = 4
 
 const handshakeTimeout = 5 * time.Second
 const protocolMagic = "LUXORPC\x00"

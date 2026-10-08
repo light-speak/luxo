@@ -3,13 +3,71 @@ package api
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
 
+	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/light-speak/luxo/pkg/lux/schema"
 )
+
+func TestNativeStreamPanicFinishesOnlyItsSubscription(t *testing.T) {
+	for _, exit := range []struct {
+		name string
+		run  func()
+	}{
+		{"panic", func() { panic("private-native-details") }},
+		{"nil", func() { panic(nil) }},
+		{"goexit", runtime.Goexit},
+	} {
+		t.Run(exit.name, func(t *testing.T) { testNativeStreamAbnormalExit(t, exit.run) })
+	}
+}
+
+func testNativeStreamAbnormalExit(t *testing.T, exit func()) {
+	t.Helper()
+	for _, prepared := range []bool{false, true} {
+		synctest.Test(t, func(t *testing.T) {
+			router := NewRouter()
+			produce := func(_ context.Context, stream *Stream) error {
+				if err := stream.Send([]byte{42}); err != nil {
+					return err
+				}
+				exit()
+				return nil
+			}
+			if prepared {
+				router.HandleStreamPrepared("watch", func(context.Context, *Request, any) (PreparedStreamHandler, error) {
+					return produce, nil
+				})
+			} else {
+				router.HandleStreamNative("watch", func(ctx context.Context, _ *StreamParams, _ any, stream *Stream) error {
+					return produce(ctx, stream)
+				})
+			}
+			unrelated := router.Streams.Subscribe("other", nil, nil, nil, nil)
+			defer router.Streams.Unsubscribe("other", unrelated)
+			stream, err := router.OpenInternalStream(t.Context(), &Request{API: "watch"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stream.Close()
+			synctest.Wait()
+			value, open := <-stream.Messages()
+			if !open || len(value) != 1 || value[0] != 42 {
+				t.Fatalf("accepted data lost: %v %t", value, open)
+			}
+			if _, open := <-stream.Messages(); open || stream.Err() != luxerrors.InternalError {
+				t.Fatalf("panic did not finish stream: open=%t error=%v", open, stream.Err())
+			}
+			if router.Streams.SubCount("watch") != 0 || router.Streams.SubCount("other") != 1 {
+				t.Fatal("panic leaked or removed another subscription")
+			}
+		})
+	}
+}
 
 func TestStreamCancellationStopsWriterBeforeQueueClose(t *testing.T) {
 	for _, slow := range []bool{false, true} {
@@ -168,7 +226,7 @@ func TestInternalStreamParentCancellationIsNotNormalCompletion(t *testing.T) {
 
 func TestInternalStreamSlowConsumerIsNotSuccessfulCompletion(t *testing.T) {
 	router := NewRouter()
-	router.Schema.RegisterAPI(&schema.API{Name: "watch", Stream: true})
+	router.Schema.RegisterAPI(&schema.API{ID: 1, Name: "watch", Stream: true})
 	stream, err := router.OpenInternalStream(t.Context(), &Request{API: "watch"})
 	if err != nil {
 		t.Fatal(err)

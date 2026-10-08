@@ -20,8 +20,32 @@ import (
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux"
+	"github.com/light-speak/luxo/pkg/lux/api"
 	"github.com/light-speak/luxo/pkg/lux/auth"
+	"github.com/light-speak/luxo/pkg/lux/cache"
+	"github.com/light-speak/luxo/pkg/lux/schema"
 )
+
+func TestGatewayExplicitResponseCache(t *testing.T) {
+	binding, err := api.NewResponseCache(cache.Nop{}, api.CacheNamespace{Project: "p", Environment: "e", Service: "s", Revision: "r"}, api.ResponseOriginOptions{MaxConcurrent: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := NewWithOptions(api.RouterOptions{ResponseCache: binding})
+	gateway.Router.Schema.RegisterAPI(&schema.API{ID: 1, Name: "cached", ReturnType: "Int", CacheDependencies: &schema.CacheDependencies{}, CachePolicy: &schema.CachePolicy{Mode: "ttl", TTL: time.Minute, Scope: "private"}})
+	gateway.Router.RequireCache("cached")
+	if err := gateway.Router.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if gateway.Router.IdentityExtractor == nil || gateway.Router.InternalRequestContext == nil {
+		t.Fatal("cache options lost identity hooks")
+	}
+	missing := New()
+	missing.Router.RequireCache("cached")
+	if err := missing.Serve("test"); err == nil || !strings.Contains(err.Error(), "cache") {
+		t.Fatalf("unconfigured cached gateway started: %v", err)
+	}
+}
 
 func TestMaskDSN(t *testing.T) {
 	tests := []struct {
@@ -465,6 +489,23 @@ func TestStartGatewayServerRejectsInvalidTimeoutsBeforeListening(t *testing.T) {
 	server, serveErr, err := startGatewayServer("127.0.0.1:0", http.NewServeMux(), "", "")
 	if err == nil || server != nil || serveErr != nil {
 		t.Fatalf("startGatewayServer = %#v, %#v, %v", server, serveErr, err)
+	}
+}
+
+func TestStartGatewayServerRejectsInvalidAddress(t *testing.T) {
+	server, serveErr, err := startGatewayServer("invalid-listen-address", http.NewServeMux(), "", "")
+	if err == nil || !strings.Contains(err.Error(), "listen invalid-listen-address") || server != nil || serveErr != nil {
+		t.Fatalf("invalid listener address started gateway: %v, %v, %v", server, serveErr, err)
+	}
+}
+
+func TestConfigureWebSocketOriginsRejectsMalformedOrigins(t *testing.T) {
+	for _, origin := range []string{"", "relative/path", "https://", "://bad", "https://user:password@example.com"} {
+		router := api.NewRouter()
+		configureWebSocketOrigins(router, origin)
+		if router.WSAllowAllOrigins || len(router.WSOrigins) != 0 {
+			t.Fatalf("invalid origin %q enabled cross-origin access", origin)
+		}
 	}
 }
 

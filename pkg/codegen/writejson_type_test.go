@@ -424,8 +424,8 @@ func TestWriteTypeListScalarField_EnumList(t *testing.T) {
 	generator.generateTypeWriteLuxo(&b, pseudo, enums)
 	code := b.String()
 
-	if !strings.Contains(code, "string(v)") {
-		t.Errorf("should convert enum to string:\n%s", code)
+	if !strings.Contains(code, "Role(v).AppendLuxo(buf.B)") {
+		t.Errorf("should validate and encode enum:\n%s", code)
 	}
 }
 

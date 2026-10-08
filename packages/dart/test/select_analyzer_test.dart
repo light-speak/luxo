@@ -21,6 +21,30 @@ class LuxoClient {
 ''';
 
 void main() {
+  test('sealed enum metadata stays outside model field selections', () async {
+    final hints = await analyzeSource('''
+import 'package:luxo_client/luxo_client.dart';
+sealed class State { const State(); String get rawValue; }
+enum StateKnown implements State {
+  open;
+  @override String get rawValue => 'OPEN';
+}
+final class StateUnknown extends State {
+  @override final String rawValue;
+  const StateUnknown(this.rawValue);
+}
+class Card(final Selected<State> state, final Selected<State?> optional,
+  final Selected<List<State>> states);
+class LuxoClient { Future<Card> getCard() async => throw UnimplementedError(); }
+Future<void> inspect(LuxoClient client) async {
+  final card = await client.getCard();
+  print(card.state.value.rawValue);
+  print(card.optional.value?.rawValue);
+  print(card.states.value.map((state) => state.rawValue));
+}
+''');
+    expect(hints, {'getCard': 'optional,state,states'});
+  });
   test('unresolved AST cannot invent field hints', () {
     final analyzer = SelectAnalyzer({});
     parseString(

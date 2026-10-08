@@ -60,7 +60,7 @@ func sequenceRequest(mode websocket.MessageType, api string, id uint64) []byte {
 	}
 	data := codec.AppendVarint([]byte{BinaryFrameCallRequest}, id)
 	data = codec.AppendVarint(data, apiID)
-	mask := codec.AppendSelectionMask(nil, []byte{0x06}, nil)
+	mask := testSelectionMask([]byte{0x06})
 	data = codec.AppendVarint(data, uint64(len(mask)))
 	data = append(data, mask...)
 	var encoder codec.Encoder

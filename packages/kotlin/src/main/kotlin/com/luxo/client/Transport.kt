@@ -180,6 +180,18 @@ internal object LuxoBinaryProtocol {
         return enc.bytes()
     }
 
+    fun encodeRequest(meta: APISchemaEntry, request: GeneratedRequest): ByteArray {
+        if (meta.id != request.apiID) throw LuxoError("ConfigError", 0, "generated request API ID differs from registered schema")
+        val enc = LuxoEncoder()
+        enc.writeVarint(request.apiID.toLong())
+        writeFieldMask(enc, meta, request.selection)
+        request.writeParameters(enc)
+        request.filters?.let { encodeTypedFilters(enc, it) }
+        request.sorters?.let { encodeTypedSorters(enc, it) }
+        enc.writeEnd()
+        return enc.bytes()
+    }
+
     fun callFrame(sequence: Long, body: ByteArray): ByteArray = frame(CALL_REQUEST, sequence, body)
 
     fun subscribeFrame(sequence: Long, body: ByteArray): ByteArray = frame(SUBSCRIBE, sequence, body)
@@ -286,15 +298,26 @@ internal object LuxoBinaryProtocol {
         for ((index, item) in filters.withIndex()) {
             val filter = filterParts(item)
                 ?: throw LuxoError("ConfigError", 0, "invalid \$filters entry at index $index")
-            val operatorID = filterOperatorIDs[filter.op]
-                ?: throw LuxoError("ConfigError", 0, "invalid \$filters entry at index $index")
-            if (filter.field.isEmpty() || !validFilterValue(filter.value)) {
-                throw LuxoError("ConfigError", 0, "invalid \$filters entry at index $index")
-            }
-            enc.writeString(filter.field)
-            enc.writeVarint(operatorID.toLong())
-            enc.writeString(filterValueText(filter.value))
+            writeFilter(enc, filter, index)
         }
+    }
+
+    private fun encodeTypedFilters(enc: LuxoEncoder, filters: List<LuxoFilter>) {
+        if (filters.size > 1000) throw LuxoError("ConfigError", 0, "\$filters exceeds 1000 entries")
+        enc.writeVarint(BINARY_FILTERS_FIELD_ID.toLong())
+        enc.writeVarint(filters.size.toLong())
+        for ((index, filter) in filters.withIndex()) writeFilter(enc, filter, index)
+    }
+
+    private fun writeFilter(enc: LuxoEncoder, filter: LuxoFilter, index: Int) {
+        val operatorID = filterOperatorIDs[filter.op]
+            ?: throw LuxoError("ConfigError", 0, "invalid \$filters entry at index $index")
+        if (filter.field.isEmpty() || !validFilterValue(filter.value)) {
+            throw LuxoError("ConfigError", 0, "invalid \$filters entry at index $index")
+        }
+        enc.writeString(filter.field)
+        enc.writeVarint(operatorID.toLong())
+        enc.writeString(filterValueText(filter.value))
     }
 
     private fun encodeSorters(enc: LuxoEncoder, value: Any) {
@@ -306,12 +329,23 @@ internal object LuxoBinaryProtocol {
         for ((index, item) in sorters.withIndex()) {
             val sorter = sorterParts(item)
                 ?: throw LuxoError("ConfigError", 0, "invalid \$sorters entry at index $index")
-            if (sorter.field.isEmpty() || (sorter.order != "asc" && sorter.order != "desc")) {
-                throw LuxoError("ConfigError", 0, "invalid \$sorters entry at index $index")
-            }
-            enc.writeString(sorter.field)
-            enc.writeBool(sorter.order == "desc")
+            writeSorter(enc, sorter, index)
         }
+    }
+
+    private fun encodeTypedSorters(enc: LuxoEncoder, sorters: List<LuxoSorter>) {
+        if (sorters.size > 100) throw LuxoError("ConfigError", 0, "\$sorters exceeds 100 entries")
+        enc.writeVarint(BINARY_SORTERS_FIELD_ID.toLong())
+        enc.writeVarint(sorters.size.toLong())
+        for ((index, sorter) in sorters.withIndex()) writeSorter(enc, sorter, index)
+    }
+
+    private fun writeSorter(enc: LuxoEncoder, sorter: LuxoSorter, index: Int) {
+        if (sorter.field.isEmpty() || (sorter.order != "asc" && sorter.order != "desc")) {
+            throw LuxoError("ConfigError", 0, "invalid \$sorters entry at index $index")
+        }
+        enc.writeString(sorter.field)
+        enc.writeBool(sorter.order == "desc")
     }
 
     private fun filterParts(value: Any?): LuxoFilter? = when (value) {
@@ -415,6 +449,12 @@ class StreamObserver(
  */
 interface Transport {
     suspend fun call(api: String, params: Map<String, Any?> = emptyMap()): Any
+    suspend fun call(api: String, request: GeneratedRequest): Any =
+        throw LuxoError("ConfigError", 0, "transport must implement generated requests")
+    suspend fun <T> subscribe(
+        api: String, decoder: (Any) -> T, request: GeneratedRequest,
+        observer: StreamObserver? = null, handler: (T) -> Unit,
+    ): () -> Unit = throw LuxoError("ConfigError", 0, "transport must implement generated subscriptions")
     /** Decode separately so an invalid payload cannot be confused with an application callback error. */
     suspend fun <T> subscribe(
         api: String,
@@ -457,7 +497,7 @@ class OkHttpTransport(
     headers: Map<String, String> = emptyMap(),
     client: OkHttpClient? = null,
     mode: TransportMode = TransportMode.JSON,
-    private val schema: Map<String, APISchemaEntry> = emptyMap(),
+    schema: Map<String, APISchemaEntry> = emptyMap(),
     /** Request timeout in seconds (default 30) */
     timeoutSeconds: Long = 30,
     /** Called only for valid HTTP/code 401 errors; a new token retries once in the original mode. */
@@ -471,19 +511,23 @@ class OkHttpTransport(
         .build())
     @Volatile private var currentHeaders = HttpProtocolHeaders(headers, token)
     @Volatile private var currentMode: TransportMode = mode
-    @Volatile private var currentSchema: Map<String, APISchemaEntry> = schema
+    @Volatile private var currentSchema: Map<String, APISchemaEntry> = snapshotAPISchema(schema)
 
     /**
      * Call a Luxo API. Returns JsonElement (JSON mode) or ByteArray (binary mode).
      * Generated client code handles both transparently.
      */
-    override fun setSchema(schema: Map<String, APISchemaEntry>) { currentSchema = schema }
+    override fun setSchema(schema: Map<String, APISchemaEntry>) { currentSchema = snapshotAPISchema(schema) }
     override fun setMode(mode: TransportMode) { currentMode = mode }
     override fun setToken(token: String) { currentHeaders = currentHeaders.withToken(token) }
 
     override suspend fun call(api: String, params: Map<String, Any?>): Any {
         return if (currentMode == TransportMode.BINARY) callBinary(api, params) else callJSON(api, params)
     }
+
+    override suspend fun call(api: String, request: GeneratedRequest): Any =
+        if (currentMode == TransportMode.BINARY) callBinary(api, emptyMap(), generated = request)
+        else callJSON(api, request.toJSONParameters())
 
     private suspend fun callJSON(api: String, params: Map<String, Any?>, isRetry: Boolean = false): JsonElement {
         val body = buildJsonObject {
@@ -506,7 +550,9 @@ class OkHttpTransport(
             throw LuxoError("ParseError", response.code, "invalid JSON response: ${e.message}")
         }
         val decoded = decodeLuxoJsonError(json, response.code)
-        if (response.code == 200 && decoded == null) return json["data"] ?: JsonNull
+        if (response.code == 200 && decoded == null) {
+            return json["data"] ?: throw LuxoError("ParseError", response.code, "missing JSON response data")
+        }
         val error = decoded ?: LuxoError("ParseError", response.code, "missing JSON error envelope")
         val newToken = refreshFor(response.code, error, isRetry)?.invoke()
         if (newToken != null) {
@@ -516,11 +562,12 @@ class OkHttpTransport(
         throw error
     }
 
-    private suspend fun callBinary(api: String, params: Map<String, Any?>, isRetry: Boolean = false): ByteArray {
+    private suspend fun callBinary(api: String, params: Map<String, Any?>, isRetry: Boolean = false, generated: GeneratedRequest? = null): ByteArray {
         val meta = currentSchema[api]
             ?: throw LuxoError("ConfigError", 0, "no schema for API \"$api\" — binary mode requires schema")
 
-        val body = LuxoBinaryProtocol.encodeRequest(meta, params)
+        val body = if (generated == null) LuxoBinaryProtocol.encodeRequest(meta, params)
+            else LuxoBinaryProtocol.encodeRequest(meta, generated)
 
         val request = Request.Builder()
             .url(endpoint)
@@ -536,7 +583,7 @@ class OkHttpTransport(
         val newToken = refreshFor(response.code, error, isRetry)?.invoke()
         if (newToken != null) {
             setToken(newToken)
-            return callBinary(api, params, isRetry = true)
+            return callBinary(api, params, isRetry = true, generated = generated)
         }
         throw error
     }

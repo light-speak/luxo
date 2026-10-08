@@ -9,11 +9,47 @@ object CodecMetadataBenchmark {
     @JvmStatic
     fun main(args: Array<String>) {
         println("JDK ${System.getProperty("java.version")}; 12 warmup pairs, 20 alternating samples; ns/op and B/op")
+        if (args.contains("selection")) { compareSelection(); return }
         compareRows()
         for (count in listOf(1, 16, 128)) {
             compareArray(count)
             compareColumns(count)
         }
+    }
+
+    private fun compareSelection() {
+        for (id in listOf(1, 128, 65535)) {
+            val mask = FieldMask.set(byteArrayOf(), id)
+            check(previousMaskHas(mask, id) == FieldMask.has(mask, id))
+            PairedJvmBenchmark.compare("mask has id=$id",
+                LongSupplier { if (previousMaskHas(mask, id)) 1 else 0 },
+                LongSupplier { if (FieldMask.has(mask, id)) 1 else 0 })
+            for (fresh in listOf(false, true)) {
+                check(previousMaskSet(byteArrayOf(), id).contentEquals(FieldMask.set(byteArrayOf(), id)))
+                PairedJvmBenchmark.compare("mask set id=$id fresh=$fresh",
+                    LongSupplier { previousMaskSet(if (fresh) byteArrayOf() else mask, id).last().toLong() },
+                    LongSupplier { FieldMask.set(if (fresh) byteArrayOf() else mask, id).last().toLong() },
+                    iterations = if (fresh) 10000 else 500000)
+            }
+        }
+    }
+
+    // Frozen pre-limit helpers for valid input only, never used in production.
+    private fun previousMaskHas(mask: ByteArray, fieldID: Int): Boolean {
+        if (fieldID <= 0) return false
+        val bit = fieldID - 1
+        val byteIdx = bit ushr 3
+        if (byteIdx >= mask.size) return false
+        return (mask[byteIdx].toInt() and (1 shl (bit and 7))) != 0
+    }
+
+    private fun previousMaskSet(mask: ByteArray, fieldID: Int): ByteArray {
+        if (fieldID <= 0) return mask
+        val bit = fieldID - 1
+        val byteIdx = bit ushr 3
+        val m = if (byteIdx >= mask.size) mask.copyOf(byteIdx + 1) else mask
+        m[byteIdx] = (m[byteIdx].toInt() or (1 shl (bit and 7))).toByte()
+        return m
     }
 
     private fun compareRows() {

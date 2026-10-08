@@ -1,0 +1,121 @@
+import 'dart:typed_data';
+
+import 'package:luxo_client/luxo_client.dart';
+
+import '../../benchmark/uint64_benchmark.dart' show compareBenchmarks;
+import 'types.dart';
+
+Object? _sink;
+
+void main() {
+  for (final text in ['OPEN', '未来状态']) {
+    final raw = decodeLuxoJSON(encodeLuxoJSON(text));
+    final bytes = Uint8List.fromList(
+      (LuxoEncoder()..writeString(text)).bytes(),
+    );
+    _compare(
+      'JSON scalar $text',
+      () => luxoStringFromJSON(raw),
+      () => TaskStatus.fromValue(luxoStringFromJSON(raw)),
+      100000,
+    );
+    _compare(
+      'Binary scalar $text',
+      () => LuxoDecoder(bytes).readStringChecked(),
+      () => TaskStatus.fromValue(LuxoDecoder(bytes).readStringChecked()),
+      100000,
+    );
+    for (final count in [0, 1, 128]) {
+      final values = List<Object?>.filled(count, raw);
+      final encoder = LuxoEncoder()..writeVarint(count);
+      for (var i = 0; i < count; i++) {
+        encoder.writeString(text);
+      }
+      final list = Uint8List.fromList(encoder.bytes());
+      _compare(
+        'JSON list $count $text',
+        () => luxoStringListFromJSON(values),
+        () => TaskStatus.$fromJSONList(values),
+        2000,
+      );
+      _compare(
+        'Binary list $count $text',
+        () => LuxoDecoder(list).readStringArrayChecked(),
+        () => TaskStatus.$readArray(LuxoDecoder(list), complete: true),
+        2000,
+      );
+      final states = values
+          .map((v) => TaskStatus.fromValue(v as String))
+          .toList();
+      final parameterValues = List<String>.from(values);
+      _compare(
+        'parameter list $count $text',
+        () => {'values': parameterValues},
+        () => {'values': TaskStatus.$rawList(states)},
+        2000,
+      );
+      _compare(
+        'parameter generated indexed $count $text',
+        () => {'values': states.map((v) => v.rawValue).toList()},
+        () => {'values': TaskStatus.$rawList(states)},
+        2000,
+      );
+    }
+  }
+  _mixedParameters();
+  print(
+    'sink present: ${_sink != null}; warm helpers; allocations/network not measured',
+  );
+}
+
+void _mixedParameters() {
+  final raw = List<String>.generate(128, (i) => i.isEven ? 'OPEN' : '未来状态');
+  final states = raw.map(TaskStatus.fromValue).toList();
+  _compare(
+    'parameter mixed overhead 128',
+    () => {'values': raw},
+    () => {'values': TaskStatus.$rawList(states)},
+    2000,
+  );
+  _compare(
+    'parameter mixed generated indexed 128',
+    () => {'values': states.map((value) => value.rawValue).toList()},
+    () => {'values': TaskStatus.$rawList(states)},
+    2000,
+  );
+}
+
+Object? _raw(Object? value) => switch (value) {
+  TaskStatus status => status.rawValue,
+  List values => values.map(_raw).toList(),
+  Map<String, Object?> values => values.map(
+    (key, value) => MapEntry(key, _raw(value)),
+  ),
+  _ => value,
+};
+
+void _compare(
+  String name,
+  Object? Function() before,
+  Object? Function() after,
+  int iterations,
+) {
+  // Equivalence checks are outside the measured loops.
+  if (encodeLuxoJSON(_raw(before())) != encodeLuxoJSON(_raw(after()))) {
+    throw StateError('$name changed wire values');
+  }
+  compareBenchmarks(
+    name,
+    () => _batch(before, iterations),
+    () => _batch(after, iterations),
+    iterations: iterations,
+    includeRange: true,
+  );
+}
+
+int _batch(Object? Function() operation, int iterations) {
+  for (var i = 0; i < iterations; i++) {
+    _sink = operation();
+  }
+  return _sink == null ? 0 : 1;
+}

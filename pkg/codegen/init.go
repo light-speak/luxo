@@ -9,6 +9,7 @@ import (
 
 // Keep scaffold and build-image requirements in sync with the core module.
 const generatedGoVersion = "1.27.1"
+const generatedLuxoVersion = "1.0.0-beta.1"
 
 // ScaffoldResult holds scaffold files to be written to disk.
 // Keys are relative paths from the project root.
@@ -79,11 +80,13 @@ tmp/
 }
 
 // generateGoMod produces the go.mod file.
-// Does not include luxo dependency — added automatically by `go mod tidy` after `luxo gen`.
+// Pin the core and the supported default database adapter to this generator.
+// Optional adapters are added explicitly, never through an unbounded latest lookup.
 func generateGoMod(modulePath string) []byte {
 	var b strings.Builder
 	fmt.Fprintf(&b, "module %s\n\n", modulePath)
 	b.WriteString("go " + generatedGoVersion + "\n")
+	fmt.Fprintf(&b, "\nrequire (\n\tgithub.com/light-speak/luxo v%s\n\tgithub.com/light-speak/luxo/pkg/lux/pg v%s\n)\n", generatedLuxoVersion, generatedLuxoVersion)
 	return []byte(b.String())
 }
 
@@ -131,6 +134,12 @@ APP_ENV=development                                    # environment: developmen
 APP_PORT=8080                                          # Luvia Gateway port (HTTP/2 h2c by default)
 APP_LOCALE=en                                          # response locale
 DEPLOY_MODE=embedded                                   # runtime: embedded / cluster
+
+# ---- Build-time backends: change, then regenerate and rebuild ----
+LUXO_EVENT_BACKEND=none                                # none / memory / nats; select explicitly before using events/streams
+LUXO_QUEUE_BACKEND=none                                # none / memory / nats
+LUXO_CACHE_BACKEND=none                                # none / memory / redis
+# Optional adapters must use the same version as the core in go.mod.
 
 # ---- TLS (optional) ----
 # Without these, uses h2c (HTTP/2 cleartext, recommended for internal networks)

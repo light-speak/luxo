@@ -10,6 +10,21 @@ import (
 	"time"
 )
 
+func TestParseFloat64ArrayLimit(t *testing.T) {
+	value, err := ParseFloat64ArrayLimit([]byte(`[1.5,-0,5e-324,1.7976931348623157e308,0e-9999]`), 5)
+	if err != nil || len(value) != 5 || value[0] != 1.5 || !math.Signbit(value[1]) || value[2] != math.SmallestNonzeroFloat64 || value[3] != math.MaxFloat64 || value[4] != 0 {
+		t.Fatalf("Float array = %v, %v", value, err)
+	}
+	if value, err := ParseFloat64ArrayLimit([]byte(`[]`), 0); err != nil || value == nil || len(value) != 0 {
+		t.Fatalf("empty = %v, %v", value, err)
+	}
+	for _, raw := range []string{`null`, `true`, `[null]`, `["NaN"]`, `["1"]`, `[1e999]`, `[1e-999]`, `[1,2,3]`, `[1,]`, `[`, `[1`, `[1e]`, `[01]`, `[]true`} {
+		if value, err := ParseFloat64ArrayLimit([]byte(raw), 2); err == nil || value != nil {
+			t.Errorf("invalid %s = %v, %v", raw, value, err)
+		}
+	}
+}
+
 func TestParseRawArray(t *testing.T) {
 	input := []byte(" \n[null, 123456789012345678901234567890, {\"n\":0.123456789012345678901}, \"\\u6771京\"] \t")
 	want := []string{"null", "123456789012345678901234567890", `{"n":0.123456789012345678901}`, `"\u6771京"`}
@@ -139,6 +154,27 @@ func TestParseStringArrayLimit(t *testing.T) {
 			if err != nil || !slices.Equal(values, want) {
 				t.Fatalf("bounded parser changed strings: %v / %v", values, want)
 			}
+		}
+	}
+}
+
+func TestParseNamedStringArrayLimit(t *testing.T) {
+	type state string
+	for _, tc := range []struct {
+		raw   string
+		limit int
+		valid bool
+	}{
+		{`[]`, 0, true}, {`["OPEN","\u0043LOSED"]`, 2, true},
+		{`["OPEN"]`, 0, false}, {`["OPEN","CLOSED"]`, 1, false},
+		{`["OPEN",null]`, 2, false}, {`["\uD800"]`, 2, false},
+	} {
+		got, err := ParseStringValuesLimit[state]([]byte(tc.raw), tc.limit)
+		if (err == nil) != tc.valid || (!tc.valid && got != nil) {
+			t.Fatalf("%s limit=%d: %v / %v", tc.raw, tc.limit, got, err)
+		}
+		if tc.valid && tc.limit == 2 && (len(got) != 2 || got[0] != "OPEN" || got[1] != "CLOSED") {
+			t.Fatal(got)
 		}
 	}
 }

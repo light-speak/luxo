@@ -134,14 +134,16 @@ func writeDirectColumnValue(b *strings.Builder, column directColumn, enums map[s
 
 func writeDirectScalarColumn(b *strings.Builder, column directColumn, value string, isEnum bool) {
 	if column.stringValue {
+		expression := "codec.AppendString(buf.B, v)"
 		switch {
 		case isEnum:
-			value = "string(" + value + ")"
+			value = column.field.Type.Name + "(" + value + ")"
+			expression = enumAppendExpression(column.field.Type.Name, "buf.B", "v")
 		case column.field.Type.Name == "Decimal":
 			value = "(" + value + ").String()"
 		}
 		fmt.Fprintf(b, "\t\t\tv := %s\n", value)
-		writeBinaryAppend(b, "\t\t\t", "buf.B", "codec.AppendString(buf.B, v)", "return err")
+		writeBinaryAppend(b, "\t\t\t", "buf.B", expression, "return err")
 		b.WriteString("\t\t\t_arenaSize += len(v)\n")
 		return
 	}

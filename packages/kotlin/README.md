@@ -115,6 +115,33 @@ serializer；正常 SDK 请求不要求消费者启用序列化编译插件。�
 的 null 标记一致；API 参数的 `LuxoOptional.Absent` 省略规则不变。生成 Float 编码
 拒绝非有限值，不输出非法 JSON。升级后重新生成客户端；Schema 边界校验仍保留。
 
+## Named enums / 命名枚举
+
+Generated enums are sealed interfaces, not String aliases. `Role.Known.MEMBER`
+is a canonical known value; `Role.fromValue(raw)` returns a known constant or a
+`Role.Unknown` retaining the exact string. Exhaustive `when` expressions handle
+known constants and `is Role.Unknown`. Unknown equality is scoped to that enum.
+Regenerate clients and replace raw String arguments with the generated type.
+JSON/Binary still carry strings; generated parameter and input writers unwrap
+`rawValue` only at declared enum positions. Omitted defaults, explicit null and
+unselected fields stay distinct. Generic JSON does not implicitly unwrap enums.
+The server continues to reject values absent from its own Schema.
+
+生成枚举改为 sealed interface，不再是 String 别名。`Role.Known.MEMBER` 是已知常量，
+`Role.fromValue(raw)` 将已知值映射到常量，未知值以 `Role.Unknown` 保留原文。
+业务可用穷尽 `when` 匹配已知常量和 Unknown 分支；不同枚举的未知值不相等。
+升级需重新生成客户端，并把字符串参数改为生成类型。JSON/Binary 仍传字符串，
+生成参数和输入写入器只在声明为 Enum 的位置解包 `rawValue`；缺省、null 和未选择
+字段语义不变，通用 JSON 不做隐式枚举转换。服务端仍拒绝自身 Schema 未声明的值。
+
+Missing enum references, unnamed enum returns and empty/duplicate declarations
+fail before snapshots or generated sources are overwritten. Known values reuse
+constants; unknown wrappers and list conversions are not allocation-free.
+Performance and Android device validation remain separate acceptance gates.
+
+缺失枚举引用、裸 Enum 返回值、空或重复声明在覆盖快照/代码前报错。已知值复用
+常量，但未知包装及列表转换并非零分配；性能和 Android 真机仍需独立验收。
+
 Introspection preserves known Go metadata, including descriptions, directives,
 deprecation, primary/foreign keys and relationships. Unknown schema properties
 are still rejected rather than ignored globally. Network introspection shares
@@ -196,16 +223,33 @@ val cancel = transport.subscribe("liveTraces", { it }, mapOf("projectId" to 1L),
 cancel()
 ```
 
+## Typed query controls / 类型化查询条件
+
+For an API `listUsers` advertising an Int `count` filter and sorter, `Queries.kt` provides typed helpers:
+
+```kotlin
+val filters = listOf(LuxoQuery_listUsers.count_eq(9007199254740993L))
+val sorters = listOf(LuxoQuery_listUsers.count_desc())
+```
+
+Pass these to the generated API's `filters` / `sorters` arguments. Only advertised fields and operators get helpers; dynamic controls remain available and server validation remains mandatory.
+
+构造器只依据 API 明确开放的字段和操作符生成，不根据返回模型猜测。直接创建条件值，不增加运行时 Schema 查找；Int 保持 Long 精度，服务端仍严格校验查询。
+
 ## Install / 安装
+
+These coordinates target the unreleased `1.0.0-beta.1` candidate; use them after
+publication. Keep the client and field-selection plugin on the same exact version.
 
 ```kotlin
 // build.gradle.kts
-dependencies {
-    implementation("com.luxo:luxo-client:0.1.0")
+plugins {
+    kotlin("jvm") version "2.4.20"
+    id("com.luxo.select") version "1.0.0-beta.1"
 }
 
-plugins {
-    id("com.luxo.select") version "0.1.0"
+dependencies {
+    implementation("com.luxo:luxo-client:1.0.0-beta.1")
 }
 
 luxo {
@@ -215,7 +259,7 @@ luxo {
 ```
 
 Generate the schema-driven client once, then build normally. Kotlin compilation
-automatically runs the incremental field analyzer. Keep the introspection key
+loads the Luxo IR plugin to inject selections at each resolved call site. Keep the introspection key
 out of command-line arguments:
 
 ```bash
@@ -224,8 +268,21 @@ LUXO_INTROSPECTION_KEY=YOUR_KEY ./gradlew luxoGenerate build
 
 The plugin stores the schema snapshot in `src/main/luxo/luxo.schema.json` and
 generated sources in `src/main/kotlin/com/luxo/generated` by default. The Kotlin
-compiler is loaded only by the isolated analyzer process; it is not added to the
-SDK runtime or the Gradle build classpath.
+compiler plugin uses the project's pinned Kotlin compiler; its compiler API is
+not an SDK runtime dependency. Kotlin must match the version catalog (currently
+2.4.20); a mismatch is rejected rather than silently disabling inference.
+
+Each invocation receives its own selection. Local immutable aliases, nested
+`Selected.value()` accesses, inline `map`/`mapNotNull`/`forEach` callbacks and
+inline subscription callbacks are supported. Explicit `select` takes precedence.
+Opaque model escape, unresolved usage and API function references require an
+explicitly selected wrapper; they fail compilation instead of underfetching or
+selecting all fields. Generated clients no longer read API-wide `SelectHints`;
+the legacy `luxoAnalyze` task is diagnostic only and is not a compile dependency.
+
+The JVM acceptance includes generated typed Binary requests and a real Gradle
+consumer with incremental source changes. Android, other Kotlin targets,
+complete inference coverage and performance remain separate acceptance gates.
 
 ## Usage / 使用
 
@@ -412,13 +469,31 @@ UTF-8 读取，保留前导 U+FEFF 与合法 U+FFFD，原始 Bytes 不受文本�
 
 Generated scalar responses and independent scalar-array column cells check
 their entire payload before returning or invoking stream callbacks. This check
-is not inserted between fields of a larger message. Named enum returns keep
-their existing String alias and use scalar readers, not model selection or
-model decoders. Regenerate clients together with the compatible runtime.
+is not inserted between fields of a larger message. Named enum returns use
+strict scalar string readers followed by the generated Known/Unknown factory,
+not model selection or model decoders. Regenerate clients with this runtime.
 
 生成的标量响应和独立标量数组列单元在返回或触发流回调前检查完整负载，不把结束
-检查插入父消息的字段之间。命名枚举返回沿用 String 别名，使用标量读取器，不再
-误走模型选择/解码；没有增加枚举取值范围限制。升级兼容 runtime 后需重新生成客户端。
+检查插入父消息的字段之间。命名枚举返回先严格读取字符串，再由生成工厂区分
+Known/Unknown，不走模型选择/解码，也不丢弃未知值；升级后需重新生成客户端。
+
+### Runtime schema ownership / 运行时 Schema 所有权
+
+`OkHttpTransport` constructor metadata and HTTP/WebSocket `setSchema` validate
+all API, parameter, field and nested-type IDs before publication. Invalid or
+duplicate IDs throw `IllegalArgumentException`; failed replacement keeps the
+previous registration. Both modes use the same privately owned snapshot.
+Mutating the original maps/lists has no effect until explicit re-registration;
+do not mutate input containers concurrently while registration is copying them.
+Shared field/type directories stay shared within one registration. Checks run
+at registration, not on every request or stream message; no reflection or
+encoding/decoding roundtrip is used to copy metadata.
+
+`OkHttpTransport`构造及HTTP/WS的`setSchema`先校验API、参数、字段和嵌套type编号，
+再发布两种协议共用的私有快照。非法/重复编号抛`IllegalArgumentException`，失败
+保留旧登记。修改源Map/List后必须显式重新登记，复制期间不要并发修改输入容器。
+共享字段/type目录在同次快照内继续共享；检查不进入每次请求或推送，不使用反射
+或编解码往返复制元数据。
 
 ### Binary metadata bounds / Binary 元数据边界
 

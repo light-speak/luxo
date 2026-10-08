@@ -15,6 +15,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/light-speak/luxo/pkg/lux/api"
+	"github.com/light-speak/luxo/pkg/lux/auth"
+	"github.com/light-speak/luxo/pkg/lux/luvia"
 	"github.com/shopspring/decimal"
 )
 
@@ -25,7 +27,24 @@ func main() {
 	}
 }
 
+func configureFixtureAuth() error {
+	// Every SDK owner launches this fixture with the same isolated test settings.
+	for _, setting := range [][2]string{
+		{"JWT_SECRET", "sdk-interop-fixture-only"}, {"JWT_EXPIRES", "1h"},
+		{"JWT_REFRESH", "true"}, {"JWT_REFRESH_EXPIRES", "2h"},
+	} {
+		if err := os.Setenv(setting[0], setting[1]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func serveHTTP(router *api.Router) error {
+	cfg, err := auth.LoadConfig()
+	if err != nil {
+		return err
+	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return err
@@ -34,7 +53,7 @@ func serveHTTP(router *api.Router) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	server := &http.Server{
-		Handler: api.TraceMiddleware(router), ReadHeaderTimeout: 5 * time.Second,
+		Handler: api.TraceMiddleware(luvia.AuthMiddleware(cfg, router)), ReadHeaderTimeout: 5 * time.Second,
 		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 	done := make(chan error, 1)
@@ -56,28 +75,34 @@ func serveHTTP(router *api.Router) error {
 
 type streamResolver struct{}
 
-func (streamResolver) HandleWatchFiniteJSON(_ context.Context, params *api.StreamParams, _ any, stream *api.TypedStream[[]json.RawMessage]) error {
-	value, ok := params.Get("value").(json.RawMessage)
-	if !ok {
-		return errors.New("missing finite JSON stream value")
+func (streamResolver) HandleWatchOptionalInteger(_ context.Context, _ *WatchOptionalIntegerStreamParams, _ any, stream *api.TypedStream[*int64]) error {
+	if err := stream.Send(nil); err != nil {
+		return err
 	}
-	for index := range 64 {
-		row := []json.RawMessage{strconv.AppendInt(nil, int64(index), 10), value}
-		if err := stream.Send(row); err != nil {
-			return err
-		}
-	}
-	if params.Boolean("fail") {
-		return NewJSONRejected(value)
-	}
-	return nil
+	value := int64(0)
+	return stream.Send(&value)
 }
 
-func (streamResolver) HandleWatchJSON(ctx context.Context, params *api.StreamParams, _ any, stream *api.TypedStream[json.RawMessage]) error {
-	value, ok := params.Get("value").(json.RawMessage)
-	if !ok {
-		return errors.New("missing JSON stream value")
+func (streamResolver) HandleWatchOptionalIntegers(_ context.Context, _ *WatchOptionalIntegersStreamParams, _ any, stream *api.TypedStream[[]int64]) error {
+	if err := stream.Send(nil); err != nil {
+		return err
 	}
+	return stream.Send([]int64{})
+}
+
+func (streamResolver) HandleWatchOptionalPrecision(_ context.Context, _ *WatchOptionalPrecisionStreamParams, _ any, stream *api.TypedStream[*Precision]) error {
+	if err := stream.Send(nil); err != nil {
+		return err
+	}
+	return stream.Send(&Precision{Value: 42})
+}
+
+func (streamResolver) FixturePrincipal(context.Context) (FixturePrincipal, error) {
+	return FixturePrincipal{Id: 9007199254740993, Name: "東京"}, nil
+}
+
+func (streamResolver) HandleWatchTimestamp(ctx context.Context, params *WatchTimestampStreamParams, _ any, stream *api.TypedStream[time.Time]) error {
+	value := params.Value
 	if err := stream.Send(value); err != nil {
 		return err
 	}
@@ -85,11 +110,8 @@ func (streamResolver) HandleWatchJSON(ctx context.Context, params *api.StreamPar
 	return ctx.Err()
 }
 
-func (streamResolver) HandleWatchJSONs(ctx context.Context, params *api.StreamParams, _ any, stream *api.TypedStream[[]json.RawMessage]) error {
-	values, ok := params.Get("values").([]json.RawMessage)
-	if !ok {
-		return errors.New("missing JSON stream values")
-	}
+func (streamResolver) HandleWatchTimestamps(ctx context.Context, params *WatchTimestampsStreamParams, _ any, stream *api.TypedStream[[]time.Time]) error {
+	values := params.Values
 	if err := stream.Send(values); err != nil {
 		return err
 	}
@@ -97,7 +119,39 @@ func (streamResolver) HandleWatchJSONs(ctx context.Context, params *api.StreamPa
 	return ctx.Err()
 }
 
-func (streamResolver) HandleWatchFixtureState(ctx context.Context, _ *api.StreamParams, _ any, stream *api.TypedStream[FixtureState]) error {
+func (streamResolver) HandleWatchFiniteJSON(_ context.Context, params *WatchFiniteJSONStreamParams, _ any, stream *api.TypedStream[[]json.RawMessage]) error {
+	value := params.Value
+	for index := range 64 {
+		row := []json.RawMessage{strconv.AppendInt(nil, int64(index), 10), value}
+		if err := stream.Send(row); err != nil {
+			return err
+		}
+	}
+	if params.Fail {
+		return NewJSONRejected(value)
+	}
+	return nil
+}
+
+func (streamResolver) HandleWatchJSON(ctx context.Context, params *WatchJSONStreamParams, _ any, stream *api.TypedStream[json.RawMessage]) error {
+	value := params.Value
+	if err := stream.Send(value); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (streamResolver) HandleWatchJSONs(ctx context.Context, params *WatchJSONsStreamParams, _ any, stream *api.TypedStream[[]json.RawMessage]) error {
+	values := params.Values
+	if err := stream.Send(values); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (streamResolver) HandleWatchFixtureState(ctx context.Context, _ *WatchFixtureStateStreamParams, _ any, stream *api.TypedStream[FixtureState]) error {
 	if err := stream.Send(FixtureState("OPEN")); err != nil {
 		return err
 	}
@@ -105,7 +159,7 @@ func (streamResolver) HandleWatchFixtureState(ctx context.Context, _ *api.Stream
 	return ctx.Err()
 }
 
-func (streamResolver) HandleWatchFixtureStates(ctx context.Context, _ *api.StreamParams, _ any, stream *api.TypedStream[[]FixtureState]) error {
+func (streamResolver) HandleWatchFixtureStates(ctx context.Context, _ *WatchFixtureStatesStreamParams, _ any, stream *api.TypedStream[[]FixtureState]) error {
 	if err := stream.Send([]FixtureState{"OPEN", "CLOSED"}); err != nil {
 		return err
 	}
@@ -113,11 +167,8 @@ func (streamResolver) HandleWatchFixtureStates(ctx context.Context, _ *api.Strea
 	return ctx.Err()
 }
 
-func (streamResolver) HandleWatchPrecision(ctx context.Context, params *api.StreamParams, _ any, stream *api.TypedStream[Precision]) error {
-	value, ok := params.LookupInt("value")
-	if !ok {
-		return errors.New("missing precision stream value")
-	}
+func (streamResolver) HandleWatchPrecision(ctx context.Context, params *WatchPrecisionStreamParams, _ any, stream *api.TypedStream[Precision]) error {
+	value := params.Value
 	if err := stream.Send(Precision{
 		Value: value, Duration: time.Duration(value), Optional: &value,
 		Values: []int64{value}, Label: "精度 café", Ignored: 42,
@@ -128,11 +179,8 @@ func (streamResolver) HandleWatchPrecision(ctx context.Context, params *api.Stre
 	return ctx.Err()
 }
 
-func (streamResolver) HandleWatchNullableArrays(ctx context.Context, params *api.StreamParams, _ any, stream *api.TypedStream[NullableArrays]) error {
-	state, ok := params.LookupInt("state")
-	if !ok {
-		return errors.New("missing nullable array state")
-	}
+func (streamResolver) HandleWatchNullableArrays(ctx context.Context, params *WatchNullableArraysStreamParams, _ any, stream *api.TypedStream[NullableArrays]) error {
+	state := params.State
 	value := NullableArrays{Tail: 42}
 	switch state {
 	case 1:
@@ -149,11 +197,8 @@ func (streamResolver) HandleWatchNullableArrays(ctx context.Context, params *api
 	return ctx.Err()
 }
 
-func (streamResolver) HandleWatchNestedPrecision(ctx context.Context, params *api.StreamParams, _ any, stream *api.TypedStream[NestedPrecision]) error {
-	state, ok := params.LookupInt("state")
-	if !ok {
-		return errors.New("missing nested precision state")
-	}
+func (streamResolver) HandleWatchNestedPrecision(ctx context.Context, params *WatchNestedPrecisionStreamParams, _ any, stream *api.TypedStream[NestedPrecision]) error {
+	state := params.State
 	value := int64(math.MaxInt64)
 	row := Precision{
 		Value: value, Duration: time.Duration(math.MinInt64), Optional: &value,
@@ -174,11 +219,8 @@ func (streamResolver) HandleWatchNestedPrecision(ctx context.Context, params *ap
 	return ctx.Err()
 }
 
-func (streamResolver) HandleWatchScalarArrays(ctx context.Context, params *api.StreamParams, _ any, stream *api.TypedStream[ScalarArrays]) error {
-	state, ok := params.LookupInt("state")
-	if !ok {
-		return errors.New("missing scalar array state")
-	}
+func (streamResolver) HandleWatchScalarArrays(ctx context.Context, params *WatchScalarArraysStreamParams, _ any, stream *api.TypedStream[ScalarArrays]) error {
+	state := params.State
 	value := scalarArrays(state)
 	if err := stream.Send(value); err != nil {
 		return err

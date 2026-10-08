@@ -8,7 +8,7 @@ import (
 )
 
 // QueryPlan describes how a gateway request should be split across services.
-// Nil plan = no extend fields in the mask → direct forward (zero overhead).
+// A nil plan skips extension RPCs and merging; normal request processing remains.
 type QueryPlan struct {
 	// Primary is the main request sent to the API's owning module.
 	// Its mask contains only fields owned by that module + the id field.
@@ -57,7 +57,7 @@ func (s ExtendStep) Shape() int {
 
 // Plan analyzes a field mask against a model's schema and produces a QueryPlan.
 // Returns nil if there are no cross-module extend fields in the mask,
-// meaning the gateway should directly forward the request (zero overhead).
+// meaning the gateway should forward without extension RPCs or merging.
 //
 // Parameters:
 //   - model: the schema model for the API's return type
@@ -89,7 +89,12 @@ func Plan(model *schema.Model, mask []byte, apiModule string) (*QueryPlan, error
 
 		if f.Module == "" {
 			// Local field → include in primary mask
-			primaryMask = codec.FieldMaskSet(primaryMask, f.ID)
+			var err error
+			primaryMask, err = codec.FieldMaskSet(primaryMask, f.ID)
+			if err != nil {
+				// Defensive: FieldMaskHas checked the ID and only this constructor owns primaryMask.
+				return nil, err
+			}
 			if child, ok := codec.SelectionMaskNested(mask, f.ID); ok {
 				primaryChildren = append(primaryChildren, codec.SelectionMaskChild{FieldID: f.ID, Mask: child})
 			}
@@ -123,12 +128,19 @@ func Plan(model *schema.Model, mask []byte, apiModule string) (*QueryPlan, error
 	}
 
 	// Auto-include the primary key in the primary mask for extend resolution.
-	primaryMask = codec.FieldMaskSet(primaryMask, primaryKey.ID)
+	primaryMask, err := codec.FieldMaskSet(primaryMask, primaryKey.ID)
+	if err != nil {
+		return nil, err
+	}
+	primaryNode, err := codec.AppendSelectionMask(nil, primaryMask, primaryChildren)
+	if err != nil {
+		return nil, err
+	}
 
 	return &QueryPlan{
 		Primary: PlanStep{
 			Module: apiModule,
-			Mask:   codec.AppendSelectionMask(nil, primaryMask, primaryChildren),
+			Mask:   primaryNode,
 		},
 		Extends:         extends,
 		OriginalMask:    mask,

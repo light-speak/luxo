@@ -11,12 +11,14 @@ import 'client.dart';
 import 'types.dart';
 
 part 'response_consumer.dart';
+part 'nullable_root_consumer.dart';
 part 'json_kind_consumer.dart';
 part 'json_projection_consumer.dart';
 part 'stream_isolation_consumer.dart';
 
 void main() {
   verifyScalarResponses();
+  verifyNullableRoots();
   verifyJSONKinds();
   verifyJSONProjection();
   verifyStreamIsolation();
@@ -43,7 +45,7 @@ void main() {
         ),
         (client.scalarBytes, [0], Uint8List(0)),
         (client.scalarDecimal, [1, 48], '0'),
-        (client.scalarEnum, [4, 79, 80, 69, 78], 'OPEN'),
+        (client.scalarEnum, [4, 79, 80, 69, 78], TaskStatusKnown.OPEN),
         (client.scalarJSON, [5, 102, 97, 108, 115, 101], false),
       ];
       for (final (call, bytes, expected) in cases) {
@@ -87,6 +89,7 @@ void main() {
         Uint8List(0),
         Uint8List.fromList([1, 255]),
       ];
+      expected[9] = (expected[9] as List<String>).map(TaskStatus.fromValue).toList();
       for (var index = 0; index < calls.length; index++) {
         response = cells[index];
         expect(await calls[index](), expected[index]);

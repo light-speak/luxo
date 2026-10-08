@@ -1,0 +1,103 @@
+part of 'int64_consumer_test.dart';
+
+typedef _NullableCall = Future<Object?> Function();
+typedef _NullableSubscribe = Future<void Function()> Function(void Function(Object?));
+
+void verifyNullableRoots() {
+  test('nullable roots preserve null, zero, empty values and complete payloads', () async {
+    final transport = _ResponseTransport();
+    final client = LuxoClient(transport);
+    final cases = _nullableCases(client);
+    for (final (call, subscribe, wire, json, expected) in cases) {
+      final delivered = <Object?>[];
+      final stop = await subscribe(delivered.add);
+      for (final value in <Object?>[null, Uint8List.fromList([0])]) {
+        transport.response = value;
+        expect(await call(), isNull);
+        transport.emit(value);
+        expect(delivered.removeLast(), isNull);
+      }
+      for (final value in [json, Uint8List.fromList([1, ...wire])]) {
+        transport.response = value;
+        expect(_rootComparable(await call()), expected);
+        transport.emit(value);
+        expect(_rootComparable(delivered.removeLast()), expected);
+      }
+      final bytes = [1, ...wire];
+      for (final bad in <List<int>>[
+        [], [1], [2], [255, ...wire], [0, 0], [0, ...wire],
+        [...bytes, 99],
+        for (var end = 2; end < bytes.length; end++) bytes.sublist(0, end),
+      ]) {
+        transport.response = Uint8List.fromList(bad);
+        await expectLater(call(), throwsFormatException);
+        expect(() => transport.emit(transport.response), throwsFormatException);
+        expect(delivered, isEmpty);
+      }
+      stop();
+    }
+  });
+}
+
+Object? _rootComparable(Object? value) => switch (value) {
+  Payload() => value.toJson(),
+  Projection() => value.toJson(),
+  List() => value.map(_rootComparable).toList(),
+  _ => value,
+};
+
+List<(_NullableCall, _NullableSubscribe, List<int>, Object, Object)> _nullableCases(LuxoClient c) {
+  final model = (sdk.LuxoEncoder()..writeVarint(2)..writeVarint(1)..writePresent()..writeString('ok')..writeEnd()).bytes();
+  final column = (sdk.LuxoEncoder()
+    ..writeVarint(1)..writeVarint(2)..writeVarint(1)
+    ..writePresent()..writeString('ok')..writeEnd()).bytes();
+  return [
+    ..._nullableArrayCases(c),
+    (c.optionalInt, (f) => c.subscribeOptionalIntStream(onData: f), [0], 0, sdk.LuxoInt64.zero),
+    (c.optionalInt, (f) => c.subscribeOptionalIntStream(onData: f), [84], 42, sdk.LuxoInt64.fromInt(42)),
+    (c.optionalDuration, (f) => c.subscribeOptionalDurationStream(onData: f), [0], 0, sdk.LuxoInt64.zero),
+    (c.optionalFloat, (f) => c.subscribeOptionalFloatStream(onData: f), List.filled(8, 0), 0.0, 0.0),
+    (c.optionalString, (f) => c.subscribeOptionalStringStream(onData: f), [0], '', ''),
+    (c.optionalBoolean, (f) => c.subscribeOptionalBooleanStream(onData: f), [0], false, false),
+    (c.optionalDateTime, (f) => c.subscribeOptionalDateTimeStream(onData: f), [0, 0], '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z'),
+    (c.optionalUUID, (f) => c.subscribeOptionalUUIDStream(onData: f), List.filled(16, 0), '00000000-0000-0000-0000-000000000000', '00000000-0000-0000-0000-000000000000'),
+    (c.optionalBytes, (f) => c.subscribeOptionalBytesStream(onData: f), [0], '', Uint8List(0)),
+    (c.optionalDecimal, (f) => c.subscribeOptionalDecimalStream(onData: f), [1, 48], '0', '0'),
+    (c.optionalEnum, (f) => c.subscribeOptionalEnumStream(onData: f), [4, ...utf8.encode('OPEN')], 'OPEN', TaskStatusKnown.OPEN),
+    (c.optionalEnum, (f) => c.subscribeOptionalEnumStream(onData: f), [6, ...utf8.encode('FUTURE')], 'FUTURE', TaskStatus.fromValue('FUTURE')),
+    (c.optionalJSON, (f) => c.subscribeOptionalJSONStream(onData: f), [5, ...utf8.encode('false')], false, false),
+    (c.optionalIntArray, (f) => c.subscribeOptionalIntArrayStream(onData: f), [0], [], []),
+    (c.optionalIntArray, (f) => c.subscribeOptionalIntArrayStream(onData: f), [1, 84], [42], [sdk.LuxoInt64.fromInt(42)]),
+    (c.optionalEnumArray, (f) => c.subscribeOptionalEnumArrayStream(onData: f), [1, 4, ...utf8.encode('OPEN')], ['OPEN'], [TaskStatusKnown.OPEN]),
+    (c.optionalPayload, (f) => c.subscribeOptionalPayloadStream(onData: f), [0, 0], <String, Object?>{}, <String, Object?>{}),
+    (c.optionalProjection, (f) => c.subscribeOptionalProjectionStream(onData: f), model, {'label': 'ok'}, {'label': 'ok'}),
+    (c.optionalProjectionArray, (f) => c.subscribeOptionalProjectionArrayStream(onData: f), column, [{'label': 'ok'}], [{'label': 'ok'}]),
+    (c.optionalPayloadArray, (f) => c.subscribeOptionalPayloadArrayStream(onData: f), [0, 0, 0], [], []),
+  ];
+}
+
+List<(_NullableCall, _NullableSubscribe, List<int>, Object, Object)> _nullableArrayCases(LuxoClient c) {
+  final calls = <(_NullableCall, _NullableSubscribe)>[
+    (c.optionalIntArray, (f) => c.subscribeOptionalIntArrayStream(onData: f)),
+    (c.optionalDurationArray, (f) => c.subscribeOptionalDurationArrayStream(onData: f)),
+    (c.optionalFloatArray, (f) => c.subscribeOptionalFloatArrayStream(onData: f)),
+    (c.optionalStringArray, (f) => c.subscribeOptionalStringArrayStream(onData: f)),
+    (c.optionalBooleanArray, (f) => c.subscribeOptionalBooleanArrayStream(onData: f)),
+    (c.optionalDateTimeArray, (f) => c.subscribeOptionalDateTimeArrayStream(onData: f)),
+    (c.optionalUUIDArray, (f) => c.subscribeOptionalUUIDArrayStream(onData: f)),
+    (c.optionalBytesArray, (f) => c.subscribeOptionalBytesArrayStream(onData: f)),
+    (c.optionalDecimalArray, (f) => c.subscribeOptionalDecimalArrayStream(onData: f)),
+    (c.optionalEnumArray, (f) => c.subscribeOptionalEnumArrayStream(onData: f)),
+    (c.optionalJSONArray, (f) => c.subscribeOptionalJSONArrayStream(onData: f)),
+  ];
+  final cells = _scalarArrayCells();
+  return [
+    for (final (index, (call, subscribe)) in calls.indexed)
+      (call, subscribe, cells[index], _streamValues[index].map(_jsonValue).toList(),
+        index == 9
+          ? _streamValues[index].map((v) => TaskStatus.fromValue(v as String)).toList()
+          : _streamValues[index]),
+    (c.optionalJSONArray, (f) => c.subscribeOptionalJSONArrayStream(onData: f),
+      [1, 4, ...utf8.encode('null')], [null], [null]),
+  ];
+}

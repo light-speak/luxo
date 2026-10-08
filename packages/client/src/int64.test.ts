@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { ColumnarDecoder, Decoder, Encoder } from './codec'
 import { encodeBinaryBody } from './transport'
 import { inspectBinaryRequest } from './wire-inspector'
+import { writeWireInt64 } from './int64'
 
 const fixture = JSON.parse(readFileSync(new URL('../../../pkg/lux/codec/testdata/protocol-v1.json', import.meta.url), 'utf8')) as {
   int64Cases: { value: string; wire: string }[]
@@ -25,6 +26,38 @@ function reference(value: bigint): Uint8Array {
 }
 
 describe('full-width int64', () => {
+  it('preserves destination boundaries and validates before writing', () => {
+    for (const value of [0n, -1n, 2147483648n, -2147483649n, 9007199254740993n, -(1n << 63n), (1n << 63n) - 1n]) {
+      const expected = reference(value)
+      const output = new Uint8Array(20).fill(165)
+      expect(writeWireInt64(output, 3, value)).toBe(3 + expected.length)
+      expect(output.subarray(3, 3 + expected.length)).toEqual(expected)
+      expect(output.subarray(0, 3)).toEqual(new Uint8Array(3).fill(165))
+      expect(output.subarray(3 + expected.length)).toEqual(new Uint8Array(17 - expected.length).fill(165))
+    }
+    for (const value of [null, undefined, 1, '1', {}, -(1n << 63n) - 1n, 1n << 63n]) {
+      const output = new Uint8Array(20).fill(165)
+      expect(() => writeWireInt64(output, 3, value as bigint)).toThrow()
+      expect(output).toEqual(new Uint8Array(20).fill(165))
+    }
+  })
+
+  it('keeps extracted words independent when destination writes reenter the encoder', () => {
+    const output = new Uint8Array(10)
+    const nested = new Uint8Array(10)
+    let entered = false
+    const destination = new Proxy(output, { set(target, property, value) {
+      if (!entered) {
+        entered = true
+        expect(writeWireInt64(nested, 0, -(1n << 63n))).toBe(10)
+      }
+      return Reflect.set(target, property, value)
+    } })
+    expect(writeWireInt64(destination, 0, (1n << 63n) - 1n)).toBe(10)
+    expect(output).toEqual(reference((1n << 63n) - 1n))
+    expect(nested).toEqual(reference(-(1n << 63n)))
+  })
+
   it('inspects full-width request values without a number conversion', () => {
     const schema = {
       sample: { id: 1, params: [

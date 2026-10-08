@@ -2,12 +2,58 @@ package main
 
 import (
 	"bytes"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestFixtureDeploymentChecksRegistrationErrors(t *testing.T) {
+	for name, source := range map[string][]byte{
+		"deployment.go":      fixtureDeploymentServer,
+		"server.go":          fixtureServer,
+		"gateway_failure.go": fixtureGatewayFailureTests,
+		"gateway_nested.go":  fixtureGatewayNestedTests,
+		"gateway_http.go":    fixtureGatewayHTTPTests,
+		"gateway_bench.go":   fixtureGatewayBenchmarks,
+	} {
+		t.Run(name, func(t *testing.T) { checkFixtureRegistrationErrors(t, name, source) })
+	}
+}
+
+func checkFixtureRegistrationErrors(t *testing.T, name string, source []byte) {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), name, source, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ast.Inspect(file, func(node ast.Node) bool {
+		statement, ok := node.(*ast.ExprStmt)
+		if !ok {
+			return true
+		}
+		call, ok := statement.X.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		var name string
+		switch target := call.Fun.(type) {
+		case *ast.Ident:
+			name = target.Name
+		case *ast.SelectorExpr:
+			name = target.Sel.Name
+		}
+		switch name {
+		case "RegisterSchema", "RegisterSchemaAPIs", "RegisterHandlers", "RegisterStreams",
+			"RegisterModel", "RegisterType", "RegisterAPI", "RegisterParams", "Prepare":
+			t.Errorf("fixture startup ignores %s error", name)
+		}
+		return true
+	})
+}
 
 func TestGenerateFixtureOwnsOnlyEmptyProjectScratch(t *testing.T) {
 	t.Chdir("../..")
@@ -71,6 +117,69 @@ func TestCompileFixture(t *testing.T) {
 	}
 	if bytes.Contains(files["handler.gen.go"], []byte(`Type: "Model", TypeName: "FixtureState"`)) {
 		t.Fatal("generated handlers must agree with schema enum parameter metadata")
+	}
+}
+
+func TestFixtureEnumUpgradeUsesDistinctValidatedSchemas(t *testing.T) {
+	source, server, err := fixtureEnumUpgrade(fixtureSchema, fixtureServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains([]byte(fixtureSchema), []byte("\n  FUTURE\n")) {
+		t.Fatal("the old SDK schema already contains FUTURE")
+	}
+	old, err := compileFixture(fixtureSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := compileFixture(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(old["model.gen.go"], next["model.gen.go"]) || !bytes.Contains(next["model.gen.go"], []byte("FixtureStateFUTURE")) {
+		t.Fatal("upgraded server does not have a genuinely extended enum")
+	}
+	for _, fragment := range []string{`FixtureState("FUTURE")`, `[]FixtureState{"OPEN", "FUTURE", "CLOSED"}`} {
+		if !bytes.Contains(server, []byte(fragment)) {
+			t.Fatalf("upgraded stream is missing %s", fragment)
+		}
+	}
+	if _, _, err := fixtureEnumUpgrade("changed fixture", fixtureServer); err == nil {
+		t.Fatal("accepted missing schema revision anchor")
+	}
+	if _, _, err := fixtureEnumUpgrade(fixtureSchema, []byte("changed server")); err == nil {
+		t.Fatal("accepted missing stream revision anchor")
+	}
+}
+
+func TestFixtureUpgradeIncludesAdditiveContractChanges(t *testing.T) {
+	source, _, err := fixtureEnumUpgrade(fixtureSchema, fixtureServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fragment := range []string{
+		"api aFutureInteger(", "echoInteger(value: Int, delta: Int = 0)",
+		"model PageRecord {\n  future: String?",
+	} {
+		if !strings.Contains(source, fragment) || strings.Contains(fixtureSchema, fragment) {
+			t.Fatalf("missing distinct additive revision: %s", fragment)
+		}
+	}
+}
+
+func TestFixtureUpgradeRejectsBaselineAndAnchorDrift(t *testing.T) {
+	for _, anchor := range []string{"api echoInteger(value: Int): Int", "model PageRecord {"} {
+		if _, err := fixtureAdditiveUpgrade(strings.Replace(fixtureSchema, anchor, "changed", 1)); err == nil {
+			t.Fatalf("ignored missing anchor %s", anchor)
+		}
+	}
+	for _, broken := range []string{"`", "api", "api bad(): MissingType { return 1 }"} {
+		if _, err := compileFixtureRevision(fixtureSchema, broken); err == nil {
+			t.Fatalf("ignored invalid baseline %q", broken)
+		}
+		if _, err := compileFixtureRevision(broken, fixtureSchema); err == nil {
+			t.Fatalf("ignored invalid new revision %q", broken)
+		}
 	}
 }
 

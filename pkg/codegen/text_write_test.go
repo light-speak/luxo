@@ -19,16 +19,18 @@ func TestGeneratedStringWriters(t *testing.T) {
 
 const stringWriterAssertions = `package generated
 import (
+"github.com/light-speak/luxo/internal/testutil"
+
     "errors"
     "testing"
     "github.com/light-speak/luxo/pkg/lux/api"
     "github.com/light-speak/luxo/pkg/lux/codec"
 )
 
-func stringMask(ids ...int) []byte {
+func stringMask(t testing.TB, ids ...int) []byte {
     var fields []byte
-    for _, id := range ids { fields = codec.FieldMaskSet(fields, id) }
-    return codec.AppendSelectionMask(nil, fields, nil)
+    for _, id := range ids { fields = testutil.Bytes(t)(codec.FieldMaskSet(fields, id)) }
+    return testutil.Bytes(t)(codec.AppendSelectionMask(nil, fields, nil))
 }
 
 func TestRejectSelectedInvalidText(t *testing.T) {
@@ -39,7 +41,7 @@ func TestRejectSelectedInvalidText(t *testing.T) {
             {Children: []Child{{Value: "ok"}, {Value: value}}},
         }
         for index, item := range payloads {
-            mask := stringMask(index+1)
+            mask := stringMask(t, index+1)
             buf := &api.ResponseBuf{B: []byte("prefix")}
             if err := item.WriteLuxo(buf, mask); !errors.Is(err, codec.ErrInvalidUTF8) || string(buf.B[:6]) != "prefix" {
                 t.Fatalf("row %d published invalid text: %x / %v", index, buf.B, err)
@@ -59,7 +61,7 @@ func TestRejectSelectedInvalidText(t *testing.T) {
             if err := encode(req, []string{"ok", value}); !errors.Is(err, codec.ErrInvalidUTF8) { t.Fatalf("array: %v", err) }
         }
         item := Payload{Value:"valid", Optional:&value, Values:[]string{value}}
-        if err := item.WriteLuxo(&api.ResponseBuf{}, stringMask(1)); err != nil { t.Fatalf("unselected field validated: %v", err) }
+        if err := item.WriteLuxo(&api.ResponseBuf{}, stringMask(t, 1)); err != nil { t.Fatalf("unselected field validated: %v", err) }
     }
 }
 `
@@ -75,7 +77,8 @@ func TestGeneratedEventStringErrors(t *testing.T) {
 		{Name: "role", Type: &ast.TypeRef{Name: "Role"}},
 	}}
 	var source strings.Builder
-	source.WriteString("package generated\nimport (\"fmt\"; \"github.com/light-speak/luxo/pkg/lux/codec\")\ntype Role string\n")
+	source.WriteString("package generated\nimport (\"fmt\"; \"github.com/light-speak/luxo/pkg/lux/codec\")\n")
+	generateEnum(&source, &ast.EnumDecl{Name: "Role", Values: []string{"USER", "ADMIN"}})
 	generateEventStruct(&source, event)
 	g.generateEventCodec(&source, event, map[string]bool{"Role": true}, nil)
 	runGeneratedProtocolPackage(t, source.String(), stringEventAssertions)
@@ -85,13 +88,14 @@ const stringEventAssertions = `package generated
 import ("errors"; "testing"; "github.com/light-speak/luxo/pkg/lux/codec")
 func TestStringEventFailure(t *testing.T) {
     for _, value := range []string{"\xff", "good\xed\xa0\x80tail"} {
-        for _, event := range []TextEvent{{Value:value}, {Optional:&value}, {Values:[]string{"ok", value}}, {Role:Role(value)}} {
+        for _, event := range []TextEvent{{Value:value}, {Optional:&value}, {Values:[]string{"ok", value}}} {
             data, err := event.MarshalLuxo()
             if !errors.Is(err, codec.ErrInvalidUTF8) || data != nil { t.Fatalf("invalid event returned: %x / %v", data, err) }
         }
+        if data,err := (&TextEvent{Role:Role(value)}).MarshalLuxo(); !errors.Is(err,codec.ErrInvalidEnum) || data != nil { t.Fatalf("invalid enum returned: %x / %v",data,err) }
     }
     value := "東京\ufeff\x00"
-    event := TextEvent{Value:value, Optional:&value, Values:[]string{"", value}, Role:Role(value)}
+    event := TextEvent{Value:value, Optional:&value, Values:[]string{"", value}, Role:RoleUSER}
     data, err := event.MarshalLuxo(); if err != nil { t.Fatal(err) }
     var out TextEvent
     if err := out.UnmarshalLuxo(data); err != nil { t.Fatal(err) }
@@ -117,7 +121,8 @@ func TestGeneratedStringOutputDirectives(t *testing.T) {
 	for _, declaration := range []string{"model", "type"} {
 		t.Run(declaration, func(t *testing.T) {
 			var source strings.Builder
-			source.WriteString("package generated\nimport (\"github.com/light-speak/luxo/pkg/lux/api\"; \"github.com/light-speak/luxo/pkg/lux/codec\"; \"github.com/light-speak/luxo/pkg/lux/str\")\ntype Role string\n")
+			source.WriteString("package generated\nimport (\"github.com/light-speak/luxo/pkg/lux/api\"; \"github.com/light-speak/luxo/pkg/lux/codec\"; \"github.com/light-speak/luxo/pkg/lux/str\")\n")
+			generateEnum(&source, &ast.EnumDecl{Name: "Role", Values: []string{"USER", "ADMIN"}})
 			writeArrayFixtureDeclaration(&source, g, model, map[string]bool{"Role": true}, declaration)
 			runGeneratedProtocolPackage(t, source.String(), stringDirectiveAssertions)
 		})
@@ -125,7 +130,9 @@ func TestGeneratedStringOutputDirectives(t *testing.T) {
 }
 
 const stringDirectiveAssertions = `package generated
-import ("errors"; "testing"; "github.com/light-speak/luxo/pkg/lux/api"; "github.com/light-speak/luxo/pkg/lux/codec")
+import (
+"github.com/light-speak/luxo/internal/testutil"
+"errors"; "testing"; "github.com/light-speak/luxo/pkg/lux/api"; "github.com/light-speak/luxo/pkg/lux/codec")
 
 var rewritten string
 var rewriteCalls int
@@ -133,7 +140,7 @@ func rewriteText(string) string { rewriteCalls++; return rewritten }
 
 func writeTextFixture(t *testing.T, item Payload, field int, column bool) ([]byte, error) {
     t.Helper()
-    mask := codec.AppendSelectionMask(nil, codec.FieldMaskSet(nil, field), nil)
+    mask := testutil.Bytes(t)(codec.AppendSelectionMask(nil, testutil.Bytes(t)(codec.FieldMaskSet(nil, field)), nil))
     buf := &api.ResponseBuf{}
     if column { err := WriteColumnarPayload(buf, []Payload{item}, mask); return buf.B, err }
     err := item.WriteLuxo(buf, mask)
@@ -173,10 +180,10 @@ func checkTextOutput(t *testing.T, data []byte, column bool, field int, want str
 
 func TestEnumStringValidation(t *testing.T) {
     invalid := Role("bad\xff")
-    items := []Payload{{Role:invalid}, {OptionalRole:&invalid}, {Roles:[]Role{"valid", invalid}}}
+    items := []Payload{{Role:invalid}, {OptionalRole:&invalid}, {Roles:[]Role{RoleUSER, invalid}}}
     for i, item := range items {
         for _, column := range []bool{false,true} {
-            if _, err := writeTextFixture(t, item, i+3, column); !errors.Is(err, codec.ErrInvalidUTF8) { t.Fatalf("enum field %d: %v", i+3, err) }
+            if _, err := writeTextFixture(t, item, i+3, column); !errors.Is(err, codec.ErrInvalidEnum) { t.Fatalf("enum field %d: %v", i+3, err) }
         }
     }
 }

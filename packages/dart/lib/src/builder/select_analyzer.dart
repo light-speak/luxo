@@ -16,6 +16,10 @@ class SelectAnalyzer extends RecursiveAstVisitor<void> {
   /// API name → field tree (nested)
   final Map<String, FieldNode> hints = {};
 
+  /// Each invocation owns its own selection, even when API names are equal.
+  final Map<MethodInvocation, FieldNode> callSelections = {};
+  final Set<MethodInvocation> escapedCalls = {};
+
   /// Resolved symbols keep aliases, callbacks and shadowed variables separate.
   final Map<Element, List<_SelectionSource>> _bindings = {};
   final Map<DartType, bool> _modelTypes = {};
@@ -74,8 +78,38 @@ class SelectAnalyzer extends RecursiveAstVisitor<void> {
 
   @override
   void visitMethodInvocation(MethodInvocation node) {
+    _callSources(node);
+    for (final argument in node.argumentList.arguments) {
+      _escape(_sources(argument.argumentExpression));
+    }
+    if (!const {
+      'then',
+      'map',
+      'where',
+      'forEach',
+      'any',
+      'every',
+      'firstWhere',
+      'lastWhere',
+      'singleWhere',
+      'toList',
+    }.contains(node.methodName.name)) {
+      _escape(_sources(node.realTarget));
+    }
     _bindCallback(node);
     super.visitMethodInvocation(node);
+  }
+
+  @override
+  void visitReturnStatement(ReturnStatement node) {
+    _escape(_sources(node.expression));
+    super.visitReturnStatement(node);
+  }
+
+  void _escape(List<_SelectionSource> sources) {
+    for (final source in sources) {
+      if (_isModel(_valueType(source.type))) escapedCalls.add(source.call);
+    }
   }
 
   @override
@@ -101,7 +135,9 @@ class SelectAnalyzer extends RecursiveAstVisitor<void> {
   }
 
   bool _sameSource(_SelectionSource a, _SelectionSource b) {
-    if (a.api != b.api || a.type != b.type || a.path.length != b.path.length) {
+    if (a.call != b.call ||
+        a.type != b.type ||
+        a.path.length != b.path.length) {
       return false;
     }
     for (var i = 0; i < a.path.length; i++) {
@@ -153,7 +189,10 @@ class SelectAnalyzer extends RecursiveAstVisitor<void> {
           (clientLibrary == null || type.element.library.uri == clientLibrary),
     );
     if (!isClient || call.methodName.name.startsWith('_')) return [];
-    return [(api: call.methodName.name, type: result, path: <String>[])];
+    callSelections.putIfAbsent(call, FieldNode.root);
+    return [
+      (api: call.methodName.name, call: call, type: result, path: <String>[]),
+    ];
   }
 
   List<_SelectionSource> _retype(
@@ -161,7 +200,10 @@ class SelectAnalyzer extends RecursiveAstVisitor<void> {
     DartType? type,
   ) => type == null
       ? []
-      : [for (final s in sources) (api: s.api, type: type, path: s.path)];
+      : [
+          for (final s in sources)
+            (api: s.api, call: s.call, type: type, path: s.path),
+        ];
 
   List<_SelectionSource> _properties(
     List<_SelectionSource> sources,
@@ -198,13 +240,14 @@ class SelectAnalyzer extends RecursiveAstVisitor<void> {
     }
     return (
       api: source.api,
+      call: source.call,
       type: getter.returnType,
       path: [...source.path, field],
     );
   }
 
   _SelectionSource _withType(_SelectionSource source, DartType type) =>
-      (api: source.api, type: type, path: source.path);
+      (api: source.api, call: source.call, type: type, path: source.path);
 
   bool _isSDKType(DartType type, String name) =>
       type is InterfaceType &&
@@ -222,8 +265,9 @@ class SelectAnalyzer extends RecursiveAstVisitor<void> {
   ];
 
   void _bindCallback(MethodInvocation call) {
+    if (_bindSubscription(call)) return;
     if (call.argumentList.arguments.isEmpty) return;
-    final callback = call.argumentList.arguments.first;
+    final callback = call.argumentList.arguments.first.argumentExpression;
     if (callback is! FunctionExpression) return;
     final parameter = callback.parameters?.parameters.firstOrNull;
     if (parameter == null) return;
@@ -251,20 +295,50 @@ class SelectAnalyzer extends RecursiveAstVisitor<void> {
     _bind(parameter.declaredFragment?.element, values);
   }
 
+  bool _bindSubscription(MethodInvocation call) {
+    if (!callSelections.containsKey(call)) return false;
+    for (final argument in call.argumentList.arguments) {
+      if (argument.correspondingParameter?.name != 'onData') continue;
+      final callback = argument.argumentExpression;
+      if (callback is! FunctionExpression) return false;
+      final element = callback
+          .parameters
+          ?.parameters
+          .firstOrNull
+          ?.declaredFragment
+          ?.element;
+      if (element is! FormalParameterElement) return false;
+      _bind(element, [
+        (
+          api: call.methodName.name,
+          call: call,
+          type: element.type,
+          path: <String>[],
+        ),
+      ]);
+      return true;
+    }
+    return false;
+  }
+
   /// Only terminal schema fields form a valid selection, never wrapper members.
   void _record(List<_SelectionSource> sources) {
     for (final source in sources) {
       if (source.path.isEmpty || _isModel(_valueType(source.type))) continue;
       var node = hints.putIfAbsent(source.api, FieldNode.root);
+      var callNode = callSelections.putIfAbsent(source.call, FieldNode.root);
       for (final field in source.path) {
         node = node.addChild(field);
+        callNode = callNode.addChild(field);
       }
     }
   }
 
   DartType _valueType(DartType type) {
     while (type is InterfaceType &&
-        (_isSDKType(type, 'Selected') || _isCollection(type))) {
+        (_isSDKType(type, 'Selected') ||
+            _isCollection(type) ||
+            type.isDartAsyncFuture)) {
       type = type.typeArguments.single;
     }
     return type;
@@ -281,7 +355,12 @@ class SelectAnalyzer extends RecursiveAstVisitor<void> {
   );
 }
 
-typedef _SelectionSource = ({String api, DartType type, List<String> path});
+typedef _SelectionSource = ({
+  String api,
+  MethodInvocation call,
+  DartType type,
+  List<String> path,
+});
 
 /// Tree node for nested field selection.
 /// Root → { user → { name, email }, comments → { content, user → { id } } }

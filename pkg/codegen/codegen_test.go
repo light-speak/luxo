@@ -19,6 +19,22 @@ func buildResult(files ...*ast.File) *semantic.Result {
 	}
 }
 
+func TestGeneratorSnapshotsSharedEnumDeclarations(t *testing.T) {
+	declaration := &ast.EnumDecl{Name: "Role", Values: []string{"USER", "ADMIN"}, Doc: "Roles"}
+	context := BuildEventContext([]*ast.File{{Name: "origin/common/types.luxo", Enums: []*ast.EnumDecl{declaration}}}, "example.com/app")
+	generator := mustNewGenerator(t, GeneratorConfig{Events: context})
+	declaration.Values[0] = "CHANGED"
+	declaration.Doc = "changed"
+	delete(context.Enums, "Role")
+	got := generator.events.Enums["Role"]
+	if got == nil || got.Values[0] != "USER" || got.Doc != "Roles" {
+		t.Fatalf("shared enum snapshot changed: %#v", got)
+	}
+	if generator.events.EnumModule["Role"] != "common" {
+		t.Fatal("shared enum lost schema ownership")
+	}
+}
+
 func TestGeneratorAllEnumsMergesLocalAndCrossModuleEnums(t *testing.T) {
 	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		EnumModule: map[string]string{"Role": "auth"},
@@ -65,10 +81,10 @@ func TestGenerateEmpty(t *testing.T) {
 	}
 }
 
-func TestFormatGeneratedReturnsInvalidSourceUnchanged(t *testing.T) {
+func TestFormatGeneratedRejectsInvalidSource(t *testing.T) {
 	raw := []byte("package invalid {")
-	if got := formatGenerated(raw); !bytes.Equal(got, raw) {
-		t.Fatalf("formatGenerated() = %q, want original %q", got, raw)
+	if got, err := formatGeneratedChecked(raw); err == nil || got != nil {
+		t.Fatalf("formatGeneratedChecked() = %q, %v; want nil source and error", got, err)
 	}
 }
 
@@ -177,7 +193,7 @@ func TestGenerateOutputIsGofmtFormatted(t *testing.T) {
 		},
 	}
 
-	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: modelIDs}})
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: completeFixtureAPIIDs(result(file), StableIDs{ModelFields: modelIDs})})
 	gr, err := generator.Generate(result(file), "gen", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -589,7 +605,11 @@ func TestGenerateAppFile(t *testing.T) {
 		"&OrderClient{db: db}",
 		"func (a *App) Close()",
 		"func (a *App) Tx(ctx context.Context, fn func(tx *App) error) error",
-		"NewFromDB(txDB)",
+		"txApp := *a",
+		"txApp.DB = txDB",
+		"txApp.User = &UserClient{db: txDB}",
+		"txApp.Order = &OrderClient{db: txDB}",
+		"return fn(&txApp)",
 	}
 	for _, check := range checks {
 		if !strings.Contains(appSrc, check) {
@@ -919,15 +939,6 @@ func TestGeneratorAPIParamIDs(t *testing.T) {
 	}
 }
 
-func TestGeneratorAPIParamTypes(t *testing.T) {
-	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIParamTypes: map[string]map[string]string{
-		"getUser": {"id": "Int"},
-	}}})
-	if generator.ids.APIParamTypes["getUser"]["id"] != "Int" {
-		t.Fatal("API parameter type not copied")
-	}
-}
-
 func TestDriverImportAndPkg(t *testing.T) {
 	tests := []struct {
 		d          DBDriver
@@ -955,7 +966,7 @@ func TestBuildSchemaJSON(t *testing.T) {
 	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
 		ModelFields: map[string]map[string]int{"User": {"id": 1, "name": 2, "email": 3}},
 		APIs:        map[string]int{"getUser": 7, "listUsers": 8},
-		APIParams:   map[string]map[string]int{"getUser": {"id": 1}},
+		APIParams:   map[string]map[string]int{"getUser": {"id": 1}, "listUsers": {"page": 1, "pageSize": 2}},
 	}})
 
 	r := result(
@@ -973,6 +984,7 @@ func TestBuildSchemaJSON(t *testing.T) {
 		},
 	)
 
+	generator = mustNewGenerator(t, GeneratorConfig{IDs: completeFixtureAPIIDs(r, generator.ids)})
 	data, err := generator.BuildSchemaJSON(r, map[string]bool{})
 	if err != nil {
 		t.Fatal(err)

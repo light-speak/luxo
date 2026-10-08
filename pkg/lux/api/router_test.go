@@ -903,7 +903,7 @@ func TestRouterHeadSamplesDetailedTraceWithoutExposingDebugHeaders(t *testing.T)
 		req.Buf.AppendInt(1)
 		return nil
 	})
-	rt.Schema.RegisterAPI(&schema.API{Name: "getUser", ReturnType: "Int"})
+	rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "getUser", ReturnType: "Int"})
 
 	r := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(`{"$api":"getUser","$select":"id"}`))
 	r.Header.Set("X-Request-Id", "sample-me")
@@ -934,8 +934,8 @@ func TestHandleStream(t *testing.T) {
 
 func TestIsStreamAPIUsesSchemaAndNativeRegistration(t *testing.T) {
 	rt := NewRouter()
-	rt.Schema.RegisterAPI(&schema.API{Name: "watchSchema", Stream: true})
-	rt.Schema.RegisterAPI(&schema.API{Name: "regularAPI"})
+	rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "watchSchema", Stream: true})
+	rt.Schema.RegisterAPI(&schema.API{ID: 2, Name: "regularAPI"})
 	rt.HandleStreamNative("watchNative", func(context.Context, *StreamParams, any, *Stream) error { return nil })
 
 	if !rt.isStreamAPI("watchSchema") {
@@ -968,6 +968,53 @@ func TestRouterValidateRequiresGeneratedStreamImplementations(t *testing.T) {
 }
 
 // --- convertBinaryToJSON: scalar, type declaration, list, paginated ---
+
+func TestNullableRootResponse(t *testing.T) {
+	for _, test := range []struct {
+		name, kind string
+		list       bool
+		data       []byte
+		want       string
+	}{
+		{"null", "Int", false, []byte{0}, "null"},
+		{"zero", "Int", false, []byte{1, 0}, "0"},
+		{"positive", "Int", false, []byte{1, 84}, "42"},
+		{"false", "Boolean", false, []byte{1, 0}, "false"},
+		{"empty-text", "String", false, []byte{1, 0}, `""`},
+		{"empty-list", "Int", true, []byte{1, 0}, "[]"},
+		{"null-list", "Int", true, []byte{0}, "null"},
+		{"null-object", "Item", false, []byte{0}, "null"},
+		{"object", "Item", false, []byte{1, 0, 1, 84, 0}, `{"id":42}`},
+		{"empty-body", "Int", false, nil, ""},
+		{"invalid-flag", "Int", false, []byte{2}, ""},
+		{"null-trailing", "Int", false, []byte{0, 0}, ""},
+		{"missing-value", "Int", false, []byte{1}, ""},
+		{"value-trailing", "Int", false, []byte{1, 84, 0}, ""},
+		{"truncated-object", "Item", false, []byte{1, 0, 1, 84}, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			router := NewRouter()
+			if err := router.Schema.RegisterType(&schema.TypeDecl{Name: "Item", Fields: []schema.Field{{ID: 1, Name: "id", Type: schema.FieldInt}}}); err != nil {
+				t.Fatal(err)
+			}
+			var metadata schema.API
+			if err := json.Unmarshal(fmt.Appendf(nil, `{"id":1,"name":"read","returnType":%q,"returnList":%v,"returnNullable":true}`, test.kind, test.list), &metadata); err != nil {
+				t.Fatal(err)
+			}
+			if err := router.Schema.RegisterAPI(&metadata); err != nil {
+				t.Fatal(err)
+			}
+			got, err := router.StreamPayloadJSON("read", test.data)
+			if test.want == "" {
+				if err == nil {
+					t.Fatalf("accepted invalid nullable root: %x -> %s", test.data, got)
+				}
+			} else if err != nil || string(got) != test.want {
+				t.Fatalf("got %s, %v; want %s", got, err, test.want)
+			}
+		})
+	}
+}
 
 func TestConvertBinaryToJSON_ScalarNoReturnType(t *testing.T) {
 	rt := NewRouter()
@@ -1326,6 +1373,27 @@ func TestPreparedTypesKeepJSONAndBinarySelectionInSync(t *testing.T) {
 	}
 	if err := rt.applyJSONSelection(&Request{API: "read", Select: previous}, false); err == nil {
 		t.Fatal("removed field is still selectable")
+	}
+}
+
+func TestRouterRejectsUnknownSelectionBeforeHandler(t *testing.T) {
+	router := NewRouter()
+	if err := router.Schema.RegisterType(&schema.TypeDecl{Name: "Snapshot", Fields: []schema.Field{{ID: 1, Name: "value", Type: schema.FieldInt}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Schema.RegisterAPI(&schema.API{ID: 1, Name: "read", ReturnType: "Snapshot"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Registry.RegisterSchemaAPIs(router.Schema); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	router.Handle("read", func(context.Context, *Request) error { called = true; return nil })
+	request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"$api":"read","$select":"missing"}`))
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || called || !strings.Contains(response.Body.String(), "missing") {
+		t.Fatalf("unknown projection reached handler: called=%t status=%d body=%s", called, response.Code, response.Body.String())
 	}
 }
 

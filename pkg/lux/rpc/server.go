@@ -19,7 +19,7 @@ import (
 const MaxRPCConnections = 10000
 
 // Server handles internal RPC connections using Luxo binary protocol.
-// Dispatches requests to the same handlers as the HTTP router.
+// Dispatches both public API and RPC-only handlers from a startup snapshot.
 type Server struct {
 	router                 *api.Router
 	handlers               map[string]api.HandlerFunc
@@ -35,7 +35,7 @@ type Server struct {
 	closeOnce              sync.Once
 }
 
-// NewServer creates an RPC server that shares handlers with the HTTP router.
+// NewServer exports public and internal handlers after registration is complete.
 func NewServer(router *api.Router) *Server {
 	return &Server{
 		router:                 router,
@@ -50,6 +50,9 @@ func NewServer(router *api.Router) *Server {
 
 // ListenAndServe starts the RPC server on the given TCP address.
 func (s *Server) ListenAndServe(addr string) error {
+	if err := s.router.Prepare(); err != nil {
+		return err
+	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -67,6 +70,9 @@ func (s *Server) Serve(ln net.Listener) error {
 		return fmt.Errorf("rpc: nil listener")
 	}
 	defer ln.Close()
+	if err := s.router.Prepare(); err != nil {
+		return err
+	}
 	s.connMu.Lock()
 	if s.closing {
 		s.connMu.Unlock()
@@ -308,15 +314,20 @@ func (s *Server) processStream(conn net.Conn, envelope requestEnvelope) {
 	req.Internal = true
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	stream, err := s.router.OpenInternalStream(streamCtx, req)
+	stream, err := s.router.PrepareInternalStream(streamCtx, req)
 	if err != nil {
-		WriteFrame(conn, encodeError(400, "BadRequest", err.Error()))
+		if appErr, ok := stderrors.AsType[*luxerrors.AppError](err); ok {
+			writeApplicationError(conn, appErr, nil)
+			return
+		}
+		writeApplicationError(conn, luxerrors.Wrap(err), nil)
 		return
 	}
 	defer stream.Close()
 	if err := writeStatusFrame(conn, statusOK, nil); err != nil {
 		return
 	}
+	stream.Start()
 	s.pumpInternalStream(conn, stream)
 }
 

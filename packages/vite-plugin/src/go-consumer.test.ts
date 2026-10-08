@@ -12,6 +12,12 @@ import { generateTypes } from './codegen'
 
 const runFile = promisify(execFile)
 
+it.each([
+  ['commonjs', false], ['module', false], ['commonjs', true], ['module', true],
+] as const)('explicit wrapper baseline %s gateway=%s interoperates with Go', async (moduleType, gateway) => {
+  await verifyGoConsumer(moduleType, gateway, false)
+}, 180000)
+
 it.each(['commonjs', 'module'])('TS 7 generated %s client interoperates with the real Go router', async moduleType => {
   await verifyGoConsumer(moduleType, false)
 }, 180000)
@@ -20,24 +26,73 @@ it.each(['commonjs', 'module'])('TS 7 generated %s client preserves numbers, err
   await verifyGoConsumer(moduleType, true)
 }, 180000)
 
-async function verifyGoConsumer(moduleType: string, gateway: boolean): Promise<void> {
+it.each(['commonjs', 'module'])('old %s SDK preserves new server enum members in both deployments', async moduleType => {
+  const root = resolve(import.meta.dirname, '../../..')
+  const scratch = join(root, '.tmp')
+  mkdirSync(scratch, { recursive: true })
+  const directory = mkdtempSync(join(scratch, 'ts-enum-upgrade-'))
+  try {
+    const oldBinary = await buildGoFixture(root, join(directory, 'old'))
+    const nextBinary = await buildGoFixture(root, join(directory, 'next'), true)
+    for (const gateway of [false, true]) {
+      const output = join(directory, gateway ? 'gateway-consumer' : 'direct-consumer')
+      let oldSchema: LuxoSchema | undefined
+      await withGoDeployment(oldBinary, gateway, async endpoint => {
+        oldSchema = await readGoSchema(endpoint)
+        expect(oldSchema.enums?.FixtureState.values).toEqual(['OPEN', 'CLOSED'])
+        await generateTypes(oldSchema, output)
+      })
+      const oldTypes = readFileSync(join(output, 'types.ts'), 'utf8')
+      await withGoDeployment(nextBinary, gateway, async endpoint => {
+        const nextSchema = await readGoSchema(endpoint)
+        expect(nextSchema.enums?.FixtureState.values).toEqual(['OPEN', 'CLOSED', 'FUTURE'])
+        if (!oldSchema) throw new Error('Missing original Schema')
+        for (const [name, api] of Object.entries(oldSchema.apis)) {
+          const next = nextSchema.apis[name]
+          expect(next.id).toBe(api.id)
+          expect(next.params).toEqual(name === 'echoInteger'
+            ? [...(api.params ?? []), expect.objectContaining({ name: 'delta', hasDefault: true })]
+            : api.params)
+        }
+        expect(nextSchema.apis.aFutureInteger).toBeDefined()
+        await runGoConsumer(root, output, endpoint, moduleType, true)
+      })
+      expect(readFileSync(join(output, 'types.ts'), 'utf8')).toBe(oldTypes)
+    }
+  } finally {
+    if (!directory.startsWith(`${scratch}${sep}ts-enum-upgrade-`)) throw new Error('Unsafe fixture cleanup')
+    rmSync(directory, { recursive: true, force: true })
+  }
+}, 180000)
+
+async function buildGoFixture(root: string, directory: string, futureEnum = false): Promise<string> {
+  mkdirSync(directory, { recursive: true })
+  await runFile('go', ['run', './tests/sdk-interop', '-out', directory, ...(futureEnum ? ['-future-enum'] : [])], { cwd: root, timeout: 120000 })
+  const binary = join(directory, 'server')
+  await runFile('go', ['build', '-o', binary, directory], { cwd: root, timeout: 120000 })
+  return binary
+}
+
+async function readGoSchema(endpoint: string): Promise<LuxoSchema> {
+  const response = await fetch(`${endpoint}?$schema`, {
+    headers: { 'X-Introspection-Key': 'sdk-interop' }, signal: AbortSignal.timeout(10000),
+  })
+  expect(response.status).toBe(200)
+  return await response.json() as LuxoSchema
+}
+
+async function verifyGoConsumer(moduleType: string, gateway: boolean, staticRequests?: boolean): Promise<void> {
   const root = resolve(import.meta.dirname, '../../..')
   const scratch = join(root, '.tmp')
   mkdirSync(scratch, { recursive: true })
   const directory = mkdtempSync(join(scratch, 'ts-go-interop-'))
   try {
-    await runFile('go', ['run', './tests/sdk-interop', '-out', directory], { cwd: root, timeout: 120000 })
-    const binary = join(directory, 'server')
-    await runFile('go', ['build', '-o', binary, directory], { cwd: root, timeout: 120000 })
+    const binary = await buildGoFixture(root, directory)
     await withGoDeployment(binary, gateway, async endpoint => {
       const output = join(directory, 'consumer')
-      const response = await fetch(`${endpoint}?$schema`, {
-        headers: { 'X-Introspection-Key': 'sdk-interop' }, signal: AbortSignal.timeout(10000),
-      })
-      expect(response.status).toBe(200)
-      const schema = await response.json() as LuxoSchema
+      const schema = await readGoSchema(endpoint)
       expect(schema.apis.echoInteger.params?.[0].typeName).toBe('Int')
-      await generateTypes(schema, output)
+      await generateTypes(schema, output, staticRequests === undefined ? undefined : { staticRequests })
       await runGoConsumer(root, output, endpoint, moduleType)
     })
   } finally {
@@ -46,9 +101,9 @@ async function verifyGoConsumer(moduleType: string, gateway: boolean): Promise<v
   }
 }
 
-async function runGoConsumer(root: string, output: string, endpoint: string, moduleType: string): Promise<void> {
+async function runGoConsumer(root: string, output: string, endpoint: string, moduleType: string, enumUpgrade = false): Promise<void> {
   await withDisconnectProxy(endpoint, async (proxy, disconnect) => {
-    prepareConsumer(root, output, endpoint, moduleType, proxy)
+    prepareConsumer(root, output, endpoint, moduleType, proxy, enumUpgrade)
     await runFile(join(root, 'packages/vite-plugin/node_modules/.bin/tsc'), ['-p', output], { timeout: 60000 })
     const pending = runFile(process.execPath, [join(output, 'out/consumer.js')], { timeout: 30000 })
     const lines = createInterface({ input: pending.child.stdout! })
@@ -61,7 +116,10 @@ async function runGoConsumer(root: string, output: string, endpoint: string, mod
       for (const channel of ['http:', 'ws:']) {
         for (const mode of ['json', 'binary']) expect(result.stdout).toContain(`${channel} ${mode} passed`)
       }
-      for (const mode of ['json', 'binary']) expect(result.stdout).toContain(`disconnect ${mode} passed`)
+      for (const mode of ['json', 'binary']) {
+        expect(result.stdout).toContain(`refresh ${mode} passed`)
+        expect(result.stdout).toContain(`disconnect ${mode} passed`)
+      }
       expect(disconnected).toBe(2)
     } finally { lines.close() }
   })
@@ -74,7 +132,7 @@ async function withGoDeployment(binary: string, gateway: boolean, use: (endpoint
   }, ['-rpc'], 'tcp:')
 }
 
-function prepareConsumer(root: string, output: string, endpoint: string, moduleType: string, disconnectEndpoint: string): void {
+function prepareConsumer(root: string, output: string, endpoint: string, moduleType: string, disconnectEndpoint: string, enumUpgrade: boolean): void {
   const scope = join(output, 'node_modules/@luxojs')
   mkdirSync(scope, { recursive: true })
   symlinkSync(join(root, 'packages/client'), join(scope, 'client'), 'dir')
@@ -86,7 +144,7 @@ function prepareConsumer(root: string, output: string, endpoint: string, moduleT
   }
   const integers = fixture.int64Cases.map(entry => entry.value)
   const source = readFileSync(join(import.meta.dirname, 'fixtures/go-consumer.ts.txt'), 'utf8')
-  const assertions = 'verifyComplete'
+  const assertions = enumUpgrade ? 'verifyEnumUpgrade' : 'verifyComplete'
   writeFileSync(join(output, 'consumer.ts'), `const endpoint = ${JSON.stringify(endpoint)}\nconst disconnectEndpoint = ${JSON.stringify(disconnectEndpoint)}\nconst integerCases = ${JSON.stringify(integers)}\nconst jsonNumberTokens = ${JSON.stringify(fixture.jsonNumberTokens)}\nconst dateTimeCases = ${JSON.stringify(fixture.dateTimeCases)}\nconst uuidCanonicalCases = ${JSON.stringify(fixture.uuidCanonicalCases)}\n${source}\nvoid runInterop(${assertions}).catch(error => { throw error })\n`)
   writeFileSync(join(output, 'package.json'), JSON.stringify({ type: moduleType }))
   writeFileSync(join(output, 'tsconfig.json'), JSON.stringify({ compilerOptions: {

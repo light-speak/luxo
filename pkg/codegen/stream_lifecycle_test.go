@@ -41,18 +41,22 @@ import (
     luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
 )
 type nativeResolver struct{}
-func (*nativeResolver) HandleWatch(ctx context.Context, params *api.StreamParams, identity any, stream *api.TypedStream[int64]) error {
+func (*nativeResolver) HandleWatch(ctx context.Context, params *WatchStreamParams, identity any, stream *api.TypedStream[int64]) error {
     if err := stream.Send(9223372036854775807); err != nil { return err }
     return luxerrors.Conflict
 }
-func (*nativeResolver) HandleWatchPrivate(ctx context.Context, params *api.StreamParams, identity any, stream *api.TypedStream[int64]) error {
+func (*nativeResolver) HandleWatchPrivate(ctx context.Context, params *WatchPrivateStreamParams, identity any, stream *api.TypedStream[int64]) error {
     return errors.New("anonymous subscriber reached private handler")
 }
 func TestNativeLifecycle(t *testing.T) {
     router := api.NewRouter()
-    RegisterStreams(router, nil, &nativeResolver{})
+    if err := RegisterStreams(router, nil, &nativeResolver{}); err != nil { t.Fatal(err) }
     for _, name := range []string{"watch", "watchPrivate"} {
         sub, err := router.OpenInternalStream(t.Context(), &api.Request{API:name})
+        if name == "watchPrivate" {
+            if sub != nil || !errors.Is(err,luxerrors.Unauthorized) {t.Fatalf("private stream accepted before authorization: %v",err)}
+            continue
+        }
         if err != nil { t.Fatal(err) }
         count := 0
         for payload := range sub.Messages() {
@@ -65,7 +69,6 @@ func TestNativeLifecycle(t *testing.T) {
         sub.Close()
         want := luxerrors.Conflict
         wantCount := 1
-        if name == "watchPrivate" { want, wantCount = luxerrors.Unauthorized, 0 }
         if count != wantCount || !errors.Is(sub.Err(), want) { t.Fatalf("%s: count=%d result=%v",name,count,sub.Err()) }
     }
 }
@@ -73,20 +76,44 @@ func TestNativeLifecycle(t *testing.T) {
 
 const streamBridgeAssertions = `package generated
 import (
+    "bytes"
     "context"
     "errors"
     "net"
+    "net/http/httptest"
+    "strings"
     "testing"
     "time"
     "github.com/light-speak/luxo/pkg/lux/api"
     luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
     "github.com/light-speak/luxo/pkg/lux/rpc"
     "github.com/light-speak/luxo/pkg/lux/schema"
+    "nhooyr.io/websocket"
 )
 const precisionData = "{\"id\":9223372036854775807,\"decimal\":0.123456789012345678901234567890}"
 type rawErrorData struct{}
 func (rawErrorData) AppendJSON(dst []byte) ([]byte,error) { return append(dst, precisionData...),nil }
 func (rawErrorData) AppendText(dst []byte, field string) ([]byte,bool) { return dst,false }
+func TestBridgeRejectsBeforeWebSocketACK(t *testing.T){
+ for _,binary:=range []bool{false,true}{
+  backend:=api.NewRouter();backend.Schema.RegisterAPI(&schema.API{ID:1,Name:"watch",Stream:true,ReturnType:"Int"});backend.Registry.RegisterSchemaAPIs(backend.Schema)
+  backend.HandleStreamPrepared("watch",func(context.Context,*api.Request,any)(api.PreparedStreamHandler,error){return nil,luxerrors.New("Rejected",422,"error.rejected").WithData(rawErrorData{})})
+  client:=startStreamBackend(t,backend)
+  gateway:=api.NewRouter();gateway.Schema.RegisterAPI(&schema.API{ID:1,Name:"watch",Stream:true,ReturnType:"Int"});gateway.Registry.RegisterSchemaAPIs(gateway.Schema)
+  gateway.HandleStreamForwarded("watch",rpcStreamProxy(client,gateway,"watch"))
+  server:=httptest.NewServer(gateway);defer server.Close()
+  ctx,cancel:=context.WithTimeout(t.Context(),3*time.Second);defer cancel()
+  conn,_,err:=websocket.Dial(ctx,"ws"+strings.TrimPrefix(server.URL,"http"),nil);if err!=nil{t.Fatal(err)};defer conn.CloseNow()
+  mode,frame:=websocket.MessageText,[]byte("{\"$id\":1,\"$sub\":\"watch\"}")
+  if binary{mode=websocket.MessageBinary;frame=[]byte{api.BinaryFrameSubscribe,1,1,0,0}}
+  if err:=conn.Write(ctx,mode,frame);err!=nil{t.Fatal(err)}
+  _,ack,err:=conn.Read(ctx);if err!=nil{t.Fatal(err)}
+  if binary{
+   if len(ack)<3||ack[0]!=api.BinaryFrameSubscribeError{t.Fatalf("remote rejection acknowledged as success: %x",ack)}
+   failure,err:=api.DecodeBinaryError(ack[2:],0);if err!=nil||failure.Code!=422{t.Fatalf("lost rejection: %v %v",failure,err)}
+  }else if !bytes.Contains(ack,[]byte("\"code\":422"))||!bytes.Contains(ack,[]byte(precisionData)){t.Fatalf("remote rejection acknowledged as success: %s",ack)}
+ }
+}
 func TestBridgeTerminalOrder(t *testing.T) {
     for _, failure := range []bool{false,true} {
         backend := api.NewRouter()
@@ -100,7 +127,7 @@ func TestBridgeTerminalOrder(t *testing.T) {
         client := startStreamBackend(t,backend)
         gateway:=api.NewRouter()
         gateway.Schema.RegisterAPI(&schema.API{ID:1,Name:"watch",Stream:true})
-        gateway.HandleStreamNative("watch",rpcStreamProxy(client,gateway,"watch"))
+        gateway.HandleStreamForwarded("watch",rpcStreamProxy(client,gateway,"watch"))
         ctx,cancel:=context.WithTimeout(t.Context(),5*time.Second)
         sub,err:=gateway.OpenInternalStream(ctx,&api.Request{API:"watch"})
         if err!=nil{cancel();t.Fatal(err)}
@@ -132,15 +159,12 @@ func TestBridgeMissingRouteAndCancellation(t *testing.T){
     router.Schema.RegisterAPI(&schema.API{ID:1,Name:"watch",Stream:true})
     client:=rpc.NewClient("127.0.0.1:1")
     defer client.Close()
-    for _,handler:=range []api.StreamHandlerFunc{rpcStreamProxy(nil,router,"watch"),rpcStreamProxy(client,router,"missing")}{
-        if err:=handler(t.Context(),nil,nil,nil);err==nil{t.Fatal("missing route silently completed")}
+    for _,prepare:=range []api.StreamForwardPrepareFunc{rpcStreamProxy(nil,router,"watch"),rpcStreamProxy(client,router,"missing")}{
+        if _,err:=prepare(t.Context(),&api.Request{API:"watch"},nil);err==nil{t.Fatal("missing route silently completed")}
     }
     ctx,cancel:=context.WithCancel(t.Context());cancel()
-    router.HandleStreamNative("watch",rpcStreamProxy(client,router,"watch"))
+    router.HandleStreamForwarded("watch",rpcStreamProxy(client,router,"watch"))
     sub,err:=router.OpenInternalStream(ctx,&api.Request{API:"watch"})
-    if err!=nil{t.Fatal(err)}
-    for range sub.Messages(){t.Fatal("cancelled bridge produced a message")}
-    sub.Close()
-    if !errors.Is(sub.Err(),context.Canceled){t.Fatalf("cancellation lost: %v",sub.Err())}
+    if sub!=nil||!errors.Is(err,context.Canceled){t.Fatalf("cancelled bridge accepted: %v %v",sub,err)}
 }
 `

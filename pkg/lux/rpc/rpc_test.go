@@ -1,6 +1,8 @@
 package rpc
 
 import (
+	"github.com/light-speak/luxo/internal/testutil"
+
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -453,9 +455,27 @@ func TestRPCErrorEnvelopeRequiresCanonicalFieldsAndTermination(t *testing.T) {
 	}
 }
 
+func TestUnaryDispatcherRejectsStreamEnvelope(t *testing.T) {
+	server := NewServer(api.NewRouter())
+	defer server.Close()
+	payload := encodeRequestEnvelope(requestKindStream, "", []byte{1, 0, 0})
+	var response bytes.Buffer
+	if err := server.processRequest(&response, payload); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := ReadFrame(&response, nil)
+	if err != nil || len(frame) == 0 || frame[0] != statusError {
+		t.Fatalf("unary dispatcher accepted stream request: %x, %v", frame, err)
+	}
+	var appErr *luxerrors.AppError
+	if !stderrors.As(decodeError(frame[1:]), &appErr) || appErr.Code != 400 {
+		t.Fatalf("stream rejection is not BadRequest: %+v", appErr)
+	}
+}
+
 func TestRPCStreamRoundTripAndCancellation(t *testing.T) {
 	rt := api.NewRouter()
-	rt.Schema.RegisterAPI(&schema.API{Name: "watchRPC", Stream: true})
+	rt.Schema.RegisterAPI(&schema.API{ID: 8, Name: "watchRPC", Stream: true})
 	rt.Registry.Register("watchRPC", 8)
 	rt.Registry.RegisterParams("watchRPC", nil)
 
@@ -502,7 +522,7 @@ func TestRPCStreamRoundTripAndCancellation(t *testing.T) {
 
 func TestServerCloseTerminatesActiveRPCStream(t *testing.T) {
 	rt := api.NewRouter()
-	rt.Schema.RegisterAPI(&schema.API{Name: "watchShutdown", Stream: true})
+	rt.Schema.RegisterAPI(&schema.API{ID: 9, Name: "watchShutdown", Stream: true})
 	rt.Registry.Register("watchShutdown", 9)
 	rt.Registry.RegisterParams("watchShutdown", nil)
 	srv := NewServer(rt)
@@ -858,6 +878,37 @@ func TestSubscribeContextRejectsConnectionAndAcknowledgmentErrors(t *testing.T) 
 	}
 }
 
+func TestClientDiscardsConnectionOnSetupFailure(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, phase := range []string{"deadline", "write", "read"} {
+			t.Run(fmt.Sprintf("stream=%t/%s", stream, phase), func(t *testing.T) {
+				owned := &poolLifecycleConn{}
+				conn := &prefaceTestConn{Conn: owned, reader: bytes.NewReader(nil), writer: io.Discard}
+				if phase == "deadline" {
+					conn.failDeadline = 1
+				} else if phase == "write" {
+					conn.writer = &errWriter{}
+				}
+				client := NewClient("unused")
+				t.Cleanup(client.Close)
+				client.pool.Put(conn)
+				ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+				defer cancel()
+				if stream {
+					if sub, err := client.SubscribeContext(ctx, "", 1, nil, nil); err == nil || sub != nil {
+						t.Fatalf("failed stream escaped setup: %v", err)
+					}
+				} else if body, err := client.exchange(ctx, []byte{1}); err == nil || body != nil {
+					t.Fatalf("failed unary exchange returned data: %v", err)
+				}
+				if owned.closes.Load() == 0 || len(client.pool.conns) != 0 {
+					t.Fatal("failed setup retained or pooled its connection")
+				}
+			})
+		}
+	}
+}
+
 func startSingleFrameRPCServer(t *testing.T, response []byte, respond bool) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -991,8 +1042,8 @@ func TestClientCallWithMask(t *testing.T) {
 	client := NewClient(addr)
 	defer client.Close()
 
-	mask := codec.FieldMaskSet(nil, 1)
-	mask = codec.AppendSelectionMask(nil, mask, nil)
+	mask := testutil.Bytes(t)(codec.FieldMaskSet(nil, 1))
+	mask = testutil.Bytes(t)(codec.AppendSelectionMask(nil, mask, nil))
 	resp, err := client.CallWithMask(1, mask, nil)
 	if err != nil {
 		t.Fatal(err)

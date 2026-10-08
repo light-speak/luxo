@@ -1,6 +1,8 @@
 package luvia
 
 import (
+	"github.com/light-speak/luxo/internal/testutil"
+
 	"bytes"
 	"testing"
 
@@ -40,8 +42,8 @@ func simpleUserModel() *schema.Model {
 	return s.Models["User"]
 }
 
-func selectionNode(mask []byte, children ...codec.SelectionMaskChild) []byte {
-	return codec.AppendSelectionMask(nil, mask, children)
+func selectionNode(t testing.TB, mask []byte, children ...codec.SelectionMaskChild) []byte {
+	return testutil.Bytes(t)(codec.AppendSelectionMask(nil, mask, children))
 }
 
 func selectionFields(mask []byte) []byte {
@@ -55,6 +57,51 @@ func planForTest(t *testing.T, model *schema.Model, mask []byte, module string) 
 		t.Fatal(err)
 	}
 	return plan
+}
+
+func TestPlanRejectsInvalidPrimaryKeyID(t *testing.T) {
+	for _, id := range []int{-1, 0, codec.MaxSelectionFieldID + 1} {
+		model := &schema.Model{Name: "Broken", Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt},
+			{ID: 2, Name: "posts", Type: schema.FieldModel, TypeName: "Post", Module: "post", Relation: true, ForeignKey: "userId"},
+		}}
+		schema.New().RegisterModel(model)
+		// Corrupt already indexed metadata to test the planner's own boundary.
+		model.Fields[0].ID = id
+		if plan, err := Plan(model, nil, "user"); err != codec.ErrInvalidSelectionField || plan != nil {
+			t.Fatalf("invalid primary key %d produced a plan: %v / %v", id, plan, err)
+		}
+	}
+}
+
+func TestPlanRejectsUnsupportedPrimaryKey(t *testing.T) {
+	for _, key := range []schema.Field{
+		{ID: 1, Name: "id", Type: schema.FieldInt, Nullable: true},
+		{ID: 1, Name: "id", Type: schema.FieldInt, IsList: true},
+		{ID: 1, Name: "id", Type: schema.FieldFloat},
+	} {
+		model := userModelWithExtend()
+		model.Fields[0] = key
+		schema.New().RegisterModel(model)
+		if plan, err := Plan(model, nil, "user"); err == nil || plan != nil {
+			t.Fatalf("unsupported primary key produced a plan: %v / %v", plan, err)
+		}
+	}
+}
+
+func TestPlanPropagatesDuplicateChildError(t *testing.T) {
+	model := &schema.Model{Name: "Broken", Fields: []schema.Field{
+		{ID: 1, Name: "id", Type: schema.FieldInt},
+		{ID: 2, Name: "first", Type: schema.FieldModel},
+		{ID: 4, Name: "second", Type: schema.FieldModel},
+		{ID: 3, Name: "posts", Type: schema.FieldModel, TypeName: "Post", Module: "post", Relation: true, ForeignKey: "userId"},
+	}}
+	schema.New().RegisterModel(model)
+	model.Fields[2].ID = 2
+	mask := selectionNode(t, []byte{7}, codec.SelectionMaskChild{FieldID: 2, Mask: selectionNode(t, []byte{1})})
+	if plan, err := Plan(model, mask, "user"); err != codec.ErrInvalidSelectionMask || plan != nil {
+		t.Fatalf("duplicate local child produced a plan: %v / %v", plan, err)
+	}
 }
 
 func TestPlan_NilModelReturnsNil(t *testing.T) {
@@ -75,9 +122,9 @@ func TestPlan_NoExtendFieldsReturnsNil(t *testing.T) {
 func TestPlan_NoExtendFieldsInMaskReturnsNil(t *testing.T) {
 	m := userModelWithExtend()
 	// Only request name and email (no extend fields)
-	mask := codec.FieldMaskSet(nil, 2) // name
-	mask = codec.FieldMaskSet(mask, 3) // email
-	mask = selectionNode(mask)
+	mask := testutil.Bytes(t)(codec.FieldMaskSet(nil, 2)) // name
+	mask = testutil.Bytes(t)(codec.FieldMaskSet(mask, 3)) // email
+	mask = selectionNode(t, mask)
 	p := planForTest(t, m, mask, "user")
 	if p != nil {
 		t.Error("mask without extend fields should return nil plan")
@@ -87,10 +134,10 @@ func TestPlan_NoExtendFieldsInMaskReturnsNil(t *testing.T) {
 func TestPlan_WithExtendFields(t *testing.T) {
 	m := userModelWithExtend()
 	// Request name + posts (extend from post module)
-	mask := codec.FieldMaskSet(nil, 2)  // name
-	mask = codec.FieldMaskSet(mask, 10) // posts (extend)
-	postsMask := selectionNode(codec.FieldMaskSet(nil, 2))
-	mask = selectionNode(mask, codec.SelectionMaskChild{FieldID: 10, Mask: postsMask})
+	mask := testutil.Bytes(t)(codec.FieldMaskSet(nil, 2))  // name
+	mask = testutil.Bytes(t)(codec.FieldMaskSet(mask, 10)) // posts (extend)
+	postsMask := selectionNode(t, testutil.Bytes(t)(codec.FieldMaskSet(nil, 2)))
+	mask = selectionNode(t, mask, codec.SelectionMaskChild{FieldID: 10, Mask: postsMask})
 	p := planForTest(t, m, mask, "user")
 	if p == nil {
 		t.Fatal("expected non-nil plan")
@@ -167,10 +214,10 @@ func TestPlan_UsesDeclaredPrimaryKey(t *testing.T) {
 func TestPlan_MultipleExtendModules(t *testing.T) {
 	m := userModelWithExtend()
 	// Request name + posts + comments (two different extend modules)
-	mask := codec.FieldMaskSet(nil, 2)  // name
-	mask = codec.FieldMaskSet(mask, 10) // posts (post module)
-	mask = codec.FieldMaskSet(mask, 11) // comments (comment module)
-	mask = selectionNode(mask)
+	mask := testutil.Bytes(t)(codec.FieldMaskSet(nil, 2))  // name
+	mask = testutil.Bytes(t)(codec.FieldMaskSet(mask, 10)) // posts (post module)
+	mask = testutil.Bytes(t)(codec.FieldMaskSet(mask, 11)) // comments (comment module)
+	mask = selectionNode(t, mask)
 	p := planForTest(t, m, mask, "user")
 	if p == nil {
 		t.Fatal("expected non-nil plan")

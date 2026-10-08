@@ -28,7 +28,7 @@ func writeReadNestedValue(b *strings.Builder, f *ast.FieldDecl, goField string, 
 
 func writeReadNestedInput(b *strings.Builder, f *ast.FieldDecl, goField string) {
 	if f.Type.IsList {
-		fmt.Fprintf(b, "{ _n := dec.ReadArrayLength(); if dec.CheckElementBytes(_n, 2) { %s = make([]%s, _n); for i := range %s { if dec.Err() != nil { break }; %s[i].ReadLuxoInput(dec) } } }\n", goField, f.Type.Name, goField, goField)
+		fmt.Fprintf(b, "{ _n := dec.ReadArrayLength(); if dec.CheckElementBytes(_n, 2) { %s = make([]%s, _n); for _index := range %s { if dec.Err() != nil { break }; %s[_index].ReadLuxoInput(dec) } } }\n", goField, f.Type.Name, goField, goField)
 	} else {
 		fmt.Fprintf(b, "%s = &%s{}\n%s.ReadLuxoInput(dec)\n", goField, f.Type.Name, goField)
 	}

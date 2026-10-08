@@ -1,14 +1,26 @@
-import { beforeAll, expect, it } from 'vitest'
+import { afterAll, beforeAll, expect, it } from 'vitest'
 import { execFile } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { join, resolve, sep } from 'node:path'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { dirname, join, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 import type { LuxoSchema } from '@luxojs/client'
 
-const runFile = promisify(execFile)
+const executeFile = promisify(execFile)
+
+async function runFile(command: string, args: string[], options: { cwd?: string; timeout: number }) {
+  try {
+    return await executeFile(command, args, options)
+  } catch (error) {
+    if (error instanceof Error && 'stdout' in error) error.message += '\n' + String(error.stdout)
+    if (error instanceof Error && 'stderr' in error) error.message += '\n' + String(error.stderr)
+    throw error
+  }
+}
 const packageRoot = resolve(import.meta.dirname, '..')
 const repositoryRoot = resolve(packageRoot, '../..')
 const temporaryRoot = join(repositoryRoot, '.tmp')
+let consumerRoot = packageRoot
 const schema: LuxoSchema = {
   models: { Metric: { name: 'Metric', fields: [
     { id: 1, name: 'id', type: 'Int' },
@@ -21,17 +33,54 @@ const schema: LuxoSchema = {
 
 beforeAll(async () => {
   await runFile('pnpm', ['build'], { cwd: packageRoot, timeout: 60000 })
-}, 65000)
+  mkdirSync(temporaryRoot, { recursive: true })
+  consumerRoot = mkdtempSync(join(temporaryRoot, 'packed-vite-plugin-'))
+  await runFile('pnpm', ['pack', '--out', join(consumerRoot, 'plugin.tgz')], { cwd: packageRoot, timeout: 30000 })
+  preparePackedConsumer()
+  await runFile('pnpm', ['install', '--offline', '--no-frozen-lockfile', '--ignore-scripts'], { cwd: consumerRoot, timeout: 60000 })
+}, 180000)
+
+afterAll(() => {
+  if (consumerRoot.startsWith(temporaryRoot + sep)) rmSync(consumerRoot, { recursive: true })
+})
+
+function preparePackedConsumer(): void {
+  const require = createRequire(import.meta.url)
+  const dependencies: Record<string, string> = {
+    '@luxojs/vite-plugin': 'file:./plugin.tgz',
+    '@luxojs/client': `link:${join(repositoryRoot, 'packages/client')}`,
+  }
+  // Reuse installed peers/tooling; only the plugin under test comes from this
+  // archive. Client archive consumption is covered by the React package suite.
+  for (const name of ['@babel/parser', '@babel/traverse', '@babel/types', 'typescript', 'vite']) {
+    dependencies[name] = `link:${dirname(require.resolve(`${name}/package.json`))}`
+  }
+  // Bind the archive's Babel imports to the same installed versions as the
+  // build. Offline registry metadata need not contain those cached releases.
+  const overrides = Object.fromEntries(['@babel/parser', '@babel/traverse', '@babel/types'].map(name => [name, dependencies[name]]))
+  writeFileSync(join(consumerRoot, 'package.json'), JSON.stringify({
+    private: true, devDependencies: dependencies,
+  }))
+  writeFileSync(join(consumerRoot, 'pnpm-workspace.yaml'), JSON.stringify({ overrides }))
+}
+
+it('resolves the plugin from an installed archive, never the workspace source', () => {
+  const require = createRequire(join(consumerRoot, 'package.json'))
+  const entry = realpathSync(require.resolve('@luxojs/vite-plugin'))
+  expect(entry.startsWith(temporaryRoot + sep)).toBe(true)
+  expect(existsSync(join(dirname(entry), '../src'))).toBe(false)
+})
 
 it('publishes declarations generated from the implementation, not a duplicate public interface', () => {
-  const manifest = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8')) as {
+  const installed = join(consumerRoot, 'node_modules/@luxojs/vite-plugin')
+  const manifest = JSON.parse(readFileSync(join(installed, 'package.json'), 'utf8')) as {
     types: string; exports: { '.': { types: string } }; files: string[]
   }
   expect(manifest.types).toBe('dist/index.d.ts')
   expect(manifest.exports['.'].types).toBe('./dist/index.d.ts')
   expect(manifest.files).toEqual(['dist'])
-  expect(readFileSync(join(packageRoot, manifest.types), 'utf8')).toContain('interface LuxoPluginOptions')
-  expect(existsSync(join(packageRoot, 'src/public.d.ts'))).toBe(false)
+  expect(readFileSync(join(installed, manifest.types), 'utf8')).toContain('interface LuxoPluginOptions')
+  expect(existsSync(join(installed, 'src'))).toBe(false)
 })
 
 it.each(['commonjs', 'module'])('builds and executes a real Vite %s consumer from a separate project root', async moduleType => {
@@ -40,12 +89,9 @@ it.each(['commonjs', 'module'])('builds and executes a real Vite %s consumer fro
   try {
     writeFixture(directory)
     const result = await runFile(process.execPath, ['--input-type=module', '-e', buildConsumer, directory, moduleType], {
-      cwd: packageRoot, timeout: 60000,
+      cwd: consumerRoot, timeout: 60000,
     })
     expect(result.stdout).toContain('selection and int64 verified')
-  } catch (error) {
-    if (error instanceof Error && 'stdout' in error) error.message += '\n' + String(error.stdout)
-    throw error
   } finally {
     if (directory.startsWith(temporaryRoot + sep)) rmSync(directory, { recursive: true })
   }
@@ -67,10 +113,10 @@ it.each(['commonjs', 'module'])('exposes standalone generation through the publi
   try {
     writeFixture(directory)
     const result = await runFile(process.execPath, ['--input-type=module', '-e', standaloneConsumer, directory, moduleType], {
-      cwd: packageRoot, timeout: 60000,
+      cwd: consumerRoot, timeout: 60000,
     })
     expect(result.stdout).toContain('standalone SDK verified')
-    expect(readFileSync(join(packageRoot, 'dist/index.d.ts'), 'utf8')).toContain('generateSDK(')
+    expect(readFileSync(join(consumerRoot, 'node_modules/@luxojs/vite-plugin/dist/index.d.ts'), 'utf8')).toContain('generateSDK(')
   } finally {
     if (directory.startsWith(temporaryRoot + sep)) rmSync(directory, { recursive: true })
   }
@@ -90,6 +136,9 @@ assert.equal(schema.models.Metric.fields[0].type, 'Int')
 const output = join(directory, 'src/generated/types.ts')
 const before = readFileSync(output, 'utf8')
 assert.match(before, /id.*bigint/)
+const client = readFileSync(join(directory, 'src/generated/client.ts'), 'utf8')
+assert.ok(client.includes('this.transport.callGenerated('))
+assert.ok(!client.includes('new $getMetricRequest'))
 writeFileSync(join(directory, options.schema), Buffer.from([0xff]))
 await assert.rejects(generateSDK(options, directory), AggregateError)
 assert.equal(readFileSync(output, 'utf8'), before)
@@ -102,12 +151,9 @@ it.each(['commonjs', 'module'])('rejects corrupt network/files before replacing 
   try {
     writeFixture(directory)
     const result = await runFile(process.execPath, ['--input-type=module', '-e', verifySchemaBoundary, directory, moduleType], {
-      cwd: packageRoot, timeout: 60000,
+      cwd: consumerRoot, timeout: 60000,
     })
     expect(result.stdout).toContain('schema byte boundaries verified')
-  } catch (error) {
-    if (error instanceof Error && 'stdout' in error) error.message += '\n' + String(error.stdout)
-    throw error
   } finally {
     if (directory.startsWith(temporaryRoot + sep)) rmSync(directory, { recursive: true })
   }
@@ -158,7 +204,7 @@ try {
     setPayload(valid)
     await plugin.buildStart()
     const files = readdirSync(outDir).sort()
-    assert.deepEqual(files, ['client.ts', 'schema.ts', 'types.ts'])
+    assert.deepEqual(files, ['client.ts', 'queries.ts', 'requests.ts', 'schema.ts', 'types.ts'])
     const before = files.map(file => readFileSync(join(outDir, file), 'utf8'))
     setPayload(Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), valid]))
     await plugin.buildStart()
@@ -200,6 +246,16 @@ export async function selectMetric(client: LuxoClient): Promise<bigint> {
   return metric.id
 }
 
+export async function selectLabel(client: LuxoClient): Promise<string> {
+  const metric = await client.getMetric({ id: 9223372036854775807n })
+  return metric.label
+}
+
+export async function selectExplicit(client: LuxoClient): Promise<bigint> {
+  const metric = await client.getMetric({ id: 9223372036854775807n, $select: 'id, label' })
+  return metric.id
+}
+
 export function createClient(endpoint: string): LuxoClient {
   return LuxoClient.create(endpoint)
 }
@@ -230,13 +286,20 @@ await build({
 })
 assert.match(readFileSync(join(directory, 'src/luxo/types.ts'), 'utf8'), /id.*bigint/)
 const location = join(directory, 'out', filename)
-const { selectMetric, createClient } = commonjs ? require(location) : await import(pathToFileURL(location).href)
+const { selectMetric, selectLabel, selectExplicit, createClient } = commonjs ? require(location) : await import(pathToFileURL(location).href)
 const value = 9223372036854775807n
-const actual = await selectMetric({ async getMetric(params) {
-  assert.deepEqual(params, { id: value, $select: 'id' })
-  return { id: value }
-} })
-assert.equal(actual, value)
+for (const [call, selection, response, expected] of [
+  [selectMetric, 'id', { id: value }, value],
+  [selectLabel, 'label', { label: 'only label' }, 'only label'],
+  [selectExplicit, 'id, label', { id: value, label: 'explicit' }, value],
+  [selectMetric, 'id', { id: value }, value],
+]) {
+  const actual = await call({ async getMetric(params) {
+    assert.deepEqual(params, { id: value, $select: selection })
+    return response
+  } })
+  assert.equal(actual, expected)
+}
 const client = createClient('http://127.0.0.1:1/not-called')
 client.close()
 console.log('selection and int64 verified')

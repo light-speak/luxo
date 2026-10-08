@@ -14,6 +14,42 @@ func pos() token.Position {
 	return token.Position{File: "test.luxo", Line: 1, Col: 1}
 }
 
+func TestInferredAPIParametersReceiveStableIDs(t *testing.T) {
+	model := &ast.ModelDecl{Name: "User", Fields: []*ast.FieldDecl{field("id", "Int"), field("name", "String"), field("age", "Int")}}
+	for _, test := range []struct {
+		name   string
+		params []string
+	}{
+		{"getUserByName", []string{"name"}},
+		{"listUsersByAgeBetween", []string{"ageFrom", "ageTo", "page", "pageSize"}},
+		{"listTop5UsersByName", []string{"name"}},
+		{"existsUserByIdIn", []string{"ids"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			input := files([]*ast.ModelDecl{model}, []*ast.ApiDecl{{Name: test.name}})
+			lf := New()
+			mustUpdate(t, lf, input)
+			assigned := make(map[string]int)
+			for _, name := range test.params {
+				id := lf.APIParamID(test.name, name)
+				if id <= 0 {
+					t.Errorf("inferred parameter %s.%s has no stable ID", test.name, name)
+				}
+				assigned[name] = id
+			}
+			mustUpdate(t, lf, input)
+			for name, id := range assigned {
+				if lf.APIParamID(test.name, name) != id {
+					t.Errorf("parameter %s was renumbered", name)
+				}
+			}
+			if len(input[0].APIs[0].Params) != 0 {
+				t.Fatal("lock update mutated the parsed declaration")
+			}
+		})
+	}
+}
+
 func field(name, typeName string) *ast.FieldDecl {
 	return &ast.FieldDecl{
 		Pos:  pos(),
@@ -194,7 +230,7 @@ func TestUpdateNewModel(t *testing.T) {
 		nil,
 	)
 
-	lf.Update(f)
+	mustUpdate(t, lf, f)
 
 	ml := lf.Models["User"]
 	if ml == nil {
@@ -225,7 +261,7 @@ func TestUpdateExistingModelKeepsIDs(t *testing.T) {
 		nil,
 	)
 
-	lf.Update(f)
+	mustUpdate(t, lf, f)
 
 	ml := lf.Models["User"]
 	if ml.Fields["id"] != 1 || ml.Fields["name"] != 2 || ml.Fields["email"] != 3 {
@@ -249,7 +285,7 @@ func TestBreakingChangesProtectWireContracts(t *testing.T) {
 		}},
 	)
 	lf := New()
-	lf.Update(base)
+	mustUpdate(t, lf, base)
 
 	compatible := files(
 		[]*ast.ModelDecl{model("User", field("id", "Int"), field("name", "String"), field("avatar", "String"))},
@@ -284,10 +320,10 @@ func TestBreakingChangesProtectWireContracts(t *testing.T) {
 
 func TestUpdateReservesRemovedAPIIDs(t *testing.T) {
 	lf := New()
-	lf.Update(files(nil, []*ast.ApiDecl{api("oldAPI")}))
+	mustUpdate(t, lf, files(nil, []*ast.ApiDecl{api("oldAPI")}))
 	oldID := lf.APIID("oldAPI")
 
-	lf.Update(files(nil, []*ast.ApiDecl{api("newAPI")}))
+	mustUpdate(t, lf, files(nil, []*ast.ApiDecl{api("newAPI")}))
 	if lf.APIID("oldAPI") != 0 {
 		t.Fatal("removed API must not remain active")
 	}
@@ -301,7 +337,7 @@ func TestUpdateReservesRemovedAPIIDs(t *testing.T) {
 
 func TestAPIContractMetadataSurvivesJSONRoundTrip(t *testing.T) {
 	lf := New()
-	lf.Update(files(nil, []*ast.ApiDecl{{Name: "health", ReturnType: &ast.TypeRef{Name: "String"}}}))
+	mustUpdate(t, lf, files(nil, []*ast.ApiDecl{{Name: "health", ReturnType: &ast.TypeRef{Name: "String"}}}))
 	data, err := json.Marshal(lf)
 	if err != nil {
 		t.Fatal(err)
@@ -329,14 +365,14 @@ func TestExtensionBeforeModelPreservesWireContract(t *testing.T) {
 		}},
 	}
 	lf := New()
-	lf.Update([]*ast.File{modelFile, extensionFile})
+	mustUpdate(t, lf, []*ast.File{modelFile, extensionFile})
 	extensionID := lf.Models["Project"].Fields["alertRules"]
 
 	reordered := []*ast.File{extensionFile, modelFile}
 	if changes := lf.BreakingChanges(reordered); hasBreakingPath(changes, "model Project.alertRules") {
 		t.Fatalf("file order produced a false breaking change: %v", changes)
 	}
-	lf.Update(reordered)
+	mustUpdate(t, lf, reordered)
 	if got := lf.Models["Project"].Fields["alertRules"]; got != extensionID {
 		t.Fatalf("extension field ID changed from %d to %d", extensionID, got)
 	}
@@ -391,7 +427,7 @@ func TestBreakingChangesCoverAllWireEntities(t *testing.T) {
 		}},
 	}}
 	lf := New()
-	lf.Update(base)
+	mustUpdate(t, lf, base)
 
 	changed := []*ast.File{{
 		Name:   "contracts.luxo",
@@ -522,7 +558,7 @@ func TestUpdateRemovedFieldReserved(t *testing.T) {
 		nil,
 	)
 
-	lf.Update(f)
+	mustUpdate(t, lf, f)
 
 	ml := lf.Models["User"]
 	if _, ok := ml.Fields["avatar"]; ok {
@@ -548,7 +584,7 @@ func TestUpdateModelRemovedEntirely(t *testing.T) {
 
 	// No models in AST
 	f := files(nil, nil)
-	lf.Update(f)
+	mustUpdate(t, lf, f)
 
 	ml := lf.Models["OldModel"]
 	if len(ml.Fields) != 0 {
@@ -569,7 +605,7 @@ func TestUpdateComputedFieldsReceiveStableIDs(t *testing.T) {
 		nil,
 	)
 
-	lf.Update(f)
+	mustUpdate(t, lf, f)
 
 	ml := lf.Models["Post"]
 	if ml.Fields["totalLikes"] != 2 {
@@ -587,7 +623,7 @@ func TestUpdateAPIs(t *testing.T) {
 		api("listUsers"),
 	})
 
-	lf.Update(f)
+	mustUpdate(t, lf, f)
 
 	if lf.APIs["getUser"].ID != 1 {
 		t.Errorf("getUser = %d, want 1", lf.APIs["getUser"].ID)
@@ -607,7 +643,7 @@ func TestUpdateAPIsPreservesExisting(t *testing.T) {
 		api("createUser"),
 	})
 
-	lf.Update(f)
+	mustUpdate(t, lf, f)
 
 	if lf.APIs["getUser"].ID != 5 {
 		t.Errorf("getUser = %d, want 5 (preserved)", lf.APIs["getUser"].ID)
@@ -669,7 +705,7 @@ func TestSortReserved(t *testing.T) {
 	}
 }
 
-func TestReservedNotDuplicated(t *testing.T) {
+func TestUpdateRejectsReservedFieldCollision(t *testing.T) {
 	lf := New()
 	lf.Models["User"] = &ModelLock{
 		NextID:   4,
@@ -686,22 +722,13 @@ func TestReservedNotDuplicated(t *testing.T) {
 		nil,
 	)
 
-	lf.Update(f)
-
-	ml := lf.Models["User"]
-	// Should not duplicate the reserved entry
-	count := 0
-	for _, id := range ml.Reserved {
-		if id == 3 {
-			count++
-		}
-	}
-	if count != 1 {
-		t.Errorf("Reserved ID 3 appears %d times, want 1", count)
+	before := lockJSON(t, lf)
+	if err := lf.Update(f); err == nil || lockJSON(t, lf) != before {
+		t.Fatalf("active/reserved collision was silently repaired: %v", err)
 	}
 }
 
-func TestModelRemovedAllFieldsReservedNoDuplicates(t *testing.T) {
+func TestRemovedModelDoesNotRepairReservedCollision(t *testing.T) {
 	lf := New()
 	lf.Models["Old"] = &ModelLock{
 		NextID:   3,
@@ -710,21 +737,9 @@ func TestModelRemovedAllFieldsReservedNoDuplicates(t *testing.T) {
 	}
 
 	f := files(nil, nil) // model removed
-	lf.Update(f)
-
-	ml := lf.Models["Old"]
-	// a(1) was already reserved, b(2) should be newly reserved
-	count1 := 0
-	for _, id := range ml.Reserved {
-		if id == 1 {
-			count1++
-		}
-	}
-	if count1 != 1 {
-		t.Errorf("Reserved ID 1 appears %d times, want 1", count1)
-	}
-	if len(ml.Reserved) != 2 {
-		t.Errorf("Reserved = %v, want 2 entries", ml.Reserved)
+	before := lockJSON(t, lf)
+	if err := lf.Update(f); err == nil || lockJSON(t, lf) != before {
+		t.Fatalf("removed model hid active/reserved collision: %v", err)
 	}
 }
 
@@ -749,7 +764,7 @@ func TestMultipleFilesMultipleModels(t *testing.T) {
 		},
 	}
 
-	lf.Update(ff)
+	mustUpdate(t, lf, ff)
 
 	if lf.Models["User"].Fields["id"] != 1 {
 		t.Error("User.id should be 1")
@@ -771,7 +786,7 @@ func TestRoundTrip(t *testing.T) {
 
 	// First gen: create User with 3 fields
 	lf, _ := Load(path)
-	lf.Update(files(
+	mustUpdate(t, lf, files(
 		[]*ast.ModelDecl{model("User",
 			field("id", "Int"),
 			field("name", "String"),
@@ -783,7 +798,7 @@ func TestRoundTrip(t *testing.T) {
 
 	// Second gen: remove avatar, add phone
 	lf2, _ := Load(path)
-	lf2.Update(files(
+	mustUpdate(t, lf2, files(
 		[]*ast.ModelDecl{model("User",
 			field("id", "Int"),
 			field("name", "String"),
@@ -889,7 +904,7 @@ func TestUpdateEventsNewEvent(t *testing.T) {
 		}},
 	}}
 
-	lf.Update(ff)
+	mustUpdate(t, lf, ff)
 
 	el := lf.Events["OrderPlaced"]
 	if el == nil {
@@ -923,7 +938,7 @@ func TestUpdateEventsPreservesExisting(t *testing.T) {
 		}},
 	}}
 
-	lf.Update(ff)
+	mustUpdate(t, lf, ff)
 
 	el := lf.Events["OrderPlaced"]
 	if el.Fields["orderId"] != 1 || el.Fields["total"] != 2 {
@@ -953,7 +968,7 @@ func TestUpdateEventsRemovedParam(t *testing.T) {
 		}},
 	}}
 
-	lf.Update(ff)
+	mustUpdate(t, lf, ff)
 
 	el := lf.Events["OrderPlaced"]
 	if _, ok := el.Fields["total"]; ok {
@@ -972,7 +987,7 @@ func TestUpdateEventsRemovedEntirely(t *testing.T) {
 	}
 
 	ff := []*ast.File{{Name: "test.luxo"}}
-	lf.Update(ff)
+	mustUpdate(t, lf, ff)
 
 	el := lf.Events["OldEvent"]
 	if len(el.Fields) != 0 {
@@ -998,7 +1013,7 @@ func TestUpdateEventsNilEventsMap(t *testing.T) {
 		}},
 	}}
 
-	lf.Update(ff)
+	mustUpdate(t, lf, ff)
 
 	if lf.Events == nil {
 		t.Fatal("Events should be initialized")
@@ -1009,6 +1024,47 @@ func TestUpdateEventsNilEventsMap(t *testing.T) {
 }
 
 // --- updateAPIs with @crud ---
+
+func TestCRUDPluralNamesMatchGeneratedRoutes(t *testing.T) {
+	for name, plural := range map[string]string{
+		"TimeEntry": "TimeEntries", "Address": "Addresses", "Box": "Boxes", "Quiz": "Quizes", "Gateway": "Gateways",
+	} {
+		t.Run(name, func(t *testing.T) {
+			lf := New()
+			m := model(name, field("id", "Int"))
+			m.Directives = []*ast.Directive{{Name: "crud"}}
+			files := []*ast.File{{Name: "model.luxo", Models: []*ast.ModelDecl{m}}}
+			mustUpdate(t, lf, files)
+			for _, api := range []string{"list" + plural, "delete" + plural} {
+				if lf.APIs[api] == nil {
+					t.Fatalf("generated API %s has no stable ID", api)
+				}
+				id := lf.APIs[api].ID
+				mustUpdate(t, lf, files)
+				if lf.APIs[api].ID != id {
+					t.Fatalf("repeated update changed %s ID", api)
+				}
+			}
+		})
+	}
+}
+
+func TestCRUDPluralCorrectionReservesOldIDs(t *testing.T) {
+	lf := New()
+	lf.APIs["listTimeEntrys"] = &APILock{ID: 1}
+	lf.APIs["deleteTimeEntrys"] = &APILock{ID: 2}
+	m := model("TimeEntry", field("id", "Int"))
+	m.Directives = []*ast.Directive{{Name: "crud"}}
+	mustUpdate(t, lf, []*ast.File{{Name: "model.luxo", Models: []*ast.ModelDecl{m}}})
+	if lf.APIs["listTimeEntrys"] != nil || lf.APIs["deleteTimeEntrys"] != nil || len(lf.ReservedAPI) != 2 {
+		t.Fatal("obsolete spellings were not retired")
+	}
+	for _, api := range lf.APIs {
+		if api.ID <= 2 {
+			t.Fatal("retired ID reused")
+		}
+	}
+}
 
 func TestUpdateAPIsWithCrud(t *testing.T) {
 	lf := New()
@@ -1026,7 +1082,7 @@ func TestUpdateAPIsWithCrud(t *testing.T) {
 		Models: []*ast.ModelDecl{m},
 	}}
 
-	lf.Update(ff)
+	mustUpdate(t, lf, ff)
 
 	// CRUD generates: getPost, listPosts, createPost, updatePost, deletePost, deletePosts
 	expectedAPIs := []string{"getPost", "listPosts", "createPost", "updatePost", "deletePost", "deletePosts"}
@@ -1075,11 +1131,11 @@ func TestUpdateAPIsHonorsCrudOperationsAndExplicitOverrides(t *testing.T) {
 		},
 	}
 	lf := New()
-	lf.Update([]*ast.File{file})
+	mustUpdate(t, lf, []*ast.File{file})
 	updateRuleID := lf.APIParamID("updateAlertRule", "ruleId")
 	deleteRuleID := lf.APIParamID("deleteAlertRule", "ruleId")
 
-	lf.Update([]*ast.File{file})
+	mustUpdate(t, lf, []*ast.File{file})
 	if got := lf.APIParamID("updateAlertRule", "ruleId"); got != updateRuleID {
 		t.Fatalf("update override param ID changed from %d to %d", updateRuleID, got)
 	}
@@ -1105,9 +1161,9 @@ func TestUpdateAPIsNeverReusesReservedParamIDs(t *testing.T) {
 		}
 		return files(nil, []*ast.ApiDecl{{Name: "search", Params: params}})
 	}
-	lf.Update(withParams("query", "cursor"))
+	mustUpdate(t, lf, withParams("query", "cursor"))
 	removedID := lf.APIParamID("search", "cursor")
-	lf.Update(withParams("query"))
+	mustUpdate(t, lf, withParams("query"))
 	data, err := json.Marshal(lf)
 	if err != nil {
 		t.Fatal(err)
@@ -1116,7 +1172,7 @@ func TestUpdateAPIsNeverReusesReservedParamIDs(t *testing.T) {
 	if err := json.Unmarshal(data, reloaded); err != nil {
 		t.Fatal(err)
 	}
-	reloaded.Update(withParams("query", "limit"))
+	mustUpdate(t, reloaded, withParams("query", "limit"))
 	if got := reloaded.APIParamID("search", "limit"); got <= removedID {
 		t.Fatalf("new param ID %d reused or preceded reserved ID %d", got, removedID)
 	}
@@ -1133,7 +1189,7 @@ func TestUpdateAPIsInjectsPaginateParamIDs(t *testing.T) {
 		}}}},
 	}}}}
 
-	lf.Update(files)
+	mustUpdate(t, lf, files)
 	params := lf.APIs["browsePosts"].Params
 	if params["status"] != 1 || params["page"] != 2 || params["pageSize"] != 3 {
 		t.Fatalf("paginated API params = %v", params)
@@ -1159,7 +1215,7 @@ func TestUpdateAPIsWithCrudUsesOnlyHandlerParams(t *testing.T) {
 	m := model("Post", autoID, field("title", "String"), immutable, internal, relation)
 	m.Directives = []*ast.Directive{{Pos: pos(), Name: "crud"}}
 
-	lf.Update([]*ast.File{{
+	mustUpdate(t, lf, []*ast.File{{
 		Name:   "test.luxo",
 		Models: []*ast.ModelDecl{m, model("User", field("id", "UUID"))},
 	}})
@@ -1188,7 +1244,7 @@ func TestUpdateAPIsWithParams(t *testing.T) {
 		}},
 	}}
 
-	lf.Update(ff)
+	mustUpdate(t, lf, ff)
 
 	al := lf.APIs["search"]
 	if al == nil {
@@ -1287,7 +1343,7 @@ func TestUpdateExtendsAssignsFieldIDs(t *testing.T) {
 		},
 	}
 
-	lf.Update(ff)
+	mustUpdate(t, lf, ff)
 
 	ml := lf.Models["User"]
 	if ml == nil {
@@ -1334,7 +1390,7 @@ func TestUpdateExtendsMultipleModules(t *testing.T) {
 		},
 	}
 
-	lf.Update(ff)
+	mustUpdate(t, lf, ff)
 
 	ml := lf.Models["User"]
 	if len(ml.Fields) != 3 { // id + posts + orders
@@ -1362,11 +1418,11 @@ func TestUpdateExtendsIdempotent(t *testing.T) {
 		},
 	}
 
-	lf.Update(ff)
+	mustUpdate(t, lf, ff)
 	postsID := lf.Models["User"].Fields["posts"]
 	nextID := lf.Models["User"].NextID
 
-	lf.Update(ff)
+	mustUpdate(t, lf, ff)
 	if lf.Models["User"].Fields["posts"] != postsID {
 		t.Error("posts ID changed after second update")
 	}
@@ -1393,7 +1449,7 @@ func TestUpdateExtendsComputedReceivesStableID(t *testing.T) {
 		},
 	}
 
-	lf.Update(ff)
+	mustUpdate(t, lf, ff)
 	ml := lf.Models["User"]
 	if ml.Fields["postCount"] == 0 {
 		t.Error("computed extend field should get ID")
@@ -1417,7 +1473,7 @@ func TestUpdateExtendsParentNotDeclared(t *testing.T) {
 		},
 	}
 
-	lf.Update(ff)
+	mustUpdate(t, lf, ff)
 
 	ml := lf.Models["User"]
 	if ml == nil {
@@ -1666,6 +1722,10 @@ func TestFederationForeignKey(t *testing.T) {
 	if got := federationForeignKey("User", "id", explicit); got != "authorId" {
 		t.Fatalf("explicit foreign key = %q", got)
 	}
+	explicit.Directives = append([]*ast.Directive{{Name: "hasMany"}, {Name: "by"}}, explicit.Directives...)
+	if got := federationForeignKey("User", "id", explicit); got != "authorId" {
+		t.Fatalf("unrelated or empty directives hid the explicit foreign key: %q", got)
+	}
 	invalidExplicit := &ast.FieldDecl{
 		Type:       &ast.TypeRef{Name: "Post", IsList: true},
 		Directives: []*ast.Directive{{Name: "by", Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.String, Value: "authorId"}}}}},
@@ -1713,7 +1773,7 @@ func TestInternalAPIHelperBoundaries(t *testing.T) {
 	if upperFirst("") != "" || upperFirst("über") != "Über" || lowerFirst("Üser") != "üser" {
 		t.Fatal("identifier case conversion failed")
 	}
-	if name, params := crudAPIContract("User", "Users", "unknown", &ast.ModelDecl{}, nil); name != "" || params != nil {
+	if name, params := crudAPIContract("User", "unknown", &ast.ModelDecl{}, nil); name != "" || params != nil {
 		t.Fatalf("unknown CRUD contract = %q, %#v", name, params)
 	}
 }

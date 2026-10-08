@@ -66,6 +66,12 @@ func TestSelectAffectedPackages(t *testing.T) {
 			benchmarks: []string{"pkg/parser", "pkg/lux/codec"},
 			want:       []string{"pkg/lux/codec", "pkg/parser"},
 		},
+		{
+			name:       "adapter dependency change runs every benchmark",
+			changed:    []string{"pkg/lux/pg/go.mod"},
+			benchmarks: []string{"pkg/parser", "pkg/lux/pg"},
+			want:       []string{"pkg/lux/pg", "pkg/parser"},
+		},
 	}
 
 	for _, test := range tests {
@@ -148,6 +154,25 @@ func TestListProductionInputs(t *testing.T) {
 func TestListProductionInputsRejectsInvalidRoot(t *testing.T) {
 	if _, err := listProductionInputs("missing-root", "pkg/parser"); err == nil {
 		t.Fatal("invalid root error = nil")
+	}
+}
+
+func TestListProductionInputsRejectsRemovedWorkingDirectory(t *testing.T) {
+	directory, err := filepath.Abs(scopeTestDirectory(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	working := filepath.Join(directory, "working")
+	if err := os.Mkdir(working, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(working)
+	if err := os.Remove(working); err != nil {
+		t.Fatal(err)
+	}
+	inputs, err := listProductionInputs(".", "pkg/parser")
+	if !errors.Is(err, os.ErrNotExist) || inputs != nil {
+		t.Fatalf("removed working directory: inputs=%v error=%v", inputs, err)
 	}
 }
 

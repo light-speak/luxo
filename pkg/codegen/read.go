@@ -93,10 +93,11 @@ func writeReadLuxoField(b *strings.Builder, f *ast.FieldDecl, fieldID int, goFie
 func writeReadLuxoValueArena(b *strings.Builder, f *ast.FieldDecl, goField string, enums map[string]bool) {
 	if enums[f.Type.Name] {
 		if f.Type.Nullable {
-			writeReadNullableConversion(b, "dec.ReadStringArenaPtr(_arena, &_arenaOff)", f.Type.Name+"(*v)", goField)
+			writeReadNullableConversion(b, "dec.ReadStringArenaPtr(_arena, &_arenaOff)", f.Type.Name+"(*_raw)", goField)
 		} else {
 			fmt.Fprintf(b, " %s = %s(dec.ReadStringArena(_arena, &_arenaOff))\n", goField, f.Type.Name)
 		}
+		writeReadEnumCheck(b, f, goField)
 		return
 	}
 	// String / String?
@@ -115,10 +116,11 @@ func writeReadLuxoValue(b *strings.Builder, f *ast.FieldDecl, goField string, en
 	}
 	if enums[f.Type.Name] {
 		if f.Type.Nullable {
-			writeReadNullableConversion(b, "dec.ReadStringPtr()", f.Type.Name+"(*v)", goField)
+			writeReadNullableConversion(b, "dec.ReadStringPtr()", f.Type.Name+"(*_raw)", goField)
 		} else {
 			fmt.Fprintf(b, " %s = %s(dec.ReadString())\n", goField, f.Type.Name)
 		}
+		writeReadEnumCheck(b, f, goField)
 		return
 	}
 	type decSpec struct {
@@ -154,13 +156,13 @@ func writeReadLuxoTypedValue(b *strings.Builder, f *ast.FieldDecl, goField strin
 		}
 	case "Duration":
 		if f.Type.Nullable {
-			writeReadNullableConversion(b, "dec.ReadIntPtr()", "time.Duration(*v)", goField)
+			writeReadNullableConversion(b, "dec.ReadIntPtr()", "time.Duration(*_raw)", goField)
 		} else {
 			fmt.Fprintf(b, " %s = time.Duration(dec.ReadInt())\n", goField)
 		}
 	case "UUID":
 		if f.Type.Nullable {
-			writeReadNullableConversion(b, "dec.ReadUUIDPtr()", "uuid.UUID(*v)", goField)
+			writeReadNullableConversion(b, "dec.ReadUUIDPtr()", "uuid.UUID(*_raw)", goField)
 		} else {
 			fmt.Fprintf(b, " %s = uuid.UUID(dec.ReadUUID())\n", goField)
 		}
@@ -173,7 +175,7 @@ func writeReadLuxoTypedValue(b *strings.Builder, f *ast.FieldDecl, goField strin
 	case "Bytes", "JSON":
 		if f.Type.Nullable {
 			if f.Type.Name == "JSON" {
-				writeReadNullableConversion(b, "dec.ReadJSONPtr()", "json.RawMessage(*v)", goField)
+				writeReadNullableConversion(b, "dec.ReadJSONPtr()", "json.RawMessage(*_raw)", goField)
 			} else {
 				fmt.Fprintf(b, " %s = dec.ReadBytesValuePtr()\n", goField)
 			}
@@ -187,7 +189,7 @@ func writeReadLuxoTypedValue(b *strings.Builder, f *ast.FieldDecl, goField strin
 
 // Converted nullable scalars must clear reused fields when the wire says null.
 func writeReadNullableConversion(b *strings.Builder, read, convert, goField string) {
-	fmt.Fprintf(b, "\n\t\t\tif v := %s; v != nil { value := %s; %s = &value } else { %s = nil }\n", read, convert, goField, goField)
+	fmt.Fprintf(b, "\n\t\t\tif _raw := %s; _raw != nil { _value := %s; %s = &_value } else { %s = nil }\n", read, convert, goField, goField)
 }
 
 // writeReadLuxoListValue writes the decode case for a scalar array field ([T]),
@@ -205,8 +207,8 @@ func writeReadLuxoListValue(b *strings.Builder, f *ast.FieldDecl, goField string
 
 func writeReadScalarArrayValue(b *strings.Builder, elemType, goField string, isEnum bool) {
 	if isEnum {
-		fmt.Fprintf(b, "{ _a := dec.ReadStringArray(); %s = make([]%s, len(_a)); for i, v := range _a { %s[i] = %s(v) } }",
-			goField, elemType, goField, elemType)
+		fmt.Fprintf(b, "{ _a := dec.ReadStringArray(); %s = make([]%s, len(_a)); for _index, _item := range _a { _value := %s(_item); if !_value.IsValid() { dec.Fail(codec.ErrInvalidEnum); break }; %s[_index] = _value } }",
+			goField, elemType, elemType, goField)
 		return
 	}
 	switch elemType {
@@ -217,14 +219,26 @@ func writeReadScalarArrayValue(b *strings.Builder, elemType, goField string, isE
 	case "Bytes":
 		fmt.Fprintf(b, "%s = dec.ReadBytesArray()", goField)
 	case "JSON":
-		fmt.Fprintf(b, "{ _n := dec.ReadArrayLength(); if dec.CheckElementBytes(_n, 1) { %s = make([]json.RawMessage, _n); for i := range %s { if dec.Err() != nil { break }; %s[i] = dec.ReadJSON() } } }", goField, goField, goField)
+		fmt.Fprintf(b, "{ _n := dec.ReadArrayLength(); if dec.CheckElementBytes(_n, 1) { %s = make([]json.RawMessage, _n); for _index := range %s { if dec.Err() != nil { break }; %s[_index] = dec.ReadJSON() } } }", goField, goField, goField)
 	case "DateTime":
 		fmt.Fprintf(b, "%s = dec.ReadDateTimeArray()", goField)
 	case "Duration":
-		fmt.Fprintf(b, "{ _a := dec.ReadIntArray(); %s = make([]time.Duration, len(_a)); for i, v := range _a { %s[i] = time.Duration(v) } }", goField, goField)
+		fmt.Fprintf(b, "{ _a := dec.ReadIntArray(); %s = make([]time.Duration, len(_a)); for _index, _item := range _a { %s[_index] = time.Duration(_item) } }", goField, goField)
 	case "UUID":
-		fmt.Fprintf(b, "{ _a := dec.ReadUUIDArray(); %s = make([]uuid.UUID, len(_a)); for i, v := range _a { %s[i] = uuid.UUID(v) } }", goField, goField)
+		fmt.Fprintf(b, "{ _a := dec.ReadUUIDArray(); %s = make([]uuid.UUID, len(_a)); for _index, _item := range _a { %s[_index] = uuid.UUID(_item) } }", goField, goField)
 	case "Decimal":
-		fmt.Fprintf(b, "{ _a := dec.ReadStringArray(); %s = make([]decimal.Decimal, len(_a)); for i, raw := range _a { value, err := decimal.NewFromString(raw); if err != nil { dec.Fail(err); break }; %s[i] = value } }", goField, goField)
+		fmt.Fprintf(b, "{ _a := dec.ReadStringArray(); %s = make([]decimal.Decimal, len(_a)); for _index, _item := range _a { value, err := decimal.NewFromString(_item); if err != nil { dec.Fail(err); break }; %s[_index] = value } }", goField, goField)
 	}
+}
+
+func writeReadEnumCheck(b *strings.Builder, f *ast.FieldDecl, value string) {
+	writeEnumReadCheck(b, value, f.Type.Nullable, "\t\t\t")
+}
+
+func writeEnumReadCheck(b *strings.Builder, value string, nullable bool, indent string) {
+	guard := ""
+	if nullable {
+		guard = value + " != nil && "
+	}
+	fmt.Fprintf(b, "%sif %s!%s.IsValid() { dec.Fail(codec.ErrInvalidEnum) }\n", indent, guard, value)
 }

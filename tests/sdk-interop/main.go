@@ -27,16 +27,24 @@ func main() {
 	out := flag.String("out", "", "existing empty directory under the core repository's .tmp")
 	run := flag.Bool("run", false, "run a consumer command against an owned temporary Go service")
 	gateway := flag.Bool("gateway", false, "run the consumer through a generated gateway and a separate TCP RPC service")
+	futureEnum := flag.Bool("future-enum", false, "generate a newer enum revision for old-SDK interoperability tests; requires -out")
+	enumUpgrade := flag.Bool("enum-upgrade", false, "run an old-Schema consumer against a newer enum service; requires -run")
 	flag.Parse()
 	var err error
-	if *run && *out != "" {
+	if *enumUpgrade && (!*run || *futureEnum) {
+		err = fmt.Errorf("-enum-upgrade requires -run and cannot be combined with -future-enum")
+	} else if *futureEnum && (*run || *out == "") {
+		err = fmt.Errorf("-future-enum requires -out and cannot be combined with -run")
+	} else if *run && *out != "" {
 		err = fmt.Errorf("-run and -out cannot be combined")
 	} else if *gateway && !*run {
 		err = fmt.Errorf("-gateway requires -run")
+	} else if *enumUpgrade {
+		err = runEnumUpgradeCommand(flag.Args(), *gateway)
 	} else if *run {
 		err = runFixtureCommand(flag.Args(), *gateway)
 	} else {
-		err = generateFixture(*out)
+		err = generateFixtureRevision(*out, *futureEnum)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -45,14 +53,30 @@ func main() {
 }
 
 func generateFixture(out string) error {
+	return generateFixtureRevision(out, false)
+}
+
+func generateFixtureRevision(out string, futureEnum bool) error {
 	if err := validateOutput(out); err != nil {
 		return err
 	}
-	files, err := compileFixture(fixtureSchema)
+	source, server := fixtureSchema, fixtureServer
+	if futureEnum {
+		var err error
+		source, server, err = fixtureEnumUpgrade(source, server)
+		if err != nil {
+			return err
+		}
+	}
+	baseline := ""
+	if futureEnum {
+		baseline = fixtureSchema
+	}
+	files, err := compileFixtureRevision(source, baseline)
 	if err != nil {
 		return err
 	}
-	files["main.go"] = fixtureServer
+	files["main.go"] = server
 	files["deployment.go"] = fixtureDeploymentServer
 	for name, source := range files {
 		file, err := os.OpenFile(filepath.Join(out, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
@@ -69,6 +93,41 @@ func generateFixture(out string) error {
 		}
 	}
 	return nil
+}
+
+// Compile two actual schemas, rather than masking the live server's metadata.
+// Refuse template drift so the upgrade test cannot silently test one revision.
+func fixtureEnumUpgrade(source string, server []byte) (string, []byte, error) {
+	const original = "enum FixtureState {\n  OPEN\n  CLOSED\n}"
+	const upgraded = "enum FixtureState {\n  OPEN\n  CLOSED\n  FUTURE\n}"
+	if strings.Count(source, original) != 1 {
+		return "", nil, fmt.Errorf("missing unique enum upgrade anchor")
+	}
+	text := string(server)
+	for _, pair := range [][2]string{
+		{`FixtureState("OPEN")`, `FixtureState("FUTURE")`},
+		{`stream.Send([]FixtureState{"OPEN", "CLOSED"})`, `stream.Send([]FixtureState{"OPEN", "FUTURE", "CLOSED"})`},
+	} {
+		if strings.Count(text, pair[0]) != 1 {
+			return "", nil, fmt.Errorf("missing unique stream upgrade anchor: %s", pair[0])
+		}
+		text = strings.Replace(text, pair[0], pair[1], 1)
+	}
+	source, err := fixtureAdditiveUpgrade(strings.Replace(source, original, upgraded, 1))
+	return source, []byte(text), err
+}
+
+func fixtureAdditiveUpgrade(source string) (string, error) {
+	for _, pair := range [][2]string{
+		{"api echoInteger(value: Int): Int {\n  return value\n}", "api echoInteger(value: Int, delta: Int = 0): Int {\n  return value + delta\n}"},
+		{"model PageRecord {\n", "model PageRecord {\n  future: String?\n"},
+	} {
+		if strings.Count(source, pair[0]) != 1 {
+			return "", fmt.Errorf("missing unique additive revision anchor: %s", pair[0])
+		}
+		source = strings.Replace(source, pair[0], pair[1], 1)
+	}
+	return "api aFutureInteger(value: Int): Int { return value }\n\n" + source, nil
 }
 
 func validateOutput(out string) error {
@@ -102,6 +161,10 @@ func validateOutput(out string) error {
 }
 
 func compileFixture(source string) (map[string][]byte, error) {
+	return compileFixtureRevision(source, "")
+}
+
+func analyzeFixture(source string) (*semantic.Result, error) {
 	tokens, lexErrors := lexer.New(source, "origin/precision/schema.luxo").Tokenize()
 	if len(lexErrors) > 0 {
 		return nil, lexErrors[0]
@@ -114,8 +177,27 @@ func compileFixture(source string) (map[string][]byte, error) {
 	if len(result.Errors) > 0 {
 		return nil, result.Errors[0]
 	}
+	return result, nil
+}
+
+func compileFixtureRevision(source, baseline string) (map[string][]byte, error) {
 	lock := lockfile.New()
-	lock.Update(result.Files)
+	if baseline != "" {
+		prior, err := analyzeFixture(baseline)
+		if err != nil {
+			return nil, err
+		}
+		if err := lock.Update(prior.Files); err != nil {
+			return nil, err
+		}
+	}
+	result, err := analyzeFixture(source)
+	if err != nil {
+		return nil, err
+	}
+	if err := lock.Update(result.Files); err != nil {
+		return nil, err
+	}
 	generator, err := codegen.NewGenerator(codegen.GeneratorConfig{
 		IDs: fixtureIDs(lock), Events: codegen.BuildEventContext(result.Files, ""),
 	})
@@ -126,7 +208,7 @@ func compileFixture(source string) (map[string][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	entry, err := codegen.GenerateGatewayEntryChecked(result, "sdk-interop")
+	entry, err := codegen.GenerateGatewayEntryChecked(result, "sdk-interop", codegen.EntryBackends{Events: "memory"})
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +223,7 @@ func compileFixture(source string) (map[string][]byte, error) {
 func fixtureIDs(lock *lockfile.LockFile) codegen.StableIDs {
 	ids := codegen.StableIDs{
 		ModelFields: make(map[string]map[string]int), APIs: make(map[string]int),
-		APIParams: make(map[string]map[string]int), APIParamTypes: make(map[string]map[string]string),
+		APIParams: make(map[string]map[string]int),
 	}
 	for _, declarations := range []map[string]*lockfile.ModelLock{lock.Models, lock.Types} {
 		for name, model := range declarations {
@@ -151,7 +233,6 @@ func fixtureIDs(lock *lockfile.LockFile) codegen.StableIDs {
 	for name, api := range lock.APIs {
 		ids.APIs[name] = api.ID
 		ids.APIParams[name] = api.Params
-		ids.APIParamTypes[name] = api.ParamTypes
 	}
 	return ids
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/light-speak/luxo/pkg/lux/codec"
+	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
 )
 
 // StreamHub manages all WebSocket stream subscriptions.
@@ -32,6 +33,8 @@ type StreamSub struct {
 	sendMu       sync.RWMutex       // native Send vs. hub-owned channel close
 	closed       bool               // protected by sendMu
 	result       error              // terminal result, protected by sendMu
+	onClose      func()             // typed event detachment, called under hub.mu
+	release      func()             // remote resource release, called outside hub.mu
 }
 
 // StreamParams holds subscription parameters from the client.
@@ -214,10 +217,28 @@ func (s *TypedStream[T]) Context() context.Context {
 
 // InternalStream is a transport-neutral subscription used by RPC bridges.
 type InternalStream struct {
-	hub     *StreamHub
-	apiName string
-	sub     *StreamSub
-	once    sync.Once
+	hub       *StreamHub
+	apiName   string
+	sub       *StreamSub
+	once      sync.Once
+	startOnce sync.Once
+	router    *Router
+	ctx       context.Context
+	run       PreparedStreamHandler
+}
+
+// Start begins producing after the owning transport acknowledges the subscription.
+// It is idempotent; a subscription closed before Start never invokes its handler.
+func (s *InternalStream) Start() {
+	s.startOnce.Do(func() {
+		run := s.run
+		s.run = nil
+		if err := s.ctx.Err(); err != nil {
+			s.hub.finish(s.apiName, s.sub, err)
+			return
+		}
+		s.router.startNativeStreamHandler(s.ctx, s.apiName, s.sub.Identity, s.sub, run)
+	})
 }
 
 // Messages returns canonical Luxo binary stream payloads.
@@ -237,6 +258,7 @@ func (s *InternalStream) Err() error {
 func (s *InternalStream) Close() {
 	s.once.Do(func() {
 		s.hub.Unsubscribe(s.apiName, s.sub)
+		s.startOnce.Do(func() { s.run = nil })
 	})
 }
 
@@ -265,7 +287,11 @@ func (s *Stream) Send(data []byte) error {
 // close is called once under the hub's write lock. Event dispatch already holds
 // the hub read lock; only native Send needs the per-subscription lock as well.
 // Lock order is hub.mu -> sendMu; Send never acquires hub.mu.
-func (s *StreamSub) close(err error) {
+func (s *StreamSub) close(err error) func() {
+	if s.onClose != nil {
+		s.onClose()
+		s.onClose = nil
+	}
 	s.sendMu.Lock()
 	s.closed = true
 	s.result = err
@@ -274,6 +300,9 @@ func (s *StreamSub) close(err error) {
 	if s.cancel != nil {
 		s.cancel()
 	}
+	release := s.release
+	s.release = nil
+	return release
 }
 
 // Context returns the stream's context (cancelled when client disconnects).
@@ -347,6 +376,10 @@ func (h *StreamHub) SubscribeMode(apiName string, params map[string]any, identit
 }
 
 func (h *StreamHub) subscribeMode(apiName string, params map[string]any, identity any, fieldMask []byte, binary bool, cancel, cancelWriter context.CancelFunc) *StreamSub {
+	return h.subscribePreparedMode(apiName, params, identity, fieldMask, binary, cancel, cancelWriter, preparedStream{})
+}
+
+func (h *StreamHub) subscribePreparedMode(apiName string, params map[string]any, identity any, fieldMask []byte, binary bool, cancel, cancelWriter context.CancelFunc, prepared preparedStream) *StreamSub {
 	sub := &StreamSub{
 		Ch:           make(chan []byte, 64), // buffered to absorb bursts
 		Params:       &StreamParams{values: params},
@@ -355,6 +388,7 @@ func (h *StreamHub) subscribeMode(apiName string, params map[string]any, identit
 		Binary:       binary,
 		cancel:       cancel,
 		cancelWriter: cancelWriter,
+		release:      prepared.release,
 	}
 
 	h.mu.Lock()
@@ -363,6 +397,9 @@ func (h *StreamHub) subscribeMode(apiName string, params map[string]any, identit
 		return nil
 	}
 	h.subs[apiName] = append(h.subs[apiName], sub)
+	if prepared.bind != nil {
+		prepared.bind(sub)
+	}
 	h.mu.Unlock()
 
 	return sub
@@ -390,7 +427,14 @@ func (s *StreamSub) stopWriting() {
 // a later handler return or cancellation cannot overwrite the first result.
 func (h *StreamHub) finish(apiName string, sub *StreamSub, err error) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	release := h.finishLocked(apiName, sub, err)
+	h.mu.Unlock()
+	if release != nil {
+		release()
+	}
+}
+
+func (h *StreamHub) finishLocked(apiName string, sub *StreamSub, err error) func() {
 
 	subs := h.subs[apiName]
 	for i, s := range subs {
@@ -402,10 +446,10 @@ func (h *StreamHub) finish(apiName string, sub *StreamSub, err error) {
 			} else {
 				h.subs[apiName] = kept
 			}
-			sub.close(err)
-			return
+			return sub.close(err)
 		}
 	}
+	return nil
 }
 
 // Dispatch sends data to matching subscribers and propagates encoding failures.
@@ -454,23 +498,27 @@ func (h *StreamHub) DispatchPreparedEvent(apiName string, matcher StreamSubscrib
 
 	var encodings streamEncodings
 	var slow []*StreamSub
+	defer h.finishDispatch(apiName, &slow)
 	for _, sub := range h.subs[apiName] {
 		if matcher != nil && !matcher(sub.Params, sub.Identity) {
 			continue
 		}
 		encoded, err := cachedStreamEncoding(&encodings, sub.FieldMask, sub.Binary, encodeFn)
 		if err != nil {
-			h.mu.RUnlock()
-			h.removeSlowSubscribers(apiName, slow)
 			return err
 		}
 		if !enqueueStreamData(sub, encoded) {
 			slow = append(slow, sub)
 		}
 	}
-	h.mu.RUnlock()
-	h.removeSlowSubscribers(apiName, slow)
 	return nil
+}
+
+// Native callbacks may panic; the event bus owns recovery, but the hub must
+// release its lock and process already-detected slow subscribers on every exit.
+func (h *StreamHub) finishDispatch(apiName string, slow *[]*StreamSub) {
+	h.mu.RUnlock()
+	h.removeSlowSubscribers(apiName, *slow)
 }
 
 type streamEncoding struct {
@@ -517,6 +565,7 @@ func (h *StreamHub) DispatchEncoded(apiName string, encoded []byte, matcher Stre
 	h.mu.RLock()
 
 	var slow []*StreamSub
+	defer h.finishDispatch(apiName, &slow)
 	for _, sub := range h.subs[apiName] {
 		if matcher != nil && !matcher(encoded, sub.Params, sub.Identity) {
 			continue
@@ -525,8 +574,6 @@ func (h *StreamHub) DispatchEncoded(apiName string, encoded []byte, matcher Stre
 			slow = append(slow, sub)
 		}
 	}
-	h.mu.RUnlock()
-	h.removeSlowSubscribers(apiName, slow)
 }
 
 func enqueueStreamData(sub *StreamSub, data []byte) bool {
@@ -543,7 +590,13 @@ func (h *StreamHub) removeSlowSubscribers(apiName string, slow []*StreamSub) {
 		return
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	var releases []func()
+	defer func() {
+		h.mu.Unlock()
+		for _, release := range releases {
+			release()
+		}
+	}()
 
 	slowSet := make(map[*StreamSub]struct{}, len(slow))
 	for _, sub := range slow {
@@ -554,7 +607,9 @@ func (h *StreamHub) removeSlowSubscribers(apiName string, slow []*StreamSub) {
 	for _, sub := range subs {
 		if _, remove := slowSet[sub]; remove {
 			sub.stopWriting()
-			sub.close(ErrStreamFull)
+			if release := sub.close(ErrStreamFull); release != nil {
+				releases = append(releases, release)
+			}
 			continue
 		}
 		kept = append(kept, sub)
@@ -579,31 +634,67 @@ func (h *StreamHub) SubCount(apiName string) int {
 // OpenInternalStream creates a binary subscription for an internal transport.
 // It shares validation, matching, backpressure, and native handlers with WebSocket.
 func (rt *Router) OpenInternalStream(ctx context.Context, req *Request) (*InternalStream, error) {
+	stream, err := rt.PrepareInternalStream(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	stream.Start()
+	return stream, nil
+}
+
+// PrepareInternalStream validates and reserves a subscription without invoking
+// its native producer. Transports must call Start after a successful ACK and
+// Close on every path, including ACK failure. OpenInternalStream starts directly.
+func (rt *Router) PrepareInternalStream(ctx context.Context, req *Request) (*InternalStream, error) {
 	if req == nil || !rt.isStreamAPI(req.API) {
-		return nil, fmt.Errorf("api: %q is not a stream", requestAPIName(req))
+		return nil, luxerrors.New("BadRequest", 400, fmt.Sprintf("api: %q is not a stream", requestAPIName(req)))
+	}
+	identity := rt.identityFromCtx(ctx)
+	prepared, err := rt.prepareStreamHandler(ctx, req, identity)
+	if err != nil {
+		return nil, err
 	}
 	streamCtx, cancel := context.WithCancel(ctx)
-	params := binaryStreamParams(req)
-	identity := rt.identityFromCtx(streamCtx)
-	sub := rt.Streams.SubscribeMode(req.API, params, identity, req.FieldMask, true, cancel)
+	params := rt.streamInputValues(req)
+	sub := rt.Streams.subscribePreparedMode(req.API, params, identity, preparedStreamFieldMask(req, prepared), true, cancel, nil, prepared)
 	if sub == nil {
 		cancel()
-		return nil, fmt.Errorf("api: stream %q reached subscriber limit", req.API)
+		if prepared.release != nil {
+			prepared.release()
+		}
+		return nil, luxerrors.New("Unavailable", 503, fmt.Sprintf("api: stream %q reached subscriber limit", req.API))
 	}
-	sub.Params.binary = append([]byte(nil), req.BinaryParams()...)
-	internal := &InternalStream{hub: rt.Streams, apiName: req.API, sub: sub}
-	rt.startNativeStreamHandler(streamCtx, req.API, params, identity, sub)
+	if !prepared.valid() {
+		sub.Params.binary = append([]byte(nil), req.BinaryParams()...)
+	}
+	internal := &InternalStream{hub: rt.Streams, apiName: req.API, sub: sub,
+		router: rt, ctx: streamCtx, run: prepared.run}
 	return internal, nil
 }
 
-func (rt *Router) startNativeStreamHandler(ctx context.Context, apiName string, params map[string]any, identity any, sub *StreamSub) {
-	handler, ok := rt.streamHandlers[apiName]
-	if !ok {
+func (rt *Router) startNativeStreamHandler(ctx context.Context, apiName string, identity any, sub *StreamSub, run PreparedStreamHandler) {
+	route, ok := rt.streamHandlers[apiName]
+	if !ok || route.eventPrepare != nil {
 		return
 	}
 	stream := &Stream{sub: sub, ctx: ctx}
+	handler := route.handler
 	go func() {
-		err := handler(ctx, sub.Params, identity, stream)
+		returned := false
+		defer func() {
+			if !returned {
+				// Also finish if user code exits this goroutine without returning.
+				_ = recover()
+				rt.Streams.finish(apiName, sub, luxerrors.InternalError)
+			}
+		}()
+		var err error
+		if run != nil {
+			err = run(ctx, stream)
+		} else {
+			err = handler(ctx, sub.Params, identity, stream)
+		}
+		returned = true
 		if err == nil {
 			err = ctx.Err()
 		}

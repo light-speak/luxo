@@ -95,6 +95,16 @@ func TestCanonicalJSONNumberConversions(t *testing.T) {
 	}
 }
 
+func TestParseFloat64TextMatchesBytes(t *testing.T) {
+	for _, input := range []string{"1.25", "-0", "5e-324", "1.7976931348623157e308", "0e-9999", "1E+2", "0.5e+1", " 1.5\n", "", "-", "-x", "true", "null", "NaN", "Infinity", "1e309", "1e-9999", "+1", "01", "0x1p2", "1_000", "1 2", "1.", "1.e2", "1e", "1e+", "1e-", "1e+a", ".1"} {
+		want, before := ParseFloat64([]byte(input))
+		got, err := ParseFloat64Text(input)
+		if (err == nil) != (before == nil) || math.Float64bits(got) != math.Float64bits(want) {
+			t.Errorf("%q: %v %v; want %v %v", input, got, err, want, before)
+		}
+	}
+}
+
 func TestParseFloat64(t *testing.T) {
 	for _, token := range []string{"0", "-0", "0.00", "0e99999", "-0E-99999", "1.25", "1E+03", "5e-324", "-5e-324",
 		"2.4703282292062328e-324", "1.7976931348623157e308", "9223372036854775808", " \n1.25\r\t"} {
@@ -121,6 +131,10 @@ func FuzzParseFloat64(f *testing.F) {
 	}
 	f.Fuzz(func(t *testing.T, raw []byte) {
 		got, err := ParseFloat64(raw)
+		text, textErr := ParseFloat64Text(string(raw))
+		if (err == nil) != (textErr == nil) || math.Float64bits(got) != math.Float64bits(text) {
+			t.Fatalf("text/bytes float mismatch for %q", raw)
+		}
 		if err != nil {
 			return
 		}

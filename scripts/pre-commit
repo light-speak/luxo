@@ -2,17 +2,18 @@
 # Luxo pre-commit hook — static quality gate
 # Full tests run on CI (PR checks), not here.
 # Install: cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+# Standalone checkout: run sh scripts/setup-modules.sh . once before these checks.
 
 set -e
 
 echo "=== gofmt ==="
-sh scripts/check-go.sh format pkg/ cmd/ scripts/
+sh scripts/check-go.sh format pkg/ cmd/ scripts/ internal/
 
 echo "=== go vet ==="
-go vet ./pkg/... ./cmd/... ./scripts/...
+go vet ./pkg/... ./cmd/... ./cmd/luxo/... ./scripts/... ./internal/... ./pkg/lux/pg/... ./pkg/lux/nats/... ./pkg/lux/cache/redis/... ./pkg/lux/storage/s3/...
 
 echo "=== gocyclo ==="
-sh scripts/check-go.sh complexity pkg/ cmd/ scripts/
+sh scripts/check-go.sh complexity pkg/ cmd/ scripts/ internal/
 
 echo "=== go mod tidy ==="
 go mod tidy

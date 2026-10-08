@@ -13,43 +13,16 @@ import 'int64_native.dart'
     as platform;
 import 'json.dart';
 import 'schema.dart';
+import 'schema_ids.dart' show snapshotAPISchema;
 import 'socket.dart';
 import 'uint64.dart';
 
 export 'error_codec.dart' show decodeBinaryError;
 export 'schema.dart';
 
-// Keep compiled JSON metadata and Binary metadata on the same registration snapshot.
-Map<String, APISchemaEntry> _snapshotSchema(
-  Map<String, APISchemaEntry> schema,
-) {
-  final types =
-      Map<
-        Map<String, Map<String, SelectionFieldSchema>>,
-        Map<String, Map<String, SelectionFieldSchema>>
-      >.identity();
-  return schema.map(
-    (name, entry) => MapEntry(
-      name,
-      APISchemaEntry(
-        entry.id,
-        List.unmodifiable(entry.params),
-        Map.unmodifiable(entry.fields),
-        types.putIfAbsent(
-          entry.types,
-          () => Map.unmodifiable(
-            entry.types.map(
-              (name, fields) => MapEntry(
-                name,
-                Map<String, SelectionFieldSchema>.unmodifiable(fields),
-              ),
-            ),
-          ),
-        ),
-      ),
-    ),
-  );
-}
+// JSON maps have no inherited fields; only null needs a second presence lookup.
+bool _hasJSONResponseData(Map<String, dynamic> json, Object? payload) =>
+    payload != null || json.containsKey('data');
 
 /// Transport mode: json for debugging, binary for production.
 enum TransportMode { json, binary }
@@ -336,12 +309,7 @@ Uint8List _encodeSelectionNode(
   return node.bytes();
 }
 
-void _writeFieldMask(
-  LuxoEncoder enc,
-  APISchemaEntry meta,
-  Map<String, dynamic>? params,
-) {
-  final select = params?[r'$select'];
+void _writeFieldMask(LuxoEncoder enc, APISchemaEntry meta, Object? select) {
   if (meta.fields.isEmpty) {
     enc.writeVarint(0);
     return;
@@ -380,19 +348,56 @@ void _writeFilters(LuxoEncoder enc, dynamic value) {
   enc.writeVarint(value.length);
   for (var i = 0; i < value.length; i++) {
     final item = value[i];
-    final map = item is LuxoFilter ? item.toJson() : item;
-    if (map is! Map ||
-        map['field'] is! String ||
-        (map['field'] as String).isEmpty ||
-        map['op'] is! String ||
-        !_filterOperatorIDs.containsKey(map['op']) ||
-        !_validFilterValue(map['value'])) {
+    if (item is LuxoFilter) {
+      _writeFilter(enc, item.field, item.op, item.value, i);
+    } else if (item is Map && item['field'] is String && item['op'] is String) {
+      _writeFilter(
+        enc,
+        item['field'] as String,
+        item['op'] as String,
+        item['value'],
+        i,
+      );
+    } else {
       throw LuxoError('ConfigError', 0, 'invalid \$filters entry at index $i');
     }
-    enc.writeString(map['field'] as String);
-    enc.writeVarint(_filterOperatorIDs[map['op']]!);
-    enc.writeString(_filterValueText(map['value']));
   }
+}
+
+void _writeTypedFilters(LuxoEncoder enc, List<LuxoFilter> filters) {
+  if (filters.length > 1000) {
+    throw LuxoError(
+      'ConfigError',
+      0,
+      r'$filters must contain at most 1000 entries',
+    );
+  }
+  enc.writeVarint(_binaryFiltersFieldID);
+  enc.writeVarint(filters.length);
+  for (var i = 0; i < filters.length; i++) {
+    final filter = filters[i];
+    _writeFilter(enc, filter.field, filter.op, filter.value, i);
+  }
+}
+
+void _writeFilter(
+  LuxoEncoder enc,
+  String field,
+  String op,
+  Object? value,
+  int index,
+) {
+  final operatorID = _filterOperatorIDs[op];
+  if (field.isEmpty || operatorID == null || !_validFilterValue(value)) {
+    throw LuxoError(
+      'ConfigError',
+      0,
+      'invalid \$filters entry at index $index',
+    );
+  }
+  enc.writeString(field);
+  enc.writeVarint(operatorID);
+  enc.writeString(_filterValueText(value));
 }
 
 void _writeSorters(LuxoEncoder enc, dynamic value) {
@@ -407,17 +412,44 @@ void _writeSorters(LuxoEncoder enc, dynamic value) {
   enc.writeVarint(value.length);
   for (var i = 0; i < value.length; i++) {
     final item = value[i];
-    final map = item is LuxoSorter ? item.toJson() : item;
-    final order = map is Map ? map['order'] : null;
-    if (map is! Map ||
-        map['field'] is! String ||
-        (map['field'] as String).isEmpty ||
-        (order != 'asc' && order != 'desc')) {
+    if (item is LuxoSorter) {
+      _writeSorter(enc, item.field, item.order, i);
+    } else if (item is Map &&
+        item['field'] is String &&
+        item['order'] is String) {
+      _writeSorter(enc, item['field'] as String, item['order'] as String, i);
+    } else {
       throw LuxoError('ConfigError', 0, 'invalid \$sorters entry at index $i');
     }
-    enc.writeString(map['field'] as String);
-    enc.writeBool(order == 'desc');
   }
+}
+
+void _writeTypedSorters(LuxoEncoder enc, List<LuxoSorter> sorters) {
+  if (sorters.length > 100) {
+    throw LuxoError(
+      'ConfigError',
+      0,
+      r'$sorters must contain at most 100 entries',
+    );
+  }
+  enc.writeVarint(_binarySortersFieldID);
+  enc.writeVarint(sorters.length);
+  for (var i = 0; i < sorters.length; i++) {
+    final sorter = sorters[i];
+    _writeSorter(enc, sorter.field, sorter.order, i);
+  }
+}
+
+void _writeSorter(LuxoEncoder enc, String field, String order, int index) {
+  if (field.isEmpty || (order != 'asc' && order != 'desc')) {
+    throw LuxoError(
+      'ConfigError',
+      0,
+      'invalid \$sorters entry at index $index',
+    );
+  }
+  enc.writeString(field);
+  enc.writeBool(order == 'desc');
 }
 
 bool _validFilterValue(dynamic value) =>
@@ -432,10 +464,39 @@ String _filterValueText(dynamic value) {
 }
 
 /// Transport interface — implemented by HTTP and WebSocket.
+abstract class GeneratedRequest {
+  int get apiID;
+  String? get selection => null;
+  void writeParameters(LuxoEncoder encoder);
+  List<LuxoFilter>? get filters => null;
+  List<LuxoSorter>? get sorters => null;
+  Map<String, dynamic> toJSONParameters();
+}
+
+Map<String, dynamic>? _requestJSON(
+  Map<String, dynamic>? params,
+  GeneratedRequest? request,
+) {
+  if (request == null) return params;
+  _checkRequestArguments(params);
+  return request.toJSONParameters();
+}
+
+void _checkRequestArguments(Map<String, dynamic>? params) {
+  if (params != null && params.isNotEmpty) {
+    throw LuxoError(
+      'ConfigError',
+      0,
+      'cannot combine generated and dynamic parameters',
+    );
+  }
+}
+
 abstract class Transport {
   Future<T> call<T>(
     String api, {
     Map<String, dynamic>? params,
+    GeneratedRequest? request,
     T Function(dynamic)? decoder,
   });
 
@@ -446,6 +507,7 @@ abstract class Transport {
     Map<String, dynamic> params,
     void Function(T) onData, {
     required T Function(Object?) decoder,
+    GeneratedRequest? request,
     void Function(LuxoError)? onError,
     void Function()? onDone,
   });
@@ -458,10 +520,30 @@ abstract class Transport {
 void _writeRequest(
   LuxoEncoder encoder,
   APISchemaEntry schema,
-  Map<String, dynamic>? params,
-) {
+  Map<String, dynamic>? params, [
+  GeneratedRequest? request,
+]) {
+  if (request != null) {
+    _checkRequestArguments(params);
+    if (request.apiID != schema.id) {
+      throw LuxoError(
+        'ConfigError',
+        0,
+        'generated request API ID differs from registered schema',
+      );
+    }
+    encoder.writeVarint(request.apiID);
+    _writeFieldMask(encoder, schema, request.selection);
+    request.writeParameters(encoder);
+    final filters = request.filters;
+    final sorters = request.sorters;
+    if (filters != null) _writeTypedFilters(encoder, filters);
+    if (sorters != null) _writeTypedSorters(encoder, sorters);
+    encoder.writeEnd();
+    return;
+  }
   encoder.writeVarint(schema.id);
-  _writeFieldMask(encoder, schema, params);
+  _writeFieldMask(encoder, schema, params?[r'$select']);
   if (params != null) {
     for (final param in schema.params) {
       if (params.containsKey(param.name)) {
@@ -522,8 +604,9 @@ class HttpTransport implements Transport {
 
   @override
   void setSchema(Map<String, APISchemaEntry> schema) {
-    _schema = _snapshotSchema(schema);
-    _jsonRequests.setSchema(_schema);
+    final snapshot = snapshotAPISchema(schema);
+    _jsonRequests.setSchema(snapshot);
+    _schema = snapshot;
   }
 
   @override
@@ -537,11 +620,12 @@ class HttpTransport implements Transport {
   Future<T> call<T>(
     String api, {
     Map<String, dynamic>? params,
+    GeneratedRequest? request,
     T Function(dynamic)? decoder,
   }) async {
     final result = _mode == TransportMode.binary
-        ? await _binaryCall(api, params)
-        : await _jsonCall(api, params);
+        ? await _binaryCall(api, params, request: request)
+        : await _jsonCall(api, _requestJSON(params, request));
     return decoder == null
         ? (result is Uint8List ? result : normalizeLuxoJSON(result)) as T
         : decoder(result);
@@ -553,6 +637,7 @@ class HttpTransport implements Transport {
     Map<String, dynamic> params,
     void Function(T) onData, {
     required T Function(Object?) decoder,
+    GeneratedRequest? request,
     void Function(LuxoError)? onError,
     void Function()? onDone,
   }) {
@@ -582,8 +667,17 @@ class HttpTransport implements Transport {
     }
 
     final json = _jsonEnvelope(resp);
-    if (resp.statusCode == 200 && !json.containsKey('error'))
-      return json['data'];
+    if (resp.statusCode == 200 && !json.containsKey('error')) {
+      final payload = json['data'];
+      if (!_hasJSONResponseData(json, payload)) {
+        throw LuxoError(
+          'ParseError',
+          resp.statusCode,
+          'missing JSON response data',
+        );
+      }
+      return payload;
+    }
     final error = decodeJSONError(json, resp.statusCode);
     final refresh = _refreshAfterUnauthorized(error, resp.statusCode, isRetry);
     if (refresh != null) {
@@ -626,6 +720,7 @@ class HttpTransport implements Transport {
     String api,
     Map<String, dynamic>? params, {
     bool isRetry = false,
+    GeneratedRequest? request,
   }) async {
     final meta = _schema[api];
     if (meta == null)
@@ -636,7 +731,7 @@ class HttpTransport implements Transport {
       );
 
     final enc = LuxoEncoder();
-    _writeRequest(enc, meta, params);
+    _writeRequest(enc, meta, params, request);
 
     final http.Response resp;
     try {
@@ -659,7 +754,7 @@ class HttpTransport implements Transport {
       final newToken = await refresh;
       if (newToken != null) {
         setToken(newToken);
-        return _binaryCall(api, params, isRetry: true);
+        return _binaryCall(api, params, isRetry: true, request: request);
       }
     }
 
@@ -756,8 +851,9 @@ class WsTransport implements Transport {
 
   @override
   void setSchema(Map<String, APISchemaEntry> schema) {
-    _schema = _snapshotSchema(schema);
-    _jsonRequests.setSchema(_schema);
+    final snapshot = snapshotAPISchema(schema);
+    _jsonRequests.setSchema(snapshot);
+    _schema = snapshot;
   }
 
   @override
@@ -882,6 +978,7 @@ class WsTransport implements Transport {
     String api, {
     Map<String, dynamic>? params,
     T Function(dynamic)? decoder,
+    GeneratedRequest? request,
   }) async {
     await _connect();
     final ws = _requireSocket();
@@ -899,10 +996,14 @@ class WsTransport implements Transport {
         final enc = LuxoEncoder();
         enc.writeVarint(BinaryFrameType.callRequest);
         _writeSequence(enc, id);
-        _writeRequest(enc, meta, params);
+        _writeRequest(enc, meta, params, request);
         ws.add(enc.bytes());
       } else {
-        final body = _jsonRequests.encode(api, params, sequence: id);
+        final body = _jsonRequests.encode(
+          api,
+          _requestJSON(params, request),
+          sequence: id,
+        );
         ws.add(body);
       }
     } catch (_) {
@@ -957,8 +1058,22 @@ class WsTransport implements Transport {
     }
     if (json.containsKey(r'$stream')) {
       final stream = uint64FromJSON(json[r'$stream']);
-      if (stream != null)
-        _deliverSubscription(stream, TransportMode.json, json['data']);
+      if (stream == null) return;
+      final payload = json['data'];
+      if (!_hasJSONResponseData(json, payload)) {
+        final subscription = _subscriptions[stream];
+        if (subscription != null &&
+            subscription.mode == TransportMode.json &&
+            subscription.acknowledgement == null) {
+          _failSubscription(
+            stream,
+            subscription,
+            LuxoError('ParseError', 0, 'missing JSON response data'),
+          );
+        }
+        return;
+      }
+      _deliverSubscription(stream, TransportMode.json, payload);
       return;
     }
     final id = uint64FromJSON(json[r'$id']);
@@ -968,7 +1083,14 @@ class WsTransport implements Transport {
     if (json.containsKey('error')) {
       c.completeError(decodeJSONError(json, 0));
     } else {
-      c.complete(json['data']);
+      final payload = json['data'];
+      if (_hasJSONResponseData(json, payload)) {
+        c.complete(payload);
+      } else {
+        c.completeError(
+          LuxoError('ParseError', 0, 'missing JSON response data'),
+        );
+      }
     }
   }
 
@@ -1084,6 +1206,7 @@ class WsTransport implements Transport {
     required T Function(Object?) decoder,
     void Function(LuxoError)? onError,
     void Function()? onDone,
+    GeneratedRequest? request,
   }) async {
     await _connect();
     final ws = _requireSocket();
@@ -1099,7 +1222,7 @@ class WsTransport implements Transport {
     );
     _subscriptions[id] = subscription;
     try {
-      _sendSubscription(ws, id, api, params, subscription.mode);
+      _sendSubscription(ws, id, api, params, subscription.mode, request);
     } catch (error, stackTrace) {
       _subscriptions.remove(id);
       acknowledgement.completeError(error, stackTrace);
@@ -1127,6 +1250,15 @@ class WsTransport implements Transport {
       0,
       cause is LuxoError ? cause.message : cause.toString(),
     );
+    _failSubscription(id, subscription, error);
+  }
+
+  void _failSubscription(
+    Object id,
+    _Subscription<Object?> subscription,
+    LuxoError error,
+  ) {
+    if (!identical(_subscriptions[id], subscription)) return;
     // Local termination does not depend on the advisory cancellation being sent.
     try {
       _unsubscribe(id);
@@ -1202,10 +1334,16 @@ class WsTransport implements Transport {
     String api,
     Map<String, dynamic> params,
     TransportMode mode,
+    GeneratedRequest? request,
   ) {
     if (mode == TransportMode.json) {
       ws.add(
-        _jsonRequests.encode(api, params, sequence: id, subscription: true),
+        _jsonRequests.encode(
+          api,
+          _requestJSON(params, request),
+          sequence: id,
+          subscription: true,
+        ),
       );
       return;
     }
@@ -1214,7 +1352,7 @@ class WsTransport implements Transport {
     final enc = LuxoEncoder();
     enc.writeVarint(BinaryFrameType.subscribe);
     _writeSequence(enc, id);
-    _writeRequest(enc, meta, params);
+    _writeRequest(enc, meta, params, request);
     ws.add(enc.bytes());
   }
 

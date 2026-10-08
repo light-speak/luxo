@@ -21,6 +21,52 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('WxTransport precision', () => {
+  it.each([false, true])('rejects missing response data but preserves explicit null (generated=%s)', async generated => {
+    const transport = new WxTransport('https://example.test/api', { schema: { echo: { id: 7 } } })
+    const codec = { apiID: 7, initialCapacity: () => 16, writeParameters() {} }
+    const call = () => generated ? transport.callGenerated('echo', codec) : transport.call('echo')
+    for (const data of ['{}', '{"traceId":"request"}']) {
+      request.mockImplementation(options => options.success({ statusCode: 200, data }))
+      await expect(call()).rejects.toMatchObject({ error: 'ParseError', code: 200 })
+    }
+    for (const [data, value] of [['{"data":null}', null], ['{"data":false}', false], ['{"data":0}', 0]] as const) {
+      request.mockImplementation(options => options.success({ statusCode: 200, data }))
+      await expect(call()).resolves.toBe(value)
+    }
+  })
+  it.each(['json', 'binary'] as const)('supports original typed parameters in the dedicated %s entry', async mode => {
+    const schema = { echo: { id: 7, params: [{ fieldID: 1, name: 'value', type: 'Int' }] } }
+    const transport = new WxTransport('https://example.test/api', { mode, schema })
+    const values = Object.freeze({ value: 9007199254740993n })
+    let writes = 0
+    const codec = { apiID: 7, initialCapacity: () => 16, writeParameters(enc: Encoder, actual: typeof values | undefined) {
+      expect(actual).toBe(values)
+      writes++
+      enc.writeVarint(1)
+      enc.writeSvarint(actual!.value)
+    } }
+    request.mockImplementation(options => options.success({ statusCode: 200,
+      data: mode === 'json' ? '{"data":true}' : new Uint8Array([1]).buffer }))
+    await expect(transport.callGenerated('echo', codec, values)).resolves.toEqual(mode === 'json' ? true : new Uint8Array([1]))
+    expect(writes).toBe(mode === 'binary' ? 1 : 0)
+    await expect(transport.callGenerated('echo', { ...codec, apiID: 9 }, values)).rejects.toMatchObject({ error: 'ConfigError' })
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+  it.each(['json', 'binary'] as const)('owns constructor metadata and keeps valid %s registration after failure', async mode => {
+    const schema = { echo: { id: 7, params: [{ fieldID: 1, name: 'value', type: 'Int' }] } }
+    const transport = new WxTransport('https://example.test/api', { mode, schema })
+    schema.echo.id = 9
+    schema.echo.params[0].type = 'String'
+    expect(() => transport.setSchema({ echo: { id: 0 } })).toThrow(/ID/)
+    request.mockImplementation(options => options.success({ statusCode: 200,
+      data: mode === 'json' ? '{"data":true}' : new Uint8Array([1]).buffer }))
+    await expect(transport.call('echo', { value: 7n })).resolves.toEqual(mode === 'json' ? true : new Uint8Array([1]))
+    expect(request.mock.lastCall?.[0].data).toEqual(mode === 'json'
+      ? '{"$api":"echo","value":7}' : new Uint8Array([7, 0, 1, 14, 0]).buffer)
+    await expect(transport.call('echo', { value: 'invalid' })).rejects.toThrow(/bigint/)
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
   it('exports the shared implementation from the public package entry', () => {
     expect(PublicWxTransport).toBe(WxTransport)
   })

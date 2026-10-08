@@ -43,6 +43,31 @@ func (a *Analyzer) injectSealedVariantFields(scope *Scope, sealedType *ResolvedT
 
 // ========== @withAuth Method Injection ==========
 
+func (a *Analyzer) checkAuthMethodArguments(call *ast.CallExpr, argTypes []*ResolvedType) {
+	member, ok := call.Func.(*ast.MemberExpr)
+	if !ok || (member.Field != "createToken" && member.Field != "createRefreshToken" && member.Field != "refreshToken") {
+		return
+	}
+	model := a.types[member.Object.GetTypeTag()]
+	if model == nil || model.Kind != TypeModel || member.Object.IsListType() {
+		return
+	}
+	field := model.Fields[member.Field]
+	if field == nil || !field.IsMethod {
+		return
+	}
+	var parameters []*ast.ParamDecl
+	switch member.Field {
+	case "createToken":
+		// Only marks omission as valid here; generated code reads the configured
+		// duration at runtime instead of compiling this marker as a default.
+		parameters = []*ast.ParamDecl{{Name: "expires", Type: &ast.TypeRef{Name: "Duration"}, Default: &ast.Literal{}}}
+	case "refreshToken":
+		parameters = []*ast.ParamDecl{{Name: "token", Type: &ast.TypeRef{Name: "String"}}}
+	}
+	a.checkFunctionArguments(call, &ast.FnDecl{Name: member.Field, Params: parameters}, argTypes)
+}
+
 func hasModelDirective(directives []*ast.Directive, name string) bool {
 	for _, d := range directives {
 		if d.Name == name {
@@ -101,7 +126,13 @@ func (a *Analyzer) injectWithAuthMethods(typ *ResolvedType, directives []*ast.Di
 		Name:     "createToken",
 		Type:     a.types["String"],
 		IsMethod: true,
-		Doc:      ".createToken(expires?: Duration): String — Generate JWT token / 生成 JWT 令牌",
+		Doc:      ".createToken(expires?: Duration): String — Generate access token / 生成访问令牌",
+	}
+	typ.Fields["createRefreshToken"] = &FieldInfo{
+		Name:     "createRefreshToken",
+		Type:     a.types["String"],
+		IsMethod: true,
+		Doc:      ".createRefreshToken(): String — Generate refresh token when enabled / 启用刷新时签发刷新令牌",
 	}
 	typ.Fields["verify"] = &FieldInfo{
 		Name:     "verify",
@@ -115,7 +146,7 @@ func (a *Analyzer) injectWithAuthMethods(typ *ResolvedType, directives []*ast.Di
 		Name:     "refreshToken",
 		Type:     a.types["String"],
 		IsMethod: true,
-		Doc:      ".refreshToken(token: String): String — Refresh JWT token / 刷新 JWT 令牌",
+		Doc:      ".refreshToken(token: String): String — Exchange refresh for access token / 使用刷新令牌换取访问令牌",
 	}
 
 	// Inject stores fields into Identity type so my.<field> works for all stored fields
@@ -195,29 +226,20 @@ func (a *Analyzer) checkEventCycles() {
 // and returns an adjacency map: event → list of emitted events.
 func (a *Analyzer) buildEventGraph() map[string][]string {
 	graph := map[string][]string{}
+	var bodies map[callableKey]*ast.Block
 	for _, file := range a.files {
 		for _, on := range file.Listeners {
 			if on.Body == nil {
 				continue
 			}
-			emitted := collectEmits(on.Body)
+			emitted, nextBodies := collectReachableEmits(on.Body, a.fileModule(file.Name), bodies, a)
+			bodies = nextBodies
 			if len(emitted) > 0 {
 				graph[on.EventName] = append(graph[on.EventName], emitted...)
 			}
 		}
 	}
 	return graph
-}
-
-// collectEmits recursively collects all event names from EmitStmt in a block.
-func collectEmits(block *ast.Block) []string {
-	var result []string
-	for _, stmt := range block.Stmts {
-		if emit, ok := stmt.(*ast.EmitStmt); ok {
-			result = append(result, emit.EventName)
-		}
-	}
-	return result
 }
 
 // detectCycles runs DFS on the event graph to find and report cycles.
@@ -289,12 +311,30 @@ func (a *Analyzer) checkFieldDirectives(f *ast.FieldDecl) {
 	typeName := f.Type.Name
 	for _, d := range f.Directives {
 		a.validateDirective(d, OnField, typeName)
+		if d.Name == "filterable" && !a.supportsFilterableType(f.Type) {
+			a.addError(d.Pos, "@filterable requires a supported scalar or enum (Int, Float, String, Boolean, DateTime, UUID, Decimal); lists, JSON, Bytes, Duration and structured types are not implemented / @filterable 仅支持已实现的标量和枚举；列表、JSON、Bytes、Duration及结构类型尚未实现")
+		}
 	}
 	// computed field directives (@count, @sum, @avg, etc.)
 	if f.Computed != nil {
 		for _, d := range f.Computed.Directives {
 			a.validateDirective(d, OnComputed, typeName)
 		}
+	}
+}
+
+// Keep unsupported query declarations out of generated public schemas. Nullable
+// scalar fields retain ordinary comparison semantics; no null operator is added.
+func (a *Analyzer) supportsFilterableType(ref *ast.TypeRef) bool {
+	if ref.IsList {
+		return false
+	}
+	switch ref.Name {
+	case "Int", "Float", "String", "Boolean", "DateTime", "UUID", "Decimal":
+		return true
+	default:
+		typ := a.types[ref.Name]
+		return typ != nil && typ.Kind == TypeEnum
 	}
 }
 
@@ -386,7 +426,9 @@ func (a *Analyzer) hasSearchDirective(expr ast.Expr) bool {
 	if !ok {
 		return false
 	}
-	objType := a.checkExpr(member.Object, a.scope)
+	// Member resolution already checked the receiver in its lexical scope.
+	// Rechecking it at the root would lose collection and function parameters.
+	objType := a.resolvedExprType(member.Object)
 	if objType == nil {
 		return false
 	}
@@ -488,13 +530,11 @@ func (a *Analyzer) resolveQueryMethod(method string, modelType *ResolvedType) *R
 	case "where", "groupBy", "orderBy", "limit", "offset":
 		// chaining methods — return a query builder
 		return qb
-	case "sum", "avg":
-		return a.types["Float"]
+	case "sum", "avg", "min", "max":
+		// The call's selected field determines its result type.
+		return nil
 	case "count":
 		return a.types["Int"]
-	case "min", "max":
-		// could be any numeric type; Float is a safe approximation
-		return a.types["Float"]
 	case "select":
 		// select { ... } — return type depends on the lambda; can't infer here
 		return nil
@@ -532,8 +572,13 @@ func editDistance(a, b string) int {
 		return m
 	}
 	// Two-row DP: O(n) space instead of O(m*n).
-	prev := make([]int, n+1)
-	curr := make([]int, n+1)
+	// Typical identifiers fit on the stack; longer names remain unrestricted.
+	var rows [2][64]int
+	prev, curr := rows[0][:], rows[1][:]
+	if n >= len(rows[0]) {
+		prev = make([]int, n+1)
+		curr = make([]int, n+1)
+	}
 	for j := 0; j <= n; j++ {
 		prev[j] = j
 	}

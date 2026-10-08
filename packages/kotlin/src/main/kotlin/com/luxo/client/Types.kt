@@ -87,6 +87,13 @@ data class LuxoModel(
     val module: String = "",
     val description: String = "",
     val directives: List<String> = emptyList(),
+    val computedSources: Map<String, LuxoComputedSource> = emptyMap(),
+)
+
+@Serializable
+data class LuxoComputedSource(
+    val model: String,
+    val module: String = "",
 )
 
 @Serializable
@@ -132,7 +139,19 @@ data class LuxoAPI(
     val deprecatedReason: String = "",
     val description: String = "",
     val directives: List<String> = emptyList(),
+    @SerialName("internal") val isInternal: Boolean = false,
+    val returnNullable: Boolean = false,
+    val query: LuxoQueryCapabilities? = null,
 )
+
+@Serializable
+data class LuxoQueryCapabilities(
+    val filters: List<LuxoQueryFilter> = emptyList(),
+    val sorters: List<String> = emptyList(),
+)
+
+@Serializable
+data class LuxoQueryFilter(val field: String, val type: String, val operators: List<String>)
 
 @Serializable
 data class LuxoParam(

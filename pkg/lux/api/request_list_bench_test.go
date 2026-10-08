@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"testing"
@@ -13,9 +14,7 @@ import (
 
 func BenchmarkWSJSONSubscriptionMetadata(b *testing.B) {
 	for _, apiName := range []string{`"watchIdentity"`, `"\u0077atchIdentity"`} {
-		router := subscriptionIdentityRouter()
-		router.Schema.APIs["watchIdentity"].Params = []schema.Param{{ID: 1, Name: "value", Type: schema.FieldInt}}
-		router.Registry.RegisterParams("watchIdentity", []ParamMeta{{Name: "value", Type: "Int", FieldID: 1}})
+		router := subscriptionMetadataBenchmarkRouter(b)
 		raw := map[string]json.RawMessage{"$id": []byte("1"), "$sub": []byte(apiName), "value": []byte("9223372036854775807")}
 		for _, version := range []struct {
 			name  string
@@ -29,6 +28,42 @@ func BenchmarkWSJSONSubscriptionMetadata(b *testing.B) {
 					}
 				}
 			})
+		}
+	}
+}
+
+func subscriptionMetadataBenchmarkRouter(t testing.TB) *Router {
+	t.Helper()
+	router := testWSRouter()
+	if err := router.Registry.Register("watchIdentity", 71); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Registry.RegisterParams("watchIdentity", []ParamMeta{{Name: "value", Type: "Int", FieldID: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Schema.RegisterAPI(&schema.API{
+		ID: 71, Name: "watchIdentity", ReturnType: "Int", Stream: true,
+		Params: []schema.Param{{ID: 1, Name: "value", Type: schema.FieldInt}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return router
+}
+
+func TestWSJSONSubscriptionMetadataBenchmarkFixture(t *testing.T) {
+	router := subscriptionMetadataBenchmarkRouter(t)
+	for _, apiName := range []string{`"watchIdentity"`, `"\u0077atchIdentity"`} {
+		for _, parse := range []func(map[string]json.RawMessage) (*Request, map[string]any, error){
+			router.formerWSJSONSubscriptionMetadata, router.prepareWSJSONSubscription,
+		} {
+			raw := map[string]json.RawMessage{"$id": []byte("1"), "$sub": []byte(apiName), "value": []byte("9223372036854775807")}
+			req, params, err := parse(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if req.API != "watchIdentity" || params["value"] != int64(math.MaxInt64) {
+				t.Fatalf("benchmark request lost API or exact integer: %s, %v", req.API, params)
+			}
 		}
 	}
 }

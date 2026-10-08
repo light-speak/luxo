@@ -1,6 +1,6 @@
 {
   "name": "@luxojs/vite-plugin",
-  "version": "0.1.0-dev.1",
+  "version": "1.0.0-beta.1",
   "description": "Luxo Vite plugin — compile-time field tracking, auto $select injection, and typed client generation",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -34,7 +34,7 @@
     "prepublishOnly": "pnpm build"
   },
   "peerDependencies": {
-    "@luxojs/client": ">=0.1.0-dev.3",
+    "@luxojs/client": "1.0.0-beta.1",
     "typescript": ">=7.0 <8",
     "vite": ">=5.0"
   },

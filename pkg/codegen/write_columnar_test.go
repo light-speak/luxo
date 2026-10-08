@@ -39,6 +39,8 @@ func TestGeneratedColumnarRequiresReturnedField(t *testing.T) {
 
 const columnarProjectionAssertions = `package generated
 import (
+"github.com/light-speak/luxo/internal/testutil"
+
     "bytes"
     "fmt"
     "testing"
@@ -51,7 +53,7 @@ func TestFinalColumnProjection(t *testing.T) {
     for _, allowed := range []bool{false, true} {
         allowColumn = allowed
         for _, id := range []int{1, 2} {
-            mask := codec.AppendSelectionMask(nil, codec.FieldMaskSet(nil,id), nil)
+            mask := testutil.Bytes(t)(codec.AppendSelectionMask(nil, testutil.Bytes(t)(codec.FieldMaskSet(nil,id)), nil))
             var buf api.ResponseBuf
             err := WRITE(&buf, items, mask)
             if !allowed || id != 1 {
@@ -82,7 +84,7 @@ func TestProjectionWriterParityAndAllocations(t *testing.T) {
     allowColumn = true
     text := "value"
     items := []Projection{{Value:&text},{}}
-    mask := codec.AppendSelectionMask(nil, []byte{1}, nil)
+    mask := testutil.Bytes(t)(codec.AppendSelectionMask(nil, []byte{1}, nil))
     baseline := api.ResponseBuf{B:make([]byte,0,4096)}
     checked := api.ResponseBuf{B:make([]byte,0,4096)}
     if err := WRITEBeforeProjection(&baseline,items,mask); err != nil { t.Fatal(err) }
@@ -98,7 +100,7 @@ func BenchmarkPayloadColumnarProjection(b *testing.B) {
         items := make([]Projection,count)
         text := "value"
         for i := range items { items[i].Value = &text }
-        mask := codec.AppendSelectionMask(nil, []byte{1}, nil)
+        mask := testutil.Bytes(b)(codec.AppendSelectionMask(nil, []byte{1}, nil))
         for _, before := range []bool{true,false} {
             b.Run(fmt.Sprintf("count=%d/before=%t",count,before),func(b *testing.B) {
                 buf := api.ResponseBuf{B:make([]byte,0,4096)}
@@ -229,8 +231,10 @@ func TestReusedNull%d(t *testing.T) {
 `, i, fixture.value, i, 2*i+2, i, fixture.name)
 	}
 	g := generatorWithModelFieldIDs(map[string]map[string]int{"Scalars": ids})
-	source := columnarFixtureSource(g, []*ast.ModelDecl{model}, declaration, map[string]bool{"State": true}) + "type State string\n"
-	return source, assertions.String()
+	var source strings.Builder
+	source.WriteString(columnarFixtureSource(g, []*ast.ModelDecl{model}, declaration, map[string]bool{"State": true}))
+	generateEnum(&source, &ast.EnumDecl{Name: "State", Values: []string{"ready"}})
+	return source.String(), assertions.String()
 }
 
 func writeColumnarScalarFixture(b *strings.Builder, fixture columnarScalarFixture, index int) {
@@ -346,6 +350,8 @@ func columnarFixtureSource(g *GeneratorContext, models []*ast.ModelDecl, declara
 
 const columnarDirectiveAssertions = `package generated
 import (
+"github.com/light-speak/luxo/internal/testutil"
+
     "bytes"
     "strings"
     "testing"
@@ -365,7 +371,7 @@ func TestNestedColumnDirectives(t *testing.T) {
     items := []PrivateParent{{Children:children}}
     for _, role := range []string{"admin","guest"} {
         for _, fields := range []byte{1,3} {
-            mask := codec.AppendSelectionMask(nil, []byte{1}, []codec.SelectionMaskChild{{FieldID:1, Mask:[]byte{1,fields}}})
+            mask := testutil.Bytes(t)(codec.AppendSelectionMask(nil, []byte{1}, []codec.SelectionMaskChild{{FieldID:1, Mask:[]byte{1,fields}}}))
             buf := api.ResponseBuf{Identity:identity{role:role}}
             transformCalls = 0
             writeFixture(&buf, items, mask)

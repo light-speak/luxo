@@ -56,7 +56,7 @@ func TestRegistrarRetriesRegistrationBeforeSendingHeartbeat(t *testing.T) {
 			return
 		}
 		calls = append(calls, body.API)
-		if body.API == "svc:registerGateway" {
+		if body.API == "registerGateway" {
 			attempts++
 			if attempts == 1 {
 				w.WriteHeader(http.StatusServiceUnavailable)
@@ -70,7 +70,7 @@ func TestRegistrarRetriesRegistrationBeforeSendingHeartbeat(t *testing.T) {
 	registrar.refreshRegistration()
 	registrar.refreshRegistration()
 	registrar.refreshRegistration()
-	want := []string{"svc:registerGateway", "svc:registerGateway", "svc:heartbeat", "svc:heartbeat"}
+	want := []string{"registerGateway", "registerGateway", "heartbeat", "heartbeat"}
 	if !reflect.DeepEqual(calls, want) {
 		t.Fatalf("requests = %v, want %v", calls, want)
 	}
@@ -155,8 +155,8 @@ func TestGatewayRegistrarRegisterBody(t *testing.T) {
 	}
 
 	regBody := received[0]
-	if regBody["$api"] != "svc:registerGateway" {
-		t.Errorf("$api = %v, want svc:registerGateway", regBody["$api"])
+	if regBody["$api"] != "registerGateway" {
+		t.Errorf("$api = %v, want registerGateway", regBody["$api"])
 	}
 	if regBody["$select"] != "id" {
 		t.Errorf("$select = %v, want id", regBody["$select"])
@@ -214,8 +214,8 @@ func TestGatewayRegistrarHeartbeatBody(t *testing.T) {
 	}
 
 	hb := received[0]
-	if hb["$api"] != "svc:heartbeat" {
-		t.Errorf("$api = %v, want svc:heartbeat", hb["$api"])
+	if hb["$api"] != "heartbeat" {
+		t.Errorf("$api = %v, want heartbeat", hb["$api"])
 	}
 	if hb["instanceId"] != "test-instance" {
 		t.Errorf("instanceId = %v, want test-instance", hb["instanceId"])
@@ -255,7 +255,7 @@ func TestGatewayRegistrarHeartbeatReregistersExpiredLease(t *testing.T) {
 		mu.Lock()
 		apiNames = append(apiNames, apiName)
 		mu.Unlock()
-		if apiName == "svc:heartbeat" {
+		if apiName == "heartbeat" {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -271,7 +271,7 @@ func TestGatewayRegistrarHeartbeatReregistersExpiredLease(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(apiNames) != 2 || apiNames[0] != "svc:heartbeat" || apiNames[1] != "svc:registerGateway" {
+	if len(apiNames) != 2 || apiNames[0] != "heartbeat" || apiNames[1] != "registerGateway" {
 		t.Fatalf("API sequence = %v, want heartbeat then registration", apiNames)
 	}
 }
@@ -282,8 +282,8 @@ func TestGatewayRegistrarDeregisterPayloads(t *testing.T) {
 		nodeType string
 		apiName  string
 	}{
-		{name: "gateway", apiName: "svc:deregisterGateway"},
-		{name: "service", nodeType: "service", apiName: "svc:deregisterServiceNode"},
+		{name: "gateway", apiName: "deregisterGateway"},
+		{name: "service", nodeType: "service", apiName: "deregisterServiceNode"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var received map[string]any
@@ -656,7 +656,7 @@ func TestServiceNodeRegistrarPayloads(t *testing.T) {
 	if len(received) < 2 {
 		t.Fatalf("received %d payloads, want registration and heartbeat", len(received))
 	}
-	if received[0]["$api"] != "svc:registerServiceNode" || received[0]["name"] != "billing" || received[0]["addr"] == nil {
+	if received[0]["$api"] != "registerServiceNode" || received[0]["name"] != "billing" || received[0]["addr"] == nil {
 		t.Fatalf("registration payload = %+v", received[0])
 	}
 	if received[0]["$select"] != "id" {
@@ -665,7 +665,7 @@ func TestServiceNodeRegistrarPayloads(t *testing.T) {
 	if _, ok := received[0]["introKey"]; ok {
 		t.Fatalf("service registration must not send gateway-only introKey: %+v", received[0])
 	}
-	if received[len(received)-1]["$api"] != "svc:heartbeatServiceNode" {
+	if received[len(received)-1]["$api"] != "heartbeatServiceNode" {
 		t.Fatalf("heartbeat payload = %+v", received[len(received)-1])
 	}
 }

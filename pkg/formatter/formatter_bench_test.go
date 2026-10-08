@@ -1,8 +1,9 @@
 package formatter
 
 import (
-	"os"
 	"testing"
+
+	"github.com/light-speak/luxo/internal/testutil"
 )
 
 // Representative .luxo source for formatter benchmarks.
@@ -67,16 +68,28 @@ func BenchmarkFormat(b *testing.B) {
 	}
 }
 
-// BenchmarkFormatDemoFile measures formatting of the full demo.luxo file.
+// BenchmarkFormatDemoFile measures formatting of the immutable V1 corpus.
 func BenchmarkFormatDemoFile(b *testing.B) {
-	data, err := os.ReadFile("../../editors/vscode/examples/demo.luxo")
-	if err != nil {
-		b.Skipf("demo.luxo not found: %v", err)
-	}
-	src := string(data)
+	src := testutil.CompilerDemoV1()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
 		Format(src, "demo.luxo")
+	}
+}
+
+func BenchmarkFormatBlockBoundaries(b *testing.B) {
+	for _, sample := range []struct{ name, source string }{
+		{"inline", "api read(): Value { Value { child: Value { id: 1 } } }"},
+		{"raw", "interface Worker {\n fn run() {\n if (ready) { work() }\n finish()\n }\n fn next(): Int\n}"},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := Format(sample.source, "body.luxo"); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

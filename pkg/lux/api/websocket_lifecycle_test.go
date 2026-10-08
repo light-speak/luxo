@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,6 +16,106 @@ import (
 	"github.com/light-speak/luxo/pkg/lux/schema"
 	"nhooyr.io/websocket"
 )
+
+func TestWSStreamPanicIsolation(t *testing.T) {
+	for _, binary := range []bool{false, true} {
+		for _, beforeACK := range []bool{false, true} {
+			t.Run(fmt.Sprintf("binary=%t/beforeACK=%t", binary, beforeACK), func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) { testWSStreamPanicIsolation(t, binary, beforeACK) })
+			})
+		}
+	}
+}
+
+func testWSStreamPanicIsolation(t *testing.T, binary, beforeACK bool) {
+	t.Helper()
+	router := newPanicStreamRouter(t, beforeACK)
+	ctx, conn := newInMemoryWebSocket(t, router)
+	subscribeIdentity(t, ctx, conn, binary, 0)
+	mode, request := websocket.MessageText, []byte(`{"$id":1,"$sub":"watchFinite"}`)
+	ack, data := []byte(`{"$sub":1,"ok":true}`), []byte(`{"$stream":1,"data":1}`)
+	if binary {
+		mode, request = websocket.MessageBinary, []byte{BinaryFrameSubscribe, 1, 72, 0, 0}
+		ack, data = []byte{BinaryFrameSubscribeSuccess, 1}, []byte{BinaryFrameStream, 1, 2}
+	}
+	writeWSFrame(t, ctx, conn, mode, request)
+	if !beforeACK {
+		requireWSFrame(t, ctx, conn, mode, ack)
+		requireWSFrame(t, ctx, conn, mode, data)
+	}
+	requireStreamPanicFrame(t, ctx, conn, binary, beforeACK)
+	synctest.Wait()
+	if router.Streams.SubCount("watchFinite") != 0 {
+		t.Fatal("panic retained subscription")
+	}
+	readIdentityData(t, ctx, conn, router, binary, 0)
+	writeWSFrame(t, ctx, conn, websocket.MessageText, sequenceRequest(websocket.MessageText, "getUser", 99))
+	_, response, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSequenceResponse(t, websocket.MessageText, "getUser", 99, response)
+}
+
+func newPanicStreamRouter(t *testing.T, beforeACK bool) *Router {
+	t.Helper()
+	router := subscriptionIdentityRouter()
+	// The legacy unary fixture registers its parameter separately. Complete its
+	// startup schema before registering the prepared route; never mutate live metadata.
+	router.Schema.APIs["getUser"].Params = []schema.Param{{ID: 1, Name: "id", Type: schema.FieldInt}}
+	if err := router.Schema.RegisterAPI(&schema.API{ID: 72, Name: "watchFinite", ReturnType: "Int", Stream: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Registry.RegisterSchemaAPIs(router.Schema); err != nil {
+		t.Fatal(err)
+	}
+	router.HandleStreamPrepared("watchFinite", func(context.Context, *Request, any) (PreparedStreamHandler, error) {
+		if beforeACK {
+			panic("private-prepare-details")
+		}
+		return func(_ context.Context, stream *Stream) error {
+			payload := []byte("1")
+			if stream.Binary() {
+				payload = []byte{2}
+			}
+			if err := stream.Send(payload); err != nil {
+				return err
+			}
+			panic("private-producer-details")
+		}, nil
+	})
+	return router
+}
+
+func requireStreamPanicFrame(t *testing.T, ctx context.Context, conn *websocket.Conn, binary, beforeACK bool) {
+	t.Helper()
+	kind, body, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binary {
+		frame := byte(0x16)
+		if beforeACK {
+			frame = BinaryFrameSubscribeError
+		}
+		if kind != websocket.MessageBinary || !bytes.HasPrefix(body, []byte{frame, 1}) {
+			t.Fatalf("unexpected frame: %x", body)
+		}
+		decoded, err := DecodeBinaryError(body[2:], 0)
+		if err != nil || decoded.Name != "Internal" || decoded.Code != 500 || decoded.Message != "error.internal" || decoded.Data != nil {
+			t.Fatalf("unsanitized panic: %v, %v", decoded, err)
+		}
+		return
+	}
+	key := "$end"
+	if beforeACK {
+		key = "$sub"
+	}
+	want := fmt.Sprintf(`{"%s":1,"error":"Internal","code":500,"message":"error.internal"}`, key)
+	if kind != websocket.MessageText || string(body) != want {
+		t.Fatalf("unexpected terminal: %s", body)
+	}
+}
 
 func TestWSNativeFinishDrainsAcceptedMessages(t *testing.T) {
 	for _, binary := range []bool{false, true} {

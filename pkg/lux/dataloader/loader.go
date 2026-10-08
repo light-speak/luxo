@@ -49,18 +49,23 @@ func New[K comparable, V any](fn BatchFn[K, V], cfg Config) *Loader[K, V] {
 		batchFn:  fn,
 		wait:     cfg.Wait,
 		maxBatch: cfg.MaxBatch,
-		batches:  make(map[<-chan struct{}]*batch[K, V]),
 	}
 }
 
 // Load adds a key + fields to the current batch and waits for the result.
 // Respects ctx cancellation — returns immediately if context is done.
 func (l *Loader[K, V]) Load(ctx context.Context, key K, fields []*selection.Field) (V, error) {
+	if l.maxBatch == 1 {
+		return l.loadImmediate(ctx, key, fields)
+	}
 	l.mu.Lock()
 
 	scope := ctx.Done()
 	b := l.batches[scope]
 	if b == nil {
+		if l.batches == nil {
+			l.batches = make(map[<-chan struct{}]*batch[K, V])
+		}
 		b = newBatch[K, V](ctx)
 		l.batches[scope] = b
 		time.AfterFunc(l.wait, func() { l.flushBatch(scope, b) })
@@ -83,6 +88,22 @@ func (l *Loader[K, V]) Load(ctx context.Context, key K, fields []*selection.Fiel
 		var zero V
 		return zero, ctx.Err()
 	}
+}
+
+// A one-key batch never needs a queue, timer or completion channel. Finish the
+// backend call on the caller so transaction completion cannot race dispatch.
+func (l *Loader[K, V]) loadImmediate(ctx context.Context, key K, fields []*selection.Field) (V, error) {
+	dispatchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	results, err := l.batchFn(dispatchCtx, []K{key}, fields)
+	if canceled := ctx.Err(); canceled != nil {
+		err = canceled
+	}
+	if err != nil {
+		var zero V
+		return zero, err
+	}
+	return results[key], nil
 }
 
 // LoadAll loads multiple keys immediately — bypasses batch window.

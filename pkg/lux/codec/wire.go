@@ -25,6 +25,9 @@ var ErrNonFiniteFloat = errors.New("luxo: Float must be finite")
 // ErrInvalidUTF8 rejects String values outside the protocol's text domain.
 var ErrInvalidUTF8 = errors.New("luxo: String must be valid UTF-8")
 
+// ErrInvalidEnum rejects enum values not declared by the service's schema.
+var ErrInvalidEnum = errors.New("luxo: undeclared enum value")
+
 // ErrInsufficientElementBytes rejects collections before allocating their
 // results when even their minimum encoded size cannot fit the remaining bytes.
 var ErrInsufficientElementBytes = errors.New("codec: insufficient element bytes")
@@ -49,6 +52,16 @@ var ErrInvalidColumnarArena = errors.New("codec: invalid columnar arena size")
 
 // Safety limits to prevent OOM from malicious/corrupted wire data.
 const (
+	// MaxSelectionFieldID bounds model/type/extend masks to 8 KiB per level.
+	MaxSelectionFieldID   = (1 << 16) - 1
+	MaxSelectionMaskBytes = (MaxSelectionFieldID + 7) / 8
+	// MaxAPIID and MaxEventFieldID fit the common signed 32-bit metadata domain.
+	MaxAPIID        = (1 << 31) - 1
+	MaxEventFieldID = (1 << 31) - 1
+	// Request control IDs are not available to user-declared parameters.
+	FiltersFieldID = (1 << 31) - 2
+	SortersFieldID = (1 << 31) - 1
+	MaxParameterID = FiltersFieldID - 1
 	// MaxArrayElements caps decoded array/list size (1M elements).
 	MaxArrayElements = 1_000_000
 	// MaxColumnarRecords caps columnar record count (10M rows).
@@ -166,19 +179,18 @@ func appendString(dst []byte, v string) []byte {
 // ReadBytes reads length-prefixed bytes from buf at offset.
 // Returns the bytes slice (pointing into buf) and total bytes consumed.
 func ReadBytes(buf []byte, off int) ([]byte, int) {
+	if off < 0 {
+		return nil, 0
+	}
 	length, n := ReadVarint(buf, off)
 	if n <= 0 {
 		return nil, 0
 	}
-	if length > uint64(len(buf)) {
-		return nil, 0 // length exceeds buffer, prevent overflow
-	}
 	start := off + n
-	end := start + int(length)
-	if end > len(buf) {
+	if length > uint64(len(buf)-start) {
 		return nil, 0
 	}
-	return buf[start:end], n + int(length)
+	return buf[start : start+int(length)], n + int(length)
 }
 
 // ReadString reads strict UTF-8, preserving a leading U+FEFF as field data.
@@ -274,6 +286,19 @@ func ReadNullable(buf []byte, off int) (present bool, n int) {
 		return false, 0
 	}
 }
+
+// UnwrapNullableRoot validates the root presence envelope without copying.
+// The caller must still validate the complete non-null value against its schema.
+func UnwrapNullableRoot(data []byte) (value []byte, null bool, err error) {
+	present, size := ReadNullable(data, 0)
+	if size == 0 || (!present && len(data) != 1) || (present && len(data) == 1) {
+		return nil, false, ErrInvalidNullableRoot
+	}
+	return data[1:], !present, nil
+}
+
+// ErrInvalidNullableRoot rejects missing flags, invalid flags and malformed nulls.
+var ErrInvalidNullableRoot = errors.New("codec: invalid nullable root envelope")
 
 // --- Fixed 16-byte (UUID) ---
 

@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"math"
+	"slices"
 	"strconv"
 	"time"
 	"unicode/utf8"
@@ -13,6 +15,7 @@ import (
 )
 
 var errInvalidJSONPayload = errors.New("schema: invalid UTF-8 JSON payload")
+var errJSONSizeOverflow = errors.New("schema: JSON list size overflows int")
 
 // BinaryToJSON converts a Luxo binary-encoded model to JSON using schema metadata.
 // No model struct needed — pure schema-driven conversion.
@@ -151,6 +154,14 @@ func readJSONColumns(data []byte, model *Model) (*codec.ColumnarReader, []typedC
 
 func appendJSONRows(dst []byte, count int, columns []typedColumn, schemas ...*Schema) ([]byte, error) {
 	start := len(dst)
+	// Batch rows amortize estimation; single rows can hit worse size classes.
+	if count > 1 {
+		var err error
+		dst, err = growJSONRows(dst, count, columns)
+		if err != nil {
+			return dst, err
+		}
+	}
 	dst = append(dst, '[')
 	for i := 0; i < count; i++ {
 		if i > 0 {
@@ -172,6 +183,48 @@ func appendJSONRows(dst []byte, count int, columns []typedColumn, schemas ...*Sc
 		dst = append(dst, '}')
 	}
 	return append(dst, ']'), nil
+}
+
+// Reserve only a proven lower bound after column decoding has succeeded.
+// Values are still validated and appended normally; none are encoded twice.
+func growJSONRows(dst []byte, count int, columns []typedColumn) ([]byte, error) {
+	size, err := jsonRowsMinimumSize(count, columns, math.MaxInt-len(dst))
+	if err != nil {
+		return dst, err
+	}
+	return slices.Grow(dst, size), nil
+}
+
+func jsonRowsMinimumSize(count int, columns []typedColumn, limit int) (int, error) {
+	if count < 0 || limit < 2 {
+		return 0, errJSONSizeOverflow
+	}
+	if count == 0 {
+		return 2, nil
+	}
+	// Each selected field needs its prefix, at least one value byte and a
+	// separator. The row braces and outer array account for the remainder.
+	rowSize := 2
+	for i := range columns {
+		field := columns[i].field
+		// Blob contents are validated during output, not column framing.
+		// Do not reserve a whole batch before those values are known valid.
+		if field.IsList || field.Type == FieldJSON || field.Type == FieldModel {
+			return 0, nil
+		}
+		prefix := len(field.JSONPrefix)
+		if prefix > limit-rowSize-2 {
+			return 0, errJSONSizeOverflow
+		}
+		rowSize += prefix + 2
+	}
+	if len(columns) == 0 {
+		rowSize = 3
+	}
+	if count > (limit-1)/rowSize {
+		return 0, errJSONSizeOverflow
+	}
+	return count*rowSize + 1, nil
 }
 
 // readColumn reads a column's values into a typedColumn using the field's type info.

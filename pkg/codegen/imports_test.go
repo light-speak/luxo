@@ -90,6 +90,24 @@ func TestGeneratedImportsIgnoreLiteralPackageNames(t *testing.T) {
 	}
 }
 
+func TestHandlerStringUtilityImports(t *testing.T) {
+	for _, sample := range []struct{ source, path string }{
+		{`str.Matches("b", value)`, "github.com/light-speak/luxo/pkg/lux/str"},
+		{`convert.StringToInt(value)`, "github.com/light-speak/luxo/pkg/lux/convert"},
+	} {
+		var out strings.Builder
+		writeHandlerImports(&out, &semantic.Result{}, nil, handlerFeatures{}, false, sample.source)
+		if !strings.Contains(out.String(), strconv.Quote(sample.path)) {
+			t.Fatalf("missing import %s: %s", sample.path, out.String())
+		}
+		out.Reset()
+		writeHandlerImports(&out, &semantic.Result{}, nil, handlerFeatures{}, false, strconv.Quote(sample.source))
+		if strings.Contains(out.String(), strconv.Quote(sample.path)) {
+			t.Fatalf("literal added unused import: %s", out.String())
+		}
+	}
+}
+
 func TestBodyContainsAwaitRecurses(t *testing.T) {
 	await := &ast.AwaitExpr{Body: &ast.Block{}}
 	for _, statement := range []ast.Stmt{
@@ -136,6 +154,19 @@ func TestGeneratedPackagesLexicalBoundaries(t *testing.T) {
 	}
 	if allocs := testing.AllocsPerRun(100, func() { generatedPackages(`selection.Field; "codec.NewEncoder"`) }); allocs != 0 {
 		t.Fatalf("scan allocated %v times", allocs)
+	}
+}
+
+func TestGeneratedContextImport(t *testing.T) {
+	for source, want := range map[string]bool{
+		`context.Context`:                       true,
+		`context /* boundary */ . Background()`: true,
+		`"context.Context"`:                     false,
+		`object.context.Context`:                false,
+	} {
+		if got := generatedPackages(source).has("context"); got != want {
+			t.Fatalf("context import for %q = %v, want %v", source, got, want)
+		}
 	}
 }
 

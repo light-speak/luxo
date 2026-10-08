@@ -155,31 +155,57 @@ func appendOrderBy(b *strings.Builder, orderBy []string) {
 	b.WriteString(strings.Join(orderBy, ", "))
 }
 
-// GroupAgg represents a single aggregation in a GROUP BY query.
+// GroupAgg represents one explicitly selected column in a GROUP BY query.
 type GroupAgg struct {
-	Fn    string // "SUM", "AVG", "COUNT", "MAX", "MIN"
+	Fn    string // "SUM", "AVG", "COUNT", "MAX", "MIN", or empty for a grouping key
 	Col   string // column to aggregate, empty for COUNT(*)
 	Alias string // result alias in output
 }
 
-// BuildGroupBySQL builds a GROUP BY query with multiple aggregations.
-// SELECT groupCols..., AGG(col) AS alias, ... FROM table WHERE ... GROUP BY groupCols... ORDER BY ...
-func BuildGroupBySQL(table string, groupCols []string, aggs []GroupAgg, conds []Condition, orderBy []string, limit int) (string, []any) {
+// SQLExpression shares aggregate spelling between SELECT and checked HAVING.
+// Column/function identifiers must originate from the trusted schema, not input.
+func (a GroupAgg) SQLExpression() string {
+	var b strings.Builder
+	appendGroupExpression(&b, a)
+	return b.String()
+}
+
+func appendGroupExpression(b *strings.Builder, agg GroupAgg) {
+	if agg.Fn == "" {
+		b.WriteString(agg.Col)
+		return
+	}
+	if agg.Col == "" {
+		b.WriteString(agg.Fn)
+		b.WriteString("(*)")
+		return
+	}
+	coalesce := agg.Fn == "SUM" || agg.Fn == "AVG"
+	if coalesce {
+		b.WriteString("COALESCE(")
+	}
+	b.WriteString(agg.Fn)
+	b.WriteByte('(')
+	b.WriteString(agg.Col)
+	b.WriteByte(')')
+	if coalesce {
+		b.WriteString(", 0)")
+	}
+}
+
+// BuildGroupBySQL selects only the requested columns, in projection order.
+// Grouping keys need not be returned, and may be renamed by the projection.
+func BuildGroupBySQL(table string, groupCols []string, aggs []GroupAgg, conds []Condition, orderBy []string, limit, offset int, having ...Condition) (string, []any) {
 	var b strings.Builder
 	var args []any
 	argIdx := 1
 
 	b.WriteString("SELECT ")
-	b.WriteString(strings.Join(groupCols, ", "))
-	for _, agg := range aggs {
-		b.WriteString(", ")
-		if agg.Col == "" {
-			fmt.Fprintf(&b, "%s(*)", agg.Fn)
-		} else if agg.Fn == "SUM" || agg.Fn == "AVG" {
-			fmt.Fprintf(&b, "COALESCE(%s(%s), 0)", agg.Fn, agg.Col)
-		} else {
-			fmt.Fprintf(&b, "%s(%s)", agg.Fn, agg.Col)
+	for i, agg := range aggs {
+		if i > 0 {
+			b.WriteString(", ")
 		}
+		appendGroupExpression(&b, agg)
 		if agg.Alias != "" {
 			b.WriteString(" AS ")
 			b.WriteString(agg.Alias)
@@ -190,8 +216,16 @@ func BuildGroupBySQL(table string, groupCols []string, aggs []GroupAgg, conds []
 	argIdx, args = appendWhere(&b, argIdx, args, conds)
 	b.WriteString(" GROUP BY ")
 	b.WriteString(strings.Join(groupCols, ", "))
+	if len(having) != 0 {
+		group := conditionGroup{operator: " AND ", emptySQL: "TRUE", conditions: having}
+		fragment, values := group.ToSQL(argIdx)
+		b.WriteString(" HAVING ")
+		b.WriteString(fragment)
+		args = append(args, values...)
+		argIdx += len(values)
+	}
 	appendOrderBy(&b, orderBy)
-	appendLimitOffset(&b, &argIdx, &args, limit, 0)
+	appendLimitOffset(&b, &argIdx, &args, limit, offset)
 
 	return b.String(), args
 }

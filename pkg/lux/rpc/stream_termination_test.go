@@ -8,13 +8,138 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/api"
 	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/light-speak/luxo/pkg/lux/schema"
 )
+
+func TestPreparedStreamBusinessErrorBeforeACK(t *testing.T) {
+	router := api.NewRouter()
+	router.Schema.RegisterAPI(&schema.API{ID: 1, Name: "watch", Stream: true, ReturnType: "Int"})
+	router.Registry.RegisterSchemaAPIs(router.Schema)
+	router.HandleStreamPrepared("watch", func(context.Context, *api.Request, any) (api.PreparedStreamHandler, error) {
+		return nil, fmt.Errorf("prepare: %w", luxerrors.New("PrecisionRejected", 422, "error.precision").WithData(rpcPrecisionData{}))
+	})
+	client := NewClient(startTestRPCServer(t, NewServer(router)))
+	defer client.Close()
+	sub, err := client.SubscribeContext(t.Context(), "", 1, nil, nil)
+	if sub != nil {
+		sub.Close()
+		t.Fatal("failed preparation acknowledged a subscription")
+	}
+	requireRPCPrecisionData(t, err)
+	if router.Streams.SubCount("watch") != 0 {
+		t.Fatal("failed preparation retained a subscription")
+	}
+}
+
+func TestRPCPreparedStreamACKFailureDoesNotStartHandler(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		router := api.NewRouter()
+		router.Schema.RegisterAPI(&schema.API{ID: 1, Name: "watch", Stream: true, ReturnType: "Int"})
+		router.Registry.RegisterSchemaAPIs(router.Schema)
+		var started atomic.Int32
+		router.HandleStreamPrepared("watch", func(context.Context, *api.Request, any) (api.PreparedStreamHandler, error) {
+			return func(context.Context, *api.Stream) error { started.Add(1); return nil }, nil
+		})
+		serverConn, clientConn := net.Pipe()
+		defer serverConn.Close()
+		clientConn.Close()
+		NewServer(router).processStream(serverConn, requestEnvelope{body: []byte{1, 0, 0}})
+		synctest.Wait()
+		if started.Load() != 0 || router.Streams.SubCount("watch") != 0 {
+			t.Fatal("failed RPC ACK started or retained a subscription")
+		}
+	})
+}
+
+func TestPreparedStreamUnexpectedFailureIsInternal(t *testing.T) {
+	router := api.NewRouter()
+	router.Schema.RegisterAPI(&schema.API{ID: 1, Name: "watch", Stream: true, ReturnType: "Int"})
+	router.Registry.RegisterSchemaAPIs(router.Schema)
+	router.HandleStreamPrepared("watch", func(context.Context, *api.Request, any) (api.PreparedStreamHandler, error) {
+		return nil, errors.New("private preparation detail")
+	})
+	client := NewClient(startTestRPCServer(t, NewServer(router)))
+	defer client.Close()
+	sub, err := client.SubscribeContext(t.Context(), "", 1, nil, nil)
+	if sub != nil {
+		sub.Close()
+		t.Fatal("unexpected preparation failure acknowledged")
+	}
+	appErr, ok := errors.AsType[*luxerrors.AppError](err)
+	if !ok || appErr.Code != 500 || !appErr.Internal || appErr.Message != "error.internal" || appErr.Data != nil {
+		t.Fatalf("unexpected failure was not sanitized: %+v", err)
+	}
+}
+
+func TestRPCStreamPanicIsolation(t *testing.T) {
+	for _, beforeACK := range []bool{false, true} {
+		t.Run(fmt.Sprintf("beforeACK=%t", beforeACK), func(t *testing.T) {
+			router, contexts := newStreamIsolationRouter(t)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			registerPanicStream(t, router, beforeACK)
+			client := NewClient(startTestRPCServer(t, NewServer(router)))
+			t.Cleanup(client.Close)
+			other := openIsolationStream(t, ctx, client)
+			otherContext := <-contexts
+			sub, err := client.SubscribeContext(ctx, "", 3, nil, nil)
+			if beforeACK {
+				if sub != nil {
+					sub.Close()
+					t.Fatal("preparation panic acknowledged")
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer sub.Close()
+				requireStreamPayload(t, ctx, sub, 42)
+				if _, open := <-sub.Messages(); open {
+					t.Fatal("panic did not close data")
+				}
+				err = sub.Err()
+			}
+			appErr, ok := errors.AsType[*luxerrors.AppError](err)
+			if !ok || appErr.Code != 500 || appErr.Message != "error.internal" || appErr.Data != nil {
+				t.Fatalf("unsanitized terminal error: %v", err)
+			}
+			if otherContext.Err() != nil || router.Streams.SubCount("panicWatch") != 0 {
+				t.Fatal("panic isolation failed")
+			}
+			router.Streams.DispatchEncoded("watch", []byte{99}, nil)
+			requireStreamPayload(t, ctx, other, 99)
+			requirePooledPing(t, ctx, client)
+		})
+	}
+}
+
+func registerPanicStream(t *testing.T, router *api.Router, beforeACK bool) {
+	t.Helper()
+	if err := router.Schema.RegisterAPI(&schema.API{ID: 3, Name: "panicWatch", Stream: true, ReturnType: "Int"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Registry.RegisterSchemaAPIs(router.Schema); err != nil {
+		t.Fatal(err)
+	}
+	router.HandleStreamPrepared("panicWatch", func(context.Context, *api.Request, any) (api.PreparedStreamHandler, error) {
+		if beforeACK {
+			panic("private-prepare-details")
+		}
+		return func(_ context.Context, stream *api.Stream) error {
+			if err := stream.Send([]byte{42}); err != nil {
+				return err
+			}
+			panic("private-producer-details")
+		}, nil
+	})
+}
 
 func TestNativeStreamNormalCompletionDrainsMessages(t *testing.T) {
 	router := api.NewRouter()
@@ -58,6 +183,14 @@ func TestNativeStreamNormalCompletionDrainsMessages(t *testing.T) {
 
 func newStreamIsolationClient(t *testing.T) (*Client, *api.Router, <-chan context.Context) {
 	t.Helper()
+	router, contexts := newStreamIsolationRouter(t)
+	client := NewClient(startTestRPCServer(t, NewServer(router)))
+	t.Cleanup(client.Close)
+	return client, router, contexts
+}
+
+func newStreamIsolationRouter(t *testing.T) (*api.Router, <-chan context.Context) {
+	t.Helper()
 	router := api.NewRouter()
 	router.Registry.Register("watch", 1)
 	router.Registry.RegisterParams("watch", nil)
@@ -76,9 +209,7 @@ func newStreamIsolationClient(t *testing.T) (*Client, *api.Router, <-chan contex
 		req.Buf.B = append(req.Buf.B, 0, 84)
 		return nil
 	})
-	client := NewClient(startTestRPCServer(t, NewServer(router)))
-	t.Cleanup(client.Close)
-	return client, router, contexts
+	return router, contexts
 }
 
 func TestRPCStreamCancellationKeepsOtherStreamsAndPooledCalls(t *testing.T) {
@@ -284,7 +415,7 @@ func TestRPCStreamSetupFailureReleasesSubscription(t *testing.T) {
 				envelope.token = "unverified"
 			}
 			if scenario == "ack-write" {
-				router.Schema.RegisterAPI(&schema.API{Name: "watch", Stream: true})
+				router.Schema.RegisterAPI(&schema.API{ID: 1, Name: "watch", Stream: true})
 				conn.writer = &errWriter{}
 			}
 			NewServer(router).processStream(conn, envelope)
@@ -317,7 +448,7 @@ func (*streamFailingWriter) Write([]byte) (int, error) { return 0, io.ErrClosedP
 
 func TestRPCStreamStopsAfterDataWriteFailure(t *testing.T) {
 	router := api.NewRouter()
-	router.Schema.RegisterAPI(&schema.API{Name: "watch", Stream: true})
+	router.Schema.RegisterAPI(&schema.API{ID: 1, Name: "watch", Stream: true})
 	stream, err := router.OpenInternalStream(t.Context(), &api.Request{API: "watch"})
 	if err != nil {
 		t.Fatal(err)

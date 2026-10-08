@@ -10,6 +10,14 @@ type generatedImports uint32
 
 func (imports generatedImports) has(name string) bool { return imports&generatedPackageBit(name) != 0 }
 
+func writeStringUtilityImports(b *strings.Builder, packages generatedImports) {
+	for _, name := range []string{"str", "convert"} {
+		if packages.has(name) {
+			fmt.Fprintf(b, "\t\"github.com/light-speak/luxo/pkg/lux/%s\"\n", name)
+		}
+	}
+}
+
 // writeScalarTypeImports shares value-type imports across emitted signatures.
 func writeScalarTypeImports(b *strings.Builder, body string) {
 	wanted := generatedPackageBit("json") | generatedPackageBit("time") |
@@ -131,6 +139,16 @@ func generatedPackageBit(name string) generatedImports {
 		return 1 << 15
 	case "luxolog":
 		return 1 << 16
+	case "bytes":
+		return 1 << 17
+	case "jsonutil":
+		return 1 << 18
+	case "str":
+		return 1 << 19
+	case "convert":
+		return 1 << 20
+	case "context":
+		return 1 << 21
 	default:
 		return 0
 	}

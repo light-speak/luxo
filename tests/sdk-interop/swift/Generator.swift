@@ -20,7 +20,8 @@ struct LuxoInteropGenerator {
         let consumer = scratch.appendingPathComponent("swift-consumer", isDirectory: true)
         let sources = consumer.appendingPathComponent("Sources/GoConsumer", isDirectory: true)
         let generator = try LuxoCodegen(
-            endpoint: endpoint, introspectionKey: try required("LUXO_INTROSPECTION_KEY", in: environment))
+            endpoint: environment["LUXO_INTEROP_SCHEMA_ENDPOINT"] ?? endpoint,
+            introspectionKey: try required("LUXO_INTROSPECTION_KEY", in: environment))
         try await generator.generate(outputDir: sources.path)
         guard let fixture = Bundle.module.url(forResource: "Consumer.swift", withExtension: "txt") else {
             throw failure("missing generated-consumer fixture")
@@ -28,8 +29,12 @@ struct LuxoInteropGenerator {
         try FileManager.default.copyItem(at: fixture, to: sources.appendingPathComponent("Main.swift"))
         try manifest(sdkPath: sdkPath).write(
             to: consumer.appendingPathComponent("Package.swift"), atomically: true, encoding: .utf8)
+        let lock = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .appendingPathComponent("Package.resolved")
+        try FileManager.default.copyItem(at: lock, to: consumer.appendingPathComponent("Package.resolved"))
         try runSwift([
-            "run", "--package-path", consumer.path, "--scratch-path", consumer.appendingPathComponent(".build").path,
+            "run", "--disable-automatic-resolution", "--package-path", consumer.path,
+            "--scratch-path", consumer.appendingPathComponent(".build").path,
             "-Xswiftc", "-warnings-as-errors", "-Xswiftc", "-strict-concurrency=complete",
             "-Xswiftc", "-enable-testing", "GoConsumer",
         ])
@@ -42,7 +47,7 @@ struct LuxoInteropGenerator {
         let package = Package(
             name: "GoConsumer", platforms: [.macOS(.v13)],
             dependencies: [.package(name: "LuxoSDK", path: \(String(reflecting: sdkPath)))],
-            targets: [.executableTarget(name: "GoConsumer", dependencies: [.product(name: "LuxoClient", package: "LuxoSDK")])]
+            targets: [.executableTarget(name: "GoConsumer", dependencies: [.product(name: "LuxoClient", package: "LuxoSDK")], exclude: ["LuxoSelection.json"])]
         )
         """
     }

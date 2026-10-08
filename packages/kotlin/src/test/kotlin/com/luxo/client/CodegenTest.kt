@@ -14,16 +14,92 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class CodegenTest {
+    @Test
+    fun `output getters and APIs carry static selection markers without runtime hint fallback`() {
+        val schema = LuxoSchema(
+            models = mapOf("User" to LuxoModel("User", fields = listOf(LuxoField(1, "id", "Int")))),
+            apis = mapOf("getUser" to LuxoAPI(1, "getUser", "user", returnType = "User")),
+        )
+        assertContains(LuxoCodegen.genTypes(schema, "probe"), "@get:LuxoSelectionField(\"id\")")
+        val client = LuxoCodegen.genClient(schema, "probe")
+        assertContains(client, "@LuxoSelection")
+        assertFalse(client.contains("hint("))
+        assertFalse(client.contains("SelectHints"))
+    }
+
+    @Test
+    fun `stable numbering rejects invalid and duplicate IDs before writing`() {
+        for (target in listOf("models", "types", "apis", "params")) {
+            val maximum = when (target) { "apis" -> 2147483647L; "params" -> 2147483645L; else -> 65535L }
+            for (id in listOf(0L, -1L, maximum + 1)) {
+                rejectNumberedSchema(numberedSchema(target, id), id <= Int.MAX_VALUE)
+            }
+            rejectNumberedSchema(numberedSchema(target, 1, duplicate = true), true)
+        }
+    }
+
+    @Test
+    fun `stable numbering preserves legal sparse maxima`() {
+        for ((target, id) in listOf("models" to 65535L, "types" to 65535L,
+            "apis" to 2147483647L, "params" to 2147483645L)) {
+            withIntrospection(numberedSchema(target, id)) { endpoint, root ->
+                LuxoCodegen.generate(endpoint, "test-key", File(root, "generated").path)
+                assertContains(File(root, "generated/Schema.kt").readText(), id.toString())
+            }
+        }
+    }
+
+    private fun rejectNumberedSchema(body: ByteArray, checkMessage: Boolean) {
+        withIntrospection(body) { endpoint, root ->
+            val output = File(root, "generated").also { it.mkdirs() }
+            File(output, "Types.kt").writeText("existing client")
+            val snapshot = File(root, "schema.json").also { it.writeText("existing schema") }
+            val error = assertFailsWith<RuntimeException> {
+                LuxoCodegen.generate(endpoint, "test-key", output.path, "example", snapshot.path)
+            }
+            if (checkMessage) assertContains(error.message.orEmpty(), "ID")
+            assertEquals("existing client", File(output, "Types.kt").readText())
+            assertEquals("existing schema", snapshot.readText())
+            assertEquals(setOf("Types.kt"), output.list()?.toSet())
+        }
+    }
+
+    private fun numberedSchema(target: String, id: Long, duplicate: Boolean = false): ByteArray {
+        val field = """{"id":$id,"name":"value","type":"Int"}"""
+        val fields = "[$field" + (if (duplicate) "," + field.replace("value", "other") else "") + "]"
+        val apiID = if (target == "apis") id else 1
+        val params = if (target == "params") ",\"params\":$fields" else ""
+        val api = """{"id":$apiID,"name":"read","module":"test","returnType":"Int"$params}"""
+        val apis = """"apis":{"read":$api""" +
+            (if (target == "apis" && duplicate) ",\"other\":" + api.replace("read", "other") else "") + "}"
+        val models = if (target == "models" || target == "types")
+            ""","$target":{"Payload":{"name":"Payload","fields":$fields}}""" else ""
+        return "{$apis$models}".toByteArray()
+    }
+
+    @Test
+    fun internalRoutesUseExplicitMetadataInsteadOfNames() {
+        val fixture = Json.decodeFromString<LuxoSchema>("""
+            {"models":{},"apis":{
+                "ping":{"id":1,"name":"ping","module":"test","returnType":"Int","internal":false},
+                "privateOperation":{"id":2,"name":"privateOperation","module":"test","returnType":"Int","internal":true}
+            }}
+        """.trimIndent())
+        for (source in listOf(LuxoCodegen.genClient(fixture, "test"), LuxoCodegen.genSchemaMap(fixture, "test"))) {
+            assertContains(source, "ping")
+            assertFalse(source.contains("privateOperation"))
+        }
+    }
 
     @Test
     fun enumArraysUseScalarReadersInRowsAndColumns() {
         val fixture = LuxoSchema(models = mapOf("EnumRecord" to LuxoModel(
             name = "EnumRecord", usage = TypeUsage.OUTPUT,
-            fields = listOf(LuxoField(1, "states", "Enum", nullable = true, isList = true)),
-        )))
+            fields = listOf(LuxoField(1, "states", "Enum", typeName = "State", nullable = true, isList = true)),
+        )), enums = mapOf("State" to LuxoEnum("State", listOf("OPEN"))))
         val generated = LuxoCodegen.genTypes(fixture, "com.example")
-        assertContains(generated, "if (dec.readBool()) dec.readArray { dec.readString() } else null")
-        assertContains(generated, "cell.readArray { cell.readString() }")
+        assertContains(generated, "if (dec.readBool()) dec.readArray { State.fromValue(dec.readString()) } else null")
+        assertContains(generated, "cell.readArray { State.fromValue(cell.readString()) }")
     }
 
     @Test
@@ -145,7 +221,7 @@ class CodegenTest {
                     assertEquals(document, snapshot.readText())
                     assertEquals(description, Json.decodeFromString<LuxoSchema>(snapshot.readText()).apis.getValue("echo").description)
                     assertEquals(LuxoCodegen.genClient(expected, "example"), File(output, "LuxoClient.kt").readText())
-                    assertEquals(setOf("Types.kt", "Schema.kt", "LuxoClient.kt", "SelectHints.kt"), output.list()?.toSet())
+                    assertEquals(setOf("Types.kt", "Schema.kt", "LuxoClient.kt", "Queries.kt"), output.list()?.toSet())
                 }
             }
         }
@@ -195,6 +271,33 @@ class CodegenTest {
                 }
                 assertContains(error.message.orEmpty(), if (status == 200) "invalid JSON" else "HTTP 503")
                 assertTrue(root.list().orEmpty().isEmpty())
+            }
+        }
+    }
+
+    @Test
+    fun `invalid enum metadata preserves existing generated files and snapshot`() {
+        val invalid = schema.copy(types = mapOf("Broken" to LuxoTypeDecl("Broken",
+            fields = listOf(LuxoField(1, "state", "Enum", typeName = "Missing")))))
+        val body = Json.encodeToString(LuxoSchema.serializer(), invalid).toByteArray()
+        for (existing in listOf(false, true)) withIntrospection(body) { endpoint, root ->
+            val output = File(root, "generated")
+            val snapshot = File(root, "schema.json")
+            if (existing) {
+                output.mkdirs()
+                File(output, "Types.kt").writeText("existing client")
+                snapshot.writeText("existing schema")
+            }
+            assertFailsWith<IllegalArgumentException> {
+                LuxoCodegen.generate(endpoint, "test-key", output.path, "example", snapshot.path)
+            }
+            if (existing) {
+                assertEquals("existing client", File(output, "Types.kt").readText())
+                assertEquals("existing schema", snapshot.readText())
+                assertEquals(setOf("Types.kt"), output.list()?.toSet())
+            } else {
+                assertFalse(output.exists())
+                assertFalse(snapshot.exists())
             }
         }
     }
@@ -258,11 +361,12 @@ class CodegenTest {
 		assertContains(wireSchema, "SelectionFieldSchema(1, type = \"String\"")
         assertContains(client, "note: String?")
         assertContains(client, "caption: LuxoOptional<String> = LuxoOptional.Absent")
-        assertContains(client, "is LuxoOptional.Present -> callParams[\"caption\"] = caption.value")
+        assertContains(client, "is LuxoOptional.Present) put(\"caption\"")
         assertContains(client, "filters: List<LuxoFilter>? = null")
-        assertContains(client, "callParams[\"\\\$filters\"] = filters.map")
+        assertContains(client, "override val filters: List<LuxoFilter>?")
         assertContains(client, "suspend fun subscribeWatchPayload(projectId: Long, select: String? = null, observer: StreamObserver? = null, onData: (Payload) -> Unit): () -> Unit")
-        assertContains(client, "transport.subscribe(\"watchPayload\", { data -> decode_watchPayload(data) }, callParams, observer, onData)")
+        assertContains(client, "transport.subscribe(\"watchPayload\", { data -> decode_watchPayload(data) }, _watchPayloadRequest(projectId, select), observer, onData)")
+        assertFalse(client.contains("mutableMapOf<String, Any?>"))
         assertFalse(client.contains("onData(decode_watchPayload(data))"))
         assertContains(client, "endpoint.startsWith(\"ws://\") || endpoint.startsWith(\"wss://\")")
         assertContains(client, "LuxoWebSocket(endpoint, token = token)")

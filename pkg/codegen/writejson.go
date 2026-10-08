@@ -64,7 +64,12 @@ func (g *GeneratorContext) generateWriteJSONFile(result *semantic.Result, packag
 			importDecls = append(importDecls, &ast.ModelDecl{Name: t.Name, Fields: t.Fields})
 		}
 	}
-	writeWriteJSONImports(&b, importDecls)
+	var input strings.Builder
+	for _, declaration := range importDecls {
+		g.generateReadJSONInput(&input, declaration, enums)
+	}
+	writeWriteJSONImports(&b, importDecls, generatedPackages(input.String()))
+	b.WriteString(input.String())
 
 	for _, m := range models {
 		g.generateWriteLuxo(&b, m, enums, modelNames)
@@ -158,14 +163,19 @@ func scanWriteJSONImports(m *ast.ModelDecl, needs *writeJSONImportNeeds) {
 	}
 }
 
-func writeWriteJSONImports(b *strings.Builder, declarations []*ast.ModelDecl) {
+func writeWriteJSONImports(b *strings.Builder, declarations []*ast.ModelDecl, inputImports generatedImports) {
 	var needs writeJSONImportNeeds
 	for _, m := range declarations {
 		scanWriteJSONImports(m, &needs)
 	}
 
 	b.WriteString("import (\n")
-	if needs.json {
+	for _, name := range []string{"bytes", "fmt"} {
+		if inputImports.has(name) {
+			fmt.Fprintf(b, "\t%q\n", name)
+		}
+	}
+	if needs.json || inputImports.has("json") {
 		b.WriteString("\t\"encoding/json\"\n")
 	}
 	if needs.strings {
@@ -176,6 +186,9 @@ func writeWriteJSONImports(b *strings.Builder, declarations []*ast.ModelDecl) {
 	}
 	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
+	if inputImports.has("jsonutil") {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/jsonutil\"\n")
+	}
 	if needs.str {
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/str\"\n")
 	}
@@ -460,13 +473,13 @@ func writeModelFieldEncoding(b *strings.Builder, f *ast.FieldDecl, fid, goField 
 			fmt.Fprintf(b, "%sbuf.B = codec.AppendVarint(buf.B, %s)\n", indent, fid)
 			fmt.Fprintf(b, "%sif %s != nil {\n", indent, goField)
 			fmt.Fprintf(b, "%s\tbuf.B = codec.AppendPresent(buf.B)\n", indent)
-			writeBinaryAppend(b, indent+"\t", "buf.B", fmt.Sprintf("codec.AppendString(buf.B, string(*%s))", goField), "return err")
+			writeBinaryAppend(b, indent+"\t", "buf.B", enumAppendExpression(f.Type.Name, "buf.B", "*"+goField), "return err")
 			fmt.Fprintf(b, "%s} else {\n", indent)
 			fmt.Fprintf(b, "%s\tbuf.B = codec.AppendNull(buf.B)\n", indent)
 			fmt.Fprintf(b, "%s}\n", indent)
 		} else {
 			fmt.Fprintf(b, "%sbuf.B = codec.AppendVarint(buf.B, %s)\n", indent, fid)
-			writeBinaryAppend(b, indent, "buf.B", fmt.Sprintf("codec.AppendString(buf.B, string(%s))", goField), "return err")
+			writeBinaryAppend(b, indent, "buf.B", enumAppendExpression(f.Type.Name, "buf.B", goField), "return err")
 		}
 		return
 	}
@@ -475,39 +488,28 @@ func writeModelFieldEncoding(b *strings.Builder, f *ast.FieldDecl, fid, goField 
 
 // writeScalarEncoding writes binary encoding for a scalar type, handling nullable.
 func writeScalarEncoding(b *strings.Builder, typeName string, nullable bool, fid, goField, indent string) {
-	type encSpec struct {
-		appendFn string // e.g. "AppendSvarint", "AppendFixed64"
-		valExpr  string // e.g. "%s", "int64(%s)"
-		ptrExpr  string // e.g. "*%s", "int64(*%s)"
+	value := goField
+	if nullable && typeName != "Decimal" {
+		value = "*" + value
 	}
-	specs := map[string]encSpec{
-		"Int":      {"AppendSvarint", "%s", "*%s"},
-		"DateTime": {"AppendDateTime", "%s", "*%s"},
-		"Duration": {"AppendSvarint", "int64(%s)", "int64(*%s)"},
-		"Float":    {"AppendFixed64", "%s", "*%s"},
-		"String":   {"AppendString", "%s", "*%s"},
-		"Boolean":  {"AppendBool", "%s", "*%s"},
-		"UUID":     {"AppendUUID", "[16]byte(%s)", "[16]byte(*%s)"},
-		"Decimal":  {"AppendString", "%s.String()", "%s.String()"},
-		"Bytes":    {"AppendBytes", "%s", "*%s"},
-		"JSON":     {"AppendJSON", "%s", "*%s"},
+	if typeName == "UUID" {
+		value = "[16]byte(" + value + ")"
 	}
-
-	if spec, ok := specs[typeName]; ok {
-		if nullable {
-			fmt.Fprintf(b, "%sbuf.B = codec.AppendVarint(buf.B, %s)\n", indent, fid)
-			fmt.Fprintf(b, "%sif %s != nil {\n", indent, goField)
-			fmt.Fprintf(b, "%s\tbuf.B = codec.AppendPresent(buf.B)\n", indent)
-			writeBinaryAppend(b, indent+"\t", "buf.B", fmt.Sprintf("codec.%s(buf.B, %s)", spec.appendFn, fmt.Sprintf(spec.ptrExpr, goField)), "return err")
-			fmt.Fprintf(b, "%s} else {\n", indent)
-			fmt.Fprintf(b, "%s\tbuf.B = codec.AppendNull(buf.B)\n", indent)
-			fmt.Fprintf(b, "%s}\n", indent)
-		} else {
-			fmt.Fprintf(b, "%sbuf.B = codec.AppendVarint(buf.B, %s)\n", indent, fid)
-			writeBinaryAppend(b, indent, "buf.B", fmt.Sprintf("codec.%s(buf.B, %s)", spec.appendFn, fmt.Sprintf(spec.valExpr, goField)), "return err")
-		}
+	expression, ok := binaryScalarAppend(typeName, "buf.B", value, false)
+	if !ok {
 		return
 	}
+	fmt.Fprintf(b, "%sbuf.B = codec.AppendVarint(buf.B, %s)\n", indent, fid)
+	if !nullable {
+		writeBinaryAppend(b, indent, "buf.B", expression, "return err")
+		return
+	}
+	fmt.Fprintf(b, "%sif %s != nil {\n", indent, goField)
+	fmt.Fprintf(b, "%s\tbuf.B = codec.AppendPresent(buf.B)\n", indent)
+	writeBinaryAppend(b, indent+"\t", "buf.B", expression, "return err")
+	fmt.Fprintf(b, "%s} else {\n", indent)
+	fmt.Fprintf(b, "%s\tbuf.B = codec.AppendNull(buf.B)\n", indent)
+	fmt.Fprintf(b, "%s}\n", indent)
 }
 
 // generateWriteLuxoAllFields generates the nil-mask fast path for the default
@@ -630,7 +632,7 @@ func writeScalarArrayItems(b *strings.Builder, elemType string, isEnum bool, goF
 // Share the scalar conversion for row arrays and columnar array cells.
 func scalarArrayItemEncoding(elemType string, isEnum bool, buffer string) string {
 	if isEnum {
-		return fmt.Sprintf("codec.AppendString(%s, string(v))", buffer)
+		return enumAppendExpression(elemType, buffer, "v")
 	}
 	var method, value string
 	switch elemType {
@@ -669,9 +671,6 @@ func (g *GeneratorContext) hasArenaFields(m *ast.ModelDecl, enums map[string]boo
 	for _, f := range m.Fields {
 		if isArenaField(f, enums) {
 			if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
-				continue
-			}
-			if isRelationField(f, enums) {
 				continue
 			}
 			if g.modelFieldID(m.Name, f.Name) == 0 {

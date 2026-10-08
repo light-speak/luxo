@@ -9,6 +9,34 @@ import (
 	"github.com/light-speak/luxo/pkg/token"
 )
 
+func TestEventFieldWritersLeaveIncompleteFieldsUnchanged(t *testing.T) {
+	for _, field := range []struct {
+		id    int
+		param *ast.ParamDecl
+	}{
+		{0, &ast.ParamDecl{Name: "value", Type: &ast.TypeRef{Name: "Int"}}},
+		{1, &ast.ParamDecl{Name: "value"}},
+	} {
+		var output strings.Builder
+		output.WriteString("prefix")
+		writeEventMarshalField(&output, field.id, field.param, false, false)
+		writeEventUnmarshalField(&output, field.id, field.param, false, false, false)
+		if output.String() != "prefix" {
+			t.Fatalf("incomplete field emitted partial source: %q", output.String())
+		}
+	}
+}
+
+func TestCrossModuleEventImportsIgnoreBodylessAPI(t *testing.T) {
+	g := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
+		EventModule: map[string]string{"Created": "owner"},
+	}})
+	result := &semantic.Result{Files: []*ast.File{{APIs: []*ast.ApiDecl{{Name: "listUsers"}}}}}
+	if imports := g.collectCrossModuleEventImports(result, nil, "consumer"); len(imports) != 0 {
+		t.Fatalf("bodyless API imported event owners: %v", imports)
+	}
+}
+
 func TestGenerateEventFileNoEvents(t *testing.T) {
 	result := &semantic.Result{Files: []*ast.File{{Name: "test.luxo"}}}
 	src := generateEventFile(result, "luxo")
@@ -82,14 +110,101 @@ func TestGeneratedEventFloatErrors(t *testing.T) {
 		{Name: "children", Type: &ast.TypeRef{Name: "FloatChild", IsList: true}},
 	}}
 	var source strings.Builder
-	source.WriteString("package generated\nimport (\"fmt\"; \"github.com/light-speak/luxo/pkg/lux/codec\"; \"github.com/light-speak/luxo/pkg/lux/api\")\n")
+	source.WriteString("package generated\nimport (\"fmt\"; \"github.com/light-speak/luxo/pkg/lux/codec\"; \"github.com/light-speak/luxo/pkg/lux/api\"; \"github.com/light-speak/luxo/pkg/lux/event\")\n")
 	generateModel(&source, child, nil)
 	generator.generateTypeWriteLuxo(&source, child, nil)
 	generator.generateReadLuxo(&source, child, nil)
+	generator.generateEventObjectCodec(&source, child.Name, child.Fields, nil, map[string]bool{"FloatChild": true})
 	generateEventStruct(&source, event)
 	generator.generateEventCodec(&source, event, nil, map[string]bool{"FloatChild": true})
 	runGeneratedProtocolPackage(t, source.String(), eventFloatAssertions)
 }
+
+func TestGeneratedEventNullableReplacement(t *testing.T) {
+	g := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+		EventFields: map[string]map[string]int{"OptionalPayload": {"amount": 1, "child": 2}},
+		ModelFields: map[string]map[string]int{"EventChild": {"value": 1}},
+	}})
+	child := &ast.ModelDecl{Name: "EventChild", Fields: []*ast.FieldDecl{{Name: "value", Type: &ast.TypeRef{Name: "Int"}}}}
+	event := &ast.EventDecl{Name: "OptionalPayload", Params: []*ast.ParamDecl{
+		{Name: "amount", Type: &ast.TypeRef{Name: "Decimal", Nullable: true}},
+		{Name: "child", Type: &ast.TypeRef{Name: "EventChild", Nullable: true}},
+	}}
+	var source strings.Builder
+	source.WriteString("package generated\nimport (\"fmt\";\"github.com/shopspring/decimal\";\"github.com/light-speak/luxo/pkg/lux/codec\";\"github.com/light-speak/luxo/pkg/lux/api\";\"github.com/light-speak/luxo/pkg/lux/event\")\n")
+	generateModel(&source, child, nil)
+	g.generateTypeWriteLuxo(&source, child, nil)
+	g.generateReadLuxo(&source, child, nil)
+	g.generateEventObjectCodec(&source, child.Name, child.Fields, nil, map[string]bool{"EventChild": true})
+	generateEventStruct(&source, event)
+	g.generateEventCodec(&source, event, nil, map[string]bool{"EventChild": true})
+	// Retain the exact pre-fix reader only inside the generated benchmark fixture.
+	var previous strings.Builder
+	generateEventStruct(&previous, event)
+	g.generateEventCodec(&previous, event, nil, map[string]bool{"EventChild": true})
+	legacy := strings.ReplaceAll(previous.String(), "OptionalPayloadEvent", "LegacyOptionalPayloadEvent")
+	legacy = strings.ReplaceAll(legacy, " else { e.Amount = nil }", "")
+	legacy = strings.ReplaceAll(legacy, " else { e.Child = nil }", "")
+	source.WriteString(legacy)
+	runGeneratedProtocolPackage(t, source.String(), eventNullableReplacementAssertions)
+}
+
+const eventNullableReplacementAssertions = `package generated
+import ("os";"slices";"testing";"github.com/shopspring/decimal";"github.com/light-speak/luxo/pkg/lux/codec")
+func TestNullableReplacement(t *testing.T) {
+    amount:=decimal.NewFromInt(42)
+    original:=OptionalPayloadEvent{Amount:&amount,Child:&EventChild{Value:42}}
+    present,err:=original.MarshalLuxo();if err!=nil {t.Fatal(err)}
+    empty,err:=(&OptionalPayloadEvent{}).MarshalLuxo();if err!=nil {t.Fatal(err)}
+    var reused OptionalPayloadEvent
+    for round:=0;round<3;round++ {
+        if err:=reused.UnmarshalLuxo(present);err!=nil {t.Fatal(err)}
+        if reused.Amount==nil || !reused.Amount.Equal(amount) || reused.Child==nil || reused.Child.Value!=42 {t.Fatalf("lost present values: %+v",reused)}
+        if err:=reused.UnmarshalLuxo(empty);err!=nil {t.Fatal(err)}
+        if reused.Amount!=nil || reused.Child!=nil {t.Fatalf("explicit null retained previous values: %+v",reused)}
+    }
+    combined:=append(append([]byte{},present[:len(present)-1]...),empty...)
+    if err:=reused.UnmarshalLuxo(combined);err!=nil {t.Fatal(err)}
+    if reused.Amount!=nil || reused.Child!=nil {t.Fatalf("last explicit null was ignored: %+v",reused)}
+    legacy:=LegacyOptionalPayloadEvent{Amount:&amount,Child:&EventChild{Value:42}}
+    if err:=legacy.UnmarshalLuxo(empty);err!=nil || legacy.Amount==nil || legacy.Child==nil {t.Fatalf("legacy reference no longer reproduces original bug: %+v %v",legacy,err)}
+}
+func TestMalformedNullableEvent(t *testing.T) {
+    var enc codec.Encoder
+    enc.WriteFieldHeader(1);enc.WritePresent()
+    if err:=enc.WriteString("not-decimal");err!=nil {t.Fatal(err)}
+    enc.WriteEnd()
+    for _,raw:=range [][]byte{enc.Bytes(),{1,2,0},{2,2,0},{2,1,127,0}} {
+        var got OptionalPayloadEvent
+        if err:=got.UnmarshalLuxo(raw);err==nil {t.Fatalf("accepted malformed nullable event: %x",raw)}
+    }
+}
+func BenchmarkEventNullable(b *testing.B) {
+    amount:=decimal.NewFromInt(42)
+    original:=OptionalPayloadEvent{Amount:&amount,Child:&EventChild{Value:42}}
+    present,err:=original.MarshalLuxo();if err!=nil {b.Fatal(err)}
+    empty,err:=(&OptionalPayloadEvent{}).MarshalLuxo();if err!=nil {b.Fatal(err)}
+    mixed:=append(append([]byte{},present[:len(present)-1]...),empty...)
+    orders:=[]string{"previous","current"}
+    if os.Getenv("LUXO_EVENT_BENCHMARK_REVERSE")=="1" {slices.Reverse(orders)}
+    for _,sample:=range []struct{name string;raw []byte;null bool}{{"present",present,false},{"null",empty,true},{"duplicate-null",mixed,true}} {
+        for _,version:=range orders {
+            b.Run(sample.name+"/"+version,func(b *testing.B) {
+                current:=original
+                previous:=LegacyOptionalPayloadEvent{Amount:&amount,Child:&EventChild{Value:42}}
+                b.ReportAllocs()
+                if version=="previous" {
+                    for b.Loop() {if err:=previous.UnmarshalLuxo(sample.raw);err!=nil {b.Fatal(err)}}
+                    if previous.Amount==nil || previous.Child==nil {b.Fatal("legacy sample changed")}
+                } else {
+                    for b.Loop() {if err:=current.UnmarshalLuxo(sample.raw);err!=nil {b.Fatal(err)}}
+                    if (current.Amount==nil)!=sample.null || (current.Child==nil)!=sample.null {b.Fatal("incorrect nullable result")}
+                }
+            })
+        }
+    }
+}
+`
 
 const eventFloatAssertions = `package generated
 import (
@@ -98,7 +213,7 @@ import (
     "testing"
     "github.com/light-speak/luxo/pkg/lux/codec"
 )
-var _ codec.LuxoMarshaler = MeasuredEvent{}
+var _ codec.LuxoMarshaler = (*MeasuredEvent)(nil)
 func TestEventFloatErrors(t *testing.T) {
     for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
         for _, event := range []MeasuredEvent{
@@ -158,13 +273,14 @@ func TestEventListenerIncludesExtendedModelContext(t *testing.T) {
 }
 
 func TestEventJSONFieldRequirement(t *testing.T) {
-	events := []*ast.EventDecl{{Params: []*ast.ParamDecl{
+	events := []*ast.EventDecl{{Name: "Changed", Params: []*ast.ParamDecl{
 		{Name: "unknown", Type: &ast.TypeRef{Name: "LegacyPayload"}},
 		{Name: "metadata", Type: &ast.TypeRef{Name: "JSON"}},
 		{Name: "items", Type: &ast.TypeRef{Name: "String", IsList: true}},
 	}}}
-	if !eventsNeedJSON(events) {
-		t.Fatal("eventsNeedJSON() = false, want true")
+	code := string(generateEventFile(result(&ast.File{Events: events}), "generated"))
+	if !strings.Contains(code, `"encoding/json"`) {
+		t.Fatal("JSON event fields require their concrete type import")
 	}
 	if !isEventBuiltin("JSON") || isEventBuiltin("LegacyPayload") {
 		t.Fatal("event builtin classification is incorrect")
@@ -184,8 +300,8 @@ func TestEventObjectCollectionAndJSONRequirements(t *testing.T) {
 	if !eventsUseObjects(events, objects) {
 		t.Fatal("type declarations must be treated as event objects")
 	}
-	if eventsNeedJSON([]*ast.EventDecl{{Params: []*ast.ParamDecl{{Name: "unknown"}}}}) {
-		t.Fatal("an unresolved event parameter must not enable a JSON fallback")
+	if eventsUseObjects([]*ast.EventDecl{{Params: []*ast.ParamDecl{{Name: "unknown"}}}}, objects) {
+		t.Fatal("an unresolved event parameter must not enable an object fallback")
 	}
 }
 
@@ -194,7 +310,7 @@ func TestEventScalarWriteStatements(t *testing.T) {
 		name, typeName, want string
 		isEnum               bool
 	}{
-		{name: "enum", typeName: "Role", isEnum: true, want: "if err := enc.WriteString(string(value)); err != nil { return nil, err }"},
+		{name: "enum", typeName: "Role", isEnum: true, want: "if !value.IsValid() { return nil, codec.ErrInvalidEnum }; if err := enc.WriteString(string(value)); err != nil { return nil, err }"},
 		{name: "int", typeName: "Int", want: "enc.WriteInt(value)"},
 		{name: "float", typeName: "Float", want: "if err := enc.WriteFloat(value); err != nil { return nil, err }"},
 		{name: "string", typeName: "String", want: "if err := enc.WriteString(value); err != nil { return nil, err }"},
@@ -258,8 +374,8 @@ func TestEventCodecDoesNotGenerateJSONFallbacks(t *testing.T) {
 	var b strings.Builder
 	generator.writeEventMarshalField(&b, "Changed", param, false, false)
 	generator.writeEventUnmarshalField(&b, "Changed", param, false, false)
-	writeEventListMarshal(&b, 2, "e.Payloads", "External", false, false)
-	writeEventListUnmarshal(&b, 2, "e.Payloads", "External", false, false)
+	writeEventListMarshal(&b, 2, "e.Payloads", &ast.TypeRef{Name: "External", IsList: true}, false, false)
+	writeEventListUnmarshal(&b, 2, "e.Payloads", &ast.TypeRef{Name: "External", IsList: true}, false, false)
 	for _, forbidden := range []string{"json.Marshal", "json.Unmarshal"} {
 		if strings.Contains(b.String(), forbidden) {
 			t.Fatalf("invalid event types must not generate reflection fallback %q:\n%s", forbidden, b.String())
@@ -272,7 +388,7 @@ func TestEventCodecNullableObjectAndDecimalWriters(t *testing.T) {
 	writeEventObjectMarshal(&b, 1, "e.Payload", true)
 	writeEventObjectUnmarshal(&b, 1, "e.Payload", &ast.TypeRef{Name: "Payload", Nullable: true})
 	writeEventDecimalUnmarshal(&b, "e.Amount", true)
-	writeEventListUnmarshal(&b, 2, "e.Amounts", "Decimal", false, false)
+	writeEventListUnmarshal(&b, 2, "e.Amounts", &ast.TypeRef{Name: "Decimal", IsList: true}, false, false)
 	for _, want := range []string{"e.Payload == nil", "enc.WritePresent()", "e.Payload = &Payload{}", "dec.ReadStringPtr()", "decimal.NewFromString(dec.ReadString())"} {
 		if !strings.Contains(b.String(), want) {
 			t.Fatalf("nullable/object codec missing %q:\n%s", want, b.String())
@@ -315,8 +431,8 @@ func TestGenerateEventFile(t *testing.T) {
 		`Order Order`,
 		`UserId int64`,
 		"func EmitOrderCreated(ctx context.Context, bus event.Bus, e OrderCreatedEvent) error",
-		`bus.Emit(ctx, "OrderCreated", e)`,
-		"func (e OrderCreatedEvent) MarshalLuxo() ([]byte, error)",
+		`bus.Emit(ctx, "OrderCreated", &e)`,
+		"func (e *OrderCreatedEvent) MarshalLuxo() ([]byte, error)",
 		"event OrderCreated: expected *OrderCreatedEvent, got %T",
 		"func RegisterEvents(bus event.Bus, app *App)",
 		`event.OnQueueDecode(bus, "OrderCreated", "test", UnmarshalOrderCreated, func(ctx context.Context, e OrderCreatedEvent)`,
@@ -540,8 +656,8 @@ func TestGenerateEventCodecComplexType(t *testing.T) {
 	src := generator.generateEventFile(result, "luxo")
 	code := string(src)
 
-	if !strings.Contains(code, "e.Data.WriteLuxo(buf, nil)") || !strings.Contains(code, "e.Data.ReadLuxo(nested)") {
-		t.Errorf("model event payload should use nested Luxo binary:\n%s", code)
+	if !strings.Contains(code, "e.Data.marshalEventSnapshot(buf.B, depth + 1)") || !strings.Contains(code, "e.Data.unmarshalEventSnapshot(raw, depth + 1)") {
+		t.Errorf("snapshot event payload should use independent Luxo binary:\n%s", code)
 	}
 	if strings.Contains(code, "json.Marshal(e.Data)") {
 		t.Errorf("model event payload must not embed JSON:\n%s", code)

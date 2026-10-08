@@ -44,6 +44,8 @@ func TestGeneratedRawJSONStream(t *testing.T) {
 
 const rawJSONAssertions = `package generated
 import (
+"github.com/light-speak/luxo/internal/testutil"
+
     "bytes"
     "encoding/json"
     "testing"
@@ -51,8 +53,8 @@ import (
     "github.com/light-speak/luxo/pkg/lux/codec"
 )
 
-func jsonMask(id int) []byte {
-    return codec.AppendSelectionMask(nil, codec.FieldMaskSet(nil, id), nil)
+func jsonMask(t testing.TB, id int) []byte {
+    return testutil.Bytes(t)(codec.AppendSelectionMask(nil, testutil.Bytes(t)(codec.FieldMaskSet(nil, id)), nil))
 }
 
 func jsonPayload(raw json.RawMessage) Payload {
@@ -69,7 +71,7 @@ func TestRawJSONWrites(t *testing.T) {
     for _, raw := range badJSONValues() {
         payload := jsonPayload(raw)
         for field := 1; field <= 6; field++ {
-            mask := jsonMask(field)
+            mask := jsonMask(t, field)
             buf := &api.ResponseBuf{}
             if err := payload.WriteLuxo(buf, mask); err == nil { t.Errorf("row field %d accepted %q", field, raw) }
             buf.B = nil
@@ -83,8 +85,8 @@ func TestRawJSONWrites(t *testing.T) {
         }
         // An unselected invalid field must not make an unrelated projection fail.
         payload.Value = []byte("null")
-        if err := payload.WriteLuxo(&api.ResponseBuf{}, jsonMask(1)); err != nil { t.Fatal(err) }
-        if err := WriteColumnarPayload(&api.ResponseBuf{}, []Payload{payload}, jsonMask(1)); err != nil { t.Fatal(err) }
+        if err := payload.WriteLuxo(&api.ResponseBuf{}, jsonMask(t, 1)); err != nil { t.Fatal(err) }
+        if err := WriteColumnarPayload(&api.ResponseBuf{}, []Payload{payload}, jsonMask(t, 1)); err != nil { t.Fatal(err) }
     }
 }
 
@@ -131,13 +133,13 @@ func TestRawJSONExactRoundtrip(t *testing.T) {
         value := jsonPayload(raw)
         for field := 1; field <= 6; field++ {
             buf := &api.ResponseBuf{}
-            if err := value.WriteLuxo(buf, jsonMask(field)); err != nil { t.Fatal(err) }
+            if err := value.WriteLuxo(buf, jsonMask(t, field)); err != nil { t.Fatal(err) }
             dec, out := codec.NewDecoder(buf.B), Payload{}
             out.ReadLuxo(dec)
             if err := dec.Finish(); err != nil { t.Fatal(err) }
             checkJSONField(t, out, field, raw)
             buf.B = nil
-            if err := WriteColumnarPayload(buf, []Payload{value}, jsonMask(field)); err != nil { t.Fatal(err) }
+            if err := WriteColumnarPayload(buf, []Payload{value}, jsonMask(t, field)); err != nil { t.Fatal(err) }
             rows, err := ReadColumnarPayload(buf.B)
             if err != nil || len(rows) != 1 { t.Fatalf("column: %v", err) }
             checkJSONField(t, rows[0], field, raw)
@@ -146,7 +148,7 @@ func TestRawJSONExactRoundtrip(t *testing.T) {
     value := Payload{}
     for _, field := range []int{2,4} {
         buf := &api.ResponseBuf{}
-        if err := value.WriteLuxo(buf, jsonMask(field)); err != nil { t.Fatal(err) }
+        if err := value.WriteLuxo(buf, jsonMask(t, field)); err != nil { t.Fatal(err) }
         out, dec := Payload{}, codec.NewDecoder(buf.B)
         out.ReadLuxo(dec)
         if err := dec.Finish(); err != nil || out.Optional != nil || out.OptionalValues != nil { t.Fatalf("null: %v", err) }
@@ -211,10 +213,10 @@ import (
     "github.com/light-speak/luxo/pkg/lux/codec"
 )
 type jsonResolver struct { raw json.RawMessage }
-func (r *jsonResolver) HandleWatchJSON(_ context.Context, _ *api.StreamParams, _ any, stream *api.TypedStream[json.RawMessage]) error {
+func (r *jsonResolver) HandleWatchJSON(_ context.Context, _ *WatchJSONStreamParams, _ any, stream *api.TypedStream[json.RawMessage]) error {
     return stream.Send(r.raw)
 }
-func (r *jsonResolver) HandleWatchJSONList(_ context.Context, _ *api.StreamParams, _ any, stream *api.TypedStream[[]json.RawMessage]) error {
+func (r *jsonResolver) HandleWatchJSONList(_ context.Context, _ *WatchJSONListStreamParams, _ any, stream *api.TypedStream[[]json.RawMessage]) error {
     return stream.Send([]json.RawMessage{[]byte("null"),r.raw})
 }
 func TestRawJSONNativeStream(t *testing.T) {
@@ -223,7 +225,7 @@ func TestRawJSONNativeStream(t *testing.T) {
         {"{\"n\":123456789012345678901234567890,\"f\":1e-9999}",true},
     } {
         router := api.NewRouter()
-        RegisterStreams(router,nil,&jsonResolver{raw:json.RawMessage(sample.raw)})
+        if err:=RegisterStreams(router,nil,&jsonResolver{raw:json.RawMessage(sample.raw)});err!=nil{t.Fatal(err)}
         for _, name := range []string{"watchJSON","watchJSONList"} {
             ctx,cancel := context.WithTimeout(t.Context(),time.Second)
             sub,err := router.OpenInternalStream(ctx,&api.Request{API:name})

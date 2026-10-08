@@ -2,6 +2,7 @@ package luvia
 
 import (
 	"math"
+	"strconv"
 	"testing"
 
 	"github.com/light-speak/luxo/internal/testutil"
@@ -23,43 +24,72 @@ func BenchmarkHistoricalGroupedResponse(b *testing.B) {
 
 var resolvedValidationResult bool
 
-func BenchmarkValidateResolvedFields(b *testing.B) {
-	for _, test := range []struct {
-		name         string
-		rows, fields int
-		list         bool
-	}{
-		{"object-2", 1, 2, false}, {"list-small-128x16", 128, 16, true}, {"list-wide-128x16", 128, 16, true},
-	} {
-		registry := schema.New()
-		model := &schema.Model{Name: "Child"}
-		for id := 1; id <= test.fields; id++ {
-			model.Fields = append(model.Fields, schema.Field{ID: id, Type: schema.FieldInt})
+type resolvedValidationCase struct {
+	name         string
+	rows, fields int
+	list         bool
+}
+
+var resolvedValidationCases = []resolvedValidationCase{
+	{"object-2", 1, 2, false}, {"list-small-128x16", 128, 16, true}, {"list-wide-128x16", 128, 16, true},
+}
+
+func resolvedValidationFixture(t testing.TB, test resolvedValidationCase) ([][]byte, ExtendStep, *schema.Schema) {
+	t.Helper()
+	registry := schema.New()
+	model := &schema.Model{Name: "Child"}
+	for id := 1; id <= test.fields; id++ {
+		model.Fields = append(model.Fields, schema.Field{ID: id, Name: "field" + strconv.Itoa(id), Type: schema.FieldInt})
+	}
+	if err := registry.RegisterModel(model); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte{0}
+	if test.list {
+		w := &codec.ColumnarWriter{}
+		w.SetCount(test.rows)
+		values := make([]int64, test.rows)
+		for i := range values {
+			values[i] = math.MaxInt64 - int64(i)
+			if test.name == "list-small-128x16" {
+				values[i] = int64(i % 32)
+			}
 		}
-		registry.RegisterModel(model)
-		body := []byte{0}
-		if test.list {
-			w := &codec.ColumnarWriter{}
-			w.SetCount(test.rows)
-			values := make([]int64, test.rows)
-			for i := range values {
-				values[i] = math.MaxInt64 - int64(i)
-				if test.name == "list-small-128x16" {
-					values[i] = int64(i % 32)
+		for id := 1; id <= test.fields; id++ {
+			w.WriteColumnInt(id, values)
+		}
+		body = testutil.Bytes(t)(w.Bytes())
+	} else {
+		for id := 1; id <= test.fields; id++ {
+			body = codec.AppendSvarint(codec.AppendVarint(body, uint64(id)), math.MaxInt64)
+		}
+		body = append(body, 0)
+	}
+	return [][]byte{codec.AppendBytes(nil, body)}, ExtendStep{ModelName: "Child", IsList: test.list}, registry
+}
+
+func TestResolvedValidationBenchmarkFixtures(t *testing.T) {
+	for _, test := range resolvedValidationCases {
+		t.Run(test.name, func(t *testing.T) {
+			values, step, registry := resolvedValidationFixture(t, test)
+			for _, validate := range []func([][]byte, ExtendStep, *schema.Schema) bool{
+				validateResolvedPerValue, ValidateResolvedFields,
+			} {
+				if !validate(values, step, registry) {
+					t.Fatal("invalid benchmark fixture")
+				}
+				truncated := [][]byte{values[0][:len(values[0])-1]}
+				if validate(truncated, step, registry) {
+					t.Fatal("truncated benchmark fixture was accepted")
 				}
 			}
-			for id := 1; id <= test.fields; id++ {
-				w.WriteColumnInt(id, values)
-			}
-			body = testutil.Bytes(b)(w.Bytes())
-		} else {
-			for id := 1; id <= test.fields; id++ {
-				body = codec.AppendSvarint(codec.AppendVarint(body, uint64(id)), math.MaxInt64)
-			}
-			body = append(body, 0)
-		}
-		values := [][]byte{codec.AppendBytes(nil, body)}
-		step := ExtendStep{ModelName: "Child", IsList: test.list}
+		})
+	}
+}
+
+func BenchmarkValidateResolvedFields(b *testing.B) {
+	for _, test := range resolvedValidationCases {
+		values, step, registry := resolvedValidationFixture(b, test)
 		for _, implementation := range []struct {
 			name     string
 			validate func([][]byte, ExtendStep, *schema.Schema) bool

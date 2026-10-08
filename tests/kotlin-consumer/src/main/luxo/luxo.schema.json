@@ -39,9 +39,17 @@
     }
   },
   "enums": {
-    "Role": {"name": "Role", "values": ["MEMBER", "ADMIN"]}
+    "Role": {"name": "Role", "values": ["MEMBER", "ADMIN"]},
+    "OtherRole": {"name": "OtherRole", "values": ["MEMBER"]},
+    "EscapedRole": {"name":"EscapedRole","values":["when","name","rawValue","entries","Known"]}
   },
   "types": {
+    "EnumRecord": {"name":"EnumRecord","usage":"inputOutput","fields":[
+      {"id":1,"name":"state","type":"Enum","typeName":"Role"},
+      {"id":2,"name":"optional","type":"Enum","typeName":"Role","nullable":true},
+      {"id":3,"name":"states","type":"Enum","typeName":"Role","isList":true},
+      {"id":4,"name":"optionalStates","type":"Enum","typeName":"Role","isList":true,"nullable":true}
+    ]},
     "ProjectionNames": {"name":"ProjectionNames","usage":"output","fields":[
       {"id":1,"name":"label","type":"String","nullable":true},
       {"id":2,"name":"labelJSON","type":"String","nullable":true},
@@ -131,10 +139,10 @@
     "watchProbeDecimal": {"id":137,"name":"watchProbeDecimal","module":"test","returnType":"Decimal","returnList":false,"stream":true},
     "probeDecimalList": {"id":138,"name":"probeDecimalList","module":"test","returnType":"Decimal","returnList":true,"stream":false},
     "watchProbeDecimalList": {"id":139,"name":"watchProbeDecimalList","module":"test","returnType":"Decimal","returnList":true,"stream":true},
-    "probeEnum": {"id":140,"name":"probeEnum","module":"test","returnType":"Enum","returnList":false,"stream":false},
-    "watchProbeEnum": {"id":141,"name":"watchProbeEnum","module":"test","returnType":"Enum","returnList":false,"stream":true},
-    "probeEnumList": {"id":142,"name":"probeEnumList","module":"test","returnType":"Enum","returnList":true,"stream":false},
-    "watchProbeEnumList": {"id":143,"name":"watchProbeEnumList","module":"test","returnType":"Enum","returnList":true,"stream":true},
+    "probeEnum": {"id":140,"name":"probeEnum","module":"test","returnType":"Role","returnList":false,"stream":false},
+    "watchProbeEnum": {"id":141,"name":"watchProbeEnum","module":"test","returnType":"Role","returnList":false,"stream":true},
+    "probeEnumList": {"id":142,"name":"probeEnumList","module":"test","returnType":"Role","returnList":true,"stream":false},
+    "watchProbeEnumList": {"id":143,"name":"watchProbeEnumList","module":"test","returnType":"Role","returnList":true,"stream":true},
     "probeRole": {"id":144,"name":"probeRole","module":"test","returnType":"Role","returnList":false,"stream":false},
     "watchProbeRole": {"id":145,"name":"watchProbeRole","module":"test","returnType":"Role","returnList":false,"stream":true},
     "probeRoleList": {"id":146,"name":"probeRoleList","module":"test","returnType":"Role","returnList":true,"stream":false},
@@ -165,6 +173,12 @@
       "name": "lookupNode",
       "module": "node",
       "returnType": "Node"
-    }
+    },
+    "enumOptions": {"id":200,"name":"enumOptions","module":"test","returnType":"Role","params":[
+      {"id":1,"name":"required","type":"Enum","typeName":"Role","nullable":true},
+      {"id":2,"name":"state","type":"Enum","typeName":"Role","hasDefault":true},
+      {"id":3,"name":"optional","type":"Enum","typeName":"Role","nullable":true,"hasDefault":true},
+      {"id":4,"name":"states","type":"Enum","typeName":"Role","isList":true,"nullable":true,"hasDefault":true}
+    ]}
   }
 }

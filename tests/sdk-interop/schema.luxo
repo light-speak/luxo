@@ -1,3 +1,38 @@
+/// Preauthenticated test identity only; these token issuers are not login APIs.
+model FixturePrincipal @withAuth(stores: [id, name]) {
+  id: Int @id
+  name: String
+}
+
+fn fixturePrincipal(): Result<FixturePrincipal> @native
+
+api issueFixtureAccess(): String {
+  val principal = fixturePrincipal()?
+  return principal.createToken()
+}
+
+api issueFixtureRefresh(): String {
+  val principal = fixturePrincipal()?
+  return principal.createRefreshToken()
+}
+
+api exchangeFixtureRefresh(token: String): String {
+  val principal = fixturePrincipal()?
+  return principal.refreshToken(token)
+}
+
+api fixtureIdentity(): Int @auth { return my.id }
+
+/// Invalid queries must be rejected before accessing this unconfigured database.
+model QueryProbe @crud(only: [list]) {
+  id: Int @id @auto
+  state: FixtureState @filterable
+  count: Int @filterable @sortable
+  active: Boolean @filterable
+  score: Float @filterable
+  createdAt: DateTime @filterable
+}
+
 /// Exact integer values sent through generated Go and SDK codecs.
 type Precision {
   value: Int
@@ -26,6 +61,15 @@ api echoDuration(value: Duration): Duration {
   return value
 }
 
+/// Nullable roots preserve presence independently of zero and empty values.
+api echoOptionalInteger(value: Int?): Int? { return value }
+api echoOptionalIntegers(values: [Int]?): [Int]? { return values }
+api echoOptionalPrecision(input: Precision?): Precision? { return input }
+api echoOptionalPrecisions(inputs: [Precision]?): [Precision]? { return inputs }
+api watchOptionalInteger(): Int? @stream @native
+api watchOptionalIntegers(): [Int]? @stream @native
+api watchOptionalPrecision(): Precision? @stream @native
+
 /// DateTime responses preserve seconds and nanoseconds, including before the epoch.
 api echoTimestamp(value: DateTime): DateTime {
   return value
@@ -34,6 +78,10 @@ api echoTimestamp(value: DateTime): DateTime {
 api echoTimestamps(values: [DateTime]): [DateTime] {
   return values
 }
+
+/// Stream input and output retain the same nanoseconds as unary DateTime.
+api watchTimestamp(value: DateTime): DateTime @stream @native
+api watchTimestamps(values: [DateTime]): [DateTime] @stream @native
 
 api echoIntegers(values: [Int]): [Int] {
   return values
@@ -157,7 +205,7 @@ api checkListEffects(): [Int] {
 }
 
 /// Native code only supplies stream values; generated code encodes them.
-api watchPrecision(value: Int): Precision @stream @native
+api watchPrecision(value: Int = 42): Precision @stream @native
 
 /// Nullable arrays must preserve null, empty and unselected states.
 type NullableArrays {

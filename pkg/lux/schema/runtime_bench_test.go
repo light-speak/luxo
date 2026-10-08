@@ -8,6 +8,32 @@ import (
 
 var runtimeBenchmarkSchema *Schema
 
+// This measures cold registration with and without aggregate metadata. It is
+// not an old/new decoder comparison or a per-request cache benchmark.
+func BenchmarkComputedSourceRegistration(b *testing.B) {
+	for _, fields := range []int{2, 16} {
+		declaration := runtimeBenchmarkType(fields)
+		for _, computed := range []bool{false, true} {
+			b.Run(fmt.Sprintf("fields=%d/computed=%t", fields, computed), func(b *testing.B) {
+				b.Cleanup(func() { runtimeBenchmarkSchema = nil })
+				b.ReportAllocs()
+				for b.Loop() {
+					s := New()
+					model := &Model{Name: "User", Fields: append([]Field(nil), declaration.Fields...)}
+					if computed {
+						model.Fields[0].Computed = true
+						model.ComputedSources = map[string]ComputedSource{
+							model.Fields[0].Name: {Model: "Post", Module: "blog"},
+						}
+					}
+					s.RegisterModel(model)
+					runtimeBenchmarkSchema = s
+				}
+			})
+		}
+	}
+}
+
 func runtimeBenchmarkType(count int) *TypeDecl {
 	t := &TypeDecl{Name: "Payload", Fields: make([]Field, count)}
 	for i := range t.Fields {

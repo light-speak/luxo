@@ -3,7 +3,6 @@ package luvia
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -208,31 +207,11 @@ func (gr *GatewayRegistrar) Close() {
 }
 
 func (gr *GatewayRegistrar) register() bool {
-	payload := map[string]any{
-		"$api":       "svc:registerGateway",
-		"$select":    "id",
-		"apiKey":     gr.apiKey,
-		"projectId":  gr.projectID,
-		"name":       gr.nodeName,
-		"endpoint":   gr.endpoint,
-		"instanceId": gr.instanceID,
+	body, err := gr.encodeRegistration()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[gateway] registration encoding failed: %v\n", err)
+		return false
 	}
-	if gr.nodeType == "service" {
-		payload["$api"] = "svc:registerServiceNode"
-		payload["addr"] = gr.endpoint
-		payload["version"] = gr.version
-		delete(payload, "endpoint")
-	}
-	// A nullable Luxo parameter is still required unless it has a default.
-	// Send explicit null when introspection is disabled so registration keeps
-	// the stored key without weakening the protocol's missing/null distinction.
-	if gr.nodeType != "service" {
-		payload["introKey"] = nil
-		if gr.introKey != "" {
-			payload["introKey"] = gr.introKey
-		}
-	}
-	body, _ := json.Marshal(payload)
 
 	req, err := http.NewRequestWithContext(gr.requestContext(), http.MethodPost, gr.studioURL+"/luvia", bytes.NewReader(body))
 	if err != nil {
@@ -298,27 +277,17 @@ func (gr *GatewayRegistrar) heartbeat() {
 	runtime.ReadMemStats(&m)
 	memMB := float64(m.Alloc) / 1024 / 1024
 
-	apiName := "svc:heartbeat"
-	if gr.nodeType == "service" {
-		apiName = "svc:heartbeatServiceNode"
-	}
 	dependencies := make([]lux.RuntimeDependencyStats, 0)
 	if gr.dependencyStats != nil {
 		ctx, cancel := context.WithTimeout(gr.requestContext(), 2*time.Second)
 		dependencies = gr.dependencyStats.RuntimeDependencies(ctx)
 		cancel()
 	}
-	body, _ := json.Marshal(map[string]any{
-		"$api":         apiName,
-		"apiKey":       gr.apiKey,
-		"projectId":    gr.projectID,
-		"instanceId":   gr.instanceID,
-		"version":      gr.version,
-		"uptime":       time.Since(gr.startedAt),
-		"memoryMB":     memMB,
-		"cpuPercent":   gr.cpu.percent(),
-		"dependencies": dependencies,
-	})
+	body, err := gr.encodeHeartbeat(memMB, gr.cpu.percent(), time.Since(gr.startedAt), dependencies)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[gateway] heartbeat encoding failed: %v\n", err)
+		return
+	}
 
 	req, err := http.NewRequestWithContext(gr.requestContext(), http.MethodPost, gr.studioURL+"/luvia", bytes.NewReader(body))
 	if err != nil {
@@ -341,16 +310,11 @@ func (gr *GatewayRegistrar) deregister() {
 	if gr.studioURL == "" || gr.client == nil {
 		return
 	}
-	apiName := "svc:deregisterGateway"
-	if gr.nodeType == "service" {
-		apiName = "svc:deregisterServiceNode"
+	body, err := gr.encodeDeregistration()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[gateway] deregistration encoding failed: %v\n", err)
+		return
 	}
-	body, _ := json.Marshal(map[string]any{
-		"$api":       apiName,
-		"apiKey":     gr.apiKey,
-		"projectId":  gr.projectID,
-		"instanceId": gr.instanceID,
-	})
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, gr.studioURL+"/luvia", bytes.NewReader(body))

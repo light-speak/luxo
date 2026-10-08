@@ -9,6 +9,7 @@ import 'int64_validation.dart';
 import 'wire_reader.dart';
 import 'unicode.dart';
 import 'uint64.dart' show writeWireUint64;
+import 'schema.dart' show maxSelectionFieldID;
 
 Uint8List _encodeString(String value) => utf8.encode(requireUnicode(value));
 
@@ -980,9 +981,19 @@ int _hexNibble(int c) {
 
 // --- Field mask utilities ---
 
+@pragma('vm:prefer-inline')
+@pragma('dart2js:tryInline')
+@pragma('wasm:prefer-inline')
+void _checkSelectionFieldID(int fieldID) {
+  if (fieldID <= 0 || fieldID > maxSelectionFieldID) {
+    throw RangeError.range(fieldID, 1, maxSelectionFieldID, 'fieldID');
+  }
+}
+
 /// Sets a bit in the field mask for the given fieldID. Returns the (possibly grown) mask.
+/// Throws RangeError for IDs outside 1..65535 before allocating or mutating.
 Uint8List fieldMaskSet(Uint8List mask, int fieldID) {
-  if (fieldID <= 0) return mask;
+  _checkSelectionFieldID(fieldID);
   final bit = fieldID - 1;
   final byteIndex = bit >> 3;
   if (byteIndex >= mask.length) {
@@ -996,8 +1007,9 @@ Uint8List fieldMaskSet(Uint8List mask, int fieldID) {
 }
 
 /// Checks if a bit is set in the field mask for the given fieldID.
+/// Throws RangeError for invalid IDs instead of aliasing another bit on Web.
 bool fieldMaskHas(Uint8List mask, int fieldID) {
-  if (fieldID <= 0) return false;
+  _checkSelectionFieldID(fieldID);
   final bit = fieldID - 1;
   final byteIndex = bit >> 3;
   if (byteIndex >= mask.length) return false;

@@ -102,6 +102,22 @@ describe('binary param validation', () => {
 			.toThrow('missing schema for structured type Missing')
 	})
 
+	it('ignores inherited structured field metadata', () => {
+		const fields = { id: { fieldID: 1, type: 'Int' }, name: { fieldID: 2, type: 'String' } }
+		const inherited = { ignored: { fieldID: 3, type: 'String' } }
+		Object.defineProperty(inherited, 'trap', { enumerable: true, get() { throw new Error('inherited field read') } })
+		Object.setPrototypeOf(fields, inherited)
+		const meta: APISchema = {
+			id: 7,
+			params: [{ fieldID: 1, name: 'items', type: 'Model', typeName: 'Input', isList: true }],
+			types: { Input: fields },
+		}
+		const input = { items: [{ id: -1n, name: '中文' }, { id: 42n, name: 'é' }] }
+		const expected = encodeBinaryBody({ ...meta, types: { Input: { ...fields } } }, input)
+		const actual = encodeBinaryBody(meta, input)
+		expect(actual).toEqual(expected)
+	})
+
 	it('accepts only RFC3339 strings for DateTime', () => {
 		expect(() => encodeParam(new Encoder(), { fieldID: 1, type: 'DateTime' }, 0)).toThrow('RFC3339 string')
 		expect(() => encodeParam(new Encoder(), { fieldID: 1, type: 'DateTime' }, 'not-a-date')).toThrow('RFC3339 string')
@@ -236,6 +252,22 @@ describe('FetchTransport setToken / setMode / setSchema', () => {
 })
 
 describe('FetchTransport binary field selection', () => {
+  it('sends the owned encoded buffer without another copy or input aliasing', async () => {
+    const encoded = vi.spyOn(Encoder.prototype, 'bytes')
+    const t = new FetchTransport('http://localhost:8080/api', { mode: 'binary' })
+    t.setSchema({ echo: { id: 1, params: [{ fieldID: 1, name: 'payload', type: 'Bytes' }] } })
+    mockFetch.mockResolvedValue({ status: 200, arrayBuffer: async () => new Uint8Array([84]).buffer })
+    const input = new Uint8Array([1, 2, 3])
+    await t.call('echo', { payload: input })
+    const first = mockFetch.mock.calls[0][1].body as ArrayBuffer
+    expect(first).toBe(encoded.mock.results[0].value.buffer)
+    const saved = new Uint8Array(first).slice()
+    input.fill(255)
+    await t.call('echo', { payload: input })
+    expect(mockFetch.mock.calls[1][1].body).not.toBe(first)
+    expect(new Uint8Array(first)).toEqual(saved)
+  })
+
   it('encodes $select into the request field mask', async () => {
     const t = new FetchTransport('http://localhost:8080/api', { mode: 'binary' })
     t.setSchema({ getUser: { id: 1, fields: { id: { fieldID: 1 }, name: { fieldID: 2 } } } })
@@ -334,6 +366,21 @@ describe('FetchTransport binary field selection', () => {
 })
 
 describe('FetchTransport jsonCall', () => {
+  it('rejects absent success data but preserves explicit null and empty values', async () => {
+    const refresh = vi.fn()
+    const transport = new FetchTransport('http://localhost/luvia', { onTokenExpired: refresh })
+    for (const body of ['{}', '{"ok":true}', '{"value":42}']) {
+      mockFetch.mockResolvedValueOnce(new Response(body, { status: 200 }))
+      await expect(transport.call('echo')).rejects.toMatchObject({ error: 'ParseError', code: 200 })
+    }
+    for (const data of [null, false, 0, '', [], {}]) {
+      mockFetch.mockResolvedValueOnce(new Response(JSON.stringify({ data }), { status: 200 }))
+      await expect(transport.call('echo')).resolves.toEqual(data)
+    }
+    expect(refresh).not.toHaveBeenCalled()
+    expect(mockFetch).toHaveBeenCalledTimes(9)
+  })
+
   it('preserves full-width integers through raw HTTP request and response text', async () => {
     const value = 9223372036854775807n
     mockFetch.mockResolvedValueOnce(new Response(`{"data":{"value":${value}}}`))
@@ -660,6 +707,128 @@ describe('WsTransport subscriptions', () => {
   beforeEach(() => {
     FakeWebSocket.instances = []
     vi.stubGlobal('WebSocket', FakeWebSocket)
+  })
+
+  it.each(['json', 'binary'] as const)('uses a static encoder for %s calls and subscriptions', async mode => {
+    const transport = new WsTransport('ws://localhost/luvia', { mode })
+    transport.setSchema({ live: { id: 7, params: [{ fieldID: 1, name: 'value', type: 'Int' }] } })
+    const values = Object.freeze({ value: 9007199254740993n })
+    let writes = 0
+    const codec = { apiID: 7, initialCapacity: () => 16, writeParameters(enc: Encoder, actual: typeof values | undefined) {
+      expect(actual).toBe(values)
+      writes++
+      enc.writeVarint(1)
+      enc.writeSvarint(actual!.value)
+    } }
+    try {
+      const pending = transport.callGenerated('live', codec, values)
+      const socket = FakeWebSocket.instances[0]
+      socket.open()
+      await Promise.resolve()
+      const body = encodeBinaryBody({ id: 7, params: [{ fieldID: 1, name: 'value', type: 'Int' }] }, values)
+      expect(socket.sent[0]).toEqual(mode === 'binary' ? sequenceFrame(1, 1n, [...body]).buffer : '{"value":9007199254740993,"$id":1,"$api":"live"}')
+      socket.message(mode === 'binary' ? sequenceFrame(2, 1n, [1]).buffer : '{"$id":1,"data":true}')
+      await pending
+      const subscribed = transport.subscribeGenerated('live', codec, values, data => data, () => {})
+      await Promise.resolve()
+      expect(socket.sent[1]).toEqual(mode === 'binary' ? sequenceFrame(0x10, 2n, [...body]).buffer : '{"value":9007199254740993,"$id":2,"$sub":"live"}')
+      socket.message(mode === 'binary' ? sequenceFrame(0x13, 2n, []).buffer : '{"$sub":2,"ok":true}')
+      const cancel = await subscribed
+      cancel()
+      expect(writes).toBe(mode === 'binary' ? 2 : 0)
+    } finally { transport.close() }
+  })
+
+  it('sends owned call, subscription and cancellation buffers without recopying', async () => {
+    const encoded = vi.spyOn(Encoder.prototype, 'bytes')
+    const transport = new WsTransport('ws://localhost/luvia', { mode: 'binary' })
+    transport.setSchema({ live: { id: 7 } })
+    try {
+      const pending = transport.call('live')
+      const socket = FakeWebSocket.instances[0]
+      socket.open()
+      await Promise.resolve()
+      expect(socket.sent[0]).toBe(encoded.mock.results.at(-1)?.value.buffer)
+      const saved = new Uint8Array(socket.sent[0] as ArrayBuffer).slice()
+      socket.message(sequenceFrame(2, 1n, [1]).buffer)
+      await pending
+      const subscribed = transport.subscribe('live', {}, value => value, () => {})
+      await Promise.resolve()
+      expect(socket.sent.at(-1)).toBe(encoded.mock.results.at(-1)?.value.buffer)
+      socket.message(sequenceFrame(0x13, 2n, []).buffer)
+      const cancel = await subscribed
+      cancel()
+      expect(socket.sent.at(-1)).toBe(encoded.mock.results.at(-1)?.value.buffer)
+      expect(socket.sent.at(-1)).not.toBe(socket.sent[0])
+      expect(new Uint8Array(socket.sent[0] as ArrayBuffer)).toEqual(saved)
+    } finally {
+      transport.close()
+    }
+  })
+
+  it.each(['json', 'binary'] as const)('retains its %s registration after caller mutation or invalid updates', async mode => {
+    const transport = new WsTransport('ws://localhost/luvia', { mode })
+    const schema = { live: { id: 7, params: [{ fieldID: 1, name: 'value', type: 'Int' }] } }
+    transport.setSchema(schema)
+    schema.live.id = 9
+    schema.live.params[0].type = 'String'
+    expect(() => transport.setSchema({ live: { id: 0 } })).toThrow(/ID/)
+    try {
+      const pending = transport.call('live', { value: 7n })
+      const socket = FakeWebSocket.instances[0]
+      socket.open()
+      await Promise.resolve()
+      const sent = socket.sent[0]
+      socket.message(mode === 'json' ? '{"$id":1,"data":true}' : sequenceFrame(2, 1n, [1]).buffer)
+      await expect(pending).resolves.toEqual(mode === 'json' ? true : new Uint8Array([1]))
+      expect(sent).toEqual(mode === 'json'
+        ? '{"value":7,"$id":1,"$api":"live"}' : sequenceFrame(1, 1n, [7, 0, 1, 14, 0]).buffer)
+      const onData = vi.fn()
+      const subscribed = transport.subscribe('live', { value: 7n }, value => value, onData)
+      await Promise.resolve()
+      socket.message(mode === 'json' ? '{"$sub":2,"ok":true}' : sequenceFrame(0x13, 2n, []).buffer)
+      const cancel = await subscribed
+      socket.message(mode === 'json' ? '{"$stream":2,"data":true}' : sequenceFrame(0x12, 2n, [1]).buffer)
+      expect(onData).toHaveBeenCalledExactlyOnceWith(mode === 'json' ? true : new Uint8Array([1]))
+      cancel()
+    } finally { transport.close() }
+  })
+
+  it('isolates missing JSON data without mistaking explicit null for completion', async () => {
+    const transport = new WsTransport('ws://localhost/luvia')
+    const onData = vi.fn(), onError = vi.fn(), onComplete = vi.fn(), peer = vi.fn()
+    const decode = vi.fn((value: unknown) => value)
+    try {
+      const first = transport.subscribe('live', {}, decode, onData, { onError, onComplete })
+      const second = transport.subscribe('live', {}, decode, peer)
+      const socket = FakeWebSocket.instances[0]
+      socket.open()
+      await Promise.resolve()
+      for (const id of [1, 2]) socket.message(`{"$sub":${id},"ok":true}`)
+      const [cancel, cancelPeer] = await Promise.all([first, second])
+      socket.message('{"$stream":1,"data":null}')
+      expect(onData).toHaveBeenCalledExactlyOnceWith(null)
+      socket.message('{"$stream":1}')
+      expect(onError).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ error: 'ParseError', code: 0 }))
+      expect(socket.sent.at(-1)).toBe('{"$unsub":1}')
+      socket.message('{"$stream":1}')
+      socket.message('{"$end":1,"ok":true}')
+      expect(onError).toHaveBeenCalledTimes(1)
+      expect(onComplete).not.toHaveBeenCalled()
+      expect(decode).toHaveBeenCalledTimes(1)
+      socket.message('{"$stream":2,"data":null}')
+      expect(peer).toHaveBeenCalledExactlyOnceWith(null)
+      const missing = transport.call('echo')
+      const failure = expect(missing).rejects.toMatchObject({ error: 'ParseError', code: 0 })
+      await Promise.resolve()
+      socket.message('{"$id":3}')
+      await failure
+      const valid = transport.call('echo')
+      await Promise.resolve()
+      socket.message('{"$id":4,"data":null}')
+      await expect(valid).resolves.toBeNull()
+      cancel(); cancelPeer()
+    } finally { transport.close() }
   })
 
   it.each(['json', 'binary'] as const)('isolates %s decoder failures from peers, unary calls and repeated frames', async mode => {

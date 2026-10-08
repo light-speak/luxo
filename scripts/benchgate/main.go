@@ -197,7 +197,11 @@ func (evaluator *comparisonEvaluator) consume(row []string) error {
 	if err := validateSamples(row[6]); err != nil {
 		return fmt.Errorf("%s/%s: %w", evaluator.packageName, row[0], err)
 	}
-	change, significant, err := parseDelta(row[5])
+	values, err := parseMeasurement(row[1], row[3])
+	if err != nil {
+		return fmt.Errorf("%s/%s: %w", evaluator.packageName, row[0], err)
+	}
+	change, significant, err := parseMeasuredDelta(row[5], values)
 	if err != nil {
 		return fmt.Errorf("%s/%s: %w", evaluator.packageName, row[0], err)
 	}
@@ -205,10 +209,6 @@ func (evaluator *comparisonEvaluator) consume(row []string) error {
 	key := comparisonKey{Package: evaluator.packageName, Benchmark: row[0], Unit: evaluator.unit}
 	if _, exists := evaluator.result.Comparisons[key]; exists {
 		return fmt.Errorf("duplicate benchmark comparison: %v", key)
-	}
-	values, err := parseMeasurement(row[1], row[3])
-	if err != nil {
-		return fmt.Errorf("%s/%s: %w", evaluator.packageName, row[0], err)
 	}
 	evaluator.result.Comparisons[key] = struct{}{}
 	evaluator.result.Measurements[key] = values
@@ -337,6 +337,16 @@ func parseDelta(value string) (float64, bool, error) {
 		return 0, false, fmt.Errorf("invalid delta %q", value)
 	}
 	return change, true, nil
+}
+
+func parseMeasuredDelta(delta string, values measurement) (float64, bool, error) {
+	// benchstat reports a significant change from zero as "?", not a percentage.
+	// Preserve its significance decision; a finite positive result exceeds every
+	// relative threshold. Invalid measurements are rejected before this step.
+	if delta == "?" && values.Base == 0 && values.Head > 0 {
+		return math.Inf(1), true, nil
+	}
+	return parseDelta(delta)
 }
 
 func parseMeasurement(base, head string) (measurement, error) {

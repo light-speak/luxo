@@ -4,8 +4,36 @@ import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertFalse
 import kotlin.test.assertEquals
+import kotlinx.serialization.json.Json
 
 class CodegenResponseTest {
+    @Test
+    fun `nullable root schema generates explicit presence without copying binary bodies`() {
+        for (type in listOf("Int", "String", "Record", "State")) {
+            for (list in listOf(false, true)) {
+                for (stream in listOf(false, true)) {
+                    val api = Json.decodeFromString<LuxoAPI>("""{
+                        "id":1,"name":"optional","module":"test","returnType":"$type",
+                        "returnList":$list,"returnNullable":true,"stream":$stream
+                    }""")
+                    val schema = LuxoSchema(apis = mapOf("optional" to api),
+                        types = mapOf("Record" to LuxoTypeDecl("Record", usage = TypeUsage.OUTPUT,
+                            fields = listOf(LuxoField(1, "id", "Int")))),
+                        enums = mapOf("State" to LuxoEnum("State", listOf("OPEN"))))
+                    val code = LuxoCodegen.genClient(schema, "test")
+                    val element = if (type == "Int") "Long" else type
+                    val result = if (list) "List<$element>?" else "$element?"
+                    assertContains(code, "private fun decode_optional(data: Any): $result")
+                    assertContains(code, "isNullRoot(data)")
+                    assertContains(code, "data === JsonNull")
+                    assertFalse(code.contains("copyOfRange"))
+                    assertContains(code, if (type == "Record" && list)
+                        "ColumnarDecoder.atOffset(data, 1)" else "LuxoDecoder.atOffset(data, 1)")
+                }
+            }
+        }
+    }
+
     @Test
     fun `model and type lists require a schema field without changing unary signatures`() {
         val fields = listOf(LuxoField(1, "label", "String", nullable = true),
@@ -66,13 +94,15 @@ class CodegenResponseTest {
         for (type in listOf("String", "Boolean", "DateTime", "UUID", "Decimal", "Enum", "Bytes")) {
             val reader = if (type == "Boolean") "decodeLuxoJsonBoolean" else "decodeLuxoJsonString"
             val fields = listOf(false, true).flatMap { nullable -> listOf(false, true).map { list ->
-                LuxoField(1 + (if (nullable) 2 else 0) + (if (list) 1 else 0), "value${nullable}_$list", type, nullable = nullable, isList = list)
+                LuxoField(1 + (if (nullable) 2 else 0) + (if (list) 1 else 0), "value${nullable}_$list", type,
+                    typeName = "State".takeIf { type == "Enum" }, nullable = nullable, isList = list)
             } }
             val apis = listOf(false, true).flatMap { stream -> listOf(false, true).map { list ->
                 val name = "value${stream}_$list"
-                name to LuxoAPI(1, name, "test", returnType = type, returnList = list, stream = stream)
+                name to LuxoAPI(1, name, "test", returnType = if (type == "Enum") "State" else type, returnList = list, stream = stream)
             } }.toMap()
-            val schema = LuxoSchema(apis = apis, models = mapOf("Record" to LuxoModel("Record", fields = fields, usage = TypeUsage.OUTPUT)))
+            val schema = LuxoSchema(apis = apis, models = mapOf("Record" to LuxoModel("Record", fields = fields, usage = TypeUsage.OUTPUT)),
+                enums = mapOf("State" to LuxoEnum("State", listOf("OPEN"))))
             for (source in listOf(LuxoCodegen.genClient(schema, "test"), LuxoCodegen.genTypes(schema, "test"))) {
                 assertContains(source, "$reader(")
                 assertFalse(source.contains(".jsonPrimitive.content"))
@@ -107,8 +137,9 @@ class CodegenResponseTest {
         for (type in listOf(null, "Int", "Duration", "String", "Float", "Boolean", "Bytes", "JSON", "DateTime", "UUID", "Decimal", "Enum")) {
             for (list in listOf(false, true)) {
                 for (stream in listOf(false, true)) {
-                    val api = LuxoAPI(1, "echo", "test", returnType = type, returnList = list, stream = stream)
-                    val source = LuxoCodegen.genClient(LuxoSchema(apis = mapOf("echo" to api)), "test")
+                    val api = LuxoAPI(1, "echo", "test", returnType = if (type == "Enum") "State" else type, returnList = list, stream = stream)
+                    val source = LuxoCodegen.genClient(LuxoSchema(apis = mapOf("echo" to api),
+                        enums = mapOf("State" to LuxoEnum("State", listOf("OPEN")))), "test")
                     assertContains(source, "dec.checkComplete()", message = "$type list=$list stream=$stream")
                     assertContains(source, "val value = ")
                 }

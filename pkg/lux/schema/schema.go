@@ -3,8 +3,10 @@ package schema
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"sort"
 
+	"github.com/light-speak/luxo/pkg/cachepolicy"
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/selection"
 )
@@ -20,6 +22,7 @@ type Schema struct {
 	Enums      map[string]*Enum     `json:"enums,omitempty"`
 	Types      map[string]*TypeDecl `json:"types,omitempty"`
 	typeModels map[string]*Model
+	apiNames   map[int]string
 }
 
 // Enum describes an enum type with its values.
@@ -59,8 +62,16 @@ type Model struct {
 	Fields      []Field   `json:"fields"`
 	Description string    `json:"description,omitempty"`
 	Directives  []string  `json:"directives,omitempty"`
-	byID        map[int]*Field
-	byName      map[string]*Field
+	// ComputedSources is startup metadata kept outside the hot field descriptors.
+	ComputedSources map[string]ComputedSource `json:"computedSources,omitempty"`
+	byID            map[int]*Field
+	byName          map[string]*Field
+}
+
+// ComputedSource identifies the persistent model read by a selected aggregate.
+type ComputedSource struct {
+	Model  string `json:"model"`
+	Module string `json:"module,omitempty"`
 }
 
 // RelationKind describes where the join key is stored.
@@ -117,19 +128,50 @@ const (
 
 // API describes an API's params and return type.
 type API struct {
-	ID               int      `json:"id"`
-	Name             string   `json:"name"`
-	Module           string   `json:"module"`
-	ReturnType       string   `json:"returnType,omitempty"`
-	ReturnList       bool     `json:"returnList,omitempty"`
-	Paginated        bool     `json:"paginated,omitempty"`
-	DefaultPageSize  int      `json:"defaultPageSize,omitempty"`
-	Stream           bool     `json:"stream,omitempty"`
-	Params           []Param  `json:"params,omitempty"`
-	Deprecated       bool     `json:"deprecated,omitempty"`
-	DeprecatedReason string   `json:"deprecatedReason,omitempty"`
-	Description      string   `json:"description,omitempty"`
-	Directives       []string `json:"directives,omitempty"`
+	ID               int                `json:"id"`
+	Name             string             `json:"name"`
+	Module           string             `json:"module"`
+	Internal         bool               `json:"internal"` // RPC-only; never inferred from the API name.
+	ReturnType       string             `json:"returnType,omitempty"`
+	ReturnList       bool               `json:"returnList,omitempty"`
+	ReturnNullable   bool               `json:"returnNullable,omitempty"`
+	Paginated        bool               `json:"paginated,omitempty"`
+	DefaultPageSize  int                `json:"defaultPageSize,omitempty"`
+	Stream           bool               `json:"stream,omitempty"`
+	Params           []Param            `json:"params,omitempty"`
+	Query            *QueryCapabilities `json:"query,omitempty"`
+	Deprecated       bool               `json:"deprecated,omitempty"`
+	DeprecatedReason string             `json:"deprecatedReason,omitempty"`
+	Description      string             `json:"description,omitempty"`
+	Directives       []string           `json:"directives,omitempty"`
+	// CacheDependencies is generated server-only startup metadata. Introspection
+	// is not an authority for enabling response caching after deserialization.
+	CacheDependencies *CacheDependencies `json:"-"`
+	// CachePolicy is a generated server contract, not client-provided metadata.
+	CachePolicy *CachePolicy `json:"-"`
+}
+
+// QueryCapabilities describes controls actually consumed by this API's handler.
+// A model return type alone does not grant filtering or sorting capability.
+type QueryCapabilities struct {
+	Filters []QueryFilter `json:"filters,omitempty"`
+	Sorters []string      `json:"sorters,omitempty"`
+}
+
+type QueryFilter struct {
+	Field     string   `json:"field"`
+	Type      string   `json:"type"`
+	Operators []string `json:"operators"`
+}
+
+// CachePolicy shares the compiler's validated value contract without wire fields.
+type CachePolicy = cachepolicy.Policy
+
+// CacheDependencies separates persistent models from native external resources.
+// A non-nil empty value means checked pure execution, not missing analysis.
+type CacheDependencies struct {
+	Models   []ComputedSource
+	External []string
 }
 
 // Param describes an API parameter.
@@ -213,10 +255,24 @@ func (s *Schema) RegisterEnum(e *Enum) {
 
 // RegisterType owns a copy of the declaration and prepares its runtime indexes.
 // It may replace a declaration during startup, never while serving requests.
-func (s *Schema) RegisterType(t *TypeDecl) {
+func (s *Schema) RegisterType(t *TypeDecl) error {
+	if t == nil {
+		return fmt.Errorf("schema: nil type declaration")
+	}
+	if err := validateFields(t.Name, t.Fields); err != nil {
+		return err
+	}
+	s.registerType(t)
+	return nil
+}
+
+func (s *Schema) registerType(t *TypeDecl) {
 	m := t.AsModel()
 	owned := *t
 	owned.Fields, owned.Directives = m.Fields, m.Directives
+	if s.Types == nil {
+		s.Types = make(map[string]*TypeDecl)
+	}
 	s.Types[t.Name] = &owned
 	if s.typeModels == nil {
 		s.typeModels = make(map[string]*Model)
@@ -225,16 +281,30 @@ func (s *Schema) RegisterType(t *TypeDecl) {
 }
 
 // RegisterModel adds a model definition to the schema.
-func (s *Schema) RegisterModel(m *Model) {
+func (s *Schema) RegisterModel(m *Model) error {
+	if m == nil {
+		return fmt.Errorf("schema: nil model declaration")
+	}
+	if err := validateFields(m.Name, m.Fields); err != nil {
+		return err
+	}
 	if existing := s.Models[m.Name]; existing != nil {
 		m = mergeModels(existing, m)
+		if err := validateFields(m.Name, m.Fields); err != nil {
+			return err
+		}
 	}
 	initializeModel(m)
+	if s.Models == nil {
+		s.Models = make(map[string]*Model)
+	}
 	s.Models[m.Name] = m
+	return nil
 }
 
 func mergeModels(existing, incoming *Model) *Model {
 	merged := &Model{Name: existing.Name, Module: existing.Module, Description: existing.Description, Directives: existing.Directives}
+	merged.ComputedSources = maps.Clone(existing.ComputedSources)
 	if incoming.Module != "" {
 		merged.Module = incoming.Module
 	}
@@ -258,6 +328,7 @@ func mergeModels(existing, incoming *Model) *Model {
 		}
 		if exists {
 			old := merged.Fields[index]
+			delete(merged.ComputedSources, old.Name)
 			field.PrimaryKey = field.PrimaryKey || old.PrimaryKey
 			delete(byID, old.ID)
 			delete(byName, old.Name)
@@ -268,6 +339,12 @@ func mergeModels(existing, incoming *Model) *Model {
 		}
 		byID[field.ID] = index
 		byName[field.Name] = index
+		if source, ok := incoming.ComputedSources[field.Name]; ok && field.Computed {
+			if merged.ComputedSources == nil {
+				merged.ComputedSources = make(map[string]ComputedSource)
+			}
+			merged.ComputedSources[field.Name] = source
+		}
 	}
 	sort.Slice(merged.Fields, func(i, j int) bool { return merged.Fields[i].ID < merged.Fields[j].ID })
 	return merged
@@ -288,8 +365,31 @@ func initializeModel(m *Model) {
 }
 
 // RegisterAPI adds an API definition to the schema.
-func (s *Schema) RegisterAPI(a *API) {
+func (s *Schema) RegisterAPI(a *API) error {
+	if err := validateAPIDefinition(a); err != nil {
+		return err
+	}
+	ids := s.apiNames
+	if ids == nil {
+		var err error
+		ids, err = s.validatedAPIIndex()
+		if err != nil {
+			return err
+		}
+	}
+	if previous, ok := ids[a.ID]; ok && previous != a.Name {
+		return fmt.Errorf("schema: API ID %d already belongs to %q", a.ID, previous)
+	}
+	if previous := s.APIs[a.Name]; previous != nil && previous.ID != a.ID {
+		return fmt.Errorf("schema: API %q already has ID %d", a.Name, previous.ID)
+	}
+	if s.APIs == nil {
+		s.APIs = make(map[string]*API)
+	}
 	s.APIs[a.Name] = a
+	ids[a.ID] = a.Name
+	s.apiNames = ids
+	return nil
 }
 
 // InferTypeUsage derives input/output roles from API roots and follows nested
@@ -418,7 +518,11 @@ func selectToFieldMask(fields []*selection.Field, model *Model, schema *Schema, 
 		if mf == nil {
 			return nil, fmt.Errorf("unknown selected field %q on %s", f.Name, model.Name)
 		}
-		fieldMask = codec.FieldMaskSet(fieldMask, mf.ID)
+		var err error
+		fieldMask, err = codec.FieldMaskSet(fieldMask, mf.ID)
+		if err != nil {
+			return nil, err
+		}
 		if f.Children == nil {
 			continue
 		}
@@ -437,5 +541,5 @@ func selectToFieldMask(fields []*selection.Field, model *Model, schema *Schema, 
 			children = append(children, codec.SelectionMaskChild{FieldID: mf.ID, Mask: childMask})
 		}
 	}
-	return codec.AppendSelectionMask(nil, fieldMask, children), nil
+	return codec.AppendSelectionMask(nil, fieldMask, children)
 }

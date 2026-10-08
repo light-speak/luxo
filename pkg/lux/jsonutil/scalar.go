@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json/jsontext"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -138,6 +139,31 @@ func ParseInt64Array(raw []byte) ([]int64, error) {
 	})
 }
 
+// ParseFloat64ArrayLimit uses the already validated numeric token instead of
+// running a second JSON syntax scan for every Float. Underflow remains invalid.
+func ParseFloat64ArrayLimit(raw []byte, limit int) ([]float64, error) {
+	count := 0
+	return parseArrayReader(raw, func(reader *Reader) (float64, error) {
+		if count >= limit {
+			return 0, errArrayLimit
+		}
+		count++
+		start := reader.InputOffset()
+		token, err := reader.ReadToken()
+		if err != nil {
+			return 0, err
+		}
+		if token.Kind() != '0' {
+			return 0, fmt.Errorf("expected a JSON number")
+		}
+		value, err := token.Float()
+		if err == nil && value == 0 && nonzeroMantissa(raw[start:reader.InputOffset()]) {
+			return 0, fmt.Errorf("JSON number underflows float64")
+		}
+		return value, err
+	})
+}
+
 // ParseStringArray packs short strings into bounded, independently owned blocks.
 func ParseStringArray(raw []byte) ([]string, error) {
 	var text strings.Builder
@@ -149,13 +175,20 @@ func ParseStringArray(raw []byte) ([]string, error) {
 // ParseStringArrayLimit rejects an excess item before storing it. The bounded
 // parser retains the same strict validation and independently owned text blocks.
 func ParseStringArrayLimit(raw []byte, limit int) ([]string, error) {
+	return ParseStringValuesLimit[string](raw, limit)
+}
+
+// ParseStringValuesLimit decodes directly into a named string slice, without an
+// intermediate []string. Schema-specific membership is checked by generated code.
+func ParseStringValuesLimit[T ~string](raw []byte, limit int) ([]T, error) {
 	var text strings.Builder
 	count := 0
-	return parseArrayReader(raw, func(reader *Reader) (string, error) {
+	return parseArrayReader(raw, func(reader *Reader) (T, error) {
 		if count >= limit {
 			return "", errArrayLimit
 		}
 		count++
-		return readOwnedString(reader, &text, min(len(raw), ownedTextBlockSize))
+		value, err := readOwnedString(reader, &text, min(len(raw), ownedTextBlockSize))
+		return T(value), err
 	})
 }

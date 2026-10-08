@@ -20,23 +20,37 @@ func runFixtureCommand(args []string, gateway bool) error {
 		return fmt.Errorf("-run requires a consumer command after --")
 	}
 	return withFixtureMode(gateway, func(endpoint, scratch string) error {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		defer cancel()
-		command := exec.CommandContext(ctx, args[0], args[1:]...)
-		corpus, err := filepath.Abs("pkg/lux/codec/testdata/protocol-v1.json")
-		if err != nil {
-			return err
-		}
-		topology := "direct"
-		if gateway {
-			topology = "gateway"
-		}
-		command.Env = append(os.Environ(), "LUXO_INTEROP_ENDPOINT="+endpoint,
-			"LUXO_INTEROP_SCRATCH="+scratch, "LUXO_INTEROP_CORPUS="+corpus,
-			"LUXO_INTROSPECTION_KEY=sdk-interop", "LUXO_INTEROP_TOPOLOGY="+topology)
-		command.Stdout, command.Stderr = os.Stdout, os.Stderr
-		return command.Run()
+		return runFixtureConsumer(args, gateway, false, endpoint, endpoint, scratch)
 	})
+}
+
+func runEnumUpgradeCommand(args []string, gateway bool) error {
+	if len(args) == 0 {
+		return fmt.Errorf("-run -enum-upgrade requires a consumer command after --")
+	}
+	return withEnumUpgradeFixture(gateway, func(endpoint, schemaEndpoint, scratch string) error {
+		return runFixtureConsumer(args, gateway, true, endpoint, schemaEndpoint, scratch)
+	})
+}
+
+func runFixtureConsumer(args []string, gateway, enumUpgrade bool, endpoint, schemaEndpoint, scratch string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	command := exec.Command(args[0], args[1:]...)
+	corpus, err := filepath.Abs("pkg/lux/codec/testdata/protocol-v1.json")
+	if err != nil {
+		return err
+	}
+	topology := "direct"
+	if gateway {
+		topology = "gateway"
+	}
+	command.Env = append(os.Environ(), "LUXO_INTEROP_ENDPOINT="+endpoint,
+		"LUXO_INTEROP_SCHEMA_ENDPOINT="+schemaEndpoint, fmt.Sprintf("LUXO_INTEROP_ENUM_UPGRADE=%t", enumUpgrade),
+		"LUXO_INTEROP_SCRATCH="+scratch, "LUXO_INTEROP_CORPUS="+corpus,
+		"LUXO_INTROSPECTION_KEY=sdk-interop", "LUXO_INTEROP_TOPOLOGY="+topology)
+	command.Stdout, command.Stderr = os.Stdout, os.Stderr
+	return runOwnedFixtureCommand(ctx, command)
 }
 
 func withFixture(use func(endpoint, scratch string) error) (result error) {
@@ -55,6 +69,10 @@ func withFixtureMode(gateway bool, use func(endpoint, scratch string) error) err
 }
 
 func withBuiltFixture(use func(binary, scratch string) error) (result error) {
+	return withBuiltFixtureRevision(false, use)
+}
+
+func withBuiltFixtureRevision(futureEnum bool, use func(binary, scratch string) error) (result error) {
 	root, err := filepath.Abs(".tmp")
 	if err != nil {
 		return err
@@ -71,17 +89,21 @@ func withBuiltFixture(use func(binary, scratch string) error) (result error) {
 			result = errors.Join(result, fmt.Errorf("refusing cleanup outside fixture scratch"))
 			return
 		}
+		if errors.Is(result, errFixtureProcessCleanup) {
+			result = errors.Join(result, fmt.Errorf("retaining fixture scratch until process cleanup: %s", scratch))
+			return
+		}
 		result = errors.Join(result, os.RemoveAll(scratch))
 	}()
-	if err := generateFixture(scratch); err != nil {
+	if err := generateFixtureRevision(scratch, futureEnum); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	binary := filepath.Join(scratch, "server")
-	build := exec.CommandContext(ctx, "go", "build", "-o", binary, scratch)
+	build := exec.Command("go", "build", "-o", binary, scratch)
 	build.Stdout, build.Stderr = os.Stdout, os.Stderr
-	if err := build.Run(); err != nil {
+	if err := runOwnedFixtureCommand(ctx, build); err != nil {
 		return err
 	}
 	return use(binary, scratch)

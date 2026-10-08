@@ -40,6 +40,12 @@ export interface LuxoModel {
   name: string
   usage?: TypeUsage
   fields: LuxoField[]
+  computedSources?: Record<string, LuxoComputedSource>
+}
+
+export interface LuxoComputedSource {
+  model: string
+  module?: string
 }
 
 export interface LuxoField {
@@ -68,12 +74,18 @@ export interface LuxoAPI {
   id: number
   name: string
   module: string
+  internal?: boolean
   returnType?: string
   returnList?: boolean
+  returnNullable?: boolean
   paginated?: boolean
   defaultPageSize?: number
   stream?: boolean
   params?: LuxoParam[]
+  query?: {
+    filters?: { field: string; type: string; operators: FilterOperator[] }[]
+    sorters?: string[]
+  }
 }
 
 export interface LuxoParam {

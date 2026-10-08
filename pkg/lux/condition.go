@@ -5,8 +5,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/light-speak/luxo/pkg/lux/datetime"
-
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 )
@@ -143,9 +141,15 @@ type BoolField struct{ col string }
 // NewBoolField creates a BoolField for the given column.
 func NewBoolField(col string) BoolField { return BoolField{col: col} }
 
-func (f BoolField) Eq(v bool) Condition { return &cmpCond{col: f.col, op: "=", val: v} }
-func (f BoolField) IsTrue() Condition   { return &cmpCond{col: f.col, op: "=", val: true} }
-func (f BoolField) IsFalse() Condition  { return &cmpCond{col: f.col, op: "=", val: false} }
+func (f BoolField) Eq(v bool) Condition  { return &cmpCond{col: f.col, op: "=", val: v} }
+func (f BoolField) Neq(v bool) Condition { return f.Eq(!v) }
+func (f BoolField) IsTrue() Condition    { return &cmpCond{col: f.col, op: "=", val: true} }
+func (f BoolField) IsFalse() Condition   { return &cmpCond{col: f.col, op: "=", val: false} }
+func (f BoolField) IsNull() Condition    { return &nullCond{col: f.col, isNull: true} }
+func (f BoolField) IsNotNull() Condition { return &nullCond{col: f.col, isNull: false} }
+
+// In returns a condition matching any of the Boolean values.
+func (f BoolField) In(vs ...bool) Condition { return scalarInCondition(f.col, vs) }
 
 // TimeField provides typed conditions for timestamp columns.
 type TimeField struct{ col string }
@@ -169,29 +173,24 @@ func (f TimeField) Between(from, to time.Time) Condition {
 	return &betweenCond{col: f.col, from: from, to: to}
 }
 
-// FilterOp creates a condition from string operator and value (RFC3339).
-// Returns FALSE condition if the value cannot be parsed.
-func (f TimeField) FilterOp(op, val string) Condition {
-	t, err := datetime.ParseRFC3339(val)
-	if err != nil {
-		return falseCond{}
+// In returns a condition matching any of the timestamps.
+func (f TimeField) In(vs ...time.Time) Condition { return scalarInCondition(f.col, vs) }
+
+// InEnum binds named string values without an intermediate string slice.
+func (f StringField) InEnum[E ~string](vs ...E) Condition {
+	vals := make([]any, len(vs))
+	for i, value := range vs {
+		vals[i] = string(value)
 	}
-	switch strings.ToLower(op) {
-	case "eq":
-		return f.Eq(t)
-	case "ne":
-		return f.Neq(t)
-	case "gt", "after":
-		return f.After(t)
-	case "gte":
-		return f.Gte(t)
-	case "lt", "before":
-		return f.Before(t)
-	case "lte":
-		return f.Lte(t)
-	default:
-		return f.Eq(t)
+	return &inCond{col: f.col, vals: vals}
+}
+
+func scalarInCondition[T any](column string, values []T) Condition {
+	vals := make([]any, len(values))
+	for i, value := range values {
+		vals[i] = value
 	}
+	return &inCond{col: column, vals: vals}
 }
 
 // UUIDField provides typed conditions for UUID columns.
@@ -259,87 +258,6 @@ func (f DecimalField) NotIn(vs ...decimal.Decimal) Condition {
 		vals[i] = v
 	}
 	return &notInCond{col: f.col, vals: vals}
-}
-
-// --- FilterOp: generic operator dispatch from string (used by generated filter parsers) ---
-
-// FilterOp creates a condition from string operator and value.
-func (f IntField) FilterOp(op, val string) Condition {
-	v, err := parseInt64(val)
-	if err != nil {
-		return falseCond{}
-	}
-	switch strings.ToLower(op) {
-	case "eq":
-		return f.Eq(v)
-	case "ne":
-		return f.Neq(v)
-	case "gt":
-		return f.Gt(v)
-	case "gte":
-		return f.Gte(v)
-	case "lt":
-		return f.Lt(v)
-	case "lte":
-		return f.Lte(v)
-	default:
-		return f.Eq(v)
-	}
-}
-
-// FilterOp creates a condition from string operator and value.
-func (f StringField) FilterOp(op, val string) Condition {
-	switch strings.ToLower(op) {
-	case "eq":
-		return f.Eq(val)
-	case "ne":
-		return f.Neq(val)
-	case "contains":
-		return f.Like("%" + EscapeLike(val) + "%")
-	case "startswith":
-		return f.Like(EscapeLike(val) + "%")
-	case "endswith":
-		return f.Like("%" + EscapeLike(val))
-	default:
-		return f.Eq(val)
-	}
-}
-
-// FilterOp creates a condition from string operator and value.
-func (f FloatField) FilterOp(op, val string) Condition {
-	v, err := strconv.ParseFloat(val, 64)
-	if err != nil {
-		return falseCond{}
-	}
-	switch strings.ToLower(op) {
-	case "eq":
-		return f.Eq(v)
-	case "ne":
-		return f.Neq(v)
-	case "gt":
-		return f.Gt(v)
-	case "gte":
-		return f.Gte(v)
-	case "lt":
-		return f.Lt(v)
-	case "lte":
-		return f.Lte(v)
-	default:
-		return f.Eq(v)
-	}
-}
-
-// FilterOp creates a condition from string operator and value.
-func (f BoolField) FilterOp(op, val string) Condition {
-	v := strings.EqualFold(val, "true") || val == "1"
-	if strings.EqualFold(op, "ne") {
-		return f.Eq(!v)
-	}
-	return f.Eq(v)
-}
-
-func parseInt64(s string) (int64, error) {
-	return strconv.ParseInt(s, 10, 64)
 }
 
 // likeReplacer escapes SQL LIKE special characters (backslash, %, _).
@@ -451,10 +369,44 @@ func (c *betweenCond) ToSQL(argOffset int) (string, []any) {
 	return b.String(), []any{c.from, c.to}
 }
 
-// falseCond always evaluates to FALSE — used when filter input is invalid.
-type falseCond struct{}
+// BoolCondition represents a row-independent Boolean without a SQL parameter.
+func BoolCondition(value bool) Condition { return booleanCondition(value) }
 
-func (c falseCond) ToSQL(argOffset int) (string, []any) { return "FALSE", nil }
+type booleanCondition bool
+
+func (c booleanCondition) ToSQL(int) (string, []any) {
+	if c {
+		return "TRUE", nil
+	}
+	return "FALSE", nil
+}
+
+// Not negates a predicate using SQL three-valued logic. A missing condition is
+// unrestricted, like AllOf(nil), so its negation matches no rows.
+func Not(condition Condition) Condition {
+	switch value := condition.(type) {
+	case nil:
+		return booleanCondition(false)
+	case booleanCondition:
+		return !value
+	case *negatedCondition:
+		return value.condition
+	default:
+		return &negatedCondition{condition: condition}
+	}
+}
+
+type negatedCondition struct{ condition Condition }
+
+func (c *negatedCondition) ToSQL(offset int) (string, []any) {
+	sql, args := c.condition.ToSQL(offset)
+	var b strings.Builder
+	b.Grow(len(sql) + 6)
+	b.WriteString("NOT (")
+	b.WriteString(sql)
+	b.WriteByte(')')
+	return b.String(), args
+}
 
 // AllOf combines conditions with AND while preserving parameter offsets.
 // An empty group matches every row.
@@ -558,14 +510,6 @@ func NewSearchField(col string) SearchField {
 // Match generates a full-text search condition using the configured backend.
 func (f SearchField) Match(query string) Condition {
 	return &searchCond{col: f.col, query: query}
-}
-
-// FilterOp applies a search filter (used by @filterable @search).
-func (f SearchField) FilterOp(op, val string) Condition {
-	if strings.EqualFold(op, "match") || strings.EqualFold(op, "search") {
-		return f.Match(val)
-	}
-	return f.StringField.FilterOp(op, val)
 }
 
 type searchCond struct {

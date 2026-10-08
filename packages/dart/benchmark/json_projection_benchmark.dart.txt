@@ -135,6 +135,7 @@ class _Transport extends Transport {
   Future<T> call<T>(
     String api, {
     Map<String, dynamic>? params,
+    GeneratedRequest? request,
     T Function(dynamic)? decoder,
   }) async => throw StateError('Unexpected call');
   @override
@@ -143,6 +144,7 @@ class _Transport extends Transport {
     Map<String, dynamic> params,
     void Function(T) onData, {
     required T Function(Object?) decoder,
+    GeneratedRequest? request,
     void Function(LuxoError)? onError,
     void Function()? onDone,
   }) async {

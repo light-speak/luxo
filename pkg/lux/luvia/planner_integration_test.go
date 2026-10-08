@@ -82,10 +82,10 @@ func TestIntegration_PlanSplitMerge(t *testing.T) {
 	registry, userModel := integrationUserModel()
 
 	// Client requests: id, name, posts (extend field)
-	mask := codec.FieldMaskSet(nil, 1)  // id
-	mask = codec.FieldMaskSet(mask, 2)  // name
-	mask = codec.FieldMaskSet(mask, 10) // posts (extend)
-	mask = selectionNode(mask)
+	mask := testutil.Bytes(t)(codec.FieldMaskSet(nil, 1))  // id
+	mask = testutil.Bytes(t)(codec.FieldMaskSet(mask, 2))  // name
+	mask = testutil.Bytes(t)(codec.FieldMaskSet(mask, 10)) // posts (extend)
+	mask = selectionNode(t, mask)
 
 	// Step 1: Plan
 	plan := planForTest(t, userModel, mask, "user")

@@ -2,266 +2,22 @@ package codegen
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
-	"unicode"
 
+	"github.com/light-speak/luxo/internal/inferred"
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lux/str"
 )
 
-// InferredAPI represents a parsed method name like getUserByEmailOrPhone.
-type InferredAPI struct {
-	Action    string        // "get", "list", "count", "delete", "exists"
-	ModelName string        // "User", "Post"
-	Groups    []ClauseGroup // OR-separated groups of AND clauses
-	OrderBy   string        // "createdAt" (optional)
-	OrderDesc bool          // true if ends with Desc
-	TopN      int           // listTop10... → 10 (0 = no limit)
-}
+type InferredAPI = inferred.InferredAPI
+type ClauseGroup = inferred.ClauseGroup
+type InferClause = inferred.InferClause
 
-// ClauseGroup is a group of AND-ed clauses. Groups are OR-ed together.
-// ByEmailOrPhone → [{email,eq}] OR [{phone,eq}]
-// ByNameAndRoleOrEmail → [{name,eq},{role,eq}] OR [{email,eq}]
-type ClauseGroup struct {
-	Clauses []InferClause
-}
-
-// InferClause is a single field condition.
-type InferClause struct {
-	Field string // "email", "title", "age"
-	Op    string // "eq", "containing", "gt", "lt", "gte", "lte", "between", "isNull", "isNotNull", "true", "false"
-}
-
-// InferAPI tries to parse an API name into a structured query.
-// Returns nil if the name doesn't match any known pattern.
+// InferAPI parses a name-derived query using the shared compile-time contract.
 func InferAPI(name string, models map[string]*ast.ModelDecl) *InferredAPI {
-	result := &InferredAPI{}
-
-	rest := extractActionPrefix(name, result)
-	if result.Action == "" {
-		return nil
-	}
-
-	// Split off OrderBy section
-	orderIdx := strings.LastIndex(rest, "OrderBy")
-	if orderIdx > 0 {
-		result.OrderBy, result.OrderDesc = parseOrderBy(rest[orderIdx+7:])
-		rest = rest[:orderIdx]
-	}
-
-	// Extract model name: before "By"
-	byIdx := strings.Index(rest, "By")
-	var modelPart, fieldsPart string
-	if byIdx > 0 {
-		modelPart = rest[:byIdx]
-		fieldsPart = rest[byIdx+2:]
-	} else {
-		modelPart = rest
-	}
-
-	// Resolve model name
-	modelName := singularize(modelPart)
-	if _, ok := models[modelName]; !ok {
-		return nil
-	}
-	result.ModelName = modelName
-	model := models[modelName]
-
-	// Parse field clauses with Or support
-	if fieldsPart != "" {
-		groups := parseClauseGroups(fieldsPart, model)
-		if groups == nil {
-			return nil
-		}
-		result.Groups = groups
-	}
-
-	// Validate OrderBy field
-	if result.OrderBy != "" && !hasField(model, result.OrderBy) {
-		return nil
-	}
-
-	return result
+	return inferred.Parse(name, models)
 }
 
-// extractActionPrefix parses the action (get/list/count/exists/delete) and optional TopN.
-func extractActionPrefix(name string, result *InferredAPI) string {
-	for _, prefix := range []string{"list", "get", "count", "exists", "delete"} {
-		if !strings.HasPrefix(name, prefix) || len(name) <= len(prefix) {
-			continue
-		}
-		after := name[len(prefix):]
-		if prefix == "list" {
-			after = extractTopN(after, result)
-		}
-		if len(after) > 0 && unicode.IsUpper(rune(after[0])) {
-			result.Action = prefix
-			return after
-		}
-	}
-	return ""
-}
-
-// extractTopN parses Top10 or First5 from the string, sets result.TopN.
-func extractTopN(s string, result *InferredAPI) string {
-	for _, keyword := range []string{"Top", "First"} {
-		if !strings.HasPrefix(s, keyword) {
-			continue
-		}
-		numStart := len(keyword)
-		numEnd := numStart
-		for numEnd < len(s) && s[numEnd] >= '0' && s[numEnd] <= '9' {
-			numEnd++
-		}
-		if numEnd > numStart {
-			n, _ := strconv.Atoi(s[numStart:numEnd])
-			result.TopN = n
-			return s[numEnd:]
-		}
-	}
-	return s
-}
-
-// parseClauseGroups splits by Or, then each group by And.
-// "EmailOrPhone" → [{email}] OR [{phone}]
-// "NameAndRoleOrEmail" → [{name,role}] OR [{email}]
-func parseClauseGroups(s string, model *ast.ModelDecl) []ClauseGroup {
-	orParts := splitBySeparator(s, "Or")
-	var groups []ClauseGroup
-
-	for _, part := range orParts {
-		andParts := splitBySeparator(part, "And")
-		var clauses []InferClause
-		for _, ap := range andParts {
-			clause := parseOneClause(ap, model)
-			if clause == nil {
-				return nil
-			}
-			clauses = append(clauses, *clause)
-		}
-		groups = append(groups, ClauseGroup{Clauses: clauses})
-	}
-	return groups
-}
-
-// splitBySeparator splits "EmailAndRole" by "And" or "EmailOrPhone" by "Or".
-// Ensures separator is between two uppercase-starting parts.
-func splitBySeparator(s, sep string) []string {
-	var parts []string
-	for {
-		idx := strings.Index(s, sep)
-		if idx <= 0 || idx+len(sep) >= len(s) {
-			break
-		}
-		// Verify separator is between two uppercase-starting parts
-		if unicode.IsUpper(rune(s[idx+len(sep)])) {
-			parts = append(parts, s[:idx])
-			s = s[idx+len(sep):]
-		} else {
-			break
-		}
-	}
-	if s != "" {
-		parts = append(parts, s)
-	}
-	return parts
-}
-
-// Operator suffixes in order of longest-first to avoid prefix conflicts.
-var operatorSuffixes = []struct {
-	suffix string
-	op     string
-}{
-	// Comparison — longest first
-	{"GreaterThanEqual", "gte"},
-	{"LessThanEqual", "lte"},
-	{"GreaterThan", "gt"},
-	{"LessThan", "lt"},
-	// Time-semantic aliases
-	{"After", "gt"},
-	{"Before", "lt"},
-	// String matching
-	{"NotContaining", "notContaining"},
-	{"StartingWith", "startswith"},
-	{"EndingWith", "endswith"},
-	{"Containing", "containing"},
-	{"IgnoreCase", "ignoreCase"},
-	// Null checks
-	{"IsNotNull", "isNotNull"},
-	{"IsNull", "isNull"},
-	{"NotNull", "isNotNull"},
-	// Range
-	{"Between", "between"},
-	// Set membership
-	{"NotIn", "notIn"},
-	{"In", "in"},
-	// String pattern
-	{"NotLike", "notLike"},
-	{"Like", "like"},
-	// Negation
-	{"Not", "ne"},
-	// Boolean
-	{"True", "true"},
-	{"False", "false"},
-}
-
-// parseOneClause parses "TitleContaining" or "Email" or "PublishedTrue".
-func parseOneClause(s string, model *ast.ModelDecl) *InferClause {
-	for _, op := range operatorSuffixes {
-		if strings.HasSuffix(s, op.suffix) {
-			field := str.LowerFirst(s[:len(s)-len(op.suffix)])
-			if hasField(model, field) {
-				return &InferClause{Field: field, Op: op.op}
-			}
-		}
-	}
-	// Default: eq
-	field := str.LowerFirst(s)
-	if hasField(model, field) {
-		return &InferClause{Field: field, Op: "eq"}
-	}
-	return nil
-}
-
-// singularize strips trailing 's' for simple English plurals.
-func singularize(s string) string {
-	if strings.HasSuffix(s, "ies") {
-		return s[:len(s)-3] + "y"
-	}
-	if strings.HasSuffix(s, "ses") || strings.HasSuffix(s, "xes") || strings.HasSuffix(s, "zes") {
-		return s[:len(s)-2]
-	}
-	if strings.HasSuffix(s, "s") && !strings.HasSuffix(s, "ss") {
-		return s[:len(s)-1]
-	}
-	return s
-}
-
-// parseOrderBy parses "CreatedAtDesc" → ("createdAt", true)
-func parseOrderBy(s string) (string, bool) {
-	if strings.HasSuffix(s, "Desc") {
-		return str.LowerFirst(s[:len(s)-4]), true
-	}
-	if strings.HasSuffix(s, "Asc") {
-		return str.LowerFirst(s[:len(s)-3]), false
-	}
-	return str.LowerFirst(s), false
-}
-
-// hasField checks if model has a field with the given name.
-func hasField(m *ast.ModelDecl, name string) bool {
-	for _, f := range m.Fields {
-		if f.Name == name {
-			return true
-		}
-	}
-	return false
-}
-
-// --- Handler generation ---
-
-// generateInferredHandler generates a handler from an inferred API.
 func generateInferredHandler(b *strings.Builder, api *ast.ApiDecl, inf *InferredAPI, enums map[string]bool, m *ast.ModelDecl) {
 	name := api.Name
 	modelName := inf.ModelName
@@ -274,34 +30,29 @@ func generateInferredHandler(b *strings.Builder, api *ast.ApiDecl, inf *Inferred
 
 	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(name))
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
+	if directive := findDirective(api.Directives, "auth"); directive != nil {
+		writeAuthCheck(b, "\t\t", directive)
+	} else if directive := findDirective(m.Directives, "auth"); directive != nil || hasDirective(m.Directives, "withAuth") {
+		writeCRUDAuthCheck(b, "\t\t", directive)
+	}
 
 	// Parse params
 	for _, p := range params {
-		goType := resolveGoType(p.Type)
-		method := paramMethod(goType)
-		if p.Type != nil && p.Type.Nullable {
-			method = ""
-		}
-		// Enum params are strings in JSON
-		if method == "" && p.Type != nil && !p.Type.Nullable && enums[p.Type.Name] {
-			method = "String"
-		}
-		if method == "" {
-			fmt.Fprintf(b, "\t\tvar %s %s\n", p.Name, goType)
-			methodName := paramJSONMethod(p)
-			fmt.Fprintf(b, "\t\tif err := req.%s(%q, &%s); err != nil {\n", methodName, p.Name, p.Name)
-			fmt.Fprintf(b, "\t\t\treturn err\n\t\t}\n")
+		if p.Type != nil && enums[p.Type.Name] {
+			writeInferredEnumParamExtraction(b, p, enums, "\t\t")
 		} else {
-			fmt.Fprintf(b, "\t\t%s, err := req.Param%s(%q)\n", p.Name, method, p.Name)
-			fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
+			writeCallableParamExtraction(b, p, enums, "\t\t")
 		}
 	}
+	cached := writeCachedBodyStart(b, api.Directives)
 
 	// Build conditions
 	writeInferredConditions(b, inf, m, params)
 
 	rels := analyzeRelations(m, enums)
 	writeInferredAction(b, inf, modelName, isSoftDelete(m), rels, m)
+	writeCachedBodyEnd(b, cached)
+	fmt.Fprintf(b, "\t}\n}\n\n")
 }
 
 // writeInferredConditions generates the WHERE conditions for an inferred handler.
@@ -450,7 +201,6 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 	}
 
 	fmt.Fprintf(b, "\t\treturn nil\n")
-	fmt.Fprintf(b, "\t}\n}\n\n")
 }
 
 // writeZeroParamClause writes a zero-parameter clause (true/false/isNull/isNotNull).
@@ -689,75 +439,15 @@ func ValidateInferredReturnType(api *ast.ApiDecl, inf *InferredAPI) string {
 	return ""
 }
 
-// buildInferredParams auto-generates parameter declarations from inferred clauses.
-// Each clause that requires a parameter produces one (or two for between).
-func buildInferredParams(inf *InferredAPI, m *ast.ModelDecl) []*ast.ParamDecl {
-	var params []*ast.ParamDecl
-	for _, group := range inf.Groups {
-		for _, clause := range group.Clauses {
-			switch clause.Op {
-			case "true", "false", "isNull", "isNotNull":
-				// Zero-param operations
-				continue
-
-			case "between":
-				fieldType := getFieldTypeRef(m, clause.Field)
-				params = append(params,
-					&ast.ParamDecl{Name: clause.Field + "From", Type: fieldType},
-					&ast.ParamDecl{Name: clause.Field + "To", Type: fieldType},
-				)
-
-			case "in", "notIn":
-				// Array param: [Int], [String], etc.
-				fieldType := getFieldTypeRef(m, clause.Field)
-				params = append(params, &ast.ParamDecl{
-					Name: inferParamName(clause),
-					Type: &ast.TypeRef{Name: fieldType.Name, IsList: true},
-				})
-
-			case "containing", "notContaining", "startswith", "endswith", "like", "notLike", "ignoreCase":
-				// String operations always take string param
-				params = append(params, &ast.ParamDecl{
-					Name: inferParamName(clause),
-					Type: &ast.TypeRef{Name: "String"},
-				})
-
-			default:
-				// eq, ne, gt, gte, lt, lte — same type as field
-				params = append(params, &ast.ParamDecl{
-					Name: inferParamName(clause),
-					Type: getFieldTypeRef(m, clause.Field),
-				})
-			}
-		}
-	}
-	return params
+func inferredAPIContract(api *ast.ApiDecl, models map[string]*ast.ModelDecl) *ast.ApiDecl {
+	return inferred.Contract(api, models)
 }
-
-// inferParamName generates a reasonable parameter name from a clause.
-func inferParamName(clause InferClause) string {
-	switch clause.Op {
-	case "containing", "notContaining":
-		return "keyword"
-	case "startswith":
-		return clause.Field + "Prefix"
-	case "endswith":
-		return clause.Field + "Suffix"
-	case "in", "notIn":
-		return clause.Field + "s" // plural: ids, roles, etc.
-	default:
-		return clause.Field
-	}
+func buildInferredParams(inf *InferredAPI, model *ast.ModelDecl) []*ast.ParamDecl {
+	return inferred.Parameters(inf, model)
 }
-
-// getFieldTypeRef returns a copy of the AST TypeRef for a model field.
-func getFieldTypeRef(m *ast.ModelDecl, name string) *ast.TypeRef {
-	for _, f := range m.Fields {
-		if f.Name == name && f.Type != nil {
-			return &ast.TypeRef{Name: f.Type.Name}
-		}
-	}
-	return &ast.TypeRef{Name: "String"}
+func inferParamName(clause InferClause) string { return inferred.ParamName(clause) }
+func getFieldTypeRef(model *ast.ModelDecl, name string) *ast.TypeRef {
+	return inferred.FieldType(model, name)
 }
 
 // getFieldTypeRefRaw returns the original TypeRef from the model field (for fieldConditionType).
