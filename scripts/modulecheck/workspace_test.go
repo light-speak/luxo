@@ -44,3 +44,43 @@ func TestRevisionWorkspace(t *testing.T) {
 		t.Fatalf("existing workspace was not protected: %v\n%s", err, output)
 	}
 }
+
+func TestLegacyRevisionWorkspaceWithoutVersion(t *testing.T) {
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := consumerFixture(t, root, "", "")
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module github.com/light-speak/luxo\ngo 1.27.1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sh", filepath.Join(root, "scripts/setup-modules.sh"), dir)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("legacy setup: %v\n%s", err, output)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "go.work"))
+	if err != nil || strings.Contains(string(data), "replace") {
+		t.Fatalf("legacy workspace: %s %v", data, err)
+	}
+}
+
+func TestSplitRevisionWorkspaceRequiresVersion(t *testing.T) {
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := consumerFixture(t, root, "", "")
+	for _, name := range []string{"go.mod", "pkg/lux/pg/go.mod"} {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("module fixture\ngo 1.27.1\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmd := exec.Command("sh", filepath.Join(root, "scripts/setup-modules.sh"), dir)
+	if output, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(output), "Missing VERSION") {
+		t.Fatalf("split module without version: %v %s", err, output)
+	}
+}

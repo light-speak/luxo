@@ -182,6 +182,10 @@ func (c *compiler) compileValueBranch(expr ast.Expr) {
 			} else {
 				c.compileStmt(statement)
 			}
+			switch statement.(type) {
+			case *ast.ReturnStmt, *ast.ThrowStmt:
+				return
+			}
 		}
 		return
 	}

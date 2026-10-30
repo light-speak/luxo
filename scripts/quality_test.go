@@ -54,7 +54,7 @@ func TestStorageCIRequiresRealS3(t *testing.T) {
 		case "Start MinIO and verify readiness":
 			start = i
 			for _, required := range []string{
-				"quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
+				"luxo-ci-minio:7aac2a2c5b7c882e68c1ce017d8256be2feea27f",
 				"127.0.0.1:9000:9000", "--tmpfs /data:", "MINIO_ROOT_USER=$STORAGE_ACCESS_KEY",
 				"MINIO_ROOT_PASSWORD=$STORAGE_SECRET_KEY", "http://$STORAGE_ENDPOINT/minio/health/ready",
 				"--fail", "--max-time 5",
@@ -77,6 +77,35 @@ func TestStorageCIRequiresRealS3(t *testing.T) {
 	}
 	if start < 0 || tests <= start || stop <= tests {
 		t.Fatalf("S3 lifecycle order invalid: start=%d tests=%d stop=%d", start, tests, stop)
+	}
+}
+
+func TestStorageCIBuildsPinnedOfficialSource(t *testing.T) {
+	job := readQualityWorkflow(t).Jobs["test"]
+	checkout, build, start := -1, -1, -1
+	for i, step := range job.Steps {
+		switch step.Name {
+		case "Checkout pinned MinIO source":
+			checkout = i
+			if step.With["repository"] != "minio/minio" || step.With["ref"] != "7aac2a2c5b7c882e68c1ce017d8256be2feea27f" || step.With["persist-credentials"] != "false" {
+				t.Fatal("MinIO source must be pinned without credentials")
+			}
+		case "Build pinned MinIO test image":
+			build = i
+			for _, required := range []string{"set -euo pipefail", "GOWORK=off CGO_ENABLED=0 go build -mod=readonly", "FROM scratch", "docker build --tag luxo-ci-minio:7aac2a2c5b7c882e68c1ce017d8256be2feea27f"} {
+				if !strings.Contains(step.Run, required) {
+					t.Errorf("missing MinIO build constraint %q", required)
+				}
+			}
+			if step.ContinueOnError {
+				t.Error("MinIO build errors must block tests")
+			}
+		case "Start MinIO and verify readiness":
+			start = i
+		}
+	}
+	if checkout < 0 || build <= checkout || start <= build {
+		t.Fatalf("invalid MinIO source lifecycle: %d %d %d", checkout, build, start)
 	}
 }
 

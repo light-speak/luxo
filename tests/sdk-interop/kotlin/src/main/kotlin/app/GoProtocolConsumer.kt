@@ -579,19 +579,22 @@ private suspend fun verifyConcurrentSelections(client: LuxoClient) {
     val inputs = List(16) { index ->
         PrecisionInput(Long.MAX_VALUE - index, index.toLong(), null, emptyList(), "call-$index", 0)
     }
-    val pending = inputs.map { input -> startSubscription {
-        val value = startSubscription { client.echoPrecision(input, select = "value") }
-        val label = startSubscription { client.echoPrecision(input, select = "label") }
-        val combined = startSubscription { client.echoPrecision(input, select = "value, label") }
-        val rows = listOf(awaitValue(value), awaitValue(label), awaitValue(combined))
-        check(rows[0].value.value() == input.value && !rows[0].label.isSelected)
-        check(rows[1].label.value() == input.label && !rows[1].value.isSelected)
-        check(rows[2].value.value() == input.value && rows[2].label.value() == input.label)
-        for (row in rows) {
-            check(!row.duration.isSelected && !row.optional.isSelected && !row.values.isSelected && !row.ignored.isSelected)
-        }
-    } }
-    awaitValue(CompletableFuture.allOf(*pending.toTypedArray()))
+    // Keep each batch below the default 16-request admission limit (3 calls per input).
+    for (batch in inputs.chunked(4)) {
+        val pending = batch.map { input -> startSubscription {
+            val value = startSubscription { client.echoPrecision(input, select = "value") }
+            val label = startSubscription { client.echoPrecision(input, select = "label") }
+            val combined = startSubscription { client.echoPrecision(input, select = "value, label") }
+            val rows = listOf(awaitValue(value), awaitValue(label), awaitValue(combined))
+            check(rows[0].value.value() == input.value && !rows[0].label.isSelected)
+            check(rows[1].label.value() == input.label && !rows[1].value.isSelected)
+            check(rows[2].value.value() == input.value && rows[2].label.value() == input.label)
+            for (row in rows) {
+                check(!row.duration.isSelected && !row.optional.isSelected && !row.values.isSelected && !row.ignored.isSelected)
+            }
+        } }
+        awaitValue(CompletableFuture.allOf(*pending.toTypedArray()))
+    }
     val repeated = client.echoPrecision(inputs[0], select = "value")
     check(repeated.value.value() == inputs[0].value && !repeated.label.isSelected)
 }

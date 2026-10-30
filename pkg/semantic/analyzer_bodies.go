@@ -129,7 +129,7 @@ func (a *Analyzer) checkCallableBody(body *ast.Block, scope *Scope, expected *Re
 	a.expectedReturn = expected
 	defer func() { a.expectedReturn = previous }()
 
-	a.checkBlock(body, scope)
+	a.checkResultBlock(body, scope, expected != nil && expected.Kind != TypeVoid)
 	if expected == nil || expected.Kind == TypeVoid {
 		return
 	}
@@ -188,20 +188,7 @@ func (a *Analyzer) validateStreamMatcherResult(api *ast.ApiDecl) {
 }
 
 func (a *Analyzer) checkBlock(block *ast.Block, scope *Scope) {
-	if block == nil {
-		return
-	}
-	terminated := false
-	for _, stmt := range block.Stmts {
-		if terminated {
-			a.addWarning(stmt.GetPos(), "unreachable code / 不可达代码")
-			break
-		}
-		a.checkStmt(stmt, scope)
-		if isTerminating(stmt) {
-			terminated = true
-		}
-	}
+	a.checkResultBlock(block, scope, false)
 }
 
 func isTerminating(stmt ast.Stmt) bool {
@@ -262,7 +249,9 @@ func (a *Analyzer) checkStmt(stmt ast.Stmt, scope *Scope) {
 		// valid in any loop context, no check needed at semantic level
 
 	case *ast.ExprStmt:
-		if s.Expr != nil {
+		if branch, ok := s.Expr.(*ast.WhenExpr); ok {
+			setExprResolvedType(branch, a.checkWhen(branch, scope, false))
+		} else if s.Expr != nil {
 			a.checkExpr(s.Expr, scope)
 		}
 	}
@@ -354,6 +343,10 @@ func (a *Analyzer) checkAssignStmt(s *ast.AssignStmt, scope *Scope) {
 }
 
 func (a *Analyzer) checkForStmt(s *ast.ForStmt, scope *Scope) *ResolvedType {
+	return a.checkForBody(s, scope, false)
+}
+
+func (a *Analyzer) checkForBody(s *ast.ForStmt, scope *Scope, required bool) *ResolvedType {
 	childScope := scope.Child()
 	if s.Collection != nil {
 		collType := a.checkExpr(s.Collection, childScope)
@@ -367,7 +360,7 @@ func (a *Analyzer) checkForStmt(s *ast.ForStmt, scope *Scope) *ResolvedType {
 			})
 		}
 	}
-	a.checkBlock(s.Body, childScope)
+	a.checkResultBlock(s.Body, childScope, required)
 	return a.inferForExprType(s.Body)
 }
 

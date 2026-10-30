@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"context"
 	goast "go/ast"
 	goparser "go/parser"
 	gotoken "go/token"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lexer"
@@ -779,7 +781,10 @@ func (app *App) eligible(ctx context.Context) (bool, error) { app.calls++; if ap
 	if err := os.WriteFile(filepath.Join(dir, "closure_test.go"), []byte(source), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("go", "test", "-count=1", ".")
+	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "test", "-timeout=30s", "-count=1", ".")
+	cmd.WaitDelay = time.Second
 	cmd.Dir = dir
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("generated execution: %v\n%s\n%s", err, output, source)
@@ -894,5 +899,58 @@ func TestFallibleWhenSubjectWithoutElse(t *testing.T) {
 	}
 	if got := c.compileLiteral(&ast.Literal{Kind: token.Duration, Value: "broken"}); got != "broken" {
 		t.Fatalf("invalid duration recovery = %q", got)
+	}
+}
+
+func TestFormalValueBlocksExecute(t *testing.T) {
+	const source = `
+fn chooseBlock(flag: Boolean): Int {
+ return when { flag -> { val value = 1 value } else -> { return 2 val unreachable = 3 } }
+}
+fn mapBlock(items: [Int]): [Int] {
+ return for item in items { val value = item value + 1 }
+}
+fn sumStatements(items: [Int]): Int {
+ var total = 0
+ for item in items { total += item }
+ return total
+}
+`
+	runGeneratedFixture(t, source, `package generated
+import("testing";"slices")
+type App struct{}
+func TestValueBlocks(t *testing.T) {
+ app:=&App{}
+ for _, flag:= range []bool{false,true} {
+  value,err:=app.chooseBlock(t.Context(),flag)
+  want:=int64(2);if flag {want=1}
+  if err!=nil || value!=want {t.Fatal(value,err)}
+ }
+ values,err:=app.mapBlock(t.Context(),[]int64{1,2})
+ if err!=nil || !slices.Equal(values,[]int64{2,3}) {t.Fatal(values,err)}
+ total,err:=app.sumStatements(t.Context(),[]int64{1,2})
+ if err!=nil || total!=3 {t.Fatal(total,err)}
+}
+`, StableIDs{})
+}
+
+func TestFormalGenerationRejectsMissingValueResults(t *testing.T) {
+	for _, source := range []string{
+		`fn broken(flag: Boolean): Int { return when { flag -> 1 else -> { val value = 2 } } }`,
+		`fn broken(items: [Int]): [Int] { return for item in items { val value = item } }`,
+	} {
+		tokens, lexErrors := lexer.New(source, "missing-result.luxo").Tokenize()
+		if len(lexErrors) != 0 {
+			t.Fatal(lexErrors)
+		}
+		file, parseErrors := parser.New(tokens).Parse("missing-result.luxo")
+		if len(parseErrors) != 0 {
+			t.Fatal(parseErrors)
+		}
+		result := semantic.Analyze([]*ast.File{file})
+		generated, err := Generate(result, "generated", GeneratorConfig{IDs: completeFixtureAPIIDs(result, StableIDs{})})
+		if err == nil || generated != nil || !strings.Contains(err.Error(), "must produce a value") {
+			t.Fatalf("missing value: generated=%v error=%v", generated != nil, err)
+		}
 	}
 }

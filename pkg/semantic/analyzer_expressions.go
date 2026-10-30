@@ -70,7 +70,10 @@ func (a *Analyzer) checkCompositeExpr(expr ast.Expr, scope *Scope) (resolved *Re
 	case *ast.AwaitExpr:
 		resolved = a.checkAwaitExpr(e, scope)
 	case *ast.ForStmt:
-		resolved = a.checkForStmt(e, scope)
+		resolved = a.checkForBody(e, scope, true)
+		if resolved == nil || isVoidResult(resolved) {
+			a.addError(e.Pos, "for expression must produce a value / for 值表达式必须产生结果")
+		}
 	}
 	return resolved
 }
@@ -1529,8 +1532,12 @@ func (a *Analyzer) checkElvisExpr(e *ast.ElvisExpr, scope *Scope) *ResolvedType 
 }
 
 func (a *Analyzer) checkWhenExpr(e *ast.WhenExpr, scope *Scope) *ResolvedType {
+	return a.checkWhen(e, scope, true)
+}
+
+func (a *Analyzer) checkWhen(e *ast.WhenExpr, scope *Scope, required bool) *ResolvedType {
 	if isChannelSelect(e) {
-		return a.checkChannelSelect(e, scope)
+		return a.checkChannelSelect(e, scope, required)
 	}
 	var subjectType *ResolvedType
 	var resultType *ResolvedType
@@ -1555,12 +1562,12 @@ func (a *Analyzer) checkWhenExpr(e *ast.WhenExpr, scope *Scope) *ResolvedType {
 			if b.IsType != "" && subjectType != nil && subjectType.Kind == TypeSealed {
 				branchScope = a.injectSealedVariantFields(scope, subjectType, b.IsType, e.Subject)
 			}
-			bodyType := a.checkExpr(b.Body, branchScope)
+			bodyType := a.checkWhenBranch(b.Body, branchScope, required)
 			resultType = a.mergeWhenBranchType(resultType, bodyType, b.Body.GetPos())
 		}
 	}
 	if e.Else != nil {
-		elseType := a.checkExpr(e.Else, scope)
+		elseType := a.checkWhenBranch(e.Else, scope, required)
 		resultType = a.mergeWhenBranchType(resultType, elseType, e.Else.GetPos())
 	}
 	// sealed exhaustiveness check

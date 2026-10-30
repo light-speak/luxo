@@ -74,6 +74,22 @@ jobs:
             http://127.0.0.1:8222/jsz | jq --exit-status \
             '.disabled != true and .config.max_memory > 0 and .config.max_storage > 0'
 
+      - name: Checkout pinned MinIO source
+        uses: actions/checkout@v7
+        with:
+          repository: minio/minio
+          ref: 7aac2a2c5b7c882e68c1ce017d8256be2feea27f
+          path: .tmp/minio-source
+          persist-credentials: false
+
+      - name: Build pinned MinIO test image
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/minio-image
+          (cd .tmp/minio-source && GOWORK=off CGO_ENABLED=0 go build -mod=readonly -p=2 -o ../minio-image/minio .)
+          printf 'FROM scratch\nCOPY minio /minio\nENTRYPOINT ["/minio"]\n' > .tmp/minio-image/Dockerfile
+          docker build --tag luxo-ci-minio:7aac2a2c5b7c882e68c1ce017d8256be2feea27f .tmp/minio-image
+
       - name: Start MinIO and verify readiness
         run: |
           set -euo pipefail
@@ -83,7 +99,7 @@ jobs:
             --security-opt no-new-privileges --tmpfs /data:rw,size=128m \
             -e "MINIO_ROOT_USER=$STORAGE_ACCESS_KEY" \
             -e "MINIO_ROOT_PASSWORD=$STORAGE_SECRET_KEY" \
-            quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e \
+            luxo-ci-minio:7aac2a2c5b7c882e68c1ce017d8256be2feea27f \
             server /data
           curl --fail --silent --show-error --retry 20 --retry-all-errors \
             --retry-delay 1 --connect-timeout 2 --max-time 5 \

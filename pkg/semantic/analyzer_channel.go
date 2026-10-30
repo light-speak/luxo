@@ -93,7 +93,7 @@ func isChannelSelect(expr *ast.WhenExpr) bool {
 	return false
 }
 
-func (a *Analyzer) checkChannelSelect(expr *ast.WhenExpr, scope *Scope) *ResolvedType {
+func (a *Analyzer) checkChannelSelect(expr *ast.WhenExpr, scope *Scope, required bool) *ResolvedType {
 	var result *ResolvedType
 	for _, branch := range expr.Branches {
 		receive, ok := branch.Condition.(*ast.UnaryExpr)
@@ -102,19 +102,19 @@ func (a *Analyzer) checkChannelSelect(expr *ast.WhenExpr, scope *Scope) *Resolve
 			continue
 		}
 		element := a.checkExpr(receive, scope)
-		body := a.checkChannelBranch(branch.Body, element, scope)
+		body := a.checkChannelBranch(branch.Body, element, scope, required)
 		result = a.mergeWhenBranchType(result, body, expr.Pos)
 	}
 	if expr.Else != nil {
-		result = a.mergeWhenBranchType(result, a.checkExpr(expr.Else, scope), expr.Pos)
+		result = a.mergeWhenBranchType(result, a.checkWhenBranch(expr.Else, scope, required), expr.Pos)
 	}
 	return result
 }
 
-func (a *Analyzer) checkChannelBranch(expr ast.Expr, element *ResolvedType, scope *Scope) *ResolvedType {
+func (a *Analyzer) checkChannelBranch(expr ast.Expr, element *ResolvedType, scope *Scope, required bool) *ResolvedType {
 	lambda, ok := expr.(*ast.LambdaExpr)
 	if !ok {
-		return a.checkExpr(expr, scope)
+		return a.checkWhenBranch(expr, scope, required)
 	}
 	if len(lambda.Params) > 1 {
 		a.addError(lambda.Pos, "receive branch accepts at most one value / 接收分支最多接受一个值参数")
@@ -123,10 +123,5 @@ func (a *Analyzer) checkChannelBranch(expr ast.Expr, element *ResolvedType, scop
 	if len(lambda.Params) == 1 {
 		child.Define(&Symbol{Name: lambda.Params[0], Kind: SymVariable, Type: element})
 	}
-	a.checkBlock(lambda.Body, child)
-	result := a.resolvedExprType(blockResultExpr(lambda.Body))
-	if result != nil {
-		setExprResolvedType(lambda, result)
-	}
-	return result
+	return a.checkWhenBlock(lambda, child, required)
 }

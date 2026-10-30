@@ -8,6 +8,16 @@ if [ -e "$GOWORK" ]; then
     exit 1
 fi
 go work init .
+# Historical single-module baselines predate VERSION and adapter modules.
+if [ ! -f VERSION ]; then
+    for module in cmd/luxo pkg/lux/pg pkg/lux/storage/s3 pkg/lux/cache/redis pkg/lux/nats; do
+        if [ -f "$module/go.mod" ]; then
+            printf 'Missing VERSION for split-module checkout\n' >&2
+            exit 1
+        fi
+    done
+    exit 0
+fi
 version="v$(tr -d '\r\n' < VERSION)"
 go work edit "-replace=github.com/light-speak/luxo@${version}=."
 for module in cmd/luxo pkg/lux/pg pkg/lux/storage/s3 pkg/lux/cache/redis pkg/lux/nats; do

@@ -195,3 +195,35 @@ func TestHandlerFeaturesIncludeFunctionsAndInferredOr(t *testing.T) {
 		t.Fatal("function authentication dependency was missed")
 	}
 }
+
+func TestGeneratedImportsRespectLocalBindings(t *testing.T) {
+	for _, sample := range []struct {
+		body string
+		want bool
+	}{
+		{`func f(selection Input) { _ = selection.Value }`, false},
+		{`func f() { selection := Input{}; _ = selection.Value }`, false},
+		{`func f() { var selection *Input; _ = selection.Value }`, false},
+		{`func f(selection Input) { _ = selection.Value }; func g() { _ = selection.Field }`, true},
+		{`func f() { _ = selection.Field; { selection := Input{}; _ = selection.Value } }`, true},
+		{`selection := Input{}; _ = selection.Value`, false},
+		{`func f(selection Input) { _ = selection.Value`, true},
+	} {
+		if got := generatedPackages(sample.body).has("selection"); got != sample.want {
+			t.Errorf("import=%v want=%v: %s", got, sample.want, sample.body)
+		}
+	}
+}
+
+func TestFormalLocalPackageName(t *testing.T) {
+	const source = `type Input { value: Int }
+fn readInput(selection: Input): Int { return selection.value }`
+	runGeneratedFixture(t, source, `package generated
+import "testing"
+type App struct{}
+func TestReadInput(t *testing.T) {
+ value,err:=(&App{}).readInput(t.Context(),Input{Value:42})
+ if err!=nil || value!=42 {t.Fatal(value,err)}
+}
+`, StableIDs{ModelFields: map[string]map[string]int{"Input": {"value": 1}}})
+}

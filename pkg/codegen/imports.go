@@ -2,6 +2,9 @@ package codegen
 
 import (
 	"fmt"
+	goast "go/ast"
+	"go/parser"
+	"go/token"
 	"strconv"
 	"strings"
 )
@@ -33,8 +36,9 @@ func writeScalarTypeImports(b *strings.Builder, body string) {
 	}
 }
 
-// generatedPackages recognizes package-root selectors without allocating tokens
-// or reparsing a Go AST. Go literal boundaries come from the standard library;
+// generatedPackages normally recognizes package-root selectors without allocating
+// tokens; ambiguous bindings receive scope resolution. Go literal boundaries come
+// from the standard library;
 // comments/whitespace preserve the preceding identifier, other tokens clear it.
 // This scan is generation-only and retains no state between output files.
 func generatedPackages(body string) generatedImports {
@@ -42,7 +46,7 @@ func generatedPackages(body string) generatedImports {
 }
 
 func scanGeneratedPackages(body string, stopAfter generatedImports) generatedImports {
-	var imports generatedImports
+	var imports, possibleBindings generatedImports
 	identifier := ""
 	afterDot := false
 	for index := 0; index < len(body); {
@@ -65,6 +69,7 @@ func scanGeneratedPackages(body string, stopAfter generatedImports) generatedImp
 			continue
 		}
 		if generatedIdentifierByte(ch) {
+			possibleBindings |= generatedPackageBit(identifier)
 			start := index
 			for index < len(body) && generatedIdentifierByte(body[index]) {
 				index++
@@ -76,6 +81,9 @@ func scanGeneratedPackages(body string, stopAfter generatedImports) generatedImp
 			afterDot = false
 			continue
 		}
+		if ch != '.' {
+			possibleBindings |= generatedPackageBit(identifier)
+		}
 		if ch == '.' {
 			imports |= generatedPackageBit(identifier)
 			if stopAfter != 0 && imports&stopAfter == stopAfter {
@@ -85,6 +93,32 @@ func scanGeneratedPackages(body string, stopAfter generatedImports) generatedImp
 		identifier, afterDot = "", ch == '.'
 		index++
 	}
+	if stopAfter == 0 && imports&possibleBindings != 0 {
+		return scopedGeneratedPackages(body, imports)
+	}
+	return imports
+}
+
+// Only ambiguous names need lexical scope resolution. Ordinary generated
+// bodies retain the allocation-free selector scan; this is a cold codegen path.
+func scopedGeneratedPackages(body string, fallback generatedImports) generatedImports {
+	file, err := parser.ParseFile(token.NewFileSet(), "generated.go", "package generated\n"+body, 0)
+	if err != nil {
+		file, err = parser.ParseFile(token.NewFileSet(), "generated.go", "package generated\nfunc _() {\n"+body+"\n}", 0)
+	}
+	if err != nil {
+		return fallback // The formal generation boundary rejects invalid Go.
+	}
+	var imports generatedImports
+	goast.Inspect(file, func(node goast.Node) bool {
+		selector, ok := node.(*goast.SelectorExpr)
+		if ok {
+			if root, ok := selector.X.(*goast.Ident); ok && root.Obj == nil {
+				imports |= generatedPackageBit(root.Name)
+			}
+		}
+		return true
+	})
 	return imports
 }
 
