@@ -3,12 +3,77 @@ import 'dart:io';
 import 'package:luxo_client/src/builder/selection_build.dart';
 import 'package:test/test.dart';
 
-import 'select_builder_test.dart' show generateSelectionClient;
 import 'select_fixture.dart';
 
 const _minimal = {'lib/main.dart': 'void main() {}', 'asset.txt': 'original'};
 
 void main() {
+  for (final usePart in [false, true]) {
+    test('hidden client types receive plan imports (part: $usePart)', () async {
+      const client = r'''import 'package:luxo_client/luxo_client.dart';
+class User(final Selected<int> id);
+class LuxoClient {
+  static PreparedSelection $prepareSelection(String text) => PreparedSelection(text);
+  Future<User> getUser(int id, {String? select, PreparedSelection? $selectionPlan}) async {
+    if ($selectionPlan == null || $selectionPlan.text != select) throw StateError('missing plan');
+    return User(Selected.value(id));
+  }
+}
+LuxoClient makeClient() => LuxoClient();
+''';
+      const main = "import 'factory.dart' show makeClient; part 'calls.dart';";
+      const calls = r'''part of 'main.dart';
+final $luxoSelectionClient0 = 42;
+Future<void> main() async {
+  final user = await makeClient().getUser(1);
+  if (user.id.value != 1) throw StateError('wrong result');
+  final next = await makeClient().getUser(2);
+  if (next.id.value != 2) throw StateError('wrong second result');
+}
+''';
+      final sources = {
+        'lib/main.dart': usePart
+            ? main
+            : "import 'factory.dart' show makeClient;" +
+                  calls.replaceFirst("part of 'main.dart';", ''),
+        if (usePart) 'lib/calls.dart': calls,
+      };
+      final fixture = await SelectFixture.create({
+        'lib/src/luxo/client.dart': client,
+        'lib/factory.dart': "export 'src/luxo/client.dart' show makeClient;",
+        ...sources,
+      });
+      SelectionBuild? build;
+      try {
+        build = await SelectionBuild.prepare(fixture.root);
+        await fixture.runDart([
+          'lib/main.dart',
+        ], workingDirectory: build.directory.path);
+        final root = await File('${build.directory.path}/lib/main.dart')
+            .readAsString();
+        expect(
+          RegExp(r'as \$luxoSelectionClient0_').allMatches(root).length,
+          1,
+        );
+        for (final entry in sources.entries) {
+          expect(
+            await File('${fixture.root.path}/${entry.key}').readAsString(),
+            entry.value,
+          );
+          final staged = await File('${build.directory.path}/${entry.key}')
+              .readAsString();
+          expect(staged.split('\n').length, entry.value.split('\n').length);
+        }
+        await build.refresh();
+        await fixture.runDart([
+          'lib/main.dart',
+        ], workingDirectory: build.directory.path);
+      } finally {
+        await build?.close();
+        await fixture.close();
+      }
+    });
+  }
   test(
     'release output rejects overwrites and escapes before creating directories',
     () async {
@@ -188,6 +253,39 @@ void main() {
       await fixture.close();
     }
   });
+  test(
+    'generated Binary calls reuse isolated plans and preserve manual selection',
+    () async {
+      final source = await File('test/fixtures/select_binary_consumer.dart.txt')
+          .readAsString();
+      final fixture = await _generatedFixture(source);
+      SelectionBuild? build;
+      try {
+        build = await SelectionBuild.prepare(fixture.root);
+        for (final arguments in [
+          <String>[],
+          ['--network'],
+        ]) {
+          final result = await Process.run(Platform.resolvedExecutable, [
+            'bin/verify.dart',
+            ...arguments,
+          ], workingDirectory: build.directory.path);
+          expect(
+            result.exitCode,
+            0,
+            reason: '$arguments: ${result.stdout}\n${result.stderr}',
+          );
+        }
+        expect(
+          await File('${fixture.root.path}/bin/verify.dart').readAsString(),
+          source,
+        );
+      } finally {
+        await build?.close();
+        await fixture.close();
+      }
+    },
+  );
   test(
     'AOT artifact retains call-site selections after snapshot cleanup',
     () async {

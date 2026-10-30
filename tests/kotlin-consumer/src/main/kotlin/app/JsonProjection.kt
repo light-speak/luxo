@@ -4,27 +4,31 @@ import com.luxo.client.*
 import com.luxo.generated.*
 import kotlinx.serialization.json.*
 
+// These decoder fixtures inspect whole results rather than statically accessed fields.
+private const val textProjection = "enabled, texts, payload, child { enabled }"
+private const val precisionProjection = "value, optional"
+
 suspend fun verifyJSONProjection() {
     val transport = ResponseTransport()
     val client = LuxoClient(transport)
     var delivered = 0
-    val stop = client.subscribeWatchTextRecords { delivered++ }
+    val stop = client.subscribeWatchTextRecords(select = textProjection) { delivered++ }
     for (bad in listOf("{}", """{"unknown":true}""")) {
         val valid = """{"value":1,"enabled":true}"""
         for (json in listOf("[$bad]", "[$valid,$bad]", "[$bad,$valid]", "[$valid,$bad,$valid]")) {
             transport.response = Json.parseToJsonElement(json)
-            check((runCatching { client.probeTextRecords() }.exceptionOrNull() as? LuxoError)?.error == "ParseError") {
+            check((runCatching { client.probeTextRecords(select = textProjection) }.exceptionOrNull() as? LuxoError)?.error == "ParseError") {
                 "fieldless list was not rejected as ParseError: $json"
             }
             check((runCatching { transport.callback(transport.response) }.exceptionOrNull() as? LuxoError)?.error == "ParseError")
             transport.response = Json.parseToJsonElement("""{"items":$json,"total":3,"page":1,"pageSize":3}""")
-            check((runCatching { client.precisionPage(0, 0, null, emptyList()) }.exceptionOrNull() as? LuxoError)?.error == "ParseError")
+            check((runCatching { client.precisionPage(0, 0, null, emptyList(), select = precisionProjection) }.exceptionOrNull() as? LuxoError)?.error == "ParseError")
         }
     }
     check(delivered == 0)
     for (json in listOf("[null]", "[1]", "[true]", "[[]]", "[\"text\"]")) {
         transport.response = Json.parseToJsonElement(json)
-        check(runCatching { client.probeTextRecords() }.isFailure)
+        check(runCatching { client.probeTextRecords(select = textProjection) }.isFailure)
         check(runCatching { transport.callback(transport.response) }.isFailure)
     }
     check(delivered == 0)
@@ -91,7 +95,7 @@ private fun verifyNestedProjection() {
 
 private suspend fun verifyValidProjection(client: LuxoClient, transport: ResponseTransport) {
     var received: List<TextRecord>? = null
-    val stop = client.subscribeWatchTextRecords { received = it }
+    val stop = client.subscribeWatchTextRecords(select = textProjection) { received = it }
     val valid = listOf(
         "[]" to emptyList(),
         """[{"enabled":null}]""" to listOf(TextRecord(enabled = Selected.value(null))),
@@ -102,7 +106,7 @@ private suspend fun verifyValidProjection(client: LuxoClient, transport: Respons
     for ((json, expected) in valid) {
         val rows = Json.parseToJsonElement(json).jsonArray
         transport.response = rows
-        check(client.probeTextRecords() == expected)
+        check(client.probeTextRecords(select = textProjection) == expected)
         transport.callback(rows)
         check(received == expected)
     }
@@ -110,7 +114,7 @@ private suspend fun verifyValidProjection(client: LuxoClient, transport: Respons
         """[{"optional":null}]""" to listOf(PrecisionRecord(optional = Selected.value(null))),
         """[{"value":9223372036854775807}]""" to listOf(PrecisionRecord(value = Selected.value(Long.MAX_VALUE))))) {
         transport.response = Json.parseToJsonElement("""{"items":$rows,"total":1,"page":1,"pageSize":1}""")
-        check(client.precisionPage(0, 0, null, emptyList()).items == expected)
+        check(client.precisionPage(0, 0, null, emptyList(), select = precisionProjection).items == expected)
     }
     transport.response = Json.parseToJsonElement("""[{},null,{"unknown":[]}]""")
     check(JsonArray(client.probeJSONList()) == transport.response)

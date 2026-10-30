@@ -21,29 +21,21 @@ class LuxoGradlePlugin : KotlinCompilerPluginSupportPlugin {
         val extension = target.extensions.create("luxo", LuxoExtension::class.java)
         extension.applyConventions(target)
         val codegenClasspath = target.toolingClasspath("luxoCodegenRuntimeClasspath")
-        val analyzerClasspath = target.toolingClasspath("luxoAnalyzerRuntimeClasspath", includeCompiler = true)
 
-        val generate = target.tasks.register("luxoGenerate", LuxoGenerateTask::class.java) {
+        target.tasks.register("luxoGenerate", LuxoGenerateTask::class.java) {
             it.configureFrom(extension, codegenClasspath)
-        }
-        target.tasks.register("luxoAnalyze", LuxoAnalyzeTask::class.java) {
-            it.configureFrom(extension, analyzerClasspath)
-            it.mustRunAfter(generate)
         }
 
     }
 }
 
-private fun Project.toolingClasspath(name: String, includeCompiler: Boolean = false): Configuration {
+private fun Project.toolingClasspath(name: String): Configuration {
     val classpath = configurations.create(name) {
         it.isCanBeConsumed = false
         it.isCanBeResolved = true
         it.description = "Isolated runtime for Luxo build tooling"
     }
     dependencies.add(name, "com.luxo:luxo-client:${ToolingVersions.luxo}")
-    if (includeCompiler) {
-        dependencies.add(name, "org.jetbrains.kotlin:kotlin-compiler-embeddable:${ToolingVersions.kotlin}")
-    }
     return classpath
 }
 
@@ -55,5 +47,4 @@ private object ToolingVersions {
         }.use { load(it) }
     }
     val luxo: String = checkNotNull(properties.getProperty("luxoVersion"))
-    val kotlin: String = checkNotNull(properties.getProperty("kotlinVersion"))
 }

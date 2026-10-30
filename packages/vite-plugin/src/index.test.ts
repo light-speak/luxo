@@ -102,7 +102,7 @@ describe('source transformation scope', () => {
     await (plugin.buildStart as () => Promise<void>)()
     const transform = plugin.transform as (code: string, id: string) => { code: string } | null
     expect(transform('async function view() { const user = await client.me(); console.log(user.name) }', `/workspace/view.${extension}?import`)?.code)
-      .toContain("client.me({ $select: 'name' })")
+      .toContain("client.me({ $select: $luxoSelection0 })")
   })
 
   it('does not mistake a parent directory named luxo for the generated output', async () => {
@@ -125,7 +125,7 @@ describe('source transformation scope', () => {
       'const member = await client.me(); consume(member)',
       '/workspace/golang/luxo/luxo-studio/web/src/hooks/use-auth.ts',
     )
-    expect(result?.code).toContain("client.me({ $select: 'id' })")
+    expect(result?.code).toContain("client.me({ $select: $luxoSelection0 })")
     expect(transform('export const generated = true', '/workspace/web/src/luxo/client.ts')).toBeNull()
   })
 })
@@ -231,7 +231,7 @@ it.each(['load', 'generate'])('does not reuse a stale schema after a failed rebu
   const transform = plugin.transform as (code: string, id: string) => { code: string } | null
   const source = 'async function view() { const user = await client.me(); console.log(user.id) }'
   await build()
-  expect(transform(source, '/workspace/view.ts')?.code).toContain("$select: 'id'")
+  expect(transform(source, '/workspace/view.ts')?.code).toContain("$select: $luxoSelection0")
   fetchMock.mockResolvedValueOnce(failure === 'load' ? new Response('{') : Response.json(schemaWithText))
   if (failure === 'generate') mocks.generateTypes.mockRejectedValueOnce(new Error('generation failed'))
   await expect(build()).rejects.toThrow()

@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 
 import 'error.dart';
+import 'buffered_http_response.dart';
 import 'error_codec.dart';
 import 'codec.dart';
 import 'int64.dart';
@@ -13,6 +14,8 @@ import 'int64_native.dart'
     as platform;
 import 'json.dart';
 import 'schema.dart';
+import 'selection.dart';
+export 'selection.dart' show PreparedSelection;
 import 'schema_ids.dart' show snapshotAPISchema;
 import 'socket.dart';
 import 'uint64.dart';
@@ -81,10 +84,12 @@ abstract interface class LuxoBinaryEncodable {
 
 /// Transport options.
 class TransportOptions {
+  final int maxResponseBytes;
   final String? token;
   final TransportMode mode;
   final Map<String, String>? headers;
   const TransportOptions({
+    this.maxResponseBytes = 2 * 1024 * 1024,
     this.token,
     this.mode = TransportMode.json,
     this.headers,
@@ -136,9 +141,7 @@ void encodeParam(LuxoEncoder enc, ParamSchema pm, dynamic v) {
         for (final value in list.cast<Uint8List>()) enc.writeBytes(value);
       case 'JSON':
         for (final value in list) {
-          enc.writeBytes(
-            Uint8List.fromList(utf8.encode(encodeLuxoJSON(value))),
-          );
+          enc.writeBytes(utf8.encode(encodeLuxoJSON(value)));
         }
       case 'Model':
         for (final value in list) {
@@ -169,7 +172,7 @@ void encodeParam(LuxoEncoder enc, ParamSchema pm, dynamic v) {
     case 'Bytes':
       enc.writeBytes(v as Uint8List);
     case 'JSON':
-      enc.writeBytes(Uint8List.fromList(utf8.encode(encodeLuxoJSON(v))));
+      enc.writeBytes(utf8.encode(encodeLuxoJSON(v)));
     case 'Model':
       _writeStructuredParam(enc, pm, v);
     default:
@@ -190,144 +193,6 @@ void _writeStructuredParam(LuxoEncoder enc, ParamSchema param, dynamic value) {
     );
   }
   enc.writeDelimited(value.writeLuxo);
-}
-
-class _SelectedField {
-  final String name;
-  final List<_SelectedField>? children;
-  const _SelectedField(this.name, [this.children]);
-}
-
-class _SelectionParser {
-  final String input;
-  int offset = 0;
-  _SelectionParser(this.input);
-
-  List<_SelectedField> parse() {
-    final fields = _parseList(false, 0);
-    _skipSpaces();
-    if (offset != input.length) _fail("unexpected '${input[offset]}'");
-    return fields;
-  }
-
-  List<_SelectedField> _parseList(bool nested, int depth) {
-    if (depth >= 32) _fail('selection depth exceeds 32');
-    final fields = <_SelectedField>[];
-    final names = <String>{};
-    while (true) {
-      _skipSpaces();
-      if (offset >= input.length || (nested && input[offset] == '}')) break;
-      final name = _readIdentifier();
-      if (name.isEmpty) _fail('expected field name');
-      if (!names.add(name)) _fail("duplicate field '$name'");
-      _skipSpaces();
-      List<_SelectedField>? children;
-      if (offset < input.length && input[offset] == '{') {
-        offset++;
-        children = _parseList(true, depth + 1);
-        if (children.isEmpty) _fail("empty selection for '$name'");
-        _skipSpaces();
-        if (offset >= input.length || input[offset] != '}') {
-          _fail("missing '}' for '$name'");
-        }
-        offset++;
-      }
-      fields.add(_SelectedField(name, children));
-      _skipSpaces();
-      if (offset >= input.length || input[offset] != ',') break;
-      offset++;
-    }
-    return fields;
-  }
-
-  String _readIdentifier() {
-    final start = offset;
-    if (offset >= input.length || !_identifierStart(input.codeUnitAt(offset))) {
-      return '';
-    }
-    offset++;
-    while (offset < input.length && _identifierPart(input.codeUnitAt(offset))) {
-      offset++;
-    }
-    return input.substring(start, offset);
-  }
-
-  void _skipSpaces() {
-    while (offset < input.length && input.codeUnitAt(offset) <= 32) offset++;
-  }
-
-  Never _fail(String message) =>
-      throw LuxoError('ConfigError', 0, '$message at position $offset');
-}
-
-bool _identifierStart(int code) =>
-    code == 95 || (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
-
-bool _identifierPart(int code) =>
-    _identifierStart(code) || (code >= 48 && code <= 57);
-
-Uint8List _encodeSelectionNode(
-  List<_SelectedField> selected,
-  Map<String, SelectionFieldSchema> fields,
-  Map<String, Map<String, SelectionFieldSchema>> types,
-) {
-  var mask = Uint8List(0);
-  final children = <({int fieldID, Uint8List data})>[];
-  for (final field in selected) {
-    final meta = fields[field.name];
-    if (meta == null) {
-      throw LuxoError(
-        'ConfigError',
-        0,
-        'unknown selected field: ${field.name}',
-      );
-    }
-    mask = fieldMaskSet(mask, meta.fieldID);
-    if (field.children == null) continue;
-    final nestedFields = meta.typeName == null ? null : types[meta.typeName];
-    if (nestedFields == null) {
-      throw LuxoError(
-        'ConfigError',
-        0,
-        'field ${field.name} does not support nested selection',
-      );
-    }
-    children.add((
-      fieldID: meta.fieldID,
-      data: _encodeSelectionNode(field.children!, nestedFields, types),
-    ));
-  }
-  children.sort((a, b) => a.fieldID.compareTo(b.fieldID));
-  final node = LuxoEncoder();
-  node.writeVarint(mask.length);
-  node.writeRawBytes(mask);
-  for (final child in children) {
-    node.writeVarint(child.fieldID);
-    node.writeVarint(child.data.length);
-    node.writeRawBytes(child.data);
-  }
-  return node.bytes();
-}
-
-void _writeFieldMask(LuxoEncoder enc, APISchemaEntry meta, Object? select) {
-  if (meta.fields.isEmpty) {
-    enc.writeVarint(0);
-    return;
-  }
-  if (select is! String || select.trim().isEmpty) {
-    throw LuxoError(
-      'ConfigError',
-      0,
-      r'$select is required for structured responses',
-    );
-  }
-  final mask = _encodeSelectionNode(
-    _SelectionParser(select).parse(),
-    meta.fields,
-    meta.types,
-  );
-  enc.writeVarint(mask.length);
-  enc.writeRawBytes(mask);
 }
 
 void _writeListControls(LuxoEncoder enc, Map<String, dynamic>? params) {
@@ -467,6 +332,7 @@ String _filterValueText(dynamic value) {
 abstract class GeneratedRequest {
   int get apiID;
   String? get selection => null;
+  PreparedSelection? get selectionPlan => null;
   void writeParameters(LuxoEncoder encoder);
   List<LuxoFilter>? get filters => null;
   List<LuxoSorter>? get sorters => null;
@@ -533,7 +399,12 @@ void _writeRequest(
       );
     }
     encoder.writeVarint(request.apiID);
-    _writeFieldMask(encoder, schema, request.selection);
+    writeSelectionMask(
+      encoder,
+      schema,
+      request.selection,
+      plan: request.selectionPlan,
+    );
     request.writeParameters(encoder);
     final filters = request.filters;
     final sorters = request.sorters;
@@ -543,7 +414,7 @@ void _writeRequest(
     return;
   }
   encoder.writeVarint(schema.id);
-  _writeFieldMask(encoder, schema, params?[r'$select']);
+  writeSelectionMask(encoder, schema, params?[r'$select']);
   if (params != null) {
     for (final param in schema.params) {
       if (params.containsKey(param.name)) {
@@ -555,12 +426,26 @@ void _writeRequest(
   encoder.writeEnd();
 }
 
+int _responseLimit(int value) {
+  if (value <= 0 || value > 0x7fffffff) {
+    throw ArgumentError.value(
+      value,
+      'maxResponseBytes',
+      'must be a positive 31-bit integer',
+    );
+  }
+  return value;
+}
+
 // --- HTTP Transport ---
 
 /// HTTP-based transport for Flutter / Dart server.
-/// Uses HTTP/2 when available (dart:io HttpClient supports h2).
+/// The default native client uses HTTP/1.1; web negotiation is browser-managed.
+/// Inject a compatible client to use a different HTTP backend.
 class HttpTransport implements Transport {
+  final int maxResponseBytes;
   final String endpoint;
+  late final Uri _endpointURI = Uri.parse(endpoint);
   final Map<String, String> _headers = {
     'content-type': 'application/json',
     'x-luxo-mode': 'json',
@@ -570,6 +455,8 @@ class HttpTransport implements Transport {
     'x-luxo-mode': 'binary',
   };
   final http.Client _client;
+  final _pendingHTTP = <Completer<void>>{};
+  bool _closedHTTP = false;
   final Duration timeout;
   final Future<String?> Function()? onTokenExpired;
   TransportMode _mode;
@@ -582,7 +469,10 @@ class HttpTransport implements Transport {
     http.Client? client,
     this.timeout = const Duration(seconds: 30),
     this.onTokenExpired,
-  }) : _client = client ?? http.Client(),
+  }) : maxResponseBytes = _responseLimit(
+         options?.maxResponseBytes ?? 2 * 1024 * 1024,
+       ),
+       _client = client ?? http.Client(),
        _mode = options?.mode ?? TransportMode.json,
        _schema = {} {
     final headers = options?.headers;
@@ -614,7 +504,66 @@ class HttpTransport implements Transport {
   @override
   void setToken(String token) => _setHeader('authorization', 'Bearer $token');
   @override
-  void close() => _client.close();
+  void close() {
+    if (_closedHTTP) return;
+    _closedHTTP = true;
+    for (final abort in _pendingHTTP) {
+      if (!abort.isCompleted) abort.complete();
+    }
+    _pendingHTTP.clear();
+    _client.close();
+  }
+
+  Future<http.Response> _post(Map<String, String> headers, Object body) async {
+    if (_closedHTTP) {
+      throw LuxoError('NetworkError', 0, 'transport is closed');
+    }
+    final abort = Completer<void>();
+    _pendingHTTP.add(abort);
+    try {
+      final request = http.AbortableRequest(
+        'POST',
+        _endpointURI,
+        abortTrigger: abort.future,
+      )..headers.addAll(headers);
+      if (body is String) {
+        request.body = body;
+      } else {
+        request.bodyBytes = body as Uint8List;
+      }
+      return await _readHTTPResponse(request).timeout(
+        timeout,
+        onTimeout: () {
+          if (!abort.isCompleted) abort.complete();
+          throw TimeoutException('request deadline exceeded', timeout);
+        },
+      );
+    } on LuxoError {
+      if (!abort.isCompleted) abort.complete();
+      rethrow;
+    } on TimeoutException {
+      throw LuxoError('TimeoutError', 0, 'request timed out after $timeout');
+    } on http.RequestAbortedException {
+      throw LuxoError('CancelledError', 0, 'request cancelled');
+    } catch (error) {
+      throw LuxoError('NetworkError', 0, error.toString());
+    } finally {
+      _pendingHTTP.remove(abort);
+    }
+  }
+
+  Future<http.Response> _readHTTPResponse(http.BaseRequest request) async {
+    final response = await _client.send(request);
+    if (response is BufferedHTTPResponse) {
+      checkHTTPResponseSize(
+        response.bodyBytes.length,
+        maxResponseBytes,
+        response.statusCode,
+      );
+      return response.toResponse();
+    }
+    return collectHTTPResponse(response, maxResponseBytes);
+  }
 
   @override
   Future<T> call<T>(
@@ -655,16 +604,7 @@ class HttpTransport implements Transport {
   }) async {
     final body = _jsonRequests.encode(api, params);
 
-    final http.Response resp;
-    try {
-      resp = await _client
-          .post(Uri.parse(endpoint), headers: _headers, body: body)
-          .timeout(timeout);
-    } on TimeoutException {
-      throw LuxoError('TimeoutError', 0, 'request timed out after $timeout');
-    } catch (e) {
-      throw LuxoError('NetworkError', 0, e.toString());
-    }
+    final resp = await _post(_headers, body);
 
     final json = _jsonEnvelope(resp);
     if (resp.statusCode == 200 && !json.containsKey('error')) {
@@ -733,22 +673,11 @@ class HttpTransport implements Transport {
     final enc = LuxoEncoder();
     _writeRequest(enc, meta, params, request);
 
-    final http.Response resp;
-    try {
-      resp = await _client
-          .post(Uri.parse(endpoint), headers: _binaryHeaders, body: enc.bytes())
-          .timeout(timeout);
-    } on TimeoutException {
-      throw LuxoError('TimeoutError', 0, 'request timed out after $timeout');
-    } catch (e) {
-      throw LuxoError('NetworkError', 0, e.toString());
-    }
+    final resp = await _post(_binaryHeaders, enc.bytes());
 
-    if (resp.statusCode == 200) return Uint8List.fromList(resp.bodyBytes);
-    final error = decodeBinaryError(
-      Uint8List.fromList(resp.bodyBytes),
-      resp.statusCode,
-    );
+    // The HTTP response owns its collected body; no second copy is needed.
+    if (resp.statusCode == 200) return resp.bodyBytes;
+    final error = decodeBinaryError(resp.bodyBytes, resp.statusCode);
     final refresh = _refreshAfterUnauthorized(error, resp.statusCode, isRetry);
     if (refresh != null) {
       final newToken = await refresh;

@@ -8,10 +8,13 @@ String rewriteSelections(
   CompilationUnit unit,
   String source, {
   Uri? clientLibrary,
+  LibraryElement? library,
+  String Function(LibraryElement, MethodElement)? hiddenFactory,
 }) {
   final analyzer = SelectAnalyzer({}, clientLibrary: clientLibrary);
   unit.accept(analyzer);
   final edits = <({int offset, String text})>[];
+  final plans = StringBuffer();
   for (final entry in analyzer.callSelections.entries) {
     final call = entry.key;
     final method = call.methodName.element;
@@ -20,7 +23,9 @@ String rewriteSelections(
       continue;
     }
     if (call.argumentList.arguments.any(
-      (a) => a is NamedArgument && a.name.lexeme == 'select',
+      (a) =>
+          a is NamedArgument &&
+          (a.name.lexeme == 'select' || a.name.lexeme == r'$selectionPlan'),
     )) {
       continue;
     }
@@ -37,11 +42,76 @@ String rewriteSelections(
         ? ''
         : ',';
     // Schema field names are identifiers; no source text is interpolated.
-    edits.add((offset: closing.offset, text: "$separator select: '$select'"));
+    var argument = "$separator select: '$select'";
+    if (library != null &&
+        method.formalParameters.any(
+          (p) => p.isNamed && p.name == r'$selectionPlan',
+        )) {
+      final name = _hoistPlan(
+        unit,
+        source,
+        library,
+        method,
+        call,
+        select,
+        plans,
+        hiddenFactory,
+      );
+      argument += ', \$selectionPlan: $name';
+    }
+    edits.add((offset: closing.offset, text: argument));
+  }
+  if (plans.isNotEmpty) {
+    edits.add((offset: unit.declarations.first.offset, text: plans.toString()));
   }
   edits.sort((a, b) => b.offset.compareTo(a.offset));
   for (final edit in edits) {
     source = source.replaceRange(edit.offset, edit.offset, edit.text);
   }
   return source;
+}
+
+String _selectionFactory(
+  LibraryElement library,
+  MethodElement method,
+  String Function(LibraryElement, MethodElement)? hiddenFactory,
+) {
+  final owner = method.enclosingElement;
+  if (owner == null) throw StateError('Missing generated client owner');
+  if (library == method.library) return '${owner.name}.\$prepareSelection';
+  for (final fragment in library.fragments) {
+    for (final imported in fragment.libraryImports) {
+      final prefix = imported.prefix?.element.name;
+      final visible = prefix == null
+          ? imported.namespace.get2(owner.name!)
+          : imported.namespace.getPrefixed2(prefix, owner.name!);
+      if (visible != owner) continue;
+      return '${prefix == null ? '' : '$prefix.'}${owner.name}.\$prepareSelection';
+    }
+  }
+  if (hiddenFactory != null) return hiddenFactory(library, method);
+  throw StateError('Generated client is not visible for selection preparation');
+}
+
+String _hoistPlan(
+  CompilationUnit unit,
+  String source,
+  LibraryElement library,
+  MethodElement method,
+  MethodInvocation call,
+  String select,
+  StringBuffer plans,
+  String Function(LibraryElement, MethodElement)? hiddenFactory,
+) {
+  final factory = _selectionFactory(library, method, hiddenFactory);
+  final fragment = library.fragments.indexWhere(
+    (f) => f == unit.declaredFragment,
+  );
+  if (fragment < 0) throw StateError('Missing selection source fragment');
+  var name = '\$luxoSelection${fragment}_${call.offset}';
+  while (source.contains(name) || library.exportNamespace.get2(name) != null) {
+    name += '_';
+  }
+  plans.write(" final $name = $factory('$select');");
+  return name;
 }

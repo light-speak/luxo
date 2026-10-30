@@ -20,11 +20,15 @@ Android 设备最低版本，也不替代真实设备兼容性验证。
 
 Kotlin CI runs on Temurin JDK 26, supported by the
 [Gradle compatibility matrix](https://docs.gradle.org/9.7.0/userguide/compatibility.html).
+The build-time Gradle plugin explicitly targets JVM 26 and requires JDK 26 or
+later to load; this is separate from the SDK runtime's JVM 1.8 target.
 Local integration and benchmark results identify the exact JDK patch used;
 they do not imply validation of every newer patch or Android release.
 
 Kotlin CI 使用 Temurin JDK 26，见上方 Gradle 官方兼容矩阵。本地联测和基准注明
 实际 JDK 补丁版本，不把这些结果视为所有更新补丁或 Android 版本均已通过。
+构建期 Gradle 插件显式以 JVM 26 为目标，加载时需要 JDK 26 或更高版本；
+这与 SDK 运行库的 JVM 1.8 目标独立。
 
 Field analysis uses the current compiler's project-environment factory and
 configuration-service initializer, without opting into deprecated K1/Core
@@ -278,13 +282,25 @@ inline subscription callbacks are supported. Explicit `select` takes precedence.
 Opaque model escape, unresolved usage and API function references require an
 explicitly selected wrapper; they fail compilation instead of underfetching or
 selecting all fields. Generated clients no longer read API-wide `SelectHints`;
-the legacy `luxoAnalyze` task is diagnostic only and is not a compile dependency.
+the legacy `luxoAnalyze` task, `SelectAnalyzerCli`, and API-wide hints generator
+have been removed. Apply the `com.luxo.select` compiler plugin for per-call
+inference; remove obsolete `luxo.srcDir`/`luxo.hintsFile` configuration.
 
 The JVM acceptance includes generated typed Binary requests and a real Gradle
 consumer with incremental source changes. Android, other Kotlin targets,
 complete inference coverage and performance remain separate acceptance gates.
 
 ## Usage / 使用
+
+`OkHttpTransport` defaults to `maxResponseBytes = 2 * 1024 * 1024` and
+`maxConcurrentRequests = 16`. Oversized responses fail with `ParseError`;
+capacity overflow fails with `NetworkError`/503 without an SDK waiting queue.
+Slots remain occupied until response reading and close complete. The default
+client applies `timeoutSeconds` to the whole HTTP call; an injected client's
+dispatcher, socket factory and timeout configuration are preserved. Default
+direct TCP sockets enable `TCP_NODELAY` when created, before TLS wrapping; this
+does not add a per-request socket option call. OkHttp creates SOCKS proxy sockets
+separately, so this setting does not promise the same behavior through SOCKS.
 
 ```kotlin
 val transport = OkHttpTransport(

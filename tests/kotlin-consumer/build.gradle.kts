@@ -1,3 +1,5 @@
+import org.gradle.api.attributes.LibraryElements
+
 plugins {
     kotlin("jvm") version "2.4.20"
     id("com.luxo.select")
@@ -9,6 +11,11 @@ repositories {
 
 dependencies {
     implementation("com.luxo:luxo-client:1.0.0-beta.1")
+}
+
+// Exercise the packaged SDK, including when dependency substitution uses the local build.
+configurations.named("compileClasspath") {
+    attributes.attribute(LibraryElements.LIBRARY_ELEMENTS_ATTRIBUTE, objects.named(LibraryElements.JAR))
 }
 
 layout.buildDirectory = layout.projectDirectory.dir(".tmp/build")
@@ -23,6 +30,9 @@ kotlin {
 luxo {
     outputDirectory.set(layout.projectDirectory.dir(".tmp/generated/com/luxo/generated"))
 }
+
+// Generation is explicit; when requested together, compile only after its outputs are ready.
+tasks.named("compileKotlin") { mustRunAfter("luxoGenerate") }
 
 val verifyProtocol = tasks.register<JavaExec>("verifyProtocol") {
     group = "verification"
@@ -79,7 +89,7 @@ tasks.register("captureProjectionBaseline") {
     dependsOn("luxoGenerate")
     doLast {
         val snapshot = file(".tmp/projection-before").apply { mkdirs() }
-        for (name in listOf("Types.kt", "LuxoClient.kt", "Schema.kt", "SelectHints.kt")) {
+        for (name in listOf("Types.kt", "LuxoClient.kt", "Schema.kt")) {
             val source = file(".tmp/generated/com/luxo/generated/$name").readText()
             val target = snapshot.resolve(name)
             check(!target.exists() || target.readText() == source) { "Projection baseline already exists with different content" }
@@ -91,7 +101,8 @@ tasks.register("captureProjectionBaseline") {
 // Compare real generated clients; the frozen side is an explicit local input, not shipped code.
 providers.gradleProperty("luxo.projectionBaseline").orNull?.let { snapshot ->
     val baseline = file(snapshot)
-    val names = listOf("Types.kt", "LuxoClient.kt", "Schema.kt", "SelectHints.kt")
+    val names = listOf("Types.kt", "LuxoClient.kt", "Schema.kt") +
+        listOf("SelectHints.kt").filter { baseline.resolve(it).isFile }
     val generated = layout.projectDirectory.dir(".tmp/projection-benchmark")
     val template = file("benchmark/JsonProjectionBenchmark.kt.txt")
     val harness = file("../../packages/kotlin/src/test/kotlin/com/luxo/client/WebSocketIDBenchmark.kt")

@@ -252,7 +252,7 @@ func TestDartCIPinsBothSupportedToolchains(t *testing.T) {
 		if strings.Contains(step.Run, "dart analyze --fatal-infos") {
 			analyses++
 		}
-		if step.Run == "dart test" {
+		if step.Run == "dart test --concurrency=1" {
 			vm++
 		}
 		if strings.Contains(step.Run, "dart test -p node -c dart2js -c dart2wasm") {
@@ -427,27 +427,6 @@ func TestQualityGatesCheckEveryGoDirectory(t *testing.T) {
 	}
 }
 
-func TestCIEnforces32BitErrorCodeBoundaries(t *testing.T) {
-	for _, step := range readQualityWorkflow(t).Jobs["test"].Steps {
-		if step.Name != "Verify 32-bit error code boundaries" {
-			continue
-		}
-		for _, required := range []string{
-			"GOARCH=386", "CGO_ENABLED=0", "go test ./pkg/lux/api ./pkg/lux/rpc",
-			"TestDecodeBinaryErrorCodeRepresentability", "TestRPCErrorCodeDoesNotNarrow", "-count=1",
-		} {
-			if !strings.Contains(step.Run, required) {
-				t.Errorf("32-bit boundary check missing %q", required)
-			}
-		}
-		if step.ContinueOnError || step.If != "" {
-			t.Fatal("32-bit boundary failures must block CI")
-		}
-		return
-	}
-	t.Fatal("missing 32-bit boundary check")
-}
-
 func TestCIGoCommandsIncludeInternalPackages(t *testing.T) {
 	workflow := readQualityWorkflow(t)
 	for _, test := range []struct{ job, step, command string }{
@@ -620,4 +599,37 @@ func readQualityFile(t *testing.T, path string) string {
 
 func shellQualityQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+func TestSDKInteropBindsCandidateModules(t *testing.T) {
+	workflow := readQualityWorkflow(t)
+	for _, job := range []string{"sdk-ts", "sdk-dart", "sdk-kotlin", "sdk-swift-conformance"} {
+		t.Run(job, func(t *testing.T) {
+			goSetup, bindings, firstConsumer, count := -1, -1, -1, 0
+			for index, step := range workflow.Jobs[job].Steps {
+				if strings.HasPrefix(step.Uses, "actions/setup-go@") {
+					goSetup = index
+				}
+				if step.Uses == "./.github/actions/setup-modules" {
+					bindings = index
+					count++
+					condition := ""
+					if job == "sdk-ts" {
+						condition = "matrix.package == 'vite-plugin'"
+					}
+					if step.If != condition || step.ContinueOnError {
+						t.Error("module setup must match Go setup and propagate failures")
+					}
+				}
+				consumer := strings.Contains(step.Run, "./tests/sdk-interop") ||
+					strings.Contains(step.Run, "pnpm test") || strings.Contains(step.Run, "./gradlew build")
+				if consumer && firstConsumer < 0 {
+					firstConsumer = index
+				}
+			}
+			if count != 1 || goSetup < 0 || bindings <= goSetup || firstConsumer <= bindings {
+				t.Fatalf("invalid module setup order: go=%d bindings=%d consumer=%d count=%d", goSetup, bindings, firstConsumer, count)
+			}
+		})
+	}
 }

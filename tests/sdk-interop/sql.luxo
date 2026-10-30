@@ -1,0 +1,9 @@
+model Product @noTime {
+  id: Int @id
+  name: String
+  price: Int
+  description: String
+}
+api products(): [Product] { return Product.all() }
+api selectedProducts(): [Product] { return Product.select().all() }
+api listProducts(): [Product]

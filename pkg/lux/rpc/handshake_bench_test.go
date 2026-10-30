@@ -67,6 +67,8 @@ func benchmarkColdConnection(b *testing.B, verified bool) {
 	}
 }
 
+// Historical envelope-only control. Production directly composes the complete
+// request; BenchmarkLRPCDirectRequest measures that path against its predecessor.
 func BenchmarkRPCRequestEnvelope(b *testing.B) {
 	body := encodeCallRequest(1, nil, nil)
 	for _, traced := range []bool{false, true} {

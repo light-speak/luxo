@@ -30,6 +30,7 @@ func (c BreakingChange) String() string {
 // BreakingChanges compares the current AST with the persisted wire contract.
 // Additive response fields and optional API parameters remain compatible.
 func (lf *LockFile) BreakingChanges(files []*ast.File) []BreakingChange {
+	files = inferred.ExpandedFiles(files)
 	contracts := collectContracts(files)
 	var changes []BreakingChange
 	changes = append(changes, compareFields("model", lf.Models, contracts.models, false)...)

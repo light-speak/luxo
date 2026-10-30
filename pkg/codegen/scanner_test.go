@@ -74,12 +74,14 @@ func BenchmarkScannerDiscard(b *testing.B) {
   rows := &discardRows{fields: make([]pgconn.FieldDescription, unknown+1)}
   rows.fields[0].Name = "id"
   for i := 1; i < len(rows.fields); i++ { rows.fields[i].Name = "ignored" }
+  for _, count := range []int{1, 128} {
   for _, previous := range []bool{true, false} {
    scan := scanUser; if previous { scan = scanUserPrevious }
-   b.Run(fmt.Sprintf("unknown=%d/previous=%v", unknown, previous), func(b *testing.B) {
+   b.Run(fmt.Sprintf("unknown=%d/rows=%d/previous=%v", unknown, count, previous), func(b *testing.B) {
     b.ReportAllocs()
-    for b.Loop() { var err error; scannerSink, err = scan(rows); if err != nil { b.Fatal(err) } }
+    for b.Loop() { for range count { var err error; scannerSink, err = scan(rows); if err != nil { b.Fatal(err) } } }
    })
+  }
   }
  }
 }

@@ -90,7 +90,46 @@ const posts = await transport.call('listPosts', { page: 1n, pageSize: 20n, $sele
 
 ## Features
 
-### HTTP/2 Transport
+### Native Node.js HTTP/2
+
+`FetchTransport` limits collected response bodies to 2 MiB by default. Set
+`maxResponseBytes` to a positive byte limit to override it. A streamed response
+that exceeds the limit fails with `ParseError` and its reader is cancelled.
+Custom HTTP executors returning only a completed `arrayBuffer()` must enforce
+their own collection limit; the transport can only check that completed buffer.
+
+Node applications can use the dedicated entry point with their generated client:
+
+```ts
+import { NodeHTTP2Transport } from '@luxojs/client/node'
+import { LuxoClient } from './generated/client.js'
+
+const transport = new NodeHTTP2Transport('https://api.example.com/luvia', {
+  mode: 'binary',
+  timeout: 30000,
+  maxConcurrentRequests: 16,
+})
+const client = new LuxoClient(transport)
+// Use the generated client's API methods. Close on application shutdown.
+// transport.close()
+```
+
+This transport uses Node's built-in HTTP/2 implementation and a reusable TLS
+connection. It requires HTTPS with verified certificates and negotiated HTTP/2;
+it does not silently fall back to HTTP/1.1 or replay failed requests. The existing
+token-refresh policy remains shared with `FetchTransport`.
+
+Requests above the local or known peer concurrency limit fail rather than enter
+an unbounded queue. Encoded request and response bodies are each limited to
+2 MiB by default (`maxRequestBytes` and `maxResponseBytes`). Cancelling one
+request leaves other streams active. `close()` cancels pending requests and
+permanently closes this transport. Private CAs and mutual TLS can be configured
+through `tls.ca`, `tls.cert`, and `tls.key`; certificate verification stays enabled.
+
+The Node entry point is separate from browser imports. Generated `create()`
+calls and `FetchTransport` retain their existing fetch-based behavior.
+
+### Fetch Transport
 
 Uses native `fetch()` and the runtime's HTTP connection management. HTTP/2 multiplexing depends on the runtime, endpoint and negotiated protocol; the SDK cannot force browsers or Node.js to use HTTP/2. JSON mode also requires the native lossless-number APIs described below.
 

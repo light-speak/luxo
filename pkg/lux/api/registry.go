@@ -12,6 +12,10 @@ import (
 // Register adds an API during startup. Repeating the same binding is harmless;
 // changing either side of an existing binding requires a new registry.
 func (r *APIRegistry) Register(name string, id int) error {
+	return r.register(name, id, true)
+}
+
+func (r *APIRegistry) register(name string, id int, prepare bool) error {
 	if name == "" || id <= 0 || id > codec.MaxAPIID {
 		return fmt.Errorf("registry: API %q ID %d must be in 1..%d with a nonempty name", name, id, codec.MaxAPIID)
 	}
@@ -25,6 +29,9 @@ func (r *APIRegistry) Register(name string, id int) error {
 		return fmt.Errorf("registry: API %q already has ID %d, not %d", name, previous, id)
 	}
 	r.idToName[id], r.nameToID[name] = name, id
+	if prepare {
+		r.refreshBinaryPlan(name)
+	}
 	return nil
 }
 
@@ -34,7 +41,7 @@ func (r *APIRegistry) RegisterParams(name string, params []ParamMeta) error {
 	if exists, err := r.checkParams(name, params); exists || err != nil {
 		return err
 	}
-	r.installParams(name, slices.Clone(params))
+	r.installParams(name, slices.Clone(params), true)
 	return nil
 }
 
@@ -53,12 +60,15 @@ func (r *APIRegistry) checkParams(name string, params []ParamMeta) (bool, error)
 
 // Only accept a newly allocated, registry-owned slice here. Public registration
 // clones caller input; schema conversion already supplies an independent slice.
-func (r *APIRegistry) installParams(name string, owned []ParamMeta) {
+func (r *APIRegistry) installParams(name string, owned []ParamMeta, prepare bool) {
 	names := make([]string, len(owned))
 	for i, param := range owned {
 		names[i] = param.Name
 	}
 	r.paramOrder[name], r.paramNames[name] = owned, names
+	if prepare {
+		r.refreshBinaryPlan(name)
+	}
 }
 
 func sameRegisteredParams(previous, incoming []ParamMeta) bool {
@@ -132,7 +142,7 @@ func (r *APIRegistry) RegisterSchemaAPIs(s *schema.Schema) error {
 		if definition == nil || definition.Name != name {
 			return fmt.Errorf("registry: schema API %q is nil or has a different name", name)
 		}
-		if err := candidate.Register(name, definition.ID); err != nil {
+		if err := candidate.register(name, definition.ID, false); err != nil {
 			return err
 		}
 		params := schemaParamMetadata(definition.Params)
@@ -141,12 +151,13 @@ func (r *APIRegistry) RegisterSchemaAPIs(s *schema.Schema) error {
 			return err
 		}
 		if !exists {
-			candidate.installParams(name, params)
+			candidate.installParams(name, params, false)
 		}
 	}
 	if err := s.Prepare(); err != nil {
 		return err
 	}
+	candidate.rebuildBinaryPlans()
 	*r = *candidate
 	return nil
 }

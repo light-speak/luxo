@@ -77,6 +77,8 @@ func TestInitProjectEnvExample(t *testing.T) {
 		"LUXO_CACHE_BACKEND=none",
 		"CORS_ORIGIN=*",
 		"LOG_LEVEL=info",
+		"LOG_REQUESTS_FULL=true",
+		"sample 1 in 100 successful requests",
 		"GRACEFUL_TIMEOUT=30s",
 	}
 	for _, check := range checks {

@@ -40,6 +40,7 @@ data class APISchemaEntry(
 ) {
     // Built once with the schema, not on the request path.
     internal val paramsByName = params.associateBy { it.name }
+    internal var selectionSnapshot = false
 }
 
 data class SelectionFieldSchema(
@@ -59,67 +60,6 @@ data class ParamSchema(
     val nullable: Boolean = false,
 	val typeName: String? = null,
 )
-
-private data class SelectedField(val name: String, val children: List<SelectedField>? = null)
-
-private class SelectionParser(private val input: String) {
-    private var offset = 0
-
-    fun parse(): List<SelectedField> {
-        val fields = parseList(nested = false, depth = 0)
-        skipSpaces()
-        if (offset != input.length) fail("unexpected '${input[offset]}'")
-        return fields
-    }
-
-    private fun parseList(nested: Boolean, depth: Int): List<SelectedField> {
-        if (depth >= 32) fail("selection depth exceeds 32")
-        val fields = mutableListOf<SelectedField>()
-        val names = mutableSetOf<String>()
-        while (true) {
-            skipSpaces()
-            if (offset >= input.length || (nested && input[offset] == '}')) break
-            val name = readIdentifier()
-            if (name.isEmpty()) fail("expected field name")
-            if (!names.add(name)) fail("duplicate field '$name'")
-            skipSpaces()
-            val children = if (offset < input.length && input[offset] == '{') parseChildren(name, depth) else null
-            fields += SelectedField(name, children)
-            skipSpaces()
-            if (offset >= input.length || input[offset] != ',') break
-            offset++
-        }
-        return fields
-    }
-
-    private fun parseChildren(name: String, depth: Int): List<SelectedField> {
-        offset++
-        val children = parseList(nested = true, depth = depth + 1)
-        if (children.isEmpty()) fail("empty selection for '$name'")
-        skipSpaces()
-        if (offset >= input.length || input[offset] != '}') fail("missing '}' for '$name'")
-        offset++
-        return children
-    }
-
-    private fun readIdentifier(): String {
-        val start = offset
-        if (offset >= input.length || !input[offset].isIdentifierStart()) return ""
-        offset++
-        while (offset < input.length && input[offset].isIdentifierPart()) offset++
-        return input.substring(start, offset)
-    }
-
-    private fun skipSpaces() {
-        while (offset < input.length && input[offset].isWhitespace()) offset++
-    }
-
-    private fun fail(message: String): Nothing =
-        throw LuxoError("ConfigError", 0, "$message at position $offset")
-}
-
-private fun Char.isIdentifierStart(): Boolean = this == '_' || this in 'A'..'Z' || this in 'a'..'z'
-private fun Char.isIdentifierPart(): Boolean = isIdentifierStart() || this in '0'..'9'
 
 /** Convert supported Kotlin values to their lossless JSON representation. */
 internal fun luxoJsonValue(value: Any?): JsonElement = when (value) {
@@ -184,7 +124,7 @@ internal object LuxoBinaryProtocol {
         if (meta.id != request.apiID) throw LuxoError("ConfigError", 0, "generated request API ID differs from registered schema")
         val enc = LuxoEncoder()
         enc.writeVarint(request.apiID.toLong())
-        writeFieldMask(enc, meta, request.selection)
+        writeFieldMask(enc, meta, request.selection, request.selectionPlan)
         request.writeParameters(enc)
         request.filters?.let { encodeTypedFilters(enc, it) }
         request.sorters?.let { encodeTypedSorters(enc, it) }
@@ -249,45 +189,6 @@ internal object LuxoBinaryProtocol {
         }
     }
 
-    private fun writeFieldMask(enc: LuxoEncoder, meta: APISchemaEntry, selection: String?) {
-		if (meta.fields.isEmpty()) {
-            enc.writeVarint(0)
-            return
-        }
-		if (selection.isNullOrBlank()) {
-			throw LuxoError("ConfigError", 0, "\$select is required for structured responses")
-		}
-        val mask = encodeSelectionNode(SelectionParser(selection).parse(), meta.fields, meta.types)
-        enc.writeVarint(mask.size.toLong())
-        enc.writeRawBytes(mask)
-    }
-
-    private fun encodeSelectionNode(
-        selected: List<SelectedField>,
-        fields: Map<String, SelectionFieldSchema>,
-        types: Map<String, Map<String, SelectionFieldSchema>>,
-    ): ByteArray {
-        var mask = ByteArray(0)
-        val children = mutableListOf<Pair<Int, ByteArray>>()
-        for (field in selected) {
-            val meta = fields[field.name]
-                ?: throw LuxoError("ConfigError", 0, "unknown selected field: ${field.name}")
-            mask = FieldMask.set(mask, meta.fieldID)
-            val nestedSelection = field.children ?: continue
-            val nestedFields = meta.typeName?.let(types::get)
-                ?: throw LuxoError("ConfigError", 0, "field ${field.name} does not support nested selection")
-            children += meta.fieldID to encodeSelectionNode(nestedSelection, nestedFields, types)
-        }
-        val node = LuxoEncoder()
-        node.writeVarint(mask.size.toLong())
-        node.writeRawBytes(mask)
-        for ((fieldID, child) in children.sortedBy { it.first }) {
-            node.writeVarint(fieldID.toLong())
-            node.writeVarint(child.size.toLong())
-            node.writeRawBytes(child)
-        }
-        return node.bytes()
-    }
 
     private fun encodeFilters(enc: LuxoEncoder, value: Any) {
         val filters = value as? List<*>
@@ -502,13 +403,20 @@ class OkHttpTransport(
     timeoutSeconds: Long = 30,
     /** Called only for valid HTTP/code 401 errors; a new token retries once in the original mode. */
     private val onTokenExpired: (suspend () -> String?)? = null,
+    private val maxResponseBytes: Int = 2 * 1024 * 1024,
+    maxConcurrentRequests: Int = 16,
 ) : Transport {
 
-    private val client: OkHttpClient = (client ?: OkHttpClient.Builder()
-        .connectTimeout(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)
-        .readTimeout(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)
-        .writeTimeout(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)
-        .build())
+    init {
+        require(maxResponseBytes > 0) { "maxResponseBytes must be positive" }
+        require(maxConcurrentRequests > 0) { "maxConcurrentRequests must be positive" }
+    }
+    private val capacity = HTTPRequestCapacity(maxConcurrentRequests)
+
+    // Preserve OkHttp URL normalization and call-time failures; reuse its immutable value.
+    private val endpointURL by lazy { Request.Builder().url(endpoint).build().url }
+
+    private val client: OkHttpClient = client ?: defaultHTTPClient(timeoutSeconds, maxConcurrentRequests)
     @Volatile private var currentHeaders = HttpProtocolHeaders(headers, token)
     @Volatile private var currentMode: TransportMode = mode
     @Volatile private var currentSchema: Map<String, APISchemaEntry> = snapshotAPISchema(schema)
@@ -536,13 +444,13 @@ class OkHttpTransport(
         }
 
         val request = Request.Builder()
-            .url(endpoint)
+            .url(endpointURL)
             .post(encodeLuxoJSON(body).toRequestBody(HttpProtocolHeaders.JSON_MEDIA_TYPE))
             .headers(currentHeaders.json)
             .build()
 
-        val response = client.awaitFullResponse(request) {
-            HTTPResponseBytes(it.code, it.body?.bytes() ?: throw IOException("missing response body"))
+        val response = client.awaitFullResponse(request, capacity) {
+            HTTPResponseBytes(it.code, readBoundedHTTPBody(it, maxResponseBytes))
         }
         val json = try {
             decodeHTTPJSON(response.body)
@@ -570,13 +478,13 @@ class OkHttpTransport(
             else LuxoBinaryProtocol.encodeRequest(meta, generated)
 
         val request = Request.Builder()
-            .url(endpoint)
+            .url(endpointURL)
             .post(body.toRequestBody(HttpProtocolHeaders.BINARY_MEDIA_TYPE))
             .headers(currentHeaders.binary)
             .build()
 
-        val response = client.awaitFullResponse(request) {
-            HTTPResponseBytes(it.code, it.body?.bytes() ?: throw IOException("missing response body"))
+        val response = client.awaitFullResponse(request, capacity) {
+            HTTPResponseBytes(it.code, readBoundedHTTPBody(it, maxResponseBytes))
         }
         if (response.code == 200) return response.body
         val error = LuxoBinaryProtocol.decodeError(response.body, response.code)
@@ -595,22 +503,32 @@ class OkHttpTransport(
 /** Internal response wrapper carrying HTTP status code. */
 private data class HTTPResponseBytes(val code: Int, val body: ByteArray)
 
-private suspend inline fun <T> OkHttpClient.awaitFullResponse(request: Request, crossinline read: (Response) -> T): T =
+private suspend inline fun <T> OkHttpClient.awaitFullResponse(request: Request, capacity: HTTPRequestCapacity, crossinline read: (Response) -> T): T =
     suspendCancellableCoroutine { cont ->
-        val call = newCall(request)
-        cont.invokeOnCancellation { call.cancel() }
-        call.enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                cont.resumeWithException(LuxoError("NetworkError", 0, e.message ?: "network error"))
-            }
-            override fun onResponse(call: Call, response: Response) {
-                val result = try {
-                    response.use { read(it) }
-                } catch (error: Exception) {
-                    cont.resumeWithException(LuxoError("NetworkError", 0, error.message ?: "response body failed"))
-                    return
+        if (!capacity.acquire()) {
+            cont.resumeWithException(LuxoError("NetworkError", 503, "HTTP request capacity exceeded"))
+            return@suspendCancellableCoroutine
+        }
+        try {
+            val call = newCall(request)
+            cont.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    capacity.release()
+                    cont.resumeWithException(LuxoError("NetworkError", 0, e.message ?: "network error"))
                 }
-                cont.resume(result)
-            }
-        })
+                override fun onResponse(call: Call, response: Response) {
+                    val result = try {
+                        Result.success(response.use { read(it) })
+                    } catch (error: Exception) {
+                        call.cancel()
+                        Result.failure(error as? LuxoError ?: LuxoError("NetworkError", 0, error.message ?: "response body failed"))
+                    } finally { capacity.release() }
+                    cont.resumeWith(result)
+                }
+            })
+        } catch (error: Exception) {
+            capacity.release()
+            cont.resumeWithException(LuxoError("NetworkError", 0, error.message ?: "request failed"))
+        }
     }

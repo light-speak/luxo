@@ -84,11 +84,11 @@ export function genScalarJSONRead(type: string, value: string): string {
 function modelDecode(api: LuxoAPI): string {
   const type = api.returnType
   if (api.paginated) {
-    const page = `(d as Record<string, unknown>)`
+    const page = `(d as { [key: string]: unknown })`
     return `d instanceof Uint8Array ? decodePaginated${type}(d) : { items: decodeJSON${type}$list(${page}['items']), total: int64FromJSON(${page}['total']), page: int64FromJSON(${page}['page']), pageSize: int64FromJSON(${page}['pageSize']) }`
   }
   if (api.returnList) {
     return `d instanceof Uint8Array ? decodeColumnar${type}(d) : decodeJSON${type}$list(d)`
   }
-  return `d instanceof Uint8Array ? decode${type}(new Decoder(d)) : decodeJSON${type}(d as Record<string, unknown>)`
+  return `d instanceof Uint8Array ? decode${type}(new Decoder(d)) : decodeJSON${type}(d as { [key: string]: unknown })`
 }

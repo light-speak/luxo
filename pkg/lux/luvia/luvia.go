@@ -27,7 +27,7 @@ import (
 type Gateway struct {
 	Router          *api.Router
 	modules         []string
-	server          *http.Server
+	server          gatewayHTTPRuntime
 	metrics         *MetricsCollector
 	registrar       *GatewayRegistrar
 	dependencyStats lux.RuntimeDependencyStatsProvider
@@ -137,7 +137,7 @@ func (g *Gateway) serve(version string, quit <-chan os.Signal) (serveResult erro
 	certFile := envOr("APP_TLS_CERT", "")
 	keyFile := envOr("APP_TLS_KEY", "")
 
-	server, serveErr, err := startGatewayServer(addr, mux, certFile, keyFile)
+	server, serveErr, err := startGatewayServerWithBodyLimits(addr, mux, certFile, keyFile, g.Router.BodyLimits())
 	if err != nil {
 		return err
 	}
@@ -178,8 +178,16 @@ func (g *Gateway) closeIntegrations() {
 	}
 }
 
-func startGatewayServer(addr string, mux http.Handler, certFile, keyFile string) (*http.Server, <-chan error, error) {
+func startGatewayServer(addr string, mux http.Handler, certFile, keyFile string) (*gatewayHTTPServer, <-chan error, error) {
+	return startGatewayServerWithBodyLimits(addr, mux, certFile, keyFile, api.BodyLimits{RequestBytes: api.MaxRequestBodySize, ResponseBytes: api.DefaultResponseBodySize})
+}
+
+func startGatewayServerWithBodyLimits(addr string, mux http.Handler, certFile, keyFile string, body api.BodyLimits) (*gatewayHTTPServer, <-chan error, error) {
 	timeouts, err := serverTimeoutsFromEnv()
+	if err != nil {
+		return nil, nil, err
+	}
+	h2, err := newGatewayHTTPTransport(mux, timeouts, body)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -188,7 +196,7 @@ func startGatewayServer(addr string, mux http.Handler, certFile, keyFile string)
 		return nil, nil, fmt.Errorf("listen %s: %w", addr, err)
 	}
 	server := &http.Server{
-		Addr:         addr,
+		Addr:         listener.Addr().String(),
 		Handler:      h2c.NewHandler(mux, &http2.Server{}),
 		ReadTimeout:  timeouts.read,
 		WriteTimeout: timeouts.write,
@@ -202,15 +210,15 @@ func startGatewayServer(addr string, mux http.Handler, certFile, keyFile string)
 		}
 		server.Handler = mux
 		server.TLSConfig = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
-		if configureErr := http2.ConfigureServer(server, &http2.Server{}); configureErr != nil {
-			listener.Close()
-			return nil, nil, fmt.Errorf("configure HTTP/2: %w", configureErr)
+		if h2 == nil {
+			if configureErr := http2.ConfigureServer(server, &http2.Server{}); configureErr != nil {
+				// This locally owned TLS config has no custom cipher suites; retain upstream error propagation.
+				listener.Close()
+				return nil, nil, fmt.Errorf("configure HTTP/2: %w", configureErr)
+			}
 		}
-		listener = tls.NewListener(listener, server.TLSConfig)
 	}
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- server.Serve(listener) }()
-	return server, serveErr, nil
+	return startConfiguredGatewayServer(listener, server, h2, certFile != "" && keyFile != "")
 }
 
 type serverTimeouts struct {

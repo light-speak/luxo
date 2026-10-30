@@ -1,6 +1,23 @@
 part of 'int64_consumer_test.dart';
 
 void verifyScalarResponses() {
+  test('generated calls and streams retain selection plan identity', () async {
+    final transport = _ResponseTransport()..response = <String, dynamic>{};
+    final client = LuxoClient(transport);
+    final plan = sdk.PreparedSelection('data');
+    await client.createSnapshot($selectionPlan: plan);
+    expect(identical(transport.lastRequest!.selectionPlan, plan), isTrue);
+    expect(transport.params, {r'$select': 'data'});
+    await client.createSnapshot(select: 'metadata', $selectionPlan: plan);
+    expect(transport.params, {r'$select': 'metadata'});
+    final cancel = await client.subscribeWatchPayload(
+      projectId: sdk.LuxoInt64.fromInt(1), $selectionPlan: plan, onData: (_) {},
+    );
+    expect(identical(transport.lastRequest!.selectionPlan, plan), isTrue);
+    expect(transport.params, {'projectId': sdk.LuxoInt64.fromInt(1), r'$select': 'data'});
+    cancel();
+    client.close();
+  });
   test('enum parameter lists remain independent and growable', () async {
     final transport = _ResponseTransport()..response = 'OPEN';
     final client = LuxoClient(transport);
@@ -407,6 +424,7 @@ Future<void> _verifySubscription(
 // Controlled response injection tests generated callbacks, not real WebSocket frames.
 class _ResponseTransport extends sdk.Transport {
   Object? response;
+  sdk.GeneratedRequest? lastRequest;
   Map<String, dynamic>? params;
   void Function(dynamic)? receiver;
 
@@ -417,6 +435,7 @@ class _ResponseTransport extends sdk.Transport {
     sdk.GeneratedRequest? request,
     T Function(dynamic)? decoder,
   }) async {
+    lastRequest = request;
     this.params = request?.toJSONParameters() ?? params;
     return decoder!(response);
   }
@@ -431,6 +450,7 @@ class _ResponseTransport extends sdk.Transport {
     void Function(sdk.LuxoError)? onError,
     void Function()? onDone,
   }) async {
+    lastRequest = request;
     this.params = request?.toJSONParameters() ?? params;
     receiver = (value) => onData(decoder(value));
     return () => receiver = null;

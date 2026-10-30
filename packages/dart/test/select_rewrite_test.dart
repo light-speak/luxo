@@ -15,6 +15,66 @@ class LuxoClient {
 ''';
 
 void main() {
+  test('prefixed client plans are hoisted once in part files', () async {
+    final client = definitions
+        .replaceFirst(
+          'class LuxoClient {',
+          r'class LuxoClient { static PreparedSelection $prepareSelection(String text) => PreparedSelection(text);',
+        )
+        .replaceFirst(
+          '{String? select}',
+          r'{String? select, PreparedSelection? $selectionPlan}',
+        );
+    const source = """part of 'main.dart';
+Future<void> load(sdk.LuxoClient client) async {
+  final first = await client.getUser(1);
+  print(first.id.value);
+  final second = await client.getUser(2);
+  print(second.name.value);
+}
+""";
+    final fixture = await SelectFixture.create({
+      'lib/client.dart': client,
+      'lib/main.dart':
+          "import 'client.dart' as sdk show LuxoClient; part 'calls.dart';",
+      'lib/calls.dart': source,
+    });
+    try {
+      final resolved = await fixture.unit('lib/calls.dart');
+      final rewritten = rewriteSelections(
+        resolved.unit,
+        source,
+        library: resolved.libraryElement,
+      );
+      expect(rewritten, contains(r"sdk.LuxoClient.$prepareSelection('id')"));
+      expect(rewritten, contains(r"sdk.LuxoClient.$prepareSelection('name')"));
+      expect(rewritten, contains(r'$selectionPlan:'));
+      expect(rewritten.split('\n').length, source.split('\n').length);
+      final rebuilt = await SelectFixture.create({
+        'lib/client.dart': client,
+        'lib/main.dart':
+            "import 'client.dart' as sdk show LuxoClient; part 'calls.dart';",
+        'lib/calls.dart': rewritten,
+      });
+      try {
+        final reparsed = await rebuilt.unit('lib/calls.dart');
+        expect(
+          rewriteSelections(
+            reparsed.unit,
+            rewritten,
+            library: reparsed.libraryElement,
+          ),
+          rewritten,
+          reason: 'prepared output must not accumulate plans on a second pass',
+        );
+      } finally {
+        await rebuilt.close();
+      }
+    } finally {
+      await fixture.close();
+    }
+  });
+
   test(
     'same API has isolated call-site selections and source stays unchanged',
     () async {

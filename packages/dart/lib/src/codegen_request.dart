@@ -6,7 +6,11 @@ String _requestCall(
   bool stream = false,
 }) {
   final args = api.params.map((p) => '${p.name}: ${p.name}').toList();
-  if (selection) args.add('sel: ${stream ? 'select' : 'sel'}');
+  if (selection) {
+    final selected = stream ? r'select ?? $selectionPlan?.text' : 'sel';
+    args.add('sel: $selected');
+    args.add(r'$selectionPlan: $selectionPlan');
+  }
   if (api.paginated) {
     for (final name in _paginationNames) {
       if (!api.params.any((p) => p.name == name)) args.add('$name: $name');
@@ -40,6 +44,7 @@ void _genRequest(
   _writeRequestAccessors(b, api, selection, stored);
   b.writeln('  @override\n  Map<String, dynamic> toJSONParameters() {');
   for (final name in fields.keys) {
+    if (name == r'$selectionPlan') continue;
     b.writeln('    final $name = ${stored[name]};');
   }
   b.writeln('    return {');
@@ -73,6 +78,8 @@ void _genRequest(
   if (selection) {
     fields['sel'] = 'String?';
     declarations.add('String? sel');
+    fields[r'$selectionPlan'] = 'PreparedSelection?';
+    declarations.add(r'PreparedSelection? $selectionPlan');
   }
   if (api.paginated) {
     for (final name in _paginationNames) {
@@ -99,8 +106,12 @@ void _writeRequestAccessors(
   bool selection,
   Map<String, String> stored,
 ) {
-  if (selection)
+  if (selection) {
     b.writeln('  @override\n  String? get selection => ${stored['sel']};');
+    b.writeln(
+      '  @override\n  PreparedSelection? get selectionPlan => ${stored[r'$selectionPlan']};',
+    );
+  }
   if (api.paginated) {
     b.writeln(
       '  @override\n  List<LuxoFilter>? get filters => ${stored['filters']};',

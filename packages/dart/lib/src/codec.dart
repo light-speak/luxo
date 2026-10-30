@@ -79,9 +79,7 @@ class LuxoEncoder {
   void writeFixed64(double v) {
     if (!v.isFinite) throw const FormatException('Float must be finite');
     _ensureCapacity(8);
-    final bd = ByteData(8);
-    bd.setFloat64(0, v, Endian.little);
-    _buf.setRange(_pos, _pos + 8, bd.buffer.asUint8List());
+    ByteData.sublistView(_buf).setFloat64(_pos, v, Endian.little);
     _pos += 8;
   }
 

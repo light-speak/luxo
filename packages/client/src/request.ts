@@ -1,10 +1,11 @@
+import { PreparedSelection } from './selection'
 import type { Encoder } from './codec'
 import type { Filter, Sorter } from './types'
 
 /** Shared controls remain on the original generated parameter object. */
 export interface RequestValues {
   readonly [name: string]: unknown
-  readonly $select?: string
+  readonly $select?: string | PreparedSelection
   readonly $filters?: readonly Filter[]
   readonly $sorters?: readonly Sorter[]
 }
@@ -21,7 +22,7 @@ export abstract class GeneratedRequest {
   abstract readonly apiID: number
   /** A bounded allocation hint, never a substitute for parameter validation. */
   get initialCapacity(): number { return 1024 }
-  get selection(): string | undefined { return undefined }
+  get selection(): string | PreparedSelection | undefined { return undefined }
   get filters(): readonly Filter[] | undefined { return undefined }
   get sorters(): readonly Sorter[] | undefined { return undefined }
   abstract writeParameters(encoder: Encoder): void
@@ -32,5 +33,6 @@ export abstract class GeneratedRequest {
 export type RequestParameters = GeneratedRequest | Record<string, unknown>
 
 export function requestJSON(request?: RequestParameters): Record<string, unknown> | undefined {
-  return request instanceof GeneratedRequest ? request.toJSONParameters() : request
+  const params = request instanceof GeneratedRequest ? request.toJSONParameters() : request
+  return params?.$select instanceof PreparedSelection ? { ...params, $select: params.$select.text } : params
 }

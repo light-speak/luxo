@@ -15,6 +15,15 @@ import kotlin.test.assertTrue
 
 class CodegenTest {
     @Test
+    fun `runtime artifact excludes obsolete API-wide hint entry points`() {
+        for (name in listOf("SelectAnalyzer", "SelectAnalyzerCli")) {
+            assertFailsWith<ClassNotFoundException> {
+                Class.forName("com.luxo.client.$name", false, javaClass.classLoader)
+            }
+        }
+    }
+
+    @Test
     fun `output getters and APIs carry static selection markers without runtime hint fallback`() {
         val schema = LuxoSchema(
             models = mapOf("User" to LuxoModel("User", fields = listOf(LuxoField(1, "id", "Int")))),
@@ -335,7 +344,6 @@ class CodegenTest {
         val types = LuxoCodegen.genTypes(schema, "com.example")
         val client = LuxoCodegen.genClient(schema, "com.example")
 		val wireSchema = LuxoCodegen.genSchemaMap(schema, "com.example")
-        val hints = LuxoCodegen.genSelectHints("com.example", emptyMap())
 
         assertContains(types, "fun decodeColumnarPayload(data: ByteArray): List<Payload>")
         assertContains(types, "fun decodePaginatedPayload(data: ByteArray): Page<Payload>")
@@ -364,18 +372,18 @@ class CodegenTest {
         assertContains(client, "is LuxoOptional.Present) put(\"caption\"")
         assertContains(client, "filters: List<LuxoFilter>? = null")
         assertContains(client, "override val filters: List<LuxoFilter>?")
-        assertContains(client, "suspend fun subscribeWatchPayload(projectId: Long, select: String? = null, observer: StreamObserver? = null, onData: (Payload) -> Unit): () -> Unit")
-        assertContains(client, "transport.subscribe(\"watchPayload\", { data -> decode_watchPayload(data) }, _watchPayloadRequest(projectId, select), observer, onData)")
+        assertContains(client, "override val selectionPlan: PreparedSelection?")
+        assertContains(client, "val sel = select ?: `\$selectionPlan`?.text")
+        assertContains(client, "suspend fun subscribeWatchPayload(projectId: Long, select: String? = null, `\$selectionPlan`: PreparedSelection? = null, observer: StreamObserver? = null, onData: (Payload) -> Unit): () -> Unit")
+        assertContains(client, "transport.subscribe(\"watchPayload\", { data -> decode_watchPayload(data) }, _watchPayloadRequest(projectId, select ?: `\$selectionPlan`?.text, `\$selectionPlan`), observer, onData)")
         assertFalse(client.contains("mutableMapOf<String, Any?>"))
         assertFalse(client.contains("onData(decode_watchPayload(data))"))
         assertContains(client, "endpoint.startsWith(\"ws://\") || endpoint.startsWith(\"wss://\")")
         assertContains(client, "LuxoWebSocket(endpoint, token = token)")
-        assertContains(client, "suspend fun searchPayloads(page: Long? = null, pageSize: Long? = null, select: String? = null, filters: List<LuxoFilter>? = null, sorters: List<LuxoSorter>? = null)")
-        assertContains(client, "suspend fun createSnapshot(select: String? = null): Payload")
+        assertContains(client, "suspend fun searchPayloads(page: Long? = null, pageSize: Long? = null, select: String? = null, `\$selectionPlan`: PreparedSelection? = null, filters: List<LuxoFilter>? = null, sorters: List<LuxoSorter>? = null)")
+        assertContains(client, "suspend fun createSnapshot(select: String? = null, `\$selectionPlan`: PreparedSelection? = null): Payload")
         assertFalse(client.contains("createSnapshot(input:"))
-        assertContains(client, "suspend fun createPayload(input: CreateInput, note: String?, caption: LuxoOptional<String> = LuxoOptional.Absent, select: String? = null)")
-        assertContains(hints, "object SelectHints")
-        assertContains(hints, "emptyMap()")
+        assertContains(client, "suspend fun createPayload(input: CreateInput, note: String?, caption: LuxoOptional<String> = LuxoOptional.Absent, select: String? = null, `\$selectionPlan`: PreparedSelection? = null)")
         assertFalse(client.contains("try { SelectHints.hints[api] }"))
         assertFalse(client.contains("!!"))
     }

@@ -206,7 +206,14 @@ String _genTypes(LuxoSchema schema) {
   if (convert) {
     b.writeln("import 'dart:convert';");
   }
-  if (convert || usages.values.any(_hasOutputUsage)) {
+  bool needsBytes(String name, List<LuxoField> fields) =>
+      usages[name] != TypeUsage.unused &&
+      fields.any((field) => field.type == 'Bytes');
+  if (usages.values.any(_hasOutputUsage) ||
+      schema.models.values.any(
+        (model) => needsBytes(model.name, model.fields),
+      ) ||
+      schema.types.values.any((type) => needsBytes(type.name, type.fields))) {
     b.writeln("import 'dart:typed_data';");
   }
   if (schema.enums.isNotEmpty ||
@@ -463,7 +470,7 @@ void _writeDartBinaryScalar(
       b.writeln('${indent}encoder.writeBytes($value);');
     case 'JSON':
       b.writeln(
-        '${indent}encoder.writeBytes(Uint8List.fromList(utf8.encode(encodeLuxoJSON($value))));',
+        '${indent}encoder.writeBytes(utf8.encode(encodeLuxoJSON($value)));',
       );
   }
 }
@@ -910,6 +917,9 @@ String _genClient(LuxoSchema schema) {
   b.writeln('class LuxoClient {');
   b.writeln('  final Transport transport;');
   b.writeln('  static final schema = luxoSchema;\n');
+  b.writeln(
+    r'  static PreparedSelection $prepareSelection(String text) => PreparedSelection(text);',
+  );
   b.writeln('  LuxoClient(Transport transport) : transport = transport {');
   b.writeln('    transport.setSchema(luxoSchema);');
   b.writeln('  }\n');
@@ -990,7 +1000,7 @@ void _genMethod(
   final args = declarations.isEmpty ? '' : '{${declarations.join(', ')}}';
   b.writeln("  Future<$ret> ${api.name}($args) async {");
   if (selection) {
-    b.writeln('    final sel = select;');
+    b.writeln(r'    final sel = select ?? $selectionPlan?.text;');
   }
   b.writeln(
     "    return transport.call('${api.name}', request: ${_requestCall(api, selection: selection)}, decoder: $dec);",
@@ -1023,7 +1033,10 @@ List<String> _unaryDeclarations(
         result.add('LuxoInt64? $name');
     }
   }
-  if (selection) result.add('String? select');
+  if (selection) {
+    result.add('String? select');
+    result.add(r'PreparedSelection? $selectionPlan');
+  }
   if (api.paginated)
     result.addAll(['List<LuxoFilter>? filters', 'List<LuxoSorter>? sorters']);
   return result;
@@ -1066,7 +1079,10 @@ void _genStreamMethod(
   final declarations = api.params
       .map((param) => _dartParamDeclaration(param, usages))
       .toList();
-  if (structuredReturn) declarations.add('String? select');
+  if (structuredReturn) {
+    declarations.add('String? select');
+    declarations.add(r'PreparedSelection? $selectionPlan');
+  }
   declarations.add('required void Function($returnType) onData');
   declarations.add('void Function(LuxoError)? onError');
   declarations.add('void Function()? onDone');

@@ -259,7 +259,7 @@ model User : Base {
   name: String
   role: Role
 }
-api getUser(id: Int): User
+api getUser(id: Int): User @native
 `, "user.luxo")
 	tokens2, _ := l2.Tokenize()
 	p2 := parser.New(tokens2)
@@ -283,8 +283,8 @@ api getUser(id: Int): User
 func TestApiDeclaration(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
-api getUser(id: Int): User
-api listUsers(limit: Int): [User]
+api getUser(id: Int): User @native
+api listUsers(limit: Int): [User] @native
 `)
 	expectNoErrors(t, result)
 
@@ -342,7 +342,7 @@ type AuthResult {
   user: User
 }
 
-api getUser(id: Int): User @cache(policy: "preview")
+api getUser(id: Int): User @cache(policy: "preview") { return User.find(id: id) }
 
 api register(input: AuthResult): AuthResult {
   val user = User.create(name: "test")

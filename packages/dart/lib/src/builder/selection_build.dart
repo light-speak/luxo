@@ -6,6 +6,7 @@ import 'package:analyzer/dart/analysis/results.dart';
 import 'package:analyzer/diagnostic/diagnostic.dart';
 
 import 'select_rewrite.dart';
+import 'selection_imports.dart';
 
 /// An owned build snapshot. Source files are never written by this class.
 class SelectionBuild {
@@ -87,6 +88,7 @@ class SelectionBuild {
     );
     final analysis = AnalysisContextCollection(includedPaths: [source.path]);
     final prepared = <String, List<int>>{};
+    final imports = SelectionImports();
     try {
       for (final file in files) {
         final relative = source.uri.relativize(file.uri);
@@ -95,11 +97,13 @@ class SelectionBuild {
           relative,
           analysis,
           client,
+          imports,
         );
       }
     } finally {
       await analysis.dispose();
     }
+    imports.apply(prepared, source.uri);
     prepared['.dart_tool/package_config.json'] = utf8.encode(
       jsonEncode(config.value),
     );
@@ -124,6 +128,7 @@ class SelectionBuild {
     String relative,
     AnalysisContextCollection analysis,
     Uri client,
+    SelectionImports imports,
   ) async {
     final bytes = await file.readAsBytes();
     if (!file.path.endsWith('.dart') || file.path.endsWith('.g.dart'))
@@ -141,7 +146,13 @@ class SelectionBuild {
     if (result.content != original)
       throw StateError('Source changed during analysis: $relative');
     return utf8.encode(
-      rewriteSelections(result.unit, original, clientLibrary: client),
+      rewriteSelections(
+        result.unit,
+        original,
+        clientLibrary: client,
+        library: result.libraryElement,
+        hiddenFactory: imports.factory,
+      ),
     );
   }
 

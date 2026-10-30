@@ -26,6 +26,8 @@
 
 ---
 
+The Go core and CLI in 1.0.0-beta.1 support 64-bit platforms only. 32-bit Go targets are not supported or release-tested. This does not change the wire format or its Int64/UInt64 value ranges.
+
 ## Why "Luxo"?
 
 **Luxo** /lɑːkèsuǒ/ — the path from database to client should be short. Instead, we turned it into a maze.
@@ -352,6 +354,15 @@ JSON and Luxo Binary are both production transports. HTTP clients select them th
 
 Both encodings preserve the same value semantics. Business `Int`/`Duration` are signed int64; WebSocket call IDs (`$id` in JSON, `sequence` in Binary) are unsigned uint64. JSON IDs must be unquoted decimal integer tokens in `0…18446744073709551615`, not booleans, strings, fractions or exponents. Invalid/missing/overflowing IDs are dropped before handler dispatch, never coerced to zero. Successful and failed calls echo the exact valid ID. SDK counters must fail on exhaustion instead of rounding, narrowing or overwriting pending calls; complete cross-SDK boundary acceptance remains a beta release gate.
 
+### Gateway HTTP implementation
+
+The gateway defaults to `APP_HTTP_TRANSPORT=luxo`. TLS ALPN and cleartext HTTP/2
+prior-knowledge connections use Luxo's dedicated HTTP/2 server; HTTP/1.1 and
+WebSocket retain the standard Go HTTP path on the same listener. Set
+`APP_HTTP_TRANSPORT=standard` explicitly to use the standard HTTP implementation
+for HTTP/2 as well. Unknown values fail at startup. This startup setting selects
+the server implementation, not the JSON/Binary encoding or a client's HTTP version.
+
 ### Request and SQL Tracing
 
 Luxo traces a request as an execution DAG across the gateway, services,
@@ -463,6 +474,12 @@ Generated handlers distinguish missing, explicit null, and a value. Defaults app
 `api.EncodeBinaryRequest` also requires explicit `json.RawMessage` documents for JSON parameters. Lists accept `[]json.RawMessage`, a raw JSON array document, or `[]any` containing only raw documents; maps, structs, custom `MarshalJSON` values and implicit scalar conversion are rejected. For example, pass ``json.RawMessage(`{"count":123456789012345678901234567890}`)`` instead of a Go map. Valid documents retain their exact bytes, including numeric tokens; invalid input returns an error and a nil request body. This restriction is on the Go encoding API, not a wire-format change.
 
 Local structured JSON input no longer takes an intermediate JSON-to-Binary-to-model detour. Gateway forwarding still validates and encodes parameters for the internal Binary RPC boundary; that network encoding is distinct from local model decoding. This removes the arbitrary-target reflection fallback, not every dynamic boundary in Luxo, and does not imply zero encoding, zero allocations, or completed whole-chain performance acceptance.
+
+#### Request Log Sampling
+
+Request logs are disabled unless `LOG_REQUESTS=true`. When enabled, successful requests are sampled one in 100 by default. Set `LOG_REQUESTS_FULL=true` as well to opt into full logging for development or troubleshooting; it does not enable logging by itself. Errors bypass sampling, but bounded asynchronous queues can still drop records and report counters. These logs are not a durable audit channel. Metrics and trace sampling are independent.
+
+For explicit Go configuration, `RouterOptions.RequestLogSampleEvery` uses 100 when zero, 1 for full logging, and N for one in N successes. Use `api.RouterOptionsFromEnv()` before overriding options if environment-based logging settings are desired. Generated cached and uncached services use the same environment policy.
 
 #### NATS Task Retries and Dead Letters
 

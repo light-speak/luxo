@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +19,33 @@ import (
 type dependencyStatsProviderFunc func(context.Context) []lux.RuntimeDependencyStats
 
 const testStudioProjectID = "531f2d00-20e5-47f2-b874-22b6fc76328b"
+
+func TestRegistrarEncodingFailureDoesNotSendPartialPayload(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	gr := &GatewayRegistrar{studioURL: server.URL, projectID: testStudioProjectID, apiKey: "test", instanceID: "invalid\xff", client: server.Client(), startedAt: time.Now()}
+	if gr.register() {
+		t.Fatal("invalid registration reported success")
+	}
+	gr.heartbeat()
+	gr.deregister()
+	if calls.Load() != 0 {
+		t.Fatal("encoding failure sent a partial control request")
+	}
+	gr.instanceID = "valid-instance"
+	if !gr.register() {
+		t.Fatal("corrected registration could not recover")
+	}
+	gr.heartbeat()
+	gr.deregister()
+	if calls.Load() != 3 {
+		t.Fatal("corrected control requests were lost", calls.Load())
+	}
+}
 
 func TestStudioProjectUUIDConfiguration(t *testing.T) {
 	for _, value := range []string{"", "1", "7junk", "00000000-0000-0000-0000-000000000000", "531f2d0020e547f2b87422b6fc76328b"} {

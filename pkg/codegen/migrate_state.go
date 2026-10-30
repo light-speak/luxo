@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/light-speak/luxo/internal/inferred"
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lux"
 	"github.com/light-speak/luxo/pkg/lux/str"
@@ -95,7 +96,7 @@ func validateSchemaState(s *SchemaState) error {
 func ComputeState(result *semantic.Result, enums map[string]bool, dialect lux.Dialect) *SchemaState {
 	s := &SchemaState{Models: make(map[string]*ModelState)}
 
-	for _, file := range result.Files {
+	for _, file := range inferred.ExpandedFiles(result.Files) {
 		for _, m := range file.Models {
 			ms := &ModelState{
 				Table:   modelTableName(m.Name),

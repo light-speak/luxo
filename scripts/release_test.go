@@ -120,6 +120,19 @@ func TestCoreAndSwiftCandidateBindings(t *testing.T) {
 	}
 }
 
+func TestKotlinBuildPluginHasExplicitBytecodeTarget(t *testing.T) {
+	build := readQualityFile(t, "../packages/kotlin/gradle-plugin/build.gradle.kts")
+	for _, required := range []string{
+		"sourceCompatibility = JavaVersion.VERSION_26",
+		"targetCompatibility = JavaVersion.VERSION_26",
+		"jvmTarget.set(JvmTarget.JVM_26)",
+	} {
+		if !strings.Contains(build, required) {
+			t.Errorf("build plugin must not inherit its bytecode target from the host: missing %q", required)
+		}
+	}
+}
+
 func TestSwiftCandidateCheckoutIsPinned(t *testing.T) {
 	checkouts := 0
 	for _, step := range readQualityWorkflow(t).Jobs["sdk-swift-conformance"].Steps {
@@ -127,7 +140,7 @@ func TestSwiftCandidateCheckoutIsPinned(t *testing.T) {
 			continue
 		}
 		checkouts++
-		if step.With["ref"] != "d04f0e93efda40bd61825bba65954d1a06443a8a" {
+		if step.With["ref"] != "9e45d47284827e06d1dfd649ff54876d0116d249" {
 			t.Errorf("Swift conformance must use the verified beta.1 candidate, got %q", step.With["ref"])
 		}
 		if step.With["path"] != ".tmp/luxo-swift" || step.With["persist-credentials"] != "false" || step.ContinueOnError {

@@ -8,6 +8,7 @@ import kotlinx.serialization.json.jsonObject
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MediaType
 import okhttp3.Request
+import okhttp3.OkHttpClient
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.ResponseBody.Companion.toResponseBody
 
@@ -21,12 +22,50 @@ object HttpProtocolBenchmark {
 
     @JvmStatic
     fun main(args: Array<String>) {
+        if (args.contains("--endpoint-init-only")) { measureEndpointInitialization(); return }
         println("JDK ${System.getProperty("java.version")}; 12 warmup pairs, 20 alternating samples; ns/op and B/op")
+        if (args.contains("--endpoint-only")) { compareEndpoints(); return }
         compareJSONBodies(candidate = args.contains("--candidate"))
         if (args.contains("--json-only")) return
         compareLengths()
         compareHeaders()
         for (detailed in listOf(false, true)) compareErrors(detailed)
+    }
+
+    private fun measureEndpointInitialization() {
+        val client = OkHttpClient()
+        try {
+            println("Actual Transport construction, shared prebuilt OkHttpClient, empty Schema; no URL access/network")
+            PairedJvmBenchmark.isolated("endpoint transport construction", LongSupplier {
+                headersSink = OkHttpTransport("https://example.test:8443/api%20v1", client = client)
+                1L
+            }, iterations = 20_000, warmupIterations = 20_000)
+        } finally {
+            client.dispatcher.executorService.shutdownNow()
+            client.connectionPool.evictAll()
+        }
+    }
+
+    private fun compareEndpoints() {
+        val body = byteArrayOf(1, 0, 0).toRequestBody(HttpProtocolHeaders.BINARY_MEDIA_TYPE)
+        for (endpoint in listOf("http://localhost/luvia", "https://example.test:8443/api%20v1")) {
+            val cached by lazy { Request.Builder().url(endpoint).build().url }
+            fun previous() = Request.Builder().url(endpoint).post(body).build()
+            fun current() = Request.Builder().url(cached).post(body).build()
+            check(previous().url == current().url)
+            PairedJvmBenchmark.compare("endpoint warm $endpoint", LongSupplier {
+                requestSink = previous(); requestSink!!.url.encodedPath.length.toLong()
+            }, LongSupplier {
+                requestSink = current(); requestSink!!.url.encodedPath.length.toLong()
+            }, iterations = 50_000)
+            PairedJvmBenchmark.compare("endpoint first access $endpoint", LongSupplier {
+                requestSink = previous(); requestSink!!.url.encodedPath.length.toLong()
+            }, LongSupplier {
+                val first by lazy { Request.Builder().url(endpoint).build().url }
+                requestSink = Request.Builder().url(first).post(body).build()
+                requestSink!!.url.encodedPath.length.toLong()
+            }, iterations = 50_000)
+        }
     }
 
     private fun compareJSONBodies(candidate: Boolean) {

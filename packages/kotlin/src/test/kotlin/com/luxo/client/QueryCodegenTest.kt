@@ -40,6 +40,30 @@ class QueryCodegenTest {
         compileAndRun(source, LuxoCodegen.genTypes(schema, "probe"))
     }
 
+    @Test
+    fun `schema directories compile without selectable fields`() {
+        val root = File(".tmp").apply { mkdirs() }
+        val directory = Files.createTempDirectory(root.toPath(), "empty-schema-").toFile()
+        val classpath = (System.getProperty("luxo.testRuntimeClasspath") ?: System.getProperty("java.class.path"))
+            .split(File.pathSeparator).filter { File(it).exists() }.joinToString(File.pathSeparator)
+        val fixtures = listOf(
+            LuxoSchema(),
+            LuxoSchema(apis = mapOf("echo" to LuxoAPI(1, "echo", "fixture", returnType = "Bytes"))),
+            LuxoSchema(models = mapOf("Empty" to LuxoModel("Empty", fields = emptyList()))),
+        )
+        try {
+            val sources = fixtures.mapIndexed { index, schema ->
+                File(directory, "Schema$index.kt").apply {
+                    writeText(LuxoCodegen.genSchemaMap(schema, "probe$index"))
+                }.path
+            }
+            val compiled = run(directory, listOf("-cp", classpath,
+                "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler", "-no-stdlib", "-no-reflect",
+                "-Werror", "-classpath", classpath, "-d", File(directory, "classes").path) + sources)
+            assertEquals(0, compiled.first, compiled.second)
+        } finally { directory.deleteRecursively() }
+    }
+
     private fun compileAndRun(source: String, types: String) {
         val root = File(".tmp").apply { mkdirs() }
         val directory = Files.createTempDirectory(root.toPath(), "query-generated-").toFile()

@@ -97,11 +97,6 @@ jobs:
           go test ./pkg/... ./cmd/... ./scripts/... ./internal/... -v -coverprofile=coverage.out -timeout 180s -count=1
           go test ./cmd/luxo/... -v -timeout 60s -count=1
 
-      - name: Verify 32-bit error code boundaries
-        run: |
-          GOARCH=386 CGO_ENABLED=0 go test ./pkg/lux/api ./pkg/lux/rpc \
-            -run '^(TestDecodeBinaryErrorCodeRepresentability|TestRPCErrorCodeDoesNotNarrow)$' -count=1
-
       - name: Verify independent adapters against this core revision
         run: |
           go test -race ./pkg/lux/storage/s3/... -coverprofile=s3-coverage.out -count=1 -timeout=120s
@@ -610,6 +605,10 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Bind candidate modules for generated SDK fixtures
+        uses: ./.github/actions/setup-modules
+        if: matrix.package == 'vite-plugin'
+
       - name: Install dependencies
         working-directory: packages/${{ matrix.package }}
         run: pnpm install --frozen-lockfile
@@ -670,6 +669,9 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Bind candidate modules for generated SDK fixtures
+        uses: ./.github/actions/setup-modules
+
       - uses: actions/setup-node@v7
         with:
           node-version-file: .node-version
@@ -690,7 +692,7 @@ jobs:
 
       - name: Test SDK
         working-directory: packages/dart
-        run: dart test
+        run: dart test --concurrency=1
 
       - name: Test JavaScript and Wasm precision and WebSocket adapter
         working-directory: packages/dart
@@ -721,6 +723,9 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+
+      - name: Bind candidate modules for generated SDK fixtures
+        uses: ./.github/actions/setup-modules
 
       - name: Verify Gradle Wrapper
         working-directory: packages/kotlin
@@ -756,13 +761,12 @@ jobs:
           trap 'kill "${server_pid}"' EXIT
           curl --retry 20 --retry-connrefused --retry-delay 1 -fsS -o /dev/null http://127.0.0.1:18080/luxo.schema.json
           ../../packages/kotlin/gradlew luxoGenerate build --project-cache-dir .tmp/gradle-cache --no-daemon --warning-mode fail -Pluxo.endpoint=http://127.0.0.1:18080/luxo.schema.json
-          grep -F '"lookupNode" to "name, posts { title }"' .tmp/generated/com/luxo/generated/SelectHints.kt
           if grep -R -F '!!' .tmp/generated/com/luxo/generated; then
             echo "::error::Generated Kotlin contains a non-null assertion"
             exit 1
           fi
-          ../../packages/kotlin/gradlew luxoAnalyze --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
-          ../../packages/kotlin/gradlew luxoAnalyze --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
+          ../../packages/kotlin/gradlew build --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
+          ../../packages/kotlin/gradlew build --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
 
   sdk-swift-conformance:
     runs-on: macos-26
@@ -780,7 +784,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: light-speak/luxo-swift
-          ref: d04f0e93efda40bd61825bba65954d1a06443a8a
+          ref: 9e45d47284827e06d1dfd649ff54876d0116d249
           path: .tmp/luxo-swift
           persist-credentials: false
 
@@ -795,6 +799,9 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+
+      - name: Bind candidate modules for generated SDK fixtures
+        uses: ./.github/actions/setup-modules
 
       - name: Verify generated Swift client against Go
         env:

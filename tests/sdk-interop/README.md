@@ -7,6 +7,12 @@ macOS with Xcode for the Swift iOS compilation check):
 bash tests/sdk-interop/acceptance.sh all
 ```
 
+In a standalone core checkout, first run `sh scripts/setup-modules.sh .` once
+to bind the unpublished candidate modules. Generated fixtures import the PostgreSQL
+adapter even when they do not query a database. Keep workspace mode enabled; an
+existing workspace must explicitly bind this checkout and its adapter modules.
+The setup command refuses to overwrite an existing `go.work`.
+
 Use `ts`, `dart`, `kotlin` or `swift` to select one SDK. The runner stops at the first
 failure and retains per-stage logs plus `results.tsv` under `.tmp/sdk-acceptance.*`.
 This is not a performance benchmark, release approval, or application build wrapper.
@@ -36,6 +42,112 @@ also use real compiled handlers. All four SDKs additionally exercise a generated
 gateway with a separate TCP RPC backend as described below. That four-SDK fixture
 does not exercise extension-response merging, multiple backend modules or device
 consumers; the separate Go gateway fixture below covers the first two.
+
+## PostgreSQL selection fixture
+
+From the core repository, generate and build a fresh fixture without reusing prior generated artifacts:
+
+```sh
+mkdir -p .tmp
+fixture=$(mktemp -d "$PWD/.tmp/sdk-sql.XXXXXX")
+go run ./tests/sdk-interop -sql -out "$fixture"
+go build -o "$fixture/server" "$fixture"
+LUXO_TEST_DATABASE_URL="$DEDICATED_TEST_DATABASE_URL" "$fixture/server"
+```
+
+Use a dedicated, disposable PostgreSQL database. This fixture creates `products`
+and inserts 128 rows, including IDs above JavaScript's safe integer range and
+4 KiB descriptions. It refuses a missing database URL and does not drop existing
+tables. Do not point it at a development or production database.
+
+The first stdout JSON line contains `url` (TLS H2), `plain` (Schema discovery),
+and the fixture certificate. Generate SDK clients using the discovery endpoint
+and introspection key `benchmark`; trust only that certificate for the test.
+Keep stdin open while the consumer runs. Closing stdin stops the fixture and
+prints the H2/other request counts and captured SQL. The caller owns database
+and scratch cleanup. Neither this server nor its credentials are for deployment.
+
+`products` reads all database columns; `selectedProducts` applies the explicit
+selection to SQL; inferred `listProducts` applies projection and pagination.
+Consumers should verify selected/unselected fields, exact IDs, two 64-row pages,
+and the captured SQL. These are correctness checks, not performance measurements.
+`sql/runner.py` additionally owns a disposable database container and validates
+the final transport/SQL report. It accepts only an already installed image
+(`--pull=never`), resolves its immutable image ID, builds the server from current
+source, and preserves evidence under the core `.tmp`:
+
+```sh
+python3 -B tests/sdk-interop/sql/runner.py --image <installed-pg-image> -- <consumer-command>
+```
+
+The consumer receives `LUXO_SQL_ENDPOINT`, `LUXO_SQL_SCHEMA_ENDPOINT`,
+`LUXO_SQL_CERTIFICATE`, `LUXO_SQL_SCRATCH`, and `LUXO_INTROSPECTION_KEY`.
+It must generate/build its SDK client and execute the five calls in the retained
+`sql/consumer.mjs`, `sql/consumer.dart`, `sql/Consumer.kt`, or `sql/Consumer.swift`
+assertion source. Use `--runs 2` when running both TS module formats. Failed
+consumers fail the run; a successful consumer still fails if SQL or protocol
+counts differ. The runner closes its server and removes only its own container.
+Platform build drivers generate fresh consumers from the running Schema:
+
+```sh
+python3 -B tests/sdk-interop/sql/runner.py --image "$PG_TEST_IMAGE" --runs 2 -- python3 -B tests/sdk-interop/sql/ts.py
+python3 -B tests/sdk-interop/sql/runner.py --image "$PG_TEST_IMAGE" -- python3 -B tests/sdk-interop/sql/dart.py
+python3 -B tests/sdk-interop/sql/runner.py --image "$PG_TEST_IMAGE" -- python3 -B tests/sdk-interop/sql/kotlin.py
+python3 -B tests/sdk-interop/sql/runner.py --image "$PG_TEST_IMAGE" -- python3 -B tests/sdk-interop/sql/swift.py
+```
+
+Prepare the repository's pinned toolchains and existing package dependencies
+before running. No driver installs dependencies: Kotlin uses Gradle offline;
+TS builds the local runtime and generator; Dart requires its package config;
+Swift compiles the local SDK sources directly. `DART` may name the installed Dart
+executable, and `LUXO_SWIFT_PATH` may override the sibling Swift repository path.
+Swift runs on macOS and injects a session using the test-only initializer to trust
+the fixture certificate. These commands do not exercise Android/iOS devices.
+Each driver retains source/artifact hashes and generated consumers in the evidence
+directory. Dart removes its owned package scratch after execution. Keep these
+builds separate from timed benchmarks.
+
+The owner terminates the consumer's process group, including descendants left
+behind by an exited parent. It waits up to five seconds for graceful termination
+before killing remaining group members; a regression test covers a child that
+ignores SIGTERM. Processes that deliberately create another session are outside
+this ownership mechanism.
+
+### Same-output SQL projection comparison
+
+From the core repository, run a current SDK driver with the opt-in comparison:
+
+```sh
+python3 -B tests/sdk-interop/sql/runner.py --image "$PG_TEST_IMAGE" --runs 2 --projection-benchmark -- python3 -B tests/sdk-interop/sql/ts.py
+python3 -B tests/sdk-interop/sql/runner.py --image "$PG_TEST_IMAGE" --projection-benchmark -- python3 -B tests/sdk-interop/sql/dart.py
+python3 -B tests/sdk-interop/sql/runner.py --image "$PG_TEST_IMAGE" --projection-benchmark -- python3 -B tests/sdk-interop/sql/kotlin.py
+python3 -B tests/sdk-interop/sql/runner.py --image "$PG_TEST_IMAGE" --projection-benchmark -- python3 -B tests/sdk-interop/sql/swift.py
+```
+
+Both paths return only the same 128 names. `products` reads all database columns;
+`selectedProducts` reads `name, id`. Each module format warms both paths 20 times,
+then runs three alternating batches of 50 calls per path. Assertions run outside
+the timed call and check every name and the absence of unselected fields.
+The owner checks exactly 340 H2 calls and matching SQL counts per consumer
+(680 across TS CJS/ESM). Dart uses AOT, Kotlin uses JVM/OkHttp, and Swift uses
+an optimized macOS build with URLSession.
+Raw JSON/CSV samples and artifact hashes stay in the evidence folder.
+Each SQL SDK driver also writes `<sdk>-inputs.tar.gz` before temporary cleanup,
+plus `<sdk>-inputs.json` with the archive digest and external dependency paths.
+Project-local inputs are retained in the archive; external dependencies are
+hash-only and are not copied from toolchain caches. This is not a standalone
+installation bundle. Missing explicit inputs fail collection rather than being
+silently omitted. Existing older hash-only reports are not retroactively sealed.
+Compare each runtime against itself; do not rank runtimes from sequential runs.
+CSV durations are in microseconds; use the nearest-rank percentile convention
+when comparing them with the JSON summaries.
+
+This is a local, single-concurrency SDK/TLS H2/PostgreSQL comparison using the
+same generated client and service. The database has a one-CPU/512MiB limit; the
+host client/server are not resource-isolated. It does not compare frameworks,
+measure cumulative allocation or establish stable P99 from 50-call batches.
+The normal correctness runner remains unchanged unless the option is supplied.
+
 
 ## HTTP access / refresh lifecycle
 

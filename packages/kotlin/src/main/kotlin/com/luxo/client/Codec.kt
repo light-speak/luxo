@@ -235,7 +235,7 @@ class LuxoEncoder(initialCapacity: Int = 1024) {
 
     private fun ensure(n: Int) {
         if (pos + n <= buf.size) return
-        var newCap = buf.size
+        var newCap = maxOf(buf.size, 1)
         while (newCap < pos + n) newCap = newCap shl 1
         buf = buf.copyOf(newCap)
     }

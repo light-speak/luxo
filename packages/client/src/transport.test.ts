@@ -538,7 +538,7 @@ describe('FetchTransport error handling', () => {
     expect(mockFetch).not.toHaveBeenCalled()
   })
 
-  it('cancels while reading a JSON response body', async () => {
+  it.each(['json', 'binary'] as const)('cancels while reading a %s response body', async mode => {
     const controller = new AbortController()
     mockFetch.mockImplementationOnce((_url: string, init: { signal: AbortSignal }) => Promise.resolve({
       status: 200,
@@ -552,12 +552,28 @@ describe('FetchTransport error handling', () => {
         })
       }),
     }))
-    const t = new FetchTransport('http://localhost:8080/api')
+    const t = new FetchTransport('http://localhost:8080/api', { mode })
+    t.setSchema({ getUser: { id: 1 } })
     const request = t.call('getUser', undefined, { signal: controller.signal })
     await Promise.resolve()
     controller.abort()
 
     await expect(request).rejects.toMatchObject({ error: 'CancelledError' })
+  })
+
+  it.each([200, 503])('cleans up failed Binary body reads with HTTP %i', async status => {
+    vi.useFakeTimers()
+    try {
+      const refresh = vi.fn()
+      const t = new FetchTransport('http://localhost/api', { mode: 'binary', onTokenExpired: refresh })
+      t.setSchema({ read: { id: 1 } })
+      mockFetch.mockResolvedValueOnce({ status, arrayBuffer: async () => { throw new Error('broken body') } })
+      await expect(t.call('read')).rejects.toMatchObject({ error: 'ParseError', code: status })
+      expect(refresh).not.toHaveBeenCalled()
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('times out while reading a Binary response body', async () => {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"nhooyr.io/websocket"
@@ -17,6 +18,30 @@ func formerWSWrite(ws *wsConn, ctx context.Context, kind websocket.MessageType, 
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 	return ws.conn.Write(ctx, kind, data)
+}
+
+// Immediate pre-budget baseline, including subscription cancellation isolation.
+func unboundedWSWrite(ws *wsConn, ctx context.Context, kind websocket.MessageType, data []byte) error {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return ws.conn.Write(ws.ctx, kind, data)
+	}
+}
+
+func BenchmarkWSWriteBudgets(b *testing.B) {
+	for _, kind := range []websocket.MessageType{websocket.MessageText, websocket.MessageBinary} {
+		for _, size := range []int{8, 1024} {
+			for _, impl := range []string{"unbounded", "isolated"} {
+				b.Run(fmt.Sprintf("kind=%d/bytes=%d/%s", kind, size, impl), func(b *testing.B) {
+					benchmarkWSWrite(b, kind, false, size, impl)
+				})
+			}
+		}
+	}
 }
 
 func BenchmarkWSWriteCancellationIsolation(b *testing.B) {
@@ -35,6 +60,9 @@ func BenchmarkWSWriteCancellationIsolation(b *testing.B) {
 
 func benchmarkWSWrite(b *testing.B, kind websocket.MessageType, stream bool, size int, impl string) {
 	ws, peer := benchmarkWebSocketPair(b)
+	var total atomic.Int64
+	ws.totalWriteBytes = &total
+	ws.limits = normalizeWSLimits(WebSocketLimits{})
 	ctx := ws.ctx
 	if stream {
 		var cancel context.CancelFunc
@@ -53,6 +81,8 @@ func benchmarkWSWrite(b *testing.B, kind websocket.MessageType, stream bool, siz
 			var err error
 			if impl == "isolated" {
 				err = ws.write(ctx, kind, payload)
+			} else if impl == "unbounded" {
+				err = unboundedWSWrite(ws, ctx, kind, payload)
 			} else {
 				err = formerWSWrite(ws, ctx, kind, payload)
 			}
@@ -101,6 +131,7 @@ func benchmarkWebSocketPair(b *testing.B) (*wsConn, *websocket.Conn) {
 	if ws == nil {
 		b.Fatal("WebSocket accept failed")
 	}
+	b.Cleanup(ws.writeDeadline.close)
 	return ws, peer
 }
 

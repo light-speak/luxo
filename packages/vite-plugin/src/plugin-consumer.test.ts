@@ -288,6 +288,7 @@ assert.match(readFileSync(join(directory, 'src/luxo/types.ts'), 'utf8'), /id.*bi
 const location = join(directory, 'out', filename)
 const { selectMetric, selectLabel, selectExplicit, createClient } = commonjs ? require(location) : await import(pathToFileURL(location).href)
 const value = 9223372036854775807n
+const selectionIdentities = new Map()
 for (const [call, selection, response, expected] of [
   [selectMetric, 'id', { id: value }, value],
   [selectLabel, 'label', { label: 'only label' }, 'only label'],
@@ -295,12 +296,40 @@ for (const [call, selection, response, expected] of [
   [selectMetric, 'id', { id: value }, value],
 ]) {
   const actual = await call({ async getMetric(params) {
-    assert.deepEqual(params, { id: value, $select: selection })
+    const selected = params.$select
+    const text = typeof selected === 'string' ? selected : selected.text
+    assert.deepEqual({ ...params, $select: text }, { id: value, $select: selection })
+    if (call !== selectExplicit) {
+      assert.equal(Object.isFrozen(selected), true)
+      if (selectionIdentities.has(call)) assert.equal(selected, selectionIdentities.get(call))
+      selectionIdentities.set(call, selected)
+    }
     return response
   } })
   assert.equal(actual, expected)
 }
-const client = createClient('http://127.0.0.1:1/not-called')
-client.close()
+const { createServer } = await import('node:http')
+const { decodeLuxoJSON } = await import('@luxojs/client')
+const selections = []
+const server = createServer(async (request, response) => {
+  const parts = []
+  for await (const part of request) parts.push(part)
+  const body = decodeLuxoJSON(Buffer.concat(parts).toString())
+  selections.push(body.$select)
+  response.setHeader('content-type', 'application/json')
+  response.end(body.$select === 'label' ? '{"data":{"label":"network"}}' : '{"data":{"id":9223372036854775807}}')
+})
+await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+const client = createClient('http://127.0.0.1:' + server.address().port)
+client.setMode('json')
+try {
+  assert.equal(await selectMetric(client), value)
+  assert.equal(await selectLabel(client), 'network')
+  assert.deepEqual(selections, ['id', 'label'])
+} finally {
+  client.close()
+  server.closeAllConnections()
+  await new Promise(resolve => server.close(resolve))
+}
 console.log('selection and int64 verified')
 `

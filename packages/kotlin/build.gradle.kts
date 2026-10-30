@@ -39,8 +39,6 @@ publishing {
     }
 }
 
-val luxoAnalyzerRuntime = configurations.create("luxoAnalyzerRuntime")
-
 tasks.processResources {
     val version = libs.versions.kotlin.get()
     inputs.property("kotlinVersion", version)
@@ -52,11 +50,10 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
     api("com.squareup.okhttp3:okhttp:4.12.0")
 
-    // The compiler is isolated to the build-time field analyzer and is not
+    // The compiler is isolated to the call-site compilation plugin and is not
     // published as an SDK runtime dependency.
     compileOnly(libs.kotlin.compiler)
     testRuntimeOnly(libs.kotlin.compiler)
-    luxoAnalyzerRuntime(libs.kotlin.compiler)
 
     testImplementation(kotlin("test"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
@@ -85,6 +82,14 @@ tasks.register<JavaExec>("benchmarkResponsePresence") {
     description = "Measure HTTP/WS response presence using one transport implementation per JVM"
     classpath = sourceSets["test"].runtimeClasspath
     mainClass.set("com.luxo.client.ResponsePresenceBenchmark")
+    jvmArgs("-Xms512m", "-Xmx512m")
+}
+
+tasks.register<JavaExec>("benchmarkSelectionPlans") {
+    group = "verification"
+    description = "Compare dynamic selection with warm and first-use call-site plans"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.luxo.client.SelectionPlanBenchmark")
     jvmArgs("-Xms512m", "-Xmx512m")
 }
 
@@ -273,7 +278,6 @@ tasks.wrapper {
 // --- Luxo codegen tasks (for user projects) ---
 // Usage:
 //   ./gradlew luxoGenerate -Pluxo.endpoint=http://localhost:4000/luvia -Pluxo.key=YOUR_KEY
-//   ./gradlew luxoAnalyze
 
 tasks.register<JavaExec>("luxoGenerate") {
     group = "luxo"
@@ -287,20 +291,6 @@ tasks.register<JavaExec>("luxoGenerate") {
     args(
         project.findProperty("luxo.endpoint")?.toString() ?: "http://localhost:4000/luvia",
         project.findProperty("luxo.outDir")?.toString() ?: "src/main/kotlin/com/luxo/generated",
-        project.findProperty("luxo.package")?.toString() ?: "com.luxo.generated",
-        project.findProperty("luxo.schemaFile")?.toString()
-            ?: layout.buildDirectory.file("luxo/luxo.schema.json").get().asFile.absolutePath,
-    )
-}
-
-tasks.register<JavaExec>("luxoAnalyze") {
-    group = "luxo"
-    description = "Analyze source code for field access patterns and generate SelectHints"
-    classpath = sourceSets["main"].runtimeClasspath + luxoAnalyzerRuntime
-    mainClass.set("com.luxo.client.SelectAnalyzerCli")
-    args(
-        project.findProperty("luxo.srcDir")?.toString() ?: "src/main/kotlin",
-        project.findProperty("luxo.hintsFile")?.toString() ?: "src/main/kotlin/com/luxo/generated/SelectHints.kt",
         project.findProperty("luxo.package")?.toString() ?: "com.luxo.generated",
         project.findProperty("luxo.schemaFile")?.toString()
             ?: layout.buildDirectory.file("luxo/luxo.schema.json").get().asFile.absolutePath,

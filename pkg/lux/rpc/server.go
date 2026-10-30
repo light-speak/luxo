@@ -186,7 +186,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			}
 			return
 		}
-		readBuf = payload[:0] // reuse buffer
+		readBuf = retainReadFrame(payload)
 		envelope, envelopeErr := decodeRequestEnvelope(payload)
 		if envelopeErr != nil {
 			if WriteFrame(conn, encodeError(400, "BadRequest", envelopeErr.Error())) != nil {
@@ -266,8 +266,8 @@ func (s *Server) processCall(conn io.Writer, envelope requestEnvelope) error {
 	}
 
 	buf := api.GetBuf()
-	// Reserve 1 byte for status prefix — handler appends after it
-	buf.B = append(buf.B, statusOK)
+	// Reserve the frame header and status; the handler appends its body once.
+	buf.B = append(buf.B, 0, 0, 0, 0, statusOK)
 	req.Buf = buf
 
 	metrics := s.router.RequestMetricsRecorder()
@@ -291,9 +291,9 @@ func (s *Server) processCall(conn io.Writer, envelope requestEnvelope) error {
 
 	// Zero-copy: write [frame header][statusOK + handler payload] directly from pooled buf
 	if trace == nil {
-		err = WriteFrame(conn, buf.B)
+		err = writePreparedFrame(conn, buf.B)
 	} else {
-		err = writeTracedFrame(conn, statusTraceOK, buf.B[1:], trace)
+		err = writeTracedFrame(conn, statusTraceOK, buf.B[5:], trace)
 	}
 	api.PutBuf(buf)
 	return err

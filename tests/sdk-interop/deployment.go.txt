@@ -36,7 +36,10 @@ func serveFixture() error {
 }
 
 func fixtureRouter() (*api.Router, error) {
-	router := luvia.New().Router
+	// Selection isolation sends 16 groups of three concurrent calls.
+	router := luvia.NewWithOptions(api.RouterOptions{
+		WebSocket: api.WebSocketLimits{CallsPerConnection: 64},
+	}).Router
 	// Verify production error redaction. Introspection has its own explicit key.
 	router.SetDevMode(false)
 	router.IntrospectionKey = "sdk-interop"

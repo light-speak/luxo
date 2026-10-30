@@ -14,6 +14,11 @@ void checkSchemaID(
   if (!seen.add(id)) throw FormatException('$owner.$name: duplicate ID $id');
 }
 
+final _selectionSnapshots = Expando<bool>();
+
+bool isSelectionSnapshot(APISchemaEntry schema) =>
+    _selectionSnapshots[schema] == true;
+
 typedef _Fields = Map<String, SelectionFieldSchema>;
 typedef _Types = Map<String, _Fields>;
 
@@ -27,15 +32,14 @@ Map<String, APISchemaEntry> snapshotAPISchema(
     schema.map((name, entry) {
       final id = entry.id;
       checkSchemaID(id, maxAPIID, seen, 'API', name);
-      return MapEntry(
-        name,
-        APISchemaEntry(
-          id,
-          _snapshotParams(entry.params, name),
-          snapshots.fields(entry.fields, 'API $name'),
-          snapshots.types(entry.types),
-        ),
+      final copy = APISchemaEntry(
+        id,
+        _snapshotParams(entry.params, name),
+        snapshots.fields(entry.fields, 'API $name'),
+        snapshots.types(entry.types),
       );
+      _selectionSnapshots[copy] = true;
+      return MapEntry(name, copy);
     }),
   );
 }

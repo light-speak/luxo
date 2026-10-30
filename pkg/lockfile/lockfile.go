@@ -151,6 +151,7 @@ func (lf *LockFile) Update(files []*ast.File) error {
 	if err := lf.Validate(); err != nil {
 		return err
 	}
+	files = inferred.ExpandedFiles(files)
 	candidate := lf.cloneForUpdate()
 	candidate.updateModels(files)
 	candidate.updateTypes(files)

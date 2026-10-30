@@ -6,6 +6,9 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ConcurrentLinkedQueue
 import com.sun.net.httpserver.HttpServer
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.MediaType.Companion.toMediaType
@@ -22,6 +25,44 @@ import okio.buffer
 import kotlin.test.*
 
 class HttpProtocolTest {
+    @Test
+    fun `concurrent first calls publish one immutable endpoint`() = runBlocking {
+        withClient({ request, _ -> response(request, 200, byteArrayOf(1)) }) { client, sent ->
+            val transport = OkHttpTransport(endpoint, client = client, mode = TransportMode.BINARY, schema = schema,
+                maxConcurrentRequests = 32)
+            List(32) { async(Dispatchers.Default) { transport.call("echo") } }.awaitAll()
+            assertEquals(32, sent.size)
+            val first = sent.first().url
+            sent.forEach { assertSame(first, it.url) }
+        }
+    }
+
+    @Test
+    fun `calls reuse the parsed endpoint across modes`() = runBlocking {
+        withClient({ request, _ ->
+            response(request, 200, if (request.header("X-Luxo-Mode") == "binary") byteArrayOf(1) else "{\"data\":1}".toByteArray())
+        }) { client, sent ->
+            val endpoint = "https://example.test:8443/api%20v1"
+            val transport = OkHttpTransport(endpoint, client = client, schema = schema)
+            transport.call("echo")
+            transport.setMode(TransportMode.BINARY)
+            transport.call("echo")
+            assertEquals(2, sent.size)
+            val requests = sent.toList()
+            assertEquals(endpoint, requests[0].url.toString())
+            assertSame(requests[0].url, requests[1].url)
+        }
+    }
+
+    @Test
+    fun `invalid endpoint remains a call time error`() = runBlocking {
+        val transport = OkHttpTransport("http://[invalid", schema = schema)
+        for (mode in TransportMode.entries) {
+            transport.setMode(mode)
+            assertFailsWith<IllegalArgumentException> { transport.call("echo") }
+        }
+    }
+
     @Test
     fun `success requires data while explicit null remains valid`() = runBlocking {
         var body = "{}"

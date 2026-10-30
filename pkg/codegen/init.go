@@ -174,7 +174,8 @@ JWT_REFRESH_EXPIRES=30d                                # refresh token expiry
 
 # ---- Log ----
 LOG_LEVEL=info                                         # level: debug / info / warn / error
-# LOG_REQUESTS=true                                    # log every API request
+# LOG_REQUESTS=true                                    # sample 1 in 100 successful requests; errors bypass sampling
+# LOG_REQUESTS_FULL=true                               # opt into all request logs when LOG_REQUESTS=true
 
 # ---- Gateway (Luvia) ----
 CORS_ORIGIN=*                                          # allowed origin or *

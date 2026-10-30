@@ -216,7 +216,7 @@ function genInterface(
 
 function genBinaryDecode(model: LuxoModel, schema: LuxoSchema): string {
   let out = `export function decode${model.name}(dec: Decoder): ${model.name}<true> {\n`
-  out += `  const obj: Record<string, unknown> = {}\n`
+  out += `  const obj: { [key: string]: unknown } = {}\n`
   out += `  dec.skipArenaHeader()\n`
   out += `  while (dec.nextField()) {\n`
   out += `    switch (dec.fieldID) {\n`
@@ -234,10 +234,10 @@ function genBinaryDecode(model: LuxoModel, schema: LuxoSchema): string {
 // Keep unary decoders usable as one-argument map callbacks. List items share the
 // field pass; '$' helper names cannot collide with a DSL model identifier.
 function genJSONDecode(model: LuxoModel, schema: LuxoSchema): string {
-  let out = `export function decodeJSON${model.name}(data: Record<string, unknown>): ${model.name}<true> {\n`
+  let out = `export function decodeJSON${model.name}(data: { [key: string]: unknown }): ${model.name}<true> {\n`
   out += `  return decodeJSON${model.name}$value(data, false)\n}\n\n`
   out += genJSONListDecode(model.name)
-  out += `function decodeJSON${model.name}$value(data: Record<string, unknown>, requireField: boolean): ${model.name}<true> {\n`
+  out += `function decodeJSON${model.name}$value(data: { [key: string]: unknown }, requireField: boolean): ${model.name}<true> {\n`
   out += `  if (requireField && (data === null || typeof data !== 'object' || Array.isArray(data))) throw new TypeError('${model.name} list item must be an object')\n`
   out += `  const obj = {} as ${model.name}<true>\n`
   out += `  let hasField = false\n`
@@ -265,7 +265,7 @@ function genJSONListDecode(name: string): string {
   out += `  if (!Array.isArray(data)) throw new TypeError('${name} list must be an array')\n`
   out += `  const items = new Array<${name}<true>>(data.length)\n`
   out += `  for (let i = 0; i < items.length; i++) {\n`
-  out += `    items[i] = decodeJSON${name}$value(data[i] as Record<string, unknown>, true)\n`
+  out += `    items[i] = decodeJSON${name}$value(data[i] as { [key: string]: unknown }, true)\n`
   out += `  }\n  return items\n}\n\n`
   return out
 }
@@ -276,7 +276,7 @@ function jsonValueDecode(field: LuxoField, schema: LuxoSchema, value: string): s
   const raw = list ? 'item' : value
   const enumField = Boolean(schema.enums?.[typeName])
   if (isNestedField(field, schema)) {
-    return list ? `decodeJSON${typeName}$list(${value})` : `decodeJSON${typeName}(${raw} as Record<string, unknown>)`
+    return list ? `decodeJSON${typeName}$list(${value})` : `decodeJSON${typeName}(${raw} as { [key: string]: unknown })`
   }
   const decoded = enumField ? `decodeEnum$${typeName}(stringFromJSON(${raw}))` : genScalarJSONRead(field.type, raw)
   return list ? `(${value} as unknown[]).map(item => ${decoded})` : decoded
@@ -506,7 +506,7 @@ function genSchema(schema: LuxoSchema): string {
   out += '}\n\n'
 
   out += '/** API schema map — binary encoding and schema-aware JSON integer validation. */\n'
-  out += 'export const LUXO_SCHEMA: Record<string, APISchema> = {\n'
+  out += 'export const LUXO_SCHEMA: { [key: string]: APISchema } = {\n'
   for (const api of Object.values(schema.apis)) {
     if (api.internal) continue
     out += `  '${api.name}': { id: ${api.id}`

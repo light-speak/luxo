@@ -21,8 +21,8 @@ import (
 // bodyPool reuses byte buffers for reading request bodies.
 var bodyPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, 0, 4096)
-		return &b
+		// Allocate backing storage only after receive-budget admission.
+		return new([]byte)
 	},
 }
 
@@ -58,21 +58,80 @@ func putBody(bp *[]byte) {
 
 // readBody reads the full contents of r into a pooled buffer.
 // Returns the data, the pool handle (caller must return via bodyPool.Put), and any error.
-// MaxRequestBodySize limits binary request body to 100MB to prevent OOM.
-const MaxRequestBodySize = 100 * 1024 * 1024
+// MaxRequestBodySize is the default public request limit, not a memory reservation.
+const MaxRequestBodySize = 2 << 20
 
 func readBody(r io.Reader) ([]byte, *[]byte, error) {
+	return readBodyLimit(r, MaxRequestBodySize)
+}
+
+func readBodyLimit(r io.Reader, limit int) ([]byte, *[]byte, error) {
+	return readBodyLimitBudget(r, limit, nil)
+}
+
+func readBodyLimitBudget(r io.Reader, limit int, lease *receiveLease) ([]byte, *[]byte, error) {
 	bp := bodyPool.Get().(*[]byte)
-	buf := bytes.NewBuffer((*bp)[:0])
-	n, err := buf.ReadFrom(io.LimitReader(r, MaxRequestBodySize+1))
+	buf, err := readBodyBufferBudget(r, (*bp)[:0], limit, lease)
+	*bp = buf
 	if err != nil {
 		return nil, bp, err
 	}
-	if n > MaxRequestBodySize {
-		return nil, bp, fmt.Errorf("request body exceeds %d bytes limit", MaxRequestBodySize)
-	}
-	*bp = buf.Bytes()
 	return *bp, bp, nil
+}
+
+// readBodyBuffer reads through EOF without trusting Content-Length.
+func readBodyBuffer(r io.Reader, buf []byte, limit int) ([]byte, error) {
+	return readBodyBufferBudget(r, buf, limit, nil)
+}
+
+func readBodyBufferBudget(r io.Reader, buf []byte, limit int, lease *receiveLease) ([]byte, error) {
+	if limit < 0 || limit == int(^uint(0)>>1) {
+		return buf[:0], errInvalidBodyLimits
+	}
+	storage := cap(buf)
+	if err := lease.acquire(storage); err != nil {
+		return buf[:0], err
+	}
+	// Bound the writable slice once, rather than clipping every fragment read.
+	used := len(buf)
+	buf = buf[:min(cap(buf), limit+1)]
+	emptyReads := 0
+	for {
+		if used == len(buf) {
+			size := min(max(4096, cap(buf)*2), limit+1)
+			if err := lease.acquire(size); err != nil {
+				return buf[:used], err
+			}
+			next := make([]byte, size)
+			copy(next, buf)
+			buf = next
+			lease.discard(storage)
+			storage = size
+		}
+		space := buf[used:]
+		n, err := r.Read(space)
+		if n < 0 || n > len(space) {
+			return buf[:used], stderrors.New("invalid request body reader count")
+		}
+		used += n
+		if used > limit {
+			return buf[:used], errRequestBodyTooLarge
+		}
+		if err == io.EOF {
+			return buf[:used], nil
+		}
+		if err != nil {
+			return buf[:used], err
+		}
+		if n > 0 {
+			emptyReads = 0
+		} else {
+			emptyReads++
+			if emptyReads >= 100 {
+				return buf[:used], io.ErrNoProgress
+			}
+		}
+	}
 }
 
 // reservedKeys are protocol fields that should not appear in user params.
@@ -110,6 +169,7 @@ type Request struct {
 	// Gateways forward these slices directly without decoding and re-encoding.
 	binaryRequest []byte
 	binaryParams  []byte
+	binaryPlan    *binaryAPIPlan
 }
 
 const (
@@ -132,17 +192,31 @@ func (r *Request) applyBinaryListParams() {
 }
 
 // ParseRequest reads an HTTP request body and extracts $api, $select, and params.
-// MaxJSONBodySize limits JSON request body to 10MB (smaller than binary).
-const MaxJSONBodySize = 10 * 1024 * 1024
+// MaxJSONBodySize uses the same public request default as Binary.
+const MaxJSONBodySize = MaxRequestBodySize
 
 var errInvalidJSONUTF8 = stderrors.New("invalid JSON: invalid UTF-8")
 
 func ParseRequest(r *http.Request) (*Request, error) {
+	return parseRequestLimit(r, MaxJSONBodySize)
+}
+
+func parseRequestLimit(r *http.Request, limit int) (*Request, error) {
+	return parseRequestLimitBudget(r, limit, nil)
+}
+
+func parseRequestLimitBudget(r *http.Request, limit int, lease *receiveLease) (*Request, error) {
 	defer r.Body.Close()
-	body, bp, err := readBody(r.Body)
+	if r.ContentLength > int64(limit) {
+		return nil, fmt.Errorf("JSON body exceeds %d bytes limit: %w", limit, errRequestBodyTooLarge)
+	}
+	body, bp, err := readBodyLimitBudget(r.Body, limit, lease)
 	if err != nil {
 		if bp != nil {
 			putBody(bp)
+		}
+		if stderrors.Is(err, errRequestBodyTooLarge) {
+			return nil, fmt.Errorf("JSON body exceeds %d bytes limit: %w", limit, err)
 		}
 		return nil, fmt.Errorf("read body: %w", err)
 	}
@@ -150,9 +224,6 @@ func ParseRequest(r *http.Request) (*Request, error) {
 
 	if len(body) == 0 {
 		return nil, fmt.Errorf("empty request body")
-	}
-	if len(body) > MaxJSONBodySize {
-		return nil, fmt.Errorf("JSON body exceeds %d bytes limit", MaxJSONBodySize)
 	}
 	// Parse names and opaque values together; reject invalid Unicode before it
 	// can be replaced. The returned values own their bytes, not the pooled body.

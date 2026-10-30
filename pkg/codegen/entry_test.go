@@ -5,6 +5,9 @@ import (
 	goast "go/ast"
 	goparser "go/parser"
 	gotoken "go/token"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -135,7 +138,7 @@ func TestCacheEntryRequiresExplicitBackend(t *testing.T) {
 		for name, source := range map[string][]byte{"embedded": embedded, "task": entries["task"]} {
 			code := string(source)
 			if cached {
-				for _, part := range []string{`api.NewResponseCacheFromEnv(ctx, "` + name + `", cache.OpenMemory)`, "defer responseCache.Close()", "luvia.NewWithOptions", "ResponseCache: responseCache"} {
+				for _, part := range []string{`api.NewResponseCacheFromEnv(ctx, "` + name + `", cache.OpenMemory)`, "defer responseCache.Close()", "luvia.NewWithOptions", "options := api.RouterOptionsFromEnv()", "options.ResponseCache = responseCache", "luvia.NewWithOptions(options)"} {
 					if !strings.Contains(code, part) {
 						t.Fatalf("%s missing %s: %s", name, part, code)
 					}
@@ -286,10 +289,11 @@ func TestGeneratedEntriesTreatDotEnvAsOptionalButRejectMalformedFiles(t *testing
 	}
 	for name, source := range sources {
 		t.Run(name, func(t *testing.T) {
-			if !strings.Contains(source, `err != nil && !os.IsNotExist(err)`) ||
+			if !strings.Contains(source, `err != nil && !errors.Is(err, os.ErrNotExist)`) ||
 				!strings.Contains(source, `fatal: load .env: %v`) {
 				t.Fatalf("generated entry must ignore only a missing .env file:\n%s", source)
 			}
+			executeGeneratedDotEnvGuard(t, source)
 		})
 	}
 }
@@ -1407,5 +1411,83 @@ func TestGenerateGatewayEntryCompiledAPIDedup(t *testing.T) {
 	count := strings.Count(src, `"getUser"`)
 	if count != 1 {
 		t.Errorf("getUser should appear exactly once (dedup), appeared %d times:\n%s", count, src)
+	}
+}
+
+// Execute the exact generated guard: string matching alone cannot prove that
+// wrapped filesystem errors retain the intended optional-file behavior.
+func executeGeneratedDotEnvGuard(t *testing.T, source string) {
+	t.Helper()
+	start := strings.Index(source, "if err := env.Load(")
+	if start < 0 {
+		t.Fatal("missing generated environment guard")
+	}
+	end := strings.Index(source[start:], "\n\t}\n")
+	if end < 0 {
+		t.Fatal("unterminated generated environment guard")
+	}
+	guard := source[start : start+end+4]
+	root, err := filepath.Abs("../../.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(root, 0755); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp(root, "entry-env-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Error(err)
+		}
+	})
+	program := `package main
+import ("errors"; "fmt"; "os"; "github.com/light-speak/luxo/pkg/lux/env")
+func main() {` + guard + "}\n"
+	path := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(path, []byte(program), 0600); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(dir, "entry")
+	build := exec.CommandContext(t.Context(), "go", "build", "-o", binary, path)
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build guard: %v\n%s", err, output)
+	}
+	for _, mode := range []string{"missing", "valid", "malformed", "directory"} {
+		t.Run(mode, func(t *testing.T) { checkGeneratedDotEnvGuard(t, binary, dir, mode) })
+	}
+}
+
+func checkGeneratedDotEnvGuard(t *testing.T, binary, root, mode string) {
+	t.Helper()
+	dir := filepath.Join(root, mode)
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, ".env")
+	if mode == "directory" {
+		if err := os.Mkdir(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	} else if mode != "missing" {
+		text := "LUXO_ENTRY_TEST_VALUE=valid\n"
+		if mode == "malformed" {
+			text = "invalid assignment\n"
+		}
+		if err := os.WriteFile(path, []byte(text), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	command := exec.CommandContext(t.Context(), binary)
+	command.Dir = dir
+	output, err := command.CombinedOutput()
+	rejected := mode == "malformed" || mode == "directory"
+	if (err != nil) != rejected {
+		t.Fatalf("%s: error=%v output=%s", mode, err, output)
+	}
+	if rejected && !strings.Contains(string(output), "fatal: load .env:") {
+		t.Fatalf("missing error diagnostic: %s", output)
 	}
 }

@@ -8,7 +8,7 @@ import 'package:analyzer/dart/ast/ast.dart';
 import 'package:analyzer/dart/element/element.dart';
 import 'package:analyzer/diagnostic/diagnostic.dart';
 import 'package:build/build.dart';
-import 'package:glob/glob.dart';
+import 'package:luxo_client/src/codegen.dart';
 import 'package:test/test.dart';
 
 /// Uses real resolved Dart libraries without starting a build daemon.
@@ -156,37 +156,42 @@ class SelectFixture implements Resolver {
   );
 }
 
-class SelectBuildStep implements BuildStep {
-  @override
-  final SelectFixture resolver;
-  final Map<AssetId, String> outputs = {};
-
-  SelectBuildStep(this.resolver);
-
-  @override
-  AssetId get inputId => AssetId('fixture', r'lib/$lib$');
-
-  @override
-  Stream<AssetId> findAssets(Glob glob) async* {
-    for (final path in resolver.sources.keys) {
-      if (glob.matches(path)) yield AssetId('fixture', path);
-    }
+Future<void> generateSelectionClient(Directory root) async {
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  final response = server.first.then((request) async {
+    request.response.headers.contentType = ContentType.json;
+    request.response.write(
+      jsonEncode({
+        'models': {
+          'User': {
+            'name': 'User',
+            'usage': 'output',
+            'fields': [
+              {'id': 1, 'name': 'id', 'type': 'Int'},
+              {'id': 2, 'name': 'name', 'type': 'String'},
+            ],
+          },
+        },
+        'apis': {
+          'getUser': {
+            'id': 1,
+            'name': 'getUser',
+            'module': 'user',
+            'returnType': 'User',
+          },
+        },
+      }),
+    );
+    await request.response.close();
+  });
+  try {
+    await generate(
+      endpoint: 'http://${server.address.host}:${server.port}/luvia',
+      key: 'fixture',
+      outDir: '${root.path}/lib/src/luxo',
+    );
+    await response;
+  } finally {
+    await server.close(force: true);
   }
-
-  @override
-  Future<String> readAsString(AssetId id, {Encoding encoding = utf8}) async =>
-      resolver.sources[id.path]!;
-
-  @override
-  Future<void> writeAsString(
-    AssetId id,
-    FutureOr<String> contents, {
-    Encoding encoding = utf8,
-  }) async {
-    outputs[id] = await contents;
-  }
-
-  @override
-  dynamic noSuchMethod(Invocation invocation) =>
-      throw UnsupportedError('Unexpected build call: ${invocation.memberName}');
 }

@@ -31,6 +31,7 @@ Future<void> verify() async {
       () async {
         await docs.quickStart('$endpoint/quick');
         await docs.http('$endpoint/http');
+        await docs.nativeHttp2('https://api.example.com/luvia');
         await docs.websocket(endpoint.replaceFirst('http', 'ws'));
         await docs.binary('$endpoint/binary');
         await docs.refresh('$endpoint/refresh');

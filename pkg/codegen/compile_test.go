@@ -12,6 +12,27 @@ import (
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
+func TestGeneratedInheritedInferredParameter(t *testing.T) {
+	runGeneratedFixture(t, `
+model Base @noTime { id: Int @id }
+model Item : Base @noTime { name: String }
+api getItemById(key: Int): Item
+`, `package generated
+import("strings";"net/http/httptest";"testing";"github.com/light-speak/luxo/pkg/lux/api")
+func TestInheritedParameter(t *testing.T) {
+ router:=api.NewRouter()
+ if err:=RegisterSchema(router.Schema);err!=nil{t.Fatal(err)}
+ if err:=RegisterHandlers(router,&App{});err!=nil{t.Fatal(err)}
+ request:=httptest.NewRequest("POST","/luvia",strings.NewReader("{\"$api\":\"getItemById\",\"key\":\"bad\",\"$select\":\"id\"}"))
+ request.Header.Set("Content-Type","application/json")
+ response:=httptest.NewRecorder();router.ServeHTTP(response,request)
+ if response.Code!=400 { t.Fatalf("status=%d body=%s",response.Code,response.Body.String()) }
+}
+`, StableIDs{APIs: map[string]int{"getItemById": 1}, ModelFields: map[string]map[string]int{
+		"Base": {"id": 1}, "Item": {"id": 1, "name": 2},
+	}})
+}
+
 func TestGeneratedUnusedAPIParametersRemainValidated(t *testing.T) {
 	runGeneratedFixture(t, `
 type Input { value: Int }
@@ -7238,8 +7259,8 @@ func TestCompileModifierMethodSelect(t *testing.T) {
 		{method: "select"},
 		{method: "all"},
 	})
-	if !strings.Contains(got, "selectUserSQLColumns(req.Select)") {
-		t.Fatalf("select should use the model SQL selector, got %q", got)
+	if got != "app.User.Where().Select(selectUserSQLColumns(req.Select)...).All(ctx)" {
+		t.Fatalf("select must start a typed query and use the SQL selector, got %q", got)
 	}
 }
 
@@ -7709,7 +7730,7 @@ func TestCompileReturnPaginatedQueryUsesExactTotal(t *testing.T) {
 
 	out := compilerOut(c)
 	for _, want := range []string{
-		"_result, _luxoTotal1, err := app.Post.Limit(req.PageSize).Offset((req.Page - 1) * req.PageSize).AllWithCount(ctx)",
+		"_result, _luxoTotal1, err := app.Post.Where().Limit(req.PageSize).Offset((req.Page - 1) * req.PageSize).AllWithCount(ctx)",
 		"codec.AppendSvarint(req.Buf.B, _luxoTotal1)",
 	} {
 		if !strings.Contains(out, want) {
@@ -9272,4 +9293,28 @@ func TestIsIntExprFalseForUnknownVar(t *testing.T) {
 	if c.isIntExpr(&ast.Ident{Name: "unknown"}) {
 		t.Fatal("isIntExpr should be false for unknown variable")
 	}
+}
+
+func TestGeneratedLeadingSelection(t *testing.T) {
+	runGeneratedFixture(t, `
+model Product @noTime { id: Int @id name: String price: Int }
+api unselectedProducts(): [Product] { return Product.all() }
+api firstProduct(): Product? { return Product.first() }
+api orderedProducts(): [Product] { return Product.orderBy(price.desc).all() }
+api limitedProducts(): [Product] { return Product.limit(2).all() }
+api offsetProducts(): [Product] { return Product.offset(1).all() }
+api selectedProducts(): [Product] { return Product.select().all() }
+api filteredProducts(): [Product] { return Product.where(it.id > 0).select().all() }
+`, `package generated
+import (
+ "slices"
+ "testing"
+ "github.com/light-speak/luxo/pkg/lux/selection"
+)
+func TestSelectedSQLColumns(t *testing.T) {
+ got := selectProductSQLColumns([]*selection.Field{{Name:"name"}})
+ if !slices.Equal(got, []string{"name","id"}) { t.Fatalf("columns=%v",got) }
+}
+`, StableIDs{APIs: map[string]int{"selectedProducts": 1, "filteredProducts": 2, "unselectedProducts": 3, "firstProduct": 4, "orderedProducts": 5, "limitedProducts": 6, "offsetProducts": 7},
+		ModelFields: map[string]map[string]int{"Product": {"id": 1, "name": 2, "price": 3}}})
 }

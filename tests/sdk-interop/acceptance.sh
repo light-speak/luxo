@@ -42,13 +42,14 @@ fi
 if [[ "$suite" == all || "$suite" == dart ]]; then
   run dart-analysis "$core_dir/packages/dart" dart analyze
   run dart-generated "$core_dir/packages/dart" dart test \
-    test/generated_request_test.dart test/query_codegen_test.dart test/selection_build_test.dart \
+    test/generated_request_test.dart test/query_codegen_test.dart test/selection_test.dart test/selection_build_test.dart \
     test/go_interop_test.dart --reporter expanded --concurrency=1
 fi
 if [[ "$suite" == all || "$suite" == kotlin ]]; then
   run kotlin-generated "$core_dir/packages/kotlin" ./gradlew :test \
     --tests com.luxo.client.GeneratedRequestTest --tests com.luxo.client.QueryCodegenTest \
-    --tests com.luxo.client.SelectionPluginTest --no-daemon --warning-mode fail
+    --tests com.luxo.client.SelectionPluginTest --tests com.luxo.client.PreparedSelectionTest \
+    --no-daemon --warning-mode fail
   run kotlin-gradle "$core_dir/packages/kotlin" ./gradlew :gradle-plugin:test --no-daemon --warning-mode fail
   run kotlin-direct "$core_dir" go run ./tests/sdk-interop -run -- ./packages/kotlin/gradlew \
     -p tests/sdk-interop/kotlin build --project-cache-dir .tmp/gradle-cache --no-daemon --warning-mode fail

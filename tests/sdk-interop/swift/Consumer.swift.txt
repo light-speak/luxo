@@ -726,15 +726,22 @@ struct GoConsumer {
   }
 
   static func verifyConcurrentSelections(_ client: LuxoGeneratedClient) async throws {
+    let valuePlan = try LuxoGeneratedClient.prepareSelection_echoPrecision("value")
+    let labelPlan = try LuxoGeneratedClient.prepareSelection_echoPrecision("label")
+    let combinedPlan = try LuxoGeneratedClient.prepareSelection_echoPrecision("value, label")
     try await withThrowingTaskGroup(of: Void.self) { group in
       for index in 0..<16 {
         group.addTask {
           let input = PrecisionInput(
             value: Int.max - index, duration: Int64(index), optional: nil, values: [],
             label: "call-\(index)", ignored: 0)
-          async let value = client.echoPrecision(input: input, select: "value")
-          async let label = client.echoPrecision(input: input, select: "label")
-          async let combined = client.echoPrecision(input: input, select: "value, label")
+          let prepared = index.isMultiple(of: 2)
+          async let value = client.echoPrecision(
+            input: input, select: prepared ? nil : "value", selectionPlan: prepared ? valuePlan : nil)
+          async let label = client.echoPrecision(
+            input: input, select: prepared ? nil : "label", selectionPlan: prepared ? labelPlan : nil)
+          async let combined = client.echoPrecision(
+            input: input, select: "value, label", selectionPlan: prepared ? combinedPlan : valuePlan)
           let rows = try await [value, label, combined]
           try ensure(try rows[0].value.requireValue() == input.value, "concurrent value mismatch")
           try ensure(unselected(rows[0].label), "concurrent value gained label")
@@ -755,14 +762,15 @@ struct GoConsumer {
       try await group.waitForAll()
     }
     let repeated = try await client.echoPrecision(
-      input: makeInput(value: Int.max, optional: nil, values: []), select: "value")
+      input: makeInput(value: Int.max, optional: nil, values: []), selectionPlan: valuePlan)
     try ensure(try repeated.value.requireValue() == Int.max, "repeated concurrent value mismatch")
     try ensure(unselected(repeated.label), "repeated request gained label")
   }
 
   static func verifyStreams(_ client: LuxoGeneratedClient, values: [Int]) async throws {
     let (defaultStream, defaultContinuation) = AsyncStream<Precision>.makeStream()
-    let cancelDefault = try await client.subscribeWatchPrecision(select: selection) {
+    let streamPlan = try LuxoGeneratedClient.prepareSelection_subscribeWatchPrecision(selection)
+    let cancelDefault = try await client.subscribeWatchPrecision(selectionPlan: streamPlan) {
       defaultContinuation.yield($0)
     }
     do {

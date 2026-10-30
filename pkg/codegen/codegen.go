@@ -5,6 +5,7 @@ import (
 	"go/format"
 	"strings"
 
+	"github.com/light-speak/luxo/internal/inferred"
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/semantic"
 )
@@ -181,7 +182,9 @@ func (g *GeneratorContext) Generate(result *semantic.Result, packageName string,
 	if len(result.Errors) > 0 {
 		return nil, fmt.Errorf("code generation requires successful semantic analysis: %s", result.Errors[0].Message)
 	}
-	result = g.withEnumDependencies(result)
+	copy := *result
+	copy.Files = inferred.ExpandedFiles(result.Files)
+	result = g.withEnumDependencies(&copy)
 	if err := validateRequestContracts(result); err != nil {
 		return nil, err
 	}

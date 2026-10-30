@@ -63,9 +63,17 @@ internal class SelectionCalls(private val context: IrPluginContext, private val 
             if (parameter == null) { reject(file, call); continue }
             val index = parameter.indexInParameters
             if (call.arguments[index] != null) continue
+            val plan = call.symbol.owner.parameters.singleOrNull { it.name.asString() == "\$selectionPlan" }
+            if (plan != null && call.arguments[plan.indexInParameters] != null) continue
             if (paths.isEmpty() || call in escaped || unresolvedAlias) { reject(file, call); continue }
+            val text = render(paths.toList())
             call.arguments[index] = IrConstImpl.string(call.startOffset, call.endOffset,
-                context.irBuiltIns.stringType, render(paths.toList()))
+                context.irBuiltIns.stringType, text)
+            if (plan != null) {
+                val prepared = hoistSelectionPlan(context, file, call, plan, text)
+                if (prepared == null) { reject(file, call); continue }
+                call.arguments[plan.indexInParameters] = prepared
+            }
         }
     }
 

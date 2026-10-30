@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
+	"time"
 	"unicode/utf8"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
@@ -21,10 +23,16 @@ import (
 // WebSocket spec: concurrent writes are not safe, so we serialize with a mutex.
 // Reads are single-goroutine (the read loop), no lock needed.
 type wsConn struct {
-	conn           *websocket.Conn
-	ctx            context.Context // connection lifetime, never a subscription's context
-	acceptLanguage string
-	mu             sync.Mutex // serialize writes
+	writeDeadline   wsWriteDeadline
+	limits          WebSocketLimits
+	responseLimit   int
+	calls           atomic.Int64
+	writeBytes      atomic.Int64
+	totalWriteBytes *atomic.Int64
+	conn            *websocket.Conn
+	ctx             context.Context // connection lifetime, never a subscription's context
+	acceptLanguage  string
+	mu              sync.Mutex // serialize writes
 }
 
 func (c *wsConn) writeText(ctx context.Context, data []byte) error {
@@ -36,7 +44,20 @@ func (c *wsConn) writeBinary(ctx context.Context, data []byte) error {
 }
 
 func (c *wsConn) write(ctx context.Context, kind websocket.MessageType, data []byte) error {
-	c.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if c.responseLimit > 0 && len(data) > c.responseLimit {
+		_ = c.conn.Close(websocket.StatusMessageTooBig, "response exceeds configured size limit")
+		return errWSWriteCapacity
+	}
+	limits := normalizeWSLimits(c.limits)
+	if !c.reserveWrite(int64(len(data)), limits) {
+		c.conn.CloseNow()
+		return errWSWriteCapacity
+	}
+	defer c.releaseWrite(int64(len(data)))
+	deadline := c.lockWrite(ctx, limits.WriteTimeout)
 	defer c.mu.Unlock()
 	// A queued message can be discarded. Once writing starts, the entire frame
 	// must finish: cancelling websocket.Write closes the shared connection.
@@ -44,7 +65,13 @@ func (c *wsConn) write(ctx context.Context, kind websocket.MessageType, data []b
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
-		return c.conn.Write(c.ctx, kind, data)
+		if time.Until(deadline) <= 0 {
+			c.conn.CloseNow()
+			return context.DeadlineExceeded
+		}
+		writeCtx := c.writeDeadline.arm(c.ctx, deadline)
+		defer c.writeDeadline.disarm()
+		return c.conn.Write(writeCtx, kind, data)
 	}
 }
 
@@ -67,6 +94,11 @@ func (c *wsConn) write(ctx context.Context, kind websocket.MessageType, data []b
 //	  Sub OK:    [0x13][subscription UInt64]
 //	  Sub Error: [0x14][subscription UInt64][Binary Error Envelope]
 func (rt *Router) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	if !reserveWS(&rt.wsConnections, 1, rt.wsLimits.ConnectionsTotal) {
+		http.Error(w, "WebSocket connection capacity reached", http.StatusServiceUnavailable)
+		return
+	}
+	defer rt.wsConnections.Add(-1)
 	opts := &websocket.AcceptOptions{}
 	if rt.WSAllowAllOrigins {
 		opts.InsecureSkipVerify = true
@@ -79,46 +111,77 @@ func (rt *Router) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	conn.SetReadLimit(1 << 20) // 1MB max incoming message
+	conn.SetReadLimit(int64(rt.bodyLimits.RequestBytes))
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	ws := &wsConn{conn: conn, ctx: ctx, acceptLanguage: r.Header.Get("Accept-Language")}
+	ws := &wsConn{conn: conn, ctx: ctx, acceptLanguage: r.Header.Get("Accept-Language"), limits: rt.wsLimits, totalWriteBytes: &rt.wsWriteBytes, responseLimit: rt.bodyLimits.ResponseBytes}
+	defer ws.writeDeadline.close()
 
 	// Track this connection's stream subscriptions for cleanup on disconnect
 	var connSubs connectionSubscriptions
 	defer connSubs.close(rt.Streams)
+	var readDeadline wsWriteDeadline
+	defer readDeadline.close()
+	readCtx := readDeadline.context(ctx)
 
 	for {
-		msgType, data, err := conn.Read(ctx)
+		msgType, reader, err := conn.Reader(readCtx)
 		if err != nil {
 			return
 		}
-
-		if msgType == websocket.MessageText {
-			if !rt.handleWSText(ctx, ws, data, &connSubs) {
-				return
+		lease := rt.newReceiveLease()
+		readDeadline.arm(ctx, time.Now().Add(rt.wsLimits.ReadTimeout))
+		data, err := readBodyBufferBudget(reader, nil, rt.bodyLimits.RequestBytes, &lease)
+		readDeadline.disarm()
+		if err != nil {
+			lease.release()
+			if stderrors.Is(err, errReceiveCapacity) {
+				conn.Close(websocket.StatusTryAgainLater, "receive capacity reached")
 			}
-		} else if len(data) > 0 {
-			switch data[0] {
-			case 0x04, 0x05, 0x06, 0x07, 0x08:
-				conn.Close(websocket.StatusProtocolError, "retired stream protocol")
-				return
-			case BinaryFrameSubscribe, BinaryFrameUnsubscribe:
-				rt.handleWSStreamBinary(ctx, ws, data, &connSubs)
-			case BinaryFrameCallRequest:
-				go rt.handleWSBinary(ctx, ws, data)
-			}
+			return
+		}
+		if !rt.handleWSMessage(ctx, ws, msgType, data, &connSubs, lease) {
+			return
 		}
 	}
+}
+
+// Ownership follows unary dispatch; synchronous subscription preparation finishes
+// before releasing the raw buffer's reservation. Buffers are not pooled.
+func (rt *Router) handleWSMessage(ctx context.Context, ws *wsConn, kind websocket.MessageType, data []byte, subs *connectionSubscriptions, lease receiveLease) bool {
+	if kind == websocket.MessageText {
+		return rt.handleWSTextOwned(ctx, ws, data, subs, lease)
+	}
+	if len(data) > 0 && data[0] == BinaryFrameCallRequest {
+		rt.dispatchWSBinaryOwned(ctx, ws, data, lease)
+		return true
+	}
+	defer lease.release()
+	if len(data) == 0 {
+		return true
+	}
+	switch data[0] {
+	case 0x04, 0x05, 0x06, 0x07, 0x08:
+		ws.conn.Close(websocket.StatusProtocolError, "retired stream protocol")
+		return false
+	case BinaryFrameSubscribe, BinaryFrameUnsubscribe:
+		rt.handleWSStreamBinary(ctx, ws, data, subs)
+	}
+	return true
 }
 
 // Validate the complete message, not individual fragments. RFC 6455 §8.1.
 // Classify only decoded top-level names, including escaped control keys.
 func (rt *Router) handleWSText(ctx context.Context, ws *wsConn, data []byte, connSubs *connectionSubscriptions) bool {
+	return rt.handleWSTextOwned(ctx, ws, data, connSubs, receiveLease{})
+}
+
+func (rt *Router) handleWSTextOwned(ctx context.Context, ws *wsConn, data []byte, connSubs *connectionSubscriptions, lease receiveLease) bool {
 	raw, err := jsonutil.ParseObject(data)
 	if err != nil {
+		lease.release()
 		if invalidJSONUnicode(data, err) {
 			ws.conn.Close(websocket.StatusInvalidFramePayloadData, "invalid JSON Unicode")
 			return false
@@ -126,9 +189,10 @@ func (rt *Router) handleWSText(ctx context.Context, ws *wsConn, data []byte, con
 		return true // Preserve the existing malformed-JSON drop policy.
 	}
 	if isStreamRequest(raw) {
+		defer lease.release()
 		rt.handleWSStreamJSON(ctx, ws, raw, connSubs)
 	} else {
-		go rt.handleWSJSON(ctx, ws, raw)
+		rt.dispatchWSJSONOwned(ctx, ws, raw, lease)
 	}
 	return true
 }

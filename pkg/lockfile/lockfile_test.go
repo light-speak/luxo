@@ -14,6 +14,38 @@ func pos() token.Position {
 	return token.Position{File: "test.luxo", Line: 1, Col: 1}
 }
 
+func TestInheritedFieldsKeepChildStableIDs(t *testing.T) {
+	base := &ast.ModelDecl{Name: "Base", Fields: []*ast.FieldDecl{field("id", "Int")}}
+	child := &ast.ModelDecl{Name: "Child", Fields: []*ast.FieldDecl{field("name", "String")}}
+	input := files([]*ast.ModelDecl{base, child}, nil)
+	lf := New()
+	mustUpdate(t, lf, input)
+	nameID := lf.FieldID("Child", "name")
+	child.Parents = []string{"Base"}
+	mustUpdate(t, lf, input)
+	id := lf.FieldID("Child", "id")
+	if id <= nameID || lf.FieldID("Child", "name") != nameID {
+		t.Fatal("inherited field missing or existing child field renumbered")
+	}
+	mustUpdate(t, lf, input)
+	if lf.FieldID("Child", "id") != id || len(child.Fields) != 1 {
+		t.Fatal("unstable inherited ID or modified source AST")
+	}
+	if changes := lf.BreakingChanges(input); len(changes) != 0 {
+		t.Fatalf("unchanged inheritance reported as breaking: %v", changes)
+	}
+	base.Fields[0].Type.Name = "String"
+	changes := lf.BreakingChanges(input)
+	if len(changes) != 2 || changes[1].Path != "model Child.id" || changes[1].Before != "Int" || changes[1].After != "String" {
+		t.Fatalf("parent type change did not reach the child wire contract: %v", changes)
+	}
+	base.Fields = nil
+	mustUpdate(t, lf, input)
+	if lf.FieldID("Child", "id") != 0 || len(lf.Models["Child"].Reserved) != 1 || lf.Models["Child"].Reserved[0] != id {
+		t.Fatal("removed inherited field ID must remain reserved")
+	}
+}
+
 func TestInferredAPIParametersReceiveStableIDs(t *testing.T) {
 	model := &ast.ModelDecl{Name: "User", Fields: []*ast.FieldDecl{field("id", "Int"), field("name", "String"), field("age", "Int")}}
 	for _, test := range []struct {

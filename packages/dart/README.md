@@ -151,6 +151,10 @@ schema depend on server validation; generated clients register their schema.
 
 Full-featured HTTP client with JSON and binary modes:
 
+The default native `package:http` client uses HTTP/1.1. Web builds use the
+browser's negotiated protocol. `client:` accepts a compatible HTTP backend;
+Binary mode selects the Luxo payload format, not the HTTP version.
+
 ```dart
 final transport = HttpTransport(
   'https://api.example.com/luvia',
@@ -167,6 +171,43 @@ try {
   transport.close();
 }
 ```
+
+### Native HTTP/2
+
+Native Dart/Flutter can explicitly use the SDK's HTTP/2 candidate:
+
+```dart
+import 'package:luxo_client/http2.dart';
+import 'package:luxo_client/luxo_client.dart';
+
+final origin = Uri.parse('https://api.example.com/luvia');
+final transport = HttpTransport(
+  origin.toString(),
+  client: LuxoHttp2Client(origin),
+  options: const TransportOptions(mode: TransportMode.binary),
+);
+// Register the generated schema/client before calling APIs.
+// Close transport when its owner is disposed.
+transport.close();
+```
+
+This optional backend uses one TLS connection per client, requires ALPN `h2`,
+and restricts requests to the configured origin. It defaults to 16 concurrent
+requests and 2 MiB per request/response body; excess work fails without an
+unbounded queue. It buffers complete unary responses and does not automatically
+retry, follow redirects, or fall back to HTTP/1.1. `HttpTransport` deadlines cancel
+only the affected request; closing it cancels outstanding work. Browser builds
+should keep the default client and must not import the native `http2.dart` entry.
+Only buffered `Request`/`AbortableRequest` bodies are supported, as used by
+`HttpTransport`; arbitrary streaming uploads are rejected.
+Functional TLS checks have passed; performance acceptance is still pending.
+HTTP/1.1 remains the default.
+
+All `HttpTransport` backends also enforce
+`TransportOptions(maxResponseBytes: 2 * 1024 * 1024)` by default. This positive
+byte limit is configurable. Oversized streamed responses fail with `ParseError`
+and cancel only that request. Injected clients must honor `AbortableRequest`;
+backend-specific collection limits still apply independently.
 
 ### WebSocket — Real-time Subscriptions
 
@@ -399,7 +440,9 @@ An explicit `select:` always takes precedence. This is static analysis, not
 whole-program tracing: opaque helper calls and dynamic result usage require an
 explicit selection. Custom SDK output locations use `--client lib/path/client.dart`.
 Unsafe or empty inference fails instead of selecting all fields. The old
-build_runner hint output is no longer consumed by generated clients.
+build_runner hint builder is disabled by default and rejects explicit use with a
+migration diagnostic. Use the call-site build entry above; API-wide hint output
+is not consumed by generated clients.
 
 For Flutter tooling, the machine-protocol entry runs against the same isolated
 snapshot and refreshes selections before forwarding each `app.restart` command:
@@ -514,6 +557,8 @@ the existing typed-parameter validation rules.
 映射。自定义 `LuxoJSONEncodable` 继续遵循已有的强类型参数校验。
 
 ### Real Go interoperability / 真实 Go 联测
+
+Tests and benchmarks are distributed in the source repository, not the pub package. Run the following development commands from `packages/dart` in a repository checkout.
 
 `dart test test/go_interop_test.dart --reporter expanded` builds a real service
 from [the shared Luxo fixture](../../tests/sdk-interop), fetches live schema,

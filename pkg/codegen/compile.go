@@ -1647,6 +1647,12 @@ func (c *compiler) compileModelChain(modelName string, links []chainLink) string
 
 // compileModifierMethod handles non-terminal method links in a model chain.
 func (c *compiler) compileModifierMethod(b *strings.Builder, modelName string, link chainLink, i, totalLinks int, scopeInjected bool) {
+	if b.Len() == 0 {
+		switch link.method {
+		case "select", "orderBy", "limit", "offset":
+			fmt.Fprintf(b, "app.%s.Where()", modelName)
+		}
+	}
 	switch link.method {
 	case "where":
 		c.compileWhereChain(b, modelName, link.args, i == 0 && !scopeInjected)
@@ -2546,6 +2552,9 @@ func (c *compiler) compileTerminalMethod(b *strings.Builder, modelName string, l
 	// Seed builder if empty (terminal-only chain without prior modifier)
 	if b.Len() == 0 {
 		fmt.Fprintf(b, "app.%s", modelName)
+		if link.method == "all" || link.method == "first" {
+			b.WriteString(".Where()")
+		}
 	}
 	switch link.method {
 	case "delete":

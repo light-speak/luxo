@@ -48,7 +48,7 @@ func TestClientExchangeDeadlineFailuresDoNotRecycleConnections(t *testing.T) {
 				ctx, cancel = context.WithTimeout(ctx, time.Minute)
 				defer cancel()
 			}
-			response, err := client.exchange(ctx, []byte{1})
+			response, err := client.exchange(ctx, []byte{0, 0, 0, 0, 1})
 			if sample.wantError {
 				if !errors.Is(err, net.ErrClosed) || response != nil {
 					t.Fatalf("deadline error = %v, response=%x", err, response)
@@ -79,7 +79,7 @@ func TestClientExchangeCancellationInterruptsBlockedIO(t *testing.T) {
 			var callErr error
 			go func() {
 				defer close(done)
-				response, callErr = client.exchange(ctx, []byte{42})
+				response, callErr = client.exchange(ctx, []byte{0, 0, 0, 0, 42})
 			}()
 			if reading {
 				if request, err := ReadFrame(peer, nil); err != nil || !bytes.Equal(request, []byte{42}) {
@@ -130,7 +130,7 @@ func TestClientExchangeCompletedResponseRacingCancellation(t *testing.T) {
 			}
 			done <- WriteFrame(peer, []byte{statusOK, 42})
 		}()
-		response, err := client.exchange(ctx, []byte{1})
+		response, err := client.exchange(ctx, []byte{0, 0, 0, 0, 1})
 		if err != nil || !bytes.Equal(response, []byte{statusOK, 42}) || len(client.pool.conns) != 0 {
 			t.Fatalf("completed response or pool ownership changed: %x, %v, idle=%d", response, err, len(client.pool.conns))
 		}
@@ -150,7 +150,7 @@ func TestPoolIdleBorrowReturnAllocations(t *testing.T) {
 	t.Cleanup(pool.Close)
 	allocs := testing.AllocsPerRun(1000, func() {
 		borrowed, err := pool.Get()
-		if err != nil || borrowed != conn {
+		if err != nil || borrowed.(*poolConn).Conn != conn {
 			t.Fatalf("idle borrow = %v / %v", borrowed, err)
 		}
 		pool.Put(borrowed)
@@ -183,7 +183,7 @@ func TestPoolClosePreservesBorrowedOwnership(t *testing.T) {
 	pool.Put(nil)
 	pool.Put(conn)
 	borrowed, err := pool.Get()
-	if err != nil || borrowed != conn {
+	if err != nil || borrowed.(*poolConn).Conn != conn {
 		t.Fatalf("borrow = %v / %v", borrowed, err)
 	}
 	pool.Close()

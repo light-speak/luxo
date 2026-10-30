@@ -295,6 +295,11 @@ void main() {
         expect(types, isNot(contains('Uint8List(0)')));
         expect(types, contains('dec.readBytes()'));
         expect(types, contains('decodeLuxoJSON(utf8.decode(dec.readBytes()))'));
+        expect(types, isNot(contains('Uint8List.fromList(utf8.encode(')));
+        expect(
+          types,
+          contains('encoder.writeBytes(utf8.encode(encodeLuxoJSON('),
+        );
         expect(
           schema,
           contains("ParamSchema(1, 'chunks', 'Bytes', true, false)"),
@@ -357,12 +362,14 @@ void main() {
         expect(
           client,
           contains(
-            'Future<Page<Payload>> searchPayloads({LuxoInt64? page, LuxoInt64? pageSize, String? select, List<LuxoFilter>? filters, List<LuxoSorter>? sorters})',
+            'Future<Page<Payload>> searchPayloads({LuxoInt64? page, LuxoInt64? pageSize, String? select, PreparedSelection? \$selectionPlan, List<LuxoFilter>? filters, List<LuxoSorter>? sorters})',
           ),
         );
         expect(
           client,
-          contains('Future<Payload> createSnapshot({String? select})'),
+          contains(
+            'Future<Payload> createSnapshot({String? select, PreparedSelection? \$selectionPlan})',
+          ),
         );
         expect(
           client,
@@ -373,7 +380,7 @@ void main() {
         expect(
           client,
           contains(
-            'Future<void Function()> subscribeWatchPayload({required LuxoInt64 projectId, String? select, required void Function(Payload) onData, void Function(LuxoError)? onError, void Function()? onDone})',
+            'Future<void Function()> subscribeWatchPayload({required LuxoInt64 projectId, String? select, PreparedSelection? \$selectionPlan, required void Function(Payload) onData, void Function(LuxoError)? onError, void Function()? onDone})',
           ),
         );
         expect(client, contains("transport.subscribe('watchPayload'"));

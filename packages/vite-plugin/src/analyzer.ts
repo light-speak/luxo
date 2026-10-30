@@ -45,7 +45,7 @@ interface AnalysisState {
  * Tracks statically visible result usage and injects a safe compile-time
  * selection into generated client's params object.
  */
-export function analyzeAndTransform(code: string, id: string, schema: LuxoSchema): string | null {
+export function analyzeAndTransform(code: string, id: string, schema: LuxoSchema, preparedSelections = false): string | null {
   const ast = parseSource(code, id)
 
   const state = createAnalysisState(schema)
@@ -54,7 +54,21 @@ export function analyzeAndTransform(code: string, id: string, schema: LuxoSchema
   collectFieldAccesses(ast, state)
   collectEscapes(ast, state)
 
-  const edits = state.usages.flatMap(usage => createSelectionEdit(code, usage, state.schema))
+  let prefix = '$luxoSelection'
+  while (code.includes(prefix)) prefix += '_'
+  const plans: string[] = []
+  const expression = (selection: string): string => {
+    if (!preparedSelections) return `'${selection}'`
+    const name = `${prefix}${plans.length}`
+    plans.push(`const ${name} = ${prefix}Prepare(${JSON.stringify(selection)});`)
+    return name
+  }
+  const edits = state.usages.flatMap(usage => createSelectionEdit(code, usage, state.schema, expression))
+  if (plans.length) {
+    const directives = ast.program.directives
+    const point = directives.at(-1)?.end ?? ast.program.interpreter?.end ?? 0
+    edits.push({ start: point, end: point, replacement: `\nimport { prepareSelection as ${prefix}Prepare } from '@luxojs/client';\n${plans.join('\n')}\n` })
+  }
   if (edits.length === 0) return null
   return applyTextEdits(code, edits)
 }
@@ -353,7 +367,7 @@ function unwrapExpression(path: NodePath<t.Node>): NodePath<t.Node> {
   }
 }
 
-function createSelectionEdit(code: string, usage: CallUsage, schema: LuxoSchema): TextEdit[] {
+function createSelectionEdit(code: string, usage: CallUsage, schema: LuxoSchema, expression: (text: string) => string): TextEdit[] {
   if (hasManualSelection(usage.call)) return []
   if (usage.escaped) addSafeProjection(usage.tree, usage.api.returnType ?? '', schema)
   completeStructuredLeaves(usage.tree, usage.api.returnType ?? '', schema)
@@ -362,10 +376,11 @@ function createSelectionEdit(code: string, usage: CallUsage, schema: LuxoSchema)
   if (!selection) return []
   warnDeepSelection(usage.api.name, usage.tree)
 
+  const value = expression(selection)
   const first = usage.call.arguments[0]
-  if (!first) return insertEmptyParams(usage.call, selection)
-  if (t.isObjectExpression(first)) return mergeObjectParams(first, selection)
-  return wrapDynamicParams(code, first, selection)
+  if (!first) return insertEmptyParams(usage.call, value)
+  if (t.isObjectExpression(first)) return mergeObjectParams(first, value)
+  return wrapDynamicParams(code, first, value)
 }
 
 function addSafeProjection(
@@ -455,15 +470,15 @@ function hasManualSelection(call: t.CallExpression): boolean {
 function insertEmptyParams(call: t.CallExpression, selection: string): TextEdit[] {
   if (call.end === null || call.end === undefined) return []
   const point = call.end - 1
-  return [{ start: point, end: point, replacement: `{ $select: '${selection}' }` }]
+  return [{ start: point, end: point, replacement: `{ $select: ${selection} }` }]
 }
 
 function mergeObjectParams(params: t.ObjectExpression, selection: string): TextEdit[] {
   if (params.start === null || params.start === undefined || params.end === null || params.end === undefined) return []
   if (params.properties.length === 0) {
-    return [{ start: params.start, end: params.end, replacement: `{ $select: '${selection}' }` }]
+    return [{ start: params.start, end: params.end, replacement: `{ $select: ${selection} }` }]
   }
-  return [{ start: params.start + 1, end: params.start + 1, replacement: ` $select: '${selection}',` }]
+  return [{ start: params.start + 1, end: params.start + 1, replacement: ` $select: ${selection},` }]
 }
 
 function wrapDynamicParams(
@@ -476,7 +491,7 @@ function wrapDynamicParams(
   return [{
     start: params.start,
     end: params.end,
-    replacement: `{ $select: '${selection}', ...(${source}) }`,
+    replacement: `{ $select: ${selection}, ...(${source}) }`,
   }]
 }
 

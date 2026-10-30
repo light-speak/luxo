@@ -16,14 +16,14 @@ internal object KotlinRequestCodegen {
             add("${p.name}: ${type(api, p, types(p))}$default")
         }
         for (name in missingPages(api)) add("$name: Long? = null")
-        if (selection) add("select: String? = null")
+        if (selection) addAll(listOf("select: String? = null", "`\$selectionPlan`: PreparedSelection? = null"))
         if (api.paginated) addAll(listOf("filters: List<LuxoFilter>? = null", "sorters: List<LuxoSorter>? = null"))
     }
 
     fun invocation(api: LuxoAPI, selection: Boolean, select: String): String {
         val args = api.params.map { it.name }.toMutableList()
         args += missingPages(api)
-        if (selection) args += select
+        if (selection) args += listOf(select, "`\$selectionPlan`")
         if (api.paginated) args += listOf("filters", "sorters")
         return "_${api.name}Request(${args.joinToString(", ")})"
     }
@@ -32,7 +32,7 @@ internal object KotlinRequestCodegen {
         scalar: (StringBuilder, LuxoField, String) -> Unit): String = buildString {
         val fields = api.params.mapIndexed { i, p -> "private val p$i: ${type(api, p, types(p))}" }.toMutableList()
         for (name in missingPages(api)) fields += "private val $name: Long?"
-        if (selection) fields += "override val selection: String?"
+        if (selection) fields += listOf("override val selection: String?", "override val selectionPlan: PreparedSelection?")
         if (api.paginated) fields += listOf("override val filters: List<LuxoFilter>?", "override val sorters: List<LuxoSorter>?")
         appendLine("\nprivate class _${api.name}Request(${fields.joinToString(", ")}) : GeneratedRequest {")
         appendLine("    override val apiID: Int = ${api.id}")

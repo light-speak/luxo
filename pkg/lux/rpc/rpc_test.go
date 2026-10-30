@@ -898,7 +898,7 @@ func TestClientDiscardsConnectionOnSetupFailure(t *testing.T) {
 					if sub, err := client.SubscribeContext(ctx, "", 1, nil, nil); err == nil || sub != nil {
 						t.Fatalf("failed stream escaped setup: %v", err)
 					}
-				} else if body, err := client.exchange(ctx, []byte{1}); err == nil || body != nil {
+				} else if body, err := client.exchange(ctx, []byte{0, 0, 0, 0, 1}); err == nil || body != nil {
 					t.Fatalf("failed unary exchange returned data: %v", err)
 				}
 				if owned.closes.Load() == 0 || len(client.pool.conns) != 0 {

@@ -26,6 +26,8 @@
 
 ---
 
+1.0.0-beta.1 的 Go 核心与 CLI 仅支持 64 位平台；32 位 Go 目标不受支持，也不纳入发行验收。这不改变协议布局或 Int64/UInt64 数值范围。
+
 ## 为什么叫 "Luxo"？
 
 **Luxo** /lɑːkèsuǒ/ — 数据从数据库到达客户端，这条路本该很短。
@@ -342,6 +344,14 @@ JSON 与 Luxo Binary 都是生产传输。HTTP 客户端通过 SDK transport mod
 
 两种编码保持相同的数据语义。业务 `Int/Duration` 为有符号 int64；WebSocket 调用编号（JSON `$id`、Binary `sequence`）为无符号 uint64。JSON ID 必须是 `0…18446744073709551615` 范围内不带引号的十进制整数 token，不能用布尔值、字符串、小数或指数。非法、缺失或溢出的 ID 在业务执行前直接丢弃，不能强转为零；成功与失败响应都原样返回合法 ID。SDK 计数器耗尽时须明确失败，不得舍入、窄化或覆盖待响应请求；四 SDK 的完整边界验收仍是 beta 发布门禁。
 
+### 网关 HTTP 实现
+
+网关默认使用 `APP_HTTP_TRANSPORT=luxo`：TLS ALPN 和明文 HTTP/2 prior-knowledge
+连接进入 Luxo 专用 HTTP/2 服务端，同一监听端口的 HTTP/1.1 与 WebSocket 继续使用
+Go 标准 HTTP 路径。显式设置 `APP_HTTP_TRANSPORT=standard` 可让 HTTP/2 也使用
+标准实现；未知配置值在启动时拒绝。此启动配置选择服务端实现，不选择 JSON/Binary
+编码，也不会替客户端改变 HTTP 版本。
+
 ### 请求追踪与 SQL
 
 Luxo 的追踪是请求级、跨网关、服务、DataLoader 与数据库的执行 DAG。Studio Playground
@@ -442,6 +452,12 @@ AppendJSON 成功必须返回合法 JSON，失败保留原始 dst 前缀并返�
 `api.EncodeBinaryRequest` 的 JSON 参数也必须显式使用 `json.RawMessage` 文档。列表支持 `[]json.RawMessage`、原始 JSON 数组文档或仅含原始文档的 `[]any`；拒绝 map、struct、自定义 `MarshalJSON` 对象及标量的隐式转换。例如传入 ``json.RawMessage(`{"count":123456789012345678901234567890}`)``，而不是 Go map。合法文档及数字文本保持原始字节，非法输入返回 error 和 nil 请求正文。这是 Go 编码 API 的约束，不改变 wire 布局。
 
 本地结构化 JSON 输入不再经过“JSON 转 Binary 再读模型”的中间往返。网关转发仍需校验参数并编码内部 Binary RPC 消息，这是网络边界编码，与本地模型读取不同。本项移除了任意目标的反射回退，不代表所有动态边界都已静态化，也不代表零编码、零分配或整体性能验收完成。
+
+#### 请求日志采样
+
+请求日志默认关闭；`LOG_REQUESTS=true` 开启后，成功请求默认每 100 条记录 1 条。开发或排障时再设置 `LOG_REQUESTS_FULL=true` 显式选择全量；单独设置它不会开启日志。错误绕过采样，但有界异步队列仍可丢弃并计数，不是可靠审计通道。指标和 Trace 采样独立。
+
+显式 Go 配置中，`RouterOptions.RequestLogSampleEvery` 为 0 时使用默认 100，1 表示全量，其他 N 表示每 N 条成功请求记录 1 条。需要环境配置时先调用 `api.RouterOptionsFromEnv()`，再覆盖选项。生成的缓存与非缓存服务遵循同一环境策略。
 
 #### NATS 任务重试与死信
 

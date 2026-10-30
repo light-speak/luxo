@@ -5,8 +5,6 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
 
-import 'package:build/build.dart';
-import 'package:luxo_client/src/builder/select_builder.dart';
 import 'package:luxo_client/src/builder/selection_build.dart';
 import 'package:luxo_client/src/codegen.dart';
 import 'package:test/test.dart';
@@ -16,6 +14,7 @@ import 'select_fixture.dart';
 const _sections = {
   'Quick Start': 'quickStart',
   'HTTP Transport': 'http',
+  'Native HTTP/2': 'nativeHttp2',
   'WebSocket — Real-time Subscriptions': 'websocket',
   'Binary Mode': 'binary',
   '401 Auto-Refresh': 'refresh',
@@ -28,7 +27,7 @@ const _sections = {
 
 void main() {
   test(
-    'README Dart snippets compile and run with generated client and hints',
+    'README Dart snippets compile and run with generated client and call-site selections',
     _verifyReadme,
     timeout: const Timeout(Duration(minutes: 2)),
   );
@@ -133,13 +132,6 @@ Future<void> _verifyReadme() async {
   addTearDown(fixture.close);
   for (final name in _sections.values) {
     await fixture.unit('lib/example_$name.dart');
-  }
-  final step = SelectBuildStep(fixture);
-  await selectHintsBuilder(BuilderOptions({})).build(step);
-  expect(step.outputs.values.single, contains("'getUser': 'name'"));
-  for (final entry in step.outputs.entries) {
-    await File('${fixture.root.path}/${entry.key.path}')
-        .writeAsString(entry.value);
   }
   await fixture.runDart([
     'analyze',

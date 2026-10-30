@@ -119,7 +119,7 @@ func TestRouterLoggingDisabledWritesNothing(t *testing.T) {
 func TestRouterLogsStableErrorNameWithoutCause(t *testing.T) {
 	const secret = "DO_NOT_LOG_THIS_ERROR_CAUSE"
 	var logs bytes.Buffer
-	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, SynchronousRequestLogs: true, LogWriter: &logs})
+	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, RequestLogSampleEvery: 1, SynchronousRequestLogs: true, LogWriter: &logs})
 	rt.Handle("failing", func(context.Context, *Request) error {
 		return luxerrors.Wrap(fmt.Errorf("database rejected %s", secret))
 	})
@@ -139,11 +139,11 @@ func BenchmarkRouterObservabilityDisabled(b *testing.B) {
 }
 
 func BenchmarkRouterObservabilityEnabled(b *testing.B) {
-	benchmarkRouterObservability(b, RouterOptions{RequestLogging: true, SynchronousRequestLogs: true, LogWriter: io.Discard})
+	benchmarkRouterObservability(b, RouterOptions{RequestLogging: true, RequestLogSampleEvery: 1, SynchronousRequestLogs: true, LogWriter: io.Discard})
 }
 
 func BenchmarkRouterObservabilityAsync(b *testing.B) {
-	benchmarkRouterObservability(b, RouterOptions{RequestLogging: true, LogWriter: io.Discard})
+	benchmarkRouterObservability(b, RouterOptions{RequestLogging: true, RequestLogSampleEvery: 1, LogWriter: io.Discard})
 }
 
 func BenchmarkRouterObservabilitySampled(b *testing.B) {

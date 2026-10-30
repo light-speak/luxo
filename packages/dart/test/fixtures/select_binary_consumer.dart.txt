@@ -1,0 +1,80 @@
+import 'dart:io';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+import 'package:luxo_client/luxo_client.dart';
+import 'package:fixture/src/luxo/client.dart';
+import 'package:fixture/label.dart';
+import 'package:fixture/identifier.dart';
+
+class InspectTransport extends HttpTransport {
+  final plans = <PreparedSelection?>[];
+  InspectTransport(String endpoint, {http.Client? client})
+    : super(endpoint, client: client);
+  @override
+  Future<T> call<T>(String api, {Map<String, dynamic>? params,
+    GeneratedRequest? request, T Function(dynamic)? decoder}) {
+    plans.add(request?.selectionPlan);
+    return super.call<T>(api, params: params, request: request, decoder: decoder);
+  }
+}
+
+Future<void> main(List<String> arguments) async {
+  var calls = 0;
+  Future<http.Response> handle(http.Request request) async {
+    final expectedMask = calls++ < 2 ? 2 : 1;
+    final expected = [1, 2, 1, expectedMask, 0];
+    final actual = request.bodyBytes;
+    if (actual.length != expected.length ||
+        List.generate(expected.length, (i) => actual[i] == expected[i]).contains(false)) {
+      throw StateError('request bytes: $actual');
+    }
+    final response = LuxoEncoder()..writeVarint(expectedMask == 2 ? 3 : 0);
+    if (expectedMask == 2) {
+      response.writeFieldString(2, 'Ada');
+    } else {
+      response.writeFieldInt(1, LuxoInt64.parse('9223372036854775807'));
+    }
+    response.writeEnd();
+    return http.Response.bytes(response.bytes(), 200);
+  }
+  HttpServer? server;
+  final InspectTransport transport;
+  if (arguments.contains('--network')) {
+    server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    server.listen((incoming) async {
+      try {
+        final request = http.Request(incoming.method, incoming.requestedUri)
+          ..bodyBytes = await incoming.fold<List<int>>([], (bytes, chunk) => bytes..addAll(chunk));
+        final response = await handle(request);
+        incoming.response.statusCode = response.statusCode;
+        incoming.response.add(response.bodyBytes);
+      } catch (error) {
+        incoming.response.statusCode = 500;
+        incoming.response.write(error);
+      } finally {
+        await incoming.response.close();
+      }
+    });
+    transport = InspectTransport('http://${server.address.host}:${server.port}/luvia');
+  } else {
+    transport = InspectTransport('https://example.test/luvia', client: MockClient(handle));
+  }
+  final client = LuxoClient(transport)..setMode(TransportMode.binary);
+  try {
+    for (var i = 0; i < 2; i++) {
+      if (await label(client) != 'Ada') throw StateError('label');
+    }
+    if (await identifier(client) != '9223372036854775807') throw StateError('id');
+    final explicit = await client.getUser(select: 'id');
+    if (explicit.id.value.toString() != '9223372036854775807') throw StateError('explicit');
+    final plans = transport.plans;
+    if (plans.length != 4 || plans[0] == null ||
+        !identical(plans[0], plans[1]) || identical(plans[0], plans[2]) ||
+        plans[2]?.text != 'id' || plans[3] != null) {
+      throw StateError('call-site plan ownership');
+    }
+  } finally {
+    client.close();
+    await server?.close(force: true);
+  }
+}

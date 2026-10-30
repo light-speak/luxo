@@ -3,6 +3,7 @@ package semantic
 import (
 	"fmt"
 
+	"github.com/light-speak/luxo/internal/inferred"
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/cachepolicy"
 	"github.com/light-speak/luxo/pkg/token"
@@ -145,6 +146,9 @@ func (a *Analyzer) analyzeInternal(files []*ast.File) *Result {
 	a.runTypePass(files)
 	a.runBodyPass(files)
 	a.runPostAnalysisPass(files)
+	if len(a.errors) == 0 {
+		files = inferred.ExpandedFiles(files)
+	}
 
 	return &Result{
 		Scope:                      a.scope,
@@ -177,6 +181,7 @@ func (a *Analyzer) runTypePass(files []*ast.File) {
 		a.resolveFields(file)
 	}
 	a.validateComputedFields(files)
+	a.validateInferredParameters(files)
 	if a.moduleMap != nil {
 		a.validateFederationExtendFields()
 		a.checkModuleVisibility()

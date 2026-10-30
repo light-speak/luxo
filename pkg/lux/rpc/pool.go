@@ -12,15 +12,20 @@ import (
 
 var errPoolClosed = errors.New("pool closed")
 
-// Pool manages reusable TCP connections to a remote service.
-// Zero-alloc Get/Put on the hot path (channel + atomic bool).
+// Pool bounds idle, open (including dialing), and waiting LRPC connections.
 type Pool struct {
-	addr    string
-	maxIdle int
-	timeout time.Duration
-	conns   chan net.Conn
-	closed  atomic.Bool
-	once    sync.Once
+	addr     string
+	maxIdle  int
+	timeout  time.Duration
+	conns    chan net.Conn
+	closed   atomic.Bool
+	once     sync.Once
+	options  PoolOptions
+	open     atomic.Int64
+	waiters  atomic.Int64
+	wake     chan struct{}
+	lifetime context.Context
+	cancel   context.CancelFunc
 }
 
 // NewPool creates a connection pool for the given address.
@@ -28,12 +33,10 @@ func NewPool(addr string, maxIdle int) *Pool {
 	if maxIdle <= 0 {
 		maxIdle = 32
 	}
-	return &Pool{
-		addr:    addr,
-		maxIdle: maxIdle,
-		timeout: 5 * time.Second,
-		conns:   make(chan net.Conn, maxIdle),
-	}
+	options := DefaultPoolOptions()
+	options.MaxIdle = maxIdle
+	options.MaxOpen = max(32, maxIdle)
+	return newPool(addr, options)
 }
 
 // Get returns an idle connection or dials a new one.
@@ -43,15 +46,14 @@ func (p *Pool) Get() (net.Conn, error) {
 
 // GetContext returns an idle connection or dials with context support.
 func (p *Pool) GetContext(ctx context.Context) (net.Conn, error) {
-	if p.closed.Load() {
-		return nil, errPoolClosed
+	conn, err, ready := p.tryAcquire(ctx)
+	if !ready {
+		conn, err = p.wait(ctx)
 	}
-	select {
-	case conn := <-p.conns:
-		return conn, nil // conns stays open and Put never enqueues nil.
-	default:
+	if conn == nil && err == nil {
+		return p.dialReserved(ctx)
 	}
-	return p.dialContext(ctx)
+	return conn, err
 }
 
 // Put returns a connection to the pool. Closes it if pool is full or closed.
@@ -65,13 +67,28 @@ func (p *Pool) Put(conn net.Conn) {
 		conn.Close()
 		return
 	}
+	tracked, ok := conn.(*poolConn)
+	if !ok {
+		if !reserve(&p.open, p.options.MaxOpen) {
+			conn.Close()
+			return
+		}
+		tracked = &poolConn{Conn: conn, pool: p}
+	} else if tracked.pool != p {
+		tracked.Close()
+		return
+	}
+	if !tracked.state.CompareAndSwap(connBorrowed, connIdle) {
+		return
+	}
 	select {
-	case p.conns <- conn:
+	case p.conns <- tracked:
+		p.signal()
 		if p.closed.Load() {
 			p.closeIdle()
 		}
 	default:
-		conn.Close()
+		tracked.Close()
 	}
 }
 
@@ -82,6 +99,7 @@ func (p *Pool) Put(conn net.Conn) {
 func (p *Pool) Close() {
 	p.once.Do(func() {
 		p.closed.Store(true)
+		p.cancel()
 		p.closeIdle()
 	})
 }

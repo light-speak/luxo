@@ -1,3 +1,4 @@
+export { PreparedSelection, prepareSelection } from './selection'
 export { FetchTransport, WsTransport, encodeBinaryBody, encodeStaticRequestBody, encodeJSONParam, utf8Length } from './transport'
 export { WxTransport } from './wx'
 export { GeneratedRequest } from './request'

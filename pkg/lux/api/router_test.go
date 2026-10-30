@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,6 +59,46 @@ func TestDirectClientKeyFallsBackToUnparsedAddress(t *testing.T) {
 	const remoteAddress = "unix-client"
 	if got := directClientKey(remoteAddress); got != remoteAddress {
 		t.Fatalf("directClientKey = %q, want %q", got, remoteAddress)
+	}
+}
+
+func TestRouterSchemaQueryBoundary(t *testing.T) {
+	for _, query := range []string{"", "?", "?x=1", "?$schema", "?%24schema=", "?x=%ZZ&$schema", "?x=$schema", "?$schema%ZZ=1"} {
+		t.Run(query, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/luvia"+query, nil)
+			want := http.StatusMethodNotAllowed
+			if r.URL.Query().Has("$schema") {
+				want = http.StatusForbidden
+			}
+			w := httptest.NewRecorder()
+			NewRouter().ServeHTTP(w, r)
+			if w.Code != want {
+				t.Fatalf("status=%d, want %d", w.Code, want)
+			}
+		})
+	}
+}
+
+func BenchmarkSchemaQueryCheck(b *testing.B) {
+	for _, query := range []string{"", "$schema", "x=1"} {
+		for _, guarded := range []bool{false, true} {
+			b.Run(fmt.Sprintf("%q/guard=%t", query, guarded), func(b *testing.B) {
+				u := &url.URL{RawQuery: query}
+				want := u.Query().Has("$schema")
+				b.ReportAllocs()
+				for b.Loop() {
+					var got bool
+					if guarded {
+						got = u.RawQuery != "" && u.Query().Has("$schema")
+					} else {
+						got = u.Query().Has("$schema")
+					}
+					if got != want {
+						b.Fatal("query semantics changed")
+					}
+				}
+			})
+		}
 	}
 }
 

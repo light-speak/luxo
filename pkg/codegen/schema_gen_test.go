@@ -828,6 +828,31 @@ func TestBuildSchemaJSONMarksDeclaredPrimaryKey(t *testing.T) {
 	}
 }
 
+func TestBuildSchemaJSONIncludesInheritedFieldIDs(t *testing.T) {
+	base := &ast.ModelDecl{Name: "Base", Fields: []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}}}}}
+	child := &ast.ModelDecl{Name: "Child", Parents: []string{"Base"}, Fields: []*ast.FieldDecl{{Name: "name", Type: &ast.TypeRef{Name: "String"}}}}
+	result := &semantic.Result{Files: []*ast.File{{Models: []*ast.ModelDecl{base, child}}}}
+	g := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
+		"Base": {"id": 1}, "Child": {"name": 1, "id": 7},
+	}}})
+	data, err := g.BuildSchemaJSON(result, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exported schema.Schema
+	if err := json.Unmarshal(data, &exported); err != nil {
+		t.Fatal(err)
+	}
+	if child := exported.Models["Child"]; child != nil {
+		for _, field := range child.Fields {
+			if field.Name == "id" && field.ID == 7 && field.PrimaryKey {
+				return
+			}
+		}
+	}
+	t.Fatalf("inherited field missing child-specific ID: %s", data)
+}
+
 func TestBuildSchemaJSONPreservesDocumentationAndRelationMetadata(t *testing.T) {
 	generator := mustNewGenerator(t, GeneratorConfig{
 		IDs: StableIDs{

@@ -27,6 +27,9 @@ class SelectionCompilationTest {
             source.writeText(original)
             assertContains(run(root), "selection=id")
             assertEquals(original, source.readText())
+            val cached = run(root)
+            assertContains(cached, "Reusing configuration cache.")
+            assertContains(cached, "selection=id")
             val changed = original.replace("println(user.id)", "println(user.name)")
             source.writeText(changed)
             assertContains(run(root), "selection=name")
@@ -78,7 +81,7 @@ class SelectionCompilationTest {
     }
 
     private fun run(root: File): String = GradleRunner.create().withProjectDir(root)
-        .withArguments("run", "--offline", "--console=plain", "--no-watch-fs",
+        .withArguments("run", "--offline", "--console=plain", "--no-watch-fs", "--configuration-cache",
             "-Djava.io.tmpdir=${root.absolutePath}",
             "--gradle-user-home", System.getProperty("luxo.testGradleUserHome"),
             "-Pkotlin.compiler.execution.strategy=in-process").build().output

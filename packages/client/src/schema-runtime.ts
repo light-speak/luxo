@@ -1,6 +1,12 @@
 import type { APISchema, ParamSchema, SelectionFieldSchema } from './transport'
 import { checkSchemaID, MAX_API_ID, MAX_PARAM_ID, MAX_SELECTION_FIELD_ID } from './schema'
 
+const selectionSnapshots = new WeakSet<APISchema>()
+
+export function isSelectionSnapshot(schema: APISchema): boolean {
+  return selectionSnapshots.has(schema)
+}
+
 type Fields = Record<string, SelectionFieldSchema>
 type Types = Record<string, Fields>
 
@@ -11,12 +17,14 @@ export function snapshotAPISchema(schema: Record<string, APISchema>): Record<str
   return Object.fromEntries(Object.entries(schema).map(([name, api]) => {
     const id = api.id
     checkSchemaID(id, MAX_API_ID, seen, 'API', name)
-    return [name, {
+    const snapshot = Object.freeze({
       id,
       params: api.params && snapshotParams(api.params, name),
       fields: api.fields && snapshots.fields(api.fields, `API ${name}`),
       types: api.types && snapshots.types(api.types),
-    }]
+    })
+    selectionSnapshots.add(snapshot)
+    return [name, snapshot]
   }))
 }
 
@@ -32,8 +40,8 @@ function snapshotParams(params: readonly ParamSchema[], api: string): ParamSchem
 }
 
 function snapshotField(field: SelectionFieldSchema): SelectionFieldSchema {
-  return { fieldID: field.fieldID, type: field.type, typeName: field.typeName,
-    isList: field.isList, nullable: field.nullable }
+  return Object.freeze({ fieldID: field.fieldID, type: field.type, typeName: field.typeName,
+    isList: field.isList, nullable: field.nullable })
 }
 
 class SchemaSnapshots {
@@ -49,6 +57,7 @@ class SchemaSnapshots {
       checkSchemaID(value.fieldID, MAX_SELECTION_FIELD_ID, seen, owner, name)
       return [name, value]
     }))
+    Object.freeze(copy)
     this.fieldCopies.set(fields, copy)
     return copy
   }
@@ -58,6 +67,7 @@ class SchemaSnapshots {
     if (cached) return cached
     const copy = Object.fromEntries(Object.entries(types).map(([name, fields]) =>
       [name, this.fields(fields, `type ${name}`)]))
+    Object.freeze(copy)
     this.typeCopies.set(types, copy)
     return copy
   }

@@ -89,7 +89,7 @@ func TestCRUDLockAndGeneratedSchemaUseTheSameNames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := generateModules(files, result, generator); err != nil {
+	if _, err := generateModules(result, generator); err != nil {
 		t.Fatal(err)
 	}
 	raw, err := generator.BuildSchemaJSON(result, nil)
@@ -116,27 +116,29 @@ func TestCachePolicyReadFailure(t *testing.T) {
 	}
 }
 
-func TestModuleGenerationPreservesExternalStoredFields(t *testing.T) {
+func parseGenerationSource(t *testing.T, source, path string) *ast.File {
+	t.Helper()
+	tokens, lexErrors := lexer.New(source, path).Tokenize()
+	if len(lexErrors) != 0 {
+		t.Fatal(lexErrors)
+	}
+	file, parseErrors := parser.New(tokens).Parse(path)
+	if len(parseErrors) != 0 {
+		t.Fatal(parseErrors)
+	}
+	return file
+}
+
+func TestModuleGenerationPreservesInheritedFields(t *testing.T) {
 	enterCacheGenerationScratch(t)
 	configureGeneratedModuleWorkspace(t)
 	var files []*ast.File
 	for name, source := range map[string]string{
-		"common/types": "enum Role { USER ADMIN }",
-		"user/model":   "model User @noTime { id: Int @id role: Role optionalRole: Role? tags: [String]? }",
-		"post/model":   "extend User { role: Role optionalRole: Role? tags: [String]? } model Post @noTime { id: Int @id }",
-		"user/stream":  "api watchRole(): Role @stream @native",
-		"post/events":  "event RoleChanged(role: Role) api roleUpdates(): Role @stream(RoleChanged) { it.role == Role.ADMIN }",
+		"common/base": "model Base @noTime { id: Int @id }",
+		"item/model":  "model Item : Base @noTime { name: String } api getItemById(key: Int): Item",
 	} {
 		path := "origin/" + name + ".luxo"
-		tokens, lexErrors := lexer.New(source, path).Tokenize()
-		if len(lexErrors) != 0 {
-			t.Fatal(lexErrors)
-		}
-		file, parseErrors := parser.New(tokens).Parse(path)
-		if len(parseErrors) != 0 {
-			t.Fatal(parseErrors)
-		}
-		files = append(files, file)
+		files = append(files, parseGenerationSource(t, source, path))
 	}
 	analyzed, err := analyzeFiles(files)
 	if err != nil {
@@ -150,7 +152,49 @@ func TestModuleGenerationPreservesExternalStoredFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := generateModules(files, analyzed, generator); err != nil {
+	if _, err := generateModules(analyzed, generator); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile("service/item/luxo/db.gen.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `case "id":`) {
+		t.Fatal("module generation lost the inherited primary key")
+	}
+	command := exec.Command("go", "test", "./service/...")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("generated inherited modules do not compile: %v\n%s", err, output)
+	}
+}
+
+func TestModuleGenerationPreservesExternalStoredFields(t *testing.T) {
+	enterCacheGenerationScratch(t)
+	configureGeneratedModuleWorkspace(t)
+	var files []*ast.File
+	for name, source := range map[string]string{
+		"common/types": "enum Role { USER ADMIN }",
+		"user/model":   "model User @noTime { id: Int @id role: Role optionalRole: Role? tags: [String]? }",
+		"post/model":   "extend User { role: Role optionalRole: Role? tags: [String]? } model Post @noTime { id: Int @id }",
+		"user/stream":  "api watchRole(): Role @stream @native",
+		"post/events":  "event RoleChanged(role: Role) api roleUpdates(): Role @stream(RoleChanged) { it.role == Role.ADMIN }",
+	} {
+		path := "origin/" + name + ".luxo"
+		files = append(files, parseGenerationSource(t, source, path))
+	}
+	analyzed, err := analyzeFiles(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked := lockfile.New()
+	if err := locked.Update(analyzed.Files); err != nil {
+		t.Fatal(err)
+	}
+	generator, err := buildProjectGenerator(locked, analyzed.Files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := generateModules(analyzed, generator); err != nil {
 		t.Fatal(err)
 	}
 	shared, err := os.ReadFile(filepath.Join("internal", "luxotypes", "enum.gen.go"))
@@ -358,7 +402,7 @@ func TestModuleGenerationInternalOnlyAndDataOnlyPackages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := generateModules(files, analyzed, generator); err != nil {
+	if _, err := generateModules(analyzed, generator); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat("service/common/resolver/resolver.go"); !os.IsNotExist(err) {
@@ -499,7 +543,7 @@ func TestAnalyzeFilesLoadsExplicitCachePolicies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := generateModules([]*ast.File{file}, analyzed, generator); err != nil {
+	if _, err := generateModules(analyzed, generator); err != nil {
 		t.Fatal(err)
 	}
 	metadata, err := os.ReadFile("service/main/luxo/schema.gen.go")
@@ -517,15 +561,7 @@ func TestGenerateModulesPreservesCacheDependencyAnalysis(t *testing.T) {
 	for _, name := range []string{"first", "second"} {
 		path := "origin/" + name + "/api.luxo"
 		source := "api " + name + `(): Int @native @cache(policy: "preview") @cacheable(dependsOn: ["pricing/rates"])`
-		tokens, errors := lexer.New(source, path).Tokenize()
-		if len(errors) != 0 {
-			t.Fatal(errors)
-		}
-		file, parseErrors := parser.New(tokens).Parse(path)
-		if len(parseErrors) != 0 {
-			t.Fatal(parseErrors)
-		}
-		files = append(files, file)
+		files = append(files, parseGenerationSource(t, source, path))
 	}
 	analyzed, err := analyzeFiles(files)
 	if err != nil {
@@ -539,7 +575,7 @@ func TestGenerateModulesPreservesCacheDependencyAnalysis(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := generateModules(files, analyzed, generator); err != nil {
+	if _, err := generateModules(analyzed, generator); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"first", "second"} {

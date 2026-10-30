@@ -76,16 +76,45 @@ void main() {
     }
     return sum;
   });
+  _measureFloatWrites();
 }
 
-void _measure(String name, int Function() operation) {
+void _measureFloatWrites() {
+  for (final length in [1, 128]) {
+    final encoder = LuxoEncoder(2048);
+    final values = List.generate(
+      length,
+      (index) => index.isEven ? 1.5 + index : -2.75 - index,
+    );
+    final iterations = _iterations ~/ length;
+    _measure('float64 encode $length values', () {
+      var sum = 0;
+      for (var i = 0; i < iterations; i++) {
+        encoder.reset();
+        encoder.writeBool(true);
+        for (final value in values) {
+          encoder.writeFixed64(value);
+        }
+        final bytes = encoder.bytes();
+        sum ^= bytes.last + bytes.length;
+      }
+      return sum;
+    }, iterations: iterations);
+  }
+}
+
+void _measure(
+  String name,
+  int Function() operation, {
+  int iterations = _iterations,
+}) {
   var checksum = operation();
   final samples = <double>[];
   for (var i = 0; i < 7; i++) {
     final watch = Stopwatch()..start();
     checksum += operation();
     watch.stop();
-    samples.add(watch.elapsedTicks * 1e9 / watch.frequency / _iterations);
+    samples.add(watch.elapsedTicks * 1e9 / watch.frequency / iterations);
   }
   samples.sort();
   print(

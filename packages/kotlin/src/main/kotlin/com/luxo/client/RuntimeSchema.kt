@@ -1,6 +1,7 @@
 package com.luxo.client
 
 import java.util.IdentityHashMap
+import java.util.Collections
 
 private typealias Fields = Map<String, SelectionFieldSchema>
 private typealias Types = Map<String, Fields>
@@ -15,7 +16,9 @@ internal fun snapshotAPISchema(schema: Map<String, APISchemaEntry>): Map<String,
         checkSchemaID(entry.id, WireIDLimits.API, seen, "API", name)
         val owner = "API $name"
         result[name] = entry.copy(params = snapshotParams(entry.params, owner),
-            fields = snapshots.fields(entry.fields, owner), types = snapshots.types(entry.types))
+            fields = snapshots.fields(entry.fields, owner), types = snapshots.types(entry.types)).also {
+                it.selectionSnapshot = true
+            }
     }
     return result
 }
@@ -39,8 +42,9 @@ private class SchemaSnapshots {
         val copy = LinkedHashMap(source)
         val seen = HashSet<Int>()
         for ((name, field) in copy) checkSchemaID(field.fieldID, WireIDLimits.SELECTION_FIELD, seen, owner, name)
-        fieldCopies[source] = copy
-        return copy
+        val snapshot = Collections.unmodifiableMap(copy)
+        fieldCopies[source] = snapshot
+        return snapshot
     }
 
     fun types(source: Types): Types {
@@ -48,7 +52,8 @@ private class SchemaSnapshots {
         typeCopies[source]?.let { return it }
         val copy = LinkedHashMap<String, Fields>()
         for ((name, definition) in source) copy[name] = fields(definition, "type $name")
-        typeCopies[source] = copy
-        return copy
+        val snapshot = Collections.unmodifiableMap(copy)
+        typeCopies[source] = snapshot
+        return snapshot
     }
 }

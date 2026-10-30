@@ -619,6 +619,9 @@ func BuildSchemaJSON(result *semantic.Result, enums map[string]bool, config Gene
 }
 
 func (g *GeneratorContext) BuildSchemaJSON(result *semantic.Result, enums map[string]bool) ([]byte, error) {
+	copy := *result
+	copy.Files = inferred.ExpandedFiles(result.Files)
+	result = &copy
 	declaredEnums := collectEnums(result)
 	for name, enabled := range enums {
 		if enabled {

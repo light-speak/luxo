@@ -20,11 +20,12 @@ import (
 // APIRegistry maps API IDs (from luxo.lock) to handler names and param metadata.
 // Built at startup by RegisterHandlers, used for binary protocol routing.
 type APIRegistry struct {
-	idToName   map[int]string
-	nameToID   map[string]int
-	paramOrder map[string][]ParamMeta
-	paramNames map[string][]string // static name lists for zero-alloc param lookup
-	schema     *schema.Schema
+	binaryPlans map[int]*binaryAPIPlan
+	idToName    map[int]string
+	nameToID    map[string]int
+	paramOrder  map[string][]ParamMeta
+	paramNames  map[string][]string // static name lists for zero-alloc param lookup
+	schema      *schema.Schema
 }
 
 // SetSchema validates return metadata during startup before replacing it.
@@ -34,6 +35,7 @@ func (r *APIRegistry) SetSchema(s *schema.Schema) error {
 		return err
 	}
 	r.schema = s
+	r.rebuildBinaryPlans()
 	return nil
 }
 
@@ -125,30 +127,31 @@ func (r *APIRegistry) ParseBinaryRequestInto(body []byte, req *Request) error {
 	if len(body) == 0 {
 		return fmt.Errorf("empty binary request")
 	}
-	apiName, fields, fieldMask, off, err := r.parseBinaryHeader(body)
+	plan, fields, fieldMask, off, err := r.parseBinaryHeader(body)
 	if err != nil {
 		return err
 	}
 
 	// Inline decode params into Request.paramSlots — zero map allocation
-	paramMeta := r.paramOrder[apiName]
-	req.API = apiName
+	paramMeta := plan.params
+	req.API = plan.name
+	req.binaryPlan = plan
 	req.Select = fields
 	req.Page = 1
 	req.PageSize = defaultPageSize
 	req.BinaryMode = true
 	req.FieldMask = fieldMask
-	req.paramNames = r.paramNames[apiName]
+	req.paramNames = plan.names
 	req.paramCount = len(paramMeta)
 	if len(paramMeta) > len(req.paramSlots) {
-		return fmt.Errorf("too many params (max %d) for API %s", len(req.paramSlots), apiName)
+		return fmt.Errorf("too many params (max %d) for API %s", len(req.paramSlots), plan.name)
 	}
-	decoder := binaryParamDecoder{req: req, buf: body[off:], meta: paramMeta}
+	decoder := binaryParamDecoder{req: req, buf: body[off:], meta: paramMeta, lookup: &plan.lookup}
 	if err := decoder.decode(); err != nil {
 		return err
 	}
 	req.applyBinaryListParams()
-	definition := r.apiDefinition(apiName)
+	definition := plan.definition
 	applyPaginationDefaults(req, definition)
 	if err := validateRequiredParams(req, definition); err != nil {
 		return err
@@ -368,45 +371,46 @@ func validateRequiredParams(req *Request, definition *schema.API) error {
 	return nil
 }
 
-func (r *APIRegistry) parseBinaryHeader(body []byte) (string, []*selection.Field, []byte, int, error) {
+func (r *APIRegistry) parseBinaryHeader(body []byte) (*binaryAPIPlan, []*selection.Field, []byte, int, error) {
 	apiID, n := codec.ReadVarint(body, 0)
 	if n <= 0 {
-		return "", nil, nil, 0, fmt.Errorf("invalid API ID varint")
+		return nil, nil, nil, 0, fmt.Errorf("invalid API ID varint")
 	}
 	if apiID == 0 || apiID > codec.MaxAPIID {
-		return "", nil, nil, 0, fmt.Errorf("API ID %d is outside 1..%d", apiID, codec.MaxAPIID)
+		return nil, nil, nil, 0, fmt.Errorf("API ID %d is outside 1..%d", apiID, codec.MaxAPIID)
 	}
-	apiName, ok := r.idToName[int(apiID)]
+	plan, ok := r.binaryPlans[int(apiID)]
 	if !ok {
-		return "", nil, nil, 0, fmt.Errorf("unknown API ID: %d", apiID)
+		return nil, nil, nil, 0, fmt.Errorf("unknown API ID: %d", apiID)
 	}
 	maskLen, consumed := codec.ReadVarint(body, n)
 	if consumed <= 0 {
-		return "", nil, nil, 0, fmt.Errorf("invalid field mask length")
+		return nil, nil, nil, 0, fmt.Errorf("invalid field mask length")
 	}
 	off := n + consumed
 	if maskLen == 0 {
-		return apiName, nil, nil, off, nil
+		return plan, nil, nil, off, nil
 	}
 	if maskLen > maxFieldMaskSize {
-		return "", nil, nil, 0, fmt.Errorf("field mask size %d exceeds limit %d", maskLen, maxFieldMaskSize)
+		return nil, nil, nil, 0, fmt.Errorf("field mask size %d exceeds limit %d", maskLen, maxFieldMaskSize)
 	}
 	if maskLen > uint64(len(body)) {
-		return "", nil, nil, 0, fmt.Errorf("field mask length overflow")
+		return nil, nil, nil, 0, fmt.Errorf("field mask length overflow")
 	}
 	maskEnd := off + int(maskLen)
 	if maskEnd > len(body) {
-		return "", nil, nil, 0, fmt.Errorf("field mask exceeds body")
+		return nil, nil, nil, 0, fmt.Errorf("field mask exceeds body")
 	}
 	mask := body[off:maskEnd]
 	if _, _, valid := codec.SplitSelectionMask(mask); !valid {
-		return "", nil, nil, 0, fmt.Errorf("invalid recursive field mask")
+		return nil, nil, nil, 0, fmt.Errorf("invalid recursive field mask")
 	}
-	fields, err := r.decodeFieldMask(apiName, mask)
-	return apiName, fields, mask, maskEnd, err
+	fields, err := r.decodeFieldMask(plan.name, mask)
+	return plan, fields, mask, maskEnd, err
 }
 
 type binaryParamDecoder struct {
+	lookup     *binaryParamLookup
 	req        *Request
 	buf        []byte
 	meta       []ParamMeta
@@ -489,10 +493,11 @@ func (d *binaryParamDecoder) decodeSorters() error {
 }
 
 func (d *binaryParamDecoder) decodeParam(fieldID uint64) error {
-	paramIndex, meta := findBinaryParam(d.meta, int(fieldID))
-	if meta == nil {
+	paramIndex := d.lookup.find(int(fieldID))
+	if paramIndex < 0 {
 		return fmt.Errorf("unknown param field ID %d for API %s", fieldID, d.req.API)
 	}
+	meta := &d.meta[paramIndex]
 	if d.req.paramSet&(uint16(1)<<paramIndex) != 0 {
 		return fmt.Errorf("duplicate param field ID %d for API %s", fieldID, d.req.API)
 	}
@@ -515,15 +520,6 @@ func (d *binaryParamDecoder) decodeParam(fieldID uint64) error {
 	d.off += consumed
 	d.req.paramSlots[paramIndex] = value
 	return nil
-}
-
-func findBinaryParam(params []ParamMeta, fieldID int) (int, *ParamMeta) {
-	for i := range params {
-		if params[i].FieldID == fieldID {
-			return i, &params[i]
-		}
-	}
-	return -1, nil
 }
 
 func (r *APIRegistry) decodeFieldMask(apiName string, mask []byte) ([]*selection.Field, error) {
@@ -644,7 +640,7 @@ func EncodeBinaryRequest(apiID int, fieldMask []byte, params map[string]any, par
 	buf = codec.AppendVarint(buf, uint64(len(fieldMask)))
 	buf = append(buf, fieldMask...)
 
-	var enc codec.Encoder
+	enc := codec.NewEncoder(buf)
 	known := make(map[string]struct{}, len(paramMeta))
 	for _, meta := range paramMeta {
 		if meta.FieldID <= 0 {
@@ -688,8 +684,7 @@ func EncodeBinaryRequest(apiID int, fieldMask []byte, params map[string]any, par
 		}
 	}
 	enc.WriteEnd()
-	buf = append(buf, enc.Bytes()...)
-	return buf, nil
+	return enc.Bytes(), nil
 }
 
 func writeBinaryFilters(enc *codec.Encoder, filters []Filter) error {
@@ -1048,6 +1043,7 @@ func encodeBinaryDateTimeList(enc *codec.Encoder, meta ParamMeta, values []any) 
 			return binaryListElementError(meta, i, value)
 		}
 		if err := enc.WriteDateTime(parsed); err != nil {
+			// binaryDateTime already checked the same Unix-second range; time.Time normalizes nanoseconds.
 			return err
 		}
 	}

@@ -15,6 +15,20 @@ import (
 
 func pgDialect() lux.Dialect { return pg.Dialect{} }
 
+func TestInheritedMigrationColumns(t *testing.T) {
+	base := &ast.ModelDecl{Name: "Base", Fields: []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}}}}}
+	child := &ast.ModelDecl{Name: "Child", Parents: []string{"Base"}, Fields: []*ast.FieldDecl{{Name: "name", Type: &ast.TypeRef{Name: "String"}}}}
+	result := &semantic.Result{Files: []*ast.File{{Models: []*ast.ModelDecl{base, child}}}}
+	state := ComputeState(result, nil, pgDialect())
+	id := state.Models["Child"].Columns["id"]
+	if id == nil || !id.PK || state.Models["Child"].Columns["name"] == nil {
+		t.Fatal("child table is missing inherited column metadata")
+	}
+	if state.Models["Child"].Table == state.Models["Base"].Table || len(child.Fields) != 1 {
+		t.Fatal("child table identity or original declaration changed")
+	}
+}
+
 func TestQualifiedEnumDefaultColumnState(t *testing.T) {
 	for _, value := range []ast.Expr{
 		&ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "ADMIN"},

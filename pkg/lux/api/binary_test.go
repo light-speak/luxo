@@ -25,6 +25,31 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+func TestEncodeBinaryRequestOwnsOutput(t *testing.T) {
+	meta := []ParamMeta{{Name: "data", Type: "Bytes", FieldID: 1}}
+	data := bytes.Repeat([]byte{0x5a}, 4096)
+	got, err := EncodeBinaryRequest(1, nil, map[string]any{"data": data}, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := codec.AppendVarint(nil, 1)
+	want = codec.AppendVarint(want, 0)
+	want = codec.AppendVarint(want, 1)
+	want = codec.AppendBytes(want, data)
+	want = append(want, 0)
+	if !bytes.Equal(got, want) {
+		t.Fatal("request wire differs")
+	}
+	data[0] = 0
+	if !bytes.Equal(got, want) {
+		t.Fatal("request aliases caller payload")
+	}
+	bad, err := EncodeBinaryRequest(1, nil, map[string]any{"data": data, "unknown": true}, meta)
+	if err == nil || bad != nil {
+		t.Fatal("invalid request returned a partial body")
+	}
+}
+
 func TestEncodeBinaryParamRejectsNonPositiveFieldID(t *testing.T) {
 	for _, id := range []int{0, -1} {
 		var enc codec.Encoder

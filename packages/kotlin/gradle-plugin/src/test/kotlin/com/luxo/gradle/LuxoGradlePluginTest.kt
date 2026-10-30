@@ -3,6 +3,7 @@ package com.luxo.gradle
 import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
 import kotlin.test.assertFalse
@@ -11,7 +12,17 @@ import org.gradle.testfixtures.ProjectBuilder
 
 class LuxoGradlePluginTest {
     @Test
-    fun `registers production codegen and analyzer tasks`() {
+    fun `does not register API-wide hint generation`() {
+        val project = ProjectBuilder.builder()
+            .withProjectDir(File("build/no-legacy-hints-test"))
+            .build()
+        project.pluginManager.apply(LuxoGradlePlugin::class.java)
+        assertNull(project.tasks.findByName("luxoAnalyze"))
+        assertNull(project.configurations.findByName("luxoAnalyzerRuntimeClasspath"))
+    }
+
+    @Test
+    fun `registers production codegen and call-site compiler integration`() {
         val project = ProjectBuilder.builder()
             .withProjectDir(File("build/plugin-test"))
             .build()
@@ -23,7 +34,6 @@ class LuxoGradlePluginTest {
         assertEquals("http://localhost:4000/luvia", extension.endpoint.get())
         assertEquals("com.luxo.generated", extension.packageName.get())
         assertIs<LuxoGenerateTask>(project.tasks.getByName("luxoGenerate"))
-        assertIs<LuxoAnalyzeTask>(project.tasks.getByName("luxoAnalyze"))
         assertIs<KotlinCompilerPluginSupportPlugin>(project.plugins.getPlugin(LuxoGradlePlugin::class.java))
         assertFalse(
             compileKotlin.get().taskDependencies.getDependencies(compileKotlin.get())
@@ -31,13 +41,8 @@ class LuxoGradlePluginTest {
         )
         assertEquals("com.luxo.select", project.plugins.getPlugin(LuxoGradlePlugin::class.java).getCompilerPluginId())
 
-        val catalog = File("../gradle/libs.versions.toml").readText()
-        val compilerVersion = checkNotNull(Regex("""kotlin = "([^"]+)"""").find(catalog)).groupValues[1]
-        val analyzer = project.configurations.getByName("luxoAnalyzerRuntimeClasspath").dependencies
-        val compiler = analyzer.single { it.name == "kotlin-compiler-embeddable" }
-        assertEquals(compilerVersion, compiler.version)
         val codegen = project.configurations.getByName("luxoCodegenRuntimeClasspath").dependencies
         assertTrue(codegen.none { it.group == "org.jetbrains.kotlin" })
-        assertEquals(codegen.single().version, analyzer.single { it.name == "luxo-client" }.version)
+        assertEquals(codegen.single().version, project.plugins.getPlugin(LuxoGradlePlugin::class.java).getPluginArtifact().version)
     }
 }

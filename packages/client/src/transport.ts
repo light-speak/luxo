@@ -5,8 +5,10 @@ import { decodeBinaryError, jsonResponseError } from './error-codec'
 import { JSONParamValidator } from './json-params'
 import { snapshotAPISchema } from './schema-runtime'
 import { LuxoError } from './error'
-import { Encoder, fieldMaskSet } from './codec'
+import { Encoder } from './codec'
+import { writeSelectionMask } from './selection'
 import { HTTPHeaders } from './http-headers'
+import { readHTTPBody, responseLimit } from './http-response'
 import { enumRawValue } from './enum'
 import { GeneratedRequest, requestJSON } from './request'
 import type { RequestEncoder, RequestValues } from './request'
@@ -277,106 +279,6 @@ export interface SelectionFieldSchema {
 	nullable?: boolean
 }
 
-interface SelectedField {
-  name: string
-  children?: SelectedField[]
-}
-
-class SelectionParser {
-  private offset = 0
-
-  constructor(private readonly input: string) {}
-
-  parse(): SelectedField[] {
-    const fields = this.parseList(false, 0)
-    this.skipSpaces()
-    if (this.offset !== this.input.length) this.fail(`unexpected '${this.input[this.offset]}'`)
-    return fields
-  }
-
-  private parseList(nested: boolean, depth: number): SelectedField[] {
-    if (depth >= 32) this.fail('selection depth exceeds 32')
-    const fields: SelectedField[] = []
-    const names = new Set<string>()
-    while (true) {
-      this.skipSpaces()
-      if (this.offset >= this.input.length || (nested && this.input[this.offset] === '}')) break
-      const name = this.readIdentifier()
-      if (!name) this.fail('expected field name')
-      if (names.has(name)) this.fail(`duplicate field '${name}'`)
-      names.add(name)
-      this.skipSpaces()
-      let children: SelectedField[] | undefined
-      if (this.input[this.offset] === '{') {
-        this.offset++
-        children = this.parseList(true, depth + 1)
-        if (children.length === 0) this.fail(`empty selection for '${name}'`)
-        this.skipSpaces()
-        if (this.input[this.offset] !== '}') this.fail(`missing '}' for '${name}'`)
-        this.offset++
-      }
-      fields.push(children ? { name, children } : { name })
-      this.skipSpaces()
-      if (this.input[this.offset] !== ',') break
-      this.offset++
-    }
-    return fields
-  }
-
-  private readIdentifier(): string {
-    const start = this.offset
-    const first = this.input.charCodeAt(this.offset)
-    if (!isIdentifierStart(first)) return ''
-    this.offset++
-    while (isIdentifierPart(this.input.charCodeAt(this.offset))) this.offset++
-    return this.input.slice(start, this.offset)
-  }
-
-  private skipSpaces(): void {
-    while (/\s/.test(this.input[this.offset] ?? '')) this.offset++
-  }
-
-  private fail(message: string): never {
-    throw new LuxoError('ConfigError', 0, `${message} at position ${this.offset}`)
-  }
-}
-
-function isIdentifierStart(code: number): boolean {
-  return code === 95 || (code >= 65 && code <= 90) || (code >= 97 && code <= 122)
-}
-
-function isIdentifierPart(code: number): boolean {
-  return isIdentifierStart(code) || (code >= 48 && code <= 57)
-}
-
-function encodeSelectionNode(
-  selected: SelectedField[],
-  fields: Record<string, SelectionFieldSchema>,
-  types: Record<string, Record<string, SelectionFieldSchema>>,
-): Uint8Array {
-  let mask: Uint8Array<ArrayBufferLike> = new Uint8Array(0)
-  const children: Array<{ fieldID: number; data: Uint8Array }> = []
-  for (const field of selected) {
-    const meta = fields[field.name]
-    if (!meta) throw new LuxoError('ConfigError', 0, `unknown selected field: ${field.name}`)
-    mask = fieldMaskSet(mask, meta.fieldID)
-    if (!field.children) continue
-    const nestedFields = meta.typeName ? types[meta.typeName] : undefined
-    if (!nestedFields) throw new LuxoError('ConfigError', 0, `field ${field.name} does not support nested selection`)
-    children.push({ fieldID: meta.fieldID, data: encodeSelectionNode(field.children, nestedFields, types) })
-  }
-  const node = new Encoder()
-  node.writeVarint(mask.length)
-  node.writeRawBytes(mask)
-  children.sort((a, b) => a.fieldID - b.fieldID)
-  for (const child of children) {
-    node.writeVarint(child.fieldID)
-    node.writeVarint(child.data.length)
-    node.writeRawBytes(child.data)
-  }
-  return node.bytes()
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }
@@ -385,19 +287,6 @@ export function writeFieldMask(enc: Encoder, meta: APISchema, params?: Record<st
   writeSelectionMask(enc, meta, params?.$select)
 }
 
-function writeSelectionMask(enc: Encoder, meta: APISchema, select: unknown): void {
-	if (!meta.fields || Object.keys(meta.fields).length === 0) {
-    enc.writeVarint(0)
-    return
-  }
-	if (typeof select !== 'string' || select.trim() === '') {
-		throw new LuxoError('ConfigError', 0, '$select is required for structured responses')
-	}
-  const selected = new SelectionParser(select).parse()
-  const mask = encodeSelectionNode(selected, meta.fields, meta.types ?? {})
-  enc.writeVarint(mask.length)
-  enc.writeRawBytes(mask)
-}
 
 export function encodeStaticRequestBody<P extends RequestValues>(
   meta: APISchema, codec: RequestEncoder<P>, params?: P,
@@ -482,6 +371,8 @@ export interface StreamObserver {
 
 /** Shared transport options */
 export interface TransportOptions {
+  /** Maximum collected HTTP response bytes (default: 2 MiB). */
+  maxResponseBytes?: number
   token?: string
   headers?: Record<string, string>
   mode?: TransportMode
@@ -506,8 +397,16 @@ export interface TransportEvent {
 
 export type TransportObserver = (event: TransportEvent) => void
 
+/** Minimal HTTP I/O boundary; decoding and authentication stay in the transport. */
+export interface HTTPResponse {
+  readonly status: number
+  readonly body?: ReadableStream<Uint8Array> | null
+  readonly headers?: Pick<Headers, 'get'>
+  arrayBuffer(): Promise<ArrayBuffer>
+}
+
 interface ResponseScope {
-  response: Response
+  response: HTTPResponse
   close: () => void
   abortError: (error: unknown) => LuxoError | undefined
 }
@@ -520,11 +419,12 @@ function notifyObserver(observer: TransportObserver, event: TransportEvent): voi
   }
 }
 
-// --- Fetch Transport (HTTP/2) ---
+// --- Fetch Transport ---
 
-/** Fetch-based transport for Web / Node.js 18+.
- *  Uses HTTP/2 when available — single connection, multiplexed requests. */
+/** Fetch-based transport; the host runtime selects the HTTP version.
+ *  Use the Node-specific NodeHTTP2Transport for explicit HTTP/2 connections. */
 export class FetchTransport implements Transport {
+  private readonly responseByteLimit: number
   private readonly jsonParams = new JSONParamValidator()
   private readonly headers: HTTPHeaders
   private mode: TransportMode = 'json'
@@ -534,6 +434,7 @@ export class FetchTransport implements Transport {
   private readonly observer?: TransportObserver
 
   constructor(private endpoint: string, options?: TransportOptions) {
+    this.responseByteLimit = responseLimit(options?.maxResponseBytes)
     this.mode = options?.mode ?? 'json'
     this.timeout = options?.timeout ?? 30000
     this.onTokenExpired = options?.onTokenExpired
@@ -616,6 +517,10 @@ export class FetchTransport implements Transport {
     throw new LuxoError('ConfigError', 0, 'subscriptions require a WebSocket endpoint')
   }
 
+  protected executeRequest(endpoint: string, init: RequestInit): Promise<HTTPResponse> {
+    return fetch(endpoint, init)
+  }
+
   private async openRequest(init: RequestInit, signal?: AbortSignal): Promise<ResponseScope> {
     if (signal?.aborted) throw new LuxoError('CancelledError', 0, 'request cancelled')
     const controller = new AbortController()
@@ -640,7 +545,7 @@ export class FetchTransport implements Transport {
       return new LuxoError('CancelledError', 0, 'request cancelled')
     }
     try {
-      const response = await fetch(this.endpoint, { ...init, signal: controller.signal })
+      const response = await this.executeRequest(this.endpoint, { ...init, signal: controller.signal })
       return { response, close, abortError }
     } catch (e) {
       const aborted = abortError(e)
@@ -668,7 +573,7 @@ export class FetchTransport implements Transport {
 
     try {
       let json: Record<string, unknown>
-      try { json = decodeJSONEnvelope(httpTextDecoder.decode(await resp.arrayBuffer())) } catch (error) {
+      try { json = decodeJSONEnvelope(httpTextDecoder.decode(await readHTTPBody(resp, this.responseByteLimit))) } catch (error) {
         const aborted = scope.abortError(error)
         if (aborted) throw aborted
         throw new LuxoError('ParseError', resp.status, `invalid JSON (HTTP ${resp.status})`)
@@ -706,7 +611,14 @@ export class FetchTransport implements Transport {
       body: preparedBody ?? this.encodeBinaryRequest(api, params),
     }, options?.signal)
     try {
-      const data = await this.readBinaryResponse(scope)
+      let data: Uint8Array
+      try {
+        data = await readHTTPBody(scope.response, this.responseByteLimit)
+      } catch (error) {
+        const aborted = scope.abortError(error)
+        if (aborted) throw aborted
+        throw new LuxoError('ParseError', scope.response.status, 'invalid binary response body')
+      }
       if (scope.response.status === 200) return data
       const error = decodeBinaryError(data, scope.response.status)
       const refresh = this.refreshAfterUnauthorized(error, scope, allowRefresh)
@@ -739,16 +651,7 @@ export class FetchTransport implements Transport {
     return encodeBinaryBody(meta, params).buffer
   }
 
-  private async readBinaryResponse(scope: ResponseScope): Promise<Uint8Array> {
-    const response = scope.response
-    try {
-      return new Uint8Array(await response.arrayBuffer())
-    } catch (error) {
-      const aborted = scope.abortError(error)
-      if (aborted) throw aborted
-      throw new LuxoError('ParseError', response.status, 'invalid binary response body')
-    }
-  }
+
 }
 
 // --- WebSocket Transport ---

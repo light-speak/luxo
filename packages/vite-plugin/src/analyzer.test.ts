@@ -453,3 +453,21 @@ console.log(user.name)
     expect(result).toContain("getUser({ $select: 'name', id: 1 })")
   })
 })
+
+it('hoists separate immutable selection plans in the production transform', () => {
+  const code = `'use client';
+const $luxoSelection = 1;
+async function run(params) {
+  const a = await client.getUser({ id: 1 });
+  console.log(a.name);
+  const b = await client.getUser(params);
+  console.log(b.email);
+}`
+  const output = analyzeAndTransform(code, 'consumer.ts', schema, true)!
+  expect(output.startsWith("'use client';")).toBe(true)
+  expect(output).toContain('$luxoSelection_Prepare("name")')
+  expect(output).toContain('$luxoSelection_Prepare("email")')
+  expect(output).toContain('getUser({ $select: $luxoSelection_0, id: 1 })')
+  expect(output).toContain('getUser({ $select: $luxoSelection_1, ...(params) })')
+  expect(output.indexOf('const $luxoSelection_0')).toBeLessThan(output.indexOf('async function run'))
+})

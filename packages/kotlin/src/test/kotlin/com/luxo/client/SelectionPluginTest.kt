@@ -10,6 +10,45 @@ import kotlin.test.assertNotEquals
 
 class SelectionPluginTest {
     @Test
+    fun `compiler hoists distinct plans and repeated calls reuse identity`() {
+        verify("""
+            import com.luxo.client.*
+            class User(@get:LuxoSelectionField("id") val id: Long)
+            val seen = mutableListOf<PreparedSelection>()
+            @LuxoSelection fun getUser(select: String? = null,
+                `${'$'}selectionPlan`: PreparedSelection? = null): User {
+                val plan = checkNotNull(`${'$'}selectionPlan`)
+                check(plan.text == select)
+                seen += plan
+                return User(42)
+            }
+            @LuxoSelection fun subscribeUser(select: String? = null,
+                `${'$'}selectionPlan`: PreparedSelection? = null, onData: (User) -> Unit): () -> Unit {
+                val plan = checkNotNull(`${'$'}selectionPlan`)
+                check(plan.text == select)
+                seen += plan
+                onData(User(42))
+                return {}
+            }
+            fun watch() { subscribeUser { check(it.id == 42L) }() }
+            fun read(): Long { val user = getUser(); return user.id }
+            fun main() {
+                check(read() == 42L)
+                check(read() == 42L)
+                val other = getUser()
+                check(other.id == 42L)
+                check(seen[0] === seen[1])
+                check(seen[0] !== seen[2])
+                watch()
+                watch()
+                check(seen[3] === seen[4])
+                check(seen[3] !== seen[0])
+                println("plans reused and isolated")
+            }
+        """.trimIndent(), listOf("plans reused and isolated"))
+    }
+
+    @Test
     fun `compiler injects selections per resolved call and preserves explicit selection`() {
         verify("""
                 import com.luxo.client.LuxoSelection
@@ -88,7 +127,7 @@ class SelectionPluginTest {
     }
 
     @Test
-    fun `real generated client sends per-call selection through typed binary requests`() {
+    fun `real generated client sends per-call selection over HTTP Binary`() {
         val schema = LuxoSchema(
             models = mapOf("User" to LuxoModel("User", fields = listOf(
                 LuxoField(1, "id", "Int"), LuxoField(2, "name", "String")))),
@@ -100,30 +139,70 @@ class SelectionPluginTest {
         verify("""
             import com.luxo.client.*
             import kotlinx.coroutines.runBlocking
-            import kotlinx.serialization.json.Json
+            import com.sun.net.httpserver.HttpServer
+            import java.net.InetSocketAddress
+            import okhttp3.OkHttpClient
             import probe.LuxoClient
-            class Wire : Transport {
+            var expectedPlan: PreparedSelection? = null
+            class Wire(private val real: Transport) : Transport by real {
                 private var schema = emptyMap<String, APISchemaEntry>()
                 override suspend fun call(api: String, params: Map<String, Any?>): Any = error("dynamic path")
                 override suspend fun call(api: String, request: GeneratedRequest): Any {
+                    if (expectedPlan != null) check(request.selectionPlan === expectedPlan)
+                    else check(request.selectionPlan != null)
+                    check(request.toJSONParameters() == mapOf("\${'$'}select" to request.selection))
                     val metadata = schema.getValue(api)
                     val bytes = LuxoBinaryProtocol.encodeRequest(metadata, request)
                     check(bytes.contentEquals(LuxoBinaryProtocol.encodeRequest(metadata, mapOf("\${'$'}select" to request.selection))))
                     println(request.selection)
-                    return Json.parseToJsonElement("{\"id\":42,\"name\":\"Ada\"}")
+                    return real.call(api, request)
                 }
-                override fun setSchema(schema: Map<String, APISchemaEntry>) { this.schema = schema }
-                override fun setMode(mode: TransportMode) {}
-                override fun setToken(token: String) {}
+                override fun setSchema(schema: Map<String, APISchemaEntry>) {
+                    this.schema = schema; real.setSchema(schema)
+                }
             }
             fun main() = runBlocking {
-                val client = LuxoClient(Wire())
-                val first = client.getUser()
-                println(first.id.value())
-                val second = client.getUser()
-                println(second.name.value())
+                val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+                server.createContext("/luvia") { exchange ->
+                    try {
+                        val bytes = exchange.requestBody.use { it.readBytes() }
+                        check(bytes.size == 5 && bytes[0] == 1.toByte() && bytes[1] == 2.toByte() &&
+                            bytes[2] == 1.toByte() && bytes[4] == 0.toByte())
+                        val mask = bytes[3].toInt()
+                        check(mask == 1 || mask == 2)
+                        val encoder = LuxoEncoder()
+                        encoder.writeVarint(if (mask == 2) 3L else 0L)
+                        if (mask == 1) encoder.writeFieldInt(1, 42L)
+                        else encoder.writeFieldString(2, "Ada")
+                        encoder.writeEnd()
+                        val body = encoder.bytes()
+                        exchange.sendResponseHeaders(200, body.size.toLong())
+                        exchange.responseBody.use { it.write(body) }
+                    } catch (error: Exception) {
+                        exchange.sendResponseHeaders(500, -1)
+                    } finally { exchange.close() }
+                }
+                server.start()
+                val http = OkHttpClient()
+                try {
+                    val endpoint = "http://127.0.0.1:" + server.address.port + "/luvia"
+                    val client = LuxoClient(Wire(OkHttpTransport(endpoint, client = http, mode = TransportMode.BINARY)))
+                    val first = client.getUser()
+                    println(first.id.value())
+                    val second = client.getUser()
+                    println(second.name.value())
+                    expectedPlan = PreparedSelection("id")
+                    val planned = client.getUser(`${'$'}selectionPlan` = expectedPlan)
+                    println(planned.id.value())
+                    val overridden = client.getUser(select = "name", `${'$'}selectionPlan` = expectedPlan)
+                    println(overridden.name.value())
+                } finally {
+                    http.dispatcher.executorService.shutdownNow()
+                    http.connectionPool.evictAll()
+                    server.stop(0)
+                }
             }
-        """.trimIndent(), listOf("id", "42", "name", "Ada"), sources)
+        """.trimIndent(), listOf("id", "42", "name", "Ada", "id", "42", "name", "Ada"), sources)
     }
 
     private fun verify(sourceText: String, expected: List<String>?, extras: Map<String, String> = emptyMap()) {

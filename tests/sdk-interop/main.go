@@ -26,12 +26,17 @@ var fixtureServer []byte
 func main() {
 	out := flag.String("out", "", "existing empty directory under the core repository's .tmp")
 	run := flag.Bool("run", false, "run a consumer command against an owned temporary Go service")
+	sql := flag.Bool("sql", false, "generate the TLS H2 / PostgreSQL selection fixture; requires -out")
 	gateway := flag.Bool("gateway", false, "run the consumer through a generated gateway and a separate TCP RPC service")
 	futureEnum := flag.Bool("future-enum", false, "generate a newer enum revision for old-SDK interoperability tests; requires -out")
 	enumUpgrade := flag.Bool("enum-upgrade", false, "run an old-Schema consumer against a newer enum service; requires -run")
 	flag.Parse()
 	var err error
-	if *enumUpgrade && (!*run || *futureEnum) {
+	if *sql && (*run || *gateway || *futureEnum || *enumUpgrade || *out == "") {
+		err = fmt.Errorf("-sql requires -out and cannot be combined with run/gateway/enum options")
+	} else if *sql {
+		err = generateSQLFixture(*out)
+	} else if *enumUpgrade && (!*run || *futureEnum) {
 		err = fmt.Errorf("-enum-upgrade requires -run and cannot be combined with -future-enum")
 	} else if *futureEnum && (*run || *out == "") {
 		err = fmt.Errorf("-future-enum requires -out and cannot be combined with -run")
@@ -78,6 +83,10 @@ func generateFixtureRevision(out string, futureEnum bool) error {
 	}
 	files["main.go"] = server
 	files["deployment.go"] = fixtureDeploymentServer
+	return writeFixtureFiles(out, files)
+}
+
+func writeFixtureFiles(out string, files map[string][]byte) error {
 	for name, source := range files {
 		file, err := os.OpenFile(filepath.Join(out, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 		if err != nil {

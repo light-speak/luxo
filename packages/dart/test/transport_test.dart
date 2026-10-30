@@ -24,8 +24,125 @@ class _TestInput implements LuxoBinaryEncodable {
   }
 }
 
+class _SelectionRequest extends GeneratedRequest {
+  @override
+  final String selection;
+  @override
+  final PreparedSelection selectionPlan;
+
+  _SelectionRequest(this.selection, this.selectionPlan);
+
+  @override
+  int get apiID => 1;
+
+  @override
+  void writeParameters(LuxoEncoder encoder) {}
+
+  @override
+  Map<String, dynamic> toJSONParameters() =>
+      throw StateError('Binary requests must not use JSON parameters');
+}
+
 void main() {
   group('HttpTransport', () {
+    test(
+      'shared plans keep HTTP Schema and manual selections isolated',
+      () async {
+        final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+        server.listen((request) async {
+          final body = await request.fold<List<int>>(
+            [],
+            (bytes, chunk) => bytes..addAll(chunk),
+          );
+          request.response.add(body);
+          await request.response.close();
+        });
+        final clients = [
+          for (var i = 0; i < 2; i++)
+            HttpTransport(
+              'http://${server.address.host}:${server.port}',
+              options: const TransportOptions(mode: TransportMode.binary),
+            )..setSchema({
+              'read': APISchemaEntry(1, [], {
+                'id': SelectionFieldSchema(i == 0 ? 1 : 3),
+                'name': const SelectionFieldSchema(2),
+              }),
+            }),
+        ];
+        final plan = PreparedSelection('id');
+        try {
+          final replies = await Future.wait([
+            for (var i = 0; i < 48; i++)
+              clients[i % 2].call<Uint8List>(
+                'read',
+                request: _SelectionRequest(i % 3 == 0 ? 'name' : 'id', plan),
+              ),
+          ]);
+          for (var i = 0; i < replies.length; i++) {
+            final mask = i % 3 == 0 ? 2 : (i % 2 == 0 ? 1 : 4);
+            expect(replies[i], [1, 2, 1, mask, 0]);
+          }
+          clients[0].setSchema({
+            'read': APISchemaEntry(1, [], {
+              'id': const SelectionFieldSchema(4),
+            }),
+          });
+          expect(
+            await clients[0].call<Uint8List>(
+              'read',
+              request: _SelectionRequest('id', plan),
+            ),
+            [1, 2, 1, 8, 0],
+          );
+        } finally {
+          for (final client in clients) {
+            client.close();
+          }
+          await server.close(force: true);
+        }
+      },
+    );
+
+    test('binary responses retain independent ownership after close', () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      var sequence = 0;
+      server.listen((request) async {
+        await request.drain<void>();
+        final value = ++sequence;
+        final payload = Uint8List(128 * 1024)..fillRange(0, 128 * 1024, value);
+        request.response.contentLength = payload.length;
+        request.response.add(payload.sublist(0, 4096));
+        await request.response.flush();
+        request.response.add(payload.sublist(4096));
+        await request.response.close();
+      });
+      final transport = HttpTransport(
+        'http://${server.address.host}:${server.port}',
+        options: const TransportOptions(mode: TransportMode.binary),
+      )..setSchema({'payload': APISchemaEntry(1, [])});
+      try {
+        final first = await transport.call<Uint8List>('payload');
+        final responses = await Future.wait([
+          for (var i = 0; i < 8; i++) transport.call<Uint8List>('payload'),
+        ]);
+        transport.close();
+        expect(first, everyElement(1));
+        expect(first.length, 128 * 1024);
+        expect(responses.map((data) => data.first).toSet(), {
+          for (var i = 2; i <= 9; i++) i,
+        });
+        for (final data in responses) {
+          expect(data.length, 128 * 1024);
+          expect(data, everyElement(data.first));
+        }
+        first.fillRange(0, first.length, 255);
+        expect(responses.every((data) => data.first != 255), isTrue);
+      } finally {
+        transport.close();
+        await server.close(force: true);
+      }
+    });
+
     group('timeout', () {
       test('default timeout is 30 seconds', () {
         final transport = HttpTransport('http://localhost:8080');

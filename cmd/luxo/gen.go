@@ -62,6 +62,7 @@ func runGen(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	files = result.Files
 	backends := codegen.EntryBackends{
 		Events: os.Getenv("LUXO_EVENT_BACKEND"),
 		Queue:  os.Getenv("LUXO_QUEUE_BACKEND"),
@@ -81,7 +82,7 @@ func runGen(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	totalFiles, err := generateModules(files, result, generator)
+	totalFiles, err := generateModules(result, generator)
 	if err != nil {
 		return err
 	}
@@ -322,7 +323,8 @@ func validateWireCompatibility(lf *lockfile.LockFile, files []*ast.File, allow b
 	return fmt.Errorf("%s", message.String())
 }
 
-func generateModules(files []*ast.File, result *semantic.Result, generator *codegen.GeneratorContext) (int, error) {
+func generateModules(result *semantic.Result, generator *codegen.GeneratorContext) (int, error) {
+	files := result.Files
 	if err := generateSharedEnums(generator); err != nil {
 		return 0, err
 	}

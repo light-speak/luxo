@@ -390,15 +390,20 @@ func hasDirective(directives []*ast.Directive, name string) bool {
 // Models indexes local models and extension stubs for compile-time name resolution.
 func Models(files []*ast.File) map[string]*ast.ModelDecl {
 	models := make(map[string]*ast.ModelDecl)
+	hasInheritance := false
 	for _, file := range files {
 		for _, model := range file.Models {
 			models[model.Name] = model
+			hasInheritance = hasInheritance || len(model.Parents) != 0
 		}
 		for _, extension := range file.Extends {
 			if models[extension.Name] == nil {
 				models[extension.Name] = &ast.ModelDecl{Name: extension.Name, Fields: extension.Fields}
 			}
 		}
+	}
+	if hasInheritance {
+		resolveInheritedModels(models, files)
 	}
 	return models
 }

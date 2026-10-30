@@ -68,33 +68,6 @@ type requestEnvelope struct {
 	body            []byte
 }
 
-func encodeRequestEnvelope(kind byte, token string, body []byte) []byte {
-	payload := make([]byte, 0, 2+10+len(token)+len(body))
-	payload = append(payload, kind, 0)
-	payload = codec.AppendVarint(payload, uint64(len(token)))
-	payload = append(payload, token...)
-	payload = append(payload, body...)
-	return payload
-}
-
-func encodeTracedRequestEnvelope(kind byte, token, traceID, fieldPath string, databaseDetails bool, body []byte) []byte {
-	payload := make([]byte, 0, 3+30+len(token)+len(traceID)+len(fieldPath)+len(body))
-	payload = append(payload, kind, requestFlagTraced)
-	payload = codec.AppendVarint(payload, uint64(len(token)))
-	payload = append(payload, token...)
-	payload = codec.AppendVarint(payload, uint64(len(traceID)))
-	payload = append(payload, traceID...)
-	payload = codec.AppendVarint(payload, uint64(len(fieldPath)))
-	payload = append(payload, fieldPath...)
-	if databaseDetails {
-		payload = append(payload, 1)
-	} else {
-		payload = append(payload, 0)
-	}
-	payload = append(payload, body...)
-	return payload
-}
-
 func decodeRequestEnvelope(payload []byte) (requestEnvelope, error) {
 	if len(payload) < 4 {
 		return requestEnvelope{}, fmt.Errorf("rpc: truncated request envelope")
@@ -197,6 +170,20 @@ func WriteFrame(w io.Writer, payload []byte) error {
 	return err
 }
 
+// Internal callers reserve the prefix before encoding, avoiding both a copy
+// and the temporary scatter/gather containers needed by separate payloads.
+func writePreparedFrame(w io.Writer, frame []byte) error {
+	if len(frame) < 4 || len(frame)-4 > maxFrameSize {
+		return fmt.Errorf("rpc: invalid prepared frame length: %d", len(frame))
+	}
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(frame)-4))
+	n, err := w.Write(frame)
+	if err == nil && n != len(frame) {
+		return io.ErrShortWrite
+	}
+	return err
+}
+
 func writeStatusFrame(w io.Writer, status byte, payload []byte) error {
 	if len(payload) >= maxFrameSize {
 		return fmt.Errorf("rpc: frame too large: %d bytes (max %d)", len(payload)+1, maxFrameSize)
@@ -210,7 +197,8 @@ func writeStatusFrame(w io.Writer, status byte, payload []byte) error {
 }
 
 // ReadFrame reads a length-prefixed frame from r.
-// Returns the payload bytes. Reuses buf if large enough.
+// Returns the payload bytes. Reuses buf's capacity, including zero-length
+// slices. The caller owns the buffer and controls its reuse lifetime.
 func ReadFrame(r io.Reader, buf []byte) ([]byte, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
@@ -220,7 +208,7 @@ func ReadFrame(r io.Reader, buf []byte) ([]byte, error) {
 	if size > maxFrameSize {
 		return nil, fmt.Errorf("rpc: frame too large: %d bytes (max %d)", size, maxFrameSize)
 	}
-	if int(size) > len(buf) {
+	if int(size) > cap(buf) {
 		buf = make([]byte, size)
 	} else {
 		buf = buf[:size]
@@ -229,4 +217,13 @@ func ReadFrame(r io.Reader, buf []byte) ([]byte, error) {
 		return nil, err
 	}
 	return buf, nil
+}
+
+// Bound per-connection idle retention without lowering the accepted frame size.
+// A large frame stays alive through dispatch but is not kept for the next call.
+func retainReadFrame(buf []byte) []byte {
+	if cap(buf) > 64<<10 {
+		return nil
+	}
+	return buf[:0]
 }

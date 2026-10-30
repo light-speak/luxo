@@ -160,6 +160,7 @@ func generateEntryFile(result *semantic.Result, modulePath string, backends Entr
 	b.WriteString("package main\n\n")
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
+	b.WriteString("\t\"errors\"\n")
 	b.WriteString("\t\"fmt\"\n")
 	b.WriteString("\t\"os\"\n\n")
 
@@ -193,7 +194,7 @@ func generateEntryFile(result *semantic.Result, modulePath string, backends Entr
 
 	b.WriteString("func main() {\n")
 	b.WriteString("\tctx := context.Background()\n\n")
-	b.WriteString("\tif err := env.Load(\".env\"); err != nil && !os.IsNotExist(err) {\n")
+	b.WriteString("\tif err := env.Load(\".env\"); err != nil && !errors.Is(err, os.ErrNotExist) {\n")
 	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"fatal: load .env: %v\\n\", err)\n")
 	b.WriteString("\t\tos.Exit(1)\n")
 	b.WriteString("\t}\n\n")
@@ -347,7 +348,9 @@ func writeGatewayCacheWiring(b *strings.Builder, service string, enabled bool, b
 	fmt.Fprintf(b, "\tresponseCache, err := api.NewResponseCacheFromEnv(ctx, %q, %s)\n", service, opener)
 	b.WriteString("\tif err != nil { fmt.Fprintf(os.Stderr, \"fatal: response cache: %v\\n\", err); os.Exit(1) }\n")
 	b.WriteString("\tdefer responseCache.Close()\n")
-	b.WriteString("\tgw := luvia.NewWithOptions(api.RouterOptions{ResponseCache: responseCache, RequestLogging: os.Getenv(\"LOG_REQUESTS\") == \"true\", DebugParamStructure: os.Getenv(\"LOG_LEVEL\") == \"debug\"})\n")
+	b.WriteString("\toptions := api.RouterOptionsFromEnv()\n")
+	b.WriteString("\toptions.ResponseCache = responseCache\n")
+	b.WriteString("\tgw := luvia.NewWithOptions(options)\n")
 }
 
 func writeEmbeddedRPCWiring(b *strings.Builder, modules []moduleInfo, hasServiceFunctions bool) {
@@ -579,6 +582,7 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 	b.WriteString("package main\n\n")
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
+	b.WriteString("\t\"errors\"\n")
 	b.WriteString("\t\"fmt\"\n")
 	b.WriteString("\t\"os\"\n\n")
 
@@ -608,7 +612,7 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 
 	b.WriteString("func main() {\n")
 	b.WriteString("\tctx := context.Background()\n\n")
-	b.WriteString("\tif err := env.Load(\".env\"); err != nil && !os.IsNotExist(err) {\n")
+	b.WriteString("\tif err := env.Load(\".env\"); err != nil && !errors.Is(err, os.ErrNotExist) {\n")
 	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"fatal: load .env: %v\\n\", err)\n")
 	b.WriteString("\t\tos.Exit(1)\n")
 	b.WriteString("\t}\n\n")
@@ -739,6 +743,7 @@ func generateGatewayEntry(result *semantic.Result, modulePath string, backends E
 	b.WriteString("import (\n")
 	b.WriteString("\t\"bytes\"\n")
 	b.WriteString("\t\"context\"\n")
+	b.WriteString("\t\"errors\"\n")
 	b.WriteString("\t\"fmt\"\n")
 	b.WriteString("\t\"os\"\n\n")
 	if len(rateLimits) > 0 {
@@ -766,7 +771,7 @@ func generateGatewayEntry(result *semantic.Result, modulePath string, backends E
 	b.WriteString("var Version = \"dev\"\n\n")
 
 	b.WriteString("func main() {\n")
-	b.WriteString("\tif err := env.Load(\".env\"); err != nil && !os.IsNotExist(err) {\n")
+	b.WriteString("\tif err := env.Load(\".env\"); err != nil && !errors.Is(err, os.ErrNotExist) {\n")
 	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"fatal: load .env: %v\\n\", err)\n")
 	b.WriteString("\t\tos.Exit(1)\n")
 	b.WriteString("\t}\n\n")

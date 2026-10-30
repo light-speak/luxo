@@ -52,7 +52,7 @@ export function luxo(options: LuxoPluginOptions = {}): Plugin {
       if (!schema) return null
 
       // Analyze field access and inject $select
-      const result = analyzeAndTransform(code, id, schema)
+      const result = analyzeAndTransform(code, id, schema, true)
       if (!result) return null
 
       return { code: result, map: null }
