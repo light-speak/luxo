@@ -89,7 +89,7 @@ func TestRepositoryApprovedCostBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	cost := costs[costKey{"github.com/light-speak/luxo/pkg/semantic", "AnalyzeDemoFile-2"}]
-	if len(costs) != 17 || cost.ID != "beta-compiler-demo-v1-validation" || cost.MaxBytes != 11280 || cost.MaxAllocs != 116 {
+	if len(costs) != 18 || cost.ID != "beta-compiler-demo-v1-validation" || cost.MaxBytes != 11280 || cost.MaxAllocs != 116 {
 		t.Fatalf("unexpected reviewed repository budget: %+v", costs)
 	}
 	for _, test := range []struct {
@@ -201,6 +201,8 @@ func TestRuntimeTimeBudgetsFailClosed(t *testing.T) {
 		{"github.com/light-speak/luxo/pkg/lux/codec", "ColumnarWrite10-2"},
 		{"github.com/light-speak/luxo/pkg/lux/api", "RouterObservabilityDisabled-2"},
 		{"github.com/light-speak/luxo/pkg/lux/event", "ChanBusEmitUnreviewed-2"},
+		{"github.com/light-speak/luxo/pkg/lux/luvia", "MetricsCollectorRecordParallel-2"},
+		{"github.com/light-speak/luxo/pkg/unreviewed", "Sample-2"},
 	} {
 		invalid := cost
 		invalid.Package, invalid.Benchmark = key.Package, key.Benchmark
@@ -498,6 +500,106 @@ func TestApprovedCostPolicyRejectsInvalidConfiguration(t *testing.T) {
 		data := writeRunInput(t, compilerCostCSV("~", 256, 2))
 		if err := run([]string{"--approved-costs", policy, "--base-sha", approvedBase, data, data}, io.Discard); err == nil {
 			t.Errorf("invalid policy accepted: %s", input)
+		}
+	}
+}
+
+func TestPlatformTimeBudgetUsesEvidence(t *testing.T) {
+	cost := approvedCost{ID: "platform", BaseSHA: approvedBase, Package: "github.com/light-speak/luxo/pkg/lux/codec", Benchmark: "EncodeEvent-2", MaxNanoseconds: 1.005, PlatformNanoseconds: map[string]float64{"linux/amd64": 5.485}, Reason: "reviewed"}
+	for _, platform := range []string{"linux/amd64", "darwin/arm64", ""} {
+		selected := cost.forPlatform(platform)
+		want := 1.005
+		if platform == "linux/amd64" {
+			want = 5.485
+		}
+		if selected.MaxNanoseconds != want {
+			t.Fatalf("platform %q: %+v", platform, selected)
+		}
+		testColdCompilationBudget(t, selected)
+	}
+	for _, limits := range []map[string]float64{{"linux/amd64": 0}, {"linux/amd64": -1}, {"linux/amd64": math.NaN()}, {"linux/amd64": math.Inf(1)}, {"*": 1}} {
+		cost.PlatformNanoseconds = limits
+		if cost.validate() == nil {
+			t.Fatalf("accepted invalid platform budget: %v", limits)
+		}
+	}
+}
+
+func TestEvidencePlatformsMustAgree(t *testing.T) {
+	input := "goos: linux\ngoarch: amd64\n" + compilerCostCSV("~", 256, 2)
+	primary := mustEvaluate(t, input)
+	if primary.platform() != "linux/amd64" {
+		t.Fatalf("platform: %+v", primary)
+	}
+	for _, header := range []string{"goos: darwin\ngoarch: arm64\n", ""} {
+		confirmation := mustEvaluate(t, header+compilerCostCSV("~", 256, 2))
+		if _, err := confirmEvaluations(primary, confirmation); err == nil {
+			t.Fatal("accepted different or missing platform")
+		}
+	}
+	if _, err := evaluate(strings.NewReader(input + "goarch: arm64\n")); err == nil {
+		t.Fatal("accepted mixed platform")
+	}
+}
+
+func TestBudgetFailureIdentifiesActualExceededMetric(t *testing.T) {
+	cost := approvedCost{Package: "sample", Benchmark: "sample", MaxNanoseconds: 12936, MaxBytes: 9744, MaxAllocs: 44}
+	primary, confirmation := coldCostMeasurements(cost), coldCostMeasurements(cost)
+	key := comparisonKey{cost.Package, cost.Benchmark, "sec/op"}
+	value := confirmation.Measurements[key]
+	value.Head += 26e-9
+	confirmation.Measurements[key] = value
+	reason, err := cost.budgetFailure(primary, confirmation)
+	if err != nil || !strings.Contains(reason, "group 2 sec/op") {
+		t.Fatalf("reason=%q err=%v", reason, err)
+	}
+}
+
+func TestReviewedLinuxBudgetsAreExact(t *testing.T) {
+	costs, err := loadApprovedCosts("approved-costs.json", approvedBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := map[string]float64{"ReadStringVsArena/Arena-2": 57.25, "ReadStringVsArena/NoArena-2": 59.5, "ColumnarStringArena-2": 1532, "ColumnarStringNoArena-2": 939, "RowWrite10-2": 268.1, "EncodeEvent-2": 5.485, "DecodeEvent-2": 18.27, "Update-2": 12962, "MetricsCollectorRecord-2": 4.84}
+	count := 0
+	for _, cost := range costs {
+		if len(cost.PlatformNanoseconds) == 0 {
+			continue
+		}
+		count++
+		if len(cost.PlatformNanoseconds) != 1 || cost.PlatformNanoseconds["linux/amd64"] != expected[cost.Benchmark] {
+			t.Fatalf("unexpected platform budget: %+v", cost)
+		}
+		if cost.Benchmark != "Update-2" && (cost.MaxBytes != 0 || cost.MaxAllocs != 0) {
+			t.Fatalf("expanded allocation allowance: %+v", cost)
+		}
+		selected := cost.forPlatform("linux/amd64")
+		testColdCompilationBudget(t, selected)
+	}
+	if count != len(expected) {
+		t.Fatalf("platform budgets=%d", count)
+	}
+}
+
+func TestLinuxApprovalReplaysEventCostWithoutWideningOtherPlatforms(t *testing.T) {
+	for _, test := range []struct {
+		platform string
+		delta    float64
+		pass     bool
+	}{
+		{"linux/amd64", 5.485, true}, {"linux/amd64", 5.486, false},
+		{"darwin/arm64", 5.485, false}, {"", 5.485, false},
+	} {
+		input := allocationCostCSV("github.com/light-speak/luxo/pkg/lux/codec", "EncodeEvent-2", "+49.02%", 0, 0, 0, 0)
+		input = strings.Replace(input, ",10,0%,10,0%,", fmt.Sprintf(",%.17g,0%%,%.17g,0%%,", 11.19e-9, (11.19+test.delta)*1e-9), 1)
+		if test.platform != "" {
+			parts := strings.Split(test.platform, "/")
+			input = "goos: " + parts[0] + "\ngoarch: " + parts[1] + "\n" + input
+		}
+		path := writeRunInput(t, input)
+		err := run([]string{"--approved-costs", "approved-costs.json", "--base-sha", approvedBase, path, path}, io.Discard)
+		if (err == nil) != test.pass {
+			t.Fatalf("platform=%q delta=%g err=%v", test.platform, test.delta, err)
 		}
 	}
 }

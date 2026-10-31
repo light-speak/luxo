@@ -57,7 +57,10 @@
       "maxBytes": 9744,
       "maxAllocs": 44,
       "maxNanoseconds": 12936,
-      "reason": "2026-09-24用户确认：仅固定main基线的本编译样例，两组都须满足上限。生成基线漏编号、语义分析输入扩充的差异已记录，不宣称等价功能对照。批准所列耗时和内存增量。不放行请求路径、SDK、其他样例或其他基线；详见私有docs/benchmark.md当前编译候选复测记录。"
+      "reason": "2026-09-24用户确认：仅固定main基线的本编译样例，两组都须满足上限。生成基线漏编号、语义分析输入扩充的差异已记录，不宣称等价功能对照。批准所列耗时和内存增量。不放行请求路径、SDK、其他样例或其他基线；详见私有docs/benchmark.md当前编译候选复测记录。 2026-10-31用户确认：Linux/amd64 的 PR #64、CI run 41114686013 两组各十轮已测组合增量；仅此固定 main 与样例，platformNanoseconds 不扩大其他平台的旧预算，内存上限不增加。旧实现缺少当前严格校验，不视为等价功能对照；不是完整请求或全部载荷上限。",
+      "platformNanoseconds": {
+        "linux/amd64": 12962
+      }
     },
     {
       "id": "beta-cold-lockfile-SaveLoad-2",
@@ -105,7 +108,10 @@
       "maxBytes": 0,
       "maxAllocs": 0,
       "maxNanoseconds": 35.285,
-      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。"
+      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。 2026-10-31用户确认：Linux/amd64 的 PR #64、CI run 41114686013 两组各十轮已测组合增量；仅此固定 main 与样例，platformNanoseconds 不扩大其他平台的旧预算，内存上限不增加。旧实现缺少当前严格校验，不视为等价功能对照；不是完整请求或全部载荷上限。",
+      "platformNanoseconds": {
+        "linux/amd64": 57.25
+      }
     },
     {
       "id": "beta-runtime-combination-ReadStringVsArena-NoArena-2",
@@ -115,7 +121,10 @@
       "maxBytes": 0,
       "maxAllocs": 0,
       "maxNanoseconds": 37.32,
-      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。"
+      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。 2026-10-31用户确认：Linux/amd64 的 PR #64、CI run 41114686013 两组各十轮已测组合增量；仅此固定 main 与样例，platformNanoseconds 不扩大其他平台的旧预算，内存上限不增加。旧实现缺少当前严格校验，不视为等价功能对照；不是完整请求或全部载荷上限。",
+      "platformNanoseconds": {
+        "linux/amd64": 59.5
+      }
     },
     {
       "id": "beta-runtime-combination-ColumnarStringArena-2",
@@ -125,7 +134,10 @@
       "maxBytes": 0,
       "maxAllocs": 0,
       "maxNanoseconds": 659.4,
-      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。"
+      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。 2026-10-31用户确认：Linux/amd64 的 PR #64、CI run 41114686013 两组各十轮已测组合增量；仅此固定 main 与样例，platformNanoseconds 不扩大其他平台的旧预算，内存上限不增加。旧实现缺少当前严格校验，不视为等价功能对照；不是完整请求或全部载荷上限。",
+      "platformNanoseconds": {
+        "linux/amd64": 1532
+      }
     },
     {
       "id": "beta-runtime-combination-ColumnarStringNoArena-2",
@@ -135,7 +147,10 @@
       "maxBytes": 0,
       "maxAllocs": 0,
       "maxNanoseconds": 721.25,
-      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。"
+      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。 2026-10-31用户确认：Linux/amd64 的 PR #64、CI run 41114686013 两组各十轮已测组合增量；仅此固定 main 与样例，platformNanoseconds 不扩大其他平台的旧预算，内存上限不增加。旧实现缺少当前严格校验，不视为等价功能对照；不是完整请求或全部载荷上限。",
+      "platformNanoseconds": {
+        "linux/amd64": 939
+      }
     },
     {
       "id": "beta-runtime-combination-RowWrite10-2",
@@ -145,7 +160,10 @@
       "maxBytes": 0,
       "maxAllocs": 0,
       "maxNanoseconds": 53.7,
-      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。"
+      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。 2026-10-31用户确认：Linux/amd64 的 PR #64、CI run 41114686013 两组各十轮已测组合增量；仅此固定 main 与样例，platformNanoseconds 不扩大其他平台的旧预算，内存上限不增加。旧实现缺少当前严格校验，不视为等价功能对照；不是完整请求或全部载荷上限。",
+      "platformNanoseconds": {
+        "linux/amd64": 268.1
+      }
     },
     {
       "id": "beta-runtime-combination-EncodeEvent-2",
@@ -155,7 +173,10 @@
       "maxBytes": 0,
       "maxAllocs": 0,
       "maxNanoseconds": 1.005,
-      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。"
+      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。 2026-10-31用户确认：Linux/amd64 的 PR #64、CI run 41114686013 两组各十轮已测组合增量；仅此固定 main 与样例，platformNanoseconds 不扩大其他平台的旧预算，内存上限不增加。旧实现缺少当前严格校验，不视为等价功能对照；不是完整请求或全部载荷上限。",
+      "platformNanoseconds": {
+        "linux/amd64": 5.485
+      }
     },
     {
       "id": "beta-runtime-combination-DecodeEvent-2",
@@ -165,7 +186,22 @@
       "maxBytes": 0,
       "maxAllocs": 0,
       "maxNanoseconds": 6.355,
-      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。"
+      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。 2026-10-31用户确认：Linux/amd64 的 PR #64、CI run 41114686013 两组各十轮已测组合增量；仅此固定 main 与样例，platformNanoseconds 不扩大其他平台的旧预算，内存上限不增加。旧实现缺少当前严格校验，不视为等价功能对照；不是完整请求或全部载荷上限。",
+      "platformNanoseconds": {
+        "linux/amd64": 18.27
+      }
+    },
+    {
+      "id": "beta-linux-metrics-record",
+      "baseSHA": "dbd269d586a71739b69dd6acb1a26b85f50483d0",
+      "package": "github.com/light-speak/luxo/pkg/lux/luvia",
+      "benchmark": "MetricsCollectorRecord-2",
+      "maxBytes": 0,
+      "maxAllocs": 0,
+      "platformNanoseconds": {
+        "linux/amd64": 4.84
+      },
+      "reason": "2026-10-31用户确认：Linux/amd64 的 PR #64、CI run 41114686013 两组各十轮已测组合增量；仅此固定 main 与样例，platformNanoseconds 不扩大其他平台的旧预算，内存上限不增加。旧实现缺少当前严格校验，不视为等价功能对照；不是完整请求或全部载荷上限。 成本涉及关闭检查及有界观测保留，保留错误/总请求计数。"
     }
   ]
 }

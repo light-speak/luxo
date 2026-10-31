@@ -31,6 +31,7 @@ type qualityWorkflow struct {
 		}
 		Steps []struct {
 			Name, Run, Uses, If string
+			WorkingDirectory    string `yaml:"working-directory"`
 			With, Env           map[string]string
 			ContinueOnError     bool `yaml:"continue-on-error"`
 		}
@@ -660,5 +661,23 @@ func TestSDKInteropBindsCandidateModules(t *testing.T) {
 				t.Fatalf("invalid module setup order: go=%d bindings=%d consumer=%d count=%d", goSetup, bindings, firstConsumer, count)
 			}
 		})
+	}
+}
+
+func TestReactCIInstallsImportedGeneratorDependencies(t *testing.T) {
+	install, test := -1, -1
+	for i, step := range readQualityWorkflow(t).Jobs["sdk-ts"].Steps {
+		if step.Name == "Install generator dependencies for React tests" {
+			install = i
+			if step.If != "matrix.package == 'react'" || step.WorkingDirectory != "packages/vite-plugin" || step.Run != "pnpm install --frozen-lockfile" {
+				t.Fatalf("invalid generator setup: %+v", step)
+			}
+		}
+		if step.Name == "Test and build package" {
+			test = i
+		}
+	}
+	if install < 0 || test <= install {
+		t.Fatalf("React must install imported generator dependencies before tests: install=%d test=%d", install, test)
 	}
 }

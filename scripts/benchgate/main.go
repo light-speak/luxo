@@ -19,6 +19,8 @@ const (
 )
 
 type evaluation struct {
+	GOOS                  string
+	GOARCH                string
 	TimeComparisons       int
 	AllocationComparisons int
 	Comparisons           map[comparisonKey]struct{}
@@ -178,6 +180,9 @@ func evaluate(input io.Reader) (evaluation, error) {
 }
 
 func (evaluator *comparisonEvaluator) consume(row []string) error {
+	if handled, err := evaluator.consumePlatform(row); handled {
+		return err
+	}
 	if len(row) == 1 && strings.HasPrefix(row[0], "pkg: ") {
 		evaluator.packageName = strings.TrimPrefix(row[0], "pkg: ")
 		evaluator.unit = ""
@@ -225,6 +230,9 @@ func (evaluator *comparisonEvaluator) consume(row []string) error {
 }
 
 func confirmEvaluations(primary, confirmation evaluation) (evaluation, error) {
+	if primary.GOOS != confirmation.GOOS || primary.GOARCH != confirmation.GOARCH {
+		return evaluation{}, errors.New("benchmark platforms differ between sample groups")
+	}
 	if !matchingComparisons(primary.Comparisons, confirmation.Comparisons) {
 		return evaluation{}, errors.New("benchmark comparison sets differ between sample groups")
 	}
@@ -363,4 +371,34 @@ func parseMeasurement(base, head string) (measurement, error) {
 		}
 	}
 	return result, nil
+}
+
+func (result evaluation) platform() string {
+	if result.GOOS == "" || result.GOARCH == "" {
+		return ""
+	}
+	return result.GOOS + "/" + result.GOARCH
+}
+
+func (evaluator *comparisonEvaluator) consumePlatform(row []string) (bool, error) {
+	if len(row) != 1 {
+		return false, nil
+	}
+	for _, field := range []struct {
+		prefix string
+		target *string
+	}{
+		{"goos: ", &evaluator.result.GOOS}, {"goarch: ", &evaluator.result.GOARCH},
+	} {
+		if !strings.HasPrefix(row[0], field.prefix) {
+			continue
+		}
+		value := strings.TrimSpace(strings.TrimPrefix(row[0], field.prefix))
+		if value == "" || *field.target != "" && *field.target != value {
+			return true, errors.New("missing or mixed benchmark platform metadata")
+		}
+		*field.target = value
+		return true, nil
+	}
+	return false, nil
 }

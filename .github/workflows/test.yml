@@ -643,6 +643,11 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
 
+      - name: Install generator dependencies for React tests
+        if: matrix.package == 'react'
+        working-directory: packages/vite-plugin
+        run: pnpm install --frozen-lockfile
+
       - name: Test and build package
         working-directory: packages/${{ matrix.package }}
         run: |
