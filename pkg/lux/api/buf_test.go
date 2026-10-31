@@ -1,9 +1,45 @@
 package api
 
 import (
+	"bytes"
+	"errors"
+	"math"
 	"testing"
 	"time"
+
+	"github.com/light-speak/luxo/pkg/lux/codec"
 )
+
+func TestResponseBufRejectsNonFiniteFloat(t *testing.T) {
+	for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		buf := ResponseBuf{B: []byte("prefix")}
+		if err := buf.AppendFloat(value); !errors.Is(err, codec.ErrNonFiniteFloat) || !bytes.Equal(buf.B, []byte("prefix")) {
+			t.Fatalf("invalid JSON Float published: %q, %v", buf.B, err)
+		}
+	}
+}
+
+func TestResponseBufReset(t *testing.T) {
+	storage := make([]byte, 0, 64)
+	buf := ResponseBuf{B: storage}
+	for range 2 {
+		buf.AppendString("previous response")
+		buf.Identity = struct{ ID int64 }{ID: 42}
+		buf.Reset()
+		if len(buf.B) != 0 || cap(buf.B) != cap(storage) || buf.Identity != nil {
+			t.Fatalf("reset retained state or lost capacity: %+v", buf)
+		}
+		buf.AppendByte('x')
+		if &buf.B[0] != &storage[:cap(storage)][0] || string(buf.B) != "x" {
+			t.Fatal("reset did not reuse the original storage")
+		}
+	}
+	var empty ResponseBuf
+	empty.Reset()
+	if empty.B != nil || empty.Identity != nil {
+		t.Fatalf("reset changed zero buffer: %+v", empty)
+	}
+}
 
 func TestResponseBufAppendInt(t *testing.T) {
 	buf := GetBuf()
@@ -29,7 +65,9 @@ func TestResponseBufAppendFloat(t *testing.T) {
 	buf := GetBuf()
 	defer PutBuf(buf)
 
-	buf.AppendFloat(3.14)
+	if err := buf.AppendFloat(3.14); err != nil {
+		t.Fatal(err)
+	}
 	if string(buf.B) != "3.14" {
 		t.Errorf("got %q", string(buf.B))
 	}

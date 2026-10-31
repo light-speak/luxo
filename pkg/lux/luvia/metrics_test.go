@@ -2,11 +2,14 @@ package luvia
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/api"
@@ -17,7 +20,7 @@ func TestTraceSampleRateFromEnv(t *testing.T) {
 	if got := traceSampleRateFromEnv(); got != 0.25 {
 		t.Fatalf("traceSampleRateFromEnv() = %v, want 0.25", got)
 	}
-	for _, value := range []string{"invalid", "-1", "1.1"} {
+	for _, value := range []string{"invalid", "-1", "1.1", "NaN", "+Inf", "-Inf"} {
 		t.Run(value, func(t *testing.T) {
 			t.Setenv("LUXO_TRACE_SAMPLE_RATE", value)
 			if got := traceSampleRateFromEnv(); got != 0.1 {
@@ -69,7 +72,7 @@ func TestMetricsCollectorFlushTraces(t *testing.T) {
 	mc := &MetricsCollector{
 		studioURL:       srv.URL,
 		apiKey:          "secret",
-		projectID:       7,
+		projectID:       testStudioProjectID,
 		instanceID:      "gateway-1",
 		traceSampleRate: 1,
 		client:          srv.Client(),
@@ -81,7 +84,7 @@ func TestMetricsCollectorFlushTraces(t *testing.T) {
 	})
 	mc.flushTraces()
 
-	if received["$api"] != "svc:ingestTraces" || received["apiKey"] != "secret" {
+	if received["$api"] != "ingestTraces" || received["apiKey"] != "secret" {
 		t.Fatalf("trace payload metadata = %+v", received)
 	}
 	traces, ok := received["traces"].([]any)
@@ -290,7 +293,8 @@ func TestNewMetricsCollectorCreated(t *testing.T) {
 
 	os.Setenv("LUXO_STUDIO_URL", srv.URL)
 	os.Setenv("LUXO_API_KEY", "test-key")
-	os.Setenv("LUXO_PROJECT_ID", "42")
+	t.Setenv("LUXO_PROJECT_ID", testStudioProjectID)
+	t.Setenv("LUXO_PROJECT_ID", testStudioProjectID)
 	defer os.Unsetenv("LUXO_STUDIO_URL")
 	defer os.Unsetenv("LUXO_API_KEY")
 	defer os.Unsetenv("LUXO_PROJECT_ID")
@@ -301,8 +305,8 @@ func TestNewMetricsCollectorCreated(t *testing.T) {
 	}
 	defer mc.Close()
 
-	if mc.projectID != 42 {
-		t.Errorf("projectID = %d, want 42", mc.projectID)
+	if mc.projectID != testStudioProjectID {
+		t.Errorf("projectID = %s, want UUID", mc.projectID)
 	}
 }
 
@@ -339,8 +343,8 @@ func TestMetricsCollectorCloseFlush(t *testing.T) {
 	}
 
 	body := received[0]
-	if body["$api"] != "svc:ingestMetrics" {
-		t.Errorf("$api = %v, want svc:ingestMetrics", body["$api"])
+	if body["$api"] != "ingestMetrics" {
+		t.Errorf("$api = %v, want ingestMetrics", body["$api"])
 	}
 	if body["apiKey"] != "test" {
 		t.Errorf("apiKey = %v, want test", body["apiKey"])
@@ -479,6 +483,98 @@ func TestMetricsFlushLoopTickerBranch(t *testing.T) {
 	}
 }
 
+type metricsRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f metricsRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+func TestMetricsPeriodicFlushAndFinalDrain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		flushed := make(chan string, 4)
+		transport := metricsRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			defer request.Body.Close()
+			var body struct {
+				API     string `json:"$api"`
+				Buckets []struct {
+					Name  string `json:"apiName"`
+					Count int    `json:"totalCount"`
+				} `json:"buckets"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil || body.API != "ingestMetrics" || len(body.Buckets) != 1 || body.Buckets[0].Count != 1 {
+				t.Errorf("unexpected metrics publication: %+v, %v", body, err)
+			} else {
+				flushed <- body.Buckets[0].Name
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, nil
+		})
+		mc := &MetricsCollector{studioURL: "http://metrics.test", buckets: make(map[metricBucketKey]*metricBucket), done: make(chan struct{}), client: &http.Client{Transport: transport}}
+		defer mc.Close()
+		stopped := make(chan struct{})
+		mc.worker.Go(func() { defer close(stopped); mc.flushLoop() })
+		mc.Record("periodic", time.Millisecond, false)
+		synctest.Wait()
+		time.Sleep(29 * time.Second)
+		synctest.Wait()
+		if len(flushed) != 0 {
+			t.Fatal("metrics flushed before the configured interval")
+		}
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if len(flushed) != 1 || <-flushed != "periodic" {
+			t.Fatal("ticker did not publish the recorded metric exactly once")
+		}
+		mc.Record("final", time.Millisecond, false)
+		mc.Close()
+		<-stopped
+		time.Sleep(30 * time.Second)
+		if len(flushed) != 1 || <-flushed != "final" {
+			t.Fatal("shutdown lost the final metric or left a live periodic sender")
+		}
+	})
+}
+
+func TestMetricsCloseWaitsForInFlightFlush(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		entered, release := make(chan struct{}), make(chan struct{})
+		calls := 0
+		transport := metricsRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			calls++
+			if calls == 1 {
+				close(entered)
+				<-release
+				return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: http.NoBody}, nil
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+		})
+		mc := &MetricsCollector{studioURL: "http://metrics.test", buckets: make(map[metricBucketKey]*metricBucket), done: make(chan struct{}), client: &http.Client{Transport: transport}}
+		mc.worker.Go(mc.flushLoop)
+		mc.Record("retry", time.Millisecond, false)
+		time.Sleep(30 * time.Second)
+		<-entered
+		closed := make(chan struct{}, 2)
+		for range 2 {
+			go func() { mc.Close(); closed <- struct{}{} }()
+		}
+		synctest.Wait()
+		if len(closed) != 0 {
+			t.Error("Close returned before the in-flight export finished")
+		}
+		close(release)
+		<-closed
+		<-closed
+		synctest.Wait()
+		if calls != 2 || len(mc.buckets) != 0 {
+			t.Fatalf("final drain did not retry the failed in-flight batch: calls=%d pending=%d", calls, len(mc.buckets))
+		}
+		mc.Record("after-close", time.Millisecond, false)
+		mc.RecordTrace(api.TraceRecord{StatusCode: http.StatusInternalServerError})
+		if len(mc.buckets) != 0 || len(mc.traces) != 0 {
+			t.Fatal("closed collector accepted records with no active exporter")
+		}
+	})
+}
+
 func TestShouldSampleTraceDeterministic(t *testing.T) {
 	first := shouldSampleTrace("trace-deterministic", 0.5)
 	second := shouldSampleTrace("trace-deterministic", 0.5)
@@ -559,7 +655,7 @@ func TestMetricsCollectorReenqueueTraceLimits(t *testing.T) {
 
 	mc.traces = make([]api.TraceRecord, maxPendingTraces-1)
 	mc.reenqueueTraces([]api.TraceRecord{{TraceID: "kept"}, {TraceID: "truncated"}})
-	if len(mc.traces) != maxPendingTraces || mc.traces[0].TraceID != "kept" {
+	if len(mc.traces) != maxPendingTraces || mc.traces[0].TraceID != "truncated" {
 		t.Fatalf("limited requeue = len %d first %q", len(mc.traces), mc.traces[0].TraceID)
 	}
 }

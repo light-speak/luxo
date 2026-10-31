@@ -2,16 +2,23 @@ package codec
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"os"
 	"slices"
+	"strconv"
 	"testing"
 )
 
 type codecProtocolFixture struct {
 	Version    int `json:"version"`
-	Primitives struct {
+	Int64Cases []struct {
+		Value string `json:"value"`
+		Wire  string `json:"wire"`
+	} `json:"int64Cases"`
+	InvalidInt64 []string `json:"invalidInt64"`
+	Primitives   struct {
 		Varint300         string `json:"varint300"`
 		SvarintNegative42 string `json:"svarintNegative42"`
 		Fixed64OnePoint25 string `json:"fixed64OnePoint25"`
@@ -49,6 +56,114 @@ func protocolFixtureBytes(t *testing.T, value string) []byte {
 		t.Fatal(err)
 	}
 	return data
+}
+
+func TestProtocolConformanceInt64(t *testing.T) {
+	fixture := loadCodecProtocolFixture(t)
+	for _, item := range fixture.Int64Cases {
+		t.Run(item.Value, func(t *testing.T) {
+			value, err := strconv.ParseInt(item.Value, 10, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var encoder Encoder
+			encoder.WriteInt(value)
+			if got := hex.EncodeToString(encoder.Bytes()); got != item.Wire {
+				t.Fatalf("wire = %s, want %s", got, item.Wire)
+			}
+			wire := protocolFixtureBytes(t, item.Wire)
+			decoder := NewDecoder(wire)
+			if got := decoder.ReadInt(); got != value || decoder.Err() != nil {
+				t.Fatalf("value = %d, error = %v", got, decoder.Err())
+			}
+			column := NewColumnarReader(append(append([]byte{1, 0, 1}, wire...), 0))
+			if !column.NextColumn() || !slices.Equal(column.ReadColumnInt(), []int64{value}) || column.Err() != nil {
+				t.Fatalf("invalid int64 column: %v", column.Err())
+			}
+			checkProtocolInt64Containers(t, wire, value)
+		})
+	}
+}
+
+func TestProtocolConformanceInvalidInt64(t *testing.T) {
+	fixture := loadCodecProtocolFixture(t)
+	for _, wire := range fixture.InvalidInt64 {
+		t.Run("invalid/"+wire, func(t *testing.T) {
+			data := protocolFixtureBytes(t, wire)
+			decoder := NewDecoder(data)
+			decoder.ReadInt()
+			if decoder.Err() == nil {
+				t.Fatal("accepted invalid int64")
+			}
+			column := NewColumnarReader(append([]byte{1, 0, 1}, data...))
+			column.NextColumn()
+			column.ReadColumnInt()
+			if column.Err() == nil {
+				t.Fatal("accepted invalid int64 column")
+			}
+		})
+	}
+}
+
+func checkProtocolInt64Containers(t *testing.T, wire []byte, value int64) {
+	t.Helper()
+	data := append([]byte{1}, wire...)
+	decoder := NewDecoder(data)
+	if got := decoder.ReadIntPtr(); got == nil || *got != value || decoder.Err() != nil {
+		t.Fatalf("invalid nullable int64: %v", decoder.Err())
+	}
+	decoder = NewDecoder(data)
+	if got := decoder.ReadIntArray(); !slices.Equal(got, []int64{value}) || decoder.Err() != nil {
+		t.Fatalf("invalid int64 array: %v", decoder.Err())
+	}
+	column := NewColumnarReader(append([]byte{1, 0, 1}, data...))
+	column.NextColumn()
+	got := column.ReadColumnIntPtr()
+	if len(got) != 1 || got[0] == nil || *got[0] != value || column.Err() != nil {
+		t.Fatalf("invalid nullable int64 column: %v", column.Err())
+	}
+}
+
+func TestVarintTenthByteMatchesStandardLibrary(t *testing.T) {
+	for last := range 256 {
+		wire := append(bytes.Repeat([]byte{0xff}, 9), byte(last))
+		want, wantN := binary.Uvarint(wire)
+		got, n := ReadVarint(wire, 0)
+		if got != want || (wantN > 0 && n != wantN) || (wantN < 0 && n >= 0) {
+			t.Fatalf("last byte %x: value/count = %d/%d, want %d/%d", last, got, n, want, wantN)
+		}
+	}
+}
+
+func FuzzProtocolVarint(f *testing.F) {
+	f.Add([]byte{})
+	f.Add([]byte{0})
+	f.Add(bytes.Repeat([]byte{0x80}, 10))
+	f.Add(append(bytes.Repeat([]byte{0xff}, 9), 1))
+	f.Add(append(bytes.Repeat([]byte{0xff}, 9), 2))
+	f.Fuzz(func(t *testing.T, wire []byte) {
+		want, wantN := binary.Uvarint(wire)
+		got, n := ReadVarint(wire, 0)
+		// The standard library reports ten continuation bytes as truncated;
+		// Luxo rejects them as overflow. Both must reject without consuming.
+		if (wantN > 0 && (got != want || n != wantN)) || (wantN <= 0 && n > 0) {
+			t.Fatalf("wire %x: value/count = %d/%d, want %d/%d", wire, got, n, want, wantN)
+		}
+	})
+}
+
+func BenchmarkProtocolInt64(b *testing.B) {
+	for _, value := range []int64{0, 127, 1 << 32, 1<<53 + 1, 1<<63 - 1, -1 << 63} {
+		b.Run(strconv.FormatInt(value, 10), func(b *testing.B) {
+			wire := AppendSvarint(nil, value)
+			b.ReportAllocs()
+			for b.Loop() {
+				if got, n := ReadSvarint(wire, 0); got != value || n != len(wire) {
+					b.Fatal("incorrect int64 decode")
+				}
+			}
+		})
+	}
 }
 
 func TestProtocolConformancePrimitiveEncodings(t *testing.T) {
@@ -100,8 +215,9 @@ func TestProtocolConformanceColumnarEncoding(t *testing.T) {
 	writer.WriteColumnString(2, []string{"a", "世界", ""})
 	writer.WriteColumnBoolPtr(3, []*bool{&trueValue, nil, &falseValue})
 	want := protocolFixtureBytes(t, fixture.Columnar)
-	if !bytes.Equal(writer.Bytes(), want) {
-		t.Fatalf("columnar wire = %x, want %x", writer.Bytes(), want)
+	data, err := writer.Bytes()
+	if err != nil || !bytes.Equal(data, want) {
+		t.Fatalf("columnar wire = %x, %v; want %x", data, err, want)
 	}
 
 	reader := NewColumnarReader(want)

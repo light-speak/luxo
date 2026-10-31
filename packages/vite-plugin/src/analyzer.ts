@@ -1,15 +1,16 @@
 import { parse } from '@babel/parser'
-import _traverse, { type NodePath } from '@babel/traverse'
+import traverse, { type NodePath } from '@babel/traverse'
 import * as t from '@babel/types'
 import type { LuxoAPI, LuxoField, LuxoModel, LuxoSchema, LuxoTypeDecl } from '@luxojs/client'
 
-const traverse = (_traverse as unknown as { default: typeof _traverse }).default ?? _traverse
 const MAX_NESTING_DEPTH = 5
 const ARRAY_CALLBACKS = new Set(['every', 'filter', 'find', 'flatMap', 'forEach', 'map', 'some'])
 const PAGE_FIELDS = new Set(['page', 'pageSize', 'total'])
 
 type SchemaDeclaration = LuxoModel | LuxoTypeDecl
 type ValueShape = 'object' | 'list' | 'page' | 'scalar'
+type TransparentExpression = t.TSAsExpression | t.TSTypeAssertion | t.TSSatisfiesExpression |
+  t.TSNonNullExpression | t.TypeCastExpression | t.ParenthesizedExpression
 
 interface CallUsage {
   api: LuxoAPI
@@ -44,9 +45,8 @@ interface AnalysisState {
  * Tracks statically visible result usage and injects a safe compile-time
  * selection into generated client's params object.
  */
-export function analyzeAndTransform(code: string, _id: string, schema: LuxoSchema): string | null {
-  const ast = parseSource(code)
-  if (!ast) return null
+export function analyzeAndTransform(code: string, id: string, schema: LuxoSchema, preparedSelections = false): string | null {
+  const ast = parseSource(code, id)
 
   const state = createAnalysisState(schema)
   collectBindings(ast, state)
@@ -54,19 +54,41 @@ export function analyzeAndTransform(code: string, _id: string, schema: LuxoSchem
   collectFieldAccesses(ast, state)
   collectEscapes(ast, state)
 
-  const edits = state.usages.flatMap(usage => createSelectionEdit(code, usage, state.schema))
+  let prefix = '$luxoSelection'
+  while (code.includes(prefix)) prefix += '_'
+  const plans: string[] = []
+  const expression = (selection: string): string => {
+    if (!preparedSelections) return `'${selection}'`
+    const name = `${prefix}${plans.length}`
+    plans.push(`const ${name} = ${prefix}Prepare(${JSON.stringify(selection)});`)
+    return name
+  }
+  const edits = state.usages.flatMap(usage => createSelectionEdit(code, usage, state.schema, expression))
+  if (plans.length) {
+    const directives = ast.program.directives
+    const point = directives.at(-1)?.end ?? ast.program.interpreter?.end ?? 0
+    edits.push({ start: point, end: point, replacement: `\nimport { prepareSelection as ${prefix}Prepare } from '@luxojs/client';\n${plans.join('\n')}\n` })
+  }
   if (edits.length === 0) return null
   return applyTextEdits(code, edits)
 }
 
-function parseSource(code: string): t.File | null {
+function parseSource(code: string, id: string): t.File {
+  const sourceID = id.split('?', 1)[0]!
   try {
     return parse(code, {
       sourceType: 'module',
-      plugins: ['typescript', 'jsx'],
+      sourceFilename: id,
+      createParenthesizedExpressions: true,
+      plugins: [
+        ['typescript', { disallowAmbiguousJSXLike: /\.[mc]ts$/.test(sourceID) }],
+        ...(sourceID.endsWith('.tsx') ? ['jsx' as const] : []),
+        'decorators', 'decoratorAutoAccessors',
+      ],
     })
-  } catch {
-    return null
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new SyntaxError(`[luxo] Cannot analyze ${id}: ${message}`, { cause: error })
   }
 }
 
@@ -276,8 +298,9 @@ function isSafeReference(path: NodePath<t.Identifier>): boolean {
   return !parent.node.computed || isStaticMemberProperty(parent.node.property)
 }
 
-function isTransparentExpression(path: NodePath<t.Node> | null): boolean {
-  return Boolean(path?.isTSAsExpression() || path?.isTSNonNullExpression() || path?.isTypeCastExpression())
+function isTransparentExpression(path: NodePath<t.Node> | null): path is NodePath<TransparentExpression> {
+  return Boolean(path?.isTSAsExpression() || path?.isTSTypeAssertion() || path?.isTSSatisfiesExpression() || path?.isTSNonNullExpression() ||
+    path?.isTypeCastExpression() || path?.isParenthesizedExpression())
 }
 
 function resolveValue(path: NodePath<t.Node> | null, state: AnalysisState): ValueBinding | null {
@@ -336,7 +359,7 @@ function unwrapExpression(path: NodePath<t.Node>): NodePath<t.Node> {
       current = asNodePath(current.get('argument')) ?? current
       continue
     }
-    if (current.isTSAsExpression() || current.isTSNonNullExpression() || current.isTypeCastExpression()) {
+    if (isTransparentExpression(current)) {
       current = asNodePath(current.get('expression')) ?? current
       continue
     }
@@ -344,7 +367,7 @@ function unwrapExpression(path: NodePath<t.Node>): NodePath<t.Node> {
   }
 }
 
-function createSelectionEdit(code: string, usage: CallUsage, schema: LuxoSchema): TextEdit[] {
+function createSelectionEdit(code: string, usage: CallUsage, schema: LuxoSchema, expression: (text: string) => string): TextEdit[] {
   if (hasManualSelection(usage.call)) return []
   if (usage.escaped) addSafeProjection(usage.tree, usage.api.returnType ?? '', schema)
   completeStructuredLeaves(usage.tree, usage.api.returnType ?? '', schema)
@@ -353,10 +376,11 @@ function createSelectionEdit(code: string, usage: CallUsage, schema: LuxoSchema)
   if (!selection) return []
   warnDeepSelection(usage.api.name, usage.tree)
 
+  const value = expression(selection)
   const first = usage.call.arguments[0]
-  if (!first) return insertEmptyParams(usage.call, selection)
-  if (t.isObjectExpression(first)) return mergeObjectParams(first, selection)
-  return wrapDynamicParams(code, first, selection)
+  if (!first) return insertEmptyParams(usage.call, value)
+  if (t.isObjectExpression(first)) return mergeObjectParams(first, value)
+  return wrapDynamicParams(code, first, value)
 }
 
 function addSafeProjection(
@@ -446,15 +470,15 @@ function hasManualSelection(call: t.CallExpression): boolean {
 function insertEmptyParams(call: t.CallExpression, selection: string): TextEdit[] {
   if (call.end === null || call.end === undefined) return []
   const point = call.end - 1
-  return [{ start: point, end: point, replacement: `{ $select: '${selection}' }` }]
+  return [{ start: point, end: point, replacement: `{ $select: ${selection} }` }]
 }
 
 function mergeObjectParams(params: t.ObjectExpression, selection: string): TextEdit[] {
   if (params.start === null || params.start === undefined || params.end === null || params.end === undefined) return []
   if (params.properties.length === 0) {
-    return [{ start: params.start, end: params.end, replacement: `{ $select: '${selection}' }` }]
+    return [{ start: params.start, end: params.end, replacement: `{ $select: ${selection} }` }]
   }
-  return [{ start: params.start + 1, end: params.start + 1, replacement: ` $select: '${selection}',` }]
+  return [{ start: params.start + 1, end: params.start + 1, replacement: ` $select: ${selection},` }]
 }
 
 function wrapDynamicParams(
@@ -467,7 +491,7 @@ function wrapDynamicParams(
   return [{
     start: params.start,
     end: params.end,
-    replacement: `{ $select: '${selection}', ...(${source}) }`,
+    replacement: `{ $select: ${selection}, ...(${source}) }`,
   }]
 }
 
@@ -546,7 +570,7 @@ function isStaticMemberProperty(property: t.Expression | t.PrivateName): boolean
   return t.isNumericLiteral(property) || t.isStringLiteral(property)
 }
 
-function asNodePath(value: NodePath<t.Node> | NodePath<t.Node>[] | null | undefined): NodePath<t.Node> | null {
-  if (!value || Array.isArray(value)) return null
+function asNodePath(value: NodePath<t.Node | null> | NodePath<t.Node | null>[] | null | undefined): NodePath<t.Node> | null {
+  if (!value || Array.isArray(value) || value.type === null) return null
   return value
 }

@@ -2,10 +2,13 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -14,6 +17,183 @@ func testConfig() Config {
 		MaxRetries:  3,
 		RetryDelay:  10 * time.Millisecond, // fast retries for tests
 		Concurrency: 2,
+	}
+}
+
+func TestMemoryPublishCanceledBeforeEnqueue(t *testing.T) {
+	q := NewMemoryQueue(testConfig())
+	defer q.Close()
+	q.queues["test"] = &memQueue{ch: make(chan []byte, 1)}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := q.Publish(ctx, "test", []byte("must not enqueue")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Publish error = %v, want canceled", err)
+	}
+	if len(q.queues["test"].ch) != 0 {
+		t.Fatal("canceled publication enqueued a task")
+	}
+}
+
+func TestMemoryBlockedPublishObservesContext(t *testing.T) {
+	for _, deadline := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deadline=%v", deadline), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				q := NewMemoryQueue(testConfig())
+				defer q.Close()
+				q.queues["test"] = &memQueue{ch: make(chan []byte, 1)}
+				q.queues["test"].ch <- []byte("original")
+				ctx, cancel := context.WithCancel(t.Context())
+				want := context.Canceled
+				if deadline {
+					cancel()
+					ctx, cancel = context.WithTimeout(t.Context(), time.Second)
+					want = context.DeadlineExceeded
+				}
+				defer cancel()
+				result := make(chan error, 1)
+				go func() { result <- q.Publish(ctx, "test", []byte("blocked")) }()
+				synctest.Wait()
+				if deadline {
+					time.Sleep(time.Second)
+				} else {
+					cancel()
+				}
+				synctest.Wait()
+				select {
+				case err := <-result:
+					if !errors.Is(err, want) {
+						t.Fatalf("Publish error = %v, want %v", err, want)
+					}
+				default:
+					t.Fatal("blocked publication ignored canceled context")
+				}
+				if string(<-q.queues["test"].ch) != "original" || len(q.queues["test"].ch) != 0 {
+					t.Fatal("canceled publication changed buffered task")
+				}
+			})
+		})
+	}
+}
+
+func TestMemoryBlockedPublishResumesWhenCapacityReturns(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		q := NewMemoryQueue(testConfig())
+		defer q.Close()
+		buffer := make(chan []byte, 1)
+		q.queues["test"] = &memQueue{ch: buffer}
+		buffer <- []byte("original")
+		payload := []byte("pending")
+		result := make(chan error, 1)
+		go func() { result <- q.Publish(t.Context(), "test", payload) }()
+		synctest.Wait()
+		select {
+		case err := <-result:
+			t.Fatalf("full queue did not block publication: %v", err)
+		default:
+		}
+		if got := string(<-buffer); got != "original" {
+			t.Fatal(got)
+		}
+		if err := <-result; err != nil {
+			t.Fatal(err)
+		}
+		payload[0] = 'X'
+		if got := string(<-buffer); got != "pending" {
+			t.Fatalf("slow publication did not retain its own payload: %q", got)
+		}
+	})
+}
+
+func TestMemoryCloseInterruptsRetryDelay(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		q := NewMemoryQueue(Config{Concurrency: 1, MaxRetries: 3, RetryDelay: time.Hour})
+		defer q.Close()
+		var calls atomic.Int32
+		if err := q.Subscribe("retry", func(context.Context, []byte) error {
+			calls.Add(1)
+			return errors.New("rejected")
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := q.Publish(t.Context(), "retry", []byte("task")); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		start := time.Now()
+		if err := q.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if calls.Load() != 1 || time.Since(start) != 0 {
+			t.Fatalf("shutdown retried or waited for backoff: calls=%d elapsed=%v", calls.Load(), time.Since(start))
+		}
+	})
+}
+
+func TestMemoryCloseReportsBlockedHandler(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		q := NewMemoryQueue(Config{Concurrency: 1, MaxRetries: 1})
+		defer q.Close()
+		entered, release := make(chan struct{}), make(chan struct{})
+		defer func() { close(release); synctest.Wait() }()
+		if err := q.Subscribe("blocked", func(context.Context, []byte) error {
+			close(entered)
+			<-release
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := q.Publish(t.Context(), "blocked", nil); err != nil {
+			t.Fatal(err)
+		}
+		<-entered
+		start := time.Now()
+		err := q.Close()
+		if err == nil || !strings.Contains(err.Error(), "shutdown timed out") || time.Since(start) != shutdownTimeout {
+			t.Fatalf("blocked handler shutdown: err=%v elapsed=%v", err, time.Since(start))
+		}
+	})
+}
+
+func TestMemoryFullDeadLetterQueuePreservesBufferedTask(t *testing.T) {
+	q := NewMemoryQueue(testConfig())
+	defer q.Close()
+	buffer := make(chan []byte, 1)
+	q.queues["failed.dlq"] = &memQueue{ch: buffer}
+	buffer <- []byte("original")
+	q.sendToDLQ("failed", []byte("cannot enqueue"))
+	if got := string(<-buffer); got != "original" || len(buffer) != 0 {
+		t.Fatalf("full development DLQ changed the accepted task: %q", got)
+	}
+}
+
+func BenchmarkMemoryPublishReady(b *testing.B) {
+	for _, cancellable := range []bool{false, true} {
+		for _, size := range []int{32, 4096} {
+			b.Run(fmt.Sprintf("cancel=%v/bytes=%d", cancellable, size), func(b *testing.B) {
+				ctx := context.Background()
+				if cancellable {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithCancel(ctx)
+					defer cancel()
+					_ = ctx.Done()
+				}
+				q := NewMemoryQueue(testConfig())
+				defer q.Close()
+				channel := make(chan []byte, 1)
+				q.queues["test"] = &memQueue{ch: channel}
+				payload := make([]byte, size)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for b.Loop() {
+					if err := q.Publish(ctx, "test", payload); err != nil {
+						b.Fatal(err)
+					}
+					if len(<-channel) != size {
+						b.Fatal("publication changed payload size")
+					}
+				}
+			})
+		}
 	}
 }
 

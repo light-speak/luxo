@@ -213,6 +213,20 @@ func TestToIntUint64Overflow(t *testing.T) {
 	}
 }
 
+func TestToIntUintBoundary(t *testing.T) {
+	input := ^uint(0)
+	got, err := ToInt(input)
+	if uint64(input) > gomath.MaxInt64 {
+		if err == nil || got != 0 {
+			t.Fatalf("ToInt(%d) = %d, %v; want overflow", input, got, err)
+		}
+		return
+	}
+	if err != nil || got != int64(input) {
+		t.Fatalf("ToInt(%d) = %d, %v; want exact value", input, got, err)
+	}
+}
+
 func TestToIntFloat64Rounds(t *testing.T) {
 	v, err := ToInt(float64(1.9))
 	if err != nil {
@@ -252,6 +266,30 @@ func TestToIntFloat64Overflow(t *testing.T) {
 	_, err := ToInt(float64(1e19))
 	if err == nil {
 		t.Error("expected error for float64 overflow")
+	}
+}
+
+func TestToIntFloatBoundary(t *testing.T) {
+	for _, input := range []any{float64(0x1p63), float32(0x1p63), gomath.Nextafter(-0x1p63, gomath.Inf(-1))} {
+		if value, err := ToInt(input); err == nil || value != 0 {
+			t.Errorf("ToInt(%T %v) accepted overflow: value=%d err=%v", input, input, value, err)
+		}
+	}
+	for _, sample := range []struct {
+		input any
+		want  int64
+	}{
+		{gomath.Nextafter(0x1p63, 0), gomath.MaxInt64 - 1023},
+		{float64(-0x1p63), gomath.MinInt64},
+		{float32(-0x1p63), gomath.MinInt64},
+		{gomath.Nextafter(-0x1p63, 0), gomath.MinInt64 + 1024},
+		{gomath.Copysign(0, -1), 0},
+		{0.5, 1},
+		{-0.5, -1},
+	} {
+		if got, err := ToInt(sample.input); err != nil || got != sample.want {
+			t.Errorf("ToInt(%T %v) = %d, %v; want %d", sample.input, sample.input, got, err, sample.want)
+		}
 	}
 }
 

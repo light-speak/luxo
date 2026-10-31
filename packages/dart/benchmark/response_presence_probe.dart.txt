@@ -1,0 +1,132 @@
+// Appended to unchanged before/after transport sources in separate executables.
+const _warmupBatches = 12;
+const _sampleBatches = 20;
+const _dispatchIterations = 5000;
+int _presenceSink = 0;
+
+Future<void> main() async {
+  for (final name in ['small', 'null', 'nested16', 'unicode4K', 'binary']) {
+    await _httpPresence(name);
+  }
+  for (final mode in TransportMode.values) {
+    await _wsPresence(mode);
+    await _dispatchPresence(mode, nullable: false);
+    if (mode == TransportMode.json) await _dispatchPresence(mode, nullable: true);
+  }
+  print('Same classes and call sites; fake HTTP/socket, no allocation, generated-model, error-cleanup or real-network measurement.');
+}
+
+Future<void> _httpPresence(String name) async {
+  final binary = name == 'binary';
+  final payload = switch (name) {
+    'null' => 'null',
+    'nested16' => '[${List.filled(16, '{"id":42,"name":"sample"}').join(',')}]',
+    'unicode4K' => '"${List.filled(350, '发布检查').join()}"',
+    _ => '42',
+  };
+  final bytes = binary ? Uint8List.fromList([42]) : utf8.encode('{"data":$payload}');
+  final client = _PresenceClient(bytes);
+  final transport = HttpTransport('http://unused', client: client,
+      options: TransportOptions(mode: binary ? TransportMode.binary : TransportMode.json));
+  transport.setSchema(const {'echo': APISchemaEntry(7)});
+  final expected = switch (name) { 'null' => 0, 'nested16' => 16, 'unicode4K' => 1400, _ => 42 };
+  try {
+    await _measurePresenceAsync('HTTP/$name', () async {
+      for (var i = 0; i < _iterations; i++) {
+        final value = await transport.call<Object?>('echo');
+        final check = _valueChecksum(value);
+        if (check != expected) throw StateError('Invalid HTTP benchmark result');
+        _presenceSink += check;
+      }
+    });
+    if (client.calls != (_warmupBatches + _sampleBatches) * _iterations) {
+      throw StateError('HTTP operation count changed');
+    }
+  } finally { transport.close(); }
+}
+
+int _valueChecksum(Object? value) {
+  if (value == null) return 0;
+  if (value is Uint8List) return value.single;
+  if (value is List) return value.length;
+  if (value is String) return value.length;
+  if (value == 42) return 42;
+  throw StateError('Unexpected benchmark payload');
+}
+
+WsTransport _presenceTransport(TransportMode mode, _ProbeSocket socket) {
+  final transport = WsTransport('ws://unused', autoReconnect: false,
+      options: TransportOptions(mode: mode));
+  transport._ws = socket;
+  transport._listenWs(socket);
+  transport.setSchema(const {'echo': APISchemaEntry(7)});
+  return transport;
+}
+
+Future<void> _wsPresence(TransportMode mode) async {
+  final socket = _ProbeSocket();
+  final transport = _presenceTransport(mode, socket);
+  try {
+    await _measurePresenceAsync('WS/unary/${mode.name}', () => _unary(() => transport.call<Object>('echo')));
+    await _measurePresenceAsync('WS/setup-ack-cancel/${mode.name}', () => _subscribe(() =>
+        transport.subscribe('echo', {}, (_) => throw StateError('Unexpected data'), decoder: (value) => value)));
+    final count = (_warmupBatches + _sampleBatches) * _iterations;
+    if (socket.calls != count || socket.starts != count || socket.cancels != count ||
+        transport._subscriptions.isNotEmpty || transport._pending.isNotEmpty) {
+      throw StateError('WS lifecycle operations did not finish');
+    }
+  } finally { transport.close(); }
+}
+
+Future<void> _dispatchPresence(TransportMode mode, {required bool nullable}) async {
+  final socket = _ProbeSocket();
+  final transport = _presenceTransport(mode, socket);
+  var received = 0;
+  final cancel = await transport.subscribe<Object?>('echo', {}, (value) {
+    if (nullable ? value != null : _valueChecksum(value) != 42) throw StateError('Unexpected stream data');
+    received++;
+  }, decoder: (value) => value);
+  try {
+    if (transport._subscriptions.keys.single != 1) throw StateError('Unexpected subscription ID');
+    final frame = mode == TransportMode.binary ? Uint8List.fromList([0x12, 1, 42])
+        : '{"\$stream":1,"data":${nullable ? 'null' : '42'}}';
+    void run() { for (var i = 0; i < _dispatchIterations; i++) { socket.deliver(frame); } }
+    for (var i = 0; i < _warmupBatches; i++) { run(); }
+    final samples = <double>[];
+    for (var i = 0; i < _sampleBatches; i++) {
+      final start = clock.nowNanoseconds(); run();
+      samples.add((clock.nowNanoseconds() - start) / _dispatchIterations);
+    }
+    if (received != (_warmupBatches + _sampleBatches) * _dispatchIterations) {
+      throw StateError('Lost stream messages');
+    }
+    _reportPresence('WS/dispatch/${mode.name}/null=$nullable', samples);
+  } finally { cancel(); transport.close(); }
+}
+
+Future<void> _measurePresenceAsync(String label, Future<void> Function() operation) async {
+  for (var i = 0; i < _warmupBatches; i++) { await operation(); }
+  final samples = <double>[];
+  for (var i = 0; i < _sampleBatches; i++) {
+    final start = clock.nowNanoseconds(); await operation();
+    samples.add((clock.nowNanoseconds() - start) / _iterations);
+  }
+  _reportPresence(label, samples);
+}
+
+void _reportPresence(String label, List<double> samples) {
+  samples.sort();
+  print(jsonEncode({'name': label, 'medianNs': (samples[9] + samples[10]) / 2,
+    'minNs': samples.first, 'maxNs': samples.last, 'sink': _presenceSink}));
+}
+
+class _PresenceClient extends http.BaseClient {
+  final Uint8List bytes;
+  int calls = 0;
+  _PresenceClient(this.bytes);
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    calls++;
+    return http.StreamedResponse(Stream.value(bytes), 200);
+  }
+}

@@ -1,0 +1,73 @@
+import { LuxoClient } from './client.js'
+import { decodeJSONMetric, decodeJSONTextValues } from './types.js'
+import { encodeLuxoJSON } from '@luxojs/client'
+import { responseTransport } from './response-transport.js'
+
+let response: unknown
+const transport = responseTransport(() => response)
+const client = new LuxoClient(transport)
+const failures: string[] = []
+
+async function reject(label: string, read: () => unknown | Promise<unknown>): Promise<void> {
+  try { await read(); failures.push(label) }
+  catch (error) { if (!(error instanceof TypeError)) throw error }
+}
+
+async function verifyInvalidLists(): Promise<void> {
+  for (const rows of [Array<unknown>(2), { map: () => [{ id: 1n }] }, {}, 'not an array']) {
+    response = rows
+    await reject('non-array or sparse list bypassed validation', () => client.metricRows({ $select: 'id' }))
+    response = { items: rows, total: 1n, page: 1n, pageSize: 1n }
+    await reject('non-array or sparse page bypassed validation', () => client.listMetrics({ $select: 'id' }))
+  }
+  const badRows: unknown[] = [{}, { unknown: true }, Object.create({ id: 1n }) as unknown, [], [1], Object.assign([], { id: 1n }), null, 7, 'text']
+  for (const row of badRows) {
+    for (const rows of [[row], [{ id: 1n }, row], [row, { id: 1n }], [{ id: 1n }, row, { id: 2n }]]) {
+      response = rows
+      await reject('ordinary list accepted a fieldless/non-object row', () => client.metricRows({ $select: 'id' }))
+      await reject('list stream delivered a fieldless/non-object row', () => client.subscribeLiveMetricRows({ $select: 'id' }, () => {
+        failures.push('invalid stream reached onData')
+      }))
+      response = { items: rows, total: 3n, page: 1n, pageSize: 3n }
+      await reject('page accepted a fieldless/non-object row', () => client.listMetrics({ $select: 'id' }))
+    }
+  }
+  for (const children of [[{}], [{ enabled: true }, {}], [{ unknown: 1 }]]) {
+    for (const row of [{ children }, { child: { children } }, { children: [{ children }] }]) {
+      await reject('nested type list accepted a fieldless row', () => decodeJSONTextValues(row))
+    }
+  }
+}
+
+async function verifyValidLists(): Promise<void> {
+  for (const rows of [[], [{ duration: null }], [{ counts: [] }], [{ id: 1n }, { duration: null }]]) {
+    response = rows
+    const actual = await client.metricRows({ $select: 'id, duration, counts' })
+    if (encodeLuxoJSON(actual) !== encodeLuxoJSON(rows)) throw new Error('Valid projection changed')
+    let received = 0
+    const cancel = await client.subscribeLiveMetricRows({ $select: 'id, duration, counts' }, data => {
+      received++
+      if (encodeLuxoJSON(data) !== encodeLuxoJSON(rows)) throw new Error('Valid stream changed')
+    })
+    cancel()
+    if (received !== 1) throw new Error('Valid stream was not delivered')
+    response = { items: rows, total: BigInt(rows.length), page: 1n, pageSize: 3n }
+    const page = await client.listMetrics({ $select: 'id, duration, counts' })
+    if (encodeLuxoJSON(page.items) !== encodeLuxoJSON(rows)) throw new Error('Valid page changed')
+  }
+  for (const row of [{ children: [] }, { children: [{ state: null }] }, { child: {} }, { children: [{ child: {} }, { children: [] }] }]) {
+    if (encodeLuxoJSON(decodeJSONTextValues(row)) !== encodeLuxoJSON(row)) throw new Error('Valid nested projection changed')
+  }
+  // Singleton empty selections and generic JSON are not model-list elements.
+  if (encodeLuxoJSON(decodeJSONMetric({})) !== '{}') throw new Error('Singleton behavior changed')
+  if (encodeLuxoJSON([{}, { duration: null }].map(decodeJSONMetric)) !== '[{},{"duration":null}]') throw new Error('Decoder map callback compatibility changed')
+  response = [{}, null, { unknown: [] }]
+  if (encodeLuxoJSON(await client.getJSONList()) !== '[{},null,{"unknown":[]}]') throw new Error('Generic JSON was restricted')
+}
+
+async function main(): Promise<void> {
+  await verifyInvalidLists()
+  await verifyValidLists()
+  if (failures.length) throw new Error(`${failures.length} projection failures: ${failures.slice(0, 10).join('; ')}`)
+}
+void main().catch(error => { throw error })

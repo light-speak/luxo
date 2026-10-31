@@ -5,11 +5,7 @@ package queue
 
 import (
 	"context"
-	"fmt"
-	"os"
 	"time"
-
-	"github.com/light-speak/luxo/pkg/lux/env"
 )
 
 // Queue is the interface for publishing and consuming tasks.
@@ -31,10 +27,13 @@ type Queue interface {
 // Handler processes a task payload.
 type Handler func(ctx context.Context, payload []byte) error
 
+// DeadLetterSuffix names the portable dead-letter destination of a task queue.
+const DeadLetterSuffix = ".dlq"
+
 // Config controls queue behavior.
 type Config struct {
 	MaxRetries  int           // maximum delivery attempts (default 3)
-	RetryDelay  time.Duration // base delay before retry, doubled each attempt (default 5s)
+	RetryDelay  time.Duration // base retry delay, doubled each attempt (default 5s; NATS caps at 1m)
 	Concurrency int           // concurrent workers per queue (default 4)
 }
 
@@ -47,8 +46,8 @@ func DefaultConfig() Config {
 	}
 }
 
-// validate fills zero-value fields with defaults.
-func (c *Config) validate() {
+// SetDefaults fills zero-value fields with defaults.
+func (c *Config) SetDefaults() {
 	if c.MaxRetries <= 0 {
 		c.MaxRetries = 3
 	}
@@ -58,20 +57,4 @@ func (c *Config) validate() {
 	if c.Concurrency <= 0 {
 		c.Concurrency = 4
 	}
-}
-
-// NewFromEnv creates a Queue based on environment configuration.
-// If NATS_URL is set, connects to NATS JetStream (falls back to MemoryQueue on failure).
-// Otherwise uses MemoryQueue.
-func NewFromEnv(cfg Config) Queue {
-	cfg.validate()
-	if natsURL, ok := env.Get("NATS_URL"); ok {
-		q, err := NewNATSQueue(natsURL, cfg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: NATS JetStream connect failed, using memory queue: %v\n", err)
-			return NewMemoryQueue(cfg)
-		}
-		return q
-	}
-	return NewMemoryQueue(cfg)
 }

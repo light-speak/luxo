@@ -17,12 +17,12 @@ var (
 
 // ChanBus implements Bus using Go channels.
 // Zero external dependencies — used in embedded (single-process) mode.
-// Payloads are passed directly as Go values — zero serialization.
+// Payloads use static owned snapshots — no serialization round trip.
 type ChanBus struct {
 	mu       sync.RWMutex
 	subs     map[string][]Handler
 	bufSize  int
-	channels map[string]chan any
+	channels map[string]chan Snapshot
 	done     chan struct{}
 	once     sync.Once
 	wg       sync.WaitGroup
@@ -37,7 +37,7 @@ func NewChanBus(bufSize int) *ChanBus {
 	return &ChanBus{
 		subs:     make(map[string][]Handler),
 		bufSize:  bufSize,
-		channels: make(map[string]chan any),
+		channels: make(map[string]chan Snapshot),
 		done:     make(chan struct{}),
 	}
 }
@@ -46,6 +46,10 @@ var _ Bus = (*ChanBus)(nil)
 
 // Emit publishes an event without blocking. Accepted events are drained during Close.
 func (b *ChanBus) Emit(ctx context.Context, name string, payload any) error {
+	owned, err := captureSnapshot(payload)
+	if err != nil {
+		return err
+	}
 	b.mu.RLock()
 	select {
 	case <-b.done:
@@ -61,7 +65,7 @@ func (b *ChanBus) Emit(ctx context.Context, name string, payload any) error {
 	}
 
 	select {
-	case ch <- payload:
+	case ch <- owned:
 		b.mu.RUnlock()
 		return nil
 	default:
@@ -83,7 +87,7 @@ func (b *ChanBus) On(name string, handler Handler) error {
 	b.subs[name] = append(b.subs[name], handler)
 
 	if _, ok := b.channels[name]; !ok {
-		ch := make(chan any, b.bufSize)
+		ch := make(chan Snapshot, b.bufSize)
 		b.channels[name] = ch
 		// Start dispatcher for this event
 		b.wg.Add(1)
@@ -100,24 +104,32 @@ func (b *ChanBus) OnQueue(name string, group string, handler Handler) error {
 }
 
 // dispatch reads from the channel and calls all handlers for the event.
-func (b *ChanBus) dispatch(name string, ch <-chan any) {
+func (b *ChanBus) dispatch(name string, ch <-chan Snapshot) {
 	defer b.wg.Done()
 	for payload := range ch {
 		b.mu.RLock()
 		handlers := b.subs[name]
 		b.mu.RUnlock()
 
-		for _, h := range handlers {
-			if err := safeCall(h, bgCtx, payload); err != nil {
+		for index, h := range handlers {
+			// The final listener receives ownership of the original snapshot.
+			// Earlier listeners receive independent copies, never shared aliases.
+			var value any
+			if index+1 == len(handlers) {
+				value = payload.takePayload()
+			} else {
+				value = payload.copyPayload()
+			}
+			if err := InvokeHandler(h, context.Background(), value); err != nil {
 				fmt.Fprintf(os.Stderr, "event %s handler error: %v\n", name, err)
 			}
 		}
 	}
 }
 
-// safeCall calls handler with panic recovery to prevent one handler from killing the dispatcher.
+// InvokeHandler calls handler with panic recovery to prevent one handler from killing the dispatcher.
 // Returns the handler's error, or a panic-wrapped error if the handler panicked.
-func safeCall(h Handler, ctx context.Context, payload any) (err error) {
+func InvokeHandler(h Handler, ctx context.Context, payload any) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("event handler panic: %v", r)

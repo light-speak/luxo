@@ -1,0 +1,78 @@
+const _iterations = 1000;
+
+Future<void> _unary(Future<Object> Function() call) async {
+  for (var i = 0; i < _iterations; i++) {
+    final result = await call();
+    if (result is Uint8List ? result.single != 42 : result != 42) {
+      throw StateError('Unexpected unary response');
+    }
+  }
+}
+
+Future<void> _subscribe(Future<void Function()> Function() start) async {
+  for (var i = 0; i < _iterations; i++) {
+    final stop = await start();
+    stop();
+  }
+}
+
+Future<void> _compareAsync(String label, Future<void> Function() before, Future<void> Function() after) async {
+  for (var i = 0; i < 12; i++) { await before(); await after(); }
+  final oldTimes = <double>[];
+  final newTimes = <double>[];
+  Future<void> measure(Future<void> Function() run, List<double> samples) async {
+    final start = clock.nowNanoseconds();
+    await run();
+    samples.add((clock.nowNanoseconds() - start) / _iterations);
+  }
+  for (var i = 0; i < 20; i++) {
+    if (i.isEven) { await measure(before, oldTimes); await measure(after, newTimes); }
+    else { await measure(after, newTimes); await measure(before, oldTimes); }
+  }
+  String stats(List<double> values) {
+    values.sort();
+    final median = (values[9] + values[10]) / 2;
+    return '${median.toStringAsFixed(2)} [${values.first.toStringAsFixed(2)}, ${values.last.toStringAsFixed(2)}]';
+  }
+  print('$label: before=${stats(oldTimes)} after=${stats(newTimes)} ns/op');
+}
+
+class _ProbeSocket implements LuxoSocket {
+  final _messages = StreamController<Object>(sync: true);
+  int calls = 0;
+  int starts = 0;
+  int cancels = 0;
+  @override
+  Stream<Object> get messages => _messages.stream;
+
+  @override
+  void add(Object data) {
+    if (data is String) {
+      final request = decodeLuxoJSON(data) as Map<String, dynamic>;
+      if (request.containsKey(r'$unsub')) { cancels++; return; }
+      final subscription = request.containsKey(r'$sub');
+      if (subscription) starts++; else calls++;
+      final id = request[r'$id'];
+      _messages.add(subscription ? '{"\$sub":$id,"ok":true}' : '{"\$id":$id,"data":42}');
+    } else {
+      final decoder = LuxoDecoder(data as Uint8List);
+      if (!decoder.nextField()) throw StateError('Missing request tag');
+      final tag = decoder.fieldID;
+      if (!decoder.nextField()) throw StateError('Missing small request ID');
+      final id = decoder.fieldID;
+      if (tag == BinaryFrameType.unsubscribe) { cancels++; return; }
+      final subscription = tag == BinaryFrameType.subscribe;
+      if (subscription) starts++; else calls++;
+      final response = LuxoEncoder()
+        ..writeVarint(subscription ? BinaryFrameType.subscribeSuccess : BinaryFrameType.callSuccess)
+        ..writeVarint(id);
+      if (!subscription) response.writeRawBytes(Uint8List.fromList([42]));
+      _messages.add(response.bytes());
+    }
+  }
+
+  void deliver(Object data) => _messages.add(data);
+
+  @override
+  Future<void> close() => _messages.close();
+}

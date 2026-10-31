@@ -8,6 +8,34 @@ import (
 	"github.com/light-speak/luxo/pkg/token"
 )
 
+func TestFunctionParameterRejectsLambdaValue(t *testing.T) {
+	for _, signature := range []string{
+		`fn take(value: Int): Int { return value }`,
+		`fn take(value: Int?): Int { return 1 }`,
+		`fn take(value: [Int]): Int { return 1 }`,
+		`fn take(value: Int): Int @native`,
+	} {
+		t.Run(signature, func(t *testing.T) {
+			result := analyze(t, signature+"\nfn run(): Int { return take { value -> 1 } }")
+			expectError(t, result, "lambda cannot be passed")
+		})
+	}
+}
+
+func TestInferredModelLookupUsesSharedPluralNames(t *testing.T) {
+	for name, plural := range map[string]string{
+		"TimeEntry": "TimeEntries", "Address": "Addresses", "Box": "Boxes", "Quiz": "Quizes", "Gateway": "Gateways",
+	} {
+		analyzer := newAnalyzer()
+		model := &ResolvedType{Kind: TypeModel, Name: name}
+		analyzer.types[name] = model
+		matched, resolved := analyzer.findModelInName(plural + "ById")
+		if matched != plural || resolved != model {
+			t.Errorf("%s: matched %q, resolved %v", plural, matched, resolved)
+		}
+	}
+}
+
 func TestAnalyzerBodyEdgeCases(t *testing.T) {
 	analyzer := newAnalyzer()
 	if got := analyzer.symbolReturnType("missing"); got != nil {
@@ -350,7 +378,7 @@ api test(): Boolean {
   x
 }
 `)
-	expectError(t, result, "requires Boolean")
+	expectError(t, result, "requires non-null Boolean")
 }
 
 func TestComparisonOp(t *testing.T) {
@@ -649,6 +677,243 @@ api count(): Int {
 `)
 	expectError(t, result, "must be consumed directly with '?'")
 	expectError(t, result, "must be applied directly")
+}
+
+func TestFunctionCallAcceptsNamedArgumentsAndDefaults(t *testing.T) {
+	result := analyze(t, `
+fn format(label: String, count: Int = 2): String { label }
+api display(): String { format(count: 3, label: "ready") }
+`)
+	expectNoErrors(t, result)
+}
+
+func TestCompiledFunctionCanCallNativeFunction(t *testing.T) {
+	result := analyze(t, `
+fn loadBaseScore(projectId: Int, adjustment: Int = 4): Result<Int> @native
+fn evaluateScore(projectId: Int): Int {
+  loadBaseScore(adjustment: 3, projectId: projectId)? + 1
+}
+api releaseScore(projectId: Int): Int { evaluateScore(projectId) }
+`)
+	expectNoErrors(t, result)
+}
+
+func TestCompiledFunctionCanCallVoidNativeFunction(t *testing.T) {
+	result := analyze(t, `
+fn recordAudit(action: String) @native
+fn recordRelease() { recordAudit("release") }
+api release(): Boolean {
+  recordRelease()
+  return true
+}
+`)
+	expectNoErrors(t, result)
+}
+
+func TestFunctionCallAcceptsVariadicArguments(t *testing.T) {
+	result := analyze(t, `
+fn join(prefix: String, ...values: String): String { prefix }
+api display(): String { join("release", "ready", "now") }
+`)
+	expectNoErrors(t, result)
+}
+
+func TestFunctionDeclarationRejectsInvalidVariadicParameters(t *testing.T) {
+	tests := []struct {
+		name    string
+		params  string
+		message string
+	}{
+		{name: "not last", params: "...values: String, suffix: String", message: "variadic parameter 'values' must be last"},
+		{name: "default", params: `...values: String = "ready"`, message: "variadic parameter 'values' cannot have a default value"},
+		{name: "multiple", params: "...first: String, ...second: String", message: "only one variadic parameter is allowed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := analyze(t, "fn join("+tt.params+"): String { \"ready\" }")
+			expectError(t, result, tt.message)
+		})
+	}
+}
+
+func TestFunctionDeclarationRequiresOneExecutableBoundary(t *testing.T) {
+	tests := []struct {
+		name    string
+		source  string
+		message string
+	}{
+		{name: "missing body", source: "fn helper(): Int", message: "fn 'helper' must declare a Luxo body or use @native"},
+		{name: "service missing body", source: "fn helper(): Int @service", message: "fn 'helper' must declare a Luxo body or use @native"},
+		{name: "native with body", source: "fn helper(): Result<Int> @native { 1 }", message: "@native fn 'helper' cannot declare a Luxo body"},
+		{name: "private auth", source: "fn helper(): Int @auth { 1 }", message: "@auth on fn 'helper' requires @service"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := analyze(t, tt.source)
+			expectError(t, result, tt.message)
+		})
+	}
+}
+
+func TestNativeAPICannotDeclareLuxoBody(t *testing.T) {
+	result := analyze(t, "api helper(): Int @native { 1 }")
+	expectError(t, result, "@native API cannot declare a Luxo body")
+}
+
+func TestAPICannotDeclareVariadicParameter(t *testing.T) {
+	result := analyze(t, "api sum(...values: Int): Int @native")
+	expectError(t, result, "API parameter 'values' cannot be variadic; use [Int]")
+}
+
+func TestFunctionCallCannotBypassServiceBoundary(t *testing.T) {
+	result := analyze(t, `
+fn remoteScore(projectId: Int): Int @service { projectId }
+api score(projectId: Int): Int { remoteScore(projectId) }
+`)
+	expectError(t, result, "@service fn 'remoteScore' cannot be called as a local function")
+}
+
+func TestCallableParametersRejectDuplicateNames(t *testing.T) {
+	tests := []struct {
+		name    string
+		source  string
+		message string
+	}{
+		{name: "API", source: "api lookup(id: Int, id: Int): Int @native", message: "duplicate parameter 'id' in API 'lookup'"},
+		{name: "function", source: "fn add(value: Int, value: Int): Int { value }", message: "duplicate parameter 'value' in fn 'add'"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := analyze(t, tt.source)
+			expectError(t, result, tt.message)
+		})
+	}
+}
+
+func TestLogicalOperatorsRequireNonNullBoolean(t *testing.T) {
+	for _, expression := range []string{
+		`1 && true`, `false || "yes"`, `[true] && true`, `false || [false]`,
+		`nullable && true`, `false || nullable`, `!nullable`, `![true]`,
+	} {
+		t.Run(expression, func(t *testing.T) {
+			result := analyze(t, `api invalid(nullable: Boolean?): Boolean {
+ return `+expression+`
+}`)
+			expectError(t, result, "requires non-null Boolean")
+		})
+	}
+}
+
+func TestLogicalOperatorsPreserveValidBooleanExpressions(t *testing.T) {
+	for _, expression := range []string{`left && right`, `left || !right`, `!(left && right)`, `left == right || left != right`} {
+		t.Run(expression, func(t *testing.T) {
+			expectNoErrors(t, analyze(t, `api valid(left: Boolean, right: Boolean): Boolean {
+ return `+expression+`
+}`))
+		})
+	}
+	expectNoErrors(t, analyze(t, `api narrowed(value: Boolean?): Boolean {
+ if value != null { return !value }
+ return false
+}`))
+	for _, expression := range []string{`value != null && value`, `value == null || !value`, `null != value && !value`, `!(value == null) && value`} {
+		t.Run(expression, func(t *testing.T) {
+			expectNoErrors(t, analyze(t, `api guarded(value: Boolean?): Boolean { return `+expression+` }`))
+		})
+	}
+	expectNoErrors(t, analyze(t, `api compared(value: Boolean): Boolean {
+ if value != false { return !value }
+ return false
+}`))
+	expectNoErrors(t, analyze(t, `type Box { enabled: Boolean? }
+api present(box: Box): Boolean {
+ if box.enabled != null { return true }
+ return false
+}`))
+}
+
+func TestConditionalNarrowingDoesNotLeak(t *testing.T) {
+	for _, body := range []string{
+		`if value != null { val copy = !value } return !value`,
+		`if value == null { return !value } return false`,
+		`return value != null || value`,
+		`return value == null && value`,
+		`if value != null { val value: Boolean? = null return !value } return false`,
+		`var copy = value if copy != null { copy = null return !copy } return false`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			expectError(t, analyze(t, `api invalid(value: Boolean?): Boolean { `+body+` }`), "requires non-null Boolean")
+		})
+	}
+}
+
+func TestIfConditionRequiresNonNullBoolean(t *testing.T) {
+	for _, expression := range []string{`1`, `"yes"`, `[true]`, `value`} {
+		t.Run(expression, func(t *testing.T) {
+			expectError(t, analyze(t, `api invalid(value: Boolean?): Boolean { if `+expression+` { return true } return false }`), "requires non-null Boolean")
+		})
+	}
+}
+
+func TestCallableParameterDefaultsMustBeStaticAndTyped(t *testing.T) {
+	tests := []struct {
+		name    string
+		source  string
+		message string
+	}{
+		{name: "API type mismatch", source: `api lookup(limit: Int = "all"): Int @native`, message: "default value for parameter 'limit' expects 'Int', got 'String'"},
+		{name: "function type mismatch", source: `fn label(value: String = 1): String { value }`, message: "default value for parameter 'value' expects 'String', got 'Int'"},
+		{name: "runtime expression", source: `fn add(value: Int = now()): Int { value }`, message: "default value for parameter 'value' must be a compile-time constant"},
+		{name: "member runtime expression", source: `fn add(value: Int = now().second): Int { value }`, message: "default value for parameter 'value' must be a compile-time constant"},
+		{name: "null non-nullable", source: `fn label(value: String = null): String { value }`, message: "default value for parameter 'value' expects 'String', got 'null'"},
+		{name: "wrong enum", source: `enum Mode { FAST } enum State { READY } fn mode(value: Mode = State.READY): Mode { value }`, message: "default value for parameter 'value' expects 'Mode', got 'State'"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := analyze(t, tt.source)
+			expectError(t, result, tt.message)
+		})
+	}
+}
+
+func TestCallableParameterDefaultsAcceptSupportedConstants(t *testing.T) {
+	result := analyze(t, `
+enum Mode { FAST }
+fn configure(
+  retries: Int = -1,
+  ratio: Float = 0.5,
+  label: String = "ready",
+  enabled: Boolean = true,
+  timeout: Duration = 5s,
+  mode: Mode = Mode.FAST,
+  note: String? = null
+): Int { retries }
+`)
+	expectNoErrors(t, result)
+}
+
+func TestFunctionCallRejectsInvalidArguments(t *testing.T) {
+	tests := []struct {
+		name    string
+		call    string
+		message string
+	}{
+		{name: "missing required", call: "format(count: 3)", message: "missing required argument 'label'"},
+		{name: "unknown named", call: `format(label: "ready", other: 3)`, message: "unknown argument 'other'"},
+		{name: "duplicate named", call: `format(label: "ready", label: "again")`, message: "duplicate argument 'label'"},
+		{name: "wrong type", call: "format(label: 1)", message: "argument 'label' expects 'String', got 'Int'"},
+		{name: "too many positional", call: `format("ready", 2, 3)`, message: "expects at most 2 argument(s), got 3"},
+		{name: "positional after named", call: `format(count: 3, "ready")`, message: "positional argument cannot follow named arguments"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := analyze(t, `
+fn format(label: String, count: Int = 2): String { label }
+api display(): String { `+tt.call+` }
+`)
+			expectError(t, result, tt.message)
+		})
+	}
 }
 
 func TestBinaryIn(t *testing.T) {
@@ -1128,6 +1393,23 @@ api transform(items: [Int]): [Int] {
 	mapped := body.Stmts[1].(*ast.ValStmt).Value
 	if mapped.GetTypeTag() != "Int" || !mapped.IsListType() || mapped.IsNullable() {
 		t.Fatalf("mapped for type = %s list=%v nullable=%v, want [Int]", mapped.GetTypeTag(), mapped.IsListType(), mapped.IsNullable())
+	}
+}
+
+func TestNestedYieldBelongsToNearestForExpression(t *testing.T) {
+	result := analyze(t, `
+api mapped(items: [Int]): [Int] {
+  val results = for item in items {
+    val inner = for candidate in [item] { yield candidate }
+    inner ?: 0
+  }
+  results
+}
+`)
+	expectNoErrors(t, result)
+	outer := result.Files[0].APIs[0].Body.Stmts[0].(*ast.ValStmt).Value
+	if outer.GetTypeTag() != "Int" || !outer.IsListType() || outer.IsNullable() {
+		t.Fatalf("outer type = %s list=%v nullable=%v", outer.GetTypeTag(), outer.IsListType(), outer.IsNullable())
 	}
 }
 
@@ -1774,6 +2056,45 @@ func TestTemplateStringExpr(t *testing.T) {
 	if len(result.Errors) > 0 {
 		t.Errorf("unexpected errors: %v", result.Errors)
 	}
+}
+
+func TestTemplateInterpolationContract(t *testing.T) {
+	for _, name := range []string{"String", "Int", "Float", "Boolean", "DateTime", "Duration", "UUID", "Decimal", "Status"} {
+		t.Run(name, func(t *testing.T) {
+			source := "enum Status { READY }\napi render(value: " + name + "): String { \"value=${value}\" }"
+			expectNoErrors(t, analyze(t, source))
+		})
+	}
+	for _, name := range []string{"String?", "Int?", "Status?", "[String]", "[Int]", "[Status]", "Bytes", "JSON", "Snapshot", "Record"} {
+		t.Run("reject/"+name, func(t *testing.T) {
+			source := "enum Status { READY }\ntype Snapshot { id: Int }\nmodel Record { id: Int @id }\napi render(value: " + name + "): String { \"value=${value}\" }"
+			expectError(t, analyze(t, source), "template interpolation requires a non-null scalar or enum")
+		})
+	}
+	for _, expression := range []string{"null", "[1, 2]", "Snapshot { id: 1 }", "\"a,b\".split(\",\")"} {
+		t.Run(expression, func(t *testing.T) {
+			expectError(t, analyze(t, "type Snapshot { id: Int }\napi render(): String { \"value=${"+expression+"}\" }"), "template interpolation requires a non-null scalar or enum")
+		})
+	}
+	expectNoErrors(t, analyze(t, `api render(value: String?): String { "value=${value ?: "missing"}" }`))
+	expectNoErrors(t, analyze(t, `api render(value: Int?): String { if value != null { return "value=${value}" } return "missing" }`))
+	expectError(t, analyze(t, `api render(): String { "value=${missing}" }`), "undefined")
+}
+
+func TestDefaultValueDoesNotNarrowOriginal(t *testing.T) {
+	expectError(t, analyze(t, `api render(): String { return missing ?: "fallback" }`), "undefined")
+	expectError(t, analyze(t, `api render(value: String?): String { return value ?: missing }`), "undefined")
+	expectError(t, analyze(t, `api render(value: String?): String {
+ val display = value ?: "missing"
+ return "${display}|${value}"
+}`), "template interpolation requires a non-null scalar or enum")
+	expectError(t, analyze(t, `api render(value: String?): String { return value ?: 42 }`), "default value type mismatch")
+	expectError(t, analyze(t, `api render(value: String?, fallback: String?): String { return "${value ?: fallback}" }`), "template interpolation requires a non-null scalar or enum")
+	expectNoErrors(t, analyze(t, `api render(value: String?): String { value ?: throw error.NotFound return "${value}" }`))
+	expectError(t, analyze(t, `api render(value: String?, other: String?): String {
+ val display = value ?: (other ?: throw error.NotFound)
+ return "${display}|${other}"
+}`), "template interpolation requires a non-null scalar or enum")
 }
 
 func TestTemplateStringDirect(t *testing.T) {

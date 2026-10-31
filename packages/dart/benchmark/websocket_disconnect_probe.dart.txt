@@ -1,0 +1,81 @@
+Future<void> main() async {
+  for (final mode in TransportMode.values) {
+    final options = TransportOptions(mode: mode);
+    final before = _BeforeTransport('ws://unused', options: options, autoReconnect: false);
+    final after = WsTransport('ws://unused', options: options, autoReconnect: false);
+    final oldSocket = _ProbeSocket();
+    final newSocket = _ProbeSocket();
+    before._ws = oldSocket;
+    after._ws = newSocket;
+    before._listenWs(oldSocket);
+    after._listenWs(newSocket);
+    const schema = {'echo': APISchemaEntry(7)};
+    before.setSchema(schema);
+    after.setSchema(schema);
+    await _compareAsync('$mode unary fake-socket',
+        () => _unary(() => before.call<Object>('echo')), () => _unary(() => after.call<Object>('echo')));
+    await _compareAsync('$mode subscribe ACK cancel fake-socket',
+        () => _subscribe(() => before.subscribe('echo', {}, (_) => throw StateError('Unexpected data'))),
+        () => _subscribe(() => after.subscribe('echo', {}, (_) => throw StateError('Unexpected data'), decoder: (value) => value)));
+    if (oldSocket.calls != newSocket.calls || oldSocket.starts != newSocket.starts ||
+        oldSocket.cancels != newSocket.cancels || oldSocket.starts != oldSocket.cancels ||
+        before._pending.isNotEmpty || after._pending.isNotEmpty ||
+        before._subscriptions.isNotEmpty || after._subscriptions.isNotEmpty) {
+      throw StateError('Lifecycle operations did not finish equally');
+    }
+    before.close(); after.close();
+    _compareDispatch(mode);
+  }
+  for (final count in [1, 8, 64]) _measureRetirement(count);
+  print('Normal paths compare the supplied frozen transport with current code.');
+  print('Retirement columns are current silent/notifying absolute costs, not old/new.');
+  print('No network, handshake, browser-device or allocation measurement.');
+}
+
+void _compareDispatch(TransportMode mode) {
+  final before = _BeforeTransport('ws://unused', autoReconnect: false);
+  final after = WsTransport('ws://unused', autoReconnect: false);
+  var oldCount = 0;
+  var newCount = 0;
+  before._subscriptions[1] = _BeforeSubscription('echo', mode, {}, (_) => oldCount++, null);
+  after._subscriptions[1] = _Subscription(mode, (value) => value, (_) => newCount++, null);
+  const json = '{"\$stream":1,"data":42}';
+  final binary = Uint8List.fromList([0x12, 1, 42]);
+  int oldRun() {
+    for (var i = 0; i < 5000; i++) {
+      if (mode == TransportMode.json) before._handleJsonResponse(json);
+      else before._handleBinaryResponse(binary);
+    }
+    return oldCount;
+  }
+  int newRun() {
+    for (var i = 0; i < 5000; i++) {
+      if (mode == TransportMode.json) after._handleJsonResponse(json);
+      else after._handleBinaryResponse(binary);
+    }
+    return newCount;
+  }
+  benchmark.compareBenchmarks('$mode data dispatch', oldRun, newRun, iterations: 5000, includeRange: true);
+  if (oldCount != newCount) throw StateError('Dispatch counts differ');
+  before.close(); after.close();
+}
+
+void _measureRetirement(int count) {
+  final transport = WsTransport('ws://unused', autoReconnect: false);
+  final error = LuxoError('NetworkError', 0, 'WebSocket closed');
+  var observed = 0;
+  final subscription = _Subscription(TransportMode.json, (value) => value, (_) {}, null, onError: (_) => observed++);
+  int run(bool notify) {
+    for (var i = 0; i < _iterations; i++) {
+      for (var id = 1; id <= count; id++) transport._subscriptions[id] = subscription;
+      final retired = transport._retirePending(error);
+      if (notify) {
+        for (final sub in retired.values) Zone.current.runUnaryGuarded(sub.onError!, error);
+      }
+    }
+    return observed;
+  }
+  benchmark.compareBenchmarks('retire $count silent/notifying (absolute)',
+      () => run(false), () => run(true), iterations: _iterations, includeRange: true);
+  transport.close();
+}

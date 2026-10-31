@@ -158,9 +158,8 @@ func (s *DocumentStore) analyzeAll() {
 		}
 	}
 
-	// Phase 2: semantic analysis across all files together with module isolation
-	a := semantic.New()
-	semResult := a.AnalyzeWithModules(files)
+	// Phase 2: analyze each project independently with its own policy catalog.
+	semResults := analyzeProjects(files)
 
 	// Write all results under lock to avoid races with server goroutine
 	s.mu.Lock()
@@ -169,7 +168,7 @@ func (s *DocumentStore) analyzeAll() {
 		doc.lexErrors = results[i].lexErrs
 		doc.File = results[i].file
 		doc.parseErrors = results[i].parseErrs
-		doc.Result = semResult
+		doc.Result = semResults[results[i].file]
 	}
 	s.mu.Unlock()
 

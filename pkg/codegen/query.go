@@ -11,13 +11,16 @@ import (
 // luxImport is the import path for the Luxo runtime package.
 const luxImport = "github.com/light-speak/luxo/pkg/lux"
 
+// modelTableName is shared by queries, migrations and mutation declarations.
+func modelTableName(name string) string { return str.ToSnakeCase(name) + "s" }
+
 // generateQueryBuilder generates the type-safe query builder for a model.
 // Uses runtime generics (lux.Query[T], lux.CreateBase[T], lux.UpdateBase[T])
 // to minimize generated code — only scanner, client, fields, where, and
 // typed Set methods are generated per model.
 func generateQueryBuilder(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
 	name := m.Name
-	tableName := str.ToSnakeCase(name) + "s" // simple pluralize
+	tableName := modelTableName(name)
 	soft := isSoftDelete(m)
 
 	// @soft: ensure deletedAt field exists for scanner/struct generation
@@ -38,9 +41,9 @@ func generateQueryBuilder(b *strings.Builder, m *ast.ModelDecl, enums map[string
 	generateClient(b, name, tableName, dbFields, soft)
 	generateFieldConstants(b, name, dbFields)
 	generateWhereFields(b, name, dbFields)
-	generateCreateBuilder(b, name, dbFields)
-	generateCreateManyBuilder(b, name, dbFields)
-	generateUpdateBuilder(b, name, dbFields)
+	generateCreateBuilder(b, name, dbFields, m.Directives)
+	generateCreateManyBuilder(b, name, dbFields, m.Directives)
+	generateUpdateBuilder(b, name, dbFields, m.Directives)
 }
 
 // generateExtendQueryBuilder generates minimal query support for extend models:
@@ -52,7 +55,7 @@ func generateExtendQueryBuilder(b *strings.Builder, ext *ast.ExtendDecl) {
 
 func (g *GeneratorContext) generateExtendQueryBuilder(b *strings.Builder, ext *ast.ExtendDecl) {
 	name := ext.Name
-	tableName := str.ToSnakeCase(name) + "s"
+	tableName := modelTableName(name)
 
 	// Filter out relation fields
 	var dbFields []*ast.FieldDecl
@@ -100,9 +103,9 @@ type %sClient struct {
 	db *pg.DB
 }
 
-// Find returns a %s by primary key.
+// Find returns a %s by ID or NotFound.
 func (c *%sClient) Find(ctx context.Context, id %s) (*%s, error) {
-	return c.Where(%sWhere.%s.Eq(id)).First(ctx)
+	return c.Where(%sWhere.%s.Eq(id)).FirstRequired(ctx)
 }
 
 // Where starts a query with conditions.
@@ -133,9 +136,9 @@ type %sClient struct {
 	db *pg.DB
 }
 
-// Find returns a %s by primary key.
+// Find returns a %s by ID or NotFound.
 func (c *%sClient) Find(ctx context.Context, id %s) (*%s, error) {
-	return c.Where(%sWhere.%s.Eq(id)).First(ctx)
+	return c.Where(%sWhere.%s.Eq(id)).FirstRequired(ctx)
 }
 
 `, name, name, name,
@@ -318,7 +321,7 @@ func fieldConditionTypeWithDirectives(f *ast.FieldDecl) string {
 // --- Create builder ---
 
 // collectAutoFills returns Set statements for auto-managed fields (UUID @auto, createdAt/updatedAt).
-func collectAutoFills(fields []*ast.FieldDecl) []string {
+func collectAutoFills(fields []*ast.FieldDecl, modelDirectives ...[]*ast.Directive) []string {
 	var fills []string
 	for _, f := range fields {
 		if f.Computed != nil || f.Type == nil {
@@ -328,14 +331,14 @@ func collectAutoFills(fields []*ast.FieldDecl) []string {
 		if hasDirective(f.Directives, "auto") && f.Type.Name == "UUID" {
 			fills = append(fills, fmt.Sprintf("\tb.Set(%q, uuid.Must(uuid.NewV7()))\n", col))
 		}
-		if f.Type.Name == "DateTime" && (f.Name == "createdAt" || f.Name == "updatedAt") {
+		if f.Type.Name == "DateTime" && (f.Name == "createdAt" || f.Name == "updatedAt") && isAutoManaged(f, modelDirectives...) {
 			fills = append(fills, fmt.Sprintf("\tb.Set(%q, time.Now())\n", col))
 		}
 	}
 	return fills
 }
 
-func generateCreateBuilder(b *strings.Builder, name string, fields []*ast.FieldDecl) {
+func generateCreateBuilder(b *strings.Builder, name string, fields []*ast.FieldDecl, modelDirectives ...[]*ast.Directive) {
 	fmt.Fprintf(b, `// %sCreateBuilder builds an INSERT statement.
 type %sCreateBuilder struct {
 	pg.CreateBase[%s]
@@ -345,7 +348,7 @@ type %sCreateBuilder struct {
 
 	// Generate Set methods — skip auto-managed, @internal, computed
 	for _, f := range fields {
-		if f.Computed != nil || hasDirective(f.Directives, "internal") || isAutoManaged(f) {
+		if f.Computed != nil || hasDirective(f.Directives, "internal") || isAutoManaged(f, modelDirectives...) {
 			continue
 		}
 		goFieldName := str.Capitalize(f.Name)
@@ -357,7 +360,7 @@ type %sCreateBuilder struct {
 		fmt.Fprintf(b, "}\n\n")
 	}
 
-	autoFills := collectAutoFills(fields)
+	autoFills := collectAutoFills(fields, modelDirectives...)
 	if len(autoFills) > 0 {
 		fmt.Fprintf(b, "func (b *%sCreateBuilder) Exec(ctx context.Context) (*%s, error) {\n", name, name)
 		for _, fill := range autoFills {
@@ -377,7 +380,7 @@ type autoCol struct {
 }
 
 // collectAutoCols returns auto-managed columns that need generated values.
-func collectAutoCols(fields []*ast.FieldDecl) []autoCol {
+func collectAutoCols(fields []*ast.FieldDecl, modelDirectives ...[]*ast.Directive) []autoCol {
 	var result []autoCol
 	for _, f := range fields {
 		if f.Computed != nil || f.Type == nil {
@@ -387,7 +390,7 @@ func collectAutoCols(fields []*ast.FieldDecl) []autoCol {
 		if hasDirective(f.Directives, "auto") && f.Type.Name == "UUID" {
 			result = append(result, autoCol{col, "uuid.Must(uuid.NewV7())"})
 		}
-		if f.Type.Name == "DateTime" && (f.Name == "createdAt" || f.Name == "updatedAt") {
+		if f.Type.Name == "DateTime" && (f.Name == "createdAt" || f.Name == "updatedAt") && isAutoManaged(f, modelDirectives...) {
 			result = append(result, autoCol{col, "now"})
 		}
 	}
@@ -395,10 +398,10 @@ func collectAutoCols(fields []*ast.FieldDecl) []autoCol {
 }
 
 // collectUserFields returns fields that are user-provided (not computed, not internal, not auto-managed, not relation).
-func collectUserFields(fields []*ast.FieldDecl) []*ast.FieldDecl {
+func collectUserFields(fields []*ast.FieldDecl, modelDirectives ...[]*ast.Directive) []*ast.FieldDecl {
 	var result []*ast.FieldDecl
 	for _, f := range fields {
-		if f.Computed != nil || hasDirective(f.Directives, "internal") || isAutoManaged(f) {
+		if f.Computed != nil || hasDirective(f.Directives, "internal") || isAutoManaged(f, modelDirectives...) {
 			continue
 		}
 		result = append(result, f)
@@ -430,9 +433,9 @@ func buildCreateManyColumns(userFields []*ast.FieldDecl, autoCols []autoCol) (co
 	return allCols.String(), valsExtract.String()
 }
 
-func generateCreateManyBuilder(b *strings.Builder, name string, fields []*ast.FieldDecl) {
-	userFields := collectUserFields(fields)
-	autoCols := collectAutoCols(fields)
+func generateCreateManyBuilder(b *strings.Builder, name string, fields []*ast.FieldDecl, modelDirectives ...[]*ast.Directive) {
+	userFields := collectUserFields(fields, modelDirectives...)
+	autoCols := collectAutoCols(fields, modelDirectives...)
 
 	var structFields strings.Builder
 	for _, f := range userFields {
@@ -490,7 +493,7 @@ func (b *%sCreateManyBuilder) Exec(ctx context.Context) ([]*%s, error) {
 
 // --- Update builder ---
 
-func generateUpdateBuilder(b *strings.Builder, name string, fields []*ast.FieldDecl) {
+func generateUpdateBuilder(b *strings.Builder, name string, fields []*ast.FieldDecl, modelDirectives ...[]*ast.Directive) {
 	scanFn := "scan" + name
 
 	primaryKey := primaryKeyField(&ast.ModelDecl{Name: name, Fields: fields})
@@ -517,7 +520,7 @@ func new%sUpdateBuilder(db *pg.DB, table string, id %s) *%sUpdateBuilder {
 
 	// Generate Set methods — skip auto-managed, @immutable, @internal, computed, relation
 	for _, f := range fields {
-		if f.Computed != nil || isAutoManaged(f) {
+		if f.Computed != nil || isAutoManaged(f, modelDirectives...) {
 			continue
 		}
 		if primaryKey != nil && f.Name == primaryKey.Name || hasDirective(f.Directives, "immutable") || hasDirective(f.Directives, "internal") {
@@ -535,7 +538,7 @@ func new%sUpdateBuilder(db *pg.DB, table string, id %s) *%sUpdateBuilder {
 	// Auto-fill updatedAt on update
 	hasUpdatedAt := false
 	for _, f := range fields {
-		if isAutoOnUpdate(f) {
+		if isAutoOnUpdate(f, modelDirectives...) {
 			hasUpdatedAt = true
 			break
 		}

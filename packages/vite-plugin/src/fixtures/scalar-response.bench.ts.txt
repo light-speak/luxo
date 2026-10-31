@@ -1,0 +1,58 @@
+import { LuxoClient } from './client.js'
+import { LuxoClient as UncheckedClient } from './client.unchecked.js'
+import { Encoder } from '@luxojs/client'
+import type { Transport } from '@luxojs/client'
+import { measure } from './measure.js'
+
+type Receive = (value: unknown) => void
+type Subscribe = (client: LuxoClient, receive: Receive) => Promise<() => void>
+const cases: { name: string; write: (encoder: Encoder) => void; single: Subscribe; list: Subscribe }[] = [
+  { name: 'String', write: enc => enc.writeString('发布检查 café'),
+    single: (client, receive) => client.subscribeLiveString(receive),
+    list: (client, receive) => client.subscribeLiveStringList(receive) },
+  { name: 'Float', write: enc => enc.writeFixed64(1.5),
+    single: (client, receive) => client.subscribeLiveFloat(receive),
+    list: (client, receive) => client.subscribeLiveFloatList(receive) },
+  { name: 'Boolean', write: enc => enc.writeBool(true),
+    single: (client, receive) => client.subscribeLiveBoolean(receive),
+    list: (client, receive) => client.subscribeLiveBooleanList(receive) },
+  { name: 'Bytes', write: enc => enc.writeBytes(Uint8Array.of(255, 128)),
+    single: (client, receive) => client.subscribeLiveBytes(receive),
+    list: (client, receive) => client.subscribeLiveBytesList(receive) },
+  { name: 'DateTime', write: enc => enc.writeDateTime('1970-01-01T00:00:00Z'),
+    single: (client, receive) => client.subscribeLiveDateTime(receive),
+    list: (client, receive) => client.subscribeLiveDateTimeList(receive) },
+  { name: 'JSON', write: enc => enc.writeString('{"value":1}'),
+    single: (client, receive) => client.subscribeLiveJSON(receive),
+    list: (client, receive) => client.subscribeLiveJSONList(receive) },
+]
+
+async function operation(Client: typeof LuxoClient, subscribe: Subscribe, bytes: Uint8Array): Promise<() => unknown> {
+  let receive: Receive = () => { throw new Error('Missing generated subscription callback') }
+  let result: unknown
+  const transport: Transport = {
+    async call() { throw new Error('Unexpected call') },
+    async subscribe(_api, _params, decode, onData) { receive = value => onData(decode(value)); return () => {} },
+    setSchema() {}, setToken() {}, setMode() {},
+  }
+  const client = new Client(transport)
+  await subscribe(client, value => { result = value })
+  return () => { receive(bytes); return result }
+}
+
+async function main(): Promise<void> {
+  for (const test of cases) {
+    for (const count of [1, 16]) {
+      const encoder = new Encoder()
+      if (count > 1) encoder.writeVarint(count)
+      for (let index = 0; index < count; index++) test.write(encoder)
+      const subscribe = count === 1 ? test.single : test.list
+      const bytes = encoder.bytes()
+      // Both generated classes are structurally identical; only checks differ.
+      const before = await operation(UncheckedClient as unknown as typeof LuxoClient, subscribe, bytes)
+      const after = await operation(LuxoClient, subscribe, bytes)
+      measure(`${test.name} ${count}`, before, after)
+    }
+  }
+}
+void main().catch(error => { throw error })

@@ -158,6 +158,7 @@ func (s *Server) handleInitialized() error {
 					Watchers: []FileSystemWatcher{
 						{GlobPattern: "**/*.gen.go", Kind: 7}, // Created|Changed|Deleted
 						{GlobPattern: "**/*.luxo", Kind: 7},
+						{GlobPattern: "**/luxo.cache.json", Kind: 7},
 					},
 				},
 			},
@@ -1434,9 +1435,10 @@ func memberMethodDescription(word string) string {
 		"query":       "`request.query(name)` — Get query parameter\n\n获取查询参数",
 		"body":        "`request.body` — Request body\n\n请求体",
 		// @withAuth injected methods
-		"createToken":  "`.createToken(expires?: Duration): String` — Generate JWT token\n\n生成 JWT 令牌",
-		"verify":       "`.verify(plain: String): Boolean` — Verify password against @hash field\n\n校验 @hash 字段的密码",
-		"refreshToken": "`.refreshToken(token: String): String` — Refresh JWT token\n\n刷新 JWT 令牌",
+		"createToken":        "`.createToken(expires?: Duration): String` — Generate access token\n\n生成访问令牌",
+		"createRefreshToken": "`.createRefreshToken(): String` — Generate refresh token when enabled\n\n启用刷新时签发刷新令牌",
+		"verify":             "`.verify(plain: String): Boolean` — Verify password against @hash field\n\n校验 @hash 字段的密码",
+		"refreshToken":       "`.refreshToken(token: String): String` — Exchange refresh for access token\n\n使用刷新令牌换取访问令牌",
 		// Identity methods
 		"load": "`.load(fields...): Identity` — Lazy load user fields from database\n\n从数据库懒加载用户字段",
 		// CRUD chain methods
@@ -1531,9 +1533,9 @@ func directiveDescription(name string) string {
 		"beforeSave": "`@beforeSave { expr }` — Transform before saving\n\n保存前转换",
 		// api annotations
 		"auth":      "`@auth` / `@auth(User, Admin)` / `@auth(Admin, permission: { it.role == ... })` — Require authentication with optional identity and permission\n\n认证鉴权，可指定认证主体和权限",
-		"withAuth":  "`@withAuth(jwt: { secret: env(\"...\"), expires: 7d }, stores: [id])` — Mark model as auth subject, auto-generates .createToken()/.verify()\n\n标记模型为认证主体，自动生成认证方法",
+		"withAuth":  "`@withAuth(stores: [id])` — Mark model as auth subject; JWT configuration comes from the environment\n\n标记模型为认证主体，JWT 使用环境配置。`.createToken()` 签发 access；`.createRefreshToken()` 仅在 JWT_REFRESH 启用时签发 refresh；`.refreshToken(token)` 仅接受 refresh 并换取新的 access。不会自动签发令牌对。",
 		"native":    "`@native` — Implementation in Go\n\n使用 Go 实现",
-		"cache":     "`@cache(ttl: duration)` — Cache response\n\n缓存响应",
+		"cache":     "`@cache(policy: \"name\")` — Cache response using an explicit policy in luxo.cache.json\n\n引用 luxo.cache.json 中显式声明的缓存策略；mode 和正 TTL 必填，默认按身份隔离",
 		"rateLimit": "`@rateLimit(max, window)` — Rate limiting\n\n限流",
 		"global":    "`@global` — Global middleware\n\n全局中间件",
 		"retry":     "`@retry(max, delay)` — Retry on failure\n\n失败重试",

@@ -3,23 +3,26 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"encoding/json/jsontext"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/light-speak/luxo/pkg/lux/errors"
+	"github.com/light-speak/luxo/pkg/lux/jsonutil"
 	"github.com/light-speak/luxo/pkg/lux/selection"
-	"github.com/shopspring/decimal"
 )
 
 // bodyPool reuses byte buffers for reading request bodies.
 var bodyPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, 0, 4096)
-		return &b
+		// Allocate backing storage only after receive-budget admission.
+		return new([]byte)
 	},
 }
 
@@ -55,95 +58,105 @@ func putBody(bp *[]byte) {
 
 // readBody reads the full contents of r into a pooled buffer.
 // Returns the data, the pool handle (caller must return via bodyPool.Put), and any error.
-// MaxRequestBodySize limits binary request body to 100MB to prevent OOM.
-const MaxRequestBodySize = 100 * 1024 * 1024
+// MaxRequestBodySize is the default public request limit, not a memory reservation.
+const MaxRequestBodySize = 2 << 20
 
 func readBody(r io.Reader) ([]byte, *[]byte, error) {
+	return readBodyLimit(r, MaxRequestBodySize)
+}
+
+func readBodyLimit(r io.Reader, limit int) ([]byte, *[]byte, error) {
+	return readBodyLimitBudget(r, limit, nil)
+}
+
+func readBodyLimitBudget(r io.Reader, limit int, lease *receiveLease) ([]byte, *[]byte, error) {
 	bp := bodyPool.Get().(*[]byte)
-	buf := bytes.NewBuffer((*bp)[:0])
-	n, err := buf.ReadFrom(io.LimitReader(r, MaxRequestBodySize+1))
+	buf, err := readBodyBufferBudget(r, (*bp)[:0], limit, lease)
+	*bp = buf
 	if err != nil {
 		return nil, bp, err
 	}
-	if n > MaxRequestBodySize {
-		return nil, bp, fmt.Errorf("request body exceeds %d bytes limit", MaxRequestBodySize)
-	}
-	*bp = buf.Bytes()
 	return *bp, bp, nil
 }
 
-// reservedKeys are protocol fields that should not appear in user params.
-var reservedKeys = map[string]bool{
-	"$id": true, "$api": true, "$select": true, "$filters": true, "$sorters": true,
-	"page": true, "pageSize": true,
+// readBodyBuffer reads through EOF without trusting Content-Length.
+func readBodyBuffer(r io.Reader, buf []byte, limit int) ([]byte, error) {
+	return readBodyBufferBudget(r, buf, limit, nil)
 }
 
-// Filter represents a single filter condition from $filters.
-type Filter struct {
-	Field    string `json:"field"`
-	Operator string `json:"op"`
-	Value    string `json:"value"`
-}
-
-// UnmarshalJSON accepts JSON scalar filter values while keeping the internal
-// string representation consumed by typed FilterOp implementations.
-func (f *Filter) UnmarshalJSON(data []byte) error {
-	var raw struct {
-		Field    string          `json:"field"`
-		Operator string          `json:"op"`
-		Value    json.RawMessage `json:"value"`
+func readBodyBufferBudget(r io.Reader, buf []byte, limit int, lease *receiveLease) ([]byte, error) {
+	if limit < 0 || limit == int(^uint(0)>>1) {
+		return buf[:0], errInvalidBodyLimits
 	}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
+	storage := cap(buf)
+	if err := lease.acquire(storage); err != nil {
+		return buf[:0], err
 	}
-	value, err := parseFilterValue(raw.Value)
-	if err != nil {
-		return err
-	}
-	f.Value = value
-	f.Field = raw.Field
-	f.Operator = raw.Operator
-	return nil
-}
-
-func parseFilterValue(raw json.RawMessage) (string, error) {
-	value := bytes.TrimSpace(raw)
-	if len(value) == 0 || bytes.Equal(value, []byte("null")) || value[0] == '{' || value[0] == '[' {
-		return "", fmt.Errorf("filter value must be a string, number, or boolean")
-	}
-	if value[0] == '"' {
-		var decoded string
-		if err := json.Unmarshal(value, &decoded); err != nil {
-			return "", err
+	// Bound the writable slice once, rather than clipping every fragment read.
+	used := len(buf)
+	buf = buf[:min(cap(buf), limit+1)]
+	emptyReads := 0
+	for {
+		if used == len(buf) {
+			size := min(max(4096, cap(buf)*2), limit+1)
+			if err := lease.acquire(size); err != nil {
+				return buf[:used], err
+			}
+			next := make([]byte, size)
+			copy(next, buf)
+			buf = next
+			lease.discard(storage)
+			storage = size
 		}
-		return decoded, nil
+		space := buf[used:]
+		n, err := r.Read(space)
+		if n < 0 || n > len(space) {
+			return buf[:used], stderrors.New("invalid request body reader count")
+		}
+		used += n
+		if used > limit {
+			return buf[:used], errRequestBodyTooLarge
+		}
+		if err == io.EOF {
+			return buf[:used], nil
+		}
+		if err != nil {
+			return buf[:used], err
+		}
+		if n > 0 {
+			emptyReads = 0
+		} else {
+			emptyReads++
+			if emptyReads >= 100 {
+				return buf[:used], io.ErrNoProgress
+			}
+		}
 	}
-	return string(value), nil
 }
 
-// Sorter represents a sort directive from $sorters.
-type Sorter struct {
-	Field string `json:"field"`
-	Order string `json:"order"` // "asc" or "desc"
+// reservedKeys are protocol fields that should not appear in user params.
+var reservedKeys = [...]string{
+	"$id", "$api", "$select", "$filters", "$sorters", "page", "pageSize",
 }
 
 // Request represents a parsed Luvia API request.
 type Request struct {
-	API         string                     // $api field
-	Select      []*selection.Field         // parsed $select (JSON mode)
-	Params      map[string]json.RawMessage // remaining fields as raw JSON
-	Buf         *ResponseBuf               // response buffer — handler writes directly here
-	Filters     []Filter                   // parsed $filters
-	Sorters     []Sorter                   // parsed $sorters
-	Page        int                        // page number (default 1)
-	PageSize    int                        // page size (default 20)
-	BinaryMode  bool                       // true when X-Luxo-Mode: binary
-	FieldMask   []byte                     // binary field mask (binary mode)
-	ClientKey   string                     // transport-provided key for per-client policies
-	Internal    bool                       // trusted internal RPC dispatch; public-edge policies already ran
-	pageSizeSet bool                       // true when pageSize was explicitly supplied
+	responseCache *cacheRouteBinding
+	API           string                     // $api field
+	Select        []*selection.Field         // parsed $select (JSON mode)
+	Params        map[string]json.RawMessage // remaining fields as raw JSON
+	Buf           *ResponseBuf               // response buffer — handler writes directly here
+	Filters       []Filter                   // parsed $filters
+	Sorters       []Sorter                   // parsed $sorters
+	Page          int                        // page number (default 1)
+	PageSize      int                        // page size (default 20)
+	BinaryMode    bool                       // true when X-Luxo-Mode: binary
+	FieldMask     []byte                     // binary field mask (binary mode)
+	ClientKey     string                     // transport-provided key for per-client policies
+	Internal      bool                       // trusted internal RPC dispatch; public-edge policies already ran
+	pageSizeSet   bool                       // true when pageSize was explicitly supplied
 
-	// Binary params — zero-allocation inline storage
+	// Typed binary params and prepared JSON structured messages share inline storage.
 	// paramSlots stores values by index (position in API param list)
 	// paramNames points to the static name list from Registry (never allocated per request)
 	paramSlots [16]any
@@ -156,6 +169,7 @@ type Request struct {
 	// Gateways forward these slices directly without decoding and re-encoding.
 	binaryRequest []byte
 	binaryParams  []byte
+	binaryPlan    *binaryAPIPlan
 }
 
 const (
@@ -178,15 +192,31 @@ func (r *Request) applyBinaryListParams() {
 }
 
 // ParseRequest reads an HTTP request body and extracts $api, $select, and params.
-// MaxJSONBodySize limits JSON request body to 10MB (smaller than binary).
-const MaxJSONBodySize = 10 * 1024 * 1024
+// MaxJSONBodySize uses the same public request default as Binary.
+const MaxJSONBodySize = MaxRequestBodySize
+
+var errInvalidJSONUTF8 = stderrors.New("invalid JSON: invalid UTF-8")
 
 func ParseRequest(r *http.Request) (*Request, error) {
+	return parseRequestLimit(r, MaxJSONBodySize)
+}
+
+func parseRequestLimit(r *http.Request, limit int) (*Request, error) {
+	return parseRequestLimitBudget(r, limit, nil)
+}
+
+func parseRequestLimitBudget(r *http.Request, limit int, lease *receiveLease) (*Request, error) {
 	defer r.Body.Close()
-	body, bp, err := readBody(r.Body)
+	if r.ContentLength > int64(limit) {
+		return nil, fmt.Errorf("JSON body exceeds %d bytes limit: %w", limit, errRequestBodyTooLarge)
+	}
+	body, bp, err := readBodyLimitBudget(r.Body, limit, lease)
 	if err != nil {
 		if bp != nil {
 			putBody(bp)
+		}
+		if stderrors.Is(err, errRequestBodyTooLarge) {
+			return nil, fmt.Errorf("JSON body exceeds %d bytes limit: %w", limit, err)
 		}
 		return nil, fmt.Errorf("read body: %w", err)
 	}
@@ -195,28 +225,31 @@ func ParseRequest(r *http.Request) (*Request, error) {
 	if len(body) == 0 {
 		return nil, fmt.Errorf("empty request body")
 	}
-	if len(body) > MaxJSONBodySize {
-		return nil, fmt.Errorf("JSON body exceeds %d bytes limit", MaxJSONBodySize)
-	}
-
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(body, &raw); err != nil {
+	// Parse names and opaque values together; reject invalid Unicode before it
+	// can be replaced. The returned values own their bytes, not the pooled body.
+	raw, err := jsonutil.ParseObject(body)
+	if err != nil {
+		if !utf8.Valid(body) {
+			return nil, errInvalidJSONUTF8
+		}
 		return nil, fmt.Errorf("invalid JSON: %w", err)
 	}
 	return parseRawRequest(raw)
 }
 
+// parseRawRequest takes ownership of raw on success. Callers must extract any
+// transport metadata first and stop using raw once the request is returned.
+// Failure leaves the envelope intact; values already own their input bytes.
 func parseRawRequest(raw map[string]json.RawMessage) (*Request, error) {
-	req := &Request{
-		Params: make(map[string]json.RawMessage),
-	}
+	req := &Request{}
 
 	// Extract $api
 	apiRaw, ok := raw["$api"]
 	if !ok {
 		return nil, fmt.Errorf("missing $api field")
 	}
-	if err := json.Unmarshal(apiRaw, &req.API); err != nil {
+	var err error
+	if req.API, err = jsonutil.ParseString(apiRaw); err != nil {
 		return nil, fmt.Errorf("$api must be a string")
 	}
 	if req.API == "" {
@@ -225,8 +258,8 @@ func parseRawRequest(raw map[string]json.RawMessage) (*Request, error) {
 
 	// Extract $select (optional)
 	if selRaw, ok := raw["$select"]; ok {
-		var selStr string
-		if err := json.Unmarshal(selRaw, &selStr); err != nil {
+		selStr, err := jsonutil.ParseString(selRaw)
+		if err != nil {
 			return nil, fmt.Errorf("$select must be a string")
 		}
 		fields, err := selection.Parse(selStr)
@@ -241,13 +274,11 @@ func parseRawRequest(raw map[string]json.RawMessage) (*Request, error) {
 		return nil, err
 	}
 
-	// Remaining fields are params
-	for k, v := range raw {
-		if reservedKeys[k] {
-			continue
-		}
-		req.Params[k] = v
+	// Reuse the owned envelope rather than allocate and populate a second map.
+	for _, key := range reservedKeys {
+		delete(raw, key)
 	}
+	req.Params = raw
 
 	return req, nil
 }
@@ -255,12 +286,11 @@ func parseRawRequest(raw map[string]json.RawMessage) (*Request, error) {
 // parseListParams extracts $filters, $sorters, page, pageSize from raw request.
 func (req *Request) parseListParams(raw map[string]json.RawMessage) error {
 	if filtersRaw, ok := raw["$filters"]; ok {
-		if err := json.Unmarshal(filtersRaw, &req.Filters); err != nil {
+		filters, err := parseListObjects(filtersRaw, 1000, "op", filterMetadata)
+		if err != nil {
 			return fmt.Errorf("$filters: %w", err)
 		}
-		if len(req.Filters) > 1000 {
-			return fmt.Errorf("$filters exceeds limit: %d > 1000", len(req.Filters))
-		}
+		req.Filters = filters
 		for i := range req.Filters {
 			if req.Filters[i].Field == "" || filterOperatorID(req.Filters[i].Operator) == 0 {
 				return fmt.Errorf("$filters[%d]: invalid field or operator", i)
@@ -268,12 +298,11 @@ func (req *Request) parseListParams(raw map[string]json.RawMessage) error {
 		}
 	}
 	if sortersRaw, ok := raw["$sorters"]; ok {
-		if err := json.Unmarshal(sortersRaw, &req.Sorters); err != nil {
+		sorters, err := parseListObjects(sortersRaw, 100, "order", sorterMetadata)
+		if err != nil {
 			return fmt.Errorf("$sorters: %w", err)
 		}
-		if len(req.Sorters) > 100 {
-			return fmt.Errorf("$sorters exceeds limit: %d > 100", len(req.Sorters))
-		}
+		req.Sorters = sorters
 		for i := range req.Sorters {
 			if req.Sorters[i].Field == "" || (req.Sorters[i].Order != "asc" && req.Sorters[i].Order != "desc") {
 				return fmt.Errorf("$sorters[%d]: invalid field or order", i)
@@ -282,14 +311,15 @@ func (req *Request) parseListParams(raw map[string]json.RawMessage) error {
 	}
 	req.Page = 1
 	req.PageSize = defaultPageSize
+	var err error
 	if pageRaw, ok := raw["page"]; ok {
-		if err := json.Unmarshal(pageRaw, &req.Page); err != nil {
+		if req.Page, err = parseJSONPageInteger(pageRaw); err != nil {
 			return fmt.Errorf("page must be an integer")
 		}
 	}
 	if psRaw, ok := raw["pageSize"]; ok {
 		req.pageSizeSet = true
-		if err := json.Unmarshal(psRaw, &req.PageSize); err != nil {
+		if req.PageSize, err = parseJSONPageInteger(psRaw); err != nil {
 			return fmt.Errorf("pageSize must be an integer")
 		}
 	}
@@ -301,6 +331,15 @@ func (req *Request) parseListParams(raw map[string]json.RawMessage) error {
 	}
 	// pageSize == 0 → return all (no pagination)
 	return nil
+}
+
+// Pagination still uses Go int internally; never truncate on a 32-bit host.
+func parseJSONPageInteger(raw []byte) (int, error) {
+	value, err := jsonutil.ParseInt64(raw)
+	if err != nil || int64(int(value)) != value {
+		return 0, fmt.Errorf("expected an integer within platform range")
+	}
+	return int(value), nil
 }
 
 // findParam looks up a binary param by name from the inline slot array.
@@ -330,23 +369,24 @@ func (r *Request) markParamNull(index int) {
 	r.paramSlots[index] = nil
 }
 
-// ParamIsNull reports whether a binary parameter was explicitly encoded as null.
+// ParamIsNull reports an explicit null in the request's original transport.
 func (r *Request) ParamIsNull(name string) bool {
+	if r.Params != nil {
+		raw, ok := r.Params[name]
+		return ok && bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+	}
 	for i := 0; i < r.paramCount; i++ {
 		if r.paramNames[i] == name {
 			return r.paramNull&(1<<i) != 0
 		}
 	}
-	if raw, ok := r.Params[name]; ok {
-		return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
-	}
 	return false
 }
 
 // ParamInt extracts an integer parameter. Returns 400 BadRequest on error.
-// Binary mode: inline array lookup (zero alloc). JSON mode: json.Unmarshal.
+// Binary mode uses typed slots; JSON mode reads a strict integer token.
 func (r *Request) ParamInt(name string) (int64, error) {
-	if r.paramNames != nil {
+	if r.Params == nil {
 		if v, ok := r.findParam(name); ok {
 			if iv, ok := v.(int64); ok {
 				return iv, nil
@@ -358,8 +398,8 @@ func (r *Request) ParamInt(name string) (int64, error) {
 	if !ok {
 		return 0, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
-	var v int64
-	if err := json.Unmarshal(raw, &v); err != nil {
+	v, err := jsonutil.ParseInt64(raw)
+	if err != nil {
 		return 0, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be an integer"})
 	}
 	return v, nil
@@ -367,7 +407,7 @@ func (r *Request) ParamInt(name string) (int64, error) {
 
 // ParamString extracts a string parameter. Returns 400 BadRequest on error.
 func (r *Request) ParamString(name string) (string, error) {
-	if r.paramNames != nil {
+	if r.Params == nil {
 		if v, ok := r.findParam(name); ok {
 			if sv, ok := v.(string); ok {
 				return sv, nil
@@ -379,8 +419,8 @@ func (r *Request) ParamString(name string) (string, error) {
 	if !ok {
 		return "", errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
-	var v string
-	if err := json.Unmarshal(raw, &v); err != nil {
+	v, err := jsonutil.ParseString(raw)
+	if err != nil {
 		return "", errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be a string"})
 	}
 	return v, nil
@@ -388,7 +428,7 @@ func (r *Request) ParamString(name string) (string, error) {
 
 // ParamDateTime extracts a time.Time parameter.
 func (r *Request) ParamDateTime(name string) (time.Time, error) {
-	if r.paramNames != nil {
+	if r.Params == nil {
 		if v, ok := r.findParam(name); ok {
 			if tv, ok := v.(time.Time); ok {
 				return tv, nil
@@ -400,11 +440,7 @@ func (r *Request) ParamDateTime(name string) (time.Time, error) {
 	if !ok {
 		return time.Time{}, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return time.Time{}, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be a string"})
-	}
-	t, err := time.Parse(time.RFC3339, s)
+	t, err := jsonutil.ParseDateTime(raw)
 	if err != nil {
 		return time.Time{}, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be RFC3339 format"})
 	}
@@ -413,7 +449,7 @@ func (r *Request) ParamDateTime(name string) (time.Time, error) {
 
 // ParamFloat extracts a float64 parameter. Returns 400 BadRequest on error.
 func (r *Request) ParamFloat(name string) (float64, error) {
-	if r.paramNames != nil {
+	if r.Params == nil {
 		if v, ok := r.findParam(name); ok {
 			if fv, ok := v.(float64); ok {
 				return fv, nil
@@ -425,8 +461,8 @@ func (r *Request) ParamFloat(name string) (float64, error) {
 	if !ok {
 		return 0, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
-	var v float64
-	if err := json.Unmarshal(raw, &v); err != nil {
+	v, err := jsonutil.ParseFloat64(raw)
+	if err != nil {
 		return 0, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be a number"})
 	}
 	return v, nil
@@ -434,7 +470,7 @@ func (r *Request) ParamFloat(name string) (float64, error) {
 
 // ParamBool extracts a boolean parameter. Returns 400 BadRequest on error.
 func (r *Request) ParamBool(name string) (bool, error) {
-	if r.paramNames != nil {
+	if r.Params == nil {
 		if v, ok := r.findParam(name); ok {
 			if bv, ok := v.(bool); ok {
 				return bv, nil
@@ -446,8 +482,8 @@ func (r *Request) ParamBool(name string) (bool, error) {
 	if !ok {
 		return false, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
-	var v bool
-	if err := json.Unmarshal(raw, &v); err != nil {
+	v, err := jsonutil.ParseBool(raw)
+	if err != nil {
 		return false, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be a boolean"})
 	}
 	return v, nil
@@ -455,7 +491,7 @@ func (r *Request) ParamBool(name string) (bool, error) {
 
 // ParamIntArray extracts an []int64 parameter. Returns 400 BadRequest on error.
 func (r *Request) ParamIntArray(name string) ([]int64, error) {
-	if r.paramNames != nil {
+	if r.Params == nil {
 		if v, ok := r.findParam(name); ok {
 			switch iv := v.(type) {
 			case []int64:
@@ -470,8 +506,8 @@ func (r *Request) ParamIntArray(name string) ([]int64, error) {
 	if !ok {
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
-	var v []int64
-	if err := json.Unmarshal(raw, &v); err != nil {
+	v, err := jsonutil.ParseInt64Array(raw)
+	if err != nil {
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be an array of integers"})
 	}
 	return v, nil
@@ -479,7 +515,7 @@ func (r *Request) ParamIntArray(name string) ([]int64, error) {
 
 // ParamStringArray extracts a []string parameter. Returns 400 BadRequest on error.
 func (r *Request) ParamStringArray(name string) ([]string, error) {
-	if r.paramNames != nil {
+	if r.Params == nil {
 		if v, ok := r.findParam(name); ok {
 			switch sv := v.(type) {
 			case []string:
@@ -494,8 +530,8 @@ func (r *Request) ParamStringArray(name string) ([]string, error) {
 	if !ok {
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
-	var v []string
-	if err := json.Unmarshal(raw, &v); err != nil {
+	v, err := jsonutil.ParseStringArray(raw)
+	if err != nil {
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be an array of strings"})
 	}
 	return v, nil
@@ -503,7 +539,7 @@ func (r *Request) ParamStringArray(name string) ([]string, error) {
 
 // ParamUUIDArray extracts a []uuid.UUID parameter. Returns 400 BadRequest on error.
 func (r *Request) ParamUUIDArray(name string) ([]uuid.UUID, error) {
-	if r.paramNames != nil {
+	if r.Params == nil {
 		if v, ok := r.findParam(name); ok {
 			switch uv := v.(type) {
 			case []uuid.UUID:
@@ -518,14 +554,31 @@ func (r *Request) ParamUUIDArray(name string) ([]uuid.UUID, error) {
 	if !ok {
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
 	}
-	var value []uuid.UUID
-	if err := json.Unmarshal(raw, &value); err != nil {
+	var reader jsonUUIDArrayReader
+	value, err := jsonutil.ParseArray(raw, reader.parse)
+	if err != nil {
 		return nil, errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must be an array of UUIDs"})
 	}
 	return value, nil
 }
 
-// ParamMessage returns a structured Luxo parameter without JSON conversion.
+// ParseArray has already validated this entire JSON value, including Unicode.
+type jsonUUIDArrayReader struct{ scratch []byte }
+
+func (r *jsonUUIDArrayReader) parse(raw []byte) (uuid.UUID, error) {
+	if len(raw) >= 2 && raw[0] == '"' && bytes.IndexByte(raw, '\\') < 0 {
+		return uuid.ParseBytes(raw[1 : len(raw)-1])
+	}
+	value, err := jsontext.AppendUnquote(r.scratch[:0], raw)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	r.scratch = value
+	return uuid.ParseBytes(value)
+}
+
+// ParamMessage returns the structured binary message prepared by the transport
+// boundary. Local JSON handlers use ParamInput and generated JSON readers.
 // present distinguishes an omitted optional parameter from an explicit null.
 func (r *Request) ParamMessage(name string, optional, nullable bool) ([]byte, bool, error) {
 	value, present, err := r.binaryStructuredParam(name, optional, nullable)
@@ -581,73 +634,10 @@ func InvalidParam(name string, cause error) error {
 		WithCause(cause)
 }
 
-// ParamJSON extracts a required parameter into the target.
-func (r *Request) ParamJSON(name string, target any) error {
-	return r.paramJSON(name, target, false, false)
-}
-
-// ParamJSONOptional extracts an optional parameter into the target.
-func (r *Request) ParamJSONOptional(name string, target any) error {
-	return r.paramJSON(name, target, true, false)
-}
-
-// ParamJSONNullable extracts a required parameter that may explicitly be null.
-func (r *Request) ParamJSONNullable(name string, target any) error {
-	return r.paramJSON(name, target, false, true)
-}
-
-// ParamJSONOptionalNullable extracts an optional parameter that may explicitly be null.
-func (r *Request) ParamJSONOptionalNullable(name string, target any) error {
-	return r.paramJSON(name, target, true, true)
-}
-
-func (r *Request) paramJSON(name string, target any, optional, nullable bool) error {
-	if r.paramNames != nil {
-		v, ok := r.findParam(name)
-		if !ok {
-			if optional {
-				return nil
-			}
-			return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
-		}
-		if v == nil {
-			if nullable {
-				return nil
-			}
-			return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must not be null"})
-		}
-		if ptr, ok := target.(*any); ok {
-			*ptr = v
-			return nil
-		}
-		if assignBinaryParamFast(v, target) {
-			return nil
-		}
-		data, err := json.Marshal(v)
-		if err != nil || json.Unmarshal(data, target) != nil {
-			return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "invalid format"})
-		}
-		return nil
-	}
-	raw, ok := r.Params[name]
-	if !ok {
-		if optional {
-			return nil
-		}
-		return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "missing"})
-	}
-	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) && !nullable {
-		return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "must not be null"})
-	}
-	if err := json.Unmarshal(raw, target); err != nil {
-		return errors.BadRequest.WithData(errors.ParamError{Param: name, Error: "invalid format"})
-	}
-	return nil
-}
-
 // SetBinaryParams configures binary mode param storage.
 // Called by RPC server to set up paramSlots without allocation.
 func (r *Request) SetBinaryParams(names []string, count int) {
+	r.Params = nil
 	r.paramNames = names
 	r.paramCount = count
 }
@@ -659,7 +649,12 @@ func (r *Request) SetParamSlot(index int, value any) {
 	if index < 0 || index >= 16 {
 		return
 	}
+	if value == nil {
+		r.markParamNull(index)
+		return
+	}
 	r.markParamPresent(index)
+	r.paramNull &^= 1 << index
 	existing := r.paramSlots[index]
 	if existing == nil {
 		r.paramSlots[index] = value
@@ -694,7 +689,7 @@ func (r *Request) SetParamSlot(index int, value any) {
 
 // HasParam checks if a parameter exists (supports both JSON and binary mode).
 func (r *Request) HasParam(name string) bool {
-	if r.paramNames != nil {
+	if r.Params == nil {
 		_, ok := r.findParam(name)
 		return ok
 	}
@@ -710,172 +705,4 @@ func (r *Request) BinaryRequest() []byte {
 // BinaryParams returns the canonical parameter fields including the end marker.
 func (r *Request) BinaryParams() []byte {
 	return r.binaryParams
-}
-
-// assignBinaryParam assigns a binary-decoded value to a typed pointer target.
-func assignBinaryParam(v any, target any) error {
-	assignBinaryParamFast(v, target)
-	return nil
-}
-
-func assignBinaryParamFast(v any, target any) bool {
-	switch t := target.(type) {
-	case **string:
-		if sv, ok := v.(string); ok {
-			*t = &sv
-			return true
-		}
-	case **int64:
-		if iv, ok := v.(int64); ok {
-			*t = &iv
-			return true
-		}
-	case **float64:
-		if fv, ok := v.(float64); ok {
-			*t = &fv
-			return true
-		}
-	case **bool:
-		if bv, ok := v.(bool); ok {
-			*t = &bv
-			return true
-		}
-	case *string:
-		if sv, ok := v.(string); ok {
-			*t = sv
-			return true
-		}
-	case *int64:
-		if iv, ok := v.(int64); ok {
-			*t = iv
-			return true
-		}
-	case *float64:
-		if fv, ok := v.(float64); ok {
-			*t = fv
-			return true
-		}
-	case *bool:
-		if bv, ok := v.(bool); ok {
-			*t = bv
-			return true
-		}
-	default:
-		return assignBinaryNativeParam(v, target)
-	}
-	return false
-}
-
-func assignBinaryNativeParam(v any, target any) bool {
-	switch t := target.(type) {
-	case *time.Time:
-		if tv, ok := v.(time.Time); ok {
-			*t = tv
-			return true
-		}
-	case **time.Time:
-		if tv, ok := v.(time.Time); ok {
-			*t = &tv
-			return true
-		}
-	case *uuid.UUID:
-		if uv, ok := v.(uuid.UUID); ok {
-			*t = uv
-			return true
-		}
-	case **uuid.UUID:
-		if uv, ok := v.(uuid.UUID); ok {
-			*t = &uv
-			return true
-		}
-	case *json.RawMessage:
-		if raw, ok := v.(json.RawMessage); ok {
-			*t = append((*t)[:0], raw...)
-			return true
-		}
-	case *time.Duration:
-		if dv, ok := v.(time.Duration); ok {
-			*t = dv
-			return true
-		}
-	case **time.Duration:
-		if dv, ok := v.(time.Duration); ok {
-			*t = &dv
-			return true
-		}
-	case *decimal.Decimal:
-		if dv, ok := v.(decimal.Decimal); ok {
-			*t = dv
-			return true
-		}
-	case **decimal.Decimal:
-		if dv, ok := v.(decimal.Decimal); ok {
-			*t = &dv
-			return true
-		}
-	default:
-		return assignBinarySliceParam(v, target)
-	}
-	return false
-}
-
-func assignBinarySliceParam(v any, target any) bool {
-	switch t := target.(type) {
-	case *[]byte:
-		if bv, ok := v.([]byte); ok {
-			*t = bv
-			return true
-		}
-	case *[]int64:
-		if values, ok := v.([]int64); ok {
-			*t = values
-			return true
-		}
-	case *[]float64:
-		if values, ok := v.([]float64); ok {
-			*t = values
-			return true
-		}
-	case *[]string:
-		if values, ok := v.([]string); ok {
-			*t = values
-			return true
-		}
-	case *[]bool:
-		if values, ok := v.([]bool); ok {
-			*t = values
-			return true
-		}
-	case *[]time.Time:
-		if values, ok := v.([]time.Time); ok {
-			*t = values
-			return true
-		}
-	case *[]time.Duration:
-		if values, ok := v.([]time.Duration); ok {
-			*t = values
-			return true
-		}
-	case *[]uuid.UUID:
-		if values, ok := v.([]uuid.UUID); ok {
-			*t = values
-			return true
-		}
-	case *[]decimal.Decimal:
-		if values, ok := v.([]decimal.Decimal); ok {
-			*t = values
-			return true
-		}
-	case *[][]byte:
-		if values, ok := v.([][]byte); ok {
-			*t = values
-			return true
-		}
-	case *[]json.RawMessage:
-		if values, ok := v.([]json.RawMessage); ok {
-			*t = values
-			return true
-		}
-	}
-	return false
 }

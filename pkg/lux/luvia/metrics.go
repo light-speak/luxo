@@ -2,11 +2,11 @@ package luvia
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -33,15 +33,20 @@ type metricBucketKey struct {
 type MetricsCollector struct {
 	studioURL  string
 	apiKey     string
-	projectID  int
+	projectID  string
 	instanceID string
 	nodeType   string
 
-	mu      sync.Mutex
-	buckets map[metricBucketKey]*metricBucket
-	traces  []api.TraceRecord
-	done    chan struct{}
-	closed  bool
+	mu         sync.Mutex
+	buckets    map[metricBucketKey]*metricBucket
+	traces     []api.TraceRecord
+	traceBytes int
+	traceHead  int
+	dropped    ObservationDrops
+	done       chan struct{}
+	closed     bool
+	worker     sync.WaitGroup
+	closeWait  sync.WaitGroup
 
 	traceSampleRate float64
 
@@ -65,9 +70,15 @@ func NewMetricsCollector() *MetricsCollector {
 	if studioURL == "" || apiKey == "" {
 		return nil
 	}
-	projectID := 0
-	if v := os.Getenv("LUXO_PROJECT_ID"); v != "" {
-		fmt.Sscanf(v, "%d", &projectID)
+	studioURL, err := studioURLFromEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[studio] %v\n", err)
+		return nil
+	}
+	projectID, err := studioProjectIDFromEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[studio] %v\n", err)
+		return nil
 	}
 	mc := &MetricsCollector{
 		studioURL:       studioURL,
@@ -79,9 +90,9 @@ func NewMetricsCollector() *MetricsCollector {
 		traces:          make([]api.TraceRecord, 0, 128),
 		traceSampleRate: traceSampleRateFromEnv(),
 		done:            make(chan struct{}),
-		client:          &http.Client{Timeout: 10 * time.Second},
+		client:          newStudioHTTPClient(),
 	}
-	go mc.flushLoop()
+	mc.worker.Go(mc.flushLoop)
 	return mc
 }
 
@@ -91,7 +102,7 @@ func traceSampleRateFromEnv() float64 {
 		return 0.1
 	}
 	rate, err := strconv.ParseFloat(value, 64)
-	if err != nil || rate < 0 || rate > 1 {
+	if err != nil || math.IsNaN(rate) || rate < 0 || rate > 1 {
 		fmt.Fprintf(os.Stderr, "[traces] invalid LUXO_TRACE_SAMPLE_RATE %q, using 0.1\n", value)
 		return 0.1
 	}
@@ -102,6 +113,13 @@ func traceSampleRateFromEnv() float64 {
 func (mc *MetricsCollector) Record(apiName string, duration time.Duration, isError bool) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
+	if mc.closed {
+		return
+	}
+	if len(apiName) > maxMetricNameBytes {
+		mc.dropped.Measurements++
+		return
+	}
 
 	now := time.Now().Unix()
 	key := metricBucketKey{apiName: apiName, bucketUnix: now - now%metricBucketSecs}
@@ -121,20 +139,41 @@ func (mc *MetricsCollector) Record(apiName string, duration time.Duration, isErr
 	if isError {
 		b.errCount++
 	}
+	if len(mc.buckets) > maxPendingMetricBuckets {
+		mc.trimMetricBuckets()
+	}
 }
 
 // RecordTrace queues a sampled request trace for the Studio exporter.
-// Errors are always retained; successful requests obey LUXO_TRACE_SAMPLE_RATE.
+// Errors bypass sampling; successful requests obey LUXO_TRACE_SAMPLE_RATE.
+// Both remain subject to the bounded pending queue.
 func (mc *MetricsCollector) RecordTrace(record api.TraceRecord) {
 	if record.StatusCode < http.StatusBadRequest && !record.HeadSampled && !shouldSampleTrace(record.TraceID, mc.traceSampleRate) {
 		return
 	}
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
-	if len(mc.traces) >= maxPendingTraces {
+	if mc.closed {
 		return
 	}
+	size := traceTextBytes(record)
+	if size > maxTraceTextBytes {
+		mc.dropped.Traces++
+		return
+	}
+	if len(mc.traces) == maxPendingTraces || mc.traceBytes+size > maxPendingTraceBytes {
+		if mc.replaceOldestTrace(record, size) {
+			return
+		}
+	}
+	if mc.traceHead != 0 {
+		mc.normalizeTraces()
+	}
 	mc.traces = append(mc.traces, record)
+	mc.traceBytes += size
+	if len(mc.traces) > maxPendingTraces || mc.traceBytes > maxPendingTraceBytes {
+		mc.trimTraces()
+	}
 }
 
 // ShouldTrace performs deterministic head sampling before request execution.
@@ -157,18 +196,23 @@ func shouldSampleTrace(traceID string, rate float64) bool {
 	return float64(hash%1000000)/1000000 < rate
 }
 
-// Close stops the flush loop and performs a final flush.
+// Close stops accepting records, joins the exporter, and attempts a final flush.
+// Concurrent callers wait for the same drain. Failed final exports remain pending;
+// shutdown does not promise delivery when Studio is unavailable.
 func (mc *MetricsCollector) Close() {
 	mc.mu.Lock()
 	if mc.closed {
 		mc.mu.Unlock()
+		mc.closeWait.Wait()
 		return
 	}
+	mc.closeWait.Add(1)
 	mc.closed = true
 	mc.mu.Unlock()
-
 	close(mc.done)
-	mc.flush() // final flush
+	mc.worker.Wait()
+	mc.flush()
+	mc.closeWait.Done()
 }
 
 func (mc *MetricsCollector) flushLoop() {
@@ -199,32 +243,14 @@ func (mc *MetricsCollector) flushMetrics() {
 	mc.buckets = make(map[metricBucketKey]*metricBucket)
 	mc.mu.Unlock()
 
-	var bucketList []map[string]any
-	for _, b := range old {
-		avg := 0.0
-		if b.totalCount > 0 {
-			avg = b.totalMs / float64(b.totalCount)
-		}
-		bucketList = append(bucketList, map[string]any{
-			"apiName":    b.apiName,
-			"timestamp":  b.timestamp.Format(time.RFC3339),
-			"totalCount": b.totalCount,
-			"errCount":   b.errCount,
-			"avgMs":      avg,
-			"p50Ms":      percentile(b.latencies, 0.50),
-			"p95Ms":      percentile(b.latencies, 0.95),
-			"p99Ms":      percentile(b.latencies, 0.99),
-		})
+	body, err := mc.encodePendingMetrics(old)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[metrics] encode failed: %v\n", err)
+		return
 	}
-
-	body, _ := json.Marshal(map[string]any{
-		"$api":       "svc:ingestMetrics",
-		"apiKey":     mc.apiKey,
-		"projectId":  mc.projectID,
-		"instanceId": mc.instanceID,
-		"nodeType":   mc.nodeType,
-		"buckets":    bucketList,
-	})
+	if len(old) == 0 {
+		return
+	}
 
 	req, err := http.NewRequest("POST", mc.studioURL+"/luvia", bytes.NewReader(body))
 	if err != nil {
@@ -253,47 +279,22 @@ func (mc *MetricsCollector) flushTraces() {
 		mc.mu.Unlock()
 		return
 	}
+	mc.normalizeTraces()
 	old := mc.traces
 	mc.traces = make([]api.TraceRecord, 0, 128)
+	mc.traceBytes = 0
 	mc.mu.Unlock()
 
-	traces := make([]map[string]any, 0, len(old))
-	for _, record := range old {
-		status := "OK"
-		if record.StatusCode >= http.StatusBadRequest {
-			status = "ERROR"
-		}
-		trace := map[string]any{
-			"traceId":    record.TraceID,
-			"apiName":    record.APIName,
-			"duration":   float64(record.Duration.Microseconds()) / 1000,
-			"status":     status,
-			"statusCode": record.StatusCode,
-			"timestamp":  record.Timestamp.Format(time.RFC3339Nano),
-		}
-		if record.ClientName != "" {
-			trace["clientName"] = record.ClientName
-		}
-		if record.ClientVersion != "" {
-			trace["clientVersion"] = record.ClientVersion
-		}
-		if record.Spans != "" {
-			trace["spans"] = record.Spans
-		}
-		if record.Selection != "" {
-			trace["selection"] = record.Selection
-		}
-		traces = append(traces, trace)
+	body, valid, err := mc.encodePendingTraces(old)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[traces] encode failed: %v\n", err)
+		return
+	}
+	old = valid
+	if len(old) == 0 {
+		return
 	}
 
-	body, _ := json.Marshal(map[string]any{
-		"$api":       "svc:ingestTraces",
-		"apiKey":     mc.apiKey,
-		"projectId":  mc.projectID,
-		"instanceId": mc.instanceID,
-		"nodeType":   mc.nodeType,
-		"traces":     traces,
-	})
 	req, err := http.NewRequest("POST", mc.studioURL+"/luvia", bytes.NewReader(body))
 	if err != nil {
 		mc.reenqueueTraces(old)
@@ -317,14 +318,13 @@ func (mc *MetricsCollector) flushTraces() {
 func (mc *MetricsCollector) reenqueueTraces(records []api.TraceRecord) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
-	remaining := maxPendingTraces - len(mc.traces)
-	if remaining <= 0 {
-		return
-	}
-	if len(records) > remaining {
-		records = records[:remaining]
-	}
+	mc.normalizeTraces()
 	mc.traces = append(records, mc.traces...)
+	mc.traceBytes = 0
+	for _, record := range mc.traces {
+		mc.traceBytes += traceTextBytes(record)
+	}
+	mc.trimTraces()
 }
 
 func (mc *MetricsCollector) reenqueue(buckets map[metricBucketKey]*metricBucket) {
@@ -334,6 +334,7 @@ func (mc *MetricsCollector) reenqueue(buckets map[metricBucketKey]*metricBucket)
 		current, exists := mc.buckets[key]
 		if !exists {
 			mc.buckets[key] = previous
+			mc.trimMetricBuckets()
 			continue
 		}
 		current.totalCount += previous.totalCount
@@ -350,15 +351,18 @@ func (mc *MetricsCollector) reenqueue(buckets map[metricBucketKey]*metricBucket)
 	}
 }
 
-func percentile(data []float64, p float64) float64 {
-	if len(data) == 0 {
+func latencyPercentiles(data []float64) [3]float64 {
+	// Preserve sample order for retries, but copy and sort only once per batch.
+	sorted := slices.Clone(data)
+	sort.Float64s(sorted)
+	return [3]float64{percentile(sorted, 0.50), percentile(sorted, 0.95), percentile(sorted, 0.99)}
+}
+
+// percentile reads a nearest-rank value from an already sorted sample.
+func percentile(sorted []float64, p float64) float64 {
+	if len(sorted) == 0 {
 		return 0
 	}
-	// Sort a copy — don't mutate the original
-	sorted := make([]float64, len(data))
-	copy(sorted, data)
-	sort.Float64s(sorted)
-
 	// Nearest-rank keeps high percentiles meaningful for small buckets. The
 	// previous floor((n-1)*p) formula made p95 ignore the slowest request until
 	// a bucket contained at least 20 samples, allowing p95 to fall below avg.

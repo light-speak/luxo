@@ -1,29 +1,19 @@
 #!/bin/sh
-# Luxo pre-commit hook — fast quality gate (<3s)
+# Luxo pre-commit hook — static quality gate
 # Full tests run on CI (PR checks), not here.
 # Install: cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+# Standalone checkout: run sh scripts/setup-modules.sh . once before these checks.
 
 set -e
 
 echo "=== gofmt ==="
-UNFORMATTED=$(gofmt -l pkg/ cmd/ 2>/dev/null || true)
-if [ -n "$UNFORMATTED" ]; then
-  echo "ERROR: Files not formatted:"
-  echo "$UNFORMATTED"
-  echo "Run: gofmt -s -w pkg/ cmd/"
-  exit 1
-fi
+sh scripts/check-go.sh format pkg/ cmd/ scripts/ internal/
 
 echo "=== go vet ==="
-go vet ./pkg/... ./cmd/...
+go vet ./pkg/... ./cmd/... ./cmd/luxo/... ./scripts/... ./internal/... ./pkg/lux/pg/... ./pkg/lux/nats/... ./pkg/lux/cache/redis/... ./pkg/lux/storage/s3/...
 
 echo "=== gocyclo ==="
-VIOLATIONS=$(gocyclo -over 25 pkg/ cmd/ 2>/dev/null || true)
-if [ -n "$VIOLATIONS" ]; then
-  echo "ERROR: Cyclomatic complexity > 25:"
-  echo "$VIOLATIONS"
-  exit 1
-fi
+sh scripts/check-go.sh complexity pkg/ cmd/ scripts/ internal/
 
 echo "=== go mod tidy ==="
 go mod tidy

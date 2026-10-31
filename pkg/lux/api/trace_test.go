@@ -88,7 +88,7 @@ func TestDebugTraceConcurrentSpansAndBinaryRoundTrip(t *testing.T) {
 	}
 	wg.Wait()
 
-	encoded := EncodeDebugTrace(trace.Snapshot())
+	encoded := mustTraceEncode[[]byte](t)(EncodeDebugTrace(trace.Snapshot()))
 	decoded, err := DecodeDebugTrace(encoded)
 	if err != nil {
 		t.Fatalf("decode debug trace: %v", err)
@@ -116,7 +116,7 @@ func TestDebugTracePreservesExecutionDAGAndFieldPath(t *testing.T) {
 	trace.FinishSpan(call)
 	trace.FinishSpan(handler)
 
-	decoded, err := DecodeDebugTrace(EncodeDebugTrace(trace.Snapshot()))
+	decoded, err := DecodeDebugTrace(mustTraceEncode[[]byte](t)(EncodeDebugTrace(trace.Snapshot())))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -330,29 +330,29 @@ func TestRouterRequiresDebugKeyOutsideDevelopment(t *testing.T) {
 }
 
 func TestDebugTraceJSONUsesMillisecondsAndAttribution(t *testing.T) {
-	got := DebugTraceJSON(DebugTraceSnapshot{Spans: []DebugSpan{{
+	got := mustTraceEncode[string](t)(DebugTraceJSON(DebugTraceSnapshot{Spans: []DebugSpan{{
 		DebugSpanMeta: DebugSpanMeta{Name: "service.call", Category: "service", Service: "user", Operation: "getUser", Field: "owner", Selection: "id,name"},
 		ID:            7,
 		ParentID:      3,
 		Start:         time.Millisecond,
 		Duration:      2500 * time.Microsecond,
-	}}})
-	want := `[{"id":7,"parentId":3,"name":"service.call","category":"service","service":"user","operation":"getUser","field":"owner","fieldPath":"","selection":"id,name","dependency":"","start":1,"duration":2.5}]`
+	}}}))
+	want := `[{"id":7,"parentId":3,"name":"service.call","category":"service","service":"user","operation":"getUser","field":"owner","fieldPath":"","dependency":"","selection":"id,name","start":1,"duration":2.5}]`
 	if got != want {
 		t.Fatalf("debug trace JSON = %s, want %s", got, want)
 	}
 }
 
 func TestDebugTraceJSONIncludesDatabaseMetadata(t *testing.T) {
-	got := DebugTraceJSON(DebugTraceSnapshot{Spans: []DebugSpan{{
+	got := mustTraceEncode[string](t)(DebugTraceJSON(DebugTraceSnapshot{Spans: []DebugSpan{{
 		DebugSpanMeta: DebugSpanMeta{
 			Name: "database.query", Category: "database", DatabaseBackend: "postgresql", DatabaseName: "taskflow",
 			DatabaseOperation: "SELECT", DatabaseResource: "tasks", Statement: "SELECT id FROM tasks WHERE id = $1",
 			Fingerprint: "abc123", ErrorCode: "23505", ArgumentCount: 1, RowsAffected: 0, RowsKnown: true, StatementTruncated: true,
 		},
 		ID: 9, ParentID: 4, Start: time.Millisecond, Duration: 2 * time.Millisecond,
-	}}})
-	want := `[{"id":9,"parentId":4,"name":"database.query","category":"database","service":"","operation":"","field":"","fieldPath":"","selection":"","dependency":"","databaseBackend":"postgresql","databaseName":"taskflow","databaseOperation":"SELECT","databaseResource":"tasks","statement":"SELECT id FROM tasks WHERE id = $1","fingerprint":"abc123","argumentCount":1,"rowsAffected":0,"errorCode":"23505","statementTruncated":true,"start":1,"duration":2}]`
+	}}}))
+	want := `[{"id":9,"parentId":4,"name":"database.query","category":"database","service":"","operation":"","field":"","fieldPath":"","dependency":"","selection":"","databaseBackend":"postgresql","databaseName":"taskflow","databaseOperation":"SELECT","databaseResource":"tasks","statement":"SELECT id FROM tasks WHERE id = $1","fingerprint":"abc123","errorCode":"23505","argumentCount":1,"rowsAffected":0,"statementTruncated":true,"start":1,"duration":2}]`
 	if got != want {
 		t.Fatalf("database trace JSON = %s, want %s", got, want)
 	}
@@ -367,7 +367,7 @@ func TestDebugTraceCapsSpansAndMarksTruncation(t *testing.T) {
 	if len(snapshot.Spans) != maxDebugTraceSpans || !snapshot.Truncated {
 		t.Fatalf("capped snapshot = len %d truncated %v", len(snapshot.Spans), snapshot.Truncated)
 	}
-	decoded, err := DecodeDebugTrace(EncodeDebugTrace(snapshot))
+	decoded, err := DecodeDebugTrace(mustTraceEncode[[]byte](t)(EncodeDebugTrace(snapshot)))
 	if err != nil || !decoded.Truncated {
 		t.Fatalf("decoded truncation = %+v, %v", decoded, err)
 	}
@@ -390,7 +390,7 @@ func TestDebugTraceRecordsDatabaseQueryAndPoolWait(t *testing.T) {
 	databaseTracer.FinishDatabaseQuery(queryCtx, lux.DatabaseTraceResult{Command: "SELECT", RowsAffected: 3, RowsKnown: true})
 	trace.FinishSpan(handler)
 
-	decoded, err := DecodeDebugTrace(EncodeDebugTrace(trace.Snapshot()))
+	decoded, err := DecodeDebugTrace(mustTraceEncode[[]byte](t)(EncodeDebugTrace(trace.Snapshot())))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -455,7 +455,7 @@ func TestDebugResponseEnvelopeRoundTrip(t *testing.T) {
 		ID:            1, Duration: time.Millisecond,
 	}}}
 	body := []byte(`{"data":{"id":1}}`)
-	decodedBody, decodedTrace, err := DecodeDebugResponseEnvelope(EncodeDebugResponseEnvelope(body, snapshot))
+	decodedBody, decodedTrace, err := DecodeDebugResponseEnvelope(mustTraceEncode[[]byte](t)(EncodeDebugResponseEnvelope(body, snapshot)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,7 +464,7 @@ func TestDebugResponseEnvelopeRoundTrip(t *testing.T) {
 	}
 	legacy := []byte{legacyDebugResponseEnvelopeVersion, byte(len(body))}
 	legacy = append(legacy, body...)
-	legacy = append(legacy, EncodeDebugTrace(snapshot)...)
+	legacy = append(legacy, mustTraceEncode[[]byte](t)(EncodeDebugTrace(snapshot))...)
 	legacyBody, legacyTrace, err := DecodeDebugResponseEnvelope(legacy)
 	if err != nil || string(legacyBody) != string(body) || legacyTrace.TraceID != snapshot.TraceID {
 		t.Fatalf("decoded legacy envelope = %s %+v, %v", legacyBody, legacyTrace, err)
@@ -488,7 +488,7 @@ func TestDebugTraceDecodeCompatibilityAndValidation(t *testing.T) {
 		DebugSpanMeta: DebugSpanMeta{Name: "service.call", Category: "service", Field: "project", ErrorCode: "remote_error", StatementTruncated: true},
 		ID:            17, Start: time.Microsecond, Duration: time.Millisecond,
 	}}}
-	legacy := EncodeDebugTrace(snapshot)
+	legacy := mustTraceEncode[[]byte](t)(EncodeDebugTrace(snapshot))
 	legacy[0] = 1
 	decoded, err := DecodeDebugTrace(legacy)
 	if err != nil || decoded.Spans[0].ID != 1 || decoded.Spans[0].FieldPath != "project" || decoded.Spans[0].ErrorCode != "remote_error" || !decoded.Spans[0].StatementTruncated {

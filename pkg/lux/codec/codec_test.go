@@ -2,13 +2,60 @@ package codec
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"math"
 	"testing"
 	"unsafe"
+
+	"github.com/light-speak/luxo/internal/testutil"
 )
 
 // --- Wire-level tests ---
+
+func TestNullableRootEnvelope(t *testing.T) {
+	for _, test := range []struct {
+		data        []byte
+		null, valid bool
+	}{
+		{nil, false, false}, {[]byte{0}, true, true}, {[]byte{1}, false, false},
+		{[]byte{2}, false, false}, {[]byte{0, 0}, false, false},
+		{[]byte{1, 0}, false, true}, {[]byte{1, 84}, false, true},
+	} {
+		value, null, err := UnwrapNullableRoot(test.data)
+		if (err == nil) != test.valid || null != test.null {
+			t.Fatalf("%x: %x %v %v", test.data, value, null, err)
+		}
+		if err != nil && !errors.Is(err, ErrInvalidNullableRoot) {
+			t.Fatal(err)
+		}
+		if test.valid && !bytes.Equal(value, test.data[1:]) {
+			t.Fatal("changed payload")
+		}
+		if test.valid && !null && &value[0] != &test.data[1] {
+			t.Fatal("copied payload")
+		}
+	}
+	if allocations := testing.AllocsPerRun(100, func() {
+		_, _, _ = UnwrapNullableRoot([]byte{0})
+		_, _, _ = UnwrapNullableRoot([]byte{1, 84})
+	}); allocations != 0 {
+		t.Fatalf("root envelope allocated: %v", allocations)
+	}
+}
+
+func TestColumnarReaderHeaderDoesNotAllocate(t *testing.T) {
+	data := []byte{1, 0, 1, 0, 0}
+	allocs := testing.AllocsPerRun(100, func() {
+		reader := NewColumnarReader(data)
+		if reader.Err() != nil || reader.Count() != 1 || reader.ArenaSize() != 0 {
+			t.Fatal("invalid columnar header")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("columnar header parsing allocated %v times", allocs)
+	}
+}
 
 func TestVarint(t *testing.T) {
 	cases := []uint64{0, 1, 127, 128, 255, 256, 16383, 16384, math.MaxUint64}
@@ -44,7 +91,10 @@ func TestSvarint(t *testing.T) {
 func TestFixed64(t *testing.T) {
 	cases := []float64{0, 1.0, -1.0, 3.14, math.MaxFloat64, math.SmallestNonzeroFloat64}
 	for _, c := range cases {
-		buf := AppendFixed64(nil, c)
+		buf, err := AppendFixed64(nil, c)
+		if err != nil {
+			t.Fatal(err)
+		}
 		got, n := ReadFixed64(buf, 0)
 		if n != 8 {
 			t.Fatalf("fixed64 consumed %d bytes", n)
@@ -58,7 +108,10 @@ func TestFixed64(t *testing.T) {
 func TestString(t *testing.T) {
 	cases := []string{"", "hello", "你好世界", "a string with spaces and special chars: !@#$%"}
 	for _, c := range cases {
-		buf := AppendString(nil, c)
+		buf, err := AppendString(nil, c)
+		if err != nil {
+			t.Fatal(err)
+		}
 		got, n := ReadString(buf, 0)
 		if n == 0 {
 			t.Fatalf("ReadString failed for %q", c)
@@ -141,6 +194,27 @@ func TestEncoderDecoderRoundTrip(t *testing.T) {
 	}
 }
 
+func TestEncoderReusesSuppliedBuffer(t *testing.T) {
+	buffer := make([]byte, 1, 64)
+	buffer[0] = 99
+	enc := NewEncoder(buffer)
+	enc.WriteFieldInt(1, 42)
+	enc.WriteEnd()
+	encoded := enc.Bytes()
+	if encoded[0] != 99 || &encoded[0] != &buffer[0] {
+		t.Fatal("encoder lost prefix or copied supplied storage")
+	}
+	dec := NewDecoder(encoded[1:])
+	if !dec.NextField() || dec.FieldID() != 1 || dec.ReadInt() != 42 || dec.NextField() || dec.Finish() != nil {
+		t.Fatal("invalid appended message")
+	}
+	enc.Reset()
+	enc.WriteEnd()
+	if len(enc.Bytes()) != 1 || &enc.Bytes()[0] != &buffer[0] {
+		t.Fatal("reset did not reuse storage")
+	}
+}
+
 func TestEncoderValueWritersAndReset(t *testing.T) {
 	uuidValue := [16]byte{1, 2, 3}
 	var enc Encoder
@@ -162,8 +236,8 @@ func TestEncoderValueWritersAndReset(t *testing.T) {
 	want = AppendPresent(want)
 	want = AppendSvarint(want, -3)
 	want = AppendVarint(want, 4)
-	want = AppendFixed64(want, 1.5)
-	want = AppendString(want, "x")
+	want = binary.LittleEndian.AppendUint64(want, math.Float64bits(1.5))
+	want = AppendBytes(want, []byte("x"))
 	want = AppendBool(want, true)
 	want = AppendBytes(want, []byte{5, 6})
 	want = AppendUUID(want, uuidValue)
@@ -338,6 +412,28 @@ func TestDecoderReadArrayLength(t *testing.T) {
 	}
 }
 
+func TestDecoderFinish(t *testing.T) {
+	for _, data := range [][]byte{{2}, {2, 42}, {0xff}} {
+		dec := NewDecoder(data)
+		dec.ReadInt()
+		previous := dec.Err()
+		err := dec.Finish()
+		if len(data) == 1 && data[0] == 2 {
+			if err != nil {
+				t.Fatal(err)
+			}
+		} else if err == nil {
+			t.Fatalf("accepted invalid boundary: %x", data)
+		}
+		if previous != nil && err != previous {
+			t.Fatal("replaced original error")
+		}
+		if dec.Finish() != err {
+			t.Fatal("Finish changed its result")
+		}
+	}
+}
+
 func TestDecoderReadArrayLengthRejectsOversize(t *testing.T) {
 	data := AppendVarint(nil, uint64(MaxArrayElements+1))
 	dec := NewDecoder(data)
@@ -416,9 +512,9 @@ func BenchmarkDecodeEvent(b *testing.B) {
 // --- Field Mask ---
 
 func TestFieldMaskHas(t *testing.T) {
-	mask := FieldMaskSet(nil, 1)
-	mask = FieldMaskSet(mask, 3)
-	mask = FieldMaskSet(mask, 9)
+	mask := testutil.Bytes(t)(FieldMaskSet(nil, 1))
+	mask = testutil.Bytes(t)(FieldMaskSet(mask, 3))
+	mask = testutil.Bytes(t)(FieldMaskSet(mask, 9))
 
 	if !FieldMaskHas(mask, 1) {
 		t.Error("should have field 1")
@@ -441,7 +537,7 @@ func TestFieldMaskNilIsAll(t *testing.T) {
 }
 
 func TestFieldMaskAll(t *testing.T) {
-	mask := FieldMaskAll(12)
+	mask := testutil.Bytes(t)(FieldMaskAll(12))
 	for i := 1; i <= 12; i++ {
 		if !FieldMaskHas(mask, i) {
 			t.Errorf("FieldMaskAll(12) should have field %d", i)
@@ -576,7 +672,7 @@ func TestColumnarSingleRecord(t *testing.T) {
 	w.WriteColumnInt(1, []int64{42})
 	w.WriteColumnString(2, []string{"alice"})
 	w.WriteColumnBool(3, []bool{true})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	t.Logf("single record columnar: %d bytes", len(data))
 
@@ -617,7 +713,7 @@ func TestColumnarList(t *testing.T) {
 	w.WriteColumnInt(1, []int64{1, 2, 3})
 	w.WriteColumnString(2, []string{"alice", "bob", "carol"})
 	w.WriteColumnFloat(3, []float64{10.5, 20.5, 30.5})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	t.Logf("3 records columnar: %d bytes", len(data))
 
@@ -651,7 +747,7 @@ func TestColumnarNullable(t *testing.T) {
 	var w ColumnarWriter
 	w.SetCount(3)
 	w.WriteColumnIntPtr(1, []*int64{&v1, nil, &v3})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -710,7 +806,7 @@ func TestColumnarVsRow(t *testing.T) {
 	col.WriteColumnInt(1, ids)
 	col.WriteColumnString(2, names)
 	col.WriteColumnFloat(3, scores)
-	colBuf := col.Bytes()
+	colBuf := testutil.Bytes(t)(col.Bytes())
 
 	t.Logf("10 users row: %d bytes, columnar: %d bytes, saving: %d%%",
 		len(rowBuf), len(colBuf), (len(rowBuf)-len(colBuf))*100/len(rowBuf))
@@ -729,7 +825,9 @@ func BenchmarkColumnarWrite10(b *testing.B) {
 		w.WriteColumnInt(1, ids)
 		w.WriteColumnString(2, names)
 		w.WriteColumnFloat(3, scores)
-		_ = w.Bytes()
+		if _, err := w.Bytes(); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -1141,12 +1239,12 @@ func TestColumnarWriterReset(t *testing.T) {
 	var w ColumnarWriter
 	w.SetCount(2)
 	w.WriteColumnInt(1, []int64{10, 20})
-	_ = w.Bytes()
+	_ = testutil.Bytes(t)(w.Bytes())
 
 	w.Reset()
 	w.SetCount(1)
 	w.WriteColumnInt(1, []int64{42})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	if r.Count() != 1 {
@@ -1167,7 +1265,7 @@ func TestColumnarFloatPtrWrite(t *testing.T) {
 	var w ColumnarWriter
 	w.SetCount(3)
 	w.WriteColumnFloatPtr(1, []*float64{&f1, nil, &f3})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	// Verify we can read the data (reader for FloatPtr doesn't exist, verify no panic)
 	r := NewColumnarReader(data)
@@ -1185,7 +1283,7 @@ func TestColumnarStringPtr(t *testing.T) {
 	var w ColumnarWriter
 	w.SetCount(3)
 	w.WriteColumnStringPtr(1, []*string{&s1, nil, &s3})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -1210,7 +1308,7 @@ func TestColumnarBoolPtrWrite(t *testing.T) {
 	var w ColumnarWriter
 	w.SetCount(3)
 	w.WriteColumnBoolPtr(1, []*bool{&b1, nil, &b3})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	// Verify write produces data without error
 	r := NewColumnarReader(data)
@@ -1233,9 +1331,10 @@ func TestColumnarReaderInvalidHeader(t *testing.T) {
 
 func TestColumnarReaderIntTruncated(t *testing.T) {
 	var w ColumnarWriter
-	w.SetCount(3)
+	w.SetCount(1)
 	w.WriteColumnInt(1, []int64{1}) // only 1 value, but count=3
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
+	data[0] = 3 // Corrupt the valid header; the writer itself now rejects this count.
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -1247,9 +1346,10 @@ func TestColumnarReaderIntTruncated(t *testing.T) {
 
 func TestColumnarReaderFloatTruncated(t *testing.T) {
 	var w ColumnarWriter
-	w.SetCount(3)
+	w.SetCount(1)
 	w.WriteColumnFloat(1, []float64{1.0}) // only 1, count=3
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
+	data[0] = 3 // Corrupt the valid header; the writer itself now rejects this count.
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -1261,9 +1361,10 @@ func TestColumnarReaderFloatTruncated(t *testing.T) {
 
 func TestColumnarReaderStringTruncated(t *testing.T) {
 	var w ColumnarWriter
-	w.SetCount(3)
+	w.SetCount(1)
 	w.WriteColumnString(1, []string{"a"}) // only 1, count=3
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
+	data[0] = 3 // Corrupt the valid header; the writer itself now rejects this count.
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -1275,9 +1376,10 @@ func TestColumnarReaderStringTruncated(t *testing.T) {
 
 func TestColumnarReaderBoolTruncated(t *testing.T) {
 	var w ColumnarWriter
-	w.SetCount(3)
+	w.SetCount(1)
 	w.WriteColumnBool(1, []bool{true}) // only 1, count=3
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
+	data[0] = 3 // Corrupt the valid header; the writer itself now rejects this count.
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -1291,9 +1393,10 @@ func TestColumnarReaderIntPtrTruncatedNullable(t *testing.T) {
 	// count=3 but only 1 value worth of data
 	v := int64(1)
 	var w ColumnarWriter
-	w.SetCount(3)
+	w.SetCount(1)
 	w.WriteColumnIntPtr(1, []*int64{&v}) // only 1, count=3
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
+	data[0] = 3 // Corrupt the valid header; the writer itself now rejects this count.
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -1306,9 +1409,10 @@ func TestColumnarReaderIntPtrTruncatedNullable(t *testing.T) {
 func TestColumnarReaderStringPtrTruncated(t *testing.T) {
 	s := "a"
 	var w ColumnarWriter
-	w.SetCount(3)
+	w.SetCount(1)
 	w.WriteColumnStringPtr(1, []*string{&s}) // only 1, count=3
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
+	data[0] = 3 // Corrupt the valid header; the writer itself now rejects this count.
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -1469,7 +1573,7 @@ func TestColumnarUUID(t *testing.T) {
 	var w ColumnarWriter
 	w.SetCount(2)
 	w.WriteColumnUUID(1, [][16]byte{uuidA, uuidB})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -1486,7 +1590,7 @@ func TestColumnarUUIDPtr(t *testing.T) {
 	var w ColumnarWriter
 	w.SetCount(3)
 	w.WriteColumnUUIDPtr(1, []*[16]byte{&uuidA, nil, &uuidB})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -1503,7 +1607,7 @@ func TestColumnarBytes(t *testing.T) {
 	var w ColumnarWriter
 	w.SetCount(3)
 	w.WriteColumnBytes(1, [][]byte{[]byte("a"), {}, []byte("\x00\x01")})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -1521,7 +1625,7 @@ func TestColumnarBytesPtr(t *testing.T) {
 	var w ColumnarWriter
 	w.SetCount(2)
 	w.WriteColumnBytesPtr(1, []*[]byte{&blob, nil})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -1534,6 +1638,34 @@ func TestColumnarBytesPtr(t *testing.T) {
 	}
 }
 
+func TestColumnarNullableByteSlices(t *testing.T) {
+	values := [][]byte{nil, {}, {0, 255}}
+	var writer ColumnarWriter
+	writer.SetCount(len(values))
+	writer.WriteColumnBytesNullable(1, values)
+	want := []byte{3, 0, 1, 0, 1, 0, 1, 2, 0, 255, 0}
+	if got := testutil.Bytes(t)(writer.Bytes()); !bytes.Equal(got, want) {
+		t.Fatalf("wire=%x want=%x", got, want)
+	}
+	reader := NewColumnarReader(want)
+	if !reader.NextColumn() || reader.FieldID() != 1 {
+		t.Fatal("missing byte column")
+	}
+	decoded := reader.ReadColumnBytesPtr()
+	if reader.Err() != nil || decoded[0] != nil || decoded[1] == nil || len(*decoded[1]) != 0 || !bytes.Equal(*decoded[2], values[2]) {
+		t.Fatalf("nullable byte slices=%v error=%v", decoded, reader.Err())
+	}
+	if reader.NextColumn() || reader.Err() != nil {
+		t.Fatalf("column terminator=%v", reader.Err())
+	}
+	writer.Reset()
+	writer.SetCount(0)
+	writer.WriteColumnBytesNullable(2, nil)
+	if got := testutil.Bytes(t)(writer.Bytes()); !bytes.Equal(got, []byte{0, 0, 0}) {
+		t.Fatalf("empty column=%x", got)
+	}
+}
+
 func TestColumnarSkipUUIDBytes(t *testing.T) {
 	u := uuidB
 	blob := []byte("x")
@@ -1543,7 +1675,7 @@ func TestColumnarSkipUUIDBytes(t *testing.T) {
 	w.WriteColumnUUIDPtr(2, []*[16]byte{&u})
 	w.WriteColumnBytesPtr(3, []*[]byte{&blob})
 	w.WriteColumnInt(4, []int64{99})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -1564,9 +1696,10 @@ func TestColumnarSkipUUIDBytes(t *testing.T) {
 
 func TestColumnarUUIDTruncated(t *testing.T) {
 	var w ColumnarWriter
-	w.SetCount(3)
+	w.SetCount(1)
 	w.WriteColumnUUID(1, [][16]byte{uuidA}) // only 1, count=3
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
+	data[0] = 3 // Corrupt the valid header; the writer itself now rejects this count.
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -1577,9 +1710,10 @@ func TestColumnarUUIDTruncated(t *testing.T) {
 
 func TestColumnarUUIDPtrTruncated(t *testing.T) {
 	var w ColumnarWriter
-	w.SetCount(3)
+	w.SetCount(1)
 	w.WriteColumnUUIDPtr(1, []*[16]byte{&uuidA}) // only 1, count=3
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
+	data[0] = 3 // Corrupt the valid header; the writer itself now rejects this count.
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -1591,9 +1725,10 @@ func TestColumnarUUIDPtrTruncated(t *testing.T) {
 func TestColumnarBytesPtrTruncated(t *testing.T) {
 	blob := []byte("x")
 	var w ColumnarWriter
-	w.SetCount(3)
+	w.SetCount(1)
 	w.WriteColumnBytesPtr(1, []*[]byte{&blob}) // only 1, count=3
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
+	data[0] = 3 // Corrupt the valid header; the writer itself now rejects this count.
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -1604,9 +1739,10 @@ func TestColumnarBytesPtrTruncated(t *testing.T) {
 
 func TestColumnarSkipUUIDTruncated(t *testing.T) {
 	var w ColumnarWriter
-	w.SetCount(3)
+	w.SetCount(1)
 	w.WriteColumnUUID(1, [][16]byte{uuidA}) // only 1, count=3
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
+	data[0] = 3 // Corrupt the valid header; the writer itself now rejects this count.
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -1618,9 +1754,10 @@ func TestColumnarSkipUUIDTruncated(t *testing.T) {
 
 func TestColumnarSkipUUIDPtrTruncated(t *testing.T) {
 	var w ColumnarWriter
-	w.SetCount(3)
+	w.SetCount(1)
 	w.WriteColumnUUIDPtr(1, []*[16]byte{&uuidA}) // only 1, count=3
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
+	data[0] = 3 // Corrupt the valid header; the writer itself now rejects this count.
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -1633,9 +1770,10 @@ func TestColumnarSkipUUIDPtrTruncated(t *testing.T) {
 func TestColumnarSkipBytesPtrTruncated(t *testing.T) {
 	blob := []byte("x")
 	var w ColumnarWriter
-	w.SetCount(3)
+	w.SetCount(1)
 	w.WriteColumnBytesPtr(1, []*[]byte{&blob}) // only 1, count=3
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
+	data[0] = 3 // Corrupt the valid header; the writer itself now rejects this count.
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -1711,18 +1849,18 @@ func TestColumnarSkipUUIDPtrErrors(t *testing.T) {
 // --- FieldMask edge cases ---
 
 func TestFieldMaskSetInvalid(t *testing.T) {
-	mask := FieldMaskSet(nil, 0)
-	if mask != nil {
+	mask, err := FieldMaskSet(nil, 0)
+	if err == nil || mask != nil {
 		t.Error("fieldID 0 should not set anything")
 	}
-	mask = FieldMaskSet(nil, -1)
-	if mask != nil {
+	mask, err = FieldMaskSet(nil, -1)
+	if err == nil || mask != nil {
 		t.Error("negative fieldID should not set anything")
 	}
 }
 
 func TestFieldMaskHasInvalid(t *testing.T) {
-	mask := FieldMaskSet(nil, 1)
+	mask := testutil.Bytes(t)(FieldMaskSet(nil, 1))
 	if FieldMaskHas(mask, 0) {
 		t.Error("fieldID 0 should not match")
 	}
@@ -1732,19 +1870,19 @@ func TestFieldMaskHasInvalid(t *testing.T) {
 }
 
 func TestFieldMaskHasBeyondLen(t *testing.T) {
-	mask := FieldMaskSet(nil, 1) // 1 byte
+	mask := testutil.Bytes(t)(FieldMaskSet(nil, 1)) // 1 byte
 	if FieldMaskHas(mask, 100) {
 		t.Error("field beyond mask length should not match")
 	}
 }
 
 func TestFieldMaskAllZero(t *testing.T) {
-	mask := FieldMaskAll(0)
-	if mask != nil {
+	mask, err := FieldMaskAll(0)
+	if err == nil || mask != nil {
 		t.Error("FieldMaskAll(0) should return nil")
 	}
-	mask = FieldMaskAll(-1)
-	if mask != nil {
+	mask, err = FieldMaskAll(-1)
+	if err == nil || mask != nil {
 		t.Error("FieldMaskAll(-1) should return nil")
 	}
 }
@@ -1841,7 +1979,7 @@ func TestColumnarNullableFloat(t *testing.T) {
 	var w ColumnarWriter
 	w.SetCount(3)
 	w.WriteColumnFloatPtr(1, []*float64{&v1, nil, &v3})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -1866,7 +2004,7 @@ func TestColumnarNullableBool(t *testing.T) {
 	var w ColumnarWriter
 	w.SetCount(3)
 	w.WriteColumnBoolPtr(1, []*bool{&tr, nil, &fa})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -1954,6 +2092,46 @@ func TestDecoderReadBytesPtrNullable(t *testing.T) {
 	}
 }
 
+func TestDecoderNullableBytesRejectMalformedInput(t *testing.T) {
+	for _, data := range [][]byte{nil, {2}, {255}, {1}, {1, 2, 42}} {
+		dec := NewDecoder(data)
+		if value := dec.ReadBytesPtr(); value != nil || dec.Err() == nil {
+			t.Fatalf("ReadBytesPtr(%x) = %x, err=%v", data, value, dec.Err())
+		}
+		if dec.Finish() == nil || dec.NextField() {
+			t.Fatalf("malformed nullable bytes continued decoding: %x", data)
+		}
+		dec = NewDecoder(data)
+		if value := dec.ReadBytesValuePtr(); value != nil || dec.Err() == nil {
+			t.Fatalf("ReadBytesValuePtr(%x) = %v, err=%v", data, value, dec.Err())
+		}
+	}
+}
+
+func TestDecoderSkipFixed16Boundaries(t *testing.T) {
+	for length := 0; length <= 16; length++ {
+		data := append([]byte{0}, make([]byte, length)...)
+		dec := NewDecoder(data)
+		dec.ReadInt()
+		dec.SkipFixed16()
+		if length < 16 {
+			if dec.Err() == nil || dec.Offset() != 1 || dec.Finish() == nil || dec.NextField() {
+				t.Fatalf("truncated fixed16 advanced or succeeded: length=%d offset=%d err=%v", length, dec.Offset(), dec.Err())
+			}
+		} else if dec.Offset() != 17 || dec.Finish() != nil {
+			t.Fatalf("complete fixed16 failed: offset=%d err=%v", dec.Offset(), dec.Err())
+		}
+	}
+	for _, offset := range []int{-1, 17, math.MaxInt} {
+		dec := NewDecoder(make([]byte, 16))
+		dec.off = offset
+		dec.SkipFixed16()
+		if dec.Err() == nil || dec.Offset() != offset {
+			t.Fatalf("invalid offset %d accepted or changed", offset)
+		}
+	}
+}
+
 func TestColumnarFloatPtrTruncated(t *testing.T) {
 	// Write header but truncate the float data
 	buf := AppendVarint(nil, 2) // count=2
@@ -2012,6 +2190,9 @@ func TestColumnarCountLimit(t *testing.T) {
 
 func TestReadArenaSize(t *testing.T) {
 	buf := AppendVarint(nil, 42)
+	buf = append(buf, 1)
+	buf = AppendBytes(buf, []byte(string(bytes.Repeat([]byte{'a'}, 42))))
+	buf = append(buf, 0)
 	dec := NewDecoder(buf)
 	size := dec.ReadArenaSize()
 	if size != 42 {
@@ -2034,11 +2215,14 @@ func TestReadArenaSizeEmpty(t *testing.T) {
 }
 
 func TestSkipArenaHeader(t *testing.T) {
-	// Build: [arena_size varint] [fieldID=1] [int value]
+	// Build: [arena_size varint] [fieldID=1] [int value] [fieldID=2] [string] [end]
 	var buf []byte
 	buf = AppendVarint(buf, 100) // arena size
 	buf = AppendVarint(buf, 1)   // field ID 1
 	buf = AppendSvarint(buf, 42) // int value
+	buf = append(buf, 2)
+	buf = AppendBytes(buf, []byte(string(bytes.Repeat([]byte{'a'}, 100))))
+	buf = append(buf, 0)
 
 	dec := NewDecoder(buf)
 	dec.SkipArenaHeader()
@@ -2069,9 +2253,9 @@ func TestReadStringArena(t *testing.T) {
 	// Encode two strings
 	var buf []byte
 	buf = AppendVarint(buf, 1) // field ID 1
-	buf = AppendString(buf, "hello")
+	buf = AppendBytes(buf, []byte("hello"))
 	buf = AppendVarint(buf, 2) // field ID 2
-	buf = AppendString(buf, "world")
+	buf = AppendBytes(buf, []byte("world"))
 	buf = append(buf, 0x00) // end marker
 
 	arena := make([]byte, 10) // "hello"(5) + "world"(5)
@@ -2112,7 +2296,7 @@ func TestReadStringArenaEmpty(t *testing.T) {
 	// Empty string should work without advancing arena offset
 	var buf []byte
 	buf = AppendVarint(buf, 1)
-	buf = AppendString(buf, "")
+	buf = AppendBytes(buf, []byte(""))
 	buf = append(buf, 0x00)
 
 	arena := make([]byte, 0)
@@ -2133,7 +2317,7 @@ func TestReadStringArenaPtr(t *testing.T) {
 	// Non-null string
 	var buf []byte
 	buf = AppendPresent(buf)
-	buf = AppendString(buf, "hello")
+	buf = AppendBytes(buf, []byte("hello"))
 
 	arena := make([]byte, 5)
 	arenaOff := 0
@@ -2177,7 +2361,7 @@ func TestReadStringArenaOverflow(t *testing.T) {
 	// Arena too small — should fall back to regular allocation, not panic
 	var buf []byte
 	buf = AppendVarint(buf, 1)
-	buf = AppendString(buf, "hello world") // 11 bytes
+	buf = AppendBytes(buf, []byte("hello world")) // 11 bytes
 	buf = append(buf, 0x00)
 
 	arena := make([]byte, 3) // too small for "hello world"
@@ -2245,11 +2429,11 @@ func TestReadStringArenaFullRoundTrip(t *testing.T) {
 	var buf []byte
 	buf = AppendVarint(buf, uint64(totalStringLen))
 	buf = AppendVarint(buf, 1)
-	buf = AppendString(buf, name)
+	buf = AppendBytes(buf, []byte(name))
 	buf = AppendVarint(buf, 2)
 	buf = AppendSvarint(buf, 30) // age (non-string field)
 	buf = AppendVarint(buf, 3)
-	buf = AppendString(buf, email)
+	buf = AppendBytes(buf, []byte(email))
 	buf = append(buf, 0x00)
 
 	// Decode with arena
@@ -2294,7 +2478,7 @@ func TestReadStringArenaUTF8(t *testing.T) {
 	s := "你好世界🌍"
 	var buf []byte
 	buf = AppendVarint(buf, 1)
-	buf = AppendString(buf, s)
+	buf = AppendBytes(buf, []byte(s))
 	buf = append(buf, 0x00)
 
 	arena := make([]byte, len(s))
@@ -2323,14 +2507,14 @@ func BenchmarkReadStringVsArena(b *testing.B) {
 	arenaBuf := AppendVarint(nil, uint64(totalLen))
 	for i, s := range strs {
 		arenaBuf = AppendVarint(arenaBuf, uint64(i+1))
-		arenaBuf = AppendString(arenaBuf, s)
+		arenaBuf = AppendBytes(arenaBuf, []byte(s))
 	}
 	arenaBuf = append(arenaBuf, 0x00)
 
 	// Without arena header
 	for i, s := range strs {
 		buf = AppendVarint(buf, uint64(i+1))
-		buf = AppendString(buf, s)
+		buf = AppendBytes(buf, []byte(s))
 	}
 	buf = append(buf, 0x00)
 
@@ -2365,7 +2549,7 @@ func TestSkipColumnInt(t *testing.T) {
 	w.SetCount(3)
 	w.WriteColumnInt(1, []int64{10, 20, 30})
 	w.WriteColumnString(2, []string{"a", "b", "c"})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	// Skip int column, read string column
@@ -2386,7 +2570,7 @@ func TestSkipColumnFloat(t *testing.T) {
 	w.SetCount(2)
 	w.WriteColumnFloat(1, []float64{1.1, 2.2})
 	w.WriteColumnInt(2, []int64{42, 43})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -2406,7 +2590,7 @@ func TestSkipColumnString(t *testing.T) {
 	w.SetCount(2)
 	w.WriteColumnString(1, []string{"hello", "world"})
 	w.WriteColumnInt(2, []int64{1, 2})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -2426,7 +2610,7 @@ func TestSkipColumnBool(t *testing.T) {
 	w.SetCount(2)
 	w.WriteColumnBool(1, []bool{true, false})
 	w.WriteColumnInt(2, []int64{7, 8})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	r.NextColumn()
@@ -2453,7 +2637,7 @@ func TestSkipColumnNullable(t *testing.T) {
 	b1 := true
 	w.WriteColumnBoolPtr(4, []*bool{&b1, nil, &b1})
 	w.WriteColumnInt(5, []int64{99, 88, 77})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	// Skip all nullable columns
@@ -2572,7 +2756,7 @@ func TestSkipColumnString_Truncated(t *testing.T) {
 	buf := AppendVarint(nil, 2)
 	buf = AppendVarint(buf, 0) // arena size=0
 	buf = AppendVarint(buf, 1)
-	buf = AppendString(buf, "ok") // only 1 value
+	buf = AppendBytes(buf, []byte("ok")) // only 1 value
 	r := NewColumnarReader(buf)
 	r.NextColumn()
 	r.SkipColumnString()
@@ -2682,12 +2866,12 @@ func TestReadColumnBytes_Truncated(t *testing.T) {
 func TestDecoderSkipMethods(t *testing.T) {
 	// Build: [varint][fixed64][len-prefixed string][0x00]
 	var buf []byte
-	buf = AppendVarint(buf, 1)     // field 1
-	buf = AppendSvarint(buf, 42)   // varint value
-	buf = AppendVarint(buf, 2)     // field 2
-	buf = AppendFixed64(buf, 3.14) // fixed64 value
-	buf = AppendVarint(buf, 3)     // field 3
-	buf = AppendString(buf, "hi")  // len-prefixed
+	buf = AppendVarint(buf, 1)                                          // field 1
+	buf = AppendSvarint(buf, 42)                                        // varint value
+	buf = AppendVarint(buf, 2)                                          // field 2
+	buf = binary.LittleEndian.AppendUint64(buf, math.Float64bits(3.14)) // fixed64 value
+	buf = AppendVarint(buf, 3)                                          // field 3
+	buf = AppendBytes(buf, []byte("hi"))                                // len-prefixed
 	buf = append(buf, 0x00)
 
 	dec := NewDecoder(buf)
@@ -2709,8 +2893,8 @@ func TestDecoderSkipArrayAndFixed16(t *testing.T) {
 	uuidValue := [16]byte{1, 2, 3}
 	var data []byte
 	data = AppendVarint(data, 2)
-	data = AppendString(data, "a")
-	data = AppendString(data, "b")
+	data = AppendBytes(data, []byte("a"))
+	data = AppendBytes(data, []byte("b"))
 	data = AppendUUID(data, uuidValue)
 	dec := NewDecoder(data)
 	dec.SkipArray(SkipBytes)
@@ -2726,10 +2910,10 @@ func TestDecoderSkipNullable(t *testing.T) {
 	buf = AppendNull(buf)      // nullable varint = null
 	buf = AppendVarint(buf, 2) // field 2
 	buf = AppendPresent(buf)
-	buf = AppendFixed64(buf, 1.0) // nullable fixed64 = present
-	buf = AppendVarint(buf, 3)    // field 3
+	buf = binary.LittleEndian.AppendUint64(buf, math.Float64bits(1.0)) // nullable fixed64 = present
+	buf = AppendVarint(buf, 3)                                         // field 3
 	buf = AppendPresent(buf)
-	buf = AppendString(buf, "x") // nullable string = present
+	buf = AppendBytes(buf, []byte("x")) // nullable string = present
 	buf = append(buf, 0x00)
 
 	dec := NewDecoder(buf)
@@ -2755,10 +2939,10 @@ func TestDecoderSkipValueVariants(t *testing.T) {
 		data   []byte
 	}{
 		{name: "varint", typeID: SkipVarint, data: AppendVarint(nil, 7)},
-		{name: "fixed64", typeID: SkipFixed64, data: AppendFixed64(nil, 1.5)},
+		{name: "fixed64", typeID: SkipFixed64, data: binary.LittleEndian.AppendUint64(nil, math.Float64bits(1.5))},
 		{name: "bytes", typeID: SkipBytes, data: AppendBytes(nil, []byte("x"))},
 		{name: "nullable varint", typeID: SkipNullVarint, data: AppendVarint(AppendPresent(nil), 7)},
-		{name: "nullable fixed64", typeID: SkipNullFixed64, data: AppendFixed64(AppendPresent(nil), 1.5)},
+		{name: "nullable fixed64", typeID: SkipNullFixed64, data: binary.LittleEndian.AppendUint64(AppendPresent(nil), math.Float64bits(1.5))},
 		{name: "nullable bytes", typeID: SkipNullBytes, data: AppendBytes(AppendPresent(nil), []byte("x"))},
 		{name: "fixed16", typeID: SkipFixed16, data: AppendUUID(nil, uuidValue)},
 		{name: "nullable fixed16", typeID: SkipNullFixed16, data: AppendUUID(AppendPresent(nil), uuidValue)},
@@ -2929,7 +3113,7 @@ func TestColumnarOffset(t *testing.T) {
 	w := &ColumnarWriter{}
 	w.SetCount(1)
 	w.WriteColumnInt(1, []int64{42})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 	r := NewColumnarReader(data)
 	if r.Offset() <= 0 {
 		t.Fatal("offset should be > 0 after reading count")
@@ -2943,7 +3127,7 @@ func TestColumnarArenaSize(t *testing.T) {
 	w.SetCount(3)
 	w.WriteColumnString(1, []string{"hello", "world", "!"})
 	w.WriteColumnInt(2, []int64{1, 2, 3})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	if w.TotalStringLen() != 11 { // "hello"(5) + "world"(5) + "!"(1)
 		t.Fatalf("TotalStringLen: expected 11, got %d", w.TotalStringLen())
@@ -2964,7 +3148,7 @@ func TestColumnarArenaSizeWithPtr(t *testing.T) {
 	w := &ColumnarWriter{}
 	w.SetCount(3)
 	w.WriteColumnStringPtr(1, []*string{&s1, nil, &s2})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	if w.TotalStringLen() != 9 { // "foo"(3) + "barbaz"(6), nil doesn't count
 		t.Fatalf("TotalStringLen: expected 9, got %d", w.TotalStringLen())
@@ -2980,7 +3164,7 @@ func TestColumnarReadColumnStringArena(t *testing.T) {
 	w := &ColumnarWriter{}
 	w.SetCount(3)
 	w.WriteColumnString(1, []string{"alpha", "beta", "gamma"})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	arena := make([]byte, r.ArenaSize())
@@ -3017,7 +3201,7 @@ func TestColumnarReadColumnStringArenaEmpty(t *testing.T) {
 	w := &ColumnarWriter{}
 	w.SetCount(2)
 	w.WriteColumnString(1, []string{"", "hi"})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	arena := make([]byte, r.ArenaSize())
@@ -3043,7 +3227,7 @@ func TestColumnarReadColumnStringArenaOverflow(t *testing.T) {
 	w := &ColumnarWriter{}
 	w.SetCount(2)
 	w.WriteColumnString(1, []string{"hello", "world"})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	// Allocate arena too small
@@ -3071,7 +3255,7 @@ func TestColumnarReadColumnStringPtrArena(t *testing.T) {
 	w := &ColumnarWriter{}
 	w.SetCount(3)
 	w.WriteColumnStringPtr(1, []*string{&s1, nil, &s2})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	arena := make([]byte, r.ArenaSize())
@@ -3111,7 +3295,7 @@ func TestColumnarReadColumnStringPtrArenaEmptyString(t *testing.T) {
 	w := &ColumnarWriter{}
 	w.SetCount(1)
 	w.WriteColumnStringPtr(1, []*string{&s})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	arena := make([]byte, r.ArenaSize())
@@ -3135,7 +3319,7 @@ func TestColumnarReadColumnStringPtrArenaOverflow(t *testing.T) {
 	w := &ColumnarWriter{}
 	w.SetCount(1)
 	w.WriteColumnStringPtr(1, []*string{&s})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	arena := make([]byte, 3) // too small
@@ -3162,7 +3346,7 @@ func TestColumnarArenaFullRoundTrip(t *testing.T) {
 	w.WriteColumnString(2, []string{"alice", "bob"})
 	w.WriteColumnString(3, []string{"x@example.com", "y@test.org"})
 	w.WriteColumnFloat(4, []float64{1.5, 2.5})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	r := NewColumnarReader(data)
 	if r.ArenaSize() != 5+3+13+10 { // alice(5)+bob(3)+x@example.com(13)+y@test.org(10)
@@ -3211,7 +3395,7 @@ func TestColumnarArenaNoStrings(t *testing.T) {
 	w.SetCount(2)
 	w.WriteColumnInt(1, []int64{1, 2})
 	w.WriteColumnBool(2, []bool{true, false})
-	data := w.Bytes()
+	data := testutil.Bytes(t)(w.Bytes())
 
 	if w.TotalStringLen() != 0 {
 		t.Fatalf("TotalStringLen should be 0, got %d", w.TotalStringLen())
@@ -3230,7 +3414,7 @@ func TestColumnarWriterEmptyOmitsFieldColumns(t *testing.T) {
 	w.WriteColumnString(2, nil)
 
 	want := []byte{0, 0, 0}
-	if got := w.Bytes(); !bytes.Equal(got, want) {
+	if got := testutil.Bytes(t)(w.Bytes()); !bytes.Equal(got, want) {
 		t.Fatalf("empty columnar payload = %v, want %v", got, want)
 	}
 }
@@ -3269,11 +3453,11 @@ func TestColumnarReaderArenaSizeExceedsLimit(t *testing.T) {
 func TestColumnarReadColumnStringArenaTruncated(t *testing.T) {
 	// Manually craft: count=3, arena=0, fieldID=1, then only 1 string with length > remaining buf
 	var buf []byte
-	buf = AppendVarint(buf, 3)    // count=3
-	buf = AppendVarint(buf, 0)    // arena size=0
-	buf = AppendVarint(buf, 1)    // fieldID=1
-	buf = AppendString(buf, "ok") // 1st value
-	buf = AppendVarint(buf, 100)  // 2nd value: length=100 but no data → truncated
+	buf = AppendVarint(buf, 3)           // count=3
+	buf = AppendVarint(buf, 0)           // arena size=0
+	buf = AppendVarint(buf, 1)           // fieldID=1
+	buf = AppendBytes(buf, []byte("ok")) // 1st value
+	buf = AppendVarint(buf, 100)         // 2nd value: length=100 but no data → truncated
 
 	r := NewColumnarReader(buf)
 	arena := make([]byte, 10)
@@ -3291,13 +3475,13 @@ func TestColumnarReadColumnStringArenaTruncated(t *testing.T) {
 func TestColumnarReadColumnStringPtrArenaTruncated(t *testing.T) {
 	// Manually craft: count=2, arena=0, fieldID=1, present+string, then truncated
 	var buf []byte
-	buf = AppendVarint(buf, 2)   // count=2
-	buf = AppendVarint(buf, 0)   // arena size=0
-	buf = AppendVarint(buf, 1)   // fieldID=1
-	buf = AppendPresent(buf)     // present
-	buf = AppendString(buf, "x") // 1st value
-	buf = AppendPresent(buf)     // present
-	buf = AppendVarint(buf, 100) // length=100 but no data → truncated
+	buf = AppendVarint(buf, 2)          // count=2
+	buf = AppendVarint(buf, 0)          // arena size=0
+	buf = AppendVarint(buf, 1)          // fieldID=1
+	buf = AppendPresent(buf)            // present
+	buf = AppendBytes(buf, []byte("x")) // 1st value
+	buf = AppendPresent(buf)            // present
+	buf = AppendVarint(buf, 100)        // length=100 but no data → truncated
 
 	r := NewColumnarReader(buf)
 	arena := make([]byte, 10)
@@ -3320,7 +3504,7 @@ func BenchmarkColumnarStringNoArena(b *testing.B) {
 		vals[i] = "user_name_value_" + string(rune('A'+i%26))
 	}
 	w.WriteColumnString(1, vals)
-	data := w.Bytes()
+	data := testutil.Bytes(b)(w.Bytes())
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -3339,7 +3523,7 @@ func BenchmarkColumnarStringArena(b *testing.B) {
 		vals[i] = "user_name_value_" + string(rune('A'+i%26))
 	}
 	w.WriteColumnString(1, vals)
-	data := w.Bytes()
+	data := testutil.Bytes(b)(w.Bytes())
 
 	b.ReportAllocs()
 	b.ResetTimer()

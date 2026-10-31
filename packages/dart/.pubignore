@@ -1,0 +1,9 @@
+.dart_tool/
+.packages
+pubspec.lock
+build/
+.tmp/
+
+# Development-only fixtures remain available in the source repository.
+benchmark/
+test/

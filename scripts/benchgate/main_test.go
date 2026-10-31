@@ -48,6 +48,52 @@ func TestEvaluateRejectsSignificantAllocationRegression(t *testing.T) {
 	}
 }
 
+func TestEvaluateZeroBaselineRegression(t *testing.T) {
+	for _, unit := range []string{"sec/op", "B/op", "allocs/op"} {
+		t.Run(unit, func(t *testing.T) {
+			input := zeroBaselineCSV(unit, "0", "72", "?")
+			result := mustEvaluate(t, input)
+			if len(result.Regressions) != 1 || result.Regressions[0].Key.Unit != unit {
+				t.Fatalf("zero baseline increase lost: %+v", result)
+			}
+			if !strings.Contains(result.Regressions[0].Description, "base=0 head=72 delta=+72") {
+				t.Fatalf("missing absolute cost: %s", result.Regressions[0].Description)
+			}
+			file := writeRunInput(t, input)
+			var output strings.Builder
+			if err := run([]string{confirmationFlag, file}, &output); err != nil || output.String() != "true\n" {
+				t.Fatalf("confirmation was not requested: %q %v", output.String(), err)
+			}
+			if err := run([]string{file, file}, io.Discard); err == nil || !strings.Contains(err.Error(), "rejected 1 regression") {
+				t.Fatalf("confirmed increase was not rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestEvaluateZeroBaselineStillValidatesEvidence(t *testing.T) {
+	for _, values := range [][3]string{{"0", "0", "?"}, {"1", "2", "?"}, {"NaN", "72", "?"}, {"0", "-1", "?"}, {"0", "+Inf", "?"}} {
+		if _, err := evaluate(strings.NewReader(zeroBaselineCSV("B/op", values[0], values[1], values[2]))); err == nil {
+			t.Fatalf("invalid comparison accepted: %v", values)
+		}
+	}
+	for _, values := range [][3]string{{"0", "0", "~"}, {"0", "72", "~"}, {"72", "0", "-100.00%"}} {
+		if result := mustEvaluate(t, zeroBaselineCSV("B/op", values[0], values[1], values[2])); len(result.Regressions) != 0 {
+			t.Fatalf("noise or improvement rejected: %v", result.Regressions)
+		}
+	}
+	input := strings.ReplaceAll(zeroBaselineCSV("B/op", "0", "72", "?"), "n=10", "n=9")
+	if _, err := evaluate(strings.NewReader(input)); err == nil {
+		t.Fatal("insufficient evidence accepted")
+	}
+}
+
+func zeroBaselineCSV(unit, base, head, delta string) string {
+	input := benchstatCSV("~", "~", "n=10")
+	table := strings.Replace(benchstatTable(unit, delta, "n=10"), ",10,0%,11,0%,", ","+base+",0%,"+head+",0%,", 1)
+	return strings.Replace(input, benchstatTable(unit, "~", "n=10"), table, 1)
+}
+
 func TestConfirmEvaluationsAcceptsUnconfirmedRunnerNoise(t *testing.T) {
 	primary := mustEvaluate(t, benchstatCSV("+5.37%", "~", "n=10"))
 	confirmation := mustEvaluate(t, benchstatCSV("+1.42%", "~", "n=10"))

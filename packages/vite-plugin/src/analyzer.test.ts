@@ -83,6 +83,67 @@ const schema: LuxoSchema = {
 }
 
 describe('analyzeAndTransform', () => {
+  it('reports source syntax errors instead of silently skipping field analysis', () => {
+    expect(() => analyzeAndTransform('const user = await client.me(); const broken = ;', 'broken.ts', schema))
+      .toThrow(/broken\.ts/)
+  })
+
+  it('tracks satisfies expressions without falling back to all fields', () => {
+    const code = `
+const user = (await client.getUser({ id: 9007199254740993n })) satisfies { name: string }
+console.log(user.name)
+`
+    const result = analyzeAndTransform(code, 'consumer.ts', schema)
+    expect(result).toContain("getUser({ $select: 'name', id: 9007199254740993n })")
+    expect(result).toContain('satisfies { name: string }')
+  })
+
+  it('keeps aliases through satisfies and type assertions precise', () => {
+    const code = `
+const user = await client.me()
+const alias = (user satisfies { email: string }) as { email: string }
+console.log(alias.email)
+`
+    expect(analyzeAndTransform(code, 'consumer.ts', schema)).toContain("client.me({ $select: 'email' })")
+  })
+
+  it('supports angle-bracket assertions in TS and JSX only in TSX', () => {
+    const code = 'const user = <{ name: string }> await client.me(); console.log(user.name)'
+    expect(analyzeAndTransform(code, 'consumer.ts', schema)).toContain("client.me({ $select: 'name' })")
+    const jsx = 'const user = await client.me(); const view = <div>{user.name}</div>'
+    expect(analyzeAndTransform(jsx, 'view.tsx?import', schema)).toContain("client.me({ $select: 'name' })")
+    expect(() => analyzeAndTransform(jsx, 'view.ts', schema)).toThrow(/view\.ts/)
+    for (const extension of ['mts', 'cts']) {
+      expect(() => analyzeAndTransform(code, `consumer.${extension}`, schema)).toThrow(`Cannot analyze consumer.${extension}:`)
+    }
+  })
+
+  it('handles decorators, const type parameters and resource declarations around API calls', () => {
+    const code = `
+@decorate
+class View {
+  accessor title = ''
+  identity<const T>(value: T): T { return value }
+}
+await using resource = acquireResource()
+const user = await client.me()
+console.log(user.name)
+`
+    const result = analyzeAndTransform(code, 'modern.ts', schema)
+    expect(result).toContain("client.me({ $select: 'name' })")
+    expect(result).toContain('identity<const T>')
+    expect(result).toContain('await using resource')
+  })
+
+  it('handles missing AST nodes and array pattern holes with Babel 8 paths', () => {
+    const code = `
+let later: string
+const [, user] = await client.allUsers()
+console.log(user.name)
+`
+    expect(analyzeAndTransform(code, 'consumer.ts', schema)).toContain("client.allUsers({ $select: 'name' })")
+  })
+
   it('should inject $select for simple field access', () => {
     const code = `
 const user = await client.getUser({ id: 1 })
@@ -391,4 +452,22 @@ console.log(user.name)
     const result = analyzeAndTransform(code, 'test.ts', schema)
     expect(result).toContain("getUser({ $select: 'name', id: 1 })")
   })
+})
+
+it('hoists separate immutable selection plans in the production transform', () => {
+  const code = `'use client';
+const $luxoSelection = 1;
+async function run(params) {
+  const a = await client.getUser({ id: 1 });
+  console.log(a.name);
+  const b = await client.getUser(params);
+  console.log(b.email);
+}`
+  const output = analyzeAndTransform(code, 'consumer.ts', schema, true)!
+  expect(output.startsWith("'use client';")).toBe(true)
+  expect(output).toContain('$luxoSelection_Prepare("name")')
+  expect(output).toContain('$luxoSelection_Prepare("email")')
+  expect(output).toContain('getUser({ $select: $luxoSelection_0, id: 1 })')
+  expect(output).toContain('getUser({ $select: $luxoSelection_1, ...(params) })')
+  expect(output.indexOf('const $luxoSelection_0')).toBeLessThan(output.indexOf('async function run'))
 })

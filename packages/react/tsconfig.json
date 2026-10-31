@@ -6,12 +6,12 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "jsx": "react-jsx",
     "strict": true,
-    "noEmit": true,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "rootDir": "src",
+    "outDir": "dist",
     "skipLibCheck": false,
-    "verbatimModuleSyntax": true,
-    "paths": {
-      "@luxojs/client": ["../client/src/index.ts"]
-    }
+    "verbatimModuleSyntax": true
   },
   "include": ["src/**/*.ts"],
   "exclude": ["src/**/*.test.ts", "src/**/*.bench.ts"]

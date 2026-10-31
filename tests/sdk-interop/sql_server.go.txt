@@ -1,0 +1,130 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/light-speak/luxo/pkg/lux/api"
+	"github.com/light-speak/luxo/pkg/lux/h2transport"
+	"github.com/light-speak/luxo/pkg/lux/pg"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"sync"
+	"sync/atomic"
+)
+
+type capture struct {
+	mu      sync.Mutex
+	queries []string
+}
+
+func (c *capture) TraceQueryStart(ctx context.Context, _ *pgx.Conn, d pgx.TraceQueryStartData) context.Context {
+	c.mu.Lock()
+	c.queries = append(c.queries, d.SQL)
+	c.mu.Unlock()
+	return ctx
+}
+func (*capture) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+func (c *capture) take() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	q := c.queries
+	c.queries = nil
+	return q
+}
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+func run() error {
+	ctx := context.Background()
+	dsn := os.Getenv("LUXO_TEST_DATABASE_URL")
+	if dsn == "" {
+		return fmt.Errorf("LUXO_TEST_DATABASE_URL must identify a dedicated empty test database")
+	}
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return err
+	}
+	trace := &capture{}
+	cfg.ConnConfig.Tracer = trace
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	_, err = pool.Exec(ctx, "CREATE TABLE products(id bigint PRIMARY KEY,name text,price bigint,description text); INSERT INTO products SELECT 9007199254740992+i,'item-'||i,i,repeat('x',4096) FROM generate_series(1,128) i")
+	if err != nil {
+		return err
+	}
+	trace.take()
+	router, err := prepareSQLRouter(pool)
+	if err != nil {
+		return err
+	}
+	return serveSQLFixture(router, trace)
+}
+
+func prepareSQLRouter(pool *pgxpool.Pool) (*api.Router, error) {
+	app := NewFromDB(pg.NewDBFromPool(pool))
+	router := api.NewRouter()
+	router.SetDevMode(false)
+	router.IntrospectionKey = "benchmark"
+	if err := RegisterSchema(router.Schema); err != nil {
+		return nil, err
+	}
+	if err := router.Registry.RegisterSchemaAPIs(router.Schema); err != nil {
+		return nil, err
+	}
+	if err := RegisterHandlers(router, app); err != nil {
+		return nil, err
+	}
+	if err := router.Prepare(); err != nil {
+		return nil, err
+	}
+	return router, nil
+}
+
+func serveSQLFixture(router *api.Router, trace *capture) error {
+	var h2, other atomic.Int64
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor == 2 {
+			h2.Add(1)
+		} else {
+			other.Add(1)
+		}
+		router.ServeHTTP(w, r)
+	})
+	secure := httptest.NewUnstartedServer(handler)
+	engine, err := h2transport.NewServer(handler)
+	if err != nil {
+		return err
+	}
+	if err = engine.ConfigureHTTPServer(secure.Config); err != nil {
+		return err
+	}
+	secure.TLS = secure.Config.TLSConfig
+	secure.EnableHTTP2 = true
+	secure.StartTLS()
+	defer secure.Close()
+	defer engine.Close()
+	plain := httptest.NewServer(router)
+	defer plain.Close()
+	certificate := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: secure.Certificate().Raw})
+	if err := json.NewEncoder(os.Stdout).Encode(map[string]string{"url": secure.URL + "/luvia", "plain": plain.URL + "/luvia", "certificate": string(certificate)}); err != nil {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	return json.NewEncoder(os.Stdout).Encode(struct {
+		H2    int64    `json:"h2Requests"`
+		Other int64    `json:"otherRequests"`
+		SQL   []string `json:"sql"`
+	}{h2.Load(), other.Load(), trace.take()})
+}

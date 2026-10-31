@@ -13,7 +13,7 @@
   <a href="https://github.com/light-speak/luxo/actions/workflows/test.yml"><img src="https://github.com/light-speak/luxo/actions/workflows/test.yml/badge.svg" alt="Tests" /></a>
   <a href="https://codecov.io/gh/light-speak/luxo"><img src="https://codecov.io/gh/light-speak/luxo/branch/main/graph/badge.svg" alt="codecov" /></a>
   <a href="https://goreportcard.com/report/github.com/light-speak/luxo"><img src="https://goreportcard.com/badge/github.com/light-speak/luxo?v=2" alt="Go Report Card" /></a>
-  <a href="https://go.dev"><img src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go" alt="Go Version" /></a>
+  <a href="https://go.dev"><img src="https://img.shields.io/badge/Go-1.27.1+-00ADD8?style=flat&logo=go" alt="Go Version" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License" /></a>
 </p>
 
@@ -25,6 +25,8 @@
 </p>
 
 ---
+
+The Go core and CLI in 1.0.0-beta.1 support 64-bit platforms only. 32-bit Go targets are not supported or release-tested. This does not change the wire format or its Int64/UInt64 value ranges.
 
 ## Why "Luxo"?
 
@@ -81,6 +83,8 @@ One source definition drives the generated server, database layer, migrations, s
 
 Luxo is a backend programming language, not only a schema DSL. Its scalar types are `Int`, `Float`, `String`, `Boolean`, `DateTime`, `Duration`, `UUID`, `Decimal`, `Bytes`, and `JSON`; generic runtime types include `Result<T>`, `Channel<T>`, `Page<T>`, and `Cursor<T>`. Luxo compiles to Go.
 
+DateTime preserves nanoseconds in both JSON and Binary. JSON requires timezone-bearing RFC3339 with at most nine fractional digits and UTC years 0000–9999; Binary carries floor Unix seconds plus unsigned nanoseconds. Excess precision and out-of-range values are rejected. This pre-release change requires matching regenerated services and SDKs, with no legacy time fallback. Database storage precision and performance are separate acceptance gates. Internal RPC is now version 4, adding explicit nullable root responses; the corresponding four-SDK migration is not complete and the release is not frozen.
+
 ### Null Safety
 
 ```luxo
@@ -120,6 +124,32 @@ api getUser(id: Int): User {
 ```
 
 `Result<T>` is the ABI for Go-backed native functions. Public APIs declare their payload type (`User` above); transport errors use the shared structured error envelope.
+
+### Compiled Functions and Native Boundaries
+
+Ordinary functions are compiled into direct module-local Go methods. They can call other compiled functions or cross into a Go implementation through `@native`; neither path uses reflection or runtime name lookup.
+
+```luxo
+fn normalizeScore(score: Int, ceiling: Int = 100): Int {
+  when(score) {
+    in 0..ceiling -> score
+    else -> ceiling
+  }
+}
+
+fn verifyRelease(projectId: Int): Result<Boolean> @native
+fn recordRelease(projectId: Int) @native
+
+api releaseReady(projectId: Int, score: Int): Boolean {
+  val normalized = normalizeScore(ceiling: 100, score: score)
+  recordRelease(projectId)             // Go error is propagated automatically
+  verifyRelease(projectId)? && normalized >= 80
+}
+```
+
+Named arguments are matched to declarations at compile time. Defaults must be type-safe compile-time constants, and invalid names, duplicates, missing required values, or type mismatches stop generation during semantic analysis.
+Value-returning native functions use `Result<T>` and explicit `?`; native functions without a value lower to Go `error` and propagate failures automatically.
+Function variadics use `...values: T`, must be last, cannot have defaults, and preserve the same direct Go variadic ABI for compiled and `@native` functions. Public APIs use `[T]` instead because their named parameter IDs must remain stable on the wire.
 
 ### Concurrency — No async/await Infection
 
@@ -172,9 +202,21 @@ val vip = users.any { it.role == Role.VIP }
 
 ### API Definition — Three Levels
 
+Declare cache behavior explicitly in the project's `luxo.cache.json`:
+
+```json
+{"version":1,"policies":{"userPreview":{"mode":"ttl","ttl":"1m","scope":"private"}}}
+```
+
+Beta supports explicit TTL response caching, not automatic write invalidation.
+TTL starts when an entry is filled; it does not bound the age of the underlying database snapshot.
+Use uncached queries for decisions that require fresh data. Identity isolation is preserved;
+an explicit backend, deployment namespace and bounded origin concurrency are required at startup.
+The `invalidation` mode is rejected rather than silently converted to TTL.
+
 ```luxo
 // 1. Zero code — framework generates everything
-api getUser(id: Int): User @cache(ttl: 60)
+api getUser(id: Int): User @cache(policy: "userPreview")
 
 // 2. With logic — write in Luxo
 api register(input: RegisterInput): AuthResult {
@@ -207,11 +249,12 @@ api createPost(title: String): Post @auth {
 ### Events — `event` / `emit` / `on`
 
 ```luxo
-event OrderCreated(order: Order, userId: Int)    // typed event declaration
+type OrderSnapshot { id: Int }
+event OrderCreated(order: OrderSnapshot, userId: Int) // typed event declaration
 
 api placeOrder(id: Int): Order @auth {
   val order = Order.create(userId: my.id)
-  emit OrderCreated(order: order, userId: my.id) // typed emit
+  emit OrderCreated(order: OrderSnapshot { id: order.id }, userId: my.id) // typed emit
   order
 }
 
@@ -219,6 +262,15 @@ on OrderCreated { order ->                       // event listener
   "order created".i                              // .i = info log
 }
 ```
+
+Event payloads use explicit `type` snapshots, not database `model` or `extend`
+types, including inside nested fields and lists. The publisher chooses which
+fields belong to the event; changing a database model does not add event fields.
+Structured snapshots support at most 64 nested `type` values on each path. The
+first type is level one; the event envelope and list containers do not add levels.
+In-memory publishing and wire encoding/decoding reject excessive depth, including
+native cycles, with `event.ErrSnapshotDepth`; content is never truncated. Regenerate
+event publishers and consumers together. Valid wire bytes remain unchanged.
 
 ### Debug Chain — `.d`
 
@@ -249,17 +301,22 @@ selected value. Input DTOs remain strict; shared input/output types generate
 
 ### Real-time Streams
 
+Event payloads are explicit snapshots. The authenticated example uses the application's `User` auth model.
+
 ```luxo
-event DanmakuSent(danmaku: Danmaku)
-event NotificationCreated(notification: Notification)
+type DanmakuSnapshot { roomId: Int text: String }
+type NotificationSnapshot { userId: Int text: String }
+type ScoreEvent { matchId: Int score: Int }
+event DanmakuSent(roomId: Int, danmaku: DanmakuSnapshot)
+event NotificationCreated(userId: Int, notification: NotificationSnapshot)
 
 // Event-driven stream with filter
-api watchDanmaku(roomId: Int): Danmaku @stream(DanmakuSent) {
+api watchDanmaku(roomId: Int): DanmakuSnapshot @stream(DanmakuSent) {
   it.roomId == roomId
 }
 
 // Auth-filtered stream
-api watchNotifications: Notification @stream(NotificationCreated) @auth {
+api watchNotifications: NotificationSnapshot @stream(NotificationCreated) @auth {
   it.userId == my.id
 }
 
@@ -270,7 +327,7 @@ api watchLiveScore(matchId: Int): ScoreEvent @stream @native
 ## Quick Start
 
 ```bash
-go install github.com/light-speak/luxo/cmd/luxo@latest
+go install github.com/light-speak/luxo/cmd/luxo@v1.0.0-beta.1
 
 luxo init my-app
 cd my-app
@@ -280,13 +337,31 @@ luxo gen
 luxo run
 ```
 
+This beta.1 coordinate requires the corresponding release artifacts to be published.
+The CLI and adapters are separate modules in this repository; pin them to the same
+candidate as the core. Select optional backends before `luxo gen`; changing a backend
+requires regenerating and rebuilding. For NATS, add
+`github.com/light-speak/luxo/pkg/lux/nats@v1.0.0-beta.1` and set
+`LUXO_EVENT_BACKEND=nats`. Runtime addresses do not select adapters.
+
 ## Architecture
 
 > [View full architecture diagram](assets/architecture.svg)
 
 **Luvia is always on.** Embedded mode runs every module and the gateway in one process. Cluster mode uses generated per-module service binaries plus a generated gateway; RPC routing and federation loaders come from the same analyzed schema, without handwritten transport clients.
 
-JSON and Luxo Binary are both production transports. HTTP clients select them through the SDK transport mode or `X-Luxo-Mode: json|binary`; WebSocket and native RPC use their canonical binary framing. `APP_ENV` never silently changes the wire contract.
+JSON and Luxo Binary are both production transports. HTTP clients select them through the SDK transport mode or `X-Luxo-Mode: json|binary`; WebSocket supports JSON text and canonical binary frames, while native RPC uses its binary framing. `APP_ENV` never silently changes the wire contract.
+
+Both encodings preserve the same value semantics. Business `Int`/`Duration` are signed int64; WebSocket call IDs (`$id` in JSON, `sequence` in Binary) are unsigned uint64. JSON IDs must be unquoted decimal integer tokens in `0…18446744073709551615`, not booleans, strings, fractions or exponents. Invalid/missing/overflowing IDs are dropped before handler dispatch, never coerced to zero. Successful and failed calls echo the exact valid ID. SDK counters must fail on exhaustion instead of rounding, narrowing or overwriting pending calls; complete cross-SDK boundary acceptance remains a beta release gate.
+
+### Gateway HTTP implementation
+
+The gateway defaults to `APP_HTTP_TRANSPORT=luxo`. TLS ALPN and cleartext HTTP/2
+prior-knowledge connections use Luxo's dedicated HTTP/2 server; HTTP/1.1 and
+WebSocket retain the standard Go HTTP path on the same listener. Set
+`APP_HTTP_TRANSPORT=standard` explicitly to use the standard HTTP implementation
+for HTTP/2 as well. Unknown values fail at startup. This startup setting selects
+the server implementation, not the JSON/Binary encoding or a client's HTTP version.
 
 ### Request and SQL Tracing
 
@@ -314,6 +389,172 @@ metadata.
 
 Compatibility here means a new server continues accepting old clients, so compatible releases should deploy servers before regenerated clients. Adding a model/type field or an optional API parameter is compatible in that direction. Removing or changing a field/parameter, adding a required parameter, changing an API return type, removing an API, or changing an event payload is breaking. Removed IDs stay reserved and are never reused.
 
+
+### Studio Registration Transport Security
+
+Configure `LUXO_STUDIO_URL`, `LUXO_API_KEY`, and the public project UUID `LUXO_PROJECT_ID` to enable registration and periodic heartbeats. Remote URLs require HTTPS by default; `localhost` and loopback IPs may use HTTP for local development. Only explicitly trusted private networks should enable remote HTTP through `LUXO_STUDIO_ALLOW_INSECURE_HTTP=true`; this does not encrypt the connection. URLs must not contain embedded credentials, query parameters, or fragments.
+
+Registration, heartbeats, deregistration, metrics, and trace exports never follow HTTP redirects, preventing replay of credential-bearing request bodies. Gateway shutdown cancels in-flight registration, heartbeats, and dependency probes, joins the registration worker, then attempts deregistration with a separate two-second timeout. These operations stay outside application request hot paths.
+
+### Release and Stability Policy
+
+Cross-repository Swift CI pins candidate commit `c0fa9cc3334045ce488bd5d97d1a3a8c82ff8071` and checks that its `VERSION` matches the core, rather than following floating `main`. Local conformance against that commit does not replace remote checkout after pushing, the complete release gates, or publication; every candidate update must record the tested revisions and compatibility matrix again.
+
+The next release target is **`v1.0.0-beta.1`**, not an already published stable release. Luxo follows [Semantic Versioning](https://semver.org/): Git tags use the `v` prefix; package versions use the format required by their ecosystem.
+
+| Stage | Version sequence | Scope |
+| --- | --- | --- |
+| Beta | `v1.0.0-beta.1`, `v1.0.0-beta.2`, … | Establish the compatibility baseline and fix correctness, security, and performance defects. |
+| Release candidate | `v1.0.0-rc.1`, `v1.0.0-rc.2`, … | Feature freeze; release-blocking fixes only. |
+| Stable | `v1.0.0` | Publish the verified public contract. |
+| Maintenance | `v1.0.1` / `v1.1.0` / `v2.0.0` | Compatible fixes / compatible additions / incompatible public-contract changes. |
+
+Beta releases are prereleases, not a promise of production stability. From beta.1 onward, preserve compatibility by default. Any unavoidable beta contract break requires explicit review, migration instructions, updated SDKs, and compatibility tests; a new beta number alone does not make a breaking change safe. Published tags and artifacts must never be overwritten.
+
+The public contract covers DSL semantics, supported CLI/configuration, generated/native Go interfaces, SDK behavior, explicit field selection, schema/lock IDs and wire types, JSON/Binary and RPC/stream framing, errors, and Studio registration/telemetry. Internal implementation and trace timing measurements are not stable APIs. Product versions, wire-envelope versions, and `luxo.lock` versions are separate: a product release must not renumber unchanged encodings or reuse removed IDs.
+
+Each release must identify the exact core commit and tested TypeScript, Dart, Kotlin, and Swift SDK versions/commits. Release gates include compiler/runtime tests, race checks, lint and reachable-path coverage review, benchmark comparison against the previous baseline, cross-SDK protocol fixtures, and a clean external consumer build. Preserve baseline fixtures and generated consumers; running only regenerated clients against a new server is not a backward-compatibility test. Before the first stable release, verify Studio against the candidate without a developer Go workspace or unpinned sibling checkout.
+
+SDK convenience features may follow the core release, but protocol correctness cannot: `Int` and `Duration` must preserve the entire signed 64-bit range, reject overflow/truncated binary values, and agree across JSON/Binary, nullable values, arrays, columns, and streams. Use shared exact-wire fixtures, not just same-SDK round trips. Validate Dart VM and JavaScript targets independently; passing native tests does not certify web precision. SDK version pinning is not a reason to defer these release blockers.
+
+The first candidate uses `1.0.0-beta.1` from [`VERSION`](VERSION) across the core, four SDKs, React/Vite companions, and Kotlin plugin. TS companions require the exact matching client; Swift installation examples also pin the exact version. Version-alignment tests prevent stale package coordinates, but matching numbers do not replace protocol tests or verified commit SHAs. These are candidate metadata, not a claim that release or freeze is complete.
+
+Go adapters and the CLI remain in this repository but are independently versioned modules. The first candidate requires the following tags on the same verified repository commit; the root tag alone does not publish nested modules:
+
+| Module directory | Candidate tag |
+| --- | --- |
+| Repository root | `v1.0.0-beta.1` |
+| `cmd/luxo` | `cmd/luxo/v1.0.0-beta.1` |
+| `pkg/lux/pg` | `pkg/lux/pg/v1.0.0-beta.1` |
+| `pkg/lux/cache/redis` | `pkg/lux/cache/redis/v1.0.0-beta.1` |
+| `pkg/lux/nats` | `pkg/lux/nats/v1.0.0-beta.1` |
+| `pkg/lux/storage/s3` | `pkg/lux/storage/s3/v1.0.0-beta.1` |
+
+This table defines release coordinates, not publication status. Publish only after the release gates pass and authorization is granted. Verify the released coordinates in an external consumer with `GOWORK=off` and no local replacements; workspace builds alone cannot prove published dependency resolution. Applications require only their selected adapters. All Luxo module requirements, including the CLI's PG dependency, must match the first candidate version.
+
+Studio releases must pin the tested core Go module, CLI, frontend SDKs, and CI checkout to the recorded release/commit, never floating `main` or `latest`. Local source overrides are development-only. Studio keeps an independent version; any later independent SDK releases still need a compatibility matrix, not an assumption based on version numbers. PostgreSQL is the currently implemented database backend; future database backends and new Studio features are outside this release freeze.
+
+#### Pre-Beta Internal RPC Upgrade (Under Validation)
+
+`fn @service`, generated batch loaders, relation resolvers, and named remote
+loaders register through `Router.HandleInternal`. HTTP and WebSocket only use
+the public route table; RPC exports both public APIs and internal functions at
+startup. Schema metadata carries `internal`, and startup validation rejects
+conflicting registrations. The `svc:` prefix is not an authorization rule.
+Regenerate services and gateways together. Studio registration, heartbeats,
+deregistration, and telemetry now use explicit control APIs authenticated with
+the project API key, without legacy `svc:` aliases. All four SDK generators use
+explicit scope metadata. Studio preserves internal entries in Schema documentation,
+but excludes them from executable Playground APIs, including restored requests.
+Full deployment/performance acceptance remains in progress; this is not a
+frozen release or a replacement for RPC peer authentication.
+
+The unreleased internal protocol does not retain old-gateway compatibility or automatic fallback. Regenerate, rebuild, and deploy gateways and services together from the same verified core commit. This does not change the public SDK HTTP/WebSocket JSON/Binary formats.
+
+Each new TCP connection exchanges a fixed preface and requires an exact `rpc.ProtocolVersion` match before business requests. Pooled connections do not repeat the handshake. New connections, reconnects, and newly opened stream connections incur one extra network RTT, subject to separate performance acceptance. Requests use one kind/flags/token/optional-trace/body format; historical trace-request decoders are removed. Version checks do not replace authentication or schema/lock ID consistency checks.
+
+Internal relation resolvers now require `keys` (field 1) and `shape` (field 2: bit 0 list, bit 1 nullable). Each response group is the canonical field value, including presence and length, with an object or columnar-list body generated by the target service. The gateway validates and copies those bytes without model decoding/re-encoding. Required missing objects and multiple rows for a single relation fail; empty lists and selected null values remain distinct. Regenerate both gateways and services together.
+
+Nested response regressions pass for the new format. Unary RPC errors now preserve raw JSON data, differing interpolation text and the internal-error flag without converting numbers to floating point. Generated TS, Dart, Kotlin and Swift consumers exercise error data through gateways over HTTP/WebSocket and JSON/Binary. Native stream completion and structured terminal errors also have direct-service and gateway consumer regressions in all four SDKs; complete release, device and remaining performance gates stay open. This does not freeze Beta.
+
+#### Pre-Beta Error Data Interface Migration
+
+The development Go API uses static `errors.ErrorData` methods `AppendJSON(dst []byte) ([]byte, error)` and `AppendText(dst []byte, field string) ([]byte, bool)` instead of `I18nData()/MapData` and reflective formatting. Luxo error declarations and constructor arguments are unchanged: rerun `luxo gen`. Handwritten native error data implementations must implement the new methods. Use `errors.IntID(value)`, `errors.StringID(value)`, or `errors.UUIDID(value)` for `ResourceError.ID` rather than a dynamically typed ID.
+
+AppendJSON must append valid JSON on success and preserve the original dst prefix on failure; `errors.DataWriter` provides static writers. AppendText supplies only the requested field and returns the original dst with false for a missing or unrepresentable value. Direct i18n callers may use string-only `i18n.Values`. Int/Duration retain the full signed 64-bit range; generic JSON keeps original numeric tokens without floating-point conversion. Internal errors never encode or interpolate data, expose only `error.internal` as their message, and disclose cause only in development mode.
+
+This is a pre-freeze Go source-interface change, not a change to the public JSON/Binary numeric contracts or binary layouts. Unary RPC data propagation is covered by the integration tests above, not a certification of every SDK path or performance gate. Float writer error propagation has been separately approved and implemented; performance acceptance remains independent.
+
+#### Pre-Beta Static Request Parameter Migration
+
+`Request.ParamJSON`, `ParamJSONOptional`, `ParamJSONNullable`, and `ParamJSONOptionalNullable` have been removed. Regenerate services with `luxo gen`; ordinary `.luxo` and `@native` business signatures and valid wire layouts are unchanged. Handwritten Request handlers must use concrete getters such as `ParamInt`, `ParamUUID`, `ParamDuration`, and their array variants. Use `ParamRawJSON` / `ParamRawJSONArray` for opaque JSON, not arbitrary Go destinations; numbers retain their original text. For structured local JSON input, generated handlers use `ParamInput` and `ReadJSONInput` / `ReadJSONInput<Type>List` directly. Binary input uses `ParamMessage` / `ParamMessageArray`, generated `ReadLuxoInput`, and `Decoder.Finish()`.
+
+Generated handlers distinguish missing, explicit null, and a value. Defaults apply only when missing; explicit null clears a nullable default and fails for non-nullable parameters. Handwritten handlers must preserve the same distinction with `HasParam` and `ParamIsNull`. Binary Bytes/JSON borrow request storage during the synchronous handler; copy them before retaining them asynchronously. Historical reflective readers exist only in test references, never in ordinary builds.
+
+`api.EncodeBinaryRequest` also requires explicit `json.RawMessage` documents for JSON parameters. Lists accept `[]json.RawMessage`, a raw JSON array document, or `[]any` containing only raw documents; maps, structs, custom `MarshalJSON` values and implicit scalar conversion are rejected. For example, pass ``json.RawMessage(`{"count":123456789012345678901234567890}`)`` instead of a Go map. Valid documents retain their exact bytes, including numeric tokens; invalid input returns an error and a nil request body. This restriction is on the Go encoding API, not a wire-format change.
+
+Local structured JSON input no longer takes an intermediate JSON-to-Binary-to-model detour. Gateway forwarding still validates and encodes parameters for the internal Binary RPC boundary; that network encoding is distinct from local model decoding. This removes the arbitrary-target reflection fallback, not every dynamic boundary in Luxo, and does not imply zero encoding, zero allocations, or completed whole-chain performance acceptance.
+
+#### Request Log Sampling
+
+Request logs are disabled unless `LOG_REQUESTS=true`. When enabled, successful requests are sampled one in 100 by default. Set `LOG_REQUESTS_FULL=true` as well to opt into full logging for development or troubleshooting; it does not enable logging by itself. Errors bypass sampling, but bounded asynchronous queues can still drop records and report counters. These logs are not a durable audit channel. Metrics and trace sampling are independent.
+
+For explicit Go configuration, `RouterOptions.RequestLogSampleEvery` uses 100 when zero, 1 for full logging, and N for one in N successes. Use `api.RouterOptionsFromEnv()` before overriding options if environment-based logging settings are desired. Generated cached and uncached services use the same environment policy.
+
+#### NATS Task Retries and Dead Letters
+
+`queue.NATSQueue` uses JetStream, not the non-persistent Core NATS event broadcast.
+`MaxRetries` bounds business delivery attempts. Once exhausted, subsequent deliveries
+only transfer the task to `<queue>.dlq`, including after worker restart. A failed
+DLQ creation or publication does not acknowledge the original. Transfer retries use
+exponential `RetryDelay`, capped at one minute, and the original is acknowledged
+only after JetStream confirms publication. The broker schedules delayed NAKs;
+waiting tasks do not each require a framework goroutine.
+
+Transfer is at-least-once, not exactly-once: an uncertain publish acknowledgement or
+lost original ACK can duplicate the dead letter. Consumers must remain idempotent
+using application task identifiers. Queue streams use `DiscardNew`: when an active
+capacity limit is reached, new writes are rejected instead of evicting unacknowledged
+tasks. Operators must monitor storage and backlog, and must not delete durable
+consumers or reset delivery state as a task-recovery shortcut.
+
+#### Finite Float Writer Migration (Under Validation)
+
+`codec.LuxoMarshaler.MarshalLuxo` now returns `([]byte, error)`; rerun `luxo gen` for events and update handwritten implementations. Encoder Float value/field/array writers and ColumnarWriter Float column writers return `error`, rejecting NaN/infinities without committing a partial field or column. `rpc.EncodeParams` also returns `([]byte, error)` and rejects unsupported values instead of dropping parameters. NATS does not publish when marshaling fails; the existing `Emit` error return is unchanged.
+
+Generated model/type `WriteLuxo` and all `WriteColumnar` variants now return `error`; `codec.AppendFixed64` returns `([]byte,error)`, and `ResponseBuf.AppendFloat` returns `error`. Nested events, compiled/native handlers and internal RPC propagate failures. Direct ResponseBuf callers must discard the current output after a write error.
+
+`codec.ColumnarWriter.Bytes()` now returns `([]byte, error)`. It rejects nonempty zero-column output, invalid record/arena counts, nonpositive field IDs and inconsistent column lengths before touching the output buffer; failures return nil bytes. Callers must check the error. Empty lists retain `00 00 00`, and a selected all-null column remains valid. Call `Reset()` after inconsistent columns or invalid field IDs; generated direct writers already return errors and do not use this buffered helper. This API change does not imply performance acceptance for unmeasured workloads.
+
+Stream encoder callbacks and `StreamPayloadJSON` return `([]byte,error)`; `TypedStream.Send` and `Dispatch*` report failures without sending the failed payload. All five schema Binary-to-JSON converters also return `([]byte,error)`, propagated through HTTP, WebSocket and CLI instead of disguising invalid responses as integers, null or default pagination. Rerun `luxo gen` and update handwritten encoder callbacks; ordinary DSL and native business return types are unchanged.
+
+Native stream handlers now receive generated, strongly typed parameter snapshots and return `error`. Authentication, defaults, and parameter checks complete before the subscription ACK. A normal return drains accepted messages before completion; a business error terminates that subscription with its structured error data. The gateway propagates RPC termination and payload-conversion failures rather than silently ending a void handler. Each subscription has an independent UInt64 identity. SDKs terminate subscriptions on disconnect and leave resubscription to the caller; no replay or continuous delivery is implied. These implemented contracts do not replace final candidate, device, and performance acceptance.
+
+Valid wire bytes, negative zero and finite subnormals are preserved. Checks apply only to fields actually written, without reflection or additional serialization round trips. Cross-SDK revalidation, end-to-end performance acceptance and protocol freeze remain pending. An asynchronous subscriber failure cannot retroactively fail a completed publish, retract previously delivered valid messages, or roll back database writes.
+
+#### Modern Stable Toolchains
+
+The development mainline actively adopts the latest stable toolchains and useful stable language features. It does not maintain old compiler support merely for its own sake. Experimental flags, nightly compilers, and preview APIs are not requirements of released SDKs. Toolchain upgrades do not change wire versions, field IDs, integer precision, or selection semantics.
+
+The current migration targets are Go 1.27.1+, TypeScript 7, Dart 3.13+, and Kotlin 2.4.20; Swift tracks its latest stable compiler line in separately verified SDK changes. Compiler versions and device/runtime deployment targets are separate decisions: a newer Kotlin or Swift compiler does not by itself justify dropping older Android or iOS devices.
+
+The exact Node version for JavaScript development and SDK interoperability is defined in [`.node-version`](.node-version), shared by TS and Dart Web CI instead of a floating major. Before installing dependencies, `sh scripts/check-node.sh` verifies the actual runtime; Studio's linked build uses the same core script. Old or preview versions, invalid pins, and failed tool invocations stop validation without downloading or installing tools. TS CI also pins pnpm and reports the actual Node, pnpm and TypeScript compiler versions. Node declarations in all three TS packages are build/test-only, with resolved versions pinned by lockfiles; they do not enter browser runtime code. Client/React retain ES2022 output, and the Vite plugin declares its minimum Node requirement separately. Updating development tools does not certify browser or minimum plugin-runtime compatibility.
+
+Dart CI pins both the supported minimum, 3.13.0, and the selected stable version, 3.13.4, in the [workflow](.github/workflows/test.yml). Both use the same analysis, VM, JavaScript/Wasm, and generated-consumer checks. Startup verification rejects a different compiler version, a preview channel, or a failed tool invocation instead of treating floating `stable` as a reproducible baseline. Updating this exact version neither raises the SDK minimum nor approves performance costs caused by compiler changes.
+
+The Go generator and generated projects move together: database entry points use generic methods `DB.QueryRows[T]`, `DB.QueryRow[T]` and `DB.QueryScalar[T]`, retaining package-level call compatibility over one implementation. Existing `Query[T]`, create/update bases and DataLoader already share generic algorithms; model scanners, field selection and codecs remain schema-specialized. `NativeResolver` keeps concrete signatures because interface methods cannot declare independent type parameters.
+
+Go-based analysis tools must also be built with a compiler that understands the project's syntax. From this repository root, rebuild the pinned checker with `go install github.com/fzipp/gocyclo/cmd/gocyclo@v0.6.0` and inspect it with `go version -m "$(command -v gocyclo)"` after upgrading Go. The tracked pre-commit hook, `bash scripts/lint.sh`, and CI share [check-go.sh](scripts/check-go.sh), checking `pkg/`, `cmd/`, `scripts/`, and `internal/`. Missing tools, parse failures, unexpected diagnostics, unformatted files, and complexity above 25 all fail the gate with diagnostics preserved. Nothing is automatically installed or skipped locally; reinstall the tracked hook if using an older copied version.
+
+For a standalone checkout, run `sh scripts/setup-modules.sh .` once to bind candidate modules locally; this is unnecessary when a complete parent workspace already exists. The script refuses to overwrite `go.work` and does not change release manifests. Since `go test ./pkg/...` excludes nested modules, local lint and CI check the CLI, PG, Redis, NATS, and S3 modules separately. Adapter integration tests still require their corresponding service configuration.
+
+On macOS with Colima, the testcontainers cleanup container needs the Docker socket path inside the VM, not the host path.
+Verify it with `colima ssh -- test -S /var/run/docker.sock`; if successful, prefix the test command with
+`TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock`. Do not disable the cleanup container to bypass mount failures.
+
+For a CI-like local database test run, set `LUXO_TEST_DATABASE_URL` to a dedicated PostgreSQL test database: each test creates and cleans its own schema. Without it, tests start individual containers, whose cumulative startup/cleanup can exceed the local lint script's 60-second package timeout. Do not point this setting at application data or skip database tests to obtain a passing result.
+
+Dart hints use resolved types at build time for primary-constructor fields, local aliases, nested relations, list/page access and inline callbacks. Cross-file and `part` merging isolates symbols and client libraries. SDK wrappers such as `Selected.value` are not wire fields, and explicit `select` takes precedence. See the [Dart SDK](packages/dart/README.md#compile-time-field-tracking) for the default output directory and static-analysis boundaries; source analysis never runs on the request path.
+
+Adoption includes generators, generated consumers, build/declaration tools, language-aware field-selection analysis, CI, and documentation, not just manifest edits. Unsupported source syntax must produce a diagnostic, never silently expand field selection. Stable features are adopted where they improve correctness, performance, or maintainability; new syntax alone is not evidence of faster runtime code. Reflection and generic hot-path serialization remain prohibited.
+
+Lock exact resolved tools for reproducible builds and record them in release evidence. CI verifies the supported minimum and current stable toolchain where different; previews belong in separate scheduled compatibility checks. Compare baseline and candidate on the same toolchain, and separately measure compiler upgrades on unchanged code. Do not reset performance baselines to hide regressions. Published artifacts keep their recorded requirements; increasing a released package's minimum compiler requires an explicit compatibility review, version decision, and migration notes, never a silent maintenance update.
+
+References: [Go 1.27](https://go.dev/doc/go1.27), [Dart 3.13](https://dart.dev/blog/announcing-dart-3-13), [TypeScript 7](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/).
+
+#### Performance Blocking and Approved Feature Costs
+
+Performance review distinguishes request-path regressions from necessary compilation costs. Initialization on first use in each compilation is neither per-request allocation nor once-per-process initialization. Required features still need tests and benchmarks; necessity alone grants no exception.
+
+Default CI rules remain unchanged: at least 10 samples per revision; significant time growth above 5% or significant allocation growth triggers a second sample group, and repeated regressions block. The 5% threshold is an automated detection threshold, not an expendable performance budget. Reflection, generic request-path serialization, and confirmed hot-path defects still require rejection during review.
+
+Approved costs for necessary functionality have one machine-readable source: [approved-costs.json](scripts/benchgate/approved-costs.json), rather than a duplicated list of budgets here. Each record identifies its reason, exact baseline SHA, package, benchmark, and approved absolute time or allocation increase limits; wildcards are forbidden. Approval for memory does not approve time, and approval for a cold path does not approve request paths.
+
+CI applies and prints an approval only when both sample groups contain matching comparisons and both satisfy its limits. Unapproved regressions, exceeded budgets, and other samples retain the default gates. A different baseline SHA no longer matches the approval, preventing rolling budget accumulation. New or expanded approvals require explicit maintainer confirmation; tools must not grant them automatically. Local samples do not replace end-to-end request validation.
+
+When a zero baseline increases to a positive value with a significant difference, benchstat displays the relative change as `?`. The gate uses the valid absolute measurements to detect a regression and require confirmation, never treating it as zero growth or automatic approval. A `?` with a nonzero baseline, invalid measurements, or insufficient samples is still rejected.
+
+CI retains raw benchmark samples and benchstat comparisons for 14 days, including failed runs. Gate diagnostics report exact baseline, candidate, and absolute differences rather than rounded percentages alone. Queue integration tests require a healthy JetStream-enabled NATS server, not just an open NATS port. Each lexer/parser/semantic fuzz target runs two million executions with four workers and a 180-second hard timeout; any failure or timeout still fails CI. Fuzz logs, toolchain information, and saved failing inputs are retained for 14 days.
 
 ## AI-Native by Design
 

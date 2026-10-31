@@ -1,0 +1,777 @@
+import { LuxoClient } from './client.js'
+import { LuxoQuery_listQueryProbes } from './queries.js'
+import { Decoder, LuxoError, FetchTransport, WsTransport, UnknownEnumValue, encodeLuxoJSON, decodeLuxoJSON } from '@luxojs/client'
+import { decodeNestedGroup, decodeColumnarNestedGroup, decodePrecision, decodeColumnarPrecision } from './types.js'
+import type { Precision, PrecisionInput, NullableArrays, NullableArraysInput, NestedGroup, NestedGroupInput, NestedPrecision, NestedPrecisionInput } from './types.js'
+import type { ScalarArrays, ScalarArraysInput, FixtureState } from './types.js'
+import type { Filter } from '@luxojs/client'
+
+const integers = integerCases.map(value => BigInt(value))
+const selection = 'value, duration, optional, values, label'
+
+function equal(actual: unknown, expected: unknown): void {
+  if (actual !== expected) throw new Error(String(actual) + ' != ' + String(expected))
+}
+
+function equalArray<T>(actual: T[] | undefined, expected: T[]): void {
+  equal(actual?.length, expected.length)
+  for (let i = 0; i < expected.length; i++) equal(actual?.[i], expected[i])
+}
+
+function verify(row: Precision<true>, input: PrecisionInput): void {
+  equal(row.value, input.value)
+  equal(row.duration, input.duration)
+  equal(row.optional, input.optional)
+  equalArray(row.values, input.values)
+  equal(row.label, input.label)
+  equal(row.ignored, undefined)
+}
+
+async function verifyUnary(client: LuxoClient): Promise<void> {
+  await verifyConcurrentSelections(client)
+  await verifyNullableRoots(client)
+  await verifyTimestamps(client)
+  await verifyBusinessFloats(client)
+  await verifyOpaqueJSON(client)
+  await verifyText(client)
+  for (const value of integers) {
+    equal(await client.echoInteger({ value }), value)
+    equal(await client.echoDuration({ value }), value)
+    for (const optional of [null, value]) {
+      const input: PrecisionInput = { value, duration: value, optional, values: integers, label: '精度 café', ignored: 42n }
+      verify(await client.echoPrecision({ input, $select: selection }), input)
+      const rows = await client.listPrecision({ input, $select: selection })
+      equal(rows.length, 2)
+      for (const row of rows) verify(row, input)
+    }
+  }
+  equalArray(await client.echoIntegers({ values: integers }), integers)
+  equalArray(await client.echoIntegers({ values: [] }), [])
+  const input: PrecisionInput = { value: (1n << 63n) - 1n, duration: -(1n << 63n), optional: null, values: [], label: 'not selected', ignored: 0n }
+  const partial = await client.echoPrecision({ input, $select: 'value' })
+  equal(partial.value, input.value)
+  for (const value of [partial.duration, partial.optional, partial.values, partial.label, partial.ignored]) equal(value, undefined)
+}
+
+async function verifyConcurrentSelections(client: LuxoClient): Promise<void> {
+  const inputs: PrecisionInput[] = Array.from({ length: 16 }, (_, index) => ({
+    value: (1n << 63n) - 1n - BigInt(index), duration: BigInt(index), optional: null,
+    values: [], label: `call-${index}`, ignored: 0n,
+  }))
+  await Promise.all(inputs.map(async input => {
+    const [valueOnly, labelOnly, combined] = await Promise.all([
+      client.echoPrecision({ input, $select: 'value' }),
+      client.echoPrecision({ input, $select: 'label' }),
+      client.echoPrecision({ input, $select: 'value, label' }),
+    ])
+    equal(valueOnly.value, input.value)
+    equal(valueOnly.label, undefined)
+    equal(labelOnly.label, input.label)
+    equal(labelOnly.value, undefined)
+    equal(combined.value, input.value)
+    equal(combined.label, input.label)
+    for (const row of [valueOnly, labelOnly, combined]) {
+      for (const field of [row.duration, row.optional, row.values, row.ignored]) equal(field, undefined)
+    }
+  }))
+  const repeated = await client.echoPrecision({ input: inputs[0]!, $select: 'value' })
+  equal(repeated.value, inputs[0]!.value)
+  equal(repeated.label, undefined)
+}
+
+async function verifyNullableRoots(client: LuxoClient): Promise<void> {
+  for (const value of [null, 0n, ...integers]) equal(await client.echoOptionalInteger({ value }), value)
+  for (const values of [null, [], integers]) {
+    equal(encodeLuxoJSON(await client.echoOptionalIntegers({ values })), encodeLuxoJSON(values))
+  }
+  const input: PrecisionInput = { value: 42n, duration: 0n, optional: null, values: [], label: 'not selected', ignored: 7n }
+  for (const value of [null, input]) {
+    const row = await client.echoOptionalPrecision({ input: value, $select: 'value' })
+    equal(encodeLuxoJSON(row), encodeLuxoJSON(value === null ? null : { value: 42n }))
+  }
+  for (const inputs of [null, [], [input]]) {
+    const rows = await client.echoOptionalPrecisions({ inputs, $select: 'value' })
+    equal(encodeLuxoJSON(rows), encodeLuxoJSON(inputs?.map(() => ({ value: 42n })) ?? null))
+  }
+}
+
+async function verifyNullableRootStream(client: LuxoClient, kind: number): Promise<void> {
+  const finished = Promise.withResolvers<void>()
+  const rows: unknown[] = []
+  let terminals = 0
+  const observer = {
+    onComplete: () => { terminals++; finished.resolve() },
+    onError: (error: LuxoError) => { terminals++; finished.reject(error) },
+  }
+  const receive = (value: unknown) => { rows.push(value) }
+  const timer = setTimeout(() => finished.reject(new Error('missing nullable stream completion')), 5000)
+  let cancel: (() => void) | undefined
+  try {
+    if (kind === 0) cancel = await client.subscribeWatchOptionalInteger(receive, observer)
+    else if (kind === 1) cancel = await client.subscribeWatchOptionalIntegers(receive, observer)
+    else cancel = await client.subscribeWatchOptionalPrecision({ $select: 'value' }, receive, observer)
+    await finished.promise
+    equal(terminals, 1)
+    equal(encodeLuxoJSON(rows), encodeLuxoJSON([null, kind === 0 ? 0n : kind === 1 ? [] : { value: 42n }]))
+    equal(await client.echoInteger({ value: 42n }), 42n)
+  } finally { clearTimeout(timer); cancel?.() }
+}
+
+async function verifyTimestamps(client: LuxoClient): Promise<void> {
+  for (const { input, canonical } of dateTimeCases) equal(await client.echoTimestamp({ value: input }), canonical)
+  const inputs = dateTimeCases.map(item => item.input)
+  const expected = dateTimeCases.map(item => item.canonical)
+  equal(encodeLuxoJSON(await client.echoTimestamps({ values: inputs })), encodeLuxoJSON(expected))
+  const input = { ...scalarArraysInput(0), dates: inputs }
+  equal(encodeLuxoJSON((await client.echoScalarArrays({ input, $select: 'dates, tail' })).dates), encodeLuxoJSON(expected))
+  for (const row of await client.listScalarArrays({ input, $select: 'dates, tail' })) {
+    equal(encodeLuxoJSON(row.dates), encodeLuxoJSON(expected))
+    equal(row.tail, 42n)
+  }
+}
+
+async function verifyTimestampStreams(client: LuxoClient): Promise<void> {
+  for (const { input, canonical } of dateTimeCases) {
+    equal(await firstStream<string>(receive => client.subscribeWatchTimestamp({ value: input }, receive)), canonical)
+  }
+  for (const cases of [[], dateTimeCases.slice(0, 1), dateTimeCases]) {
+    const rows = await firstStream<string[]>(receive => client.subscribeWatchTimestamps({ values: cases.map(item => item.input) }, receive))
+    equalArray(rows, cases.map(item => item.canonical))
+  }
+  equal(await client.echoInteger({ value: 42n }), 42n)
+}
+
+async function verifyUUIDs(client: LuxoClient): Promise<void> {
+  for (const { input, canonical } of uuidCanonicalCases) {
+    if (canonical !== null) {
+      const values = await client.echoUUIDs({ values: [input] })
+      equalArray(values, [canonical])
+      continue
+    }
+    let rejected = false
+    try { await client.echoUUIDs({ values: [input] }) } catch (error) {
+      if (error instanceof LuxoError) {
+        equal(error.code, 400)
+        equal(error.error, 'BadRequest')
+        const data: unknown = error.data
+        if (typeof data === 'object' && data !== null && 'param' in data) equal(data.param, 'values')
+        else equal(/uuid/i.test(error.message) && /values/.test(error.message), true)
+      } else equal(error instanceof Error && /uuid/i.test(error.message), true)
+      rejected = true
+    }
+    equal(rejected, true)
+  }
+  const values = await client.echoUUIDs({ values: ['00112233-4455-6677-8899-aabbccddeeff'] })
+  equalArray(values, ['00112233-4455-6677-8899-aabbccddeeff'])
+}
+
+async function verifyBusinessFloats(client: LuxoClient): Promise<void> {
+  for (const value of [0, -0, Number.MIN_VALUE, -Number.MIN_VALUE, Number.MAX_VALUE, -Number.MAX_VALUE]) {
+    equal(Object.is(await client.scaleFloat({ value, factor: 1 }), value), true)
+    const rows = await client.scaleFloatList({ value, factor: 1 })
+    equal(rows.length, 2)
+    for (const row of rows) equal(Object.is(row, value), true)
+  }
+  for (const value of [Number.MAX_VALUE, -Number.MAX_VALUE]) {
+    for (const list of [false, true]) {
+      let rejected = false
+      try {
+        if (list) await client.scaleFloatList({ value, factor: 2 })
+        else await client.scaleFloat({ value, factor: 2 })
+      } catch (error) {
+        if (!(error instanceof LuxoError)) throw error
+        equal(error.code, 500)
+        equal(error.error, 'Internal')
+        equal(error.message, 'error.internal')
+        equal(error.data, undefined)
+        equal(error.cause, undefined)
+        rejected = true
+      }
+      equal(rejected, true)
+      equal(await client.scaleFloat({ value: 1.25, factor: 2 }), 2.5)
+    }
+  }
+}
+
+async function verifyNamedEnums(client: LuxoClient, websocket: boolean): Promise<void> {
+  for (const value of ['OPEN', 'CLOSED'] as const) equal(await client.echoFixtureState({ value }), value)
+  for (const values of [[], ['OPEN'], ['CLOSED', 'OPEN']] satisfies FixtureState[][]) {
+    equal(encodeLuxoJSON(await client.echoFixtureStates({ values })), encodeLuxoJSON(values))
+  }
+  if (!websocket) return
+  equal(await firstStream<FixtureState>(receive => client.subscribeWatchFixtureState(receive)), 'OPEN')
+  const values = await firstStream<FixtureState[]>(receive => client.subscribeWatchFixtureStates(receive))
+  equal(encodeLuxoJSON(values), '["OPEN","CLOSED"]')
+}
+
+async function verifyText(client: LuxoClient): Promise<void> {
+  for (const label of ['', '\ufeff', '\ufeffvalue', '\ufffd', 'a\u0000b', '東京',
+    '\ud800\udc00', '\udbff\udfff', '\\uD800', 'e\u0301']) {
+    const input: PrecisionInput = { value: 1n, duration: 1n, optional: null, values: [], label, ignored: 0n }
+    verify(await client.echoPrecision({ input, $select: selection }), input)
+    for (const row of await client.listPrecision({ input, $select: selection })) verify(row, input)
+    equal(await client.echoJSON({ value: label }), label)
+    const value = { [label]: [label, 9223372036854775807n] }
+    equal(encodeLuxoJSON(await client.echoJSON({ value })), encodeLuxoJSON(value))
+  }
+}
+
+function jsonNumberDocuments(): string[] {
+  return jsonNumberTokens.flatMap(token => [token, `{"n":${token},"items":[${token},null],"nested":{"n":${token}},"text":"精度 café"}`])
+}
+
+async function verifyOpaqueJSON(client: LuxoClient): Promise<void> {
+  const zero = { n: -0, items: [0, -0] }
+  equal(encodeLuxoJSON(await client.echoJSON({ value: zero })), '{"n":-0,"items":[0,-0]}')
+  equal(encodeLuxoJSON(await client.echoJSONs({ values: [zero] })), '[{"n":-0,"items":[0,-0]}]')
+  for (const text of jsonNumberDocuments()) {
+    const value = decodeLuxoJSON(text)
+    equal(encodeLuxoJSON(await client.echoJSON({ value })), text)
+    equal(encodeLuxoJSON(await client.echoJSONs({ values: [value, null] })), `[${text},null]`)
+  }
+  const large = 18446744073709551617n
+  const values = [9007199254740993n, (1n << 63n) - 1n, large, -large, { value: large, nested: [large, -large] }]
+  for (const value of values) {
+    equal(encodeLuxoJSON(await client.echoJSON({ value })), encodeLuxoJSON(value))
+  }
+  equal(encodeLuxoJSON(await client.echoJSONs({ values })), encodeLuxoJSON(values))
+  equal(encodeLuxoJSON(await client.echoJSONs({ values: [] })), '[]')
+}
+
+async function verifyError(client: LuxoClient, value: bigint): Promise<void> {
+  try {
+    await client.rejectPrecision({ value })
+  } catch (error) {
+    if (!(error instanceof LuxoError)) throw error
+    equal(error.code, 422)
+    equal(error.error, 'PrecisionRejected')
+    equal(error.message, 'error.precision_rejected')
+    if (!error.traceId) throw new Error('Missing error trace ID')
+    const data: unknown = error.data
+    if (data === null || typeof data !== 'object' || !('value' in data) || !('label' in data)) throw new Error('Missing error data')
+    if (typeof data.value !== 'bigint' && !(typeof data.value === 'number' && Number.isSafeInteger(data.value))) throw new Error('Inexact error integer')
+    equal(BigInt(data.value), value)
+    equal(data.label, '精度 café')
+    equal(error.cause, undefined)
+    return
+  }
+  throw new Error('Expected PrecisionRejected')
+}
+
+async function verifyErrorResponses(client: LuxoClient): Promise<void> {
+  for (const value of integers) {
+    const [, echoed] = await Promise.all([verifyError(client, value), client.echoInteger({ value })])
+    equal(echoed, value)
+  }
+  equalArray(await client.checkListEffects(), [1n, 2n, 3n, 3n])
+}
+
+async function verifyJSONError(client: LuxoClient, value: unknown, text: string): Promise<void> {
+  try {
+    await client.rejectJSON({ value })
+  } catch (error) {
+    if (!(error instanceof LuxoError)) throw error
+    equal(error.code, 422)
+    equal(error.error, 'JSONRejected')
+    equal(error.message, 'error.json_rejected')
+    if (!error.traceId) throw new Error('Missing JSON error trace ID')
+    const data: unknown = error.data
+    if (data === null || typeof data !== 'object' || !('value' in data)) throw new Error('Missing JSON error data')
+    equal(encodeLuxoJSON(data.value), text)
+    equal(error.cause, undefined)
+    return
+  }
+  throw new Error('Expected JSONRejected')
+}
+
+async function verifyJSONErrors(client: LuxoClient): Promise<void> {
+  for (const text of jsonNumberDocuments()) {
+    const value = decodeLuxoJSON(text)
+    const [, echoed] = await Promise.all([verifyJSONError(client, value, text), client.echoJSON({ value })])
+    equal(encodeLuxoJSON(echoed), text)
+  }
+}
+
+async function verifyJSONStreams(client: LuxoClient): Promise<void> {
+  for (const text of jsonNumberDocuments()) {
+    const value = decodeLuxoJSON(text)
+    const row = await firstStream<unknown>(receive => client.subscribeWatchJSON({ value }, receive))
+    equal(encodeLuxoJSON(row), text)
+    const rows = await firstStream<unknown[]>(receive => client.subscribeWatchJSONs({ values: [value, null] }, receive))
+    equal(encodeLuxoJSON(rows), `[${text},null]`)
+  }
+}
+
+async function verifyPagination(client: LuxoClient): Promise<void> {
+  const cases: [bigint | undefined, bigint | undefined, bigint, bigint, bigint[]][] = [
+    [undefined, undefined, 1n, 2n, [1n, 2n]], [2n, 2n, 2n, 2n, [3n]],
+    [3n, 2n, 3n, 2n, []], [9007199254740993n, 2n, 9007199254740993n, 2n, []],
+    [(1n << 63n) - 1n, 2n, (1n << 63n) - 1n, 2n, []],
+    [0n, 2n, 1n, 2n, [1n, 2n]], [-1n, 2n, 1n, 2n, [1n, 2n]],
+    [1n, 0n, 1n, 0n, [1n, 2n, 3n]], [1n, 100n, 1n, 100n, [1n, 2n, 3n]],
+    [1n, -1n, 1n, 20n, [1n, 2n, 3n]], [1n, 101n, 1n, 20n, [1n, 2n, 3n]],
+  ]
+  for (const value of [-(1n << 63n), (1n << 63n) - 1n]) {
+    for (const [page, pageSize, expectedPage, expectedSize, ids] of cases) {
+      const result = await client.browsePrecision({ value, page, pageSize, $select: 'id, value' })
+      equal(result.total, 3n)
+      equal(result.page, expectedPage)
+      equal(result.pageSize, expectedSize)
+      equal(result.items.length, ids.length)
+      for (let i = 0; i < ids.length; i++) {
+        equal(result.items[i].id, ids[i])
+        equal(result.items[i].value, value)
+        equal(result.items[i].label, undefined)
+      }
+    }
+  }
+}
+
+const nullableSelection = 'values, durations, flags, tail'
+const nullableCases: NullableArraysInput[] = [
+  { values: null, durations: null, flags: null, tail: 42n },
+  { values: [], durations: [], flags: [], tail: 42n },
+  { values: [-(1n << 63n), (1n << 63n) - 1n], durations: [-(1n << 63n), (1n << 63n) - 1n], flags: [true, false], tail: 42n },
+]
+
+function verifyNullable(row: NullableArrays<true>, input: NullableArraysInput): void {
+  for (const name of ['values', 'durations', 'flags'] as const) {
+    const actual = row[name], expected = input[name]
+    if (expected === null) equal(actual, null)
+    else {
+      equal(actual?.length, expected.length)
+      for (let i = 0; i < expected.length; i++) equal(actual?.[i], expected[i])
+    }
+  }
+  equal(row.tail, input.tail)
+}
+
+async function verifyNullableArrays(client: LuxoClient, websocket: boolean): Promise<void> {
+  for (let state = 0; state < nullableCases.length; state++) {
+    const input = nullableCases[state]
+    verifyNullable(await client.echoNullableArrays({ input, $select: nullableSelection }), input)
+    const rows = await client.listNullableArrays({ input, $select: nullableSelection })
+    equal(rows.length, 2)
+    for (const row of rows) verifyNullable(row, input)
+    const partials = await client.listNullableArrays({ input, $select: 'tail' })
+    partials.push(await client.echoNullableArrays({ input, $select: 'tail' }))
+    for (const partial of partials) {
+      equal(partial.tail, input.tail)
+      for (const value of [partial.values, partial.durations, partial.flags]) equal(value, undefined)
+    }
+    if (websocket) {
+      const row = await firstStream<NullableArrays<true>>(receive =>
+        client.subscribeWatchNullableArrays({ state: BigInt(state), $select: nullableSelection }, receive))
+      verifyNullable(row, input)
+    }
+  }
+}
+
+async function verifyStreams(client: LuxoClient): Promise<void> {
+  const defaultRow = await firstStream<Precision<true>>(receive => client.subscribeWatchPrecision({ $select: selection }, receive))
+  verify(defaultRow, { value: 42n, duration: 42n, optional: 42n, values: [42n], label: '精度 café', ignored: 42n })
+  for (const value of integers) {
+    const row = await firstStream<Precision<true>>(receive => client.subscribeWatchPrecision({ value, $select: selection }, receive))
+    verify(row, { value, duration: value, optional: value, values: [value], label: '精度 café', ignored: 42n })
+  }
+}
+
+async function firstStream<T>(subscribe: (receive: (row: T) => void) => Promise<() => void>): Promise<T> {
+  const { promise, resolve } = Promise.withResolvers<T>()
+  const unsubscribe = await subscribe(resolve)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const expired = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('Missing Go stream value')), 5000) })
+    return await Promise.race([promise, expired])
+  } finally { clearTimeout(timer); unsubscribe() }
+}
+
+const nestedGroupSelection = `label, primary { ${selection} }, optional { ${selection} }, rows { ${selection} }, optionalRows { ${selection} }, tail`
+const nestedSelection = `group { ${nestedGroupSelection} }, groups { ${nestedGroupSelection} }, tail`
+
+function nestedInput(state: number): NestedPrecisionInput {
+  const value = (1n << 63n) - 1n
+  const row: PrecisionInput = { value, duration: -(1n << 63n), optional: value, values: [-(1n << 63n), value], label: '精度 café', ignored: 42n }
+  const group: NestedGroupInput = {
+    label: 'nested 東京', primary: row, optional: state === 0 ? null : row,
+    rows: state === 2 ? [row] : [], optionalRows: state === 0 ? null : state === 1 ? [] : [row], tail: 42n,
+  }
+  return { group, groups: [group], tail: -42n }
+}
+
+function verifyGroup(actual: NestedGroup<true>, expected: NestedGroupInput): void {
+  equal(actual.label, expected.label)
+  if (!actual.primary) throw new Error('Missing nested primary')
+  verify(actual.primary, expected.primary)
+  if (expected.optional === null) equal(actual.optional, null)
+  else if (actual.optional) verify(actual.optional, expected.optional)
+  else throw new Error('Missing nested optional')
+  for (const key of ['rows', 'optionalRows'] as const) {
+    const rows = actual[key], input = expected[key]
+    if (input === null) equal(rows, null)
+    else {
+      equal(rows?.length, input.length)
+      for (let i = 0; i < input.length; i++) verify(rows![i], input[i])
+    }
+  }
+  equal(actual.tail, expected.tail)
+}
+
+function verifyNested(actual: NestedPrecision<true>, expected: NestedPrecisionInput): void {
+  if (!actual.group) throw new Error('Missing nested group')
+  verifyGroup(actual.group, expected.group)
+  equal(actual.groups?.length, expected.groups.length)
+  for (let i = 0; i < expected.groups.length; i++) verifyGroup(actual.groups![i], expected.groups[i])
+  equal(actual.tail, expected.tail)
+}
+
+async function verifyNestedResponses(client: LuxoClient, websocket: boolean): Promise<void> {
+  for (let state = 0; state < 3; state++) {
+    const input = nestedInput(state)
+    verifyNested(await client.echoNestedPrecision({ input, $select: nestedSelection }), input)
+    const rows = await client.listNestedPrecision({ input, $select: nestedSelection })
+    equal(rows.length, 2)
+    for (const row of rows) verifyNested(row, input)
+    const partials = await client.listNestedPrecision({ input, $select: 'tail' })
+    partials.push(await client.echoNestedPrecision({ input, $select: 'tail' }))
+    for (const row of partials) { equal(row.tail, -42n); equal(row.group, undefined); equal(row.groups, undefined) }
+    if (!websocket) continue
+    const row = await firstStream<NestedPrecision<true>>(receive =>
+      client.subscribeWatchNestedPrecision({ state: BigInt(state), $select: nestedSelection }, receive))
+    verifyNested(row, input)
+  }
+}
+
+async function verifySuccessAndStreams(client: LuxoClient, websocket: boolean): Promise<void> {
+  await verifyUUIDs(client)
+  await verifyUnary(client)
+  await verifyNamedEnums(client, websocket)
+  await verifyPagination(client)
+  await verifyNullableArrays(client, websocket)
+  await verifyNestedResponses(client, websocket)
+  await verifyScalarArrays(client, websocket)
+  if (websocket) {
+    await verifyTimestampStreams(client)
+    await verifyStreams(client)
+    await verifyJSONStreams(client)
+  }
+}
+
+async function verifyComplete(client: LuxoClient, websocket: boolean): Promise<void> {
+  await verifySuccessAndStreams(client, websocket)
+  await verifyStrictQueries(client)
+  await verifyErrorResponses(client)
+  await verifyJSONErrors(client)
+  if (websocket) for (const fail of [false, true]) await verifyStreamTermination(client, fail)
+  if (websocket) for (const kind of [0, 1, 2]) await verifyNullableRootStream(client, kind)
+}
+
+function verifyFutureState(value: FixtureState): void {
+  if (!(value instanceof UnknownEnumValue)) throw new Error('future enum was not explicitly Unknown')
+  equal(value.kind, 'unknown')
+  equal(value.enumName, 'FixtureState')
+  equal(value.rawValue, 'FUTURE')
+}
+
+async function verifyEnumUpgrade(client: LuxoClient, websocket: boolean): Promise<void> {
+  await verifyPagination(client)
+  const future = new UnknownEnumValue('FixtureState', 'FUTURE')
+  const received = await client.echoFixtureState({ value: future })
+  verifyFutureState(received)
+  verifyFutureState(await client.echoFixtureState({ value: received }))
+  equal(await client.echoFixtureState({ value: 'OPEN' }), 'OPEN')
+  const values = await client.echoFixtureStates({ values: ['OPEN', future, 'CLOSED'] })
+  equal(values.length, 3)
+  equal(values[0], 'OPEN'); verifyFutureState(values[1]); equal(values[2], 'CLOSED')
+  equal((await client.echoFixtureStates({ values: [] })).length, 0)
+  if (websocket) {
+    verifyFutureState(await firstStream<FixtureState>(receive => client.subscribeWatchFixtureState(receive)))
+    const rows = await firstStream<FixtureState[]>(receive => client.subscribeWatchFixtureStates(receive))
+    equal(rows.length, 3)
+    equal(rows[0], 'OPEN'); verifyFutureState(rows[1]); equal(rows[2], 'CLOSED')
+  }
+  try {
+    await client.echoFixtureState({ value: new UnknownEnumValue('FixtureState', 'UNDECLARED') })
+    throw new Error('server accepted an undeclared enum')
+  } catch (error) {
+    if (!(error instanceof LuxoError)) throw error
+    equal(error.code, 400); equal(error.error, 'BadRequest')
+  }
+  equal(await client.echoInteger({ value: 42n }), 42n)
+}
+
+async function verifyStrictQueries(client: LuxoClient): Promise<void> {
+  equal(LuxoQuery_listQueryProbes.count_eq(9007199254740993n).value, 9007199254740993n)
+  equal(LuxoQuery_listQueryProbes.count_desc().order, 'desc')
+  await verifyQueryError(client, 'createdAt', () => client.listQueryProbes({
+    $select: 'id', $filters: [LuxoQuery_listQueryProbes.createdAt_eq('2026-02-30T00:00:00Z')],
+  }))
+  const filters: Filter[] = [
+    { field: 'missing', op: 'eq', value: '1' },
+    { field: 'id', op: 'eq', value: '1' },
+    { field: 'state', op: 'eq', value: 'FUTURE' },
+    { field: 'state', op: 'gt', value: 'OPEN' },
+    { field: 'active', op: 'eq', value: 'truue' },
+    { field: 'score', op: 'eq', value: 'NaN' },
+    { field: 'count', op: 'eq', value: 'bad' },
+    { field: 'createdAt', op: 'eq', value: '2026-02-30T00:00:00Z' },
+  ]
+  for (const filter of filters) {
+    await verifyQueryError(client, filter.field, () =>
+      client.listQueryProbes({ $select: 'id', $filters: [filter] }))
+  }
+  for (const field of ['missing', 'id']) {
+    await verifyQueryError(client, field, () =>
+      client.listQueryProbes({ $select: 'id', $sorters: [{ field, order: 'asc' }] }))
+  }
+}
+
+async function verifyQueryError(client: LuxoClient, field: string, request: () => Promise<unknown>): Promise<void> {
+  try { await request(); throw new Error('invalid query succeeded: ' + field) }
+  catch (error) {
+    if (!(error instanceof LuxoError)) throw error
+    equal(error.code, 400)
+    equal(error.error, 'BadRequest')
+    const data: unknown = error.data
+    if (!data || typeof data !== 'object' || !('param' in data)) throw new Error('missing query error data')
+    equal(data.param, field)
+  }
+  equal(await client.echoInteger({ value: 42n }), 42n)
+}
+
+async function verifyStreamTermination(client: LuxoClient, fail: boolean): Promise<void> {
+  const text = '{"integer":9223372036854775807,"large":123456789012345678901234567890,"fraction":0.1234567890123456789,"zero":-0}'
+  const value = decodeLuxoJSON(text)
+  const finished = Promise.withResolvers<LuxoError | undefined>()
+  let count = 0, terminals = 0
+  const timer = setTimeout(() => finished.reject(new Error('missing stream terminal frame')), 5000)
+  let cancel: (() => void) | undefined
+  try {
+    cancel = await client.subscribeWatchFiniteJSON({ value, fail }, row => {
+      try {
+        equal(row.length, 2)
+        equal(row[0], count++)
+        equal(encodeLuxoJSON(row[1]), text)
+      } catch (error) { finished.reject(error) }
+    }, {
+      onComplete: () => { terminals++; finished.resolve(undefined) },
+      onError: error => { terminals++; finished.resolve(error) },
+    })
+    const error = await finished.promise
+    equal(count, 64)
+    equal(terminals, 1)
+    if (fail) {
+      equal(error?.error, 'JSONRejected')
+      equal(error?.code, 422)
+      equal(encodeLuxoJSON(error?.data), '{"value":' + text + '}')
+    } else equal(error, undefined)
+    equal(await client.echoInteger({ value: 64n }), 64n)
+  } finally { clearTimeout(timer); cancel?.() }
+}
+
+async function verifySubscriptionIDs(mode: 'json' | 'binary'): Promise<void> {
+  for (const start of [9007199254740990n, 9223372036854775806n, 18446744073709551613n]) {
+    const transport = new WsTransport(endpoint.replace('http:', 'ws:'), { mode, timeout: 5000 })
+    ;(transport as unknown as { seq: number | bigint }).seq = start <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(start) : start
+    const client = new LuxoClient(transport)
+    try {
+      // Two subscriptions to one API may finish in either order. Both use the
+      // real generated decoder, real WS connection and distinct full-width IDs.
+      const rows = await Promise.all([1n, 2n].map(value => firstStream<Precision<true>>(receive =>
+        client.subscribeWatchPrecision({ value, $select: 'value' }, receive))))
+      equal(rows[0].value, 1n)
+      equal(rows[1].value, 2n)
+      if (start === 18446744073709551613n) {
+        let exhausted = false
+        try { await client.subscribeWatchFixtureState(() => {}) }
+        catch (error) { exhausted = error instanceof LuxoError && error.error === 'RequestIDExhausted' }
+        equal(exhausted, true)
+      }
+    } finally { client.close() }
+  }
+}
+
+async function runInterop(verifyClient: (client: LuxoClient, websocket: boolean) => Promise<void>): Promise<void> {
+  verifyNestedBoundaries()
+  verifyTextBoundaries()
+  for (const channel of ['http:', 'ws:']) {
+    for (const mode of ['json', 'binary'] as const) {
+      const client = LuxoClient.create(endpoint.replace('http:', channel), { mode, timeout: 5000 })
+      try {
+        await verifyClient(client, channel === 'ws:')
+        if (channel === 'ws:') await verifySubscriptionIDs(mode)
+        console.log(channel + ' ' + mode + ' passed')
+      } finally {
+        client.close()
+      }
+    }
+  }
+  for (const mode of ['json', 'binary'] as const) {
+    await verifyTokenRefresh(mode)
+    console.log('refresh ' + mode + ' passed')
+    await verifyDisconnect(mode)
+  }
+}
+
+async function verifyTokenRefresh(mode: 'json' | 'binary'): Promise<void> {
+  const bootstrap = LuxoClient.create(endpoint, { mode, timeout: 5000 })
+  let attempts = 0, policy: 'renew' | 'decline' | 'invalid' = 'renew'
+  let refresh = ''
+  const transport = new FetchTransport(endpoint, { mode, timeout: 5000, onTokenExpired: async () => {
+    attempts++
+    if (policy === 'decline') return null
+    return policy === 'invalid' ? refresh : await bootstrap.exchangeFixtureRefresh({ token: refresh })
+  } })
+  const client = new LuxoClient(transport)
+  try {
+    refresh = await bootstrap.issueFixtureRefresh()
+    const access = await bootstrap.issueFixtureAccess()
+    let rejected = false
+    try { await bootstrap.exchangeFixtureRefresh({ token: access }) }
+    catch (error) { if (!(error instanceof LuxoError)) throw error; rejected = true }
+    equal(rejected, true)
+    transport.setToken(refresh)
+    equal(await client.fixtureIdentity(), 9007199254740993n)
+    equal(await client.fixtureIdentity(), 9007199254740993n)
+    equal(attempts, 1)
+    for (const next of ['decline', 'invalid'] as const) {
+      policy = next
+      transport.setToken(refresh)
+      rejected = false
+      try { await client.fixtureIdentity() }
+      catch (error) { if (!(error instanceof LuxoError)) throw error; equal(error.code, 401); rejected = true }
+      equal(rejected, true)
+      equal(attempts, next === 'decline' ? 2 : 3)
+    }
+  } finally { client.close(); bootstrap.close() }
+}
+
+async function verifyDisconnect(mode: 'json' | 'binary'): Promise<void> {
+  const client = LuxoClient.create(disconnectEndpoint.replace('http:', 'ws:'), { mode, timeout: 5000 })
+  const data = Promise.withResolvers<void>(), failed = Promise.withResolvers<void>()
+  let delivered = 0, errors = 0, completed = 0
+  let cancels: (() => void)[] = []
+  const timeout = setTimeout(() => { failed.reject(new Error('missing disconnect error')); data.reject(new Error('missing stream data')) }, 5000)
+  // Attach handlers before a failure can win either phase of this fixture.
+  void data.promise.catch(() => {}); void failed.promise.catch(() => {})
+  try {
+    cancels = await Promise.all([1n, 2n].map(value => client.subscribeWatchPrecision({ value, $select: 'value' }, row => {
+      equal(row.value, value)
+      if (++delivered === 2) data.resolve()
+    }, {
+      onComplete: () => { completed++ },
+      onError: error => { equal(error.error, 'NetworkError'); if (++errors === 2) failed.resolve() },
+    })))
+    await data.promise
+    // The parent destroys the real TCP proxy sockets only after both streams delivered data.
+    console.log('disconnect ' + mode + ' ready')
+    await failed.promise
+    equal(errors, 2); equal(completed, 0)
+    equal(await client.echoInteger({ value: 3n }), 3n)
+    cancels.forEach(cancel => cancel())
+    const next = await firstStream<Precision<true>>(receive =>
+      client.subscribeWatchPrecision({ value: 3n, $select: 'value' }, receive))
+    equal(next.value, 3n)
+    equal(delivered, 2); equal(errors, 2)
+    console.log('disconnect ' + mode + ' passed')
+  } finally { clearTimeout(timeout); cancels.forEach(cancel => cancel()); client.close() }
+}
+
+function verifyTextBoundaries(): void {
+  for (const bytes of [[0xff], [0xc0, 0x80], [0xed, 0xa0, 0x80], [0xf4, 0x90, 0x80, 0x80]]) {
+    for (const columnar of [false, true]) {
+      const wire = Uint8Array.from([...(columnar ? [1, 0] : [0]), 5, bytes.length, ...bytes, 0])
+      let rejected = false
+      try {
+        if (columnar) decodeColumnarPrecision(wire)
+        else decodePrecision(new Decoder(wire))
+      } catch { rejected = true }
+      equal(rejected, true)
+    }
+  }
+}
+
+// Deliberately malformed bytes supplement, never replace, the live Go responses.
+function verifyNestedBoundaries(): void {
+  for (const columnar of [false, true]) {
+    const read = (bytes: number[]) => columnar
+      ? decodeColumnarNestedGroup(Uint8Array.from(bytes))[0]
+      : decodeNestedGroup(new Decoder(Uint8Array.from(bytes)))
+    for (const field of [2, 3, 4, 5]) {
+      const child = field < 4 ? [0, 1, 84, 0] : [1, 0, 1, 84, 0]
+      const wrap = (payload: number[]) => [
+        ...(columnar ? [1, 0] : [0]), field, ...([3, 5].includes(field) ? [1] : []),
+        payload.length, ...payload, 6, 84, 0,
+      ]
+      const valid = wrap(child)
+      const row = read(valid)
+      equal(row.tail, 42n)
+      const value = field === 2 ? row.primary : field === 3 ? row.optional : field === 4 ? row.rows?.[0] : row.optionalRows?.[0]
+      equal(value?.value, 42n)
+      const invalid = [wrap([...child, 99]), [...valid, 99]]
+      for (let end = 0; end < child.length; end++) invalid.push(wrap(child.slice(0, end)))
+      for (let end = 0; end < valid.length; end++) invalid.push(valid.slice(0, end))
+      if (field === 3 || field === 5) {
+        const marker = [...valid]
+        marker[columnar ? 3 : 2] = 2
+        invalid.push(marker)
+      }
+      for (const bytes of invalid) {
+        let rejected = false
+        try { read(bytes) } catch { rejected = true }
+        equal(rejected, true)
+      }
+    }
+  }
+}
+
+const scalarFields = ['ints', 'floats', 'strings', 'bools', 'dates', 'durations', 'uuids', 'bytes', 'decimals', 'jsons', 'enums'] as const
+const scalarSelection = [...scalarFields, 'tail'].join(', ')
+
+function scalarArraysInput(state: number): ScalarArraysInput {
+  return {
+    ints: state === 0 ? null : state === 1 ? [] : [-(1n << 63n), (1n << 63n) - 1n],
+    floats: state === 0 ? null : state === 1 ? [] : state === 3
+      ? [-1.5, 1.25, -0, Number.MIN_VALUE, -Number.MIN_VALUE, Number.MAX_VALUE] : [-1.5, 1.25],
+    strings: state === 0 ? null : state === 1 ? [] : ['', '精度 café 東京'],
+    bools: state === 0 ? null : state === 1 ? [] : [true, false],
+    dates: state === 0 ? null : state === 1 ? [] : ['1969-12-31T23:59:59Z', '2021-01-01T00:00:00Z'],
+    durations: state === 0 ? null : state === 1 ? [] : [-(1n << 63n), (1n << 63n) - 1n],
+    uuids: state === 0 ? null : state === 1 ? [] : ['00000000-0000-0000-0000-000000000000', '00000000-0000-0000-0000-000000000001'],
+    bytes: state === 0 ? null : state === 1 ? [] : [new Uint8Array(), Uint8Array.from([0, 127, 128, 255])],
+    decimals: state === 0 ? null : state === 1 ? [] : ['1234567890.123456789', '-0.000000001'],
+    jsons: state === 0 ? null : state === 1 ? [] : [{ value: (1n << 63n) - 1n, text: '東京' }, false],
+    enums: state === 0 ? null : state === 1 ? [] : ['OPEN', 'CLOSED'], tail: 42n,
+  }
+}
+
+function verifyScalarArrayValues(row: ScalarArrays<true>, input: ScalarArraysInput): void {
+  equal(row.tail, input.tail)
+  for (const field of scalarFields) equal(encodeLuxoJSON(row[field]), encodeLuxoJSON(input[field]))
+  if (input.floats) {
+    equal(row.floats?.length, input.floats.length)
+    for (let index = 0; index < input.floats.length; index++) {
+      equal(Object.is(row.floats?.[index], input.floats[index]), true)
+    }
+  }
+}
+
+async function verifyScalarArrays(client: LuxoClient, websocket: boolean): Promise<void> {
+  for (const state of [0, 1, 2, 3]) {
+    const input = scalarArraysInput(state)
+    verifyScalarArrayValues(await client.echoScalarArrays({ input, $select: scalarSelection }), input)
+    const rows = await client.listScalarArrays({ input, $select: scalarSelection })
+    equal(rows.length, 2)
+    for (const row of rows) verifyScalarArrayValues(row, input)
+    const partials = await client.listScalarArrays({ input, $select: 'tail' })
+    partials.push(await client.echoScalarArrays({ input, $select: 'tail' }))
+    for (const row of partials) {
+      equal(row.tail, input.tail)
+      for (const field of scalarFields) equal(row[field], undefined)
+    }
+    if (!websocket) continue
+    const row = await firstStream<ScalarArrays<true>>(receive =>
+      client.subscribeWatchScalarArrays({ state: BigInt(state), $select: scalarSelection }, receive))
+    verifyScalarArrayValues(row, input)
+  }
+}

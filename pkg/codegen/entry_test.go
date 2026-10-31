@@ -1,6 +1,13 @@
 package codegen
 
 import (
+	"bytes"
+	goast "go/ast"
+	goparser "go/parser"
+	gotoken "go/token"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -8,6 +15,140 @@ import (
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
 )
+
+func TestCheckedEntriesReturnCanonicalSource(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{Name: "origin/user.luxo", Models: []*ast.ModelDecl{{Name: "User"}}}}}
+	entries, err := GenerateModuleEntryFilesChecked(result, "example.com/app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, generate := range map[string]func(*semantic.Result, string, ...EntryBackends) ([]byte, error){
+		"embedded": GenerateEntryFileChecked, "gateway": GenerateGatewayEntryChecked,
+	} {
+		source, err := generate(result, "example.com/app")
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries[name] = source
+	}
+	for name, source := range entries {
+		canonical, err := formatGeneratedChecked(source)
+		if err != nil || !bytes.Equal(source, canonical) || len(source) == 0 {
+			t.Errorf("%s is not canonical Go: %v", name, err)
+		}
+	}
+}
+
+func TestEntryGeneratorsExposeOnlyCheckedFunctions(t *testing.T) {
+	file, err := goparser.ParseFile(gotoken.NewFileSet(), "entry.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	functions := make(map[string]bool)
+	for _, declaration := range file.Decls {
+		if function, ok := declaration.(*goast.FuncDecl); ok && function.Recv == nil {
+			functions[function.Name.Name] = true
+		}
+	}
+	for _, name := range []string{"GenerateEntryFile", "GenerateModuleEntryFiles", "GenerateGatewayEntry"} {
+		t.Run(name, func(t *testing.T) {
+			if functions[name] {
+				t.Errorf("unchecked entry generator %s must not be exported", name)
+			}
+			if !functions[name+"Checked"] {
+				t.Errorf("checked entry generator %sChecked must remain public", name)
+			}
+		})
+	}
+}
+
+func TestEntryEmissionDefersFormattingToCheckedBoundary(t *testing.T) {
+	file, err := goparser.ParseFile(gotoken.NewFileSet(), "entry.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emitters := map[string]bool{
+		"generateEntryFile": false, "generateSingleModuleEntry": false, "generateGatewayEntry": false,
+	}
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*goast.FuncDecl)
+		if !ok {
+			continue
+		}
+		if _, tracked := emitters[function.Name.Name]; !tracked {
+			continue
+		}
+		emitters[function.Name.Name] = true
+		goast.Inspect(function.Body, func(node goast.Node) bool {
+			call, ok := node.(*goast.CallExpr)
+			if !ok {
+				return true
+			}
+			if name, ok := call.Fun.(*goast.Ident); ok && (name.Name == "formatGenerated" || name.Name == "formatGeneratedChecked") {
+				t.Errorf("%s formats twice through its Checked boundary", function.Name.Name)
+			}
+			return true
+		})
+	}
+	for name, found := range emitters {
+		if !found {
+			t.Errorf("missing emitter %s", name)
+		}
+	}
+}
+
+func TestCheckedEntriesRejectUnresolvedCacheContracts(t *testing.T) {
+	declaration := cachedTestAPI(true)
+	for _, args := range [][]*ast.NamedArg{
+		{{Name: "ttl", Value: &ast.Literal{Kind: token.Int, Value: "60"}}},
+		{{Name: "policy", Value: &ast.Literal{Kind: token.String, Value: "missing"}}},
+	} {
+		declaration.Directives[1].Args = args
+		input := &semantic.Result{Files: []*ast.File{{APIs: []*ast.ApiDecl{declaration}}}}
+		if source, err := GenerateEntryFileChecked(input, "example.com/cache", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}); err == nil || source != nil {
+			t.Fatal("embedded entry accepted unresolved policy")
+		}
+		if source, err := GenerateModuleEntryFilesChecked(input, "example.com/cache", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}); err == nil || source != nil {
+			t.Fatal("module entries accepted unresolved policy")
+		}
+		if source, err := GenerateGatewayEntryChecked(input, "example.com/cache", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}); err == nil || source != nil {
+			t.Fatal("gateway entry accepted unresolved policy")
+		}
+	}
+}
+
+func TestCacheEntryRequiresExplicitBackend(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		api := &ast.ApiDecl{Name: "answer", ReturnType: &ast.TypeRef{Name: "Int"}, Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.Literal{Kind: token.Int, Value: "1"}}}}}
+		if cached {
+			api.Directives = []*ast.Directive{{Name: "cache", Args: []*ast.NamedArg{{Name: "policy", Value: &ast.Literal{Kind: token.String, Value: "preview"}}}}}
+		}
+		result := analyzeCachedFixture(t, []*ast.File{{Name: "origin/task/api.luxo", APIs: []*ast.ApiDecl{api}}}, true)
+		if len(result.Errors) != 0 {
+			t.Fatal(result.Errors)
+		}
+		embedded, err := GenerateEntryFileChecked(result, "example.com/cache", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries, err := GenerateModuleEntryFilesChecked(result, "example.com/cache", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name, source := range map[string][]byte{"embedded": embedded, "task": entries["task"]} {
+			code := string(source)
+			if cached {
+				for _, part := range []string{`api.NewResponseCacheFromEnv(ctx, "` + name + `", cache.OpenMemory)`, "defer responseCache.Close()", "luvia.NewWithOptions", "options := api.RouterOptionsFromEnv()", "options.ResponseCache = responseCache", "luvia.NewWithOptions(options)"} {
+					if !strings.Contains(code, part) {
+						t.Fatalf("%s missing %s: %s", name, part, code)
+					}
+				}
+			} else if strings.Contains(code, "ResponseCache") || strings.Contains(code, `"github.com/light-speak/luxo/pkg/lux/api"`) {
+				t.Fatalf("uncached app gained cache setup: %s", code)
+			}
+		}
+	}
+}
 
 func TestGenerateEntryFile(t *testing.T) {
 	result := &semantic.Result{
@@ -31,7 +172,7 @@ func TestGenerateEntryFile(t *testing.T) {
 		},
 	}
 
-	src := GenerateEntryFile(result, "myapp")
+	src := generateEntryFile(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	if src == nil {
 		t.Fatal("should generate entry file")
 	}
@@ -44,6 +185,8 @@ func TestGenerateEntryFile(t *testing.T) {
 		`user_resolver "myapp/service/user/resolver"`,
 		`post_resolver "myapp/service/post/resolver"`,
 		"migrate.EnsureDatabase",
+		`env.CheckBackend("DATABASE_DRIVER", "pg")`,
+		`"github.com/light-speak/luxo/pkg/lux/pg/migrate"`,
 		"migrate.New(ctx",
 		"migrator.Up(ctx)",
 		"fatal: ensure db:",
@@ -79,9 +222,55 @@ func TestGenerateEntryFile(t *testing.T) {
 
 func TestGenerateEntryFileNoModels(t *testing.T) {
 	result := &semantic.Result{Files: []*ast.File{}}
-	src := GenerateEntryFile(result, "myapp")
+	src := generateEntryFile(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	if src != nil {
 		t.Error("should return nil for empty files")
+	}
+}
+
+func TestGeneratedSchemaRegistrationPrecedesServing(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{}}
+	for _, name := range []string{"user", "post"} {
+		result.Files = append(result.Files, &ast.File{
+			Name:      "origin/" + name + "/api.luxo",
+			Models:    []*ast.ModelDecl{{Name: name + "Record", Directives: []*ast.Directive{{Name: "crud"}}}},
+			Types:     []*ast.TypeDecl{{Name: name + "Payload", Fields: []*ast.FieldDecl{{Name: "value", Type: &ast.TypeRef{Name: "Int"}}}}},
+			Functions: []*ast.FnDecl{{Name: name + "Score", Directives: []*ast.Directive{{Name: "service"}}, Body: &ast.Block{}}},
+		})
+	}
+	modules := generateModuleEntryFiles(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
+	for _, entry := range []struct {
+		name    string
+		source  []byte
+		modules []string
+	}{
+		{"embedded", generateEntryFile(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}), []string{"user", "post"}},
+		{"gateway", generateGatewayEntry(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}), []string{"user", "post"}},
+		{"user", modules["user"], []string{"user"}},
+		{"post", modules["post"], []string{"post"}},
+	} {
+		t.Run(entry.name, func(t *testing.T) { assertSchemaBeforeServing(t, string(entry.source), entry.modules) })
+	}
+}
+
+func assertSchemaBeforeServing(t *testing.T, source string, modules []string) {
+	t.Helper()
+	firstServe := strings.Index(source, "gw.Serve(")
+	if firstServe < 0 {
+		t.Fatal("entry has no HTTP serving boundary")
+	}
+	if rpc := strings.Index(source, "rpc.NewServer("); rpc >= 0 && rpc < firstServe {
+		firstServe = rpc
+	}
+	for _, module := range modules {
+		registration := module + "_luxo.RegisterSchema(gw.Router.Schema)"
+		at := strings.Index(source, registration)
+		if at < 0 || at > firstServe {
+			t.Fatalf("%s must complete before publishing a server", registration)
+		}
+		if strings.Count(source, registration) != 1 {
+			t.Fatalf("%s registered more than once", registration)
+		}
 	}
 }
 
@@ -94,16 +283,17 @@ func TestGeneratedEntriesTreatDotEnvAsOptionalButRejectMalformedFiles(t *testing
 		}},
 	}}}
 	sources := map[string]string{
-		"embedded": string(GenerateEntryFile(result, "myapp")),
-		"module":   string(GenerateModuleEntryFiles(result, "myapp")["user"]),
-		"gateway":  string(GenerateGatewayEntry(result, "myapp")),
+		"embedded": string(generateEntryFile(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})),
+		"module":   string(generateModuleEntryFiles(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})["user"]),
+		"gateway":  string(generateGatewayEntry(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})),
 	}
 	for name, source := range sources {
 		t.Run(name, func(t *testing.T) {
-			if !strings.Contains(source, `err != nil && !os.IsNotExist(err)`) ||
+			if !strings.Contains(source, `err != nil && !errors.Is(err, os.ErrNotExist)`) ||
 				!strings.Contains(source, `fatal: load .env: %v`) {
 				t.Fatalf("generated entry must ignore only a missing .env file:\n%s", source)
 			}
+			executeGeneratedDotEnvGuard(t, source)
 		})
 	}
 }
@@ -120,25 +310,25 @@ func TestCheckedEntryGenerationReportsInvalidGo(t *testing.T) {
 
 func TestCheckedEntryGenerationCoversEmptyValidAndInvalidProjects(t *testing.T) {
 	empty := &semantic.Result{}
-	if source, err := GenerateEntryFileChecked(empty, "myapp"); err != nil || source != nil {
+	if source, err := GenerateEntryFileChecked(empty, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}); err != nil || source != nil {
 		t.Fatalf("empty embedded entry = %q, %v", source, err)
 	}
-	if entries, err := GenerateModuleEntryFilesChecked(empty, "myapp"); err != nil || entries != nil {
+	if entries, err := GenerateModuleEntryFilesChecked(empty, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}); err != nil || entries != nil {
 		t.Fatalf("empty module entries = %#v, %v", entries, err)
 	}
-	if source, err := GenerateGatewayEntryChecked(empty, "myapp"); err != nil || source != nil {
+	if source, err := GenerateGatewayEntryChecked(empty, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}); err != nil || source != nil {
 		t.Fatalf("empty gateway entry = %q, %v", source, err)
 	}
 
 	result := &semantic.Result{Files: []*ast.File{{Name: "origin/user.luxo", Models: []*ast.ModelDecl{{Name: "User"}}}}}
-	entries, err := GenerateModuleEntryFilesChecked(result, "myapp")
+	entries, err := GenerateModuleEntryFilesChecked(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	if err != nil || len(entries["user"]) == 0 {
 		t.Fatalf("valid module entries = %#v, %v", entries, err)
 	}
 	if _, err := GenerateModuleEntryFilesChecked(result, `invalid"module`); err == nil {
 		t.Fatal("invalid module entry import was not reported")
 	}
-	if source, err := GenerateGatewayEntryChecked(result, "myapp"); err != nil || len(source) == 0 {
+	if source, err := GenerateGatewayEntryChecked(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}); err != nil || len(source) == 0 {
 		t.Fatalf("valid gateway entry = %q, %v", source, err)
 	}
 	if _, err := GenerateGatewayEntryChecked(result, `invalid"module`); err == nil {
@@ -157,7 +347,7 @@ func TestGenerateEntryFileNoCrud(t *testing.T) {
 			}},
 		}},
 	}
-	src := GenerateEntryFile(result, "myapp")
+	src := generateEntryFile(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	code := string(src)
 
 	// Should still generate entry but not register handlers
@@ -184,7 +374,7 @@ func TestGenerateEntryFileNonCrudAPIRegistersHandlers(t *testing.T) {
 			}},
 		}},
 	}
-	src := GenerateEntryFile(result, "myapp")
+	src := generateEntryFile(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	code := string(src)
 
 	if !strings.Contains(code, `gw.AddModule("schema")`) {
@@ -227,7 +417,7 @@ func TestGenerateEntryFileWithLoaders(t *testing.T) {
 		},
 	}
 
-	src := GenerateEntryFile(result, "myapp")
+	src := generateEntryFile(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	if src == nil {
 		t.Fatal("should generate entry file")
 	}
@@ -291,7 +481,7 @@ func TestGenerateEntryFileWithExtends(t *testing.T) {
 		},
 	}
 
-	src := GenerateEntryFile(result, "myapp")
+	src := generateEntryFile(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	if src == nil {
 		t.Fatal("should generate entry file")
 	}
@@ -340,18 +530,23 @@ func TestGenerateEntryFileWithEvents(t *testing.T) {
 		},
 	}
 
-	src := GenerateEntryFile(result, "myapp")
+	src := generateEntryFile(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	if src == nil {
 		t.Fatal("should generate entry file")
 	}
 	code := string(src)
 
 	// Should have event bus wiring via framework function
-	if !strings.Contains(code, "event.NewFromEnv()") {
-		t.Errorf("should use event.NewFromEnv():\n%s", code)
+	if !strings.Contains(code, "event.NewChanBus(256)") {
+		t.Errorf("should use event.NewChanBus(256):\n%s", code)
 	}
 	if !strings.Contains(code, "RegisterEvents") {
 		t.Errorf("should call RegisterEvents:\n%s", code)
+	}
+	for _, required := range []string{"eventBus := event.NewChanBus(256)", "taskQueue := queue.NewMemoryQueue(", "if err := user_luxo.RegisterEvents(", "fatal: register events:"} {
+		if !strings.Contains(code, required) {
+			t.Errorf("embedded entry must propagate messaging failures: missing %q", required)
+		}
 	}
 	if !strings.Contains(code, "eventBus.Close()") {
 		t.Errorf("should defer eventBus.Close():\n%s", code)
@@ -377,7 +572,7 @@ func TestGenerateEntryFileWithServiceFns(t *testing.T) {
 		},
 	}
 
-	src := GenerateEntryFile(result, "myapp")
+	src := generateEntryFile(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	code := string(src)
 
 	// Should register service fns
@@ -415,7 +610,7 @@ func TestGenerateEntryFileNoServiceFns(t *testing.T) {
 		}},
 	}
 
-	src := GenerateEntryFile(result, "myapp")
+	src := generateEntryFile(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	code := string(src)
 
 	// Should NOT have service fn registration
@@ -469,7 +664,7 @@ func TestGenerateModuleEntryFiles(t *testing.T) {
 		},
 	}
 
-	entries := GenerateModuleEntryFiles(result, "myapp")
+	entries := generateModuleEntryFiles(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	if len(entries) != 2 {
 		t.Fatalf("expected 2 entries, got %d", len(entries))
 	}
@@ -505,7 +700,7 @@ func TestGenerateModuleEntryFiles(t *testing.T) {
 
 func TestGenerateModuleEntryFiles_Empty(t *testing.T) {
 	result := &semantic.Result{Files: []*ast.File{}}
-	entries := GenerateModuleEntryFiles(result, "myapp")
+	entries := generateModuleEntryFiles(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	if entries != nil {
 		t.Error("should return nil for empty project")
 	}
@@ -539,7 +734,7 @@ func TestGenerateModuleEntryFiles_WithLoaders(t *testing.T) {
 		},
 	}
 
-	entries := GenerateModuleEntryFiles(result, "myapp")
+	entries := generateModuleEntryFiles(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	userSrc := string(entries["user"])
 
 	// Module with same-module relations (no extend) should use DefaultLoaders
@@ -566,14 +761,19 @@ func TestGenerateModuleEntryFiles_WithEvents(t *testing.T) {
 		}},
 	}
 
-	entries := GenerateModuleEntryFiles(result, "myapp")
+	entries := generateModuleEntryFiles(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	src := string(entries["order"])
 
-	if !strings.Contains(src, "event.NewFromEnv()") {
+	if !strings.Contains(src, "event.NewChanBus(256)") {
 		t.Errorf("should have event bus:\n%s", src)
 	}
 	if !strings.Contains(src, "RegisterEvents") {
 		t.Errorf("should register events:\n%s", src)
+	}
+	for _, required := range []string{"eventBus := event.NewChanBus(256)", "taskQueue := queue.NewMemoryQueue(", "if err := order_luxo.RegisterEvents(", "fatal: register events:"} {
+		if !strings.Contains(src, required) {
+			t.Errorf("module entry must propagate messaging failures: missing %q", required)
+		}
 	}
 }
 
@@ -594,7 +794,7 @@ func TestGenerateModuleEntryFiles_WithServiceFns(t *testing.T) {
 		}},
 	}
 
-	entries := GenerateModuleEntryFiles(result, "myapp")
+	entries := generateModuleEntryFiles(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	src := string(entries["user"])
 
 	if !strings.Contains(src, "RegisterServiceFns") {
@@ -624,7 +824,7 @@ func TestGenerateGatewayEntry(t *testing.T) {
 		},
 	}
 
-	code := GenerateGatewayEntry(result, "myapp")
+	code := generateGatewayEntry(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	if code == nil {
 		t.Fatal("should generate gateway entry")
 	}
@@ -658,7 +858,7 @@ func TestGenerateGatewayEntry(t *testing.T) {
 		`Name: "response.merge"`,
 		"luvia.ExtractPrimaryKeyColumn",
 		"luvia.ExtractPrimaryKeys",
-		"keys.EncodeParam(1)",
+		"keys.EncodeResolveParams(shape)",
 	}
 	for _, check := range checks {
 		if !strings.Contains(src, check) {
@@ -669,7 +869,7 @@ func TestGenerateGatewayEntry(t *testing.T) {
 
 func TestGenerateGatewayEntry_Empty(t *testing.T) {
 	result := &semantic.Result{Files: []*ast.File{}}
-	code := GenerateGatewayEntry(result, "myapp")
+	code := generateGatewayEntry(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	if code != nil {
 		t.Error("should return nil for empty project")
 	}
@@ -687,7 +887,7 @@ func TestGenerateGatewayEntryAppliesRateLimitAtPublicEdge(t *testing.T) {
 		}},
 	}}}
 
-	src := string(GenerateGatewayEntry(result, "myapp"))
+	src := string(generateGatewayEntry(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}))
 	if !strings.Contains(src, `case "searchUsers":`) ||
 		!strings.Contains(src, "api.WithRateLimit(20, time.Minute, handler)") {
 		t.Fatalf("gateway must enforce @rateLimit before RPC forwarding:\n%s", src)
@@ -708,7 +908,7 @@ func TestGenerateGatewayEntrySkipsRoutesWithoutRateLimits(t *testing.T) {
 			{Name: "open"},
 		},
 	}}}
-	source := string(GenerateGatewayEntry(result, "myapp"))
+	source := string(generateGatewayEntry(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}))
 	if !strings.Contains(source, `case "limited":`) || strings.Contains(source, `case "open":`) {
 		t.Fatalf("gateway rate-limit switch is incorrect:\n%s", source)
 	}
@@ -731,12 +931,12 @@ func TestGenerateGatewayEntry_WithServiceFns(t *testing.T) {
 		}},
 	}
 
-	code := GenerateGatewayEntry(result, "myapp")
+	code := generateGatewayEntry(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	src := string(code)
 
-	// Service fns should be in routing table
-	if !strings.Contains(src, "svc:getScore") {
-		t.Errorf("missing service fn route:\n%s", src)
+	// Internal service functions must not be forwarded by the public gateway.
+	if strings.Contains(src, "svc:getScore") {
+		t.Errorf("internal service fn exposed by gateway:\n%s", src)
 	}
 }
 
@@ -799,7 +999,7 @@ func TestCollectModulesMarksEventEmitters(t *testing.T) {
 	if len(modules) != 1 || !modules[0].emitsEvents {
 		t.Fatalf("event emitter must receive EventBus wiring: %#v", modules)
 	}
-	src := string(GenerateEntryFile(result, "myapp"))
+	src := string(generateEntryFile(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}))
 	if !strings.Contains(src, "authApp.EventBus = eventBus") {
 		t.Fatalf("missing emitter EventBus wiring:\n%s", src)
 	}
@@ -883,14 +1083,14 @@ func TestEntryRegistersCrossModuleLoadEndpoints(t *testing.T) {
 	if len(modules) != 2 || !modules[0].hasBatchRPC || !modules[0].hasRemoteLoad {
 		t.Fatalf("module endpoint flags = %#v", modules)
 	}
-	code := string(GenerateEntryFile(result, "github.com/test"))
+	code := string(generateEntryFile(result, "github.com/test", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}))
 	if !strings.Contains(code, "user_luxo.RegisterBatchLoaders(gw.Router, userApp)") {
 		t.Errorf("entry did not register the PK batch endpoint:\n%s", code)
 	}
 	if !strings.Contains(code, "user_luxo.RegisterRemoteLoaders(gw.Router, userApp)") {
 		t.Errorf("entry did not register the named load endpoint:\n%s", code)
 	}
-	entries := GenerateModuleEntryFiles(result, "github.com/test")
+	entries := generateModuleEntryFiles(result, "github.com/test", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	userEntry := string(entries["user"])
 	if !strings.Contains(userEntry, "user_luxo.RegisterRemoteLoaders(gw.Router, app)") {
 		t.Errorf("user service did not register the named load endpoint:\n%s", userEntry)
@@ -915,6 +1115,21 @@ func TestCollectModulesIgnoresPrimaryKeyLoadEndpoint(t *testing.T) {
 	modules := collectModules(result)
 	if len(modules) != 1 || modules[0].hasRemoteLoad {
 		t.Fatalf("module flags = %#v", modules)
+	}
+}
+
+func TestDataOnlyModulesHaveNoRuntimeEntry(t *testing.T) {
+	common := &ast.File{Name: "origin/common/types.luxo", Enums: []*ast.EnumDecl{{Name: "Role", Values: []string{"USER"}}}}
+	result := &semantic.Result{Files: []*ast.File{common}}
+	if modules := collectModules(result); len(modules) != 0 {
+		t.Fatalf("data-only runtime modules = %v", modules)
+	}
+	if src := generateEntryFile(result, "example.com/app", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}); src != nil {
+		t.Fatal("data-only project generated a process")
+	}
+	result.Files = append(result.Files, &ast.File{Name: "origin/common/events.luxo", Events: []*ast.EventDecl{{Name: "Refresh"}}})
+	if modules := collectModules(result); len(modules) != 1 || modules[0].name != "common" || !modules[0].hasEvents {
+		t.Fatalf("event-bearing module lost its runtime: %v", modules)
 	}
 }
 
@@ -985,7 +1200,7 @@ func TestGenerateSingleModuleEntryWithExtends(t *testing.T) {
 			break
 		}
 	}
-	code := generateSingleModuleEntry(target, modules, result, "myapp")
+	code := generateSingleModuleEntry(target, modules, result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	src := string(code)
 
 	// Should have RPC-backed loader wiring with project service
@@ -1019,7 +1234,7 @@ func TestGenerateGatewayEntryEventOnly(t *testing.T) {
 		},
 	}
 
-	code := GenerateGatewayEntry(result, "myapp")
+	code := generateGatewayEntry(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	src := string(code)
 
 	if !strings.Contains(src, "user_luxo.RegisterSchema") {
@@ -1049,7 +1264,7 @@ func TestGenerateGatewayEntryStreamSkip(t *testing.T) {
 		}},
 	}
 
-	code := GenerateGatewayEntry(result, "myapp")
+	code := generateGatewayEntry(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	src := string(code)
 
 	if strings.Contains(src, `"watchUsers"`) {
@@ -1067,19 +1282,24 @@ func TestGeneratedEntriesRegisterStreams(t *testing.T) {
 		}},
 	}}}
 
-	embedded := string(GenerateEntryFile(result, "myapp"))
+	embedded := string(generateEntryFile(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}))
 	if !strings.Contains(embedded, "alert_luxo.RegisterStreams(gw.Router, eventBus, nil)") {
 		t.Fatalf("embedded entry does not register streams:\n%s", embedded)
 	}
 
-	module := string(GenerateModuleEntryFiles(result, "myapp")["alert"])
+	module := string(generateModuleEntryFiles(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})["alert"])
 	if !strings.Contains(module, "alert_luxo.RegisterStreams(gw.Router, eventBus, nil)") {
 		t.Fatalf("module entry does not register streams:\n%s", module)
 	}
 
-	gateway := string(GenerateGatewayEntry(result, "myapp"))
+	gateway := string(generateGatewayEntry(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}))
 	if !strings.Contains(gateway, "alert_luxo.RegisterStreams(gw.Router, eventBus, nil)") {
 		t.Fatalf("gateway entry does not register streams:\n%s", gateway)
+	}
+	for name, source := range map[string]string{"embedded": embedded, "module": module, "gateway": gateway} {
+		if !strings.Contains(source, "if err := alert_luxo.RegisterStreams(gw.Router, eventBus, nil); err != nil {") || !strings.Contains(source, "fatal: register streams:") {
+			t.Errorf("%s ignores stream listener registration failure", name)
+		}
 	}
 }
 
@@ -1097,32 +1317,51 @@ func TestGeneratedEntriesBridgeNativeStreamsThroughRPC(t *testing.T) {
 		}},
 	}}}
 
-	embedded := string(GenerateEntryFile(result, "myapp"))
+	embedded := string(generateEntryFile(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}))
 	if !strings.Contains(embedded, "score_luxo.RegisterStreams(gw.Router, eventBus, scoreApp.Resolver)") {
 		t.Fatalf("embedded native stream resolver was not injected:\n%s", embedded)
 	}
-	module := string(GenerateModuleEntryFiles(result, "myapp")["score"])
+	module := string(generateModuleEntryFiles(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})["score"])
 	if !strings.Contains(module, "score_luxo.RegisterStreams(gw.Router, eventBus, app.Resolver)") {
 		t.Fatalf("service native stream resolver was not injected:\n%s", module)
 	}
-	if !strings.Contains(module, "eventBus := event.NewFromEnv()") {
+	if !strings.Contains(module, "eventBus := event.NewChanBus(256)") {
 		t.Fatalf("native stream service did not initialize its event bus:\n%s", module)
 	}
 	if !strings.Contains(module, "score_luxo.RegisterSchema(gw.Router.Schema)") {
 		t.Fatalf("standalone module did not register its runtime schema:\n%s", module)
 	}
-	gateway := string(GenerateGatewayEntry(result, "myapp"))
+	gateway := string(generateGatewayEntry(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}))
 	for _, want := range []string{
 		"score_luxo.RegisterStreams(gw.Router, eventBus, nil)",
-		`gw.Router.HandleStreamNative("watchLiveScore", rpcStreamProxy(rpcClients["score"]`,
+		`gw.Router.HandleStreamForwarded("watchLiveScore", rpcStreamProxy(rpcClients["score"]`,
 		"client.SubscribeContext(ctx, luvia.BearerToken(ctx)",
-		"params.Binary()",
-		"router.StreamPayloadJSON(apiName, data)",
+		"req.BinaryParams()",
+		"data, err = router.StreamPayloadJSON(apiName, data)",
+		"return subscription.Err()",
 	} {
 		if !strings.Contains(gateway, want) {
 			t.Fatalf("gateway native stream bridge missing %q:\n%s", want, gateway)
 		}
 	}
+	if strings.Contains(gateway, "case <-subscription.Errors():") {
+		t.Fatal("terminal errors must not skip buffered stream messages")
+	}
+}
+
+func TestGeneratedGatewayStreamErrorInterfaceCompiles(t *testing.T) {
+	var source strings.Builder
+	source.WriteString(`package generated
+import (
+    "context"
+    "fmt"
+    "github.com/light-speak/luxo/pkg/lux/api"
+    "github.com/light-speak/luxo/pkg/lux/rpc"
+    "github.com/light-speak/luxo/pkg/lux/luvia"
+)
+`)
+	writeGatewayRPCStreamProxy(&source, []moduleInfo{{nativeStreams: []string{"watch"}}})
+	runGeneratedProtocolPackage(t, source.String(), "package generated\n")
 }
 
 func TestGenerateGatewayEntryNoCrudModel(t *testing.T) {
@@ -1138,7 +1377,7 @@ func TestGenerateGatewayEntryNoCrudModel(t *testing.T) {
 		}},
 	}
 
-	code := GenerateGatewayEntry(result, "myapp")
+	code := generateGatewayEntry(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	src := string(code)
 
 	// Should not have CRUD routes
@@ -1165,12 +1404,90 @@ func TestGenerateGatewayEntryCompiledAPIDedup(t *testing.T) {
 		}},
 	}
 
-	code := GenerateGatewayEntry(result, "myapp")
+	code := generateGatewayEntry(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"})
 	src := string(code)
 
 	// getUser should appear exactly once in routing
 	count := strings.Count(src, `"getUser"`)
 	if count != 1 {
 		t.Errorf("getUser should appear exactly once (dedup), appeared %d times:\n%s", count, src)
+	}
+}
+
+// Execute the exact generated guard: string matching alone cannot prove that
+// wrapped filesystem errors retain the intended optional-file behavior.
+func executeGeneratedDotEnvGuard(t *testing.T, source string) {
+	t.Helper()
+	start := strings.Index(source, "if err := env.Load(")
+	if start < 0 {
+		t.Fatal("missing generated environment guard")
+	}
+	end := strings.Index(source[start:], "\n\t}\n")
+	if end < 0 {
+		t.Fatal("unterminated generated environment guard")
+	}
+	guard := source[start : start+end+4]
+	root, err := filepath.Abs("../../.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(root, 0755); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp(root, "entry-env-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Error(err)
+		}
+	})
+	program := `package main
+import ("errors"; "fmt"; "os"; "github.com/light-speak/luxo/pkg/lux/env")
+func main() {` + guard + "}\n"
+	path := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(path, []byte(program), 0600); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(dir, "entry")
+	build := exec.CommandContext(t.Context(), "go", "build", "-o", binary, path)
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build guard: %v\n%s", err, output)
+	}
+	for _, mode := range []string{"missing", "valid", "malformed", "directory"} {
+		t.Run(mode, func(t *testing.T) { checkGeneratedDotEnvGuard(t, binary, dir, mode) })
+	}
+}
+
+func checkGeneratedDotEnvGuard(t *testing.T, binary, root, mode string) {
+	t.Helper()
+	dir := filepath.Join(root, mode)
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, ".env")
+	if mode == "directory" {
+		if err := os.Mkdir(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	} else if mode != "missing" {
+		text := "LUXO_ENTRY_TEST_VALUE=valid\n"
+		if mode == "malformed" {
+			text = "invalid assignment\n"
+		}
+		if err := os.WriteFile(path, []byte(text), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	command := exec.CommandContext(t.Context(), binary)
+	command.Dir = dir
+	output, err := command.CombinedOutput()
+	rejected := mode == "malformed" || mode == "directory"
+	if (err != nil) != rejected {
+		t.Fatalf("%s: error=%v output=%s", mode, err, output)
+	}
+	if rejected && !strings.Contains(string(output), "fatal: load .env:") {
+		t.Fatalf("missing error diagnostic: %s", output)
 	}
 }

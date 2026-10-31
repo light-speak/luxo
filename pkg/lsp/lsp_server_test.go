@@ -2562,6 +2562,7 @@ func TestMemberMethodDescription(t *testing.T) {
 		{"joinToString", true},
 		// @withAuth injected methods
 		{"createToken", true},
+		{"createRefreshToken", true},
 		{"verify", true},
 		{"refreshToken", true},
 		// Identity methods
@@ -2926,6 +2927,20 @@ func TestDirectiveDescriptionCoverage(t *testing.T) {
 		desc := directiveDescription(name)
 		if desc == "" {
 			t.Errorf("expected non-empty description for @%s", name)
+		}
+	}
+}
+
+func TestAuthDirectiveDescriptionMatchesTokenContract(t *testing.T) {
+	description := directiveDescription("withAuth")
+	for _, required := range []string{"@withAuth(stores: [id])", "createToken", "createRefreshToken", "refreshToken", "JWT_REFRESH"} {
+		if !strings.Contains(description, required) {
+			t.Errorf("auth description is missing %q", required)
+		}
+	}
+	for _, removed := range []string{"jwt:", ".verify()"} {
+		if strings.Contains(description, removed) {
+			t.Errorf("auth description still advertises %q", removed)
 		}
 	}
 }
@@ -5371,6 +5386,27 @@ func TestInferredAPICompletionFieldLevel(t *testing.T) {
 	}
 }
 
+func TestInferredAPICompletionBaseActions(t *testing.T) {
+	for _, action := range []struct{ prefix, label, detail string }{
+		{"li", "listUsers", "list all User (paginated)"},
+		{"COUNT", "countUsers", "count all User"},
+		{"deleteUser", "deleteUser", "delete User by id"},
+	} {
+		t.Run(action.prefix, func(t *testing.T) {
+			items := buildModelAPICompletions(testModelForCompletion(), nil, action.prefix)
+			for _, item := range items {
+				if item.Label == action.label {
+					if item.Kind != 3 || item.InsertText != action.label || item.Detail != action.detail {
+						t.Fatalf("invalid base completion: %+v", item)
+					}
+					return
+				}
+			}
+			t.Fatalf("missing %s in %+v", action.label, items)
+		})
+	}
+}
+
 func TestInferredAPICompletionAfterOr(t *testing.T) {
 	m := testModelForCompletion()
 	items := buildModelAPICompletions(m, map[string]bool{}, "getUserByEmailOr")
@@ -6241,6 +6277,21 @@ func TestBuildSQLPreviewOrGroups(t *testing.T) {
 	}
 }
 
+func TestBuildSQLPreviewPreservesAndWithinOrGroups(t *testing.T) {
+	inf := &codegen.InferredAPI{
+		Action: "get", ModelName: "User",
+		Groups: []codegen.ClauseGroup{
+			{Clauses: []codegen.InferClause{{Field: "email", Op: "eq"}, {Field: "name", Op: "eq"}}},
+			{Clauses: []codegen.InferClause{{Field: "id", Op: "eq"}}},
+		},
+	}
+	result := buildSQLPreview(inf, testModelMap())
+	want := "((email = $1 AND name = $2)\n  OR (id = $3))"
+	if !strings.Contains(result, want) {
+		t.Fatalf("SQL preview lost grouping or parameter order: %s; want %s", result, want)
+	}
+}
+
 func TestBuildSQLPreviewNoGroups(t *testing.T) {
 	models := testModelMap()
 	inf := &codegen.InferredAPI{
@@ -6448,9 +6499,28 @@ func TestGetInferredAPICompletionsBasic(t *testing.T) {
 		URI:     "test.luxo",
 		File:    &ast.File{Models: []*ast.ModelDecl{userModel}},
 	}
-	items := server.getInferredAPICompletions(doc, Position{Line: 0, Character: 7}, "get")
+	items := server.getCompletions(doc, Position{Line: 0, Character: 7})
 	if len(items) == 0 {
 		t.Fatal("expected completions for 'api get'")
+	}
+	for _, item := range items {
+		if item.Label == "getUserByEmail" {
+			return
+		}
+	}
+	t.Fatal("completion dispatcher lost inferred API suggestions")
+}
+
+func TestResolveInferredAPIHoverWithTrailingComment(t *testing.T) {
+	server, _ := newTestServer()
+	doc := &Document{
+		Content: "api getUserByEmail // Lookup by email",
+		URI:     "test.luxo",
+		File:    &ast.File{Models: []*ast.ModelDecl{testModelWithFields()}},
+	}
+	result := server.resolveInferredAPIHover(doc, "getUserByEmail", Position{Line: 0, Character: 5})
+	if !strings.Contains(result, "SELECT") {
+		t.Fatalf("trailing comment suppressed SQL preview: %q", result)
 	}
 }
 
@@ -6603,6 +6673,21 @@ func TestCollectQueryableFieldsWithDirectives(t *testing.T) {
 	}
 	if !emailField.searchable {
 		t.Error("expected searchable")
+	}
+}
+
+func TestCollectQueryableFieldsPreservesExplicitTimestamps(t *testing.T) {
+	model := &ast.ModelDecl{Name: "User", Fields: []*ast.FieldDecl{
+		{Name: "createdAt", Type: &ast.TypeRef{Name: "DateTime"}, Directives: []*ast.Directive{{Name: "sortable"}}},
+		{Name: "updatedAt", Type: &ast.TypeRef{Name: "DateTime", Nullable: true}},
+	}}
+	fields := collectQueryableFields(model, nil)
+	if len(fields) != 2 {
+		t.Fatalf("explicit timestamps were duplicated: %+v", fields)
+	}
+	if fields[0].name != "createdAt" || !fields[0].sortable || fields[0].nullable ||
+		fields[1].name != "updatedAt" || !fields[1].nullable {
+		t.Fatalf("explicit timestamp metadata changed: %+v", fields)
 	}
 }
 

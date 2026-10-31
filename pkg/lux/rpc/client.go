@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/api"
 	"github.com/light-speak/luxo/pkg/lux/codec"
-	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
 )
 
 // Client sends RPC requests to a remote Luxo service.
@@ -36,6 +36,8 @@ type Subscription struct {
 	cancel   context.CancelFunc
 	stop     func() bool
 	once     sync.Once
+	finished atomic.Bool
+	result   error // published by finished; immutable afterward
 }
 
 // Messages returns canonical Luxo binary stream payloads.
@@ -43,9 +45,19 @@ func (s *Subscription) Messages() <-chan []byte {
 	return s.messages
 }
 
-// Errors reports the terminal stream result and then closes.
+// Errors reports terminal failure and then closes. Drain Messages first when
+// ordering matters; selecting Errors alongside Messages can skip buffered data.
 func (s *Subscription) Errors() <-chan error {
 	return s.errors
+}
+
+// Err returns the terminal result without consuming it. Drain Messages before
+// interpreting nil as successful completion; an active stream also returns nil.
+func (s *Subscription) Err() error {
+	if s.finished.Load() {
+		return s.result
+	}
+	return nil
 }
 
 // Close cancels the subscription and closes its dedicated connection.
@@ -64,6 +76,15 @@ func NewNamedClient(name, addr string) *Client {
 	return &Client{name: name, pool: NewPool(addr, 32)}
 }
 
+// NewNamedClientWithOptions creates an LRPC client with explicit pool budgets.
+func NewNamedClientWithOptions(name, addr string, options PoolOptions) (*Client, error) {
+	pool, err := NewPoolWithOptions(addr, options)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{name: name, pool: pool}, nil
+}
+
 // Call sends a binary-encoded request and returns the response body.
 // apiID: from luxo.lock. params: pre-encoded binary (fieldID+value pairs + 0x00).
 // Returns the response body (without status byte) and any error.
@@ -73,9 +94,7 @@ func (c *Client) Call(apiID int, params []byte) ([]byte, error) {
 
 // CallWithMask sends a request with field mask for field selection.
 func (c *Client) CallWithMask(apiID int, fieldMask []byte, params []byte) ([]byte, error) {
-	request := encodeCallRequest(apiID, fieldMask, params)
-	payload := encodeRequestEnvelope(requestKindCall, "", request)
-	return c.callPayload(context.Background(), payload)
+	return c.callRequest(context.Background(), callRequest{apiID: apiID, mask: fieldMask, params: params})
 }
 
 // CallWithMaskContext sends an authenticated request and propagates cancellation
@@ -85,13 +104,11 @@ func (c *Client) CallWithMaskContext(ctx context.Context, bearerToken string, ap
 }
 
 // CallWithMaskTargetContext adds service and field attribution when detailed
-// tracing is explicitly enabled on ctx. The normal path keeps the v1 envelope.
+// tracing is explicitly enabled on ctx. Normal requests carry no trace metadata.
 func (c *Client) CallWithMaskTargetContext(ctx context.Context, bearerToken string, apiID int, fieldMask []byte, params []byte, target TraceTarget) ([]byte, error) {
-	request := encodeCallRequest(apiID, fieldMask, params)
 	trace := api.DebugTrace(ctx)
 	if trace == nil {
-		payload := encodeRequestEnvelope(requestKindCall, bearerToken, request)
-		return c.callPayload(ctx, payload)
+		return c.callRequest(ctx, callRequest{apiID: apiID, token: bearerToken, mask: fieldMask, params: params})
 	}
 	fieldPath := target.FieldPath
 	if fieldPath == "" {
@@ -102,7 +119,7 @@ func (c *Client) CallWithMaskTargetContext(ctx context.Context, bearerToken stri
 		Name: "service.call", Category: "service", Service: c.traceName(), Operation: target.Operation,
 		Field: target.Field, FieldPath: fieldPath, Selection: target.Selection, Dependency: target.Dependency,
 	})
-	payload := encodeTracedRequestEnvelope(requestKindCall, bearerToken, api.TraceID(ctx), fieldPath, trace.DatabaseDetails(), request)
+	payload := prepareTracedCallFrame(bearerToken, api.TraceID(ctx), fieldPath, trace.DatabaseDetails(), apiID, fieldMask, params)
 	body, remote, err := c.callTracedPayload(ctx, payload)
 	applyTraceDefaults(&remote, c.traceName(), target)
 	trace.MergeSpan(callSpan, remote)
@@ -113,8 +130,7 @@ func (c *Client) CallWithMaskTargetContext(ctx context.Context, bearerToken stri
 // SubscribeContext opens a dedicated binary RPC stream. The connection is not
 // returned to the unary pool because it remains owned by the subscription.
 func (c *Client) SubscribeContext(ctx context.Context, bearerToken string, apiID int, fieldMask []byte, params []byte) (*Subscription, error) {
-	request := encodeCallRequest(apiID, fieldMask, params)
-	payload := encodeRequestEnvelope(requestKindStream, bearerToken, request)
+	payload := prepareCallFrame(requestKindStream, bearerToken, apiID, fieldMask, params)
 	conn, err := c.pool.GetContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("rpc: dial %s: %w", c.pool.addr, err)
@@ -133,7 +149,7 @@ func (c *Client) SubscribeContext(ctx context.Context, bearerToken string, apiID
 		cancel:   cancel,
 	}
 	subscription.stop = context.AfterFunc(streamCtx, func() { conn.Close() })
-	if err := WriteFrame(conn, payload); err != nil {
+	if err := writePreparedFrame(conn, payload); err != nil {
 		subscription.finish(fmt.Errorf("rpc: stream write: %w", err))
 		return nil, err
 	}
@@ -189,6 +205,13 @@ func (s *Subscription) readLoop(ctx context.Context) {
 		case statusError:
 			s.finish(decodeError(frame[1:]))
 			return
+		case statusStreamComplete:
+			var err error
+			if len(frame) != 1 {
+				err = fmt.Errorf("rpc: trailing stream completion data")
+			}
+			s.finish(err)
+			return
 		default:
 			s.finish(fmt.Errorf("rpc: invalid stream frame status %d", frame[0]))
 			return
@@ -198,6 +221,8 @@ func (s *Subscription) readLoop(ctx context.Context) {
 
 func (s *Subscription) finish(err error) {
 	s.once.Do(func() {
+		s.result = err
+		s.finished.Store(true)
 		if s.stop != nil {
 			s.stop()
 		}
@@ -211,24 +236,12 @@ func (s *Subscription) finish(err error) {
 	})
 }
 
-func encodeCallRequest(apiID int, fieldMask []byte, params []byte) []byte {
-	// Build request payload: [API ID varint] [mask len varint] [mask] [params]
-	var payload []byte
-	payload = codec.AppendVarint(payload, uint64(apiID))
-	payload = codec.AppendVarint(payload, uint64(len(fieldMask)))
-	if len(fieldMask) > 0 {
-		payload = append(payload, fieldMask...)
-	}
-	if len(params) > 0 {
-		payload = append(payload, params...)
-	} else {
-		payload = append(payload, 0x00) // empty params terminator
-	}
-	return payload
+func (c *Client) callRequest(ctx context.Context, request callRequest) ([]byte, error) {
+	resp, err := c.exchangeRequest(ctx, nil, &request)
+	return decodeCallResponse(resp, err)
 }
 
-func (c *Client) callPayload(ctx context.Context, payload []byte) ([]byte, error) {
-	resp, err := c.exchange(ctx, payload)
+func decodeCallResponse(resp []byte, err error) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
@@ -250,10 +263,21 @@ func (c *Client) callPayload(ctx context.Context, payload []byte) ([]byte, error
 }
 
 func (c *Client) exchange(ctx context.Context, payload []byte) ([]byte, error) {
+	return c.exchangeRequest(ctx, payload, nil)
+}
+
+func (c *Client) exchangeRequest(ctx context.Context, payload []byte, request *callRequest) ([]byte, error) {
 	// Get pooled connection
 	conn, err := c.pool.GetContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("rpc: dial %s: %w", c.pool.addr, err)
+	}
+	if request != nil {
+		payload, err = request.prepare(conn)
+		if err != nil {
+			c.pool.Put(conn)
+			return nil, err
+		}
 	}
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := conn.SetDeadline(deadline); err != nil {
@@ -273,7 +297,7 @@ func (c *Client) exchange(ctx context.Context, payload []byte) ([]byte, error) {
 	}
 
 	// Send request frame
-	if err := WriteFrame(conn, payload); err != nil {
+	if err := writePreparedFrame(conn, payload); err != nil {
 		closeConnection()
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -376,66 +400,30 @@ func (c *Client) Close() {
 	c.pool.Close()
 }
 
-// decodeError decodes a binary error response.
-func decodeError(data []byte) error {
-	dec := codec.NewDecoder(data)
-	var code int64
-	var name, message string
-	var seen uint8
-	for dec.NextField() {
-		switch dec.FieldID() {
-		case 1:
-			code = dec.ReadInt()
-			seen |= 1 << 0
-		case 2:
-			name = dec.ReadString()
-			seen |= 1 << 1
-		case 3:
-			message = dec.ReadString()
-			seen |= 1 << 2
-		default:
-			return fmt.Errorf("rpc: unknown error field %d", dec.FieldID())
-		}
-	}
-	if err := dec.Err(); err != nil {
-		return fmt.Errorf("rpc: decode error envelope: %w", err)
-	}
-	if dec.FieldID() != 0 {
-		return fmt.Errorf("rpc: error envelope missing end marker")
-	}
-	if dec.Offset() != len(data) {
-		return fmt.Errorf("rpc: error envelope has trailing bytes")
-	}
-	if seen != 0b111 {
-		return fmt.Errorf("rpc: error envelope missing required fields")
-	}
-	appErr := &luxerrors.AppError{Name: name, Code: int(code), Message: message}
-	if code >= 500 {
-		appErr.Message = "error.internal"
-		appErr.Internal = true
-		appErr.Cause = fmt.Errorf("rpc error %d %s: %s", code, name, message)
-	}
-	return appErr
-}
-
 // EncodeParams builds binary params from typed values.
 // Helper for constructing RPC call params.
-func EncodeParams(fields ...ParamField) []byte {
+func EncodeParams(fields ...ParamField) ([]byte, error) {
 	var enc codec.Encoder
 	for _, f := range fields {
 		switch v := f.Value.(type) {
 		case int64:
 			enc.WriteFieldInt(f.FieldID, v)
 		case float64:
-			enc.WriteFieldFloat(f.FieldID, v)
+			if err := enc.WriteFieldFloat(f.FieldID, v); err != nil {
+				return nil, fmt.Errorf("RPC parameter %d: %w", f.FieldID, err)
+			}
 		case string:
-			enc.WriteFieldString(f.FieldID, v)
+			if err := enc.WriteFieldString(f.FieldID, v); err != nil {
+				return nil, fmt.Errorf("RPC parameter %d: %w", f.FieldID, err)
+			}
 		case bool:
 			enc.WriteFieldBool(f.FieldID, v)
+		default:
+			return nil, fmt.Errorf("RPC parameter %d: unsupported value type %T", f.FieldID, f.Value)
 		}
 	}
 	enc.WriteEnd()
-	return enc.Bytes()
+	return enc.Bytes(), nil
 }
 
 // ParamField represents a single parameter for EncodeParams.

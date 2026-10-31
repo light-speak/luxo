@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/light-speak/luxo/internal/benchlayout"
 )
 
 type dependencyLister func(root, packagePath string) ([]string, error)
@@ -106,9 +108,23 @@ func listProductionInputs(root, packagePath string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	command := exec.Command("go", "list", "-deps", "-test", "-json", "./"+filepath.ToSlash(packagePath))
+	packages, err := benchlayout.Packages(absoluteRoot, packagePath)
+	if err != nil {
+		return nil, err
+	}
+	args := []string{"list", "-deps", "-test", "-json"}
+	for _, path := range packages {
+		args = append(args, "./"+path)
+	}
+	command := exec.Command("go", args...)
 	command.Dir = absoluteRoot
-	command.Env = append(os.Environ(), "GOWORK=off")
+	workspace := "off"
+	if _, err := os.Stat(filepath.Join(absoluteRoot, "go.work")); err == nil {
+		workspace = filepath.Join(absoluteRoot, "go.work")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	command.Env = append(os.Environ(), "GOWORK="+workspace)
 	result, err := command.Output()
 	if err != nil {
 		return nil, err
@@ -189,7 +205,7 @@ func outsideRoot(path string) bool {
 
 func moduleDependenciesChanged(changed []string) bool {
 	for _, file := range changed {
-		switch filepath.ToSlash(filepath.Clean(file)) {
+		switch filepath.Base(filepath.Clean(file)) {
 		case "go.mod", "go.sum", "go.work", "go.work.sum":
 			return true
 		}

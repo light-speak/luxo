@@ -30,7 +30,7 @@ func TestGeneratorRejectsUnsupportedDriver(t *testing.T) {
 }
 
 func TestGenerateRejectsUnsupportedDriver(t *testing.T) {
-	_, err := Generate(&semantic.Result{}, "luxo", DBDriver("oracle"))
+	_, err := Generate(&semantic.Result{}, "luxo", GeneratorConfig{Driver: DBDriver("oracle")})
 	if err == nil || !strings.Contains(err.Error(), "unknown database driver") {
 		t.Fatalf("Generate error = %v, want unknown database driver", err)
 	}
@@ -67,9 +67,9 @@ func TestGeneratorsKeepStableIDsIsolatedConcurrently(t *testing.T) {
 			defer wg.Done()
 			generator, err := NewGenerator(GeneratorConfig{
 				Driver: DriverPG,
-				IDs: StableIDs{ModelFields: map[string]map[string]int{
+				IDs: completeFixtureAPIIDs(result, StableIDs{ModelFields: map[string]map[string]int{
 					"User": {"name": fieldID},
-				}},
+				}}),
 			})
 			if err != nil {
 				errs <- err

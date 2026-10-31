@@ -4,8 +4,79 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/light-speak/luxo/pkg/lexer"
 	"github.com/light-speak/luxo/pkg/token"
 )
+
+func TestFormatRawNestedBodyPreservesTokens(t *testing.T) {
+	for _, body := range []string{
+		"if (ready) { work() }\nfinish()",
+		"if (ready) {\n if (valid) { work() } else { reject() }\n}\nfinish()",
+		"val item = Item { value: 1 }\n// keep this comment\nreturn item",
+	} {
+		t.Run(body, func(t *testing.T) {
+			source := "interface Worker {\n fn run() {\n" + body + "\n }\n fn next(): Int\n}\napi after(): Int { 1 }"
+			assertFormatTokensUnchanged(t, source)
+		})
+	}
+}
+
+func TestFormatInlineBlockBoundaries(t *testing.T) {
+	for _, source := range []string{
+		"api value(): Int { 1 }",
+		"fn values(): [Int] { [1, 2] }",
+		"api read(): Value { Value { count: 1, child: Value { count: 2 } } }",
+		"api read(): Int { if (ready) { if (valid) { 1 } else { 2 } } else { 3 } }",
+		"on Changed { event -> if (event.ok) { consume(event) } done() }",
+		"on Changed { event -> if (event.ok) { consume(event) }\n done()\n}",
+		"api read(): Int { source.map { Item { value: it } }.count() }",
+	} {
+		t.Run(source, func(t *testing.T) { assertFormatTokensUnchanged(t, source) })
+	}
+}
+
+func assertFormatTokensUnchanged(t *testing.T, source string) {
+	t.Helper()
+	formatted, err := Format(source, "body.luxo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, beforeErr := lexer.New(source, "body.luxo").Tokenize()
+	after, afterErr := lexer.New(formatted, "body.luxo").Tokenize()
+	if len(beforeErr)+len(afterErr) != 0 || len(before) != len(after) {
+		t.Fatalf("format changed tokens: %d -> %d, errors %v %v\n%s", len(before), len(after), beforeErr, afterErr, formatted)
+	}
+	for i := range before {
+		if before[i].Type != after[i].Type || before[i].Val != after[i].Val {
+			t.Fatalf("token %d changed: %v -> %v\n%s", i, before[i], after[i], formatted)
+		}
+	}
+	again, err := Format(formatted, "body.luxo")
+	if err != nil || again != formatted {
+		t.Fatalf("format was not idempotent: %v\n%s\n%s", err, formatted, again)
+	}
+}
+
+func TestFormatTokensWithoutTerminalEOF(t *testing.T) {
+	for _, source := range []string{
+		"api find(id: Int): Int { if (id > 0) { id } else { 0 } }",
+		"model Item {\n id: Int @id\n value: String?\n}",
+		"on Changed { event -> consume(event) }",
+		"interface Worker { fn run(): Int { 1 } }",
+	} {
+		tokens, errors := lexer.New(source, "tokens.luxo").Tokenize()
+		if len(errors) != 0 {
+			t.Fatal(errors)
+		}
+		for end := 0; end < len(tokens); end++ {
+			prefix := tokens[:end:end]
+			terminated := append(append([]token.Token(nil), prefix...), token.Token{Type: token.EOF})
+			if got, want := FormatTokens(prefix), FormatTokens(terminated); got != want {
+				t.Fatalf("EOF changed prefix %d of %q:\n%s\n%s", end, source, got, want)
+			}
+		}
+	}
+}
 
 // ========== Step 1: use / val / var ==========
 
@@ -2451,22 +2522,15 @@ func TestRawBodyTokensEmptyMalformed(t *testing.T) {
 }
 
 // ========== Coverage: emitRawBodyTokens — inner RBrace mid-line (line 509) ==========
-// The inner loop break on RBrace (line 509) combined with the outer loop creates
-// a potential infinite loop when the RBrace is not the last token. This path is
-// only safely reachable when the RBrace IS the last token (handled by line 493).
-// Defensive code — no test needed.
+// The former raw-body walker discarded tokens after an inner RBrace.
+// TestFormatRawNestedBodyPreservesTokens now verifies this through Format.
 
 // ========== Coverage: emitRawBodyTokens — defensive fallback (lines 518-522) ==========
-// collectRawBody always includes the closing }, so the fallback after the for loop
-// in emitRawBodyTokens is unreachable. This is a defensive nil-guard.
+// Empty or incomplete raw bodies use the shared statement formatter's EOF handling.
 
 // ========== Coverage: collectRawBody — nested LBrace (line 595) ==========
-// collectRawBody's nested LBrace depth tracking (line 595-597) is exercised
-// whenever a raw line inside a block body contains a nested { ... } pair.
-// However, the corresponding emitRawBodyTokens has a latent issue with
-// non-terminal RBrace tokens, making it unsafe to test nested braces inside
-// raw bodies via Format(). The depth tracking code is a defensive guard
-// for correctness when nested braces appear in collected raw bodies.
+// Nested braces are exercised by TestFormatRawNestedBodyPreservesTokens, including
+// trailing statements, comments and sibling declarations after the raw body.
 
 // ========== Coverage: collectRawLine — RBrace mid-line (line 571) ==========
 
@@ -2517,9 +2581,7 @@ func TestAnnotationBreakOnLineChange(t *testing.T) {
 }
 
 // ========== Coverage: emitDeclTail — EOF with checkTopLevel (line 938) ==========
-// The EOF check inside emitDeclTail (line 938) is unreachable because
-// atEnd() in the for loop already returns true for EOF tokens.
-// Defensive guard — no test can reach it.
+// atEnd() owns the EOF check; the unreachable duplicate has been removed.
 
 // ========== Coverage: countParams — no RParen fallback (line 1058) ==========
 
@@ -2581,14 +2643,11 @@ func TestFormatOnAnnotationNextLine(t *testing.T) {
 }
 
 // ========== Coverage: formatBody — EOF branch (line 1391) ==========
-// The EOF check inside formatBody (line 1391) is unreachable because
-// atEnd() in the for loop already returns true for EOF tokens.
-// Defensive guard — no test can reach it.
+// atEnd() owns the EOF check; the unreachable duplicate has been removed.
 
 // ========== Coverage: stmtShouldBreak — EOF (line 1469) ==========
-// The EOF check inside stmtShouldBreak (line 1469) is unreachable because
-// formatStatement's for loop checks atEnd() which already handles EOF.
-// Defensive guard — no test can reach it.
+// formatStatement checks atEnd() before calling stmtShouldBreak, so the
+// duplicate EOF condition has been removed without weakening truncated-input handling.
 
 // ========== Coverage: handleInlineRBrace — same-line continuation (line 1497) ==========
 

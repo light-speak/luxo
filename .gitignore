@@ -5,6 +5,8 @@
 *.swo
 
 # Go
+/go.work
+/go.work.sum
 /bin/
 vendor/
 
@@ -24,3 +26,7 @@ examples/
 cover.out
 .tmp/
 packages/*/dist/
+
+# Kotlin integration consumer caches
+/tests/sdk-interop/kotlin/.gradle/
+/tests/sdk-interop/kotlin/.kotlin/

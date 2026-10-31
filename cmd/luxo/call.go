@@ -1,13 +1,12 @@
 package main
 
 import (
-	"encoding/base64"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/lux/api"
@@ -62,8 +61,11 @@ func callJSONMode(apiName string, params []string) error {
 		body[k] = inferType(v)
 	}
 
-	data, _ := json.Marshal(body)
-	resp, err := http.Post(callHost+"/luvia", "application/json", strings.NewReader(string(data)))
+	data, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("encode JSON request: %w", err)
+	}
+	resp, err := http.Post(callHost+"/luvia", "application/json", bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}
@@ -115,7 +117,7 @@ func callBinaryMode(apiName string, params []string) error {
 		return fmt.Errorf("encode binary request: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", callHost+"/luvia", strings.NewReader(string(body)))
+	req, err := http.NewRequest("POST", callHost+"/luvia", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -138,7 +140,7 @@ func callBinaryMode(apiName string, params []string) error {
 			}
 			return binaryErr
 		}
-		decodeBinaryResponse(respBody, apiSchema, runtimeSchema)
+		return decodeBinaryResponse(respBody, apiSchema, runtimeSchema)
 	} else {
 		// JSON response (error or fallback)
 		fmt.Println(string(respBody))
@@ -147,28 +149,36 @@ func callBinaryMode(apiName string, params []string) error {
 }
 
 // decodeBinaryResponse prints a hex + field dump of a binary response.
-func decodeBinaryResponse(data []byte, apiSchema *schema.API, runtimeSchema *schema.Schema) {
-	if len(data) == 0 {
+func decodeBinaryResponse(data []byte, apiSchema *schema.API, runtimeSchema *schema.Schema) error {
+	if len(data) == 0 && apiSchema.ReturnType == "" {
 		fmt.Println("(empty response)")
-		return
+		return nil
 	}
 
 	if apiSchema.ReturnType != "" {
-		if model := responseModel(apiSchema.ReturnType, runtimeSchema); model != nil {
+		if model := runtimeSchema.LookupModel(apiSchema.ReturnType); model != nil {
 			var output []byte
+			var err error
 			switch {
 			case apiSchema.Paginated:
-				output = schema.BinaryPaginatedListToJSON(nil, data, model, runtimeSchema)
+				output, err = schema.BinaryPaginatedListToJSON(nil, data, model, runtimeSchema)
 			case apiSchema.ReturnList:
-				output = schema.BinaryListToJSON(nil, data, model, runtimeSchema)
+				output, err = schema.BinaryListToJSON(nil, data, model, runtimeSchema)
 			default:
-				output = schema.BinaryToJSON(nil, data, model, runtimeSchema)
+				output, err = schema.BinaryToJSON(nil, data, model, runtimeSchema)
+			}
+			if err != nil {
+				return err
 			}
 			fmt.Println(string(output))
-			return
+			return nil
 		}
-		fmt.Println(string(schema.BinaryScalarToJSON(nil, data, apiSchema.ReturnType)))
-		return
+		output, err := decodeBinaryScalarResponse(data, apiSchema, runtimeSchema)
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(output))
+		return nil
 	}
 
 	// Hex dump
@@ -180,6 +190,18 @@ func decodeBinaryResponse(data []byte, apiSchema *schema.API, runtimeSchema *sch
 		fmt.Printf("%02x ", b)
 	}
 	fmt.Println()
+	return nil
+}
+
+func decodeBinaryScalarResponse(data []byte, meta *schema.API, runtimeSchema *schema.Schema) ([]byte, error) {
+	wireType := meta.ReturnType
+	if runtimeSchema.Enums[wireType] != nil {
+		wireType = "String"
+	}
+	if meta.ReturnList {
+		return schema.BinaryScalarListToJSON(nil, data, wireType)
+	}
+	return schema.BinaryScalarToJSON(nil, data, wireType)
 }
 
 func loadCallSchema(path string) (*schema.Schema, error) {
@@ -191,27 +213,17 @@ func loadCallSchema(path string) (*schema.Schema, error) {
 	if err := json.Unmarshal(data, &result); err != nil {
 		return nil, fmt.Errorf("decode %s: %w", path, err)
 	}
-	for _, model := range result.Models {
-		result.RegisterModel(model)
+	if err := result.Prepare(); err != nil {
+		return nil, fmt.Errorf("prepare %s: %w", path, err)
 	}
 	return &result, nil
-}
-
-func responseModel(typeName string, runtimeSchema *schema.Schema) *schema.Model {
-	if model := runtimeSchema.Models[typeName]; model != nil {
-		return model
-	}
-	if decl := runtimeSchema.Types[typeName]; decl != nil {
-		return decl.AsModel()
-	}
-	return nil
 }
 
 func callFieldMask(selectText string, apiSchema *schema.API, runtimeSchema *schema.Schema) ([]byte, error) {
 	if strings.TrimSpace(selectText) == "" {
 		return nil, nil
 	}
-	model := responseModel(apiSchema.ReturnType, runtimeSchema)
+	model := runtimeSchema.LookupModel(apiSchema.ReturnType)
 	if model == nil {
 		return nil, fmt.Errorf("API %s does not return a selectable model", apiSchema.Name)
 	}
@@ -220,92 +232,4 @@ func callFieldMask(selectText string, apiSchema *schema.API, runtimeSchema *sche
 		return nil, fmt.Errorf("parse --select: %w", err)
 	}
 	return schema.SelectToFieldMask(fields, model, runtimeSchema)
-}
-
-func parseBinaryCLIValue(raw string, param schema.Param) (any, error) {
-	if param.IsList {
-		var values []any
-		if err := json.Unmarshal([]byte(raw), &values); err != nil {
-			return nil, fmt.Errorf("expected JSON array: %w", err)
-		}
-		for i := range values {
-			value, err := parseBinaryJSONValue(values[i], param.Type)
-			if err != nil {
-				return nil, fmt.Errorf("element %d: %w", i, err)
-			}
-			values[i] = value
-		}
-		return values, nil
-	}
-	if param.Type == schema.FieldJSON {
-		var value any
-		if err := json.Unmarshal([]byte(raw), &value); err != nil {
-			return nil, fmt.Errorf("expected JSON value: %w", err)
-		}
-		return value, nil
-	}
-	return parseBinaryTextValue(raw, param.Type)
-}
-
-func parseBinaryJSONValue(value any, fieldType schema.FieldType) (any, error) {
-	if fieldType == schema.FieldJSON {
-		return value, nil
-	}
-	if fieldType == schema.FieldBytes {
-		text, ok := value.(string)
-		if !ok {
-			return nil, fmt.Errorf("expected base64 string")
-		}
-		return parseBinaryTextValue(text, fieldType)
-	}
-	if text, ok := value.(string); ok {
-		return parseBinaryTextValue(text, fieldType)
-	}
-	return value, nil
-}
-
-func parseBinaryTextValue(raw string, fieldType schema.FieldType) (any, error) {
-	switch fieldType {
-	case schema.FieldInt, schema.FieldDuration:
-		return strconv.ParseInt(raw, 10, 64)
-	case schema.FieldFloat:
-		return strconv.ParseFloat(raw, 64)
-	case schema.FieldBool:
-		return strconv.ParseBool(raw)
-	case schema.FieldBytes:
-		return base64.StdEncoding.DecodeString(raw)
-	case schema.FieldString, schema.FieldEnum, schema.FieldDateTime, schema.FieldUUID, schema.FieldDecimal:
-		return raw, nil
-	default:
-		return nil, fmt.Errorf("unsupported CLI type %s", fieldType.String())
-	}
-}
-
-func parseParam(s string) (string, string) {
-	idx := strings.IndexByte(s, '=')
-	if idx < 0 {
-		return s, ""
-	}
-	return s[:idx], s[idx+1:]
-}
-
-func inferType(v string) any {
-	// Try int
-	var i int64
-	if _, err := fmt.Sscanf(v, "%d", &i); err == nil && fmt.Sprintf("%d", i) == v {
-		return i
-	}
-	// Try float
-	var f float64
-	if _, err := fmt.Sscanf(v, "%g", &f); err == nil {
-		return f
-	}
-	// Try bool
-	if v == "true" {
-		return true
-	}
-	if v == "false" {
-		return false
-	}
-	return v
 }

@@ -1,0 +1,470 @@
+part of 'int64_consumer_test.dart';
+
+void verifyScalarResponses() {
+  test('generated calls and streams retain selection plan identity', () async {
+    final transport = _ResponseTransport()..response = <String, dynamic>{};
+    final client = LuxoClient(transport);
+    final plan = sdk.PreparedSelection('data');
+    await client.createSnapshot($selectionPlan: plan);
+    expect(identical(transport.lastRequest!.selectionPlan, plan), isTrue);
+    expect(transport.params, {r'$select': 'data'});
+    await client.createSnapshot(select: 'metadata', $selectionPlan: plan);
+    expect(transport.params, {r'$select': 'metadata'});
+    final cancel = await client.subscribeWatchPayload(
+      projectId: sdk.LuxoInt64.fromInt(1), $selectionPlan: plan, onData: (_) {},
+    );
+    expect(identical(transport.lastRequest!.selectionPlan, plan), isTrue);
+    expect(transport.params, {'projectId': sdk.LuxoInt64.fromInt(1), r'$select': 'data'});
+    cancel();
+    client.close();
+  });
+  test('enum parameter lists remain independent and growable', () async {
+    final transport = _ResponseTransport()..response = 'OPEN';
+    final client = LuxoClient(transport);
+    final states = [TaskStatusKnown.OPEN, TaskStatus.fromValue('FUTURE')];
+    await client.enumOptions(nullable: null, nullableList: states);
+    final raw = transport.params!['nullableList'] as List<String>;
+    states[0] = TaskStatusKnown.DONE;
+    expect(raw, ['OPEN', 'FUTURE']);
+    raw.add('OTHER');
+    expect(states.map((value) => value.rawValue), ['DONE', 'FUTURE']);
+    await client.enumOptions(nullable: null, nullableList: []);
+    final empty = transport.params!['nullableList'] as List<String>;
+    empty.add('OPEN');
+    expect(empty, ['OPEN']);
+  });
+  test(
+    'enum parameters preserve omitted values, null and raw unknown text',
+    () async {
+      final transport = _ResponseTransport()..response = 'FUTURE';
+      final client = LuxoClient(transport);
+      await client.enumOptions(nullable: null, nullableList: null);
+      expect(transport.params, {'nullable': null, 'nullableList': null});
+      final unknown = TaskStatus.fromValue('FUTURE');
+      await client.enumOptions(
+        nullable: unknown,
+        nullableList: [unknown],
+        defaulted: unknown,
+        nullableDefault: sdk.LuxoOptional.present(unknown),
+      );
+      expect(transport.params, {
+        'nullable': 'FUTURE',
+        'nullableList': ['FUTURE'],
+        'defaulted': 'FUTURE',
+        'nullableDefault': 'FUTURE',
+      });
+      await client.enumOptions(
+        nullable: null,
+        nullableList: [],
+        nullableDefault: const sdk.LuxoOptional<TaskStatus>.present(null),
+      );
+      expect(transport.params, {
+        'nullable': null,
+        'nullableList': [],
+        'nullableDefault': null,
+      });
+      for (final invalid in [null, 1, true, <Object?>{}]) {
+        expect(
+          () => EnumPayload.fromJson({'status': invalid}),
+          throwsA(isA<TypeError>()),
+        );
+        expect(
+          () => EnumPayload.fromJson({
+            'statuses': ['OPEN', invalid],
+          }),
+          throwsA(isA<TypeError>()),
+        );
+      }
+    },
+  );
+
+  test(
+    'enum models preserve unknown values, null and selection in both encodings',
+    () {
+      for (final nullable in [false, true]) {
+        final json = <String, Object?>{
+          'status': '未来状态',
+          'optional': nullable ? null : 'FUTURE',
+          'statuses': ['OPEN', 'FUTURE'],
+          'optionalList': nullable ? null : ['DONE', 'FUTURE'],
+        };
+        final input = EnumPayloadInput.fromJson(json);
+        expect(input.status, isA<TaskStatusUnknown>());
+        expect(input.toJson(), json);
+        expect(input.toLuxoParameters(), json);
+        final row = sdk.LuxoEncoder();
+        input.writeLuxo(row);
+        expect(
+          row.bytes().first,
+          utf8.encode('未来状态').length + (nullable ? 0 : 6),
+        );
+        expect(decodeEnumPayload(sdk.LuxoDecoder(row.bytes())).toJson(), json);
+        final model = EnumPayload.fromJson(json);
+        expect(model.status.value.rawValue, '未来状态');
+        expect(model.toJson(), json);
+        expect(EnumPayload.fromJson({}).status.isSelected, isFalse);
+        expect(EnumPayload.fromJson({'optional': null}).optional.value, isNull);
+        final column = sdk.LuxoEncoder()
+          ..writeVarint(1)
+          ..writeVarint(0);
+        column
+          ..writeVarint(1)
+          ..writeString('未来状态')
+          ..writeVarint(2);
+        if (nullable) {
+          column.writeNull();
+        } else {
+          column
+            ..writePresent()
+            ..writeString('FUTURE');
+        }
+        final list =
+            (sdk.LuxoEncoder()
+                  ..writeVarint(2)
+                  ..writeString('OPEN')
+                  ..writeString('FUTURE'))
+                .bytes();
+        column
+          ..writeVarint(3)
+          ..writeBytes(list)
+          ..writeVarint(4);
+        if (nullable) {
+          column.writeNull();
+        } else {
+          column
+            ..writePresent()
+            ..writeBytes(
+              (sdk.LuxoEncoder()
+                    ..writeVarint(2)
+                    ..writeString('DONE')
+                    ..writeString('FUTURE'))
+                  .bytes(),
+            );
+        }
+        column.writeEnd();
+        expect(decodeColumnarEnumPayload(column.bytes()).single.toJson(), json);
+        column
+          ..writeSvarint(sdk.LuxoInt64.fromInt(1))
+          ..writeSvarint(sdk.LuxoInt64.fromInt(1))
+          ..writeSvarint(sdk.LuxoInt64.fromInt(1));
+        expect(
+          decodePaginatedEnumPayload(column.bytes()).items.single.toJson(),
+          json,
+        );
+      }
+      expect(
+        TaskStatus.fromValue('future'),
+        isNot(OtherStatus.fromValue('future')),
+      );
+      expect({
+        TaskStatus.fromValue('future'),
+        TaskStatus.fromValue('future'),
+      }, hasLength(1));
+      expect(OtherStatusKnown.class$.rawValue, 'class');
+      expect(OtherStatusKnown.values$.rawValue, 'values');
+      expect(OtherStatusKnown.rawValue$.rawValue, 'rawValue');
+      expect(OtherStatusKnown.value$_hidden.rawValue, '_hidden');
+      expect(OtherStatusKnown.OtherStatusKnown$.rawValue, 'OtherStatusKnown');
+      expect(
+        () => sdk.encodeLuxoJSON(TaskStatus.fromValue('future')),
+        throwsFormatException,
+      );
+    },
+  );
+
+  test(
+    'named enum returns use scalar wire decoding without field selection',
+    () async {
+      final transport = _ResponseTransport();
+      final client = LuxoClient(transport);
+      for (final text in ['OPEN', 'DONE', 'FUTURE', '', '未来状态']) {
+        final expected = TaskStatus.fromValue(text);
+        transport.response = text;
+        expect(await client.namedEnum(), expected);
+        transport.response = (sdk.LuxoEncoder()..writeString(text)).bytes();
+        expect(await client.namedEnum(), expected);
+        expect(transport.params, isEmpty);
+        transport.response = [text];
+        expect(await client.namedEnums(), [expected]);
+        transport.response =
+            (sdk.LuxoEncoder()
+                  ..writeVarint(1)
+                  ..writeString(text))
+                .bytes();
+        expect(await client.namedEnums(), [expected]);
+        expect(transport.params, isEmpty);
+        expect(expected.rawValue, text);
+        if (text == 'OPEN' || text == 'DONE') {
+          expect(expected, isA<TaskStatusKnown>());
+          expect(identical(TaskStatus.fromValue(text), expected), isTrue);
+        } else {
+          expect(expected, isA<TaskStatusUnknown>());
+          expect(_describeStatus(expected), text);
+        }
+        transport.response = text;
+        await client.echoEnum(value: expected);
+        expect(transport.params?['value'], text);
+      }
+      for (final bytes in <List<int>>[
+        [],
+        [1],
+        [1, 255],
+        [0, 99],
+      ]) {
+        transport.response = Uint8List.fromList(bytes);
+        await expectLater(client.namedEnum(), throwsFormatException);
+        await expectLater(client.namedEnums(), throwsFormatException);
+      }
+    },
+  );
+
+  test('implicit Int returns retain scalar and list shape', () async {
+    final transport = _ResponseTransport();
+    final client = LuxoClient(transport);
+    for (final value in [sdk.LuxoInt64.minValue, sdk.LuxoInt64.maxValue]) {
+      transport.response = value.toBigInt();
+      expect(await client.implicitInteger(), value);
+      transport.response = (sdk.LuxoEncoder()..writeSvarint(value)).bytes();
+      expect(await client.implicitInteger(), value);
+      transport.response = [value.toBigInt()];
+      expect(await client.implicitIntegers(), [value]);
+      transport.response =
+          (sdk.LuxoEncoder()
+                ..writeVarint(1)
+                ..writeSvarint(value))
+              .bytes();
+      expect(await client.implicitIntegers(), [value]);
+    }
+  });
+
+  test('generated scalar and scalar-list streams reject bad payloads before callback delivery', () async {
+    final transport = _ResponseTransport();
+    final client = LuxoClient(transport);
+    final unary = _streamSubscribers(client, array: false);
+    final arrays = _streamSubscribers(client, array: true);
+    final cells = _scalarArrayCells();
+    for (var index = 0; index < unary.length; index++) {
+      final position = index == 11 ? 9 : index;
+      final values = _streamValues[position];
+      final expected = position == 9
+          ? values
+                .map((value) => TaskStatus.fromValue(value as String))
+                .toList()
+          : values;
+      final cell = cells[position];
+      final element = Uint8List.sublistView(
+        cell,
+        1,
+        _firstElementEnd(position),
+      );
+      final malformed = _malformedScalarPayloads(position);
+      await _verifySubscription(
+        transport,
+        unary[index],
+        element,
+        expected.first,
+        _jsonValue(values.first),
+        malformed,
+      );
+      await _verifySubscription(
+        transport,
+        arrays[index],
+        cell,
+        expected,
+        values.map(_jsonValue).toList(),
+        [
+          for (final bytes in malformed) ...[
+            [1, ...bytes],
+            [2, ...element, ...bytes],
+          ],
+        ],
+      );
+    }
+  });
+}
+
+String _describeStatus(TaskStatus status) => switch (status) {
+  TaskStatusKnown.OPEN => 'open',
+  TaskStatusKnown.DONE => 'done',
+  TaskStatusUnknown(:final rawValue) => rawValue,
+};
+
+typedef _Subscribe = Future<void Function()> Function(void Function(Object));
+
+List<_Subscribe> _streamSubscribers(LuxoClient c, {required bool array}) =>
+    array
+    ? [
+        (receive) => c.subscribeWatchIntArray(onData: receive),
+        (receive) => c.subscribeWatchDurationArray(onData: receive),
+        (receive) => c.subscribeWatchFloatArray(onData: receive),
+        (receive) => c.subscribeWatchStringArray(onData: receive),
+        (receive) => c.subscribeWatchBooleanArray(onData: receive),
+        (receive) => c.subscribeWatchDateTimeArray(onData: receive),
+        (receive) => c.subscribeWatchUUIDArray(onData: receive),
+        (receive) => c.subscribeWatchBytesArray(onData: receive),
+        (receive) => c.subscribeWatchDecimalArray(onData: receive),
+        (receive) => c.subscribeWatchEnumArray(onData: receive),
+        (receive) => c.subscribeWatchJSONArray(onData: receive),
+        (receive) => c.subscribeWatchTaskStatusArray(onData: receive),
+      ]
+    : [
+        (receive) => c.subscribeWatchInt(onData: receive),
+        (receive) => c.subscribeWatchDuration(onData: receive),
+        (receive) => c.subscribeWatchFloat(onData: receive),
+        (receive) => c.subscribeWatchString(onData: receive),
+        (receive) => c.subscribeWatchBoolean(onData: receive),
+        (receive) => c.subscribeWatchDateTime(onData: receive),
+        (receive) => c.subscribeWatchUUID(onData: receive),
+        (receive) => c.subscribeWatchBytes(onData: receive),
+        (receive) => c.subscribeWatchDecimal(onData: receive),
+        (receive) => c.subscribeWatchEnum(onData: receive),
+        (receive) => c.subscribeWatchJSON(onData: receive),
+        (receive) => c.subscribeWatchTaskStatus(onData: receive),
+      ];
+
+// Offsets in the independently written two-element wire fixtures, including count.
+int _firstElementEnd(int kind) => switch (kind) {
+  0 || 1 => 11,
+  2 => 9,
+  3 || 4 || 7 => 2,
+  5 => 3,
+  6 => 17,
+  8 => 3,
+  9 => 6,
+  10 => 7,
+  _ => throw StateError('unknown fixture kind'),
+};
+
+List<List<Object>> get _streamValues => [
+  [sdk.LuxoInt64.minValue, sdk.LuxoInt64.maxValue],
+  [sdk.LuxoInt64.minValue, sdk.LuxoInt64.maxValue],
+  [1.5, 2.0],
+  ['', '\uFEFF\uFEFF发布\uFFFD'],
+  [false, true],
+  ['1970-01-01T00:00:00Z', '1970-01-01T00:00:01Z'],
+  [_uuid, _uuid],
+  [
+    Uint8List(0),
+    Uint8List.fromList([1, 255]),
+  ],
+  ['0', '1.25'],
+  ['OPEN', 'DONE'],
+  [
+    false,
+    {'large': BigInt.parse('18446744073709551616')},
+  ],
+];
+
+Object _jsonValue(Object value) => switch (value) {
+  sdk.LuxoInt64() => value.toBigInt(),
+  Uint8List() => base64Encode(value),
+  _ => value,
+};
+
+List<List<int>> _malformedScalarPayloads(int kind) {
+  final overflow = [...List<int>.filled(9, 255), 2];
+  return switch (kind) {
+    0 || 1 || 5 => [overflow],
+    3 || 8 || 9 => [
+      [1, 255],
+      overflow,
+    ],
+    4 => [
+      [2],
+    ],
+    7 => [overflow],
+    10 => [
+      [1, 123],
+      [1, 255],
+      overflow,
+    ],
+    _ => [],
+  };
+}
+
+Future<void> _verifySubscription(
+  _ResponseTransport transport,
+  _Subscribe subscribe,
+  Uint8List bytes,
+  Object expected,
+  Object json,
+  List<List<int>> malformed,
+) async {
+  final delivered = <Object>[];
+  final stop = await subscribe(delivered.add);
+  expect(transport.params, isEmpty);
+  transport.emit(bytes);
+  expect(delivered, [expected]);
+  for (var end = 0; end < bytes.length; end++) {
+    expect(
+      () => transport.emit(Uint8List.sublistView(bytes, 0, end)),
+      throwsFormatException,
+    );
+    expect(delivered, [expected]);
+  }
+  expect(
+    () => transport.emit(Uint8List.fromList([...bytes, 99])),
+    throwsFormatException,
+  );
+  expect(delivered, [expected]);
+  for (final value in malformed) {
+    expect(
+      () => transport.emit(Uint8List.fromList(value)),
+      throwsFormatException,
+    );
+    expect(delivered, [expected]);
+  }
+  delivered.clear();
+  transport.emit(json);
+  expect(delivered, [expected]);
+  stop();
+  expect(transport.receiver, isNull);
+}
+
+// Controlled response injection tests generated callbacks, not real WebSocket frames.
+class _ResponseTransport extends sdk.Transport {
+  Object? response;
+  sdk.GeneratedRequest? lastRequest;
+  Map<String, dynamic>? params;
+  void Function(dynamic)? receiver;
+
+  @override
+  Future<T> call<T>(
+    String api, {
+    Map<String, dynamic>? params,
+    sdk.GeneratedRequest? request,
+    T Function(dynamic)? decoder,
+  }) async {
+    lastRequest = request;
+    this.params = request?.toJSONParameters() ?? params;
+    return decoder!(response);
+  }
+
+  @override
+  Future<void Function()> subscribe<T>(
+    String api,
+    Map<String, dynamic> params,
+    void Function(T) onData, {
+    required T Function(Object?) decoder,
+    sdk.GeneratedRequest? request,
+    void Function(sdk.LuxoError)? onError,
+    void Function()? onDone,
+  }) async {
+    lastRequest = request;
+    this.params = request?.toJSONParameters() ?? params;
+    receiver = (value) => onData(decoder(value));
+    return () => receiver = null;
+  }
+
+  void emit(Object? value) => receiver!(value);
+  @override
+  void setSchema(Map<String, sdk.APISchemaEntry> schema) {}
+  @override
+  void setMode(sdk.TransportMode mode) {}
+  @override
+  void setToken(String token) {}
+  @override
+  void close() {
+    receiver = null;
+  }
+}

@@ -1,10 +1,34 @@
 {
   "models": {
+    "TextRecord": {"name":"TextRecord","usage":"output","fields":[
+      {"id":1,"name":"texts","type":"String","isList":true},
+      {"id":2,"name":"payload","type":"JSON"},
+      {"id":3,"name":"payloads","type":"JSON","isList":true,"nullable":true},
+      {"id":4,"name":"enabled","type":"Boolean","nullable":true},
+      {"id":5,"name":"flags","type":"Boolean","isList":true},
+      {"id":6,"name":"state","type":"Enum","typeName":"Role","nullable":true},
+      {"id":7,"name":"states","type":"Enum","typeName":"Role","isList":true},
+      {"id":8,"name":"child","type":"Model","typeName":"TextRecord","nullable":true}
+    ]},
     "Node": {
       "name": "Node",
       "fields": [
         {"id": 1, "name": "name", "type": "String"},
         {"id": 2, "name": "posts", "type": "Post", "typeName": "Post", "isList": true, "relation": true}
+      ]
+    },
+    "PrecisionRecord": {
+      "name": "PrecisionRecord",
+      "fields": [
+        {"id": 1, "name": "value", "type": "Int"},
+        {"id": 2, "name": "duration", "type": "Duration"},
+        {"id": 3, "name": "optional", "type": "Int", "nullable": true},
+        {"id": 4, "name": "values", "type": "Int", "isList": true},
+        {"id": 5, "name": "ignored", "type": "Int"},
+        {"id": 6, "name": "ratio", "type": "Float"},
+        {"id": 7, "name": "ratios", "type": "Float", "isList": true},
+        {"id": 8, "name": "optionalRatio", "type": "Float", "nullable": true},
+        {"id": 9, "name": "optionalRatios", "type": "Float", "nullable": true, "isList": true}
       ]
     },
     "Post": {
@@ -14,12 +38,147 @@
       ]
     }
   },
+  "enums": {
+    "Role": {"name": "Role", "values": ["MEMBER", "ADMIN"]},
+    "OtherRole": {"name": "OtherRole", "values": ["MEMBER"]},
+    "EscapedRole": {"name":"EscapedRole","values":["when","name","rawValue","entries","Known"]}
+  },
+  "types": {
+    "EnumRecord": {"name":"EnumRecord","usage":"inputOutput","fields":[
+      {"id":1,"name":"state","type":"Enum","typeName":"Role"},
+      {"id":2,"name":"optional","type":"Enum","typeName":"Role","nullable":true},
+      {"id":3,"name":"states","type":"Enum","typeName":"Role","isList":true},
+      {"id":4,"name":"optionalStates","type":"Enum","typeName":"Role","isList":true,"nullable":true}
+    ]},
+    "ProjectionNames": {"name":"ProjectionNames","usage":"output","fields":[
+      {"id":1,"name":"label","type":"String","nullable":true},
+      {"id":2,"name":"labelJSON","type":"String","nullable":true},
+      {"id":3,"name":"hasField","type":"String","nullable":true},
+      {"id":4,"name":"requireField","type":"String","nullable":true},
+      {"id":5,"name":"result","type":"String","nullable":true}
+    ]},
+    "Projection": {"name":"Projection","usage":"output","fields":[
+      {"id":1,"name":"label","type":"String","nullable":true},
+      {"id":2,"name":"children","type":"Model","typeName":"Projection","isList":true},
+      {"id":3,"name":"models","type":"Model","typeName":"TextRecord","isList":true},
+      {"id":4,"name":"child","type":"Model","typeName":"Projection","nullable":true}
+    ]},
+    "EncodingChild": {
+      "name": "EncodingChild", "usage": "input",
+      "fields": [{"id": 1, "name": "value", "type": "Int"}]
+    },
+    "EncodingInput": {
+      "name": "EncodingInput", "usage": "input",
+      "fields": [
+        {"id": 1, "name": "number", "type": "Int"},
+        {"id": 2, "name": "duration", "type": "Duration"},
+        {"id": 3, "name": "ratio", "type": "Float"},
+        {"id": 4, "name": "text", "type": "String"},
+        {"id": 5, "name": "flag", "type": "Boolean"},
+        {"id": 6, "name": "date", "type": "DateTime"},
+        {"id": 7, "name": "uuid", "type": "UUID"},
+        {"id": 8, "name": "decimal", "type": "Decimal"},
+        {"id": 9, "name": "blob", "type": "Bytes"},
+        {"id": 10, "name": "payload", "type": "JSON"},
+        {"id": 11, "name": "role", "type": "Enum", "typeName": "Role"},
+        {"id": 12, "name": "child", "type": "Model", "typeName": "EncodingChild", "nullable": true},
+        {"id": 13, "name": "integers", "type": "Int", "isList": true},
+        {"id": 14, "name": "durations", "type": "Duration", "isList": true},
+        {"id": 15, "name": "ratios", "type": "Float", "isList": true},
+        {"id": 16, "name": "texts", "type": "String", "isList": true},
+        {"id": 17, "name": "flags", "type": "Boolean", "isList": true},
+        {"id": 18, "name": "dates", "type": "DateTime", "isList": true},
+        {"id": 19, "name": "uuids", "type": "UUID", "isList": true},
+        {"id": 20, "name": "decimals", "type": "Decimal", "isList": true},
+        {"id": 21, "name": "blobs", "type": "Bytes", "isList": true},
+        {"id": 22, "name": "payloads", "type": "JSON", "isList": true},
+        {"id": 23, "name": "roles", "type": "Enum", "typeName": "Role", "isList": true},
+        {"id": 24, "name": "children", "type": "Model", "typeName": "EncodingChild", "isList": true, "nullable": true},
+        {"id": 25, "name": "optional", "type": "Int", "nullable": true}
+      ]
+    }
+  },
   "apis": {
+    "probeInt": {"id":100,"name":"probeInt","module":"test","returnType":"Int","returnList":false,"stream":false},
+    "watchProbeInt": {"id":101,"name":"watchProbeInt","module":"test","returnType":"Int","returnList":false,"stream":true},
+    "probeIntList": {"id":102,"name":"probeIntList","module":"test","returnType":"Int","returnList":true,"stream":false},
+    "watchProbeIntList": {"id":103,"name":"watchProbeIntList","module":"test","returnType":"Int","returnList":true,"stream":true},
+    "probeDuration": {"id":104,"name":"probeDuration","module":"test","returnType":"Duration","returnList":false,"stream":false},
+    "watchProbeDuration": {"id":105,"name":"watchProbeDuration","module":"test","returnType":"Duration","returnList":false,"stream":true},
+    "probeDurationList": {"id":106,"name":"probeDurationList","module":"test","returnType":"Duration","returnList":true,"stream":false},
+    "watchProbeDurationList": {"id":107,"name":"watchProbeDurationList","module":"test","returnType":"Duration","returnList":true,"stream":true},
+    "probeString": {"id":108,"name":"probeString","module":"test","returnType":"String","returnList":false,"stream":false},
+    "watchProbeString": {"id":109,"name":"watchProbeString","module":"test","returnType":"String","returnList":false,"stream":true},
+    "probeStringList": {"id":110,"name":"probeStringList","module":"test","returnType":"String","returnList":true,"stream":false},
+    "watchProbeStringList": {"id":111,"name":"watchProbeStringList","module":"test","returnType":"String","returnList":true,"stream":true},
+    "probeFloat": {"id":112,"name":"probeFloat","module":"test","returnType":"Float","returnList":false,"stream":false},
+    "watchProbeFloat": {"id":113,"name":"watchProbeFloat","module":"test","returnType":"Float","returnList":false,"stream":true},
+    "probeFloatList": {"id":114,"name":"probeFloatList","module":"test","returnType":"Float","returnList":true,"stream":false},
+    "watchProbeFloatList": {"id":115,"name":"watchProbeFloatList","module":"test","returnType":"Float","returnList":true,"stream":true},
+    "probeBoolean": {"id":116,"name":"probeBoolean","module":"test","returnType":"Boolean","returnList":false,"stream":false},
+    "watchProbeBoolean": {"id":117,"name":"watchProbeBoolean","module":"test","returnType":"Boolean","returnList":false,"stream":true},
+    "probeBooleanList": {"id":118,"name":"probeBooleanList","module":"test","returnType":"Boolean","returnList":true,"stream":false},
+    "watchProbeBooleanList": {"id":119,"name":"watchProbeBooleanList","module":"test","returnType":"Boolean","returnList":true,"stream":true},
+    "probeBytes": {"id":120,"name":"probeBytes","module":"test","returnType":"Bytes","returnList":false,"stream":false},
+    "watchProbeBytes": {"id":121,"name":"watchProbeBytes","module":"test","returnType":"Bytes","returnList":false,"stream":true},
+    "probeBytesList": {"id":122,"name":"probeBytesList","module":"test","returnType":"Bytes","returnList":true,"stream":false},
+    "watchProbeBytesList": {"id":123,"name":"watchProbeBytesList","module":"test","returnType":"Bytes","returnList":true,"stream":true},
+    "probeJSON": {"id":124,"name":"probeJSON","module":"test","returnType":"JSON","returnList":false,"stream":false},
+    "watchProbeJSON": {"id":125,"name":"watchProbeJSON","module":"test","returnType":"JSON","returnList":false,"stream":true},
+    "probeJSONList": {"id":126,"name":"probeJSONList","module":"test","returnType":"JSON","returnList":true,"stream":false},
+    "watchProbeJSONList": {"id":127,"name":"watchProbeJSONList","module":"test","returnType":"JSON","returnList":true,"stream":true},
+    "probeDateTime": {"id":128,"name":"probeDateTime","module":"test","returnType":"DateTime","returnList":false,"stream":false},
+    "watchProbeDateTime": {"id":129,"name":"watchProbeDateTime","module":"test","returnType":"DateTime","returnList":false,"stream":true},
+    "probeDateTimeList": {"id":130,"name":"probeDateTimeList","module":"test","returnType":"DateTime","returnList":true,"stream":false},
+    "watchProbeDateTimeList": {"id":131,"name":"watchProbeDateTimeList","module":"test","returnType":"DateTime","returnList":true,"stream":true},
+    "probeUUID": {"id":132,"name":"probeUUID","module":"test","returnType":"UUID","returnList":false,"stream":false},
+    "watchProbeUUID": {"id":133,"name":"watchProbeUUID","module":"test","returnType":"UUID","returnList":false,"stream":true},
+    "probeUUIDList": {"id":134,"name":"probeUUIDList","module":"test","returnType":"UUID","returnList":true,"stream":false},
+    "watchProbeUUIDList": {"id":135,"name":"watchProbeUUIDList","module":"test","returnType":"UUID","returnList":true,"stream":true},
+    "probeDecimal": {"id":136,"name":"probeDecimal","module":"test","returnType":"Decimal","returnList":false,"stream":false},
+    "watchProbeDecimal": {"id":137,"name":"watchProbeDecimal","module":"test","returnType":"Decimal","returnList":false,"stream":true},
+    "probeDecimalList": {"id":138,"name":"probeDecimalList","module":"test","returnType":"Decimal","returnList":true,"stream":false},
+    "watchProbeDecimalList": {"id":139,"name":"watchProbeDecimalList","module":"test","returnType":"Decimal","returnList":true,"stream":true},
+    "probeEnum": {"id":140,"name":"probeEnum","module":"test","returnType":"Role","returnList":false,"stream":false},
+    "watchProbeEnum": {"id":141,"name":"watchProbeEnum","module":"test","returnType":"Role","returnList":false,"stream":true},
+    "probeEnumList": {"id":142,"name":"probeEnumList","module":"test","returnType":"Role","returnList":true,"stream":false},
+    "watchProbeEnumList": {"id":143,"name":"watchProbeEnumList","module":"test","returnType":"Role","returnList":true,"stream":true},
+    "probeRole": {"id":144,"name":"probeRole","module":"test","returnType":"Role","returnList":false,"stream":false},
+    "watchProbeRole": {"id":145,"name":"watchProbeRole","module":"test","returnType":"Role","returnList":false,"stream":true},
+    "probeRoleList": {"id":146,"name":"probeRoleList","module":"test","returnType":"Role","returnList":true,"stream":false},
+    "watchProbeRoleList": {"id":147,"name":"watchProbeRoleList","module":"test","returnType":"Role","returnList":true,"stream":true},
+    "probeImplicit": {"id":148,"name":"probeImplicit","module":"test"},
+    "probeTextRecord": {"id":149,"name":"probeTextRecord","module":"test","returnType":"TextRecord"},
+    "probeTextRecords": {"id":150,"name":"probeTextRecords","module":"test","returnType":"TextRecord","returnList":true},
+    "watchTextRecord": {"id":151,"name":"watchTextRecord","module":"test","returnType":"TextRecord","stream":true},
+    "watchTextRecords": {"id":152,"name":"watchTextRecords","module":"test","returnType":"TextRecord","returnList":true,"stream":true},
+    "precisionPage": {
+      "id": 2,
+      "name": "precisionPage",
+      "module": "precision",
+      "returnType": "PrecisionRecord",
+      "returnList": true,
+      "paginated": true,
+      "params": [
+        {"id": 1, "name": "value", "type": "Int"},
+        {"id": 2, "name": "duration", "type": "Duration"},
+        {"id": 3, "name": "optional", "type": "Int", "nullable": true},
+        {"id": 4, "name": "values", "type": "Int", "isList": true},
+        {"id": 5, "name": "page", "type": "Int"},
+        {"id": 6, "name": "pageSize", "type": "Int"}
+      ]
+    },
     "lookupNode": {
       "id": 1,
       "name": "lookupNode",
       "module": "node",
       "returnType": "Node"
-    }
+    },
+    "enumOptions": {"id":200,"name":"enumOptions","module":"test","returnType":"Role","params":[
+      {"id":1,"name":"required","type":"Enum","typeName":"Role","nullable":true},
+      {"id":2,"name":"state","type":"Enum","typeName":"Role","hasDefault":true},
+      {"id":3,"name":"optional","type":"Enum","typeName":"Role","nullable":true,"hasDefault":true},
+      {"id":4,"name":"states","type":"Enum","typeName":"Role","isList":true,"nullable":true,"hasDefault":true}
+    ]}
   }
 }

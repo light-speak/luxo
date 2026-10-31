@@ -1,0 +1,207 @@
+{
+  "version": 1,
+  "approvals": [
+    {
+      "id": "beta-event-snapshot-ChanBusEmit-2",
+      "baseSHA": "dbd269d586a71739b69dd6acb1a26b85f50483d0",
+      "package": "github.com/light-speak/luxo/pkg/lux/event",
+      "benchmark": "ChanBusEmit-2",
+      "maxBytes": 72,
+      "maxAllocs": 4,
+      "maxNanoseconds": 82.105,
+      "reason": "2026-09-26用户确认：仅固定main的通用事件快照样例，两组均须满足。旧版直接共享原对象，新版校验并隔离所有权，非等价功能对照；不放行其他事件载荷、生成事件整链路、并发或NATS。"
+    },
+    {
+      "id": "beta-compiler-demo-v1-validation",
+      "baseSHA": "dbd269d586a71739b69dd6acb1a26b85f50483d0",
+      "package": "github.com/light-speak/luxo/pkg/semantic",
+      "benchmark": "AnalyzeDemoFile-2",
+      "maxBytes": 11280,
+      "maxAllocs": 116,
+      "reason": "2026-09-23用户确认：仅固定34735字节CompilerDemoV1历史分析/诊断样例，接受新增严格编译检查的总内存增量上限11280B/116次；替代该样例原272B/2次批准，不叠加。语料SHA256为0f5e8717ae3031e8d1ae08eb473d929c9f9b4a00164f6a6d329726f30f9b8c2e；两组十轮实测分别增加11262.5B/11261.5B，均增加116次。已去除错误文件的无用缓存记录和监听器的无用索引。不批准耗时、业务请求、其他样例或其他基线。 User-approved on 2026-09-23: only the fixed 34735-byte CompilerDemoV1 analysis/diagnostics workload may add at most 11280 B and 116 allocations for stricter compilation checks. This total replaces, rather than adds to, its previous 272 B/2 allocation approval. Two ten-sample groups measured +11262.5 B/+11261.5 B and +116 allocations after removing discarded cache metadata and unused listener indexes. Time, request paths, other workloads and other baselines remain gated."
+    },
+    {
+      "id": "beta-jwt-verification-precision",
+      "baseSHA": "dbd269d586a71739b69dd6acb1a26b85f50483d0",
+      "package": "github.com/light-speak/luxo/pkg/lux/auth",
+      "benchmark": "VerifyUncached-2",
+      "maxBytes": 736,
+      "maxAllocs": 10,
+      "reason": "2026-09-23用户确认：仅固定main基线的完整JWT验签样例（id=42、role=ADMIN），登记精确只读身份、严格JSON检查和access/refresh用途隔离的组合内存增量上限736B/10次。两组十轮交错均为1456→2192B、22→32次；这是逐次完整验签，不是初始化或缓存命中。不批准耗时、缓存命中、其他载荷或其他基线。 User-approved on 2026-09-23: only full JWT verification with id=42 and role=ADMIN against this exact main baseline may add at most 736 B and 10 allocations for immutable precise claims, strict JSON validation and access/refresh purpose isolation. Both ten-sample groups measured 1456 to 2192 B and 22 to 32 allocations. This is a per-verification cost, not initialization or a cache hit. Time, cache hits, other payloads and other baselines remain gated."
+    },
+    {
+      "id": "beta-cold-codegen-Generate-2",
+      "baseSHA": "dbd269d586a71739b69dd6acb1a26b85f50483d0",
+      "package": "github.com/light-speak/luxo/pkg/codegen",
+      "benchmark": "Generate-2",
+      "maxBytes": 1053545,
+      "maxAllocs": 22002,
+      "maxNanoseconds": 4850000,
+      "reason": "2026-09-24用户确认：仅固定main基线的本编译样例，两组都须满足上限。生成基线漏编号、语义分析输入扩充的差异已记录，不宣称等价功能对照。批准所列耗时和内存增量。不放行请求路径、SDK、其他样例或其他基线；详见私有docs/benchmark.md当前编译候选复测记录。"
+    },
+    {
+      "id": "beta-cold-codegen-GenerateModelFile-2",
+      "baseSHA": "dbd269d586a71739b69dd6acb1a26b85f50483d0",
+      "package": "github.com/light-speak/luxo/pkg/codegen",
+      "benchmark": "GenerateModelFile-2",
+      "maxBytes": 3649,
+      "maxAllocs": 5,
+      "maxNanoseconds": 2237,
+      "reason": "2026-09-24用户确认：仅固定main基线的本编译样例，两组都须满足上限。生成基线漏编号、语义分析输入扩充的差异已记录，不宣称等价功能对照。批准所列耗时和内存增量。不放行请求路径、SDK、其他样例或其他基线；详见私有docs/benchmark.md当前编译候选复测记录。"
+    },
+    {
+      "id": "beta-cold-lockfile-Update-2",
+      "baseSHA": "dbd269d586a71739b69dd6acb1a26b85f50483d0",
+      "package": "github.com/light-speak/luxo/pkg/lockfile",
+      "benchmark": "Update-2",
+      "maxBytes": 9744,
+      "maxAllocs": 44,
+      "maxNanoseconds": 12936,
+      "reason": "2026-09-24用户确认：仅固定main基线的本编译样例，两组都须满足上限。生成基线漏编号、语义分析输入扩充的差异已记录，不宣称等价功能对照。批准所列耗时和内存增量。不放行请求路径、SDK、其他样例或其他基线；详见私有docs/benchmark.md当前编译候选复测记录。 2026-10-31用户确认：Linux/amd64 的 PR #64、CI run 41114686013 两组各十轮已测组合增量；仅此固定 main 与样例，platformNanoseconds 不扩大其他平台的旧预算，内存上限不增加。旧实现缺少当前严格校验，不视为等价功能对照；不是完整请求或全部载荷上限。",
+      "platformNanoseconds": {
+        "linux/amd64": 12962
+      }
+    },
+    {
+      "id": "beta-cold-lockfile-SaveLoad-2",
+      "baseSHA": "dbd269d586a71739b69dd6acb1a26b85f50483d0",
+      "package": "github.com/light-speak/luxo/pkg/lockfile",
+      "benchmark": "SaveLoad-2",
+      "maxBytes": 19355,
+      "maxAllocs": 66,
+      "reason": "2026-09-24用户确认：仅固定main基线的本编译样例，两组都须满足上限。生成基线漏编号、语义分析输入扩充的差异已记录，不宣称等价功能对照。只批准内存增量，不批准耗时。不放行请求路径、SDK、其他样例或其他基线；详见私有docs/benchmark.md当前编译候选复测记录。"
+    },
+    {
+      "id": "beta-cold-semantic-Analyze-2",
+      "baseSHA": "dbd269d586a71739b69dd6acb1a26b85f50483d0",
+      "package": "github.com/light-speak/luxo/pkg/semantic",
+      "benchmark": "Analyze-2",
+      "maxBytes": 4184,
+      "maxAllocs": 17,
+      "maxNanoseconds": 5791,
+      "reason": "2026-09-24用户确认：仅固定main基线的本编译样例，两组都须满足上限。生成基线漏编号、语义分析输入扩充的差异已记录，不宣称等价功能对照。批准所列耗时和内存增量。不放行请求路径、SDK、其他样例或其他基线；详见私有docs/benchmark.md当前编译候选复测记录。"
+    },
+    {
+      "id": "beta-cold-semantic-AnalyzeLargeFile-2",
+      "baseSHA": "dbd269d586a71739b69dd6acb1a26b85f50483d0",
+      "package": "github.com/light-speak/luxo/pkg/semantic",
+      "benchmark": "AnalyzeLargeFile-2",
+      "maxBytes": 64,
+      "maxAllocs": 0,
+      "reason": "2026-09-24用户确认：仅固定main基线的本编译样例，两组都须满足上限。生成基线漏编号、语义分析输入扩充的差异已记录，不宣称等价功能对照。只批准内存增量，不批准耗时。不放行请求路径、SDK、其他样例或其他基线；详见私有docs/benchmark.md当前编译候选复测记录。"
+    },
+    {
+      "id": "beta-runtime-combination-ParseBinaryRequestPaginatedDefaults-2",
+      "baseSHA": "dbd269d586a71739b69dd6acb1a26b85f50483d0",
+      "package": "github.com/light-speak/luxo/pkg/lux/api",
+      "benchmark": "ParseBinaryRequestPaginatedDefaults-2",
+      "maxBytes": 0,
+      "maxAllocs": 0,
+      "maxNanoseconds": 11.435,
+      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。"
+    },
+    {
+      "id": "beta-runtime-combination-ReadStringVsArena-Arena-2",
+      "baseSHA": "dbd269d586a71739b69dd6acb1a26b85f50483d0",
+      "package": "github.com/light-speak/luxo/pkg/lux/codec",
+      "benchmark": "ReadStringVsArena/Arena-2",
+      "maxBytes": 0,
+      "maxAllocs": 0,
+      "maxNanoseconds": 35.285,
+      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。 2026-10-31用户确认：Linux/amd64 的 PR #64、CI run 41114686013 两组各十轮已测组合增量；仅此固定 main 与样例，platformNanoseconds 不扩大其他平台的旧预算，内存上限不增加。旧实现缺少当前严格校验，不视为等价功能对照；不是完整请求或全部载荷上限。",
+      "platformNanoseconds": {
+        "linux/amd64": 57.25
+      }
+    },
+    {
+      "id": "beta-runtime-combination-ReadStringVsArena-NoArena-2",
+      "baseSHA": "dbd269d586a71739b69dd6acb1a26b85f50483d0",
+      "package": "github.com/light-speak/luxo/pkg/lux/codec",
+      "benchmark": "ReadStringVsArena/NoArena-2",
+      "maxBytes": 0,
+      "maxAllocs": 0,
+      "maxNanoseconds": 37.32,
+      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。 2026-10-31用户确认：Linux/amd64 的 PR #64、CI run 41114686013 两组各十轮已测组合增量；仅此固定 main 与样例，platformNanoseconds 不扩大其他平台的旧预算，内存上限不增加。旧实现缺少当前严格校验，不视为等价功能对照；不是完整请求或全部载荷上限。",
+      "platformNanoseconds": {
+        "linux/amd64": 59.5
+      }
+    },
+    {
+      "id": "beta-runtime-combination-ColumnarStringArena-2",
+      "baseSHA": "dbd269d586a71739b69dd6acb1a26b85f50483d0",
+      "package": "github.com/light-speak/luxo/pkg/lux/codec",
+      "benchmark": "ColumnarStringArena-2",
+      "maxBytes": 0,
+      "maxAllocs": 0,
+      "maxNanoseconds": 659.4,
+      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。 2026-10-31用户确认：Linux/amd64 的 PR #64、CI run 41114686013 两组各十轮已测组合增量；仅此固定 main 与样例，platformNanoseconds 不扩大其他平台的旧预算，内存上限不增加。旧实现缺少当前严格校验，不视为等价功能对照；不是完整请求或全部载荷上限。",
+      "platformNanoseconds": {
+        "linux/amd64": 1532
+      }
+    },
+    {
+      "id": "beta-runtime-combination-ColumnarStringNoArena-2",
+      "baseSHA": "dbd269d586a71739b69dd6acb1a26b85f50483d0",
+      "package": "github.com/light-speak/luxo/pkg/lux/codec",
+      "benchmark": "ColumnarStringNoArena-2",
+      "maxBytes": 0,
+      "maxAllocs": 0,
+      "maxNanoseconds": 721.25,
+      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。 2026-10-31用户确认：Linux/amd64 的 PR #64、CI run 41114686013 两组各十轮已测组合增量；仅此固定 main 与样例，platformNanoseconds 不扩大其他平台的旧预算，内存上限不增加。旧实现缺少当前严格校验，不视为等价功能对照；不是完整请求或全部载荷上限。",
+      "platformNanoseconds": {
+        "linux/amd64": 939
+      }
+    },
+    {
+      "id": "beta-runtime-combination-RowWrite10-2",
+      "baseSHA": "dbd269d586a71739b69dd6acb1a26b85f50483d0",
+      "package": "github.com/light-speak/luxo/pkg/lux/codec",
+      "benchmark": "RowWrite10-2",
+      "maxBytes": 0,
+      "maxAllocs": 0,
+      "maxNanoseconds": 53.7,
+      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。 2026-10-31用户确认：Linux/amd64 的 PR #64、CI run 41114686013 两组各十轮已测组合增量；仅此固定 main 与样例，platformNanoseconds 不扩大其他平台的旧预算，内存上限不增加。旧实现缺少当前严格校验，不视为等价功能对照；不是完整请求或全部载荷上限。",
+      "platformNanoseconds": {
+        "linux/amd64": 268.1
+      }
+    },
+    {
+      "id": "beta-runtime-combination-EncodeEvent-2",
+      "baseSHA": "dbd269d586a71739b69dd6acb1a26b85f50483d0",
+      "package": "github.com/light-speak/luxo/pkg/lux/codec",
+      "benchmark": "EncodeEvent-2",
+      "maxBytes": 0,
+      "maxAllocs": 0,
+      "maxNanoseconds": 1.005,
+      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。 2026-10-31用户确认：Linux/amd64 的 PR #64、CI run 41114686013 两组各十轮已测组合增量；仅此固定 main 与样例，platformNanoseconds 不扩大其他平台的旧预算，内存上限不增加。旧实现缺少当前严格校验，不视为等价功能对照；不是完整请求或全部载荷上限。",
+      "platformNanoseconds": {
+        "linux/amd64": 5.485
+      }
+    },
+    {
+      "id": "beta-runtime-combination-DecodeEvent-2",
+      "baseSHA": "dbd269d586a71739b69dd6acb1a26b85f50483d0",
+      "package": "github.com/light-speak/luxo/pkg/lux/codec",
+      "benchmark": "DecodeEvent-2",
+      "maxBytes": 0,
+      "maxAllocs": 0,
+      "maxNanoseconds": 6.355,
+      "reason": "2026-09-26用户确认：仅此固定main样例的组合耗时增量，两组均须满足；不放行新增分配、事件快照、完整请求、其他样例或其他基线。保留编号、边界、UTF-8及有限Float校验；基线缺少部分校验，不视为等价正确性对照。 2026-10-31用户确认：Linux/amd64 的 PR #64、CI run 41114686013 两组各十轮已测组合增量；仅此固定 main 与样例，platformNanoseconds 不扩大其他平台的旧预算，内存上限不增加。旧实现缺少当前严格校验，不视为等价功能对照；不是完整请求或全部载荷上限。",
+      "platformNanoseconds": {
+        "linux/amd64": 18.27
+      }
+    },
+    {
+      "id": "beta-linux-metrics-record",
+      "baseSHA": "dbd269d586a71739b69dd6acb1a26b85f50483d0",
+      "package": "github.com/light-speak/luxo/pkg/lux/luvia",
+      "benchmark": "MetricsCollectorRecord-2",
+      "maxBytes": 0,
+      "maxAllocs": 0,
+      "platformNanoseconds": {
+        "linux/amd64": 4.84
+      },
+      "reason": "2026-10-31用户确认：Linux/amd64 的 PR #64、CI run 41114686013 两组各十轮已测组合增量；仅此固定 main 与样例，platformNanoseconds 不扩大其他平台的旧预算，内存上限不增加。旧实现缺少当前严格校验，不视为等价功能对照；不是完整请求或全部载荷上限。 成本涉及关闭检查及有界观测保留，保留错误/总请求计数。"
+    }
+  ]
+}

@@ -1,0 +1,54 @@
+import { LuxoClient } from './client.js'
+import { LuxoClient as UncheckedClient } from './client.unchecked.js'
+import { decodeJSONTextValues } from './types.js'
+import { decodeJSONTextValues as uncheckedModel } from './types.unchecked.js'
+import type { Transport } from '@luxojs/client'
+import { measure } from './measure.js'
+
+type Subscribe = (client: LuxoClient, receive: (value: unknown) => void) => Promise<() => void>
+const cases: { name: string; values: unknown[]; single: Subscribe; list: Subscribe }[] = [
+  { name: 'String short', values: ['', '发布检查 café', 'false'],
+    single: (client, receive) => client.subscribeLiveString(receive),
+    list: (client, receive) => client.subscribeLiveStringList(receive) },
+  { name: 'String 72KiB', values: ['中'.repeat(24 * 1024), '文'.repeat(24 * 1024)],
+    single: (client, receive) => client.subscribeLiveString(receive),
+    list: (client, receive) => client.subscribeLiveStringList(receive) },
+  { name: 'Boolean', values: [false, true],
+    single: (client, receive) => client.subscribeLiveBoolean(receive),
+    list: (client, receive) => client.subscribeLiveBooleanList(receive) },
+  { name: 'Bytes base64', values: ['', '/4A=', 'aGVsbG8='],
+    single: (client, receive) => client.subscribeLiveBytes(receive),
+    list: (client, receive) => client.subscribeLiveBytesList(receive) },
+]
+
+async function operation(Client: typeof LuxoClient, subscribe: Subscribe, values: unknown[]): Promise<() => unknown> {
+  let receive: (value: unknown) => void = () => { throw new Error('Missing generated callback') }
+  let result: unknown
+  let index = 0
+  const transport: Transport = {
+    async call() { throw new Error('Unexpected call') },
+    async subscribe(_api, _params, decode, onData) { receive = value => onData(decode(value)); return () => {} },
+    setSchema() {}, setToken() {}, setMode() {},
+  }
+  await subscribe(new Client(transport), value => { result = value })
+  return () => { receive(values[index++ % values.length]); return result }
+}
+
+async function main(): Promise<void> {
+  for (const test of cases) {
+    for (const count of [1, 16, 128]) {
+      const subscribe = count === 1 ? test.single : test.list
+      const values = count === 1 ? test.values : test.values.map(value => Array<unknown>(count).fill(value))
+      const before = await operation(UncheckedClient as unknown as typeof LuxoClient, subscribe, values)
+      const after = await operation(LuxoClient, subscribe, values)
+      measure(`${test.name} ${count}`, before, after)
+    }
+  }
+  for (const count of [1, 128]) {
+    const rows = Array.from({ length: count }, (_, index) => ({
+      label: String(index), enabled: index % 2 === 0, labels: ['中', '文'], flags: [true, false], state: 'ok', states: ['ok'],
+    }))
+    measure(`model ${count}`, () => rows.map(uncheckedModel), () => rows.map(decodeJSONTextValues))
+  }
+}
+void main().catch(error => { throw error })

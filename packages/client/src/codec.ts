@@ -11,8 +11,20 @@
 //   - Nullable: 1-byte flag (0x00=null, 0x01=present) + value if present
 //   - Message end: 0x00 terminator (fieldID 0 is reserved)
 
+import { writeWireInt64 } from './int64'
+import { formatDateTime, parseDateTime } from './datetime'
+import { writeWireUint64 } from './uint64'
+import { MAX_ARENA_SIZE, MAX_COLUMNAR_RECORDS, WireReader, decodeUTF8 } from './wire-reader'
+import { decodeLuxoJSON } from './json'
+import { assertUnicode } from './unicode'
+import { MAX_SELECTION_FIELD_ID } from './schema'
+
 const textEncoder = new TextEncoder()
-const textDecoder = new TextDecoder()
+
+function encodeUTF8(value: string): Uint8Array {
+  assertUnicode(value)
+  return textEncoder.encode(value)
+}
 
 const INITIAL_BUF_SIZE = 1024
 
@@ -38,16 +50,12 @@ export function formatUUID(data: Uint8Array, off: number): string {
 }
 
 // --- DateTime helpers ---
-// On the wire a DateTime is svarint(unix seconds). In JS it is represented as
-// an RFC3339 string (e.g. "2026-05-28T12:00:00Z"), matching the Go JSON output
-// which formats time.Unix(sec, 0).UTC() with RFC3339Nano. Since wire values
-// carry only whole seconds, the fractional ".000" produced by Date.toISOString()
-// is stripped so binary and JSON modes yield byte-identical strings.
+// The wire carries floor Unix seconds and nanoseconds. Public DateTime values
+// remain RFC3339 strings, so JavaScript's millisecond Date cannot erase precision.
 
 /** Convert unix seconds to an RFC3339 string, matching Go's DateTime JSON output. */
-export function unixSecondsToISO(seconds: number): string {
-  // Date expects milliseconds; whole-second timestamps never have a fractional part.
-  return new Date(seconds * 1000).toISOString().replace('.000Z', 'Z')
+export function unixSecondsToISO(seconds: number | bigint): string {
+  return formatDateTime(seconds, 0)
 }
 
 /** Decode canonical base64 JSON representation into raw bytes. */
@@ -60,7 +68,7 @@ export function decodeBase64(value: string): Uint8Array {
 
 /** Decode a JSON value from its raw binary payload. */
 export function decodeJSONValue(value: Uint8Array): unknown {
-  return JSON.parse(textDecoder.decode(value)) as unknown
+  return decodeLuxoJSON(decodeUTF8(value))
 }
 
 /** Decode a single hex digit, or -1 if not a hex char. */
@@ -71,29 +79,33 @@ function hexNibble(c: number): number {
   return -1
 }
 
+// Fixed hex-pair offsets in canonical UUID text; no per-value table allocation.
+const UUID_HEX_OFFSETS = [0, 2, 4, 6, 9, 11, 14, 16, 19, 21, 24, 26, 28, 30, 32, 34]
+
 /** Parse a canonical 36-char UUID string into 16 bytes. Returns null on malformed input. */
 export function parseUUID(s: string): Uint8Array | null {
   if (s.length !== 36) return null
+  if (s.charCodeAt(8) !== 0x2d || s.charCodeAt(13) !== 0x2d ||
+      s.charCodeAt(18) !== 0x2d || s.charCodeAt(23) !== 0x2d) return null
   const out = new Uint8Array(16)
-  let j = 0
-  let i = 0
-  while (i < s.length) {
-    const c = s.charCodeAt(i)
-    if (c === 0x2d) { i++; continue } // '-'
-    if (i + 1 >= s.length || j >= 16) return null
-    const hi = hexNibble(c)
+  for (let j = 0; j < 16; j++) {
+    const i = UUID_HEX_OFFSETS[j]
+    const hi = hexNibble(s.charCodeAt(i))
     const lo = hexNibble(s.charCodeAt(i + 1))
     if (hi < 0 || lo < 0) return null
-    out[j++] = (hi << 4) | lo
-    i += 2
+    out[j] = (hi << 4) | lo
   }
-  return j === 16 ? out : null
+  return out
 }
 
 // --- Encoder ---
 
+const emptyEncoderBuffer = new Uint8Array(0)
+const emptyEncoderView = new DataView(emptyEncoderBuffer.buffer)
+const maxTransferredSlack = 64
+
 export class Encoder {
-  private buf: Uint8Array
+  private buf: Uint8Array<ArrayBuffer>
   private view: DataView
   private pos: number
 
@@ -106,9 +118,9 @@ export class Encoder {
   /** Ensure at least `n` bytes available */
   private grow(n: number): void {
     if (this.pos + n <= this.buf.length) return
-    let newLen = this.buf.length
+    let newLen = this.buf.length || 64
     const needed = this.pos + n
-    while (newLen < needed) newLen <<= 1
+    while (newLen < needed) newLen *= 2
     const next = new Uint8Array(newLen)
     next.set(this.buf, 0)
     this.buf = next
@@ -117,7 +129,7 @@ export class Encoder {
 
   /** Write unsigned LEB128 varint */
   writeVarint(v: number): void {
-    // v must be a non-negative integer
+    if (!Number.isSafeInteger(v) || v < 0) throw new RangeError('invalid metadata integer')
     if (v < 0x80) {
       this.grow(1)
       this.buf[this.pos++] = v
@@ -132,20 +144,32 @@ export class Encoder {
     this.buf[this.pos++] = v
   }
 
-  /** Write signed zigzag-encoded varint (matches Go: (v<<1) ^ (v>>63)) */
-  writeSvarint(v: number): void {
-    // Zigzag: map signed → unsigned. Safe for |v| < 2^52.
-    // JS number precision: 53 bits → zigzag doubles the magnitude → safe up to 2^52.
-    // API params rarely exceed this. For snowflake IDs > 2^52, use string type instead.
-    if (v >= 0) {
-      this.writeVarint(v * 2)
-    } else {
-      this.writeVarint(-v * 2 - 1)
+  /** Write a full-width unsigned ID without widening field-ID and length metadata. */
+  writeUint64(value: number | bigint): void {
+    if (typeof value === 'number') {
+      this.writeVarint(value)
+      return
     }
+    this.grow(10)
+    this.pos = writeWireUint64(this.buf, this.pos, value)
+  }
+
+  /** Write signed zigzag-encoded varint (matches Go: (v<<1) ^ (v>>63)) */
+  writeSvarint(v: bigint): void {
+    this.grow(10)
+    this.pos = writeWireInt64(this.buf, this.pos, v)
+  }
+
+  /** Write an RFC3339 timestamp with its exact nanosecond fraction. */
+  writeDateTime(value: string): void {
+    const timestamp = parseDateTime(value)
+    this.writeSvarint(timestamp.seconds)
+    this.writeVarint(timestamp.nanoseconds)
   }
 
   /** Write float64 as 8 bytes little-endian */
   writeFixed64(v: number): void {
+    if (!Number.isFinite(v)) throw new RangeError('Float must be finite')
     this.grow(8)
     this.view.setFloat64(this.pos, v, true)
     this.pos += 8
@@ -153,11 +177,7 @@ export class Encoder {
 
   /** Write length-prefixed UTF-8 string */
   writeString(v: string): void {
-    const encoded = textEncoder.encode(v)
-    this.writeVarint(encoded.length)
-    this.grow(encoded.length)
-    this.buf.set(encoded, this.pos)
-    this.pos += encoded.length
+    this.writeBytes(encodeUTF8(v))
   }
 
   /** Write boolean as varint 0 or 1 */
@@ -181,12 +201,17 @@ export class Encoder {
 
   /** Write a length-delimited value directly into this encoder's buffer. */
   writeDelimited(writeValue: (encoder: Encoder) => void): void {
+    this.writeDelimitedValue(undefined, writeValue)
+  }
+
+  /** Write a typed delimited value without allocating a capturing callback. */
+  writeDelimitedValue<T>(value: T, writeValue: (encoder: Encoder, value: T) => void): void {
     const prefixPosition = this.pos
     this.grow(1)
     this.pos++
     const valuePosition = this.pos
     try {
-      writeValue(this)
+      writeValue(this, value)
     } catch (error) {
       this.pos = prefixPosition
       throw error
@@ -221,7 +246,7 @@ export class Encoder {
 
   // --- Field writers (fieldID + value) ---
 
-  writeFieldInt(fieldID: number, v: number): void {
+  writeFieldInt(fieldID: number, v: bigint): void {
     this.writeVarint(fieldID)
     this.writeSvarint(v)
   }
@@ -232,8 +257,9 @@ export class Encoder {
   }
 
   writeFieldString(fieldID: number, v: string): void {
+    const encoded = encodeUTF8(v)
     this.writeVarint(fieldID)
-    this.writeString(v)
+    this.writeBytes(encoded)
   }
 
   writeFieldBool(fieldID: number, v: boolean): void {
@@ -254,7 +280,7 @@ export class Encoder {
   // --- Array field writers (fieldID + [count][items...]) ---
   // Array count is a plain varint (not zigzag); each item is encoded per element type.
 
-  writeFieldIntArray(fieldID: number, v: number[]): void {
+  writeFieldIntArray(fieldID: number, v: bigint[]): void {
     this.writeVarint(fieldID)
     this.writeVarint(v.length)
     for (const item of v) this.writeSvarint(item)
@@ -267,9 +293,15 @@ export class Encoder {
   }
 
   writeFieldStringArray(fieldID: number, v: string[]): void {
-    this.writeVarint(fieldID)
-    this.writeVarint(v.length)
-    for (const item of v) this.writeString(item)
+    const start = this.pos
+    try {
+      this.writeVarint(fieldID)
+      this.writeVarint(v.length)
+      for (const item of v) this.writeString(item)
+    } catch (error) {
+      this.pos = start
+      throw error
+    }
   }
 
   writeFieldBoolArray(fieldID: number, v: boolean[]): void {
@@ -297,8 +329,19 @@ export class Encoder {
   }
 
   /** Return a trimmed copy of the encoded data (safe for fetch body) */
-  bytes(): Uint8Array {
+  bytes(): Uint8Array<ArrayBuffer> {
     return this.buf.slice(0, this.pos)
+  }
+
+  /** Transfer ownership, compacting buffers with significant unused capacity.
+   * Subsequent writes use a new buffer. Consumers must honor byteOffset/byteLength. */
+  takeBytes(): Uint8Array<ArrayBuffer> {
+    const result = this.buf.length - this.pos > maxTransferredSlack
+      ? this.buf.slice(0, this.pos) : this.buf.subarray(0, this.pos)
+    this.buf = emptyEncoderBuffer
+    this.view = emptyEncoderView
+    this.pos = 0
+    return result
   }
 
   /** Reset encoder for reuse without reallocating */
@@ -318,31 +361,27 @@ function varintLength(value: number): number {
 
 // --- Decoder ---
 
-export class Decoder {
-  private data: Uint8Array
+export class Decoder extends WireReader {
   private view: DataView
-  private off: number
   fieldID: number
-  error: string | null
 
   constructor(data: Uint8Array) {
-    this.data = data
+    super(data)
     // zero-copy: use the buffer directly
     this.view = new DataView(data.buffer, data.byteOffset, data.byteLength)
-    this.off = 0
     this.fieldID = 0
-    this.error = null
   }
 
   /** Skip the arena header (totalStringLen varint) that prefixes each model's binary data. */
   skipArenaHeader(): void {
-    this.readVarintRaw()
+    this.readBoundedUnsigned(MAX_ARENA_SIZE, 'arena size')
   }
 
-  /** Read next field ID. Returns false at end marker (0x00) or EOF. */
+  /** Read next field ID. EOF without an end marker is a protocol error. */
   nextField(): boolean {
     if (this.error !== null) return false
-    if (this.off >= this.data.length) {
+    if (this.wireOffset >= this.wireBytes.length) {
+      this.error = 'missing row end marker'
       this.fieldID = 0
       return false
     }
@@ -353,55 +392,41 @@ export class Decoder {
 
   /** Read unsigned LEB128 varint */
   private readVarintRaw(): number {
-    const start = this.off
-    let v = 0
-    let mul = 1
-    while (this.off < this.data.length) {
-      const b = this.data[this.off++]
-      v += (b & 0x7F) * mul
-      if (b < 0x80) return v
-      mul *= 128
-      if (mul > 562949953421312) {
-        this.error ??= `varint overflow at offset ${start}`
-        return 0
-      }
-    }
-    this.error ??= `truncated varint at offset ${start}`
-    return 0
+    return this.readUnsigned()
   }
 
   /** Read signed zigzag-encoded int */
-  readInt(): number {
-    const uv = this.readVarintRaw()
-    // zigzag decode: (uv >>> 1) ^ -(uv & 1)
-    // For large JS numbers, use arithmetic instead of bitwise
-    const half = Math.floor(uv / 2)
-    return (uv & 1) ? -(half + 1) : half
+  readInt(): bigint {
+    return this.readSigned()
+  }
+
+  /** Decode a complete scalar response and reject malformed or trailing bytes. */
+  readIntChecked(): bigint {
+    const value = this.readInt()
+    checkComplete(this)
+    return value
+  }
+
+  readIntArrayChecked(): bigint[] {
+    const values = this.readIntArray()
+    checkComplete(this)
+    return values
   }
 
   /** Read float64 from 8 bytes little-endian */
   readFloat(): number {
-    if (this.off + 8 > this.data.length) {
-      this.error ??= `truncated fixed64 at offset ${this.off}`
-      return 0
-    }
-    const v = this.view.getFloat64(this.off, true)
-    this.off += 8
+    if (!this.requireBytes(8, 'fixed64')) return 0
+    const v = this.view.getFloat64(this.wireOffset, true)
+    if (!this.acceptFloat(v)) return 0
+    this.wireOffset += 8
     return v
   }
 
   /** Read length-prefixed UTF-8 string */
   readString(): string {
-    const len = this.readVarintRaw()
-    if (this.error !== null) return ''
-    if (len === 0) return ''
-    if (this.off + len > this.data.length) {
-      this.error ??= `truncated string at offset ${this.off}`
-      return ''
-    }
-    const bytes = this.data.subarray(this.off, this.off + len)
-    this.off += len
-    return textDecoder.decode(bytes)
+    const len = this.readLength('string')
+    if (len <= 0) return ''
+    return this.readStringBytes(len)
   }
 
   /** Read length-prefixed bytes as a zero-copy view. */
@@ -409,12 +434,12 @@ export class Decoder {
     const len = this.readVarintRaw()
     if (this.error !== null) return new Uint8Array(0)
     if (len === 0) return new Uint8Array(0)
-    if (this.off + len > this.data.length) {
-      this.error ??= `truncated bytes at offset ${this.off}`
+    if (this.wireOffset + len > this.wireBytes.length) {
+      this.error ??= `truncated bytes at offset ${this.wireOffset}`
       return new Uint8Array(0)
     }
-    const bytes = this.data.subarray(this.off, this.off + len)
-    this.off += len
+    const bytes = this.wireBytes.subarray(this.wireOffset, this.wireOffset + len)
+    this.wireOffset += len
     return bytes
   }
 
@@ -425,55 +450,58 @@ export class Decoder {
 
   /** Read a fixed 16-byte UUID, returning the canonical 36-char string. */
   readUUID(): string {
-    if (this.off + 16 > this.data.length) {
-      this.error ??= `truncated uuid at offset ${this.off}`
+    if (this.wireOffset + 16 > this.wireBytes.length) {
+      this.error ??= `truncated uuid at offset ${this.wireOffset}`
       return '00000000-0000-0000-0000-000000000000'
     }
-    const s = formatUUID(this.data, this.off)
-    this.off += 16
+    const s = formatUUID(this.wireBytes, this.wireOffset)
+    this.wireOffset += 16
     return s
   }
 
   // --- Scalar array readers (row mode: [count][item0][item1]...) ---
   // count is a plain varint; each item is encoded per element type.
 
-  readIntArray(): number[] {
-    const count = this.readVarintRaw()
-    const out: number[] = new Array(count)
+  readIntArray(): bigint[] {
+    const count = this.readArrayCount()
+    const out: bigint[] = new Array(count)
     for (let i = 0; i < count; i++) out[i] = this.readInt()
     return out
   }
 
   readFloatArray(): number[] {
-    const count = this.readVarintRaw()
+    const count = this.readArrayCount(8)
     const out: number[] = new Array(count)
     for (let i = 0; i < count; i++) out[i] = this.readFloat()
     return out
   }
 
   readStringArray(): string[] {
-    const count = this.readVarintRaw()
+    const count = this.readArrayCount()
     const out: string[] = new Array(count)
-    for (let i = 0; i < count; i++) out[i] = this.readString()
+    for (let i = 0; i < count; i++) {
+      out[i] = this.readString()
+      if (this.error !== null) return []
+    }
     return out
   }
 
   readBoolArray(): boolean[] {
-    const count = this.readVarintRaw()
+    const count = this.readArrayCount()
     const out: boolean[] = new Array(count)
     for (let i = 0; i < count; i++) out[i] = this.readBool()
     return out
   }
 
   readUUIDArray(): string[] {
-    const count = this.readVarintRaw()
+    const count = this.readArrayCount(16)
     const out: string[] = new Array(count)
     for (let i = 0; i < count; i++) out[i] = this.readUUID()
     return out
   }
 
   readBytesArray(): Uint8Array[] {
-    const count = this.readVarintRaw()
+    const count = this.readArrayCount()
     const out: Uint8Array[] = new Array(count)
     for (let i = 0; i < count; i++) out[i] = this.readBytes()
     return out
@@ -481,7 +509,7 @@ export class Decoder {
 
   // --- Nullable readers (1-byte flag + value if present) ---
 
-  readIntPtr(): number | null {
+  readIntPtr(): bigint | null {
     if (!this.readCanonicalMarker('nullable')) return null
     return this.readInt()
   }
@@ -506,15 +534,22 @@ export class Decoder {
     return this.readUUID()
   }
 
-  /** Read a DateTime: svarint(unix seconds) → RFC3339 string (matches Go JSON output). */
-  readDateTime(): string {
-    return unixSecondsToISO(this.readInt())
-  }
-
-  /** Read a nullable DateTime (0x00=null, else svarint seconds → RFC3339 string). */
+  /** Read a nullable seconds/nanoseconds pair. */
   readDateTimePtr(): string | null {
     if (!this.readCanonicalMarker('nullable')) return null
-    return unixSecondsToISO(this.readInt())
+    const value = this.readDateTime()
+    return this.error === null ? value : null
+  }
+
+  readDateTimeArray(): string[] {
+    const count = this.readArrayCount(2)
+    if (this.error !== null) return []
+    const values: string[] = new Array(count)
+    for (let i = 0; i < count; i++) {
+      values[i] = this.readDateTime()
+      if (this.error !== null) return []
+    }
+    return values
   }
 
   /** Read a nested model using a decoder function. */
@@ -524,12 +559,12 @@ export class Decoder {
   }
 
   private readCanonicalMarker(kind: 'bool' | 'nullable'): boolean {
-    if (this.off >= this.data.length) {
-      this.error ??= `truncated ${kind} marker at offset ${this.off}`
+    if (this.wireOffset >= this.wireBytes.length) {
+      this.error ??= `truncated ${kind} marker at offset ${this.wireOffset}`
       return false
     }
-    const offset = this.off
-    const marker = this.data[this.off++]
+    const offset = this.wireOffset
+    const marker = this.wireBytes[this.wireOffset++]
     if (marker === 0x00) return false
     if (marker === 0x01) return true
     this.error ??= `invalid ${kind} marker 0x${marker.toString(16).padStart(2, '0')} at offset ${offset}`
@@ -538,9 +573,9 @@ export class Decoder {
 
   /** Read an array of items using a decoder function. */
   readArray<T>(decode: () => T): T[] {
-    const count = this.readVarintRaw()
+    const count = this.readArrayCount()
     const items: T[] = []
-    for (let i = 0; i < count; i++) {
+    for (let i = 0; i < count && this.error === null; i++) {
       items.push(decode())
     }
     return items
@@ -548,7 +583,7 @@ export class Decoder {
 
   /** Skip remaining bytes (useful when encountering unknown fields) */
   get remaining(): number {
-    return this.data.length - this.off
+    return this.wireBytes.length - this.wireOffset
   }
 }
 
@@ -556,29 +591,45 @@ export class Decoder {
 // Reads columnar-encoded list data:
 // [count varint][arena size varint][fieldID][vals...]...[0x00]
 
-export class ColumnarDecoder {
-  private buf: Uint8Array
+export class ColumnarDecoder extends WireReader {
   private view: DataView
-  private off: number
   readonly count: number
   readonly arenaSize: number
   fieldID: number
-  error: string | null
 
   constructor(data: Uint8Array) {
-    this.buf = data
+    super(data)
     this.view = new DataView(data.buffer, data.byteOffset, data.byteLength)
-    this.off = 0
     this.fieldID = 0
-    this.error = null
-    this.count = this.readVarintRaw()
-    this.arenaSize = this.readVarintRaw()
+    this.count = this.readBoundedUnsigned(MAX_COLUMNAR_RECORDS, 'column count')
+    this.arenaSize = this.readBoundedUnsigned(MAX_ARENA_SIZE, 'arena size')
+    if (this.error === null && this.count > 0) {
+      if (this.count > this.wireBytes.length - this.wireOffset - 2) {
+        this.error = 'insufficient columnar element bytes'
+      } else {
+        const start = this.wireOffset
+        let id = this.wireBytes[start]
+        if (id >= 0x80) {
+          id = this.readVarintRaw()
+          if (this.count > this.wireBytes.length - this.wireOffset - 1) {
+            this.error ??= 'insufficient columnar element bytes'
+          }
+          this.wireOffset = start
+        }
+        if (id === 0 && this.error === null) {
+          this.error = 'nonempty list requires at least one column'
+        }
+      }
+    }
   }
 
-  /** Advance to next column. Returns false at end marker (0x00) or EOF. */
+  /** Advance to next column. EOF without an end marker is a protocol error. */
   nextColumn(): boolean {
     if (this.error !== null) return false
-    if (this.off >= this.buf.length) return false
+    if (this.wireOffset >= this.wireBytes.length) {
+      this.error = 'missing column end marker'
+      return false
+    }
     const id = this.readVarintRaw()
     this.fieldID = id
     if (id === 0) return false
@@ -586,8 +637,9 @@ export class ColumnarDecoder {
   }
 
   /** Read count svarint values (zigzag-encoded int column). */
-  readColumnInt(): number[] {
-    const result: number[] = new Array(this.count)
+  readColumnInt(): bigint[] {
+    if (!this.requireBytes(this.count, 'int64 column')) return []
+    const result: bigint[] = new Array(this.count)
     for (let i = 0; i < this.count; i++) {
       result[i] = this.readSvarint()
     }
@@ -596,28 +648,33 @@ export class ColumnarDecoder {
 
   /** Read count fixed64 float values. */
   readColumnFloat(): number[] {
+    if (!this.requireBytes(this.count * 8, 'float column')) return []
     const result: number[] = new Array(this.count)
     for (let i = 0; i < this.count; i++) {
-      result[i] = this.view.getFloat64(this.off, true)
-      this.off += 8
+      result[i] = this.view.getFloat64(this.wireOffset, true)
+      if (!this.acceptFloat(result[i])) return []
+      this.wireOffset += 8
     }
     return result
   }
 
   /** Read count length-prefixed string values. */
   readColumnString(): string[] {
+    if (!this.requireBytes(this.count, 'string column')) return []
     const result: string[] = new Array(this.count)
     for (let i = 0; i < this.count; i++) {
-      const len = this.readVarintRaw()
+      const len = this.readLength('string')
+      if (len < 0) return []
       if (len === 0) { result[i] = ''; continue }
-      result[i] = textDecoder.decode(this.buf.subarray(this.off, this.off + len))
-      this.off += len
+      result[i] = this.readStringBytes(len)
+      if (this.error !== null) return []
     }
     return result
   }
 
   /** Read count boolean values (varint 0/1). */
   readColumnBool(): boolean[] {
+    if (!this.requireBytes(this.count, 'bool column')) return []
     const result: boolean[] = new Array(this.count)
     for (let i = 0; i < this.count; i++) {
       result[i] = this.readCanonicalMarker('bool')
@@ -627,10 +684,11 @@ export class ColumnarDecoder {
 
   /** Read count fixed 16-byte UUID values (canonical strings). */
   readColumnUUID(): string[] {
+    if (!this.requireBytes(this.count * 16, 'uuid column')) return []
     const result: string[] = new Array(this.count)
     for (let i = 0; i < this.count; i++) {
-      result[i] = formatUUID(this.buf, this.off)
-      this.off += 16
+      result[i] = formatUUID(this.wireBytes, this.wireOffset)
+      this.wireOffset += 16
     }
     return result
   }
@@ -638,41 +696,48 @@ export class ColumnarDecoder {
   /** Read count length-prefixed byte blobs. Each cell is a length-prefixed blob —
    *  used for scalar array columns ([T]), where each cell holds [count][items...]. */
   readColumnBytes(): Uint8Array[] {
+    if (!this.requireBytes(this.count, 'bytes column')) return []
     const result: Uint8Array[] = new Array(this.count)
     for (let i = 0; i < this.count; i++) {
-      const len = this.readVarintRaw()
-      result[i] = this.buf.subarray(this.off, this.off + len)
-      this.off += len
+      const len = this.readLength('bytes')
+      if (len < 0) return []
+      result[i] = this.wireBytes.subarray(this.wireOffset, this.wireOffset + len)
+      this.wireOffset += len
     }
     return result
   }
 
   /** Read count nullable byte blobs (0x00=null, 0x01+length+bytes). */
   readColumnBytesPtr(): (Uint8Array | null)[] {
+    if (!this.requireBytes(this.count, 'nullable bytes column')) return []
     const result: (Uint8Array | null)[] = new Array(this.count)
     for (let i = 0; i < this.count; i++) {
       if (!this.readCanonicalMarker('nullable')) { result[i] = null; continue }
-      const len = this.readVarintRaw()
-      result[i] = this.buf.subarray(this.off, this.off + len)
-      this.off += len
+      const len = this.readLength('bytes')
+      if (len < 0) return []
+      result[i] = this.wireBytes.subarray(this.wireOffset, this.wireOffset + len)
+      this.wireOffset += len
     }
     return result
   }
 
   /** Read count nullable UUID values (0x00=null, 0x01+16 bytes). */
   readColumnUUIDPtr(): (string | null)[] {
+    if (!this.requireBytes(this.count, 'nullable uuid column')) return []
     const result: (string | null)[] = new Array(this.count)
     for (let i = 0; i < this.count; i++) {
       if (!this.readCanonicalMarker('nullable')) { result[i] = null; continue }
-      result[i] = formatUUID(this.buf, this.off)
-      this.off += 16
+      if (!this.requireBytes(16, 'uuid')) return []
+      result[i] = formatUUID(this.wireBytes, this.wireOffset)
+      this.wireOffset += 16
     }
     return result
   }
 
   /** Read count nullable int values (0x00=null, 0x01+svarint). */
-  readColumnIntPtr(): (number | null)[] {
-    const result: (number | null)[] = new Array(this.count)
+  readColumnIntPtr(): (bigint | null)[] {
+    if (!this.requireBytes(this.count, 'nullable int64 column')) return []
+    const result: (bigint | null)[] = new Array(this.count)
     for (let i = 0; i < this.count; i++) {
       if (!this.readCanonicalMarker('nullable')) { result[i] = null; continue }
       result[i] = this.readSvarint()
@@ -680,51 +745,62 @@ export class ColumnarDecoder {
     return result
   }
 
-  /** Read count DateTime values (svarint seconds → RFC3339 strings). */
+  /** Read count exact DateTime pairs. */
   readColumnDateTime(): string[] {
+    if (!this.requireBytes(this.count * 2, 'datetime column')) return []
     const result: string[] = new Array(this.count)
     for (let i = 0; i < this.count; i++) {
-      result[i] = unixSecondsToISO(this.readSvarint())
+      result[i] = this.readDateTime()
+      if (this.error !== null) return []
     }
     return result
   }
 
-  /** Read count nullable DateTime values (0x00=null, 0x01+svarint → RFC3339 string). */
+  /** Read count nullable DateTime pairs. */
   readColumnDateTimePtr(): (string | null)[] {
+    if (!this.requireBytes(this.count, 'nullable datetime column')) return []
     const result: (string | null)[] = new Array(this.count)
     for (let i = 0; i < this.count; i++) {
       if (!this.readCanonicalMarker('nullable')) { result[i] = null; continue }
-      result[i] = unixSecondsToISO(this.readSvarint())
+      result[i] = this.readDateTime()
+      if (this.error !== null) return []
     }
     return result
   }
 
   /** Read count nullable float values (0x00=null, 0x01+fixed64). */
   readColumnFloatPtr(): (number | null)[] {
+    if (!this.requireBytes(this.count, 'nullable float column')) return []
     const result: (number | null)[] = new Array(this.count)
     for (let i = 0; i < this.count; i++) {
       if (!this.readCanonicalMarker('nullable')) { result[i] = null; continue }
-      result[i] = this.view.getFloat64(this.off, true)
-      this.off += 8
+      if (!this.requireBytes(8, 'float')) return []
+      const value = this.view.getFloat64(this.wireOffset, true)
+      if (!this.acceptFloat(value)) return []
+      result[i] = value
+      this.wireOffset += 8
     }
     return result
   }
 
   /** Read count nullable string values (0x00=null, 0x01+string). */
   readColumnStringPtr(): (string | null)[] {
+    if (!this.requireBytes(this.count, 'nullable string column')) return []
     const result: (string | null)[] = new Array(this.count)
     for (let i = 0; i < this.count; i++) {
       if (!this.readCanonicalMarker('nullable')) { result[i] = null; continue }
-      const len = this.readVarintRaw()
+      const len = this.readLength('string')
+      if (len < 0) return []
       if (len === 0) { result[i] = ''; continue }
-      result[i] = textDecoder.decode(this.buf.subarray(this.off, this.off + len))
-      this.off += len
+      result[i] = this.readStringBytes(len)
+      if (this.error !== null) return []
     }
     return result
   }
 
   /** Read count nullable boolean values (0x00=null, 0x01+varint). */
   readColumnBoolPtr(): (boolean | null)[] {
+    if (!this.requireBytes(this.count, 'nullable bool column')) return []
     const result: (boolean | null)[] = new Array(this.count)
     for (let i = 0; i < this.count; i++) {
       if (!this.readCanonicalMarker('nullable')) { result[i] = null; continue }
@@ -735,37 +811,26 @@ export class ColumnarDecoder {
 
   /** Current read position (for reading pagination metadata after 0x00). */
   offset(): number {
-    return this.off
+    return this.wireOffset
   }
 
   /** Read one signed zigzag-encoded varint at current position. */
-  readSvarint(): number {
-    const uv = this.readVarintRaw()
-    const half = Math.floor(uv / 2)
-    return (uv & 1) ? -(half + 1) : half
+  readSvarint(): bigint {
+    return this.readSigned()
   }
 
   /** Read unsigned LEB128 varint. */
   private readVarintRaw(): number {
-    let v = 0
-    let mul = 1 // multiplier: 1, 128, 16384, ... — avoids 2**shift per iteration
-    while (this.off < this.buf.length) {
-      const b = this.buf[this.off++]
-      v += (b & 0x7F) * mul
-      if (b < 0x80) return v
-      mul *= 128
-      if (mul > 562949953421312) return 0 // 2^49 overflow guard
-    }
-    return 0
+    return this.readUnsigned()
   }
 
   private readCanonicalMarker(kind: 'bool' | 'nullable'): boolean {
-    if (this.off >= this.buf.length) {
-      this.error ??= `truncated ${kind} marker at offset ${this.off}`
+    if (this.wireOffset >= this.wireBytes.length) {
+      this.error ??= `truncated ${kind} marker at offset ${this.wireOffset}`
       return false
     }
-    const offset = this.off
-    const marker = this.buf[this.off++]
+    const offset = this.wireOffset
+    const marker = this.wireBytes[this.wireOffset++]
     if (marker === 0x00) return false
     if (marker === 0x01) return true
     this.error ??= `invalid ${kind} marker 0x${marker.toString(16).padStart(2, '0')} at offset ${offset}`
@@ -775,9 +840,15 @@ export class ColumnarDecoder {
 
 // --- FieldMask helpers ---
 
-/** Set a field bit in the mask, growing the mask if necessary. Returns the (possibly new) mask. */
+function checkSelectionFieldID(fieldID: number): void {
+  if (!Number.isInteger(fieldID) || fieldID <= 0 || fieldID > MAX_SELECTION_FIELD_ID) {
+    throw new RangeError('selection field ID must be an integer from 1 to 65535')
+  }
+}
+
+/** Set a field bit, growing if necessary. IDs outside 1..65535 throw RangeError. */
 export function fieldMaskSet(mask: Uint8Array, fieldID: number): Uint8Array {
-  if (!Number.isInteger(fieldID) || fieldID <= 0) return mask
+  checkSelectionFieldID(fieldID)
   const bit = fieldID - 1
   const byteIdx = bit >>> 3
   const bitIdx = bit & 7
@@ -791,9 +862,9 @@ export function fieldMaskSet(mask: Uint8Array, fieldID: number): Uint8Array {
   return mask
 }
 
-/** Check if a field bit is set in the mask. */
+/** Check a field bit. Invalid IDs throw RangeError rather than aliasing another bit. */
 export function fieldMaskHas(mask: Uint8Array, fieldID: number): boolean {
-  if (!Number.isInteger(fieldID) || fieldID <= 0) return false
+  checkSelectionFieldID(fieldID)
   const bit = fieldID - 1
   const byteIdx = bit >>> 3
   if (byteIdx >= mask.length) return false
@@ -810,13 +881,24 @@ export type FieldType =
 /** Decode a scalar array cell ([count][items...]) into a JS array, by element type.
  *  Used both for row-mode list fields and for columnar list cells (each cell is a
  *  length-prefixed blob read via ColumnarDecoder.readColumnBytes). Duration values
- *  are returned as raw numbers (nanoseconds); DateTime values are returned as RFC3339
+ *  are returned as bigint nanoseconds; DateTime values are returned as RFC3339
  *  strings, matching the Go JSON output and the row/columnar scalar decoders. */
 export function decodeScalarArray(cell: Uint8Array, type: FieldType): unknown[] {
   const dec = new Decoder(cell)
+  const values = readScalarArray(dec, type)
+  checkComplete(dec)
+  return values
+}
+
+function checkComplete(dec: Decoder): void {
+  if (dec.error) throw new Error(dec.error)
+  if (dec.remaining !== 0) throw new Error('unexpected trailing response bytes')
+}
+
+function readScalarArray(dec: Decoder, type: FieldType): unknown[] {
   switch (type) {
     case 'DateTime':
-      return dec.readIntArray().map(unixSecondsToISO)
+      return dec.readDateTimeArray()
     case 'Int': case 'Duration':
       return dec.readIntArray()
     case 'Float':
@@ -832,6 +914,6 @@ export function decodeScalarArray(cell: Uint8Array, type: FieldType): unknown[] 
     case 'JSON':
       return dec.readBytesArray().map(decodeJSONValue)
     default:
-      return []
+      throw new TypeError(`unsupported scalar array type ${type}`)
   }
 }

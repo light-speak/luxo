@@ -1,0 +1,1514 @@
+import 'dart:async';
+import 'dart:typed_data';
+
+import 'package:luxo_client/luxo_client.dart' as sdk;
+import 'package:luxo_client/src/transport.dart' show wsTransportWithSequence;
+import 'package:test/test.dart';
+
+import 'client.dart';
+import 'queries.dart';
+import 'fixture.dart';
+import 'types.dart';
+
+const _selection = 'value, duration, optional, values, label';
+final _integers = integerCases.map(sdk.LuxoInt64.parse).toList();
+
+Future<void> _verifyNullableRootCalls(LuxoClient client) async {
+  for (final value in [
+    null,
+    sdk.LuxoInt64.zero,
+    sdk.LuxoInt64.minValue,
+    sdk.LuxoInt64.maxValue,
+  ]) {
+    expect(await client.echoOptionalInteger(value: value), value);
+  }
+  for (final values in <List<sdk.LuxoInt64>?>[
+    null,
+    [],
+    [sdk.LuxoInt64.minValue, sdk.LuxoInt64.maxValue],
+  ]) {
+    expect(await client.echoOptionalIntegers(values: values), values);
+  }
+  expect(
+    await client.echoOptionalPrecision(input: null, select: 'value'),
+    isNull,
+  );
+  expect(
+    await client.echoOptionalPrecisions(inputs: null, select: 'value'),
+    isNull,
+  );
+  expect(
+    await client.echoOptionalPrecisions(inputs: [], select: 'value'),
+    isEmpty,
+  );
+  final input = PrecisionInput(
+    value: sdk.LuxoInt64.maxValue,
+    duration: sdk.LuxoInt64.zero,
+    optional: null,
+    values: [],
+    label: '',
+    ignored: sdk.LuxoInt64.zero,
+  );
+  final row = await client.echoOptionalPrecision(input: input, select: 'value');
+  expect(row!.value.value, input.value);
+  expect(row.label.isSelected, isFalse);
+  final rows = await client.echoOptionalPrecisions(
+    inputs: [input],
+    select: 'value',
+  );
+  expect(rows!.single.value.value, input.value);
+  expect(rows.single.label.isSelected, isFalse);
+}
+
+Future<void> _verifyNullableRootStreams(LuxoClient client) async {
+  final starters =
+      <
+        Future<void Function()> Function(
+          void Function(Object?),
+          void Function(),
+          void Function(sdk.LuxoError),
+        )
+      >[
+        (data, done, error) => client.subscribeWatchOptionalInteger(
+          onData: data,
+          onDone: done,
+          onError: error,
+        ),
+        (data, done, error) => client.subscribeWatchOptionalIntegers(
+          onData: data,
+          onDone: done,
+          onError: error,
+        ),
+        (data, done, error) => client.subscribeWatchOptionalPrecision(
+          select: 'value',
+          onData: data,
+          onDone: done,
+          onError: error,
+        ),
+      ];
+  for (final (index, start) in starters.indexed) {
+    final received = <Object?>[], done = Completer<void>();
+    final cancel = await start(
+      received.add,
+      () => done.complete(),
+      done.completeError,
+    );
+    try {
+      await done.future.timeout(const Duration(seconds: 3));
+      expect(received, hasLength(2));
+      expect(received.first, isNull);
+      switch (index) {
+        case 0:
+          expect(received.last, sdk.LuxoInt64.zero);
+        case 1:
+          expect(received.last, isEmpty);
+        case 2:
+          final row = received.last! as Precision;
+          expect(row.value.value, sdk.LuxoInt64.fromInt(42));
+          expect(row.label.isSelected, isFalse);
+      }
+    } finally {
+      cancel();
+    }
+  }
+  expect(
+    await client.echoInteger(value: sdk.LuxoInt64.fromInt(42)),
+    sdk.LuxoInt64.fromInt(42),
+  );
+}
+
+void registerEnumUpgradeTests() {
+  for (final websocket in [false, true]) {
+    for (final mode in [sdk.TransportMode.json, sdk.TransportMode.binary]) {
+      test(
+        'old SDK preserves future enum: websocket=$websocket mode=$mode',
+        () async {
+          final address = websocket
+              ? endpoint.replaceFirst('http:', 'ws:')
+              : endpoint;
+          final client = LuxoClient.create(
+            address,
+            options: sdk.TransportOptions(mode: mode),
+          );
+          try {
+            await _verifyEnumUpgrade(client, websocket);
+          } finally {
+            client.close();
+          }
+        },
+      );
+    }
+  }
+}
+
+void _verifyFutureState(FixtureState state) {
+  expect(state, isA<FixtureStateUnknown>());
+  expect(state.rawValue, 'FUTURE');
+}
+
+Future<void> _verifyEnumUpgrade(LuxoClient client, bool websocket) async {
+  await _verifyPagination(client);
+  final future = FixtureState.fromValue('FUTURE');
+  _verifyFutureState(future);
+  final received = await client.echoFixtureState(value: future);
+  _verifyFutureState(received);
+  _verifyFutureState(await client.echoFixtureState(value: received));
+  final expected = [FixtureStateKnown.OPEN, future, FixtureStateKnown.CLOSED];
+  final values = await client.echoFixtureStates(values: expected);
+  expect(values, expected);
+  _verifyFutureState(values[1]);
+  expect(await client.echoFixtureStates(values: []), isEmpty);
+  if (websocket) {
+    _verifyFutureState(
+      await _firstStream<FixtureState>(
+        (receive) => client.subscribeWatchFixtureState(onData: receive),
+      ),
+    );
+    final rows = await _firstStream<List<FixtureState>>(
+      (receive) => client.subscribeWatchFixtureStates(onData: receive),
+    );
+    expect(rows, expected);
+    _verifyFutureState(rows[1]);
+  }
+  await expectLater(
+    client.echoFixtureState(value: FixtureState.fromValue('UNDECLARED')),
+    throwsA(isA<sdk.LuxoError>().having((error) => error.code, 'code', 400)),
+  );
+  expect(
+    await client.echoInteger(value: sdk.LuxoInt64.fromInt(42)),
+    sdk.LuxoInt64.fromInt(42),
+  );
+}
+
+Iterable<String> _jsonNumberDocuments() => jsonNumberTokens.expand(
+  (token) => [
+    token,
+    '{"n":$token,"items":[$token,null],"nested":{"n":$token},"text":"精度 café"}',
+  ],
+);
+
+Future<void> _verifyFiniteStream(
+  LuxoClient client,
+  bool failure, {
+  bool checkReuse = true,
+}) async {
+  const raw =
+      '{"integer":123456789012345678901234567890,"fraction":0.12345678901234567890123456789,"zero":-0}';
+  final terminal = Completer<sdk.LuxoError?>();
+  var rows = 0;
+  var notifications = 0;
+  void finish(sdk.LuxoError? error) {
+    notifications++;
+    terminal.complete(error);
+  }
+
+  final cancel = await client.subscribeWatchFiniteJSON(
+    value: sdk.decodeLuxoJSON(raw)!,
+    fail: failure,
+    onData: (row) {
+      expect(row, hasLength(2));
+      expect(row[0], rows++);
+      expect(sdk.encodeLuxoJSON(row[1]), raw);
+    },
+    onDone: () => finish(null),
+    onError: finish,
+  );
+  try {
+    final error = await terminal.future.timeout(const Duration(seconds: 3));
+    expect(rows, 64);
+    expect(notifications, 1);
+    if (failure) {
+      expect(error?.error, 'JSONRejected');
+      expect(error?.code, 422);
+      expect(sdk.encodeLuxoJSON(error?.data), '{"value":$raw}');
+    } else {
+      expect(error, isNull);
+    }
+    if (checkReuse)
+      expect(
+        await client.echoInteger(value: sdk.LuxoInt64.maxValue),
+        sdk.LuxoInt64.maxValue,
+      );
+  } finally {
+    cancel();
+    cancel();
+  }
+}
+
+Future<void> _verifySubscriptionIDs(sdk.TransportMode mode) async {
+  for (final start in [
+    '9007199254740990',
+    '9223372036854775806',
+    '18446744073709551613',
+  ]) {
+    final transport = wsTransportWithSequence(
+      endpoint.replaceFirst('http:', 'ws:'),
+      BigInt.parse(start),
+      options: sdk.TransportOptions(mode: mode),
+    );
+    final client = LuxoClient(transport);
+    try {
+      final received = [Completer<sdk.LuxoInt64>(), Completer<sdk.LuxoInt64>()];
+      final stops = await Future.wait([
+        for (var i = 0; i < 2; i++)
+          client.subscribeWatchPrecision(
+            value: sdk.LuxoInt64.fromInt(i + 1),
+            select: 'value',
+            onData: (row) => received[i].complete(row.value.value),
+          ),
+      ]);
+      expect(
+        await Future.wait(received.map((c) => c.future))
+            .timeout(const Duration(seconds: 3)),
+        [sdk.LuxoInt64.fromInt(1), sdk.LuxoInt64.fromInt(2)],
+      );
+      for (final stop in stops) {
+        stop();
+        stop();
+      }
+      if (start == '18446744073709551613') {
+        await expectLater(
+          client.subscribeWatchPrecision(
+            value: sdk.LuxoInt64.fromInt(3),
+            select: 'value',
+            onData: (_) {},
+          ),
+          throwsA(
+            isA<sdk.LuxoError>().having(
+              (e) => e.error,
+              'error',
+              'RequestIDExhausted',
+            ),
+          ),
+        );
+      }
+    } finally {
+      client.close();
+    }
+  }
+}
+
+Uint8List _floatBytes(double value) =>
+    (ByteData(8)..setFloat64(0, value, Endian.little)).buffer.asUint8List();
+
+Future<void> _verifyTimestamps(LuxoClient client) async {
+  for (final item in dateTimeCases) {
+    expect(
+      await client.echoTimestamp(value: item['input']! as String),
+      item['canonical'],
+      reason: item['input']! as String,
+    );
+  }
+  final inputs = dateTimeCases.map((item) => item['input']! as String).toList();
+  final expected = dateTimeCases.map((item) => item['canonical']!).toList();
+  expect(await client.echoTimestamps(values: inputs), expected);
+  final input = ScalarArraysInput(
+    dates: inputs,
+    tail: sdk.LuxoInt64.fromInt(42),
+  );
+  final row = await client.echoScalarArrays(
+    input: input,
+    select: 'dates, tail',
+  );
+  expect(row.dates.value, expected);
+  for (final row in await client.listScalarArrays(
+    input: input,
+    select: 'dates, tail',
+  )) {
+    expect(row.dates.value, expected);
+    expect(row.tail.value, sdk.LuxoInt64.fromInt(42));
+  }
+}
+
+Future<void> _verifyTimestampStreams(LuxoClient client) async {
+  for (final item in dateTimeCases) {
+    final value = await _firstStream<String>(
+      (receive) => client.subscribeWatchTimestamp(
+        value: item['input']! as String,
+        onData: receive,
+      ),
+    );
+    expect(value, item['canonical']);
+  }
+  for (final cases in [
+    dateTimeCases.take(0),
+    dateTimeCases.take(1),
+    dateTimeCases,
+  ]) {
+    final values = await _firstStream<List<String>>(
+      (receive) => client.subscribeWatchTimestamps(
+        values: cases.map((item) => item['input']! as String).toList(),
+        onData: receive,
+      ),
+    );
+    expect(values, cases.map((item) => item['canonical']).toList());
+  }
+  expect(
+    await client.echoInteger(value: sdk.LuxoInt64.fromInt(42)),
+    sdk.LuxoInt64.fromInt(42),
+  );
+}
+
+Future<void> _verifyBusinessFloats(LuxoClient client) async {
+  for (final value in [
+    0.0,
+    -0.0,
+    double.minPositive,
+    -double.minPositive,
+    double.maxFinite,
+    -double.maxFinite,
+  ]) {
+    expect(
+      _floatBytes(await client.scaleFloat(value: value, factor: 1)),
+      _floatBytes(value),
+    );
+    final rows = await client.scaleFloatList(value: value, factor: 1);
+    expect(rows.length, 2);
+    for (final row in rows) {
+      expect(_floatBytes(row), _floatBytes(value));
+    }
+  }
+  for (final value in [double.maxFinite, -double.maxFinite]) {
+    for (final list in [false, true]) {
+      await expectLater(
+        list
+            ? client.scaleFloatList(value: value, factor: 2)
+            : client.scaleFloat(value: value, factor: 2),
+        throwsA(
+          isA<sdk.LuxoError>()
+              .having((e) => e.code, 'code', 500)
+              .having((e) => e.error, 'error', 'Internal')
+              .having((e) => e.message, 'message', 'error.internal')
+              .having((e) => e.data, 'data', isNull)
+              .having((e) => e.cause, 'cause', isNull),
+        ),
+      );
+      expect(await client.scaleFloat(value: 1.25, factor: 2), 2.5);
+    }
+  }
+}
+
+Future<void> _verifyError(LuxoClient client, sdk.LuxoInt64 value) async {
+  try {
+    await client.rejectPrecision(value: value);
+  } on sdk.LuxoError catch (error) {
+    expect(error.error, 'PrecisionRejected');
+    expect(error.code, 422);
+    expect(error.message, 'error.precision_rejected');
+    expect(error.traceId, isNotEmpty);
+    final Object? data = error.data;
+    expect(data, isA<Map<String, Object?>>());
+    final fields = data! as Map<String, Object?>;
+    expect(sdk.luxoInt64FromJSON(fields['value']), value);
+    expect(fields['label'], '精度 café');
+    expect(error.cause, isNull);
+    return;
+  }
+  fail('Expected PrecisionRejected');
+}
+
+Future<void> _verifyJSONError(
+  LuxoClient client,
+  Object value,
+  String text,
+) async {
+  try {
+    await client.rejectJSON(value: value);
+  } on sdk.LuxoError catch (error) {
+    expect(error.error, 'JSONRejected');
+    expect(error.code, 422);
+    expect(error.message, 'error.json_rejected');
+    expect(error.traceId, isNotEmpty);
+    final fields = error.data! as Map<String, Object?>;
+    expect(sdk.encodeLuxoJSON(fields['value']), text);
+    expect(error.cause, isNull);
+    return;
+  }
+  fail('Expected JSONRejected');
+}
+
+Future<void> _verifyJSONErrors(LuxoClient client) async {
+  for (final text in _jsonNumberDocuments()) {
+    final value = sdk.decodeLuxoJSON(text)!;
+    final results = await Future.wait<Object?>([
+      _verifyJSONError(client, value, text),
+      client.echoJSON(value: value),
+    ]);
+    expect(sdk.encodeLuxoJSON(results[1]), text);
+  }
+}
+
+Future<void> _verifyJSONStreams(LuxoClient client) async {
+  for (final text in _jsonNumberDocuments()) {
+    final value = sdk.decodeLuxoJSON(text)!;
+    final row = await _firstStream<Object?>(
+      (receive) => client.subscribeWatchJSON(value: value, onData: receive),
+    );
+    expect(sdk.encodeLuxoJSON(row), text);
+    final rows = await _firstStream<List<Object?>>(
+      (receive) =>
+          client.subscribeWatchJSONs(values: [value, null], onData: receive),
+    );
+    expect(sdk.encodeLuxoJSON(rows), '[$text,null]');
+  }
+}
+
+Future<void> _verifyPagination(LuxoClient client) async {
+  final cases = <(String?, String?, String, String, List<int>)>[
+    (null, null, '1', '2', [1, 2]),
+    ('2', '2', '2', '2', [3]),
+    ('3', '2', '3', '2', []),
+    ('9007199254740993', '2', '9007199254740993', '2', []),
+    ('9223372036854775807', '2', '9223372036854775807', '2', []),
+    ('0', '2', '1', '2', [1, 2]),
+    ('-1', '2', '1', '2', [1, 2]),
+    ('1', '0', '1', '0', [1, 2, 3]),
+    ('1', '100', '1', '100', [1, 2, 3]),
+    ('1', '-1', '1', '20', [1, 2, 3]),
+    ('1', '101', '1', '20', [1, 2, 3]),
+  ];
+  for (final value in [sdk.LuxoInt64.minValue, sdk.LuxoInt64.maxValue]) {
+    for (final (page, size, expectedPage, expectedSize, ids) in cases) {
+      final result = await client.browsePrecision(
+        value: value,
+        page: page == null ? null : sdk.LuxoInt64.parse(page),
+        pageSize: size == null ? null : sdk.LuxoInt64.parse(size),
+        select: 'id, value',
+      );
+      expect(result.total, sdk.LuxoInt64.fromInt(3));
+      expect(result.page, sdk.LuxoInt64.parse(expectedPage));
+      expect(result.pageSize, sdk.LuxoInt64.parse(expectedSize));
+      expect(result.items, hasLength(ids.length));
+      for (var i = 0; i < ids.length; i++) {
+        expect(result.items[i].id.value, sdk.LuxoInt64.fromInt(ids[i]));
+        expect(result.items[i].value.value, value);
+        expect(result.items[i].label.isSelected, isFalse);
+      }
+    }
+  }
+}
+
+Future<T> _firstStream<T>(
+  Future<void Function()> Function(void Function(T)) subscribe,
+) async {
+  final received = Completer<T>();
+  final cancel = await subscribe((row) {
+    if (!received.isCompleted) received.complete(row);
+  });
+  try {
+    return await received.future.timeout(const Duration(seconds: 5));
+  } finally {
+    cancel();
+  }
+}
+
+void _verifyJSONNumberConversions() {
+  expect(jsonNumberConversions, isNotEmpty);
+  final bytes = ByteData(8);
+  for (final item in jsonNumberConversions) {
+    final token = item['token']!;
+    for (final value in [
+      sdk.LuxoJSONNumber.parse(token),
+      sdk.decodeLuxoJSON(token),
+    ]) {
+      final integer = item['int64'];
+      if (integer == null) {
+        expect(
+          () => sdk.luxoInt64FromJSON(value),
+          throwsA(isA<FormatException>()),
+          reason: token,
+        );
+      } else {
+        expect(sdk.luxoInt64FromJSON(value).toString(), integer, reason: token);
+      }
+      final bits = item['float64Bits'];
+      if (bits == null) {
+        expect(
+          () => sdk.luxoDoubleFromJSON(value),
+          throwsA(isA<FormatException>()),
+          reason: token,
+        );
+      } else {
+        bytes.setFloat64(0, sdk.luxoDoubleFromJSON(value));
+        final actual =
+            '${bytes.getUint32(0).toRadixString(16).padLeft(8, '0')}'
+            '${bytes.getUint32(4).toRadixString(16).padLeft(8, '0')}';
+        expect(actual, bits, reason: token);
+      }
+      expect(sdk.encodeLuxoJSON(value), token);
+    }
+  }
+}
+
+void registerErrorTests() {
+  for (final mode in sdk.TransportMode.values) {
+    for (final websocket in [false, true]) {
+      final address = websocket
+          ? endpoint.replaceFirst('http:', 'ws:')
+          : endpoint;
+      group('$mode ${websocket ? 'WebSocket' : 'HTTP'} errors', () {
+        late LuxoClient client;
+        setUp(() {
+          client = LuxoClient.create(
+            address,
+            options: sdk.TransportOptions(mode: mode),
+          );
+        });
+        tearDown(() => client.close());
+
+        test(
+          'invalid filters and sorters fail before database access',
+          () async {
+            final exact = sdk.LuxoInt64.parse('9007199254740993');
+            expect(LuxoQuery_listQueryProbes.count_eq(exact).value, exact);
+            expect(LuxoQuery_listQueryProbes.count_desc().order, 'desc');
+            await _verifyQueryError(
+              client,
+              'createdAt',
+              () => client.listQueryProbes(
+                select: 'id',
+                filters: [
+                  LuxoQuery_listQueryProbes.createdAt_eq(
+                    '2026-02-30T00:00:00Z',
+                  ),
+                ],
+              ),
+            );
+            const cases = [
+              ('missing', 'eq', '1'),
+              ('id', 'eq', '1'),
+              ('state', 'eq', 'FUTURE'),
+              ('state', 'gt', 'OPEN'),
+              ('active', 'eq', 'truue'),
+              ('score', 'eq', 'NaN'),
+              ('count', 'eq', 'bad'),
+              ('createdAt', 'eq', '2026-02-30T00:00:00Z'),
+            ];
+            for (final (field, op, value) in cases) {
+              await _verifyQueryError(
+                client,
+                field,
+                () => client.listQueryProbes(
+                  select: 'id',
+                  filters: [sdk.LuxoFilter(field: field, op: op, value: value)],
+                ),
+              );
+            }
+            for (final field in ['missing', 'id']) {
+              await _verifyQueryError(
+                client,
+                field,
+                () => client.listQueryProbes(
+                  select: 'id',
+                  sorters: [sdk.LuxoSorter(field: field, order: 'asc')],
+                ),
+              );
+            }
+          },
+        );
+        test(
+          'structured errors retain Int64 data and do not misroute success',
+          () async {
+            for (final value in _integers) {
+              await Future.wait<void>([
+                _verifyError(client, value),
+                (() async {
+                  expect(await client.echoInteger(value: value), value);
+                })(),
+              ]);
+            }
+          },
+        );
+        test(
+          'raw JSON numbers survive errors without misrouting success',
+          () => _verifyJSONErrors(client),
+        );
+      });
+    }
+  }
+}
+
+void registerSuccessAndStreamTests() {
+  for (final mode in sdk.TransportMode.values) {
+    test(
+      'HTTP refresh preserves purpose and identity: $mode',
+      () => _verifyTokenRefresh(mode),
+    );
+  }
+  test('shared Unicode corpus agrees on all Dart targets', () {
+    expect(jsonUnicodeCases, hasLength(23));
+    for (final entry in jsonUnicodeCases) {
+      final raw = entry['raw']! as String;
+      if (entry['valid'] == false) {
+        expect(
+          () => sdk.decodeLuxoJSON(raw),
+          throwsFormatException,
+          reason: entry['name']! as String,
+        );
+      } else {
+        final value = sdk.decodeLuxoJSON(raw);
+        expect(
+          sdk.encodeLuxoJSON(sdk.decodeLuxoJSON(sdk.encodeLuxoJSON(value))),
+          sdk.encodeLuxoJSON(value),
+        );
+      }
+    }
+  });
+  test(
+    'explicit numeric conversions match the canonical corpus without changing tokens',
+    _verifyJSONNumberConversions,
+  );
+  test(
+    'generated nested decoders reject malformed message boundaries',
+    _verifyNestedBoundaries,
+  );
+  for (final mode in sdk.TransportMode.values) {
+    for (final websocket in [false, true]) {
+      final address = websocket
+          ? endpoint.replaceFirst('http:', 'ws:')
+          : endpoint;
+      group('$mode ${websocket ? 'WebSocket' : 'HTTP'}', () {
+        late LuxoClient client;
+        setUp(() {
+          client = LuxoClient.create(
+            address,
+            options: sdk.TransportOptions(mode: mode),
+          );
+        });
+        tearDown(() => client.close());
+
+        test(
+          'nullable root presence survives the complete request chain',
+          () async {
+            await _verifyNullableRootCalls(client);
+            if (websocket) await _verifyNullableRootStreams(client);
+          },
+        );
+
+        test(
+          'complete Unicode survives typed rows and opaque JSON keys',
+          () async {
+            for (final text in [
+              '',
+              '東京',
+              '\ud800\udc00',
+              '\udbff\udfff',
+              '\ufffd',
+              '\u0000\ufeff',
+              r'\uD800',
+              'e\u0301',
+            ]) {
+              final input = PrecisionInput(
+                value: sdk.LuxoInt64.maxValue,
+                duration: sdk.LuxoInt64.minValue,
+                optional: null,
+                values: [],
+                label: text,
+                ignored: sdk.LuxoInt64.zero,
+              );
+              _verify(
+                await client.echoPrecision(input: input, select: _selection),
+                input,
+              );
+              for (final row in await client.listPrecision(
+                input: input,
+                select: _selection,
+              ))
+                _verify(row, input);
+              final value = {
+                text: [text, BigInt.parse('123456789012345678901234567890')],
+              };
+              expect(
+                sdk.encodeLuxoJSON(await client.echoJSON(value: value)),
+                sdk.encodeLuxoJSON(value),
+              );
+            }
+          },
+        );
+
+        if (websocket) {
+          for (final failure in [false, true]) {
+            test(
+              'finite stream drains 64 exact JSON values then terminates: $failure',
+              () => _verifyFiniteStream(client, failure),
+            );
+            test(
+              'finite stream terminal preserves UInt64.max: $failure',
+              () async {
+                final transport = wsTransportWithSequence(
+                  address,
+                  BigInt.parse('18446744073709551614'),
+                  options: sdk.TransportOptions(mode: mode),
+                );
+                final maximum = LuxoClient(transport);
+                try {
+                  await _verifyFiniteStream(
+                    maximum,
+                    failure,
+                    checkReuse: false,
+                  );
+                } finally {
+                  maximum.close();
+                }
+              },
+            );
+          }
+        }
+
+        test('compiled business Float overflow reports an error without partial results', () async {
+          await _verifyBusinessFloats(client);
+        });
+
+        test('DateTime preserves nanoseconds in calls and streams', () async {
+          await _verifyTimestamps(client);
+          if (websocket) await _verifyTimestampStreams(client);
+        });
+
+        test(
+          'named enums use scalar and list responses without selection',
+          () async {
+            for (final value in ['OPEN', 'CLOSED']) {
+              final state = FixtureState.fromValue(value);
+              expect(await client.echoFixtureState(value: state), state);
+            }
+            for (final values in <List<String>>[
+              [],
+              ['OPEN'],
+              ['CLOSED', 'OPEN'],
+            ]) {
+              final states = values.map(FixtureState.fromValue).toList();
+              expect(await client.echoFixtureStates(values: states), states);
+            }
+            for (final raw in ['FUTURE', '', 'open']) {
+              final unknown = FixtureState.fromValue(raw);
+              expect(unknown, isA<FixtureStateUnknown>());
+              final rejected = throwsA(
+                isA<sdk.LuxoError>().having((error) => error.code, 'code', 400),
+              );
+              await expectLater(
+                client.echoFixtureState(value: unknown),
+                rejected,
+              );
+              await expectLater(
+                client.echoFixtureStates(
+                  values: [FixtureStateKnown.OPEN, unknown],
+                ),
+                rejected,
+              );
+            }
+            if (!websocket) return;
+            expect(
+              await _firstStream<FixtureState>(
+                (receive) => client.subscribeWatchFixtureState(onData: receive),
+              ),
+              FixtureStateKnown.OPEN,
+            );
+            expect(
+              await _firstStream<List<FixtureState>>(
+                (receive) =>
+                    client.subscribeWatchFixtureStates(onData: receive),
+              ),
+              [FixtureStateKnown.OPEN, FixtureStateKnown.CLOSED],
+            );
+          },
+        );
+
+        test('compiled list elements execute once', () async {
+          expect(
+            await client.checkListEffects(),
+            [1, 2, 3, 3].map(sdk.LuxoInt64.fromInt).toList(),
+          );
+        });
+
+        test(
+          'pagination defaults, extremes and selections match Go',
+          () => _verifyPagination(client),
+        );
+
+        if (websocket) {
+          test(
+            'generated concurrent subscriptions preserve full UInt64 identity',
+            () => _verifySubscriptionIDs(mode),
+          );
+          test(
+            'raw JSON numbers survive native scalar and list streams',
+            () => _verifyJSONStreams(client),
+          );
+        }
+
+        test(
+          'opaque JSON preserves number tokens beyond business numeric types',
+          () async {
+            final zero = {
+              'n': -0.0,
+              'items': [0.0, -0.0],
+            };
+            final echoedZero =
+                await client.echoJSON(value: zero) as Map<String, Object?>;
+            expect(sdk.luxoDoubleFromJSON(echoedZero['n']).isNegative, isTrue);
+            final zeroItems = echoedZero['items']! as List<Object?>;
+            expect(
+              zeroItems
+                  .map(sdk.luxoDoubleFromJSON)
+                  .map((value) => value.isNegative),
+              [false, true],
+            );
+            for (final text in _jsonNumberDocuments()) {
+              final value = sdk.decodeLuxoJSON(text)!;
+              expect(
+                sdk.encodeLuxoJSON(await client.echoJSON(value: value)),
+                text,
+              );
+              expect(
+                sdk.encodeLuxoJSON(
+                  await client.echoJSONs(values: [value, value]),
+                ),
+                '[$text,$text]',
+              );
+            }
+            final large = BigInt.parse('18446744073709551617');
+            final values = <Object>[
+              BigInt.parse('9007199254740993'),
+              BigInt.parse('9223372036854775807'),
+              large,
+              -large,
+              {
+                'value': large,
+                'nested': [large, -large],
+              },
+            ];
+            for (final value in values) {
+              expect(
+                sdk.encodeLuxoJSON(await client.echoJSON(value: value)),
+                sdk.encodeLuxoJSON(value),
+              );
+            }
+            expect(
+              sdk.encodeLuxoJSON(await client.echoJSONs(values: values)),
+              sdk.encodeLuxoJSON(values),
+            );
+            expect(await client.echoJSONs(values: []), isEmpty);
+          },
+        );
+
+        test(
+          'all eleven scalar arrays match Go values and preserve selection',
+          () async {
+            for (final state in [0, 1, 2, 3]) {
+              final input = _scalarArraysInput(state);
+              final rows = await client.listScalarArrays(
+                input: input,
+                select: _scalarSelection,
+              );
+              expect(rows, hasLength(2));
+              rows.add(
+                await client.echoScalarArrays(
+                  input: input,
+                  select: _scalarSelection,
+                ),
+              );
+              for (final row in rows) {
+                expect(row.toJson(), input.toJson());
+                _verifyFloatSigns(row, input);
+              }
+              final partials = await client.listScalarArrays(
+                input: input,
+                select: 'tail',
+              );
+              partials.add(
+                await client.echoScalarArrays(input: input, select: 'tail'),
+              );
+              for (final row in partials) {
+                expect(row.toJson(), {'tail': BigInt.from(42)});
+              }
+              if (!websocket) continue;
+              final row = await _firstStream<ScalarArrays>(
+                (receive) => client.subscribeWatchScalarArrays(
+                  state: sdk.LuxoInt64.fromInt(state),
+                  select: _scalarSelection,
+                  onData: receive,
+                ),
+              );
+              // This native stream returns fixed fixture data, not the unary input.
+              expect(
+                row.toJson(),
+                _scalarArraysInput(state, fixedStream: true).toJson(),
+              );
+              _verifyFloatSigns(row, input);
+            }
+          },
+        );
+
+        test('signed 64-bit scalar, Duration and array round trips', () async {
+          for (final value in _integers) {
+            expect(await client.echoInteger(value: value), value);
+            expect(await client.echoDuration(value: value), value);
+          }
+          expect(await client.echoIntegers(values: _integers), _integers);
+          expect(await client.echoIntegers(values: []), isEmpty);
+        });
+
+        test('typed inputs, nullable values and columnar responses', () async {
+          for (final value in _integers) {
+            for (final optional in [null, value]) {
+              final input = PrecisionInput(
+                value: value,
+                duration: value,
+                optional: optional,
+                values: _integers,
+                label: '精度 café',
+                ignored: sdk.LuxoInt64.fromInt(42),
+              );
+              final row = await client.echoPrecision(
+                input: input,
+                select: _selection,
+              );
+              _verify(row, input);
+              final rows = await client.listPrecision(
+                input: input,
+                select: _selection,
+              );
+              expect(rows, hasLength(2));
+              for (final row in rows) {
+                _verify(row, input);
+              }
+            }
+          }
+        });
+
+        test('concurrent selections stay isolated on the same API', () async {
+          final inputs = List.generate(
+            16,
+            (index) => PrecisionInput(
+              value: sdk.LuxoInt64.parse(
+                (BigInt.parse('9223372036854775807') - BigInt.from(index))
+                    .toString(),
+              ),
+              duration: sdk.LuxoInt64.fromInt(index),
+              optional: null,
+              values: [],
+              label: 'call-$index',
+              ignored: sdk.LuxoInt64.zero,
+            ),
+          );
+          await Future.wait(
+            inputs.map((input) async {
+              final rows = await Future.wait([
+                client.echoPrecision(input: input, select: 'value'),
+                client.echoPrecision(input: input, select: 'label'),
+                client.echoPrecision(input: input, select: 'value, label'),
+              ]);
+              expect(rows[0].value.value, input.value);
+              expect(rows[0].label.isSelected, isFalse);
+              expect(rows[1].label.value, input.label);
+              expect(rows[1].value.isSelected, isFalse);
+              expect(rows[2].value.value, input.value);
+              expect(rows[2].label.value, input.label);
+              for (final row in rows) {
+                expect(
+                  row.duration.isSelected ||
+                      row.optional.isSelected ||
+                      row.values.isSelected ||
+                      row.ignored.isSelected,
+                  isFalse,
+                );
+              }
+            }),
+          );
+          final repeated = await client.echoPrecision(
+            input: inputs.first,
+            select: 'value',
+          );
+          expect(repeated.value.value, inputs.first.value);
+          expect(repeated.label.isSelected, isFalse);
+        });
+
+        test('partial selection stays partial across both encodings', () async {
+          final input = PrecisionInput(
+            value: sdk.LuxoInt64.maxValue,
+            duration: sdk.LuxoInt64.minValue,
+            optional: null,
+            values: [],
+            label: 'not selected',
+            ignored: sdk.LuxoInt64.zero,
+          );
+          final row = await client.echoPrecision(input: input, select: 'value');
+          expect(row.value.value, sdk.LuxoInt64.maxValue);
+          expect(row.duration.isSelected, isFalse);
+          expect(row.optional.isSelected, isFalse);
+          expect(row.values.isSelected, isFalse);
+          expect(row.label.isSelected, isFalse);
+          expect(row.ignored.isSelected, isFalse);
+        });
+
+        test(
+          'nullable arrays preserve null, empty and unselected states',
+          () async {
+            for (var state = 0; state < _nullableCases.length; state++) {
+              final input = _nullableCases[state];
+              _verifyNullable(
+                await client.echoNullableArrays(
+                  input: input,
+                  select: _nullableSelection,
+                ),
+                input,
+              );
+              final rows = await client.listNullableArrays(
+                input: input,
+                select: _nullableSelection,
+              );
+              expect(rows, hasLength(2));
+              for (final row in rows) {
+                _verifyNullable(row, input);
+              }
+              final partials = await client.listNullableArrays(
+                input: input,
+                select: 'tail',
+              );
+              partials.add(
+                await client.echoNullableArrays(input: input, select: 'tail'),
+              );
+              for (final partial in partials) {
+                expect(partial.tail.value, input.tail);
+                expect(partial.values.isSelected, isFalse);
+                expect(partial.durations.isSelected, isFalse);
+                expect(partial.flags.isSelected, isFalse);
+              }
+              if (websocket) {
+                final row = await _firstStream<NullableArrays>(
+                  (receive) => client.subscribeWatchNullableArrays(
+                    state: sdk.LuxoInt64.fromInt(state),
+                    select: _nullableSelection,
+                    onData: receive,
+                  ),
+                );
+                _verifyNullable(row, input);
+              }
+            }
+          },
+        );
+
+        test(
+          'three-level nested responses preserve precision and selection',
+          () async {
+            for (var state = 0; state < 3; state++) {
+              final input = _nestedInput(state);
+              _verifyNested(
+                await client.echoNestedPrecision(
+                  input: input,
+                  select: _nestedSelection,
+                ),
+                input,
+              );
+              final rows = await client.listNestedPrecision(
+                input: input,
+                select: _nestedSelection,
+              );
+              expect(rows, hasLength(2));
+              for (final row in rows) {
+                _verifyNested(row, input);
+              }
+              final partials = await client.listNestedPrecision(
+                input: input,
+                select: 'tail',
+              );
+              partials.add(
+                await client.echoNestedPrecision(input: input, select: 'tail'),
+              );
+              for (final partial in partials) {
+                expect(partial.tail.value, input.tail);
+                expect(partial.group.isSelected, isFalse);
+                expect(partial.groups.isSelected, isFalse);
+              }
+              if (websocket) {
+                final row = await _firstStream<NestedPrecision>(
+                  (receive) => client.subscribeWatchNestedPrecision(
+                    state: sdk.LuxoInt64.fromInt(state),
+                    select: _nestedSelection,
+                    onData: receive,
+                  ),
+                );
+                _verifyNested(row, input);
+              }
+            }
+          },
+        );
+
+        if (websocket) {
+          test(
+            'native stream resolves omitted parameters on the server',
+            () async {
+              final row = await _firstStream<Precision>(
+                (receive) => client.subscribeWatchPrecision(
+                  select: _selection,
+                  onData: receive,
+                ),
+              );
+              final expected = sdk.LuxoInt64.fromInt(42);
+              expect(row.value.value, expected);
+              expect(row.duration.value, expected);
+              expect(row.optional.value, expected);
+              expect(row.values.value, [expected]);
+              expect(row.label.value, '精度 café');
+              expect(row.ignored.isSelected, isFalse);
+            },
+          );
+          test(
+            'generated native stream preserves integer extremes and selection',
+            () async {
+              for (final value in _integers) {
+                final row = await _firstStream<Precision>(
+                  (receive) => client.subscribeWatchPrecision(
+                    value: value,
+                    select: _selection,
+                    onData: receive,
+                  ),
+                );
+                expect(row.value.value, value);
+                expect(row.duration.value, value);
+                expect(row.optional.value, value);
+                expect(row.values.value, [value]);
+                expect(row.label.value, '精度 café');
+                expect(row.ignored.isSelected, isFalse);
+              }
+            },
+          );
+        }
+      });
+    }
+  }
+}
+
+Future<void> _verifyTokenRefresh(sdk.TransportMode mode) async {
+  final bootstrap = LuxoClient.create(
+    endpoint,
+    options: sdk.TransportOptions(mode: mode),
+  );
+  var attempts = 0;
+  var policy = 'renew';
+  var refresh = '';
+  final transport = sdk.HttpTransport(
+    endpoint,
+    options: sdk.TransportOptions(mode: mode),
+    timeout: const Duration(seconds: 5),
+    onTokenExpired: () async {
+      attempts++;
+      if (policy == 'decline') return null;
+      return policy == 'invalid'
+          ? refresh
+          : await bootstrap.exchangeFixtureRefresh(token: refresh);
+    },
+  );
+  final client = LuxoClient(transport);
+  try {
+    refresh = await bootstrap.issueFixtureRefresh();
+    final access = await bootstrap.issueFixtureAccess();
+    await expectLater(
+      bootstrap.exchangeFixtureRefresh(token: access),
+      throwsA(isA<sdk.LuxoError>()),
+    );
+    transport.setToken(refresh);
+    final expected = sdk.LuxoInt64.parse('9007199254740993');
+    expect(await client.fixtureIdentity(), expected);
+    expect(await client.fixtureIdentity(), expected);
+    expect(attempts, 1);
+    for (final next in ['decline', 'invalid']) {
+      policy = next;
+      transport.setToken(refresh);
+      await expectLater(
+        client.fixtureIdentity(),
+        throwsA(
+          isA<sdk.LuxoError>().having((error) => error.code, 'code', 401),
+        ),
+      );
+      expect(attempts, next == 'decline' ? 2 : 3);
+    }
+  } finally {
+    client.close();
+    bootstrap.close();
+  }
+}
+
+Future<void> _verifyQueryError(
+  LuxoClient client,
+  String field,
+  Future<Object?> Function() request,
+) async {
+  await expectLater(
+    request,
+    throwsA(
+      isA<sdk.LuxoError>()
+          .having((error) => error.code, 'code', 400)
+          .having((error) => error.error, 'error', 'BadRequest')
+          .having((error) => (error.data as Map)['param'], 'field', field),
+    ),
+  );
+  expect(
+    await client.echoInteger(value: sdk.LuxoInt64.fromInt(42)),
+    sdk.LuxoInt64.fromInt(42),
+  );
+}
+
+void _verify(Precision row, PrecisionInput input) {
+  expect(row.value.value, input.value);
+  expect(row.duration.value, input.duration);
+  expect(row.optional.isSelected, isTrue);
+  expect(row.optional.value, input.optional);
+  expect(row.values.value, input.values);
+  expect(row.label.value, input.label);
+  expect(row.ignored.isSelected, isFalse);
+}
+
+const _nullableSelection = 'values, durations, flags, tail';
+final _nullableCases = [
+  NullableArraysInput(
+    values: null,
+    durations: null,
+    flags: null,
+    tail: sdk.LuxoInt64.fromInt(42),
+  ),
+  NullableArraysInput(
+    values: [],
+    durations: [],
+    flags: [],
+    tail: sdk.LuxoInt64.fromInt(42),
+  ),
+  NullableArraysInput(
+    values: [sdk.LuxoInt64.minValue, sdk.LuxoInt64.maxValue],
+    durations: [sdk.LuxoInt64.minValue, sdk.LuxoInt64.maxValue],
+    flags: [true, false],
+    tail: sdk.LuxoInt64.fromInt(42),
+  ),
+];
+
+void _verifyNullable(NullableArrays row, NullableArraysInput input) {
+  expect(row.values.isSelected, isTrue);
+  expect(row.durations.isSelected, isTrue);
+  expect(row.flags.isSelected, isTrue);
+  expect(row.values.value, input.values);
+  expect(row.durations.value, input.durations);
+  expect(row.flags.value, input.flags);
+  expect(row.tail.value, input.tail);
+}
+
+const _nestedGroupSelection =
+    'label, primary { $_selection }, optional { $_selection }, rows { $_selection }, optionalRows { $_selection }, tail';
+const _nestedSelection =
+    'group { $_nestedGroupSelection }, groups { $_nestedGroupSelection }, tail';
+
+NestedPrecisionInput _nestedInput(int state) {
+  final value = sdk.LuxoInt64.maxValue;
+  final row = PrecisionInput(
+    value: value,
+    duration: sdk.LuxoInt64.minValue,
+    optional: value,
+    values: [sdk.LuxoInt64.minValue, value],
+    label: '精度 café',
+    ignored: sdk.LuxoInt64.fromInt(42),
+  );
+  final group = NestedGroupInput(
+    label: 'nested 東京',
+    primary: row,
+    optional: state == 0 ? null : row,
+    rows: state == 2 ? [row] : [],
+    optionalRows: state == 0
+        ? null
+        : state == 1
+        ? []
+        : [row],
+    tail: sdk.LuxoInt64.fromInt(42),
+  );
+  return NestedPrecisionInput(
+    group: group,
+    groups: [group],
+    tail: sdk.LuxoInt64.fromInt(-42),
+  );
+}
+
+void _verifyGroup(NestedGroup actual, NestedGroupInput expected) {
+  expect(actual.label.value, expected.label);
+  _verify(actual.primary.value, expected.primary);
+  if (expected.optional == null) {
+    expect(actual.optional.value, isNull);
+  } else {
+    _verify(actual.optional.value!, expected.optional!);
+  }
+  _verifyNestedRows(actual.rows.value, expected.rows);
+  _verifyNestedRows(actual.optionalRows.value, expected.optionalRows);
+  expect(actual.tail.value, expected.tail);
+}
+
+void _verifyNestedRows(
+  List<Precision>? actual,
+  List<PrecisionInput>? expected,
+) {
+  if (expected == null) {
+    expect(actual, isNull);
+    return;
+  }
+  expect(actual, hasLength(expected.length));
+  for (var i = 0; i < expected.length; i++) {
+    _verify(actual![i], expected[i]);
+  }
+}
+
+void _verifyNested(NestedPrecision actual, NestedPrecisionInput expected) {
+  _verifyGroup(actual.group.value, expected.group);
+  expect(actual.groups.value, hasLength(expected.groups.length));
+  for (var i = 0; i < expected.groups.length; i++) {
+    _verifyGroup(actual.groups.value[i], expected.groups[i]);
+  }
+  expect(actual.tail.value, expected.tail);
+}
+
+// These deliberately malformed messages are separate from the live Go assertions.
+void _verifyNestedBoundaries() {
+  for (final bytes in <List<int>>[
+    [1, 0, 0],
+    [1, 0, 0, 0, 0],
+    [1, 0, 0x80, 0, 0],
+    [0x80, 0x89, 0x7a, 0, 0],
+  ]) {
+    expect(
+      () => decodeColumnarNestedGroup(Uint8List.fromList(bytes)),
+      throwsA(isA<FormatException>()),
+    );
+  }
+  for (final columnar in [false, true]) {
+    NestedGroup read(List<int> bytes) => columnar
+        ? decodeColumnarNestedGroup(Uint8List.fromList(bytes)).single
+        : decodeNestedGroup(sdk.LuxoDecoder(Uint8List.fromList(bytes)));
+    for (final field in [2, 3, 4, 5]) {
+      final child = field < 4 ? [0, 1, 84, 0] : [1, 0, 1, 84, 0];
+      List<int> wrap(List<int> payload) => [
+        ...columnar ? [1, 0] : [0],
+        field,
+        if (field == 3 || field == 5) 1,
+        payload.length,
+        ...payload,
+        6,
+        84,
+        0,
+      ];
+      final valid = wrap(child);
+      final row = read(valid);
+      expect(row.tail.value, sdk.LuxoInt64.fromInt(42));
+      final value = switch (field) {
+        2 => row.primary.value,
+        3 => row.optional.value!,
+        4 => row.rows.value.single,
+        _ => row.optionalRows.value!.single,
+      };
+      expect(value.value.value, sdk.LuxoInt64.fromInt(42));
+      final invalid = [
+        wrap([...child, 99]),
+        [...valid, 99],
+        for (var end = 0; end < child.length; end++)
+          wrap(child.sublist(0, end)),
+        for (var end = 0; end < valid.length; end++) valid.sublist(0, end),
+      ];
+      if (field == 3 || field == 5) {
+        invalid.add([...valid]..[columnar ? 3 : 2] = 2);
+      }
+      for (final bytes in invalid) {
+        expect(
+          () => read(bytes),
+          throwsFormatException,
+          reason: '$columnar field $field: $bytes',
+        );
+      }
+    }
+  }
+}
+
+const _scalarSelection =
+    'ints, floats, strings, bools, dates, durations, uuids, bytes, decimals, jsons, enums, tail';
+
+void _verifyFloatSigns(ScalarArrays row, ScalarArraysInput input) {
+  final actual = row.floats.value;
+  expect(actual, input.floats);
+  if (actual != null) {
+    expect(
+      actual.map((value) => value.isNegative),
+      input.floats!.map((value) => value.isNegative),
+    );
+  }
+}
+
+ScalarArraysInput _scalarArraysInput(int state, {bool fixedStream = false}) =>
+    ScalarArraysInput(
+      ints: state == 0
+          ? null
+          : state == 1
+          ? []
+          : [sdk.LuxoInt64.minValue, sdk.LuxoInt64.maxValue],
+      floats: state == 0
+          ? null
+          : state == 1
+          ? []
+          : state == 3
+          ? [
+              -1.5,
+              1.25,
+              -0.0,
+              double.minPositive,
+              -double.minPositive,
+              double.maxFinite,
+            ]
+          : [-1.5, 1.25],
+      strings: state == 0
+          ? null
+          : state == 1
+          ? []
+          : ['', fixedStream ? '精度 café 東京' : '\uFEFF\uFEFF精度 café 東京\uFFFD'],
+      bools: state == 0
+          ? null
+          : state == 1
+          ? []
+          : [true, false],
+      dates: state == 0
+          ? null
+          : state == 1
+          ? []
+          : ['1969-12-31T23:59:59Z', '2021-01-01T00:00:00Z'],
+      durations: state == 0
+          ? null
+          : state == 1
+          ? []
+          : [sdk.LuxoInt64.minValue, sdk.LuxoInt64.maxValue],
+      uuids: state == 0
+          ? null
+          : state == 1
+          ? []
+          : [
+              '00000000-0000-0000-0000-000000000000',
+              '00000000-0000-0000-0000-000000000001',
+            ],
+      bytes: state == 0
+          ? null
+          : state == 1
+          ? []
+          : [
+              Uint8List(0),
+              Uint8List.fromList([0, 127, 128, 255]),
+            ],
+      decimals: state == 0
+          ? null
+          : state == 1
+          ? []
+          : ['1234567890.123456789', '-0.000000001'],
+      jsons: state == 0
+          ? null
+          : state == 1
+          ? []
+          : [
+              {'value': BigInt.parse('9223372036854775807'), 'text': '東京'},
+              false,
+            ],
+      enums: state == 0
+          ? null
+          : state == 1
+          ? []
+          : [FixtureStateKnown.OPEN, FixtureStateKnown.CLOSED],
+      tail: sdk.LuxoInt64.fromInt(42),
+    );

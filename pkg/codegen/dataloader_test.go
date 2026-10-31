@@ -16,6 +16,74 @@ func pos0() token.Position {
 	return token.Position{File: "test.luxo", Line: 1, Col: 1}
 }
 
+func TestLoaderCollectionBoundaries(t *testing.T) {
+	if got := loaderNameFromLoadCall(loadCallInfo{modelName: "User"}); got != "ExtendUser" {
+		t.Fatalf("primary-key loader = %q", got)
+	}
+	var calls []loadCallInfo
+	seen := make(map[string]bool)
+	recordLoadCallExpr(nil, seen, &calls, nil)
+	recordLoadCallExpr(&ast.CallExpr{Func: &ast.MemberExpr{
+		Object: &ast.Literal{Kind: token.Int, Value: "1"}, Field: "load",
+	}}, seen, &calls, nil)
+	if len(calls) != 0 || len(seen) != 0 {
+		t.Fatal("invalid receiver registered a loader")
+	}
+	result := &semantic.Result{Files: []*ast.File{
+		{Name: "origin/first/model.luxo", Extends: []*ast.ExtendDecl{{Name: "User"}}},
+		{Name: "origin/second/model.luxo", Extends: []*ast.ExtendDecl{{Name: "User"}}},
+	}}
+	if got := collectExtendModels(result); !slices.Equal(got, []string{"User"}) {
+		t.Fatalf("repeated external model = %v", got)
+	}
+}
+
+func TestNamedLoaderTypesDoNotDuplicateDeclarations(t *testing.T) {
+	call := loadCallInfo{modelName: "Post", argNames: []string{"userId"}, argTypes: []string{"int64"}}
+	var output strings.Builder
+	generateNamedLoaderTypes(&output, []loadCallInfo{call, call}, make(map[string]bool))
+	if strings.Count(output.String(), "type PostByUserIdLoader =") != 1 {
+		t.Fatalf("duplicate loader declaration:\n%s", output.String())
+	}
+}
+
+func TestRemoteLoadersDeduplicateSharedRelations(t *testing.T) {
+	group := modelRelations{modelName: "User", relations: []Relation{{
+		TargetName: "Post", RemoteKey: "userId", IsList: true, KeyGoType: "int64",
+	}}}
+	result := &semantic.Result{Files: []*ast.File{{Extends: []*ast.ExtendDecl{{Name: "User"}}}}}
+	var single, repeated strings.Builder
+	g := defaultGenerator()
+	g.generateRemoteLoaders(&single, result, []modelRelations{group}, nil, []string{"User"}, nil)
+	g.generateRemoteLoaders(&repeated, result, []modelRelations{group, group}, nil, []string{"User"}, nil)
+	if single.Len() == 0 || single.String() != repeated.String() {
+		t.Fatal("duplicate relation changed remote loader construction")
+	}
+}
+
+func TestNamedLoadersPreserveSoftDeleteConditions(t *testing.T) {
+	for _, call := range []loadCallInfo{
+		{modelName: "Post", argNames: []string{"userId"}, argTypes: []string{"int64"}},
+		{modelName: "Post", argNames: []string{"userId", "slug"}, argTypes: []string{"int64", "string"}},
+	} {
+		for _, soft := range []bool{false, true} {
+			var source strings.Builder
+			defaultGenerator().generateFKLoadBatchFunc(&source, call, soft)
+			text := source.String()
+			want := 0
+			if soft {
+				want = 1
+			}
+			if got := strings.Count(text, `lux.NewTimeField("deleted_at").IsNull()`); got != want {
+				t.Fatalf("%v soft=%v: deletion predicate count=%d, want=%d", call.argNames, soft, got, want)
+			}
+			if soft && strings.Index(text, `lux.NewTimeField("deleted_at")`) > strings.Index(text, "lux.BuildSelectSQL") {
+				t.Fatal("soft deletion was added after query construction")
+			}
+		}
+	}
+}
+
 func TestAnalyzeRelationsBelongsTo(t *testing.T) {
 	m := &ast.ModelDecl{
 		Name: "Post",
@@ -162,6 +230,17 @@ func TestGenerateDataLoaderFile(t *testing.T) {
 		if !strings.Contains(code, check) {
 			t.Errorf("missing %q in:\n%s", check, code)
 		}
+	}
+}
+
+func TestDataLoaderGenericQueryDoesNotImportDriver(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{Extends: []*ast.ExtendDecl{{Name: "User"}}}}}
+	source := string(generateDataLoaderFile(result, "generated", nil, nil, DriverPG))
+	if !strings.Contains(source, "app.DB.QueryRows(") {
+		t.Fatal("expected the generic database method")
+	}
+	if strings.Contains(source, DriverPG.DriverImport()) {
+		t.Fatal("method-based loaders must not import an unused database package")
 	}
 }
 
@@ -869,6 +948,10 @@ func TestGenerateRemoteLoadersUsesRPCForExternalBelongsToRelations(t *testing.T)
 	}
 	if strings.Contains(remote, `lux.BuildSelectSQL("users"`) {
 		t.Fatalf("external relation must not query a table in the local service database:\n%s", remote)
+	}
+	if !strings.Contains(remote, "return NewRemoteLoaders(tx, rpcClients, registry, cfg)") ||
+		!strings.Contains(remote, "cfg.MaxBatch = 1") {
+		t.Fatalf("transaction loader factory lost remote routing or synchronous dispatch:\n%s", remote)
 	}
 }
 

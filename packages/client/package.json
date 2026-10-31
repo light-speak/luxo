@@ -1,6 +1,6 @@
 {
   "name": "@luxojs/client",
-  "version": "0.1.0-dev.3",
+  "version": "1.0.0-beta.1",
   "description": "Luxo client SDK — HTTP/2 + WebSocket transport with binary codec, type-safe API calls, and automatic field selection",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -10,11 +10,18 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.mjs",
       "require": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.mjs",
+      "require": "./dist/node.js"
     }
   },
   "files": [
     "dist",
-    "src"
+    "src",
+    "!src/**/*.test.ts",
+    "!src/**/*.bench.ts"
   ],
   "license": "Apache-2.0",
   "keywords": ["luxo", "api", "rpc", "sdk", "binary", "codec", "http2", "websocket", "field-selection"],
@@ -25,17 +32,19 @@
   },
   "homepage": "https://github.com/light-speak/luxo",
   "scripts": {
-    "build": "tsup",
+    "build": "tsdown && tsc -p tsconfig.json && tsc -p tsconfig.node.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.test.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "prepublishOnly": "pnpm build"
   },
   "peerDependencies": {
-    "typescript": ">=5.0"
+    "typescript": ">=7.0 <8"
   },
   "devDependencies": {
-    "tsup": "^8.5.1",
-    "typescript": "^6.0.3",
-    "vitest": "^3.2.4"
+    "@types/node": "^26.5.1",
+    "tsdown": "^0.23.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
   }
 }

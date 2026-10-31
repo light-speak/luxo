@@ -217,20 +217,17 @@ func (a *Analyzer) checkModelTypeRefs(file *ast.File, mi *ModuleInfo) {
 func (a *Analyzer) checkDeclTypeRefs(file *ast.File, mi *ModuleInfo) {
 	for _, api := range file.APIs {
 		a.checkTypeRefVisibility(api.ReturnType, mi, api.Pos)
-		for _, p := range api.Params {
-			a.checkTypeRefVisibility(p.Type, mi, p.Pos)
-		}
+		a.checkParameterTypeRefs(api.Params, mi)
 	}
 	for _, fn := range file.Functions {
 		a.checkTypeRefVisibility(fn.ReturnType, mi, fn.Pos)
-		for _, p := range fn.Params {
-			a.checkTypeRefVisibility(p.Type, mi, p.Pos)
-		}
+		a.checkParameterTypeRefs(fn.Params, mi)
 	}
 	for _, ev := range file.Events {
-		for _, p := range ev.Params {
-			a.checkTypeRefVisibility(p.Type, mi, p.Pos)
-		}
+		a.checkParameterTypeRefs(ev.Params, mi)
+	}
+	for _, declaration := range file.Errors {
+		a.checkParameterTypeRefs(declaration.Fields, mi)
 	}
 	// sealed variant fields
 	for _, s := range file.Sealeds {
@@ -239,6 +236,12 @@ func (a *Analyzer) checkDeclTypeRefs(file *ast.File, mi *ModuleInfo) {
 				a.checkTypeRefVisibility(f.Type, mi, f.Pos)
 			}
 		}
+	}
+}
+
+func (a *Analyzer) checkParameterTypeRefs(params []*ast.ParamDecl, mi *ModuleInfo) {
+	for _, param := range params {
+		a.checkTypeRefVisibility(param.Type, mi, param.Pos)
 	}
 }
 

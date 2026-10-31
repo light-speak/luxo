@@ -4,10 +4,31 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/token"
 )
 
 // ========== Scope & Lookup Tests ==========
+
+func TestIdentifierNarrowingMetadataIsScopedAndRecomputed(t *testing.T) {
+	analyzer := New()
+	parent := NewScope()
+	nullable := analyzer.types["Boolean"].AsNullable()
+	parent.Define(&Symbol{Name: "value", Kind: SymParam, Type: nullable})
+	guard := parent.Child()
+	guard.Narrow("value", analyzer.types["Boolean"])
+	identifier := &ast.Ident{Name: "value"}
+	if actual := analyzer.checkExpr(identifier, guard); !actual.IsNonNullBoolean() || !identifier.NarrowedTag {
+		t.Fatal("guard did not annotate the narrowed read")
+	}
+	if actual := analyzer.checkExpr(identifier, parent); !actual.Nullable || identifier.NarrowedTag {
+		t.Fatal("narrowing survived reanalysis outside its guard")
+	}
+	guard.Define(&Symbol{Name: "value", Kind: SymVariable, Type: nullable})
+	if actual := analyzer.checkExpr(identifier, guard); !actual.Nullable || identifier.NarrowedTag {
+		t.Fatal("shadowed declaration inherited the old guard")
+	}
+}
 
 func TestScopeLookup(t *testing.T) {
 	scope := NewScope()
@@ -44,6 +65,26 @@ func TestTypeNarrowing(t *testing.T) {
 	resolved = scope.ResolvedTypeOf("user")
 	if resolved.Nullable {
 		t.Error("expected non-null after narrowing")
+	}
+}
+
+func TestNarrowedTypeStopsAtShadowingBinding(t *testing.T) {
+	outer := NewScope()
+	text := &ResolvedType{Kind: TypeString, Name: "String"}
+	integer := &ResolvedType{Kind: TypeInt, Name: "Int"}
+	outer.Define(&Symbol{Name: "value", Type: text.AsNullable()})
+	outer.Narrow("value", text)
+	inherited := outer.Child()
+	if inherited.ResolvedTypeOf("value") != text {
+		t.Fatal("unshadowed narrowing was lost")
+	}
+	inner := inherited.Child()
+	inner.Define(&Symbol{Name: "value", Type: integer})
+	if inner.ResolvedTypeOf("value") != integer || inner.Child().ResolvedTypeOf("value") != integer {
+		t.Fatal("outer narrowing replaced the inner binding")
+	}
+	if inner.ResolvedTypeOf("missing") != nil {
+		t.Fatal("missing binding gained a type")
 	}
 }
 
@@ -88,6 +129,59 @@ func TestEditDistanceEmptyStrings(t *testing.T) {
 	}
 	if d := editDistance("", ""); d != 0 {
 		t.Errorf("editDistance('', '') = %d, want 0", d)
+	}
+}
+
+func TestEditDistanceBufferBoundary(t *testing.T) {
+	for _, size := range []int{1, 63, 64, 65, 128} {
+		left := strings.Repeat("a", size)
+		right := strings.Repeat("a", size-1) + "b"
+		for _, pair := range [][2]string{{left, right}, {right, left}} {
+			if got := editDistance(pair[0], pair[1]); got != 1 {
+				t.Fatalf("length %d: distance = %d, want 1", size, got)
+			}
+		}
+		if got := editDistance(left, left+"xyz"); got != 3 {
+			t.Fatalf("length %d: insertion distance = %d, want 3", size, got)
+		}
+	}
+}
+
+func TestEditDistanceShortNamesDoNotAllocate(t *testing.T) {
+	var distance int
+	allocations := testing.AllocsPerRun(100, func() {
+		distance = editDistance("UserProfile", "UserProfiel")
+	})
+	if distance != 2 || allocations != 0 {
+		t.Fatalf("distance = %d, allocations = %g; want 2 and 0", distance, allocations)
+	}
+}
+
+func TestEditDistanceMatchesMatrix(t *testing.T) {
+	words := []string{"", "a", "b", "aa", "ab", "ba", "bb", "aba", "aab", "baa", "abcd", "dcba"}
+	for _, left := range words {
+		for _, right := range words {
+			width := len(right) + 1
+			matrix := make([]int, (len(left)+1)*width)
+			for i := 0; i <= len(left); i++ {
+				matrix[i*width] = i
+			}
+			for j := 0; j <= len(right); j++ {
+				matrix[j] = j
+			}
+			for i := 1; i <= len(left); i++ {
+				for j := 1; j <= len(right); j++ {
+					cost := 0
+					if left[i-1] != right[j-1] {
+						cost = 1
+					}
+					matrix[i*width+j] = min(matrix[(i-1)*width+j]+1, matrix[i*width+j-1]+1, matrix[(i-1)*width+j-1]+cost)
+				}
+			}
+			if got, want := editDistance(left, right), matrix[len(matrix)-1]; got != want {
+				t.Fatalf("%q/%q: got %d, want %d", left, right, got, want)
+			}
+		}
 	}
 }
 

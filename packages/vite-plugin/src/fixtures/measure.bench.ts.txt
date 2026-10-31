@@ -1,0 +1,22 @@
+type Operation = () => unknown
+let sink: unknown
+
+export function measure(name: string, before: Operation, after: Operation): void {
+  const format = (value: unknown) => JSON.stringify(value, (_, item: unknown) =>
+    typeof item === 'bigint' ? item.toString() : item)
+  if (format(before()) !== format(after())) throw new Error(`${name}: unequal results`)
+  const batch = (operation: Operation) => {
+    const start = performance.now()
+    for (let iteration = 0; iteration < 5000; iteration++) sink = operation()
+    return (performance.now() - start) * 1e6 / 5000
+  }
+  for (let warmup = 0; warmup < 20; warmup++) {
+    if (warmup % 2) { batch(after); batch(before) } else { batch(before); batch(after) }
+  }
+  const beforeNs: number[] = [], afterNs: number[] = []
+  for (let sample = 0; sample < 20; sample++) {
+    if (sample % 2) { afterNs.push(batch(after)); beforeNs.push(batch(before)) }
+    else { beforeNs.push(batch(before)); afterNs.push(batch(after)) }
+  }
+  console.log(JSON.stringify({ name, beforeNs, afterNs, resultPresent: sink !== undefined }))
+}

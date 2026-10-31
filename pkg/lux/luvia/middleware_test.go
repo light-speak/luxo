@@ -18,9 +18,27 @@ func testCfg() *auth.Config {
 	}
 }
 
+func testClaimsJSON(raw string) auth.ClaimsWriter {
+	return func(dst []byte) ([]byte, error) { return append(dst, raw...), nil }
+}
+
+func testIdentity(t testing.TB, raw string) *Claims {
+	t.Helper()
+	cfg := testCfg()
+	token, err := auth.Sign(cfg, testClaimsJSON(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := auth.Verify(cfg, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &claims
+}
+
 func TestAuthMiddlewareValidToken(t *testing.T) {
 	cfg := testCfg()
-	token, _ := auth.Sign(cfg, map[string]any{"id": float64(42), "role": "admin"})
+	token, _ := auth.Sign(cfg, testClaimsJSON(`{"id":42,"role":"admin"}`))
 
 	var gotIdentity *Claims
 	var gotToken string
@@ -51,20 +69,138 @@ func TestAuthMiddlewareValidToken(t *testing.T) {
 	}
 }
 
+func TestRefreshTokenCannotEstablishRequestIdentity(t *testing.T) {
+	auth.ResetConfig()
+	auth.ResetVerifyCache()
+	t.Cleanup(auth.ResetConfig)
+	t.Cleanup(auth.ResetVerifyCache)
+	t.Setenv("JWT_SECRET", "refresh-boundary-test")
+	t.Setenv("JWT_REFRESH", "true")
+	cfg, err := auth.LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := auth.SignRefresh(cfg, testClaimsJSON(`{"id":9007199254740993}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := auth.VerifyRefresh(cfg, token); err != nil {
+		t.Fatal(err)
+	}
+	handler := AuthMiddleware(cfg, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if Identity(r.Context()) != nil || BearerToken(r.Context()) != "" {
+			t.Error("refresh token established an access identity")
+		}
+	}))
+	for _, websocket := range []bool{false, true} {
+		r := httptest.NewRequest("GET", "/luvia", nil)
+		if websocket {
+			r.Header.Set("Upgrade", "websocket")
+			r.URL.RawQuery = "token=" + url.QueryEscape(token)
+		} else {
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
+		for range 2 {
+			handler.ServeHTTP(httptest.NewRecorder(), r)
+		}
+	}
+	if ctx, err := internalRequestContext(t.Context(), token); err == nil || ctx != nil {
+		t.Fatal("internal RPC accepted refresh as access")
+	}
+}
+
+func TestInternalRequestContextPreservesExactIdentity(t *testing.T) {
+	auth.ResetConfig()
+	auth.ResetVerifyCache()
+	t.Cleanup(auth.ResetConfig)
+	t.Cleanup(auth.ResetVerifyCache)
+	t.Setenv("JWT_SECRET", "internal-context-test")
+	cfg, err := auth.LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := auth.Sign(cfg, testClaimsJSON(`{"id":9007199254740993,"role":"ADMIN"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		ctx, err := internalRequestContext(t.Context(), token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		claims := Identity(ctx)
+		if claims == nil || claims.ID() != 9007199254740993 || claims.String("role") != "ADMIN" || BearerToken(ctx) != token {
+			t.Fatal("internal request lost exact identity or bearer token")
+		}
+	}
+	auth.ResetConfig()
+	t.Setenv("JWT_SECRET", " ")
+	if ctx, err := internalRequestContext(t.Context(), token); ctx != nil || err == nil {
+		t.Fatal("invalid signing configuration accepted an internal request")
+	}
+}
 func TestNewGatewayConfiguresStreamIdentityExtraction(t *testing.T) {
 	gateway := New()
-	claims := &Claims{data: map[string]any{"id": float64(42)}}
+	claims := testIdentity(t, `{"id":42}`)
 	ctx := context.WithValue(context.Background(), identityKey, claims)
 
 	got := gateway.Router.IdentityExtractor(ctx)
 	if got != claims {
 		t.Fatalf("stream identity = %#v, want authenticated claims", got)
 	}
+	for _, anonymous := range []context.Context{
+		context.Background(),
+		context.WithValue(context.Background(), identityKey, (*Claims)(nil)),
+	} {
+		if got := gateway.Router.IdentityExtractor(anonymous); got != nil {
+			t.Fatalf("anonymous stream identity must be a nil interface, got %T", got)
+		}
+	}
+}
+
+// The historical extractor returns a typed nil for anonymous requests. It is
+// retained only as a local performance reference, not an equivalent safe API.
+func BenchmarkGatewayIdentity(b *testing.B) {
+	identity := testIdentity(b, `{"id":42}`)
+	for _, sample := range []struct {
+		name string
+		ctx  context.Context
+		want *Claims
+	}{
+		{"anonymous", context.Background(), nil},
+		{"authenticated", context.WithValue(context.Background(), identityKey, identity), identity},
+		{"typed-nil", context.WithValue(context.Background(), identityKey, (*Claims)(nil)), nil},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			for _, candidate := range []struct {
+				name string
+				read func(context.Context) any
+			}{
+				{"before", func(ctx context.Context) any { return Identity(ctx) }},
+				{"after", New().Router.IdentityExtractor},
+			} {
+				b.Run(candidate.name, func(b *testing.B) {
+					var want any = sample.want
+					if candidate.name == "after" && sample.want == nil {
+						want = nil
+					}
+					var got any
+					b.ReportAllocs()
+					for b.Loop() {
+						got = candidate.read(sample.ctx)
+					}
+					if got != want {
+						b.Fatal("unexpected extracted identity")
+					}
+				})
+			}
+		})
+	}
 }
 
 func TestAuthMiddlewareAcceptsWebSocketQueryToken(t *testing.T) {
 	cfg := testCfg()
-	token, _ := auth.Sign(cfg, map[string]any{"id": float64(42)})
+	token, _ := auth.Sign(cfg, testClaimsJSON(`{"id":42}`))
 	var identity *Claims
 	handler := AuthMiddleware(cfg, http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		identity = Identity(r.Context())
@@ -80,7 +216,7 @@ func TestAuthMiddlewareAcceptsWebSocketQueryToken(t *testing.T) {
 
 func TestAuthMiddlewareRejectsHTTPQueryToken(t *testing.T) {
 	cfg := testCfg()
-	token, _ := auth.Sign(cfg, map[string]any{"id": float64(42)})
+	token, _ := auth.Sign(cfg, testClaimsJSON(`{"id":42}`))
 	var identity *Claims
 	handler := AuthMiddleware(cfg, http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		identity = Identity(r.Context())
@@ -135,7 +271,7 @@ func TestAuthMiddlewareInvalidToken(t *testing.T) {
 
 func TestAuthMiddlewareBearerCaseInsensitive(t *testing.T) {
 	cfg := testCfg()
-	token, _ := auth.Sign(cfg, map[string]any{"id": float64(1)})
+	token, _ := auth.Sign(cfg, testClaimsJSON(`{"id":1}`))
 
 	var gotIdentity *Claims
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -185,13 +321,7 @@ func TestExtractBearerTokenShort(t *testing.T) {
 }
 
 func TestClaimsAccessors(t *testing.T) {
-	c := &Claims{data: map[string]any{
-		"id":      float64(42),
-		"role":    "admin",
-		"active":  true,
-		"balance": float64(99.5),
-		"count":   int64(7),
-	}}
+	c := testIdentity(t, `{"id":42,"role":"admin","active":true,"balance":99.5,"count":7}`)
 
 	if c.ID() != 42 {
 		t.Errorf("ID() = %d, want 42", c.ID())
@@ -214,20 +344,20 @@ func TestClaimsAccessors(t *testing.T) {
 	if c.Has("missing") {
 		t.Error("Has(missing) should be false")
 	}
-	if c.Get("role") != "admin" {
+	if value, ok := c.Get("role").String(); !ok || value != "admin" {
 		t.Errorf("Get(role) = %v", c.Get("role"))
 	}
-	if c.Get("missing") != nil {
-		t.Error("Get(missing) should be nil")
+	if c.Get("missing").Raw() != "" {
+		t.Error("Get(missing) should be absent")
 	}
 	raw := c.Raw()
-	if raw["id"] != float64(42) {
-		t.Error("Raw() should return underlying map")
+	if raw != `{"id":42,"role":"admin","active":true,"balance":99.5,"count":7}` {
+		t.Error("Raw() should preserve immutable JSON text")
 	}
 }
 
 func TestClaimsZeroValues(t *testing.T) {
-	c := &Claims{data: map[string]any{}}
+	c := &Claims{}
 
 	if c.ID() != 0 {
 		t.Errorf("ID() on empty = %d, want 0", c.ID())
@@ -246,16 +376,15 @@ func TestClaimsZeroValues(t *testing.T) {
 	}
 }
 
-func TestClaimsIntFromFloat(t *testing.T) {
-	// JSON numbers decode as float64
-	c := &Claims{data: map[string]any{"id": float64(123)}}
-	if c.Int("id") != 123 {
-		t.Errorf("Int from float64 = %d, want 123", c.Int("id"))
+func TestClaimsIntRejectsFloat(t *testing.T) {
+	c := testIdentity(t, `{"id":123.5}`)
+	if c.Int("id") != 0 {
+		t.Errorf("fraction was truncated to %d", c.Int("id"))
 	}
 }
 
 func TestClaimsFloatFromInt(t *testing.T) {
-	c := &Claims{data: map[string]any{"count": int64(10)}}
+	c := testIdentity(t, `{"count":10}`)
 	if c.Float("count") != 10.0 {
 		t.Errorf("Float from int64 = %f, want 10.0", c.Float("count"))
 	}

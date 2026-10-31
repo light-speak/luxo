@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -8,6 +9,74 @@ import (
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
 )
+
+func TestWriteObjectArrayItemsPropagatesEncodingError(t *testing.T) {
+	var output strings.Builder
+	writeScalarArrayItems(&output, "Snapshot", false, "items", "\t")
+	for _, want := range []string{
+		"codec.AppendArrayHeader(buf.B, len(items))",
+		"for i := range items",
+		"items[i].WriteLuxo(buf, nil)",
+		"return err",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("object array encoding missing %q: %s", want, output.String())
+		}
+	}
+}
+
+func TestWriteScalarEncodingPreservesOutput(t *testing.T) {
+	for _, scalar := range []struct{ name, call, value, pointer string }{
+		{"Int", "AppendSvarint", "item.Value", "*item.Value"},
+		{"Float", "AppendFixed64", "item.Value", "*item.Value"},
+		{"String", "AppendString", "item.Value", "*item.Value"},
+		{"Boolean", "AppendBool", "item.Value", "*item.Value"},
+		{"DateTime", "AppendDateTime", "item.Value", "*item.Value"},
+		{"Duration", "AppendSvarint", "int64(item.Value)", "int64(*item.Value)"},
+		{"UUID", "AppendUUID", "[16]byte(item.Value)", "[16]byte(*item.Value)"},
+		{"Decimal", "AppendString", "item.Value.String()", "item.Value.String()"},
+		{"Bytes", "AppendBytes", "item.Value", "*item.Value"},
+		{"JSON", "AppendJSON", "item.Value", "*item.Value"},
+	} {
+		for _, nullable := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/nullable=%t", scalar.name, nullable), func(t *testing.T) {
+				value, indent := scalar.value, "\t"
+				want := "prefix\n\tbuf.B = codec.AppendVarint(buf.B, 7)\n"
+				if nullable {
+					value, indent = scalar.pointer, "\t\t"
+					want += "\tif item.Value != nil {\n\t\tbuf.B = codec.AppendPresent(buf.B)\n"
+				}
+				call := fmt.Sprintf("codec.%s(buf.B, %s)", scalar.call, value)
+				switch scalar.name {
+				case "Float", "String", "DateTime", "Decimal", "JSON":
+					want += indent + "if encoded, err := " + call + "; err != nil { return err } else { buf.B = encoded }\n"
+				default:
+					want += indent + "buf.B = " + call + "\n"
+				}
+				if nullable {
+					want += "\t} else {\n\t\tbuf.B = codec.AppendNull(buf.B)\n\t}\n"
+				}
+				var output strings.Builder
+				output.WriteString("prefix\n")
+				writeScalarEncoding(&output, scalar.name, nullable, "7", "item.Value", "\t")
+				if output.String() != want {
+					t.Fatalf("encoding changed:\ngot %q\nwant %q", output.String(), want)
+				}
+			})
+		}
+	}
+}
+
+func TestWriteScalarEncodingLeavesUnsupportedTypeUnchanged(t *testing.T) {
+	for _, nullable := range []bool{false, true} {
+		var output strings.Builder
+		output.WriteString("prefix")
+		writeScalarEncoding(&output, "NestedModel", nullable, "7", "item.Value", "\t")
+		if output.String() != "prefix" {
+			t.Fatal("non-scalar dispatch emitted a partial scalar")
+		}
+	}
+}
 
 func TestGenerateWriteJSONFileNoModels(t *testing.T) {
 	generator := defaultGenerator()
@@ -61,7 +130,7 @@ func TestReadLuxoAllocatesNonNullableNestedModel(t *testing.T) {
 	var builder strings.Builder
 	generator.generateReadLuxo(&builder, model, nil)
 	code := builder.String()
-	if !strings.Contains(code, "p.Owner = &User{}") || !strings.Contains(code, "p.Owner.ReadLuxo(dec)") {
+	if !strings.Contains(code, "p.Owner = &User{}") || !strings.Contains(code, "p.Owner.ReadLuxo(_child)") {
 		t.Fatalf("non-nullable nested decoder must allocate its pointer before decoding:\n%s", code)
 	}
 }
@@ -136,8 +205,8 @@ func TestGenerateWriteLuxoDateTimeField(t *testing.T) {
 	src := generator.generateWriteJSONFile(result, "app", nil)
 	code := string(src)
 
-	if !strings.Contains(code, ".Unix()") {
-		t.Errorf("DateTime should use .Unix():\n%s", code)
+	if !strings.Contains(code, "codec.AppendDateTime(") || strings.Contains(code, ".Unix()") {
+		t.Errorf("DateTime must preserve nanoseconds:\n%s", code)
 	}
 	if !strings.Contains(code, "int64(") {
 		t.Errorf("Duration should cast to int64:\n%s", code)
@@ -367,9 +436,9 @@ func TestWriteMaskDirective_Default(t *testing.T) {
 func TestWriteColumnarMaskedStringField(t *testing.T) {
 	var b strings.Builder
 	field := &ast.FieldDecl{Name: "secret", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "mask"}}}
-	writeColumnarMaskedStringField(&b, field, "Secret", 3)
+	writeDirectColumn(&b, directColumn{field: field, id: 3, stringValue: true}, nil, true)
 	code := b.String()
-	if !strings.Contains(code, "str.Mask(item.Secret, 3, 4)") || !strings.Contains(code, "WriteColumnString(3, vals)") {
+	if !strings.Contains(code, "str.Mask(items[_row].Secret, 3, 4)") || !strings.Contains(code, "codec.AppendString(buf.B, v)") {
 		t.Fatalf("masked columnar field is incomplete:\n%s", code)
 	}
 }
@@ -383,9 +452,9 @@ func TestWriteColumnarMaskedStringFieldWithPattern(t *testing.T) {
 			{Value: &ast.Literal{Kind: token.String, Value: "###****####"}},
 		}}},
 	}
-	writeColumnarMaskedStringField(&b, field, "Phone", 3)
+	writeDirectColumn(&b, directColumn{field: field, id: 3, stringValue: true}, nil, true)
 	code := b.String()
-	if !strings.Contains(code, `str.MaskPattern(item.Phone, "###****####")`) || !strings.Contains(code, "WriteColumnString(3, vals)") {
+	if !strings.Contains(code, `str.MaskPattern(items[_row].Phone, "###****####")`) || !strings.Contains(code, "codec.AppendString(buf.B, v)") {
 		t.Fatalf("pattern-masked columnar field is incomplete:\n%s", code)
 	}
 }
@@ -436,10 +505,10 @@ func TestGenerateWriteColumnarAppliesTransformBeforeMask(t *testing.T) {
 	generator.generateWriteColumnar(&b, model, nil)
 	code := b.String()
 
-	if !strings.Contains(code, "str.Mask(strings.ToUpper(item.Name), 3, 4)") {
+	if !strings.Contains(code, "str.Mask(strings.ToUpper(items[_row].Name), 3, 4)") {
 		t.Fatalf("columnar writer must transform before masking:\n%s", code)
 	}
-	if !strings.Contains(code, "w.WriteColumnString(1, vals)") {
+	if !strings.Contains(code, "buf.B = codec.AppendVarint(buf.B, 1)") || !strings.Contains(code, "_arenaSize += len(v)") {
 		t.Fatalf("transformed values must stay columnar:\n%s", code)
 	}
 }
@@ -459,10 +528,10 @@ func TestGenerateWriteColumnarNullableTransform(t *testing.T) {
 	result := &semantic.Result{Files: []*ast.File{{Models: []*ast.ModelDecl{model}}}}
 	code := string(generator.generateWriteJSONFile(result, "app", nil))
 
-	if !strings.Contains(code, "if item.Nickname != nil { v := strings.TrimSpace(*item.Nickname); vals[i] = &v }") {
+	if !strings.Contains(code, "if items[_row].Nickname == nil { buf.B = codec.AppendNull(buf.B); continue }") || !strings.Contains(code, "v := strings.TrimSpace(*items[_row].Nickname)") {
 		t.Fatalf("nullable transform must preserve nulls:\n%s", code)
 	}
-	if !strings.Contains(code, "w.WriteColumnStringPtr(1, vals)") {
+	if !strings.Contains(code, "buf.B = codec.AppendPresent(buf.B)") {
 		t.Fatalf("nullable transform must use the nullable column encoding:\n%s", code)
 	}
 	if !strings.Contains(code, "if u.Nickname != nil { nicknameTransformedValue := strings.TrimSpace(*u.Nickname)") {
@@ -492,7 +561,7 @@ func TestGenerateWriteColumnarHonorsVisible(t *testing.T) {
 	if !strings.Contains(code, condition) {
 		t.Fatalf("columnar writer must omit invisible columns:\n%s", code)
 	}
-	if !strings.Contains(code, "w.WriteColumnFloatPtr(1, vals)") {
+	if !strings.Contains(code, "if items[_row].Salary == nil { buf.B = codec.AppendNull(buf.B); continue }") || !strings.Contains(code, "codec.AppendFixed64(buf.B, v)") {
 		t.Fatalf("visible nullable field must preserve nullable column encoding:\n%s", code)
 	}
 }
@@ -872,16 +941,16 @@ func TestGenerateTypeWriteColumnar(t *testing.T) {
 	if !strings.Contains(out, "func WriteColumnarServiceSummary(buf *api.ResponseBuf, items []ServiceSummary, mask []byte)") {
 		t.Errorf("should take value slice: %s", out)
 	}
-	if !strings.Contains(out, "w.WriteColumnString(1, vals)") {
+	if !strings.Contains(out, "v := items[_row].ServiceName") || !strings.Contains(out, "codec.AppendString(buf.B, v)") {
 		t.Errorf("should write serviceName column: %s", out)
 	}
-	if !strings.Contains(out, "w.WriteColumnInt(2, vals)") {
+	if !strings.Contains(out, "var v int64 = items[_row].ApiCount") {
 		t.Errorf("should write apiCount column: %s", out)
 	}
-	if !strings.Contains(out, "WriteColumnStringPtr(3, vals)") {
+	if !strings.Contains(out, "if items[_row].Version == nil { buf.B = codec.AppendNull(buf.B); continue }") {
 		t.Errorf("should write nullable version column: %s", out)
 	}
-	if !strings.Contains(out, "w.WriteColumnBytes(4, cells)") {
+	if !strings.Contains(out, "values := items[_row].Tags") || !strings.Contains(out, "buf.EndMessage(_frame)") {
 		t.Errorf("should write list tags column: %s", out)
 	}
 }
@@ -929,7 +998,7 @@ func TestGenerateTypeOutputDirectives(t *testing.T) {
 	if !strings.Contains(code, "displayNameTransformed := strings.TrimSpace(p.DisplayName)") {
 		t.Fatalf("type row writer must apply @transform:\n%s", code)
 	}
-	if !strings.Contains(code, "vals[i] = strings.TrimSpace(item.DisplayName)") {
+	if !strings.Contains(code, "v := strings.TrimSpace(items[_row].DisplayName)") {
 		t.Fatalf("type columnar writer must apply @transform:\n%s", code)
 	}
 	if !strings.Contains(code, `if api.IdentityString(buf.Identity, "role") == "admin" {`) {
@@ -938,7 +1007,7 @@ func TestGenerateTypeOutputDirectives(t *testing.T) {
 	if !strings.Contains(code, "secretMaskedValue := str.Mask(*p.Secret, 3, 4)") {
 		t.Fatalf("type row writer must mask nullable strings:\n%s", code)
 	}
-	if strings.Contains(code, "p.Hidden") || strings.Contains(code, "item.Hidden") {
+	if strings.Contains(code, "p.Hidden") || strings.Contains(code, "items[_row].Hidden") {
 		t.Fatalf("type writers must omit hidden fields:\n%s", code)
 	}
 }
@@ -965,7 +1034,7 @@ func TestGenerateTypeWriteColumnarNestedList(t *testing.T) {
 	if !strings.Contains(out, "WriteColumnarMetricPoint(") {
 		t.Errorf("nested list cell should encode via nested columnar writer: %s", out)
 	}
-	if !strings.Contains(out, "w.WriteColumnBytes(2, vals)") {
+	if !strings.Contains(out, "_frame := buf.BeginMessage()") || !strings.Contains(out, "buf.EndMessage(_frame)") {
 		t.Errorf("nested list should be a blob column: %s", out)
 	}
 }
@@ -990,19 +1059,20 @@ func TestGenerateTypeWriteColumnarNestedSingle(t *testing.T) {
 	if !strings.Contains(out, ".WriteLuxo(") {
 		t.Errorf("nested single cell should encode via WriteLuxo: %s", out)
 	}
-	if !strings.Contains(out, "w.WriteColumnBytes(2, vals)") {
+	if !strings.Contains(out, "_frame := buf.BeginMessage()") || !strings.Contains(out, "buf.EndMessage(_frame)") {
 		t.Errorf("nested single should be a blob column: %s", out)
 	}
 }
 
 func TestGenerateTypeWriteColumnarNestedNullable(t *testing.T) {
 	var b strings.Builder
-	writeColumnarNestedBlobField(&b, "Child", 4, &ast.TypeRef{Name: "Child", Nullable: true}, "selectionMask")
+	field := &ast.FieldDecl{Name: "child", Type: &ast.TypeRef{Name: "Child", Nullable: true}}
+	writeDirectColumn(&b, directColumn{field: field, id: 4, relation: true}, nil, false)
 	code := b.String()
-	if !strings.Contains(code, "if items[i].Child != nil") || !strings.Contains(code, "items[i].Child.WriteLuxo") {
+	if !strings.Contains(code, "if items[_row].Child == nil { buf.B = codec.AppendNull(buf.B); continue }") || !strings.Contains(code, "items[_row].Child.WriteLuxo") {
 		t.Fatalf("nullable nested type must preserve null cells:\n%s", code)
 	}
-	if !strings.Contains(code, "w.WriteColumnBytesPtr(4, vals)") {
+	if !strings.Contains(code, "buf.B = codec.AppendPresent(buf.B)") || !strings.Contains(code, "buf.EndMessage(_frame)") {
 		t.Fatalf("nullable nested type must use canonical nullable column encoding:\n%s", code)
 	}
 }
@@ -1025,7 +1095,7 @@ func TestGenerateModelBinaryWritersIncludeRelations(t *testing.T) {
 	rowCode := row.String()
 	if !strings.Contains(rowCode, "_childMask2, _ := codec.SelectionMaskNested(selectionMask, 2)") ||
 		!strings.Contains(rowCode, "p.Child.WriteLuxo(buf, _childMask2)") ||
-		!strings.Contains(rowCode, "p.Children[i].WriteLuxo(buf, _childMask3)") {
+		!strings.Contains(rowCode, "WriteColumnarChildValues(buf, p.Children, _childMask3)") {
 		t.Fatalf("model row writer must encode selected relations:\n%s", rowCode)
 	}
 	if strings.Contains(rowCode, "p.Children[i].WriteLuxo(buf, nil)") {
@@ -1035,7 +1105,7 @@ func TestGenerateModelBinaryWritersIncludeRelations(t *testing.T) {
 	var columnar strings.Builder
 	generator.generateWriteColumnar(&columnar, model, nil)
 	columnarCode := columnar.String()
-	if !strings.Contains(columnarCode, "WriteColumnarChildValues(&nb, items[i].Children, _childMask3)") {
+	if !strings.Contains(columnarCode, "WriteColumnarChildValues(buf, items[_row].Children, _childMask3)") {
 		t.Fatalf("model list relation must use canonical nested columnar encoding:\n%s", columnarCode)
 	}
 	if !strings.Contains(columnarCode, "if len(selectionMask) > 0 && codec.FieldMaskHas(mask, 3)") {
@@ -1044,7 +1114,7 @@ func TestGenerateModelBinaryWritersIncludeRelations(t *testing.T) {
 	if !strings.Contains(columnarCode, "mask = codec.SelectionMaskFields(mask)") {
 		t.Fatalf("columnar writer must decode the recursive selection node:\n%s", columnarCode)
 	}
-	if !strings.Contains(columnarCode, "w.WriteColumnBytesPtr(2, vals)") {
+	if !strings.Contains(columnarCode, "if items[_row].Child == nil { buf.B = codec.AppendNull(buf.B); continue }") || !strings.Contains(columnarCode, "buf.EndMessage(_frame)") {
 		t.Fatalf("nullable model relation must use nullable byte cells:\n%s", columnarCode)
 	}
 	if !strings.Contains(columnarCode, "func WriteColumnarParentValues(") {
@@ -1065,34 +1135,22 @@ func TestGenerateTypeWriteColumnarNoFields(t *testing.T) {
 	}
 }
 
-func TestColumnarWritersIgnoreUnsupportedTypes(t *testing.T) {
-	var valueBuilder strings.Builder
-	writeColumnarValueField(&valueBuilder, "item.Value", 1, "Unsupported", false)
-	if valueBuilder.Len() != 0 {
-		t.Fatalf("unsupported scalar should not generate invalid code: %s", valueBuilder.String())
-	}
-
-	var nullableBuilder strings.Builder
-	writeColumnarNullableValueField(&nullableBuilder, "item.Value", "*item.Value", 1, "Unsupported", false)
-	if nullableBuilder.Len() != 0 {
-		t.Fatalf("unsupported nullable scalar should not generate invalid code: %s", nullableBuilder.String())
-	}
-}
-
 func TestWriteColumnarArrayFieldAllScalarTypes(t *testing.T) {
-	types := []string{"Float", "Boolean", "DateTime", "Duration", "Decimal", "Bytes", "JSON", "Unsupported"}
+	types := []string{"Float", "Boolean", "DateTime", "Duration", "Decimal", "Bytes", "JSON"}
 	var b strings.Builder
-	for id, typeName := range types {
-		writeColumnarArrayField(&b, "item.Values", id+1, typeName, false)
+	for _, typeName := range types {
+		field := &ast.FieldDecl{Name: "values", Type: &ast.TypeRef{Name: typeName, IsList: true}}
+		writeDirectArrayColumn(&b, field, "items[_row].Values", nil)
 	}
 	code := b.String()
 	checks := []string{
-		"codec.AppendFixed64(cb, v)",
-		"codec.AppendBool(cb, v)",
-		"codec.AppendSvarint(cb, v.Unix())",
-		"codec.AppendSvarint(cb, int64(v))",
-		"codec.AppendString(cb, v.String())",
-		"codec.AppendBytes(cb, v)",
+		"codec.AppendFixed64(buf.B, v)",
+		"codec.AppendBool(buf.B, v)",
+		"codec.AppendDateTime(buf.B, v)",
+		"codec.AppendSvarint(buf.B, int64(v))",
+		"codec.AppendString(buf.B, v.String())",
+		"codec.AppendBytes(buf.B, v)",
+		"codec.AppendJSON(buf.B, v)",
 	}
 	for _, check := range checks {
 		if !strings.Contains(code, check) {
@@ -1139,7 +1197,10 @@ func TestGenerateWriteLuxoUUIDDecimalBytesJSON(t *testing.T) {
 		t.Errorf("Decimal should use .String():\n%s", code)
 	}
 	if !strings.Contains(code, "AppendBytes") {
-		t.Errorf("Bytes/JSON should use AppendBytes:\n%s", code)
+		t.Errorf("Bytes should use AppendBytes:\n%s", code)
+	}
+	if !strings.Contains(code, "AppendJSON") || !strings.Contains(code, "ReadJSON()") || !strings.Contains(code, "ReadJSONPtr()") {
+		t.Errorf("JSON should use validated raw-value readers and writers:\n%s", code)
 	}
 
 	// ReadLuxo checks
@@ -1160,17 +1221,17 @@ func TestGenerateWriteLuxoUUIDDecimalBytesJSON(t *testing.T) {
 	}
 
 	// WriteColumnar checks
-	if !strings.Contains(code, "WriteColumnUUID") {
-		t.Errorf("UUID columnar should use WriteColumnUUID (16-byte fixed):\n%s", code)
+	if !strings.Contains(code, "codec.AppendUUID(buf.B, [16]byte(v))") {
+		t.Errorf("UUID columnar should use 16-byte fixed encoding:\n%s", code)
 	}
-	if !strings.Contains(code, "WriteColumnUUIDPtr") {
-		t.Errorf("nullable UUID columnar should use WriteColumnUUIDPtr:\n%s", code)
+	if !strings.Contains(code, "if items[_row].OptUuid == nil { buf.B = codec.AppendNull(buf.B); continue }") {
+		t.Errorf("nullable UUID columnar should preserve null cells:\n%s", code)
 	}
-	if !strings.Contains(code, "WriteColumnString") {
-		t.Errorf("Decimal columnar should use WriteColumnString:\n%s", code)
+	if !strings.Contains(code, "v := (items[_row].Price).String()") {
+		t.Errorf("Decimal columnar should encode a string:\n%s", code)
 	}
-	if !strings.Contains(code, "WriteColumnBytes") {
-		t.Errorf("Bytes columnar should use WriteColumnBytes:\n%s", code)
+	if !strings.Contains(code, "v := items[_row].Data") {
+		t.Errorf("Bytes columnar should encode bytes directly:\n%s", code)
 	}
 }
 
@@ -1203,19 +1264,19 @@ func TestGenerateScalarArrayFields(t *testing.T) {
 		// WriteLuxo: array header + per-type item append
 		"codec.AppendArrayHeader(buf.B, len(t.Tags))",
 		"codec.AppendUUID(buf.B, [16]byte(v))", // [UUID]
-		"codec.AppendString(buf.B, string(v))", // [Role] enum
+		"Role(v).AppendLuxo(buf.B)",            // [Role] enum
 		// ReadLuxo: array readers + conversions
 		"dec.ReadStringArray()",
 		"dec.ReadIntArray()",
 		"dec.ReadUUIDArray()",
-		"uuid.UUID(v)",
+		"uuid.UUID(_item)",
 		"make([]Role, len(_a))",
 		"make([]decimal.Decimal, len(_a))",
 		// Columnar: array field encoded as a Bytes column of inline-array cells
-		"w.WriteColumnBytes",
-		"cells := make([][]byte, len(items))",
-		"values := item.Tags",
-		"cb = codec.AppendArrayHeader(cb, len(values))",
+		"_frame := buf.BeginMessage()",
+		"buf.EndMessage(_frame)",
+		"values := items[_row].Tags",
+		"buf.B = codec.AppendArrayHeader(buf.B, len(values))",
 	}
 	for _, c := range checks {
 		if !strings.Contains(code, c) {
@@ -1224,7 +1285,7 @@ func TestGenerateScalarArrayFields(t *testing.T) {
 	}
 }
 
-func TestGenerateNestedModelListUsesCanonicalArrayHeader(t *testing.T) {
+func TestGenerateNestedModelListSeparatesResponseAndInput(t *testing.T) {
 	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"User": {"id": 1, "posts": 2},
 		"Post": {"id": 1},
@@ -1241,11 +1302,11 @@ func TestGenerateNestedModelListUsesCanonicalArrayHeader(t *testing.T) {
 	}}}}
 
 	code := string(generator.generateWriteJSONFile(result, "app", nil))
-	if !strings.Contains(code, "codec.AppendArrayHeader(buf.B, len(u.Posts))") {
-		t.Fatalf("nested model list must use the canonical unsigned array header:\n%s", code)
+	if !strings.Contains(code, "WriteColumnarPostValues(buf, u.Posts, _childMask2)") || !strings.Contains(code, "buf.EndMessage(_frame2)") {
+		t.Fatalf("nested response list must be length-delimited columnar data:\n%s", code)
 	}
 	if !strings.Contains(code, "_n := dec.ReadArrayLength()") {
-		t.Fatalf("nested model list must read the canonical unsigned array header:\n%s", code)
+		t.Fatalf("nested input list must retain its canonical unsigned array header:\n%s", code)
 	}
 	if strings.Contains(code, "codec.AppendSvarint(buf.B, int64(len(u.Posts)))") {
 		t.Fatalf("nested model list must not zigzag-encode its length:\n%s", code)
@@ -1527,8 +1588,8 @@ func TestReadLuxoAllFieldTypes(t *testing.T) {
 	code := string(src)
 
 	// ReadLuxo should handle DateTime, Duration, Bytes, nullable String, nullable Float
-	if !strings.Contains(code, "time.Unix(dec.ReadInt(), 0)") {
-		t.Errorf("DateTime ReadLuxo missing time.Unix:\n%s", code)
+	if !strings.Contains(code, "dec.ReadDateTime()") {
+		t.Errorf("DateTime ReadLuxo missing precise timestamp reader:\n%s", code)
 	}
 	if !strings.Contains(code, "time.Duration(dec.ReadInt())") {
 		t.Errorf("Duration ReadLuxo missing:\n%s", code)

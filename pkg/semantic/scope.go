@@ -20,6 +20,7 @@ const (
 	SymMiddleware
 	SymScope
 	SymEvent
+	SymQueryRow
 )
 
 var symbolKindNames = map[SymbolKind]string{
@@ -27,7 +28,8 @@ var symbolKindNames = map[SymbolKind]string{
 	SymSealed: "sealed", SymType: "type", SymApi: "api", SymFn: "fn",
 	SymError: "error", SymField: "field", SymParam: "param",
 	SymVariable: "variable", SymMiddleware: "middleware", SymScope: "scope",
-	SymEvent: "event",
+	SymEvent:    "event",
+	SymQueryRow: "query row",
 }
 
 func (k SymbolKind) String() string {
@@ -77,6 +79,7 @@ func (s *Scope) Define(sym *Symbol) bool {
 		return false
 	}
 	s.symbols[sym.Name] = sym
+	delete(s.narrowed, sym.Name)
 	return true
 }
 
@@ -105,12 +108,25 @@ func (s *Scope) Narrow(name string, typ *ResolvedType) {
 	s.narrowed[name] = typ
 }
 
+// Assignment invalidates facts about the same binding, including outer guards.
+func (s *Scope) invalidateNarrowing(name string) {
+	for current := s; current != nil; current = current.parent {
+		delete(current.narrowed, name)
+		if _, owns := current.symbols[name]; owns {
+			return
+		}
+	}
+}
+
 // LookupNarrowed returns the narrowed type for a variable, if any.
 func (s *Scope) LookupNarrowed(name string) *ResolvedType {
 	if s.narrowed != nil {
 		if t, ok := s.narrowed[name]; ok {
 			return t
 		}
+	}
+	if _, shadows := s.symbols[name]; shadows {
+		return nil
 	}
 	if s.parent != nil {
 		return s.parent.LookupNarrowed(name)

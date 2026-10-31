@@ -1,0 +1,88 @@
+package com.luxo.client
+
+import com.luxo.client.unicodebaseline.LuxoEncoder as BeforeEncoder
+import com.luxo.client.unicodebaseline.decodeLuxoJsonString as beforeString
+import com.luxo.client.unicodebaseline.decodeLuxoJsonError as beforeError
+import com.luxo.client.unicodebaseline.luxoUtf8Length as beforeLength
+import java.util.function.LongSupplier
+import kotlinx.serialization.json.*
+
+/** Matched legal inputs, warmed local operations, same compiler and runtime on both sides. */
+object UnicodeBenchmark {
+    @Volatile private var resultSink: Any? = null
+
+    @JvmStatic
+    fun main(args: Array<String>) {
+        println("JDK ${System.getProperty("java.version")}; strict Unicode; ns/op and current-thread B/op")
+        for ((name, text) in linkedMapOf("ascii16" to "abcdefghijklmnop", "chinese24" to "发布检查数据完整",
+            "chinese1026" to "文".repeat(342), "chinese72000" to "文".repeat(24000),
+            "pairs128" to "\uD800\uDC00".repeat(128), "literalEscapes128" to "\\uD800".repeat(128))) {
+            val iterations = if (name == "chinese72000") 300 else 20_000
+            val value = JsonPrimitive(text)
+            PairedJvmBenchmark.compare("readString/$name", LongSupplier { beforeString(value).length.toLong() },
+                LongSupplier { decodeLuxoJsonString(value).length.toLong() }, iterations)
+            check(beforeLength(text) == luxoUtf8Length(text))
+            PairedJvmBenchmark.compare("utf8Length/$name", LongSupplier { beforeLength(text).toLong() },
+                LongSupplier { luxoUtf8Length(text).toLong() }, iterations)
+            json(name, buildJsonObject { put("value", value) }, iterations)
+            binary(name, text, iterations)
+        }
+        val escaped = "{\"value\":\"${"\\uD800\\uDC00".repeat(128)}\"}"
+        compare("decode/escapedPairs128", { Json.parseToJsonElement(escaped) }, { decodeLuxoJSON(escaped) }, 2000)
+        json("objects128", JsonArray(List(128) { buildJsonObject {
+            put("name", "row$it"); put("label", "发布检查"); put("valid", true)
+        } }), 1000)
+        val strings = List(128) { JsonPrimitive("发布检查") }
+        compare("readStringList128", { strings.map(::beforeString) }, { strings.map(::decodeLuxoJsonString) }, 2000)
+        errors()
+        // Array rollback also covers user callbacks; keep a non-string control in the comparison.
+        val ints = List(128) { it.toLong() }
+        compare("writeInts128", { BeforeEncoder(2048).apply { writeFieldArray(1, ints, ::writeSvarint) }.bytes() },
+            { LuxoEncoder(2048).apply { writeFieldArray(1, ints, ::writeSvarint) }.bytes() }, 2000)
+        check(resultSink != null)
+        println("Finished; not network, Android, cold startup or invalid-input measurements")
+    }
+
+    private fun json(name: String, value: JsonElement, iterations: Int) {
+        val text = value.toString()
+        compare("decode/$name", { Json.parseToJsonElement(text) }, { decodeLuxoJSON(text) }, iterations)
+        compare("encode/$name", { value.toString() }, { encodeLuxoJSON(value) }, iterations)
+        compare("checkValue/$name", { value }, { decodeLuxoJsonValue(value) }, iterations)
+    }
+
+    private fun binary(name: String, text: String, iterations: Int) {
+        val capacity = text.toByteArray().size + 32
+        compare("writeString/$name", { BeforeEncoder(capacity).apply { writeString(text) }.bytes() },
+            { LuxoEncoder(capacity).apply { writeString(text) }.bytes() }, iterations)
+        compare("writeFieldString/$name", { BeforeEncoder(capacity).apply { writeFieldString(1, text) }.bytes() },
+            { LuxoEncoder(capacity).apply { writeFieldString(1, text) }.bytes() }, iterations)
+        if (name == "chinese72000") return
+        val values = List(128) { text }
+        compare("writeStrings128/$name", { BeforeEncoder(capacity * 128).apply {
+            writeFieldArray(1, values, ::writeString)
+        }.bytes() }, { LuxoEncoder(capacity * 128).apply {
+            writeFieldArray(1, values, ::writeString)
+        }.bytes() }, 500)
+    }
+
+    private fun errors() {
+        val value = buildJsonObject {
+            put("error", "Rejected"); put("code", 400); put("message", "bad")
+            put("traceId", "trace"); put("cause", "detail"); put("data", buildJsonObject { put("label", "发布检查") })
+        }
+        val before = checkNotNull(beforeError(value, 502))
+        val after = checkNotNull(decodeLuxoJsonError(value, 502))
+        check(before.error == after.error && before.code == after.code && before.message == after.message &&
+            before.traceId == after.traceId && before.developmentCause == after.developmentCause && before.data == after.data)
+        PairedJvmBenchmark.compare("JSONError/withData", LongSupplier { resultSink = beforeError(value, 502); 1L },
+            LongSupplier { resultSink = decodeLuxoJsonError(value, 502); 1L }, 20_000)
+    }
+
+    private fun compare(name: String, before: () -> Any, after: () -> Any, iterations: Int) {
+        val old = before()
+        val next = after()
+        check(if (old is ByteArray && next is ByteArray) old.contentEquals(next) else old == next) { name }
+        PairedJvmBenchmark.compare(name, LongSupplier { resultSink = before(); 1L },
+            LongSupplier { resultSink = after(); 1L }, iterations)
+    }
+}

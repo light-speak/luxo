@@ -1,0 +1,449 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+import 'package:luxo_client/luxo_client.dart' as sdk;
+import 'package:test/test.dart';
+
+import 'client.dart';
+import 'types.dart';
+
+part 'response_consumer.dart';
+part 'nullable_root_consumer.dart';
+part 'json_kind_consumer.dart';
+part 'json_projection_consumer.dart';
+part 'stream_isolation_consumer.dart';
+
+void main() {
+  verifyScalarResponses();
+  verifyNullableRoots();
+  verifyJSONKinds();
+  verifyJSONProjection();
+  verifyStreamIsolation();
+  final maximum = sdk.LuxoInt64.maxValue;
+  final minimum = sdk.LuxoInt64.minValue;
+
+  test(
+    'every generated scalar API validates complete binary responses',
+    () async {
+      var response = Uint8List(0);
+      final client = _binaryClient(() => response);
+      addTearDown(client.close);
+      final cases = <(Future<Object> Function(), List<int>, Object)>[
+        (client.scalarInt, [0], sdk.LuxoInt64.zero),
+        (client.scalarDuration, [0], sdk.LuxoInt64.zero),
+        (client.scalarFloat, List.filled(8, 0), 0.0),
+        (client.scalarString, [0], ''),
+        (client.scalarBoolean, [0], false),
+        (client.scalarDateTime, [0, 0], '1970-01-01T00:00:00Z'),
+        (
+          client.scalarUUID,
+          List.filled(16, 0),
+          '00000000-0000-0000-0000-000000000000',
+        ),
+        (client.scalarBytes, [0], Uint8List(0)),
+        (client.scalarDecimal, [1, 48], '0'),
+        (client.scalarEnum, [4, 79, 80, 69, 78], TaskStatusKnown.OPEN),
+        (client.scalarJSON, [5, 102, 97, 108, 115, 101], false),
+      ];
+      for (final (call, bytes, expected) in cases) {
+        response = Uint8List.fromList(bytes);
+        expect(await call(), expected);
+        for (final invalid in <List<int>>[
+          [],
+          [...bytes, 99],
+        ]) {
+          response = Uint8List.fromList(invalid);
+          await expectLater(call(), throwsFormatException);
+        }
+      }
+    },
+  );
+
+  test(
+    'every generated scalar-array API validates complete binary responses',
+    () async {
+      var response = Uint8List(0);
+      final client = _binaryClient(() => response);
+      addTearDown(client.close);
+      final calls = <Future<Object> Function()>[
+        client.arrayInt,
+        client.arrayDuration,
+        client.arrayFloat,
+        client.arrayString,
+        client.arrayBoolean,
+        client.arrayDateTime,
+        client.arrayUUID,
+        client.arrayBytes,
+        client.arrayDecimal,
+        client.arrayEnum,
+        client.arrayJSON,
+      ];
+      final cells = _scalarArrayCells();
+      final expected = <Object?>[..._scalarArrayJSON().values];
+      expected[0] = [minimum, maximum];
+      expected[1] = [minimum, maximum];
+      expected[7] = [
+        Uint8List(0),
+        Uint8List.fromList([1, 255]),
+      ];
+      expected[9] = (expected[9] as List<String>).map(TaskStatus.fromValue).toList();
+      for (var index = 0; index < calls.length; index++) {
+        response = cells[index];
+        expect(await calls[index](), expected[index]);
+        for (final invalid in <List<int>>[
+          [],
+          [1],
+          [...cells[index], 99],
+        ]) {
+          response = Uint8List.fromList(invalid);
+          await expectLater(calls[index](), throwsFormatException);
+        }
+      }
+    },
+  );
+
+  test(
+    'all generated scalar arrays agree across JSON, rows, columns and pages',
+    () {
+      final expected = _scalarArrayJSON();
+      final input = ScalarArraysInput.fromJson(expected);
+      expect(input.toJson(), expected);
+      final row = sdk.LuxoEncoder();
+      input.writeLuxo(row);
+      expect(
+        decodeScalarArrays(sdk.LuxoDecoder(row.bytes())).toJson(),
+        expected,
+      );
+      expect(ScalarArrays.fromJson(expected).toJson(), expected);
+      final columns = sdk.LuxoEncoder()
+        ..writeVarint(1)
+        ..writeVarint(0);
+      final cells = _scalarArrayCells();
+      for (var index = 0; index < cells.length; index++) {
+        columns.writeVarint(index + 1);
+        columns.writeBytes(cells[index]);
+      }
+      columns.writeEnd();
+      expect(
+        decodeColumnarScalarArrays(columns.bytes()).single.toJson(),
+        expected,
+      );
+      columns.writeSvarint(maximum);
+      columns.writeSvarint(sdk.LuxoInt64.fromInt(1));
+      columns.writeSvarint(sdk.LuxoInt64.fromInt(1));
+      final page = decodePaginatedScalarArrays(columns.bytes());
+      expect(page.items.single.toJson(), expected);
+      expect(page.total, maximum);
+    },
+  );
+
+  test(
+    'every generated scalar array rejects incomplete or trailing cell data',
+    () {
+      for (var field = 1; field <= 11; field++) {
+        for (final payload in <List<int>>[
+          [],
+          [1],
+          [0, 99],
+          [2, 0],
+        ]) {
+          final encoder = sdk.LuxoEncoder()
+            ..writeVarint(1)
+            ..writeVarint(0)
+            ..writeVarint(field)
+            ..writeBytes(Uint8List.fromList(payload))
+            ..writeEnd();
+          expect(
+            () => decodeColumnarScalarArrays(encoder.bytes()),
+            throwsFormatException,
+            reason: 'field $field, cell $payload',
+          );
+          expect(
+            () => decodePaginatedScalarArrays(encoder.bytes()),
+            throwsFormatException,
+            reason: 'field $field, cell $payload',
+          );
+        }
+      }
+    },
+  );
+
+  test('JSON arrays retain null elements in inputs, rows, columns and calls', () async {
+    final jsons = <Object?>[null, {'n': BigInt.parse('123456789012345678901234567890')}];
+    final fields = _scalarArrayJSON()..['jsons'] = jsons;
+    final input = ScalarArraysInput.fromJson(fields);
+    expect(input.jsons, jsons);
+    expect(input.toJson()['jsons'], jsons);
+    expect(ScalarArrays.fromJson(fields).jsons.value, jsons);
+    final row = sdk.LuxoEncoder();
+    input.writeLuxo(row);
+    expect(decodeScalarArrays(sdk.LuxoDecoder(row.bytes())).jsons.value, jsons);
+
+    final cell = sdk.LuxoEncoder()..writeVarint(jsons.length);
+    for (final item in jsons) {
+      cell.writeBytes(utf8.encode(sdk.encodeLuxoJSON(item)));
+    }
+    final columns = sdk.LuxoEncoder()
+      ..writeVarint(1)
+      ..writeVarint(0)
+      ..writeVarint(11)
+      ..writeBytes(cell.bytes())
+      ..writeEnd();
+    expect(decodeColumnarScalarArrays(columns.bytes()).single.jsons.value, jsons);
+    final transport = _ResponseTransport();
+    final client = LuxoClient(transport);
+    for (final response in <Object>[jsons, cell.bytes()]) {
+      transport.response = response;
+      expect(await client.arrayJSON(), jsons);
+    }
+  });
+
+  test('generated scalar methods keep JSON tokens exact', () async {
+    var response = '{"data":9223372036854775807}';
+    var requestBody = '';
+    final client = LuxoClient(
+      sdk.HttpTransport(
+        'http://example.test/luxo',
+        client: MockClient((request) async {
+          requestBody = request.body;
+          return http.Response(response, 200);
+        }),
+      ),
+    );
+    addTearDown(client.close);
+    expect(await client.echoInteger(value: maximum), maximum);
+    expect(requestBody, contains('"value":9223372036854775807'));
+    response = '{"data":[9223372036854775807,-9223372036854775808]}';
+    expect(await client.listDurations(), [maximum, minimum]);
+    response = '{"data":[1.0,1e20]}';
+    expect(await client.listFloats(), [1.0, 1e20]);
+    for (final invalid in ['1.0', '1e0', '9223372036854775808']) {
+      response = '{"data":$invalid}';
+      await expectLater(
+        client.echoInteger(value: maximum),
+        throwsFormatException,
+      );
+    }
+  });
+
+  test('generated binary scalar methods reject malformed responses', () async {
+    var response = (sdk.LuxoEncoder()..writeSvarint(maximum)).bytes();
+    final client = LuxoClient(
+      sdk.HttpTransport(
+        'http://example.test/luxo',
+        options: const sdk.TransportOptions(mode: sdk.TransportMode.binary),
+        client: MockClient((request) async {
+          final decoder = sdk.LuxoDecoder(request.bodyBytes);
+          expect(decoder.nextField(), isTrue);
+          expect(decoder.fieldID, 13);
+          expect(decoder.nextField(), isFalse); // Empty selection mask.
+          expect(decoder.nextField(), isTrue);
+          expect(decoder.readInt(), maximum);
+          return http.Response.bytes(response, 200);
+        }),
+      ),
+    );
+    addTearDown(client.close);
+    expect(await client.echoInteger(value: maximum), maximum);
+    for (final invalid in <List<int>>[
+      [],
+      [128],
+      [0, 0],
+      [...List.filled(9, 255), 2],
+    ]) {
+      response = Uint8List.fromList(invalid);
+      await expectLater(
+        client.echoInteger(value: maximum),
+        throwsFormatException,
+      );
+    }
+  });
+
+  test('generated structured inputs preserve every numeric shape', () {
+    const wire =
+        '{"id":9223372036854775807,"duration":-9223372036854775808,'
+        '"values":[9223372036854775807,-9223372036854775808],"optional":null,'
+        '"ratios":[1.0,1e20],"metadata":{"large":18446744073709551616,"fraction":1.0},'
+        '"createdAt":"2026-01-01T00:00:00.000Z"}';
+    final input = NumbersInput.fromJson(
+      sdk.decodeLuxoJSON(wire, preserveNumberSyntax: true)
+          as Map<String, dynamic>,
+    );
+    expect(input.id, maximum);
+    expect(input.duration, minimum);
+    expect(input.values, [maximum, minimum]);
+    expect(NumbersInput.fromJson(input.toJson()).id, maximum);
+    final encoder = sdk.LuxoEncoder();
+    input.writeLuxo(encoder);
+    final output = decodeNumbers(sdk.LuxoDecoder(encoder.bytes()));
+    expect(output.id.value, maximum);
+    expect(output.duration.value, minimum);
+    expect(output.values.value, [maximum, minimum]);
+    expect(output.optional.value, isNull);
+    expect(output.ratios.value, [1.0, 1e20]);
+    expect(sdk.encodeLuxoJSON(output.metadata.value),
+        '{"large":18446744073709551616,"fraction":1.0}');
+    expect(output.createdAt.value, '2026-01-01T00:00:00Z');
+    expect(sdk.encodeLuxoJSON(output), contains('"id":9223372036854775807'));
+  });
+
+  test(
+    'generated columnar pagination keeps int64 totals and checks truncation',
+    () {
+      final encoder = sdk.LuxoEncoder()
+        ..writeVarint(2)
+        ..writeVarint(0);
+      encoder.writeVarint(1);
+      encoder.writeSvarint(maximum);
+      encoder.writeSvarint(minimum);
+      encoder.writeEnd();
+      final column = decodeColumnarNumbers(encoder.bytes());
+      expect(column.map((row) => row.id.value), [maximum, minimum]);
+      encoder.writeSvarint(maximum);
+      encoder.writeSvarint(sdk.LuxoInt64.fromInt(1));
+      encoder.writeSvarint(sdk.LuxoInt64.fromInt(2));
+      final page = decodePaginatedNumbers(encoder.bytes());
+      expect(page.total, maximum);
+      expect(page.page.toInt(), 1);
+      final truncated = Uint8List.sublistView(
+        encoder.bytes(),
+        0,
+        encoder.bytes().length - 1,
+      );
+      expect(() => decodePaginatedNumbers(truncated), throwsFormatException);
+    },
+  );
+
+  test('generated lists reject metadata overflow', () {
+    for (final count in [10_000_001, 4294967296]) {
+      final encoder = sdk.LuxoEncoder()
+        ..writeVarint(count)
+        ..writeVarint(0)
+        ..writeEnd();
+      // Stop at the primitive error if the cap regresses; never allocate billions of rows in a red test.
+      expect(sdk.ColumnarDecoder(encoder.bytes()).error, isNotNull);
+      expect(
+        () => decodeColumnarNumbers(encoder.bytes()),
+        throwsFormatException,
+      );
+      expect(
+        () => decodePaginatedNumbers(encoder.bytes()),
+        throwsFormatException,
+      );
+    }
+    for (final arena in [67_108_865, 4294967296]) {
+      final encoder = sdk.LuxoEncoder()
+        ..writeVarint(arena)
+        ..writeEnd();
+      expect(
+        () => decodeNumbers(sdk.LuxoDecoder(encoder.bytes())),
+        throwsFormatException,
+      );
+    }
+  });
+
+  test('generated lists reject malformed scalar array cells', () {
+    for (final field in [3, 5]) {
+      for (final payload in <List<int>>[
+        [],
+        [1],
+        [0, 99],
+      ]) {
+        final encoder = sdk.LuxoEncoder()
+          ..writeVarint(1)
+          ..writeVarint(0)
+          ..writeVarint(field)
+          ..writeBytes(Uint8List.fromList(payload))
+          ..writeEnd();
+        expect(
+          () => decodeColumnarNumbers(encoder.bytes()),
+          throwsFormatException,
+        );
+        expect(
+          () => decodePaginatedNumbers(encoder.bytes()),
+          throwsFormatException,
+        );
+      }
+    }
+  });
+}
+
+const _uuid = '00112233-4455-6677-8899-aabbccddeeff';
+
+LuxoClient _binaryClient(Uint8List Function() response) => LuxoClient(
+  sdk.HttpTransport(
+    'http://example.test/luxo',
+    options: const sdk.TransportOptions(mode: sdk.TransportMode.binary),
+    client: MockClient((request) async => http.Response.bytes(response(), 200)),
+  ),
+);
+
+Map<String, dynamic> _scalarArrayJSON() => {
+  'integers': [
+    sdk.LuxoInt64.minValue.toBigInt(),
+    sdk.LuxoInt64.maxValue.toBigInt(),
+  ],
+  'durations': [
+    sdk.LuxoInt64.minValue.toBigInt(),
+    sdk.LuxoInt64.maxValue.toBigInt(),
+  ],
+  'floats': [1.5, 2.0],
+  'strings': ['', '\uFEFF\uFEFF发布\uFFFD'],
+  'booleans': [false, true],
+  'dates': ['1970-01-01T00:00:00Z', '1970-01-01T00:00:01Z'],
+  'uuids': [_uuid, _uuid],
+  'blobs': ['', 'Af8='],
+  'decimals': ['0', '1.25'],
+  'enums': ['OPEN', 'DONE'],
+  'jsons': [
+    false,
+    {'large': BigInt.parse('18446744073709551616')},
+  ],
+};
+
+List<Uint8List> _scalarArrayCells() {
+  final writers = <void Function(sdk.LuxoEncoder)>[
+    _writeIntegers,
+    _writeIntegers,
+    (e) => e
+      ..writeFixed64(1.5)
+      ..writeFixed64(2.0),
+    (e) => e
+      ..writeString('')
+      ..writeString('\uFEFF\uFEFF发布\uFFFD'),
+    (e) => e
+      ..writeBool(false)
+      ..writeBool(true),
+    (e) => e
+      ..writeDateTime('1970-01-01T00:00:00Z')
+      ..writeDateTime('1970-01-01T00:00:01Z'),
+    (e) => e
+      ..writeUuid(_uuid)
+      ..writeUuid(_uuid),
+    (e) => e
+      ..writeBytes(Uint8List(0))
+      ..writeBytes(Uint8List.fromList([1, 255])),
+    (e) => e
+      ..writeString('0')
+      ..writeString('1.25'),
+    (e) => e
+      ..writeString('OPEN')
+      ..writeString('DONE'),
+    (e) => e
+      ..writeBytes(utf8.encode('false'))
+      ..writeBytes(utf8.encode('{"large":18446744073709551616}')),
+  ];
+  return writers.map((write) {
+    final encoder = sdk.LuxoEncoder()..writeVarint(2);
+    write(encoder);
+    return encoder.bytes();
+  }).toList();
+}
+
+void _writeIntegers(sdk.LuxoEncoder encoder) {
+  encoder.writeSvarint(sdk.LuxoInt64.minValue);
+  encoder.writeSvarint(sdk.LuxoInt64.maxValue);
+}

@@ -6,13 +6,14 @@
 //	[4 bytes: payload length, big-endian uint32]
 //	[payload bytes]
 //
-// Request payload (canonical envelope, version 1):
+// A connection preface verifies ProtocolVersion before the first frame.
+// Request payload:
 //
-//	[marker 0x00] [version 0x01] [kind 0x01=call, 0x02=stream]
+//	[kind 0x01=call, 0x02=stream] [flags: 0x01=traced, otherwise 0]
 //	[bearer token len varint] [bearer token bytes]
 //	[API ID varint] [field mask len varint] [field mask bytes] [params binary (fieldID+value pairs, 0x00 terminator)]
 //
-// Traced requests use version 4 and insert trace ID, full field path, and a
+// Traced requests insert trace ID, full field path, and a
 // database-detail flag before the canonical binary request body.
 //
 // Response payload:
@@ -20,10 +21,16 @@
 //	[status 1 byte: 0x00=ok, 0x01=error, 0x02=stream item]
 //	[body bytes]
 //
+// Streams end with status 0x05 and no body, or a canonical error frame. EOF
+// without a terminal frame is a transport failure, never successful completion.
+//
 // Error body (status=0x01):
 //
 //	[field 1=error code svarint] [field 2=error name string]
 //	[field 3=error message string] [0x00 terminator]
+//
+// All three fields are required exactly once, in any order. Text must be valid
+// UTF-8. Unknown fields, duplicate fields, truncation and trailing bytes fail.
 package rpc
 
 import (
@@ -36,23 +43,20 @@ import (
 )
 
 const (
-	statusOK         = 0x00
-	statusError      = 0x01
-	statusStream     = 0x02
-	statusTraceOK    = 0x03
-	statusTraceError = 0x04
-	maxFrameSize     = 4 << 20 // 4MB max frame
+	statusOK             = 0x00
+	statusError          = 0x01
+	statusStream         = 0x02
+	statusTraceOK        = 0x03
+	statusTraceError     = 0x04
+	statusStreamComplete = 0x05
+	maxFrameSize         = 4 << 20 // 4MB max frame
 
-	requestEnvelopeMarker        = 0x00
-	requestEnvelopeVersion       = 0x01
-	legacyTraceEnvelopeVersion   = 0x02
-	fieldTraceEnvelopeVersion    = 0x03
-	tracedRequestEnvelopeVersion = 0x04
-	requestKindCall              = 0x01
-	requestKindStream            = 0x02
-	maxBearerTokenSize           = 16 << 10
-	maxTraceIDSize               = 256
-	maxTraceFieldPathSize        = 4 << 10
+	requestFlagTraced     = 0x01
+	requestKindCall       = 0x01
+	requestKindStream     = 0x02
+	maxBearerTokenSize    = 16 << 10
+	maxTraceIDSize        = 256
+	maxTraceFieldPathSize = 4 << 10
 )
 
 type requestEnvelope struct {
@@ -64,56 +68,26 @@ type requestEnvelope struct {
 	body            []byte
 }
 
-func encodeRequestEnvelope(kind byte, token string, body []byte) []byte {
-	payload := make([]byte, 0, 3+10+len(token)+len(body))
-	payload = append(payload, requestEnvelopeMarker, requestEnvelopeVersion, kind)
-	payload = codec.AppendVarint(payload, uint64(len(token)))
-	payload = append(payload, token...)
-	payload = append(payload, body...)
-	return payload
-}
-
-func encodeTracedRequestEnvelope(kind byte, token, traceID, fieldPath string, databaseDetails bool, body []byte) []byte {
-	payload := make([]byte, 0, 4+30+len(token)+len(traceID)+len(fieldPath)+len(body))
-	payload = append(payload, requestEnvelopeMarker, tracedRequestEnvelopeVersion, kind)
-	payload = codec.AppendVarint(payload, uint64(len(token)))
-	payload = append(payload, token...)
-	payload = codec.AppendVarint(payload, uint64(len(traceID)))
-	payload = append(payload, traceID...)
-	payload = codec.AppendVarint(payload, uint64(len(fieldPath)))
-	payload = append(payload, fieldPath...)
-	if databaseDetails {
-		payload = append(payload, 1)
-	} else {
-		payload = append(payload, 0)
-	}
-	payload = append(payload, body...)
-	return payload
-}
-
 func decodeRequestEnvelope(payload []byte) (requestEnvelope, error) {
-	if len(payload) == 0 || payload[0] != requestEnvelopeMarker {
-		return requestEnvelope{}, fmt.Errorf("rpc: missing canonical request envelope")
-	}
 	if len(payload) < 4 {
 		return requestEnvelope{}, fmt.Errorf("rpc: truncated request envelope")
 	}
-	version := payload[1]
-	if version != requestEnvelopeVersion && version != legacyTraceEnvelopeVersion && version != fieldTraceEnvelopeVersion && version != tracedRequestEnvelopeVersion {
-		return requestEnvelope{}, fmt.Errorf("rpc: unsupported request envelope version %d", payload[1])
+	flags := payload[1]
+	if flags & ^byte(requestFlagTraced) != 0 {
+		return requestEnvelope{}, fmt.Errorf("rpc: unsupported request flags %d", flags)
 	}
-	kind := payload[2]
+	kind := payload[0]
 	if kind != requestKindCall && kind != requestKindStream {
 		return requestEnvelope{}, fmt.Errorf("rpc: unknown request kind %d", kind)
 	}
-	tokenLength, consumed := codec.ReadVarint(payload, 3)
+	tokenLength, consumed := codec.ReadVarint(payload, 2)
 	if consumed <= 0 {
 		return requestEnvelope{}, fmt.Errorf("rpc: invalid bearer token length")
 	}
 	if tokenLength > maxBearerTokenSize {
 		return requestEnvelope{}, fmt.Errorf("rpc: bearer token exceeds %d bytes", maxBearerTokenSize)
 	}
-	start := 3 + consumed
+	start := 2 + consumed
 	if tokenLength > uint64(len(payload)-start) {
 		return requestEnvelope{}, fmt.Errorf("rpc: bearer token length exceeds request")
 	}
@@ -122,34 +96,31 @@ func decodeRequestEnvelope(payload []byte) (requestEnvelope, error) {
 		return requestEnvelope{}, fmt.Errorf("rpc: request envelope has no body")
 	}
 	envelope := requestEnvelope{kind: kind, token: string(payload[start:tokenEnd])}
-	if version == legacyTraceEnvelopeVersion || version == fieldTraceEnvelopeVersion || version == tracedRequestEnvelopeVersion {
-		traceID, bodyStart, err := decodeTraceID(payload, tokenEnd)
-		if err != nil {
-			return requestEnvelope{}, err
-		}
-		envelope.traceID = traceID
-		if version == fieldTraceEnvelopeVersion || version == tracedRequestEnvelopeVersion {
-			fieldPath, next, pathErr := decodeTraceFieldPath(payload, bodyStart)
-			if pathErr != nil {
-				return requestEnvelope{}, pathErr
-			}
-			envelope.fieldPath = fieldPath
-			bodyStart = next
-		}
-		if version == tracedRequestEnvelopeVersion {
-			if bodyStart >= len(payload) || payload[bodyStart] > 1 {
-				return requestEnvelope{}, fmt.Errorf("rpc: invalid database trace detail flag")
-			}
-			envelope.databaseDetails = payload[bodyStart] == 1
-			bodyStart++
-		}
-		if bodyStart >= len(payload) {
-			return requestEnvelope{}, fmt.Errorf("rpc: request envelope has no body")
-		}
-		envelope.body = payload[bodyStart:]
-		return envelope, nil
+	if flags&requestFlagTraced != 0 {
+		return decodeRequestTrace(payload, tokenEnd, envelope)
 	}
 	envelope.body = payload[tokenEnd:]
+	return envelope, nil
+}
+
+func decodeRequestTrace(payload []byte, offset int, envelope requestEnvelope) (requestEnvelope, error) {
+	traceID, next, err := decodeTraceID(payload, offset)
+	if err != nil {
+		return requestEnvelope{}, err
+	}
+	fieldPath, next, err := decodeTraceFieldPath(payload, next)
+	if err != nil {
+		return requestEnvelope{}, err
+	}
+	if next >= len(payload) || payload[next] > 1 {
+		return requestEnvelope{}, fmt.Errorf("rpc: invalid database trace detail flag")
+	}
+	if next+1 >= len(payload) {
+		return requestEnvelope{}, fmt.Errorf("rpc: request envelope has no body")
+	}
+	envelope.traceID, envelope.fieldPath = traceID, fieldPath
+	envelope.databaseDetails = payload[next] == 1
+	envelope.body = payload[next+1:]
 	return envelope, nil
 }
 
@@ -199,6 +170,20 @@ func WriteFrame(w io.Writer, payload []byte) error {
 	return err
 }
 
+// Internal callers reserve the prefix before encoding, avoiding both a copy
+// and the temporary scatter/gather containers needed by separate payloads.
+func writePreparedFrame(w io.Writer, frame []byte) error {
+	if len(frame) < 4 || len(frame)-4 > maxFrameSize {
+		return fmt.Errorf("rpc: invalid prepared frame length: %d", len(frame))
+	}
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(frame)-4))
+	n, err := w.Write(frame)
+	if err == nil && n != len(frame) {
+		return io.ErrShortWrite
+	}
+	return err
+}
+
 func writeStatusFrame(w io.Writer, status byte, payload []byte) error {
 	if len(payload) >= maxFrameSize {
 		return fmt.Errorf("rpc: frame too large: %d bytes (max %d)", len(payload)+1, maxFrameSize)
@@ -212,7 +197,8 @@ func writeStatusFrame(w io.Writer, status byte, payload []byte) error {
 }
 
 // ReadFrame reads a length-prefixed frame from r.
-// Returns the payload bytes. Reuses buf if large enough.
+// Returns the payload bytes. Reuses buf's capacity, including zero-length
+// slices. The caller owns the buffer and controls its reuse lifetime.
 func ReadFrame(r io.Reader, buf []byte) ([]byte, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
@@ -222,7 +208,7 @@ func ReadFrame(r io.Reader, buf []byte) ([]byte, error) {
 	if size > maxFrameSize {
 		return nil, fmt.Errorf("rpc: frame too large: %d bytes (max %d)", size, maxFrameSize)
 	}
-	if int(size) > len(buf) {
+	if int(size) > cap(buf) {
 		buf = make([]byte, size)
 	} else {
 		buf = buf[:size]
@@ -231,4 +217,13 @@ func ReadFrame(r io.Reader, buf []byte) ([]byte, error) {
 		return nil, err
 	}
 	return buf, nil
+}
+
+// Bound per-connection idle retention without lowering the accepted frame size.
+// A large frame stays alive through dispatch but is not kept for the next call.
+func retainReadFrame(buf []byte) []byte {
+	if cap(buf) > 64<<10 {
+		return nil
+	}
+	return buf[:0]
 }

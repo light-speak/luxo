@@ -1,13 +1,17 @@
 package codec
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/light-speak/luxo/internal/testutil"
+)
 
 func TestSelectionMaskRoundTrip(t *testing.T) {
-	childFields := FieldMaskSet(nil, 2)
-	child := AppendSelectionMask(nil, childFields, nil)
-	rootFields := FieldMaskSet(nil, 1)
-	rootFields = FieldMaskSet(rootFields, 3)
-	root := AppendSelectionMask(nil, rootFields, []SelectionMaskChild{{FieldID: 3, Mask: child}})
+	childFields := testutil.Bytes(t)(FieldMaskSet(nil, 2))
+	child := testutil.Bytes(t)(AppendSelectionMask(nil, childFields, nil))
+	rootFields := testutil.Bytes(t)(FieldMaskSet(nil, 1))
+	rootFields = testutil.Bytes(t)(FieldMaskSet(rootFields, 3))
+	root := testutil.Bytes(t)(AppendSelectionMask(nil, rootFields, []SelectionMaskChild{{FieldID: 3, Mask: child}}))
 
 	fields, children, ok := SplitSelectionMask(root)
 	if !ok || !FieldMaskHas(fields, 1) || !FieldMaskHas(fields, 3) || FieldMaskHas(fields, 2) {
@@ -29,6 +33,9 @@ func TestSelectionMaskRoundTrip(t *testing.T) {
 	}
 	if _, found := SelectionMaskNested(root, 1); found {
 		t.Fatal("scalar field must not have a child mask")
+	}
+	if _, found := SelectionMaskNested(root, 4); found {
+		t.Fatal("unselected field must not have a child mask")
 	}
 }
 
@@ -65,12 +72,46 @@ func TestSelectionMaskRejectsMalformedNodes(t *testing.T) {
 	}
 }
 
+func TestSelectionMaskClassifiedFieldLimit(t *testing.T) {
+	maxFields := testutil.Bytes(t)(FieldMaskSet(nil, MaxSelectionFieldID))
+	valid := testutil.Bytes(t)(AppendSelectionMask(nil, maxFields, nil))
+	if fields, _, ok := SplitSelectionMask(valid); !ok || !FieldMaskHas(fields, MaxSelectionFieldID) {
+		t.Fatal("maximum selection field was rejected")
+	}
+	child := testutil.Bytes(t)(AppendSelectionMask(nil, []byte{1}, nil))
+	maxChild := testutil.Bytes(t)(AppendSelectionMask(nil, maxFields, []SelectionMaskChild{{FieldID: MaxSelectionFieldID, Mask: child}}))
+	if _, found := SelectionMaskNested(maxChild, MaxSelectionFieldID); !found {
+		t.Fatal("maximum child field was rejected")
+	}
+	unusedBit := append([]byte(nil), maxFields...)
+	unusedBit[len(unusedBit)-1] |= 0x80
+	oversized := append(append([]byte(nil), maxFields...), 1)
+	cases := map[string][]byte{
+		"unused final bit":       rawSelectionMask(unusedBit),
+		"oversized bitmap":       rawSelectionMask(oversized),
+		"child ID overflow":      rawSelectionMask([]byte{1}, SelectionMaskChild{FieldID: MaxSelectionFieldID + 1, Mask: child}),
+		"nested bitmap overflow": rawSelectionMask([]byte{1}, SelectionMaskChild{FieldID: 1, Mask: rawSelectionMask(oversized)}),
+	}
+	for name, wire := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, _, ok := SplitSelectionMask(wire); ok {
+				t.Fatal("out-of-range selection accepted")
+			}
+		})
+	}
+}
+
 func TestAppendSelectionMaskSortsChildren(t *testing.T) {
-	child := AppendSelectionMask(nil, []byte{1}, nil)
-	root := AppendSelectionMask(nil, []byte{7}, []SelectionMaskChild{
+	child := testutil.Bytes(t)(AppendSelectionMask(nil, []byte{1}, nil))
+	input := []SelectionMaskChild{
 		{FieldID: 3, Mask: child},
 		{FieldID: 1, Mask: child},
-	})
+	}
+	root := testutil.Bytes(t)(AppendSelectionMask([]byte{99}, []byte{7}, input))
+	if input[0].FieldID != 3 || input[1].FieldID != 1 || root[0] != 99 {
+		t.Fatal("constructor mutated children or destination prefix")
+	}
+	root = root[1:]
 	_, children, ok := SplitSelectionMask(root)
 	if !ok {
 		t.Fatal("invalid generated mask")
@@ -81,13 +122,25 @@ func TestAppendSelectionMaskSortsChildren(t *testing.T) {
 	}
 }
 
-func TestAppendSelectionMaskSkipsInvalidChildren(t *testing.T) {
-	child := AppendSelectionMask(nil, []byte{1}, nil)
-	root := AppendSelectionMask(nil, []byte{1}, []SelectionMaskChild{
+func TestAppendSelectionMaskRejectsInvalidChildren(t *testing.T) {
+	child := testutil.Bytes(t)(AppendSelectionMask(nil, []byte{1}, nil))
+	root, err := AppendSelectionMask(nil, []byte{1}, []SelectionMaskChild{
 		{FieldID: 0, Mask: child},
 		{FieldID: 1},
 	})
-	if _, children, ok := SplitSelectionMask(root); !ok || len(children) != 0 {
-		t.Fatalf("selection = %v, children = %v, ok = %v", root, children, ok)
+	if err == nil || root != nil {
+		t.Fatalf("invalid children silently ignored: %v", err)
 	}
+}
+
+// Build malformed receiver fixtures without calling the checked constructor.
+func rawSelectionMask(fields []byte, children ...SelectionMaskChild) []byte {
+	mask := AppendVarint(nil, uint64(len(fields)))
+	mask = append(mask, fields...)
+	for _, child := range children {
+		mask = AppendVarint(mask, uint64(child.FieldID))
+		mask = AppendVarint(mask, uint64(len(child.Mask)))
+		mask = append(mask, child.Mask...)
+	}
+	return mask
 }

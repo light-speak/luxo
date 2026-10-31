@@ -69,3 +69,33 @@ func BenchmarkLoadWithFields(b *testing.B) {
 	}
 	wg.Wait()
 }
+
+var constructionSink *Loader[int, int]
+
+func BenchmarkLoaderConstruction(b *testing.B) {
+	result := map[int]int{1: 42}
+	load := func(context.Context, []int, []*selection.Field) (map[int]int, error) { return result, nil }
+	for _, operation := range []string{"unused", "list", "single"} {
+		b.Run(operation, func(b *testing.B) {
+			keys := []int{1}
+			ctx := b.Context()
+			b.ReportAllocs()
+			for b.Loop() {
+				loader := New(load, Config{MaxBatch: 1})
+				constructionSink = loader
+				switch operation {
+				case "list":
+					values, err := loader.LoadAll(ctx, keys, nil)
+					if err != nil || values[1] != 42 {
+						b.Fatalf("list result: %v %v", values, err)
+					}
+				case "single":
+					value, err := loader.Load(ctx, 1, nil)
+					if err != nil || value != 42 {
+						b.Fatalf("single result: %v %v", value, err)
+					}
+				}
+			}
+		})
+	}
+}

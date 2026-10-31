@@ -151,44 +151,41 @@ func TestNew(t *testing.T) {
 	}
 }
 
-func TestParamErrorI18nData(t *testing.T) {
-	p := ParamError{Param: "email", Error: "invalid format"}
-	m := p.I18nData()
-	if m["param"] != "email" || m["error"] != "invalid format" {
-		t.Errorf("got %v", m)
+func TestBuiltinErrorData(t *testing.T) {
+	for _, test := range []struct {
+		data        ErrorData
+		json        string
+		field, text string
+	}{
+		{ParamError{Param: "email", Error: "invalid format"}, `{"param":"email","error":"invalid format"}`, "param", "email"},
+		{ParamError{Param: "email", Error: "invalid format"}, `{"param":"email","error":"invalid format"}`, "error", "invalid format"},
+		{ResourceError{Resource: "User", ID: IntID(42)}, `{"resource":"User","id":42}`, "id", "42"},
+		{ResourceError{Resource: "User", ID: IntID(0)}, `{"resource":"User","id":0}`, "resource", "User"},
+		{ResourceError{Resource: "User", ID: StringID("")}, `{"resource":"User","id":""}`, "id", ""},
+		{ResourceError{Resource: "User", ID: UUIDID([16]byte{15: 1})}, `{"resource":"User","id":"00000000-0000-0000-0000-000000000001"}`, "id", "00000000-0000-0000-0000-000000000001"},
+		{ResourceError{Resource: "Post"}, `{"resource":"Post"}`, "resource", "Post"},
+	} {
+		got, err := test.data.AppendJSON(nil)
+		if err != nil || string(got) != test.json {
+			t.Fatalf("%s: %v; want %s", got, err, test.json)
+		}
+		text, found := test.data.AppendText([]byte("prefix:"), test.field)
+		if !found || string(text) != "prefix:"+test.text {
+			t.Fatalf("text: %s, %v", text, found)
+		}
+		text, found = test.data.AppendText([]byte("prefix:"), "missing")
+		if found || string(text) != "prefix:" {
+			t.Fatal("unknown field changed prefix")
+		}
+	}
+	var absent ErrorData = ResourceError{Resource: "Post"}
+	if _, found := absent.AppendText(nil, "id"); found {
+		t.Fatal("absent ID interpolated")
 	}
 }
 
-func TestResourceErrorI18nData(t *testing.T) {
-	r := ResourceError{Resource: "User", ID: int64(42)}
-	m := r.I18nData()
-	if m["resource"] != "User" || m["id"] != int64(42) {
-		t.Errorf("got %v", m)
-	}
-
-	// nil ID should be omitted
-	r2 := ResourceError{Resource: "Post"}
-	m2 := r2.I18nData()
-	if _, ok := m2["id"]; ok {
-		t.Error("nil ID should not appear in I18nData")
-	}
-}
-
-func TestMapDataI18nData(t *testing.T) {
-	d := MapData{"key": "value", "count": 3}
-	m := d.I18nData()
-	if m["key"] != "value" || m["count"] != 3 {
-		t.Errorf("got %v", m)
-	}
-}
-
-func TestWithDataMapData(t *testing.T) {
-	e := BadRequest.WithData(MapData{"field": "name", "reason": "too short"})
-	md, ok := e.Data.(MapData)
-	if !ok {
-		t.Fatal("Data should be MapData")
-	}
-	if md["field"] != "name" {
-		t.Errorf("got %v", md)
+func TestBuiltinInternalErrorIsPrivate(t *testing.T) {
+	if !InternalError.Internal || !InternalError.WithData(ParamError{Param: "private"}).Internal {
+		t.Fatal("built-in Internal error must retain the privacy flag")
 	}
 }

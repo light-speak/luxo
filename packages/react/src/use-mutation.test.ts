@@ -1,9 +1,37 @@
+// @vitest-environment jsdom
+
 import { act, renderHook, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { QueryClient } from './query-client'
 import { useLuxoMutation } from './use-mutation'
 
 describe('useLuxoMutation', () => {
+  it('preserves int64 mutation inputs, results and invalidation keys', async () => {
+    const maximum = 9223372036854775807n
+    const queryClient = new QueryClient({ gcTime: Infinity })
+    const matching = vi.fn()
+    const adjacent = vi.fn()
+    const unsubscribeMatching = queryClient.subscribe(['metric', maximum], matching)
+    const unsubscribeAdjacent = queryClient.subscribe(['metric', maximum - 1n], adjacent)
+    const mutationFn = vi.fn(async (id: bigint) => ({ id, duration: -9223372036854775808n }))
+    const { result, unmount } = renderHook(() => useLuxoMutation(mutationFn, {
+      queryClient,
+      invalidateQueries: data => [['metric', data.id]],
+    }))
+
+    await act(async () => {
+      expect(await result.current.mutate(maximum)).toEqual({ id: maximum, duration: -9223372036854775808n })
+    })
+    expect(mutationFn).toHaveBeenCalledWith(maximum)
+    expect(result.current.data?.id).toBe(maximum)
+    expect(matching).toHaveBeenCalledWith({ type: 'invalidated' })
+    expect(adjacent).not.toHaveBeenCalled()
+    unmount()
+    unsubscribeMatching()
+    unsubscribeAdjacent()
+    queryClient.clear()
+  })
+
   it('never deduplicates mutations and invalidates configured queries after success', async () => {
     const queryClient = new QueryClient({ gcTime: Infinity })
     const listener = vi.fn()
@@ -42,7 +70,7 @@ describe('useLuxoMutation', () => {
     let resolveSecond!: (value: string) => void
     const first = new Promise<string>(resolve => { resolveFirst = resolve })
     const second = new Promise<string>(resolve => { resolveSecond = resolve })
-    const mutationFn = vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(second)
+    const mutationFn = vi.fn<() => Promise<string>>().mockReturnValueOnce(first).mockReturnValueOnce(second)
     const { result } = renderHook(() => useLuxoMutation(mutationFn))
 
     let firstCall!: Promise<string>

@@ -15,39 +15,44 @@ export interface LuxoPluginOptions {
   outDir?: string
 }
 
+/** Generate an SDK without starting Vite; return the loaded schema for field analysis. */
+export async function generateSDK(options: LuxoPluginOptions = {}, projectRoot = process.cwd()): Promise<LuxoSchema> {
+  const schema = await loadSchema(options, projectRoot)
+  await generateTypes(schema, resolve(projectRoot, options.outDir || 'src/luxo'))
+  return schema
+}
+
 /** Luxo Vite plugin — compile-time field tracking + type generation */
 export function luxo(options: LuxoPluginOptions = {}): Plugin {
   let schema: LuxoSchema | null = null
   const outDir = options.outDir || 'src/luxo'
-  let generatedDir = resolve(outDir)
+  let projectRoot = process.cwd()
+  let generatedDir = resolve(projectRoot, outDir)
 
   return {
     name: 'luxo',
 
     configResolved(config) {
-      generatedDir = resolve(config.root, outDir)
+      projectRoot = config.root
+      generatedDir = resolve(projectRoot, outDir)
     },
 
     async buildStart() {
       // Load schema from endpoint or local file
-      schema = await loadSchema(options)
-      if (!schema) {
-        console.warn('[luxo] No schema available — skipping codegen. Set endpoint + key or schemaFile option.')
-        return
-      }
-      await generateTypes(schema, outDir)
+      schema = null
+      schema = await generateSDK(options, projectRoot)
     },
 
     transform(code: string, id: string) {
       const sourceID = id.split('?', 1)[0]!.replaceAll('\\', '/')
-      if (!sourceID.endsWith('.ts') && !sourceID.endsWith('.tsx')) return null
+      if (!/\.(?:[mc]?ts|tsx)$/.test(sourceID)) return null
       if (sourceID.includes('/node_modules/')) return null
       if (isInsideDirectory(sourceID, generatedDir)) return null
 
       if (!schema) return null
 
       // Analyze field access and inject $select
-      const result = analyzeAndTransform(code, id, schema)
+      const result = analyzeAndTransform(code, id, schema, true)
       if (!result) return null
 
       return { code: result, map: null }
@@ -60,38 +65,56 @@ function isInsideDirectory(file: string, directory: string): boolean {
   return file === normalizedDirectory || file.startsWith(`${normalizedDirectory}/`)
 }
 
-async function loadSchema(options: LuxoPluginOptions): Promise<LuxoSchema | null> {
+async function loadSchema(options: LuxoPluginOptions, projectRoot: string): Promise<LuxoSchema> {
+  const failures: unknown[] = []
   // Try endpoint first
   if (options.endpoint) {
     try {
-      const url = `${options.endpoint}?$schema`
-      const headers: Record<string, string> = {}
-      if (options.introspectionKey) {
-        headers['X-Introspection-Key'] = options.introspectionKey
-      }
-      const resp = await fetch(url, { headers })
-      if (resp.ok) {
-        return await resp.json() as LuxoSchema
-      }
-      console.warn(`[luxo] Failed to fetch schema: ${resp.status}`)
+      return await fetchSchema(options.endpoint, options.introspectionKey)
     } catch (e) {
-      console.warn(`[luxo] Failed to connect to ${options.endpoint}:`, e)
+      failures.push(e)
     }
   }
 
   // Try local schema file
   if (options.schema) {
+    const path = resolve(projectRoot, options.schema)
     try {
       const fs = await import('fs')
-      const data = fs.readFileSync(options.schema, 'utf-8')
-      return JSON.parse(data) as LuxoSchema
+      const schema = decodeSchema(fs.readFileSync(path))
+      if (failures.length > 0) console.warn('[luxo] Schema endpoint failed; using the explicitly configured local schema.')
+      return schema
     } catch (e) {
-      console.warn(`[luxo] Failed to read schema file:`, e)
+      failures.push(new Error(`[luxo] Cannot read schema file ${path}`, { cause: e }))
     }
   }
 
-  console.warn('[luxo] No schema available. Set endpoint or schema option.')
-  return null
+  throw new AggregateError(failures, '[luxo] No schema available. Configure a working endpoint or schema file.')
+}
+
+async function fetchSchema(endpoint: string, key?: string): Promise<LuxoSchema> {
+  const url = new URL(endpoint)
+  url.searchParams.set('$schema', '')
+  url.hash = ''
+  const headers: Record<string, string> = {}
+  if (key) headers['X-Introspection-Key'] = key
+  const response = await fetch(url.toString(), { headers })
+  if (!response.ok) throw new Error(`[luxo] Schema endpoint returned HTTP ${response.status}`)
+  return decodeSchema(new Uint8Array(await response.arrayBuffer()))
+}
+
+/** Decode once, before generation; accept one document BOM, never replacement decoding. */
+function decodeSchema(bytes: Uint8Array): LuxoSchema {
+  const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+  const value: unknown = JSON.parse(text)
+  if (!isRecord(value) || !isRecord(value.models) || !isRecord(value.apis)) {
+    throw new TypeError('[luxo] Expected a Schema object with models and apis maps')
+  }
+  return value as unknown as LuxoSchema
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
 export default luxo

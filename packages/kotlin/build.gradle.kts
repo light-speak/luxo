@@ -2,14 +2,14 @@ import org.gradle.api.tasks.wrapper.Wrapper
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
-    kotlin("jvm") version "2.4.10"
-    kotlin("plugin.serialization") version "2.4.10"
+    alias(libs.plugins.kotlin.jvm)
+    alias(libs.plugins.kotlin.serialization)
     `java-library`
     `maven-publish`
 }
 
 group = "com.luxo"
-version = "0.1.0"
+version = file("../../VERSION").readText().trim()
 
 base {
     archivesName.set("luxo-client")
@@ -23,6 +23,7 @@ java {
 kotlin {
     compilerOptions {
         jvmTarget.set(JvmTarget.JVM_1_8)
+        allWarningsAsErrors.set(true)
     }
 }
 
@@ -38,19 +39,21 @@ publishing {
     }
 }
 
-val kotlinCompilerVersion = "2.4.10"
-val luxoAnalyzerRuntime = configurations.create("luxoAnalyzerRuntime")
+tasks.processResources {
+    val version = libs.versions.kotlin.get()
+    inputs.property("kotlinVersion", version)
+    filesMatching("com/luxo/client/compiler/tooling.properties") { expand("kotlinVersion" to version) }
+}
 
 dependencies {
     api("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
     api("com.squareup.okhttp3:okhttp:4.12.0")
 
-    // The compiler is isolated to the build-time field analyzer and is not
+    // The compiler is isolated to the call-site compilation plugin and is not
     // published as an SDK runtime dependency.
-    compileOnly("org.jetbrains.kotlin:kotlin-compiler-embeddable:$kotlinCompilerVersion")
-    testRuntimeOnly("org.jetbrains.kotlin:kotlin-compiler-embeddable:$kotlinCompilerVersion")
-    luxoAnalyzerRuntime("org.jetbrains.kotlin:kotlin-compiler-embeddable:$kotlinCompilerVersion")
+    compileOnly(libs.kotlin.compiler)
+    testRuntimeOnly(libs.kotlin.compiler)
 
     testImplementation(kotlin("test"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
@@ -58,6 +61,212 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    dependsOn(tasks.jar)
+    doFirst {
+        systemProperty("luxo.testRuntimeClasspath", sourceSets["test"].runtimeClasspath.asPath)
+        systemProperty("luxo.testPluginJar", tasks.jar.get().archiveFile.get().asFile.absolutePath)
+    }
+}
+
+tasks.register<JavaExec>("benchmarkNullableRoots") {
+    group = "verification"
+    description = "Compile real generated nullable readers and measure isolated JVMs"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.luxo.client.NullableRootBenchmark")
+    args(providers.gradleProperty("luxo.nullableMode").orElse("measure").get())
+    providers.gradleProperty("luxo.nullableBaseline").orNull?.let { args(file(it).absolutePath) }
+}
+
+tasks.register<JavaExec>("benchmarkResponsePresence") {
+    group = "verification"
+    description = "Measure HTTP/WS response presence using one transport implementation per JVM"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.luxo.client.ResponsePresenceBenchmark")
+    jvmArgs("-Xms512m", "-Xmx512m")
+}
+
+tasks.register<JavaExec>("benchmarkSelectionPlans") {
+    group = "verification"
+    description = "Compare dynamic selection with warm and first-use call-site plans"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.luxo.client.SelectionPlanBenchmark")
+    jvmArgs("-Xms512m", "-Xmx512m")
+}
+
+tasks.register<JavaExec>("benchmarkSchemaRegistration") {
+    group = "verification"
+    description = "Compare validated schema snapshots with borrowed metadata registration"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.luxo.client.SchemaRegistrationBenchmark")
+    jvmArgs("-Xms512m", "-Xmx512m")
+    args(providers.gradleProperty("luxo.schemaParams").orElse("1").get())
+}
+
+tasks.register<JavaExec>("benchmarkWebSocketIDs") {
+    group = "verification"
+    description = "Compare unsigned WebSocket metadata with the previous signed implementation"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.luxo.client.WebSocketIDBenchmark")
+}
+
+tasks.register<JavaExec>("benchmarkWebSocketSubscriptions") {
+    group = "verification"
+    description = "Compare UInt64 subscription dispatch and lifecycle with the frozen API-keyed transport"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.luxo.client.WebSocketSubscriptionBenchmark")
+    jvmArgs("-Xms512m", "-Xmx512m")
+}
+
+tasks.register<JavaExec>("benchmarkWebSocketBinarySend") {
+    group = "verification"
+    description = "Compare immutable binary send snapshots without the redundant vararg array copy"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.luxo.client.WebSocketBinarySendBenchmark")
+    jvmArgs("-Xms512m", "-Xmx512m")
+}
+
+tasks.register<JavaExec>("benchmarkWebSocketUnary") {
+    group = "verification"
+    description = "Measure one unary transport implementation in an isolated JVM"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.luxo.client.WebSocketIsolatedBenchmark")
+    jvmArgs("-Xms512m", "-Xmx512m")
+    args(providers.gradleProperty("luxo.unaryMode").orElse("BINARY").get(),
+        providers.gradleProperty("luxo.unaryPayloadBytes").orElse("0").get())
+}
+
+tasks.register<JavaExec>("benchmarkWebSocketTerminals") {
+    group = "verification"
+    description = "Compare terminal-aware subscriptions with the frozen UInt64 transport"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.luxo.client.WebSocketTerminalBenchmark")
+    jvmArgs("-Xms512m", "-Xmx512m")
+}
+
+// Supply the unmodified pre-change transport explicitly; never keep a second runtime copy in source.
+providers.gradleProperty("luxo.decoderBaseline").orNull?.let { snapshot ->
+    val baseline = file(snapshot)
+    val generated = layout.projectDirectory.dir(".tmp/websocket-decoding-benchmark")
+    val template = layout.projectDirectory.file("benchmark/WebSocketDecodingBenchmark.kt.txt")
+    val prepare = tasks.register("prepareWebSocketDecodingBenchmark") {
+        inputs.file(baseline)
+        inputs.file(template)
+        outputs.dir(generated)
+        doLast {
+            val original = baseline.readText()
+            val declaration = "override suspend fun subscribe("
+            check(original.windowed(declaration.length).count { it == declaration } == 1) {
+                "Expected the original non-generic subscribe declaration in the baseline"
+            }
+            val directory = generated.asFile.apply { mkdirs() }
+            directory.resolve("BeforeDecodingWebSocket.kt").writeText(original
+                .replace("LuxoWebSocket", "BeforeDecodingWebSocket")
+                .replace(declaration, "suspend fun subscribeRaw("))
+            directory.resolve("WebSocketDecodingBenchmark.kt").writeText(template.asFile.readText())
+        }
+    }
+    kotlin.sourceSets["test"].kotlin.srcDir(generated)
+    tasks.named("compileTestKotlin") { dependsOn(prepare) }
+    tasks.register<JavaExec>("benchmarkWebSocketDecoding") {
+        group = "verification"
+        description = "Compare decoder isolation with an explicit frozen transport snapshot"
+        classpath = sourceSets["test"].runtimeClasspath
+        mainClass.set("com.luxo.client.WebSocketDecodingBenchmark")
+        jvmArgs("-Xms512m", "-Xmx512m")
+        providers.gradleProperty("luxo.benchmarkJfr").orNull?.let { recording ->
+            val settings = providers.gradleProperty("luxo.benchmarkJfrSettings").orElse("profile").get()
+            jvmArgs("-XX:StartFlightRecording=settings=$settings,filename=${file(recording)},dumponexit=true")
+        }
+    }
+}
+
+tasks.register<JavaExec>("benchmarkHTTPProtocol") {
+    group = "verification"
+    description = "Compare HTTP JSON decoding, headers, byte-length validation and strict error decoding"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.luxo.client.HttpProtocolBenchmark")
+    jvmArgs("-Xms512m", "-Xmx512m")
+}
+
+tasks.register<JavaExec>("benchmarkCodecMetadata") {
+    group = "verification"
+    description = "Compare bounded metadata decoding with frozen pre-bounds readers"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.luxo.client.CodecMetadataBenchmark")
+    jvmArgs("-Xms512m", "-Xmx512m")
+    providers.gradleProperty("luxo.codecBenchmark").orNull?.let { args(it) }
+}
+
+tasks.register<JavaExec>("benchmarkUUID") {
+    group = "verification"
+    description = "Compare canonical UUID parsing with the frozen permissive parser"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.luxo.client.UuidBenchmark")
+    jvmArgs("-Xms512m", "-Xmx512m")
+}
+
+tasks.register<JavaExec>("benchmarkCodecText") {
+    group = "verification"
+    description = "Compare strict UTF-8, direct row text reading and response completion"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.luxo.client.CodecTextBenchmark")
+    jvmArgs("-Xms512m", "-Xmx512m")
+}
+
+tasks.register<JavaExec>("benchmarkJSONInputs") {
+    group = "verification"
+    description = "Compare generated JSON input projection with serializer discovery"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.luxo.client.JSONInputBenchmark")
+    jvmArgs("-Xms512m", "-Xmx512m")
+}
+
+tasks.register<JavaExec>("benchmarkJSONNumbers") {
+    group = "verification"
+    description = "Compare strict JSON numeric conversion with the previous primitive readers"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.luxo.client.JsonNumbersBenchmark")
+    jvmArgs("-Xms512m", "-Xmx512m")
+}
+
+tasks.register<JavaExec>("benchmarkJSONKinds") {
+    group = "verification"
+    description = "Compare strict JSON string and boolean readers with previous primitive access"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.luxo.client.JsonKindsBenchmark")
+    jvmArgs("-Xms512m", "-Xmx512m")
+}
+
+// Frozen sources are opt-in test inputs, never a second implementation in the published SDK.
+providers.gradleProperty("luxo.unicodeBaseline").orNull?.let { snapshot ->
+    val baseline = file(snapshot)
+    val generated = layout.projectDirectory.dir(".tmp/unicode-benchmark")
+    val template = layout.projectDirectory.file("benchmark/UnicodeBenchmark.kt.txt")
+    val names = listOf("Codec.kt", "JsonProtocol.kt")
+    val prepare = tasks.register("prepareUnicodeBenchmark") {
+        inputs.files(names.map { baseline.resolve(it) })
+        inputs.file(template)
+        outputs.dir(generated)
+        doLast {
+            val directory = generated.asFile.apply { mkdirs() }
+            for (name in names) {
+                val original = baseline.resolve(name).readText()
+                check(original.startsWith("package com.luxo.client\n")) { "Unexpected baseline package" }
+                directory.resolve(name).writeText(original.replaceFirst("package com.luxo.client",
+                    "package com.luxo.client.unicodebaseline\n\nimport com.luxo.client.*"))
+            }
+            directory.resolve("UnicodeBenchmark.kt").writeText(template.asFile.readText())
+        }
+    }
+    kotlin.sourceSets["test"].kotlin.srcDir(generated)
+    tasks.named("compileTestKotlin") { dependsOn(prepare) }
+    tasks.register<JavaExec>("benchmarkUnicode") {
+        group = "verification"
+        description = "Compare strict Unicode boundaries with explicitly frozen pre-check sources"
+        classpath = sourceSets["test"].runtimeClasspath
+        mainClass.set("com.luxo.client.UnicodeBenchmark")
+        jvmArgs("-Xms512m", "-Xmx512m")
+    }
 }
 
 tasks.wrapper {
@@ -69,7 +278,6 @@ tasks.wrapper {
 // --- Luxo codegen tasks (for user projects) ---
 // Usage:
 //   ./gradlew luxoGenerate -Pluxo.endpoint=http://localhost:4000/luvia -Pluxo.key=YOUR_KEY
-//   ./gradlew luxoAnalyze
 
 tasks.register<JavaExec>("luxoGenerate") {
     group = "luxo"
@@ -83,20 +291,6 @@ tasks.register<JavaExec>("luxoGenerate") {
     args(
         project.findProperty("luxo.endpoint")?.toString() ?: "http://localhost:4000/luvia",
         project.findProperty("luxo.outDir")?.toString() ?: "src/main/kotlin/com/luxo/generated",
-        project.findProperty("luxo.package")?.toString() ?: "com.luxo.generated",
-        project.findProperty("luxo.schemaFile")?.toString()
-            ?: layout.buildDirectory.file("luxo/luxo.schema.json").get().asFile.absolutePath,
-    )
-}
-
-tasks.register<JavaExec>("luxoAnalyze") {
-    group = "luxo"
-    description = "Analyze source code for field access patterns and generate SelectHints"
-    classpath = sourceSets["main"].runtimeClasspath + luxoAnalyzerRuntime
-    mainClass.set("com.luxo.client.SelectAnalyzerCli")
-    args(
-        project.findProperty("luxo.srcDir")?.toString() ?: "src/main/kotlin",
-        project.findProperty("luxo.hintsFile")?.toString() ?: "src/main/kotlin/com/luxo/generated/SelectHints.kt",
         project.findProperty("luxo.package")?.toString() ?: "com.luxo.generated",
         project.findProperty("luxo.schemaFile")?.toString()
             ?: layout.buildDirectory.file("luxo/luxo.schema.json").get().asFile.absolutePath,

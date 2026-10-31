@@ -1,8 +1,9 @@
 package lexer
 
 import (
-	"os"
 	"testing"
+
+	"github.com/light-speak/luxo/internal/testutil"
 )
 
 // Representative .luxo source covering common token types.
@@ -110,13 +111,9 @@ func BenchmarkTokenizeStringTemplate(b *testing.B) {
 	}
 }
 
-// BenchmarkTokenizeDemoFile measures tokenization of the full demo.luxo file.
+// BenchmarkTokenizeDemoFile measures tokenization of the immutable V1 corpus.
 func BenchmarkTokenizeDemoFile(b *testing.B) {
-	data, err := os.ReadFile("../../editors/vscode/examples/demo.luxo")
-	if err != nil {
-		b.Skipf("demo.luxo not found: %v", err)
-	}
-	src := string(data)
+	src := testutil.CompilerDemoV1()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {

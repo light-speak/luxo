@@ -18,7 +18,7 @@ type fieldInfo struct {
 
 // generateModel generates a Go struct for a Luxo model declaration.
 // Pre-computes field widths and aligns output without needing gofmt.
-func generateModel(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
+func generateModel(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool, writers ...*errorDataGenerator) {
 	// Collect effective fields — @soft adds deletedAt if missing.
 	effectiveFields := m.Fields
 	if isSoftDelete(m) && !hasDeletedAtField(m.Fields) {
@@ -56,50 +56,7 @@ func generateModel(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) 
 			fmt.Fprintf(b, "}\n")
 		}
 	}
-	// Generate CreateToken/RefreshToken for @withAuth models
-	for _, d := range m.Directives {
-		if d.Name != "withAuth" {
-			continue
-		}
-		recv := strings.ToLower(m.Name[:1])
-		// Extract stores fields
-		var storeFields []string
-		for _, arg := range d.Args {
-			if arg.Name == "stores" {
-				if list, ok := arg.Value.(*ast.ListExpr); ok {
-					for _, item := range list.Items {
-						if ident, ok := item.(*ast.Ident); ok {
-							storeFields = append(storeFields, ident.Name)
-						}
-					}
-				}
-			}
-		}
-		// CreateToken: builds data map from stores fields, calls auth.Sign
-		fmt.Fprintf(b, "\nfunc (%s *%s) CreateToken() string {\n", recv, m.Name)
-		fmt.Fprintf(b, "\tdata := map[string]any{\n")
-		for _, sf := range storeFields {
-			fmt.Fprintf(b, "\t\t%q: %s.%s,\n", sf, recv, str.Capitalize(sf))
-		}
-		fmt.Fprintf(b, "\t}\n")
-		fmt.Fprintf(b, "\tcfg, err := auth.LoadConfig()\n")
-		fmt.Fprintf(b, "\tif err != nil {\n\t\tfmt.Fprintf(os.Stderr, \"luxo: CreateToken LoadConfig failed: %%v\\n\", err)\n\t\treturn \"\"\n\t}\n")
-		fmt.Fprintf(b, "\ttoken, err := auth.Sign(cfg, data)\n")
-		fmt.Fprintf(b, "\tif err != nil {\n\t\tfmt.Fprintf(os.Stderr, \"luxo: CreateToken Sign failed: %%v\\n\", err)\n\t\treturn \"\"\n\t}\n")
-		fmt.Fprintf(b, "\treturn token\n")
-		fmt.Fprintf(b, "}\n")
-		// RefreshToken
-		fmt.Fprintf(b, "\nfunc (%s *%s) RefreshToken(oldToken string) string {\n", recv, m.Name)
-		fmt.Fprintf(b, "\tcfg, err := auth.LoadConfig()\n")
-		fmt.Fprintf(b, "\tif err != nil {\n\t\tfmt.Fprintf(os.Stderr, \"luxo: RefreshToken LoadConfig failed: %%v\\n\", err)\n\t\treturn \"\"\n\t}\n")
-		fmt.Fprintf(b, "\tdata, err := auth.Verify(cfg, oldToken)\n")
-		fmt.Fprintf(b, "\tif err != nil {\n\t\tfmt.Fprintf(os.Stderr, \"luxo: RefreshToken Verify failed: %%v\\n\", err)\n\t\treturn \"\"\n\t}\n")
-		fmt.Fprintf(b, "\ttoken, err := auth.Sign(cfg, data)\n")
-		fmt.Fprintf(b, "\tif err != nil {\n\t\tfmt.Fprintf(os.Stderr, \"luxo: RefreshToken Sign failed: %%v\\n\", err)\n\t\treturn \"\"\n\t}\n")
-		fmt.Fprintf(b, "\treturn token\n")
-		fmt.Fprintf(b, "}\n")
-		break // only generate once even if @withAuth appears multiple times
-	}
+	generateAuthMethods(b, m, enums, writers)
 }
 
 // generateTypeStruct generates a Go struct for a `type` declaration (non-DB plain data).
@@ -129,7 +86,7 @@ func (g *GeneratorContext) generateExtendStub(b *strings.Builder, ext *ast.Exten
 
 // collectFieldInfos collects field info from declarations and measures column widths.
 func collectFieldInfos(fields []*ast.FieldDecl, enums map[string]bool) ([]fieldInfo, int, int) {
-	var infos []fieldInfo
+	infos := make([]fieldInfo, 0, len(fields))
 	maxName := 0
 	maxType := 0
 	for _, f := range fields {
@@ -177,6 +134,9 @@ func resolveGoType(t *ast.TypeRef) string {
 
 	// base type mapping
 	goType := mapBaseType(t.Name)
+	if t.Name == "Channel" && len(t.TypeArgs) == 1 {
+		goType = "chan " + resolveGoType(t.TypeArgs[0])
+	}
 
 	// nullable → pointer
 	if t.Nullable {

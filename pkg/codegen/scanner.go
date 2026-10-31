@@ -49,9 +49,9 @@ func generateScanner(b *strings.Builder, m *ast.ModelDecl) {
 		fmt.Fprintf(b, "\t\t\tdests[i] = &%s.%s\n", lower, goField)
 	}
 
-	// default: discard unknown columns safely
+	// pgx treats nil as an explicit skip; do not decode discarded values into any.
 	fmt.Fprintf(b, "\t\tdefault:\n")
-	fmt.Fprintf(b, "\t\t\tdests[i] = new(any)\n")
+	fmt.Fprintf(b, "\t\t\tdests[i] = nil\n")
 
 	fmt.Fprintf(b, "\t\t}\n")
 	fmt.Fprintf(b, "\t}\n")

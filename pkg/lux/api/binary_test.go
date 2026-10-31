@@ -3,22 +3,91 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/light-speak/luxo/internal/testutil"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
+	"github.com/light-speak/luxo/pkg/lux/jsonutil"
 	"github.com/light-speak/luxo/pkg/lux/schema"
 	"github.com/shopspring/decimal"
 )
+
+func TestEncodeBinaryRequestOwnsOutput(t *testing.T) {
+	meta := []ParamMeta{{Name: "data", Type: "Bytes", FieldID: 1}}
+	data := bytes.Repeat([]byte{0x5a}, 4096)
+	got, err := EncodeBinaryRequest(1, nil, map[string]any{"data": data}, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := codec.AppendVarint(nil, 1)
+	want = codec.AppendVarint(want, 0)
+	want = codec.AppendVarint(want, 1)
+	want = codec.AppendBytes(want, data)
+	want = append(want, 0)
+	if !bytes.Equal(got, want) {
+		t.Fatal("request wire differs")
+	}
+	data[0] = 0
+	if !bytes.Equal(got, want) {
+		t.Fatal("request aliases caller payload")
+	}
+	bad, err := EncodeBinaryRequest(1, nil, map[string]any{"data": data, "unknown": true}, meta)
+	if err == nil || bad != nil {
+		t.Fatal("invalid request returned a partial body")
+	}
+}
+
+func TestEncodeBinaryParamRejectsNonPositiveFieldID(t *testing.T) {
+	for _, id := range []int{0, -1} {
+		var enc codec.Encoder
+		err := encodeBinaryParam(&enc, ParamMeta{Name: "value", Type: "Int", FieldID: id}, int64(7))
+		if err == nil || !strings.Contains(err.Error(), "invalid field ID") {
+			t.Fatalf("field ID %d: expected metadata error, got %v", id, err)
+		}
+		if len(enc.Bytes()) != 0 {
+			t.Fatalf("field ID %d emitted partial parameter bytes", id)
+		}
+	}
+}
+
+func TestBinaryFloatRejectsNonFiniteRequestValues(t *testing.T) {
+	for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		for _, list := range []bool{false, true} {
+			meta := []ParamMeta{{Name: "value", Type: "Float", FieldID: 1, IsList: list}}
+			var input any = value
+			if list {
+				input = []float64{1, value}
+			}
+			if body, err := EncodeBinaryRequest(1, nil, map[string]any{"value": input}, meta); err == nil || body != nil {
+				t.Errorf("non-finite Float encoded: list=%v err=%v body=%x", list, err, body)
+			}
+			registry := NewAPIRegistry()
+			registry.Register("read", 1)
+			registry.RegisterParams("read", meta)
+			wire := []byte{1, 0, 1}
+			if list {
+				wire = append(wire, 1)
+			}
+			wire = binary.LittleEndian.AppendUint64(wire, math.Float64bits(value))
+			if _, err := registry.ParseBinaryRequest(append(wire, 0)); err == nil {
+				t.Errorf("non-finite Float parsed: list=%v", list)
+			}
+		}
+	}
+}
 
 func mustEncodeBinaryRequest(t *testing.T, apiID int, fieldMask []byte, params map[string]any, meta []ParamMeta) []byte {
 	t.Helper()
@@ -30,7 +99,37 @@ func mustEncodeBinaryRequest(t *testing.T, apiID int, fieldMask []byte, params m
 }
 
 func testSelectionMask(fieldMask []byte, children ...codec.SelectionMaskChild) []byte {
-	return codec.AppendSelectionMask(nil, fieldMask, children)
+	// Deliberately independent of the checked constructor: parser tests need bad wire.
+	mask := codec.AppendVarint(nil, uint64(len(fieldMask)))
+	mask = append(mask, fieldMask...)
+	for _, child := range children {
+		mask = codec.AppendVarint(mask, uint64(child.FieldID))
+		mask = codec.AppendVarint(mask, uint64(len(child.Mask)))
+		mask = append(mask, child.Mask...)
+	}
+	return mask
+}
+
+func TestBinaryRequestRejectsSelectionFieldOverflow(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("read", 1)
+	fields := make([]byte, codec.MaxSelectionMaskBytes)
+	fields[len(fields)-1] = 0x80
+	for _, mask := range [][]byte{
+		testSelectionMask(fields),
+		testSelectionMask(append(fields, 1)),
+		testSelectionMask([]byte{1}, codec.SelectionMaskChild{FieldID: codec.MaxSelectionFieldID + 1, Mask: []byte{1, 1}}),
+	} {
+		wire := codec.AppendVarint([]byte{1}, uint64(len(mask)))
+		wire = append(wire, mask...)
+		wire = append(wire, 0)
+		if _, err := reg.ParseBinaryRequest(wire); err == nil {
+			t.Fatal("request parser accepted out-of-range selection")
+		}
+		if _, err := EncodeBinaryRequest(1, mask, nil, nil); err == nil {
+			t.Fatal("request encoder accepted out-of-range selection")
+		}
+	}
 }
 
 func TestBinaryRequestRoundTrip(t *testing.T) {
@@ -124,8 +223,8 @@ func TestPrepareJSONRequestParamsProducesCanonicalBinary(t *testing.T) {
 	if got, err := canonical.ParamInt("id"); err != nil || got != 42 {
 		t.Fatalf("canonical id = %d, err = %v", got, err)
 	}
-	var payload map[string]bool
-	if err := canonical.ParamJSON("payload", &payload); err != nil || !payload["ok"] {
+	payload, err := canonical.ParamRawJSON("payload")
+	if err != nil || string(payload) != `{"ok":true}` {
 		t.Fatalf("canonical payload = %v, err = %v", payload, err)
 	}
 }
@@ -228,6 +327,68 @@ func TestJSONParamValueCanonicalDurationAndBytes(t *testing.T) {
 	}
 }
 
+func TestJSONParamValuePreservesFullWidthIntegers(t *testing.T) {
+	for _, kind := range []string{"Int", "Duration"} {
+		for _, value := range []int64{0, -1, 9007199254740993, -9007199254740993, 9223372036854775807, -9223372036854775808} {
+			for _, list := range []bool{false, true} {
+				raw := fmt.Sprint(value)
+				var want any = value
+				if list {
+					raw, want = "[ "+raw+" ]", []int64{value}
+				}
+				req := &Request{Params: map[string]json.RawMessage{"value": []byte(raw)}}
+				got, present, err := (&APIRegistry{}).jsonParamValue(req, ParamMeta{Name: "value", Type: kind, IsList: list})
+				if err != nil || !present || !reflect.DeepEqual(got, want) {
+					t.Fatalf("%s %s = %#v, %t, %v; want %#v", kind, raw, got, present, err, want)
+				}
+			}
+		}
+	}
+}
+
+func TestJSONParamValueRejectsNonIntegerTokens(t *testing.T) {
+	for _, kind := range []string{"Int", "Duration"} {
+		for _, token := range []string{"true", "1.0", "1e0", "9223372036854775808", "-9223372036854775809", `"1"`, "", "+1", "01", "-01", "-", "1 2"} {
+			for _, list := range []bool{false, true} {
+				raw := token
+				if list {
+					raw = "[0," + token + "]"
+				}
+				req := &Request{Params: map[string]json.RawMessage{"value": []byte(raw)}}
+				if _, _, err := (&APIRegistry{}).jsonParamValue(req, ParamMeta{Name: "value", Type: kind, IsList: list}); err == nil {
+					t.Errorf("%s accepted %q", kind, raw)
+				}
+			}
+		}
+	}
+}
+
+func TestJSONIntegerArrayBoundsAndWhitespace(t *testing.T) {
+	meta := ParamMeta{Name: "values", Type: "Int", IsList: true}
+	for _, raw := range []string{"[]", " \n[ \t] \r"} {
+		got, err := decodeJSONIntegerParam([]byte(raw), meta)
+		if err != nil || len(got.([]int64)) != 0 {
+			t.Fatalf("empty array %q = %v, %v", raw, got, err)
+		}
+	}
+	if value, err := jsonutil.ParseInt64([]byte(" \n-0\t")); value != 0 || err != nil {
+		t.Fatalf("negative zero = %v, %v", value, err)
+	}
+	for _, raw := range []string{"", "1", "{}", "[1", "1]", "[null]", "[1,]", "[,1]"} {
+		if _, err := decodeJSONIntegerParam([]byte(raw), meta); err == nil {
+			t.Errorf("accepted invalid array %q", raw)
+		}
+	}
+	boundary := "[" + strings.Repeat("0,", codec.MaxArrayElements-1) + "0]"
+	got, err := decodeJSONIntegerParam([]byte(boundary), meta)
+	if err != nil || len(got.([]int64)) != codec.MaxArrayElements {
+		t.Fatalf("maximum array = %v", err)
+	}
+	if _, err := decodeJSONIntegerParam([]byte("[0,"+boundary[1:]), meta); err == nil {
+		t.Fatal("accepted oversized array")
+	}
+}
+
 func TestJSONParamValueRejectsInvalidDurationAndBytes(t *testing.T) {
 	tests := []struct {
 		name string
@@ -279,7 +440,7 @@ func TestEncodeBinaryRequestPreservesMaskBytesAndBinaryTypes(t *testing.T) {
 	selectionMask := testSelectionMask([]byte{0x12, 0x80})
 	body := mustEncodeBinaryRequest(t, 7, selectionMask, map[string]any{
 		"chunks":   [][]byte{{0xde, 0xad}, {}},
-		"metadata": map[string]any{"ok": true},
+		"metadata": json.RawMessage(`{"ok":true}`),
 	}, meta)
 
 	req, err := reg.ParseBinaryRequest(body)
@@ -636,7 +797,9 @@ func TestParseBinaryRequestRejectsMissingRequiredSchemaParam(t *testing.T) {
 	reg.RegisterParams("create", []ParamMeta{{Name: "input", Type: "Model", TypeName: "CreateInput", FieldID: 1}})
 	s := schema.New()
 	s.RegisterAPI(&schema.API{ID: 1, Name: "create", Params: []schema.Param{{ID: 1, Name: "input", Type: schema.FieldModel, TypeName: "CreateInput"}}})
-	reg.SetSchema(s)
+	if err := reg.SetSchema(s); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := reg.ParseBinaryRequest([]byte{1, 0, 0}); err == nil {
 		t.Fatal("missing required structured parameter was accepted")
@@ -650,7 +813,9 @@ func TestJSONStructuredParamRejectsInvalidShapes(t *testing.T) {
 	}
 
 	reg := NewAPIRegistry()
-	reg.SetSchema(schema.New())
+	if err := reg.SetSchema(schema.New()); err != nil {
+		t.Fatal(err)
+	}
 	if _, _, err := reg.jsonStructuredParam(json.RawMessage(`{}`), meta); err == nil {
 		t.Fatal("unknown structured parameter type was accepted")
 	}
@@ -660,6 +825,20 @@ func TestJSONStructuredParamRejectsInvalidShapes(t *testing.T) {
 	}
 	if _, _, err := reg.jsonStructuredParam(json.RawMessage(`[{}]`), meta); err == nil {
 		t.Fatal("invalid structured list element was accepted")
+	}
+}
+
+func TestJSONStructuredParamArrayLimit(t *testing.T) {
+	s := schema.New()
+	s.RegisterType(&schema.TypeDecl{Name: "Input", Fields: []schema.Field{{ID: 1, Name: "id", Type: schema.FieldInt}}})
+	reg := NewAPIRegistry()
+	if err := reg.SetSchema(s); err != nil {
+		t.Fatal(err)
+	}
+	meta := ParamMeta{Name: "inputs", Type: "Model", TypeName: "Input", IsList: true}
+	raw := []byte("[" + strings.Repeat("{},", codec.MaxArrayElements) + "{}]")
+	if data, present, err := reg.jsonStructuredParam(raw, meta); err == nil || present || data != nil || !strings.Contains(err.Error(), "array size exceeds limit") {
+		t.Fatalf("oversized structured input list: present=%v error=%v", present, err)
 	}
 }
 
@@ -779,14 +958,14 @@ func TestParamStringArrayBinary(t *testing.T) {
 
 // --- ParamJSON with paramSlots ---
 
-func TestParamJSONBinary(t *testing.T) {
+func TestLegacyParamJSONBinary(t *testing.T) {
 	req := &Request{
 		paramNames: []string{"data"},
 		paramCount: 1,
 		paramSlots: [16]any{"some-value"},
 	}
 	var v any
-	err := req.ParamJSON("data", &v)
+	err := req.LegacyParamJSON("data", &v)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -795,17 +974,17 @@ func TestParamJSONBinary(t *testing.T) {
 	}
 
 	// Missing required params fail; callers must opt into optional semantics.
-	err = req.ParamJSON("missing", &v)
+	err = req.LegacyParamJSON("missing", &v)
 	if err == nil {
 		t.Fatal("binary mode missing required param should error")
 	}
-	if err = req.ParamJSONOptional("missing", &v); err != nil {
+	if err = req.LegacyParamJSONOptional("missing", &v); err != nil {
 		t.Fatal("binary mode missing optional param should not error")
 	}
 
-	// Non-*any target in binary mode — assignBinaryParam handles typed assignment
+	// Non-*any target in binary mode — legacyAssignBinaryParam handles typed assignment
 	var s string
-	err = req.ParamJSON("data", &s)
+	err = req.LegacyParamJSON("data", &s)
 	if err != nil {
 		t.Fatal("should assign string target in binary mode")
 	}
@@ -872,8 +1051,10 @@ func TestParseBinaryRequestDecodesFieldMaskFromSchema(t *testing.T) {
 	reg.Register("getUser", 1)
 	s := schema.New()
 	s.RegisterModel(&schema.Model{Name: "User", Fields: []schema.Field{{ID: 1, Name: "id"}, {ID: 2, Name: "name"}}})
-	s.RegisterAPI(&schema.API{Name: "getUser", ReturnType: "User"})
-	reg.SetSchema(s)
+	s.RegisterAPI(&schema.API{ID: 1, Name: "getUser", ReturnType: "User"})
+	if err := reg.SetSchema(s); err != nil {
+		t.Fatal(err)
+	}
 
 	mask := testSelectionMask([]byte{0b00000010})
 	body := append([]byte{1, byte(len(mask))}, mask...)
@@ -894,15 +1075,17 @@ func TestDecodeFieldMaskMissingMetadata(t *testing.T) {
 	}
 
 	s := schema.New()
-	reg.SetSchema(s)
+	if err := reg.SetSchema(s); err != nil {
+		t.Fatal(err)
+	}
 	if fields, err := reg.decodeFieldMask("missing", testSelectionMask([]byte{1})); err != nil || fields != nil {
 		t.Fatalf("missing API fields = %#v, want nil", fields)
 	}
-	s.RegisterAPI(&schema.API{Name: "scalar"})
+	s.RegisterAPI(&schema.API{ID: 1, Name: "scalar"})
 	if fields, err := reg.decodeFieldMask("scalar", testSelectionMask([]byte{1})); err != nil || fields != nil {
 		t.Fatalf("scalar API fields = %#v, want nil", fields)
 	}
-	s.RegisterAPI(&schema.API{Name: "unknown", ReturnType: "Missing"})
+	s.RegisterAPI(&schema.API{ID: 2, Name: "unknown", ReturnType: "Missing"})
 	if fields, err := reg.decodeFieldMask("unknown", testSelectionMask([]byte{1})); err != nil || fields != nil {
 		t.Fatalf("missing return type fields = %#v, want nil", fields)
 	}
@@ -912,8 +1095,10 @@ func TestDecodeFieldMaskTypeDeclaration(t *testing.T) {
 	reg := NewAPIRegistry()
 	s := schema.New()
 	s.RegisterType(&schema.TypeDecl{Name: "Payload", Fields: []schema.Field{{ID: 1, Name: "id"}}})
-	s.RegisterAPI(&schema.API{Name: "payload", ReturnType: "Payload"})
-	reg.SetSchema(s)
+	s.RegisterAPI(&schema.API{ID: 1, Name: "payload", ReturnType: "Payload"})
+	if err := reg.SetSchema(s); err != nil {
+		t.Fatal(err)
+	}
 
 	fields, err := reg.decodeFieldMask("payload", testSelectionMask([]byte{0b00000001}))
 	if err != nil {
@@ -1005,6 +1190,83 @@ func TestParseBinaryRequestRejectsNonCanonicalBoolArray(t *testing.T) {
 	}
 }
 
+func TestBinaryRequestsRejectUnsignedArrayCountOverflow(t *testing.T) {
+	for _, typeName := range []string{"Int", "Duration", "Float", "DateTime", "String", "Enum", "Decimal", "Boolean", "UUID", "Bytes", "JSON", "Model"} {
+		for _, count := range []uint64{codec.MaxArrayElements + 1, 1 << 31, 1 << 32, 1 << 63, math.MaxUint64} {
+			t.Run(fmt.Sprintf("%s/%d", typeName, count), func(t *testing.T) {
+				defer func() {
+					if failure := recover(); failure != nil {
+						t.Errorf("untrusted array count caused a panic: %v", failure)
+					}
+				}()
+				registry := NewAPIRegistry()
+				registry.Register("test", 1)
+				registry.RegisterParams("test", []ParamMeta{{Name: "values", Type: typeName, IsList: true, FieldID: 1}})
+				body := codec.AppendVarint([]byte{1, 0, 1}, count)
+				body = append(body, 0)
+				if _, err := registry.ParseBinaryRequest(body); err == nil {
+					t.Fatal("oversized array count accepted")
+				}
+			})
+		}
+	}
+}
+
+func TestBinaryArrayOverflowReturnsBadRequestBeforeHandler(t *testing.T) {
+	router := NewRouterWithOptions(RouterOptions{})
+	router.Registry.Register("inspect", 1)
+	router.Registry.RegisterParams("inspect", []ParamMeta{{Name: "values", Type: "Int", IsList: true, FieldID: 1}})
+	called := false
+	router.Handle("inspect", func(context.Context, *Request) error {
+		called = true
+		return nil
+	})
+	for _, count := range []uint64{1 << 63, math.MaxUint64} {
+		body := codec.AppendVarint([]byte{1, 0, 1}, count)
+		body = append(body, 0)
+		request := httptest.NewRequest(http.MethodPost, "/luvia", bytes.NewReader(body))
+		request.Header.Set("X-Luxo-Mode", "binary")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest || called {
+			t.Fatalf("overflow reached handler or wrong status: %d, called=%v", response.Code, called)
+		}
+	}
+}
+
+func TestBinaryListPreflightsElementPayload(t *testing.T) {
+	for _, kind := range []string{"Int", "Duration", "Float", "DateTime", "String", "Enum", "Decimal", "Boolean", "UUID", "Bytes", "JSON", "Model"} {
+		t.Run(kind, func(t *testing.T) {
+			width := 1
+			if kind == "Float" {
+				width = 8
+			} else if kind == "UUID" {
+				width = 16
+			}
+			for end := range 3 * width {
+				data := append(codec.AppendArrayHeader([]byte{42}, 3), make([]byte, end)...)
+				value, consumed, err := readBinaryListParam(data, 1, ParamMeta{Name: "values", Type: kind})
+				if value != nil || consumed != 0 || err == nil || !strings.Contains(err.Error(), "insufficient element bytes") {
+					t.Fatalf("short payload not rejected before decoding: end=%d consumed=%d err=%v", end, consumed, err)
+				}
+			}
+		})
+	}
+}
+
+func TestBinaryListPreflightKeepsItemValidation(t *testing.T) {
+	for _, kind := range []string{"Int", "Duration", "DateTime", "String", "Enum", "Decimal", "Boolean", "Bytes", "JSON", "Model"} {
+		wire := []byte{1, 0x80}
+		if kind == "DateTime" {
+			wire = append(wire, 0x80)
+		}
+		_, _, err := readBinaryListParam(wire, 0, ParamMeta{Name: "values", Type: kind})
+		if err == nil || strings.Contains(err.Error(), "insufficient element bytes") {
+			t.Errorf("%s did not validate its encoded element: %v", kind, err)
+		}
+	}
+}
+
 // --- ParseBinaryRequest: field mask exceeds body ---
 
 func TestParseBinaryRequestFieldMaskExceedsBody(t *testing.T) {
@@ -1057,11 +1319,13 @@ func TestParseBinaryRequestDecodesNestedFieldMask(t *testing.T) {
 		{ID: 1, Name: "id"},
 		{ID: 3, Name: "posts", Type: schema.FieldModel, TypeName: "Post", IsList: true, Relation: true},
 	}})
-	s.RegisterAPI(&schema.API{Name: "getUser", ReturnType: "User"})
-	reg.SetSchema(s)
-	child := testSelectionMask(codec.FieldMaskSet(nil, 2))
-	rootFields := codec.FieldMaskSet(nil, 1)
-	rootFields = codec.FieldMaskSet(rootFields, 3)
+	s.RegisterAPI(&schema.API{ID: 1, Name: "getUser", ReturnType: "User"})
+	if err := reg.SetSchema(s); err != nil {
+		t.Fatal(err)
+	}
+	child := testSelectionMask(testutil.Bytes(t)(codec.FieldMaskSet(nil, 2)))
+	rootFields := testutil.Bytes(t)(codec.FieldMaskSet(nil, 1))
+	rootFields = testutil.Bytes(t)(codec.FieldMaskSet(rootFields, 3))
 	mask := testSelectionMask(rootFields, codec.SelectionMaskChild{FieldID: 3, Mask: child})
 
 	req, err := reg.ParseBinaryRequest(mustEncodeBinaryRequest(t, 1, mask, nil, nil))
@@ -1078,10 +1342,12 @@ func TestParseBinaryRequestRejectsInvalidSelectionTree(t *testing.T) {
 	reg.Register("getUser", 1)
 	s := schema.New()
 	s.RegisterModel(&schema.Model{Name: "User", Fields: []schema.Field{{ID: 1, Name: "id"}}})
-	s.RegisterAPI(&schema.API{Name: "getUser", ReturnType: "User"})
-	reg.SetSchema(s)
+	s.RegisterAPI(&schema.API{ID: 1, Name: "getUser", ReturnType: "User"})
+	if err := reg.SetSchema(s); err != nil {
+		t.Fatal(err)
+	}
 
-	unknown := testSelectionMask(codec.FieldMaskSet(nil, 2))
+	unknown := testSelectionMask(testutil.Bytes(t)(codec.FieldMaskSet(nil, 2)))
 	body := append([]byte{1, byte(len(unknown))}, unknown...)
 	body = append(body, 0)
 	if _, err := reg.ParseBinaryRequest(body); err == nil {
@@ -1122,7 +1388,9 @@ func TestAPIRegistryAppliesSchemaPaginationDefaults(t *testing.T) {
 			{ID: 2, Name: "pageSize", Type: schema.FieldInt, HasDefault: true},
 		},
 	})
-	reg.SetSchema(s)
+	if err := reg.SetSchema(s); err != nil {
+		t.Fatal(err)
+	}
 
 	binaryReq, err := reg.ParseBinaryRequest(mustEncodeBinaryRequest(t, 1, nil, nil, meta))
 	if err != nil {
@@ -1158,7 +1426,9 @@ func TestAPIRegistryPreservesExplicitPagination(t *testing.T) {
 	reg.RegisterParams("browseUsers", meta)
 	s := schema.New()
 	s.RegisterAPI(&schema.API{ID: 1, Name: "browseUsers", Paginated: true, DefaultPageSize: 50})
-	reg.SetSchema(s)
+	if err := reg.SetSchema(s); err != nil {
+		t.Fatal(err)
+	}
 
 	binaryReq, err := reg.ParseBinaryRequest(mustEncodeBinaryRequest(t, 1, nil, map[string]any{"page": 3, "pageSize": 7}, meta))
 	if err != nil {
@@ -1193,7 +1463,9 @@ func TestAPIRegistryRejectsInvalidSchemaPaginationDefaults(t *testing.T) {
 		reg.Register("browseUsers", 1)
 		s := schema.New()
 		s.RegisterAPI(&schema.API{ID: 1, Name: "browseUsers", Paginated: true, DefaultPageSize: invalid})
-		reg.SetSchema(s)
+		if err := reg.SetSchema(s); err != nil {
+			t.Fatal(err)
+		}
 		req, err := reg.ParseBinaryRequest([]byte{1, 0, 0})
 		if err != nil {
 			t.Fatal(err)
@@ -1226,6 +1498,31 @@ func TestBinaryRequestRoundTripsFiltersAndSorters(t *testing.T) {
 	}
 }
 
+func TestJSONListControlsPreserveValuesThroughCanonicalRequest(t *testing.T) {
+	reg := NewAPIRegistry()
+	reg.Register("listUsers", 1)
+	reg.RegisterParams("listUsers", []ParamMeta{{Name: "page", Type: "Int", FieldID: 1}, {Name: "pageSize", Type: "Int", FieldID: 2}})
+	for _, token := range []string{"9223372036854775807", "123456789012345678901234567890", "0.123456789012345678901", "1e9999", "-0", "true", `"\u6771\u4eac"`} {
+		body := `{"$api":"listUsers","$filters":[{"FIELD":"name","Op":"eq","VALUE":` + token + `}],` +
+			`"$sorters":[{"Field":"name","ORDER":"desc"}],"page":2,"pageSize":7}`
+		original, err := ParseRequest(makeReq(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := reg.prepareJSONRequest(original); err != nil {
+			t.Fatal(err)
+		}
+		forwarded, err := reg.ParseBinaryRequest(original.BinaryRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(forwarded.Filters, original.Filters) || !reflect.DeepEqual(forwarded.Sorters, original.Sorters) ||
+			forwarded.Page != original.Page || forwarded.PageSize != original.PageSize {
+			t.Fatalf("list controls changed during forwarding: %s / %+v", token, forwarded)
+		}
+	}
+}
+
 func TestBinaryRequestRejectsInvalidListControls(t *testing.T) {
 	invalid := []map[string]any{
 		{"$filters": []Filter{{Field: "name", Operator: "unknown", Value: "x"}}},
@@ -1251,7 +1548,7 @@ func TestParseBinaryRequestRejectsMalformedListControls(t *testing.T) {
 	body = codec.AppendVarint(body, 0)
 	body = codec.AppendVarint(body, BinarySortersFieldID)
 	body = codec.AppendVarint(body, 1)
-	body = codec.AppendString(body, "name")
+	body = codec.AppendBytes(body, []byte("name"))
 	body = codec.AppendVarint(body, 2)
 	body = append(body, 0)
 	if _, err := reg.ParseBinaryRequest(body); err == nil {
@@ -1270,13 +1567,13 @@ func TestParseBinaryRequestRejectsAllMalformedListControlShapes(t *testing.T) {
 	}
 	filter := func(field string, operator uint64, value string) []byte {
 		payload := codec.AppendVarint(nil, 1)
-		payload = codec.AppendString(payload, field)
+		payload = codec.AppendBytes(payload, []byte(field))
 		payload = codec.AppendVarint(payload, operator)
-		return codec.AppendString(payload, value)
+		return codec.AppendBytes(payload, []byte(value))
 	}
 	sorter := func(field string, descending byte) []byte {
 		payload := codec.AppendVarint(nil, 1)
-		payload = codec.AppendString(payload, field)
+		payload = codec.AppendBytes(payload, []byte(field))
 		return append(payload, descending)
 	}
 	tests := [][]byte{
@@ -1284,6 +1581,7 @@ func TestParseBinaryRequestRejectsAllMalformedListControlShapes(t *testing.T) {
 		request(BinaryFiltersFieldID, filter("", 1, "x")),
 		request(BinaryFiltersFieldID, filter("name", 11, "x")),
 		request(BinaryFiltersFieldID, []byte{1, 4, 'n'}),
+		request(BinaryFiltersFieldID, []byte{1, 1, 'n', 1, 3, 'x'}),
 		request(BinarySortersFieldID, codec.AppendVarint(nil, 101)),
 		request(BinarySortersFieldID, sorter("", 0)),
 		request(BinarySortersFieldID, sorter("name", 2)),
@@ -1384,7 +1682,7 @@ func TestEncodeBinaryRequestFloat(t *testing.T) {
 func TestReadBinaryParamDateTime(t *testing.T) {
 	unixSec := int64(1776427200) // 2026-04-17T12:00:00Z
 	var buf []byte
-	buf = codec.AppendSvarint(buf, unixSec)
+	buf = testutil.Bytes(t)(codec.AppendDateTime(buf, time.Unix(unixSec, 0)))
 
 	val, n, err := readBinaryParam(buf, 0, ParamMeta{Name: "date", Type: "DateTime"})
 	if err != nil {
@@ -1400,7 +1698,7 @@ func TestReadBinaryParamDateTime(t *testing.T) {
 
 func TestReadBinaryParamEnum(t *testing.T) {
 	var buf []byte
-	buf = codec.AppendString(buf, "admin")
+	buf = codec.AppendBytes(buf, []byte("admin"))
 
 	val, n, err := readBinaryParam(buf, 0, ParamMeta{Name: "role", Type: "Enum"})
 	if err != nil {
@@ -1500,17 +1798,14 @@ func TestStructuredBinaryParamsRejectInvalidMessageContainers(t *testing.T) {
 	}
 }
 
-func TestStructuredJSONParamsRoundTripIntoTypedTargets(t *testing.T) {
-	type input struct {
-		Name string `json:"name"`
-	}
+func TestJSONParamsRoundTripPreservesRawDocuments(t *testing.T) {
 	meta := []ParamMeta{
 		{Name: "input", Type: "JSON", FieldID: 1},
 		{Name: "inputs", Type: "JSON", FieldID: 2, IsList: true},
 	}
 	body := mustEncodeBinaryRequest(t, 9, nil, map[string]any{
-		"input":  input{Name: "one"},
-		"inputs": []any{input{Name: "two"}, input{Name: "three"}},
+		"input":  json.RawMessage(`{"name":"one"}`),
+		"inputs": []json.RawMessage{json.RawMessage(`{"name":"two"}`), json.RawMessage(`{"name":"three"}`)},
 	}, meta)
 	registry := NewAPIRegistry()
 	registry.Register("create", 9)
@@ -1519,16 +1814,44 @@ func TestStructuredJSONParamsRoundTripIntoTypedTargets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var one input
-	var many []input
-	if err := req.ParamJSON("input", &one); err != nil {
+	one, err := req.ParamRawJSON("input")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := req.ParamJSON("inputs", &many); err != nil {
+	many, err := req.ParamRawJSONArray("inputs")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if one.Name != "one" || !reflect.DeepEqual(many, []input{{Name: "two"}, {Name: "three"}}) {
+	if string(one) != `{"name":"one"}` || !reflect.DeepEqual(many, []json.RawMessage{json.RawMessage(`{"name":"two"}`), json.RawMessage(`{"name":"three"}`)}) {
 		t.Fatalf("round trip = %#v / %#v", one, many)
+	}
+}
+
+func TestTypedJSONListEncoding(t *testing.T) {
+	meta := []ParamMeta{{Name: "values", Type: "JSON", FieldID: 1, IsList: true}}
+	registry := NewAPIRegistry()
+	registry.Register("read", 9)
+	registry.RegisterParams("read", meta)
+	for _, documents := range [][]json.RawMessage{
+		{}, {[]byte("null")}, {[]byte(`123456789012345678901234567890`), []byte(`1.234567890123456789`), []byte(`{"text":"東京"}`)},
+	} {
+		body := mustEncodeBinaryRequest(t, 9, nil, map[string]any{"values": documents}, meta)
+		req, err := registry.ParseBinaryRequest(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := req.ParamRawJSONArray("values")
+		if err != nil || !reflect.DeepEqual(got, documents) {
+			t.Fatalf("documents changed: %q, %v", got, err)
+		}
+	}
+	for _, invalid := range [][]json.RawMessage{
+		{nil}, {[]byte(`1 2`)}, {[]byte(`"\uD800"`)}, {[]byte{'"', 0xff, '"'}}, make([]json.RawMessage, codec.MaxArrayElements+1),
+	} {
+		body, err := EncodeBinaryRequest(9, nil, map[string]any{"values": invalid}, meta)
+		if err == nil || body != nil {
+			t.Fatal("invalid JSON list published a request")
+		}
 	}
 }
 
@@ -1558,12 +1881,14 @@ func TestNullableBinaryParamsDistinguishNullPresentAndAbsent(t *testing.T) {
 	if req.HasParam("bio") || req.ParamIsNull("bio") {
 		t.Fatal("absent param must remain absent")
 	}
-	var nickname *string
-	if err := req.ParamJSONOptionalNullable("nickname", &nickname); err != nil || nickname != nil {
-		t.Fatalf("nickname = %v, err = %v", nickname, err)
+	if req.ParamIsNull("unregistered") {
+		t.Fatal("unregistered parameter was treated as explicit null")
 	}
-	var age *int64
-	if err := req.ParamJSONOptionalNullable("age", &age); err != nil || age == nil || *age != 42 {
+	if _, err := req.ParamString("nickname"); err == nil {
+		t.Fatal("explicit null was accepted by the non-null string getter")
+	}
+	age, err := req.ParamInt("age")
+	if err != nil || age != 42 {
 		t.Fatalf("age = %v, err = %v", age, err)
 	}
 }
@@ -1603,7 +1928,7 @@ func TestParseBinaryRequestRejectsMalformedParamEnvelope(t *testing.T) {
 
 func TestReadBinaryParamDecimal(t *testing.T) {
 	var buf []byte
-	buf = codec.AppendString(buf, "123.456")
+	buf = codec.AppendBytes(buf, []byte("123.456"))
 
 	val, n, err := readBinaryParam(buf, 0, ParamMeta{Name: "price", Type: "Decimal"})
 	if err != nil {
@@ -1644,7 +1969,7 @@ func TestParseBinaryRequestListParams(t *testing.T) {
 	enc.WriteFieldFloatArray(2, []float64{1.5, -2.25})
 	enc.WriteFieldStringArray(3, []string{"a", "bb"})
 	enc.WriteFieldBoolArray(4, []bool{true, false})
-	enc.WriteFieldIntArray(5, []int64{0, 1_700_000_000})
+	enc.WriteFieldDateTimeArray(5, []time.Time{time.Unix(0, 0), time.Unix(1_700_000_000, 0)})
 	enc.WriteFieldIntArray(6, []int64{10, 20})
 	uuidA := [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00}
 	enc.WriteFieldUUIDArray(7, [][16]byte{uuidA})
@@ -1681,11 +2006,11 @@ func TestParseBinaryRequestListParams(t *testing.T) {
 	}
 }
 
-// --- assignBinaryParam ---
+// --- legacyAssignBinaryParam ---
 
-func TestAssignBinaryParamStringPtr(t *testing.T) {
+func TestLegacyAssignBinaryParamStringPtr(t *testing.T) {
 	var s *string
-	err := assignBinaryParam("hello", &s)
+	err := legacyAssignBinaryParam("hello", &s)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1694,9 +2019,9 @@ func TestAssignBinaryParamStringPtr(t *testing.T) {
 	}
 }
 
-func TestAssignBinaryParamInt64Ptr(t *testing.T) {
+func TestLegacyAssignBinaryParamInt64Ptr(t *testing.T) {
 	var i *int64
-	err := assignBinaryParam(int64(42), &i)
+	err := legacyAssignBinaryParam(int64(42), &i)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1705,9 +2030,9 @@ func TestAssignBinaryParamInt64Ptr(t *testing.T) {
 	}
 }
 
-func TestAssignBinaryParamFloat64Ptr(t *testing.T) {
+func TestLegacyAssignBinaryParamFloat64Ptr(t *testing.T) {
 	var f *float64
-	err := assignBinaryParam(float64(3.14), &f)
+	err := legacyAssignBinaryParam(float64(3.14), &f)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1716,9 +2041,9 @@ func TestAssignBinaryParamFloat64Ptr(t *testing.T) {
 	}
 }
 
-func TestAssignBinaryParamBoolPtr(t *testing.T) {
+func TestLegacyAssignBinaryParamBoolPtr(t *testing.T) {
 	var b *bool
-	err := assignBinaryParam(true, &b)
+	err := legacyAssignBinaryParam(true, &b)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1727,9 +2052,9 @@ func TestAssignBinaryParamBoolPtr(t *testing.T) {
 	}
 }
 
-func TestAssignBinaryParamStringDirect(t *testing.T) {
+func TestLegacyAssignBinaryParamStringDirect(t *testing.T) {
 	var s string
-	err := assignBinaryParam("world", &s)
+	err := legacyAssignBinaryParam("world", &s)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1738,9 +2063,9 @@ func TestAssignBinaryParamStringDirect(t *testing.T) {
 	}
 }
 
-func TestAssignBinaryParamInt64Direct(t *testing.T) {
+func TestLegacyAssignBinaryParamInt64Direct(t *testing.T) {
 	var i int64
-	err := assignBinaryParam(int64(99), &i)
+	err := legacyAssignBinaryParam(int64(99), &i)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1749,9 +2074,9 @@ func TestAssignBinaryParamInt64Direct(t *testing.T) {
 	}
 }
 
-func TestAssignBinaryParamFloat64Direct(t *testing.T) {
+func TestLegacyAssignBinaryParamFloat64Direct(t *testing.T) {
 	var f float64
-	err := assignBinaryParam(float64(2.71), &f)
+	err := legacyAssignBinaryParam(float64(2.71), &f)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1760,9 +2085,9 @@ func TestAssignBinaryParamFloat64Direct(t *testing.T) {
 	}
 }
 
-func TestAssignBinaryParamBoolDirect(t *testing.T) {
+func TestLegacyAssignBinaryParamBoolDirect(t *testing.T) {
 	var b bool
-	err := assignBinaryParam(true, &b)
+	err := legacyAssignBinaryParam(true, &b)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1771,10 +2096,10 @@ func TestAssignBinaryParamBoolDirect(t *testing.T) {
 	}
 }
 
-func TestAssignBinaryParamTypeMismatch(t *testing.T) {
+func TestLegacyAssignBinaryParamTypeMismatch(t *testing.T) {
 	// Assigning int64 to *string should silently return nil (no error, no assignment)
 	var s string
-	err := assignBinaryParam(int64(42), &s)
+	err := legacyAssignBinaryParam(int64(42), &s)
 	if err != nil {
 		t.Fatal("should not error on type mismatch")
 	}
@@ -1798,8 +2123,8 @@ func TestEncodeBinaryRequestDuration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var v time.Duration
-	if err := req.ParamJSON("dur", &v); err != nil {
+	v, err := req.ParamDuration("dur")
+	if err != nil {
 		t.Fatal(err)
 	}
 	if v != 3600 {
@@ -1981,7 +2306,7 @@ func TestEncodeBinaryRequestAllScalarTypesRoundTrip(t *testing.T) {
 		"integer": int(42), "float": float32(1.5), "text": "luxo", "active": true,
 		"createdAt": instant, "ttl": 3 * time.Second, "id": id,
 		"price": decimal.RequireFromString("12.50"), "blob": []byte{0, 255},
-		"role": "ADMIN", "metadata": map[string]any{"ok": true},
+		"role": "ADMIN", "metadata": json.RawMessage(`{"ok":true}`),
 	}
 	reg := NewAPIRegistry()
 	reg.Register("allScalars", 1)
@@ -2023,7 +2348,7 @@ func TestEncodeBinaryRequestAllListTypesRoundTrip(t *testing.T) {
 		"durations": []time.Duration{time.Second}, "ids": []uuid.UUID{id},
 		"prices": []decimal.Decimal{decimal.RequireFromString("1.25")},
 		"blobs":  [][]byte{{1, 2}}, "roles": []string{"ADMIN"},
-		"metadata": []any{map[string]any{"ok": true}},
+		"metadata": []json.RawMessage{json.RawMessage(`{"ok":true}`)},
 	}
 	reg := NewAPIRegistry()
 	reg.Register("allLists", 1)
@@ -2072,10 +2397,10 @@ func TestEncodeBinaryRequestRejectsInvalidListElements(t *testing.T) {
 	}
 }
 
-func TestAssignBinaryParamUnknownTarget(t *testing.T) {
+func TestLegacyAssignBinaryParamUnknownTarget(t *testing.T) {
 	// Unknown target type — should return nil
 	var x struct{ Name string }
-	err := assignBinaryParam("val", &x)
+	err := legacyAssignBinaryParam("val", &x)
 	if err != nil {
 		t.Fatal("should not error for unknown target type")
 	}
@@ -2125,10 +2450,10 @@ func TestBinaryScalarCoercionVariants(t *testing.T) {
 	if _, ok := binaryJSON(invalidJSON); ok {
 		t.Fatal("invalid raw JSON was accepted")
 	}
-	if value, ok := binaryDateTime(int64(4)); !ok || value != 4 {
+	if value, ok := binaryDateTime(int64(4)); !ok || !value.Equal(time.Unix(4, 0)) {
 		t.Fatalf("int64 datetime coercion = %v, %v", value, ok)
 	}
-	if value, ok := binaryDateTime(float64(5)); !ok || value != 5 {
+	if value, ok := binaryDateTime(float64(5)); !ok || !value.Equal(time.Unix(5, 0)) {
 		t.Fatalf("float datetime coercion = %v, %v", value, ok)
 	}
 	if _, ok := binaryDateTime(5.5); ok {
@@ -2146,7 +2471,7 @@ func TestBinaryScalarCoercionVariants(t *testing.T) {
 }
 
 func TestReadBinaryParamRejectsMalformedWireValues(t *testing.T) {
-	invalidDecimal := codec.AppendString(nil, "invalid")
+	invalidDecimal := codec.AppendBytes(nil, []byte("invalid"))
 	invalidJSON := codec.AppendBytes(nil, []byte(`{"ok":`))
 	tests := []struct {
 		name     string
@@ -2178,7 +2503,7 @@ func TestReadBinaryParamRejectsMalformedWireValues(t *testing.T) {
 func TestReadBinaryListParamRejectsMalformedWireValues(t *testing.T) {
 	truncatedElement := codec.AppendArrayHeader(nil, 1)
 	invalidDecimal := codec.AppendArrayHeader(nil, 1)
-	invalidDecimal = codec.AppendString(invalidDecimal, "invalid")
+	invalidDecimal = codec.AppendBytes(invalidDecimal, []byte("invalid"))
 	invalidJSON := codec.AppendArrayHeader(nil, 1)
 	invalidJSON = codec.AppendBytes(invalidJSON, []byte(`{"ok":`))
 	overLimit := codec.AppendArrayHeader(nil, codec.MaxArrayElements+1)

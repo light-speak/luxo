@@ -27,7 +27,7 @@ import (
 type Gateway struct {
 	Router          *api.Router
 	modules         []string
-	server          *http.Server
+	server          gatewayHTTPRuntime
 	metrics         *MetricsCollector
 	registrar       *GatewayRegistrar
 	dependencyStats lux.RuntimeDependencyStatsProvider
@@ -35,9 +35,21 @@ type Gateway struct {
 
 // New creates a new Luvia gateway.
 func New() *Gateway {
-	router := api.NewRouter()
+	return newGateway(api.NewRouter())
+}
+
+// NewWithOptions creates a gateway with explicitly owned runtime dependencies.
+func NewWithOptions(options api.RouterOptions) *Gateway {
+	return newGateway(api.NewRouterWithOptions(options))
+}
+
+func newGateway(router *api.Router) *Gateway {
 	router.IdentityExtractor = func(ctx context.Context) any {
-		return Identity(ctx)
+		// An anonymous identity must not become a non-nil interface holding a nil pointer.
+		if identity := Identity(ctx); identity != nil {
+			return identity
+		}
+		return nil
 	}
 	router.InternalRequestContext = internalRequestContext
 	return &Gateway{
@@ -54,7 +66,7 @@ func internalRequestContext(ctx context.Context, bearerToken string) (context.Co
 	if err != nil {
 		return nil, err
 	}
-	ctx = context.WithValue(ctx, identityKey, &Claims{data: data})
+	ctx = context.WithValue(ctx, identityKey, &data)
 	return context.WithValue(ctx, bearerTokenCtxKey{}, bearerToken), nil
 }
 
@@ -73,7 +85,24 @@ func (g *Gateway) SetRuntimeDependencyStatsProvider(provider lux.RuntimeDependen
 // If APP_TLS_CERT and APP_TLS_KEY are set, uses HTTP/2 with TLS.
 // Handles SIGTERM/SIGINT for graceful shutdown — drains active connections.
 func (g *Gateway) Serve(version string) error {
-	if err := g.Router.Validate(); err != nil {
+	// Register before startup so signals received while initializing are retained.
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(quit)
+	return g.serve(version, quit)
+}
+
+func (g *Gateway) serve(version string, quit <-chan os.Signal) (serveResult error) {
+	// Logs are best-effort diagnostics, but drain failures remain visible to the
+	// process owner. This also releases the worker when startup fails.
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := g.Router.CloseRequestLogs(ctx); err != nil {
+			serveResult = errors.Join(serveResult, fmt.Errorf("request log shutdown: %w", err))
+		}
+	}()
+	if err := g.Router.Prepare(); err != nil {
 		return err
 	}
 	shutdownTimeout, err := positiveDurationEnv("GRACEFUL_TIMEOUT", 30*time.Second)
@@ -85,6 +114,14 @@ func (g *Gateway) Serve(version string) error {
 	}
 	if err := validateJWTConfig(); err != nil {
 		return err
+	}
+	if os.Getenv("LUXO_STUDIO_URL") != "" && os.Getenv("LUXO_API_KEY") != "" {
+		if _, err := studioURLFromEnv(); err != nil {
+			return err
+		}
+		if _, err := studioProjectIDFromEnv(); err != nil {
+			return err
+		}
 	}
 	mux, port := g.buildMux(version)
 	addr := ":" + port
@@ -100,7 +137,7 @@ func (g *Gateway) Serve(version string) error {
 	certFile := envOr("APP_TLS_CERT", "")
 	keyFile := envOr("APP_TLS_KEY", "")
 
-	server, serveErr, err := startGatewayServer(addr, mux, certFile, keyFile)
+	server, serveErr, err := startGatewayServerWithBodyLimits(addr, mux, certFile, keyFile, g.Router.BodyLimits())
 	if err != nil {
 		return err
 	}
@@ -111,7 +148,7 @@ func (g *Gateway) Serve(version string) error {
 	}
 
 	g.server = server
-	return g.waitForShutdown(serveErr, shutdownTimeout)
+	return g.waitForShutdown(quit, serveErr, shutdownTimeout)
 }
 
 func validateDeploymentMode() error {
@@ -141,8 +178,16 @@ func (g *Gateway) closeIntegrations() {
 	}
 }
 
-func startGatewayServer(addr string, mux http.Handler, certFile, keyFile string) (*http.Server, <-chan error, error) {
+func startGatewayServer(addr string, mux http.Handler, certFile, keyFile string) (*gatewayHTTPServer, <-chan error, error) {
+	return startGatewayServerWithBodyLimits(addr, mux, certFile, keyFile, api.BodyLimits{RequestBytes: api.MaxRequestBodySize, ResponseBytes: api.DefaultResponseBodySize})
+}
+
+func startGatewayServerWithBodyLimits(addr string, mux http.Handler, certFile, keyFile string, body api.BodyLimits) (*gatewayHTTPServer, <-chan error, error) {
 	timeouts, err := serverTimeoutsFromEnv()
+	if err != nil {
+		return nil, nil, err
+	}
+	h2, err := newGatewayHTTPTransport(mux, timeouts, body)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -151,7 +196,7 @@ func startGatewayServer(addr string, mux http.Handler, certFile, keyFile string)
 		return nil, nil, fmt.Errorf("listen %s: %w", addr, err)
 	}
 	server := &http.Server{
-		Addr:         addr,
+		Addr:         listener.Addr().String(),
 		Handler:      h2c.NewHandler(mux, &http2.Server{}),
 		ReadTimeout:  timeouts.read,
 		WriteTimeout: timeouts.write,
@@ -165,15 +210,15 @@ func startGatewayServer(addr string, mux http.Handler, certFile, keyFile string)
 		}
 		server.Handler = mux
 		server.TLSConfig = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
-		if configureErr := http2.ConfigureServer(server, &http2.Server{}); configureErr != nil {
-			listener.Close()
-			return nil, nil, fmt.Errorf("configure HTTP/2: %w", configureErr)
+		if h2 == nil {
+			if configureErr := http2.ConfigureServer(server, &http2.Server{}); configureErr != nil {
+				// This locally owned TLS config has no custom cipher suites; retain upstream error propagation.
+				listener.Close()
+				return nil, nil, fmt.Errorf("configure HTTP/2: %w", configureErr)
+			}
 		}
-		listener = tls.NewListener(listener, server.TLSConfig)
 	}
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- server.Serve(listener) }()
-	return server, serveErr, nil
+	return startConfiguredGatewayServer(listener, server, h2, certFile != "" && keyFile != "")
 }
 
 type serverTimeouts struct {
@@ -211,10 +256,7 @@ func positiveDurationEnv(name string, fallback time.Duration) (time.Duration, er
 }
 
 // waitForShutdown blocks until SIGTERM, SIGINT, or a server failure, then gracefully shuts down.
-func (g *Gateway) waitForShutdown(serveErr <-chan error, timeout time.Duration) error {
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
-	defer signal.Stop(quit)
+func (g *Gateway) waitForShutdown(quit <-chan os.Signal, serveErr <-chan error, timeout time.Duration) error {
 	var sig os.Signal
 	select {
 	case err := <-serveErr:

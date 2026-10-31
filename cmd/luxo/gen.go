@@ -3,11 +3,13 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/cachepolicy"
 	"github.com/light-speak/luxo/pkg/codegen"
 	"github.com/light-speak/luxo/pkg/lexer"
 	"github.com/light-speak/luxo/pkg/lockfile"
@@ -60,6 +62,15 @@ func runGen(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	files = result.Files
+	backends := codegen.EntryBackends{
+		Events: os.Getenv("LUXO_EVENT_BACKEND"),
+		Queue:  os.Getenv("LUXO_QUEUE_BACKEND"),
+		Cache:  os.Getenv("LUXO_CACHE_BACKEND"),
+	}
+	if err := backends.Validate(result); err != nil {
+		return err
+	}
 
 	lf, err := updateLockFileAndReturn(files)
 	if err != nil {
@@ -71,7 +82,7 @@ func runGen(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	totalFiles, err := generateModules(files, result, generator)
+	totalFiles, err := generateModules(result, generator)
 	if err != nil {
 		return err
 	}
@@ -79,19 +90,19 @@ func runGen(cmd *cobra.Command, args []string) error {
 	// Generate entry points
 	modulePath, _ := readModulePath()
 	if modulePath != "" {
-		// Embedded entry: luxis/app/main.gen.go (all modules, single process)
-		if err := generateEntry(result, modulePath); err != nil {
+		// Embedded entry: lucis/app/main.gen.go (all modules, single process)
+		if err := generateEntry(result, modulePath, backends); err != nil {
 			return err
 		}
 		totalFiles++
 
-		// Per-module entries: luxis/<module>/main.gen.go (cluster mode, one binary per module)
-		moduleEntries, err := codegen.GenerateModuleEntryFilesChecked(result, modulePath)
+		// Per-module entries: lucis/<module>/main.gen.go (cluster mode, one binary per module)
+		moduleEntries, err := codegen.GenerateModuleEntryFilesChecked(result, modulePath, backends)
 		if err != nil {
 			return err
 		}
 		for modName, src := range moduleEntries {
-			outDir := filepath.Join("luxis", modName)
+			outDir := filepath.Join("lucis", modName)
 			if err := os.MkdirAll(outDir, 0755); err != nil {
 				return fmt.Errorf("create %s: %w", outDir, err)
 			}
@@ -105,13 +116,13 @@ func runGen(cmd *cobra.Command, args []string) error {
 			totalFiles++
 		}
 
-		// Gateway entry: luxis/gateway/main.gen.go (pure router, no handler code)
-		gwSrc, err := codegen.GenerateGatewayEntryChecked(result, modulePath)
+		// Gateway entry: lucis/gateway/main.gen.go (pure router, no handler code)
+		gwSrc, err := codegen.GenerateGatewayEntryChecked(result, modulePath, backends)
 		if err != nil {
 			return err
 		}
 		if gwSrc != nil {
-			outDir := filepath.Join("luxis", "gateway")
+			outDir := filepath.Join("lucis", "gateway")
 			if err := os.MkdirAll(outDir, 0755); err != nil {
 				return fmt.Errorf("create %s: %w", outDir, err)
 			}
@@ -123,6 +134,9 @@ func runGen(cmd *cobra.Command, args []string) error {
 			reset := "\033[0m"
 			fmt.Printf("  %s+%s %s\n", green, reset, outPath)
 			totalFiles++
+		}
+		if err := cleanStaleEntryFiles(moduleEntries, gwSrc != nil); err != nil {
+			return err
 		}
 	}
 
@@ -171,19 +185,22 @@ func buildProjectGenerator(lf *lockfile.LockFile, files []*ast.File) (*codegen.G
 	}
 
 	modulePath := goModulePath()
+	sharedEnumPackage := ""
 	if modulePath != "" {
+		sharedEnumPackage = modulePath + "/internal/luxotypes"
 		modulePath += "/service"
 	}
+	events := codegen.BuildEventContext(files, modulePath)
+	events.SharedEnumPackage = sharedEnumPackage
 	return codegen.NewGenerator(codegen.GeneratorConfig{
 		Driver: codegen.DBDriver(os.Getenv("DATABASE_DRIVER")),
 		IDs: codegen.StableIDs{
-			EventFields:   eventIDs,
-			ModelFields:   modelIDs,
-			APIs:          apiIDs,
-			APIParams:     paramIDs,
-			APIParamTypes: buildParamTypesFromAST(files),
+			EventFields: eventIDs,
+			ModelFields: modelIDs,
+			APIs:        apiIDs,
+			APIParams:   paramIDs,
 		},
-		Events: codegen.BuildEventContext(files, modulePath),
+		Events: events,
 	})
 }
 
@@ -251,7 +268,11 @@ func parseAllFiles(paths []string) ([]*ast.File, error) {
 }
 
 func analyzeFiles(files []*ast.File) (*semantic.Result, error) {
-	result := semantic.AnalyzeModules(files)
+	policies, err := loadCachePolicies(cachepolicy.Filename)
+	if err != nil {
+		return nil, err
+	}
+	result := semantic.AnalyzeWithOptions(files, semantic.Options{ModuleIsolation: true, CachePolicies: policies})
 	if len(result.Errors) > 0 {
 		for _, e := range result.Errors {
 			fmt.Fprintf(os.Stderr, "error: %s:%d: %s\n", e.Pos.File, e.Pos.Line, e.Message)
@@ -264,6 +285,10 @@ func analyzeFiles(files []*ast.File) (*semantic.Result, error) {
 	return result, nil
 }
 
+func loadCachePolicies(path string) (*cachepolicy.Catalog, error) {
+	return cachepolicy.Load(path)
+}
+
 func updateLockFileAndReturn(files []*ast.File) (*lockfile.LockFile, error) {
 	green := "\033[32m"
 	reset := "\033[0m"
@@ -274,7 +299,9 @@ func updateLockFileAndReturn(files []*ast.File) (*lockfile.LockFile, error) {
 	if err := validateWireCompatibility(lf, files, allowBreaking); err != nil {
 		return nil, err
 	}
-	lf.Update(files)
+	if err := lf.Update(files); err != nil {
+		return nil, fmt.Errorf("update luxo.lock: %w\n更新 luxo.lock 失败: %w", err, err)
+	}
 	if err := lf.Save("luxo.lock"); err != nil {
 		return nil, fmt.Errorf("save luxo.lock: %w\n保存 luxo.lock 失败: %w", err, err)
 	}
@@ -296,132 +323,11 @@ func validateWireCompatibility(lf *lockfile.LockFile, files []*ast.File, allow b
 	return fmt.Errorf("%s", message.String())
 }
 
-// buildParamTypesFromAST extracts param types from AST for accurate binary metadata.
-func buildParamTypesFromAST(files []*ast.File) map[string]map[string]string {
-	types := make(map[string]map[string]string)
-	enums := make(map[string]bool)
-	for _, file := range files {
-		for _, enum := range file.Enums {
-			enums[enum.Name] = true
-		}
+func generateModules(result *semantic.Result, generator *codegen.GeneratorContext) (int, error) {
+	files := result.Files
+	if err := generateSharedEnums(generator); err != nil {
+		return 0, err
 	}
-	for _, file := range files {
-		for _, a := range file.APIs {
-			params := a.EffectiveParams()
-			if len(params) == 0 {
-				continue
-			}
-			m := make(map[string]string, len(params))
-			for _, p := range params {
-				if p.Type != nil {
-					m[p.Name] = binaryParamType(p.Type, enums)
-				}
-			}
-			types[a.Name] = m
-		}
-		for _, fn := range file.Functions {
-			if !hasASTDirective(fn.Directives, "service") || len(fn.Params) == 0 {
-				continue
-			}
-			m := make(map[string]string, len(fn.Params))
-			for _, p := range fn.Params {
-				if p.Type != nil {
-					m[p.Name] = binaryParamType(p.Type, enums)
-				}
-			}
-			types[fn.Name] = m
-		}
-		for _, model := range file.Models {
-			hasCrud := false
-			for _, d := range model.Directives {
-				if d.Name == "crud" {
-					hasCrud = true
-					break
-				}
-			}
-			if !hasCrud {
-				continue
-			}
-			idType := "Int"
-			for _, f := range model.Fields {
-				if f.Name == "id" && f.Type != nil {
-					idType = binaryParamType(&ast.TypeRef{Name: f.Type.Name}, enums)
-					break
-				}
-			}
-			createTypes := make(map[string]string)
-			updateTypes := map[string]string{"id": idType}
-			for _, f := range model.Fields {
-				if !isGeneratedCRUDParam(f, enums, false) {
-					continue
-				}
-				createTypes[f.Name] = binaryParamType(f.Type, enums)
-				if isGeneratedCRUDParam(f, enums, true) {
-					updateTypes[f.Name] = binaryParamType(f.Type, enums)
-				}
-			}
-			name := model.Name
-			plural := name + "s"
-			types["get"+name] = map[string]string{"id": idType}
-			types["delete"+name] = map[string]string{"id": idType}
-			types["delete"+plural] = map[string]string{"ids": "[" + idType + "]"}
-			types["list"+plural] = map[string]string{"page": "Int", "pageSize": "Int"}
-			types["create"+name] = createTypes
-			types["update"+name] = updateTypes
-		}
-	}
-	return types
-}
-
-func isGeneratedCRUDParam(field *ast.FieldDecl, enums map[string]bool, update bool) bool {
-	if field.Type == nil || field.Computed != nil || hasASTDirective(field.Directives, "internal") ||
-		hasASTDirective(field.Directives, "serial") || hasASTDirective(field.Directives, "auto") {
-		return false
-	}
-	if field.Type.Name == "DateTime" && (field.Name == "createdAt" || field.Name == "updatedAt") {
-		return false
-	}
-	if update && (field.Name == "id" || hasASTDirective(field.Directives, "immutable")) {
-		return false
-	}
-	if !isBinaryScalarParamType(field.Type.Name) && !enums[field.Type.Name] {
-		return false
-	}
-	return true
-}
-
-func binaryParamType(ref *ast.TypeRef, enums map[string]bool) string {
-	typeName := ref.Name
-	if enums[typeName] {
-		typeName = "Enum"
-	}
-	if ref.IsList {
-		typeName = "[" + typeName + "]"
-	}
-	if ref.Nullable {
-		typeName += "?"
-	}
-	return typeName
-}
-
-func isBinaryScalarParamType(typeName string) bool {
-	switch typeName {
-	case "Int", "Float", "String", "Boolean", "DateTime", "Duration", "Bytes", "UUID", "Decimal", "JSON":
-		return true
-	}
-	return false
-}
-
-func hasASTDirective(directives []*ast.Directive, name string) bool {
-	for _, directive := range directives {
-		if directive.Name == name {
-			return true
-		}
-	}
-	return false
-}
-
-func generateModules(files []*ast.File, result *semantic.Result, generator *codegen.GeneratorContext) (int, error) {
 	green := "\033[32m"
 	reset := "\033[0m"
 
@@ -443,7 +349,7 @@ func generateModules(files []*ast.File, result *semantic.Result, generator *code
 		if err := os.MkdirAll(outDir, 0755); err != nil {
 			return 0, fmt.Errorf("create %s: %w", outDir, err)
 		}
-		singleResult := &semantic.Result{Files: moduleFiles}
+		singleResult := &semantic.Result{Files: moduleFiles, ExecutionCacheDependencies: result.ExecutionCacheDependencies, CachePolicies: result.CachePolicies}
 		gr, err := generator.Generate(singleResult, "luxo", softModels)
 		if err != nil {
 			return 0, fmt.Errorf("generate module %s: %w", moduleName, err)
@@ -468,6 +374,10 @@ func generateModules(files []*ast.File, result *semantic.Result, generator *code
 			fmt.Printf("  %s-%s %s\n", red, reset, filepath.Join(outDir, name))
 		}
 
+		// Data-only modules have no App and cannot host a native resolver.
+		if _, hasApp := gr.Files["app.gen.go"]; !hasApp {
+			continue
+		}
 		// Auto-create resolver package if it doesn't exist
 		resolverDir := filepath.Join("service", moduleName, "resolver")
 		resolverFile := filepath.Join(resolverDir, "resolver.go")
@@ -514,22 +424,135 @@ func cleanStaleGenFiles(dir string, written map[string][]byte) ([]string, error)
 	return removed, nil
 }
 
+func cleanStaleEntryFiles(expected map[string][]byte, hasRuntime bool) error {
+	info, err := os.Lstat("lucis")
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("lucis must be a real directory for generated entry cleanup")
+	}
+	entries, err := os.ReadDir("lucis")
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		_, keep := expected[entry.Name()]
+		if keep || hasRuntime && (entry.Name() == "app" || entry.Name() == "gateway") {
+			continue
+		}
+		path := filepath.Join("lucis", entry.Name(), "main.gen.go")
+		removed, err := removeMarkedEntry(path)
+		if err != nil {
+			return fmt.Errorf("clean stale entry %s: %w", path, err)
+		}
+		if removed {
+			fmt.Printf("  - %s\n", path)
+		}
+	}
+	return nil
+}
+
+func removeMarkedEntry(path string) (bool, error) {
+	marked, err := isMarkedGeneratedFile(path)
+	if err != nil || !marked {
+		return false, err
+	}
+	if err := os.Remove(path); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func isMarkedGeneratedFile(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() {
+		return false, nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	const marker = "// Code generated by luxo. DO NOT EDIT.\n"
+	var header [len(marker)]byte
+	_, readErr := io.ReadFull(file, header[:])
+	if err := file.Close(); err != nil {
+		return false, err
+	}
+	if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+		return false, readErr
+	}
+	return string(header[:]) == marker, nil
+}
+
+func generateSharedEnums(generator *codegen.GeneratorContext) error {
+	source, err := generator.GenerateSharedEnums()
+	if err != nil {
+		return err
+	}
+	directory := filepath.Join("internal", "luxotypes")
+	for _, path := range []string{"internal", directory} {
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("shared enum directory must be a real directory: %s", path)
+		}
+	}
+	path := filepath.Join(directory, "enum.gen.go")
+	if source == nil {
+		_, err := removeMarkedEntry(path)
+		return err
+	}
+	if _, err := os.Lstat(path); err == nil {
+		marked, err := isMarkedGeneratedFile(path)
+		if err != nil {
+			return err
+		}
+		if !marked {
+			return fmt.Errorf("refusing to overwrite unowned shared enum file: %s", path)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.MkdirAll(directory, 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, source, 0644)
+}
+
 func goModulePath() string {
 	p, _ := readModulePath()
 	return p
 }
 
-func generateEntry(result *semantic.Result, modulePath string) error {
+func generateEntry(result *semantic.Result, modulePath string, backends ...codegen.EntryBackends) error {
 	green := "\033[32m"
 	reset := "\033[0m"
-	src, err := codegen.GenerateEntryFileChecked(result, modulePath)
+	src, err := codegen.GenerateEntryFileChecked(result, modulePath, backends...)
 	if err != nil {
 		return fmt.Errorf("generate embedded entry: %w", err)
 	}
 	if src == nil {
 		return nil
 	}
-	outDir := filepath.Join("luxis", "app")
+	outDir := filepath.Join("lucis", "app")
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		return fmt.Errorf("create %s: %w", outDir, err)
 	}

@@ -1,8 +1,10 @@
 package parser
 
 import (
+	"os"
 	"testing"
 
+	"github.com/light-speak/luxo/internal/testutil"
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lexer"
 	"github.com/light-speak/luxo/pkg/token"
@@ -21,6 +23,19 @@ func parse(t *testing.T, input string) *ast.File {
 		t.Fatalf("parser errors: %v", parseErrors)
 	}
 	return file
+}
+
+func TestCompilerCorporaParseIndependently(t *testing.T) {
+	t.Run("historical-benchmark-v1", func(t *testing.T) {
+		parse(t, testutil.CompilerDemoV1())
+	})
+	t.Run("current-editor-example", func(t *testing.T) {
+		data, err := os.ReadFile("../../editors/vscode/examples/demo.luxo")
+		if err != nil {
+			t.Fatal(err)
+		}
+		parse(t, string(data))
+	})
 }
 
 func TestParseModel(t *testing.T) {

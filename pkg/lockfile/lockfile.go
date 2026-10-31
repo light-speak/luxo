@@ -10,6 +10,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/light-speak/luxo/internal/inferred"
 	"github.com/light-speak/luxo/pkg/ast"
 )
 
@@ -112,12 +113,15 @@ func Load(path string) (*LockFile, error) {
 		}
 		return nil, err
 	}
-	lf := New()
-	if err := json.Unmarshal(data, lf); err != nil {
+	lf, err := readLock(data)
+	if err != nil {
 		return nil, err
 	}
 	if lf.Version > currentVersion {
 		return nil, fmt.Errorf("luxo.lock version %d is newer than supported version %d", lf.Version, currentVersion)
+	}
+	if err := lf.Validate(); err != nil {
+		return nil, err
 	}
 	lf.Version = currentVersion
 	lf.computeNextAPI()
@@ -126,25 +130,40 @@ func Load(path string) (*LockFile, error) {
 
 // Save writes the lock file to disk as formatted JSON.
 func (lf *LockFile) Save(path string) error {
+	if err := lf.Validate(); err != nil {
+		return err
+	}
 	lf.sortReserved()
 	data, err := json.MarshalIndent(lf, "", "  ")
 	if err != nil {
+		// Unreachable for the validated fixed lock types; retain encoder error propagation.
 		return err
 	}
 	data = append(data, '\n')
 	return os.WriteFile(path, data, 0644)
 }
 
-// Update synchronizes the lock file with the current AST.
-// New fields get the next available ID. Removed fields have their IDs reserved.
-// New APIs get the next available API ID.
-func (lf *LockFile) Update(files []*ast.File) {
-	lf.updateModels(files)
-	lf.updateTypes(files)
-	lf.updateExtends(files)
-	lf.updateEvents(files)
-	lf.updateAPIs(files)
-	lf.updateContractMetadata(files)
+// Update synchronizes the lock with an analyzed AST, preserving removed IDs.
+// Validation failure leaves the receiver and its nested data unchanged. Successful
+// updates replace the snapshot; callers must not retain mutable entry pointers.
+// The caller owns synchronization; Update is not a concurrent publication API.
+func (lf *LockFile) Update(files []*ast.File) error {
+	if err := lf.Validate(); err != nil {
+		return err
+	}
+	files = inferred.ExpandedFiles(files)
+	candidate := lf.cloneForUpdate()
+	candidate.updateModels(files)
+	candidate.updateTypes(files)
+	candidate.updateExtends(files)
+	candidate.updateEvents(files)
+	candidate.updateAPIs(files)
+	candidate.updateContractMetadata(files)
+	if err := candidate.Validate(); err != nil {
+		return err
+	}
+	*lf = *candidate
+	return nil
 }
 
 // updateTypes assigns field IDs for type declarations (non-DB, e.g. AuthPayload).
@@ -369,6 +388,7 @@ func (lf *LockFile) reserveRemovedFields(ml *ModelLock, current map[string]bool)
 
 // updateAPIs assigns stable IDs to all API declarations, including CRUD APIs.
 func (lf *LockFile) updateAPIs(files []*ast.File) {
+	models := inferred.ModelsForAPIs(files)
 	active := make(map[string]bool)
 	declared := make(map[string]bool)
 	for _, file := range files {
@@ -393,9 +413,8 @@ func (lf *LockFile) updateAPIs(files []*ast.File) {
 				continue
 			}
 			name := m.Name
-			plural := name + "s"
 			for _, operation := range m.CRUDOperations() {
-				apiName, params := crudAPIContract(name, plural, operation, m, enums)
+				apiName, params := crudAPIContract(name, operation, m, enums)
 				if apiName != "" && !declared[apiName] {
 					ensure(apiName, params)
 				}
@@ -408,6 +427,7 @@ func (lf *LockFile) updateAPIs(files []*ast.File) {
 	// Declared APIs — params from AST
 	for _, file := range files {
 		for _, api := range file.APIs {
+			api = inferred.Contract(api, models)
 			params := make([]string, 0, len(api.Params)+2)
 			for _, p := range api.EffectiveParams() {
 				params = append(params, p.Name)
@@ -431,20 +451,21 @@ func (lf *LockFile) updateAPIs(files []*ast.File) {
 	lf.reserveRemovedAPIs(active)
 }
 
-func crudAPIContract(name, plural, operation string, model *ast.ModelDecl, enums map[string]bool) (string, []string) {
+func crudAPIContract(name, operation string, model *ast.ModelDecl, enums map[string]bool) (string, []string) {
+	apiName := ast.CRUDAPIName(name, operation)
 	switch operation {
 	case "get":
-		return "get" + name, []string{"id"}
+		return apiName, []string{"id"}
 	case "list":
-		return "list" + plural, []string{"page", "pageSize"}
+		return apiName, []string{"page", "pageSize"}
 	case "create":
-		return "create" + name, collectCRUDFieldNames(model, enums, false)
+		return apiName, collectCRUDFieldNames(model, enums, false)
 	case "update":
-		return "update" + name, append([]string{"id"}, collectCRUDFieldNames(model, enums, true)...)
+		return apiName, append([]string{"id"}, collectCRUDFieldNames(model, enums, true)...)
 	case "delete":
-		return "delete" + name, []string{"id"}
+		return apiName, []string{"id"}
 	case "deleteMany":
-		return "delete" + plural, []string{"ids"}
+		return apiName, []string{"ids"}
 	default:
 		return "", nil
 	}
@@ -465,7 +486,7 @@ func (lf *LockFile) updateFederationAPIs(files []*ast.File, enums map[string]boo
 					continue
 				}
 				foreignKey := federationForeignKey(ext.Name, primaryKeys[ext.Name], field)
-				ensure("svc:resolve:"+field.Type.Name+":"+foreignKey, []string{"keys"})
+				ensure("svc:resolve:"+field.Type.Name+":"+foreignKey, []string{"keys", "shape"})
 			}
 		}
 	}

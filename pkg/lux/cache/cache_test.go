@@ -2,7 +2,10 @@ package cache
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -10,7 +13,6 @@ import (
 
 var (
 	_ Cache = (*MemoryCache)(nil)
-	_ Cache = (*RedisCache)(nil)
 	_ Cache = Nop{}
 )
 
@@ -137,6 +139,48 @@ func TestMemoryCache_Close(t *testing.T) {
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestMemoryCacheConcurrentClose(t *testing.T) {
+	var panics atomic.Int32
+	for range 100 {
+		c := NewMemory()
+		start := make(chan struct{})
+		var workers sync.WaitGroup
+		for range 64 {
+			workers.Go(func() {
+				defer func() {
+					if recover() != nil {
+						panics.Add(1)
+					}
+				}()
+				<-start
+				_ = c.Close()
+			})
+		}
+		close(start)
+		workers.Wait()
+	}
+	if got := panics.Load(); got != 0 {
+		t.Fatalf("concurrent Close panicked %d times", got)
+	}
+}
+
+func TestMemoryCacheCleanup(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := NewMemory()
+		defer c.Close()
+		ctx := context.Background()
+		_ = c.Set(ctx, "expired", []byte("a"), time.Second)
+		_ = c.Set(ctx, "live", []byte("b"), 2*time.Minute)
+		_ = c.Set(ctx, "persistent", []byte("c"), 0)
+		synctest.Wait()
+		time.Sleep(61 * time.Second)
+		synctest.Wait()
+		if c.Len() != 2 {
+			t.Fatalf("cleanup retained %d entries, want 2", c.Len())
+		}
+	})
 }
 
 func TestMemoryCache_DataIsolation(t *testing.T) {

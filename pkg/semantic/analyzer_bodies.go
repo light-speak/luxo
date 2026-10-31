@@ -129,7 +129,7 @@ func (a *Analyzer) checkCallableBody(body *ast.Block, scope *Scope, expected *Re
 	a.expectedReturn = expected
 	defer func() { a.expectedReturn = previous }()
 
-	a.checkBlock(body, scope)
+	a.checkResultBlock(body, scope, expected != nil && expected.Kind != TypeVoid)
 	if expected == nil || expected.Kind == TypeVoid {
 		return
 	}
@@ -144,6 +144,14 @@ func (a *Analyzer) checkCallableBody(body *ast.Block, scope *Scope, expected *Re
 	case *ast.ReturnStmt, *ast.ThrowStmt:
 		return
 	case *ast.ExprStmt:
+		// Exact concrete metadata needs no reconstructed nullable/list type.
+		// Generic arguments and inheritance still use full assignability checks.
+		expression := statement.Expr
+		if expression != nil && expected.Name != "" && len(expected.TypeArgs) == 0 &&
+			expected.Name == expression.GetTypeTag() && expected.IsList == expression.IsListType() &&
+			(expected.Nullable || !expression.IsNullable()) {
+			return
+		}
 		a.validateReturnValue(statement.GetPos(), expected, a.resolvedExprType(statement.Expr))
 	default:
 		a.addError(last.GetPos(), "callable must return '%s' / 可调用声明必须返回 '%s'", formatResolvedType(expected), formatResolvedType(expected))
@@ -170,7 +178,7 @@ func (a *Analyzer) validateStreamMatcherResult(api *ast.ApiDecl) {
 		return
 	}
 	resolved := a.resolvedExprType(stmt.Expr)
-	if resolved == nil || resolved.Kind != TypeBool || resolved.IsList || resolved.Nullable {
+	if !resolved.IsNonNullBoolean() {
 		actual := "unknown"
 		if resolved != nil {
 			actual = formatResolvedType(resolved)
@@ -180,20 +188,7 @@ func (a *Analyzer) validateStreamMatcherResult(api *ast.ApiDecl) {
 }
 
 func (a *Analyzer) checkBlock(block *ast.Block, scope *Scope) {
-	if block == nil {
-		return
-	}
-	terminated := false
-	for _, stmt := range block.Stmts {
-		if terminated {
-			a.addWarning(stmt.GetPos(), "unreachable code / 不可达代码")
-			break
-		}
-		a.checkStmt(stmt, scope)
-		if isTerminating(stmt) {
-			terminated = true
-		}
-	}
+	a.checkResultBlock(block, scope, false)
 }
 
 func isTerminating(stmt ast.Stmt) bool {
@@ -216,8 +211,12 @@ func (a *Analyzer) checkStmt(stmt ast.Stmt, scope *Scope) {
 		a.checkValStmt(s, scope)
 
 	case *ast.IfStmt:
-		a.checkExpr(s.Condition, scope)
+		condition := a.checkExpr(s.Condition, scope)
+		if condition != nil && !condition.IsNonNullBoolean() {
+			a.addError(s.Pos, "if condition requires non-null Boolean / if 条件必须是非空 Boolean")
+		}
 		childScope := scope.Child()
+		narrowCondition(s.Condition, true, scope, childScope)
 		a.checkBlock(s.Then, childScope)
 
 	case *ast.ForStmt:
@@ -250,14 +249,21 @@ func (a *Analyzer) checkStmt(stmt ast.Stmt, scope *Scope) {
 		// valid in any loop context, no check needed at semantic level
 
 	case *ast.ExprStmt:
-		if s.Expr != nil {
+		if branch, ok := s.Expr.(*ast.WhenExpr); ok {
+			setExprResolvedType(branch, a.checkWhen(branch, scope, false))
+		} else if s.Expr != nil {
 			a.checkExpr(s.Expr, scope)
 		}
 	}
 }
 
 func (a *Analyzer) checkValStmt(s *ast.ValStmt, scope *Scope) {
-	exprType := a.checkExpr(s.Value, scope)
+	var exprType *ResolvedType
+	if _, channel := channelConstructor(s.Value); channel {
+		exprType = a.checkChannelInitializer(s, scope)
+	} else {
+		exprType = a.checkExpr(s.Value, scope)
+	}
 	if s.Type != nil {
 		declaredType := a.resolveTypeRef(s.Type, s.Pos)
 		if exprType != nil && !isEmptyListExpr(s.Value) && !isTypeAssignable(declaredType, exprType) {
@@ -317,6 +323,11 @@ func (a *Analyzer) checkAssignStmt(s *ast.AssignStmt, scope *Scope) {
 	a.checkExpr(s.Target, scope)
 	a.checkExpr(s.Value, scope)
 	if ident, ok := s.Target.(*ast.Ident); ok {
+		ident.NarrowedTag = false
+		scope.invalidateNarrowing(ident.Name)
+		if declared := scope.ResolvedTypeOf(ident.Name); declared != nil {
+			setExprResolvedType(s.Target, declared)
+		}
 		if sym := scope.Lookup(ident.Name); sym != nil && sym.Kind == SymVariable && !sym.Mutable {
 			a.addError(s.Pos, "cannot assign to immutable variable '%s' (declared with val) / 不能给不可变变量 '%s' 赋值（使用 val 声明）", ident.Name, ident.Name)
 		}
@@ -332,6 +343,10 @@ func (a *Analyzer) checkAssignStmt(s *ast.AssignStmt, scope *Scope) {
 }
 
 func (a *Analyzer) checkForStmt(s *ast.ForStmt, scope *Scope) *ResolvedType {
+	return a.checkForBody(s, scope, false)
+}
+
+func (a *Analyzer) checkForBody(s *ast.ForStmt, scope *Scope, required bool) *ResolvedType {
 	childScope := scope.Child()
 	if s.Collection != nil {
 		collType := a.checkExpr(s.Collection, childScope)
@@ -345,7 +360,7 @@ func (a *Analyzer) checkForStmt(s *ast.ForStmt, scope *Scope) *ResolvedType {
 			})
 		}
 	}
-	a.checkBlock(s.Body, childScope)
+	a.checkResultBlock(s.Body, childScope, required)
 	return a.inferForExprType(s.Body)
 }
 

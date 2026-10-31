@@ -1,0 +1,54 @@
+import { LuxoClient } from './client.js'
+import { LuxoClient as BeforeClient } from './client.before.js'
+import { decodeJSONMetric, decodeJSONMetric$list, decodeJSONTextValues, decodeMetric, decodeColumnarMetric } from './types.js'
+import * as before from './types.before.js'
+import { Decoder, Encoder } from '@luxojs/client'
+import type { Transport } from '@luxojs/client'
+import { measure } from './measure.js'
+
+const cases = [
+  { name: 'first', value: { id: 42n } },
+  { name: 'last', value: { score: 0.5 } },
+  { name: 'null', value: { duration: null } },
+  { name: 'mixed', value: { id: 9223372036854775807n, duration: null, counts: [1n, 2n], score: 0.5 } },
+]
+
+async function dispatch(Client: typeof LuxoClient, rows: unknown[]): Promise<() => unknown> {
+  let receive: (value: unknown) => void = () => { throw new Error('Missing receiver') }
+  let result: unknown
+  const transport: Transport = {
+    async call() { throw new Error('Unexpected ordinary request') },
+    async subscribe(_api, _params, decode, onData) { receive = value => onData(decode(value)); return () => {} },
+    setSchema() {}, setMode() {}, setToken() {},
+  }
+  await new Client(transport).subscribeLiveMetricRows({ $select: 'id, duration, counts, score' }, value => { result = value })
+  return () => { receive(rows); return result }
+}
+
+async function main(): Promise<void> {
+  for (const sample of cases) {
+    measure(`single ${sample.name}`, () => before.decodeJSONMetric(sample.value), () => decodeJSONMetric(sample.value))
+    for (const count of [1, 128]) {
+      const rows = Array.from({ length: count }, () => sample.value)
+      measure(`list ${count} ${sample.name}`,
+        () => rows.map(before.decodeJSONMetric), () => decodeJSONMetric$list(rows))
+    }
+  }
+  for (const count of [1, 128]) {
+    const value = { children: Array.from({ length: count }, () => ({ state: null })) }
+    measure(`nested ${count}`, () => before.decodeJSONTextValues(value), () => decodeJSONTextValues(value))
+    const rows = Array.from({ length: count }, () => ({ id: 42n }))
+    measure(`stream ${count}`, await dispatch(BeforeClient as unknown as typeof LuxoClient, rows), await dispatch(LuxoClient, rows))
+  }
+  const enc = new Encoder()
+  enc.writeVarint(0); enc.writeFieldInt(1, 42n); enc.writeEnd()
+  const row = enc.bytes().slice()
+  measure('binary row control', () => before.decodeMetric(new Decoder(row)), () => decodeMetric(new Decoder(row)))
+  enc.reset(); enc.writeVarint(128); enc.writeVarint(0); enc.writeVarint(1)
+  for (let i = 0; i < 128; i++) enc.writeSvarint(42n)
+  enc.writeEnd()
+  const column = enc.bytes().slice()
+  measure('binary column 128 control', () => before.decodeColumnarMetric(column), () => decodeColumnarMetric(column))
+}
+
+void main().catch(error => { throw error })

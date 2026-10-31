@@ -11,6 +11,93 @@ import (
 	"github.com/light-speak/luxo/pkg/lux/codec"
 )
 
+func TestJSONToBinaryBytesRejectNumericArrays(t *testing.T) {
+	s := New()
+	s.RegisterType(&TypeDecl{Name: "Blob", Fields: []Field{
+		{ID: 1, Name: "data", Type: FieldBytes},
+		{ID: 2, Name: "items", Type: FieldBytes, IsList: true},
+	}})
+	for _, raw := range []string{`{"data":[]}`, `{"data":[1,2]}`, `{"items":[[1,2]]}`, `{"items":["AQI=",[]]}`} {
+		if value, err := s.JSONToBinary("Blob", []byte(raw)); err == nil || value != nil {
+			t.Errorf("structured Bytes accepted numeric arrays: %s: %x / %v", raw, value, err)
+		}
+	}
+}
+
+func TestJSONToBinaryArrayLimit(t *testing.T) {
+	s := New()
+	s.RegisterType(&TypeDecl{Name: "Input", Fields: []Field{{ID: 1, Name: "items", Type: FieldInt, IsList: true}}})
+	raw := []byte(`{"items":[` + strings.Repeat("0,", codec.MaxArrayElements) + `0]}`)
+	if data, err := s.JSONToBinary("Input", raw); err == nil || data != nil || !strings.Contains(err.Error(), "array size exceeds limit") {
+		t.Fatalf("oversized structured array: output length=%d / %v", len(data), err)
+	}
+}
+
+func TestJSONToBinaryOwnsDecodedText(t *testing.T) {
+	s := newJSONEncodingSchema()
+	price := "123456789012345678901234567890." + strings.Repeat("0123456789", 20)
+	raw := []byte(`{"name":"\u6771京","createdAt":"1969-12-31T23:59:59.999Z",` +
+		`"key":"\u003550e8400-e29b-41d4-a716-446655440000","price":"` + price + `"}`)
+	message, err := s.JSONToBinary("Input", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clear(raw)
+	decoder := codec.NewDecoder(message)
+	decoder.SkipArenaHeader()
+	assertNextField(t, decoder, 3)
+	if decoder.ReadString() != "東京" {
+		t.Fatal("decoded text lost ownership")
+	}
+	assertNextField(t, decoder, 5)
+	if !decoder.ReadDateTime().Equal(time.Unix(-1, 999000000)) {
+		t.Fatal("negative fractional datetime lost precision")
+	}
+	assertNextField(t, decoder, 10)
+	if got := uuid.UUID(decoder.ReadUUID()).String(); got != "550e8400-e29b-41d4-a716-446655440000" {
+		t.Fatalf("escaped UUID changed: %s", got)
+	}
+	assertNextField(t, decoder, 11)
+	if decoder.ReadString() != price || decoder.NextField() || decoder.Err() != nil {
+		t.Fatal("long decimal changed or lost ownership")
+	}
+}
+
+func TestJSONToBinaryJSONScalarPreservesNull(t *testing.T) {
+	s := New()
+	s.RegisterType(&TypeDecl{Name: "Opaque", Fields: []Field{{ID: 1, Name: "value", Type: FieldJSON}}})
+	message, err := s.JSONToBinary("Opaque", []byte(`{"value":null}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := codec.NewDecoder(message)
+	decoder.SkipArenaHeader()
+	if !decoder.NextField() || string(decoder.ReadBytes()) != "null" || decoder.NextField() || decoder.Err() != nil {
+		t.Fatalf("required opaque JSON null was not preserved: %x", message)
+	}
+}
+
+func TestJSONToBinaryJSONListPreservesNull(t *testing.T) {
+	s := New()
+	s.RegisterType(&TypeDecl{Name: "Opaque", Fields: []Field{
+		{ID: 1, Name: "items", Type: FieldJSON, IsList: true},
+	}})
+	for _, raw := range []string{"null", "123456789012345678901234567890", "0.123456789012345678901234567890"} {
+		message, err := s.JSONToBinary("Opaque", []byte(`{"items":[`+raw+`]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoder := codec.NewDecoder(message)
+		decoder.SkipArenaHeader()
+		if !decoder.NextField() || decoder.FieldID() != 1 || decoder.ReadArrayLength() != 1 || string(decoder.ReadBytes()) != raw {
+			t.Fatalf("opaque JSON token changed: %s => %x", raw, message)
+		}
+		if decoder.NextField() || decoder.Err() != nil {
+			t.Fatalf("invalid complete message: %v", decoder.Err())
+		}
+	}
+}
+
 func TestJSONToBinaryStructuredValue(t *testing.T) {
 	s := newJSONEncodingSchema()
 	raw := json.RawMessage(`{
@@ -55,6 +142,19 @@ func TestJSONToBinaryTypeDeclaration(t *testing.T) {
 	}
 }
 
+func TestJSONToBinaryRejectsMalformedUnicodeBeforeConversion(t *testing.T) {
+	s := newJSONEncodingSchema()
+	for _, raw := range []string{
+		`{"name":"\uD800"}`, `{"address":{"city":"\uDC00"}}`,
+		`{"metadata":{"\uD800":1}}`, `{"metadata":{"x":["\uDBFF"]}}`,
+		`{"name":"\uD800","name":"valid"}`, "{\"name\":\"\xff\"}",
+	} {
+		if got, err := s.JSONToBinary("Input", json.RawMessage(raw)); err == nil || got != nil {
+			t.Errorf("accepted or exposed partial invalid JSON %s: %x / %v", raw, got, err)
+		}
+	}
+}
+
 func TestJSONToBinaryRejectsInvalidValues(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -71,6 +171,9 @@ func TestJSONToBinaryRejectsInvalidValues(t *testing.T) {
 		{name: "required null", field: Field{Type: FieldInt}, value: `null`, wantError: "must not be null"},
 		{name: "integer", field: Field{Type: FieldInt}, value: `1.5`, wantError: "expected integer"},
 		{name: "float", field: Field{Type: FieldFloat}, value: `"x"`, wantError: "expected number"},
+		{name: "float underflow", field: Field{Type: FieldFloat}, value: `1e-400`, wantError: "expected number"},
+		{name: "float negative underflow", field: Field{Type: FieldFloat}, value: `-1e-400`, wantError: "expected number"},
+		{name: "float list underflow", field: Field{Type: FieldFloat, IsList: true}, value: `[0,1e-400]`, wantError: "element 1: expected number"},
 		{name: "string", field: Field{Type: FieldString, IsList: true}, value: `[1]`, wantError: "expected string"},
 		{name: "boolean", field: Field{Type: FieldBool}, value: `"true"`, wantError: "expected boolean"},
 		{name: "datetime type", field: Field{Type: FieldDateTime}, value: `1`, wantError: "expected RFC3339 string"},
@@ -229,8 +332,8 @@ func assertJSONEncodedFields(t *testing.T, dec *codec.Decoder) {
 	}
 	assertNextField(t, dec, 5)
 	wantTime, _ := time.Parse(time.RFC3339Nano, "2024-01-02T03:04:05.123Z")
-	if got := dec.ReadInt(); got != wantTime.Unix() {
-		t.Fatalf("createdAt = %d", got)
+	if got := dec.ReadDateTime(); !got.Equal(wantTime) {
+		t.Fatalf("createdAt = %v", got)
 	}
 	assertNextField(t, dec, 6)
 	if got := dec.ReadInt(); got != 15 {

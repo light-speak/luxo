@@ -1,0 +1,256 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"net"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/light-speak/luxo/pkg/lux/api"
+	"github.com/light-speak/luxo/pkg/lux/auth"
+	"github.com/light-speak/luxo/pkg/lux/luvia"
+	"github.com/shopspring/decimal"
+)
+
+func main() {
+	if err := serveFixture(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func configureFixtureAuth() error {
+	// Every SDK owner launches this fixture with the same isolated test settings.
+	for _, setting := range [][2]string{
+		{"JWT_SECRET", "sdk-interop-fixture-only"}, {"JWT_EXPIRES", "1h"},
+		{"JWT_REFRESH", "true"}, {"JWT_REFRESH_EXPIRES", "2h"},
+	} {
+		if err := os.Setenv(setting[0], setting[1]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func serveHTTP(router *api.Router) error {
+	cfg, err := auth.LoadConfig()
+	if err != nil {
+		return err
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := &http.Server{
+		Handler: api.TraceMiddleware(luvia.AuthMiddleware(cfg, router)), ReadHeaderTimeout: 5 * time.Second,
+		BaseContext: func(net.Listener) context.Context { return ctx },
+	}
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(listener) }()
+	fmt.Printf("http://%s/luvia\n", listener.Addr())
+	// The test owner closes stdin; no fixed port or persistent background daemon.
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	cancel()
+	shutdown, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stop()
+	if err := server.Shutdown(shutdown); err != nil {
+		return err
+	}
+	if err := <-done; !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
+type streamResolver struct{}
+
+func (streamResolver) HandleWatchOptionalInteger(_ context.Context, _ *WatchOptionalIntegerStreamParams, _ any, stream *api.TypedStream[*int64]) error {
+	if err := stream.Send(nil); err != nil {
+		return err
+	}
+	value := int64(0)
+	return stream.Send(&value)
+}
+
+func (streamResolver) HandleWatchOptionalIntegers(_ context.Context, _ *WatchOptionalIntegersStreamParams, _ any, stream *api.TypedStream[[]int64]) error {
+	if err := stream.Send(nil); err != nil {
+		return err
+	}
+	return stream.Send([]int64{})
+}
+
+func (streamResolver) HandleWatchOptionalPrecision(_ context.Context, _ *WatchOptionalPrecisionStreamParams, _ any, stream *api.TypedStream[*Precision]) error {
+	if err := stream.Send(nil); err != nil {
+		return err
+	}
+	return stream.Send(&Precision{Value: 42})
+}
+
+func (streamResolver) FixturePrincipal(context.Context) (FixturePrincipal, error) {
+	return FixturePrincipal{Id: 9007199254740993, Name: "東京"}, nil
+}
+
+func (streamResolver) HandleWatchTimestamp(ctx context.Context, params *WatchTimestampStreamParams, _ any, stream *api.TypedStream[time.Time]) error {
+	value := params.Value
+	if err := stream.Send(value); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (streamResolver) HandleWatchTimestamps(ctx context.Context, params *WatchTimestampsStreamParams, _ any, stream *api.TypedStream[[]time.Time]) error {
+	values := params.Values
+	if err := stream.Send(values); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (streamResolver) HandleWatchFiniteJSON(_ context.Context, params *WatchFiniteJSONStreamParams, _ any, stream *api.TypedStream[[]json.RawMessage]) error {
+	value := params.Value
+	for index := range 64 {
+		row := []json.RawMessage{strconv.AppendInt(nil, int64(index), 10), value}
+		if err := stream.Send(row); err != nil {
+			return err
+		}
+	}
+	if params.Fail {
+		return NewJSONRejected(value)
+	}
+	return nil
+}
+
+func (streamResolver) HandleWatchJSON(ctx context.Context, params *WatchJSONStreamParams, _ any, stream *api.TypedStream[json.RawMessage]) error {
+	value := params.Value
+	if err := stream.Send(value); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (streamResolver) HandleWatchJSONs(ctx context.Context, params *WatchJSONsStreamParams, _ any, stream *api.TypedStream[[]json.RawMessage]) error {
+	values := params.Values
+	if err := stream.Send(values); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (streamResolver) HandleWatchFixtureState(ctx context.Context, _ *WatchFixtureStateStreamParams, _ any, stream *api.TypedStream[FixtureState]) error {
+	if err := stream.Send(FixtureState("OPEN")); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (streamResolver) HandleWatchFixtureStates(ctx context.Context, _ *WatchFixtureStatesStreamParams, _ any, stream *api.TypedStream[[]FixtureState]) error {
+	if err := stream.Send([]FixtureState{"OPEN", "CLOSED"}); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (streamResolver) HandleWatchPrecision(ctx context.Context, params *WatchPrecisionStreamParams, _ any, stream *api.TypedStream[Precision]) error {
+	value := params.Value
+	if err := stream.Send(Precision{
+		Value: value, Duration: time.Duration(value), Optional: &value,
+		Values: []int64{value}, Label: "精度 café", Ignored: 42,
+	}); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (streamResolver) HandleWatchNullableArrays(ctx context.Context, params *WatchNullableArraysStreamParams, _ any, stream *api.TypedStream[NullableArrays]) error {
+	state := params.State
+	value := NullableArrays{Tail: 42}
+	switch state {
+	case 1:
+		value.Values, value.Durations, value.Flags = []int64{}, []time.Duration{}, []bool{}
+	case 2:
+		value.Values = []int64{math.MinInt64, math.MaxInt64}
+		value.Durations = []time.Duration{math.MinInt64, math.MaxInt64}
+		value.Flags = []bool{true, false}
+	}
+	if err := stream.Send(value); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (streamResolver) HandleWatchNestedPrecision(ctx context.Context, params *WatchNestedPrecisionStreamParams, _ any, stream *api.TypedStream[NestedPrecision]) error {
+	state := params.State
+	value := int64(math.MaxInt64)
+	row := Precision{
+		Value: value, Duration: time.Duration(math.MinInt64), Optional: &value,
+		Values: []int64{math.MinInt64, math.MaxInt64}, Label: "精度 café", Ignored: 42,
+	}
+	group := NestedGroup{Label: "nested 東京", Primary: &row, Rows: []Precision{}, Tail: 42}
+	if state > 0 {
+		group.Optional = &row
+		group.OptionalRows = []Precision{}
+	}
+	if state == 2 {
+		group.Rows, group.OptionalRows = []Precision{row}, []Precision{row}
+	}
+	if err := stream.Send(NestedPrecision{Group: &group, Groups: []NestedGroup{group}, Tail: -42}); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (streamResolver) HandleWatchScalarArrays(ctx context.Context, params *WatchScalarArraysStreamParams, _ any, stream *api.TypedStream[ScalarArrays]) error {
+	state := params.State
+	value := scalarArrays(state)
+	if err := stream.Send(value); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func scalarArrays(state int64) ScalarArrays {
+	if state == 0 {
+		return ScalarArrays{Tail: 42}
+	}
+	value := ScalarArrays{
+		Ints: []int64{math.MinInt64, math.MaxInt64}, Floats: []float64{-1.5, 1.25},
+		Strings: []string{"", "精度 café 東京"}, Bools: []bool{true, false},
+		Dates:     []time.Time{time.Unix(-1, 0).UTC(), time.Unix(1609459200, 0).UTC()},
+		Durations: []time.Duration{math.MinInt64, math.MaxInt64},
+		Uuids:     []uuid.UUID{{}, {15: 1}}, Bytes: [][]byte{{}, {0, 127, 128, 255}},
+		Decimals: []decimal.Decimal{decimal.New(1234567890123456789, -9), decimal.New(-1, -9)},
+		Jsons:    []json.RawMessage{json.RawMessage(`{"value":9223372036854775807,"text":"東京"}`), json.RawMessage(`false`)},
+		Enums:    []FixtureState{"OPEN", "CLOSED"}, Tail: 42,
+	}
+	if state == 1 {
+		value.Ints, value.Floats, value.Strings = value.Ints[:0], value.Floats[:0], value.Strings[:0]
+		value.Bools, value.Dates, value.Durations = value.Bools[:0], value.Dates[:0], value.Durations[:0]
+		value.Uuids, value.Bytes, value.Decimals = value.Uuids[:0], value.Bytes[:0], value.Decimals[:0]
+		value.Jsons, value.Enums = value.Jsons[:0], value.Enums[:0]
+	}
+	if state == 3 {
+		value.Floats = []float64{-1.5, 1.25, math.Copysign(0, -1), math.SmallestNonzeroFloat64, -math.SmallestNonzeroFloat64, math.MaxFloat64}
+	}
+	return value
+}

@@ -220,6 +220,20 @@ func TestPadRight(t *testing.T) {
 	if got := PadRight("42", 5, "0"); got != "42000" {
 		t.Errorf("padright = %q", got)
 	}
+	for _, test := range []struct {
+		text string
+		size int
+		pad  string
+	}{
+		{"hello", 3, "x"},
+		{"hello", 5, "x"},
+		{"hello", -1, "x"},
+		{"a", 5, ""},
+	} {
+		if got := PadRight(test.text, test.size, test.pad); got != test.text {
+			t.Errorf("PadRight(%q, %d, %q) = %q", test.text, test.size, test.pad, got)
+		}
+	}
 }
 
 func TestMatches(t *testing.T) {

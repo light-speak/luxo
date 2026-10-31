@@ -1,3 +1,5 @@
+// @vitest-environment jsdom
+
 import { describe, it, expect, vi } from 'vitest'
 import { renderHook, waitFor, act } from '@testing-library/react'
 import { createElement, StrictMode, type ReactNode } from 'react'
@@ -5,6 +7,23 @@ import { QueryClient } from './query-client'
 import { useLuxoQuery } from './use-query'
 
 describe('useLuxoQuery', () => {
+  it('preserves adjacent int64 keys and distinguishes unselected from nullable fields', async () => {
+    const maximum = 9223372036854775807n
+    const queryClient = new QueryClient({ gcTime: Infinity })
+    const queryFn = vi.fn(async (id: bigint) => ({ id, duration: -9223372036854775808n, nullable: null, unloaded: undefined }))
+    const { result, unmount } = renderHook(() => ({
+      first: useLuxoQuery(() => queryFn(maximum), [], { queryKey: ['metric', maximum], queryClient }),
+      second: useLuxoQuery(() => queryFn(maximum - 1n), [], { queryKey: ['metric', maximum - 1n], queryClient }),
+    }))
+
+    await waitFor(() => expect(result.current.second.loading).toBe(false))
+    expect(result.current.first.data).toEqual({ id: maximum, duration: -9223372036854775808n, nullable: null, unloaded: undefined })
+    expect(result.current.second.data?.id).toBe(maximum - 1n)
+    expect(queryFn).toHaveBeenCalledTimes(2)
+    unmount()
+    queryClient.clear()
+  })
+
   it('deduplicates React StrictMode effect replay', async () => {
     const queryFn = vi.fn(() => Promise.resolve('ready'))
     const wrapper = ({ children }: { children: ReactNode }) => createElement(StrictMode, null, children)

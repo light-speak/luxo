@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"crypto/subtle"
-	"encoding/json"
 	stderrors "errors"
 	"fmt"
 	"io"
@@ -16,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/light-speak/luxo/pkg/lux/i18n"
 	"github.com/light-speak/luxo/pkg/lux/schema"
@@ -32,9 +32,15 @@ var (
 // Handlers write their response directly to req.Buf — zero allocation, zero any.
 type HandlerFunc func(ctx context.Context, req *Request) error
 
+type handlerRoute struct {
+	call      HandlerFunc
+	localJSON bool
+}
+
 // StreamHandlerFunc is called when a client subscribes to a @stream @native API without event source.
-// The handler receives a Stream and pushes data via stream.Send(). Return when done or context cancelled.
-type StreamHandlerFunc func(ctx context.Context, params *StreamParams, identity any, stream *Stream)
+// The handler pushes data via stream.Send(). Return nil for completion or an
+// error for terminal failure; accepted messages precede the terminal result.
+type StreamHandlerFunc func(ctx context.Context, params *StreamParams, identity any, stream *Stream) error
 
 // MetricsRecorder is called for each completed request to collect metrics.
 type MetricsRecorder interface {
@@ -71,10 +77,22 @@ type TraceSampler interface {
 
 // Router maps API names to handlers and serves the /luvia endpoint.
 type Router struct {
-	handlers               map[string]HandlerFunc
-	streamMatchers         map[string]StreamMatcher     // @stream API name → matcher function
-	streamHandlers         map[string]StreamHandlerFunc // @stream @native (no event) → handler
-	requiredStreams        map[string]struct{}          // generated @stream APIs that must have an implementation
+	binaryRoutes           map[*binaryAPIPlan]handlerRoute
+	wsLimits               WebSocketLimits
+	wsCalls                atomic.Int64
+	wsConnections          atomic.Int64
+	wsWriteBytes           atomic.Int64
+	prepareMu              sync.Mutex
+	prepared               bool
+	responseCache          *ResponseCache
+	requiredCache          map[string]struct{}
+	cachePlans             map[string]*cacheDependencyPlan
+	cacheBindings          map[string]*cacheRouteBinding
+	handlers               map[string]handlerRoute
+	internalHandlers       map[string]HandlerFunc
+	streamMatchers         map[string]StreamMatcher      // @stream API name → matcher function
+	streamHandlers         map[string]streamHandlerRoute // @stream @native (no event) → handler
+	requiredStreams        map[string]struct{}           // generated @stream APIs that must have an implementation
 	translator             *i18n.Translator
 	devMode                bool
 	Registry               *APIRegistry                                           // binary protocol API ID mapping
@@ -91,13 +109,26 @@ type Router struct {
 	requestLogging         bool
 	debugParamShape        bool
 	logWriter              io.Writer
+	asyncLogs              *asyncRequestLogs
+	logSampleEvery         uint64
+	logSequence            atomic.Uint64
+	bodyLimits             BodyLimits
+	receiveBytes           atomic.Int64
 }
 
-// RouterOptions configures optional request observability outside the hot path.
+// RouterOptions configures runtime resource budgets and request observability.
 type RouterOptions struct {
+	BodyLimits          BodyLimits
+	WebSocket           WebSocketLimits
+	ResponseCache       *ResponseCache
 	RequestLogging      bool
 	DebugParamStructure bool
 	LogWriter           io.Writer
+	// SynchronousRequestLogs opts out of bounded asynchronous request output.
+	SynchronousRequestLogs bool
+	// RequestLogSampleEvery logs one of every N successful requests; 0 defaults to 100, 1 explicitly logs all.
+	// Errors bypass sampling, but queue and record size limits still apply.
+	RequestLogSampleEvery uint64
 }
 
 // SetMetricsCollector configures request metrics collection.
@@ -122,25 +153,43 @@ func (rt *Router) RequestMetricsRecorder() MetricsRecorder {
 
 // NewRouter creates an empty router.
 func NewRouter() *Router {
-	return NewRouterWithOptions(RouterOptions{
-		RequestLogging:      os.Getenv("LOG_REQUESTS") == "true",
-		DebugParamStructure: os.Getenv("LOG_LEVEL") == "debug",
-	})
+	return NewRouterWithOptions(RouterOptionsFromEnv())
 }
 
-// NewRouterWithOptions creates a router with explicit observability settings.
+// RouterOptionsFromEnv reads startup logging settings without creating a router.
+// Callers can attach resource settings before passing these options to NewRouterWithOptions.
+func RouterOptionsFromEnv() RouterOptions {
+	sampleEvery := uint64(100)
+	if os.Getenv("LOG_REQUESTS_FULL") == "true" {
+		sampleEvery = 1
+	}
+	return RouterOptions{
+		RequestLogging:        os.Getenv("LOG_REQUESTS") == "true",
+		RequestLogSampleEvery: sampleEvery,
+		DebugParamStructure:   os.Getenv("LOG_LEVEL") == "debug",
+	}
+}
+
+// NewRouterWithOptions creates a router with explicit resource and observability settings.
 func NewRouterWithOptions(options RouterOptions) *Router {
+	if options.RequestLogSampleEvery == 0 {
+		options.RequestLogSampleEvery = 100
+	}
 	s := schema.New()
 	registry := NewAPIRegistry()
-	registry.SetSchema(s)
+	// Both objects are fresh; their shared schema is validated after registration.
+	registry.schema = s
 	logWriter := options.LogWriter
 	if logWriter == nil {
 		logWriter = os.Stderr
 	}
-	return &Router{
-		handlers:        make(map[string]HandlerFunc),
+	router := &Router{
+		bodyLimits:      normalizeBodyLimits(options.BodyLimits),
+		wsLimits:        normalizeWSLimits(options.WebSocket),
+		responseCache:   options.ResponseCache,
+		handlers:        make(map[string]handlerRoute),
 		streamMatchers:  make(map[string]StreamMatcher),
-		streamHandlers:  make(map[string]StreamHandlerFunc),
+		streamHandlers:  make(map[string]streamHandlerRoute),
 		requiredStreams: make(map[string]struct{}),
 		Registry:        registry,
 		Schema:          s,
@@ -148,7 +197,12 @@ func NewRouterWithOptions(options RouterOptions) *Router {
 		requestLogging:  options.RequestLogging,
 		debugParamShape: options.DebugParamStructure,
 		logWriter:       logWriter,
+		logSampleEvery:  options.RequestLogSampleEvery,
 	}
+	if options.RequestLogging && !options.SynchronousRequestLogs {
+		router.asyncLogs = newAsyncRequestLogs(logWriter, requestLogQueueCapacity)
+	}
+	return router
 }
 
 // HandleStream registers a matcher for a @stream API.
@@ -161,7 +215,7 @@ func (rt *Router) HandleStream(apiName string, matcher StreamMatcher) {
 // HandleStreamNative registers a handler for @stream @native without event source.
 // The handler is invoked per subscription and controls push timing via stream.Send().
 func (rt *Router) HandleStreamNative(apiName string, handler StreamHandlerFunc) {
-	rt.streamHandlers[apiName] = handler
+	rt.streamHandlers[apiName] = streamHandlerRoute{handler: handler}
 }
 
 // RequireStream marks a generated stream route as requiring an implementation.
@@ -169,8 +223,65 @@ func (rt *Router) RequireStream(apiName string) {
 	rt.requiredStreams[apiName] = struct{}{}
 }
 
-// Validate checks startup invariants that cannot be proven by code generation.
+// Prepare freezes a successfully validated startup snapshot for HTTP and RPC.
+// Finish registration first. Failed validation may be corrected and retried;
+// successful preparation is shared without repeating initialization. Do not
+// mutate registrations or schema after success; prepare a new router instead.
+func (rt *Router) Prepare() error {
+	rt.prepareMu.Lock()
+	defer rt.prepareMu.Unlock()
+	if rt.prepared {
+		return nil
+	}
+	if err := rt.Validate(); err != nil {
+		return err
+	}
+	for name, binding := range rt.cacheBindings {
+		binding.plan.Store(rt.cachePlans[name])
+	}
+	rt.prepareBinaryRoutes()
+	rt.prepared = true
+	return nil
+}
+
+// Validate checks startup invariants and prepares immutable cache plans.
+// Complete registration first; do not call it concurrently with requests.
 func (rt *Router) Validate() error {
+	if err := rt.bodyLimits.validate(); err != nil {
+		return err
+	}
+	if err := rt.wsLimits.validate(); err != nil {
+		return err
+	}
+	if rt.Schema != nil {
+		if err := rt.Schema.Prepare(); err != nil {
+			return err
+		}
+	}
+	if err := rt.validateRouteScopes(); err != nil {
+		return err
+	}
+	for name, route := range rt.handlers {
+		if route.localJSON {
+			if _, err := rt.Registry.localJSONDefinition(name); err != nil {
+				return err
+			}
+		}
+	}
+	for name, route := range rt.streamHandlers {
+		if route.handler == nil && !route.preparesInputs() && route.forwardPrepare == nil {
+			return fmt.Errorf("api: stream %q has no registered implementation", name)
+		}
+		if route.preparesInputs() || route.forwardPrepare != nil {
+			if _, err := rt.Registry.localJSONDefinition(name); err != nil {
+				return err
+			}
+		}
+	}
+	plans, err := rt.prepareCacheRequirements()
+	if err != nil {
+		return err
+	}
 	missing := make([]string, 0)
 	for apiName := range rt.requiredStreams {
 		if _, registered := rt.streamMatchers[apiName]; registered {
@@ -181,10 +292,30 @@ func (rt *Router) Validate() error {
 		}
 	}
 	if len(missing) == 0 {
+		rt.cachePlans = plans
 		return nil
 	}
 	sort.Strings(missing)
 	return fmt.Errorf("api: stream %q has no registered implementation", missing[0])
+}
+
+func (rt *Router) validateRouteScopes() error {
+	if rt.Schema == nil {
+		return nil
+	}
+	for name, definition := range rt.Schema.APIs {
+		if definition.Internal {
+			_, public := rt.handlers[name]
+			_, matcher := rt.streamMatchers[name]
+			_, stream := rt.streamHandlers[name]
+			if public || matcher || stream {
+				return fmt.Errorf("api: internal route %q cannot be registered on a public transport", name)
+			}
+		} else if _, internal := rt.internalHandlers[name]; internal {
+			return fmt.Errorf("api: public schema %q does not match its internal registration", name)
+		}
+	}
+	return nil
 }
 
 func (rt *Router) isStreamAPI(apiName string) bool {
@@ -198,9 +329,45 @@ func (rt *Router) isStreamAPI(apiName string) bool {
 	return definition != nil && definition.Stream
 }
 
-// Handle registers a handler for an API name.
+// Handle registers a public HTTP/WebSocket handler, also available over RPC.
+// Registration replaces any previous route with the same name and must finish
+// before serving requests or exporting the RPC startup snapshot.
 func (rt *Router) Handle(name string, fn HandlerFunc) {
-	rt.handlers[name] = fn
+	delete(rt.internalHandlers, name)
+	rt.handlers[name] = handlerRoute{call: rt.bindHandler(name, fn)}
+}
+
+// HandleInternal registers an RPC-only handler. Public transports never look up
+// this table; names and prefixes have no bearing on route visibility.
+func (rt *Router) HandleInternal(name string, fn HandlerFunc) {
+	if rt.internalHandlers == nil {
+		rt.internalHandlers = make(map[string]HandlerFunc)
+	}
+	delete(rt.handlers, name)
+	rt.internalHandlers[name] = rt.bindHandler(name, fn)
+}
+
+func (rt *Router) bindHandler(name string, fn HandlerFunc) HandlerFunc {
+	if rt.responseCache != nil {
+		if rt.cacheBindings == nil {
+			rt.cacheBindings = make(map[string]*cacheRouteBinding)
+		}
+		binding := &cacheRouteBinding{cache: rt.responseCache, api: name}
+		rt.cacheBindings[name] = binding
+		fn = bindResponseCache(binding, fn)
+	}
+	return fn
+}
+
+// HandleLocal registers a statically typed handler that reads and validates all
+// parameters before business effects or cache lookup. JSON stays in its original
+// representation; forwarding handlers must use Handle for canonical wire input.
+// Registration, like Schema construction, must finish before serving requests.
+func (rt *Router) HandleLocal(name string, fn HandlerFunc) {
+	rt.Handle(name, fn)
+	route := rt.handlers[name]
+	route.localJSON = true
+	rt.handlers[name] = route
 }
 
 // SetTranslator configures i18n translation for error responses.
@@ -218,9 +385,17 @@ func (rt *Router) SetDebugTraceKey(key string) {
 	rt.debugTraceSecret = key
 }
 
-// ExportHandlers returns the handler map for sharing with RPC server.
+// ExportHandlers takes a startup snapshot for the RPC server. JSON preparation
+// policy belongs to the public transport and is not part of RPC dispatch.
 func (rt *Router) ExportHandlers() map[string]HandlerFunc {
-	return rt.handlers
+	handlers := make(map[string]HandlerFunc, len(rt.handlers)+len(rt.internalHandlers))
+	for name, route := range rt.handlers {
+		handlers[name] = route.call
+	}
+	for name, handler := range rt.internalHandlers {
+		handlers[name] = handler
+	}
+	return handlers
 }
 
 // ServeHTTP implements http.Handler for the /luvia endpoint.
@@ -230,10 +405,11 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rt.handleWebSocket(w, r)
 		return
 	}
-	if r.URL.Query().Has("$schema") {
+	if r.URL.RawQuery != "" && r.URL.Query().Has("$schema") {
 		rt.handleIntrospection(w, r)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	metrics := rt.RequestMetricsRecorder()
 	r, debugTrace := rt.enableTrace(r, metrics)
 	if debugTrace != nil && debugTrace.responseEnvelope {
@@ -252,11 +428,17 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (rt *Router) serveCall(w http.ResponseWriter, r *http.Request, binaryMode bool, metrics MetricsRecorder, trace *DebugTraceSession) {
+	var logStarted time.Time
+	if rt.requestLogging {
+		logStarted = time.Now()
+	}
 	var decodeStarted time.Time
 	if trace != nil {
 		decodeStarted = trace.Start()
 	}
-	req, bp, err := rt.parseTransportRequest(r, binaryMode)
+	lease := rt.newReceiveLease()
+	defer lease.release()
+	req, bp, err := rt.parseTransportRequestBudget(r, binaryMode, &lease)
 	if trace != nil {
 		trace.Finish(decodeStarted, DebugSpanMeta{Name: "request.decode", Category: "gateway"})
 	}
@@ -264,12 +446,14 @@ func (rt *Router) serveCall(w http.ResponseWriter, r *http.Request, binaryMode b
 		rt.writeParseError(w, r, binaryMode, trace, err)
 		return
 	}
-	if bp != nil {
+	if binaryMode {
 		defer PutRequest(req)
+	}
+	if bp != nil {
 		defer putBody(bp)
 	}
 	req.ClientKey = directClientKey(r.RemoteAddr)
-	fn, ok := rt.handlers[req.API]
+	fn, ok := rt.requestRoute(req)
 	if !ok {
 		writeDebugTraceHeaders(w.Header(), trace)
 		rt.writeAppError(w, r, binaryMode, errors.NotFound.WithData(errors.ResourceError{Resource: req.API}))
@@ -279,7 +463,7 @@ func (rt *Router) serveCall(w http.ResponseWriter, r *http.Request, binaryMode b
 	if trace != nil {
 		prepareStarted = trace.Start()
 	}
-	if err = rt.prepareRequest(req, binaryMode); err != nil {
+	if err = rt.prepareCallRequest(req, binaryMode, fn.localJSON); err != nil {
 		trace.Finish(prepareStarted, DebugSpanMeta{Name: "request.prepare", Category: "gateway", Operation: req.API})
 		writeDebugTraceHeaders(w.Header(), trace)
 		rt.writeAppError(w, r, binaryMode, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
@@ -288,22 +472,31 @@ func (rt *Router) serveCall(w http.ResponseWriter, r *http.Request, binaryMode b
 	if trace != nil {
 		trace.Finish(prepareStarted, DebugSpanMeta{Name: "request.prepare", Category: "gateway", Operation: req.API})
 	}
-	rt.executeHTTPHandler(w, r, req, fn, binaryMode, metrics, trace)
+	rt.executeHTTPHandler(w, r, req, fn.call, binaryMode, metrics, trace, logStarted)
 }
 
 func (rt *Router) parseTransportRequest(r *http.Request, binaryMode bool) (*Request, *[]byte, error) {
+	return rt.parseTransportRequestBudget(r, binaryMode, nil)
+}
+
+func (rt *Router) parseTransportRequestBudget(r *http.Request, binaryMode bool, lease *receiveLease) (*Request, *[]byte, error) {
+	if r.ContentLength > int64(rt.bodyLimits.RequestBytes) {
+		return nil, nil, errRequestBodyTooLarge
+	}
 	if !binaryMode {
-		req, err := ParseRequest(r)
+		req, err := parseRequestLimitBudget(r, rt.bodyLimits.RequestBytes, lease)
 		return req, nil, err
 	}
 	req := GetRequest()
-	body, bp, err := readBody(r.Body)
+	body, bp, err := readTransportBodyBudget(r.Body, rt.bodyLimits.RequestBytes, lease)
 	if err == nil {
 		err = rt.Registry.ParseBinaryRequestInto(body, req)
 	}
 	if err != nil {
 		PutRequest(req)
-		putBody(bp)
+		if bp != nil {
+			putBody(bp)
+		}
 		return nil, nil, err
 	}
 	return req, bp, nil
@@ -315,28 +508,46 @@ func (rt *Router) writeParseError(w http.ResponseWriter, r *http.Request, binary
 		if binaryMode {
 			mode = "binary"
 		}
-		fmt.Fprintf(rt.logWriter, "%s%s%s %s[parse]%s %s %s✗ %s%s\n",
-			colorDim, time.Now().Format("15:04:05"), colorReset,
-			colorRed, colorReset, mode, colorRed, err.Error(), colorReset)
+		rt.logParseFailure(mode, err.Error())
 	}
 	writeDebugTraceHeaders(w.Header(), trace)
+	if stderrors.Is(err, errReceiveCapacity) {
+		rt.writeAppError(w, r, binaryMode, errors.New("Unavailable", http.StatusServiceUnavailable, err.Error()))
+		return
+	}
+	if stderrors.Is(err, errRequestBodyTooLarge) {
+		rt.writeAppError(w, r, binaryMode, errors.New("PayloadTooLarge", http.StatusRequestEntityTooLarge, err.Error()))
+		return
+	}
 	rt.writeAppError(w, r, binaryMode, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
 }
 
-func (rt *Router) executeHTTPHandler(w http.ResponseWriter, r *http.Request, req *Request, fn HandlerFunc, binaryMode bool, metrics MetricsRecorder, trace *DebugTraceSession) {
+func (rt *Router) executeHTTPHandler(w http.ResponseWriter, r *http.Request, req *Request, fn HandlerFunc, binaryMode bool, metrics MetricsRecorder, trace *DebugTraceSession, logStarted time.Time) {
 	buf := GetBuf()
 	req.Buf = buf
 	startedAt, duration, handlerErr := rt.callObservedHandler(r.Context(), req, fn, metrics != nil || rt.requestLogging, trace)
-	rt.recordRequestMetrics(r, req, metrics, startedAt, duration, handlerErr)
 	if handlerErr != nil {
-		rt.writeHandlerError(w, r, req, buf, binaryMode, trace, duration, handlerErr)
+		rt.recordRequestMetrics(r, req, metrics, startedAt, duration, handlerErr)
+		rt.writeHandlerError(w, r, req, buf, binaryMode, trace, handlerErr)
+		rt.logHTTPCompletion(req.API, duration, logStarted, handlerErr)
 		return
 	}
-	rt.logRequest(req.API, duration, nil)
-	jsonBody := rt.encodeHTTPResponse(req, buf, binaryMode, trace)
+	jsonBody, encodeErr := rt.encodeHTTPResponse(req, buf, binaryMode, trace)
+	if encodeErr == nil && responseBodySize(buf.B, jsonBody, binaryMode) > rt.responseBodyLimit() {
+		encodeErr = errors.New("ResponseTooLarge", http.StatusInternalServerError, "response exceeds configured size limit")
+	}
+	rt.recordRequestMetrics(r, req, metrics, startedAt, duration, encodeErr)
+	if encodeErr != nil {
+		rt.writeHandlerError(w, r, req, buf, binaryMode, trace, encodeErr)
+		rt.logHTTPCompletion(req.API, duration, logStarted, encodeErr)
+		return
+	}
 	writeDebugTraceHeaders(w.Header(), trace)
-	rt.writeHTTPResponse(w, buf.B, jsonBody, binaryMode)
-	PutBuf(buf)
+	transferred := rt.writeOwnedResponse(w, buf, jsonBody, binaryMode)
+	rt.logHTTPCompletion(req.API, duration, logStarted, nil)
+	if !transferred {
+		PutBuf(buf)
+	}
 }
 
 func (rt *Router) callObservedHandler(ctx context.Context, req *Request, fn HandlerFunc, observed bool, trace *DebugTraceSession) (time.Time, time.Duration, error) {
@@ -372,8 +583,7 @@ func (rt *Router) recordRequestMetrics(r *http.Request, req *Request, metrics Me
 	}
 }
 
-func (rt *Router) writeHandlerError(w http.ResponseWriter, r *http.Request, req *Request, buf *ResponseBuf, binaryMode bool, trace *DebugTraceSession, duration time.Duration, err error) {
-	rt.logRequest(req.API, duration, err)
+func (rt *Router) writeHandlerError(w http.ResponseWriter, r *http.Request, req *Request, buf *ResponseBuf, binaryMode bool, trace *DebugTraceSession, err error) {
 	if rt.requestLogging && rt.debugParamShape {
 		rt.logParamStructure(req)
 	}
@@ -382,27 +592,26 @@ func (rt *Router) writeHandlerError(w http.ResponseWriter, r *http.Request, req 
 	rt.writeAppError(w, r, binaryMode, err)
 }
 
-func (rt *Router) encodeHTTPResponse(req *Request, buf *ResponseBuf, binaryMode bool, trace *DebugTraceSession) []byte {
+func (rt *Router) encodeHTTPResponse(req *Request, buf *ResponseBuf, binaryMode bool, trace *DebugTraceSession) ([]byte, error) {
 	var jsonBody []byte
+	var err error
 	if trace == nil {
 		if !binaryMode {
-			jsonBody = rt.convertBinaryToJSON(req.API, buf.B)
+			jsonBody, err = rt.convertBinaryToJSON(req.API, buf.B)
 		}
-		return jsonBody
+		return jsonBody, err
 	}
 	encodeStarted := trace.Start()
 	if !binaryMode {
-		jsonBody = rt.convertBinaryToJSON(req.API, buf.B)
+		jsonBody, err = rt.convertBinaryToJSON(req.API, buf.B)
 	}
 	trace.Finish(encodeStarted, DebugSpanMeta{Name: "response.encode", Category: "gateway", Operation: req.API})
-	return jsonBody
+	return jsonBody, err
 }
 
 func (rt *Router) writeHTTPResponse(w http.ResponseWriter, binaryBody, jsonBody []byte, binaryMode bool) {
 	if binaryMode {
-		w.Header().Set("Content-Type", "application/x-luxo")
-		w.Header().Set("X-Luxo-Mode", "binary")
-		w.WriteHeader(http.StatusOK)
+		writeBinaryResponseHead(w, len(binaryBody))
 		_, _ = w.Write(binaryBody)
 	} else {
 		w.Header().Set("Content-Type", "application/json")
@@ -411,6 +620,13 @@ func (rt *Router) writeHTTPResponse(w http.ResponseWriter, binaryBody, jsonBody 
 		_, _ = w.Write(jsonBody)
 		_, _ = w.Write(jsonDataSuffix)
 	}
+}
+
+func writeBinaryResponseHead(w http.ResponseWriter, size int) {
+	w.Header().Set("Content-Length", strconv.Itoa(size))
+	w.Header().Set("Content-Type", "application/x-luxo")
+	w.Header().Set("X-Luxo-Mode", "binary")
+	w.WriteHeader(http.StatusOK)
 }
 
 func (rt *Router) enableDebugTrace(r *http.Request) *http.Request {
@@ -456,6 +672,10 @@ func directClientKey(remoteAddr string) string {
 }
 
 func (rt *Router) prepareRequest(req *Request, binaryMode bool) error {
+	return rt.prepareCallRequest(req, binaryMode, false)
+}
+
+func (rt *Router) prepareCallRequest(req *Request, binaryMode, localJSON bool) error {
 	if err := rt.validatePublicSelection(req, binaryMode); err != nil {
 		return err
 	}
@@ -465,6 +685,9 @@ func (rt *Router) prepareRequest(req *Request, binaryMode bool) error {
 	if binaryMode {
 		return nil
 	}
+	if localJSON {
+		return rt.Registry.prepareLocalJSONRequest(req)
+	}
 	return rt.Registry.prepareJSONRequest(req)
 }
 
@@ -473,7 +696,7 @@ func (rt *Router) validatePublicSelection(req *Request, binaryMode bool) error {
 		return nil
 	}
 	apiMeta := rt.Schema.APIs[req.API]
-	if apiMeta == nil || schemaObject(rt.Schema, apiMeta.ReturnType) == nil {
+	if apiMeta == nil || rt.Schema.LookupModel(apiMeta.ReturnType) == nil {
 		return nil
 	}
 	if binaryMode {
@@ -496,7 +719,7 @@ func (rt *Router) applyJSONSelection(req *Request, binaryMode bool) error {
 	if apiMeta == nil || apiMeta.ReturnType == "" {
 		return nil
 	}
-	model := schemaObject(rt.Schema, apiMeta.ReturnType)
+	model := rt.Schema.LookupModel(apiMeta.ReturnType)
 	if model == nil {
 		return nil
 	}
@@ -526,7 +749,11 @@ func newTraceRecord(r *http.Request, apiName string, selected []*selection.Field
 		Timestamp:     startedAt.UTC(),
 	}
 	if trace := DebugTrace(r.Context()); trace != nil {
-		record.Spans = DebugTraceJSON(trace.Snapshot())
+		var encodeErr error
+		record.Spans, encodeErr = DebugTraceJSON(trace.Snapshot())
+		if encodeErr != nil {
+			record.Spans = failedDebugTraceJSON
+		}
 		record.Selection = selection.Format(selected)
 		record.HeadSampled = trace.Sampled()
 	}
@@ -551,6 +778,7 @@ func (rt *Router) handleIntrospection(w http.ResponseWriter, r *http.Request) {
 	}
 	data, err := rt.Schema.ToJSON()
 	if err != nil {
+		// Unreachable with Schema's fixed JSON-safe fields; retain the public encoder's error contract.
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -565,16 +793,26 @@ func (rt *Router) handleIntrospection(w http.ResponseWriter, r *http.Request) {
 
 // convertBinaryToJSON converts handler's Luxo binary response to JSON using schema.
 // Handles model, list, paginated list, and scalar return types.
-func (rt *Router) convertBinaryToJSON(apiName string, data []byte) []byte {
-	if len(data) == 0 {
-		return []byte("null")
+func (rt *Router) convertBinaryToJSON(apiName string, data []byte) ([]byte, error) {
+	if len(data) == 0 && (rt.Schema == nil || rt.Schema.APIs[apiName] == nil || rt.Schema.APIs[apiName].ReturnType == "") {
+		return []byte("null"), nil
 	}
 	if rt.Schema == nil {
-		return data // no schema — assume handler wrote JSON directly
+		return data, nil // no schema — assume handler wrote JSON directly
 	}
 	apiMeta := rt.Schema.APIs[apiName]
 	if apiMeta == nil {
-		return data // unknown API — pass through as-is
+		return data, nil // unknown API — pass through as-is
+	}
+	if apiMeta.ReturnNullable {
+		value, null, err := codec.UnwrapNullableRoot(data)
+		if err != nil {
+			return nil, err
+		}
+		if null {
+			return []byte("null"), nil
+		}
+		data = value
 	}
 
 	// No return type → scalar (delete returns count as Int)
@@ -583,7 +821,7 @@ func (rt *Router) convertBinaryToJSON(apiName string, data []byte) []byte {
 	}
 
 	// Check if return type is a model, type declaration, or scalar
-	model := schemaObject(rt.Schema, apiMeta.ReturnType)
+	model := rt.Schema.LookupModel(apiMeta.ReturnType)
 	if model == nil {
 		wireType := apiMeta.ReturnType
 		if rt.Schema.Enums[wireType] != nil {
@@ -606,18 +844,8 @@ func (rt *Router) convertBinaryToJSON(apiName string, data []byte) []byte {
 
 // StreamPayloadJSON converts a generated binary stream payload through the
 // same schema-driven path as an ordinary API response.
-func (rt *Router) StreamPayloadJSON(apiName string, data []byte) []byte {
+func (rt *Router) StreamPayloadJSON(apiName string, data []byte) ([]byte, error) {
 	return rt.convertBinaryToJSON(apiName, data)
-}
-
-func schemaObject(s *schema.Schema, typeName string) *schema.Model {
-	if model := s.Models[typeName]; model != nil {
-		return model
-	}
-	if declaration := s.Types[typeName]; declaration != nil {
-		return declaration.AsModel()
-	}
-	return nil
 }
 
 // callHandler executes a handler with panic recovery.
@@ -638,11 +866,13 @@ func (rt *Router) writeAppError(w http.ResponseWriter, r *http.Request, binaryMo
 	buf := GetBuf()
 
 	if binaryMode {
-		buf.B = appendBinaryError(buf.B, werr)
+		werr = appendWireErrorFields(buf, werr, true)
 		w.Header().Set("Content-Type", "application/x-luxo")
 		w.Header().Set("X-Luxo-Mode", "binary")
 	} else {
-		appendJSONError(buf, werr)
+		buf.AppendByte('{')
+		werr = appendWireErrorFields(buf, werr, false)
+		buf.AppendByte('}')
 	}
 
 	w.WriteHeader(werr.Code)
@@ -651,19 +881,26 @@ func (rt *Router) writeAppError(w http.ResponseWriter, r *http.Request, binaryMo
 }
 
 func (rt *Router) buildWireError(ctx context.Context, acceptLanguage string, err error) wireError {
-	var appErr *errors.AppError
-	if !stderrors.As(err, &appErr) {
+	appErr, ok := stderrors.AsType[*errors.AppError](err)
+	if !ok {
 		appErr = errors.Wrap(err)
 	}
 
+	var data []byte
+	if appErr.Data != nil && !appErr.Internal {
+		var encodeErr error
+		data, encodeErr = appErr.Data.AppendJSON(nil)
+		if encodeErr != nil {
+			appErr, data = errors.Wrap(encodeErr), nil
+		}
+	}
 	message := appErr.Message
+	if appErr.Internal {
+		message = "error.internal"
+	}
 	if rt.translator != nil && !appErr.Internal {
 		locale := i18n.ParseAcceptLanguage(acceptLanguage)
-		if appErr.Data != nil {
-			message = rt.translator.Translate(locale, appErr.Message, appErr.Data.I18nData())
-		} else {
-			message = rt.translator.Translate(locale, appErr.Message, nil)
-		}
+		message = rt.translator.Translate(locale, appErr.Message, appErr.Data)
 	}
 
 	werr := wireError{
@@ -671,9 +908,7 @@ func (rt *Router) buildWireError(ctx context.Context, acceptLanguage string, err
 		Name:    appErr.Name,
 		Message: message,
 		TraceID: TraceID(ctx),
-	}
-	if appErr.Data != nil && !appErr.Internal {
-		werr.Data, _ = json.Marshal(appErr.Data)
+		Data:    data,
 	}
 	if rt.devMode && appErr.Cause != nil {
 		werr.Cause = appErr.Cause.Error()
@@ -681,22 +916,22 @@ func (rt *Router) buildWireError(ctx context.Context, acceptLanguage string, err
 	return werr
 }
 
-func appendJSONError(buf *ResponseBuf, e wireError) {
-	buf.AppendByte('{')
-	appendJSONErrorFields(buf, e)
-	buf.AppendByte('}')
-}
-
-func appendJSONErrorFields(buf *ResponseBuf, e wireError) {
+func appendJSONErrorFields(buf *ResponseBuf, e wireError) error {
 	buf.AppendString(`"error":`)
-	buf.AppendJSONString(e.Name)
+	if err := buf.AppendJSONString(e.Name); err != nil {
+		return err
+	}
 	buf.AppendString(`,"code":`)
 	buf.AppendInt(int64(e.Code))
 	buf.AppendString(`,"message":`)
-	buf.AppendJSONString(e.Message)
+	if err := buf.AppendJSONString(e.Message); err != nil {
+		return err
+	}
 	if e.TraceID != "" {
 		buf.AppendString(`,"traceId":`)
-		buf.AppendJSONString(e.TraceID)
+		if err := buf.AppendJSONString(e.TraceID); err != nil {
+			return err
+		}
 	}
 	if len(e.Data) > 0 {
 		buf.AppendString(`,"data":`)
@@ -704,8 +939,37 @@ func appendJSONErrorFields(buf *ResponseBuf, e wireError) {
 	}
 	if e.Cause != "" {
 		buf.AppendString(`,"cause":`)
-		buf.AppendJSONString(e.Cause)
+		if err := buf.AppendJSONString(e.Cause); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+// appendWireErrorFields discards the entire invalid error, not just its text.
+// The fallback consists only of fixed valid strings and cannot recurse.
+func appendWireErrorFields(buf *ResponseBuf, value wireError, binaryMode bool) wireError {
+	prefix := len(buf.B)
+	var err error
+	if binaryMode {
+		buf.B, err = appendBinaryError(buf.B, value)
+	} else {
+		err = appendJSONErrorFields(buf, value)
+	}
+	if err == nil {
+		return value
+	}
+	buf.B = buf.B[:prefix]
+	value = wireError{Code: 500, Name: "Internal", Message: "error.internal"}
+	if binaryMode {
+		buf.B = codec.AppendSvarint(append(buf.B, binaryErrorCodeField), 500)
+		buf.B = codec.AppendBytes(append(buf.B, binaryErrorNameField), []byte("Internal"))
+		buf.B = codec.AppendBytes(append(buf.B, binaryErrorMessageField), []byte("error.internal"))
+		buf.AppendByte(0)
+	} else {
+		buf.AppendString(`"error":"Internal","code":500,"message":"error.internal"`)
+	}
+	return value
 }
 
 // ANSI color codes for module tags
@@ -733,20 +997,40 @@ const (
 // moduleColorMap caches color assignment per module name.
 var (
 	moduleColorMu  sync.Mutex
-	moduleColorMap = make(map[string]string)
+	moduleColorMap atomic.Pointer[map[string]string]
 	moduleColorIdx int
 )
 
 func moduleColor(mod string) string {
+	if snapshot := moduleColorMap.Load(); snapshot != nil {
+		if color, ok := (*snapshot)[mod]; ok {
+			return color
+		}
+	}
+	return registerModuleColor(mod)
+}
+
+func registerModuleColor(mod string) string {
 	moduleColorMu.Lock()
 	defer moduleColorMu.Unlock()
-	if c, ok := moduleColorMap[mod]; ok {
-		return c
+	snapshot := moduleColorMap.Load()
+	if snapshot != nil {
+		if color, ok := (*snapshot)[mod]; ok {
+			return color
+		}
 	}
-	c := moduleColors[moduleColorIdx%len(moduleColors)]
-	moduleColorMap[mod] = c
+	colors := make(map[string]string)
+	if snapshot != nil {
+		for name, color := range *snapshot {
+			colors[name] = color
+		}
+	}
+	color := moduleColors[moduleColorIdx%len(moduleColors)]
+	colors[mod] = color
 	moduleColorIdx++
-	return c
+	// Publish immutable metadata; accepted request logs do not take this lock.
+	moduleColorMap.Store(&colors)
+	return color
 }
 
 // logRequest prints a colored request log line:
@@ -754,9 +1038,26 @@ func moduleColor(mod string) string {
 //	12:34:56 [auth] login 2.3ms ✓
 //	12:34:56 [auth] login 1.2ms ✗ InvalidCredentials
 func (rt *Router) logRequest(apiName string, duration time.Duration, err error) {
-	if !rt.requestLogging {
-		return
+	rt.logRequestTiming(apiName, duration, -1, err)
+}
+
+func (rt *Router) logHTTPCompletion(name string, duration time.Duration, started time.Time, err error) {
+	if !started.IsZero() && rt.shouldLogRequest(err) {
+		rt.logAcceptedRequestTiming(name, duration, time.Since(started), err)
 	}
+}
+
+func (rt *Router) shouldLogRequest(err error) bool {
+	return rt.requestLogging && (err != nil || rt.logSampleEvery <= 1 || rt.logSequence.Add(1)%rt.logSampleEvery == 0)
+}
+
+func (rt *Router) logRequestTiming(apiName string, duration, serverDuration time.Duration, err error) {
+	if rt.shouldLogRequest(err) {
+		rt.logAcceptedRequestTiming(apiName, duration, serverDuration, err)
+	}
+}
+
+func (rt *Router) logAcceptedRequestTiming(apiName string, duration, serverDuration time.Duration, err error) {
 	mod := ""
 	if rt.Schema != nil {
 		if a, ok := rt.Schema.APIs[apiName]; ok {
@@ -767,37 +1068,21 @@ func (rt *Router) logRequest(apiName string, duration time.Duration, err error) 
 		mod = "api"
 	}
 
-	ts := time.Now().Format("15:04:05")
-	ms := float64(duration.Microseconds()) / 1000.0
-	mc := moduleColor(mod)
-
-	var durColor string
-	if ms > 500 {
-		durColor = colorRed
-	} else if ms > 100 {
-		durColor = "\033[33m" // yellow
-	} else {
-		durColor = colorDim
-	}
-
+	failure := ""
 	if err != nil {
-		errorName := safeLogErrorName(err)
-		fmt.Fprintf(rt.logWriter, "%s %s[%s]%s %s %s%.1fms%s %s✗ %s%s\n",
-			colorDim+ts+colorReset,
-			mc, mod, colorReset,
-			apiName,
-			durColor, ms, colorReset,
-			colorRed, errorName, colorReset,
-		)
-	} else {
-		fmt.Fprintf(rt.logWriter, "%s %s[%s]%s %s %s%.1fms%s %s✓%s\n",
-			colorDim+ts+colorReset,
-			mc, mod, colorReset,
-			apiName,
-			durColor, ms, colorReset,
-			colorGreen, colorReset,
-		)
+		failure = safeLogErrorName(err)
 	}
+	if !rt.allowLogParts(mod, apiName, failure) {
+		return
+	}
+	buf := requestLogBuffers.Get().(*[]byte)
+	*buf = appendRequestLog((*buf)[:0], time.Now(), mod, moduleColor(mod), apiName, duration, failure)
+	if serverDuration >= 0 {
+		*buf = append((*buf)[:len(*buf)-1], " server="...)
+		*buf = strconv.AppendFloat(*buf, float64(serverDuration)/float64(time.Millisecond), 'f', 1, 64)
+		*buf = append(*buf, "ms\n"...)
+	}
+	rt.writeLogBuffer(buf)
 }
 
 func safeLogErrorName(err error) string {
@@ -810,7 +1095,7 @@ func safeLogErrorName(err error) string {
 
 func (rt *Router) logParamStructure(req *Request) {
 	params := rt.Registry.ParamOrder(req.API)
-	if req.paramNames == nil {
+	if req.Params != nil {
 		for i, param := range params {
 			_, present := req.Params[param.Name]
 			rt.writeParamStructure(i, param.Name, param.Type, present)
@@ -827,7 +1112,20 @@ func (rt *Router) logParamStructure(req *Request) {
 }
 
 func (rt *Router) writeParamStructure(index int, name string, typeName string, present bool) {
-	fmt.Fprintf(rt.logWriter, "    param[%d] %s %s present=%t\n", index, name, typeName, present)
+	if !rt.allowLogParts(name, typeName) {
+		return
+	}
+	buf := requestLogBuffers.Get().(*[]byte)
+	*buf = append((*buf)[:0], "    param["...)
+	*buf = strconv.AppendInt(*buf, int64(index), 10)
+	*buf = append(*buf, "] "...)
+	*buf = append(*buf, name...)
+	*buf = append(*buf, ' ')
+	*buf = append(*buf, typeName...)
+	*buf = append(*buf, " present="...)
+	*buf = strconv.AppendBool(*buf, present)
+	*buf = append(*buf, '\n')
+	rt.writeLogBuffer(buf)
 }
 
 // writeError writes a simple JSON error response for infrastructure errors.

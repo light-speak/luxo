@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -13,12 +14,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/light-speak/luxo/pkg/lux"
+	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
 // testDB uses an explicitly configured test database when available and falls
 // back to an isolated PostgreSQL container for local development.
-func testDB(t *testing.T) *DB {
+func testDB(t testing.TB) *DB {
 	t.Helper()
 	ctx := context.Background()
 	if connString := os.Getenv("LUXO_TEST_DATABASE_URL"); connString != "" {
@@ -27,7 +29,7 @@ func testDB(t *testing.T) *DB {
 	return containerTestDB(t, ctx)
 }
 
-func containerTestDB(t *testing.T, ctx context.Context) *DB {
+func containerTestDB(t testing.TB, ctx context.Context) *DB {
 	t.Helper()
 	container, err := postgres.Run(ctx, "postgres:17-alpine",
 		postgres.WithDatabase("luxo_test"),
@@ -35,10 +37,10 @@ func containerTestDB(t *testing.T, ctx context.Context) *DB {
 		postgres.WithPassword("test"),
 		postgres.BasicWaitStrategies(),
 	)
+	testcontainers.CleanupContainer(t, container)
 	if err != nil {
 		t.Fatalf("start postgres container: %v", err)
 	}
-	t.Cleanup(func() { container.Terminate(ctx) })
 
 	connStr, err := container.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
@@ -47,7 +49,7 @@ func containerTestDB(t *testing.T, ctx context.Context) *DB {
 	return connectedTestDB(t, ctx, connStr, nil)
 }
 
-func externalTestDB(t *testing.T, ctx context.Context, connString string) *DB {
+func externalTestDB(t testing.TB, ctx context.Context, connString string) *DB {
 	t.Helper()
 	admin, err := pgx.Connect(ctx, connString)
 	if err != nil {
@@ -77,7 +79,7 @@ func externalTestDB(t *testing.T, ctx context.Context, connString string) *DB {
 	})
 }
 
-func connectedTestDB(t *testing.T, ctx context.Context, connString string, cleanup func(context.Context)) *DB {
+func connectedTestDB(t testing.TB, ctx context.Context, connString string, cleanup func(context.Context)) *DB {
 	t.Helper()
 	db, err := NewDB(ctx, connString)
 	if err != nil {
@@ -177,6 +179,17 @@ func TestNewDBInvalidConnStr(t *testing.T) {
 	_, err := NewDB(ctx, "not-a-valid-url://:::")
 	if err == nil {
 		t.Fatal("expected error for invalid connection string")
+	}
+}
+
+func TestNewDBInvalidPoolSize(t *testing.T) {
+	db, err := NewDBWithConfig(t.Context(), "postgres://localhost/unused", lux.DBConfig{Pool: 0})
+	if db != nil {
+		db.Close()
+		t.Fatal("invalid pool size produced a database")
+	}
+	if err == nil || !strings.Contains(err.Error(), "pg: connect to database") {
+		t.Fatalf("pool construction failure not propagated: %v", err)
 	}
 }
 
@@ -384,6 +397,43 @@ func TestUpdateReturning(t *testing.T) {
 	}
 	if updated.Name != "new" {
 		t.Errorf("name = %q, want new", updated.Name)
+	}
+}
+
+func TestUpdateReturningAtomicWithoutCache(t *testing.T) {
+	db := testDB(t)
+	id := uuid.New()
+	if _, err := InsertReturning(t.Context(), db, scanUser, "users", []string{"id", "name", "email", "age"}, []any{id, "before", "atomic@test.com", int64(3)}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := UpdateReturningBy(t.Context(), db, scanUser, "users", "", id, []lux.SetField{
+		{Col: "age", Val: int64(4), Atomic: "+"}, {Col: "name", Val: "after"},
+	})
+	if err != nil || updated == nil || updated.Age != 7 || updated.Name != "after" {
+		t.Fatalf("atomic update=%+v error=%v", updated, err)
+	}
+}
+
+func TestSoftDeleteWithoutCache(t *testing.T) {
+	db := testDB(t)
+	if _, err := Exec(t.Context(), db, "ALTER TABLE users ADD COLUMN deleted_at TIMESTAMPTZ"); err != nil {
+		t.Fatal(err)
+	}
+	id := uuid.New()
+	if _, err := InsertReturning(t.Context(), db, scanUser, "users", []string{"id", "name", "email"}, []any{id, "delete", "delete@test.com"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []int64{1, 0} {
+		q := NewQuery(db, "users", scanUser, []lux.Condition{lux.NewUUIDField("id").Eq(id)})
+		if count, err := q.SoftDelete(t.Context()); err != nil || count != want {
+			t.Fatalf("soft delete count=%d error=%v; want %d", count, err, want)
+		}
+	}
+	if count, err := QueryScalar[int64](t.Context(), db, "SELECT COUNT(*) FROM users WHERE id=$1 AND deleted_at IS NOT NULL", id); err != nil || count != 1 {
+		t.Fatalf("retained deleted row count=%d error=%v", count, err)
+	}
+	if _, err := NewQuery(db, "missing_table", scanUser, nil).SoftDelete(t.Context()); err == nil {
+		t.Fatal("soft delete lost database error")
 	}
 }
 
@@ -799,9 +849,20 @@ func TestQueryGroupBy(t *testing.T) {
 	}
 
 	q := NewQuery[testUser](db, "users", scanUser, nil)
+	type summary struct {
+		Name            string
+		Count, TotalAge int64
+	}
 	results, err := q.GroupBy(ctx, []string{"name"}, []lux.GroupAgg{
+		{Col: "name"},
 		{Fn: "COUNT", Alias: "cnt"},
 		{Fn: "SUM", Col: "age", Alias: "total_age"},
+	}, func(rows Rows) (*summary, error) {
+		var value summary
+		if err := rows.Scan(&value.Name, &value.Count, &value.TotalAge); err != nil {
+			return nil, err
+		}
+		return &value, nil
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -810,12 +871,82 @@ func TestQueryGroupBy(t *testing.T) {
 		t.Fatalf("expected at least 2 groups, got %d", len(results))
 	}
 	for _, r := range results {
-		if r["name"] == "Alice" {
-			cnt, _ := r["cnt"].(int64)
-			if cnt != 2 {
-				t.Errorf("Alice count = %d, want 2", cnt)
+		if r.Name == "Alice" {
+			if r.Count != 2 || r.TotalAge != 60 {
+				t.Errorf("Alice summary = %+v", r)
 			}
 		}
+	}
+}
+
+func TestQueryGroupByValueProjection(t *testing.T) {
+	db := testDB(t)
+	ctx := t.Context()
+	if _, err := Exec(ctx, db, `CREATE TABLE grouped_values(owner_id bigint, state text, points bigint);
+		INSERT INTO grouped_values VALUES (1,'open',4),(1,'open',6),(2,'open',3),(3,'closed',8)`); err != nil {
+		t.Fatal(err)
+	}
+	type summary struct {
+		Total int64
+		Owner int64
+		Mean  float64
+	}
+	columns := []lux.GroupAgg{{Fn: "COUNT", Alias: "total"}, {Col: "owner_id", Alias: "owner"}, {Fn: "AVG", Col: "points", Alias: "mean"}}
+	scan := func(rows Rows) (summary, error) {
+		var value summary
+		err := rows.Scan(&value.Total, &value.Owner, &value.Mean)
+		return value, err
+	}
+	for _, tc := range []struct {
+		name   string
+		offset int
+		state  string
+		want   []summary
+		having []lux.Condition
+	}{
+		{"all", 0, "open", []summary{{2, 1, 5}, {1, 2, 3}}, nil},
+		{"offset", 1, "open", []summary{{1, 2, 3}}, nil},
+		{"empty", 0, "missing", nil, nil},
+		{"having before limit", 0, "open", []summary{{1, 2, 3}}, []lux.Condition{lux.NewIntField("COUNT(*)").Eq(1)}},
+		{"having empty", 0, "open", nil, []lux.Condition{lux.NewIntField("COUNT(*)").Gt(5)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			query := NewQuery(db, "grouped_values", scanUser, []lux.Condition{lux.NewStringField("state").Eq(tc.state)}).OrderBy("owner_id").Limit(2).Offset(tc.offset)
+			if len(tc.having) != 0 {
+				query.Limit(1)
+			}
+			values, err := query.GroupBy(ctx, []string{"state", "owner_id"}, columns, scan, tc.having...)
+			if err != nil || !slices.Equal(values, tc.want) {
+				t.Fatalf("projection = %+v, err=%v, want=%+v", values, err, tc.want)
+			}
+		})
+	}
+	counts, err := NewQuery(db, "grouped_values", scanUser, nil).OrderBy("owner_id").GroupBy(ctx, []string{"owner_id"}, []lux.GroupAgg{{Fn: "COUNT"}}, func(rows Rows) (int64, error) {
+		var count int64
+		err := rows.Scan(&count)
+		return count, err
+	})
+	if err != nil || !slices.Equal(counts, []int64{2, 1, 1}) {
+		t.Fatalf("unselected keys leaked into count projection: %v, %v", counts, err)
+	}
+}
+
+func TestQueryGroupByRejectsAggregateOverflow(t *testing.T) {
+	db := testDB(t)
+	if _, err := Exec(t.Context(), db, `CREATE TABLE grouped_overflow(owner_id bigint, points bigint);
+		INSERT INTO grouped_overflow VALUES(1,9223372036854775807),(1,1)`); err != nil {
+		t.Fatal(err)
+	}
+	values, err := NewQuery(db, "grouped_overflow", scanUser, nil).GroupBy(t.Context(), []string{"owner_id"}, []lux.GroupAgg{{Fn: "SUM", Col: "points"}}, func(rows Rows) (int64, error) {
+		var value int64
+		err := rows.Scan(&value)
+		return value, err
+	})
+	if err == nil || values != nil {
+		t.Fatalf("Int64 aggregate overflow accepted: %v, %v", values, err)
+	}
+	if _, err := db.QueryScalar[int64](t.Context(), "SELECT 1"); err != nil {
+		t.Fatalf("scan failure retained connection: %v", err)
 	}
 }
 
@@ -845,7 +976,7 @@ func TestQuerySumAvgMinMax(t *testing.T) {
 		t.Fatal(err)
 	}
 	if avg != 20 {
-		t.Errorf("Avg = %d, want 20", avg)
+		t.Errorf("Avg = %g, want 20", avg)
 	}
 
 	max, err := q.Max(ctx, "age")
@@ -939,14 +1070,13 @@ func TestQueryAggregateBatch(t *testing.T) {
 		lux.AggregateSpec{Function: lux.AggregateCount},
 		lux.AggregateSpec{Function: lux.AggregateCount, Conditions: []lux.Condition{lux.NewIntField("age").Gte(20)}},
 		lux.AggregateSpec{Function: lux.AggregateSum, Column: "age"},
-		lux.AggregateSpec{Function: lux.AggregateAvg, Column: "age"},
 		lux.AggregateSpec{Function: lux.AggregateMin, Column: "age"},
 		lux.AggregateSpec{Function: lux.AggregateMax, Column: "age"},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fmt.Sprint(values) != "[3 2 60 20 10 30]" {
+	if fmt.Sprint(values) != "[3 2 60 10 30]" {
 		t.Fatalf("aggregate batch values = %v", values)
 	}
 }

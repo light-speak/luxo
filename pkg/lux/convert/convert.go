@@ -47,7 +47,8 @@ func floatToInt(f float64) (int64, error) {
 		return 0, fmt.Errorf("convert: float %v cannot be converted to int64", f)
 	}
 	r := gomath.Round(f)
-	if r > float64(gomath.MaxInt64) || r < float64(gomath.MinInt64) {
+	// MaxInt64 rounds up to 2^63 in float64; that endpoint is exclusive.
+	if r >= 0x1p63 || r < -0x1p63 {
 		return 0, fmt.Errorf("convert: float %v overflows int64", f)
 	}
 	return int64(r), nil

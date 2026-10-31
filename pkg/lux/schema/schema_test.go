@@ -25,6 +25,71 @@ func TestNew(t *testing.T) {
 	}
 }
 
+func TestComputedSourcesSurviveSchemaRoundTrip(t *testing.T) {
+	var source Schema
+	err := json.Unmarshal([]byte(`{"models":{"User":{"name":"User","fields":[{"id":2,"name":"postCount","type":"Int","computed":true}],"computedSources":{"postCount":{"model":"Post","module":"blog"}}}}}`), &source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	s.RegisterModel(source.Models["User"])
+	s.RegisterModel(&Model{Name: "User", Fields: []Field{{ID: 3, Name: "name", Type: FieldString}}})
+	encoded, err := s.ToJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"computedSources":{"postCount":{"model":"Post","module":"blog"}}`) {
+		t.Fatalf("schema dropped aggregate dependency: %s", encoded)
+	}
+}
+
+func TestComputedSourceMergeTracksFieldReplacement(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		field  Field
+		source ComputedSource
+		want   bool
+	}{
+		{"same name new ID", Field{ID: 7, Name: "count", Type: FieldInt, Computed: true}, ComputedSource{Model: "Comment", Module: "blog"}, true},
+		{"same ID new name", Field{ID: 2, Name: "other", Type: FieldInt, Computed: true}, ComputedSource{Model: "Comment", Module: "blog"}, true},
+		{"scalar replaces aggregate", Field{ID: 2, Name: "count", Type: FieldInt}, ComputedSource{Model: "Comment"}, false},
+		{"missing source replaces aggregate", Field{ID: 2, Name: "count", Type: FieldInt, Computed: true}, ComputedSource{}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			old := &Model{Name: "User", Fields: []Field{{ID: 2, Name: "count", Type: FieldInt, Computed: true}},
+				ComputedSources: map[string]ComputedSource{"count": {Model: "Post", Module: "blog"}}}
+			incoming := &Model{Name: "User", Module: "blog", Fields: []Field{test.field}}
+			if test.source.Model != "" {
+				incoming.ComputedSources = map[string]ComputedSource{test.field.Name: test.source}
+			}
+			s := New()
+			s.RegisterModel(old)
+			s.RegisterModel(incoming)
+			got, ok := s.Models["User"].ComputedSources[test.field.Name]
+			wantCount := 0
+			if test.want {
+				wantCount = 1
+			}
+			if ok != test.want || (ok && got != test.source) || len(s.Models["User"].ComputedSources) != wantCount {
+				t.Fatalf("stale aggregate source: %v", s.Models["User"].ComputedSources)
+			}
+			if old.ComputedSources["count"].Model != "Post" {
+				t.Fatal("merging mutated an earlier schema snapshot")
+			}
+		})
+	}
+}
+
+func TestComputedSourceMergeAddsFirstAggregate(t *testing.T) {
+	s := New()
+	s.RegisterModel(&Model{Name: "User", Fields: []Field{{ID: 1, Name: "id", Type: FieldInt}}})
+	s.RegisterModel(&Model{Name: "User", Fields: []Field{{ID: 2, Name: "count", Type: FieldInt, Computed: true}},
+		ComputedSources: map[string]ComputedSource{"count": {Model: "Post"}}})
+	if s.Models["User"].ComputedSources["count"].Model != "Post" {
+		t.Fatal("new aggregate dependency was not registered")
+	}
+}
+
 func TestRegisterModel(t *testing.T) {
 	s := New()
 	m := &Model{
@@ -213,6 +278,34 @@ func TestFieldTypeUnmarshalJSON(t *testing.T) {
 	if err := json.Unmarshal([]byte(`"Bogus"`), &unknown); err == nil {
 		t.Fatal("unknown field type should fail")
 	}
+	for _, data := range []string{`42`, `true`, `{}`, `[]`, `"unterminated`} {
+		got := FieldUUID
+		if err := got.UnmarshalJSON([]byte(data)); err == nil || got != FieldUUID {
+			t.Fatalf("invalid field type %s accepted or changed prior value: %v", data, got)
+		}
+	}
+}
+
+func TestModelPrimaryKeyFallbackAndExtendMetadata(t *testing.T) {
+	s := New()
+	for _, model := range []*Model{
+		{Name: "Fallback", Fields: []Field{{ID: 1, Name: "id", Type: FieldInt}}},
+		{Name: "NoKey", Fields: []Field{{ID: 1, Name: "name", Type: FieldString}}},
+		{Name: "Extended", Fields: []Field{{ID: 1, Name: "id", Type: FieldInt}, {ID: 2, Name: "name", Type: FieldString, Module: "profile"}}},
+	} {
+		if err := s.RegisterModel(model); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if model := s.Models["Fallback"]; model.PrimaryKeyField() != model.FieldByName("id") || model.PrimaryKeyField() == nil {
+		t.Fatal("conventional id was not returned as the fallback key")
+	}
+	if s.Models["NoKey"].PrimaryKeyField() != nil {
+		t.Fatal("model without a key returned an unrelated field")
+	}
+	if s.Models["Fallback"].HasExtendFields() || !s.Models["Extended"].HasExtendFields() || (&Model{}).HasExtendFields() {
+		t.Fatal("incorrect extension ownership metadata")
+	}
 }
 
 func TestSchemaToJSON(t *testing.T) {
@@ -370,6 +463,20 @@ func TestTypeUsageIsSerializedInIntrospection(t *testing.T) {
 	}
 	if decoded.Types["Input"].Usage != TypeUsageInput {
 		t.Fatalf("type usage was not serialized: %s", data)
+	}
+}
+
+func TestSelectToFieldMaskRejectsInvalidIDs(t *testing.T) {
+	for _, id := range []int{-1, 0, codec.MaxSelectionFieldID + 1} {
+		model := &Model{Name: "Broken", Fields: []Field{{ID: id, Name: "value", Type: FieldInt}}}
+		s := New()
+		// Bypass startup validation to exercise the conversion boundary itself.
+		initializeModel(model)
+		s.Models[model.Name] = model
+		out, err := SelectToFieldMask([]*selection.Field{{Name: "value"}}, model, s)
+		if err != codec.ErrInvalidSelectionField || out != nil {
+			t.Fatalf("invalid Schema field %d produced a selection: %x / %v", id, out, err)
+		}
 	}
 }
 

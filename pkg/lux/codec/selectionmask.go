@@ -1,6 +1,9 @@
 package codec
 
-import "sort"
+import (
+	"cmp"
+	"slices"
+)
 
 // SelectionMaskChild binds a relation field to its recursively encoded child mask.
 type SelectionMaskChild struct {
@@ -10,23 +13,55 @@ type SelectionMaskChild struct {
 
 // AppendSelectionMask appends one canonical selection node. A node contains a
 // bitmap followed by length-delimited child nodes ordered by relation field ID.
-func AppendSelectionMask(dst, fields []byte, children []SelectionMaskChild) []byte {
+// Invalid input returns an error without modifying dst or reordering children.
+func AppendSelectionMask(dst, fields []byte, children []SelectionMaskChild) ([]byte, error) {
+	if !validSelectionBitmap(fields) {
+		return nil, ErrInvalidSelectionMask
+	}
+	sorted, err := checkedSelectionChildren(fields, children)
+	if err != nil {
+		return nil, err
+	}
 	dst = AppendVarint(dst, uint64(len(fields)))
 	dst = append(dst, fields...)
-	if len(children) == 0 {
-		return dst
-	}
-	sorted := append([]SelectionMaskChild(nil), children...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].FieldID < sorted[j].FieldID })
 	for _, child := range sorted {
-		if child.FieldID <= 0 || len(child.Mask) == 0 {
-			continue
-		}
 		dst = AppendVarint(dst, uint64(child.FieldID))
 		dst = AppendVarint(dst, uint64(len(child.Mask)))
 		dst = append(dst, child.Mask...)
 	}
-	return dst
+	return dst, nil
+}
+
+func validSelectionBitmap(fields []byte) bool {
+	return len(fields) > 0 && fields[len(fields)-1] != 0 && validFieldMaskBits(fields)
+}
+
+// Validate before touching dst; only clone when sorting is actually needed.
+func checkedSelectionChildren(fields []byte, children []SelectionMaskChild) ([]SelectionMaskChild, error) {
+	ordered, previous := true, 0
+	for _, child := range children {
+		if !FieldMaskHas(fields, child.FieldID) || len(child.Mask) == 0 {
+			return nil, ErrInvalidSelectionMask
+		}
+		if _, _, ok := SplitSelectionMask(child.Mask); !ok {
+			return nil, ErrInvalidSelectionMask
+		}
+		if child.FieldID <= previous {
+			ordered = false
+		}
+		previous = child.FieldID
+	}
+	if ordered {
+		return children, nil
+	}
+	sorted := slices.Clone(children)
+	slices.SortFunc(sorted, func(a, b SelectionMaskChild) int { return cmp.Compare(a.FieldID, b.FieldID) })
+	for i := 1; i < len(sorted); i++ {
+		if sorted[i-1].FieldID == sorted[i].FieldID {
+			return nil, ErrInvalidSelectionMask
+		}
+	}
+	return sorted, nil
 }
 
 // SplitSelectionMask returns the current node's bitmap and encoded child area.
@@ -36,12 +71,12 @@ func SplitSelectionMask(mask []byte) (fields, children []byte, ok bool) {
 		return nil, nil, true
 	}
 	fieldLen, n := ReadVarint(mask, 0)
-	if n <= 0 || fieldLen == 0 || fieldLen > uint64(len(mask)-n) {
+	if n <= 0 || fieldLen == 0 || fieldLen > MaxSelectionMaskBytes || fieldLen > uint64(len(mask)-n) {
 		return nil, nil, false
 	}
 	end := n + int(fieldLen)
 	fields = mask[n:end]
-	if fields[len(fields)-1] == 0 || !validSelectionChildren(mask[end:]) {
+	if !validSelectionBitmap(fields) || !validSelectionChildren(mask[end:]) {
 		return nil, nil, false
 	}
 	return fields, mask[end:], true
@@ -51,7 +86,7 @@ func validSelectionChildren(children []byte) bool {
 	previousID := uint64(0)
 	for off := 0; off < len(children); {
 		fieldID, n := ReadVarint(children, off)
-		if n <= 0 || fieldID == 0 || fieldID <= previousID {
+		if n <= 0 || fieldID == 0 || fieldID > MaxSelectionFieldID || fieldID <= previousID {
 			return false
 		}
 		off += n

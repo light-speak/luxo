@@ -35,11 +35,6 @@ jobs:
           --health-timeout=3s
           --health-retries=5
 
-      nats:
-        image: nats:2-alpine
-        ports:
-          - 4222:4222
-
     env:
       DATABASE_HOST: localhost
       DATABASE_PORT: 5432
@@ -48,6 +43,13 @@ jobs:
       DATABASE_PREFIX: luxo_test
       DATABASE_SSL: disable
       LUXO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
+      NATS_URL: nats://127.0.0.1:4222
+      STORAGE_ENDPOINT: 127.0.0.1:9000
+      STORAGE_REGION: us-east-1
+      STORAGE_ACCESS_KEY: luxo-ci-storage
+      STORAGE_SECRET_KEY: luxo-ci-storage-secret
+      STORAGE_BUCKET: luxo-ci-storage
+      STORAGE_USE_SSL: "false"
 
     steps:
       - uses: actions/checkout@v7
@@ -58,10 +60,66 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Start NATS with JetStream and verify readiness
+        run: |
+          set -euo pipefail
+          docker run --detach --name luxo-ci-nats \
+            --publish 127.0.0.1:4222:4222 \
+            --publish 127.0.0.1:8222:8222 \
+            nats:2-alpine -js -m 8222
+          curl --fail --silent --show-error --retry 20 --retry-all-errors \
+            --retry-delay 1 --connect-timeout 2 --max-time 5 \
+            http://127.0.0.1:8222/healthz
+          curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+            http://127.0.0.1:8222/jsz | jq --exit-status \
+            '.disabled != true and .config.max_memory > 0 and .config.max_storage > 0'
+
+      - name: Checkout pinned MinIO source
+        uses: actions/checkout@v7
+        with:
+          repository: minio/minio
+          ref: 7aac2a2c5b7c882e68c1ce017d8256be2feea27f
+          path: .tmp/minio-source
+          persist-credentials: false
+
+      - name: Build pinned MinIO test image
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/minio-image
+          (cd .tmp/minio-source && GOWORK=off CGO_ENABLED=0 go build -mod=readonly -p=2 -o ../minio-image/minio .)
+          printf 'FROM scratch\nCOPY minio /minio\nENTRYPOINT ["/minio"]\n' > .tmp/minio-image/Dockerfile
+          docker build --tag luxo-ci-minio:7aac2a2c5b7c882e68c1ce017d8256be2feea27f .tmp/minio-image
+
+      - name: Start MinIO and verify readiness
+        run: |
+          set -euo pipefail
+          docker run --detach --name luxo-ci-minio \
+            --publish 127.0.0.1:9000:9000 \
+            --memory 512m --cpus 1 --cap-drop ALL \
+            --security-opt no-new-privileges --tmpfs /data:rw,size=128m \
+            -e "MINIO_ROOT_USER=$STORAGE_ACCESS_KEY" \
+            -e "MINIO_ROOT_PASSWORD=$STORAGE_SECRET_KEY" \
+            luxo-ci-minio:7aac2a2c5b7c882e68c1ce017d8256be2feea27f \
+            server /data
+          curl --fail --silent --show-error --retry 20 --retry-all-errors \
+            --retry-delay 1 --connect-timeout 2 --max-time 5 \
+            "http://$STORAGE_ENDPOINT/minio/health/ready"
+
+      - name: Configure local module graph
+        uses: ./.github/actions/setup-modules
+
       - name: Run tests with coverage
         run: |
-          go test ./pkg/... ./scripts/... -v -coverprofile=coverage.out -timeout 180s -count=1
-          go test ./cmd/... -v -timeout 60s -count=1
+          go test ./pkg/... ./cmd/... ./scripts/... ./internal/... -v -coverprofile=coverage.out -timeout 180s -count=1
+          go test ./cmd/luxo/... -v -timeout 60s -count=1
+
+      - name: Verify independent adapters against this core revision
+        run: |
+          go test -race ./pkg/lux/storage/s3/... -coverprofile=s3-coverage.out -count=1 -timeout=120s
+          go test -race ./pkg/lux/cache/redis/... -coverprofile=redis-coverage.out -count=1 -timeout=120s
+          go test -race ./pkg/lux/nats/... -coverprofile=nats-coverage.out -count=1 -timeout=120s
+          go test -race ./pkg/lux/pg/... -coverprofile=pg-coverage.out -count=1 -timeout=180s
+          go vet ./cmd/luxo/... ./pkg/lux/pg/... ./pkg/lux/storage/s3/... ./pkg/lux/cache/redis/... ./pkg/lux/nats/...
 
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1
@@ -79,9 +137,21 @@ jobs:
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7
         with:
-          files: coverage.out
+          files: coverage.out,s3-coverage.out,redis-coverage.out,nats-coverage.out,pg-coverage.out
           use_oidc: true
           fail_ci_if_error: true
+
+      - name: Stop MinIO test container
+        if: always()
+        run: |
+          docker logs luxo-ci-minio || true
+          docker rm --force luxo-ci-minio || true
+
+      - name: Stop NATS test container
+        if: always()
+        run: |
+          docker logs luxo-ci-nats || true
+          docker rm --force luxo-ci-nats || true
 
   lint:
     runs-on: ubuntu-latest
@@ -94,32 +164,28 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Configure local module graph
+        uses: ./.github/actions/setup-modules
+
       - name: Vet
-        run: go vet ./pkg/... ./cmd/... ./scripts/...
+        run: go vet ./pkg/... ./cmd/... ./cmd/luxo/... ./scripts/... ./internal/... ./pkg/lux/pg/... ./pkg/lux/nats/... ./pkg/lux/cache/redis/... ./pkg/lux/storage/s3/...
+
 
       - name: Gofmt check
-        run: |
-          UNFORMATTED=$(gofmt -l pkg/ cmd/ scripts/)
-          if [ -n "$UNFORMATTED" ]; then
-            echo "::error::Files not formatted: $UNFORMATTED"
-            exit 1
-          fi
+        run: sh scripts/check-go.sh format pkg/ cmd/ scripts/ internal/
 
       - name: Gocyclo check
         run: |
           go install github.com/fzipp/gocyclo/cmd/gocyclo@v0.6.0
-          VIOLATIONS=$(gocyclo -over 25 pkg/ cmd/ scripts/)
-          if [ -n "$VIOLATIONS" ]; then
-            echo "::error::Cyclomatic complexity > 25:"
-            echo "$VIOLATIONS"
-            exit 1
-          fi
+          go version -m "$(command -v gocyclo)"
+          sh scripts/check-go.sh complexity pkg/ cmd/ scripts/ internal/
 
       - name: Build
-        run: go build ./pkg/... ./cmd/... ./scripts/...
+        run: go build ./pkg/... ./cmd/... ./cmd/luxo/... ./scripts/... ./internal/... ./pkg/lux/pg/... ./pkg/lux/nats/... ./pkg/lux/cache/redis/... ./pkg/lux/storage/s3/...
 
   race:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
@@ -129,8 +195,13 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Configure local module graph
+        uses: ./.github/actions/setup-modules
+
       - name: Verify compiler state isolation
-        run: go test -race ./pkg/codegen ./pkg/semantic ./pkg/lockfile -count=1 -timeout=180s
+        env:
+          GOFLAGS: -trimpath -race
+        run: go test ./pkg/codegen ./pkg/semantic ./pkg/lockfile -count=1 -timeout=10m
 
   runtime-race:
     runs-on: ubuntu-latest
@@ -174,15 +245,22 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Configure local module graph
+        uses: ./.github/actions/setup-modules
+
       - name: Verify runtime concurrency safety
         run: go test -race ./pkg/lux/... -count=1 -timeout=240s
 
-  performance:
+  performance-scope:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
+    outputs:
+      run: ${{ steps.benchmark_scope.outputs.run }}
+      matrix: ${{ steps.benchmark_plan.outputs.matrix }}
+      artifact: ${{ steps.benchmark_plan.outputs.artifact }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -201,7 +279,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Test performance gate
-        run: GOWORK=off go test ./scripts/benchgate ./scripts/benchscope -count=1
+        run: GOWORK=off go test ./scripts/benchgate ./scripts/benchscope ./scripts/benchplan ./scripts/benchrun ./internal/benchlayout -count=1
 
       - name: Select affected benchmark packages
         id: benchmark_scope
@@ -218,14 +296,18 @@ jobs:
           }
           mkdir -p .tmp/head
           git archive HEAD | tar -x -C .tmp/head
+          sh scripts/setup-modules.sh .tmp/base
+          sh scripts/setup-modules.sh .tmp/head
+          mkdir -p .tmp/bin
+          GOWORK=off go build -o .tmp/bin/benchrun ./scripts/benchrun
           (
             cd .tmp/base
             benchmark_packages
-          ) > .tmp/base-benchmark-packages.txt
+          ) | .tmp/bin/benchrun canonical > .tmp/base-benchmark-packages.txt
           (
             cd .tmp/head
             benchmark_packages
-          ) > .tmp/head-benchmark-packages.txt
+          ) | .tmp/bin/benchrun canonical > .tmp/head-benchmark-packages.txt
           comm -12 .tmp/base-benchmark-packages.txt .tmp/head-benchmark-packages.txt > .tmp/common-benchmark-packages.txt
           git -c core.quotePath=false diff --no-renames --name-only "${BASE_SHA}" HEAD > .tmp/changed-files.txt
           GOWORK=off go run ./scripts/benchscope \
@@ -242,8 +324,89 @@ jobs:
             echo "No benchmarked package has production changes in its dependency graph."
           fi
 
-      - name: Install pinned benchstat
+      - name: Discover and plan benchmark batches
+        id: benchmark_plan
         if: steps.benchmark_scope.outputs.run == 'true'
+        env:
+          TMPDIR: ${{ github.workspace }}/.tmp/test-tmp
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/bin .tmp/test-tmp .tmp/benchmark-inventory/base .tmp/benchmark-inventory/head
+          while IFS= read -r package; do
+            for revision in base head; do
+              .tmp/bin/benchrun compile ".tmp/${revision}" ".tmp/bin/${revision}" "${package}"
+              .tmp/bin/benchrun run ".tmp/${revision}" ".tmp/bin/${revision}" "${package}" \
+                -test.run='^$' -test.bench=. -test.benchmem -test.benchtime=1x \
+                -test.count=1 -test.cpu=2 -test.timeout=180s \
+                > ".tmp/benchmark-inventory/${revision}/${package//\//-}.raw.log"
+              GOWORK=off go run ./scripts/benchplan --normalize \
+                ".tmp/benchmark-inventory/${revision}/${package//\//-}.raw.log" \
+                ".tmp/benchmark-inventory/${revision}/${package//\//-}.log"
+            done
+          done < .tmp/benchmark-packages.txt
+          matrix=$(GOWORK=off go run ./scripts/benchplan .tmp/benchmark-packages.txt .tmp/benchmark-inventory .tmp/benchmark-plan)
+          echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
+          echo "artifact=benchmark-plan-${RUN_ATTEMPT}" >> "${GITHUB_OUTPUT}"
+
+      - name: Preserve benchmark plan and discovery evidence
+        if: always() && steps.benchmark_scope.outputs.run == 'true'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: benchmark-plan-${{ github.run_attempt }}
+          retention-days: 14
+          include-hidden-files: true
+          path: |
+            .tmp/benchmark-plan/
+            .tmp/benchmark-inventory/
+            .tmp/*benchmark-packages.txt
+            .tmp/changed-files.txt
+
+  performance-samples:
+    needs: performance-scope
+    if: needs.performance-scope.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.performance-scope.outputs.matrix).include }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check out benchmark baseline
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: .tmp/base
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Load benchmark batch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          PLAN_ARTIFACT: ${{ needs.performance-scope.outputs.artifact }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          gh run download "${RUN_ID}" --name "${PLAN_ARTIFACT}" --dir .tmp/plan
+          cp ".tmp/plan/benchmark-plan/shard-${SHARD}.tsv" .tmp/benchmark-batch.tsv
+          cp ".tmp/plan/benchmark-plan/shard-${SHARD}.json" .tmp/benchmark-expected.json
+          test -s .tmp/benchmark-batch.tsv
+          mkdir -p .tmp/head
+          git archive HEAD | tar -x -C .tmp/head
+
+      - name: Install pinned benchstat
         env:
           GOBIN: ${{ github.workspace }}/.tmp/bin
         run: |
@@ -251,24 +414,18 @@ jobs:
           go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70
 
       - name: Compile benchmark binaries
-        if: steps.benchmark_scope.outputs.run == 'true'
         run: |
           set -euo pipefail
           mkdir -p .tmp/bin/base .tmp/bin/head .tmp/test-tmp
-          while IFS= read -r package; do
-            binary="${package//\//-}.test"
-            (
-              cd .tmp/base
-              GOWORK=off go test -trimpath -c "./${package}" -o "${GITHUB_WORKSPACE}/.tmp/bin/base/${binary}"
-            )
-            (
-              cd .tmp/head
-              GOWORK=off go test -trimpath -c "./${package}" -o "${GITHUB_WORKSPACE}/.tmp/bin/head/${binary}"
-            )
-          done < .tmp/benchmark-packages.txt
+          sh scripts/setup-modules.sh .tmp/base
+          sh scripts/setup-modules.sh .tmp/head
+          GOWORK=off go build -o .tmp/bin/benchrun ./scripts/benchrun
+          while IFS=$'\t' read -r package filter; do
+            .tmp/bin/benchrun compile .tmp/base .tmp/bin/base "${package}"
+            .tmp/bin/benchrun compile .tmp/head .tmp/bin/head "${package}"
+          done < .tmp/benchmark-batch.tsv
 
       - name: Run adaptive interleaved benchmark samples
-        if: steps.benchmark_scope.outputs.run == 'true'
         env:
           TMPDIR: ${{ github.workspace }}/.tmp/test-tmp
         run: |
@@ -278,43 +435,40 @@ jobs:
             local binary_root="$2"
             local output="$3"
             local package="$4"
-            local binary="${package//\//-}.test"
-            (
-              cd "${source_root}/${package}"
-              "${binary_root}/${binary}" \
-                -test.run='^$' \
-                -test.bench=. \
-                -test.benchmem \
-                -test.benchtime=200ms \
-                -test.count=1 \
-                -test.cpu=2
-            ) >> "${output}"
+            local filter="$5"
+            .tmp/bin/benchrun run "${source_root}" "${binary_root}" "${package}" \
+              -test.run='^$' -test.bench="${filter}" -test.benchmem \
+              -test.benchtime=200ms -test.count=1 -test.cpu=2 >> "${output}"
           }
           run_group() {
             local group="$1"
-            local base_output="${GITHUB_WORKSPACE}/.tmp/benchmark-${group}-base.txt"
-            local head_output="${GITHUB_WORKSPACE}/.tmp/benchmark-${group}-head.txt"
+            local base_output="${GITHUB_WORKSPACE}/.tmp/benchmark-raw-${group}-base.txt"
+            local head_output="${GITHUB_WORKSPACE}/.tmp/benchmark-raw-${group}-head.txt"
             : > "${base_output}"
             : > "${head_output}"
             for sample in {1..10}; do
-              while IFS= read -r package; do
+              while IFS=$'\t' read -r package filter; do
                 if (( sample % 2 == 1 )); then
-                  run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}"
-                  run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}"
+                  run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}" "${filter}"
+                  run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}" "${filter}"
                 else
-                  run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}"
-                  run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}"
+                  run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}" "${filter}"
+                  run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}" "${filter}"
                 fi
-              done < "${GITHUB_WORKSPACE}/.tmp/benchmark-packages.txt"
+              done < "${GITHUB_WORKSPACE}/.tmp/benchmark-batch.tsv"
             done
+            GOWORK=off go run ./scripts/benchplan --normalize "${base_output}" ".tmp/benchmark-${group}-base.txt"
+            GOWORK=off go run ./scripts/benchplan --normalize "${head_output}" ".tmp/benchmark-${group}-head.txt"
           }
           run_group primary
+          GOWORK=off go run ./scripts/benchplan --verify .tmp/benchmark-expected.json .tmp/benchmark-primary-base.txt .tmp/benchmark-primary-head.txt
           .tmp/bin/benchstat -alpha 0.01 base=.tmp/benchmark-primary-base.txt head=.tmp/benchmark-primary-head.txt
           .tmp/bin/benchstat -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv base=.tmp/benchmark-primary-base.txt head=.tmp/benchmark-primary-head.txt > .tmp/benchstat-primary.csv 2> .tmp/benchstat-primary-warnings.txt
           confirmation_required=$(GOWORK=off go run ./scripts/benchgate --requires-confirmation .tmp/benchstat-primary.csv)
           if [[ "${confirmation_required}" == "true" ]]; then
             echo "Primary samples found a regression candidate; running confirmation samples."
             run_group confirmation
+            GOWORK=off go run ./scripts/benchplan --verify .tmp/benchmark-expected.json .tmp/benchmark-confirmation-base.txt .tmp/benchmark-confirmation-head.txt
             .tmp/bin/benchstat -alpha 0.01 base=.tmp/benchmark-confirmation-base.txt head=.tmp/benchmark-confirmation-head.txt
             .tmp/bin/benchstat -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv base=.tmp/benchmark-confirmation-base.txt head=.tmp/benchmark-confirmation-head.txt > .tmp/benchstat-confirmation.csv 2> .tmp/benchstat-confirmation-warnings.txt
           else
@@ -322,12 +476,49 @@ jobs:
           fi
 
       - name: Enforce performance baseline
-        if: steps.benchmark_scope.outputs.run == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
+          set -euo pipefail
           if [[ -s .tmp/benchstat-confirmation.csv ]]; then
-            GOWORK=off go run ./scripts/benchgate .tmp/benchstat-primary.csv .tmp/benchstat-confirmation.csv
+            GOWORK=off go run ./scripts/benchgate --approved-costs scripts/benchgate/approved-costs.json --base-sha "${BASE_SHA}" .tmp/benchstat-primary.csv .tmp/benchstat-confirmation.csv
           else
-            GOWORK=off go run ./scripts/benchgate .tmp/benchstat-primary.csv
+            GOWORK=off go run ./scripts/benchgate --approved-costs scripts/benchgate/approved-costs.json --base-sha "${BASE_SHA}" .tmp/benchstat-primary.csv
+          fi
+
+      - name: Preserve performance evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: performance-evidence-${{ matrix.shard }}-${{ github.run_attempt }}
+          retention-days: 14
+          include-hidden-files: true
+          path: |
+            .tmp/benchmark-*.txt
+            .tmp/benchstat-*.csv
+            .tmp/benchstat-*-warnings.txt
+            .tmp/benchmark-batch.tsv
+            .tmp/benchmark-expected.json
+
+  performance:
+    needs: [performance-scope, performance-samples]
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require every selected benchmark batch
+        env:
+          SCOPE_RESULT: ${{ needs.performance-scope.result }}
+          SAMPLES_RESULT: ${{ needs.performance-samples.result }}
+          HAS_BENCHMARKS: ${{ needs.performance-scope.outputs.run }}
+        run: |
+          set -euo pipefail
+          test "${SCOPE_RESULT}" = success
+          if [[ "${HAS_BENCHMARKS}" == true ]]; then
+            test "${SAMPLES_RESULT}" = success
+          else
+            test "${HAS_BENCHMARKS}" == false
+            test "${SAMPLES_RESULT}" = skipped
           fi
 
   external-go-consumer:
@@ -340,6 +531,9 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+
+      - name: Configure local module graph
+        uses: ./.github/actions/setup-modules
 
       - name: Build Luxo CLI
         run: |
@@ -356,6 +550,7 @@ jobs:
 
   fuzz:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
@@ -365,14 +560,39 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Prepare fuzz diagnostics
+        run: |
+          mkdir -p .tmp/fuzz
+          go version | tee .tmp/fuzz/toolchain.txt
+          go env GOOS GOARCH >> .tmp/fuzz/toolchain.txt
+
       - name: Fuzz Lexer
-        run: go test ./pkg/lexer/ -fuzz=FuzzLexer -fuzztime=30s -timeout=120s
+        run: |
+          set -euo pipefail
+          go test ./pkg/lexer/ -run='^$' -fuzz='^FuzzLexer$' -fuzztime=2000000x -parallel=4 -timeout=180s 2>&1 | tee .tmp/fuzz/lexer.log
 
       - name: Fuzz Parser
-        run: go test ./pkg/parser/ -fuzz=FuzzParser -fuzztime=30s -timeout=120s
+        run: |
+          set -euo pipefail
+          go test ./pkg/parser/ -run='^$' -fuzz='^FuzzParser$' -fuzztime=2000000x -parallel=4 -timeout=180s 2>&1 | tee .tmp/fuzz/parser.log
 
       - name: Fuzz Semantic
-        run: go test ./pkg/semantic/ -fuzz=FuzzAnalyzer -fuzztime=30s -timeout=120s
+        run: |
+          set -euo pipefail
+          go test ./pkg/semantic/ -run='^$' -fuzz='^FuzzAnalyzer$' -fuzztime=2000000x -parallel=4 -timeout=180s 2>&1 | tee .tmp/fuzz/semantic.log
+
+      - name: Preserve fuzz diagnostics and failing inputs
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: fuzz-evidence-${{ github.run_attempt }}
+          retention-days: 14
+          include-hidden-files: true
+          path: |
+            .tmp/fuzz/
+            pkg/lexer/testdata/fuzz/
+            pkg/parser/testdata/fuzz/
+            pkg/semantic/testdata/fuzz/
 
   sdk-ts:
     runs-on: ubuntu-latest
@@ -387,14 +607,45 @@ jobs:
 
       - uses: pnpm/action-setup@v6
         with:
-          version: 10
+          version: 11.9.0
 
       - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version-file: .node-version
+
+      - name: Verify Node toolchain
+        run: sh scripts/check-node.sh
+
+      - uses: actions/setup-go@v7
+        if: matrix.package == 'vite-plugin'
+        with:
+          go-version-file: go.mod
+
+      - name: Bind candidate modules for generated SDK fixtures
+        uses: ./.github/actions/setup-modules
+        if: matrix.package == 'vite-plugin'
 
       - name: Install dependencies
         working-directory: packages/${{ matrix.package }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Report JavaScript toolchain
+        working-directory: packages/${{ matrix.package }}
+        run: |
+          node --version
+          pnpm --version
+          pnpm exec tsc --version
+
+      - name: Build client dependency for SDK consumers
+        if: matrix.package != 'client'
+        working-directory: packages/client
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Install generator dependencies for React tests
+        if: matrix.package == 'react'
+        working-directory: packages/vite-plugin
         run: pnpm install --frozen-lockfile
 
       - name: Test and build package
@@ -403,19 +654,54 @@ jobs:
           pnpm test
           pnpm build
 
-      - name: Type-check React package
-        if: matrix.package == 'react'
-        working-directory: packages/react
+      - name: Type-check SDK package
+        working-directory: packages/${{ matrix.package }}
         run: pnpm typecheck
 
   sdk-dart:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dart: ['3.13.0', '3.13.4']
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ matrix.dart }}
+
+      - name: Verify Dart toolchain
+        env:
+          DART_EXPECTED: ${{ matrix.dart }}
+        run: |
+          set -euo pipefail
+          : "${DART_EXPECTED:?missing expected Dart version}"
+          dart_version_output="$(dart --version 2>&1)"
+          printf '%s\n' "${dart_version_output}"
+          case "${dart_version_output}" in
+            "Dart SDK version: ${DART_EXPECTED} (stable) "*) ;;
+            *) printf '::error::Expected Dart %s stable\n' "${DART_EXPECTED}"; exit 1 ;;
+          esac
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Bind candidate modules for generated SDK fixtures
+        uses: ./.github/actions/setup-modules
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+
+      - name: Verify Node toolchain
+        run: sh scripts/check-node.sh
+
+      - name: Check generated Go interoperability fixture
+        run: go test ./tests/sdk-interop
 
       - name: Install dependencies
         working-directory: packages/dart
@@ -427,10 +713,20 @@ jobs:
 
       - name: Test SDK
         working-directory: packages/dart
-        run: dart test
+        run: dart test --concurrency=1
+
+      - name: Test JavaScript and Wasm precision and WebSocket adapter
+        working-directory: packages/dart
+        run: >-
+          dart test -p node -c dart2js -c dart2wasm -j 1
+          test/int64_test.dart test/int64_codec_test.dart test/int64_json_test.dart
+          test/socket_web_test.dart test/uint64_test.dart test/error_response_test.dart test/json_parameters_test.dart
+          test/http_protocol_test.dart test/codec_metadata_test.dart test/codec_test.dart test/codec_text_test.dart
+          test/unicode_test.dart
 
   sdk-kotlin:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -441,8 +737,16 @@ jobs:
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: 21
+          java-version: '26'
+          check-latest: true
           cache: gradle
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Bind candidate modules for generated SDK fixtures
+        uses: ./.github/actions/setup-modules
 
       - name: Verify Gradle Wrapper
         working-directory: packages/kotlin
@@ -453,6 +757,19 @@ jobs:
       - name: Test Kotlin SDK and Gradle plugin
         working-directory: packages/kotlin
         run: ./gradlew build :gradle-plugin:validatePlugins --no-daemon --warning-mode fail
+
+      - name: Test generated Kotlin client against Go
+        run: |
+          go test ./tests/sdk-interop
+          go run ./tests/sdk-interop -run -- ./packages/kotlin/gradlew -p tests/sdk-interop/kotlin build --project-cache-dir .tmp/gradle-cache --no-daemon --warning-mode fail
+
+      - name: Test Kotlin gateway responses, errors and stream terminals
+        run: go run ./tests/sdk-interop -run -gateway -- ./packages/kotlin/gradlew -p tests/sdk-interop/kotlin build --project-cache-dir .tmp/gradle-cache --no-daemon --warning-mode fail
+
+      - name: Test old Kotlin SDK against new enum services
+        run: |
+          go run ./tests/sdk-interop -run -enum-upgrade -- ./packages/kotlin/gradlew -p tests/sdk-interop/kotlin build --project-cache-dir .tmp/gradle-cache --no-daemon --warning-mode fail
+          go run ./tests/sdk-interop -run -enum-upgrade -gateway -- ./packages/kotlin/gradlew -p tests/sdk-interop/kotlin build --project-cache-dir .tmp/gradle-cache --no-daemon --warning-mode fail
 
       - name: Test external Kotlin consumer
         working-directory: tests/kotlin-consumer
@@ -465,16 +782,17 @@ jobs:
           trap 'kill "${server_pid}"' EXIT
           curl --retry 20 --retry-connrefused --retry-delay 1 -fsS -o /dev/null http://127.0.0.1:18080/luxo.schema.json
           ../../packages/kotlin/gradlew luxoGenerate build --project-cache-dir .tmp/gradle-cache --no-daemon --warning-mode fail -Pluxo.endpoint=http://127.0.0.1:18080/luxo.schema.json
-          grep -F '"lookupNode" to "name, posts { title }"' .tmp/generated/com/luxo/generated/SelectHints.kt
           if grep -R -F '!!' .tmp/generated/com/luxo/generated; then
             echo "::error::Generated Kotlin contains a non-null assertion"
             exit 1
           fi
-          ../../packages/kotlin/gradlew luxoAnalyze --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
-          ../../packages/kotlin/gradlew luxoAnalyze --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
+          ../../packages/kotlin/gradlew build --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
+          ../../packages/kotlin/gradlew build --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
 
   sdk-swift-conformance:
-    runs-on: macos-15
+    runs-on: macos-26
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
     timeout-minutes: 20
     permissions:
       contents: read
@@ -487,11 +805,38 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: light-speak/luxo-swift
-          ref: main
+          ref: 9e45d47284827e06d1dfd649ff54876d0116d249
           path: .tmp/luxo-swift
           persist-credentials: false
+
+      - name: Verify Swift candidate version
+        run: cmp VERSION .tmp/luxo-swift/VERSION
 
       - name: Verify Swift wire protocol compatibility
         env:
           LUXO_PROTOCOL_FIXTURE: ${{ github.workspace }}/pkg/lux/codec/testdata/protocol-v1.json
         run: swift test --package-path .tmp/luxo-swift --filter ProtocolConformanceTests
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Bind candidate modules for generated SDK fixtures
+        uses: ./.github/actions/setup-modules
+
+      - name: Verify generated Swift client against Go
+        env:
+          LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
+        run: go run ./tests/sdk-interop -run -- bash tests/sdk-interop/swift/run.sh
+
+      - name: Verify Swift gateway responses, error data and stream terminals
+        env:
+          LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
+        run: go run ./tests/sdk-interop -run -gateway -- bash tests/sdk-interop/swift/run.sh
+
+      - name: Verify old Swift SDK against new enum services
+        env:
+          LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
+        run: |
+          go run ./tests/sdk-interop -run -enum-upgrade -- bash tests/sdk-interop/swift/run.sh
+          go run ./tests/sdk-interop -run -enum-upgrade -gateway -- bash tests/sdk-interop/swift/run.sh

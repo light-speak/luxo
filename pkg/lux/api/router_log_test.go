@@ -2,19 +2,68 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/schema"
 )
 
+type delayedLogResponseWriter struct{ *httptest.ResponseRecorder }
+
+func (w delayedLogResponseWriter) Write(p []byte) (int, error) {
+	time.Sleep(10 * time.Millisecond)
+	return w.ResponseRecorder.Write(p)
+}
+
+func TestHTTPLogIncludesResponseWriteDuration(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var out bytes.Buffer
+		r := NewRouterWithOptions(RouterOptions{RequestLogging: true, RequestLogSampleEvery: 1, SynchronousRequestLogs: true, LogWriter: &out})
+		r.Handle("health", func(_ context.Context, req *Request) error { req.Buf.AppendString("true"); return nil })
+		r.ServeHTTP(delayedLogResponseWriter{httptest.NewRecorder()}, httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(`{"$api":"health"}`)))
+		if !strings.Contains(out.String(), "server=30.0ms") {
+			t.Fatalf("write time missing: %q", out.String())
+		}
+	})
+}
+
+func TestHTTPAsyncLogDoesNotWaitForWriter(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		out := &blockedLogWriter{entered: make(chan struct{}), release: make(chan struct{})}
+		r := NewRouterWithOptions(RouterOptions{RequestLogging: true, RequestLogSampleEvery: 1, LogWriter: out})
+		r.Handle("health", func(_ context.Context, req *Request) error {
+			req.Buf.AppendString("true")
+			return nil
+		})
+		response := httptest.NewRecorder()
+		r.ServeHTTP(delayedLogResponseWriter{response}, httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(`{"$api":"health"}`)))
+		<-out.entered
+		// The response completed although output is blocked. Output delay must
+		// not rewrite the already captured server-side duration.
+		time.Sleep(time.Second)
+		close(out.release)
+		if err := r.CloseRequestLogs(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if response.Code != http.StatusOK || !strings.Contains(out.buf.String(), "server=30.0ms") {
+			t.Fatalf("response=%d logs=%q", response.Code, out.buf.String())
+		}
+		if drops, failures := r.RequestLogStats(); drops != 0 || failures != 0 {
+			t.Fatalf("drops=%d failures=%d", drops, failures)
+		}
+	})
+}
+
 func TestLogRequest_WithError(t *testing.T) {
 	var logs bytes.Buffer
-	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, LogWriter: &logs})
+	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, RequestLogSampleEvery: 1, SynchronousRequestLogs: true, LogWriter: &logs})
 	rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "getUser", Module: "user"})
 
 	rt.logRequest("getUser", 50*time.Millisecond, fmt.Errorf("InvalidCredentials"))
@@ -32,7 +81,7 @@ func TestLogRequest_WithError(t *testing.T) {
 
 func TestLogRequest_SlowDuration(t *testing.T) {
 	var logs bytes.Buffer
-	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, LogWriter: &logs})
+	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, RequestLogSampleEvery: 1, SynchronousRequestLogs: true, LogWriter: &logs})
 	rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "slowAPI", Module: "slow"})
 
 	// >500ms should be red
@@ -46,7 +95,7 @@ func TestLogRequest_SlowDuration(t *testing.T) {
 
 func TestLogRequest_MediumDuration(t *testing.T) {
 	var logs bytes.Buffer
-	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, LogWriter: &logs})
+	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, RequestLogSampleEvery: 1, SynchronousRequestLogs: true, LogWriter: &logs})
 	rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "medAPI", Module: "med"})
 
 	// >100ms <500ms should be yellow
@@ -77,7 +126,7 @@ func TestServeHTTPLogsParseErrors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var logs bytes.Buffer
-			rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, LogWriter: &logs})
+			rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, RequestLogSampleEvery: 1, SynchronousRequestLogs: true, LogWriter: &logs})
 			r := httptest.NewRequest(http.MethodPost, "/luvia", strings.NewReader(tt.body))
 			if tt.binary {
 				r.Header.Set("X-Luxo-Mode", "binary")
@@ -96,7 +145,7 @@ func TestServeHTTPLogsParseErrors(t *testing.T) {
 
 func TestLogRequest_NoModule(t *testing.T) {
 	var logs bytes.Buffer
-	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, LogWriter: &logs})
+	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, RequestLogSampleEvery: 1, SynchronousRequestLogs: true, LogWriter: &logs})
 	// API not in schema — should fall back to "api" module
 
 	rt.logRequest("unknownAPI", 5*time.Millisecond, nil)
@@ -109,18 +158,7 @@ func TestLogRequest_NoModule(t *testing.T) {
 
 func TestModuleColor_DifferentModules(t *testing.T) {
 	// Reset state for test isolation
-	moduleColorMu.Lock()
-	oldMap := moduleColorMap
-	oldIdx := moduleColorIdx
-	moduleColorMap = make(map[string]string)
-	moduleColorIdx = 0
-	moduleColorMu.Unlock()
-	defer func() {
-		moduleColorMu.Lock()
-		moduleColorMap = oldMap
-		moduleColorIdx = oldIdx
-		moduleColorMu.Unlock()
-	}()
+	resetModuleColors(t)
 
 	c1 := moduleColor("auth")
 	c2 := moduleColor("user")
@@ -134,18 +172,7 @@ func TestModuleColor_DifferentModules(t *testing.T) {
 
 func TestModuleColor_Idempotent(t *testing.T) {
 	// Same module should always return same color
-	moduleColorMu.Lock()
-	oldMap := moduleColorMap
-	oldIdx := moduleColorIdx
-	moduleColorMap = make(map[string]string)
-	moduleColorIdx = 0
-	moduleColorMu.Unlock()
-	defer func() {
-		moduleColorMu.Lock()
-		moduleColorMap = oldMap
-		moduleColorIdx = oldIdx
-		moduleColorMu.Unlock()
-	}()
+	resetModuleColors(t)
 
 	c1 := moduleColor("auth")
 	c2 := moduleColor("auth")
@@ -154,4 +181,102 @@ func TestModuleColor_Idempotent(t *testing.T) {
 	if c1 != c2 || c2 != c3 {
 		t.Errorf("same module should return same color: %q %q %q", c1, c2, c3)
 	}
+}
+
+func TestModuleColorConcurrentStable(t *testing.T) {
+	resetModuleColors(t)
+	const workers = 32
+	var wg sync.WaitGroup
+	colors := make([]string, workers)
+	for i := range colors {
+		wg.Go(func() { colors[i] = moduleColor("concurrent-module") })
+	}
+	wg.Wait()
+	for _, color := range colors {
+		if color != colors[0] || color == "" {
+			t.Fatalf("unstable module color: %q", colors)
+		}
+	}
+}
+
+func BenchmarkModuleColorWarm(b *testing.B) {
+	moduleColor("benchmark-module")
+	b.ReportAllocs()
+	for b.Loop() {
+		moduleColor("benchmark-module")
+	}
+}
+
+func BenchmarkModuleColorParallel(b *testing.B) {
+	moduleColor("benchmark-module")
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			moduleColor("benchmark-module")
+		}
+	})
+}
+
+func TestModuleColorSnapshotImmutable(t *testing.T) {
+	resetModuleColors(t)
+	moduleColor("snapshot-before")
+	before := moduleColorMap.Load()
+	count := len(*before)
+	moduleColor("snapshot-after")
+	if len(*before) != count {
+		t.Fatal("published color snapshot mutated")
+	}
+	if _, ok := (*before)["snapshot-after"]; ok {
+		t.Fatal("new module leaked into old snapshot")
+	}
+	if registerModuleColor("snapshot-before") != (*before)["snapshot-before"] {
+		t.Fatal("duplicate registration changed color")
+	}
+}
+
+var moduleColorColdPrevious map[string]string
+
+func BenchmarkModuleColorCold(b *testing.B) {
+	names := []string{"a", "b", "c", "d", "e", "f", "g", "h"}
+	b.Run("previous", func(b *testing.B) {
+		var mu sync.Mutex
+		b.ReportAllocs()
+		for b.Loop() {
+			moduleColorColdPrevious = make(map[string]string)
+			for i, name := range names {
+				mu.Lock()
+				moduleColorColdPrevious[name] = moduleColors[i%len(moduleColors)]
+				mu.Unlock()
+			}
+		}
+	})
+	b.Run("snapshot", func(b *testing.B) {
+		old := moduleColorMap.Load()
+		oldIdx := moduleColorIdx
+		defer func() { moduleColorMap.Store(old); moduleColorIdx = oldIdx }()
+		b.ReportAllocs()
+		for b.Loop() {
+			moduleColorMap.Store(nil)
+			moduleColorIdx = 0
+			for _, name := range names {
+				moduleColor(name)
+			}
+		}
+	})
+}
+
+func resetModuleColors(t *testing.T) {
+	t.Helper()
+	moduleColorMu.Lock()
+	oldMap := moduleColorMap.Load()
+	oldIdx := moduleColorIdx
+	moduleColorMap.Store(nil)
+	moduleColorIdx = 0
+	moduleColorMu.Unlock()
+	t.Cleanup(func() {
+		moduleColorMu.Lock()
+		moduleColorMap.Store(oldMap)
+		moduleColorIdx = oldIdx
+		moduleColorMu.Unlock()
+	})
 }
