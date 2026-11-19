@@ -137,6 +137,19 @@ func TestLockFileMaintenanceCoversExistingReservedIDs(t *testing.T) {
 	}
 }
 
+func TestUpdateFieldMetadataReusesCollectedFieldTypes(t *testing.T) {
+	locked := map[string]*ModelLock{"Item": {Fields: map[string]int{"id": 1}}}
+	current := map[string]map[string]string{"Item": {"id": "Int", "retired": "String"}}
+	allocations := testing.AllocsPerRun(20, func() { updateFieldMetadata(locked, current) })
+	if allocations != 0 {
+		t.Fatalf("updating an existing declaration allocated %.0f objects per call", allocations)
+	}
+	got := locked["Item"].FieldTypes
+	if len(got) != 1 || got["id"] != "Int" {
+		t.Fatalf("field metadata = %v", got)
+	}
+}
+
 func TestUpdateContractMetadataToleratesMissingRegisteredAPI(t *testing.T) {
 	lf := New()
 	lf.updateContractMetadata([]*ast.File{{APIs: []*ast.ApiDecl{{

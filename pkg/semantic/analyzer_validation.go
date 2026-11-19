@@ -457,14 +457,14 @@ func (a *Analyzer) addFieldError(pos token.Position, objType *ResolvedType, fiel
 }
 
 func (a *Analyzer) findClosest(name string) string {
-	var candidates []string
+	match := closestSpelling{target: name, distance: 3}
 	for typeName := range a.types {
-		candidates = append(candidates, typeName)
+		match.consider(typeName)
 	}
-	for _, sym := range a.scope.AllSymbols() {
-		candidates = append(candidates, sym.Name)
+	for _, sym := range a.scope.symbols {
+		match.consider(sym.Name)
 	}
-	return findClosestString(name, candidates)
+	return match.name
 }
 
 func fieldNames(t *ResolvedType) []string {
@@ -476,21 +476,29 @@ func fieldNames(t *ResolvedType) []string {
 }
 
 func findClosestString(target string, candidates []string) string {
-	best := ""
-	bestDist := 3 // max edit distance to suggest
-	for _, c := range candidates {
-		// Length difference is a lower bound; ties cannot replace the first match.
-		lengthDelta := len(c) - len(target)
-		if lengthDelta >= bestDist || lengthDelta <= -bestDist {
-			continue
-		}
-		d := editDistance(target, c)
-		if d < bestDist {
-			bestDist = d
-			best = c
-		}
+	match := closestSpelling{target: target, distance: 3}
+	for _, candidate := range candidates {
+		match.consider(candidate)
 	}
-	return best
+	return match.name
+}
+
+type closestSpelling struct {
+	target   string
+	name     string
+	distance int
+}
+
+func (match *closestSpelling) consider(candidate string) {
+	// Length difference is a lower bound; ties cannot replace the first match.
+	lengthDelta := len(candidate) - len(match.target)
+	if lengthDelta >= match.distance || lengthDelta <= -match.distance {
+		return
+	}
+	if distance := editDistance(match.target, candidate); distance < match.distance {
+		match.distance = distance
+		match.name = candidate
+	}
 }
 
 // hasSearchDirective checks if the expression's underlying field has @search directive.

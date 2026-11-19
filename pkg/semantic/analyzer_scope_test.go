@@ -307,6 +307,37 @@ func TestEditDistanceEmptyStrings(t *testing.T) {
 	}
 }
 
+func TestAnalyzerRegistersBuiltinsWithoutAllocatingEachSymbol(t *testing.T) {
+	catalogAllocations := testing.AllocsPerRun(20, func() { BuiltinTypes() })
+	analyzerAllocations := testing.AllocsPerRun(20, func() { New() })
+	if extra := analyzerAllocations - catalogAllocations; extra >= float64(len(BuiltinTypes())) {
+		t.Fatalf("initializing the analyzer around the builtin catalog allocated %.0f objects", extra)
+	}
+	first, second := New(), New()
+	for name, typ := range first.types {
+		symbol := first.scope.LookupLocal(name)
+		if symbol == nil || symbol.Kind != SymType || symbol.Type != typ || second.scope.LookupLocal(name) == symbol {
+			t.Fatalf("builtin %q was missing or shared a scope symbol", name)
+		}
+	}
+}
+
+func TestFindClosestUsesExistingNamesWithoutAllocating(t *testing.T) {
+	analyzer := New()
+	analyzer.scope.Define(&Symbol{Name: "retentionLimit", Kind: SymVariable})
+	allocations := testing.AllocsPerRun(20, func() {
+		if got := analyzer.findClosest("retentoinLimit"); got != "retentionLimit" {
+			t.Fatalf("closest scope name = %q", got)
+		}
+		if got := analyzer.findClosest("Bolean"); got != "Boolean" {
+			t.Fatalf("closest type name = %q", got)
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("suggesting existing names allocated %.0f objects", allocations)
+	}
+}
+
 func TestFindClosestStringMatchesDistanceReference(t *testing.T) {
 	names := []string{"", "a", "b", "ab", "aa", "abc", "abcd", "abcde", "abcdef",
 		"User", "Usar", "Usor", "é", "É", "用户", "用戶", strings.Repeat("x", 128)}

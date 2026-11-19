@@ -192,22 +192,24 @@ func verifyPurpose(cfg *Config, token, purpose string) (Claims, int64, error) {
 	if cfg == nil || strings.TrimSpace(cfg.Secret) == "" {
 		return Claims{}, 0, fmt.Errorf("JWT secret is required")
 	}
-	parts := strings.SplitN(token, ".", 3)
-	if len(parts) != 3 {
+	header, rest, _ := strings.Cut(token, ".")
+	encodedPayload, signature, ok := strings.Cut(rest, ".")
+	if !ok {
 		return Claims{}, 0, fmt.Errorf("invalid token format")
 	}
 
 	// Verify signature
-	expectedSig := hmacSign(parts[0]+"."+parts[1], cfg.Secret)
-	if !hmac.Equal([]byte(parts[2]), []byte(expectedSig)) {
+	signed := token[:len(header)+1+len(encodedPayload)]
+	expectedSig := hmacSign(signed, cfg.Secret)
+	if !hmac.Equal([]byte(signature), []byte(expectedSig)) {
 		return Claims{}, 0, fmt.Errorf("invalid signature")
 	}
-	if err := validateJWTHeader(parts[0]); err != nil {
+	if err := validateJWTHeader(header); err != nil {
 		return Claims{}, 0, err
 	}
 
 	// Decode payload
-	payload, err := base64Decode(parts[1])
+	payload, err := base64Decode(encodedPayload)
 	if err != nil {
 		return Claims{}, 0, fmt.Errorf("decode payload: %w", err)
 	}

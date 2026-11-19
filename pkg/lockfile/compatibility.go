@@ -231,12 +231,16 @@ func (lf *LockFile) updateContractMetadata(files []*ast.File) {
 func updateFieldMetadata(locked map[string]*ModelLock, current map[string]map[string]string) {
 	for name, entity := range locked {
 		fields := current[name]
-		entity.FieldTypes = make(map[string]string, len(fields))
-		for field, typeName := range fields {
-			if _, active := entity.Fields[field]; active {
-				entity.FieldTypes[field] = typeName
+		if fields == nil {
+			fields = make(map[string]string)
+		}
+		for field := range fields {
+			if _, active := entity.Fields[field]; !active {
+				delete(fields, field)
 			}
 		}
+		// The collected contract is local to this update and owns its field maps.
+		entity.FieldTypes = fields
 	}
 }
 

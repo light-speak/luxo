@@ -19,11 +19,10 @@ func normalizedGoNameIsExported(name string) bool {
 }
 
 func formatGeneratedWithIdentifiers(source []byte, exportUnicode bool) ([]byte, error) {
-	formatted, err := formatGeneratedChecked(source)
-	if err != nil || !exportUnicode {
-		return formatted, err
+	if !exportUnicode {
+		return formatGeneratedChecked(source)
 	}
-	files := map[string][]byte{"symbols.gen.go": formatted}
+	files := map[string][]byte{"symbols.gen.go": source}
 	if err := prepareGeneratedSymbols(files, true); err != nil {
 		return nil, err
 	}
@@ -46,17 +45,13 @@ func unicodeGoIdentifier(name string) string {
 	return goUnicodeIdentifierPrefix + hex.EncodeToString([]byte(name))
 }
 
-func exportGeneratedUnicodeIdentifiers(file *goast.File) bool {
-	changed := false
+func exportGeneratedUnicodeIdentifiers(file *goast.File) {
 	goast.Inspect(file, func(node goast.Node) bool {
 		if identifier, ok := node.(*goast.Ident); ok {
-			if name := unicodeGoIdentifier(identifier.Name); name != identifier.Name {
-				identifier.Name, changed = name, true
-			}
+			identifier.Name = unicodeGoIdentifier(identifier.Name)
 		}
 		return true
 	})
-	return changed
 }
 
 func needsUnicodeGoName(name string) bool {

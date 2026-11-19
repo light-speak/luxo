@@ -13,32 +13,46 @@ func (p *Parser) parseLambdaExpr() *ast.LambdaExpr {
 	pos := p.current().Pos
 	p.expect(token.LBrace)
 	params := p.tryParseLambdaParams()
-	block := &ast.Block{Pos: pos}
-	for !p.check(token.RBrace) && !p.isEOF() {
-		stmt := p.parseStmt()
-		if stmt != nil {
-			block.Stmts = append(block.Stmts, stmt)
-		}
-	}
-	block.EndPos = p.current().Pos
-	p.expect(token.RBrace)
-	return &ast.LambdaExpr{Pos: pos, Params: params, Body: block}
+	return &ast.LambdaExpr{Pos: pos, Params: params, Body: p.parseBlockBody(pos)}
 }
 
 func (p *Parser) parseBlock() *ast.Block {
 	pos := p.current().Pos
 	p.expect(token.LBrace)
-	block := &ast.Block{Pos: pos}
+	return p.parseBlockBody(pos)
+}
 
+func (p *Parser) parseBlockBody(pos token.Position) *ast.Block {
+	statements := p.parseBlockStatements()
+	end := p.current().Pos
+	p.expect(token.RBrace)
+	return &ast.Block{Pos: pos, EndPos: end, Stmts: statements}
+}
+
+func (p *Parser) parseBlockStatements() []ast.Stmt {
+	var local [8]ast.Stmt
+	count := 0
+	var overflow []ast.Stmt
 	for !p.check(token.RBrace) && !p.isEOF() {
 		stmt := p.parseStmt()
-		if stmt != nil {
-			block.Stmts = append(block.Stmts, stmt)
+		if stmt == nil {
+			continue
 		}
+		if count < len(local) {
+			local[count] = stmt
+			count++
+			continue
+		}
+		if overflow == nil {
+			overflow = make([]ast.Stmt, count, 2*count)
+			copy(overflow, local[:])
+		}
+		overflow = append(overflow, stmt)
 	}
-	block.EndPos = p.current().Pos
-	p.expect(token.RBrace)
-	return block
+	if overflow != nil {
+		return overflow
+	}
+	return append([]ast.Stmt(nil), local[:count]...)
 }
 
 // ========== Statements ==========

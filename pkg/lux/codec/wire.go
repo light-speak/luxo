@@ -218,10 +218,45 @@ func ReadString(buf []byte, off int) (string, int) {
 
 func readStringBytes(buf []byte, off int) ([]byte, int) {
 	b, n := ReadBytes(buf, off)
-	if n == 0 || !utf8.Valid(b) {
+	if n == 0 || !validWireText(b) {
 		return nil, 0
 	}
 	return b, n
+}
+
+// Overlapping loads cover short ASCII strings without a loop or any overread.
+// Non-ASCII input and larger strings use the standard UTF-8 validator.
+func validWireText(text []byte) bool {
+	length := len(text)
+	switch {
+	case length > 32:
+		return utf8.Valid(text)
+	case length >= 8:
+		first := binary.LittleEndian.Uint64(text)
+		last := binary.LittleEndian.Uint64(text[length-8:])
+		if length > 16 {
+			first |= binary.LittleEndian.Uint64(text[8:])
+		}
+		if length > 24 {
+			first |= binary.LittleEndian.Uint64(text[16:])
+		}
+		if (first|last)&0x8080808080808080 == 0 {
+			return true
+		}
+	case length >= 4:
+		first := binary.LittleEndian.Uint32(text)
+		last := binary.LittleEndian.Uint32(text[length-4:])
+		if (first|last)&0x80808080 == 0 {
+			return true
+		}
+	case length == 0:
+		return true
+	default:
+		if (text[0] | text[length/2] | text[length-1]) < utf8.RuneSelf {
+			return true
+		}
+	}
+	return utf8.Valid(text)
 }
 
 // --- Boolean ---

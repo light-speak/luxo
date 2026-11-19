@@ -101,23 +101,23 @@ func New() *Analyzer {
 }
 
 func newAnalyzer() *Analyzer {
-	a := &Analyzer{
-		scope:              NewScope(),
-		types:              make(map[string]*ResolvedType),
+	types := BuiltinTypes()
+	scope := &Scope{symbols: make(map[string]*Symbol, len(types))}
+	// The symbol records have the same lifetime as this analyzer's builtin types.
+	symbols := make([]Symbol, len(types))
+	index := 0
+	for name, typ := range types {
+		symbols[index] = Symbol{Name: name, Kind: SymType, Type: typ}
+		scope.symbols[name] = &symbols[index]
+		index++
+	}
+	return &Analyzer{
+		scope:              scope,
+		types:              types,
 		typeOwners:         newTypeOwnership(),
 		extendVisible:      make(map[string]map[string]bool),
 		extendFieldVisible: make(map[string]map[string]map[string]bool),
 	}
-	// register built-in types
-	for name, typ := range BuiltinTypes() {
-		a.types[name] = typ
-		a.scope.Define(&Symbol{
-			Name: name,
-			Kind: SymType,
-			Type: typ,
-		})
-	}
-	return a
 }
 
 // Analyze creates an isolated semantic context for one compilation.

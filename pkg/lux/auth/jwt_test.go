@@ -80,6 +80,22 @@ func TestVerifyBadFormat(t *testing.T) {
 	}
 }
 
+func TestVerifyDoesNotAllocateTokenParts(t *testing.T) {
+	cfg := cacheTestConfig()
+	token, err := Sign(cfg, testClaims(42, "ADMIN"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocations := testing.AllocsPerRun(20, func() {
+		if _, err := Verify(cfg, token); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocations >= 32 {
+		t.Fatalf("Verify with the fixed two-claim token allocated %.0f objects per call", allocations)
+	}
+}
+
 func TestVerifyBadPayload(t *testing.T) {
 	cfg := testConfig()
 	// Valid header + bad payload + valid sig format

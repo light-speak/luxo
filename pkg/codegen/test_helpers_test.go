@@ -38,7 +38,18 @@ func generateSourceFragments(result *semantic.Result, packageName string, driver
 	if len(softModels) > 0 {
 		soft = softModels[0]
 	}
-	return generator.generateSources(result, packageName, generator.allEnums(collectEnums(result)), soft)
+	generated, err := generator.generateSources(result, packageName, generator.allEnums(collectEnums(result)), soft)
+	if err != nil {
+		return nil, err
+	}
+	for name, source := range generated.Files {
+		formatted, err := formatGeneratedChecked(source)
+		if err != nil {
+			return nil, err
+		}
+		generated.Files[name] = formatted
+	}
+	return generated, nil
 }
 
 func generatorWithModelFieldIDs(ids map[string]map[string]int) *GeneratorContext {

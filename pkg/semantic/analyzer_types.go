@@ -260,6 +260,9 @@ func isPrimaryKeyType(name string) bool {
 }
 
 func (a *Analyzer) validateComputedFields(files []*ast.File) {
+	if !hasComputedFields(files) {
+		return
+	}
 	models := make(map[string]*ast.ModelDecl)
 	modelModules := make(map[string]string)
 	for _, file := range files {
@@ -275,6 +278,19 @@ func (a *Analyzer) validateComputedFields(files []*ast.File) {
 			}
 		}
 	}
+}
+
+func hasComputedFields(files []*ast.File) bool {
+	for _, file := range files {
+		for _, model := range file.Models {
+			for _, field := range model.Fields {
+				if field.Computed != nil {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (a *Analyzer) validateComputedField(model *ast.ModelDecl, field *ast.FieldDecl, models map[string]*ast.ModelDecl, modelModules map[string]string) {

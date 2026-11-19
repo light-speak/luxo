@@ -125,7 +125,7 @@ func (e *Encoder) WriteFieldFloat(fieldID int, v float64) error {
 
 // WriteFieldString writes a string field.
 func (e *Encoder) WriteFieldString(fieldID int, v string) error {
-	if !utf8.ValidString(v) {
+	if !validWireText([]byte(v)) {
 		return ErrInvalidUTF8
 	}
 	e.buf = AppendVarint(e.buf, uint64(fieldID))

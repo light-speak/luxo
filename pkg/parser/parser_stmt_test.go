@@ -5,8 +5,27 @@ import (
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lexer"
 	"github.com/light-speak/luxo/pkg/token"
 )
+
+func TestParseBlockAllocatesOneShortStatementSlice(t *testing.T) {
+	const source = "{\n return 1\n return 2\n return 3\n return 4\n return 5\n}"
+	tokens, lexErrors := lexer.New(source, "block.luxo").Tokenize()
+	if len(lexErrors) != 0 {
+		t.Fatal(lexErrors)
+	}
+	allocations := testing.AllocsPerRun(20, func() {
+		parser := New(tokens)
+		block := parser.parseBlock()
+		if len(block.Stmts) != 5 || len(parser.errors) != 0 {
+			t.Fatalf("failed to parse all statements: %d %v", len(block.Stmts), parser.errors)
+		}
+	})
+	if allocations > 12 {
+		t.Fatalf("five returns, five literals, a block and its slice allocated %.0f objects", allocations)
+	}
+}
 
 func TestParseForStmt(t *testing.T) {
 	input := `api test(): Int {

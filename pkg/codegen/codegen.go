@@ -226,8 +226,8 @@ func validateSemanticResult(result *semantic.Result) error {
 	return nil
 }
 
-// generateSources is internal emission after contract validation. Source-fragment
-// tests may call it without a wire catalog; public entry points never do so.
+// generateSources emits raw sources after contract validation. The public entry
+// point checks and formats the complete output before returning it.
 func (g *GeneratorContext) generateSources(result *semantic.Result, packageName string, enums map[string]bool, softModels map[string]bool) (*GenerateResult, error) {
 	g = g.withModelReferences(result)
 	if err := g.prepareInstanceSaves(result, enums); err != nil {
@@ -309,13 +309,6 @@ func (g *GeneratorContext) generateSources(result *semantic.Result, packageName 
 		gr.Files["debug.gen.go"] = debugSrc
 	}
 
-	for name, src := range gr.Files {
-		formatted, err := formatGeneratedChecked(src)
-		if err != nil {
-			return nil, fmt.Errorf("format %s: %w", name, err)
-		}
-		gr.Files[name] = formatted
-	}
 	return gr, nil
 }
 

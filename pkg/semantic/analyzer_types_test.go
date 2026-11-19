@@ -269,6 +269,19 @@ func TestAnalyzerDeclarationTypeValidationEdgeCases(t *testing.T) {
 	}
 }
 
+func TestComputedValidationDoesNotIndexPlainModels(t *testing.T) {
+	file := &ast.File{Name: "plain.luxo"}
+	for model := 'A'; model <= 'Z'; model++ {
+		file.Models = append(file.Models, &ast.ModelDecl{Name: string(model), Fields: []*ast.FieldDecl{{Name: "id"}}})
+	}
+	analyzer := New()
+	files := []*ast.File{file}
+	allocations := testing.AllocsPerRun(20, func() { analyzer.validateComputedFields(files) })
+	if allocations != 0 {
+		t.Fatalf("validating models without computed fields allocated %.0f objects", allocations)
+	}
+}
+
 func TestAnalyzerComputedTypeValidationEdgeCases(t *testing.T) {
 	analyzer := newAnalyzer()
 	computed := func(name string, body *ast.Block, directives ...*ast.Directive) *ast.FieldDecl {

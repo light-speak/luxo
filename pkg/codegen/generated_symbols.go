@@ -6,9 +6,11 @@ import (
 	goast "go/ast"
 	"go/format"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"maps"
 	"slices"
+	"strings"
 )
 
 type generatedSymbolKey struct{ owner, name string }
@@ -29,34 +31,70 @@ func validateGeneratedSymbols(files map[string][]byte) error {
 	return prepareGeneratedSymbols(files, false)
 }
 
+// Format and check the same parse tree to avoid parsing generated bodies twice.
 // Go 1.27.1 preserves parsed-template grammar across identifier-only renames.
 // Comment/semicolon gating and list comma rules keep the renamed output parseable.
 // Retain formatting errors for inputs outside that normal producer contract.
 func prepareGeneratedSymbols(files map[string][]byte, exportUnicode bool) error {
 	symbols := generatedSymbols{positions: token.NewFileSet(), names: make(map[generatedSymbolKey]generatedSymbol)}
-	mode := parser.SkipObjectResolution
-	if exportUnicode {
-		mode |= parser.ParseComments
-	}
-	for _, name := range slices.Sorted(maps.Keys(files)) {
+	const mode = parser.SkipObjectResolution | parser.ParseComments
+	names := slices.Sorted(maps.Keys(files))
+	formattedSources := make([][]byte, len(names))
+	for index, name := range names {
 		file, err := parser.ParseFile(symbols.positions, name, files[name], mode)
 		if err != nil {
-			return fmt.Errorf("inspect generated Go symbols in %s: %w", name, err)
+			return fmt.Errorf("format %s: %w", name, err)
 		}
-		if exportUnicode && exportGeneratedUnicodeIdentifiers(file) {
-			var output bytes.Buffer
-			if err := format.Node(&output, symbols.positions, file); err != nil {
-				return fmt.Errorf("format generated Go identifiers in %s: %w", name, err)
-			}
-			files[name] = output.Bytes()
+		if exportUnicode {
+			exportGeneratedUnicodeIdentifiers(file)
 		}
 		for _, declaration := range file.Decls {
 			if err := symbols.addDeclaration(declaration); err != nil {
 				return err
 			}
 		}
+		formatted, err := formatParsedGeneratedFile(symbols.positions, file)
+		if err != nil {
+			return fmt.Errorf("format %s: %w", name, err)
+		}
+		formattedSources[index] = formatted
+	}
+	for index, name := range names {
+		files[name] = formattedSources[index]
 	}
 	return nil
+}
+
+func formatParsedGeneratedFile(positions *token.FileSet, file *goast.File) ([]byte, error) {
+	var output bytes.Buffer
+	var err error
+	goast.SortImports(positions, file)
+	if hasNoncanonicalNumberSpelling(file) {
+		// Use gofmt's literal normalization for Go spellings the printer preserves.
+		err = format.Node(&output, positions, file)
+	} else {
+		// format.Node makes a copy of files with grouped imports through reprinting
+		// and reparsing. This tree is owned by codegen and its imports are sorted.
+		printerConfig := printer.Config{Mode: printer.UseSpaces | printer.TabIndent, Tabwidth: 8}
+		err = printerConfig.Fprint(&output, positions, file)
+	}
+	return output.Bytes(), err
+}
+
+func hasNoncanonicalNumberSpelling(file *goast.File) bool {
+	for node := range goast.Preorder(file) {
+		if literal, ok := node.(*goast.BasicLit); ok {
+			switch literal.Kind {
+			case token.IMAG:
+				return true
+			case token.INT, token.FLOAT:
+				if strings.ContainsAny(literal.Value, "XOBEP") {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (symbols *generatedSymbols) addDeclaration(declaration goast.Decl) error {
