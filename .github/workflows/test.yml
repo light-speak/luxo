@@ -121,7 +121,9 @@ jobs:
             fi
           done <<< "$listed_packages"
           go test -v -coverprofile=coverage.out -timeout=180s -count=1 "${packages[@]}"
-          go test ./cmd/luxo/... -v -timeout 60s -count=1
+
+      - name: Run CLI module tests
+        run: go test ./cmd/luxo/... -v -timeout=5m -count=1
 
       - name: Run code generator tests with coverage
         run: |

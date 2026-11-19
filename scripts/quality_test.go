@@ -154,17 +154,22 @@ func readQualityWorkflow(t *testing.T) qualityWorkflow {
 }
 
 func TestCodegenCoverageUsesSeparateTimeoutAndKeepsTheCombinedProfile(t *testing.T) {
-	var coverage, generator string
+	var coverage, cli, generator string
 	for _, step := range readQualityWorkflow(t).Jobs["test"].Steps {
 		switch step.Name {
 		case "Run tests with coverage":
 			coverage = step.Run
+		case "Run CLI module tests":
+			if step.If != "" || step.ContinueOnError {
+				t.Fatal("CLI tests must run and block CI on failure")
+			}
+			cli = step.Run
 		case "Run code generator tests with coverage":
 			generator = step.Run
 		}
 	}
-	if coverage == "" || generator == "" {
-		t.Fatal("missing separate coverage steps")
+	if coverage == "" || cli == "" || generator == "" {
+		t.Fatal("missing separate core, CLI, or generator test steps")
 	}
 	fixture := newQualityFixture(t)
 	fixture.write(t, "bin/tail", "#!/bin/sh\nexec /usr/bin/tail \"$@\"\n")
@@ -175,14 +180,14 @@ case "$*" in
   *-coverprofile=coverage.out*) printf 'mode: set\nparser.go:1.1,2.1 1 1\n' > coverage.out ;;
   *-coverprofile=codegen-coverage.out*) printf 'mode: set\ncodegen.go:1.1,2.1 1 1\n' > codegen-coverage.out ;;
 esac`, false)
-	output, log, err := fixture.run(t, coverage+"\n"+generator)
+	output, log, err := fixture.run(t, coverage+"\n"+cli+"\n"+generator)
 	if err != nil {
 		t.Fatalf("coverage steps failed: %v\n%s", err, output)
 	}
 	for _, want := range []string{
 		"go test -v -coverprofile=coverage.out -timeout=180s -count=1 example/pkg/parser example/cmd/tool example/scripts example/internal/helper\n",
 		"go test ./pkg/codegen -v -coverprofile=codegen-coverage.out -timeout=75m -count=1\n",
-		"go test ./cmd/luxo/... -v -timeout 60s -count=1\n",
+		"go test ./cmd/luxo/... -v -timeout=5m -count=1\n",
 	} {
 		if !strings.Contains(log, want) {
 			t.Errorf("missing %q in:\n%s", want, log)
@@ -491,6 +496,9 @@ func TestQualityGatesCheckEveryGoDirectory(t *testing.T) {
 				t.Errorf("lint must run gate regression tests:\n%s", log)
 			}
 			if entry.name == "lint" {
+				if !strings.Contains(log, "go test ./cmd/luxo/... -timeout=5m\n") {
+					t.Errorf("lint must allow five minutes for the CLI test suite:\n%s", log)
+				}
 				for _, module := range []string{"cmd/luxo", "pkg/lux/pg", "pkg/lux/nats", "pkg/lux/cache/redis", "pkg/lux/storage/s3"} {
 					if !strings.Contains(log, "go test ./"+module+"/...") {
 						t.Errorf("lint skipped nested module %s:\n%s", module, log)

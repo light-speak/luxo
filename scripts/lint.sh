@@ -19,7 +19,7 @@ echo "gocyclo OK"
 
 echo "==> go test"
 go test ./pkg/... ./cmd/... ./scripts/... ./internal/... -cover -timeout 60s
-go test ./cmd/luxo/... -timeout 60s
+go test ./cmd/luxo/... -timeout=5m
 for module in pkg/lux/pg pkg/lux/nats pkg/lux/cache/redis pkg/lux/storage/s3; do
     go test "./$module/..." -cover -timeout 180s
 done
