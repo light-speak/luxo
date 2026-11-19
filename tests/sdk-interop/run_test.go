@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -204,6 +206,39 @@ func TestFixtureRunnerClosesServerAfterConsumerFailure(t *testing.T) {
 	if response, err := client.Get(endpoint); err == nil {
 		response.Body.Close()
 		t.Fatal("fixture server survived consumer failure")
+	}
+}
+
+func TestFixtureRunnerClosesConnectionsAwaitingHeaders(t *testing.T) {
+	t.Chdir("../..")
+	for _, topology := range []string{"direct", "gateway"} {
+		t.Run(topology, func(t *testing.T) {
+			var connection net.Conn
+			err := withFixtureMode(topology == "gateway", func(endpoint, _ string) error {
+				address, err := url.Parse(endpoint)
+				if err != nil {
+					return err
+				}
+				connection, err = net.DialTimeout("tcp", address.Host, time.Second)
+				if err != nil {
+					return err
+				}
+				t.Cleanup(func() { _ = connection.Close() })
+				// Serve a later connection so the waiting socket has already been accepted.
+				_, err = readFixtureSchema(endpoint)
+				return err
+			})
+			if err != nil {
+				t.Fatalf("fixture shutdown with a connection awaiting headers: %v", err)
+			}
+			if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			var data [1]byte
+			if _, err := connection.Read(data[:]); !errors.Is(err, io.EOF) {
+				t.Fatalf("pending connection should be closed: %v", err)
+			}
+		})
 	}
 }
 

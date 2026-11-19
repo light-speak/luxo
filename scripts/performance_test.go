@@ -23,8 +23,8 @@ func performanceStep(t *testing.T, job, name string) string {
 func TestPerformanceCIKeepsSamplingAndEvidenceGates(t *testing.T) {
 	workflow := readQualityWorkflow(t)
 	job := workflow.Jobs["performance-samples"]
-	if job.TimeoutMinutes != 30 || job.Strategy.FailFast == nil || *job.Strategy.FailFast {
-		t.Fatal("every batch must finish independently within the existing timeout")
+	if job.TimeoutMinutes != 60 || job.Strategy.FailFast == nil || *job.Strategy.FailFast {
+		t.Fatal("every batch must have a bounded budget for primary and confirmation samples")
 	}
 	if job.Needs.Value != "performance-scope" || job.If != "needs.performance-scope.outputs.run == 'true'" {
 		t.Fatal("sampling must require the successful scope and plan job")
