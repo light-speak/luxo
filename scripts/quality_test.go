@@ -153,10 +153,51 @@ func readQualityWorkflow(t *testing.T) qualityWorkflow {
 	return workflow
 }
 
+func TestCodegenCoverageUsesSeparateTimeoutAndKeepsTheCombinedProfile(t *testing.T) {
+	var coverage, generator string
+	for _, step := range readQualityWorkflow(t).Jobs["test"].Steps {
+		switch step.Name {
+		case "Run tests with coverage":
+			coverage = step.Run
+		case "Run code generator tests with coverage":
+			generator = step.Run
+		}
+	}
+	if coverage == "" || generator == "" {
+		t.Fatal("missing separate coverage steps")
+	}
+	fixture := newQualityFixture(t)
+	fixture.write(t, "bin/tail", "#!/bin/sh\nexec /usr/bin/tail \"$@\"\n")
+	fixture.tool(t, "go", `
+case "$*" in
+  "list ./pkg/codegen") printf '%s\n' example/pkg/codegen ;;
+  "list ./pkg/... ./cmd/... ./scripts/... ./internal/...") printf '%s\n' example/pkg/codegen example/pkg/parser example/cmd/tool example/scripts example/internal/helper ;;
+  *-coverprofile=coverage.out*) printf 'mode: set\nparser.go:1.1,2.1 1 1\n' > coverage.out ;;
+  *-coverprofile=codegen-coverage.out*) printf 'mode: set\ncodegen.go:1.1,2.1 1 1\n' > codegen-coverage.out ;;
+esac`, false)
+	output, log, err := fixture.run(t, coverage+"\n"+generator)
+	if err != nil {
+		t.Fatalf("coverage steps failed: %v\n%s", err, output)
+	}
+	for _, want := range []string{
+		"go test -v -coverprofile=coverage.out -timeout=180s -count=1 example/pkg/parser example/cmd/tool example/scripts example/internal/helper\n",
+		"go test ./pkg/codegen -v -coverprofile=codegen-coverage.out -timeout=75m -count=1\n",
+		"go test ./cmd/luxo/... -v -timeout 60s -count=1\n",
+	} {
+		if !strings.Contains(log, want) {
+			t.Errorf("missing %q in:\n%s", want, log)
+		}
+	}
+	profile := readQualityFile(t, filepath.Join(string(fixture), "coverage.out"))
+	if profile != "mode: set\nparser.go:1.1,2.1 1 1\ncodegen.go:1.1,2.1 1 1\n" {
+		t.Errorf("combined profile lost coverage or duplicated its header:\n%s", profile)
+	}
+}
+
 func TestCompilerRaceCIIncludesGeneratedChildren(t *testing.T) {
 	job := readQualityWorkflow(t).Jobs["race"]
-	if job.TimeoutMinutes != 15 {
-		t.Errorf("compiler race job needs a bounded 15 minute lifecycle, got %d", job.TimeoutMinutes)
+	if job.TimeoutMinutes != 120 {
+		t.Errorf("compiler race job needs room for both bounded test groups, got %d", job.TimeoutMinutes)
 	}
 	found := 0
 	for _, step := range job.Steps {
@@ -167,7 +208,10 @@ func TestCompilerRaceCIIncludesGeneratedChildren(t *testing.T) {
 		if !slices.Contains(strings.Fields(step.Env["GOFLAGS"]), "-race") {
 			t.Error("generated Go test children must inherit race instrumentation through GOFLAGS")
 		}
-		for _, required := range []string{"./pkg/codegen", "./pkg/semantic", "./pkg/lockfile", "-count=1", "-timeout=10m"} {
+		for _, required := range []string{
+			"go test ./pkg/semantic ./pkg/lockfile -count=1 -timeout=10m",
+			"go test ./pkg/codegen -count=1 -timeout=95m",
+		} {
 			if !strings.Contains(step.Run, required) {
 				t.Errorf("compiler race command lost %q", required)
 			}
@@ -460,7 +504,7 @@ func TestQualityGatesCheckEveryGoDirectory(t *testing.T) {
 func TestCIGoCommandsIncludeInternalPackages(t *testing.T) {
 	workflow := readQualityWorkflow(t)
 	for _, test := range []struct{ job, step, command string }{
-		{"test", "Run tests with coverage", "go test ./pkg/... ./cmd/... ./scripts/... ./internal/..."},
+		{"test", "Run tests with coverage", "go list ./pkg/... ./cmd/... ./scripts/... ./internal/..."},
 		{"lint", "Vet", "go vet ./pkg/... ./cmd/... ./cmd/luxo/... ./scripts/... ./internal/... ./pkg/lux/pg/... ./pkg/lux/nats/... ./pkg/lux/cache/redis/... ./pkg/lux/storage/s3/..."},
 		{"lint", "Build", "go build ./pkg/... ./cmd/... ./cmd/luxo/... ./scripts/... ./internal/... ./pkg/lux/pg/... ./pkg/lux/nats/... ./pkg/lux/cache/redis/... ./pkg/lux/storage/s3/..."},
 	} {

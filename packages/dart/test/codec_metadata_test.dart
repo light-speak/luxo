@@ -50,12 +50,8 @@ Uint8List _batch(BigInt count, [List<int> payload = const [], int arena = 0]) =>
 
 void main() {
   test('array headers validate the count before writing', () {
-    for (final count in [
-      -1,
-      -9223372036854775807,
-      1000001,
-      9223372036854775807,
-    ]) {
+    final largeCount = int.parse('9223372036854775807');
+    for (final count in [-1, -largeCount, 1000001, largeCount]) {
       final encoder = LuxoEncoder()..writeBool(true);
       expect(() => encoder.writeArrayHeader(count), throwsRangeError);
       expect(encoder.bytes(), [1]);

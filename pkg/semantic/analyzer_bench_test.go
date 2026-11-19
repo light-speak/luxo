@@ -851,7 +851,7 @@ func BenchmarkAnalyzeLoadPrimaryKeys(b *testing.B) {
 				if kind == "ordinary_call" {
 					fmt.Fprintf(&source, "api lookup%d(key: String): String { return echo(key) }\n", i)
 				} else {
-					fmt.Fprintf(&source, "api lookup%d(key: String): Product { return Product.load(key) }\n", i)
+					fmt.Fprintf(&source, "api lookup%d(key: String): Product? { return Product.load(key) }\n", i)
 				}
 			}
 			tokens, lexErrors := lexer.New(source.String(), "load.luxo").Tokenize()

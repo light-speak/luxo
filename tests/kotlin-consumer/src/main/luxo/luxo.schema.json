@@ -147,7 +147,7 @@
     "watchProbeRole": {"id":145,"name":"watchProbeRole","module":"test","returnType":"Role","returnList":false,"stream":true},
     "probeRoleList": {"id":146,"name":"probeRoleList","module":"test","returnType":"Role","returnList":true,"stream":false},
     "watchProbeRoleList": {"id":147,"name":"watchProbeRoleList","module":"test","returnType":"Role","returnList":true,"stream":true},
-    "probeImplicit": {"id":148,"name":"probeImplicit","module":"test"},
+    "probeIntBoundary": {"id":148,"name":"probeIntBoundary","module":"test","returnType":"Int"},
     "probeTextRecord": {"id":149,"name":"probeTextRecord","module":"test","returnType":"TextRecord"},
     "probeTextRecords": {"id":150,"name":"probeTextRecords","module":"test","returnType":"TextRecord","returnList":true},
     "watchTextRecord": {"id":151,"name":"watchTextRecord","module":"test","returnType":"TextRecord","stream":true},

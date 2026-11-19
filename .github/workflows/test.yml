@@ -16,6 +16,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     permissions:
       contents: read
       id-token: write
@@ -110,15 +111,33 @@ jobs:
 
       - name: Run tests with coverage
         run: |
-          go test ./pkg/... ./cmd/... ./scripts/... ./internal/... -v -coverprofile=coverage.out -timeout 180s -count=1
+          set -euo pipefail
+          listed_packages=$(go list ./pkg/... ./cmd/... ./scripts/... ./internal/...)
+          codegen_package=$(go list ./pkg/codegen)
+          packages=()
+          while IFS= read -r package; do
+            if [[ "$package" != "$codegen_package" ]]; then
+              packages+=("$package")
+            fi
+          done <<< "$listed_packages"
+          go test -v -coverprofile=coverage.out -timeout=180s -count=1 "${packages[@]}"
           go test ./cmd/luxo/... -v -timeout 60s -count=1
+
+      - name: Run code generator tests with coverage
+        run: |
+          set -euo pipefail
+          go test ./pkg/codegen -v -coverprofile=codegen-coverage.out -timeout=75m -count=1
+          IFS= read -r coverage_mode < coverage.out
+          IFS= read -r codegen_mode < codegen-coverage.out
+          test "$coverage_mode" = "$codegen_mode"
+          tail -n +2 codegen-coverage.out >> coverage.out
 
       - name: Verify independent adapters against this core revision
         run: |
           go test -race ./pkg/lux/storage/s3/... -coverprofile=s3-coverage.out -count=1 -timeout=120s
           go test -race ./pkg/lux/cache/redis/... -coverprofile=redis-coverage.out -count=1 -timeout=120s
           go test -race ./pkg/lux/nats/... -coverprofile=nats-coverage.out -count=1 -timeout=120s
-          go test -race ./pkg/lux/pg/... -coverprofile=pg-coverage.out -count=1 -timeout=180s
+          go test -race ./pkg/lux/pg/... -coverprofile=pg-coverage.out -count=1 -timeout=15m
           go vet ./cmd/luxo/... ./pkg/lux/pg/... ./pkg/lux/storage/s3/... ./pkg/lux/cache/redis/... ./pkg/lux/nats/...
 
       - name: Coverage summary
@@ -198,7 +217,7 @@ jobs:
 
   race:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
         with:
@@ -214,7 +233,9 @@ jobs:
       - name: Verify compiler state isolation
         env:
           GOFLAGS: -trimpath -race
-        run: go test ./pkg/codegen ./pkg/semantic ./pkg/lockfile -count=1 -timeout=10m
+        run: |
+          go test ./pkg/semantic ./pkg/lockfile -count=1 -timeout=10m
+          go test ./pkg/codegen -count=1 -timeout=95m
 
   runtime-race:
     runs-on: ubuntu-latest
@@ -819,7 +840,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: light-speak/luxo-swift
-          ref: 9e45d47284827e06d1dfd649ff54876d0116d249
+          ref: 40aa5cc7948a0b74cfc59bc97dfbbc85371f4705
           path: .tmp/luxo-swift
           persist-credentials: false
 

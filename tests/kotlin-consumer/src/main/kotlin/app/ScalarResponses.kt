@@ -79,9 +79,9 @@ suspend fun verifyScalarResponses() {
     for (test in scalarResponses()) verifyResponse(test)
     val transport = ResponseTransport().apply { response = "feffffffffffffffff01".hexToByteArray() }
     val client = LuxoClient(transport)
-    check(client.probeImplicit() == Long.MAX_VALUE)
+    check(client.probeIntBoundary() == Long.MAX_VALUE)
     transport.response = (transport.response as ByteArray) + byteArrayOf(0)
-    check(runCatching { client.probeImplicit() }.isFailure)
+    check(runCatching { client.probeIntBoundary() }.isFailure)
     verifyTextRecords()
     println("Generated Kotlin responses: 12 scalar kinds, single/list, call/stream, JSON/Binary, truncation and trailing bytes passed")
 }

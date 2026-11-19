@@ -74,7 +74,12 @@ it('compiles and loads documented React examples against the generated client', 
     ] } },
     apis: {
       getUser: { id: 1, name: 'getUser', module: 'fixture', returnType: 'User', params: [{ id: 1, name: 'id', type: 'Int' }] },
-      listUsers: { id: 2, name: 'listUsers', module: 'fixture', returnType: 'User', returnList: true, paginated: true },
+      listUsers: {
+        id: 2, name: 'listUsers', module: 'fixture', returnType: 'User', returnList: true, paginated: true, params: [
+          { id: 1, name: 'page', type: 'Int', hasDefault: true },
+          { id: 2, name: 'pageSize', type: 'Int', hasDefault: true },
+        ],
+      },
     },
   }
   await generateTypes(schema, join(directory, 'luxo'))
