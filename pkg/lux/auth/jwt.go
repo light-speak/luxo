@@ -22,6 +22,7 @@ import (
 type ClaimsWriter func([]byte) ([]byte, error)
 
 const signedJWTHeader = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+const encodedJWTSignatureSize = (sha256.Size*8 + 5) / 6
 
 const (
 	accessPurpose  = "access"
@@ -200,8 +201,8 @@ func verifyPurpose(cfg *Config, token, purpose string) (Claims, int64, error) {
 
 	// Verify signature
 	signed := token[:len(header)+1+len(encodedPayload)]
-	expectedSig := hmacSign(signed, cfg.Secret)
-	if !hmac.Equal([]byte(signature), []byte(expectedSig)) {
+	var encoded [encodedJWTSignatureSize]byte
+	if !hmac.Equal([]byte(signature), appendJWTSignature(encoded[:0], signed, cfg.Secret)) {
 		return Claims{}, 0, fmt.Errorf("invalid signature")
 	}
 	if err := validateJWTHeader(header); err != nil {
@@ -281,9 +282,14 @@ func SignRefresh(cfg *Config, data ClaimsWriter) (string, error) {
 }
 
 func hmacSign(message, secret string) string {
+	var encoded [encodedJWTSignatureSize]byte
+	return string(appendJWTSignature(encoded[:0], message, secret))
+}
+
+func appendJWTSignature(dst []byte, message, secret string) []byte {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(message))
-	return base64Encode(mac.Sum(nil))
+	return base64.RawURLEncoding.AppendEncode(dst, mac.Sum(nil))
 }
 
 func base64Encode(data []byte) string {

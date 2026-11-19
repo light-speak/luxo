@@ -41,7 +41,8 @@ func prepareGeneratedSymbols(files map[string][]byte, exportUnicode bool) error 
 	names := slices.Sorted(maps.Keys(files))
 	formattedSources := make([][]byte, len(names))
 	for index, name := range names {
-		file, err := parser.ParseFile(symbols.positions, name, files[name], mode)
+		source := files[name]
+		file, err := parser.ParseFile(symbols.positions, name, source, mode)
 		if err != nil {
 			return fmt.Errorf("format %s: %w", name, err)
 		}
@@ -53,7 +54,7 @@ func prepareGeneratedSymbols(files map[string][]byte, exportUnicode bool) error 
 				return err
 			}
 		}
-		formatted, err := formatParsedGeneratedFile(symbols.positions, file)
+		formatted, err := formatParsedGeneratedFile(symbols.positions, file, len(source))
 		if err != nil {
 			return fmt.Errorf("format %s: %w", name, err)
 		}
@@ -65,8 +66,9 @@ func prepareGeneratedSymbols(files map[string][]byte, exportUnicode bool) error 
 	return nil
 }
 
-func formatParsedGeneratedFile(positions *token.FileSet, file *goast.File) ([]byte, error) {
+func formatParsedGeneratedFile(positions *token.FileSet, file *goast.File, sourceSize int) ([]byte, error) {
 	var output bytes.Buffer
+	output.Grow(sourceSize)
 	var err error
 	goast.SortImports(positions, file)
 	if hasNoncanonicalNumberSpelling(file) {

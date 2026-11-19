@@ -72,17 +72,7 @@ func (g *GeneratorContext) writeJSONInputField(b *strings.Builder, model string,
 	if field.Type.Nullable {
 		b.WriteString("\t\tif string(raw) != \"null\" {\n")
 	}
-	goType := mapBaseType(field.Type.Name)
-	if field.Type.IsList {
-		goType = "[]" + goType
-	}
-	fmt.Fprintf(b, "\t\tvalue, err := func() (%s, error) {\n", goType)
-	if field.Type.IsList {
-		g.writeJSONInputList(b, field.Type.Name, enums[field.Type.Name], identity)
-	} else {
-		g.writeJSONInputScalar(b, field.Type.Name, enums[field.Type.Name], "raw", "\t\t\t", identity)
-	}
-	b.WriteString("\t\t}()\n")
+	g.writeJSONInputValue(b, field, enums, identity)
 	fmt.Fprintf(b, "\t\tif err != nil { return fmt.Errorf(%q, err) }\n", model+"."+field.Name+": %w")
 	value := "value"
 	if field.Type.IsList && len(modes) > 1 && modes[1] {
@@ -102,6 +92,24 @@ func (g *GeneratorContext) writeJSONInputField(b *strings.Builder, model string,
 	b.WriteString("\t}\n")
 }
 
+func (g *GeneratorContext) writeJSONInputValue(b *strings.Builder, field *ast.FieldDecl, enums map[string]bool, identity bool) {
+	if reader := directJSONInputReader(field.Type.Name, enums[field.Type.Name]); !field.Type.IsList && reader != "" {
+		fmt.Fprintf(b, "\t\tvalue, err := jsonutil.%s(raw)\n", reader)
+		return
+	}
+	goType := mapBaseType(field.Type.Name)
+	if field.Type.IsList {
+		goType = "[]" + goType
+	}
+	fmt.Fprintf(b, "\t\tvalue, err := func() (%s, error) {\n", goType)
+	if field.Type.IsList {
+		g.writeJSONInputList(b, field.Type.Name, enums[field.Type.Name], identity)
+	} else {
+		g.writeJSONInputScalar(b, field.Type.Name, enums[field.Type.Name], "raw", "\t\t\t", identity)
+	}
+	b.WriteString("\t\t}()\n")
+}
+
 func (g *GeneratorContext) writeJSONInputList(b *strings.Builder, name string, isEnum bool, modes ...bool) {
 	b.WriteString("\t\t\tcount := 0\n")
 	fmt.Fprintf(b, "\t\t\treturn jsonutil.ParseArray(raw, func(item []byte) (%s, error) {\n", mapBaseType(name))
@@ -111,11 +119,29 @@ func (g *GeneratorContext) writeJSONInputList(b *strings.Builder, name string, i
 	b.WriteString("\t\t\t})\n")
 }
 
-func (g *GeneratorContext) writeJSONInputScalar(b *strings.Builder, name string, isEnum bool, raw, indent string, modes ...bool) {
-	readers := map[string]string{
-		"Int": "ParseInt64", "Float": "ParseFloat64", "Boolean": "ParseBool", "String": "ParseString", "DateTime": "ParseDateTime", "Bytes": "ParseBase64",
+func directJSONInputReader(name string, isEnum bool) string {
+	if isEnum {
+		return ""
 	}
-	if reader, ok := readers[name]; ok && !isEnum {
+	switch name {
+	case "Int":
+		return "ParseInt64"
+	case "Float":
+		return "ParseFloat64"
+	case "Boolean":
+		return "ParseBool"
+	case "String":
+		return "ParseString"
+	case "DateTime":
+		return "ParseDateTime"
+	case "Bytes":
+		return "ParseBase64"
+	}
+	return ""
+}
+
+func (g *GeneratorContext) writeJSONInputScalar(b *strings.Builder, name string, isEnum bool, raw, indent string, modes ...bool) {
+	if reader := directJSONInputReader(name, isEnum); reader != "" {
 		fmt.Fprintf(b, "%sreturn jsonutil.%s(%s)\n", indent, reader, raw)
 		return
 	}

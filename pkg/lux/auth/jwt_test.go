@@ -2,6 +2,7 @@ package auth
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -57,12 +58,20 @@ func TestVerifyBadSignature(t *testing.T) {
 	cfg := testConfig()
 	data := testClaims(1, "")
 
-	token, _ := Sign(cfg, data)
+	token, err := Sign(cfg, data)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	// Tamper with token
-	_, err := Verify(cfg, token+"x")
-	if err == nil {
-		t.Fatal("should reject tampered token")
+	end := strings.LastIndexByte(token, '.') + 1
+	replacement := "A"
+	if token[end] == 'A' {
+		replacement = "B"
+	}
+	for _, invalid := range []string{token + "x", token + "=", token + "\n", token[:end] + replacement + token[end+1:]} {
+		if _, err := Verify(cfg, invalid); err == nil || err.Error() != "invalid signature" {
+			t.Fatalf("expected invalid signature, got %v", err)
+		}
 	}
 }
 
