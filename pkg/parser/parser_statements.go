@@ -1,6 +1,8 @@
 package parser
 
 import (
+	"slices"
+
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/token"
 )
@@ -30,29 +32,39 @@ func (p *Parser) parseBlockBody(pos token.Position) *ast.Block {
 }
 
 func (p *Parser) parseBlockStatements() []ast.Stmt {
-	var local [8]ast.Stmt
-	count := 0
-	var overflow []ast.Stmt
+	var statements parsedList[ast.Stmt]
 	for !p.check(token.RBrace) && !p.isEOF() {
-		stmt := p.parseStmt()
-		if stmt == nil {
-			continue
+		if stmt := p.parseStmt(); stmt != nil {
+			statements.add(stmt)
 		}
-		if count < len(local) {
-			local[count] = stmt
-			count++
-			continue
-		}
-		if overflow == nil {
-			overflow = make([]ast.Stmt, count, 2*count)
-			copy(overflow, local[:])
-		}
-		overflow = append(overflow, stmt)
 	}
-	if overflow != nil {
-		return overflow
+	return statements.values()
+}
+
+type parsedList[T any] struct {
+	local    [8]T
+	count    int
+	overflow []T
+}
+
+func (list *parsedList[T]) add(value T) {
+	if list.count < len(list.local) {
+		list.local[list.count] = value
+		list.count++
+		return
 	}
-	return append([]ast.Stmt(nil), local[:count]...)
+	if list.overflow == nil {
+		list.overflow = make([]T, list.count, 2*list.count)
+		copy(list.overflow, list.local[:])
+	}
+	list.overflow = append(list.overflow, value)
+}
+
+func (list *parsedList[T]) values() []T {
+	if list.overflow != nil {
+		return list.overflow
+	}
+	return append([]T(nil), list.local[:list.count]...)
 }
 
 // ========== Statements ==========
@@ -232,4 +244,36 @@ func (p *Parser) parseThrowStmt() *ast.ThrowStmt {
 		Pos:   pos,
 		Error: p.parseExpr(precNone),
 	}
+}
+
+// Allocate arguments in bounded groups so list growth only copies pointers.
+type parsedArguments struct {
+	local     [8]ast.NamedArg
+	count     int
+	arguments []*ast.NamedArg
+}
+
+func (a *parsedArguments) add(argument ast.NamedArg) {
+	if a.count == len(a.local) {
+		a.flush()
+	}
+	a.local[a.count] = argument
+	a.count++
+}
+
+func (a *parsedArguments) flush() {
+	if a.count == 0 {
+		return
+	}
+	owned := append([]ast.NamedArg(nil), a.local[:a.count]...)
+	a.arguments = slices.Grow(a.arguments, len(owned))
+	for index := range owned {
+		a.arguments = append(a.arguments, &owned[index])
+	}
+	a.count = 0
+}
+
+func (a *parsedArguments) pointers() []*ast.NamedArg {
+	a.flush()
+	return a.arguments
 }

@@ -198,37 +198,37 @@ func (p *Parser) parseConcurrencyExpr(pos token.Position) ast.Expr {
 // parseTemplateString parses a string template: "text ${expr} more ${expr} end"
 // Tokens arrive as: StringStart, expr..., StringMid, expr..., StringEnd
 func (p *Parser) parseTemplateString(pos token.Position) ast.Expr {
-	tmpl := &ast.TemplateString{Pos: pos}
+	var parts parsedList[ast.Expr]
 
 	// StringStart: "text ${"
 	start := p.advance()
 	if start.Val != "" {
-		tmpl.Parts = append(tmpl.Parts, &ast.Literal{Pos: start.Pos, Kind: token.String, Value: start.Val})
+		parts.add(&ast.Literal{Pos: start.Pos, Kind: token.String, Value: start.Val})
 	}
 
 	// Parse the first interpolated expression
-	tmpl.Parts = append(tmpl.Parts, p.parseExpr(0))
+	parts.add(p.parseExpr(0))
 
 	// Loop: StringMid or StringEnd
 	for p.check(token.StringMid) {
 		mid := p.advance()
 		if mid.Val != "" {
-			tmpl.Parts = append(tmpl.Parts, &ast.Literal{Pos: mid.Pos, Kind: token.String, Value: mid.Val})
+			parts.add(&ast.Literal{Pos: mid.Pos, Kind: token.String, Value: mid.Val})
 		}
-		tmpl.Parts = append(tmpl.Parts, p.parseExpr(0))
+		parts.add(p.parseExpr(0))
 	}
 
 	// StringEnd: "} text"
 	if p.check(token.StringEnd) {
 		end := p.advance()
 		if end.Val != "" {
-			tmpl.Parts = append(tmpl.Parts, &ast.Literal{Pos: end.Pos, Kind: token.String, Value: end.Val})
+			parts.add(&ast.Literal{Pos: end.Pos, Kind: token.String, Value: end.Val})
 		}
 	} else {
 		p.error("expected end of template string")
 	}
 
-	return tmpl
+	return &ast.TemplateString{Pos: pos, Parts: parts.values()}
 }
 
 // parseLiteral parses a literal expression (Int, Float, String, Duration, True, False, Null).
@@ -275,11 +275,7 @@ func (p *Parser) parseInfixExpr(left ast.Expr) ast.Expr {
 		// Lambda call: items.map { it.name } or items.map { x -> x.name }
 		// Skip in condition context (noBraceLambda) to avoid consuming if/for block
 		if p.check(token.LBrace) && !p.noBraceLambda {
-			return &ast.CallExpr{
-				Pos:  pos,
-				Func: member,
-				Args: []*ast.NamedArg{{Value: p.parseLambdaExpr()}},
-			}
+			return p.parseTrailingLambdaCall(pos, member)
 		}
 		return member
 
@@ -300,11 +296,7 @@ func (p *Parser) parseInfixExpr(left ast.Expr) ast.Expr {
 
 	// Trailing lambda: items.filter { it.active } or { x -> x.active }
 	case p.check(token.LBrace) && p.isCallable(left):
-		return &ast.CallExpr{
-			Pos:  pos,
-			Func: left,
-			Args: []*ast.NamedArg{{Value: p.parseLambdaExpr()}},
-		}
+		return p.parseTrailingLambdaCall(pos, left)
 
 	// Elvis: expr ?: fallback
 	case p.check(token.Elvis):
@@ -340,12 +332,24 @@ func (p *Parser) parseInfixExpr(left ast.Expr) ast.Expr {
 	}
 }
 
+func (p *Parser) parseTrailingLambdaCall(pos token.Position, fn ast.Expr) *ast.CallExpr {
+	// The single argument and its pointer slice belong to the same call.
+	node := &struct {
+		call      ast.CallExpr
+		argument  ast.NamedArg
+		arguments [1]*ast.NamedArg
+	}{call: ast.CallExpr{Pos: pos, Func: fn}, argument: ast.NamedArg{Value: p.parseLambdaExpr()}}
+	node.arguments[0] = &node.argument
+	node.call.Args = node.arguments[:]
+	return &node.call
+}
+
 func (p *Parser) parseCallArgs(pos token.Position, fn ast.Expr) *ast.CallExpr {
 	p.expect(token.LParen)
-	call := &ast.CallExpr{Pos: pos, Func: fn}
+	var args parsedArguments
 
 	for !p.check(token.RParen) && !p.isEOF() {
-		arg := &ast.NamedArg{}
+		arg := ast.NamedArg{}
 		// named arg: key: value
 		if p.check(token.Ident) && p.peekType() == token.Colon {
 			arg.Name = p.expectIdent()
@@ -361,7 +365,7 @@ func (p *Parser) parseCallArgs(pos token.Position, fn ast.Expr) *ast.CallExpr {
 			break
 		}
 		arg.Value = val
-		call.Args = append(call.Args, arg)
+		args.add(arg)
 		p.match(token.Comma)
 	}
 	p.expect(token.RParen)
@@ -369,27 +373,30 @@ func (p *Parser) parseCallArgs(pos token.Position, fn ast.Expr) *ast.CallExpr {
 	// trailing lambda: find(User, id: 1) { ... } or { x -> ... }
 	// but NOT inside if/for conditions (noBraceLambda flag)
 	if p.check(token.LBrace) && !p.noBraceLambda {
-		call.Args = append(call.Args, &ast.NamedArg{
+		args.add(ast.NamedArg{
 			Value: p.parseLambdaExpr(),
 		})
 	}
 
-	return call
+	return &ast.CallExpr{Pos: pos, Func: fn, Args: args.pointers()}
 }
 
 func (p *Parser) parseListExpr(pos token.Position) ast.Expr {
 	p.expect(token.LBracket)
+	var parts parsedList[ast.Expr]
 	list := &ast.ListExpr{Pos: pos}
 	for !p.check(token.RBracket) && !p.isEOF() {
-		list.Items = append(list.Items, p.parseExpr(precNone))
+		parts.add(p.parseExpr(precNone))
 		p.match(token.Comma)
 	}
 	p.expect(token.RBracket)
+	list.Items = parts.values()
 	return list
 }
 
 func (p *Parser) parseWhenExpr(pos token.Position) ast.Expr {
 	p.expect(token.When)
+	var parts parsedList[*ast.WhenBranch]
 	when := &ast.WhenExpr{Pos: pos}
 
 	// when(subject) { ... } or when subject { ... } or when { ... }
@@ -428,9 +435,10 @@ func (p *Parser) parseWhenExpr(pos token.Position) ast.Expr {
 
 		p.expect(token.Arrow)
 		branch.Body = p.parseWhenBody()
-		when.Branches = append(when.Branches, branch)
+		parts.add(branch)
 	}
 	p.expect(token.RBrace)
+	when.Branches = parts.values()
 	return when
 }
 
